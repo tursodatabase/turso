@@ -87,7 +87,7 @@ test alter-table-rename-column {
 expect {
 }
 
-# E-04 (S2): ALTER COLUMN SET DEFAULT
+# E-04: ALTER COLUMN SET DEFAULT
 @setup t_id_s_with_rows
 @compat-gap "syntax:alter-table"
 test alter-column-set-default {
@@ -98,7 +98,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# E-05 (S2): ALTER COLUMN DROP DEFAULT
+# E-05: ALTER COLUMN DROP DEFAULT
 @setup t_id_s_with_rows
 @compat-gap "syntax:alter-table"
 test alter-column-drop-default {
@@ -109,7 +109,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# E-06 (S2): ALTER COLUMN SET NOT NULL
+# E-06: ALTER COLUMN SET NOT NULL
 @setup t_id_s_with_rows
 @compat-gap "syntax:alter-table"
 test alter-column-set-not-null {
@@ -120,7 +120,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# E-07 (S2): ALTER COLUMN DROP NOT NULL
+# E-07: ALTER COLUMN DROP NOT NULL
 @compat-gap "syntax:alter-table"
 test alter-column-drop-not-null {
     CREATE TABLE t (id int, s text NOT NULL);
@@ -131,7 +131,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# E-08 (S2): ALTER COLUMN TYPE
+# E-08: ALTER COLUMN TYPE
 @setup t_id_s_with_rows
 @compat-gap "syntax:alter-table"
 test alter-column-type {
@@ -142,7 +142,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-09 (S2): ADD CONSTRAINT UNIQUE
+# E-09: ADD CONSTRAINT UNIQUE
 @setup t_id_s_with_rows
 @compat-gap "syntax:alter-table"
 test add-constraint-unique {
@@ -153,7 +153,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# E-10 (S2): ADD CONSTRAINT FOREIGN KEY
+# E-10: ADD CONSTRAINT FOREIGN KEY
 @compat-gap "syntax:alter-table"
 test add-constraint-foreign-key {
     CREATE TABLE p (id int PRIMARY KEY);
@@ -165,7 +165,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# E-11 (S2): ADD CONSTRAINT CHECK
+# E-11: ADD CONSTRAINT CHECK
 @setup t_id_s_with_rows
 @compat-gap "syntax:alter-table"
 test add-constraint-check {
@@ -176,7 +176,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# E-12 (S2): DROP CONSTRAINT
+# E-12: DROP CONSTRAINT
 @compat-gap "syntax:alter-table"
 test drop-constraint {
     CREATE TABLE t (id int, s text CONSTRAINT t_s_key UNIQUE);
@@ -248,7 +248,7 @@ expect {
     b|s
 }
 
-# E-19 (S4): 't'::regclass resolves
+# E-19: 't'::regclass resolves
 @setup t_id
 @compat-gap "type:regclass"
 test t-regclass-resolves {
@@ -261,7 +261,7 @@ expect @tursopg {
     0
 }
 
-# E-20 (S4): view in pg_class relkind v
+# E-20: view in pg_class relkind v
 @setup t_id_view_v
 @compat-gap "syntax:catalog"
 test view-in-pg-class-relkind-v {
@@ -275,7 +275,7 @@ expect @tursopg {
     t|r
 }
 
-# E-21 (S4): pg_views
+# E-21: pg_views
 @setup t_id_view_v
 @compat-gap "syntax:catalog"
 test pg-views {
@@ -287,7 +287,7 @@ expect {
 @sqlstate 42P01
 expect @tursopg error {}
 
-# E-22 (S4): view columns in pg_attribute
+# E-22: view columns in pg_attribute
 @setup t_id_view_v
 @compat-gap "syntax:catalog"
 test view-columns-in-pg-attribute {
@@ -299,7 +299,7 @@ expect {
 expect @tursopg {
 }
 
-# E-23 (S4): pg_enum
+# E-23: pg_enum
 @setup type_mood
 @compat-gap "syntax:catalog"
 test pg-enum {
@@ -321,7 +321,7 @@ expect {
     mood|e
 }
 
-# E-25 (S4): enum column atttypid/format_type
+# E-25: enum column atttypid/format_type
 @compat-gap "function:format_type"
 test enum-column-atttypid-format-type {
     CREATE TYPE mood AS ENUM ('happy', 'sad');
@@ -344,7 +344,7 @@ expect {
     posint|d|integer
 }
 
-# E-27 (S4): domain column format_type
+# E-27: domain column format_type
 @compat-gap "function:format_type"
 test domain-column-format-type {
     CREATE DOMAIN posint AS integer CHECK (VALUE > 0);
@@ -358,7 +358,7 @@ expect @tursopg {
     unknown
 }
 
-# E-28 (S4): serial column default in pg_attrdef
+# E-28: serial column default in pg_attrdef
 @setup t_id_serial
 @compat-gap "function:pg_get_expr"
 test serial-column-default-in-pg-attrdef {
@@ -371,7 +371,7 @@ expect @tursopg {
     nextval ('__turso_ns1_t_id_seq')
 }
 
-# E-29 (S4): serial internal tables visible
+# E-29: serial internal tables visible
 @setup t_id_serial
 @compat-gap "syntax:catalog"
 test serial-internal-tables-visible {
@@ -388,7 +388,7 @@ expect @tursopg {
     t_id_seq|S
 }
 
-# E-30 (S4): format_type with typmod
+# E-30: format_type with typmod
 @compat-gap "function:format_type"
 test format-type-with-typmod {
     CREATE TABLE t (n numeric(10,2), v varchar(5), ts timestamptz, j jsonb, u uuid, a text[]);
@@ -411,7 +411,7 @@ expect @tursopg {
     a|text
 }
 
-# E-31 (S4): information_schema.columns
+# E-31: information_schema.columns
 @setup t_id
 @compat-gap "syntax:information-schema"
 test information-schema-columns {
@@ -423,7 +423,7 @@ expect {
 @sqlstate 42P01
 expect @tursopg error {}
 
-# E-32 (S4): information_schema.tables
+# E-32: information_schema.tables
 @setup t_id
 @compat-gap "syntax:information-schema"
 test information-schema-tables {
@@ -455,7 +455,7 @@ expect {
     s
 }
 
-# E-35 (S4): pg_constraint rows for non-public schema
+# E-35: pg_constraint rows for non-public schema
 @setup schema_api_api_items_id
 @compat-gap "syntax:catalog"
 test pg-constraint-rows-for-non-public-schema {
@@ -480,7 +480,7 @@ expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
 
-# E-38 (S1): cross-schema FK rejects orphan
+# E-38: cross-schema FK rejects orphan
 # Fails while foreign keys are off, see D-01.
 @compat-gap "syntax:foreign-key"
 test cross-schema-fk-rejects-orphan {
@@ -494,7 +494,7 @@ expect error {}
 expect @tursopg {
 }
 
-# E-39 (S4): FK in pg_constraint confrelid/conkey/confkey
+# E-39: FK in pg_constraint confrelid/conkey/confkey
 @compat-gap "syntax:catalog"
 test fk-in-pg-constraint-confrelid-conkey-confkey {
     CREATE TABLE p (id int PRIMARY KEY);
@@ -508,7 +508,7 @@ expect @tursopg {
     c_pid_fkey|1|2|1
 }
 
-# E-40 (S4): COMMENT ON TABLE + obj_description
+# E-40: COMMENT ON TABLE + obj_description
 @compat-gap "function:obj_description"
 test comment-on-table-obj-description {
     CREATE TABLE t (id int);
@@ -521,7 +521,7 @@ expect {
 expect @tursopg {
 }
 
-# E-41 (S4): COMMENT ON COLUMN + col_description
+# E-41: COMMENT ON COLUMN + col_description
 @compat-gap "function:col_description"
 test comment-on-column-col-description {
     CREATE TABLE t (id int);
@@ -570,7 +570,7 @@ test enable-row-level-security {
 expect {
 }
 
-# E-46 (S2): CREATE FUNCTION language sql
+# E-46: CREATE FUNCTION language sql
 @compat-gap "syntax:create-function"
 test create-function-language-sql {
     CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
@@ -580,7 +580,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-47 (S2): CREATE TRIGGER
+# E-47: CREATE TRIGGER
 @setup t_id
 @compat-gap "syntax:create-trigger"
 test create-trigger {
@@ -599,7 +599,7 @@ test grant {
 expect {
 }
 
-# E-49 (S3): SET LOCAL ROLE nonexistent
+# E-49: SET LOCAL ROLE nonexistent
 @compat-gap "syntax:set-role"
 test set-local-role-nonexistent {
     BEGIN;
@@ -619,7 +619,7 @@ expect {
     t|1
 }
 
-# E-51 (S4): pg_get_indexdef
+# E-51: pg_get_indexdef
 @compat-gap "function:pg_get_indexdef"
 test pg-get-indexdef {
     CREATE TABLE t (id int, s text);
@@ -643,7 +643,7 @@ expect {
     FOREIGN KEY (pid) REFERENCES p(id) ON DELETE CASCADE
 }
 
-# E-53 (S2): DROP TABLE CASCADE with dependent view
+# E-53: DROP TABLE CASCADE with dependent view
 @compat-gap "syntax:drop-table"
 test drop-table-cascade-with-dependent-view {
     CREATE TABLE t (id int);
@@ -657,7 +657,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-54 (S1): DROP TABLE without CASCADE blocked by view
+# E-54: DROP TABLE without CASCADE blocked by view
 @setup t_id_view_v
 @compat-gap "syntax:drop-table"
 test drop-table-without-cascade-blocked-by-view {
@@ -701,7 +701,7 @@ expect {
     0
 }
 
-# E-58 (S4): column default now() in pg_attrdef
+# E-58: column default now() in pg_attrdef
 @compat-gap "function:pg_get_expr"
 test column-default-now-in-pg-attrdef {
     CREATE TABLE t (ts timestamptz DEFAULT now());
@@ -725,7 +725,7 @@ expect {
     n|f|f
 }
 
-# E-60 (S2): CREATE INDEX USING gin
+# E-60: CREATE INDEX USING gin
 @compat-gap "syntax:create-index"
 test create-index-using-gin {
     CREATE TABLE t (j jsonb);
@@ -736,7 +736,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-61 (S2): CREATE EXTENSION
+# E-61: CREATE EXTENSION
 @compat-gap "syntax:create-extension"
 test create-extension {
     CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -746,7 +746,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-62 (S2): CREATE TYPE composite
+# E-62: CREATE TYPE composite
 @compat-gap "syntax:create-type"
 test create-type-composite {
     CREATE TYPE pair AS (a int, b text);
@@ -756,7 +756,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-63 (S2): CREATE MATERIALIZED VIEW then select
+# E-63: CREATE MATERIALIZED VIEW then select
 @compat-gap "syntax:create-materialized-view"
 test create-materialized-view-then-select {
     CREATE TABLE t (id int);
@@ -770,7 +770,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# E-64 (S3): partitioned table without partitions rejects insert
+# E-64: partitioned table without partitions rejects insert
 @compat-gap "syntax:partitioned-table"
 test partitioned-table-without-partitions-rejects-insert {
     CREATE TABLE m (id int, d date) PARTITION BY RANGE (d);
@@ -781,7 +781,7 @@ expect error {}
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-65 (S2): ALTER TYPE ADD VALUE
+# E-65: ALTER TYPE ADD VALUE
 @compat-gap "syntax:alter-type"
 test alter-type-add-value {
     CREATE TYPE mood AS ENUM ('happy');
@@ -842,7 +842,7 @@ expect {
     1
 }
 
-# E-73 (S1): omitted nullable uuid column stays NULL
+# E-73: omitted nullable uuid column stays NULL
 @compat-gap "type:uuid"
 test omitted-nullable-uuid-column-stays-null {
     CREATE TABLE t (id int PRIMARY KEY, u uuid);
@@ -865,7 +865,7 @@ expect {
     Todos
 }
 
-# E-79 (S2): REINDEX
+# E-79: REINDEX
 @compat-gap "syntax:reindex"
 test reindex {
     CREATE TABLE t (id int, s text);
@@ -878,7 +878,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-80 (S2): ALTER COLUMN TYPE on an indexed column, then select it
+# E-80: ALTER COLUMN TYPE on an indexed column, then select it
 @compat-gap "syntax:alter-table"
 test alter-column-type-on-an-indexed-column-then-select-it {
     CREATE TABLE t (id int, s text);
@@ -893,7 +893,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-81 (S4): quoted schema name keeps its case
+# E-81: quoted schema name keeps its case
 @compat-gap "syntax:catalog"
 test quoted-schema-name-keeps-its-case {
     CREATE SCHEMA "Api";
@@ -906,7 +906,7 @@ expect @tursopg {
     api
 }
 
-# E-82 (S2): CREATE TYPE in a non-public schema
+# E-82: CREATE TYPE in a non-public schema
 @compat-gap "syntax:create-type"
 test create-type-in-a-non-public-schema {
     CREATE SCHEMA api;
@@ -917,7 +917,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-85 (S2): table in a quoted non-ASCII schema
+# E-85: table in a quoted non-ASCII schema
 @compat-gap "syntax:create-schema"
 test table-in-a-quoted-non-ascii-schema {
     CREATE SCHEMA "ÄPP";
@@ -928,7 +928,7 @@ expect {
 @sqlstate 3F000
 expect @tursopg error {}
 
-# E-86 (S4): DEFAULT auth.uid() in pg_attrdef
+# E-86: DEFAULT auth.uid() in pg_attrdef
 @setup auth_uid_from_claims_on_postgres
 @compat-gap "function:pg_get_expr"
 test default-auth-uid-in-pg-attrdef {
@@ -950,7 +950,7 @@ test check-calling-auth-uid {
 expect {
 }
 
-# E-89 (S2): BYPASSRLS role attribute
+# E-89: BYPASSRLS role attribute
 @compat-gap "syntax:alter-role"
 test bypassrls-role-attribute {
     ALTER ROLE CURRENT_USER WITH BYPASSRLS;
@@ -960,7 +960,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-90 (S2): ALTER DEFAULT PRIVILEGES
+# E-90: ALTER DEFAULT PRIVILEGES
 @compat-gap "syntax:alter-default-privileges"
 test alter-default-privileges {
     ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO PUBLIC;
@@ -970,7 +970,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-91 (S2): CREATE POLICY with a FROM subquery
+# E-91: CREATE POLICY with a FROM subquery
 @compat-gap "syntax:create-policy"
 test create-policy-with-a-from-subquery {
     CREATE TABLE t (id int PRIMARY KEY, s text);
@@ -982,7 +982,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-92 (S2): ALTER POLICY
+# E-92: ALTER POLICY
 @setup t_id_s_policy_p
 @compat-gap "syntax:alter-policy"
 test alter-policy {
@@ -993,7 +993,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-93 (S2): FORCE ROW LEVEL SECURITY
+# E-93: FORCE ROW LEVEL SECURITY
 @compat-gap "syntax:row-level-security"
 test force-row-level-security {
     CREATE TABLE t (id int PRIMARY KEY, s text);
@@ -1004,7 +1004,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-94 (S2): GRANT role membership
+# E-94: GRANT role membership
 @compat-gap "syntax:grant"
 test grant-role-membership {
     GRANT pg_read_all_data TO CURRENT_USER;
@@ -1022,7 +1022,7 @@ test revoke {
 expect {
 }
 
-# E-96 (S2): GRANT column privileges
+# E-96: GRANT column privileges
 @setup t_id_s_with_rows
 @compat-gap "syntax:grant"
 test grant-column-privileges {
@@ -1033,7 +1033,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-97 (S1): CREATE TABLE in pg_catalog
+# E-97: CREATE TABLE in pg_catalog
 @compat-gap "syntax:create-table"
 test create-table-in-pg-catalog {
     CREATE TABLE pg_catalog.zz (id int);
@@ -1052,7 +1052,7 @@ expect {
     p
 }
 
-# E-99 (S4): pg_available_extensions()
+# E-99: pg_available_extensions()
 @compat-gap "function:pg_available_extensions"
 test pg-available-extensions {
     SELECT name, default_version FROM pg_available_extensions() WHERE name = 'plpgsql';
@@ -1063,7 +1063,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-100 (S4): pg_indexes names of PRIMARY KEY and UNIQUE indexes
+# E-100: pg_indexes names of PRIMARY KEY and UNIQUE indexes
 # The primary key index name has the same cause as E-29.
 @compat-gap "syntax:catalog"
 test pg-indexes-names-of-primary-key-and-unique-indexes {
@@ -1077,7 +1077,7 @@ expect @tursopg {
     0
 }
 
-# E-101 (S4): conkey of a two-column UNIQUE constraint as text
+# E-101: conkey of a two-column UNIQUE constraint as text
 # Fails because tursopg returns int2vector columns as text, see E-39.
 @compat-gap "syntax:catalog"
 test conkey-of-a-two-column-unique-constraint-as-text {
@@ -1092,7 +1092,7 @@ expect @tursopg {
     2 3
 }
 
-# E-102 (S4): conkey subscript and array_length
+# E-102: conkey subscript and array_length
 # Fails because tursopg returns int2vector columns as text, see E-39.
 @setup p_a_b_c_x_y_fkey
 @compat-gap "syntax:catalog"
@@ -1106,7 +1106,7 @@ expect @tursopg {
     |
 }
 
-# E-103 (S4): indkey cast to int2[]
+# E-103: indkey cast to int2[]
 # Fails because tursopg returns int2vector columns as text, see E-39.
 @setup p_a_b_c_x_y_fkey
 @compat-gap "syntax:catalog"
@@ -1119,7 +1119,7 @@ expect {
 @sqlstate 23000
 expect @tursopg error {}
 
-# E-104 (S1): unquoted name does not find a quoted mixed-case schema
+# E-104: unquoted name does not find a quoted mixed-case schema
 # Fails because tursopg folds the quoted schema name to lower case, see E-81.
 @compat-gap "syntax:quoted-identifier"
 test unquoted-name-does-not-find-a-quoted-mixed-case-schema {
@@ -1132,7 +1132,7 @@ expect error {}
 expect @tursopg {
 }
 
-# E-105 (S4): regclass cast of an unknown name
+# E-105: regclass cast of an unknown name
 # Fails because every regclass cast returns 0, see E-19.
 @compat-gap "type:regclass"
 test regclass-cast-of-an-unknown-name {
@@ -1154,7 +1154,7 @@ expect {
     t|f
 }
 
-# E-107 (S2): PL/pgSQL trigger function
+# E-107: PL/pgSQL trigger function
 # Fails because CREATE FUNCTION is not supported, see E-46.
 @compat-gap "syntax:create-function"
 test pl-pgsql-trigger-function {
@@ -1176,7 +1176,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-108 (S2): SECURITY DEFINER function with SET search_path
+# E-108: SECURITY DEFINER function with SET search_path
 # Fails because CREATE FUNCTION is not supported, see E-46.
 @compat-gap "syntax:create-function"
 test security-definer-function-with-set-search-path {
@@ -1189,7 +1189,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-109 (S4): table and column privilege functions
+# E-109: table and column privilege functions
 @compat-gap "function:has_table_privilege"
 test table-and-column-privilege-functions {
     CREATE ROLE gap_e_109_reader;
@@ -1206,7 +1206,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# E-110 (S4): pg_has_role
+# E-110: pg_has_role
 @compat-gap "function:pg_has_role"
 test pg-has-role {
     CREATE ROLE gap_e_110_role;
@@ -1218,7 +1218,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# E-111 (S4): pg_is_other_temp_schema
+# E-111: pg_is_other_temp_schema
 @compat-gap "function:pg_is_other_temp_schema"
 test pg-is-other-temp-schema {
     SELECT pg_is_other_temp_schema((SELECT oid FROM pg_namespace WHERE nspname = 'public'));
@@ -1229,7 +1229,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# E-112 (S4): pg_column_is_updatable
+# E-112: pg_column_is_updatable
 @compat-gap "function:pg_column_is_updatable"
 test pg-column-is-updatable {
     CREATE TABLE t (id int PRIMARY KEY, s text);
@@ -1241,7 +1241,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# E-113 (S4): pg_total_relation_size and pg_relation_size
+# E-113: pg_total_relation_size and pg_relation_size
 @setup t_id_s_with_rows
 @compat-gap "function:pg_total_relation_size"
 test pg-total-relation-size-and-pg-relation-size {
@@ -1253,7 +1253,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# E-114 (S4): pg_stat_user_tables
+# E-114: pg_stat_user_tables
 @setup t_id_s_with_rows
 @compat-gap "syntax:catalog"
 test pg-stat-user-tables {

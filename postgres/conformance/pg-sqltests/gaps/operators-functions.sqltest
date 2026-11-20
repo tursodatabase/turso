@@ -56,7 +56,7 @@ expect {
     2
 }
 
-# B-04 (S1): IS TRUE / IS NOT TRUE on bool col
+# B-04: IS TRUE / IS NOT TRUE on bool col
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "type:bool"
 test is-true-is-not-true-on-bool-col {
@@ -94,7 +94,7 @@ expect {
     2
 }
 
-# B-07 (S1): LIKE case-sensitive literal
+# B-07: LIKE case-sensitive literal
 @compat-gap "type:bool"
 test like-case-sensitive-literal {
     SELECT 'ABC' LIKE 'abc', 'abc' LIKE 'a%', 'abc' LIKE 'A%';
@@ -143,7 +143,7 @@ expect {
     2
 }
 
-# B-12 (S1): ILIKE non-ASCII
+# B-12: ILIKE non-ASCII
 @compat-gap "operator:text ~~* text"
 test ilike-non-ascii {
     SELECT 'Ärger' ILIKE 'ä%';
@@ -165,7 +165,7 @@ expect {
     4
 }
 
-# B-15 (S2): LIKE ANY(array)
+# B-15: LIKE ANY(array)
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "syntax:any-all"
 test like-any-array {
@@ -179,7 +179,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-16 (S2): ILIKE ALL(array)
+# B-16: ILIKE ALL(array)
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "syntax:any-all"
 test ilike-all-array {
@@ -233,7 +233,7 @@ expect {
     4
 }
 
-# B-21 (S1): regex classes \d and escapes
+# B-21: regex classes \d and escapes
 @compat-gap "type:bool"
 test regex-classes-d-and-escapes {
     SELECT 'a1' ~ '^a\d$', 'a.c' ~ '^a\.c$', 'abc' ~ '^a\.c$';
@@ -245,7 +245,7 @@ expect @tursopg {
     1|1|0
 }
 
-# B-22 (S1): SIMILAR TO
+# B-22: SIMILAR TO
 @compat-gap "type:bool"
 test similar-to {
     SELECT 'abc' SIMILAR TO 'a(b|x)c', 'abc' SIMILAR TO 'b';
@@ -257,7 +257,7 @@ expect @tursopg {
     1|0
 }
 
-# B-23 (S1): IN with NULL (three-valued)
+# B-23: IN with NULL (three-valued)
 @compat-gap "type:bool"
 test in-with-null-three-valued {
     SELECT 1 IN (1, NULL), 2 IN (1, NULL), 2 NOT IN (1, NULL);
@@ -269,7 +269,7 @@ expect @tursopg {
     1||
 }
 
-# B-25 (S1): = ANY('{..}'::int[])
+# B-25: = ANY('{..}'::int[])
 @compat-gap "type:bool"
 test eq-any-int-array-literal {
     SELECT 1 = ANY('{1,2}'::int[]), 3 = ANY('{1,2}'::int[]);
@@ -281,7 +281,7 @@ expect @tursopg {
     1|0
 }
 
-# B-26 (S2): > ALL / < ANY (non-equality)
+# B-26: > ALL / < ANY (non-equality)
 @compat-gap "syntax:any-all"
 test all-any-non-equality {
     SELECT 3 > ALL (ARRAY[1,2]), 1 < ANY (ARRAY[0,2]);
@@ -348,7 +348,7 @@ expect {
     1
 }
 
-# B-35 (S1): ARRAY @> ARRAY literal
+# B-35: ARRAY @> ARRAY literal
 @compat-gap "type:bool"
 test array-array-literal {
     SELECT ARRAY[1,2] @> ARRAY[1], ARRAY['a'] <@ ARRAY['a','b'], ARRAY[1] && ARRAY[2];
@@ -369,7 +369,7 @@ expect {
     a||2
 }
 
-# B-37 (S2): array_length / cardinality
+# B-37: array_length / cardinality
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "function:array_length"
 test array-length-cardinality {
@@ -381,7 +381,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# B-38 (S2): unnest
+# B-38: unnest
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "function:unnest"
 test unnest {
@@ -394,7 +394,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# B-39 (S1): jsonb -> key output
+# B-39: jsonb -> key output
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "type:jsonb"
 test jsonb-arrow-key-output {
@@ -407,7 +407,7 @@ expect @tursopg {
     {"b":1}
 }
 
-# B-40 (S1): jsonb ->> key output
+# B-40: jsonb ->> key output
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "type:jsonb"
 test jsonb-double-arrow-key-output {
@@ -429,7 +429,7 @@ expect {
     1|2
 }
 
-# B-42 (S2): jsonb #> / #>> path
+# B-42: jsonb #> / #>> path
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "operator:jsonb #> _text"
 test jsonb-path {
@@ -441,7 +441,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-43 (S1): jsonb @> filter
+# B-43: jsonb @> filter
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "operator:jsonb @> jsonb"
 test jsonb-filter {
@@ -453,7 +453,7 @@ expect {
 expect @tursopg {
 }
 
-# B-45 (S1): jsonb <@
+# B-45: jsonb <@
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "operator:jsonb <@ jsonb"
 test jsonb-is-contained-by {
@@ -465,7 +465,7 @@ expect {
 expect @tursopg {
 }
 
-# B-46 (S2): jsonb ? key
+# B-46: jsonb ? key
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "operator:jsonb ? text"
 test jsonb-key {
@@ -477,7 +477,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-47 (S2): jsonb ?| array
+# B-47: jsonb ?| array
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "operator:jsonb ?| _text"
 test jsonb-has-any-key-in-array {
@@ -489,7 +489,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-48 (S2): jsonb ?& array
+# B-48: jsonb ?& array
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "operator:jsonb ?& _text"
 test jsonb-has-all-keys-in-array {
@@ -502,7 +502,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-49 (S1): jsonb ->> compared to text
+# B-49: jsonb ->> compared to text
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "operator:jsonb ->> text"
 test jsonb-compared-to-text {
@@ -533,7 +533,7 @@ expect {
     |
 }
 
-# B-52 (S1): jsonb ->> object returns PG-formatted text
+# B-52: jsonb ->> object returns PG-formatted text
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "type:jsonb"
 test jsonb-object-returns-pg-formatted-text {
@@ -555,7 +555,7 @@ expect {
     x
 }
 
-# B-55 (S2): to_tsvector @@ plainto_tsquery
+# B-55: to_tsvector @@ plainto_tsquery
 @compat-gap "operator:tsvector @@ tsquery"
 test to-tsvector-plainto-tsquery {
     SELECT to_tsvector('english', 'The quick brown foxes') @@ plainto_tsquery('english', 'fox');
@@ -566,7 +566,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-56 (S2): websearch_to_tsquery
+# B-56: websearch_to_tsquery
 @compat-gap "function:websearch_to_tsquery"
 test websearch-to-tsquery {
     SELECT to_tsvector('english', 'quick brown fox') @@ websearch_to_tsquery('english', '"brown fox" -cat');
@@ -577,7 +577,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-57 (S2): to_tsquery / phraseto_tsquery
+# B-57: to_tsquery / phraseto_tsquery
 @compat-gap "function:to_tsquery"
 test to-tsquery-phraseto-tsquery {
     SELECT to_tsvector('quick brown fox') @@ to_tsquery('quick & fox'), to_tsvector('quick brown fox') @@ phraseto_tsquery('brown fox');
@@ -588,7 +588,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-58 (S2): text col @@ to_tsquery
+# B-58: text col @@ to_tsquery
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "operator:tsvector @@ tsquery"
 test text-col-to-tsquery {
@@ -600,7 +600,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-59 (S2): to_tsvector output
+# B-59: to_tsvector output
 @compat-gap "function:to_tsvector"
 test to-tsvector-output {
     SELECT to_tsvector('english', 'The quick brown foxes');
@@ -611,7 +611,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# B-60 (S2): int4range @> elem
+# B-60: int4range @> elem
 @compat-gap "operator:int4range @> int4"
 test int4range-elem {
     SELECT int4range(1, 10) @> 5;
@@ -622,7 +622,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# B-61 (S2): range overlap / strictly left / adjacent
+# B-61: range overlap / strictly left / adjacent
 @compat-gap "operator:int4range && int4range"
 test range-overlap-strictly-left-adjacent {
     SELECT '[1,5)'::int4range && '[4,8)'::int4range, '[1,2)'::int4range << '[3,4)'::int4range, '[1,2)'::int4range -|- '[2,3)'::int4range;
@@ -633,7 +633,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-62 (S2): tstzrange contains
+# B-62: tstzrange contains
 @compat-gap "operator:tstzrange @> timestamptz"
 test tstzrange-contains {
     SELECT tstzrange('2026-01-01', '2027-01-01') @> '2026-10-08'::timestamptz;
@@ -644,7 +644,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# B-63 (S2): json_build_object
+# B-63: json_build_object
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "function:json_build_object"
 test json-build-object {
@@ -656,7 +656,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# B-64 (S2): jsonb_build_object
+# B-64: jsonb_build_object
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "function:jsonb_build_object"
 test jsonb-build-object {
@@ -668,7 +668,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# B-65 (S2): json_agg
+# B-65: json_agg
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "function:json_agg"
 test json-agg {
@@ -680,7 +680,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-66 (S2): jsonb_agg
+# B-66: jsonb_agg
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "function:jsonb_agg"
 test jsonb-agg {
@@ -692,7 +692,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-67 (S2): to_json(scalar)
+# B-67: to_json(scalar)
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "function:to_json"
 test to-json-scalar {
@@ -704,7 +704,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# B-68 (S2): row_to_json / to_json(row)
+# B-68: row_to_json / to_json(row)
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "function:row_to_json"
 test row-to-json-to-json-row {
@@ -716,7 +716,7 @@ expect {
 @sqlstate 42703
 expect @tursopg error {}
 
-# B-69 (S2): to_json(t.*) of table alias
+# B-69: to_json(t.*) of table alias
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "function:to_json"
 test to-json-t-of-table-alias {
@@ -737,7 +737,7 @@ expect {
     ["a","b"]
 }
 
-# B-71 (S2): json_object_agg
+# B-71: json_object_agg
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "function:json_object_agg"
 test json-object-agg {
@@ -749,7 +749,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-72 (S2): coalesce(json_agg(...), '[]')
+# B-72: coalesce(json_agg(...), '[]')
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "function:json_agg"
 test coalesce-json-agg {
@@ -771,7 +771,7 @@ expect {
     2|4
 }
 
-# B-74 (S1): string_agg ORDER BY
+# B-74: string_agg ORDER BY
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "function:string_agg"
 test string-agg-order-by {
@@ -793,7 +793,7 @@ expect {
     {4,3,2,1}
 }
 
-# B-76 (S2): ctid
+# B-76: ctid
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "syntax:system-column"
 test ctid {
@@ -805,7 +805,7 @@ expect {
 @sqlstate 42703
 expect @tursopg error {}
 
-# B-77 (S1): now() text format has offset and micros
+# B-77: now() text format has offset and micros
 @compat-gap "cast:timestamptz -> text"
 test now-text-format-has-offset-and-micros {
     SELECT now()::text LIKE '____-__-__ __:__:__.%+00';
@@ -817,7 +817,7 @@ expect @tursopg {
     0
 }
 
-# B-78 (S1): gen_random_uuid() format
+# B-78: gen_random_uuid() format
 @compat-gap "type:bool"
 test gen-random-uuid-format {
     SELECT gen_random_uuid()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
@@ -844,7 +844,7 @@ test current-setting-missing-ok {
 expect {
 }
 
-# B-81 (S2): pg_typeof
+# B-81: pg_typeof
 @compat-gap "function:pg_typeof"
 test pg-typeof {
     SELECT pg_typeof(1), pg_typeof(1.5), pg_typeof('a'::text), pg_typeof(true);
@@ -855,7 +855,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# B-82 (S1): integer division truncates
+# B-82: integer division truncates
 @compat-gap "type:numeric"
 test integer-division-truncates {
     SELECT 5 / 2, -7 / 2, 7 % 3, 5 / 2.0;
@@ -867,7 +867,7 @@ expect @tursopg {
     2|-3|1|2.5
 }
 
-# B-83 (S2): ^ is power
+# B-83: ^ is power
 @compat-gap "operator:float8 ^ float8"
 test caret-is-the-power-operator {
     SELECT 2 ^ 3;
@@ -886,7 +886,7 @@ expect {
     |a1
 }
 
-# B-85 (S1): float output
+# B-85: float output
 @compat-gap "type:float8"
 test float-output {
     SELECT 0.1::float8 + 0.2::float8, 1::float8 / 3, 1e300::float8 * 10;
@@ -931,7 +931,7 @@ expect {
     2|c
 }
 
-# B-90 (S1): count/sum/avg output
+# B-90: count/sum/avg output
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "type:numeric"
 test count-sum-avg-output {
@@ -944,7 +944,7 @@ expect @tursopg {
     4|45|15.0
 }
 
-# B-91 (S1): sum(numeric) keeps scale
+# B-91: sum(numeric) keeps scale
 @compat-gap "type:numeric"
 test sum-numeric-keeps-scale {
     CREATE TABLE v (x numeric);
@@ -958,7 +958,7 @@ expect @tursopg {
     3.3000000000000003
 }
 
-# B-92 (S2): date_trunc / extract
+# B-92: date_trunc / extract
 @compat-gap "function:date_trunc"
 test date-trunc-extract {
     SELECT date_trunc('day', '2026-10-08 12:34:56+00'::timestamptz), extract(year FROM '2026-10-08'::date), extract(epoch FROM '1970-01-02 00:00:00+00'::timestamptz);
@@ -977,7 +977,7 @@ expect {
     |3|a
 }
 
-# B-94 (S1): lower/upper non-ASCII
+# B-94: lower/upper non-ASCII
 @compat-gap "function:upper"
 test lower-upper-non-ascii {
     SELECT upper('äb'), lower('ÄB');
@@ -989,7 +989,7 @@ expect @tursopg {
     äB|Äb
 }
 
-# B-95 (S1): string comparison order
+# B-95: string comparison order
 @compat-gap "operator:text < text"
 test string-comparison-order {
     SELECT 'a' < 'B', 'B' < 'a';
@@ -1009,7 +1009,7 @@ expect {
     1|2
 }
 
-# B-97 (S1): current_user / current_role
+# B-97: current_user / current_role
 @compat-gap "type:bool"
 test current-user-current-role {
     SELECT current_user = current_role;
@@ -1029,7 +1029,7 @@ expect {
     a
 }
 
-# B-99 (S2): DELETE ... USING
+# B-99: DELETE ... USING
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "syntax:delete-using"
 test delete-using {
@@ -1041,7 +1041,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# B-100 (S2): TRUNCATE a, b
+# B-100: TRUNCATE a, b
 @compat-gap "syntax:truncate"
 test truncate-a-b {
     CREATE TABLE a (x int);
@@ -1075,7 +1075,7 @@ expect {
     1|new
 }
 
-# B-103 (S2): ON CONFLICT ON CONSTRAINT name
+# B-103: ON CONFLICT ON CONSTRAINT name
 @compat-gap "syntax:on-conflict"
 test on-conflict-on-constraint-name {
     CREATE TABLE u (id int, CONSTRAINT u_id_key UNIQUE (id));
@@ -1105,7 +1105,7 @@ expect {
     z|0
 }
 
-# B-106 (S1): boolean comparison output
+# B-106: boolean comparison output
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "type:bool"
 test boolean-comparison-output {
@@ -1118,7 +1118,7 @@ expect @tursopg {
     1|0
 }
 
-# B-107 (S1): EXISTS subquery output
+# B-107: EXISTS subquery output
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "type:bool"
 test exists-subquery-output {
@@ -1140,7 +1140,7 @@ expect {
     2
 }
 
-# B-120 (S2): jsonb_array_elements
+# B-120: jsonb_array_elements
 @compat-gap "function:jsonb_array_elements"
 test jsonb-array-elements {
     SELECT value FROM jsonb_array_elements('[1, {"a": 2}]');
@@ -1152,7 +1152,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# B-121 (S2): jsonb_each
+# B-121: jsonb_each
 @compat-gap "function:jsonb_each"
 test jsonb-each {
     SELECT key, value FROM jsonb_each('{"a": 1}');
@@ -1163,7 +1163,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# B-122 (S2): jsonb_set / || / - operators
+# B-122: jsonb_set / || / - operators
 @compat-gap "function:jsonb_set"
 test jsonb-set-operators {
     SELECT jsonb_set('{"a":1}', '{a}', '2'), '{"a":1}'::jsonb || '{"b":2}'::jsonb, '{"a":1,"b":2}'::jsonb - 'a';
@@ -1174,7 +1174,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-123 (S2): jsonb_typeof / jsonb_array_length
+# B-123: jsonb_typeof / jsonb_array_length
 @compat-gap "function:jsonb_typeof"
 test jsonb-typeof-jsonb-array-length {
     SELECT jsonb_typeof('[1]'), jsonb_array_length('[1,2]');
@@ -1194,7 +1194,7 @@ expect {
     2
 }
 
-# B-109 (S2): WITH ... INSERT ... RETURNING (data-modifying CTE)
+# B-109: WITH ... INSERT ... RETURNING (data-modifying CTE)
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "syntax:with-data-modifying-cte"
 test with-insert-returning-data-modifying-cte {
@@ -1224,7 +1224,7 @@ expect {
     t
 }
 
-# B-112 (S2): json_agg of row subquery
+# B-112: json_agg of row subquery
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 @compat-gap "function:json_agg"
 test json-agg-of-row-subquery {
@@ -1257,7 +1257,7 @@ expect {
     4
 }
 
-# B-115 (S2): text concat with typed values
+# B-115: text concat with typed values
 @compat-gap "operator:text || anynonarray"
 test text-concat-with-typed-values {
     SELECT 'id=' || 1::int || ' at ' || '2026-10-08'::date;
@@ -1268,7 +1268,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# B-116 (S1): to_char(timestamptz)
+# B-116: to_char(timestamptz)
 @compat-gap "function:to_char"
 test to-char-timestamptz {
     SELECT to_char('2026-10-08 12:00:00+00'::timestamptz, 'YYYY-MM-DD HH24:MI');
@@ -1279,7 +1279,7 @@ expect {
 expect @tursopg {
 }
 
-# B-124 (S2): 64 nested scalar subqueries
+# B-124: 64 nested scalar subqueries
 @compat-gap "syntax:nested-subquery"
 test nested-scalar-subqueries-64-deep {
     SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT 1))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))));
@@ -1290,7 +1290,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-126 (S2): auth.role() reads the role claim
+# B-126: auth.role() reads the role claim
 @setup auth_role_from_claims_on_postgres
 @compat-gap "syntax:create-function"
 test auth-role-reads-the-role-claim {
@@ -1304,7 +1304,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# B-127 (S1): ->> of a JSON boolean is the text true
+# B-127: ->> of a JSON boolean is the text true
 @compat-gap "operator:jsonb ->> text"
 test of-a-json-boolean-is-the-text-true {
     SELECT '{"a": true}'::jsonb ->> 'a', '{"a": true}'::jsonb ->> 'a' <> 'true';
@@ -1316,7 +1316,7 @@ expect @tursopg {
     1|1
 }
 
-# B-128 (S1): jsonb || concatenates two objects
+# B-128: jsonb || concatenates two objects
 # B-122 also uses ||. After a fix, the output still differs because of A-45.
 @compat-gap "operator:jsonb || jsonb"
 test jsonb-concatenates-two-objects {
@@ -1329,7 +1329,7 @@ expect @tursopg {
     {"a":1}{"b":2}
 }
 
-# B-129 (S1): jsonb - removes a key
+# B-129: jsonb - removes a key
 # B-122 also uses -. After a fix, the output still differs because of A-45.
 @compat-gap "operator:jsonb - text"
 test jsonb-removes-a-key {
@@ -1342,7 +1342,7 @@ expect @tursopg {
     0
 }
 
-# B-130 (S2): 16 nested scalar subqueries
+# B-130: 16 nested scalar subqueries
 # Same cause as B-124. tursopg accepts 15 levels, so this is the first depth that fails.
 @compat-gap "syntax:nested-subquery"
 test nested-scalar-subqueries-16-deep {
@@ -1354,7 +1354,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-131 (S2): pg_options_to_table with a column alias list
+# B-131: pg_options_to_table with a column alias list
 @compat-gap "function:pg_options_to_table"
 test pg-options-to-table-with-a-column-alias-list {
     SELECT o.k, o.v FROM pg_options_to_table(ARRAY['a=1']) AS o(k, v);
@@ -1365,7 +1365,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# B-132 (S2): pg_size_pretty
+# B-132: pg_size_pretty
 @compat-gap "function:pg_size_pretty"
 test pg-size-pretty {
     SELECT pg_size_pretty(8192::bigint), pg_size_pretty(10485760::bigint);

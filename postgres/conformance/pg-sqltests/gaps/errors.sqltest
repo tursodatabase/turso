@@ -26,7 +26,7 @@ setup t_id {
     CREATE TABLE t (id int);
 }
 
-# D-01 (S1): FK not enforced by default
+# D-01: FK not enforced by default
 # D-02 had the same SQL. This test covers it.
 @setup parent_id_child_id_pid_with_rows
 @compat-gap "syntax:foreign-key"
@@ -38,7 +38,7 @@ expect error {}
 expect @tursopg {
 }
 
-# D-03 (S1): FK violation on update child
+# D-03: FK violation on update child
 # Fails while foreign keys are off, see D-01.
 @setup parent_id_child_id_pid_with_rows
 @compat-gap "syntax:foreign-key"
@@ -50,7 +50,7 @@ expect error {}
 expect @tursopg {
 }
 
-# D-04 (S1): FK violation on delete parent
+# D-04: FK violation on delete parent
 # Fails while foreign keys are off, see D-01.
 @setup parent_id_child_id_pid_with_rows
 @compat-gap "syntax:foreign-key"
@@ -62,7 +62,7 @@ expect error {}
 expect @tursopg {
 }
 
-# D-05 (S1): ON DELETE CASCADE
+# D-05: ON DELETE CASCADE
 # Fails while foreign keys are off, see D-01.
 @compat-gap "syntax:foreign-key"
 test on-delete-cascade {
@@ -80,7 +80,7 @@ expect @tursopg {
     1
 }
 
-# D-06 (S1): ON DELETE SET NULL
+# D-06: ON DELETE SET NULL
 # Fails while foreign keys are off, see D-01.
 @compat-gap "syntax:foreign-key"
 test on-delete-set-null {
@@ -98,7 +98,7 @@ expect @tursopg {
     1|1
 }
 
-# D-07 (S1): ON UPDATE CASCADE
+# D-07: ON UPDATE CASCADE
 # Fails while foreign keys are off, see D-01.
 @compat-gap "syntax:foreign-key"
 test on-update-cascade {
@@ -116,7 +116,7 @@ expect @tursopg {
     1
 }
 
-# D-08 (S1): FK to non-PK unique column
+# D-08: FK to non-PK unique column
 # Fails while foreign keys are off, see D-01.
 @compat-gap "syntax:foreign-key"
 test fk-to-non-pk-unique-column {
@@ -244,7 +244,7 @@ test domain-check-violation {
 @sqlstate 23514
 expect error {}
 
-# D-22 (S3): invalid int into int column
+# D-22: invalid int into int column
 @setup t_n
 @compat-gap "type:int4"
 test invalid-int-into-int-column {
@@ -255,7 +255,7 @@ expect error {}
 @sqlstate 23000
 expect @tursopg error {}
 
-# D-23 (S3): invalid uuid into uuid column
+# D-23: invalid uuid into uuid column
 @compat-gap "type:uuid"
 test invalid-uuid-into-uuid-column {
     CREATE TABLE t (u uuid);
@@ -282,7 +282,7 @@ test invalid-json-into-jsonb-column {
 @sqlstate 22P02
 expect error {}
 
-# D-26 (S3): invalid bool into bool column
+# D-26: invalid bool into bool column
 @compat-gap "type:bool"
 test invalid-bool-into-bool-column {
     CREATE TABLE t (b boolean);
@@ -322,7 +322,7 @@ test varchar-n-too-long {
 @sqlstate 22001
 expect error {}
 
-# D-31 (S3): char(n) too long
+# D-31: char(n) too long
 @compat-gap "type:bpchar"
 test char-n-too-long {
     CREATE TABLE t (s char(3));
@@ -333,7 +333,7 @@ expect error {}
 @sqlstate 0A000
 expect @tursopg error {}
 
-# D-32 (S3): numeric(p,s) overflow
+# D-32: numeric(p,s) overflow
 @compat-gap "type:numeric"
 test numeric-p-s-overflow {
     CREATE TABLE t (n numeric(5,2));
@@ -344,7 +344,7 @@ expect error {}
 @sqlstate 23000
 expect @tursopg error {}
 
-# D-33 (S1): int4 column overflow
+# D-33: int4 column overflow
 @setup t_n
 @compat-gap "type:int4"
 test int4-column-overflow {
@@ -425,7 +425,7 @@ test write-in-read-only-transaction {
 @sqlstate 25006
 expect error {}
 
-# D-44 (S1): unknown type in cast
+# D-44: unknown type in cast
 @compat-gap "syntax:type-name"
 test unknown-type-in-cast {
     SELECT 1::nosuchtype;
@@ -436,7 +436,7 @@ expect @tursopg {
     1
 }
 
-# D-45 (S3): wrong arg type to function
+# D-45: wrong arg type to function
 @compat-gap "function:lower"
 test wrong-arg-type-to-function {
     SELECT lower(1, 2);
@@ -471,7 +471,7 @@ test check-named-column-level {
 @sqlstate 23514
 expect error {}
 
-# D-48 (S1): RAISE-style error via invalid regex
+# D-48: RAISE-style error via invalid regex
 @compat-gap "operator:text ~ text"
 test raise-style-error-via-invalid-regex {
     SELECT 'a' ~ '(';

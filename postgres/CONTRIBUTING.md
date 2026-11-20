@@ -42,7 +42,7 @@ feature the translator drops produces wrong results, not an error.
 A known gap is a case where tursopg gives a different result than PostgreSQL. Each gap is a test with an ID, for example `E-19`.
 
 - Gap tests are in [`conformance/pg-sqltests/gaps/`](conformance/pg-sqltests/gaps/), one file per category: `params-casts` (A), `operators-functions` (B), `output-formats` (C), `errors` (D), `ddl-catalog` (E).
-- A test name is a short title in lower case, for example `int4-overflow-literal-cast`. The comment line above it gives the gap ID and the title. An open gap also gives its severity, for example `# A-07 (S1): int4 overflow literal cast`. When you fix a gap, remove the severity.
+- A test name is a short title in lower case, for example `int4-overflow-literal-cast`. The comment line above it gives the gap ID and the title, for example `# A-07: int4 overflow literal cast`.
 - Tests that share setup statements use a named `setup` block and `@setup`.
 - The default `expect` block is the PostgreSQL result. `make -C postgres/conformance run-postgres` checks it.
 - A gap test has a `@compat-gap "<kind>:<object>"` label and an `expect @tursopg` block with the current tursopg result. `make -C postgres/conformance run` checks it. The label names the PostgreSQL function, type, operator, cast or syntax form that the fix changes, for example `function:age`, `type:int4`, `operator:jsonb @> jsonb`, `cast:timestamptz -> date` or `syntax:on-conflict`. [`testing/sqltest/docs/dsl-spec.md`](../testing/sqltest/docs/dsl-spec.md) gives the rules.
@@ -55,17 +55,6 @@ A known gap is a case where tursopg gives a different result than PostgreSQL. Ea
 - A test without an `@tursopg` block matches PostgreSQL. It is a regression test.
 - `run-postgres` needs a server with the `en_US.UTF-8` locale, which is the default of the Docker image. B-12, B-74, B-94 and B-95 give different results with the `C` locale or an ICU locale.
 - Cases that need bound parameters, a database reopen, two commands in one prepared statement, MVCC, or a query after a failed statement are in [`tests/integration/postgres/gaps.rs`](tests/integration/postgres/gaps.rs), named `gap_<id>_<short_title>`. A test of a gap that matches PostgreSQL asserts the PostgreSQL result. A test of an open gap is named `gap_<id>_tursopg_returns_wrong_result_<short_title>` and asserts the current wrong tursopg result, with the PostgreSQL result in a comment above it. When you fix the gap, its test fails: change the assert to the PostgreSQL result and remove `tursopg_returns_wrong_result` from the name. Run them with `cargo test -p turso_pg_tests --test integration_tests gaps::`.
-
-Severity:
-
-| Severity | Meaning |
-|----------|---------|
-| S1 | Wrong result or wrong data, with no error |
-| S2 | Error where PostgreSQL succeeds |
-| S3 | Wrong error code or message |
-| S4 | Catalog or metadata gap |
-
-A catalog or metadata gap is S4, even when tursopg returns an error or no rows.
 
 ## Running the upstream regression suite
 
