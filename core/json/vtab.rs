@@ -13,7 +13,7 @@ use crate::{
         vtab::columns::{Columns, Key},
         Conv,
     },
-    types::AsValueRef,
+    types::{AsValueRef, Text, TextSubtype},
     vtab::{column_definition, InternalVirtualTable, InternalVirtualTableCursor},
     Connection, LimboError, Value,
 };
@@ -376,6 +376,57 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             _ => Value::Null,
         })
     }
+
+    /// Writes the text columns into the buffer of `value` when `value` is a
+    /// text: the key of an object member, the fullkey and path columns, and
+    /// the value and atom columns of a string with no escape. The other
+    /// columns are the values of [Self::column].
+    fn column_into(&self, idx: usize, value: &mut Value) -> Result<(), LimboError> {
+        // Only a text with a buffer of its own has a buffer to write into.
+        if !matches!(
+            value,
+            Value::Text(Text {
+                value: Cow::Owned(_),
+                ..
+            })
+        ) {
+            *value = self.column(idx)?;
+            return Ok(());
+        }
+        let path = &self.path_to_current_value.string;
+        let text = match idx {
+            COL_VALUE | COL_ATOM => self.columns.plain_string(),
+            COL_KEY => self.columns.key_name(self.path_to_current_value.key()),
+            COL_FULLKEY => Some(Cow::Borrowed(self.columns.fullkey_text(path))),
+            COL_PATH => Some(Cow::Borrowed(self.columns.path_text(path))),
+            _ => None,
+        };
+        match text {
+            Some(text) => set_text(value, text.as_ref()),
+            None => {
+                *value = self.column(idx)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Makes `value` the text `text`, in the buffer of `value` when `value` is a
+/// text with a buffer of its own.
+fn set_text(value: &mut Value, text: &str) -> Result<(), LimboError> {
+    if let Value::Text(Text {
+        value: Cow::Owned(buffer),
+        subtype,
+    }) = value
+    {
+        buffer.clear();
+        buffer.try_reserve(text.len())?;
+        buffer.push_str(text);
+        *subtype = TextSubtype::Text;
+        return Ok(());
+    }
+    *value = Value::Text(Text::new(text.to_owned()));
+    Ok(())
 }
 
 impl JsonEachCursor {
@@ -541,6 +592,7 @@ mod columns {
         types::Text,
         LimboError, Value,
     };
+    use std::borrow::Cow;
 
     #[derive(Debug, Clone, Copy)]
     pub(super) enum Key<'a> {
@@ -620,6 +672,21 @@ mod columns {
             })
         }
 
+        /// The text of the value of the current row, when the value is a string
+        /// with no escape. The value and atom columns are this text.
+        pub(super) fn plain_string(&self) -> Option<Cow<'_, str>> {
+            jsonb::plain_string_payload(self.value.as_bytes()).map(jsonb::utf8_lossy)
+        }
+
+        /// The key column, when it is the name of an object member.
+        /// `last_element` is the last element of the path of the cursor.
+        pub(super) fn key_name<'a>(&self, last_element: Key<'a>) -> Option<Cow<'a, str>> {
+            match last_element {
+                Key::String(name) if self.has_key => Some(Cow::Borrowed(name)),
+                _ => None,
+            }
+        }
+
         /// `last_element` is the last element of the path of the cursor.
         pub(super) fn key(&self, last_element: Key<'_>) -> Value {
             if self.has_key {
@@ -673,15 +740,22 @@ mod columns {
 
         /// `path` is the path of the cursor.
         pub(super) fn fullkey(&self, path: &str) -> Value {
-            Value::Text(Text::new(path_prefix(path, self.fullkey_len)))
+            Value::Text(Text::new(self.fullkey_text(path).to_owned()))
+        }
+
+        /// The text of the fullkey column. `path` is the path of the cursor.
+        pub(super) fn fullkey_text<'a>(&self, path: &'a str) -> &'a str {
+            path_prefix(path, self.fullkey_len)
         }
 
         /// `path` is the path of the cursor.
         pub(super) fn path(&self, path: &str) -> Value {
-            Value::Text(Text::new(path_prefix(
-                path,
-                self.innermost_container_path_len,
-            )))
+            Value::Text(Text::new(self.path_text(path).to_owned()))
+        }
+
+        /// The text of the path column. `path` is the path of the cursor.
+        pub(super) fn path_text<'a>(&self, path: &'a str) -> &'a str {
+            path_prefix(path, self.innermost_container_path_len)
         }
 
         pub(super) fn parent(&self) -> Value {
@@ -716,8 +790,8 @@ mod columns {
 
     /// The first `len` bytes of the path of the cursor. The lengths come from
     /// the path itself, so they are in range while the cursor is on a row.
-    fn path_prefix(path: &str, len: usize) -> String {
-        path.get(..len).unwrap_or_default().to_owned()
+    fn path_prefix(path: &str, len: usize) -> &str {
+        path.get(..len).unwrap_or_default()
     }
 }
 
@@ -921,5 +995,53 @@ impl InPlaceJsonPath {
             LastElement::Name => Key::String(&self.last_name),
             LastElement::None => Key::None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The buffer of a text value, or None for other values.
+    fn text_buffer(value: &Value) -> Option<*const u8> {
+        match value {
+            Value::Text(Text {
+                value: Cow::Owned(text),
+                ..
+            }) => Some(text.as_ptr()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn column_into_writes_the_column_into_the_buffer_of_the_register() {
+        let mut cursor = JsonEachCursor::empty(JsonTraversalMode::Tree);
+        let doc = Value::build_text(r#"{"a":"x","bb":["yy",1,{"c":null}],"d":"e\"f","é":2.5}"#);
+        assert!(cursor.filter(&[doc], None, 0).unwrap());
+        let mut values: Vec<Value> = (0..COL_JSON)
+            .map(|_| Value::build_text(String::with_capacity(64)))
+            .collect();
+        let fullkey_buffer = text_buffer(&values[COL_FULLKEY]);
+        let mut rows = 0;
+        loop {
+            for (column, value) in values.iter_mut().enumerate() {
+                cursor.column_into(column, value).unwrap();
+                let expected = cursor.column(column).unwrap();
+                assert_eq!(*value, expected, "row {rows}, column {column}");
+                if let (Value::Text(value), Value::Text(expected)) = (&*value, &expected) {
+                    assert_eq!(
+                        value.subtype, expected.subtype,
+                        "row {rows}, column {column}"
+                    );
+                }
+            }
+            // The fullkey column is a text on each row, so it keeps its buffer.
+            assert_eq!(text_buffer(&values[COL_FULLKEY]), fullkey_buffer);
+            rows += 1;
+            if !cursor.next().unwrap() {
+                break;
+            }
+        }
+        assert_eq!(rows, 9);
     }
 }

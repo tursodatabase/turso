@@ -1577,12 +1577,14 @@ pub fn op_vcolumn(
         },
         insn
     );
-    let value = {
-        let cursor = state.get_cursor(*cursor_id);
+    {
+        let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_virtual_mut();
-        return_if_io!(state, cursor.column(*column))
-    };
-    state.registers[*dest].set_value(value);
+        return_if_io!(
+            state,
+            cursor.column_into(*column, &mut state.registers[*dest])
+        );
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

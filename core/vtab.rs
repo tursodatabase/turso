@@ -343,6 +343,25 @@ impl VirtualTableCursor {
         })
     }
 
+    /// Writes the value of `column` into the register `dest`. An internal
+    /// cursor writes it into the value of the register, with
+    /// [InternalVirtualTableCursor::column_into].
+    pub(crate) fn column_into(&mut self, column: usize, dest: &mut Register) -> IOResultOr<()> {
+        if let (false, VirtualTableCursorInner::Internal(cursor), Register::Value(value)) =
+            (self.null_flag, &self.inner, &mut *dest)
+        {
+            cursor.read().column_into(column, value)?;
+            return Ok(IOResult::Done(()));
+        }
+        match self.column(column)? {
+            IOResult::Done(value) => {
+                dest.set_value(value);
+                Ok(IOResult::Done(()))
+            }
+            IOResult::IO(io) => Ok(IOResult::IO(io)),
+        }
+    }
+
     pub fn column(&mut self, column: usize) -> IOResultOr<Value> {
         if self.null_flag {
             return Ok(IOResult::Done(Value::Null));
@@ -713,6 +732,14 @@ pub trait InternalVirtualTableCursor: Send + Sync {
     fn next(&mut self) -> Result<bool, LimboError>;
     fn rowid(&self) -> i64;
     fn column(&self, column: usize) -> Result<Value, LimboError>;
+    /// Writes the value of `column` into `value`, the value that the register
+    /// of the column holds. A cursor can write a text value into the buffer of
+    /// `value`, so that each row does not allocate a new string. The default
+    /// replaces `value` with the value of [Self::column].
+    fn column_into(&self, column: usize, value: &mut Value) -> Result<(), LimboError> {
+        *value = self.column(column)?;
+        Ok(())
+    }
     fn filter(
         &mut self,
         args: &[Value],
