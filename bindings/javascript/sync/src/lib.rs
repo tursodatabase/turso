@@ -258,36 +258,29 @@ impl SyncEngine {
             }
         };
         let mut experimental = opts.experimental.clone().unwrap_or_default();
-        let encryption = opts
-            .remote_encryption_cipher
-            .as_deref()
-            .filter(|cipher| {
-                opts.local_encryption_key.is_some()
-                    || !matches!(*cipher, "chacha20poly1305" | "chacha20-poly1305")
-            })
-            .map(|cipher| {
-                let cipher = turso_core::CipherMode::try_from(cipher)
-                    .map_err(|error| napi::Error::from_reason(error.to_string()))?;
-                let key = opts
-                    .local_encryption_key
-                    .as_deref()
-                    .map(turso_core::EncryptionKey::from_hex_string)
-                    .transpose()
-                    .map_err(|error| napi::Error::from_reason(error.to_string()))?;
-                turso_sync_engine::sync_encryption::SyncEncryption::new(cipher, key)
-                    .map_err(|error| napi::Error::from_reason(error.to_string()))
-            })
-            .transpose()?;
-        if opts.local_encryption_key.is_some() && encryption.is_none() {
+        if opts.local_encryption_key.is_some() && opts.remote_encryption_cipher.is_none() {
             return Err(napi::Error::from_reason(
                 "local sync encryption requires a shared cipher",
             ));
         }
+        let local_encryption =
+            opts.local_encryption_key
+                .as_ref()
+                .map(|key| turso_core::EncryptionOpts {
+                    cipher: opts.remote_encryption_cipher.clone().unwrap(),
+                    hexkey: key.clone(),
+                });
+        let encryption = turso_sync_engine::sync_encryption::SyncEncryption::from_options(
+            opts.remote_encryption_cipher.as_deref(),
+            local_encryption.as_ref(),
+        )
+        .map_err(|error| napi::Error::from_reason(error.to_string()))?;
         if opts.local_encryption_key.is_some()
             && !experimental.iter().any(|value| value == "encryption")
         {
             experimental.push("encryption".into());
         }
+
         let db_opts =
             turso_node::apply_experimental_features(turso_core::DatabaseOpts::new(), &experimental);
         #[allow(clippy::arc_with_non_send_sync)]
