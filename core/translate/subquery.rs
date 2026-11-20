@@ -1092,7 +1092,7 @@ fn get_subquery_parser<'a>(
                 )?;
                 let mut plan = plan;
                 read_in_subquery_columns_as_timestamps(
-                    &lhs,
+                    &mut lhs,
                     &mut plan,
                     referenced_tables,
                     resolver,
@@ -1245,71 +1245,88 @@ fn get_subquery_parser<'a>(
 }
 
 /// Compares each left-hand column of `x IN (SELECT ...)` with the subquery's
-/// column as `x = y` does when one of them is a timestamp or timestamptz. A
-/// string literal or parameter among the subquery's results is text, because
-/// PostgreSQL types it so in a select list: `ts IN (SELECT '2024-01-01')` is
-/// an error there. So is any other value that is known not to be a timestamp,
-/// as PostgreSQL has no operator `timestamp = text`. The ephemeral index orders
-/// its keys as timestamps and cannot order such a value.
+/// column as `x = y` does when one of them is a timestamp or timestamptz.
+/// [meet_timestamps] decides for each SELECT of the subquery:
+/// - A string literal or parameter among its results is text, because
+///   PostgreSQL types it so in a select list: `ts IN (SELECT '2024-01-01')` is
+///   an error there. So is any other value that is known not to be a
+///   timestamp, as PostgreSQL has no operator `timestamp = text`. The
+///   ephemeral index orders its keys as timestamps and cannot order such a
+///   value.
+/// - A value of type ANY or of no type is cast to the timestamp type, so that
+///   text that is not a timestamp fails with the cast's error. The same holds
+///   for such a value on the left.
 fn read_in_subquery_columns_as_timestamps(
-    lhs: &ast::Expr,
+    lhs: &mut ast::Expr,
     plan: &mut Plan,
     referenced_tables: &TableReferences,
     resolver: &Resolver,
 ) -> Result<()> {
-    use crate::translate::expr::expr_type::{
-        is_type_named, name_without_domains, query_column_type, ExprType,
+    use crate::translate::expr::expr_type::{name_without_domains, BuiltinType, ExprType};
+    use crate::translate::expr::{
+        cast_to, is_untyped_operand, meet_timestamps, type_meeting_timestamp, TimestampSide,
     };
-    use crate::translate::expr::{cannot_meet_timestamp, is_untyped_operand};
+    use crate::translate::select::cast_result_column;
     let schema = resolver.schema();
     if schema.type_registry.is_empty() {
         return Ok(());
     }
-    let lhs_columns: Vec<&ast::Expr> = match unwrap_parens(lhs)? {
-        ast::Expr::Parenthesized(exprs) => exprs.iter().map(|e| e.as_ref()).collect(),
+    let lhs_columns: Vec<&mut ast::Expr> = match lhs {
+        ast::Expr::Parenthesized(exprs) => exprs.iter_mut().map(|e| e.as_mut()).collect(),
         expr => vec![expr],
     };
     if lhs_columns.len() != plan.select_result_columns().len() {
         // Reported with the other column count errors.
         return Ok(());
     }
-    let is_timestamp = |ty: &ExprType| {
-        is_type_named(ty, "timestamp", schema) || is_type_named(ty, "timestamptz", schema)
-    };
     for (column, lhs_column) in lhs_columns.into_iter().enumerate() {
-        let lhs_type = type_of(lhs_column, &TypeEnv::new(Some(referenced_tables), resolver));
-        let rhs_type = query_column_type(plan, column, resolver);
-        let other = match (is_timestamp(&lhs_type), is_timestamp(&rhs_type)) {
-            (true, false) => rhs_type,
-            (false, true) => lhs_type,
-            _ => continue,
-        };
-        let mut has_untyped = false;
-        let mut check_arm = |arm: &SelectPlan| -> Result<()> {
-            has_untyped |= is_untyped_operand(&arm.result_columns[column].expr)?;
-            Ok(())
-        };
-        match &*plan {
-            Plan::Select(select) => check_arm(select)?,
+        let lhs_type = type_meeting_timestamp(
+            lhs_column,
+            type_of(lhs_column, &TypeEnv::new(Some(referenced_tables), resolver)),
+        )?;
+        let arms: Vec<&mut SelectPlan> = match plan {
+            Plan::Select(select) => vec![select.as_mut()],
             Plan::CompoundSelect {
                 left, right_most, ..
-            } => {
-                for (select, _) in left.iter() {
-                    check_arm(select)?;
+            } => left
+                .iter_mut()
+                .map(|(select, _)| select)
+                .chain(std::iter::once(right_most.as_mut()))
+                .collect(),
+            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => Vec::new(),
+        };
+        let mut lhs_cast = None;
+        for arm in arms {
+            let arm_type = match type_of(
+                &arm.result_columns[column].expr,
+                &TypeEnv::new(Some(&arm.table_references), resolver),
+            ) {
+                ExprType::Untyped => ExprType::Builtin(BuiltinType::Text),
+                ty => ty,
+            };
+            let types = [lhs_type.clone(), arm_type];
+            let Some((target, sides)) = meet_timestamps(&types, schema) else {
+                continue;
+            };
+            for (ty, side) in types.iter().zip(sides.iter()) {
+                if *side == TimestampSide::Error {
+                    crate::bail_parse_error!(
+                        "operator does not exist: timestamp and {}",
+                        name_without_domains(ty.clone(), schema)
+                    );
                 }
-                check_arm(right_most)?;
             }
-            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {}
+            // A string literal or parameter on the left is read as the type of
+            // the column it is compared with, where the comparison is compiled.
+            if sides[0] == TimestampSide::Cast && !is_untyped_operand(lhs_column)? {
+                lhs_cast = Some(target);
+            }
+            if sides[1] == TimestampSide::Cast {
+                cast_result_column(arm, column, target);
+            }
         }
-        if has_untyped || cannot_meet_timestamp(&other, schema) {
-            crate::bail_parse_error!(
-                "operator does not exist: timestamp and {}",
-                if has_untyped {
-                    "text".to_string()
-                } else {
-                    name_without_domains(other, schema)
-                }
-            );
+        if let Some(target) = lhs_cast {
+            cast_to(lhs_column, target);
         }
     }
     Ok(())

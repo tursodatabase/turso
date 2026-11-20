@@ -40,9 +40,7 @@ use turso_parser::ast::{
 use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
-use super::expr::expr_type::{
-    compound_column_type, type_of, type_ordering, BuiltinType, ExprType,
-};
+use super::expr::expr_type::{compound_column_type, type_of, type_ordering, BuiltinType, ExprType};
 
 /// Infer the affinity of a subquery result column from its expression.
 ///

@@ -14,7 +14,8 @@ use crate::{
         emitter::Resolver,
         expr::{
             expr_type::{query_column_type, type_of, type_ordering, ExprType},
-            row_value_component_expr, row_value_len,
+            meet_timestamps, row_value_component_expr, row_value_len, type_meeting_timestamp,
+            TimestampSide,
         },
         expr_context::{ExprContext, ExprProperties},
         plan::{Plan, SelectPlan, TableReferences},
@@ -694,7 +695,8 @@ fn common_ordering_of<'a, 'c, 's: 'c, C: Borrow<ExprContext<'c, 's>>>(
     let mut schema = None;
     for (expr, context) in exprs {
         let context: ExprContext<'c, 's> = *context.borrow();
-        types.push(type_of(expr, &context.type_env()));
+        let ty = type_of(expr, &context.type_env());
+        types.push(type_meeting_timestamp(expr, ty)?);
         schema.get_or_insert(context.schema());
     }
     match schema {
@@ -732,11 +734,14 @@ fn common_ordering(
     // that is not one (the text of a column, say) must not meet it: PostgreSQL
     // has no operator for it, and hashing or sorting it would be wrong.
     if let Some((TypeOrdering::Timestamp, _)) = found {
-        if let Some(other) = types
-            .iter()
-            .find(|ty| crate::translate::expr::cannot_meet_timestamp(ty, schema))
-        {
-            crate::bail_parse_error!("operator does not exist: timestamp and {other}");
+        if let Some((_, sides)) = meet_timestamps(types, schema) {
+            if let Some(other) = types
+                .iter()
+                .zip(sides)
+                .find_map(|(ty, side)| (side == TimestampSide::Error).then_some(ty))
+            {
+                crate::bail_parse_error!("operator does not exist: timestamp and {other}");
+            }
         }
     }
     match (found, array_of_unknown_elements) {

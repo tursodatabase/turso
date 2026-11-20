@@ -13,9 +13,9 @@ use crate::sync::Arc;
 use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
-    bind_and_rewrite_expr, cannot_meet_timestamp,
-    expr_contains_function_that_changes_within_statement, expr_vector_size, is_untyped_operand,
-    walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+    bind_and_rewrite_expr, cast_to, expr_contains_function_that_changes_within_statement,
+    expr_vector_size, meet_timestamps, type_meeting_timestamp, walk_expr, walk_expr_mut,
+    BindingBehavior, TimestampSide, WalkControl,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
@@ -302,7 +302,8 @@ pub(crate) fn prepare_select_plan_from_arms(
 }
 
 /// Gives each column of a compound SELECT that has a timestamp or timestamptz
-/// in one SELECT the type PostgreSQL gives it:
+/// in one SELECT the type PostgreSQL gives it, as [meet_timestamps] decides for
+/// each SELECT:
 /// - A timestamp is read as a timestamptz when a SELECT on the other side of
 ///   the UNION, INTERSECT or EXCEPT has a timestamptz in that column. The
 ///   conversion is in the session time zone, which is UTC in tursopg. Without
@@ -313,6 +314,8 @@ pub(crate) fn prepare_select_plan_from_arms(
 ///   SELECT '2024-01-01T10:00'` returns that timestamp. The order of the
 ///   column reads only the text a timestamp prints as, so an unconverted
 ///   literal in another form could not be ordered.
+/// - A value of type ANY or of no type is cast to the column's type, so that
+///   text that is not a timestamp fails with the cast's error.
 /// - Any other expression whose type is not a timestamp is an error, as in
 ///   PostgreSQL, because the compound would have to order it as a timestamp.
 fn convert_timestamps_in_compound(
@@ -321,56 +324,45 @@ fn convert_timestamps_in_compound(
     resolver: &Resolver,
 ) -> Result<()> {
     use crate::translate::expr::expr_type::{
-        common_of_types, is_type_named, name_without_domains, type_of, ExprType, TypeEnv,
+        is_type_named, name_without_domains, type_of, ExprType, TypeEnv,
     };
     let schema = resolver.schema();
     if schema.type_registry.is_empty() {
         return Ok(());
     }
-    // A domain over timestamp is a timestamp.
-    let is_timestamp = |ty: &ExprType| {
-        is_type_named(ty, "timestamp", schema) || is_type_named(ty, "timestamptz", schema)
-    };
     let num_columns = last.result_columns.len();
     let operators: Vec<ast::CompoundOperator> = left.iter().map(|(_, op)| *op).collect();
     let mut arms: Vec<&mut SelectPlan> = left.iter_mut().map(|(plan, _)| plan).collect();
     arms.push(last);
     for column in 0..num_columns {
-        let types: Vec<ExprType> = arms
+        let types = arms
             .iter()
             .map(|arm| {
-                type_of(
-                    &arm.result_columns[column].expr,
-                    &TypeEnv::new(Some(&arm.table_references), resolver),
-                )
+                let expr = &arm.result_columns[column].expr;
+                let ty = type_of(expr, &TypeEnv::new(Some(&arm.table_references), resolver));
+                type_meeting_timestamp(expr, ty)
             })
-            .collect();
-        if !types.iter().any(is_timestamp) {
+            .collect::<Result<Vec<ExprType>>>()?;
+        let Some((target, sides)) = meet_timestamps(&types, schema) else {
             continue;
-        }
-        // The column's type is the common type of the arms (see common_scalar_type).
-        let target = if is_type_named(
-            &common_of_types(types.iter().cloned(), schema),
-            "timestamptz",
-            schema,
-        ) {
-            "timestamptz"
-        } else {
-            "timestamp"
         };
-        for (i, (arm, ty)) in arms.iter_mut().zip(&types).enumerate() {
-            let expr = &arm.result_columns[column].expr;
-            if is_untyped_operand(expr)?
-                || (is_type_named(ty, "timestamp", schema) && target == "timestamptz")
-            {
-                cast_result_column(arm, column, target);
-            } else if cannot_meet_timestamp(ty, schema) {
-                let operator = operators.get(i).or_else(|| operators.last());
-                crate::bail_parse_error!(
-                    "{} types timestamp and {} cannot be matched",
-                    operator.map_or_else(String::new, |op| op.to_string()),
-                    name_without_domains(ty.clone(), schema)
-                );
+        for (i, (arm, (ty, side))) in arms.iter_mut().zip(types.iter().zip(sides)).enumerate() {
+            match side {
+                TimestampSide::Cast => cast_result_column(arm, column, target),
+                TimestampSide::Timestamp
+                    if target == "timestamptz" && is_type_named(ty, "timestamp", schema) =>
+                {
+                    cast_result_column(arm, column, target)
+                }
+                TimestampSide::Error => {
+                    let operator = operators.get(i).or_else(|| operators.last());
+                    crate::bail_parse_error!(
+                        "{} types timestamp and {} cannot be matched",
+                        operator.map_or_else(String::new, |op| op.to_string()),
+                        name_without_domains(ty.clone(), schema)
+                    );
+                }
+                TimestampSide::Timestamp | TimestampSide::Skip => {}
             }
         }
     }
@@ -387,18 +379,7 @@ pub(crate) fn cast_result_column(arm: &mut SelectPlan, column: usize, type_name:
     if result_column.alias.is_none() {
         result_column.implicit_column_name = name;
     }
-    let expr = std::mem::replace(
-        &mut result_column.expr,
-        ast::Expr::Literal(ast::Literal::Null),
-    );
-    result_column.expr = ast::Expr::cast(
-        expr,
-        Some(ast::Type {
-            name: type_name.to_string(),
-            size: None,
-            array_dimensions: 0,
-        }),
-    );
+    cast_to(&mut result_column.expr, type_name);
 }
 
 #[allow(clippy::too_many_arguments)]

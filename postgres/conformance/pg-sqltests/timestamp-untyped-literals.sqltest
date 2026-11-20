@@ -280,3 +280,83 @@ expect {
     2024-01-02 09:00:00
     2024-01-03 08:30:00
 }
+
+# PostgreSQL types an expression that yields a string literal, such as CASE,
+# coalesce or a scalar subquery, as text. Only a literal that is itself the
+# operand or the select item is unknown-typed.
+
+@setup tslit
+test ts-lit-union-case-literal-errors {
+    SELECT ts FROM m UNION SELECT CASE WHEN true THEN '2024-01-01T10:00' END;
+}
+@sqlstate 42804
+expect error {
+    UNION types timestamp without time zone and text cannot be matched
+}
+expect @tursopg error {
+    UNION types timestamp and text cannot be matched
+}
+
+@setup tslit
+test ts-lit-union-coalesce-literal-errors {
+    SELECT ts FROM m UNION SELECT coalesce('2024-01-01', '2024-01-02');
+}
+@sqlstate 42804
+expect error {
+    UNION types timestamp without time zone and text cannot be matched
+}
+expect @tursopg error {
+    UNION types timestamp and text cannot be matched
+}
+
+@setup tslit
+test ts-lit-union-scalar-subquery-literal-errors {
+    SELECT ts FROM m UNION SELECT (SELECT 'zzz');
+}
+@sqlstate 42804
+expect error {
+    UNION types timestamp without time zone and text cannot be matched
+}
+expect @tursopg error {
+    UNION types timestamp and text cannot be matched
+}
+
+@setup tslit
+test ts-lit-in-list-case-literal-errors {
+    SELECT id FROM m WHERE ts IN (CASE WHEN true THEN '2024-01-01 10:00' END);
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp without time zone = text
+}
+expect @tursopg error {
+    operator does not exist: timestamp and text
+}
+
+@setup tslit
+test ts-lit-compare-coalesce-literal-errors {
+    SELECT id FROM m WHERE ts = coalesce('2024-01-01 10:00', 'x');
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp without time zone = text
+}
+expect @tursopg error {
+    operator does not exist: timestamp and text
+}
+
+@setup tslit
+test ts-lit-compare-parenthesized-literal {
+    SELECT id FROM m WHERE ts = ('2024-01-01 10:00') ORDER BY id;
+}
+expect {
+    1
+}
+
+@setup tslit
+test ts-lit-between-literals {
+    SELECT id FROM m WHERE ts BETWEEN '2024-01-01T09:00' AND '2024-01-01T11:00' ORDER BY id;
+}
+expect {
+    1
+}

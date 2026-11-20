@@ -1239,6 +1239,65 @@ mod tests {
         );
     }
 
+    /// A value of unknown type, such as a column without a declared type, may
+    /// hold any text. Where it meets a timestamp it is cast to it, so text that
+    /// is a timestamp matches and other text is an error, not a panic in the
+    /// order of timestamps. PostgreSQL has no such column, so this is not a
+    /// conformance test.
+    #[test]
+    fn test_untyped_column_meeting_timestamp_is_cast() {
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id integer, ts timestamp) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, '2024-01-01 10:00:00'), (2, '2024-01-02 09:00:00')")
+            .unwrap();
+        conn.execute("CREATE TABLE good(v)").unwrap();
+        conn.execute("INSERT INTO good VALUES ('2024-01-01T10:00')")
+            .unwrap();
+        conn.execute("CREATE TABLE bad(v)").unwrap();
+        conn.execute("INSERT INTO bad VALUES ('zzz')").unwrap();
+
+        let union = "SELECT ts FROM t UNION SELECT v FROM {} ORDER BY 1";
+        let statements = [
+            (
+                "union",
+                union,
+                vec!["2024-01-01 10:00:00", "2024-01-02 09:00:00"],
+            ),
+            (
+                "in",
+                "SELECT CAST(id AS text) FROM t WHERE ts IN (SELECT v FROM {}) ORDER BY 1",
+                vec!["1"],
+            ),
+            (
+                "join",
+                "SELECT CAST(t.id AS text) FROM t JOIN {0} ON t.ts = {0}.v ORDER BY 1",
+                vec!["1"],
+            ),
+            (
+                "compare",
+                "SELECT CAST(t.id AS text) FROM t, {0} WHERE t.ts = {0}.v ORDER BY 1",
+                vec!["1"],
+            ),
+        ];
+        for (name, template, expected) in statements {
+            let sql = |table: &str| template.replace("{}", table).replace("{0}", table);
+            let rows: Vec<(String,)> = conn.exec_rows(&sql("good"));
+            let expected: Vec<(String,)> = expected.iter().map(|s| (s.to_string(),)).collect();
+            assert_eq!(rows, expected, "{name}");
+
+            let result = conn
+                .prepare(sql("bad"))
+                .and_then(|mut stmt| stmt.run_with_row_callback(|_| Ok(())));
+            assert_that!(result)
+                .err()
+                .display_string()
+                .contains("timestamp");
+        }
+    }
+
     /// A failed `CREATE TYPE` must not leave `__turso_internal_types` behind: the types table is
     /// registered in the connection schema before the type SQL is parsed, and the rollback
     /// restores that schema only when the schema cookie was set beforehand.

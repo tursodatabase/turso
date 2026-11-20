@@ -106,7 +106,10 @@ pub use condition::translate_condition_expr;
 pub(crate) use custom_type_operators::{
     check_custom_operator, custom_operator_call, emit_operator_call_on_registers,
 };
-pub(crate) use custom_types::{cannot_meet_timestamp, is_untyped_operand, read_untyped_operand_as};
+pub(crate) use custom_types::{
+    cast_to, cast_unknown_timestamp_operands, is_untyped_operand, meet_timestamps,
+    read_untyped_operand_as, type_meeting_timestamp, TimestampSide,
+};
 pub(crate) use custom_types::{
     emit_constraint_values_decode, emit_decode, emit_dml_expr_index_value,
     emit_encode_for_comparison, emit_store_value, emit_trigger_decode_registers, emit_type_expr,

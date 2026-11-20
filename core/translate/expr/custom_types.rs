@@ -498,25 +498,75 @@ pub(crate) fn is_untyped_operand(expr: &ast::Expr) -> Result<bool> {
     })
 }
 
-/// Whether a value of type `ty` is known to be something PostgreSQL has no
-/// timestamp operator for: text, a number, an array or a custom type other
-/// than timestamp, timestamptz and date, which converts to a timestamp. A
-/// value of unknown type (an ANY column) is not, because it may hold a
-/// timestamp.
-pub(crate) fn cannot_meet_timestamp(ty: &ExprType, schema: &crate::schema::Schema) -> bool {
+/// What a value does when it meets a timestamp or timestamptz in one order,
+/// as [meet_timestamps] decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimestampSide {
+    /// A timestamp, timestamptz or date, which converts to the order's type.
+    Timestamp,
+    /// A value whose type is not known here: a string literal or parameter
+    /// that PostgreSQL reads as a timestamp, or a value of type ANY or of no
+    /// type, which may hold text. Cast it to the target type, so that text
+    /// that is not a timestamp fails with the cast's error instead of
+    /// reaching the order, which reads only timestamps.
+    Cast,
+    /// Text, a number, an array or a custom type other than the timestamps and
+    /// date: PostgreSQL has no operator for it.
+    Error,
+    /// NULL, a row value, or a value whose type is known only after planning.
+    Skip,
+}
+
+/// How values of `types`, which are compared, ordered or matched with each
+/// other, meet a timestamp: the type they take, `"timestamp"` or
+/// `"timestamptz"` when any of them is one, and what each does. None when no
+/// type is a timestamp.
+pub(crate) fn meet_timestamps(
+    types: &[ExprType],
+    schema: &crate::schema::Schema,
+) -> Option<(&'static str, Vec<TimestampSide>)> {
     use super::expr_type::{is_type_named, BuiltinType};
-    match ty {
-        ExprType::Builtin(BuiltinType::Any) => false,
-        ExprType::Custom { .. } => ["timestamp", "timestamptz", "date"]
-            .iter()
-            .all(|name| !is_type_named(ty, name, schema)),
-        ExprType::Builtin(_) | ExprType::Array { .. } => true,
-        ExprType::Untyped
-        | ExprType::Null
-        | ExprType::Unknown
-        | ExprType::RowValue
-        | ExprType::NotKnownYet => false,
+    let is_timestamp = |ty: &ExprType| {
+        is_type_named(ty, "timestamp", schema) || is_type_named(ty, "timestamptz", schema)
+    };
+    if !types.iter().any(is_timestamp) {
+        return None;
     }
+    let target = if types
+        .iter()
+        .any(|ty| is_type_named(ty, "timestamptz", schema))
+    {
+        "timestamptz"
+    } else {
+        "timestamp"
+    };
+    let sides = types
+        .iter()
+        .map(|ty| match ty {
+            ExprType::Custom { .. } if is_timestamp(ty) || is_type_named(ty, "date", schema) => {
+                TimestampSide::Timestamp
+            }
+            ExprType::Builtin(BuiltinType::Any) | ExprType::Untyped | ExprType::Unknown => {
+                TimestampSide::Cast
+            }
+            ExprType::Null | ExprType::RowValue | ExprType::NotKnownYet => TimestampSide::Skip,
+            ExprType::Custom { .. } | ExprType::Builtin(_) | ExprType::Array { .. } => {
+                TimestampSide::Error
+            }
+        })
+        .collect();
+    Some((target, sides))
+}
+
+/// The type of `expr` as a value that meets a timestamp. Only a string
+/// literal or a parameter is untyped: PostgreSQL types any other expression
+/// that yields a string literal, such as `CASE WHEN c THEN 'a' END`, as text.
+pub(crate) fn type_meeting_timestamp(expr: &ast::Expr, ty: ExprType) -> Result<ExprType> {
+    use super::expr_type::BuiltinType;
+    Ok(match ty {
+        ExprType::Untyped if !is_untyped_operand(expr)? => ExprType::Builtin(BuiltinType::Text),
+        ty => ty,
+    })
 }
 
 /// Whether a string literal or parameter compared with a value of `resolved`
@@ -979,5 +1029,83 @@ pub(crate) fn emit_constraint_values_decode(
         }
         info.violation_regs[i] = decoded_reg;
     }
+    Ok(())
+}
+
+/// Wraps `expr` in a CAST to the type `type_name`.
+pub(crate) fn cast_to(expr: &mut ast::Expr, type_name: &str) {
+    let operand = std::mem::replace(expr, ast::Expr::Literal(ast::Literal::Null));
+    *expr = ast::Expr::cast(
+        operand,
+        Some(ast::Type {
+            name: type_name.to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    );
+}
+
+/// Casts a value of type ANY or of no type that is compared with a timestamp
+/// or timestamptz to it, in a comparison, BETWEEN, IN list or `CASE x WHEN`
+/// of `expr`: [meet_timestamps] says which operands. Text in such a value
+/// then fails with the cast's error where the comparison is evaluated,
+/// instead of reaching a hash join or an index, whose keys are timestamps.
+/// A string literal or parameter is read as a timestamp where the comparison
+/// is compiled, and a row value is compared element by element.
+pub(crate) fn cast_unknown_timestamp_operands(
+    expr: &mut ast::Expr,
+    tables: Option<&TableReferences>,
+    resolver: &Resolver<'_>,
+) -> Result<()> {
+    let schema = resolver.schema();
+    if schema.type_registry.is_empty() {
+        return Ok(());
+    }
+    let env = TypeEnv::new(tables, resolver);
+    let cast_pair = |a: &mut ast::Expr, b: &mut ast::Expr| -> Result<()> {
+        if row_value_len(a)?.max(row_value_len(b)?) > 1 {
+            return Ok(());
+        }
+        let types = [
+            type_meeting_timestamp(a, type_of(a, &env))?,
+            type_meeting_timestamp(b, type_of(b, &env))?,
+        ];
+        let Some((target, sides)) = meet_timestamps(&types, schema) else {
+            return Ok(());
+        };
+        for (operand, side) in [a, b].into_iter().zip(sides) {
+            if side == TimestampSide::Cast && !is_untyped_operand(operand)? {
+                cast_to(operand, target);
+            }
+        }
+        Ok(())
+    };
+    walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
+        match expr {
+            ast::Expr::Binary(lhs, op, rhs) if op.is_comparison() => cast_pair(lhs, rhs)?,
+            ast::Expr::Between {
+                lhs, start, end, ..
+            } => {
+                cast_pair(lhs, start)?;
+                cast_pair(lhs, end)?;
+            }
+            ast::Expr::InList { lhs, rhs, .. } => {
+                for item in rhs.iter_mut() {
+                    cast_pair(lhs, item)?;
+                }
+            }
+            ast::Expr::Case {
+                base: Some(base),
+                when_then_pairs,
+                ..
+            } => {
+                for (when, _) in when_then_pairs.iter_mut() {
+                    cast_pair(base, when)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
     Ok(())
 }
