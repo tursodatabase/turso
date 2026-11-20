@@ -509,7 +509,6 @@ expect @tursopg {
 }
 
 # E-40: COMMENT ON TABLE + obj_description
-@compat-gap "function:obj_description"
 test comment-on-table-obj-description {
     CREATE TABLE t (id int);
     COMMENT ON TABLE t IS 'hello';
@@ -518,11 +517,8 @@ test comment-on-table-obj-description {
 expect {
     hello
 }
-expect @tursopg {
-}
 
 # E-41: COMMENT ON COLUMN + col_description
-@compat-gap "function:col_description"
 test comment-on-column-col-description {
     CREATE TABLE t (id int);
     COMMENT ON COLUMN t.id IS 'pk';
@@ -530,8 +526,6 @@ test comment-on-column-col-description {
 }
 expect {
     pk
-}
-expect @tursopg {
 }
 
 # E-42: SHOW search_path

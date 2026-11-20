@@ -1582,6 +1582,30 @@ pub enum RelationKind {
     Index,
 }
 
+impl RelationKind {
+    /// The kind in words, such as `table` or `materialized view`.
+    pub fn name(self) -> &'static str {
+        match self {
+            RelationKind::Table => "table",
+            RelationKind::View => "view",
+            RelationKind::MaterializedView => "materialized view",
+            RelationKind::Sequence => "sequence",
+            RelationKind::Index => "index",
+        }
+    }
+
+    /// The kind as an error message names it, such as `a table` or `an index`.
+    pub fn with_article(self) -> &'static str {
+        match self {
+            RelationKind::Table => "a table",
+            RelationKind::View => "a view",
+            RelationKind::MaterializedView => "a materialized view",
+            RelationKind::Sequence => "a sequence",
+            RelationKind::Index => "an index",
+        }
+    }
+}
+
 /// A role named in DDL, like PostgreSQL's RoleSpec.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

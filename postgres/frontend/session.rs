@@ -32,9 +32,9 @@ use turso_pg_parser::sqlstate::{
 use turso_pg_parser::translator::{
     check_enum_labels, execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
     set_transaction_access_mode, unnamed_index_name, unqualified_create_table_name_location,
-    FrontendStmt, PgCommentTarget, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
-    PgGrantStmt, PgGrantTables, PgGrantee, PgSetStmt, PgSetTo, PgSetValue, PgShowStmt,
-    PostgreSQLTranslator, SerialSequence, TranslateResult,
+    FrontendStmt, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgGrantStmt, PgGrantTables,
+    PgGrantee, PgSetStmt, PgSetTo, PgSetValue, PgShowStmt, PostgreSQLTranslator, SerialSequence,
+    TranslateResult,
 };
 use turso_pg_parser::ParseError;
 
@@ -593,6 +593,7 @@ fn translate_statement<'a>(
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
     let sql = write_out_renamed_serial_columns(&pg_conn.conn, sql, &translated.serial_sequences)?;
     reject_catalog_dml(translated.cmd.stmt())?;
+    reject_catalog_ddl(translated.cmd.stmt())?;
     if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
         reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
     }
@@ -734,6 +735,9 @@ enum DeferredCommand {
     Ast(ast::Stmt),
     Postgres(String),
     Sqlite(String),
+    /// A statement of the engine that writes a table of the frontend's own,
+    /// which no role has the privilege to write.
+    Engine(String),
 }
 
 struct DeferredStatement {
@@ -1228,11 +1232,20 @@ impl DeferredOperation {
                             index: 0,
                         })));
                     }
-                    FrontendStmt::RefreshMatview(_) | FrontendStmt::CommentOn(_) => {
+                    FrontendStmt::RefreshMatview(_) => {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
                         return Ok(None);
+                    }
+                    FrontendStmt::CommentOn(stmt) => {
+                        if conn.is_tx_read_only() {
+                            return Err(LimboError::ReadOnly);
+                        }
+                        crate::descriptions::comment_statements(conn, stmt)?
+                            .into_iter()
+                            .map(engine_statement)
+                            .collect()
                     }
                     FrontendStmt::Grant(stmt) => {
                         if conn.is_tx_read_only() {
@@ -1375,6 +1388,9 @@ impl CommandSequence {
                 prepare_statement_inner(pg_conn, sql)?.without_tx_tracking()
             }
             DeferredCommand::Sqlite(_) => crate::Statement::new(conn.prepare_sqlite(sql)?),
+            DeferredCommand::Engine(_) => {
+                crate::Statement::new(conn.prepare_engine_schema_statement(sql)?)
+            }
         })
     }
 
@@ -1387,6 +1403,7 @@ impl CommandSequence {
         match &self.current().command {
             DeferredCommand::Translated(_, sql)
             | DeferredCommand::Sqlite(sql)
+            | DeferredCommand::Engine(sql)
             | DeferredCommand::Postgres(sql) => Cow::Borrowed(sql),
             DeferredCommand::Ast(stmt) => stmt.to_string().into(),
         }
@@ -1802,6 +1819,37 @@ fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
     ))
 }
 
+/// Refuses a statement that changes the definition of a catalog table, as
+/// PostgreSQL does. A table of the same name in a schema of the user's is
+/// not a catalog table.
+fn reject_catalog_ddl(stmt: &ast::Stmt) -> Result<()> {
+    let (schema, table_name) = match stmt {
+        ast::Stmt::AlterTable(ast::AlterTable { name, .. }) => {
+            (name.namespace.as_ref(), &name.name)
+        }
+        ast::Stmt::DropTable { tbl_name, .. } | ast::Stmt::CreateTrigger { tbl_name, .. } => {
+            (tbl_name.namespace.as_ref(), &tbl_name.name)
+        }
+        ast::Stmt::CreateIndex {
+            idx_name, tbl_name, ..
+        } => (idx_name.namespace.as_ref(), tbl_name),
+        _ => return Ok(()),
+    };
+    let table_name = table_name.as_str();
+    let is_in_catalog_schema = schema.is_none_or(|schema| schema.as_str() == "main");
+    if !is_in_catalog_schema
+        || !catalog::is_catalog_table_name(table_name)
+        || catalog::is_catalog_view_name(table_name)
+    {
+        return Ok(());
+    }
+    Err(sqlstate_error(
+        SQLSTATE_INSUFFICIENT_PRIVILEGE,
+        format!("permission denied: \"{table_name}\" is a system catalog"),
+        None,
+    ))
+}
+
 fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
     let lower = sql.to_ascii_lowercase();
     for table_name in ["sqlite_master", "sqlite_schema"] {
@@ -1926,6 +1974,8 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
         // Who may grant or revoke on each table is decided from its stored
         // privileges when the engine's GRANT or REVOKE runs.
         FrontendStmt::Grant(_) => return Ok(()),
+        // Who may comment on an object is decided when the object is found.
+        FrontendStmt::CommentOn(_) => return Ok(()),
         FrontendStmt::CreateSchema(_) => PermissionDenied::privilege(
             Action::Create,
             Object::Database(catalog::db_name_from_path(conn.db_file_path())),
@@ -1940,17 +1990,6 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
             return Err(sqlstate_error(
                 SQLSTATE_INSUFFICIENT_PRIVILEGE,
                 format!("permission denied for materialized view {}", stmt.name),
-                None,
-            ));
-        }
-        FrontendStmt::CommentOn(stmt) => {
-            let message = match &stmt.target {
-                PgCommentTarget::Owned(object) => format!("must be owner of {object}"),
-                PgCommentTarget::Role | PgCommentTarget::Other => "permission denied".to_string(),
-            };
-            return Err(sqlstate_error(
-                SQLSTATE_INSUFFICIENT_PRIVILEGE,
-                message,
                 None,
             ));
         }
@@ -2401,6 +2440,13 @@ fn drop_schema_commands(
             },
         })
         .collect();
+    let delete_comment = conn.qualifier(&name).and_then(|namespace| {
+        crate::descriptions::delete_schema_comment_statement(
+            &conn.current_schema(),
+            namespace.target.id,
+        )
+    });
+    commands.extend(delete_comment.map(engine_statement));
     commands.push(DeferredStatement {
         command: DeferredCommand::Ast(ast::Stmt::DropSchema {
             name: ast::Name::exact(name.clone()),
@@ -2408,6 +2454,13 @@ fn drop_schema_commands(
         context: CommandContext::DropSchema { schema: name },
     });
     Ok(commands)
+}
+
+fn engine_statement(sql: String) -> DeferredStatement {
+    DeferredStatement {
+        command: DeferredCommand::Engine(sql),
+        context: CommandContext::Default,
+    }
 }
 
 /// The sequences that the tables among `objects` of schema `schema` own.

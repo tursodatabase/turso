@@ -27,6 +27,7 @@ use turso_pg_parser::quote_identifier;
 
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
+use turso_pg_parser::translator::{PG_CLASS_OID, PG_NAMESPACE_OID};
 
 /// PostgreSQL uses OID zero when no object is referenced.
 const PG_INVALID_OID: i64 = 0;
@@ -476,13 +477,13 @@ fn schema_name_of(schema: &Schema, namespace: NamespaceId) -> &str {
 }
 
 /// OID of the public schema, which initdb gives it.
-const PUBLIC_NAMESPACE_OID: i64 = 2200;
+pub(crate) const PUBLIC_NAMESPACE_OID: i64 = 2200;
 
 /// What is added to the id of a namespace to get the OID of its
 /// schema.
 const FIRST_USER_SCHEMA_OID: i64 = 16384;
 
-fn namespace_oid(schema: &Schema, namespace: NamespaceId) -> i64 {
+pub(crate) fn namespace_oid(schema: &Schema, namespace: NamespaceId) -> i64 {
     if schema.namespace_name(namespace) == Some("public") {
         return PUBLIC_NAMESPACE_OID;
     }
@@ -664,7 +665,7 @@ impl SnapshotRows for PgClassTable {
         )";
     /// Fixed PostgreSQL OID of pg_class, which describes tables and indexes.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(1259);
+    const TABLE_OID: Option<i64> = Some(PG_CLASS_OID);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -823,7 +824,7 @@ impl SnapshotRows for PgNamespaceTable {
         )";
     /// Fixed PostgreSQL OID of pg_namespace, which describes schemas.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(2615);
+    const TABLE_OID: Option<i64> = Some(PG_NAMESPACE_OID);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 5;
 
@@ -865,25 +866,6 @@ impl SnapshotRows for PgNamespaceTable {
             ]);
         }
         rows
-    }
-}
-
-#[derive(Debug)]
-struct PgDescriptionTable;
-
-impl SnapshotRows for PgDescriptionTable {
-    const SCHEMA: &'static str = "CREATE TABLE pg_description (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)";
-    const TABLE_OID: Option<i64> = None;
-    const ESTIMATED_COST: f64 = 1.0;
-    const ESTIMATED_ROWS: u32 = 1;
-
-    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        vec![vec![
-            Value::from_i64(2200),
-            Value::from_i64(PgNamespaceTable::TABLE_OID.unwrap()),
-            Value::from_i64(0),
-            Value::build_text("standard public schema"),
-        ]]
     }
 }
 
@@ -2372,10 +2354,7 @@ impl SnapshotRows for PgConstraintTable {
                     .iter()
                     .find(|index| index.table_oid == table_oid && index.primary)
                     .expect("rowid primary keys have a catalog index");
-                let conname = btree
-                    .primary_key_constraint_name
-                    .clone()
-                    .unwrap_or_else(|| format!("{table_name}_pkey"));
+                let conname = primary_key_constraint_name(btree);
                 let conkey: String = btree
                     .primary_key_columns
                     .iter()
@@ -2428,15 +2407,9 @@ impl SnapshotRows for PgConstraintTable {
                 };
                 let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
                 let conname = if primary {
-                    btree
-                        .primary_key_constraint_name
-                        .clone()
-                        .unwrap_or_else(|| format!("{table_name}_pkey"))
+                    primary_key_constraint_name(btree)
                 } else {
-                    us.constraint_name.clone().unwrap_or_else(|| {
-                        let cols_str = col_names.join("_");
-                        format!("{table_name}_{cols_str}_key")
-                    })
+                    unique_constraint_name(btree, us)
                 };
 
                 // Build conkey: space-separated 1-based attnums
@@ -3031,11 +3004,6 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             )"
             .to_string(),
         },
-    );
-    options = options.native_module(
-        "pg_description",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgDescriptionTable>(PhantomData),
     );
     options = options.native_module(
         "pg_seclabels",
@@ -4654,6 +4622,36 @@ struct CatalogIndexColumn {
     order: SortOrder,
 }
 
+/// The names of the PRIMARY KEY and UNIQUE constraints of `table`. PostgreSQL
+/// gives the index of each constraint the same name.
+pub(crate) fn key_constraint_names(table: &BTreeTable) -> Vec<String> {
+    let rowid_primary_key = table
+        .get_rowid_alias_column()
+        .map(|_| primary_key_constraint_name(table));
+    let unique_sets = table.unique_sets.iter().map(|set| {
+        if unique_set_is_primary_key(table, set) {
+            primary_key_constraint_name(table)
+        } else {
+            unique_constraint_name(table, set)
+        }
+    });
+    rowid_primary_key.into_iter().chain(unique_sets).collect()
+}
+
+fn primary_key_constraint_name(table: &BTreeTable) -> String {
+    table
+        .primary_key_constraint_name
+        .clone()
+        .unwrap_or_else(|| format!("{}_pkey", table.declared_name))
+}
+
+fn unique_constraint_name(table: &BTreeTable, set: &UniqueSet) -> String {
+    set.constraint_name.clone().unwrap_or_else(|| {
+        let columns: Vec<&str> = set.columns.iter().map(|c| c.name.as_str()).collect();
+        format!("{}_{}_key", table.declared_name, columns.join("_"))
+    })
+}
+
 fn unique_set_is_primary_key(table: &BTreeTable, set: &UniqueSet) -> bool {
     table.get_rowid_alias_column().is_none()
         && set.columns.len() == table.primary_key_columns.len()
@@ -4789,7 +4787,6 @@ mod tests {
             "pg_foreign_table",
             "pg_partitioned_table",
             "pg_collation",
-            "pg_description",
             "pg_publication",
             "pg_publication_namespace",
             "pg_publication_rel",
