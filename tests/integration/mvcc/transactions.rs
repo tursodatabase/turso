@@ -1,9 +1,10 @@
-use super::checkpoint::get_rows;
+use super::checkpoint::{get_rows, FixedYieldInjector};
 use super::database::MvccTestDb;
 use crate::mvcc::test_db::MvccTestDbNoConn;
 use std::sync::Arc;
 use turso_core::mvcc::clock::MvccClock;
 use turso_core::mvcc::database::*;
+use turso_core::mvcc::yield_hooks::YieldPointMarker;
 use turso_core::types::IOResult;
 use turso_core::types::ImmutableRecord;
 use turso_core::Connection;
@@ -1834,4 +1835,278 @@ fn test_commit_dependency_aborted_statement_rolls_back_txn() {
 
     let rows = get_rows(&updater_conn, "SELECT id, n FROM hot ORDER BY id");
     assert_eq!(rows, vec![vec![Value::from_i64(1), Value::from_i64(0)]]);
+}
+
+/// Writer A deletes key 1 and is Preparing in its COMMIT. Writer B begins after A's
+/// end_ts, so A's delete is in B's snapshot, and inserts key 1. B's COMMIT waits for A
+/// and then commits.
+#[test]
+fn insert_after_preparing_delete_commits_when_delete_commits() {
+    let (b_result, rows) = commit_insert_after_preparing_delete(false, PreparingDeleteEnd::Commit);
+    assert!(b_result.is_ok(), "B's COMMIT failed: {b_result:?}");
+    assert_eq!(
+        rows,
+        vec![vec![Value::from_i64(1), Value::build_text("new")]]
+    );
+}
+
+/// Same as above, but A aborts while B waits for it. B must abort too, or the table
+/// would hold two rows with id 1.
+#[test]
+fn insert_after_preparing_delete_aborts_when_delete_aborts() {
+    let (b_result, rows) = commit_insert_after_preparing_delete(false, PreparingDeleteEnd::Abort);
+    assert!(
+        matches!(b_result, Err(LimboError::CommitDependencyAborted)),
+        "expected CommitDependencyAborted, got: {b_result:?}"
+    );
+    assert_eq!(
+        rows,
+        vec![vec![Value::from_i64(1), Value::build_text("old")]]
+    );
+}
+
+/// The row is checkpointed before A deletes it, so A's delete is a B-tree tombstone
+/// (begin: None, end: TxID(A)).
+#[test]
+fn insert_after_preparing_btree_delete_commits_when_delete_commits() {
+    let (b_result, rows) = commit_insert_after_preparing_delete(true, PreparingDeleteEnd::Commit);
+    assert!(b_result.is_ok(), "B's COMMIT failed: {b_result:?}");
+    assert_eq!(
+        rows,
+        vec![vec![Value::from_i64(1), Value::build_text("new")]]
+    );
+}
+
+#[test]
+fn insert_after_preparing_btree_delete_aborts_when_delete_aborts() {
+    let (b_result, rows) = commit_insert_after_preparing_delete(true, PreparingDeleteEnd::Abort);
+    assert!(
+        matches!(b_result, Err(LimboError::CommitDependencyAborted)),
+        "expected CommitDependencyAborted, got: {b_result:?}"
+    );
+    assert_eq!(
+        rows,
+        vec![vec![Value::from_i64(1), Value::build_text("old")]]
+    );
+}
+
+/// A deletes the row with unique value 'u' and B inserts another row with 'u', so the
+/// conflict check runs on the unique index key.
+#[test]
+fn unique_insert_after_preparing_delete_commits_when_delete_commits() {
+    let (b_result, rows) = commit_unique_insert_after_preparing_delete(PreparingDeleteEnd::Commit);
+    assert!(b_result.is_ok(), "B's COMMIT failed: {b_result:?}");
+    assert_eq!(rows, vec![vec![Value::from_i64(2), Value::build_text("u")]]);
+}
+
+#[test]
+fn unique_insert_after_preparing_delete_aborts_when_delete_aborts() {
+    let (b_result, rows) = commit_unique_insert_after_preparing_delete(PreparingDeleteEnd::Abort);
+    assert!(
+        matches!(b_result, Err(LimboError::CommitDependencyAborted)),
+        "expected CommitDependencyAborted, got: {b_result:?}"
+    );
+    assert_eq!(rows, vec![vec![Value::from_i64(1), Value::build_text("u")]]);
+}
+
+/// A deletes more B-tree-resident rows than `MVCC_COMMIT_BATCH_SIZE` and pauses
+/// between chunks of RewriteLiveVersions. A is Committed, but the tombstone of the
+/// last row still ends with TxID(A). B begins after A committed and inserts that row.
+#[test]
+fn insert_after_committed_btree_delete_with_txid_end_commits() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    let last = MVCC_COMMIT_BATCH_SIZE as i64 + 1;
+    conn_a
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn_a
+        .execute(format!(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < {last}) \
+             INSERT INTO t SELECT x, 'old' FROM c"
+        ))
+        .unwrap();
+    conn_a.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("DELETE FROM t").unwrap();
+    let tx_a = conn_a.get_mv_tx().unwrap().0;
+    let mvcc_store = db.get_mvcc_store();
+    let root_page = get_rows(
+        &conn_a,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = mvcc_store.get_table_id_from_root_page(root_page);
+    let last_row = RowID::new(table_id, RowKey::Int(last));
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+    loop {
+        let a_committed = matches!(
+            mvcc_store.tx_snapshot(tx_a).unwrap().state,
+            TransactionState::Committed(_)
+        );
+        if a_committed {
+            break;
+        }
+        match commit_a.step().unwrap() {
+            turso_core::StepResult::IO => commit_a._io().step().unwrap(),
+            turso_core::StepResult::Done => panic!("A finished its COMMIT without a pause"),
+            _ => {}
+        }
+    }
+    let last_row_versions = mvcc_store.rows.get(&last_row).unwrap();
+    assert_eq!(
+        last_row_versions
+            .value()
+            .read()
+            .iter()
+            .map(|v| (v.begin(), v.end()))
+            .collect::<Vec<_>>(),
+        vec![(None, Some(TxTimestampOrID::TxID(tx_a)))]
+    );
+
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b
+        .execute(format!("INSERT INTO t VALUES ({last}, 'new')"))
+        .unwrap();
+    // B's COMMIT runs its conflict check first, then waits for A to release the
+    // commit lock.
+    let mut commit_b = conn_b.prepare("COMMIT").unwrap();
+    let b_result = commit_b.step();
+    assert!(
+        matches!(b_result, Ok(turso_core::StepResult::IO)),
+        "B's COMMIT failed: {b_result:?}"
+    );
+    step_until_done(&mut commit_a).unwrap();
+    step_until_done(&mut commit_b).unwrap();
+
+    let rows = get_rows(&conn_a, "SELECT id, v FROM t");
+    assert_eq!(
+        rows,
+        vec![vec![Value::from_i64(last), Value::build_text("new")]]
+    );
+}
+
+#[derive(Clone, Copy)]
+enum PreparingDeleteEnd {
+    Commit,
+    Abort,
+}
+
+fn commit_insert_after_preparing_delete(
+    checkpoint_before_delete: bool,
+    a_end: PreparingDeleteEnd,
+) -> (Result<()>, Vec<Vec<Value>>) {
+    let setup: &[&str] = if checkpoint_before_delete {
+        &[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)",
+            "INSERT INTO t VALUES (1, 'old')",
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+        ]
+    } else {
+        &[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)",
+            "INSERT INTO t VALUES (1, 'old')",
+        ]
+    };
+    commit_write_after_preparing_delete(
+        setup,
+        "DELETE FROM t WHERE id = 1",
+        "INSERT INTO t VALUES (1, 'new')",
+        a_end,
+    )
+}
+
+fn commit_unique_insert_after_preparing_delete(
+    a_end: PreparingDeleteEnd,
+) -> (Result<()>, Vec<Vec<Value>>) {
+    commit_write_after_preparing_delete(
+        &[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)",
+            "INSERT INTO t VALUES (1, 'u')",
+        ],
+        "DELETE FROM t WHERE id = 1",
+        "INSERT INTO t VALUES (2, 'u')",
+        a_end,
+    )
+}
+
+/// Runs `setup`, then A runs `a_delete` in BEGIN CONCURRENT and pauses its COMMIT right
+/// after the conflict check, so A is Preparing. B begins, runs `b_write` and starts its
+/// COMMIT, which must wait for A. Then A commits or aborts and B's COMMIT finishes.
+/// Returns B's COMMIT result and the rows of `t`.
+fn commit_write_after_preparing_delete(
+    setup: &[&str],
+    a_delete: &str,
+    b_write: &str,
+    a_end: PreparingDeleteEnd,
+) -> (Result<()>, Vec<Vec<Value>>) {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    for sql in setup {
+        conn_a.execute(sql).unwrap();
+    }
+
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute(a_delete).unwrap();
+    let tx_a = conn_a.get_mv_tx().unwrap().0;
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::WaitForDependencies.point(),
+    ])));
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+    assert!(matches!(
+        commit_a.step().unwrap(),
+        turso_core::StepResult::Yield
+    ));
+
+    let mvcc_store = db.get_mvcc_store();
+    let TransactionState::Preparing(a_end_ts) = mvcc_store.tx_snapshot(tx_a).unwrap().state else {
+        panic!("A should be Preparing");
+    };
+
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute(b_write).unwrap();
+    let tx_b = conn_b.get_mv_tx().unwrap().0;
+    assert!(mvcc_store.tx_snapshot(tx_b).unwrap().begin_ts > a_end_ts);
+    let mut commit_b = conn_b.prepare("COMMIT").unwrap();
+    // B's conflict check passes and B waits for A.
+    assert!(matches!(
+        commit_b.step().unwrap(),
+        turso_core::StepResult::Yield
+    ));
+    assert_eq!(mvcc_store.tx_snapshot(tx_b).unwrap().commit_dep_count, 1);
+
+    match a_end {
+        PreparingDeleteEnd::Commit => step_until_done(&mut commit_a).unwrap(),
+        PreparingDeleteEnd::Abort => {
+            drop(commit_a);
+            conn_a.close().unwrap();
+            assert!(mvcc_store.tx_snapshot(tx_a).is_none_or(|tx| matches!(
+                tx.state,
+                TransactionState::Aborted | TransactionState::Terminated
+            )));
+        }
+    }
+    let b_result = step_until_done(&mut commit_b);
+    drop(commit_b);
+    if b_result.is_err() {
+        conn_b.close().unwrap();
+    }
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "SELECT id, v FROM t ORDER BY id");
+    (b_result, rows)
+}
+
+fn step_until_done(stmt: &mut turso_core::Statement) -> Result<()> {
+    loop {
+        match stmt.step()? {
+            turso_core::StepResult::Done => return Ok(()),
+            turso_core::StepResult::IO => stmt._io().step()?,
+            _ => {}
+        }
+    }
 }
