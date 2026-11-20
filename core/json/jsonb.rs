@@ -2570,11 +2570,17 @@ impl Jsonb {
             ElementType::INT
         };
 
-        self.write_element_header(num_start, element_type, len, false)
-            .map_err(|_| PError::Message {
-                msg: "Unexpected input after json".to_string(),
-                location: Some(pos),
-            })?;
+        // Most numbers have a 1-byte header, which replaces the placeholder
+        // in place, as write_element_header does.
+        if len <= 11 {
+            self.data[num_start] = (element_type as u8) | ((len as u8) << 4);
+        } else {
+            self.write_element_header(num_start, element_type, len, false)
+                .map_err(|_| PError::Message {
+                    msg: "Unexpected input after json".to_string(),
+                    location: Some(pos),
+                })?;
+        }
 
         Ok(pos)
     }
