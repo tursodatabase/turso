@@ -623,6 +623,7 @@ pub(super) fn emit_table_read_start(
                         .size(&seek_def.start)
                         .max(seek_def.size(&seek_def.end));
                     let start_reg = program.alloc_registers(max_registers);
+                    t_ctx.seek_key_registers.insert(seek_cursor_id, start_reg);
                     SeekEmitter::new(
                         program,
                         table_references,
