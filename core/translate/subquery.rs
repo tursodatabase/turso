@@ -3,8 +3,8 @@ use std::sync::Arc;
 use crate::alloc::TursoSliceExt;
 use crate::translate::expr_context::ExprContext;
 
+use crate::ast::{self, SortOrder, SubqueryType, TableInternalId};
 use rustc_hash::FxHashMap as HashMap;
-use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
 
 use super::{
     emitter::{OperationMode, Resolver, RowValueSubquery, RowValueSubqueryColumn, TranslateCtx},

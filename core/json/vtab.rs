@@ -5,6 +5,7 @@ use std::result::Result;
 
 use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
 
+use crate::ast;
 use crate::{
     json::{
         convert_dbtype_to_jsonb, json_path_text,
@@ -17,7 +18,6 @@ use crate::{
     vtab::{column_definition, InternalVirtualTable, InternalVirtualTableCursor},
     Connection, LimboError, Value,
 };
-use turso_parser::ast;
 
 use super::jsonb;
 

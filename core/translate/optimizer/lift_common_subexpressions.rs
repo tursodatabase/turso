@@ -1,5 +1,5 @@
+use crate::ast::{Expr, Operator, TableInternalId, UnaryOperator};
 use crate::{turso_assert, turso_assert_greater_than};
-use turso_parser::ast::{Expr, Operator, TableInternalId, UnaryOperator};
 
 use crate::{
     translate::{
@@ -261,7 +261,7 @@ fn literal_expr_can_be_copied(expr: &Expr) -> bool {
         Expr::Unary(UnaryOperator::Negative | UnaryOperator::Positive, value) => {
             matches!(
                 unwrap_parens(value),
-                Ok(Expr::Literal(turso_parser::ast::Literal::Numeric(_)))
+                Ok(Expr::Literal(crate::ast::Literal::Numeric(_)))
             )
         }
         _ => false,
@@ -271,8 +271,8 @@ fn literal_expr_can_be_copied(expr: &Expr) -> bool {
 /// Selects the literal types that the rewrite copies into a new `IN` filter.
 ///
 /// `NULL` cannot satisfy `=`. The rewrite leaves all other literal types in the original expression.
-fn literal_can_be_copied(literal: &turso_parser::ast::Literal) -> bool {
-    use turso_parser::ast::Literal;
+fn literal_can_be_copied(literal: &crate::ast::Literal) -> bool {
+    use crate::ast::Literal;
 
     matches!(
         literal,
@@ -347,8 +347,8 @@ fn rebuild_or_expr_from_list(mut branches: Vec<Expr>) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{self, Expr, Literal, Operator, TableInternalId};
     use crate::translate::plan::{JoinOrigin, WhereTerm, WhereTermOrigin};
-    use turso_parser::ast::{self, Expr, Literal, Operator, TableInternalId};
 
     #[test]
     fn common_and_terms_move_out_of_two_or_branches() -> Result<()> {

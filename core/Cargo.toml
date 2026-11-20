@@ -49,7 +49,7 @@ simulator = ["fuzz", "serde", "io_memory_yield", "allocation_metric"]
 allocation_metric = []
 # Test only: exposed to testing/stress and the simulator, never to regular library users.
 io_memory_yield = []
-serde = ["dep:serde"]
+serde = ["dep:serde", "bitflags/serde"]
 series = []
 encryption = []
 pure-rust-crypto = ["aegis/pure-rust"]
@@ -119,7 +119,7 @@ ryu = "1.0.19"
 uncased = "0.9.10"
 strum_macros = { workspace = true }
 bitflags = { workspace = true }
-serde = { workspace = true, optional = true, features = ["derive"] }
+serde = { workspace = true, optional = true, features = ["derive", "rc"] }
 serde_json = { workspace = true, optional = true }
 pastey = "0.2.1"
 uuid = { version = "1.11.0", features = ["v4", "v5", "v7"] }
@@ -128,7 +128,6 @@ pack1 = { version = "1.0.0", features = ["bytemuck"] }
 bytemuck = "1.23.1"
 aes-gcm = { version = "0.10.3" }
 aes = { version = "0.8.4" }
-turso_parser = { workspace = true }
 twox-hash = "2.1.1"
 intrusive-collections = "0.9.7"
 roaring = "0.11.2"

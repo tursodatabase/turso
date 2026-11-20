@@ -1,4 +1,4 @@
-use crate::token::TokenType;
+use crate::ast::token::TokenType;
 
 /// SQL lexer and parser errors
 #[non_exhaustive]

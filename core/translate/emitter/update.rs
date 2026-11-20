@@ -4,6 +4,7 @@ use super::gencol::{
 };
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
+use crate::ast::{RefAct, ResolveType, TriggerEvent, TriggerTime};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::collate::CollationSeq;
@@ -69,7 +70,6 @@ use crate::{
 use std::num::NonZeroUsize;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert, turso_assert_eq};
-use turso_parser::ast::{RefAct, ResolveType, TriggerEvent, TriggerTime};
 
 /// Info about position of rowid alias in the table if present + whether the current UPDATE statement will update the rowid.
 struct RowidUpdateInfo {

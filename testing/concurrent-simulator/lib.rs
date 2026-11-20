@@ -18,12 +18,12 @@ use std::sync::Arc;
 use tracing::{debug, error, trace};
 #[cfg(target_os = "windows")]
 use turso_core::WindowsIOCP;
+use turso_core::ast::{ColumnConstraint, SortOrder};
 use turso_core::schema::SEQ_BACKING_TABLE_PREFIX;
 use turso_core::{
     CheckpointMode, CipherMode, ConnectOpts, Connection, Database, DatabaseOpts, EncryptionOpts,
     IO, LimboError, OpenFlags, Statement, Value,
 };
-use turso_parser::ast::{ColumnConstraint, SortOrder};
 use turso_sqlite::SqliteDialect;
 
 mod allocation_fault;

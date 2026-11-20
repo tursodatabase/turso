@@ -19,7 +19,7 @@ use sql_generation::model::query::transaction::Rollback;
 use sql_generation::model::table::{SimValue, Table};
 use tracing::trace;
 use turso_core::Database;
-use turso_parser::ast::ColumnConstraint;
+use turso_core::ast::ColumnConstraint;
 
 use crate::generation::Shadow;
 use crate::model::Query;
@@ -1183,7 +1183,7 @@ mod tests {
     /// and one row per (a, b) pair, with g materialized in the shadow rows.
     fn table_with_unique_generated_column(rows: &[(i64, i64)]) -> Table {
         use sql_generation::model::table::{Column, ColumnType};
-        use turso_parser::ast;
+        use turso_core::ast;
 
         let generated_expr = ast::Expr::Binary(
             Box::new(ast::Expr::Id(ast::Name::from_string("a"))),

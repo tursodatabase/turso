@@ -1,10 +1,10 @@
+use crate::ast;
 use crate::schema::Index;
 use crate::stats::AnalyzeStats;
 use crate::sync::Arc;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::RangeConstraintRef;
 use crate::translate::plan::JoinedTable;
-use turso_parser::ast;
 
 use super::constraints::Constraint;
 use super::cost_params::CostModelParams;

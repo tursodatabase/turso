@@ -5,6 +5,9 @@ use super::plan::{
     NamedWindowDef, Operation, OuterQueryReference, QueryDestination, Search, TableReferences,
     Window,
 };
+use crate::ast::ResultColumn;
+use crate::ast::SortOrder;
+use crate::ast::{self, CompoundSelect, Expr};
 use crate::dialect::SortTermMatching;
 use crate::schema::Table;
 use crate::security::policy::Command;
@@ -37,9 +40,6 @@ use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
 use std::borrow::Cow;
-use turso_parser::ast::ResultColumn;
-use turso_parser::ast::SortOrder;
-use turso_parser::ast::{self, CompoundSelect, Expr};
 
 #[turso_macros::trace_stack]
 pub fn translate_select(

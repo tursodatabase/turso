@@ -28,6 +28,7 @@ pub use catalog::{
     AccessStatement, CatalogApply, NewOwner, OwnerColumn, RelationChange, RelationName,
 };
 
+use crate::ast::{self, Cmd, CreateTableBody, IdentityKind, Privilege, QualifiedName, Stmt};
 use crate::{
     function::ScalarFunc,
     namespace::NamespaceId,
@@ -38,7 +39,6 @@ use crate::{
     WallClockInstant, IO,
 };
 use std::{any::Any, cell::Cell, ops::Range, sync::Arc};
-use turso_parser::ast::{self, Cmd, CreateTableBody, IdentityKind, Privilege, QualifiedName, Stmt};
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.

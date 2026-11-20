@@ -1,5 +1,6 @@
 use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
+use crate::ast::{self, SortOrder, TableInternalId};
 use crate::translate::expr::comparison_affinity;
 use crate::translate::expr_context::{ExprContext, ExprProperties, TableMetadata};
 use crate::{
@@ -30,7 +31,6 @@ use crate::{turso_assert, turso_debug_assert};
 use smallvec::SmallVec;
 use std::{collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
-use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 /// Represents a single condition derived from a `WHERE` clause term
 /// that constrains a specific column of a table.

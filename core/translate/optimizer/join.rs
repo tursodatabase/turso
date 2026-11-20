@@ -3,7 +3,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
 
-use turso_parser::ast::{Operator, SubqueryType, TableInternalId};
+use crate::ast::{Operator, SubqueryType, TableInternalId};
 
 use super::{
     access_method::{add_where_cost, find_best_access_method_for_join_order, AccessMethod},
@@ -229,7 +229,7 @@ fn rows_after_join(
         }
         matches!(
             constraint.get_constraining_expr_ref(where_clause),
-            turso_parser::ast::Expr::Literal(turso_parser::ast::Literal::Null)
+            crate::ast::Expr::Literal(crate::ast::Literal::Null)
         ) && constraint.table_col_pos.is_some_and(|column_pos| {
             rhs_table
                 .table
@@ -2499,7 +2499,7 @@ fn generate_join_bitmasks(table_number_max_exclusive: usize, how_many: usize) ->
 mod tests {
     use std::{collections::VecDeque, sync::Arc};
 
-    use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
+    use crate::ast::{self, Expr, Operator, SortOrder, TableInternalId};
 
     use super::*;
     use crate::alloc::TursoSliceExt;

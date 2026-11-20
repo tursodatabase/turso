@@ -1,4 +1,5 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
+use crate::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 use crate::dialect::RelationChange;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
@@ -38,7 +39,6 @@ use crate::{
     },
 };
 use rustc_hash::FxHashMap as HashMap;
-use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
 use super::schema::{
     self, emit_delete_index_row, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID,
@@ -1407,7 +1407,7 @@ fn emit_index_column_value_from_cursor(
 }
 
 pub fn resolve_index_method_parameters(
-    parameters: Vec<(turso_parser::ast::Name, Box<Expr>)>,
+    parameters: Vec<(crate::ast::Name, Box<Expr>)>,
 ) -> crate::Result<HashMap<String, crate::Value>> {
     let mut resolved = HashMap::default();
     for (key, value) in parameters {
@@ -1634,7 +1634,7 @@ pub fn translate_optimize(
 #[cfg(test)]
 mod tests {
     use super::canonical_create_index_sql;
-    use turso_parser::ast;
+    use crate::ast;
 
     #[test]
     fn canonical_create_index_sql_drops_schema_qualifier_from_index_name_only() {

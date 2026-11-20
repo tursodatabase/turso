@@ -25,6 +25,7 @@ use super::{
     window::WindowMetadata,
 };
 use crate::alloc::{TryClone, TursoIteratorExt};
+use crate::ast::{self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime};
 use crate::instrument;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
@@ -55,9 +56,6 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
-use turso_parser::ast::{
-    self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
-};
 
 pub(crate) mod delete;
 pub(crate) mod gencol;

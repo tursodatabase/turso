@@ -1,3 +1,4 @@
+use crate::ast::{self, QualifiedName};
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::NamespaceRef;
 use crate::sync::Arc;
@@ -11,7 +12,6 @@ use crate::translate::ProgramBuilderOpts;
 use crate::util::{escape_sql_string_literal, normalize_ident};
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, Connection, Result};
-use turso_parser::ast::{self, QualifiedName};
 
 /// Reconstruct SQL string from CREATE TRIGGER AST
 #[allow(clippy::too_many_arguments)]

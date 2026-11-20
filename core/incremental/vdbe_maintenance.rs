@@ -24,9 +24,9 @@
 //! completion (or before an in-statement view read), or inside the CREATE
 //! MATERIALIZED VIEW statement for initial population.
 
+use crate::ast;
 use crate::namespace::NamespaceRef;
 use rustc_hash::FxHashMap;
-use turso_parser::ast;
 
 use crate::incremental::dag;
 use crate::schema::Schema;

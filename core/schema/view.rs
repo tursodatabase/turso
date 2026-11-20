@@ -1,4 +1,5 @@
 use crate::alloc::TursoIteratorExt;
+use crate::ast;
 use crate::namespace::NamespaceId;
 use crate::schema::ColDef;
 use crate::translate::plan::{
@@ -12,7 +13,6 @@ use crate::{
     LimboError, Result,
 };
 use rustc_hash::FxHashMap as HashMap;
-use turso_parser::ast;
 
 /// Information about a table referenced in a view
 #[derive(Debug, Clone)]

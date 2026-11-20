@@ -1,9 +1,9 @@
 use std::{borrow::Borrow, cmp::Ordering, collections::HashMap, hash::Hasher, str::FromStr as _};
 
+use crate::ast::{Expr, UnaryOperator};
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
 use smallvec::SmallVec;
-use turso_parser::ast::{Expr, UnaryOperator};
 
 use crate::{
     function::ExternalCollation,
@@ -1089,7 +1089,7 @@ mod tests {
     use crate::namespace::NamespaceRef;
     use crate::{sync::Arc, MAIN_DB_ID};
 
-    use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
+    use crate::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
 
     use crate::{
         schema::{BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Table, Type},
@@ -1262,7 +1262,7 @@ mod tests {
         assert_eq!(collseq_plus, Some(TextCollation::NoCase));
 
         // CAST(column AS TEXT)
-        let cast_ty = Some(turso_parser::ast::Type {
+        let cast_ty = Some(crate::ast::Type {
             name: "TEXT".to_string(),
             size: None,
             array_dimensions: 0,
@@ -1463,7 +1463,7 @@ mod tests {
             })],
             order_by: std::vec![],
             within_group: std::vec![],
-            filter_over: turso_parser::ast::FunctionTail {
+            filter_over: crate::ast::FunctionTail {
                 filter_clause: None,
                 over_clause: None,
             },
@@ -1710,7 +1710,7 @@ mod tests {
     fn get_table_references_single_table_rowid_alias_with_collation(
         collation: Option<TextCollation>,
     ) -> TableReferences {
-        use turso_parser::ast::SortOrder;
+        use crate::ast::SortOrder;
         let mut table_references = TableReferences::new_empty();
         let columns = vec![Column::new(
             Some("id".to_string()),

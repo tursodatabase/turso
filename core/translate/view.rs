@@ -1,3 +1,4 @@
+use crate::ast;
 use crate::dialect::RelationChange;
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
@@ -18,7 +19,6 @@ use crate::util::{
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
 use crate::{bail_parse_error, Connection, Result};
-use turso_parser::ast;
 
 fn validate_materialized(
     connection: &Arc<crate::Connection>,

@@ -1,3 +1,4 @@
+use turso_core::ast;
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::alter_table::{
     rewrite_select_table_refs, rewrite_view_sql_for_column_rename,
@@ -5,7 +6,6 @@ use turso_core::schema::alter_table::{
 use turso_core::schema::view::ViewColumnSchema;
 use turso_core::schema::BTreeTable;
 use turso_core::schema::Schema;
-use turso_parser::ast;
 
 fn schema_with_tables(create_table_sqls: &[&str]) -> Schema {
     let mut schema = Schema::new();

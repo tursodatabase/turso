@@ -1,5 +1,5 @@
+use crate::ast::{self, TableInternalId};
 use rustc_hash::{FxHashMap, FxHashSet};
-use turso_parser::ast::{self, TableInternalId};
 
 use super::output::NodeOutputContract;
 use super::stream::{binding_rowid_metadata_width, DeltaIdentity};
