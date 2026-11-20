@@ -13,7 +13,8 @@ use crate::sync::Arc;
 use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
-    bind_and_rewrite_expr, expr_contains_function_that_changes_within_statement, expr_vector_size,
+    bind_and_rewrite_expr, cannot_meet_timestamp,
+    expr_contains_function_that_changes_within_statement, expr_vector_size, is_untyped_operand,
     walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
@@ -281,7 +282,7 @@ pub(crate) fn prepare_select_plan_from_arms(
         &mut same_query_map,
     )?;
 
-    convert_timestamps_in_compound(&mut left, &mut last, resolver);
+    convert_timestamps_in_compound(&mut left, &mut last, resolver)?;
 
     // ORDER BY names can come from any arm of a compound SELECT.
     let all_plans: Vec<&SelectPlan> = left
@@ -300,27 +301,38 @@ pub(crate) fn prepare_select_plan_from_arms(
     })
 }
 
-/// Reads a timestamp column of a compound SELECT as a timestamptz when a
-/// SELECT on the other side of the UNION, INTERSECT or EXCEPT has a
-/// timestamptz in that column. PostgreSQL gives such a column the type
-/// timestamptz, converting the timestamps in the session time zone, which is
-/// UTC in tursopg. Without the conversion the two decoded texts of one instant
-/// differ by the `+00` suffix, so the compound keeps both.
+/// Gives each column of a compound SELECT that has a timestamp or timestamptz
+/// in one SELECT the type PostgreSQL gives it:
+/// - A timestamp is read as a timestamptz when a SELECT on the other side of
+///   the UNION, INTERSECT or EXCEPT has a timestamptz in that column. The
+///   conversion is in the session time zone, which is UTC in tursopg. Without
+///   it the two decoded texts of one instant differ by the `+00` suffix, so the
+///   compound keeps both.
+/// - A string literal or parameter is read as a timestamp (a timestamptz in
+///   a timestamptz column), as ENCODE reads input: `SELECT ts FROM t UNION
+///   SELECT '2024-01-01T10:00'` returns that timestamp. The order of the
+///   column reads only the text a timestamp prints as, so an unconverted
+///   literal in another form could not be ordered.
+/// - Any other expression whose type is not a timestamp is an error, as in
+///   PostgreSQL, because the compound would have to order it as a timestamp.
 fn convert_timestamps_in_compound(
     left: &mut [(SelectPlan, ast::CompoundOperator)],
     last: &mut SelectPlan,
     resolver: &Resolver,
-) {
+) -> Result<()> {
     use crate::translate::expr::expr_type::{
-        common_of_types, is_type_named, type_of, ExprType, TypeEnv,
+        common_of_types, is_type_named, name_without_domains, type_of, ExprType, TypeEnv,
     };
     let schema = resolver.schema();
     if schema.type_registry.is_empty() {
-        return;
+        return Ok(());
     }
     // A domain over timestamp is a timestamp.
-    let type_named = |ty: &ExprType, name: &str| is_type_named(ty, name, schema);
+    let is_timestamp = |ty: &ExprType| {
+        is_type_named(ty, "timestamp", schema) || is_type_named(ty, "timestamptz", schema)
+    };
     let num_columns = last.result_columns.len();
+    let operators: Vec<ast::CompoundOperator> = left.iter().map(|(_, op)| *op).collect();
     let mut arms: Vec<&mut SelectPlan> = left.iter_mut().map(|(plan, _)| plan).collect();
     arms.push(last);
     for column in 0..num_columns {
@@ -333,38 +345,60 @@ fn convert_timestamps_in_compound(
                 )
             })
             .collect();
-        // The column's type is the common type of the arms (see common_scalar_type).
-        if !type_named(
-            &common_of_types(types.iter().cloned(), schema),
-            "timestamptz",
-        ) {
+        if !types.iter().any(is_timestamp) {
             continue;
         }
-        for (arm, ty) in arms.iter_mut().zip(&types) {
-            if !type_named(ty, "timestamp") {
-                continue;
+        // The column's type is the common type of the arms (see common_scalar_type).
+        let target = if is_type_named(
+            &common_of_types(types.iter().cloned(), schema),
+            "timestamptz",
+            schema,
+        ) {
+            "timestamptz"
+        } else {
+            "timestamp"
+        };
+        for (i, (arm, ty)) in arms.iter_mut().zip(&types).enumerate() {
+            let expr = &arm.result_columns[column].expr;
+            if is_untyped_operand(expr)?
+                || (is_type_named(ty, "timestamp", schema) && target == "timestamptz")
+            {
+                cast_result_column(arm, column, target);
+            } else if cannot_meet_timestamp(ty, schema) {
+                let operator = operators.get(i).or_else(|| operators.last());
+                crate::bail_parse_error!(
+                    "{} types timestamp and {} cannot be matched",
+                    operator.map_or_else(String::new, |op| op.to_string()),
+                    name_without_domains(ty.clone(), schema)
+                );
             }
-            let name = arm.result_columns[column]
-                .name(&arm.table_references)
-                .map(str::to_string);
-            let result_column = &mut arm.result_columns[column];
-            if result_column.alias.is_none() {
-                result_column.implicit_column_name = name;
-            }
-            let expr = std::mem::replace(
-                &mut result_column.expr,
-                ast::Expr::Literal(ast::Literal::Null),
-            );
-            result_column.expr = ast::Expr::cast(
-                expr,
-                Some(ast::Type {
-                    name: "timestamptz".to_string(),
-                    size: None,
-                    array_dimensions: 0,
-                }),
-            );
         }
     }
+    Ok(())
+}
+
+/// Wraps result column `column` of `arm` in a CAST to the type `type_name`,
+/// keeping the column's name.
+pub(crate) fn cast_result_column(arm: &mut SelectPlan, column: usize, type_name: &str) {
+    let name = arm.result_columns[column]
+        .name(&arm.table_references)
+        .map(str::to_string);
+    let result_column = &mut arm.result_columns[column];
+    if result_column.alias.is_none() {
+        result_column.implicit_column_name = name;
+    }
+    let expr = std::mem::replace(
+        &mut result_column.expr,
+        ast::Expr::Literal(ast::Literal::Null),
+    );
+    result_column.expr = ast::Expr::cast(
+        expr,
+        Some(ast::Type {
+            name: type_name.to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

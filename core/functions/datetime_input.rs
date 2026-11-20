@@ -98,6 +98,17 @@ fn encode(value: &Value, ty: TemporalType) -> Result<Value> {
     Fields::read(input, ty)?.encode(input, ty)
 }
 
+/// The stored microseconds of timestamp or timestamptz text, read as the ENCODE
+/// reads it. The ordering of the two types uses it for the decoded text of a
+/// value, so the ordering has no text parser of its own.
+pub fn read_timestamp_text(input: &str) -> Result<i64> {
+    let ty = TemporalType::Timestamptz;
+    match Fields::read(input, ty)?.encode(input, ty)? {
+        Value::Numeric(Numeric::Integer(micros)) => Ok(micros),
+        other => unreachable!("the encode of a timestamp is an integer, got {other:?}"),
+    }
+}
+
 fn not_supported(message: String) -> LimboError {
     LimboError::DatetimeNotSupported(message)
 }

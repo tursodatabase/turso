@@ -488,7 +488,7 @@ fn untyped_operands_read_as(
 /// foreign key's parent key, carries the column's type or collation and holds
 /// the column's value. Parentheses don't change this: `('10:00')` is a string
 /// literal too.
-fn is_untyped_operand(expr: &ast::Expr) -> Result<bool> {
+pub(crate) fn is_untyped_operand(expr: &ast::Expr) -> Result<bool> {
     Ok(match unwrap_parens(expr)? {
         ast::Expr::Literal(ast::Literal::String(_)) => true,
         ast::Expr::Variable(variable) => {
@@ -496,6 +496,27 @@ fn is_untyped_operand(expr: &ast::Expr) -> Result<bool> {
         }
         _ => false,
     })
+}
+
+/// Whether a value of type `ty` is known to be something PostgreSQL has no
+/// timestamp operator for: text, a number, an array or a custom type other
+/// than timestamp, timestamptz and date, which converts to a timestamp. A
+/// value of unknown type (an ANY column) is not, because it may hold a
+/// timestamp.
+pub(crate) fn cannot_meet_timestamp(ty: &ExprType, schema: &crate::schema::Schema) -> bool {
+    use super::expr_type::{is_type_named, BuiltinType};
+    match ty {
+        ExprType::Builtin(BuiltinType::Any) => false,
+        ExprType::Custom { .. } => ["timestamp", "timestamptz", "date"]
+            .iter()
+            .all(|name| !is_type_named(ty, name, schema)),
+        ExprType::Builtin(_) | ExprType::Array { .. } => true,
+        ExprType::Untyped
+        | ExprType::Null
+        | ExprType::Unknown
+        | ExprType::RowValue
+        | ExprType::NotKnownYet => false,
+    }
 }
 
 /// Whether a string literal or parameter compared with a value of `resolved`

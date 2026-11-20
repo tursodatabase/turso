@@ -1,0 +1,175 @@
+# A string literal in a compound SELECT arm or in the result of an IN subquery
+# is read as the timestamp or timestamptz it meets, as PostgreSQL does for
+# unknown-type literals, in every form timestamp input accepts. Text that is
+# not a literal has no operator with a timestamp, which is an error when the
+# statement is planned. Every expected result comes from PostgreSQL 18.
+
+@database :memory:
+
+setup tslit {
+    CREATE TABLE m (id int, ts timestamp, tz timestamptz);
+    INSERT INTO m VALUES
+        (1, '2024-01-01 10:00', '2024-01-01 10:00+00'),
+        (2, '2024-01-02 09:00', '2024-01-02 09:00+00');
+}
+
+@setup tslit
+test ts-lit-union-literal-after {
+    SELECT ts FROM m UNION SELECT '2024-01-01T10:00' ORDER BY 1;
+}
+expect {
+    2024-01-01 10:00:00
+    2024-01-02 09:00:00
+}
+
+@setup tslit
+test ts-lit-union-literal-before {
+    SELECT '2024-01-03T08:30' UNION SELECT ts FROM m ORDER BY 1;
+}
+expect {
+    2024-01-01 10:00:00
+    2024-01-02 09:00:00
+    2024-01-03 08:30:00
+}
+
+@setup tslit
+test ts-lit-union-all-sorts-as-time {
+    SELECT ts FROM m UNION ALL SELECT '2024-01-01 23:00' ORDER BY 1;
+}
+expect {
+    2024-01-01 10:00:00
+    2024-01-01 23:00:00
+    2024-01-02 09:00:00
+}
+
+@setup tslit
+test ts-lit-union-timestamptz {
+    SELECT tz FROM m UNION SELECT '2024-01-01T10:00' ORDER BY 1;
+}
+expect {
+    2024-01-01 10:00:00+00
+    2024-01-02 09:00:00+00
+}
+
+@setup tslit
+test ts-lit-union-timestamptz-offset {
+    SELECT tz FROM m UNION SELECT '2024-01-01 12:00:00+02' ORDER BY 1;
+}
+expect {
+    2024-01-01 10:00:00+00
+    2024-01-02 09:00:00+00
+}
+
+@setup tslit
+test ts-lit-except {
+    SELECT ts FROM m EXCEPT SELECT '2024-01-01T10:00' ORDER BY 1;
+}
+expect {
+    2024-01-02 09:00:00
+}
+
+@setup tslit
+test ts-lit-intersect {
+    SELECT tz FROM m INTERSECT SELECT '2024-01-02T09:00' ORDER BY 1;
+}
+expect {
+    2024-01-02 09:00:00+00
+}
+
+@setup tslit
+test ts-lit-distinct-over-union-all {
+    SELECT DISTINCT x FROM (SELECT ts AS x FROM m UNION ALL SELECT '2024-01-01T10:00') q ORDER BY x;
+}
+expect {
+    2024-01-01 10:00:00
+    2024-01-02 09:00:00
+}
+
+@setup tslit
+test ts-lit-group-by-over-union-all {
+    SELECT x, count(*) FROM (SELECT ts AS x FROM m UNION ALL SELECT '2024-01-01T10:00') q GROUP BY x ORDER BY x;
+}
+expect {
+    2024-01-01 10:00:00|2
+    2024-01-02 09:00:00|1
+}
+
+@setup tslit
+test ts-lit-in-subquery-literal {
+    SELECT id FROM m WHERE ts IN (SELECT '2024-01-02T09:00') ORDER BY id;
+}
+expect {
+    2
+}
+
+@setup tslit
+test ts-lit-in-subquery-literal-timestamptz {
+    SELECT id FROM m WHERE tz IN (SELECT '2024-01-01T10:00') ORDER BY id;
+}
+expect {
+    1
+}
+
+@setup tslit
+test ts-lit-in-subquery-union-of-literals {
+    SELECT id FROM m WHERE ts IN (SELECT '2024-01-01T10:00' UNION SELECT '2024-01-02 09:00') ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup tslit
+test ts-lit-in-subquery-text {
+    SELECT id FROM m WHERE ts IN (SELECT 'x' || '');
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp without time zone = text
+}
+expect @tursopg error {
+    operator does not exist: timestamp and text
+}
+
+@setup tslit
+test ts-lit-in-subquery-text-timestamptz {
+    SELECT id FROM m WHERE tz IN (SELECT 'x' || '');
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp with time zone = text
+}
+expect @tursopg error {
+    operator does not exist: timestamp and text
+}
+
+@setup tslit
+test ts-lit-union-text {
+    SELECT ts FROM m UNION SELECT 'x' || '';
+}
+@sqlstate 42804
+expect error {
+    UNION types timestamp without time zone and text cannot be matched
+}
+expect @tursopg error {
+    UNION types timestamp and text cannot be matched
+}
+
+setup tsjoin {
+    CREATE TABLE m (id int, ts timestamp);
+    INSERT INTO m VALUES (1, '2024-01-01 10:00');
+    CREATE TABLE t2 (id int, txt text);
+    INSERT INTO t2 VALUES (1, 'x');
+}
+
+@setup tsjoin
+test ts-lit-join-on-text-column {
+    SELECT m.id FROM m JOIN t2 ON m.ts = t2.txt;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp without time zone = text
+}
+expect @tursopg error {
+    operator does not exist: timestamp and text
+}

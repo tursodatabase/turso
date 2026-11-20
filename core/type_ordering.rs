@@ -81,20 +81,23 @@ impl TypeOrdering {
 /// The microseconds since 2000-01-01 of a timestamp or timestamptz operand, or
 /// None for NULL. An integer is the stored form. Text is what the DECODE of
 /// timestamp or timestamptz gives, or the text of a date, which PostgreSQL
-/// compares as midnight. Every other value cannot be a timestamp, which is an
+/// compares as midnight; it is read by the parser of the ENCODE, so there is no
+/// second text form. Every other value cannot be a timestamp, which is an
 /// error: ordering it somewhere would give a wrong answer, not an error.
 fn read_timestamp_micros(value: ValueRef, allow_integer: bool) -> crate::Result<Option<i64>> {
     match value {
         ValueRef::Null => Ok(None),
         ValueRef::Numeric(Numeric::Integer(micros)) if allow_integer => Ok(Some(micros)),
-        ValueRef::Text(text) => parse_timestamp_text(text.as_str())
-            .map(Some)
-            .ok_or_else(|| {
-                LimboError::InvalidArgument(format!(
-                    "operator does not exist: timestamp and '{}'",
-                    text.as_str()
-                ))
-            }),
+        ValueRef::Text(text) => {
+            crate::functions::datetime_input::read_timestamp_text(text.as_str())
+                .map(Some)
+                .map_err(|_| {
+                    LimboError::InvalidArgument(format!(
+                        "operator does not exist: timestamp and '{}'",
+                        text.as_str()
+                    ))
+                })
+        }
         other => Err(LimboError::InvalidArgument(format!(
             "operator does not exist: timestamp and {other:?}"
         ))),
@@ -102,12 +105,16 @@ fn read_timestamp_micros(value: ValueRef, allow_integer: bool) -> crate::Result<
 }
 
 /// [read_timestamp_micros] for the places that cannot fail (sorting, hashing,
-/// key comparison). A value that is not a timestamp there is a corrupt index or
-/// a bug, which must not be ordered somewhere.
+/// key comparison). Translation reads every untyped literal that meets a
+/// timestamp as one and rejects other text, so a value that is not a timestamp
+/// here is corrupt data (a damaged index or table) and must not be ordered
+/// somewhere.
 fn timestamp_micros(value: ValueRef) -> Option<i64> {
     match read_timestamp_micros(value, true) {
         Ok(micros) => micros,
-        Err(err) => panic!("a value of type timestamp or timestamptz is not one: {err}"),
+        Err(err) => {
+            panic!("corrupt data: a value of type timestamp or timestamptz is not one: {err}")
+        }
     }
 }
 
@@ -117,58 +124,6 @@ fn compare_timestamp_operands(left: ValueRef, right: ValueRef) -> crate::Result<
         read_timestamp_micros(right, false)?,
     );
     Ok(left.cmp(&right))
-}
-
-/// Reads `YYYY-MM-DD`, or `YYYY-MM-DD HH:MM:SS` with up to 6 fractional digits
-/// and an optional `+00`: the only forms tursopg prints a timestamp,
-/// timestamptz or date in. tursopg rejects infinity, BC dates and years past
-/// 9999 on input, so no other form exists.
-fn parse_timestamp_text(text: &str) -> Option<i64> {
-    let bytes = text.as_bytes();
-    let digits = |range: std::ops::Range<usize>| -> Option<i64> {
-        let part = bytes.get(range)?;
-        part.iter()
-            .all(u8::is_ascii_digit)
-            .then(|| part.iter().fold(0i64, |n, d| n * 10 + i64::from(d - b'0')))
-    };
-    let date = chrono::NaiveDate::from_ymd_opt(
-        i32::try_from(digits(0..4)?).ok()?,
-        u32::try_from(digits(5..7)?).ok()?,
-        u32::try_from(digits(8..10)?).ok()?,
-    )?;
-    if bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
-        return None;
-    }
-    let epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1)?;
-    let days = date.signed_duration_since(epoch).num_days();
-    let mut micros = days * 86_400_000_000;
-    if bytes.len() == 10 {
-        return Some(micros);
-    }
-    if bytes.get(10) != Some(&b' ') || bytes.get(13) != Some(&b':') || bytes.get(16) != Some(&b':')
-    {
-        return None;
-    }
-    let (hour, minute, second) = (digits(11..13)?, digits(14..16)?, digits(17..19)?);
-    if hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    micros += ((hour * 60 + minute) * 60 + second) * 1_000_000;
-    let mut rest = &text[19..];
-    rest = rest.strip_suffix("+00").unwrap_or(rest);
-    if let Some(fraction) = rest.strip_prefix('.') {
-        if fraction.is_empty()
-            || fraction.len() > 6
-            || !fraction.bytes().all(|c| c.is_ascii_digit())
-        {
-            return None;
-        }
-        let scale = 10i64.pow(6 - fraction.len() as u32);
-        micros += fraction.parse::<i64>().ok()? * scale;
-    } else if !rest.is_empty() {
-        return None;
-    }
-    Some(micros)
 }
 
 /// NULL first; then arrays, element by element and then shorter first; then
@@ -371,7 +326,6 @@ mod tests {
         for bad in [
             Value::from_text("abc"),
             Value::from_text("infinity"),
-            Value::from_text("2000-01-01 00:00:00.1234567"),
             Value::from_text("2000-13-01"),
             Value::from_f64(1.0),
             Value::from_blob(crate::alloc::vec![1]),

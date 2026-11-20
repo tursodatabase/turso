@@ -728,6 +728,17 @@ fn common_ordering(
             Some((_, other_ty)) => return Err(cannot_compare(other_ty, ty)),
         }
     }
+    // The order of a timestamp reads only timestamps, so a value of a type
+    // that is not one (the text of a column, say) must not meet it: PostgreSQL
+    // has no operator for it, and hashing or sorting it would be wrong.
+    if let Some((TypeOrdering::Timestamp, _)) = found {
+        if let Some(other) = types
+            .iter()
+            .find(|ty| crate::translate::expr::cannot_meet_timestamp(ty, schema))
+        {
+            crate::bail_parse_error!("operator does not exist: timestamp and {other}");
+        }
+    }
     match (found, array_of_unknown_elements) {
         (None, Some(_)) => Ok(Some(TypeOrdering::Array)),
         (Some((other, other_ty)), Some(array_ty))
