@@ -216,6 +216,9 @@ pub fn py_turso_sync_new(
     let sync_config = rsapi::TursoDatabaseSyncConfig {
         cipher: sync_config
             .remote_encryption_cipher
+            .filter(|_| {
+                db_config.encryption.is_some() || sync_config.remote_encryption_key.is_some()
+            })
             .map(|cipher| cipher.cipher_name().to_string()),
         path: sync_config.path.clone(),
         remote_url: sync_config.remote_url.clone(),

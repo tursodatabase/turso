@@ -31,6 +31,37 @@ class EmptyEncryptedSource(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class KeylessCipherTests(unittest.TestCase):
+    def test_sync_cipher_without_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            options = dict(remote_url="http://127.0.0.1:1", bootstrap_if_empty=False,
+                           remote_encryption_cipher=sync.RemoteEncryptionCipher.ChaCha20Poly1305)
+            db = sync.connect(str(Path(directory) / "replica.db"), **options)
+            try:
+                self.assertEqual(db.execute("SELECT 1").fetchone(), (1,))
+            finally:
+                db.close()
+            with self.assertRaisesRegex(Exception, "Unknown cipher name"):
+                sync.connect(str(Path(directory) / "encrypted.db"),
+                             remote_encryption_key=CLOUD_KEY, **options)
+
+    def test_async_cipher_without_keys(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as directory:
+                db = await aio_sync.connect(
+                    str(Path(directory) / "replica.db"), remote_url="http://127.0.0.1:1",
+                    bootstrap_if_empty=False,
+                    remote_encryption_cipher=sync.RemoteEncryptionCipher.ChaCha20Poly1305,
+                )
+                try:
+                    cursor = await db.execute("SELECT 1")
+                    self.assertEqual(await cursor.fetchone(), (1,))
+                    await cursor.close()
+                finally:
+                    await db.close()
+        asyncio.run(run())
+
+
 class SyncEncryptionTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -83,6 +114,15 @@ class SyncEncryptionTests(unittest.TestCase):
             self.assertEqual(await cursor.fetchone(), ("binding private marker",))
             await db.close()
         asyncio.run(run())
+
+    def test_cloud_only_encryption_forwards_cipher_header(self):
+        options = self.options(True)
+        options.pop("local_encryption_key")
+        db = sync.connect(self.path, **options)
+        try:
+            self.assertFalse(Path(self.path + "-info").read_bytes().startswith(b"TSYNMETA"))
+        finally:
+            db.close()
 
 
 if __name__ == "__main__":
