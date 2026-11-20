@@ -12,7 +12,9 @@
 //! expectations and counts them per label.
 
 use crate::backends::QueryResult;
-use crate::parser::ast::{Backend, Expectation, Skip, SkipCondition, TestCase, TestFile};
+use crate::parser::ast::{
+    Backend, Expectation, Requirement, Skip, SkipCondition, TestCase, TestFile,
+};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -198,8 +200,14 @@ impl fmt::Display for GapClass {
 }
 
 /// Checks the rules for a test with a `@compat-gap` decorator. `global_skip` are the
-/// `@skip-file` and `@skip-file-if` directives of its file.
-fn check_gap_test(test: &TestCase, label: &str, global_skip: &[Skip]) -> Result<(), String> {
+/// `@skip-file` and `@skip-file-if` directives of its file, and `global_requires` are
+/// its `@requires-file` directives.
+fn check_gap_test(
+    test: &TestCase,
+    label: &str,
+    global_skip: &[Skip],
+    global_requires: &[Requirement],
+) -> Result<(), String> {
     label_kind(label)?;
     let Some(tursopg) = test.expectations.overrides.get(&Backend::Tursopg) else {
         return Err(
@@ -238,6 +246,15 @@ fn check_gap_test(test: &TestCase, label: &str, global_skip: &[Skip]) -> Result<
             }
             Some(SkipCondition::Mvcc | SkipCondition::Sqlite) => {}
         }
+    }
+    // The postgres and tursopg backends have no capabilities, so a requirement
+    // skips the test on both, and `sqltest gaps` would count a gap that no run
+    // checks.
+    if let Some(requirement) = test.modifiers.requires.iter().chain(global_requires).next() {
+        return Err(format!(
+            "a @compat-gap test cannot have @requires or @requires-file ({}): the postgres and tursopg backends skip it, so no run checks the gap",
+            requirement.reason
+        ));
     }
     let postgres = &test.expectations.default;
     for (side, expectation) in [("default", postgres), ("@tursopg", tursopg)] {
@@ -428,7 +445,7 @@ fn markdown_cell(text: &str) -> String {
 /// and of an `expect @tursopg` block without `@compat-gap`.
 pub fn lint_test(file: &TestFile, test: &TestCase) -> Result<(), String> {
     match &test.gap {
-        Some(label) => check_gap_test(test, label, &file.global_skip),
+        Some(label) => check_gap_test(test, label, &file.global_skip, &file.global_requires),
         None => check_tursopg_override(test),
     }
 }
@@ -543,6 +560,19 @@ expect @tursopg {
         ))
         .expect_err("the file must not parse");
         assert!(format!("{err:?}").contains("postgres"), "{err:?}");
+    }
+
+    #[test]
+    fn lint_gap_that_requires_a_capability() {
+        assert_rejected(
+            &WRONG.replace("@compat-gap", "@requires strict \"x\"\n@compat-gap"),
+            "@requires",
+        );
+        let err = parse_with_gap_lints(&format!(
+            "@database :memory:\n@requires-file strict \"x\"\n{WRONG}"
+        ))
+        .expect_err("the file must not parse");
+        assert!(format!("{err:?}").contains("@requires-file"), "{err:?}");
     }
 
     #[test]
