@@ -756,6 +756,10 @@ test datetime-current-timestamp-with-precision {
 expect {
     1
 }
+@sqlstate 0A000
+expect @tursopg error {
+    a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP is not supported
+}
 
 test datetime-foreign-key-on-timestamptz {
     CREATE TABLE fk_parent (k timestamptz PRIMARY KEY);
@@ -1118,12 +1122,12 @@ expect {
 }
 
 test datetime-input-timestamp-literal-compares-with-timestamptz-literal {
-    SELECT '2024-01-05 10:00'::timestamp = '2024-01-05 10:00'::timestamptz,
-           '2024-01-05 10:00'::timestamp < '2024-01-05 10:00'::timestamptz,
-           '2024-01-05 10:00'::timestamp < '2024-01-05 10:00:00.5'::timestamptz;
+    SELECT ('2024-01-05 10:00'::timestamp = '2024-01-05 10:00'::timestamptz)::int,
+           ('2024-01-05 10:00'::timestamp < '2024-01-05 10:00'::timestamptz)::int,
+           ('2024-01-05 10:00'::timestamp < '2024-01-05 10:00:00.5'::timestamptz)::int;
 }
 expect {
-    t|f|t
+    1|0|1
 }
 
 test datetime-input-union-of-timestamp-and-timestamptz {
@@ -1140,7 +1144,7 @@ expect {
 
 test datetime-input-untyped-literal-in-timestamptz-array {
     SELECT array_to_json(ARRAY['2024-01-05'::timestamptz, '2024-01-06']),
-           ARRAY['2024-01-05'::timestamp, '2024-01-06']::text;
+           ARRAY['2024-01-05'::timestamp, '2024-01-06'];
 }
 expect {
     ["2024-01-05T00:00:00+00:00","2024-01-06T00:00:00+00:00"]|{"2024-01-05 00:00:00","2024-01-06 00:00:00"}

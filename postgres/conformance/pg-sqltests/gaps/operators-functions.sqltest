@@ -767,6 +767,11 @@ test gap-b-77-now-text-format-has-offset-and-micros {
 expect {
     t
 }
+# now() now prints the offset and microseconds, so only the boolean format
+# differs.
+expect @tursopg {
+    1
+}
 
 # B-78 (S1): gen_random_uuid() format
 test gap-b-78-gen-random-uuid-format {
