@@ -3947,6 +3947,12 @@ pub(crate) fn plain_string_payload(element: &[u8]) -> Option<&[u8]> {
     (!payload.iter().any(|&byte| ESCAPED_IN_TEXT[byte as usize])).then_some(payload)
 }
 
+/// Whether the JSON text of the string `text` has an escape: `text` has a
+/// control character, a `"` or a `\`.
+pub(crate) fn needs_escape(text: &[u8]) -> bool {
+    text.iter().any(|&byte| ESCAPED_IN_TEXT[byte as usize])
+}
+
 /// Returns `bytes` as text, like [String::from_utf8_lossy]. Valid UTF-8, the
 /// usual case, is checked with [validate_utf8], which is faster than the
 /// byte-at-a-time decoder of the lossy conversion.

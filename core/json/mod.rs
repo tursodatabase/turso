@@ -1210,24 +1210,30 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
                 return Ok(value.to_owned()?);
             }
 
+            let text = t.as_str();
             let mut escaped_value = String::with_capacity(t.value.len() + 4);
             escaped_value.push('"');
-
-            for c in t.as_str().chars() {
-                match c {
-                    '"' | '\\' => {
-                        escaped_value.push('\\');
-                        escaped_value.push(c);
+            // Usually the text has no character to escape, and its JSON text
+            // is the text in quotes.
+            if !jsonb::needs_escape(text.as_bytes()) {
+                escaped_value.push_str(text);
+            } else {
+                for c in text.chars() {
+                    match c {
+                        '"' | '\\' => {
+                            escaped_value.push('\\');
+                            escaped_value.push(c);
+                        }
+                        '\u{0008}' => escaped_value.push_str("\\b"),
+                        '\u{000c}' => escaped_value.push_str("\\f"),
+                        '\n' => escaped_value.push_str("\\n"),
+                        '\r' => escaped_value.push_str("\\r"),
+                        '\t' => escaped_value.push_str("\\t"),
+                        c if (c as u32) < 0x20 => {
+                            let _ = write!(escaped_value, "\\u{:04x}", c as u32);
+                        }
+                        c => escaped_value.push(c),
                     }
-                    '\u{0008}' => escaped_value.push_str("\\b"),
-                    '\u{000c}' => escaped_value.push_str("\\f"),
-                    '\n' => escaped_value.push_str("\\n"),
-                    '\r' => escaped_value.push_str("\\r"),
-                    '\t' => escaped_value.push_str("\\t"),
-                    c if (c as u32) < 0x20 => {
-                        let _ = write!(escaped_value, "\\u{:04x}", c as u32);
-                    }
-                    c => escaped_value.push(c),
                 }
             }
             escaped_value.push('"');
@@ -1401,6 +1407,25 @@ mod tests {
             // Test passed
         } else {
             panic!("Expected Value::Null");
+        }
+    }
+
+    #[test]
+    fn json_quote_escapes_only_the_characters_that_need_an_escape() {
+        let cases = [
+            ("user_1", r#""user_1""#),
+            ("caf\u{e9} \u{20ac}", "\"caf\u{e9} \u{20ac}\""),
+            ("a\"b\\c", r#""a\"b\\c""#),
+            ("tab\there\n", r#""tab\there\n""#),
+            ("\u{1}\u{1f}", r#""\u0001\u001f""#),
+            ("", "\"\""),
+        ];
+        for (text, expected) in cases {
+            let Value::Text(quoted) = json_quote(Value::build_text(text)).unwrap() else {
+                panic!("Expected Value::Text");
+            };
+            assert_eq!(quoted.as_str(), expected);
+            assert_eq!(quoted.subtype, TextSubtype::Json);
         }
     }
 
