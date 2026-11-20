@@ -5132,10 +5132,6 @@ impl WalFile {
                     let mut group = CompletionGroup::new(|_| {});
                     let mut ongoing_chkpt = self.ongoing_checkpoint.write();
 
-                    // Check and clean any completed writes from pending flush
-                    if ongoing_chkpt.process_inflight_writes() {
-                        tracing::trace!("Completed a write batch");
-                    }
                     // Process completed reads into current batch
                     if ongoing_chkpt.process_pending_reads()? {
                         tracing::trace!("Drained reads into batch");
@@ -5151,6 +5147,11 @@ impl WalFile {
                         pager.io.cancel(&to_cancel)?;
                         pager.io.drain_completions(&to_cancel)?;
                         return Err(LimboError::CompletionError(e).into());
+                    }
+                    // Remove completed writes only after the error check, so that a
+                    // failed batch is never counted as backfilled.
+                    if ongoing_chkpt.process_inflight_writes() {
+                        tracing::trace!("Completed a write batch");
                     }
                     let epoch = self.coordination.checkpoint_epoch();
                     // Issue reads until we hit limits
