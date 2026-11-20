@@ -4119,7 +4119,7 @@ impl Schema {
     /// The tables `select` reads, with the namespace each resolves to when
     /// the select is the body of a view of `namespace`. A table of a
     /// namespace the schema does not know is left out.
-    fn referenced_tables_of(
+    pub fn referenced_tables_of(
         &self,
         namespace: NamespaceId,
         select: &ast::Select,

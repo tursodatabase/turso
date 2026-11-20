@@ -2222,3 +2222,21 @@ test pg-description-rejects-ddl {
 expect error {
     permission denied: "pg_description" is a system catalog
 }
+
+test pg-depend-has-the-relations-that-a-view-reads {
+    CREATE TABLE dep_base (a int);
+    CREATE TABLE dep_other (a int);
+    CREATE TABLE dep_unread (a int);
+    CREATE VIEW dep_inner AS SELECT a FROM dep_base;
+    CREATE VIEW dep_outer AS
+        SELECT a FROM dep_inner WHERE EXISTS (SELECT 1 FROM dep_other);
+    SELECT DISTINCT t.relname, d.deptype
+    FROM pg_depend d JOIN pg_class t ON t.oid = d.refobjid
+    WHERE d.classid = 2618 AND d.refclassid = 1259
+      AND t.relname IN ('dep_base', 'dep_other', 'dep_unread')
+    ORDER BY 1;
+}
+expect {
+    dep_base|n
+    dep_other|n
+}

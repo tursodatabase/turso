@@ -97,6 +97,10 @@ pg_dump does not emit a command to clear that comment on restore. Dropping a
 relation, a column or a schema deletes its comments. The public schema reports
 `pg_database_owner` as its owner, with CREATE and USAGE for that role and USAGE
 for PUBLIC. These are catalog defaults; role management is not implemented.
+`pg_depend` has the rows of each view's `_RETURN` rule: the rule is part of
+the view, and depends on each table and view that the view reads, as whole
+relations and not column by column. The rule is not in `pg_rewrite` and the
+view is not in `pg_class`.
 `pg_statistic_ext` exposes the hidden system column
 `tableoid` for pg_dump discovery. `pg_trigger` exposes `tgparentid` for
 parent-trigger lookup and hidden `tableoid` during dump discovery.
