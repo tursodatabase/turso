@@ -11,7 +11,7 @@ use crate::{
     schema::{Column, Schema, Table},
     LimboError, Result,
 };
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast;
 
 /// Information about a table referenced in a view
@@ -709,4 +709,125 @@ pub fn extract_view_columns(
     schema: &Schema,
 ) -> Result<ViewColumnSchema> {
     extract_view_columns_inner(namespace, select_stmt, schema, &HashMap::default())
+}
+
+/// The tables `select` reads, each with the namespace it is written
+/// with, if any. A name that is a CTE of the select is not a table.
+pub(crate) fn referenced_tables(select: &ast::Select) -> std::vec::Vec<(Option<String>, String)> {
+    fn collect_source(
+        source: &ast::SelectTable,
+        cte_names: &HashSet<String>,
+        tables: &mut HashSet<(Option<String>, String)>,
+    ) {
+        match source {
+            ast::SelectTable::Table(name, _, _) => {
+                if cte_names
+                    .iter()
+                    .any(|cte| cte.eq_ignore_ascii_case(name.name.as_str()))
+                {
+                    return;
+                }
+                tables.insert((
+                    name.namespace
+                        .as_ref()
+                        .map(|namespace| crate::util::normalize_ident(namespace.as_str())),
+                    crate::util::normalize_ident(name.name.as_str()),
+                ));
+            }
+            ast::SelectTable::Select { select, .. } => collect_select(select, cte_names, tables),
+            ast::SelectTable::Sub(from, _) => {
+                collect_source(&from.select, cte_names, tables);
+                for join in &from.joins {
+                    collect_source(&join.table, cte_names, tables);
+                }
+            }
+            ast::SelectTable::TableCall(_, _, _) => {}
+        }
+    }
+
+    fn collect_one(
+        select: &ast::OneSelect,
+        cte_names: &HashSet<String>,
+        tables: &mut HashSet<(Option<String>, String)>,
+    ) {
+        let ast::OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            distinctness,
+            ..
+        } = select
+        else {
+            return;
+        };
+        let mut exprs = Vec::new();
+        if let Some(from) = from {
+            for source in std::iter::once(from.select.as_ref())
+                .chain(from.joins.iter().map(|join| join.table.as_ref()))
+            {
+                collect_source(source, cte_names, tables);
+            }
+            for join in &from.joins {
+                if let Some(ast::JoinConstraint::On(on)) = &join.constraint {
+                    exprs.push(on.as_ref());
+                }
+            }
+        }
+        for column in columns {
+            if let ast::ResultColumn::Expr(expr, _) = column {
+                exprs.push(expr.as_ref());
+            }
+        }
+        exprs.extend(where_clause.as_deref());
+        if let Some(group_by) = group_by {
+            exprs.extend(group_by.exprs.iter().map(|expr| expr.as_ref()));
+            exprs.extend(group_by.having.as_deref());
+        }
+        exprs.extend(
+            distinctness
+                .iter()
+                .flat_map(|distinctness| distinctness.exprs())
+                .map(|expr| expr.as_ref()),
+        );
+        // Subqueries in expressions read tables too: the planner may turn
+        // `EXISTS (SELECT ... FROM t)` into a join with `t`.
+        for expr in exprs {
+            crate::translate::expr::walk_expr(expr, &mut |expr: &ast::Expr| {
+                match expr {
+                    ast::Expr::Exists(select)
+                    | ast::Expr::Subquery(select)
+                    | ast::Expr::InSelect { rhs: select, .. } => {
+                        collect_select(select, cte_names, tables);
+                    }
+                    _ => {}
+                }
+                Ok(crate::translate::expr::WalkControl::Continue)
+            })
+            .expect("collecting subquery tables cannot fail");
+        }
+    }
+
+    fn collect_select(
+        select: &ast::Select,
+        inherited_ctes: &HashSet<String>,
+        tables: &mut HashSet<(Option<String>, String)>,
+    ) {
+        let mut cte_names = inherited_ctes.clone();
+        if let Some(with) = &select.with {
+            for cte in &with.ctes {
+                cte_names.insert(crate::util::normalize_ident(cte.tbl_name.as_str()));
+            }
+            for cte in &with.ctes {
+                collect_select(&cte.select, &cte_names, tables);
+            }
+        }
+        collect_one(&select.body.select, &cte_names, tables);
+        for compound in &select.body.compounds {
+            collect_one(&compound.select, &cte_names, tables);
+        }
+    }
+    let mut tables = HashSet::default();
+    collect_select(select, &HashSet::default(), &mut tables);
+    tables.into_iter().collect()
 }

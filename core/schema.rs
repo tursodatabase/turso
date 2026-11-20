@@ -4066,7 +4066,7 @@ impl Schema {
 
     /// Every name a materialized view's dependency must be registered under:
     /// the tables its query reads (including tables read only inside
-    /// subqueries, see [IncrementalView::referenced_table_names]), with each
+    /// subqueries, see [view::referenced_tables]), with each
     /// plain `VIEW` among them expanded recursively, since a view can itself
     /// select from another view, down to the real tables it reads. A write
     /// only ever lands on a real table, so if a dependency were left naming
@@ -4125,7 +4125,7 @@ impl Schema {
         select: &ast::Select,
     ) -> Vec<(NamespaceId, String)> {
         let mut tables = vec![];
-        for (qualifier, name) in IncrementalView::referenced_tables(select) {
+        for (qualifier, name) in view::referenced_tables(select) {
             let table_namespace = match qualifier.as_deref() {
                 None => namespace,
                 Some("main") => NamespaceId::ROOT,
