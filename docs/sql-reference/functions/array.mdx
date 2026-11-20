@@ -535,6 +535,8 @@ SELECT ARRAY[1,2,3] @> ARRAY[1,4];
 -- 0
 ```
 
+Through the PostgreSQL frontend, `@>` and `<@` also compare jsonb values, as in PostgreSQL: `a <@ b` is `b @> a`. If an operand is an array, the operator compares arrays. If neither operand is an array, it tests whether the left JSON value contains the right one: `'{"a":1,"b":2}'::jsonb @> '{"a":1}'` is true. An index expression and a stored generated column compare arrays only.
+
 ### Overlap: &&
 
 Tests whether two arrays share any common elements. Equivalent to `array_overlap(left, right)`.

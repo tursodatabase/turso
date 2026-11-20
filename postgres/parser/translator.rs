@@ -4225,7 +4225,24 @@ impl PostgreSQLTranslator {
             ">>" => ast::Operator::RightShift,
             "AND" => ast::Operator::And,
             "OR" => ast::Operator::Or,
-            // Array operators → translate to native array function calls
+            // PostgreSQL has @> and <@ for arrays and for jsonb, and only the
+            // type of an operand tells which one runs. Only core knows the
+            // types, so core chooses. `a <@ b` is `b @> a`.
+            //
+            // A generation expression and an index expression can use only
+            // core functions, so they keep the array function. Thus the values
+            // that such a column or index stored before stay the same.
+            "@>" | "<@"
+                if self.generation_expression_table.borrow().is_none()
+                    && !self.translating_index.get() =>
+            {
+                let (lhs, rhs) = if op_name == "@>" {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                return Ok(ast::Expr::Binary(lhs, ast::Operator::ArrayContains, rhs));
+            }
             "@>" | "<@" | "&&" => {
                 let (func_name, args) = match op_name {
                     "@>" => ("array_contains_all", vec![left, right]),
@@ -12178,47 +12195,29 @@ mod tests {
 
     #[test]
     fn test_array_contains_operator() {
-        let translator = PostgreSQLTranslator::new();
-        let sql = "SELECT id FROM posts WHERE tags @> '{\"ORM\"}'";
-        let parsed = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parsed).unwrap();
-        if let ast::Stmt::Select(select) = translated {
-            if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
-                let wc = where_clause.as_ref().expect("Expected WHERE clause");
-                if let ast::Expr::FunctionCall { name, args, .. } = &**wc {
-                    assert_eq!(name.as_str(), "array_contains_all");
-                    assert_eq!(args.len(), 2);
-                } else {
-                    panic!("Expected FunctionCall for @>, got: {wc:?}");
-                }
-            } else {
-                panic!("Expected Select variant");
-            }
-        } else {
-            panic!("Expected Select statement");
-        }
+        let wc = where_clause_of("SELECT id FROM posts WHERE tags @> '{\"ORM\"}'");
+        let ast::Expr::Binary(lhs, ast::Operator::ArrayContains, rhs) = wc else {
+            panic!("Expected ArrayContains for @>, got: {wc:?}");
+        };
+        assert!(
+            matches!(&*lhs, ast::Expr::Id(name) if name.as_str() == "tags"),
+            "{lhs:?}"
+        );
+        assert!(matches!(&*rhs, ast::Expr::Literal(_)), "{rhs:?}");
     }
 
+    /// `a <@ b` is `b @> a`.
     #[test]
     fn test_array_contained_operator() {
-        let translator = PostgreSQLTranslator::new();
-        let sql = "SELECT id FROM posts WHERE tags <@ '{\"ORM\"}'";
-        let parsed = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parsed).unwrap();
-        if let ast::Stmt::Select(select) = translated {
-            if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
-                let wc = where_clause.as_ref().expect("Expected WHERE clause");
-                if let ast::Expr::FunctionCall { name, .. } = &**wc {
-                    assert_eq!(name.as_str(), "array_contains_all");
-                } else {
-                    panic!("Expected FunctionCall for <@, got: {wc:?}");
-                }
-            } else {
-                panic!("Expected Select variant");
-            }
-        } else {
-            panic!("Expected Select statement");
-        }
+        let wc = where_clause_of("SELECT id FROM posts WHERE tags <@ '{\"ORM\"}'");
+        let ast::Expr::Binary(lhs, ast::Operator::ArrayContains, rhs) = wc else {
+            panic!("Expected ArrayContains for <@, got: {wc:?}");
+        };
+        assert!(matches!(&*lhs, ast::Expr::Literal(_)), "{lhs:?}");
+        assert!(
+            matches!(&*rhs, ast::Expr::Id(name) if name.as_str() == "tags"),
+            "{rhs:?}"
+        );
     }
 
     /// Extract the WHERE clause of a translated single SELECT.

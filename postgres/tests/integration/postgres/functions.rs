@@ -914,3 +914,42 @@ fn test_pg_jsonb_arrows_with_parameters(db: TempDatabase) {
         vec![vec![Value::build_text("6")]]
     );
 }
+
+/// A Data API sends the value of a contains filter as a parameter. `@>` and
+/// `<@` compare a jsonb column with it by jsonb containment, and compare an
+/// array column with it as arrays.
+#[turso_macros::test(mvcc)]
+fn test_pg_containment_with_parameters(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE items (id int PRIMARY KEY, data jsonb, tags text[])")
+        .unwrap();
+    conn.execute(
+        r#"INSERT INTO items VALUES (1, '{"qty":10,"tags":["fruit"]}', '{fruit,red}'), (2, '{"qty":2}', '{bakery}')"#,
+    )
+    .unwrap();
+    let param = |index| std::num::NonZero::new(index).unwrap();
+
+    for (sql, value, expected_id) in [
+        ("SELECT id FROM items WHERE data @> $1", r#"{"qty":2}"#, 2),
+        (
+            "SELECT id FROM items WHERE data @> $1",
+            r#"{"tags":["fruit"]}"#,
+            1,
+        ),
+        (
+            "SELECT id FROM items WHERE data <@ $1",
+            r#"{"qty":2,"other":1}"#,
+            2,
+        ),
+        ("SELECT id FROM items WHERE tags @> $1", "{red}", 1),
+        ("SELECT id FROM items WHERE tags <@ $1", "{bakery,bread}", 2),
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.bind_at(param(1), Value::build_text(value)).unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(expected_id)]],
+            "{sql} with $1 = {value}"
+        );
+    }
+}
