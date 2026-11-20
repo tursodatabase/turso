@@ -8,7 +8,7 @@ use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
 
 use crate::{
     json::{
-        convert_dbtype_to_jsonb, json_path_from_db_value, json_path_text,
+        convert_dbtype_to_jsonb, json_path_text,
         jsonb::{IteratorState, Jsonb, SearchOperation},
         path::{json_path, JsonPath, PathElement},
         vtab::columns::{Columns, Key},
@@ -294,11 +294,14 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             ));
         }
 
-        let mut jsonb = convert_dbtype_to_jsonb(&args[0], Conv::Strict)?;
+        let jsonb = convert_dbtype_to_jsonb(&args[0], Conv::Strict)?;
+        // The path is parsed once, after the document, for the search and
+        // for the path of the cursor.
+        let root_json_path = json_path(&root_path)?;
 
         let (root_json, root_offset, root_id) = if args.len() == 1 {
             (jsonb, 0, 0)
-        } else if let Some(found) = navigate_to_path(&mut jsonb, &args[1])? {
+        } else if let Some(found) = navigate_to_path(jsonb, &root_json_path)? {
             found
         } else {
             return Ok(false);
@@ -307,8 +310,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         self.json = root_json;
         self.root_offset = root_offset;
         self.id = root_id;
-        self.path_to_current_value
-            .set(&root_path, &json_path(&root_path)?);
+        self.path_to_current_value.set(&root_path, &root_json_path);
         let iterator_state = json_iterator_from(&self.json)?;
         let innermost_container_path = if matches!(self.traversal_mode, JsonTraversalMode::Tree)
             && matches!(iterator_state, IteratorState::Primitive(_))
@@ -501,16 +503,15 @@ fn json_iterator_from(json: &Jsonb) -> crate::Result<IteratorState> {
         }
     }
 }
+/// Returns the element of `jsonb` at `json_path`, in the buffer of `jsonb`,
+/// with its offset and its id.
 fn navigate_to_path(
-    jsonb: &mut Jsonb,
-    path: &Value,
+    mut jsonb: Jsonb,
+    json_path: &JsonPath,
 ) -> Result<Option<(Jsonb, i64, i64)>, LimboError> {
-    let json_path = json_path_from_db_value(path, true)?.ok_or_else(|| {
-        LimboError::InvalidArgument(format!("path '{path}' is not a valid json path"))
-    })?;
-    let mut search_operation = SearchOperation::new();
+    let mut search_operation = SearchOperation::locate();
     if jsonb
-        .operate_on_path(&json_path, &mut search_operation)
+        .operate_on_path(json_path, &mut search_operation)
         .is_err()
     {
         return Ok(None);
@@ -519,7 +520,11 @@ fn navigate_to_path(
     let root_id = search_operation
         .label_offset()
         .map_or(value_offset, |offset| offset as i64);
-    Ok(Some((search_operation.result(), value_offset, root_id)))
+    Ok(Some((
+        search_operation.into_element(jsonb),
+        value_offset,
+        root_id,
+    )))
 }
 
 mod columns {
