@@ -13,9 +13,19 @@ pub(crate) enum SettingScope {
 #[derive(Default)]
 pub(crate) struct PgSessionState {
     settings: Mutex<ConnectionSettings>,
+    /// Set for a client that the caller has not authenticated: it may not
+    /// read host files with `COPY FROM`, although it starts as the superuser.
+    pub(crate) file_copy_denied: bool,
 }
 
 impl PgSessionState {
+    pub(crate) fn new(file_copy_denied: bool) -> Self {
+        Self {
+            file_copy_denied,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn mutate(&self, conn: &Connection, mutate: impl FnOnce(&mut ConnectionSettings)) {
         let mut settings = self.settings.lock().unwrap();
         settings.save_memo_before_change(conn.has_active_root_statement(), !conn.get_auto_commit());

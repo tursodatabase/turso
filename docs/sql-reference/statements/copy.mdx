@@ -41,3 +41,8 @@ COPY reads changes visible to the current transaction and does not commit that
 transaction. Views, query sources such as `COPY (SELECT ...)`, file or program
 destinations, CSV, binary format, and custom output options are not supported.
 COPY TO STDOUT is not supported through the extended query protocol.
+
+`COPY table FROM 'file'` reads a file on the host and is not available through
+`tursopg --server`, which does not authenticate clients: every session starts as
+the superuser, so the server refuses it with
+`permission denied to COPY from a file` (`42501`).
