@@ -705,25 +705,10 @@ fn resolve_unqualified_outer_column(
     table_references: &TableReferences,
     column_name: &str,
 ) -> Result<Option<ResolvedColumn>> {
-    // Definition-only entries let a FROM clause find a CTE by name; the CTE's
-    // columns are visible only after a FROM clause adds the table.
-    let outer_refs: Vec<&OuterQueryReference> = table_references
-        .outer_query_refs()
-        .iter()
-        .filter(|outer_ref| !outer_ref.cte_definition_only)
-        .collect();
-    let mut scope_depths: Vec<usize> = outer_refs.iter().map(|r| r.scope_depth).collect();
-    scope_depths.sort_unstable();
-    scope_depths.dedup();
     let is_rowid_name = crate::translate::planner::ROWID_STRS
         .iter()
         .any(|name| name.eq_ignore_ascii_case(column_name));
-    for scope_depth in scope_depths {
-        let scope: Vec<&OuterQueryReference> = outer_refs
-            .iter()
-            .copied()
-            .filter(|outer_ref| outer_ref.scope_depth == scope_depth)
-            .collect();
+    for scope in outer_query_scopes(table_references) {
         let has_declared_column = is_rowid_name
             && scope.iter().any(|outer_ref| {
                 !matches!(
@@ -854,22 +839,9 @@ fn resolve_qualified_name(
         scope_match => return Ok(scope_match),
     }
 
-    // Definition-only entries let a FROM clause find a CTE by name; the CTE's
-    // columns are visible only after a FROM clause adds the table.
-    let outer_refs: Vec<&OuterQueryReference> = table_references
-        .outer_query_refs()
-        .iter()
-        .filter(|outer_ref| !outer_ref.cte_definition_only)
-        .collect();
-    let mut scope_depths: Vec<usize> = outer_refs.iter().map(|r| r.scope_depth).collect();
-    scope_depths.sort_unstable();
-    scope_depths.dedup();
-    for scope_depth in scope_depths {
+    for scope in outer_query_scopes(table_references) {
         let mut candidates = Vec::new();
-        for outer_ref in outer_refs
-            .iter()
-            .filter(|outer_ref| outer_ref.scope_depth == scope_depth)
-        {
+        for outer_ref in scope {
             candidates.push(QualifiedCandidate {
                 table_id: outer_ref.internal_id,
                 table: &outer_ref.table,
@@ -903,6 +875,31 @@ fn resolve_qualified_name(
     } else {
         Ok(QualifiedNameMatch::NoTable)
     }
+}
+
+/// The outer query tables whose columns a subquery can name, grouped by query
+/// scope, closest scope first.
+fn outer_query_scopes(table_references: &TableReferences) -> Vec<Vec<&OuterQueryReference>> {
+    // Definition-only entries let a FROM clause find a CTE by name; the CTE's
+    // columns are visible only after a FROM clause adds the table.
+    let outer_refs: Vec<&OuterQueryReference> = table_references
+        .outer_query_refs()
+        .iter()
+        .filter(|outer_ref| !outer_ref.cte_definition_only)
+        .collect();
+    let mut scope_depths: Vec<usize> = outer_refs.iter().map(|r| r.scope_depth).collect();
+    scope_depths.sort_unstable();
+    scope_depths.dedup();
+    scope_depths
+        .into_iter()
+        .map(|scope_depth| {
+            outer_refs
+                .iter()
+                .copied()
+                .filter(|outer_ref| outer_ref.scope_depth == scope_depth)
+                .collect()
+        })
+        .collect()
 }
 
 /// One FROM item of a query scope, matched against a qualified name.
