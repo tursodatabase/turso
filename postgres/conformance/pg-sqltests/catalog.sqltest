@@ -1801,3 +1801,11 @@ expect {
     zz_serial_depend_owned_seq|2|a
     zz_serial_depend_c_seq|3|a
 }
+
+test pg-description-rejects-ddl {
+    DROP TABLE pg_description;
+}
+@sqlstate 42501
+expect error {
+    permission denied: "pg_description" is a system catalog
+}

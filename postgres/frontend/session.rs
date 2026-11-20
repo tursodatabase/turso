@@ -593,6 +593,7 @@ fn translate_statement<'a>(
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
     let sql = write_out_renamed_serial_columns(&pg_conn.conn, sql, &translated.serial_sequences)?;
     reject_catalog_dml(translated.cmd.stmt())?;
+    reject_catalog_ddl(translated.cmd.stmt())?;
     if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
         reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
     }
@@ -1798,6 +1799,37 @@ fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
     Err(sqlstate_error(
         SQLSTATE_INSUFFICIENT_PRIVILEGE,
         format!("cannot {verb} pg_catalog table \"{table_name}\""),
+        None,
+    ))
+}
+
+/// Refuses a statement that changes the definition of a catalog table, as
+/// PostgreSQL does. A table of the same name in a schema of the user's is
+/// not a catalog table.
+fn reject_catalog_ddl(stmt: &ast::Stmt) -> Result<()> {
+    let (schema, table_name) = match stmt {
+        ast::Stmt::AlterTable(ast::AlterTable { name, .. }) => {
+            (name.namespace.as_ref(), &name.name)
+        }
+        ast::Stmt::DropTable { tbl_name, .. } | ast::Stmt::CreateTrigger { tbl_name, .. } => {
+            (tbl_name.namespace.as_ref(), &tbl_name.name)
+        }
+        ast::Stmt::CreateIndex {
+            idx_name, tbl_name, ..
+        } => (idx_name.namespace.as_ref(), tbl_name),
+        _ => return Ok(()),
+    };
+    let table_name = table_name.as_str();
+    let is_in_catalog_schema = schema.is_none_or(|schema| schema.as_str() == "main");
+    if !is_in_catalog_schema
+        || !catalog::is_catalog_table_name(table_name)
+        || catalog::is_catalog_view_name(table_name)
+    {
+        return Ok(());
+    }
+    Err(sqlstate_error(
+        SQLSTATE_INSUFFICIENT_PRIVILEGE,
+        format!("permission denied: \"{table_name}\" is a system catalog"),
         None,
     ))
 }
