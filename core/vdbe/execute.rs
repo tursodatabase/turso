@@ -1549,10 +1549,12 @@ pub fn op_vfilter(
         let cursor = cursor.as_virtual_mut();
         return_if_io!(
             state,
-            cursor.filter(
+            cursor.filter_with_json_cache(
                 *idx_num as i32,
                 idx_str,
                 &mut state.registers[*args_reg..*args_reg + *arg_count],
+                #[cfg(feature = "json")]
+                &state.json_cache,
             )
         )
     };

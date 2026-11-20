@@ -478,3 +478,55 @@ expect {
     x y|$."x y"
     z|$."x y".z
 }
+
+# json_each and json_tree read a text document from the JSON cache of the
+# statement when another JSON function of the statement uses the cache. The
+# rows are the same as with a document of their own.
+test json-each-after-arrow-on-the-same-documents {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, doc TEXT);
+    INSERT INTO t VALUES (1, '{"a":1,"tags":["x","y"]}'), (2, '{"a":0,"tags":["y"]}'), (3, '{"a":2,"tags":[]}'), (4, '{"a":3,"tags":["y",{"z":[1,2]}]}');
+    SELECT id FROM t WHERE doc->>'$.a' AND EXISTS (SELECT 1 FROM json_each(doc, '$.tags') WHERE value = 'y') ORDER BY id;
+}
+expect {
+    1
+    4
+}
+
+test json-each-and-arrow-in-one-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, doc TEXT);
+    INSERT INTO t VALUES (1, '{"a":1,"tags":["x","y"]}'), (2, '{"a":0,"tags":["y"]}'), (3, '{"a":2,"tags":[]}'), (4, '{"a":3,"tags":["y",{"z":[1,2]}]}');
+    SELECT t.id, doc->>'$.a', key, value FROM t, json_each(t.doc, '$.tags') ORDER BY t.id, key;
+}
+expect {
+    1|1|0|x
+    1|1|1|y
+    2|0|0|y
+    4|3|0|y
+    4|3|1|{"z":[1,2]}
+}
+
+test json-tree-and-json-extract-in-one-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, doc TEXT);
+    INSERT INTO t VALUES (1, '{"a":1,"tags":["x","y"]}'), (2, '{"a":0,"tags":["y"]}'), (3, '{"a":2,"tags":[]}'), (4, '{"a":3,"tags":["y",{"z":[1,2]}]}');
+    SELECT t.id, j.fullkey, json_extract(t.doc, '$.a') FROM t, json_tree(t.doc) AS j WHERE j.type = 'integer' ORDER BY t.id, j.id;
+}
+expect {
+    1|$.a|1
+    2|$.a|0
+    3|$.a|2
+    4|$.a|3
+    4|$.tags[1].z[0]|3
+    4|$.tags[1].z[1]|3
+}
+
+test correlated-json-tree-after-arrow-on-the-same-documents {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, doc TEXT);
+    INSERT INTO t VALUES (1, '{"a":1,"tags":["x","y"]}'), (2, '{"a":0,"tags":["y"]}'), (3, '{"a":2,"tags":[]}'), (4, '{"a":3,"tags":["y",{"z":[1,2]}]}');
+    SELECT id, (SELECT group_concat(fullkey) FROM json_tree(t.doc, '$.tags')), t.doc -> '$.tags' FROM t ORDER BY id;
+}
+expect {
+    1|$.tags,$.tags[0],$.tags[1]|["x","y"]
+    2|$.tags,$.tags[0]|["y"]
+    3|$.tags|[]
+    4|$.tags,$.tags[0],$.tags[1],$.tags[1].z,$.tags[1].z[0],$.tags[1].z[1]|["y",{"z":[1,2]}]
+}

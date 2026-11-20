@@ -292,6 +292,16 @@ impl JsonCacheCell {
         Ok(CachedJsonPath::Cached(path))
     }
 
+    /// Whether the cache holds a document. A JSON function that converts its
+    /// argument through the cache fills it, so after the first call the cache
+    /// holds documents until the statement resets.
+    pub fn has_documents(&self) -> bool {
+        let _guard = self.access_guard();
+        // SAFETY: the access guard makes a second access to the cache panic
+        // while this reference lives.
+        unsafe { (*self.inner.get()).as_ref() }.is_some_and(|cache| cache.used > 0)
+    }
+
     fn access_guard(&self) -> JsonCacheAccessGuard<'_> {
         assert!(!self.accessed.replace(true));
         JsonCacheAccessGuard {

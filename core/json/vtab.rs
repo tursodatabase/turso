@@ -8,12 +8,13 @@ use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
 
 use crate::{
     json::{
-        convert_dbtype_to_jsonb, convert_ref_dbtype_into_jsonb, find_in_blob, json_path_text,
+        convert_dbtype_to_jsonb, convert_ref_dbtype_into_jsonb, curry_convert_dbtype_into_jsonb,
+        find_in_blob, json_path_text,
         jsonb::{find_path_element, IteratorState, Jsonb},
         looks_like_jsonb_blob,
         path::{json_path, JsonPath, PathElement},
         vtab::columns::{Columns, Key},
-        Conv, InBlob,
+        Conv, InBlob, JsonCacheCell,
     },
     types::{AsValueRef, Text, TextSubtype},
     vtab::{column_definition, InternalVirtualTable, InternalVirtualTableCursor},
@@ -267,8 +268,19 @@ impl InternalVirtualTableCursor for JsonEachCursor {
     fn filter(
         &mut self,
         args: &[Value],
+        idx_str: Option<String>,
+        idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        // An empty cache gives the conversion of the documents without it.
+        self.filter_with_json_cache(args, idx_str, idx_num, &JsonCacheCell::new())
+    }
+
+    fn filter_with_json_cache(
+        &mut self,
+        args: &[Value],
         _idx_str: Option<String>,
         _idx_num: i32,
+        json_cache: &JsonCacheCell,
     ) -> Result<bool, LimboError> {
         self.traversal_states.clear();
         self.pop_path_before_advance = false;
@@ -307,7 +319,19 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             _ => None,
         };
         if blob.is_none() {
-            convert_ref_dbtype_into_jsonb(document, Conv::Strict, &mut self.json)?;
+            let json_cache = Some(json_cache)
+                .filter(|cache| matches!(document, ValueRef::Text(_)) && cache.has_documents());
+            match json_cache {
+                // A JSON function of the statement converts its arguments
+                // through the cache, and it can have parsed this document
+                // already, as in `doc->>'$.a' AND EXISTS (SELECT 1 FROM
+                // json_each(doc))`. The cache gives the same document as the
+                // conversion below. A statement with only json_each leaves the
+                // cache empty, so that its documents are not copied into the
+                // entries of the cache.
+                Some(json_cache) => self.copy_cached_document(document, json_cache)?,
+                None => convert_ref_dbtype_into_jsonb(document, Conv::Strict, &mut self.json)?,
+            }
         }
         // The path is parsed after the document, so that a bad document
         // gives its error first. The parsed path is for the search and for
@@ -470,6 +494,24 @@ fn set_text(value: &mut Value, text: &str) -> Result<(), LimboError> {
 }
 
 impl JsonEachCursor {
+    /// Copies the document of `document` in `json_cache` into the buffer of
+    /// the cursor. A document that is not in the cache enters it.
+    ///
+    /// This is a separate function, so that the filter stays small
+    /// enough for the compiler to inline the helpers that it calls.
+    #[inline(never)]
+    fn copy_cached_document(
+        &mut self,
+        document: ValueRef<'_>,
+        json_cache: &JsonCacheCell,
+    ) -> Result<(), LimboError> {
+        json_cache.with_jsonb(
+            document,
+            curry_convert_dbtype_into_jsonb(Conv::Strict),
+            |json| Ok(self.json.set_data(json.as_bytes())?),
+        )
+    }
+
     fn advance(&mut self) -> Result<bool, LimboError> {
         if std::mem::take(&mut self.pop_path_before_advance) {
             self.path_to_current_value.pop();
@@ -1042,6 +1084,42 @@ impl InPlaceJsonPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn filter_reads_a_text_document_from_a_json_cache_with_documents() {
+        let cache = JsonCacheCell::new();
+        let doc = Value::build_text(r#"{"a":[1,2]}"#);
+        let mut cursor = JsonEachCursor::empty(JsonTraversalMode::Each);
+
+        // An empty cache stays empty.
+        assert!(cursor
+            .filter_with_json_cache(std::slice::from_ref(&doc), None, 0, &cache)
+            .unwrap());
+        assert_eq!(cursor.column(COL_KEY).unwrap(), Value::build_text("a"));
+        assert!(!cache.has_documents());
+
+        // The cache holds another document for the same text, so the key of
+        // the row shows which document the cursor read.
+        cache
+            .with_jsonb(
+                &doc,
+                |_, json| {
+                    *json = Jsonb::from_str(r#"{"b":3}"#).unwrap();
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(cursor
+            .filter_with_json_cache(std::slice::from_ref(&doc), None, 0, &cache)
+            .unwrap());
+        assert_eq!(cursor.column(COL_KEY).unwrap(), Value::build_text("b"));
+
+        // Without the cache, the cursor parses the document.
+        assert!(cursor.filter(std::slice::from_ref(&doc), None, 0).unwrap());
+        assert_eq!(cursor.column(COL_KEY).unwrap(), Value::build_text("a"));
+    }
 
     /// The buffer of a text value, or None for other values.
     fn text_buffer(value: &Value) -> Option<*const u8> {

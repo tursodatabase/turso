@@ -395,6 +395,25 @@ impl VirtualTableCursor {
         idx_str: Option<String>,
         arg_registers: &mut [Register],
     ) -> IOResultOr<bool> {
+        self.filter_with_json_cache(
+            idx_num,
+            idx_str,
+            arg_registers,
+            #[cfg(feature = "json")]
+            &crate::json::JsonCacheCell::new(),
+        )
+    }
+
+    /// Like [Self::filter], and an internal cursor can read its document from
+    /// `json_cache`, the JSON cache of the statement, with
+    /// [InternalVirtualTableCursor::filter_with_json_cache].
+    pub(crate) fn filter_with_json_cache(
+        &mut self,
+        idx_num: i32,
+        idx_str: Option<String>,
+        arg_registers: &mut [Register],
+        #[cfg(feature = "json")] json_cache: &crate::json::JsonCacheCell,
+    ) -> IOResultOr<bool> {
         self.null_flag = false;
         let result = match &mut self.inner {
             VirtualTableCursorInner::Pragma(cursor) => cursor.filter(copy_values(arg_registers)?),
@@ -412,6 +431,11 @@ impl VirtualTableCursor {
                     };
                     args.try_push(value)?;
                 }
+                #[cfg(feature = "json")]
+                let result = cursor
+                    .write()
+                    .filter_with_json_cache(args, idx_str, idx_num, json_cache);
+                #[cfg(not(feature = "json"))]
                 let result = cursor.write().filter(args, idx_str, idx_num);
                 for (register, value) in arg_registers.iter_mut().zip(args.drain(..)) {
                     if let Register::Value(slot) = register {
@@ -756,6 +780,19 @@ pub trait InternalVirtualTableCursor: Send + Sync {
         idx_str: Option<String>,
         idx_num: i32,
     ) -> Result<bool, LimboError>;
+    /// Like [Self::filter], for a cursor that can read its document from
+    /// `json_cache`, the JSON cache of the statement. The default ignores the
+    /// cache.
+    #[cfg(feature = "json")]
+    fn filter_with_json_cache(
+        &mut self,
+        args: &[Value],
+        idx_str: Option<String>,
+        idx_num: i32,
+        _json_cache: &crate::json::JsonCacheCell,
+    ) -> Result<bool, LimboError> {
+        self.filter(args, idx_str, idx_num)
+    }
 }
 
 #[cfg(test)]
