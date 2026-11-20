@@ -75,19 +75,22 @@ impl SyncEncryption {
         self.cloud_key.as_ref()
     }
 
-    pub(crate) fn local_context(&self) -> Result<Option<EncryptionContext>> {
+    /// Encryption context for the local database, absent when there is no local key.
+    pub fn local_context(&self) -> Result<Option<EncryptionContext>> {
         self.local_key
             .as_ref()
             .map(|key| EncryptionContext::new(self.cipher, key, 4096).map_err(Error::from))
             .transpose()
     }
 
-    pub(crate) fn connect_options(&self) -> ConnectOpts {
+    /// Connection options using the local key and a superuser session.
+    pub fn connect_options(&self) -> ConnectOpts {
         ConnectOpts::new(turso_core::SessionRole::Superuser)
             .with_encryption_key(self.local_key.clone())
     }
 
-    pub(crate) fn local_options(&self) -> Option<EncryptionOpts> {
+    /// Database-open encryption options, absent when there is no local key.
+    pub fn local_options(&self) -> Option<EncryptionOpts> {
         self.local_key.as_ref().map(|key| EncryptionOpts {
             cipher: self.cipher.to_string(),
             hexkey: key

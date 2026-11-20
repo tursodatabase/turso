@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -17,8 +18,8 @@ use tracing::{debug, error, info};
 
 use turso_core::mvcc::persistent_storage::logical_log::frame_codec;
 use turso_core::{
-    CipherMode, ConnectOpts, Connection, Database, DatabaseOpts, EncryptionContext, EncryptionKey,
-    EncryptionOpts, OpenFlags, SessionRole, Value as CoreValue,
+    CipherMode, ConnectOpts, Connection, Database, DatabaseOpts, EncryptionContext, OpenFlags,
+    SessionRole, Value as CoreValue,
 };
 use turso_sqlite::SqliteDialect;
 use turso_sync_engine::server_proto::{
@@ -28,23 +29,12 @@ use turso_sync_engine::server_proto::{
     PullUpdatesApplyMode, PullUpdatesProtocol, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
     PullUpdatesStreamKind, Row, StmtResult, StreamRequest, StreamResponse, StreamResult, Value,
 };
+use turso_sync_engine::sync_encryption::SyncEncryption;
 
 const WAL_FRAME_HEADER_SIZE: usize = 24;
 const PAGE_SIZE: usize = 4096;
-const MVCC_LOG_MAGIC: u32 = 0x4C4D4C32;
 const MVCC_LOG_VERSION: u8 = 3;
 const MVCC_LOG_HEADER_SIZE: usize = 56;
-const MVCC_LOG_HEADER_SALT_START: usize = 8;
-const MVCC_LOG_HEADER_SALT_END: usize = 16;
-const MVCC_LOG_HEADER_RESERVED_START: usize = 16;
-const MVCC_LOG_HEADER_CRC_START: usize = 52;
-const MVCC_TX_FRAME_MAGIC: u32 = 0x5854564D;
-const MVCC_TX_EXT_FRAME_MAGIC: u32 = 0x5845564D;
-const MVCC_TX_END_MAGIC: u32 = 0x4554564D;
-const MVCC_TX_HEADER_SIZE: usize = 24;
-const MVCC_TX_EXT_HEADER_SIZE: usize = 40;
-const MVCC_TX_TRAILER_SIZE: usize = 8;
-const MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const QUEUED_CONNECTIONS_PER_WORKER: usize = 4;
@@ -54,13 +44,7 @@ pub struct OpenConfig {
     pub flags: OpenFlags,
     pub db_opts: DatabaseOpts,
     pub max_open: usize,
-    pub encryption: Option<ServerEncryption>,
-}
-
-#[derive(Clone)]
-pub struct ServerEncryption {
-    cipher: CipherMode,
-    pub key: EncryptionKey,
+    pub encryption: Option<SyncEncryption>,
 }
 
 struct DbHandle {
@@ -95,7 +79,7 @@ pub struct TursoSyncServer {
     source: DbSource,
     interrupt_count: Arc<AtomicUsize>,
     workers: usize,
-    encryption: Option<ServerEncryption>,
+    encryption: Option<SyncEncryption>,
 }
 
 struct ConnectionQueue {
@@ -117,9 +101,10 @@ impl TursoSyncServer {
         conn: Arc<Connection>,
         interrupt_count: Arc<AtomicUsize>,
         workers: usize,
-        encryption: Option<ServerEncryption>,
+        encryption: Option<SyncEncryption>,
     ) -> Result<Self> {
-        anyhow::ensure!(conn.get_encryption_cipher_mode() == encryption.as_ref().map(|e| e.cipher),
+        require_server_key(encryption.as_ref())?;
+        anyhow::ensure!(conn.get_encryption_cipher_mode() == encryption.as_ref().map(|e| e.cipher()),
             "encrypted sync requires matching --sync-encryption-cipher and --sync-encryption-key-file");
         conn.wal_auto_actions_disable();
         if encryption.is_some() {
@@ -145,6 +130,7 @@ impl TursoSyncServer {
         config: OpenConfig,
         workers: usize,
     ) -> Result<Self> {
+        require_server_key(config.encryption.as_ref())?;
         if !base.is_dir() {
             return Err(anyhow!(
                 "sync dir path does not exist or is not a directory: {}",
@@ -367,11 +353,16 @@ impl TursoSyncServer {
         let (method, path, body) = parse_http_request(request_data)?;
         info!("Request: {} {}", method, path);
         let route = parse_route(&method, &path);
-        let require_cipher = matches!(route, Route::PullUpdates { .. });
-        if matches!(route, Route::Pipeline { .. } | Route::PullUpdates { .. })
-            && validate_encryption_headers(request_data, self.encryption.as_ref(), require_cipher)
-                .is_err()
-        {
+        let invalid_credentials = match route {
+            Route::Pipeline { .. } => {
+                validate_encryption_headers(request_data, self.encryption.as_ref(), false).is_err()
+            }
+            Route::PullUpdates { .. } => {
+                validate_encryption_headers(request_data, self.encryption.as_ref(), true).is_err()
+            }
+            Route::Options | Route::NotFound => false,
+        };
+        if invalid_credentials {
             return Ok(text_response(
                 400,
                 "Invalid or missing sync encryption credentials",
@@ -924,16 +915,17 @@ impl TursoSyncServer {
                 start == 0 || start == log.len() as u64,
                 "MVCC logical pull offset is not a transaction boundary"
             );
-            // An empty database initially has an LML2 header. Its first portable
-            // transaction upgrades the header in place, preserving salt and offsets.
+            // A header-only log has no transactions to normalize, including
+            // an older LML2 log awaiting its first portable transaction.
             return self.handle_empty_logical_pull(format!("g1:o{}", log.len()), db_size);
         }
-        let normalized = match self
+        let crypto = self
             .encryption
             .as_ref()
-            .map(|e| normalize_encrypted_log(&log, &e.context()?))
-            .transpose()
-        {
+            .map(SyncEncryption::local_context)
+            .transpose()?
+            .flatten();
+        let normalized = match normalize_mvcc_log(&log, crypto.as_ref()) {
             Ok(normalized) => normalized,
             Err(err) if is_nonportable_mvcc_log_error(&err) => {
                 return self.handle_logical_fallback(
@@ -946,28 +938,7 @@ impl TursoSyncServer {
             }
             Err(err) => return Err(err),
         };
-        let plaintext_snapshot;
-        let snapshot = if let Some(normalized) = &normalized {
-            &normalized.snapshot
-        } else {
-            plaintext_snapshot = match scan_mvcc_log(&log) {
-                Ok(snapshot) => snapshot,
-                Err(err) if is_nonportable_mvcc_log_error(&err) => {
-                    info!(
-                        "logical pull requested but MVCC log is not portable; returning replace-base pages: {err}"
-                    );
-                    return self.handle_logical_fallback(
-                        db,
-                        req,
-                        fallback_revision,
-                        &legacy_current_revision,
-                        db_size,
-                    );
-                }
-                Err(err) => return Err(err),
-            };
-            &plaintext_snapshot
-        };
+        let snapshot = &normalized.snapshot;
         let start_offset = parse_mvcc_revision_offset(&req.client_revision, snapshot.end_offset)?;
         if start_offset > snapshot.end_offset {
             return Err(anyhow!(
@@ -976,23 +947,16 @@ impl TursoSyncServer {
                 snapshot.end_offset
             ));
         }
-        let source_start = usize::try_from(start_offset)
-            .map_err(|_| anyhow!("MVCC logical pull start offset overflows usize"))?;
-        let source_end = usize::try_from(snapshot.end_offset)
-            .map_err(|_| anyhow!("MVCC logical pull end offset overflows usize"))?;
-        let (log, start, end) = if let Some(normalized) = &normalized {
-            let start = *normalized
-                .wire_offsets
-                .get(&start_offset)
-                .ok_or_else(|| anyhow!("MVCC offset is not a transaction boundary"))?;
-            (normalized.body.as_slice(), start, normalized.body.len())
-        } else {
-            (log.as_slice(), source_start, source_end)
-        };
+        let start = *normalized
+            .wire_offsets
+            .get(&start_offset)
+            .ok_or_else(|| anyhow!("MVCC offset is not a transaction boundary"))?;
+        let log = normalized.body.as_ref();
+        let end = log.len();
 
         let mut response_body = Vec::new();
-        let (mvcc_log, body) = if start == end {
-            (None, Vec::new())
+        let mvcc_log = if start == end {
+            None
         } else {
             let crc_seed = if start_offset == 0 {
                 None
@@ -1000,20 +964,17 @@ impl TursoSyncServer {
                 let seed = snapshot.crc_seed_at(start_offset)?;
                 Some(seed.to_le_bytes().to_vec())
             };
-            (
-                Some(MvccLogicalLogMetadataProto {
-                    format: "lml3".to_string(),
-                    checkpoint_transition: false,
-                    ranges: vec![MvccLogicalLogRangeProto {
-                        generation: 1,
-                        start_offset,
-                        end_offset: snapshot.end_offset,
-                        starts_with_header: start_offset == 0,
-                        crc_seed,
-                    }],
-                }),
-                log[start..end].to_vec(),
-            )
+            Some(MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: false,
+                ranges: vec![MvccLogicalLogRangeProto {
+                    generation: 1,
+                    start_offset,
+                    end_offset: snapshot.end_offset,
+                    starts_with_header: start_offset == 0,
+                    crc_seed,
+                }],
+            })
         };
 
         let header = PullUpdatesRespProtoBody {
@@ -1029,14 +990,14 @@ impl TursoSyncServer {
 
         let header_bytes = header.encode_to_vec();
         encode_length_delimited(&mut response_body, &header_bytes);
-        response_body.extend_from_slice(&body);
+        response_body.extend_from_slice(&log[start..end]);
 
         debug!(
             "pull-updates logical: path={} client_revision={} end_offset={} body_bytes={}",
             log_path.display(),
             req.client_revision,
             snapshot.end_offset,
-            body.len()
+            end - start
         );
 
         Ok(HttpResponse {
@@ -1179,40 +1140,21 @@ struct HttpResponse {
     body: Vec<u8>,
 }
 
-impl ServerEncryption {
-    pub fn from_key_file(cipher: &str, path: &Path) -> Result<Self> {
-        let config = Self {
-            cipher: CipherMode::try_from(cipher)?,
-            key: EncryptionKey::from_hex_string(&std::fs::read_to_string(path)?)?,
-        };
-        config.context()?;
-        Ok(config)
-    }
-
-    pub fn open_options(&self) -> EncryptionOpts {
-        EncryptionOpts {
-            cipher: self.cipher.to_string(),
-            hexkey: self
-                .key
-                .as_slice()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect(),
-        }
-    }
-
-    fn context(&self) -> Result<EncryptionContext> {
-        Ok(EncryptionContext::new(self.cipher, &self.key, PAGE_SIZE)?)
-    }
+fn require_server_key(encryption: Option<&SyncEncryption>) -> Result<()> {
+    anyhow::ensure!(
+        encryption.is_none_or(|encryption| encryption.local_key().is_some()),
+        "sync server encryption requires a key"
+    );
+    Ok(())
 }
 
 fn validate_encryption_headers(
     request: &[u8],
-    encryption: Option<&ServerEncryption>,
+    encryption: Option<&SyncEncryption>,
     require_cipher: bool,
 ) -> Result<()> {
     let end = find_header_end(request, 0).ok_or_else(|| anyhow!("missing HTTP headers"))?;
-    let headers = std::str::from_utf8(&request[..end])?;
+    let headers = String::from_utf8_lossy(&request[..end]);
     let mut key = None;
     let mut cipher = None;
     for line in headers.lines().skip(1) {
@@ -1240,7 +1182,7 @@ fn validate_encryption_headers(
     };
     if let Some(cipher) = cipher {
         anyhow::ensure!(
-            CipherMode::try_from(cipher)? == encryption.cipher,
+            CipherMode::try_from(cipher)? == encryption.cipher(),
             "cipher mismatch"
         );
     } else {
@@ -1249,23 +1191,33 @@ fn validate_encryption_headers(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(key.ok_or_else(|| anyhow!("missing encryption key"))?)?;
     anyhow::ensure!(
-        bytes.as_slice() == encryption.key.as_slice(),
+        bytes.as_slice()
+            == encryption
+                .local_key()
+                .ok_or_else(|| anyhow!("sync server encryption requires a key"))?
+                .as_slice(),
         "encryption key mismatch"
     );
     Ok(())
 }
 
-struct NormalizedMvccLog {
+struct NormalizedMvccLog<'a> {
     snapshot: MvccLogSnapshot,
-    body: Vec<u8>,
+    body: Cow<'a, [u8]>,
     wire_offsets: HashMap<u64, usize>,
 }
 
-fn normalize_encrypted_log(log: &[u8], crypto: &EncryptionContext) -> Result<NormalizedMvccLog> {
+fn normalize_mvcc_log<'a>(
+    log: &'a [u8],
+    crypto: Option<&EncryptionContext>,
+) -> Result<NormalizedMvccLog<'a>> {
     if log.is_empty() {
         return Ok(NormalizedMvccLog {
-            snapshot: scan_mvcc_log(log)?,
-            body: Vec::new(),
+            snapshot: MvccLogSnapshot {
+                end_offset: 0,
+                crc_by_offset: vec![(0, 0)],
+            },
+            body: Cow::Borrowed(log),
             wire_offsets: HashMap::from([(0, 0)]),
         });
     }
@@ -1283,33 +1235,41 @@ fn normalize_encrypted_log(log: &[u8], crypto: &EncryptionContext) -> Result<Nor
     let mut source_crc = header.initial_crc();
     let mut wire_crc = source_crc;
     let mut offset = MVCC_LOG_HEADER_SIZE;
-    let mut body = header.bytes().to_vec();
+    let mut body = crypto.map(|_| header.bytes().to_vec());
     let mut wire_offsets = HashMap::from([(0, 0), (offset as u64, offset)]);
     let mut crc_by_offset = vec![(offset as u64, wire_crc)];
     let mut plaintext = Vec::new();
+    // A crash may leave an incomplete frame after the last committed boundary.
     while offset < log.len() {
-        let layout = frame_codec::inspect_frame_prefix(&log[offset..], Some(crypto))?
-            .ok_or_else(|| anyhow!("truncated MVCC frame header"))?;
+        let Some(layout) = frame_codec::inspect_frame_prefix(&log[offset..], crypto)? else {
+            break;
+        };
         let end = offset
             .checked_add(layout.stored_size())
-            .filter(|end| *end <= log.len())
-            .ok_or_else(|| anyhow!("truncated MVCC frame"))?;
+            .ok_or_else(|| anyhow!("MVCC frame end overflows usize"))?;
+        if end > log.len() {
+            break;
+        }
         let frame = frame_codec::validate_frame_into(
             &header,
             offset as u64,
             &log[offset..end],
             source_crc,
-            Some(crypto),
+            crypto,
             &mut plaintext,
         )?;
         source_crc = frame.source_crc();
-        let wire = frame_codec::plaintext_wire_parts(&frame, wire_crc);
-        body.extend_from_slice(wire.header);
-        body.extend_from_slice(wire.body);
-        body.extend_from_slice(&wire.trailer);
-        wire_crc = wire.next_crc;
+        if let Some(body) = &mut body {
+            let wire = frame_codec::plaintext_wire_parts(&frame, wire_crc);
+            body.extend_from_slice(wire.header);
+            body.extend_from_slice(wire.body);
+            body.extend_from_slice(&wire.trailer);
+            wire_crc = wire.next_crc;
+        } else {
+            wire_crc = source_crc;
+        }
         offset = end;
-        wire_offsets.insert(offset as u64, body.len());
+        wire_offsets.insert(offset as u64, body.as_ref().map_or(offset, Vec::len));
         crc_by_offset.push((offset as u64, wire_crc));
     }
     Ok(NormalizedMvccLog {
@@ -1317,7 +1277,8 @@ fn normalize_encrypted_log(log: &[u8], crypto: &EncryptionContext) -> Result<Nor
             end_offset: offset as u64,
             crc_by_offset,
         },
-        body,
+        // Plaintext frames are already in wire format; borrow the complete prefix.
+        body: body.map_or_else(|| Cow::Borrowed(&log[..offset]), Cow::Owned),
         wire_offsets,
     })
 }
@@ -1385,178 +1346,9 @@ fn parse_mvcc_revision_offset(revision: &str, legacy_default: u64) -> Result<u64
     Ok(legacy_default)
 }
 
-fn scan_mvcc_log(log: &[u8]) -> Result<MvccLogSnapshot> {
-    if log.is_empty() {
-        return Ok(MvccLogSnapshot {
-            end_offset: 0,
-            crc_by_offset: vec![(0, 0)],
-        });
-    }
-    if log.len() < MVCC_LOG_HEADER_SIZE {
-        return Err(anyhow!(
-            "truncated MVCC logical log header: len={} header_size={}",
-            log.len(),
-            MVCC_LOG_HEADER_SIZE
-        ));
-    }
-    validate_mvcc_log_header(log)?;
-    let mut running_crc = initial_mvcc_log_crc(log)?;
-    let mut offset = MVCC_LOG_HEADER_SIZE;
-    let mut crc_by_offset = vec![(MVCC_LOG_HEADER_SIZE as u64, running_crc)];
-
-    while offset < log.len() {
-        let Some((frame_end, frame_crc)) = read_mvcc_frame_boundary(log, offset, running_crc)?
-        else {
-            break;
-        };
-        running_crc = frame_crc;
-        offset = frame_end;
-        crc_by_offset.push((offset as u64, running_crc));
-    }
-
-    Ok(MvccLogSnapshot {
-        end_offset: offset as u64,
-        crc_by_offset,
-    })
-}
-
 fn is_nonportable_mvcc_log_error(err: &anyhow::Error) -> bool {
     let message = err.to_string();
     message.starts_with("unsupported MVCC logical log version ")
-}
-
-fn validate_mvcc_log_header(log: &[u8]) -> Result<()> {
-    if read_u32_le(log, 0)? != MVCC_LOG_MAGIC {
-        return Err(anyhow!("invalid MVCC logical log magic"));
-    }
-    if log[4] != MVCC_LOG_VERSION {
-        return Err(anyhow!("unsupported MVCC logical log version {}", log[4]));
-    }
-    if log[5] & 0b1111_1110 != 0 {
-        return Err(anyhow!("invalid MVCC logical log header flags"));
-    }
-    let header_len = u16::from_le_bytes([log[6], log[7]]) as usize;
-    if header_len != MVCC_LOG_HEADER_SIZE {
-        return Err(anyhow!(
-            "invalid MVCC logical log header length: {header_len}"
-        ));
-    }
-    if log[MVCC_LOG_HEADER_RESERVED_START..MVCC_LOG_HEADER_CRC_START]
-        .iter()
-        .any(|byte| *byte != 0)
-    {
-        return Err(anyhow!(
-            "MVCC logical log header reserved bytes must be zero"
-        ));
-    }
-    let stored_crc = read_u32_le(log, MVCC_LOG_HEADER_CRC_START)?;
-    let mut crc_buf = [0u8; MVCC_LOG_HEADER_SIZE];
-    crc_buf.copy_from_slice(&log[..MVCC_LOG_HEADER_SIZE]);
-    crc_buf[MVCC_LOG_HEADER_CRC_START..MVCC_LOG_HEADER_SIZE].fill(0);
-    let expected_crc = crc32c::crc32c(&crc_buf);
-    if stored_crc != expected_crc {
-        return Err(anyhow!("MVCC logical log header checksum mismatch"));
-    }
-    Ok(())
-}
-
-fn initial_mvcc_log_crc(log: &[u8]) -> Result<u32> {
-    let salt = u64::from_le_bytes(
-        log[MVCC_LOG_HEADER_SALT_START..MVCC_LOG_HEADER_SALT_END]
-            .try_into()
-            .expect("fixed-size salt slice"),
-    );
-    Ok(crc32c::crc32c(&salt.to_le_bytes()))
-}
-
-fn read_mvcc_frame_boundary(
-    log: &[u8],
-    offset: usize,
-    running_crc: u32,
-) -> Result<Option<(usize, u32)>> {
-    if log.len() - offset < MVCC_TX_HEADER_SIZE + MVCC_TX_TRAILER_SIZE {
-        return Ok(None);
-    }
-    let frame_magic = read_u32_le(log, offset)?;
-    let has_extension_header = frame_magic == MVCC_TX_EXT_FRAME_MAGIC;
-    if frame_magic != MVCC_TX_FRAME_MAGIC && !has_extension_header {
-        return Err(anyhow!(
-            "invalid MVCC logical log frame magic at offset {offset}: {frame_magic:#x}"
-        ));
-    }
-    let header_size = if has_extension_header {
-        MVCC_TX_EXT_HEADER_SIZE
-    } else {
-        MVCC_TX_HEADER_SIZE
-    };
-    if log.len() - offset < header_size + MVCC_TX_TRAILER_SIZE {
-        return Ok(None);
-    }
-    let payload_size = usize::try_from(read_u64_le(log, offset + 4)?)
-        .map_err(|_| anyhow!("MVCC logical log payload size overflows usize"))?;
-    let extension_size = if has_extension_header {
-        let extension_size = usize::try_from(read_u64_le(log, offset + 24)?)
-            .map_err(|_| anyhow!("MVCC logical log extension size overflows usize"))?;
-        let extension_record_count = read_u32_le(log, offset + 32)?;
-        let frame_flags = read_u32_le(log, offset + 36)?;
-        if frame_flags & !MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK != 0 {
-            return Err(anyhow!(
-                "unsupported MVCC logical log frame flags at offset {offset}: {frame_flags:#x}"
-            ));
-        }
-        if extension_size == 0 && extension_record_count != 0 {
-            return Err(anyhow!(
-                "MVCC logical log extension record count without extension block at offset {offset}"
-            ));
-        }
-        if extension_size > 0 && frame_flags & MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK == 0 {
-            return Err(anyhow!(
-                "MVCC logical log extension block missing flag at offset {offset}"
-            ));
-        }
-        extension_size
-    } else {
-        0
-    };
-    let trailer_start = offset
-        .checked_add(header_size)
-        .and_then(|value| value.checked_add(payload_size))
-        .and_then(|value| value.checked_add(extension_size))
-        .ok_or_else(|| anyhow!("MVCC logical log frame offset overflow"))?;
-    let frame_end = trailer_start
-        .checked_add(MVCC_TX_TRAILER_SIZE)
-        .ok_or_else(|| anyhow!("MVCC logical log frame end overflow"))?;
-    if frame_end > log.len() {
-        return Ok(None);
-    }
-    let expected_crc = crc32c::crc32c_append(running_crc, &log[offset..trailer_start]);
-    let stored_crc = read_u32_le(log, trailer_start)?;
-    if stored_crc != expected_crc {
-        return Err(anyhow!(
-            "MVCC logical log frame checksum mismatch at offset {offset}"
-        ));
-    }
-    let end_magic = read_u32_le(log, trailer_start + 4)?;
-    if end_magic != MVCC_TX_END_MAGIC {
-        return Err(anyhow!(
-            "invalid MVCC logical log frame end magic at offset {offset}"
-        ));
-    }
-    Ok(Some((frame_end, stored_crc)))
-}
-
-fn read_u32_le(buf: &[u8], offset: usize) -> Result<u32> {
-    let bytes = buf
-        .get(offset..offset + 4)
-        .ok_or_else(|| anyhow!("buffer too short for u32 at offset {offset}"))?;
-    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
-}
-
-fn read_u64_le(buf: &[u8], offset: usize) -> Result<u64> {
-    let bytes = buf
-        .get(offset..offset + 8)
-        .ok_or_else(|| anyhow!("buffer too short for u64 at offset {offset}"))?;
-    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
 }
 
 fn current_sync_db_size_pages(conn: &Connection, max_frame: u64) -> Result<u64> {
@@ -1861,6 +1653,7 @@ impl ConnectionQueue {
 }
 
 fn open_db_handle(path: &Path, config: &OpenConfig) -> Result<Arc<DbHandle>> {
+    require_server_key(config.encryption.as_ref())?;
     let path_str = path.to_string_lossy().to_string();
     let (_io, db) = Database::open_new(
         &path_str,
@@ -1869,15 +1662,18 @@ fn open_db_handle(path: &Path, config: &OpenConfig) -> Result<Arc<DbHandle>> {
         config
             .db_opts
             .with_encryption(config.encryption.is_some() || config.db_opts.enable_encryption),
-        config.encryption.as_ref().map(|e| e.open_options()),
+        config
+            .encryption
+            .as_ref()
+            .and_then(SyncEncryption::local_options),
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(
-        ConnectOpts::new(SessionRole::Superuser)
-            .with_encryption_key(config.encryption.as_ref().map(|e| e.key.clone())),
-    )?;
+    let conn = db.connect(config.encryption.as_ref().map_or_else(
+        || ConnectOpts::new(SessionRole::Superuser),
+        SyncEncryption::connect_options,
+    ))?;
     anyhow::ensure!(
-        conn.get_encryption_cipher_mode() == config.encryption.as_ref().map(|e| e.cipher),
+        conn.get_encryption_cipher_mode() == config.encryption.as_ref().map(|e| e.cipher()),
         "database cipher does not match the sync server configuration"
     );
     if config.encryption.is_some() {
@@ -1931,17 +1727,73 @@ fn convert_core_to_value(value: CoreValue) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use turso_core::EncryptionKey;
+    const MVCC_LOG_HEADER_CRC_START: usize = 52;
+    const MVCC_TX_EXT_HEADER_SIZE: usize = 40;
+    const MVCC_TX_TRAILER_SIZE: usize = 8;
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn server_rejects_encryption_without_a_key_before_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        let config = OpenConfig {
+            vfs: None,
+            flags: OpenFlags::Create,
+            db_opts: DatabaseOpts::new(),
+            max_open: 1,
+            encryption: Some(SyncEncryption::new(CipherMode::Aes256Gcm, None, None).unwrap()),
+        };
+        let error = open_db_handle(&path, &config).err().expect("missing key");
+        assert!(error
+            .to_string()
+            .contains("sync server encryption requires a key"));
+        assert!(!path.exists());
+        let error = TursoSyncServer::new_dir(
+            "127.0.0.1:0".into(),
+            dir.path().into(),
+            Arc::new(AtomicUsize::new(0)),
+            config,
+            1,
+        )
+        .err()
+        .expect("missing key");
+        assert!(error
+            .to_string()
+            .contains("sync server encryption requires a key"));
+    }
+
+    #[test]
+    fn plaintext_requests_accept_non_utf8_unrelated_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = dir_server(dir.path());
+        for (endpoint, body) in [("v2/pipeline", SELECT_ONE_PIPELINE), ("pull-updates", "")] {
+            let mut request =
+                format!("POST /db/plaintext/{endpoint} HTTP/1.1\r\nUser-Agent: caf").into_bytes();
+            request.extend_from_slice(b"\xe9\r\n");
+            request.extend_from_slice(
+                format!("Content-Length: {}\r\n\r\n{body}", body.len()).as_bytes(),
+            );
+            let response = server.handle_request(&request).unwrap();
+            assert_eq!(response.status, 200, "{endpoint}");
+            if endpoint == "v2/pipeline" {
+                let response: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(response["results"][0]["type"], "ok");
+            }
+        }
+    }
 
     #[test]
     fn encrypted_pipeline_accepts_key_only_but_pull_requires_cipher() {
         let dir = tempfile::tempdir().unwrap();
         let mut server = dir_server(dir.path());
-        let encryption = ServerEncryption {
-            cipher: CipherMode::Aes256Gcm,
-            key: EncryptionKey::new_256([11; 32]),
-        };
+        let encryption = SyncEncryption::new(
+            CipherMode::Aes256Gcm,
+            Some(EncryptionKey::new_256([11; 32])),
+            None,
+        )
+        .unwrap();
         server.encryption = Some(encryption.clone());
         if let DbSource::Dir { config, .. } = &mut server.source {
             config.encryption = Some(encryption);
@@ -1994,10 +1846,12 @@ mod tests {
     fn encrypted_requests_validate_credentials_before_opening_or_writing() {
         let dir = tempfile::tempdir().unwrap();
         let mut server = dir_server(dir.path());
-        let encryption = ServerEncryption {
-            cipher: CipherMode::Aes256Gcm,
-            key: EncryptionKey::new_256([11; 32]),
-        };
+        let encryption = SyncEncryption::new(
+            CipherMode::Aes256Gcm,
+            Some(EncryptionKey::new_256([11; 32])),
+            None,
+        )
+        .unwrap();
         server.encryption = Some(encryption.clone());
         if let DbSource::Dir { config, .. } = &mut server.source {
             config.encryption = Some(encryption);
@@ -2055,10 +1909,8 @@ mod tests {
     fn encrypted_pull_rejects_corrupt_header_instead_of_replacing_base() {
         for cipher in [CipherMode::Aes256Gcm, CipherMode::Aegis256] {
             let dir = tempfile::tempdir().unwrap();
-            let encryption = ServerEncryption {
-                cipher,
-                key: EncryptionKey::new_256([11; 32]),
-            };
+            let encryption =
+                SyncEncryption::new(cipher, Some(EncryptionKey::new_256([11; 32])), None).unwrap();
             let path = dir.path().join("data");
             let handle = open_db_handle(
                 &path,
@@ -2090,6 +1942,32 @@ mod tests {
             let original = std::fs::read(&log_path).unwrap();
             assert_eq!(original[4], MVCC_LOG_VERSION);
             assert!(original.len() > MVCC_LOG_HEADER_SIZE);
+            let crypto = server.encryption.as_ref().unwrap().local_context().unwrap();
+            let normalized = normalize_mvcc_log(&original, crypto.as_ref()).unwrap();
+            let boundaries = &normalized.snapshot.crc_by_offset;
+            let committed = boundaries[boundaries.len() - 2].0;
+            let start = committed as usize;
+            let layout = frame_codec::inspect_frame_prefix(&original[start..], crypto.as_ref())
+                .unwrap()
+                .unwrap();
+            for end in [
+                start + 1,
+                start + 3,
+                start + layout.header_size() - 1,
+                start + layout.header_size(),
+                original.len() - 1,
+            ] {
+                std::fs::write(&log_path, &original[..end]).unwrap();
+                let response = server.handle_pull_updates(&handle, &request).unwrap();
+                assert_eq!(response.status, 200);
+                let mut bytes = response.body.as_slice();
+                let header = PullUpdatesRespProtoBody::decode_length_delimited(&mut bytes).unwrap();
+                assert_eq!(header.server_revision, format!("g1:o{committed}"));
+                assert_eq!(
+                    bytes,
+                    &normalized.body[..normalized.wire_offsets[&committed]]
+                );
+            }
             for version in [2, 4] {
                 let mut corrupt = original.clone();
                 corrupt[4] = version;
@@ -2101,18 +1979,42 @@ mod tests {
                 );
                 assert!(!is_nonportable_mvcc_log_error(&result.err().unwrap()));
             }
-            let mut older_header = original[..MVCC_LOG_HEADER_SIZE].to_vec();
-            older_header[4] = 2;
-            older_header[MVCC_LOG_HEADER_CRC_START..].fill(0);
-            let crc = crc32c::crc32c(&older_header);
-            older_header[MVCC_LOG_HEADER_CRC_START..].copy_from_slice(&crc.to_le_bytes());
-            let error = normalize_encrypted_log(
-                &older_header,
-                &server.encryption.as_ref().unwrap().context().unwrap(),
-            )
-            .err()
-            .expect("valid older log must request replacement");
-            assert!(is_nonportable_mvcc_log_error(&error));
+            for version in [2, MVCC_LOG_VERSION] {
+                let mut header_only = original[..MVCC_LOG_HEADER_SIZE].to_vec();
+                header_only[4] = version;
+                header_only[MVCC_LOG_HEADER_CRC_START..].fill(0);
+                let crc = crc32c::crc32c(&header_only);
+                header_only[MVCC_LOG_HEADER_CRC_START..].copy_from_slice(&crc.to_le_bytes());
+                if version == 2 {
+                    let error = normalize_mvcc_log(
+                        &header_only,
+                        server
+                            .encryption
+                            .as_ref()
+                            .unwrap()
+                            .local_context()
+                            .unwrap()
+                            .as_ref(),
+                    )
+                    .err()
+                    .expect("valid older log must request replacement");
+                    assert!(is_nonportable_mvcc_log_error(&error));
+                }
+                std::fs::write(&log_path, header_only).unwrap();
+                let response = server.handle_pull_updates(&handle, &request).unwrap();
+                let mut bytes = response.body.as_slice();
+                let header = PullUpdatesRespProtoBody::decode_length_delimited(&mut bytes).unwrap();
+                assert_eq!(
+                    header.server_revision,
+                    format!("g1:o{MVCC_LOG_HEADER_SIZE}")
+                );
+                assert_eq!(header.apply_mode, PullUpdatesApplyMode::Incremental as i32);
+                assert_eq!(
+                    header.stream_kind,
+                    PullUpdatesStreamKind::MvccLogicalLog as i32
+                );
+                assert!(bytes.is_empty());
+            }
             std::fs::write(log_path, original).unwrap();
         }
     }
@@ -2130,14 +2032,16 @@ mod tests {
             CipherMode::Aegis256X4,
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let encryption = ServerEncryption {
+            let encryption = SyncEncryption::new(
                 cipher,
-                key: if cipher.required_key_size() == 16 {
+                Some(if cipher.required_key_size() == 16 {
                     EncryptionKey::new_128([11; 16])
                 } else {
                     EncryptionKey::new_256([11; 32])
-                },
-            };
+                }),
+                None,
+            )
+            .unwrap();
             let path = dir.path().join("data");
             let handle = open_db_handle(
                 &path,
@@ -2159,20 +2063,39 @@ mod tests {
             ))
             .unwrap();
             let log = std::fs::read(logical_log_path(path.to_str().unwrap()).unwrap()).unwrap();
-            let normalized = normalize_encrypted_log(&log, &encryption.context().unwrap()).unwrap();
+            let normalized =
+                normalize_mvcc_log(&log, encryption.local_context().unwrap().as_ref()).unwrap();
             assert_eq!(normalized.snapshot.end_offset, log.len() as u64);
             assert!(normalized.body.len() < log.len());
-            let wire_snapshot = scan_mvcc_log(&normalized.body).unwrap();
+            let wire = normalize_mvcc_log(&normalized.body, None).unwrap();
+            assert_eq!(wire.body, normalized.body);
+            let wire_snapshot = wire.snapshot;
             assert_eq!(wire_snapshot.end_offset, normalized.body.len() as u64);
+            let mut corrupt_wire = normalized.body.to_vec();
+            corrupt_wire[MVCC_LOG_HEADER_SIZE + MVCC_TX_EXT_HEADER_SIZE] ^= 1;
+            assert!(normalize_mvcc_log(&corrupt_wire, None).is_err());
+            let truncated_wire =
+                normalize_mvcc_log(&normalized.body[..normalized.body.len() - 1], None).unwrap();
+            let boundaries = &wire_snapshot.crc_by_offset;
+            assert_eq!(
+                truncated_wire.snapshot.end_offset,
+                boundaries[boundaries.len() - 2].0
+            );
             for (source_offset, crc) in &normalized.snapshot.crc_by_offset {
                 let wire_offset = normalized.wire_offsets[source_offset];
                 assert_eq!(wire_snapshot.crc_seed_at(wire_offset as u64).unwrap(), *crc);
             }
             assert!(normalized.body.windows(15).any(|w| w == b"private payload"));
             assert!(!log.windows(15).any(|w| w == b"private payload"));
-            assert!(
-                normalize_encrypted_log(&log[..log.len() - 1], &encryption.context().unwrap())
-                    .is_err()
+            let truncated = normalize_mvcc_log(
+                &log[..log.len() - 1],
+                encryption.local_context().unwrap().as_ref(),
+            )
+            .unwrap();
+            let boundaries = &normalized.snapshot.crc_by_offset;
+            assert_eq!(
+                truncated.snapshot.end_offset,
+                boundaries[boundaries.len() - 2].0
             );
             let wrong_key = EncryptionContext::new(
                 cipher,
@@ -2184,15 +2107,17 @@ mod tests {
                 PAGE_SIZE,
             )
             .unwrap();
-            assert!(normalize_encrypted_log(&log, &wrong_key).is_err());
+            assert!(normalize_mvcc_log(&log, Some(&wrong_key)).is_err());
             let mut corrupt = log.clone();
             corrupt[MVCC_LOG_HEADER_SIZE + MVCC_TX_EXT_HEADER_SIZE + 5] ^= 1;
-            assert!(normalize_encrypted_log(&corrupt, &encryption.context().unwrap()).is_err());
+            assert!(
+                normalize_mvcc_log(&corrupt, encryption.local_context().unwrap().as_ref()).is_err()
+            );
             // Recomputing the unkeyed frame CRC must not bypass AEAD authentication.
             let header = frame_codec::validate_log_header(&log[..MVCC_LOG_HEADER_SIZE]).unwrap();
             let layout = frame_codec::inspect_frame_prefix(
                 &log[MVCC_LOG_HEADER_SIZE..],
-                Some(&encryption.context().unwrap()),
+                encryption.local_context().unwrap().as_ref(),
             )
             .unwrap()
             .unwrap();
@@ -2203,7 +2128,7 @@ mod tests {
             );
             corrupt[trailer..trailer + 4].copy_from_slice(&crc.to_le_bytes());
             assert!(
-                normalize_encrypted_log(&corrupt, &encryption.context().unwrap())
+                normalize_mvcc_log(&corrupt, encryption.local_context().unwrap().as_ref())
                     .err()
                     .unwrap()
                     .to_string()
@@ -2213,45 +2138,83 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_snapshot_pages_advertise_sync_support() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("source.db");
-        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(
-            io,
-            path.to_str().unwrap(),
-            OpenFlags::Create,
-            DatabaseOpts::new().with_encryption(true),
-            Some(turso_core::EncryptionOpts {
-                cipher: "aes256gcm".into(),
-                hexkey: "0b".repeat(32),
-            }),
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(
-                ConnectOpts::new(SessionRole::Superuser)
-                    .with_encryption_key(Some(turso_core::EncryptionKey::new_256([11; 32]))),
+    fn encrypted_bootstrap_pages_advertise_sync_support() {
+        for mvcc in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.db");
+            let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+            let db = Database::open_file_with_flags(
+                io,
+                path.to_str().unwrap(),
+                OpenFlags::Create,
+                DatabaseOpts::new().with_encryption(true),
+                Some(turso_core::EncryptionOpts {
+                    cipher: "aes256gcm".into(),
+                    hexkey: "0b".repeat(32),
+                }),
+                Arc::new(SqliteDialect),
             )
             .unwrap();
-        conn.execute("CREATE TABLE secrets(value TEXT)").unwrap();
-        conn.execute("INSERT INTO secrets VALUES ('sample private value')")
-            .unwrap();
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-        let handle = DbHandle {
-            conn: Mutex::new(conn),
-            path: path.to_string_lossy().into_owned(),
-        };
-        let server = dir_server(dir.path());
-        let response = server
-            .handle_replace_base_pages(&handle, "g1:o0".into())
-            .unwrap();
-        let mut bytes = response.body.as_slice();
-        let header = PullUpdatesRespProtoBody::decode_length_delimited(&mut bytes).unwrap();
-        assert!(header.db_size > 0);
-        let first = PageData::decode_length_delimited(&mut bytes).unwrap();
-        assert!(first.encoded_page.starts_with(b"SQLite format 3\0"));
+            let conn = db
+                .connect(
+                    ConnectOpts::new(SessionRole::Superuser)
+                        .with_encryption_key(Some(turso_core::EncryptionKey::new_256([11; 32]))),
+                )
+                .unwrap();
+            if mvcc {
+                conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+            }
+            conn.execute("CREATE TABLE secrets(value TEXT)").unwrap();
+            conn.execute("INSERT INTO secrets VALUES ('sample private value')")
+                .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            let handle = DbHandle {
+                conn: Mutex::new(conn),
+                path: path.to_string_lossy().into_owned(),
+            };
+            let mut server = dir_server(dir.path());
+            server.encryption = Some(
+                SyncEncryption::new(
+                    CipherMode::Aes256Gcm,
+                    Some(EncryptionKey::new_256([11; 32])),
+                    None,
+                )
+                .unwrap(),
+            );
+            let request = PullUpdatesReqProtoBody::default().encode_to_vec();
+            let response = server.handle_pull_updates(&handle, &request).unwrap();
+            let mut bytes = response.body.as_slice();
+            let header = PullUpdatesRespProtoBody::decode_length_delimited(&mut bytes).unwrap();
+            assert!(header.db_size > 0);
+            assert_eq!(header.apply_mode, PullUpdatesApplyMode::Incremental as i32);
+            assert_eq!(
+                header.protocol,
+                if mvcc {
+                    PullUpdatesProtocol::MvccLogical
+                } else {
+                    PullUpdatesProtocol::Pages
+                } as i32,
+            );
+            let first = PageData::decode_length_delimited(&mut bytes).unwrap();
+            assert!(first.encoded_page.starts_with(b"SQLite format 3\0"));
+
+            let request = PullUpdatesReqProtoBody {
+                client_revision: header.server_revision,
+                stream_kind: if mvcc {
+                    PullUpdatesStreamKind::MvccLogicalLog
+                } else {
+                    PullUpdatesStreamKind::Pages
+                } as i32,
+                ..Default::default()
+            }
+            .encode_to_vec();
+            let response = server.handle_pull_updates(&handle, &request).unwrap();
+            let mut bytes = response.body.as_slice();
+            let incremental =
+                PullUpdatesRespProtoBody::decode_length_delimited(&mut bytes).unwrap();
+            assert_eq!(incremental.db_size, header.db_size);
+            assert!(bytes.is_empty());
+        }
     }
 
     #[test]

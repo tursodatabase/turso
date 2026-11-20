@@ -40,6 +40,7 @@ use turso_core::{
     QueryMode, SessionRole, Statement, Value,
 };
 use turso_sqlite::SqliteDialect;
+use turso_sync_engine::sync_encryption::SyncEncryption;
 
 #[derive(Parser, Debug)]
 #[command(name = "Turso")]
@@ -165,7 +166,7 @@ pub struct Limbo {
     input_buff: ManuallyDrop<String>,
     pub(crate) opts: Settings,
     pub(crate) db_opts: turso_core::DatabaseOpts,
-    pub(crate) sync_encryption: Option<crate::sync_server::ServerEncryption>,
+    pub(crate) sync_encryption: Option<SyncEncryption>,
     read_state: ReadState,
     pub rl: Option<Editor<LimboHelper, DefaultHistory>>,
     config: Option<Config>,
@@ -274,13 +275,17 @@ impl Limbo {
         let sync_encryption = opts
             .sync_encryption_cipher
             .as_deref()
-            .map(|cipher| {
-                crate::sync_server::ServerEncryption::from_key_file(
-                    cipher,
-                    opts.sync_encryption_key_file
-                        .as_ref()
-                        .expect("clap requires key file"),
-                )
+            .map(|cipher| -> anyhow::Result<_> {
+                Ok(SyncEncryption::from_local_options(
+                    &turso_core::EncryptionOpts {
+                        cipher: cipher.to_string(),
+                        hexkey: std::fs::read_to_string(
+                            opts.sync_encryption_key_file
+                                .as_ref()
+                                .expect("clap requires key file"),
+                        )?,
+                    },
+                )?)
             })
             .transpose()?;
 
@@ -317,13 +322,15 @@ impl Limbo {
                 opts.vfs.as_ref(),
                 flags,
                 db_opts.turso_cli(),
-                sync_encryption.as_ref().map(|e| e.open_options()),
+                sync_encryption
+                    .as_ref()
+                    .and_then(SyncEncryption::local_options),
                 Arc::new(SqliteDialect),
             )?;
-            let conn = db.connect(
-                ConnectOpts::new(SessionRole::Superuser)
-                    .with_encryption_key(sync_encryption.as_ref().map(|e| e.key.clone())),
-            )?;
+            let conn = db.connect(sync_encryption.as_ref().map_or_else(
+                || ConnectOpts::new(SessionRole::Superuser),
+                SyncEncryption::connect_options,
+            ))?;
             (io, conn)
         };
         unsafe {
