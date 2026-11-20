@@ -797,19 +797,14 @@ pub(super) fn emit_binary_insn(
             }
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
-            resolver.require_custom_types("Array features")?;
+            let func = containment_func(op, lhs_expr, rhs_expr, referenced_tables, resolver)?;
             let start = contiguous_operands(program, lhs, rhs);
-            let func = match op {
-                ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
-                ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
-                _ => unreachable!(),
-            };
             program.emit_insn(Insn::Function {
                 constant_mask: 0,
                 start_reg: start,
                 dest: target_register,
                 func: FuncCtx {
-                    func: Func::Scalar(func),
+                    func,
                     arg_count: 2,
                     collation: CollationSeq::BINARY,
                 },
@@ -1104,19 +1099,14 @@ pub(super) fn emit_binary_condition_insn(
             eval_result(program, target_register);
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
-            resolver.require_custom_types("Array features")?;
+            let func = containment_func(op, lhs_expr, rhs_expr, referenced_tables, resolver)?;
             let start = contiguous_operands(program, lhs, rhs);
-            let func = match op {
-                ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
-                ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
-                _ => unreachable!(),
-            };
             program.emit_insn(Insn::Function {
                 constant_mask: 0,
                 start_reg: start,
                 dest: target_register,
                 func: FuncCtx {
-                    func: Func::Scalar(func),
+                    func,
                     arg_count: 2,
                     collation: CollationSeq::BINARY,
                 },
@@ -1127,6 +1117,36 @@ pub(super) fn emit_binary_condition_insn(
     }
 
     Ok(())
+}
+
+/// The function that runs `lhs @> rhs` or `lhs && rhs`. When neither operand
+/// of `@>` is an array, the function of the dialect runs it, if the dialect
+/// has one: PostgreSQL's `@>` also compares jsonb values. The types of the
+/// operands are known only here, not when the statement is parsed.
+fn containment_func(
+    op: &ast::Operator,
+    lhs_expr: &Expr,
+    rhs_expr: &Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<Func> {
+    if matches!(op, ast::Operator::ArrayContains)
+        && !is_array(lhs_expr, referenced_tables, resolver)
+        && !is_array(rhs_expr, referenced_tables, resolver)
+    {
+        if let Some(name) = resolver.catalog.dialect.json_contains_function() {
+            let func = resolver.resolve_function(name, 2)?;
+            return Ok(func.unwrap_or_else(|| {
+                panic!("the dialect gives {name}() for @>, but no function has that name")
+            }));
+        }
+    }
+    resolver.require_custom_types("Array features")?;
+    Ok(Func::Scalar(match op {
+        ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
+        ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
+        _ => unreachable!("only @> and && run an array function"),
+    }))
 }
 
 fn is_array(expr: &Expr, referenced_tables: Option<&TableReferences>, resolver: &Resolver) -> bool {

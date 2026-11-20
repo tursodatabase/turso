@@ -56,6 +56,12 @@ This project includes a vendored copy of crossbeam-skiplist (in `core/skiplist`)
 * License: licenses/core/crossbeam-skiplist-mit-license.md (MIT License)
 * Homepage: https://github.com/crossbeam-rs/crossbeam
 
+This project depends on bigdecimal, distributed by the BigDecimal-rs contributors:
+
+* License: licenses/core/bigdecimal-apache-license.md (Apache License v2.0)
+* License: licenses/core/bigdecimal-mit-license.md (MIT License)
+* Homepage: https://github.com/akubera/bigdecimal-rs
+
 This project depends on pastey, distributed by the pastey authors:
 
 * License: licenses/core/pastey-apache-license.md (Apache License v2.0)

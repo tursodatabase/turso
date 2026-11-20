@@ -7346,6 +7346,7 @@ dependencies = [
 name = "turso_pg"
 version = "0.9.0-pre.6"
 dependencies = [
+ "bigdecimal",
  "bitflags 2.9.4",
  "chrono",
  "chumsky",

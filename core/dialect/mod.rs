@@ -637,6 +637,16 @@ pub trait Dialect: Send + Sync + 'static {
     fn generates_integer_primary_keys(&self) -> bool {
         true
     }
+
+    /// The name of the function that runs `a @> b` when neither operand is
+    /// an array, or None when the array function runs it too.
+    ///
+    /// PostgreSQL's `@>` also compares jsonb values: the frontend gives a
+    /// function that it registers. SQLite has no `@>`, and Turso's `@>`
+    /// compares arrays.
+    fn json_contains_function(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// How an ORDER BY or DISTINCT ON term is matched to the output columns.

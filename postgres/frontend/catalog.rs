@@ -430,6 +430,10 @@ impl Dialect for PostgresDialect {
     fn casts_nonzero_integer_to_true(&self) -> bool {
         true
     }
+
+    fn json_contains_function(&self) -> Option<&'static str> {
+        Some("jsonb_contains")
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
