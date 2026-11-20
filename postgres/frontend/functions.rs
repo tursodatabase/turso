@@ -1632,7 +1632,7 @@ pub(crate) fn validate_pg_input(
             }
         }
         _ => Err(error(
-            "0A000",
+            "42704",
             format!("type \"{type_name}\" does not exist"),
         )),
     }
