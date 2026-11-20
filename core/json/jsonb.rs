@@ -1082,153 +1082,117 @@ impl Jsonb {
         depth: usize,
         delimiter: &JsonIndentation,
     ) -> Result<usize> {
-        // Serialization recurses once per nesting level, so without this the
-        // stack depth is bounded only by the size of the document, and a
-        // deeply nested blob aborts the process instead of raising an error.
-        if depth > MAX_JSON_DEPTH {
-            bail_parse_error!("Too deep");
+        enum Step {
+            Value(usize),
+            Container(bool, usize, usize),
+            After(bool, usize, usize),
         }
-
-        let (header, skip_header) = self.read_header(cursor)?;
-
-        let cursor = cursor + skip_header;
-        let current_cursor = match header {
-            JsonbHeader(ElementType::OBJECT, len) => {
-                self.serialize_object(string, cursor, len, depth, delimiter)?
-            }
-            JsonbHeader(ElementType::ARRAY, len) => {
-                self.serialize_array(string, cursor, len, depth, delimiter)?
-            }
-            JsonbHeader(ElementType::TEXT, len)
-            | JsonbHeader(ElementType::TEXTRAW, len)
-            | JsonbHeader(ElementType::TEXTJ, len)
-            | JsonbHeader(ElementType::TEXT5, len) => {
-                self.serialize_string(string, cursor, len, &header.0, true)?
-            }
-            JsonbHeader(ElementType::INT, len)
-            | JsonbHeader(ElementType::INT5, len)
-            | JsonbHeader(ElementType::FLOAT, len)
-            | JsonbHeader(ElementType::FLOAT5, len) => {
-                self.serialize_number(string, cursor, len, &header.0)?
-            }
-
-            JsonbHeader(ElementType::TRUE, _) => self.serialize_boolean(string, cursor, true),
-            JsonbHeader(ElementType::FALSE, _) => self.serialize_boolean(string, cursor, false),
-            JsonbHeader(ElementType::NULL, _) => self.serialize_null(string, cursor),
-            JsonbHeader(_, _) => {
-                unreachable!();
-            }
-        };
-        Ok(current_cursor)
-    }
-
-    fn serialize_object(
-        &self,
-        string: &mut String,
-        cursor: usize,
-        len: usize,
-        mut depth: usize,
-        indent: &JsonIndentation,
-    ) -> Result<usize> {
-        let end_cursor = cursor
-            .checked_add(len)
-            .ok_or_else(|| LimboError::ParseError("Invalid JSONB: payload size overflow".into()))?;
-        let mut current_cursor = cursor;
-        depth += 1;
-        string.push('{');
-        if current_cursor == end_cursor {
-            string.push('}');
-            return Ok(current_cursor);
-        }
-        if indent.is_pretty() {
-            string.push('\n');
-        };
-        while current_cursor < end_cursor {
-            let (key_header, key_header_offset) = self.read_header(current_cursor)?;
-            current_cursor += key_header_offset;
-            let JsonbHeader(element_type, len) = key_header;
-            if let JsonIndentation::Indentation(value) = indent {
-                for _ in 0..depth {
-                    string.push_str(value);
+        let mut cursor = cursor;
+        let mut pending = vec![Step::Value(depth)];
+        while let Some(step) = pending.pop() {
+            match step {
+                Step::Value(depth) => {
+                    if depth > MAX_JSON_DEPTH {
+                        bail_parse_error!("Too deep");
+                    }
+                    let (header, skip) = self.read_header(cursor)?;
+                    cursor += skip;
+                    match header {
+                        JsonbHeader(ElementType::OBJECT, len)
+                        | JsonbHeader(ElementType::ARRAY, len) => {
+                            let object = matches!(header.0, ElementType::OBJECT);
+                            let end = cursor.checked_add(len).ok_or_else(|| {
+                                LimboError::ParseError(
+                                    "Invalid JSONB: payload size overflow".into(),
+                                )
+                            })?;
+                            string.push(if object { '{' } else { '[' });
+                            if cursor == end {
+                                string.push(if object { '}' } else { ']' });
+                            } else {
+                                if delimiter.is_pretty() {
+                                    string.push('\n');
+                                }
+                                pending.push(Step::Container(object, end, depth + 1));
+                            }
+                        }
+                        JsonbHeader(
+                            ElementType::TEXT
+                            | ElementType::TEXTRAW
+                            | ElementType::TEXTJ
+                            | ElementType::TEXT5,
+                            len,
+                        ) => {
+                            cursor = self.serialize_string(string, cursor, len, &header.0, true)?;
+                        }
+                        JsonbHeader(
+                            ElementType::INT
+                            | ElementType::INT5
+                            | ElementType::FLOAT
+                            | ElementType::FLOAT5,
+                            len,
+                        ) => {
+                            cursor = self.serialize_number(string, cursor, len, &header.0)?;
+                        }
+                        JsonbHeader(ElementType::TRUE, _) => {
+                            cursor = self.serialize_boolean(string, cursor, true)
+                        }
+                        JsonbHeader(ElementType::FALSE, _) => {
+                            cursor = self.serialize_boolean(string, cursor, false)
+                        }
+                        JsonbHeader(ElementType::NULL, _) => {
+                            cursor = self.serialize_null(string, cursor)
+                        }
+                        JsonbHeader(_, _) => unreachable!(),
+                    }
                 }
-            };
-            match element_type {
-                ElementType::TEXT
-                | ElementType::TEXTRAW
-                | ElementType::TEXTJ
-                | ElementType::TEXT5 => {
-                    current_cursor =
-                        self.serialize_string(string, current_cursor, len, &element_type, true)?;
+                Step::Container(object, end, depth) => {
+                    if cursor >= end {
+                        if let JsonIndentation::Indentation(value) = delimiter {
+                            for _ in 0..depth - 1 {
+                                string.push_str(value);
+                            }
+                        }
+                        string.push(if object { '}' } else { ']' });
+                        continue;
+                    }
+                    if let JsonIndentation::Indentation(value) = delimiter {
+                        for _ in 0..depth {
+                            string.push_str(value);
+                        }
+                    }
+                    if object {
+                        let (JsonbHeader(kind, len), skip) = self.read_header(cursor)?;
+                        cursor += skip;
+                        match kind {
+                            ElementType::TEXT
+                            | ElementType::TEXTRAW
+                            | ElementType::TEXTJ
+                            | ElementType::TEXT5 => {
+                                cursor = self.serialize_string(string, cursor, len, &kind, true)?;
+                            }
+                            _ => bail_parse_error!("malformed JSON"),
+                        }
+                        string.push(':');
+                        if delimiter.is_pretty() {
+                            string.push(' ');
+                        }
+                    }
+                    pending.push(Step::After(object, end, depth));
+                    pending.push(Step::Value(depth));
                 }
-                _ => bail_parse_error!("malformed JSON"),
-            }
-
-            string.push(':');
-            if indent.is_pretty() {
-                string.push(' ');
-            }
-            current_cursor = self.serialize_value(string, current_cursor, depth, indent)?;
-            if current_cursor < end_cursor {
-                string.push(',');
-            }
-
-            if indent.is_pretty() {
-                string.push('\n');
-            };
-        }
-        if let JsonIndentation::Indentation(value) = indent {
-            for _ in 0..depth - 1 {
-                string.push_str(value);
-            }
-        };
-        string.push('}');
-
-        Ok(current_cursor)
-    }
-
-    fn serialize_array(
-        &self,
-        string: &mut String,
-        cursor: usize,
-        len: usize,
-        mut depth: usize,
-        indent: &JsonIndentation,
-    ) -> Result<usize> {
-        let end_cursor = cursor
-            .checked_add(len)
-            .ok_or_else(|| LimboError::ParseError("Invalid JSONB: payload size overflow".into()))?;
-        let mut current_cursor = cursor;
-        depth += 1;
-        string.push('[');
-        if current_cursor == end_cursor {
-            string.push(']');
-            return Ok(current_cursor);
-        }
-        if indent.is_pretty() {
-            string.push('\n');
-        };
-        while current_cursor < end_cursor {
-            if let JsonIndentation::Indentation(value) = indent {
-                for _ in 0..depth {
-                    string.push_str(value);
+                Step::After(object, end, depth) => {
+                    if cursor < end {
+                        string.push(',');
+                    }
+                    if delimiter.is_pretty() {
+                        string.push('\n');
+                    }
+                    pending.push(Step::Container(object, end, depth));
                 }
-            };
-            current_cursor = self.serialize_value(string, current_cursor, depth, indent)?;
-            if current_cursor < end_cursor {
-                string.push(',');
             }
-            if indent.is_pretty() {
-                string.push('\n');
-            };
         }
-        if let JsonIndentation::Indentation(value) = indent {
-            for _ in 0..depth - 1 {
-                string.push_str(value);
-            }
-        };
-        string.push(']');
-
-        Ok(current_cursor)
+        Ok(cursor)
     }
 
     fn serialize_string(
@@ -1604,12 +1568,10 @@ impl Jsonb {
 
         match input[pos] {
             b'{' => {
-                pos += 1; // consume '{'
-                pos = self.deserialize_obj(input, pos, depth + 1, info)?;
+                pos = self.deserialize_container(input, pos, depth, info)?;
             }
             b'[' => {
-                pos += 1; // consume '['
-                pos = self.deserialize_array(input, pos, depth + 1, info)?;
+                pos = self.deserialize_container(input, pos, depth, info)?;
             }
             b't' => {
                 pos = self.deserialize_true(input, pos)?;
@@ -1648,174 +1610,173 @@ impl Jsonb {
         Ok(pos)
     }
 
-    fn deserialize_obj(
+    fn deserialize_container(
         &mut self,
         input: &[u8],
         mut pos: usize,
         depth: usize,
         info: &mut ParseInfo,
     ) -> PResult<usize> {
-        if depth > MAX_JSON_DEPTH {
-            return Err(PError::Message {
-                msg: "Too deep".to_string(),
-                location: Some(pos),
-            });
+        enum Step {
+            Value(usize, usize),
+            Loop(bool, bool, usize, usize, usize),
+            After(bool, usize, usize, usize),
+            Error(&'static str, usize),
         }
-        if self.data.capacity() - self.data.len() < 50 {
-            self.data.reserve(self.data.capacity());
-        }
-        if pos >= input.len() {
-            return Err(PError::Message {
-                msg: "Unexpected end of input".to_string(),
-                location: Some(pos),
-            });
-        }
-
-        let header_pos = self.len();
-        self.write_element_header(header_pos, ElementType::OBJECT, 0, false)
-            .map_err(|_| PError::Message {
-                msg: "Failed to write header".to_string(),
-                location: Some(pos),
-            })?;
-        let obj_start = self.len();
-        let mut first = true;
-
-        loop {
-            let key_start = pos;
-            pos = skip_whitespace_tracking(input, pos, info);
-            if pos >= input.len() {
-                return Err(PError::Message {
-                    msg: "Unexpected end of input".to_string(),
-                    location: Some(pos),
-                });
-            }
-            let c = input[pos];
-            if c == b'}' {
-                if !first {
-                    info.has_json5 = true;
+        let mut pending = vec![Step::Value(pos, depth)];
+        while let Some(step) = pending.pop() {
+            match step {
+                Step::Value(start, depth) => {
+                    if depth > MAX_JSON_DEPTH {
+                        return Err(PError::Message {
+                            msg: "Too deep".into(),
+                            location: Some(pos),
+                        });
+                    }
+                    if pos >= input.len() {
+                        return Err(PError::Message {
+                            msg: "Unexpected end of input".into(),
+                            location: Some(start),
+                        });
+                    }
+                    let object = match input[pos] {
+                        b'{' => true,
+                        b'[' => false,
+                        _ => {
+                            pos = self.deserialize_value(input, start, pos, depth, info)?;
+                            continue;
+                        }
+                    };
+                    if depth + 1 > MAX_JSON_DEPTH {
+                        return Err(PError::Message {
+                            msg: "Too deep".into(),
+                            location: Some(pos),
+                        });
+                    }
+                    pos += 1;
+                    if object && pos >= input.len() {
+                        return Err(PError::Message {
+                            msg: "Unexpected end of input".into(),
+                            location: Some(pos),
+                        });
+                    }
+                    if object && self.data.capacity() - self.data.len() < 50 {
+                        self.data.reserve(self.data.capacity());
+                    }
+                    let header = self.len();
+                    let kind = if object {
+                        ElementType::OBJECT
+                    } else {
+                        ElementType::ARRAY
+                    };
+                    self.write_element_header(header, kind, 0, false)
+                        .map_err(|_| PError::Message {
+                            msg: "Failed to write header".into(),
+                            location: Some(pos),
+                        })?;
+                    let payload = self.len();
+                    pending.push(Step::Loop(object, true, header, payload, depth + 1));
                 }
-                break;
-            }
-            if c == b'"' || c == b'\'' || c == b'\\' || is_json5_id_char(c, true) {
-                pos = self.deserialize_string(input, pos, info)?;
-            } else if matches!(c, b']' | b',' | b':') {
-                return Err(PError::Message {
-                    msg: "Missing object key".to_string(),
-                    location: Some(pos),
-                });
-            } else {
-                self.deserialize_value(input, key_start, pos, depth + 1, info)?;
-                return Err(PError::Message {
-                    msg: "Object key must be a string".to_string(),
-                    location: Some(key_start),
-                });
-            }
-
-            pos = skip_whitespace_tracking(input, pos, info);
-            if pos >= input.len() || input[pos] != b':' {
-                self.deserialize_value(input, pos, pos, depth + 1, info)?;
-                return Err(PError::Message {
-                    msg: "Expected : after object key".to_string(),
-                    location: Some(pos),
-                });
-            }
-            pos += 1; // consume ':'
-
-            let value_start = pos;
-            pos = skip_whitespace_tracking(input, pos, info);
-            pos = self.deserialize_value(input, value_start, pos, depth + 1, info)?;
-            first = false;
-
-            pos = skip_whitespace_tracking(input, pos, info);
-            if pos >= input.len() {
-                return Err(PError::Message {
-                    msg: "Unexpected end of input".to_string(),
-                    location: Some(pos),
-                });
-            }
-            match input[pos] {
-                b',' => pos += 1,
-                b'}' => break,
-                _ => {
+                Step::Loop(object, first, header, payload, depth) => {
+                    let start = pos;
+                    pos = skip_whitespace_tracking(input, pos, info);
+                    if object && pos >= input.len() {
+                        return Err(PError::Message {
+                            msg: "Unexpected end of input".into(),
+                            location: Some(pos),
+                        });
+                    }
+                    let close = if object { b'}' } else { b']' };
+                    if pos < input.len() && input[pos] == close {
+                        if !first {
+                            info.has_json5 = true;
+                        }
+                        pos += 1;
+                        let kind = if object {
+                            ElementType::OBJECT
+                        } else {
+                            ElementType::ARRAY
+                        };
+                        self.write_element_header(header, kind, self.len() - payload, false)
+                            .map_err(|_| PError::Message {
+                                msg: "Failed to write header".into(),
+                                location: Some(pos),
+                            })?;
+                        continue;
+                    }
+                    if object {
+                        let c = input[pos];
+                        if c == b'"' || c == b'\'' || c == b'\\' || is_json5_id_char(c, true) {
+                            pos = self.deserialize_string(input, pos, info)?;
+                        } else if matches!(c, b']' | b',' | b':') {
+                            return Err(PError::Message {
+                                msg: "Missing object key".into(),
+                                location: Some(pos),
+                            });
+                        } else {
+                            pending.push(Step::Error("Object key must be a string", start));
+                            pending.push(Step::Value(start, depth));
+                            continue;
+                        }
+                        pos = skip_whitespace_tracking(input, pos, info);
+                        if pos >= input.len() || input[pos] != b':' {
+                            pending.push(Step::Error("Expected : after object key", pos));
+                            pending.push(Step::Value(pos, depth));
+                            continue;
+                        }
+                        pos += 1;
+                    }
+                    let value_start = if object { pos } else { start };
+                    if object {
+                        pos = skip_whitespace_tracking(input, pos, info);
+                    }
+                    pending.push(Step::After(object, header, payload, depth));
+                    pending.push(Step::Value(value_start, depth));
+                }
+                Step::After(object, header, payload, depth) => {
+                    pos = skip_whitespace_tracking(input, pos, info);
+                    if pos >= input.len() {
+                        return Err(PError::Message {
+                            msg: "Unexpected end of input".into(),
+                            location: Some(pos),
+                        });
+                    }
+                    let close = if object { b'}' } else { b']' };
+                    if input[pos] == b',' {
+                        pos += 1;
+                        pending.push(Step::Loop(object, false, header, payload, depth));
+                    } else if input[pos] == close {
+                        pos += 1;
+                        let kind = if object {
+                            ElementType::OBJECT
+                        } else {
+                            ElementType::ARRAY
+                        };
+                        self.write_element_header(header, kind, self.len() - payload, false)
+                            .map_err(|_| PError::Message {
+                                msg: "Failed to write header".into(),
+                                location: Some(pos),
+                            })?;
+                    } else {
+                        return Err(PError::Message {
+                            msg: if object {
+                                "Should be , or }"
+                            } else {
+                                "Should be , or ]"
+                            }
+                            .into(),
+                            location: Some(pos),
+                        });
+                    }
+                }
+                Step::Error(msg, location) => {
                     return Err(PError::Message {
-                        msg: "Should be , or }".to_string(),
-                        location: Some(pos),
-                    });
+                        msg: msg.into(),
+                        location: Some(location),
+                    })
                 }
             }
         }
-
-        pos += 1; // consume '}'
-        let obj_size = self.len() - obj_start;
-        self.write_element_header(header_pos, ElementType::OBJECT, obj_size, false)
-            .map_err(|_| PError::Message {
-                msg: "Failed to write header".to_string(),
-                location: Some(pos),
-            })?;
-        Ok(pos)
-    }
-
-    fn deserialize_array(
-        &mut self,
-        input: &[u8],
-        mut pos: usize,
-        depth: usize,
-        info: &mut ParseInfo,
-    ) -> PResult<usize> {
-        if depth > MAX_JSON_DEPTH {
-            return Err(PError::Message {
-                msg: "Too deep".to_string(),
-                location: Some(pos),
-            });
-        }
-
-        let header_pos = self.len();
-        self.write_element_header(header_pos, ElementType::ARRAY, 0, false)
-            .map_err(|_| PError::Message {
-                msg: "Failed to write header".to_string(),
-                location: Some(pos),
-            })?;
-        let arr_start = self.len();
-        let mut first = true;
-
-        loop {
-            let element_start = pos;
-            pos = skip_whitespace_tracking(input, pos, info);
-            if pos < input.len() && input[pos] == b']' {
-                if !first {
-                    info.has_json5 = true;
-                }
-                break;
-            }
-            pos = self.deserialize_value(input, element_start, pos, depth + 1, info)?;
-            first = false;
-
-            pos = skip_whitespace_tracking(input, pos, info);
-            if pos >= input.len() {
-                return Err(PError::Message {
-                    msg: "Unexpected end of input".to_string(),
-                    location: Some(pos),
-                });
-            }
-            match input[pos] {
-                b',' => pos += 1,
-                b']' => break,
-                _ => {
-                    return Err(PError::Message {
-                        msg: "Should be , or ]".to_string(),
-                        location: Some(pos),
-                    });
-                }
-            }
-        }
-
-        pos += 1; // consume ']'
-        let arr_len = self.len() - arr_start;
-        self.write_element_header(header_pos, ElementType::ARRAY, arr_len, false)
-            .map_err(|_| PError::Message {
-                msg: "Failed to write header".to_string(),
-                location: Some(pos),
-            })?;
         Ok(pos)
     }
 
@@ -3628,6 +3589,63 @@ fn validate_element(
     depth: usize,
     strict: bool,
 ) -> std::result::Result<(), usize> {
+    enum Frame {
+        Value(usize, usize, usize),
+        Array(usize, usize, usize),
+        Object(usize, usize, usize, usize),
+    }
+    let mut pending = vec![Frame::Value(start, end, depth)];
+    while let Some(frame) = pending.pop() {
+        match frame {
+            Frame::Value(start, end, depth) => {
+                validate_one(
+                    data,
+                    start,
+                    end,
+                    depth,
+                    strict,
+                    &mut |kind, pos, end, depth| {
+                        pending.push(if kind {
+                            Frame::Object(pos, end, depth, 0)
+                        } else {
+                            Frame::Array(pos, end, depth)
+                        });
+                    },
+                )?;
+            }
+            Frame::Array(pos, end, depth) if pos < end => {
+                let next = child_element_end(data, pos, end)?;
+                pending.push(Frame::Array(next, end, depth));
+                pending.push(Frame::Value(pos, next, depth + 1));
+            }
+            Frame::Object(pos, end, depth, count) if pos < end => {
+                let next = child_element_end(data, pos, end)?;
+                if count % 2 == 0 {
+                    let Ok((header, _)) = JsonbHeader::from_slice(pos, data) else {
+                        return Err(pos + 1);
+                    };
+                    if !header.element_type().is_valid_key() {
+                        return Err(pos + 1);
+                    }
+                }
+                pending.push(Frame::Object(next, end, depth, count + 1));
+                pending.push(Frame::Value(pos, next, depth + 1));
+            }
+            Frame::Object(_, end, _, count) if count % 2 != 0 => return Err(end + 1),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_one(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    depth: usize,
+    strict: bool,
+    schedule: &mut impl FnMut(bool, usize, usize, usize),
+) -> std::result::Result<(), usize> {
     if depth > MAX_JSON_DEPTH {
         return Err(start + 1);
     }
@@ -3750,35 +3768,11 @@ fn validate_element(
             Ok(())
         }
         ElementType::ARRAY => {
-            let mut pos = payload_start;
-            while pos < payload_end {
-                let elem_end = child_element_end(data, pos, payload_end)?;
-                validate_element(data, pos, elem_end, depth + 1, strict)?;
-                pos = elem_end;
-            }
+            schedule(false, payload_start, payload_end, depth);
             Ok(())
         }
         ElementType::OBJECT => {
-            let mut pos = payload_start;
-            let mut count = 0;
-            while pos < payload_end {
-                let elem_end = child_element_end(data, pos, payload_end)?;
-                if count % 2 == 0 {
-                    let Ok((elem_header, _)) = JsonbHeader::from_slice(pos, data) else {
-                        return Err(pos + 1);
-                    };
-                    if !elem_header.element_type().is_valid_key() {
-                        return Err(pos + 1);
-                    }
-                }
-                validate_element(data, pos, elem_end, depth + 1, strict)?;
-                pos = elem_end;
-                count += 1;
-            }
-
-            if count % 2 != 0 {
-                return Err(payload_end + 1);
-            }
+            schedule(true, payload_start, payload_end, depth);
             Ok(())
         }
         _ => Err(start + 1),
@@ -5018,6 +5012,38 @@ world""#,
 
         // Should fail due to exceeding depth limit
         assert!(Jsonb::from_str(&deep_json).is_err());
+    }
+
+    #[test]
+    fn deeply_nested_text_and_jsonb_are_stack_safe() {
+        for shape in 0..3 {
+            for depth in [999, 1000, 1001] {
+                let mut text = String::new();
+                let mut closing = String::new();
+                for level in 0..depth {
+                    if shape == 0 || (shape == 2 && level % 2 == 0) {
+                        text.push('[');
+                        closing.push(']');
+                    } else {
+                        text.push_str("{\"a\":");
+                        closing.push('}');
+                    }
+                }
+                text.push('1');
+                text.extend(closing.chars().rev());
+                if depth > MAX_JSON_DEPTH {
+                    assert!(Jsonb::from_str(&text).is_err());
+                } else {
+                    let json = Jsonb::from_str(&text).unwrap();
+                    assert_eq!(json.to_string().unwrap(), text);
+                    assert!(validate_jsonb(&json.data));
+                    assert_eq!(
+                        jsonb_error_position(&json.data) == 0,
+                        depth < MAX_JSON_DEPTH
+                    );
+                }
+            }
+        }
     }
 
     #[test]

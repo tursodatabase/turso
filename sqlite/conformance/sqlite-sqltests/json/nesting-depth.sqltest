@@ -1,0 +1,57 @@
+@database :memory:
+
+test json-nesting-array-boundary {
+    WITH RECURSIVE t1(a,b) AS (
+        VALUES(0,'1')
+        UNION ALL SELECT a+1,'['||b||']' FROM t1 WHERE a<1001
+    )
+    SELECT a,json_valid(b),json_error_position(b),
+        CASE WHEN json_valid(b) THEN length(json(b)) ELSE -1 END,
+        CASE WHEN json_valid(b) THEN json_valid(jsonb(b),8) ELSE -1 END
+    FROM t1 WHERE a IN (499,500,501,999,1000,1001) ORDER BY a;
+}
+expect {
+    499|1|0|999|1
+    500|1|0|1001|1
+    501|1|0|1003|1
+    999|1|0|1999|1
+    1000|1|0|2001|0
+    1001|0|1001|-1|-1
+}
+
+test json-nesting-object-boundary {
+    WITH RECURSIVE t1(a,b) AS (
+        VALUES(0,'1')
+        UNION ALL SELECT a+1,'{"a":'||b||'}' FROM t1 WHERE a<1001
+    )
+    SELECT a,json_valid(b),json_error_position(b),
+        CASE WHEN json_valid(b) THEN length(json(b)) ELSE -1 END,
+        CASE WHEN json_valid(b) THEN json_valid(jsonb(b),8) ELSE -1 END
+    FROM t1 WHERE a IN (499,500,501,999,1000,1001) ORDER BY a;
+}
+expect {
+    499|1|0|2995|1
+    500|1|0|3001|1
+    501|1|0|3007|1
+    999|1|0|5995|1
+    1000|1|0|6001|0
+    1001|0|5001|-1|-1
+}
+
+test json-nesting-empty-array-boundary {
+    WITH RECURSIVE t1(a,b) AS (
+        VALUES(1,'[]')
+        UNION ALL SELECT a+1,'['||b||']' FROM t1 WHERE a<1001
+    )
+    SELECT a,json_valid(b),json_error_position(b),
+        CASE WHEN json_valid(b) THEN length(json(b)) ELSE -1 END
+    FROM t1 WHERE a IN (499,500,501,999,1000,1001) ORDER BY a;
+}
+expect {
+    499|1|0|998
+    500|1|0|1000
+    501|1|0|1002
+    999|1|0|1998
+    1000|1|0|2000
+    1001|0|1001|-1
+}
