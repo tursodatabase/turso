@@ -40,7 +40,7 @@ mod native_extension;
 mod pragma;
 mod query_processing;
 mod query_timeout;
-mod queued_io;
+use core_tester::queued_io;
 mod reindex;
 mod schema;
 mod security;
