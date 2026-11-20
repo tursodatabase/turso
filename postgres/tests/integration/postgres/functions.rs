@@ -759,13 +759,11 @@ fn test_pg_quote_literal(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
-fn test_pg_description_stubs_return_null(db: TempDatabase) {
+fn description_lookups_return_null_for_an_object_without_a_comment(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE t (id integer PRIMARY KEY)")
         .unwrap();
 
-    // Comments are not stored, so description lookups report none rather
-    // than erroring.
     for sql in [
         "SELECT obj_description(16384, 'pg_class')",
         "SELECT obj_description(16384)",

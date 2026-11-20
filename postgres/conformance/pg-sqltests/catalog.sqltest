@@ -1384,6 +1384,86 @@ expect {
     2200|2615|0|standard public schema
 }
 
+test obj-description-reads-the-comment-of-the-public-schema {
+    SELECT obj_description(oid, 'pg_namespace'), obj_description(oid, 'pg_class')
+    FROM pg_namespace WHERE nspname = 'public';
+}
+expect {
+    standard public schema|
+}
+
+test obj-description-of-a-subquery-with-an-aggregate {
+    SELECT obj_description((SELECT max(oid) FROM pg_namespace WHERE nspname = 'public'), 'pg_namespace');
+}
+expect {
+    standard public schema
+}
+
+@skip-if postgres "PostgreSQL looks up the comment of an aggregate"
+test obj-description-of-an-aggregate-is-not-supported {
+    SELECT obj_description(max(oid), 'pg_namespace') FROM pg_namespace WHERE nspname = 'public';
+}
+@sqlstate 0A000
+expect error {
+    obj_description of an aggregate or window function is not supported
+}
+
+@skip-if postgres "PostgreSQL looks up the comment of a window function"
+test col-description-of-a-window-function-is-not-supported {
+    SELECT col_description(oid, row_number() OVER ()) FROM pg_namespace WHERE nspname = 'public';
+}
+@sqlstate 0A000
+expect error {
+    col_description of an aggregate or window function is not supported
+}
+
+@skip-if postgres "PostgreSQL accepts obj_description in a column default"
+test obj-description-in-a-column-default-is-not-supported {
+    CREATE TABLE description_default (x int, y text DEFAULT obj_description(1, 'pg_class'));
+}
+@sqlstate 0A000
+expect error {
+    obj_description in a table definition is not supported
+}
+
+@skip-if postgres "PostgreSQL accepts col_description in a CHECK constraint"
+test col-description-in-a-check-constraint-is-not-supported {
+    CREATE TABLE description_check (x int, CHECK (col_description(x, 1) IS NULL));
+}
+@sqlstate 0A000
+expect error {
+    col_description in a table definition is not supported
+}
+
+@skip-if postgres "PostgreSQL accepts obj_description in the default of an added column"
+test obj-description-in-the-default-of-an-added-column-is-not-supported {
+    CREATE TABLE description_added (x int);
+    ALTER TABLE description_added ADD COLUMN y text DEFAULT obj_description(1, 'pg_class');
+}
+@sqlstate 0A000
+expect error {
+    obj_description in a table definition is not supported
+}
+
+@skip-if postgres "PostgreSQL refuses it as not immutable"
+test obj-description-in-an-index-is-not-supported {
+    CREATE TABLE description_indexed (x int);
+    CREATE INDEX description_index ON description_indexed ((obj_description(x, 'pg_class')));
+}
+@sqlstate 0A000
+expect error {
+    obj_description in an index is not supported
+}
+
+test obj-description-in-create-table-as {
+    CREATE TABLE description_copy AS
+        SELECT obj_description(oid, 'pg_namespace') AS d FROM pg_namespace WHERE nspname = 'public';
+    SELECT d FROM description_copy;
+}
+expect {
+    standard public schema
+}
+
 @skip-if postgres "a PostgreSQL superuser may write pg_description"
 test pg-description-rejects-writes {
     INSERT INTO pg_description VALUES (1, 1, 0, 'x');

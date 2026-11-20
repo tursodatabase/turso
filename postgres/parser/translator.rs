@@ -64,6 +64,8 @@ type RelationNameCheck = Box<dyn Fn(&str, &str) -> bool>;
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
     translating_index: std::cell::Cell<bool>,
+    /// Set while a CREATE TABLE or ALTER TABLE statement is being translated.
+    translating_table_definition: std::cell::Cell<bool>,
     /// None when nothing is known about the schema, as in tests.
     relation_name_is_taken: Option<RelationNameCheck>,
     /// Table name in scope while a generation expression is being translated.
@@ -240,7 +242,12 @@ impl PostgreSQLTranslator {
             NodeRef::TransactionStmt(txn) => self.translate_transaction(txn)?,
             NodeRef::LockStmt(lock) => self.translate_lock_stub(lock)?,
             NodeRef::DropStmt(drop) => self.translate_drop(drop)?,
-            NodeRef::AlterTableStmt(alter) => self.translate_alter_table(alter)?,
+            NodeRef::AlterTableStmt(alter) => {
+                self.translating_table_definition.set(true);
+                let alter_table = self.translate_alter_table(alter);
+                self.translating_table_definition.set(false);
+                alter_table?
+            }
             NodeRef::RenameStmt(rename) => self.translate_rename_stmt(rename)?,
             NodeRef::IndexStmt(idx) => self.translate_create_index(idx)?,
             NodeRef::TruncateStmt(truncate) => self.translate_truncate(truncate)?,
@@ -552,7 +559,10 @@ impl PostgreSQLTranslator {
         &self,
         create: &pg_query::protobuf::CreateStmt,
     ) -> Result<TranslateResult, ParseError> {
-        let (stmt, serial_sequences) = self.translate_create_table(create)?;
+        self.translating_table_definition.set(true);
+        let create_table = self.translate_create_table(create);
+        self.translating_table_definition.set(false);
+        let (stmt, serial_sequences) = create_table?;
         let ast::Stmt::CreateTable { tbl_name, .. } = &stmt else {
             unreachable!("translate_create_table returns a CREATE TABLE statement");
         };
@@ -4528,6 +4538,27 @@ impl PostgreSQLTranslator {
             None
         };
 
+        if func_call.agg_filter.is_none() && func_call.over.is_none() {
+            if let Some(description) = description_lookup(&func_name, &args) {
+                let unsupported_use = if self.translating_index.get() {
+                    Some("in an index")
+                } else if self.translating_table_definition.get() {
+                    Some("in a table definition")
+                } else if has_aggregate_outside_subqueries(&func_call.args) {
+                    Some("of an aggregate or window function")
+                } else {
+                    None
+                };
+                if let Some(unsupported_use) = unsupported_use {
+                    return Err(ParseError::Sqlstate {
+                        sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+                        message: format!("{func_name} {unsupported_use} is not supported"),
+                    });
+                }
+                return Ok(description);
+            }
+        }
+
         // Rewrite PG-specific function-name spellings to their core-native
         // equivalents so the core resolver doesn't need to carry aliases
         // that only matter when a query came through the PG parser. This
@@ -7928,12 +7959,7 @@ fn validate_generation_expression(
                             .to_string(),
                     ));
                 }
-                if call.agg_star
-                    || call.agg_distinct
-                    || call.agg_filter.is_some()
-                    || !call.agg_order.is_empty()
-                    || pg_func(&name).is_some_and(|f| f.aggregate)
-                {
+                if is_aggregate_call(call) {
                     return Err(error(
                         SQLSTATE_GROUPING_ERROR,
                         "aggregate functions are not allowed in column generation expressions"
@@ -9132,6 +9158,123 @@ fn relation_privilege(name: &str, on_sequences: bool) -> Result<ast::Privilege, 
             if on_sequences { "sequence" } else { "table" }
         ),
     })
+}
+
+/// Whether one of `args` calls an aggregate or window function that is not
+/// inside a subquery of the argument.
+fn has_aggregate_outside_subqueries(args: &[pg_query::protobuf::Node]) -> bool {
+    let nodes: Vec<NodeRef<'_>> = args
+        .iter()
+        .filter_map(|arg| arg.node.as_ref())
+        .flat_map(|arg| arg.nodes())
+        .map(|(node, ..)| node)
+        .collect();
+    let calls_in_subqueries: Vec<*const pg_query::protobuf::FuncCall> = nodes
+        .iter()
+        .filter_map(|node| match node {
+            NodeRef::SubLink(subquery) => subquery.subselect.as_ref()?.node.as_ref(),
+            _ => None,
+        })
+        .flat_map(|subquery| subquery.nodes())
+        .filter_map(|(node, ..)| match node {
+            NodeRef::FuncCall(call) => Some(std::ptr::from_ref(call)),
+            _ => None,
+        })
+        .collect();
+    nodes.iter().any(|node| match node {
+        NodeRef::FuncCall(call) => {
+            (call.over.is_some() || is_aggregate_call(call))
+                && !calls_in_subqueries.contains(&std::ptr::from_ref(*call))
+        }
+        _ => false,
+    })
+}
+
+fn is_aggregate_call(call: &pg_query::protobuf::FuncCall) -> bool {
+    let name = last_string(&call.funcname)
+        .unwrap_or_default()
+        .to_lowercase();
+    call.agg_star
+        || call.agg_distinct
+        || call.agg_filter.is_some()
+        || !call.agg_order.is_empty()
+        || pg_func(&name).is_some_and(|f| f.aggregate)
+}
+
+/// The subquery that reads the comment for a call of `obj_description` or
+/// `col_description`. None for another function or number of arguments.
+fn description_lookup(func_name: &str, args: &[Box<ast::Expr>]) -> Option<ast::Expr> {
+    let conditions = match (func_name, args) {
+        ("obj_description", [object]) => vec![
+            ("objoid", (**object).clone()),
+            ("objsubid", integer_literal(0)),
+        ],
+        ("obj_description", [object, catalog]) => vec![
+            ("objoid", (**object).clone()),
+            ("classoid", catalog_oid(catalog)),
+            ("objsubid", integer_literal(0)),
+        ],
+        ("col_description", [table, column_number]) => vec![
+            ("objoid", (**table).clone()),
+            ("classoid", integer_literal(PG_CLASS_OID)),
+            ("objsubid", (**column_number).clone()),
+        ],
+        _ => return None,
+    };
+    Some(description_subquery(conditions))
+}
+
+/// `(SELECT description FROM pg_description WHERE column = value AND ... LIMIT 1)`
+/// for the `conditions`, which are pairs of a column and its value.
+fn description_subquery(conditions: Vec<(&str, ast::Expr)>) -> ast::Expr {
+    let mut parser = turso_parser::parser::Parser::new(DESCRIPTION_SELECT.as_bytes());
+    let Ok(Some(ast::Cmd::Stmt(ast::Stmt::Select(mut select)))) = parser.next_cmd() else {
+        unreachable!("DESCRIPTION_SELECT is a SELECT statement");
+    };
+    let ast::OneSelect::Select { where_clause, .. } = &mut select.body.select else {
+        unreachable!("DESCRIPTION_SELECT has no VALUES");
+    };
+    *where_clause = conditions
+        .into_iter()
+        .map(|(column, value)| {
+            let column = ast::Expr::Id(exact_name(format!("_turso_{column}")));
+            ast::Expr::Binary(Box::new(column), ast::Operator::Equals, Box::new(value))
+        })
+        .reduce(|all, condition| {
+            ast::Expr::Binary(Box::new(all), ast::Operator::And, Box::new(condition))
+        })
+        .map(Box::new);
+    ast::Expr::Subquery(Box::new(select))
+}
+
+// The columns are renamed because a value is an expression of the outer
+// query: `oid` in it must not be read as the rowid of pg_description.
+const DESCRIPTION_SELECT: &str = "SELECT _turso_description FROM (\
+    SELECT objoid AS _turso_objoid, classoid AS _turso_classoid, \
+    objsubid AS _turso_objsubid, description AS _turso_description \
+    FROM main.pg_description) LIMIT 1";
+
+/// `CASE catalog WHEN 'pg_class' THEN 1259 WHEN 'pg_namespace' THEN 2615 END`:
+/// the oid of the catalog named `catalog`.
+fn catalog_oid(catalog: &ast::Expr) -> ast::Expr {
+    ast::Expr::Case {
+        base: Some(Box::new(catalog.clone())),
+        when_then_pairs: [
+            ("pg_class", PG_CLASS_OID),
+            ("pg_namespace", PG_NAMESPACE_OID),
+        ]
+        .iter()
+        .map(|(name, oid)| {
+            let name = ast::Expr::Literal(ast::Literal::String(format!("'{name}'")));
+            (Box::new(name), Box::new(integer_literal(*oid)))
+        })
+        .collect(),
+        else_expr: None,
+    }
+}
+
+fn integer_literal(value: i64) -> ast::Expr {
+    ast::Expr::Literal(ast::Literal::Numeric(value.to_string()))
 }
 
 /// PostgreSQL's oid of `pg_class`, the `classoid` of a comment on a relation
