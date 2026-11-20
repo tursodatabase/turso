@@ -94,6 +94,10 @@ impl IO for MemoryIO {
     fn supports_shared_wal_coordination(&self) -> bool {
         false
     }
+
+    fn is_memory(&self) -> bool {
+        true
+    }
 }
 
 /// In-memory page-backed storage shared by the synchronous [`MemoryIO`] and
