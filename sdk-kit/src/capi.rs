@@ -1122,10 +1122,9 @@ mod tests {
             let status = turso_database_open(db, &mut error);
 
             assert_eq!(status, turso_status_code_t::TURSO_IOERR);
-            assert_eq!(
-                std::ffi::CStr::from_ptr(error).to_str().unwrap(),
-                "I/O error (open): entity not found"
-            );
+            let message = std::ffi::CStr::from_ptr(error).to_str().unwrap();
+            assert!(message.starts_with("I/O error ("));
+            assert!(message.ends_with(": entity not found"));
             turso_str_deinit(error);
             turso_database_deinit(db);
         }

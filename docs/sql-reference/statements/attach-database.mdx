@@ -18,6 +18,8 @@ ATTACH [DATABASE] filename AS schema-name;
 
 ATTACH opens the database file at `filename` and makes its tables accessible through the given `schema-name`. Tables in the attached database are referenced as `schema-name.table-name`.
 
+A URI with `mode=ro` attaches the database read-only, even if another connection already has that file open for writing. `PRAGMA query_only=OFF` cannot remove this restriction. Other writable databases and private TEMP tables remain writable.
+
 ### Clauses
 
 | Clause | Description |

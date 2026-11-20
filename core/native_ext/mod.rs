@@ -53,8 +53,7 @@ impl NativeExtensions {
     pub(crate) fn register(&self, db: &Database) -> Result<()> {
         let mut syms = db.builtin_syms.write();
         for function in &self.functions {
-            syms.functions
-                .insert(function.name.clone(), function.clone());
+            syms.insert_function(function.name.clone(), function.clone());
         }
         for (name, module) in &self.modules {
             syms.vtab_modules.insert(name.clone(), module.clone());

@@ -104,6 +104,8 @@ tursodb -t trace.log mydata.db
 
 Open the database in read-only mode. Write operations will return an error.
 
+Within one process, a database already opened read-only cannot be joined by a writable open. Close all connections and database handles for that file, then reopen it writable.
+
 ```bash
 tursodb --readonly production.db "SELECT count(*) FROM users;"
 ```

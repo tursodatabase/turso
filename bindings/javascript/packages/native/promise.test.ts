@@ -159,6 +159,25 @@ test('readonly-db', async () => {
     }
 })
 
+test('readonly connection stays restricted beside a writable connection', async () => {
+    const path = `test-mixed-${(Math.random() * 1000000) | 0}.db`;
+    const rw = await connect(path);
+    let ro;
+    try {
+        await rw.exec("CREATE TABLE t(x); INSERT INTO t VALUES(1)");
+        ro = await connect(path, { readonly: true });
+        await ro.exec("PRAGMA query_only=OFF");
+        await expect(ro.exec("INSERT INTO t VALUES(2)")).rejects.toThrowError(/readonly database/g);
+        await rw.exec("INSERT INTO t VALUES(3)");
+        expect(await (await ro.prepare("SELECT x FROM t ORDER BY x")).all()).toEqual([{ x: 1 }, { x: 3 }]);
+    } finally {
+        ro?.close();
+        rw.close();
+        unlinkSync(path);
+        unlinkSync(`${path}-wal`);
+    }
+});
+
 test('file-must-exist', async () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
     const error = await connect(path, { fileMustExist: true }).then(() => undefined, (e) => e);
