@@ -144,3 +144,12 @@ test copy-view-errors {
     COPY user_view TO STDOUT;
 }
 expect error {}
+
+test copy-bytea-array-elements-as-hex {
+    CREATE TABLE bytea_arrays (id int, a bytea[]);
+    INSERT INTO bytea_arrays VALUES (1, ARRAY['ab'::bytea]);
+    COPY bytea_arrays TO STDOUT;
+}
+expect {
+    1|{"\\\\\\\\x6162"}
+}

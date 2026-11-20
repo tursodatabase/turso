@@ -2855,3 +2855,19 @@ expect {
     1
     2
 }
+
+test bytea-array-elements-print-as-hex {
+    CREATE TABLE bytea_arrays (id int PRIMARY KEY, a bytea[]);
+    INSERT INTO bytea_arrays VALUES (1, ARRAY['ab'::bytea]);
+    SELECT a, a[1] FROM bytea_arrays;
+}
+expect {
+    {"\\\\x6162"}|\\x6162
+}
+
+test bytea-array-literal-elements-print-as-hex {
+    SELECT ARRAY['ab'::bytea, 'c'::bytea], ARRAY[''::bytea], ARRAY[NULL::bytea, 'a"b'::bytea];
+}
+expect {
+    {"\\\\x6162","\\\\x63"}|{"\\\\x"}|{NULL,"\\\\x612262"}
+}

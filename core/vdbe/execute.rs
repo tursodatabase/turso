@@ -2857,7 +2857,7 @@ pub fn op_array_decode(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _connection: &Arc<Connection>,
+    connection: &Arc<Connection>,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(ArrayDecode { reg }, insn);
@@ -2870,7 +2870,7 @@ pub fn op_array_decode(
 
     let text = match val {
         Value::Blob(b) if b.is_empty() => "{}".to_string(),
-        Value::Blob(b) => serialize_array_from_blob(b)?,
+        Value::Blob(b) => serialize_array_from_blob(b, connection.dialect().as_ref())?,
         _ => {
             // Not a blob — leave as-is (might be text from a function result)
             state.pc += 1;

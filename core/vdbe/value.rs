@@ -1644,7 +1644,7 @@ fn hex_upper(bytes: &[u8]) -> String {
     hex
 }
 
-fn push_hex_upper(out: &mut String, bytes: &[u8]) {
+pub(crate) fn push_hex_upper(out: &mut String, bytes: &[u8]) {
     const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
     for &byte in bytes {
         out.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
