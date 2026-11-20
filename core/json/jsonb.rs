@@ -782,6 +782,12 @@ impl SearchOperation {
         json
     }
 
+    /// Returns the bytes of the element that the search found in `json`, or
+    /// no bytes if the search found nothing.
+    pub fn element_in<'a>(&self, json: &'a Jsonb) -> &'a [u8] {
+        &json.data[self.value_offset..self.value_end]
+    }
+
     pub fn value_offset(&self) -> usize {
         self.value_offset
     }
