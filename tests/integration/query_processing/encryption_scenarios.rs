@@ -793,6 +793,8 @@ fn s14_cached_credentials_are_checked_before_wal_and_main_file_reads() {
         env.io.set_owner(format!("s14.{source}.right"));
         let peer = connect(&db, cipher, Some(KEY_A)).unwrap();
         env.io.set_owner(format!("s14.{source}.wrong"));
+        // Visible header metadata cannot authenticate a key. Cached connections verify
+        // the encrypted sample before any file read.
         assert_eq!(
             assert_refused(connect(&db, cipher, Some(KEY_B)), "wrong key"),
             Category::CredentialWrong
