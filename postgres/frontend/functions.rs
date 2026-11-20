@@ -1696,9 +1696,9 @@ fn check_interval_input(input: &str) -> Option<(String, String)> {
     }
 
     let mut tokens: Vec<&str> = trimmed.split_ascii_whitespace().collect();
-    if tokens.first().is_some_and(|token| *token == "@") {
+    if tokens.first().is_some_and(|token| token.contains("@")) {
         tokens.remove(0);
-    } else if tokens.iter().any(|token| *token == "@") {
+    } else if tokens.iter().any(|token| token.contains("@")) {
         return invalid();
     }
     if tokens
