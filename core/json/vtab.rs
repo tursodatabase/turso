@@ -773,7 +773,7 @@ impl InPlaceJsonPath {
         let start = self.string.len();
         // write! costs about 300 instructions for an index, in the formatting code.
         let mut digits = [0u8; 20];
-        let digits = jsonb::decimal_digits(*idx as u64, &mut digits);
+        let digits = crate::numeric::write_decimal_digits(&mut digits, *idx as u64);
         self.string.push('[');
         self.string
             .extend(digits.iter().map(|&digit| char::from(digit)));

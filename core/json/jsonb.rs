@@ -3839,7 +3839,7 @@ pub(crate) fn append_i64(
     int: i64,
 ) -> std::result::Result<(), TryReserveError> {
     let mut digits = [0u8; 20];
-    let digits = decimal_digits(int.unsigned_abs(), &mut digits);
+    let digits = crate::numeric::write_decimal_digits(&mut digits, int.unsigned_abs());
     let payload_size = digits.len() + usize::from(int < 0);
     let header = JsonbHeader::new(ElementType::INT, payload_size).into_bytes();
     let header = header.as_bytes();
@@ -3850,22 +3850,6 @@ pub(crate) fn append_i64(
     }
     data.extend_from_slice(digits);
     Ok(())
-}
-
-/// Writes the decimal digits of `n` at the end of `buf`, and returns them. The largest `u64`
-/// has 20 digits.
-#[inline]
-pub(crate) fn decimal_digits(mut n: u64, buf: &mut [u8; 20]) -> &[u8] {
-    let mut start = buf.len();
-    loop {
-        start -= 1;
-        buf[start] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
-    }
-    &buf[start..]
 }
 
 /// Appends to `data` the element for `text`, as [Jsonb::from_number_text]
@@ -5199,14 +5183,6 @@ mod tests {
                 "the buffer grew for {input}"
             );
             assert_eq!(jsonb.to_string().unwrap(), input.replace(' ', ""));
-        }
-    }
-
-    #[test]
-    fn decimal_digits_are_the_display_text() {
-        let mut buf = [0u8; 20];
-        for n in [0, 7, 10, 99, 100, 1234, u64::MAX] {
-            assert_eq!(decimal_digits(n, &mut buf), n.to_string().as_bytes());
         }
     }
 
