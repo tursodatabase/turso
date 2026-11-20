@@ -464,8 +464,8 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
-        let lhs = turso_core::Value::from_slice(&[1, 2]).unwrap();
-        let rhs = turso_core::Value::from_slice(&[3, 4]).unwrap();
+        let lhs = turso_core::Value::from_slice(&[0xff, 1]).unwrap();
+        let rhs = turso_core::Value::from_slice(&[0xfe, 2]).unwrap();
         let blob = turso_core::Value::from_slice(&[1, 2, 3, 4]).unwrap();
         let vector_bytes = 1.0f32.to_le_bytes();
         let json = turso_core::Value::build_text(r#"{"key":"value"}"#);
@@ -484,7 +484,7 @@ mod tests {
         assert_eq!(injector.injected_faults(), before + 1);
         assert_eq!(
             lhs.exec_concat(&rhs).unwrap().to_blob(),
-            Some([1, 2, 3, 4].as_slice())
+            Some([0xff, 1, 0xfe, 2].as_slice())
         );
 
         let before = injector.injected_faults();

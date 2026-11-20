@@ -41,6 +41,19 @@ expect {
     0102
 }
 
+test concat-blob-is-text {
+    SELECT typeof(x'0001' || x'01'), length(x'0001' || x'01');
+    SELECT typeof(zeroblob(3) || x'01'), length(zeroblob(3) || x'01');
+    SELECT typeof(x'41' || x'42'), x'41' || x'42', length(x'41' || x'42');
+    SELECT typeof(x'e282' || x'ac'), x'e282' || x'ac';
+}
+expect {
+    text|0
+    text|0
+    text|AB|2
+    text|€
+}
+
 test concat-no-args-error {
     SELECT concat();
 }
