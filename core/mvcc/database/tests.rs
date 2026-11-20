@@ -4587,7 +4587,7 @@ fn test_exact_index_seek_with_duplicate_and_null_prefixes() {
         key.order = SortOrder::Desc;
         let index = cursor_test_index(
             unique,
-            vec![key, IndexColumn::new("v", 2, CollationSeq::BINARY)],
+            [key, IndexColumn::new("v", 2, CollationSeq::BINARY)],
         );
         let records = (301..=600)
             .chain(1..=300)
@@ -4948,7 +4948,7 @@ impl CursorTestFixture {
 
     fn integer_rows(unique: Option<bool>, rows: impl IntoIterator<Item = (i64, i64)>) -> Self {
         let index = unique.map(|unique| {
-            cursor_test_index(unique, vec![IndexColumn::new("v", 1, CollationSeq::BINARY)])
+            cursor_test_index(unique, [IndexColumn::new("v", 1, CollationSeq::BINARY)])
         });
         let records = rows
             .into_iter()
@@ -5054,12 +5054,15 @@ impl CursorTestFixture {
     }
 }
 
-fn cursor_test_index(unique: bool, columns: Vec<IndexColumn>) -> crate::schema::Index {
+fn cursor_test_index(
+    unique: bool,
+    columns: impl IntoIterator<Item = IndexColumn>,
+) -> crate::schema::Index {
     crate::schema::Index {
         name: "test_index".to_string(),
         table_name: "test".to_string(),
         root_page: 0,
-        columns,
+        columns: columns.into_iter().try_collect().unwrap(),
         unique,
         ephemeral: false,
         has_rowid: true,
