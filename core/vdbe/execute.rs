@@ -168,7 +168,7 @@ use crate::vdbe::vacuum::{
 
 #[cfg(feature = "json")]
 use crate::{
-    function::JsonFunc, json, json::convert_dbtype_to_raw_jsonb, json::ensure_blob_arg_is_jsonb,
+    function::JsonFunc, json, json::append_dbtype_as_jsonb, json::ensure_blob_arg_is_jsonb,
     json::get_json, json::is_json_valid, json::json_array, json::json_array_length,
     json::json_arrow_extract, json::json_arrow_shift_extract, json::json_error_position,
     json::json_extract, json::json_from_raw_bytes_agg, json::json_insert, json::json_object,
@@ -7870,21 +7870,28 @@ fn update_agg_payload(
                 return Ok(());
             }
             ensure_blob_arg_is_jsonb(value.as_value_ref())?;
-            let mut key_vec = convert_dbtype_to_raw_jsonb(arg, Conv::ToString)?;
-            let mut val_vec = convert_dbtype_to_raw_jsonb(value, Conv::NotStrict)?;
             let Value::Blob(vec) = &mut payload[0] else {
                 mark_unlikely();
                 return Err(LimboError::InternalError(
                     "JsonGroupObject: payload[0] is not a blob".to_string(),
                 ));
             };
-            vec.try_reserve(usize::from(vec.is_empty()) + key_vec.len() + val_vec.len())?;
-            if vec.is_empty() {
-                // bits for obj header
-                vec.push(12);
+            // The key and the value are written in place. If one of them
+            // fails, the payload goes back to its length before the row.
+            let len = vec.len();
+            let appended = (|| {
+                if vec.is_empty() {
+                    vec.try_reserve(1)?;
+                    // bits for obj header
+                    vec.push(12);
+                }
+                append_dbtype_as_jsonb(vec, arg.as_value_ref(), Conv::ToString)?;
+                append_dbtype_as_jsonb(vec, value.as_value_ref(), Conv::NotStrict)
+            })();
+            if appended.is_err() {
+                vec.truncate(len);
             }
-            vec.append(&mut key_vec);
-            vec.append(&mut val_vec);
+            appended?;
         }
         AggFunc::ArrayAgg => {
             // Buffer every value (including NULLs) by growing the payload Vec; payload[0] is a
@@ -7921,18 +7928,26 @@ fn update_agg_payload(
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
             // arg = value
             ensure_blob_arg_is_jsonb(arg.as_value_ref())?;
-            let mut data = convert_dbtype_to_raw_jsonb(arg, Conv::NotStrict)?;
             let Value::Blob(vec) = &mut payload[0] else {
                 mark_unlikely();
                 return Err(LimboError::InternalError(
                     "JsonGroupArray: payload[0] is not a blob".to_string(),
                 ));
             };
-            vec.try_reserve(usize::from(vec.is_empty()) + data.len())?;
-            if vec.is_empty() {
-                vec.push(11); // bits for array header
+            // The value is written in place. If it fails, the payload goes
+            // back to its length before the row.
+            let len = vec.len();
+            let appended = (|| {
+                if vec.is_empty() {
+                    vec.try_reserve(1)?;
+                    vec.push(11); // bits for array header
+                }
+                append_dbtype_as_jsonb(vec, arg.as_value_ref(), Conv::NotStrict)
+            })();
+            if appended.is_err() {
+                vec.truncate(len);
             }
-            vec.append(&mut data);
+            appended?;
         }
     }
     Ok(())
@@ -10378,9 +10393,11 @@ pub fn op_function(
                         path_value.map(|x| x.get_value()),
                         &state.json_cache,
                     ),
-                    JsonFunc::JsonType => {
-                        json_type(json_value.get_value(), path_value.map(|x| x.get_value()))
-                    }
+                    JsonFunc::JsonType => json_type(
+                        json_value.get_value(),
+                        path_value.map(|x| x.get_value()),
+                        &state.json_cache,
+                    ),
                     _ => unreachable!(),
                 };
 
