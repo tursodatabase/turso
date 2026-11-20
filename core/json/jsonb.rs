@@ -2047,7 +2047,7 @@ impl Jsonb {
                         })?;
                 }
 
-                self.data.extend_from_slice(&input[pos..end_pos]);
+                self.data.extend_from_slice(&rest[..len]);
                 return Ok(end_pos + 1); // Skip past closing quote
             }
         }
