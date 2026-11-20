@@ -57,6 +57,7 @@ pub use params::IntoParams;
 
 use std::fmt::Debug;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Poll;
@@ -389,6 +390,8 @@ impl Database {
 pub struct Statement {
     conn: Connection,
     inner: Arc<Mutex<Box<turso_sdk_kit::rsapi::TursoStatement>>>,
+    /// How many `query` and `execute` calls have started on this statement.
+    runs_started: Arc<AtomicU64>,
 }
 
 struct Execute {
@@ -459,7 +462,7 @@ impl Statement {
         params: impl IntoParams,
         operation_guard: Option<connection::ConnectionOperationGuard>,
     ) -> Result<Rows> {
-        self.reset()?;
+        let run = self.start_run()?;
 
         let mut stmt = self.inner.lock().unwrap();
         let params = params.into_params()?;
@@ -477,7 +480,7 @@ impl Statement {
                 }
             }
         }
-        let rows = Rows::new(self.clone(), operation_guard);
+        let rows = Rows::new(self.clone(), run, operation_guard);
         Ok(rows)
     }
 
@@ -500,10 +503,7 @@ impl Statement {
         params: impl IntoParams,
         operation_guard: Option<connection::ConnectionOperationGuard>,
     ) -> Result<u64> {
-        {
-            // Reset the statement before executing
-            self.inner.lock().unwrap().reset()?;
-        }
+        self.start_run()?;
         let params = params.into_params()?;
         match params {
             params::Params::None => (),
@@ -527,6 +527,13 @@ impl Statement {
             _operation_guard: operation_guard,
         };
         execute.await
+    }
+
+    /// Resets the statement for a new `query` or `execute` and returns that run's number.
+    fn start_run(&self) -> Result<u64> {
+        let mut stmt = self.inner.lock().unwrap();
+        stmt.reset()?;
+        Ok(self.runs_started.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
     /// Returns the number of columns in the result set.

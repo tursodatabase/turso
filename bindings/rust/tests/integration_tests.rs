@@ -1126,6 +1126,155 @@ async fn test_prepare_cached_basic() {
 }
 
 #[tokio::test]
+async fn test_dropping_unfinished_rows_ends_the_read_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let db = Builder::new_local(path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let pooled = db.connect().unwrap();
+    let other = db.connect().unwrap();
+
+    pooled.execute("CREATE TABLE t (x)", ()).await.unwrap();
+    pooled
+        .execute("INSERT INTO t VALUES (1), (2)", ())
+        .await
+        .unwrap();
+
+    let mut select = pooled.prepare_cached("SELECT x FROM t").await.unwrap();
+    let mut rows = select.query(()).await.unwrap();
+    rows.next().await.unwrap().unwrap();
+    drop(rows);
+
+    other.execute("INSERT INTO t VALUES (3)", ()).await.unwrap();
+
+    let mut insert = pooled
+        .prepare_cached("INSERT INTO t VALUES (?1)")
+        .await
+        .unwrap();
+    insert.execute((4,)).await.unwrap();
+
+    let mut rows = select.query(()).await.unwrap();
+    let mut seen = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        seen.push(row.get::<i64>(0).unwrap());
+    }
+    assert_eq!(seen, vec![1, 2, 3, 4]);
+}
+
+#[tokio::test]
+async fn test_dropping_old_rows_keeps_the_newer_query_running() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t (x)", ()).await.unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)", ())
+        .await
+        .unwrap();
+
+    let mut stmt = conn.prepare("SELECT x FROM t WHERE x >= ?1").await.unwrap();
+    let mut old_rows = stmt.query((1,)).await.unwrap();
+    old_rows.next().await.unwrap().unwrap();
+
+    let mut new_rows = stmt.query((2,)).await.unwrap();
+    assert_eq!(
+        new_rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap(),
+        2
+    );
+    drop(old_rows);
+    assert_eq!(
+        new_rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap(),
+        3
+    );
+    assert!(new_rows.next().await.unwrap().is_none());
+
+    // Assigning over `Rows` drops the old value after the new query has bound its parameters.
+    let mut rows = stmt.query((1,)).await.unwrap();
+    rows.next().await.unwrap().unwrap();
+    rows = stmt.query((3,)).await.unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        3
+    );
+    assert!(rows.next().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_dropping_finished_rows_keeps_n_change() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t (x)", ()).await.unwrap();
+
+    let mut stmt = conn
+        .prepare("INSERT INTO t VALUES (1), (2) RETURNING x")
+        .await
+        .unwrap();
+    let mut rows = stmt.query(()).await.unwrap();
+    while rows.next().await.unwrap().is_some() {}
+    drop(rows);
+    assert_eq!(stmt.n_change(), 2);
+}
+
+#[tokio::test]
+async fn test_dropping_unfinished_returning_rows_commits_the_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let db = Builder::new_local(path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let other = db.connect().unwrap();
+    conn.execute("CREATE TABLE t (x)", ()).await.unwrap();
+
+    let mut stmt = conn
+        .prepare("INSERT INTO t VALUES (1), (2) RETURNING x")
+        .await
+        .unwrap();
+    let mut rows = stmt.query(()).await.unwrap();
+    rows.next().await.unwrap().unwrap();
+    drop(rows);
+
+    let mut rows = other.query("SELECT count(*) FROM t", ()).await.unwrap();
+    let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn test_dropping_unfinished_rows_keeps_the_explicit_transaction() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t (x)", ()).await.unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2)", ())
+        .await
+        .unwrap();
+
+    conn.execute("BEGIN", ()).await.unwrap();
+    conn.execute("INSERT INTO t VALUES (3)", ()).await.unwrap();
+    let mut select = conn.prepare("SELECT x FROM t").await.unwrap();
+    let mut rows = select.query(()).await.unwrap();
+    rows.next().await.unwrap().unwrap();
+    drop(rows);
+    conn.execute("ROLLBACK", ()).await.unwrap();
+
+    let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+    let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
 async fn test_prepare_cached_reprepare_on_query_only_change() {
     let db = Builder::new_local(":memory:").build().await.unwrap();
     let conn = db.connect().unwrap();
