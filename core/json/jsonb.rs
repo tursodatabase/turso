@@ -67,6 +67,64 @@ const fn make_plain_string_end_table(quote: u8) -> [bool; 256] {
 
 static ENDS_SINGLE_QUOTED_PLAIN_PART: [bool; 256] = make_plain_string_end_table(b'\'');
 
+/// The length of the part of `rest` that a string quoted with `quote` copies as
+/// it is: the offset of the first `quote`, backslash or control character in
+/// `rest`, or the length of `rest`. `quote` is `"` or `'`.
+///
+/// `rest` is the input after a position in a string, so it usually has 16 bytes
+/// or more also for a short string. On x86_64, each step tests 16 bytes with
+/// SSE2, which is part of the x86_64 baseline. The other bytes, and the bytes
+/// on other targets, are tested one at a time with a byte table.
+#[inline(always)]
+fn plain_part_len(rest: &[u8], quote: u8) -> usize {
+    let ends_plain_part = if quote == b'"' {
+        &ESCAPED_IN_TEXT
+    } else {
+        &ENDS_SINGLE_QUOTED_PLAIN_PART
+    };
+    #[cfg(target_arch = "x86_64")]
+    let start = {
+        use std::arch::x86_64::{
+            _mm_cmpeq_epi8, _mm_loadu_si128, _mm_min_epu8, _mm_movemask_epi8, _mm_or_si128,
+            _mm_set1_epi8,
+        };
+        let mut offset = 0;
+        // SAFETY: SSE2 is part of the x86_64 baseline, so the intrinsics are
+        // available, and the loop condition keeps each unaligned 16-byte load
+        // inside `rest`.
+        unsafe {
+            let quotes = _mm_set1_epi8(quote as i8);
+            let backslashes = _mm_set1_epi8(b'\\' as i8);
+            let last_control = _mm_set1_epi8(0x1F);
+            while offset + 16 <= rest.len() {
+                let chunk = _mm_loadu_si128(rest.as_ptr().add(offset).cast());
+                let is_quote = _mm_cmpeq_epi8(chunk, quotes);
+                let is_backslash = _mm_cmpeq_epi8(chunk, backslashes);
+                // A byte is a control character when it is at most 0x1F, that
+                // is, when the unsigned minimum with 0x1F is the byte.
+                let is_control = _mm_cmpeq_epi8(_mm_min_epu8(chunk, last_control), chunk);
+                let mask = _mm_movemask_epi8(_mm_or_si128(
+                    _mm_or_si128(is_quote, is_backslash),
+                    is_control,
+                ));
+                if mask != 0 {
+                    return offset + mask.trailing_zeros() as usize;
+                }
+                offset += 16;
+            }
+        }
+        offset
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let start = 0;
+    let tail = &rest[start..];
+    start
+        + tail
+            .iter()
+            .position(|&c| ends_plain_part[c as usize])
+            .unwrap_or(tail.len())
+}
+
 /// The 1-byte headers of TEXT elements with a payload of 0 to 11 bytes. The
 /// string parser reads the header from this table after its scan. When it
 /// computed the header from the length, the compiler computed it in each
@@ -1951,16 +2009,8 @@ impl Jsonb {
 
         // A string with no escape and no control character ends at the first
         // quote, and its payload is the bytes before the quote.
-        let ends_plain_part = if quote == b'"' {
-            &ESCAPED_IN_TEXT
-        } else {
-            &ENDS_SINGLE_QUOTED_PLAIN_PART
-        };
         let rest = &input[pos..];
-        let len = rest
-            .iter()
-            .position(|&c| ends_plain_part[c as usize])
-            .unwrap_or(rest.len());
+        let len = plain_part_len(rest, quote);
         if rest.get(len) == Some(&quote) {
             let end_pos = pos + len;
             let header_pos = self.data.len();
@@ -1995,10 +2045,7 @@ impl Jsonb {
         info: &mut ParseInfo,
     ) -> PResult<usize> {
         if let Some(rest) = input.get(pos + 1..) {
-            let len = rest
-                .iter()
-                .position(|&c| ESCAPED_IN_TEXT[c as usize])
-                .unwrap_or(rest.len());
+            let len = plain_part_len(rest, b'"');
             if let (Some(b'"'), Some(&header)) = (rest.get(len), TEXT_HEADERS.get(len)) {
                 self.data.push(header);
                 self.data.extend_from_slice(&rest[..len]);
@@ -2031,11 +2078,6 @@ impl Jsonb {
         quote: u8,
         info: &mut ParseInfo,
     ) -> PResult<usize> {
-        let ends_plain_part = if quote == b'"' {
-            &ESCAPED_IN_TEXT
-        } else {
-            &ENDS_SINGLE_QUOTED_PLAIN_PART
-        };
         let mut element_type = ElementType::TEXT;
         let mut pos = special;
         loop {
@@ -2108,11 +2150,7 @@ impl Jsonb {
                 element_type = ElementType::TEXT5;
                 pos += 1;
             }
-            let rest = &input[pos..];
-            pos += rest
-                .iter()
-                .position(|&c| ends_plain_part[c as usize])
-                .unwrap_or(rest.len());
+            pos += plain_part_len(&input[pos..], quote);
         }
 
         if matches!(element_type, ElementType::TEXT5) {
@@ -5431,6 +5469,38 @@ mod tests {
     #[test]
     fn escaped_bytes_end_the_plain_part_of_a_double_quoted_string() {
         assert_eq!(make_plain_string_end_table(b'"'), ESCAPED_IN_TEXT);
+    }
+
+    #[test]
+    fn plain_part_len_is_the_offset_of_the_first_special_byte() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let special = [b'"', b'\'', b'\\', 0x00, 0x1F, 0x20, 0x7F, 0x80, 0xFF, b'a'];
+        for len in 0..80 {
+            for _ in 0..50 {
+                let input: Vec<u8> = (0..len)
+                    .map(|_| match next() % 8 {
+                        0 => special[(next() % special.len() as u64) as usize],
+                        _ => b'a' + (next() % 26) as u8,
+                    })
+                    .collect();
+                for quote in [b'"', b'\''] {
+                    for start in 0..=len {
+                        let rest = &input[start..];
+                        let expected = rest
+                            .iter()
+                            .position(|&c| c == quote || c == b'\\' || c < 0x20)
+                            .unwrap_or(rest.len());
+                        assert_eq!(plain_part_len(rest, quote), expected, "{rest:?} {quote}");
+                    }
+                }
+            }
+        }
     }
 
     /// The payload of a string with escapes is the input between the quotes,
