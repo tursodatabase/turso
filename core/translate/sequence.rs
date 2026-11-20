@@ -15,6 +15,7 @@ use crate::dialect::{AccessStatement, NewOwner, OwnerColumn, RelationChange};
 use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
 
+use crate::ast;
 use crate::bail_parse_error;
 use crate::namespace::{NamespaceId, NamespaceRef, MANGLED_NAME_PREFIX};
 use crate::schema::{
@@ -35,7 +36,6 @@ use crate::vdbe::insn::{
 };
 use crate::Connection;
 use crate::Result;
-use turso_parser::ast;
 
 pub fn sequence_backing_table_name(seq_name: &str) -> String {
     String::from(SEQ_BACKING_TABLE_PREFIX) + seq_name

@@ -7,7 +7,7 @@ use sql_generation::model::{
     query::{predicate::Predicate, select::table_qualified_name},
     table::SimValue,
 };
-use turso_parser::ast::{
+use turso_core::ast::{
     self,
     fmt::{BlankContext, ToTokens},
 };

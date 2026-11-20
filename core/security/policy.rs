@@ -17,7 +17,7 @@
 //! superusers or the owner of the table, or a role with the owner's
 //! privileges, and it does not apply to TRUNCATE.
 
-use turso_parser::ast;
+use crate::ast;
 
 use crate::security::roles::RoleId;
 

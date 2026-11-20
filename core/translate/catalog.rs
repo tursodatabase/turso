@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 
+use crate::ast;
 use rustc_hash::FxHashMap as HashMap;
-use turso_parser::ast;
 
 use crate::alloc::TursoIteratorExt;
 use crate::function::Func;

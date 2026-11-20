@@ -6,6 +6,7 @@ use super::stream::{
     ArrangementIdentityColumn, DeltaIdentity,
 };
 use super::MaintenanceInput;
+use crate::ast;
 use crate::incremental::dag;
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
@@ -19,7 +20,6 @@ use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
 use crate::{Connection, LimboError, Result};
-use turso_parser::ast;
 
 const JOIN_ARITY: usize = 2;
 

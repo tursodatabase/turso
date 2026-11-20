@@ -2,13 +2,13 @@
 //! dialect's catalog of the main database, and what the dialect's bytecode
 //! tells the in-memory schema once the change is written.
 
+use crate::ast::{self, Grantee, Privilege, RoleSpec};
 use crate::{
     namespace::NamespaceId,
     schema::{RelationKind, Schema},
     LimboError, Result, Value,
 };
 use std::borrow::Cow;
-use turso_parser::ast::{self, Grantee, Privilege, RoleSpec};
 
 /// A relation that a statement created, dropped or renamed. The engine makes
 /// the change itself; the dialect records it in its own catalog through

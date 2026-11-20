@@ -1,4 +1,10 @@
-use crate::ast::{
+use crate::lexer::{Lexer, Token};
+use crate::Result;
+use std::collections::HashMap;
+use std::num::NonZeroU32;
+use turso_core::ast::error::Error;
+use turso_core::ast::token::TokenType::{self, *};
+use turso_core::ast::{
     check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint, ColumnDefinition,
     CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateTypeBody,
     CreateVirtualTable, DeferSubclause, Distinctness, DomainConstraint, EqpFormat, Expr,
@@ -12,12 +18,6 @@ use crate::ast::{
     TriggerTime, Type, TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert,
     UpsertDo, UpsertIndex, Variable, Window, WindowDef, With, MAX_ARRAY_DIMENSIONS,
 };
-use crate::error::Error;
-use crate::lexer::{Lexer, Token};
-use crate::token::TokenType::{self, *};
-use crate::Result;
-use std::collections::HashMap;
-use std::num::NonZeroU32;
 use turso_macros::match_ignore_ascii_case;
 
 macro_rules! peek_expect {
@@ -352,9 +352,7 @@ impl<'a> Parser<'a> {
                             got: tt,
                             token_text,
                             offset,
-                            expected_display: crate::token::TokenType::format_expected_tokens(&[
-                                TK_SEMI,
-                            ]),
+                            expected_display: TokenType::format_expected_tokens(&[TK_SEMI]),
                         });
                     }
 
@@ -1241,7 +1239,7 @@ impl<'a> Parser<'a> {
                 got: token.token_type,
                 token_text,
                 offset,
-                expected_display: crate::token::TokenType::format_expected_tokens(&[
+                expected_display: TokenType::format_expected_tokens(&[
                     TK_ID,
                     TK_STRING,
                     TK_INDEXED,
@@ -2055,7 +2053,7 @@ impl<'a> Parser<'a> {
                         expected: &[TK_ID, TK_INDEXED, TK_JOIN_KW],
                         token_text,
                         offset,
-                        expected_display: crate::token::TokenType::format_expected_tokens(&[
+                        expected_display: TokenType::format_expected_tokens(&[
                             TK_ID, TK_INDEXED, TK_JOIN_KW,
                         ]),
                     });

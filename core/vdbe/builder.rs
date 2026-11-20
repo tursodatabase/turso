@@ -1,9 +1,9 @@
 use crate::{alloc, turso_assert, turso_assert_eq, types::AsValueRef, Result, Value, ValueRef};
 
+use crate::ast::{self, ResolveType, SortOrder, TableInternalId};
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Range;
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
 use crate::{
     index_method::IndexMethodAttachment,

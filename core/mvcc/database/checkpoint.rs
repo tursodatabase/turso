@@ -3972,11 +3972,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
 mod tests {
     use super::*;
     use crate::alloc::vec;
+    use crate::ast::SortOrder;
     use crate::mvcc::database::tests::MvccTestDbNoConn;
     use crate::mvcc::database::{Row, SortableIndexKey};
     use crate::translate::collate::CollationSeq;
     use crate::types::{IndexInfo, KeyInfo};
-    use turso_parser::ast::SortOrder;
 
     fn sqlite_schema_row_version(
         rowid: i64,

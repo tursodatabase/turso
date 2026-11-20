@@ -4,11 +4,11 @@
 //! that need a dialect but no SQL use this one, so a test that parses by
 //! accident fails with the SQL it was asked to parse.
 
+use crate::ast;
 use crate::dialect::Dialect;
 use crate::sync::Arc;
 use crate::{LimboError, Result};
 use std::ops::Range;
-use turso_parser::ast;
 
 pub(crate) struct DialectThatCannotParse;
 

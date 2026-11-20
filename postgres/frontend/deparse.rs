@@ -11,8 +11,8 @@
 //! one, so the printer follows the types of the table's columns. A form it
 //! does not know how to print as PostgreSQL does gives None.
 
+use turso_core::ast;
 use turso_core::schema::BTreeTable;
-use turso_parser::ast;
 use turso_pg_parser::quote_identifier;
 use turso_pg_parser::translator::role_keyword;
 

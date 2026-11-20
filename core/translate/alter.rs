@@ -1,4 +1,5 @@
 use crate::alloc::TursoIteratorExt;
+use crate::ast::{self, TableInternalId};
 use crate::dialect::{AccessStatement, NewOwner, RelationChange};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::RelationKind;
@@ -9,7 +10,6 @@ use crate::types::StrictType;
 use crate::util::renamed_automatic_index_name;
 use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
 use std::borrow::Cow;
-use turso_parser::ast::{self, TableInternalId};
 
 use super::{
     index::emit_refill_index,

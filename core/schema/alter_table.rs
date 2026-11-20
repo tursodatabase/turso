@@ -1,4 +1,5 @@
 use crate::alloc::TursoIteratorExt;
+use crate::ast;
 use crate::namespace::NamespaceId;
 use crate::schema::view::{extract_view_columns, ViewColumnSchema};
 use crate::translate::expr::{walk_expr_mut, WalkControl};
@@ -8,7 +9,6 @@ use crate::{
     LimboError, Result,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use turso_parser::ast;
 
 pub fn rewrite_fk_parent_cols_if_self_ref(
     clause: &mut ast::ForeignKeyClause,

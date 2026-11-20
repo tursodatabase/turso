@@ -1,4 +1,5 @@
 use crate::alloc::TursoVecExt;
+use crate::ast::{NullsOrder, SortOrder};
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
 use crate::translate::collate::{first_collation, CollationSeq};
@@ -19,7 +20,6 @@ use crate::translate::result_row::{emit_columns_to_destination, emit_offset};
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, Insn};
 use crate::{emit_explain, LimboError, Result};
-use turso_parser::ast::{NullsOrder, SortOrder};
 
 pub(crate) fn emit_recursive_cte(
     program: &mut ProgramBuilder,

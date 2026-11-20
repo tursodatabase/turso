@@ -58,7 +58,8 @@ rand_chacha = { workspace = true }
 # that the sqltests use to observe planner behavior.
 turso = { workspace = true, features = ["test_helper"] }
 
-# Turso SQL parser (for splitting multi-statement SQL)
+# Turso SQL parser (for splitting multi-statement SQL) and the AST it produces
+turso_core = { path = "../../core", default-features = false, features = ["fs"] }
 turso_parser = { workspace = true }
 query-result-oracle = { path = "../query-result-oracle" }
 

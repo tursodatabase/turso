@@ -22,8 +22,8 @@ use crate::sqlstate::{
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
-use turso_parser::ast;
-use turso_parser::ast::GroupBy;
+use turso_core::ast;
+use turso_core::ast::GroupBy;
 
 /// Result of translating a PostgreSQL command, which may include
 /// prerequisite statements (e.g., implicit CREATE SEQUENCE for serial columns).

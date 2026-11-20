@@ -49,9 +49,9 @@ use crate::vdbe::insn::{
 use crate::{bail_parse_error, turso_assert, turso_assert_eq, Result};
 use crate::{Connection, Value, MAIN_DB_ID};
 
+use crate::ast;
+use crate::ast::ColumnDefinition;
 use turso_ext::VTabKind;
-use turso_parser::ast;
-use turso_parser::ast::ColumnDefinition;
 
 /// Validate a CHECK constraint expression at CREATE TABLE / ALTER TABLE ADD COLUMN time.
 /// Rejects non-existent columns, non-existent functions, aggregates, window functions,

@@ -3883,9 +3883,9 @@ fn is_alter_table_add_column(sql: &str) -> bool {
     };
     matches!(
         ast,
-        turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::AlterTable(
-            turso_parser::ast::AlterTable {
-                body: turso_parser::ast::AlterTableBody::AddColumn(_),
+        turso_core::ast::Cmd::Stmt(turso_core::ast::Stmt::AlterTable(
+            turso_core::ast::AlterTable {
+                body: turso_core::ast::AlterTableBody::AddColumn(_),
                 ..
             }
         ))
@@ -3900,15 +3900,15 @@ fn rewrite_create_ddl_as_if_not_exists(sql: &str) -> Option<String> {
     let Some(Ok(mut ast)) = parser.next() else {
         return None;
     };
-    let turso_parser::ast::Cmd::Stmt(stmt) = &mut ast else {
+    let turso_core::ast::Cmd::Stmt(stmt) = &mut ast else {
         return None;
     };
     match stmt {
-        turso_parser::ast::Stmt::CreateTable { if_not_exists, .. }
-        | turso_parser::ast::Stmt::CreateIndex { if_not_exists, .. }
-        | turso_parser::ast::Stmt::CreateTrigger { if_not_exists, .. }
-        | turso_parser::ast::Stmt::CreateMaterializedView { if_not_exists, .. }
-        | turso_parser::ast::Stmt::CreateView { if_not_exists, .. } => {
+        turso_core::ast::Stmt::CreateTable { if_not_exists, .. }
+        | turso_core::ast::Stmt::CreateIndex { if_not_exists, .. }
+        | turso_core::ast::Stmt::CreateTrigger { if_not_exists, .. }
+        | turso_core::ast::Stmt::CreateMaterializedView { if_not_exists, .. }
+        | turso_core::ast::Stmt::CreateView { if_not_exists, .. } => {
             *if_not_exists = true;
             Some(ast.to_string())
         }

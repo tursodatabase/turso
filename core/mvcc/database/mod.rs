@@ -2,6 +2,7 @@ use crate::alloc::{
     ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator, TursoVecInExt,
     ALLOC_ERR_MSG,
 };
+use crate::ast::SortOrder;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 use crate::mvcc::sqlite_schema_row::{types_table_root_page, SqliteSchemaRow};
@@ -59,7 +60,6 @@ use std::ops::Bound;
 use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
-use turso_parser::ast::SortOrder;
 
 pub mod checkpoint;
 #[cfg(not(nightly))]

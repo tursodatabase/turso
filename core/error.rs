@@ -99,7 +99,7 @@ pub enum LimboError {
     /// `LimboError`'s size, which rides in every hot-path `Result`.
     #[error(transparent)]
     #[diagnostic(transparent)]
-    LexerError(#[from] Box<turso_parser::error::Error>),
+    LexerError(#[from] Box<crate::ast::error::Error>),
     #[error("Conversion error: {0}")]
     ConversionError(String),
     #[error("Env variable error: {0}")]
@@ -145,7 +145,7 @@ pub enum LimboError {
     /// An error that halts the statement with its own resolve type (RAISE, a
     /// constraint-level ON CONFLICT clause, or a trigger step's OR clause).
     #[error("{1}")]
-    Raise(turso_parser::ast::ResolveType, Box<LimboError>),
+    Raise(crate::ast::ResolveType, Box<LimboError>),
     #[error("RaiseIgnore")]
     RaiseIgnore,
     #[error("Extension error: {0}")]
@@ -237,7 +237,7 @@ macro_rules! boxed_from {
 }
 boxed_from!(crate::alloc::TryReserveError);
 boxed_from!(std::collections::TryReserveError);
-boxed_from!(turso_parser::error::Error);
+boxed_from!(crate::ast::error::Error);
 boxed_from!(CompletionError);
 boxed_from!(CacheError);
 boxed_from!(bumpalo::AllocErr);
@@ -249,8 +249,8 @@ impl From<Box<LimboError>> for LimboError {
     }
 }
 
-impl From<turso_parser::error::Error> for LimboError {
-    fn from(err: turso_parser::error::Error) -> Self {
+impl From<crate::ast::error::Error> for LimboError {
+    fn from(err: crate::ast::error::Error) -> Self {
         LimboError::LexerError(Box::new(err))
     }
 }

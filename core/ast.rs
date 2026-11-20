@@ -1,9 +1,11 @@
 pub mod check;
+pub mod error;
 pub mod fmt;
+pub mod token;
 
 use std::{num::NonZeroU32, sync::Arc};
 
-use crate::lexer::is_quotable_keyword;
+use crate::ast::token::is_quotable_keyword;
 use strum_macros::{EnumIter, EnumString};
 
 /// `?` or `$` Prepared statement arg placeholder(s)

@@ -1,6 +1,6 @@
 //! Contains code for generation for [ast::Expr::Binary] Predicate
 
-use turso_parser::ast::{self, Expr, Name};
+use turso_core::ast::{self, Expr, Name};
 
 use crate::{
     generation::{

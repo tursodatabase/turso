@@ -1,6 +1,6 @@
 use crate::alloc::TursoIteratorExt;
+use crate::ast::{self, SortOrder};
 use crate::translate::expr_context::ExprContext;
-use turso_parser::ast::{self, SortOrder};
 
 use super::{
     emitter::TranslateCtx,
@@ -100,7 +100,7 @@ impl EmitGroupBy {
         order_by: &'a [(
             Box<ast::Expr>,
             ast::SortOrder,
-            Option<turso_parser::ast::NullsOrder>,
+            Option<crate::ast::NullsOrder>,
         )],
     ) -> Result<()> {
         collect_non_aggregate_expressions(
@@ -164,7 +164,7 @@ impl EmitGroupBy {
             let order_collations_nulls: crate::alloc::Vec<(
                 SortOrder,
                 CollationSeq,
-                Option<turso_parser::ast::NullsOrder>,
+                Option<crate::ast::NullsOrder>,
             )> = group_by
                 .exprs
                 .iter()
@@ -296,11 +296,7 @@ pub fn is_orderby_agg_or_const(resolver: &Resolver, e: &ast::Expr, aggs: &[Aggre
 /// appears in ORDER BY, and the remaining keys default to `ASC`.
 pub fn compute_group_by_sort_order(
     group_by_exprs: &[ast::Expr],
-    order_by: &[(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )],
+    order_by: &[(Box<ast::Expr>, SortOrder, Option<crate::ast::NullsOrder>)],
     aggs: &[Aggregate],
     resolver: &Resolver,
 ) -> (Vec<SortOrder>, Vec<Option<ast::NullsOrder>>) {
@@ -407,7 +403,7 @@ fn collect_non_aggregate_expressions<'a>(
     order_by: &'a [(
         Box<ast::Expr>,
         ast::SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
+        Option<crate::ast::NullsOrder>,
     )],
 ) -> Result<()> {
     let mut result_columns = Vec::new();
@@ -469,7 +465,7 @@ fn collect_result_columns<'a>(
 ) -> Result<()> {
     fn is_deferred_grouped_output_subquery(
         plan: &SelectPlan,
-        subquery_id: turso_parser::ast::TableInternalId,
+        subquery_id: crate::ast::TableInternalId,
     ) -> bool {
         plan.non_from_clause_subqueries
             .iter()

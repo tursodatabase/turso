@@ -21,13 +21,13 @@
 //! Both flags default to `true` (conservative). Each DML translate path calls
 //! into this module to set them to `false` when safe.
 
+use crate::ast::{ResolveType, TriggerEvent};
 use crate::namespace::NamespaceRef;
 use crate::translate::emitter::Resolver;
 use crate::translate::plan::{ColumnMask, DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::{sync::Arc, Connection, Result};
-use turso_parser::ast::{ResolveType, TriggerEvent};
 
 /// Check whether any DDL-level constraint (IPK or index) uses REPLACE.
 pub(crate) fn any_index_or_ipk_has_replace(

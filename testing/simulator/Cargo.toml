@@ -49,7 +49,6 @@ tempfile.workspace = true
 hex = { workspace = true }
 itertools = { workspace = true }
 sql_generation = { workspace = true }
-turso_parser = { workspace = true }
 schemars = { workspace = true }
 garde = { workspace = true, features = ["derive", "serde"] }
 json5 = { version = "0.4.1" }
