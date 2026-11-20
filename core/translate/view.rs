@@ -1,7 +1,8 @@
 use crate::dialect::{CatalogCmd, CmdContext, CreateMaterializedView, CreateView, DropView};
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
-use crate::schema::view::extract_view_columns;
+use crate::schema::alter_table::qualify_select_table_refs;
+use crate::schema::view::{extract_view_columns, referenced_tables};
 use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
@@ -740,4 +741,36 @@ pub fn translate_drop_view(
 
     program.epilogue(resolver.schema());
     Ok(())
+}
+
+/// Writes, in front of each table that the body of a new view names without
+/// a schema, the schema the name is found in now, so that the view keeps
+/// reading that table when the search path changes. A name that no schema
+/// has a table for is left as written.
+pub(crate) fn bind_table_names(select: &mut ast::Select, resolver: &Resolver) {
+    for (qualifier, table) in referenced_tables(select) {
+        if qualifier.is_some() {
+            continue;
+        }
+        if let Some(schema_name) = schema_with_table(resolver, &table) {
+            qualify_select_table_refs(select, &table, &schema_name);
+        }
+    }
+}
+
+/// The name of the schema of the main database that a statement finds the
+/// table or view `table` in when it names it without a schema.
+fn schema_with_table(resolver: &Resolver, table: &str) -> Option<String> {
+    let unqualified = ast::QualifiedName::single(ast::Name::exact(table.to_string()));
+    let namespace = resolver.find_existing_table(&unqualified).ok()??;
+    if namespace.database_id != crate::MAIN_DB_ID {
+        return None;
+    }
+    resolver.with_schema(namespace.database_id, |schema| {
+        let has_relation = schema.get_table(namespace.id, table).is_some()
+            || schema.get_view(namespace.id, table).is_some();
+        has_relation
+            .then(|| schema.namespace_name(namespace.id).map(str::to_string))
+            .flatten()
+    })
 }
