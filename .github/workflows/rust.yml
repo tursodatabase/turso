@@ -419,6 +419,18 @@ jobs:
           - name: Differential
             iterations: 10
             args: "--maximum-tests 1000 --differential --io-backend=memory"
+          # Swarm testing: each iteration picks its statement mix, properties,
+          # faults and connection count from its seed. The log shows the
+          # picked settings, and the same seed repeats the run. Pull requests
+          # use the seeds 1 to `iterations`, which pass on main, so a failure
+          # on a pull request comes from its change. All other runs (pushes
+          # to main and manual runs) use random seeds to try new settings.
+          # There, a failure is a bug to investigate, and it does not block
+          # an unrelated pull request.
+          - name: Swarm
+            iterations: 100
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --io-backend=memory --swarm"
+            swarm: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -437,17 +449,26 @@ jobs:
       - name: Simulator ${{ matrix.profile.name }}
         env:
           SIM_ARGS: ${{ matrix.profile.args }}
+          FIXED_SEEDS: ${{ github.event_name == 'pull_request' && matrix.profile.swarm || false }}
         run: |
           set -euo pipefail
+          # The step picks the seed, so that a failed iteration can print it
+          # even if the simulator stops before it prints the seed.
           seq 1 ${{ matrix.profile.iterations }} | xargs -P 4 -n 1 bash -c '
             i="$1"
             log="sim-run-$i.log"
             read -r -a args <<< "$SIM_ARGS"
-            if ./target/simulator/limbo_sim "${args[@]}" >"$log" 2>&1; then
-              echo "iteration $i ok: $(grep -m1 "^seed: " "$log")"
+            if [ "$FIXED_SEEDS" = true ]; then
+              seed="$i"
             else
-              echo "iteration $i FAILED:"
+              seed=$(od -An -N8 -tu8 /dev/urandom | tr -d " ")
+            fi
+            if ./target/simulator/limbo_sim "${args[@]}" --seed "$seed" >"$log" 2>&1; then
+              echo "iteration $i ok: seed: $seed"
+            else
+              echo "iteration $i FAILED (seed: $seed):"
               cat "$log"
+              echo "Reproduce with: cargo run -p limbo_sim --profile simulator -- $SIM_ARGS --seed $seed"
               exit 255
             fi
           ' _
