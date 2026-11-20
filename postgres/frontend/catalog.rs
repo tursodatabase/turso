@@ -483,7 +483,7 @@ pub(crate) const PUBLIC_NAMESPACE_OID: i64 = 2200;
 /// schema.
 const FIRST_USER_SCHEMA_OID: i64 = 16384;
 
-fn namespace_oid(schema: &Schema, namespace: NamespaceId) -> i64 {
+pub(crate) fn namespace_oid(schema: &Schema, namespace: NamespaceId) -> i64 {
     if schema.namespace_name(namespace) == Some("public") {
         return PUBLIC_NAMESPACE_OID;
     }
@@ -2354,10 +2354,7 @@ impl SnapshotRows for PgConstraintTable {
                     .iter()
                     .find(|index| index.table_oid == table_oid && index.primary)
                     .expect("rowid primary keys have a catalog index");
-                let conname = btree
-                    .primary_key_constraint_name
-                    .clone()
-                    .unwrap_or_else(|| format!("{table_name}_pkey"));
+                let conname = primary_key_constraint_name(btree);
                 let conkey: String = btree
                     .primary_key_columns
                     .iter()
@@ -2410,15 +2407,9 @@ impl SnapshotRows for PgConstraintTable {
                 };
                 let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
                 let conname = if primary {
-                    btree
-                        .primary_key_constraint_name
-                        .clone()
-                        .unwrap_or_else(|| format!("{table_name}_pkey"))
+                    primary_key_constraint_name(btree)
                 } else {
-                    us.constraint_name.clone().unwrap_or_else(|| {
-                        let cols_str = col_names.join("_");
-                        format!("{table_name}_{cols_str}_key")
-                    })
+                    unique_constraint_name(btree, us)
                 };
 
                 // Build conkey: space-separated 1-based attnums
@@ -4629,6 +4620,36 @@ struct CatalogIndexColumn {
     position: usize,
     expression: Option<String>,
     order: SortOrder,
+}
+
+/// The names of the PRIMARY KEY and UNIQUE constraints of `table`. PostgreSQL
+/// gives the index of each constraint the same name.
+pub(crate) fn key_constraint_names(table: &BTreeTable) -> Vec<String> {
+    let rowid_primary_key = table
+        .get_rowid_alias_column()
+        .map(|_| primary_key_constraint_name(table));
+    let unique_sets = table.unique_sets.iter().map(|set| {
+        if unique_set_is_primary_key(table, set) {
+            primary_key_constraint_name(table)
+        } else {
+            unique_constraint_name(table, set)
+        }
+    });
+    rowid_primary_key.into_iter().chain(unique_sets).collect()
+}
+
+fn primary_key_constraint_name(table: &BTreeTable) -> String {
+    table
+        .primary_key_constraint_name
+        .clone()
+        .unwrap_or_else(|| format!("{}_pkey", table.declared_name))
+}
+
+fn unique_constraint_name(table: &BTreeTable, set: &UniqueSet) -> String {
+    set.constraint_name.clone().unwrap_or_else(|| {
+        let columns: Vec<&str> = set.columns.iter().map(|c| c.name.as_str()).collect();
+        format!("{}_{}_key", table.declared_name, columns.join("_"))
+    })
 }
 
 fn unique_set_is_primary_key(table: &BTreeTable, set: &UniqueSet) -> bool {

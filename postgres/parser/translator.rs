@@ -9285,25 +9285,33 @@ pub const PG_CLASS_OID: i64 = 1259;
 /// schema.
 pub const PG_NAMESPACE_OID: i64 = 2615;
 
-/// A COMMENT ON statement. Comments are accepted for PostgreSQL
-/// compatibility but are not stored.
-#[derive(Debug, Clone)]
+/// A COMMENT ON statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PgCommentOnStmt {
-    pub target: PgCommentTarget,
+    pub object: PgCommentObject,
+    /// The comment, or None when the statement removes it: `IS NULL` and
+    /// `IS ''` both do.
+    pub comment: Option<String>,
 }
 
-/// What a COMMENT ON statement comments on, as far as deciding who may run
-/// it.
-#[derive(Debug, Clone)]
-pub enum PgCommentTarget {
-    /// An object that only its owner may comment on, named the way
-    /// PostgreSQL names it in errors, such as `table t`, or `relation t` for
-    /// a column or constraint of `t`.
-    Owned(String),
-    /// A role. Commenting on it needs the CREATEROLE attribute.
-    Role,
-    /// Any other kind of object.
-    Other,
+/// What a COMMENT ON statement comments on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PgCommentObject {
+    /// A relation, of the kind the statement says it is.
+    Relation {
+        kind: ast::RelationKind,
+        schema: Option<String>,
+        name: String,
+    },
+    Column {
+        schema: Option<String>,
+        table: String,
+        column: String,
+    },
+    Schema(String),
+    /// A kind of object whose comments are not stored, named as the
+    /// statement names it, such as `TYPE`.
+    Unsupported(&'static str),
 }
 
 /// Extracts a COMMENT ON statement.
@@ -9321,28 +9329,64 @@ pub fn try_extract_comment_on(parse_result: &ParseResult) -> Option<PgCommentOnS
         .and_then(|node| node.node.as_ref())
         .map(comment_object_names)
         .unwrap_or_default();
-    let last = || names.last().cloned().unwrap_or_default();
-    let owned = |kind: &str, name: String| PgCommentTarget::Owned(format!("{kind} {name}"));
-    let target = match ObjectType::try_from(comment.objtype) {
-        Ok(ObjectType::ObjectTable) => owned("table", last()),
-        Ok(ObjectType::ObjectView) => owned("view", last()),
-        Ok(ObjectType::ObjectMatview) => owned("materialized view", last()),
-        Ok(ObjectType::ObjectIndex) => owned("index", last()),
-        Ok(ObjectType::ObjectSequence) => owned("sequence", last()),
-        Ok(ObjectType::ObjectSchema) => owned("schema", last()),
-        Ok(ObjectType::ObjectType | ObjectType::ObjectDomain) => owned("type", last()),
-        Ok(ObjectType::ObjectFunction) => owned("function", last()),
-        Ok(ObjectType::ObjectDatabase) => owned("database", last()),
-        Ok(ObjectType::ObjectExtension) => owned("extension", last()),
-        // A column or constraint belongs to its table.
-        Ok(ObjectType::ObjectColumn | ObjectType::ObjectTabconstraint) => owned(
-            "relation",
-            names.iter().rev().nth(1).cloned().unwrap_or_default(),
-        ),
-        Ok(ObjectType::ObjectRole) => PgCommentTarget::Role,
-        _ => PgCommentTarget::Other,
+    let object_type = ObjectType::try_from(comment.objtype).ok();
+    let relation_kind = match object_type {
+        Some(ObjectType::ObjectTable) => Some(ast::RelationKind::Table),
+        Some(ObjectType::ObjectView) => Some(ast::RelationKind::View),
+        Some(ObjectType::ObjectMatview) => Some(ast::RelationKind::MaterializedView),
+        Some(ObjectType::ObjectIndex) => Some(ast::RelationKind::Index),
+        Some(ObjectType::ObjectSequence) => Some(ast::RelationKind::Sequence),
+        _ => None,
     };
-    Some(PgCommentOnStmt { target })
+    let object = match (relation_kind, object_type, names.as_slice()) {
+        (Some(kind), _, [name]) => PgCommentObject::Relation {
+            kind,
+            schema: None,
+            name: name.clone(),
+        },
+        (Some(kind), _, [schema, name]) => PgCommentObject::Relation {
+            kind,
+            schema: Some(schema.clone()),
+            name: name.clone(),
+        },
+        (None, Some(ObjectType::ObjectColumn), [table, column]) => PgCommentObject::Column {
+            schema: None,
+            table: table.clone(),
+            column: column.clone(),
+        },
+        (None, Some(ObjectType::ObjectColumn), [schema, table, column]) => {
+            PgCommentObject::Column {
+                schema: Some(schema.clone()),
+                table: table.clone(),
+                column: column.clone(),
+            }
+        }
+        (None, Some(ObjectType::ObjectSchema), [schema]) => PgCommentObject::Schema(schema.clone()),
+        _ => PgCommentObject::Unsupported(match object_type {
+            Some(ObjectType::ObjectType) => "TYPE",
+            Some(ObjectType::ObjectDomain) => "DOMAIN",
+            Some(ObjectType::ObjectFunction) => "FUNCTION",
+            Some(ObjectType::ObjectTabconstraint | ObjectType::ObjectDomconstraint) => "CONSTRAINT",
+            Some(ObjectType::ObjectDatabase) => "DATABASE",
+            Some(ObjectType::ObjectExtension) => "EXTENSION",
+            Some(ObjectType::ObjectRole) => "ROLE",
+            Some(ObjectType::ObjectTrigger) => "TRIGGER",
+            Some(ObjectType::ObjectPolicy) => "POLICY",
+            Some(ObjectType::ObjectColumn) => "COLUMN with a database name",
+            Some(
+                ObjectType::ObjectTable
+                | ObjectType::ObjectView
+                | ObjectType::ObjectMatview
+                | ObjectType::ObjectIndex
+                | ObjectType::ObjectSequence,
+            ) => "a relation with a database name",
+            _ => "this kind of object",
+        }),
+    };
+    Some(PgCommentOnStmt {
+        object,
+        comment: (!comment.comment.is_empty()).then(|| comment.comment.clone()),
+    })
 }
 
 /// The names in the object of a COMMENT ON statement, such as
@@ -12939,36 +12983,72 @@ mod tests {
     }
 
     #[test]
-    fn comment_on_names_the_object_whose_owner_may_run_it() {
-        let target = |sql: &str| match try_extract_comment_on(&crate::parse(sql).unwrap())
-            .unwrap()
-            .target
-        {
-            PgCommentTarget::Owned(object) => object,
-            PgCommentTarget::Role => "role".to_string(),
-            PgCommentTarget::Other => "other".to_string(),
+    fn comment_on_names_its_object_and_its_comment() {
+        let stmt = |sql: &str| try_extract_comment_on(&crate::parse(sql).unwrap()).unwrap();
+        let relation = |kind, schema: Option<&str>, name: &str| PgCommentObject::Relation {
+            kind,
+            schema: schema.map(str::to_string),
+            name: name.to_string(),
         };
-        for (sql, want) in [
-            ("COMMENT ON TABLE s.t IS 'x'", "table t"),
-            ("COMMENT ON COLUMN s.t.a IS 'x'", "relation t"),
-            ("COMMENT ON CONSTRAINT c ON t IS 'x'", "relation t"),
-            ("COMMENT ON VIEW v IS 'x'", "view v"),
+        for (sql, object) in [
+            (
+                "COMMENT ON TABLE s.t IS 'x'",
+                relation(ast::RelationKind::Table, Some("s"), "t"),
+            ),
+            (
+                "COMMENT ON VIEW v IS 'x'",
+                relation(ast::RelationKind::View, None, "v"),
+            ),
             (
                 "COMMENT ON MATERIALIZED VIEW mv IS 'x'",
-                "materialized view mv",
+                relation(ast::RelationKind::MaterializedView, None, "mv"),
             ),
-            ("COMMENT ON INDEX i IS 'x'", "index i"),
-            ("COMMENT ON SEQUENCE s IS 'x'", "sequence s"),
-            ("COMMENT ON SCHEMA sc IS 'x'", "schema sc"),
-            ("COMMENT ON TYPE ty IS 'x'", "type ty"),
-            ("COMMENT ON DOMAIN d IS 'x'", "type d"),
-            ("COMMENT ON FUNCTION f(int) IS 'x'", "function f"),
-            ("COMMENT ON DATABASE db IS 'x'", "database db"),
-            ("COMMENT ON EXTENSION plpgsql IS 'x'", "extension plpgsql"),
-            ("COMMENT ON ROLE r IS 'x'", "role"),
-            ("COMMENT ON LANGUAGE sql IS 'x'", "other"),
+            (
+                "COMMENT ON INDEX i IS 'x'",
+                relation(ast::RelationKind::Index, None, "i"),
+            ),
+            (
+                "COMMENT ON SEQUENCE s IS 'x'",
+                relation(ast::RelationKind::Sequence, None, "s"),
+            ),
+            (
+                "COMMENT ON COLUMN s.t.a IS 'x'",
+                PgCommentObject::Column {
+                    schema: Some("s".to_string()),
+                    table: "t".to_string(),
+                    column: "a".to_string(),
+                },
+            ),
+            (
+                "COMMENT ON SCHEMA sc IS 'x'",
+                PgCommentObject::Schema("sc".to_string()),
+            ),
+            (
+                "COMMENT ON CONSTRAINT c ON t IS 'x'",
+                PgCommentObject::Unsupported("CONSTRAINT"),
+            ),
+            (
+                "COMMENT ON TYPE ty IS 'x'",
+                PgCommentObject::Unsupported("TYPE"),
+            ),
+            (
+                "COMMENT ON FUNCTION f(int) IS 'x'",
+                PgCommentObject::Unsupported("FUNCTION"),
+            ),
+            (
+                "COMMENT ON ROLE r IS 'x'",
+                PgCommentObject::Unsupported("ROLE"),
+            ),
+            (
+                "COMMENT ON LANGUAGE sql IS 'x'",
+                PgCommentObject::Unsupported("this kind of object"),
+            ),
         ] {
-            assert_eq!(target(sql), want, "{sql}");
+            assert_eq!(stmt(sql).object, object, "{sql}");
+            assert_eq!(stmt(sql).comment.as_deref(), Some("x"), "{sql}");
+        }
+        for sql in ["COMMENT ON TABLE t IS NULL", "COMMENT ON TABLE t IS ''"] {
+            assert_eq!(stmt(sql).comment, None, "{sql}");
         }
     }
 
