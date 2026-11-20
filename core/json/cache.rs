@@ -6,6 +6,7 @@ use crate::sync::Arc;
 use crate::types::{AsValueRef, Text};
 use crate::{Value, ValueRef};
 
+use super::json_path_from_text;
 use super::jsonb::Jsonb;
 use super::path::JsonPath;
 
@@ -215,16 +216,9 @@ impl JsonCacheCell {
         }
     }
 
-    /// Returns the path that `parse` makes for `text` in the mode `strict`.
-    /// A path in the cache is not parsed again. `parse` must give the same
-    /// path for the same text and mode, and an error must not depend on
-    /// anything else.
-    pub fn path<'t>(
-        &self,
-        text: &'t str,
-        strict: bool,
-        parse: impl FnOnce(&'t str) -> crate::Result<JsonPath<'t>>,
-    ) -> crate::Result<CachedJsonPath<'t>> {
+    /// Returns the path that [json_path_from_text] parses from `text` in the
+    /// mode `strict`. A path in the cache is not parsed again.
+    pub fn path<'t>(&self, text: &'t str, strict: bool) -> crate::Result<CachedJsonPath<'t>> {
         let mut paths = self.paths.borrow_mut();
         if let Some(cached) = paths
             .entries
@@ -234,7 +228,7 @@ impl JsonCacheCell {
         {
             return Ok(CachedJsonPath::Cached(cached.path.clone()));
         }
-        let path = parse(text)?;
+        let path = json_path_from_text(text, strict)?;
         let missed_before = paths
             .misses
             .iter()
@@ -558,7 +552,7 @@ mod tests {
     fn test_json_cache_cell_path_enters_on_the_second_miss() {
         use crate::json::path::json_path;
         let cell = JsonCacheCell::new();
-        let parsed = |text| cell.path(text, true, json_path).unwrap();
+        let parsed = |text| cell.path(text, true).unwrap();
         let expected = json_path("$.a[1].b").unwrap().elements;
 
         // The first miss parses the path, and the second also caches it.
@@ -570,20 +564,20 @@ mod tests {
         assert!(matches!(third, CachedJsonPath::Cached(_)));
         assert_eq!(third.elements, expected);
 
-        // The mode is part of the key.
-        let label = |text| {
-            cell.path(text, false, |text| {
-                Ok(JsonPath {
-                    elements: vec![
-                        crate::json::path::PathElement::Root(),
-                        crate::json::path::PathElement::Key(Cow::Borrowed(text), true),
-                    ],
-                })
-            })
-            .unwrap()
-        };
-        assert!(matches!(label("$.a[1].b"), CachedJsonPath::Parsed(_)));
-        assert_eq!(label("$.a[1].b").elements.len(), 2);
+        // The mode is part of the key: in non-strict mode, `a` is the label
+        // of a member, and in strict mode, it is not a path.
+        let label = vec![
+            crate::json::path::PathElement::Root(),
+            crate::json::path::PathElement::Key(Cow::Borrowed("a"), true),
+        ];
+        for _ in 0..3 {
+            assert_eq!(cell.path("a", false).unwrap().elements, label);
+        }
+        assert!(matches!(
+            cell.path("a", false).unwrap(),
+            CachedJsonPath::Cached(_)
+        ));
+        assert!(cell.path("a", true).is_err());
         assert_eq!(parsed("$.a[1].b").elements, expected);
     }
 
@@ -594,25 +588,25 @@ mod tests {
         // A new path for each call is parsed each time.
         for i in 0..20 {
             let text = format!("$.k{i}");
-            let path = cell.path(&text, true, json_path).unwrap();
+            let path = cell.path(&text, true).unwrap();
             assert!(matches!(path, CachedJsonPath::Parsed(_)));
             assert_eq!(path.elements, json_path(&text).unwrap().elements);
         }
         // Paths that come back within the last misses enter the cache.
         for _ in 0..2 {
             for text in ["$.x", "$.y", "$.z"] {
-                cell.path(text, true, json_path).unwrap();
+                cell.path(text, true).unwrap();
             }
         }
         for text in ["$.x", "$.y", "$.z"] {
             assert!(matches!(
-                cell.path(text, true, json_path).unwrap(),
+                cell.path(text, true).unwrap(),
                 CachedJsonPath::Cached(_)
             ));
         }
         // An error is returned each time, and is not cached.
         for _ in 0..3 {
-            assert!(cell.path("$[", true, json_path).is_err());
+            assert!(cell.path("$[", true).is_err());
         }
     }
 

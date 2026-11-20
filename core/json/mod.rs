@@ -913,9 +913,7 @@ fn cached_json_path<'a>(
 ) -> crate::Result<Option<CachedJsonPath<'a>>> {
     if let ValueRef::Text(text) = path.as_value_ref() {
         let text = sqlite_text_prefix(text.as_str());
-        return json_cache
-            .path(text, strict, |text| json_path_from_text(text, strict))
-            .map(Some);
+        return json_cache.path(text, strict).map(Some);
     }
     Ok(json_path_from_db_value(path, strict)?.map(CachedJsonPath::Parsed))
 }
