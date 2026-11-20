@@ -7200,6 +7200,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
+    #[cfg(feature = "test_helper")]
+    pub fn with_global_header_mut_for_testing<T>(
+        &self,
+        f: impl Fn(&mut DatabaseHeader) -> T,
+    ) -> Result<T> {
+        self.with_header_mut(f, None)
+    }
+
     pub(crate) fn with_header_mut<T, F>(&self, f: F, tx_id: Option<&TxID>) -> Result<T>
     where
         F: Fn(&mut DatabaseHeader) -> T,
