@@ -367,9 +367,21 @@ expect {
     2|5
 }
 
+test table-index-expression-qualified-with-its-own-schema {
+    CREATE SCHEMA idx_own_schema;
+    CREATE TABLE idx_own_schema.t (a int, b int);
+    CREATE INDEX t_b ON idx_own_schema.t ((idx_own_schema.t.b + 1));
+    INSERT INTO idx_own_schema.t VALUES (1, 2);
+    SELECT a FROM idx_own_schema.t WHERE b + 1 = 3;
+}
+expect {
+    1
+}
+
 # A column qualified with another schema is not the indexed table's column.
-# PostgreSQL reports the table reference (42P01); tursopg reports the column,
-# as it does on main.
+# PostgreSQL reports the table reference (42P01); tursopg reports the column
+# (42703), as it does on main.
+@compat-gap "syntax:create-index"
 test table-index-expression-with-other-schema-rejected {
     CREATE TABLE t_other_schema (a int, b int);
     CREATE INDEX t_other_schema_b ON t_other_schema ((zz.t_other_schema.b + 3));
