@@ -40,7 +40,9 @@ use turso_parser::ast::{
 use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
-use super::expr::expr_type::{compound_column_type, type_of, type_ordering, ExprType};
+use super::expr::expr_type::{
+    compound_column_type, type_of, type_ordering, BuiltinType, ExprType,
+};
 
 /// Infer the affinity of a subquery result column from its expression.
 ///
@@ -3452,6 +3454,13 @@ pub(super) fn query_output_columns(
         column.set_array_dimensions(dimensions);
         column.set_collation(Some(text_collation));
         column.set_type_ordering(type_ordering(&result_type, resolver.schema()));
+        // A string literal takes its type from where it is used, and an outer
+        // query is not where the subquery wrote it: PostgreSQL types a literal in a
+        // select list as text, so `ts = q.s` is an error for `(SELECT 'x' s) q`.
+        let result_type = match result_type {
+            ExprType::Untyped => ExprType::Builtin(BuiltinType::Text),
+            ty => ty,
+        };
         column_types.try_push(result_type)?;
     }
     Ok((columns, column_types))

@@ -184,3 +184,99 @@ expect error {
 expect @tursopg error {
     operator does not exist: timestamp and text
 }
+
+# A string literal in the select list of a CTE or a subquery in FROM is text
+# when an outer query reads it, as in PostgreSQL, so it does not meet a
+# timestamp. Only a literal in a compound SELECT arm of the same query does.
+
+@setup tslit
+test ts-lit-cte-union-errors {
+    WITH c AS (SELECT 'zzz' s) SELECT ts FROM m UNION SELECT s FROM c;
+}
+@sqlstate 42804
+expect error {
+    UNION types timestamp without time zone and text cannot be matched
+}
+expect @tursopg error {
+    UNION types timestamp and text cannot be matched
+}
+
+@setup tslit
+test ts-lit-cte-union-timestamptz-errors {
+    WITH c AS (SELECT '2024-01-01T10:00' s) SELECT tz FROM m UNION SELECT s FROM c;
+}
+@sqlstate 42804
+expect error {
+    UNION types timestamp with time zone and text cannot be matched
+}
+expect @tursopg error {
+    UNION types timestamp and text cannot be matched
+}
+
+@setup tslit
+test ts-lit-cte-in-errors {
+    WITH c AS (SELECT 'zzz' s) SELECT id FROM m WHERE ts IN (SELECT s FROM c);
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp without time zone = text
+}
+expect @tursopg error {
+    operator does not exist: timestamp and text
+}
+
+@setup tslit
+test ts-lit-from-subquery-in-errors {
+    SELECT id FROM m WHERE ts IN (SELECT s FROM (SELECT '2024-01-02T09:00' s) q);
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp without time zone = text
+}
+expect @tursopg error {
+    operator does not exist: timestamp and text
+}
+
+@setup tslit
+test ts-lit-from-subquery-join-errors {
+    SELECT m.id FROM m, (SELECT 'zzz' s) q WHERE m.ts = q.s;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp without time zone = text
+}
+expect @tursopg error {
+    operator does not exist: timestamp and text
+}
+
+@setup tslit
+test ts-lit-from-subquery-union-errors {
+    SELECT ts FROM m UNION SELECT s FROM (SELECT 'zzz' s) q;
+}
+@sqlstate 42804
+expect error {
+    UNION types timestamp without time zone and text cannot be matched
+}
+expect @tursopg error {
+    UNION types timestamp and text cannot be matched
+}
+
+@setup tslit
+test ts-lit-cte-compound-reads-literal {
+    WITH c AS (SELECT ts FROM m UNION SELECT '2024-01-01T10:00' ORDER BY 1)
+    SELECT id FROM m WHERE ts IN (SELECT ts FROM c) ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup tslit
+test ts-lit-cte-cast-literal-union {
+    WITH c AS (SELECT '2024-01-03T08:30'::timestamp s) SELECT ts FROM m UNION SELECT s FROM c ORDER BY 1;
+}
+expect {
+    2024-01-01 10:00:00
+    2024-01-02 09:00:00
+    2024-01-03 08:30:00
+}
