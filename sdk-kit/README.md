@@ -45,7 +45,7 @@ fn main() -> Result<(), TursoError> {
     let db = TursoDatabase::new(TursoDatabaseConfig {
         path: ":memory:".to_string(),
         experimental_features: None,
-        // When true, open/step/finalize may return Io and the caller drives I/O.
+        // When true, step/execute may return Io and you should call run_io() to progress.
         async_io: true,
         encryption: None,
         vfs: IoBackend::Default,
@@ -76,15 +76,22 @@ fn main() -> Result<(), TursoError> {
                     other => println!("row[0] = {other:?}"),
                 }
             }
-            // Drive one iteration of the I/O backend.
-            TursoStatusCode::Io => stmt.run_io()?,
+            TursoStatusCode::Io => {
+                // Drive one iteration of the I/O backend.
+                stmt.run_io()?;
+            }
             TursoStatusCode::Done => break,
         }
     }
 
     // Finalize to complete the statement cleanly (may also return Io).
-    while stmt.finalize(None)? == TursoStatusCode::Io {
-        stmt.run_io()?;
+    match stmt.finalize(None)? {
+        TursoStatusCode::Io => {
+            // If needed, drive IO and finalize again.
+            stmt.run_io()?;
+            let _ = stmt.finalize(None)?;
+        }
+        _ => {}
     }
 
     Ok(())
@@ -96,6 +103,7 @@ fn main() -> Result<(), TursoError> {
 ```c
 #include <stdio.h>
 #include <string.h>
+#include <stdbool.h>
 #include "turso.h"
 
 // Print the error message returned through an error_opt_out parameter and free it.
@@ -112,11 +120,14 @@ int main(void) {
     turso_status_code_t rc;
     int exit_code = 1;
 
-    // Create the database holder (not opened yet). With async_io set, step and
-    // finalize may return TURSO_IO and the caller drives I/O with turso_statement_run_io().
+    // Optional: initialize logging (stdout example) and/or set log level via environment.
+    // turso_setup(&(turso_config_t){ .logger = NULL, .log_level = "info" }, NULL);
+
+    // Create database holder (not opened yet). Enable caller-driven async I/O.
     turso_database_config_t config = {
-        .async_io = 1,
         .path = ":memory:",
+        .experimental_features = NULL,
+        .async_io = true,
     };
     rc = turso_database_new(&config, &db, &error);
     if (rc != TURSO_OK) { report_error("turso_database_new", rc, error); return 1; }
@@ -142,7 +153,7 @@ int main(void) {
     for (;;) {
         rc = turso_statement_step(stmt, &error);
         if (rc == TURSO_IO) {
-            // Run one iteration of the I/O backend and step again.
+            // Run one iteration of the IO backend and continue.
             rc = turso_statement_run_io(stmt, &error);
             if (rc != TURSO_OK) { report_error("turso_statement_run_io", rc, error); goto cleanup; }
             continue;
@@ -177,7 +188,7 @@ int main(void) {
     exit_code = 0;
 
 cleanup:
-    // The deinit functions accept NULL.
+    // Clean up handles.
     turso_statement_deinit(stmt);
     turso_connection_deinit(conn);
     turso_database_deinit(db);
