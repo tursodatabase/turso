@@ -1,0 +1,98 @@
+@database :memory:
+
+# A FROM subquery, a CTE, a view and CREATE TABLE AS give a column reference
+# in parentheses or with COLLATE the name of the column, as SQLite's
+# sqlite3ColumnsFromExprList() does. A result set gives a column reference in
+# parentheses the name of the column too, but keeps the text of a COLLATE
+# expression, as SQLite's sqlite3GenerateColumnNames() does.
+
+setup schema {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x, y);
+    INSERT INTO t VALUES(1, 'a', 'b');
+}
+
+@setup schema
+test subquery-column-in-parentheses-or-collate-name {
+    SELECT x FROM (SELECT (x) FROM t);
+    SELECT x FROM (SELECT ((t.x)) FROM t);
+    SELECT x FROM (SELECT x COLLATE nocase FROM t);
+    SELECT s.x FROM (SELECT (t.x COLLATE nocase) FROM t) AS s;
+    SELECT x FROM (SELECT (x) FROM t UNION ALL SELECT 'c');
+}
+expect {
+    a
+    a
+    a
+    a
+    a
+    c
+}
+
+@setup schema
+test cte-and-view-column-in-parentheses-or-collate-name {
+    CREATE VIEW v AS SELECT (x), y COLLATE nocase FROM t;
+    WITH c AS (SELECT (x), y COLLATE nocase FROM t) SELECT x, y FROM c;
+    SELECT x, y FROM v;
+    SELECT name FROM pragma_table_info('v');
+}
+expect {
+    a|b
+    a|b
+    x
+    y
+}
+
+@setup schema
+test create-table-as-column-in-parentheses-or-collate-name {
+    CREATE TABLE t2 AS SELECT (x), y COLLATE nocase, x COLLATE nocase, (x || y) FROM t;
+    SELECT sql FROM sqlite_schema WHERE name = 't2';
+}
+expect {
+    CREATE TABLE t2(x,y,"x:1","(x || y)")
+}
+
+@setup schema
+@backend cli
+test result-column-in-parentheses-header {
+    .headers on
+    SELECT (x), ((t.x)), y COLLATE nocase, (x) COLLATE nocase, (x || y) FROM t;
+}
+expect {
+    x|x|y COLLATE nocase|(x) COLLATE nocase|(x || y)
+    a|a|b|a|ab
+}
+
+@setup schema
+@backend cli
+test returning-column-in-parentheses-header {
+    .headers on
+    INSERT INTO t VALUES(2, 'c', 'd') RETURNING (x), (t.y);
+}
+expect {
+    x|y
+    c|d
+}
+
+@setup schema
+@backend cli
+test full-column-names-column-in-parentheses-header {
+    .headers on
+    PRAGMA full_column_names=ON;
+    SELECT (x), ((t.y)) FROM t;
+}
+expect {
+    t.x|t.y
+    a|b
+}
+
+@setup schema
+@backend cli
+test short-column-names-off-column-in-parentheses-header {
+    .headers on
+    PRAGMA short_column_names=OFF;
+    SELECT (x), x FROM t;
+}
+expect {
+    (x)|x
+    a|a
+}

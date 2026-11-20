@@ -715,6 +715,11 @@ pub struct Variable {
     /// they use a column's collation.
     #[cfg_attr(feature = "serde", serde(default))]
     pub col_collation: Option<Box<str>>,
+    /// The column name as written in the trigger reference the variable
+    /// replaces: `x` for `NEW.x` or `OLD.x`. As in SQLite, a subquery column
+    /// that selects `NEW.x` gets this name, so the outer query can select `x`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub column_name: Option<Box<str>>,
     /// True for an explicit `?N` marker. Numbered markers carry no allocated
     /// name; their "?N" spelling is derived from the index on demand.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -728,6 +733,7 @@ impl Variable {
             name: None,
             custom_type: None,
             col_collation: None,
+            column_name: None,
             numbered: false,
         }
     }
@@ -739,6 +745,7 @@ impl Variable {
             name: None,
             custom_type: None,
             col_collation: None,
+            column_name: None,
             numbered: true,
         }
     }
@@ -755,6 +762,7 @@ impl Variable {
             name: None,
             custom_type: custom_type.map(Box::new),
             col_collation: col_collation.map(Into::into),
+            column_name: None,
             numbered: false,
         }
     }
@@ -765,6 +773,7 @@ impl Variable {
             name: Some(name.into()),
             custom_type: None,
             col_collation: None,
+            column_name: None,
             numbered: false,
         }
     }
