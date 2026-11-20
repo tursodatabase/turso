@@ -4107,6 +4107,12 @@ pub(super) fn validate_jsonb(data: &[u8]) -> bool {
     validate_element(data, 0, data.len(), 0, false).is_ok()
 }
 
+/// Whether `element`, an element of `data` that [find_path_element] found,
+/// passes the check that [validate_jsonb] makes of a whole document.
+pub(super) fn is_valid_element(data: &[u8], element: PathTarget) -> bool {
+    validate_element(data, element.start, element.end, 0, false).is_ok()
+}
+
 /// SQLite's jsonbValidityCheck: 0 when `data` is fully valid JSONB
 /// including numeric payload contents, otherwise the 1-based byte
 /// offset of the first malformed byte or element. json_valid(X, 8) and

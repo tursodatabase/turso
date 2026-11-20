@@ -12,6 +12,8 @@ Most functions come in pairs: a `json_*` variant that returns TEXT and a `jsonb_
 
 SQL REAL arguments are converted to JSON numbers with up to 15 significant decimal digits, matching SQLite. Numbers already stored in JSON text retain their original precision.
 
+A BLOB argument is read as JSONB when its first header gives the size of the whole BLOB. Other BLOB arguments are read as JSON text. Like SQLite, `->`, `->>`, `json_extract`, `jsonb_extract`, `json_type` and `json_array_length` with a path read only the part of a JSONB argument that the path selects. Thus a malformed value outside the path does not cause an error.
+
 ## JSON Path Syntax
 
 Many JSON functions accept a **path** argument that identifies a specific element within a JSON document.
