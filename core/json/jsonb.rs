@@ -3753,75 +3753,25 @@ impl Jsonb {
         Ok(Some((&self.data[key_start..key_stop], st.index, next)))
     }
 
-    /// If the iterator points at a container value, return an iterator for that container.
-    /// For arrays, we inspect the next element; for objects, we inspect the next property's *value*.
-    pub fn container_property_iterator(&self, it: &IteratorState) -> Option<IteratorState> {
-        match it {
-            IteratorState::Array(st) => {
-                if st.cursor >= st.end {
-                    return None;
-                }
-                let (JsonbHeader(ty, len), hdr_len) = self.read_header(st.cursor).ok()?;
-                let payload_cursor = st.cursor.checked_add(hdr_len)?;
-                let payload_end = payload_cursor.checked_add(len)?;
-                if payload_end > st.end || payload_end > self.data.len() {
-                    return None;
-                }
-
-                match ty {
-                    ElementType::ARRAY => Some(IteratorState::Array(ArrayIteratorState {
-                        cursor: payload_cursor,
-                        end: payload_end,
-                        index: 0,
-                    })),
-                    ElementType::OBJECT => Some(IteratorState::Object(ObjectIteratorState {
-                        cursor: payload_cursor,
-                        end: payload_end,
-                        index: 0,
-                    })),
-                    _ => None,
-                }
-            }
-
-            IteratorState::Object(st) => {
-                if st.cursor >= st.end {
-                    return None;
-                }
-
-                // key -> value
-                let (JsonbHeader(key_ty, key_len), key_hdr_len) =
-                    self.read_header(st.cursor).ok()?;
-                if !key_ty.is_valid_key() {
-                    return None;
-                }
-                let key_stop = st.cursor.checked_add(key_hdr_len + key_len)?;
-                if key_stop > st.end || key_stop > self.data.len() {
-                    return None;
-                }
-
-                let (JsonbHeader(val_ty, val_len), val_hdr_len) =
-                    self.read_header(key_stop).ok()?;
-                let payload_cursor = key_stop.checked_add(val_hdr_len)?;
-                let payload_end = payload_cursor.checked_add(val_len)?;
-                if payload_end > st.end || payload_end > self.data.len() {
-                    return None;
-                }
-
-                match val_ty {
-                    ElementType::ARRAY => Some(IteratorState::Array(ArrayIteratorState {
-                        cursor: payload_cursor,
-                        end: payload_end,
-                        index: 0,
-                    })),
-                    ElementType::OBJECT => Some(IteratorState::Object(ObjectIteratorState {
-                        cursor: payload_cursor,
-                        end: payload_end,
-                        index: 0,
-                    })),
-                    _ => None,
-                }
-            }
-            IteratorState::Primitive(_) => None,
+    /// The state of an iterator over the element at `start..end`, when it is
+    /// an array or an object. `start..end` is an element or a member value
+    /// that [Self::array_iterator_next] or [Self::object_iterator_next]
+    /// returned, so its header and its size are already checked.
+    pub fn container_iterator_at(&self, start: usize, end: usize) -> Option<IteratorState> {
+        let (JsonbHeader(element_type, _), header_len) = self.read_header(start).ok()?;
+        let payload_start = start + header_len;
+        match element_type {
+            ElementType::ARRAY => Some(IteratorState::Array(ArrayIteratorState {
+                cursor: payload_start,
+                end,
+                index: 0,
+            })),
+            ElementType::OBJECT => Some(IteratorState::Object(ObjectIteratorState {
+                cursor: payload_start,
+                end,
+                index: 0,
+            })),
+            _ => None,
         }
     }
 }

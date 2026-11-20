@@ -405,7 +405,7 @@ impl JsonEachCursor {
 
                 let recursing_iterator = if matches!(self.traversal_mode, JsonTraversalMode::Tree) {
                     self.json
-                        .container_property_iterator(&IteratorState::Array(state))
+                        .container_iterator_at(state.position(), new_state.position())
                 } else {
                     None
                 };
@@ -438,6 +438,9 @@ impl JsonEachCursor {
                     return self.advance();
                 };
                 self.id = self.root_offset + state.position() as i64;
+                // The value of the member follows its key, and ends where the
+                // next member starts.
+                let value = state.position() + key.len()..new_state.position();
 
                 // The state of the object keeps the path before the key.
                 let container_cursor = self.path_to_current_value.cursor();
@@ -450,7 +453,7 @@ impl JsonEachCursor {
                 let recursing = matches!(self.traversal_mode, JsonTraversalMode::Tree)
                     && self
                         .json
-                        .container_property_iterator(&IteratorState::Object(state))
+                        .container_iterator_at(value.start, value.end)
                         .is_some_and(|it| {
                             self.push_state(it, Some(self.id), self.path_to_current_value.cursor());
                             true
