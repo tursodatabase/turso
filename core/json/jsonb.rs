@@ -736,10 +736,6 @@ pub struct SearchOperation {
 }
 
 impl SearchOperation {
-    #[expect(
-        clippy::new_without_default,
-        reason = "each path operation makes its own search"
-    )]
     pub fn new() -> Self {
         Self {
             mode: PathOperationMode::ReplaceExisting,
@@ -6291,7 +6287,6 @@ mod path_operations_tests {
     fn malformed_element_size_is_rejected_before_slicing() {
         // ARRAY (type 11, inline payload size 8) whose single child is a TEXT5
         // with a 1-byte size marker declaring 200 bytes, in a 9-byte buffer.
-        let bytes = [0x8Bu8, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let path = create_path(vec![
             PathElement::Root(),
             PathElement::ArrayLocator(Some(0)),
