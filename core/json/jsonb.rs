@@ -372,6 +372,11 @@ pub enum JsonLocationKind {
     ArrayEntry,
 }
 
+/// The traversal results of the segments of a path, from the root. Most
+/// paths have few segments, so the stack is inline for up to 4 of them and
+/// a path operation does not allocate it.
+pub type TraversalStack = smallvec::SmallVec<[JsonTraversalResult; 4]>;
+
 #[derive(Debug, Clone)]
 pub struct JsonTraversalResult {
     field_key_index: JsonLocationKind,
@@ -391,7 +396,7 @@ pub trait PathOperation {
     fn operation_mode(&self) -> PathOperationMode;
 
     // Execute the actual operation
-    fn execute(&mut self, json: &mut Jsonb, stack: Vec<JsonTraversalResult>) -> Result<()>;
+    fn execute(&mut self, json: &mut Jsonb, stack: TraversalStack) -> Result<()>;
 
     /// Whether `execute` can change the document.
     fn changes_document(&self) -> bool {
@@ -420,7 +425,7 @@ impl PathOperation for SetOperation {
         self.mode
     }
 
-    fn execute(&mut self, json: &mut Jsonb, mut stack: Vec<JsonTraversalResult>) -> Result<()> {
+    fn execute(&mut self, json: &mut Jsonb, mut stack: TraversalStack) -> Result<()> {
         if stack.is_empty() {
             bail_parse_error!("Nothing to operate on!")
         }
@@ -499,7 +504,7 @@ impl PathOperation for DeleteOperation {
         self.mode
     }
 
-    fn execute(&mut self, json: &mut Jsonb, mut stack: Vec<JsonTraversalResult>) -> Result<()> {
+    fn execute(&mut self, json: &mut Jsonb, mut stack: TraversalStack) -> Result<()> {
         if stack.is_empty() {
             bail_parse_error!("Nothing to operate on!")
         }
@@ -585,7 +590,7 @@ impl PathOperation for ReplaceOperation {
         self.mode
     }
 
-    fn execute(&mut self, json: &mut Jsonb, mut stack: Vec<JsonTraversalResult>) -> Result<()> {
+    fn execute(&mut self, json: &mut Jsonb, mut stack: TraversalStack) -> Result<()> {
         if stack.is_empty() {
             bail_parse_error!("Nothing to operate on!")
         }
@@ -666,7 +671,7 @@ impl PathOperation for InsertOperation {
         self.mode
     }
 
-    fn execute(&mut self, json: &mut Jsonb, mut stack: Vec<JsonTraversalResult>) -> Result<()> {
+    fn execute(&mut self, json: &mut Jsonb, mut stack: TraversalStack) -> Result<()> {
         if stack.is_empty() {
             bail_parse_error!("Nothing to operate on!")
         }
@@ -763,7 +768,7 @@ impl PathOperation for SearchOperation {
         self.mode
     }
 
-    fn execute(&mut self, json: &mut Jsonb, mut stack: Vec<JsonTraversalResult>) -> Result<()> {
+    fn execute(&mut self, json: &mut Jsonb, mut stack: TraversalStack) -> Result<()> {
         let target = stack.pop().ok_or_else(|| {
             LimboError::InternalError("stack should not be empty after check".to_string())
         })?;
@@ -1914,6 +1919,10 @@ impl Jsonb {
     /// A payload of 12 to 255 bytes has a 2-byte header, and most containers
     /// have a payload of that size. For them, the payload does not move when
     /// the real header is written, as it does after a 1-byte placeholder.
+    ///
+    /// The function is inlined always: when the compiler chose not to inline
+    /// it into the recursive parser, the parser got slower by about 2%.
+    #[inline(always)]
     fn start_container(&mut self, element_type: ElementType) -> Result<usize> {
         let header_pos = self.len();
         self.data.try_reserve(2)?;
@@ -2790,10 +2799,10 @@ impl Jsonb {
         &mut self,
         path: &JsonPath,
         mode: PathOperationMode,
-    ) -> Result<Vec<JsonTraversalResult>> {
+    ) -> Result<TraversalStack> {
         let mut path_iter = path.elements.iter().peekable();
         let mut pos = 0;
-        let mut stack: Vec<JsonTraversalResult> = Vec::with_capacity(path.elements.len());
+        let mut stack = TraversalStack::with_capacity(path.elements.len());
 
         while let Some(current) = path_iter.next() {
             let next_is_array = matches!(path_iter.peek(), Some(PathElement::ArrayLocator(_)))
@@ -2878,11 +2887,7 @@ impl Jsonb {
         result
     }
 
-    fn update_parent_references(
-        &mut self,
-        stack: Vec<JsonTraversalResult>,
-        delta: isize,
-    ) -> Result<()> {
+    fn update_parent_references(&mut self, stack: TraversalStack, delta: isize) -> Result<()> {
         let mut delta = delta;
         // With nested array locators ($[0][2]) the element of the outer
         // entry is the container of the inner entry, whose header the
