@@ -2189,6 +2189,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let mut processed = 0;
         let drop_current_if_in_btree = true;
         let total = self.write_set.len() + self.unwritten_table_rows.len();
+        // The write set has the rows of each table in key order, so a cursor
+        // that walks the rows map gets to each row in a few steps, where a
+        // lookup searches from the head of the map. A key below the previous
+        // key, as at the start of the next table, starts a new cursor,
+        // because the cursor only walks forward.
+        let mvstore = self.mvstore.clone();
+        let guard = epoch::pin();
+        let mut rows = LockstepCursor::new(&mvstore.rows, &guard);
+        let mut previous_row_id: Option<&RowID> = None;
         while index < total {
             let current = index;
             index += 1;
@@ -2208,8 +2217,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     true,
                 )
             };
-            if let Some(entry) = self.mvstore.rows.get(row_id) {
-                let mut versions = entry.value().write();
+            if previous_row_id.is_some_and(|previous| row_id < previous) {
+                rows = LockstepCursor::new(&mvstore.rows, &guard);
+            }
+            previous_row_id = Some(row_id);
+            if let Some(chain) = rows.advance_to(row_id) {
+                let mut versions = chain.write();
                 if stamp {
                     self.mvstore.stamp_chain_materialized(
                         &mut versions,
