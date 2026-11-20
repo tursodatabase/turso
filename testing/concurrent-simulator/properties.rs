@@ -2434,6 +2434,41 @@ mod tests {
                 .finish_op(0, 0, txn_id, exec_id, exec_id, &op, &Ok(rows))
         }
     }
+
+    #[test]
+    fn rolled_back_key_is_visible_only_to_the_transaction_that_inserts_it_again() {
+        let mut property = RolledBackInsertsNotVisible::new();
+        let insert = Operation::SimpleInsert {
+            table_name: "t".to_string(),
+            key: "k".to_string(),
+            value_length: 1,
+        };
+        let select = Operation::SimpleSelect {
+            table_name: "t".to_string(),
+            key: "k".to_string(),
+        };
+        let done = Ok(vec![]);
+        let row = Ok(vec![vec![Value::build_text("k"), Value::from_i64(1)]]);
+        // Transaction 1 inserts k, then rolls back.
+        property
+            .finish_op(1, 0, Some(1), 1, 1, &insert, &done)
+            .unwrap();
+        property
+            .finish_op(2, 0, Some(1), 2, 2, &Operation::Rollback, &done)
+            .unwrap();
+        // Transaction 2 inserts k again, then reads it.
+        property
+            .finish_op(3, 0, Some(2), 3, 3, &insert, &done)
+            .unwrap();
+        property
+            .finish_op(4, 0, Some(2), 4, 4, &select, &row)
+            .unwrap();
+        // Transaction 2 did not commit, so k must stay invisible to transaction 3.
+        let error = property
+            .finish_op(5, 1, Some(3), 5, 5, &select, &row)
+            .unwrap_err();
+        assert!(error.to_string().contains("isolation violation"));
+    }
 }
 
 fn parse_read_result(result: &OpResult) -> Option<Vec<i64>> {
@@ -2894,14 +2929,16 @@ impl Property for SnapshotStabilityProperty {
 /// - Committed: promoted from in-flight on Commit, or inserted by an autocommit op.
 /// - Rolled-back: moved from in-flight on Rollback, only if never committed by any txn.
 ///
-/// A SimpleSelect returning rows for a rolled-back key is a violation.
+/// A SimpleSelect returning rows for a rolled-back key is a violation, unless
+/// the reading transaction inserted the key again.
 pub struct RolledBackInsertsNotVisible {
     /// Per txn_id: keys inserted by SimpleInsert in that explicit tx.
     in_flight: HashMap<u64, HashSet<(String, String)>>,
     /// Keys that have been committed at any point by any connection.
     committed: HashSet<(String, String)>,
     /// Keys from rolled-back txns that have never been committed — must not be
-    /// visible to any subsequent SimpleSelect.
+    /// visible to a subsequent SimpleSelect, except in a txn that inserted the
+    /// key again.
     rolled_back: HashSet<(String, String)>,
 }
 
@@ -2978,7 +3015,12 @@ impl Property for RolledBackInsertsNotVisible {
             Operation::SimpleSelect { table_name, key } => {
                 let rows = result.as_ref().unwrap();
                 let pair = (table_name.clone(), key.clone());
-                if !rows.is_empty() && self.rolled_back.contains(&pair) {
+                // A transaction sees its own writes, so a rolled-back key that
+                // the reading transaction inserted again is visible to it.
+                let inserted_by_reader = txn_id
+                    .and_then(|t| self.in_flight.get(&t))
+                    .is_some_and(|keys| keys.contains(&pair));
+                if !rows.is_empty() && self.rolled_back.contains(&pair) && !inserted_by_reader {
                     return Err(anyhow!(
                         "isolation violation: table={table_name}, key={key} \
                          was written by a rolled-back transaction but is still visible"
