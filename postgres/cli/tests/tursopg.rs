@@ -1786,11 +1786,11 @@ fn rewritten_table_definitions_survive_reopen() {
     std::fs::remove_dir_all(&test_dir).ok();
 }
 
-/// An enum type is not loaded again when the database is reopened, so a
-/// CREATE TABLE AS from a table with an enum column cannot type the new
-/// column. The column is left unchecked instead of failing the statement.
+/// A CREATE TABLE AS from a table with an enum column, run after the database
+/// is reopened, gives the new column the enum type, so it rejects a value that
+/// is not one of the enum's labels.
 #[test]
-fn create_table_as_from_enum_column_works_after_reopen() {
+fn create_table_as_from_enum_column_keeps_the_enum_after_reopen() {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1814,6 +1814,15 @@ fn create_table_as_from_enum_column_works_after_reopen() {
     assert_eq!(out2.status.code(), Some(0), "reopen failed: {err}");
     assert!(!err.contains("Error"), "reopen failed: {err}");
     assert!(out.contains("sad"), "expected sad in: {out}");
+
+    let out3 = stdout(&run_tursopg_with_db(
+        &db_path,
+        b"INSERT INTO t VALUES ('zz');\n",
+    ));
+    assert!(
+        out3.contains("ERROR:  invalid input value for enum mood: \"zz\""),
+        "expected the copied enum column to reject 'zz': {out3}"
+    );
 
     std::fs::remove_dir_all(&test_dir).ok();
 }

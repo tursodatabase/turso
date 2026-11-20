@@ -247,8 +247,8 @@ expect {
 }
 
 setup typed_src {
-    CREATE TABLE src (b boolean, n numeric(5,2), v varchar(3), a int[]);
-    INSERT INTO src VALUES (true, 1.5, 'abc', '{1,2}');
+    CREATE TABLE src (b boolean, n numeric(5,2), v varchar(3), a int[], ts timestamp);
+    INSERT INTO src VALUES (true, 1.5, 'abc', '{1,2}', '2024-01-02 03:04:05');
 }
 
 @setup typed_src
@@ -287,6 +287,13 @@ expect error {}
 test table-create-table-as-rejects-invalid-array-element {
     CREATE TABLE dst AS SELECT * FROM src;
     INSERT INTO dst (a) VALUES ('{x}');
+}
+expect error {}
+
+@setup typed_src
+test table-create-table-as-rejects-invalid-timestamp {
+    CREATE TABLE dst AS SELECT * FROM src;
+    INSERT INTO dst (ts) VALUES ('y');
 }
 expect error {}
 

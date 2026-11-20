@@ -29,7 +29,7 @@ use crate::translate::catalog::CatalogContext;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{prepare_cdc_if_necessary, Resolver};
 use crate::translate::expr::expr_type::{
-    base_value_type, common_type_of, decode_type, iif_values, type_of, value_type, ExprType,
+    base_value_type, compound_column_type, decode_type, iif_values, type_of, value_type, ExprType,
     TypeEnv,
 };
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
@@ -1014,7 +1014,10 @@ fn derive_ctas_schema(
     } else {
         ast::TableOptions::empty()
     };
-    let strict_suffix = if keeps_column_types { " STRICT" } else { "" };
+    let strict_suffix = options
+        .strict_text
+        .as_ref()
+        .map_or(String::new(), |strict| format!(" {strict}"));
     let info = CtasInfo {
         plan,
         schema_sql: format!(
@@ -1036,22 +1039,18 @@ fn ctas_column_type(arms: &[&SelectPlan], column_index: usize, resolver: &Resolv
     if types.all(|ty| ty == first) {
         return first;
     }
-    let common = common_type_of(
-        arms.iter().map(|arm| {
-            let env = TypeEnv::new(Some(&arm.table_references), resolver);
-            type_of(&arm.result_columns[column_index].expr, &env)
-        }),
-        resolver.schema(),
-    );
-    strict_column_type(common)
+    strict_column_type(compound_column_type(
+        arms.iter().copied(),
+        column_index,
+        resolver,
+    ))
 }
 
 /// A column of a STRICT table keeps the type it was declared with, including
 /// its parameters and array dimensions. The name of a type made with CREATE
 /// TYPE or CREATE DOMAIN is quoted when it has to be, such as `"select"` or
-/// `"Mood X"`. A custom type the schema does not know (an enum is not loaded
-/// again when the database is reopened) leaves the column unchecked, as on a
-/// table created without types.
+/// `"Mood X"`. A custom type the schema does not know leaves the column
+/// unchecked, as on a table created without types.
 fn result_column_strict_type(
     select: &SelectPlan,
     column_index: usize,
