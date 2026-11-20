@@ -623,7 +623,7 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
         assert_eq!(row_count, 1, "Should read data with correct key");
     }
 
-    // Step 3: A cached database still validates the key when connecting
+    // Step 3: Opening a cached database must still validate the key.
     {
         let result = Database::open_file_with_flags(
             io.clone(),

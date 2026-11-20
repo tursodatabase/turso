@@ -415,14 +415,14 @@ pub(crate) enum DbHeaderReadState {
 }
 
 /// Resumable pager initialization for opens, connections, and attachments.
-/// Reads the page layout, authenticates encryption, and reads the autovacuum
-/// mode while holding a read transaction.
+/// Reads the page layout and authenticates encryption before building the pager.
+/// A read transaction then protects the page-1 read used to determine the
+/// autovacuum mode. Each I/O read can yield without blocking.
 pub(crate) enum InitState {
+    /// Verifies credentials and reads page 1 on cold opens to authenticate its layout.
     AuthenticateHeader(HeaderAuthenticationState),
     /// Pager built and read-tx open; reading page 1 for the autovacuum mode.
-    ReadPage1 {
-        pager: Box<Pager>,
-    },
+    ReadPage1 { pager: Box<Pager> },
 }
 
 impl Default for InitState {
@@ -3663,6 +3663,8 @@ impl Database {
                             }));
                         }
 
+                        // Read the 512-byte header to recover the page size and reserved-space
+                        // byte before reading the complete encrypted page.
                         let header = return_if_io!(self.read_db_header_buf(hdr_st));
                         let (reserved_space, page_size) =
                             Self::plain_header_page_info(&header, true)?;
@@ -3673,12 +3675,20 @@ impl Database {
                             )
                             .into());
                         }
+                        // Set up encryption context BEFORE decoding the full header page.
+                        // For encrypted databases, page 1 has:
+                        // - Bytes 0-15: Turso magic header (replaces SQLite magic)
+                        // - Bytes 16-99: Unencrypted header metadata
+                        // - Bytes 100+: Encrypted content and per-page encryption metadata
+                        // The encryption context is needed to properly decrypt page 1 when reopening.
                         let mut io_ctx = IOContext::default();
                         io_ctx.set_encryption(EncryptionContext::new(
                             cipher,
                             key,
                             page_size.get() as usize,
                         )?);
+                        // Keep this authentication read out of the page cache. Normal pager
+                        // reads must still choose the current page from the WAL or database file.
                         let buf = Arc::new(Buffer::new_temporary(page_size.get() as usize));
                         let completion = new_header_read_completion(buf.clone());
                         let completion = self.db_file.read_page(1, &io_ctx, completion)?;
@@ -3694,6 +3704,8 @@ impl Database {
                     let (mut reserved_space, header_page_size) = if self.initialized() {
                         let header = return_if_io!(self.read_db_header_buf(hdr_st));
                         if let Some(codec) = page_codec {
+                            // A codec may transform the magic bytes, so a short codec
+                            // file cannot be judged here.
                             if let Some(err) = header.short_read() {
                                 return Err(err.into());
                             }
@@ -3730,6 +3742,7 @@ impl Database {
                     let mut io_ctx = IOContext::default();
                     if reserved_space.is_some_and(|space| space != CHECKSUM_REQUIRED_RESERVED_BYTES)
                     {
+                        // Disable checksums when the required reserved bytes are not present.
                         io_ctx.reset_checksum();
                     }
                     if let Some(codec) = page_codec {

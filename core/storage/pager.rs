@@ -1634,6 +1634,7 @@ impl SharedPagerState {
     }
 
     pub(crate) fn verify_encryption_key(&self, key: &EncryptionKey) -> Result<EncryptionContext> {
+        // The key is not stored in shared database state, so verify it by decrypting the sample.
         let sample = self
             .encryption_verifier
             .as_deref()
