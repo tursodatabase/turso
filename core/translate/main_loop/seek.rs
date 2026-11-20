@@ -6,13 +6,26 @@ use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
 use turso_parser::ast::{self, NullsOrder};
 
-fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
+/// The affinity of each component of `seek_key` from position `first` on. A
+/// component that `stored` marks (`stored[0]` is position `first`) holds the
+/// value as the index stores it and gets none: the comparison affinity is for
+/// the value as read. Text affinity would turn a timestamptz key encoded to
+/// an integer back into text.
+fn index_seek_affinities(
+    seek_def: &SeekDef,
+    seek_key: &SeekKey,
+    first: usize,
+    stored: &[bool],
+) -> String {
     // Apply the constraint's resolved comparison affinity to the seek key,
     // not the indexed column's affinity.
     seek_def
         .iter(seek_key)
         .zip(seek_def.iter_affinity(seek_key))
-        .map(|(key_component, aff)| match key_component {
+        .enumerate()
+        .skip(first)
+        .map(|(i, (key_component, aff))| match key_component {
+            _ if stored.get(i - first) == Some(&true) => affinity::SQLITE_AFF_BLOB,
             SeekKeyComponent::Expr(expr) if aff.expr_needs_no_affinity_change(expr) => {
                 affinity::SQLITE_AFF_BLOB
             }
@@ -25,6 +38,8 @@ fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
 /// `keys` are the keys' expressions, or None for a key that is not one, such
 /// as a value read from a subquery. `in_list_affinity` is the comparison
 /// affinity of an IN list's values, which a key gets before it is encoded.
+/// Returns, for each key, whether its register holds the value in the form
+/// the index stores.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn encode_seek_keys_for_custom_types<'e>(
     program: &mut ProgramBuilder,
@@ -35,7 +50,7 @@ pub(super) fn encode_seek_keys_for_custom_types<'e>(
     idx_col_offset: usize,
     in_list_affinity: Option<&str>,
     resolver: &Resolver<'_>,
-) -> crate::Result<()> {
+) -> crate::Result<Vec<bool>> {
     let table = tables
         .find_table_by_identifier(&seek_index.table_name)
         .or_else(|| tables.find_table_by_table_name(&seek_index.table_name))
@@ -45,6 +60,7 @@ pub(super) fn encode_seek_keys_for_custom_types<'e>(
                 seek_index.name, seek_index.table_name
             ))
         })?;
+    let mut stored = Vec::new();
     for (i, key) in keys.into_iter().enumerate() {
         let idx_col_pos = idx_col_offset + i;
         if idx_col_pos >= seek_index.columns.len() {
@@ -52,6 +68,7 @@ pub(super) fn encode_seek_keys_for_custom_types<'e>(
         }
         let idx_col = &seek_index.columns[idx_col_pos];
         let reg = start_reg + i;
+        stored.push(false);
         // A scan reads a string literal or parameter compared with a value of
         // a custom type as a value of the type, so the key is converted as the
         // scan converts it. A column holds the stored value; an expression
@@ -68,6 +85,8 @@ pub(super) fn encode_seek_keys_for_custom_types<'e>(
             crate::translate::expr::emit_untyped_operand_store(program, &resolved, reg, resolver)?;
             if idx_col.expression().is_some() {
                 crate::translate::expr::emit_decode(program, &resolved, reg, resolver)?;
+            } else {
+                stored[i] = true;
             }
             continue;
         }
@@ -116,8 +135,9 @@ pub(super) fn encode_seek_keys_for_custom_types<'e>(
         } else {
             emit_seek_key_encode(program, &resolved, reg, resolver)?;
         }
+        stored[i] = true;
     }
-    Ok(())
+    Ok(stored)
 }
 
 /// The type of the values the index column holds, as a scan reads them.
@@ -329,7 +349,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         unreachable!("None component is not possible in iterator")
                     }
                 });
-            encode_seek_keys_for_custom_types(
+            let stored = encode_seek_keys_for_custom_types(
                 self.program,
                 self.tables,
                 idx,
@@ -339,7 +359,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 None,
                 &self.t_ctx.resolver,
             )?;
-            let affinities = index_seek_affinities(self.seek_def, &self.seek_def.start);
+            let affinities = index_seek_affinities(self.seek_def, &self.seek_def.start, 0, &stored);
             if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
                 self.program.emit_insn(Insn::Affinity {
                     start_reg: self.start_reg,
@@ -457,7 +477,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     NoConstantOptReason::RegisterReuse,
                 )?;
                 if let Some(idx) = self.seek_index {
-                    encode_seek_keys_for_custom_types(
+                    let stored = encode_seek_keys_for_custom_types(
                         self.program,
                         self.tables,
                         idx,
@@ -467,11 +487,18 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         None,
                         &self.t_ctx.resolver,
                     )?;
-                    let affinities = index_seek_affinities(self.seek_def, &self.seek_def.end);
+                    // As in SQLite, only the last component gets the end key's
+                    // affinity. The prefix components got the start key's.
+                    let affinities = index_seek_affinities(
+                        self.seek_def,
+                        &self.seek_def.end,
+                        self.seek_def.prefix.len(),
+                        &stored,
+                    );
                     if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
                         self.program.emit_insn(Insn::Affinity {
-                            start_reg: self.start_reg,
-                            count: std::num::NonZeroUsize::new(num_regs).unwrap(),
+                            start_reg: last_reg,
+                            count: std::num::NonZeroUsize::new(affinities.len()).unwrap(),
                             affinities,
                         });
                     }

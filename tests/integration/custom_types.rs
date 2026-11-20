@@ -1192,6 +1192,53 @@ mod tests {
         );
     }
 
+    /// A timestamptz index stores integers. A bound text parameter is converted
+    /// to that integer before the seek, and the seek must not turn it back
+    /// into text. Expected rows are PostgreSQL 18's.
+    #[test]
+    fn test_timestamptz_index_seek_with_bound_parameters() {
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id integer, ts timestamptz) STRICT")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO t VALUES (1, '2024-01-05 10:00:00+02'), (2, '2024-01-05 08:00:00.123456Z'), \
+             (4, '2024-01-05'), (5, '2024-01-05 13:30:00+05:30'), (6, '2024-01-07')",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX t_ts_id ON t(ts, id)").unwrap();
+
+        let ids = |sql: &str, params: &[&str]| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            for (i, param) in params.iter().enumerate() {
+                let param = turso_core::Value::build_text(param.to_string());
+                stmt.bind_at((i + 1).try_into().unwrap(), param).unwrap();
+            }
+            let mut ids = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                ids.push(row.get::<i64>(0)?);
+                Ok(())
+            })
+            .unwrap();
+            ids
+        };
+        assert_eq!(
+            ids(
+                "SELECT id FROM t WHERE ts = ?1 AND id < 5 ORDER BY id",
+                &["2024-01-05 10:00:00+02"]
+            ),
+            vec![1]
+        );
+        assert_eq!(
+            ids(
+                "SELECT id FROM t WHERE ts BETWEEN ?1 AND ?2 ORDER BY id",
+                &["2024-01-05", "2024-01-05 08:00:00"]
+            ),
+            vec![1, 4, 5]
+        );
+    }
+
     /// A failed `CREATE TYPE` must not leave `__turso_internal_types` behind: the types table is
     /// registered in the connection schema before the type SQL is parsed, and the rollback
     /// restores that schema only when the schema cookie was set beforehand.
