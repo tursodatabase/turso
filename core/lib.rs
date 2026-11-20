@@ -109,7 +109,6 @@ use crate::{
     busy::{BusyHandler, BusyHandlerCallback},
     index_method::IndexMethod,
     schema::Trigger,
-    storage::encryption::AtomicCipherMode,
     sync::{atomic::AtomicBool, Arc, RwLock},
     vdbe::metrics::ConnectionMetrics,
 };

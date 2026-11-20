@@ -39,6 +39,7 @@ pub struct TempDatabase {
     pub init_sql: Option<String>,
     #[allow(dead_code)]
     pub enable_mvcc: bool,
+    pub encryption: Option<turso_core::EncryptionOpts>,
 }
 unsafe impl Send for TempDatabase {}
 
@@ -53,6 +54,8 @@ pub struct TempDatabaseBuilder {
     io_uring: bool,
     enable_views: bool,
     dialect: Option<Arc<dyn Dialect>>,
+    encryption: Option<turso_core::EncryptionOpts>,
+    page_size: Option<turso_core::storage::sqlite3_ondisk::PageSize>,
 }
 
 struct TestIo {
@@ -139,6 +142,8 @@ impl TempDatabaseBuilder {
             io_uring: false,
             enable_views: false,
             dialect: None,
+            encryption: None,
+            page_size: None,
         }
     }
 
@@ -200,6 +205,19 @@ impl TempDatabaseBuilder {
         self
     }
 
+    pub fn with_encryption(mut self, cipher: &str, hexkey: &str) -> Self {
+        self.encryption = Some(turso_core::EncryptionOpts {
+            cipher: cipher.into(),
+            hexkey: hexkey.into(),
+        });
+        self
+    }
+
+    pub fn with_page_size(mut self, size: u32) -> Self {
+        self.page_size = Some(turso_core::storage::sqlite3_ondisk::PageSize::new(size).unwrap());
+        self
+    }
+
     pub fn build(self) -> TempDatabase {
         let mut opts = self
             .opts
@@ -250,21 +268,25 @@ impl TempDatabaseBuilder {
             }
         };
         let dialect = self.dialect.unwrap_or_else(|| Arc::new(SqliteDialect));
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            db_path.to_str().unwrap(),
-            flags,
-            opts,
-            None,
-            dialect,
-        )
-        .unwrap();
+        let mut options = turso_core::OpenOptions::new(dialect)
+            .flags(flags)
+            .db_opts(opts)
+            .encryption(self.encryption.clone());
+        if let Some(size) = self.page_size {
+            options = options.page_size(size);
+        }
+        let db = Database::open(io.clone(), db_path.to_str().unwrap(), options).unwrap();
+        let connect_opts = || {
+            ConnectOpts::new(SessionRole::Superuser).with_encryption_key(
+                self.encryption
+                    .as_ref()
+                    .map(|opts| turso_core::EncryptionKey::from_hex_string(&opts.hexkey).unwrap()),
+            )
+        };
 
         // Enable MVCC via turso connection if requested
         if self.enable_mvcc {
-            let conn = db
-                .connect(ConnectOpts::new(SessionRole::Superuser))
-                .unwrap();
+            let conn = db.connect(connect_opts()).unwrap();
             conn.pragma_update("journal_mode", "'mvcc'")
                 .expect("enable mvcc");
         }
@@ -277,6 +299,7 @@ impl TempDatabaseBuilder {
             db_flags: flags,
             init_sql: self.init_sql,
             enable_mvcc: self.enable_mvcc,
+            encryption: self.encryption,
         }
     }
 }
@@ -331,7 +354,13 @@ impl TempDatabase {
 
         let conn = self
             .db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .connect(
+                ConnectOpts::new(SessionRole::Superuser).with_encryption_key(
+                    self.encryption.as_ref().map(|opts| {
+                        turso_core::EncryptionKey::from_hex_string(&opts.hexkey).unwrap()
+                    }),
+                ),
+            )
             .unwrap();
         log::debug!("connected to limbo");
         conn

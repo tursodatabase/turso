@@ -174,6 +174,9 @@ impl PageCodec for EncryptionPageCodec {
         input: &[u8],
         output: &mut [u8],
     ) -> Result<()> {
+        if context.page_no == 1 {
+            self.validate_page_one_layout(input)?;
+        }
         // todo(v): once we have in place encryption, we can avoid allocations here
         let encrypted = self.context.encrypt_page(input, context.page_no as usize)?;
         output.copy_from_slice(&encrypted);
@@ -188,7 +191,32 @@ impl PageCodec for EncryptionPageCodec {
     ) -> Result<()> {
         // todo(v): once we have in place encryption, we can avoid allocations here
         let decrypted = self.context.decrypt_page(input, context.page_no as usize)?;
+        if context.page_no == 1 {
+            self.validate_page_one_layout(input)?;
+        }
         output.copy_from_slice(&decrypted);
+        Ok(())
+    }
+}
+
+impl EncryptionPageCodec {
+    fn validate_page_one_layout(&self, page: &[u8]) -> Result<()> {
+        if page.len() < super::sqlite3_ondisk::DatabaseHeader::SIZE {
+            return Err(LimboError::InvalidArgument(
+                "encrypted page 1 is shorter than its header".into(),
+            ));
+        }
+        let size = super::sqlite3_ondisk::PageSize::new_from_header_u16(u16::from_be_bytes([
+            page[16], page[17],
+        ]))?;
+        if size.get() as usize != self.context.page_size()
+            || page.len() != self.context.page_size()
+            || page[20] != self.required_reserved_bytes()
+        {
+            return Err(LimboError::InvalidArgument(
+                "encrypted page layout does not match the cipher".into(),
+            ));
+        }
         Ok(())
     }
 }

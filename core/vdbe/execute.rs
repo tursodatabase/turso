@@ -33,6 +33,7 @@ use crate::storage::btree::{
     PageCategory,
 };
 use crate::storage::database::DatabaseFile;
+use crate::storage::encryption::CipherMode;
 use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{
@@ -10756,7 +10757,12 @@ pub fn op_function(
             assert_eq!(arg_count, 3);
             let filename = state.registers[*start_reg].get_value();
             let dbname = state.registers[*start_reg + 1].get_value();
-            let _key = state.registers[*start_reg + 2].get_value(); // Not used in read-only implementation
+            let key = state.registers[*start_reg + 2].get_value();
+            if !matches!(key, Value::Null) {
+                return Err(LimboError::InvalidArgument(
+                    "ATTACH KEY is not supported; provide cipher and hexkey in the attached database URI".into(),
+                ).into());
+            }
 
             let Value::Text(filename_str) = filename else {
                 return Err(LimboError::InvalidArgument(
@@ -19329,6 +19335,9 @@ fn op_journal_mode_inner(
             }
 
             OpJournalModeSubState::UpdateHeader => {
+                if pager.encryption_cipher() != CipherMode::None {
+                    return_if_io!(state, pager.maybe_allocate_page1());
+                }
                 let new_mode = state
                     .active_op_state
                     .journal_mode()
@@ -20011,7 +20020,7 @@ where
     }
 }
 
-pub fn with_header_mut<T, F>(
+fn with_header_mut<T, F>(
     pager: &Pager,
     mv_store: Option<&Arc<MvStore>>,
     connection: &Arc<Connection>,

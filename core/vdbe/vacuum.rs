@@ -281,11 +281,15 @@ pub(crate) struct VacuumTempDb {
 #[cfg(not(target_family = "wasm"))]
 fn vacuum_temp_db_encryption(
     source_conn: &Arc<Connection>,
+    source_db: &Database,
 ) -> Result<(Option<EncryptionOpts>, Option<EncryptionKey>)> {
+    if source_db.encryption_cipher() == crate::CipherMode::None {
+        return Ok((None, None));
+    }
     let Some(cipher_mode) = source_conn.get_encryption_cipher_mode() else {
         return Ok((None, None));
     };
-    let encryption_key = source_conn.encryption_key.read().clone().ok_or_else(|| {
+    let encryption_key = source_conn.encryption_key.clone().ok_or_else(|| {
         LimboError::InternalError(
             "encrypted in-place VACUUM temp database requires source encryption key".to_string(),
         )
@@ -318,7 +322,7 @@ pub(crate) fn open_vacuum_temp_db(
     #[cfg(test)]
     let test_path = path.clone();
 
-    let (encryption_opts, encryption_key) = vacuum_temp_db_encryption(source_conn)?;
+    let (encryption_opts, encryption_key) = vacuum_temp_db_encryption(source_conn, source_db)?;
     let page_codec = source_conn.pager.load().page_codec_external();
     let db = match &page_codec {
         Some(codec) => Database::open(
@@ -328,15 +332,23 @@ pub(crate) fn open_vacuum_temp_db(
                 .flags(OpenFlags::Create)
                 .db_opts(vacuum_target_opts_from_source(source_db))
                 .encryption(encryption_opts)
+                .page_size(
+                    crate::storage::sqlite3_ondisk::PageSize::new(page_size)
+                        .expect("valid vacuum page size"),
+                )
                 .page_codec(codec.clone()),
         )?,
-        None => Database::open_file_with_flags(
+        None => Database::open(
             source_db.io.clone(),
             &path,
-            OpenFlags::Create,
-            vacuum_target_opts_from_source(source_db),
-            encryption_opts,
-            source_db.dialect(),
+            crate::OpenOptions::new(source_db.dialect())
+                .flags(OpenFlags::Create)
+                .db_opts(vacuum_target_opts_from_source(source_db))
+                .encryption(encryption_opts)
+                .page_size(
+                    crate::storage::sqlite3_ondisk::PageSize::new(page_size)
+                        .expect("valid vacuum page size"),
+                ),
         )?,
     };
     let conn = match page_codec {
@@ -347,7 +359,9 @@ pub(crate) fn open_vacuum_temp_db(
             ConnectOpts::new(SessionRole::Superuser).with_encryption_key(encryption_key),
         )?,
     };
-    conn.reset_page_size(crate::MAIN_DB_ID, page_size)?;
+    if conn.get_encryption_cipher_mode().is_none() {
+        conn.reset_page_size(crate::MAIN_DB_ID, page_size)?;
+    }
     conn.set_reserved_bytes(reserved_space)?;
     conn.wal_auto_actions_disable();
 
@@ -1892,6 +1906,14 @@ fn vacuum_in_place_step(
     loop {
         match phase {
             VacuumInPlacePhase::Preflight => {
+                if db != crate::MAIN_DB_ID
+                    && source_pager.encryption_cipher() != crate::CipherMode::None
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "cannot VACUUM an encrypted attached database".into(),
+                    )
+                    .into());
+                }
                 // 1. Must be in auto-commit mode (no explicit transaction).
                 if !connection.auto_commit.load(Ordering::SeqCst) {
                     return Err(LimboError::TxError(
@@ -3203,7 +3225,7 @@ mod tests {
             temp.conn.get_encryption_cipher_mode(),
             source_conn.get_encryption_cipher_mode()
         );
-        assert!(temp.conn.encryption_key.read().is_some());
+        assert!(temp.conn.encryption_key.is_some());
         assert_eq!(temp.conn.get_reserved_bytes(), Some(reserved_space));
 
         Ok(())
