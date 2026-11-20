@@ -1738,10 +1738,12 @@ mod tests {
     fn the_statements_of_one_query_message_share_now_and_statement_timestamp() {
         let (mut client, _conn) = copy_test_client();
         let events = client
-            .simple_query(&format!("{THREE_TIMES}; {THREE_TIMES}"))
+            .simple_query(&format!(
+                "{THREE_TIMES}; SELECT count(*) FROM generate_series(1, 100000); {THREE_TIMES}"
+            ))
             .unwrap();
         let rows = data_rows(&events);
-        let [first, second] = &rows[..] else {
+        let [first, _, second] = &rows[..] else {
             panic!("{events:?}");
         };
         assert_eq!(first[0], second[0], "now()");
