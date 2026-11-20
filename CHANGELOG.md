@@ -1,6 +1,21 @@
 # Changelog
 
-## 0.8.2 -- 2026-10-12
+## 0.8.4 -- 2026-11-20
+
+### Updated
+
+* ci: build macOS release binaries on macos-15 runners (Pekka Enberg)
+* deps: update rustls to 0.23.45 to reject misaligned TLS 1.3 handshake messages (Pekka Enberg)
+
+### Fixed
+
+* core/translate: read the UPSERT DO UPDATE before image before the write (Jussi Saurio)
+* core/statement: only roll back autocommit transaction after schema update (Pekka Enberg)
+* bindings/javascript: bind statement parameters while holding the exec lock (turso-github-handyman)
+* core/translate: open a statement savepoint for UPDATEs that change the rowid (Nikita Sivukhin)
+* core/translate: collect DELETE rowids first when an FK action can fire (Pere Diaz Bou)
+
+## 0.8.3 -- 2026-10-12
 
 ### Fixed
 
