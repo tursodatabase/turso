@@ -100,7 +100,7 @@ fn translate_compared_value(
     reg: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    match untyped_operand_type(operand, other, referenced_tables, resolver)? {
+    match compared_operand_type(operand, other, referenced_tables, resolver)? {
         Some(resolved) => translate_untyped_operand_as(
             program,
             referenced_tables,
@@ -153,14 +153,15 @@ pub(crate) fn translate_in_lhs_for_element(
             for (i, component) in components.iter().enumerate() {
                 let other = row_value_component_expr(element, i)?;
                 if let Some(resolved) =
-                    untyped_operand_type(component, &other, referenced_tables, resolver)?
+                    compared_operand_type(component, &other, referenced_tables, resolver)?
                 {
                     converted.push((i, component.as_ref(), resolved));
                 }
             }
         }
         _ => {
-            if let Some(resolved) = untyped_operand_type(lhs, element, referenced_tables, resolver)?
+            if let Some(resolved) =
+                compared_operand_type(lhs, element, referenced_tables, resolver)?
             {
                 converted.push((0, lhs, resolved));
             }
@@ -366,8 +367,10 @@ pub(crate) fn translate_untyped_value(
     Ok(true)
 }
 
-/// Translates the string literal or parameter `operand` into `reg` as a value
-/// of `resolved`: stored as a column of the type stores it, then read back.
+/// Translates `operand`, a string literal or parameter or a value of an
+/// earlier date/time type (see [read_compared_operand_as]), into `reg` as a
+/// value of `resolved`: stored as a column of the type stores it, then read
+/// back.
 pub(crate) fn translate_untyped_operand_as(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
@@ -376,8 +379,10 @@ pub(crate) fn translate_untyped_operand_as(
     reg: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    // The operand is a constant, so its conversion is computed once with it.
-    let constant_span = (!program.constant_span_is_open()).then(|| program.constant_span_start());
+    // A string literal or parameter is a constant, so its conversion is
+    // computed once with it. A column is read again for each row.
+    let constant_span = (is_untyped_operand(operand)? && !program.constant_span_is_open())
+        .then(|| program.constant_span_start());
     translate_expr(program, referenced_tables, operand, reg, resolver)?;
     emit_untyped_operand_store(program, resolved, reg, resolver)?;
     emit_decode(program, resolved, reg, resolver)?;
@@ -387,22 +392,104 @@ pub(crate) fn translate_untyped_operand_as(
     Ok(reg)
 }
 
-/// The type a string literal or parameter compared with `other` is read as,
-/// or None when it is compared as written.
-pub(crate) fn untyped_operand_type(
+/// The type `operand` compared with `other` is read as, or None when it is
+/// compared as written. See [read_compared_operand_as].
+pub(crate) fn compared_operand_type(
     operand: &ast::Expr,
     other: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
 ) -> Result<Option<ResolvedType>> {
-    read_untyped_operand_as(operand, resolver.schema(), || {
-        Ok(type_of(other, &TypeEnv::new(referenced_tables, resolver)))
-    })
+    let env = TypeEnv::new(referenced_tables, resolver);
+    read_compared_operand_as(
+        operand,
+        resolver.schema(),
+        || type_of(operand, &env),
+        || Ok(type_of(other, &env)),
+    )
+}
+
+/// The type `operand`, a value of `operand_type`, is read as when it is
+/// compared with a value of `other_type`, or None when it is compared as it
+/// is. A string literal or parameter is read as the other value's type (see
+/// [read_untyped_operand_as]). Of two values of different types among date,
+/// timestamp and timestamptz, the one of the earlier type is read as the
+/// later type, as PostgreSQL reads it: a date as midnight of that day, a
+/// timestamp as that time in UTC. Scans, index seeks and the choice of
+/// indexes all decide here, so they read the same rows.
+pub(crate) fn read_compared_operand_as(
+    operand: &ast::Expr,
+    schema: &crate::schema::Schema,
+    operand_type: impl FnOnce() -> ExprType,
+    other_type: impl FnOnce() -> Result<ExprType>,
+) -> Result<Option<ResolvedType>> {
+    if schema.type_registry.is_empty() {
+        return Ok(None);
+    }
+    if is_untyped_operand(operand)? {
+        return read_untyped_operand_as(operand, schema, other_type);
+    }
+    let Some(later) = later_date_time_type(&operand_type(), &other_type()?, schema)? else {
+        return Ok(None);
+    };
+    let resolved = schema.resolve_type_unchecked(&later.name)?.ok_or_else(|| {
+        LimboError::InternalError(format!("type {} does not resolve", later.name))
+    })?;
+    Ok(Some(resolved))
+}
+
+/// The type a value of `operand_type` is read as when it is compared with a
+/// value of `other_type`: `other_type` when both are among date, timestamp and
+/// timestamptz and `other_type` comes later in that list. Fails when the two
+/// are different custom types and one of them is a date, timestamp or
+/// timestamptz but not both: PostgreSQL has no operator that compares them,
+/// and comparing their texts would give answers nobody asked for, such as a
+/// date never equal to a timestamp.
+pub(crate) fn later_date_time_type(
+    operand_type: &ExprType,
+    other_type: &ExprType,
+    schema: &crate::schema::Schema,
+) -> Result<Option<Arc<TypeDef>>> {
+    let custom = |ty: &ExprType| -> Result<Option<Arc<TypeDef>>> {
+        match ty {
+            ExprType::Custom { type_def, .. } => schema.without_domains(type_def),
+            ExprType::Array { .. }
+            | ExprType::Builtin(_)
+            | ExprType::Untyped
+            | ExprType::Null
+            | ExprType::Unknown
+            | ExprType::RowValue
+            | ExprType::NotKnownYet => Ok(None),
+        }
+    };
+    let (Some(operand), Some(other)) = (custom(operand_type)?, custom(other_type)?) else {
+        return Ok(None);
+    };
+    if operand.name.eq_ignore_ascii_case(&other.name) {
+        return Ok(None);
+    }
+    match (date_time_rank(&operand), date_time_rank(&other)) {
+        (Some(operand_rank), Some(other_rank)) => Ok((operand_rank < other_rank).then_some(other)),
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => crate::bail_parse_error!(
+            "cannot compare type {} with type {}",
+            operand.name,
+            other.name
+        ),
+    }
+}
+
+/// The position of a type in date, timestamp, timestamptz, the order in which
+/// PostgreSQL converts one of them to another when they are compared.
+fn date_time_rank(type_def: &TypeDef) -> Option<u8> {
+    ["date", "timestamp", "timestamptz"]
+        .iter()
+        .position(|name| type_def.name.eq_ignore_ascii_case(name))
+        .map(|rank| rank as u8)
 }
 
 /// The type a string literal or parameter compared with a value of
-/// `other_type` is read as, or None when it is compared as written. Scans and
-/// index seeks both decide here, so they read the same rows.
+/// `other_type` is read as, or None when it is compared as written.
 pub(crate) fn read_untyped_operand_as(
     operand: &ast::Expr,
     schema: &crate::schema::Schema,

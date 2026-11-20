@@ -785,6 +785,16 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
             let operands =
                 std::iter::once(lhs.as_ref()).chain(rhs.iter().map(|item| item.as_ref()));
             common_type_ordering(operands.map(|expr| (expr, context)))?;
+            // Compiled as `lhs = item` for each item.
+            let env = context.type_env();
+            let lhs_type = type_of(lhs, &env);
+            for item in rhs {
+                crate::translate::expr::later_date_time_type(
+                    &lhs_type,
+                    &type_of(item, &env),
+                    context.schema(),
+                )?;
+            }
             Ok(())
         }
         // Compiled as `base = when` for each WHEN.
@@ -854,6 +864,12 @@ fn check_comparison(lhs: &Expr, rhs: &Expr, context: &ExprContext<'_, '_>) -> Re
         return Ok(());
     }
     common_type_ordering([(lhs, context), (rhs, context)])?;
+    let env = context.type_env();
+    crate::translate::expr::later_date_time_type(
+        &type_of(lhs, &env),
+        &type_of(rhs, &env),
+        context.schema(),
+    )?;
     Ok(())
 }
 

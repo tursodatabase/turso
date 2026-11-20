@@ -1,6 +1,6 @@
 use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
-use crate::translate::expr::comparison_affinity;
+use crate::translate::expr::{compared_operand_type, comparison_affinity};
 use crate::translate::expr_context::{ExprContext, ExprProperties, TableMetadata};
 use crate::{
     schema::{Column, Index, IndexColumn, Schema},
@@ -887,6 +887,23 @@ pub fn table_constraints_from_where_clause(
                 }
                 _ => None,
             };
+            // A side that the comparison reads as a later date/time type, such
+            // as a date compared with a timestamp, is not compared as the index
+            // on it holds it, so no index on it serves the term.
+            let read_as_other_type = |operand: &ast::Expr, other: &ast::Expr| -> Result<bool> {
+                match operator.as_ast_operator() {
+                    Some(op) if op.is_comparison() => Ok(compared_operand_type(
+                        operand,
+                        other,
+                        Some(table_references),
+                        resolver,
+                    )?
+                    .is_some()),
+                    _ => Ok(false),
+                }
+            };
+            let lhs_read_as_other_type = read_as_other_type(lhs, rhs)?;
+            let rhs_read_as_other_type = read_as_other_type(rhs, lhs)?;
             let is_op = matches!(operator.as_ast_operator(), Some(ast::Operator::Is));
             let outer_join_compatible = can_use_before_null_extension(is_op);
             // See [Constraint::null_matching]. The constraining value sits
@@ -895,6 +912,7 @@ pub fn table_constraints_from_where_clause(
                 |constraining_expr: &ast::Expr| is_op && !is_non_null_literal(constraining_expr);
             // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
             match lhs {
+                _ if lhs_read_as_other_type => {}
                 ast::Expr::Column { table, column, .. } => {
                     if *table == table_reference.internal_id {
                         let table_column = &table_reference.table.columns()[*column];
@@ -1001,6 +1019,7 @@ pub fn table_constraints_from_where_clause(
                 _ => {}
             };
             match rhs {
+                _ if rhs_read_as_other_type => {}
                 ast::Expr::Column { table, column, .. } => {
                     if *table == table_reference.internal_id {
                         let table_column = &table_reference.table.columns()[*column];
@@ -1147,7 +1166,17 @@ pub fn table_constraints_from_where_clause(
                 )
             })?);
 
+            // An element that reads the left side as a later date/time type,
+            // such as a timestamp compared with a date column, is not compared
+            // with the value the index on the column holds.
+            let mut lhs_read_as_other_type = false;
+            for rhs_expr in rhs.iter() {
+                lhs_read_as_other_type |=
+                    compared_operand_type(lhs, rhs_expr, Some(table_references), resolver)?
+                        .is_some();
+            }
             match lhs.as_ref() {
+                _ if lhs_read_as_other_type => {}
                 ast::Expr::Column { table, column, .. }
                     if *table == table_reference.internal_id =>
                 {

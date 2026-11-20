@@ -12,7 +12,7 @@ use crate::stats::AnalyzeStats;
 use crate::translate::collate::comparison_collation;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
-    as_binary_components, do_comparison_affinity, walk_expr, WalkControl,
+    as_binary_components, compared_operand_type, do_comparison_affinity, walk_expr, WalkControl,
 };
 use crate::translate::expr_context::ExprContext;
 use crate::translate::optimizer::constraints::{
@@ -1347,6 +1347,13 @@ pub(super) fn tables_in_hashable_equal_test(
         return Ok(None);
     }
     if !comparison_collation(left, right, &ExprContext::new(Some(tables), resolver))?.can_hash() {
+        return Ok(None);
+    }
+    // A key that the comparison reads as a later date/time type, such as a
+    // date compared with a timestamp, would be hashed as it is written.
+    if compared_operand_type(left, right, Some(tables), resolver)?.is_some()
+        || compared_operand_type(right, left, Some(tables), resolver)?.is_some()
+    {
         return Ok(None);
     }
     Ok(Some((left_table, right_table)))

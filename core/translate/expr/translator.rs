@@ -382,7 +382,7 @@ fn translate_subquery_result_expr(
             let lhs_column_count = lhs_columns.len();
             let lhs_column_regs_start = program.alloc_registers(lhs_column_count);
             for (i, lhs_column) in lhs_columns.iter().enumerate() {
-                let read_as = read_untyped_operand_as(lhs_column, resolver.schema(), || {
+                let column_type = || {
                     let column_types = resolver
                         .in_subquery_column_types
                         .get(*subquery_id)
@@ -396,7 +396,22 @@ fn translate_subquery_result_expr(
                             "IN subquery {subquery_id} has no result column {i}"
                         ))
                     })
-                })?;
+                };
+                // The subquery's values are not converted to a later date/time
+                // type, and a seek on an index of the left side would not
+                // convert the left side, so two different date/time types are
+                // not compared here.
+                let lhs_type = type_of(lhs_column, &TypeEnv::new(referenced_tables, resolver));
+                let rhs_type = column_type()?;
+                if later_date_time_type(&lhs_type, &rhs_type, resolver.schema())?.is_some()
+                    || later_date_time_type(&rhs_type, &lhs_type, resolver.schema())?.is_some()
+                {
+                    crate::bail_parse_error!(
+                        "cannot compare type {lhs_type} with type {rhs_type} in IN (SELECT ...)"
+                    );
+                }
+                let read_as =
+                    read_untyped_operand_as(lhs_column, resolver.schema(), || Ok(rhs_type))?;
                 match read_as {
                     Some(resolved) => {
                         translate_untyped_operand_as(
@@ -733,7 +748,7 @@ fn translate_case_expr(
     for (when_expr, then_expr) in when_then_pairs {
         let when_type = match base {
             Some(base_expr) => {
-                untyped_operand_type(when_expr, base_expr, referenced_tables, resolver)?
+                compared_operand_type(when_expr, base_expr, referenced_tables, resolver)?
             }
             None => None,
         };
@@ -759,6 +774,28 @@ fn translate_case_expr(
                 resolver,
                 NoConstantOptReason::RegisterReuse,
             )?,
+        };
+        // A base of an earlier date/time type than the WHEN value, such as a
+        // date compared with a timestamp, is read as the WHEN value's type,
+        // in a register of its own so that the next WHEN sees the base as it is.
+        let base_reg = match (base, base_reg) {
+            (Some(base_expr), Some(base_reg)) => {
+                match compared_operand_type(base_expr, when_expr, referenced_tables, resolver)? {
+                    Some(resolved) => {
+                        let reg = program.alloc_register();
+                        program.emit_insn(Insn::Copy {
+                            src_reg: base_reg,
+                            dst_reg: reg,
+                            extra_amount: 0,
+                        });
+                        emit_untyped_operand_store(program, &resolved, reg, resolver)?;
+                        emit_decode(program, &resolved, reg, resolver)?;
+                        Some(reg)
+                    }
+                    None => Some(base_reg),
+                }
+            }
+            _ => base_reg,
         };
         match base_reg {
             // CASE 1 WHEN 0 THEN 0 ELSE 1 becomes 1==0, Ne branch to next clause
