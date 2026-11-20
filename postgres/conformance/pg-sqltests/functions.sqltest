@@ -2977,3 +2977,55 @@ test clock-timestamp-has-microseconds {
 expect {
     1
 }
+
+# date_trunc truncates a timestamptz to each unit. Weeks start on Monday, and
+# centuries and millennia start at years ending in 01. Each row whose
+# truncated value equals the expected value is listed.
+test date-trunc-timestamptz-units {
+    CREATE TABLE trunc_units (unit text, expected timestamptz);
+    INSERT INTO trunc_units VALUES
+        ('microseconds', '2026-10-08 12:34:56.789123+00'),
+        ('milliseconds', '2026-10-08 12:34:56.789+00'),
+        ('second', '2026-10-08 12:34:56+00'),
+        ('minute', '2026-10-08 12:34:00+00'),
+        ('hour', '2026-10-08 12:00:00+00'),
+        ('day', '2026-10-08 00:00:00+00'),
+        ('week', '2026-10-05 00:00:00+00'),
+        ('month', '2026-10-01 00:00:00+00'),
+        ('quarter', '2026-10-01 00:00:00+00'),
+        ('year', '2026-01-01 00:00:00+00'),
+        ('decade', '2020-01-01 00:00:00+00'),
+        ('century', '2001-01-01 00:00:00+00'),
+        ('millennium', '2001-01-01 00:00:00+00');
+    SELECT unit FROM trunc_units
+    WHERE date_trunc(unit, '2026-10-08 12:34:56.789123+00'::timestamptz) = expected
+    ORDER BY unit;
+}
+expect {
+    century
+    day
+    decade
+    hour
+    microseconds
+    millennium
+    milliseconds
+    minute
+    month
+    quarter
+    second
+    week
+    year
+}
+
+# date_trunc of a timestamptz column, a typical "events per day" query.
+test date-trunc-group-by-day {
+    CREATE TABLE trunc_events (at timestamptz);
+    INSERT INTO trunc_events VALUES ('2026-10-08 01:00:00+00'), ('2026-10-08 23:59:59.999999+00'),
+        ('2026-10-09 00:00:00+00'), (NULL);
+    SELECT count(*) FROM trunc_events GROUP BY date_trunc('day', at) ORDER BY date_trunc('day', at) NULLS LAST;
+}
+expect {
+    2
+    1
+    1
+}

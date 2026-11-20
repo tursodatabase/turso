@@ -121,6 +121,10 @@ other forms; relation oid and pretty printing do not change the output),
 `pg_input_is_valid`, `to_char` (numeric; other argument types fail with
 0A000), `now`/`clock_timestamp`/
 `transaction_timestamp`/`statement_timestamp`. `to_timestamp` fails with 0A000.
+`date_trunc(text, timestamptz)` for the units microseconds, milliseconds,
+second, minute, hour, day, week, month, quarter, year, decade, century and
+millennium; other units and other argument types, such as timestamp, fail with
+0A000.
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
 forms; the first schema of `search_path` that exists), `current_schemas(boolean)`
