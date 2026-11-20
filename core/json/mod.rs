@@ -16,6 +16,7 @@ use crate::numeric::{str_to_i64, Numeric};
 use crate::types::{validate_utf8, AsValueRef, Text, TextSubtype, Value, ValueBlob, ValueType};
 use crate::vdbe::value::{first_nul, sqlite_text_prefix};
 use crate::{LimboError, ValueRef};
+use cache::CachedJsonPath;
 pub use cache::JsonCacheCell;
 use jsonb::{
     jsonb_error_position, unescape_string, utf8_lossy, validate_jsonb, ElementType, Jsonb,
@@ -360,7 +361,7 @@ pub fn json_array_length(
         return Ok(Value::from_i64(len as i64));
     }
 
-    let path = json_path_from_db_value(path.expect("We already checked none"), true)?;
+    let path = cached_json_path(json_cache, path.expect("We already checked none"), true)?;
 
     if let Some(path) = path {
         let mut op = SearchOperation::locate();
@@ -403,7 +404,7 @@ where
             crate::LimboError::InternalError("args should have second element in loop".to_string())
         })?;
 
-        if let Some(path) = json_edit_path(&first, &second)? {
+        if let Some(path) = json_edit_path(json_cache, &first, &second)? {
             let value = convert_dbtype_to_jsonb(second, Conv::SetValue)?;
             let mut op = SetOperation::new(value);
             let _ = json.operate_on_path(&path, &mut op);
@@ -445,7 +446,7 @@ where
         let second = args.next().ok_or_else(|| {
             crate::LimboError::InternalError("args should have second element in loop".to_string())
         })?;
-        if let Some(path) = json_edit_path(&first, &second)? {
+        if let Some(path) = json_edit_path(json_cache, &first, &second)? {
             let value = convert_dbtype_to_jsonb(second, Conv::SetValue)?;
             let mut op = SetOperation::new(value);
             let _ = json.operate_on_path(&path, &mut op);
@@ -471,7 +472,7 @@ pub fn json_arrow_extract(
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
-    if let Some(path) = json_path_from_db_value(&path, false)? {
+    if let Some(path) = cached_json_path(json_cache, &path, false)? {
         let mut op = SearchOperation::locate();
         let res = json.operate_on_path(&path, &mut op);
         let extracted = op.into_element(json);
@@ -498,7 +499,7 @@ pub fn json_arrow_shift_extract(
     }
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
-    if let Some(path) = json_path_from_db_value(&path, false)? {
+    if let Some(path) = cached_json_path(json_cache, &path, false)? {
         let mut op = SearchOperation::locate();
         let res = json.operate_on_path(&path, &mut op);
         let extracted = op.into_element(json);
@@ -547,7 +548,7 @@ where
     let jsonb = json_cache.get_or_insert_with(value, convert_to_jsonb)?;
     // The result is an SQL value or JSON text, which does not keep the
     // buffer of the element.
-    let (json, element_type) = jsonb_extract_internal(jsonb, paths, true)?;
+    let (json, element_type) = jsonb_extract_internal(jsonb, paths, true, json_cache)?;
 
     let result = json_string_to_db_type(json, element_type, OutputVariant::ElementType)?;
 
@@ -575,7 +576,7 @@ where
     let convert_to_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let jsonb = json_cache.get_or_insert_with(value, convert_to_jsonb)?;
 
-    let (json, element_type) = jsonb_extract_internal(jsonb, paths, false)?;
+    let (json, element_type) = jsonb_extract_internal(jsonb, paths, false, json_cache)?;
     let output_variant = match element_type {
         ElementType::ARRAY | ElementType::OBJECT => OutputVariant::Binary,
         _ => OutputVariant::ElementType,
@@ -593,6 +594,7 @@ fn jsonb_extract_internal<E, V>(
     value: Jsonb,
     mut paths: E,
     in_place: bool,
+    json_cache: &JsonCacheCell,
 ) -> crate::Result<(Jsonb, ElementType)>
 where
     V: AsValueRef,
@@ -604,7 +606,7 @@ where
         let first_path = paths.next().ok_or_else(|| {
             crate::LimboError::InternalError("paths should have one element".to_string())
         })?;
-        if let Some(path) = json_path_from_db_value(&first_path, true)? {
+        if let Some(path) = cached_json_path(json_cache, &first_path, true)? {
             let mut json = value;
 
             let mut op = if in_place {
@@ -637,7 +639,7 @@ where
 
     // TODO: make an op to avoid creating new json for every path element
     for path in paths {
-        let path = json_path_from_db_value(&path, true);
+        let path = cached_json_path(json_cache, &path, true);
         if let Some(path) = path? {
             let mut op = SearchOperation::locate();
             let res = json.operate_on_path(&path, &mut op);
@@ -897,6 +899,23 @@ fn json_path_from_db_value<'a>(
     Ok(Some(json_path_from_text(text, strict)?))
 }
 
+/// Like [json_path_from_db_value], but a TEXT path comes from the path cache
+/// of `json_cache`, so a path that the statement gives for each row is
+/// parsed once.
+fn cached_json_path<'a>(
+    json_cache: &JsonCacheCell,
+    path: &'a (impl AsValueRef + 'a),
+    strict: bool,
+) -> crate::Result<Option<CachedJsonPath<'a>>> {
+    if let ValueRef::Text(text) = path.as_value_ref() {
+        let text = sqlite_text_prefix(text.as_str());
+        return json_cache
+            .path(text, strict, |text| json_path_from_text(text, strict))
+            .map(Some);
+    }
+    Ok(json_path_from_db_value(path, strict)?.map(CachedJsonPath::Parsed))
+}
+
 /// Like SQLite, a BLOB path is read as text, and the path ends at the first NUL.
 pub(crate) fn json_path_text(path: ValueRef<'_>) -> Option<Cow<'_, str>> {
     match path {
@@ -925,13 +944,14 @@ fn json_path_from_text(text: &str, strict: bool) -> crate::Result<JsonPath<'_>> 
 /// to start with `$`, before the rest of the path is parsed, and is not looked
 /// at when the path is NULL.
 fn json_edit_path<'a>(
+    json_cache: &JsonCacheCell,
     path: &'a (impl AsValueRef + 'a),
     value: &impl AsValueRef,
-) -> crate::Result<Option<JsonPath<'a>>> {
+) -> crate::Result<Option<CachedJsonPath<'a>>> {
     if json_path_text(path.as_value_ref()).is_some_and(|text| text.starts_with('$')) {
         ensure_blob_arg_is_jsonb(value.as_value_ref())?;
     }
-    json_path_from_db_value(path, true)
+    cached_json_path(json_cache, path, true)
 }
 
 pub fn json_document_to_db_type(
