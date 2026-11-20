@@ -1337,16 +1337,7 @@ impl Jsonb {
                     string.push_str(value);
                 }
             };
-            match element_type {
-                ElementType::TEXT
-                | ElementType::TEXTRAW
-                | ElementType::TEXTJ
-                | ElementType::TEXT5 => {
-                    current_cursor =
-                        self.serialize_string(string, current_cursor, len, &element_type, true)?;
-                }
-                _ => bail_parse_error!("malformed JSON"),
-            }
+            current_cursor = self.serialize_key(string, current_cursor, len, element_type)?;
 
             string.push(':');
             if indent.is_pretty() {
@@ -1414,6 +1405,42 @@ impl Jsonb {
         string.push(']');
 
         Ok(current_cursor)
+    }
+
+    /// Writes the object key of type `element_type` with the `len`-byte
+    /// payload at `cursor`, with [Self::serialize_string]. Most keys are TEXT
+    /// and ASCII with no byte to escape, and this copy of the fast path of
+    /// [Self::serialize_string] for them can be inlined into the object loop,
+    /// without the call.
+    #[inline]
+    fn serialize_key(
+        &self,
+        string: &mut String,
+        cursor: usize,
+        len: usize,
+        element_type: ElementType,
+    ) -> Result<usize> {
+        match element_type {
+            ElementType::TEXT => {
+                let payload = cursor
+                    .checked_add(len)
+                    .and_then(|end| self.data.get(cursor..end));
+                if let Some(text) = payload
+                    .and_then(validate_utf8)
+                    .filter(|text| !text.bytes().any(|b| ESCAPED_IN_TEXT[b as usize]))
+                {
+                    string.push('"');
+                    string.push_str(text);
+                    string.push('"');
+                    return Ok(cursor + len);
+                }
+                self.serialize_string(string, cursor, len, &element_type, true)
+            }
+            ElementType::TEXTRAW | ElementType::TEXTJ | ElementType::TEXT5 => {
+                self.serialize_string(string, cursor, len, &element_type, true)
+            }
+            _ => bail_parse_error!("malformed JSON"),
+        }
     }
 
     fn serialize_string(
