@@ -316,9 +316,7 @@ fn convert_timestamps_in_compound(
     if schema.type_registry.is_empty() {
         return;
     }
-    let type_named = |ty: &ExprType, name: &str| {
-        matches!(ty, ExprType::Custom { type_def, .. } if type_def.name.eq_ignore_ascii_case(name))
-    };
+    let type_named = |ty: &ExprType, name: &str| matches!(ty, ExprType::Custom { type_def, .. } if type_def.name.eq_ignore_ascii_case(name));
     let num_columns = last.result_columns.len();
     let mut arms: Vec<&mut SelectPlan> = left.iter_mut().map(|(plan, _)| plan).collect();
     arms.push(last);
@@ -346,7 +344,10 @@ fn convert_timestamps_in_compound(
             if result_column.alias.is_none() {
                 result_column.implicit_column_name = name;
             }
-            let expr = std::mem::replace(&mut result_column.expr, ast::Expr::Literal(ast::Literal::Null));
+            let expr = std::mem::replace(
+                &mut result_column.expr,
+                ast::Expr::Literal(ast::Literal::Null),
+            );
             result_column.expr = ast::Expr::cast(
                 expr,
                 Some(ast::Type {
