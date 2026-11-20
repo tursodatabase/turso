@@ -33,6 +33,49 @@ expect @tursopg error {
     type "date" is not supported
 }
 
+# Only text is read as a timestamp: 20240105 is a number, not 2024-01-05.
+test datetime-input-integer-stored-as-timestamptz-is-refused {
+    CREATE TABLE n (id int, tz timestamptz);
+    INSERT INTO n VALUES (1, 20240105);
+}
+@sqlstate 42804
+expect error {
+    column "tz" is of type timestamp with time zone but expression is of type integer
+}
+@sqlstate 0A000
+expect @tursopg error {
+    converting a number to timestamp with time zone is not supported
+}
+
+test datetime-input-integer-stored-as-timestamp-by-update-is-refused {
+    CREATE TABLE n (id int, ts timestamp);
+    INSERT INTO n VALUES (1, '2024-01-05');
+    UPDATE n SET ts = 5;
+}
+@sqlstate 42804
+expect error {
+    column "ts" is of type timestamp without time zone but expression is of type integer
+}
+@sqlstate 0A000
+expect @tursopg error {
+    converting a number to timestamp is not supported
+}
+
+# PostgreSQL refuses the DEFAULT when the table is created, tursopg when a row
+# uses it.
+test datetime-input-integer-default-of-timestamptz-is-refused {
+    CREATE TABLE n (id int, tz timestamptz DEFAULT 20240105);
+    INSERT INTO n (id) VALUES (1);
+}
+@sqlstate 42804
+expect error {
+    column "tz" is of type timestamp with time zone but default expression is of type integer
+}
+@sqlstate 0A000
+expect @tursopg error {
+    converting a number to timestamp with time zone is not supported
+}
+
 test datetime-input-keeps-microseconds {
     CREATE TABLE t (id int, tm time, ts timestamp, tz timestamptz);
     INSERT INTO t VALUES (1, '10:00:00.123456', '2024-01-05 10:00:00.123456', '2024-01-05 10:00:00.123456+00:00');
@@ -269,8 +312,9 @@ expect @tursopg error {
     type "time" is not supported
 }
 
-# PostgreSQL accepts the values below. Turso stores these types as text that
-# must sort in time order, which these values would not, so it rejects them.
+# PostgreSQL accepts the values below. Turso compares these types by their
+# text, which must sort in time order. The text of these values would not, so
+# it rejects them.
 
 @skip-if postgres "PostgreSQL accepts BC dates"
 test datetime-input-rejects-bc {
@@ -315,6 +359,8 @@ test datetime-input-rejects-posix-time-zone {
 expect error {
     invalid input syntax for type timestamp: "2024-01-05 z10:00"
 }
+@sqlstate 0A000
+expect @tursopg error {}
 
 # A string compared with a date or time column is read as a value of the
 # column's type, in any input form, whether the query scans the table or
@@ -322,14 +368,16 @@ expect error {
 
 setup datetime-compare-no-index {
     CREATE TABLE c (id int, ts timestamp, tz timestamptz);
-    INSERT INTO c VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00');
+    INSERT INTO c VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00'),
+        (2, NULL, '2024-01-05 13:30:00.000001+05:30');
 }
 
 setup datetime-compare-index {
     CREATE TABLE c (id int, ts timestamp, tz timestamptz);
     CREATE INDEX c_ts ON c (ts);
-    CREATE INDEX c_tz ON c (tz);
-    INSERT INTO c VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00');
+    CREATE INDEX c_tz ON c (tz, id);
+    INSERT INTO c VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00'),
+        (2, NULL, '2024-01-05 13:30:00.000001+05:30');
 }
 
 @setup datetime-compare-no-index
@@ -381,6 +429,42 @@ expect {
 }
 
 @setup datetime-compare-no-index
+test datetime-compare-timestamptz-forms-scan {
+    SELECT id FROM c WHERE tz = '2024-01-05T08:00:00.000001Z';
+    SELECT id FROM c WHERE tz IN ('2024-01-05 12:00:00+02', '2024-01-06', NULL);
+    SELECT id FROM c WHERE tz BETWEEN '2024-01-05' AND '2024-01-05 08:00:00.000001';
+    SELECT id FROM c WHERE tz < '2024-01-05 08:00:00.000002';
+    SELECT id FROM c WHERE tz = CAST('2024-01-05 08:00:00.000001' AS timestamptz) AND id < 5;
+    SELECT id FROM c WHERE tz = (SELECT max(tz) FROM c);
+}
+expect {
+    2
+    1
+    2
+    2
+    2
+    1
+}
+
+@setup datetime-compare-index
+test datetime-compare-timestamptz-forms-index {
+    SELECT id FROM c WHERE tz = '2024-01-05T08:00:00.000001Z';
+    SELECT id FROM c WHERE tz IN ('2024-01-05 12:00:00+02', '2024-01-06', NULL);
+    SELECT id FROM c WHERE tz BETWEEN '2024-01-05' AND '2024-01-05 08:00:00.000001';
+    SELECT id FROM c WHERE tz < '2024-01-05 08:00:00.000002';
+    SELECT id FROM c WHERE tz = CAST('2024-01-05 08:00:00.000001' AS timestamptz) AND id < 5;
+    SELECT id FROM c WHERE tz = (SELECT max(tz) FROM c);
+}
+expect {
+    2
+    1
+    2
+    2
+    2
+    1
+}
+
+@setup datetime-compare-no-index
 test datetime-compare-timestamp-t-form-scan {
     SELECT id FROM c WHERE ts > '2024-01-05T09:00';
 }
@@ -423,14 +507,262 @@ expect @tursopg error {
     type "date" is not supported
 }
 
-# With the session time zone UTC, a timestamp equals the timestamptz of the
-# same wall-clock time.
-@requires strict "uses STRICT tables"
-test datetime-timestamp-equals-timestamptz {
-    CREATE TABLE t(id INTEGER, ts timestamp, tz timestamptz) STRICT;
-    INSERT INTO t VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00');
-    INSERT INTO t VALUES (2, '2024-01-05 10:00:00', '2024-01-05 10:00:00+02');
-    SELECT id FROM t WHERE ts = tz;
+# A timestamptz orders by its instant, whatever offset it was written with.
+test datetime-timestamptz-order {
+    CREATE TABLE o (id int, tz timestamptz);
+    INSERT INTO o VALUES (1, '2024-01-05 10:00:00+02'), (2, '2024-01-05 08:00:00.000001Z'),
+        (3, '2024-01-05 13:29:59.999999+05:30'), (4, '0001-01-01'), (5, '9999-12-31 23:59:59.999999');
+    SELECT id FROM o ORDER BY tz;
+    SELECT min(tz)::text, max(tz) FROM o;
+}
+expect {
+    4
+    3
+    1
+    2
+    5
+    0001-01-01 00:00:00+00|9999-12-31 23:59:59.999999+00
+}
+
+test datetime-timestamptz-copied-between-columns {
+    CREATE TABLE a (tz timestamptz, tz2 timestamptz);
+    INSERT INTO a VALUES ('2024-01-05 10:00:00.5+02', NULL);
+    UPDATE a SET tz2 = tz;
+    INSERT INTO a SELECT tz2, tz FROM a;
+    SELECT tz, tz2 FROM a;
+}
+expect {
+    2024-01-05 08:00:00.5+00|2024-01-05 08:00:00.5+00
+    2024-01-05 08:00:00.5+00|2024-01-05 08:00:00.5+00
+}
+
+# CURRENT_TIMESTAMP is a timestamptz, as now() is.
+test datetime-timestamptz-default-now {
+    CREATE TABLE n (id int, tz timestamptz DEFAULT now());
+    INSERT INTO n (id) VALUES (1);
+    SELECT id FROM n WHERE tz <= CURRENT_TIMESTAMP AND tz > '2024-01-01' AND CURRENT_TIMESTAMP::text LIKE '%+00';
+}
+expect {
+    1
+}
+
+setup datetime-uses {
+    CREATE TABLE r (id int, ts timestamp, tz timestamptz);
+    INSERT INTO r VALUES (1, '2024-01-05 10:00:00.5', '2024-01-05 10:00:00+02'), (2, NULL, NULL);
+}
+
+# A timestamptz prints with the offset of the session's time zone, which is
+# UTC, and a timestamp prints without an offset.
+@setup datetime-uses
+test datetime-timestamp-and-timestamptz-as-text {
+    SELECT id, ts::text, tz::text FROM r ORDER BY id;
+    SELECT CAST(ts AS text), CAST(tz AS text) FROM r WHERE id = 1;
+}
+expect {
+    1|2024-01-05 10:00:00.5|2024-01-05 08:00:00+00
+    2||
+    2024-01-05 10:00:00.5|2024-01-05 08:00:00+00
+}
+
+@setup datetime-uses
+test datetime-timestamp-compared-with-columns-and-null {
+    SELECT id FROM r WHERE ts = (SELECT ts FROM r WHERE id = 1);
+    SELECT id FROM r WHERE tz IN (SELECT tz FROM r WHERE id = 1);
+    SELECT id FROM r WHERE ts IS NULL;
+    SELECT id FROM r WHERE tz IS NOT NULL;
+    SELECT id FROM r WHERE ts BETWEEN '2024-01-05' AND '2024-01-06' AND tz IN ('2024-01-05 08:00:00+00', NULL);
+    SELECT count(DISTINCT tz) FROM r;
+    SELECT tz, count(*) FROM r GROUP BY tz ORDER BY tz;
+}
+expect {
+    1
+    1
+    2
+    1
+    1
+    1
+    2024-01-05 08:00:00+00|1
+    |1
+}
+
+@setup datetime-uses
+test datetime-timestamptz-in-coalesce {
+    SELECT coalesce(tz, '2024-01-01') FROM r ORDER BY id;
+}
+expect {
+    2024-01-05 08:00:00+00
+    2024-01-01 00:00:00+00
+}
+
+@setup datetime-uses
+test datetime-timestamp-in-case {
+    SELECT 'a', CASE WHEN id = 1 THEN ts END FROM r ORDER BY id;
+}
+expect {
+    a|2024-01-05 10:00:00.5
+    a|
+}
+
+@setup datetime-uses
+test datetime-timestamp-concatenated {
+    SELECT ts || 'x' FROM r WHERE id = 1;
+}
+expect {
+    2024-01-05 10:00:00.5x
+}
+
+# A string literal is read as a timestamp only when it is itself compared with
+# one. In a subquery or a UNION it is text.
+# PostgreSQL types ARRAY['a', 'b'] as text[], unlike the literals of IN ('a',
+# 'b'), which are read as the type they are compared with.
+# One element of a known type makes the literals that type.
+@setup datetime-uses
+test datetime-timestamptz-equals-any-of-typed-and-literal-elements {
+    SELECT id FROM r WHERE tz = ANY(ARRAY['2024-01-05 08:00:00+00'::timestamptz, '2024-01-07']);
+    SELECT id FROM r WHERE ts = ANY(ARRAY['2024-01-05 10:00:00.5', ts]);
+}
+expect {
+    1
+    1
+}
+
+@setup datetime-uses
+test datetime-timestamptz-cast-to-date-is-refused {
+    SELECT tz::date FROM r WHERE id = 1;
+}
+expect {
+    2024-01-05
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
+
+# PostgreSQL converts the timestamp to timestamptz in the session's time zone.
+@setup datetime-uses
+test datetime-timestamp-compared-with-timestamptz {
+    SELECT count(*) FROM r WHERE ts = tz;
+}
+expect {
+    0
+}
+
+@setup datetime-uses
+test datetime-timestamptz-in-sqlite-date-function-is-refused {
+    SELECT date(tz) FROM r WHERE id = 1;
+}
+expect {
+    2024-01-05
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
+
+test datetime-timestamptz-in-array {
+    SELECT ARRAY['2024-01-01 10:00:00+02'::timestamptz];
+}
+expect {
+    {"2024-01-01 08:00:00+00"}
+}
+
+@setup datetime-uses
+test datetime-timestamp-in-array {
+    SELECT ARRAY[ts] FROM r WHERE id = 1;
+}
+expect {
+    {"2024-01-05 10:00:00.5"}
+}
+
+@setup datetime-uses
+test datetime-timestamptz-in-array-agg {
+    SELECT array_agg(tz) FROM r WHERE id = 1;
+}
+expect {
+    {"2024-01-05 08:00:00+00"}
+}
+
+@setup datetime-uses
+test datetime-timestamp-in-array-agg {
+    SELECT array_agg(ts) FROM r WHERE id = 1;
+}
+expect {
+    {"2024-01-05 10:00:00.5"}
+}
+
+# A column of a VALUES list has one type. A string literal in it is read as a
+# timestamptz when another row is one.
+# The rows of INSERT ... VALUES don't share a type: each value is converted to
+# the type of its target column, so a literal next to a timestamptz in a text
+# column stays text.
+test datetime-insert-values-rows-keep-their-own-types {
+    CREATE TABLE w (id int, s text);
+    INSERT INTO w VALUES (1, now()), (2, '2024-01-01'), (3, 'abc');
+    SELECT id, s FROM w WHERE id > 1 ORDER BY id;
+}
+expect {
+    2|2024-01-01
+    3|abc
+}
+
+# A VALUES list used as a value or as the right side of IN has the type of its
+# column, so a string literal next to it is read as a timestamptz.
+# The first SELECT of a recursive CTE gives a column its type, and NULL there
+# is text.
+@setup datetime-uses
+test datetime-timestamptz-in-recursive-cte {
+    WITH RECURSIVE c(x, n) AS (SELECT tz, 1 FROM r WHERE id = 1 UNION ALL SELECT x, n + 1 FROM c WHERE n < 3) SELECT x, n FROM c ORDER BY n;
+}
+expect {
+    2024-01-05 08:00:00+00|1
+    2024-01-05 08:00:00+00|2
+    2024-01-05 08:00:00+00|3
+}
+
+# A string literal in the recursive query is not converted to the type of the
+# column, as in an arm of a compound SELECT.
+test datetime-to-timestamp-is-refused {
+    SELECT to_timestamp(0);
+}
+expect {
+    1970-01-01 00:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    to_timestamp\(\) and make_timestamp\(\) are not supported
+}
+
+test datetime-make-timestamp-is-refused {
+    SELECT make_timestamp(2024, 1, 5, 8, 0, 1.5);
+}
+expect {
+    2024-01-05 08:00:01.5
+}
+@sqlstate 0A000
+expect @tursopg error {
+    to_timestamp\(\) and make_timestamp\(\) are not supported
+}
+
+test datetime-localtimestamp {
+    SELECT 1 WHERE LOCALTIMESTAMP > '2024-01-01';
+}
+expect {
+    1
+}
+
+test datetime-current-timestamp-with-precision {
+    SELECT 1 WHERE CURRENT_TIMESTAMP(0) > '2024-01-01';
+}
+expect {
+    1
+}
+
+test datetime-foreign-key-on-timestamptz {
+    CREATE TABLE fk_parent (k timestamptz PRIMARY KEY);
+    CREATE TABLE fk_child (k timestamptz REFERENCES fk_parent (k));
+    INSERT INTO fk_parent VALUES ('2024-01-01 00:00+00');
+    INSERT INTO fk_child VALUES ('2024-01-01 00:00+00');
+    SELECT count(*) FROM fk_child;
 }
 expect {
     1
@@ -538,6 +870,8 @@ test datetime-input-rejects-order-5-2024-jan {
 expect error {
     invalid input syntax for type timestamp: "5 2024 Jan"
 }
+@sqlstate 0A000
+expect @tursopg error {}
 
 test datetime-input-rejects-order-10-00-2024-01-05 {
     CREATE TABLE t(ts timestamp);
@@ -577,4 +911,189 @@ expect error {
 @sqlstate 0A000
 expect @tursopg error {
     type "time" is not supported
+}
+
+# The new column would have no type, so it could not be compared as a timestamptz.
+test datetime-create-table-as-of-cast-literal {
+    CREATE TABLE s AS SELECT '2020-01-01 00:00:00+00'::timestamptz AS z;
+    SELECT count(*) FROM s;
+}
+expect {
+    1
+}
+
+test datetime-create-table-as-of-now {
+    CREATE TABLE s AS SELECT now() AS n;
+    SELECT count(*) FROM s;
+}
+expect {
+    1
+}
+
+test datetime-create-table-as-of-timestamptz-column {
+    CREATE TABLE events (id int, created_at timestamptz);
+    INSERT INTO events VALUES (1, '2024-01-05 10:00+00');
+    CREATE TABLE s AS SELECT created_at FROM events;
+    SELECT count(*) FROM s;
+}
+expect {
+    1
+}
+
+test datetime-create-table-as-of-star-with-timestamp-column {
+    CREATE TABLE events (id int, created_at timestamp);
+    INSERT INTO events VALUES (1, '2024-01-05 10:00');
+    CREATE TABLE s AS SELECT * FROM events;
+    SELECT count(*) FROM s;
+}
+expect {
+    1
+}
+
+test datetime-create-table-as-of-union-with-timestamptz {
+    CREATE TABLE events (id int, created_at timestamptz);
+    CREATE TABLE s AS SELECT NULL UNION ALL SELECT created_at FROM events;
+    SELECT count(*) FROM s;
+}
+expect {
+    1
+}
+
+# PostgreSQL reads these, so Turso refuses them with 0A000, not 22007.
+test datetime-input-special-values-are-not-supported {
+    SELECT 'infinity'::timestamptz, 'epoch'::timestamptz;
+}
+expect {
+    infinity|1970-01-01 00:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    the timestamp with time zone value "infinity" is not supported
+}
+
+test datetime-input-time-zone-name-is-not-supported {
+    SELECT '2024-01-05 10:00 America/New_York'::timestamptz;
+}
+expect {
+    2024-01-05 15:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    invalid or unsupported input for type timestamp with time zone: "2024-01-05 10:00 America/New_York"
+}
+
+test datetime-input-time-zone-abbreviation-is-not-supported {
+    SELECT '2024-01-05 10:00 EST'::timestamptz;
+}
+expect {
+    2024-01-05 15:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    invalid or unsupported input for type timestamp with time zone: "2024-01-05 10:00 EST"
+}
+
+test datetime-input-day-name-is-not-supported {
+    SELECT 'Fri Jan 5 2024'::timestamp;
+}
+expect {
+    2024-01-05 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    invalid or unsupported input for type timestamp: "Fri Jan 5 2024"
+}
+
+test datetime-input-month-day-year-is-not-supported {
+    SELECT '01/05/2024'::timestamp;
+}
+expect {
+    2024-01-05 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    invalid or unsupported input for type timestamp: "01/05/2024"
+}
+
+test datetime-input-bc-is-not-supported {
+    SELECT '2024-01-05 10:00 BC'::timestamp;
+}
+expect {
+    2024-01-05 10:00:00 BC
+}
+@sqlstate 0A000
+expect @tursopg error {
+    BC dates are not supported for type timestamp: "2024-01-05 10:00 BC"
+}
+
+test datetime-input-year-after-9999-is-not-supported {
+    SELECT '10000-01-05'::timestamp;
+}
+expect {
+    10000-01-05 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    years must be written with 4 digits, from 0001 to 9999: "10000-01-05"
+}
+
+test datetime-input-offset-into-year-0-is-not-supported {
+    SELECT '0001-01-01 00:00+01'::timestamptz;
+}
+expect {
+    0001-12-31 23:00:00+00 BC
+}
+@sqlstate 0A000
+expect @tursopg error {
+    timestamp with time zone values must be between years 0001 and 9999
+}
+
+test datetime-input-offset-into-year-10000-is-not-supported {
+    SELECT '9999-12-31 23:00-02'::timestamptz;
+}
+expect {
+    10000-01-01 01:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    timestamp with time zone values must be between years 0001 and 9999
+}
+
+test datetime-input-minutes-and-seconds-are-not-supported {
+    SELECT '2024-01-05 10:00.5'::timestamp;
+}
+expect {
+    2024-01-05 00:10:00.5
+}
+@sqlstate 0A000
+expect @tursopg error {
+    invalid or unsupported input for type timestamp: "2024-01-05 10:00.5"
+}
+
+test datetime-input-pg-input-is-valid-of-special-value-is-not-supported {
+    SELECT pg_input_is_valid('infinity', 'timestamptz');
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    the timestamp with time zone value "infinity" is not supported
+}
+
+# PostgreSQL rejects these too, so Turso gives the same SQLSTATE.
+test datetime-input-two-dates-are-invalid {
+    SELECT '2024-01-05 2024-01-06'::timestamp;
+}
+@sqlstate 22007
+expect error {
+    invalid input syntax for type timestamp: "2024-01-05 2024-01-06"
+}
+
+test datetime-input-year-0-is-out-of-range {
+    SELECT '0000-01-05'::timestamp;
+}
+@sqlstate 22008
+expect error {
+    date/time field value out of range: "0000-01-05"
 }

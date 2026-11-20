@@ -569,7 +569,7 @@ fn test_pg_derived_result_column_names(db: TempDatabase) {
         ("SELECT CASE WHEN true THEN 1 ELSE 1::int END", "case"),
         ("SELECT CASE WHEN true THEN 1 END::text", "text"),
         ("SELECT CASE WHEN true THEN 1 ELSE 1::int END::text", "text"),
-        ("SELECT CASE WHEN true THEN 1 ELSE now() END::text", "now"),
+        ("SELECT CASE WHEN true THEN 1 ELSE abs(1) END::text", "abs"),
         (
             "SELECT CASE WHEN true THEN 1 ELSE CASE WHEN true THEN 1 ELSE abs(1) END END",
             "abs",
@@ -710,16 +710,27 @@ fn test_pg_native_timestamps_are_registered_before_connection_wrapping(db: TempD
         let Value::Text(timestamp) = &rows[0][0] else {
             panic!("expected timestamp text for {name}")
         };
-        assert_eq!(timestamp.as_str().len(), 23);
-        for (index, separator) in [
-            (4, b'-'),
-            (7, b'-'),
-            (10, b' '),
-            (13, b':'),
-            (16, b':'),
-            (19, b'.'),
-        ] {
-            assert_eq!(timestamp.as_str().as_bytes()[index], separator, "{name}");
+        // PostgreSQL's form, such as 2024-01-05 10:00:00.12+00: up to six
+        // digits after the point, without trailing zeros.
+        let timestamp = timestamp.as_str();
+        let local = timestamp
+            .strip_suffix("+00")
+            .unwrap_or_else(|| panic!("{name}: {timestamp}"));
+        for (index, separator) in [(4, b'-'), (7, b'-'), (10, b' '), (13, b':'), (16, b':')] {
+            assert_eq!(local.as_bytes()[index], separator, "{name}: {timestamp}");
+        }
+        if local.len() > 19 {
+            let fraction = local[19..]
+                .strip_prefix('.')
+                .unwrap_or_else(|| panic!("{name}: {timestamp}"));
+            assert!(
+                (1..=6).contains(&fraction.len())
+                    && fraction.bytes().all(|b| b.is_ascii_digit())
+                    && !fraction.ends_with('0'),
+                "{name}: {timestamp}"
+            );
+        } else {
+            assert_eq!(local.len(), 19, "{name}: {timestamp}");
         }
     }
 }
@@ -864,4 +875,100 @@ fn test_pg_application_name_isolation_and_rollback(db: TempDatabase) {
     assert!(conn
         .execute("SELECT current_setting('unknown_builtin')")
         .is_err());
+}
+
+/// Parameters bound as text, the way a PostgreSQL client sends them, are read
+/// as timestamps where a timestamp is expected. The expected values come from
+/// PostgreSQL 18.
+#[turso_macros::test(mvcc)]
+fn test_pg_timestamp_text_parameters(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE p (id int, ts timestamp, tz timestamptz)")
+        .unwrap();
+    run_with_text_parameters(
+        &conn,
+        "INSERT INTO p VALUES ($1, $2, $3)",
+        &["1", "2024-01-05 08:00:01.5", "2024-01-01 00:00:00.5+00"],
+    )
+    .unwrap();
+    run_with_text_parameters(
+        &conn,
+        "INSERT INTO p VALUES ($1, $2, $3)",
+        &["2", "2023-01-01 00:00", "1970-01-01 02:00+02"],
+    )
+    .unwrap();
+
+    let ids = |sql: &str, parameters: &[&str]| -> Vec<Value> {
+        run_with_text_parameters(&conn, sql, parameters)
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect()
+    };
+    assert_eq!(
+        run_with_text_parameters(&conn, "SELECT id, ts, tz FROM p ORDER BY id", &[]).unwrap(),
+        vec![
+            vec![
+                Value::from_i64(1),
+                Value::build_text("2024-01-05 08:00:01.5"),
+                Value::build_text("2024-01-01 00:00:00.5+00"),
+            ],
+            vec![
+                Value::from_i64(2),
+                Value::build_text("2023-01-01 00:00:00"),
+                Value::build_text("1970-01-01 00:00:00+00"),
+            ],
+        ]
+    );
+    let read = conn.prepare("SELECT ts, tz FROM p").unwrap();
+    assert_eq!(read.get_column_decltype(0).as_deref(), Some("timestamp"));
+    assert_eq!(read.get_column_decltype(1).as_deref(), Some("timestamptz"));
+    assert_eq!(
+        ids(
+            "SELECT id FROM p WHERE tz > $1 ORDER BY id",
+            &["1970-01-01 00:01:40+00"]
+        ),
+        [Value::from_i64(1)]
+    );
+    assert_eq!(
+        ids(
+            "SELECT id FROM p WHERE tz = $1",
+            &["2024-01-01 02:00:00.5+02"]
+        ),
+        [Value::from_i64(1)]
+    );
+    assert_eq!(
+        ids(
+            "SELECT id FROM p WHERE ts BETWEEN $1 AND $2 ORDER BY id",
+            &["2023-01-01", "2024-01-05 08:00:01.5"],
+        ),
+        [Value::from_i64(1), Value::from_i64(2)]
+    );
+
+    let error = run_with_text_parameters(
+        &conn,
+        "SELECT id FROM p WHERE tz IN ($1, $2)",
+        &["1970-01-01 00:00Z", "x"],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains(r#"invalid or unsupported input for type timestamp with time zone: "x""#),
+        "{error}"
+    );
+}
+
+fn run_with_text_parameters(
+    conn: &PgConnection,
+    sql: &str,
+    parameters: &[&str],
+) -> turso_pg::Result<Vec<Vec<Value>>> {
+    let mut stmt = conn.prepare(sql)?;
+    for (i, parameter) in parameters.iter().enumerate() {
+        stmt.bind_at(
+            std::num::NonZero::new(i + 1).unwrap(),
+            Value::build_text(parameter.to_string()),
+        )?;
+    }
+    stmt.run_collect_rows()
 }

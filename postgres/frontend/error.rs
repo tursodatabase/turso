@@ -264,6 +264,7 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
         | LimboError::InvalidTime(_)
         | LimboError::InvalidModifier(_) => SQLSTATE_INVALID_DATETIME_FORMAT,
         LimboError::DatetimeFieldOverflow(_) => SQLSTATE_DATETIME_FIELD_OVERFLOW,
+        LimboError::DatetimeNotSupported(_) => SQLSTATE_FEATURE_NOT_SUPPORTED,
         LimboError::InvalidArgument(msg) => invalid_argument_sqlstate(msg),
         LimboError::ConversionError(_) | LimboError::InvalidFormatter(_) => SQLSTATE_DATA_EXCEPTION,
         LimboError::ParseIntError(_) | LimboError::ParseFloatError(_) => {

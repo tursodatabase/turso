@@ -550,6 +550,10 @@ test select-cast-invalid-text-to-timestamp {
 }
 @sqlstate 22007
 expect error {}
+@sqlstate 0A000
+expect @tursopg error {
+    invalid or unsupported input for type timestamp: "hello"
+}
 
 test select-cast-int8-accepts-its-smallest-and-largest-values {
     SELECT 9223372036854775807::int8, (-9223372036854775808)::bigint, int8(-9223372036854775808);

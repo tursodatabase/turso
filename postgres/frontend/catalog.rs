@@ -3985,7 +3985,7 @@ impl VirtualTableCursor for PgInputErrorInfoCursor {
             }
         };
 
-        self.row = Some(match validate_pg_input(&input, &type_name) {
+        self.row = Some(match validate_pg_input(&input, &type_name)? {
             Some((message, code)) => [
                 Value::build_text(message),
                 Value::Null,

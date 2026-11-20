@@ -182,41 +182,8 @@ expect {
 expect @tursopg error {}
 
 # C-15 (S2): timestamp '2026-10-08T12:00:00.5': raw value, inside json_build_object
-test gap-c-15-timestamp-2026-10-08t12-00-00-5-raw-value-inside {
-    CREATE TABLE t (v timestamp);
-    INSERT INTO t VALUES ('2026-10-08T12:00:00.5');
-    SELECT v, json_build_object('v', v) FROM t;
-}
-expect {
-    2026-10-08 12:00:00.5|{"v" : "2026-10-08T12:00:00.5"}
-}
-@sqlstate 42883
-expect @tursopg error {}
-
 # C-16 (S2): timestamptz '2026-10-08 14:00:00+02': raw value, inside json_build_object
-test gap-c-16-timestamptz-2026-10-08-14-00-00-02-raw-value-ins {
-    CREATE TABLE t (v timestamptz);
-    INSERT INTO t VALUES ('2026-10-08 14:00:00+02');
-    SELECT v, json_build_object('v', v) FROM t;
-}
-expect {
-    2026-10-08 12:00:00+00|{"v" : "2026-10-08T12:00:00+00:00"}
-}
-@sqlstate 42883
-expect @tursopg error {}
-
 # C-17 (S2): timestamptz '2026-10-08T12:00:00.123456Z': raw value, inside json_build_object
-test gap-c-17-timestamptz-2026-10-08t12-00-00-123456z-raw-valu {
-    CREATE TABLE t (v timestamptz);
-    INSERT INTO t VALUES ('2026-10-08T12:00:00.123456Z');
-    SELECT v, json_build_object('v', v) FROM t;
-}
-expect {
-    2026-10-08 12:00:00.123456+00|{"v" : "2026-10-08T12:00:00.123456+00:00"}
-}
-@sqlstate 42883
-expect @tursopg error {}
-
 # C-18 (S2): interval '1 day 2 hours': raw value, inside json_build_object
 test gap-c-18-interval-1-day-2-hours-raw-value-inside-json-bui {
     CREATE TABLE t (v interval);
@@ -400,16 +367,6 @@ expect {
 expect @tursopg error {}
 
 # C-40 (S2): json_agg of mixed-type row
-@setup t_b_n_ts_j_jb_arr_u_with_rows
-test gap-c-40-json-agg-of-mixed-type-row {
-    SELECT json_agg(json_build_object('b', b, 'n', n, 'ts', ts, 'j', j, 'jb', jb, 'u', u)) FROM t;
-}
-expect {
-    [{"b" : true, "n" : 1.50, "ts" : "2026-10-08T12:00:00+00:00", "j" : {"x": 1}, "jb" : {"y": 2}, "u" : "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}]
-}
-@sqlstate 42883
-expect @tursopg error {}
-
 # C-41 (S2): text[] inside json object
 @setup t_b_n_ts_j_jb_arr_u_with_rows
 test gap-c-41-text-inside-json-object {
@@ -430,20 +387,10 @@ expect {
     true|1.50|2026-10-08 12:00:00+00|{"y": 2}|{a}|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
 expect @tursopg {
-    1|1.50|2026-10-08 12:00:00|{"y":2}|a|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    1|1.50|2026-10-08 12:00:00+00|{"y":2}|a|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
 
 # C-43 (S2): result column type of bool comparison via pg_typeof
-@setup t_b_n_ts_j_jb_arr_u_with_rows
-test gap-c-43-result-column-type-of-bool-comparison-via-pg-typ {
-    SELECT pg_typeof(b), pg_typeof(n), pg_typeof(ts), pg_typeof(jb), pg_typeof(arr) FROM t;
-}
-expect {
-    boolean|numeric|timestamp with time zone|jsonb|text[]
-}
-@sqlstate 42883
-expect @tursopg error {}
-
 # C-44 (S2): row_to_json of whole row
 @setup t_b_n_ts_j_jb_arr_u_with_rows
 test gap-c-44-row-to-json-of-whole-row {

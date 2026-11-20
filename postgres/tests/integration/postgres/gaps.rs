@@ -107,14 +107,14 @@ fn gap_a_29_tursopg_returns_wrong_result_numeric_n_param(db: TempDatabase) {
 
 // A-33: timestamptz $n param with offset
 #[turso_macros::test(views)]
-fn gap_a_33_timestamptz_n_param_with_offset(db: TempDatabase) {
+fn timestamptz_param_with_offset_is_shown_in_utc(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::timestamptz",
         params: &[P::Text("2026-10-08T14:00:00+02:00")],
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "2026-10-08 12:00:00");
+    assert_eq!(out, "2026-10-08 12:00:00+00");
 }
 
 // A-41 (S2): date $n param
@@ -248,7 +248,7 @@ fn gap_a_68_untyped_1_text_true_into_bool_column(db: TempDatabase) {
 
 // A-69: untyped $1 '2026-10-08 14:00+02' into timestamptz column
 #[turso_macros::test(views)]
-fn gap_a_69_untyped_1_2026_10_08_14_00_02_into_timestamptz_c(db: TempDatabase) {
+fn untyped_param_with_offset_into_timestamptz_column_is_shown_in_utc(db: TempDatabase) {
     let out = GapCase {
         setup: &["CREATE TABLE t (ts timestamptz)"],
         sql: "INSERT INTO t VALUES ($1) RETURNING ts",
@@ -256,7 +256,7 @@ fn gap_a_69_untyped_1_2026_10_08_14_00_02_into_timestamptz_c(db: TempDatabase) {
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "2026-10-08 12:00:00");
+    assert_eq!(out, "2026-10-08 12:00:00+00");
 }
 
 // A-70 (S1): insert jsonb text param into jsonb column
@@ -510,7 +510,7 @@ fn gap_b_89_limit_offset_with_text_params(db: TempDatabase) {
 // tursopg: json_populate_recordset in FROM is refused with 0A000.
 // PostgreSQL: 1|a
 #[turso_macros::test(views)]
-fn gap_b_118_tursopg_returns_wrong_result_json_populate_recordset(db: TempDatabase) {
+fn gap_b_118_json_populate_recordset_is_not_supported(db: TempDatabase) {
     let out = GapCase {
         setup: &["CREATE TABLE r (id int, s text)"],
         sql: "SELECT id, s FROM json_populate_recordset(null::r, $1)",

@@ -83,7 +83,7 @@ expect {
     ok
 }
 
-test localtimestamp-returns-timestamp {
+test localtimestamp-returns-a-timestamp {
     SELECT 'ok' WHERE LOCALTIMESTAMP IS NOT NULL;
 }
 expect {
