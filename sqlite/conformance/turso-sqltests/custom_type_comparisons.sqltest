@@ -1796,3 +1796,25 @@ test cmp-coalesce-with-text-and-two-custom-types-is-an-error {
 expect error {
     cannot tell which type to read a string literal or parameter as
 }
+
+# As in PostgreSQL, a timestamp compared with a timestamptz is converted to a
+# timestamptz in UTC first, in a comparison, a hash join, an IN subquery and a
+# compound SELECT.
+@requires strict "uses STRICT tables"
+test cmp-timestamp-with-timestamptz {
+    CREATE TABLE a(ts timestamp) STRICT;
+    CREATE TABLE b(tz timestamptz) STRICT;
+    INSERT INTO a VALUES ('2024-01-05 10:00');
+    INSERT INTO b VALUES ('2024-01-05 10:00+00'), ('2024-01-05 11:00+00');
+    SELECT 'join', count(*) FROM a, b WHERE a.ts = b.tz;
+    SELECT 'lt', count(*) FROM a, b WHERE a.ts < b.tz;
+    SELECT 'in', count(*) FROM a WHERE ts IN (SELECT tz FROM b);
+    SELECT 'union', tz FROM (SELECT ts AS tz FROM a UNION SELECT tz FROM b) ORDER BY 2;
+}
+expect {
+    join|1
+    lt|1
+    in|1
+    union|2024-01-05 10:00:00+00
+    union|2024-01-05 11:00:00+00
+}

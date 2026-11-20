@@ -2,7 +2,9 @@ use super::*;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
-use crate::translate::expr::{comparison_affinity, emit_table_column, maybe_apply_affinity};
+use crate::translate::expr::{
+    comparison_affinity, emit_table_column, maybe_apply_affinity, translate_compared_operand,
+};
 use crate::translate::expr_context::{ExprContext, TableMetadata};
 use crate::translate::plan::ColumnUsedMask;
 
@@ -341,10 +343,13 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         } else {
             for (idx, join_key) in planner.hash_join_op.join_keys.iter().enumerate() {
                 let build_expr = join_key.get_build_expr(planner.predicates);
-                translate_expr(
+                // Read as a comparison reads it, so a timestamp key matches
+                // an equal timestamptz key.
+                translate_compared_operand(
                     planner.program,
                     Some(planner.table_references),
                     build_expr,
+                    join_key.get_probe_expr(planner.predicates),
                     build_key_start_reg + idx,
                     &planner.t_ctx.resolver,
                 )?;
@@ -673,10 +678,11 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         let probe_key_start_reg = self.program.alloc_registers(num_keys);
         for (idx, join_key) in self.hash_join_op.join_keys.iter().enumerate() {
             let probe_expr = join_key.get_probe_expr(self.predicates);
-            translate_expr(
+            translate_compared_operand(
                 self.program,
                 Some(self.table_references),
                 probe_expr,
+                join_key.get_build_expr(self.predicates),
                 probe_key_start_reg + idx,
                 &self.t_ctx.resolver,
             )?;

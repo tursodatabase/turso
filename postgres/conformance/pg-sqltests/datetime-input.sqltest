@@ -1097,3 +1097,43 @@ test datetime-input-year-0-is-out-of-range {
 expect error {
     date/time field value out of range: "0000-01-05"
 }
+
+# PostgreSQL compares a timestamp with a timestamptz after converting the
+# timestamp to a timestamptz in the session time zone, UTC here.
+test datetime-input-timestamp-equals-timestamptz {
+    CREATE TABLE a (ts timestamp);
+    CREATE TABLE b (tz timestamptz);
+    INSERT INTO a VALUES ('2024-01-05 10:00');
+    INSERT INTO b VALUES ('2024-01-05 10:00+00'), ('2024-01-05 09:00+00'), ('2024-01-05 11:00+00');
+    SELECT
+        (SELECT count(*) FROM a WHERE ts = (SELECT tz FROM b WHERE tz = '2024-01-05 10:00+00')),
+        (SELECT count(*) FROM a, b WHERE a.ts = b.tz),
+        (SELECT count(*) FROM a JOIN b ON b.tz < a.ts),
+        (SELECT count(*) FROM a JOIN b ON b.tz >= a.ts),
+        (SELECT count(*) FROM a WHERE ts IN (SELECT tz FROM b)),
+        (SELECT count(*) FROM a JOIN b ON b.tz BETWEEN a.ts AND '2024-01-05 12:00');
+}
+expect {
+    1|1|1|2|1|2
+}
+
+test datetime-input-timestamp-literal-compares-with-timestamptz-literal {
+    SELECT '2024-01-05 10:00'::timestamp = '2024-01-05 10:00'::timestamptz,
+           '2024-01-05 10:00'::timestamp < '2024-01-05 10:00'::timestamptz,
+           '2024-01-05 10:00'::timestamp < '2024-01-05 10:00:00.5'::timestamptz;
+}
+expect {
+    t|f|t
+}
+
+test datetime-input-union-of-timestamp-and-timestamptz {
+    CREATE TABLE a (ts timestamp);
+    CREATE TABLE b (tz timestamptz);
+    INSERT INTO a VALUES ('2024-01-05 10:00');
+    INSERT INTO b VALUES ('2024-01-05 10:00+00'), ('2024-01-05 11:00+00');
+    SELECT ts FROM a UNION SELECT tz FROM b ORDER BY 1;
+}
+expect {
+    2024-01-05 10:00:00+00
+    2024-01-05 11:00:00+00
+}

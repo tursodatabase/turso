@@ -281,6 +281,8 @@ pub(crate) fn prepare_select_plan_from_arms(
         &mut same_query_map,
     )?;
 
+    convert_timestamps_in_compound(&mut left, &mut last, resolver);
+
     // ORDER BY names can come from any arm of a compound SELECT.
     let all_plans: Vec<&SelectPlan> = left
         .iter()
@@ -296,6 +298,65 @@ pub(crate) fn prepare_select_plan_from_arms(
         offset,
         order_by,
     })
+}
+
+/// Reads a timestamp column of a compound SELECT as a timestamptz when a
+/// SELECT on the other side of the UNION, INTERSECT or EXCEPT has a
+/// timestamptz in that column. PostgreSQL gives such a column the type
+/// timestamptz, converting the timestamps in the session time zone, which is
+/// UTC in tursopg. Without the conversion the two decoded texts of one instant
+/// differ by the `+00` suffix, so the compound keeps both.
+fn convert_timestamps_in_compound(
+    left: &mut [(SelectPlan, ast::CompoundOperator)],
+    last: &mut SelectPlan,
+    resolver: &Resolver,
+) {
+    use crate::translate::expr::expr_type::{type_of, ExprType, TypeEnv};
+    let schema = resolver.schema();
+    if schema.type_registry.is_empty() {
+        return;
+    }
+    let type_named = |ty: &ExprType, name: &str| {
+        matches!(ty, ExprType::Custom { type_def, .. } if type_def.name.eq_ignore_ascii_case(name))
+    };
+    let num_columns = last.result_columns.len();
+    let mut arms: Vec<&mut SelectPlan> = left.iter_mut().map(|(plan, _)| plan).collect();
+    arms.push(last);
+    for column in 0..num_columns {
+        let types: Vec<ExprType> = arms
+            .iter()
+            .map(|arm| {
+                type_of(
+                    &arm.result_columns[column].expr,
+                    &TypeEnv::new(Some(&arm.table_references), resolver),
+                )
+            })
+            .collect();
+        if !types.iter().any(|ty| type_named(ty, "timestamptz")) {
+            continue;
+        }
+        for (arm, ty) in arms.iter_mut().zip(&types) {
+            if !type_named(ty, "timestamp") {
+                continue;
+            }
+            let name = arm.result_columns[column]
+                .name(&arm.table_references)
+                .map(str::to_string);
+            let result_column = &mut arm.result_columns[column];
+            if result_column.alias.is_none() {
+                result_column.implicit_column_name = name;
+            }
+            let expr = std::mem::replace(&mut result_column.expr, ast::Expr::Literal(ast::Literal::Null));
+            result_column.expr = ast::Expr::cast(
+                expr,
+                Some(ast::Type {
+                    name: "timestamptz".to_string(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            );
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

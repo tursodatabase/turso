@@ -106,7 +106,9 @@ pub use condition::translate_condition_expr;
 pub(crate) use custom_type_operators::{
     check_custom_operator, custom_operator_call, emit_operator_call_on_registers,
 };
-pub(crate) use custom_types::read_untyped_operand_as;
+pub(crate) use custom_types::{
+    convert_timestamp_for_comparison, read_untyped_operand_as, translate_compared_operand,
+};
 pub(crate) use custom_types::{
     emit_constraint_values_decode, emit_decode, emit_dml_expr_index_value,
     emit_encode_for_comparison, emit_store_value, emit_trigger_decode_registers, emit_type_expr,
