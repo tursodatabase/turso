@@ -200,6 +200,12 @@ pub struct SimulatorCLI {
     #[clap(long, default_value_t = ProfileType::Default)]
     /// Profile selector for Simulation run
     pub profile: ProfileType,
+    /// Pick the statement mix, the properties, the faults and the connection count from
+    /// the seed (swarm testing). The flags that you give keep their values.
+    #[clap(long)]
+    // A bug base entry from an older simulator has no `swarm` field.
+    #[serde(default)]
+    pub swarm: bool,
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
