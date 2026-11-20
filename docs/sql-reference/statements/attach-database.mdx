@@ -23,8 +23,10 @@ ATTACH opens the database file at `filename` and makes its tables accessible thr
 | Clause | Description |
 |--------|-------------|
 | `DATABASE` | Optional keyword. Has no effect on behavior. |
-| `filename` | A string expression that evaluates to the path of the database file to attach. Use `':memory:'` to attach an in-memory database. |
-| `schema-name` | The name used to qualify table references from the attached database. This name must be unique among all attached databases on the connection. |
+| `filename` | An expression that evaluates to the path of the database file to attach, such as a string literal or a scalar subquery. Use `':memory:'` to attach an in-memory database. |
+| `schema-name` | The name used to qualify table references from the attached database, given as an identifier or as an expression that evaluates to the name. This name must be unique among all attached databases on the connection. |
+
+A bare identifier in either position is used as the name itself, so `ATTACH archive AS a` opens a file named `archive`. Any other form is evaluated as an expression: `ATTACH archive.db AS a` reads `archive.db` as a column reference and fails, so quote file names that contain a dot.
 
 Every connection has a built-in schema named `main` for its primary database. The names `main` and `temp` are reserved and cannot be used as schema names for attached databases.
 
@@ -59,6 +61,12 @@ JOIN customers_db.customers c ON o.customer_id = c.id;
 
 ```sql
 ATTACH ':memory:' AS scratch;
+```
+
+### Take the File Name From a Table
+
+```sql
+ATTACH (SELECT path FROM config WHERE name = 'archive') AS archive;
 ```
 
 ## See Also

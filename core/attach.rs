@@ -10,10 +10,7 @@ use crate::storage::journal_mode;
 use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
-use crate::translate::{
-    emitter::Resolver,
-    expr::{sanitize_string, translate_expr},
-};
+use crate::translate::{emitter::Resolver, subquery::translate_expr_without_from_clause};
 use crate::types::IOResultOr;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
@@ -23,7 +20,7 @@ use crate::{is_memory_like, DatabaseOpts, EncryptionKey, IOResult};
 use crate::{
     turso_assert, Connection, Database, LimboError, Pager, Result, MAIN_DB_ID, TEMP_DB_ID,
 };
-use turso_parser::ast::{Expr, Literal};
+use turso_parser::ast::Expr;
 
 /// Translate ATTACH statement
 pub fn translate_attach(
@@ -46,70 +43,10 @@ pub fn translate_attach(
 
     let arg_reg = program.alloc_registers(4); // 3 for args + 1 for result
 
-    // Load filename argument
-    // Handle different expression types as string literals for filenames
-    match expr {
-        Expr::Literal(Literal::String(s)) => {
-            // For ATTACH, string literals should be used directly (without quotes)
-            program.emit_insn(Insn::String8 {
-                value: sanitize_string(s),
-                dest: arg_reg,
-            });
-        }
-        Expr::Qualified(_, _) => {
-            // For ATTACH, qualified expressions like "foo.db" should be treated as filename strings
-            let filename = expr.to_string();
-            program.emit_insn(Insn::String8 {
-                value: filename,
-                dest: arg_reg,
-            });
-        }
-        Expr::Id(id) => {
-            // For ATTACH, identifiers should be treated as filename strings
-            program.emit_insn(Insn::String8 {
-                value: normalize_ident(id.as_str()),
-                dest: arg_reg,
-            });
-        }
-        _ => {
-            translate_expr(program, None, expr, arg_reg, resolver)?;
-        }
-    }
-
-    // Load database name argument
-    // Handle different expression types as string literals for database names
-    match db_name {
-        Expr::Literal(Literal::String(s)) => {
-            // For ATTACH, string literals should be used directly (without quotes)
-            program.emit_insn(Insn::String8 {
-                value: sanitize_string(s),
-                dest: arg_reg + 1,
-            });
-        }
-        Expr::Qualified(_, _) => {
-            // For ATTACH, qualified expressions should be treated as name strings
-            let db_name_str = format!("{db_name}");
-            program.emit_insn(Insn::String8 {
-                value: db_name_str,
-                dest: arg_reg + 1,
-            });
-        }
-        Expr::Id(id) => {
-            // For ATTACH, identifiers should be treated as name strings
-            // Use normalize_ident to strip quotes from double-quoted identifiers
-            program.emit_insn(Insn::String8 {
-                value: normalize_ident(id.as_str()),
-                dest: arg_reg + 1,
-            });
-        }
-        _ => {
-            translate_expr(program, None, db_name, arg_reg + 1, resolver)?;
-        }
-    }
-
-    // Load key argument (NULL if not provided)
+    translate_attach_arg(program, resolver, &connection, expr, arg_reg)?;
+    translate_attach_arg(program, resolver, &connection, db_name, arg_reg + 1)?;
     if let Some(key_expr) = key {
-        translate_expr(program, None, key_expr, arg_reg + 2, resolver)?;
+        translate_attach_arg(program, resolver, &connection, key_expr, arg_reg + 2)?;
     } else {
         program.emit_insn(Insn::Null {
             dest: arg_reg + 2,
@@ -149,36 +86,7 @@ pub fn translate_detach(
 
     let arg_reg = program.alloc_registers(2); // 1 for arg + 1 for result
 
-    // Load database name argument
-    // Handle different expression types as string literals for database names
-    match expr {
-        Expr::Literal(Literal::String(s)) => {
-            // For DETACH, string literals should be used directly (without quotes)
-            program.emit_insn(Insn::String8 {
-                value: sanitize_string(s),
-                dest: arg_reg,
-            });
-        }
-        Expr::Qualified(_, _) => {
-            // For DETACH, qualified expressions should be treated as name strings
-            let db_name_str = format!("{expr}");
-            program.emit_insn(Insn::String8 {
-                value: db_name_str,
-                dest: arg_reg,
-            });
-        }
-        Expr::Id(id) => {
-            // For DETACH, identifiers should be treated as name strings
-            // Use normalize_ident to strip quotes from double-quoted identifiers
-            program.emit_insn(Insn::String8 {
-                value: normalize_ident(id.as_str()),
-                dest: arg_reg,
-            });
-        }
-        _ => {
-            translate_expr(program, None, expr, arg_reg, resolver)?;
-        }
-    }
+    translate_attach_arg(program, resolver, &connection, expr, arg_reg)?;
 
     // Call sqlite_detach function
     program.emit_insn(Insn::Function {
@@ -193,6 +101,26 @@ pub fn translate_detach(
     });
 
     Ok(())
+}
+
+/// Load an ATTACH or DETACH argument into `target_register`. As in SQLite, a
+/// bare identifier is used as its own name and anything else is evaluated as an
+/// expression, so `x.db` is a column reference and a subquery is run.
+fn translate_attach_arg(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    expr: &Expr,
+    target_register: usize,
+) -> Result<()> {
+    if let Expr::Id(id) = expr {
+        program.emit_insn(Insn::String8 {
+            value: normalize_ident(id.as_str()),
+            dest: target_register,
+        });
+        return Ok(());
+    }
+    translate_expr_without_from_clause(program, resolver, connection, expr, target_register)
 }
 
 #[cfg(not(feature = "fs"))]
