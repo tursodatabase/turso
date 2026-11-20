@@ -7,6 +7,7 @@ mod copy;
 mod deparse;
 mod error;
 mod functions;
+mod json_operators;
 mod open;
 mod options;
 mod pg_type;
