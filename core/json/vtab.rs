@@ -554,18 +554,18 @@ mod columns {
         LimboError, Value,
     };
 
-    #[derive(Debug, Clone)]
-    pub(super) enum Key {
+    #[derive(Debug, Clone, Copy)]
+    pub(super) enum Key<'a> {
         Integer(i64),
-        String(String),
+        String(&'a str),
         None,
     }
 
-    impl Key {
-        fn key_representation(&self) -> Value {
+    impl Key<'_> {
+        fn key_representation(self) -> Value {
             match self {
-                Key::Integer(ref i) => Value::from_i64(*i),
-                Key::String(ref s) => Value::Text(Text::new(s.to_owned())),
+                Key::Integer(i) => Value::from_i64(i),
+                Key::String(s) => Value::Text(Text::new(s.to_owned())),
                 Key::None => Value::Null,
             }
         }
@@ -633,7 +633,7 @@ mod columns {
         }
 
         /// `last_element` is the last element of the path of the cursor.
-        pub(super) fn key(&self, last_element: &Key) -> Value {
+        pub(super) fn key(&self, last_element: Key<'_>) -> Value {
             if self.has_key {
                 last_element.key_representation()
             } else {
@@ -736,7 +736,19 @@ mod columns {
 struct InPlaceJsonPath {
     string: String,
     element_lengths: Vec<usize>,
-    last_element: Key,
+    last_element: LastElement,
+    /// The unescaped name of the last element when it is an object member. The buffer stays
+    /// when the last element becomes an array index, so that the next name does not allocate.
+    last_name: String,
+}
+
+/// The kind of the last element of an [`InPlaceJsonPath`].
+#[derive(Clone, Copy)]
+enum LastElement {
+    Index(i64),
+    /// An object member, with its name in `last_name`.
+    Name,
+    None,
 }
 
 type InPlaceJsonPathCursor = usize;
@@ -746,7 +758,8 @@ impl InPlaceJsonPath {
         Self {
             string: "$".to_owned(),
             element_lengths: vec![1],
-            last_element: Key::None,
+            last_element: LastElement::None,
+            last_name: String::new(),
         }
     }
 
@@ -759,7 +772,7 @@ impl InPlaceJsonPath {
     }
 
     fn push_array_index(&mut self, idx: &usize) {
-        self.last_element = Key::Integer(*idx as i64);
+        self.last_element = LastElement::Index(*idx as i64);
         let start = self.string.len();
         // Writing to a String cannot fail.
         let _ = write!(self.string, "[{idx}]");
@@ -781,14 +794,16 @@ impl InPlaceJsonPath {
             .and_then(|s| s.strip_suffix('"'))
             .ok_or_else(|| crate::LimboError::ParseError("malformed JSON".to_string()))?;
         if key.element_type()? != jsonb::ElementType::TEXT5 {
-            self.last_element = Key::String(jsonb::unescape_string(inner));
+            self.last_name = jsonb::unescape_string(inner);
+            self.last_element = LastElement::Name;
             self.push_object_name(inner);
             return Ok(());
         }
         // The JSON text rendering of a key with JSON5 escapes rewrites them (\v becomes \u0009),
         // so read the key from its stored bytes, as the value column does. SQLite copies them.
         let stored = key.scalar_payload_text()?;
-        self.last_element = Key::String(jsonb::unescape_string(&stored));
+        self.last_name = jsonb::unescape_string(&stored);
+        self.last_element = LastElement::Name;
         // A raw control character (jsonb_object() stores one where SQLite stores an escape) or a
         // raw quote keeps the rendering: SQLite's path for a raw quote cannot be read back.
         let name = if Self::needs_json_text_rendering(&stored) {
@@ -804,12 +819,9 @@ impl InPlaceJsonPath {
     /// the name before it, if there is one, so that the members of an
     /// object do not allocate a name each.
     fn set_last_element_name(&mut self, name: &str) {
-        if let Key::String(last_name) = &mut self.last_element {
-            last_name.clear();
-            last_name.push_str(name);
-        } else {
-            self.last_element = Key::String(name.to_owned());
-        }
+        self.last_name.clear();
+        self.last_name.push_str(name);
+        self.last_element = LastElement::Name;
     }
 
     fn push_object_name(&mut self, name: &str) {
@@ -867,7 +879,7 @@ impl InPlaceJsonPath {
         if json_path.elements.is_empty() {
             self.element_lengths
                 .push(Self::element_length(&PathElement::Root()));
-            self.last_element = Key::None;
+            self.last_element = LastElement::None;
             return;
         }
         self.element_lengths
@@ -875,9 +887,9 @@ impl InPlaceJsonPath {
         match json_path.elements.last() {
             Some(PathElement::Key(name, _)) => self.set_last_element_name(name),
             Some(PathElement::ArrayLocator(Some(idx))) => {
-                self.last_element = Key::Integer(*idx as i64)
+                self.last_element = LastElement::Index(*idx as i64)
             }
-            _ => self.last_element = Key::None,
+            _ => self.last_element = LastElement::None,
         }
     }
 
@@ -908,7 +920,11 @@ impl InPlaceJsonPath {
         }
     }
 
-    fn key(&self) -> &Key {
-        &self.last_element
+    fn key(&self) -> Key<'_> {
+        match self.last_element {
+            LastElement::Index(idx) => Key::Integer(idx),
+            LastElement::Name => Key::String(&self.last_name),
+            LastElement::None => Key::None,
+        }
     }
 }
