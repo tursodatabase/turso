@@ -84,6 +84,15 @@ class SyncEncryptionTests(unittest.TestCase):
             await db.close()
         asyncio.run(run())
 
+    def test_cloud_only_encryption_forwards_cipher_header(self):
+        options = self.options(True)
+        options.pop("local_encryption_key")
+        db = sync.connect(self.path, **options)
+        try:
+            self.assertFalse(Path(self.path + "-info").read_bytes().startswith(b"TSYNMETA"))
+        finally:
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()
