@@ -618,7 +618,8 @@ mod columns {
         }
 
         pub(super) fn atom(&self) -> Result<Value, LimboError> {
-            Self::atom_from_value(&self.value)
+            let element_type = self.value.element_type().expect("invalid value");
+            Self::atom_from_value(&self.value, element_type)
         }
 
         pub(super) fn value(&self) -> Result<Value, LimboError> {
@@ -627,7 +628,7 @@ mod columns {
                 ElementType::ARRAY | ElementType::OBJECT => {
                     json_ref_to_db_type(&self.value, element_type, OutputVariant::String)?
                 }
-                _ => Self::atom_from_value(&self.value)?,
+                _ => Self::atom_from_value(&self.value, element_type)?,
             })
         }
 
@@ -640,8 +641,8 @@ mod columns {
             }
         }
 
-        fn atom_from_value(value: &Jsonb) -> Result<Value, LimboError> {
-            let element_type = value.element_type().expect("invalid value");
+        /// `element_type` is the element type of `value`.
+        fn atom_from_value(value: &Jsonb, element_type: ElementType) -> Result<Value, LimboError> {
             let string: Result<Value, LimboError> = match element_type {
                 jsonb::ElementType::NULL => Ok(Value::Null),
                 jsonb::ElementType::TRUE => Ok(Value::from_i64(1)),
