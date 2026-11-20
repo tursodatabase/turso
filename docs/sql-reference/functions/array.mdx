@@ -620,7 +620,7 @@ SELECT tags FROM t;
 -- {A,b,C,NULL,E}
 ```
 
-Arrays always start at index 1, so an assignment that PostgreSQL would answer by moving the first index is an error: an index below 1, or an index above 1 on an empty or NULL array. A NULL or non-integer index is also an error. Assigning index 1 of a NULL array makes a one-element array.
+Arrays always start at index 1, so an assignment that PostgreSQL would answer by moving the first index is an error: an index below 1, or an index above 1 on an empty or NULL array. A NULL or non-integer index is also an error. Assigning index 1 of a NULL array makes a one-element array. Assigning an element of a value that is not an array, such as an INTEGER or TEXT column, is an error.
 
 ---
 

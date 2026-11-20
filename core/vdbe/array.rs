@@ -430,7 +430,10 @@ pub(crate) fn exec_array_set_element(arr: &Value, index: &Value, value: &Value) 
         }
     };
     let Some(mut elements) = array_values_from_any(arr) else {
-        return Ok(Value::Null);
+        return Err(LimboError::InvalidArgument(format!(
+            "array subscript in assignment needs an array, got {}",
+            arr.value_type()
+        )));
     };
     if index < 1 {
         return Err(LimboError::InvalidArgument(format!(

@@ -658,6 +658,24 @@ expect {
     2|{x}
 }
 
+test array-set-element-on-integer-column-is-error {
+    CREATE TABLE t_setint (a INTEGER) STRICT;
+    INSERT INTO t_setint VALUES (5);
+    UPDATE t_setint SET a[1] = 7;
+}
+expect error {
+    array subscript in assignment needs an array, got INT
+}
+
+test array-set-element-on-text-column-is-error {
+    CREATE TABLE t_settext (a TEXT) STRICT;
+    INSERT INTO t_settext VALUES ('hello');
+    UPDATE t_settext SET a[1] = 'x';
+}
+expect error {
+    array subscript in assignment needs an array, got TEXT
+}
+
 test array-set-element-function-on-text-array {
     SELECT array_set_element('{1,2}', 1, 5), array_set_element('{1,2}', 4, 5), array_set_element(NULL, 1, 5);
 }
