@@ -573,6 +573,15 @@ SELECT ARRAY[1,2] || 3;           -- [1,2,3]    (append element)
 SELECT 0 || ARRAY[1,2];           -- [0,1,2]    (prepend element)
 ```
 
+### Arithmetic and bitwise operators
+
+As in PostgreSQL, `+`, `-`, `*`, `/`, `%`, `&`, `|`, `<<`, `>>` and `~` are not defined for arrays. Use them on elements instead.
+
+```sql
+SELECT ARRAY[1,2] + 1;               -- error: operator does not exist: integer[] + integer
+SELECT a[1] + 1 FROM t;              -- adds 1 to the first element
+```
+
 ### Using operators in WHERE clauses
 
 ```sql
