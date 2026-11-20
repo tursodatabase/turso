@@ -521,13 +521,16 @@ expect error {}
 
 # tursopg has one collation and cannot tell these expressions apart.
 @setup rows
+@compat-gap "syntax:distinct-on"
 test error-order-by-with-another-collation {
     SELECT DISTINCT ON (c) c FROM t ORDER BY c COLLATE "C";
 }
 @sqlstate 42P10
-expect error {}
+expect error {
+}
 @sqlstate 0A000
-expect @tursopg error {}
+expect @tursopg error {
+}
 
 @setup rows
 test error-integer-arithmetic-is-not-a-select-list-position {
@@ -615,16 +618,20 @@ test error-key-names-two-different-output-columns {
 expect error {}
 
 @setup rows
+@compat-gap "syntax:distinct-on"
 test error-order-by-plus-number-is-not-the-key {
     SELECT DISTINCT ON (a) a, b FROM t ORDER BY +1, b;
 }
 @sqlstate 42P10
-expect error {}
+expect error {
+}
 @sqlstate 0A000
-expect @tursopg error {}
+expect @tursopg error {
+}
 
 # PostgreSQL makes one group of all rows. tursopg would read the key as a position.
 @setup rows
+@compat-gap "syntax:distinct-on"
 test key-of-plus-number-is-a-constant-not-a-position {
     SELECT DISTINCT ON (+1) a FROM t WHERE a IS NOT NULL ORDER BY +1, a DESC;
 }
@@ -632,7 +639,8 @@ expect {
     3
 }
 @sqlstate 0A000
-expect @tursopg error {}
+expect @tursopg error {
+}
 
 @setup rows
 test error-for-update {
@@ -679,6 +687,7 @@ expect {
 }
 
 @setup rows
+@compat-gap "syntax:distinct-on"
 test aggregate-only-in-the-key {
     SELECT DISTINCT ON (sum(b)) 42 FROM t;
 }
@@ -686,7 +695,8 @@ expect {
     42
 }
 @sqlstate 0A000
-expect @tursopg error {}
+expect @tursopg error {
+}
 
 @setup rows
 test key-computed-from-a-group-by-expression {
@@ -699,16 +709,20 @@ expect {
 }
 
 @setup rows
+@compat-gap "syntax:distinct-on"
 test error-key-reads-a-column-that-is-not-grouped {
     SELECT DISTINCT ON (b) a, count(*) FROM t GROUP BY a;
 }
 @sqlstate 42803
-expect error {}
+expect error {
+}
 @sqlstate 0A000
-expect @tursopg error {}
+expect @tursopg error {
+}
 
 # tursopg computes the select list before it drops rows, so it refuses these.
 @setup rows
+@compat-gap "syntax:distinct-on"
 test volatile-function-in-the-select-list {
     CREATE SEQUENCE distinct_on_seq;
     SELECT DISTINCT ON (a) a, nextval('distinct_on_seq') FROM t WHERE a < 3 ORDER BY a, b;
@@ -718,9 +732,11 @@ expect {
     2|2
 }
 @sqlstate 0A000
-expect @tursopg error {}
+expect @tursopg error {
+}
 
 @setup rows
+@compat-gap "syntax:distinct-on"
 test key-computed-on-the-aggregate-of-a-query-without-group-by {
     SELECT DISTINCT ON (1 / sum(b)) count(*) FROM t;
 }
@@ -728,7 +744,8 @@ expect {
     8
 }
 @sqlstate 0A000
-expect @tursopg error {}
+expect @tursopg error {
+}
 
 setup indexed_rows {
     CREATE TABLE ti (a int, b int, c text);
