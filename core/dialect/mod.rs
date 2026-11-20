@@ -28,9 +28,9 @@ pub use crate::translate::schema::SqliteCatalog;
 pub use catalog::{
     AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
     CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,
-    CreateView, DropColumn, DropIndex, DropSequence, DropTable, DropView, NewOwner, OwnerColumn,
-    RelationName, RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, TableText,
-    TempTriggerOfRenamedTable,
+    CreateView, Dependent, DependentObject, DropColumn, DropIndex, DropSequence, DropTable,
+    DropView, NewOwner, OwnerColumn, RelationName, RenameColumn, RenameTable, RewrittenTrigger,
+    RewrittenView, TableText, TempTriggerOfRenamedTable,
 };
 
 use crate::{
@@ -344,6 +344,35 @@ pub trait Dialect: Send + Sync + 'static {
     /// is created.
     fn binds_names_at_create(&self) -> bool {
         false
+    }
+
+    /// The name that a message gives the relation `name` of `namespace`.
+    fn relation_name_in_messages(
+        &self,
+        connection: &Connection,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> String {
+        let _ = (connection, schema, namespace);
+        name.to_string()
+    }
+
+    /// The objects that depend on the table or view `name` of `namespace`,
+    /// directly or through other objects, which DROP without CASCADE refuses
+    /// to leave without it. Each object comes before the objects that it
+    /// depends on, so they can be dropped in this order.
+    ///
+    /// SQLite records no dependencies: it drops the relation, and a view
+    /// that reads it fails when it is read.
+    fn relation_dependents(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Vec<Dependent> {
+        let _ = (schema, namespace, name);
+        Vec::new()
     }
 
     /// Whether a database of this dialect supports namespaces: the objects of

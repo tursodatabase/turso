@@ -990,11 +990,20 @@ pub fn translate_alter_table(
                     column: &column_name_norm,
                 },
             )? {
-                crate::bail_parse_error!(
-                    "cannot drop column {} of table {} because other objects depend on it: {usage}",
-                    column_name_norm,
-                    table_name_norm
-                );
+                return Err(LimboError::dependent_objects(
+                    format!(
+                        "column {column_name_norm} of table {}",
+                        resolver.with_schema(database_id, |schema| {
+                            connection.dialect().relation_name_in_messages(
+                                connection,
+                                schema,
+                                namespace.id,
+                                &table_name_norm,
+                            )
+                        })
+                    ),
+                    vec![usage],
+                ));
             }
             let cmd_context = CmdContext::new(connection, resolver, database_id);
             resolver.catalog.dialect.catalog().emit(

@@ -21,6 +21,7 @@ use turso_core::{
     text_array_literal, walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError,
     NamespaceId, NamespaceRef, OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
 };
+use turso_core::{Dependent, DependentObject};
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{self, RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
@@ -255,6 +256,25 @@ impl Dialect for PostgresDialect {
 
     fn binds_names_at_create(&self) -> bool {
         true
+    }
+
+    fn relation_name_in_messages(
+        &self,
+        connection: &Connection,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> String {
+        relation_name(connection, schema, namespace, name)
+    }
+
+    fn relation_dependents(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Vec<Dependent> {
+        relation_dependents(schema, namespace, name)
     }
 
     fn supports_namespaces(&self) -> bool {
@@ -3319,7 +3339,7 @@ impl SnapshotRows for PgSettingsTable {
     }
 }
 
-#[derive(strum::IntoStaticStr)]
+#[derive(Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
 enum DependencyKind {
     #[strum(serialize = "n")]
     Normal,
@@ -3329,6 +3349,7 @@ enum DependencyKind {
     Internal,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct ObjectAddress {
     catalog_oid: i64,
     object_oid: i64,
@@ -3494,6 +3515,13 @@ impl SnapshotRows for PgDependTable {
 
         // A sequence owned by a column depends on it: internally for identity columns, automatically otherwise.
         let schema = conn.current_schema();
+        rows.extend(
+            view_rule_dependencies(&schema)
+                .into_iter()
+                .map(|dependency| {
+                    dependency_row(dependency.dependent, dependency.referenced, dependency.kind)
+                }),
+        );
         for (namespace, table_name, table, table_oid) in user_tables_with_oids(&schema) {
             for (index, column) in table.columns().iter().enumerate() {
                 let Some(column_name) = column.name.as_deref() else {
@@ -3525,6 +3553,150 @@ impl SnapshotRows for PgDependTable {
         rows
     }
 }
+
+/// One row of pg_depend: `dependent` depends on `referenced`.
+struct Dependency {
+    dependent: ObjectAddress,
+    referenced: ObjectAddress,
+    kind: DependencyKind,
+}
+
+/// The pg_depend rows of the views' `_RETURN` rules: each rule is part of
+/// its view, and depends on every table and view that the view reads.
+fn view_rule_dependencies(schema: &Schema) -> Vec<Dependency> {
+    let mut dependencies = Vec::new();
+    for rule in view_rules(schema) {
+        let rule_address = ObjectAddress::rule(rule.oid);
+        dependencies.push(Dependency {
+            dependent: rule_address,
+            referenced: ObjectAddress::whole::<PgClassTable>(rule.view_oid),
+            kind: DependencyKind::Internal,
+        });
+        let mut read_oids: Vec<i64> = schema
+            .referenced_tables_of(rule.namespace, &rule.view.select_stmt)
+            .iter()
+            .filter_map(|(namespace, name)| stored_relation_oid(schema, *namespace, name))
+            .collect();
+        read_oids.sort_unstable();
+        read_oids.dedup();
+        for read_oid in read_oids {
+            dependencies.push(Dependency {
+                dependent: rule_address,
+                referenced: ObjectAddress::whole::<PgClassTable>(read_oid),
+                kind: DependencyKind::Normal,
+            });
+        }
+    }
+    dependencies
+}
+
+/// The views that depend on the table or view `name` of `namespace` in
+/// pg_depend, directly or through other views, each before the relations it
+/// reads.
+pub(crate) fn relation_dependents(
+    schema: &Schema,
+    namespace: NamespaceId,
+    name: &str,
+) -> Vec<Dependent> {
+    fn visit(
+        relation_oid: i64,
+        dependencies: &[Dependency],
+        classes: &crate::classes::ClassCatalog,
+        seen: &mut HashSet<i64>,
+        dependents: &mut Vec<Dependent>,
+    ) {
+        let Some(relation) = classes.get_by_oid(relation_oid) else {
+            return;
+        };
+        let rules_that_read = dependencies.iter().filter(|dependency| {
+            dependency.kind == DependencyKind::Normal
+                && dependency.referenced == ObjectAddress::whole::<PgClassTable>(relation_oid)
+                && dependency.dependent.catalog_oid == PG_REWRITE_OID
+        });
+        let mut view_oids: Vec<i64> = rules_that_read
+            .filter_map(|read| {
+                dependencies.iter().find(|dependency| {
+                    dependency.kind == DependencyKind::Internal
+                        && dependency.dependent == read.dependent
+                })
+            })
+            .map(|rule_of_view| rule_of_view.referenced.object_oid)
+            .collect();
+        view_oids.sort_unstable();
+        for view_oid in view_oids {
+            let Some(view) = classes.get_by_oid(view_oid) else {
+                continue;
+            };
+            if !seen.insert(view_oid) {
+                continue;
+            }
+            visit(view_oid, dependencies, classes, seen, dependents);
+            dependents.push(Dependent {
+                object: DependentObject::View {
+                    namespace: view.relnamespace,
+                    name: view.relname.clone(),
+                },
+                depends_on: (relation.relnamespace, relation.relname.clone()),
+            });
+        }
+    }
+
+    let Some(classes) = crate::classes::class_catalog(schema) else {
+        return Vec::new();
+    };
+    let Some(relation) = classes.get_by_name(namespace, name) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::default();
+    seen.insert(relation.oid);
+    let mut dependents = Vec::new();
+    visit(
+        relation.oid,
+        &view_rule_dependencies(schema),
+        classes,
+        &mut seen,
+        &mut dependents,
+    );
+    dependents
+}
+
+/// Fixed PostgreSQL OID of pg_rewrite, which has the rewrite rules of views.
+const PG_REWRITE_OID: i64 = 2618;
+
+/// The `_RETURN` rule of a view, which pg_depend describes. pg_rewrite does
+/// not list the rules while pg_class does not list the views: pg_dump stops
+/// at a rule whose view it cannot find.
+struct ViewRule<'a> {
+    oid: i64,
+    view_oid: i64,
+    namespace: NamespaceId,
+    view: &'a turso_core::schema::View,
+}
+
+/// The rules of the views that have a class row, ordered by oid.
+fn view_rules(schema: &Schema) -> Vec<ViewRule<'_>> {
+    let mut rules: Vec<ViewRule> = schema
+        .namespace_ids()
+        .flat_map(|namespace| {
+            schema.views(namespace).filter_map(move |(name, view)| {
+                let view_oid = stored_relation_oid(schema, namespace, name)?;
+                Some(ViewRule {
+                    oid: view_oid + VIEW_RULE_OID_OFFSET,
+                    view_oid,
+                    namespace,
+                    view,
+                })
+            })
+        })
+        .collect();
+    rules.sort_by_key(|rule| rule.oid);
+    rules
+}
+
+/// What is added to the oid of a view to make the oid of its `_RETURN` rule.
+/// The oids of relations stay below `CONSTRAINT_OID_START`, and the oids
+/// from `ROWID_PK_INDEX_OID_OFFSET` up to this offset are those of indexes.
+const VIEW_RULE_OID_OFFSET: i64 = 3 << 30;
 
 fn catalog_column_numbers(text: Option<&str>) -> Vec<i64> {
     match text {
@@ -3566,6 +3738,14 @@ impl ObjectAddress {
         Self {
             catalog_oid: T::TABLE_OID.expect("dependency catalogs have OIDs"),
             object_oid,
+            column_number: WHOLE_OBJECT_COLUMN_NUMBER,
+        }
+    }
+
+    const fn rule(rule_oid: i64) -> Self {
+        Self {
+            catalog_oid: PG_REWRITE_OID,
+            object_oid: rule_oid,
             column_number: WHOLE_OBJECT_COLUMN_NUMBER,
         }
     }

@@ -1408,6 +1408,20 @@ pub fn rewrite_select_namespace_table_refs(
     );
 }
 
+/// Writes the qualifier `qualifier` in front of each reference to table
+/// `tbl` in `select` that has no qualifier. A reference to a CTE named `tbl`
+/// is left as written.
+pub fn qualify_select_table_refs(select: &mut ast::Select, tbl: &str, qualifier: &str) {
+    rewrite_select_in_scope(
+        select,
+        TableRenameScope {
+            table_qualifiers: Some(&[]),
+            new_qualifier: Some(qualifier),
+            ..TableRenameScope::new(tbl, tbl)
+        },
+    );
+}
+
 #[derive(Clone, Copy)]
 struct TableRenameScope<'a> {
     old_tbl: &'a str,
@@ -1418,6 +1432,9 @@ struct TableRenameScope<'a> {
     unqualified_names_table: bool,
     /// The qualifiers that name the table's namespace; None takes any.
     table_qualifiers: Option<&'a [String]>,
+    /// When set, a reference to the table keeps its name and gets this
+    /// qualifier, and column qualifiers and table functions are left alone.
+    new_qualifier: Option<&'a str>,
 }
 
 impl<'a> TableRenameScope<'a> {
@@ -1429,6 +1446,7 @@ impl<'a> TableRenameScope<'a> {
             qualifier_is_table: true,
             unqualified_names_table: true,
             table_qualifiers: None,
+            new_qualifier: None,
         }
     }
 
@@ -1504,7 +1522,18 @@ impl<'a> TableRenameScope<'a> {
     }
 
     fn renames_qualifier(&self, name: &ast::Name) -> bool {
-        self.qualifier_is_table && self.is_old_name(name)
+        self.new_qualifier.is_none() && self.qualifier_is_table && self.is_old_name(name)
+    }
+
+    fn renames_table_function(&self, name: &ast::QualifiedName) -> bool {
+        self.new_qualifier.is_none() && self.renames_table(name)
+    }
+
+    fn rewrite_table(&self, name: &mut ast::QualifiedName) {
+        match self.new_qualifier {
+            Some(qualifier) => name.namespace = Some(ast::Name::exact(qualifier.to_owned())),
+            None => name.name = self.new_name(),
+        }
     }
 
     fn is_old_name(&self, name: &ast::Name) -> bool {
@@ -1628,11 +1657,11 @@ fn rewrite_select_table_entry_table_refs(
     match st {
         ast::SelectTable::Table(ref mut name, _, _) => {
             if scope.renames_table(name) {
-                name.name = scope.new_name();
+                scope.rewrite_table(name);
             }
         }
         ast::SelectTable::TableCall(ref mut name, ref mut args, _) => {
-            if scope.renames_table(name) {
+            if scope.renames_table_function(name) {
                 name.name = scope.new_name();
             }
             for arg in args {
@@ -1671,7 +1700,7 @@ fn rewrite_expr_table_refs(expr: &mut ast::Expr, scope: TableRenameScope) {
                 }
                 ast::Expr::InTable { rhs, .. } => {
                     if scope.renames_table(rhs) {
-                        rhs.name = scope.new_name();
+                        scope.rewrite_table(rhs);
                     }
                 }
                 _ => {}

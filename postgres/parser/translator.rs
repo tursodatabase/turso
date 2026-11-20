@@ -8910,6 +8910,62 @@ pub fn try_extract_drop_schema(parse_result: &ParseResult) -> Option<PgDropSchem
     })
 }
 
+/// DROP TABLE, DROP VIEW or DROP MATERIALIZED VIEW that names several
+/// relations or has CASCADE. The frontend runs it as one DROP statement for
+/// each relation it drops.
+#[derive(Debug, Clone)]
+pub struct PgDropRelationsStmt {
+    /// `TABLE`, `VIEW` or `MATERIALIZED VIEW`.
+    pub kind: &'static str,
+    /// The parts of each name: the relation, or its schema and the relation.
+    pub names: Vec<Vec<String>>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+/// The DROP statement of `parse_result` when the frontend runs it as several
+/// statements: a DROP of tables or views with CASCADE or with several names.
+pub fn try_extract_drop_relations(parse_result: &ParseResult) -> Option<PgDropRelationsStmt> {
+    use pg_query::protobuf::{DropBehavior, ObjectType};
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let NodeRef::DropStmt(drop) = &nodes.first()?.0 else {
+        return None;
+    };
+    let kind = match ObjectType::try_from(drop.remove_type).ok()? {
+        ObjectType::ObjectTable => "TABLE",
+        ObjectType::ObjectView => "VIEW",
+        ObjectType::ObjectMatview => "MATERIALIZED VIEW",
+        _ => return None,
+    };
+    let cascade = DropBehavior::try_from(drop.behavior).ok() == Some(DropBehavior::DropCascade);
+    if !cascade && drop.objects.len() < 2 {
+        return None;
+    }
+    let names = drop
+        .objects
+        .iter()
+        .map(|object| match object.node.as_ref()?.to_ref() {
+            NodeRef::List(list) => list
+                .items
+                .iter()
+                .map(|part| match part.node.as_ref()?.to_ref() {
+                    NodeRef::String(part) => Some(part.sval.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(PgDropRelationsStmt {
+        kind,
+        names,
+        if_exists: drop.missing_ok,
+        cascade,
+    })
+}
+
 /// A REFRESH MATERIALIZED VIEW statement. Turso materialized views are live
 /// (auto-updating), so REFRESH does nothing.
 #[derive(Debug, Clone)]
@@ -9566,6 +9622,7 @@ pub enum FrontendStmt {
     DiscardAll,
     CreateSchema(PgCreateSchemaStmt),
     DropSchema(PgDropSchemaStmt),
+    DropRelations(PgDropRelationsStmt),
     RefreshMatview(PgRefreshMatviewStmt),
     CommentOn(PgCommentOnStmt),
     Grant(PgGrantStmt),
@@ -9604,6 +9661,9 @@ pub fn frontend_stmt(
     }
     if let Some(stmt) = try_extract_drop_schema(parse_result) {
         return Ok(Some(FrontendStmt::DropSchema(stmt)));
+    }
+    if let Some(stmt) = try_extract_drop_relations(parse_result) {
+        return Ok(Some(FrontendStmt::DropRelations(stmt)));
     }
     if let Some(stmt) = try_extract_refresh_matview(parse_result)? {
         return Ok(Some(FrontendStmt::RefreshMatview(stmt)));
@@ -10334,6 +10394,7 @@ mod tests {
                 FrontendStmt::DiscardAll => "discard all",
                 FrontendStmt::CreateSchema(_) => "create schema",
                 FrontendStmt::DropSchema(_) => "drop schema",
+                FrontendStmt::DropRelations(_) => "drop relations",
                 FrontendStmt::RefreshMatview(_) => "refresh matview",
                 FrontendStmt::CommentOn(_) => "comment on",
                 FrontendStmt::Grant(_) => "grant",

@@ -301,6 +301,11 @@ fn translate_statement(
     let mut stmt = stmt;
     let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
         && sequence::bind_sequence_names_in_stored_expressions(&mut stmt, resolver)?;
+    if resolver.catalog.dialect.binds_names_at_create() {
+        if let ast::Stmt::CreateView { select, .. } = &mut stmt {
+            view::bind_table_names(select, resolver);
+        }
+    }
 
     match stmt {
         ast::Stmt::AlterTable(alter) => {

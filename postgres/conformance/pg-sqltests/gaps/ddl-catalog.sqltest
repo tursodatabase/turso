@@ -638,7 +638,6 @@ expect {
 }
 
 # E-53: DROP TABLE CASCADE with dependent view
-@compat-gap "syntax:drop-table"
 test drop-table-cascade-with-dependent-view {
     CREATE TABLE t (id int);
     CREATE VIEW v AS SELECT id FROM t;
@@ -648,19 +647,14 @@ test drop-table-cascade-with-dependent-view {
 expect {
     0
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
 # E-54: DROP TABLE without CASCADE blocked by view
 @setup t_id_view_v
-@compat-gap "syntax:drop-table"
 test drop-table-without-cascade-blocked-by-view {
     DROP TABLE t;
 }
 @sqlstate 2BP01
 expect error {}
-expect @tursopg {
-}
 
 # E-55: SAVEPOINT / ROLLBACK TO
 test savepoint-rollback-to {

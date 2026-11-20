@@ -3,7 +3,7 @@ use crate::alloc::{
     TursoTryWithCapacityExt, TursoVecExt,
 };
 use crate::cdc::TURSO_CDC_VERSION_TABLE_NAME;
-use crate::dialect::{ScalarFuncContext, StatementTimes};
+use crate::dialect::{DependentObject, ScalarFuncContext, StatementTimes};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
@@ -17360,6 +17360,26 @@ pub fn op_drop_column(
     })??;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
+        let dropped = format!(
+            "column {column_name} of table {}",
+            conn.dialect().relation_name_in_messages(
+                &conn,
+                schema,
+                *namespace,
+                &normalized_table_name
+            )
+        );
+        let dependents = views_broken_by_dropped_column(
+            &conn,
+            schema,
+            *db,
+            *namespace,
+            &normalized_table_name,
+            &dropped,
+        );
+        if !dependents.is_empty() {
+            return Err(LimboError::dependent_objects(dropped, dependents));
+        }
         for (view_name, view) in schema.views(*namespace) {
             let view_select_sql = select_from_view_sql(&conn, *db, schema, *namespace, view_name);
             let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
@@ -17374,6 +17394,46 @@ pub fn op_drop_column(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// A description of each view that the dialect says depends on `table` of
+/// `namespace` and that can no longer be prepared now that the table has
+/// lost a column. `dropped` names the column, as in `column c of table t`.
+fn views_broken_by_dropped_column(
+    conn: &Arc<Connection>,
+    schema: &crate::schema::Schema,
+    db: usize,
+    namespace: NamespaceId,
+    table: &str,
+    dropped: &str,
+) -> Vec<String> {
+    if db != MAIN_DB_ID {
+        return Vec::new();
+    }
+    conn.dialect()
+        .relation_dependents(schema, namespace, table)
+        .iter()
+        .rev()
+        .filter(|dependent| {
+            let DependentObject::View { namespace, name } = &dependent.object;
+            let view_select_sql = select_from_view_sql(conn, db, schema, *namespace, name);
+            conn.prepare(view_select_sql.as_str()).is_err()
+        })
+        .map(|dependent| {
+            let DependentObject::View {
+                namespace: view_namespace,
+                name,
+            } = &dependent.object;
+            if dependent.depends_on.0 == namespace && dependent.depends_on.1 == table {
+                let view_name =
+                    conn.dialect()
+                        .relation_name_in_messages(conn, schema, *view_namespace, name);
+                format!("view {view_name} depends on {dropped}")
+            } else {
+                crate::translate::view::describe_dependent(conn, schema, dependent)
+            }
+        })
+        .collect()
 }
 
 /// SQL that selects from the view `view_name` of database `db`, named with
