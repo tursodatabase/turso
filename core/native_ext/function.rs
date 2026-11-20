@@ -1,8 +1,8 @@
 use super::ExtensionState;
+use crate::dialect::ScalarFuncContext;
 use crate::function::ReturnType;
-use crate::sync::Arc;
 use crate::types::{AggContext, IOResultOr, ValueBlob};
-use crate::{Connection, IOResult, LimboError, Register, Result, Value};
+use crate::{IOResult, LimboError, Register, Result, Value};
 use std::fmt::Debug;
 
 pub trait ScalarFunction: Debug + Send + Sync {
@@ -16,8 +16,11 @@ pub trait ScalarCall: Send + Sync {
     /// function cannot declare one type and return another.
     type Output: ScalarReturn;
 
-    fn step(&mut self, connection: &Arc<Connection>, args: &[Register])
-        -> IOResultOr<Self::Output>;
+    fn step(
+        &mut self,
+        context: &ScalarFuncContext<'_>,
+        args: &[Register],
+    ) -> IOResultOr<Self::Output>;
 }
 
 /// A Rust type a native scalar function can return.
@@ -98,12 +101,12 @@ impl<T: ScalarReturn> ScalarReturn for Option<T> {
 /// `ScalarCall` with its output converted to `Value`, so calls of different
 /// output types can be stored behind one trait object.
 pub trait ScalarStep: Send + Sync {
-    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value>;
+    fn step(&mut self, context: &ScalarFuncContext<'_>, args: &[Register]) -> IOResultOr<Value>;
 }
 
 impl<C: ScalarCall> ScalarStep for C {
-    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
-        Ok(ScalarCall::step(self, connection, args)?.map(ScalarReturn::into_value))
+    fn step(&mut self, context: &ScalarFuncContext<'_>, args: &[Register]) -> IOResultOr<Value> {
+        Ok(ScalarCall::step(self, context, args)?.map(ScalarReturn::into_value))
     }
 }
 
@@ -131,7 +134,7 @@ impl<F: ScalarFunction> ScalarFactory for F {
 pub fn step_scalar(
     state: &mut ExtensionState,
     factory: &dyn ScalarFactory,
-    connection: &Arc<Connection>,
+    context: &ScalarFuncContext<'_>,
     args: &[Register],
 ) -> IOResultOr<Value> {
     if matches!(state, ExtensionState::None) {
@@ -140,7 +143,7 @@ pub fn step_scalar(
     let ExtensionState::ScalarCall(call) = state else {
         unreachable!("scalar instruction requires scalar call state");
     };
-    let result = call.step(connection, args);
+    let result = call.step(context, args);
     if !matches!(result, Ok(IOResult::IO(_))) {
         *state = ExtensionState::None;
     }

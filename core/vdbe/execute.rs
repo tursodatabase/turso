@@ -3,7 +3,7 @@ use crate::alloc::{
     TursoTryWithCapacityExt, TursoVecExt,
 };
 use crate::cdc::TURSO_CDC_VERSION_TABLE_NAME;
-use crate::dialect::ScalarFuncContext;
+use crate::dialect::{ScalarFuncContext, StatementTimes};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
@@ -5458,7 +5458,7 @@ pub fn op_auto_commit(
                 // Write: set by Transaction opcode for BEGIN IMMEDIATE/EXCLUSIVE; leave as-is.
                 // Read: a SELECT in autocommit mode is still open; leave as-is — the
                 //       next write inside the explicit transaction will upgrade to Write.
-                conn.auto_commit.store(false, Ordering::SeqCst);
+                conn.start_explicit_transaction(pager.io.current_time_wall_clock());
                 conn.set_tx_read_only(*read_only);
                 return Ok(InsnFunctionStepResult::Done);
             }
@@ -5693,7 +5693,7 @@ pub fn op_savepoint(
                             !conn.tx_is_poisoned(),
                             "rollback-only marker leaked outside an explicit transaction"
                         );
-                        conn.auto_commit.store(false, Ordering::SeqCst);
+                        conn.start_explicit_transaction(pager.io.current_time_wall_clock());
                     }
 
                     state.pc += 1;
@@ -6110,6 +6110,10 @@ pub fn op_program(
                         .current_time
                         .get_or_insert_with(|| pager.io.current_time_wall_clock());
                     statement.set_current_time(now);
+                    let times = *state
+                        .statement_times
+                        .get_or_insert_with(|| StatementTimes::new(now, connection));
+                    statement.set_statement_times(times);
                     statement.set_query_deadline(state.query_deadline);
                     let res = statement.step_subprogram();
                     match res {
@@ -10644,6 +10648,7 @@ pub fn op_function(
                 connection,
                 io: pager.io.as_ref(),
                 clock: &clock,
+                statement_times: Cell::from_mut(&mut state.statement_times),
                 collation: func.collation,
             };
             let value = connection.dialect().call_scalar(
@@ -10711,11 +10716,19 @@ pub fn op_function(
             }
         }
         crate::function::Func::External(f) => {
+            let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+            let context = ScalarFuncContext {
+                connection,
+                io: pager.io.as_ref(),
+                clock: &clock,
+                statement_times: Cell::from_mut(&mut state.statement_times),
+                collation: func.collation,
+            };
             let value = return_if_io!(
                 state,
                 f.func.call_scalar(
                     &mut state.extension_state,
-                    connection,
+                    &context,
                     &state.registers[*start_reg..*start_reg + arg_count],
                 )
             );

@@ -34,23 +34,82 @@ use crate::{
     schema::{BTreeTable, Schema, SchemaBuilder},
     security::{policy::RowPolicy, roles::RoleId},
     vdbe::{builder::ProgramBuilder, Register},
-    Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
+    Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value,
+    WallClockInstant, IO,
 };
-use std::{any::Any, ops::Range, sync::Arc};
+use std::{any::Any, cell::Cell, ops::Range, sync::Arc};
 use turso_parser::ast::{self, Cmd, CreateTableBody, IdentityKind, Privilege, QualifiedName, Stmt};
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
 pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
 
-/// What a built-in scalar function may read besides its arguments.
+/// What a scalar function may read besides its arguments.
 pub struct ScalarFuncContext<'a> {
-    pub connection: &'a Connection,
+    pub connection: &'a Arc<Connection>,
     pub io: &'a dyn IO,
     /// The statement's clock: every function of one step sees the same time.
     pub clock: &'a dyn Clock,
+    /// Set by the first call of `statement_times` in the statement.
+    pub statement_times: &'a Cell<Option<StatementTimes>>,
     /// The collation of the call site, for functions that compare arguments.
     pub collation: CollationSeq,
+}
+
+impl ScalarFuncContext<'_> {
+    /// The same times for every call until the statement ends, triggers
+    /// included.
+    pub fn statement_times(&self) -> StatementTimes {
+        if let Some(times) = self.statement_times.get() {
+            return times;
+        }
+        let times = StatementTimes::new(self.io.current_time_wall_clock(), self.connection);
+        self.statement_times.set(Some(times));
+        times
+    }
+
+    /// The wall clock now. The statement start is read first, so no time
+    /// read during a statement is earlier than its `statement_times`.
+    pub fn current_time(&self) -> WallClockInstant {
+        self.statement_times();
+        self.io.current_time_wall_clock()
+    }
+}
+
+/// When the client command that holds the running statements was received,
+/// and when the implicit transaction around it started. A command with
+/// several statements, or an extended-protocol batch that ends at Sync, is
+/// one transaction in autocommit mode, so its statements share these times.
+#[derive(Debug, Clone, Copy)]
+pub struct CommandTimes {
+    pub statement: WallClockInstant,
+    pub transaction: WallClockInstant,
+}
+
+/// When a statement and its transaction started, as PostgreSQL's
+/// `statement_timestamp()` and `now()` report them.
+#[derive(Debug, Clone, Copy)]
+pub struct StatementTimes {
+    pub statement: WallClockInstant,
+    pub transaction: WallClockInstant,
+}
+
+impl StatementTimes {
+    /// Times for a statement that starts at `now`. In autocommit mode the
+    /// statement is its own transaction, unless a command set the times.
+    pub(crate) fn new(now: WallClockInstant, connection: &Connection) -> Self {
+        let command = connection.command_times();
+        let statement = command.map_or(now, |times| times.statement);
+        let transaction = if connection.get_auto_commit() {
+            command.map_or(now, |times| times.transaction)
+        } else {
+            connection.explicit_transaction_start()
+        };
+        Self {
+            statement,
+            transaction,
+        }
+    }
 }
 
 /// Start of the comment in stored table SQL that lists the positions and kinds
