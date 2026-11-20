@@ -1,6 +1,5 @@
 use crate::sync::{Arc, RwLock};
 use std::borrow::Cow;
-use std::fmt::Write as _;
 use std::iter::successors;
 use std::result::Result;
 
@@ -774,8 +773,13 @@ impl InPlaceJsonPath {
     fn push_array_index(&mut self, idx: &usize) {
         self.last_element = LastElement::Index(*idx as i64);
         let start = self.string.len();
-        // Writing to a String cannot fail.
-        let _ = write!(self.string, "[{idx}]");
+        // write! costs about 300 instructions for an index, in the formatting code.
+        let mut digits = [0u8; 20];
+        let digits = jsonb::decimal_digits(*idx as u64, &mut digits);
+        self.string.push('[');
+        self.string
+            .extend(digits.iter().map(|&digit| char::from(digit)));
+        self.string.push(']');
         self.element_lengths.push(self.string.len() - start);
     }
 
