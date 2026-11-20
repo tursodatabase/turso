@@ -15,6 +15,12 @@ const SIZE_MARKER_16BIT: u8 = 13;
 const SIZE_MARKER_32BIT: u8 = 14;
 const MAX_JSON_DEPTH: usize = 1000;
 const INFINITY_CHAR_COUNT: u8 = 5;
+/// The bytes that the parser reserves after the input length. Each container
+/// reserves the rest of the input and 3 bytes (see [Jsonb::start_container]).
+/// With this space, that reservation does not allocate for most documents. For
+/// example, it allocates for a document that starts with more than 7 opening
+/// brackets.
+const PARSE_CAPACITY_SLACK: usize = 8;
 
 const fn make_whitespace_table() -> [u8; 256] {
     let mut table = [0u8; 256];
@@ -1868,7 +1874,7 @@ impl Jsonb {
         }
 
         let header_pos = self
-            .start_container(ElementType::OBJECT)
+            .start_container(ElementType::OBJECT, input.len() - pos)
             .map_err(|_| parse_error("Failed to write header", pos))?;
         let mut first = true;
 
@@ -1939,7 +1945,7 @@ impl Jsonb {
         }
 
         let header_pos = self
-            .start_container(ElementType::ARRAY)
+            .start_container(ElementType::ARRAY, input.len() - pos)
             .map_err(|_| parse_error("Failed to write header", pos))?;
         let mut first = true;
 
@@ -1982,12 +1988,22 @@ impl Jsonb {
     /// have a payload of that size. For them, the payload does not move when
     /// the real header is written, as it does after a 1-byte placeholder.
     ///
+    /// `remaining` is the number of input bytes after the opening bracket. The
+    /// parser reserves the input length and pushes the payload bytes with no
+    /// check of the capacity, because each payload byte comes from one input
+    /// byte. The placeholder uses one byte more than the bracket, so it takes
+    /// the space of a payload byte, and a push of the payload can then grow the
+    /// buffer. That allocation cannot report a failure, and the process aborts
+    /// when it fails. For this reason, the function reserves space for all the
+    /// remaining input bytes after the placeholder, and for the header that a
+    /// number writes before its digits.
+    ///
     /// The function is inlined always: when the compiler chose not to inline
     /// it into the recursive parser, the parser got slower by about 2%.
     #[inline(always)]
-    fn start_container(&mut self, element_type: ElementType) -> Result<usize> {
+    fn start_container(&mut self, element_type: ElementType, remaining: usize) -> Result<usize> {
         let header_pos = self.len();
-        self.data.try_reserve(2)?;
+        self.data.try_reserve(remaining + 3)?;
         self.data.push(element_type as u8 | (SIZE_MARKER_8BIT << 4));
         self.data.push(0);
         Ok(header_pos)
@@ -2770,7 +2786,7 @@ impl Jsonb {
     }
 
     pub fn from_str_tracking(input: &str) -> PResult<(Self, ParseInfo)> {
-        let mut result = Self::new(input.len())?;
+        let mut result = Self::new(input.len() + PARSE_CAPACITY_SLACK)?;
         let input = input.as_bytes();
         let mut info = ParseInfo::default();
 
@@ -5176,6 +5192,33 @@ mod tests {
             assert!(jsonb.data[header.len()..]
                 .chunks(4)
                 .all(|member| member == [0x17, b'k', 0x13, b'1']));
+        }
+    }
+
+    #[test]
+    fn parsed_containers_fit_in_the_reserved_capacity() {
+        // Each of these documents has at least as many JSONB bytes as input
+        // bytes while it is parsed, before a container header shrinks. The
+        // parser pushes them with no check of the capacity, so the buffer must
+        // not grow: that allocation cannot report a failure.
+        let inputs = [
+            "1",
+            "-12",
+            "[5,6]",
+            "[[1]]",
+            "[[1,2],[3,4]]",
+            "[[[[[[[1]]]]]]]",
+            "[\"a\",[1,2]]",
+            "[true,null,[0]]",
+        ];
+        for input in inputs {
+            let (jsonb, _) = Jsonb::from_str_tracking(input).unwrap();
+            assert_eq!(
+                jsonb.data.capacity(),
+                input.len() + PARSE_CAPACITY_SLACK,
+                "the buffer grew for {input}"
+            );
+            assert_eq!(jsonb.to_string().unwrap(), input.replace(' ', ""));
         }
     }
 
