@@ -1,0 +1,13 @@
+setting up plain: 50000 rows
+pulling plain: rows=1000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=1128
+pulling plain: rows=1000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=1128
+pulling plain: rows=2000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=0
+pulling plain: rows=2000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=1445521
+pulling plain: rows=4000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=0
+pulling plain: rows=4000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=0
+pulling plain: rows=10000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=0
+pulling plain: rows=10000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=0
+pulling plain: rows=20000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=0
+pulling plain: rows=20000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=0
+pulling plain: rows=40000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=0
+pulling plain: rows=40000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=0

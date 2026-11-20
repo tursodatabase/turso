@@ -1,0 +1,13 @@
+setting up indexed: 50000 rows
+pulling indexed: rows=1000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=1128
+pulling indexed: rows=1000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=1128
+pulling indexed: rows=2000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=0
+pulling indexed: rows=2000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=1582991
+pulling indexed: rows=4000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=0
+pulling indexed: rows=4000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=0
+pulling indexed: rows=10000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=0
+pulling indexed: rows=10000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=0
+pulling indexed: rows=20000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=0
+pulling indexed: rows=20000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=0
+pulling indexed: rows=40000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=0
+pulling indexed: rows=40000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=0

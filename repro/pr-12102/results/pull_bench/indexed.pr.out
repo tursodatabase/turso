@@ -1,0 +1,19 @@
+
+running 1 test
+test pull_scaling::large_update_pull_scaling ... case,rows,repeat,checkpoint_policy,remote_update_seconds,pull_seconds,checkpoint_seconds,cycle_seconds,log_bytes_before_pull,log_bytes_after_pull,log_bytes_after_checkpoint
+indexed,1000,1,automatic,0.018797,0.071500,0.000000,0.071500,1128,1582991,1582991
+indexed,1000,1,after_pull,0.018797,0.064612,0.050092,0.114704,1128,1582991,0
+indexed,2000,1,after_pull,0.035135,0.145778,0.083704,0.229482,0,3167505,0
+indexed,2000,1,automatic,0.035135,0.217568,0.000000,0.217568,1582991,0,0
+indexed,4000,1,automatic,0.073656,0.481664,0.000000,0.481664,0,0,0
+indexed,4000,1,after_pull,0.073656,0.538842,0.003142,0.541983,0,0,0
+indexed,10000,1,after_pull,0.195402,1.294231,0.004147,1.298378,0,0,0
+indexed,10000,1,automatic,0.195402,1.518506,0.000000,1.518506,0,0,0
+indexed,20000,1,automatic,0.427814,2.694558,0.000000,2.694558,0,0,0
+indexed,20000,1,after_pull,0.427814,3.410365,0.006911,3.417277,0,0,0
+indexed,40000,1,after_pull,0.961039,5.719602,0.010687,5.730289,0,0,0
+indexed,40000,1,automatic,0.961039,6.956523,0.000000,6.956523,0,0,0
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 31.10s
+

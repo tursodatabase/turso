@@ -1,0 +1,13 @@
+PRAGMA mvcc_checkpoint_threshold = -1;
+.timer on
+-- One transaction deletes @N@ checkpointed rows, then inserts them again.
+-- Pull replay uses this order: all deletes, then all upserts.
+BEGIN;
+DELETE FROM items WHERE id <= @N@;
+WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x < @N@)
+INSERT INTO items (id,payload,version,c0,c1,c2,c3,c4,c5,c6)
+SELECT x,printf('%01400d',x),1,x+1,x+1,x+2,x+3,x+4,x+5,x+6 FROM seq;
+COMMIT;
+SELECT count(*), sum(version), sum(c0) FROM items;
+PRAGMA integrity_check;
+PRAGMA wal_checkpoint(TRUNCATE);

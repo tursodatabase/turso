@@ -1,0 +1,13 @@
+setting up generated: 50000 rows
+pulling generated: rows=1000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=1128
+pulling generated: rows=1000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=1128
+pulling generated: rows=2000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=0
+pulling generated: rows=2000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=1445521
+pulling generated: rows=4000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=0
+pulling generated: rows=4000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=0
+pulling generated: rows=10000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=0
+pulling generated: rows=10000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=0
+pulling generated: rows=20000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=0
+pulling generated: rows=20000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=0
+pulling generated: rows=40000, repeat=1, checkpoint_policy=after_pull, log_bytes_before_pull=0
+pulling generated: rows=40000, repeat=1, checkpoint_policy=automatic, log_bytes_before_pull=0

@@ -1,0 +1,11 @@
+PRAGMA mvcc_checkpoint_threshold = -1;
+-- One committed transaction deletes 4,000 checkpointed rows and inserts them
+-- again. Their old index entries stay in the B-tree, hidden by MVCC versions,
+-- until a checkpoint. The lookups that follow go into that range.
+BEGIN;
+DELETE FROM items WHERE id <= 4000;
+WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x < 4000)
+INSERT INTO items (id,payload,version,c0,c1,c2,c3,c4,c5,c6)
+SELECT x,printf('%01400d',x),1,x+1,x+1,x+2,x+3,x+4,x+5,x+6 FROM seq;
+COMMIT;
+.timer on
