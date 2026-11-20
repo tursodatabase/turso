@@ -169,6 +169,12 @@ date, time, timetz and interval, and arrays of every date and time type
 `CURRENT_DATE`, `CURRENT_TIME`, `LOCALTIME` and the built-in functions that
 return date, time, timetz or interval, such as `age` and `make_date`.
 
+`now()`, `transaction_timestamp()` and `CURRENT_TIMESTAMP` are the time the
+transaction started, and `LOCALTIMESTAMP` is that time as a timestamp in UTC;
+`statement_timestamp()` is the time the client's query arrived, shared by all
+statements of one query string;
+`clock_timestamp()` reads the clock at each call.
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |

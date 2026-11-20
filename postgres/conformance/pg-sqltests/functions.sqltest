@@ -2686,3 +2686,122 @@ expect error {
 expect @tursopg error {
     json_tree as a function in FROM is not supported
 }
+
+# now() is the time the transaction started, so every row a transaction
+# inserts gets the same DEFAULT now(). The generate_series between the
+# INSERTs lets the clock move.
+test default-now-is-the-same-for-every-insert-of-a-transaction {
+    CREATE TABLE created (id int, created_at timestamptz NOT NULL DEFAULT now());
+    BEGIN;
+    INSERT INTO created (id) VALUES (1);
+    SELECT count(*) FROM generate_series(1, 100000);
+    INSERT INTO created (id) VALUES (2);
+    SELECT count(DISTINCT created_at) FROM created;
+    COMMIT;
+}
+expect {
+    100000
+    1
+}
+
+# Outside a transaction, now() and statement_timestamp() are the time the
+# statement started: one value for all rows. clock_timestamp() changes.
+test now-and-statement-timestamp-are-the-same-for-every-row {
+    SELECT count(DISTINCT now()), count(DISTINCT transaction_timestamp()),
+           count(DISTINCT statement_timestamp())
+    FROM generate_series(1, 100000);
+    SELECT count(*) FROM generate_series(1, 100000) WHERE now() <> statement_timestamp();
+    SELECT count(*) FROM (
+        SELECT count(DISTINCT clock_timestamp()) AS n FROM generate_series(1, 100000)
+    ) AS clock WHERE n > 1;
+}
+expect {
+    1|1|1
+    0
+    1
+}
+
+# LOCALTIMESTAMP is the time the transaction started, as a timestamp in the
+# session's time zone (UTC), so it equals now() to the microsecond.
+test localtimestamp-is-the-start-of-the-transaction {
+    BEGIN;
+    SELECT count(*) FROM generate_series(1, 100000);
+    SELECT count(*) WHERE LOCALTIMESTAMP = now()::timestamp;
+    SELECT count(*) WHERE LOCALTIMESTAMP = CURRENT_TIMESTAMP::timestamp;
+    COMMIT;
+}
+expect {
+    100000
+    1
+    1
+}
+
+# In a transaction, statement_timestamp() is the time the statement started,
+# which is later than now() in the second statement.
+test statement-timestamp-is-later-than-now-in-a-later-statement {
+    BEGIN;
+    SELECT count(*) FROM generate_series(1, 100000);
+    SELECT count(*)
+    WHERE statement_timestamp() > now() AND statement_timestamp() > transaction_timestamp();
+    COMMIT;
+}
+expect {
+    100000
+    1
+}
+
+# ALTER TABLE fills the existing rows with one value of DEFAULT now().
+test add-column-default-now-gives-every-existing-row-one-value {
+    CREATE TABLE filled (x int);
+    INSERT INTO filled SELECT g FROM generate_series(1, 20000) AS g;
+    ALTER TABLE filled ADD COLUMN d timestamptz DEFAULT now();
+    SELECT count(d), count(DISTINCT d) FROM filled;
+}
+expect {
+    20000|1
+}
+
+# The statement starts before any clock_timestamp() call in it.
+test clock-timestamp-is-never-earlier-than-statement-timestamp {
+    SELECT count(*) FROM generate_series(1, 100000) WHERE clock_timestamp() < statement_timestamp();
+}
+expect {
+    0
+}
+
+# PostgreSQL rounds to the given precision. tursopg cannot yet, so it refuses
+# every explicit precision, including 0.
+test current-timestamp-with-precision-0-has-no-fraction {
+    SELECT current_timestamp(0) = date_trunc('second', current_timestamp(0));
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP is not supported
+}
+
+test localtimestamp-with-precision-0-has-no-fraction {
+    SELECT localtimestamp(0) = date_trunc('second', localtimestamp(0));
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP is not supported
+}
+
+test default-current-timestamp-with-precision-0-has-no-fraction {
+    CREATE TABLE ts_precision (id int, t timestamptz DEFAULT current_timestamp(0));
+    INSERT INTO ts_precision (id) VALUES (1);
+    SELECT t = date_trunc('second', t) FROM ts_precision;
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP is not supported
+}

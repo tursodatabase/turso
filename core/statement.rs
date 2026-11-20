@@ -909,6 +909,12 @@ impl Statement {
         self.state.current_time = Some(now);
     }
 
+    /// Makes a trigger or foreign key action see the statement and
+    /// transaction times of the statement that runs it.
+    pub(crate) fn set_statement_times(&mut self, times: crate::dialect::StatementTimes) {
+        self.state.statement_times = Some(times);
+    }
+
     /// Makes a trigger or foreign key action stop at the deadline of the
     /// statement that runs it.
     pub(crate) fn set_query_deadline(&mut self, deadline: Option<crate::MonotonicInstant>) {
