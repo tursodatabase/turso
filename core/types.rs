@@ -8,14 +8,15 @@ use crate::alloc::*;
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
 use crate::index_method::IndexMethodCursor;
-use crate::numeric::format_float;
 use crate::numeric::nonnan::NonNan;
 use crate::numeric::Numeric;
+use crate::numeric::{format_float, IntegerText};
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::sqlite3_ondisk::{
-    read_integer, read_value, read_value_serial_type, read_varint, varint_len, write_varint,
+    read_integer, read_value, read_value_serial_type, read_varint, try_read_integer, varint_len,
+    write_varint,
 };
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
@@ -188,6 +189,32 @@ impl Text {
 
     pub fn as_str(&self) -> &str {
         &self.value
+    }
+
+    /// Replaces the text with `lhs` followed by `rhs`, in the same buffer
+    /// when the buffer is large enough. The subtype becomes TEXT, as for
+    /// [Text::new]. An allocation failure leaves the text as it was.
+    pub(crate) fn replace_with_concat(&mut self, lhs: &str, rhs: &str) -> Result<()> {
+        let needed = lhs.len() + rhs.len();
+        match &mut self.value {
+            Cow::Owned(string) => {
+                if string.capacity() < needed {
+                    string.try_reserve(needed - string.len())?;
+                }
+                string.clear();
+                string.push_str(lhs);
+                string.push_str(rhs);
+            }
+            Cow::Borrowed(_) => {
+                let mut string = String::new();
+                string.try_reserve(needed)?;
+                string.push_str(lhs);
+                string.push_str(rhs);
+                self.value = Cow::Owned(string);
+            }
+        }
+        self.subtype = TextSubtype::Text;
+        Ok(())
     }
 }
 
@@ -553,7 +580,7 @@ impl From<Text> for String {
 pub type ValueBlob = crate::alloc::Vec<u8>;
 
 #[inline]
-pub(crate) fn value_blob_from_slice(
+pub fn value_blob_from_slice(
     bytes: &[u8],
 ) -> std::result::Result<ValueBlob, crate::alloc::TryReserveError> {
     bytes.try_to_vec()
@@ -906,7 +933,19 @@ impl Value {
         match self {
             Value::Null => None,
             Value::Text(text) => Some(Cow::Borrowed(text.as_str())),
-            other => Some(Cow::Owned(other.to_string())),
+            other => Some(Cow::Owned(other.non_text_to_string())),
+        }
+    }
+
+    /// The same text as `to_string()`, for a value that is not TEXT. A
+    /// number does not go through the formatting machinery. Out of line, so
+    /// that `cast_text_ref` stays small enough to inline.
+    #[inline(never)]
+    fn non_text_to_string(&self) -> String {
+        match self {
+            Value::Numeric(Numeric::Integer(i)) => IntegerText::new(*i).as_str().to_owned(),
+            Value::Numeric(Numeric::Float(f)) => format_float(f64::from(*f)),
+            other => other.to_string(),
         }
     }
 }
@@ -936,7 +975,7 @@ impl Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Null => write!(f, ""),
-            Self::Numeric(Numeric::Integer(i)) => write!(f, "{i}"),
+            Self::Numeric(Numeric::Integer(i)) => f.write_str(IntegerText::new(*i).as_str()),
             Self::Numeric(Numeric::Float(fl)) => f.write_str(&format_float(f64::from(*fl))),
             Self::Text(s) => write!(f, "{}", s.as_str()),
             Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),
@@ -1394,6 +1433,7 @@ impl<'a> TryFrom<ValueRef<'a>> for &'a str {
 
 mod immutable_record {
     use super::*;
+    use smallvec::SmallVec;
 
     /// This struct serves the purpose of not allocating multiple vectors of bytes if not needed.
     /// A value in a record that has already been serialized can stay serialized and what this struct offsers
@@ -1520,54 +1560,30 @@ mod immutable_record {
         write_varint(out, value)
     }
 
-    /// Writes the bytes of `value` for `serial_type` at the start of `out`
-    /// and returns how many it wrote.
+    /// Appends the bytes of `value` for `serial_type` to `out`.
     #[inline(always)]
-    fn write_value(out: &mut [u8], value: ValueRef<'_>, serial_type: SerialType) -> usize {
-        let bytes: &[u8] = match value {
-            ValueRef::Null => return 0,
-            ValueRef::Numeric(Numeric::Integer(i)) => {
-                return match serial_type.kind() {
-                    SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 => 0,
-                    SerialTypeKind::I8 => {
-                        out[0] = i as u8;
-                        1
-                    }
-                    SerialTypeKind::I16 => {
-                        out[..2].copy_from_slice(&(i as i16).to_be_bytes());
-                        2
-                    }
-                    // Without the most significant byte.
-                    SerialTypeKind::I24 => {
-                        out[..3].copy_from_slice(&(i as i32).to_be_bytes()[1..]);
-                        3
-                    }
-                    SerialTypeKind::I32 => {
-                        out[..4].copy_from_slice(&(i as i32).to_be_bytes());
-                        4
-                    }
-                    // Without the two most significant bytes.
-                    SerialTypeKind::I48 => {
-                        out[..6].copy_from_slice(&i.to_be_bytes()[2..]);
-                        6
-                    }
-                    SerialTypeKind::I64 => {
-                        out[..8].copy_from_slice(&i.to_be_bytes());
-                        8
-                    }
-                    other => panic!("Serial type is not an integer: {other:?}"),
-                };
-            }
+    fn append_value(out: &mut ValueBlob, value: ValueRef<'_>, serial_type: SerialType) {
+        match value {
+            ValueRef::Null => {}
+            ValueRef::Numeric(Numeric::Integer(i)) => match serial_type.kind() {
+                SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 => {}
+                SerialTypeKind::I8 => out.push(i as u8),
+                SerialTypeKind::I16 => out.extend_from_slice(&(i as i16).to_be_bytes()),
+                // Without the most significant byte.
+                SerialTypeKind::I24 => out.extend_from_slice(&(i as i32).to_be_bytes()[1..]),
+                SerialTypeKind::I32 => out.extend_from_slice(&(i as i32).to_be_bytes()),
+                // Without the two most significant bytes.
+                SerialTypeKind::I48 => out.extend_from_slice(&i.to_be_bytes()[2..]),
+                SerialTypeKind::I64 => out.extend_from_slice(&i.to_be_bytes()),
+                other => panic!("Serial type is not an integer: {other:?}"),
+            },
             ValueRef::Numeric(Numeric::Float(f)) => {
                 let fval: f64 = f.into();
-                out[..8].copy_from_slice(&fval.to_be_bytes());
-                return 8;
+                out.extend_from_slice(&fval.to_be_bytes());
             }
-            ValueRef::Text(t) => t.value.as_bytes(),
-            ValueRef::Blob(b) => b,
-        };
-        out[..bytes.len()].copy_from_slice(bytes);
-        bytes.len()
+            ValueRef::Text(t) => out.extend_from_slice(t.value.as_bytes()),
+            ValueRef::Blob(b) => out.extend_from_slice(b),
+        }
     }
 
     #[inline(always)]
@@ -1580,6 +1596,11 @@ mod immutable_record {
         let values = iter.try_collect::<Result<_>>()??;
         Ok(values)
     }
+
+    /// The values of a record, decoded by `get_values_inline`. A record with at
+    /// most 8 values keeps them in place, without a heap allocation. A larger
+    /// inline capacity makes each move of the vector a larger copy.
+    pub type InlineValues<'a> = SmallVec<[ValueRef<'a>; 8]>;
 
     fn values_range(payload: &[u8], range: std::ops::Range<usize>) -> Result<Vec<ValueRef<'_>>> {
         let mut iter = iter(payload)?;
@@ -1867,6 +1888,20 @@ mod immutable_record {
             values(self.get_payload())
         }
 
+        /// Decodes all values, like `get_values`, without a heap allocation for
+        /// a record with at most 8 values.
+        #[inline]
+        pub fn get_values_inline(&self) -> Result<InlineValues<'_>> {
+            let mut values = InlineValues::new();
+            for value in iter(self.get_payload())? {
+                let value = value?;
+                // A failed allocation for a longer record is an error, as in `values`.
+                values.try_reserve(1).map_err(|_| LimboError::OutOfMemory)?;
+                values.push(value);
+            }
+            Ok(values)
+        }
+
         pub fn get_two_values(
             &self,
             idx1: usize,
@@ -2006,21 +2041,23 @@ mod immutable_record {
                 return Err(LimboError::TooBig);
             }
             buf.try_reserve_exact(total_size)?;
-            buf.resize(total_size, 0);
+            // Only the header is zeroed before the writing pass. The values
+            // are appended after it, so the bytes of a large text or blob are
+            // written once.
+            buf.resize(header_size, 0);
 
             // Writing pass: each serial type goes into the header and each
             // value after it, the varints straight into their place.
             let mut header_pos = write_short_varint(&mut buf[..header_size], header_size as u64);
-            let mut value_pos = header_size;
             for value in values {
                 let value = value.as_value_ref();
                 let serial_type = SerialType::from(value);
                 header_pos +=
                     write_short_varint(&mut buf[header_pos..header_size], serial_type.into());
-                value_pos += write_value(&mut buf[value_pos..], value, serial_type);
+                append_value(&mut buf, value, serial_type);
             }
             crate::turso_assert!(
-                header_pos == header_size && value_pos == total_size,
+                header_pos == header_size && buf.len() == total_size,
                 "record sizing pass and writing pass disagree"
             );
             Ok(Self {
@@ -2057,7 +2094,9 @@ mod immutable_record {
             &self.payload
         }
 
-        #[inline]
+        // The sorter and the MVCC cursors call this once per row. The
+        // compiler inlines it into Sorter::next only in some builds.
+        #[inline(always)]
         #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::RecordCopy)]
         pub fn start_serialization(&mut self, payload: &[u8]) -> Result<()> {
             let blob = self.as_blob_mut();
@@ -2125,7 +2164,7 @@ mod immutable_record {
     }
 }
 
-pub use immutable_record::{ImmutableRecord, ImmutableRecordRef, RecordBuf};
+pub use immutable_record::{ImmutableRecord, ImmutableRecordRef, InlineValues, RecordBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Record {
@@ -2245,6 +2284,41 @@ impl<'a> ValueIterator<'a> {
     #[inline(always)]
     pub fn set_data_section(&self, data: &'a [u8]) {
         self.data_section.set(data);
+    }
+
+    /// The next value and its number of data bytes, if the value is an
+    /// integer and all of its bytes are in the record. Else None, also for a
+    /// corrupt record: [Iterator::next] then gives the error. The iterator
+    /// does not move. [Self::skip_value] moves it past the integer.
+    #[inline(always)]
+    pub fn peek_integer(&self) -> Option<(i64, usize)> {
+        let &serial_type = self.header_section.get().first()?;
+        try_read_integer(self.data_section.get(), serial_type)
+    }
+
+    /// The next value, its number of serial type bytes and its number of
+    /// data bytes, if the value is a TEXT whose bytes are all in the record
+    /// and are valid UTF-8. Else None, also for a corrupt record:
+    /// [Iterator::next] then gives the error. The iterator does not move.
+    #[inline(always)]
+    pub fn peek_text(&self) -> Option<(&'a str, usize, usize)> {
+        let (serial_type, header_len) = read_varint(self.header_section.get()).ok()?;
+        if serial_type < 13 || serial_type % 2 == 0 {
+            return None;
+        }
+        let size = usize::try_from((serial_type - 13) / 2).ok()?;
+        let text = validate_utf8(self.data_section.get().get(..size)?)?;
+        Some((text, header_len, size))
+    }
+
+    /// Moves the iterator past a value that [Self::peek_integer] or
+    /// [Self::peek_text] gave, which has `header_len` serial type bytes and
+    /// `data_len` data bytes.
+    #[inline(always)]
+    pub fn skip_value(&self, header_len: usize, data_len: usize) {
+        self.header_section
+            .set(&self.header_section.get()[header_len..]);
+        self.data_section.set(&self.data_section.get()[data_len..]);
     }
 }
 
@@ -4265,6 +4339,34 @@ mod tests {
         let mut iter = ValueIterator::new(&buf).unwrap();
         let _ = iter.next();
         let _ = iter.next();
+    }
+
+    #[test]
+    fn get_values_inline_matches_get_values() {
+        for count in 0..20usize {
+            let values: Vec<Value> = (0..count)
+                .map(|i| match i % 3 {
+                    0 => Value::from_i64(i as i64),
+                    1 => Value::build_text(format!("text-{i}")),
+                    _ => Value::Null,
+                })
+                .try_collect()
+                .unwrap();
+            let record = create_record(values);
+            let record_ref = ImmutableRecordRef::from_bin_record(record.get_payload());
+            let inline = record_ref.get_values_inline().unwrap();
+            assert_eq!(
+                inline.as_slice(),
+                record_ref.get_values().unwrap().as_slice()
+            );
+            assert_eq!(inline.spilled(), count > 8);
+        }
+        // The header says that the second value is a TEXT of 10 bytes, but
+        // the payload ends after 2 of them.
+        let corrupt = [3u8, 1, 33, 7, b'a', b'b'];
+        let record_ref = ImmutableRecordRef::from_bin_record(&corrupt);
+        assert!(record_ref.get_values().is_err());
+        assert!(record_ref.get_values_inline().is_err());
     }
 
     pub fn compare_immutable_for_testing(

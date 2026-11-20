@@ -67,6 +67,7 @@ impl Drop for SyncBusyGuard {
 }
 
 pub use turso_core::types::FromValue;
+use turso_core::SessionRole;
 pub use turso_ext::{
     AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarFunction,
     StepFunction, Value as ExtensionValue, ValueDestructor,
@@ -1084,7 +1085,9 @@ impl TursoDatabase {
         };
 
         let connection = if let Some(page_codec) = &self.config.page_codec {
-            db.connect(ConnectOpts::new().with_page_codec(page_codec.clone()))?
+            db.connect(
+                ConnectOpts::new(SessionRole::Superuser).with_page_codec(page_codec.clone()),
+            )?
         } else {
             // Parse encryption key if configured - needed at connect time
             // which sets up encryption context before reading pages.
@@ -1093,7 +1096,9 @@ impl TursoDatabase {
             } else {
                 None
             };
-            db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?
+            db.connect(
+                ConnectOpts::new(SessionRole::Superuser).with_encryption_key(encryption_key),
+            )?
         };
 
         Ok(TursoConnection::new(&self.config, connection))
@@ -1366,12 +1371,14 @@ impl TursoConnection {
         // Check if we have a cached version
         if let Some(cached) = self.cached_statements.lock().unwrap().get(sql_str) {
             if cached.program.is_compatible_with(&self.connection) {
-                let program = turso_core::Program::from_prepared(
-                    cached.program.clone(),
+                let program = turso_core::Program::from_prepared(cached.program.clone());
+                let statement = Statement::new(
+                    program,
                     self.connection.clone(),
+                    self.connection.get_pager(),
+                    cached.query_mode,
+                    0,
                 );
-                let statement =
-                    Statement::new(program, self.connection.get_pager(), cached.query_mode, 0);
                 let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
                 let stmt_id = self.track_stmt(&handle);
                 return Ok(Box::new(TursoStatement {
@@ -1669,7 +1676,7 @@ impl TursoStatement {
         let stmt = handle
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
-        if sync_operation_active(self.sync_busy.as_ref(), &stmt.get_program().connection) {
+        if sync_operation_active(self.sync_busy.as_ref(), stmt.get_connection()) {
             return Err(sync_busy_error());
         }
         step_inner(stmt, self.async_io, waker)
@@ -1686,7 +1693,7 @@ impl TursoStatement {
         let stmt = handle
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
-        if sync_operation_active(self.sync_busy.as_ref(), &stmt.get_program().connection) {
+        if sync_operation_active(self.sync_busy.as_ref(), stmt.get_connection()) {
             return Err(sync_busy_error());
         }
 
@@ -1727,7 +1734,7 @@ impl TursoStatement {
         let stmt = handle
             .as_ref()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
-        if sync_operation_active(self.sync_busy.as_ref(), &stmt.get_program().connection) {
+        if sync_operation_active(self.sync_busy.as_ref(), stmt.get_connection()) {
             return Err(sync_busy_error());
         }
         let Some(row) = stmt.row() else {

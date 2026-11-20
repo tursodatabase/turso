@@ -33,7 +33,9 @@ use codspeed_criterion_compat::{
 
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, PlatformIO, StepResult};
+use turso_core::{
+    ConnectOpts, Database, DatabaseOpts, OpenFlags, PlatformIO, SessionRole, StepResult,
+};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
@@ -173,7 +175,9 @@ fn open_turso() -> TursoDatabase {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     execute_turso(&db, &conn, "PRAGMA fts_merge_threshold = 0");
     execute_turso(
         &db,

@@ -24,6 +24,7 @@ use crate::{
     },
     runner::env::{ShadowTablesMut, SimConnection, SimulationType, SimulatorEnv},
 };
+use turso_core::SessionRole;
 
 #[derive(Debug, Clone)]
 pub(crate) struct InteractionPlan {
@@ -984,7 +985,7 @@ fn reopen_database(env: &mut SimulatorEnv, power_loss: bool) -> Result<()> {
                     .db
                     .as_ref()
                     .expect("db to be Some")
-                    .connect(ConnectOpts::new())
+                    .connect(ConnectOpts::new(SessionRole::Superuser))
                     .unwrap();
                 conn.pragma_update("journal_mode", "'mvcc'")
                     .expect("enable mvcc");

@@ -1,9 +1,10 @@
 use crate::alloc::{
-    ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator,
-    TursoTryWithCapacityExt, TursoVecInExt, ALLOC_ERR_MSG,
+    ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator, TursoVecInExt,
+    ALLOC_ERR_MSG,
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
+use crate::mvcc::sqlite_schema_row::{types_table_root_page, SqliteSchemaRow};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
@@ -20,13 +21,15 @@ use crate::storage::btree::BTreeKey;
 use crate::storage::btree::CursorTrait;
 use crate::storage::btree::CursorValidState;
 use crate::storage::pager::SavepointResult;
-use crate::storage::sqlite3_ondisk::DatabaseHeader;
+use crate::storage::sqlite3_ondisk::{try_read_integer, DatabaseHeader};
 use crate::storage::wal::{CheckpointMode, CheckpointResult, TursoRwLock};
 use crate::sync::atomic::{fence, AtomicBool, AtomicI64};
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
+use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
+use crate::types::cmp_in_column;
 use crate::types::compare_immutable;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
@@ -43,11 +46,8 @@ use crate::PageSize;
 use crate::Result;
 #[cfg(feature = "conn_raw_api")]
 use crate::Value;
-use crate::ValueRef;
 use crate::{io::FileSyncType, io_yield_one, return_if_io};
-use crate::{
-    turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable, Numeric,
-};
+use crate::{turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable};
 use crate::{Connection, Pager, SyncMode};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
@@ -59,13 +59,12 @@ use std::ops::Bound;
 use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
+use turso_parser::ast::SortOrder;
 
-pub mod checkpoint_state_machine;
+pub mod checkpoint;
 #[cfg(not(nightly))]
 mod version_chain;
-pub use checkpoint_state_machine::{
-    sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
-};
+pub use checkpoint::{sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine};
 
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
@@ -81,11 +80,9 @@ use super::persistent_storage::logical_log::{
 #[cfg(feature = "conn_raw_api")]
 use super::portable_logical::{
     is_portable_logical_name, is_portable_schema_row, is_portable_table_schema_row,
-    portable_schema_row_from_record, PortableLogicalBuilder, PortableObjectMapEntry,
+    PortableLogicalBuilder, PortableObjectMapEntry,
 };
 
-#[cfg(test)]
-pub mod hermitage_tests;
 #[cfg(test)]
 pub mod tests;
 
@@ -220,7 +217,63 @@ impl SortableIndexKey {
         })
     }
 
+    /// Always inlined, so that the skip list loops compare two keys whose
+    /// first columns are different integers without a call.
+    #[inline(always)]
     fn compare(&self, other: &Self) -> Result<std::cmp::Ordering> {
+        if let Some(ordering) = self.compare_first_integers(other) {
+            return Ok(ordering);
+        }
+        self.compare_columns(other)
+    }
+
+    /// The order of the two keys when their first columns are integers that
+    /// differ, under a text collation. This is the result of
+    /// [Self::compare_columns] for such keys. Else None.
+    #[inline(always)]
+    fn compare_first_integers(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        // The values come before the metadata: for a key whose first value
+        // is not an integer, as in an index on a TEXT column, this returns
+        // after a few instructions.
+        let lhs = Self::first_integer(self.key.get_payload())?;
+        let rhs = Self::first_integer(other.key.get_payload())?;
+        let key_info = self.metadata.key_info.first()?;
+        if self.metadata.num_cols.min(other.metadata.num_cols) == 0
+            || !matches!(key_info.collation, CollationSeq::Text(_))
+        {
+            return None;
+        }
+        match lhs.cmp(&rhs) {
+            std::cmp::Ordering::Equal => None,
+            ordering => Some(match key_info.sort_order {
+                SortOrder::Asc => ordering,
+                SortOrder::Desc => ordering.reverse(),
+            }),
+        }
+    }
+
+    /// The first value of a record if it is an integer, and the header size
+    /// and the first serial type take one byte each, as in most index keys.
+    /// Else None, also for a record that is not valid: the general
+    /// comparison then gives the order or the error. This function makes no
+    /// error value, because an error value adds code to each inlined copy
+    /// of [Self::compare].
+    #[inline(always)]
+    fn first_integer(payload: &[u8]) -> Option<i64> {
+        let &[header_size, serial_type, ..] = payload else {
+            return None;
+        };
+        // A header size of 0x80 or more takes more than one byte, and a
+        // header of fewer than two bytes has no serial type.
+        if !(2..0x80).contains(&header_size) {
+            return None;
+        }
+        let data = payload.get(usize::from(header_size)..)?;
+        try_read_integer(data, serial_type).map(|(value, _)| value)
+    }
+
+    #[inline(never)]
+    fn compare_columns(&self, other: &Self) -> Result<std::cmp::Ordering> {
         // We sometimes need to compare a shorter key to a longer one,
         // for example when seeking with an index key that is a prefix of the full key.
         let num_cols = self.metadata.num_cols.min(other.metadata.num_cols);
@@ -229,14 +282,52 @@ impl SortableIndexKey {
         let mut rhs = other.key.iter()?;
 
         for i in 0..num_cols {
+            // Two integers compare by value under every text collation, and
+            // two texts compare byte by byte under BINARY, so they need no
+            // ValueRef. The skip list compares keys many times for each
+            // insert and seek. Other values, and a corrupt record, take the
+            // general path below.
+            if let Some(key_info) = self.metadata.key_info.get(i) {
+                if matches!(key_info.collation, CollationSeq::Text(_)) {
+                    if let (Some((lhs_int, lhs_size)), Some((rhs_int, rhs_size))) =
+                        (lhs.peek_integer(), rhs.peek_integer())
+                    {
+                        lhs.skip_value(1, lhs_size);
+                        rhs.skip_value(1, rhs_size);
+                        let cmp = match key_info.sort_order {
+                            SortOrder::Asc => lhs_int.cmp(&rhs_int),
+                            SortOrder::Desc => lhs_int.cmp(&rhs_int).reverse(),
+                        };
+                        if cmp != std::cmp::Ordering::Equal {
+                            return Ok(cmp);
+                        }
+                        continue;
+                    }
+                }
+                if key_info.collation == CollationSeq::BINARY {
+                    if let (
+                        Some((lhs_text, lhs_header_len, lhs_size)),
+                        Some((rhs_text, rhs_header_len, rhs_size)),
+                    ) = (lhs.peek_text(), rhs.peek_text())
+                    {
+                        lhs.skip_value(lhs_header_len, lhs_size);
+                        rhs.skip_value(rhs_header_len, rhs_size);
+                        let cmp = match key_info.sort_order {
+                            SortOrder::Asc => lhs_text.cmp(rhs_text),
+                            SortOrder::Desc => lhs_text.cmp(rhs_text).reverse(),
+                        };
+                        if cmp != std::cmp::Ordering::Equal {
+                            return Ok(cmp);
+                        }
+                        continue;
+                    }
+                }
+            }
+
             let lhs_value = lhs.next().expect("we already checked length")?;
             let rhs_value = rhs.next().expect("we already checked length")?;
 
-            let cmp = compare_immutable(
-                std::iter::once(&lhs_value),
-                std::iter::once(&rhs_value),
-                &self.metadata.key_info[i..i + 1],
-            );
+            let cmp = cmp_in_column(&lhs_value, &rhs_value, &self.metadata.key_info[i]);
 
             if cmp != std::cmp::Ordering::Equal {
                 return Ok(cmp);
@@ -592,8 +683,8 @@ impl LogRecord {
     /// [`DurableStorage::serialize_row_version`] and
     /// [`DurableStorage::serialize_database_header`] instead so the bytes are
     /// appended one op at a time.
-    #[cfg(test)]
-    pub(crate) fn for_test(
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn for_test(
         tx_timestamp: TxID,
         row_versions: &[(RowID, RowVersion)],
         header: Option<DatabaseHeader>,
@@ -610,7 +701,7 @@ impl LogRecord {
     }
 
     /// Test-only: append one row-version op to the payload buffer.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub(crate) fn push_row_version_for_test(&mut self, row_id: &RowID, row_version: &RowVersion) {
         crate::mvcc::persistent_storage::logical_log::LogSerializer::new(&mut self.buf)
             .serialize_op_entry(row_id, row_version, None)
@@ -619,7 +710,7 @@ impl LogRecord {
     }
 
     /// Test-only: append a `DatabaseHeader` op to the payload buffer.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub(crate) fn set_header_for_test(&mut self, header: &DatabaseHeader) {
         assert!(!self.has_header, "header op appended twice in test");
         crate::mvcc::persistent_storage::logical_log::LogSerializer::new(&mut self.buf)
@@ -706,11 +797,12 @@ fn table_name_for_rootpage_in_mvcc_schema<Clock: LogicalClock, A: ConcurrentAllo
             if row_version.end().is_some() {
                 continue;
             }
-            let Ok(row) = portable_schema_row_from_record(row_version.payload(entry.key())) else {
+            let Ok(row) = SqliteSchemaRow::from_record_bytes(row_version.payload(entry.key()))
+            else {
                 continue;
             };
-            if row.rootpage == rootpage || row.rootpage == alternate_rootpage {
-                return Some(row.name);
+            if row.root_page == rootpage || row.root_page == alternate_rootpage {
+                return Some(row.name.to_string());
             }
         }
     }
@@ -1323,7 +1415,7 @@ impl<A: RowVersionAllocator> std::fmt::Display for Transaction<A> {
 
 /// Transaction state.
 #[derive(Debug, Clone, PartialEq, Copy)]
-enum TransactionState {
+pub enum TransactionState {
     Active,
     /// Preparing state includes the end_ts so other transactions can compare
     /// timestamps during validation to resolve races (first-committer-wins).
@@ -1525,6 +1617,11 @@ pub struct BuildLogRecordCtx {
     /// op after both row-version passes complete (preserves on-disk
     /// order: ops first, header last).
     pub pending_header: Option<DatabaseHeader>,
+    /// Indexes of the sqlite_schema entries in the write set, found by the
+    /// first step of BuildLogRecord. The write set does not change after the
+    /// transaction leaves the Active state, so the later steps read these
+    /// entries instead of all the entries of the write set.
+    pub schema_entries: Option<Vec<usize>>,
 }
 
 /// Iteration state for the chunked `RewriteLiveVersions` step.
@@ -1538,7 +1635,7 @@ pub struct RewriteLiveVersionsCtx {
 /// How many rowids `BuildLogRecord` / `RewriteLiveVersions` process before
 /// yielding to the executor. Picked to amortize state-machine overhead
 /// while keeping a CREATE INDEX on a 2M-row table responsive.
-const MVCC_COMMIT_BATCH_SIZE: usize = 1024;
+pub const MVCC_COMMIT_BATCH_SIZE: usize = 1024;
 
 #[derive(Debug)]
 pub enum WriteRowState {
@@ -1555,7 +1652,7 @@ pub enum WriteRowState {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum CommitYieldPoint {
+pub enum CommitYieldPoint {
     CommitValidation,
     WaitForDependencies,
     /// Fires once on the first entry into `step_build_log_record` (cursor=0,
@@ -1585,7 +1682,7 @@ pub(crate) enum CommitYieldPoint {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum ExclusiveTxYieldPoint {
+pub enum ExclusiveTxYieldPoint {
     AfterTimestampCheckBeforeCas,
 }
 
@@ -2002,6 +2099,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             cursor: 0,
             schema_process: true,
             pending_header,
+            schema_entries: None,
         });
         Ok(())
     }
@@ -2388,31 +2486,35 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         let mut btree_ids_removed_from_schema_by_tx: HashSet<MVTableId> = HashSet::default();
         {
             let write_set = tx.write_set.lock();
-            let frame_writes_schema = write_set
-                .entries
-                .iter()
-                .any(|(id, _)| id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID);
+            // Each step of BuildLogRecord processes MVCC_COMMIT_BATCH_SIZE
+            // entries, and each step needs the sqlite_schema entries. A scan
+            // of the whole write set in each step made a large commit
+            // quadratic, so only the first step scans it.
+            let schema_entries = ctx.schema_entries.get_or_insert_with(|| {
+                write_set
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (id, _))| id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID)
+                    .map(|(index, _)| index)
+                    .collect()
+            });
 
             // Decoding sqlite_schema records is only needed for DDL frames.
             // Normal DML frames do not touch sqlite_schema, so avoid parsing
             // schema records while committing the common path.
-            if frame_writes_schema {
+            if !schema_entries.is_empty() {
                 let mut schema_roots_created_and_deleted_in_tx: HashSet<i64> = HashSet::default();
                 let mut schema_roots_deleted_by_tx: HashSet<i64> = HashSet::default();
                 let mut schema_roots_present_before_tx: HashSet<i64> = HashSet::default();
                 let mut schema_roots_present_after_tx: HashSet<i64> = HashSet::default();
 
-                for (id, row_versions) in &write_set.entries {
-                    // Only sqlite_schema entries can yield a btree identity. The
-                    // common path (CREATE INDEX on a populated table, bulk DML)
-                    // has tens of thousands of write_set entries that are NOT
-                    // sqlite_schema; locking each and parsing every version was
-                    // the dominant cost of MVCC commit on this branch.
-                    if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-                        continue;
-                    }
+                for &index in schema_entries.iter() {
+                    // Only sqlite_schema entries can yield a btree identity.
+                    let (id, row_versions) = &write_set.entries[index];
                     for row_version in row_versions.read().iter() {
-                        let Some(identity) = sqlite_schema_btree_identity(id.table_id, row_version)
+                        let Some(identity) =
+                            sqlite_schema_btree_identity(id.table_id, row_version)?
                         else {
                             continue;
                         };
@@ -2834,7 +2936,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                         ..
                     } if *table_id == SQLITE_SCHEMA_MVCC_TABLE_ID => {
                         let rowid = rowid.row_id.to_int_or_panic();
-                        let row = portable_schema_row_from_record(record_bytes)?;
+                        let row = SqliteSchemaRow::from_record_bytes(record_bytes)?;
                         has_portable_schema_changes |= is_portable_schema_row(&row);
                         schema_rowids.push(rowid);
                         schema_upserts.insert(rowid, row);
@@ -2850,7 +2952,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                             ));
                         }
                         let schema_rowid = rowid.row_id.to_int_or_panic();
-                        let row = portable_schema_row_from_record(record_bytes)?;
+                        let row = SqliteSchemaRow::from_record_bytes(record_bytes)?;
                         has_portable_schema_changes |= is_portable_schema_row(&row);
                         schema_rowids.push(schema_rowid);
                         schema_deletes.insert(schema_rowid, row);
@@ -2878,17 +2980,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     (Some(old_row), Some(new_row)) => {
                         if is_portable_table_schema_row(old_row) {
                             table_refs_by_id.insert(
-                                portable_table_id_from_rootpage(old_row.rootpage),
+                                portable_table_id_from_rootpage(old_row.root_page),
                                 PortableTableRef {
-                                    name: old_row.name.clone(),
+                                    name: old_row.name.to_string(),
                                 },
                             );
                         }
                         if is_portable_table_schema_row(new_row) {
                             table_refs_by_id.insert(
-                                portable_table_id_from_rootpage(new_row.rootpage),
+                                portable_table_id_from_rootpage(new_row.root_page),
                                 PortableTableRef {
-                                    name: new_row.name.clone(),
+                                    name: new_row.name.to_string(),
                                 },
                             );
                         }
@@ -2896,9 +2998,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     (None, Some(new_row)) => {
                         if is_portable_table_schema_row(new_row) {
                             table_refs_by_id.insert(
-                                portable_table_id_from_rootpage(new_row.rootpage),
+                                portable_table_id_from_rootpage(new_row.root_page),
                                 PortableTableRef {
-                                    name: new_row.name.clone(),
+                                    name: new_row.name.to_string(),
                                 },
                             );
                         }
@@ -2906,9 +3008,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     (Some(old_row), None) => {
                         if is_portable_table_schema_row(old_row) {
                             table_refs_by_id.insert(
-                                portable_table_id_from_rootpage(old_row.rootpage),
+                                portable_table_id_from_rootpage(old_row.root_page),
                                 PortableTableRef {
-                                    name: old_row.name.clone(),
+                                    name: old_row.name.to_string(),
                                 },
                             );
                         }
@@ -3396,6 +3498,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     cursor: 0,
                     schema_process: true,
                     pending_header,
+                    schema_entries: None,
                 });
                 return Ok(TransitionResult::Continue);
             }
@@ -3541,7 +3644,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
             CommitState::SyncLogicalLog { end_ts } => {
                 // Skip fsync unless this transaction or a written group member uses FULL.
-                // NORMAL mode skips fsync on commit (but still fsyncs on checkpoint).
+                // In NORMAL mode, the commit becomes durable when a checkpoint writes it to
+                // the database file and fsyncs that file.
                 if !self.log_sync_required() {
                     tracing::debug!("Skipping fsync of logical log (synchronous!=full)");
                     self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
@@ -4248,8 +4352,7 @@ pub enum RecoverLogicalLogState {
 pub struct RecoverCtx {
     reader: Box<StreamingLogicalLogReader>,
     preserved_table_valued_functions: Vec<Arc<crate::vtab::VirtualTable>>,
-    /// Fallback schema cookie (pre-read) used by `recover_build_schema` only
-    /// when `global_header` is unset.
+    /// Schema cookie of the database file header, for when `global_header` is unset.
     cookie: u32,
     persistent_tx_ts_max: u64,
     replay_cutoff_ts: u64,
@@ -4343,11 +4446,31 @@ impl RootEntry {
     }
 }
 
-/// SkipMap / GC counters for debugging (see [`MvStore::debug_gc_snapshot`]).
-/// Test-only harness data, not part of the public MVCC API.
-#[cfg(test)]
+/// What a transaction looked like when [`MvStore::tx_snapshot`] read it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TxSnapshot {
+    pub state: TransactionState,
+    pub begin_ts: u64,
+    /// Number of transactions this one waits for before it can commit.
+    pub commit_dep_count: u64,
+    /// Whether a transaction this one waited for aborted, so that this one has to abort too.
+    pub abort_now: bool,
+    /// Whether the commit record of this transaction is in the logical log.
+    pub log_appended: bool,
+}
+
+/// Commit timestamps that say how far the commits and the checkpoints of a store have come.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GcDebugSnapshot {
+pub struct Watermarks {
+    /// Commit timestamp of the newest committed transaction.
+    pub last_committed_tx_ts: u64,
+    /// Highest commit timestamp that a checkpoint has made durable.
+    pub durable_txid_max: u64,
+}
+
+/// SkipMap / GC counters for debugging (see [`MvStore::debug_gc_snapshot`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcDebugSnapshot {
     pub rows_slots: usize,
     pub rows_empty_slots: usize,
     pub rows_versions: usize,
@@ -4361,6 +4484,13 @@ pub(crate) struct GcDebugSnapshot {
     pub logical_log_offset: u64,
     pub logical_log_size: u64,
     pub active_txs: usize,
+    /// Number of removed transactions whose final state the store still remembers.
+    pub finalized_tx_states: usize,
+    /// Whether the incremental GC of table rows stopped part way, so that the next pass
+    /// continues from there instead of from the first row.
+    pub table_sweep_unfinished: bool,
+    /// Like `table_sweep_unfinished`, for index rows.
+    pub index_sweep_unfinished: bool,
     pub min_reader_mark: WalPos,
     pub backfill_floor: WalPos,
 }
@@ -4904,6 +5034,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Release the MVCC stop-the-world gate acquired by `try_begin_vacuum_gate`.
     pub(crate) fn release_vacuum_gate(&self) {
         self.blocking_checkpoint_lock.unlock();
+    }
+
+    /// Runs [`Self::reset_after_vacuum`] while holding the vacuum gate, as
+    /// VACUUM does.
+    #[cfg(feature = "test_helper")]
+    pub fn reset_after_vacuum_for_testing(&self, header: DatabaseHeader, schema: &Schema) {
+        self.try_begin_vacuum_gate()
+            .expect("no transaction should be active");
+        self.reset_after_vacuum(header, schema);
+        self.release_vacuum_gate();
     }
 
     /// VACUUM copies the physical DB image, so any transaction frames in the
@@ -5600,6 +5740,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ) -> Result<bool> {
         tracing::trace!("update(tx_id={}, row.id={:?})", tx_id, row.id);
         if !self.delete_from_table_or_index(tx_id, row.id.clone(), maybe_index_id, None)? {
+            // The caller may have read a version created by a transaction that was
+            // committing at the time and has aborted since, which removed the version.
+            // This transaction depends on that one, so it must abort too.
+            if self.tx_should_abort(tx_id) {
+                return Err(LimboError::CommitDependencyAborted);
+            }
             return Ok(false);
         }
         self.insert_to_table_or_index(tx_id, row, maybe_index_id)?;
@@ -6677,17 +6823,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// This function starts a new transaction in the database and returns a `TxID` value
     /// that you can use to perform operations within the transaction. All changes made within the
     /// transaction are isolated from other transactions until you commit the transaction.
-    #[cfg(any(test, feature = "bench"))]
     pub fn begin_tx(&self, pager: Arc<Pager>) -> Result<TxID> {
         self.begin_tx_with_schema_generation(pager, None)
     }
 
     /// `begin_tx` with the connection's validated `schema_generation` gate (see
-    /// `Connection::mvcc_begin_schema_generation`). Used by the statement begin path so a passive
-    /// checkpoint that republishes physical roots into the begin window forces a reprepare instead
-    /// of a transaction beginning against stale roots.
-    #[cfg(any(test, feature = "bench"))]
-    pub fn begin_tx_with_schema_generation(
+    /// `Connection::mvcc_begin_schema_generation`). With the gate, a passive checkpoint that
+    /// republishes physical roots into the begin window forces a reprepare instead of a
+    /// transaction beginning against stale roots.
+    pub(crate) fn begin_tx_with_schema_generation(
         &self,
         pager: Arc<Pager>,
         expected_schema_generation: Option<u64>,
@@ -7027,7 +7171,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// invisible to MVCC header lookups even though the pager itself honors `N` for on-disk
     /// page allocation. Only valid before any data has been written; matches the same
     /// precondition `Connection::reset_page_size` enforces via `db.initialized()`.
-    pub fn set_global_page_size(&self, size: PageSize) {
+    pub(crate) fn set_global_page_size(&self, size: PageSize) {
         let mut header = self.global_header.write();
         if let Some(header) = header.as_mut() {
             header.page_size = size;
@@ -7056,7 +7200,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    pub fn with_header_mut<T, F>(&self, f: F, tx_id: Option<&TxID>) -> Result<T>
+    #[cfg(feature = "test_helper")]
+    pub fn with_global_header_mut_for_testing<T>(
+        &self,
+        f: impl Fn(&mut DatabaseHeader) -> T,
+    ) -> Result<T> {
+        self.with_header_mut(f, None)
+    }
+
+    pub(crate) fn with_header_mut<T, F>(&self, f: F, tx_id: Option<&TxID>) -> Result<T>
     where
         F: Fn(&mut DatabaseHeader) -> T,
     {
@@ -7458,6 +7610,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// the set, so comparing two reads from that connection is race-free.
     pub fn tx_write_set_len(&self, tx_id: TxID) -> Option<usize> {
         Some(self.txs.get(&tx_id)?.value().write_set.lock().len())
+    }
+
+    /// What the transaction looks like now, or None when the store no longer tracks it.
+    pub fn tx_snapshot(&self, tx_id: TxID) -> Option<TxSnapshot> {
+        let tx = self.txs.get(&tx_id)?;
+        let tx = tx.value();
+        Some(TxSnapshot {
+            state: tx.state.load(),
+            begin_ts: tx.begin_ts,
+            commit_dep_count: tx.commit_dep_counter.load(Ordering::Acquire),
+            abort_now: tx.abort_now.load(Ordering::Acquire),
+            log_appended: tx.log_appended.load(Ordering::Acquire),
+        })
+    }
+
+    /// How far commits and checkpoints of this store have come.
+    pub fn watermarks(&self) -> Watermarks {
+        Watermarks {
+            last_committed_tx_ts: self.last_committed_tx_ts.load(Ordering::SeqCst),
+            durable_txid_max: self.durable_txid_max.load(Ordering::SeqCst),
+        }
     }
 
     /// Rolls back a savepoint within a transaction.
@@ -8025,8 +8198,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Debug SkipMap / GC counters. Walks every chain; not for hot paths.
-    #[cfg(test)]
-    pub(crate) fn debug_gc_snapshot(&self) -> GcDebugSnapshot {
+    pub fn debug_gc_snapshot(&self) -> GcDebugSnapshot {
         let mut rows_empty_slots = 0;
         let mut rows_versions = 0;
         for entry in self.rows.iter() {
@@ -8065,6 +8237,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             logical_log_offset: self.logical_log_offset(),
             logical_log_size: self.get_logical_log_file().size().unwrap_or(0),
             active_txs: self.txs.len(),
+            finalized_tx_states: self.finalized_tx_states.len(),
+            table_sweep_unfinished: self.gc_table_cursor.lock().is_some(),
+            index_sweep_unfinished: self.gc_index_cursor.lock().is_some(),
             min_reader_mark: self.compute_min_reader_mark(),
             backfill_floor: *self.backfill_floor.read(),
         }
@@ -8112,9 +8287,71 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.commit_coordinator.group_commit_enabled()
     }
 
-    #[cfg(test)]
+    /// Number of commit records that the last group commit wrote together.
+    #[cfg(any(test, feature = "test_helper"))]
     pub fn last_group_commit_size(&self) -> usize {
         self.commit_coordinator.last_group_size()
+    }
+
+    /// Takes the lock that a commit holds while it writes the logical log, so
+    /// that commits started meanwhile wait for it. Returns false if it is
+    /// already held.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn lock_commits_for_testing(&self) -> bool {
+        self.commit_coordinator.pager_commit_lock.write()
+    }
+
+    /// Releases the lock taken by [`Self::lock_commits_for_testing`] and wakes
+    /// the commits that wait for it.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn unlock_commits_for_testing(&self) {
+        self.commit_coordinator.unlock_pager_commit_lock();
+    }
+
+    /// Number of commits that wait for the commit lock.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn waiting_commit_count_for_testing(&self) -> usize {
+        self.commit_coordinator.parked_tickets().len()
+    }
+
+    /// Number of times commits ran the step that waits for the commit lock.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn commit_wait_count_for_testing(&self) -> usize {
+        self.commit_coordinator.park_calls()
+    }
+
+    /// Makes GC treat every transaction up to `tx_id` as written to the WAL by
+    /// a checkpoint, whether a checkpoint wrote it or not.
+    #[cfg(feature = "test_helper")]
+    pub fn set_durable_txid_max_for_testing(&self, tx_id: u64) {
+        self.durable_txid_max.store(tx_id, Ordering::SeqCst);
+    }
+
+    /// Moves `tx_id` to Preparing with a new commit timestamp, as if its
+    /// commit had started and not finished.
+    #[cfg(feature = "test_helper")]
+    pub fn start_commit_for_testing(&self, tx_id: TxID) {
+        self.get_commit_timestamp(|ts| {
+            self.txs
+                .get(&tx_id)
+                .expect("the transaction is active")
+                .value()
+                .state
+                .store(TransactionState::Preparing(ts));
+        });
+    }
+
+    /// The number of entries in the write set of transaction `tx_id`, and the
+    /// number of distinct version chains that they point to.
+    #[cfg(feature = "test_helper")]
+    pub fn write_set_counts_for_testing(&self, tx_id: TxID) -> (usize, usize) {
+        let tx = self.txs.get(&tx_id).expect("transaction should exist");
+        let write_set = tx.value().write_set.lock();
+        let distinct_chains: HashSet<usize> = write_set
+            .iter()
+            .map(|(_, row_versions)| Arc::as_ptr(row_versions) as usize)
+            .collect();
+        (write_set.len(), distinct_chains.len())
     }
 
     /// Whether an incremental GC pass should run now: inline GC is enabled
@@ -9148,20 +9385,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ///
     /// The returned completion must finish before reopening/recovering MVCC
     /// state. Otherwise recovery could replay stale local logical-log frames on
-    /// top of the restored database image.
+    /// top of the restored database image. To make the reset durable, call
+    /// `sync_logical_log` after the completion finishes.
     pub fn reset_logical_log_after_external_restore(&self) -> Result<Completion> {
+        if self.storage.encryption_ctx().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "external restore is not supported with built-in encryption".into(),
+            ));
+        }
+
         self.storage.reset_to_fresh_header()
     }
 
-    /// Return the durable sync completion for the freshly reset logical log.
-    ///
-    /// This is separate from `reset_logical_log_after_external_restore` so
-    /// callers can drive the reset completion cooperatively, then issue the
-    /// ordered sync only after the header/truncate group has completed.
-    pub fn sync_logical_log_after_external_restore(
-        &self,
-        connection: &Arc<Connection>,
-    ) -> Result<Option<Completion>> {
+    /// Fsync the logical log and return the completion. When `synchronous` is OFF on
+    /// `connection`, do nothing and return `None`.
+    pub fn sync_logical_log(&self, connection: &Arc<Connection>) -> Result<Option<Completion>> {
         if connection.get_sync_mode() != SyncMode::Off {
             let pager = connection.pager.load().clone();
             return Ok(Some(self.storage.sync(pager.get_sync_type())?));
@@ -9232,13 +9470,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             self.storage.set_header(header);
                         }
                         HeaderReadResult::NoLog => {
-                            if !connection.experimental_mvcc_passive_checkpoint_enabled() {
-                                return Err(LimboError::Corrupt(
-                                    "WAL has committed frames but logical log header is missing"
-                                        .to_string(),
-                                )
-                                .into());
-                            }
+                            // Committed WAL + empty/absent log. Passive checkpoints leave
+                            // this as their steady state. A TRUNCATE checkpoint leaves it
+                            // too when the process dies between truncating the logical log
+                            // (step 8) and truncating the WAL (step 10): the log is only
+                            // truncated to 0 once every frame in it is at or below the
+                            // boundary committed to the WAL, so the WAL holds everything
+                            // the log did. Completing the checkpoint loses nothing; failing
+                            // closed made the database permanently unopenable (#7480).
                         }
                         HeaderReadResult::Invalid => {
                             // Present but undecodable: a torn header write / genuine
@@ -9471,133 +9710,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .and_then(|e| e.value().root_page)
             .map(|r| r as i64)
             .unwrap_or(root_page)
-    }
-
-    /// Build an `Arc<Schema>` from a set of sqlite_schema rows (keyed by rowid)
-    /// and the CREATE TYPE statements `type_sqls`. Used by the checkpoint's
-    /// snapshot-consistent `BuildLocalSchemaView` (btree + MVCC-delta merge at
-    /// snapshot_ts).
-    pub(crate) fn build_schema_from_rows(
-        &self,
-        connection: &Arc<Connection>,
-        schema_rows: &HashMap<i64, ImmutableRecordRef<'static>>,
-        type_sqls: &[String],
-        preserved_table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
-    ) -> Result<Arc<Schema>> {
-        let pager = connection.pager.load().clone();
-        let cookie = self
-            .global_header
-            .read()
-            .as_ref()
-            .map(|header| header.schema_cookie.get())
-            .unwrap_or(
-                pager
-                    .io
-                    .block(|| pager.with_header(|header| header.schema_cookie))?
-                    .get(),
-            );
-        let mut fresh = Schema::with_options(
-            connection.db.experimental_custom_types_enabled(),
-            connection.db.dialect().as_ref(),
-        )?;
-        fresh.schema_version = cookie;
-        Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
-        let mut from_sql_indexes = crate::alloc::vec![];
-        let mut automatic_indices = HashMap::default();
-        let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
-        let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-        let mut materialized_view_info: HashMap<String, crate::schema::StoredMaterializedView> =
-            HashMap::default();
-        let syms = connection.syms.read();
-        let mv_store = connection.db.get_mv_store().clone();
-
-        let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
-        sorted_rowids.sort_unstable();
-        for rowid in &sorted_rowids {
-            let record = &schema_rows[rowid];
-            let ty = match record.get_value_opt(0) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema type must be text".to_string(),
-                    ));
-                }
-            };
-            let name = match record.get_value_opt(1) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema name must be text".to_string(),
-                    ));
-                }
-            };
-            let table_name = match record.get_value_opt(2) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema tbl_name must be text".to_string(),
-                    ));
-                }
-            };
-            let root_page = match record.get_value_opt(3) {
-                Some(ValueRef::Numeric(Numeric::Integer(v))) => v,
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema root_page must be integer".to_string(),
-                    ));
-                }
-            };
-            // A negative root is a not-yet-materialized placeholder. If a (passive) checkpoint
-            // has since materialized this object, resolve to its real positive root so the
-            // rebuilt schema reflects the btree page — otherwise integrity_check skips the
-            // negative root and reports its materialized page as orphaned ("never used").
-            let root_page = if root_page < 0 {
-                self.table_id_to_rootpage
-                    .get(&MVTableId::from(root_page))
-                    .filter(|e| e.value().is_live())
-                    .and_then(|e| e.value().root_page)
-                    .map(|r| r as i64)
-                    .unwrap_or(root_page)
-            } else {
-                root_page
-            };
-            let sql = match record.get_value_opt(4) {
-                Some(ValueRef::Text(v)) => Some(v.as_str()),
-                _ => None,
-            };
-            let attached_resolver = |alias: &str| -> Option<usize> {
-                connection
-                    .current_qualifiers()
-                    .database_id(&crate::util::normalize_ident(alias))
-            };
-            fresh.handle_schema_row(
-                ty,
-                name,
-                table_name,
-                root_page,
-                sql,
-                &syms,
-                &mut from_sql_indexes,
-                &mut automatic_indices,
-                &mut dbsp_state_roots,
-                &mut dbsp_state_index_roots,
-                &mut materialized_view_info,
-                &attached_resolver,
-                connection.dialect().as_ref(),
-            )?;
-        }
-        fresh.populate_types_views_then_indices(
-            &syms,
-            type_sqls,
-            materialized_view_info,
-            dbsp_state_roots,
-            dbsp_state_index_roots,
-            from_sql_indexes,
-            automatic_indices,
-            mv_store.is_some(),
-        )?;
-
-        Ok(Arc::new(fresh))
     }
 
     /// Replays committed logical-log frames into the in-memory MVCC store.
@@ -9968,13 +10080,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     } if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID => {
                         let schema_rows_after =
                             schema_rows_after.get_or_insert_with(|| schema_rows.clone());
-                        let record = ImmutableRecordRef::from_bin_record(record_bytes);
-                        let column_count = record.column_count();
-                        if column_count < 5 {
-                            return Err(LimboError::Corrupt(format!(
-                                "sqlite_schema row must have at least 5 columns, got {column_count}",
-                            )));
-                        }
+                        // Reject a malformed row before staging it.
+                        SqliteSchemaRow::from_record_bytes(record_bytes)?;
                         crate::with_mv_store_allocation_site!(SchemaRowPayload, {
                             schema_rows_after.insert(
                                 rowid.row_id.to_int_or_panic(),
@@ -9998,11 +10105,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // schema needs those types to give indexes their columns' type
             // orders, so stage the types table the same way.
             let types_table_id = if connection.experimental_custom_types_enabled() {
-                schema_rows_after
-                    .as_ref()
-                    .unwrap_or(&schema_rows)
-                    .values()
-                    .find_map(|record| types_table_root_page(&record.as_record_ref()))
+                let schema_rows = schema_rows_after.as_ref().unwrap_or(&schema_rows);
+                types_table_root_page(schema_rows.values().map(|record| record.get_payload()))?
                     .map(|root_page| self.get_table_id_from_root_page(root_page))
             } else {
                 None
@@ -10041,13 +10145,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let schema_after = match schema_rows_after.as_ref() {
                 Some(schema_rows_after) => {
                     let type_sqls_after = type_sqls_after.as_ref().unwrap_or(&type_sqls);
-                    Some(self.recover_build_schema(
-                        connection,
-                        schema_rows_after,
-                        &type_sqls_after.values().cloned().collect::<Vec<_>>(),
-                        cookie,
-                        &ctx.preserved_table_valued_functions,
-                    )?)
+                    Some(
+                        self.build_schema_from_rows(
+                            connection,
+                            schema_rows_after
+                                .iter()
+                                .map(|(rowid, record)| (*rowid, record.get_payload())),
+                            &type_sqls_after.values().cloned().collect::<Vec<_>>(),
+                            self.global_schema_cookie().unwrap_or(cookie),
+                            &ctx.preserved_table_valued_functions,
+                        )?,
+                    )
                 }
                 None => None,
             };
@@ -10171,42 +10279,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             }
                             let is_schema_row = rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
                             if is_schema_row {
-                                let record = ImmutableRecordRef::from_bin_record(row.payload());
-                                let column_count = record.column_count();
-                                if column_count < 5 {
-                                    return Err(LimboError::Corrupt(format!(
-                                        "sqlite_schema row must have at least 5 columns, got {column_count}",
-                                    )));
-                                }
-                                let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
-                                    return Err(LimboError::Corrupt(
-                                        "sqlite_schema type must be text".to_string(),
-                                    ));
-                                };
-                                let row_type = row_type.as_str();
-                                let val = match record.get_value_opt(3) {
-                                    Some(v) => v,
-                                    None => {
-                                        return Err(LimboError::InternalError(
-                                            "Expected at least 5 columns in sqlite_schema"
-                                                .to_string(),
-                                        ));
-                                    }
-                                };
-                                let ValueRef::Numeric(crate::numeric::Numeric::Integer(root_page)) =
-                                    val
-                                else {
-                                    panic!("Expected integer value for root page, got {val:?}");
-                                };
-                                let sql = match record.get_value_opt(4) {
-                                    Some(ValueRef::Text(v)) => Some(v.as_str()),
-                                    _ => None,
-                                };
+                                let SqliteSchemaRow {
+                                    row_type,
+                                    root_page,
+                                    sql,
+                                    ..
+                                } = SqliteSchemaRow::from_record_bytes(row.payload())?;
                                 let has_btree = match row_type {
                                     "index" => root_page != 0,
-                                    "table" => {
-                                        !sql.is_some_and(crate::util::sql_is_create_virtual_table)
-                                    }
+                                    "table" => !sql.is_some_and(|sql| {
+                                        crate::dialect::sql_is_create_virtual_table(
+                                            connection.dialect().as_ref(),
+                                            sql,
+                                        )
+                                    }),
                                     _ => false,
                                 };
                                 if has_btree {
@@ -10378,23 +10464,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     // deleted in the same transaction (ex: a CREATE TABLE followed by a DROP TABLE)
                                     continue;
                                 };
-                                if record.column_count() < 5 {
-                                    return Err(LimboError::Corrupt(format!(
-                                        "sqlite_schema row must have at least 5 columns, got {}",
-                                        record.column_count()
-                                    )));
-                                }
-                                let (
-                                    ValueRef::Text(row_type),
-                                    ValueRef::Numeric(Numeric::Integer(root_page)),
-                                ) = record.get_two_values(0, 3)?
-                                else {
-                                    return Err(LimboError::Corrupt(
-                                        "sqlite_schema type and root_page must be text and integer"
-                                            .to_string(),
-                                    ));
-                                };
-                                let row_type = row_type.as_str();
+                                let SqliteSchemaRow {
+                                    row_type,
+                                    root_page,
+                                    ..
+                                } = SqliteSchemaRow::from_record_bytes(record.get_payload())?;
                                 if (row_type == "table" || row_type == "index") && root_page > 0 {
                                     dropped_root_pages.insert(root_page);
                                 }
@@ -10519,34 +10593,32 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
-    /// Build a fresh `Schema` from the recovered `sqlite_schema` rows and the
-    /// CREATE TYPE statements `type_sqls`. Sync: the schema cookie comes from
-    /// `global_header` (in-memory) or `fallback_cookie` (pre-read by the
-    /// caller); no IO here.
-    fn recover_build_schema(
-        &self,
-        connection: &Arc<Connection>,
-        schema_rows: &HashMap<i64, ImmutableRecord>,
-        type_sqls: &[String],
-        fallback_cookie: u32,
-        preserved_table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
-    ) -> Result<Arc<Schema>> {
-        let cookie = self
-            .global_header
+    /// The schema cookie in `global_header`, if a header has been loaded.
+    pub(crate) fn global_schema_cookie(&self) -> Option<u32> {
+        self.global_header
             .read()
             .as_ref()
             .map(|header| header.schema_cookie.get())
-            .unwrap_or(fallback_cookie);
-        let mut fresh = Schema::with_options(
-            connection.db.experimental_custom_types_enabled(),
-            connection.db.dialect().as_ref(),
-        )?;
-        fresh.schema_version = cookie;
+    }
+
+    /// Build a `Schema` from `sqlite_schema` records, given as (rowid, record),
+    /// and the CREATE TYPE statements `type_sqls`.
+    pub(crate) fn build_schema_from_rows<'r>(
+        &self,
+        connection: &Arc<Connection>,
+        schema_rows: impl IntoIterator<Item = (i64, &'r [u8])>,
+        type_sqls: &[String],
+        schema_cookie: u32,
+        preserved_table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
+    ) -> Result<Arc<Schema>> {
+        let mut fresh = connection
+            .db
+            .dialect()
+            .new_schema(connection.db.experimental_custom_types_enabled())?;
+        fresh.schema_version = schema_cookie;
         Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
-        let mut from_sql_indexes =
-            crate::alloc::Vec::try_with_capacity_ext(10).expect(crate::alloc::ALLOC_ERR_MSG);
-        let mut automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>> =
-            HashMap::default();
+        let mut from_sql_indexes = crate::alloc::vec![];
+        let mut automatic_indices = HashMap::default();
         let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
         let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
         let mut materialized_view_info: HashMap<String, crate::schema::StoredMaterializedView> =
@@ -10554,71 +10626,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let syms = connection.syms.read();
         let mv_store = connection.db.get_mv_store().clone();
 
-        let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
-        sorted_rowids.sort_unstable();
-        for rowid in &sorted_rowids {
-            let record = &schema_rows[rowid];
-            let ty = match record.get_value_opt(0) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema type must be text".to_string(),
-                    ));
-                }
-            };
-            let name = match record.get_value_opt(1) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema name must be text".to_string(),
-                    ));
-                }
-            };
-            let table_name = match record.get_value_opt(2) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema tbl_name must be text".to_string(),
-                    ));
-                }
-            };
-            let root_page = match record.get_value_opt(3) {
-                Some(ValueRef::Numeric(Numeric::Integer(v))) => v,
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema root_page must be integer".to_string(),
-                    ));
-                }
-            };
+        let mut schema_rows: Vec<(i64, &[u8])> = schema_rows.into_iter().collect();
+        schema_rows.sort_unstable_by_key(|(rowid, _)| *rowid);
+        for (_, record) in schema_rows {
+            let row = SqliteSchemaRow::from_record_bytes(record)?;
             // A negative root is a not-yet-materialized placeholder. If a (passive) checkpoint
             // has since materialized this object, resolve to its real positive root so the
             // rebuilt schema reflects the btree page — otherwise integrity_check skips the
             // negative root and reports its materialized page as orphaned ("never used").
-            let root_page = if root_page < 0 {
-                self.table_id_to_rootpage
-                    .get(&MVTableId::from(root_page))
-                    .filter(|e| e.value().is_live())
-                    .and_then(|e| e.value().root_page)
-                    .map(|r| r as i64)
-                    .unwrap_or(root_page)
-            } else {
-                root_page
-            };
-            let sql = match record.get_value_opt(4) {
-                Some(ValueRef::Text(v)) => Some(v.as_str()),
-                _ => None,
-            };
+            let root_page = self.resolve_root_page(row.root_page);
             let attached_resolver = |alias: &str| -> Option<usize> {
                 connection
                     .current_qualifiers()
                     .database_id(&crate::util::normalize_ident(alias))
             };
             fresh.handle_schema_row(
-                ty,
-                name,
-                table_name,
+                row.row_type,
+                row.name,
+                row.table_name,
                 root_page,
-                sql,
+                row.sql,
                 &syms,
                 &mut from_sql_indexes,
                 &mut automatic_indices,
@@ -10630,6 +10657,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             )?;
         }
         fresh.populate_types_views_then_indices(
+            connection.dialect().as_ref(),
             &syms,
             type_sqls,
             materialized_view_info,
@@ -10649,6 +10677,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     pub fn checkpoint_threshold(&self) -> i64 {
         self.storage.checkpoint_threshold()
+    }
+
+    /// Whether the logical log has reached the checkpoint threshold, so that the next commit
+    /// starts a checkpoint.
+    pub fn should_checkpoint(&self) -> bool {
+        self.storage.should_checkpoint()
     }
 
     pub fn get_real_table_id(&self, table_id: i64) -> i64 {
@@ -10745,16 +10779,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         } else {
             false
         }
-    }
-}
-
-/// The root page of the types table, if `record` is its sqlite_schema row.
-pub(crate) fn types_table_root_page(record: &ImmutableRecordRef) -> Option<i64> {
-    let is_types_table = matches!(record.get_value_opt(0), Some(ValueRef::Text(ty)) if ty.as_str() == "table")
-        && matches!(record.get_value_opt(1), Some(ValueRef::Text(name)) if name.as_str() == crate::schema::TURSO_TYPES_TABLE_NAME);
-    match record.get_value_opt(3) {
-        Some(ValueRef::Numeric(Numeric::Integer(root_page))) if is_types_table => Some(root_page),
-        _ => None,
     }
 }
 
@@ -10965,6 +10989,12 @@ impl RowVersion {
     /// ([`WalPos::ORIGIN`] = not materialized). See the field doc.
     #[inline]
     pub(crate) fn materialized_at(&self) -> WalPos {
+        self.materialized_at
+    }
+
+    /// [`Self::materialized_at`] for integration tests.
+    #[cfg(feature = "test_helper")]
+    pub fn materialized_at_for_testing(&self) -> WalPos {
         self.materialized_at
     }
 

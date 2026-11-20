@@ -178,6 +178,9 @@ pub(super) fn open_in_seek_source_cursor(
             let val_reg = program.alloc_register();
             let record_reg = program.alloc_register();
             let affinity_str = affinity.aff_mask().to_string();
+            // Each value takes at least three instructions: the value, MakeRecord
+            // and IdxInsert.
+            program.reserve_insns(values.len() * 3);
             for value in values.iter() {
                 translate_expr_no_constant_opt(
                     program,

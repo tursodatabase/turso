@@ -7,16 +7,17 @@ use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
 
 use crate::{
     json::{
-        convert_dbtype_to_jsonb, json_path_from_db_value, json_path_text,
+        convert_dbtype_to_jsonb, json_path_text,
         jsonb::{IteratorState, Jsonb, SearchOperation},
         path::{json_path, JsonPath, PathElement},
         vtab::columns::{Columns, Key},
         Conv,
     },
     types::AsValueRef,
-    vtab::{InternalVirtualTable, InternalVirtualTableCursor},
+    vtab::{column_definition, InternalVirtualTable, InternalVirtualTableCursor},
     Connection, LimboError, Value,
 };
+use turso_parser::ast;
 
 use super::jsonb;
 
@@ -165,20 +166,29 @@ impl InternalVirtualTable for JsonVirtualTable {
         })
     }
 
-    fn sql(&self) -> String {
-        "CREATE TABLE x(
-            key,                 -- key for current element relative to its parent
-            value,               -- value for the current element
-            type,                -- 'object','array','string','integer', etc.
-            atom,                -- value for primitive types, null for array & object
-            id,                  -- integer ID for this element
-            parent,              -- integer ID for the parent of this element
-            fullkey,             -- full path describing the current element
-            path,                -- path to the container of the current row
-            json HIDDEN,         -- 1st input parameter: the raw JSON
-            root HIDDEN          -- 2nd input parameter: the PATH at which to start
-        );"
-        .to_owned()
+    fn columns(&self) -> Vec<ast::ColumnDefinition> {
+        vec![
+            // key for current element relative to its parent
+            column_definition("key", ""),
+            // value for the current element
+            column_definition("value", ""),
+            // 'object','array','string','integer', etc.
+            column_definition("type", ""),
+            // value for primitive types, null for array & object
+            column_definition("atom", ""),
+            // integer ID for this element
+            column_definition("id", ""),
+            // integer ID for the parent of this element
+            column_definition("parent", ""),
+            // full path describing the current element
+            column_definition("fullkey", ""),
+            // path to the container of the current row
+            column_definition("path", ""),
+            // 1st input parameter: the raw JSON
+            column_definition("json", "HIDDEN"),
+            // 2nd input parameter: the PATH at which to start
+            column_definition("root", "HIDDEN"),
+        ]
     }
 
     fn superuser_only(&self) -> bool {
@@ -201,6 +211,14 @@ pub struct JsonEachCursor {
     traversal_states: Vec<TraversalState>,
     columns: Columns,
     traversal_mode: JsonTraversalMode,
+    /// Whether the last element of `path_to_current_value` is the element of
+    /// the current row, which the next call of `advance` removes. It stays
+    /// until then, because the fullkey and path columns read the path.
+    pop_path_before_advance: bool,
+    /// The text of the last root path and the path that it parses to. The
+    /// calls of a statement usually have the same root path, which is then
+    /// parsed once.
+    root_path: Option<(String, JsonPath<'static>)>,
 }
 
 struct TraversalState {
@@ -220,6 +238,8 @@ impl JsonEachCursor {
             path_to_current_value: InPlaceJsonPath::new_root(),
             columns: Columns::default(),
             traversal_mode,
+            pop_path_before_advance: false,
+            root_path: None,
         }
     }
 
@@ -249,6 +269,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         _idx_num: i32,
     ) -> Result<bool, LimboError> {
         self.traversal_states.clear();
+        self.pop_path_before_advance = false;
         self.rowid = 0;
 
         if args.is_empty() || args[0] == Value::Null {
@@ -273,11 +294,25 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             ));
         }
 
-        let mut jsonb = convert_dbtype_to_jsonb(&args[0], Conv::Strict)?;
+        let jsonb = convert_dbtype_to_jsonb(&args[0], Conv::Strict)?;
+        // The path is parsed after the document, so that a bad document
+        // gives its error first. The parsed path is for the search and for
+        // the path of the cursor.
+        if self
+            .root_path
+            .as_ref()
+            .is_none_or(|(text, _)| *text != *root_path)
+        {
+            let parsed = json_path(&root_path)?.into_owned();
+            self.root_path = Some((root_path.to_string(), parsed));
+        }
+        let Some((_, root_json_path)) = &self.root_path else {
+            unreachable!("the root path is set above");
+        };
 
         let (root_json, root_offset, root_id) = if args.len() == 1 {
             (jsonb, 0, 0)
-        } else if let Some(found) = navigate_to_path(&mut jsonb, &args[1])? {
+        } else if let Some(found) = navigate_to_path(jsonb, root_json_path)? {
             found
         } else {
             return Ok(false);
@@ -286,8 +321,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         self.json = root_json;
         self.root_offset = root_offset;
         self.id = root_id;
-        self.path_to_current_value =
-            InPlaceJsonPath::from_json_path(root_path.to_string(), json_path(&root_path)?);
+        self.path_to_current_value.set(&root_path, root_json_path);
         let iterator_state = json_iterator_from(&self.json)?;
         let innermost_container_path = if matches!(self.traversal_mode, JsonTraversalMode::Tree)
             && matches!(iterator_state, IteratorState::Primitive(_))
@@ -298,7 +332,6 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         };
         self.push_state(iterator_state, Some(root_id), innermost_container_path);
 
-        let key = self.path_to_current_value.key().to_owned();
         match self.traversal_mode {
             JsonTraversalMode::Each => self.advance(),
             JsonTraversalMode::Tree => {
@@ -308,14 +341,12 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                 if matches!(state.iterator_state, IteratorState::Primitive(_)) {
                     self.advance()
                 } else {
-                    self.columns = Columns::new(
-                        key,
-                        self.json.clone(),
-                        self.path_to_current_value.string.clone(),
+                    self.columns.value_mut().copy_from(&self.json)?;
+                    self.columns.set_row(
+                        true,
+                        self.path_to_current_value.cursor(),
                         None,
-                        self.path_to_current_value
-                            .read(self.path_to_current_value.cursor_before_last_element())
-                            .to_owned(),
+                        self.path_to_current_value.cursor_before_last_element(),
                     );
                     Ok(true)
                 }
@@ -334,14 +365,14 @@ impl InternalVirtualTableCursor for JsonEachCursor {
 
     fn column(&self, idx: usize) -> Result<Value, LimboError> {
         Ok(match idx {
-            COL_KEY => self.columns.key(),
+            COL_KEY => self.columns.key(self.path_to_current_value.key()),
             COL_VALUE => self.columns.value()?,
             COL_TYPE => self.columns.ttype(),
             COL_ATOM => self.columns.atom()?,
             COL_ID => Value::from_i64(self.id),
             COL_PARENT => self.columns.parent(),
-            COL_FULLKEY => self.columns.fullkey(),
-            COL_PATH => self.columns.path(),
+            COL_FULLKEY => self.columns.fullkey(&self.path_to_current_value.string),
+            COL_PATH => self.columns.path(&self.path_to_current_value.string),
             _ => Value::Null,
         })
     }
@@ -349,6 +380,9 @@ impl InternalVirtualTableCursor for JsonEachCursor {
 
 impl JsonEachCursor {
     fn advance(&mut self) -> Result<bool, LimboError> {
+        if std::mem::take(&mut self.pop_path_before_advance) {
+            self.path_to_current_value.pop();
+        }
         let Some(traversal_state) = self.traversal_states.pop() else {
             return Ok(false);
         };
@@ -360,7 +394,10 @@ impl JsonEachCursor {
         };
         match traversal_state.iterator_state {
             IteratorState::Array(state) => {
-                let Some(((idx, value), new_state)) = self.json.array_iterator_next(&state)? else {
+                let Some((idx, new_state)) = self
+                    .json
+                    .array_iterator_next(&state, self.columns.value_mut())?
+                else {
                     self.path_to_current_value.pop();
                     return self.advance();
                 };
@@ -368,7 +405,7 @@ impl JsonEachCursor {
 
                 let recursing_iterator = if matches!(self.traversal_mode, JsonTraversalMode::Tree) {
                     self.json
-                        .container_property_iterator(&IteratorState::Array(state))
+                        .container_iterator_at(state.position(), new_state.position())
                 } else {
                     None
                 };
@@ -383,72 +420,64 @@ impl JsonEachCursor {
                     self.push_state(it, Some(self.id), self.path_to_current_value.cursor());
                 }
 
-                let key = self.path_to_current_value.key().to_owned();
-                self.columns = Columns::new(
-                    key,
-                    value,
-                    self.path_to_current_value.string.clone(),
+                self.columns.set_row(
+                    true,
+                    self.path_to_current_value.cursor(),
                     parent_id,
-                    self.path_to_current_value
-                        .read(traversal_state.innermost_container_cursor)
-                        .to_owned(),
+                    traversal_state.innermost_container_cursor,
                 );
 
-                if !recurses {
-                    self.path_to_current_value.pop();
-                }
+                self.pop_path_before_advance = !recurses;
             }
             IteratorState::Object(state) => {
-                let Some(((_idx, key, value), new_state)) =
-                    self.json.object_iterator_next(&state)?
+                let Some((key, _idx, new_state)) = self
+                    .json
+                    .object_iterator_next(&state, self.columns.value_mut())?
                 else {
                     self.path_to_current_value.pop();
                     return self.advance();
                 };
                 self.id = self.root_offset + state.position() as i64;
+                // The value of the member follows its key, and ends where the
+                // next member starts.
+                let value = state.position() + key.len()..new_state.position();
 
+                // The state of the object keeps the path before the key.
+                let container_cursor = self.path_to_current_value.cursor();
+                self.path_to_current_value.push_object_key(key)?;
                 self.push_state(
                     IteratorState::Object(new_state),
                     traversal_state.parent_id,
-                    self.path_to_current_value.cursor(),
+                    container_cursor,
                 );
-                self.path_to_current_value.push_object_key(&key)?;
                 let recursing = matches!(self.traversal_mode, JsonTraversalMode::Tree)
                     && self
                         .json
-                        .container_property_iterator(&IteratorState::Object(state))
+                        .container_iterator_at(value.start, value.end)
                         .is_some_and(|it| {
                             self.push_state(it, Some(self.id), self.path_to_current_value.cursor());
                             true
                         });
 
-                self.columns = Columns::new(
-                    self.path_to_current_value.key().to_owned(),
-                    value,
-                    self.path_to_current_value.string.clone(),
+                self.columns.set_row(
+                    true,
+                    self.path_to_current_value.cursor(),
                     parent_id,
-                    self.path_to_current_value
-                        .read(traversal_state.innermost_container_cursor)
-                        .to_owned(),
+                    traversal_state.innermost_container_cursor,
                 );
 
-                if !recursing {
-                    self.path_to_current_value.pop();
-                }
+                self.pop_path_before_advance = !recursing;
             }
             IteratorState::Primitive(jsonb) => {
-                let key = match self.traversal_mode {
-                    JsonTraversalMode::Each => Key::None,
-                    JsonTraversalMode::Tree => self.path_to_current_value.key().to_owned(),
-                };
-                self.columns = Columns::new(
-                    key,
-                    jsonb,
-                    self.path_to_current_value.string.clone(),
+                // The root of json_each() has no key. The root of
+                // json_tree() has the last element of the root path.
+                let has_key = matches!(self.traversal_mode, JsonTraversalMode::Tree);
+                *self.columns.value_mut() = jsonb;
+                self.columns.set_row(
+                    has_key,
+                    self.path_to_current_value.cursor(),
                     None,
-                    self.path_to_current_value
-                        .read(traversal_state.innermost_container_cursor)
-                        .to_owned(),
+                    traversal_state.innermost_container_cursor,
                 );
             }
         };
@@ -487,16 +516,15 @@ fn json_iterator_from(json: &Jsonb) -> crate::Result<IteratorState> {
         }
     }
 }
+/// Returns the element of `jsonb` at `json_path`, in the buffer of `jsonb`,
+/// with its offset and its id.
 fn navigate_to_path(
-    jsonb: &mut Jsonb,
-    path: &Value,
+    mut jsonb: Jsonb,
+    json_path: &JsonPath,
 ) -> Result<Option<(Jsonb, i64, i64)>, LimboError> {
-    let json_path = json_path_from_db_value(path, true)?.ok_or_else(|| {
-        LimboError::InvalidArgument(format!("path '{path}' is not a valid json path"))
-    })?;
-    let mut search_operation = SearchOperation::new(jsonb.len() / 2)?;
+    let mut search_operation = SearchOperation::new();
     if jsonb
-        .operate_on_path(&json_path, &mut search_operation)
+        .operate_on_path(json_path, &mut search_operation)
         .is_err()
     {
         return Ok(None);
@@ -505,13 +533,17 @@ fn navigate_to_path(
     let root_id = search_operation
         .label_offset()
         .map_or(value_offset, |offset| offset as i64);
-    Ok(Some((search_operation.result(), value_offset, root_id)))
+    Ok(Some((
+        search_operation.into_element(jsonb),
+        value_offset,
+        root_id,
+    )))
 }
 
 mod columns {
     use crate::{
         json::{
-            json_string_to_db_type,
+            json_ref_to_db_type,
             jsonb::{self, ElementType, Jsonb},
             OutputVariant,
         },
@@ -519,90 +551,101 @@ mod columns {
         LimboError, Value,
     };
 
-    #[derive(Debug, Clone)]
-    pub(super) enum Key {
+    #[derive(Debug, Clone, Copy)]
+    pub(super) enum Key<'a> {
         Integer(i64),
-        String(String),
+        String(&'a str),
         None,
     }
 
-    impl Key {
-        fn empty() -> Self {
-            Self::None
-        }
-
-        fn key_representation(&self) -> Value {
+    impl Key<'_> {
+        fn key_representation(self) -> Value {
             match self {
-                Key::Integer(ref i) => Value::from_i64(*i),
-                Key::String(ref s) => Value::Text(Text::new(s.to_owned())),
+                Key::Integer(i) => Value::from_i64(i),
+                Key::String(s) => Value::Text(Text::new(s.to_owned())),
                 Key::None => Value::Null,
             }
         }
     }
 
+    /// The columns of the current row. The key column is the last element of
+    /// the path of the cursor, and the fullkey and path columns are prefixes
+    /// of the path. The path stays the same until the cursor advances, so
+    /// only their lengths are kept.
     pub(super) struct Columns {
-        key: Key,
+        /// False for the row of a json_each() root, which has no key.
+        has_key: bool,
         value: Jsonb,
-        fullkey: String,
+        fullkey_len: usize,
         parent_id: Option<i64>,
-        innermost_container_path: String,
+        innermost_container_path_len: usize,
     }
 
     impl Default for Columns {
         fn default() -> Columns {
             Self {
-                key: Key::empty(),
+                has_key: false,
                 value: Jsonb::empty(),
-                fullkey: "".to_owned(),
+                fullkey_len: 0,
                 parent_id: None,
-                innermost_container_path: "".to_owned(),
+                innermost_container_path_len: 0,
             }
         }
     }
 
     impl Columns {
-        pub(super) fn new(
-            key: Key,
-            value: Jsonb,
-            fullkey: String,
+        /// The value of the current row. The cursor writes each value in
+        /// this buffer, so that the rows do not allocate a buffer each.
+        pub(super) fn value_mut(&mut self) -> &mut Jsonb {
+            &mut self.value
+        }
+
+        /// Sets the columns of the current row other than the value.
+        pub(super) fn set_row(
+            &mut self,
+            has_key: bool,
+            fullkey_len: usize,
             parent_id: Option<i64>,
-            innermost_container_path: String,
-        ) -> Self {
-            Self {
-                key,
-                value,
-                parent_id,
-                fullkey,
-                innermost_container_path,
-            }
+            innermost_container_path_len: usize,
+        ) {
+            self.has_key = has_key;
+            self.fullkey_len = fullkey_len;
+            self.parent_id = parent_id;
+            self.innermost_container_path_len = innermost_container_path_len;
         }
 
         pub(super) fn atom(&self) -> Result<Value, LimboError> {
-            Self::atom_from_value(&self.value)
+            let element_type = self.value.element_type().expect("invalid value");
+            Self::atom_from_value(&self.value, element_type)
         }
 
         pub(super) fn value(&self) -> Result<Value, LimboError> {
             let element_type = self.value.element_type()?;
             Ok(match element_type {
                 ElementType::ARRAY | ElementType::OBJECT => {
-                    json_string_to_db_type(self.value.clone(), element_type, OutputVariant::String)?
+                    json_ref_to_db_type(&self.value, element_type, OutputVariant::String)?
                 }
-                _ => Self::atom_from_value(&self.value)?,
+                _ => Self::atom_from_value(&self.value, element_type)?,
             })
         }
 
-        pub(super) fn key(&self) -> Value {
-            self.key.key_representation()
+        /// `last_element` is the last element of the path of the cursor.
+        pub(super) fn key(&self, last_element: Key<'_>) -> Value {
+            if self.has_key {
+                last_element.key_representation()
+            } else {
+                Value::Null
+            }
         }
 
-        fn atom_from_value(value: &Jsonb) -> Result<Value, LimboError> {
-            let element_type = value.element_type().expect("invalid value");
+        /// `element_type` is the element type of `value`.
+        fn atom_from_value(value: &Jsonb, element_type: ElementType) -> Result<Value, LimboError> {
             let string: Result<Value, LimboError> = match element_type {
                 jsonb::ElementType::NULL => Ok(Value::Null),
                 jsonb::ElementType::TRUE => Ok(Value::from_i64(1)),
                 jsonb::ElementType::FALSE => Ok(Value::from_i64(0)),
                 jsonb::ElementType::INT | jsonb::ElementType::INT5 => {
-                    json_string_to_db_type(value.clone(), element_type, OutputVariant::ElementType)
+                    json_ref_to_db_type(value, element_type, OutputVariant::ElementType)
                 }
                 jsonb::ElementType::FLOAT | jsonb::ElementType::FLOAT5 => {
                     Self::jsonb_to_float(value)
@@ -610,11 +653,9 @@ mod columns {
                 jsonb::ElementType::TEXT
                 | jsonb::ElementType::TEXTJ
                 | jsonb::ElementType::TEXT5
-                | jsonb::ElementType::TEXTRAW => json_string_to_db_type(
-                    value.clone(),
-                    element_type,
-                    OutputVariant::ElementTypePlain,
-                ),
+                | jsonb::ElementType::TEXTRAW => {
+                    json_ref_to_db_type(value, element_type, OutputVariant::ElementTypePlain)
+                }
                 jsonb::ElementType::ARRAY => Ok(Value::Null),
                 jsonb::ElementType::OBJECT => Ok(Value::Null),
                 jsonb::ElementType::RESERVED1 => Ok(Value::Null),
@@ -626,18 +667,30 @@ mod columns {
         }
 
         fn jsonb_to_float(value: &Jsonb) -> Result<Value, LimboError> {
+            // The JSON text of a FLOAT element is its payload, so a UTF-8
+            // payload is parsed without the text.
+            if value.element_type_at(0).ok() == Some(ElementType::FLOAT) {
+                if let Some(text) = value.scalar_payload().and_then(crate::types::validate_utf8) {
+                    return Ok(Value::from_f64(text.parse::<f64>()?));
+                }
+            }
             let string = value.to_string()?;
             let float = string.parse::<f64>()?;
 
             Ok(Value::from_f64(float))
         }
 
-        pub(super) fn fullkey(&self) -> Value {
-            Value::Text(Text::new(self.fullkey.clone()))
+        /// `path` is the path of the cursor.
+        pub(super) fn fullkey(&self, path: &str) -> Value {
+            Value::Text(Text::new(path_prefix(path, self.fullkey_len)))
         }
 
-        pub(super) fn path(&self) -> Value {
-            Value::Text(Text::new(self.innermost_container_path.clone()))
+        /// `path` is the path of the cursor.
+        pub(super) fn path(&self, path: &str) -> Value {
+            Value::Text(Text::new(path_prefix(
+                path,
+                self.innermost_container_path_len,
+            )))
         }
 
         pub(super) fn parent(&self) -> Value {
@@ -669,12 +722,30 @@ mod columns {
             Value::Text(Text::new(ttype))
         }
     }
+
+    /// The first `len` bytes of the path of the cursor. The lengths come from
+    /// the path itself, so they are in range while the cursor is on a row.
+    fn path_prefix(path: &str, len: usize) -> String {
+        path.get(..len).unwrap_or_default().to_owned()
+    }
 }
 
 struct InPlaceJsonPath {
     string: String,
     element_lengths: Vec<usize>,
-    last_element: Key,
+    last_element: LastElement,
+    /// The unescaped name of the last element when it is an object member. The buffer stays
+    /// when the last element becomes an array index, so that the next name does not allocate.
+    last_name: String,
+}
+
+/// The kind of the last element of an [`InPlaceJsonPath`].
+#[derive(Clone, Copy)]
+enum LastElement {
+    Index(i64),
+    /// An object member, with its name in `last_name`.
+    Name,
+    None,
 }
 
 type InPlaceJsonPathCursor = usize;
@@ -684,7 +755,8 @@ impl InPlaceJsonPath {
         Self {
             string: "$".to_owned(),
             element_lengths: vec![1],
-            last_element: Key::None,
+            last_element: LastElement::None,
+            last_name: String::new(),
         }
     }
 
@@ -697,11 +769,28 @@ impl InPlaceJsonPath {
     }
 
     fn push_array_index(&mut self, idx: &usize) {
-        self.last_element = Key::Integer(*idx as i64);
-        self.push(format!("[{idx}]"));
+        self.last_element = LastElement::Index(*idx as i64);
+        let start = self.string.len();
+        // write! costs about 300 instructions for an index, in the formatting code.
+        let mut digits = [0u8; 20];
+        let digits = crate::numeric::write_decimal_digits(&mut digits, *idx as u64);
+        self.string.push('[');
+        self.string
+            .extend(digits.iter().map(|&digit| char::from(digit)));
+        self.string.push(']');
+        self.element_lengths.push(self.string.len() - start);
     }
 
-    fn push_object_key(&mut self, key: &Jsonb) -> crate::Result<()> {
+    /// `key` is the key element of an object member.
+    fn push_object_key(&mut self, key: &[u8]) -> crate::Result<()> {
+        // A key with no escape is its own name, so it needs no JSON text.
+        if let Some(payload) = jsonb::plain_string_payload(key) {
+            let name = jsonb::utf8_lossy(payload);
+            self.set_last_element_name(&name);
+            self.push_object_name(&name);
+            return Ok(());
+        }
+        let key = Jsonb::from_raw_data(key)?;
         let key_text = key.to_string()?;
         // Keys must be properly quoted strings
         let inner = key_text
@@ -709,14 +798,16 @@ impl InPlaceJsonPath {
             .and_then(|s| s.strip_suffix('"'))
             .ok_or_else(|| crate::LimboError::ParseError("malformed JSON".to_string()))?;
         if key.element_type()? != jsonb::ElementType::TEXT5 {
-            self.last_element = Key::String(jsonb::unescape_string(inner));
+            self.last_name = jsonb::unescape_string(inner);
+            self.last_element = LastElement::Name;
             self.push_object_name(inner);
             return Ok(());
         }
         // The JSON text rendering of a key with JSON5 escapes rewrites them (\v becomes \u0009),
         // so read the key from its stored bytes, as the value column does. SQLite copies them.
         let stored = key.scalar_payload_text()?;
-        self.last_element = Key::String(jsonb::unescape_string(&stored));
+        self.last_name = jsonb::unescape_string(&stored);
+        self.last_element = LastElement::Name;
         // A raw control character (jsonb_object() stores one where SQLite stores an escape) or a
         // raw quote keeps the rendering: SQLite's path for a raw quote cannot be read back.
         let name = if Self::needs_json_text_rendering(&stored) {
@@ -726,6 +817,15 @@ impl InPlaceJsonPath {
         };
         self.push_object_name(name);
         Ok(())
+    }
+
+    /// Makes `name` the last element. The name is written in the buffer of
+    /// the name before it, if there is one, so that the members of an
+    /// object do not allocate a name each.
+    fn set_last_element_name(&mut self, name: &str) {
+        self.last_name.clear();
+        self.last_name.push_str(name);
+        self.last_element = LastElement::Name;
     }
 
     fn push_object_name(&mut self, name: &str) {
@@ -738,11 +838,16 @@ impl InPlaceJsonPath {
                 !first.is_ascii_alphabetic() || chars.any(|c| !c.is_ascii_alphanumeric())
             }
         };
-        self.push(if needs_quotes {
-            format!(".\"{name}\"")
+        let start = self.string.len();
+        self.string.push('.');
+        if needs_quotes {
+            self.string.push('"');
+            self.string.push_str(name);
+            self.string.push('"');
         } else {
-            format!(".{name}")
-        });
+            self.string.push_str(name);
+        }
+        self.element_lengths.push(self.string.len() - start);
     }
 
     /// True when a stored name holds a control character or a double quote that is not part of
@@ -764,51 +869,31 @@ impl InPlaceJsonPath {
         false
     }
 
-    fn push(&mut self, element: String) {
-        self.element_lengths.push(element.len());
-        self.string.push_str(&element);
-    }
-
     fn cursor(&self) -> InPlaceJsonPathCursor {
         self.string.len()
     }
 
-    fn read(&self, cursor: InPlaceJsonPathCursor) -> &str {
-        &self.string[0..cursor]
-    }
-
-    fn from_json_path(path: String, json_path: JsonPath<'_>) -> Self {
-        let (json_path, last_element) = if json_path.elements.is_empty() {
-            (
-                JsonPath {
-                    elements: vec![PathElement::Root()],
-                },
-                Key::None,
-            )
-        } else {
-            let last_element = json_path
-                .elements
-                .last()
-                .and_then(|path_element| match path_element {
-                    PathElement::Key(cow, _) => Some(Key::String(cow.to_string())),
-                    PathElement::ArrayLocator(Some(idx)) => Some(Key::Integer(*idx as i64)),
-                    _ => None,
-                })
-                .unwrap_or(Key::None);
-
-            (json_path, last_element)
-        };
-
-        let element_lengths = json_path
-            .elements
-            .iter()
-            .map(Self::element_length)
-            .collect();
-
-        Self {
-            string: path,
-            element_lengths,
-            last_element,
+    /// Makes this the path `path`, which parses to `json_path`. The path keeps
+    /// its buffers, so that the rows of each new document do not allocate
+    /// and grow new buffers.
+    fn set(&mut self, path: &str, json_path: &JsonPath<'_>) {
+        self.string.clear();
+        self.string.push_str(path);
+        self.element_lengths.clear();
+        if json_path.elements.is_empty() {
+            self.element_lengths
+                .push(Self::element_length(&PathElement::Root()));
+            self.last_element = LastElement::None;
+            return;
+        }
+        self.element_lengths
+            .extend(json_path.elements.iter().map(Self::element_length));
+        match json_path.elements.last() {
+            Some(PathElement::Key(name, _)) => self.set_last_element_name(name),
+            Some(PathElement::ArrayLocator(Some(idx))) => {
+                self.last_element = LastElement::Index(*idx as i64)
+            }
+            _ => self.last_element = LastElement::None,
         }
     }
 
@@ -839,7 +924,11 @@ impl InPlaceJsonPath {
         }
     }
 
-    fn key(&self) -> &Key {
-        &self.last_element
+    fn key(&self) -> Key<'_> {
+        match self.last_element {
+            LastElement::Index(idx) => Key::Integer(idx),
+            LastElement::Name => Key::String(&self.last_name),
+            LastElement::None => Key::None,
+        }
     }
 }

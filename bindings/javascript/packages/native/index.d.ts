@@ -202,7 +202,7 @@ export interface QueryOptions {
 export interface TableColumn {
   name: string
   type?: string | null
-  column?: undefined
-  table?: undefined
-  database?: undefined
+  column?: string | null
+  table?: string | null
+  database?: string | null
 }

@@ -1,106 +1,44 @@
 ---
 name: mvcc
-description: Overview of Experimental MVCC feature - snapshot isolation, versioning, limitations
+description: MVCC journal mode - snapshot isolation, row versions, logical log, checkpoint and GC settings, how to test
 ---
-# MVCC Guide (Experimental)
+# MVCC
 
-Multi-Version Concurrency Control. **Work in progress, not production-ready.**
-
-**CRITICAL**: Ignore MVCC when debugging unless the bug is MVCC-specific.
-
-## Enabling MVCC
+Multi-version concurrency control, enabled per database:
 
 ```sql
 PRAGMA journal_mode = 'mvcc';
 ```
 
-Runtime configuration, not a compile-time feature flag. Per-database setting.
+It is a runtime setting, not a compile-time feature flag. Most bugs are not MVCC-specific, so rule MVCC out first unless the bug only reproduces with `journal_mode=mvcc`.
 
-## How It Works
-
-Standard WAL: single version per page, readers see snapshot at read mark time.
-
-MVCC: multiple row versions, snapshot isolation. Each transaction sees consistent snapshot at begin time.
-
-### Key Differences from WAL
+## Differences from WAL
 
 | Aspect | WAL | MVCC |
 |--------|-----|------|
-| Write granularity | Every commit writes full pages | Affected rows only
-| Readers/Writers | Don't block each other | Don't block each other |
-| Persistence | `.db-wal` | `.db-log` (logical log) |
-| Isolation | Snapshot (page-level) | Snapshot (row-level) |
+| Commit writes | Full pages | Affected rows only |
+| Readers and writers | Do not block each other | Do not block each other |
+| Persistence | `.db-wal` | `.db-log` (logical log), replayed on restart |
+| Isolation | Snapshot (page level) | Snapshot (row level) |
 
-### Versioning
+MVCC gives snapshot isolation, not serializability. The module docs in `core/mvcc/` describe the data anomalies.
 
-Each row version tracks:
-- `begin` - timestamp when visible
-- `end` - timestamp when deleted/replaced
-- `btree_resident` - existed before MVCC enabled
+Each row version has a begin timestamp (when it becomes visible), an end timestamp (when it is deleted or replaced) and a flag saying the row already existed in the B-tree before MVCC wrote it.
 
-## Architecture
+## Checkpointing and garbage collection
 
-```
-Database
-  └─ mv_store: MvStore
-      ├─ rows: SkipMap<RowID, Vec<RowVersion>>
-      ├─ txs: SkipMap<TxID, Transaction>
-      ├─ Storage (.db-log file)
-      └─ CheckpointStateMachine
-```
+Checkpointing writes row versions to the B-tree and truncates the logical log. Old versions are dropped by garbage collection. Settings are `PRAGMA mvcc_checkpoint_threshold` (the logical log size in bytes that starts a checkpoint; default about 4 MB; -1 disables, 0 checkpoints after every commit), `mvcc_gc_threshold` and `mvcc_group_commit`. See `docs/sql-reference/pragmas.mdx`.
 
-**Per-connection**: `mv_tx` tracks current MVCC transaction.
+## Limitations
 
-**Shared**: `MvStore` with lock-free `crossbeam_skiplist` structures.
-
-## Key Files
-
-- `core/mvcc/mod.rs` - Module overview
-- `core/mvcc/database/mod.rs` - Main implementation (~3000 lines)
-- `core/mvcc/cursor.rs` - Merged MVCC + B-tree cursor
-- `core/mvcc/persistent_storage/logical_log.rs` - Disk format
-- `core/mvcc/database/checkpoint_state_machine.rs` - Checkpoint logic
-
-## Checkpointing
-
-Flushes row versions to B-tree periodically.
-
-```sql
-PRAGMA mvcc_checkpoint_threshold = <pages>;
-```
-
-Process: acquire lock → begin pager txn → write rows → commit → truncate log → fsync → release.
-
-## Current Limitations
-
-**Not implemented:**
-- Garbage collection (old versions accumulate)
-- Recovery from logical log on restart
-
-**Known issues:**
-- Checkpoint blocks other transactions, even reads!
-- No spilling to disk; memory use concerns
+- `PRAGMA wal_checkpoint(TRUNCATE)` blocks other transactions, including reads. Passive checkpointing does not, but is behind `--experimental-mvcc-passive-checkpoint`.
+- Row versions live in memory, so large working sets use a lot of memory.
 
 ## Testing
 
-```bash
-# Run MVCC-specific tests
-cargo test mvcc
-
-# TCL tests with MVCC
-make test-mvcc
-```
-
-Use `#[turso_macros::test(mvcc)]` attribute for MVCC-enabled tests.
+`cargo test mvcc` runs the MVCC tests. To run a test with MVCC on:
 
 ```rust
 #[turso_macros::test(mvcc)]
-fn test_something() {
-    // runs with MVCC enabled
-}
+fn test_something() {}
 ```
-
-## References
-
-- `core/mvcc/mod.rs` documents data anomalies (dirty reads, lost updates, etc.)
-- Snapshot isolation vs serializability: MVCC provides the former, not the latter

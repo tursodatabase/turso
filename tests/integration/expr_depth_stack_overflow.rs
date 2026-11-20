@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use turso_sqlite::SqliteDialect;
 
-use turso_core::{ConnectOpts, Database, MemoryIO, IO};
+use turso_core::{ConnectOpts, Database, MemoryIO, SessionRole, IO};
 use turso_parser::MAX_EXPR_DEPTH;
 
 struct GenExpr {
@@ -111,7 +111,7 @@ fn run_with_stack(stack_size: usize, statements: Vec<String>) -> turso_core::Res
         .spawn(move || -> turso_core::Result<()> {
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
             let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
-            let conn = db.connect(ConnectOpts::new())?;
+            let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
             for sql in &statements {
                 conn.execute(sql)?;
             }

@@ -1,29 +1,29 @@
 use crate::alloc::TursoIteratorExt;
-use crate::dialect::{NewOwner, RelationChange};
+use crate::dialect::{
+    AccessStatement, AddColumn, AlterColumn, CatalogCmd, CmdContext, DropColumn, NewOwner,
+    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, TempTriggerOfRenamedTable,
+};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::RelationKind;
 use crate::sync::Arc;
-use crate::translate::collate::CollationSeq;
 use crate::translate::row_security;
 use crate::types::StrictType;
-use crate::util::renamed_automatic_index_name;
 use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
-use turso_parser::{
-    ast::{self, TableInternalId},
-    parser::Parser,
-};
+use turso_parser::ast::{self, TableInternalId};
 
 use super::{
     index::emit_refill_index,
     planner::ROWID_STRS,
     schema::{
         self, check_column_type, validate_check_expr, validate_default_expr,
-        validate_generated_function_calls, SQLITE_TABLEID,
+        validate_generated_function_calls,
     },
-    update::translate_update_for_schema_change,
 };
 use crate::{
-    function::{AlterTableFunc, Func},
+    schema::alter_table::{
+        rename_identifiers, rewrite_check_expr_table_refs, rewrite_trigger_cmd_table_refs,
+        rewrite_view_sql_for_column_rename,
+    },
     schema::{
         collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Column, ColumnLayout,
         ForeignKey, FromDefinitionFlags, Index, Schema, Table, EXPR_INDEX_SENTINEL,
@@ -42,15 +42,11 @@ use crate::{
         },
         trigger::create_trigger_to_sql,
     },
-    util::{
-        check_expr_references_column, escape_sql_string_literal, normalize_ident,
-        parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
-        rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
-    },
+    util::{check_expr_references_column, normalize_ident, parse_numeric_literal},
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, DmlColumnContext, DmlRowForm, ProgramBuilder},
-        insn::{to_u32, AddColumnData, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
+        insn::{to_u32, AddColumnData, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
     LimboError, Numeric, Result, Value, ValueRef,
@@ -88,20 +84,7 @@ struct SchemaTriggerEntry {
     trigger: Arc<crate::schema::Trigger>,
 }
 
-fn schema_table_name_for_db(resolver: &Resolver, database_id: usize) -> String {
-    if database_id == crate::MAIN_DB_ID {
-        SQLITE_TABLEID.to_string()
-    } else if database_id == crate::TEMP_DB_ID {
-        format!("temp.{SQLITE_TABLEID}")
-    } else {
-        let db_name = resolver
-            .namespace_name(database_id)
-            .unwrap_or_else(|| "main".to_string());
-        format!("{db_name}.{SQLITE_TABLEID}")
-    }
-}
-
-fn database_uses_mvcc(connection: &Arc<crate::Connection>, database_id: usize) -> bool {
+pub(super) fn database_uses_mvcc(connection: &Arc<crate::Connection>, database_id: usize) -> bool {
     connection.mv_store_for_db(database_id).is_some()
 }
 
@@ -172,217 +155,6 @@ fn default_requires_empty_table(expr: &ast::Expr) -> bool {
         }
         _ => false,
     }
-}
-
-/// Rewrite the sqlite_schema row for the AUTOINCREMENT backing table when
-/// the parent table is renamed. The backing table is keyed by name
-/// `__turso_internal_seq___turso_internal_autoincrement_<table>`, so its
-/// row is not touched by the general `Func::AlterTable::RenameTable` sweep
-/// (which only matches rows whose `tbl_name` column equals the renamed
-/// user table). Without this rewrite, the persistent sqlite_schema row
-/// keeps the old backing-table name and SQL, so the next process to open
-/// the DB rebuilds the in-memory schema with the stale backing table —
-/// and an INSERT into the renamed table fails with "missing implicit
-/// sequence for AUTOINCREMENT table".
-///
-/// Mirrors the existing `emit_rename_sqlite_sequence_entry` helper for
-/// the `sqlite_sequence` row; the in-memory rename of `schema.sequences`
-/// and `schema.tables` happens in `op_rename_table`.
-fn emit_rename_autoincrement_backing_table_entry(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    connection: &Arc<crate::Connection>,
-    database_id: usize,
-    old_table_name_norm: &str,
-    new_table_name_norm: &str,
-) {
-    use crate::schema::autoincrement_sequence_name;
-    use crate::translate::sequence::{sequence_backing_table_name, sequence_backing_table_sql};
-
-    let old_backing_name =
-        sequence_backing_table_name(&autoincrement_sequence_name(old_table_name_norm));
-    let new_seq_name = autoincrement_sequence_name(new_table_name_norm);
-    let new_backing_name = sequence_backing_table_name(&new_seq_name);
-    let new_backing_sql = sequence_backing_table_sql(&new_seq_name);
-
-    let Some(sqlite_schema) = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-    }) else {
-        return;
-    };
-
-    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id,
-        root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
-        db: database_id,
-    });
-
-    let old_backing_reg = program.emit_string8_new_reg(old_backing_name);
-    program.mark_last_insn_constant();
-    let new_backing_reg = program.emit_string8_new_reg(new_backing_name);
-    program.mark_last_insn_constant();
-    let new_sql_reg = program.emit_string8_new_reg(new_backing_sql);
-    program.mark_last_insn_constant();
-
-    program.cursor_loop(cursor_id, |program, rowid| {
-        let name_reg = program.alloc_register();
-        program.emit_column_or_rowid(cursor_id, 1, name_reg);
-
-        let continue_label = program.allocate_label();
-        program.emit_insn(Insn::Ne {
-            lhs: name_reg,
-            rhs: old_backing_reg,
-            target_pc: continue_label,
-            flags: CmpInsFlags::default(),
-            collation: CollationSeq::for_internal_values(),
-        });
-
-        // Preserve type (col 0) and rootpage (col 3); overwrite name/tbl_name
-        // (cols 1, 2) and sql (col 4). The backing table is INTERNAL — its
-        // sql is regenerated from `sequence_backing_table_sql(new_seq_name)`
-        // and never altered by user DDL, so we don't need to AST-rewrite it.
-        let rec_start = program.alloc_registers(5);
-        program.emit_column_or_rowid(cursor_id, 0, rec_start); // type
-        program.emit_insn(Insn::Copy {
-            src_reg: new_backing_reg,
-            dst_reg: rec_start + 1, // name
-            extra_amount: 0,
-        });
-        program.emit_insn(Insn::Copy {
-            src_reg: new_backing_reg,
-            dst_reg: rec_start + 2, // tbl_name
-            extra_amount: 0,
-        });
-        program.emit_column_or_rowid(cursor_id, 3, rec_start + 3); // rootpage
-        program.emit_insn(Insn::Copy {
-            src_reg: new_sql_reg,
-            dst_reg: rec_start + 4, // sql
-            extra_amount: 0,
-        });
-
-        let record_reg = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(rec_start),
-            count: to_u32(5),
-            dest_reg: to_u32(record_reg),
-            index_name: None,
-            affinity_str: None,
-        });
-
-        // MVCC: end the old version before writing the new one
-        // (Hekaton-style UPDATE = DELETE + INSERT), mirroring the
-        // pattern used by `emit_rename_sqlite_sequence_entry` and the
-        // main-table rewrite cursor_loop.
-        if database_uses_mvcc(connection, database_id) {
-            program.emit_insn(Insn::Delete {
-                cursor_id,
-                table_name: SQLITE_TABLEID.to_string(),
-                is_part_of_update: true,
-            });
-        }
-
-        program.emit_insn(Insn::Insert {
-            cursor: cursor_id,
-            key_reg: rowid,
-            record_reg,
-            flag: crate::vdbe::insn::InsertFlags(0),
-            table_name: SQLITE_TABLEID.to_string(),
-        });
-
-        program.preassign_label_to_next_insn(continue_label);
-    });
-}
-
-fn emit_rename_sqlite_sequence_entry(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    connection: &Arc<crate::Connection>,
-    database_id: usize,
-    old_table_name_norm: &str,
-    new_table_name_norm: &str,
-) {
-    let Some(sqlite_sequence) = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(NamespaceId::ROOT, crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
-    }) else {
-        return;
-    };
-
-    let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_sequence.clone()));
-    let sequence_name_reg = program.alloc_register();
-    let sequence_value_reg = program.alloc_register();
-    let row_name_to_replace_reg = program.emit_string8_new_reg(old_table_name_norm.to_string());
-    program.mark_last_insn_constant();
-    let replacement_row_name_reg = program.emit_string8_new_reg(new_table_name_norm.to_string());
-    program.mark_last_insn_constant();
-
-    let affinity_str = sqlite_sequence
-        .columns()
-        .iter()
-        .map(|col| col.affinity().aff_mask())
-        .collect::<String>();
-
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: seq_cursor_id,
-        root_page: RegisterOrLiteral::Literal(sqlite_sequence.root_page),
-        db: database_id,
-    });
-
-    program.cursor_loop(seq_cursor_id, |program, rowid| {
-        program.emit_column_or_rowid(seq_cursor_id, 0, sequence_name_reg);
-
-        let continue_loop_label = program.allocate_label();
-        program.emit_insn(Insn::Ne {
-            lhs: sequence_name_reg,
-            rhs: row_name_to_replace_reg,
-            target_pc: continue_loop_label,
-            flags: CmpInsFlags::default().jump_if_null(),
-            collation: CollationSeq::for_internal_values(),
-        });
-
-        program.emit_column_or_rowid(seq_cursor_id, 1, sequence_value_reg);
-
-        let record_start_reg = program.alloc_registers(2);
-        let record_reg = program.alloc_register();
-
-        program.emit_insn(Insn::Copy {
-            src_reg: replacement_row_name_reg,
-            dst_reg: record_start_reg,
-            extra_amount: 0,
-        });
-        program.emit_insn(Insn::Copy {
-            src_reg: sequence_value_reg,
-            dst_reg: record_start_reg + 1,
-            extra_amount: 0,
-        });
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(record_start_reg),
-            count: to_u32(2),
-            dest_reg: to_u32(record_reg),
-            index_name: None,
-            affinity_str: Some(affinity_str.clone()),
-        });
-
-        // In MVCC mode, we need to delete before insert to properly
-        // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
-        if database_uses_mvcc(connection, database_id) {
-            program.emit_insn(Insn::Delete {
-                cursor_id: seq_cursor_id,
-                table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
-                is_part_of_update: true,
-            });
-        }
-
-        program.emit_insn(Insn::Insert {
-            cursor: seq_cursor_id,
-            key_reg: rowid,
-            record_reg,
-            flag: crate::translate::insert::autoincrement_bookkeeping_insert_flags(),
-            table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
-        });
-
-        program.preassign_label_to_next_insn(continue_loop_label);
-    });
 }
 
 pub(crate) fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
@@ -760,6 +532,7 @@ fn emit_column_constraints_validation(
                 namespace,
                 indexed: None,
                 plan_estimate: None,
+                row_filter: None,
             }],
             vec![],
         );
@@ -876,9 +649,6 @@ pub fn translate_alter_table(
     program.begin_write_operation()?;
     let table_name = qualified_name.name.as_str();
     let mangled_table_name = resolver.mangle_name(namespace, &normalize_ident(table_name));
-    // For attached databases, qualify sqlite_schema with the database name
-    // so that the UPDATE targets the correct database's schema table.
-    let qualified_schema_table = schema_table_name_for_db(resolver, database_id);
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     validate(
         &alter_table,
@@ -903,15 +673,8 @@ pub fn translate_alter_table(
     };
     if let Some(tbl) = table.virtual_table() {
         if let ast::AlterTableBody::RenameTo(new_name) = &alter_table {
-            let new_name_norm = normalize_ident(new_name.as_str());
             return translate_rename_virtual_table(
-                program,
-                tbl,
-                table_name,
-                new_name_norm,
-                resolver,
-                connection,
-                namespace,
+                program, tbl, table_name, new_name, resolver, connection, namespace, input,
             );
         }
     }
@@ -941,6 +704,12 @@ pub fn translate_alter_table(
         }
         ast::AlterTableBody::DropColumn(column_name) => {
             let column_name = column_name.as_str();
+            row_security::reject_change_of_policy_column(
+                resolver,
+                namespace,
+                table_name,
+                column_name,
+            )?;
 
             // Tables always have at least one column.
             turso_assert_ne!(btree.columns().len(), 0);
@@ -1181,29 +950,6 @@ pub fn translate_alter_table(
 
             btree.columns_mut().remove(dropped_index);
 
-            let sql = escape_sql_string_literal(
-                &btree.to_sql_as(&resolver.mangle_name(namespace, &btree.declared_name)),
-            );
-
-            let escaped_table_name = escape_sql_string_literal(&mangled_table_name);
-            let stmt = format!(
-                r#"
-                    UPDATE {qualified_schema_table}
-                    SET sql = '{sql}'
-                    WHERE name = '{escaped_table_name}' COLLATE NOCASE AND type = 'table'
-                "#,
-            );
-
-            let mut parser = Parser::new(stmt.as_bytes());
-            let cmd = parser.next_cmd().map_err(|e| {
-                LimboError::ParseError(format!("failed to parse generated UPDATE statement: {e}"))
-            })?;
-            let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
-                return Err(LimboError::ParseError(
-                    "generated UPDATE statement did not parse as expected".to_string(),
-                ));
-            };
-
             let rewrite_rows = if !original_btree.columns()[dropped_index].is_virtual_generated() {
                 let source_column_by_schema_idx: Vec<Option<usize>> = btree
                     .columns()
@@ -1224,44 +970,75 @@ pub fn translate_alter_table(
                 None
             };
 
-            let mut rewrite_rows_result = Ok(());
-            translate_update_for_schema_change(
-                update,
+            let owned_sequences = if database_id == crate::MAIN_DB_ID {
+                resolver.catalog.dialect.owned_sequences(
+                    resolver.schema(),
+                    namespace.id,
+                    &table_name_norm,
+                    Some(&column_name_norm),
+                )
+            } else {
+                Vec::new()
+            };
+            if let Some(usage) = schema::find_object_using_sequence(
                 resolver,
-                program,
                 connection,
-                input,
-                |program| {
-                    if let Some((source_column_by_schema_idx, layout)) = &rewrite_rows {
-                        rewrite_rows_result = emit_rewrite_table_rows(
-                            program,
-                            original_btree.clone(),
-                            &btree,
-                            source_column_by_schema_idx,
-                            layout,
-                            None,
-                            resolver,
-                            connection,
-                            database_id,
-                        );
-                    }
-
-                    program.emit_insn(Insn::SetCookie {
-                        db: database_id,
-                        cookie: Cookie::SchemaVersion,
-                        value: schema_version as i32 + 1,
-                        p5: 0,
-                    });
-
-                    program.emit_insn(Insn::DropColumn {
-                        db: database_id,
-                        namespace: namespace.id,
-                        table: btree.name.clone(),
-                        column_index: dropped_index,
-                    })
+                namespace,
+                &owned_sequences,
+                schema::DroppedWithSequences::Column {
+                    table: &table_name_norm,
+                    column: &column_name_norm,
                 },
+            )? {
+                crate::bail_parse_error!(
+                    "cannot drop column {} of table {} because other objects depend on it: {usage}",
+                    column_name_norm,
+                    table_name_norm
+                );
+            }
+            let cmd_context = CmdContext::new(connection, resolver, database_id);
+            resolver.catalog.dialect.catalog().emit(
+                program,
+                &cmd_context,
+                &CatalogCmd::DropColumn(DropColumn {
+                    namespace: namespace.id,
+                    name: &table_name_norm,
+                    table: &btree,
+                    statement: input,
+                }),
             )?;
-            rewrite_rows_result?
+            if let Some((source_column_by_schema_idx, layout)) = &rewrite_rows {
+                emit_rewrite_table_rows(
+                    program,
+                    original_btree.clone(),
+                    &btree,
+                    source_column_by_schema_idx,
+                    layout,
+                    None,
+                    resolver,
+                    connection,
+                    database_id,
+                )?;
+            }
+            for sequence in &owned_sequences {
+                crate::translate::sequence::emit_drop_sequence(
+                    program, resolver, connection, namespace, sequence,
+                )?;
+            }
+
+            program.emit_insn(Insn::SetCookie {
+                db: database_id,
+                cookie: Cookie::SchemaVersion,
+                value: schema_version as i32 + 1,
+                p5: 0,
+            });
+
+            program.emit_insn(Insn::DropColumn {
+                db: database_id,
+                namespace: namespace.id,
+                table: btree.name.clone(),
+                column_index: dropped_index,
+            });
         }
         ast::AlterTableBody::AddColumn(col_def) => {
             let is_generated = col_def
@@ -1399,28 +1176,6 @@ pub fn translate_alter_table(
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
 
-            let escaped = escape_sql_string_literal(
-                &btree.to_sql_as(&resolver.mangle_name(namespace, &btree.declared_name)),
-            );
-            let escaped_table_name = escape_sql_string_literal(&mangled_table_name);
-            let stmt = format!(
-                r#"
-                    UPDATE {qualified_schema_table}
-                    SET sql = '{escaped}'
-                    WHERE name = '{escaped_table_name}' COLLATE NOCASE AND type = 'table'
-                "#,
-            );
-
-            let mut parser = Parser::new(stmt.as_bytes());
-            let cmd = parser.next_cmd().map_err(|e| {
-                LimboError::ParseError(format!("failed to parse generated UPDATE statement: {e}"))
-            })?;
-            let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
-                return Err(LimboError::ParseError(
-                    "generated UPDATE statement did not parse as expected".to_string(),
-                ));
-            };
-
             if is_stored {
                 btree.check_stored_columns_have_no_custom_types(resolver.schema())?;
                 emit_halt_if_table_has_rows(
@@ -1530,37 +1285,39 @@ pub fn translate_alter_table(
                 namespace,
             )?;
 
-            translate_update_for_schema_change(
-                update,
-                resolver,
+            let cmd_context = CmdContext::new(connection, resolver, database_id);
+            resolver.catalog.dialect.catalog().emit(
                 program,
-                connection,
-                input,
-                |program| {
-                    program.emit_insn(Insn::SetCookie {
-                        db: database_id,
-                        cookie: Cookie::SchemaVersion,
-                        value: schema_version as i32 + 1,
-                        p5: 0,
-                    });
-                    program.emit_insn(Insn::AddColumn {
-                        data: Box::new(AddColumnData {
-                            db: database_id,
-                            namespace: namespace.id,
-                            table: table_name.to_owned(),
-                            column,
-                            check_constraints: btree.check_constraints.to_vec(),
-                            foreign_keys: btree.foreign_keys.to_vec(),
-                        }),
-                    });
-                },
-            )?
+                &cmd_context,
+                &CatalogCmd::AddColumn(AddColumn {
+                    namespace: namespace.id,
+                    name: &normalize_ident(table_name),
+                    table: &btree,
+                    statement: input,
+                }),
+            )?;
+            program.emit_insn(Insn::SetCookie {
+                db: database_id,
+                cookie: Cookie::SchemaVersion,
+                value: schema_version as i32 + 1,
+                p5: 0,
+            });
+            program.emit_insn(Insn::AddColumn {
+                data: Box::new(AddColumnData {
+                    db: database_id,
+                    namespace: namespace.id,
+                    table: table_name.to_owned(),
+                    column,
+                    check_constraints: btree.check_constraints.to_vec(),
+                    foreign_keys: btree.foreign_keys.to_vec(),
+                }),
+            });
         }
         ast::AlterTableBody::RenameTo(new_name) => {
             let new_name = new_name.as_str();
             let normalized_old_name = normalize_ident(table_name);
             let normalized_new_name = normalize_ident(new_name);
-            let mut temp_triggers_to_rewrite: Vec<(String, String, bool)> = Vec::new();
+            let mut temp_triggers_to_rewrite: Vec<TempTriggerOfRenamedTable> = Vec::new();
 
             // Under a dialect whose relation names are unique across kinds,
             // a name any relation has is taken, as for CREATE.
@@ -1613,17 +1370,18 @@ pub fn translate_alter_table(
                         .namespace_name(database_id)
                         .unwrap_or_else(|| "main".to_string());
                     let new_sql = rewrite_trigger_sql_for_table_rename(
+                        connection.dialect().as_ref(),
                         &trigger_entry.trigger.sql,
                         table_name,
                         new_name,
                         &renamed_db_name,
                     )?;
                     if new_sql != trigger_entry.trigger.sql {
-                        temp_triggers_to_rewrite.push((
-                            trigger_entry.trigger.name.clone(),
-                            new_sql,
-                            temp_trigger_targets_renamed_table,
-                        ));
+                        temp_triggers_to_rewrite.push(TempTriggerOfRenamedTable {
+                            name: trigger_entry.trigger.name.clone(),
+                            sql: new_sql,
+                            is_on_the_table: temp_trigger_targets_renamed_table,
+                        });
                     }
                 }
             }
@@ -1636,186 +1394,25 @@ pub fn translate_alter_table(
                 None
             };
 
-            let sqlite_schema = resolver
-                .with_schema(database_id, |s| {
-                    s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-                })
-                .ok_or_else(|| {
-                    LimboError::ParseError("sqlite_schema table not found in schema".to_string())
-                })?;
-
-            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
-
-            program.emit_insn(Insn::OpenWrite {
-                cursor_id,
-                root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
-                db: database_id,
-            });
-
-            program.cursor_loop(cursor_id, |program, rowid| {
-                let sqlite_schema_column_len = sqlite_schema.columns().len();
-                turso_assert_eq!(sqlite_schema_column_len, 5);
-
-                let first_column = program.alloc_registers(sqlite_schema_column_len);
-
-                for i in 0..sqlite_schema_column_len {
-                    program.emit_column_or_rowid(cursor_id, i, first_column + i);
-                }
-
-                program.emit_string8_new_reg(mangled_table_name.clone());
-                program.mark_last_insn_constant();
-
-                program.emit_string8_new_reg(
-                    resolver.mangle_name(namespace, &normalize_ident(new_name)),
-                );
-                program.mark_last_insn_constant();
-
-                let out = program.alloc_registers(5);
-
-                program.emit_insn(Insn::Function {
-                    constant_mask: 0,
-                    start_reg: first_column,
-                    dest: out,
-                    func: crate::function::FuncCtx {
-                        func: Func::AlterTable(AlterTableFunc::RenameTable),
-                        arg_count: 7,
-                        collation: CollationSeq::BINARY,
-                    },
-                });
-
-                let record = program.alloc_register();
-
-                program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u32(out),
-                    count: to_u32(sqlite_schema_column_len),
-                    dest_reg: to_u32(record),
-                    index_name: None,
-                    affinity_str: None,
-                });
-
-                // In MVCC mode, we need to delete before insert to properly
-                // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
-                if database_uses_mvcc(connection, database_id) {
-                    program.emit_insn(Insn::Delete {
-                        cursor_id,
-                        table_name: SQLITE_TABLEID.to_string(),
-                        is_part_of_update: true,
-                    });
-                }
-
-                program.emit_insn(Insn::Insert {
-                    cursor: cursor_id,
-                    key_reg: rowid,
-                    record_reg: record,
-                    flag: crate::vdbe::insn::InsertFlags(0),
-                    table_name: table_name.to_string(),
-                });
-            });
-
             let mangled_new_name = resolver.mangle_name(namespace, &normalized_new_name);
-            emit_rename_sqlite_sequence_entry(
+            let cmd_context = CmdContext::new(connection, resolver, database_id);
+            resolver.catalog.dialect.catalog().emit(
                 program,
-                resolver,
-                connection,
-                database_id,
-                &mangled_table_name,
-                &mangled_new_name,
-            );
-
-            // For AUTOINCREMENT tables, also rewrite the persistent
-            // sqlite_schema row for the hidden backing table. The in-memory
-            // rename happens in `op_rename_table`; without this bytecode the
-            // schema state on disk and in memory would diverge across a
-            // reopen. Cheap no-op for non-AUTOINCREMENT tables: we look up
-            // the implicit sequence via `autoincrement_sequence_name` and
-            // only emit the sweep when the descriptor is present.
-            let has_implicit_seq = resolver.with_schema(database_id, |s| {
-                s.get_sequence(
-                    NamespaceId::ROOT,
-                    &crate::schema::autoincrement_sequence_name(&mangled_table_name),
-                )
-                .is_some()
-            });
-            if has_implicit_seq {
-                emit_rename_autoincrement_backing_table_entry(
-                    program,
-                    resolver,
-                    connection,
-                    database_id,
-                    &mangled_table_name,
-                    &mangled_new_name,
-                );
-            }
-
-            if schema::dialect_relation_hooks_apply(connection, database_id)? {
-                // Automatic indexes are renamed with the table, because
-                // their names embed it.
-                let mut changes = vec![RelationChange::Rename {
+                &cmd_context,
+                &CatalogCmd::RenameTable(RenameTable {
                     namespace: namespace.id,
-                    old_name: normalized_old_name,
-                    new_name: normalized_new_name,
-                }];
-                for index in &table_indexes {
-                    let Some(new_name) = renamed_automatic_index_name(
-                        &index.name,
-                        &mangled_table_name,
-                        &mangled_new_name,
-                    ) else {
-                        continue;
-                    };
-                    changes.push(RelationChange::Rename {
-                        namespace: namespace.id,
-                        old_name: index.name.clone(),
-                        new_name,
-                    });
-                }
-                resolver.catalog.dialect.translate_relation_changes(
-                    program,
-                    resolver.schema(),
-                    connection,
-                    &changes,
-                )?;
-            }
-
-            for (trigger_name, new_sql, renames_target) in temp_triggers_to_rewrite {
-                let escaped_sql = escape_sql_string_literal(&new_sql);
-                let escaped_trigger_name = escape_sql_string_literal(&trigger_name);
-                let qualified_schema_table = schema_table_name_for_db(resolver, crate::TEMP_DB_ID);
-                let tbl_name_update = if renames_target {
-                    let escaped_new_name = escape_sql_string_literal(new_name);
-                    format!(", tbl_name = '{escaped_new_name}'")
-                } else {
-                    String::new()
-                };
-                let update_stmt = format!(
-                    r#"
-                        UPDATE {qualified_schema_table}
-                        SET sql = '{escaped_sql}'{tbl_name_update}
-                        WHERE name = '{escaped_trigger_name}' COLLATE NOCASE AND type = 'trigger'
-                    "#,
-                );
-
-                let mut parser = Parser::new(update_stmt.as_bytes());
-                let cmd = parser.next_cmd().map_err(|e| {
-                    LimboError::ParseError(format!(
-                        "failed to parse trigger update SQL for {trigger_name}: {e}"
-                    ))
-                })?;
-                let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
-                    return Err(LimboError::ParseError(format!(
-                        "failed to parse trigger update SQL for {trigger_name}",
-                    )));
-                };
-
-                translate_update_for_schema_change(
-                    update,
-                    resolver,
-                    program,
-                    connection,
-                    input,
-                    |_program| {},
-                )?;
-            }
+                    old_name: &normalized_old_name,
+                    new_name: &normalized_new_name,
+                    written_old_name: table_name,
+                    written_new_name: new_name,
+                    is_virtual: false,
+                    indexes: &table_indexes,
+                    stored_old_name: &mangled_table_name,
+                    stored_new_name: &mangled_new_name,
+                    temp_triggers: &temp_triggers_to_rewrite,
+                    statement: input,
+                }),
+            )?;
 
             if let Some(temp_schema_version) = temp_schema_version {
                 program.emit_insn(Insn::SetCookie {
@@ -1869,6 +1466,7 @@ pub fn translate_alter_table(
 
             let from = from.as_str();
             let col_name = col_name.as_str();
+            row_security::reject_change_of_policy_column(resolver, namespace, table_name, from)?;
 
             let Some((column_index, _)) = btree.get_column(from) else {
                 return Err(LimboError::ParseError(format!(
@@ -1892,7 +1490,11 @@ pub fn translate_alter_table(
                 let Some(index_method) = &index.index_method else {
                     continue;
                 };
-                if let Some(attachment) = index_method.rename_column(old_column_name, col_name)? {
+                if let Some(attachment) = index_method.rename_column(
+                    connection.dialect().as_ref(),
+                    old_column_name,
+                    col_name,
+                )? {
                     renamed_index_methods.push((index.name.clone(), attachment));
                 }
             }
@@ -1958,7 +1560,7 @@ pub fn translate_alter_table(
                             resolver.schema(),
                         )?;
                         let replacement_column =
-                            btree.column_for_alter(column_index, &definition)?;
+                            btree.column_for_alter(column_index, &definition, resolver.schema())?;
                         let old_column = &btree.columns()[column_index];
                         // Switching between a rowid alias and a key with an automatic
                         // index would need that index created or dropped.
@@ -2082,7 +1684,6 @@ pub fn translate_alter_table(
                         )?;
                     }
                 }
-                table.resolve_custom_types(resolver.schema())?;
                 let column = &table.columns()[column_index];
                 let ty = column_type(column, table.is_strict, resolver.schema());
                 key_collation(column.text_collation(), &ty, resolver.schema())?;
@@ -2147,7 +1748,7 @@ pub fn translate_alter_table(
             // If renaming, rewrite trigger SQL for all triggers that reference this column
             // We'll collect the triggers to rewrite and update them in sqlite_schema
             let mut triggers_to_rewrite: Vec<(NamespaceRef, String, String)> = Vec::new();
-            let mut views_to_rewrite: Vec<(usize, String, String)> = Vec::new();
+            let mut views_to_rewrite: Vec<RewrittenView> = Vec::new();
             if rename {
                 // Try to rewrite every trigger's SQL for the column rename.
                 // If the rewritten SQL differs from the original, include it
@@ -2169,6 +1770,7 @@ pub fn translate_alter_table(
                         )));
                     }
                     match rewrite_trigger_sql_for_column_rename(
+                        connection.dialect().as_ref(),
                         &trigger_entry.trigger.sql,
                         table_name,
                         from,
@@ -2219,6 +1821,7 @@ pub fn translate_alter_table(
                     let mut rewrites = Vec::new();
                     for (view_name, view) in s.views(namespace.id) {
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename(
+                            connection.dialect().as_ref(),
                             &view.sql,
                             s,
                             namespace.id,
@@ -2227,11 +1830,11 @@ pub fn translate_alter_table(
                             from,
                             col_name,
                         )? {
-                            rewrites.push((
-                                database_id,
-                                resolver.mangle_name(namespace, view_name),
-                                rewritten.sql,
-                            ));
+                            rewrites.push(RewrittenView {
+                                namespace,
+                                name: view_name.to_string(),
+                                sql: rewritten.sql,
+                            });
                         }
                     }
                     Ok(rewrites)
@@ -2244,6 +1847,7 @@ pub fn translate_alter_table(
                             let mut rewrites = Vec::new();
                             for (view_name, view) in s.views(NamespaceId::ROOT) {
                                 if let Some(rewritten) = rewrite_view_sql_for_column_rename(
+                                    connection.dialect().as_ref(),
                                     &view.sql,
                                     s,
                                     NamespaceId::ROOT,
@@ -2252,11 +1856,11 @@ pub fn translate_alter_table(
                                     from,
                                     col_name,
                                 )? {
-                                    rewrites.push((
-                                        crate::TEMP_DB_ID,
-                                        view_name.to_string(),
-                                        rewritten.sql,
-                                    ));
+                                    rewrites.push(RewrittenView {
+                                        namespace: NamespaceRef::root_of(crate::TEMP_DB_ID),
+                                        name: view_name.to_string(),
+                                        sql: rewritten.sql,
+                                    });
                                 }
                             }
                             Ok(rewrites)
@@ -2269,7 +1873,7 @@ pub fn translate_alter_table(
                 .any(|(namespace, _, _)| namespace.database_id == crate::TEMP_DB_ID)
                 || views_to_rewrite
                     .iter()
-                    .any(|(db, _, _)| *db == crate::TEMP_DB_ID);
+                    .any(|view| view.namespace.database_id == crate::TEMP_DB_ID);
             let temp_schema_version = if has_temp_rewrites {
                 let schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
                 program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie)?;
@@ -2278,158 +1882,43 @@ pub fn translate_alter_table(
                 None
             };
 
-            let sqlite_schema = resolver
-                .with_schema(database_id, |s| {
-                    s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+            let rewritten_triggers: Vec<RewrittenTrigger> = triggers_to_rewrite
+                .iter()
+                .map(|(namespace, name, sql)| RewrittenTrigger {
+                    namespace: *namespace,
+                    name: name.clone(),
+                    sql: sql.clone(),
                 })
-                .ok_or_else(|| {
-                    LimboError::ParseError("sqlite_schema table not found in schema".to_string())
-                })?;
-
-            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
-
-            program.emit_insn(Insn::OpenWrite {
-                cursor_id,
-                root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
-                db: database_id,
-            });
-
-            program.cursor_loop(cursor_id, |program, rowid| {
-                let sqlite_schema_column_len = sqlite_schema.columns().len();
-                turso_assert_eq!(sqlite_schema_column_len, 5);
-
-                let first_column = program.alloc_registers(sqlite_schema_column_len);
-
-                for i in 0..sqlite_schema_column_len {
-                    program.emit_column_or_rowid(cursor_id, i, first_column + i);
-                }
-
-                program.emit_string8_new_reg(mangled_table_name.clone());
-                program.mark_last_insn_constant();
-
-                program.emit_string8_new_reg(from.to_string());
-                program.mark_last_insn_constant();
-
-                program.emit_string8_new_reg(definition.to_string());
-                program.mark_last_insn_constant();
-
-                let out = program.alloc_registers(sqlite_schema_column_len);
-
-                program.emit_insn(Insn::Function {
-                    constant_mask: 0,
-                    start_reg: first_column,
-                    dest: out,
-                    func: crate::function::FuncCtx {
-                        func: Func::AlterTable(if rename {
-                            AlterTableFunc::RenameColumn
-                        } else {
-                            AlterTableFunc::AlterColumn
-                        }),
-                        arg_count: 8,
-                        collation: CollationSeq::BINARY,
-                    },
-                });
-
-                let record = program.alloc_register();
-
-                program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u32(out),
-                    count: to_u32(sqlite_schema_column_len),
-                    dest_reg: to_u32(record),
-                    index_name: None,
-                    affinity_str: None,
-                });
-
-                // In MVCC mode, we need to delete before insert to properly
-                // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
-                if database_uses_mvcc(connection, database_id) {
-                    program.emit_insn(Insn::Delete {
-                        cursor_id,
-                        table_name: SQLITE_TABLEID.to_string(),
-                        is_part_of_update: true,
-                    });
-                }
-
-                program.emit_insn(Insn::Insert {
-                    cursor: cursor_id,
-                    key_reg: rowid,
-                    record_reg: record,
-                    flag: crate::vdbe::insn::InsertFlags(0),
-                    table_name: table_name.to_string(),
-                });
-            });
-
-            // Update trigger SQL for renamed columns
-            for (trigger_namespace, trigger_name, new_sql) in triggers_to_rewrite.clone() {
-                let escaped_sql = escape_sql_string_literal(&new_sql);
-                let escaped_trigger_name = escape_sql_string_literal(
-                    &resolver.mangle_name(trigger_namespace, &trigger_name),
-                );
-                let qualified_schema_table =
-                    schema_table_name_for_db(resolver, trigger_namespace.database_id);
-                let update_stmt = format!(
-                    r#"
-                        UPDATE {qualified_schema_table}
-                        SET sql = '{escaped_sql}'
-                        WHERE name = '{escaped_trigger_name}' COLLATE NOCASE AND type = 'trigger'
-                    "#,
-                );
-
-                let mut parser = Parser::new(update_stmt.as_bytes());
-                let cmd = parser.next_cmd().map_err(|e| {
-                    LimboError::ParseError(format!(
-                        "failed to parse trigger update SQL for {trigger_name}: {e}"
-                    ))
-                })?;
-                let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
-                    return Err(LimboError::ParseError(format!(
-                        "failed to parse trigger update SQL for {trigger_name}",
-                    )));
-                };
-
-                translate_update_for_schema_change(
-                    update,
-                    resolver,
-                    program,
-                    connection,
-                    input,
-                    |_program| {},
-                )?;
-            }
-
-            // Update view SQL for renamed columns
-            for (view_database_id, view_name, new_sql) in views_to_rewrite {
-                let escaped_sql = escape_sql_string_literal(&new_sql);
-                let view_schema_table = schema_table_name_for_db(resolver, view_database_id);
-                let update_stmt = format!(
-                    r#"
-                        UPDATE {view_schema_table}
-                        SET sql = '{escaped_sql}'
-                        WHERE name = '{view_name}' COLLATE NOCASE AND type = 'view'
-                    "#,
-                );
-
-                let mut parser = Parser::new(update_stmt.as_bytes());
-                let cmd = parser.next_cmd().map_err(|e| {
-                    LimboError::ParseError(format!(
-                        "failed to parse view update SQL for {view_name}: {e}"
-                    ))
-                })?;
-                let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
-                    return Err(LimboError::ParseError(format!(
-                        "failed to parse view update SQL for {view_name}",
-                    )));
-                };
-
-                translate_update_for_schema_change(
-                    update,
-                    resolver,
-                    program,
-                    connection,
-                    input,
-                    |_program| {},
-                )?;
-            }
+                .collect();
+            let cmd_context = CmdContext::new(connection, resolver, database_id);
+            let normalized_table_name = normalize_ident(table_name);
+            let catalog_cmd = if rename {
+                CatalogCmd::RenameColumn(RenameColumn {
+                    namespace: namespace.id,
+                    table: &normalized_table_name,
+                    written_table_name: table_name,
+                    old_name: old_column_name,
+                    written_old_name: from,
+                    new_name: &definition.col_name,
+                    triggers: &rewritten_triggers,
+                    views: &views_to_rewrite,
+                    statement: input,
+                })
+            } else {
+                CatalogCmd::AlterColumn(AlterColumn {
+                    namespace: namespace.id,
+                    table: &normalized_table_name,
+                    written_table_name: table_name,
+                    old_name: old_column_name,
+                    written_old_name: from,
+                    definition: &definition,
+                })
+            };
+            resolver
+                .catalog
+                .dialect
+                .catalog()
+                .emit(program, &cmd_context, &catalog_cmd)?;
 
             if let Some(temp_schema_version) = temp_schema_version {
                 program.emit_insn(Insn::SetCookie {
@@ -2537,8 +2026,7 @@ pub fn translate_alter_table(
 /// relation of another kind.
 ///
 /// [`crate::translate::roles::check_statement_privileges`] lets a superuser
-/// run it, and the owner when it names a role it may set, which without
-/// role membership is itself.
+/// run it, and the owner when it names a role it may set.
 fn translate_alter_owner(
     qualified_name: &ast::QualifiedName,
     kind: RelationKind,
@@ -2570,20 +2058,21 @@ fn translate_alter_owner(
     }
     // The dialect decides what goes with the relation, such as a table's
     // indexes, and whose an index's owner is.
-    let changes = [RelationChange::ChangeOwner {
+    let owner = NewOwner::Role(role.clone());
+    let statement = AccessStatement::ChangeOwner {
         namespace: namespace.id,
-        name: normalized_name,
-        owner: NewOwner::Role(role.clone()),
-    }];
+        name: &normalized_name,
+        owner: &owner,
+    };
 
     let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
     program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
-    resolver.catalog.dialect.translate_relation_changes(
-        program,
-        resolver.schema(),
-        connection,
-        &changes,
-    )?;
+    let cmd_context = CmdContext::new(connection, resolver, namespace.database_id);
+    resolver
+        .catalog
+        .dialect
+        .catalog()
+        .emit_access(program, &cmd_context, &statement)?;
     schema::emit_schema_cookie(resolver, program);
     Ok(())
 }
@@ -3159,15 +2648,18 @@ fn non_virtual_affinity_str(table: &BTreeTable) -> String {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn translate_rename_virtual_table(
     program: &mut ProgramBuilder,
     vtab: Arc<VirtualTable>,
     old_name: &str,
-    new_name_norm: String,
+    new_name: &ast::Name,
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
     namespace: NamespaceRef,
+    input: &str,
 ) -> Result<()> {
+    let new_name_norm = normalize_ident(new_name.as_str());
     let database_id = namespace.database_id;
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_operation()?;
@@ -3181,76 +2673,26 @@ fn translate_rename_virtual_table(
         cursor_id: vtab_cur,
         new_name_reg,
     });
-    // Rewrite sqlite_schema entry
-    let sqlite_schema = resolver
-        .schema()
-        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-        .ok_or_else(|| {
-            LimboError::ParseError("sqlite_schema table not found in schema".to_string())
-        })?;
-
-    let schema_cur = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: schema_cur,
-        root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
-        db: database_id,
-    });
-
-    program.cursor_loop(schema_cur, |program, rowid| {
-        let ncols = sqlite_schema.columns().len();
-        turso_assert_eq!(ncols, 5);
-
-        let first_col = program.alloc_registers(ncols);
-        for i in 0..ncols {
-            program.emit_column_or_rowid(schema_cur, i, first_col + i);
-        }
-
-        program.emit_string8_new_reg(old_name.to_string());
-        program.mark_last_insn_constant();
-
-        program.emit_string8_new_reg(new_name_norm.clone());
-        program.mark_last_insn_constant();
-
-        let out = program.alloc_registers(ncols);
-
-        program.emit_insn(Insn::Function {
-            constant_mask: 0,
-            start_reg: first_col,
-            dest: out,
-            func: crate::function::FuncCtx {
-                func: Func::AlterTable(AlterTableFunc::RenameTable),
-                arg_count: 7,
-                collation: CollationSeq::BINARY,
-            },
-        });
-
-        let rec = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(out),
-            count: to_u32(ncols),
-            dest_reg: to_u32(rec),
-            index_name: None,
-            affinity_str: None,
-        });
-
-        // In MVCC mode, we need to delete before insert to properly
-        // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
-        if database_uses_mvcc(connection, database_id) {
-            program.emit_insn(Insn::Delete {
-                cursor_id: schema_cur,
-                table_name: SQLITE_TABLEID.to_string(),
-                is_part_of_update: true,
-            });
-        }
-
-        program.emit_insn(Insn::Insert {
-            cursor: schema_cur,
-            key_reg: rowid,
-            record_reg: rec,
-            flag: crate::vdbe::insn::InsertFlags(0),
-            table_name: old_name.to_string(),
-        });
-    });
+    let old_name_norm = normalize_ident(old_name);
+    let cmd_context = CmdContext::new(connection, resolver, database_id);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::RenameTable(RenameTable {
+            namespace: namespace.id,
+            old_name: &old_name_norm,
+            new_name: &new_name_norm,
+            written_old_name: old_name,
+            written_new_name: new_name.as_str(),
+            is_virtual: true,
+            indexes: &[],
+            stored_old_name: &old_name_norm,
+            stored_new_name: &new_name_norm,
+            temp_triggers: &[],
+            statement: input,
+        }),
+    )?;
+    let schema_cur = cmd_context.sqlite_schema_cursor(program);
 
     // Bump schema cookie
     program.emit_insn(Insn::SetCookie {
@@ -3291,14 +2733,13 @@ Here are some helpers related to that: */
 /// `CREATE TEMP TRIGGER ... ON aux.t` during
 /// `ALTER TABLE main.t RENAME TO ...`.
 fn rewrite_trigger_sql_for_table_rename(
+    dialect: &dyn crate::dialect::Dialect,
     trigger_sql: &str,
     old_table_name: &str,
     new_table_name: &str,
     renamed_db_name: &str,
 ) -> Result<String> {
-    let mut parser = Parser::new(trigger_sql.as_bytes());
-    let cmd = parser
-        .next_cmd()
+    let cmd = crate::dialect::parse_statement(dialect, trigger_sql)
         .map_err(|e| LimboError::ParseError(format!("failed to parse trigger SQL: {e}")))?;
     let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
         temporary,
@@ -3366,7 +2807,9 @@ fn rewrite_trigger_sql_for_table_rename(
 /// Check if a trigger contains qualified references to a specific column in its owning table.
 /// Rewrite trigger SQL to replace old column name with new column name.
 /// This handles old.x, new.x, and unqualified x references.
+#[allow(clippy::too_many_arguments)]
 fn rewrite_trigger_sql_for_column_rename(
+    dialect: &dyn crate::dialect::Dialect,
     trigger_sql: &str,
     table_name: &str,
     old_column_name: &str,
@@ -3376,9 +2819,7 @@ fn rewrite_trigger_sql_for_column_rename(
     resolver: &Resolver,
 ) -> Result<String> {
     // Parse the trigger SQL
-    let mut parser = Parser::new(trigger_sql.as_bytes());
-    let cmd = parser
-        .next_cmd()
+    let cmd = crate::dialect::parse_statement(dialect, trigger_sql)
         .map_err(|e| LimboError::ParseError(format!("failed to parse trigger SQL: {e}")))?;
     let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
         temporary,
@@ -3610,7 +3051,7 @@ impl<'a> ColumnRenameMode<'a> {
 struct TargetQualifiers {
     names: Vec<String>,
     unqualified_column_is_from_other_table: bool,
-    ctes: rustc_hash::FxHashMap<String, crate::util::ViewColumnSchema>,
+    ctes: rustc_hash::FxHashMap<String, crate::schema::view::ViewColumnSchema>,
 }
 
 impl TargetQualifiers {
@@ -3655,7 +3096,7 @@ impl TargetQualifiers {
                 _ => {
                     other_table_has_column |= resolver
                         .with_schema(database_id, |schema| {
-                            crate::util::select_table_column_names(
+                            crate::schema::view::select_table_column_names(
                                 NamespaceId::ROOT,
                                 select_table,
                                 schema,
@@ -4123,7 +3564,7 @@ fn apply_select_for_column_rename(
 ) -> Result<()> {
     let outer_target_qualifiers = &TargetQualifiers {
         ctes: resolver.with_schema(database_id, |schema| {
-            crate::util::extract_cte_columns(
+            crate::schema::view::extract_cte_columns(
                 NamespaceId::ROOT,
                 &select.with,
                 schema,
@@ -4191,7 +3632,7 @@ fn apply_select_for_column_rename(
     // the alias label, which is independent of the renamed table column.
     let body = &select.body;
     for sorted_col in &mut select.order_by {
-        if crate::util::is_order_by_alias_ref(body, &sorted_col.expr, old_col_norm) {
+        if crate::schema::alter_table::is_order_by_alias_ref(body, &sorted_col.expr, old_col_norm) {
             continue;
         }
         apply_expr_for_column_rename(
@@ -4262,7 +3703,7 @@ fn apply_one_select_for_column_rename(
             where_clause,
             group_by,
             window_clause,
-            ..
+            distinctness,
         } => {
             let visible_target_qualifiers = outer_target_qualifiers.with_from_tables(
                 from_clause_tables(from),
@@ -4306,6 +3747,25 @@ fn apply_one_select_for_column_rename(
                 apply_expr_for_column_rename(
                     mode,
                     where_expr,
+                    ColumnRenameExprTraversal::Normal,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    None,
+                    &visible_target_qualifiers,
+                    database_id,
+                    resolver,
+                )?;
+            }
+
+            for expr in distinctness
+                .iter_mut()
+                .flat_map(|distinctness| distinctness.exprs_mut())
+            {
+                apply_expr_for_column_rename(
+                    mode,
+                    expr,
                     ColumnRenameExprTraversal::Normal,
                     trigger_table,
                     trigger_table_name,
@@ -5468,7 +4928,7 @@ fn validate_one_select_column_refs_after_drop(
             where_clause,
             group_by,
             window_clause,
-            ..
+            distinctness,
         } => {
             let local_visible_columns = merge_column_lists(
                 outer_visible_columns,
@@ -5524,6 +4984,25 @@ fn validate_one_select_column_refs_after_drop(
             if let Some(where_clause) = where_clause {
                 if let Some(bad) = validate_expr_column_refs_after_drop(
                     where_clause,
+                    &local_visible_columns,
+                    owning_table_columns,
+                    allow_bare_owning_columns,
+                    altered_table_norm,
+                    post_drop_table,
+                    resolver,
+                    trigger_database_id,
+                    altered_database_id,
+                )? {
+                    return Ok(Some(bad));
+                }
+            }
+
+            for expr in distinctness
+                .iter()
+                .flat_map(|distinctness| distinctness.exprs())
+            {
+                if let Some(bad) = validate_expr_column_refs_after_drop(
+                    expr,
                     &local_visible_columns,
                     owning_table_columns,
                     allow_bare_owning_columns,
@@ -5891,7 +5370,7 @@ fn collect_select_table_visible_columns_from_output(
 }
 
 fn collect_one_select_output_columns(one_select: &ast::OneSelect) -> Vec<String> {
-    crate::util::output_column_aliases(one_select)
+    crate::schema::alter_table::output_column_aliases(one_select)
 }
 
 /// Check a single expression node for invalid column references after a DROP COLUMN.

@@ -66,6 +66,9 @@ impl ConstraintViolation {
 pub struct DialectError {
     pub code: &'static str,
     pub message: String,
+    /// More about the error, which a dialect may report apart from the
+    /// message, such as the objects that keep it from dropping something.
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
@@ -117,6 +120,9 @@ pub enum LimboError {
     ParseFloatError(#[from] std::num::ParseFloatError),
     #[error("Parse error: {0}")]
     InvalidDate(String),
+    /// A date or time field is out of range, such as `2024-02-30`.
+    #[error("Parse error: {0}")]
+    DatetimeFieldOverflow(String),
     #[error("Parse error: {0}")]
     InvalidTime(String),
     #[error("Modifier parsing error: {0}")]

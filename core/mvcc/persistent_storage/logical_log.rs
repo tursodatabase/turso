@@ -153,11 +153,16 @@
 //! 3. checkpoint WAL pages into DB file;
 //! 4. fsync DB file (unless `SyncMode::Off`);
 //! 5. truncate logical log to 0 (regenerates salt in memory; header written with next frame);
-//! 6. fsync logical log (unless `SyncMode::Off`);
-//! 7. truncate WAL last.
+//! 6. truncate WAL last.
 //!
 //! WAL-last is intentional: if crash happens mid-checkpoint, WAL remains a safety net until
-//! logical-log cleanup is complete.
+//! the DB file is durable.
+//!
+//! The logical log needs no fsync after step 5. If a crash loses the truncation, the old
+//! frames come back, but their `commit_ts` is at or below `persistent_tx_ts_max`, so recovery
+//! skips them. A switch from MVCC to WAL mode is different: it fsyncs the log after the
+//! checkpoint, before it writes the WAL-mode header, because a database in WAL mode does not
+//! open while its logical log has frames.
 //!
 //! ### Frame Layout: Unencrypted vs Encrypted
 //!
@@ -302,12 +307,12 @@ const LOG_HDR_SALT_SIZE: usize = 8;
 const LOG_HDR_RESERVED_START: usize = LOG_HDR_SALT_START + LOG_HDR_SALT_SIZE; // 16
 const LOG_HDR_CRC_START: usize = 52;
 const LOG_HDR_RESERVED_SIZE: usize = LOG_HDR_CRC_START - LOG_HDR_RESERVED_START; // 36
-pub(crate) const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
-pub(crate) const EXT_FRAME_MAGIC: u32 = 0x5845564D; // "MVEX" in LE
+pub const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
+pub const EXT_FRAME_MAGIC: u32 = 0x5845564D; // "MVEX" in LE
 const END_MAGIC: u32 = 0x4554564D; // "MVTE" in LE
 
 // Size of each chunk before encryption (i.e. before tag/nonce overhead is added)
-pub(crate) const ENCRYPTED_PAYLOAD_CHUNK_SIZE: usize = 32 * 1024;
+pub const ENCRYPTED_PAYLOAD_CHUNK_SIZE: usize = 32 * 1024;
 // Fixed AAD width for one encrypted chunk:
 // salt(8) + payload_size_or_zero(8) + op_count(4) + commit_ts(8) + chunk_index(4).
 const ENCRYPTED_CHUNK_AAD_SIZE: usize = 32;
@@ -459,7 +464,7 @@ pub struct LogHeader {
 
 impl LogHeader {
     pub(crate) fn new(io: &Arc<dyn crate::IO>) -> Self {
-        Self::new_with_version(io, LOG_VERSION_V2)
+        Self::new_with_version(io, LOG_VERSION)
     }
 
     fn new_with_version(io: &Arc<dyn crate::IO>, version: u8) -> Self {
@@ -712,16 +717,11 @@ impl LogicalLog {
         let has_portable_changes = portable_changes_enabled;
 
         // 1. Ensure we have a log header object (created lazily on first write).
-        // Non-portable logs remain LML2 so a deployment that does not enable
-        // portable extensions can still roll back to readers that only know LML2.
+        // New logs are always LML3, so a later portable frame never needs the
+        // header rewritten in place.
         let is_first_write = self.offset == 0;
         if is_first_write && self.header.is_none() {
-            let version = if portable_changes_enabled {
-                LOG_VERSION
-            } else {
-                LOG_VERSION_V2
-            };
-            let header = LogHeader::new_with_version(&self.io, version);
+            let header = LogHeader::new(&self.io);
             self.running_crc = derive_initial_crc(header.salt);
             self.header = Some(header);
         }
@@ -1645,6 +1645,36 @@ enum HeaderParseOutcome {
     Invalid,
 }
 
+/// The header bytes of a transaction frame in a stack buffer: the
+/// TX_HEADER_SIZE bytes of the base header and, for an extension frame, the
+/// extension header that follows them.
+struct FrameHeaderBytes {
+    buf: [u8; TX_EXT_HEADER_SIZE],
+    len: usize,
+}
+
+impl FrameHeaderBytes {
+    /// The header bytes that were read.
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    /// Whether the frame has an extension header.
+    fn has_extension_header(&self) -> bool {
+        self.len == TX_EXT_HEADER_SIZE
+    }
+}
+
+/// Outcome of reading the header bytes of a transaction frame.
+enum FrameHeaderRead {
+    Header(FrameHeaderBytes),
+    /// The log ends before the end of the header.
+    Eof,
+    /// The frame magic is not FRAME_MAGIC, or EXT_FRAME_MAGIC where an
+    /// extension frame is permitted.
+    BadMagic,
+}
+
 /// Outcome of parsing a payload phase. Corruption is signalled via
 /// `Err(LimboError::Corrupt(..))` and translated to `Invalid` by the caller,
 /// mirroring the previous control flow.
@@ -1883,6 +1913,34 @@ impl StreamingLogicalLogReader {
     ) -> Result<Option<Vec<ParsedOp>>> {
         let io = io.clone();
         io.block(|| self.next_frame())
+    }
+
+    /// Reads the operations of every remaining transaction frame.
+    #[cfg(feature = "test_helper")]
+    pub fn read_ops_for_testing(
+        &mut self,
+        io: &Arc<dyn crate::IO>,
+    ) -> Result<Vec<LogOpForTesting>> {
+        let mut ops = Vec::new();
+        while let Some(frame) = io.block(|| self.next_frame())? {
+            ops.extend(frame.into_iter().map(|op| match op {
+                ParsedOp::DeleteTable {
+                    rowid,
+                    record_bytes,
+                    pk_record_bytes,
+                    ..
+                } => LogOpForTesting::DeleteTable {
+                    rowid,
+                    record_bytes,
+                    pk_record_bytes,
+                },
+                ParsedOp::UpdateHeader { .. } => LogOpForTesting::UpdateHeader,
+                ParsedOp::UpsertTable { .. }
+                | ParsedOp::UpsertIndex { .. }
+                | ParsedOp::DeleteIndex { .. } => LogOpForTesting::Other,
+            }));
+        }
+        Ok(ops)
     }
 
     /// Reads the next complete transaction frame.
@@ -2566,8 +2624,11 @@ impl StreamingLogicalLogReader {
                         )
                         .into());
                     }
-                    let mut payload = payload;
-                    let record_bytes = payload.split_off(rowid_len);
+                    // The payload is a buffer of its own, so the rowid bytes
+                    // are removed in place instead of copying the record into
+                    // a new buffer.
+                    let mut record_bytes = payload;
+                    record_bytes.drain(..rowid_len);
                     let rowid = RowID::new(table_id, RowKey::Int(rowid_i64));
                     ParsedOp::UpsertTable {
                         table_id,
@@ -2592,8 +2653,9 @@ impl StreamingLogicalLogReader {
                         .into());
                     }
                     let rowid_i64 = rowid_u64 as i64;
-                    let mut payload = payload;
-                    let mut record_bytes = payload.split_off(rowid_len);
+                    // See OP_UPSERT_TABLE: the rowid bytes are removed in place.
+                    let mut record_bytes = payload;
+                    record_bytes.drain(..rowid_len);
                     let mut pk_record_bytes = crate::alloc::vec![];
                     if !portable_extension.is_empty() {
                         let decoded = decode_delete_portable_extension(&portable_extension)?;
@@ -2830,36 +2892,18 @@ impl StreamingLogicalLogReader {
         //
         // TX HEADER v3 extension frames append:
         // extension_size(8) | extension_record_count(4) | frame_flags(4)
-        let mut header_bytes = match return_if_io!(self.try_consume_bytes(TX_HEADER_SIZE)) {
-            Some(bytes) => bytes,
-            None => return Ok(IOResult::Done(HeaderParseOutcome::Eof)),
-        };
-
-        let frame_magic = u32::from_le_bytes([
-            header_bytes[0],
-            header_bytes[1],
-            header_bytes[2],
-            header_bytes[3],
-        ]);
+        // A v2 log has no extension frames.
         let is_v2 = self
             .header
             .as_ref()
             .is_some_and(|header| header.version == LOG_VERSION_V2);
-        let has_extension_header = !is_v2 && frame_magic == EXT_FRAME_MAGIC;
-        if frame_magic != FRAME_MAGIC && !has_extension_header {
-            return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
-        }
-        if is_v2 && frame_magic != FRAME_MAGIC {
-            return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
-        }
-        if has_extension_header {
-            let Some(extension_header) =
-                return_if_io!(self.try_consume_bytes(TX_EXT_HEADER_SIZE - TX_HEADER_SIZE))
-            else {
-                return Ok(IOResult::Done(HeaderParseOutcome::Eof));
-            };
-            header_bytes.extend_from_slice(&extension_header);
-        }
+        let header = match return_if_io!(self.try_consume_frame_header(!is_v2)) {
+            FrameHeaderRead::Header(header) => header,
+            FrameHeaderRead::Eof => return Ok(IOResult::Done(HeaderParseOutcome::Eof)),
+            FrameHeaderRead::BadMagic => return Ok(IOResult::Done(HeaderParseOutcome::Invalid)),
+        };
+        let has_extension_header = header.has_extension_header();
+        let header_bytes = header.bytes();
         let payload_size_u64 = u64::from_le_bytes([
             header_bytes[4],
             header_bytes[5],
@@ -2939,7 +2983,7 @@ impl StreamingLogicalLogReader {
         };
 
         // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC).
-        let running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
+        let running_crc = crc32c::crc32c_append(self.running_crc, header_bytes);
 
         Ok(IOResult::Done(HeaderParseOutcome::Ok(FrameHeader {
             payload_size,
@@ -3146,30 +3190,16 @@ impl StreamingLogicalLogReader {
         }
         let frame_start = self.offset.saturating_sub(self.bytes_can_read());
 
-        let mut header_bytes = match return_if_io!(self.try_consume_bytes(TX_HEADER_SIZE)) {
-            Some(bytes) => bytes,
-            None => return Ok(IOResult::Done(ParseResult::Eof)),
+        let header = match return_if_io!(self.try_consume_frame_header(true)) {
+            FrameHeaderRead::Header(header) => header,
+            FrameHeaderRead::Eof => return Ok(IOResult::Done(ParseResult::Eof)),
+            FrameHeaderRead::BadMagic => {
+                self.last_valid_offset = frame_start;
+                return Ok(IOResult::Done(ParseResult::InvalidFrame));
+            }
         };
-
-        let frame_magic = u32::from_le_bytes([
-            header_bytes[0],
-            header_bytes[1],
-            header_bytes[2],
-            header_bytes[3],
-        ]);
-        let has_extension_header = frame_magic == EXT_FRAME_MAGIC;
-        if frame_magic != FRAME_MAGIC && !has_extension_header {
-            self.last_valid_offset = frame_start;
-            return Ok(IOResult::Done(ParseResult::InvalidFrame));
-        }
-        if has_extension_header {
-            let Some(extension_header) =
-                return_if_io!(self.try_consume_bytes(TX_EXT_HEADER_SIZE - TX_HEADER_SIZE))
-            else {
-                return Ok(IOResult::Done(ParseResult::Eof));
-            };
-            header_bytes.extend_from_slice(&extension_header);
-        }
+        let has_extension_header = header.has_extension_header();
+        let header_bytes = header.bytes();
         let payload_size_u64 = u64::from_le_bytes([
             header_bytes[4],
             header_bytes[5],
@@ -3253,7 +3283,7 @@ impl StreamingLogicalLogReader {
             }
         };
 
-        let running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
+        let running_crc = crc32c::crc32c_append(self.running_crc, header_bytes);
         let encrypted_extension_size = if self.encryption_ctx.is_some() {
             extension_size
         } else {
@@ -3486,6 +3516,44 @@ impl StreamingLogicalLogReader {
         let bytes = crate::types::value_blob_from_slice(&buffer[start..end])?;
         self.buffer_offset = end;
         Ok(IOResult::Done(Some(bytes)))
+    }
+
+    /// Reads the header of a transaction frame into a stack buffer, without
+    /// an allocation for each frame: the base header, then, when its magic is
+    /// EXT_FRAME_MAGIC and `allow_extension` is true, the extension header
+    /// that follows. Any other magic than FRAME_MAGIC gives BadMagic. Always
+    /// inlined, so that the buffer is not copied into the result for each
+    /// frame.
+    #[inline(always)]
+    fn try_consume_frame_header(&mut self, allow_extension: bool) -> IOResultOr<FrameHeaderRead> {
+        let Some(base_header) = return_if_io!(self.try_consume_fixed::<TX_HEADER_SIZE>()) else {
+            return Ok(IOResult::Done(FrameHeaderRead::Eof));
+        };
+        let mut header = FrameHeaderBytes {
+            buf: [0u8; TX_EXT_HEADER_SIZE],
+            len: TX_HEADER_SIZE,
+        };
+        header.buf[..TX_HEADER_SIZE].copy_from_slice(&base_header);
+        let frame_magic = u32::from_le_bytes([
+            base_header[0],
+            base_header[1],
+            base_header[2],
+            base_header[3],
+        ]);
+        let has_extension_header = allow_extension && frame_magic == EXT_FRAME_MAGIC;
+        if frame_magic != FRAME_MAGIC && !has_extension_header {
+            return Ok(IOResult::Done(FrameHeaderRead::BadMagic));
+        }
+        if has_extension_header {
+            let Some(extension_header) =
+                return_if_io!(self.try_consume_fixed::<{ TX_EXT_HEADER_SIZE - TX_HEADER_SIZE }>())
+            else {
+                return Ok(IOResult::Done(FrameHeaderRead::Eof));
+            };
+            header.buf[TX_HEADER_SIZE..].copy_from_slice(&extension_header);
+            header.len = TX_EXT_HEADER_SIZE;
+        }
+        Ok(IOResult::Done(FrameHeaderRead::Header(header)))
     }
 
     fn try_consume_fixed<const N: usize>(&mut self) -> IOResultOr<Option<[u8; N]>> {
@@ -3814,6 +3882,23 @@ pub(crate) enum ParsedOp {
     },
 }
 
+/// A logical log operation, as [`StreamingLogicalLogReader::read_ops_for_testing`]
+/// returns it to integration tests.
+#[cfg(feature = "test_helper")]
+#[derive(Debug)]
+pub enum LogOpForTesting {
+    DeleteTable {
+        rowid: RowID,
+        /// The deleted row's record, which a delete may leave out.
+        record_bytes: crate::ValueBlob,
+        /// A record of the deleted row's primary key values.
+        pk_record_bytes: crate::ValueBlob,
+    },
+    UpdateHeader,
+    /// Any operation that is not one of the above.
+    Other,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum IndexOpKind {
     Upsert,
@@ -3822,11 +3907,9 @@ pub(crate) enum IndexOpKind {
 
 #[cfg(test)]
 mod tests {
-    use crate::namespace::NamespaceId;
     use crate::types::IOResult;
     use crate::util::IOExt as _;
     use std::cell::RefCell;
-    use std::collections::BTreeSet;
     use std::sync::Once;
 
     use quickcheck_macros::quickcheck;
@@ -3840,15 +3923,13 @@ mod tests {
     use crate::sync::Arc;
     use crate::{
         mvcc::database::{
-            tests::{commit_tx, generate_simple_string_row, MvccTestDbNoConn},
-            MVTableId, Row, RowID, RowKey, SortableIndexKey,
+            tests::generate_simple_string_row, MVTableId, Row, RowID, RowKey, SortableIndexKey,
         },
-        schema::Table,
         storage::sqlite3_ondisk::{
             read_varint, read_varint_partial, varint_len, write_varint, DatabaseHeader,
         },
-        types::{ImmutableRecord, ImmutableRecordRef, IndexInfo, Text},
-        Buffer, Completion, SharedBufferData, Value, ValueRef,
+        types::{ImmutableRecord, IndexInfo, Text},
+        Buffer, Completion, SharedBufferData, Value,
     };
 
     use super::{
@@ -4364,402 +4445,6 @@ mod tests {
             recovered, expected,
             "encrypted forced-yield recovery must match the synchronous path exactly"
         );
-    }
-
-    /// What this test checks: A committed transaction written to the logical log is replayed correctly after restart.
-    /// Why this matters: This is the baseline durability/recovery guarantee for MVCC commits.
-    #[test]
-    fn test_logical_log_read() {
-        init_tracing();
-        // Load a transaction
-        // let's not drop db as we don't want files to be removed
-        let mut db = MvccTestDbNoConn::new_with_random_db();
-        {
-            let conn = db.connect();
-            let pager = conn.pager.load().clone();
-            let mvcc_store = db.get_mvcc_store();
-            let table_id: MVTableId = (-100).into();
-            let tx_id = mvcc_store.begin_tx(pager).unwrap();
-            // insert table id -2 into sqlite_schema table (table_id -1)
-            let data = ImmutableRecord::from_values(
-                &[
-                    Value::Text(Text::new("table")),  // type
-                    Value::Text(Text::new("test")),   // name
-                    Value::Text(Text::new("test")),   // tbl_name
-                    Value::from_i64(table_id.into()), // rootpage
-                    Value::Text(Text::new(
-                        "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
-                    )), // sql
-                ],
-                5,
-            )
-            .unwrap();
-            mvcc_store
-                .insert(
-                    tx_id,
-                    Row::new_table_row(RowID::new((-1).into(), RowKey::Int(1000)), data.as_blob())
-                        .unwrap(),
-                )
-                .unwrap();
-            // now insert a row into table -2
-            let row = generate_simple_string_row(table_id, 1, "foo");
-            mvcc_store.insert(tx_id, row).unwrap();
-            commit_tx(mvcc_store, &conn, tx_id).unwrap();
-        }
-
-        // Restart the database to trigger recovery
-        db.restart();
-
-        // Now try to read it back - recovery happens automatically during bootstrap
-        let conn = db.connect();
-        let pager = conn.pager.load().clone();
-        let mvcc_store = db.get_mvcc_store();
-        let tx = mvcc_store.begin_tx(pager).unwrap();
-        let row = mvcc_store
-            .read(tx, &RowID::new((-100).into(), RowKey::Int(1)))
-            .unwrap()
-            .unwrap();
-        let record = ImmutableRecordRef::from_bin_record(row.payload());
-        let foo = record.iter().unwrap().next().unwrap().unwrap();
-        let ValueRef::Text(foo) = foo else {
-            unreachable!()
-        };
-        assert_eq!(foo.as_str(), "foo");
-    }
-
-    /// What this test checks: A long sequence of committed frames is replayed in order without dropping or reordering transactions.
-    /// Why this matters: Recovery must preserve commit order to maintain MVCC visibility semantics.
-    #[test]
-    fn test_logical_log_read_multiple_transactions() {
-        init_tracing();
-        let table_id: MVTableId = (-100).into();
-        let values = (0..100)
-            .map(|i| {
-                (
-                    RowID::new(table_id, RowKey::Int(i as i64)),
-                    format!("foo_{i}"),
-                )
-            })
-            .collect::<Vec<(RowID, String)>>();
-        // let's not drop db as we don't want files to be removed
-        let mut db = MvccTestDbNoConn::new_with_random_db();
-        {
-            let conn = db.connect();
-            let pager = conn.pager.load().clone();
-            let mvcc_store = db.get_mvcc_store();
-
-            let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
-            // insert table id -2 into sqlite_schema table (table_id -1)
-            let data = ImmutableRecord::from_values(
-                &[
-                    Value::Text(Text::new("table")),  // type
-                    Value::Text(Text::new("test")),   // name
-                    Value::Text(Text::new("test")),   // tbl_name
-                    Value::from_i64(table_id.into()), // rootpage
-                    Value::Text(Text::new(
-                        "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
-                    )), // sql
-                ],
-                5,
-            )
-            .unwrap();
-            mvcc_store
-                .insert(
-                    tx_id,
-                    Row::new_table_row(RowID::new((-1).into(), RowKey::Int(1000)), data.as_blob())
-                        .unwrap(),
-                )
-                .unwrap();
-            commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
-            // now insert a row into table -2
-            // generate insert per transaction
-            for (rowid, value) in &values {
-                let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
-                let row = generate_simple_string_row(
-                    rowid.table_id,
-                    rowid.row_id.to_int_or_panic(),
-                    value,
-                );
-                mvcc_store.insert(tx_id, row).unwrap();
-                commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
-            }
-        }
-
-        // Restart the database to trigger recovery
-        db.restart();
-
-        // Now try to read it back - recovery happens automatically during bootstrap
-        let conn = db.connect();
-        let pager = conn.pager.load().clone();
-        let mvcc_store = db.get_mvcc_store();
-        for (rowid, value) in &values {
-            let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
-            let row = mvcc_store.read(tx, rowid).unwrap().unwrap();
-            let record = ImmutableRecordRef::from_bin_record(row.payload());
-            let foo = record.iter().unwrap().next().unwrap().unwrap();
-            let ValueRef::Text(foo) = foo else {
-                unreachable!()
-            };
-            assert_eq!(foo.as_str(), value.as_str());
-        }
-    }
-
-    /// What this test checks: Randomized insert/delete workloads round-trip through write + restart replay with matching final contents.
-    /// Why this matters: Fuzz-style coverage catches edge combinations that hand-written examples miss.
-    #[test]
-    fn test_logical_log_read_fuzz() {
-        init_tracing();
-        let table_id: MVTableId = (-100).into();
-        let seed = rng().random();
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let num_transactions = rng.next_u64() % 128;
-        let mut txns = vec![];
-        let mut present_rowids = BTreeSet::new();
-        let mut non_present_rowids = BTreeSet::new();
-        for _ in 0..num_transactions {
-            let num_operations = rng.next_u64() % 8;
-            let mut ops = vec![];
-            for _ in 0..num_operations {
-                let op_type = rng.next_u64() % 2;
-                match op_type {
-                    0 => {
-                        // Generate a positive rowid that fits in i64
-                        let row_id = (rng.next_u64() % (i64::MAX as u64)) as i64;
-                        let rowid = RowID::new(table_id, RowKey::Int(row_id));
-                        let row = generate_simple_string_row(
-                            rowid.table_id,
-                            rowid.row_id.to_int_or_panic(),
-                            &format!("row_{row_id}"),
-                        );
-                        ops.push((true, Some(row), rowid.clone()));
-                        present_rowids.insert(rowid.clone());
-                        non_present_rowids.remove(&rowid);
-                        tracing::debug!("insert {rowid:?}");
-                    }
-                    1 => {
-                        if present_rowids.is_empty() {
-                            continue;
-                        }
-                        let row_id_pos = rng.next_u64() as usize % present_rowids.len();
-                        let row_id = present_rowids.iter().nth(row_id_pos).unwrap().clone();
-                        ops.push((false, None, row_id.clone()));
-                        present_rowids.remove(&row_id);
-                        non_present_rowids.insert(row_id.clone());
-                        tracing::debug!("removed {row_id:?}");
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            txns.push(ops);
-        }
-        // let's not drop db as we don't want files to be removed
-        let mut db = MvccTestDbNoConn::new_with_random_db();
-        let pager = {
-            let conn = db.connect();
-            let pager = conn.pager.load().clone();
-            let mvcc_store = db.get_mvcc_store();
-
-            // insert table id -2 into sqlite_schema table (table_id -1)
-            let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
-            let data = ImmutableRecord::from_values(
-                &[
-                    Value::Text(Text::new("table")),  // type
-                    Value::Text(Text::new("test")),   // name
-                    Value::Text(Text::new("test")),   // tbl_name
-                    Value::from_i64(table_id.into()), // rootpage
-                    Value::Text(Text::new(
-                        "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
-                    )), // sql
-                ],
-                5,
-            )
-            .unwrap();
-            mvcc_store
-                .insert(
-                    tx_id,
-                    Row::new_table_row(RowID::new((-1).into(), RowKey::Int(1000)), data.as_blob())
-                        .unwrap(),
-                )
-                .unwrap();
-            commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
-
-            // insert rows
-            for ops in &txns {
-                let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
-                for (is_insert, maybe_row, rowid) in ops {
-                    if *is_insert {
-                        mvcc_store
-                            .insert(tx_id, maybe_row.as_ref().unwrap().clone())
-                            .unwrap();
-                    } else {
-                        mvcc_store.delete(tx_id, rowid.clone()).unwrap();
-                    }
-                }
-                commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
-            }
-
-            conn.close().unwrap();
-            pager
-        };
-
-        db.restart();
-
-        // connect after restart should recover log.
-        let _conn = db.connect();
-        let mvcc_store = db.get_mvcc_store();
-
-        // Check rowids that weren't deleted
-        let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
-        for present_rowid in present_rowids {
-            let row = mvcc_store.read(tx, &present_rowid).unwrap().unwrap();
-            let record = ImmutableRecordRef::from_bin_record(row.payload());
-            let foo = record.iter().unwrap().next().unwrap().unwrap();
-            let ValueRef::Text(foo) = foo else {
-                unreachable!()
-            };
-
-            assert_eq!(
-                foo.as_str(),
-                format!("row_{}", present_rowid.row_id.to_int_or_panic())
-            );
-        }
-
-        // Check rowids that were deleted
-        let tx = mvcc_store.begin_tx(pager).unwrap();
-        for present_rowid in non_present_rowids {
-            let row = mvcc_store.read(tx, &present_rowid).unwrap();
-            assert!(
-                row.is_none(),
-                "row {present_rowid:?} should have been removed"
-            );
-        }
-    }
-
-    /// What this test checks: Recovery rebuilds both table rows and index rows from logical-log operations.
-    /// Why this matters: Table/index divergence after restart would break query correctness.
-    #[test]
-    fn test_logical_log_read_table_and_index_rows() {
-        init_tracing();
-        // Test that both table rows and index rows can be read back after recovery
-        let mut db = MvccTestDbNoConn::new_with_random_db();
-        {
-            let conn = db.connect();
-
-            // Create a table with an index
-            conn.execute("CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)")
-                .unwrap();
-            conn.execute("CREATE INDEX idx_data ON test(data)").unwrap();
-
-            // Checkpoint to ensure the index has a root_page mapping
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-            // Insert some data - this will create both table rows and index rows in the logical log
-            // Don't checkpoint after inserts so they remain in the logical log for recovery testing
-            conn.execute("INSERT INTO test(id, data) VALUES (1, 'foo')")
-                .unwrap();
-            conn.execute("INSERT INTO test(id, data) VALUES (2, 'bar')")
-                .unwrap();
-            conn.execute("INSERT INTO test(id, data) VALUES (3, 'baz')")
-                .unwrap();
-        }
-
-        // Restart the database to trigger recovery
-        db.restart();
-
-        // Now verify that both table rows and index rows can be read back
-        let conn = db.connect();
-        let pager = conn.pager.load().clone();
-        let mvcc_store = db.get_mvcc_store();
-        let schema = conn.schema.read();
-        let table = schema
-            .get_table(NamespaceId::ROOT, "test")
-            .expect("table test should exist");
-        let Table::BTree(table) = table.as_ref() else {
-            panic!("table test should be btree");
-        };
-        let table_id = mvcc_store.get_table_id_from_root_page(table.root_page);
-
-        // Get the index from schema
-        let index = schema
-            .get_index(NamespaceId::ROOT, "test", "idx_data")
-            .expect("Index should exist");
-        // Use get_table_id_from_root_page to get the correct index_id (handles both checkpointed and non-checkpointed)
-        let index_id = mvcc_store.get_table_id_from_root_page(index.root_page);
-        let index_info = Arc::new(IndexInfo::new_from_index(index).unwrap());
-
-        // Verify table rows can be read
-        let tx = mvcc_store.begin_tx(pager).unwrap();
-        for (row_id, expected_data) in [(1, "foo"), (2, "bar"), (3, "baz")] {
-            let row = mvcc_store
-                .read(tx, &RowID::new(table_id, RowKey::Int(row_id)))
-                .unwrap()
-                .expect("Table row should exist");
-            let record = ImmutableRecordRef::from_bin_record(row.payload());
-            let values = record.get_values().unwrap();
-            let data_value = values.get(1).expect("Should have data column");
-            let ValueRef::Text(data_text) = data_value else {
-                panic!("Data column should be text");
-            };
-            assert_eq!(data_text.as_str(), expected_data);
-        }
-
-        // Verify index rows can be read
-        // Note: Index rows are written to the logical log, but we need to construct the correct key format
-        // The index key format is (indexed_column_value, table_rowid)
-        for (row_id, data_value) in [(1, "foo"), (2, "bar"), (3, "baz")] {
-            // Create the index key: (data_value, rowid)
-            // The index on data column stores (data_value, table_rowid) as the key
-            let key_record = ImmutableRecord::from_values(
-                &[
-                    Value::Text(Text::new(data_value.to_string())),
-                    Value::from_i64(row_id),
-                ],
-                2,
-            )
-            .unwrap();
-            let sortable_key = SortableIndexKey::new_from_payload_in(
-                &key_record,
-                index_info.clone(),
-                crate::alloc::TursoAllocator,
-            )
-            .unwrap();
-            let index_rowid = RowID::new(index_id, RowKey::Record(Arc::new(sortable_key)));
-
-            // Use read_from_table_or_index to read the index row
-            // This verifies that index rows were properly serialized and deserialized from the logical log
-            let index_row_opt = mvcc_store
-                .read_from_table_or_index(tx, &index_rowid, Some(index_id))
-                .unwrap_or_else(|e| {
-                    panic!("Failed to read index row for ({}, {}): {:?}. Index ID: {:?}, root_page: {}",
-                           data_value, row_id, e, index_id, index.root_page)
-                });
-
-            let Some(index_row) = index_row_opt else {
-                panic!(
-                    "Index row for ({data_value}, {row_id}) not found after recovery. Index rows should be in the logical log."
-                );
-            };
-            // Verify the index row contains the correct data
-            let RowKey::Record(sortable_key) = index_row.id.row_id else {
-                panic!("Index row should have a record row_id");
-            };
-            let record = sortable_key.key.clone();
-            let values = record.get_values().unwrap();
-            assert_eq!(
-                values.len(),
-                2,
-                "Index row should have 2 columns (data, rowid)"
-            );
-            let ValueRef::Text(index_data) = values[0] else {
-                panic!("First index column should be text");
-            };
-            assert_eq!(index_data.as_str(), data_value, "Index data should match");
-            let ValueRef::Numeric(crate::numeric::Numeric::Integer(index_rowid_val)) = values[1]
-            else {
-                panic!("Second index column should be integer (rowid)");
-            };
-            assert_eq!(index_rowid_val, row_id, "Index rowid should match");
-        }
     }
 
     /// What this test checks: If the last frame is torn, recovery keeps the valid prefix and ignores only the incomplete tail.
@@ -6003,7 +5688,7 @@ mod tests {
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let header = reader.header().unwrap();
-        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(header.version, LOG_VERSION);
         // Verify the on-disk CRC matches a fresh computation over the header bytes
         let encoded = header.encode();
         let mut check_buf = [0u8; LOG_HDR_SIZE];
@@ -6020,7 +5705,7 @@ mod tests {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let header = LogHeader::new(&io);
-        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(header.version, LOG_VERSION);
         assert_ne!(header.salt, 0, "salt should be non-zero from IO RNG");
         let bytes = header.encode();
         // Verify CRC: zero out the CRC field and recompute
@@ -7236,15 +6921,11 @@ mod tests {
     }
 
     #[test]
-    fn test_non_portable_first_write_uses_lml2_header_and_v2_frame() {
+    fn test_non_portable_first_write_uses_lml3_header() {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let file = io
-            .open_file(
-                "non-portable-first-write-lml2.db-log",
-                OpenFlags::Create,
-                false,
-            )
+            .open_file("non-portable-first-write.db-log", OpenFlags::Create, false)
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
@@ -7258,7 +6939,7 @@ mod tests {
 
         let frame = read_file_bytes(file, &io);
         let header = LogHeader::decode(&frame[..LOG_HDR_SIZE]).unwrap();
-        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(header.version, LOG_VERSION);
         assert_eq!(
             u32::from_le_bytes(frame[LOG_HDR_SIZE..LOG_HDR_SIZE + 4].try_into().unwrap()),
             FRAME_MAGIC
@@ -7266,11 +6947,11 @@ mod tests {
     }
 
     #[test]
-    fn test_non_portable_appends_keep_lml2_header_and_v2_frames() {
+    fn test_non_portable_appends_keep_lml3_header() {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let file = io
-            .open_file("non-portable-appends-lml2.db-log", OpenFlags::Create, false)
+            .open_file("non-portable-appends.db-log", OpenFlags::Create, false)
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
@@ -7291,7 +6972,7 @@ mod tests {
 
         let frame = read_file_bytes(file, &io);
         let header = LogHeader::decode(&frame[..LOG_HDR_SIZE]).unwrap();
-        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(header.version, LOG_VERSION);
         assert_eq!(
             u32::from_le_bytes(frame[LOG_HDR_SIZE..LOG_HDR_SIZE + 4].try_into().unwrap()),
             FRAME_MAGIC
@@ -7314,6 +6995,17 @@ mod tests {
         );
     }
 
+    /// A log whose first write will use a version 2 (LML2) header, as logs
+    /// created by older versions do.
+    #[cfg(feature = "conn_raw_api")]
+    fn lml2_logical_log(file: Arc<dyn crate::File>, io: &Arc<dyn crate::IO>) -> LogicalLog {
+        let mut log = LogicalLog::new(file, io.clone(), None);
+        let header = LogHeader::new_with_version(io, LOG_VERSION_V2);
+        log.running_crc = derive_initial_crc(header.salt);
+        log.header = Some(header);
+        log
+    }
+
     #[cfg(feature = "conn_raw_api")]
     #[test]
     fn test_portable_changes_upgrade_non_empty_lml2_log_to_lml3() {
@@ -7326,7 +7018,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let mut log = lml2_logical_log(file.clone(), &io);
 
         let tx = crate::mvcc::database::LogRecord::for_test(
             10,
@@ -7389,7 +7081,7 @@ mod tests {
             inner: inner.clone(),
             fail_header_write: std::sync::atomic::AtomicBool::new(false),
         });
-        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let mut log = lml2_logical_log(file.clone(), &io);
 
         let tx = crate::mvcc::database::LogRecord::for_test(
             10,

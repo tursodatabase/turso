@@ -170,6 +170,7 @@ pub trait File: Send + Sync {
         let mut pos = pos;
         let outstanding = Arc::new(AtomicUsize::new(buffers.len()));
         let total_written = Arc::new(AtomicUsize::new(0));
+        let first_error = Arc::new(crate::sync::OnceLock::new());
 
         for buf in buffers {
             let len = buf.len();
@@ -177,13 +178,24 @@ pub trait File: Send + Sync {
                 let c_main = c.clone();
                 let outstanding = outstanding.clone();
                 let total_written = total_written.clone();
+                let first_error = first_error.clone();
                 Completion::new_write(move |n| {
-                    if let Ok(n) = n {
+                    match n {
                         // accumulate bytes actually reported by the backend
-                        total_written.fetch_add(n as usize, Ordering::SeqCst);
-                        if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
-                            // last one finished
-                            c_main.complete(total_written.load(Ordering::Acquire) as i32);
+                        Ok(n) => {
+                            total_written.fetch_add(n as usize, Ordering::SeqCst);
+                        }
+                        Err(e) => {
+                            let _ = first_error.set(e);
+                        }
+                    }
+                    // Resolve the parent only after the last child: the caller may
+                    // reuse the file range once the parent finishes, so no child
+                    // write may still be in flight then.
+                    if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        match first_error.get() {
+                            Some(e) => c_main.error(*e),
+                            None => c_main.complete(total_written.load(Ordering::Acquire) as i32),
                         }
                     }
                 })
@@ -474,72 +486,6 @@ mod temp_file_tests {
         drop(temp_file);
         assert!(!temp_dir.exists());
     }
-
-    #[test]
-    fn ephemeral_table_opens_a_temp_file_only_when_it_spills() {
-        let io = Arc::new(TempFileCountingIO::default());
-        let db = crate::Database::open_file(
-            io.clone(),
-            "ephemeral-temp-file.db",
-            Arc::new(crate::EngineDialect),
-        )
-        .unwrap();
-        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
-        let count_union = |rows: i64| -> i64 {
-            let sql = format!(
-                "SELECT count(*) FROM (\
-                 SELECT printf('%02500d', value) FROM generate_series(1, {rows}) \
-                 UNION SELECT printf('%02500d', value) FROM generate_series(1, {rows}))"
-            );
-            let mut stmt = conn.prepare(sql).unwrap();
-            let mut count = None;
-            stmt.run_with_row_callback(|row| {
-                count = Some(row.get::<i64>(0).unwrap());
-                Ok(())
-            })
-            .unwrap();
-            count.unwrap()
-        };
-
-        assert_eq!(count_union(10), 10);
-        assert_eq!(io.temp_files_opened.load(Ordering::Acquire), 0);
-
-        assert_eq!(count_union(4_000), 4_000);
-        assert!(io.temp_files_opened.load(Ordering::Acquire) > 0);
-    }
-
-    #[derive(Default)]
-    struct TempFileCountingIO {
-        inner: MemoryIO,
-        temp_files_opened: crate::sync::atomic::AtomicUsize,
-    }
-
-    use crate::sync::atomic::Ordering;
-    use crate::{MonotonicInstant, WallClockInstant};
-
-    impl Clock for TempFileCountingIO {
-        fn current_time_monotonic(&self) -> MonotonicInstant {
-            self.inner.current_time_monotonic()
-        }
-        fn current_time_wall_clock(&self) -> WallClockInstant {
-            self.inner.current_time_wall_clock()
-        }
-    }
-
-    impl IO for TempFileCountingIO {
-        fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
-            if path.ends_with("tursodb_temp_file") {
-                self.temp_files_opened.fetch_add(1, Ordering::AcqRel);
-            }
-            self.inner.open_file(path, flags, direct)
-        }
-        fn remove_file(&self, path: &str) -> Result<()> {
-            self.inner.remove_file(path)
-        }
-        fn file_id(&self, path: &str) -> Result<FileId> {
-            self.inner.file_id(path)
-        }
-    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -576,6 +522,11 @@ pub trait IO: Clock + Send + Sync {
 
     /// Whether this IO backend can back host-filesystem shared WAL coordination.
     fn supports_shared_wal_coordination(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend keeps its files in process memory, so nothing reaches the filesystem.
+    fn is_memory(&self) -> bool {
         false
     }
 

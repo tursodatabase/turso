@@ -1,6 +1,9 @@
 use crate::common::{do_flush, rusqlite_integrity_check, ExecRows, TempDatabase};
 use asserting::expectations::{any, StringContains};
 use asserting::prelude::*;
+use std::sync::Arc;
+use turso_core::{ConnectOpts, Database, MemoryIO, SessionRole};
+use turso_sqlite::SqliteDialect;
 
 #[turso_macros::test(mvcc)]
 fn test_create_trigger(db: TempDatabase) {
@@ -2259,5 +2262,36 @@ fn test_update_skips_stable_write_set_when_triggers_disabled(db: TempDatabase) {
         !uses_stable_write_set,
         "with triggers disabled no trigger will fire, so the UPDATE must not \
          materialize a stable write set for one; EXPLAIN rows: {rows:#?}"
+    );
+}
+
+#[test]
+fn test_trigger_compile_error_does_not_poison_future_insert_compilation() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.execute("CREATE TABLE ref(x);").unwrap();
+    conn.execute("CREATE TABLE t(a INTEGER);").unwrap();
+    conn.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT * FROM ref; END;")
+        .unwrap();
+    conn.execute("DROP TABLE ref;").unwrap();
+
+    let err = conn
+        .execute("INSERT INTO t VALUES (1);")
+        .expect_err("single-row insert should fail while trigger references dropped table");
+    assert!(
+        err.to_string().contains("no such table: ref"),
+        "expected missing-table error, got: {err}"
+    );
+
+    let err = conn
+        .execute("INSERT INTO t VALUES (2), (3);")
+        .expect_err("multi-row insert should still fail instead of skipping the poisoned trigger");
+    assert!(
+        err.to_string().contains("no such table: ref"),
+        "expected missing-table error, got: {err}"
     );
 }

@@ -37,7 +37,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
     io_error, ConnectOpts, Connection, Database, EqpFormat, LimboError, Numeric, OpenFlags,
-    QueryMode, Statement, Value,
+    QueryMode, SessionRole, Statement, Value,
 };
 use turso_sqlite::SqliteDialect;
 
@@ -100,6 +100,14 @@ pub struct Opts {
         help = "Most databases held open at once under --sync-dir, one connection each; more may exist on disk"
     )]
     pub sync_max_databases: usize,
+    #[clap(
+        long,
+        requires = "sync_server",
+        default_value_t = default_sync_workers(),
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=MAX_SYNC_WORKERS),
+        help = "Threads handling sync server requests at once; requests to the same database still run one at a time"
+    )]
+    pub sync_workers: usize,
     #[clap(long, help = "Enable experimental encryption feature")]
     pub experimental_encryption: bool,
     #[clap(long, help = "Enable experimental index method feature")]
@@ -130,6 +138,16 @@ pub struct Opts {
         help = "Enable unsafe testing features (e.g. sqlite_dbpage writes)"
     )]
     pub unsafe_testing: bool,
+}
+
+const MAX_SYNC_WORKERS: u64 = 1024;
+
+fn default_sync_workers() -> usize {
+    const MAX_DEFAULT_WORKERS: usize = 16;
+    std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(1)
+        .clamp(1, MAX_DEFAULT_WORKERS)
 }
 
 const PROMPT: &str = "turso> ";
@@ -281,7 +299,7 @@ impl Limbo {
                 None,
                 Arc::new(SqliteDialect),
             )?;
-            let conn = db.connect(ConnectOpts::new())?;
+            let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
             (io, conn)
         };
         unsafe {
@@ -461,6 +479,10 @@ impl Limbo {
         self.opts.sync_server_address.is_some()
     }
 
+    pub fn get_io(&self) -> Arc<dyn turso_core::IO> {
+        self.io.clone()
+    }
+
     pub fn get_interrupt_count(&self) -> Arc<AtomicUsize> {
         self.interrupt_count.clone()
     }
@@ -501,7 +523,7 @@ impl Limbo {
             )
         };
         self.io = io;
-        self.conn = db.connect(ConnectOpts::new())?;
+        self.conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         self.opts.db_file = path.to_string();
         Ok(())
     }
@@ -2057,7 +2079,7 @@ impl Limbo {
         }
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
         let db = Database::open_file(io.clone(), output_file, Arc::new(SqliteDialect))?;
-        let target = db.connect(ConnectOpts::new())?;
+        let target = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
         let mut applier = ApplyWriter::new(&target);
         Self::dump_database_from_conn(false, self.conn.clone(), &mut applier, StderrProgress)?;
@@ -2405,6 +2427,23 @@ fn normalize_db_path(db_file: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use turso_core::SessionRole;
+
+    #[test]
+    fn sync_workers_above_the_maximum_are_rejected_at_parse_time() {
+        let parse = |workers: &str| {
+            Opts::try_parse_from([
+                "tursodb",
+                "--sync-server",
+                "127.0.0.1:0",
+                "--sync-workers",
+                workers,
+            ])
+        };
+        assert_eq!(parse("1024").unwrap().sync_workers, 1024);
+        assert!(parse("1025").is_err());
+        assert!(parse("18446744073709551615").is_err());
+    }
 
     #[test]
     fn test_normalize_db_path_adds_file_prefix_for_query_params() {
@@ -2477,7 +2516,7 @@ mod tests {
     fn test_dump_and_reload_infinite_real() -> anyhow::Result<()> {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x REAL);")?;
         conn.execute("INSERT INTO t VALUES(1, 1e400), (2, -1e400), (3, 1.5), (4, NULL);")?;
 
@@ -2500,7 +2539,7 @@ mod tests {
 
         let io2: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
         let db2 = Database::open_file(io2, ":memory:", Arc::new(SqliteDialect))?;
-        let conn2 = db2.connect(ConnectOpts::new())?;
+        let conn2 = db2.connect(ConnectOpts::new(SessionRole::Superuser))?;
         for stmt in dump_sql.split(';') {
             let stmt = stmt.trim();
             if stmt.is_empty() {

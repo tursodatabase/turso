@@ -2,7 +2,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use turso_core::ConnectOpts;
+use turso_core::{ConnectOpts, SessionRole};
 use turso_pg_client::{error_message, BackendEvent, ConnParams, PgConn};
 use turso_pg_server::TursoPgServer;
 
@@ -90,7 +90,7 @@ impl TestServer {
             "127.0.0.1:0".to_string(),
             db_file,
             db,
-            ConnectOpts::new(),
+            ConnectOpts::new(SessionRole::Superuser),
             Arc::new(AtomicUsize::new(0)),
         );
         let runtime = tokio::runtime::Runtime::new().unwrap();

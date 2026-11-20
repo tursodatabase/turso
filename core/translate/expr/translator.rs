@@ -371,8 +371,6 @@ fn translate_subquery_result_expr(
             let label_null_result = program.allocate_label();
             // jump here when we need to make extra null-related checks
             let label_null_rewind = program.allocate_label();
-            let label_null_checks_loop_start = program.allocate_label();
-            let label_null_checks_next = program.allocate_label();
             program.emit_insn(Insn::Integer {
                 value: 0,
                 dest: target_register,
@@ -483,48 +481,76 @@ fn translate_subquery_result_expr(
                 });
             }
 
-            // Null checking loop: scan ephemeral for any all-NULL tuples.
-            // If found, result is NULL (unknown). If not found, result depends on IN vs NOT IN.
-            program.preassign_label_to_next_insn(label_null_rewind);
-            program.emit_insn(Insn::Rewind {
-                cursor_id: *cursor_id,
-                pc_if_empty: label_on_no_null,
-            });
-            program.preassign_label_to_next_insn(label_null_checks_loop_start);
-            let column_check_reg = program.alloc_register();
-            for (i, affinity) in affinity_str.chars().map(Affinity::from_char).enumerate() {
+            if lhs_column_count == 1 {
+                program.preassign_label_to_next_insn(label_null_rewind);
+                program.emit_insn(Insn::Rewind {
+                    cursor_id: *cursor_id,
+                    pc_if_empty: label_on_no_null,
+                });
+                program.emit_insn(Insn::IsNull {
+                    reg: lhs_column_regs_start,
+                    target_pc: label_null_result,
+                });
+                let first_value_reg = program.alloc_register();
                 program.emit_insn(Insn::Column {
                     cursor_id: *cursor_id,
-                    column: i,
-                    dest: column_check_reg,
+                    column: 0,
+                    dest: first_value_reg,
                     default: None,
                 });
-                // Ne with NULL operand does NOT jump (comparison is NULL/unknown).
-                // Like SQLite, this compares with the collation of the left side alone.
-                program.emit_insn(Insn::Ne {
-                    lhs: lhs_column_regs_start + i,
-                    rhs: column_check_reg,
-                    target_pc: label_null_checks_next,
-                    flags: CmpInsFlags::default().with_affinity(affinity),
-                    collation: ExprContext::new(referenced_tables, resolver)
-                        .expr_collation(lhs_columns[i])?,
+                program.emit_insn(Insn::IsNull {
+                    reg: first_value_reg,
+                    target_pc: label_null_result,
+                });
+                program.emit_insn(Insn::Goto {
+                    target_pc: label_on_no_null,
+                });
+            } else {
+                // Null checking loop: scan ephemeral for any all-NULL tuples.
+                // If found, result is NULL (unknown). If not found, result depends on IN vs NOT IN.
+                let label_null_checks_loop_start = program.allocate_label();
+                let label_null_checks_next = program.allocate_label();
+                program.preassign_label_to_next_insn(label_null_rewind);
+                program.emit_insn(Insn::Rewind {
+                    cursor_id: *cursor_id,
+                    pc_if_empty: label_on_no_null,
+                });
+                program.preassign_label_to_next_insn(label_null_checks_loop_start);
+                let column_check_reg = program.alloc_register();
+                for (i, affinity) in affinity_str.chars().map(Affinity::from_char).enumerate() {
+                    program.emit_insn(Insn::Column {
+                        cursor_id: *cursor_id,
+                        column: i,
+                        dest: column_check_reg,
+                        default: None,
+                    });
+                    // Ne with NULL operand does NOT jump (comparison is NULL/unknown).
+                    // Like SQLite, this compares with the collation of the left side alone.
+                    program.emit_insn(Insn::Ne {
+                        lhs: lhs_column_regs_start + i,
+                        rhs: column_check_reg,
+                        target_pc: label_null_checks_next,
+                        flags: CmpInsFlags::default().with_affinity(affinity),
+                        collation: ExprContext::new(referenced_tables, resolver)
+                            .expr_collation(lhs_columns[i])?,
+                    });
+                }
+                // All Ne comparisons fell through -> this row has all NULLs -> result is NULL
+                program.emit_insn(Insn::Goto {
+                    target_pc: label_null_result,
+                });
+                program.preassign_label_to_next_insn(label_null_checks_next);
+                program.emit_insn(Insn::Next {
+                    cursor_id: *cursor_id,
+                    pc_if_next: label_null_checks_loop_start,
+                    fullscan: false,
+                    is_index: false,
+                });
+                // Loop exhausted without finding all-NULL row
+                program.emit_insn(Insn::Goto {
+                    target_pc: label_on_no_null,
                 });
             }
-            // All Ne comparisons fell through -> this row has all NULLs -> result is NULL
-            program.emit_insn(Insn::Goto {
-                target_pc: label_null_result,
-            });
-            program.preassign_label_to_next_insn(label_null_checks_next);
-            program.emit_insn(Insn::Next {
-                cursor_id: *cursor_id,
-                pc_if_next: label_null_checks_loop_start,
-                fullscan: false,
-                is_index: false,
-            });
-            // Loop exhausted without finding all-NULL row
-            program.emit_insn(Insn::Goto {
-                target_pc: label_on_no_null,
-            });
             // Final result handling:
             // label_include_row: result = 1 (TRUE)
             // label_skip_row: result = 0 (FALSE)
@@ -1100,13 +1126,33 @@ fn translate_function_call_expr(
             crate::bail_parse_error!("misuse of window function {}()", name.as_str())
         }
         Func::External(_) | Func::Dialect(_) => {
-            let regs = program.alloc_registers(args_count);
+            let argument_types: Vec<String> = match &func_ctx.func {
+                Func::External(external) if external.func.receives_argument_types() => {
+                    let env = TypeEnv::new(referenced_tables, resolver);
+                    args.iter()
+                        .map(|arg| name_without_domains(type_of(arg, &env), resolver.schema()))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            let total_count = args_count + argument_types.len();
+            let regs = program.alloc_registers(total_count);
             for (i, arg_expr) in args.iter().enumerate() {
                 translate_expr(program, referenced_tables, arg_expr, regs + i, resolver)?;
             }
+            for (i, type_name) in argument_types.into_iter().enumerate() {
+                program.emit_insn(Insn::String8 {
+                    value: type_name,
+                    dest: regs + args_count + i,
+                });
+            }
 
             // Use shared function call helper
-            let arg_registers: Vec<usize> = (regs..regs + args_count).collect();
+            let arg_registers: Vec<usize> = (regs..regs + total_count).collect();
+            let func_ctx = FuncCtx {
+                arg_count: total_count,
+                ..func_ctx
+            };
             emit_function_call(program, func_ctx, &arg_registers, target_register)?;
 
             Ok(target_register)
@@ -2121,6 +2167,7 @@ fn translate_function_call_expr(
                 | ScalarFunc::BooleanToInt
                 | ScalarFunc::IntToBoolean
                 | ScalarFunc::ValidateIpAddr
+                | ScalarFunc::TemporalEncode
                 | ScalarFunc::NumericEncode
                 | ScalarFunc::NumericFit
                 | ScalarFunc::NumericDecode

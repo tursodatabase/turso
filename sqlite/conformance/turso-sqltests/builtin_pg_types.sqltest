@@ -669,7 +669,7 @@ test date-compare-with-text-that-is-not-a-date-scan {
     SELECT count(*) FROM a WHERE d = 'zzz';
 }
 expect error {
-    invalid date value
+    invalid input syntax for type date
 }
 
 @requires strict "uses STRICT tables"
@@ -680,7 +680,7 @@ test date-compare-with-text-that-is-not-a-date-index {
     SELECT count(*) FROM b WHERE d IN ('zzz', '2026-10-08');
 }
 expect error {
-    invalid date value
+    invalid input syntax for type date
 }
 
 @requires strict "uses STRICT tables"

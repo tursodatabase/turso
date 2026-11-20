@@ -12,7 +12,9 @@ use std::{
         Arc,
     },
 };
-use turso_core::{ConnectOpts, Connection, ConnectionHooks, LimboError, SavepointMemo, StepResult};
+use turso_core::{
+    ConnectOpts, Connection, ConnectionHooks, LimboError, SavepointMemo, SessionRole, StepResult,
+};
 use turso_ext::{
     AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarDerive,
     ScalarFunc, ScalarFunction, StepFunction, Value as ExtValue, ValueDestructor,
@@ -26,12 +28,16 @@ static CTX_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 fn connection_context_is_typed_and_isolated(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let db = tmp_db.limbo_database();
     let context = Arc::new(std::sync::Mutex::new(7i64));
-    let first = db.connect_with_context(ConnectOpts::new(), context.clone())?;
+    let first =
+        db.connect_with_context(ConnectOpts::new(SessionRole::Superuser), context.clone())?;
     let first_clone = first.clone();
-    let second =
-        db.connect_with_context(ConnectOpts::new(), Arc::new(std::sync::Mutex::new(19i64)))?;
-    let shared = db.connect_with_context(ConnectOpts::new(), context.clone())?;
-    let plain = db.connect(ConnectOpts::new())?;
+    let second = db.connect_with_context(
+        ConnectOpts::new(SessionRole::Superuser),
+        Arc::new(std::sync::Mutex::new(19i64)),
+    )?;
+    let shared =
+        db.connect_with_context(ConnectOpts::new(SessionRole::Superuser), context.clone())?;
+    let plain = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
     assert!(std::ptr::eq(
         context.as_ref(),
@@ -68,7 +74,7 @@ fn connection_hooks_see_statement_ends_rollbacks_and_savepoints(
     let hooks = Arc::new(RecordingHooks::default());
     let conn = tmp_db
         .limbo_database()
-        .connect_with_hooks(ConnectOpts::new(), hooks.clone())?;
+        .connect_with_hooks(ConnectOpts::new(SessionRole::Superuser), hooks.clone())?;
     assert!(std::ptr::eq(
         hooks.as_ref(),
         conn.context::<RecordingHooks>().unwrap()
@@ -143,7 +149,7 @@ fn connection_made_with_settings_and_a_context_has_that_context(
 ) -> anyhow::Result<()> {
     let db = tmp_db.limbo_database();
     let context = Arc::new(std::sync::Mutex::new(7i64));
-    let opts = ConnectOpts::new().with_encryption_key(None);
+    let opts = ConnectOpts::new(SessionRole::Superuser).with_encryption_key(None);
 
     let conn = db.connect_with_context(opts.clone(), context.clone())?;
 
@@ -167,7 +173,7 @@ fn connection_context_lives_until_the_last_connection_owner_drops(
     let weak = Arc::downgrade(&context);
     let conn = tmp_db
         .limbo_database()
-        .connect_with_context(ConnectOpts::new(), context.clone())?;
+        .connect_with_context(ConnectOpts::new(SessionRole::Superuser), context.clone())?;
     let cloned_conn = conn.clone();
     let mut statement = conn.prepare("SELECT 7")?;
 

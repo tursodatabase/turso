@@ -49,6 +49,18 @@ expect {
 }
 
 @cross-check-integrity
+test alter-table-rename-keeps-autoindex-of-table-with-same-prefix {
+    CREATE TABLE activity (id INTEGER PRIMARY KEY, kind TEXT UNIQUE);
+    CREATE TABLE activity_word (kind TEXT NOT NULL, code TEXT NOT NULL, PRIMARY KEY (kind, code));
+    ALTER TABLE activity RENAME TO activity_old;
+    SELECT name, tbl_name FROM sqlite_schema WHERE type = 'index' ORDER BY name;
+}
+expect {
+    sqlite_autoindex_activity_old_1|activity_old
+    sqlite_autoindex_activity_word_1|activity_word
+}
+
+@cross-check-integrity
 test alter-table-rename-column {
     CREATE TABLE t (a INTEGER);
     CREATE INDEX i ON t (a);

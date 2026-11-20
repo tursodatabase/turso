@@ -4,6 +4,7 @@ mod copy;
 mod dialect;
 mod domain;
 mod functions;
+mod gaps;
 mod namespace;
 mod parse_edge_cases;
 mod role;

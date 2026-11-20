@@ -20,6 +20,7 @@ use crate::protocol::{
     self, WorkerCommand, WorkerCoordinationOpenMode, WorkerResponse, WorkerSharedWalSnapshot,
     WorkerStartupTelemetry,
 };
+use turso_core::SessionRole;
 
 fn worker_trace_enabled() -> bool {
     std::env::var_os("WHOPPER_TRACE_WORKER").is_some()
@@ -72,7 +73,7 @@ pub fn run_worker(
     }
 
     let connections = (0..connections_per_process)
-        .map(|_| db.connect(ConnectOpts::new()))
+        .map(|_| db.connect(ConnectOpts::new(SessionRole::Superuser)))
         .collect::<turso_core::Result<Vec<_>>>()?;
 
     if enable_mvcc {

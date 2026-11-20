@@ -234,10 +234,11 @@ impl<'a> CatalogContext<'a> {
                 .as_ref()
                 .map(|temp_db| temp_db.db.schema.lock().clone())
                 .unwrap_or_else(|| {
-                    // with_options only fails if built-in type SQL is malformed (programmer bug).
-                    let mut schema =
-                        Schema::with_options(self.enable_custom_types, self.dialect.as_ref())
-                            .expect("built-in type definitions are malformed");
+                    // new_schema only fails if built-in type SQL is malformed (programmer bug).
+                    let mut schema = self
+                        .dialect
+                        .new_schema(self.enable_custom_types)
+                        .expect("built-in type definitions are malformed");
                     schema.copy_table_valued_functions(self.schema);
                     Arc::new(schema)
                 }),

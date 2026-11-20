@@ -16,7 +16,7 @@ use codspeed_criterion_compat::{
 };
 
 use std::sync::Arc;
-use turso_core::io::MemoryIO;
+use turso_core::{io::MemoryIO, SessionRole};
 use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, StepResult};
 
 #[cfg(not(target_family = "wasm"))]
@@ -38,7 +38,9 @@ fn setup_db() -> (Arc<Database>, Arc<turso_core::Connection>) {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     (db, conn)
 }
 

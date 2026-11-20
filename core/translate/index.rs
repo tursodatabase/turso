@@ -1,9 +1,9 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
-use crate::dialect::RelationChange;
+use crate::dialect::{CatalogCmd, CmdContext, CreateIndex, DropIndex};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
-use crate::namespace::{is_reserved_object_name, NamespaceId, NamespaceRef};
+use crate::namespace::{is_reserved_object_name, NamespaceRef};
 use crate::numeric::Numeric;
 use crate::schema::{
     Column, GeneratedType, Schema, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES,
@@ -12,10 +12,7 @@ use crate::sync::Arc;
 use crate::translate::{
     catalog::CatalogContext,
     collate::{key_collation, CollationSeq, TextCollation},
-    emitter::{
-        emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
-        OperationMode, Resolver,
-    },
+    emitter::Resolver,
     expr::expr_type::{column_type, type_of, type_ordering, ExprType, TypeEnv},
     expr::{
         bind_and_rewrite_expr, emit_stored_column, emit_table_column, translate_condition_expr,
@@ -26,18 +23,17 @@ use crate::translate::{
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
 };
 use crate::type_ordering::TypeOrdering;
+use crate::util::escape_sql_string_literal;
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
-use crate::vdbe::insn::{to_u32, ClearBtreeCount, CmpInsFlags, Cookie};
-use crate::{
-    bail_parse_error, CaptureDataChangesExt, LimboError, SymbolTable, MAIN_DB_ID, TEMP_DB_ID,
-};
+use crate::vdbe::insn::{to_u32, ClearBtreeCount, Cookie};
+use crate::{bail_parse_error, LimboError, SymbolTable, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
     schema::{
         is_deterministic_schema_function_call, BTreeTable, Index, IndexColumn, PseudoCursorType,
         SchemaObjectType,
     },
     storage::pager::CreateBTreeFlags,
-    util::{escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
+    util::{normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral, SorterOpenData},
@@ -46,9 +42,9 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
-use super::schema::{self, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
+use super::schema;
 
-fn canonical_create_index_sql(
+pub(super) fn canonical_create_index_sql(
     stmt: &ast::Stmt,
     idx_name_in_sql: ast::Name,
     tbl_name_in_sql: ast::Name,
@@ -142,11 +138,6 @@ pub fn translate_create_index(
         None => resolver.resolve_existing_table_named(original_tbl_name.as_str())?,
     };
     let database_id = namespace.database_id;
-    let sql = canonical_create_index_sql(
-        &written_stmt,
-        resolver.name_in_sql(namespace, &original_idx_name.name),
-        resolver.name_in_sql(namespace, &original_tbl_name),
-    );
     let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(original_tbl_name.as_str());
 
@@ -281,12 +272,15 @@ pub fn translate_create_index(
         }
         if let Some(index_module) = index_module {
             let parameters = resolve_index_method_parameters(with_clause)?;
-            index_method = Some(index_module.attach(&IndexMethodConfiguration {
-                table_name: tbl.name.clone(),
-                index_name: idx_name.clone(),
-                columns: columns.try_clone()?,
-                parameters,
-            })?);
+            index_method = Some(index_module.attach(
+                connection.dialect().as_ref(),
+                &IndexMethodConfiguration {
+                    table_name: tbl.name.clone(),
+                    index_name: idx_name.clone(),
+                    columns: columns.try_clone()?,
+                    parameters,
+                },
+            )?);
         }
     }
     let idx = Arc::new(Index {
@@ -315,12 +309,8 @@ pub fn translate_create_index(
         );
     }
 
-    let sqlite_table = resolver
-        .schema()
-        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-        .unwrap();
-    let sqlite_schema_cursor_id =
-        program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
+    let cmd_context = CmdContext::new(connection, resolver, database_id);
+    cmd_context.alloc_sqlite_schema_cursor(program);
 
     // Create a new B-Tree and store the root page index in a register
     let root_page_reg = program.alloc_register();
@@ -340,43 +330,19 @@ pub fn translate_create_index(
         });
     }
 
-    // open the sqlite schema table for writing and create a new entry for the index
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
-        db: database_id,
-    });
-    let cdc_table = prepare_cdc_if_necessary(
+    resolver.catalog.dialect.catalog().emit(
         program,
-        resolver.schema(),
-        database_id,
-        Some(SQLITE_TABLEID),
+        &cmd_context,
+        &CatalogCmd::CreateIndex(CreateIndex {
+            namespace: namespace.id,
+            name: &idx_name,
+            written_name: &original_idx_name.name,
+            table: &tbl_name,
+            written_table: &original_tbl_name,
+            statement: &written_stmt,
+            root_reg: root_page_reg,
+        }),
     )?;
-    emit_schema_entry(
-        program,
-        resolver,
-        sqlite_schema_cursor_id,
-        cdc_table.map(|x| x.0),
-        SchemaEntryType::Index,
-        &resolver.mangle_name(namespace, &idx_name),
-        &resolver.mangle_name(namespace, &tbl_name),
-        root_page_reg,
-        Some(sql),
-    )?;
-
-    if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[RelationChange::Create {
-                namespace: namespace.id,
-                name: idx_name.clone(),
-                kind: crate::schema::RelationKind::Index,
-                table: Some(tbl_name),
-            }],
-        )?;
-    }
 
     emit_refill_index(
         program,
@@ -404,10 +370,7 @@ pub fn translate_create_index(
         where_clause: Some(parse_schema_where_clause),
         trigger_target_database_id: None,
     });
-    // Close the final sqlite_schema cursor
-    program.emit_insn(Insn::Close {
-        cursor_id: sqlite_schema_cursor_id,
-    });
+    cmd_context.close_sqlite_schema_cursor(program);
 
     Ok(())
 }
@@ -489,6 +452,7 @@ pub(crate) fn emit_refill_index(
             namespace,
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         }],
         vec![],
     );
@@ -1538,142 +1502,15 @@ pub fn translate_drop_index(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(
+    let cmd_context = CmdContext::new(connection, resolver, database_id);
+    resolver.catalog.dialect.catalog().emit(
         program,
-        resolver.schema(),
-        database_id,
-        Some(SQLITE_TABLEID),
+        &cmd_context,
+        &CatalogCmd::DropIndex(DropIndex {
+            namespace: namespace.id,
+            name: &idx_name,
+        }),
     )?;
-
-    if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[RelationChange::Drop {
-                namespace: namespace.id,
-                name: idx_name.clone(),
-            }],
-        )?;
-    }
-
-    // According to sqlite should emit Null instruction
-    // but why?
-    let null_reg = program.alloc_register();
-    program.emit_null(null_reg, None);
-
-    // String8; r[3] = 'some idx name'
-    let index_name_reg = program.emit_string8_new_reg(resolver.mangle_name(namespace, &idx_name));
-    // String8; r[4] = 'index'
-    let index_str_reg = program.emit_string8_new_reg("index".to_string());
-
-    // for r[5]=rowid
-    let row_id_reg = program.alloc_register();
-
-    // We're going to use this cursor to search through sqlite_schema
-    let sqlite_table = resolver
-        .schema()
-        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-        .unwrap();
-    let sqlite_schema_cursor_id =
-        program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
-
-    // Open sqlite_schema for writing
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
-        db: database_id,
-    });
-
-    let loop_start_label = program.allocate_label();
-    let loop_end_label = program.allocate_label();
-    program.emit_insn(Insn::Rewind {
-        cursor_id: sqlite_schema_cursor_id,
-        pc_if_empty: loop_end_label,
-    });
-    program.preassign_label_to_next_insn(loop_start_label);
-
-    // Read sqlite_schema.name into dest_reg
-    let dest_reg = program.alloc_register();
-    program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, dest_reg);
-
-    // if current column is not index_name then jump to Next
-    // skip if sqlite_schema.name != index_name_reg
-    let next_label = program.allocate_label();
-    program.emit_insn(Insn::Ne {
-        lhs: index_name_reg,
-        rhs: dest_reg,
-        target_pc: next_label,
-        flags: CmpInsFlags::default(),
-        collation: CollationSeq::NOCASE,
-    });
-
-    // read type of table
-    // skip if sqlite_schema.type != 'index' (index_str_reg)
-    program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, dest_reg);
-    // if current column is not index then jump to Next
-    program.emit_insn(Insn::Ne {
-        lhs: index_str_reg,
-        rhs: dest_reg,
-        target_pc: next_label,
-        flags: CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
-    });
-
-    program.emit_insn(Insn::RowId {
-        cursor_id: sqlite_schema_cursor_id,
-        dest: row_id_reg,
-    });
-
-    let label_once_end = program.allocate_label();
-    program.emit_insn(Insn::Once {
-        target_pc_when_reentered: label_once_end,
-    });
-    program.preassign_label_to_next_insn(label_once_end);
-
-    if let Some((cdc_cursor_id, _)) = cdc_table {
-        let before_record_reg = if program.capture_data_changes_info().has_before() {
-            Some(emit_cdc_full_record(
-                program,
-                resolver,
-                sqlite_table.columns(),
-                sqlite_schema_cursor_id,
-                row_id_reg,
-            )?)
-        } else {
-            None
-        };
-        emit_cdc_insns(
-            program,
-            resolver,
-            OperationMode::DELETE,
-            cdc_cursor_id,
-            row_id_reg,
-            before_record_reg,
-            None,
-            None,
-            SQLITE_TABLEID,
-        )?;
-    }
-
-    program.emit_insn(Insn::Delete {
-        cursor_id: sqlite_schema_cursor_id,
-        table_name: "sqlite_schema".to_string(),
-        is_part_of_update: false,
-    });
-
-    program.preassign_label_to_next_insn(next_label);
-    program.emit_insn(Insn::Next {
-        cursor_id: sqlite_schema_cursor_id,
-        pc_if_next: loop_start_label,
-        fullscan: false,
-        is_index: false,
-    });
-
-    program.preassign_label_to_next_insn(loop_end_label);
-    if let Some((cdc_cursor_id, _)) = cdc_table {
-        emit_cdc_autocommit_commit(program, resolver, Some(cdc_cursor_id))?;
-    }
 
     let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
@@ -1795,34 +1632,32 @@ pub fn translate_optimize(
 #[cfg(test)]
 mod tests {
     use super::canonical_create_index_sql;
-    use turso_parser::{ast, parser::Parser};
+    use turso_parser::ast;
 
     #[test]
     fn canonical_create_index_sql_drops_schema_qualifier_from_index_name_only() {
-        let mut parser = Parser::new(b"CREATE INDEX aux.idx1 ON t1(name);");
-        let stmt = match parser.next_cmd().unwrap().unwrap() {
-            ast::Cmd::Stmt(stmt) => stmt,
-            other => panic!("expected statement, got {other:?}"),
+        let name = |name: &str| ast::Name::exact(name.to_string());
+        // CREATE INDEX aux.idx1 ON t1(name)
+        let stmt = ast::Stmt::CreateIndex {
+            unique: false,
+            if_not_exists: false,
+            idx_name: ast::QualifiedName {
+                namespace: Some(name("aux")),
+                name: name("idx1"),
+                alias: None,
+            },
+            tbl_name: name("t1"),
+            using: None,
+            columns: vec![ast::SortedColumn {
+                expr: Box::new(ast::Expr::Id(name("name"))),
+                order: None,
+                nulls: None,
+            }],
+            with_clause: vec![],
+            where_clause: None,
         };
 
-        // let's confirm that the stmt does carry `aux`
-        let ast::Stmt::CreateIndex { idx_name, .. } = &stmt else {
-            panic!("expected CREATE INDEX statement");
-        };
-        assert_eq!(
-            idx_name
-                .namespace
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref(),
-            Some("aux")
-        );
-
-        let ast::Stmt::CreateIndex { tbl_name, .. } = &stmt else {
-            panic!("expected CREATE INDEX statement");
-        };
-        let canonical_sql =
-            canonical_create_index_sql(&stmt, idx_name.name.clone(), tbl_name.clone());
+        let canonical_sql = canonical_create_index_sql(&stmt, name("idx1"), name("t1"));
         assert_eq!(canonical_sql, "CREATE INDEX idx1 ON t1 (name)");
         let stored_sql = canonical_create_index_sql(
             &stmt,

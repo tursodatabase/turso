@@ -7,10 +7,10 @@ use crate::ast::{
     JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, LikeOperator, Limit, Literal,
     Materialized, Name, NamedColumnConstraint, NamedTableConstraint, NullsOrder, OneSelect,
     Operator, Over, PragmaBody, PragmaValue, QualifiedName, RefAct, RefArg, ResolveType,
-    ResultColumn, Select, SelectBody, SelectTable, Set, SortOrder, SortedColumn, Stmt,
-    TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent, TriggerTime, Type,
-    TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert, UpsertDo,
-    UpsertIndex, Variable, Window, WindowDef, With, MAX_ARRAY_DIMENSIONS,
+    ResultColumn, Select, SelectBody, SelectDistinctness, SelectTable, Set, SortOrder,
+    SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent,
+    TriggerTime, Type, TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert,
+    UpsertDo, UpsertIndex, Variable, Window, WindowDef, With, MAX_ARRAY_DIMENSIONS,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
@@ -1283,13 +1283,15 @@ impl<'a> Parser<'a> {
             return Ok(None);
         };
         let start = self.offset();
-        let first_word = match token_type.fallback_id_if_ok() {
+        let is_struct_or_union =
+            |word: &str| word.eq_ignore_ascii_case("STRUCT") || word.eq_ignore_ascii_case("UNION");
+        let first_word_is_struct_or_union = match token_type.fallback_id_if_ok() {
             TK_ID | TK_STRING => {
                 let tok = eat_assert!(self, TK_ID, TK_STRING);
-                from_bytes(tok.as_bytes())
+                is_struct_or_union(from_bytes_as_str(tok.as_bytes()))
             }
             TK_LBRACKET if !self.peeked_empty_brackets() => {
-                self.parse_bracket_quoted_name()?.as_str().to_owned()
+                is_struct_or_union(self.parse_bracket_quoted_name()?.as_str())
             }
             _ => return Ok(None),
         };
@@ -1298,9 +1300,7 @@ impl<'a> Parser<'a> {
         // Inline STRUCT/UNION types (e.g. `col STRUCT(x INT)`) are only valid
         // inside CREATE TYPE field lists (tracked by type_nesting_depth > 0).
         // In column definitions and CAST expressions, reject them.
-        let is_struct = first_word.eq_ignore_ascii_case("STRUCT");
-        let is_union = first_word.eq_ignore_ascii_case("UNION");
-        if (is_struct || is_union) && self.peek()?.is_some_and(|t| t.token_type == TK_LP) {
+        if first_word_is_struct_or_union && self.peek()?.is_some_and(|t| t.token_type == TK_LP) {
             if self.type_nesting_depth == 0 {
                 return Err(Error::ParseError(
                     "inline STRUCT/UNION column types are not supported; \
@@ -3268,7 +3268,7 @@ impl<'a> Parser<'a> {
         let tok = eat_expect!(self, TK_SELECT, TK_VALUES);
         match tok.token_type {
             TK_SELECT => {
-                let distinct = self.parse_distinct()?;
+                let distinct = self.parse_select_distinct()?;
                 let collist = self.parse_select_columns()?;
                 let from = self.parse_from_clause_opt()?;
                 let where_clause = self.parse_where()?;
@@ -3309,6 +3309,23 @@ impl<'a> Parser<'a> {
                 Ok(OneSelect::Values(values))
             }
             _ => unreachable!(),
+        }
+    }
+
+    fn parse_select_distinct(&mut self) -> Result<Option<SelectDistinctness>> {
+        match self.parse_distinct()? {
+            None => Ok(None),
+            Some(Distinctness::All) => Ok(Some(SelectDistinctness::All)),
+            Some(Distinctness::Distinct) => {
+                if !matches!(self.peek()?, Some(tok) if tok.token_type == TK_ON) {
+                    return Ok(Some(SelectDistinctness::Distinct));
+                }
+                eat_assert!(self, TK_ON);
+                eat_expect!(self, TK_LP);
+                let exprs = self.parse_nexpr_list()?;
+                eat_expect!(self, TK_RP);
+                Ok(Some(SelectDistinctness::DistinctOn(exprs)))
+            }
         }
     }
 
@@ -3846,6 +3863,16 @@ impl<'a> Parser<'a> {
             }
             TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => {
                 Ok(Box::new(Expr::Name(self.parse_nm()?)))
+            }
+            // SQLite's pragma value grammar does not accept NULL
+            TK_NULL => {
+                let offset = self.offset();
+                let token = self.peek_no_eof()?;
+                Err(unexpected_token_error(
+                    token,
+                    offset,
+                    &[TK_ID, TK_STRING, TK_INTEGER, TK_FLOAT],
+                ))
             }
             tt if tt
                 .as_str()
@@ -4892,6 +4919,7 @@ impl<'a> Parser<'a> {
             indexed,
             where_clause,
             returning,
+            truncate: false,
         })
     }
 
@@ -5491,6 +5519,7 @@ impl<'a> Parser<'a> {
         };
 
         Ok(Stmt::Insert {
+            overriding_system_value: false,
             with,
             or_conflict: resolve_type,
             tbl_name,
@@ -5659,6 +5688,52 @@ mod tests {
         ] {
             let cmd = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();
             assert_eq!(cmd.to_string(), format!("{sql};"));
+        }
+    }
+
+    #[test]
+    fn test_distinct_on() {
+        for sql in [
+            "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC",
+            "SELECT DISTINCT ON (a, b + 1) * FROM t",
+            "SELECT DISTINCT ON (1) a FROM t UNION ALL SELECT DISTINCT ON (c COLLATE NOCASE) c FROM u",
+            "CREATE VIEW v AS SELECT DISTINCT ON (t.a) t.a, t.b FROM t ORDER BY t.a",
+        ] {
+            let cmd = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();
+            assert_eq!(cmd.to_string(), format!("{sql};"));
+        }
+    }
+
+    #[test]
+    fn test_distinct_on_keeps_its_expressions() {
+        let cmd = Parser::new(b"SELECT DISTINCT ON (a, b) c FROM t")
+            .next_cmd()
+            .unwrap()
+            .unwrap();
+        let Cmd::Stmt(Stmt::Select(select)) = cmd else {
+            panic!("expected a SELECT");
+        };
+        let OneSelect::Select { distinctness, .. } = select.body.select else {
+            panic!("expected a SELECT core");
+        };
+        let Some(SelectDistinctness::DistinctOn(exprs)) = distinctness else {
+            panic!("expected DISTINCT ON, got {distinctness:?}");
+        };
+        assert_eq!(exprs.len(), 2);
+    }
+
+    #[test]
+    fn test_distinct_on_needs_a_parenthesized_expression_list() {
+        for sql in [
+            "SELECT DISTINCT ON a a FROM t",
+            "SELECT DISTINCT ON () a FROM t",
+            "SELECT ALL ON (a) a FROM t",
+            "SELECT count(DISTINCT ON (a) a) FROM t",
+        ] {
+            assert!(
+                Parser::new(sql.as_bytes()).next_cmd().is_err(),
+                "parsed: {sql}"
+            );
         }
     }
 
@@ -12909,6 +12984,7 @@ mod tests {
                     indexed: None,
                     where_clause: None,
                     returning: vec![],
+                    truncate: false,
                 })],
             ),
             (
@@ -12956,6 +13032,7 @@ mod tests {
                             None,
                         ),
                     ],
+                    truncate: false,
                 })],
             ),
             // parse drop index
@@ -13054,6 +13131,7 @@ mod tests {
             (
                 b"INSERT INTO foo VALUES (1, 2)".as_slice(),
                 vec![Cmd::Stmt(Stmt::Insert {
+                    overriding_system_value: false,
                     with: None,
                     or_conflict: None,
                     tbl_name: QualifiedName {
@@ -13082,6 +13160,7 @@ mod tests {
             (
                 b"REPLACE INTO foo VALUES (1, 2)".as_slice(),
                 vec![Cmd::Stmt(Stmt::Insert {
+                    overriding_system_value: false,
                     with: None,
                     or_conflict: Some(ResolveType::Replace),
                     tbl_name: QualifiedName {
@@ -13110,6 +13189,7 @@ mod tests {
             (
                 b"WITH test AS (SELECT 1) INSERT INTO foo DEFAULT VALUES RETURNING bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Insert {
+                    overriding_system_value: false,
                     with: Some(With {
                         recursive: false,
                         ctes: vec![
@@ -13158,6 +13238,7 @@ mod tests {
             (
                 b"WITH test AS (SELECT 1) REPLACE INTO foo DEFAULT VALUES RETURNING bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Insert {
+                    overriding_system_value: false,
                     with: Some(With {
                         recursive: false,
                         ctes: vec![
@@ -13430,6 +13511,17 @@ mod tests {
             b"DELETE FROM t ORDER BY x LIMIT 1".as_slice(),
             b"UPDATE t SET x = 1 LIMIT 1".as_slice(),
             b"UPDATE t SET x = 1 ORDER BY x LIMIT 1".as_slice(),
+        ] {
+            let result = Parser::new(sql).next().unwrap();
+            assert!(result.is_err(), "expected parse error for {sql:?}");
+        }
+    }
+
+    #[test]
+    fn test_pragma_value_rejects_null() {
+        for sql in [
+            b"PRAGMA foreign_keys = NULL".as_slice(),
+            b"PRAGMA foreign_keys(NULL)".as_slice(),
         ] {
             let result = Parser::new(sql).next().unwrap();
             assert!(result.is_err(), "expected parse error for {sql:?}");

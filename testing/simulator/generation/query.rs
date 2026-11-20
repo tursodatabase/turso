@@ -113,6 +113,10 @@ fn random_pragma<R: rand::Rng + ?Sized>(
         return Query::Pragma(Pragma::ForeignKeyList(table.name.clone()));
     }
 
+    if rng.random_bool(0.5) {
+        return Query::Pragma(Pragma::AutomaticIndex(rng.random_bool(0.5)));
+    }
+
     const ALL_MODES: [VacuumMode; 2] = [
         VacuumMode::None,
         // VacuumMode::Incremental, not implemented yet

@@ -155,7 +155,7 @@ INSERT INTO tasks (id, title, status, priority) VALUES
 --          (3, 'Code review', 'in_progress', 0)
 ```
 
-The `DEFAULT` keyword is only valid inside INSERT VALUES lists. Using it in other contexts (SELECT, WHERE, UPDATE) produces an error.
+The `DEFAULT` keyword is valid inside INSERT VALUES lists and as the whole expression of an assignment in the `SET` clause of an [UPDATE](/docs/sql-reference/statements/update#default-keyword-in-set) or of `ON CONFLICT DO UPDATE`. Using it in other contexts (SELECT, WHERE) produces an error.
 
 ## Conflict Handling
 

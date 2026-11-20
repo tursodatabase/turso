@@ -17,6 +17,7 @@ use turso_core::{
 };
 
 pub use encoder::encode_value;
+use turso_core::SessionRole;
 
 #[derive(Debug, Clone, Default)]
 pub struct DbHashOptions {
@@ -28,9 +29,7 @@ pub struct DbHashOptions {
     pub without_schema: bool,
     /// If true, print each value to stderr as it's hashed.
     pub debug_trace: bool,
-    /// Cipher and key of an encrypted database. Hashing fails if this process already has
-    /// the database open and it was encrypted with `PRAGMA cipher`/`PRAGMA hexkey`: that
-    /// open `Database` has no cipher set, so a new connection cannot use the key.
+    /// Cipher and key of an encrypted database.
     pub encryption: Option<EncryptionOpts>,
 }
 
@@ -84,7 +83,8 @@ pub fn hash_database_with_database_opts(
         .as_ref()
         .map(|encryption| EncryptionKey::from_hex_string(&encryption.hexkey))
         .transpose()?;
-    let conn = db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?;
+    let conn =
+        db.connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(encryption_key))?;
 
     let mut hasher = Sha1::new();
     let mut tables_hashed = 0;

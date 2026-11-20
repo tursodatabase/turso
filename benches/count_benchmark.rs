@@ -22,7 +22,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
-use turso_core::{ConnectOpts, Database, PlatformIO, StepResult};
+use turso_core::{ConnectOpts, Database, PlatformIO, SessionRole, StepResult};
 use turso_sqlite::SqliteDialect;
 
 #[cfg(not(target_family = "wasm"))]
@@ -110,7 +110,9 @@ fn bench_count(criterion: &mut Criterion) {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         // Cache sized to hold the ~15MB covering index (the queries' whole working set) so the
         // measurement is CPU-bound, while staying small enough to avoid paging under memory
         // pressure -- both are needed for a stable result.

@@ -9,45 +9,19 @@
 //! - Empty field = empty string (not NULL)
 //! - Lines starting with `\.` = end of data
 
-mod pgwire_text;
-
 use crate::session::relation_lookup_namespaces;
-use turso_core::{ColumnTypeKind, LimboError, Numeric, Result, Row, Value};
+use crate::text::{value_text, TextType};
+use turso_core::{LimboError, Result, Row};
 use turso_pg_parser::{copy::CopyToStdout, quote_identifier};
 
 pub struct CopyTextEncoder {
-    columns: Vec<CopyTextType>,
-}
-
-enum CopyTextType {
-    Plain,
-    Boolean,
-    TimestampTz,
-    ByteaArray,
+    columns: Vec<TextType>,
 }
 
 impl CopyTextEncoder {
     pub fn new(stmt: &crate::Statement) -> Self {
         let columns = (0..stmt.num_columns())
-            .map(|index| {
-                let Some(info) = stmt.get_column_type_info(index).ok().flatten() else {
-                    return CopyTextType::Plain;
-                };
-                if matches!(info.kind, ColumnTypeKind::Struct | ColumnTypeKind::Union) {
-                    return CopyTextType::Plain;
-                }
-                std::iter::once(info.declared_name.as_str())
-                    .chain(info.base_type.as_deref())
-                    .find_map(|name| {
-                        match (name.to_ascii_uppercase().as_str(), info.array_dimensions) {
-                            ("BOOL" | "BOOLEAN", 0) => Some(CopyTextType::Boolean),
-                            ("TIMESTAMPTZ", 0) => Some(CopyTextType::TimestampTz),
-                            ("BLOB" | "BYTEA", 1..) => Some(CopyTextType::ByteaArray),
-                            _ => None,
-                        }
-                    })
-                    .unwrap_or(CopyTextType::Plain)
-            })
+            .map(|index| TextType::of_column(stmt, index))
             .collect();
         Self { columns }
     }
@@ -55,43 +29,13 @@ impl CopyTextEncoder {
     /// Append one COPY text record, including its trailing newline.
     pub fn encode_row(&self, row: &Row, output: &mut Vec<u8>) {
         assert_eq!(row.len(), self.columns.len());
-        let mut bytea = Vec::new();
-        for (index, (value, ty)) in row.get_values().zip(&self.columns).enumerate() {
+        for (index, (value, text_type)) in row.get_values().zip(&self.columns).enumerate() {
             if index > 0 {
                 output.push(b'\t');
             }
-            match value {
-                Value::Null => output.extend_from_slice(b"\\N"),
-                Value::Numeric(Numeric::Integer(value)) => {
-                    if matches!(ty, CopyTextType::Boolean) {
-                        pgwire_text::encode_bool(*value != 0, output);
-                    } else {
-                        pgwire_text::encode_integer(*value, output);
-                    }
-                }
-                Value::Numeric(Numeric::Float(value)) => {
-                    output.extend_from_slice(pgwire_text::format_f64(f64::from(*value)).as_bytes());
-                }
-                Value::Text(text) => {
-                    let text = text.value.as_ref();
-                    escape_copy_text(text.as_bytes(), output);
-                    if matches!(ty, CopyTextType::TimestampTz)
-                        && !text.contains('+')
-                        && !text.contains('Z')
-                        && !text.ends_with("-00")
-                    {
-                        output.extend_from_slice(b"+00");
-                    }
-                }
-                Value::Blob(bytes) => {
-                    bytea.clear();
-                    pgwire_text::encode_bytea(
-                        bytes,
-                        matches!(ty, CopyTextType::ByteaArray),
-                        &mut bytea,
-                    );
-                    escape_copy_text(&bytea, output);
-                }
+            match value_text(value, *text_type) {
+                None => output.extend_from_slice(b"\\N"),
+                Some(text) => escape_copy_text(text.as_bytes(), output),
             }
         }
         output.push(b'\n');

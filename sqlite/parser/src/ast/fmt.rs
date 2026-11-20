@@ -486,6 +486,9 @@ impl ToTokens for Stmt {
                 indexed,
                 where_clause,
                 returning,
+                // Written as the DELETE it runs as: this is SQLite's syntax,
+                // which has no TRUNCATE.
+                truncate: _,
             } => {
                 if let Some(with) = with {
                     with.to_tokens(s, context)?;
@@ -565,6 +568,7 @@ impl ToTokens for Stmt {
                 columns,
                 body,
                 returning,
+                ..
             } => {
                 if let Some(with) = with {
                     with.to_tokens(s, context)?;
@@ -688,10 +692,26 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
-            Self::CreateRole { role_name } => {
+            Self::CreateRole { role_name, options } => {
                 s.append(TK_CREATE, None)?;
                 s.append(TK_ID, Some("ROLE"))?;
-                s.append(TK_ID, Some(role_name))
+                s.append(TK_ID, Some(role_name))?;
+                if !options.inherit {
+                    s.append(TK_ID, Some("NOINHERIT"))?;
+                }
+                if options.bypassrls {
+                    s.append(TK_ID, Some("BYPASSRLS"))?;
+                }
+                Ok(())
+            }
+            Self::DropRole { if_exists, roles } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_ID, Some("ROLE"))?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                s.comma(roles, context)
             }
             Self::Grant(grant) => grant.to_tokens(s, context),
             Self::CreateType {
@@ -906,6 +926,22 @@ impl ToTokens for Stmt {
                 s.append(TK_ID, Some("SCHEMA"))?;
                 name.to_tokens(s, context)?;
                 Ok(())
+            }
+            Self::CreatePolicy(policy) => policy.to_tokens(s, context),
+            Self::DropPolicy {
+                if_exists,
+                policy_name,
+                tbl_name,
+            } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_ID, Some("POLICY"))?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                policy_name.to_tokens(s, context)?;
+                s.append(TK_ON, None)?;
+                tbl_name.to_tokens(s, context)
             }
             Self::DropDomain {
                 if_exists,
@@ -1436,6 +1472,27 @@ impl ToTokens for FromClause {
     }
 }
 
+impl_display_for_to_tokens!(SelectDistinctness);
+impl ToTokens for SelectDistinctness {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        match self {
+            Self::Distinct => s.append(TK_DISTINCT, None),
+            Self::All => s.append(TK_ALL, None),
+            Self::DistinctOn(exprs) => {
+                s.append(TK_DISTINCT, None)?;
+                s.append(TK_ON, None)?;
+                s.append(TK_LP, None)?;
+                comma(exprs, s, context)?;
+                s.append(TK_RP, None)
+            }
+        }
+    }
+}
+
 impl_display_for_to_tokens!(Distinctness);
 impl ToTokens for Distinctness {
     fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
@@ -1764,11 +1821,34 @@ impl ToTokens for Grant {
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        s.append(TK_ID, Some("GRANT"))?;
-        s.comma(&self.privileges, context)?;
-        s.append(TK_ON, None)?;
-        s.comma(&self.relations, context)?;
-        s.append(TK_TO, None)?;
+        s.append(TK_ID, Some(if self.revoke { "REVOKE" } else { "GRANT" }))?;
+        match &self.objects {
+            GrantObjects::Relations {
+                privileges,
+                on_sequences,
+                relations,
+            } => {
+                s.comma(privileges, context)?;
+                s.append(TK_ON, None)?;
+                if *on_sequences {
+                    s.append(TK_ID, Some("SEQUENCE"))?;
+                }
+                s.comma(relations, context)?;
+            }
+            GrantObjects::Roles(roles) => {
+                for (i, role) in roles.iter().enumerate() {
+                    if i > 0 {
+                        s.append(TK_COMMA, None)?;
+                    }
+                    s.append(TK_ID, Some(role))?;
+                }
+            }
+        }
+        if self.revoke {
+            s.append(TK_FROM, None)?;
+        } else {
+            s.append(TK_TO, None)?;
+        }
         s.comma(&self.grantees, context)
     }
 }
@@ -1782,6 +1862,15 @@ impl ToTokens for Privilege {
     ) -> Result<(), S::Error> {
         match self {
             Self::Select => s.append(TK_SELECT, None),
+            Self::Insert => s.append(TK_INSERT, None),
+            Self::Update => s.append(TK_UPDATE, None),
+            Self::Delete => s.append(TK_DELETE, None),
+            Self::Truncate => s.append(TK_ID, Some("TRUNCATE")),
+            Self::References => s.append(TK_REFERENCES, None),
+            Self::Trigger => s.append(TK_TRIGGER, None),
+            Self::Maintain => s.append(TK_ID, Some("MAINTAIN")),
+            Self::Usage => s.append(TK_ID, Some("USAGE")),
+            Self::All => s.append(TK_ALL, None),
         }
     }
 }
@@ -1797,6 +1886,54 @@ impl ToTokens for Grantee {
             Self::Public => s.append(TK_ID, Some("PUBLIC")),
             Self::Role(role) => role.to_tokens(s, context),
         }
+    }
+}
+
+impl_display_for_to_tokens!(CreatePolicy);
+impl ToTokens for CreatePolicy {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        s.append(TK_CREATE, None)?;
+        s.append(TK_ID, Some("POLICY"))?;
+        self.policy_name.to_tokens(s, context)?;
+        s.append(TK_ON, None)?;
+        self.tbl_name.to_tokens(s, context)?;
+        s.append(TK_AS, None)?;
+        s.append(
+            TK_ID,
+            Some(if self.permissive {
+                "PERMISSIVE"
+            } else {
+                "RESTRICTIVE"
+            }),
+        )?;
+        s.append(TK_FOR, None)?;
+        match self.command {
+            PolicyCommand::All => s.append(TK_ALL, None)?,
+            PolicyCommand::Select => s.append(TK_SELECT, None)?,
+            PolicyCommand::Insert => s.append(TK_INSERT, None)?,
+            PolicyCommand::Update => s.append(TK_UPDATE, None)?,
+            PolicyCommand::Delete => s.append(TK_DELETE, None)?,
+        }
+        s.append(TK_TO, None)?;
+        s.comma(&self.roles, context)?;
+        if let Some(expr) = &self.using_expr {
+            s.append(TK_USING, None)?;
+            s.append(TK_LP, None)?;
+            expr.to_tokens(s, context)?;
+            s.append(TK_RP, None)?;
+        }
+        if let Some(expr) = &self.check_expr {
+            s.append(TK_WITH, None)?;
+            s.append(TK_CHECK, None)?;
+            s.append(TK_LP, None)?;
+            expr.to_tokens(s, context)?;
+            s.append(TK_RP, None)?;
+        }
+        Ok(())
     }
 }
 
@@ -2012,6 +2149,7 @@ impl ToTokens for ColumnConstraint {
                 }
                 Ok(())
             }
+            Self::Identity(_) => Ok(()),
         }
     }
 }

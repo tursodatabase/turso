@@ -14,6 +14,7 @@ use super::{
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
 };
+use crate::security::permission::Object;
 use crate::translate::plan::BitSet;
 use crate::translate::{
     emitter::Resolver,
@@ -25,6 +26,7 @@ use crate::translate::{
     plan::{NonFromClauseSubquery, SubqueryState},
     subquery::outer_query_refs_for_correlated_subquery,
 };
+use crate::translate::{roles, row_security};
 use crate::{
     ast::Limit,
     function::Func,
@@ -38,7 +40,7 @@ use crate::{
 };
 use crate::{
     function::{AccumulatorFunc, AggFunc, WindowFunc},
-    translate::expr::bind_and_rewrite_expr,
+    translate::expr::{bind_and_rewrite_expr, bind_and_rewrite_expr_except},
 };
 use crate::{
     translate::plan::{Window, WindowFunction},
@@ -223,7 +225,7 @@ impl RecursiveRefCounter<'_> {
                 where_clause,
                 group_by,
                 window_clause,
-                ..
+                distinctness,
             } => {
                 let mut count = 0;
                 if let Some(from) = from {
@@ -253,6 +255,12 @@ impl RecursiveRefCounter<'_> {
                 }
                 for window_def in window_clause {
                     count += self.count_window(&window_def.window, scope);
+                }
+                for expr in distinctness
+                    .iter()
+                    .flat_map(|distinctness| distinctness.exprs())
+                {
+                    count += self.count_expr(expr, scope);
                 }
                 count
             }
@@ -448,6 +456,7 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
             where_clause,
             group_by,
             window_clause,
+            distinctness,
             ..
         } => {
             for column in columns {
@@ -467,6 +476,12 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
                 }
             }
             collect_subquery_table_refs_in_window_clause(window_clause, out);
+            for expr in distinctness
+                .iter()
+                .flat_map(|distinctness| distinctness.exprs())
+            {
+                collect_subquery_table_refs_in_expr(expr, out);
+            }
             if let ast::OneSelect::Select {
                 from: Some(from), ..
             } = one
@@ -1643,9 +1658,6 @@ fn parse_from_clause_table(
                 if already_visible {
                     continue;
                 }
-                let name_used_by_table_on_the_left = outer_query_refs_for_subquery
-                    .iter()
-                    .any(|reference| reference.identifier == cte_definition.name);
                 // This plan only makes the name visible. A later FROM lookup performs
                 // the real CTE use and validates its explicit column list.
                 let cte_table = plan_cte(
@@ -1669,7 +1681,7 @@ fn parse_from_clause_table(
                         .then(|| cte_definition.select.clone()),
                     cte_explicit_columns: cte_definition.explicit_columns.clone(),
                     cte_id: Some(cte_definition.cte_id),
-                    cte_definition_only: name_used_by_table_on_the_left,
+                    cte_definition_only: true,
                     rowid_referenced: false,
                     outer_join_may_null_extend: false,
                     scope_depth: 0,
@@ -2153,6 +2165,7 @@ fn parse_table(
                     namespace: NamespaceRef::root_of(crate::MAIN_DB_ID),
                     indexed: None,
                     plan_estimate: None,
+                    row_filter: None,
                 });
             }
             return Ok(());
@@ -2171,21 +2184,22 @@ fn parse_table(
         let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             if let VirtualTableType::Pragma(pragma) = &tbl.vtab_type {
-                crate::translate::roles::check_pragma_function(resolver, &pragma.pragma_name)?;
+                roles::check_pragma_function(resolver, &pragma.pragma_name)?;
             }
-            crate::translate::row_security::check_virtual_table(tbl, resolver)?;
+            row_security::check_virtual_table(tbl, resolver)?;
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
             Table::Virtual(tbl.clone())
         } else if let Table::BTree(table) = table.as_ref() {
             if !args.is_empty() {
                 crate::bail_parse_error!("'{}' is not a function", table_name.as_str());
             }
-            crate::translate::roles::check_read_privilege(
+            roles::check_privilege(
                 resolver,
                 connection,
                 namespace,
                 &table.name,
-                crate::security::permission::Object::Table(table.name.clone()),
+                ast::Privilege::Select,
+                Object::Table(table.name.clone()),
             )?;
             Table::BTree(table.clone())
         } else {
@@ -2207,6 +2221,7 @@ fn parse_table(
             namespace,
             indexed,
             plan_estimate: None,
+            row_filter: None,
         });
         return Ok(());
     };
@@ -2215,12 +2230,13 @@ fn parse_table(
         schema.get_view(namespace.id, table_name.as_str())
     });
     if let Some(view) = regular_view {
-        crate::translate::roles::check_read_privilege(
+        roles::check_privilege(
             resolver,
             connection,
             namespace,
             &view.name,
-            crate::security::permission::Object::View(view.name.clone()),
+            ast::Privilege::Select,
+            Object::View(view.name.clone()),
         )?;
         // Views are essentially query aliases, so just Expand the view as a subquery.
         let has_alias = maybe_alias.is_some();
@@ -2292,12 +2308,13 @@ fn parse_table(
             ));
         }
 
-        crate::translate::roles::check_read_privilege(
+        roles::check_privilege(
             resolver,
             connection,
             namespace,
             view_guard.name(),
-            crate::security::permission::Object::View(view_guard.name().to_string()),
+            ast::Privilege::Select,
+            Object::View(view_guard.name().to_string()),
         )?;
 
         // This is a materialized view with storage - treat it as a regular BTree table
@@ -2335,6 +2352,7 @@ fn parse_table(
             namespace,
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         });
         return Ok(());
     }
@@ -2362,6 +2380,7 @@ fn parse_table(
                     namespace,
                     indexed: None,
                     plan_estimate: None,
+                    row_filter: None,
                 });
                 return Ok(());
             }
@@ -3319,19 +3338,29 @@ pub(crate) fn append_vtab_predicates_to_where_clause(
     out_where_clause: &mut Vec<WhereTerm>,
     resolver: &Resolver,
 ) -> Result<()> {
+    let reads_only_earlier_tables = resolver
+        .catalog
+        .dialect
+        .table_function_arguments_read_only_earlier_tables();
     for mut expr in vtab_predicates.drain(..) {
-        bind_and_rewrite_expr(
+        let table_function = vtab_predicate_table_id(&expr)
+            .expect("a table-function argument must constrain its hidden column");
+        let hidden_tables = if reads_only_earlier_tables {
+            tables_from(table_references, table_function)
+        } else {
+            Vec::new()
+        };
+        bind_and_rewrite_expr_except(
             &mut expr,
             Some(table_references),
-            Some(result_columns),
+            (!reads_only_earlier_tables).then_some(result_columns),
             resolver,
             BindingBehavior::TryCanonicalColumnsFirst,
+            &hidden_tables,
         )?;
 
         // SQLite treats a table-function argument as an ON term for that table.
         // This keeps the term with the table when a later RIGHT JOIN adds NULL rows.
-        let table_function = vtab_predicate_table_id(&expr)
-            .expect("a table-function argument must constrain its hidden column");
         let table_reference = table_references
             .find_joined_table_by_internal_id(table_function)
             .expect("a table-function argument must have a table reference");
@@ -3349,6 +3378,16 @@ pub(crate) fn append_vtab_predicates_to_where_clause(
         });
     }
     Ok(())
+}
+
+/// The table `first` and every table listed after it.
+fn tables_from(table_references: &TableReferences, first: TableInternalId) -> Vec<TableInternalId> {
+    table_references
+        .joined_tables()
+        .iter()
+        .skip_while(|table| table.internal_id != first)
+        .map(|table| table.internal_id)
+        .collect()
 }
 
 /// Get the source table from `hidden_column = +(argument)`.

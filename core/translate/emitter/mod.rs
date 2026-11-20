@@ -28,8 +28,7 @@ use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::instrument;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
-    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, Index, IndexColumn, Schema,
-    Table,
+    BTreeTable, CheckConstraint, Column, ColumnLayout, Index, IndexColumn, Schema, Table,
 };
 use crate::security::roles::RoleId;
 use crate::translate::expr::expr_type::{column_type, BuiltinType, ExprType};
@@ -173,6 +172,7 @@ pub struct Resolver<'a> {
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
     pub dqs_dml: DoubleQuotedDml,
+    pub(crate) automatic_index: bool,
     #[cfg(feature = "simulator")]
     subquery_unnesting_mode: crate::SubqueryUnnestingMode,
     /// Foreign-key action programs currently being compiled by this resolver.
@@ -189,7 +189,7 @@ pub struct Resolver<'a> {
     /// compiled. Every caller of [`Resolver::new`] says which role it is, so
     /// that compiling a statement as the superuser is a visible choice: the
     /// engine makes it for the statements it runs on its own behalf and
-    /// inside [`Resolver::without_row_security`].
+    /// inside [`Resolver::as_superuser`].
     pub(crate) row_security_role: RoleId,
 }
 
@@ -374,8 +374,8 @@ impl SelfTableScope {
 
 #[cfg(test)]
 impl Resolver<'static> {
-    /// A resolver over an empty main schema with the SQLite dialect. Its state is leaked so
-    /// that unit tests can create one in a single call.
+    /// A resolver over an empty main schema with a dialect that cannot parse.
+    /// Its state is leaked so that unit tests can create one in a single call.
     pub(crate) fn empty_for_tests() -> Self {
         Self::new(
             Box::leak(Box::new(Schema::default())),
@@ -386,7 +386,7 @@ impl Resolver<'static> {
             Box::leak(Box::new(SymbolTable::new())),
             true,
             DoubleQuotedDml::Enabled,
-            Arc::new(crate::EngineDialect),
+            Arc::new(crate::dialect::cannot_parse::DialectThatCannotParse),
             None,
             RoleId::SUPERUSER,
         )
@@ -394,12 +394,14 @@ impl Resolver<'static> {
 }
 
 impl<'a> Resolver<'a> {
-    /// Compiles `f` as for the superuser, so row-level security limits
-    /// nothing, and then restores the role.
-    pub(crate) fn without_row_security<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+    /// Compiles `f` as for the superuser, so neither privileges nor
+    /// row-level security limit anything, and then restores the role.
+    pub(crate) fn as_superuser<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
         let role = std::mem::replace(&mut self.row_security_role, RoleId::SUPERUSER);
+        let role_is_not_superuser = std::mem::replace(&mut self.role_is_not_superuser, false);
         let result = f(self);
         self.row_security_role = role;
+        self.role_is_not_superuser = role_is_not_superuser;
         result
     }
 
@@ -437,6 +439,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(None),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml,
+            automatic_index: true,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             fk_action_compile_stack: FkActionCompileStack::default(),
@@ -474,6 +477,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
+            automatic_index: self.automatic_index,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
@@ -493,6 +497,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
+            automatic_index: self.automatic_index,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
@@ -1152,12 +1157,11 @@ pub fn emit_program(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     plan: Plan,
-    after: impl FnOnce(&mut ProgramBuilder),
 ) -> Result<()> {
     match plan {
         Plan::Select(plan) => emit_program_for_select(program, resolver, *plan),
         Plan::Delete(plan) => emit_program_for_delete(connection, resolver, program, *plan),
-        Plan::Update(plan) => emit_program_for_update(connection, resolver, program, *plan, after),
+        Plan::Update(plan) => emit_program_for_update(connection, resolver, program, *plan),
         mut plan @ Plan::CompoundSelect { .. } => {
             emit_program_for_compound_select(program, resolver, &mut plan).map(|_| ())
         }
@@ -2008,8 +2012,8 @@ pub(crate) fn init_limit(
     Ok(())
 }
 
-/// Emits `target_columns`, plus the stored columns needed by `target_columns`, into a
-/// DML row context. This takes into account stored columns, and any stored columns
+/// Emits `target_columns`, plus the columns needed by `target_columns`, into a
+/// DML row context. This takes into account stored columns, and any columns
 /// required by virtual columns in `target_columns`.
 ///
 /// Non-rowid target columns are allocated in target order, once per distinct column.
@@ -2040,7 +2044,7 @@ pub(crate) fn emit_columns_and_dependencies(
     for (pos, idx) in non_rowid_targets.iter().copied().enumerate() {
         non_rowid_target_positions[idx] = Some(pos);
     }
-    let dependencies = table.dependencies_of_columns(targets.iter().copied())?;
+    let needed_columns = table.columns_with_dependencies(targets.iter().copied())?;
 
     let target_base = if non_rowid_targets.is_empty() {
         0
@@ -2048,7 +2052,7 @@ pub(crate) fn emit_columns_and_dependencies(
         program.alloc_registers(non_rowid_targets.len())
     };
     let extra_base = {
-        let mut dependencies_not_in_targets: ColumnMask = dependencies.try_clone()?;
+        let mut dependencies_not_in_targets: ColumnMask = needed_columns.try_clone()?;
         dependencies_not_in_targets -= &target_mask;
 
         let extra_count = table
@@ -2076,9 +2080,11 @@ pub(crate) fn emit_columns_and_dependencies(
             reg
         } else if col.is_rowid_alias() {
             rowid_reg
-        } else if dependencies.get(idx) {
+        } else if needed_columns.get(idx) {
             let reg = extra_base + extra_idx;
-            emit_stored_column(program, cursor_id, idx, reg, resolver)?;
+            if !col.is_virtual_generated() {
+                emit_stored_column(program, cursor_id, idx, reg, resolver)?;
+            }
             extra_idx += 1;
             reg
         } else {
@@ -2099,7 +2105,7 @@ pub(crate) fn emit_columns_and_dependencies(
     let table_arc = Arc::new(table.clone());
     gencol::compute_virtual_columns(
         program,
-        &table.columns_topo_sort()?,
+        &table.columns_topo_sort()?.retain_columns(&needed_columns),
         &dml_ctx,
         resolver,
         &table_arc,
@@ -2217,7 +2223,8 @@ fn generated_column(
 }
 
 /// Emit code to load the value of an IndexColumn from the NEW image of the row being updated.
-/// Handling expression indexes and regular columns
+/// Handling expression indexes and regular columns. A virtual column is copied from its
+/// register, because UPDATE computes the virtual columns of the NEW image before the index keys.
 #[allow(clippy::too_many_arguments)]
 fn emit_index_column_value_new_image(
     program: &mut ProgramBuilder,
@@ -2256,42 +2263,16 @@ fn emit_index_column_value_new_image(
         let col_in_table = columns
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
-        match col_in_table.generated_type() {
-            GeneratedType::Virtual { .. } => {
-                gencol::emit_gencol_expr_from_registers(
-                    program,
-                    col_in_table,
-                    dest_reg,
-                    columns_start_reg,
-                    columns,
-                    resolver,
-                    rowid_reg,
-                    layout,
-                    table,
-                )?;
-                program.emit_column_affinity(dest_reg, col_in_table.affinity());
-            }
-            GeneratedType::Stored { .. } => {
-                let src_reg = layout.to_register(columns_start_reg, idx_col.pos_in_table);
-                program.emit_insn(Insn::Copy {
-                    src_reg,
-                    dst_reg: dest_reg,
-                    extra_amount: 0,
-                });
-            }
-            GeneratedType::NotGenerated => {
-                let src_reg = if col_in_table.is_rowid_alias() {
-                    rowid_reg
-                } else {
-                    layout.to_register(columns_start_reg, idx_col.pos_in_table)
-                };
-                program.emit_insn(Insn::Copy {
-                    src_reg,
-                    dst_reg: dest_reg,
-                    extra_amount: 0,
-                });
-            }
-        }
+        let src_reg = if col_in_table.is_rowid_alias() {
+            rowid_reg
+        } else {
+            layout.to_register(columns_start_reg, idx_col.pos_in_table)
+        };
+        program.emit_insn(Insn::Copy {
+            src_reg,
+            dst_reg: dest_reg,
+            extra_amount: 0,
+        });
     }
     Ok(())
 }
@@ -2440,40 +2421,78 @@ pub(crate) fn emit_check_constraints<'a>(
     if connection.check_constraints_ignored() || check_constraints.is_empty() {
         return Ok(());
     }
+    with_columns_in_registers(
+        program,
+        resolver,
+        table,
+        rowid_reg,
+        stored_columns,
+        referenced_tables,
+        |col_name| {
+            let normalized_name = normalize_ident(col_name);
+            check_constraints
+                .iter()
+                .any(|check| check_expr_references_column(&check.expr, &normalized_name))
+        },
+        |program, resolver, stored_column_mappings| {
+            emit_check_constraint_bytecode(
+                program,
+                check_constraints,
+                resolver,
+                or_conflict,
+                halt_on_error,
+                skip_row_label,
+                referenced_tables,
+                table.name.as_str(),
+                stored_column_mappings,
+            )
+        },
+    )
+}
 
+/// Runs `emit` with the resolver reading the columns of a row of `table`
+/// from registers instead of a cursor: the rowid from `rowid_reg`, and each
+/// column from the register `stored_columns` gives, which holds its stored
+/// value, after ENCODE. A custom-type column that `is_read` names is DECODEd
+/// into a new register first, so that expressions see the value a SELECT
+/// reads. `emit` gets each column's name and stored register.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn with_columns_in_registers<'a>(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    table: &BTreeTable,
+    rowid_reg: usize,
+    stored_columns: impl Iterator<Item = (&'a Column, usize)>,
+    referenced_tables: Option<&TableReferences>,
+    is_read: impl Fn(&str) -> bool,
+    emit: impl FnOnce(&mut ProgramBuilder, &mut Resolver, &[(&'a str, usize)]) -> Result<()>,
+) -> Result<()> {
     let table_name = table.name.as_str();
     let mut stored_column_mappings = Vec::new();
-    // A CHECK sees the values a SELECT reads, so it reads a custom-type column
-    // after DECODE, as `ceil(n)` on a numeric must compute from 4.50, not
-    // from the stored blob. Only the columns the CHECKs name are decoded.
+    // An expression sees the values a SELECT reads, so it reads a custom-type
+    // column after DECODE, as `ceil(n)` on a numeric must compute from 4.50,
+    // not from the stored blob. Only the columns it reads are decoded.
     let mut column_mappings = Vec::new();
     for (column, stored_reg) in stored_columns {
         let Some(col_name) = column.name.as_deref() else {
             continue;
         };
         stored_column_mappings.push((col_name, stored_reg));
-        let is_named_by_a_check = || {
-            let normalized_name = normalize_ident(col_name);
-            check_constraints
-                .iter()
-                .any(|check| check_expr_references_column(&check.expr, &normalized_name))
-        };
-        let register = if resolver.schema().column_has_decode(column, table.is_strict)
-            && is_named_by_a_check()
-        {
-            let decoded_reg = program.alloc_register();
-            emit_user_facing_column_value(
-                program,
-                stored_reg,
-                decoded_reg,
-                column,
-                table.is_strict,
-                resolver,
-            )?;
-            decoded_reg
-        } else {
-            stored_reg
-        };
+        let register =
+            if resolver.schema().column_has_decode(column, table.is_strict) && is_read(col_name) {
+                let decoded_reg = program.alloc_register();
+                emit_user_facing_column_value(
+                    program,
+                    stored_reg,
+                    decoded_reg,
+                    column,
+                    table.is_strict,
+                    resolver,
+                )?;
+                decoded_reg
+            } else {
+                stored_reg
+            };
         column_mappings.push((col_name, register));
     }
     let initial_cache_size = resolver.expr_to_reg_cache.len();
@@ -2535,17 +2554,7 @@ pub(crate) fn emit_check_constraints<'a>(
 
     resolver.enable_expr_to_reg_cache();
 
-    let result = emit_check_constraint_bytecode(
-        program,
-        check_constraints,
-        resolver,
-        or_conflict,
-        halt_on_error,
-        skip_row_label,
-        referenced_tables,
-        table_name,
-        &stored_column_mappings,
-    );
+    let result = emit(program, resolver, &stored_column_mappings);
 
     // Always restore resolver state, even on error.
     resolver.expr_to_reg_cache.truncate(initial_cache_size);

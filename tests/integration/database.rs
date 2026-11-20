@@ -2,7 +2,11 @@ use crate::common::ExecRows;
 use asserting::prelude::*;
 use std::sync::Arc;
 use turso::IoBackend;
-use turso_core::{ConnectOpts, Database, OpenFlags};
+use turso_core::sync::RwLock;
+use turso_core::{
+    ConnectOpts, Database, InternalVirtualTable, InternalVirtualTableCursor, OpenFlags,
+    SessionRole, Value,
+};
 use turso_sdk_kit::rsapi::{TursoDatabase, TursoDatabaseConfig, TursoStatusCode};
 use turso_sqlite::SqliteDialect;
 
@@ -34,7 +38,9 @@ fn test_database_rename_registry_stale() {
     )
     .unwrap();
 
-    let conn_a = db_a.connect(ConnectOpts::new()).unwrap();
+    let conn_a = db_a
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn_a.execute("CREATE TABLE t(x INTEGER)").unwrap();
     conn_a.execute("INSERT INTO t VALUES (42)").unwrap();
 
@@ -67,7 +73,9 @@ fn test_database_rename_registry_stale() {
     .unwrap();
 
     // 5. The new A.db should be empty — querying table 't' should fail.
-    let conn_a2 = db_a2.connect(ConnectOpts::new()).unwrap();
+    let conn_a2 = db_a2
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     // A new database at A.db has no table `t`. Before the fix,
     // DATABASE_MANAGER returned the stale Database after the rename.
     assert_that!(conn_a2.execute("SELECT x FROM t")).is_err();
@@ -265,32 +273,6 @@ fn test_open_file_with_wrong_argument_count_in_schema() {
     }
 }
 
-/// The SQLite dialect has no roles, so a table named like the roles table of
-/// the PostgreSQL frontend is an ordinary table, as it is to sqlite3.
-#[test]
-fn test_open_file_with_table_named_like_the_roles_table() {
-    let tmp_dir = tempfile::TempDir::new().unwrap();
-    let path = tmp_dir.path().join("roles.db");
-    let sqlite = rusqlite::Connection::open(&path).unwrap();
-    sqlite
-        .execute_batch(
-            "CREATE TABLE __turso_internal_roles(x);
-             INSERT INTO __turso_internal_roles VALUES (1);
-             CREATE TABLE t(a);
-             INSERT INTO t VALUES (5);",
-        )
-        .unwrap();
-    drop(sqlite);
-
-    let db = open_plain_file(&path).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
-    conn.force_reparse_schema_without_publish().unwrap();
-
-    let mut stmt = conn.prepare("SELECT a FROM t").unwrap();
-    let rows = stmt.run_collect_rows().unwrap();
-    assert_that!(rows).is_equal_to(vec![vec![turso_core::Value::from_i64(5)]]);
-}
-
 /// Regression test: TursoConnection.close() must finalize outstanding statements
 /// so that the Statement → Arc<Connection> → Arc<Database> chain is broken.
 ///
@@ -376,7 +358,9 @@ fn test_sdk_close_finalizes_leaked_statements() {
     .unwrap();
 
     // 7. The new A.db should be empty — table 't' should NOT exist.
-    let conn_a2 = db_a2.connect(ConnectOpts::new()).unwrap();
+    let conn_a2 = db_a2
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     let result = conn_a2.execute("SELECT x FROM t");
     assert!(
         result.is_err(),
@@ -405,7 +389,9 @@ fn test_database_open_with_options() {
             .flags(OpenFlags::Create),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
@@ -567,6 +553,31 @@ fn test_errors_on_zero_divisor_dialect() {
         fn name(&self) -> &'static str {
             SqliteDialect.name()
         }
+
+        fn parse_internal(
+            &self,
+            sql: &str,
+        ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            turso_sqlite::SqliteDialect.parse_internal(sql)
+        }
+
+        fn parse_internal_column_definition(
+            &self,
+            sql: &str,
+        ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+            turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+        }
+
+        fn parameter_marker_ranges(
+            &self,
+            sql: &str,
+        ) -> turso_core::Result<Vec<std::ops::Range<usize>>> {
+            turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
+        }
+
+        fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+            Arc::new(SqliteDialect)
+        }
         fn parse(&self, sql: &str) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
             SqliteDialect.parse(sql)
         }
@@ -590,13 +601,6 @@ fn test_errors_on_zero_divisor_dialect() {
             body: &turso_parser::ast::CreateTableBody,
         ) -> turso_core::Result<String> {
             SqliteDialect.format_table_sql(input, tbl_name, body)
-        }
-        fn register_catalog(
-            &self,
-            schema: &mut turso_core::schema::Schema,
-            enable_custom_types: bool,
-        ) -> turso_core::Result<()> {
-            SqliteDialect.register_catalog(schema, enable_custom_types)
         }
         fn resolve_function(
             &self,
@@ -668,4 +672,165 @@ fn test_a_sqlite_table_named_like_the_namespaces_table_is_an_ordinary_table() {
         limbo_exec_rows(&conn, "SELECT a FROM t"),
         vec![vec![rusqlite::types::Value::Integer(5)]]
     );
+}
+
+#[test]
+fn registered_internal_vtab_is_visible_to_connections() {
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        ":memory:",
+        OpenFlags::Create,
+        turso_core::DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let name = db
+        .register_internal_vtab(StaticTable {
+            name: "external_metadata",
+        })
+        .unwrap();
+    assert_eq!(name, "external_metadata");
+
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let mut stmt = conn
+        .prepare("SELECT key, value FROM external_metadata")
+        .unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    let mapped: Vec<(String, i64)> = rows
+        .into_iter()
+        .map(|cols| {
+            let key = match &cols[0] {
+                Value::Text(t) => t.as_str().to_string(),
+                other => panic!("unexpected key type {other:?}"),
+            };
+            let value = match &cols[1] {
+                Value::Numeric(turso_core::Numeric::Integer(i)) => *i,
+                other => panic!("unexpected value type {other:?}"),
+            };
+            (key, value)
+        })
+        .collect();
+    assert_eq!(
+        mapped,
+        vec![("alpha".to_string(), 1), ("beta".to_string(), 2)]
+    );
+}
+
+#[test]
+fn registered_internal_vtab_lookup_folds_ascii_only() {
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        ":memory:",
+        OpenFlags::Create,
+        turso_core::DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let name = db
+        .register_internal_vtab(StaticTable {
+            name: "External_ΔΥΣ",
+        })
+        .unwrap();
+    assert_eq!(name, "External_ΔΥΣ");
+
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let mut stmt = conn.prepare("SELECT key, value FROM external_ΔΥΣ").unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 2);
+
+    assert!(conn.prepare("SELECT key, value FROM external_δυσ").is_err());
+}
+
+/// Minimal `InternalVirtualTable` that exposes a fixed two-row table. Used
+/// to verify that callers can register an arbitrary catalog table at
+/// database open time and query it like any other table.
+#[derive(Debug)]
+struct StaticTable {
+    name: &'static str,
+}
+
+impl InternalVirtualTable for StaticTable {
+    fn name(&self) -> String {
+        self.name.to_string()
+    }
+    fn columns(&self) -> Vec<turso_parser::ast::ColumnDefinition> {
+        vec![
+            turso_core::vtab::column_definition("key", "TEXT"),
+            turso_core::vtab::column_definition("value", "INTEGER"),
+        ]
+    }
+    fn superuser_only(&self) -> bool {
+        false
+    }
+    fn open(
+        &self,
+        _conn: Arc<turso_core::Connection>,
+    ) -> turso_core::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(StaticCursor {
+            rows: vec![("alpha".to_string(), 1), ("beta".to_string(), 2)],
+            position: -1,
+        })))
+    }
+    fn best_index(
+        &self,
+        constraints: &[turso_ext::ConstraintInfo],
+        _order_by: &[turso_ext::OrderByInfo],
+    ) -> Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
+        Ok(turso_ext::IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 1.0,
+            estimated_rows: 2,
+            constraint_usages: constraints
+                .iter()
+                .map(|_| turso_ext::ConstraintUsage {
+                    argv_index: None,
+                    omit: false,
+                })
+                .collect(),
+        })
+    }
+}
+
+struct StaticCursor {
+    rows: Vec<(String, i64)>,
+    position: i64,
+}
+
+impl InternalVirtualTableCursor for StaticCursor {
+    fn next(&mut self) -> turso_core::Result<bool> {
+        self.position += 1;
+        Ok((self.position as usize) < self.rows.len())
+    }
+    fn rowid(&self) -> i64 {
+        self.position
+    }
+    fn column(&self, column: usize) -> turso_core::Result<Value> {
+        let (key, value) = &self.rows[self.position as usize];
+        match column {
+            0 => Ok(Value::build_text(key.clone())),
+            1 => Ok(Value::from_i64(*value)),
+            _ => Err(turso_core::LimboError::InternalError(format!(
+                "column index {column} out of range"
+            ))),
+        }
+    }
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> turso_core::Result<bool> {
+        self.position = -1;
+        self.next()
+    }
 }

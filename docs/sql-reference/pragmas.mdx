@@ -48,6 +48,8 @@ PRAGMA page_size;
 PRAGMA page_size = 8192;
 ```
 
+Encrypted databases reject page-size assignments, including before their first write. Select the page size in core `OpenOptions::page_size` when opening a new encrypted database.
+
 ### max_page_count
 
 Returns or sets the maximum number of pages allowed in the database file.
@@ -106,6 +108,10 @@ PRAGMA user_version = 3;
 ### table_info
 
 Returns one row for each column in the named table.
+
+The table-valued form, `pragma_table_info('table-name')`, takes the table name as
+its first argument. Constraining only its hidden `schema` column does not supply
+a table name and returns no rows.
 
 ```sql
 PRAGMA table_info(table-name);
@@ -212,6 +218,29 @@ foreign keys, and a missing table argument, return no rows rather than an error.
 PRAGMA main.foreign_key_list(child);
 SELECT * FROM pragma_foreign_key_list('child');
 ```
+
+### foreign_key_check
+
+Finds rows that break a foreign key. Returns one row for each child row that has no matching
+parent row.
+
+```sql
+PRAGMA foreign_key_check;
+PRAGMA foreign_key_check(child);
+-- table | rowid | parent | fkid
+-- child | 3     | parent | 0
+```
+
+table is the child table, rowid is the broken row, parent is the table the key points at, and
+fkid is the id that foreign_key_list gives the key. A row that breaks two keys is returned
+twice. A row with a NULL in the key is skipped. The result is the same whether foreign_keys is
+on or off.
+
+Without an argument all tables are checked. With a table name only that table is checked, and
+an unknown name is an error. If the parent table does not exist, every row with no NULL in the
+key is returned. If the parent columns are not a PRIMARY KEY or a UNIQUE index, the pragma
+fails with a foreign key mismatch error. An optional schema prefix selects the database, and
+pragma_foreign_key_check() returns the same rows as a table-valued function.
 
 ### collation_list
 
@@ -455,6 +484,15 @@ When enabled, CHECK constraints are not enforced.
 ```sql
 PRAGMA ignore_check_constraints = 1;   -- disable CHECK constraints
 PRAGMA ignore_check_constraints = 0;   -- enable CHECK constraints
+```
+
+### automatic_index
+
+Turso can by default build a temporary index for tables to join faster.
+
+```sql
+PRAGMA automatic_index = 0;   -- off
+PRAGMA automatic_index = 1;   -- on (default)
 ```
 
 ### data_sync_retry
@@ -751,11 +789,13 @@ CDC respects transaction boundaries. Changes are only recorded when a transactio
 
 ### cipher
 
-Sets the encryption cipher for the database.
+Reports the immutable encryption cipher for the current connection:
 
 ```sql
-PRAGMA cipher = 'aegis256';
+PRAGMA cipher;
 ```
+
+Encryption must be configured when opening the database. Assignments to `cipher` or `hexkey` are rejected during preparation, including on a new empty database. Enabling the experimental encryption feature without credentials creates a plaintext database that cannot later become encrypted.
 
 Supported ciphers:
 
@@ -772,30 +812,27 @@ Supported ciphers:
 
 ### hexkey
 
-Sets the encryption key as a hexadecimal string.
+Reports whether the current connection has an encryption key. It never returns key material:
 
 ```sql
-PRAGMA hexkey = '2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d';
+PRAGMA hexkey;
 ```
 
-#### Encryption Example
+Supply both cipher and key at open time, for example:
 
-```sql
--- Set cipher and key before creating tables
-PRAGMA cipher = 'aegis256';
-PRAGMA hexkey = '2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d';
-
-CREATE TABLE secrets (id INTEGER PRIMARY KEY, data TEXT);
-INSERT INTO secrets VALUES (1, 'sensitive data');
+```shell
+tursodb --experimental-encryption "file:database.db?cipher=aegis256&hexkey=YOUR_HEX_KEY"
 ```
 
-Alternatively, specify encryption parameters in the database URI:
+This URI can expose the key through process arguments, shell history, and command-line recording. It is not a protected secret-input channel.
 
-```
-file:database.db?cipher=aegis256&hexkey=2d7a30...
-```
+Every open and connection independently authenticates its credentials before shared schema or MVCC state is accessible. Missing keys, wrong keys, and cipher mismatches are rejected. Existing encrypted files retain their format and credentials. Choose an encrypted database's page size in core `OpenOptions::page_size` before opening it; the default for a new database is 4096. Page size and reserved bytes are immutable afterward.
 
-To open an existing encrypted database, the cipher and key must be provided as URI parameters.
+Each encrypted attachment requires its own cipher/key URI. Non-NULL `ATTACH ... KEY` values are rejected before opening or creating the target. `KEY NULL` uses the URI credentials. Serialize other opens of a fresh target until ATTACH completes. In-place VACUUM preserves encryption for the main database and rejects encrypted attached databases. VACUUM INTO produces a plaintext destination.
+
+External storage restore is not supported with built-in encryption. Sync encryption is not supported.
+
+Built-in encryption protects database storage, WAL, and encrypted MVCC storage. Serialize writes until the first page of a new database has been initialized, including across connections, raw/custom-storage opens, and separate processes. Recovery after a failed or abandoned initial write is not guaranteed.
 
 ## Custom Types
 

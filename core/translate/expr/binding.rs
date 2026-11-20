@@ -5,7 +5,7 @@ use crate::schema::{
 };
 use crate::translate::catalog::CatalogContext;
 use crate::translate::plan::{
-    is_schema_table, merge_columns, resolve_unqualified_column, unqualified_column_sources,
+    is_schema_table, merge_columns, resolve_unqualified_column_except, unqualified_column_sources,
     ColumnLookup, OuterQueryReference, ResolvedColumn,
 };
 
@@ -117,13 +117,32 @@ enum QualifiedNameMatch {
 /// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
 /// using the provided TableReferences, and replacing anonymous parameters with internal named
 /// ones
-#[turso_macros::trace_stack]
 pub fn bind_and_rewrite_expr<'a>(
+    top_level_expr: &mut ast::Expr,
+    referenced_tables: Option<&'a mut TableReferences>,
+    result_columns: Option<&'a [ResultSetColumn]>,
+    resolver: &Resolver<'_>,
+    binding_behavior: BindingBehavior,
+) -> Result<()> {
+    bind_and_rewrite_expr_except(
+        top_level_expr,
+        referenced_tables,
+        result_columns,
+        resolver,
+        binding_behavior,
+        &[],
+    )
+}
+
+/// Like [bind_and_rewrite_expr], but no name is ever a column of the tables in `excluded`.
+#[turso_macros::trace_stack]
+pub fn bind_and_rewrite_expr_except<'a>(
     top_level_expr: &mut ast::Expr,
     mut referenced_tables: Option<&'a mut TableReferences>,
     result_columns: Option<&'a [ResultSetColumn]>,
     resolver: &Resolver<'_>,
     binding_behavior: BindingBehavior,
+    excluded: &[TableInternalId],
 ) -> Result<()> {
     walk_expr_mut(
         top_level_expr,
@@ -154,7 +173,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     let joined_tables = referenced_tables.joined_tables();
                     // First check joined tables
                     if let Some(resolved_column) =
-                        resolve_unqualified_column(joined_tables, id.as_str())?
+                        resolve_unqualified_column_except(joined_tables, id.as_str(), excluded)?
                     {
                         *expr = resolved_column.expr;
                         // FULL JOIN can make the merged value read several table columns.
@@ -257,6 +276,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         None,
                         &normalized_table_name,
                         &normalized_id,
+                        excluded,
                     )?;
 
                     // --- Error reporting. ---
@@ -377,6 +397,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             Some(*namespace),
                             &tbl_name_str,
                             &normalized_col_name,
+                            excluded,
                         )? {
                             QualifiedNameMatch::Found(table_id, column) => {
                                 bind_qualified_name(expr, referenced_tables, table_id, column);
@@ -656,7 +677,7 @@ pub(crate) fn validate_function_tail(
         Ok(func) => func,
         // SQLite reports OVER on a scalar function before a wrong argument count.
         Err(err) if filter_over.over_clause.is_some() => {
-            match crate::dialect::engine::resolve_builtin_function_name(name, arg_count) {
+            match crate::functions::builtin::resolve_builtin_function_name(name, arg_count) {
                 Ok(Some(Func::Scalar(_))) => {
                     crate::bail_parse_error!("{} may not be used as a window function", name)
                 }
@@ -798,6 +819,7 @@ fn resolve_qualified_name(
     namespace: Option<NamespaceRef>,
     table_name: &str,
     column_name: &str,
+    excluded: &[TableInternalId],
 ) -> Result<QualifiedNameMatch> {
     let use_nearest_table_only = resolver
         .catalog
@@ -806,6 +828,9 @@ fn resolve_qualified_name(
     let mut table_found = false;
     let mut found = None;
     for joined_table in table_references.joined_tables() {
+        if excluded.contains(&joined_table.internal_id) {
+            continue;
+        }
         let candidate = match_qualified_name_in_table(
             &joined_table.table,
             joined_table.internal_id,

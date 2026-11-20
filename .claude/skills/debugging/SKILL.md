@@ -1,104 +1,73 @@
 ---
 name: debugging
-description: How to debug tursodb using Bytecode comparison, logging, ThreadSanitizer, deterministic simulation, and corruption analysis tools
+description: How to debug tursodb using bytecode comparison, logging, ThreadSanitizer, deterministic simulation, stack usage scripts, and corruption analysis tools
 ---
 # Debugging Guide
 
-## Bytecode Comparison Flow
+## Bytecode Comparison
 
-Turso aims for SQLite compatibility. When behavior differs:
-
-```
-1. EXPLAIN query in sqlite3
-2. EXPLAIN query in tursodb
-3. Compare bytecode
-   ├─ Different → bug in code generation
-   └─ Same but results differ → bug in VM or storage layer
-```
-
-### Example
+When Turso and SQLite give different results, run `EXPLAIN` on both:
 
 ```bash
-# SQLite
 sqlite3 :memory: "EXPLAIN SELECT 1 + 1;"
-
-# Turso
 cargo run --bin tursodb :memory: "EXPLAIN SELECT 1 + 1;"
 ```
 
-## Manual Query Inspection
-
-```bash
-cargo run --bin tursodb :memory: 'SELECT * FROM foo;'
-cargo run --bin tursodb :memory: 'EXPLAIN SELECT * FROM foo;'
-```
+Different bytecode means a bug in code generation (`core/translate/`). Same bytecode
+with different results means a bug in the VM or storage layer.
 
 ## Logging
 
-```bash
-# Trace core during tests
-RUST_LOG=none,turso_core=trace make test
+`tursodb` logs with `tracing`. It reads `RUST_LOG` (default level: warn) and writes to
+stderr, or to a file with `-t <file>` (`--tracing-output`).
 
-# Output goes to testing/test.log
-# Warning: can be megabytes per test run
+```bash
+RUST_LOG=turso_core=trace cargo run --bin tursodb -- -t /tmp/turso.log :memory: 'SELECT 1;'
 ```
+
+Logs can reach megabytes. `make test` sets `RUST_LOG=off`, so use `cargo run` or `cargo test` to get logs.
 
 ## Threading Issues
 
-Use stress tests with ThreadSanitizer:
+Run the stress test under ThreadSanitizer. It needs a nightly toolchain with the `rust-src` component, and `--target` set to the host target (`x86_64-unknown-linux-gnu` on Linux, `aarch64-apple-darwin` on Apple Silicon):
 
 ```bash
-rustup toolchain install nightly
-rustup override set nightly
-cargo run -Zbuild-std --target x86_64-unknown-linux-gnu \
+RUSTFLAGS="-Zsanitizer=thread" cargo +nightly run -Zbuild-std --target x86_64-unknown-linux-gnu \
   -p turso_stress -- --vfs syscall --nr-threads 4 --nr-iterations 1000
 ```
 
+Flags: `--vfs`, `--nr-threads` (`-t`), `--nr-iterations` (`-i`); see `--help` for the rest.
+
 ## Deterministic Simulation
 
-Reproduce bugs with seed. Note: simulator uses legacy "limbo" naming.
+Replay a failure with its seed. The simulator binary is named `limbo_sim`.
 
 ```bash
-# Simulator
 RUST_LOG=limbo_sim=debug cargo run --bin limbo_sim -- -s <seed>
 
-# Whopper (concurrent DST)
+# Whopper (concurrent simulator). Repeat a run with the same seed and flags.
 SEED=1234 ./testing/concurrent-simulator/bin/run
 ```
 
+See `testing/concurrent-simulator/README.md` for flags such as `--mode` and `--swarm`.
+
 ## Stack Usage
 
-Parsing and translating an expression recurse once per level of nesting, so
-the stack frame size of those functions limits how deep an expression can be.
-Three scripts in `scripts/stack/` measure stack use. Use a release build
-(`cargo build --release --bin tursodb`): debug builds do not reuse stack slots,
-so their frames say little about what users run. Run each script with `-h`
-for all options.
+Parsing and translating an expression recurse once per level of nesting, so frame
+size limits how deep an expression can be. Scripts in `scripts/stack/` measure it
+(`-h` lists options). Use a release build (`cargo build --release --bin tursodb`);
+debug builds do not reuse stack slots, so their frames say little about what users run.
 
 ```bash
-# Frame size of each function, read from its prologue. -c compares two binaries.
-scripts/stack/frame-sizes.sh 'translate::expr::'
-scripts/stack/frame-sizes.sh -c /tmp/tursodb-main 'translate_expr$' 'parse_expr_inner$'
-
-# Smallest stack that runs a SQL script, per binary. -S adds sqlite3.
-scripts/stack/min-stack.sh -S -b /tmp/tursodb-main -b target/release/tursodb deep.sql
-
-# Which functions use the stack at the deepest point (runs under lldb).
-scripts/stack/stack-profile.sh deep.sql
+scripts/stack/frame-sizes.sh '<function name pattern>'        # frame size per function; -c compares two binaries
+scripts/stack/min-stack.sh -S -b target/release/tursodb deep.sql   # smallest stack that runs a script
+scripts/stack/stack-profile.sh deep.sql                 # functions on the stack at its deepest point (lldb)
 ```
 
-Functions that recurse per level should be small. Move rare and large paths
-into `#[inline(never)]` helpers, like SQLite's `SQLITE_NOINLINE`.
+Functions that recurse per level should be small. Move rare and large paths into
+`#[inline(never)]` helpers, like SQLite's `SQLITE_NOINLINE`.
 
-## Architecture Reference
+## Corruption
 
-- **Parser** → AST from SQL strings
-- **Code generator** → bytecode from AST
-- **Virtual machine** → executes SQLite-compatible bytecode
-- **Storage layer** → B-tree operations, paging
-
-## Corruption Debugging
-
-For WAL corruption and database integrity issues, use the corruption debug tools in [scripts](./scripts).
-
-See [references/CORRUPTION-TOOLS.md](./references/CORRUPTION-TOOLS.md) for detailed usage.
+For WAL corruption and integrity failures, use `scripts/corruption-debug-tools/`.
+See [references/CORRUPTION-TOOLS.md](./references/CORRUPTION-TOOLS.md).

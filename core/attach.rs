@@ -204,7 +204,7 @@ pub(crate) enum AttachDatabaseState {
 
 #[cfg(feature = "fs")]
 #[derive(Default)]
-pub(crate) enum AttachDatabaseState {
+pub enum AttachDatabaseState {
     #[default]
     Start,
     Init(Box<AttachDatabaseInitState>),
@@ -218,7 +218,7 @@ pub(crate) enum AttachDatabaseState {
 }
 
 #[cfg(feature = "fs")]
-pub(crate) struct AttachDatabaseInitState {
+pub struct AttachDatabaseInitState {
     alias: String,
     reserved_space: Option<u8>,
     db: Arc<Database>,
@@ -228,13 +228,22 @@ pub(crate) struct AttachDatabaseInitState {
 }
 
 #[cfg(feature = "fs")]
-pub(crate) struct AttachDatabaseBootstrapState {
+pub struct AttachDatabaseBootstrapState {
     alias: String,
     db: Arc<Database>,
     pager: Arc<Pager>,
     encryption_key: Option<EncryptionKey>,
     bootstrap_conn: Option<Arc<Connection>>,
     bootstrap_st: crate::mvcc::database::BootstrapState,
+}
+
+#[cfg(feature = "fs")]
+impl Drop for AttachDatabaseState {
+    fn drop(&mut self) {
+        if let Self::Init(init) = self {
+            init.init_st.cancel();
+        }
+    }
 }
 
 impl Connection {
@@ -302,6 +311,15 @@ impl Connection {
         attached_db_pager: &Pager,
         reserved_space: Option<u8>,
     ) -> Result<()> {
+        if attached_db_pager.encryption_cipher() != crate::CipherMode::None {
+            let required = attached_db_pager.encryption_cipher().metadata_size() as u8;
+            if reserved_space.is_some_and(|space| space != required) {
+                return Err(LimboError::InvalidArgument(
+                    "encrypted attached database reserved bytes must match its cipher".into(),
+                ));
+            }
+            return attached_db_pager.set_initial_page_size(self.get_page_size());
+        }
         let target_page_size = self.get_page_size();
         let attached_min_reserved_space =
             Self::minimum_reserved_space_for_fresh_attach(attached_db_pager);
@@ -409,7 +427,7 @@ impl Connection {
 
     /// Attach a database file with the given alias name
     #[cfg(feature = "fs")]
-    pub(crate) fn attach_database(
+    pub fn attach_database(
         &self,
         path: &str,
         alias: &str,
@@ -473,12 +491,13 @@ impl Connection {
                         self.db.io.clone()
                     };
                     let main_db_flags = self.db.open_flags;
-                    let (db, encryption_opts) = Self::from_uri_attached(
+                    let (db, encryption_key) = Self::from_uri_attached(
                         path,
                         db_opts,
                         main_db_flags,
                         io,
                         self.db.dialect(),
+                        self.get_page_size(),
                     )?;
                     let attached_is_fresh = !db.initialized();
                     if !is_memory_db {
@@ -489,12 +508,6 @@ impl Connection {
                         &db,
                         attached_is_fresh,
                     )?;
-
-                    let encryption_key = if let Some(ref enc) = encryption_opts {
-                        Some(EncryptionKey::from_hex_string(&enc.hexkey)?)
-                    } else {
-                        None
-                    };
 
                     *state = AttachDatabaseState::Init(Box::new(AttachDatabaseInitState {
                         alias: alias.to_string(),

@@ -9,7 +9,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, SessionRole};
 use turso_sqlite::SqliteDialect;
 
 const PAGE_SIZE_OFFSET: u64 = 16;
@@ -182,8 +182,10 @@ fn test_attached_mvcc_auto_checkpoint_uses_attached_pager_and_sync_mode() -> any
         before.get(AUX_PATH),
         "an attached MVCC checkpoint must write and fsync the attached database"
     );
-    assert!(
-        !io.has_unsynced_writes(&format!("{AUX_PATH}-log")),
+    let aux_log_path = format!("{AUX_PATH}-log");
+    assert_ne!(
+        after.get(&aux_log_path),
+        before.get(&aux_log_path),
         "an attached MVCC commit must fsync using aux.synchronous=FULL"
     );
     Ok(())
@@ -201,7 +203,7 @@ fn open_unreliable_attached_database(
         None,
         Arc::new(SqliteDialect),
     )?;
-    Ok(db.connect(ConnectOpts::new())?)
+    Ok(db.connect(ConnectOpts::new(SessionRole::Superuser))?)
 }
 
 #[turso_macros::test]
@@ -398,9 +400,96 @@ fn test_fresh_attach_inherits_mvcc_before_first_write(_tmp_db: TempDatabase) -> 
         None,
         Arc::new(SqliteDialect),
     )?;
-    let aux_conn = aux_db.connect(ConnectOpts::new())?;
+    let aux_conn = aux_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     assert!(aux_conn.mvcc_enabled());
 
+    Ok(())
+}
+
+/// A fresh database attached to an MVCC database is an MVCC database, and
+/// its pager has a WAL before the database is first written.
+#[test]
+fn test_fresh_mvcc_attach_installs_wal_before_bootstrap() -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+
+    let aux_path = db.path.with_extension("attach_mvcc_wal.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+
+    let (attached_db, pager) = conn.attached_database("aux").unwrap();
+    assert!(attached_db.get_mv_store().is_some());
+    assert!(
+        pager.wal_shared_ptr().is_some(),
+        "the attached pager has no WAL"
+    );
+
+    conn.execute("CREATE TABLE aux.t(x INTEGER)")?;
+    conn.execute("INSERT INTO aux.t VALUES(1)")?;
+    conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)")?;
+    Ok(())
+}
+
+#[test]
+fn test_fresh_mvcc_attach_reuses_database_shared_wal() -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+
+    let aux_path = db.path.with_extension("attach_mvcc_shared_wal.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn.execute("CREATE TABLE aux.t(x INTEGER)")?;
+    conn.execute("INSERT INTO aux.t VALUES(1)")?;
+
+    let (attached_db, pager) = conn.attached_database("aux").unwrap();
+    let pager_shared_ptr = pager
+        .wal_shared_ptr()
+        .expect("the attached pager has no WAL");
+    assert_eq!(pager_shared_ptr, attached_db.shared_wal_ptr());
+    Ok(())
+}
+
+#[test]
+fn test_ddl_in_one_transaction_changes_the_schema_in_place() -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+    let aux_path = db.path.with_extension("attach_ddl_in_place.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+
+    for name in ["main", "temp", "aux"] {
+        conn.execute("BEGIN")?;
+        // The first DDL copies the schema, which the committed schema still shares.
+        conn.execute(format!("CREATE TABLE {name}.a(x)"))?;
+        let private_schema = conn.schema_address(name);
+        conn.execute(format!("CREATE TABLE {name}.b(x UNIQUE)"))?;
+        conn.execute(format!("CREATE INDEX {name}.b_x ON b(x)"))?;
+        conn.execute(format!(
+            "CREATE TRIGGER {name}.b_insert AFTER INSERT ON b BEGIN SELECT 1; END"
+        ))?;
+        assert_eq!(
+            conn.schema_address(name),
+            private_schema,
+            "DDL on {name} copied a schema that only this transaction uses"
+        );
+        conn.execute(format!("INSERT INTO {name}.b VALUES (1)"))?;
+
+        conn.execute("SAVEPOINT sp")?;
+        conn.execute(format!("CREATE TABLE {name}.c(x)"))?;
+        conn.execute(format!("CREATE TABLE {name}.d(x)"))?;
+        conn.execute("ROLLBACK TO sp")?;
+        assert!(conn.execute(format!("SELECT * FROM {name}.c")).is_err());
+        assert!(conn.execute(format!("SELECT * FROM {name}.d")).is_err());
+        conn.execute(format!("SELECT * FROM {name}.b"))?;
+
+        conn.execute("ROLLBACK")?;
+        for object in ["a", "b"] {
+            assert!(
+                conn.execute(format!("SELECT * FROM {name}.{object}"))
+                    .is_err(),
+                "{name}.{object} survived ROLLBACK"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -420,7 +509,7 @@ fn test_attach_rejects_initialized_page_size_mismatch(_tmp_db: TempDatabase) -> 
         None,
         Arc::new(SqliteDialect),
     )?;
-    let aux_conn = aux_db.connect(ConnectOpts::new())?;
+    let aux_conn = aux_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     aux_conn.execute("CREATE TABLE t(x INTEGER)")?;
 
     let err = conn
@@ -429,11 +518,7 @@ fn test_attach_rejects_initialized_page_size_mismatch(_tmp_db: TempDatabase) -> 
         .to_string();
     assert_eq!(
         err,
-        format!(
-            "cannot attach database 'aux': page size mismatch (main={:?}, attached={:?})",
-            turso_core::storage::sqlite3_ondisk::PageSize::new(8192).unwrap(),
-            turso_core::storage::sqlite3_ondisk::PageSize::new(4096).unwrap(),
-        )
+        "page size mismatch: requested 8192 bytes, database uses 4096 bytes"
     );
 
     Ok(())
@@ -539,7 +624,7 @@ fn test_fresh_mvcc_attach_rejects_custom_durable_storage_without_attached_backen
                 durable_storage as Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>,
             ),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     conn.pragma_update("journal_mode", "'mvcc'")?;
 
     let err = conn
@@ -910,7 +995,7 @@ fn test_attached_write_txn_rolled_back_after_io_error() -> anyhow::Result<()> {
         Arc::new(SqliteDialect),
     )?;
 
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     conn.execute("ATTACH 'queued-attach-lock-aux.db' AS aux1")?;
     conn.execute("CREATE TABLE main_t (x INTEGER)")?;
     conn.execute("INSERT INTO main_t VALUES (1)")?;
@@ -924,7 +1009,7 @@ fn test_attached_write_txn_rolled_back_after_io_error() -> anyhow::Result<()> {
     // next attached read transaction sees the database as changed, drops its
     // cached pages and cached schema cookie, and must re-read the header page
     // from disk inside its attached Transaction opcode.
-    let conn2 = db.connect(ConnectOpts::new())?;
+    let conn2 = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     conn2.execute("ATTACH 'queued-attach-lock-aux.db' AS aux1")?;
     conn2.execute("INSERT INTO aux1.t VALUES (2)")?;
 
@@ -958,4 +1043,31 @@ fn test_attached_write_txn_rolled_back_after_io_error() -> anyhow::Result<()> {
         ]
     );
     Ok(())
+}
+
+#[test]
+fn test_savepoint_loads_evicted_attached_header_before_mirroring() {
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        "savepoint-main.db",
+        OpenFlags::Create,
+        DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("ATTACH 'savepoint-aux.db' AS aux").unwrap();
+    conn.execute("CREATE TABLE aux.t(x)").unwrap();
+
+    let attached_db_id = conn.get_database_id_by_name("aux").unwrap();
+    let attached_pager = conn.get_pager_from_database_index(&attached_db_id).unwrap();
+    attached_pager.begin_read_tx().unwrap();
+    attached_pager.clear_page_cache(false);
+
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("RELEASE s").unwrap();
 }

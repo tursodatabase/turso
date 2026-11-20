@@ -273,3 +273,290 @@ test distinct-spilled-many-duplicates {
 expect {
     5000|12497500
 }
+
+@cross-check-integrity
+test distinct-with-part-of-multi-column-unique {
+    CREATE TABLE t (a NOT NULL, b NOT NULL, c, UNIQUE (a, b));
+    INSERT INTO t VALUES (1, 1, 0), (1, 2, 0), (2, 1, 0);
+    SELECT DISTINCT a, c FROM t ORDER BY a;
+}
+expect {
+    1|0
+    2|0
+}
+
+@cross-check-integrity
+test distinct-with-nullable-text-primary-key {
+    CREATE TABLE t (k TEXT PRIMARY KEY, a);
+    INSERT INTO t VALUES (NULL, 1), (NULL, 1);
+    SELECT count(*) FROM (SELECT DISTINCT k, a FROM t);
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test distinct-with-unique-index-other-collation {
+    CREATE TABLE t (x TEXT COLLATE NOCASE NOT NULL, a);
+    CREATE UNIQUE INDEX t_x ON t (x COLLATE BINARY);
+    INSERT INTO t VALUES ('a', 1), ('A', 1);
+    SELECT count(*) FROM (SELECT DISTINCT x, a FROM t);
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test distinct-with-non-unique-index {
+    CREATE TABLE t (u NOT NULL, a);
+    CREATE INDEX t_u ON t (u);
+    INSERT INTO t VALUES ('p', 1), ('p', 1);
+    SELECT count(*) FROM (SELECT DISTINCT u, a FROM t);
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test distinct-with-partial-unique-index {
+    CREATE TABLE t (u NOT NULL, a);
+    CREATE UNIQUE INDEX t_u ON t (u) WHERE a > 5;
+    INSERT INTO t VALUES ('p', 1), ('p', 1);
+    SELECT count(*) FROM (SELECT DISTINCT u, a FROM t);
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test distinct-with-expression-unique-index {
+    CREATE TABLE t (u NOT NULL, v NOT NULL, a);
+    CREATE UNIQUE INDEX t_uv ON t (u, lower(v));
+    INSERT INTO t VALUES ('p', 'x', 1), ('p', 'y', 1);
+    SELECT count(*) FROM (SELECT DISTINCT u, a FROM t);
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test distinct-with-rowid-in-join {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, a);
+    CREATE TABLE t2 (b);
+    INSERT INTO t1 VALUES (1, 'x');
+    INSERT INTO t2 VALUES (5), (5);
+    SELECT DISTINCT t1.id, t1.a FROM t1, t2;
+}
+expect {
+    1|x
+}
+
+@cross-check-integrity
+test distinct-with-outer-column {
+    CREATE TABLE o (id INTEGER PRIMARY KEY);
+    CREATE TABLE t (a);
+    INSERT INTO o VALUES (1);
+    INSERT INTO t VALUES (5), (5);
+    SELECT (SELECT count(*) FROM (SELECT DISTINCT o.id, t.a FROM t)) FROM o;
+    SELECT (SELECT count(*) FROM (SELECT DISTINCT o.rowid, t.a FROM t)) FROM o;
+}
+expect {
+    1
+    1
+}
+
+@cross-check-integrity
+test distinct-with-rowid-and-count-distinct {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a);
+    INSERT INTO t VALUES (1, 5), (2, 5);
+    SELECT n FROM (SELECT DISTINCT id, count(DISTINCT a) AS n FROM t);
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test distinct-index-order-null-first {
+    CREATE TABLE t (a, p1, p2, p3);
+    CREATE INDEX t_a ON t (a);
+    INSERT INTO t (a) VALUES (NULL), (NULL), (1), (1);
+    SELECT count(*) FROM (SELECT DISTINCT a FROM t);
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test distinct-index-order-null-in-second-column {
+    CREATE TABLE t (a, b, p1, p2, p3);
+    CREATE INDEX t_ab ON t (a, b);
+    INSERT INTO t (a, b) VALUES (1, NULL), (1, NULL), (1, 2), (1, 2), (2, NULL), (2, NULL);
+    SELECT count(*) FROM (SELECT DISTINCT a, b FROM t);
+}
+expect {
+    3
+}
+
+@cross-check-integrity
+test distinct-index-order-all-null {
+    CREATE TABLE t (a, p1, p2, p3);
+    CREATE INDEX t_a ON t (a);
+    INSERT INTO t (a) VALUES (NULL), (NULL);
+    SELECT count(*) FROM (SELECT DISTINCT a FROM t);
+    SELECT count(DISTINCT a) FROM t;
+}
+expect {
+    1
+    0
+}
+
+@cross-check-integrity
+test distinct-index-order-backward {
+    CREATE TABLE t (a, p1, p2, p3);
+    CREATE INDEX t_a ON t (a);
+    INSERT INTO t (a) VALUES (1), (3), (1), (2), (3);
+    SELECT DISTINCT a FROM t ORDER BY a DESC;
+}
+expect {
+    3
+    2
+    1
+}
+
+@cross-check-integrity
+test distinct-index-order-constant-prefix {
+    CREATE TABLE t (a, b, p1, p2, p3);
+    CREATE INDEX t_ab ON t (a, b);
+    INSERT INTO t (a, b) VALUES (1, 5), (1, 5), (1, 6), (2, 5);
+    SELECT DISTINCT b FROM t WHERE a = 1 ORDER BY b;
+}
+expect {
+    5
+    6
+}
+
+@cross-check-integrity
+test distinct-column-after-index-prefix {
+    CREATE TABLE t (a, b, p1, p2, p3);
+    CREATE INDEX t_ab ON t (a, b);
+    INSERT INTO t (a, b) VALUES (1, 5), (1, 6), (2, 5);
+    SELECT count(*) FROM (SELECT DISTINCT b FROM t);
+    SELECT count(DISTINCT b) FROM t;
+}
+expect {
+    2
+    2
+}
+
+@cross-check-integrity
+test distinct-collation-differs-from-index {
+    CREATE TABLE t (c TEXT COLLATE NOCASE, p1, p2, p3);
+    CREATE INDEX t_c ON t (c COLLATE BINARY);
+    INSERT INTO t (c) VALUES ('a'), ('B'), ('A');
+    SELECT count(*) FROM (SELECT DISTINCT c FROM t);
+    SELECT count(DISTINCT c) FROM t;
+}
+expect {
+    2
+    2
+}
+
+@cross-check-integrity
+test distinct-order-by-another-column {
+    CREATE TABLE t (a, b, p1, p2, p3);
+    CREATE INDEX t_ab ON t (a, b);
+    INSERT INTO t (a, b) VALUES (1, 5), (1, 7), (2, 6);
+    SELECT DISTINCT a FROM t ORDER BY b;
+}
+expect {
+    1
+    2
+}
+
+@cross-check-integrity
+test distinct-outer-table-column-in-join {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a, b);
+    CREATE INDEX t_ab ON t (a, b);
+    CREATE TABLE u (id INTEGER PRIMARY KEY, x);
+    INSERT INTO t VALUES (1, 1, 10), (2, 1, 10), (3, 2, 20);
+    INSERT INTO u VALUES (10, 0), (20, 0);
+    SELECT DISTINCT t.a FROM t LEFT JOIN u ON u.id = t.b ORDER BY t.a;
+}
+expect {
+    1
+    2
+}
+
+@cross-check-integrity
+test distinct-inner-table-column-in-join {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, d);
+    CREATE TABLE u (id INTEGER PRIMARY KEY, x, y);
+    CREATE INDEX u_xy ON u (x, y);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
+    INSERT INTO u VALUES (1, 1, 7), (2, 2, 5), (3, 3, 7);
+    SELECT count(*) FROM (SELECT DISTINCT u.y FROM t JOIN u ON u.x = t.d);
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test distinct-key-matches-only-part-of-index {
+    CREATE TABLE t (a, b, c, p1, p2, p3);
+    CREATE INDEX t_abc ON t (a, b, c);
+    INSERT INTO t (a, b, c) VALUES (1, 1, 'x'), (1, 2, 'y'), (1, 3, 'x');
+    SELECT count(*) FROM (SELECT DISTINCT a, c FROM t);
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test distinct-index-order-in-correlated-subquery {
+    CREATE TABLE o (id INTEGER PRIMARY KEY, v);
+    CREATE TABLE t (a);
+    CREATE INDEX t_a ON t (a);
+    INSERT INTO o VALUES (1, 3), (2, 3);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT id, (SELECT count(DISTINCT a) FROM t WHERE a >= o.v) FROM o;
+    SELECT id, (SELECT count(*) FROM (SELECT DISTINCT a FROM t WHERE a >= o.v)) FROM o;
+}
+expect {
+    1|1
+    2|1
+    1|1
+    2|1
+}
+
+@cross-check-integrity
+test distinct-index-order-with-index-collation {
+    CREATE TABLE t (c TEXT COLLATE NOCASE, p1, p2, p3);
+    CREATE INDEX t_c ON t (c);
+    INSERT INTO t (c) VALUES ('a'), ('B'), ('A');
+    SELECT count(*) FROM (SELECT DISTINCT c FROM t);
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test distinct-two-aggregates-on-index {
+    CREATE TABLE t (a, b, p1, p2, p3);
+    CREATE INDEX t_ab ON t (a, b);
+    INSERT INTO t (a, b) VALUES (1, 5), (1, 6), (2, 5);
+    SELECT count(DISTINCT a), count(DISTINCT b) FROM t;
+}
+expect {
+    2|2
+}
+
+@cross-check-integrity
+test distinct-group-by-another-column {
+    CREATE TABLE t (a, b, p1, p2, p3);
+    CREATE INDEX t_ba ON t (b, a);
+    INSERT INTO t (a, b) VALUES (1, 5), (2, 6), (3, 5);
+    SELECT count(*) FROM (SELECT DISTINCT b FROM t GROUP BY a);
+}
+expect {
+    2
+}

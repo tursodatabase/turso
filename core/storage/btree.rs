@@ -383,12 +383,14 @@ enum WriteState {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
-pub(crate) enum BTreeWriteYieldPoint {
+pub enum BTreeWriteYieldPoint {
     AfterInsertOverflowCellBeforeBalance,
 }
 
 #[cfg(any(test, injected_yields))]
-pub(crate) const BTREE_WRITE_YIELD_FAMILY: u64 = 0x4254_5245_5752_4954;
+/// The yield plan family of B-tree writes. A cursor's selection key is
+/// this family XOR its root page.
+pub const BTREE_WRITE_YIELD_FAMILY: u64 = 0x4254_5245_5752_4954;
 
 #[cfg(any(test, injected_yields))]
 impl YieldPointMarker for BTreeWriteYieldPoint {
@@ -2230,7 +2232,7 @@ impl BTreeCursor {
         index_key: &ImmutableRecordRef<'_>,
         cmp: SeekOp,
     ) -> IOResultOr<()> {
-        let key_values = index_key.get_values()?;
+        let key_values = index_key.get_values_inline()?;
         let record_comparer = {
             let index_info = self
                 .index_info
@@ -2807,7 +2809,7 @@ impl BTreeCursor {
         key: &ImmutableRecordRef<'_>,
         seek_op: SeekOp,
     ) -> IOResultOr<SeekResult> {
-        let key_values = key.get_values()?;
+        let key_values = key.get_values_inline()?;
         let record_comparer = {
             let index_info = self
                 .index_info
@@ -8888,11 +8890,13 @@ impl PartialOrd for IntegrityCheckCellRange {
 /// MINIMUM_CELL_SIZE bytes, the least space any cell takes on a page (a freed cell must be
 /// able to hold a 4-byte freeblock header).
 ///
-/// Only index cells can be smaller: a one-column record of 0, 1, '' or X'' is 2 bytes, so
-/// its cell is 3. A leaf page stores such a cell padded and cell_get_raw_region reports the
-/// padded size, while a divider in the parent stores the cell's real size after its child
-/// pointer. Padding the cell whenever it is headed for a leaf keeps balancing working with
-/// one size; the record's own length prefix keeps readers from ever looking at the padding.
+/// Only leaf cells can be smaller. An index cell holding a one-column record of NULL, 0, 1, ''
+/// or X'' is 3 bytes (the record is 2), and so is a table cell with a rowid from 0 to 127 and an
+/// empty record (the temporary table of rowids an upsert wrote). A leaf page stores such a cell in
+/// a MINIMUM_CELL_SIZE slot and cell_get_raw_region reports the padded size, while an index
+/// divider in the parent stores the cell's real size after its child pointer. Padding the cell
+/// whenever it is headed for a leaf keeps balancing working with one size; the cell's own length
+/// prefix keeps readers from ever looking at the padding.
 fn ensure_min_cell_size(buf: &mut crate::alloc::Vec<u8>, cell_start: usize) {
     const ZEROS: [u8; MINIMUM_CELL_SIZE] = [0; MINIMUM_CELL_SIZE];
     let padding = (cell_start + MINIMUM_CELL_SIZE).saturating_sub(buf.len());
@@ -10353,7 +10357,7 @@ fn _insert_into_cell(
             }
         }
         let mut payload = crate::with_btree_allocation_site!(OverflowCell, payload.try_to_vec())?;
-        if page.page_type()? == PageType::IndexLeaf {
+        if matches!(page.page_type()?, PageType::IndexLeaf | PageType::TableLeaf) {
             // Balancing must see one size for every leaf cell, whether it sits on the page
             // (where cell_get_raw_region reports at least the minimum size) or overflowed.
             ensure_min_cell_size(&mut payload, 0);
@@ -10889,7 +10893,6 @@ fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
 
 #[cfg(test)]
 mod tests {
-    use crate::EngineDialect;
     use rand::{rng, Rng};
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
@@ -10901,10 +10904,6 @@ mod tests {
     use super::*;
     use crate::{
         io::{Buffer, MemoryIO, OpenFlags, IO},
-        mvcc::{
-            yield_hooks::YieldPointMarker,
-            yield_points::{YieldInjector, YieldPoint},
-        },
         schema::IndexColumn,
         storage::{
             database::DatabaseFile,
@@ -10914,19 +10913,10 @@ mod tests {
         },
         types::Text,
         vdbe::Register,
-        BufferPool, Completion, ConnectOpts, Connection, IOContext, StepResult, Wal,
-        WalAutoActions, WalFile, WalFileShared,
+        BufferPool, CheckpointMode, Completion, IOContext, SyncMode, Wal, WalAutoActions, WalFile,
+        WalFileShared,
     };
-    use std::{
-        mem::transmute,
-        ops::Deref,
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        },
-    };
-
-    use tempfile::TempDir;
+    use std::{mem::transmute, ops::Deref, sync::Arc};
 
     use crate::{
         storage::{
@@ -10934,7 +10924,7 @@ mod tests {
             sqlite3_ondisk::{BTreeCell, PageContent, PageType, TableLeafCell},
         },
         types::Value,
-        Database, Page, Pager, PlatformIO,
+        Page, Pager,
     };
 
     use super::{btree_init_page, defragment_page, drop_cell, insert_into_cell};
@@ -10952,55 +10942,6 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct TargetedYieldInjector {
-        point: YieldPoint,
-        selection_key: u64,
-        fired: AtomicBool,
-    }
-
-    impl TargetedYieldInjector {
-        fn new(point: YieldPoint, selection_key: u64) -> Arc<Self> {
-            Arc::new(Self {
-                point,
-                selection_key,
-                fired: AtomicBool::new(false),
-            })
-        }
-
-        fn fired(&self) -> bool {
-            self.fired.load(Ordering::Acquire)
-        }
-    }
-
-    impl YieldInjector for TargetedYieldInjector {
-        fn should_yield(&self, _instance_id: u64, selection_key: u64, point: YieldPoint) -> bool {
-            point == self.point
-                && selection_key == self.selection_key
-                && !self.fired.swap(true, Ordering::AcqRel)
-        }
-    }
-
-    fn btree_write_selection_key(root_page: i64) -> u64 {
-        BTREE_WRITE_YIELD_FAMILY ^ root_page as u64
-    }
-
-    fn query_single_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
-        let mut stmt = conn.prepare(sql).unwrap();
-        match stmt.step().unwrap() {
-            StepResult::Row => stmt.row().unwrap().get::<i64>(0).unwrap(),
-            other => panic!("expected a row, got {other:?}"),
-        }
-    }
-
-    fn query_single_text(conn: &Arc<Connection>, sql: &str) -> String {
-        let mut stmt = conn.prepare(sql).unwrap();
-        match stmt.step().unwrap() {
-            StepResult::Row => stmt.row().unwrap().get::<String>(0).unwrap(),
-            other => panic!("expected a row, got {other:?}"),
-        }
-    }
-
     #[allow(clippy::arc_with_non_send_sync)]
     fn get_page(id: usize) -> PageRef {
         let page = Arc::new(Page::new(id as i64));
@@ -11015,31 +10956,6 @@ mod tests {
         page
     }
 
-    /// The returned `TempDir` deletes the database directory when it drops, so
-    /// callers must hold it for as long as they use the database.
-    #[allow(clippy::arc_with_non_send_sync)]
-    fn get_database() -> (Arc<Database>, TempDir) {
-        let temp_dir = TempDir::new().unwrap();
-        let path = temp_dir.path().join("test.db");
-        {
-            let connection = rusqlite::Connection::open(&path).unwrap();
-            connection
-                .pragma_update(None, "journal_mode", "wal")
-                .unwrap();
-        }
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(EngineDialect))
-            .unwrap();
-
-        (db, temp_dir)
-    }
-
-    /// Deterministic coverage for the allocation-failure window created by routing
-    /// overflow-cell payloads through `TursoAllocator`: in
-    /// `OverwriteCellState::ClearOverflowPagesAndOverwrite`, `drop_cell` mutates the
-    /// page before `insert_into_cell`, whose overflow-cell branch can fail on
-    /// allocation. A fault there must not lose the row or corrupt the tree.
-    ///
     /// Nightly-only because on stable `crate::alloc::Vec` degrades to the global
     /// allocator, so the injected fault can never fire.
     #[cfg(all(nightly, feature = "allocation_metric"))]
@@ -11087,51 +11003,6 @@ mod tests {
 
         fn disarm_fault() {
             FAIL_SITE.with(|slot| slot.set(None));
-        }
-
-        #[test]
-        fn overwrite_survives_overflow_cell_allocation_failure() {
-            #[allow(clippy::arc_with_non_send_sync)]
-            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-            let db =
-                Database::open_file(io, "overflow-cell-fault.db", Arc::new(EngineDialect)).unwrap();
-            let conn = db.connect(crate::ConnectOpts::new()).unwrap();
-
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
-                .unwrap();
-            // Row 1 is the overwrite target; the filler rows pack the leaf page so
-            // that growing row 1 cannot fit locally and must spill to an overflow
-            // cell inside insert_into_cell.
-            conn.execute(format!("INSERT INTO t VALUES (1, '{}')", "a".repeat(600)))
-                .unwrap();
-            for id in 2..=6 {
-                conn.execute(format!(
-                    "INSERT INTO t VALUES ({id}, '{}')",
-                    "b".repeat(600)
-                ))
-                .unwrap();
-            }
-            let rows_before = query_single_i64(&conn, "SELECT count(*) FROM t");
-            assert_eq!(rows_before, 6);
-
-            arm_fault(BTreeAllocationSite::OverflowCell);
-            let update = conn.execute(format!(
-                "UPDATE t SET v = '{}' WHERE id = 1",
-                "c".repeat(1400)
-            ));
-            disarm_fault();
-            assert!(
-                update.is_err(),
-                "update should fail once the overflow-cell allocation is denied"
-            );
-
-            // The failed statement must not lose the row or corrupt the tree.
-            assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM t"), 6);
-            assert_eq!(
-                query_single_i64(&conn, "SELECT length(v) FROM t WHERE id = 1"),
-                600
-            );
-            assert_eq!(query_single_text(&conn, "PRAGMA integrity_check"), "ok");
         }
 
         /// Regression test: the overflow-read epilogue empties the payload held
@@ -11235,203 +11106,6 @@ mod tests {
         let _ = assert_overflow_cell_buffers;
     }
 
-    #[test]
-    fn wal_reuses_freelist_leaf_after_abandoned_overflowing_insert() {
-        #[allow(clippy::arc_with_non_send_sync)]
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db =
-            Database::open_file(io, "freelist-stale-overflow.db", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-
-        conn.execute("PRAGMA journal_mode = WAL").unwrap();
-        conn.execute(
-            "CREATE TABLE red_rain_308 (
-                slow_desk_238 INTEGER NOT NULL,
-                quiet_tree_398 TEXT NOT NULL,
-                smart_dog_422 REAL UNIQUE,
-                new_hill_140 TEXT,
-                light_door_957 REAL,
-                wild_dog_803 TEXT NOT NULL,
-                new_flower_28 BLOB,
-                old_fish_931 TEXT PRIMARY KEY
-            )",
-        )
-        .unwrap();
-        conn.execute(
-            "CREATE TABLE full_fish_194 (
-                brave_star_722 TEXT PRIMARY KEY,
-                hot_star_957 NUMERIC,
-                empty_chair_834 REAL
-            )",
-        )
-        .unwrap();
-
-        conn.execute(
-            "INSERT INTO red_rain_308 (
-                slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
-                light_door_957, wild_dog_803, new_flower_28, old_fish_931
-            ) VALUES (
-                1, 'seed', 0.24, 'seed', 1.0, 'seed', zeroblob(3600), 'existing_unique'
-            )",
-        )
-        .unwrap();
-        for id in 2..260 {
-            conn.execute(format!(
-                "INSERT INTO red_rain_308 (
-                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
-                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
-                ) VALUES (
-                    {id}, 'quiet_tree_{id}', {id}.0, 'new_hill_{id}',
-                    1.5, 'wild_dog_{id}', zeroblob(3600), 'seed_{id}'
-                )"
-            ))
-            .unwrap();
-        }
-
-        conn.execute("BEGIN").unwrap();
-        conn.execute("DELETE FROM red_rain_308 WHERE old_fish_931 = 'seed_2'")
-            .unwrap();
-        conn.execute("SAVEPOINT sp_91").unwrap();
-        conn.execute(
-            "INSERT INTO full_fish_194 (brave_star_722, hot_star_957, empty_chair_834)
-             VALUES ('sweet_fish_597', 328, 7.71)",
-        )
-        .unwrap();
-
-        let red_rain_root_page = query_single_i64(
-            &conn,
-            "SELECT rootpage FROM sqlite_schema
-             WHERE type = 'table' AND name = 'red_rain_308'",
-        );
-        let injector = TargetedYieldInjector::new(
-            BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance.point(),
-            btree_write_selection_key(red_rain_root_page),
-        );
-        conn.set_yield_injector(Some(injector.clone()));
-        let mut abandoned = conn
-            .prepare(
-                "INSERT INTO red_rain_308 (
-                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
-                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
-                ) VALUES (
-                    926, 'dry_hill_411', 9.24, 'blue_hill_65',
-                    7.50, 'happy_moon_474', zeroblob(7200), 'smart_rock_113'
-                )",
-            )
-            .unwrap();
-        assert!(matches!(abandoned.step().unwrap(), StepResult::Yield));
-        assert!(injector.fired());
-        abandoned.reset().unwrap();
-        drop(abandoned);
-        conn.set_yield_injector(None);
-
-        conn.execute("DELETE FROM red_rain_308 WHERE slow_desk_238 BETWEEN 2 AND 240")
-            .unwrap();
-        conn.execute("RELEASE sp_91").unwrap();
-
-        assert!(conn
-            .execute(
-                "INSERT INTO red_rain_308 (
-                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
-                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
-                ) VALUES (
-                    927, 'dry_hill_412', 0.24, 'blue_hill_66',
-                    7.50, 'happy_moon_475', x'736f66745f73746f6e655f313732', 'smart_rock_114'
-                )"
-            )
-            .is_err());
-
-        for id in 300..420 {
-            conn.execute(format!(
-                "INSERT INTO red_rain_308 (
-                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
-                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
-                ) VALUES (
-                    {id}, 'quiet_tree_{id}', {id}.0, 'new_hill_{id}',
-                    1.5, 'wild_dog_{id}', zeroblob(3600), 'reuse_{id}'
-                )"
-            ))
-            .unwrap();
-        }
-
-        conn.execute("ROLLBACK").unwrap();
-        assert_eq!(query_single_text(&conn, "PRAGMA integrity_check"), "ok");
-    }
-
-    #[test]
-    fn wal_overflowing_insert_resumes_after_yield_before_balance() {
-        #[allow(clippy::arc_with_non_send_sync)]
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db =
-            Database::open_file(io, "resume-overflow-yield.db", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-
-        conn.execute("PRAGMA journal_mode = WAL").unwrap();
-        conn.execute(
-            "CREATE TABLE red_rain_308 (
-                slow_desk_238 INTEGER NOT NULL,
-                quiet_tree_398 TEXT NOT NULL,
-                smart_dog_422 REAL UNIQUE,
-                new_hill_140 TEXT,
-                light_door_957 REAL,
-                wild_dog_803 TEXT NOT NULL,
-                new_flower_28 BLOB,
-                old_fish_931 TEXT PRIMARY KEY
-            )",
-        )
-        .unwrap();
-
-        for id in 1..260 {
-            conn.execute(format!(
-                "INSERT INTO red_rain_308 (
-                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
-                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
-                ) VALUES (
-                    {id}, 'quiet_tree_{id}', {id}.0, 'new_hill_{id}',
-                    1.5, 'wild_dog_{id}', zeroblob(3600), 'seed_{id}'
-                )"
-            ))
-            .unwrap();
-        }
-
-        let red_rain_root_page = query_single_i64(
-            &conn,
-            "SELECT rootpage FROM sqlite_schema
-             WHERE type = 'table' AND name = 'red_rain_308'",
-        );
-        let injector = TargetedYieldInjector::new(
-            BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance.point(),
-            btree_write_selection_key(red_rain_root_page),
-        );
-        conn.set_yield_injector(Some(injector.clone()));
-        let mut stmt = conn
-            .prepare(
-                "INSERT INTO red_rain_308 (
-                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
-                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
-                ) VALUES (
-                    926, 'dry_hill_411', 9.24, 'blue_hill_65',
-                    7.50, 'happy_moon_474', zeroblob(7200), 'smart_rock_113'
-                )",
-            )
-            .unwrap();
-
-        assert!(matches!(stmt.step().unwrap(), StepResult::Yield));
-        assert!(injector.fired());
-        assert!(matches!(stmt.step().unwrap(), StepResult::Done));
-        drop(stmt);
-        conn.set_yield_injector(None);
-
-        assert_eq!(
-            query_single_i64(
-                &conn,
-                "SELECT COUNT(*) FROM red_rain_308 WHERE old_fish_931 = 'smart_rock_113'",
-            ),
-            1
-        );
-        assert_eq!(query_single_text(&conn, "PRAGMA integrity_check"), "ok");
-    }
-
     fn ensure_cell(page: &mut PageContent, cell_idx: usize, payload: &[u8]) {
         let cell = page.cell_get_raw_region(cell_idx, 4096).unwrap();
         tracing::trace!("cell idx={} start={} len={}", cell_idx, cell.0, cell.1);
@@ -11445,7 +11119,7 @@ mod tests {
         pos: usize,
         page: PageRef,
         record: ImmutableRecord,
-        conn: &Arc<Connection>,
+        pager: &Arc<Pager>,
     ) -> crate::alloc::Vec<u8> {
         let mut payload: crate::alloc::Vec<u8> = crate::alloc::vec![];
         let mut fill_cell_payload_state = FillCellPayloadState::Start;
@@ -11458,11 +11132,11 @@ mod tests {
                     pos,
                     &record,
                     4096,
-                    &conn.pager.load(),
+                    pager,
                     &mut fill_cell_payload_state,
                 )
             },
-            &conn.pager.load().clone(),
+            pager,
         )
         .unwrap();
         insert_into_cell(page.get_contents(), &payload, pos, 4096).unwrap();
@@ -11502,14 +11176,13 @@ mod tests {
 
     #[test]
     fn test_insert_cell() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
         let page = get_page(2);
 
         let header_size = 8;
         let regs = &[Register::Value(Value::from_i64(1))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let payload = add_record(1, 0, page.clone(), record, &conn);
+        let payload = add_record(1, 0, page.clone(), record, &pager);
         let page_contents = page.get_contents();
         assert_eq!(page_contents.cell_count(), 1);
         let free = compute_free_space(page_contents, 4096).unwrap();
@@ -11539,8 +11212,7 @@ mod tests {
 
     #[test]
     fn test_drop_1() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -11553,7 +11225,7 @@ mod tests {
         for i in 0..3 {
             let regs = &[Register::Value(Value::from_i64(i as i64))];
             let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-            let payload = add_record(i, i, page.clone(), record, &conn);
+            let payload = add_record(i, i, page.clone(), record, &pager);
             assert_eq!(page_contents.cell_count(), i + 1);
             let free = compute_free_space(page_contents, usable_space).unwrap();
             total_size += payload.len() + 2;
@@ -11747,36 +11419,71 @@ mod tests {
         }
     }
 
-    fn empty_btree() -> (Arc<Pager>, i64, Arc<Database>, Arc<Connection>) {
-        #[allow(clippy::arc_with_non_send_sync)]
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-        let pager = conn.pager.load().clone();
+    fn empty_btree() -> (Arc<Pager>, i64) {
+        let pager = pager_of_new_database();
+        let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
+        btree_init_page(&page2, PageType::TableLeaf, 0, pager.usable_space());
+        (pager, page2.get().id() as i64)
+    }
 
-        // FIXME: handle page cache is full
-
-        // force allocate page1 with a transaction
+    /// An empty table b-tree in a database whose page 1 was allocated by its first write transaction.
+    fn empty_btree_after_first_write_tx() -> (Arc<Pager>, i64) {
+        let pager = empty_pager(4096, PageCache::default());
         pager.begin_read_tx().unwrap();
         run_until_done(
             || pager.begin_write_tx(WalAutoActions::all_enabled()),
             &pager,
         )
         .unwrap();
-        run_until_done(
-            || pager.commit_tx(&conn, conn.get_sync_mode(), true),
-            &pager,
-        )
-        .unwrap();
+        commit_tx(&pager);
 
         let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
         btree_init_page(&page2, PageType::TableLeaf, 0, pager.usable_space());
-        (pager, page2.get().id() as i64, db, conn)
+        (pager, page2.get().id() as i64)
+    }
+
+    /// A pager whose database holds only page 1.
+    fn pager_of_new_database() -> Arc<Pager> {
+        let pager = empty_pager(4096, PageCache::default());
+        run_until_done(|| pager.allocate_page1(), &pager).unwrap();
+        pager
+    }
+
+    /// A pager over an empty in-memory database file, opened without a `Database`.
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn empty_pager(page_size: u32, page_cache: PageCache) -> Arc<Pager> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+
+        let db_file = Arc::new(DatabaseFile::new(
+            io.open_file(":memory:", OpenFlags::Create, false).unwrap(),
+        ));
+
+        let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
+        let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
+        let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
+        let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
+            io.clone(),
+            wal_shared,
+            last_checksum_and_max_frame,
+            buffer_pool.clone(),
+        ));
+
+        // `allocate_page1` needs the initial page 1 to be present.
+        let shared = Arc::new(SharedPagerState::new(Some(default_page1(None))));
+        let pager =
+            Arc::new(Pager::new(db_file, Some(wal), io, page_cache, buffer_pool, shared).unwrap());
+
+        pager.io.step().unwrap();
+        pager
+            .set_initial_page_size(PageSize::new(page_size).unwrap())
+            .unwrap();
+        pager
     }
 
     #[test]
     fn exact_table_seek_uses_loaded_leaf_after_page_descent() {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
         let registers = &[Register::Value(Value::Text(Text::new("x".repeat(128))))];
         let record = ImmutableRecord::from_registers(registers, registers.len()).unwrap();
@@ -11903,11 +11610,7 @@ mod tests {
 
     #[test]
     fn btree_with_virtual_page_1() -> Result<()> {
-        #[allow(clippy::arc_with_non_send_sync)]
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-        let pager = conn.pager.load().clone();
+        let pager = empty_pager(4096, PageCache::default());
 
         let mut cursor = BTreeCursor::new(pager, 1, 5);
         let result = cursor.rewind()?;
@@ -11923,7 +11626,7 @@ mod tests {
     #[test]
     pub fn btree_test_overflow_pages_are_cleared_on_overwrite() {
         // Create a database with a table
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 5;
 
         // Get the maximum local payload size for table leaf pages
@@ -12095,7 +11798,7 @@ mod tests {
             ]
             .as_slice(),
         ] {
-            let (pager, root_page, _, _) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let num_columns = 5;
 
             let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
@@ -12163,7 +11866,7 @@ mod tests {
         let num_columns = 5;
 
         for _ in 0..attempts {
-            let (pager, root_page, _db, conn) = empty_btree();
+            let (pager, root_page) = empty_btree_after_first_write_tx();
             let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
             let mut keys = SortedVec::new();
             tracing::info!("seed: {seed}");
@@ -12217,10 +11920,7 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                pager
-                    .io
-                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
-                    .unwrap();
+                commit_tx(&pager);
                 pager.begin_read_tx().unwrap();
                 // FIXME: add sorted vector instead, should be okay for small amounts of keys for now :P, too lazy to fix right now
                 let _c = cursor.move_to_root().unwrap();
@@ -12289,7 +11989,7 @@ mod tests {
         let mut seen = crate::HashSet::default();
         tracing::info!("super seed: {}", seed);
         for _ in 0..attempts {
-            let (pager, _, _db, conn) = empty_btree();
+            let (pager, _) = empty_btree_after_first_write_tx();
             let index_root_page = pager
                 .io
                 .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
@@ -12360,10 +12060,7 @@ mod tests {
                 if let Some(c) = c {
                     pager.io.wait_for_completion(c).unwrap();
                 }
-                pager
-                    .io
-                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
-                    .unwrap();
+                commit_tx(&pager);
             }
 
             // Check that all keys can be found by seeking
@@ -12466,7 +12163,7 @@ mod tests {
         tracing::info!("super seed: {}", seed);
 
         for _ in 0..attempts {
-            let (pager, _, _db, conn) = empty_btree();
+            let (pager, _) = empty_btree_after_first_write_tx();
             let index_root_page = pager
                 .io
                 .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
@@ -12596,10 +12293,7 @@ mod tests {
                 if let Some(c) = c {
                     pager.io.wait_for_completion(c).unwrap();
                 }
-                pager
-                    .io
-                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
-                    .unwrap();
+                commit_tx(&pager);
             }
 
             // Final validation
@@ -12702,8 +12396,7 @@ mod tests {
 
     #[test]
     pub fn test_drop_odd() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -12717,7 +12410,7 @@ mod tests {
         for i in 0..total_cells {
             let regs = &[Register::Value(Value::from_i64(i as i64))];
             let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-            let payload = add_record(i, i, page.clone(), record, &conn);
+            let payload = add_record(i, i, page.clone(), record, &pager);
             assert_eq!(page_contents.cell_count(), i + 1);
             let free = compute_free_space(page_contents, usable_space).unwrap();
             total_size += payload.len() + 2;
@@ -12747,8 +12440,7 @@ mod tests {
 
     #[test]
     fn leaf_delete_balancing_prediction_matches_underflow_after_drop() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
         let usable_space = 4096;
         let mut rng = ChaCha8Rng::seed_from_u64(1700);
         let mut predicted_no_balancing = 0;
@@ -12772,7 +12464,7 @@ mod tests {
                     page_contents.cell_count(),
                     page.clone(),
                     record,
-                    &conn,
+                    &pager,
                 );
                 rowid += 1;
             }
@@ -12873,7 +12565,7 @@ mod tests {
         let (mut rng, seed) = rng_from_time_or_env();
         tracing::info!("seed: {seed}");
         for attempt in 0..8 {
-            let (pager, _, _db, conn) = empty_btree();
+            let (pager, _) = empty_btree_after_first_write_tx();
             let index_root_page = pager
                 .io
                 .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
@@ -12978,10 +12670,7 @@ mod tests {
             if let Some(c) = c {
                 pager.io.wait_for_completion(c).unwrap();
             }
-            pager
-                .io
-                .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
-                .unwrap();
+            commit_tx(&pager);
 
             // Full scan: every key must appear exactly once.
             pager.begin_read_tx().unwrap();
@@ -13068,46 +12757,41 @@ mod tests {
         btree_insert_fuzz_run(2, 5_000, |rng| (rng.next_u32() % 32 * 1024) as usize);
     }
 
-    #[allow(clippy::arc_with_non_send_sync)]
-    fn setup_test_env(database_size: u32) -> Arc<Pager> {
-        let page_size = 512;
-
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let buffer_pool = BufferPool::begin_init(&io, page_size * 128);
-
-        let db_file = Arc::new(DatabaseFile::new(
-            io.open_file(":memory:", OpenFlags::Create, false).unwrap(),
-        ));
-
-        let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
-        let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
-        let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
-        let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
-            io.clone(),
-            wal_shared,
-            last_checksum_and_max_frame,
-            buffer_pool.clone(),
-        ));
-
-        // For new empty databases, init_page_1 must be Some(page) so allocate_page1() can be called
-        let shared = Arc::new(SharedPagerState::new(Some(default_page1(None))));
-        let pager = Arc::new(
-            Pager::new(
-                db_file,
-                Some(wal),
-                io,
-                PageCache::new(10),
-                buffer_pool,
-                shared,
-            )
-            .unwrap(),
-        );
-
-        pager.io.step().unwrap();
-
+    /// Commits the write transaction of `pager`, ends its read transaction, and checkpoints
+    /// when the WAL is over the auto-checkpoint threshold, like `Pager::commit_tx` on a
+    /// connection with default settings.
+    fn commit_tx(pager: &Pager) {
+        const WAL_AUTOCHECKPOINT: u32 = 1000;
+        let wal = pager.wal().unwrap();
         pager
-            .set_initial_page_size(PageSize::new(page_size as u32).unwrap())
+            .io
+            .block(|| {
+                pager.commit_wal(
+                    WalAutoActions::all_enabled(),
+                    WAL_AUTOCHECKPOINT,
+                    SyncMode::Full,
+                    false,
+                )
+            })
             .unwrap();
+        let needs_checkpoint = wal.should_checkpoint(WAL_AUTOCHECKPOINT);
+        wal.end_write_tx();
+        wal.end_read_tx();
+        if needs_checkpoint {
+            let mode = CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            };
+            pager
+                .io
+                .block(|| pager.checkpoint(mode, SyncMode::Full, false))
+                .unwrap();
+        }
+        pager.commit_wal_end();
+        pager.clear_savepoints().unwrap();
+    }
+
+    fn setup_test_env(database_size: u32) -> Arc<Pager> {
+        let pager = empty_pager(512, PageCache::new(10));
         let _ = run_until_done(|| pager.allocate_page1(), &pager);
         for _ in 0..(database_size - 1) {
             let _res = pager.allocate_page().unwrap();
@@ -13309,7 +12993,7 @@ mod tests {
     /// equals the true cell count.
     #[test]
     fn count_survives_spill_yield_at_finalization() {
-        let (pager, root_page, _db, _conn) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let n: u16 = 7;
 
         // `count()` only reads cell_count from the header; no real cells needed.
@@ -13335,7 +13019,7 @@ mod tests {
     /// Regression test for https://github.com/tursodatabase/turso/issues/7473.
     #[test]
     fn table_leaf_oversized_cell_count_reads_corrupt_not_panic() {
-        let (pager, root_page, _db, _conn) = empty_btree();
+        let (pager, root_page) = empty_btree();
 
         let (root, _c) = pager.io.block(|| pager.read_page(root_page)).unwrap();
         while root.is_locked() {
@@ -13500,7 +13184,7 @@ mod tests {
 
     #[test]
     pub fn test_clear_btree_with_single_page() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 5;
         let record_count = 10;
 
@@ -13525,7 +13209,7 @@ mod tests {
 
     #[test]
     pub fn test_clear_btree_with_multiple_pages() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 5;
         let record_count = 1000;
 
@@ -13551,7 +13235,7 @@ mod tests {
 
     #[test]
     pub fn test_clear_btree_reinsertion() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 5;
         let record_count = 1000;
 
@@ -13598,7 +13282,7 @@ mod tests {
 
     #[test]
     pub fn test_clear_btree_multiple_cursors() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 5;
         let record_count = 1000;
 
@@ -13640,7 +13324,7 @@ mod tests {
     /// dup cursor returns the previous partition's row count.
     #[test]
     pub fn test_clear_btree_resets_count_cache() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 1;
 
         let mut cursor_main = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
@@ -13678,7 +13362,7 @@ mod tests {
     /// Verify that clear_btree() resets its own count cache, not just sibling cursors.
     #[test]
     pub fn test_clear_btree_resets_own_count_cache() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 1;
 
         let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
@@ -13710,7 +13394,7 @@ mod tests {
     /// re-traverses the btree instead of returning the stale cached value.
     #[test]
     pub fn test_insert_invalidates_count_cache() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 1;
 
         let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
@@ -13741,7 +13425,7 @@ mod tests {
     /// pages and reads left-child pointers accurately.
     #[test]
     pub fn test_btree_count_multi_level_table() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 1;
         let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
 
@@ -13775,7 +13459,7 @@ mod tests {
 
     #[test]
     pub fn test_clear_btree_with_overflow_pages() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 5;
         let record_count = 100;
 
@@ -13806,8 +13490,7 @@ mod tests {
 
     #[test]
     pub fn test_defragment() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -13820,7 +13503,7 @@ mod tests {
         for i in 0..3 {
             let regs = &[Register::Value(Value::from_i64(i as i64))];
             let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-            let payload = add_record(i, i, page.clone(), record, &conn);
+            let payload = add_record(i, i, page.clone(), record, &pager);
             assert_eq!(page_contents.cell_count(), i + 1);
             let free = compute_free_space(page_contents, usable_space).unwrap();
             total_size += payload.len() + 2;
@@ -13847,8 +13530,7 @@ mod tests {
 
     #[test]
     pub fn test_drop_odd_with_defragment() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -13862,7 +13544,7 @@ mod tests {
         for i in 0..total_cells {
             let regs = &[Register::Value(Value::from_i64(i as i64))];
             let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-            let payload = add_record(i, i, page.clone(), record, &conn);
+            let payload = add_record(i, i, page.clone(), record, &pager);
             assert_eq!(page_contents.cell_count(), i + 1);
             let free = compute_free_space(page_contents, usable_space).unwrap();
             total_size += payload.len() + 2;
@@ -13894,8 +13576,7 @@ mod tests {
 
     #[test]
     pub fn test_fuzz_drop_defragment_insert() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -13929,11 +13610,11 @@ mod tests {
                                 cell_idx,
                                 &record,
                                 4096,
-                                &conn.pager.load(),
+                                &pager,
                                 &mut fill_cell_payload_state,
                             )
                         },
-                        &conn.pager.load().clone(),
+                        &pager,
                     )
                     .unwrap();
                     if (free as usize) < payload.len() + 2 {
@@ -13978,8 +13659,7 @@ mod tests {
     pub fn test_fuzz_drop_defragment_insert_issue_1085() {
         // This test is used to demonstrate that issue at https://github.com/tursodatabase/turso/issues/1085
         // is FIXED.
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -14012,11 +13692,11 @@ mod tests {
                                     cell_idx,
                                     &record,
                                     4096,
-                                    &conn.pager.load(),
+                                    &pager,
                                     &mut fill_cell_payload_state,
                                 )
                             },
-                            &conn.pager.load().clone(),
+                            &pager,
                         )
                         .unwrap();
                         if (free as usize) < payload.len() - 2 {
@@ -14049,110 +13729,9 @@ mod tests {
         }
     }
 
-    // this test will create a tree like this:
-    // -page:2, ptr(right):4
-    // +cells:node[rowid:14, ptr(<=):3]
-    //   -page:3, ptr(right):0
-    //   +cells:leaf[rowid:11, len(payload):137, overflow:false]
-    //   -page:4, ptr(right):0
-    //   +cells:
-    #[test]
-    pub fn test_drop_page_in_balancing_issue_1203() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-
-        let queries = vec![
-"CREATE TABLE lustrous_petit (awesome_nomous TEXT,ambitious_amargi TEXT,fantastic_daniels BLOB,stupendous_highleyman TEXT,relaxed_crane TEXT,elegant_bromma INTEGER,proficient_castro BLOB,ambitious_liman TEXT,responsible_lusbert BLOB);",
-"INSERT INTO lustrous_petit VALUES ('funny_sarambi', 'hardworking_naoumov', X'666561726C6573735F68696C6C', 'elegant_iafd', 'rousing_flag', 681399778772406122, X'706572736F6E61626C655F676F6477696E6772696D6D', 'insightful_anonymous', X'706F77657266756C5F726F636861'), ('personable_holmes', 'diligent_pera', X'686F6E6573745F64696D656E73696F6E', 'energetic_raskin', 'gleaming_federasyon', -2778469859573362611, X'656666696369656E745F6769617A', 'sensible_skirda', X'66616E7461737469635F6B656174696E67'), ('inquisitive_baedan', 'brave_sphinx', X'67656E65726F75735F6D6F6E7473656E79', 'inquisitive_syndicate', 'amiable_room', 6954857961525890638, X'7374756E6E696E675F6E6965747A73636865', 'glowing_coordinator', X'64617A7A6C696E675F7365766572696E65'), ('upbeat_foxtale', 'engaging_aktimon', X'63726561746976655F6875746368696E6773', 'ample_locura', 'creative_barrett', 6413352509911171593, X'6772697070696E675F6D696E7969', 'competitive_parissi', X'72656D61726B61626C655F77696E7374616E6C6579');",
-"INSERT INTO lustrous_petit VALUES ('ambitious_berry', 'devoted_marshall', X'696E7175697369746976655F6C6172657661', 'flexible_pramen', 'outstanding_stauch', 6936508362673228293, X'6C6F76696E675F6261756572', 'charming_anonymous', X'68617264776F726B696E675F616E6E6973'), ('enchanting_cohen', 'engaging_rubel', X'686F6E6573745F70726F766F63617A696F6E65', 'humorous_robin', 'imaginative_shuzo', 4762266264295288131, X'726F7573696E675F6261796572', 'vivid_bolling', X'6F7267616E697A65645F7275696E73'), ('affectionate_resistance', 'gripping_rustamova', X'6B696E645F6C61726B696E', 'bright_boulanger', 'upbeat_ashirov', -1726815435854320541, X'61646570745F66646361', 'dazzling_tashjian', X'68617264776F726B696E675F6D6F72656C'), ('zestful_ewald', 'favorable_lewis', X'73747570656E646F75735F7368616C6966', 'bright_combustion', 'blithesome_harding', 8408539013935554176, X'62726176655F737079726F706F756C6F75', 'hilarious_finnegan', X'676976696E675F6F7267616E697A696E67'), ('blithesome_picqueray', 'sincere_william', X'636F75726167656F75735F6D69746368656C6C', 'rousing_atan', 'mirthful_katie', -429232313453215091, X'6C6F76656C795F776174616E616265', 'stupendous_mcmillan', X'666F63757365645F6B61666568'), ('incredible_kid', 'friendly_yvetot', X'706572666563745F617A697A', 'helpful_manhattan', 'shining_horrox', -4318061095860308846, X'616D626974696F75735F726F7765', 'twinkling_anarkiya', X'696D6167696E61746976655F73756D6E6572');",
-"INSERT INTO lustrous_petit VALUES ('sleek_graeber', 'approachable_ghazzawi', X'62726176655F6865776974747768697465', 'adaptable_zimmer', 'polite_cohn', -5464225138957223865, X'68756D6F726F75735F736E72', 'adaptable_igualada', X'6C6F76656C795F7A686F75'), ('imaginative_rautiainen', 'magnificent_ellul', X'73706C656E6469645F726F6361', 'responsible_brown', 'upbeat_uruguaya', -1185340834321792223, X'616D706C655F6D6470', 'philosophical_kelly', X'676976696E675F6461676865726D6172676F7369616E'), ('blithesome_darkness', 'creative_newell', X'6C757374726F75735F61706174726973', 'engaging_kids', 'charming_wark', -1752453819873942466, X'76697669645F6162657273', 'independent_barricadas', X'676C697374656E696E675F64686F6E6474'), ('productive_chardronnet', 'optimistic_karnage', X'64696C6967656E745F666F72657374', 'engaging_beggar', 'sensible_wolke', 784341549042407442, X'656E676167696E675F6265726B6F7769637A', 'blithesome_zuzenko', X'6E6963655F70726F766F63617A696F6E65');",
-"INSERT INTO lustrous_petit VALUES ('shining_sagris', 'considerate_mother', X'6F70656E5F6D696E6465645F72696F74', 'polite_laufer', 'patient_mink', 2240393952789100851, X'636F75726167656F75735F6D636D696C6C616E', 'glowing_robertson', X'68656C7066756C5F73796D6F6E6473'), ('dazzling_glug', 'stupendous_poznan', X'706572736F6E61626C655F6672616E6B73', 'open_minded_ruins', 'qualified_manes', 2937238916206423261, X'696E736967687466756C5F68616B69656C', 'passionate_borl', X'616D6961626C655F6B7570656E647561'), ('wondrous_parry', 'knowledgeable_giovanni', X'6D6F76696E675F77696E6E', 'shimmering_aberlin', 'affectionate_calhoun', 702116954493913499, X'7265736F7572636566756C5F62726F6D6D61', 'propitious_mezzagarcia', X'746563686E6F6C6F676963616C5F6E6973686974616E69');",
-"INSERT INTO lustrous_petit VALUES ('kind_room', 'hilarious_crow', X'6F70656E5F6D696E6465645F6B6F74616E7969', 'hardworking_petit', 'adaptable_zarrow', 2491343172109894986, X'70726F647563746976655F646563616C6F677565', 'willing_sindikalis', X'62726561746874616B696E675F6A6F7264616E');",
-"INSERT INTO lustrous_petit VALUES ('confident_etrebilal', 'agreeable_shifu', X'726F6D616E7469635F7363687765697A6572', 'loving_debs', 'gripping_spooner', -3136910055229112693, X'677265676172696F75735F736B726F7A6974736B79', 'ample_ontiveros', X'7175616C69666965645F726F6D616E69656E6B6F'), ('competitive_call', 'technological_egoumenides', X'6469706C6F6D617469635F6D6F6E616768616E', 'willing_stew', 'frank_neal', -5973720171570031332, X'6C6F76696E675F6465737461', 'dazzling_gambone', X'70726F647563746976655F6D656E64656C676C6565736F6E'), ('favorable_delesalle', 'sensible_atterbury', X'666169746866756C5F64617861', 'bountiful_aldred', 'marvelous_malgraith', 5330463874397264493, X'706572666563745F7765726265', 'lustrous_anti', X'6C6F79616C5F626F6F6B6368696E'), ('stellar_corlu', 'loyal_espana', X'6D6F76696E675F7A6167', 'efficient_nelson', 'qualified_shepard', 1015518116803600464, X'737061726B6C696E675F76616E6469766572', 'loving_scoffer', X'686F6E6573745F756C72696368'), ('adaptable_taylor', 'shining_yasushi', X'696D6167696E61746976655F776974746967', 'alluring_blackmore', 'zestful_coeurderoy', -7094136731216188999, X'696D6167696E61746976655F757A63617465677569', 'gleaming_hernandez', X'6672616E6B5F646F6D696E69636B'), ('competitive_luis', 'stellar_fredericks', X'616772656561626C655F6D696368656C', 'optimistic_navarro', 'funny_hamilton', 4003895682491323194, X'6F70656E5F6D696E6465645F62656C6D6173', 'incredible_thorndycraft', X'656C6567616E745F746F6C6B69656E'), ('remarkable_parsons', 'sparkling_ulrich', X'737061726B6C696E675F6D6172696E636561', 'technological_leighlais', 'warmhearted_konok', -5789111414354869563, X'676976696E675F68657272696E67', 'adept_dabtara', X'667269656E646C795F72617070');",
-"INSERT INTO lustrous_petit VALUES ('hardworking_norberg', 'approachable_winter', X'62726176655F68617474696E6768', 'imaginative_james', 'open_minded_capital', -5950508516718821688, X'6C757374726F75735F72616E7473', 'warmhearted_limanov', X'696E736967687466756C5F646F637472696E65'), ('generous_shatz', 'generous_finley', X'726176697368696E675F6B757A6E6574736F76', 'stunning_arrigoni', 'favorable_volcano', -8442328990977069526, X'6D6972746866756C5F616C7467656C64', 'thoughtful_zurbrugg', X'6D6972746866756C5F6D6F6E726F65'), ('frank_kerr', 'splendid_swain', X'70617373696F6E6174655F6D6470', 'flexible_dubey', 'sensible_tj', 6352949260574274181, X'656666696369656E745F6B656D736B79', 'vibrant_ege', X'736C65656B5F6272696768746F6E'), ('organized_neal', 'glistening_sugar', X'656E676167696E675F6A6F72616D', 'romantic_krieger', 'qualified_corr', -4774868512022958085, X'706572666563745F6B6F7A6172656B', 'bountiful_zaikowska', X'74686F7567687466756C5F6C6F6767616E73'), ('excellent_lydiettcarrion', 'diligent_denslow', X'666162756C6F75735F6D616E68617474616E', 'confident_tomar', 'glistening_ligt', -1134906665439009896, X'7175616C69666965645F6F6E6B656E', 'remarkable_anarkiya', X'6C6F79616C5F696E64616261'), ('passionate_melis', 'loyal_xsilent', X'68617264776F726B696E675F73637564', 'lustrous_barnes', 'nice_sugako', -4097897163377829983, X'726F6D616E7469635F6461686572', 'bright_imrie', X'73656E7369626C655F6D61726B'), ('giving_mlb', 'breathtaking_fourier', X'736C65656B5F616E61726368697374', 'glittering_malet', 'brilliant_crew', 8791228049111405793, X'626F756E746966756C5F626576656E736565', 'lovely_swords', X'70726F706974696F75735F696E656469746173'), ('honest_wright', 'qualified_rabble', X'736C65656B5F6D6172656368616C', 'shimmering_marius', 'blithesome_mckelvie', -1330737263592370654, X'6F70656E5F6D696E6465645F736D616C6C', 'energetic_gorman', X'70726F706974696F75735F6B6F74616E7969');",
-"DELETE FROM lustrous_petit WHERE (ambitious_liman > 'adept_dabtaqu');",
-"INSERT INTO lustrous_petit VALUES ('technological_dewey', 'fabulous_st', X'6F7074696D69737469635F73687562', 'considerate_levy', 'adaptable_kernis', 4195134012457716562, X'61646570745F736F6C6964617269646164', 'vibrant_crump', X'6C6F79616C5F72796E6572'), ('super_marjan', 'awesome_gethin', X'736C65656B5F6F737465727765696C', 'diplomatic_loidl', 'qualified_bokani', -2822676417968234733, X'6272696768745F64756E6C6170', 'creative_en', X'6D6972746866756C5F656C6F6666'), ('philosophical_malet', 'unique_garcia', X'76697669645F6E6F7262657267', 'spellbinding_fire', 'faithful_barringtonbush', -7293711848773657758, X'6272696C6C69616E745F6F6B65656665', 'gripping_guillon', X'706572736F6E61626C655F6D61726C696E7370696B65'), ('thoughtful_morefus', 'lustrous_rodriguez', X'636F6E666964656E745F67726F73736D616E726F73686368696E', 'devoted_jackson', 'propitious_karnage', -7802999054396485709, X'63617061626C655F64', 'enchanting_orwell', X'7477696E6B6C696E675F64616C616B6F676C6F75'), ('alluring_guillon', 'brilliant_pinotnoir', X'706572736F6E61626C655F6A6165636B6C65', 'open_minded_azeez', 'courageous_romania', 2126962403055072268, X'746563686E6F6C6F676963616C5F6962616E657A', 'open_minded_rosa', X'6C757374726F75735F6575726F7065'), ('courageous_kolokotronis', 'inquisitive_gahman', X'677265676172696F75735F626172726574', 'ambitious_shakur', 'fantastic_apatris', -1232732971861520864, X'737061726B6C696E675F7761746368', 'captivating_clover', X'636F6E666964656E745F736574686E65737363617374726F'), ('charming_sullivan', 'focused_congress', X'7368696D6D6572696E675F636C7562', 'wondrous_skrbina', 'giving_mendanlioglu', -6837337053772308333, X'636861726D696E675F73616C696E6173', 'rousing_hedva', X'6469706C6F6D617469635F7061796E');",
-        ];
-
-        for query in queries {
-            let mut stmt = conn.query(query).unwrap().unwrap();
-            loop {
-                let row = stmt.step().expect("step");
-                match row {
-                    StepResult::Done => {
-                        break;
-                    }
-                    _ => {
-                        tracing::debug!("row {:?}", row);
-                    }
-                }
-            }
-        }
-    }
-
-    // this test will create a tree like this:
-    // -page:2, ptr(right):3
-    // +cells:
-    //   -page:3, ptr(right):0
-    //   +cells:
-    #[test]
-    pub fn test_drop_page_in_balancing_issue_1203_2() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-
-        let queries = vec![
-"CREATE TABLE super_becky (engrossing_berger BLOB,plucky_chai BLOB,mirthful_asbo REAL,bountiful_jon REAL,competitive_petit REAL,engrossing_rexroth REAL);",
-"INSERT INTO super_becky VALUES (X'636861726D696E675F6261796572', X'70726F647563746976655F70617269737369', 6847793643.408741, 7330361375.924953, -6586051582.891455, -6921021872.711397), (X'657863656C6C656E745F6F7267616E697A696E67', X'6C757374726F75735F73696E64696B616C6973', 9905774996.48619, 570325205.2246342, 5852346465.53047, 728566012.1968269), (X'7570626561745F73656174746C65', X'62726176655F6661756E', -2202725836.424899, 5424554426.388281, 2625872085.917082, -6657362503.808359), (X'676C6F77696E675F6D617877656C6C', X'7761726D686561727465645F726F77616E', -9610936969.793116, 4886606277.093559, -3414536174.7928505, 6898267795.317778), (X'64796E616D69635F616D616E', X'7374656C6C61725F7374657073', 3918935692.153696, 151068445.947237, 4582065669.356403, -3312668220.4789667), (X'64696C6967656E745F64757272757469', X'7175616C69666965645F6D726163686E696B', 5527271629.262201, 6068855126.044355, 289904657.13490677, 2975774820.0877323), (X'6469706C6F6D617469635F726F76657363696F', X'616C6C7572696E675F626F7474696369', 9844748192.66119, -6180276383.305578, -4137330511.025565, -478754566.79494476), (X'776F6E64726F75735F6173686572', X'6465766F7465645F6176657273696F6E', 2310211470.114773, -6129166761.628184, -2865371645.3145514, 7542428654.8645935), (X'617070726F61636861626C655F6B686F6C61', X'6C757374726F75735F6C696E6E656C6C', -4993113161.458349, 7356727284.362968, -3228937035.568404, -1779334005.5067253);",
-"INSERT INTO super_becky VALUES (X'74686F7567687466756C5F726576696577', X'617765736F6D655F63726F73736579', 9401977997.012783, 8428201961.643898, 2822821303.052643, 4555601220.718847), (X'73706563746163756C61725F6B686179617469', X'616772656561626C655F61646F6E696465', 7414547022.041355, 365016845.73330307, 50682963.055828094, -9258802584.962656), (X'6C6F79616C5F656D6572736F6E', X'676C6F77696E675F626174616C6F', -5522070106.765736, 2712536599.6384163, 6631385631.869345, 1242757880.7583427), (X'68617264776F726B696E675F6F6B656C6C79', X'666162756C6F75735F66696C697373', 6682622809.9778805, 4233900041.917185, 9017477903.795563, -756846353.6034946), (X'68617264776F726B696E675F626C61756D616368656E', X'616666656374696F6E6174655F6B6F736D616E', -1146438175.3174362, -7545123696.438596, -6799494012.403366, 5646913977.971333), (X'66616E7461737469635F726F77616E', X'74686F7567687466756C5F7465727269746F72696573', -4414529784.916277, -6209371635.279242, 4491104121.288605, 2590223842.117277);",
-"INSERT INTO super_becky VALUES (X'676C697374656E696E675F706F72746572', X'696E7175697369746976655F656D', 2986144164.3676434, 3495899172.5935287, -849280584.9386635, 6869709150.2699375), (X'696D6167696E61746976655F6D65726C696E6F', X'676C6F77696E675F616B74696D6F6E', 8733490615.829357, 6782649864.719433, 6926744218.74107, 1532081022.4379768), (X'6E6963655F726F73736574', X'626C69746865736F6D655F66696C697373', -839304300.0706863, 6155504968.705227, -2951592321.950267, -6254186334.572437), (X'636F6E666964656E745F6C69626574', X'676C696D6D6572696E675F6B6F74616E7969', -5344675223.37533, -8703794729.211002, 3987472096.020382, -7678989974.961197), (X'696D6167696E61746976655F6B61726162756C7574', X'64796E616D69635F6D6367697272', 2028227065.6995697, -7435689525.030833, 7011220815.569796, 5526665697.213846), (X'696E7175697369746976655F636C61726B', X'616666656374696F6E6174655F636C6561766572', 3016598350.546356, -3686782925.383732, 9671422351.958004, 9099319829.078941), (X'63617061626C655F746174616E6B61', X'696E6372656469626C655F6F746F6E6F6D61', 6339989259.432795, -8888997534.102034, 6855868409.475763, -2565348887.290493), (X'676F7267656F75735F6265726E657269', X'65647563617465645F6F6D6F77616C69', 6992467657.527826, -3538089391.748543, -7103111660.146708, 4019283237.3740463), (X'616772656561626C655F63756C74757265', X'73706563746163756C61725F657370616E61', 189387871.06959534, 6211851191.361202, 1786455196.9768047, 7966404387.318119);",
-"INSERT INTO super_becky VALUES (X'7068696C6F736F70686963616C5F6C656967686C616973', X'666162756C6F75735F73656D696E61746F7265', 8688321500.141502, -7855144036.024546, -5234949709.573349, -9937638367.366447), (X'617070726F61636861626C655F726F677565', X'676C65616D696E675F6D7574696E79', -5351540099.744092, -3614025150.9013805, -2327775310.276925, 2223379997.077526), (X'676C696D6D6572696E675F63617263686961', X'696D6167696E61746976655F61737379616E6E', 4104832554.8371887, -5531434716.627781, 1652773397.4099865, 3884980522.1830273);",
-"DELETE FROM super_becky WHERE (plucky_chai != X'7761726D686561727465645F6877616E67' AND mirthful_asbo != 9537234687.183533 AND bountiful_jon = -3538089391.748543);",
-"INSERT INTO super_becky VALUES (X'706C75636B795F6D617263616E74656C', X'696D6167696E61746976655F73696D73', 9535651632.375484, 92270815.0720501, 1299048084.6248207, 6460855331.572151), (X'726F6D616E7469635F706F746C61746368', X'68756D6F726F75735F63686165686F', 9345375719.265533, 7825332230.247925, -7133157299.39028, -6939677879.6597), (X'656666696369656E745F6261676E696E69', X'63726561746976655F67726168616D', -2615470560.1954746, 6790849074.977201, -8081732985.448849, -8133707792.312794), (X'677265676172696F75735F73637564', X'7368696E696E675F67726F7570', -7996394978.2610035, -9734939565.228964, 1108439333.8481388, -5420483517.169478), (X'6C696B61626C655F6B616E6176616C6368796B', X'636F75726167656F75735F7761726669656C64', -1959869609.656724, 4176668769.239971, -8423220404.063669, 9987687878.685959), (X'657863656C6C656E745F68696C6473646F74746572', X'676C6974746572696E675F7472616D7564616E61', -5220160777.908238, 3892402687.8826714, 9803857762.617172, -1065043714.0265541), (X'6D61676E69666963656E745F717565657273', X'73757065725F717565657273', -700932053.2006226, -4706306995.253335, -5286045811.046467, 1954345265.5250092), (X'676976696E675F6275636B65726D616E6E', X'667269656E646C795F70697A7A6F6C61746F', -2186859620.9089565, -6098492099.446075, -7456845586.405931, 8796967674.444252);",
-"DELETE FROM super_becky WHERE TRUE;",
-"INSERT INTO super_becky VALUES (X'6F7074696D69737469635F6368616E69616C', X'656E657267657469635F6E65677261', 1683345860.4208698, 4163199322.9289455, -4192968616.7868404, -7253371206.571701), (X'616C6C7572696E675F686176656C', X'7477696E6B6C696E675F626965627579636B', -9947019174.287437, 5975899640.893995, 3844707723.8570194, -9699970750.513876), (X'6F7074696D69737469635F7A686F75', X'616D626974696F75735F636F6E6772657373', 4143738484.1081524, -2138255286.170598, 9960750454.03466, 5840575852.80299), (X'73706563746163756C61725F6A6F6E67', X'73656E7369626C655F616269646F72', -1767611042.9716015, -7684260477.580351, 4570634429.188147, -9222640121.140202), (X'706F6C6974655F6B657272', X'696E736967687466756C5F63686F646F726B6F6666', -635016769.5123329, -4359901288.494518, -7531565119.905825, -1180410948.6572971), (X'666C657869626C655F636F6D756E69656C6C6F', X'6E6963655F6172636F73', 8708423014.802425, -6276712625.559328, -771680766.2485523, 8639486874.113342);",
-"DELETE FROM super_becky WHERE (mirthful_asbo < 9730384310.536528 AND plucky_chai < X'6E6963655F61726370B2');",
-"DELETE FROM super_becky WHERE (mirthful_asbo > 6248699554.426553 AND bountiful_jon > 4124481472.333034);",
-"INSERT INTO super_becky VALUES (X'676C696D6D6572696E675F77656C7368', X'64696C6967656E745F636F7262696E', 8217054003.369003, 8745594518.77864, 1928172803.2261295, -8375115534.050233), (X'616772656561626C655F6463', X'6C6F76696E675F666F72656D616E', -5483889804.871533, -8264576639.127487, 4770567289.404846, -3409172927.2573576), (X'6D617276656C6F75735F6173696D616B6F706F756C6F73', X'746563686E6F6C6F676963616C5F6A61637175696572', 2694858779.206814, -1703227425.3442516, -4504989231.263319, -3097265869.5230227), (X'73747570656E646F75735F64757075697364657269', X'68696C6172696F75735F6D75697268656164', 568174708.66469, -4878260547.265669, -9579691520.956625, 73507727.8100338), (X'626C69746865736F6D655F626C6F6B', X'61646570745F6C65696572', 7772117077.916897, 4590608571.321514, -881713470.657032, -9158405774.647465);",
-"INSERT INTO super_becky VALUES (X'6772697070696E675F6573736578', X'67656E65726F75735F636875726368696C6C', -4180431825.598956, 7277443000.677654, 2499796052.7878246, -2858339306.235305), (X'756E697175655F6D6172656368616C', X'62726561746874616B696E675F636875726368696C6C', 1401354536.7625294, -611427440.2796707, -4621650430.463729, 1531473111.7482872), (X'657863656C6C656E745F66696E6C6579', X'666169746866756C5F62726F636B', -4020697828.0073624, -2833530733.19637, -7766170050.654022, 8661820959.434689);",
-"INSERT INTO super_becky VALUES (X'756E697175655F6C617061797265', X'6C6F76696E675F7374617465', 7063237787.258968, -5425712581.365798, -7750509440.0141945, -7570954710.892544), (X'62726561746874616B696E675F6E65616C', X'636F75726167656F75735F61727269676F6E69', 289862394.2028198, 9690362375.014446, -4712463267.033899, 2474917855.0973473), (X'7477696E6B6C696E675F7368616B7572', X'636F75726167656F75735F636F6D6D6974746565', 5449035403.229155, -2159678989.597906, 3625606019.1150894, -3752010405.4475393);",
-"INSERT INTO super_becky VALUES (X'70617373696F6E6174655F73686970776179', X'686F6E6573745F7363687765697A6572', 4193384746.165228, -2232151704.896323, 8615245520.962444, -9789090953.995636);",
-"INSERT INTO super_becky VALUES (X'6C696B61626C655F69', X'6661766F7261626C655F6D626168', 6581403690.769894, 3260059398.9544716, -407118859.046051, -3155853965.2700634), (X'73696E636572655F6F72', X'616772656561626C655F617070656C6261756D', 9402938544.308651, -7595112171.758331, -7005316716.211025, -8368210960.419411);",
-"INSERT INTO super_becky VALUES (X'6D617276656C6F75735F6B61736864616E', X'6E6963655F636F7272', -5976459640.85817, -3177550476.2092276, 2073318650.736992, -1363247319.9978447);",
-"INSERT INTO super_becky VALUES (X'73706C656E6469645F6C616D656E646F6C61', X'677265676172696F75735F766F6E6E65677574', 6898259773.050102, 8973519699.707073, -25070632.280548096, -1845922497.9676847), (X'617765736F6D655F7365766572', X'656E657267657469635F706F746C61746368', -8750678407.717808, 5130907533.668898, -6778425327.111566, 3718982135.202587);",
-"INSERT INTO super_becky VALUES (X'70726F706974696F75735F6D616C617465737461', X'657863656C6C656E745F65766572657474', -8846855772.62094, -6168969732.697067, -8796372709.125793, 9983557891.544613), (X'73696E636572655F6C6177', X'696E7175697369746976655F73616E647374726F6D', -6366985697.975358, 3838628702.6652164, 3680621713.3371124, -786796486.8049564), (X'706F6C6974655F676C6561736F6E', X'706C75636B795F677579616E61', -3987946379.104308, -2119148244.413993, -1448660343.6888638, -1264195510.1611118), (X'676C6974746572696E675F6C6975', X'70657273697374656E745F6F6C6976696572', 6741779968.943846, -3239809989.227495, -1026074003.5506897, 4654600514.871752);",
-"DELETE FROM super_becky WHERE (engrossing_berger < X'6566651A3C70278D4E200657551D8071A1' AND competitive_petit > 1236742147.9451914);",
-"INSERT INTO super_becky VALUES (X'6661766F7261626C655F726569746D616E', X'64657465726D696E65645F726974746572', -7412553243.829927, -7572665195.290464, 7879603411.222157, 3706943306.5691853), (X'70657273697374656E745F6E6F6C616E', X'676C6974746572696E675F73686570617264', 7028261282.277422, -2064164782.3494844, -5244048504.507779, -2399526243.005843), (X'6B6E6F776C6564676561626C655F70617474656E', X'70726F66696369656E745F726F7365627261756768', 3713056763.583538, 3919834206.566164, -6306779387.430006, -9939464323.995546), (X'616461707461626C655F7172757A', X'696E7175697369746976655F68617261776179', 6519349690.299835, -9977624623.820414, 7500579325.440605, -8118341251.362242);",
-"INSERT INTO super_becky VALUES (X'636F6E73696465726174655F756E696F6E', X'6E6963655F6573736578', -1497385534.8720198, 9957688503.242973, 9191804202.566128, -179015615.7117195), (X'666169746866756C5F626F776C656773', X'6361707469766174696E675F6D6367697272', 893707300.1576138, 3381656294.246702, 6884723724.381908, 6248331214.701559), (X'6B6E6F776C6564676561626C655F70656E6E61', X'6B696E645F616A697468', -3335162603.6574974, 1812878172.8505402, 5115606679.658335, -5690100280.808182), (X'617765736F6D655F77696E7374616E6C6579', X'70726F706974696F75735F6361726173736F', -7395576292.503981, 4956546102.029215, -1468521769.7486448, -2968223925.60355), (X'636F75726167656F75735F77617266617265', X'74686F7567687466756C5F7361707068697265', 7052982930.566017, -9806098174.104418, -6910398936.377775, -4041963031.766964), (X'657863656C6C656E745F6B62', X'626C69746865736F6D655F666F75747A6F706F756C6F73', 6142173202.994768, 5193126957.544125, -7522202722.983735, -1659088056.594862), (X'7374756E6E696E675F6E6576616461', X'626F756E746966756C5F627572746F6E', -3822097036.7628613, -3458840259.240303, 2544472236.86788, 6928890176.466003);",
-"INSERT INTO super_becky VALUES (X'706572736F6E61626C655F646D69747269', X'776F6E64726F75735F6133796F', 2651932559.0077076, 811299402.3174248, -8271909238.671928, 6761098864.189909);",
-"INSERT INTO super_becky VALUES (X'726F7573696E675F6B6C6166657461', X'64617A7A6C696E675F6B6E617070', 9370628891.439335, -5923332007.253168, -2763161830.5880013, -9156194881.875952), (X'656666696369656E745F6C6576656C6C6572', X'616C6C7572696E675F706561636F7474', 3102641409.8314342, 2838360181.628153, 2466271662.169607, 1015942181.844162), (X'6469706C6F6D617469635F7065726B696E73', X'726F7573696E675F6172616269', -1551071129.022499, -8079487600.186886, 7832984580.070087, -6785993247.895652), (X'626F756E746966756C5F6D656D62657273', X'706F77657266756C5F70617269737369', 9226031830.72445, 7012021503.536997, -2297349030.108919, -2738320055.4710903), (X'676F7267656F75735F616E6172636F7469636F', X'68656C7066756C5F7765696C616E64', -8394163480.676959, -2978605095.699134, -6439355448.021704, 9137308022.281273), (X'616666656374696F6E6174655F70726F6C65696E666F', X'706C75636B795F73616E7A', 3546758708.3524914, -1870964264.9353771, 338752565.3643894, -3908023657.299715), (X'66756E6E795F706F70756C61697265', X'6F75747374616E64696E675F626576696E67746F6E', -1533858145.408224, 6164225076.710373, 8419445987.622173, 584555253.6852646), (X'76697669645F6D7474', X'7368696D6D6572696E675F70616F6E65737361', 5512251366.193035, -8680583180.123213, -4445968638.153208, -3274009935.4229546);",
-"INSERT INTO super_becky VALUES (X'7068696C6F736F70686963616C5F686F7264', X'657863656C6C656E745F67757373656C7370726F757473', -816909447.0240917, -3614686681.8786583, 7701617524.26067, -4541962047.183721), (X'616D6961626C655F69676E6174696576', X'6D61676E69666963656E745F70726F76696E6369616C69', -1318532883.847702, -4918966075.976474, -7601723171.33518, -3515747704.3847466), (X'70726F66696369656E745F32303137', X'66756E6E795F6E77', -1264540201.518032, 8227396547.578808, 6245093925.183641, -8368355328.110817);",
-"INSERT INTO super_becky VALUES (X'77696C6C696E675F6E6F6B6B65', X'726F6D616E7469635F677579616E61', 6618610796.3707695, -3814565359.1524105, 1663106272.4565296, -4175107840.768817), (X'72656C617865645F7061766C6F76', X'64657465726D696E65645F63686F646F726B6F6666', -3350029338.034504, -3520837855.4619064, 3375167499.631817, -8866806483.714607), (X'616D706C655F67696464696E6773', X'667269656E646C795F6A6F686E', 1458864959.9942684, 1344208968.0486107, 9335156635.91314, -6180643697.918882), (X'72656C617865645F6C65726F79', X'636F75726167656F75735F6E6F72646772656E', -5164986537.499656, 8820065797.720875, 6146530425.891005, 6949241471.958189), (X'666F63757365645F656D6D61', X'696D6167696E61746976655F6C6F6E67', -9587619060.80035, 6128068142.184402, 6765196076.956905, 800226302.7983418);",
-"INSERT INTO super_becky VALUES (X'616D626974696F75735F736F6E67', X'706572666563745F6761686D616E', 4989979180.706432, -9374266591.537058, 314459621.2820797, -3200029490.9553604), (X'666561726C6573735F626C6174', X'676C697374656E696E675F616374696F6E', -8512203612.903147, -7625581186.013805, -9711122307.234787, -301590929.32751083), (X'617765736F6D655F6669646573', X'666169746866756C5F63756E6E696E6768616D', -1428228887.9205084, 7669883854.400173, 5604446195.905277, -1509311057.9653416), (X'68756D6F726F75735F77697468647261776E', X'62726561746874616B696E675F7472617562656C', -7292778713.676636, -6728132503.529593, 2805341768.7252483, 330416975.2300949);",
-"INSERT INTO super_becky VALUES (X'677265676172696F75735F696873616E', X'7374656C6C61725F686172746D616E', 8819210651.1988, 5298459883.813452, 7293544377.958424, 460475869.72971725), (X'696E736967687466756C5F62657765726E69747A', X'676C65616D696E675F64656E736C6F77', -6911957282.193239, 1754196756.2193146, -6316860403.693853, -3094020672.236368), (X'6D6972746866756C5F616D6265727261656B656C6C79', X'68756D6F726F75735F6772617665', 1785574023.0269203, -372056983.82761574, 4133719439.9538956, 9374053482.066044), (X'76697669645F736169747461', X'7761726D686561727465645F696E656469746173', 2787071361.6099434, 9663839418.553448, -5934098589.901047, -9774745509.608858), (X'61646570745F6F6375727279', X'6C696B61626C655F726569746D616E', -3098540915.1310825, 5460848322.672174, -6012867197.519758, 6769770087.661135), (X'696E646570656E64656E745F6F', X'656C6567616E745F726F6F726461', 1462542860.3143978, 3360904654.2464733, 5458876201.665213, -5522844849.529962), (X'72656D61726B61626C655F626F6B616E69', X'6F70656E5F6D696E6465645F686F72726F78', 7589481760.867031, 7970075121.546291, 7513467575.5213585, 9663061478.289227), (X'636F6E666964656E745F6C616479', X'70617373696F6E6174655F736B726F7A6974736B79', 8266917234.53915, -7172933478.625412, 309854059.94031143, -8309837814.497616);",
-"DELETE FROM super_becky WHERE (competitive_petit != 8725256604.165474 OR engrossing_rexroth > -3607424615.7839313 OR plucky_chai < X'726F7573696E675F6216E20375');",
-"INSERT INTO super_becky VALUES (X'7368696E696E675F736F6C69646169726573', X'666561726C6573735F63617264616E', -170727879.20838165, 2744601113.384678, 5676912434.941502, 6757573601.657997), (X'636F75726167656F75735F706C616E636865', X'696E646570656E64656E745F636172736F6E', -6271723086.761938, -180566679.7470188, -1285774632.134449, 1359665735.7842407), (X'677265676172696F75735F7374616D61746F76', X'7374756E6E696E675F77696C64726F6F7473', -6210238866.953484, 2492683045.8287067, -9688894361.68205, 5420275482.048567), (X'696E646570656E64656E745F6F7267616E697A6572', X'676C6974746572696E675F736F72656C', 9291163783.3073, -6843003475.769236, -1320245894.772686, -5023483808.044955), (X'676C6F77696E675F6E65736963', X'676C65616D696E675F746F726D6579', 829526382.8027191, 9365690945.1316, 4761505764.826195, -4149154965.0024815), (X'616C6C7572696E675F646F637472696E65', X'6E6963655F636C6561766572', 3896644979.981762, -288600448.8016701, 9462856570.130062, -909633752.5993862);",
-        ];
-
-        for query in queries {
-            let mut stmt = conn.query(query).unwrap().unwrap();
-            loop {
-                let row = stmt.step().expect("step");
-                match row {
-                    StepResult::Done => {
-                        break;
-                    }
-                    _ => {
-                        tracing::debug!("row {:?}", row);
-                    }
-                }
-            }
-        }
-    }
-
     #[test]
     pub fn test_free_space() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
         let page = get_page(2);
 
         let page_contents = page.get_contents();
@@ -14161,7 +13740,7 @@ mod tests {
 
         let regs = &[Register::Value(Value::from_i64(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let payload = add_record(0, 0, page.clone(), record, &conn);
+        let payload = add_record(0, 0, page.clone(), record, &pager);
         let free = compute_free_space(page_contents, usable_space).unwrap();
         assert_eq!(free, 4096 - payload.len() - 2 - header_size);
     }
@@ -14208,10 +13787,54 @@ mod tests {
         );
     }
 
+    /// A table leaf cell can be 3 bytes too: a rowid from 0 to 127 and an empty record, as in the
+    /// temporary table of rowids an upsert wrote. When such a cell overflows a full leaf it must
+    /// be padded to MINIMUM_CELL_SIZE, as it would be on the page, or balancing counts and checks
+    /// a cell shorter than any cell on a page.
+    #[test]
+    pub fn test_tiny_cell_overflowing_a_leaf_is_padded() {
+        for page_type in [PageType::TableLeaf, PageType::IndexLeaf] {
+            let page = get_page(2);
+            btree_init_page(&page, page_type, 0, 4096);
+            let contents = page.get_contents();
+            let usable_space = 4096;
+
+            // 681 six-byte slots (a four-byte cell and its pointer) fill 4086 of the 4088 free
+            // bytes. insert_into_cell doesn't read the cells, so one cell repeated will do.
+            let four_byte_cell = [0x02, 0x05, 0x01, 0x00];
+            for i in 0..681 {
+                insert_into_cell(contents, &four_byte_cell, i, usable_space).unwrap();
+            }
+            assert_eq!(compute_free_space(contents, usable_space).unwrap(), 2);
+            let three_byte_cell = [0x01, 0x01, 0x01];
+            insert_into_cell(contents, &three_byte_cell, 681, usable_space).unwrap();
+
+            assert_eq!(
+                contents.overflow_cells.len(),
+                1,
+                "{page_type:?}: the cell overflows"
+            );
+            let overflowed = &contents.overflow_cells[0].payload;
+            assert_eq!(
+                overflowed.len(),
+                MINIMUM_CELL_SIZE,
+                "{page_type:?}: the overflowed cell is padded"
+            );
+            assert_eq!(
+                &overflowed[..3],
+                &three_byte_cell,
+                "{page_type:?}: the cell's bytes are kept"
+            );
+            assert_eq!(
+                overflowed[3], 0,
+                "{page_type:?}: the padding is a zero byte"
+            );
+        }
+    }
+
     #[test]
     pub fn test_defragment_1() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -14220,7 +13843,7 @@ mod tests {
 
         let regs = &[Register::Value(Value::from_i64(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let payload = add_record(0, 0, page.clone(), record, &conn);
+        let payload = add_record(0, 0, page.clone(), record, &pager);
 
         assert_eq!(page_contents.cell_count(), 1);
         defragment_page(page_contents, usable_space, 4).unwrap();
@@ -14232,8 +13855,7 @@ mod tests {
 
     #[test]
     pub fn test_insert_drop_insert() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -14245,7 +13867,7 @@ mod tests {
             Register::Value(Value::Text(Text::new("aaaaaaaa"))),
         ];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let _ = add_record(0, 0, page.clone(), record, &conn);
+        let _ = add_record(0, 0, page.clone(), record, &pager);
 
         assert_eq!(page_contents.cell_count(), 1);
         drop_cell(page_contents, 0, usable_space).unwrap();
@@ -14253,7 +13875,7 @@ mod tests {
 
         let regs = &[Register::Value(Value::from_i64(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let payload = add_record(0, 0, page.clone(), record, &conn);
+        let payload = add_record(0, 0, page.clone(), record, &pager);
         assert_eq!(page_contents.cell_count(), 1);
 
         let (start, len) = page_contents.cell_get_raw_region(0, usable_space).unwrap();
@@ -14263,8 +13885,7 @@ mod tests {
 
     #[test]
     pub fn test_insert_drop_insert_multiple() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -14276,7 +13897,7 @@ mod tests {
             Register::Value(Value::Text(Text::new("aaaaaaaa"))),
         ];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let _ = add_record(0, 0, page.clone(), record, &conn);
+        let _ = add_record(0, 0, page.clone(), record, &pager);
 
         for _ in 0..100 {
             assert_eq!(page_contents.cell_count(), 1);
@@ -14285,7 +13906,7 @@ mod tests {
 
             let regs = &[Register::Value(Value::from_i64(0))];
             let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-            let payload = add_record(0, 0, page.clone(), record, &conn);
+            let payload = add_record(0, 0, page.clone(), record, &pager);
             assert_eq!(page_contents.cell_count(), 1);
 
             let (start, len) = page_contents.cell_get_raw_region(0, usable_space).unwrap();
@@ -14296,8 +13917,7 @@ mod tests {
 
     #[test]
     pub fn test_drop_a_few_insert() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -14306,13 +13926,13 @@ mod tests {
 
         let regs = &[Register::Value(Value::from_i64(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let payload = add_record(0, 0, page.clone(), record, &conn);
+        let payload = add_record(0, 0, page.clone(), record, &pager);
         let regs = &[Register::Value(Value::from_i64(1))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let _ = add_record(1, 1, page.clone(), record, &conn);
+        let _ = add_record(1, 1, page.clone(), record, &pager);
         let regs = &[Register::Value(Value::from_i64(2))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let _ = add_record(2, 2, page.clone(), record, &conn);
+        let _ = add_record(2, 2, page.clone(), record, &pager);
 
         drop_cell(page_contents, 1, usable_space).unwrap();
         drop_cell(page_contents, 1, usable_space).unwrap();
@@ -14322,8 +13942,7 @@ mod tests {
 
     #[test]
     pub fn test_fuzz_victim_1() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -14332,37 +13951,36 @@ mod tests {
 
         let regs = &[Register::Value(Value::from_i64(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let _ = add_record(0, 0, page.clone(), record, &conn);
+        let _ = add_record(0, 0, page.clone(), record, &pager);
 
         let regs = &[Register::Value(Value::from_i64(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let _ = add_record(0, 0, page.clone(), record, &conn);
+        let _ = add_record(0, 0, page.clone(), record, &pager);
         drop_cell(page_contents, 0, usable_space).unwrap();
 
         defragment_page(page_contents, usable_space, 4).unwrap();
 
         let regs = &[Register::Value(Value::from_i64(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let _ = add_record(0, 1, page.clone(), record, &conn);
+        let _ = add_record(0, 1, page.clone(), record, &pager);
 
         drop_cell(page_contents, 0, usable_space).unwrap();
 
         let regs = &[Register::Value(Value::from_i64(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let _ = add_record(0, 1, page.clone(), record, &conn);
+        let _ = add_record(0, 1, page.clone(), record, &pager);
     }
 
     #[test]
     pub fn test_fuzz_victim_2() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
         let usable_space = 4096;
         let insert = |pos, page| {
             let regs = &[Register::Value(Value::from_i64(0))];
             let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-            let _ = add_record(0, pos, page, record, &conn);
+            let _ = add_record(0, pos, page, record, &pager);
         };
         let drop = |pos, page| {
             drop_cell(page, pos, usable_space).unwrap();
@@ -14395,15 +14013,14 @@ mod tests {
 
     #[test]
     pub fn test_fuzz_victim_3() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
         let usable_space = 4096;
         let insert = |pos, page| {
             let regs = &[Register::Value(Value::from_i64(0))];
             let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-            let _ = add_record(0, pos, page, record, &conn);
+            let _ = add_record(0, pos, page, record, &pager);
         };
         let drop = |pos, page| {
             drop_cell(page, pos, usable_space).unwrap();
@@ -14424,11 +14041,11 @@ mod tests {
                     0,
                     &record,
                     4096,
-                    &conn.pager.load(),
+                    &pager,
                     &mut fill_cell_payload_state,
                 )
             },
-            &conn.pager.load().clone(),
+            &pager,
         )
         .unwrap();
 
@@ -14450,7 +14067,7 @@ mod tests {
 
     #[test]
     pub fn btree_insert_sequential() {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let mut keys = Vec::new();
         let num_columns = 5;
 
@@ -14492,8 +14109,7 @@ mod tests {
 
     #[test]
     pub fn test_big_payload_compute_free() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
         let usable_space = 4096;
@@ -14510,11 +14126,11 @@ mod tests {
                     0,
                     &record,
                     4096,
-                    &conn.pager.load(),
+                    &pager,
                     &mut fill_cell_payload_state,
                 )
             },
-            &conn.pager.load().clone(),
+            &pager,
         )
         .unwrap();
         insert_into_cell(page.get_contents(), &payload, 0, 4096).unwrap();
@@ -14563,7 +14179,7 @@ mod tests {
     /// leaf, so the cursor is re-seeked onto row 3 and told that its next
     /// next() must stay there.
     fn three_rows_with_middle_deleted() -> (Arc<Pager>, i64, BTreeCursor) {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
         for rowid in 1..=3 {
             insert_record(&mut cursor, &pager, rowid, Value::from_i64(rowid)).unwrap();
@@ -14621,7 +14237,7 @@ mod tests {
         for n in [1i64, 2, 3, 10, 200] {
             for large in [false, true] {
                 for target in ["min", "max", "mid", "drain"] {
-                    let (pager, root_page, _, _) = empty_btree();
+                    let (pager, root_page) = empty_btree();
                     let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
                     for rowid in 1..=n {
                         let v = if large {
@@ -14669,7 +14285,7 @@ mod tests {
 
     #[test]
     fn seek_after_delete_to_empty_clears_record_position() {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
 
         insert_record(&mut cursor, &pager, 1, Value::from_i64(10)).unwrap();
@@ -14696,7 +14312,7 @@ mod tests {
 
     #[test]
     fn index_seek_after_delete_to_empty_clears_record_position() {
-        let (pager, _, _, _) = empty_btree();
+        let (pager, _) = empty_btree();
         let root_page = run_until_done(
             || pager.btree_create(&crate::storage::pager::CreateBTreeFlags::new_index()),
             pager.deref(),
@@ -14772,7 +14388,7 @@ mod tests {
         // 3. Verify validity/integrity of btree after deleting and also verify that these
         //    values are actually deleted.
 
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 5;
 
         // Insert 10,000 records in to the BTree.
@@ -14851,7 +14467,7 @@ mod tests {
             huge_texts.push(huge_text);
         }
 
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 5;
 
         for (i, huge_text) in huge_texts.iter().enumerate().take(iterations) {
@@ -14913,7 +14529,7 @@ mod tests {
                 cell_count_per_page_cumulative: [0; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE],
             };
             let mut cells_cloned = Vec::new();
-            let (pager, _, _, _) = empty_btree();
+            let (pager, _) = empty_btree();
             let page_type = PageType::TableLeaf;
             let page = run_until_done(|| pager.allocate_page(), &pager).unwrap();
             btree_init_page(&page, page_type, 0, pager.usable_space());
@@ -15047,7 +14663,7 @@ mod tests {
         /// page's last cell instead of the true maximum.
         #[test]
         fn peer_write_invalidates_rightmost_page_cache() {
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut reader = make_registered_cursor(&pager, root_page, 1);
 
@@ -15092,7 +14708,7 @@ mod tests {
         /// without invalidation every later count() returns the stale value.
         #[test]
         fn peer_write_invalidates_count_cache() {
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut reader = make_registered_cursor(&pager, root_page, 1);
 
@@ -15112,7 +14728,7 @@ mod tests {
 
         #[test]
         fn registry_toggles_has_peers_flag() {
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let cursor_a = make_registered_cursor(&pager, root_page, 1);
             assert!(
                 !cursor_a
@@ -15148,7 +14764,7 @@ mod tests {
         fn registry_buckets_per_root_page() {
             // Cursors on different root pages must not see each other as
             // peers; saveAllCursors is per-root (SQLite btree.c:806).
-            let (pager, root_a, _db, _conn) = empty_btree();
+            let (pager, root_a) = empty_btree();
             let page_b = run_until_done(|| pager.allocate_page(), &pager).unwrap();
             btree_init_page(&page_b, PageType::TableLeaf, 0, pager.usable_space());
             let root_b = page_b.get().id() as i64;
@@ -15168,7 +14784,7 @@ mod tests {
 
         #[test]
         fn try_save_position_table_returns_saved() {
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
             for rowid in 1..=5 {
                 insert_record(&mut cursor, &pager, rowid, Value::from_i64(rowid)).unwrap();
@@ -15194,7 +14810,7 @@ mod tests {
         fn try_save_position_unpositioned_returns_saved_noop() {
             // valid_state=Valid + has_record=false ⇒ nothing to save and
             // nothing to invalidate (stack already in a re-navigable state).
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
             let outcome = run_until_done(
                 || cursor.try_save_position_for_external_balance(),
@@ -15210,7 +14826,7 @@ mod tests {
             // Without saveAllCursors, ResetSorter used to invalidate dup
             // cursors via pointer-equality from op_reset_sorter. Now
             // clear_btree itself does it via the pager registry.
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut peer = make_registered_cursor(&pager, root_page, 1);
 
@@ -15245,7 +14861,7 @@ mod tests {
             // and rowid() silently returns 6. With the port, cursor2's
             // position is saved on entry to delete and restored on next
             // access — rowid() returns 5.
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut peer = make_registered_cursor(&pager, root_page, 1);
 
@@ -15283,7 +14899,7 @@ mod tests {
             // next() returns the cell the seek landed on instead of stepping
             // past it. Forward iteration continues correctly after a peer
             // deletes the row we were sitting on.
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut peer = make_registered_cursor(&pager, root_page, 1);
 
@@ -15379,7 +14995,7 @@ mod tests {
 
         #[test]
         fn peer_after_last_cell_of_leaf_continues_forward_after_split() {
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut peer = make_registered_cursor(&pager, root_page, 1);
             let previous_rowid =
@@ -15403,7 +15019,7 @@ mod tests {
 
         #[test]
         fn peer_after_last_cell_of_leaf_continues_forward_after_two_splits() {
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut peer = make_registered_cursor(&pager, root_page, 1);
             let previous_rowid =
@@ -15441,7 +15057,7 @@ mod tests {
 
         #[test]
         fn peer_after_last_cell_of_leaf_steps_back_to_that_cell_after_split() {
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut peer = make_registered_cursor(&pager, root_page, 1);
             let previous_rowid =
@@ -15457,7 +15073,7 @@ mod tests {
 
         #[test]
         fn peer_left_on_emptied_tree_stays_at_end_after_split() {
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut peer = make_registered_cursor(&pager, root_page, 1);
             insert_record(&mut writer, &pager, 10, Value::from_i64(10)).unwrap();
@@ -15490,7 +15106,7 @@ mod tests {
 
         #[test]
         fn index_peer_after_last_cell_of_leaf_continues_forward_after_two_inserts() {
-            let (pager, _, _db, _conn) = empty_btree();
+            let (pager, _) = empty_btree();
             let root_page = run_until_done(
                 || pager.btree_create(&crate::storage::pager::CreateBTreeFlags::new_index()),
                 pager.deref(),
@@ -15603,7 +15219,7 @@ mod tests {
         #[test]
         fn record_payload_restores_after_peer_insert() {
             for size in [16, 6000] {
-                let (pager, root_page, _db, _conn) = empty_btree();
+                let (pager, root_page) = empty_btree();
                 let mut writer = make_registered_cursor(&pager, root_page, 1);
                 let mut reader = make_registered_cursor(&pager, root_page, 1);
                 let value = Value::Blob(crate::alloc::vec![b'x'; size]);
@@ -15666,7 +15282,7 @@ mod tests {
             // cells to shift right on the shared page). Without saveAllCursors,
             // cursor2's cell_idx now points to rowid=4. With the port, the
             // saved rowid=5 is restored on next access.
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut peer = make_registered_cursor(&pager, root_page, 1);
 
@@ -16350,7 +15966,7 @@ mod tests {
     /// past one leaf so the predicate has ancestors to check.
     #[test]
     fn next_past_the_last_row_lands_on_the_rightmost_leaf_append_slot() {
-        let (pager, root_page, _db, _conn) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
         let cursor = &mut cursor;
 

@@ -287,6 +287,7 @@ fn recursive_cte_result_column_collation(
                 .values
                 .first()
                 .and_then(|row| row.get(result_column_index))
+                .map(Box::as_ref)
                 .unwrap_or(&select.result_columns[result_column_index].expr);
             columns.push((
                 expr,

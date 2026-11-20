@@ -252,6 +252,7 @@ test table-select-into-nested-rejected {
 @sqlstate 42601
 expect error {}
 
+@compat-gap "type:date"
 test table-date-arithmetic {
     CREATE TABLE dates (a date, b date);
     INSERT INTO dates VALUES ('2025-01-05', '2025-01-01');
@@ -260,7 +261,12 @@ test table-date-arithmetic {
 expect {
     2025-01-06|2025-01-04|4
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
 
+@compat-gap "type:date"
 test table-indexed-date-column-with-default {
     CREATE TABLE dates (a int, b int, c date DEFAULT '2000-01-01');
     INSERT INTO dates VALUES (1, 2, '2024-05-06');
@@ -272,7 +278,12 @@ expect {
     2024-05-06
     1|2024-05-06
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
 
+@compat-gap "type:date"
 test table-cast-timestamp-column-to-date-and-time {
     CREATE TABLE events (ts timestamp);
     INSERT INTO events VALUES ('2024-01-15 10:30:00');
@@ -280,6 +291,10 @@ test table-cast-timestamp-column-to-date-and-time {
 }
 expect {
     2024-01-15|10:30:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
 }
 
 test table-check-on-smallint-column {
@@ -574,6 +589,40 @@ test table-upsert-inserted-row-updated-rejected {
 @sqlstate 21000
 expect error {ON CONFLICT DO UPDATE command cannot affect row a second time}
 
+setup upsert_asc {
+    CREATE TABLE upsert_asc (a int PRIMARY KEY, b int);
+}
+
+@setup upsert_asc
+test table-upsert-row-inserted-earlier-with-ascending-keys-rejected {
+    INSERT INTO upsert_asc VALUES (1, 1), (2, 2), (1, 0) ON CONFLICT (a) DO UPDATE SET b = 0;
+}
+@sqlstate 21000
+expect error {ON CONFLICT DO UPDATE command cannot affect row a second time}
+
+@setup upsert_asc
+test table-upsert-last-row-inserted-again-with-ascending-keys-rejected {
+    INSERT INTO upsert_asc VALUES (3, 3), (4, 4), (4, 0) ON CONFLICT (a) DO UPDATE SET b = 0;
+}
+@sqlstate 21000
+expect error {ON CONFLICT DO UPDATE command cannot affect row a second time}
+
+@setup upsert_asc
+test table-upsert-middle-row-inserted-again-with-ascending-keys-rejected {
+    INSERT INTO upsert_asc VALUES (1, 1), (2, 2), (3, 3), (2, 0) ON CONFLICT (a) DO UPDATE SET b = 0;
+}
+@sqlstate 21000
+expect error {ON CONFLICT DO UPDATE command cannot affect row a second time}
+
+@setup upsert_asc
+test table-upsert-small-key-after-a-full-leaf-of-written-rowids {
+    INSERT INTO upsert_asc SELECT g, 1 FROM generate_series(1000, 1700) g UNION ALL SELECT 1, 1 ON CONFLICT (a) DO UPDATE SET b = 0;
+    SELECT count(*), min(a), max(a) FROM upsert_asc;
+}
+expect {
+    702|1|1700
+}
+
 @setup upsert
 test table-upsert-row-updated-twice-through-unique-column-rejected {
     INSERT INTO upsert_t VALUES (2, 1, 1), (3, 1, 5) ON CONFLICT (k) DO UPDATE SET b = excluded.b;
@@ -862,6 +911,7 @@ expect {
     2|public
 }
 
+@compat-gap "type:date"
 test array-columns-hold-element-values {
     -- tursopg prints a boolean result as 1, PostgreSQL as t, so every
     -- boolean is cast to int.
@@ -883,6 +933,10 @@ expect {
     1|1|1|1|1|1|1|0
     {a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}|{2024-01-02}
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
 
 test array-of-booleans-from-literal-and-aggregate {
     CREATE TABLE bool_values (id int PRIMARY KEY, b boolean);
@@ -893,4 +947,301 @@ test array-of-booleans-from-literal-and-aggregate {
 expect {
     1|0
     1
+}
+
+test table-insert-values-shorter-row-with-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u (id, a) VALUES (1, 2), (3);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-longer-row-with-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u (id, a) VALUES (1, 2), (3, 4, 5);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-shorter-row-without-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u VALUES (1, 2, 3), (4, 5);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-different-row-length-with-default {
+    CREATE TABLE u (id int, a int, b int DEFAULT 9);
+    INSERT INTO u VALUES (1, 2, DEFAULT), (3, 4);
+}
+@sqlstate 42601
+expect error {}
+
+@skip-if postgres "PostgreSQL supports ALTER VIEW ... RENAME"
+test alter-view-rename-is-not-supported {
+    CREATE TABLE rn_view_base (id INT);
+    CREATE VIEW rn_view AS SELECT id FROM rn_view_base;
+    ALTER VIEW rn_view RENAME TO rn_view_renamed;
+}
+@sqlstate 0A000
+expect error {
+    ALTER VIEW ... RENAME is not supported
+}
+
+@skip-if postgres "PostgreSQL supports ALTER INDEX ... RENAME"
+test alter-index-rename-is-not-supported {
+    CREATE TABLE rn_index_base (id INT);
+    CREATE INDEX rn_index ON rn_index_base (id);
+    ALTER INDEX rn_index RENAME TO rn_index_renamed;
+}
+@sqlstate 0A000
+expect error {
+    ALTER INDEX ... RENAME is not supported
+}
+
+@skip-if postgres "PostgreSQL supports ALTER TYPE ... RENAME"
+test alter-type-rename-is-not-supported {
+    CREATE TYPE rn_type AS ENUM ('a');
+    ALTER TYPE rn_type RENAME TO rn_type_renamed;
+}
+@sqlstate 0A000
+expect error {
+    ALTER TYPE ... RENAME is not supported
+}
+
+@skip-if postgres "PostgreSQL supports ALTER TABLE ... RENAME CONSTRAINT"
+test alter-table-rename-constraint-is-not-supported {
+    CREATE TABLE rn_constrained (id INT CONSTRAINT rn_positive CHECK (id > 0));
+    ALTER TABLE rn_constrained RENAME CONSTRAINT rn_positive TO rn_still_positive;
+}
+@sqlstate 0A000
+expect error {
+    ALTER TABLE ... RENAME CONSTRAINT is not supported
+}
+
+test update-set-default-uses-column-default {
+    DROP TABLE IF EXISTS defaults_t;
+    CREATE TABLE defaults_t (a int DEFAULT 7, b text);
+    INSERT INTO defaults_t (a, b) VALUES (1, 'x');
+    UPDATE defaults_t SET a = DEFAULT;
+    SELECT a, b FROM defaults_t;
+}
+expect {
+    7|x
+}
+
+test update-set-default-without-column-default-sets-null {
+    DROP TABLE IF EXISTS defaults_t;
+    CREATE TABLE defaults_t (a int, b text);
+    INSERT INTO defaults_t (a, b) VALUES (1, 'x');
+    UPDATE defaults_t SET a = DEFAULT;
+    SELECT CASE WHEN a IS NULL THEN 1 ELSE 0 END, b FROM defaults_t;
+}
+expect {
+    1|x
+}
+
+test serial-primary-key-counts-apart-from-explicit-keys {
+    DROP TABLE IF EXISTS sk_a;
+    CREATE TABLE sk_a (id serial PRIMARY KEY, v text);
+    INSERT INTO sk_a (v) VALUES ('a');
+    INSERT INTO sk_a (id, v) VALUES (100, 'b');
+    INSERT INTO sk_a (v) VALUES ('c');
+    SELECT id, v FROM sk_a ORDER BY v;
+}
+expect {
+    1|a
+    100|b
+    2|c
+}
+
+test serial-primary-key-rejects-null {
+    DROP TABLE IF EXISTS sk_n;
+    CREATE TABLE sk_n (id serial PRIMARY KEY, v text);
+    INSERT INTO sk_n (id, v) VALUES (NULL, 'x');
+}
+@sqlstate 23502
+expect error {}
+
+test serial-primary-key-default-collides-with-explicit-key {
+    DROP TABLE IF EXISTS sk_c;
+    CREATE TABLE sk_c (id serial PRIMARY KEY, v text);
+    INSERT INTO sk_c (id, v) VALUES (1, 'x');
+    INSERT INTO sk_c (v) VALUES ('y');
+}
+@sqlstate 23505
+expect error {}
+
+test bigserial-and-smallserial-primary-keys-use-sequence {
+    DROP TABLE IF EXISTS sk_b;
+    DROP TABLE IF EXISTS sk_s;
+    CREATE TABLE sk_b (id bigserial PRIMARY KEY, v text);
+    CREATE TABLE sk_s (id smallserial PRIMARY KEY, v text);
+    INSERT INTO sk_b (v) VALUES ('a');
+    INSERT INTO sk_b (id, v) VALUES (50, 'b');
+    INSERT INTO sk_b (v) VALUES ('c');
+    INSERT INTO sk_s (v) VALUES ('a');
+    INSERT INTO sk_s (id, v) VALUES (50, 'b');
+    INSERT INTO sk_s (v) VALUES ('c');
+    SELECT id FROM sk_b UNION ALL SELECT id + 1000 FROM sk_s ORDER BY 1;
+}
+expect {
+    1
+    2
+    50
+    1001
+    1002
+    1050
+}
+
+test integer-primary-key-rejects-null {
+    DROP TABLE IF EXISTS sk_i;
+    CREATE TABLE sk_i (id integer PRIMARY KEY, v text);
+    INSERT INTO sk_i (id, v) VALUES (NULL, 'x');
+}
+@sqlstate 23502
+expect error {}
+
+test integer-primary-key-uses-column-default {
+    DROP TABLE IF EXISTS sk_d;
+    CREATE TABLE sk_d (id integer PRIMARY KEY DEFAULT 7, v text);
+    INSERT INTO sk_d (v) VALUES ('x');
+    SELECT id, v FROM sk_d;
+}
+expect {
+    7|x
+}
+
+test integer-table-level-primary-key-uses-column-default {
+    DROP TABLE IF EXISTS sk_t;
+    CREATE TABLE sk_t (id int DEFAULT 9, v text, PRIMARY KEY (id));
+    INSERT INTO sk_t (v) VALUES ('x');
+    SELECT id, v FROM sk_t;
+}
+expect {
+    9|x
+}
+
+test integer-primary-key-without-default-rejects-insert-that-omits-it {
+    DROP TABLE IF EXISTS sk_o;
+    CREATE TABLE sk_o (id integer PRIMARY KEY, v text);
+    INSERT INTO sk_o (v) VALUES ('x');
+}
+@sqlstate 23502
+expect error {}
+
+test integer-primary-key-rejects-null-from-select {
+    DROP TABLE IF EXISTS sk_q;
+    CREATE TABLE sk_q (id integer PRIMARY KEY, v text);
+    INSERT INTO sk_q (id, v) SELECT NULL, 'x';
+}
+@sqlstate 23502
+expect error {}
+
+test integer-primary-key-default-keyword-uses-column-default {
+    DROP TABLE IF EXISTS sk_k;
+    CREATE TABLE sk_k (id integer PRIMARY KEY DEFAULT 7, v text);
+    INSERT INTO sk_k VALUES (DEFAULT, 'x'), (8, 'y');
+    SELECT id, v FROM sk_k ORDER BY id;
+}
+expect {
+    7|x
+    8|y
+}
+
+test serial-primary-key-on-conflict-do-update {
+    DROP TABLE IF EXISTS sk_u;
+    CREATE TABLE sk_u (id serial PRIMARY KEY, v text);
+    INSERT INTO sk_u (v) VALUES ('a');
+    INSERT INTO sk_u (id, v) VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET v = excluded.v;
+    INSERT INTO sk_u (v) VALUES ('c');
+    SELECT id, v FROM sk_u ORDER BY id;
+}
+expect {
+    1|b
+    2|c
+}
+
+@compat-gap "syntax:returning"
+test returning-with-new-alias {
+    CREATE TABLE returning_alias (a int);
+    INSERT INTO returning_alias VALUES (1) RETURNING WITH (NEW AS n) n.a;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    RETURNING with OLD or NEW aliases is not supported
+}
+
+@compat-gap "syntax:returning"
+test returning-old-from-aliased-update {
+    CREATE TABLE returning_old (a int);
+    INSERT INTO returning_old VALUES (11);
+    UPDATE returning_old AS o SET a = a + 10 RETURNING old.a, new.a;
+}
+expect {
+    11|21
+}
+@sqlstate 0A000
+expect @tursopg error {
+    old or new as a row name in RETURNING is not supported
+}
+
+@compat-gap "syntax:returning"
+test returning-old-from-update {
+    CREATE TABLE returning_old_plain (a int);
+    INSERT INTO returning_old_plain VALUES (11);
+    UPDATE returning_old_plain SET a = a + 10 RETURNING old.a;
+}
+expect {
+    11
+}
+@sqlstate 0A000
+expect @tursopg error {
+    old or new as a row name in RETURNING is not supported
+}
+
+test returning-from-a-table-named-old {
+    CREATE TABLE old (a int);
+    INSERT INTO old VALUES (11);
+    UPDATE old SET a = a + 10 RETURNING old.a;
+}
+expect {
+    21
+}
+
+@compat-gap "syntax:foreign-key"
+test foreign-key-not-enforced {
+    CREATE TABLE fk_parent (a int PRIMARY KEY);
+    CREATE TABLE fk_child (a int, FOREIGN KEY (a) REFERENCES fk_parent (a) NOT ENFORCED);
+    INSERT INTO fk_child VALUES (5);
+    SELECT a FROM fk_child;
+}
+expect {
+    5
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a NOT ENFORCED constraint is not supported
+}
+
+@skip-if postgres "PostgreSQL needs range columns for WITHOUT OVERLAPS"
+test primary-key-without-overlaps {
+    CREATE TABLE pk_overlaps (a int, b int, PRIMARY KEY (a, b WITHOUT OVERLAPS));
+}
+@sqlstate 0A000
+expect error {
+    WITHOUT OVERLAPS is not supported
+}
+
+@skip-if postgres "PostgreSQL needs range columns for PERIOD"
+test foreign-key-period {
+    CREATE TABLE fk_period_parent (a int, b int, PRIMARY KEY (a, b));
+    CREATE TABLE fk_period_child (a int, b int, FOREIGN KEY (a, PERIOD b) REFERENCES fk_period_parent (a, PERIOD b));
+}
+@sqlstate 0A000
+expect error {
+    PERIOD in a key is not supported
 }

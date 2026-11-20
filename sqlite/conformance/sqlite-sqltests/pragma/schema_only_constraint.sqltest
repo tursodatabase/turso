@@ -1,0 +1,80 @@
+@database :memory:
+
+# A schema constraint must not become the omitted table or index argument.
+test table-info-schema-only {
+    CREATE TABLE "main"(a, b);
+    SELECT count(*) FROM pragma_table_info WHERE schema='main';
+}
+expect {
+    0
+}
+
+test table-xinfo-schema-only {
+    CREATE TABLE "main"(a, b);
+    SELECT count(*) FROM pragma_table_xinfo WHERE schema='main';
+}
+expect {
+    0
+}
+
+test index-list-schema-only {
+    CREATE TABLE "main"(a, b);
+    CREATE INDEX main_idx ON "main"(a);
+    SELECT count(*) FROM pragma_index_list WHERE schema='main';
+}
+expect {
+    0
+}
+
+test index-info-schema-only {
+    CREATE TABLE t(a, b);
+    CREATE INDEX "main" ON t(a);
+    SELECT count(*) FROM pragma_index_info WHERE schema='main';
+}
+expect {
+    0
+}
+
+test index-xinfo-schema-only {
+    CREATE TABLE t(a, b);
+    CREATE INDEX "main" ON t(a);
+    SELECT count(*) FROM pragma_index_xinfo WHERE schema='main';
+}
+expect {
+    0
+}
+
+test foreign-key-list-schema-only {
+    CREATE TABLE parent(id PRIMARY KEY);
+    CREATE TABLE "main"(parent_id REFERENCES parent(id));
+    SELECT count(*) FROM pragma_foreign_key_list WHERE schema='main';
+}
+expect {
+    0
+}
+
+test table-info-arg-constraint {
+    CREATE TABLE t(a, b);
+    SELECT name FROM pragma_table_info WHERE arg='t' ORDER BY cid;
+}
+expect {
+    a
+    b
+}
+
+test table-info-positional-arg {
+    CREATE TABLE t(a, b);
+    SELECT name FROM pragma_table_info('t') ORDER BY cid;
+}
+expect {
+    a
+    b
+}
+
+test synchronous-schema-only {
+    PRAGMA synchronous=FULL;
+    SELECT * FROM pragma_synchronous WHERE schema='main';
+}
+expect {
+    2
+}

@@ -33,6 +33,7 @@ use crate::oracle::{
 };
 use crate::schema::SchemaIntrospector;
 pub use sql_gen::TreeMode;
+use turso_core::SessionRole;
 
 const MAX_GENERATED_SQL_BYTES: usize = 64 * 1024;
 
@@ -390,7 +391,7 @@ impl Fuzzer {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let turso_conn = turso_db.connect(ConnectOpts::new())?;
+        let turso_conn = turso_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
         // Create SQLite in-memory database
         let sqlite_conn = if config.keep_files {

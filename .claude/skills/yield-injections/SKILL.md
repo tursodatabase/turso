@@ -2,62 +2,30 @@
 name: yield-injections
 description: Use when working with Turso yield injection or synthetic failure injection machinery for safe resumable state-machine boundaries, including YieldInjector, FailureInjector, YieldPointMarker, inject_transition_yield!, inject_io_yield!, inject_transition_failure!, CommitYieldPoint, CheckpointYieldPoint, CursorYieldPoint, deterministic interleaving tests, abandoned statement/commit tests, and concurrent-simulator yield plans.
 ---
-# Yield Injection Guide
+# Yield injection
 
-Yield injection is test-only infrastructure for forcing cooperative-yield or failure boundaries in resumable state machines. The implementation currently lives under `core/mvcc/`, but the mechanism is not MVCC semantics.
+Test-only code that forces a yield or an error at chosen points in resumable state machines. It lives under `core/mvcc/` but is not MVCC semantics. All hooks are behind `cfg(any(test, injected_yields))`; `injected_yields` is set by the `test_helper` and `simulator` features.
 
-## Key Files
+To add a point, read the injector traits and macros, the `YieldPointMarker`, `YieldContext` and `ProvidesYieldContext` definitions, the existing point enums and hooks, the fixed injectors in the MVCC tests, and the injector in `testing/concurrent-simulator/`.
 
-- `core/mvcc/yield_points.rs`: injector traits and macros.
-- `core/mvcc/yield_hooks.rs`: `YieldPointMarker`, `YieldContext`, `ProvidesYieldContext`.
-- `core/connection.rs`: per-connection injector slots and `yield_instance_id_counter`.
-- `core/mvcc/database/mod.rs`: commit points and commit cleanup.
-- `core/mvcc/database/checkpoint_state_machine.rs`: checkpoint points.
-- `core/mvcc/cursor.rs`: cursor points.
-- `core/mvcc/database/tests.rs`: fixed test injectors and regression examples.
-- `testing/concurrent-simulator/yield_injection.rs`: simulator injector.
+## Model
 
-All hooks are behind `cfg(any(test, injected_yields))`; `injected_yields` means `test_helper` or `simulator`.
+A `YieldPoint { ordinal, point_count }` names one hook in one family. A family is a `#[repr(u8)]` enum implementing `YieldPointMarker`; `ordinal` is `self as u8` and `point_count` comes from `EnumCount`.
 
-## Core Model
+Seeds and simulator plans store raw ordinals. Reordering variants changes which hook an old seed targets, which breaks reproduction of CI seeds and bisects. Add new variants at the end of the enum. Adding a variant changes `point_count`, which can change plans for existing seeds, but keeps the meaning of existing ordinals.
 
-`YieldPoint { ordinal, point_count }` identifies one hook in one point family. Families are `#[repr(u8)]` enums implementing `YieldPointMarker`; `ordinal` is source-order `self as u8`, and `point_count` comes from `EnumCount`.
+Each yield-capable object has an `instance_id` (tells simultaneous state machines apart), a `selection_key` (stable key of the logical operation, used by plans) and the connection's `yield_injector()` and `failure_injector()`.
 
-Do not reorder existing yield-point variants. Simulator plans store raw ordinals, not names.
+Macros:
+- `inject_transition_yield!(self, Point)`: in a `StateTransition` returning `TransitionResult<T>`.
+- `inject_io_yield!(self, Point)`: in cursor or helper functions returning `IOResult<T>`.
+- `inject_transition_failure!(self, Point)`: returns `Err(LimboError)` from a `StateTransition`. Failure injection works only for `TransitionResult` state machines.
 
-Why reordering matters: `ordinal` is `self as u8`, so source order is part of the deterministic schedule. If a seed planned "yield at ordinal 2", reordering can silently retarget that same seed from one conceptual hook to another. This makes CI seeds, bisects, and simulator coverage hard to reproduce. Appending a variant still changes `point_count` and can perturb future plans, but it preserves the meaning of existing ordinals.
+An injected yield returns `Completion::new_yield()`, which is already finished but reports `is_explicit_yield()`, so the VDBE returns `StepResult::Yield`. To express a test interleaving, add a yield point instead of calling `Completion::new_yield()` directly. Yields for real lock contention are fine.
 
-Each yield-capable live object has:
+## New yield-capable type
 
-- `instance_id`: distinguishes simultaneous state machines/cursors.
-- `selection_key`: stable logical-operation key used by deterministic plans.
-- active connection injectors: `yield_injector()` and `failure_injector()`.
-
-## Hook Macros
-
-- `inject_transition_yield!(self, Point)`: for `StateTransition` returning `TransitionResult<T>`.
-- `inject_io_yield!(self, Point)`: for cursor/helper functions returning `IOResult<T>`.
-- `inject_transition_failure!(self, Point)`: returns `Err(LimboError)` from `StateTransition`.
-
-There is no `inject_io_failure!` today; failure injection only works for `TransitionResult` state machines.
-
-Injected yields return `Completion::new_yield()`. It is already finished, but `is_explicit_yield()` is true, so the VDBE surfaces it as `StepResult::Yield` instead of continuing immediately.
-
-## New Yield-Capable Type
-
-For a new state machine/cursor family, add all of this behind `cfg(any(test, injected_yields))`:
-
-```rust
-yield_instance_id: u64,
-```
-
-Initialize it from the connection:
-
-```rust
-yield_instance_id: connection.next_yield_instance_id(),
-```
-
-Implement `ProvidesYieldContext`:
+Behind `cfg(any(test, injected_yields))`, add a field `yield_instance_id: u64`, initialize it with `connection.next_yield_instance_id()`, and implement:
 
 ```rust
 impl ProvidesYieldContext for MyStateMachine {
@@ -72,94 +40,37 @@ impl ProvidesYieldContext for MyStateMachine {
 }
 ```
 
-Add a family-specific `*_yield_key(...) -> u64` helper. Mix stable logical identity, such as tx id/table id, with a family tag so simulator plans do not collide across families. Do not use wall-clock time, random values, allocation addresses, or incidental counters unrelated to the logical operation.
+`my_yield_key(...) -> u64` mixes a stable logical identity (tx id, table id) with a tag for the family, so plans of different families do not collide. Derive it only from the logical operation, so the same seed gives the same plan.
 
-## Adding A Point
+## Adding a point
 
-Before adding a hook, prove re-entry is safe. A synthetic yield returns `StepResult::Yield`; the same statement/state machine may be stepped again immediately later. On re-entry, it must resume from an explicit state, not repeat non-idempotent work.
+A synthetic yield returns `StepResult::Yield`, and the same statement is stepped again later, so the code after the hook must be safe to enter again.
 
-Rules:
+- Update the state to a resumable state before the hook.
+- Put the hook after a `push`, `insert`, counter increment, lock acquisition or cleanup action, or make repeating that action harmless through state. The exception is a test of lock interleavings, where the hook goes before the lock acquisition.
+- If a lock is held across the yield, test both resuming and dropping the statement at the yield. Dropping must restore invariants through Drop or abort cleanup.
+- The macros call `self.yield_context()`, so place them where `&mut self.state` is not borrowed.
+- Add a deterministic test with `FixedYieldInjector` or `FixedFailureInjector`. See `async-io-model` for re-entry rules.
 
-- Mutate the state machine into the resumable state before yielding.
-- Do not put a hook before a `push`, `insert`, counter increment, lock acquisition, or cleanup action unless repeating that action is harmless or explicitly guarded by state.
-- If a lock/guard is held across the yield, test both resume and drop-at-yield paths.
-- For abandonment tests, dropping the statement at the yield must restore invariants through Drop/abort cleanup.
-- When adding a new yield point, always add it at the last position in the enum to preserve existing ordinals.
-- Do not reorder variants in existing `YieldPointMarker` enums, unless absolutely required. Reordering changes the meaning of existing ordinals and can break reproducibility of CI seeds and bisects.
-
-Checklist:
-
-1. Append a variant to the appropriate `*YieldPoint` enum. Do not reorder.
-2. Place the macro after the transition that makes resume safe, or before a lock acquisition when explicitly testing lock interleavings.
-3. Avoid calling macros while borrowing `&mut self.state`; they need `self.yield_context()`.
-4. Add a deterministic test with `FixedYieldInjector` or `FixedFailureInjector`.
-5. If testing abandoned work, drop the statement at the yield and assert cleanup invariants.
-
-For deeper re-entry/state-machine rules, also use `async-io-model`.
-
-## Fixed Unit-Test Injectors
-
-Use fixed injectors in targeted tests:
+## Fixed injectors in tests
 
 ```rust
-use crate::mvcc::yield_hooks::YieldPointMarker;
-
 conn.set_yield_injector(Some(FixedYieldInjector::new([
-    CommitYieldPoint::LogRecordPrepared.point(),
+    CommitYieldPoint::<variant>.point(),
 ])));
 ```
 
-`FixedYieldInjector` stores a `HashSet<YieldPoint>`, ignores `instance_id`/`selection_key`, and consumes each configured point once total. If two simultaneous instances hit the same point, the first one consumes it.
+`FixedYieldInjector` holds a set of points, ignores `instance_id` and `selection_key`, and fires each point once in total: if two instances reach the same point, the first consumes it. `FixedFailureInjector` maps one point to one `LimboError`.
 
-`FixedFailureInjector` behaves similarly but maps one point to one `LimboError`.
-
-Clear injectors when reusing the same connection:
+`set_yield_injector(Some(..))` asserts the slot is empty and `set_yield_injector(None)` asserts it is installed. Reset both injectors before reusing a connection:
 
 ```rust
 conn.set_yield_injector(None);
 conn.set_failure_injector(None);
 ```
 
-## Common Test Targets
+## Simulator
 
-- Commit `LogRecordPrepared`: leave commit in `Preparing`, interleave another writer/checkpoint, or drop the statement.
-- Commit `BeforeCommittedTimestampWatermarkUpdate`: test out-of-order completion and monotonic watermarks.
-- Commit `BeforeFinishCommittedTx`: test abandonment after committed state but before final cleanup.
-- Commit `AfterRemoveTx` failure: verify tx maps, connection tx slots, locks, and exclusive tx atomics are not stranded.
-- Checkpoint `BeforeAcquireLock`: interleave before checkpoint boundary sampling.
-- Checkpoint `AfterDurableBoundaryAdvanced` failure: test retry/recovery after durable state advanced.
-- Cursor `NextStart` or `SeekStart`: test cursor re-entry and dropped-statement cleanup, especially rowid allocator locks.
+The concurrent simulator installs its own injector; fixed injectors are for unit tests. Each operation gets an injector seeded from the top-level seed and the fiber index, installed around each statement step. A plan per `(instance_id, selection_key, point_count)` has a limited number of random ordinals.
 
-Abandoned commit tests rely on cleanup paths: `CommitStateMachine::drop` calls `cleanup_unfinished_commit`, and abort-side cleanup runs through `cleanup_abandoned_mvcc_commit`.
-
-## Simulator Use
-
-The concurrent simulator owns randomized deterministic injection. Do not install `FixedYieldInjector` from simulator code.
-
-Runtime:
-
-- Each fiber owns an `Arc<SimulatorYieldInjector>` for the current operation.
-- Operation init replaces it with `SimulatorYieldInjector::new(fiber_yield_seed(seed, fiber_idx))`.
-- Every `stmt.step()` goes through `step_stmt_with_injected_yield`, which installs the injector, steps once, then clears it via RAII.
-
-Planning:
-
-- Plans are keyed by `(instance_id, selection_key, point_count)`.
-- `MAX_YIELDS = 20`.
-- For each key, the simulator chooses a random count in `0..=MAX_YIELDS`; zero injected yields is valid.
-- It fills that many slots with random ordinals in `0..point_count`.
-- Matching slots are consumed once; duplicate ordinals let the same hook fire multiple times.
-
-Simulator reproducibility:
-
-- Same top-level seed and fiber count are required to reproduce a schedule.
-- Reordering variants changes ordinal meaning.
-- Adding variants changes `point_count`, which can perturb future schedules for the same seed.
-- Changing hook placement or fiber assignment can make the same seed explore a different schedule.
-
-## Gotchas
-
-- Do not add test-only ad hoc `Completion::new_yield()` if a yield point can express the interleaving. Runtime lock-contention yields are fine when semantics require them.
-- Do not place a hook before state is updated to the resumable state.
-- `set_yield_injector(Some(...))` asserts the slot is empty; `set_yield_injector(None)` asserts it is installed.
-- Do not rely on exact simulator yield counts outside `SimulatorYieldInjector` tests.
+To reproduce a schedule, use the same top-level seed and fiber count. Changing variants, hook placement or fiber assignment changes the schedule for the same seed. Tests outside the simulator injector's own tests cannot rely on exact simulator yield counts.

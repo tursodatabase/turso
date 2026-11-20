@@ -123,6 +123,33 @@ fn test_copy_from_with_columns(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_copy_from_writes_always_identity_values(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    conn.execute("CREATE TABLE t (id bigint GENERATED ALWAYS AS IDENTITY, v text)")
+        .unwrap();
+
+    let named = write_temp_file("10\ta\n");
+    conn.execute(format!("COPY t (id, v) FROM '{}'", named.path().display()))
+        .unwrap();
+    let positional = write_temp_file("11\tb\n");
+    conn.execute(format!("COPY t FROM '{}'", positional.path().display()))
+        .unwrap();
+    conn.execute("INSERT INTO t (v) VALUES ('c')").unwrap();
+    assert!(conn
+        .execute("INSERT INTO t (id, v) VALUES (12, 'd')")
+        .unwrap_err()
+        .to_string()
+        .contains("cannot insert a non-DEFAULT value into column \"id\""));
+
+    let rows = query_all(&conn, "SELECT id, v FROM t ORDER BY v");
+    assert_eq!(rows.len(), 3);
+    assert_int(&rows[0][0], 10);
+    assert_int(&rows[1][0], 11);
+    assert_int(&rows[2][0], 1);
+}
+
+#[turso_macros::test(mvcc)]
 fn test_copy_from_file_not_found(db: TempDatabase) {
     let conn = db.connect_postgres();
 
@@ -756,4 +783,39 @@ fn test_copy_from_stdin_unsupported(db: TempDatabase) {
     let result = conn.execute("COPY t FROM STDIN");
     // STDIN is not supported — should produce an error
     assert!(result.is_err());
+}
+
+#[turso_macros::test(mvcc)]
+fn copy_into_a_serial_primary_key_takes_keys_from_the_sequence(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE s (id serial PRIMARY KEY, v text)")
+        .unwrap();
+
+    let tsv = write_temp_file("a\nb\n");
+    conn.execute(format!("COPY s (v) FROM '{}'", tsv.path().display()))
+        .unwrap();
+    conn.execute("INSERT INTO s (v) VALUES ('c')").unwrap();
+
+    let rows = query_all(&conn, "SELECT id, v FROM s ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    for (row, (id, v)) in rows.iter().zip([(1, "a"), (2, "b"), (3, "c")]) {
+        assert_int(&row[0], id);
+        assert_text(&row[1], v);
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn copy_rejects_a_null_integer_primary_key(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id integer PRIMARY KEY, v text)")
+        .unwrap();
+
+    let tsv = write_temp_file("\\N\tx\n");
+    let error = conn
+        .execute(format!("COPY t FROM '{}'", tsv.path().display()))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("null value in column \"id\""), "{error}");
+
+    assert!(query_all(&conn, "SELECT id FROM t").is_empty());
 }

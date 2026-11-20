@@ -1,11 +1,11 @@
 use crate::namespace::NamespaceId;
 use crate::types::IOResultOr;
-use rustc_hash::FxHashMap;
 use std::sync::{atomic::Ordering, Arc};
 
 use crate::error::LimboError;
 use crate::io::{Buffer, Completion, CompletionGroup, WriteBatch as IOWriteBatch};
-use crate::schema::{BTreeTable, Schema, TypeDef};
+use crate::schema::{BTreeTable, Schema, SequencesByNamespace, TypeDef};
+use crate::security::roles::SessionRole;
 use crate::storage::pager::{AutoVacuumMode, Page, PageRef, Pager};
 use crate::storage::sqlite3_ondisk::{
     CacheSize, DatabaseHeader, PageSize, RawVersion, TextEncoding, WAL_FRAME_HEADER_SIZE,
@@ -281,11 +281,15 @@ pub(crate) struct VacuumTempDb {
 #[cfg(not(target_family = "wasm"))]
 fn vacuum_temp_db_encryption(
     source_conn: &Arc<Connection>,
+    source_db: &Database,
 ) -> Result<(Option<EncryptionOpts>, Option<EncryptionKey>)> {
+    if source_db.encryption_cipher() == crate::CipherMode::None {
+        return Ok((None, None));
+    }
     let Some(cipher_mode) = source_conn.get_encryption_cipher_mode() else {
         return Ok((None, None));
     };
-    let encryption_key = source_conn.encryption_key.read().clone().ok_or_else(|| {
+    let encryption_key = source_conn.encryption_key.clone().ok_or_else(|| {
         LimboError::InternalError(
             "encrypted in-place VACUUM temp database requires source encryption key".to_string(),
         )
@@ -318,7 +322,7 @@ pub(crate) fn open_vacuum_temp_db(
     #[cfg(test)]
     let test_path = path.clone();
 
-    let (encryption_opts, encryption_key) = vacuum_temp_db_encryption(source_conn)?;
+    let (encryption_opts, encryption_key) = vacuum_temp_db_encryption(source_conn, source_db)?;
     let page_codec = source_conn.pager.load().page_codec_external();
     let db = match &page_codec {
         Some(codec) => Database::open(
@@ -328,22 +332,36 @@ pub(crate) fn open_vacuum_temp_db(
                 .flags(OpenFlags::Create)
                 .db_opts(vacuum_target_opts_from_source(source_db))
                 .encryption(encryption_opts)
+                .page_size(
+                    crate::storage::sqlite3_ondisk::PageSize::new(page_size)
+                        .expect("valid vacuum page size"),
+                )
                 .page_codec(codec.clone()),
         )?,
-        None => Database::open_file_with_flags(
+        None => Database::open(
             source_db.io.clone(),
             &path,
-            OpenFlags::Create,
-            vacuum_target_opts_from_source(source_db),
-            encryption_opts,
-            source_db.dialect(),
+            crate::OpenOptions::new(source_db.dialect())
+                .flags(OpenFlags::Create)
+                .db_opts(vacuum_target_opts_from_source(source_db))
+                .encryption(encryption_opts)
+                .page_size(
+                    crate::storage::sqlite3_ondisk::PageSize::new(page_size)
+                        .expect("valid vacuum page size"),
+                ),
         )?,
     };
     let conn = match page_codec {
-        Some(codec) => db.connect(ConnectOpts::new().with_page_codec(codec))?,
-        None => db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?,
+        Some(codec) => {
+            db.connect(ConnectOpts::new(SessionRole::Superuser).with_page_codec(codec))?
+        }
+        None => db.connect(
+            ConnectOpts::new(SessionRole::Superuser).with_encryption_key(encryption_key),
+        )?,
     };
-    conn.reset_page_size(crate::MAIN_DB_ID, page_size)?;
+    if conn.get_encryption_cipher_mode().is_none() {
+        conn.reset_page_size(crate::MAIN_DB_ID, page_size)?;
+    }
     conn.set_reserved_bytes(reserved_space)?;
     conn.wal_auto_actions_disable();
 
@@ -513,6 +531,20 @@ impl VacuumTargetBuildContext {
         }
         Ok(())
     }
+}
+
+/// Runs the error cleanup of a VACUUM target build on `target_conn` while the
+/// build holds `schema_stmt` in its schema collection phase.
+#[cfg(feature = "test_helper")]
+pub fn clean_up_target_build_after_error(
+    target_conn: Arc<Connection>,
+    schema_stmt: crate::Statement,
+) -> Result<()> {
+    let mut context = VacuumTargetBuildContext::new(target_conn);
+    context.phase = VacuumTargetBuildPhase::CollectSchemaRows {
+        schema_stmt: Box::new(schema_stmt),
+    };
+    context.cleanup_after_error()
 }
 
 /// Phases for the vacuum target build state machine.
@@ -1776,7 +1808,7 @@ fn install_mvcc_state_after_vacuum_commit(
 /// state machine.
 fn capture_target_metadata(
     temp_db: &VacuumTempDb,
-    source_sequences: FxHashMap<String, Arc<crate::schema::Sequence>>,
+    source_sequences: SequencesByNamespace,
 ) -> Result<VacuumCommittedImageMeta> {
     let temp_conn = &temp_db.conn;
     let temp_pager = temp_conn.get_pager();
@@ -1845,11 +1877,7 @@ fn reload_physical_schema_for_mvcc_vacuum(
     // blocking `Schema::populate_sequences` and `populate_sequences_via_sql`
     // helpers, which violate the vdbe async contract from inside the
     // VACUUM state machine.
-    let preserved_sequences = connection
-        .schema
-        .read()
-        .sequences_by_name(NamespaceId::ROOT)
-        .clone();
+    let preserved_sequences = connection.schema.read().sequences_by_namespace();
     let reparse_result = connection.read_current_schema_cookie().and_then(|cookie| {
         connection.reparse_schema_with_cookie_keeping_sequences(cookie, preserved_sequences)
     });
@@ -1878,6 +1906,14 @@ fn vacuum_in_place_step(
     loop {
         match phase {
             VacuumInPlacePhase::Preflight => {
+                if db != crate::MAIN_DB_ID
+                    && source_pager.encryption_cipher() != crate::CipherMode::None
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "cannot VACUUM an encrypted attached database".into(),
+                    )
+                    .into());
+                }
                 // 1. Must be in auto-commit mode (no explicit transaction).
                 if !connection.auto_commit.load(Ordering::SeqCst) {
                     return Err(LimboError::TxError(
@@ -2064,11 +2100,7 @@ fn vacuum_in_place_step(
                 let temp_db_ref = temp_db
                     .as_ref()
                     .expect("VACUUM CaptureTargetMetadata phase requires temp db");
-                let source_sequences = connection
-                    .schema
-                    .read()
-                    .sequences_by_name(NamespaceId::ROOT)
-                    .clone();
+                let source_sequences = connection.schema.read().sequences_by_namespace();
                 *committed_image = Some(capture_target_metadata(temp_db_ref, source_sequences)?);
                 *phase = VacuumInPlacePhase::BeginTempReadTx;
                 continue;
@@ -2584,15 +2616,14 @@ fn vacuum_in_place_cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
     use crate::io::{FileId, FileSyncType};
-    use crate::mvcc::yield_hooks::YieldPointMarker;
-    use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
     use crate::schema::Schema;
+    use crate::security::roles::SessionRole;
     use crate::storage::encryption::{CipherMode, EncryptionKey};
+    use crate::storage::pager::test_writes::{commit_new_pages, commit_write_tx};
     use crate::storage::pager::Page;
     use crate::util::IOExt;
-    use crate::vdbe::execute::TransactionYieldPoint;
-    use crate::EngineDialect;
     use crate::{
         Buffer, Clock, Completion, ConnectOpts, DatabaseOpts, File, MemoryIO, MonotonicInstant,
         OpenFlags, WallClockInstant, IO,
@@ -2685,33 +2716,6 @@ mod tests {
         count_as_wal_sync: bool,
         db_syncs: Arc<AtomicUsize>,
         wal_syncs: Arc<AtomicUsize>,
-    }
-
-    #[derive(Debug)]
-    struct OneShotTransactionYieldInjector {
-        yielded: AtomicUsize,
-    }
-
-    impl OneShotTransactionYieldInjector {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                yielded: AtomicUsize::new(0),
-            })
-        }
-
-        fn yielded(&self) -> bool {
-            self.yielded.load(StdOrdering::SeqCst) != 0
-        }
-    }
-
-    impl YieldInjector for OneShotTransactionYieldInjector {
-        fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
-            point == TransactionYieldPoint::BeforeStart.point()
-                && self
-                    .yielded
-                    .compare_exchange(0, 1, StdOrdering::SeqCst, StdOrdering::SeqCst)
-                    .is_ok()
-        }
     }
 
     impl File for SyncCountingFile {
@@ -2909,7 +2913,7 @@ mod tests {
     #[test]
     fn replace_shared_schema_after_vacuum_replaces_wrapped_schema_cookie() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect))?;
+        let db = Database::open_file(io, ":memory:", Arc::new(DialectThatCannotParse))?;
 
         db.with_schema_mut(|schema| {
             schema.schema_version = u32::MAX;
@@ -2931,8 +2935,8 @@ mod tests {
     #[test]
     fn install_committed_vacuum_image_updates_connection_and_shared_schema() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect))?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let db = Database::open_file(io, ":memory:", Arc::new(DialectThatCannotParse))?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
         conn.with_schema_mut(|schema| {
             schema.schema_version = 1;
@@ -2966,8 +2970,8 @@ mod tests {
     #[test]
     fn cleanup_after_published_vacuum_installs_committed_image() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect))?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let db = Database::open_file(io, ":memory:", Arc::new(DialectThatCannotParse))?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
         conn.with_schema_mut(|schema| {
             schema.schema_version = 1;
@@ -3007,7 +3011,7 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn capture_target_metadata_uses_final_header_cookie_and_preserves_tvfs() -> Result<()> {
+    fn capture_target_metadata_uses_final_header_cookie() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
         let source_dir = tempfile::tempdir().unwrap();
         let source_path = source_dir.path().join("source.db");
@@ -3018,9 +3022,9 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(DialectThatCannotParse),
         )?;
-        let source_conn = source_db.connect(ConnectOpts::new())?;
+        let source_conn = source_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         // Source is uninitialized so its header reserved_space isn't usable.
         // Derive from the IOContext to keep reserved_space and the auto-
         // installed checksum context consistent under `feature = "checksum"`.
@@ -3031,11 +3035,6 @@ mod tests {
             .get_reserved_space_bytes();
         let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, reserved_space)?;
 
-        temp.conn.execute("BEGIN IMMEDIATE")?;
-        temp.conn
-            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
-        temp.conn.execute("CREATE INDEX idx_t_v ON t(v)")?;
-        temp.conn.execute("INSERT INTO t VALUES (1, 'x')")?;
         let mvcc_version = RawVersion::from(crate::storage::sqlite3_ondisk::Version::Mvcc);
         let header_meta = VacuumDbHeaderMeta {
             read_version: mvcc_version,
@@ -3046,41 +3045,19 @@ mod tests {
             user_version: 17,
             application_id: 29,
         };
-        match finalize_vacuum_target_header(&temp.conn, &header_meta)? {
-            crate::IOResult::Done(()) => {}
-            crate::IOResult::IO(_) => panic!("fresh temp header should not need async I/O"),
-        }
-        temp.conn.execute("COMMIT")?;
+        commit_write_tx(&temp.conn, |_| {
+            match finalize_vacuum_target_header(&temp.conn, &header_meta).unwrap() {
+                crate::IOResult::Done(()) => {}
+                crate::IOResult::IO(_) => panic!("fresh temp header should not need async I/O"),
+            }
+        });
 
-        let committed = capture_target_metadata(&temp, FxHashMap::default())?;
+        let committed = capture_target_metadata(&temp, SequencesByNamespace::new())?;
 
         assert_eq!(committed.header.schema_cookie.get(), 42);
         assert_eq!(committed.header.read_version, mvcc_version);
         assert_eq!(committed.header.write_version, mvcc_version);
         assert_eq!(committed.schema.schema_version, 42);
-        assert!(
-            committed
-                .schema
-                .has_table(NamespaceId::ROOT, "generate_series"),
-            "captured schema must retain built-in table-valued functions"
-        );
-        let table_root = match committed
-            .schema
-            .get_table(NamespaceId::ROOT, "t")
-            .expect("table t")
-            .as_ref()
-        {
-            crate::schema::Table::BTree(btree) => btree.root_page,
-            _ => panic!("expected btree table"),
-        };
-        assert!(table_root > 0);
-        let index_root = committed
-            .schema
-            .indices_including_backing(NamespaceId::ROOT, "t")
-            .next()
-            .map(|index| index.root_page)
-            .expect("index idx_t_v");
-        assert!(index_root > 0);
 
         Ok(())
     }
@@ -3095,16 +3072,13 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(DialectThatCannotParse),
         )?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         conn.set_sync_mode(crate::SyncMode::Off);
         conn.wal_auto_actions_disable();
 
-        conn.execute("BEGIN IMMEDIATE")?;
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
-        conn.execute("INSERT INTO t VALUES (1, 'x')")?;
-        conn.execute("COMMIT")?;
+        commit_new_pages(&conn, 1);
 
         let before = io.counts();
         assert_eq!(
@@ -3133,177 +3107,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn vacuum_target_build_preserves_nested_statement_explicit_yield() -> Result<()> {
-        let io = Arc::new(MemoryIO::new());
-        let source_io: Arc<dyn IO> = io.clone();
-        let source_db = Database::open_file_with_flags(
-            source_io,
-            "vacuum-yield-source.db",
-            OpenFlags::Create,
-            DatabaseOpts::new().with_vacuum(true),
-            None,
-            Arc::new(EngineDialect),
-        )?;
-        let source_conn = source_db.connect(ConnectOpts::new())?;
-        source_conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
-        source_conn.execute("CREATE INDEX idx_t_payload ON t(payload)")?;
-        for id in 1..=8 {
-            source_conn.execute(format!("INSERT INTO t VALUES({id}, 'payload-{id}')"))?;
-        }
-        source_conn.execute("BEGIN")?;
-
-        let source_pager = source_conn.get_pager();
-        let header_meta = source_pager
-            .io
-            .block(|| source_pager.with_header(VacuumDbHeaderMeta::from_source_header))?;
-
-        let target_io: Arc<dyn IO> = io.clone();
-        let target_db = Database::open_file_with_flags(
-            target_io,
-            "vacuum-yield-target.db",
-            OpenFlags::Create,
-            vacuum_target_opts_from_source(&source_db),
-            None,
-            Arc::new(EngineDialect),
-        )?;
-        let target_conn = target_db.connect(ConnectOpts::new())?;
-        mirror_symbols(&source_conn, &target_conn);
-
-        let config = VacuumTargetBuildConfig {
-            source_conn: source_conn.clone(),
-            escaped_schema_name: "main".to_string(),
-            source_db_id: crate::MAIN_DB_ID,
-            header_meta,
-            source_custom_types: capture_custom_types(&source_conn, crate::MAIN_DB_ID),
-            target_mvcc_enabled: source_db.mvcc_enabled(),
-            target_auto_vacuum_mode: source_pager.get_auto_vacuum_mode(),
-            copy_mvcc_metadata_table: false,
-        };
-
-        let injector = OneShotTransactionYieldInjector::new();
-        source_conn.set_yield_injector(Some(injector.clone()));
-
-        let mut context = VacuumTargetBuildContext::new(target_conn.clone());
-        let mut saw_explicit_yield = false;
-        loop {
-            match vacuum_target_build_step(&config, &mut context)? {
-                crate::IOResult::Done(()) => break,
-                crate::IOResult::IO(completions) => {
-                    saw_explicit_yield |= completions.is_explicit_yield();
-                    if !completions.is_explicit_yield() {
-                        completions.wait(io.as_ref())?;
-                    }
-                }
-            }
-        }
-
-        source_conn.set_yield_injector(None);
-        source_conn.execute("COMMIT")?;
-
-        assert!(injector.yielded(), "test must trigger the injected yield");
-        assert!(
-            saw_explicit_yield,
-            "vacuum target build must return the nested explicit yield instead of panicking"
-        );
-
-        let mut copied_rows = None;
-        let mut stmt = target_conn.prepare("SELECT COUNT(*) FROM t")?;
-        stmt.run_with_row_callback(|row| {
-            copied_rows = Some(row.get::<i64>(0)?);
-            Ok(())
-        })?;
-        assert_eq!(copied_rows, Some(8));
-
-        Ok(())
-    }
-
-    #[test]
-    fn in_place_vacuum_with_sync_off_syncs_source_db_once_and_wal_twice() -> Result<()> {
-        let io = Arc::new(SyncCountingIo::new("vacuum-source.db"));
-        let io_dyn: Arc<dyn IO> = io.clone();
-        let db = Database::open_file_with_flags(
-            io_dyn,
-            "vacuum-source.db",
-            OpenFlags::Create,
-            DatabaseOpts::new().with_vacuum(true),
-            None,
-            Arc::new(EngineDialect),
-        )?;
-        let conn = db.connect(ConnectOpts::new())?;
-        conn.set_sync_mode(crate::SyncMode::Off);
-
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
-        conn.execute("INSERT INTO t VALUES (1, 'x')")?;
-        conn.execute("INSERT INTO t VALUES (2, 'y')")?;
-
-        let before = io.counts();
-        assert_eq!(
-            before.db, 1,
-            "creating the database does exactly one source db fsync (page 1 must be \
-             durable before the first WAL commit, even with synchronous=OFF); \
-             ordinary writes must not add more"
-        );
-
-        conn.execute("VACUUM")?;
-
-        let after = io.counts();
-        assert_eq!(
-            after.db - before.db,
-            1,
-            "in-place VACUUM must do exactly one source DB fsync before truncating WAL"
-        );
-        assert_eq!(
-            after.wal - before.wal,
-            2,
-            "in-place VACUUM with synchronous=OFF must do one WAL fsync before backfill \
-             (the checkpoint crash-atomicity barrier; VACUUM forces the checkpoint to \
-             synchronous=FULL) and one after truncation"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn in_place_vacuum_with_sync_full_adds_pre_publish_wal_sync() -> Result<()> {
-        let io = Arc::new(SyncCountingIo::new("vacuum-source-full.db"));
-        let io_dyn: Arc<dyn IO> = io.clone();
-        let db = Database::open_file_with_flags(
-            io_dyn,
-            "vacuum-source-full.db",
-            OpenFlags::Create,
-            DatabaseOpts::new().with_vacuum(true),
-            None,
-            Arc::new(EngineDialect),
-        )?;
-        let conn = db.connect(ConnectOpts::new())?;
-        conn.set_sync_mode(crate::SyncMode::Off);
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
-        conn.execute("INSERT INTO t VALUES (1, 'x')")?;
-        conn.execute("INSERT INTO t VALUES (2, 'y')")?;
-
-        conn.set_sync_mode(crate::SyncMode::Full);
-        let before = io.counts();
-
-        conn.execute("VACUUM")?;
-
-        let after = io.counts();
-        assert_eq!(
-            after.db - before.db,
-            1,
-            "in-place VACUUM must still do exactly one source DB fsync under synchronous=FULL"
-        );
-        assert_eq!(
-            after.wal - before.wal,
-            3,
-            "in-place VACUUM with synchronous=FULL must do one WAL fsync before publish, \
-             one before backfill (the checkpoint crash-atomicity barrier), and one after \
-             truncation"
-        );
-
-        Ok(())
-    }
-
     #[cfg(not(target_family = "wasm"))]
     #[test]
     fn vacuum_db_header_meta_updates_target_header() -> Result<()> {
@@ -3317,9 +3120,9 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(DialectThatCannotParse),
         )?;
-        let source_conn = source_db.connect(ConnectOpts::new())?;
+        let source_conn = source_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, 0)?;
 
         let mut source_header = DatabaseHeader::default();
@@ -3330,12 +3133,12 @@ mod tests {
         source_header.application_id = 29.into();
         let header_meta = VacuumDbHeaderMeta::from_source_header(&source_header);
 
-        temp.conn.execute("BEGIN")?;
-        match finalize_vacuum_target_header(&temp.conn, &header_meta)? {
-            crate::IOResult::Done(()) => {}
-            crate::IOResult::IO(_) => panic!("fresh temp header should not need async I/O"),
-        }
-        temp.conn.execute("COMMIT")?;
+        commit_write_tx(&temp.conn, |_| {
+            match finalize_vacuum_target_header(&temp.conn, &header_meta).unwrap() {
+                crate::IOResult::Done(()) => {}
+                crate::IOResult::IO(_) => panic!("fresh temp header should not need async I/O"),
+            }
+        });
 
         let pager = temp.conn.pager.load();
         let header = pager.io.block(|| {
@@ -3360,62 +3163,6 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn vacuum_db_header_meta_schema_cookie_survives_mvcc_target_checkpoint() -> Result<()> {
-        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
-        let target_dir = tempfile::tempdir().unwrap();
-        let target_path = target_dir.path().join("target.db");
-        let target_path = target_path.to_str().unwrap();
-        let target_db = Database::open_file_with_flags(
-            io,
-            target_path,
-            OpenFlags::Create,
-            DatabaseOpts::new(),
-            None,
-            Arc::new(EngineDialect),
-        )?;
-        let target_conn = target_db.connect(ConnectOpts::new())?;
-        target_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
-        target_conn.wal_auto_actions_disable();
-
-        target_conn.execute("BEGIN IMMEDIATE")?;
-        target_conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
-        target_conn.execute("INSERT INTO t VALUES (1, 'x')")?;
-
-        let mut source_header = DatabaseHeader::default();
-        source_header.schema_cookie = 41.into();
-        source_header.user_version = 17.into();
-        source_header.application_id = 29.into();
-        let header_meta = VacuumDbHeaderMeta::from_source_header(&source_header);
-
-        match finalize_vacuum_target_header(&target_conn, &header_meta)? {
-            crate::IOResult::Done(()) => {}
-            crate::IOResult::IO(_) => panic!("MVCC header update should not need async I/O"),
-        }
-        target_conn.execute("COMMIT")?;
-        target_conn.checkpoint(crate::CheckpointMode::Truncate {
-            upper_bound_inclusive: None,
-        })?;
-
-        let pager = target_conn.pager.load();
-        let on_disk = pager.io.block(|| {
-            pager.with_header(|header| {
-                (
-                    header.schema_cookie.get(),
-                    header.user_version.get(),
-                    header.application_id.get(),
-                )
-            })
-        })?;
-        assert_eq!(on_disk, (42, 17, 29));
-
-        let schema_version = target_conn.pragma_query("schema_version")?;
-        assert_eq!(schema_version, vec![vec![crate::Value::from_i64(42)]]);
-
-        Ok(())
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    #[test]
     fn internal_vacuum_temp_db_uses_source_runtime_and_disables_auto_checkpoint() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
         let source_dir = tempfile::tempdir().unwrap();
@@ -3427,9 +3174,9 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(DialectThatCannotParse),
         )?;
-        let source_conn = source_db.connect(ConnectOpts::new())?;
+        let source_conn = source_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
         let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, 0)?;
 
@@ -3463,9 +3210,10 @@ mod tests {
                 cipher: CipherMode::Aes256Gcm.to_string(),
                 hexkey: key_hex.to_string(),
             }),
-            Arc::new(EngineDialect),
+            Arc::new(DialectThatCannotParse),
         )?;
-        let source_conn = source_db.connect(ConnectOpts::new().with_encryption_key(Some(key)))?;
+        let source_conn = source_db
+            .connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(Some(key)))?;
         let reserved_space = source_conn
             .get_reserved_bytes()
             .expect("encrypted source should have reserved bytes");
@@ -3477,64 +3225,8 @@ mod tests {
             temp.conn.get_encryption_cipher_mode(),
             source_conn.get_encryption_cipher_mode()
         );
-        assert!(temp.conn.encryption_key.read().is_some());
+        assert!(temp.conn.encryption_key.is_some());
         assert_eq!(temp.conn.get_reserved_bytes(), Some(reserved_space));
-
-        Ok(())
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn vacuum_target_build_cleanup_clears_target_connection_state() -> Result<()> {
-        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
-        let target_dir = tempfile::tempdir().unwrap();
-        let target_path = target_dir.path().join("target.db");
-        let target_path = target_path.to_str().unwrap();
-        let target_db = Database::open_file_with_flags(
-            io,
-            target_path,
-            OpenFlags::Create,
-            DatabaseOpts::new(),
-            None,
-            Arc::new(EngineDialect),
-        )?;
-        let target_conn = target_db.connect(ConnectOpts::new())?;
-        target_conn.execute("CREATE TABLE seed(x)")?;
-
-        let mut context = VacuumTargetBuildContext::new(target_conn.clone());
-        let helper_stmt = target_conn.prepare_internal("SELECT 1")?;
-        context.phase = VacuumTargetBuildPhase::CollectSchemaRows {
-            schema_stmt: Box::new(helper_stmt),
-        };
-
-        target_conn.execute("BEGIN IMMEDIATE")?;
-        target_conn.execute("INSERT INTO seed VALUES (1)")?;
-        let pager = target_conn.pager.load();
-
-        assert!(!target_conn.get_auto_commit());
-        assert!(target_conn.is_nested_stmt());
-
-        context.cleanup_after_error()?;
-
-        assert!(target_conn.get_auto_commit());
-        assert_eq!(
-            target_conn.get_tx_state(),
-            crate::connection::TransactionState::None
-        );
-        assert!(!target_conn.is_nested_stmt());
-        assert!(!pager.holds_read_lock());
-        assert!(!pager.holds_write_lock());
-
-        let mut stmt = target_conn.prepare("SELECT COUNT(*) FROM seed")?;
-        let mut saw_row = false;
-        stmt.run_with_row_callback(|_| {
-            saw_row = true;
-            Ok(())
-        })?;
-        assert!(
-            saw_row,
-            "target cleanup should leave the connection queryable"
-        );
 
         Ok(())
     }

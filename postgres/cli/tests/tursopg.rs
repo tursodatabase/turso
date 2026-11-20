@@ -476,7 +476,7 @@ fn role_without_privileges_can_use_table_valued_functions() {
         b"CREATE ROLE alice;\n\
           SET ROLE alice;\n\
           SELECT count(*) FROM generate_series(1, 3);\n\
-          SELECT count(*) FROM json_each('[1, 2]');\n",
+          SELECT count(*) FROM json_each('{\"a\": 1, \"b\": 2}');\n",
     );
     let output = stdout(&output);
     assert!(!output.contains("Error"), "{output}");

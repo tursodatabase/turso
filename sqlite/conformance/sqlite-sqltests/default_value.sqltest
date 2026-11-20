@@ -133,3 +133,65 @@ test scalar-function-in-default-control {
 expect {
     1
 }
+
+@skip-if sqlite "DEFAULT in a SET clause is a Turso extension"
+test update-set-default-writes-the-column-default {
+    CREATE TABLE ud1 (a INTEGER DEFAULT 7, b INTEGER);
+    INSERT INTO ud1 VALUES (1, 2);
+    UPDATE ud1 SET a = DEFAULT;
+    SELECT a, b FROM ud1;
+}
+expect {
+    7|2
+}
+
+@skip-if sqlite "DEFAULT in a SET clause is a Turso extension"
+test update-set-default-without-a-column-default-writes-null {
+    CREATE TABLE ud4 (a INTEGER, b INTEGER);
+    INSERT INTO ud4 VALUES (1, 2);
+    UPDATE ud4 SET a = DEFAULT;
+    SELECT a IS NULL, b FROM ud4;
+}
+expect {
+    1|2
+}
+
+@skip-if sqlite "DEFAULT in a SET clause is a Turso extension"
+test update-set-row-value-default-writes-the-column-default {
+    CREATE TABLE ud2 (a INTEGER DEFAULT 7, b INTEGER);
+    INSERT INTO ud2 VALUES (1, 2);
+    UPDATE ud2 SET (a, b) = (DEFAULT, 3);
+    SELECT a, b FROM ud2;
+}
+expect {
+    7|3
+}
+
+@skip-if sqlite "DEFAULT in a SET clause is a Turso extension"
+test upsert-set-default-writes-the-column-default {
+    CREATE TABLE ud3 (a INTEGER DEFAULT 7, b INTEGER UNIQUE);
+    INSERT INTO ud3 VALUES (1, 2);
+    INSERT INTO ud3 VALUES (3, 2) ON CONFLICT (b) DO UPDATE SET a = DEFAULT;
+    SELECT a, b FROM ud3;
+}
+expect {
+    7|2
+}
+
+@skip-if sqlite "DEFAULT in a SET clause is a Turso extension"
+test upsert-set-default-inside-a-row-value {
+    CREATE TABLE ud4 (a INTEGER DEFAULT 7, b INTEGER UNIQUE, c INTEGER);
+    INSERT INTO ud4 VALUES (1, 2, 3);
+    INSERT INTO ud4 VALUES (4, 2, 5) ON CONFLICT (b) DO UPDATE SET (a, c) = (DEFAULT, 9);
+    SELECT a, b, c FROM ud4;
+}
+expect {
+    7|2|9
+}
+
+test update-set-expression-containing-default-is-rejected {
+    CREATE TABLE ud5 (a INTEGER DEFAULT 7);
+    INSERT INTO ud5 VALUES (1);
+    UPDATE ud5 SET a = DEFAULT + 1;
+}
+expect error {}

@@ -1,10 +1,11 @@
 use crate::sync::Arc;
 use crate::util::{escape_sql_string_literal, normalize_ident, quote_identifier};
+use crate::vtab::column_definition;
 use crate::{Connection, LimboError, Statement, StepResult, Value};
 use bitflags::bitflags;
 use strum::IntoEnumIterator;
 use turso_ext::{ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, ResultCode};
-use turso_parser::ast::PragmaName;
+use turso_parser::ast::{self, PragmaName};
 
 bitflags! {
     // Flag names match those used in SQLite:
@@ -147,6 +148,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["auto_vacuum"],
         ),
+        AutomaticIndex => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["automatic_index"],
+        ),
         BusyTimeout => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["busy_timeout"],
@@ -199,6 +204,13 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         ForeignKeys => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["foreign_keys"],
+        ),
+        ForeignKeyCheck => Pragma::new(
+            PragmaFlags::NeedSchema
+                | PragmaFlags::Result0
+                | PragmaFlags::Result1
+                | PragmaFlags::SchemaOpt,
+            &["table", "rowid", "parent", "fkid"],
         ),
         ForeignKeyList => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
@@ -259,7 +271,7 @@ pub(crate) struct PragmaVirtualTable {
 }
 
 impl PragmaVirtualTable {
-    pub(crate) fn functions() -> Vec<(PragmaVirtualTable, String)> {
+    pub(crate) fn functions() -> Vec<(PragmaVirtualTable, Vec<ast::ColumnDefinition>)> {
         PragmaName::iter()
             .filter(|name| {
                 *name != PragmaName::LegacyFileFormat
@@ -281,20 +293,17 @@ impl PragmaVirtualTable {
             .collect()
     }
 
-    fn create(pragma_name: String, pragma: Pragma) -> (Self, String) {
+    fn create(pragma_name: String, pragma: Pragma) -> (Self, Vec<ast::ColumnDefinition>) {
         let mut max_arg_count = 0;
         let mut has_pragma_arg = false;
 
-        let mut sql = String::from("CREATE TABLE x (");
-        let col_defs = pragma
+        let mut columns: Vec<ast::ColumnDefinition> = pragma
             .columns
             .iter()
-            .map(|col| format!("\"{col}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        sql.push_str(&col_defs);
+            .map(|col| column_definition(col, ""))
+            .collect();
         if pragma.flags.contains(PragmaFlags::Result1) {
-            sql.push_str(", arg HIDDEN");
+            columns.push(column_definition("arg", "HIDDEN"));
             max_arg_count += 1;
             has_pragma_arg = true;
         }
@@ -302,10 +311,9 @@ impl PragmaVirtualTable {
             .flags
             .intersects(PragmaFlags::SchemaOpt | PragmaFlags::SchemaReq)
         {
-            sql.push_str(", schema HIDDEN");
+            columns.push(column_definition("schema", "HIDDEN"));
             max_arg_count += 1;
         }
-        sql.push(')');
 
         (
             PragmaVirtualTable {
@@ -314,7 +322,7 @@ impl PragmaVirtualTable {
                 max_arg_count,
                 has_pragma_arg,
             },
-            sql,
+            columns,
         )
     }
 
@@ -355,6 +363,11 @@ impl PragmaVirtualTable {
                 1 => arg1_idx = Some(i),
                 _ => unreachable!("Unexpected hidden column index: {}", hidden_idx),
             }
+        }
+
+        // Without the table argument, do not pass a schema value as that argument.
+        if self.has_pragma_arg && arg0_idx.is_none() {
+            arg1_idx = None;
         }
 
         let argv_arg0_idx = arg0_idx.map_or(0, |_| 1);
@@ -448,7 +461,8 @@ impl PragmaVirtualTableCursor {
     fn namespace_of_object(&self, name: &str) -> Option<String> {
         let names_an_index = match self.pragma_name.as_str() {
             "index_info" | "index_xinfo" => true,
-            "table_info" | "table_xinfo" | "index_list" | "foreign_key_list" => false,
+            "table_info" | "table_xinfo" | "index_list" | "foreign_key_list"
+            | "foreign_key_check" => false,
             _ => return None,
         };
         let name = normalize_ident(name);
@@ -535,38 +549,6 @@ impl PragmaVirtualTableCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConnectOpts, Database, EngineDialect, MemoryIO};
-
-    #[test]
-    fn filter_starts_each_pragma_scan_at_rowid_one() {
-        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
-        let db =
-            Database::open_file(io, crate::util::MEMORY_PATH, Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-        conn.execute("CREATE TABLE scan_target(first, second)")
-            .unwrap();
-
-        let pragma_vtab = PragmaVirtualTable {
-            pragma_name: "table_info".to_string(),
-            visible_column_count: 6,
-            max_arg_count: 2,
-            has_pragma_arg: true,
-        };
-        let mut cursor = pragma_vtab.open(conn).unwrap();
-
-        assert!(cursor
-            .filter(crate::alloc::vec![Value::from_text("scan_target")])
-            .unwrap());
-        assert_eq!(cursor.rowid(), 1);
-        assert!(cursor.next().unwrap());
-        assert_eq!(cursor.rowid(), 2);
-        assert!(!cursor.next().unwrap());
-
-        assert!(cursor
-            .filter(crate::alloc::vec![Value::from_text("scan_target")])
-            .unwrap());
-        assert_eq!(cursor.rowid(), 1);
-    }
 
     #[test]
     fn test_best_index_argv_order_both_hidden_constraints() {

@@ -1,0 +1,1266 @@
+# Known tursopg gaps against PostgreSQL: E. DDL & catalog
+#
+# Each test with a `@compat-gap "<kind>:<object>"` label records a known
+# difference: its default `expect` block is PostgreSQL 18's answer and its
+# `expect @tursopg` block is tursopg's current wrong answer. When tursopg
+# gives the PostgreSQL answer, the tursopg run fails with "gap fixed": then
+# delete only `@compat-gap` and the `expect @tursopg` block, and keep the
+# test. A test without `@compat-gap` matches PostgreSQL and guards against
+# regressions. The `# X-NN` comments are the IDs from the audit that found
+# each gap.
+
+@database :memory:
+
+setup t_id_s_with_rows {
+    CREATE TABLE t (id int PRIMARY KEY, s text);
+    INSERT INTO t VALUES (1, 'a');
+}
+
+setup t_id {
+    CREATE TABLE t (id int);
+}
+
+setup t_id_view_v {
+    CREATE TABLE t (id int);
+    CREATE VIEW v AS SELECT id FROM t;
+}
+
+setup type_mood {
+    CREATE TYPE mood AS ENUM ('happy', 'sad');
+}
+
+setup t_id_serial {
+    CREATE TABLE t (id serial PRIMARY KEY);
+}
+
+setup schema_api_api_items_id {
+    CREATE SCHEMA api;
+    CREATE TABLE api.items (id int PRIMARY KEY);
+}
+
+setup p_a_b_c_x_y_fkey {
+    CREATE TABLE p (a int, b int, PRIMARY KEY (a, b));
+    CREATE TABLE c (x int, y int, CONSTRAINT c_xy_fkey FOREIGN KEY (x, y) REFERENCES p (a, b));
+}
+
+@backend postgres
+setup auth_uid_on_postgres {
+    CREATE SCHEMA auth;
+    CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ SELECT nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;
+}
+
+@backend postgres
+setup auth_uid_from_claims_on_postgres {
+    CREATE SCHEMA auth;
+    CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ SELECT coalesce(nullif(current_setting('request.jwt.claim.sub', true), ''), (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub'))::uuid $$;
+}
+
+setup t_id_s_policy_p {
+    CREATE TABLE t (id int PRIMARY KEY, s text);
+    CREATE POLICY p ON t USING (true);
+}
+
+# E-01: ALTER TABLE ADD COLUMN with DEFAULT backfills
+test alter-table-add-column-with-default-backfills {
+    CREATE TABLE t (id int PRIMARY KEY, s text);
+    INSERT INTO t VALUES (1, 'a');
+    ALTER TABLE t ADD COLUMN n int NOT NULL DEFAULT 7;
+    SELECT n FROM t;
+}
+expect {
+    7
+}
+
+# E-02: ALTER TABLE DROP COLUMN
+@setup t_id_s_with_rows
+test alter-table-drop-column {
+    ALTER TABLE t DROP COLUMN s;
+}
+expect {
+}
+
+# E-03: ALTER TABLE RENAME COLUMN
+@setup t_id_s_with_rows
+test alter-table-rename-column {
+    ALTER TABLE t RENAME COLUMN s TO s2;
+}
+expect {
+}
+
+# E-04: ALTER COLUMN SET DEFAULT
+@setup t_id_s_with_rows
+@compat-gap "syntax:alter-table"
+test alter-column-set-default {
+    ALTER TABLE t ALTER COLUMN s SET DEFAULT 'x';
+}
+expect {
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# E-05: ALTER COLUMN DROP DEFAULT
+@setup t_id_s_with_rows
+@compat-gap "syntax:alter-table"
+test alter-column-drop-default {
+    ALTER TABLE t ALTER COLUMN s DROP DEFAULT;
+}
+expect {
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# E-06: ALTER COLUMN SET NOT NULL
+@setup t_id_s_with_rows
+@compat-gap "syntax:alter-table"
+test alter-column-set-not-null {
+    ALTER TABLE t ALTER COLUMN s SET NOT NULL;
+}
+expect {
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# E-07: ALTER COLUMN DROP NOT NULL
+@compat-gap "syntax:alter-table"
+test alter-column-drop-not-null {
+    CREATE TABLE t (id int, s text NOT NULL);
+    ALTER TABLE t ALTER COLUMN s DROP NOT NULL;
+}
+expect {
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# E-08: ALTER COLUMN TYPE
+@setup t_id_s_with_rows
+@compat-gap "syntax:alter-table"
+test alter-column-type {
+    ALTER TABLE t ALTER COLUMN s TYPE varchar(10);
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-09: ADD CONSTRAINT UNIQUE
+@setup t_id_s_with_rows
+@compat-gap "syntax:alter-table"
+test add-constraint-unique {
+    ALTER TABLE t ADD CONSTRAINT t_s_key UNIQUE (s);
+}
+expect {
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# E-10: ADD CONSTRAINT FOREIGN KEY
+@compat-gap "syntax:alter-table"
+test add-constraint-foreign-key {
+    CREATE TABLE p (id int PRIMARY KEY);
+    CREATE TABLE t (id int, pid int);
+    ALTER TABLE t ADD CONSTRAINT t_pid_fkey FOREIGN KEY (pid) REFERENCES p(id);
+}
+expect {
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# E-11: ADD CONSTRAINT CHECK
+@setup t_id_s_with_rows
+@compat-gap "syntax:alter-table"
+test add-constraint-check {
+    ALTER TABLE t ADD CONSTRAINT t_s_check CHECK (s <> '');
+}
+expect {
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# E-12: DROP CONSTRAINT
+@compat-gap "syntax:alter-table"
+test drop-constraint {
+    CREATE TABLE t (id int, s text CONSTRAINT t_s_key UNIQUE);
+    ALTER TABLE t DROP CONSTRAINT t_s_key;
+}
+expect {
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# E-13: ALTER TABLE RENAME TO
+@setup t_id_s_with_rows
+test alter-table-rename-to {
+    ALTER TABLE t RENAME TO t2;
+}
+expect {
+}
+
+# E-14: generated STORED column value
+test generated-stored-column-value {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (3);
+    SELECT a, b FROM t;
+}
+expect {
+    3|6
+}
+
+# E-15: identity ALWAYS column assigns ids
+test identity-always-column-assigns-ids {
+    CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY, s text);
+    INSERT INTO t (s) VALUES ('a'), ('b');
+    SELECT id, s FROM t ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+}
+
+# E-16: identity BY DEFAULT accepts explicit
+test identity-by-default-accepts-explicit {
+    CREATE TABLE t (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, s text);
+    INSERT INTO t (id, s) VALUES (10, 'a');
+    INSERT INTO t (s) VALUES ('b');
+    SELECT id FROM t ORDER BY id;
+}
+expect {
+    1
+    10
+}
+
+# E-17: identity in pg_attribute.attidentity
+test identity-in-pg-attribute-attidentity {
+    CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY, s text);
+    SELECT attname, attidentity FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 't') AND attnum > 0 ORDER BY attnum;
+}
+expect {
+    id|a
+    s|
+}
+
+# E-18: generated column in pg_attribute.attgenerated
+test generated-column-in-pg-attribute-attgenerated {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    SELECT attname, attgenerated FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 't') AND attnum > 0 ORDER BY attnum;
+}
+expect {
+    a|
+    b|s
+}
+
+# E-19: 't'::regclass resolves
+@setup t_id
+@compat-gap "type:regclass"
+test t-regclass-resolves {
+    SELECT 't'::regclass::oid = (SELECT oid FROM pg_class WHERE relname = 't');
+}
+expect {
+    t
+}
+expect @tursopg {
+    0
+}
+
+# E-20: view in pg_class relkind v
+@setup t_id_view_v
+@compat-gap "syntax:catalog"
+test view-in-pg-class-relkind-v {
+    SELECT relname, relkind FROM pg_class WHERE relname IN ('t', 'v') ORDER BY relname;
+}
+expect {
+    t|r
+    v|v
+}
+expect @tursopg {
+    t|r
+}
+
+# E-21: pg_views
+@setup t_id_view_v
+@compat-gap "syntax:catalog"
+test pg-views {
+    SELECT schemaname, viewname FROM pg_views WHERE schemaname = 'public';
+}
+expect {
+    public|v
+}
+@sqlstate 42P01
+expect @tursopg error {}
+
+# E-22: view columns in pg_attribute
+@setup t_id_view_v
+@compat-gap "syntax:catalog"
+test view-columns-in-pg-attribute {
+    SELECT a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'v' AND a.attnum > 0;
+}
+expect {
+    id|integer
+}
+expect @tursopg {
+}
+
+# E-23: pg_enum
+@setup type_mood
+@compat-gap "syntax:catalog"
+test pg-enum {
+    SELECT enumlabel FROM pg_enum ORDER BY enumsortorder;
+}
+expect {
+    happy
+    sad
+}
+@sqlstate 42P01
+expect @tursopg error {}
+
+# E-24: enum in pg_type typtype e
+@setup type_mood
+test enum-in-pg-type-typtype-e {
+    SELECT typname, typtype FROM pg_type WHERE typname = 'mood';
+}
+expect {
+    mood|e
+}
+
+# E-25: enum column atttypid/format_type
+@compat-gap "function:format_type"
+test enum-column-atttypid-format-type {
+    CREATE TYPE mood AS ENUM ('happy', 'sad');
+    CREATE TABLE t (m mood);
+    SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 't') AND attname = 'm';
+}
+expect {
+    mood
+}
+expect @tursopg {
+    unknown
+}
+
+# E-26: domain in pg_type typtype d
+test domain-in-pg-type-typtype-d {
+    CREATE DOMAIN posint AS integer CHECK (VALUE > 0);
+    SELECT typname, typtype, format_type(typbasetype, NULL) FROM pg_type WHERE typname = 'posint';
+}
+expect {
+    posint|d|integer
+}
+
+# E-27: domain column format_type
+@compat-gap "function:format_type"
+test domain-column-format-type {
+    CREATE DOMAIN posint AS integer CHECK (VALUE > 0);
+    CREATE TABLE t (n posint);
+    SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 't') AND attname = 'n';
+}
+expect {
+    posint
+}
+expect @tursopg {
+    unknown
+}
+
+# E-28: serial column default in pg_attrdef
+@setup t_id_serial
+@compat-gap "function:pg_get_expr"
+test serial-column-default-in-pg-attrdef {
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = (SELECT oid FROM pg_class WHERE relname = 't');
+}
+expect {
+    nextval('t_id_seq'::regclass)
+}
+expect @tursopg {
+    nextval ('__turso_ns1_t_id_seq')
+}
+
+# E-29: serial internal tables visible
+@setup t_id_serial
+@compat-gap "syntax:catalog"
+test serial-internal-tables-visible {
+    SELECT relname, relkind FROM pg_class WHERE relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public') ORDER BY relname;
+}
+expect {
+    t|r
+    t_id_seq|S
+    t_pkey|i
+}
+expect @tursopg {
+    __turso_internal_pk_index_t|i
+    t|r
+    t_id_seq|S
+}
+
+# E-30: format_type with typmod
+@compat-gap "function:format_type"
+test format-type-with-typmod {
+    CREATE TABLE t (n numeric(10,2), v varchar(5), ts timestamptz, j jsonb, u uuid, a text[]);
+    SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 't') AND attnum > 0 ORDER BY attnum;
+}
+expect {
+    n|numeric(10,2)
+    v|character varying(5)
+    ts|timestamp with time zone
+    j|jsonb
+    u|uuid
+    a|text[]
+}
+expect @tursopg {
+    n|numeric
+    v|character varying
+    ts|timestamp with time zone
+    j|jsonb
+    u|uuid
+    a|text
+}
+
+# E-31: information_schema.columns
+@setup t_id
+@compat-gap "syntax:information-schema"
+test information-schema-columns {
+    SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 't';
+}
+expect {
+    id|integer
+}
+@sqlstate 42P01
+expect @tursopg error {}
+
+# E-32: information_schema.tables
+@setup t_id
+@compat-gap "syntax:information-schema"
+test information-schema-tables {
+    SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public';
+}
+expect {
+    t|BASE TABLE
+}
+@sqlstate 42P01
+expect @tursopg error {}
+
+# E-33: pg_class rows for non-public schema
+@setup schema_api_api_items_id
+test pg-class-rows-for-non-public-schema {
+    SELECT c.relname, n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'api' AND c.relkind = 'r';
+}
+expect {
+    items|api
+}
+
+# E-34: pg_attribute rows for non-public schema
+test pg-attribute-rows-for-non-public-schema {
+    CREATE SCHEMA api;
+    CREATE TABLE api.items (id int PRIMARY KEY, s text);
+    SELECT a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'api' AND c.relkind = 'r' AND a.attnum > 0 ORDER BY a.attnum;
+}
+expect {
+    id
+    s
+}
+
+# E-35: pg_constraint rows for non-public schema
+@setup schema_api_api_items_id
+@compat-gap "syntax:catalog"
+test pg-constraint-rows-for-non-public-schema {
+    SELECT conname, contype FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace WHERE n.nspname = 'api';
+}
+expect {
+    items_id_not_null|n
+    items_pkey|p
+}
+expect @tursopg {
+}
+
+# E-37: cross-schema FK (public -> auth)
+test cross-schema-fk-public-auth {
+    CREATE SCHEMA IF NOT EXISTS auth;
+    CREATE TABLE auth.users (id uuid PRIMARY KEY);
+    CREATE TABLE profiles (id uuid PRIMARY KEY REFERENCES auth.users(id));
+    INSERT INTO auth.users VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    INSERT INTO profiles VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11') RETURNING id;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+# E-38: cross-schema FK rejects orphan
+# Fails while foreign keys are off, see D-01.
+@compat-gap "syntax:foreign-key"
+test cross-schema-fk-rejects-orphan {
+    CREATE SCHEMA IF NOT EXISTS auth;
+    CREATE TABLE auth.users (id uuid PRIMARY KEY);
+    CREATE TABLE profiles (id uuid PRIMARY KEY REFERENCES auth.users(id));
+    INSERT INTO profiles VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+}
+@sqlstate 23503
+expect error {}
+expect @tursopg {
+}
+
+# E-39: FK in pg_constraint confrelid/conkey/confkey
+@compat-gap "syntax:catalog"
+test fk-in-pg-constraint-confrelid-conkey-confkey {
+    CREATE TABLE p (id int PRIMARY KEY);
+    CREATE TABLE c (id int, pid int CONSTRAINT c_pid_fkey REFERENCES p(id));
+    SELECT conname, confrelid = (SELECT oid FROM pg_class WHERE relname = 'p'), conkey::text, confkey::text FROM pg_constraint WHERE contype = 'f';
+}
+expect {
+    c_pid_fkey|t|{2}|{1}
+}
+expect @tursopg {
+    c_pid_fkey|1|2|1
+}
+
+# E-40: COMMENT ON TABLE + obj_description
+@compat-gap "function:obj_description"
+test comment-on-table-obj-description {
+    CREATE TABLE t (id int);
+    COMMENT ON TABLE t IS 'hello';
+    SELECT obj_description((SELECT oid FROM pg_class WHERE relname = 't'), 'pg_class');
+}
+expect {
+    hello
+}
+expect @tursopg {
+}
+
+# E-41: COMMENT ON COLUMN + col_description
+@compat-gap "function:col_description"
+test comment-on-column-col-description {
+    CREATE TABLE t (id int);
+    COMMENT ON COLUMN t.id IS 'pk';
+    SELECT col_description((SELECT oid FROM pg_class WHERE relname = 't'), 1);
+}
+expect {
+    pk
+}
+expect @tursopg {
+}
+
+# E-42: SHOW search_path
+test show-search-path {
+    SHOW search_path;
+}
+expect {
+    "$user", public
+}
+
+# E-43: SET search_path then unqualified
+test set-search-path-then-unqualified {
+    CREATE SCHEMA api;
+    CREATE TABLE api.items (id int);
+    INSERT INTO api.items VALUES (1);
+    SET search_path TO api, public;
+    SELECT id FROM items;
+}
+expect {
+    1
+}
+
+# E-44: CREATE POLICY
+@setup t_id_s_with_rows
+test create-policy {
+    CREATE POLICY p ON t FOR SELECT USING (true);
+}
+expect {
+}
+
+# E-45: ENABLE ROW LEVEL SECURITY
+@setup t_id_s_with_rows
+test enable-row-level-security {
+    ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+}
+expect {
+}
+
+# E-46: CREATE FUNCTION language sql
+@compat-gap "syntax:create-function"
+test create-function-language-sql {
+    CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-47: CREATE TRIGGER
+@setup t_id
+@compat-gap "syntax:create-trigger"
+test create-trigger {
+    CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-48: GRANT
+@setup t_id_s_with_rows
+test grant {
+    GRANT SELECT ON t TO PUBLIC;
+}
+expect {
+}
+
+# E-49: SET LOCAL ROLE nonexistent
+@compat-gap "syntax:set-role"
+test set-local-role-nonexistent {
+    BEGIN;
+    SET LOCAL ROLE nosuchrole;
+}
+@sqlstate 22023
+expect error {}
+@sqlstate 42704
+expect @tursopg error {}
+
+# E-50: pg_index indkey for PK
+@setup t_id_s_with_rows
+test pg-index-indkey-for-pk {
+    SELECT indisprimary, indkey::text FROM pg_index WHERE indrelid = (SELECT oid FROM pg_class WHERE relname = 't');
+}
+expect {
+    t|1
+}
+
+# E-51: pg_get_indexdef
+@compat-gap "function:pg_get_indexdef"
+test pg-get-indexdef {
+    CREATE TABLE t (id int, s text);
+    CREATE UNIQUE INDEX t_s_idx ON t (s) WHERE id > 0;
+    SELECT pg_get_indexdef((SELECT oid FROM pg_class WHERE relname = 't_s_idx'));
+}
+expect {
+    CREATE UNIQUE INDEX t_s_idx ON public.t USING btree (s) WHERE (id > 0)
+}
+expect @tursopg {
+    CREATE UNIQUE INDEX t_s_idx ON public.t USING btree (s) WHERE id > 0
+}
+
+# E-52: pg_get_constraintdef FK
+test pg-get-constraintdef-fk {
+    CREATE TABLE p (id int PRIMARY KEY);
+    CREATE TABLE c (pid int CONSTRAINT c_pid_fkey REFERENCES p(id) ON DELETE CASCADE);
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'c_pid_fkey';
+}
+expect {
+    FOREIGN KEY (pid) REFERENCES p(id) ON DELETE CASCADE
+}
+
+# E-53: DROP TABLE CASCADE with dependent view
+@compat-gap "syntax:drop-table"
+test drop-table-cascade-with-dependent-view {
+    CREATE TABLE t (id int);
+    CREATE VIEW v AS SELECT id FROM t;
+    DROP TABLE t CASCADE;
+    SELECT count(*) FROM pg_class WHERE relname IN ('t', 'v');
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-54: DROP TABLE without CASCADE blocked by view
+@setup t_id_view_v
+@compat-gap "syntax:drop-table"
+test drop-table-without-cascade-blocked-by-view {
+    DROP TABLE t;
+}
+@sqlstate 2BP01
+expect error {}
+expect @tursopg {
+}
+
+# E-55: SAVEPOINT / ROLLBACK TO
+test savepoint-rollback-to {
+    CREATE TABLE t (id int);
+    BEGIN;
+    INSERT INTO t VALUES (1);
+    SAVEPOINT s1;
+    INSERT INTO t VALUES (2);
+    ROLLBACK TO SAVEPOINT s1;
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+}
+
+# E-56: CREATE TABLE IF NOT EXISTS in non-public schema twice
+test create-table-if-not-exists-in-non-public-schema {
+    CREATE SCHEMA api;
+    CREATE TABLE IF NOT EXISTS api.t (id int);
+    CREATE TABLE IF NOT EXISTS api.t (id int);
+}
+expect {
+}
+
+# E-57: pg_namespace after DROP SCHEMA
+test pg-namespace-after-drop-schema {
+    CREATE SCHEMA api;
+    DROP SCHEMA api;
+    SELECT count(*) FROM pg_namespace WHERE nspname = 'api';
+}
+expect {
+    0
+}
+
+# E-58: column default now() in pg_attrdef
+@compat-gap "function:pg_get_expr"
+test column-default-now-in-pg-attrdef {
+    CREATE TABLE t (ts timestamptz DEFAULT now());
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = (SELECT oid FROM pg_class WHERE relname = 't');
+}
+expect {
+    now()
+}
+expect @tursopg {
+    now ()
+}
+
+# E-59: pg_attribute attnotnull / atthasdef
+test pg-attribute-attnotnull-atthasdef {
+    CREATE TABLE t (id int PRIMARY KEY, s text NOT NULL DEFAULT 'x', n int);
+    SELECT attname, attnotnull, atthasdef FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 't') AND attnum > 0 ORDER BY attnum;
+}
+expect {
+    id|t|f
+    s|t|t
+    n|f|f
+}
+
+# E-60: CREATE INDEX USING gin
+@compat-gap "syntax:create-index"
+test create-index-using-gin {
+    CREATE TABLE t (j jsonb);
+    CREATE INDEX t_j_idx ON t USING gin (j);
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-61: CREATE EXTENSION
+@compat-gap "syntax:create-extension"
+test create-extension {
+    CREATE EXTENSION IF NOT EXISTS pgcrypto;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-62: CREATE TYPE composite
+@compat-gap "syntax:create-type"
+test create-type-composite {
+    CREATE TYPE pair AS (a int, b text);
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-63: CREATE MATERIALIZED VIEW then select
+@compat-gap "syntax:create-materialized-view"
+test create-materialized-view-then-select {
+    CREATE TABLE t (id int);
+    INSERT INTO t VALUES (1);
+    CREATE MATERIALIZED VIEW mv AS SELECT id FROM t;
+    SELECT id FROM mv;
+}
+expect {
+    1
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# E-64: partitioned table without partitions rejects insert
+@compat-gap "syntax:partitioned-table"
+test partitioned-table-without-partitions-rejects-insert {
+    CREATE TABLE m (id int, d date) PARTITION BY RANGE (d);
+    INSERT INTO m VALUES (1, '2026-10-08');
+}
+@sqlstate 23514
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-65: ALTER TYPE ADD VALUE
+@compat-gap "syntax:alter-type"
+test alter-type-add-value {
+    CREATE TYPE mood AS ENUM ('happy');
+    ALTER TYPE mood ADD VALUE 'sad';
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-66: CHECK constraint on smallint column
+test check-constraint-on-smallint-column {
+    CREATE TABLE t (n smallint DEFAULT 0 CHECK (n >= 0 AND n <= 2));
+    INSERT INTO t VALUES (1) RETURNING n;
+}
+expect {
+    1
+}
+
+# E-67: DEFAULT auth.uid() column read back
+@setup auth_uid_on_postgres
+test default-auth-uid-column-read-back {
+    CREATE TABLE t (id int, owner uuid DEFAULT auth.uid());
+    INSERT INTO t (id, owner) VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT id FROM t WHERE owner = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+}
+expect {
+    1
+}
+
+# E-68: empty search_path still finds pg_catalog
+test empty-search-path-still-finds-pg-catalog {
+    CREATE TABLE t (id int);
+    SET search_path TO '';
+    SELECT relname FROM pg_class WHERE relname = 't';
+}
+expect {
+    t
+}
+
+# E-69: identity BY DEFAULT assigns ids
+test identity-by-default-assigns-ids {
+    CREATE TABLE t (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, s text);
+    INSERT INTO t (s) VALUES ('a') RETURNING id;
+}
+expect {
+    1
+}
+
+# E-70: schema-qualified public table outside search_path
+test schema-qualified-public-table-outside-search-path {
+    CREATE TABLE t (id int);
+    INSERT INTO t VALUES (1);
+    SET search_path TO auth;
+    SELECT id FROM public.t;
+}
+expect {
+    1
+}
+
+# E-73: omitted nullable uuid column stays NULL
+@compat-gap "type:uuid"
+test omitted-nullable-uuid-column-stays-null {
+    CREATE TABLE t (id int PRIMARY KEY, u uuid);
+    INSERT INTO t (id) VALUES (1);
+    SELECT id, u IS NULL FROM t;
+}
+expect {
+    1|t
+}
+expect @tursopg {
+    1|1
+}
+
+# E-74: quoted identifier keeps its case in pg_class
+test quoted-identifier-keeps-its-case-in-pg-class {
+    CREATE TABLE "Todos" (id int);
+    SELECT relname FROM pg_class WHERE relname IN ('Todos', 'todos') ORDER BY relname;
+}
+expect {
+    Todos
+}
+
+# E-79: REINDEX
+@compat-gap "syntax:reindex"
+test reindex {
+    CREATE TABLE t (id int, s text);
+    CREATE INDEX t_s_idx ON t (s);
+    INSERT INTO t VALUES (1, 'a');
+    REINDEX TABLE t;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-80: ALTER COLUMN TYPE on an indexed column, then select it
+@compat-gap "syntax:alter-table"
+test alter-column-type-on-an-indexed-column-then-select-it {
+    CREATE TABLE t (id int, s text);
+    CREATE INDEX t_s_idx ON t (s);
+    INSERT INTO t VALUES (1, 'a');
+    ALTER TABLE t ALTER COLUMN s TYPE varchar(10);
+    SELECT s FROM t;
+}
+expect {
+    a
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-81: quoted schema name keeps its case
+@compat-gap "syntax:catalog"
+test quoted-schema-name-keeps-its-case {
+    CREATE SCHEMA "Api";
+    SELECT nspname FROM pg_namespace WHERE nspname IN ('Api', 'api');
+}
+expect {
+    Api
+}
+expect @tursopg {
+    api
+}
+
+# E-82: CREATE TYPE in a non-public schema
+@compat-gap "syntax:create-type"
+test create-type-in-a-non-public-schema {
+    CREATE SCHEMA api;
+    CREATE TYPE api.mood AS ENUM ('sad', 'happy');
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-85: table in a quoted non-ASCII schema
+@compat-gap "syntax:create-schema"
+test table-in-a-quoted-non-ascii-schema {
+    CREATE SCHEMA "ÄPP";
+    CREATE TABLE "ÄPP".t (id int);
+}
+expect {
+}
+@sqlstate 3F000
+expect @tursopg error {}
+
+# E-86: DEFAULT auth.uid() in pg_attrdef
+@setup auth_uid_from_claims_on_postgres
+@compat-gap "function:pg_get_expr"
+test default-auth-uid-in-pg-attrdef {
+    CREATE TABLE t (owner uuid DEFAULT auth.uid());
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = (SELECT oid FROM pg_class WHERE relname = 't');
+}
+expect {
+    auth.uid()
+}
+expect @tursopg {
+    "auth.uid" ()
+}
+
+# E-87: CHECK calling auth.uid()
+@setup auth_uid_from_claims_on_postgres
+test check-calling-auth-uid {
+    CREATE TABLE t (owner uuid CHECK (owner = auth.uid()));
+}
+expect {
+}
+
+# E-89: BYPASSRLS role attribute
+@compat-gap "syntax:alter-role"
+test bypassrls-role-attribute {
+    ALTER ROLE CURRENT_USER WITH BYPASSRLS;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-90: ALTER DEFAULT PRIVILEGES
+@compat-gap "syntax:alter-default-privileges"
+test alter-default-privileges {
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO PUBLIC;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-91: CREATE POLICY with a FROM subquery
+@compat-gap "syntax:create-policy"
+test create-policy-with-a-from-subquery {
+    CREATE TABLE t (id int PRIMARY KEY, s text);
+    CREATE TABLE u (id int);
+    CREATE POLICY p ON t USING (id IN (SELECT id FROM u));
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-92: ALTER POLICY
+@setup t_id_s_policy_p
+@compat-gap "syntax:alter-policy"
+test alter-policy {
+    ALTER POLICY p ON t USING (false);
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-93: FORCE ROW LEVEL SECURITY
+@compat-gap "syntax:row-level-security"
+test force-row-level-security {
+    CREATE TABLE t (id int PRIMARY KEY, s text);
+    ALTER TABLE t FORCE ROW LEVEL SECURITY;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-94: GRANT role membership
+@compat-gap "syntax:grant"
+test grant-role-membership {
+    GRANT pg_read_all_data TO CURRENT_USER;
+}
+expect {
+}
+@sqlstate 42704
+expect @tursopg error {}
+
+# E-95: REVOKE
+@setup t_id_s_with_rows
+test revoke {
+    REVOKE SELECT ON t FROM PUBLIC;
+}
+expect {
+}
+
+# E-96: GRANT column privileges
+@setup t_id_s_with_rows
+@compat-gap "syntax:grant"
+test grant-column-privileges {
+    GRANT SELECT (id) ON t TO PUBLIC;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-97: CREATE TABLE in pg_catalog
+@compat-gap "syntax:create-table"
+test create-table-in-pg-catalog {
+    CREATE TABLE pg_catalog.zz (id int);
+}
+@sqlstate 42501
+expect error {}
+expect @tursopg {
+}
+
+# E-98: pg_policies
+@setup t_id_s_policy_p
+test pg-policies {
+    SELECT policyname FROM pg_policies WHERE tablename = 't';
+}
+expect {
+    p
+}
+
+# E-99: pg_available_extensions()
+@compat-gap "function:pg_available_extensions"
+test pg-available-extensions {
+    SELECT name, default_version FROM pg_available_extensions() WHERE name = 'plpgsql';
+}
+expect {
+    plpgsql|1.0
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-100: pg_indexes names of PRIMARY KEY and UNIQUE indexes
+# The primary key index name has the same cause as E-29.
+@compat-gap "syntax:catalog"
+test pg-indexes-names-of-primary-key-and-unique-indexes {
+    CREATE TABLE u (id text PRIMARY KEY, e text UNIQUE);
+    SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname IN ('u_e_key', 'u_pkey');
+}
+expect {
+    2
+}
+expect @tursopg {
+    0
+}
+
+# E-101: conkey of a two-column UNIQUE constraint as text
+# Fails because tursopg returns int2vector columns as text, see E-39.
+@compat-gap "syntax:catalog"
+test conkey-of-a-two-column-unique-constraint-as-text {
+    CREATE SCHEMA api;
+    CREATE TABLE api.pairs (id int PRIMARY KEY, a int, b int, UNIQUE (a, b));
+    SELECT conkey::text FROM pg_constraint WHERE conname = 'pairs_a_b_key';
+}
+expect {
+    {2,3}
+}
+expect @tursopg {
+    2 3
+}
+
+# E-102: conkey subscript and array_length
+# Fails because tursopg returns int2vector columns as text, see E-39.
+@setup p_a_b_c_x_y_fkey
+@compat-gap "syntax:catalog"
+test conkey-subscript-and-array-length {
+    SELECT conkey[1], array_length(conkey, 1) FROM pg_constraint WHERE conname = 'c_xy_fkey';
+}
+expect {
+    1|2
+}
+expect @tursopg {
+    |
+}
+
+# E-103: indkey cast to int2[]
+# Fails because tursopg returns int2vector columns as text, see E-39.
+@setup p_a_b_c_x_y_fkey
+@compat-gap "syntax:catalog"
+test indkey-cast-to-int2-array {
+    SELECT indkey::int2[] FROM pg_index WHERE indrelid = (SELECT oid FROM pg_class WHERE relname = 'p');
+}
+expect {
+    [0:1]={1,2}
+}
+@sqlstate 23000
+expect @tursopg error {}
+
+# E-104: unquoted name does not find a quoted mixed-case schema
+# Fails because tursopg folds the quoted schema name to lower case, see E-81.
+@compat-gap "syntax:quoted-identifier"
+test unquoted-name-does-not-find-a-quoted-mixed-case-schema {
+    CREATE SCHEMA "Api";
+    CREATE TABLE "Api".t (id int);
+    INSERT INTO api.t VALUES (1);
+}
+@sqlstate 42P01
+expect error {}
+expect @tursopg {
+}
+
+# E-105: regclass cast of an unknown name
+# Fails because every regclass cast returns 0, see E-19.
+@compat-gap "type:regclass"
+test regclass-cast-of-an-unknown-name {
+    SELECT 'nosuch'::regclass;
+}
+@sqlstate 42P01
+expect error {}
+expect @tursopg {
+    0
+}
+
+# E-106: pg_class row level security flags
+test pg-class-row-level-security-flags {
+    CREATE TABLE t (id int PRIMARY KEY, s text);
+    ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+    SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 't';
+}
+expect {
+    t|f
+}
+
+# E-107: PL/pgSQL trigger function
+# Fails because CREATE FUNCTION is not supported, see E-46.
+@compat-gap "syntax:create-function"
+test pl-pgsql-trigger-function {
+    CREATE TABLE users (id int PRIMARY KEY, meta jsonb);
+    CREATE TABLE profiles (id int PRIMARY KEY, first_name text);
+    CREATE FUNCTION handle_new_user() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO profiles (id, first_name) VALUES (new.id, new.meta ->> 'first_name');
+      RETURN new;
+    END;
+    $$;
+    CREATE TRIGGER on_user_created AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION handle_new_user();
+    INSERT INTO users VALUES (1, '{"first_name":"Ada"}');
+    SELECT id, first_name FROM profiles;
+}
+expect {
+    1|Ada
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-108: SECURITY DEFINER function with SET search_path
+# Fails because CREATE FUNCTION is not supported, see E-46.
+@compat-gap "syntax:create-function"
+test security-definer-function-with-set-search-path {
+    CREATE FUNCTION f() RETURNS int LANGUAGE sql SECURITY DEFINER SET search_path = '' AS $$ SELECT 1 $$;
+    SELECT f();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-109: table and column privilege functions
+@compat-gap "function:has_table_privilege"
+test table-and-column-privilege-functions {
+    CREATE ROLE gap_e_109_reader;
+    CREATE TABLE t (id int PRIMARY KEY, s text);
+    GRANT SELECT ON t TO gap_e_109_reader;
+    SELECT has_table_privilege('gap_e_109_reader', 't', 'SELECT'),
+           has_table_privilege('gap_e_109_reader', 't', 'INSERT'),
+           has_any_column_privilege('gap_e_109_reader', 't', 'SELECT'),
+           has_column_privilege('gap_e_109_reader', 't', 's', 'SELECT');
+}
+expect {
+    t|f|t|t
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# E-110: pg_has_role
+@compat-gap "function:pg_has_role"
+test pg-has-role {
+    CREATE ROLE gap_e_110_role;
+    SELECT pg_has_role('gap_e_110_role', 'USAGE'), pg_has_role('gap_e_110_role', 'postgres', 'MEMBER');
+}
+expect {
+    t|f
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# E-111: pg_is_other_temp_schema
+@compat-gap "function:pg_is_other_temp_schema"
+test pg-is-other-temp-schema {
+    SELECT pg_is_other_temp_schema((SELECT oid FROM pg_namespace WHERE nspname = 'public'));
+}
+expect {
+    f
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# E-112: pg_column_is_updatable
+@compat-gap "function:pg_column_is_updatable"
+test pg-column-is-updatable {
+    CREATE TABLE t (id int PRIMARY KEY, s text);
+    SELECT pg_column_is_updatable((SELECT oid FROM pg_class WHERE relname = 't'), 1::smallint, false);
+}
+expect {
+    t
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# E-113: pg_total_relation_size and pg_relation_size
+@setup t_id_s_with_rows
+@compat-gap "function:pg_total_relation_size"
+test pg-total-relation-size-and-pg-relation-size {
+    SELECT pg_total_relation_size('t') > 0, pg_relation_size('t') > 0;
+}
+expect {
+    t|t
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# E-114: pg_stat_user_tables
+@setup t_id_s_with_rows
+@compat-gap "syntax:catalog"
+test pg-stat-user-tables {
+    SELECT count(*) FROM pg_stat_user_tables WHERE relname = 't';
+}
+expect {
+    1
+}
+@sqlstate 42P01
+expect @tursopg error {}

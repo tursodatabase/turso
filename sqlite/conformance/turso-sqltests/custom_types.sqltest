@@ -346,7 +346,7 @@ expect {
     boolean(value any)|integer|boolean_to_int (value)||CASE WHEN value THEN 1 ELSE 0 END||'<'
     bytea(value blob)|blob|||||'<'
     cidr(value text)|text|value||value||
-    date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END||value||'<'
+    date(value text)|text|temporal_encode (value, 'date')||value||'<'
     inet(value text)|text|validate_ipaddr (value)||value||
     json(value text)|text|json (value)||value||
     jsonb(value text)|blob|jsonb (value)||json (value)||
@@ -354,9 +354,9 @@ expect {
     macaddr8(value text)|text|value||value||
     numeric(value any, precision integer, scale integer)|blob|numeric_encode (value)|numeric_fit (value, precision, scale)|numeric_decode (value)||
     smallint(value integer)|integer||CASE WHEN value BETWEEN - 32768 AND 32767 THEN value ELSE RAISE (ABORT, 'integer out of range for smallint') END|||'<'
-    time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE rtrim (rtrim (strftime ('%H:%M:%f', value), '0'), '.') END||value||'<'
-    timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END||value||'<'
-    timestamptz(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END||value||'<'
+    time(value text)|text|temporal_encode (value, 'time')||value||'<'
+    timestamp(value text)|text|temporal_encode (value, 'timestamp')||value||'<'
+    timestamptz(value text)|text|temporal_encode (value, 'timestamptz')||value||'<'
     uuid(value any)|blob|CASE WHEN value IS NULL THEN NULL WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE coalesce (uuid_blob (value), RAISE (ABORT, 'invalid UUID value')) END||uuid_str (value)||'<'
     varchar(value text, maxlen integer)|text||CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
 }
@@ -379,7 +379,7 @@ expect {
     boolean(value any)|integer|boolean_to_int (value)||CASE WHEN value THEN 1 ELSE 0 END||'<'
     bytea(value blob)|blob|||||'<'
     cidr(value text)|text|value||value||
-    date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END||value||'<'
+    date(value text)|text|temporal_encode (value, 'date')||value||'<'
     inet(value text)|text|validate_ipaddr (value)||value||
     json(value text)|text|json (value)||value||
     jsonb(value text)|blob|jsonb (value)||json (value)||
@@ -388,9 +388,9 @@ expect {
     numeric(value any, precision integer, scale integer)|blob|numeric_encode (value)|numeric_fit (value, precision, scale)|numeric_decode (value)||
     smallint(value integer)|integer||CASE WHEN value BETWEEN - 32768 AND 32767 THEN value ELSE RAISE (ABORT, 'integer out of range for smallint') END|||'<'
     test_uint(value any)|text|test_uint_encode (value)||test_uint_decode (value)|0|
-    time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE rtrim (rtrim (strftime ('%H:%M:%f', value), '0'), '.') END||value||'<'
-    timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END||value||'<'
-    timestamptz(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END||value||'<'
+    time(value text)|text|temporal_encode (value, 'time')||value||'<'
+    timestamp(value text)|text|temporal_encode (value, 'timestamp')||value||'<'
+    timestamptz(value text)|text|temporal_encode (value, 'timestamptz')||value||'<'
     uuid(value any)|blob|CASE WHEN value IS NULL THEN NULL WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE coalesce (uuid_blob (value), RAISE (ABORT, 'invalid UUID value')) END||uuid_str (value)||'<'
     varchar(value text, maxlen integer)|text||CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
 }
@@ -2240,4 +2240,133 @@ test virtual-custom-type-column-through-a-hash-join {
 }
 expect {
     3
+}
+
+# A column that ALTER COLUMN gives a custom type takes its affinity from the
+# type's BASE, like a column created with that type. The letters of "doubled"
+# would give it REAL affinity.
+@requires strict "uses STRICT tables"
+test alter-column-to-custom-type-uses-base-affinity {
+    CREATE TYPE doubled BASE integer ENCODE value * 2 DECODE value / 2;
+    CREATE TABLE fresh(d doubled) STRICT;
+    CREATE TABLE altered(c integer) STRICT;
+    ALTER TABLE altered ALTER COLUMN c TO d doubled;
+    INSERT INTO fresh VALUES ('5');
+    INSERT INTO altered VALUES ('5');
+    SELECT 'fresh', d, typeof(d) FROM fresh;
+    SELECT 'altered', d, typeof(d) FROM altered;
+    PRAGMA integrity_check;
+}
+expect {
+    fresh|5|integer
+    altered|5|integer
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test upsert-returning-virtual-column-reads-decoded-custom-type {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x cents, y INT, v INT AS (CAST(x AS INTEGER) + 1)) STRICT;
+    INSERT INTO t(id, x, y) VALUES (1, 7, 0);
+    INSERT INTO t(id, x, y) VALUES (1, 8, 0) ON CONFLICT(id) DO UPDATE SET y = 2 RETURNING x, v;
+    INSERT INTO t(id, x, y) VALUES (1, 8, 0) ON CONFLICT(id) DO UPDATE SET x = 9 RETURNING x, v;
+}
+expect {
+    7|8
+    9|10
+}
+
+@requires strict "uses STRICT tables"
+test insert-virtual-column-reads-decoded-custom-type {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x cents, v INT AS (CAST(x AS INTEGER) + 1) CHECK (v < 100)) STRICT;
+    CREATE TABLE log(msg);
+    CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO log VALUES (NEW.v); END;
+    INSERT INTO t(id, x) VALUES (1, 50) RETURNING x, v;
+    SELECT msg FROM log;
+}
+expect {
+    50|51
+    51
+}
+
+@requires strict "uses STRICT tables"
+test update-virtual-column-reads-decoded-custom-type {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x cents, y INT, v INT AS (CAST(x AS INTEGER) + 1)) STRICT;
+    INSERT INTO t(id, x, y) VALUES (1, 5, 0);
+    UPDATE t SET y = 1 RETURNING x, v;
+}
+expect {
+    5|6
+}
+
+@requires strict "uses STRICT tables"
+test fk-child-virtual-column-reads-decoded-custom-type {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    INSERT INTO p VALUES (6);
+    CREATE TABLE ch(id INTEGER PRIMARY KEY, x cents, v INT AS (CAST(x AS INTEGER) + 1) REFERENCES p(id)) STRICT;
+    INSERT INTO ch(id, x) VALUES (1, 5);
+    SELECT x, v FROM ch;
+}
+expect {
+    5|6
+}
+
+@requires strict "uses STRICT tables"
+test unique-virtual-column-reads-decoded-custom-type {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, x cents, k INT AS (CAST(x AS INTEGER) + 1) UNIQUE) STRICT;
+    INSERT INTO p(id, x) VALUES (1, 5);
+    SELECT id, k FROM p WHERE k = 6;
+    PRAGMA integrity_check;
+    DELETE FROM p;
+    SELECT count(*) FROM p;
+}
+expect {
+    1|6
+    ok
+    0
+}
+
+@requires strict "uses STRICT tables"
+test index-on-virtual-column-reads-decoded-custom-type {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x cents, y INT, v INT AS (CAST(x AS INTEGER) + 1)) STRICT;
+    CREATE INDEX tv ON t(v);
+    INSERT INTO t(id, x, y) VALUES (1, 5, 0), (2, 6, 0);
+    UPDATE t SET y = 1 WHERE id = 1;
+    UPDATE t SET x = 7 WHERE id = 2;
+    INSERT INTO t(id, x, y) VALUES (1, 0, 0) ON CONFLICT(id) DO UPDATE SET x = 9;
+    SELECT id, v FROM t INDEXED BY tv ORDER BY v;
+    SELECT id FROM t WHERE v = 10;
+    PRAGMA integrity_check;
+}
+expect {
+    2|8
+    1|10
+    1
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test old-row-virtual-column-reads-decoded-custom-type {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x cents, v INT AS (CAST(x AS INTEGER) + 1)) STRICT;
+    CREATE TABLE log(msg);
+    CREATE TRIGGER t_bu BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES ('update ' || OLD.v || ' ' || NEW.v); END;
+    CREATE TRIGGER t_bd BEFORE DELETE ON t BEGIN INSERT INTO log VALUES ('delete ' || OLD.v); END;
+    INSERT INTO t(id, x) VALUES (1, 5);
+    UPDATE t SET x = 7;
+    INSERT INTO t(id, x) VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET x = 9;
+    DELETE FROM t RETURNING v;
+    SELECT msg FROM log;
+}
+expect {
+    10
+    update 6 8
+    update 8 10
+    delete 10
 }

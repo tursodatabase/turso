@@ -739,6 +739,28 @@ test('persistence-offline', async ({ server }) => {
     }
 })
 
+test('close releases the connection, so the next open of the same path can write', { timeout: 30_000 }, async ({ server }) => {
+    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    try {
+        {
+            const db = await connect({ path: path, url: server.dbUrl() });
+            await db.exec("CREATE TABLE t(x)");
+            await db.exec("BEGIN");
+            await db.exec("INSERT INTO t VALUES (1)");
+            await db.close();
+        }
+        {
+            const db = await connect({ path: path, url: server.dbUrl() });
+            await db.exec("INSERT INTO t VALUES (2)");
+            const rows = await (await db.prepare("SELECT x FROM t")).all();
+            expect(rows).toEqual([{ x: 2 }]);
+            await db.close();
+        }
+    } finally {
+        cleanup(path);
+    }
+})
+
 test('persistence-pull-push', async ({ server }) => {
     {
         const db = await connect({ path: ':memory:', url: server.dbUrl() });

@@ -8,6 +8,7 @@ use turso_core::{
 use turso_ext::{
     ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
 };
+use turso_pg_parser::translator::{unnest_column_name, MAX_UNNEST_ARRAYS};
 
 #[derive(Debug)]
 pub(crate) struct Unnest;
@@ -16,7 +17,10 @@ impl VirtualTableModule for Unnest {
     type Table = Self;
 
     fn schema(&self, _args: &[Value]) -> Result<String> {
-        Ok("CREATE TABLE unnest (unnest, input HIDDEN)".into())
+        let elements = (1..=MAX_UNNEST_ARRAYS).map(unnest_column_name);
+        let inputs = (1..=MAX_UNNEST_ARRAYS).map(|array| format!("input{array} HIDDEN"));
+        let columns: Vec<String> = elements.chain(inputs).collect();
+        Ok(format!("CREATE TABLE unnest ({})", columns.join(", ")))
     }
 
     fn create(&self, _args: &[Value]) -> Result<Self> {
@@ -33,9 +37,10 @@ impl VirtualTable for Unnest {
 
     fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(UnnestCursor {
-            values: Vec::new(),
+            arrays: Vec::new(),
+            inputs: Vec::new(),
+            row_count: 0,
             position: 0,
-            input: Value::Null,
         })
     }
 
@@ -44,15 +49,30 @@ impl VirtualTable for Unnest {
         constraints: &[ConstraintInfo],
         _order_by: &[OrderByInfo],
     ) -> Result<IndexInfo, ResultCode> {
-        let input = constraints
+        let input_of = |constraint: &ConstraintInfo| {
+            let is_input = constraint.op == ConstraintOp::Eq
+                && (MAX_UNNEST_ARRAYS..2 * MAX_UNNEST_ARRAYS)
+                    .contains(&(constraint.column_index as usize));
+            is_input.then(|| constraint.column_index as usize - MAX_UNNEST_ARRAYS)
+        };
+        let all_inputs_usable = constraints
             .iter()
-            .position(|c| c.column_index == 1 && c.op == ConstraintOp::Eq && c.usable)
-            .ok_or(ResultCode::ConstraintViolation)?;
+            .all(|constraint| input_of(constraint).is_none() || constraint.usable);
+        let input_count = constraints.iter().filter_map(input_of).count();
+        let has_each_input_once = (0..input_count)
+            .all(|input| constraints.iter().filter_map(input_of).any(|i| i == input));
+        if input_count == 0 || !all_inputs_usable || !has_each_input_once {
+            return Err(ResultCode::ConstraintViolation);
+        }
         Ok(IndexInfo {
-            constraint_usages: (0..constraints.len())
-                .map(|i| ConstraintUsage {
-                    argv_index: (i == input).then_some(1),
-                    omit: i == input,
+            constraint_usages: constraints
+                .iter()
+                .map(|constraint| {
+                    let input = input_of(constraint);
+                    ConstraintUsage {
+                        argv_index: input.map(|input| input as u32 + 1),
+                        omit: input.is_some(),
+                    }
                 })
                 .collect(),
             estimated_cost: 1.0,
@@ -63,15 +83,17 @@ impl VirtualTable for Unnest {
 }
 
 pub(crate) struct UnnestCursor {
-    values: Vec<Value>,
+    /// The elements of each array, with the elements of nested arrays in place of them.
+    arrays: Vec<Vec<Value>>,
+    inputs: Vec<Value>,
+    row_count: usize,
     position: usize,
-    input: Value,
 }
 
 impl VirtualTableCursor for UnnestCursor {
     fn next(&mut self) -> IOResultOr<bool> {
         self.position += 1;
-        Ok(IOResult::Done(self.position < self.values.len()))
+        Ok(IOResult::Done(self.position < self.row_count))
     }
 
     fn rowid(&self) -> i64 {
@@ -79,11 +101,15 @@ impl VirtualTableCursor for UnnestCursor {
     }
 
     fn column(&mut self, column: usize) -> IOResultOr<Value> {
-        Ok(IOResult::Done(match column {
-            0 => self.values[self.position].clone(),
-            1 => self.input.clone(),
-            _ => unreachable!("invalid unnest column"),
-        }))
+        let value = if column < MAX_UNNEST_ARRAYS {
+            self.arrays
+                .get(column)
+                .and_then(|elements| elements.get(self.position))
+                .cloned()
+        } else {
+            self.inputs.get(column - MAX_UNNEST_ARRAYS).cloned()
+        };
+        Ok(IOResult::Done(value.unwrap_or(Value::Null)))
     }
 
     fn filter(
@@ -92,29 +118,32 @@ impl VirtualTableCursor for UnnestCursor {
         _idx_str: Option<&str>,
         _idx_num: i32,
     ) -> IOResultOr<bool> {
-        self.values.clear();
         self.position = 0;
-        let [input] = args else {
-            return Err(LimboError::InvalidArgument("unnest requires one array".into()).into());
-        };
-        self.input = input.clone();
-        let mut pending = vec![array_values_from_any(input)
-            .ok_or_else(|| LimboError::InvalidArgument("unnest requires an array".into()))?
-            .into_iter()];
-        while let Some(elements) = pending.last_mut() {
-            match elements.next() {
-                Some(Value::Blob(blob)) => {
-                    let values = array_values_from_any(&Value::Blob(blob)).ok_or_else(|| {
-                        LimboError::InvalidArgument("invalid nested array in unnest".into())
-                    })?;
-                    pending.push(values.into_iter());
-                }
-                Some(value) => self.values.push(value),
-                None => {
-                    pending.pop();
-                }
+        self.inputs = args.to_vec();
+        self.arrays = args.iter().map(flattened_elements).collect::<Result<_>>()?;
+        self.row_count = self.arrays.iter().map(Vec::len).max().unwrap_or(0);
+        Ok(IOResult::Done(self.row_count > 0))
+    }
+}
+
+fn flattened_elements(array: &Value) -> Result<Vec<Value>> {
+    let mut elements = Vec::new();
+    let mut pending = vec![array_values_from_any(array)
+        .ok_or_else(|| LimboError::InvalidArgument("unnest requires an array".into()))?
+        .into_iter()];
+    while let Some(values) = pending.last_mut() {
+        match values.next() {
+            Some(Value::Blob(blob)) => {
+                let nested = array_values_from_any(&Value::Blob(blob)).ok_or_else(|| {
+                    LimboError::InvalidArgument("invalid nested array in unnest".into())
+                })?;
+                pending.push(nested.into_iter());
+            }
+            Some(value) => elements.push(value),
+            None => {
+                pending.pop();
             }
         }
-        Ok(IOResult::Done(!self.values.is_empty()))
     }
+    Ok(elements)
 }

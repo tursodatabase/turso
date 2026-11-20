@@ -13,6 +13,15 @@ Status legend:
 | 🟡 Partial | Feature works with limitations (see notes) |
 | ❌ Not supported | Feature is not implemented |
 
+## PostgreSQL version
+
+The reference version is PostgreSQL 18. The PostgreSQL conformance tests, the
+SQLSTATE fuzzer and the `pg_dump` differential fuzzer compare Turso against a
+PostgreSQL 18 server, and CI uses PostgreSQL 18 clients. The version is set in
+`postgres/version`. Behavior that differs between PostgreSQL versions follows
+PostgreSQL 18, and a newer release is supported only after the version there
+is changed and the tests pass against it.
+
 ## Architecture
 
 The frontend parses SQL with `pg_query` (libpg_query, the real PostgreSQL
@@ -43,7 +52,7 @@ Basics not enumerated by the official feature matrix.
 | JOINs (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL, USING) | ✅ Supported | |
 | UNION / UNION ALL / INTERSECT / EXCEPT | 🟡 Partial | Including ORDER BY/LIMIT on compounds; INTERSECT ALL / EXCEPT ALL, a set operation nested on the right (`A UNION B INTERSECT C`, `A EXCEPT (B UNION C)`) and ORDER BY/LIMIT/WITH on a parenthesized branch are rejected |
 | Subqueries (FROM, IN, EXISTS, scalar) | ✅ Supported | `= ANY(array)` and `<> ALL(array)` work, including bound text-array parameters; other ANY/ALL array operators are rejected; `ALL`/row comparison subqueries error; an EXISTS subquery may select no columns (`EXISTS (SELECT FROM t)`), but a SELECT with no columns anywhere else is rejected |
-| INSERT (column lists, multi-row VALUES, DEFAULT, INSERT ... SELECT) | ✅ Supported | Duplicate target columns, DEFAULT without a column list, array-element/field targets and OVERRIDING are rejected |
+| INSERT (column lists, multi-row VALUES, DEFAULT, DEFAULT VALUES, INSERT ... SELECT) | ✅ Supported | Without a column list, `INSERT ... SELECT *` must give a value for every column that is not generated; duplicate target columns, array-element/field targets, OVERRIDING USER VALUE and ON CONFLICT with DEFAULT VALUES are rejected |
 | UPDATE (incl. FROM clause) | ✅ Supported | Multi-column `SET (a,b) = (...)` not supported; duplicate assignments and array-element/field targets rejected |
 | DELETE | 🟡 Partial | `USING` clause rejected |
 | CREATE TABLE | ✅ Supported | PK, NOT NULL, UNIQUE, DEFAULT, CHECK, FK (with ON DELETE/UPDATE actions); IF NOT EXISTS; tables are created STRICT |
@@ -55,9 +64,11 @@ Basics not enumerated by the official feature matrix.
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
 | CREATE SCHEMA / DROP SCHEMA | ✅ Supported | A schema is stored in the main database under an id; its objects are stored under names that start with `__turso_ns<id>_`, which no user object may be named; an object qualified with `main` or `temp` is an error, since PostgreSQL has no such schemas; `public` is a schema like any other, created when a new database is made, and once dropped it stays dropped until CREATE SCHEMA public; DROP ... CASCADE; AUTHORIZATION rejected; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists; CREATE SCHEMA can contain CREATE TABLE, VIEW, INDEX and SEQUENCE statements, which create their objects in the new schema, but not inside a transaction block. Databases with schemas in `turso-postgres-schema-*.db` files from earlier versions are not supported; their schemas must be recreated. A database made by an earlier version, whose tables are in no schema, is refused when a session connects. |
 | ALTER SEQUENCE | 🟡 Partial | OWNED BY { table.column \| NONE } works, which is how a serial column's sequence belongs to its table; the other options are rejected |
-| CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE 1 accepted, a larger CACHE rejected (Turso does not cache sequence values); OWNED BY a column, TEMP and other options rejected; pg_sequences view; pg_sequence exposes the parameters of the sequences of every schema (bigint, cache 1); pg_class lists the sequences of every schema with relkind S (sequence dumps remain incomplete); a sequence named without a schema is looked up through `search_path`, and a column default or view binds it to the schema it is in when the table or view is created; a serial column's sequence is created in the table's schema |
+| CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE 1 accepted, a larger CACHE rejected (Turso does not cache sequence values); OWNED BY a column, TEMP and other options rejected; pg_sequences view; pg_sequence exposes the parameters of the sequences of every schema (bigint, cache 1); pg_class lists the sequences of every schema with relkind S (sequence dumps remain incomplete); a sequence named without a schema is looked up through `search_path`, and a column default, CHECK constraint, view or policy binds it to the schema it is in when the table, column, view or policy is created; a serial column's sequence is created in the table's schema |
+| Identity columns (GENERATED ALWAYS / BY DEFAULT AS IDENTITY) | ✅ Supported | smallint, integer and bigint columns; the column is NOT NULL and gets its values from a sequence named `<table>_<column>_seq`, which takes the options of CREATE SEQUENCE (START WITH, INCREMENT BY, MINVALUE, MAXVALUE, CYCLE) and is bounded by the range of the column type; GENERATED ALWAYS rejects a value other than DEFAULT in INSERT, UPDATE and ON CONFLICT DO UPDATE with SQLSTATE 428C9, while COPY FROM and INSERT ... OVERRIDING SYSTEM VALUE write the values they are given; another column type (22023) and a DEFAULT on an identity column (42601) are rejected; OVERRIDING USER VALUE is rejected; ALTER SEQUENCE ... OWNED BY on its sequence is rejected (0A000) |
 | CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced; array base types, type modifiers and non-binary COLLATE rejected |
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
+| DROP TABLE / DROP COLUMN / DROP SEQUENCE and sequences | 🟡 Partial | DROP TABLE drops the sequences the table owns and DROP COLUMN drops the sequences the column owns (a serial column, or `ALTER SEQUENCE ... OWNED BY table.column`); each of them, and DROP SEQUENCE, is refused with 2BP01 when a column default, CHECK constraint, view, trigger or policy that is not dropped with it still calls the sequence. DROP SCHEMA ... CASCADE is rejected when an object of another schema uses a sequence of the schema, where PostgreSQL drops that object |
 | TRUNCATE | 🟡 Partial | Lowered to DELETE of one table; several tables, CASCADE and RESTART IDENTITY rejected |
 | BEGIN / COMMIT / ROLLBACK | ✅ Supported | Every transaction is snapshot isolation, i.e. REPEATABLE READ; `ISOLATION LEVEL REPEATABLE READ` is accepted, every other level, DEFERRABLE and AND CHAIN are rejected. READ ONLY and READ WRITE are enforced, on BEGIN and on SET TRANSACTION; switching a READ ONLY transaction to READ WRITE after its first query is rejected with SQLSTATE 25001 like PostgreSQL. A statement error aborts the transaction but keeps its savepoints, so ROLLBACK TO recovers it; a failed COMMIT rolls the transaction back and returns the connection to idle |
 | LOCK TABLE | 🟡 Partial | ACCESS SHARE without NOWAIT is accepted as a no-op inside a transaction for pg_dump compatibility; table names are not checked, no locks are acquired, and no read snapshot is started; other modes are rejected |
@@ -74,9 +85,10 @@ Basics not enumerated by the official feature matrix.
 The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 `pg_namespace`, `pg_attribute`, `pg_type` (builtin + array + enum types),
 `pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_sequence`, `pg_sequences`,
-`pg_database`, `pg_roles` (built-in `postgres` superuser and `pg_database_owner`, and roles from `CREATE ROLE`), `pg_proc`, `pg_am`,
-plus `pg_input_error_info`. Present but always empty: `pg_policy`,
-`pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
+`pg_database`, `pg_roles` (built-in `postgres` superuser and `pg_database_owner`, and roles from `CREATE ROLE`), `pg_auth_members` (memberships from `GRANT role TO role`), `pg_proc`, `pg_am`,
+`pg_policy` (row-level security policies, with `polqual` and `polwithcheck`
+as the text `pg_get_expr` prints), `pg_policies`, plus `pg_input_error_info`. Present but
+always empty: `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
 `pg_foreign_table`, `pg_partitioned_table`, `pg_collation`,
 `pg_publication*`, `pg_seclabels` (security labels are not supported).
 `pg_description` contains the default `standard public schema` comment for
@@ -93,16 +105,14 @@ exposes it for policy discovery. `pg_publication`, `pg_publication_rel`, and
 `pg_get_triggerdef(oid)` and `pg_get_triggerdef(oid, pretty)` return NULL:
 PostgreSQL triggers are not supported and `pg_trigger` is empty.
 Catalog introspection functions: `format_type`,
-`pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_expr` (returns TursoPG's
-stored SQL; relation oid and pretty printing do not change the output),
+`pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_expr` (`pg_get_expr` and
+`pg_get_constraintdef` print `CHECK` constraints, and `pg_get_expr` prints
+column defaults in `pg_attrdef.adbin`, as PostgreSQL does for the forms the
+manual lists under `CREATE POLICY`, and return TursoPG's stored SQL for
+other forms; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
 `pg_input_is_valid`, `to_char` (numeric), `now`/`clock_timestamp`/
-`transaction_timestamp`/`statement_timestamp`, `age(timestamp[, timestamp])`
-(returns text in PostgreSQL's interval format, since intervals are stored as text;
-string literal arguments are cast to timestamptz, so they follow the timestamp input rules;
-other text arguments, such as text columns, are read as timestamps instead of being
-rejected, because tursopg chooses functions by name and argument count only;
-the `age(xid)` form is not supported).
+`transaction_timestamp`/`statement_timestamp`.
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
 forms; the first schema of `search_path` that exists), `current_schemas(boolean)`
@@ -146,12 +156,24 @@ Type mapping: serial/smallserial/bigserial (and serial2/4/8) become
 `INTEGER NOT NULL DEFAULT nextval(...)` with an implicit sequence named
 `<table>_<column>_seq`, or, when a relation of the schema has that name,
 the first of `<table>_<column>_seq1`, `..._seq2`, ... that none has. boolean,
-smallint, bigint, uuid, date, time, timestamp[tz], bytea, json, jsonb, inet,
+smallint, bigint, uuid, timestamp[tz], bytea, json, jsonb, inet,
 cidr, macaddr, macaddr8 map to Turso custom types. varchar(n) and
 numeric(p,s) keep their type modifiers; type modifiers on any other type,
-including char(n), timestamp(p) and bit(n), are rejected. interval, xml, tsvector/tsquery,
+including char(n), timestamp(p) and bit(n), are rejected. xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
+
+date, time, timetz and interval, and arrays of every date and time type
+(`timestamp[]` and `timestamptz[]` included), are rejected as not supported
+(0A000) in column types, casts, typed literals and domains. So are
+`CURRENT_DATE`, `CURRENT_TIME`, `LOCALTIME` and the built-in functions that
+return date, time, timetz or interval, such as `age` and `make_date`.
+
+`now()`, `transaction_timestamp()` and `CURRENT_TIMESTAMP` are the time the
+transaction started, and `LOCALTIMESTAMP` is that time as a timestamp in UTC;
+`statement_timestamp()` is the time the client's query arrived, shared by all
+statements of one query string;
+`clock_timestamp()` reads the clock at each call.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -208,17 +230,19 @@ INTEGER. Unknown type names pass through as custom types.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | ANY_VALUE aggregate | ❌ Not supported | |
-| DISTINCT ON | ❌ Not supported | Rejected |
+| DISTINCT ON | 🟡 Partial | Rejected: COLLATE in a DISTINCT ON expression or in its ORDER BY; a volatile function such as `nextval()` or `random()` in the select list; in a query with aggregates, an expression that reads a column outside GROUP BY (PostgreSQL accepts a column that depends on a grouped primary key); an aggregate that appears only in a DISTINCT ON expression; an expression computed on an aggregate when there is no GROUP BY |
 | FETCH FIRST .. WITH TIES | ❌ Not supported | `FETCH FIRST n ROWS ONLY` works (lowered to LIMIT); WITH TIES rejected |
 | GROUPING SETS, CUBE and ROLLUP support | ❌ Not supported | Translation error |
 | INSERT/UPDATE/DELETE RETURNING | ✅ Supported | Including `RETURNING *`; on UPDATE ... FROM, `RETURNING *` is rejected (it would omit the FROM tables' columns) |
-| LATERAL clause | 🟡 Partial | LATERAL subqueries work with a comma, [CROSS] JOIN, and LEFT JOIN. Column alias lists such as `AS s(x)` work on subqueries, unnest() and generate_series(); outer columns in LIMIT/OFFSET are not supported; LATERAL tvf() is not supported     |
+| LATERAL clause | 🟡 Partial | LATERAL subqueries work with a comma, [CROSS] JOIN, and LEFT JOIN. Column alias lists such as `AS s(x)` work on subqueries, unnest(), generate_series(), current_schema(), current_database() and version(); outer columns in LIMIT/OFFSET are not supported; LATERAL tvf() is not supported     |
 | MERGE | ❌ Not supported | |
 | MERGE ... RETURNING | ❌ Not supported | |
 | Multirow VALUES | ✅ Supported | In INSERT and as standalone VALUES lists |
 | ORDER BY / LIMIT on a standalone VALUES list | ❌ Not supported | Rejected: "ORDER BY clause is not allowed with VALUES clause" |
 | Non-decimal integer literals | ✅ Supported | `0x`, `0o`, `0b` |
 | ORDER BY NULLS FIRST/LAST | ✅ Supported | Honored in SELECT, window, and compound SELECT ORDER BY; without it, NULLs sort last for ASC and first for DESC, as in PostgreSQL; rejected (matching SQLite) in CREATE INDEX |
+| ORDER BY of a SELECT DISTINCT | 🟡 Partial | Every ORDER BY term must be in the select list, as in PostgreSQL. Rejected: COLLATE in the select list or in the ORDER BY of such a query |
+| ORDER BY a signed integer constant | ❌ Not supported | `ORDER BY +1` and `ORDER BY -(+1)`, also as a DISTINCT ON expression, are rejected. PostgreSQL sorts by the constant, where the engine would read a position in the select list |
 | ORDER BY USING operator | 🟡 Partial | Built-in `<` and `>` (including `pg_catalog` qualification) are translated to ascending and descending order; other operators are rejected |
 | range_agg range type aggregation function | ❌ Not supported | |
 | Recursive queries | 🟡 Partial | WITH RECURSIVE works with SQLite semantics (row-at-a-time recursive term, so e.g. DISTINCT in the recursive term over a multi-row anchor can differ from PG); SEARCH/CYCLE clauses are rejected |
@@ -227,15 +251,15 @@ INTEGER. Unknown type names pass through as custom types.
 | Row-wise comparison | ❌ Not supported | Row constructors `(a,b) < (c,d)` fail to translate |
 | SELECT ... FOR UPDATE/SHARE | ❌ Not supported | Rejected |
 | SELECT FOR NO KEY UPDATE/SELECT FOR KEY SHARE lock modes | ❌ Not supported | Rejected |
-| SQL standard interval handling | ❌ Not supported | interval degrades to TEXT; no interval arithmetic |
+| SQL standard interval handling | ❌ Not supported | interval is rejected (0A000) |
 | SYSTEM_USER | ❌ Not supported | current_user, current_role and session_user are supported |
 | TABLE statement | ✅ Supported | |
 | Underscores (_) for thousands separators | ✅ Supported | |
-| unnest/array_agg | 🟡 Partial | array_agg works; unnest is not implemented |
+| unnest/array_agg | 🟡 Partial | array_agg works; unnest works in FROM with up to 100 arrays, and not in the select list. `unnest(a, b)` needs a column alias list that gives its columns different names, because two columns named `unnest` are rejected |
 | Upsert (INSERT ... ON CONFLICT DO ...) | ✅ Supported | DO NOTHING and DO UPDATE SET ... (with EXCLUDED and conflict targets) |
 | Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented |
 | WITHIN GROUP clause | 🟡 Partial | Supports mode(), percentile_cont(), and percentile_disc() with one ORDER BY expression; DESC is not supported; NULLS FIRST/LAST is accepted and has no effect because these functions skip NULLs |
-| WITH ORDINALITY clause | ❌ Not supported | Rejected |
+| WITH ORDINALITY clause | 🟡 Partial | Works on generate_series(), unnest(), json_each(), current_schema(), current_database(), version(), and on json_to_record / json_to_recordset and their jsonb_ variants in `ROWS FROM (f(...) AS (...))`; rejected on other functions and on ROWS FROM with several functions. Two columns with the same name, as in `generate_series(1, 2) WITH ORDINALITY AS ordinality`, are rejected. The ordinality column has type `integer`; in PostgreSQL it is `bigint` |
 | WITH queries (Common Table Expressions) | ✅ Supported | Including WITH RECURSIVE; MATERIALIZED hints accepted |
 | Writable WITH queries (Common Table Expressions) | ❌ Not supported | "CTE query is not a SELECT statement" |
 
@@ -253,7 +277,7 @@ INTEGER. Unknown type names pass through as custom types.
 | DROP object IF EXISTS | ✅ Supported | TABLE, INDEX, VIEW, MATERIALIZED VIEW, TYPE, DOMAIN, SEQUENCE, SCHEMA |
 | ON COMMIT clause for CREATE TEMPORARY TABLE | ❌ Not supported | Rejected, like TEMP itself |
 | REINDEX CONCURRENTLY | ❌ Not supported | REINDEX not supported at all |
-| Stored generated columns | ❌ Not supported | GENERATED ... AS rejected |
+| Stored generated columns | 🟡 Partial | GENERATED ALWAYS AS (...) STORED, including ADD COLUMN; the type of the expression is not checked against the column type at CREATE, so a mismatch fails at INSERT instead; immutability is checked against a list of known non-immutable functions, and date/time casts and functions are checked using the declared types of the columns they read; `+`, `-`, `||` and casts to text or date/time types need the type of their operands, which is known for a literal, a cast, a column of the table being created, and the result of an operator with a known type rule, so any other operand (a function result, a `CASE` or `COALESCE`, or any column in `ADD COLUMN`) is rejected as not supported (0A000); a generated column of a custom type such as `timestamp`, or one whose expression reads such a column, is rejected with 42601; `extract`, `date_part` and `date_trunc` are not implemented |
 | Temporal constraints | ❌ Not supported | |
 | Temporary tables (CREATE TEMP TABLE) | ❌ Not supported | Rejected (UNLOGGED is accepted and creates an ordinary table) |
 | Typed tables | ❌ Not supported | |
@@ -327,8 +351,11 @@ INTEGER. Unknown type names pass through as custom types.
 | JSONB-modifying operators and functions | ❌ Not supported | |
 | JSONB subscripting | ❌ Not supported | |
 | JSON data type | 🟡 Partial | Same as jsonb (see above) |
+| array_to_json | ✅ Supported | |
 | json_strip_nulls | 🟡 Partial | Input nested deeper than 1000 levels errors with `stack depth limit exceeded`, where PostgreSQL's limit depends on `max_stack_depth`; a text or jsonb argument is accepted, where PostgreSQL only takes json; `jsonb_strip_nulls` is not supported |
-| json_to_record / json_to_recordset (and jsonb_ variants) | 🟡 Partial | Work with a column definition list; WITH ORDINALITY and ROWS FROM are not supported; error messages for malformed input differ from PostgreSQL; a repeated key reads its first value, like `->>`; a json/jsonb column drops whitespace (`{"y": 2}` comes back as `{"y":2}`), like `->`; an array column (`int[]`) accepts only an array literal string such as `"{1,2}"`, not a JSON array |
+| json_each | 🟡 Partial | Returns `key` (text) and `value` (json), accepts WITH ORDINALITY and column aliases. The wire protocol describes `value` as `text` (OID 25), where PostgreSQL describes it as `json` (OID 114). Input nested deeper than 1000 levels errors with `stack depth limit exceeded`, where PostgreSQL's limit depends on `max_stack_depth`; a text or jsonb argument is accepted, where PostgreSQL only takes json. `jsonb_each`, `json_each_text`, `jsonb_each_text` and the other functions that return members are not supported |
+| Table functions of SQLite (json_tree, completion, ...) | ❌ Not supported | Refused with `0A000` as a function in FROM; PostgreSQL has no such function and reports `42883`. The `pragma_*` functions work and check the privilege of the PRAGMA |
+| json_to_record / json_to_recordset (and jsonb_ variants) | 🟡 Partial | Work with a column definition list, after the alias or inside ROWS FROM (); WITH ORDINALITY works on the ROWS FROM form; ROWS FROM with several functions is not supported; error messages for malformed input differ from PostgreSQL; a repeated key reads its first value, like `->>`; a json/jsonb column drops whitespace (`{"y": 2}` comes back as `{"y":2}`), like `->`; an array column (`int[]`) accepts only an array literal string such as `"{1,2}"`, not a JSON array |
 | SQL/JSON constructors | ❌ Not supported | |
 | SQL/JSON: datetime() | ❌ Not supported | |
 | SQL/JSON IS JSON | ❌ Not supported | |
@@ -413,7 +440,7 @@ Upgrade is not supported.
 | Default permissions | ❌ Not supported | |
 | Direct TLS negotiation ("sslnegotiation") | ❌ Not supported | |
 | FIPS mode validation | ❌ Not supported | |
-| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | 🟡 Partial | `GRANT SELECT ON ALL TABLES IN SCHEMA` stores the privilege in each table's `pg_class.relacl` and lets the roles read the tables; other privileges, sequences, functions and REVOKE are not supported |
+| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | 🟡 Partial | `GRANT` and `REVOKE ... ON ALL TABLES IN SCHEMA` and `... ON ALL SEQUENCES IN SCHEMA` change the privileges in each relation's `pg_class.relacl`; functions are not supported |
 | GSSAPI client and server-side encryption | ❌ Not supported | |
 | GSSAPI support | ❌ Not supported | |
 | Kerberos credential delegation | ❌ Not supported | |
@@ -427,8 +454,8 @@ Upgrade is not supported.
 | Per user/database connection limits | ❌ Not supported | |
 | Predefined roles | ❌ Not supported | |
 | Privileges for setting configuration parameters | ❌ Not supported | |
-| ROLES | 🟡 Partial | `CREATE ROLE name` (no options), `SET [LOCAL] ROLE`, `RESET ROLE`, `SHOW role`; roles that are not superusers may read the tables they own or were granted `SELECT` on, but not write rows, use sequences, or change the schema they do not own; `GRANT SELECT` on tables is the only `GRANT` accepted and is stored in `pg_class.relacl`; `pg_roles` lists the built-in `postgres` superuser, `pg_database_owner`, and created roles |
-| Row-level security | 🟡 Partial | `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY` works and is shown in `pg_class.relrowsecurity`; a table with it shows no rows to roles other than superusers and the table's owner, as with no policies in PostgreSQL; policies, `CREATE POLICY` and `FORCE ROW LEVEL SECURITY` are not supported; views apply it as the view's owner, except that a superuser reading a view sees every row, and `RIGHT`/`FULL JOIN` with such a table is rejected for roles |
+| ROLES | 🟡 Partial | `CREATE ROLE name` with the options `BYPASSRLS`, `NOBYPASSRLS`, `INHERIT`, `NOINHERIT` and `NOLOGIN`, `SET [LOCAL] ROLE`, `RESET ROLE`, `SHOW role`; `GRANT role TO role` and `REVOKE role FROM role` by a superuser, shown in `pg_auth_members`, without `WITH ADMIN`, `WITH INHERIT`, `WITH SET`, `GRANTED BY` or `CASCADE`; a role may `SET ROLE` to the roles it is a member of, and with `INHERIT` has their privileges, acts as the owner of what they own, and is subject to their row-level security policies; roles that are not superusers may read and write the tables they own or were granted `SELECT`, `INSERT`, `UPDATE` and `DELETE` on, with SELECT also needed when a write reads the table's columns, and call `nextval` with `USAGE` or `UPDATE` and `setval` with `UPDATE` on the sequence, but not change the schema they do not own; `GRANT` and `REVOKE` of privileges on whole tables and sequences, `ALL` included, change `pg_class.relacl`; `TRUNCATE` needs the `TRUNCATE` privilege, and the `REFERENCES`, `TRIGGER` and `MAINTAIN` privileges let a role do nothing yet; `pg_roles` lists the built-in `postgres` superuser, `pg_database_owner`, and created roles; `DROP ROLE` and `DROP ROLE IF EXISTS` by a superuser, which fail while the role owns a relation, has privileges on one or is a policy's role, and drop its memberships; roles belong to one database file, not to the whole server as in PostgreSQL |
+| Row-level security | 🟡 Partial | `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY` works and is shown in `pg_class.relrowsecurity`; `CREATE POLICY` and `DROP POLICY` work, with permissive and restrictive `USING` policies limiting what roles read; `UPDATE` and `DELETE` change only the rows the policies of the command allow, with the `SELECT` policies too when the statement reads columns, and new rows of `INSERT` and `UPDATE` must pass `WITH CHECK`, and the `SELECT` policies with `RETURNING`, or the statement fails with 42501; `TRUNCATE` is not subject to policies, as in PostgreSQL; `INSERT ... ON CONFLICT DO UPDATE` checks the conflicting row against the `UPDATE` and `SELECT` policies and fails if it does not pass; a new row is checked after its `NOT NULL` constraints instead of before; `pg_policy` lists the policies, with conditions printed as PostgreSQL's `pg_get_expr` prints them for common forms and as `CREATE POLICY` wrote them otherwise, and so does `pg_policies`; policies cannot use subqueries with `FROM`, and the columns they use cannot be renamed or dropped; `FORCE ROW LEVEL SECURITY` is not supported; views apply it as the view's owner, except that a superuser reading a view sees every row |
 | SCRAM-SHA-256 authentication | ❌ Not supported | |
 | Search+bind mode operation for LDAP authentication | ❌ Not supported | |
 | security_barrier option on views | ❌ Not supported | |
@@ -490,7 +517,7 @@ Upgrade is not supported.
 | ALTER TABLE / ENABLE REPLICA TRIGGER/RULE | ❌ Not supported | |
 | BEGIN ATOMIC function bodies | ❌ Not supported | |
 | CALL syntax for executing procedures | ❌ Not supported | |
-| CREATE FUNCTION | ❌ Not supported | Rejected with an error |
+| CREATE FUNCTION | ❌ Not supported | Rejected with an error. A function that PostgreSQL rejects gets PostgreSQL's error; otherwise the error names the first unsupported feature, such as the language, RETURNS SETOF or an option |
 | Column level triggers | ❌ Not supported | |
 | CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | |
 | Event triggers | ❌ Not supported | |
@@ -520,7 +547,7 @@ Upgrade is not supported.
 | EXECUTE USING in PL/pgSQL | ❌ Not supported | |
 | FOREACH IN ARRAY in pl/pgsql | ❌ Not supported | |
 | IN/OUT/INOUT parameters for pl/pgsql and PL/SQL | ❌ Not supported | |
-| Named parameters | ❌ Not supported | |
+| Named parameters | ❌ Not supported | Named arguments in calls, such as `jsonb_path_exists(j, p, silent => true)`, are rejected |
 | Non-superuser language creation | ❌ Not supported | |
 | pl/pgsql installed by default | ❌ Not supported | |
 | Polymorphic functions | ❌ Not supported | |

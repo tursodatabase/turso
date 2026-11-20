@@ -162,6 +162,17 @@ impl OpenLoop {
             let scans_unmatched_hash_rows = matches!(table.op, Operation::HashJoin(ref hj) if
                 hj.join_type.keeps_unmatched_build_rows());
 
+            if let Some(row_filter) = &table.row_filter {
+                emit_row_filter(
+                    program,
+                    t_ctx,
+                    table_references,
+                    table,
+                    row_filter,
+                    condition_fail_target,
+                )?;
+            }
+
             // Emit OUTER JOIN conditions (must run before setting match flags).
             LoopConditionEmitter::new(
                 program,
@@ -317,6 +328,43 @@ impl OpenLoop {
 
         Ok(())
     }
+}
+
+/// Skips the row the loop just read unless it passes the table's row-level
+/// security filter. The filter is checked before every other condition of
+/// the loop, so no expression of the statement sees a row that fails it.
+pub(super) fn emit_row_filter(
+    program: &mut ProgramBuilder,
+    t_ctx: &TranslateCtx,
+    table_references: &TableReferences,
+    table: &JoinedTable,
+    row_filter: &Expr,
+    condition_fail_target: BranchOffset,
+) -> Result<()> {
+    // Hash joins and multi-index scans read rows outside this loop, and the
+    // optimizer does not choose them for a table with a filter.
+    turso_assert!(
+        matches!(
+            table.op,
+            Operation::Scan(_) | Operation::Search(_) | Operation::IndexMethodQuery(_)
+        ),
+        "a table with a row-level security filter is read by a loop that checks it"
+    );
+    let passed = program.allocate_label();
+    translate_condition_expr(
+        program,
+        table_references,
+        row_filter,
+        ConditionMetadata {
+            jump_if_condition_is_true: false,
+            jump_target_when_true: passed,
+            jump_target_when_false: condition_fail_target,
+            jump_target_when_null: condition_fail_target,
+        },
+        &t_ctx.resolver,
+    )?;
+    program.preassign_label_to_next_insn(passed);
+    Ok(())
 }
 
 /// The cursors one table read uses.

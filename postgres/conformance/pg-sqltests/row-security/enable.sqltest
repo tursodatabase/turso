@@ -1,0 +1,233 @@
+# ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY through the PostgreSQL
+# frontend. pg_class.relrowsecurity shows which tables have it.
+
+@database :memory:
+
+test new-table-has-no-row-security {
+    CREATE TABLE rls_new (id INT);
+    SELECT relname FROM pg_class WHERE relname = 'rls_new' AND NOT relrowsecurity;
+}
+expect {
+    rls_new
+}
+
+test enable-row-security-shows-in-pg-class {
+    CREATE TABLE rls_enable (id INT);
+    ALTER TABLE rls_enable ENABLE ROW LEVEL SECURITY;
+    SELECT relname FROM pg_class WHERE relname = 'rls_enable' AND relrowsecurity;
+}
+expect {
+    rls_enable
+}
+
+test enable-row-security-of-table-qualified-with-public {
+    CREATE TABLE rls_public (id INT);
+    ALTER TABLE public.rls_public ENABLE ROW LEVEL SECURITY;
+    SELECT relname FROM pg_class WHERE relname = 'rls_public' AND relrowsecurity;
+}
+expect {
+    rls_public
+}
+
+test enable-row-security-of-table-with-quoted-mixed-case-name {
+    CREATE TABLE "RlsMixed" (id INT);
+    ALTER TABLE "RlsMixed" ENABLE ROW LEVEL SECURITY;
+    SELECT relname FROM pg_class WHERE relname = 'RlsMixed' AND relrowsecurity;
+}
+expect {
+    RlsMixed
+}
+
+test enable-row-security-twice-keeps-it-enabled {
+    CREATE TABLE rls_twice (id INT);
+    ALTER TABLE rls_twice ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE rls_twice ENABLE ROW LEVEL SECURITY;
+    SELECT relname FROM pg_class WHERE relname = 'rls_twice' AND relrowsecurity;
+}
+expect {
+    rls_twice
+}
+
+test disable-row-security-hides-it-from-pg-class {
+    CREATE TABLE rls_disable (id INT);
+    ALTER TABLE rls_disable ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE rls_disable DISABLE ROW LEVEL SECURITY;
+    SELECT relname FROM pg_class WHERE relname = 'rls_disable' AND NOT relrowsecurity;
+}
+expect {
+    rls_disable
+}
+
+test disable-row-security-of-table-without-it {
+    CREATE TABLE rls_never (id INT);
+    ALTER TABLE rls_never DISABLE ROW LEVEL SECURITY;
+    SELECT relname FROM pg_class WHERE relname = 'rls_never' AND NOT relrowsecurity;
+}
+expect {
+    rls_never
+}
+
+test enable-row-security-affects-only-that-table {
+    CREATE TABLE rls_one (id INT);
+    CREATE TABLE rls_other (id INT);
+    ALTER TABLE rls_one ENABLE ROW LEVEL SECURITY;
+    SELECT relname FROM pg_class
+    WHERE relname IN ('rls_one', 'rls_other') AND relrowsecurity;
+}
+expect {
+    rls_one
+}
+
+test renamed-table-keeps-row-security {
+    CREATE TABLE rls_before_rename (id INT);
+    ALTER TABLE rls_before_rename ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE rls_before_rename RENAME TO rls_after_rename;
+    CREATE TABLE rls_before_rename (id INT);
+    SELECT relname, relrowsecurity::int FROM pg_class
+    WHERE relname IN ('rls_before_rename', 'rls_after_rename')
+    ORDER BY relname;
+}
+expect {
+    rls_after_rename|1
+    rls_before_rename|0
+}
+
+test table-created-with-name-of-dropped-table-has-no-row-security {
+    CREATE TABLE rls_dropped (id INT);
+    ALTER TABLE rls_dropped ENABLE ROW LEVEL SECURITY;
+    DROP TABLE rls_dropped;
+    CREATE TABLE rls_dropped (id INT);
+    SELECT relname FROM pg_class WHERE relname = 'rls_dropped' AND NOT relrowsecurity;
+}
+expect {
+    rls_dropped
+}
+
+test rolled-back-enable-leaves-no-row-security {
+    CREATE TABLE rls_rollback (id INT);
+    BEGIN;
+    ALTER TABLE rls_rollback ENABLE ROW LEVEL SECURITY;
+    ROLLBACK;
+    SELECT relname FROM pg_class WHERE relname = 'rls_rollback' AND NOT relrowsecurity;
+}
+expect {
+    rls_rollback
+}
+
+test enable-row-security-of-table-in-another-schema {
+    CREATE SCHEMA rls_schema;
+    CREATE TABLE rls_schema.rls_same_name (id INT);
+    CREATE TABLE rls_same_name (id INT);
+    ALTER TABLE rls_schema.rls_same_name ENABLE ROW LEVEL SECURITY;
+    SELECT n.nspname, c.relrowsecurity::int
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = 'rls_same_name'
+    ORDER BY n.nspname;
+}
+expect {
+    public|0
+    rls_schema|1
+}
+
+@skip-if postgres "PostgreSQL says the action cannot be performed on the view"
+test enable-on-a-view-is-rejected {
+    CREATE TABLE rls_view_table (id INT);
+    CREATE VIEW rls_view AS SELECT id FROM rls_view_table;
+    ALTER TABLE rls_view ENABLE ROW LEVEL SECURITY;
+}
+expect error {
+    "rls_view" is not a table
+}
+
+test grant-before-enabling-row-security {
+    CREATE ROLE ra_role_48;
+    CREATE TABLE ra_docs_48 (id INT);
+    INSERT INTO ra_docs_48 VALUES (1);
+    GRANT SELECT ON ra_docs_48 TO ra_role_48;
+    ALTER TABLE ra_docs_48 ENABLE ROW LEVEL SECURITY;
+    SET ROLE ra_role_48;
+    SELECT count(*) FROM ra_docs_48;
+}
+expect {
+    0
+}
+
+test disabling-row-security-shows-the-rows-to-the-role {
+    CREATE ROLE ra_role_49;
+    CREATE TABLE ra_docs_49 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_49 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_49 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_49 TO ra_role_49;
+    ALTER TABLE ra_docs_49 DISABLE ROW LEVEL SECURITY;
+    SET ROLE ra_role_49;
+    SELECT count(*) FROM ra_docs_49;
+}
+expect {
+    3
+}
+
+test enabling-row-security-hides-the-rows-in-the-same-transaction {
+    CREATE ROLE ra_role_50;
+    CREATE TABLE ra_docs_50 (id INT);
+    INSERT INTO ra_docs_50 VALUES (1), (2);
+    GRANT SELECT ON ra_docs_50 TO ra_role_50;
+    BEGIN;
+    ALTER TABLE ra_docs_50 ENABLE ROW LEVEL SECURITY;
+    SET LOCAL ROLE ra_role_50;
+    SELECT count(*) FROM ra_docs_50;
+    ROLLBACK;
+    SET ROLE ra_role_50;
+    SELECT count(*) FROM ra_docs_50;
+}
+expect {
+    0
+    2
+}
+
+test rows-inserted-after-enabling-are-hidden-too {
+    CREATE ROLE ra_role_51;
+    CREATE TABLE ra_docs_51 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_51 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_51 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_51 TO ra_role_51;
+    INSERT INTO ra_docs_51 VALUES (4, 'carol', 'd');
+    SELECT count(*) FROM ra_docs_51;
+    SET ROLE ra_role_51;
+    SELECT count(*) FROM ra_docs_51;
+}
+expect {
+    4
+    0
+}
+
+test role-that-does-not-own-the-table-cannot-enable-row-security {
+    CREATE ROLE rp_alice_17;
+    CREATE TABLE rp_docs_17 (id INT PRIMARY KEY);
+    SET ROLE rp_alice_17;
+    ALTER TABLE rp_docs_17 ENABLE ROW LEVEL SECURITY;
+}
+expect error {
+    must be owner of table rp_docs_17
+}
+
+test owner-may-enable-row-security {
+    CREATE ROLE en_owner;
+    CREATE TABLE en_owned (id INT);
+    ALTER TABLE en_owned OWNER TO en_owner;
+    SET ROLE en_owner;
+    ALTER TABLE en_owned ENABLE ROW LEVEL SECURITY;
+    SELECT relrowsecurity FROM pg_class WHERE relname = 'en_owned';
+}
+expect {
+    t
+}
+
+@skip-if postgres "PostgreSQL supports FORCE ROW LEVEL SECURITY"
+test force-row-level-security-is-not-supported {
+    CREATE TABLE en_forced (id INT);
+    ALTER TABLE en_forced FORCE ROW LEVEL SECURITY;
+}
+@sqlstate 0A000
+expect error {
+    ALTER TABLE ... FORCE ROW LEVEL SECURITY is not supported
+}

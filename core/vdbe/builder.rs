@@ -409,6 +409,7 @@ impl ProgramBuilderFlags {
     const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
     const READS_STORED_VALUES: u16 = 1 << 9;
     const WRITES_STORED_VALUES: u16 = 1 << 10;
+    const HIDES_CONSTRAINT_VALUES: u16 = 1 << 11;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -526,6 +527,18 @@ impl ProgramBuilderFlags {
     #[inline]
     pub const fn set_reads_stored_values(&mut self, v: bool) {
         self.set(Self::READS_STORED_VALUES, v)
+    }
+
+    #[inline]
+    /// When set, the errors of the statement's constraints do not show the
+    /// values of the row that broke them. Set for a statement that writes a
+    /// table for a role that may not read it.
+    pub const fn hides_constraint_values(self) -> bool {
+        self.get(Self::HIDES_CONSTRAINT_VALUES)
+    }
+    #[inline]
+    pub const fn set_hides_constraint_values(&mut self, v: bool) {
+        self.set(Self::HIDES_CONSTRAINT_VALUES, v)
     }
 
     #[inline]
@@ -1134,6 +1147,17 @@ impl ProgramBuilder {
             .reserve(opts.approx_num_labels);
     }
 
+    /// Make room for at least `additional` more instructions. The capacity
+    /// grows to a power of two, as repeated doubling of the `Vec` would make
+    /// it, but the instructions are copied only once.
+    pub fn reserve_insns(&mut self, additional: usize) {
+        let needed = self.insns.len() + additional;
+        if needed > self.insns.capacity() {
+            self.insns
+                .reserve_exact(needed.next_power_of_two() - self.insns.len());
+        }
+    }
+
     /// Start a new constant span. The next instruction to be emitted will be the first
     /// instruction in the span.
     pub fn constant_span_start(&mut self) -> usize {
@@ -1161,6 +1185,31 @@ impl ProgramBuilder {
                 span.1 = self.insns.len().saturating_sub(1);
             }
         }
+    }
+
+    /// Moves the instructions that `emit` emits to the end of the program,
+    /// where Init jumps before the first row is read, so they run once per
+    /// statement. Unlike a constant expression, they do not have to be
+    /// constant: `random()` emitted here is called once and every row sees
+    /// the same value. They must not read a cursor, because none is open yet.
+    pub fn emit_once_per_statement<T>(
+        &mut self,
+        emit: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        turso_assert!(
+            !self.constant_span_is_open(),
+            "code that runs once per statement is emitted outside constant code"
+        );
+        let first_span_of_emit = self.constant_spans.len();
+        let first_insn = self.insns.len();
+        let result = emit(self)?;
+        // One span over everything `emit` emitted replaces the spans of the
+        // constant expressions inside it.
+        self.constant_spans.truncate(first_span_of_emit);
+        if self.insns.len() > first_insn {
+            self.constant_spans.push((first_insn, self.insns.len() - 1));
+        }
+        Ok(result)
     }
 
     /// Check if there is a constant span that is currently open.
@@ -1661,7 +1710,10 @@ impl ProgramBuilder {
         // Since spans are sorted and non-overlapping, we track our position
         // in the span list and never look back - O(n + m) total, where
         // n = number of instructions, m = number of constant spans.
-        let mut non_constant = Vec::with_capacity(self.insns.len());
+        // One more slot for the `Goto` that `epilogue` emits after the constant
+        // instructions. Without it, that push copies the whole program to a
+        // larger buffer.
+        let mut non_constant = Vec::with_capacity(self.insns.len() + 1);
         let mut constant = Vec::new();
         let mut span_idx = 0;
 
@@ -2578,6 +2630,7 @@ impl ProgramBuilder {
                 needs_stmt_subtransactions,
             )),
             is_multi_write: self.flags.is_multi_write(),
+            hides_constraint_values: self.flags.hides_constraint_values(),
             trigger: self.trigger.take(),
             is_subprogram: self.flags.is_subprogram(),
             has_materialized_views: self.has_materialized_views,
@@ -2594,18 +2647,18 @@ impl ProgramBuilder {
     #[turso_macros::trace_stack]
     pub fn build(
         self,
-        connection: Arc<Connection>,
+        connection: &Connection,
         change_cnt_on: bool,
         sql: &str,
     ) -> crate::Result<Program> {
-        let prepare_context = PrepareContext::from_connection(&connection);
+        let prepare_context = PrepareContext::from_connection(connection);
         let prepared = self.build_prepared_program(
             prepare_context,
             connection.custom_collations(),
             change_cnt_on,
             sql,
         )?;
-        Ok(Program::from_prepared(Arc::new(prepared), connection))
+        Ok(Program::from_prepared(Arc::new(prepared)))
     }
 }
 

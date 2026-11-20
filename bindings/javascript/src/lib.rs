@@ -24,7 +24,7 @@ use std::{
 };
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
-use turso_core::ConnectOpts;
+use turso_core::{ConnectOpts, SessionRole};
 use turso_sqlite::SqliteDialect;
 
 /// Shared ownership of a `turso_core::Statement` that can be explicitly finalized.
@@ -211,9 +211,12 @@ pub struct TableColumn {
     pub name: String,
     #[napi(ts_type = "string | null")]
     pub r#type: Option<String>,
-    pub column: Option<()>,
-    pub table: Option<()>,
-    pub database: Option<()>,
+    #[napi(ts_type = "string | null")]
+    pub column: Option<String>,
+    #[napi(ts_type = "string | null")]
+    pub table: Option<String>,
+    #[napi(ts_type = "string | null")]
+    pub database: Option<String>,
 }
 
 /// Step one statement. Returns the step constant plus the requested sleep in
@@ -429,7 +432,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<(), String> {
     // Pass the encryption key at connect time to set up the encryption context
     // before the pager reads page 1. This is required for encrypted databases.
     let conn = db_core
-        .connect(ConnectOpts::new().with_encryption_key(encryption_key))
+        .connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(encryption_key))
         .map_err(to_sqlite_error)?;
 
     if let Some(busy_timeout) = busy_timeout {
@@ -878,7 +881,8 @@ impl Statement {
             ValueType::Null => turso_core::Value::Null,
             ValueType::Number => {
                 let n: f64 = unsafe { value.cast()? };
-                if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+                // `i64::MAX as f64` is 2^63, one past the largest i64, so the upper bound is exclusive.
+                if n.fract() == 0.0 && n >= i64::MIN as f64 && n < i64::MAX as f64 {
                     turso_core::Value::from_i64(n as i64)
                 } else {
                     turso_core::Value::from_f64(n)
@@ -1025,23 +1029,15 @@ impl Statement {
 
         for i in 0..column_count {
             let mut js_obj = Object::new(env)?;
-            let column_name = stmt.get_column_name(i);
-            let column_type = stmt.get_column_type_name(i);
-
-            // Set the name property
-            js_obj.set("name", column_name.as_ref())?;
-
-            // Set type property if available
-            match column_type {
-                Some(type_str) => js_obj.set("type", type_str.as_str())?,
-                None => js_obj.set("type", ToNapiValue::into_unknown(Null, env)?)?,
-            }
-
-            // For now, set other properties to null since turso_core doesn't provide this metadata
-            js_obj.set("column", ToNapiValue::into_unknown(Null, env)?)?;
-            js_obj.set("table", ToNapiValue::into_unknown(Null, env)?)?;
-            js_obj.set("database", ToNapiValue::into_unknown(Null, env)?)?;
-
+            let origin = stmt.get_column_origin(i);
+            js_obj.set("name", stmt.get_column_name(i).as_ref())?;
+            js_obj.set("column", origin.as_ref().map(|o| o.column.as_str()))?;
+            js_obj.set("table", origin.as_ref().map(|o| o.table.as_str()))?;
+            js_obj.set("database", origin.as_ref().map(|o| o.database.as_str()))?;
+            js_obj.set(
+                "type",
+                origin.as_ref().and_then(|o| o.declared_type.as_deref()),
+            )?;
             js_array.set(i as u32, js_obj)?;
         }
 

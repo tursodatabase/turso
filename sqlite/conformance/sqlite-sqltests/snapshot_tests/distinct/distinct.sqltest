@@ -1,0 +1,53 @@
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup schema {
+    CREATE TABLE t (
+        id INTEGER PRIMARY KEY,
+        u TEXT UNIQUE NOT NULL,
+        a INTEGER NOT NULL,
+        b INTEGER NOT NULL,
+        c INTEGER
+    );
+    CREATE UNIQUE INDEX t_ab ON t (a, b);
+}
+
+@setup schema
+snapshot distinct-with-rowid {
+    SELECT DISTINCT rowid, c FROM t;
+}
+
+@setup schema
+snapshot distinct-with-integer-primary-key {
+    SELECT DISTINCT id, c FROM t;
+}
+
+@setup schema
+snapshot distinct-with-unique-not-null {
+    SELECT DISTINCT u, c FROM t;
+}
+
+@setup schema
+snapshot distinct-with-multi-column-unique {
+    SELECT DISTINCT a, b, c FROM t;
+}
+
+@setup schema
+snapshot distinct-with-rowid-and-group-by {
+    SELECT DISTINCT id FROM t GROUP BY id;
+}
+
+@setup schema
+snapshot count-distinct-with-rowid {
+    SELECT count(DISTINCT id) FROM t;
+}
+
+@setup schema
+snapshot count-distinct-with-unique-group-by {
+    SELECT u, count(DISTINCT c) FROM t GROUP BY u;
+}
+
+@setup schema
+snapshot count-distinct-with-rowid-and-other-aggregate {
+    SELECT count(DISTINCT id), sum(c) FROM t;
+}

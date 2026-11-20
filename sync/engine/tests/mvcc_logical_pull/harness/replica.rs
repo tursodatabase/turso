@@ -99,6 +99,7 @@ fn replica_opts(db_opts: DatabaseOpts) -> DatabaseSyncEngineOpts {
         remote_encryption_key: None,
         push_operations_threshold: None,
         pull_bytes_threshold: None,
+        pull_parallel_requests: None,
         logical_mvcc_pull: None,
     }
 }

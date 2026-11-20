@@ -30,6 +30,10 @@ These features extend Turso beyond SQLite compatibility:
 
 ## PostgreSQL schema metadata
 
+The PostgreSQL opening functions initialize the relation catalog before returning
+the database, including for asynchronous server opens. Relations receive stable,
+persisted OIDs when created, and column `attrelid` values identify those relations.
+
 The PostgreSQL frontend exposes the default `standard public schema` comment in
 `pg_catalog.pg_description`. This lets `pg_dump` preserve the default comment on
 `public` without emitting an empty `COMMENT ON SCHEMA` statement. User-defined

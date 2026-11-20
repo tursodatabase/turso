@@ -1,4 +1,6 @@
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+mod fts;
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
 mod json;
 
 use crate::assertions::{AssertColumn, AssertQueryPlan, Cell, NULL};
@@ -31,6 +33,7 @@ use turso_core::{
 };
 
 use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, ExecRows, TempDatabase};
+use turso_core::SessionRole;
 use turso_sqlite::SqliteDialect;
 
 fn run<T>(db: &TempDatabase, mut f: impl FnMut() -> turso_core::types::IOResultOr<T>) -> Result<T> {
@@ -62,15 +65,18 @@ fn fts_test_stats(
     columns: &[(&str, usize)],
 ) -> turso_core::index_method::IndexMethodTestStats {
     let attachment = FtsIndexMethod
-        .attach(&IndexMethodConfiguration {
-            table_name: table_name.to_string(),
-            index_name: index_name.to_string(),
-            columns: columns
-                .iter()
-                .map(|&(name, index)| IndexColumn::new(name, index, CollationSeq::BINARY))
-                .collect(),
-            parameters: HashMap::default(),
-        })
+        .attach(
+            &turso_sqlite::SqliteDialect,
+            &IndexMethodConfiguration {
+                table_name: table_name.to_string(),
+                index_name: index_name.to_string(),
+                columns: columns
+                    .iter()
+                    .map(|&(name, index)| IndexColumn::new(name, index, CollationSeq::BINARY))
+                    .collect(),
+                parameters: HashMap::default(),
+            },
+        )
         .unwrap();
     let mut cursor = attachment.init().unwrap();
     run(db, || {
@@ -187,12 +193,15 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
 
     let index = VectorSparseInvertedIndexMethod;
     let attached = index
-        .attach(&IndexMethodConfiguration {
-            table_name: "t".to_string(),
-            index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
-            parameters: HashMap::default(),
-        })
+        .attach(
+            &turso_sqlite::SqliteDialect,
+            &IndexMethodConfiguration {
+                table_name: "t".to_string(),
+                index_name: "t_idx".to_string(),
+                columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
+                parameters: HashMap::default(),
+            },
+        )
         .unwrap();
 
     conn.wal_insert_begin().unwrap();
@@ -279,12 +288,15 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
 
     let index = VectorSparseInvertedIndexMethod;
     let attached = index
-        .attach(&IndexMethodConfiguration {
-            table_name: "t".to_string(),
-            index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
-            parameters: HashMap::default(),
-        })
+        .attach(
+            &turso_sqlite::SqliteDialect,
+            &IndexMethodConfiguration {
+                table_name: "t".to_string(),
+                index_name: "t_idx".to_string(),
+                columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
+                parameters: HashMap::default(),
+            },
+        )
         .unwrap();
 
     conn.wal_insert_begin().unwrap();
@@ -371,12 +383,15 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
 
     let index = VectorSparseInvertedIndexMethod;
     let attached = index
-        .attach(&IndexMethodConfiguration {
-            table_name: "t".to_string(),
-            index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
-            parameters: HashMap::default(),
-        })
+        .attach(
+            &turso_sqlite::SqliteDialect,
+            &IndexMethodConfiguration {
+                table_name: "t".to_string(),
+                index_name: "t_idx".to_string(),
+                columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
+                parameters: HashMap::default(),
+            },
+        )
         .unwrap();
 
     conn.wal_insert_begin().unwrap();
@@ -703,15 +718,18 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
 
     let index = FtsIndexMethod;
     let attached = index
-        .attach(&IndexMethodConfiguration {
-            table_name: "docs".to_string(),
-            index_name: "fts_docs".to_string(),
-            columns: vec![
-                IndexColumn::new("title", 1, CollationSeq::BINARY),
-                IndexColumn::new("body", 2, CollationSeq::BINARY),
-            ],
-            parameters: HashMap::default(),
-        })
+        .attach(
+            &turso_sqlite::SqliteDialect,
+            &IndexMethodConfiguration {
+                table_name: "docs".to_string(),
+                index_name: "fts_docs".to_string(),
+                columns: vec![
+                    IndexColumn::new("title", 1, CollationSeq::BINARY),
+                    IndexColumn::new("body", 2, CollationSeq::BINARY),
+                ],
+                parameters: HashMap::default(),
+            },
+        )
         .unwrap();
 
     conn.wal_insert_begin().unwrap();
@@ -754,15 +772,18 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
 
     let index = FtsIndexMethod;
     let attached = index
-        .attach(&IndexMethodConfiguration {
-            table_name: "docs".to_string(),
-            index_name: "fts_docs".to_string(),
-            columns: vec![
-                IndexColumn::new("title", 1, CollationSeq::BINARY),
-                IndexColumn::new("body", 2, CollationSeq::BINARY),
-            ],
-            parameters: HashMap::default(),
-        })
+        .attach(
+            &turso_sqlite::SqliteDialect,
+            &IndexMethodConfiguration {
+                table_name: "docs".to_string(),
+                index_name: "fts_docs".to_string(),
+                columns: vec![
+                    IndexColumn::new("title", 1, CollationSeq::BINARY),
+                    IndexColumn::new("body", 2, CollationSeq::BINARY),
+                ],
+                parameters: HashMap::default(),
+            },
+        )
         .unwrap();
 
     conn.wal_insert_begin().unwrap();
@@ -3139,7 +3160,9 @@ fn test_fts_mvcc_recovery(tmp_db: TempDatabase) {
         std::sync::Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     assert_eq!(
         limbo_exec_rows(
             &conn,
@@ -3165,7 +3188,9 @@ fn test_fts_mvcc_recovery(tmp_db: TempDatabase) {
         std::sync::Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     assert_eq!(
         limbo_exec_rows(
             &conn,
@@ -5115,12 +5140,15 @@ fn fts_read_cache_is_shared_across_connections_and_bounded() {
         .unwrap();
 
     let attachment = FtsIndexMethod
-        .attach(&IndexMethodConfiguration {
-            table_name: "docs".to_string(),
-            index_name: "docs_fts".to_string(),
-            columns: vec![IndexColumn::new("content", 1, CollationSeq::BINARY)],
-            parameters: HashMap::default(),
-        })
+        .attach(
+            &turso_sqlite::SqliteDialect,
+            &IndexMethodConfiguration {
+                table_name: "docs".to_string(),
+                index_name: "docs_fts".to_string(),
+                columns: vec![IndexColumn::new("content", 1, CollationSeq::BINARY)],
+                parameters: HashMap::default(),
+            },
+        )
         .unwrap();
     let readers = (0..5).map(|_| tmp_db.connect_limbo()).collect::<Vec<_>>();
 
@@ -6814,7 +6842,9 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
     let db1 = open();
     let db2 = open();
 
-    let setup = db1.connect(ConnectOpts::new()).unwrap();
+    let setup = db1
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     setup
         .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();
@@ -6849,7 +6879,9 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
 
     // Step 1: "process" 1, connection X pins an old snapshot and warms the
     // shared cache with FTS backing pages at that snapshot.
-    let conn_x = db1.connect(ConnectOpts::new()).unwrap();
+    let conn_x = db1
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn_x.execute("BEGIN").unwrap();
     let _ = run_rows(
         &conn_x,
@@ -6858,7 +6890,9 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
 
     // Step 2: "process" 2 commits FTS churn — deletes make old postings
     // dead (tombstones) and add new ones. Process 1's cache sees none of it.
-    let writer = db2.connect(ConnectOpts::new()).unwrap();
+    let writer = db2
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     for id in 0..50 {
         writer
             .execute(format!(
@@ -6869,7 +6903,9 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
 
     // Step 3: process 1, connection Z begins a fresh snapshot: its
     // changed-detection clears the shared cache and loads some NEW pages.
-    let conn_z = db1.connect(ConnectOpts::new()).unwrap();
+    let conn_z = db1
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     let _ = run_rows(&conn_z, "SELECT count(*) FROM docs WHERE id < 10");
 
     // Step 4: connection X (still pinned at the OLD snapshot) runs another

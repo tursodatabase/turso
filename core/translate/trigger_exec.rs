@@ -289,6 +289,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
             // use it instead of the command's or_conflict to ensure errors propagate.
             let effective_or_conflict = subprogram_ctx.override_conflict.or(*or_conflict);
             Ok(ast::Stmt::Insert {
+                overriding_system_value: false,
                 with: None,
                 or_conflict: effective_or_conflict,
                 tbl_name: QualifiedName {
@@ -365,6 +366,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 returning: vec![],
                 indexed: None,
                 with: None,
+                truncate: false,
             })
         }
         ast::TriggerCmd::Select(select) => {
@@ -606,8 +608,7 @@ fn execute_trigger_commands(
         Ok(())
     })?;
     subprogram_builder.epilogue(resolver.schema());
-    let built_subprogram =
-        subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
+    let built_subprogram = subprogram_builder.build(connection, true, "trigger subprogram")?;
     let subprogram_prepared = built_subprogram.prepared();
 
     // Trigger subprograms do not emit Transaction opcodes, so the parent statement
@@ -1185,8 +1186,15 @@ where
             where_clause,
             group_by,
             window_clause,
-            ..
+            distinctness,
         } => {
+            for expr in distinctness
+                .iter_mut()
+                .flat_map(|distinctness| distinctness.exprs_mut())
+            {
+                rewrite_expression_tree(expr, rewrite_expr)?;
+            }
+
             for col in columns {
                 if let ast::ResultColumn::Expr(expr, _) = col {
                     rewrite_expression_tree(expr, rewrite_expr)?;
