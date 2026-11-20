@@ -3987,8 +3987,24 @@ fn new_key_element_type(path_key: &str, is_quoted: bool) -> ElementType {
 ///
 /// Keys are compared as bytes, because a key that is not UTF-8 must not
 /// match a different key or a label holding U+FFFD.
+///
+/// When both sides are escape-free, the usual case, they are compared here,
+/// so that the compare inlines into its callers.
 #[inline]
 fn compare(key: (&[u8], ElementType), path_key: (&[u8], bool)) -> bool {
+    let (key_bytes, element_type) = key;
+    let (path_bytes, is_quoted) = path_key;
+    if matches!(element_type, ElementType::TEXT | ElementType::TEXTRAW)
+        && (!is_quoted || !path_bytes.contains(&b'\\'))
+    {
+        return key_bytes == path_bytes;
+    }
+    compare_with_escapes(key, path_key)
+}
+
+/// [compare] for a stored key or a path label that can hold escapes.
+#[inline(never)]
+fn compare_with_escapes(key: (&[u8], ElementType), path_key: (&[u8], bool)) -> bool {
     let (key, element_type) = key;
     let (path_key, is_quoted) = path_key;
     if !matches!(
