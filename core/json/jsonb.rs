@@ -1866,7 +1866,9 @@ impl Jsonb {
                 }
                 break;
             }
-            if c == b'"' || c == b'\'' || c == b'\\' || is_json5_id_char(c, true) {
+            if c == b'"' {
+                pos = self.deserialize_key(input, pos, info)?;
+            } else if c == b'\'' || c == b'\\' || is_json5_id_char(c, true) {
                 pos = self.deserialize_string(input, pos, info)?;
             } else if matches!(c, b']' | b',' | b':') {
                 return Err(parse_error("Missing object key", pos));
@@ -2059,6 +2061,31 @@ impl Jsonb {
         }
 
         self.deserialize_string_with_escapes(input, pos, string_start, quote, info)
+    }
+
+    /// Parses the double-quoted object key at `pos`, as
+    /// [Self::deserialize_string] does. Most keys are short and plain, and
+    /// this copy of its fast path for them can be inlined into the object
+    /// loop, without the call.
+    #[inline]
+    fn deserialize_key(
+        &mut self,
+        input: &[u8],
+        pos: usize,
+        info: &mut ParseInfo,
+    ) -> PResult<usize> {
+        if let Some(rest) = input.get(pos + 1..) {
+            let len = rest
+                .iter()
+                .position(|&c| ENDS_DOUBLE_QUOTED_PLAIN_PART[c as usize])
+                .unwrap_or(rest.len());
+            if let (Some(b'"'), Some(&header)) = (rest.get(len), TEXT_HEADERS.get(len)) {
+                self.data.push(header);
+                self.data.extend_from_slice(&rest[..len]);
+                return Ok(pos + len + 2);
+            }
+        }
+        self.deserialize_string(input, pos, info)
     }
 
     /// Parses the rest of a string that [Self::deserialize_string] cannot copy
