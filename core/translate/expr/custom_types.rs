@@ -254,7 +254,7 @@ pub(crate) fn translate_compared_args(
 /// Values of two custom types leave no single type to read a string literal
 /// as, which is an error. None when nothing is read as a custom type.
 pub(crate) fn untyped_values_type<'e>(
-    values: impl Iterator<Item = &'e ast::Expr> + Clone,
+    mut values: impl Iterator<Item = &'e ast::Expr> + Clone,
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
 ) -> Result<Option<ResolvedType>> {
@@ -271,9 +271,7 @@ pub(crate) fn untyped_values_type<'e>(
     if !has_untyped_value {
         // A timestamp among timestamptz values is read as a timestamptz.
         let converts_timestamps = is_type_named(&common, "timestamptz", schema)
-            && values
-                .clone()
-                .any(|value| is_type_named(&type_of(value, &env), "timestamp", schema));
+            && values.any(|value| is_type_named(&type_of(value, &env), "timestamp", schema));
         return if converts_timestamps {
             untyped_operands_read_as(schema, common)
         } else {

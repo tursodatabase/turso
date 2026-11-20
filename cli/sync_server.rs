@@ -75,7 +75,7 @@ enum DbSource {
     Single(Arc<DbHandle>),
     Dir {
         base: PathBuf,
-        config: OpenConfig,
+        config: Box<OpenConfig>,
         open_handles: OpenHandles,
     },
 }
@@ -138,7 +138,7 @@ impl TursoSyncServer {
             address,
             source: DbSource::Dir {
                 base: base.canonicalize()?,
-                config,
+                config: Box::new(config),
                 open_handles,
             },
             interrupt_count,
