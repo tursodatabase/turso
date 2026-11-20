@@ -18,6 +18,8 @@ use crate::harness::{database_opts, InProcessServer, Remote, Replica};
 /// GENCOL_REPRO_VALUE_COLUMNS=11 GENCOL_REPRO_ROUNDS=2
 /// `plain` is an extra control without generated columns or explicit indexes.
 /// All variants retain the PRIMARY KEY and UNIQUE constraints in the reproducer.
+/// GENCOL_REPRO_ID_FORMAT=padded is a diagnostic control: zero-pad the numeric
+/// part of TEXT primary keys so their text order agrees with insertion order.
 #[test]
 #[ignore = "manual reproduction: JSON generated columns and large MVCC pulls"]
 fn generated_columns_pull() -> Result<()> {
@@ -27,10 +29,13 @@ fn generated_columns_pull() -> Result<()> {
     let rounds = setting("GENCOL_REPRO_ROUNDS", 2);
     let cases = std::env::var("GENCOL_REPRO_CASES")
         .unwrap_or_else(|_| "full,no-indexes,no-generated,plain".to_string());
+    let id_format = std::env::var("GENCOL_REPRO_ID_FORMAT").unwrap_or_else(|_| "raw".to_string());
+    assert!(matches!(id_format.as_str(), "raw" | "padded"));
     assert!(total_rows > 0 && update_rows > 0 && update_rows <= total_rows);
     assert!(value_columns >= 2 && rounds > 0);
 
     println!("variant,total_rows,update_rows,value_columns,round,remote_update_seconds,connect_seconds,pull_seconds,empty_pull_seconds,checkpoint_seconds");
+    eprintln!("TEXT primary key format: {id_format}");
     for variant in cases.split(',') {
         assert!(matches!(
             variant,
@@ -45,7 +50,7 @@ fn generated_columns_pull() -> Result<()> {
         eprintln!("setting up {variant}: {total_rows} rows, {value_columns} JSON columns");
         let start = Instant::now();
         let remote = Remote::new(&setup.iter().map(String::as_str).collect::<Vec<_>>())?;
-        seed(&remote, total_rows, value_columns)?;
+        seed(&remote, total_rows, value_columns, id_format == "padded")?;
         eprintln!("seeded {variant} in {:.3}s", start.elapsed().as_secs_f64());
 
         let dir = Arc::new(tempfile::tempdir()?);
@@ -168,7 +173,7 @@ fn schema(generated: bool, indexed: bool, value_columns: usize) -> Vec<String> {
     statements
 }
 
-fn seed(remote: &Remote, rows: usize, value_columns: usize) -> Result<()> {
+fn seed(remote: &Remote, rows: usize, value_columns: usize, padded_ids: bool) -> Result<()> {
     let names = (1..=value_columns)
         .map(|column| format!("c{column}"))
         .collect::<Vec<_>>()
@@ -181,7 +186,11 @@ fn seed(remote: &Remote, rows: usize, value_columns: usize) -> Result<()> {
     for first in (1..=rows).step_by(50) {
         let row_sql = (first..=(first + 49).min(rows))
             .map(|row| {
-                let id = format!("'r' || {row}");
+                let id = if padded_ids {
+                    format!("printf('r%010d', {row})")
+                } else {
+                    format!("'r' || {row}")
+                };
                 format!("({id}, {row}, 0, 0, 1, 1, printf('%010d', {row}), {values})")
             })
             .collect::<Vec<_>>()
