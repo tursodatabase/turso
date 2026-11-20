@@ -1,6 +1,7 @@
 use crate::sync::{Arc, RwLock};
 use std::borrow::Cow;
 use std::iter::successors;
+use std::ops::Range;
 use std::result::Result;
 
 use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
@@ -823,8 +824,8 @@ struct InPlaceJsonPath {
     string: String,
     element_lengths: Vec<usize>,
     last_element: LastElement,
-    /// The unescaped name of the last element when it is an object member. The buffer stays
-    /// when the last element becomes an array index, so that the next name does not allocate.
+    /// The unescaped name of the last element when it is [`LastElement::Name`]. The buffer
+    /// stays when the last element changes, so that the next name does not allocate.
     last_name: String,
 }
 
@@ -834,6 +835,12 @@ enum LastElement {
     Index(i64),
     /// An object member, with its name in `last_name`.
     Name,
+    /// An object member whose key has no escape, with its name at `start..end` in the path
+    /// string. The path writes such a name as it is.
+    NameInPath {
+        start: usize,
+        end: usize,
+    },
     None,
 }
 
@@ -875,8 +882,13 @@ impl InPlaceJsonPath {
         // A key with no escape is its own name, so it needs no JSON text.
         if let Some(payload) = jsonb::plain_string_payload(key) {
             let name = jsonb::utf8_lossy(payload);
-            self.set_last_element_name(&name);
-            self.push_object_name(&name);
+            // The key column reads the name from the path, so that the name
+            // is copied once for each member.
+            let name_in_path = self.push_object_name(&name);
+            self.last_element = LastElement::NameInPath {
+                start: name_in_path.start,
+                end: name_in_path.end,
+            };
             return Ok(());
         }
         let key = Jsonb::from_raw_data(key)?;
@@ -909,15 +921,17 @@ impl InPlaceJsonPath {
     }
 
     /// Makes `name` the last element. The name is written in the buffer of
-    /// the name before it, if there is one, so that the members of an
-    /// object do not allocate a name each.
+    /// the name before it, if there is one, so that each filter of the
+    /// cursor does not allocate a name.
     fn set_last_element_name(&mut self, name: &str) {
         self.last_name.clear();
         self.last_name.push_str(name);
         self.last_element = LastElement::Name;
     }
 
-    fn push_object_name(&mut self, name: &str) {
+    /// Appends the element of the object member `name`, and returns the range
+    /// of `name` in the path string.
+    fn push_object_name(&mut self, name: &str) -> Range<usize> {
         // This follows SQLite's current quoting scheme, but it is not part of the stable API.
         // See https://sqlite.org/forum/forumpost?udc=1&name=be212a295ed8df4c
         let mut chars = name.chars();
@@ -928,6 +942,7 @@ impl InPlaceJsonPath {
             }
         };
         let start = self.string.len();
+        let name_start = start + 1 + usize::from(needs_quotes);
         self.string.push('.');
         if needs_quotes {
             self.string.push('"');
@@ -937,6 +952,7 @@ impl InPlaceJsonPath {
             self.string.push_str(name);
         }
         self.element_lengths.push(self.string.len() - start);
+        name_start..name_start + name.len()
     }
 
     /// True when a stored name holds a control character or a double quote that is not part of
@@ -1017,6 +1033,7 @@ impl InPlaceJsonPath {
         match self.last_element {
             LastElement::Index(idx) => Key::Integer(idx),
             LastElement::Name => Key::String(&self.last_name),
+            LastElement::NameInPath { start, end } => Key::String(&self.string[start..end]),
             LastElement::None => Key::None,
         }
     }

@@ -443,3 +443,38 @@ expect {
     1
     5
 }
+
+# The key column of a member whose key has no escape reads the name from the
+# path, which also has the name in quotes when the name needs them.
+test json-each-key-of-members-with-names-that-need-quotes {
+    SELECT key, fullkey FROM json_each('{"a":1,"a b":2,"":3,"é":4,"1x":5,"x.y":6}');
+}
+expect {
+    a|$.a
+    a b|$."a b"
+    |$.""
+    é|$."é"
+    1x|$."1x"
+    x.y|$."x.y"
+}
+
+test json-tree-keys-of-nested-members-with-and-without-escapes {
+    SELECT key, fullkey, path FROM json_tree('{"a b":{"c":[{"d e":1}],"f\"g":2},"h":3}');
+}
+expect {
+    |$|$
+    a b|$."a b"|$
+    c|$."a b".c|$."a b"
+    0|$."a b".c[0]|$."a b".c
+    d e|$."a b".c[0]."d e"|$."a b".c[0]
+    f"g|$."a b"."f\"g"|$."a b"
+    h|$.h|$
+}
+
+test json-tree-key-of-the-root-path-and-of-its-members {
+    SELECT key, fullkey FROM json_tree('{"x y":{"z":1}}', '$."x y"');
+}
+expect {
+    x y|$."x y"
+    z|$."x y".z
+}
