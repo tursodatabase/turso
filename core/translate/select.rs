@@ -22,9 +22,10 @@ use crate::translate::plan::{
     GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
 };
 use crate::translate::planner::{
-    append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries,
+    add_ctes_read_by_subqueries_as_outer_refs, append_vtab_predicates_to_where_clause,
+    break_predicate_at_and_boundaries, collect_cte_definitions,
     collect_subquery_table_refs_in_expr, collect_subquery_table_refs_in_window_clause, parse_from,
-    parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
+    parse_limit, parse_where, resolve_window_and_aggregate_functions, CteDefinition,
 };
 use crate::translate::result_row::emit_select_result;
 use crate::translate::row_security;
@@ -175,10 +176,11 @@ pub fn prepare_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
+    let cte_definitions = collect_cte_definitions(select.with, program)?;
     prepare_select_plan_from_arms(
         select.body.select,
         select.body.compounds,
-        select.with,
+        &cte_definitions,
         select.order_by,
         select.limit,
         resolver,
@@ -198,7 +200,7 @@ pub fn prepare_select_plan(
 pub(crate) fn prepare_select_plan_from_arms(
     first_arm: ast::OneSelect,
     compound_arms: impl IntoIterator<Item = CompoundSelect>,
-    with: Option<ast::With>,
+    cte_definitions: &[CteDefinition],
     order_by: Vec<ast::SortedColumn>,
     limit: Option<ast::Limit>,
     resolver: &Resolver,
@@ -215,22 +217,20 @@ pub(crate) fn prepare_select_plan_from_arms(
             program,
             limit,
             order_by,
-            with,
+            cte_definitions,
             outer_query_refs,
             query_destination,
             connection,
         )?)));
     }
 
-    // The WITH clause applies to every arm, so each arm needs its own copy
-    // while names are resolved.
     let mut last = prepare_one_select_plan(
         first_arm,
         resolver,
         program,
         None,
         vec![],
-        with.clone(),
+        cte_definitions,
         outer_query_refs,
         query_destination.clone(),
         connection,
@@ -249,7 +249,7 @@ pub(crate) fn prepare_select_plan_from_arms(
             program,
             None,
             vec![],
-            with.clone(),
+            cte_definitions,
             outer_query_refs,
             query_destination.clone(),
             connection,
@@ -306,7 +306,7 @@ fn prepare_one_select_plan(
     program: &mut ProgramBuilder,
     limit: Option<ast::Limit>,
     order_by: Vec<ast::SortedColumn>,
-    with: Option<ast::With>,
+    cte_definitions: &[CteDefinition],
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
@@ -339,7 +339,7 @@ fn prepare_one_select_plan(
             }
 
             // Parse the FROM clause into a vec of TableReferences. Fold all the join conditions expressions into the WHERE clause.
-            let table_refs_outside_from = if with.is_some() {
+            let table_refs_outside_from = if !cte_definitions.is_empty() {
                 collect_table_refs_outside_from(
                     &columns,
                     where_clause.as_deref(),
@@ -356,7 +356,7 @@ fn prepare_one_select_plan(
                     from,
                     resolver,
                     program,
-                    with,
+                    cte_definitions,
                     &table_refs_outside_from,
                     &mut where_predicates,
                     &mut vtab_predicates,
@@ -937,8 +937,8 @@ fn prepare_one_select_plan(
             for expr in values.iter().flatten() {
                 collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
             }
-            plan_ctes_as_outer_refs(
-                with,
+            add_ctes_read_by_subqueries_as_outer_refs(
+                cte_definitions,
                 &subquery_table_refs,
                 resolver,
                 program,

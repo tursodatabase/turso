@@ -6875,8 +6875,8 @@ pub struct FromClauseSubqueryCteMetadata {
     /// True when more than one read in the same query tree can reuse one
     /// materialized result for this CTE.
     pub shared_materialization: bool,
-    /// True for explicit WITH ... AS MATERIALIZED.
-    pub materialize_hint: bool,
+    /// The `MATERIALIZED` or `NOT MATERIALIZED` keyword of the CTE.
+    pub materialized: turso_parser::ast::Materialized,
 }
 
 impl FromClauseSubquery {
@@ -6884,8 +6884,16 @@ impl FromClauseSubquery {
         self.cte.map(|cte| cte.id)
     }
 
+    /// True for explicit WITH ... AS MATERIALIZED.
     pub fn materialize_hint(&self) -> bool {
-        self.cte.is_some_and(|cte| cte.materialize_hint)
+        self.cte
+            .is_some_and(|cte| cte.materialized == turso_parser::ast::Materialized::Yes)
+    }
+
+    /// True for explicit WITH ... AS NOT MATERIALIZED.
+    pub fn not_materialized_hint(&self) -> bool {
+        self.cte
+            .is_some_and(|cte| cte.materialized == turso_parser::ast::Materialized::No)
     }
 
     pub fn shared_materialization(&self) -> bool {

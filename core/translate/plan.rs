@@ -3555,8 +3555,8 @@ impl JoinedTable {
     /// Creates a new TableReference for a subquery from a Plan (either SelectPlan or CompoundSelect).
     /// If `explicit_columns` is provided, those names override the derived column names from the SELECT.
     /// If `cte_id` is provided, this subquery is a CTE reference that can share materialized data.
-    /// If `materialize_hint` is true, the CTE was declared with AS MATERIALIZED and should always
-    /// be materialized regardless of reference count.
+    /// `materialized` is the `MATERIALIZED` or `NOT MATERIALIZED` keyword of the CTE. A CTE
+    /// declared with AS MATERIALIZED is always materialized regardless of reference count.
     #[allow(clippy::too_many_arguments)]
     pub fn new_subquery_from_plan(
         identifier: String,
@@ -3565,18 +3565,17 @@ impl JoinedTable {
         internal_id: TableInternalId,
         explicit_columns: Option<&[String]>,
         cte_id: Option<usize>,
-        materialize_hint: bool,
+        materialized: ast::Materialized,
         resolver: &Resolver,
     ) -> Result<Self> {
         let (columns, column_types) = subquery_output_columns(&plan, explicit_columns, resolver)?;
         // Get result columns and table references from the plan
-        // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
         // and they may be materialized regardless of explicit keyword usage.
         let cte = cte_id.map(|id| crate::schema::FromClauseSubqueryCteMetadata {
             id,
             shared_materialization: false,
-            materialize_hint,
+            materialized,
         });
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),

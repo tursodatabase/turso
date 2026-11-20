@@ -464,6 +464,15 @@ WHERE total_sales > 100000
 ORDER BY total_sales DESC;
 ```
 
+As in SQLite, a CTE is computed once for the statement, and every read sees the same rows, when the CTE is marked `MATERIALIZED`, or when the statement reads it more than once, it is not marked `NOT MATERIALIZED`, and its query is one that SQLite does not merge into the query that reads it: a query without a `FROM` clause, an aggregate, `DISTINCT`, `OFFSET`, `VALUES`, or a compound other than `UNION ALL`. This includes reads in subqueries and in the arms of a compound SELECT.
+
+```sql
+WITH c(x) AS (SELECT random())
+SELECT x FROM c UNION SELECT x FROM c;   -- one row
+```
+
+A subquery in the `RETURNING` clause of an `UPDATE` or `DELETE` runs after the write. It reuses the CTE result only when a read before the write stored it, as described above. Otherwise it computes the CTE again and sees the written rows, as in SQLite.
+
 ### Multiple CTEs
 
 ```sql
