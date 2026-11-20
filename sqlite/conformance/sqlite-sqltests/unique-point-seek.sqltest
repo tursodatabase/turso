@@ -1,0 +1,100 @@
+@database :temp:
+
+# A full UNIQUE key identifies one row only when every key component is
+# non-NULL. Runtime IS keys, partial prefixes, and non-unique indexes must
+# still visit all matching rows.
+
+setup schema {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT COLLATE NOCASE, part INTEGER, v TEXT);
+    CREATE UNIQUE INDEX t_key ON t(k DESC, part);
+    CREATE INDEX t_k ON t(k);
+    INSERT INTO t VALUES
+        (1,'a',1,'one'), (2,'A',2,'two'),
+        (3,NULL,1,'three'), (4,NULL,1,'four'),
+        (5,'a',NULL,'five'), (6,'A',NULL,'six'),
+        (7,NULL,NULL,'seven'), (8,NULL,NULL,'eight'),
+        (9,'b',1,'nine');
+}
+
+@setup schema
+test unique-full-key-with-runtime-is-values {
+    SELECT id FROM t INDEXED BY t_key
+    WHERE k IS lower('A') AND part IS abs(-1);
+}
+expect {
+    1
+}
+
+@setup schema
+test unique-full-key-with-one-null-is-value {
+    SELECT id FROM t INDEXED BY t_key
+    WHERE k IS nullif('x','x') AND part IS abs(-1) ORDER BY id;
+    SELECT id FROM t INDEXED BY t_key
+    WHERE k IS lower('A') AND part IS nullif(1,1) ORDER BY id;
+}
+expect {
+    3
+    4
+    5
+    6
+}
+
+@setup schema
+test unique-full-key-with-two-null-is-values {
+    SELECT id FROM t INDEXED BY t_key
+    WHERE k IS nullif('x','x') AND part IS nullif(1,1) ORDER BY id;
+}
+expect {
+    7
+    8
+}
+
+@setup schema
+test unique-null-key-with-reverse-order {
+    SELECT id FROM t INDEXED BY t_key
+    WHERE k IS nullif('x','x') AND part IS abs(-1) ORDER BY id DESC;
+    SELECT id FROM t INDEXED BY t_key
+    WHERE k IS lower('A') AND part IS nullif(1,1) ORDER BY id DESC;
+}
+expect {
+    4
+    3
+    6
+    5
+}
+
+@setup schema
+test unique-full-key-with-mixed-equality-and-is {
+    SELECT id FROM t INDEXED BY t_key
+    WHERE k = lower('A') AND part IS nullif(1,1) ORDER BY id;
+    SELECT id FROM t INDEXED BY t_key
+    WHERE k IS nullif('x','x') AND part = abs(-1) ORDER BY id;
+}
+expect {
+    5
+    6
+    3
+    4
+}
+
+@setup schema
+test unique-prefix-keeps-all-matches {
+    SELECT id FROM t INDEXED BY t_key WHERE k IS lower('A') ORDER BY id;
+}
+expect {
+    1
+    2
+    5
+    6
+}
+
+@setup schema
+test nonunique-key-keeps-all-matches {
+    SELECT id FROM t INDEXED BY t_k WHERE k IS lower('A') ORDER BY id;
+}
+expect {
+    1
+    2
+    5
+    6
+}
