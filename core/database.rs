@@ -606,7 +606,7 @@ pub struct OpenDbAsyncState {
     /// The database being built, held across the ValidatingHeader phase yields
     /// before it is wrapped in an `Arc`.
     building_db: Option<Database>,
-    initial_page_size: Option<PageSize>,
+    requested_page_size: Option<PageSize>,
     /// Sub state machine for `header_validation`, driven in ValidatingHeader.
     header_validation_state: HeaderValidationState,
     /// The dedicated bootstrap connection used by `BootstrapMvStore`, held
@@ -646,7 +646,7 @@ impl OpenDbAsyncState {
             schema_guard: None,
             registry_key: None,
             building_db: None,
-            initial_page_size: None,
+            requested_page_size: None,
             header_validation_state: HeaderValidationState::default(),
             mvcc_bootstrap_conn: None,
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
@@ -882,7 +882,7 @@ impl Database {
         io: &Arc<dyn IO>,
         db_file: Arc<dyn DatabaseStorage>,
         encryption_opts: Option<EncryptionOpts>,
-        initial_page_size: Option<PageSize>,
+        initial_page_size: PageSize,
         allocators: DatabaseAllocators,
         page_codec_id: Option<PageCodecId>,
         dialect: Arc<dyn Dialect>,
@@ -910,10 +910,8 @@ impl Database {
         };
 
         let init_page_1 = if db_size == 0 {
-            let default_page_1 = pager::default_page1_with_size(
-                encryption_cipher_mode.as_ref(),
-                initial_page_size.unwrap_or_default(),
-            );
+            let default_page_1 =
+                pager::default_page1_with_size(encryption_cipher_mode.as_ref(), initial_page_size);
 
             Some(default_page_1)
         } else {
@@ -1536,7 +1534,7 @@ impl Database {
             // of the same path without holding the mutex across yields.
         }
 
-        state.initial_page_size = options.page_size;
+        state.requested_page_size = options.page_size;
 
         // Open the database (no registry lock held; never re-consults it).
         let result = Self::do_open_async_guarded(
@@ -1620,7 +1618,7 @@ impl Database {
             )
             .into());
         };
-        state.initial_page_size = options.page_size;
+        state.requested_page_size = options.page_size;
         Self::do_open_async_guarded(
             state,
             io,
@@ -1725,7 +1723,7 @@ impl Database {
                         &io,
                         db_file.clone(),
                         encryption_opts.clone(),
-                        state.initial_page_size,
+                        state.requested_page_size.unwrap_or_default(),
                         allocators.clone(),
                         page_codec.as_deref().map(PageCodec::codec_id),
                         dialect.clone(),
@@ -1756,7 +1754,7 @@ impl Database {
                     );
                     state.header_validation_state = hv_state;
                     let pager = return_if_io!(result);
-                    db.validate_requested_page_size(state.initial_page_size)?;
+                    db.validate_requested_page_size(state.requested_page_size)?;
 
                     let db = state
                         .building_db
