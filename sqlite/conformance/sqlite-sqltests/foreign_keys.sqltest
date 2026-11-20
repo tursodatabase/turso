@@ -5483,3 +5483,35 @@ test fk-update-of-parent-key-checks-unchanged-self-reference {
 expect error {
     FOREIGN KEY constraint failed
 }
+
+# ON UPDATE RESTRICT fails the statement at once, also for a deferred foreign
+# key, so the second UPDATE cannot repair the row before COMMIT.
+@cross-check-integrity
+test fk-self-reference-deferred-on-update-restrict-fails-at-once {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id) ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO t VALUES (2, 2);
+    BEGIN;
+    UPDATE t SET id = 1;
+    UPDATE t SET p = 1;
+    COMMIT;
+    SELECT * FROM t;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-self-reference-unique-key-deferred-on-update-restrict-fails-at-once {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INT UNIQUE, p INT REFERENCES t(id) ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO t VALUES (2, 2);
+    BEGIN;
+    UPDATE t SET id = 1;
+    UPDATE t SET p = 1;
+    COMMIT;
+    SELECT * FROM t;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}

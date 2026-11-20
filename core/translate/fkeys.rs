@@ -1302,7 +1302,9 @@ pub fn emit_fk_child_update_counters(
         //
         // An ON UPDATE CASCADE, SET NULL or SET DEFAULT action rewrites the
         // child key that references the OLD parent key, so such a match is
-        // repaired by the action.
+        // repaired by the action. With ON UPDATE RESTRICT, the row still
+        // references the parent key it changes, so the statement fails at
+        // once, even for a deferred FK.
         let check_stale_self_match = is_self_ref
             && matches!(fk_ref.fk.on_update, RefAct::NoAction | RefAct::Restrict)
             && fk_ref.parent_key_may_change(updated_cols, child_tbl)?;
@@ -1383,6 +1385,13 @@ pub fn emit_fk_child_update_counters(
             };
             emit_fk_violation(p, &fk_ref.fk, constraint_info)
         };
+        let emit_stale_self_match_violation = |p: &mut ProgramBuilder| -> Result<()> {
+            if matches!(fk_ref.fk.on_update, RefAct::Restrict) {
+                emit_fk_restrict_halt(p, None)
+            } else {
+                emit_new_key_violation(p)
+            }
+        };
 
         if fk_ref.parent_uses_rowid {
             let parent_tbl = resolver
@@ -1425,6 +1434,7 @@ pub fn emit_fk_child_update_counters(
                     collation: CollationSeq::for_internal_values(),
                 });
             }
+            let stale_self_match = program.allocate_label();
             if check_stale_self_match {
                 let old_rowid = program.alloc_register();
                 program.emit_insn(Insn::RowId {
@@ -1434,7 +1444,7 @@ pub fn emit_fk_child_update_counters(
                 program.emit_insn(Insn::Eq {
                     lhs: tmp,
                     rhs: old_rowid,
-                    target_pc: violation,
+                    target_pc: stale_self_match,
                     flags: CmpInsFlags::default(),
                     collation: CollationSeq::for_internal_values(),
                 });
@@ -1453,6 +1463,13 @@ pub fn emit_fk_child_update_counters(
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
             emit_new_key_violation(program)?;
+
+            if check_stale_self_match {
+                program.emit_insn(Insn::Goto { target_pc: fk_ok });
+                program.preassign_label_to_next_insn(stale_self_match);
+                program.emit_insn(Insn::Close { cursor_id: pcur });
+                emit_stale_self_match_violation(program)?;
+            }
         } else {
             let parent_tbl = resolver
                 .with_schema(database_id, |s| {
@@ -1521,7 +1538,7 @@ pub fn emit_fk_child_update_counters(
             if check_stale_self_match {
                 program.preassign_label_to_next_insn(stale_self_match);
                 program.emit_insn(Insn::Close { cursor_id: icur });
-                emit_new_key_violation(program)?;
+                emit_stale_self_match_violation(program)?;
             }
         }
 
