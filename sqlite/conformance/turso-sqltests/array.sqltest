@@ -701,6 +701,70 @@ expect error {
     cannot store TEXT value in INTEGER
 }
 
+test array-set-element-on-untyped-text-array-column-is-error {
+    CREATE TABLE t_setu (d);
+    INSERT INTO t_setu VALUES ('{a,b}');
+    UPDATE t_setu SET d[2] = 'z';
+}
+expect error {
+    array subscript in assignment needs an array, got TEXT
+}
+
+test array-set-element-on-untyped-empty-text-array-column-is-error {
+    CREATE TABLE t_setue (d);
+    INSERT INTO t_setue VALUES ('{}');
+    UPDATE t_setue SET d[1] = 'z';
+}
+expect error {
+    array subscript in assignment needs an array, got TEXT
+}
+
+test array-set-element-on-text-column-array-like-is-error {
+    CREATE TABLE t_setta (a TEXT) STRICT;
+    INSERT INTO t_setta VALUES ('{a,b}');
+    UPDATE t_setta SET a[2] = 'z';
+}
+expect error {
+    array subscript in assignment needs an array, got TEXT
+}
+
+test array-set-element-on-blob-column-is-error {
+    CREATE TABLE t_setb (a BLOB) STRICT;
+    INSERT INTO t_setb VALUES (x'0102');
+    UPDATE t_setb SET a[1] = x'09';
+}
+expect error {
+    array subscript in assignment needs an array, got BLOB
+}
+
+test array-set-element-on-real-column-is-error {
+    CREATE TABLE t_setr (a REAL) STRICT;
+    INSERT INTO t_setr VALUES (5.5);
+    UPDATE t_setr SET a[1] = 7.0;
+}
+expect error {
+    array subscript in assignment needs an array, got REAL
+}
+
+test array-set-element-on-null-untyped-column-is-error {
+    CREATE TABLE t_setn (d);
+    INSERT INTO t_setn VALUES (NULL);
+    UPDATE t_setn SET d[1] = 'z';
+}
+expect error {
+    array subscript in assignment needs an array, got NULL
+}
+
+test array-set-element-on-untyped-column-leaves-value-unchanged {
+    CREATE TABLE t_setl (d);
+    INSERT INTO t_setl VALUES ('{a,b}');
+    UPDATE t_setl SET d[2] = 'z' WHERE d IS NULL;
+    SELECT quote(d), typeof(d) FROM t_setl;
+}
+expect {
+    '{a,b}'|text
+}
+
 test array-slice-null-start {
     SELECT array_slice('{1,2,3,4}', NULL, 2);
 }

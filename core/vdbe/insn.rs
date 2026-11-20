@@ -1137,11 +1137,14 @@ pub enum Insn {
 
     /// Set element at index in a record-format array BLOB.
     /// Extracts all elements, replaces element at index, rebuilds blob.
+    /// `require_array` refuses a value that is not an array, for an
+    /// assignment onto a column whose type is not an array.
     ArraySetElement {
         array_reg: usize,
         index_reg: usize,
         value_reg: usize,
         dest: usize,
+        require_array: bool,
     },
 
     /// Extract a subslice of elements from a record-format array BLOB.

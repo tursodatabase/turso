@@ -3174,6 +3174,7 @@ pub fn op_array_set_element(
             index_reg,
             value_reg,
             dest,
+            require_array,
         },
         insn
     );
@@ -3182,6 +3183,7 @@ pub fn op_array_set_element(
         state.registers[*array_reg].get_value(),
         state.registers[*index_reg].get_value(),
         state.registers[*value_reg].get_value(),
+        *require_array,
     )?;
     state.registers[*dest].set_value(result);
 

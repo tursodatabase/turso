@@ -414,7 +414,17 @@ fn array_find_streaming(
 /// with NULLs. Turso arrays always start at 1, so an assignment PostgreSQL
 /// answers by moving the lower bound (an index below 1, or an index above 1
 /// into an empty array) is an error rather than a silent no-op.
-pub(crate) fn exec_array_set_element(arr: &Value, index: &Value, value: &Value) -> Result<Value> {
+///
+/// `require_array` is set when the assignment targets a column that is not an
+/// array: such a column never holds an array, so any stored value is refused.
+/// A value whose text (`'{a,b}'`) or bytes happen to look like an array is
+/// still not an array, which is why that case cannot rely on parsing the value.
+pub(crate) fn exec_array_set_element(
+    arr: &Value,
+    index: &Value,
+    value: &Value,
+    require_array: bool,
+) -> Result<Value> {
     let index = match index {
         Value::Numeric(Numeric::Integer(i)) => *i,
         Value::Null => {
@@ -429,7 +439,12 @@ pub(crate) fn exec_array_set_element(arr: &Value, index: &Value, value: &Value) 
             )))
         }
     };
-    let Some(mut elements) = array_values_from_any(arr) else {
+    let elements = if require_array {
+        None
+    } else {
+        array_values_from_any(arr)
+    };
+    let Some(mut elements) = elements else {
         return Err(LimboError::InvalidArgument(format!(
             "array subscript in assignment needs an array, got {}",
             arr.value_type()
