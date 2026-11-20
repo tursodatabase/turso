@@ -227,3 +227,106 @@ expect {
     1020|9999
     1030|9999
 }
+
+# A trigger counts immediate foreign key violations on the counter of the
+# statement that fires it, so deleting the child rows of a deleted parent row
+# cancels the violation that the parent delete counted.
+@cross-check-integrity
+test trigger-deletes-children-of-deleted-parent {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x REFERENCES p);
+    INSERT INTO p VALUES (1), (2);
+    INSERT INTO c VALUES (1), (1), (2);
+    CREATE TRIGGER tr AFTER DELETE ON p BEGIN
+        DELETE FROM c WHERE x = old.id;
+    END;
+    DELETE FROM p;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test trigger-moves-children-of-deleted-parent {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x REFERENCES p);
+    INSERT INTO p VALUES (1);
+    INSERT INTO c VALUES (1);
+    CREATE TRIGGER tr BEFORE DELETE ON p BEGIN
+        INSERT INTO p VALUES (old.id + 100);
+        UPDATE c SET x = old.id + 100 WHERE x = old.id;
+    END;
+    DELETE FROM p WHERE id = 1;
+    SELECT * FROM p;
+    SELECT * FROM c;
+}
+expect {
+    101
+    101
+}
+
+@cross-check-integrity
+test trigger-inserts-child-without-parent {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x REFERENCES p);
+    INSERT INTO p VALUES (1);
+    CREATE TRIGGER tr AFTER INSERT ON c WHEN new.x = 1 BEGIN
+        INSERT INTO c VALUES (99);
+    END;
+    INSERT INTO c VALUES (1);
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# The trigger's violation is repaired later in the same statement.
+@cross-check-integrity
+test trigger-child-without-parent-repaired-later-in-statement {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x REFERENCES p);
+    CREATE TRIGGER tr AFTER INSERT ON p WHEN new.id = 1 BEGIN
+        INSERT INTO c VALUES (2);
+    END;
+    INSERT INTO p VALUES (1), (2);
+    SELECT * FROM c;
+}
+expect {
+    2
+}
+
+# A single-row INSERT that fires triggers counts a missing parent instead of
+# failing at once, because a trigger may insert the parent.
+@cross-check-integrity
+test trigger-inserts-parent-of-inserted-child {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x REFERENCES p);
+    CREATE TRIGGER tr AFTER INSERT ON c BEGIN
+        INSERT OR IGNORE INTO p VALUES (new.x);
+    END;
+    INSERT INTO c VALUES (5);
+    SELECT * FROM p;
+}
+expect {
+    5
+}
+
+@cross-check-integrity
+test trigger-does-not-repair-inserted-child {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x REFERENCES p);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON c BEGIN
+        INSERT INTO log VALUES (new.x);
+    END;
+    INSERT INTO c VALUES (5);
+}
+expect error {
+    FOREIGN KEY constraint failed
+}

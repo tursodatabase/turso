@@ -1021,19 +1021,31 @@ pub fn translate_insert(
         insertion.record_register(),
     );
 
+    let relevant_after_triggers = get_triggers_including_temp(
+        resolver,
+        namespace,
+        TriggerEvent::Insert,
+        TriggerTime::After,
+        None,
+        &btree_table,
+        connection,
+    );
+    let has_after_triggers = !relevant_after_triggers.is_empty();
+
     if has_fks {
         // Child-side FK check must run before any writes (IdxInsert / Insert).
         // A single-row insert of an immediate FK halts here, so no index entry is
         // written when the parent is missing — matching SQLite's bytecode order.
-        // A multi-row insert counts the violation instead, because a later row may
-        // insert the parent; the count is checked when the statement ends.
+        // Like SQLite, a multi-row insert, or one that fires triggers, counts the
+        // violation instead, because a later row or a trigger may insert the
+        // parent; the count is checked when the statement ends.
         let fk_layout = btree_table.column_layout()?;
         emit_fk_child_insert_checks(
             program,
             &btree_table,
             insertion.first_col_register(),
             insertion.key_register(),
-            inserting_multiple_rows,
+            inserting_multiple_rows || has_before_triggers || has_after_triggers,
             resolver,
             namespace,
             &fk_layout,
@@ -1109,16 +1121,6 @@ pub fn translate_insert(
     }
 
     // Fire AFTER INSERT triggers
-    let relevant_after_triggers = get_triggers_including_temp(
-        resolver,
-        namespace,
-        TriggerEvent::Insert,
-        TriggerTime::After,
-        None,
-        &btree_table,
-        connection,
-    );
-    let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
         // Build raw NEW registers for AFTER triggers. Values are encoded at this point;
         // fire_trigger will decode them via decode_trigger_registers.
@@ -1168,14 +1170,12 @@ pub fn translate_insert(
     }
 
     if has_fks {
-        // After the row is actually present, repair deferred counters for children referencing this NEW parent key.
-        // For REPLACE: delete increments counters above; the insert path should try to repay
-        // them, even for immediate/self-ref FKs.
+        // After the row is actually present, repair the violations of child
+        // rows that reference this NEW parent key.
         emit_parent_side_fk_decrement_on_insert(
             program,
             &btree_table,
             &insertion,
-            on_replace,
             resolver,
             namespace,
         )?;
@@ -4166,12 +4166,17 @@ pub fn emit_fk_child_insert_checks(
     child_tbl: &BTreeTable,
     new_start_reg: usize,
     new_rowid_reg: usize,
-    inserting_multiple_rows: bool,
+    statement_may_repair_violations: bool,
     resolver: &Resolver,
     namespace: NamespaceRef,
     layout: &ColumnLayout,
 ) -> crate::Result<()> {
     let database_id = namespace.database_id;
+    // Like SQLite, a missing parent fails a single-row INSERT at once. A
+    // deferred FK, an INSERT that a later row or a trigger may repair, or a
+    // trigger or FK action that runs as part of a larger statement count the
+    // violation instead.
+    let count_violations = statement_may_repair_violations || program.flags.is_subprogram();
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_for_child(namespace.id, &child_tbl.name, None)
     })? {
@@ -4240,10 +4245,10 @@ pub fn emit_fk_child_insert_checks(
             program.emit_insn(Insn::Close { cursor_id: pcur });
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
 
-            // Missing parent: counted for a deferred FK or a multi-row insert, otherwise Halt before Insert
+            // Missing parent: counted or Halt before Insert
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            if fk_ref.fk.deferred || inserting_multiple_rows {
+            if fk_ref.fk.deferred || count_violations {
                 emit_fk_violation(program, &fk_ref.fk, None)?;
             } else {
                 let fk_col_regs: Vec<usize> = fk_ref
@@ -4356,9 +4361,9 @@ pub fn emit_fk_child_insert_checks(
                 ncols,
                 // on_found: parent exists, FK satisfied
                 |_p| Ok(()),
-                // on_not_found: counted for a deferred FK or a multi-row insert, otherwise Halt
+                // on_not_found: counted or Halt
                 |p| {
-                    if fk_ref.fk.deferred || inserting_multiple_rows {
+                    if fk_ref.fk.deferred || count_violations {
                         emit_fk_violation(p, &fk_ref.fk, None)?;
                     } else {
                         let fk_col_regs: Vec<usize> = fk_ref
@@ -4463,14 +4468,14 @@ fn build_parent_key_image_for_insert(
 
 /// Parent-side: when inserting into the parent, decrement the counter
 /// if any child rows reference the NEW parent key.
-/// We *always* do this for deferred FKs, and we *also* do it for
-/// self-referential FKs (even if immediate) because the insert can
-/// “repair” a prior child-insert count recorded earlier in the same statement.
+/// Like SQLite, this is done for every FK, also an immediate one: earlier in
+/// the same statement, a REPLACE delete, a trigger, or an earlier row of a
+/// self-referencing table may have counted a child row whose parent is this
+/// NEW key.
 pub fn emit_parent_side_fk_decrement_on_insert(
     program: &mut ProgramBuilder,
     parent_table: &BTreeTable,
     insertion: &Insertion,
-    force_immediate: bool,
     resolver: &Resolver,
     namespace: NamespaceRef,
 ) -> crate::Result<()> {
@@ -4479,10 +4484,6 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         s.resolved_fks_referencing(namespace.id, &parent_table.name)
     })? {
         let is_self_ref = pref.is_self_reference();
-        // Skip only when it cannot repair anything: non-deferred and not self-referencing
-        if !force_immediate && !pref.fk.deferred && !is_self_ref {
-            continue;
-        }
         // Nothing to do if the parent counter is 0
         let skip_fk = program.allocate_label();
         program.emit_insn(Insn::FkIfZero {

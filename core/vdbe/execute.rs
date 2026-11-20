@@ -3795,7 +3795,12 @@ pub fn halt(
 
     // Check for immediate foreign key violations.
     // Any immediate violation causes the statement subtransaction to roll back.
-    if connection.foreign_keys_enabled() && state.get_fk_immediate_violations_during_stmt() > 0 {
+    // A subprogram's violations are on the statement's counter, which the
+    // top-level program checks when the statement ends.
+    if connection.foreign_keys_enabled()
+        && !program.is_trigger_subprogram()
+        && state.get_fk_immediate_violations_during_stmt() > 0
+    {
         return Err(state.immediate_foreign_key_error().into());
     }
 
@@ -6086,6 +6091,12 @@ pub fn op_program(
                     statement.bind_at(param_index, value)?;
                 }
 
+                // Like a VdbeFrame in SQLite, the subprogram counts immediate
+                // foreign key violations on the statement's counter: a trigger
+                // that deletes the child rows of a deleted parent row cancels
+                // the violation that the parent delete counted.
+                state.copy_fk_immediate_violations_to(statement.state_mut());
+
                 *state.active_op_state.program() = OpProgramState::Step {
                     is_trigger,
                     statement,
@@ -6199,6 +6210,9 @@ pub fn op_program(
                     saved_last_insert_rowid,
                     saved_last_changes_value,
                 );
+                if !subprogram_aborted || raise_ignore {
+                    statement.state().copy_fk_immediate_violations_to(state);
+                }
 
                 // Cache the statement for reuse on subsequent fires of this
                 // same Program instruction (e.g. next row in an INSERT loop).

@@ -1515,6 +1515,14 @@ impl Statement {
         }
     }
 
+    pub(crate) fn state(&self) -> &vdbe::ProgramState {
+        &self.state
+    }
+
+    pub(crate) fn state_mut(&mut self) -> &mut vdbe::ProgramState {
+        &mut self.state
+    }
+
     /// Lightweight reset for reusing a cached subprogram statement.
     /// Skips transaction handling and abort(): the caller (op_program) has
     /// already handled trigger execution tracking. Only resets ProgramState

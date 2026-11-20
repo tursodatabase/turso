@@ -2042,6 +2042,18 @@ impl ProgramState {
         self.fk_immediate_violations_during_stmt
             .fetch_add(v, Ordering::AcqRel);
     }
+
+    /// Copies the immediate foreign key violations counted so far into
+    /// `target`, a state that runs as part of the same statement.
+    pub(crate) fn copy_fk_immediate_violations_to(&self, target: &mut ProgramState) {
+        target.fk_immediate_violations_during_stmt.store(
+            self.get_fk_immediate_violations_during_stmt(),
+            Ordering::Release,
+        );
+        target
+            .fk_immediate_violation
+            .clone_from(&self.fk_immediate_violation);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
