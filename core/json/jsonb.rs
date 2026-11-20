@@ -1107,7 +1107,8 @@ impl ObjectIteratorState {
 }
 
 pub type ArrayIteratorItem = (usize, ArrayIteratorState);
-pub type ObjectIteratorItem = (usize, ObjectIteratorState);
+/// The key element of a member, in the document, its index and the state after it.
+pub type ObjectIteratorItem<'a> = (&'a [u8], usize, ObjectIteratorState);
 
 impl Jsonb {
     pub fn empty() -> Self {
@@ -1237,16 +1238,7 @@ impl Jsonb {
     /// the string is then the payload in quotes, and its decoded text is the
     /// payload.
     pub fn plain_string_payload(&self) -> Option<&[u8]> {
-        let (JsonbHeader(element_type, len), header_size) = self.read_header(0).ok()?;
-        if !matches!(
-            element_type,
-            ElementType::TEXT | ElementType::TEXTJ | ElementType::TEXTRAW
-        ) {
-            return None;
-        }
-        let payload = self.data.get(header_size..header_size.checked_add(len)?)?;
-        // ESCAPED_IN_TEXT marks the control characters, `"` and `\`.
-        (!payload.iter().any(|&byte| ESCAPED_IN_TEXT[byte as usize])).then_some(payload)
+        plain_string_payload(&self.data)
     }
 
     pub fn to_string_pretty(&self, indentation: Option<&str>) -> Result<String> {
@@ -3711,16 +3703,15 @@ impl Jsonb {
         }
     }
 
-    /// Copies the key and the value of the next member of the object into
-    /// `key` and `value`, and returns its index and the state after it. As
-    /// in [Self::array_iterator_next], the copies use the buffers of `key`
-    /// and `value`.
+    /// Copies the value of the next member of the object into `value`, and
+    /// returns its key element, which stays in this document, its index and
+    /// the state after it. As in [Self::array_iterator_next], the copy uses
+    /// the buffer of `value`.
     pub fn object_iterator_next(
         &self,
         st: &ObjectIteratorState,
-        key: &mut Jsonb,
         value: &mut Jsonb,
-    ) -> std::result::Result<Option<ObjectIteratorItem>, TryReserveError> {
+    ) -> std::result::Result<Option<ObjectIteratorItem<'_>>, TryReserveError> {
         if st.cursor >= st.end {
             return Ok(None);
         }
@@ -3752,7 +3743,6 @@ impl Jsonb {
             return Ok(None);
         }
 
-        key.set_data(&self.data[key_start..key_stop])?;
         value.set_data(&self.data[val_start..val_stop])?;
         let next = ObjectIteratorState {
             cursor: val_stop,
@@ -3760,7 +3750,7 @@ impl Jsonb {
             index: st.index + 1,
         };
 
-        Ok(Some((st.index, next)))
+        Ok(Some((&self.data[key_start..key_stop], st.index, next)))
     }
 
     /// If the iterator points at a container value, return an iterator for that container.
@@ -3991,6 +3981,20 @@ fn is_json_float(text: &[u8]) -> bool {
         has_fraction_or_exponent = true;
     }
     has_fraction_or_exponent && rest.is_empty()
+}
+
+/// [Jsonb::plain_string_payload] for the element at the start of `element`.
+pub(crate) fn plain_string_payload(element: &[u8]) -> Option<&[u8]> {
+    let (JsonbHeader(element_type, len), header_size) = JsonbHeader::from_slice(0, element).ok()?;
+    if !matches!(
+        element_type,
+        ElementType::TEXT | ElementType::TEXTJ | ElementType::TEXTRAW
+    ) {
+        return None;
+    }
+    let payload = element.get(header_size..header_size.checked_add(len)?)?;
+    // ESCAPED_IN_TEXT marks the control characters, `"` and `\`.
+    (!payload.iter().any(|&byte| ESCAPED_IN_TEXT[byte as usize])).then_some(payload)
 }
 
 /// Returns `bytes` as text, like [String::from_utf8_lossy]. Valid UTF-8, the

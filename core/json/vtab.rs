@@ -215,9 +215,6 @@ pub struct JsonEachCursor {
     /// the current row, which the next call of `advance` removes. It stays
     /// until then, because the fullkey and path columns read the path.
     pop_path_before_advance: bool,
-    /// The key of the current object member. It is a field so that each
-    /// member uses the same buffer.
-    key_element: Jsonb,
     /// The text of the last root path and the path that it parses to. The
     /// calls of a statement usually have the same root path, which is then
     /// parsed once.
@@ -242,7 +239,6 @@ impl JsonEachCursor {
             columns: Columns::default(),
             traversal_mode,
             pop_path_before_advance: false,
-            key_element: Jsonb::empty(),
             root_path: None,
         }
     }
@@ -434,24 +430,23 @@ impl JsonEachCursor {
                 self.pop_path_before_advance = !recurses;
             }
             IteratorState::Object(state) => {
-                let Some((_idx, new_state)) = self.json.object_iterator_next(
-                    &state,
-                    &mut self.key_element,
-                    self.columns.value_mut(),
-                )?
+                let Some((key, _idx, new_state)) = self
+                    .json
+                    .object_iterator_next(&state, self.columns.value_mut())?
                 else {
                     self.path_to_current_value.pop();
                     return self.advance();
                 };
                 self.id = self.root_offset + state.position() as i64;
 
+                // The state of the object keeps the path before the key.
+                let container_cursor = self.path_to_current_value.cursor();
+                self.path_to_current_value.push_object_key(key)?;
                 self.push_state(
                     IteratorState::Object(new_state),
                     traversal_state.parent_id,
-                    self.path_to_current_value.cursor(),
+                    container_cursor,
                 );
-                self.path_to_current_value
-                    .push_object_key(&self.key_element)?;
                 let recursing = matches!(self.traversal_mode, JsonTraversalMode::Tree)
                     && self
                         .json
@@ -783,14 +778,16 @@ impl InPlaceJsonPath {
         self.element_lengths.push(self.string.len() - start);
     }
 
-    fn push_object_key(&mut self, key: &Jsonb) -> crate::Result<()> {
+    /// `key` is the key element of an object member.
+    fn push_object_key(&mut self, key: &[u8]) -> crate::Result<()> {
         // A key with no escape is its own name, so it needs no JSON text.
-        if let Some(payload) = key.plain_string_payload() {
+        if let Some(payload) = jsonb::plain_string_payload(key) {
             let name = jsonb::utf8_lossy(payload);
             self.set_last_element_name(&name);
             self.push_object_name(&name);
             return Ok(());
         }
+        let key = Jsonb::from_raw_data(key)?;
         let key_text = key.to_string()?;
         // Keys must be properly quoted strings
         let inner = key_text
