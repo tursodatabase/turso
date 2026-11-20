@@ -3695,8 +3695,9 @@ impl PostgreSQLTranslator {
                         | SqlValueFunctionOp::SvfopCurrentTimestampN
                         | SqlValueFunctionOp::SvfopLocaltimeN
                         | SqlValueFunctionOp::SvfopLocaltimestampN)
-                ) && svf.typmod != 0
-                {
+                ) {
+                    // pg_query gives the N variants only when a precision was
+                    // written. PostgreSQL rounds to it; tursopg cannot yet.
                     return Err(ParseError::not_supported(
                         "a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP",
                     ));
@@ -9532,9 +9533,7 @@ fn deparse_default_expr(node: &pg_query::protobuf::Node) -> Option<String> {
             match SqlValueFunctionOp::try_from(svf.op) {
                 Ok(
                     SqlValueFunctionOp::SvfopCurrentTimestamp
-                    | SqlValueFunctionOp::SvfopCurrentTimestampN
-                    | SqlValueFunctionOp::SvfopLocaltimestamp
-                    | SqlValueFunctionOp::SvfopLocaltimestampN,
+                    | SqlValueFunctionOp::SvfopLocaltimestamp,
                 ) => Some("strftime('%Y-%m-%d %H:%M:%f', 'now')".to_string()),
                 Ok(SqlValueFunctionOp::SvfopCurrentDate) => Some("CURRENT_DATE".to_string()),
                 Ok(

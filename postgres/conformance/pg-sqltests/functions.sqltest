@@ -2768,3 +2768,29 @@ test clock-timestamp-is-never-earlier-than-statement-timestamp {
 expect {
     0
 }
+
+# PostgreSQL rounds to the given precision. tursopg cannot yet, so it refuses
+# every explicit precision, including 0.
+test current-timestamp-with-precision-is-not-supported {
+    SELECT current_timestamp(0);
+}
+@sqlstate 0A000
+expect error {
+    a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP is not supported
+}
+
+test localtimestamp-with-precision-is-not-supported {
+    SELECT localtimestamp(0);
+}
+@sqlstate 0A000
+expect error {
+    a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP is not supported
+}
+
+test default-current-timestamp-with-precision-is-not-supported {
+    CREATE TABLE ts_precision (t timestamptz DEFAULT current_timestamp(0));
+}
+@sqlstate 0A000
+expect error {
+    a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP is not supported
+}
