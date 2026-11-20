@@ -504,14 +504,11 @@ expect @tursopg error {}
 
 # B-49: jsonb ->> compared to text
 @setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "operator:jsonb ->> text"
 test jsonb-compared-to-text {
     SELECT id FROM t WHERE j ->> 'n' = '2';
 }
 expect {
     2
-}
-expect @tursopg {
 }
 
 # B-50: (jsonb ->> )::int comparison
@@ -1305,7 +1302,9 @@ expect {
 expect @tursopg error {}
 
 # B-127: ->> of a JSON boolean is the text true
-@compat-gap "operator:jsonb ->> text"
+# After the fix of ->>, the output still differs because of B-04: a boolean
+# prints as 0 or 1.
+@compat-gap "type:bool"
 test of-a-json-boolean-is-the-text-true {
     SELECT '{"a": true}'::jsonb ->> 'a', '{"a": true}'::jsonb ->> 'a' <> 'true';
 }
@@ -1313,7 +1312,7 @@ expect {
     true|f
 }
 expect @tursopg {
-    1|1
+    true|0
 }
 
 # B-128: jsonb || concatenates two objects
