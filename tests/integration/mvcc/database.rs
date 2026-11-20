@@ -14090,3 +14090,110 @@ fn test_mvcc_portable_changes_resolve_user_table_after_cross_connection_checkpoi
         "DML-only portable frame should resolve user table after cross-connection checkpoint"
     );
 }
+
+/// Counts complete cursor seeks, including a re-seek caused by Next/Prev.
+#[derive(Debug, Default)]
+struct CursorSeekStarts(AtomicU64);
+
+impl YieldInjector for CursorSeekStarts {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        if point == CursorYieldPoint::SeekStart.point() {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        false
+    }
+}
+
+/// A complete non-NULL unique lookup needs only the index and table seeks.
+/// Stepping its index again scans unrelated tombstones in a replay transaction.
+#[test]
+fn test_unique_point_delete_does_not_seek_next() {
+    for operator in ["=", "IS"] {
+        for descending in [false, true] {
+            for composite in [false, true] {
+                assert_unique_point_delete_does_not_seek_next(operator, descending, composite);
+            }
+        }
+    }
+}
+
+fn assert_unique_point_delete_does_not_seek_next(
+    operator: &str,
+    descending: bool,
+    composite: bool,
+) {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let order = if descending { "DESC" } else { "ASC" };
+    let key = if composite {
+        format!("k COLLATE NOCASE {order}, part DESC")
+    } else {
+        format!("k COLLATE NOCASE {order}")
+    };
+    conn.execute(format!(
+        "CREATE TABLE t(k TEXT COLLATE NOCASE, part INTEGER, payload TEXT, PRIMARY KEY({key}))"
+    ))
+    .unwrap();
+    conn.execute(
+        "WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<200) \
+         INSERT INTO t SELECT 'R'||x,7,'payload' FROM seq",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t VALUES(NULL,7,'null one'),(NULL,7,'null two')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    let predicate = if composite {
+        format!("k {operator} ?1 AND part {operator} ?2")
+    } else {
+        format!("k {operator} ?1")
+    };
+    let mut stmt = conn
+        .prepare(format!("DELETE FROM t WHERE {predicate}"))
+        .unwrap();
+    let seeks = Arc::new(CursorSeekStarts::default());
+    conn.set_yield_injector(Some(seeks.clone()));
+    for row in (1..=9).rev() {
+        stmt.reset().unwrap();
+        stmt.bind_at(
+            std::num::NonZeroUsize::new(1).unwrap(),
+            Value::from_text(format!("r{row}")),
+        )
+        .unwrap();
+        if composite {
+            stmt.bind_at(std::num::NonZeroUsize::new(2).unwrap(), Value::from_i64(7))
+                .unwrap();
+        }
+        seeks.0.store(0, Ordering::Relaxed);
+        stmt.run_collect_rows().unwrap();
+        assert_eq!(stmt.n_change(), 1);
+        assert_eq!(
+            seeks.0.load(Ordering::Relaxed),
+            2,
+            "a unique point DELETE must not seek a following index row: {predicate}, descending={descending}, row={row}"
+        );
+    }
+    // Reusing the prepared statement with NULL must retain multi-row IS
+    // semantics, then recover the single-row behavior for a non-NULL key.
+    for (key, expected_changes) in [
+        (Value::Null, if operator == "IS" { 2 } else { 0 }),
+        (Value::from_text("r10"), 1),
+        (Value::from_text("missing"), 0),
+    ] {
+        stmt.reset().unwrap();
+        stmt.bind_at(std::num::NonZeroUsize::new(1).unwrap(), key)
+            .unwrap();
+        stmt.run_collect_rows().unwrap();
+        assert_eq!(stmt.n_change(), expected_changes);
+    }
+    conn.set_yield_injector(None);
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(if operator == "IS" {
+            190
+        } else {
+            192
+        })]]
+    );
+}
