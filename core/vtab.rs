@@ -318,6 +318,12 @@ impl VirtualTableCursor {
         self.null_flag
     }
 
+    /// Whether this is the cursor of an internal virtual table, whose filter
+    /// starts a new scan each time.
+    pub(crate) fn is_internal(&self) -> bool {
+        matches!(&self.inner, VirtualTableCursorInner::Internal(_))
+    }
+
     pub(crate) fn needs_close_at_done(&self) -> bool {
         matches!(&self.inner, VirtualTableCursorInner::External(cursor) if cursor.needs_close_at_done())
     }
@@ -740,6 +746,10 @@ pub trait InternalVirtualTableCursor: Send + Sync {
         *value = self.column(column)?;
         Ok(())
     }
+    /// Starts a new scan with `args`, and returns `Ok(true)` when the scan has
+    /// a first row. VOpen keeps an open cursor when it runs again, as in a
+    /// correlated subquery, so a filter must reset all state of the cursor
+    /// from an earlier scan, as SQLite's xFilter does.
     fn filter(
         &mut self,
         args: &[Value],

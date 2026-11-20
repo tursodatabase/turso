@@ -1459,12 +1459,18 @@ pub fn op_vopen(
     let CursorType::VirtualTable(virtual_table) = cursor_type else {
         panic!("VOpen on non-virtual table cursor");
     };
-    let cursor = virtual_table.open(connection.clone())?;
-    state
+    let slot = state
         .cursors
         .get_mut(*cursor_id)
-        .unwrap_or_else(|| panic!("cursor id {} out of bounds", *cursor_id))
-        .replace(Cursor::Virtual(cursor));
+        .unwrap_or_else(|| panic!("cursor id {} out of bounds", *cursor_id));
+    // A correlated subquery runs VOpen again for each outer row. The slot of a
+    // cursor id belongs to one virtual table in a program, and the VFilter
+    // after VOpen starts a new scan, so an internal cursor from an earlier run
+    // is kept with its buffers, as SQLite's OP_VOpen keeps an open cursor.
+    if !matches!(slot, Some(Cursor::Virtual(cursor)) if cursor.is_internal()) {
+        let cursor = virtual_table.open(connection.clone())?;
+        slot.replace(Cursor::Virtual(cursor));
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
