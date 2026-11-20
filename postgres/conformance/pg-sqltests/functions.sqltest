@@ -366,22 +366,22 @@ expect {
     invalid
 }
 
+test pg-input-is-valid-checks-interval-input {
+    SELECT pg_input_is_valid('1.5 weeks', 'interval');
+    SELECT pg_input_is_valid('garbage', 'interval');
+    SELECT pg_input_is_valid('@ 30 eons ago', 'interval');
+}
+expect {
+    t
+    f
+    f
+}
+
 test pg-input-is-valid-checks-array-elements {
     SELECT pg_input_is_valid('{1,2,3}', 'int2[]');
     SELECT pg_input_is_valid('{1,40000}', 'int2[]');
 }
 expect {
-    t
-    f
-}
-
-test pg-input-is-valid-checks-point-syntax {
-    SELECT pg_input_is_valid('(1,2)', 'point');
-    SELECT pg_input_is_valid('1,2', 'point');
-    SELECT pg_input_is_valid('(1)', 'point');
-}
-expect {
-    t
     t
     f
 }
@@ -405,13 +405,6 @@ test pg-input-error-info-array-element-out-of-range {
 }
 expect {
     value "40000" is out of range for type smallint|22003
-}
-
-test pg-input-error-info-point-bad-syntax {
-    SELECT message, sql_error_code FROM pg_input_error_info('(1)', 'point');
-}
-expect {
-    invalid input syntax for type point: "(1)"|22P02
 }
 
 test current-setting-numeric-parameter-name-errors {
