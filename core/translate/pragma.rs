@@ -1141,8 +1141,8 @@ fn query_pragma(
         }
         PragmaName::IndexInfo => {
             let index_name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
-                _ => None,
+                Some(value) => pragma_value_name(&value).map(|name| normalize_ident(&name)),
+                None => None,
             };
 
             let base_reg = register;
@@ -1180,8 +1180,8 @@ fn query_pragma(
         }
         PragmaName::IndexXinfo => {
             let index_name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
-                _ => None,
+                Some(value) => pragma_value_name(&value).map(|name| normalize_ident(&name)),
+                None => None,
             };
 
             let base_reg = register;
@@ -1258,8 +1258,8 @@ fn query_pragma(
         }
         PragmaName::IndexList => {
             let table_name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
-                _ => None,
+                Some(value) => pragma_value_name(&value).map(|name| normalize_ident(&name)),
+                None => None,
             };
 
             let base_reg = register;
@@ -1317,8 +1317,7 @@ fn query_pragma(
         }
         PragmaName::ForeignKeyCheck => {
             let table_name = match value {
-                Some(ast::Expr::Name(name)) => Some(name.as_str().to_string()),
-                Some(other) => Some(other.to_string()),
+                Some(value) => pragma_value_name(&value).or_else(|| Some(value.to_string())),
                 None => None,
             };
             let mut check_namespace = namespace;
@@ -1345,17 +1344,13 @@ fn query_pragma(
             Ok(TransactionMode::Read)
         }
         PragmaName::ForeignKeyList => {
-            let table_name = match value {
-                Some(ast::Expr::Name(name)) => Some(name),
-                _ => None,
-            };
+            let table_name = value.as_ref().and_then(pragma_value_name);
 
             let base_reg = register;
             // 8 columns: id, seq, table, from, to, on_update, on_delete, match
             program.alloc_registers(7);
 
-            if let Some(table_name) = table_name {
-                let table_name = table_name.as_str();
+            if let Some(table_name) = table_name.as_deref() {
                 let table_namespace = resolve_table_pragma_namespace(
                     resolver,
                     namespace,
@@ -1413,8 +1408,8 @@ fn query_pragma(
         }
         PragmaName::TableList => {
             let name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
-                _ => None,
+                Some(value) => pragma_value_name(&value).map(|name| normalize_ident(&name)),
+                None => None,
             };
 
             let base_reg = register;
@@ -1453,8 +1448,8 @@ fn query_pragma(
         }
         PragmaName::TableInfo => {
             let name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
-                _ => None,
+                Some(value) => pragma_value_name(&value).map(|name| normalize_ident(&name)),
+                None => None,
             };
 
             let base_reg = register;
@@ -1518,8 +1513,8 @@ fn query_pragma(
         }
         PragmaName::TableXinfo => {
             let name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
-                _ => None,
+                Some(value) => pragma_value_name(&value).map(|name| normalize_ident(&name)),
+                None => None,
             };
 
             let base_reg = register;
@@ -2104,6 +2099,27 @@ fn emit_columns_for_table_info(
         }
 
         program.emit_result_row(base_reg, 6 + if extended { 1 } else { 0 });
+    }
+}
+
+/// Reads the table or index name argument of a PRAGMA such as `table_info`
+/// or `foreign_key_list`. As in SQLite's `sqlite3Pragma`, a number names the
+/// object whose name is its text: `-1` names the table `"-1"` and `+2` names
+/// the table `"2"`, since the grammar keeps the minus sign but not the plus.
+fn pragma_value_name(value: &ast::Expr) -> Option<String> {
+    match value {
+        Expr::Name(name) => Some(name.as_str().to_string()),
+        Expr::Literal(Literal::Numeric(digits)) => Some(digits.clone()),
+        Expr::Unary(op, inner) => match (op, inner.as_ref()) {
+            (ast::UnaryOperator::Negative, Expr::Literal(Literal::Numeric(digits))) => {
+                Some(format!("-{digits}"))
+            }
+            (ast::UnaryOperator::Positive, Expr::Literal(Literal::Numeric(digits))) => {
+                Some(digits.clone())
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 

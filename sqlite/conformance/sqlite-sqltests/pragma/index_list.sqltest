@@ -186,3 +186,19 @@ expect {
     0|sqlite_autoindex_w_2|1|u|0
     1|sqlite_autoindex_w_1|1|pk|0
 }
+
+# A numeric argument names the table or index whose name is the number's text.
+@cross-check-integrity
+test pragma-index-pragmas-numeric-names {
+    CREATE TABLE "-1"(a, b);
+    CREATE INDEX "-7" ON "-1"(b);
+    PRAGMA index_list(-1);
+    PRAGMA index_info(-7);
+    PRAGMA index_xinfo(-7);
+}
+expect {
+    0|-7|0|c|0
+    0|1|b
+    0|1|b|0|BINARY|1
+    1|-1||0|BINARY|0
+}
