@@ -109,78 +109,8 @@ fn translate_compared_value(
             reg,
             resolver,
         ),
-        None => {
-            translate_expr(program, referenced_tables, operand, reg, resolver)?;
-            convert_timestamp_to_timestamptz(
-                program,
-                referenced_tables,
-                operand,
-                other,
-                reg,
-                resolver,
-            )?;
-            Ok(reg)
-        }
+        None => translate_expr(program, referenced_tables, operand, reg, resolver),
     }
-}
-
-/// Converts the timestamp in `reg`, the value of `operand`, to a timestamptz
-/// when `other` is a timestamptz. See [convert_timestamp_for_comparison].
-fn convert_timestamp_to_timestamptz(
-    program: &mut ProgramBuilder,
-    referenced_tables: Option<&TableReferences>,
-    operand: &ast::Expr,
-    other: &ast::Expr,
-    reg: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    if resolver.schema().type_registry.is_empty() {
-        return Ok(());
-    }
-    let env = TypeEnv::new(referenced_tables, resolver);
-    convert_timestamp_for_comparison(
-        program,
-        &type_of(operand, &env),
-        &type_of(other, &env),
-        reg,
-        resolver,
-    )
-}
-
-/// Converts the timestamp in `reg` to a timestamptz when it is compared with
-/// a timestamptz. PostgreSQL compares a timestamp with a timestamptz after
-/// converting the timestamp to a timestamptz in the session time zone, which
-/// is UTC in tursopg. Without this, the two decoded texts differ by the `+00`
-/// suffix, so equal instants compare as different.
-pub(crate) fn convert_timestamp_for_comparison(
-    program: &mut ProgramBuilder,
-    operand_type: &ExprType,
-    other_type: &ExprType,
-    reg: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    let schema = resolver.schema();
-    let is_type = |ty: &ExprType, name: &str| match ty {
-        ExprType::Custom { type_def, .. } => schema
-            .resolve_type_unchecked(&type_def.name)
-            .ok()
-            .flatten()
-            .is_some_and(|resolved| {
-                resolved
-                    .chain
-                    .iter()
-                    .any(|type_def| type_def.name.eq_ignore_ascii_case(name))
-            }),
-        _ => false,
-    };
-    if !is_type(operand_type, "timestamp") || !is_type(other_type, "timestamptz") {
-        return Ok(());
-    }
-    let timestamptz = schema
-        .resolve_type_unchecked("timestamptz")?
-        .ok_or_else(|| LimboError::InternalError("type timestamptz does not resolve".into()))?;
-    emit_store_value(program, &timestamptz, reg, Coerce::Skip, resolver)?;
-    emit_decode(program, &timestamptz, reg, resolver)
 }
 
 /// Translates the two operands of a comparison into `lhs_reg` and `rhs_reg`.

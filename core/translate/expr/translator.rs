@@ -411,22 +411,6 @@ fn translate_subquery_result_expr(
                     None => {
                         let reg = lhs_column_regs_start + i;
                         translate_expr(program, referenced_tables, lhs_column, reg, resolver)?;
-                        if !resolver.schema().type_registry.is_empty() {
-                            let result_type = resolver
-                                .in_subquery_column_types
-                                .get(*subquery_id)
-                                .and_then(|types| types.get(i).cloned());
-                            if let Some(result_type) = result_type {
-                                let env = TypeEnv::new(referenced_tables, resolver);
-                                convert_timestamp_for_comparison(
-                                    program,
-                                    &type_of(lhs_column, &env),
-                                    &result_type,
-                                    reg,
-                                    resolver,
-                                )?;
-                            }
-                        }
                     }
                 }
             }
