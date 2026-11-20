@@ -582,6 +582,18 @@ fn derive_initial_crc(salt: u64) -> u32 {
     crc32c::crc32c(&salt.to_le_bytes())
 }
 
+/// A file operation that changes the log header, issued but not yet published
+/// to the in-memory log state.
+struct PendingHeaderChange {
+    /// Becomes `LogicalLog::header` once `completion` succeeded.
+    header: LogHeader,
+    /// The header write, or the truncate that empties the file.
+    completion: Completion,
+    /// `completion` truncates the file to zero bytes, so once it succeeded the
+    /// log holds no frames.
+    empties_log: bool,
+}
+
 #[cfg_attr(feature = "aristo-instr", derive(aristo::instrument::Inspect))]
 pub struct LogicalLog {
     pub file: Arc<dyn File>,
@@ -598,10 +610,9 @@ pub struct LogicalLog {
     /// doesn't corrupt the chain.
     #[cfg_attr(feature = "aristo-instr", inspect(name = "pending_running_crc"))]
     pending_running_crc: Option<u32>,
-    /// A header write whose result has not been looked at yet. Its header
-    /// becomes `header` once the write succeeded; see
-    /// `publish_finished_header_write`.
-    pending_header_write: Option<(LogHeader, Completion)>,
+    /// A header write or truncate whose result has not been looked at yet; see
+    /// `publish_finished_header_change`.
+    pending_header_change: Option<PendingHeaderChange>,
     encryption_ctx: Option<EncryptionContext>,
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
@@ -634,7 +645,7 @@ impl LogicalLog {
             header: None,
             running_crc: 0,
             pending_running_crc: None,
-            pending_header_write: None,
+            pending_header_change: None,
             encryption_ctx,
             encrypted_payload_chunk_size,
             max_appended_commit_ts: 0,
@@ -660,7 +671,7 @@ impl LogicalLog {
     }
 
     pub(crate) fn set_header(&mut self, header: LogHeader) {
-        self.finish_pending_header_write();
+        self.finish_pending_header_change();
         self.running_crc = derive_initial_crc(header.salt);
         self.header = Some(header);
     }
@@ -686,7 +697,7 @@ impl LogicalLog {
         advance_offset_immediately: bool,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
-        self.finish_pending_header_write();
+        self.finish_pending_header_change();
         let op_count = tx.op_count;
         let commit_ts = tx.tx_timestamp;
         self.max_appended_commit_ts = self.max_appended_commit_ts.max(commit_ts);
@@ -917,13 +928,16 @@ impl LogicalLog {
             false
         };
 
-        if !portable_changes_enabled || self.offset == 0 {
-            return Ok(None);
+        // A frame must not be written while a header write or truncate is in
+        // flight: its offset and CRC chain depend on whether that operation
+        // succeeds, and a truncate could cut it.
+        self.publish_finished_header_change();
+        if let Some(pending) = &self.pending_header_change {
+            return Ok(Some(pending.completion.clone()));
         }
 
-        self.publish_finished_header_write();
-        if let Some((_, c)) = &self.pending_header_write {
-            return Ok(Some(c.clone()));
+        if !portable_changes_enabled || self.offset == 0 {
+            return Ok(None);
         }
 
         let header = self.header.as_ref().ok_or_else(|| {
@@ -1009,8 +1023,12 @@ impl LogicalLog {
         group: Option<&mut CompletionGroup>,
     ) -> Result<Completion> {
         let (header, c) = self.write_header(header, group)?;
-        self.pending_header_write = Some((header, c.clone()));
-        self.publish_finished_header_write();
+        self.pending_header_change = Some(PendingHeaderChange {
+            header,
+            completion: c.clone(),
+            empties_log: false,
+        });
+        self.publish_finished_header_change();
         Ok(c)
     }
 
@@ -1049,31 +1067,35 @@ impl LogicalLog {
     }
 
     pub fn update_header(&mut self) -> Result<Completion> {
-        self.finish_pending_header_write();
+        self.finish_pending_header_change();
         let header = self.current_or_new_header()?;
         self.write_header_and_publish_on_success(header, None)
     }
 
     #[aristo::intent("the running CRC of the log is reseeded only after the truncate operation has completed durably", id = "aristos:logical_log_truncate_crc_reseed_after_completion", verify = "full")]
     fn truncate_to_zero(&mut self) -> Result<Completion> {
+        // The truncate supersedes a header write still in flight.
+        self.pending_header_change = None;
+        let mut header = self.current_or_new_header()?;
         // Regenerate salt so stale frames (from before truncation) cannot validate
         // against the new CRC chain.
-        self.publish_finished_header_write();
-        self.pending_header_write = None;
-        let mut header = self.current_or_new_header()?;
         header.salt = self.io.generate_random_number() as u64;
-        self.running_crc = derive_initial_crc(header.salt);
-        self.pending_running_crc = None;
-        self.header = Some(header);
 
         let completion = Completion::new_trunc(move |result| {
             if let Err(err) = result {
                 tracing::error!("logical_log_truncate failed: {}", err);
             }
         });
+        // The log keeps its offset, CRC chain and header until the truncate
+        // succeeded: if it fails, the file still holds the old frames and the
+        // next frame must be chained after them.
         let c = self.file.truncate(0, completion)?;
-        self.offset = 0;
-        self.max_appended_commit_ts = 0;
+        self.pending_header_change = Some(PendingHeaderChange {
+            header,
+            completion: c.clone(),
+            empties_log: true,
+        });
+        self.publish_finished_header_change();
         Ok(c)
     }
 
@@ -1085,6 +1107,7 @@ impl LogicalLog {
         checkpointed_through_ts: u64,
     ) -> Result<(Completion, super::LogicalLogTruncateOutcome)> {
         use super::LogicalLogTruncateOutcome;
+        self.publish_finished_header_change();
         if self.max_appended_commit_ts > checkpointed_through_ts {
             // Uncheckpointed frames remain — skip truncation.
             let c = Completion::new_trunc(|_| {});
@@ -1105,7 +1128,7 @@ impl LogicalLog {
     pub fn reset_to_fresh_header(&mut self) -> Result<Completion> {
         // Regenerate salt so stale frames from before the reset cannot validate
         // against this new CRC chain.
-        self.finish_pending_header_write();
+        self.finish_pending_header_change();
         let mut header = self.current_or_new_header()?;
         // The log is empty after the reset, so the CRC chain restarts from the
         // header salt: the current salt until the new header is written, the
@@ -1127,32 +1150,43 @@ impl LogicalLog {
         Ok(group.build())
     }
 
-    /// Publishes a finished header write and checks that none is still in
-    /// flight. Used before the header is read or rewritten by a path that
-    /// never runs while a header write is in progress.
-    fn finish_pending_header_write(&mut self) {
-        self.publish_finished_header_write();
+    /// Publishes a finished header write or truncate and checks that none is
+    /// still in flight. Used before the header is read or rewritten by a path
+    /// that never runs while a header write or truncate is in progress.
+    fn finish_pending_header_change(&mut self) {
+        self.publish_finished_header_change();
         turso_assert!(
-            self.pending_header_write.is_none(),
-            "logical log header was used while a header write was in flight"
+            self.pending_header_change.is_none(),
+            "logical log header was used while a header write or truncate was in flight"
         );
     }
 
-    /// Makes the header of a finished, successful header write the in-memory
-    /// header. A failed write leaves the in-memory header as it was, so no
-    /// later frame is chained against a header the file never received. A
-    /// write still in flight stays pending.
+    /// Makes the header of a finished, successful header write or truncate the
+    /// in-memory header; a successful truncate also empties the log. A failed
+    /// operation leaves the log state as it was, so no later frame is chained
+    /// against a header or offset the file does not have. An operation still
+    /// in flight stays pending.
     #[aristo::intent("the in-memory log header is published only after the on-disk header pwrite has completed durably", id = "aristos:logical_log_header_publish_after_fsync", verify = "full")]
-    fn publish_finished_header_write(&mut self) {
-        let Some((header, c)) = self.pending_header_write.take() else {
+    pub fn publish_finished_header_change(&mut self) {
+        let Some(pending) = self.pending_header_change.take() else {
             return;
         };
-        if !c.finished() {
-            self.pending_header_write = Some((header, c));
+        if !pending.completion.finished() {
+            self.pending_header_change = Some(pending);
             return;
         }
-        if !c.succeeded() {
+        if !pending.completion.succeeded() {
             return;
+        }
+        let PendingHeaderChange {
+            header,
+            empties_log,
+            ..
+        } = pending;
+        if empties_log {
+            self.offset = 0;
+            self.pending_running_crc = None;
+            self.max_appended_commit_ts = 0;
         }
         if self.offset == 0 {
             // No frame is chained yet, so the CRC chain starts from this
@@ -4184,6 +4218,77 @@ mod tests {
         }
     }
 
+    /// Holds each truncate until the test finishes it with `finish_truncate`,
+    /// or fails it as soon as it is issued while `fail_on_issue` is set.
+    struct HeldTruncateFile {
+        inner: Arc<dyn crate::File>,
+        held: std::sync::Mutex<Option<(u64, Completion)>>,
+        fail_on_issue: std::sync::atomic::AtomicBool,
+    }
+
+    impl HeldTruncateFile {
+        fn new(inner: Arc<dyn crate::File>) -> Self {
+            Self {
+                inner,
+                held: std::sync::Mutex::new(None),
+                fail_on_issue: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn finish_truncate(&self, succeed: bool) {
+            let (len, c) = self.held.lock().unwrap().take().unwrap();
+            if succeed {
+                let inner_c = self.inner.truncate(len, Completion::new_trunc(|_| {}));
+                assert!(inner_c.unwrap().succeeded());
+                c.complete(0);
+            } else {
+                c.error(crate::CompletionError::IOError(
+                    std::io::ErrorKind::Other,
+                    "injected truncate failure",
+                ));
+            }
+        }
+    }
+
+    impl crate::File for HeldTruncateFile {
+        fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> crate::Result<()> {
+            self.inner.unlock_file()
+        }
+        fn pread(&self, pos: u64, c: Completion) -> crate::Result<Completion> {
+            self.inner.pread(pos, c)
+        }
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<Buffer>,
+            c: Completion,
+        ) -> crate::Result<Completion> {
+            self.inner.pwrite(pos, buffer, c)
+        }
+        fn sync(
+            &self,
+            c: Completion,
+            sync_type: crate::io::FileSyncType,
+        ) -> crate::Result<Completion> {
+            self.inner.sync(c, sync_type)
+        }
+        fn size(&self) -> crate::Result<u64> {
+            self.inner.size()
+        }
+        fn truncate(&self, len: u64, c: Completion) -> crate::Result<Completion> {
+            if self.fail_on_issue.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::LimboError::InternalError(
+                    "injected truncate failure".to_string(),
+                ));
+            }
+            *self.held.lock().unwrap() = Some((len, c.clone()));
+            Ok(c)
+        }
+    }
+
     /// Read an entire (synchronous) file into a `Vec`.
     fn read_file_to_vec(file: &Arc<dyn crate::File>) -> Vec<u8> {
         let size = file.size().unwrap() as usize;
@@ -7169,6 +7274,149 @@ mod tests {
             LogHeader::decode(&bytes[..LOG_HDR_SIZE]).unwrap().salt,
             after.salt
         );
+    }
+
+    fn commit_timestamps(file: Arc<dyn crate::File>, io: &Arc<dyn crate::IO>) -> Vec<u64> {
+        read_table_ops(file, io)
+            .into_iter()
+            .map(|op| match op {
+                ExpectedTableOp::Upsert { commit_ts, .. }
+                | ExpectedTableOp::Delete { commit_ts, .. } => commit_ts,
+            })
+            .collect()
+    }
+
+    /// What this test checks: a checkpoint truncate leaves the log offset, the
+    /// shadow offset, the running CRC and the header as they were until the
+    /// truncate succeeded, and a commit waits for it before writing its frame.
+    #[test]
+    fn test_truncate_keeps_log_state_until_truncate_succeeds() {
+        use crate::mvcc::persistent_storage::{DurableStorage, LogicalLogTruncateOutcome, Storage};
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let inner = io
+            .open_file("held-truncate.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let file = Arc::new(HeldTruncateFile::new(inner.clone()));
+        let storage = Storage::new(file.clone(), io.clone(), None);
+        let commit = |commit_ts: u64| {
+            let tx = crate::mvcc::database::LogRecord::for_test(
+                commit_ts,
+                &[table_row_version(
+                    (-2).into(),
+                    commit_ts as i64,
+                    commit_ts,
+                    "row",
+                )],
+                None,
+            );
+            assert!(storage.upgrade_header_for_log_tx(&tx).unwrap().is_none());
+            let (c, bytes) = storage.log_tx(tx, None).unwrap();
+            io.wait_for_completion(c).unwrap();
+            storage
+                .advance_logical_log_offset_after_success(bytes)
+                .unwrap();
+        };
+        let log_state = || {
+            let log = storage.logical_log.read();
+            (log.offset, log.running_crc, log.header().unwrap().salt)
+        };
+
+        commit(10);
+        let before = log_state();
+
+        let (truncate_c, outcome) = storage.truncate(u64::MAX).unwrap();
+        assert_eq!(outcome, LogicalLogTruncateOutcome::Truncated);
+        assert!(!truncate_c.finished());
+        assert_eq!(log_state(), before);
+        assert_eq!(storage.logical_log_offset(), before.0);
+        let next_tx = crate::mvcc::database::LogRecord::for_test(
+            20,
+            &[table_row_version((-2).into(), 20, 20, "row")],
+            None,
+        );
+        let wait_c = storage.upgrade_header_for_log_tx(&next_tx).unwrap();
+        assert!(
+            wait_c.is_some_and(|c| !c.finished()),
+            "a commit must wait for a truncate in flight"
+        );
+
+        file.finish_truncate(true);
+        commit(20);
+        let (offset, running_crc, salt) = log_state();
+        assert_ne!(salt, before.2, "salt must change on truncation");
+        assert_eq!(storage.logical_log_offset(), offset);
+        assert_eq!(offset, inner.size().unwrap());
+        assert_ne!(running_crc, before.1);
+        assert_eq!(commit_timestamps(inner, &io), vec![20]);
+    }
+
+    /// What this test checks: a truncate whose completion fails leaves the log
+    /// state as it was, so the next frame is chained after the frames the file
+    /// still holds and recovery reads all of them.
+    #[test]
+    fn test_failed_truncate_keeps_log_state_and_frames() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let inner = io
+            .open_file("failed-truncate.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let file = Arc::new(HeldTruncateFile::new(inner.clone()));
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 10, false, false, "a");
+        let before = (log.offset, log.running_crc, log.header().unwrap().salt);
+
+        let (c, _) = log.truncate(u64::MAX).unwrap();
+        file.finish_truncate(false);
+        assert!(io.wait_for_completion(c).is_err());
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 20, false, false, "b");
+
+        assert_eq!(log.header().unwrap().salt, before.2);
+        assert!(log.offset > before.0);
+        assert_eq!(log.offset, inner.size().unwrap());
+        assert_eq!(commit_timestamps(inner.clone(), &io), vec![10, 20]);
+        // The frames are still checkpointed through 20, so the next truncate
+        // goes ahead.
+        let (c, outcome) = log.truncate(20).unwrap();
+        assert_eq!(
+            outcome,
+            crate::mvcc::persistent_storage::LogicalLogTruncateOutcome::Truncated
+        );
+        file.finish_truncate(true);
+        io.wait_for_completion(c).unwrap();
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 3, 30, false, false, "c");
+        assert_eq!(log.offset, inner.size().unwrap());
+        assert_eq!(commit_timestamps(inner, &io), vec![30]);
+    }
+
+    /// What this test checks: a truncate that the file rejects when it is
+    /// issued leaves the log state as it was, so the next frame is chained
+    /// after the frames the file still holds and recovery reads all of them.
+    #[test]
+    fn test_rejected_truncate_keeps_log_state_and_frames() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let inner = io
+            .open_file("rejected-truncate.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let file = Arc::new(HeldTruncateFile::new(inner.clone()));
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 10, false, false, "a");
+        let before = (log.offset, log.running_crc, log.header().unwrap().salt);
+
+        file.fail_on_issue
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(log.truncate(u64::MAX).is_err());
+        assert_eq!(
+            (log.offset, log.running_crc, log.header().unwrap().salt),
+            before
+        );
+
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 20, false, false, "b");
+        assert_eq!(log.offset, inner.size().unwrap());
+        assert_eq!(commit_timestamps(inner, &io), vec![10, 20]);
     }
 
     #[cfg(feature = "conn_raw_api")]

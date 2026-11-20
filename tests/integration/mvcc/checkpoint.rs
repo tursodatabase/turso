@@ -5954,3 +5954,41 @@ unsafe impl turso_core::alloc::ApiAllocator for OneShotFaultAlloc {
         }
     }
 }
+
+/// A checkpoint whose logical-log truncate completes on a later I/O step must
+/// still leave the log offset at 0, so that VACUUM and the connection statistics see
+/// the empty log.
+#[test]
+fn checkpoint_with_queued_log_truncate_resets_log_offset() {
+    use crate::queued_io::QueuedIo;
+
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open_file_with_flags(
+        io,
+        "queued-truncate.db",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_vacuum(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let mv_store = conn.mv_store().as_ref().unwrap().clone();
+    assert!(mv_store.logical_log_offset() > 0);
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(mv_store.logical_log_offset(), 0);
+    conn.execute("VACUUM").unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT id, v FROM t"),
+        vec![vec![Value::from_i64(1), Value::build_text("a")]]
+    );
+}
