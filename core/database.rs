@@ -4152,8 +4152,9 @@ mod database_tests {
     use crate::storage::encryption::EncryptionKey;
     use crate::storage::page_transform::{PageCodec, PageCodecContext, PageCodecId};
     use crate::{
-        storage::database::DatabaseFile, DatabaseStorage, IOResult, OpenDbAsyncState, OpenFlags,
-        OpenOptions, PlatformIO, IO,
+        storage::database::DatabaseFile, ConnectOpts, DatabaseOpts, DatabaseStorage,
+        EncryptionOpts, IOResult, OpenDbAsyncState, OpenFlags, OpenOptions, PlatformIO,
+        SessionRole, IO,
     };
 
     #[test]
@@ -4164,6 +4165,159 @@ mod database_tests {
         assert!(is_memory_like(""));
         assert!(!is_memory_like("memory.db"));
         assert!(!is_memory_like("file:memory.db"));
+    }
+
+    #[test]
+    fn new_connection_requires_completed_pager_authentication() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let db = Database::open(
+            io.clone(),
+            ":memory:publication-key",
+            OpenOptions::new(Arc::new(DialectThatCannotParse))
+                .db_opts(DatabaseOpts::new().with_encryption(true))
+                .encryption(EncryptionOpts {
+                    cipher: "aegis256".into(),
+                    hexkey: "01".repeat(32),
+                }),
+        )
+        .unwrap();
+        for (byte, accepted) in [(None, false), (Some(1), true), (Some(2), false)] {
+            let key = byte.map(|byte| EncryptionKey::new_256([byte; 32]));
+            let pager = crate::Pager::new(
+                db.db_file.clone(),
+                None,
+                io.clone(),
+                crate::storage::page_cache::PageCache::default(),
+                db.buffer_pool.clone(),
+                db.pager_state.clone(),
+            )
+            .unwrap();
+            assert!(!pager.is_authenticated());
+            assert!(db
+                .new_connection(
+                    crate::security::roles::RoleId::SUPERUSER,
+                    false,
+                    Arc::new(pager),
+                    key.clone(),
+                    0,
+                    super::ConnectionContext::default()
+                )
+                .is_err());
+
+            let pager = db._init(key.as_ref(), None);
+            assert_eq!(pager.is_ok(), accepted);
+            if let Ok(pager) = pager {
+                assert!(pager.is_authenticated());
+                assert!(db
+                    .new_connection(
+                        crate::security::roles::RoleId::SUPERUSER,
+                        false,
+                        Arc::new(pager),
+                        key,
+                        0,
+                        super::ConnectionContext::default()
+                    )
+                    .is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn authenticated_header_is_bound_to_its_database() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let options = |byte| {
+            OpenOptions::new(Arc::new(DialectThatCannotParse))
+                .db_opts(DatabaseOpts::new().with_encryption(true))
+                .encryption(crate::EncryptionOpts {
+                    cipher: "aegis256".into(),
+                    hexkey: format!("{byte:02x}").repeat(32),
+                })
+        };
+        let source = Database::open(io.clone(), ":memory:header-source", options(1)).unwrap();
+        for target_options in [
+            OpenOptions::new(Arc::new(DialectThatCannotParse)),
+            options(2),
+        ] {
+            let target =
+                Database::open(io.clone(), ":memory:header-target", target_options).unwrap();
+            let mut state = super::HeaderAuthenticationState::default();
+            let header = crate::util::IOExt::block(io.as_ref(), || {
+                source.read_authenticated_header(
+                    &mut state,
+                    Some(&EncryptionKey::new_256([1; 32])),
+                    None,
+                )
+            })
+            .unwrap();
+            let original_size = target.pager_state.page_size();
+            let original_cipher = target.encryption_cipher();
+            let error = target.init_pager(header).err().unwrap();
+            assert!(error.to_string().contains("belongs to another database"));
+            assert_eq!(target.pager_state.page_size(), original_size);
+            assert_eq!(target.encryption_cipher(), original_cipher);
+        }
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn cold_encrypted_init_authenticates_before_configuring_shared_buffers() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let path = ":memory:authenticated-cold-header";
+        let size = crate::storage::sqlite3_ondisk::PageSize::new(8192).unwrap();
+        let opts = DatabaseOpts::new().with_encryption(true);
+        let encryption = crate::EncryptionOpts {
+            cipher: "aegis256".into(),
+            hexkey: "01".repeat(32),
+        };
+        let warm = Database::open(
+            io.clone(),
+            path,
+            OpenOptions::new(Arc::new(DialectThatCannotParse))
+                .db_opts(opts)
+                .encryption(encryption.clone())
+                .page_size(size),
+        )
+        .unwrap();
+        let owner = warm
+            .connect(
+                ConnectOpts::new(SessionRole::Superuser)
+                    .with_encryption_key(Some(EncryptionKey::new_256([1; 32]))),
+            )
+            .unwrap();
+        let pager = owner.get_pager();
+        crate::util::IOExt::block(io.as_ref(), || pager.maybe_allocate_page1()).unwrap();
+        let file = Arc::new(DatabaseFile::new(
+            io.open_file(path, OpenFlags::Create, false).unwrap(),
+        ));
+        let cold = Database::new(
+            opts,
+            OpenFlags::Create,
+            path,
+            format!("{path}-wal"),
+            &io,
+            file,
+            Some(encryption),
+            size,
+            super::DatabaseAllocators::default(),
+            None,
+            Arc::new(DialectThatCannotParse),
+            &crate::native_ext::NativeExtensions::default(),
+        )
+        .unwrap();
+        assert_eq!(cold.pager_state.page_size(), None);
+        assert_eq!(cold.buffer_pool.get_page().len(), 4096);
+        assert!(cold
+            ._init(Some(&EncryptionKey::new_256([2; 32])), None)
+            .is_err());
+        assert_eq!(cold.pager_state.page_size(), None);
+        assert_eq!(cold.buffer_pool.get_page().len(), 4096);
+        let pager = cold
+            ._init(Some(&EncryptionKey::new_256([1; 32])), None)
+            .unwrap();
+        assert!(pager.is_authenticated());
+        assert!(Arc::ptr_eq(&pager.buffer_pool, &cold.buffer_pool));
+        assert_eq!(cold.pager_state.page_size(), Some(size));
+        assert_eq!(cold.buffer_pool.get_page().len(), 8192);
     }
 
     #[cfg(feature = "fs")]
