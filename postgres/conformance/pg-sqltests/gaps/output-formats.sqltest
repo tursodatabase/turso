@@ -160,7 +160,7 @@ expect {
 expect @tursopg error {}
 
 # C-12: date '2026-10-08': raw value, inside json_build_object
-@compat-gap "type:date"
+@compat-gap "function:json_build_object"
 test date-raw-and-in-json-build-object {
     CREATE TABLE t (v date);
     INSERT INTO t VALUES ('2026-10-08');
@@ -169,8 +169,10 @@ test date-raw-and-in-json-build-object {
 expect {
     2026-10-08|{"v" : "2026-10-08"}
 }
-@sqlstate 0A000
-expect @tursopg error {}
+@sqlstate 42883
+expect @tursopg error {
+    no such function: json_build_object
+}
 
 # C-13: time '12:34:56.789': raw value, inside json_build_object
 @compat-gap "type:time"

@@ -170,18 +170,19 @@ Type mapping: serial/smallserial/bigserial (and serial2/4/8) become
 `INTEGER NOT NULL DEFAULT nextval(...)` with an implicit sequence named
 `<table>_<column>_seq`, or, when a relation of the schema has that name,
 the first of `<table>_<column>_seq1`, `..._seq2`, ... that none has. boolean,
-smallint, bigint, uuid, timestamp[tz], bytea, json, jsonb, inet,
+smallint, bigint, uuid, date, timestamp[tz], bytea, json, jsonb, inet,
 cidr, macaddr, macaddr8 map to Turso custom types. varchar(n) and
 numeric(p,s) keep their type modifiers; type modifiers on any other type,
 including char(n), timestamp(p) and bit(n), are rejected. xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
 
-date, time, timetz and interval, and arrays of every date and time type
-(`timestamp[]` and `timestamptz[]` included), are rejected as not supported
-(0A000) in column types, casts, typed literals and domains. So are
+time, timetz and interval, and arrays of every date and time type
+(`date[]`, `timestamp[]` and `timestamptz[]` included), are rejected as not
+supported (0A000) in column types, casts, typed literals and domains. So are
 `CURRENT_DATE`, `CURRENT_TIME`, `LOCALTIME` and the built-in functions that
-return date, time, timetz or interval, such as `age` and `make_date`.
+return date, time, timetz or interval, such as `age`, `make_date`, `to_date`
+and `date()`.
 
 `now()`, `transaction_timestamp()` and `CURRENT_TIMESTAMP` are the time the
 transaction started, and `LOCALTIMESTAMP` is that time as a timestamp in UTC;
@@ -193,11 +194,12 @@ precision.
 A timestamptz prints in UTC with the offset `+00`, such as
 `2024-01-05 08:00:00+00`.
 
-A timestamp compared with a timestamptz is read as a timestamptz, as in
-PostgreSQL, with the session time zone UTC. Comparing a timestamp or
-timestamptz with a value of another custom type, such as `timestamptz` with
-`json`, fails with `cannot compare type x with type y` (42601, where
-PostgreSQL gives 42883).
+A date compared with a timestamp or timestamptz is read as midnight of that
+day in the other type, and a timestamp compared with a timestamptz is read as
+a timestamptz, as in PostgreSQL, with the session time zone UTC. Comparing a
+date, timestamp or timestamptz with a value of another custom type, such as
+`timestamptz` with `json`, fails with `cannot compare type x with type y`
+(42601, where PostgreSQL gives 42883).
 
 | Feature | Status | Notes |
 |---------|--------|-------|
