@@ -704,6 +704,15 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
+            Self::DropRole { if_exists, roles } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_ID, Some("ROLE"))?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                s.comma(roles, context)
+            }
             Self::Grant(grant) => grant.to_tokens(s, context),
             Self::CreateType {
                 if_not_exists,

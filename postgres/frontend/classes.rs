@@ -688,6 +688,7 @@ pub(crate) fn translate_access_statement(
                         return Err(sqlstate_error(
                             SQLSTATE_FEATURE_NOT_SUPPORTED,
                             format!("{statement} on internal table {name} is not supported"),
+                            None,
                         ));
                     }
                     if *revoke {
@@ -697,6 +698,7 @@ pub(crate) fn translate_access_statement(
                                 "REVOKE on system catalog {} is not supported",
                                 catalog_view_name(name)
                             ),
+                            None,
                         ));
                     }
                     continue;
@@ -709,6 +711,7 @@ pub(crate) fn translate_access_statement(
                     return Err(sqlstate_error(
                         SQLSTATE_INVALID_GRANT_OPERATION,
                         "invalid privilege type USAGE for table",
+                        None,
                     ));
                 }
                 let owner = role_oid(class.relowner);
@@ -781,6 +784,7 @@ pub(crate) fn translate_access_statement(
                 return Err(sqlstate_error(
                     SQLSTATE_DUPLICATE_OBJECT,
                     format!("policy \"{policy_name}\" for table \"{name}\" already exists"),
+                    None,
                 ));
             }
             let roles = policy
@@ -834,6 +838,7 @@ pub(crate) fn translate_access_statement(
                 return Err(sqlstate_error(
                     SQLSTATE_UNDEFINED_OBJECT,
                     format!("policy \"{policy_name}\" for table \"{name}\" does not exist"),
+                    None,
                 ));
             }
             let relpolicies = class.relpolicies.without(policy_name);
@@ -844,7 +849,9 @@ pub(crate) fn translate_access_statement(
             };
             emit_class_row_set_policies(program, &cursors, *namespace, name, stored);
         }
-        AccessStatement::CreateRole { .. } | AccessStatement::GrantRole { .. } => {
+        AccessStatement::CreateRole { .. }
+        | AccessStatement::DropRole { .. }
+        | AccessStatement::GrantRole { .. } => {
             unreachable!("statements about roles do not change a class row")
         }
     }

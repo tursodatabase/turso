@@ -51,6 +51,7 @@ fn canonical_uuid(text: &str) -> Result<String> {
             sqlstate_error(
                 SQLSTATE_INVALID_TEXT_REPRESENTATION,
                 format!("invalid input syntax for type uuid: \"{text}\""),
+                None,
             )
         })
 }
