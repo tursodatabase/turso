@@ -113,6 +113,23 @@ fn translate_compared_value(
     }
 }
 
+/// Converts the timestamp in `reg` to a timestamptz, as PostgreSQL does for the
+/// values of a CASE, coalesce, min, max or UNION that mix the two types. The
+/// session time zone is UTC in tursopg, so the instant stays the same and the
+/// decoded text gains the `+00` suffix that a timestamptz shows.
+fn emit_timestamp_as_timestamptz(
+    program: &mut ProgramBuilder,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let schema = resolver.schema();
+    let timestamptz = schema
+        .resolve_type_unchecked("timestamptz")?
+        .ok_or_else(|| LimboError::InternalError("type timestamptz does not resolve".into()))?;
+    emit_store_value(program, &timestamptz, reg, Coerce::Skip, resolver)?;
+    emit_decode(program, &timestamptz, reg, resolver)
+}
+
 /// Translates the two operands of a comparison into `lhs_reg` and `rhs_reg`.
 /// See [translate_compared_operand].
 pub(crate) fn translate_compared_pair(
@@ -249,11 +266,20 @@ pub(crate) fn untyped_values_type<'e>(
     for value in values.clone() {
         has_untyped_value |= is_untyped_operand(value)?;
     }
-    if !has_untyped_value {
-        return Ok(None);
-    }
     let env = TypeEnv::new(referenced_tables, resolver);
     let common = common_type(values.clone(), &env);
+    if !has_untyped_value {
+        // A timestamp among timestamptz values is read as a timestamptz.
+        let converts_timestamps = is_type_named(&common, "timestamptz", schema)
+            && values
+                .clone()
+                .any(|value| is_type_named(&type_of(value, &env), "timestamp", schema));
+        return if converts_timestamps {
+            untyped_operands_read_as(schema, common)
+        } else {
+            Ok(None)
+        };
+    }
     match common {
         ExprType::Custom { .. } => untyped_operands_read_as(schema, common),
         ExprType::Array { .. }
@@ -332,7 +358,8 @@ pub(crate) fn translate_returned_value(
 }
 
 /// Translates `value` into `reg` if it is a string literal or parameter read
-/// as `values_type` (see [untyped_values_type]), and returns whether it did.
+/// as `values_type` (see [untyped_values_type]), or a timestamp that is read as
+/// a timestamptz, and returns whether it did.
 /// The conversion is computed once in a register of its own and copied into
 /// `reg`, so the other values may write `reg` too.
 pub(crate) fn translate_untyped_value(
@@ -346,18 +373,35 @@ pub(crate) fn translate_untyped_value(
     let Some(resolved) = values_type else {
         return Ok(false);
     };
-    if !is_untyped_operand(value)? {
+    let value_reg = program.alloc_register();
+    if is_untyped_operand(value)? {
+        translate_untyped_operand_as(
+            program,
+            referenced_tables,
+            value,
+            resolved,
+            value_reg,
+            resolver,
+        )?;
+    } else if resolved.leaf().name.eq_ignore_ascii_case("timestamptz")
+        && is_type_named(
+            &type_of(value, &TypeEnv::new(referenced_tables, resolver)),
+            "timestamp",
+            resolver.schema(),
+        )
+    {
+        translate_expr_no_constant_opt(
+            program,
+            referenced_tables,
+            value,
+            value_reg,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+        emit_timestamp_as_timestamptz(program, value_reg, resolver)?;
+    } else {
         return Ok(false);
     }
-    let value_reg = program.alloc_register();
-    translate_untyped_operand_as(
-        program,
-        referenced_tables,
-        value,
-        resolved,
-        value_reg,
-        resolver,
-    )?;
     program.emit_insn(Insn::Copy {
         src_reg: value_reg,
         dst_reg: reg,

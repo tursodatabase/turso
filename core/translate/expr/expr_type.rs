@@ -1217,7 +1217,7 @@ pub(crate) fn common_type<'e>(
     common_of_types(exprs.map(|expr| type_of(expr, env)), env.schema())
 }
 
-fn common_of_types(types: impl Iterator<Item = ExprType>, schema: &Schema) -> ExprType {
+pub(crate) fn common_of_types(types: impl Iterator<Item = ExprType>, schema: &Schema) -> ExprType {
     let mut common: Option<ExprType> = None;
     for ty in types {
         common = Some(match (common, ty) {
@@ -1250,6 +1250,15 @@ fn common_element_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
         (a, b) if b.is_unknown_element() => a,
         (a, b) => common_scalar_type(a, b, schema),
     }
+}
+
+/// Whether the two types are timestamp and timestamptz, in either order.
+fn is_timestamp_pair(a: &TypeDef, b: &TypeDef) -> bool {
+    let (a, b) = (a.name.to_ascii_lowercase(), b.name.to_ascii_lowercase());
+    matches!(
+        (a.as_str(), b.as_str()),
+        ("timestamp", "timestamptz") | ("timestamptz", "timestamp")
+    )
 }
 
 fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
@@ -1286,6 +1295,23 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
             } else {
                 Vec::new()
             },
+        },
+        // timestamp mixed with timestamptz is a timestamptz, as in PostgreSQL. The
+        // two compare as the same instant because the session time zone is UTC.
+        (
+            ExprType::Custom {
+                type_def: a_def, ..
+            },
+            ExprType::Custom {
+                type_def: b_def, ..
+            },
+        ) if is_timestamp_pair(&a_def, &b_def) => ExprType::Custom {
+            type_def: if a_def.name.eq_ignore_ascii_case("timestamptz") {
+                a_def
+            } else {
+                b_def
+            },
+            params: Vec::new(),
         },
         // A string literal is a value of the custom type it is mixed with, as in
         // PostgreSQL: coalesce(date_column, '2024-01-01') is a date.
@@ -1350,6 +1376,15 @@ fn read_type_unless_exact_numbers(ty: ExprType) -> ExprType {
 
 fn is_domain(ty: &ExprType) -> bool {
     matches!(ty, ExprType::Custom { type_def, .. } if type_def.is_domain)
+}
+
+/// Whether `ty`, or the type a domain `ty` is based on, is the custom type named
+/// `name`.
+pub(crate) fn is_type_named(ty: &ExprType, name: &str, schema: &Schema) -> bool {
+    matches!(
+        without_domain(ty.clone(), schema),
+        ExprType::Custom { type_def, .. } if type_def.name.eq_ignore_ascii_case(name)
+    )
 }
 
 /// The type's name with each domain replaced by its base type: `boolean[]`

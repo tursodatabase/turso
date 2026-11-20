@@ -311,12 +311,15 @@ fn convert_timestamps_in_compound(
     last: &mut SelectPlan,
     resolver: &Resolver,
 ) {
-    use crate::translate::expr::expr_type::{type_of, ExprType, TypeEnv};
+    use crate::translate::expr::expr_type::{
+        common_of_types, is_type_named, type_of, ExprType, TypeEnv,
+    };
     let schema = resolver.schema();
     if schema.type_registry.is_empty() {
         return;
     }
-    let type_named = |ty: &ExprType, name: &str| matches!(ty, ExprType::Custom { type_def, .. } if type_def.name.eq_ignore_ascii_case(name));
+    // A domain over timestamp is a timestamp.
+    let type_named = |ty: &ExprType, name: &str| is_type_named(ty, name, schema);
     let num_columns = last.result_columns.len();
     let mut arms: Vec<&mut SelectPlan> = left.iter_mut().map(|(plan, _)| plan).collect();
     arms.push(last);
@@ -330,7 +333,11 @@ fn convert_timestamps_in_compound(
                 )
             })
             .collect();
-        if !types.iter().any(|ty| type_named(ty, "timestamptz")) {
+        // The column's type is the common type of the arms (see common_scalar_type).
+        if !type_named(
+            &common_of_types(types.iter().cloned(), schema),
+            "timestamptz",
+        ) {
             continue;
         }
         for (arm, ty) in arms.iter_mut().zip(&types) {

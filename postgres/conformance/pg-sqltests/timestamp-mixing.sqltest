@@ -1,0 +1,1060 @@
+# timestamp mixed with timestamptz. PostgreSQL compares a timestamp with a
+# timestamptz after converting the timestamp in the session time zone, UTC on
+# both servers, and gives CASE, coalesce, UNION and the like the type
+# timestamptz. Every expected result comes from PostgreSQL 18.
+#
+# tursopg rejects infinity, BC dates and years above 9999, so the edge rows
+# are the earliest and latest years it accepts, and fractions. The queries
+# that tursopg cannot run yet are in gaps/timestamp-mixing.sqltest.
+
+@database :memory:
+
+setup tsmix {
+    CREATE TABLE t (id int, ts timestamp, tz timestamptz);
+    INSERT INTO t VALUES
+        (1, '2024-01-05 10:00', '2024-01-05 10:00+00'),
+        (2, '2024-01-05 11:00', '2024-01-05 10:00+00'),
+        (3, '2024-01-05 09:00:00.5', '2024-01-05 09:00:00.5+00'),
+        (4, NULL, '2024-01-05 10:00+00'),
+        (5, '0001-01-01 00:00:00', '9999-12-31 23:59:59.999999+00');
+}
+
+setup tsmix_idx {
+    CREATE TABLE t (id int, ts timestamp, tz timestamptz);
+    INSERT INTO t VALUES
+        (1, '2024-01-05 10:00', '2024-01-05 10:00+00'),
+        (2, '2024-01-05 11:00', '2024-01-05 10:00+00'),
+        (3, '2024-01-05 09:00:00.5', '2024-01-05 09:00:00.5+00'),
+        (4, NULL, '2024-01-05 10:00+00'),
+        (5, '0001-01-01 00:00:00', '9999-12-31 23:59:59.999999+00');
+    CREATE INDEX t_ts ON t (ts);
+    CREATE INDEX t_tz ON t (tz);
+}
+
+@setup tsmix
+test ts-tz-mix-01 {
+    SELECT id FROM t WHERE ts = tz ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup tsmix
+test ts-tz-mix-02 {
+    SELECT id FROM t WHERE ts <> tz ORDER BY id;
+}
+expect {
+    2
+    5
+}
+
+@setup tsmix
+test ts-tz-mix-03 {
+    SELECT id FROM t WHERE ts < tz ORDER BY id;
+}
+expect {
+    5
+}
+
+@setup tsmix
+test ts-tz-mix-04 {
+    SELECT id FROM t WHERE ts <= tz ORDER BY id;
+}
+expect {
+    1
+    3
+    5
+}
+
+@setup tsmix
+test ts-tz-mix-05 {
+    SELECT id FROM t WHERE ts > tz ORDER BY id;
+}
+expect {
+    2
+}
+
+@setup tsmix
+test ts-tz-mix-06 {
+    SELECT id FROM t WHERE ts >= tz ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup tsmix
+test ts-tz-mix-07 {
+    SELECT id FROM t WHERE tz = ts ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup tsmix
+test ts-tz-mix-08 {
+    SELECT id FROM t WHERE ts IS DISTINCT FROM tz ORDER BY id;
+}
+expect {
+    2
+    4
+    5
+}
+
+@setup tsmix
+test ts-tz-mix-09 {
+    SELECT id FROM t WHERE ts IS NOT DISTINCT FROM tz ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup tsmix
+test ts-tz-mix-10 {
+    SELECT id FROM t WHERE ts IN (tz, '2030-01-01') ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup tsmix
+test ts-tz-mix-11 {
+    SELECT id FROM t WHERE tz IN (ts, '2030-01-01') ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup tsmix
+test ts-tz-mix-12 {
+    SELECT id FROM t WHERE ts = ANY(ARRAY[tz]) ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup tsmix
+test ts-tz-mix-13 {
+    SELECT id FROM t WHERE ts = ANY(ARRAY[tz, '2030-01-01'::timestamptz]) ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup tsmix
+test ts-tz-mix-14 {
+    SELECT id, CASE ts WHEN tz THEN 'eq' ELSE 'ne' END FROM t ORDER BY id;
+}
+expect {
+    1|eq
+    2|ne
+    3|eq
+    4|ne
+    5|ne
+}
+
+@setup tsmix
+test ts-tz-mix-15 {
+    SELECT id, NULLIF(ts, tz) FROM t ORDER BY id;
+}
+expect {
+    1|
+    2|2024-01-05 11:00:00
+    3|
+    4|
+    5|0001-01-01 00:00:00
+}
+
+@setup tsmix
+test ts-tz-mix-16 {
+    SELECT id, GREATEST(ts, tz) FROM t WHERE ts IS NOT NULL ORDER BY id;
+}
+expect {
+    1|2024-01-05 10:00:00+00
+    2|2024-01-05 11:00:00+00
+    3|2024-01-05 09:00:00.5+00
+    5|9999-12-31 23:59:59.999999+00
+}
+
+@setup tsmix
+test ts-tz-mix-17 {
+    SELECT id, LEAST(ts, tz) FROM t WHERE ts IS NOT NULL ORDER BY id;
+}
+expect {
+    1|2024-01-05 10:00:00+00
+    2|2024-01-05 10:00:00+00
+    3|2024-01-05 09:00:00.5+00
+    5|0001-01-01 00:00:00+00
+}
+
+@setup tsmix
+test ts-tz-mix-18 {
+    SELECT id, COALESCE(ts, tz) FROM t ORDER BY id;
+}
+expect {
+    1|2024-01-05 10:00:00+00
+    2|2024-01-05 11:00:00+00
+    3|2024-01-05 09:00:00.5+00
+    4|2024-01-05 10:00:00+00
+    5|0001-01-01 00:00:00+00
+}
+
+@setup tsmix
+test ts-tz-mix-19 {
+    SELECT id, COALESCE(NULL::timestamp, tz) FROM t ORDER BY id;
+}
+expect {
+    1|2024-01-05 10:00:00+00
+    2|2024-01-05 10:00:00+00
+    3|2024-01-05 09:00:00.5+00
+    4|2024-01-05 10:00:00+00
+    5|9999-12-31 23:59:59.999999+00
+}
+
+@setup tsmix
+test ts-tz-mix-20 {
+    SELECT id, COALESCE(NULL::timestamptz, ts) FROM t ORDER BY id;
+}
+expect {
+    1|2024-01-05 10:00:00+00
+    2|2024-01-05 11:00:00+00
+    3|2024-01-05 09:00:00.5+00
+    4|
+    5|0001-01-01 00:00:00+00
+}
+
+@setup tsmix
+test ts-tz-mix-21 {
+    SELECT x FROM (SELECT ts AS x FROM t UNION ALL SELECT tz FROM t) q ORDER BY x;
+}
+expect {
+    0001-01-01 00:00:00+00
+    2024-01-05 09:00:00.5+00
+    2024-01-05 09:00:00.5+00
+    2024-01-05 10:00:00+00
+    2024-01-05 10:00:00+00
+    2024-01-05 10:00:00+00
+    2024-01-05 10:00:00+00
+    2024-01-05 11:00:00+00
+    9999-12-31 23:59:59.999999+00
+    
+}
+
+@setup tsmix
+test ts-tz-mix-22 {
+    SELECT ts FROM t UNION SELECT tz FROM t ORDER BY 1;
+}
+expect {
+    0001-01-01 00:00:00+00
+    2024-01-05 09:00:00.5+00
+    2024-01-05 10:00:00+00
+    2024-01-05 11:00:00+00
+    9999-12-31 23:59:59.999999+00
+    
+}
+
+@setup tsmix
+test ts-tz-mix-23 {
+    SELECT tz FROM t UNION SELECT ts FROM t ORDER BY 1;
+}
+expect {
+    0001-01-01 00:00:00+00
+    2024-01-05 09:00:00.5+00
+    2024-01-05 10:00:00+00
+    2024-01-05 11:00:00+00
+    9999-12-31 23:59:59.999999+00
+    
+}
+
+@setup tsmix
+test ts-tz-mix-24 {
+    SELECT ts FROM t INTERSECT SELECT tz FROM t ORDER BY 1;
+}
+expect {
+    2024-01-05 09:00:00.5+00
+    2024-01-05 10:00:00+00
+}
+
+@setup tsmix
+test ts-tz-mix-25 {
+    SELECT ts FROM t EXCEPT SELECT tz FROM t ORDER BY 1;
+}
+expect {
+    0001-01-01 00:00:00+00
+    2024-01-05 11:00:00+00
+    
+}
+
+@setup tsmix
+test ts-tz-mix-26 {
+    SELECT tz FROM t EXCEPT SELECT ts FROM t ORDER BY 1;
+}
+expect {
+    9999-12-31 23:59:59.999999+00
+}
+
+@setup tsmix
+test ts-tz-mix-27 {
+    SELECT DISTINCT x FROM (SELECT ts AS x FROM t UNION ALL SELECT tz FROM t) q ORDER BY x;
+}
+expect {
+    0001-01-01 00:00:00+00
+    2024-01-05 09:00:00.5+00
+    2024-01-05 10:00:00+00
+    2024-01-05 11:00:00+00
+    9999-12-31 23:59:59.999999+00
+    
+}
+
+@setup tsmix
+test ts-tz-mix-28 {
+    SELECT a.id, b.id FROM t a JOIN t b ON a.ts = b.tz ORDER BY 1,2;
+}
+expect {
+    1|1
+    1|2
+    1|4
+    3|3
+}
+
+@setup tsmix
+test ts-tz-mix-29 {
+    SELECT a.id, b.id FROM t a JOIN t b ON a.ts < b.tz ORDER BY 1,2;
+}
+expect {
+    1|5
+    2|5
+    3|1
+    3|2
+    3|4
+    3|5
+    5|1
+    5|2
+    5|3
+    5|4
+    5|5
+}
+
+@setup tsmix
+test ts-tz-mix-30 {
+    SELECT a.id, b.id FROM t a LEFT JOIN t b ON a.ts = b.tz ORDER BY 1,2;
+}
+expect {
+    1|1
+    1|2
+    1|4
+    2|
+    3|3
+    4|
+    5|
+}
+
+@setup tsmix
+test ts-tz-mix-31 {
+    SELECT id FROM t WHERE ts IN (SELECT tz FROM t) ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup tsmix
+test ts-tz-mix-32 {
+    SELECT id FROM t WHERE tz IN (SELECT ts FROM t) ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+@setup tsmix
+test ts-tz-mix-33 {
+    SELECT id FROM t WHERE ts NOT IN (SELECT tz FROM t) ORDER BY id;
+}
+expect {
+    2
+    5
+}
+
+@setup tsmix
+test ts-tz-mix-34 {
+    SELECT id FROM t a WHERE EXISTS (SELECT 1 FROM t b WHERE a.ts = b.tz) ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup tsmix
+test ts-tz-mix-35 {
+    SELECT id FROM t a WHERE EXISTS (SELECT 1 FROM t b WHERE b.tz = a.ts) ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup tsmix
+test ts-tz-mix-36 {
+    SELECT id FROM t WHERE (ts, 1) = (tz, 1) ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup tsmix
+test ts-tz-mix-37 {
+    SELECT id FROM t WHERE (ts, 1) < (tz, 1) ORDER BY id;
+}
+expect {
+    5
+}
+
+@setup tsmix
+test ts-tz-mix-38 {
+    SELECT min(x), max(x) FROM (SELECT ts AS x FROM t UNION ALL SELECT tz FROM t) q;
+}
+expect {
+    0001-01-01 00:00:00+00|9999-12-31 23:59:59.999999+00
+}
+
+@setup tsmix
+test ts-tz-mix-39 {
+    SELECT id FROM t WHERE ts = '2024-01-05 10:00+02'::timestamptz ORDER BY id;
+}
+expect {
+}
+
+@setup tsmix
+test ts-tz-mix-40 {
+    SELECT id FROM t WHERE ts = '2024-01-05 12:00+02'::timestamptz ORDER BY id;
+}
+expect {
+    1
+}
+
+@setup tsmix
+test ts-tz-mix-41 {
+    SELECT id FROM t WHERE ts < '2024-01-05 12:30+02'::timestamptz ORDER BY id;
+}
+expect {
+    1
+    3
+    5
+}
+
+@setup tsmix
+test ts-tz-mix-42 {
+    SELECT id FROM t WHERE tz = '2024-01-05 10:00'::timestamp ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+}
+
+@setup tsmix
+test ts-tz-mix-43 {
+    SELECT id FROM t WHERE ts = '2024-01-05 10:00'::timestamptz ORDER BY id;
+}
+expect {
+    1
+}
+
+@setup tsmix
+test ts-tz-mix-44 {
+    SELECT id FROM t WHERE ts IN ('2024-01-05 12:00+02'::timestamptz) ORDER BY id;
+}
+expect {
+    1
+}
+
+@setup tsmix
+test ts-tz-mix-45 {
+    SELECT id FROM t WHERE tz = '2024-01-05 10:00' ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+}
+
+@setup tsmix
+test ts-tz-mix-46 {
+    SELECT id, CASE WHEN id=1 THEN ts ELSE tz END FROM t ORDER BY id;
+}
+expect {
+    1|2024-01-05 10:00:00+00
+    2|2024-01-05 10:00:00+00
+    3|2024-01-05 09:00:00.5+00
+    4|2024-01-05 10:00:00+00
+    5|9999-12-31 23:59:59.999999+00
+}
+
+@setup tsmix
+test ts-tz-mix-47 {
+    SELECT id, CASE WHEN id=1 THEN tz ELSE ts END FROM t ORDER BY id;
+}
+expect {
+    1|2024-01-05 10:00:00+00
+    2|2024-01-05 11:00:00+00
+    3|2024-01-05 09:00:00.5+00
+    4|
+    5|0001-01-01 00:00:00+00
+}
+
+@setup tsmix
+test ts-tz-mix-48 {
+    SELECT id, ARRAY[ts, tz] FROM t ORDER BY id;
+}
+expect {
+    1|{"2024-01-05 10:00:00+00","2024-01-05 10:00:00+00"}
+    2|{"2024-01-05 11:00:00+00","2024-01-05 10:00:00+00"}
+    3|{"2024-01-05 09:00:00.5+00","2024-01-05 09:00:00.5+00"}
+    4|{NULL,"2024-01-05 10:00:00+00"}
+    5|{"0001-01-01 00:00:00+00","9999-12-31 23:59:59.999999+00"}
+}
+
+@setup tsmix
+test ts-tz-mix-49 {
+    SELECT id FROM t GROUP BY id, ts, tz HAVING ts = tz ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup tsmix
+test ts-tz-mix-50 {
+    SELECT id, count(*) OVER (PARTITION BY ts = tz) FROM t ORDER BY id;
+}
+expect {
+    1|2
+    2|2
+    3|2
+    4|1
+    5|2
+}
+
+@setup tsmix
+test ts-tz-mix-51 {
+    SELECT x, count(*) FROM (SELECT ts AS x FROM t UNION ALL SELECT tz FROM t) q GROUP BY x ORDER BY x;
+}
+expect {
+    0001-01-01 00:00:00+00|1
+    2024-01-05 09:00:00.5+00|2
+    2024-01-05 10:00:00+00|4
+    2024-01-05 11:00:00+00|1
+    9999-12-31 23:59:59.999999+00|1
+    |1
+}
+
+@setup tsmix
+test ts-tz-mix-52 {
+    SELECT id FROM t WHERE ts = (SELECT max(tz) FROM t) ORDER BY id;
+}
+expect {
+}
+
+@setup tsmix
+test ts-tz-mix-53 {
+    SELECT id FROM t WHERE (ts, id) IN (SELECT tz, id FROM t) ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup tsmix
+test ts-tz-mix-54 {
+    SELECT id FROM t WHERE (ts, id) IN (SELECT ts, id FROM t UNION SELECT tz, id FROM t) ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    5
+}
+
+@setup tsmix
+test ts-tz-mix-55 {
+    SELECT id FROM t WHERE ts = tz AND id = 1;
+}
+expect {
+    1
+}
+
+@setup tsmix
+test ts-tz-mix-56 {
+    SELECT id FROM t WHERE ts = tz OR id = 2 ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup tsmix
+test ts-tz-mix-57 {
+    SELECT id FROM t a JOIN t b USING (id) WHERE a.ts = b.tz ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup tsmix_idx
+test ts-tz-seek-58 {
+    SELECT id FROM t WHERE ts = '2024-01-05 10:00+00'::timestamptz ORDER BY id;
+}
+expect {
+    1
+}
+
+@setup tsmix_idx
+test ts-tz-seek-59 {
+    SELECT id FROM t WHERE ts < '2024-01-05 10:00+00'::timestamptz ORDER BY id;
+}
+expect {
+    3
+    5
+}
+
+@setup tsmix_idx
+test ts-tz-seek-60 {
+    SELECT id FROM t WHERE ts > '2024-01-05 10:00+00'::timestamptz ORDER BY id;
+}
+expect {
+    2
+}
+
+@setup tsmix_idx
+test ts-tz-seek-61 {
+    SELECT id FROM t WHERE ts IN ('2024-01-05 10:00+00'::timestamptz, '2024-01-05 11:00+00'::timestamptz) ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup tsmix_idx
+test ts-tz-seek-62 {
+    SELECT id FROM t WHERE tz = '2024-01-05 10:00'::timestamp ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+}
+
+@setup tsmix_idx
+test ts-tz-seek-63 {
+    SELECT id FROM t WHERE tz < '2024-01-05 10:00'::timestamp ORDER BY id;
+}
+expect {
+    3
+}
+
+@setup tsmix_idx
+test ts-tz-seek-64 {
+    SELECT id FROM t WHERE tz > '2024-01-05 10:00'::timestamp ORDER BY id;
+}
+expect {
+    5
+}
+
+@setup tsmix_idx
+test ts-tz-seek-65 {
+    SELECT id FROM t WHERE tz IN ('2024-01-05 10:00'::timestamp, '2024-01-05 09:00:00.5'::timestamp) ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+@setup tsmix_idx
+test ts-tz-seek-66 {
+    SELECT a.id, b.id FROM t a JOIN t b ON b.ts = a.tz ORDER BY 1, 2;
+}
+expect {
+    1|1
+    2|1
+    3|3
+    4|1
+}
+
+@setup tsmix_idx
+test ts-tz-seek-67 {
+    SELECT a.id, b.id FROM t a JOIN t b ON b.ts < a.tz ORDER BY 1, 2;
+}
+expect {
+    1|3
+    1|5
+    2|3
+    2|5
+    3|5
+    4|3
+    4|5
+    5|1
+    5|2
+    5|3
+    5|5
+}
+
+@setup tsmix_idx
+test ts-tz-seek-68 {
+    SELECT a.id, b.id FROM t a JOIN t b ON b.ts > a.tz ORDER BY 1, 2;
+}
+expect {
+    1|2
+    2|2
+    3|1
+    3|2
+    4|2
+}
+
+@setup tsmix_idx
+test ts-tz-seek-69 {
+    SELECT a.id, b.id FROM t a JOIN t b ON b.tz = a.ts ORDER BY 1, 2;
+}
+expect {
+    1|1
+    1|2
+    1|4
+    3|3
+}
+
+@setup tsmix_idx
+test ts-tz-seek-70 {
+    SELECT a.id, b.id FROM t a JOIN t b ON b.tz < a.ts ORDER BY 1, 2;
+}
+expect {
+    1|3
+    2|1
+    2|2
+    2|3
+    2|4
+}
+
+@setup tsmix_idx
+test ts-tz-seek-71 {
+    SELECT a.id, b.id FROM t a JOIN t b ON b.tz > a.ts ORDER BY 1, 2;
+}
+expect {
+    1|5
+    2|5
+    3|1
+    3|2
+    3|4
+    3|5
+    5|1
+    5|2
+    5|3
+    5|4
+    5|5
+}
+
+@setup tsmix_idx
+test ts-tz-seek-72 {
+    SELECT id FROM t WHERE ts IN (SELECT tz FROM t) ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup tsmix_idx
+test ts-tz-seek-73 {
+    SELECT id FROM t WHERE tz IN (SELECT ts FROM t) ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+@setup tsmix_idx
+test ts-tz-seek-74 {
+    SELECT id FROM t ORDER BY ts, id;
+}
+expect {
+    5
+    3
+    1
+    2
+    4
+}
+
+@setup tsmix_idx
+test ts-tz-seek-75 {
+    SELECT id FROM t ORDER BY tz, id;
+}
+expect {
+    3
+    1
+    2
+    4
+    5
+}
+
+@setup tsmix_idx
+test ts-tz-seek-76 {
+    SELECT id FROM t WHERE ts BETWEEN '2024-01-05 09:00+00'::timestamptz AND '2024-01-05 10:00+00'::timestamptz ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+@setup tsmix
+test ts-tz-order-77 {
+    SELECT id, ts FROM t ORDER BY ts, id;
+}
+expect {
+    5|0001-01-01 00:00:00
+    3|2024-01-05 09:00:00.5
+    1|2024-01-05 10:00:00
+    2|2024-01-05 11:00:00
+    4|
+}
+
+@setup tsmix
+test ts-tz-order-78 {
+    SELECT id, tz FROM t ORDER BY tz, id;
+}
+expect {
+    3|2024-01-05 09:00:00.5+00
+    1|2024-01-05 10:00:00+00
+    2|2024-01-05 10:00:00+00
+    4|2024-01-05 10:00:00+00
+    5|9999-12-31 23:59:59.999999+00
+}
+
+@setup tsmix
+test ts-tz-order-79 {
+    SELECT x FROM (SELECT ts AS x FROM t UNION ALL SELECT tz FROM t) q ORDER BY x;
+}
+expect {
+    0001-01-01 00:00:00+00
+    2024-01-05 09:00:00.5+00
+    2024-01-05 09:00:00.5+00
+    2024-01-05 10:00:00+00
+    2024-01-05 10:00:00+00
+    2024-01-05 10:00:00+00
+    2024-01-05 10:00:00+00
+    2024-01-05 11:00:00+00
+    9999-12-31 23:59:59.999999+00
+    
+}
+
+@setup tsmix
+test ts-tz-order-80 {
+    SELECT x FROM (SELECT tz AS x FROM t UNION ALL SELECT ts FROM t) q ORDER BY x DESC;
+}
+expect {
+    
+    9999-12-31 23:59:59.999999+00
+    2024-01-05 11:00:00+00
+    2024-01-05 10:00:00+00
+    2024-01-05 10:00:00+00
+    2024-01-05 10:00:00+00
+    2024-01-05 10:00:00+00
+    2024-01-05 09:00:00.5+00
+    2024-01-05 09:00:00.5+00
+    0001-01-01 00:00:00+00
+}
+
+@setup tsmix
+test ts-tz-order-81 {
+    SELECT id, CASE WHEN id % 2 = 0 THEN ts ELSE tz END AS x FROM t ORDER BY x, id;
+}
+expect {
+    3|2024-01-05 09:00:00.5+00
+    1|2024-01-05 10:00:00+00
+    2|2024-01-05 11:00:00+00
+    5|9999-12-31 23:59:59.999999+00
+    4|
+}
+
+@setup tsmix
+test ts-tz-order-82 {
+    SELECT coalesce(ts, tz) AS x FROM t ORDER BY x;
+}
+expect {
+    0001-01-01 00:00:00+00
+    2024-01-05 09:00:00.5+00
+    2024-01-05 10:00:00+00
+    2024-01-05 10:00:00+00
+    2024-01-05 11:00:00+00
+}
+
+@setup tsmix
+test ts-tz-order-83 {
+    SELECT x, count(*) FROM (SELECT coalesce(ts, tz) AS x FROM t) q GROUP BY x ORDER BY x;
+}
+expect {
+    0001-01-01 00:00:00+00|1
+    2024-01-05 09:00:00.5+00|1
+    2024-01-05 10:00:00+00|2
+    2024-01-05 11:00:00+00|1
+}
+
+@setup tsmix
+test ts-tz-order-84 {
+    SELECT DISTINCT coalesce(ts, tz) AS x FROM t ORDER BY x;
+}
+expect {
+    0001-01-01 00:00:00+00
+    2024-01-05 09:00:00.5+00
+    2024-01-05 10:00:00+00
+    2024-01-05 11:00:00+00
+}
+
+@setup tsmix
+test ts-tz-order-85 {
+    SELECT DISTINCT x FROM (SELECT tz AS x FROM t UNION ALL SELECT ts FROM t) q ORDER BY x;
+}
+expect {
+    0001-01-01 00:00:00+00
+    2024-01-05 09:00:00.5+00
+    2024-01-05 10:00:00+00
+    2024-01-05 11:00:00+00
+    9999-12-31 23:59:59.999999+00
+    
+}
+
+@setup tsmix
+test ts-tz-order-86 {
+    SELECT x, count(*) FROM (SELECT tz AS x FROM t UNION ALL SELECT ts FROM t) q GROUP BY x ORDER BY x;
+}
+expect {
+    0001-01-01 00:00:00+00|1
+    2024-01-05 09:00:00.5+00|2
+    2024-01-05 10:00:00+00|4
+    2024-01-05 11:00:00+00|1
+    9999-12-31 23:59:59.999999+00|1
+    |1
+}
+
+@setup tsmix
+test ts-tz-order-87 {
+    SELECT ts FROM t UNION SELECT tz FROM t ORDER BY 1;
+}
+expect {
+    0001-01-01 00:00:00+00
+    2024-01-05 09:00:00.5+00
+    2024-01-05 10:00:00+00
+    2024-01-05 11:00:00+00
+    9999-12-31 23:59:59.999999+00
+    
+}
+
+@setup tsmix
+test ts-tz-order-88 {
+    SELECT ts FROM t INTERSECT SELECT tz FROM t ORDER BY 1;
+}
+expect {
+    2024-01-05 09:00:00.5+00
+    2024-01-05 10:00:00+00
+}
+
+@setup tsmix
+test ts-tz-order-89 {
+    SELECT min(x), max(x) FROM (SELECT tz AS x FROM t UNION ALL SELECT ts FROM t) q;
+}
+expect {
+    0001-01-01 00:00:00+00|9999-12-31 23:59:59.999999+00
+}
+
+@setup tsmix
+test ts-tz-order-90 {
+    SELECT id, GREATEST(ts, tz), LEAST(ts, tz) FROM t WHERE ts IS NOT NULL ORDER BY id;
+}
+expect {
+    1|2024-01-05 10:00:00+00|2024-01-05 10:00:00+00
+    2|2024-01-05 11:00:00+00|2024-01-05 10:00:00+00
+    3|2024-01-05 09:00:00.5+00|2024-01-05 09:00:00.5+00
+    5|9999-12-31 23:59:59.999999+00|0001-01-01 00:00:00+00
+}
+
+setup tsmix_two_tables {
+    CREATE TABLE a (id int, ts timestamp);
+    CREATE TABLE b (id int, tz timestamptz);
+    INSERT INTO a VALUES (1, '2024-01-05 10:00'), (2, '2024-01-05 11:00'), (3, NULL);
+    INSERT INTO b VALUES (1, '2024-01-05 10:00+00'), (2, '2024-01-05 12:00+00'), (3, NULL);
+}
+
+# Column operands, not literals, in IN, CASE and ANY.
+@setup tsmix_two_tables
+test ts-tz-columns-in-list {
+    SELECT a.id FROM a, b WHERE a.ts IN (b.tz) ORDER BY a.id;
+}
+expect {
+    1
+}
+
+@setup tsmix_two_tables
+test ts-tz-columns-case-operand {
+    SELECT a.id, b.id, CASE a.ts WHEN b.tz THEN 'same' ELSE 'other' END FROM a, b WHERE a.id = b.id ORDER BY a.id;
+}
+expect {
+    1|1|same
+    2|2|other
+    3|3|other
+}
+
+@setup tsmix_two_tables
+test ts-tz-columns-any-array {
+    SELECT a.id FROM a, b WHERE a.ts = ANY(ARRAY[b.tz]) ORDER BY a.id;
+}
+expect {
+    1
+}
+
+setup tsmix_domain {
+    CREATE DOMAIN dts AS timestamp;
+    CREATE TABLE d (x dts);
+    CREATE TABLE z (x timestamptz);
+    INSERT INTO d VALUES ('2024-01-05 10:00');
+    INSERT INTO z VALUES ('2024-01-05 10:00+00');
+}
+
+# A domain over timestamp is a timestamp.
+@setup tsmix_domain
+test ts-tz-domain-union {
+    SELECT x FROM d UNION SELECT x FROM z;
+}
+expect {
+    2024-01-05 10:00:00+00
+}
+
+@setup tsmix_domain
+test ts-tz-domain-compare {
+    SELECT count(*) FROM d, z WHERE d.x = z.x;
+}
+expect {
+    1
+}
+
+@setup tsmix_domain
+test ts-tz-domain-order-by {
+    SELECT x FROM (SELECT x FROM d UNION ALL SELECT x FROM z) q ORDER BY x;
+}
+expect {
+    2024-01-05 10:00:00+00
+    2024-01-05 10:00:00+00
+}
