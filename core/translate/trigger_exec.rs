@@ -921,6 +921,10 @@ pub fn fire_trigger(
         // Evaluate WHEN clause if present
         if let Some(mut when_expr) = trigger.when_clause.clone() {
             crate::stack::trace_stack!("when_clause");
+            // A WHEN clause is translated without binding, so it gets the
+            // fold SQLite's parser does before any name is resolved here:
+            // `WHEN 0 AND nosuchcol` is 0 and never fails.
+            expr::apply_static_rewrites(&mut when_expr, &[&expr::AndWithIntegerZero], None)?;
             // Rewrite NEW/OLD references in WHEN clause to use registers
             // NEW and OLD registers hold decoded values, so they say which
             // custom type they hold.
@@ -930,6 +934,14 @@ pub fn fire_trigger(
                 resolver.schema(),
             );
             rewrite_trigger_expr_for_when_clause(&mut when_expr, ctx, &column_types)?;
+            // SQLite resolves every name of the WHEN clause when it compiles
+            // the trigger, before its code generator folds `x OR 1`, so a
+            // function that does not exist fails even in the operand the
+            // fold drops. This runs before the subquery planner, whose fold
+            // would drop that operand first. With a column name the clause
+            // cannot resolve, translate_expr reports that column, so no fold
+            // may drop anything before it gets there.
+            let has_unresolved_column = check_when_clause_function_calls(&when_expr, resolver)?;
 
             // Plan and emit any subqueries in the WHEN clause (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
             // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
@@ -940,6 +952,7 @@ pub fn fire_trigger(
                 &mut when_expr,
                 resolver,
                 connection,
+                !has_unresolved_column,
             )?;
             // Emit the planned subqueries so their results are available when we evaluate the WHEN expression.
             // Always treat these as correlated (no `Once` caching) because the WHEN clause is evaluated
@@ -955,15 +968,26 @@ pub fn fire_trigger(
                 )?;
             }
 
-            let when_reg = program.alloc_register();
-            translate_expr(program, None, &when_expr, when_reg, resolver)?;
+            // SQLite reports a row value of the wrong width anywhere in the
+            // clause (`WHEN (a, g) = (1, 2, 3)`) before it emits any of it, so
+            // this runs on the whole clause before the short-circuit below
+            // translates a leaf and reports an unresolved column first.
+            expr::walk_expr(&when_expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+                expr::reject_row_value_misuse_at(e)?;
+                Ok(WalkControl::Continue)
+            })?;
 
+            // A trigger fires only when its WHEN clause is true, so an AND or
+            // OR in it short-circuits (sqlite3ExprIfFalse with JUMPIFNULL):
+            // `WHEN new.x > 0 OR json_extract(..)` never runs the function
+            // when new.x > 0. NEW/OLD are already Expr::Register, so no tables.
             let skip_label = program.allocate_label();
-            program.emit_insn(Insn::IfNot {
-                reg: when_reg,
-                jump_if_null: true,
-                target_pc: skip_label,
-            });
+            let mut emit_leaf = |program: &mut ProgramBuilder, leaf: &ast::Expr| -> Result<usize> {
+                let reg = program.alloc_register();
+                translate_expr(program, None, leaf, reg, resolver)?;
+                Ok(reg)
+            };
+            expr::emit_jump_to_skip_unless_true(program, &when_expr, skip_label, &mut emit_leaf)?;
 
             // Execute trigger commands if WHEN clause is true
             execute_trigger_commands(
@@ -1120,6 +1144,31 @@ fn rewrite_trigger_expr_for_when_clause(
         Ok(WalkControl::Continue)
     })?;
     Ok(())
+}
+
+/// Checks the function calls of a WHEN clause the way SQLite's resolver
+/// reaches them: in source order, and not past a column name the clause
+/// cannot resolve, which translate_expr reports as "no such column" first.
+/// After the NEW/OLD rewrite every column name left is such a name. Returns
+/// true when one was found.
+fn check_when_clause_function_calls(when_expr: &ast::Expr, resolver: &Resolver) -> Result<bool> {
+    let mut unresolved_column_seen = false;
+    expr::walk_expr(when_expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if unresolved_column_seen {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match e {
+            ast::Expr::Id(_) | ast::Expr::Qualified(..) | ast::Expr::DoublyQualified(..) => {
+                unresolved_column_seen = true;
+            }
+            ast::Expr::FunctionCall { .. } | ast::Expr::FunctionCallStar { .. } => {
+                expr::check_function_calls(e, resolver)?;
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(unresolved_column_seen)
 }
 
 /// Rewrite NEW/OLD references in all expressions within a SELECT statement for trigger WHEN clauses.

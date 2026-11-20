@@ -14,7 +14,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode             p1  p2  p3  p4                                 p5  comment
-   0  Init                0  48   0                                      0  Start at 48
+   0  Init                0  47   0                                      0  Start at 47
    1  OpenWrite           0   2   0                                      0  root=2; iDb=0
    2  Integer             1   3   0                                      0  r[3]=1
    3  Integer             2   4   0                                      0  r[4]=2
@@ -43,24 +43,23 @@ addr  opcode             p1  p2  p3  p4                                 p5  comm
   26  IsNull              4  28   0                                      0  if (r[4]==NULL) goto 28
   27  ConvertToType       4   0   0  INTEGER                             0  as type bigint (BASE INTEGER)
   28  TypeCheck           3   2   0                                      0
-  29  Copy                3  17   0                                      0  r[17]=r[3]
-  30  Integer             0  18   0                                      0  r[18]=0
-  31  Integer             1  15   0                                      0  r[15]=1
-  32  Ge                 17  18  34  Binary                              0  if r[17]>=r[18] goto 34
-  33  ZeroOrNull         17  15  18                                      0  ((r[17]=NULL)|(r[18]=NULL)) ? r[15]=NULL : r[15]=0
-  34  Copy                3  19   0                                      0  r[19]=r[3]
-  35  Copy                4  20   0                                      0  r[20]=r[4]
-  36  Integer             1  16   0                                      0  r[16]=1
-  37  Lt                 19  20  39  Binary                              0  if r[19]<r[20] goto 39
-  38  ZeroOrNull         19  16  20                                      0  ((r[19]=NULL)|(r[20]=NULL)) ? r[16]=NULL : r[16]=0
-  39  And                16  15  14                                      0  r[14]=(r[15] && r[16])
-  40  IsNull             14  43   0                                      0  if (r[14]==NULL) goto 43
-  41  If                 14  43   0                                      0  if r[14] goto 43
-  42  Halt              275   0   0  a >= 0 AND a < b                    0
-  43  MakeRecord          3   2   5                                      0  r[5]=mkrec(r[3..4])
-  44  Insert              0   5   2  t                                   0  intkey=r[2] data=r[5]
+  29  Copy                3  15   0                                      0  r[15]=r[3]
+  30  Integer             0  16   0                                      0  r[16]=0
+  31  Integer             1  14   0                                      0  r[14]=1
+  32  Ge                 15  16  34  Binary                              0  if r[15]>=r[16] goto 34
+  33  ZeroOrNull         15  14  16                                      0  ((r[15]=NULL)|(r[16]=NULL)) ? r[14]=NULL : r[14]=0
+  34  IfNot              14  41   0                                      0  if !r[14] goto 41
+  35  Copy                3  18   0                                      0  r[18]=r[3]
+  36  Copy                4  19   0                                      0  r[19]=r[4]
+  37  Integer             1  17   0                                      0  r[17]=1
+  38  Lt                 18  19  40  Binary                              0  if r[18]<r[19] goto 40
+  39  ZeroOrNull         18  17  19                                      0  ((r[18]=NULL)|(r[19]=NULL)) ? r[17]=NULL : r[17]=0
+  40  If                 17  42   1                                      0  if r[17] goto 42
+  41  Halt              275   0   0  a >= 0 AND a < b                    0
+  42  MakeRecord          3   2   5                                      0  r[5]=mkrec(r[3..4])
+  43  Insert              0   5   2  t                                   0  intkey=r[2] data=r[5]
+  44  Goto                0  45   0                                      0
   45  Goto                0  46   0                                      0
-  46  Goto                0  47   0                                      0
-  47  Halt                0   0   0                                      0
-  48  Transaction         0   2   1                                      0  iDb=0 tx_mode=Write
-  49  Goto                0   1   0                                      0
+  46  Halt                0   0   0                                      0
+  47  Transaction         0   2   1                                      0  iDb=0 tx_mode=Write
+  48  Goto                0   1   0                                      0

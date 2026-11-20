@@ -265,6 +265,132 @@ pub(super) fn translate_in_list(
     Ok(())
 }
 
+/// Compiles an AND or OR that decides a jump, as the condition of a CASE
+/// WHEN without a base or an aggregate's FILTER clause does, through the
+/// jumps of [translate_condition_expr], as SQLite's sqlite3ExprIfFalse
+/// does for them: control goes to `jump_target_when_false` when the
+/// condition is false or NULL, and an operand is skipped once the other
+/// has decided the result, so `CASE WHEN a = 0 AND json_extract(b, '$.a')
+/// THEN 'y' ELSE 'n' END` never runs the function for a row with `a = 1`.
+/// Returns false for any other expression, and for an expression
+/// translated without tables, as a CHECK constraint is: the caller
+/// evaluates those into a register and tests it, as before.
+pub fn translate_and_or_condition_jump(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    jump_target_when_false: BranchOffset,
+    resolver: &Resolver,
+) -> Result<bool> {
+    let is_and_or = matches!(
+        unwrap_parens(expr)?,
+        ast::Expr::Binary(_, ast::Operator::And | ast::Operator::Or, _)
+    );
+    let Some(referenced_tables) = referenced_tables.filter(|_| is_and_or) else {
+        return Ok(false);
+    };
+    let mut emit_leaf = |program: &mut ProgramBuilder, leaf: &ast::Expr| -> Result<usize> {
+        let reg = program.alloc_register();
+        translate_expr(program, Some(referenced_tables), leaf, reg, resolver)?;
+        Ok(reg)
+    };
+    emit_jump_to_skip_unless_true(program, expr, jump_target_when_false, &mut emit_leaf)?;
+    Ok(true)
+}
+
+/// Emits a leaf condition into a register and returns it. Used by
+/// [emit_short_circuit_jump] so a schema condition (CHECK, trigger WHEN,
+/// partial index WHERE) keeps evaluating its leaves the way it already did.
+pub type LeafEmitter<'a> = dyn FnMut(&mut ProgramBuilder, &ast::Expr) -> Result<usize> + 'a;
+
+/// A trigger `WHEN` clause or a partial index `WHERE` fires or indexes a row
+/// only when it is true, so SQLite skips it on false and NULL
+/// (sqlite3ExprIfFalse with JUMPIFNULL). Jumps to `skip_label` then,
+/// short-circuiting an AND or OR so a skipped operand never runs. `emit_leaf`
+/// evaluates a leaf into a register.
+pub fn emit_jump_to_skip_unless_true(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    skip_label: BranchOffset,
+    emit_leaf: &mut LeafEmitter<'_>,
+) -> Result<()> {
+    emit_short_circuit_jump(program, expr, skip_label, false, true, emit_leaf)
+}
+
+/// A CHECK constraint passes when its expression is true or NULL, and fails
+/// only when it is false (sqlite3ExprIfTrue to the all-ok label, with
+/// JUMPIFNULL). Jumps to `passed_label` on true and NULL, short-circuiting an
+/// AND or OR so a decided-away operand never runs, and falls through to the
+/// caller's failure handling on false.
+pub fn emit_jump_when_check_passes(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    passed_label: BranchOffset,
+    emit_leaf: &mut LeafEmitter<'_>,
+) -> Result<()> {
+    emit_short_circuit_jump(program, expr, passed_label, true, true, emit_leaf)
+}
+
+/// Jumps to `dest` when `expr` is true (if `jump_on_true`) or false (if not),
+/// and also when it is NULL if `jump_if_null`, short-circuiting AND and OR as
+/// SQLite's sqlite3ExprIfTrue/IfFalse do. A leaf is evaluated by `emit_leaf`
+/// and tested, so its truth and NULL semantics are unchanged. The
+/// short-circuit branch of the opposite operator flips JUMPIFNULL so NULL
+/// still reaches the other operand, as SQLite does.
+fn emit_short_circuit_jump(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    dest: BranchOffset,
+    jump_on_true: bool,
+    jump_if_null: bool,
+    emit_leaf: &mut LeafEmitter<'_>,
+) -> Result<()> {
+    let both_decide_here = if jump_on_true {
+        ast::Operator::Or
+    } else {
+        ast::Operator::And
+    };
+    match unwrap_parens(expr)? {
+        ast::Expr::Binary(lhs, op, rhs)
+            if matches!(op, ast::Operator::And | ast::Operator::Or) && *op == both_decide_here =>
+        {
+            // Both operands jump to the same place: `a OR b` to the true
+            // target, `a AND b` to the false target.
+            emit_short_circuit_jump(program, lhs, dest, jump_on_true, jump_if_null, emit_leaf)?;
+            emit_short_circuit_jump(program, rhs, dest, jump_on_true, jump_if_null, emit_leaf)
+        }
+        ast::Expr::Binary(lhs, ast::Operator::And | ast::Operator::Or, rhs) => {
+            // The other operator: if the first operand already decides the
+            // opposite outcome, skip past the second.
+            let past = program.allocate_label();
+            emit_short_circuit_jump(program, lhs, past, !jump_on_true, !jump_if_null, emit_leaf)?;
+            emit_short_circuit_jump(program, rhs, dest, jump_on_true, jump_if_null, emit_leaf)?;
+            program.preassign_label_to_next_insn(past);
+            Ok(())
+        }
+        ast::Expr::Unary(ast::UnaryOperator::Not, inner) => {
+            emit_short_circuit_jump(program, inner, dest, !jump_on_true, jump_if_null, emit_leaf)
+        }
+        leaf => {
+            let reg = emit_leaf(program, leaf)?;
+            if jump_on_true {
+                program.emit_insn(Insn::If {
+                    reg,
+                    target_pc: dest,
+                    jump_if_null,
+                });
+            } else {
+                program.emit_insn(Insn::IfNot {
+                    reg,
+                    target_pc: dest,
+                    jump_if_null,
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
 #[instrument(skip(program, referenced_tables, expr, resolver), level = Level::DEBUG)]
 pub fn translate_condition_expr(
     program: &mut ProgramBuilder,
@@ -294,6 +420,20 @@ pub fn translate_condition_expr(
         program.release_registers(index_value_reg, 1);
     }
     match expr {
+        // `x AND 0` and `x OR 1` are decided without running `x`; see
+        // translate_binary_expr for the expressions that reach this unbound
+        // and for why one with an aggregate or an unknown column name takes
+        // the normal path.
+        ast::Expr::Binary(_, ast::Operator::And | ast::Operator::Or, _)
+            if and_or_truth_value(expr).is_some()
+                && !expr_contains_aggregate_or_window_function(expr, resolver)?
+                && every_column_name_has_a_register(expr, resolver) =>
+        {
+            let reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
+            emit_cond_jump(program, condition_metadata, reg);
+            Ok(())
+        }
         ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
             // In a binary AND, never jump to the parent 'jump_target_when_true' label on the first condition, because
             // the second condition MUST also be true. Instead we instruct the child expression to jump to a local
@@ -401,8 +541,12 @@ fn translate_leaf_condition_expr(
                 "Register in WHERE clause is currently unused. Consider removing Resolver::expr_to_reg_cache and using Expr::Register instead"
             );
         }
+        // A collation changes nothing about whether a value is true, so the
+        // value is evaluated and tested, as SQLite does.
         ast::Expr::Collate(_, _) => {
-            crate::bail_parse_error!("Collate in WHERE clause is not supported");
+            let reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
+            emit_cond_jump(program, condition_metadata, reg);
         }
         ast::Expr::DoublyQualified(_, _, _) | ast::Expr::Id(_) | ast::Expr::Qualified(_, _) => {
             crate::bail_parse_error!(

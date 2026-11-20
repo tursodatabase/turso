@@ -1053,11 +1053,15 @@ expect {
     2024-01-01
 }
 
+# A false WHERE term is never compiled, but its operands are still bound
+# and checked. `FALSE AND x` keeps x until then; `0 AND x` is replaced by 0
+# before any name is resolved, as SQLite's parser does.
+
 test dot-chain-struct-in-struct-rejects-operator-missing-for-field-type {
     CREATE TYPE inner_s AS STRUCT(d date);
     CREATE TYPE outer_s AS STRUCT(sub inner_s);
     CREATE TABLE t(data outer_s) STRICT;
-    SELECT count(*) FROM t WHERE 0 AND data.sub.d * 2 = 1;
+    SELECT count(*) FROM t WHERE FALSE AND data.sub.d * 2 = 1;
 }
 expect error {
     operator does not exist: date \* integer
@@ -1066,7 +1070,7 @@ expect error {
 test dot-access-rejects-missing-field-in-false-where-term {
     CREATE TYPE inner_s AS STRUCT(a INT);
     CREATE TABLE t(data inner_s) STRICT;
-    SELECT count(*) FROM t WHERE 0 AND data.nope = 1;
+    SELECT count(*) FROM t WHERE FALSE AND data.nope = 1;
 }
 expect error {
     no such field 'nope' in struct type 'inner_s'
