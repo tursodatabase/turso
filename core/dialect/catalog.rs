@@ -197,6 +197,23 @@ pub enum TableText<'a> {
     FromSelect(&'a str),
 }
 
+/// An object that depends on a relation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dependent {
+    pub object: DependentObject,
+    /// The namespace and name of the relation that `object` depends on.
+    pub depends_on: (NamespaceId, String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependentObject {
+    /// A view that reads the relation.
+    View {
+        namespace: NamespaceId,
+        name: String,
+    },
+}
+
 /// An index of a PRIMARY KEY or UNIQUE constraint, with the register that
 /// holds its root page.
 #[derive(Debug, Clone)]

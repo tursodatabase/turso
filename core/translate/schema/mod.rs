@@ -2028,6 +2028,12 @@ pub fn translate_drop_table(
         );
     };
     validate_drop_table(&resolver.catalog, namespace, name, connection)?;
+    let mut dependents = crate::translate::view::dependents_blocking_drop(
+        resolver,
+        connection,
+        namespace,
+        &normalize_ident(name),
+    );
     let owned_sequences = if table.btree().is_some() && namespace.database_id == MAIN_DB_ID {
         resolver.catalog.dialect.owned_sequences(
             resolver.schema(),
@@ -2045,10 +2051,23 @@ pub fn translate_drop_table(
         &owned_sequences,
         DroppedWithSequences::Table(&normalize_ident(name)),
     )? {
-        bail_parse_error!(
-            "cannot drop table {} because other objects depend on it: {usage}",
-            normalize_ident(name)
-        );
+        dependents.push(usage);
+    }
+    if !dependents.is_empty() {
+        return Err(LimboError::dependent_objects(
+            format!(
+                "table {}",
+                resolver.with_schema(database_id, |schema| {
+                    connection.dialect().relation_name_in_messages(
+                        connection,
+                        schema,
+                        namespace.id,
+                        &normalize_ident(name),
+                    )
+                })
+            ),
+            dependents,
+        ));
     }
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)

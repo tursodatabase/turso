@@ -1168,6 +1168,7 @@ where
     ];
     for (tag, value) in [
         (b'D', &error.detail),
+        (b'H', &error.hint),
         (b't', &error.table_name),
         (b'c', &error.column_name),
         (b'n', &error.constraint_name),

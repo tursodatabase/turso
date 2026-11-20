@@ -1207,3 +1207,135 @@ test foreign-key-period {
 expect error {
     PERIOD in a key is not supported
 }
+
+test drop-table-refuses-when-a-view-reads-it {
+    CREATE TABLE dv_t (id int, a int);
+    CREATE VIEW dv_v AS SELECT a FROM dv_t;
+    DROP TABLE dv_t;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop table dv_t because other objects depend on it
+}
+
+test drop-table-refuses-when-a-view-reads-it-in-a-subquery {
+    CREATE TABLE dv_sub_t (a int);
+    CREATE TABLE dv_sub_other (a int);
+    CREATE VIEW dv_sub_v AS
+        SELECT a FROM dv_sub_other WHERE EXISTS (SELECT 1 FROM dv_sub_t);
+    DROP TABLE dv_sub_t;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop table dv_sub_t because other objects depend on it
+}
+
+test drop-table-refuses-when-a-view-reads-it-in-order-by {
+    CREATE TABLE dv_order_t (a int);
+    CREATE TABLE dv_order_other (a int);
+    CREATE VIEW dv_order_v AS
+        SELECT a FROM dv_order_other ORDER BY (SELECT max(a) FROM dv_order_t);
+    DROP TABLE dv_order_t;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop table dv_order_t because other objects depend on it
+}
+
+test drop-table-refuses-when-a-view-reads-it-in-limit {
+    CREATE TABLE dv_limit_t (a int);
+    CREATE TABLE dv_limit_other (a int);
+    CREATE VIEW dv_limit_v AS
+        SELECT a FROM dv_limit_other LIMIT (SELECT count(*) FROM dv_limit_t);
+    DROP TABLE dv_limit_t;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop table dv_limit_t because other objects depend on it
+}
+
+test drop-table-refuses-when-a-view-reads-it-in-values {
+    CREATE TABLE dv_values_t (a int);
+    CREATE VIEW dv_values_v AS VALUES ((SELECT max(a) FROM dv_values_t));
+    DROP TABLE dv_values_t;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop table dv_values_t because other objects depend on it
+}
+
+test drop-table-refuses-when-a-view-of-another-schema-reads-it {
+    CREATE SCHEMA IF NOT EXISTS dv_other;
+    DROP VIEW IF EXISTS dv_other.v;
+    CREATE TABLE dv_cross_t (a int);
+    CREATE VIEW dv_other.v AS SELECT a FROM public.dv_cross_t;
+    DROP TABLE dv_cross_t;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop table dv_cross_t because other objects depend on it
+}
+
+test drop-table-ignores-a-view-that-reads-a-table-of-the-same-name-in-another-schema {
+    CREATE SCHEMA IF NOT EXISTS dv_same;
+    DROP VIEW IF EXISTS dv_same.v;
+    DROP TABLE IF EXISTS dv_same.t;
+    CREATE TABLE dv_same.t (a int);
+    CREATE TABLE dv_same_name (a int);
+    ALTER TABLE dv_same_name RENAME TO t;
+    CREATE VIEW dv_same.v AS SELECT a FROM dv_same.t;
+    DROP TABLE public.t;
+    INSERT INTO dv_same.t VALUES (7);
+    SELECT a FROM dv_same.v;
+}
+expect {
+    7
+}
+
+test drop-table-ignores-a-view-that-reads-a-cte-of-the-same-name {
+    CREATE TABLE dv_cte (a int);
+    CREATE VIEW dv_cte_v AS WITH dv_cte AS (SELECT 5 AS a) SELECT a FROM dv_cte;
+    DROP TABLE dv_cte;
+    SELECT a FROM dv_cte_v;
+}
+expect {
+    5
+}
+
+test drop-table-works-once-the-view-is-dropped {
+    CREATE TABLE dv_gone_t (a int);
+    CREATE VIEW dv_gone_v AS SELECT a FROM dv_gone_t;
+    DROP VIEW dv_gone_v;
+    DROP TABLE dv_gone_t;
+    CREATE TABLE dv_gone_t (b text);
+    INSERT INTO dv_gone_t VALUES ('again');
+    SELECT b FROM dv_gone_t;
+}
+expect {
+    again
+}
+
+test drop-view-refuses-when-a-view-reads-it {
+    CREATE TABLE dv_base (a int);
+    CREATE VIEW dv_inner AS SELECT a FROM dv_base;
+    CREATE VIEW dv_outer AS SELECT a FROM dv_inner;
+    DROP VIEW dv_inner;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop view dv_inner because other objects depend on it
+}
+
+test drop-schema-cascade-drops-views-that-read-each-other {
+    CREATE SCHEMA IF NOT EXISTS dv_cascade;
+    DROP SCHEMA dv_cascade CASCADE;
+    CREATE SCHEMA dv_cascade;
+    CREATE TABLE dv_cascade.t (a int);
+    CREATE VIEW dv_cascade.a AS SELECT a FROM dv_cascade.t;
+    CREATE VIEW dv_cascade.b AS SELECT a FROM dv_cascade.a;
+    DROP SCHEMA dv_cascade CASCADE;
+    SELECT count(*) FROM pg_namespace WHERE nspname = 'dv_cascade';
+}
+expect {
+    0
+}

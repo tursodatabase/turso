@@ -345,6 +345,49 @@ fn drop_sequence_of_a_serial_column_is_refused() {
 }
 
 #[test]
+fn refused_drop_names_the_view_that_reads_the_relation() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE base (a int)").unwrap();
+    conn.execute("INSERT INTO base VALUES (7)").unwrap();
+    conn.execute("CREATE VIEW reader AS SELECT a FROM base")
+        .unwrap();
+    conn.execute("CREATE SCHEMA other").unwrap();
+    conn.execute("CREATE VIEW other.reader_of_reader AS SELECT a FROM public.reader")
+        .unwrap();
+
+    let error = conn.execute("DROP TABLE base").unwrap_err();
+    assert_eq!(
+        error.message,
+        "cannot drop table base because other objects depend on it"
+    );
+    assert_eq!(
+        error.detail.as_deref(),
+        Some(
+            "view reader depends on table base\n\
+             view other.reader_of_reader depends on view reader"
+        )
+    );
+    let error = conn.execute("DROP VIEW reader").unwrap_err();
+    assert_eq!(
+        error.message,
+        "cannot drop view reader because other objects depend on it"
+    );
+    assert_eq!(
+        error.detail.as_deref(),
+        Some("view other.reader_of_reader depends on view reader")
+    );
+
+    let rows = conn
+        .query("SELECT a FROM other.reader_of_reader")
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows[0][0].to_string(), "7");
+}
+
+#[test]
 fn refused_drop_leaves_the_sequence_and_the_other_default_working() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();

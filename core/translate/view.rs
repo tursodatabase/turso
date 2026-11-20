@@ -1,9 +1,12 @@
-use crate::dialect::{CatalogCmd, CmdContext, CreateMaterializedView, CreateView, DropView};
+use crate::dialect::{
+    CatalogCmd, CmdContext, CreateMaterializedView, CreateView, Dependent, DependentObject,
+    DropView,
+};
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::alter_table::qualify_select_table_refs;
 use crate::schema::view::{extract_view_columns, referenced_tables};
-use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType};
+use crate::schema::{BTreeCharacteristics, BTreeTable, Schema, SchemaObjectType};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
@@ -510,6 +513,30 @@ pub fn translate_drop_view(
         }
     }
 
+    if is_materialized_view || is_regular_view {
+        let kind = if is_materialized_view {
+            "materialized view"
+        } else {
+            "view"
+        };
+        let dependents =
+            dependents_blocking_drop(resolver, connection, namespace, &normalized_view_name);
+        if !dependents.is_empty() {
+            let shown_name = resolver.with_schema(database_id, |schema| {
+                connection.dialect().relation_name_in_messages(
+                    connection,
+                    schema,
+                    namespace.id,
+                    &normalized_view_name,
+                )
+            });
+            return Err(crate::LimboError::dependent_objects(
+                format!("{kind} {shown_name}"),
+                dependents,
+            ));
+        }
+    }
+
     // If this is a materialized view, we need to destroy its btree as well
     // and also clean up its internal tables (aggregate state, MIN/MAX
     // multiset) — those that exist for its shape.
@@ -741,6 +768,62 @@ pub fn translate_drop_view(
 
     program.epilogue(resolver.schema());
     Ok(())
+}
+
+/// A description of each object that depends on the table or view `name` of
+/// `namespace`, directly or through other objects, nearest first. `name` is
+/// normalized.
+pub(crate) fn dependents_blocking_drop(
+    resolver: &Resolver,
+    connection: &Connection,
+    namespace: NamespaceRef,
+    name: &str,
+) -> Vec<String> {
+    if namespace.database_id != crate::MAIN_DB_ID {
+        return Vec::new();
+    }
+    let namespace_being_dropped = connection.namespace_being_dropped();
+    resolver.with_schema(namespace.database_id, |schema| {
+        resolver
+            .catalog
+            .dialect
+            .relation_dependents(schema, namespace.id, name)
+            .iter()
+            .rev()
+            .filter(|dependent| match &dependent.object {
+                DependentObject::View { namespace, .. } => {
+                    Some(*namespace) != namespace_being_dropped
+                }
+            })
+            .map(|dependent| describe_dependent(connection, schema, dependent))
+            .collect()
+    })
+}
+
+/// A dependent object as PostgreSQL describes it, such as
+/// `view v depends on table t`.
+pub(crate) fn describe_dependent(
+    connection: &Connection,
+    schema: &Schema,
+    dependent: &Dependent,
+) -> String {
+    let (depends_on_namespace, depends_on) = &dependent.depends_on;
+    let depends_on_kind = if schema.get_view(*depends_on_namespace, depends_on).is_some() {
+        "view"
+    } else if schema.is_materialized_view(*depends_on_namespace, depends_on) {
+        "materialized view"
+    } else {
+        "table"
+    };
+    let dialect = connection.dialect();
+    let depends_on =
+        dialect.relation_name_in_messages(connection, schema, *depends_on_namespace, depends_on);
+    match &dependent.object {
+        DependentObject::View { namespace, name } => format!(
+            "view {} depends on {depends_on_kind} {depends_on}",
+            dialect.relation_name_in_messages(connection, schema, *namespace, name)
+        ),
+    }
 }
 
 /// Writes, in front of each table that the body of a new view names without

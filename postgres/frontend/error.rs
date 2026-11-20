@@ -95,6 +95,7 @@ pub struct ErrorReport {
     pub sqlstate: &'static str,
     pub message: String,
     pub detail: Option<String>,
+    pub hint: Option<String>,
     pub table_name: Option<String>,
     pub constraint_name: Option<String>,
     pub column_name: Option<String>,
@@ -106,6 +107,7 @@ impl From<&LimboError> for ErrorReport {
             sqlstate: sqlstate(error),
             message: error.to_string(),
             detail: None,
+            hint: None,
             table_name: None,
             constraint_name: None,
             column_name: None,
@@ -123,6 +125,14 @@ impl From<&LimboError> for ErrorReport {
                 report.message = constraint_message(violation, &report);
                 report.detail = constraint_detail(violation);
             }
+        }
+        if let LimboError::DependentObjects(refusal) = error {
+            report.message = format!(
+                "cannot drop {} because other objects depend on it",
+                refusal.dropped
+            );
+            report.detail = Some(refusal.dependents.join("\n"));
+            report.hint = Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
         }
         if let LimboError::PermissionDenied(denial) = error {
             report.message = permission_denied_message(denial);
@@ -296,6 +306,7 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::Corrupt(_) | LimboError::NotADB => SQLSTATE_DATA_CORRUPTED,
         LimboError::Dialect(error) => error.code,
         LimboError::PermissionDenied(_) => SQLSTATE_INSUFFICIENT_PRIVILEGE,
+        LimboError::DependentObjects(_) => SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
         _ => SQLSTATE_INTERNAL_ERROR,
     }
 }

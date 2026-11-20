@@ -71,6 +71,16 @@ pub struct DialectError {
     pub detail: Option<String>,
 }
 
+/// A DROP that was refused because other objects depend on what it drops.
+#[derive(Debug, Clone)]
+pub struct DependentObjects {
+    /// What the statement drops, such as `table t` or `column c of table t`.
+    pub dropped: String,
+    /// One description of each dependent object, such as
+    /// `view v depends on table t`.
+    pub dependents: Vec<String>,
+}
+
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
 pub enum LimboError {
     #[error("Corrupt database: {0}")]
@@ -220,6 +230,17 @@ pub enum LimboError {
     /// functions. Boxed, so that it does not make every `LimboError` larger.
     #[error("{}", .0.message)]
     Dialect(Box<DialectError>),
+    #[error("cannot drop {} because other objects depend on it: {}", .0.dropped, .0.dependents.join(", "))]
+    DependentObjects(Box<DependentObjects>),
+}
+
+impl LimboError {
+    pub fn dependent_objects(dropped: String, dependents: Vec<String>) -> Self {
+        Self::DependentObjects(Box::new(DependentObjects {
+            dropped,
+            dependents,
+        }))
+    }
 }
 
 /// `?` in functions returning boxed errors (see `InsnResult`) composes

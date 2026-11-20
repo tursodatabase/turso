@@ -786,3 +786,32 @@ test view-cte-is-not-bound-to-a-table-of-the-search-path {
 expect {
     2
 }
+
+test drop-table-refuses-when-a-view-found-it-through-the-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_vd;
+    DROP VIEW IF EXISTS public.sp_vd_v;
+    DROP TABLE IF EXISTS sp_vd.t;
+    CREATE TABLE sp_vd.t (x int);
+    SET search_path TO sp_vd, public;
+    CREATE VIEW public.sp_vd_v AS SELECT x FROM t;
+    SET search_path TO public;
+    DROP TABLE sp_vd.t;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop table sp_vd.t because other objects depend on it
+}
+
+test drop-table-refuses-when-a-view-reads-it-by-schema-next-to-a-cte-of-its-name {
+    DROP VIEW IF EXISTS sp_vq_v;
+    DROP TABLE IF EXISTS sp_vq;
+    CREATE TABLE sp_vq (x int);
+    CREATE VIEW sp_vq_v AS
+        WITH sp_vq AS (SELECT 9 AS x)
+        SELECT x FROM sp_vq UNION ALL SELECT x FROM public.sp_vq;
+    DROP TABLE sp_vq;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop table sp_vq because other objects depend on it
+}

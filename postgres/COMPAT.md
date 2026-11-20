@@ -69,6 +69,7 @@ Basics not enumerated by the official feature matrix.
 | CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced; array base types, type modifiers and non-binary COLLATE rejected |
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
 | DROP TABLE / DROP COLUMN / DROP SEQUENCE and sequences | 🟡 Partial | DROP TABLE drops the sequences the table owns and DROP COLUMN drops the sequences the column owns (a serial column, or `ALTER SEQUENCE ... OWNED BY table.column`); each of them, and DROP SEQUENCE, is refused with 2BP01 when a column default, CHECK constraint, view, trigger or policy that is not dropped with it still calls the sequence. DROP SCHEMA ... CASCADE is rejected when an object of another schema uses a sequence of the schema, where PostgreSQL drops that object |
+| DROP TABLE / DROP VIEW of a relation that a view reads | 🟡 Partial | Refused with 2BP01, as PostgreSQL does without CASCADE, with the views that read the relation, directly or through other views, in DETAIL, and PostgreSQL's HINT; CASCADE rejected. DROP SCHEMA ... CASCADE drops the views of the schema with it, and is rejected when a view of another schema reads a relation of the schema. A table that a foreign key of another table references is still dropped, where PostgreSQL refuses, because foreign keys are not enforced |
 | TRUNCATE | 🟡 Partial | Lowered to DELETE of one table; several tables, CASCADE and RESTART IDENTITY rejected |
 | BEGIN / COMMIT / ROLLBACK | ✅ Supported | Every transaction is snapshot isolation, i.e. REPEATABLE READ; `ISOLATION LEVEL REPEATABLE READ` is accepted, every other level, DEFERRABLE and AND CHAIN are rejected. READ ONLY and READ WRITE are enforced, on BEGIN and on SET TRANSACTION; switching a READ ONLY transaction to READ WRITE after its first query is rejected with SQLSTATE 25001 like PostgreSQL. A statement error aborts the transaction but keeps its savepoints, so ROLLBACK TO recovers it; a failed COMMIT rolls the transaction back and returns the connection to idle |
 | LOCK TABLE | 🟡 Partial | ACCESS SHARE without NOWAIT is accepted as a no-op inside a transaction for pg_dump compatibility; table names are not checked, no locks are acquired, and no read snapshot is started; other modes are rejected |
@@ -100,7 +101,8 @@ for PUBLIC. These are catalog defaults; role management is not implemented.
 `pg_depend` has the rows of each view's `_RETURN` rule: the rule is part of
 the view, and depends on each table and view that the view reads, as whole
 relations and not column by column. The rule is not in `pg_rewrite` and the
-view is not in `pg_class`.
+view is not in `pg_class`. DROP reads these rows to find the views that depend
+on what it drops.
 `pg_statistic_ext` exposes the hidden system column
 `tableoid` for pg_dump discovery. `pg_trigger` exposes `tgparentid` for
 parent-trigger lookup and hidden `tableoid` during dump discovery.

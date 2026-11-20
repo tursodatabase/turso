@@ -21,6 +21,7 @@ use turso_core::{
     text_array_literal, walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError,
     NamespaceId, NamespaceRef, OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
 };
+use turso_core::{Dependent, DependentObject};
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{self, RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
@@ -255,6 +256,25 @@ impl Dialect for PostgresDialect {
 
     fn binds_names_at_create(&self) -> bool {
         true
+    }
+
+    fn relation_name_in_messages(
+        &self,
+        connection: &Connection,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> String {
+        relation_name(connection, schema, namespace, name)
+    }
+
+    fn relation_dependents(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Vec<Dependent> {
+        relation_dependents(schema, namespace, name)
     }
 
     fn supports_namespaces(&self) -> bool {
@@ -3568,6 +3588,76 @@ fn view_rule_dependencies(schema: &Schema) -> Vec<Dependency> {
         }
     }
     dependencies
+}
+
+/// The views that depend on the table or view `name` of `namespace` in
+/// pg_depend, directly or through other views, each before the relations it
+/// reads.
+pub(crate) fn relation_dependents(
+    schema: &Schema,
+    namespace: NamespaceId,
+    name: &str,
+) -> Vec<Dependent> {
+    fn visit(
+        relation_oid: i64,
+        dependencies: &[Dependency],
+        classes: &crate::classes::ClassCatalog,
+        seen: &mut HashSet<i64>,
+        dependents: &mut Vec<Dependent>,
+    ) {
+        let Some(relation) = classes.get_by_oid(relation_oid) else {
+            return;
+        };
+        let rules_that_read = dependencies.iter().filter(|dependency| {
+            dependency.kind == DependencyKind::Normal
+                && dependency.referenced == ObjectAddress::whole::<PgClassTable>(relation_oid)
+                && dependency.dependent.catalog_oid == PG_REWRITE_OID
+        });
+        let mut view_oids: Vec<i64> = rules_that_read
+            .filter_map(|read| {
+                dependencies.iter().find(|dependency| {
+                    dependency.kind == DependencyKind::Internal
+                        && dependency.dependent == read.dependent
+                })
+            })
+            .map(|rule_of_view| rule_of_view.referenced.object_oid)
+            .collect();
+        view_oids.sort_unstable();
+        for view_oid in view_oids {
+            let Some(view) = classes.get_by_oid(view_oid) else {
+                continue;
+            };
+            if !seen.insert(view_oid) {
+                continue;
+            }
+            visit(view_oid, dependencies, classes, seen, dependents);
+            dependents.push(Dependent {
+                object: DependentObject::View {
+                    namespace: view.relnamespace,
+                    name: view.relname.clone(),
+                },
+                depends_on: (relation.relnamespace, relation.relname.clone()),
+            });
+        }
+    }
+
+    let Some(classes) = crate::classes::class_catalog(schema) else {
+        return Vec::new();
+    };
+    let Some(relation) = classes.get_by_name(namespace, name) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::default();
+    seen.insert(relation.oid);
+    let mut dependents = Vec::new();
+    visit(
+        relation.oid,
+        &view_rule_dependencies(schema),
+        classes,
+        &mut seen,
+        &mut dependents,
+    );
+    dependents
 }
 
 /// Fixed PostgreSQL OID of pg_rewrite, which has the rewrite rules of views.

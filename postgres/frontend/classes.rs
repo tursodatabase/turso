@@ -211,6 +211,10 @@ impl ClassCatalog {
         self.by_oid.values()
     }
 
+    pub(crate) fn get_by_oid(&self, oid: i64) -> Option<&RelationClass> {
+        self.by_oid.get(&oid)
+    }
+
     pub(crate) fn get_by_name(&self, namespace: NamespaceId, name: &str) -> Option<&RelationClass> {
         self.oids_by_name
             .get(&(namespace, name.to_string()))
