@@ -310,6 +310,43 @@ pub fn curry_convert_dbtype_to_jsonb(
     move |val| convert_dbtype_to_jsonb(val, strict)
 }
 
+/// Returns [convert_ref_dbtype_into_jsonb] for `strict`, for
+/// [JsonCacheCell::with_jsonb].
+pub fn curry_convert_dbtype_into_jsonb(
+    strict: Conv,
+) -> impl FnOnce(ValueRef, &mut Jsonb) -> crate::Result<()> {
+    move |val, json| convert_ref_dbtype_into_jsonb(val, strict, json)
+}
+
+/// Writes the document that [convert_ref_dbtype_to_jsonb] makes for `val`
+/// into `json`. JSON text is parsed, and a JSONB blob is copied, into the
+/// buffer of `json`, so a conversion into the buffer of an old document does
+/// not allocate when the buffer is large enough. After an error, `json` can be
+/// incomplete.
+fn convert_ref_dbtype_into_jsonb(
+    val: ValueRef<'_>,
+    strict: Conv,
+    json: &mut Jsonb,
+) -> crate::Result<()> {
+    match val {
+        ValueRef::Text(text)
+            if !matches!(strict, Conv::ToString)
+                && (text.subtype == TextSubtype::Json || matches!(strict, Conv::Strict)) =>
+        {
+            // Like SQLite, text parsed as a JSON document stops at the first
+            // NUL.
+            json.parse_text(sqlite_text_prefix(text.as_str()))
+                .map_err(malformed_json_error)?;
+        }
+        ValueRef::Blob(blob) if is_jsonb_blob(blob) => {
+            json.set_data(blob)?;
+            json.element_type()?;
+        }
+        _ => *json = convert_ref_dbtype_to_jsonb(val, strict)?,
+    }
+    Ok(())
+}
+
 pub fn json_array<I, E, V>(values: I) -> crate::Result<Value>
 where
     V: AsValueRef,
@@ -358,7 +395,7 @@ pub fn json_array_length(
     }
 
     let Some(path) = path else {
-        let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
+        let make_jsonb_fn = curry_convert_dbtype_into_jsonb(Conv::Strict);
         return json_cache.with_jsonb(value, make_jsonb_fn, |json| {
             let len = json.array_len()?;
             Ok(Value::from_i64(len as i64))
@@ -520,7 +557,7 @@ fn read_path_element<R>(
             }
         }
     }
-    let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
+    let make_jsonb_fn = curry_convert_dbtype_into_jsonb(Conv::Strict);
     json_cache.with_jsonb(value, make_jsonb_fn, |json| {
         let Some(path) = cached_json_path(json_cache, path, strict_path)? else {
             return Ok(None);
@@ -674,7 +711,7 @@ where
             }
         }
     }
-    let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
+    let make_jsonb_fn = curry_convert_dbtype_into_jsonb(Conv::Strict);
     json_cache.with_jsonb(value, make_jsonb_fn, |json| {
         let result = extract_array(json.as_bytes(), false, paths, json_cache, container_output)?;
         Ok(result.unwrap_or(Value::Null))

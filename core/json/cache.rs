@@ -44,53 +44,40 @@ impl JsonCache {
         oldest_idx
     }
 
-    pub fn insert(
-        &mut self,
-        key: impl AsValueRef,
-        value: &Jsonb,
-    ) -> std::result::Result<(), TryReserveError> {
-        let key = key.as_value_ref();
-        let id = self.new_entry_slot();
-        let entry = &mut self.entries[id];
-        match entry {
-            // The entry that the new entry evicts, or an entry from before a
-            // clear. Its buffers usually have the capacity for the new entry,
-            // so a cache miss does not allocate.
-            Some((stored_key, stored_value)) => {
-                if let Err(err) = stored_value
-                    .copy_from(value)
-                    .and_then(|()| copy_key(stored_key, key))
-                {
-                    // Half of a new entry must not match a lookup.
-                    *entry = None;
-                    return Err(err);
-                }
-            }
-            None => *entry = Some((key.to_owned()?, value.try_clone()?)),
-        }
-        self.add_entry(id);
+    #[cfg(test)]
+    pub fn insert(&mut self, key: impl AsValueRef, value: &Jsonb) -> crate::Result<()> {
+        self.insert_with(key.as_value_ref(), |_, json| Ok(json.copy_from(value)?))?;
         Ok(())
     }
 
-    /// Like [Self::insert], but the cache takes `value`, and the document of
-    /// the evicted entry is dropped. Returns the slot of the new entry.
-    fn insert_owned(
+    /// Makes a new entry for `key` with the document that `convert` writes,
+    /// and returns the slot of the entry.
+    fn insert_with(
         &mut self,
         key: ValueRef,
-        value: Jsonb,
-    ) -> std::result::Result<usize, TryReserveError> {
+        convert: impl FnOnce(ValueRef, &mut Jsonb) -> crate::Result<()>,
+    ) -> crate::Result<usize> {
         let id = self.new_entry_slot();
         let entry = &mut self.entries[id];
-        match entry {
-            Some((stored_key, stored_value)) => {
-                *stored_value = value;
-                if let Err(err) = copy_key(stored_key, key) {
-                    // Half of a new entry must not match a lookup.
-                    *entry = None;
-                    return Err(err);
-                }
+        let result = match entry {
+            // The entry that the new entry evicts, or an entry from before a
+            // clear. Its buffers usually have the capacity for the new entry,
+            // so a cache miss does not allocate.
+            Some((stored_key, stored_value)) => convert(key, stored_value)
+                .and_then(|()| copy_key(stored_key, key).map_err(Into::into)),
+            None => {
+                let mut json = Jsonb::empty();
+                convert(key, &mut json).and_then(|()| {
+                    *entry = Some((key.to_owned()?, json));
+                    Ok(())
+                })
             }
-            None => *entry = Some((key.to_owned()?, value)),
+        };
+        if let Err(err) = result {
+            // After an error, the document can be incomplete, and half of a
+            // new entry must not match a lookup.
+            *entry = None;
+            return Err(err);
         }
         self.add_entry(id);
         Ok(id)
@@ -116,6 +103,7 @@ impl JsonCache {
         self.counter += 1;
     }
 
+    #[cfg(test)]
     pub fn lookup(
         &mut self,
         key: impl AsValueRef,
@@ -142,11 +130,11 @@ impl JsonCache {
     }
 
     /// The document of the entry in `id`, a slot that [Self::find] or
-    /// [Self::insert_owned] returned.
+    /// [Self::insert_with] returned.
     fn entry(&self, id: usize) -> &Jsonb {
         let (_, json) = self.entries[id]
             .as_ref()
-            .expect("a slot from find or insert_owned holds an entry");
+            .expect("a slot from find or insert_with holds an entry");
         json
     }
 
@@ -330,27 +318,36 @@ impl JsonCacheCell {
     }
 
     /// Calls `read` with the document for `key`: the document in the cache, or
-    /// the document that `value` makes for `key`, which then enters the cache.
-    /// The document is not copied, so this is for a caller that only reads it.
+    /// the document that `convert` writes for `key`, which then enters the
+    /// cache. `convert` writes into the buffer of an old entry when the cache
+    /// has one. The document is not copied, so this is for a caller that only
+    /// reads it.
     #[inline]
     pub fn with_jsonb<R>(
         &self,
         key: impl AsValueRef,
-        value: impl FnOnce(ValueRef) -> crate::Result<Jsonb>,
+        convert: impl FnOnce(ValueRef, &mut Jsonb) -> crate::Result<()>,
         read: impl FnOnce(&Jsonb) -> crate::Result<R>,
     ) -> crate::Result<R> {
         let key = key.as_value_ref();
         let _guard = self.access_guard();
         // SAFETY: the access guard makes a second access to the cache panic
-        // while this reference lives, also from `value` or `read`.
+        // while this reference lives, also from `convert` or `read`.
         let cache = unsafe { (*self.inner.get()).get_or_insert_with(JsonCache::new) };
         let id = match cache.find(key) {
             Some(id) => id,
-            None => cache.insert_owned(key, value(key)?)?,
+            None => cache.insert_with(key, convert)?,
         };
         read(cache.entry(id))
     }
 
+    /// Returns the document for `key`, for a caller that changes it: a copy of
+    /// the document in the cache, or the document that `value` makes for
+    /// `key`, a copy of which then enters the cache.
+    ///
+    /// On a miss, the caller gets the document that `value` makes. The parser
+    /// reserves the length of the JSON text, which is more than the length of
+    /// the JSONB, so an edit of the document usually does not grow the buffer.
     pub fn get_or_insert_with(
         &self,
         key: impl AsValueRef,
@@ -358,29 +355,15 @@ impl JsonCacheCell {
     ) -> crate::Result<Jsonb> {
         let key = key.as_value_ref();
         let _guard = self.access_guard();
-        unsafe {
-            let cache_ptr = self.inner.get();
-            if (*cache_ptr).is_none() {
-                *cache_ptr = Some(JsonCache::new());
-            }
-
-            if let Some(cache) = &mut (*cache_ptr) {
-                if let Some(jsonb) = cache.lookup(key)? {
-                    Ok(jsonb)
-                } else {
-                    let result = value(key);
-                    match result {
-                        Ok(json) => {
-                            cache.insert(key, &json)?;
-                            Ok(json)
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-            } else {
-                value(key)
-            }
+        // SAFETY: the access guard makes a second access to the cache panic
+        // while this reference lives, also from `value`.
+        let cache = unsafe { (*self.inner.get()).get_or_insert_with(JsonCache::new) };
+        if let Some(id) = cache.find(key) {
+            return Ok(cache.entry(id).try_clone()?);
         }
+        let json = value(key)?;
+        cache.insert_with(key, |_, entry| Ok(entry.copy_from(&json)?))?;
+        Ok(json)
     }
 
     pub fn clear(&mut self) {
@@ -401,6 +384,7 @@ impl JsonCacheCell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::json::{curry_convert_dbtype_into_jsonb, Conv};
     use std::str::FromStr;
 
     // Helper function to create test Value and Jsonb from JSON string
@@ -765,7 +749,14 @@ mod tests {
         let cache_cell = JsonCacheCell::new();
         let (key, value) = create_test_pair("{\"test\": \"value\"}");
         let text = cache_cell
-            .with_jsonb(&key, |_| Ok(value.clone()), |json| json.to_string())
+            .with_jsonb(
+                &key,
+                |_, json| {
+                    *json = value.clone();
+                    Ok(())
+                },
+                |json| json.to_string(),
+            )
             .unwrap();
         assert_eq!(text, "{\"test\":\"value\"}");
 
@@ -774,9 +765,10 @@ mod tests {
         let text = cache_cell
             .with_jsonb(
                 &key,
-                |_| {
+                |_, json| {
                     converted.set(true);
-                    Ok(Jsonb::from_str("1").unwrap())
+                    *json = Jsonb::from_str("1").unwrap();
+                    Ok(())
                 },
                 |json| json.to_string(),
             )
@@ -792,12 +784,89 @@ mod tests {
         let (key, _) = create_test_pair("{\"test\": \"value\"}");
         let result = cache_cell.with_jsonb(
             &key,
-            |_| Err(crate::LimboError::ParseError("malformed JSON".to_string())),
+            |_, _| Err(crate::LimboError::ParseError("malformed JSON".to_string())),
             |_| Ok(()),
         );
         assert!(result.is_err());
         assert!(!cache_cell.accessed.get());
         assert!(cache_cell.lookup(&key).is_none());
+    }
+
+    /// Text documents of the same length, which fit in the buffers of each
+    /// other.
+    fn padded_documents(count: usize) -> Vec<Value> {
+        (0..count)
+            .map(|i| Value::build_text(format!("{{\"id\": {i}, \"pad\": \"{}\"}}", "x".repeat(40))))
+            .collect()
+    }
+
+    #[test]
+    fn miss_after_eviction_parses_into_the_evicted_buffer() {
+        let cache_cell = JsonCacheCell::new();
+        let docs = padded_documents(JSON_CACHE_SIZE + 1);
+        for doc in &docs[..JSON_CACHE_SIZE] {
+            cache_cell
+                .with_jsonb(doc, curry_convert_dbtype_into_jsonb(Conv::Strict), |_| {
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        // The last document evicts the first one, and is parsed into its buffer.
+        let evicted_buffer = Cell::new(None);
+        let text = cache_cell
+            .with_jsonb(
+                &docs[JSON_CACHE_SIZE],
+                |key, json| {
+                    evicted_buffer.set(Some(json.as_bytes().as_ptr()));
+                    curry_convert_dbtype_into_jsonb(Conv::Strict)(key, json)
+                },
+                |json| {
+                    assert_eq!(Some(json.as_bytes().as_ptr()), evicted_buffer.get());
+                    json.to_string()
+                },
+            )
+            .unwrap();
+        assert_eq!(text, format!("{{\"id\":4,\"pad\":\"{}\"}}", "x".repeat(40)));
+    }
+
+    #[test]
+    fn failed_parse_after_eviction_leaves_the_cache_usable() {
+        let cache_cell = JsonCacheCell::new();
+        let docs = padded_documents(JSON_CACHE_SIZE + 1);
+        for doc in &docs[..JSON_CACHE_SIZE] {
+            cache_cell
+                .with_jsonb(doc, curry_convert_dbtype_into_jsonb(Conv::Strict), |_| {
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        // The parse into the buffer of the oldest entry fails, so that entry
+        // is gone, and the other entries stay.
+        let malformed = Value::build_text("{\"id\": 5, ");
+        let result = cache_cell.with_jsonb(
+            &malformed,
+            curry_convert_dbtype_into_jsonb(Conv::Strict),
+            |_| Ok(()),
+        );
+        assert!(result.is_err());
+        assert!(cache_cell.lookup(&docs[0]).is_none());
+        assert!(cache_cell.lookup(&malformed).is_none());
+        for doc in &docs[1..JSON_CACHE_SIZE] {
+            assert!(cache_cell.lookup(doc).is_some());
+        }
+
+        // A new document takes the empty slot.
+        let text = cache_cell
+            .with_jsonb(
+                &docs[JSON_CACHE_SIZE],
+                curry_convert_dbtype_into_jsonb(Conv::Strict),
+                |json| json.to_string(),
+            )
+            .unwrap();
+        assert_eq!(text, format!("{{\"id\":4,\"pad\":\"{}\"}}", "x".repeat(40)));
+        assert!(cache_cell.lookup(&docs[JSON_CACHE_SIZE]).is_some());
     }
 
     #[test]

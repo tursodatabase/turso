@@ -2672,12 +2672,32 @@ impl Jsonb {
 
     pub fn from_str_tracking(input: &str) -> PResult<(Self, ParseInfo)> {
         let mut result = Self::new(input.len() + PARSE_CAPACITY_SLACK)?;
-        let input = input.as_bytes();
+        let info = result.parse_reserved(input.as_bytes())?;
+        Ok((result, info))
+    }
+
+    /// Replaces the document with the JSONB of the JSON text `input`, in the
+    /// buffer that the document has already. Thus a parse into the buffer of
+    /// an old document does not allocate when the buffer is large enough.
+    /// After an error, the document is incomplete.
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::JsonbConstruction)]
+    pub fn parse_text(&mut self, input: &str) -> PResult<ParseInfo> {
+        self.data.clear();
+        self.data
+            .try_reserve(input.len() + PARSE_CAPACITY_SLACK)
+            .map_err(TryReserveError::from)?;
+        self.parse_reserved(input.as_bytes())
+    }
+
+    /// Parses the JSON text `input` into the empty document, whose buffer has
+    /// the capacity for the length of `input` and [PARSE_CAPACITY_SLACK].
+    #[inline(always)]
+    fn parse_reserved(&mut self, input: &[u8]) -> PResult<ParseInfo> {
         let mut info = ParseInfo::default();
 
         // Parse the first complete JSON value
         let pos = skip_whitespace_tracking(input, 0, &mut info);
-        let mut pos = result.deserialize_value(input, 0, pos, 0, &mut info)?;
+        let mut pos = self.deserialize_value(input, 0, pos, 0, &mut info)?;
 
         // Skip any trailing whitespace
         pos = skip_whitespace_tracking(input, pos, &mut info);
@@ -2690,7 +2710,7 @@ impl Jsonb {
             });
         }
 
-        Ok((result, info))
+        Ok(info)
     }
 
     pub fn from_str_with_mode(input: &str, mode: Conv) -> PResult<Self> {
@@ -2753,7 +2773,7 @@ impl Jsonb {
 
     /// Replaces the bytes of the document with `bytes`, in the buffer that it
     /// has already. If the buffer cannot grow, the document does not change.
-    fn set_data(&mut self, bytes: &[u8]) -> std::result::Result<(), TryReserveError> {
+    pub(crate) fn set_data(&mut self, bytes: &[u8]) -> std::result::Result<(), TryReserveError> {
         self.data
             .try_reserve(bytes.len().saturating_sub(self.data.len()))?;
         self.data.clear();
