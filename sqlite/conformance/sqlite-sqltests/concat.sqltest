@@ -117,3 +117,21 @@ expect {
     'héllo—'
     6
 }
+
+test concat-two-blobs-is-text {
+    SELECT typeof(x'41' || x'42'), x'41' || x'42' = 'AB', typeof(x'' || x'');
+    SELECT quote(x'41c3' || x'a9');
+    SELECT hex(x'ff' || x'fe');
+}
+expect {
+    text|1|text
+    'Aé'
+    FFFE
+}
+
+test concat-two-blobs-matches-text-column {
+    SELECT count(*) FROM products WHERE name = x'6861' || x'74';
+}
+expect {
+    1
+}
