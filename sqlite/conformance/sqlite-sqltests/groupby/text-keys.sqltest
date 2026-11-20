@@ -1,0 +1,60 @@
+@database :memory:
+
+# GROUP BY on one TEXT key compares two texts byte by byte under BINARY.
+# The keys include prefixes of each other, the empty string, and text that
+# is not ASCII.
+@cross-check-integrity
+test group_by_text_key_counts {
+    CREATE TABLE t(g TEXT);
+    INSERT INTO t VALUES ('b'), ('a'), ('ab'), (''), ('a'), ('é'), ('e'), ('ab'), ('b'), ('a'), (NULL), ('A');
+    SELECT g, count(*) FROM t GROUP BY g;
+}
+expect {
+    |1
+    |1
+    A|1
+    a|3
+    ab|2
+    b|2
+    e|1
+    é|1
+}
+
+@cross-check-integrity
+test group_by_text_key_desc {
+    CREATE TABLE t2(g TEXT);
+    INSERT INTO t2 VALUES ('b'), ('a'), ('ab'), ('a'), ('ba'), ('b');
+    SELECT g, count(*) FROM t2 GROUP BY g ORDER BY g DESC;
+}
+expect {
+    ba|1
+    b|2
+    ab|1
+    a|2
+}
+
+# Integers and texts in the same key column do not use the text comparison.
+@cross-check-integrity
+test group_by_mixed_text_and_integer_key {
+    CREATE TABLE t3(g);
+    INSERT INTO t3 VALUES ('1'), (1), ('1'), (2), ('2'), (1);
+    SELECT g, typeof(g), count(*) FROM t3 GROUP BY g;
+}
+expect {
+    1|integer|2
+    2|integer|1
+    1|text|2
+    2|text|1
+}
+
+# A NOCASE key keeps its collation.
+@cross-check-integrity
+test group_by_nocase_text_key {
+    CREATE TABLE t4(g TEXT COLLATE NOCASE);
+    INSERT INTO t4 VALUES ('a'), ('A'), ('b'), ('B'), ('a');
+    SELECT lower(g), count(*) FROM t4 GROUP BY g;
+}
+expect {
+    a|3
+    b|2
+}

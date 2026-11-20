@@ -1,0 +1,36 @@
+@database :memory:
+
+# COUNT(x) counts every value that is not NULL: integers, reals, texts
+# (also the empty text) and blobs (also the empty blob).
+@cross-check-integrity
+test count_values_of_each_type {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (NULL), (2.5), ('a'), (''), (x'00'), (zeroblob(0)), (NULL), ('b');
+    SELECT count(x), count(*) FROM t;
+}
+expect {
+    7|9
+}
+
+@cross-check-integrity
+test count_values_of_each_type_per_group {
+    CREATE TABLE t2(g, x);
+    INSERT INTO t2 VALUES (1, 'a'), (1, NULL), (1, x'01'), (2, NULL), (2, NULL), (3, ''), (3, 4), (3, 'c');
+    SELECT g, count(x), count(*) FROM t2 GROUP BY g;
+}
+expect {
+    1|2|3
+    2|0|2
+    3|3|3
+}
+
+@cross-check-integrity
+test count_text_column_of_index {
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, g TEXT);
+    CREATE INDEX t3_g ON t3(g);
+    INSERT INTO t3(g) VALUES ('x'), (NULL), ('y'), ('x'), (NULL), ('');
+    SELECT count(g) FROM t3;
+}
+expect {
+    4
+}

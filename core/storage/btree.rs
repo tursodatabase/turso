@@ -2232,7 +2232,7 @@ impl BTreeCursor {
         index_key: &ImmutableRecordRef<'_>,
         cmp: SeekOp,
     ) -> IOResultOr<()> {
-        let key_values = index_key.get_values()?;
+        let key_values = index_key.get_values_inline()?;
         let record_comparer = {
             let index_info = self
                 .index_info
@@ -2809,7 +2809,7 @@ impl BTreeCursor {
         key: &ImmutableRecordRef<'_>,
         seek_op: SeekOp,
     ) -> IOResultOr<SeekResult> {
-        let key_values = key.get_values()?;
+        let key_values = key.get_values_inline()?;
         let record_comparer = {
             let index_info = self
                 .index_info

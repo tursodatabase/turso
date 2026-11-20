@@ -817,6 +817,21 @@ pub fn op_compare(
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
+        // Two texts under BINARY compare byte by byte, and NULL order does
+        // not apply to them: the case of every GROUP BY on a text key.
+        if key_info[0].collation == CollationSeq::BINARY {
+            if let (Register::Value(Value::Text(a)), Register::Value(Value::Text(b))) =
+                (&state.registers[start_reg_a], &state.registers[start_reg_b])
+            {
+                let cmp = a.as_str().cmp(b.as_str());
+                state.last_compare = Some(match key_info[0].sort_order {
+                    turso_parser::ast::SortOrder::Asc => cmp,
+                    turso_parser::ast::SortOrder::Desc => cmp.reverse(),
+                });
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
     }
 
     return op_compare_slow(state, start_reg_a, start_reg_b, count, key_info);
@@ -1080,6 +1095,16 @@ fn op_comparison_slow(
             }
             return Ok(InsnFunctionStepResult::Step);
         };
+    }
+
+    // Two numbers, such as a REAL column and an integer constant, compare by
+    // their numeric order. Only TEXT affinity converts a number, and a type's
+    // order can place numbers differently. Otherwise the general comparison
+    // below converts nothing and gives this order too.
+    if let (Value::Numeric(l), Value::Numeric(r)) = (lhs_value, rhs_value) {
+        if affinity != Affinity::Text && matches!(collation, CollationSeq::Text(_)) {
+            take_jump_if!(comparison_matches_order(op, l.cmp(r)));
+        }
     }
 
     match (lhs_value, rhs_value) {
@@ -4245,11 +4270,12 @@ pub fn op_halt(
         insn
     );
     // If description_reg is set, read the error message from that register at runtime
-    // (used by RAISE with expression-based error messages).
+    // (used by RAISE with expression-based error messages). Each statement
+    // ends with a Halt, so the static description is borrowed, not copied.
     let desc = if let Some(reg) = description_reg {
-        state.registers[*reg].get_value().to_string()
+        std::borrow::Cow::Owned(state.registers[*reg].get_value().to_string())
     } else {
-        description.to_string()
+        std::borrow::Cow::Borrowed(description.as_str())
     };
     halt(
         program,
@@ -6295,7 +6321,12 @@ pub fn op_string8(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(String8 { value, dest }, insn);
-    state.registers[*dest].set_text(Text::new(value.clone()))?;
+    // A register that holds text keeps its buffer: copy the string into it,
+    // without first copying the string into a String that is then freed.
+    match &mut state.registers[*dest] {
+        Register::Value(Value::Text(existing)) => existing.do_extend(&value.as_str())?,
+        register => register.set_text(Text::new(value.clone()))?,
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -7756,23 +7787,12 @@ fn update_agg_payload(
             *ovrfl_i = sum_state.ovrfl as i64;
         }
         AggFunc::Min | AggFunc::Max => {
-            if matches!(arg, Value::Null) {
-                return Ok(());
-            }
-            if matches!(payload[0], Value::Null) {
-                payload[0].try_clone_from(arg)?;
-                return Ok(());
-            }
-            use std::cmp::Ordering;
-            let cmp = collation.compare(arg.as_ref(), payload[0].as_ref());
-            let should_update = match func {
-                AggFunc::Max => cmp == Ordering::Greater,
-                AggFunc::Min => cmp == Ordering::Less,
-                _ => false,
-            };
-            if should_update {
-                payload[0].try_clone_from(arg)?;
-            }
+            step_min_max(
+                matches!(func, AggFunc::Max),
+                arg,
+                &mut payload[0],
+                collation,
+            )?;
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
             if matches!(arg, Value::Null) {
@@ -8262,7 +8282,12 @@ pub(crate) fn agg_payload_width(func: &AggFunc) -> Option<usize> {
     }
 }
 
-fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
+/// The result of the aggregate `func` from its accumulator `payload`. When
+/// `take_first` is true, the caller does not use the payload again: a result
+/// that is the first payload value, as for MIN, MAX, group_concat and
+/// string_agg, moves out of the payload instead of being copied. A copy of a
+/// group_concat result copies each byte of the concatenation.
+fn finalize_agg_payload(func: &AggFunc, payload: &mut [Value], take_first: bool) -> Result<Value> {
     let val = match func {
         AggFunc::Count | AggFunc::Count0 => payload[0].clone(),
         AggFunc::Avg => {
@@ -8334,13 +8359,17 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
                 _ => unreachable!("Total accumulator initialized to Null/Integer/Float"),
             }
         }
-        AggFunc::Min | AggFunc::Max => payload[0].clone(),
-        AggFunc::GroupConcat | AggFunc::StringAgg => match payload {
-            [Value::Null, Value::Numeric(Numeric::Integer(count)), ..] if *count > 0 => {
+        AggFunc::Min | AggFunc::Max => first_payload_value(payload, take_first),
+        AggFunc::GroupConcat | AggFunc::StringAgg => {
+            if matches!(
+                &*payload,
+                [Value::Null, Value::Numeric(Numeric::Integer(count)), ..] if *count > 0
+            ) {
                 Value::build_text(String::new())
+            } else {
+                first_payload_value(payload, take_first)
             }
-            _ => payload[0].clone(),
-        },
+        }
         AggFunc::ArrayAgg => {
             // payload[0] = count, payload[1..] = accumulated values.
             // Serialize to a record blob only once at finalization.
@@ -8431,6 +8460,17 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
     };
 
     Ok(val)
+}
+
+/// The first value of an aggregate payload: moved out of the payload when
+/// `take` is true, else a copy. A value over the length limit is copied, so
+/// that the length error of the caller leaves the accumulator as it was.
+fn first_payload_value(payload: &mut [Value], take: bool) -> Value {
+    if take && payload[0].check_length_limit().is_ok() {
+        std::mem::replace(&mut payload[0], Value::Null)
+    } else {
+        payload[0].clone()
+    }
 }
 
 /// Most frequent value of an ordered set (`mode() WITHIN GROUP (ORDER BY x)`).
@@ -9561,15 +9601,24 @@ pub fn op_agg_step(
                 }
             }
             AggFunc::Count | AggFunc::Count0 => {
-                let counts = matches!(agg, AggFunc::Count0)
-                    || matches!(
-                        state.registers[data.col],
-                        Register::Value(Value::Numeric(_))
-                    );
-                if let (true, Register::Aggregate(AggContext::Builtin(payload))) =
+                // COUNT(x) counts each value that is not NULL, of every type.
+                let counts = if matches!(agg, AggFunc::Count0) {
+                    Some(true)
+                } else {
+                    match &state.registers[data.col] {
+                        Register::Value(Value::Null) => Some(false),
+                        Register::Value(_) => Some(true),
+                        _ => None,
+                    }
+                };
+                if let (Some(counts), Register::Aggregate(AggContext::Builtin(payload))) =
                     (counts, &mut state.registers[data.acc_reg])
                 {
                     if let [Value::Numeric(Numeric::Integer(count))] = payload.as_mut_slice() {
+                        if !counts {
+                            state.pc += 1;
+                            return Ok(InsnFunctionStepResult::Step);
+                        }
                         if let Some(rows) = count.checked_add(1) {
                             *count = rows;
                             state.pc += 1;
@@ -9578,31 +9627,77 @@ pub fn op_agg_step(
                     }
                 }
             }
-            AggFunc::Min | AggFunc::Max if matches!(data.collation, CollationSeq::Text(_)) => {
-                if let Register::Value(Value::Numeric(Numeric::Integer(arg))) =
-                    state.registers[data.col]
-                {
-                    if let Register::Aggregate(AggContext::Builtin(payload)) =
-                        &mut state.registers[data.acc_reg]
-                    {
-                        if let Some(Value::Numeric(Numeric::Integer(best))) = payload.first_mut() {
-                            let better = match agg {
-                                AggFunc::Max => arg > *best,
-                                _ => arg < *best,
-                            };
-                            if better {
-                                *best = arg;
-                            }
-                            state.pc += 1;
-                            return Ok(InsnFunctionStepResult::Step);
-                        }
-                    }
-                }
+            AggFunc::Min | AggFunc::Max => {
+                return op_agg_step_min_max(state, data, connection, matches!(agg, AggFunc::Max));
             }
             _ => {}
         }
     }
     op_agg_step_slow(state, data, connection)
+}
+
+/// The fast path of AggStep for MIN (`is_max` false) and MAX (`is_max`
+/// true): the step of update_agg_payload for a value against an accumulator
+/// that exists, without the work of the slow path. It is out of line: inside
+/// op_agg_step, the registers and the stack that the step of a TEXT or BLOB
+/// value needs were saved and restored on each call, also for COUNT, SUM and
+/// AVG.
+#[inline(never)]
+fn op_agg_step_min_max(
+    state: &mut ProgramState,
+    data: &AggStepData,
+    connection: &Connection,
+    is_max: bool,
+) -> InsnResult {
+    if let Ok([Register::Value(arg), Register::Aggregate(AggContext::Builtin(payload))]) =
+        state.registers.get_disjoint_mut([data.col, data.acc_reg])
+    {
+        if let Some(best) = payload.first_mut() {
+            step_min_max(is_max, arg, best, data.collation)?;
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
+    op_agg_step_slow(state, data, connection)
+}
+
+/// One step of MIN (`is_max` false) or MAX (`is_max` true): `best` takes a
+/// copy of `arg` when `arg` is not NULL and `best` is NULL, or when `arg`
+/// orders strictly after (MAX) or before (MIN) `best` under `collation`.
+#[inline(always)]
+fn step_min_max(
+    is_max: bool,
+    arg: &Value,
+    best: &mut Value,
+    collation: CollationSeq,
+) -> Result<()> {
+    // Two integers under a text collation compare as integers, and the copy
+    // of an integer does not allocate.
+    if let (Value::Numeric(Numeric::Integer(arg)), Value::Numeric(Numeric::Integer(best))) =
+        (arg, &mut *best)
+    {
+        if matches!(collation, CollationSeq::Text(_)) {
+            if (is_max && *arg > *best) || (!is_max && *arg < *best) {
+                *best = *arg;
+            }
+            return Ok(());
+        }
+    }
+    if matches!(arg, Value::Null) {
+        return Ok(());
+    }
+    let better = matches!(best, Value::Null) || {
+        let order = collation.compare(arg.as_ref(), best.as_ref());
+        if is_max {
+            order.is_gt()
+        } else {
+            order.is_lt()
+        }
+    };
+    if better {
+        best.try_clone_from(arg)?;
+    }
+    Ok(())
 }
 
 #[inline(never)]
@@ -9673,55 +9768,90 @@ fn op_agg_step_slow(
             unreachable!("extension aggregates are stepped above")
         }
         _ => {
-            let maybe_arg2 = match func {
-                AggFunc::GroupConcat | AggFunc::StringAgg => {
-                    Some(state.registers[*delimiter].get_value().try_clone()?)
-                }
-                #[cfg(feature = "json")]
-                AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-                    Some(state.registers[*delimiter].get_value().try_clone()?)
-                }
-                AggFunc::PercentileCont | AggFunc::PercentileDisc => {
-                    Some(state.registers[*delimiter].get_value().try_clone()?)
-                }
-                _ => None,
-            };
-
-            let [arg_reg, acc_slot] =
-                state
-                    .registers
-                    .get_disjoint_mut([*col, *acc_reg])
-                    .map_err(|_| {
-                        LimboError::InternalError(format!(
-                        "AggStep: input register {} and accumulator register {} must be distinct",
-                        *col, *acc_reg
-                    ))
-                    })?;
-            let arg = arg_reg.get_value();
-            let Register::Aggregate(agg) = acc_slot else {
-                return Err(LimboError::InternalError(format!(
-                    "AggStep: register {} does not hold an aggregate accumulator",
-                    *acc_reg
-                ))
-                .into());
-            };
-            let payload = agg.payload_vec_mut();
             let counts_infinite_inputs =
                 matches!(func, AggFunc::Sum | AggFunc::Total | AggFunc::Avg)
                     && connection.dialect().sum_counts_infinite_inputs();
-            update_agg_payload(
-                func,
-                arg,
-                maybe_arg2.as_ref(),
-                payload,
-                collation,
-                counts_infinite_inputs,
-            )?;
+            let arg2_reg = match func {
+                AggFunc::GroupConcat | AggFunc::StringAgg => Some(*delimiter),
+                #[cfg(feature = "json")]
+                AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => Some(*delimiter),
+                AggFunc::PercentileCont | AggFunc::PercentileDisc => Some(*delimiter),
+                _ => None,
+            };
+            match arg2_reg
+                .map(|arg2_reg| state.registers.get_disjoint_mut([*col, *acc_reg, arg2_reg]))
+            {
+                // The second argument has a register of its own, so the step
+                // reads it in that register. A clone for each row allocates
+                // when the second argument is TEXT, as a separator is.
+                Some(Ok([arg_reg, acc_slot, arg2_slot])) => step_builtin_agg(
+                    func,
+                    arg_reg,
+                    acc_slot,
+                    *acc_reg,
+                    Some(arg2_slot.get_value()),
+                    collation,
+                    counts_infinite_inputs,
+                )?,
+                _ => {
+                    let maybe_arg2 = match arg2_reg {
+                        Some(arg2_reg) => Some(state.registers[arg2_reg].get_value().try_clone()?),
+                        None => None,
+                    };
+                    let [arg_reg, acc_slot] = state
+                        .registers
+                        .get_disjoint_mut([*col, *acc_reg])
+                        .map_err(|_| {
+                            LimboError::InternalError(format!(
+                        "AggStep: input register {} and accumulator register {} must be distinct",
+                        *col, *acc_reg
+                    ))
+                        })?;
+                    step_builtin_agg(
+                        func,
+                        arg_reg,
+                        acc_slot,
+                        *acc_reg,
+                        maybe_arg2.as_ref(),
+                        collation,
+                        counts_infinite_inputs,
+                    )?;
+                }
+            }
         }
     };
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Steps the builtin aggregate in `acc_slot`, register `acc_reg`, with the
+/// value of `arg_reg`, and with `arg2` for an aggregate with a second
+/// argument. `counts_infinite_inputs` is the argument of the same name of
+/// [update_agg_payload].
+fn step_builtin_agg(
+    func: &AggFunc,
+    arg_reg: &Register,
+    acc_slot: &mut Register,
+    acc_reg: usize,
+    arg2: Option<&Value>,
+    collation: CollationSeq,
+    counts_infinite_inputs: bool,
+) -> Result<()> {
+    let arg = arg_reg.get_value();
+    let Register::Aggregate(agg) = acc_slot else {
+        return Err(LimboError::InternalError(format!(
+            "AggStep: register {acc_reg} does not hold an aggregate accumulator"
+        )));
+    };
+    update_agg_payload(
+        func,
+        arg,
+        arg2,
+        agg.payload_vec_mut(),
+        collation,
+        counts_infinite_inputs,
+    )
 }
 
 /// Adds `value` to a float total and its error term like [apply_kbn_step], or
@@ -9770,7 +9900,7 @@ pub fn op_agg_final(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    match &state.registers[acc_reg] {
+    match &mut state.registers[acc_reg] {
         Register::Aggregate(agg) => {
             let value = match agg {
                 AggContext::External(_) | AggContext::Native(_) => {
@@ -9783,7 +9913,9 @@ pub fn op_agg_final(
                         };
                         Value::from_i64(*count)
                     }
-                    _ => finalize_agg_payload(func, payload)?,
+                    // A result that replaces the accumulator can take the
+                    // first payload value: the payload is not used again.
+                    _ => finalize_agg_payload(func, payload, acc_reg == dest_reg)?,
                 },
             };
             value.check_length_limit()?;
@@ -15909,6 +16041,20 @@ pub fn op_concat(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Concat { lhs, rhs, dest }, insn);
+    // A destination register that holds TEXT, as it does from the second
+    // row of a loop on, gets the result in its buffer. A new value for each
+    // row costs an allocation and a free.
+    if let Ok([lhs_reg, rhs_reg, Register::Value(Value::Text(dest_text))]) =
+        state.registers.get_disjoint_mut([*lhs, *rhs, *dest])
+    {
+        if lhs_reg
+            .get_value()
+            .exec_concat_into(rhs_reg.get_value(), dest_text)?
+        {
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
     let value = state.registers[*lhs]
         .get_value()
         .exec_concat(state.registers[*rhs].get_value())?;
@@ -20560,36 +20706,36 @@ mod tests {
 
     #[test]
     fn test_finalize_count() {
-        let payload = vec![Value::from_i64(42)];
-        let result = finalize_agg_payload(&AggFunc::Count, &payload).unwrap();
+        let mut payload = vec![Value::from_i64(42)];
+        let result = finalize_agg_payload(&AggFunc::Count, &mut payload, false).unwrap();
         assert_eq!(result, Value::from_i64(42));
     }
 
     #[test]
     fn test_finalize_avg() {
         // Payload: [sum, r_err, count, pos_inf, neg_inf]
-        let payload = vec![
+        let mut payload = vec![
             Value::from_f64(30.0),
             Value::from_f64(0.0),
             Value::from_i64(3),
             Value::from_i64(0),
             Value::from_i64(0),
         ];
-        let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
+        let result = finalize_agg_payload(&AggFunc::Avg, &mut payload, false).unwrap();
         assert_eq!(result, Value::from_f64(10.0));
     }
 
     #[test]
     fn test_finalize_avg_empty() {
         // Payload: [sum, r_err, count, pos_inf, neg_inf]
-        let payload = vec![
+        let mut payload = vec![
             Value::from_f64(0.0),
             Value::from_f64(0.0),
             Value::from_i64(0),
             Value::from_i64(0),
             Value::from_i64(0),
         ];
-        let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
+        let result = finalize_agg_payload(&AggFunc::Avg, &mut payload, false).unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -20622,7 +20768,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
+        let result = finalize_agg_payload(&AggFunc::Avg, &mut payload, false).unwrap();
         assert_eq!(result, Value::from_f64(0.5));
     }
 
@@ -20640,7 +20786,7 @@ mod tests {
             payload.push(Value::from_i64(i));
         }
 
-        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &payload).unwrap();
+        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &mut payload, false).unwrap();
         let blob = match &result {
             Value::Blob(b) => b,
             _ => panic!("Expected Blob, got {result:?}"),
@@ -20659,7 +20805,7 @@ mod tests {
         let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::ArrayAgg, &mut payload).unwrap();
         // No values accumulated — count stays 0.
-        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &payload).unwrap();
+        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &mut payload, false).unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -20667,8 +20813,8 @@ mod tests {
     fn test_array_agg_finalize_bounds_check() {
         // If payload[0] count is larger than the actual payload length,
         // finalize should return an error rather than panicking.
-        let payload = vec![Value::from_i64(999)]; // claims 999 elements but has none
-        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &payload);
+        let mut payload = vec![Value::from_i64(999)]; // claims 999 elements but has none
+        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &mut payload, false);
         assert!(
             result.is_err(),
             "Should error on count exceeding payload length"

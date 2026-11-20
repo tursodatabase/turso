@@ -781,7 +781,9 @@ impl PageInner {
         )
     }
 
-    #[inline]
+    // Always inlined: the balance and defragment loops call it once for each
+    // cell of a page, and a call returns its Result through memory.
+    #[inline(always)]
     pub fn _cell_get_raw_region_faster(
         &self,
         idx: usize,

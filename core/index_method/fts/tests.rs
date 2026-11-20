@@ -562,6 +562,63 @@ fn segment_load_rejects_the_old_identity_field() {
 }
 
 #[test]
+fn segment_files_do_not_depend_on_the_writer_memory_budget() {
+    // `build_segment` gives the segment writer of a small batch a small
+    // memory budget. Tantivy uses the budget only for the initial size of its
+    // term table, and FTS stores the segment files in the database. Thus the
+    // files must be the same for each budget, also when the table grows.
+    let attachment = test_attachment();
+    let cursor = FtsCursor::new(&attachment);
+    let segment_id = SegmentId::generate_random();
+    let build = |memory_budget: usize| {
+        let directory = BuildDirectory::default();
+        let index = Index::create(
+            directory.clone(),
+            attachment.schema.clone(),
+            IndexSettings::default(),
+        )
+        .unwrap();
+        cursor.register_tokenizers(&index);
+        let mut writer = SegmentWriter::for_segment(
+            memory_budget,
+            index.segment(index.new_segment_meta(segment_id, 0)),
+        )
+        .unwrap();
+        // About 3,000 different terms: the smallest table (2^10 entries)
+        // grows three times.
+        for rowid in 0..1000i64 {
+            let mut document = TantivyDocument::default();
+            document.add_i64(attachment.rowid_field, rowid);
+            document.add_text(attachment.indexed_fields[0].1, format!("title {rowid}"));
+            document.add_text(
+                attachment.indexed_fields[1].1,
+                format!("body word{rowid} shared text{}", rowid % 7),
+            );
+            document.add_u64(attachment.identity_hi_field, 1);
+            document.add_u64(attachment.identity_lo_field, rowid as u64);
+            writer
+                .add_document(AddOperation {
+                    opstamp: 0,
+                    document,
+                })
+                .unwrap();
+        }
+        writer.finalize().unwrap();
+        let mut files: Vec<_> = directory
+            .captured_files()
+            .into_iter()
+            .map(|(path, bytes)| (path, bytes.to_vec()))
+            .collect();
+        files.sort();
+        files
+    };
+    let smallest = build(FtsCursor::segment_memory_budget(1));
+    let largest = build(DEFAULT_MEMORY_BUDGET_BYTES);
+    assert!(!largest.is_empty());
+    assert_eq!(smallest, largest);
+}
+
+#[test]
 fn merge_keeps_document_identities_and_retires_only_dropped_tombstones() {
     let attachment = test_attachment();
     let (mut first, _) = build_and_load_segment(&attachment, &[(1, "alpha one"), (2, "alpha two")]);
