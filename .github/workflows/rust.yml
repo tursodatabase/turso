@@ -396,6 +396,9 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 35
     strategy:
+      # Each profile tests different code, so a failure in one profile must not
+      # cancel the others.
+      fail-fast: false
       matrix:
         profile:
           - name: default
