@@ -2440,6 +2440,13 @@ fn drop_schema_commands(
             },
         })
         .collect();
+    let delete_comment = conn.qualifier(&name).and_then(|namespace| {
+        crate::descriptions::delete_schema_comment_statement(
+            &conn.current_schema(),
+            namespace.target.id,
+        )
+    });
+    commands.extend(delete_comment.map(engine_statement));
     commands.push(DeferredStatement {
         command: DeferredCommand::Ast(ast::Stmt::DropSchema {
             name: ast::Name::exact(name.clone()),

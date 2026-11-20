@@ -1545,6 +1545,19 @@ expect {
     a schema
 }
 
+test comment-on-view-is-stored-and-dropped-with-the-view {
+    CREATE TABLE commented_view_base (a int);
+    CREATE VIEW commented_view AS SELECT a FROM commented_view_base;
+    COMMENT ON VIEW commented_view IS 'a commented view';
+    SELECT objsubid, description FROM pg_description WHERE description = 'a commented view';
+    DROP VIEW commented_view;
+    SELECT count(*) FROM pg_description WHERE description = 'a commented view';
+}
+expect {
+    0|a commented view
+    0
+}
+
 test comment-on-quoted-names-with-capital-letters {
     CREATE SCHEMA "CommentUp";
     CREATE TABLE "CommentUp"."MixT" ("ColA" int, b int);
@@ -1572,6 +1585,35 @@ test comment-is-rolled-back-with-its-transaction {
 }
 expect {
     kept|
+}
+
+test dropping-a-relation-deletes-its-comments {
+    CREATE TABLE comment_dropped (a int, b int);
+    CREATE INDEX comment_dropped_index ON comment_dropped (b);
+    CREATE TABLE comment_kept (a int);
+    CREATE SEQUENCE comment_dropped_sequence;
+    COMMENT ON TABLE comment_dropped IS 'table';
+    COMMENT ON COLUMN comment_dropped.a IS 'column';
+    COMMENT ON INDEX comment_dropped_index IS 'index';
+    COMMENT ON SEQUENCE comment_dropped_sequence IS 'sequence';
+    COMMENT ON TABLE comment_kept IS 'kept';
+    DROP TABLE comment_dropped;
+    DROP SEQUENCE comment_dropped_sequence;
+    SELECT description FROM pg_description
+    WHERE description IN ('table', 'column', 'index', 'sequence', 'kept');
+}
+expect {
+    kept
+}
+
+test dropping-a-schema-deletes-its-comment {
+    CREATE SCHEMA comment_dropped_schema;
+    COMMENT ON SCHEMA comment_dropped_schema IS 'dropped schema';
+    DROP SCHEMA comment_dropped_schema;
+    SELECT count(*) FROM pg_description WHERE description = 'dropped schema';
+}
+expect {
+    0
 }
 
 test comment-on-missing-relation-fails {

@@ -10,12 +10,18 @@
 //! Nothing in memory holds these rows. `COMMENT ON` writes them with
 //! statements of the engine in the user's transaction, and
 //! `obj_description` and `col_description` are queries on the table.
+//! A statement that drops a relation deletes its comments in its own
+//! bytecode, and one that drops a schema is followed by an engine statement
+//! that does.
 
 use std::sync::Arc;
 
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::{RelationKind, Schema};
-use turso_core::{Connection, Result, MAIN_DB_ID};
+use turso_core::{
+    CmpInsFlags, CollationSeq, Connection, CursorType, Insn, ProgramBuilder, RegisterOrLiteral,
+    Result, MAIN_DB_ID,
+};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_SCHEMA_NAME,
     SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_WRONG_OBJECT_TYPE,
@@ -31,6 +37,9 @@ use crate::roles::schema_roles;
 use crate::session::relation_lookup_namespaces;
 
 pub(crate) const DESCRIPTION_TABLE_NAME: &str = "pg_description";
+
+const OBJOID_COLUMN: usize = 0;
+const CLASSOID_COLUMN: usize = 1;
 
 /// Whether `name` in the root namespace is a catalog table that this
 /// frontend stores. Every role reads such a table and no user statement
@@ -74,6 +83,23 @@ pub(crate) fn comment_statements(
         statements.push(object.insert_statement(comment));
     }
     Ok(statements)
+}
+
+/// The engine statement that deletes the comment of the schema `namespace`
+/// of `schema`, which the running statement drops. None when the database
+/// has no table of comments, which only happens outside the frontend's own
+/// open path, such as a core-level open for tests.
+pub(crate) fn delete_schema_comment_statement(
+    schema: &Schema,
+    namespace: NamespaceId,
+) -> Option<String> {
+    schema.get_btree_table(NamespaceId::ROOT, DESCRIPTION_TABLE_NAME)?;
+    let comment = DescribedObject {
+        objoid: namespace_oid(schema, namespace),
+        classoid: PG_NAMESPACE_OID,
+        objsubid: 0,
+    };
+    Some(comment.delete_statement())
 }
 
 /// What `pg_description` names an object by.
@@ -307,4 +333,63 @@ fn check_owner(
         format!("must be owner of {kind_name} {}", class.relname),
         None,
     ))
+}
+
+/// Deletes the comments of the relation with oid `oid`, which the running
+/// statement drops, and of its columns.
+pub(crate) fn emit_delete_relation_comments(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+    oid: i64,
+) {
+    let Some(table) = schema.get_btree_table(NamespaceId::ROOT, DESCRIPTION_TABLE_NAME) else {
+        return;
+    };
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(Arc::clone(&table)));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page: RegisterOrLiteral::Literal(table.root_page),
+        db: MAIN_DB_ID,
+    });
+    let objoid_reg = program.alloc_register();
+    program.emit_int(oid, objoid_reg);
+    let classoid_reg = program.alloc_register();
+    program.emit_int(PG_CLASS_OID, classoid_reg);
+    let expected = [(OBJOID_COLUMN, objoid_reg), (CLASSOID_COLUMN, classoid_reg)];
+
+    let loop_end = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id,
+        pc_if_empty: loop_end,
+    });
+    let loop_start = program.allocate_label();
+    program.preassign_label_to_next_insn(loop_start);
+    let next = program.allocate_label();
+
+    let value_reg = program.alloc_register();
+    for (column, expected_reg) in expected {
+        program.emit_column_or_rowid(cursor_id, column, value_reg);
+        program.emit_insn(Insn::Ne {
+            lhs: value_reg,
+            rhs: expected_reg,
+            target_pc: next,
+            flags: CmpInsFlags::default().jump_if_null(),
+            collation: CollationSeq::for_internal_values(),
+        });
+    }
+    // Marked as part of an update so that changes() does not count it.
+    program.emit_insn(Insn::Delete {
+        cursor_id,
+        table_name: DESCRIPTION_TABLE_NAME.to_string(),
+        is_part_of_update: true,
+    });
+
+    program.preassign_label_to_next_insn(next);
+    program.emit_insn(Insn::Next {
+        cursor_id,
+        pc_if_next: loop_start,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(loop_end);
 }

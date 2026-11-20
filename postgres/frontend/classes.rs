@@ -56,7 +56,7 @@ use crate::auth_members::{
     CREATE_AUTH_MEMBERS_TABLE_SQL,
 };
 use crate::catalog::{engine_role_by_name, role_oid, role_oid_by_name};
-use crate::descriptions::is_stored_catalog_table;
+use crate::descriptions::{emit_delete_relation_comments, is_stored_catalog_table};
 use crate::error::sqlstate_error;
 use crate::policies::{self, TablePolicies};
 use crate::roles::{
@@ -710,12 +710,12 @@ impl<'a> ClassRowWriter<'a> {
     /// Deletes the class row of a relation that the statement drops.
     fn dropped_relation(&self, program: &mut ProgramBuilder, namespace: NamespaceId, name: &str) {
         // An engine relation has no row and nothing to do.
-        if class_catalog(self.schema)
-            .and_then(|catalog| catalog.get_by_name(namespace, name))
-            .is_none()
-        {
+        let Some(class) =
+            class_catalog(self.schema).and_then(|catalog| catalog.get_by_name(namespace, name))
+        else {
             return;
-        }
+        };
+        emit_delete_relation_comments(program, self.schema, class.oid);
         emit_class_row_delete(program, &self.cursors, namespace, name)
     }
 
