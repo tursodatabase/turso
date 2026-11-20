@@ -15,10 +15,11 @@ use turso_core::{
 };
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_DATETIME_FORMAT,
-    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
-    SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
-    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_PARAMETER_VALUE,
+    SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -687,6 +688,64 @@ fn exec_json_strip_nulls(value: &Value) -> Result<Option<String>> {
     let mut stripped = String::with_capacity(json.len());
     copy_without_null_fields(json, &mut 0, 0, &mut stripped)?;
     Ok(Some(stripped))
+}
+
+/// Appends the rows of PostgreSQL's json_each(json): the key of each member
+/// unescaped and the text of its value as the input writes it, in the order of
+/// the input and with repeated keys kept. The engine's json_each() is SQLite's,
+/// which turns a number member into a SQL value and writes it again.
+pub(crate) fn exec_json_each(value: &Value, rows: &mut Vec<[Value; 2]>) -> Result<()> {
+    let json = match value {
+        Value::Null => return Ok(()),
+        Value::Text(text) => text.as_str(),
+        other => return Err(undefined_function("json_each", &[pg_type_name(other)])),
+    };
+    // Validate first, so the walk below can assume well-formed input.
+    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
+    let bytes = json.as_bytes();
+    let mut pos = 0;
+    skip_json_whitespace(bytes, &mut pos);
+    match bytes[pos] {
+        b'{' => pos += 1,
+        b'[' => {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "cannot deconstruct an array as an object",
+            ))
+        }
+        _ => {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "cannot deconstruct a scalar",
+            ))
+        }
+    }
+    // The walk decodes every string in a value, so a \u0000 or a lone surrogate
+    // anywhere in it errors as in PostgreSQL. Its copy of the value is not used.
+    let mut walked_value = String::new();
+    loop {
+        skip_json_whitespace(bytes, &mut pos);
+        match bytes[pos] {
+            b'}' => break,
+            b',' => {
+                pos += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let key = decode_json_string(json, &mut pos)?;
+        skip_json_whitespace(bytes, &mut pos);
+        pos += 1; // ':'
+        skip_json_whitespace(bytes, &mut pos);
+        let start = pos;
+        walked_value.clear();
+        copy_without_null_fields(json, &mut pos, 1, &mut walked_value)?;
+        rows.push([
+            Value::build_text(key),
+            Value::build_text(json[start..pos].to_string()),
+        ]);
+    }
+    Ok(())
 }
 
 /// `array_to_json(array [, pretty])`: the array as a JSON array, with line

@@ -2974,12 +2974,10 @@ impl PostgreSQLTranslator {
             });
         }
 
-        let qualified_name = function_qualified_name(func_name);
         if let Some(function) = rewritten_function(func_name) {
             return translate_rewritten_function(
                 function,
                 range_func,
-                qualified_name,
                 args,
                 alias,
                 CallShape {
@@ -3010,7 +3008,11 @@ impl PostgreSQLTranslator {
         }
         reject_column_aliases(&range_func.alias, "a function")?;
 
-        Ok(ast::SelectTable::TableCall(qualified_name, args, alias))
+        Ok(ast::SelectTable::TableCall(
+            function_qualified_name(func_name),
+            args,
+            alias,
+        ))
     }
 
     fn translate_json_to_record(
@@ -5748,12 +5750,10 @@ struct CallShape {
 /// the engine here. The call is a SELECT over the engine's table function.
 struct RewrittenFunction {
     name: &'static str,
-    in_main_schema: bool,
+    /// The name of the engine's table function, in the main schema.
+    engine_name: &'static str,
     /// Refuses a call that PostgreSQL refuses for this function.
     check_call: fn(CallShape) -> Result<(), ParseError>,
-    /// The arguments to pass to the engine's table function, given the arguments of the call.
-    #[allow(clippy::vec_box)]
-    prepare_arguments: fn(Vec<Box<ast::Expr>>) -> Vec<Box<ast::Expr>>,
     /// The column of the engine's table function that holds each column of the result,
     /// and the name PostgreSQL gives that column, for a call with this many arguments.
     columns: fn(usize) -> Vec<(ast::Expr, String)>,
@@ -5790,7 +5790,7 @@ const POSTGRES_TABLE_FUNCTIONS: [&str; 3] = [
 const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
     RewrittenFunction {
         name: "unnest",
-        in_main_schema: true,
+        engine_name: "unnest",
         check_call: |call| {
             let count = call.arg_count;
             if count == 0 || (call.schema_qualified && count > 1) {
@@ -5815,7 +5815,6 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
             }
             Ok(())
         },
-        prepare_arguments: |arguments| arguments,
         columns: |count| {
             (1..=count)
                 .map(|array| {
@@ -5829,7 +5828,7 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
     },
     RewrittenFunction {
         name: "generate_series",
-        in_main_schema: true,
+        engine_name: "generate_series",
         check_call: |call| {
             if !(2..=3).contains(&call.arg_count) {
                 return Err(ParseError::Sqlstate {
@@ -5842,12 +5841,11 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
             }
             Ok(())
         },
-        prepare_arguments: |arguments| arguments,
         columns: |_| vec![(ast::Expr::Id(exact_name("value")), "generate_series".into())],
     },
     RewrittenFunction {
         name: "json_each",
-        in_main_schema: false,
+        engine_name: "pg_json_each",
         check_call: |call| {
             if call.arg_count != 1 {
                 return Err(ParseError::Sqlstate {
@@ -5860,52 +5858,9 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
             }
             Ok(())
         },
-        prepare_arguments: |arguments| {
-            arguments
-                .into_iter()
-                .map(|argument| {
-                    Box::new(json_type_or_raise(
-                        json_type(vec![argument.clone()]),
-                        *argument,
-                        "object",
-                        &[(
-                            "array",
-                            "cannot deconstruct an array as an object".to_string(),
-                        )],
-                        "cannot deconstruct a scalar",
-                    ))
-                })
-                .collect()
-        },
         columns: |_| {
-            let column = |name: &str| ast::Expr::Id(exact_name(name));
-            let text = |text: &str| {
-                Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                    "'{text}'"
-                ))))
-            };
-            let json_text = ast::Expr::Case {
-                base: Some(Box::new(column("type"))),
-                when_then_pairs: vec![
-                    (text("object"), Box::new(column("value"))),
-                    (text("array"), Box::new(column("value"))),
-                    (text("true"), text("true")),
-                    (text("false"), text("false")),
-                ],
-                else_expr: Some(Box::new(ast::Expr::FunctionCall {
-                    name: exact_name("json_quote"),
-                    distinctness: None,
-                    args: vec![Box::new(column("value"))],
-                    order_by: vec![],
-                    within_group: vec![],
-                    filter_over: ast::FunctionTail {
-                        filter_clause: None,
-                        over_clause: None,
-                    },
-                })),
-            };
-            let cast = |expr: ast::Expr, type_name: &str| ast::Expr::Cast {
-                expr: Box::new(expr),
+            let cast = |name: &str, type_name: &str| ast::Expr::Cast {
+                expr: Box::new(ast::Expr::Id(exact_name(name))),
                 type_name: Some(ast::Type {
                     name: type_name.to_string(),
                     size: None,
@@ -5913,18 +5868,16 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
                 }),
             };
             vec![
-                (cast(column("key"), "TEXT"), "key".to_string()),
-                (cast(json_text, "JSON"), "value".to_string()),
+                (cast("key", "TEXT"), "key".to_string()),
+                (ast::Expr::Id(exact_name("value")), "value".to_string()),
             ]
         },
     },
 ];
 
 fn function_qualified_name(func_name: &str) -> ast::QualifiedName {
-    let in_main_schema = is_catalog_table_name(func_name)
-        || rewritten_function(func_name).is_some_and(|function| function.in_main_schema);
     let name = exact_name(func_name);
-    if in_main_schema {
+    if is_catalog_table_name(func_name) {
         ast::QualifiedName::fullname(exact_name("main"), name)
     } else {
         ast::QualifiedName::single(name)
@@ -5935,7 +5888,6 @@ fn function_qualified_name(func_name: &str) -> ast::QualifiedName {
 fn translate_rewritten_function(
     function: &RewrittenFunction,
     range_func: &pg_query::protobuf::RangeFunction,
-    qualified_name: ast::QualifiedName,
     args: Vec<Box<ast::Expr>>,
     alias: Option<ast::As>,
     call: CallShape,
@@ -5946,7 +5898,6 @@ fn translate_rewritten_function(
             "a column definition list is only allowed for functions returning \"record\"".into(),
         ));
     }
-    let args = (function.prepare_arguments)(args);
     let (mut sources, mut default_names): (Vec<_>, Vec<_>) =
         (function.columns)(args.len()).into_iter().unzip();
     if let ([name], Some(table_alias)) = (default_names.as_mut_slice(), &range_func.alias) {
@@ -5964,7 +5915,11 @@ fn translate_rewritten_function(
         })
         .collect();
     Ok(ast::SelectTable::Select {
-        select: function_select(qualified_name, args, columns),
+        select: function_select(
+            ast::QualifiedName::fullname(exact_name("main"), exact_name(function.engine_name)),
+            args,
+            columns,
+        ),
         alias: Some(alias.unwrap_or_else(|| ast::As::Elided(exact_name(function.name)))),
         lateral: true,
     })

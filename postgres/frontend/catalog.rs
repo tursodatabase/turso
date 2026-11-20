@@ -2870,9 +2870,20 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         crate::unnest::Unnest,
     );
     options = options.native_module(
+        "pg_json_each",
+        VTabKind::TableValuedFunction,
+        crate::options::TwoColumnFunction {
+            schema: "CREATE TABLE pg_json_each (key TEXT, value TEXT, input TEXT HIDDEN)",
+            append_rows: crate::functions::exec_json_each,
+        },
+    );
+    options = options.native_module(
         "pg_options_to_table",
         VTabKind::TableValuedFunction,
-        crate::options::PgOptionsToTable,
+        crate::options::TwoColumnFunction {
+            schema: "CREATE TABLE pg_options_to_table (option_name TEXT, option_value TEXT, options_array TEXT HIDDEN)",
+            append_rows: crate::options::append_options,
+        },
     );
     options = options.native_module(
         "pg_class",

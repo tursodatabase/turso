@@ -446,10 +446,7 @@ fn raise_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
     } else if msg == "value too long for varchar" {
         SQLSTATE_STRING_DATA_RIGHT_TRUNCATION
-    } else if msg.starts_with("cannot call ")
-        || msg.starts_with("cannot deconstruct ")
-        || msg.ends_with(" must be an array of objects")
-    {
+    } else if msg.starts_with("cannot call ") || msg.ends_with(" must be an array of objects") {
         SQLSTATE_INVALID_PARAMETER_VALUE
     } else {
         SQLSTATE_RAISE_EXCEPTION

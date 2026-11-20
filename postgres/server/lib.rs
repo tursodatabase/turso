@@ -1422,6 +1422,13 @@ mod tests {
                 b"\0\0\0\x011",
                 b"\0\0\0\x011",
             ),
+            // json_each() returns the text of a member, which is not a number.
+            (
+                "SELECT value FROM json_each('{\"a\":\"s\"}')",
+                Type::TEXT,
+                b"\0\0\0\x03\"s\"",
+                b"\0\0\0\x03\"s\"",
+            ),
             (
                 "SELECT coalesce(NULL::float8, 1)",
                 Type::FLOAT8,
