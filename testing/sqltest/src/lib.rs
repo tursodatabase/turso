@@ -1,5 +1,6 @@
 pub mod backends;
 pub mod comparison;
+pub mod gap;
 pub mod generator;
 pub mod matrix_oracle;
 pub mod output;

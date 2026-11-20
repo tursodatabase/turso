@@ -102,6 +102,11 @@ enum Commands {
         /// Stop at the first failed test or error
         #[arg(long)]
         fail_fast: bool,
+
+        /// Turn on the gap lints, which the PostgreSQL suites need; without
+        /// them a `@compat-gap` test does not parse.
+        #[arg(long)]
+        compat_gaps: bool,
     },
 
     /// Validate test file syntax and check for pending snapshots
@@ -109,6 +114,11 @@ enum Commands {
         /// Test files or directories
         #[arg(required = true)]
         paths: Vec<PathBuf>,
+
+        /// Turn on the gap lints, which the PostgreSQL suites need; without
+        /// them a `@compat-gap` test does not parse.
+        #[arg(long)]
+        compat_gaps: bool,
     },
 
     /// Convert Tcl .test files to .sqltest format
@@ -173,6 +183,7 @@ async fn main() -> ExitCode {
             cross_check_binary,
             postgres_dsn,
             fail_fast,
+            compat_gaps,
         } => {
             run_tests(
                 paths,
@@ -190,10 +201,11 @@ async fn main() -> ExitCode {
                 cross_check_binary,
                 postgres_dsn,
                 fail_fast,
+                compat_gaps,
             )
             .await
         }
-        Commands::Check { paths } => check_files(paths).await,
+        Commands::Check { paths, compat_gaps } => check_files(paths, compat_gaps).await,
         Commands::Convert {
             paths,
             output_dir,
@@ -248,6 +260,7 @@ async fn run_tests(
     cross_check_binary: Option<PathBuf>,
     postgres_dsn: Option<String>,
     fail_fast: bool,
+    compat_gaps: bool,
 ) -> ExitCode {
     match (&postgres_dsn, backend_type.as_str()) {
         (None, "postgres") => {
@@ -304,7 +317,7 @@ async fn run_tests(
     };
 
     // Load and parse test files
-    let loaded = match load_test_files(&paths).await {
+    let loaded = match load_test_files(&paths, &sqltest::gap::lint(compat_gaps)).await {
         Ok(loaded) => loaded,
         Err(e) => {
             eprintln!("Error loading test files: {e}");
@@ -561,7 +574,8 @@ impl sqltest::DefaultDatabaseResolver for DefaultDatabasesResolver {
     }
 }
 
-async fn check_files(paths: Vec<PathBuf>) -> ExitCode {
+async fn check_files(paths: Vec<PathBuf>, compat_gaps: bool) -> ExitCode {
+    let lint = sqltest::gap::lint(compat_gaps);
     let mut has_errors = false;
 
     // Check for pending snapshot files
@@ -607,7 +621,7 @@ async fn check_files(paths: Vec<PathBuf>) -> ExitCode {
                     for entry in entries {
                         match entry {
                             Ok(file_path) => {
-                                if !check_single_file(&file_path) {
+                                if !check_single_file(&file_path, &lint) {
                                     has_errors = true;
                                 }
                             }
@@ -624,7 +638,7 @@ async fn check_files(paths: Vec<PathBuf>) -> ExitCode {
                 }
             }
         } else if path.is_file() {
-            if !check_single_file(path) {
+            if !check_single_file(path, &lint) {
                 has_errors = true;
             }
         } else {
@@ -640,9 +654,9 @@ async fn check_files(paths: Vec<PathBuf>) -> ExitCode {
     }
 }
 
-fn check_single_file(path: &PathBuf) -> bool {
+fn check_single_file(path: &PathBuf, lint: sqltest::parser::TestLint<'_>) -> bool {
     match std::fs::read_to_string(path) {
-        Ok(content) => match sqltest::parse(&content) {
+        Ok(content) => match sqltest::parser::parse_with_lint(&content, lint) {
             Ok(file) => {
                 let snapshots_str = if file.snapshots.is_empty() {
                     String::new()

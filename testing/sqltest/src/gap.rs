@@ -1,0 +1,433 @@
+//! Gap tests.
+//!
+//! A gap test records a known difference between tursopg and PostgreSQL 18.
+//! It is a test with a `@compat-gap "<kind>:<object>"` decorator, a default `expect`
+//! block that holds the PostgreSQL answer and an `expect @tursopg` block that
+//! holds the current tursopg answer. The postgres backend checks the default
+//! block, which proves the recorded PostgreSQL answer. The tursopg backend
+//! passes when tursopg still gives the recorded answer and fails when tursopg
+//! gives the PostgreSQL answer, so that a fixed gap cannot stay recorded.
+//!
+//! This module validates gap tests.
+
+use crate::backends::QueryResult;
+use crate::parser::ast::{Backend, Expectation, Skip, SkipCondition, TestCase, TestFile};
+use std::fmt;
+
+/// What a gap label names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum GapKind {
+    Function,
+    Type,
+    Operator,
+    Cast,
+    Syntax,
+}
+
+impl GapKind {
+    pub const ALL: &'static [GapKind] = &[
+        GapKind::Function,
+        GapKind::Type,
+        GapKind::Operator,
+        GapKind::Cast,
+        GapKind::Syntax,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            GapKind::Function => "function",
+            GapKind::Type => "type",
+            GapKind::Operator => "operator",
+            GapKind::Cast => "cast",
+            GapKind::Syntax => "syntax",
+        }
+    }
+}
+
+impl fmt::Display for GapKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// The longest answer that messages and the summary print before they cut it.
+const MAX_ANSWER_LEN: usize = 80;
+
+/// One line that describes the answer an expectation records, such as
+/// `2`, `1|t; 2|f`, `no rows` or `error 22003`.
+pub fn describe_expectation(expectation: &Expectation) -> String {
+    let text = match expectation {
+        Expectation::Exact(rows) => describe_rows(trimmed(rows)),
+        Expectation::Unordered(rows) => format!("{} (any order)", describe_rows(trimmed(rows))),
+        Expectation::Pattern(pattern) => format!("output matching /{pattern}/"),
+        Expectation::Error { sqlstate, .. } => match sqlstate {
+            Some(sqlstate) => format!("error {sqlstate}"),
+            None => "an error".to_string(),
+        },
+    };
+    shorten(text)
+}
+
+/// One line that describes what a backend returned, in the form of
+/// [`describe_expectation`].
+pub fn describe_result(result: &QueryResult) -> String {
+    let text = if result.is_error() {
+        match &result.sqlstate {
+            Some(sqlstate) => format!("error {sqlstate}"),
+            None => format!(
+                "error \"{}\"",
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+            ),
+        }
+    } else {
+        let rows: Vec<String> = result.rows.iter().map(|row| row.join("|")).collect();
+        describe_rows(rows.iter().map(String::as_str).collect())
+    };
+    shorten(text)
+}
+
+fn describe_rows(rows: Vec<&str>) -> String {
+    if rows.is_empty() {
+        "no rows".to_string()
+    } else {
+        rows.iter()
+            .map(|row| row.trim())
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+fn shorten(text: String) -> String {
+    match text.char_indices().nth(MAX_ANSWER_LEN) {
+        Some((end, _)) => format!("{}...", &text[..end]),
+        None => text,
+    }
+}
+
+/// Checks the syntax of a gap label and returns its kind. The label is
+/// `<kind>:<object>`. This does not check that the object exists in
+/// PostgreSQL.
+fn label_kind(label: &str) -> Result<GapKind, String> {
+    let Some((kind, object)) = label.split_once(':') else {
+        return Err(format!(
+            "gap label '{label}' has no kind: write it as <kind>:<object>, for example function:round"
+        ));
+    };
+    let kind = GapKind::ALL
+        .iter()
+        .copied()
+        .find(|k| k.name() == kind)
+        .ok_or_else(|| {
+            format!(
+                "gap label '{label}' has the unknown kind '{kind}'; the kinds are {}",
+                GapKind::ALL
+                    .iter()
+                    .map(|k| k.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+    if object.is_empty() || object.trim() != object {
+        return Err(format!(
+            "gap label '{label}' needs an object after '{kind}:' with no leading or trailing spaces"
+        ));
+    }
+    if kind == GapKind::Cast && !object.contains(" -> ") {
+        return Err(format!(
+            "gap label '{label}' names a cast as '<source type> -> <target type>', for example cast:text -> timestamptz"
+        ));
+    }
+    Ok(kind)
+}
+
+/// Checks the rules for a test with a `@compat-gap` decorator. `global_skip` are the
+/// `@skip-file` and `@skip-file-if` directives of its file.
+fn check_gap_test(test: &TestCase, label: &str, global_skip: &[Skip]) -> Result<(), String> {
+    label_kind(label)?;
+    let Some(tursopg) = test.expectations.overrides.get(&Backend::Tursopg) else {
+        return Err(
+            "a @compat-gap test needs an `expect @tursopg` block with the current tursopg answer"
+                .to_string(),
+        );
+    };
+    if let Some(backend) = test
+        .expectations
+        .overrides
+        .keys()
+        .find(|b| **b != Backend::Tursopg)
+    {
+        return Err(format!(
+            "a @compat-gap test takes no `expect @{backend}` block: the default block is the PostgreSQL answer"
+        ));
+    }
+    if let Some(backend) = test.modifiers.backend {
+        return Err(format!(
+            "a @compat-gap test cannot have @backend {backend}: it must run on both the tursopg and the postgres backend"
+        ));
+    }
+    for skip in test.modifiers.skip.iter().chain(global_skip) {
+        match skip.condition {
+            None => {
+                return Err(
+                    "a @compat-gap test cannot be skipped: it must run on the postgres backend"
+                        .to_string(),
+                );
+            }
+            Some(SkipCondition::Postgres) => {
+                return Err(
+                    "a @compat-gap test cannot have @skip-if postgres: the postgres backend proves its PostgreSQL answer"
+                        .to_string(),
+                );
+            }
+            Some(SkipCondition::Mvcc | SkipCondition::Sqlite) => {}
+        }
+    }
+    let postgres = &test.expectations.default;
+    for (side, expectation) in [("default", postgres), ("@tursopg", tursopg)] {
+        match expectation {
+            Expectation::Pattern(_) => {
+                return Err(format!(
+                    "the {side} block of a @compat-gap test cannot be `expect pattern`: a pattern can match both answers"
+                ));
+            }
+            Expectation::Error { sqlstate, .. } => {
+                if sqlstate.is_none() {
+                    return Err(format!(
+                        "the {side} error block of a @compat-gap test needs @sqlstate: error gaps compare the SQLSTATE"
+                    ));
+                }
+            }
+            Expectation::Exact(_) | Expectation::Unordered(_) => {}
+        }
+    }
+    if crate::comparison::may_match_same_output(postgres, tursopg) {
+        return Err(
+            "the default block and the `expect @tursopg` block of this @compat-gap test accept the same answer"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The rows of an exact expectation without leading and trailing empty
+/// lines, for display.
+fn trimmed(rows: &[String]) -> Vec<&str> {
+    let mut rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    while rows.first().is_some_and(|r| r.is_empty()) {
+        rows.remove(0);
+    }
+    while rows.last().is_some_and(|r| r.is_empty()) {
+        rows.pop();
+    }
+    rows
+}
+
+/// Checks a test that has an `expect @tursopg` block and no `@compat-gap`
+/// decorator. Such a block may only record a tursopg error message that
+/// differs from the PostgreSQL message for the same SQLSTATE. A different
+/// answer is a gap and needs `@compat-gap`.
+pub(crate) fn check_tursopg_override(test: &TestCase) -> Result<(), String> {
+    let Some(tursopg) = test.expectations.overrides.get(&Backend::Tursopg) else {
+        return Ok(());
+    };
+    let postgres = test.expectations.for_backend(Backend::Postgres);
+    match (postgres.sqlstate(), tursopg.sqlstate()) {
+        (Some(pg), Some(turso)) if pg == turso => Ok(()),
+        _ => Err(
+            "an `expect @tursopg` block without @compat-gap may only change the error message for the \
+             same @sqlstate; tursopg gives a different answer here, so record it as a gap with \
+             @compat-gap \"<kind>:<object>\""
+                .to_string(),
+        ),
+    }
+}
+
+/// The gap lints for one test of a file: the rules of a `@compat-gap` test
+/// and of an `expect @tursopg` block without `@compat-gap`.
+pub fn lint_test(file: &TestFile, test: &TestCase) -> Result<(), String> {
+    match &test.gap {
+        Some(label) => check_gap_test(test, label, &file.global_skip),
+        None => check_tursopg_override(test),
+    }
+}
+
+/// The lint that the sqltest commands run on each test: the gap lints when
+/// `compat_gaps` is set (`--compat-gaps`), or else the parser's rejection of
+/// `@compat-gap`.
+pub fn lint(compat_gaps: bool) -> impl Fn(&TestFile, &TestCase) -> Result<(), String> + Sync {
+    move |file, test| {
+        if compat_gaps {
+            lint_test(file, test)
+        } else {
+            crate::parser::reject_compat_gap(file, test)
+        }
+    }
+}
+
+/// Parses a test file with the gap lints, for unit tests.
+#[cfg(test)]
+pub(crate) fn parse_with_gap_lints(input: &str) -> Result<TestFile, crate::ParseError> {
+    crate::parser::parse_with_lint(input, &lint_test)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parses a file with the given tests after a `@database :memory:` line,
+    /// with the gap lints on.
+    fn parse_tests(tests: &str) -> Result<TestFile, String> {
+        parse_with_gap_lints(&format!("@database :memory:\n\n{tests}"))
+            .map_err(|e| format!("{e:?}"))
+    }
+
+    fn assert_rejected(tests: &str, message: &str) {
+        let err = parse_tests(tests).expect_err("the file must not parse");
+        assert!(err.contains(message), "expected `{message}` in: {err}");
+    }
+
+    const WRONG: &str = r#"
+@compat-gap "type:bool"
+test wrong {
+    SELECT true;
+}
+expect {
+    t
+}
+expect @tursopg {
+    1
+}
+"#;
+
+    #[test]
+    fn compat_gap_without_the_flag_is_an_error() {
+        let err = crate::parse(&format!("@database :memory:\n\n{WRONG}"))
+            .expect_err("a gap test without --compat-gaps must not parse");
+        assert!(format!("{err:?}").contains("--compat-gaps"), "{err:?}");
+        // Without --compat-gaps, the lints for `expect @tursopg` blocks do not run.
+        let plain = WRONG.replace("@compat-gap \"type:bool\"\n", "");
+        crate::parse(&format!("@database :memory:\n\n{plain}")).unwrap();
+    }
+
+    #[test]
+    fn label_kinds() {
+        assert_eq!(label_kind("function:age"), Ok(GapKind::Function));
+        assert_eq!(label_kind("type:_int4"), Ok(GapKind::Type));
+        assert_eq!(label_kind("operator:jsonb @> jsonb"), Ok(GapKind::Operator));
+        assert_eq!(label_kind("cast:timestamptz -> date"), Ok(GapKind::Cast));
+        assert_eq!(label_kind("syntax:on-conflict"), Ok(GapKind::Syntax));
+        assert!(label_kind("relation:pg_class").is_err());
+        assert!(label_kind("age").is_err());
+        assert!(label_kind("function:").is_err());
+        assert!(label_kind("cast:timestamptz").is_err());
+        assert_eq!(label_kind("syntax:any-form"), Ok(GapKind::Syntax));
+    }
+
+    #[test]
+    fn valid_gap_test_parses() {
+        let file = parse_tests(WRONG).unwrap();
+        assert_eq!(file.tests[0].gap.as_deref(), Some("type:bool"));
+    }
+
+    #[test]
+    fn lint_unknown_label_kind() {
+        assert_rejected(&WRONG.replace("type:bool", "relation:pg_class"), "relation");
+    }
+
+    #[test]
+    fn lint_gap_without_tursopg_override() {
+        assert_rejected(
+            "@compat-gap \"type:bool\"\ntest t {\n    SELECT true;\n}\nexpect {\n    t\n}\n",
+            "expect @tursopg",
+        );
+    }
+
+    #[test]
+    fn lint_gap_that_does_not_run_on_postgres() {
+        assert_rejected(
+            &WRONG.replace("@compat-gap", "@skip-if postgres \"x\"\n@compat-gap"),
+            "postgres backend",
+        );
+        assert_rejected(
+            &WRONG.replace("@compat-gap", "@skip \"x\"\n@compat-gap"),
+            "postgres backend",
+        );
+        assert_rejected(
+            &WRONG.replace("@compat-gap", "@backend tursopg\n@compat-gap"),
+            "@backend",
+        );
+        let err = parse_with_gap_lints(&format!(
+            "@database :memory:\n@skip-file-if postgres \"x\"\n{WRONG}"
+        ))
+        .expect_err("the file must not parse");
+        assert!(format!("{err:?}").contains("postgres"), "{err:?}");
+    }
+
+    #[test]
+    fn lint_pattern_in_gap_test() {
+        assert_rejected(
+            &WRONG.replace("expect @tursopg {", "expect @tursopg pattern {"),
+            "pattern",
+        );
+    }
+
+    #[test]
+    fn lint_error_block_with_message_or_without_sqlstate() {
+        let no_sqlstate = "@compat-gap \"type:int4\"\ntest t {\n    SELECT 1;\n}\nexpect error {\n}\nexpect @tursopg {\n    1\n}\n";
+        assert_rejected(no_sqlstate, "@sqlstate");
+        // The default block holds the PostgreSQL message, which the postgres
+        // backend checks.
+        let postgres_message = "@compat-gap \"type:int4\"\ntest t {\n    SELECT 1;\n}\n@sqlstate 22003\nexpect error {\n    out of range\n}\nexpect @tursopg {\n    1\n}\n";
+        parse_tests(postgres_message).unwrap();
+        // The @tursopg block may give the tursopg message, which the tursopg
+        // run compares.
+        parse_tests("@compat-gap \"type:int4\"\ntest t {\n    SELECT 1;\n}\nexpect {\n    1\n}\n@sqlstate 0A000\nexpect @tursopg error {\n    not supported\n}\n").unwrap();
+        // Messages do not make two errors with the same SQLSTATE different.
+        let same_sqlstate = "@compat-gap \"type:int4\"\ntest t {\n    SELECT 1;\n}\n@sqlstate 22003\nexpect error {\n    out of range\n}\n@sqlstate 22003\nexpect @tursopg error {\n}\n";
+        assert_rejected(same_sqlstate, "same answer");
+    }
+
+    #[test]
+    fn lint_same_answer_in_both_blocks() {
+        assert_rejected(&WRONG.replace("    1\n}", "    t\n}"), "same");
+        // Unordered blocks compare row sets, so repeated rows count once.
+        assert_rejected(
+            "@compat-gap \"type:int4\"\ntest t {\n    SELECT 1;\n}\nexpect unordered {\n    1\n    1\n}\nexpect @tursopg unordered {\n    1\n}\n",
+            "same",
+        );
+        // An empty line in an exact block is a NULL row.
+        parse_tests(
+            "@compat-gap \"type:int4\"\ntest t {\n    SELECT 1;\n}\nexpect {\n    1\n\n    2\n}\nexpect @tursopg {\n    1\n    2\n}\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn lint_two_gap_labels() {
+        assert_rejected(
+            &WRONG.replace("@compat-gap", "@compat-gap \"type:int4\"\n@compat-gap"),
+            "one @compat-gap label",
+        );
+    }
+
+    #[test]
+    fn override_without_gap() {
+        // Only the message differs: allowed.
+        parse_tests(
+            "test t {\n    SELECT x;\n}\n@sqlstate 42703\nexpect error {\n    column \"x\" does not exist\n}\n@sqlstate 42703\nexpect @tursopg error {\n    no such column: x\n}\n",
+        )
+        .unwrap();
+        // A different answer needs @compat-gap.
+        assert_rejected(
+            &WRONG.replace("@compat-gap \"type:bool\"\n", ""),
+            "@compat-gap",
+        );
+    }
+
+}
