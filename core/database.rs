@@ -2033,7 +2033,8 @@ impl Database {
                     let header = return_if_io!(self.read_authenticated_header(
                         header_st,
                         encryption_key,
-                        page_codec
+                        page_codec,
+                        true
                     ));
                     let pager = self.init_pager(header)?;
 
@@ -2564,20 +2565,9 @@ impl Database {
     }
 
     #[cfg(feature = "conn_raw_api")]
-    pub(crate) fn ensure_external_restore_supported(&self) -> Result<()> {
-        if self.encryption_cipher() != CipherMode::None {
-            return Err(LimboError::InvalidArgument(
-                "external restore is not supported with built-in encryption".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "conn_raw_api")]
     /// Rebuild the process-local shared WAL view after a caller restores the
     /// database and WAL files outside the pager.
     pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
-        self.ensure_external_restore_supported()?;
         self.reload_wal_after_external_restore_with_encryption_key(None)
     }
 
@@ -2592,7 +2582,8 @@ impl Database {
                     .to_string(),
             ));
         }
-        self.validate_external_restore_encryption(encryption_key.as_ref())?;
+        let encryption_context =
+            self.validate_external_restore_encryption(encryption_key.as_ref())?;
         let flags = self.open_flags;
         #[cfg(host_shared_wal)]
         let shared_authority = self.open_shared_wal_coordination_for_open()?;
@@ -2633,8 +2624,6 @@ impl Database {
             .replace_after_external_restore(new_shared_wal.into_inner());
         if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
         {
-            let pager = self._init(encryption_key.as_ref(), None)?;
-            let encryption_context = pager.io_ctx.read().encryption_context().cloned();
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
                 &self.path,
@@ -2667,7 +2656,10 @@ impl Database {
     }
 
     #[cfg(feature = "conn_raw_api")]
-    fn validate_external_restore_encryption(&self, key: Option<&EncryptionKey>) -> Result<()> {
+    fn validate_external_restore_encryption(
+        &self,
+        key: Option<&EncryptionKey>,
+    ) -> Result<Option<EncryptionContext>> {
         let cipher = self.encryption_cipher();
         if cipher == CipherMode::None {
             if key.is_some() {
@@ -2675,33 +2667,17 @@ impl Database {
                     "database was opened without encryption".into(),
                 ));
             }
-            return Ok(());
+            return Ok(None);
         }
         let key = key.ok_or_else(|| {
             LimboError::InvalidArgument("encrypted database requires an encryption key".into())
         })?;
-        let mut context = self.pager_state.verify_encryption_key(key)?;
-        let mut state = DbHeaderReadState::default();
-        let header = self.io.block(|| self.read_db_header_buf(&mut state))?;
-        let (reserved, page_size) = Self::plain_header_page_info(&header, true)?;
-        if reserved as usize != cipher.metadata_size()
-            || self
-                .pager_state
-                .page_size()
-                .is_some_and(|current| current != page_size)
-        {
-            return Err(LimboError::InvalidArgument(
-                "external restore cannot change the encrypted database page layout".into(),
-            ));
-        }
-        context.set_page_size(page_size);
-        let mut io_ctx = IOContext::default();
-        io_ctx.set_encryption(context);
-        let buf = Arc::new(Buffer::new_temporary(page_size.get() as usize));
-        let completion = new_header_read_completion(buf);
-        let completion = self.db_file.read_page(1, &io_ctx, completion)?;
-        self.io.wait_for_completion(completion)?;
-        Ok(())
+        self.pager_state.verify_encryption_key(key)?;
+        let mut state = HeaderAuthenticationState::default();
+        let header = self
+            .io
+            .block(|| self.read_authenticated_header(&mut state, Some(key), None, false))?;
+        Ok(header.io_ctx.encryption_context().cloned())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -3617,6 +3593,7 @@ impl Database {
         st: &mut HeaderAuthenticationState,
         encryption_key: Option<&EncryptionKey>,
         page_codec: Option<&Arc<dyn PageCodec>>,
+        use_cached_header: bool,
     ) -> IOResultOr<AuthenticatedHeader> {
         if encryption_key.is_some() && page_codec.is_some() {
             return Err(LimboError::InvalidArgument(
@@ -3646,7 +3623,9 @@ impl Database {
             match st {
                 HeaderAuthenticationState::ReadHeader(hdr_st) => {
                     if let Some(key) = encryption_key {
-                        if let Some(page_size) = self.pager_state.page_size() {
+                        if let Some(page_size) =
+                            self.pager_state.page_size().filter(|_| use_cached_header)
+                        {
                             let mut context = self.pager_state.verify_encryption_key(key)?;
                             context.set_page_size(page_size);
                             let mut io_ctx = IOContext::default();
@@ -3664,6 +3643,19 @@ impl Database {
                         let header = return_if_io!(self.read_db_header_buf(hdr_st));
                         let (reserved_space, page_size) =
                             Self::plain_header_page_info(&header, true)?;
+                        if !use_cached_header
+                            && (reserved_space as usize != cipher.metadata_size()
+                                || self
+                                    .pager_state
+                                    .page_size()
+                                    .is_some_and(|current| current != page_size))
+                        {
+                            return Err(LimboError::InvalidArgument(
+                                "external restore cannot change the encrypted database page layout"
+                                    .into(),
+                            )
+                            .into());
+                        }
                         if reserved_space as usize != cipher.metadata_size() {
                             return Err(LimboError::InvalidArgument(
                                 "encryption cipher does not match the database reserved bytes"
@@ -4242,6 +4234,7 @@ mod database_tests {
                     &mut state,
                     Some(&EncryptionKey::new_256([1; 32])),
                     None,
+                    true,
                 )
             })
             .unwrap();

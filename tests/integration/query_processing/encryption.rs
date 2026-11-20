@@ -2671,6 +2671,42 @@ fn connect_async_yields_and_cancellation_releases_read_transactions() -> anyhow:
 }
 
 #[test]
+fn encrypted_restore_rejects_a_file_encrypted_with_another_key() -> anyhow::Result<()> {
+    for cipher in [CIPHER_A, CIPHER_B] {
+        for mvcc in [false, true] {
+            let target = TempDatabaseBuilder::new()
+                .with_encryption(cipher, KEY_A)
+                .with_mvcc(mvcc)
+                .build();
+            let source = TempDatabaseBuilder::new()
+                .with_encryption(cipher, KEY_B)
+                .with_mvcc(mvcc)
+                .build();
+            let owner = target.connect_limbo();
+            let foreign = source.connect_limbo();
+            for conn in [&owner, &foreign] {
+                conn.execute("CREATE TABLE secrets(value TEXT)")?;
+                conn.execute("INSERT INTO secrets VALUES ('protected value')")?;
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            }
+            let original = std::fs::read(&target.path)?;
+            std::fs::copy(&source.path, &target.path)?;
+            let error = owner.reload_wal_after_external_restore().unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::CompletionError(CompletionError::DecryptionError { .. })
+            ));
+            std::fs::write(&target.path, original)?;
+            owner.reload_wal_after_external_restore()?;
+            owner.publish_schema_after_external_restore()?;
+            let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
+            assert_eq!(rows, [("protected value".into(),)]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn encrypted_restore_requires_the_current_key_and_preserves_page_layout() -> anyhow::Result<()> {
     for cipher in [CIPHER_A, CIPHER_B] {
         for mvcc in [false, true] {
