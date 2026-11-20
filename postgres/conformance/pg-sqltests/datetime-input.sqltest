@@ -1137,3 +1137,11 @@ expect {
     2024-01-05 10:00:00+00
     2024-01-05 11:00:00+00
 }
+
+test datetime-input-untyped-literal-in-timestamptz-array {
+    SELECT array_to_json(ARRAY['2024-01-05'::timestamptz, '2024-01-06']),
+           ARRAY['2024-01-05'::timestamp, '2024-01-06']::text;
+}
+expect {
+    ["2024-01-05T00:00:00+00:00","2024-01-06T00:00:00+00:00"]|{"2024-01-05 00:00:00","2024-01-06 00:00:00"}
+}

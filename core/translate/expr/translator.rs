@@ -1417,14 +1417,33 @@ fn translate_function_call_expr(
                 // Arity and custom-types checks are done at bind time
                 // in validate_custom_type_function_call.
                 ScalarFunc::Array => {
-                    translate_variadic_insn!(
-                        program,
+                    // As in PostgreSQL, a string literal or parameter next to
+                    // an element of a custom type is an element of that type.
+                    let values_type = untyped_values_type(
+                        args.iter().map(|arg| arg.as_ref()),
                         referenced_tables,
                         resolver,
-                        args,
-                        target_register,
-                        MakeArray
-                    )
+                    )?;
+                    let start_reg = program.alloc_registers(args.len());
+                    for (i, arg) in args.iter().enumerate() {
+                        let reg = start_reg + i;
+                        if !translate_untyped_value(
+                            program,
+                            referenced_tables,
+                            arg,
+                            values_type.as_ref(),
+                            reg,
+                            resolver,
+                        )? {
+                            translate_expr(program, referenced_tables, arg, reg, resolver)?;
+                        }
+                    }
+                    program.emit_insn(Insn::MakeArray {
+                        start_reg,
+                        count: args.len(),
+                        dest: target_register,
+                    });
+                    Ok(target_register)
                 }
                 ScalarFunc::ArrayElement => {
                     translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
