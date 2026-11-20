@@ -12,6 +12,7 @@ use turso_sqlite::SqliteDialect;
 use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use sql_generation::model::query::pragma::Pragma;
 use sql_generation::model::table::SimValue;
 use turso_core::{ConnectOpts, Connection, Result, StepResult};
 
@@ -867,13 +868,29 @@ impl InteractionType {
                 })
                 .collect();
 
+            // An MVCC checkpoint writes the WAL and the database file before it
+            // truncates the logical log, its first operation on the log. A fault
+            // on all files stops the checkpoint at its first WAL write, so a
+            // faulty MVCC checkpoint gets a fault on the log only. The fault is
+            // on at every step: the checkpoint runs in one step, and a fault at
+            // the first step has only the chance `current_prob`.
+            let fault_only_log =
+                env.profile.mvcc && matches!(query, Query::Pragma(Pragma::WalCheckpoint { .. }));
+            let main_log_name = format!("{main_db_stem}.db-log");
+
             loop {
                 let syncing = env.io.syncing();
 
                 // Decide faults independently per database
                 let main_fault = env.rng.random_bool(current_prob);
                 let aux_prob = (current_prob * 0.5).min(1.0);
-                let mut fault_pairs: Vec<(&str, bool)> = vec![(&main_db_stem, main_fault)];
+                // `inject_fault_selective` uses the first pair whose name is in
+                // the path of a file, so the log name comes before the stem.
+                let mut fault_pairs: Vec<(&str, bool)> = if fault_only_log {
+                    vec![(&main_log_name, true), (&main_db_stem, false)]
+                } else {
+                    vec![(&main_db_stem, main_fault)]
+                };
                 for (_, stem) in &aux_db_stems {
                     let aux_fault = env.rng.random_bool(aux_prob);
                     fault_pairs.push((stem, aux_fault));

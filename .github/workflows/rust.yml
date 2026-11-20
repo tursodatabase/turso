@@ -394,6 +394,9 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 35
     strategy:
+      # Each profile tests different code, so a failure in one profile must not
+      # cancel the others.
+      fail-fast: false
       matrix:
         profile:
           - name: default
@@ -408,6 +411,11 @@ jobs:
           - name: Faultless
             iterations: 10
             args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --io-backend=memory"
+          # The default backend, not memory: it rejects an operation with a
+          # fault when it is issued, as `UnixFile::truncate` does.
+          - name: MvccSingleConnection
+            iterations: 10
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile mvcc_single_connection --io-backend=default"
           - name: SavepointStress
             iterations: 5
             args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile savepoint_stress --io-backend=memory"

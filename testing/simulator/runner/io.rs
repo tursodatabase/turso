@@ -96,9 +96,14 @@ impl SimIO for SimulatorIO {
     fn syncing(&self) -> bool {
         let files = self.files.borrow();
         // TODO: currently assuming we only have 1 file that is syncing
-        files
-            .iter()
-            .any(|file| file.sync_completion.borrow().is_some())
+        // `sync_completion` keeps the last sync after it finished, so only a
+        // sync that has not finished is in progress.
+        files.iter().any(|file| {
+            file.sync_completion
+                .borrow()
+                .as_ref()
+                .is_some_and(|c| !c.finished())
+        })
     }
 
     fn close_files(&self) {
@@ -189,7 +194,10 @@ mod tests {
     use turso_core::SessionRole;
 
     use anyhow::Result;
-    use turso_core::{ConnectOpts, Connection, Database, LimboError, OpenOptions};
+    use turso_core::io::FileSyncType;
+    use turso_core::{
+        Completion, ConnectOpts, Connection, Database, IO, LimboError, OpenFlags, OpenOptions,
+    };
     use turso_sqlite::SqliteDialect;
 
     use super::SimulatorIO;
@@ -272,6 +280,31 @@ mod tests {
             query_ids(&observer)?,
             vec![2],
             "a later transaction must not publish the failed row"
+        );
+        Ok(())
+    }
+
+    /// What this test checks: the default backend reports a sync as in
+    /// progress only until the sync finishes. `execute_faulty_query` injects
+    /// no faults while a sync is in progress, so a sync that stays in
+    /// progress turns off fault injection for the rest of the run.
+    #[test]
+    fn finished_sync_is_not_in_progress() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("finished-sync.db");
+        let path = path.to_str().expect("temporary path must be UTF-8");
+        let io = SimulatorIO::new(1, 4096, 0, 1, 1, IoBackend::Default)?;
+        let file = io.open_file(path, OpenFlags::Create, false)?;
+
+        let sync = file.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?;
+        while !sync.finished() {
+            io.step()?;
+        }
+
+        assert!(sync.succeeded(), "the sync must succeed");
+        assert!(
+            !io.syncing(),
+            "a finished sync must not count as a sync in progress"
         );
         Ok(())
     }
