@@ -178,9 +178,13 @@ statements of one query string;
 timestamp and timestamptz are stored as PostgreSQL stores them, as
 microseconds since 2000-01-01, and print as PostgreSQL prints them, with,
 for timestamptz, a `+00` offset. Storing, comparing, sorting, indexing, `min`
-and `max` match PostgreSQL. Functions other than these, such as `length`
-or `||` on a timestamp, are not yet checked against PostgreSQL's signatures
-and can return a value where PostgreSQL returns an error. `to_timestamp`,
+and `max` match PostgreSQL, and a timestamp compared with a timestamptz, or
+mixed with it in a UNION, is converted to a timestamptz in UTC as PostgreSQL
+does. Other functions are not yet checked against PostgreSQL's signatures and
+can return a value where PostgreSQL returns an error: `length(ts)` returns the
+length of the printed text (PostgreSQL: 42883). `coalesce`, `||` and arrays of
+timestamps return values as in PostgreSQL. Arithmetic such as `ts + 1` is an
+error. `to_timestamp`,
 `make_timestamp` and input such as `infinity` are rejected as not supported
 (0A000).
 
