@@ -61,7 +61,7 @@ Basics not enumerated by the official feature matrix.
 | ALTER TABLE/VIEW/MATERIALIZED VIEW/SEQUENCE/INDEX ... OWNER TO | 🟡 Partial | Changes the stored owner, which may then alter and drop the relation; a table's indexes and serial sequences move with it, ALTER INDEX changes nothing, and a serial column's sequence refuses its own OWNER TO (0A000); superuser-only for now, so an owner cannot transfer ownership |
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
 | CREATE VIEW | ✅ Supported | Column aliases supported when they name every select-list column; TEMP, UNLOGGED, OR REPLACE, WITH (options) and WITH CHECK OPTION rejected |
-| COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
+| COMMENT ON | 🟡 Partial | Stored in `pg_description` for tables, views, materialized views, indexes, sequences, table columns and schemas. Any other kind of object, a column of a view, a catalog relation such as `pg_class`, and the index of a PRIMARY KEY or UNIQUE constraint, is rejected with 0A000 |
 | CREATE SCHEMA / DROP SCHEMA | ✅ Supported | A schema is stored in the main database under an id; its objects are stored under names that start with `__turso_ns<id>_`, which no user object may be named; an object qualified with `main` or `temp` is an error, since PostgreSQL has no such schemas; `public` is a schema like any other, created when a new database is made, and once dropped it stays dropped until CREATE SCHEMA public; DROP ... CASCADE; AUTHORIZATION rejected; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists; CREATE SCHEMA can contain CREATE TABLE, VIEW, INDEX and SEQUENCE statements, which create their objects in the new schema, but not inside a transaction block. Databases with schemas in `turso-postgres-schema-*.db` files from earlier versions are not supported; their schemas must be recreated. A database made by an earlier version, whose tables are in no schema, is refused when a session connects. |
 | ALTER SEQUENCE | 🟡 Partial | OWNED BY { table.column \| NONE } works, which is how a serial column's sequence belongs to its table; the other options are rejected |
 | CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE 1 accepted, a larger CACHE rejected (Turso does not cache sequence values); OWNED BY a column, TEMP and other options rejected; pg_sequences view; pg_sequence exposes the parameters of the sequences of every schema (bigint, cache 1); pg_class lists the sequences of every schema with relkind S (sequence dumps remain incomplete); a sequence named without a schema is looked up through `search_path`, and a column default, CHECK constraint, view or policy binds it to the schema it is in when the table, column, view or policy is created; a serial column's sequence is created in the table's schema |
@@ -91,9 +91,10 @@ as the text `pg_get_expr` prints), `pg_policies`, plus `pg_input_error_info`. Pr
 always empty: `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
 `pg_foreign_table`, `pg_partitioned_table`, `pg_collation`,
 `pg_publication*`, `pg_seclabels` (security labels are not supported).
-`pg_description` contains the default `standard public schema` comment for
-`public`, so pg_dump does not emit a command to clear that comment on restore.
-User-defined comments are not persisted. The public schema reports
+`pg_description` is a stored table. It has the comments that `COMMENT ON`
+stored, and the default `standard public schema` comment for `public`, so
+pg_dump does not emit a command to clear that comment on restore. Dropping a
+relation, a column or a schema deletes its comments. The public schema reports
 `pg_database_owner` as its owner, with CREATE and USAGE for that role and USAGE
 for PUBLIC. These are catalog defaults; role management is not implemented.
 `pg_statistic_ext` exposes the hidden system column
@@ -117,8 +118,10 @@ Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
 forms; the first schema of `search_path` that exists), `current_schemas(boolean)`
 (existing schemas in search order, optionally including implicit `pg_catalog`), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
-`obj_description()`/`col_description()` always return NULL because COMMENT ON
-is not persisted. DML against pg_catalog is rejected. `pg_typeof` is not
+`obj_description()`/`col_description()` read `pg_description`; `obj_description()`
+knows the catalogs `pg_class` and `pg_namespace` and returns NULL for any other.
+A call of either in a column DEFAULT, a CHECK constraint or an index, or with an aggregate or window function in an argument, is rejected with 0A000.
+DML against pg_catalog is rejected. `pg_typeof` is not
 implemented.
 Configuration settings functions: `set_config()` and `current_setting()`,
 for `search_path` and for custom parameters (see Configuration Management).

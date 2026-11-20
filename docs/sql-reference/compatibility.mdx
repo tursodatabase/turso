@@ -34,10 +34,24 @@ The PostgreSQL opening functions initialize the relation catalog before returnin
 the database, including for asynchronous server opens. Relations receive stable,
 persisted OIDs when created, and column `attrelid` values identify those relations.
 
-The PostgreSQL frontend exposes the default `standard public schema` comment in
-`pg_catalog.pg_description`. This lets `pg_dump` preserve the default comment on
-`public` without emitting an empty `COMMENT ON SCHEMA` statement. User-defined
-comments are not persisted.
+`pg_catalog.pg_description` is a table in the database file. `COMMENT ON`
+stores the comment of a table, view, materialized view, index, sequence, table
+column or schema in it, in the transaction of the statement, and `COMMENT ON
+... IS NULL` deletes it. Dropping the relation, the column or the schema
+deletes its comments. `obj_description(oid, 'pg_class')`,
+`obj_description(oid, 'pg_namespace')` and `col_description(table_oid,
+column_number)` read them. `COMMENT ON` any other kind of object, such as a
+type, a function or a constraint, on a column of a view, and on a catalog
+relation such as `pg_class`, fails with SQLSTATE 0A000. So does `COMMENT ON
+INDEX` for the index of a `PRIMARY KEY` or `UNIQUE` constraint, such as
+`t_pkey`. A call of `obj_description` or `col_description` fails with SQLSTATE
+0A000 in a column `DEFAULT`, in a `CHECK` constraint, in an index, and with an
+aggregate or window function in an argument, such as `obj_description(max(oid),
+'pg_class')`; an aggregate inside a subquery in the argument works. Only the owner of a relation or a superuser comments on it,
+and only a superuser comments on a schema. A new database has the default
+`standard public schema` comment of `public`, so `pg_dump` does not emit an
+empty `COMMENT ON SCHEMA` statement for it. Every role reads `pg_description`,
+and no statement of a user writes it other than `COMMENT ON`.
 
 The public schema reports `pg_database_owner` as its owner, with `CREATE` and
 `USAGE` for that role and `USAGE` for `PUBLIC`, matching PostgreSQL's defaults.
