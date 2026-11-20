@@ -62,6 +62,145 @@ struct Case {
     tail: bool,
 }
 
+fn main() {
+    eprintln!("fixture,case,key,layout,total_rows,update_rows,value_columns,round,stage,checkpoint_policy,remote_update_seconds,connect_seconds,pull_seconds,empty_pull_seconds,checkpoint_seconds,cycle_seconds,log_bytes_before_pull,log_bytes_after_pull,log_bytes_after_checkpoint");
+    divan::main();
+}
+
+#[turso_macros::divan_bench_single_call(args = cases(), sample_count = 1, sample_size = 1, ignore = true)]
+fn large_pull_matrix(bencher: divan::Bencher, case: &Case) {
+    // Each sample creates a new remote and replicas, so increasing Divan's
+    // sample count never times an already-consumed, empty pull.
+    bencher.bench_local(|| run_case(*case).expect("large pull scenario failed"));
+}
+
+fn cases() -> Vec<Case> {
+    let base = Case {
+        name: "scaling-100k-50k-raw",
+        rows: 100_000,
+        updates: 50_000,
+        key: Key::Raw,
+        layout: Layout::Full,
+        columns: 11,
+        update_column: 2,
+        mixed_json: false,
+        tail: false,
+    };
+    let mut cases = Vec::new();
+    for (rows, updates, raw, padded) in [
+        (
+            100_000,
+            10_000,
+            "scaling-100k-10k-raw",
+            "scaling-100k-10k-padded",
+        ),
+        (
+            100_000,
+            50_000,
+            "scaling-100k-50k-raw",
+            "scaling-100k-50k-padded",
+        ),
+        (
+            100_000,
+            100_000,
+            "scaling-100k-100k-raw",
+            "scaling-100k-100k-padded",
+        ),
+        (
+            250_000,
+            50_000,
+            "scaling-250k-50k-raw",
+            "scaling-250k-50k-padded",
+        ),
+        (
+            250_000,
+            100_000,
+            "scaling-250k-100k-raw",
+            "scaling-250k-100k-padded",
+        ),
+        (
+            250_000,
+            200_000,
+            "scaling-250k-200k-raw",
+            "scaling-250k-200k-padded",
+        ),
+    ] {
+        for (name, key) in [(raw, Key::Raw), (padded, Key::Padded)] {
+            cases.push(Case {
+                name,
+                rows,
+                updates,
+                key,
+                ..base
+            });
+        }
+    }
+    for (name, key) in [
+        ("key-permuted", Key::Permuted),
+        ("key-reverse-padded", Key::ReversePadded),
+        ("key-integer", Key::Integer),
+        ("key-composite", Key::Composite),
+    ] {
+        cases.push(Case { name, key, ..base });
+    }
+    for (name, layout) in [
+        ("schema-no-indexes", Layout::NoIndexes),
+        ("schema-no-generated", Layout::NoGenerated),
+        ("schema-plain", Layout::Plain),
+    ] {
+        cases.push(Case {
+            name,
+            layout,
+            ..base
+        });
+    }
+    cases.extend([
+        Case {
+            name: "width-2",
+            columns: 2,
+            ..base
+        },
+        Case {
+            name: "width-24",
+            columns: 24,
+            ..base
+        },
+        Case {
+            name: "update-indexed-generated-value",
+            update_column: 1,
+            ..base
+        },
+        Case {
+            name: "mixed-json-branches",
+            mixed_json: true,
+            ..base
+        },
+        Case {
+            name: "update-tail",
+            tail: true,
+            ..base
+        },
+    ]);
+    if let Ok(selected) = std::env::var("PULL_MATRIX_CASES") {
+        let names = selected.split(',').collect::<Vec<_>>();
+        assert!(!names.is_empty());
+        for name in &names {
+            assert!(
+                cases.iter().any(|case| case.name == *name),
+                "unknown PULL_MATRIX_CASES entry: {name}"
+            );
+        }
+        cases.retain(|case| names.contains(&case.name));
+    }
+    for case in &mut cases {
+        case.rows = setting("PULL_MATRIX_ROWS", case.rows);
+        case.updates = setting("PULL_MATRIX_UPDATES", case.updates);
+        assert!(case.rows > 0 && case.rows <= u32::MAX as usize);
+        assert!(case.updates > 0 && case.updates <= case.rows);
+    }
+    cases
+}
+
 fn run_case(case: Case) -> Result<()> {
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
     let fixture = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
