@@ -198,39 +198,25 @@ recovery readers; the sync codec does not change the existing format. See the
 
 ## Validation
 
+Run the Rust suites and binding checks from this repository:
+
 ```sh
-cargo +stable test -p turso_sync_engine -p turso_sync_sdk_kit
-cargo +stable check -p turso --features turso/sync -p turso_sync_js -p py-turso
-cargo +stable test -p turso_core --features conn_raw_api logical_log
-cargo +stable test -p turso_core --features conn_raw_api encrypted_mvcc_reload
+cargo test --locked -p turso_sync_engine -p turso_sync_sdk_kit
+cargo check --locked -p turso --features turso/sync -p turso_sync_js -p py-turso
+cargo test --locked -p turso_core --features conn_raw_api --lib logical_log
+cargo test --locked -p core_tester --test integration_tests query_processing::encryption::
+python3 testing/cli_tests/sync_encryption.py
+pytest bindings/python/tests/test_sync_encryption.py
 ```
 
-The encrypted integration tests in `sync/engine/tests/mvcc_logical_pull/encryption.rs`
-cover empty and zero-page bootstrap, incremental pull, plaintext replicas,
-metadata/staging confidentiality, wrong or missing local keys, incompatible bootstrap pages, replacement, failed replacement recovery, checkpoint, and reopen.
-They also inject bootstrap failures before/after database sync and metadata
-publication, exercise pending replacement recovery at startup, and verify that
-a later create retries with missing or empty metadata, including a subprocess
-that exits after database fsync before metadata publication. Nonempty partial
-metadata, damaged metadata, and wrong-key retries preserve the existing files.
-Tests also verify that a metadata write failure preserves the published revision
-and that metadata in host storage is authoritative when core IO sees a different
-file.
-The server's `scripts/test-sync-encryption-local.sh` additionally runs the
-production retained-fragment stream against this client.
-
-For real HTTP/S3 validation, run the server repository's
-`scripts/test-sync-encryption-e2e-local.sh`. It uses this repository's
-`bindings/rust/examples/sync_encryption_e2e.rs` driver and a pinned LocalStack
-container, including server crash recovery with the local cache removed.
-
-Binding regressions exercise encrypted bootstrap, SQL, checkpoint, offline
-reopen, and wrong local keys through native Node, synchronous/asynchronous Python,
-Go, .NET, and Chromium/WASM. Their empty-source HTTP responses are fixtures;
-the real server/S3 suite above supplies transport integration coverage. Run the
-usual Go and .NET suites, `pytest bindings/python/tests/test_sync_encryption.py`,
-and the JavaScript native suite. After building WASM, run
+Run the usual Go and .NET suites from their binding directories. From
+`bindings/javascript`, run the native JavaScript suite and, after building WASM,
 `yarn workspace @tursodatabase/sync-wasm test:encryption` (Node 24 and Playwright
-Chromium). React Native's `npm run test:encryption` covers configuration forwarding
-and offline routing; native device execution remains separate from these bridge
-tests. Its changed C++ bridge was syntax-checked against React Native 0.76 JSI.
+Chromium). From `bindings/react-native`, run `npm run test:encryption`.
+
+From the production server repository, run:
+
+```sh
+cargo test --locked -p turso --lib encrypted_sync_ --features poll_io
+scripts/test-sync-encryption-e2e-local.sh
+```
