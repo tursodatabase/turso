@@ -1,11 +1,14 @@
 use crate::alloc::TursoIteratorExt;
 use crate::namespace::NamespaceId;
 use crate::schema::ColDef;
+use crate::translate::expr::WalkControl;
 use crate::translate::plan::{
     left_using_column_sources, star_column_uses_merged_value, unqualified_column_sources,
     ColumnLookup, JoinInfo, JoinType,
 };
-use crate::util::{extract_column_name_from_expr, normalize_ident, type_from_name};
+use crate::util::{
+    extract_column_name_from_expr, normalize_ident, type_from_name, visit_select, AstVisitor,
+};
 use crate::vdbe::affinity::Affinity;
 use crate::{
     schema::{Column, Schema, Table},
@@ -714,120 +717,124 @@ pub fn extract_view_columns(
 /// The tables `select` reads, each with the namespace it is written
 /// with, if any. A name that is a CTE of the select is not a table.
 pub(crate) fn referenced_tables(select: &ast::Select) -> std::vec::Vec<(Option<String>, String)> {
-    fn collect_source(
-        source: &ast::SelectTable,
-        cte_names: &HashSet<String>,
-        tables: &mut HashSet<(Option<String>, String)>,
-    ) {
-        match source {
-            ast::SelectTable::Table(name, _, _) => {
-                if cte_names
+    #[derive(Default)]
+    struct TablesRead {
+        /// The names of the CTEs of each enclosing WITH clause.
+        ctes_in_scope: Vec<Vec<String>>,
+        tables: HashSet<(Option<String>, String)>,
+    }
+
+    impl AstVisitor for TablesRead {
+        fn expr(&mut self, _expr: &ast::Expr) -> Result<WalkControl> {
+            Ok(WalkControl::Continue)
+        }
+
+        fn table(&mut self, name: &ast::QualifiedName) -> Result<()> {
+            let table = normalize_ident(name.name.as_str());
+            let qualifier = name
+                .namespace
+                .as_ref()
+                .map(|qualifier| normalize_ident(qualifier.as_str()));
+            let is_cte =
+                qualifier.is_none() && self.ctes_in_scope.iter().flatten().any(|cte| *cte == table);
+            if !is_cte {
+                self.tables.insert((qualifier, table));
+            }
+            Ok(())
+        }
+
+        fn enter_with(&mut self, with: &ast::With) {
+            self.ctes_in_scope.push(
+                with.ctes
                     .iter()
-                    .any(|cte| cte.eq_ignore_ascii_case(name.name.as_str()))
-                {
-                    return;
-                }
-                tables.insert((
-                    name.namespace
-                        .as_ref()
-                        .map(|namespace| crate::util::normalize_ident(namespace.as_str())),
-                    crate::util::normalize_ident(name.name.as_str()),
-                ));
-            }
-            ast::SelectTable::Select { select, .. } => collect_select(select, cte_names, tables),
-            ast::SelectTable::Sub(from, _) => {
-                collect_source(&from.select, cte_names, tables);
-                for join in &from.joins {
-                    collect_source(&join.table, cte_names, tables);
-                }
-            }
-            ast::SelectTable::TableCall(_, _, _) => {}
+                    .map(|cte| normalize_ident(cte.tbl_name.as_str()))
+                    .collect(),
+            );
+        }
+
+        fn leave_with(&mut self) {
+            self.ctes_in_scope.pop();
         }
     }
 
-    fn collect_one(
-        select: &ast::OneSelect,
-        cte_names: &HashSet<String>,
-        tables: &mut HashSet<(Option<String>, String)>,
-    ) {
-        let ast::OneSelect::Select {
-            columns,
-            from,
-            where_clause,
-            group_by,
-            distinctness,
-            ..
-        } = select
-        else {
-            return;
+    let mut tables_read = TablesRead::default();
+    visit_select(select, &mut tables_read).expect("collecting the tables of a query cannot fail");
+    tables_read.tables.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tables_read_by(sql: &str) -> Vec<(Option<String>, String)> {
+        let cmd = turso_parser::parser::Parser::new(sql.as_bytes())
+            .next_cmd()
+            .unwrap();
+        let Some(ast::Cmd::Stmt(ast::Stmt::Select(select))) = cmd else {
+            panic!("not a SELECT: {sql}");
         };
-        let mut exprs = Vec::new();
-        if let Some(from) = from {
-            for source in std::iter::once(from.select.as_ref())
-                .chain(from.joins.iter().map(|join| join.table.as_ref()))
-            {
-                collect_source(source, cte_names, tables);
-            }
-            for join in &from.joins {
-                if let Some(ast::JoinConstraint::On(on)) = &join.constraint {
-                    exprs.push(on.as_ref());
-                }
-            }
-        }
-        for column in columns {
-            if let ast::ResultColumn::Expr(expr, _) = column {
-                exprs.push(expr.as_ref());
-            }
-        }
-        exprs.extend(where_clause.as_deref());
-        if let Some(group_by) = group_by {
-            exprs.extend(group_by.exprs.iter().map(|expr| expr.as_ref()));
-            exprs.extend(group_by.having.as_deref());
-        }
-        exprs.extend(
-            distinctness
-                .iter()
-                .flat_map(|distinctness| distinctness.exprs())
-                .map(|expr| expr.as_ref()),
-        );
-        // Subqueries in expressions read tables too: the planner may turn
-        // `EXISTS (SELECT ... FROM t)` into a join with `t`.
-        for expr in exprs {
-            crate::translate::expr::walk_expr(expr, &mut |expr: &ast::Expr| {
-                match expr {
-                    ast::Expr::Exists(select)
-                    | ast::Expr::Subquery(select)
-                    | ast::Expr::InSelect { rhs: select, .. } => {
-                        collect_select(select, cte_names, tables);
-                    }
-                    _ => {}
-                }
-                Ok(crate::translate::expr::WalkControl::Continue)
-            })
-            .expect("collecting subquery tables cannot fail");
-        }
+        let mut tables = referenced_tables(&select);
+        tables.sort();
+        tables
     }
 
-    fn collect_select(
-        select: &ast::Select,
-        inherited_ctes: &HashSet<String>,
-        tables: &mut HashSet<(Option<String>, String)>,
-    ) {
-        let mut cte_names = inherited_ctes.clone();
-        if let Some(with) = &select.with {
-            for cte in &with.ctes {
-                cte_names.insert(crate::util::normalize_ident(cte.tbl_name.as_str()));
-            }
-            for cte in &with.ctes {
-                collect_select(&cte.select, &cte_names, tables);
-            }
-        }
-        collect_one(&select.body.select, &cte_names, tables);
-        for compound in &select.body.compounds {
-            collect_one(&compound.select, &cte_names, tables);
-        }
+    fn table(name: &str) -> (Option<String>, String) {
+        (None, name.to_string())
     }
-    let mut tables = HashSet::default();
-    collect_select(select, &HashSet::default(), &mut tables);
-    tables.into_iter().collect()
+
+    #[test]
+    fn referenced_tables_finds_subqueries_of_order_by_limit_and_values() {
+        assert_eq!(
+            tables_read_by("SELECT a FROM u ORDER BY (SELECT max(a) FROM t)"),
+            [table("t"), table("u")]
+        );
+        assert_eq!(
+            tables_read_by(
+                "SELECT a FROM u LIMIT (SELECT count(*) FROM t) OFFSET (SELECT 1 FROM w)"
+            ),
+            [table("t"), table("u"), table("w")]
+        );
+        assert_eq!(
+            tables_read_by("VALUES ((SELECT max(a) FROM t))"),
+            [table("t")]
+        );
+    }
+
+    #[test]
+    fn referenced_tables_finds_subqueries_of_window_clauses_and_table_function_arguments() {
+        assert_eq!(
+            tables_read_by(
+                "SELECT sum(a) OVER w FROM u WINDOW w AS (PARTITION BY (SELECT max(a) FROM t))"
+            ),
+            [table("t"), table("u")]
+        );
+        assert_eq!(
+            tables_read_by("SELECT value FROM json_each((SELECT j FROM t))"),
+            [table("t")]
+        );
+    }
+
+    #[test]
+    fn referenced_tables_leaves_out_a_cte_only_where_it_is_in_scope() {
+        assert_eq!(
+            tables_read_by(
+                "SELECT a FROM t WHERE EXISTS (WITH t AS (SELECT 1 AS a) SELECT a FROM t)"
+            ),
+            [table("t")]
+        );
+        assert_eq!(
+            tables_read_by("WITH c AS (SELECT a FROM t) SELECT a FROM c"),
+            [table("t")]
+        );
+    }
+
+    #[test]
+    fn referenced_tables_finds_a_table_named_with_a_schema_next_to_a_cte_of_its_name() {
+        assert_eq!(
+            tables_read_by(
+                "WITH t AS (SELECT 1 AS a) SELECT a FROM t UNION ALL SELECT a FROM main.t"
+            ),
+            [(Some("main".to_string()), "t".to_string())]
+        );
+    }
 }
