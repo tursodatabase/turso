@@ -1961,6 +1961,7 @@ pub fn emit_from_clause_subquery(
                         .collect(),
                     materialized_build_inputs: HashMap::default(),
                     hash_table_contexts: HashMap::default(),
+                    seek_key_registers: HashMap::default(),
                     unsafe_testing: t_ctx.unsafe_testing,
                 });
                 metadata.materialized_build_inputs =
@@ -2061,6 +2062,7 @@ fn emit_indexed_materialized_subquery(
                     .collect(),
                 materialized_build_inputs: HashMap::default(),
                 hash_table_contexts: HashMap::default(),
+                seek_key_registers: HashMap::default(),
                 unsafe_testing: t_ctx.unsafe_testing,
             });
             metadata.materialized_build_inputs =
@@ -2191,6 +2193,7 @@ fn emit_materialized_subquery_table(
                     .collect(),
                 materialized_build_inputs: HashMap::default(),
                 hash_table_contexts: HashMap::default(),
+                seek_key_registers: HashMap::default(),
                 unsafe_testing: t_ctx.unsafe_testing,
             });
             metadata.materialized_build_inputs =
