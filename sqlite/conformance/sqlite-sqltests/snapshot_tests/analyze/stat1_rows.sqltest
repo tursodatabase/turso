@@ -54,3 +54,17 @@ test insert-into-stat1-after-analyze-without-tables {
 expect {
     x|1
 }
+
+test analyze-writes-declared-table-and-index-names {
+    CREATE TABLE "Pk6"(a, b UNIQUE);
+    CREATE INDEX "Ix" ON pk6(a);
+    INSERT INTO pk6 VALUES (1, 10), (2, 20), (2, 30);
+    ANALYZE;
+    ANALYZE pk6;
+    ANALYZE "IX";
+    SELECT tbl, idx, stat FROM sqlite_stat1 ORDER BY idx;
+}
+expect {
+    Pk6|Ix|3 2
+    Pk6|sqlite_autoindex_Pk6_1|3 1
+}

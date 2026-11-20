@@ -1858,7 +1858,7 @@ fn open_autoincrement_state(
     });
 
     let table_name_reg =
-        program.emit_string8_new_reg(resolver.mangle_name(ctx.namespace, &ctx.table.name));
+        program.emit_string8_new_reg(resolver.mangle_name(ctx.namespace, &ctx.table.declared_name));
     let r_seq = program.alloc_register();
     let r_seq_rowid = program.alloc_register();
 

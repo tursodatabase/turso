@@ -427,7 +427,7 @@ pub fn translate_create_view(
 
     // Parse schema to load the new view
     let escaped_view_name =
-        escape_sql_string_literal(&resolver.mangle_name(namespace, &normalized_view_name));
+        escape_sql_string_literal(&resolver.mangle_name(namespace, view_name.name.as_str()));
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!("name = '{escaped_view_name}'")),

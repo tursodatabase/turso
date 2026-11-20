@@ -29,7 +29,7 @@ addr  opcode       p1   p2   p3  p4                                             
   14  OpenWrite     1    2    0                                                    0  root=2; iDb=0
   15  Rewind        1   22    0                                                    0  Rewind  sqlite_stat1
   16      Column    1    0   10                                                    0  r[10]=sqlite_stat1.tbl
-  17      Ne       10   11   21  Binary                                            0  if r[10]!=r[11] goto 21
+  17      Ne       10   11   21  NoCase                                            0  if r[10]!=r[11] goto 21
   18      RowId     1   12    0                                                    0  r[12]=sqlite_stat1.rowid
   19      Delete    1    0    0  sqlite_stat1                                      0
   20    Next        1   16    0                                                    0
@@ -97,7 +97,7 @@ addr  opcode       p1   p2   p3  p4                                             
   82  Insert        1   42   43  sqlite_stat1                                      0  intkey=r[43] data=r[42]
   83  Rewind        1   90    0                                                    0  Rewind  sqlite_stat1
   84      Column    1    0   44                                                    0  r[44]=sqlite_stat1.tbl
-  85      Ne       44   45   89  Binary                                            0  if r[44]!=r[45] goto 89
+  85      Ne       44   45   89  NoCase                                            0  if r[44]!=r[45] goto 89
   86      RowId     1   46    0                                                    0  r[46]=sqlite_stat1.rowid
   87      Delete    1    0    0  sqlite_stat1                                      0
   88    Next        1   84    0                                                    0
@@ -133,7 +133,7 @@ addr  opcode       p1   p2   p3  p4                                             
  118  Insert        1   58   59  sqlite_stat1                                      0  intkey=r[59] data=r[58]
  119  Rewind        1  126    0                                                    0  Rewind  sqlite_stat1
  120      Column    1    0   60                                                    0  r[60]=sqlite_stat1.tbl
- 121      Ne       60   61  125  Binary                                            0  if r[60]!=r[61] goto 125
+ 121      Ne       60   61  125  NoCase                                            0  if r[60]!=r[61] goto 125
  122      RowId     1   62    0                                                    0  r[62]=sqlite_stat1.rowid
  123      Delete    1    0    0  sqlite_stat1                                      0
  124    Next        1  120    0                                                    0

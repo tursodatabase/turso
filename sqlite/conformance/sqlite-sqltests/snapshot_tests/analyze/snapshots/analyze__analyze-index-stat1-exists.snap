@@ -17,9 +17,9 @@ addr  opcode       p1  p2  p3  p4              p5  comment
    2  OpenWrite     0   5   0                   0  root=5; iDb=0
    3  Rewind        0  12   0                   0  Rewind  sqlite_stat1
    4      Column    0   0   2                   0  r[2]=sqlite_stat1.tbl
-   5      Ne        2   3  11  Binary           0  if r[2]!=r[3] goto 11
+   5      Ne        2   3  11  NoCase           0  if r[2]!=r[3] goto 11
    6      Column    0   1   4                   0  r[4]=sqlite_stat1.idx
-   7      Ne        4   5  11  Binary           0  if r[4]!=r[5] goto 11
+   7      Ne        4   5  11  NoCase           0  if r[4]!=r[5] goto 11
    8      RowId     0   6   0                   0  r[6]=sqlite_stat1.rowid
    9      Delete    0   0   0  sqlite_stat1     0
   10    Next        0   4   0                   0
