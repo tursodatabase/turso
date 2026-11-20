@@ -1515,3 +1515,29 @@ expect {
     0
     1
 }
+
+test drop-table-refuses-a-view {
+    CREATE TABLE dk_t (a int);
+    CREATE VIEW dk_v AS SELECT a FROM dk_t;
+    DROP TABLE dk_v;
+}
+@sqlstate 42809
+expect error {
+    "dk_v" is not a table
+}
+
+test drop-table-if-exists-refuses-a-view {
+    CREATE TABLE dk_ie_t (a int);
+    CREATE VIEW dk_ie_v AS SELECT a FROM dk_ie_t;
+    DROP TABLE IF EXISTS dk_ie_v;
+}
+@sqlstate 42809
+expect error {
+    "dk_ie_v" is not a table
+}
+
+test drop-view-of-a-missing-view {
+    DROP VIEW dk_missing;
+}
+@sqlstate 42P01
+expect error {}

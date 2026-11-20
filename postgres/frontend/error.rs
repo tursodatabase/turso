@@ -87,6 +87,20 @@ pub fn several_dropped_objects_have_dependents(error: LimboError) -> LimboError 
 
 /// The engine error for SQL that `turso_pg_parser::parse` refuses, which
 /// keeps the SQLSTATE that the parser gave it.
+/// The error of a DROP that names a relation of another kind than the one
+/// it drops, with the DROP statement that removes that kind.
+pub fn wrong_relation_kind(name: &str, expected_kind: &str, kind: &str) -> LimboError {
+    LimboError::Dialect(Box::new(DialectError {
+        code: SQLSTATE_WRONG_OBJECT_TYPE,
+        message: format!("\"{name}\" is not a {expected_kind}"),
+        detail: None,
+        hint: Some(format!(
+            "Use DROP {} to remove a {kind}.",
+            kind.to_uppercase()
+        )),
+    }))
+}
+
 pub fn sql_parse_error(error: turso_pg_parser::ParseError) -> LimboError {
     match error {
         turso_pg_parser::ParseError::Sqlstate { sqlstate, message } => {
@@ -357,6 +371,7 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
     } else if msg.starts_with("role \"") && msg.ends_with("\" already exists") {
         SQLSTATE_DUPLICATE_OBJECT
     } else if msg.contains("no such table")
+        || msg.starts_with("no such view")
         || msg.contains("table not found")
         || msg.starts_with("no such object")
     {
@@ -635,6 +650,7 @@ mod tests {
     fn parse_errors_classify_by_message() {
         for (msg, code) in [
             ("no such table: t", SQLSTATE_UNDEFINED_TABLE),
+            ("no such view: v", SQLSTATE_UNDEFINED_TABLE),
             ("no such column: c", SQLSTATE_UNDEFINED_COLUMN),
             ("no such function: f", SQLSTATE_UNDEFINED_FUNCTION),
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),

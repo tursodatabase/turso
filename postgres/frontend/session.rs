@@ -28,7 +28,6 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_NAME,
     SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_OBJECT,
-    SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
     check_enum_labels, execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
@@ -595,8 +594,19 @@ fn translate_statement<'a>(
     let sql = write_out_renamed_serial_columns(&pg_conn.conn, sql, &translated.serial_sequences)?;
     reject_catalog_dml(translated.cmd.stmt())?;
     reject_catalog_ddl(translated.cmd.stmt())?;
-    if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
-        reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
+    match translated.cmd.stmt() {
+        ast::Stmt::DropView { view_name, .. } => {
+            let expected_kind = if is_drop_matview(&parse_result) {
+                "materialized view"
+            } else {
+                "view"
+            };
+            reject_drop_of_other_relation_kind(&pg_conn.conn, view_name, expected_kind)?;
+        }
+        ast::Stmt::DropTable { tbl_name, .. } => {
+            reject_drop_of_other_relation_kind(&pg_conn.conn, tbl_name, "table")?;
+        }
+        _ => {}
     }
     Ok(Translation::Translated(Box::new(TranslatedStatement {
         translated,
@@ -1698,46 +1708,33 @@ fn stored_sequence_name(conn: &Arc<Connection>, schema: &str, name: &str) -> Res
     })
 }
 
-/// PostgreSQL refuses DROP VIEW and DROP MATERIALIZED VIEW on a relation of
-/// another kind, but core's DROP VIEW drops both kinds of view. The relation
-/// is the first table or view named `view_name` in the databases that core
-/// looks it up in. A view is materialized when it has a root page.
-fn reject_drop_of_other_view_kind(
+/// PostgreSQL refuses DROP TABLE, DROP VIEW and DROP MATERIALIZED VIEW on a
+/// relation of another kind, but core's DROP VIEW drops both kinds of view
+/// and its DROP TABLE does not find a view. The relation is the first table
+/// or view named `view_name` in the databases that core looks it up in. A
+/// view is materialized when it has a root page.
+fn reject_drop_of_other_relation_kind(
     conn: &Arc<Connection>,
     view_name: &ast::QualifiedName,
-    materialized: bool,
+    expected_kind: &str,
 ) -> Result<()> {
-    let expected_kind = if materialized {
-        "materialized view"
-    } else {
-        "view"
-    };
     let schema = view_name.namespace.as_ref().map(|name| name.as_str());
-    for namespace in relation_lookup_namespaces(conn, schema) {
-        let kind = conn.with_schema(namespace.database_id(), |schema| {
-            let ns = namespace.target.id;
-            let name = view_name.name.as_str();
-            if schema.is_materialized_view(ns, name) {
-                Some("materialized view")
-            } else if schema.get_view(ns, name).is_some() {
-                Some("view")
-            } else if schema.get_table(ns, name).is_some() {
-                Some("table")
-            } else {
-                None
-            }
-        });
-        let Some(kind) = kind else {
-            continue;
-        };
-        if kind != expected_kind {
-            return Err(sqlstate_error(
-                SQLSTATE_WRONG_OBJECT_TYPE,
-                format!("\"{}\" is not a {expected_kind}", view_name.name.as_str()),
-                None,
-            ));
-        }
+    let name = view_name.name.as_str();
+    let Some(namespace) = namespace_with_relation(conn, schema, name) else {
         return Ok(());
+    };
+    let kind = conn.with_schema(namespace.database_id(), |schema| {
+        let ns = namespace.target.id;
+        if schema.is_materialized_view(ns, name) {
+            "materialized view"
+        } else if schema.get_view(ns, name).is_some() {
+            "view"
+        } else {
+            "table"
+        }
+    });
+    if kind != expected_kind {
+        return Err(crate::error::wrong_relation_kind(name, expected_kind, kind));
     }
     Ok(())
 }
