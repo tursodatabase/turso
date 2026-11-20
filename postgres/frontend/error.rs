@@ -336,8 +336,13 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_TABLE
     } else if msg.contains("no such column") || msg.contains("column not found") {
         SQLSTATE_UNDEFINED_COLUMN
-    } else if msg.contains("no such function") || msg.contains("no such window") {
+    } else if msg.contains("no such function")
+        || msg.contains("no such window")
+        || msg.starts_with("operator does not exist: ")
+    {
         SQLSTATE_UNDEFINED_FUNCTION
+    } else if msg.contains(" types ") && msg.ends_with(" cannot be matched") {
+        SQLSTATE_DATATYPE_MISMATCH
     } else if msg.contains("already exists") {
         SQLSTATE_DUPLICATE_TABLE
     } else if msg.starts_with("ambiguous column name") || msg.ends_with("\" is ambiguous") {
@@ -610,6 +615,14 @@ mod tests {
             ("no such table: t", SQLSTATE_UNDEFINED_TABLE),
             ("no such column: c", SQLSTATE_UNDEFINED_COLUMN),
             ("no such function: f", SQLSTATE_UNDEFINED_FUNCTION),
+            (
+                "operator does not exist: timestamp and text",
+                SQLSTATE_UNDEFINED_FUNCTION,
+            ),
+            (
+                "UNION types timestamp and text cannot be matched",
+                SQLSTATE_DATATYPE_MISMATCH,
+            ),
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
             ("relation \"t\" already exists", SQLSTATE_DUPLICATE_TABLE),
             ("role \"r\" already exists", SQLSTATE_DUPLICATE_OBJECT),

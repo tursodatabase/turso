@@ -68,7 +68,7 @@ expect {
     4|
     5|-3652058 days -23:59:59.999999
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {
     operator does not exist: timestamp - timestamptz
 }
@@ -84,7 +84,7 @@ expect {
     4|
     5|3652058 days 23:59:59.999999
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {
     operator does not exist: timestamptz - timestamp
 }
