@@ -120,7 +120,8 @@ other forms; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
 `pg_input_is_valid`, `to_char` (numeric; other argument types fail with
 0A000), `now`/`clock_timestamp`/
-`transaction_timestamp`/`statement_timestamp`. `to_timestamp` fails with 0A000.
+`transaction_timestamp`/`statement_timestamp`, `make_timestamp`/
+`make_timestamptz`. `to_timestamp` fails with 0A000.
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
 forms; the first schema of `search_path` that exists), `current_schemas(boolean)`
@@ -185,6 +186,10 @@ transaction started, and `LOCALTIMESTAMP` is that time as a timestamp in UTC;
 statements of one query string;
 `clock_timestamp()` reads the clock at each call. All of them have microsecond
 precision.
+`make_timestamp` and `make_timestamptz` build a value from its fields. Years
+before 1 or after 9999, a result past year 9999, and a `make_timestamptz`
+time zone argument other than `UTC` (in any case) or `+00` are rejected as
+not supported (0A000).
 
 | Feature | Status | Notes |
 |---------|--------|-------|
