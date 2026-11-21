@@ -91,8 +91,6 @@ expect @tursopg {
     at 2026-01-31 10:00:00
 }
 
-# tursopg stores the integer 20260101 as 2026-01-01 00:00:00+00; PostgreSQL rejects it.
-@compat-gap "cast:int4 -> timestamptz"
 test insert-integer-into-timestamptz {
     CREATE TABLE t (created_at timestamptz);
     INSERT INTO t VALUES (20260101);
@@ -100,9 +98,6 @@ test insert-integer-into-timestamptz {
 }
 @sqlstate 42804
 expect error {}
-expect @tursopg {
-    2026-01-01 00:00:00+00
-}
 
 @compat-gap "cast:int4 -> timestamptz"
 test insert-select-integer-into-timestamptz {

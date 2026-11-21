@@ -11,7 +11,7 @@ use turso_core::dialect::{CastContext, CastConversion, CastPlan, OperandType};
 use turso_core::{LimboError, Numeric, Register, Result, Value};
 use turso_parser::ast;
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_CANNOT_COERCE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    SQLSTATE_CANNOT_COERCE, SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_INVALID_TEXT_REPRESENTATION,
     SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
 };
 
@@ -65,6 +65,17 @@ impl CastType {
             "timestamptz" => Self::TimestampTz,
             _ => return None,
         })
+    }
+
+    /// The type of a column, which the schema keeps by its SQLite type name.
+    /// An INTEGER column can also be an oid or a bigserial, so only the range
+    /// of int8 is checked for it.
+    fn from_column_type(name: &str) -> Option<Self> {
+        match name {
+            "integer" => Some(Self::Int8),
+            "real" => Some(Self::Float8),
+            _ => Self::from_name(name),
+        }
     }
 
     fn is_integer(self) -> bool {
@@ -153,11 +164,21 @@ fn resolve(source: CastType, target: CastType, context: CastContext) -> Result<R
     if listed || through_text {
         return Ok(Resolution::Convert);
     }
-    Err(sqlstate_error(
-        SQLSTATE_CANNOT_COERCE,
-        format!("cannot cast type {} to {}", source.name(), target.name()),
-        None,
-    ))
+    let (sqlstate, message) = match context {
+        CastContext::Assignment => (
+            SQLSTATE_DATATYPE_MISMATCH,
+            format!(
+                "a value of type {} cannot be assigned to type {}",
+                source.name(),
+                target.name()
+            ),
+        ),
+        _ => (
+            SQLSTATE_CANNOT_COERCE,
+            format!("cannot cast type {} to {}", source.name(), target.name()),
+        ),
+    };
+    Err(sqlstate_error(sqlstate, message, None))
 }
 
 /// The cast PostgreSQL does for a CAST of `source` to `target`, or None for a
@@ -168,16 +189,26 @@ pub(crate) fn plan_cast(
     target: &ast::Type,
     context: CastContext,
 ) -> Result<Option<CastPlan>> {
-    if context != CastContext::Explicit || target.array_dimensions > 0 {
+    if target.array_dimensions > 0 {
         return Ok(None);
     }
-    let Some(target) = CastType::from_name(&target.name.to_ascii_lowercase()) else {
+    let target_name = target.name.to_ascii_lowercase();
+    let target = match context {
+        CastContext::Assignment => CastType::from_column_type(&target_name),
+        _ => CastType::from_name(&target_name),
+    };
+    let Some(target) = target else {
         return Ok(None);
     };
-    let Some(source) = source_type(&source()) else {
+    let source = source();
+    let context = match source {
+        OperandType::Untyped => CastContext::Explicit,
+        _ => context,
+    };
+    let Some(source) = source_type(&source) else {
         return Ok(None);
     };
-    let Resolution::Convert = resolve(source, target, context.into())? else {
+    let Resolution::Convert = resolve(source, target, context)? else {
         return Ok(Some(CastPlan { convert: None }));
     };
     if !needs_conversion(source, target) {
