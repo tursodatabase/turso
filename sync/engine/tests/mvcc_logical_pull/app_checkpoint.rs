@@ -34,7 +34,7 @@ fn app_checkpoint_fails_and_pulls_keep_working() -> Result<()> {
 
     remote.execute_transaction(&["INSERT INTO t VALUES ('second')"])?;
     replica.pull()?;
-    // The sync API's checkpoint, which the error points to, still works.
+    // The sync database's checkpoint(), which the error points to, works.
     replica.checkpoint()?;
 
     let rows = replica

@@ -660,7 +660,7 @@ A checkpoint writes pages from the WAL file back to the database file.
 
 Inside a transaction, the checkpoint fails with `database table is locked` once the transaction has read or written the database. Right after `BEGIN`, before any read, it runs normally.
 
-On a connection to a synced database, the checkpoint fails with an error. The sync engine keeps local changes that are not pushed yet in the WAL, so only the sync API's checkpoint may move WAL pages into the database file.
+On a connection from the sync SDK, `PRAGMA wal_checkpoint` returns an error. Call `checkpoint()` on the sync database instead. The sync engine keeps local changes that are not pushed yet in the WAL until its own checkpoint.
 
 ### wal_autocheckpoint
 

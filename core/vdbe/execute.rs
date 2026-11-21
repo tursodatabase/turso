@@ -563,7 +563,7 @@ pub fn op_checkpoint(
     if *database == MAIN_DB_ID && connection.sql_checkpoints_refused() {
         return Err(LimboError::CheckpointFailed(
             "this connection belongs to a synced database, whose checkpoints only the sync engine \
-             runs; use the sync API's checkpoint instead of PRAGMA wal_checkpoint"
+             runs; call checkpoint() on the sync database instead of PRAGMA wal_checkpoint"
                 .to_string(),
         )
         .into());
