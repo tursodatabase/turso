@@ -1,6 +1,4 @@
 pub mod alloc;
-// Used by the engine integration in the next stacked PR.
-#[allow(dead_code)]
 mod changes_file;
 pub mod client_proto;
 pub mod database_replay_generator;
@@ -12,9 +10,8 @@ pub mod database_tape;
 pub mod errors;
 pub mod io_operations;
 pub mod server_proto;
-// Used by the engine integration in the next stacked PR.
-#[allow(dead_code)]
 mod sync_cipher;
+pub mod sync_encryption;
 pub mod types;
 pub mod wal_session;
 
