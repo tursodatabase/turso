@@ -29,7 +29,7 @@ use crate::{
         },
         expr::{
             bind_and_rewrite_expr, emit_constraint_values_decode, emit_returning_results,
-            emit_returning_scan_back, process_returning_clause,
+            emit_returning_scan_back, plan_cast_conversion, process_returning_clause,
             restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
             translate_expr, translate_expr_no_constant_opt, walk_expr, BindingBehavior,
             NoConstantOptReason, ReturningBufferCtx, WalkControl,
@@ -3022,7 +3022,7 @@ fn translate_rows_multiple<'short, 'long: 'short>(
         program.preassign_label_to_next_insn(temp_table_ctx.loop_start_label);
     }
     let translate_value_fn =
-        |prg: &mut ProgramBuilder, value_index: usize, column_register: usize| {
+        |prg: &mut ProgramBuilder, value_index: usize, column_register: usize, _column: &Column| {
             if let Some(temp_table_ctx) = temp_table_ctx {
                 prg.emit_insn(Insn::Column {
                     cursor_id: temp_table_ctx.cursor_id,
@@ -3049,20 +3049,36 @@ fn translate_rows_single(
     resolver: &Resolver,
     is_strict: bool,
 ) -> Result<()> {
-    let translate_value_fn =
-        |prg: &mut ProgramBuilder, value_index: usize, column_register: usize| -> Result<()> {
-            translate_expr_no_constant_opt(
-                prg,
-                None,
-                value.get(value_index).unwrap_or_else(|| {
-                    panic!("value index out of bounds: {value_index} for value: {value:?}")
-                }),
-                column_register,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
-            Ok(())
+    let translate_value_fn = |prg: &mut ProgramBuilder,
+                              value_index: usize,
+                              column_register: usize,
+                              column: &Column|
+     -> Result<()> {
+        let expr = value.get(value_index).unwrap_or_else(|| {
+            panic!("value index out of bounds: {value_index} for value: {value:?}")
+        });
+        let column_type = ast::Type {
+            name: column.ty_str.clone(),
+            size: None,
+            array_dimensions: column.array_dimensions(),
         };
+        let converted = plan_cast_conversion(
+            None,
+            expr,
+            Some(&column_type),
+            crate::dialect::CastContext::Assignment,
+            resolver,
+        )?;
+        translate_expr_no_constant_opt(
+            prg,
+            None,
+            converted.as_ref().unwrap_or(expr),
+            column_register,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+        Ok(())
+    };
     translate_rows_base(program, insertion, translate_value_fn, resolver, is_strict)
 }
 
@@ -3074,7 +3090,7 @@ fn translate_rows_single(
 fn translate_rows_base<'short, 'long: 'short>(
     program: &mut ProgramBuilder,
     insertion: &'short Insertion<'long>,
-    mut translate_value_fn: impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
+    mut translate_value_fn: impl FnMut(&mut ProgramBuilder, usize, usize, &Column) -> Result<()>,
     resolver: &Resolver,
     is_strict: bool,
 ) -> Result<()> {
@@ -3110,7 +3126,7 @@ fn translate_rows_base<'short, 'long: 'short>(
 fn translate_key(
     program: &mut ProgramBuilder,
     insertion: &Insertion,
-    mut translate_value_fn: impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
+    mut translate_value_fn: impl FnMut(&mut ProgramBuilder, usize, usize, &Column) -> Result<()>,
     resolver: &Resolver,
     is_strict: bool,
 ) -> Result<()> {
@@ -3145,7 +3161,7 @@ fn translate_column(
     column: &Column,
     column_register: usize,
     value_index: Option<usize>,
-    translate_value_fn: &mut impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
+    translate_value_fn: &mut impl FnMut(&mut ProgramBuilder, usize, usize, &Column) -> Result<()>,
     resolver: &Resolver,
     is_strict: bool,
 ) -> Result<()> {
@@ -3159,7 +3175,7 @@ fn translate_column(
             .cloned();
         let prev = program.target_union_type.take();
         program.target_union_type = union_td;
-        let result = translate_value_fn(program, value_index, column_register);
+        let result = translate_value_fn(program, value_index, column_register, column);
         program.target_union_type = prev;
         result?;
     } else if column.is_generated() {

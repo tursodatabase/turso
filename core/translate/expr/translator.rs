@@ -956,7 +956,7 @@ fn translate_cast_expr(
 
 /// The operand wrapped in the conversion that the dialect plans for the CAST,
 /// or None when the dialect leaves the CAST to the engine.
-fn plan_cast_conversion(
+pub(crate) fn plan_cast_conversion(
     referenced_tables: Option<&TableReferences>,
     operand: &ast::Expr,
     type_name: Option<&ast::Type>,
