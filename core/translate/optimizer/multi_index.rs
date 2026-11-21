@@ -31,8 +31,8 @@ use crate::translate::plan::{
     TableReferences, UnionBranchPrePostFilters, WhereTerm, WhereTermOrigin,
 };
 use crate::translate::planner::{table_mask_from_expr, TableMask};
-use crate::Result;
-use std::cell::OnceCell;
+use crate::{turso_debug_assert, Result};
+use std::cell::{Cell, OnceCell};
 use std::sync::Arc;
 use turso_macros::turso_assert_eq;
 use turso_parser::ast;
@@ -106,6 +106,10 @@ struct UnionTerm<'a> {
     /// For each disjunct, its branch-local terms and constraints, made the
     /// first time that the disjunct is planned.
     branches: Vec<OnceCell<UnionBranch>>,
+    /// Set when a branch cannot be a lookup for any join order. A union scan
+    /// needs a lookup for each branch, so the term then cannot give a union
+    /// scan of the table.
+    has_branch_without_lookup: Cell<bool>,
 }
 
 /// The branch-local terms and constraints of one disjunct of a [UnionTerm].
@@ -380,16 +384,7 @@ fn choose_multi_index_branch_access(
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
 ) -> Result<Option<MultiIdxBranch>> {
-    // A branch needs an index seek or an IN seek. Without a constraint that
-    // an index can use, and without an IN constraint, it has neither.
-    if table_constraints
-        .candidates
-        .iter()
-        .all(|candidate| candidate.refs.is_empty())
-        && !has_in_seek_constraint(table_constraints)
-    {
-        return Ok(None);
-    }
+    turso_debug_assert!(branch_has_lookup_constraint(table_constraints));
     let mut chosen_refs = smallvec::SmallVec::new();
     let chosen_seek = choose_best_btree_candidate(
         rhs_table,
@@ -1053,6 +1048,12 @@ pub fn consider_multi_index_union<'a>(
         }
     };
     for or_term in or_terms {
+        // The join search calls this function for each join order. The term
+        // gives no union scan for any join order after a branch without a
+        // lookup, so the code does not examine the term again.
+        if or_term.has_branch_without_lookup.get() {
+            continue;
+        }
         let term = &where_clause[or_term.where_term_idx];
         let rhs_idx = or_term.table_idx;
         let mut allowed_mask = lhs_mask.try_clone()?;
@@ -1080,8 +1081,13 @@ pub fn consider_multi_index_union<'a>(
                     )
                 });
                 let Some((synthetic_where_terms, table_constraints)) = branch else {
+                    or_term.has_branch_without_lookup.set(true);
                     return Ok(None);
                 };
+                if !branch_has_lookup_constraint(table_constraints) {
+                    or_term.has_branch_without_lookup.set(true);
+                    return Ok(None);
+                }
                 let Some(mut chosen) = choose_multi_index_branch_access(
                     rhs_table,
                     table_constraints,
@@ -1186,6 +1192,7 @@ fn union_terms<'a>(
             table_idx,
             branches: disjuncts.iter().map(|_| OnceCell::new()).collect(),
             disjuncts,
+            has_branch_without_lookup: Cell::new(false),
         });
     }
     or_terms
@@ -1222,6 +1229,18 @@ fn union_branch_constraints(
         resolver,
     )
     .ok()
+}
+
+/// Return whether an index seek or an IN seek can use the constraints of a
+/// branch. Without a constraint that an index can use, and without an IN
+/// constraint, the branch has neither. The constraints do not depend on the
+/// join order, so neither does the result.
+fn branch_has_lookup_constraint(table_constraints: &TableConstraints) -> bool {
+    !table_constraints
+        .candidates
+        .iter()
+        .all(|candidate| candidate.refs.is_empty())
+        || has_in_seek_constraint(table_constraints)
 }
 
 /// Analyze top-level AND terms for AND-by-intersection optimization.
