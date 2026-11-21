@@ -348,6 +348,11 @@ pub struct AggStepData {
     /// The collation MIN, MAX, mode and percentile compare the argument with.
     /// BINARY for the aggregates that do not compare values.
     pub collation: CollationSeq,
+    /// For MIN and MAX: a register that the step sets to 1 when the row keeps
+    /// the minimum or maximum of an earlier row, and to 0 otherwise. Bare
+    /// columns of the query take their values from the rows where it is 0,
+    /// as SQLite's OP_CollSeq register does. None for the other aggregates.
+    pub minmax_keeps_best_reg: Option<usize>,
 }
 
 /// Which of SUM, TOTAL, or AVG an `IvmSumFinalize` instruction computes. The

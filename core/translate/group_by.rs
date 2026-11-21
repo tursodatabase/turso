@@ -9,7 +9,9 @@ use super::{
     result_row::emit_select_result,
 };
 use crate::translate::{
-    aggregation::{emit_aggregate_final, emit_aggregate_step, AggArgumentSource},
+    aggregation::{
+        emit_aggregate_final, emit_aggregate_step, AggArgumentSource, BareColumnRowCheck,
+    },
     expression_index::selected_expression_index,
     order_by::EmitOrderBy,
     plan::{Aggregate, NonFromClauseSubquery},
@@ -479,6 +481,15 @@ fn collect_result_columns<'a>(
 
     walk_expr(root_expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
         match expr {
+            // An expression that the selected index stores is saved whole, as
+            // in `collect_agg_leaf_columns`. Its columns may not be readable
+            // when the index covers the query and the table cursor is not open.
+            _ if !plan.aggregates.iter().any(|a| a.original_expr == *expr)
+                && selected_expression_index(expr, &plan.table_references).is_some() =>
+            {
+                result_columns.push(expr);
+                return Ok(WalkControl::SkipChildren);
+            }
             ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
                 if plan
                     .table_references
@@ -773,6 +784,12 @@ pub fn group_by_process_single_group(
 
     // Process each aggregate function for the current row
     program.preassign_label_to_next_insn(labels.label_grouping_agg_step);
+    let bare_column_row_check = BareColumnRowCheck::new(
+        program,
+        &plan.aggregates,
+        registers.reg_data_in_acc_flag,
+        true,
+    );
 
     match &row_source {
         GroupByRowSource::Sorter { pseudo_cursor, .. } => {
@@ -800,6 +817,7 @@ pub fn group_by_process_single_group(
                     .reg_agg_start
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
+                let minmax_keeps_best_reg = bare_column_row_check.emit_before_step(program, agg);
 
                 // FILTER: skip AggStep if filter condition is false
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
@@ -831,6 +849,7 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    minmax_keeps_best_reg,
                 )?;
                 if let Distinctness::Distinct { ctx, .. } = &agg.distinctness {
                     let ctx = ctx
@@ -854,6 +873,7 @@ pub fn group_by_process_single_group(
                     .reg_agg_start
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
+                let minmax_keeps_best_reg = bare_column_row_check.emit_before_step(program, agg);
 
                 // FILTER: skip AggStep if filter condition is false
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
@@ -889,6 +909,7 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    minmax_keeps_best_reg,
                 )?;
                 if let Distinctness::Distinct { ctx, .. } = &agg.distinctness {
                     let ctx = ctx
@@ -906,15 +927,15 @@ pub fn group_by_process_single_group(
         }
     }
 
-    // We only need to store non-aggregate columns once per group
-    // Skip if we've already stored them for this group
+    // Store the non-aggregate columns once per group, or on each row that sets
+    // a new minimum or maximum.
     program.add_comment(
         program.offset(),
         "don't emit group columns if continuing existing group",
     );
     program.emit_insn(Insn::If {
         target_pc: labels.label_acc_indicator_set_flag_true,
-        reg: registers.reg_data_in_acc_flag,
+        reg: bare_column_row_check.skip_reg(),
         jump_if_null: false,
     });
 
