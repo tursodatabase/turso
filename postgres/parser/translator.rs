@@ -5193,10 +5193,29 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<Option<ast::Limit>, ParseError> {
-        if select.limit_option() == pg_query::protobuf::LimitOption::WithTies {
-            return Err(ParseError::not_supported("FETCH FIRST ... WITH TIES"));
+        let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
+        if select.limit_option() != pg_query::protobuf::LimitOption::WithTies {
+            return Ok(limit);
         }
-        self.translate_limit(&select.limit_count, &select.limit_offset)
+        if is_set_operation(select) {
+            return Err(ParseError::not_supported(
+                "FETCH FIRST ... WITH TIES on a set operation",
+            ));
+        }
+        let count_is_null = matches!(
+            select.limit_count.as_ref().and_then(|count| count.node.as_ref()),
+            Some(pg_query::protobuf::node::Node::AConst(count)) if count.isnull
+        );
+        if count_is_null {
+            return Err(ParseError::Sqlstate {
+                sqlstate: "2201W",
+                message: "row count cannot be null in FETCH FIRST ... WITH TIES clause".into(),
+            });
+        }
+        Ok(limit.map(|limit| ast::Limit {
+            with_ties: true,
+            ..limit
+        }))
     }
 
     fn translate_limit(
@@ -14264,10 +14283,14 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_fetch_with_ties() {
-        assert_not_supported(
-            "SELECT * FROM t ORDER BY a FETCH FIRST 3 ROWS WITH TIES",
-            "WITH TIES",
+    fn fetch_with_ties_is_kept_for_a_single_select() {
+        let parsed =
+            crate::parse("SELECT * FROM t ORDER BY a FETCH FIRST 3 ROWS WITH TIES OFFSET 2")
+                .unwrap();
+        let stmt = PostgreSQLTranslator::new().translate(&parsed).unwrap();
+        assert_eq!(
+            stmt.to_string(),
+            "SELECT * FROM t ORDER BY a NULLS LAST LIMIT 3 OFFSET 2 WITH TIES"
         );
         assert_not_supported(
             "SELECT a FROM t UNION SELECT a FROM u ORDER BY 1 FETCH FIRST 1 ROW WITH TIES",
