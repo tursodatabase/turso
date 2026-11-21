@@ -433,8 +433,11 @@ jobs:
           prefix-key: "v1-rust"
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The simulator profile (Cargo.toml) optimizes the code but keeps
+      # debug assertions; simulations run about ten times faster than with
+      # the dev profile.
       - name: Build simulator
-        run: cargo build -p limbo_sim --bin limbo_sim --locked
+        run: cargo build -p limbo_sim --bin limbo_sim --locked --profile simulator
       - name: Simulator ${{ matrix.profile.name }}
         env:
           SIM_ARGS: ${{ matrix.profile.args }}
@@ -444,7 +447,7 @@ jobs:
             i="$1"
             log="sim-run-$i.log"
             read -r -a args <<< "$SIM_ARGS"
-            if ./target/debug/limbo_sim "${args[@]}" >"$log" 2>&1; then
+            if ./target/simulator/limbo_sim "${args[@]}" >"$log" 2>&1; then
               echo "iteration $i ok: $(grep -m1 "^seed: " "$log")"
             else
               echo "iteration $i FAILED:"

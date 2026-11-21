@@ -196,6 +196,15 @@ shuttle = { version = "0.8.1" }
 [profile.dev.package.similar]
 opt-level = 3
 
+# CI runs the simulator built with this profile. A simulation runs about ten
+# times faster than with the dev profile, and a rebuild after a change to
+# turso_core takes about twice as long. opt-level 2 runs no faster than 1.
+# Debug assertions and overflow checks stay on, as in dev.
+[profile.simulator]
+inherits = "dev"
+opt-level = 1
+debug = "line-tables-only"
+
 [profile.release]
 debug = "line-tables-only"
 codegen-units = 4
