@@ -614,6 +614,20 @@ pub trait Dialect: Send + Sync + 'static {
         true
     }
 
+    /// Checks the type of a result column of CREATE TABLE AS or SELECT INTO
+    /// before the table is created. `type_name` is the custom type of the
+    /// column, or `None` when its type is not known at that point.
+    ///
+    /// The new table types its columns with SQLite declared types, so a column
+    /// of a custom type would become a plain column that compares and accepts
+    /// values differently. SQLite has no custom types and accepts every
+    /// column. PostgreSQL refuses the statement, which PostgreSQL itself
+    /// executes with the type kept.
+    fn check_ctas_column_type(&self, column: &str, type_name: Option<&str>) -> Result<()> {
+        let _ = (column, type_name);
+        Ok(())
+    }
+
     /// Appends a blob element of an array to the array's text, as in
     /// `{"X'6162'"}`.
     ///

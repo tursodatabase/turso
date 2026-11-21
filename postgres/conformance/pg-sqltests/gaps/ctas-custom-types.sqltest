@@ -1,0 +1,150 @@
+# Known tursopg gaps against PostgreSQL: CREATE TABLE AS with a column of a
+# custom type
+#
+# PostgreSQL keeps the type of each result column in the new table. tursopg
+# types the new columns with SQLite declared types, so a timestamptz would
+# become text: it would compare wrongly and accept invalid input. tursopg
+# refuses the statement with 0A000 until the type is kept.
+#
+# Each test with a `@compat-gap "<kind>:<object>"` label records a known
+# difference: its default `expect` block is PostgreSQL 18's answer and its
+# `expect @tursopg` block is tursopg's current answer. When tursopg gives the
+# PostgreSQL answer, the tursopg run fails with "gap fixed": then delete only
+# `@compat-gap` and the `expect @tursopg` block, and keep the test.
+
+@database :memory:
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-timestamptz-column {
+    CREATE TABLE t (id int, ts timestamptz);
+    INSERT INTO t VALUES (1, '2024-03-05 12:34:56.789+02');
+    CREATE TABLE c AS SELECT ts FROM t;
+    SELECT count(*) FROM c WHERE ts = '2024-03-05 12:34:56.789+02' AND NOT ts < '2024-03-05 11:00:00+01';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-timestamptz-column-rejects-invalid-input {
+    CREATE TABLE t (ts timestamptz);
+    CREATE TABLE c AS SELECT ts FROM t;
+    INSERT INTO c VALUES ('not a time');
+}
+@sqlstate 22007
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-domain-over-timestamptz-column {
+    CREATE DOMAIN ts_dom AS timestamptz;
+    CREATE TABLE t (ts ts_dom);
+    INSERT INTO t VALUES ('2024-03-05 12:34:56+02');
+    CREATE TABLE c AS SELECT ts FROM t;
+    SELECT count(*) FROM c WHERE ts = '2024-03-05 10:34:56+00';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-timestamp-column {
+    CREATE TABLE t (ts timestamp);
+    INSERT INTO t VALUES ('2024-03-05 12:34:56');
+    CREATE TABLE c AS SELECT ts FROM t;
+    SELECT count(*) FROM c WHERE ts = '2024-03-05 12:34:56.000';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-date-column {
+    CREATE TABLE t (d date);
+    INSERT INTO t VALUES ('2024-03-05');
+    CREATE TABLE c AS SELECT d FROM t;
+    SELECT count(*) FROM c WHERE d = '2024-03-05';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-now {
+    CREATE TABLE c AS SELECT now() AS n;
+    SELECT count(*) FROM c WHERE n <= now();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-cast-to-timestamptz {
+    CREATE TABLE c AS SELECT '2024-03-05 12:34:56.789+02'::timestamptz AS ts;
+    SELECT count(*) FROM c WHERE ts = '2024-03-05 10:34:56.789+00';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create table as with custom type"
+test select-into-timestamptz-column {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2024-03-05 12:34:56+02');
+    SELECT ts INTO c FROM t;
+    SELECT count(*) FROM c WHERE ts = '2024-03-05 10:34:56+00';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-with-no-data-timestamptz-column {
+    CREATE TABLE t (ts timestamptz);
+    CREATE TABLE c AS SELECT ts FROM t WITH NO DATA;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-coalesce-timestamptz-column {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES (NULL);
+    CREATE TABLE c AS SELECT coalesce(ts, now()) AS ts FROM t;
+    SELECT count(*) FROM c;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# A result column of a built-in type still works.
+test ctas-builtin-columns {
+    CREATE TABLE t (id int, name text);
+    INSERT INTO t VALUES (1, 'a');
+    CREATE TABLE c AS SELECT id, name, id + 1 AS next_id, length(name) AS len FROM t;
+    SELECT id, name, next_id, len FROM c;
+}
+expect {
+    1|a|2|1
+}
