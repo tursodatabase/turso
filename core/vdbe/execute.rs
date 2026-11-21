@@ -7579,6 +7579,8 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
 ///
 /// The payload slice contains the intermediate aggregate state (initialized by
 /// `init_agg_payload`), and this function incorporates the new row's values.
+/// It returns true when a MIN or MAX step keeps the value it already had,
+/// like SQLite's skip flag, and false otherwise.
 ///
 /// # Payload layouts (see `init_agg_payload` for initial values):
 /// - **Count**: `[count: Integer]` - increments if arg is not NULL
@@ -7610,7 +7612,7 @@ fn update_agg_payload(
     payload: &mut crate::alloc::Vec<Value>,
     collation: CollationSeq,
     counts_infinite_inputs: bool,
-) -> Result<()> {
+) -> Result<bool> {
     match func {
         AggFunc::Count => {
             // COUNT(column) increments only when arg is not NULL. Empty args treated as non-NULL
@@ -7638,7 +7640,7 @@ fn update_agg_payload(
         }
         AggFunc::Avg => {
             if matches!(arg, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             // invariant as per init_agg_payload: payload[0] is Float (sum), payload[1] is Float (r_err),
             // payload[2] is Integer (count), payload[3] and payload[4] are Integer (pos_inf, neg_inf)
@@ -7660,10 +7662,10 @@ fn update_agg_payload(
             *count = count.checked_add(1).or_overflow()?;
             let parsed = classify_numeric_arg(arg);
             if counts_infinite_inputs && add_to_infinity_count(&parsed, pos_inf, neg_inf, 1)? {
-                return Ok(());
+                return Ok(false);
             }
             if matches!(*sum_val, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             let r_err = r_err_val.to_float_or_zero();
             let mut sum_state = SumAggState {
@@ -7732,10 +7734,10 @@ fn update_agg_payload(
                 }
                 *approx_i = 1;
                 *ovrfl_i = 0;
-                return Ok(());
+                return Ok(false);
             }
             if matches!(*acc, Value::Null) && sum_state.approx {
-                return Ok(());
+                return Ok(false);
             }
             match arg {
                 Value::Null => {}
@@ -7802,16 +7804,16 @@ fn update_agg_payload(
             *ovrfl_i = sum_state.ovrfl as i64;
         }
         AggFunc::Min | AggFunc::Max => {
-            step_min_max(
+            return step_min_max(
                 matches!(func, AggFunc::Max),
                 arg,
                 &mut payload[0],
                 collation,
-            )?;
+            );
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
             if matches!(arg, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             let [acc, count_slot, first_separator_len_slot, separator_lengths_slot, ..] =
                 payload.as_mut_slice()
@@ -7902,7 +7904,7 @@ fn update_agg_payload(
             // SQLite skips rows whose object label is SQL NULL. A NULL value is
             // still encoded as JSON null, so only the key is filtered here.
             let Some(label) = arg.cast_text_ref() else {
-                return Ok(());
+                return Ok(false);
             };
             ensure_blob_arg_is_jsonb(value.as_value_ref())?;
             let Value::Blob(vec) = &mut payload[0] else {
@@ -7987,7 +7989,7 @@ fn update_agg_payload(
             appended?;
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Max limit of aggregate Vecs we keep around to reuse their allocations. This is a very naive
@@ -9670,7 +9672,10 @@ fn op_agg_step_min_max(
         state.registers.get_disjoint_mut([data.col, data.acc_reg])
     {
         if let Some(best) = payload.first_mut() {
-            step_min_max(is_max, arg, best, data.collation)?;
+            let kept_value = step_min_max(is_max, arg, best, data.collation)?;
+            if let Some(skip_reg) = data.skip_reg {
+                state.registers[skip_reg] = Register::Value(Value::from_i64(kept_value as i64));
+            }
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
@@ -9681,27 +9686,32 @@ fn op_agg_step_min_max(
 /// One step of MIN (`is_max` false) or MAX (`is_max` true): `best` takes a
 /// copy of `arg` when `arg` is not NULL and `best` is NULL, or when `arg`
 /// orders strictly after (MAX) or before (MIN) `best` under `collation`.
+/// It returns true when `best` keeps a value it already had, like SQLite's
+/// skip flag, and false otherwise.
 #[inline(always)]
 fn step_min_max(
     is_max: bool,
     arg: &Value,
     best: &mut Value,
     collation: CollationSeq,
-) -> Result<()> {
+) -> Result<bool> {
     // Two integers under a text collation compare as integers, and the copy
     // of an integer does not allocate.
     if let (Value::Numeric(Numeric::Integer(arg)), Value::Numeric(Numeric::Integer(best))) =
         (arg, &mut *best)
     {
         if matches!(collation, CollationSeq::Text(_)) {
-            if (is_max && *arg > *best) || (!is_max && *arg < *best) {
+            let better = (is_max && *arg > *best) || (!is_max && *arg < *best);
+            if better {
                 *best = *arg;
             }
-            return Ok(());
+            return Ok(!better);
         }
     }
     if matches!(arg, Value::Null) {
-        return Ok(());
+        // A NULL is kept as the row's value only before the first value
+        // that is not NULL, as in SQLite's minmaxStep.
+        return Ok(!matches!(best, Value::Null));
     }
     let better = matches!(best, Value::Null) || {
         let order = collation.compare(arg.as_ref(), best.as_ref());
@@ -9714,7 +9724,7 @@ fn step_min_max(
     if better {
         best.try_clone_from(arg)?;
     }
-    Ok(())
+    Ok(!better)
 }
 
 #[inline(never)]
@@ -9729,6 +9739,7 @@ fn op_agg_step_slow(
         delimiter,
         func,
         collation,
+        skip_reg,
     } = data;
 
     if let AccumulatorFunc::Window(win_func) = func {
@@ -9795,7 +9806,7 @@ fn op_agg_step_slow(
                 AggFunc::PercentileCont | AggFunc::PercentileDisc => Some(*delimiter),
                 _ => None,
             };
-            match arg2_reg
+            let kept_value = match arg2_reg
                 .map(|arg2_reg| state.registers.get_disjoint_mut([*col, *acc_reg, arg2_reg]))
             {
                 // The second argument has a register of its own, so the step
@@ -9832,8 +9843,11 @@ fn op_agg_step_slow(
                         maybe_arg2.as_ref(),
                         collation,
                         counts_infinite_inputs,
-                    )?;
+                    )?
                 }
+            };
+            if let Some(skip_reg) = skip_reg {
+                state.registers[*skip_reg] = Register::Value(Value::from_i64(kept_value as i64));
             }
         }
     };
@@ -9845,7 +9859,7 @@ fn op_agg_step_slow(
 /// Steps the builtin aggregate in `acc_slot`, register `acc_reg`, with the
 /// value of `arg_reg`, and with `arg2` for an aggregate with a second
 /// argument. `counts_infinite_inputs` is the argument of the same name of
-/// [update_agg_payload].
+/// [update_agg_payload], and the result is that of [update_agg_payload].
 fn step_builtin_agg(
     func: &AggFunc,
     arg_reg: &Register,
@@ -9854,7 +9868,7 @@ fn step_builtin_agg(
     arg2: Option<&Value>,
     collation: CollationSeq,
     counts_infinite_inputs: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let arg = arg_reg.get_value();
     let Register::Aggregate(agg) = acc_slot else {
         return Err(LimboError::InternalError(format!(

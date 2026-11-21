@@ -774,6 +774,15 @@ pub fn group_by_process_single_group(
     // Process each aggregate function for the current row
     program.preassign_label_to_next_insn(labels.label_grouping_agg_step);
 
+    // Like SQLite, with MIN/MAX the non-aggregate columns are read from the row holding
+    // the MIN/MAX value: `reg_skip_nonagg` is set to 1 when the last MIN/MAX step kept
+    // its value, which tells the code below not to read this row.
+    let reg_skip_nonagg = plan
+        .aggregates
+        .iter()
+        .any(Aggregate::selects_min_max_row)
+        .then(|| program.alloc_register());
+
     match &row_source {
         GroupByRowSource::Sorter { pseudo_cursor, .. } => {
             // Read leaf columns from the pseudo cursor and cache them so that
@@ -800,6 +809,17 @@ pub fn group_by_process_single_group(
                     .reg_agg_start
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
+                let reg_skip_nonagg = reg_skip_nonagg.filter(|_| agg.selects_min_max_row());
+
+                // Like SQLite, a row that the FILTER of a MIN/MAX skips is read
+                // if it is the first row of the group.
+                if let (Some(skip), Some(_)) = (reg_skip_nonagg, &agg.filter_expr) {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: registers.reg_data_in_acc_flag,
+                        dst_reg: skip,
+                        extra_amount: 0,
+                    });
+                }
 
                 // FILTER: skip AggStep if filter condition is false
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
@@ -831,6 +851,7 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    reg_skip_nonagg,
                 )?;
                 if let Distinctness::Distinct { ctx, .. } = &agg.distinctness {
                     let ctx = ctx
@@ -854,6 +875,17 @@ pub fn group_by_process_single_group(
                     .reg_agg_start
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
+                let reg_skip_nonagg = reg_skip_nonagg.filter(|_| agg.selects_min_max_row());
+
+                // Like SQLite, a row that the FILTER of a MIN/MAX skips is read
+                // if it is the first row of the group.
+                if let (Some(skip), Some(_)) = (reg_skip_nonagg, &agg.filter_expr) {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: registers.reg_data_in_acc_flag,
+                        dst_reg: skip,
+                        extra_amount: 0,
+                    });
+                }
 
                 // FILTER: skip AggStep if filter condition is false
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
@@ -889,6 +921,7 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    reg_skip_nonagg,
                 )?;
                 if let Distinctness::Distinct { ctx, .. } = &agg.distinctness {
                     let ctx = ctx
@@ -906,15 +939,15 @@ pub fn group_by_process_single_group(
         }
     }
 
-    // We only need to store non-aggregate columns once per group
-    // Skip if we've already stored them for this group
+    // We only need to store non-aggregate columns once per group, or with MIN/MAX
+    // once per new MIN/MAX value. Skip if we've already stored them for this group
     program.add_comment(
         program.offset(),
         "don't emit group columns if continuing existing group",
     );
     program.emit_insn(Insn::If {
         target_pc: labels.label_acc_indicator_set_flag_true,
-        reg: registers.reg_data_in_acc_flag,
+        reg: reg_skip_nonagg.unwrap_or(registers.reg_data_in_acc_flag),
         jump_if_null: false,
     });
 
