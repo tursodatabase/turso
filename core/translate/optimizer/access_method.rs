@@ -42,7 +42,8 @@ use super::{
         usable_constraints_for_join_order, usable_constraints_for_lhs_mask, TableConstraints,
     },
     cost::{
-        estimate_btree_depth, estimate_cost_for_scan_or_seek, estimate_ephemeral_index_build_cost,
+        estimate_btree_depth, estimate_cost_for_scan_or_seek,
+        estimate_cost_for_scan_or_seek_with_depth_memo, estimate_ephemeral_index_build_cost,
         estimate_index_cost, estimate_rows_per_seek, estimate_scan_cost, estimate_sort_cpu_cost,
         AnalyzeCtx, Cost, IndexInfo,
     },
@@ -388,7 +389,7 @@ pub(super) fn choose_best_btree_candidate(
             }
             None => base_row_count,
         };
-        let cost = estimate_cost_for_scan_or_seek(
+        let cost = estimate_cost_for_scan_or_seek_with_depth_memo(
             index_info,
             &rhs_constraints.constraints,
             &usable_constraint_refs,
@@ -397,6 +398,7 @@ pub(super) fn choose_best_btree_candidate(
             is_index_ordered,
             params,
             Some(&analyze_ctx),
+            Some(&candidate.tree_depth),
         );
 
         // Residual filter output adjustment (mirrors SQLite's whereLoopOutputAdjust).

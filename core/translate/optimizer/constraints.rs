@@ -1,4 +1,8 @@
-use super::{cost::IndexInfo, cost_params::CostModelParams, AvailableIndexes};
+use super::{
+    cost::{BtreeDepthMemo, IndexInfo},
+    cost_params::CostModelParams,
+    AvailableIndexes,
+};
 use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
 use crate::translate::expr_context::{ExprContext, ExprProperties, TableMetadata};
@@ -303,6 +307,9 @@ pub struct ConstraintUseCandidate {
     /// the first time that the join search needs it. The search reads it for
     /// each join order that it tries, and it does not change during the search.
     pub(super) index_info: OnceCell<IndexInfo>,
+    /// The B-tree depth that the join search used for the last cost of a
+    /// lookup with this candidate.
+    pub(super) tree_depth: BtreeDepthMemo,
 }
 
 impl ConstraintUseCandidate {
@@ -311,6 +318,7 @@ impl ConstraintUseCandidate {
             index,
             refs: Vec::new(),
             index_info: OnceCell::new(),
+            tree_depth: BtreeDepthMemo::default(),
         }
     }
 }

@@ -8,6 +8,7 @@ use turso_parser::ast;
 
 use super::constraints::Constraint;
 use super::cost_params::CostModelParams;
+use std::cell::Cell;
 
 /// A simple newtype wrapper over a f64 that represents the cost of an operation.
 ///
@@ -152,6 +153,30 @@ pub(super) fn estimate_ephemeral_index_build_cost(
 
 pub(super) fn estimate_sort_cpu_cost(row_count: f64, params: &CostModelParams) -> Cost {
     Cost(row_count * row_count.max(1.0).log2() * params.sort_cpu_per_row)
+}
+
+/// The result of [estimate_btree_depth] for the arguments of its last call.
+///
+/// The join search costs each index candidate for each join order that it
+/// tries, with the same row count each time. The two logarithms of the depth
+/// cost more instructions than the rest of the cost estimate.
+#[derive(Debug, Default)]
+pub(crate) struct BtreeDepthMemo(Cell<Option<(u64, u64, f64)>>);
+
+impl BtreeDepthMemo {
+    /// Same result as [estimate_btree_depth].
+    fn estimate_btree_depth(&self, row_count: f64, rows_per_page: f64) -> f64 {
+        let (row_count_bits, rows_per_page_bits) = (row_count.to_bits(), rows_per_page.to_bits());
+        if let Some((cached_row_count, cached_rows_per_page, depth)) = self.0.get() {
+            if cached_row_count == row_count_bits && cached_rows_per_page == rows_per_page_bits {
+                return depth;
+            }
+        }
+        let depth = estimate_btree_depth(row_count, rows_per_page);
+        self.0
+            .set(Some((row_count_bits, rows_per_page_bits, depth)));
+        depth
+    }
 }
 
 /// Estimate how many B-tree levels an index search reads.
@@ -470,6 +495,33 @@ pub fn estimate_cost_for_scan_or_seek(
     params: &CostModelParams,
     analyze_ctx: Option<&AnalyzeCtx>,
 ) -> Cost {
+    estimate_cost_for_scan_or_seek_with_depth_memo(
+        index_info,
+        constraints,
+        usable_constraint_refs,
+        input_cardinality,
+        base_row_count,
+        is_index_ordered,
+        params,
+        analyze_ctx,
+        None,
+    )
+}
+
+/// Same result as [estimate_cost_for_scan_or_seek]. When `depth_memo` is
+/// given, it supplies the B-tree depth.
+#[expect(clippy::too_many_arguments)]
+pub(super) fn estimate_cost_for_scan_or_seek_with_depth_memo(
+    index_info: Option<IndexInfo>,
+    constraints: &[Constraint],
+    usable_constraint_refs: &[RangeConstraintRef],
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    is_index_ordered: bool,
+    params: &CostModelParams,
+    analyze_ctx: Option<&AnalyzeCtx>,
+    depth_memo: Option<&BtreeDepthMemo>,
+) -> Cost {
     let base_row_count = *base_row_count;
 
     let Some(index_info) = index_info else {
@@ -477,7 +529,10 @@ pub fn estimate_cost_for_scan_or_seek(
         return estimate_scan_cost(base_row_count, input_cardinality, params);
     };
 
-    let tree_depth = estimate_btree_depth(base_row_count, params.rows_per_table_page);
+    let tree_depth = match depth_memo {
+        Some(memo) => memo.estimate_btree_depth(base_row_count, params.rows_per_table_page),
+        None => estimate_btree_depth(base_row_count, params.rows_per_table_page),
+    };
 
     if is_unique_point_lookup(index_info, usable_constraint_refs) {
         // Unique point lookup: 1 seek per input row, 1 row returned per seek
