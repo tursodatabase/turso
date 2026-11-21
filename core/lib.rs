@@ -188,7 +188,10 @@ pub use storage::{
     encryption::{CipherMode, EncryptionContext, EncryptionKey},
     page_transform::{PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation},
     pager::{Page, PageRef, Pager},
-    wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
+    wal::{
+        CheckpointFrameCap, CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile,
+        WalFileShared,
+    },
 };
 pub use translate::collate::CollationSeq;
 pub use translate::expr::{walk_expr_mut, WalkControl};

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use genawaiter::GeneratorState;
 use tempfile::TempDir;
-use turso_core::{Database, DatabaseOpts, OpenOptions, PlatformIO, IO};
+use turso_core::{Connection, Database, DatabaseOpts, OpenOptions, PlatformIO, IO};
 use turso_sqlite::SqliteDialect;
 use turso_sync_engine::database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts};
 use turso_sync_engine::database_sync_operations::SyncEngineIoStats;
@@ -78,8 +78,20 @@ impl Replica {
     }
 
     pub fn snapshot(&self) -> Result<Snapshot> {
-        let conn = drive(&self.io, async |coro| self.engine.connect_rw(coro).await)?;
-        Snapshot::capture(&conn)
+        Snapshot::capture(&self.connect()?)
+    }
+
+    pub fn connect(&self) -> Result<Arc<Connection>> {
+        drive(&self.io, async |coro| self.engine.connect_rw(coro).await)
+    }
+
+    /// How many local changes are waiting to be pushed.
+    pub fn pending_local_changes(&self) -> Result<i64> {
+        drive(&self.io, async |coro| self.engine.stats(coro).await).map(|s| s.cdc_operations)
+    }
+
+    pub fn checkpoint(&self) -> Result<()> {
+        drive(&self.io, async |coro| self.engine.checkpoint(coro).await)
     }
 }
 

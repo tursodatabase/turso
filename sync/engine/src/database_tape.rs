@@ -164,6 +164,9 @@ impl DatabaseTape {
             disable_auto_checkpoint: opts.disable_auto_checkpoint,
         }
     }
+    pub(crate) fn database(&self) -> &Arc<turso_core::Database> {
+        &self.inner
+    }
     pub(crate) fn connect_untracked(&self) -> Result<Arc<turso_core::Connection>> {
         let connection = self
             .inner

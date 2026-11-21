@@ -1271,6 +1271,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             meta: Mutex::new(meta.clone()),
             client_unique_id: meta.client_unique_id.clone(),
         };
+        db.set_checkpoint_frame_cap(&meta);
 
         let synced_revision = meta.synced_revision.as_ref();
         if let Some(DatabasePullRevision::Legacy {
@@ -1704,14 +1705,18 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             "ensure_local_mvcc_journal_mode(path={}): converting local database to MVCC journal mode for MVCC-protocol remote",
             self.main_db_path
         );
+        // The conversion checkpoints the whole WAL, past the revert watermark. That is fine here:
+        // the first pull from an MVCC remote replaces the base and replays local changes from the
+        // CDC log, so it never reads pages at the watermark.
+        self.main_tape.database().set_checkpoint_frame_cap(None);
         let mut stmt = main_conn.prepare("PRAGMA journal_mode = 'mvcc'")?;
-        run_stmt_ignore_rows(coro, &mut stmt)
-            .await
-            .map_err(|error| {
-                Error::DatabaseSyncEngineError(format!(
-                    "failed to convert local database to MVCC journal mode: {error}"
-                ))
-            })?;
+        let converted = run_stmt_ignore_rows(coro, &mut stmt).await;
+        if let Err(error) = converted {
+            self.set_checkpoint_frame_cap(&self.meta());
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "failed to convert local database to MVCC journal mode: {error}"
+            )));
+        }
         assert!(
             main_conn.mvcc_enabled(),
             "journal_mode=mvcc pragma succeeded but MvStore is not open"
@@ -3275,8 +3280,32 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         )
         .await?;
         // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
+        self.set_checkpoint_frame_cap(&meta);
         *self.meta.lock().unwrap() = meta;
         Ok(())
+    }
+
+    /// Caps every checkpoint of the main DB at the revert watermark. A pull rolls back local
+    /// changes by reading pages as they were at the watermark, so the frames after it must stay
+    /// out of the DB file. The engine's own checkpoints stop at the watermark too, and its final
+    /// TRUNCATE runs after `update_meta` moves the watermark to the end of the WAL.
+    ///
+    /// An MVCC database gets no cap: a pull of logical changes does not read pages at the
+    /// watermark, and the MVCC checkpoint must copy the whole WAL.
+    fn set_checkpoint_frame_cap(&self, meta: &DatabaseMetadata) {
+        let database = self.main_tape.database();
+        let cap = if database.mvcc_enabled() {
+            None
+        } else {
+            Some(turso_core::CheckpointFrameCap {
+                wal_salt: meta
+                    .revert_since_wal_salt
+                    .as_ref()
+                    .map(|salt| (salt[0], salt[1])),
+                max_frame: meta.revert_since_wal_watermark,
+            })
+        };
+        database.set_checkpoint_frame_cap(cap);
     }
 }
 

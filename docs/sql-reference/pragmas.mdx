@@ -660,6 +660,8 @@ A checkpoint writes pages from the WAL file back to the database file.
 
 Inside a transaction, the checkpoint fails with `database table is locked` once the transaction has read or written the database. Right after `BEGIN`, before any read, it runs normally.
 
+On a database opened by the sync SDK in WAL mode, `PRAGMA wal_checkpoint` copies only the frames the sync engine knows are synced with the remote. Frames after them (local changes not pushed yet, and the sync engine's own bookkeeping) stay in the WAL, because the next pull reads the pages as they were before those frames. So `PASSIVE` can report fewer checkpointed frames than log frames, and `FULL`, `RESTART` and `TRUNCATE` return busy = 1, as when a reader blocks them. Call `checkpoint()` on the sync database to empty the WAL. In MVCC mode the checkpoint is not limited.
+
 ### wal_autocheckpoint
 
 Returns or sets how many pages the WAL can hold before a commit on this connection runs a checkpoint. The default is 1000 pages. Zero or a negative value turns automatic checkpoints off.
