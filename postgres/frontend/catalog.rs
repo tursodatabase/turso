@@ -303,6 +303,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn sums_floats_naively(&self) -> bool {
+        true
+    }
+
     fn requires_custom_types(&self) -> bool {
         true
     }
