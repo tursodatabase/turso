@@ -85,6 +85,17 @@ expect error {
     UPSERT and REPLACE on WITHOUT ROWID tables are not supported
 }
 
+test without-rowid-insert-or-ignore {
+    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
+    INSERT INTO t VALUES ('k', 1);
+    INSERT OR IGNORE INTO t VALUES ('k', 2), ('m', 3);
+    SELECT * FROM t;
+}
+expect {
+    k|1
+    m|3
+}
+
 test without-rowid-upsert-rejected {
     CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
     INSERT INTO t VALUES ('k', 1);

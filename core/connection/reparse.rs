@@ -1,9 +1,7 @@
 use super::{Connection, SchemaReparseGuard};
 use crate::alloc::TryClone;
 use crate::namespace::NamespaceId;
-use crate::schema::load::{
-    CustomTypes, DialectState, NamespaceNames, SchemaLoader, SchemaRows, Sequences, ViewsAndIndexes,
-};
+use crate::schema::load::{load_steps, SchemaInstall, SchemaLoader, StepsFor};
 use crate::schema::SequencesByNamespace;
 use crate::sync::Arc;
 use crate::util::IOExt;
@@ -129,15 +127,14 @@ impl Connection {
         // the loader swaps our schema with a new clean schema that has the same header cookie
         // before it prepares its first statement.
         let mut loader = SchemaLoader::new(
-            fresh,
-            vec![
-                Box::new(SchemaRows::new(self.clone())),
-                Box::new(NamespaceNames::new(self.clone())),
-                Box::new(Sequences::new(self.clone(), preserved_sequences)),
-                Box::new(CustomTypes::new(self.clone())),
-                Box::new(ViewsAndIndexes::new(self.clone())),
-                Box::new(DialectState::new(self.clone())),
-            ],
+            Arc::new(fresh),
+            load_steps(
+                self,
+                StepsFor::Reload {
+                    preserved_sequences,
+                },
+            ),
+            SchemaInstall::ConnectionCopy,
         );
         loader.prepare_next_statement(self)?;
 
@@ -185,9 +182,7 @@ impl Connection {
                         fresh.schema_version,
                         fresh.table_names(NamespaceId::ROOT).collect::<Vec<_>>()
                     );
-                    self.with_schema_mut(|schema| {
-                        *schema = fresh;
-                    })?;
+                    *self.schema.write() = fresh;
                     return Ok(IOResult::Done(()));
                 }
             }

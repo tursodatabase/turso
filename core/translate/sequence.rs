@@ -1239,9 +1239,20 @@ pub fn translate_drop_sequence(
         std::slice::from_ref(&normalized_name),
         schema::DroppedWithSequences::Nothing,
     )? {
-        bail_parse_error!(
-            "cannot drop sequence {normalized_name} because other objects depend on it: {usage}"
-        );
+        return Err(crate::LimboError::dependent_objects(
+            format!(
+                "sequence {}",
+                resolver.with_schema(namespace.database_id, |schema| {
+                    connection.dialect().relation_name_in_messages(
+                        connection,
+                        schema,
+                        namespace.id,
+                        &normalized_name,
+                    )
+                })
+            ),
+            vec![usage],
+        ));
     }
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);

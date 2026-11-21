@@ -6,8 +6,9 @@ use crate::translate::emitter::emit_columns_and_dependencies;
 use crate::translate::expr::{emit_constraint_values_decode, emit_stored_column};
 use crate::translate::plan::ColumnMask;
 use crate::turso_assert;
+use crate::vdbe::{MAX_TRIGGER_DEPTH, TRIGGER_DEPTH_ERROR};
 use crate::{
-    error::SQLITE_CONSTRAINT_FOREIGNKEY,
+    error::{SQLITE_CONSTRAINT_FOREIGNKEY, SQLITE_ERROR},
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef},
     sync::{Arc, OnceLock, Weak},
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
@@ -1897,11 +1898,18 @@ fn emit_fk_action_subprogram(
         );
         Subprogram::Pending(slot)
     } else {
+        let depth = program.subprogram_depth() + 1;
+        if depth > MAX_TRIGGER_DEPTH {
+            // As in SQLite, the error occurs only if the statement gets to this level.
+            program.emit_halt_err(SQLITE_ERROR, TRIGGER_DEPTH_ERROR.to_string());
+            return Ok(());
+        }
         let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
             QueryMode::Normal,
             program.capture_data_changes_info().clone(),
             FK_SUBPROGRAM_OPTS,
             program.is_mvcc_enabled(),
+            depth,
         );
         subprogram_builder
             .flags

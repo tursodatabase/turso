@@ -111,7 +111,7 @@ pub(crate) fn validate_check_expr(
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }
                 if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
-                    if matches!(func, Func::Agg(..)) {
+                    if func.is_aggregate() {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
                     }
                     if matches!(func, Func::Window(..)) {
@@ -126,7 +126,7 @@ pub(crate) fn validate_check_expr(
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }
                 if let Some(func) = resolver.resolve_function(name.as_str(), 0)? {
-                    if matches!(func, Func::Agg(..)) {
+                    if func.is_aggregate() {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
                     }
                     if matches!(func, Func::Window(..)) {
@@ -439,7 +439,7 @@ fn resolve_func_return_type(
     columns: &[&ast::ColumnDefinition],
     resolver: &CatalogContext,
 ) -> Result<CheckExprType> {
-    if let Func::Agg(_) = func {
+    if func.is_aggregate() {
         bail_parse_error!("misuse of aggregate function {}()", name);
     }
     let type_of = |arg: &ast::Expr| resolve_check_expr_type(arg, columns, resolver);
@@ -868,22 +868,21 @@ pub(crate) fn check_column_type(
             type_name
         );
     };
-    // A type with parameters besides `value` needs each one given, as in `p(10)`.
+    // A column gives one modifier for each type parameter besides `value`, as
+    // in `p(10)`, and none for a type without such parameters.
     let expected = td.user_params().count();
-    if expected > 0 {
-        let provided = match &col_type.size {
-            Some(ast::TypeSize::TypeSize(_, _)) => 2,
-            Some(ast::TypeSize::MaxSize(_)) => 1,
-            None => 0,
-        };
-        if provided != expected {
-            bail_parse_error!(
-                "type \"{}\" requires {} parameter(s), got {}",
-                type_name,
-                expected,
-                provided
-            );
-        }
+    let provided = match &col_type.size {
+        Some(ast::TypeSize::TypeSize(_, _)) => 2,
+        Some(ast::TypeSize::MaxSize(_)) => 1,
+        None => 0,
+    };
+    if provided != expected {
+        bail_parse_error!(
+            "type \"{}\" requires {} parameter(s), got {}",
+            type_name,
+            expected,
+            provided
+        );
     }
     Ok(())
 }
@@ -1408,6 +1407,27 @@ pub fn translate_create_table(
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
 
     let index_regs = collect_autoindexes(&body, program, &mangled_tbl_name, resolver)?;
+
+    // SQLite compiles `SELECT * FROM t` at the end of CREATE TABLE, after all other
+    // checks, and that fails on a RAISE outside a trigger. The SELECT reads STORED
+    // columns from the row, so only VIRTUAL columns are checked. ALTER TABLE ADD
+    // COLUMN does not compile it, so this check is not in `validate_generated_expr`.
+    if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = &body {
+        for constraint in columns.iter().flat_map(|c| &c.constraints) {
+            if let ast::ColumnConstraint::Generated { expr, typ, .. } = &constraint.constraint {
+                if matches!(typ, Some(ast::GeneratedColumnType::Stored)) {
+                    continue;
+                }
+                walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+                    if matches!(e, ast::Expr::Raise(..)) {
+                        bail_parse_error!("RAISE() may only be used within a trigger-program");
+                    }
+                    Ok(WalkControl::Continue)
+                })?;
+            }
+        }
+    }
+
     if let Some(index_regs) = index_regs.as_ref() {
         for index_reg in index_regs.iter() {
             program.emit_insn(Insn::CreateBtree {
@@ -2028,6 +2048,12 @@ pub fn translate_drop_table(
         );
     };
     validate_drop_table(&resolver.catalog, namespace, name, connection)?;
+    let mut dependents = crate::translate::view::dependents_blocking_drop(
+        resolver,
+        connection,
+        namespace,
+        &normalize_ident(name),
+    );
     let owned_sequences = if table.btree().is_some() && namespace.database_id == MAIN_DB_ID {
         resolver.catalog.dialect.owned_sequences(
             resolver.schema(),
@@ -2045,10 +2071,23 @@ pub fn translate_drop_table(
         &owned_sequences,
         DroppedWithSequences::Table(&normalize_ident(name)),
     )? {
-        bail_parse_error!(
-            "cannot drop table {} because other objects depend on it: {usage}",
-            normalize_ident(name)
-        );
+        dependents.push(usage);
+    }
+    if !dependents.is_empty() {
+        return Err(LimboError::dependent_objects(
+            format!(
+                "table {}",
+                resolver.with_schema(database_id, |schema| {
+                    connection.dialect().relation_name_in_messages(
+                        connection,
+                        schema,
+                        namespace.id,
+                        &normalize_ident(name),
+                    )
+                })
+            ),
+            dependents,
+        ));
     }
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
@@ -2611,7 +2650,7 @@ pub(crate) fn find_object_using_sequence(
             walk_schema_expressions(schema, dialect, &mut |owner_namespace, owner, expr| {
                 if usage.is_none() && !is_dropped(database_id, owner_namespace, &owner) {
                     usage = checked_sequence_called_by(expr)
-                        .map(|sequence| format!("{owner} depends on sequence {sequence}"));
+                        .map(|sequence| (owner.to_string(), sequence));
                 }
                 Ok(if usage.is_some() {
                     WalkControl::SkipChildren
@@ -2621,7 +2660,12 @@ pub(crate) fn find_object_using_sequence(
             })
         })?;
     }
-    Ok(usage)
+    Ok(usage.map(|(owner, sequence)| {
+        let sequence = resolver.with_schema(namespace.database_id, |schema| {
+            dialect.relation_name_in_messages(connection, schema, namespace.id, &sequence)
+        });
+        format!("{owner} depends on sequence {sequence}")
+    }))
 }
 
 /// Validate an encode or decode expression for safety.
@@ -2642,7 +2686,7 @@ fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &CatalogContext) -
                     bail_parse_error!("window functions prohibited in {kind} expressions");
                 }
                 if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
-                    if matches!(func, Func::Agg(..)) {
+                    if func.is_aggregate() {
                         bail_parse_error!(
                             "aggregate functions prohibited in {kind} expressions: {}",
                             name.as_str()

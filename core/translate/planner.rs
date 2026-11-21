@@ -1255,6 +1255,9 @@ fn plan_cte(
             {
                 continue;
             }
+            // The plan of this CTE holds the plan of the CTE that it reads, so a
+            // chain of CTEs in one WITH clause nests its plans one in another.
+            let nested_query = resolver.enter_nested_query()?;
             let referenced_cte_table = plan_cte(
                 referenced_cte_index,
                 cte_definitions,
@@ -1264,6 +1267,7 @@ fn plan_cte(
                 connection,
                 false,
             )?;
+            drop(nested_query);
             outer_query_refs.push(OuterQueryReference {
                 identifier: referenced_cte_table.identifier.clone(),
                 has_alias: referenced_cte_table.has_alias,
@@ -2848,11 +2852,17 @@ pub fn determine_where_to_eval_term(
                 || referenced_tables
                     .iter()
                     .any(|table_index| table_index < right_table_index);
-            if reads_left_table {
-                let loop_index = join_order
-                    .iter()
-                    .position(|table| table.table_id == right_table.internal_id)
-                    .expect("right join table must be in the join order");
+            if !reads_left_table {
+                continue;
+            }
+            // A materialized hash input removes its join prefix from this plan.
+            // When that prefix holds the RIGHT JOIN, the input's own plan already
+            // added the unmatched right rows, and every row reaches this plan
+            // through the probe loop. The term then runs where its tables are ready.
+            if let Some(loop_index) = join_order
+                .iter()
+                .position(|table| table.table_id == right_table.internal_id)
+            {
                 eval_at = eval_at.max(EvalAt::Loop(loop_index));
             }
         }

@@ -990,11 +990,20 @@ pub fn translate_alter_table(
                     column: &column_name_norm,
                 },
             )? {
-                crate::bail_parse_error!(
-                    "cannot drop column {} of table {} because other objects depend on it: {usage}",
-                    column_name_norm,
-                    table_name_norm
-                );
+                return Err(LimboError::dependent_objects(
+                    format!(
+                        "column {column_name_norm} of table {}",
+                        resolver.with_schema(database_id, |schema| {
+                            connection.dialect().relation_name_in_messages(
+                                connection,
+                                schema,
+                                namespace.id,
+                                &table_name_norm,
+                            )
+                        })
+                    ),
+                    vec![usage],
+                ));
             }
             let cmd_context = CmdContext::new(connection, resolver, database_id);
             resolver.catalog.dialect.catalog().emit(
@@ -2051,10 +2060,7 @@ fn translate_alter_owner(
     // ALTER TABLE accepts every relation kind, as in PostgreSQL; the other
     // forms want their own.
     if kind != RelationKind::Table && existing_kind != kind {
-        crate::bail_parse_error!(
-            "\"{normalized_name}\" is not {}",
-            relation_kind_phrase(kind)
-        );
+        crate::bail_parse_error!("\"{normalized_name}\" is not {}", kind.with_article());
     }
     // The dialect decides what goes with the relation, such as a table's
     // indexes, and whose an index's owner is.
@@ -2075,17 +2081,6 @@ fn translate_alter_owner(
         .emit_access(program, &cmd_context, &statement)?;
     schema::emit_schema_cookie(resolver, program);
     Ok(())
-}
-
-/// `kind` as an `ALTER ... OWNER TO` error names it.
-fn relation_kind_phrase(kind: RelationKind) -> &'static str {
-    match kind {
-        RelationKind::Table => "a table",
-        RelationKind::View => "a view",
-        RelationKind::MaterializedView => "a materialized view",
-        RelationKind::Sequence => "a sequence",
-        RelationKind::Index => "an index",
-    }
 }
 
 /// The namespace and kind of the relation `qualified_name` names: a table,

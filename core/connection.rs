@@ -1772,33 +1772,6 @@ impl Connection {
         self.fk_deferred_violations.fetch_add(v, Ordering::AcqRel);
     }
 
-    /// Query the `(id, name)` rows of the namespaces table. The connection's
-    /// schema must already contain the table definitions so that `prepare`
-    /// can resolve the table name. Returns an empty Vec if the database has
-    /// no namespaces table.
-    pub(crate) fn query_stored_namespaces(self: &Arc<Connection>) -> Result<Vec<(i64, String)>> {
-        let has_namespaces_table = {
-            let s = self.schema.read();
-            s.has_table(
-                NamespaceId::ROOT,
-                crate::schema::TURSO_NAMESPACES_TABLE_NAME,
-            )
-        };
-        if !has_namespaces_table {
-            return Ok(Vec::new());
-        }
-        let mut stmt = self.prepare_internal(format!(
-            "SELECT id, name FROM {}",
-            crate::schema::TURSO_NAMESPACES_TABLE_NAME
-        ))?;
-        let mut rows = Vec::new();
-        stmt.run_with_row_callback(|row| {
-            rows.push((row.get::<i64>(0)?, row.get::<&str>(1)?.to_string()));
-            Ok(())
-        })?;
-        Ok(rows)
-    }
-
     pub fn maybe_update_schema(&self) {
         if self.schema_reparse_in_progress() {
             return;
@@ -2306,10 +2279,12 @@ impl Connection {
         self.clear_mvcc_log_meta();
 
         let is_memory_db = is_memory_like(&self.db.path);
-        let should_checkpoint_on_close = pager
-            .wal
-            .as_ref()
-            .is_none_or(|wal| wal.should_checkpoint_on_close());
+        // For MVCC the shutdown checkpoint only fsyncs the WAL, which is needed only while
+        // the WAL holds frames that are not yet copied into the database file.
+        let should_checkpoint_on_close = pager.wal.as_ref().is_none_or(|wal| {
+            wal.should_checkpoint_on_close()
+                && (!self.mvcc_enabled() || wal.get_max_frame_in_wal() > wal.backfill_frame())
+        });
         if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
             && !self.db.is_readonly()
             && !is_memory_db

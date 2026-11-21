@@ -103,14 +103,9 @@ jobs:
         uses: useblacksmith/setup-node@v5
         with:
           node-version: 24
-      - name: Install JS dependencies
-        run: yarn install
-      - name: Build common package
-        run: yarn workspace @tursodatabase/database-common build
-      - name: Build native bindings
-        run: yarn workspace @tursodatabase/database napi-build --target x86_64-unknown-linux-gnu
-      - name: Build TypeScript
-        run: yarn workspace @tursodatabase/database tsc-build
+      # `make run-js` installs the JS dependencies and builds the common
+      # package, the native binding (with the test_helper feature the tests
+      # need) and the TypeScript, so this job has no separate build steps.
       - name: Build test runner
         working-directory: sqlite/conformance
         run: make build-runner

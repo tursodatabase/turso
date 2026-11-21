@@ -3,7 +3,7 @@ use crate::alloc::{
     TursoTryWithCapacityExt, TursoVecExt,
 };
 use crate::cdc::TURSO_CDC_VERSION_TABLE_NAME;
-use crate::dialect::{ScalarFuncContext, StatementTimes};
+use crate::dialect::{DependentObject, ScalarFuncContext, StatementTimes};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
@@ -176,7 +176,7 @@ use crate::{
     json::json_patch, json::json_quote, json::json_remove, json::json_replace, json::json_set,
     json::json_type, json::jsonb, json::jsonb_array, json::jsonb_extract, json::jsonb_insert,
     json::jsonb_object, json::jsonb_patch, json::jsonb_remove, json::jsonb_replace,
-    json::jsonb_set, json::raw_jsonb_element_len, json::Conv,
+    json::jsonb_set, json::raw_jsonb_element_len, json::Conv, vdbe::value::sqlite_text_prefix,
 };
 
 use super::{Program, ProgramState, Register};
@@ -1459,12 +1459,18 @@ pub fn op_vopen(
     let CursorType::VirtualTable(virtual_table) = cursor_type else {
         panic!("VOpen on non-virtual table cursor");
     };
-    let cursor = virtual_table.open(connection.clone())?;
-    state
+    let slot = state
         .cursors
         .get_mut(*cursor_id)
-        .unwrap_or_else(|| panic!("cursor id {} out of bounds", *cursor_id))
-        .replace(Cursor::Virtual(cursor));
+        .unwrap_or_else(|| panic!("cursor id {} out of bounds", *cursor_id));
+    // A correlated subquery runs VOpen again for each outer row. The slot of a
+    // cursor id belongs to one virtual table in a program, and the VFilter
+    // after VOpen starts a new scan, so an internal cursor from an earlier run
+    // is kept with its buffers, as SQLite's OP_VOpen keeps an open cursor.
+    if !matches!(slot, Some(Cursor::Virtual(cursor)) if cursor.is_internal()) {
+        let cursor = virtual_table.open(connection.clone())?;
+        slot.replace(Cursor::Virtual(cursor));
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1534,20 +1540,22 @@ pub fn op_vfilter(
         insn
     );
     let has_rows = {
-        let cursor = get_cursor!(state, *cursor_id);
-        let cursor = cursor.as_virtual_mut();
-
-        let args = (0..*arg_count)
-            .map(|i| state.registers[args_reg + i].get_value().try_clone())
-            .try_collect::<Result<crate::alloc::Vec<_>>>()??;
         let idx_str = if let Some(idx_str) = idx_str {
             Some(state.registers[*idx_str].get_value().to_string())
         } else {
             None
         };
+        let cursor = get_cursor!(state, *cursor_id);
+        let cursor = cursor.as_virtual_mut();
         return_if_io!(
             state,
-            cursor.filter(*idx_num as i32, idx_str, *arg_count, args)
+            cursor.filter_with_json_cache(
+                *idx_num as i32,
+                idx_str,
+                &mut state.registers[*args_reg..*args_reg + *arg_count],
+                #[cfg(feature = "json")]
+                &state.json_cache,
+            )
         )
     };
     // Increment filter_operations metric for virtual table filter
@@ -1577,12 +1585,14 @@ pub fn op_vcolumn(
         },
         insn
     );
-    let value = {
-        let cursor = state.get_cursor(*cursor_id);
+    {
+        let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_virtual_mut();
-        return_if_io!(state, cursor.column(*column))
-    };
-    state.registers[*dest].set_value(value);
+        return_if_io!(
+            state,
+            cursor.column_into(*column, &mut state.registers[*dest])
+        );
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2883,7 +2893,7 @@ pub fn op_array_decode(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _connection: &Arc<Connection>,
+    connection: &Arc<Connection>,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(ArrayDecode { reg }, insn);
@@ -2896,7 +2906,7 @@ pub fn op_array_decode(
 
     let text = match val {
         Value::Blob(b) if b.is_empty() => "{}".to_string(),
-        Value::Blob(b) => serialize_array_from_blob(b)?,
+        Value::Blob(b) => serialize_array_from_blob(b, connection.dialect().as_ref())?,
         _ => {
             // Not a blob — leave as-is (might be text from a function result)
             state.pc += 1;
@@ -6072,6 +6082,14 @@ pub fn op_program(
     loop {
         match std::mem::take(state.active_op_state.program()) {
             OpProgramState::Start => {
+                // The compiler stops at the same depth. But a foreign key action
+                // that cascades to its own table executes one program for each
+                // level of the cascade, with no compilation.
+                if state.subprogram_depth >= crate::vdbe::MAX_TRIGGER_DEPTH {
+                    return Err(
+                        LimboError::SqlError(crate::vdbe::TRIGGER_DEPTH_ERROR.to_string()).into(),
+                    );
+                }
                 // Try to reuse a cached statement for this PC, otherwise create a new one.
                 // When we have triggers or fk-actions with multi-row inserts, we can re-use
                 // cached statements by storing them key'd by the state.pc if we are in a loop
@@ -6091,6 +6109,7 @@ pub fn op_program(
                             false,
                         ))
                     };
+                statement.set_subprogram_depth(state.subprogram_depth + 1);
 
                 // Check if this is a trigger subprogram - if so, track execution
                 // and save last_insert_rowid so it can be restored after the trigger finishes.
@@ -7891,9 +7910,9 @@ fn update_agg_payload(
             };
             // SQLite skips rows whose object label is SQL NULL. A NULL value is
             // still encoded as JSON null, so only the key is filtered here.
-            if matches!(arg, Value::Null) {
+            let Some(label) = arg.cast_text_ref() else {
                 return Ok(());
-            }
+            };
             ensure_blob_arg_is_jsonb(value.as_value_ref())?;
             let Value::Blob(vec) = &mut payload[0] else {
                 mark_unlikely();
@@ -7910,7 +7929,9 @@ fn update_agg_payload(
                     // bits for obj header
                     vec.push(12);
                 }
-                append_dbtype_as_jsonb(vec, arg.as_value_ref(), Conv::ToString)?;
+                // Like jsonObjectStep in SQLite, the label is the text of the
+                // value up to its first NUL, while json_object() keeps the NUL.
+                jsonb::append_string_literal(vec, sqlite_text_prefix(&label))?;
                 append_dbtype_as_jsonb(vec, value.as_value_ref(), Conv::NotStrict)
             })();
             if appended.is_err() {
@@ -10402,7 +10423,7 @@ fn parse_schema_sql_for_alter(
         }
         return Ok(Some(ast::Cmd::Stmt(stmt)));
     }
-    dialect.parse(sql).map(|(cmd, _)| cmd)
+    dialect.parse_internal(sql).map(|(cmd, _)| cmd)
 }
 
 pub fn op_function(
@@ -17114,7 +17135,7 @@ pub fn op_rename_table(
                 if !sql_might_reference_identifier(&view.sql, &normalized_from) {
                     continue;
                 }
-                let Some(ast::Cmd::Stmt(stmt)) = conn.dialect().parse(&view.sql)?.0 else {
+                let Some(ast::Cmd::Stmt(stmt)) = conn.dialect().parse_internal(&view.sql)?.0 else {
                     continue;
                 };
                 if let Some(rewrite) = rewrite_view_for_table_rename(
@@ -17360,6 +17381,26 @@ pub fn op_drop_column(
     })??;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
+        let dropped = format!(
+            "column {column_name} of table {}",
+            conn.dialect().relation_name_in_messages(
+                &conn,
+                schema,
+                *namespace,
+                &normalized_table_name
+            )
+        );
+        let dependents = views_broken_by_dropped_column(
+            &conn,
+            schema,
+            *db,
+            *namespace,
+            &normalized_table_name,
+            &dropped,
+        );
+        if !dependents.is_empty() {
+            return Err(LimboError::dependent_objects(dropped, dependents));
+        }
         for (view_name, view) in schema.views(*namespace) {
             let view_select_sql = select_from_view_sql(&conn, *db, schema, *namespace, view_name);
             let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
@@ -17374,6 +17415,46 @@ pub fn op_drop_column(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// A description of each view that the dialect says depends on `table` of
+/// `namespace` and that can no longer be prepared now that the table has
+/// lost a column. `dropped` names the column, as in `column c of table t`.
+fn views_broken_by_dropped_column(
+    conn: &Arc<Connection>,
+    schema: &crate::schema::Schema,
+    db: usize,
+    namespace: NamespaceId,
+    table: &str,
+    dropped: &str,
+) -> Vec<String> {
+    if db != MAIN_DB_ID {
+        return Vec::new();
+    }
+    conn.dialect()
+        .relation_dependents(schema, namespace, table)
+        .iter()
+        .rev()
+        .filter(|dependent| {
+            let DependentObject::View { namespace, name } = &dependent.object;
+            let view_select_sql = select_from_view_sql(conn, db, schema, *namespace, name);
+            conn.prepare(view_select_sql.as_str()).is_err()
+        })
+        .map(|dependent| {
+            let DependentObject::View {
+                namespace: view_namespace,
+                name,
+            } = &dependent.object;
+            if dependent.depends_on.0 == namespace && dependent.depends_on.1 == table {
+                let view_name =
+                    conn.dialect()
+                        .relation_name_in_messages(conn, schema, *view_namespace, name);
+                format!("view {view_name} depends on {dropped}")
+            } else {
+                crate::translate::view::describe_dependent(conn, schema, dependent)
+            }
+        })
+        .collect()
 }
 
 /// SQL that selects from the view `view_name` of database `db`, named with

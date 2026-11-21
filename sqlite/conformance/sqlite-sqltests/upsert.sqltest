@@ -178,6 +178,53 @@ expect {
 }
 
 @cross-check-integrity
+test upsert-returning-subqueries-update {
+    CREATE TABLE r4 (id INTEGER PRIMARY KEY, v);
+    CREATE TABLE r4x (x);
+    INSERT INTO r4x VALUES (1), (2), (3);
+    INSERT INTO r4 VALUES (1, 1);
+    INSERT INTO r4 VALUES (1, 2)
+      ON CONFLICT DO UPDATE SET v = excluded.v + 1
+      RETURNING v, (SELECT count(*) FROM r4x), EXISTS (SELECT 1 FROM r4x),
+        v IN (SELECT x FROM r4x), (SELECT x * 10 FROM r4x WHERE x = r4.v);
+}
+expect {
+    3|3|1|1|30
+}
+
+@cross-check-integrity
+test upsert-returning-subqueries-update-then-insert {
+    CREATE TABLE r5 (id INTEGER PRIMARY KEY, name);
+    CREATE TABLE r5x (x);
+    INSERT INTO r5x VALUES (1), (2);
+    INSERT INTO r5 VALUES (1, 'a');
+    INSERT INTO r5 VALUES (1, 'b'), (2, 'c')
+      ON CONFLICT DO UPDATE SET name = excluded.name
+      RETURNING id, (SELECT count(*) FROM r5x), (SELECT count(*) FROM r5);
+}
+expect {
+    1|2|1
+    2|2|2
+}
+
+@cross-check-integrity
+test upsert-returning-subqueries-before-after-triggers {
+    CREATE TABLE r6 (id INTEGER PRIMARY KEY, name);
+    CREATE TABLE r6log (x);
+    CREATE TRIGGER r6i AFTER INSERT ON r6 BEGIN INSERT INTO r6log VALUES ('i'); END;
+    CREATE TRIGGER r6u AFTER UPDATE ON r6 BEGIN INSERT INTO r6log VALUES ('u'); END;
+    INSERT INTO r6 VALUES (1, 'a');
+    DELETE FROM r6log;
+    INSERT INTO r6 VALUES (1, 'b'), (2, 'c')
+      ON CONFLICT DO UPDATE SET name = excluded.name
+      RETURNING id, (SELECT count(*) FROM r6log);
+}
+expect {
+    1|0
+    2|1
+}
+
+@cross-check-integrity
 test upsert-rowid-in-set {
     CREATE TABLE rid (id INTEGER PRIMARY KEY, name);
     INSERT INTO rid VALUES (5,'foo');
@@ -1092,4 +1139,172 @@ test upsert-do-update-compiled-when-table-has-unique-index-created-separately {
 }
 expect error {
     no such column: nosuch
+}
+
+# OR IGNORE does not replace the upsert: a conflict on the upsert target runs
+# DO UPDATE, and OR IGNORE applies to the other constraints.
+@cross-check-integrity
+test upsert-insert-or-ignore-runs-do-update {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, n INTEGER NOT NULL);
+    INSERT OR IGNORE INTO u VALUES(1,1) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    INSERT OR IGNORE INTO u VALUES(1,1) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    INSERT OR IGNORE INTO u VALUES(1,1) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    INSERT OR IGNORE INTO u VALUES(1,1) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    SELECT n FROM u;
+}
+expect {
+    4
+}
+
+@cross-check-integrity
+test upsert-insert-or-ignore-skips-conflict-on-other-index {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, b UNIQUE, c UNIQUE, n);
+    INSERT INTO u VALUES(1,1,1,1),(2,2,2,1);
+    INSERT OR IGNORE INTO u VALUES(3,1,3,5),(4,4,2,0),(5,5,5,5) ON CONFLICT(c) DO UPDATE SET n=n+100;
+    INSERT OR IGNORE INTO u VALUES(6,2,6,6) ON CONFLICT(id) DO UPDATE SET n=n+100;
+    INSERT OR IGNORE INTO u VALUES(2,7,7,7) ON CONFLICT(b) DO UPDATE SET n=n+100;
+    SELECT * FROM u ORDER BY id;
+}
+expect {
+    1|1|1|1
+    2|2|2|101
+    5|5|5|5
+}
+
+@cross-check-integrity
+test upsert-insert-or-ignore-not-null-and-check {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, n INTEGER NOT NULL CHECK(n < 100));
+    INSERT INTO u VALUES(1,1);
+    INSERT OR IGNORE INTO u VALUES(2,NULL) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    INSERT OR IGNORE INTO u VALUES(3,500) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    INSERT OR IGNORE INTO u VALUES(1,500) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    INSERT OR IGNORE INTO u VALUES(1,5) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    SELECT * FROM u;
+}
+expect {
+    1|2
+}
+
+@cross-check-integrity
+test upsert-column-on-conflict-ignore-skips-conflict-on-other-index {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, b UNIQUE ON CONFLICT IGNORE, n);
+    INSERT INTO u VALUES(1,1,1),(2,2,1);
+    INSERT INTO u VALUES(3,1,5) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    INSERT INTO u VALUES(2,5,5) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    SELECT * FROM u ORDER BY id;
+}
+expect {
+    1|1|1
+    2|2|2
+}
+
+# OR REPLACE deletes the row that conflicts on a constraint other than the
+# upsert target; a conflict on the upsert target still runs DO UPDATE.
+@cross-check-integrity
+test upsert-insert-or-replace-replaces-conflict-on-other-index {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, a UNIQUE, b UNIQUE, n);
+    INSERT INTO u VALUES(1,1,1,0),(2,2,2,0),(3,3,3,0);
+    INSERT OR REPLACE INTO u VALUES(6,7,2,5) ON CONFLICT(a) DO UPDATE SET n=n+100;
+    INSERT OR REPLACE INTO u VALUES(3,8,8,5) ON CONFLICT(a) DO UPDATE SET n=n+100;
+    INSERT OR REPLACE INTO u VALUES(9,1,9,5) ON CONFLICT(a) DO UPDATE SET n=n+100;
+    SELECT * FROM u ORDER BY id;
+}
+expect {
+    1|1|1|100
+    3|8|8|5
+    6|7|2|5
+}
+
+@cross-check-integrity
+test upsert-column-on-conflict-replace-replaces-conflict-on-other-constraint {
+    CREATE TABLE u(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, a UNIQUE, b UNIQUE ON CONFLICT REPLACE, n);
+    INSERT INTO u VALUES(1,1,1,0),(2,2,2,0),(3,3,3,0);
+    INSERT INTO u VALUES(6,7,2,5) ON CONFLICT(a) DO UPDATE SET n=n+100;
+    INSERT INTO u VALUES(3,8,8,5) ON CONFLICT(a) DO UPDATE SET n=n+100;
+    INSERT INTO u VALUES(9,1,9,5) ON CONFLICT(a) DO UPDATE SET n=n+100;
+    SELECT * FROM u ORDER BY id;
+}
+expect {
+    1|1|1|100
+    3|8|8|5
+    6|7|2|5
+}
+
+# An upsert clause that targets a constraint declared ON CONFLICT REPLACE
+# handles that constraint's conflicts.
+@cross-check-integrity
+test upsert-targets-constraint-declared-on-conflict-replace {
+    CREATE TABLE u(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, a UNIQUE ON CONFLICT REPLACE, b UNIQUE, n);
+    INSERT INTO u VALUES(1,1,1,0),(2,2,2,0);
+    INSERT INTO u VALUES(1,5,5,5) ON CONFLICT(id) DO UPDATE SET n=n+100;
+    INSERT INTO u VALUES(7,2,7,5) ON CONFLICT(a) DO UPDATE SET n=n+10;
+    SELECT * FROM u ORDER BY id;
+}
+expect {
+    1|1|1|100
+    2|2|2|10
+}
+
+# The rows that ON DELETE CASCADE removes after a REPLACE delete stay removed.
+@cross-check-integrity
+test upsert-insert-or-replace-fires-foreign-key-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, a UNIQUE, b UNIQUE, n);
+    CREATE TABLE c(x REFERENCES p(b) ON DELETE CASCADE);
+    INSERT INTO p VALUES(1,1,1,0),(2,2,2,0);
+    INSERT INTO c VALUES(1),(2);
+    INSERT OR REPLACE INTO p VALUES(6,7,2,5) ON CONFLICT(a) DO UPDATE SET n=n+100;
+    SELECT * FROM p ORDER BY id;
+    SELECT x FROM c;
+}
+expect {
+    1|1|1|0
+    6|7|2|5
+    1
+}
+
+# With an upsert clause that does not target the rowid, the INTEGER PRIMARY
+# KEY ON CONFLICT REPLACE check runs right after the upsert target indexes,
+# before the other indexes: the old row is deleted before `a` is checked.
+@cross-check-integrity
+test upsert-rowid-replace-runs-before-other-index-ignore {
+    CREATE TABLE u(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, a UNIQUE ON CONFLICT IGNORE, b UNIQUE, n);
+    INSERT INTO u VALUES(0,0,0,0);
+    INSERT INTO u VALUES(0,0,4,0) ON CONFLICT(b) DO UPDATE SET n=n+1;
+    SELECT * FROM u;
+}
+expect {
+    0|0|4|0
+}
+
+@cross-check-integrity
+test upsert-rowid-replace-runs-before-other-index-abort {
+    CREATE TABLE u(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, a UNIQUE, b UNIQUE, n);
+    INSERT INTO u VALUES(0,0,0,0);
+    INSERT INTO u VALUES(0,0,4,0) ON CONFLICT(b) DO UPDATE SET n=n+1;
+    SELECT * FROM u;
+}
+expect {
+    0|0|4|0
+}
+
+# The rowid REPLACE delete has already run when `a` conflicts with another row
+# and IGNORE skips the new row. The foreign key makes SQLite delete the whole
+# old row; without one it removes only the old row's index entries, which
+# leaves its indexes out of step with the table.
+@cross-check-integrity
+test upsert-rowid-replace-then-other-index-ignore-on-other-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE u(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, a UNIQUE ON CONFLICT IGNORE, b UNIQUE, n);
+    CREATE TABLE c(x REFERENCES u(id) ON DELETE SET NULL);
+    INSERT INTO u VALUES(0,0,0,0),(1,1,1,1),(2,2,2,2);
+    INSERT INTO c VALUES(1);
+    INSERT INTO u VALUES(1,2,3,0) ON CONFLICT(b) DO UPDATE SET n=n+1;
+    SELECT * FROM u ORDER BY id;
+    SELECT quote(x) FROM c;
+}
+expect {
+    0|0|0|0
+    2|2|2|2
+    NULL
 }

@@ -1,4 +1,6 @@
 from ..lib import (
+    # DB-API 2.0 type constructor
+    Binary,
     # Exception classes
     DatabaseError,
     DataError,
@@ -37,6 +39,7 @@ __all__ = [
     "RemoteEncryptionCipher",
     # DB-API 2.0 module attributes
     "apilevel",
+    "Binary",
     "paramstyle",
     "threadsafety",
     "sqlite_version",

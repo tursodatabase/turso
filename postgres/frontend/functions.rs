@@ -95,7 +95,6 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "pg_get_indexdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
             .and_then(|oid| crate::catalog::pg_get_indexdef(connection, oid)),
         "pg_get_triggerdef"(FunctionArity::OneOf(&[1, 2]), false) => None::<String>,
-        "obj_description"(FunctionArity::OneOf(&[1, 2]), true) => None::<String>,
         "pg_get_expr"(FunctionArity::OneOf(&[2, 3]), true) => exec_pg_get_expr(args)?,
         "to_char"(FunctionArity::Exact(2), true) => {
             exec_to_char(args[0].get_value(), &text_arg(args, 1))
@@ -112,7 +111,6 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
         "booleq"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() == args[1].get_value()),
         "boolne"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() != args[1].get_value()),
-        "col_description"(FunctionArity::Exact(2), true) => None::<String>,
         "set_config"(FunctionArity::Exact(3), false) => exec_set_config(connection, args)?,
         "current_setting"(FunctionArity::OneOf(&[1, 2]), false) => {
             exec_current_setting(connection, args)?

@@ -61,12 +61,21 @@ pub struct SerialSequence {
 /// Whether a schema, by name, has a relation of a name.
 type RelationNameCheck = Box<dyn Fn(&str, &str) -> bool>;
 
+/// Whether a function name, called with no arguments, resolves to a function
+/// that is neither an aggregate nor a window function.
+type ScalarFunctionCheck = Box<dyn Fn(&str) -> bool>;
+
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
     translating_index: std::cell::Cell<bool>,
+    /// Set while a CREATE TABLE or ALTER TABLE statement is being translated.
+    translating_table_definition: std::cell::Cell<bool>,
     /// None when nothing is known about the schema, as in tests.
     relation_name_is_taken: Option<RelationNameCheck>,
+    /// None when nothing is known about the functions, as when a table
+    /// stored in the schema is translated again.
+    is_scalar_function: Option<ScalarFunctionCheck>,
     /// Table name in scope while a generation expression is being translated.
     generation_expression_table: std::cell::RefCell<Option<String>>,
     /// Generated columns already present in the table, used for ADD COLUMN validation.
@@ -85,6 +94,21 @@ impl PostgreSQLTranslator {
         is_taken: impl Fn(&str, &str) -> bool + 'static,
     ) -> Self {
         self.relation_name_is_taken = Some(Box::new(is_taken));
+        self
+    }
+
+    /// A translator that rejects `f(*)` when `is_scalar(f)` says that `f`,
+    /// called with no arguments, is neither an aggregate nor a window
+    /// function, as PostgreSQL does.
+    ///
+    /// Only statements that a client sends are checked: a table that an
+    /// older version stored with such a call is translated again when its
+    /// schema loads, and has to keep loading.
+    pub fn with_scalar_function_check(
+        mut self,
+        is_scalar: impl Fn(&str) -> bool + 'static,
+    ) -> Self {
+        self.is_scalar_function = Some(Box::new(is_scalar));
         self
     }
 
@@ -241,7 +265,12 @@ impl PostgreSQLTranslator {
             NodeRef::TransactionStmt(txn) => self.translate_transaction(txn)?,
             NodeRef::LockStmt(lock) => self.translate_lock_stub(lock)?,
             NodeRef::DropStmt(drop) => self.translate_drop(drop)?,
-            NodeRef::AlterTableStmt(alter) => self.translate_alter_table(alter)?,
+            NodeRef::AlterTableStmt(alter) => {
+                self.translating_table_definition.set(true);
+                let alter_table = self.translate_alter_table(alter);
+                self.translating_table_definition.set(false);
+                alter_table?
+            }
             NodeRef::RenameStmt(rename) => self.translate_rename_stmt(rename)?,
             NodeRef::IndexStmt(idx) => self.translate_create_index(idx)?,
             NodeRef::TruncateStmt(truncate) => self.translate_truncate(truncate)?,
@@ -422,6 +451,7 @@ impl PostgreSQLTranslator {
             relation,
             create.inh_relations.is_empty(),
             &[],
+            self.is_scalar_function.as_deref(),
         )?;
 
         for elt in &create.table_elts {
@@ -553,7 +583,10 @@ impl PostgreSQLTranslator {
         &self,
         create: &pg_query::protobuf::CreateStmt,
     ) -> Result<TranslateResult, ParseError> {
-        let (stmt, serial_sequences) = self.translate_create_table(create)?;
+        self.translating_table_definition.set(true);
+        let create_table = self.translate_create_table(create);
+        self.translating_table_definition.set(false);
+        let (stmt, serial_sequences) = create_table?;
         let ast::Stmt::CreateTable { tbl_name, .. } = &stmt else {
             unreachable!("translate_create_table returns a CREATE TABLE statement");
         };
@@ -1278,6 +1311,7 @@ impl PostgreSQLTranslator {
                     relation,
                     false,
                     &self.existing_generated_columns,
+                    self.is_scalar_function.as_deref(),
                 )?;
                 let col = self.translate_column_def(col_def, &name)?;
                 ast::AlterTableBody::AddColumn(col)
@@ -4525,6 +4559,14 @@ impl PostgreSQLTranslator {
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
         let func_name = function_name(&func_call.funcname)?;
+        if func_call.agg_star
+            && self
+                .is_scalar_function
+                .as_ref()
+                .is_some_and(|is_scalar| is_scalar(&func_name))
+        {
+            return Err(star_argument_error(&func_call.funcname));
+        }
         if let Some(result_type) = datetime_result_type(&func_name) {
             check_type_is_supported(result_type, 0)?;
         }
@@ -4578,6 +4620,27 @@ impl PostgreSQLTranslator {
         } else {
             None
         };
+
+        if func_call.agg_filter.is_none() && func_call.over.is_none() {
+            if let Some(description) = description_lookup(&func_name, &args) {
+                let unsupported_use = if self.translating_index.get() {
+                    Some("in an index")
+                } else if self.translating_table_definition.get() {
+                    Some("in a table definition")
+                } else if has_aggregate_outside_subqueries(&func_call.args) {
+                    Some("of an aggregate or window function")
+                } else {
+                    None
+                };
+                if let Some(unsupported_use) = unsupported_use {
+                    return Err(ParseError::Sqlstate {
+                        sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+                        message: format!("{func_name} {unsupported_use} is not supported"),
+                    });
+                }
+                return Ok(description);
+            }
+        }
 
         // Rewrite PG-specific function-name spellings to their core-native
         // equivalents so the core resolver doesn't need to carry aliases
@@ -7810,11 +7873,13 @@ fn check_array_dimensions(dimensions: u32) -> Result<(), ParseError> {
 
 /// Check the generated columns among `table_elts`, which declares every column of the table
 /// when `has_all_columns` is set, in a table that already has `existing_generated_columns`.
+/// `is_scalar_function` is the translator's check of `f(*)`.
 fn validate_generated_columns<'a>(
     table_elts: &'a [pg_query::protobuf::Node],
     relation: &'a pg_query::protobuf::RangeVar,
     has_all_columns: bool,
     existing_generated_columns: &'a [String],
+    is_scalar_function: Option<&'a dyn Fn(&str) -> bool>,
 ) -> Result<(), ParseError> {
     use pg_query::protobuf::node::Node;
     use pg_query::protobuf::ConstrType;
@@ -7845,6 +7910,7 @@ fn validate_generated_columns<'a>(
             .iter()
             .map(String::as_str)
             .collect(),
+        is_scalar_function,
     };
     let mut table_foreign_keys = Vec::new();
     for elt in table_elts {
@@ -7912,6 +7978,9 @@ struct GenerationTable<'a> {
     columns: Vec<(&'a str, Option<&'a pg_query::protobuf::TypeName>)>,
     has_all_columns: bool,
     generated_columns: Vec<&'a str>,
+    /// Whether a function called with `*` is neither an aggregate nor a
+    /// window function; `None` when the translator does not check that.
+    is_scalar_function: Option<&'a dyn Fn(&str) -> bool>,
 }
 
 impl GenerationTable<'_> {
@@ -7972,6 +8041,15 @@ fn validate_generation_expression(
                 let name = last_string(&call.funcname)
                     .unwrap_or_default()
                     .to_lowercase();
+                // PostgreSQL rejects `f(*)` on a function that is not an aggregate
+                // before the checks below.
+                if call.agg_star
+                    && table
+                        .is_scalar_function
+                        .is_some_and(|is_scalar| is_scalar(&name))
+                {
+                    return Err(star_argument_error(&call.funcname));
+                }
                 if call.over.is_some() {
                     return Err(error(
                         SQLSTATE_WINDOWING_ERROR,
@@ -7979,12 +8057,7 @@ fn validate_generation_expression(
                             .to_string(),
                     ));
                 }
-                if call.agg_star
-                    || call.agg_distinct
-                    || call.agg_filter.is_some()
-                    || !call.agg_order.is_empty()
-                    || pg_func(&name).is_some_and(|f| f.aggregate)
-                {
+                if is_aggregate_call(call) {
                     return Err(error(
                         SQLSTATE_GROUPING_ERROR,
                         "aggregate functions are not allowed in column generation expressions"
@@ -8935,6 +9008,62 @@ pub fn try_extract_drop_schema(parse_result: &ParseResult) -> Option<PgDropSchem
     })
 }
 
+/// DROP TABLE, DROP VIEW or DROP MATERIALIZED VIEW that names several
+/// relations or has CASCADE. The frontend runs it as one DROP statement for
+/// each relation it drops.
+#[derive(Debug, Clone)]
+pub struct PgDropRelationsStmt {
+    /// `TABLE`, `VIEW` or `MATERIALIZED VIEW`.
+    pub kind: &'static str,
+    /// The parts of each name: the relation, or its schema and the relation.
+    pub names: Vec<Vec<String>>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+/// The DROP statement of `parse_result` when the frontend runs it as several
+/// statements: a DROP of tables or views with CASCADE or with several names.
+pub fn try_extract_drop_relations(parse_result: &ParseResult) -> Option<PgDropRelationsStmt> {
+    use pg_query::protobuf::{DropBehavior, ObjectType};
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let NodeRef::DropStmt(drop) = &nodes.first()?.0 else {
+        return None;
+    };
+    let kind = match ObjectType::try_from(drop.remove_type).ok()? {
+        ObjectType::ObjectTable => "TABLE",
+        ObjectType::ObjectView => "VIEW",
+        ObjectType::ObjectMatview => "MATERIALIZED VIEW",
+        _ => return None,
+    };
+    let cascade = DropBehavior::try_from(drop.behavior).ok() == Some(DropBehavior::DropCascade);
+    if !cascade && drop.objects.len() < 2 {
+        return None;
+    }
+    let names = drop
+        .objects
+        .iter()
+        .map(|object| match object.node.as_ref()?.to_ref() {
+            NodeRef::List(list) => list
+                .items
+                .iter()
+                .map(|part| match part.node.as_ref()?.to_ref() {
+                    NodeRef::String(part) => Some(part.sval.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(PgDropRelationsStmt {
+        kind,
+        names,
+        if_exists: drop.missing_ok,
+        cascade,
+    })
+}
+
 /// A REFRESH MATERIALIZED VIEW statement. Turso materialized views are live
 /// (auto-updating), so REFRESH does nothing.
 #[derive(Debug, Clone)]
@@ -9185,25 +9314,158 @@ fn relation_privilege(name: &str, on_sequences: bool) -> Result<ast::Privilege, 
     })
 }
 
-/// A COMMENT ON statement. Comments are accepted for PostgreSQL
-/// compatibility but are not stored.
-#[derive(Debug, Clone)]
-pub struct PgCommentOnStmt {
-    pub target: PgCommentTarget,
+/// Whether one of `args` calls an aggregate or window function that is not
+/// inside a subquery of the argument.
+fn has_aggregate_outside_subqueries(args: &[pg_query::protobuf::Node]) -> bool {
+    let nodes: Vec<NodeRef<'_>> = args
+        .iter()
+        .filter_map(|arg| arg.node.as_ref())
+        .flat_map(|arg| arg.nodes())
+        .map(|(node, ..)| node)
+        .collect();
+    let calls_in_subqueries: Vec<*const pg_query::protobuf::FuncCall> = nodes
+        .iter()
+        .filter_map(|node| match node {
+            NodeRef::SubLink(subquery) => subquery.subselect.as_ref()?.node.as_ref(),
+            _ => None,
+        })
+        .flat_map(|subquery| subquery.nodes())
+        .filter_map(|(node, ..)| match node {
+            NodeRef::FuncCall(call) => Some(std::ptr::from_ref(call)),
+            _ => None,
+        })
+        .collect();
+    nodes.iter().any(|node| match node {
+        NodeRef::FuncCall(call) => {
+            (call.over.is_some() || is_aggregate_call(call))
+                && !calls_in_subqueries.contains(&std::ptr::from_ref(*call))
+        }
+        _ => false,
+    })
 }
 
-/// What a COMMENT ON statement comments on, as far as deciding who may run
-/// it.
-#[derive(Debug, Clone)]
-pub enum PgCommentTarget {
-    /// An object that only its owner may comment on, named the way
-    /// PostgreSQL names it in errors, such as `table t`, or `relation t` for
-    /// a column or constraint of `t`.
-    Owned(String),
-    /// A role. Commenting on it needs the CREATEROLE attribute.
-    Role,
-    /// Any other kind of object.
-    Other,
+fn is_aggregate_call(call: &pg_query::protobuf::FuncCall) -> bool {
+    let name = last_string(&call.funcname)
+        .unwrap_or_default()
+        .to_lowercase();
+    call.agg_star
+        || call.agg_distinct
+        || call.agg_filter.is_some()
+        || !call.agg_order.is_empty()
+        || pg_func(&name).is_some_and(|f| f.aggregate)
+}
+
+/// The subquery that reads the comment for a call of `obj_description` or
+/// `col_description`. None for another function or number of arguments.
+fn description_lookup(func_name: &str, args: &[Box<ast::Expr>]) -> Option<ast::Expr> {
+    let conditions = match (func_name, args) {
+        ("obj_description", [object]) => vec![
+            ("objoid", (**object).clone()),
+            ("objsubid", integer_literal(0)),
+        ],
+        ("obj_description", [object, catalog]) => vec![
+            ("objoid", (**object).clone()),
+            ("classoid", catalog_oid(catalog)),
+            ("objsubid", integer_literal(0)),
+        ],
+        ("col_description", [table, column_number]) => vec![
+            ("objoid", (**table).clone()),
+            ("classoid", integer_literal(PG_CLASS_OID)),
+            ("objsubid", (**column_number).clone()),
+        ],
+        _ => return None,
+    };
+    Some(description_subquery(conditions))
+}
+
+/// `(SELECT description FROM pg_description WHERE column = value AND ... LIMIT 1)`
+/// for the `conditions`, which are pairs of a column and its value.
+fn description_subquery(conditions: Vec<(&str, ast::Expr)>) -> ast::Expr {
+    let mut parser = turso_parser::parser::Parser::new(DESCRIPTION_SELECT.as_bytes());
+    let Ok(Some(ast::Cmd::Stmt(ast::Stmt::Select(mut select)))) = parser.next_cmd() else {
+        unreachable!("DESCRIPTION_SELECT is a SELECT statement");
+    };
+    let ast::OneSelect::Select { where_clause, .. } = &mut select.body.select else {
+        unreachable!("DESCRIPTION_SELECT has no VALUES");
+    };
+    *where_clause = conditions
+        .into_iter()
+        .map(|(column, value)| {
+            let column = ast::Expr::Id(exact_name(format!("_turso_{column}")));
+            ast::Expr::Binary(Box::new(column), ast::Operator::Equals, Box::new(value))
+        })
+        .reduce(|all, condition| {
+            ast::Expr::Binary(Box::new(all), ast::Operator::And, Box::new(condition))
+        })
+        .map(Box::new);
+    ast::Expr::Subquery(Box::new(select))
+}
+
+// The columns are renamed because a value is an expression of the outer
+// query: `oid` in it must not be read as the rowid of pg_description.
+const DESCRIPTION_SELECT: &str = "SELECT _turso_description FROM (\
+    SELECT objoid AS _turso_objoid, classoid AS _turso_classoid, \
+    objsubid AS _turso_objsubid, description AS _turso_description \
+    FROM main.pg_description) LIMIT 1";
+
+/// `CASE catalog WHEN 'pg_class' THEN 1259 WHEN 'pg_namespace' THEN 2615 END`:
+/// the oid of the catalog named `catalog`.
+fn catalog_oid(catalog: &ast::Expr) -> ast::Expr {
+    ast::Expr::Case {
+        base: Some(Box::new(catalog.clone())),
+        when_then_pairs: [
+            ("pg_class", PG_CLASS_OID),
+            ("pg_namespace", PG_NAMESPACE_OID),
+        ]
+        .iter()
+        .map(|(name, oid)| {
+            let name = ast::Expr::Literal(ast::Literal::String(format!("'{name}'")));
+            (Box::new(name), Box::new(integer_literal(*oid)))
+        })
+        .collect(),
+        else_expr: None,
+    }
+}
+
+fn integer_literal(value: i64) -> ast::Expr {
+    ast::Expr::Literal(ast::Literal::Numeric(value.to_string()))
+}
+
+/// PostgreSQL's oid of `pg_class`, the `classoid` of a comment on a relation
+/// or on a column.
+pub const PG_CLASS_OID: i64 = 1259;
+
+/// PostgreSQL's oid of `pg_namespace`, the `classoid` of a comment on a
+/// schema.
+pub const PG_NAMESPACE_OID: i64 = 2615;
+
+/// A COMMENT ON statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgCommentOnStmt {
+    pub object: PgCommentObject,
+    /// The comment, or None when the statement removes it: `IS NULL` and
+    /// `IS ''` both do.
+    pub comment: Option<String>,
+}
+
+/// What a COMMENT ON statement comments on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PgCommentObject {
+    /// A relation, of the kind the statement says it is.
+    Relation {
+        kind: ast::RelationKind,
+        schema: Option<String>,
+        name: String,
+    },
+    Column {
+        schema: Option<String>,
+        table: String,
+        column: String,
+    },
+    Schema(String),
+    /// A kind of object whose comments are not stored, named as the
+    /// statement names it, such as `TYPE`.
+    Unsupported(&'static str),
 }
 
 /// Extracts a COMMENT ON statement.
@@ -9221,28 +9483,64 @@ pub fn try_extract_comment_on(parse_result: &ParseResult) -> Option<PgCommentOnS
         .and_then(|node| node.node.as_ref())
         .map(comment_object_names)
         .unwrap_or_default();
-    let last = || names.last().cloned().unwrap_or_default();
-    let owned = |kind: &str, name: String| PgCommentTarget::Owned(format!("{kind} {name}"));
-    let target = match ObjectType::try_from(comment.objtype) {
-        Ok(ObjectType::ObjectTable) => owned("table", last()),
-        Ok(ObjectType::ObjectView) => owned("view", last()),
-        Ok(ObjectType::ObjectMatview) => owned("materialized view", last()),
-        Ok(ObjectType::ObjectIndex) => owned("index", last()),
-        Ok(ObjectType::ObjectSequence) => owned("sequence", last()),
-        Ok(ObjectType::ObjectSchema) => owned("schema", last()),
-        Ok(ObjectType::ObjectType | ObjectType::ObjectDomain) => owned("type", last()),
-        Ok(ObjectType::ObjectFunction) => owned("function", last()),
-        Ok(ObjectType::ObjectDatabase) => owned("database", last()),
-        Ok(ObjectType::ObjectExtension) => owned("extension", last()),
-        // A column or constraint belongs to its table.
-        Ok(ObjectType::ObjectColumn | ObjectType::ObjectTabconstraint) => owned(
-            "relation",
-            names.iter().rev().nth(1).cloned().unwrap_or_default(),
-        ),
-        Ok(ObjectType::ObjectRole) => PgCommentTarget::Role,
-        _ => PgCommentTarget::Other,
+    let object_type = ObjectType::try_from(comment.objtype).ok();
+    let relation_kind = match object_type {
+        Some(ObjectType::ObjectTable) => Some(ast::RelationKind::Table),
+        Some(ObjectType::ObjectView) => Some(ast::RelationKind::View),
+        Some(ObjectType::ObjectMatview) => Some(ast::RelationKind::MaterializedView),
+        Some(ObjectType::ObjectIndex) => Some(ast::RelationKind::Index),
+        Some(ObjectType::ObjectSequence) => Some(ast::RelationKind::Sequence),
+        _ => None,
     };
-    Some(PgCommentOnStmt { target })
+    let object = match (relation_kind, object_type, names.as_slice()) {
+        (Some(kind), _, [name]) => PgCommentObject::Relation {
+            kind,
+            schema: None,
+            name: name.clone(),
+        },
+        (Some(kind), _, [schema, name]) => PgCommentObject::Relation {
+            kind,
+            schema: Some(schema.clone()),
+            name: name.clone(),
+        },
+        (None, Some(ObjectType::ObjectColumn), [table, column]) => PgCommentObject::Column {
+            schema: None,
+            table: table.clone(),
+            column: column.clone(),
+        },
+        (None, Some(ObjectType::ObjectColumn), [schema, table, column]) => {
+            PgCommentObject::Column {
+                schema: Some(schema.clone()),
+                table: table.clone(),
+                column: column.clone(),
+            }
+        }
+        (None, Some(ObjectType::ObjectSchema), [schema]) => PgCommentObject::Schema(schema.clone()),
+        _ => PgCommentObject::Unsupported(match object_type {
+            Some(ObjectType::ObjectType) => "TYPE",
+            Some(ObjectType::ObjectDomain) => "DOMAIN",
+            Some(ObjectType::ObjectFunction) => "FUNCTION",
+            Some(ObjectType::ObjectTabconstraint | ObjectType::ObjectDomconstraint) => "CONSTRAINT",
+            Some(ObjectType::ObjectDatabase) => "DATABASE",
+            Some(ObjectType::ObjectExtension) => "EXTENSION",
+            Some(ObjectType::ObjectRole) => "ROLE",
+            Some(ObjectType::ObjectTrigger) => "TRIGGER",
+            Some(ObjectType::ObjectPolicy) => "POLICY",
+            Some(ObjectType::ObjectColumn) => "COLUMN with a database name",
+            Some(
+                ObjectType::ObjectTable
+                | ObjectType::ObjectView
+                | ObjectType::ObjectMatview
+                | ObjectType::ObjectIndex
+                | ObjectType::ObjectSequence,
+            ) => "a relation with a database name",
+            _ => "this kind of object",
+        }),
+    };
+    Some(PgCommentOnStmt {
+        object,
+        comment: (!comment.comment.is_empty()).then(|| comment.comment.clone()),
+    })
 }
 
 /// The names in the object of a COMMENT ON statement, such as
@@ -9422,6 +9720,7 @@ pub enum FrontendStmt {
     DiscardAll,
     CreateSchema(PgCreateSchemaStmt),
     DropSchema(PgDropSchemaStmt),
+    DropRelations(PgDropRelationsStmt),
     RefreshMatview(PgRefreshMatviewStmt),
     CommentOn(PgCommentOnStmt),
     Grant(PgGrantStmt),
@@ -9460,6 +9759,9 @@ pub fn frontend_stmt(
     }
     if let Some(stmt) = try_extract_drop_schema(parse_result) {
         return Ok(Some(FrontendStmt::DropSchema(stmt)));
+    }
+    if let Some(stmt) = try_extract_drop_relations(parse_result) {
+        return Ok(Some(FrontendStmt::DropRelations(stmt)));
     }
     if let Some(stmt) = try_extract_refresh_matview(parse_result)? {
         return Ok(Some(FrontendStmt::RefreshMatview(stmt)));
@@ -10115,6 +10417,20 @@ fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
     }
 }
 
+/// The error PostgreSQL reports for `f(*)` when the function named by
+/// `names` is neither an aggregate nor a window function. The name is
+/// written as the statement qualifies it.
+fn star_argument_error(names: &[pg_query::protobuf::Node]) -> ParseError {
+    let name = match extract_key_columns(names) {
+        Ok(names) => names.join("."),
+        Err(error) => return error,
+    };
+    ParseError::Sqlstate {
+        sqlstate: SQLSTATE_WRONG_OBJECT_TYPE,
+        message: format!("{name}(*) specified, but {name} is not an aggregate function"),
+    }
+}
+
 fn no_such_function(name: &str) -> ParseError {
     ParseError::ParseError(format!("no such function: {name}"))
 }
@@ -10190,6 +10506,7 @@ mod tests {
                 FrontendStmt::DiscardAll => "discard all",
                 FrontendStmt::CreateSchema(_) => "create schema",
                 FrontendStmt::DropSchema(_) => "drop schema",
+                FrontendStmt::DropRelations(_) => "drop relations",
                 FrontendStmt::RefreshMatview(_) => "refresh matview",
                 FrontendStmt::CommentOn(_) => "comment on",
                 FrontendStmt::Grant(_) => "grant",
@@ -12839,36 +13156,72 @@ mod tests {
     }
 
     #[test]
-    fn comment_on_names_the_object_whose_owner_may_run_it() {
-        let target = |sql: &str| match try_extract_comment_on(&crate::parse(sql).unwrap())
-            .unwrap()
-            .target
-        {
-            PgCommentTarget::Owned(object) => object,
-            PgCommentTarget::Role => "role".to_string(),
-            PgCommentTarget::Other => "other".to_string(),
+    fn comment_on_names_its_object_and_its_comment() {
+        let stmt = |sql: &str| try_extract_comment_on(&crate::parse(sql).unwrap()).unwrap();
+        let relation = |kind, schema: Option<&str>, name: &str| PgCommentObject::Relation {
+            kind,
+            schema: schema.map(str::to_string),
+            name: name.to_string(),
         };
-        for (sql, want) in [
-            ("COMMENT ON TABLE s.t IS 'x'", "table t"),
-            ("COMMENT ON COLUMN s.t.a IS 'x'", "relation t"),
-            ("COMMENT ON CONSTRAINT c ON t IS 'x'", "relation t"),
-            ("COMMENT ON VIEW v IS 'x'", "view v"),
+        for (sql, object) in [
+            (
+                "COMMENT ON TABLE s.t IS 'x'",
+                relation(ast::RelationKind::Table, Some("s"), "t"),
+            ),
+            (
+                "COMMENT ON VIEW v IS 'x'",
+                relation(ast::RelationKind::View, None, "v"),
+            ),
             (
                 "COMMENT ON MATERIALIZED VIEW mv IS 'x'",
-                "materialized view mv",
+                relation(ast::RelationKind::MaterializedView, None, "mv"),
             ),
-            ("COMMENT ON INDEX i IS 'x'", "index i"),
-            ("COMMENT ON SEQUENCE s IS 'x'", "sequence s"),
-            ("COMMENT ON SCHEMA sc IS 'x'", "schema sc"),
-            ("COMMENT ON TYPE ty IS 'x'", "type ty"),
-            ("COMMENT ON DOMAIN d IS 'x'", "type d"),
-            ("COMMENT ON FUNCTION f(int) IS 'x'", "function f"),
-            ("COMMENT ON DATABASE db IS 'x'", "database db"),
-            ("COMMENT ON EXTENSION plpgsql IS 'x'", "extension plpgsql"),
-            ("COMMENT ON ROLE r IS 'x'", "role"),
-            ("COMMENT ON LANGUAGE sql IS 'x'", "other"),
+            (
+                "COMMENT ON INDEX i IS 'x'",
+                relation(ast::RelationKind::Index, None, "i"),
+            ),
+            (
+                "COMMENT ON SEQUENCE s IS 'x'",
+                relation(ast::RelationKind::Sequence, None, "s"),
+            ),
+            (
+                "COMMENT ON COLUMN s.t.a IS 'x'",
+                PgCommentObject::Column {
+                    schema: Some("s".to_string()),
+                    table: "t".to_string(),
+                    column: "a".to_string(),
+                },
+            ),
+            (
+                "COMMENT ON SCHEMA sc IS 'x'",
+                PgCommentObject::Schema("sc".to_string()),
+            ),
+            (
+                "COMMENT ON CONSTRAINT c ON t IS 'x'",
+                PgCommentObject::Unsupported("CONSTRAINT"),
+            ),
+            (
+                "COMMENT ON TYPE ty IS 'x'",
+                PgCommentObject::Unsupported("TYPE"),
+            ),
+            (
+                "COMMENT ON FUNCTION f(int) IS 'x'",
+                PgCommentObject::Unsupported("FUNCTION"),
+            ),
+            (
+                "COMMENT ON ROLE r IS 'x'",
+                PgCommentObject::Unsupported("ROLE"),
+            ),
+            (
+                "COMMENT ON LANGUAGE sql IS 'x'",
+                PgCommentObject::Unsupported("this kind of object"),
+            ),
         ] {
-            assert_eq!(target(sql), want, "{sql}");
+            assert_eq!(stmt(sql).object, object, "{sql}");
+            assert_eq!(stmt(sql).comment.as_deref(), Some("x"), "{sql}");
+        }
+        for sql in ["COMMENT ON TABLE t IS NULL", "COMMENT ON TABLE t IS ''"] {
+            assert_eq!(stmt(sql).comment, None, "{sql}");
         }
     }
 

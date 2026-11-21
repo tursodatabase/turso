@@ -1428,6 +1428,12 @@ pub trait AstVisitor {
         Ok(())
     }
 
+    /// Before the CTEs and the body of a SELECT that has a WITH clause.
+    fn enter_with(&mut self, _with: &ast::With) {}
+
+    /// After the SELECT whose WITH clause `enter_with` reported.
+    fn leave_with(&mut self) {}
+
     /// Visit in SQLite's name resolution order: each query level's FROM
     /// clause before its SELECT list, and the left operand of `IN (SELECT ...)`
     /// before the subquery. Off by default: the walk visits in source order so
@@ -1845,6 +1851,9 @@ where
 /// Walk a SELECT: the tables it reads and all of its expressions, including
 /// subqueries.
 pub fn visit_select<V: AstVisitor>(select: &ast::Select, visitor: &mut V) -> Result<()> {
+    if let Some(with) = &select.with {
+        visitor.enter_with(with);
+    }
     visit_with(select.with.as_ref(), visitor)?;
 
     visit_one_select(&select.body.select, visitor)?;
@@ -1861,6 +1870,10 @@ pub fn visit_select<V: AstVisitor>(select: &ast::Select, visitor: &mut V) -> Res
         if let Some(offset) = &limit.offset {
             visit_expr_with_subqueries(offset, visitor)?;
         }
+    }
+
+    if select.with.is_some() {
+        visitor.leave_with();
     }
 
     Ok(())

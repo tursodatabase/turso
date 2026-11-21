@@ -524,7 +524,7 @@ fn role_dependents(schema: &Schema, connection: &Connection, role: RoleId) -> Ve
             continue;
         }
         let name = relation_name(connection, schema, class.relnamespace, &class.relname);
-        let kind = relation_kind_name(class.relkind);
+        let kind = class.relkind.name();
         if class.relowner == role {
             dependents.push((class.oid, format!("owner of {kind} {name}")));
         } else if class
@@ -568,16 +568,6 @@ fn dependents_detail(dependents: Vec<String>) -> String {
         "and {others} other {objects} (see server log for list)"
     ));
     lines.join("\n")
-}
-
-fn relation_kind_name(kind: RelationKind) -> &'static str {
-    match kind {
-        RelationKind::Table => "table",
-        RelationKind::View => "view",
-        RelationKind::MaterializedView => "materialized view",
-        RelationKind::Sequence => "sequence",
-        RelationKind::Index => "index",
-    }
 }
 
 /// Opens [`AUTHID_TABLE_NAME`] and its name index for writing, and returns

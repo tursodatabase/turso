@@ -5,6 +5,7 @@
 
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
 use crate::namespace::NamespaceId;
+use crate::schema::load::{load_steps, SchemaInstall, SchemaLoader, StepsFor};
 use crate::security::roles::{RoleId, SessionRole};
 use crate::types::IOResultOr;
 use crate::util::IOExt;
@@ -57,11 +58,9 @@ use crate::{
     PageRef, Pager, PlatformIO, Result, SymbolTable, SyncMode, SyscallIO, TempStore,
     TransactionState, VirtualTable, Wal, WalAutoActions, WalFile, WalFileShared, IO,
 };
-use crate::{Statement, Value};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::any::Any;
-use std::collections::VecDeque;
 #[cfg(host_shared_wal)]
 use std::path::Path;
 use std::sync::OnceLock;
@@ -362,10 +361,12 @@ pub enum OpenDbAsyncPhase {
     ReadingHeader,
     LoadingSchema,
     BootstrapMvStore,
-    /// Reads the dialect's own schema state. Runs after MVCC bootstrap,
-    /// because before it an MVCC database has no table roots and has not
-    /// replayed its logical log.
-    LoadingDialectSchema,
+    /// Runs the load steps that `Schema::make_from_btree` does not do:
+    /// reading the names of the namespaces and the dialect's own schema
+    /// state. Runs after MVCC bootstrap, because before it an MVCC database
+    /// has no table roots and has not replayed its logical log, and recovery
+    /// rebuilds the schema from the schema rows.
+    RunningLoadSteps,
     Done,
 }
 
@@ -646,13 +647,8 @@ pub struct OpenDbAsyncState {
     /// The `PRAGMA journal_mode = 'mvcc'` statement that converts the database
     /// when `DatabaseOpts::with_mvcc` is set, held across yields.
     mvcc_convert_stmt: Option<crate::Statement>,
-    /// The dialect schema state queries of `LoadingDialectSchema` not yet
-    /// started, the one being read with its rows so far, and the rows of the
-    /// finished ones, held across yields.
-    dialect_schema_queries: Option<VecDeque<String>>,
-    dialect_schema_stmt: Option<Box<Statement>>,
-    dialect_schema_rows: Vec<Vec<Value>>,
-    dialect_schema_results: Vec<Vec<Vec<Value>>>,
+    /// The loader of `RunningLoadSteps`, held across yields.
+    schema_loader: Option<SchemaLoader>,
     conn: Option<Arc<Connection>>,
 }
 
@@ -679,10 +675,7 @@ impl OpenDbAsyncState {
             mvcc_bootstrap_conn: None,
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
             mvcc_convert_stmt: None,
-            dialect_schema_queries: None,
-            dialect_schema_stmt: None,
-            dialect_schema_rows: Vec::new(),
-            dialect_schema_results: Vec::new(),
+            schema_loader: None,
         }
     }
 }
@@ -705,7 +698,7 @@ impl OpenDbAsyncState {
         self.make_from_btree_state = schema::MakeFromBtreeState::new();
         self.mvcc_convert_stmt = None;
         self.mvcc_bootstrap_state = mvcc::database::BootstrapState::default();
-        self.dialect_schema_stmt = None;
+        self.schema_loader = None;
         self.mvcc_bootstrap_conn = None;
         self.conn = None;
         self.pager = None;
@@ -1946,28 +1939,10 @@ impl Database {
                         state.mvcc_bootstrap_conn = None;
                     }
 
-                    // Load the names of the namespaces, which the schema rows
-                    // of their objects do not carry. This comes after the MVCC
-                    // bootstrap, whose recovery rebuilds the schema from the
-                    // schema rows and may replay rows of the namespaces table.
-                    let conn = state
-                        .conn
-                        .as_ref()
-                        .expect("conn must be initialized in Init phase");
-                    conn.maybe_update_schema();
-                    if !conn
-                        .with_schema(crate::MAIN_DB_ID, |schema| schema.namespace_names_loaded())
-                    {
-                        let namespace_rows = conn.query_stored_namespaces()?;
-                        db.with_schema_mut(|schema| {
-                            schema.load_namespace_names(db.dialect().as_ref(), &namespace_rows)
-                        })?;
-                    }
-
-                    state.phase = OpenDbAsyncPhase::LoadingDialectSchema;
+                    state.phase = OpenDbAsyncPhase::RunningLoadSteps;
                 }
 
-                OpenDbAsyncPhase::LoadingDialectSchema => {
+                OpenDbAsyncPhase::RunningLoadSteps => {
                     let db = state
                         .db
                         .as_ref()
@@ -1976,46 +1951,18 @@ impl Database {
                         .conn
                         .as_ref()
                         .expect("conn must be initialized in Init phase");
-                    if state.dialect_schema_queries.is_none() {
-                        let schema = db.schema.lock().clone();
-                        let queries = db.dialect().schema_state_queries(&schema);
-                        *conn.schema.write() = schema;
-                        state.dialect_schema_queries = Some(queries.into());
-                    }
-                    loop {
-                        if state.dialect_schema_stmt.is_none() {
-                            let queries = state
-                                .dialect_schema_queries
-                                .as_mut()
-                                .expect("queries were set above");
-                            let Some(sql) = queries.pop_front() else {
-                                break;
-                            };
-                            state.dialect_schema_stmt =
-                                Some(Box::new(conn.prepare_engine_metadata_read(&sql)?));
-                        }
-                        let stmt = state
-                            .dialect_schema_stmt
-                            .as_mut()
-                            .expect("statement was prepared above");
-                        let rows = &mut state.dialect_schema_rows;
-                        return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                            rows.push(row.get_values().cloned().collect());
-                            Ok(())
-                        }));
-                        state.dialect_schema_stmt = None;
-                        let rows = std::mem::take(&mut state.dialect_schema_rows);
-                        state.dialect_schema_results.push(rows);
-                    }
-                    if !state.dialect_schema_results.is_empty() {
-                        db.with_schema_mut(|schema| {
-                            schema.dialect_schema = Some(
-                                db.dialect()
-                                    .build_schema_state(schema, &state.dialect_schema_results)?,
-                            );
-                            Ok(())
-                        })?;
-                    }
+                    // No other connection exists yet, so the steps may write
+                    // to the shared schema before the whole schema is read.
+                    let loader = state.schema_loader.get_or_insert_with(|| {
+                        SchemaLoader::new(
+                            db.schema.lock().clone(),
+                            load_steps(conn, StepsFor::Open),
+                            SchemaInstall::Shared,
+                        )
+                    });
+                    return_if_io!(loader.run(conn));
+                    let loader = state.schema_loader.take().expect("set above");
+                    db.replace_schema(loader.into_schema());
 
                     state.phase = OpenDbAsyncPhase::Done;
                     return Ok(IOResult::Done(

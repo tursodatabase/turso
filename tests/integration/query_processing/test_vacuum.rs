@@ -2,7 +2,7 @@ use crate::assertions::{AssertQueryPlan, NULL};
 use crate::common::{
     compute_dbhash, compute_dbhash_with_database_opts, compute_dbhash_with_options,
     compute_dbhash_with_options_and_database_opts, do_flush, limbo_exec_rows, ExecRows,
-    TempDatabase,
+    SyncCountingIo, TempDatabase,
 };
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use asserting::prelude::*;
@@ -11,17 +11,14 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering as StdOrdering;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
-use turso_core::io::{FileId, FileSyncType};
 use turso_core::mvcc::yield_hooks::YieldPointMarker;
 use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};
 use turso_core::vdbe::execute::TransactionYieldPoint;
 use turso_core::{
-    Buffer, Clock, Completion, File, MemoryIO, MonotonicInstant, OpenFlags, WallClockInstant, IO,
-};
-use turso_core::{
     ConnectOpts, Connection, Database, DatabaseOpts, EncryptionOpts, LimboError, SessionRole,
     StepResult, Value,
 };
+use turso_core::{MemoryIO, OpenFlags, IO};
 use turso_parser::{ast::Cmd, parser::Parser};
 use turso_sqlite::SqliteDialect;
 
@@ -7107,136 +7104,6 @@ fn test_in_place_vacuum_busy_before_copyback_restores_source_txn() {
     let pager = conn.get_pager();
     assert!(!pager.holds_read_lock());
     assert!(!pager.holds_write_lock());
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct SyncCounts {
-    db: usize,
-    wal: usize,
-}
-
-struct SyncCountingIo {
-    inner: Arc<MemoryIO>,
-    tracked_db_path: String,
-    tracked_wal_path: String,
-    db_syncs: Arc<AtomicUsize>,
-    wal_syncs: Arc<AtomicUsize>,
-}
-
-impl SyncCountingIo {
-    fn new(tracked_db_path: &str) -> Self {
-        Self {
-            inner: Arc::new(MemoryIO::new()),
-            tracked_db_path: tracked_db_path.to_string(),
-            tracked_wal_path: format!("{tracked_db_path}-wal"),
-            db_syncs: Arc::new(AtomicUsize::new(0)),
-            wal_syncs: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    fn counts(&self) -> SyncCounts {
-        SyncCounts {
-            db: self.db_syncs.load(StdOrdering::SeqCst),
-            wal: self.wal_syncs.load(StdOrdering::SeqCst),
-        }
-    }
-}
-
-impl Clock for SyncCountingIo {
-    fn current_time_monotonic(&self) -> MonotonicInstant {
-        self.inner.current_time_monotonic()
-    }
-
-    fn current_time_wall_clock(&self) -> WallClockInstant {
-        self.inner.current_time_wall_clock()
-    }
-}
-
-impl IO for SyncCountingIo {
-    fn open_file(
-        &self,
-        path: &str,
-        flags: OpenFlags,
-        direct: bool,
-    ) -> turso_core::Result<Arc<dyn File>> {
-        let inner = self.inner.open_file(path, flags, direct)?;
-        Ok(Arc::new(SyncCountingFile {
-            inner,
-            count_as_db_sync: path == self.tracked_db_path,
-            count_as_wal_sync: path == self.tracked_wal_path,
-            db_syncs: self.db_syncs.clone(),
-            wal_syncs: self.wal_syncs.clone(),
-        }))
-    }
-
-    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
-        self.inner.remove_file(path)
-    }
-
-    fn step(&self) -> turso_core::Result<()> {
-        self.inner.step()
-    }
-
-    fn drain_completions(&self, completions: &[Completion]) -> turso_core::Result<()> {
-        self.inner.drain_completions(completions)
-    }
-
-    fn cancel(&self, completions: &[Completion]) -> turso_core::Result<()> {
-        self.inner.cancel(completions)
-    }
-
-    fn file_id(&self, path: &str) -> turso_core::Result<FileId> {
-        self.inner.file_id(path)
-    }
-}
-
-struct SyncCountingFile {
-    inner: Arc<dyn File>,
-    count_as_db_sync: bool,
-    count_as_wal_sync: bool,
-    db_syncs: Arc<AtomicUsize>,
-    wal_syncs: Arc<AtomicUsize>,
-}
-
-impl File for SyncCountingFile {
-    fn lock_file(&self, exclusive: bool) -> turso_core::Result<()> {
-        self.inner.lock_file(exclusive)
-    }
-
-    fn unlock_file(&self) -> turso_core::Result<()> {
-        self.inner.unlock_file()
-    }
-
-    fn pread(&self, pos: u64, c: Completion) -> turso_core::Result<Completion> {
-        self.inner.pread(pos, c)
-    }
-
-    fn pwrite(
-        &self,
-        pos: u64,
-        buffer: Arc<Buffer>,
-        c: Completion,
-    ) -> turso_core::Result<Completion> {
-        self.inner.pwrite(pos, buffer, c)
-    }
-
-    fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
-        if self.count_as_db_sync {
-            self.db_syncs.fetch_add(1, StdOrdering::SeqCst);
-        }
-        if self.count_as_wal_sync {
-            self.wal_syncs.fetch_add(1, StdOrdering::SeqCst);
-        }
-        self.inner.sync(c, sync_type)
-    }
-
-    fn size(&self) -> turso_core::Result<u64> {
-        self.inner.size()
-    }
-
-    fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
-        self.inner.truncate(len, c)
-    }
 }
 
 #[test]

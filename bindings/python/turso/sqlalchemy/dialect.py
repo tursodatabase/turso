@@ -206,13 +206,14 @@ class AsyncAdapt_turso_dbapi(AsyncAdapt_dbapi_module):
             "threadsafety",
             "sqlite_version",
             "sqlite_version_info",
+            "Binary",
         ):
             setattr(self, name, getattr(self.turso, name))
 
-        # Preserve sqlite constants/types expected by SQLite dialect helpers.
+        # Preserve sqlite constants expected by SQLite dialect helpers.
         import sqlite3
 
-        for name in ("PARSE_COLNAMES", "PARSE_DECLTYPES", "Binary"):
+        for name in ("PARSE_COLNAMES", "PARSE_DECLTYPES"):
             setattr(self, name, getattr(sqlite3, name))
 
     def connect(self, *arg: Any, **kw: Any) -> AsyncAdapt_dbapi_connection:
