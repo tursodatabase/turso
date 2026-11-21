@@ -4,6 +4,7 @@ use crate::sync::Arc;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::RangeConstraintRef;
 use crate::translate::plan::JoinedTable;
+use crate::turso_debug_assert;
 use turso_parser::ast;
 
 use super::constraints::Constraint;
@@ -202,6 +203,18 @@ impl RowsPerSeekMemo {
         let row_count_bits = (*base_row_count).to_bits();
         if let Some((cached_row_count, rows)) = self.0.get() {
             if cached_row_count == row_count_bits {
+                turso_debug_assert!(
+                    rows.to_bits()
+                        == estimate_rows_per_seek(
+                            index_info,
+                            constraints,
+                            usable_constraint_refs,
+                            base_row_count,
+                            analyze_ctx,
+                        )
+                        .to_bits(),
+                    "the memo has the rows per seek of other arguments"
+                );
                 return rows;
             }
         }
