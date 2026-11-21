@@ -29,6 +29,15 @@ Many JSON functions accept a **path** argument that identifies a specific elemen
 
 Path arguments must begin with `$`. If a path does not match any element, functions generally return `NULL`.
 
+As in SQLite, each step of a path is read only when it is applied to an element, so a malformed step is an error only if the steps before it find an element. A `[` step finds nothing in an element that is not an array.
+
+```sql
+SELECT json_extract('{"a": 1}', '$[-1]');
+-- NULL: the root is not an array
+SELECT json_extract('[1, 2, 3]', '$[-1]');
+-- error: bad JSON path: '$[-1]'
+```
+
 ```sql
 SELECT json_extract('{"a": {"b": [10, 20, 30]}}', '$.a.b[1]');
 -- 20

@@ -364,9 +364,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                     if blob.is_some() {
                         convert_ref_dbtype_into_jsonb(document, Conv::Strict, &mut self.json)?;
                     }
-                    let target = find_path_element(self.json.as_bytes(), root_json_path)
-                        .ok()
-                        .flatten();
+                    let target = find_path_element(self.json.as_bytes(), root_json_path)?;
                     if let Some(target) = target {
                         self.json.keep_only_element(target);
                     }
@@ -1055,7 +1053,9 @@ impl InPlaceJsonPath {
 
                 digit_count + bracket_count
             }
-            PathElement::BracketQuotedKey(key) => key.len() + 4, // ["..."]
+            PathElement::Malformed(_) => {
+                unreachable!("a lookup that reaches a malformed step finds nothing or fails")
+            }
         }
     }
 
