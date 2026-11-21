@@ -91,8 +91,6 @@ expect @tursopg {
     at 2026-01-31 10:00:00
 }
 
-# tursopg reads the integer as its text, as it reads an untyped parameter.
-@compat-gap "cast:int4 -> timestamptz"
 test insert-integer-into-timestamptz {
     CREATE TABLE t (created_at timestamptz);
     INSERT INTO t VALUES (20260101);
@@ -100,9 +98,6 @@ test insert-integer-into-timestamptz {
 }
 @sqlstate 42804
 expect error {}
-expect @tursopg {
-    2026-01-01 00:00:00+00
-}
 
 @compat-gap "cast:int4 -> timestamptz"
 test insert-select-integer-into-timestamptz {
@@ -807,7 +802,6 @@ expect {
 @sqlstate 22008
 expect @tursopg error {}
 
-@compat-gap "cast:int4 -> timestamp"
 test insert-integer-into-timestamp-column {
     CREATE TABLE t (ts timestamp);
     INSERT INTO t VALUES (20200101);
@@ -815,9 +809,6 @@ test insert-integer-into-timestamp-column {
 }
 @sqlstate 42804
 expect error {}
-expect @tursopg {
-    2020-01-01 00:00:00
-}
 
 # PostgreSQL has no casts between date or time types and numbers.
 @compat-gap "cast:int4 -> date"
