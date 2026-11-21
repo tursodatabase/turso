@@ -414,13 +414,16 @@ CREATE TABLE events (
 ) STRICT;
 ```
 
+## Temporary Tables
+
+`CREATE TEMP TABLE` creates a table private to the connection. Temporary tables can be created and changed even when the main database is opened read-only. Changes confined to `temp`, including temporary triggers, `ALTER TABLE`, `ANALYZE temp`, and `PRAGMA temp.user_version`, keep the main database read-only.
+
 ## Unsupported Features
 
 The following CREATE TABLE features are not yet supported:
 
 | Feature | Notes |
 |---------|-------|
-| `CREATE TEMPORARY TABLE` | Temporary tables are not supported |
 | `CREATE TABLE ... AS SELECT` | Creating a table from a query result is not supported |
 | `ON CONFLICT` clause on column constraints | The column-level ON CONFLICT clause (e.g., `NOT NULL ON CONFLICT REPLACE`) is not supported. Use the [INSERT ... ON CONFLICT](/docs/sql-reference/statements/upsert) syntax instead |
 
