@@ -8,7 +8,6 @@
 
 @database :memory:
 
-@compat-gap "type:date"
 test date-column {
     CREATE TABLE t (a date);
     INSERT INTO t VALUES ('2024-01-01');
@@ -16,10 +15,6 @@ test date-column {
 }
 expect {
     2024-01-01
-}
-@sqlstate 0A000
-expect @tursopg error {
-    type "date" is not supported
 }
 
 @compat-gap "type:interval"
@@ -46,17 +41,12 @@ expect @tursopg error {
     type "timetz" is not supported
 }
 
-@compat-gap "type:date"
 test domain-over-date {
     CREATE DOMAIN d AS date;
     SELECT '2024-01-01'::d;
 }
 expect {
     2024-01-01
-}
-@sqlstate 0A000
-expect @tursopg error {
-    type "date" is not supported
 }
 
 @compat-gap "type:time"
@@ -97,7 +87,7 @@ expect {
     ok
 }
 
-@compat-gap "type:date"
+@compat-gap "function:make_date"
 test make-date-returns-date {
     SELECT make_date(2024, 1, 1);
 }
@@ -106,7 +96,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    type "date" is not supported
+    make_date\(\) is not supported
 }
 
 @compat-gap "type:_timestamp"
