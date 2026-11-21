@@ -583,6 +583,15 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether `sum()` and `avg()` add floats one by one.
+    ///
+    /// SQLite keeps an error term for each addition (Kahan-Babuska-Neumaier),
+    /// so the total is closer to the exact sum. PostgreSQL adds the floats
+    /// one by one, so its total can differ in the last digits.
+    fn sums_floats_naively(&self) -> bool {
+        false
+    }
+
     /// Whether integer division by zero raises an error.
     ///
     /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.

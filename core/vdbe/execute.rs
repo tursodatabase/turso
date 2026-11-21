@@ -9153,7 +9153,7 @@ fn op_window_inverse(
 }
 
 pub fn op_agg_inverse(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     connection: &Arc<Connection>,
@@ -9189,6 +9189,9 @@ pub fn op_agg_inverse(
     let counts_infinite_inputs = matches!(func, AggFunc::Sum | AggFunc::Total | AggFunc::Avg)
         && connection.dialect().sum_counts_infinite_inputs();
     inverse_agg_payload(func, arg, payload, counts_infinite_inputs)?;
+    if program.prepare_context.sums_floats_naively() {
+        drop_float_sum_error(func, &mut state.registers[*acc_reg]);
+    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -9540,13 +9543,14 @@ fn sum_of_infinite_inputs(pos_inf: &Value, neg_inf: &Value) -> Option<Value> {
 }
 
 pub fn op_agg_step(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     connection: &Arc<Connection>,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(AggStep { data }, insn);
+    let naive_float_sum = program.prepare_context.sums_floats_naively();
     // Fast paths for the common numeric cases of count, sum, avg and min/max
     // over an initialized accumulator. The slow path keeps every other
     // function and value type, the first-row initialization and the error
@@ -9578,7 +9582,7 @@ pub fn op_agg_step(
                                 [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), Value::Numeric(Numeric::Integer(1)), Value::Numeric(Numeric::Integer(ovrfl)), Value::Numeric(Numeric::Integer(count)), ..],
                             ) => {
                                 if let (Some((sum, err)), Some(rows)) = (
-                                    kbn_step_finite(*acc, *r_err, f64::from(arg)),
+                                    kbn_step_finite(*acc, *r_err, f64::from(arg), naive_float_sum),
                                     count.checked_add(1),
                                 ) {
                                     *acc = sum;
@@ -9594,7 +9598,7 @@ pub fn op_agg_step(
                                 [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), _, _, Value::Numeric(Numeric::Integer(count)), ..],
                             ) if arg.unsigned_abs() < KBN_EXACT_INTEGER_LIMIT => {
                                 if let (Some((sum, err)), Some(rows)) = (
-                                    kbn_step_finite(*acc, *r_err, arg as f64),
+                                    kbn_step_finite(*acc, *r_err, arg as f64, naive_float_sum),
                                     count.checked_add(1),
                                 ) {
                                     *acc = sum;
@@ -9624,9 +9628,10 @@ pub fn op_agg_step(
                         if let [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), Value::Numeric(Numeric::Integer(count)), ..] =
                             payload.as_mut_slice()
                         {
-                            if let (Some((sum, err)), Some(rows)) =
-                                (kbn_step_finite(*acc, *r_err, arg), count.checked_add(1))
-                            {
+                            if let (Some((sum, err)), Some(rows)) = (
+                                kbn_step_finite(*acc, *r_err, arg, naive_float_sum),
+                                count.checked_add(1),
+                            ) {
                                 *acc = sum;
                                 *r_err = err;
                                 *count = rows;
@@ -9855,6 +9860,9 @@ fn op_agg_step_slow(
                     )?;
                 }
             }
+            if connection.dialect().sums_floats_naively() {
+                drop_float_sum_error(func, &mut state.registers[*acc_reg]);
+            }
         }
     };
 
@@ -9891,16 +9899,38 @@ fn step_builtin_agg(
     )
 }
 
+/// Resets the error term of a sum or average, so the total is a plain sum.
+fn drop_float_sum_error(func: &AggFunc, register: &mut Register) {
+    if !matches!(func, AggFunc::Sum | AggFunc::Total | AggFunc::Avg) {
+        return;
+    }
+    if let Register::Aggregate(agg) = register {
+        if let Some(r_err) = agg.payload_mut().get_mut(1) {
+            *r_err = Value::from_f64(0.0);
+        }
+    }
+}
+
 /// Adds `value` to a float total and its error term like [apply_kbn_step], or
+/// leaves the error term at zero when `naive` is set, or
 /// returns `None` when the result is not finite and the generic step must run.
 #[inline]
-fn kbn_step_finite(sum: NonNan, r_err: NonNan, value: f64) -> Option<(NonNan, NonNan)> {
+fn kbn_step_finite(
+    sum: NonNan,
+    r_err: NonNan,
+    value: f64,
+    naive: bool,
+) -> Option<(NonNan, NonNan)> {
     let s = f64::from(sum);
     let t = s + value;
     if !t.is_finite() {
         return None;
     }
-    let err = f64::from(r_err) + kbn_correction(s, value, t);
+    let err = if naive {
+        0.0
+    } else {
+        f64::from(r_err) + kbn_correction(s, value, t)
+    };
     Some((NonNan::new(t)?, NonNan::new(err)?))
 }
 
@@ -20273,6 +20303,7 @@ mod tests {
             database_ptr: 0,
             generation: 0,
             real_columns_keep_negative_zero: false,
+            sums_floats_naively: false,
         };
         let prepared = builder
             .build_prepared_program(prepare_context, Vec::new(), false, "")
