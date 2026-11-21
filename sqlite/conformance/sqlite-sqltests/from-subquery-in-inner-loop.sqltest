@@ -1,7 +1,8 @@
 @database :memory:
 
-# A FROM-clause subquery that is not first in the join order is stored in a
-# table once instead of running as a coroutine for each outer row. These tests check the rows of that plan,
+# A FROM-clause subquery that an outer join, a CROSS JOIN or an earlier
+# subquery keeps in an inner loop is stored in a table once instead of running
+# as a coroutine for each outer row. These tests check the rows of that plan,
 # including NULL-extended rows of the LEFT JOIN. The REAL values are cast to
 # INTEGER because the JS backend prints a REAL 6.0 as 6.
 
@@ -74,26 +75,6 @@ expect {
     3||9
     5|5|2
     5|5|9
-}
-
-# The planner puts the subquery after both inner-joined tables.
-@setup schema
-test inner-join-subquery-after-tables {
-    CREATE TABLE g (a INTEGER);
-    INSERT INTO g VALUES (1), (2), (2), (3), (7);
-    SELECT g.a, h.type_id FROM g JOIN watchlist w ON g.a = w.type_id JOIN (SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id) h ON w.name > h.avgp ORDER BY g.a, h.type_id;
-}
-expect {
-    1|9
-    2|2
-    2|2
-    2|9
-    2|9
-    3|
-    3|1
-    3|2
-    3|3
-    3|9
 }
 
 @setup schema
@@ -262,6 +243,25 @@ expect {
     1|
     2|
     3|
+}
+
+# Only inner joins come before the GROUP BY subquery in the FROM clause, so
+# SQLite keeps its coroutine even where the join order puts it in an inner
+# loop. It runs again for each updated row and reads the rows that the UPDATE
+# already changed.
+test update-reads-grouped-subquery-after-inner-joins-per-row {
+    CREATE TABLE g (k INTEGER);
+    CREATE TABLE t (a INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO g VALUES (2), (3);
+    INSERT INTO t SELECT value, value * 10 FROM generate_series(1, 50);
+    UPDATE t SET x = (SELECT sum(h.x) FROM g JOIN t AS o ON o.a = g.k JOIN (SELECT a, x FROM t GROUP BY a) h ON h.a + 1 = o.a WHERE o.a = t.a);
+    SELECT * FROM t WHERE a < 5;
+}
+expect {
+    1|
+    2|
+    3|
+    4|
 }
 
 # SQLite stores the GROUP BY subquery in a table when the SET subquery first

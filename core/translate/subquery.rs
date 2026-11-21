@@ -1840,15 +1840,16 @@ pub fn emit_from_clause_subqueries(
     Ok(())
 }
 
-/// Whether a coroutine for the FROM-clause subquery at `table_index` sits in
-/// an inner loop of the join and so runs the whole subquery again for each
-/// row of the outer loops. Such a subquery is stored in a table, filled once,
-/// instead. SQLite decides this from FROM positions before it picks the join
-/// order (`fromClauseTermCanBeCoroutine` in select.c) and relies on its cost
-/// model to put a coroutine first; Turso decides it after the join order is
-/// known, so a subquery that the join order puts in an inner loop is never
-/// run again per outer row. A subquery that SQLite may flatten into the
-/// outer query keeps its coroutine.
+/// Whether a coroutine for the FROM-clause subquery at `table_index` may sit
+/// in an inner loop of the join and so run the whole subquery again for each
+/// row of the outer loops. SQLite stores the subquery in a table instead when
+/// an earlier FROM term is a subquery, or when this term or an earlier one is
+/// joined by an outer join or CROSS JOIN, which keeps it after the earlier
+/// terms (rules 1c-i and 1c-ii of `fromClauseTermCanBeCoroutine` in select.c).
+/// A semi join or anti join that Turso makes from EXISTS or NOT EXISTS also
+/// keeps its table after the earlier terms, so it is treated the same way.
+/// SQLite applies these rules only to subqueries that it does not flatten into
+/// the outer query, so a subquery that SQLite may flatten keeps its coroutine.
 fn coroutine_would_rerun_for_outer_rows(
     tables: &TableReferences,
     join_order: &[JoinOrderMember],
@@ -1871,9 +1872,21 @@ fn coroutine_would_rerun_for_outer_rows(
         return false;
     }
     // The first table of the join order is read once.
-    join_order
+    if join_order
         .first()
-        .is_some_and(|member| member.original_idx != table_index)
+        .is_some_and(|member| member.original_idx == table_index)
+    {
+        return false;
+    }
+    joined_tables[..table_index].iter().any(|table| {
+        matches!(table.table, Table::FromClauseSubquery(_))
+            && sqlite_never_flattens_from_clause_subquery(table)
+    }) || joined_tables[..=table_index].iter().any(|table| {
+        table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::is_ordering_constrained)
+    })
 }
 
 /// Whether SQLite's `flattenSubquery` (select.c) refuses to merge the
