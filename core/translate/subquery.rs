@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::alloc::TursoSliceExt;
 use crate::translate::expr_context::ExprContext;
 
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
 
 use super::{
@@ -37,7 +37,7 @@ use crate::{
         optimizer::optimize_select_plan,
         plan::{
             plan_has_outer_scope_dependency, plan_is_correlated,
-            select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinInfo,
+            select_plan_has_outer_scope_dependency, ColumnUsedMask, Distinctness, EvalAt, JoinInfo,
             JoinOrderMember, JoinedTable, NonFromClauseSubquery, OuterQueryReference, Plan,
             SubqueryEvalPhase, SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences,
             WhereTerm,
@@ -229,6 +229,244 @@ pub(crate) fn mark_shared_cte_materialization_requirements(
             continue;
         };
         annotate_plan(subquery_plan);
+    }
+}
+
+/// The reads of one CTE in a statement, counted by [count_statement_cte_reads].
+struct StatementCteReads {
+    count: usize,
+    /// SQLite stores the result of this CTE once and reuses it for every read
+    /// when the CTE is read more than once. See [sqlite_stores_cte_once].
+    stored_once: bool,
+}
+
+/// Mark the CTE reads of a whole statement that share one stored result
+/// because SQLite computes that CTE once for the statement.
+///
+/// [mark_shared_cte_materialization_requirements] marks the reads of each query
+/// as it is planned, with the counts of that query alone. A read in a subquery
+/// or in another compound arm is only known once the statement is planned, so
+/// [optimize_plan] calls this function to count the reads of the whole
+/// statement. It only adds marks: a CTE that SQLite computes again for each read
+/// keeps the marks of the per-query pass.
+///
+/// [optimize_plan]: crate::translate::optimizer::optimize_plan
+pub(crate) fn mark_cte_reads_stored_once_for_statement(plan: &mut Plan) {
+    let mut reads = HashMap::default();
+    count_statement_cte_reads(&mut reads, plan);
+    if reads
+        .values()
+        .any(|reads: &StatementCteReads| reads.count > 1 && reads.stored_once)
+    {
+        mark_statement_cte_reads(&reads, plan);
+    }
+}
+
+// Count every CTE read of the statement, including reads in subqueries,
+// compound arms and CTE bodies, because SQLite counts the reads of a CTE over
+// the whole statement.
+//
+// A post-write RETURNING subquery runs after the write, so it reads the CTE
+// again unless an earlier read stored it. As in SQLite, its reads do not make
+// the reads before the write share a result. Its uncorrelated reads are counted
+// only for the CTEs read in the FROM clause of the statement, because those
+// reads are stored before the write and RETURNING reuses them. Correlated
+// RETURNING reads run once per written row and are never counted.
+fn count_statement_cte_reads(reads: &mut HashMap<usize, StatementCteReads>, plan: &mut Plan) {
+    for_each_query_of_plan(plan, &mut |table_references, non_from_clause_subqueries| {
+        let mut from_clause_cte_ids = HashSet::default();
+        for table in table_references.joined_tables_mut().iter_mut() {
+            if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
+                let from_clause_subquery = Arc::make_mut(from_clause_subquery);
+                if let Some(cte_id) = from_clause_subquery.cte_id() {
+                    count_cte_read(reads, cte_id, from_clause_subquery);
+                    from_clause_cte_ids.insert(cte_id);
+                }
+                count_statement_cte_reads(reads, from_clause_subquery.plan.as_mut());
+            }
+        }
+
+        let mut returning_reads = HashMap::default();
+        for subquery in non_from_clause_subqueries.iter_mut() {
+            let post_write_returning = subquery.origin.is_post_write_returning();
+            let SubqueryState::Unevaluated {
+                plan: Some(subquery_plan),
+            } = &mut subquery.state
+            else {
+                continue;
+            };
+            if !post_write_returning {
+                count_statement_cte_reads(reads, subquery_plan);
+            } else if !plan_has_outer_scope_dependency(subquery_plan) {
+                count_statement_cte_reads(&mut returning_reads, subquery_plan);
+            }
+        }
+        for (cte_id, returning) in returning_reads {
+            if from_clause_cte_ids.contains(&cte_id) {
+                if let Some(cte_reads) = reads.get_mut(&cte_id) {
+                    cte_reads.count += returning.count;
+                }
+            }
+        }
+    });
+}
+
+fn count_cte_read(
+    reads: &mut HashMap<usize, StatementCteReads>,
+    cte_id: usize,
+    from_clause_subquery: &crate::schema::FromClauseSubquery,
+) {
+    reads
+        .entry(cte_id)
+        .or_insert_with(|| StatementCteReads {
+            count: 0,
+            stored_once: sqlite_stores_cte_once(from_clause_subquery),
+        })
+        .count += 1;
+}
+
+/// Whether SQLite computes this CTE once for the statement when the statement
+/// reads it more than once. SQLite stores the result of a CTE marked
+/// `MATERIALIZED`. Without a mark, it stores the result of a CTE read twice or
+/// more, unless its query flattener merges the CTE's query into the query that
+/// reads it: such a read computes the CTE again. `NOT MATERIALIZED` makes SQLite
+/// compute the CTE again for each read (`fromClauseTermCanBeCoroutine` in
+/// SQLite's select.c).
+fn sqlite_stores_cte_once(from_clause_subquery: &crate::schema::FromClauseSubquery) -> bool {
+    if from_clause_subquery.materialize_hint() {
+        return true;
+    }
+    !from_clause_subquery.not_materialized_hint()
+        && !sqlite_can_flatten_cte_body(&from_clause_subquery.plan)
+}
+
+/// Whether SQLite's query flattener can merge this CTE body into a query that
+/// reads it, judged by the body alone. The numbers are the restrictions listed
+/// above `flattenSubquery` in SQLite's select.c. The restrictions that depend on
+/// the reading query are not checked, so this returns true for some bodies that
+/// SQLite does not merge into every query that reads them.
+fn sqlite_can_flatten_cte_body(plan: &Plan) -> bool {
+    match plan {
+        Plan::Select(select_plan) => sqlite_can_flatten_select(select_plan),
+        Plan::CompoundSelect {
+            left,
+            right_most,
+            offset,
+            order_by,
+            ..
+        } => {
+            // (14), (20), (17a), (17b), (17c) and (17e).
+            offset.is_none()
+                && order_by.is_none()
+                && left.iter().all(|(select_plan, operator)| {
+                    *operator == ast::CompoundOperator::UnionAll
+                        && sqlite_can_flatten_select(select_plan)
+                })
+                && sqlite_can_flatten_select(right_most)
+        }
+        // (22)
+        Plan::RecursiveCte(_) => false,
+        Plan::Delete(_) | Plan::Update(_) => false,
+    }
+}
+
+fn sqlite_can_flatten_select(select_plan: &SelectPlan) -> bool {
+    // (7): a query without a FROM clause.
+    !select_plan.joined_tables().is_empty()
+        // (4)
+        && matches!(select_plan.distinctness, Distinctness::NonDistinct)
+        // SQLite does not flatten an aggregate query.
+        && select_plan.group_by.is_none()
+        && select_plan.aggregates.is_empty()
+        // (25)
+        && select_plan.window.is_none()
+        // (14)
+        && select_plan.offset.is_none()
+}
+
+fn mark_statement_cte_reads(reads: &HashMap<usize, StatementCteReads>, plan: &mut Plan) {
+    for_each_query_of_plan(plan, &mut |table_references, non_from_clause_subqueries| {
+        for table in table_references.joined_tables_mut().iter_mut() {
+            if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
+                let from_clause_subquery = Arc::make_mut(from_clause_subquery);
+                let stored_once = from_clause_subquery.cte_id().is_some_and(|cte_id| {
+                    reads
+                        .get(&cte_id)
+                        .is_some_and(|reads| reads.count > 1 && reads.stored_once)
+                        && !plan_has_outer_scope_dependency(&from_clause_subquery.plan)
+                });
+                if stored_once {
+                    from_clause_subquery.set_shared_materialization(true);
+                }
+                mark_statement_cte_reads(reads, from_clause_subquery.plan.as_mut());
+            }
+        }
+        for subquery in non_from_clause_subqueries.iter_mut() {
+            let post_write_returning = subquery.origin.is_post_write_returning();
+            let SubqueryState::Unevaluated {
+                plan: Some(subquery_plan),
+            } = &mut subquery.state
+            else {
+                continue;
+            };
+            // RETURNING reads are not counted with the reads before the write,
+            // so they are only shared within their subquery. They still reuse
+            // a result that a read before the write stored.
+            if post_write_returning {
+                mark_cte_reads_stored_once_for_statement(subquery_plan);
+            } else {
+                mark_statement_cte_reads(reads, subquery_plan);
+            }
+        }
+    });
+}
+
+/// Call `visit` with the table references and the subqueries of each query that
+/// `plan` runs itself: each arm of a compound SELECT, both parts of a recursive
+/// CTE, and the queries of an UPDATE or DELETE. Nested queries are not visited.
+fn for_each_query_of_plan(
+    plan: &mut Plan,
+    visit: &mut impl FnMut(&mut TableReferences, &mut [NonFromClauseSubquery]),
+) {
+    match plan {
+        Plan::Select(select_plan) => visit(
+            &mut select_plan.table_references,
+            &mut select_plan.non_from_clause_subqueries,
+        ),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            for (select_plan, _) in left.iter_mut() {
+                visit(
+                    &mut select_plan.table_references,
+                    &mut select_plan.non_from_clause_subqueries,
+                );
+            }
+            visit(
+                &mut right_most.table_references,
+                &mut right_most.non_from_clause_subqueries,
+            );
+        }
+        Plan::RecursiveCte(recursive_cte) => {
+            for_each_query_of_plan(&mut recursive_cte.initial_query, visit);
+            for_each_query_of_plan(&mut recursive_cte.recursive_query, visit);
+        }
+        Plan::Delete(delete_plan) => {
+            if let Some(rowset_plan) = &mut delete_plan.rowset_plan {
+                visit(
+                    &mut rowset_plan.table_references,
+                    &mut rowset_plan.non_from_clause_subqueries,
+                );
+            }
+            visit(
+                &mut delete_plan.table_references,
+                &mut delete_plan.non_from_clause_subqueries,
+            );
+        }
+        Plan::Update(update_plan) => visit(
+            &mut update_plan.from_tables,
+            &mut update_plan.non_from_clause_subqueries,
+        ),
     }
 }
 

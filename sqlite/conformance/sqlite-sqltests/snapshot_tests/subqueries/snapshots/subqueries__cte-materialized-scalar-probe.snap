@@ -63,13 +63,10 @@ info:
 QUERY PLAN
 |--SCALAR SUBQUERY 1
 |  |--SCALAR SUBQUERY 2
+|  |  |--SCAN sample_points
+|  |  |--USE HASH TABLE FOR DISTINCT
+|  |  |--USE SORTER FOR ORDER BY
 |  |  `--SCAN ordered_points
-|  |     |--SCAN sample_points
-|  |     |--USE HASH TABLE FOR DISTINCT
-|  |     `--USE SORTER FOR ORDER BY
-|  |--SCAN sample_points
-|  |--USE HASH TABLE FOR DISTINCT
-|  |--USE SORTER FOR ORDER BY
 |  `--SCAN run_ids
 |     `--SCAN window_subquery_0
 |        `--SCAN run_markers
