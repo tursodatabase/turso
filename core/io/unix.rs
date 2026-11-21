@@ -3,18 +3,20 @@ use crate::error::{io_error, CompletionError, LimboError};
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
 use crate::io::FileSyncType;
+use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::Result;
 use rustix::{
     fd::{AsFd, AsRawFd},
     fs::{self, FlockOperation},
 };
-use std::os::fd::RawFd;
+use std::ffi::CString;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 
 use std::{io::ErrorKind, sync::Arc};
-#[cfg(feature = "fs")]
-use tracing::debug;
-use tracing::{instrument, trace, Level};
+use tracing::{debug, instrument, trace, Level};
 
 // Darwin fails pwrite() and pwritev() calls with buffer size larger than INT_MAX so let's treat
 // that as maximum buffer size.
@@ -58,11 +60,16 @@ impl IO for UnixIO {
         }
 
         let file = file.open(path).map_err(|e| io_error(e, "open"))?;
+        let dir_needs_sync =
+            flags.contains(OpenFlags::Create) && !flags.contains(OpenFlags::ReadOnly);
+        let parent_dir = dir_needs_sync.then(|| resolve_parent_dir(path));
 
         #[allow(clippy::arc_with_non_send_sync)]
         let unix_file = Arc::new(UnixFile {
             file,
             path: path.to_string(),
+            parent_dir,
+            dir_needs_sync: AtomicBool::new(dir_needs_sync),
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
             && !flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
@@ -86,6 +93,105 @@ impl IO for UnixIO {
 pub struct UnixFile {
     file: std::fs::File,
     path: String,
+    parent_dir: Option<PathBuf>,
+    dir_needs_sync: AtomicBool,
+}
+
+pub(crate) fn resolve_parent_dir(path: &str) -> PathBuf {
+    if let Some(parent) = std::fs::canonicalize(path)
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+    {
+        return parent;
+    }
+    let parent = Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if parent.is_relative() {
+        if let Ok(cwd) = std::env::current_dir() {
+            return cwd.join(parent);
+        }
+    }
+    parent.to_path_buf()
+}
+
+pub(crate) fn open_parent_dir(dir: &Path) -> Result<Option<OwnedFd>> {
+    let c_path = CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
+        LimboError::InvalidArgument("parent directory path contains interior NUL byte".into())
+    })?;
+    loop {
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd != -1 {
+            return Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }));
+        }
+        let err = std::io::Error::last_os_error();
+        match err.kind() {
+            ErrorKind::Interrupted => continue,
+            ErrorKind::PermissionDenied => {
+                debug!(
+                    "skipping parent directory sync for '{}': {}",
+                    dir.display(),
+                    err
+                );
+                return Ok(None);
+            }
+            _ => return Err(io_error(err, "open_parent_dir")),
+        }
+    }
+}
+
+pub(crate) fn is_ignorable_dir_sync_errno(errno: i32) -> bool {
+    matches!(errno, libc::EINVAL | libc::EROFS)
+}
+
+fn sync_parent_dir(dir: &Path, sync_type: FileSyncType) -> Result<()> {
+    let Some(dir_fd) = open_parent_dir(dir)? else {
+        return Ok(());
+    };
+
+    #[cfg(target_vendor = "apple")]
+    if sync_type == FileSyncType::FullFsync {
+        loop {
+            let rc = unsafe { libc::fcntl(dir_fd.as_raw_fd(), libc::F_FULLFSYNC) };
+            if rc != -1 {
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            if matches!(
+                err.raw_os_error(),
+                Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::EINVAL | libc::ENOTTY)
+            ) {
+                break;
+            }
+            return Err(io_error(err, "sync_parent_dir"));
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = sync_type;
+
+    loop {
+        let rc = unsafe { libc::fsync(dir_fd.as_raw_fd()) };
+        if rc != -1 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        if err.raw_os_error().is_some_and(is_ignorable_dir_sync_errno) {
+            return Ok(());
+        }
+        return Err(io_error(err, "sync_parent_dir"));
+    }
 }
 
 pub(crate) struct UnixSharedWalMapping {
@@ -483,6 +589,13 @@ impl File for UnixFile {
             #[cfg(not(target_vendor = "apple"))]
             trace!("fsync");
 
+            if self.dir_needs_sync.load(Ordering::Acquire) {
+                if let Some(parent_dir) = &self.parent_dir {
+                    sync_parent_dir(parent_dir, sync_type)?;
+                }
+                self.dir_needs_sync.store(false, Ordering::Release);
+            }
+
             c.complete(0);
             Ok(c)
         }
@@ -619,6 +732,103 @@ mod tests {
         assert_eq!(mapped.len(), 81920);
         let slice = unsafe { std::slice::from_raw_parts(mapped.ptr().as_ptr(), mapped.len()) };
         assert_eq!(&slice[..128], &bytes[4096..4096 + 128]);
-        assert_eq!(&slice[mapped.len() - 128..], &bytes[4096 + 81920 - 128..4096 + 81920]);
+        assert_eq!(
+            &slice[mapped.len() - 128..],
+            &bytes[4096 + 81920 - 128..4096 + 81920]
+        );
+    }
+
+    #[test]
+    fn test_sync_fsyncs_parent_dir_once_for_newly_created_file() {
+        for sync_type in [FileSyncType::Fsync, FileSyncType::FullFsync] {
+            let root = tempfile::tempdir().unwrap();
+            let sub = root.path().join("sub");
+            let sub_moved = root.path().join("sub_moved");
+            std::fs::create_dir(&sub).unwrap();
+            let db_path = sub.join("test.db");
+
+            let io = UnixIO::new().unwrap();
+            let file = io
+                .open_file(db_path.to_str().unwrap(), OpenFlags::Create, false)
+                .unwrap();
+            let buf = Arc::new(crate::Buffer::new_temporary(4096));
+            let w = file.pwrite(0, buf, Completion::new_write(|_| {})).unwrap();
+            io.wait_for_completion(w).unwrap();
+
+            std::fs::rename(&sub, &sub_moved).unwrap();
+            let res = file.sync(Completion::new_sync(|_| {}), sync_type);
+            assert!(
+                res.is_err(),
+                "first sync ({sync_type:?}) must fail when parent dir is missing"
+            );
+
+            std::fs::rename(&sub_moved, &sub).unwrap();
+            let c1 = file
+                .sync(Completion::new_sync(|_| {}), sync_type)
+                .expect("retry sync must succeed once parent dir is restored");
+            io.wait_for_completion(c1).unwrap();
+
+            std::fs::rename(&sub, &sub_moved).unwrap();
+            let c2 = file
+                .sync(Completion::new_sync(|_| {}), sync_type)
+                .expect("subsequent sync must not re-open parent dir");
+            io.wait_for_completion(c2).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_sync_skips_parent_dir_for_existing_and_readonly_files() {
+        for flags in [
+            OpenFlags::None,
+            OpenFlags::ReadOnly,
+            OpenFlags::Create | OpenFlags::ReadOnly,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let sub = root.path().join("sub");
+            let sub_moved = root.path().join("sub_moved");
+            std::fs::create_dir(&sub).unwrap();
+            let db_path = sub.join("existing.db");
+            std::fs::write(&db_path, b"seed").unwrap();
+
+            let io = UnixIO::new().unwrap();
+            let file = io
+                .open_file(db_path.to_str().unwrap(), flags, false)
+                .unwrap();
+
+            std::fs::rename(&sub, &sub_moved).unwrap();
+            let c = file
+                .sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)
+                .expect("sync should not touch parent dir for non-Create or ReadOnly open");
+            io.wait_for_completion(c).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_resolve_parent_dir_relative_path_uses_cwd() {
+        let resolved = resolve_parent_dir("nonexistent-turso-dirsync-test.db");
+        assert!(!resolved.as_os_str().is_empty());
+        assert_eq!(resolved, std::env::current_dir().unwrap().join("."));
+    }
+
+    #[test]
+    fn test_open_parent_dir_ignores_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        struct RestorePerms(PathBuf);
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let _restore = RestorePerms(path.clone());
+
+        let fd = open_parent_dir(&path).expect("permission denied must not error");
+        assert!(fd.is_none());
     }
 }
