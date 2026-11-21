@@ -4896,6 +4896,12 @@ impl Schema {
         })
     }
 
+    /// Returns true if `table_name` is the parent or the child of any FOREIGN KEY.
+    pub fn has_foreign_keys(&self, namespace: NamespaceId, table_name: &str) -> bool {
+        self.any_resolved_fks_referencing(namespace, table_name)
+            || self.has_child_fks(namespace, table_name)
+    }
+
     /// Returns if any table declares a FOREIGN KEY whose parent is `table_name`.
     pub fn any_resolved_fks_referencing(&self, namespace: NamespaceId, table_name: &str) -> bool {
         self.namespaces.values().any(|objects| {

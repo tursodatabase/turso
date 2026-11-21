@@ -2217,30 +2217,31 @@ fn register_index_expression_usages_for_plan(
 ) -> Result<()> {
     table_references.reset_expression_index_usages();
 
-    let mut register = |expr: &ast::Expr| {
+    let mut register = |expr: &ast::Expr, where_term: Option<&WhereTerm>| {
         walk_expr(expr, &mut |part| {
-            table_references.register_expression_index_usage(part);
+            let whole_term = where_term.filter(|_| std::ptr::eq(part, expr));
+            table_references.register_expression_index_usage(part, whole_term);
             Ok(WalkControl::Continue)
         })
     };
 
     for rc in result_columns {
-        register(&rc.expr)?;
+        register(&rc.expr, None)?;
     }
     for (expr, _, _) in order_by {
-        register(expr)?;
+        register(expr, None)?;
     }
-    for where_term in where_clause {
-        register(&where_term.expr)?;
+    for where_term in where_clause.iter() {
+        register(&where_term.expr, Some(where_term))?;
     }
 
     if let Some(group_by) = group_by {
         for expr in &group_by.exprs {
-            register(expr)?;
+            register(expr, None)?;
         }
         if let Some(having) = &group_by.having {
             for expr in having {
-                register(expr)?;
+                register(expr, None)?;
             }
         }
     }
@@ -3048,8 +3049,8 @@ fn plan_unmatched_right_rows(
             params,
             resolver,
         )?;
-        // The main plan already checked the INDEXED BY index. The unmatched-row
-        // read follows the same hint, as in SQLite.
+        // The main plan already checked that the INDEXED BY index exists. The
+        // unmatched-row read follows the same hint, as in SQLite.
         if let Some(indexed) = &table.indexed {
             let forced_index = match indexed {
                 ast::Indexed::IndexedBy(name) => Some(
@@ -3059,6 +3060,16 @@ fn plan_unmatched_right_rows(
                 ),
                 ast::Indexed::NotIndexed => None,
             };
+            // The main plan can prove a partial index predicate with an ON
+            // term. This read has no ON terms, so it must prove the predicate
+            // again.
+            let forced_partial_index_unusable =
+                partial_index(forced_index.as_ref()).is_some_and(|index| {
+                    !can_use_partial_index(index, unmatched_table, &where_clause_for_unmatched_rows)
+                });
+            if forced_partial_index_unusable {
+                crate::bail_parse_error!("no query solution");
+            }
             keep_index_hint_candidates(
                 &mut constraints_for_unmatched_rows.candidates,
                 forced_index,

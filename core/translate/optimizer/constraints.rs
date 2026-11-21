@@ -3,6 +3,8 @@ use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
 use crate::translate::expr_context::{ExprContext, ExprProperties, TableMetadata};
 use crate::{
+    function::{Func, ScalarFunc},
+    numeric::Numeric,
     schema::{Column, Index, IndexColumn, Schema},
     translate::{
         collate::{comparison_collation, in_list_collation, CollationSeq},
@@ -22,7 +24,8 @@ use crate::{
         },
         Resolver,
     },
-    util::exprs_are_equivalent,
+    types::Value,
+    util::{exprs_are_equivalent, parse_numeric_literal},
     vdbe::affinity::Affinity,
     Result,
 };
@@ -1748,10 +1751,160 @@ fn query_term_implies_predicate(query: &ast::Expr, predicate: &ast::Expr) -> boo
     if exprs_are_equivalent(query, predicate) {
         return true;
     }
-    match unwrap_parens(predicate).unwrap_or(predicate) {
+    let implied = match unwrap_parens(predicate).unwrap_or(predicate) {
         ast::Expr::Binary(left, ast::Operator::Or, right) => {
             query_term_implies_predicate(query, left) || query_term_implies_predicate(query, right)
         }
+        predicate => null_test(predicate).is_some_and(|(operand, is_null)| {
+            // SQLite parses `x ISNULL` like `x IS NULL`, and `x NOTNULL` like
+            // `x IS NOT NULL`, so each spelling proves the other.
+            let same_test = null_test(query).is_some_and(|(query_operand, query_is_null)| {
+                query_is_null == is_null && exprs_are_equivalent(query_operand, operand)
+            });
+            same_test || (!is_null && expr_implies_not_null(query, operand, false))
+        }),
+    };
+    // `iif(x, y)` is TRUE only when `x` is TRUE, so it implies what `x` implies.
+    implied
+        || iif_condition(query)
+            .is_some_and(|condition| query_term_implies_predicate(condition, predicate))
+}
+
+/// Returns `(x, true)` for `x IS NULL` and `x ISNULL`, and `(x, false)` for
+/// `x IS NOT NULL`, `x NOTNULL` and `x NOT NULL`.
+fn null_test(expr: &ast::Expr) -> Option<(&ast::Expr, bool)> {
+    let is_null_literal = |expr: &ast::Expr| matches!(expr, ast::Expr::Literal(ast::Literal::Null));
+    match unwrap_parens(expr).unwrap_or(expr) {
+        ast::Expr::IsNull(operand) => Some((operand.as_ref(), true)),
+        ast::Expr::NotNull(operand) => Some((operand.as_ref(), false)),
+        ast::Expr::Binary(operand, ast::Operator::Is, rhs) if is_null_literal(rhs) => {
+            Some((operand.as_ref(), true))
+        }
+        ast::Expr::Binary(operand, ast::Operator::IsNot, rhs) if is_null_literal(rhs) => {
+            Some((operand.as_ref(), false))
+        }
+        _ => None,
+    }
+}
+
+/// Returns `x` if `expr` is one of these, where `z` is NULL, FALSE or 0:
+///
+///   iif(x, y)    CASE WHEN x THEN y END
+///   iif(x, y, z) CASE WHEN x THEN y ELSE z END
+///
+/// Port of SQLite's `sqlite3ExprIsIIF` (expr.c).
+fn iif_condition(expr: &ast::Expr) -> Option<&ast::Expr> {
+    let (condition, otherwise) = match unwrap_parens(expr).unwrap_or(expr) {
+        ast::Expr::FunctionCall { name, args, .. }
+            if matches!(
+                Func::resolve_function(name.as_str(), args.len()),
+                Ok(Some(Func::Scalar(ScalarFunc::Iif)))
+            ) =>
+        {
+            match args.as_slice() {
+                [condition, _] => (condition, None),
+                [condition, _, otherwise] => (condition, Some(otherwise)),
+                _ => return None,
+            }
+        }
+        ast::Expr::Case {
+            base: None,
+            when_then_pairs,
+            else_expr,
+        } => match when_then_pairs.as_slice() {
+            [(condition, _)] => (condition, else_expr.as_ref()),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    otherwise
+        .is_none_or(|otherwise| expr_is_never_true(otherwise))
+        .then_some(condition.as_ref())
+}
+
+/// Returns true if `expr` is NULL, FALSE or an integer literal 0.
+///
+/// Port of SQLite's `sqlite3ExprIsNotTrue` (expr.c).
+fn expr_is_never_true(expr: &ast::Expr) -> bool {
+    match unwrap_parens(expr).unwrap_or(expr) {
+        ast::Expr::Literal(ast::Literal::Null | ast::Literal::False) => true,
+        expr => expr_is_integer_zero(expr),
+    }
+}
+
+fn expr_is_integer_zero(expr: &ast::Expr) -> bool {
+    use ast::UnaryOperator::{Negative, Positive};
+    match unwrap_parens(expr).unwrap_or(expr) {
+        ast::Expr::Unary(Positive | Negative, inner) => expr_is_integer_zero(inner),
+        ast::Expr::Literal(ast::Literal::Numeric(text)) => matches!(
+            parse_numeric_literal(text),
+            Ok(Value::Numeric(Numeric::Integer(0)))
+        ),
+        _ => false,
+    }
+}
+
+/// Returns true if `expr` can be TRUE only when `operand` is not NULL. With
+/// `when_not_null`, the claim is stronger: `expr` can be non-NULL only when
+/// `operand` is not NULL. An expression such as `NOT x` is TRUE when `x` is
+/// FALSE, so it asks for the stronger claim about `x`.
+///
+/// Port of SQLite's `exprImpliesNotNull` (expr.c). Returns false when unsure.
+fn expr_implies_not_null(expr: &ast::Expr, operand: &ast::Expr, when_not_null: bool) -> bool {
+    use ast::{Operator::*, UnaryOperator};
+    if exprs_are_equivalent(expr, operand) {
+        return !matches!(operand, ast::Expr::Literal(ast::Literal::Null));
+    }
+    let implies =
+        |expr: &ast::Expr, when_not_null: bool| expr_implies_not_null(expr, operand, when_not_null);
+    match expr {
+        // `x IN (...)` and `x NOT IN (...)` are NULL for a NULL x, unless the
+        // list is empty.
+        ast::Expr::InList { lhs, rhs, .. } => !rhs.is_empty() && implies(lhs, true),
+
+        // A subquery can return no rows. `x IN (...)` is then FALSE for a
+        // NULL x, and `x NOT IN (...)` is TRUE.
+        ast::Expr::SubqueryResult {
+            lhs: Some(lhs),
+            not_in: false,
+            query_type: ast::SubqueryType::In { .. },
+            ..
+        } => !when_not_null && implies(lhs, true),
+
+        // `x BETWEEN y AND z` can be FALSE when one of its inputs is NULL.
+        ast::Expr::Between {
+            lhs,
+            not: false,
+            start,
+            end,
+        } => !when_not_null && (implies(start, true) || implies(end, true) || implies(lhs, true)),
+
+        // These are NULL when an input is NULL.
+        ast::Expr::Binary(
+            lhs,
+            Equals | NotEquals | Less | LessEquals | Greater | GreaterEquals | Add | Subtract
+            | BitwiseOr | LeftShift | RightShift | Concat,
+            rhs,
+        ) => implies(rhs, true) || implies(lhs, true),
+
+        // These are also NULL when an input is NULL, and they are TRUE only
+        // when both inputs are TRUE.
+        ast::Expr::Binary(lhs, Multiply | Modulus | BitwiseAnd | Divide, rhs) => {
+            implies(rhs, when_not_null) || implies(lhs, when_not_null)
+        }
+
+        // `x IS TRUE` and `x IS FALSE` are FALSE for a NULL x.
+        ast::Expr::Binary(lhs, Is, rhs) if truth_test_rhs(rhs).is_some() => {
+            !when_not_null && implies(lhs, true)
+        }
+
+        ast::Expr::Unary(UnaryOperator::Not | UnaryOperator::BitwiseNot, inner) => {
+            implies(inner, true)
+        }
+        ast::Expr::Unary(UnaryOperator::Positive | UnaryOperator::Negative, inner)
+        | ast::Expr::Collate(inner, _) => implies(inner, when_not_null),
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => implies(&exprs[0], when_not_null),
+
         _ => false,
     }
 }
@@ -1783,18 +1936,11 @@ pub(super) fn partial_index_predicate_terms(
         .where_clause
         .as_ref()
         .expect("partial_index_predicate_terms requires a partial index");
-    let can_use_query_term = |term: &WhereTerm| -> bool {
-        let Some(join_info) = &table_reference.join_info else {
-            return !term.origin.is_outer_join();
-        };
-        if join_info.is_full_outer() {
-            return false;
-        }
-        if join_info.is_outer() {
-            return term.origin.join_origin()
-                == Some(JoinOrigin::Outer(table_reference.internal_id));
-        }
-        true
+    let usable_terms = || {
+        query_where_clause
+            .iter()
+            .enumerate()
+            .filter(|(_, term)| table_reference.where_term_can_prove_partial_index(term))
     };
     // Bind the index WHERE expression's column references to this query's
     // table reference so it can be compared symmetrically against bound query
@@ -1807,19 +1953,24 @@ pub(super) fn partial_index_predicate_terms(
     break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
     let mut matched_terms = SmallVec::<[usize; 4]>::new();
     for index_conjunct in index_conjuncts.iter() {
-        let (term_idx, term) = query_where_clause.iter().enumerate().find(|(_, term)| {
-            can_use_query_term(term) && query_term_implies_predicate(&term.expr, index_conjunct)
-        })?;
-        // A query term that proves one branch of an OR makes the partial index
-        // usable, but does not make that term true for every row in the index.
-        // Keep it as a residual filter unless the whole conjunct matched.
-        if exprs_are_equivalent(index_conjunct, &term.expr) && !matched_terms.contains(&term_idx) {
-            matched_terms.push(term_idx);
+        // A term that is the conjunct is true for every row in the index, so
+        // it is consumed. Look for one first: a covering index read relies on
+        // it (see `JoinedTable::apply_expression_index_coverage`).
+        if let Some((term_idx, _)) =
+            usable_terms().find(|(_, term)| exprs_are_equivalent(index_conjunct, &term.expr))
+        {
+            if !matched_terms.contains(&term_idx) {
+                matched_terms.push(term_idx);
+            }
+            continue;
         }
+        // A term that only implies the conjunct, such as one that proves one
+        // branch of an OR, makes the index usable but stays a filter.
+        usable_terms()
+            .find(|(_, term)| query_term_implies_predicate(&term.expr, index_conjunct))?;
     }
     Some(matched_terms)
-    // TODO: recognize implication beyond syntactic equivalence (e.g. `x = 5` implies
-    // `x IS NOT NULL`, `x > 10` implies `x > 5`).
+    // TODO: recognize more implications (e.g. `x > 10` implies `x > 5`).
 }
 
 pub(crate) fn partial_index(index: Option<&Arc<Index>>) -> Option<&Index> {
@@ -2568,4 +2719,28 @@ fn find_best_index_for_constraint(
     }
 
     (None, vec![])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn not_in_empty_list_does_not_imply_not_null() {
+        let column = ast::Expr::Column {
+            database: None,
+            table: TableInternalId::from(1),
+            column: 0,
+            is_rowid_alias: false,
+        };
+        let not_in = |rhs| ast::Expr::InList {
+            lhs: Box::new(column.clone()),
+            not: true,
+            rhs,
+        };
+        let value = Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".into())));
+
+        assert!(expr_implies_not_null(&not_in(vec![value]), &column, false));
+        assert!(!expr_implies_not_null(&not_in(vec![]), &column, false));
+    }
 }

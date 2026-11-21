@@ -339,8 +339,7 @@ fn emit_clear_btree_delete(
     }
     if connection.foreign_keys_enabled() {
         let has_foreign_keys = resolver.with_schema(table_ref.namespace.database_id, |schema| {
-            schema.any_resolved_fks_referencing(table_ref.namespace.id, table_name)
-                || schema.has_child_fks(table_ref.namespace.id, table_name)
+            schema.has_foreign_keys(table_ref.namespace.id, table_name)
         });
         if has_foreign_keys {
             return Ok(false);

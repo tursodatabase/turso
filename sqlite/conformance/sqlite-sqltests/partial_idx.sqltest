@@ -1345,6 +1345,58 @@ expect {
     10
 }
 
+# A term that is the whole index WHERE expression is consumed, so the index
+# read does not need b. That holds even when an earlier term already proves
+# the predicate.
+test partial-index-or-predicate-term-after-implying-term {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;
+    INSERT INTO t VALUES (-1, 1), (-3, 3), (-5, 5), (-8, 8), (10, 8);
+    SELECT a FROM t WHERE a > 5 AND (b < 5 OR a > 5) ORDER BY a;
+}
+expect {
+    10
+}
+
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-partial-index-or-predicate-term-after-implying-term {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;
+    EXPLAIN QUERY PLAN SELECT a FROM t WHERE a > 5 AND (b < 5 OR a > 5);
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX idx (a>?)
+}
+
+# Inside a larger term, the index WHERE expression is still evaluated, so the
+# index read must read b from the table.
+test partial-index-or-predicate-inside-larger-term {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;
+    INSERT INTO t VALUES (-1, 1), (-3, 3), (-5, 5), (-8, 8), (10, 8);
+    SELECT a FROM t WHERE a > 5 AND (b < 5 OR a > 5) = 1 ORDER BY a;
+}
+expect {
+    10
+}
+
+# The ON term of a later join filters the rows of v, not of t, so the index
+# on t does not consume it, and the index read must read b.
+test partial-index-or-predicate-in-on-term-of-later-join {
+    CREATE TABLE t (a, b);
+    CREATE TABLE v (y);
+    CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;
+    INSERT INTO t VALUES (-1, 1), (-3, 3), (-5, 5), (-8, 8), (10, 8), (12, 1);
+    INSERT INTO v VALUES (7), (9);
+    SELECT t.a, v.y FROM t LEFT JOIN v ON (t.b < 5 OR t.a > 5) WHERE t.a > 5 ORDER BY 1, 2;
+}
+expect {
+    10|7
+    10|9
+    12|7
+    12|9
+}
+
 # Partial index must NOT be used when the query only satisfies a subset of the
 # index WHERE conjuncts — the partial index would skip rows the query needs.
 @skip-if sqlite "query plan explanation output is different in sqlite"
@@ -1567,6 +1619,415 @@ expect {
 @setup partial_index_indexed_by_count_schema
 snapshot-eqp partial-index-indexed-by-count-star-without-predicate-counts-table-eqp {
     SELECT COUNT(*) FROM indexed_items INDEXED BY indexed_items_marker_null_idx;
+}
+
+setup partial_index_not_null_schema {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_a ON t1(a) WHERE b IS NOT NULL;
+    INSERT INTO t1 VALUES (1, 5), (2, NULL), (3, -7), (4, 0);
+}
+
+# Each WHERE term can be true only when b is not NULL, so it proves the index
+# predicate. INDEXED BY makes the query fail if the index is not usable.
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-implied-by-where-term {
+    SELECT 'b = 5', a FROM t1 INDEXED BY t1_a WHERE b = 5;
+    SELECT '0 > b', a FROM t1 INDEXED BY t1_a WHERE 0 > b;
+    SELECT 'b NOT IN (5)', a FROM t1 INDEXED BY t1_a WHERE b NOT IN (5);
+    SELECT 'b IN (SELECT 5)', a FROM t1 INDEXED BY t1_a WHERE b IN (SELECT 5);
+    SELECT 'b BETWEEN 1 AND 9', a FROM t1 INDEXED BY t1_a WHERE b BETWEEN 1 AND 9;
+    SELECT 'b + random() % 1 BETWEEN 1 AND 9', a FROM t1 INDEXED BY t1_a WHERE b + random() % 1 BETWEEN 1 AND 9;
+    SELECT 'b', a FROM t1 INDEXED BY t1_a WHERE b;
+    SELECT 'NOT b', a FROM t1 INDEXED BY t1_a WHERE NOT b;
+    SELECT '-b', a FROM t1 INDEXED BY t1_a WHERE -b;
+    SELECT '(b + 1) = 6', a FROM t1 INDEXED BY t1_a WHERE (b + 1) = 6;
+    SELECT 'b * 2', a FROM t1 INDEXED BY t1_a WHERE b * 2;
+    SELECT 'b COLLATE NOCASE = 5', a FROM t1 INDEXED BY t1_a WHERE b COLLATE NOCASE = 5;
+    SELECT 'b IS TRUE', a FROM t1 INDEXED BY t1_a WHERE b IS TRUE;
+    SELECT 'b IS FALSE', a FROM t1 INDEXED BY t1_a WHERE b IS FALSE;
+}
+expect {
+    b = 5|1
+    0 > b|3
+    b NOT IN (5)|3
+    b NOT IN (5)|4
+    b IN (SELECT 5)|1
+    b BETWEEN 1 AND 9|1
+    b + random() % 1 BETWEEN 1 AND 9|1
+    b|1
+    b|3
+    NOT b|4
+    -b|1
+    -b|3
+    (b + 1) = 6|1
+    b * 2|1
+    b * 2|3
+    b COLLATE NOCASE = 5|1
+    b IS TRUE|1
+    b IS TRUE|3
+    b IS FALSE|4
+}
+
+test partial-index-not-null-predicate-on-expression-implied-by-where-term {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_a ON t1(a) WHERE a + b IS NOT NULL;
+    INSERT INTO t1 VALUES (1, 5), (2, NULL);
+    SELECT a FROM t1 INDEXED BY t1_a WHERE a + b = 6;
+}
+expect {
+    1
+}
+
+test partial-index-notnull-keyword-predicate-implied-by-where-term {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_a ON t1(a) WHERE b NOTNULL;
+    INSERT INTO t1 VALUES (1, 5), (2, NULL);
+    SELECT a FROM t1 INDEXED BY t1_a WHERE b = 5;
+}
+expect {
+    1
+}
+
+# SQLite parses `b NOTNULL` and `b NOT NULL` like `b IS NOT NULL`, and
+# `b ISNULL` like `b IS NULL`.
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-implied-by-other-spellings {
+    SELECT 'b NOTNULL', a FROM t1 INDEXED BY t1_a WHERE b NOTNULL;
+    SELECT 'b NOT NULL', a FROM t1 INDEXED BY t1_a WHERE b NOT NULL;
+}
+expect {
+    b NOTNULL|1
+    b NOTNULL|3
+    b NOTNULL|4
+    b NOT NULL|1
+    b NOT NULL|3
+    b NOT NULL|4
+}
+
+test partial-index-notnull-keyword-predicate-implied-by-is-not-null {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_a ON t1(a) WHERE b NOTNULL;
+    INSERT INTO t1 VALUES (1, 5), (2, NULL);
+    SELECT a FROM t1 INDEXED BY t1_a WHERE b IS NOT NULL;
+}
+expect {
+    1
+}
+
+test partial-index-is-null-predicate-implied-by-other-spelling {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_is_null ON t1(a) WHERE b IS NULL;
+    CREATE INDEX t1_isnull ON t1(a) WHERE b ISNULL;
+    INSERT INTO t1 VALUES (1, 5), (2, NULL);
+    SELECT a FROM t1 INDEXED BY t1_is_null WHERE b ISNULL;
+    SELECT a FROM t1 INDEXED BY t1_isnull WHERE b IS NULL;
+}
+expect {
+    2
+    2
+}
+
+# `b = 5` rules out NULL, so it proves `b IS NOT NULL` but not `b IS NULL`.
+test partial-index-is-null-predicate-not-implied-by-comparison {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_is_null ON t1(a) WHERE b IS NULL;
+    SELECT a FROM t1 INDEXED BY t1_is_null WHERE b = 5;
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-not-implied-by-isnull {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE b ISNULL;
+}
+expect error {
+    no query solution
+}
+
+@skip-if sqlite "query plan explanation output is different in sqlite"
+@setup partial_index_not_null_schema
+test plan-partial-index-not-null-predicate-implied-by-where-term {
+    EXPLAIN QUERY PLAN SELECT a FROM t1 WHERE b = 5 AND a = 1;
+}
+expect {
+    1|0|0|SEARCH t1 USING INDEX t1_a (a=?)
+}
+
+# These WHERE terms are true for the row where b is NULL, which the index does
+# not have.
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-not-implied-by-is-not-true {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE b IS NOT TRUE;
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-not-implied-by-compared-is-true {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE (b IS TRUE) = 0;
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-not-implied-by-not-in-subquery {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE b NOT IN (SELECT 1 WHERE 0);
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-not-implied-by-compared-in-subquery {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE (b IN (SELECT 1 WHERE 0)) = 0;
+}
+expect error {
+    no query solution
+}
+
+test partial-index-null-is-not-null-predicate-never-implied {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_a ON t1(a) WHERE NULL IS NOT NULL;
+    SELECT a FROM t1 INDEXED BY t1_a WHERE b = NULL;
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-implied-by-left-join-on-term {
+    CREATE TABLE t2(c);
+    INSERT INTO t2 VALUES (1), (2);
+    SELECT t2.c, t1.a
+      FROM t2 LEFT JOIN t1 INDEXED BY t1_a ON t1.a = t2.c AND t1.b = 5
+     ORDER BY t2.c;
+}
+expect {
+    1|1
+    2|
+}
+
+# The read for unmatched right rows has no ON terms.
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-not-implied-for-unmatched-right-join-rows {
+    CREATE TABLE t2(c);
+    SELECT * FROM t2 RIGHT JOIN t1 INDEXED BY t1_a ON t1.b = 5;
+}
+expect error {
+    no query solution
+}
+
+setup partial_index_iif_schema {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_a ON t1(a) WHERE b = 5 OR b = 7;
+    INSERT INTO t1 VALUES (1, 5), (2, NULL), (3, 8);
+}
+
+# Each WHERE term is true only when its condition is true, so it proves what
+# the condition proves.
+@setup partial_index_iif_schema
+test partial-index-predicate-implied-by-iif-condition {
+    SELECT 'iif(b = 5, a)', a FROM t1 INDEXED BY t1_a WHERE iif(b = 5, a);
+    SELECT 'if(b = 5, a)', a FROM t1 INDEXED BY t1_a WHERE if(b = 5, a);
+    SELECT 'iif(b = 5, a, NULL)', a FROM t1 INDEXED BY t1_a WHERE iif(b = 5, a, NULL);
+    SELECT 'iif(b = 5, a, FALSE)', a FROM t1 INDEXED BY t1_a WHERE iif(b = 5, a, FALSE);
+    SELECT 'iif(b = 5, a, -0)', a FROM t1 INDEXED BY t1_a WHERE iif(b = 5, a, -0);
+    SELECT 'iif(iif(b = 5, a), a)', a FROM t1 INDEXED BY t1_a WHERE iif(iif(b = 5, a), a);
+    SELECT 'iif(b = 5 OR b = 7, a)', a FROM t1 INDEXED BY t1_a WHERE iif(b = 5 OR b = 7, a);
+    SELECT 'CASE WHEN b = 5 THEN a END', a FROM t1 INDEXED BY t1_a WHERE CASE WHEN b = 5 THEN a END;
+    SELECT 'CASE WHEN b = 5 THEN a ELSE 0 END', a FROM t1 INDEXED BY t1_a WHERE CASE WHEN b = 5 THEN a ELSE 0 END;
+}
+expect {
+    iif(b = 5, a)|1
+    if(b = 5, a)|1
+    iif(b = 5, a, NULL)|1
+    iif(b = 5, a, FALSE)|1
+    iif(b = 5, a, -0)|1
+    iif(iif(b = 5, a), a)|1
+    iif(b = 5 OR b = 7, a)|1
+    CASE WHEN b = 5 THEN a END|1
+    CASE WHEN b = 5 THEN a ELSE 0 END|1
+}
+
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-implied-by-iif-condition {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE iif(b = 5, a);
+}
+expect {
+    1
+}
+
+# The condition is evaluated, so a read of the index must read b even when
+# nothing else uses it.
+test partial-index-predicate-as-iif-condition-is-evaluated {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_a ON t1(a) WHERE b > 0;
+    INSERT INTO t1 VALUES (1, 1), (2, 5), (3, -1), (6, 3), (7, NULL);
+    SELECT 'iif(b > 0, 1)', a FROM t1 WHERE iif(b > 0, 1);
+    SELECT 'CASE WHEN b > 0 THEN 1 END', a FROM t1 WHERE CASE WHEN b > 0 THEN 1 END;
+    SELECT 'INDEXED BY, iif(b > 0, 1)', a FROM t1 INDEXED BY t1_a WHERE iif(b > 0, 1);
+    SELECT 'INDEXED BY, iif(b > 0, a)', a FROM t1 INDEXED BY t1_a WHERE iif(b > 0, a);
+}
+expect {
+    iif(b > 0, 1)|1
+    iif(b > 0, 1)|2
+    iif(b > 0, 1)|6
+    CASE WHEN b > 0 THEN 1 END|1
+    CASE WHEN b > 0 THEN 1 END|2
+    CASE WHEN b > 0 THEN 1 END|6
+    INDEXED BY, iif(b > 0, 1)|1
+    INDEXED BY, iif(b > 0, 1)|2
+    INDEXED BY, iif(b > 0, 1)|6
+    INDEXED BY, iif(b > 0, a)|1
+    INDEXED BY, iif(b > 0, a)|2
+    INDEXED BY, iif(b > 0, a)|6
+}
+
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-as-iif-condition-is-evaluated {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE iif(b IS NOT NULL, 1);
+}
+expect {
+    1
+    3
+    4
+}
+
+# The third value can be true for a row that the index does not have.
+@setup partial_index_iif_schema
+test partial-index-predicate-not-implied-by-iif-with-true-third-value {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE iif(b = 5, a, 1);
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_iif_schema
+test partial-index-predicate-not-implied-by-iif-with-real-third-value {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE iif(b = 5, a, 0.0);
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_iif_schema
+test partial-index-predicate-not-implied-by-iif-value {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE iif(a, b = 5);
+}
+expect error {
+    no query solution
+}
+
+# coalesce(x, y) can be true when x is NULL.
+@setup partial_index_iif_schema
+test partial-index-predicate-not-implied-by-other-function {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE coalesce(b = 5, a);
+}
+expect error {
+    no query solution
+}
+
+# With an operand, the WHEN value is compared with it, so it is not a condition.
+@setup partial_index_iif_schema
+test partial-index-predicate-not-implied-by-case-with-operand {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE CASE a WHEN b = 5 THEN a END;
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_iif_schema
+test partial-index-predicate-not-implied-by-case-with-two-conditions {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE CASE WHEN b = 5 THEN a WHEN b = 7 THEN a END;
+}
+expect error {
+    no query solution
+}
+
+setup partial_index_delete_all_schema {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_a ON t1(a) WHERE b > 0;
+    INSERT INTO t1 VALUES (1, 5), (2, NULL);
+}
+
+# SQLite erases the whole table without planning a scan, so it never checks
+# whether the INDEXED BY index is usable.
+@setup partial_index_delete_all_schema
+@cross-check-integrity
+test partial-index-indexed-by-delete-without-where-erases-table {
+    DELETE FROM t1 INDEXED BY t1_a;
+    SELECT count(*) FROM t1;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test partial-index-indexed-by-delete-without-where-ignores-unenforced-foreign-key {
+    PRAGMA foreign_keys = OFF;
+    CREATE TABLE t1(a PRIMARY KEY, b);
+    CREATE INDEX t1_b ON t1(b) WHERE b > 0;
+    CREATE TABLE t2(a REFERENCES t1(a));
+    INSERT INTO t1 VALUES (1, 5), (2, NULL);
+    DELETE FROM t1 INDEXED BY t1_b;
+    SELECT count(*) FROM t1;
+}
+expect {
+    0
+}
+
+# SQLite plans a scan for each of the DELETEs below, and the scan cannot use
+# the index.
+@setup partial_index_delete_all_schema
+test partial-index-indexed-by-delete-with-constant-where-rejected {
+    DELETE FROM t1 INDEXED BY t1_a WHERE 1;
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_delete_all_schema
+test partial-index-indexed-by-delete-returning-rejected {
+    DELETE FROM t1 INDEXED BY t1_a RETURNING a;
+}
+expect error {
+    no query solution
+}
+
+@requires trigger "the trigger makes SQLite delete row by row"
+@setup partial_index_delete_all_schema
+test partial-index-indexed-by-delete-with-trigger-rejected {
+    CREATE TABLE t2(a);
+    CREATE TRIGGER t1_delete AFTER DELETE ON t1 BEGIN INSERT INTO t2 VALUES (old.a); END;
+    DELETE FROM t1 INDEXED BY t1_a;
+}
+expect error {
+    no query solution
+}
+
+test partial-index-indexed-by-delete-from-foreign-key-parent-rejected {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE t1(a PRIMARY KEY, b);
+    CREATE INDEX t1_b ON t1(b) WHERE b > 0;
+    CREATE TABLE t2(a REFERENCES t1(a));
+    DELETE FROM t1 INDEXED BY t1_b;
+}
+expect error {
+    no query solution
+}
+
+test partial-index-indexed-by-delete-from-foreign-key-child-rejected {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE t1(a PRIMARY KEY);
+    CREATE TABLE t2(a REFERENCES t1(a), b);
+    CREATE INDEX t2_b ON t2(b) WHERE b > 0;
+    DELETE FROM t2 INDEXED BY t2_b;
+}
+expect error {
+    no query solution
 }
 
 setup partial_index_multi_index_or_schema {

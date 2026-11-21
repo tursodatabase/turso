@@ -105,6 +105,19 @@ CREATE INDEX idx_active_orders ON orders (customer_id)
 SELECT * FROM orders WHERE status = 'active' AND customer_id = 42;
 ```
 
+The query planner also uses a partial index whose `WHERE` clause is `column IS NOT NULL` when the `WHERE` clause of the query can be true only for a non-NULL value of that column.
+
+```sql
+-- Index only shipped orders
+CREATE INDEX idx_shipped_orders ON orders (customer_id)
+    WHERE shipped_at IS NOT NULL;
+
+-- shipped_at > '2026-01-01' is never true when shipped_at is NULL
+SELECT * FROM orders WHERE shipped_at > '2026-01-01' AND customer_id = 42;
+```
+
+A condition written as `iif(x, y)` or `CASE WHEN x THEN y END` is true only when `x` is true, so the query planner treats it like `x` when it checks whether a partial index matches.
+
 The `WHERE` clause of a partial index can reference any column of the table and may use operators, literal values, and deterministic built-in functions. Subqueries, bind parameters, non-deterministic functions such as `random()`, and `CURRENT_DATE`, `CURRENT_TIME`, and `CURRENT_TIMESTAMP` are not allowed.
 
 ## Expression Indexes

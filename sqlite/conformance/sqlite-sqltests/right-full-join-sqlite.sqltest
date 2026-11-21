@@ -226,6 +226,37 @@ expect {
     2|
 }
 
+# The read for unmatched right rows has no ON terms, so an ON term cannot
+# prove the partial index predicate there.
+test right-join-rejects-forced-partial-index-proven-only-by-on-term {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b, c);
+    CREATE INDEX t2_partial ON t2(b) WHERE c=5;
+    SELECT *
+      FROM t1 RIGHT JOIN t2 INDEXED BY t2_partial ON t2.c=5;
+}
+expect error {
+    no query solution
+}
+
+@cross-check-integrity
+test right-join-uses-forced-partial-index-proven-by-on-and-where-terms {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b, c);
+    CREATE INDEX t2_partial ON t2(b) WHERE c=5;
+    INSERT INTO t1 VALUES (2);
+    INSERT INTO t2 VALUES (2, 5), (3, 5), (4, 6);
+
+    SELECT t1.a, t2.b, t2.c
+      FROM t1 RIGHT JOIN t2 INDEXED BY t2_partial ON t1.a=t2.b AND t2.c=5
+     WHERE t2.c=5
+     ORDER BY t2.b;
+}
+expect {
+    2|2|5
+    |3|5
+}
+
 @cross-check-integrity
 test correlated-right-and-full-join-clear-return-address {
     CREATE TABLE q(o);
