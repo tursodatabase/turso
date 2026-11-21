@@ -357,7 +357,7 @@ expect {
     timestamp with time zone
     1
 }
-@sqlstate 0A000
+@sqlstate 42883
 expect @tursopg error {}
 
 @compat-gap "type:interval"
