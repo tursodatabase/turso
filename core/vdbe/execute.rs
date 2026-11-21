@@ -1459,12 +1459,18 @@ pub fn op_vopen(
     let CursorType::VirtualTable(virtual_table) = cursor_type else {
         panic!("VOpen on non-virtual table cursor");
     };
-    let cursor = virtual_table.open(connection.clone())?;
-    state
+    let slot = state
         .cursors
         .get_mut(*cursor_id)
-        .unwrap_or_else(|| panic!("cursor id {} out of bounds", *cursor_id))
-        .replace(Cursor::Virtual(cursor));
+        .unwrap_or_else(|| panic!("cursor id {} out of bounds", *cursor_id));
+    // A correlated subquery runs VOpen again for each outer row. The slot of a
+    // cursor id belongs to one virtual table in a program, and the VFilter
+    // after VOpen starts a new scan, so an internal cursor from an earlier run
+    // is kept with its buffers, as SQLite's OP_VOpen keeps an open cursor.
+    if !matches!(slot, Some(Cursor::Virtual(cursor)) if cursor.is_internal()) {
+        let cursor = virtual_table.open(connection.clone())?;
+        slot.replace(Cursor::Virtual(cursor));
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1534,20 +1540,22 @@ pub fn op_vfilter(
         insn
     );
     let has_rows = {
-        let cursor = get_cursor!(state, *cursor_id);
-        let cursor = cursor.as_virtual_mut();
-
-        let args = (0..*arg_count)
-            .map(|i| state.registers[args_reg + i].get_value().try_clone())
-            .try_collect::<Result<crate::alloc::Vec<_>>>()??;
         let idx_str = if let Some(idx_str) = idx_str {
             Some(state.registers[*idx_str].get_value().to_string())
         } else {
             None
         };
+        let cursor = get_cursor!(state, *cursor_id);
+        let cursor = cursor.as_virtual_mut();
         return_if_io!(
             state,
-            cursor.filter(*idx_num as i32, idx_str, *arg_count, args)
+            cursor.filter_with_json_cache(
+                *idx_num as i32,
+                idx_str,
+                &mut state.registers[*args_reg..*args_reg + *arg_count],
+                #[cfg(feature = "json")]
+                &state.json_cache,
+            )
         )
     };
     // Increment filter_operations metric for virtual table filter
@@ -1577,12 +1585,14 @@ pub fn op_vcolumn(
         },
         insn
     );
-    let value = {
-        let cursor = state.get_cursor(*cursor_id);
+    {
+        let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_virtual_mut();
-        return_if_io!(state, cursor.column(*column))
-    };
-    state.registers[*dest].set_value(value);
+        return_if_io!(
+            state,
+            cursor.column_into(*column, &mut state.registers[*dest])
+        );
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

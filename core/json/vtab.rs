@@ -1,21 +1,24 @@
 use crate::sync::{Arc, RwLock};
 use std::borrow::Cow;
 use std::iter::successors;
+use std::ops::Range;
 use std::result::Result;
 
 use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
 
 use crate::{
     json::{
-        convert_dbtype_to_jsonb, json_path_text,
-        jsonb::{IteratorState, Jsonb, SearchOperation},
+        convert_dbtype_to_jsonb, convert_ref_dbtype_into_jsonb, curry_convert_dbtype_into_jsonb,
+        find_in_blob, json_path_text,
+        jsonb::{find_path_element, IteratorState, Jsonb},
+        looks_like_jsonb_blob,
         path::{json_path, JsonPath, PathElement},
         vtab::columns::{Columns, Key},
-        Conv,
+        Conv, InBlob, JsonCacheCell,
     },
-    types::AsValueRef,
+    types::{AsValueRef, Text, TextSubtype},
     vtab::{column_definition, InternalVirtualTable, InternalVirtualTableCursor},
-    Connection, LimboError, Value,
+    Connection, LimboError, Value, ValueRef,
 };
 use turso_parser::ast;
 
@@ -265,8 +268,19 @@ impl InternalVirtualTableCursor for JsonEachCursor {
     fn filter(
         &mut self,
         args: &[Value],
+        idx_str: Option<String>,
+        idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        // An empty cache gives the conversion of the documents without it.
+        self.filter_with_json_cache(args, idx_str, idx_num, &JsonCacheCell::new())
+    }
+
+    fn filter_with_json_cache(
+        &mut self,
+        args: &[Value],
         _idx_str: Option<String>,
         _idx_num: i32,
+        json_cache: &JsonCacheCell,
     ) -> Result<bool, LimboError> {
         self.traversal_states.clear();
         self.pop_path_before_advance = false;
@@ -294,7 +308,31 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             ));
         }
 
-        let jsonb = convert_dbtype_to_jsonb(&args[0], Conv::Strict)?;
+        // The document is converted into the buffer that the cursor keeps,
+        // so that a filter for each row of an outer loop does not allocate.
+        // A JSONB blob with a root path is searched where it is, as
+        // read_path_element searches it, and only the element at the path is
+        // copied.
+        let document = args[0].as_value_ref();
+        let blob = match document {
+            ValueRef::Blob(blob) if args.len() > 1 && looks_like_jsonb_blob(blob) => Some(blob),
+            _ => None,
+        };
+        if blob.is_none() {
+            let json_cache = Some(json_cache)
+                .filter(|cache| matches!(document, ValueRef::Text(_)) && cache.has_documents());
+            match json_cache {
+                // A JSON function of the statement converts its arguments
+                // through the cache, and it can have parsed this document
+                // already, as in `doc->>'$.a' AND EXISTS (SELECT 1 FROM
+                // json_each(doc))`. The cache gives the same document as the
+                // conversion below. A statement with only json_each leaves the
+                // cache empty, so that its documents are not copied into the
+                // entries of the cache.
+                Some(json_cache) => self.copy_cached_document(document, json_cache)?,
+                None => convert_ref_dbtype_into_jsonb(document, Conv::Strict, &mut self.json)?,
+            }
+        }
         // The path is parsed after the document, so that a bad document
         // gives its error first. The parsed path is for the search and for
         // the path of the cursor.
@@ -310,15 +348,41 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             unreachable!("the root path is set above");
         };
 
-        let (root_json, root_offset, root_id) = if args.len() == 1 {
-            (jsonb, 0, 0)
-        } else if let Some(found) = navigate_to_path(jsonb, root_json_path)? {
-            found
+        let (root_offset, root_id) = if args.len() == 1 {
+            (0, 0)
         } else {
-            return Ok(false);
+            let found = match blob.map(|blob| (blob, find_in_blob(blob, root_json_path))) {
+                Some((blob, InBlob::Element(target))) => {
+                    self.json.set_data(&blob[target.start..target.end])?;
+                    Some(target)
+                }
+                Some((_, InBlob::Nothing)) => None,
+                // A blob with malformed data on the path is converted like
+                // other values, which checks the whole blob, and reads a blob
+                // that is not JSONB as JSON text.
+                Some((_, InBlob::Malformed)) | None => {
+                    if blob.is_some() {
+                        convert_ref_dbtype_into_jsonb(document, Conv::Strict, &mut self.json)?;
+                    }
+                    let target = find_path_element(self.json.as_bytes(), root_json_path)
+                        .ok()
+                        .flatten();
+                    if let Some(target) = target {
+                        self.json.keep_only_element(target);
+                    }
+                    target
+                }
+            };
+            let Some(target) = found else {
+                return Ok(false);
+            };
+            let value_offset = target.start as i64;
+            (
+                value_offset,
+                target.key.map_or(value_offset, |offset| offset as i64),
+            )
         };
 
-        self.json = root_json;
         self.root_offset = root_offset;
         self.id = root_id;
         self.path_to_current_value.set(&root_path, root_json_path);
@@ -376,9 +440,78 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             _ => Value::Null,
         })
     }
+
+    /// Writes the text columns into the buffer of `value` when `value` is a
+    /// text: the key of an object member, the fullkey and path columns, and
+    /// the value and atom columns of a string with no escape. The other
+    /// columns are the values of [Self::column].
+    fn column_into(&self, idx: usize, value: &mut Value) -> Result<(), LimboError> {
+        // Only a text with a buffer of its own has a buffer to write into.
+        if !matches!(
+            value,
+            Value::Text(Text {
+                value: Cow::Owned(_),
+                ..
+            })
+        ) {
+            *value = self.column(idx)?;
+            return Ok(());
+        }
+        let path = &self.path_to_current_value.string;
+        let text = match idx {
+            COL_VALUE | COL_ATOM => self.columns.plain_string(),
+            COL_KEY => self.columns.key_name(self.path_to_current_value.key()),
+            COL_FULLKEY => Some(Cow::Borrowed(self.columns.fullkey_text(path))),
+            COL_PATH => Some(Cow::Borrowed(self.columns.path_text(path))),
+            _ => None,
+        };
+        match text {
+            Some(text) => set_text(value, text.as_ref()),
+            None => {
+                *value = self.column(idx)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Makes `value` the text `text`, in the buffer of `value` when `value` is a
+/// text with a buffer of its own.
+fn set_text(value: &mut Value, text: &str) -> Result<(), LimboError> {
+    if let Value::Text(Text {
+        value: Cow::Owned(buffer),
+        subtype,
+    }) = value
+    {
+        buffer.clear();
+        buffer.try_reserve(text.len())?;
+        buffer.push_str(text);
+        *subtype = TextSubtype::Text;
+        return Ok(());
+    }
+    *value = Value::Text(Text::new(text.to_owned()));
+    Ok(())
 }
 
 impl JsonEachCursor {
+    /// Copies the document of `document` in `json_cache` into the buffer of
+    /// the cursor. A document that is not in the cache enters it.
+    ///
+    /// This is a separate function, so that the filter stays small
+    /// enough for the compiler to inline the helpers that it calls.
+    #[inline(never)]
+    fn copy_cached_document(
+        &mut self,
+        document: ValueRef<'_>,
+        json_cache: &JsonCacheCell,
+    ) -> Result<(), LimboError> {
+        json_cache.with_jsonb(
+            document,
+            curry_convert_dbtype_into_jsonb(Conv::Strict),
+            |json| Ok(self.json.set_data(json.as_bytes())?),
+        )
+    }
+
     fn advance(&mut self) -> Result<bool, LimboError> {
         if std::mem::take(&mut self.pop_path_before_advance) {
             self.path_to_current_value.pop();
@@ -516,30 +649,6 @@ fn json_iterator_from(json: &Jsonb) -> crate::Result<IteratorState> {
         }
     }
 }
-/// Returns the element of `jsonb` at `json_path`, in the buffer of `jsonb`,
-/// with its offset and its id.
-fn navigate_to_path(
-    mut jsonb: Jsonb,
-    json_path: &JsonPath,
-) -> Result<Option<(Jsonb, i64, i64)>, LimboError> {
-    let mut search_operation = SearchOperation::new();
-    if jsonb
-        .operate_on_path(json_path, &mut search_operation)
-        .is_err()
-    {
-        return Ok(None);
-    }
-    let value_offset = search_operation.value_offset() as i64;
-    let root_id = search_operation
-        .label_offset()
-        .map_or(value_offset, |offset| offset as i64);
-    Ok(Some((
-        search_operation.into_element(jsonb),
-        value_offset,
-        root_id,
-    )))
-}
-
 mod columns {
     use crate::{
         json::{
@@ -550,6 +659,7 @@ mod columns {
         types::Text,
         LimboError, Value,
     };
+    use std::borrow::Cow;
 
     #[derive(Debug, Clone, Copy)]
     pub(super) enum Key<'a> {
@@ -629,6 +739,21 @@ mod columns {
             })
         }
 
+        /// The text of the value of the current row, when the value is a string
+        /// with no escape. The value and atom columns are this text.
+        pub(super) fn plain_string(&self) -> Option<Cow<'_, str>> {
+            jsonb::plain_string_payload(self.value.as_bytes()).map(jsonb::utf8_lossy)
+        }
+
+        /// The key column, when it is the name of an object member.
+        /// `last_element` is the last element of the path of the cursor.
+        pub(super) fn key_name<'a>(&self, last_element: Key<'a>) -> Option<Cow<'a, str>> {
+            match last_element {
+                Key::String(name) if self.has_key => Some(Cow::Borrowed(name)),
+                _ => None,
+            }
+        }
+
         /// `last_element` is the last element of the path of the cursor.
         pub(super) fn key(&self, last_element: Key<'_>) -> Value {
             if self.has_key {
@@ -682,15 +807,22 @@ mod columns {
 
         /// `path` is the path of the cursor.
         pub(super) fn fullkey(&self, path: &str) -> Value {
-            Value::Text(Text::new(path_prefix(path, self.fullkey_len)))
+            Value::Text(Text::new(self.fullkey_text(path).to_owned()))
+        }
+
+        /// The text of the fullkey column. `path` is the path of the cursor.
+        pub(super) fn fullkey_text<'a>(&self, path: &'a str) -> &'a str {
+            path_prefix(path, self.fullkey_len)
         }
 
         /// `path` is the path of the cursor.
         pub(super) fn path(&self, path: &str) -> Value {
-            Value::Text(Text::new(path_prefix(
-                path,
-                self.innermost_container_path_len,
-            )))
+            Value::Text(Text::new(self.path_text(path).to_owned()))
+        }
+
+        /// The text of the path column. `path` is the path of the cursor.
+        pub(super) fn path_text<'a>(&self, path: &'a str) -> &'a str {
+            path_prefix(path, self.innermost_container_path_len)
         }
 
         pub(super) fn parent(&self) -> Value {
@@ -725,8 +857,8 @@ mod columns {
 
     /// The first `len` bytes of the path of the cursor. The lengths come from
     /// the path itself, so they are in range while the cursor is on a row.
-    fn path_prefix(path: &str, len: usize) -> String {
-        path.get(..len).unwrap_or_default().to_owned()
+    fn path_prefix(path: &str, len: usize) -> &str {
+        path.get(..len).unwrap_or_default()
     }
 }
 
@@ -734,8 +866,8 @@ struct InPlaceJsonPath {
     string: String,
     element_lengths: Vec<usize>,
     last_element: LastElement,
-    /// The unescaped name of the last element when it is an object member. The buffer stays
-    /// when the last element becomes an array index, so that the next name does not allocate.
+    /// The unescaped name of the last element when it is [`LastElement::Name`]. The buffer
+    /// stays when the last element changes, so that the next name does not allocate.
     last_name: String,
 }
 
@@ -745,6 +877,12 @@ enum LastElement {
     Index(i64),
     /// An object member, with its name in `last_name`.
     Name,
+    /// An object member whose key has no escape, with its name at `start..end` in the path
+    /// string. The path writes such a name as it is.
+    NameInPath {
+        start: usize,
+        end: usize,
+    },
     None,
 }
 
@@ -786,8 +924,13 @@ impl InPlaceJsonPath {
         // A key with no escape is its own name, so it needs no JSON text.
         if let Some(payload) = jsonb::plain_string_payload(key) {
             let name = jsonb::utf8_lossy(payload);
-            self.set_last_element_name(&name);
-            self.push_object_name(&name);
+            // The key column reads the name from the path, so that the name
+            // is copied once for each member.
+            let name_in_path = self.push_object_name(&name);
+            self.last_element = LastElement::NameInPath {
+                start: name_in_path.start,
+                end: name_in_path.end,
+            };
             return Ok(());
         }
         let key = Jsonb::from_raw_data(key)?;
@@ -820,15 +963,17 @@ impl InPlaceJsonPath {
     }
 
     /// Makes `name` the last element. The name is written in the buffer of
-    /// the name before it, if there is one, so that the members of an
-    /// object do not allocate a name each.
+    /// the name before it, if there is one, so that each filter of the
+    /// cursor does not allocate a name.
     fn set_last_element_name(&mut self, name: &str) {
         self.last_name.clear();
         self.last_name.push_str(name);
         self.last_element = LastElement::Name;
     }
 
-    fn push_object_name(&mut self, name: &str) {
+    /// Appends the element of the object member `name`, and returns the range
+    /// of `name` in the path string.
+    fn push_object_name(&mut self, name: &str) -> Range<usize> {
         // This follows SQLite's current quoting scheme, but it is not part of the stable API.
         // See https://sqlite.org/forum/forumpost?udc=1&name=be212a295ed8df4c
         let mut chars = name.chars();
@@ -839,6 +984,7 @@ impl InPlaceJsonPath {
             }
         };
         let start = self.string.len();
+        let name_start = start + 1 + usize::from(needs_quotes);
         self.string.push('.');
         if needs_quotes {
             self.string.push('"');
@@ -848,6 +994,7 @@ impl InPlaceJsonPath {
             self.string.push_str(name);
         }
         self.element_lengths.push(self.string.len() - start);
+        name_start..name_start + name.len()
     }
 
     /// True when a stored name holds a control character or a double quote that is not part of
@@ -928,7 +1075,92 @@ impl InPlaceJsonPath {
         match self.last_element {
             LastElement::Index(idx) => Key::Integer(idx),
             LastElement::Name => Key::String(&self.last_name),
+            LastElement::NameInPath { start, end } => Key::String(&self.string[start..end]),
             LastElement::None => Key::None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn filter_reads_a_text_document_from_a_json_cache_with_documents() {
+        let cache = JsonCacheCell::new();
+        let doc = Value::build_text(r#"{"a":[1,2]}"#);
+        let mut cursor = JsonEachCursor::empty(JsonTraversalMode::Each);
+
+        // An empty cache stays empty.
+        assert!(cursor
+            .filter_with_json_cache(std::slice::from_ref(&doc), None, 0, &cache)
+            .unwrap());
+        assert_eq!(cursor.column(COL_KEY).unwrap(), Value::build_text("a"));
+        assert!(!cache.has_documents());
+
+        // The cache holds another document for the same text, so the key of
+        // the row shows which document the cursor read.
+        cache
+            .with_jsonb(
+                &doc,
+                |_, json| {
+                    *json = Jsonb::from_str(r#"{"b":3}"#).unwrap();
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(cursor
+            .filter_with_json_cache(std::slice::from_ref(&doc), None, 0, &cache)
+            .unwrap());
+        assert_eq!(cursor.column(COL_KEY).unwrap(), Value::build_text("b"));
+
+        // Without the cache, the cursor parses the document.
+        assert!(cursor.filter(std::slice::from_ref(&doc), None, 0).unwrap());
+        assert_eq!(cursor.column(COL_KEY).unwrap(), Value::build_text("a"));
+    }
+
+    /// The buffer of a text value, or None for other values.
+    fn text_buffer(value: &Value) -> Option<*const u8> {
+        match value {
+            Value::Text(Text {
+                value: Cow::Owned(text),
+                ..
+            }) => Some(text.as_ptr()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn column_into_writes_the_column_into_the_buffer_of_the_register() {
+        let mut cursor = JsonEachCursor::empty(JsonTraversalMode::Tree);
+        let doc = Value::build_text(r#"{"a":"x","bb":["yy",1,{"c":null}],"d":"e\"f","é":2.5}"#);
+        assert!(cursor.filter(&[doc], None, 0).unwrap());
+        let mut values: Vec<Value> = (0..COL_JSON)
+            .map(|_| Value::build_text(String::with_capacity(64)))
+            .collect();
+        let fullkey_buffer = text_buffer(&values[COL_FULLKEY]);
+        let mut rows = 0;
+        loop {
+            for (column, value) in values.iter_mut().enumerate() {
+                cursor.column_into(column, value).unwrap();
+                let expected = cursor.column(column).unwrap();
+                assert_eq!(*value, expected, "row {rows}, column {column}");
+                if let (Value::Text(value), Value::Text(expected)) = (&*value, &expected) {
+                    assert_eq!(
+                        value.subtype, expected.subtype,
+                        "row {rows}, column {column}"
+                    );
+                }
+            }
+            // The fullkey column is a text on each row, so it keeps its buffer.
+            assert_eq!(text_buffer(&values[COL_FULLKEY]), fullkey_buffer);
+            rows += 1;
+            if !cursor.next().unwrap() {
+                break;
+            }
+        }
+        assert_eq!(rows, 9);
     }
 }

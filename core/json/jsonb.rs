@@ -67,6 +67,174 @@ const fn make_plain_string_end_table(quote: u8) -> [bool; 256] {
 
 static ENDS_SINGLE_QUOTED_PLAIN_PART: [bool; 256] = make_plain_string_end_table(b'\'');
 
+/// The length of the part of `rest` that a string quoted with `quote` copies as
+/// it is: the offset of the first `quote`, backslash or control character in
+/// `rest`, or the length of `rest`. `quote` is `"` or `'`.
+#[inline(always)]
+fn plain_part_len(rest: &[u8], quote: u8) -> usize {
+    let ends_plain_part = if quote == b'"' {
+        &ESCAPED_IN_TEXT
+    } else {
+        &ENDS_SINGLE_QUOTED_PLAIN_PART
+    };
+    first_marked_byte::<true, false>(rest, rest.len(), quote, ends_plain_part)
+}
+
+/// The length of the start of the first `len` bytes of `rest` that the JSON
+/// text of a string copies as it is: the offset of the first byte to escape,
+/// or `len`. The bytes to escape are the control characters, and with
+/// `escape_quote_and_backslash` also `"` and the backslash. `len` is at most
+/// the length of `rest`.
+#[inline(always)]
+fn escape_free_len(rest: &[u8], len: usize, escape_quote_and_backslash: bool) -> usize {
+    if escape_quote_and_backslash {
+        first_marked_byte::<true, true>(rest, len, b'"', &ESCAPED_IN_TEXT)
+    } else {
+        first_marked_byte::<false, true>(rest, len, 0, &ESCAPED_IN_TEXTJ)
+    }
+}
+
+/// Appends the JSON text of the string `text`, without the quotes, to
+/// `string`. The control characters are escaped, and with
+/// `escape_quote_and_backslash` also `"` and the backslash. `scanned` starts
+/// with the bytes of `text` and can have more bytes after them, which the scan
+/// for the bytes to escape can read and ignore.
+#[inline(always)]
+fn push_escaped_text(
+    string: &mut String,
+    text: &str,
+    scanned: &[u8],
+    escape_quote_and_backslash: bool,
+) {
+    let len = escape_free_len(scanned, text.len(), escape_quote_and_backslash);
+    // Usually there is no byte to escape, and the JSON text of the string is
+    // the string itself.
+    if len == text.len() {
+        string.push_str(text);
+        return;
+    }
+    push_text_with_escapes(string, text, scanned, len, escape_quote_and_backslash);
+}
+
+/// [push_escaped_text] for a string with a byte to escape at `first_escape`.
+/// The bytes to escape are ASCII, so each part between them is UTF-8.
+#[inline(never)]
+fn push_text_with_escapes(
+    string: &mut String,
+    text: &str,
+    scanned: &[u8],
+    first_escape: usize,
+    escape_quote_and_backslash: bool,
+) {
+    let mut pos = 0;
+    let mut len = first_escape;
+    loop {
+        string.push_str(&text[pos..pos + len]);
+        pos += len;
+        let Some(&b) = text.as_bytes().get(pos) else {
+            return;
+        };
+        pos += 1;
+        match b {
+            b'"' => string.push_str("\\\""),
+            b'\\' => string.push_str("\\\\"),
+            0x08 => string.push_str("\\b"),
+            0x0C => string.push_str("\\f"),
+            b'\n' => string.push_str("\\n"),
+            b'\r' => string.push_str("\\r"),
+            b'\t' => string.push_str("\\t"),
+            c => {
+                let _ = write!(string, "\\u{c:04x}");
+            }
+        }
+        len = escape_free_len(
+            &scanned[pos..],
+            text.len() - pos,
+            escape_quote_and_backslash,
+        );
+    }
+}
+
+/// The offset of the first of the first `limit` bytes of `rest` that `table`
+/// marks, or `limit`. `table` marks the control characters, and with
+/// `QUOTE_AND_BACKSLASH` also `quote` and the backslash. `limit` is at most
+/// the length of `rest`, and without `BOUNDED` it is the length of `rest`.
+///
+/// On x86_64, each step tests 16 bytes with SSE2, which is part of the x86_64
+/// baseline. With `BOUNDED`, a step can read bytes of `rest` after `limit`, and
+/// ignores them, so a short string followed by more of the document is tested
+/// in one step. The last bytes, and the bytes on other targets, are tested one
+/// at a time with `table`.
+///
+/// The parser scans to the end of `rest`, and stops at the closing quote. The
+/// checks of `limit` cost the parser about 4% with Rust 1.88, so its copy of
+/// this function has no limit.
+#[inline(always)]
+fn first_marked_byte<const QUOTE_AND_BACKSLASH: bool, const BOUNDED: bool>(
+    rest: &[u8],
+    limit: usize,
+    quote: u8,
+    table: &[bool; 256],
+) -> usize {
+    debug_assert!(limit <= rest.len());
+    #[cfg(target_arch = "x86_64")]
+    let start = {
+        use std::arch::x86_64::{
+            _mm_cmpeq_epi8, _mm_loadu_si128, _mm_min_epu8, _mm_movemask_epi8, _mm_or_si128,
+            _mm_set1_epi8,
+        };
+        let mut offset = 0;
+        // SAFETY: SSE2 is part of the x86_64 baseline, so the intrinsics are
+        // available, and the loop condition keeps each unaligned 16-byte load
+        // inside `rest`.
+        unsafe {
+            let quotes = _mm_set1_epi8(quote as i8);
+            let backslashes = _mm_set1_epi8(b'\\' as i8);
+            let last_control = _mm_set1_epi8(0x1F);
+            while (!BOUNDED || offset < limit) && offset + 16 <= rest.len() {
+                let chunk = _mm_loadu_si128(rest.as_ptr().add(offset).cast());
+                // A byte is a control character when it is at most 0x1F, that
+                // is, when the unsigned minimum with 0x1F is the byte.
+                let mut marked = _mm_cmpeq_epi8(_mm_min_epu8(chunk, last_control), chunk);
+                if QUOTE_AND_BACKSLASH {
+                    marked = _mm_or_si128(
+                        marked,
+                        _mm_or_si128(
+                            _mm_cmpeq_epi8(chunk, quotes),
+                            _mm_cmpeq_epi8(chunk, backslashes),
+                        ),
+                    );
+                }
+                let mut mask = _mm_movemask_epi8(marked) as u32;
+                if BOUNDED && limit - offset < 16 {
+                    // The bytes after `limit` are not part of the scan.
+                    mask &= (1 << (limit - offset)) - 1;
+                }
+                if mask != 0 {
+                    return offset + mask.trailing_zeros() as usize;
+                }
+                offset += 16;
+            }
+        }
+        offset
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let start = 0;
+    if BOUNDED && start >= limit {
+        return limit;
+    }
+    let tail = if BOUNDED {
+        &rest[start..limit]
+    } else {
+        &rest[start..]
+    };
+    start
+        + tail
+            .iter()
+            .position(|&c| table[c as usize])
+            .unwrap_or(tail.len())
+}
+
 /// The 1-byte headers of TEXT elements with a payload of 0 to 11 bytes. The
 /// string parser reads the header from this table after its scan. When it
 /// computed the header from the length, the compiler computed it in each
@@ -728,87 +896,6 @@ impl PathOperation for InsertOperation {
     }
 }
 
-/// A search for the element at a path. The search does not copy the element:
-/// the caller gets it with [Self::element_in] or [Self::into_element].
-pub struct SearchOperation {
-    mode: PathOperationMode,
-    value_offset: usize,
-    /// The offset after the element that the search found, or 0.
-    value_end: usize,
-    label_offset: Option<usize>,
-}
-
-impl SearchOperation {
-    pub fn new() -> Self {
-        Self {
-            mode: PathOperationMode::ReplaceExisting,
-            value_offset: 0,
-            value_end: 0,
-            label_offset: None,
-        }
-    }
-
-    /// Returns the element that the search found in `json`, in the buffer of
-    /// `json`: the element moves to the start of the buffer, and the bytes
-    /// after it are cut off. Returns an empty document if the search found
-    /// nothing.
-    ///
-    /// The buffer keeps its capacity, so this is for a caller that converts
-    /// the element and then drops it.
-    pub fn into_element(self, mut json: Jsonb) -> Jsonb {
-        if self.value_end == 0 {
-            return Jsonb::empty();
-        }
-        json.data.copy_within(self.value_offset..self.value_end, 0);
-        json.data.truncate(self.value_end - self.value_offset);
-        json
-    }
-
-    /// Returns the bytes of the element that the search found in `json`, or
-    /// no bytes if the search found nothing.
-    pub fn element_in<'a>(&self, json: &'a Jsonb) -> &'a [u8] {
-        &json.data[self.value_offset..self.value_end]
-    }
-
-    pub fn value_offset(&self) -> usize {
-        self.value_offset
-    }
-
-    pub fn label_offset(&self) -> Option<usize> {
-        self.label_offset
-    }
-}
-
-impl PathOperation for SearchOperation {
-    fn operation_mode(&self) -> PathOperationMode {
-        self.mode
-    }
-
-    fn execute(&mut self, json: &mut Jsonb, mut stack: TraversalStack) -> Result<()> {
-        let target = stack.pop().ok_or_else(|| {
-            LimboError::InternalError("stack should not be empty after check".to_string())
-        })?;
-        let (idx, label_idx) = match (target.get_array_index(), target.field_key_index) {
-            (Some(idx), _) => (idx, None),
-            (None, JsonLocationKind::ObjectProperty(key_idx)) => {
-                (target.field_value_index, Some(key_idx))
-            }
-            (None, _) => (target.field_value_index, None),
-        };
-        let (JsonbHeader(_, size), header_size) = json.read_header(idx)?;
-        let end = json.element_end(idx, &[header_size, size])?;
-        self.value_offset = idx;
-        self.value_end = end;
-        self.label_offset = label_idx;
-
-        Ok(())
-    }
-
-    fn changes_document(&self) -> bool {
-        false
-    }
-}
-
 impl JsonTraversalResult {
     pub fn new(field_value_index: usize, field_key_index: JsonLocationKind, delta: isize) -> Self {
         Self {
@@ -1172,13 +1259,25 @@ impl Jsonb {
         Ok(result)
     }
 
-    /// Returns the decoded text of the single string element this
-    /// document holds, unescaping straight from the stored payload.
-    /// This cannot go through [Jsonb::to_string], because JSON text
-    /// rendering translates the JSON5 \v escape to \u0009 for SQLite
-    /// bug-compatibility, while extraction must yield the real 0x0B.
-    pub fn scalar_string_value(&self) -> Result<String> {
-        Ok(unescape_string(&self.scalar_payload_text()?))
+    /// Returns the JSON text of `element`, an element of this document.
+    pub(crate) fn element_to_string(&self, element: PathTarget) -> Result<String> {
+        let mut result = String::with_capacity((element.end - element.start) * 2);
+        self.serialize_value(&mut result, element.start, 0, &JsonIndentation::None)?;
+        Ok(result)
+    }
+
+    /// The bytes of the document.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Makes `element`, an element of this document, the whole document: the
+    /// element moves to the start of the buffer, and the bytes after it are
+    /// cut off. The buffer keeps its capacity, so this is for a caller that
+    /// reads the element and then drops it.
+    pub(crate) fn keep_only_element(&mut self, element: PathTarget) {
+        self.data.copy_within(element.start..element.end, 0);
+        self.data.truncate(element.end - element.start);
     }
 
     pub fn scalar_payload_text(&self) -> Result<Cow<'_, str>> {
@@ -1198,18 +1297,7 @@ impl Jsonb {
     /// Returns the payload of the element at the start of the document, or
     /// None when its header is malformed or the payload runs past the end.
     pub fn scalar_payload(&self) -> Option<&[u8]> {
-        let (JsonbHeader(_, len), header_size) = self.read_header(0).ok()?;
-        let payload_end = header_size.checked_add(len)?;
-        self.data.get(header_size..payload_end)
-    }
-
-    /// Returns the payload of the string element at the start of the document
-    /// when its JSON text has no escape: the element is TEXT, TEXTJ or TEXTRAW,
-    /// and the payload has no `"`, `\` or control character. The JSON text of
-    /// the string is then the payload in quotes, and its decoded text is the
-    /// payload.
-    pub fn plain_string_payload(&self) -> Option<&[u8]> {
-        plain_string_payload(&self.data)
+        scalar_payload(&self.data)
     }
 
     pub fn to_string_pretty(&self, indentation: Option<&str>) -> Result<String> {
@@ -1427,46 +1515,28 @@ impl Jsonb {
 
         match kind {
             ElementType::TEXT | ElementType::TEXTRAW | ElementType::TEXTJ => {
-                let escaped = if *kind == ElementType::TEXTJ {
-                    &ESCAPED_IN_TEXTJ
-                } else {
-                    &ESCAPED_IN_TEXT
-                };
-                // Usually the payload is UTF-8 with no byte to escape, and
-                // its JSON text is the payload itself.
-                if let Some(text) = validate_utf8(word_slice)
-                    .filter(|text| !text.bytes().any(|b| escaped[b as usize]))
-                {
-                    string.push_str(text);
-                    if quote {
-                        string.push('"');
-                    }
-                    return Ok(end_cursor);
-                }
-                let word = utf8_lossy(word_slice);
-
-                let mut last_end = 0;
-                let bytes = word.as_bytes();
-                for i in 0..bytes.len() {
-                    let b = bytes[i];
-                    if escaped[b as usize] {
-                        string.push_str(&word[last_end..i]);
-                        match b {
-                            b'"' => string.push_str("\\\""),
-                            b'\\' => string.push_str("\\\\"),
-                            0x08 => string.push_str("\\b"),
-                            0x0C => string.push_str("\\f"),
-                            b'\n' => string.push_str("\\n"),
-                            b'\r' => string.push_str("\\r"),
-                            b'\t' => string.push_str("\\t"),
-                            c => {
-                                let _ = write!(string, "\\u{c:04x}");
-                            }
-                        }
-                        last_end = i + 1;
+                // A TEXTJ payload holds its quotes and backslashes as escapes
+                // already, so only its control characters are escaped.
+                let escape_quote_and_backslash = *kind != ElementType::TEXTJ;
+                match validate_utf8(word_slice) {
+                    // The bytes after the payload in the document let the scan
+                    // test 16 bytes at a time also for a short string.
+                    Some(text) => push_escaped_text(
+                        string,
+                        text,
+                        &self.data[cursor..],
+                        escape_quote_and_backslash,
+                    ),
+                    None => {
+                        let text = String::from_utf8_lossy(word_slice);
+                        push_escaped_text(
+                            string,
+                            &text,
+                            text.as_bytes(),
+                            escape_quote_and_backslash,
+                        );
                     }
                 }
-                string.push_str(&word[last_end..]);
             }
 
             // We have to escape some JSON5 escape sequences
@@ -2025,42 +2095,34 @@ impl Jsonb {
         }
         pos += 1; // consume quote
 
-        let quoted = quote == b'"' || quote == b'\'';
-
-        if quoted {
-            // A string with no escape and no control character ends at the
-            // first quote, and its payload is the bytes before the quote.
-            let ends_plain_part = if quote == b'"' {
-                &ESCAPED_IN_TEXT
-            } else {
-                &ENDS_SINGLE_QUOTED_PLAIN_PART
-            };
-            let rest = &input[pos..];
-            let len = rest
-                .iter()
-                .position(|&c| ends_plain_part[c as usize])
-                .unwrap_or(rest.len());
-            if rest.get(len) == Some(&quote) {
-                let end_pos = pos + len;
-                let header_pos = self.data.len();
-
-                // Write header and content
-                if let Some(&header) = TEXT_HEADERS.get(len) {
-                    self.data.push(header);
-                } else {
-                    self.write_element_header(header_pos, ElementType::TEXT, len, false)
-                        .map_err(|_| PError::Message {
-                            msg: "Failed to write header".to_string(),
-                            location: Some(pos),
-                        })?;
-                }
-
-                self.data.extend_from_slice(&rest[..len]);
-                return Ok(end_pos + 1); // Skip past closing quote
-            }
+        if quote != b'"' && quote != b'\'' {
+            return self.deserialize_unquoted_key(input, pos, string_start, quote);
         }
 
-        self.deserialize_string_with_escapes(input, pos, string_start, quote, info)
+        // A string with no escape and no control character ends at the first
+        // quote, and its payload is the bytes before the quote.
+        let rest = &input[pos..];
+        let len = plain_part_len(rest, quote);
+        if rest.get(len) == Some(&quote) {
+            let end_pos = pos + len;
+            let header_pos = self.data.len();
+
+            // Write header and content
+            if let Some(&header) = TEXT_HEADERS.get(len) {
+                self.data.push(header);
+            } else {
+                self.write_element_header(header_pos, ElementType::TEXT, len, false)
+                    .map_err(|_| PError::Message {
+                        msg: "Failed to write header".to_string(),
+                        location: Some(pos),
+                    })?;
+            }
+
+            self.data.extend_from_slice(&rest[..len]);
+            return Ok(end_pos + 1); // Skip past closing quote
+        }
+
+        self.deserialize_string_with_escapes(input, pos, pos + len, string_start, quote, info)
     }
 
     /// Parses the double-quoted object key at `pos`, as
@@ -2075,10 +2137,7 @@ impl Jsonb {
         info: &mut ParseInfo,
     ) -> PResult<usize> {
         if let Some(rest) = input.get(pos + 1..) {
-            let len = rest
-                .iter()
-                .position(|&c| ESCAPED_IN_TEXT[c as usize])
-                .unwrap_or(rest.len());
+            let len = plain_part_len(rest, b'"');
             if let (Some(b'"'), Some(&header)) = (rest.get(len), TEXT_HEADERS.get(len)) {
                 self.data.push(header);
                 self.data.extend_from_slice(&rest[..len]);
@@ -2088,11 +2147,16 @@ impl Jsonb {
         self.deserialize_string(input, pos, info)
     }
 
-    /// Parses the rest of a string that [Self::deserialize_string] cannot copy
-    /// as it is: a string with an escape or a control character, an unclosed
-    /// string, or an unquoted JSON5 key. `pos` is the offset after `quote`,
-    /// the first byte of the string, and `string_start` is the offset of the
-    /// element in the document.
+    /// Parses the rest of a quoted string that [Self::deserialize_string]
+    /// cannot copy as it is: a string with an escape or a control character,
+    /// or an unclosed string. `start` is the offset after `quote`, `special` is
+    /// the offset of the first byte that ends the plain part of the string, and
+    /// `string_start` is the offset of the element in the document.
+    ///
+    /// The payload of the element is the input between the quotes, because
+    /// JSONB keeps the escapes as they are. Thus the function checks the
+    /// escapes and finds the end of the string first, and then writes the
+    /// header and copies the payload once.
     ///
     /// This is a separate function so that the loop of the plain case in
     /// [Self::deserialize_string] has few live values.
@@ -2100,271 +2164,158 @@ impl Jsonb {
     fn deserialize_string_with_escapes(
         &mut self,
         input: &[u8],
-        mut pos: usize,
+        start: usize,
+        special: usize,
         string_start: usize,
         quote: u8,
         info: &mut ParseInfo,
     ) -> PResult<usize> {
-        let quoted = quote == b'"' || quote == b'\'';
-        let mut len = 0;
-
-        // Write placeholder header to be updated later
-        self.write_element_header(string_start, ElementType::TEXT, 0, false)
-            .map_err(|_| PError::Message {
-                msg: "Failed to write header".to_string(),
-                location: Some(pos),
-            })?;
-
         let mut element_type = ElementType::TEXT;
-
-        // Special case for unquoted JSON5 keys (identifiers)
-        if !quoted {
-            if quote == b'\\' && input.get(pos) == Some(&b'u') {
-                // The key starts with a \uXXXX escape, which SQLite
-                // accepts no matter what it decodes to. Rewind one byte
-                // so the escape handling below consumes it.
-                pos -= 1;
-            } else if !is_json5_id_char(quote, true) {
-                return Err(PError::Message {
-                    msg: "Invalid character in unquoted object key".to_string(),
-                    location: Some(pos - 1),
-                });
-            } else {
-                self.data.push(quote);
-                len += 1;
-            }
-
-            if len > 0 && pos < input.len() && input[pos] == b':' {
-                self.write_element_header(string_start, element_type, len, false)
-                    .map_err(|_| PError::Message {
-                        msg: "Failed to write header".to_string(),
-                        location: Some(pos),
-                    })?;
-                return Ok(pos);
-            }
-        }
-
-        if pos >= input.len() {
-            return Err(PError::Message {
-                msg: "Unexpected end of input".to_string(),
-                location: Some(pos),
-            });
-        }
-
-        let mut escape_buffer = [0u8; 6]; // Buffer for escape sequences
-        let mut closed = false;
-
-        while pos < input.len() {
-            let c = input[pos];
-            pos += 1;
-
-            if quoted && c == quote {
-                closed = true;
-                break; // End of string
-            } else if !quoted && !is_unquoted_key_char(input, pos - 1) {
-                pos -= 1;
+        let mut pos = special;
+        loop {
+            let Some(&c) = input.get(pos) else {
+                return Err(parse_error("Unexpected end of input", input.len()));
+            };
+            if c == quote {
                 break;
-            } else if c == b'\\' {
-                // Handle escape sequences
-                if pos >= input.len() {
-                    return Err(PError::Message {
-                        msg: "Unexpected end of input".to_string(),
-                        location: Some(pos),
-                    });
-                }
-
-                let esc_pos = pos;
-                let esc = input[pos];
-                pos += 1;
-
-                // A standard escape upgrades plain TEXT to TEXTJ but
-                // never demotes TEXT5: earlier JSON5 syntax keeps the
-                // string JSON5.
+            }
+            if c == b'\\' {
+                let esc_pos = pos + 1;
+                let Some(&esc) = input.get(esc_pos) else {
+                    return Err(parse_error("Unexpected end of input", esc_pos));
+                };
+                pos = esc_pos + 1;
+                // A standard escape upgrades plain TEXT to TEXTJ but never
+                // demotes TEXT5: earlier JSON5 syntax keeps the string JSON5.
                 match esc {
-                    b'b' => {
-                        self.data.extend_from_slice(b"\\b");
-                        len += 2;
-                        if element_type == ElementType::TEXT {
-                            element_type = ElementType::TEXTJ;
-                        }
-                    }
-                    b'f' => {
-                        self.data.extend_from_slice(b"\\f");
-                        len += 2;
-                        if element_type == ElementType::TEXT {
-                            element_type = ElementType::TEXTJ;
-                        }
-                    }
-                    b'n' => {
-                        self.data.extend_from_slice(b"\\n");
-                        len += 2;
-                        if element_type == ElementType::TEXT {
-                            element_type = ElementType::TEXTJ;
-                        }
-                    }
-                    b'r' => {
-                        self.data.extend_from_slice(b"\\r");
-                        len += 2;
-                        if element_type == ElementType::TEXT {
-                            element_type = ElementType::TEXTJ;
-                        }
-                    }
-                    b't' => {
-                        self.data.extend_from_slice(b"\\t");
-                        len += 2;
-                        if element_type == ElementType::TEXT {
-                            element_type = ElementType::TEXTJ;
-                        }
-                    }
-                    b'\\' | b'"' | b'/' => {
-                        self.data.push(b'\\');
-                        self.data.push(esc);
-                        len += 2;
+                    b'b' | b'f' | b'n' | b'r' | b't' | b'\\' | b'"' | b'/' => {
                         if element_type == ElementType::TEXT {
                             element_type = ElementType::TEXTJ;
                         }
                     }
                     b'u' => {
-                        // Unicode escape sequence
-                        if pos + 4 > input.len() {
-                            return Err(PError::Message {
-                                msg: "Incomplete unicode escape sequence".to_string(),
-                                location: Some(esc_pos),
-                            });
+                        let Some(digits) = input.get(pos..pos + 4) else {
+                            return Err(parse_error("Incomplete unicode escape sequence", esc_pos));
+                        };
+                        if !digits.iter().all(|&h| is_hex_digit(h)) {
+                            return Err(parse_error("Invalid unicode escape sequence", esc_pos));
                         }
-
-                        escape_buffer[0] = b'\\';
-                        escape_buffer[1] = b'u';
-
-                        for i in 0..4 {
-                            let h = input[pos + i];
-                            if !is_hex_digit(h) {
-                                return Err(PError::Message {
-                                    msg: "Invalid unicode escape sequence".to_string(),
-                                    location: Some(esc_pos),
-                                });
-                            }
-                            escape_buffer[2 + i] = h;
-                        }
-
-                        self.data.extend_from_slice(&escape_buffer[0..6]);
-                        len += 6;
                         pos += 4;
                         if element_type == ElementType::TEXT {
                             element_type = ElementType::TEXTJ;
                         }
                     }
                     // JSON5 extensions
-                    b'\n' => {
-                        self.data.extend_from_slice(b"\\\n");
-                        len += 2;
-                        element_type = ElementType::TEXT5;
-                    }
+                    b'\n' | b'\'' | b'v' => element_type = ElementType::TEXT5,
                     b'\r' => {
-                        // Line continuation; swallows a following LF so
+                        // Line continuation; a following LF is part of it, so
                         // \<CR><LF> counts as one line terminator.
-                        self.data.extend_from_slice(b"\\\r");
-                        len += 2;
-                        if pos < input.len() && input[pos] == b'\n' {
-                            self.data.push(b'\n');
-                            len += 1;
+                        if input.get(pos) == Some(&b'\n') {
                             pos += 1;
                         }
                         element_type = ElementType::TEXT5;
                     }
-                    0xe2 if pos + 1 < input.len()
-                        && input[pos] == 0x80
-                        && (input[pos + 1] == 0xa8 || input[pos + 1] == 0xa9) =>
+                    // Line continuation with U+2028 or U+2029
+                    0xe2 if input.get(pos) == Some(&0x80)
+                        && matches!(input.get(pos + 1), Some(0xa8 | 0xa9)) =>
                     {
-                        // Line continuation with U+2028 or U+2029
-                        self.data.push(b'\\');
-                        self.data.extend_from_slice(&input[pos - 1..pos + 2]);
-                        len += 4;
                         pos += 2;
-                        element_type = ElementType::TEXT5;
-                    }
-                    b'\'' => {
-                        self.data.extend_from_slice(b"\\\'");
-                        len += 2;
                         element_type = ElementType::TEXT5;
                     }
                     b'0' if !input.get(pos).is_some_and(u8::is_ascii_digit) => {
-                        self.data.extend_from_slice(b"\\0");
-                        len += 2;
-                        element_type = ElementType::TEXT5;
-                    }
-                    b'v' => {
-                        self.data.extend_from_slice(b"\\v");
-                        len += 2;
                         element_type = ElementType::TEXT5;
                     }
                     b'x' => {
-                        // Hex escape sequence (JSON5)
-                        if pos + 2 > input.len() {
-                            return Err(PError::Message {
-                                msg: "Incopmlete hex escape sequence".to_string(),
-                                location: Some(esc_pos),
-                            });
+                        let Some(digits) = input.get(pos..pos + 2) else {
+                            return Err(parse_error("Incomplete hex escape sequence", esc_pos));
+                        };
+                        if !digits.iter().all(|&h| is_hex_digit(h)) {
+                            return Err(parse_error("Invalid hex escape sequence", esc_pos));
                         }
-
-                        escape_buffer[0] = b'\\';
-                        escape_buffer[1] = b'x';
-
-                        for i in 0..2 {
-                            let h = input[pos + i];
-                            if !is_hex_digit(h) {
-                                return Err(PError::Message {
-                                    msg: "Invalid hex escape sequence".to_string(),
-                                    location: Some(esc_pos),
-                                });
-                            }
-                            escape_buffer[2 + i] = h;
-                        }
-
-                        self.data.extend_from_slice(&escape_buffer[0..4]);
-                        len += 4;
                         pos += 2;
                         element_type = ElementType::TEXT5;
                     }
-
-                    _ => {
-                        return Err(PError::Message {
-                            msg: "Invalid escape sequence".to_string(),
-                            location: Some(esc_pos),
-                        });
-                    }
+                    _ => return Err(parse_error("Invalid escape sequence", esc_pos)),
                 }
-            } else if c <= 0x1F {
-                // Control character
-                element_type = ElementType::TEXT5;
-                self.data.push(c);
-                len += 1;
             } else {
-                // Normal character
-                self.data.push(c);
-                len += 1;
+                // A control character, which JSON5 allows in a string.
+                element_type = ElementType::TEXT5;
+                pos += 1;
             }
-        }
-
-        // A quoted string must end with its closing quote before the
-        // input runs out.
-        if quoted && !closed {
-            return Err(PError::Message {
-                msg: "Unexpected end of input".to_string(),
-                location: Some(pos),
-            });
+            pos += plain_part_len(&input[pos..], quote);
         }
 
         if matches!(element_type, ElementType::TEXT5) {
             info.has_json5 = true;
         }
+        self.write_element_header(string_start, element_type, pos - start, false)
+            .map_err(|_| parse_error("Failed to write header", pos))?;
+        self.data.extend_from_slice(&input[start..pos]);
+        Ok(pos + 1) // Skip past closing quote
+    }
+
+    /// Parses an unquoted JSON5 object key, whose first byte is `first`. `pos`
+    /// is the offset after `first`, and `string_start` is the offset of the
+    /// element in the document.
+    #[inline(never)]
+    fn deserialize_unquoted_key(
+        &mut self,
+        input: &[u8],
+        mut pos: usize,
+        string_start: usize,
+        first: u8,
+    ) -> PResult<usize> {
+        let mut len = 0;
+
+        // Write placeholder header to be updated later
+        self.write_element_header(string_start, ElementType::TEXT, 0, false)
+            .map_err(|_| parse_error("Failed to write header", pos))?;
+
+        let mut element_type = ElementType::TEXT;
+
+        if first == b'\\' && input.get(pos) == Some(&b'u') {
+            // The key starts with a \uXXXX escape, which SQLite accepts no
+            // matter what it decodes to. Rewind one byte so the loop below
+            // reads it.
+            pos -= 1;
+        } else if !is_json5_id_char(first, true) {
+            return Err(parse_error(
+                "Invalid character in unquoted object key",
+                pos - 1,
+            ));
+        } else {
+            self.data.push(first);
+            len += 1;
+        }
+
+        if len > 0 && pos < input.len() && input[pos] == b':' {
+            self.write_element_header(string_start, element_type, len, false)
+                .map_err(|_| parse_error("Failed to write header", pos))?;
+            return Ok(pos);
+        }
+
+        if pos >= input.len() {
+            return Err(parse_error("Unexpected end of input", pos));
+        }
+
+        while pos < input.len() && is_unquoted_key_char(input, pos) {
+            if input[pos] == b'\\' {
+                // is_unquoted_key_char accepts a backslash only before u and
+                // four hex digits.
+                self.data.extend_from_slice(&input[pos..pos + 6]);
+                len += 6;
+                pos += 6;
+                element_type = ElementType::TEXTJ;
+            } else {
+                self.data.push(input[pos]);
+                len += 1;
+                pos += 1;
+            }
+        }
 
         // Write final header with correct type and size
         self.write_element_header(string_start, element_type, len, false)
-            .map_err(|_| PError::Message {
-                msg: "Failed to write header".to_string(),
-                location: Some(pos),
-            })?;
+            .map_err(|_| parse_error("Failed to write header", pos))?;
 
         Ok(pos)
     }
@@ -2752,12 +2703,32 @@ impl Jsonb {
 
     pub fn from_str_tracking(input: &str) -> PResult<(Self, ParseInfo)> {
         let mut result = Self::new(input.len() + PARSE_CAPACITY_SLACK)?;
-        let input = input.as_bytes();
+        let info = result.parse_reserved(input.as_bytes())?;
+        Ok((result, info))
+    }
+
+    /// Replaces the document with the JSONB of the JSON text `input`, in the
+    /// buffer that the document has already. Thus a parse into the buffer of
+    /// an old document does not allocate when the buffer is large enough.
+    /// After an error, the document is incomplete.
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::JsonbConstruction)]
+    pub fn parse_text(&mut self, input: &str) -> PResult<ParseInfo> {
+        self.data.clear();
+        self.data
+            .try_reserve(input.len() + PARSE_CAPACITY_SLACK)
+            .map_err(TryReserveError::from)?;
+        self.parse_reserved(input.as_bytes())
+    }
+
+    /// Parses the JSON text `input` into the empty document, whose buffer has
+    /// the capacity for the length of `input` and [PARSE_CAPACITY_SLACK].
+    #[inline(always)]
+    fn parse_reserved(&mut self, input: &[u8]) -> PResult<ParseInfo> {
         let mut info = ParseInfo::default();
 
         // Parse the first complete JSON value
         let pos = skip_whitespace_tracking(input, 0, &mut info);
-        let mut pos = result.deserialize_value(input, 0, pos, 0, &mut info)?;
+        let mut pos = self.deserialize_value(input, 0, pos, 0, &mut info)?;
 
         // Skip any trailing whitespace
         pos = skip_whitespace_tracking(input, pos, &mut info);
@@ -2770,7 +2741,7 @@ impl Jsonb {
             });
         }
 
-        Ok((result, info))
+        Ok(info)
     }
 
     pub fn from_str_with_mode(input: &str, mode: Conv) -> PResult<Self> {
@@ -2833,7 +2804,7 @@ impl Jsonb {
 
     /// Replaces the bytes of the document with `bytes`, in the buffer that it
     /// has already. If the buffer cannot grow, the document does not change.
-    fn set_data(&mut self, bytes: &[u8]) -> std::result::Result<(), TryReserveError> {
+    pub(crate) fn set_data(&mut self, bytes: &[u8]) -> std::result::Result<(), TryReserveError> {
         self.data
             .try_reserve(bytes.len().saturating_sub(self.data.len()))?;
         self.data.clear();
@@ -2851,22 +2822,7 @@ impl Jsonb {
     }
 
     pub fn array_len(&self) -> Result<usize> {
-        let (header, header_skip) = self.read_header(0)?;
-        if header.0 != ElementType::ARRAY {
-            return Ok(0);
-        }
-
-        let end = header_skip
-            .checked_add(header.1)
-            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
-        let mut count = 0;
-        let mut pos = header_skip;
-        while pos < end {
-            pos = self.skip_element(pos)?;
-            count += 1;
-        }
-
-        Ok(count)
+        array_len(&self.data)
     }
 
     pub fn navigate_path(
@@ -3898,7 +3854,179 @@ fn is_json_float(text: &[u8]) -> bool {
     has_fraction_or_exponent && rest.is_empty()
 }
 
-/// [Jsonb::plain_string_payload] for the element at the start of `element`.
+/// The element that a JSON path selects in a JSONB document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PathTarget {
+    /// The offset of the header of the element.
+    pub start: usize,
+    /// The offset after the element.
+    pub end: usize,
+    /// The offset of the object key of the element, when the last step of the
+    /// path is a key.
+    pub key: Option<usize>,
+}
+
+/// Finds the element that `path` selects in the JSONB document `data`, as the
+/// search of [Jsonb::operate_on_path] does, but with no change to the document
+/// and no copy of it. Returns None when the path selects no element: a key
+/// that the object does not have, an index that the array does not have, a
+/// step into an element of a different type, an append locator (`[#]`) or a
+/// bracket-quoted key.
+///
+/// Each header is read with checked bounds, and an element that does not fit
+/// in its container is an error. Thus a document that was not validated gives
+/// an error and not a panic. The elements that the search does not go into are
+/// not examined.
+pub(crate) fn find_path_element(data: &[u8], path: &JsonPath) -> Result<Option<PathTarget>> {
+    let mut target = PathTarget {
+        start: 0,
+        end: element_end_within(data, 0, data.len())?,
+        key: None,
+    };
+    for element in &path.elements {
+        let found = match element {
+            PathElement::Root() => Some(target),
+            PathElement::Key(key, quoted) => {
+                find_object_member(data, target, key.as_bytes(), *quoted)?
+            }
+            PathElement::ArrayLocator(Some(index)) => find_array_element(data, target, *index)?,
+            PathElement::ArrayLocator(None) | PathElement::BracketQuotedKey(_) => None,
+        };
+        let Some(found) = found else {
+            return Ok(None);
+        };
+        target = found;
+    }
+    Ok(Some(target))
+}
+
+/// Finds the value of the first member of the object `object` whose key is
+/// `path_key`. Returns None when `object` is not an object or has no such key.
+fn find_object_member(
+    data: &[u8],
+    object: PathTarget,
+    path_key: &[u8],
+    quoted: bool,
+) -> Result<Option<PathTarget>> {
+    let (JsonbHeader(element_type, _), header_size) = JsonbHeader::from_slice(object.start, data)?;
+    if element_type != ElementType::OBJECT {
+        return Ok(None);
+    }
+    let mut pos = object.start + header_size;
+    while pos < object.end {
+        let (JsonbHeader(key_type, key_len), key_header_size) = JsonbHeader::from_slice(pos, data)?;
+        if !key_type.is_valid_key() {
+            bail_parse_error!("malformed JSON");
+        }
+        let key_start = pos + key_header_size;
+        let value = match key_start.checked_add(key_len) {
+            Some(value) if value < object.end => value,
+            _ => bail_parse_error!("malformed JSON"),
+        };
+        let value_end = element_end_within(data, value, object.end)?;
+        if compare((&data[key_start..value], key_type), (path_key, quoted)) {
+            return Ok(Some(PathTarget {
+                start: value,
+                end: value_end,
+                key: Some(pos),
+            }));
+        }
+        pos = value_end;
+    }
+    Ok(None)
+}
+
+/// Finds the element of the array `array` at `index`, which counts from the end
+/// when it is negative (`-1` is the last element). Returns None when `array` is
+/// not an array or has no element at `index`.
+fn find_array_element(data: &[u8], array: PathTarget, index: i32) -> Result<Option<PathTarget>> {
+    let (JsonbHeader(element_type, _), header_size) = JsonbHeader::from_slice(array.start, data)?;
+    if element_type != ElementType::ARRAY {
+        return Ok(None);
+    }
+    let first = array.start + header_size;
+    let index = match usize::try_from(index) {
+        Ok(index) => index,
+        Err(_) => {
+            let mut count = 0usize;
+            let mut pos = first;
+            while pos < array.end {
+                pos = element_end_within(data, pos, array.end)?;
+                count += 1;
+            }
+            match count.checked_sub(index.unsigned_abs() as usize) {
+                Some(index) => index,
+                None => return Ok(None),
+            }
+        }
+    };
+    let mut pos = first;
+    let mut position = 0;
+    while pos < array.end {
+        let end = element_end_within(data, pos, array.end)?;
+        if position == index {
+            return Ok(Some(PathTarget {
+                start: pos,
+                end,
+                key: None,
+            }));
+        }
+        pos = end;
+        position += 1;
+    }
+    Ok(None)
+}
+
+/// The offset after the element at `pos`, which must end at or before `limit`.
+#[inline]
+fn element_end_within(data: &[u8], pos: usize, limit: usize) -> Result<usize> {
+    if pos < limit {
+        let (JsonbHeader(_, payload_size), header_size) = JsonbHeader::from_slice(pos, data)?;
+        if let Some(end) = (pos + header_size).checked_add(payload_size) {
+            if end <= limit {
+                return Ok(end);
+            }
+        }
+    }
+    bail_parse_error!("malformed JSON")
+}
+
+/// The number of elements of the array at the start of `element`, or 0 when
+/// the element is not an array.
+pub(crate) fn array_len(element: &[u8]) -> Result<usize> {
+    let (header, header_skip) = JsonbHeader::from_slice(0, element)?;
+    if header.0 != ElementType::ARRAY {
+        return Ok(0);
+    }
+
+    let end = header_skip
+        .checked_add(header.1)
+        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+    let mut count = 0;
+    let mut pos = header_skip;
+    while pos < end {
+        let (header, header_size) = JsonbHeader::from_slice(pos, element)?;
+        pos = pos
+            .checked_add(header_size)
+            .and_then(|pos| pos.checked_add(header.1))
+            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+/// [Jsonb::scalar_payload] for the element at the start of `element`.
+pub(crate) fn scalar_payload(element: &[u8]) -> Option<&[u8]> {
+    let (JsonbHeader(_, len), header_size) = JsonbHeader::from_slice(0, element).ok()?;
+    let payload_end = header_size.checked_add(len)?;
+    element.get(header_size..payload_end)
+}
+
+/// Returns the payload of the string element at the start of `element` when
+/// its JSON text has no escape: the element is TEXT, TEXTJ or TEXTRAW, and the
+/// payload has no `"`, `\` or control character. The JSON text of the string
+/// is then the payload in quotes, and its decoded text is the payload.
 pub(crate) fn plain_string_payload(element: &[u8]) -> Option<&[u8]> {
     let (JsonbHeader(element_type, len), header_size) = JsonbHeader::from_slice(0, element).ok()?;
     if !matches!(
@@ -4028,6 +4156,12 @@ fn unescape_bytes(input: &[u8]) -> Vec<u8> {
 /// JSON functions the way SQLite passes them through.
 pub(super) fn validate_jsonb(data: &[u8]) -> bool {
     validate_element(data, 0, data.len(), 0, false).is_ok()
+}
+
+/// Whether `element`, an element of `data` that [find_path_element] found,
+/// passes the check that [validate_jsonb] makes of a whole document.
+pub(super) fn is_valid_element(data: &[u8], element: PathTarget) -> bool {
+    validate_element(data, element.start, element.end, 0, false).is_ok()
 }
 
 /// SQLite's jsonbValidityCheck: 0 when `data` is fully valid JSONB
@@ -5104,14 +5238,13 @@ mod tests {
     }
 
     #[test]
-    fn scalar_string_value_rejects_overflowing_payload_length() {
+    fn scalar_payload_rejects_overflowing_payload_length() {
         // TEXT5 header in the 8-byte size format declaring a payload
         // length near usize::MAX: the payload end computation must not
         // overflow (SQL paths validate blobs first, but this decoder is
         // public API).
         let blob = [0xF9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF7];
-        let jsonb = Jsonb::from_raw_data(&blob).unwrap();
-        assert!(jsonb.scalar_string_value().is_err());
+        assert!(scalar_payload(&blob).is_none());
     }
 
     #[test]
@@ -5428,6 +5561,147 @@ mod tests {
     #[test]
     fn escaped_bytes_end_the_plain_part_of_a_double_quoted_string() {
         assert_eq!(make_plain_string_end_table(b'"'), ESCAPED_IN_TEXT);
+    }
+
+    #[test]
+    fn byte_scans_give_the_offset_of_the_first_special_byte() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let special = [b'"', b'\'', b'\\', 0x00, 0x1F, 0x20, 0x7F, 0x80, 0xFF, b'a'];
+        for len in 0..80 {
+            for _ in 0..50 {
+                let input: Vec<u8> = (0..len)
+                    .map(|_| match next() % 8 {
+                        0 => special[(next() % special.len() as u64) as usize],
+                        _ => b'a' + (next() % 26) as u8,
+                    })
+                    .collect();
+                for quote in [b'"', b'\''] {
+                    for start in 0..=len {
+                        let rest = &input[start..];
+                        let expected = rest
+                            .iter()
+                            .position(|&c| c == quote || c == b'\\' || c < 0x20)
+                            .unwrap_or(rest.len());
+                        assert_eq!(plain_part_len(rest, quote), expected, "{rest:?} {quote}");
+                    }
+                }
+                for start in 0..=len {
+                    let rest = &input[start..];
+                    for limit in [0, rest.len() / 2, rest.len().saturating_sub(1), rest.len()] {
+                        let part = &rest[..limit];
+                        let control = part.iter().position(|&c| c < 0x20);
+                        let escaped = part
+                            .iter()
+                            .position(|&c| c < 0x20 || c == b'"' || c == b'\\');
+                        assert_eq!(
+                            escape_free_len(rest, limit, false),
+                            control.unwrap_or(limit),
+                            "{rest:?} {limit}"
+                        );
+                        assert_eq!(
+                            escape_free_len(rest, limit, true),
+                            escaped.unwrap_or(limit),
+                            "{rest:?} {limit}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The payload of a string with escapes is the input between the quotes,
+    /// and the element type tells which escapes the payload holds.
+    #[test]
+    fn escaped_strings_keep_their_input_bytes_as_the_payload() {
+        let long = "x".repeat(300);
+        let longer = "y".repeat(70_000);
+        let cases = [
+            (
+                r#""a\nb""#.to_string(),
+                ElementType::TEXTJ,
+                r#"a\nb"#.to_string(),
+            ),
+            (
+                r#""\u00e9x""#.to_string(),
+                ElementType::TEXTJ,
+                r#"\u00e9x"#.to_string(),
+            ),
+            (
+                r#""a\"b\\c\/""#.to_string(),
+                ElementType::TEXTJ,
+                r#"a\"b\\c\/"#.to_string(),
+            ),
+            (
+                "\"a\\\r\nb\"".to_string(),
+                ElementType::TEXT5,
+                "a\\\r\nb".to_string(),
+            ),
+            // A JSON5 escape before a standard escape keeps the string TEXT5.
+            (
+                r#""\x41\n""#.to_string(),
+                ElementType::TEXT5,
+                r#"\x41\n"#.to_string(),
+            ),
+            (
+                r#""\n\v""#.to_string(),
+                ElementType::TEXT5,
+                r#"\n\v"#.to_string(),
+            ),
+            (
+                r#"'it\'s'"#.to_string(),
+                ElementType::TEXT5,
+                r#"it\'s"#.to_string(),
+            ),
+            (
+                "\"a\u{1}b\"".to_string(),
+                ElementType::TEXT5,
+                "a\u{1}b".to_string(),
+            ),
+            (
+                "\"\\u2028\u{2028}\"".to_string(),
+                ElementType::TEXTJ,
+                "\\u2028\u{2028}".to_string(),
+            ),
+            (
+                format!("\"\\t{long}\""),
+                ElementType::TEXTJ,
+                format!("\\t{long}"),
+            ),
+            (
+                format!("[\"{long}\\\"\"]"),
+                ElementType::ARRAY,
+                String::new(),
+            ),
+            (
+                format!("\"{longer}\\n\""),
+                ElementType::TEXTJ,
+                format!("{longer}\\n"),
+            ),
+        ];
+        for (input, element_type, payload) in cases {
+            let json = Jsonb::from_str(&input).unwrap();
+            let (header, header_size) = JsonbHeader::from_slice(0, json.as_bytes()).unwrap();
+            assert_eq!(header.element_type(), element_type, "{input:?}");
+            assert_eq!(header_size + header.payload_size(), json.len(), "{input:?}");
+            if element_type != ElementType::ARRAY {
+                assert_eq!(
+                    &json.as_bytes()[header_size..],
+                    payload.as_bytes(),
+                    "{input:?}"
+                );
+            }
+            // The JSON text of a string with standard escapes is the input.
+            // The JSON text of a TEXT5 string has other escapes.
+            if element_type == ElementType::TEXTJ {
+                assert_eq!(json.to_string().unwrap(), input, "{input:?}");
+            }
+        }
     }
 
     #[test]
@@ -6190,12 +6464,9 @@ mod path_operations_tests {
     }
 
     #[test]
-    fn test_search_operation() {
+    fn test_find_path_element() {
         let json_str = r#"{"person": {"name": "John", "age": 30}}"#;
-        let mut jsonb = Jsonb::from_str(json_str).unwrap();
-
-        // Create a search operation
-        let mut operation = SearchOperation::new();
+        let jsonb = Jsonb::from_str(json_str).unwrap();
 
         // Create a path to the "person" property
         let path = create_path(vec![
@@ -6203,13 +6474,8 @@ mod path_operations_tests {
             PathElement::Key(Cow::Borrowed("person"), false),
         ]);
 
-        // Execute the operation
-        let result = jsonb.operate_on_path(&path, &mut operation);
-        assert!(result.is_ok());
-
-        // Get the search result
-        let search_result = operation.into_element(jsonb);
-        let result_str = search_result.to_string().unwrap();
+        let target = find_path_element(jsonb.as_bytes(), &path).unwrap().unwrap();
+        let result_str = jsonb.element_to_string(target).unwrap();
 
         // Verify the search found the correct value
         assert_eq!(result_str, r#"{"name":"John","age":30}"#);
@@ -6390,22 +6656,55 @@ mod path_operations_tests {
         ];
         for (elements, expected) in cases {
             let path = create_path(elements);
-            let mut json = doc.clone();
-            let mut search = SearchOperation::new();
-            let found = json.operate_on_path(&path, &mut search);
-            assert_eq!(found.is_ok(), expected.is_some(), "{path:?}");
-            let element = search.element_in(&json).to_vec();
-            let moved = search.into_element(json);
+            let found = find_path_element(doc.as_bytes(), &path).unwrap();
+            assert_eq!(found.is_some(), expected.is_some(), "{path:?}");
+            let Some(target) = found else {
+                continue;
+            };
+            let element = doc.as_bytes()[target.start..target.end].to_vec();
+            let mut moved = doc.clone();
+            moved.keep_only_element(target);
             assert_eq!(moved.data.as_slice(), element.as_slice(), "{path:?}");
-            match expected {
-                Some(expected) => assert_eq!(moved.to_string().unwrap(), expected, "{path:?}"),
-                None => assert!(element.is_empty(), "{path:?}"),
-            }
+            assert_eq!(moved.to_string().unwrap(), expected.unwrap(), "{path:?}");
         }
     }
 
+    /// The search gives the offset of the key of an object member, which
+    /// json_each() uses as the id of the member, and no key for an array
+    /// element.
+    #[test]
+    fn search_gives_the_key_of_an_object_member() {
+        let doc = Jsonb::from_str(r#"{"a":[1,{"b":2}]}"#).unwrap();
+        let key = |key| PathElement::Key(Cow::Borrowed(key), false);
+        let path = create_path(vec![PathElement::Root(), key("a")]);
+        let target = find_path_element(doc.as_bytes(), &path).unwrap().unwrap();
+        // The key "a" follows the 1-byte header of the object.
+        assert_eq!(target.key, Some(1));
+        let path = create_path(vec![
+            PathElement::Root(),
+            key("a"),
+            PathElement::ArrayLocator(Some(-1)),
+            key("b"),
+        ]);
+        let target = find_path_element(doc.as_bytes(), &path).unwrap().unwrap();
+        assert_eq!(doc.element_to_string(target).unwrap(), "2");
+        let path = create_path(vec![
+            PathElement::Root(),
+            key("a"),
+            PathElement::ArrayLocator(Some(0)),
+        ]);
+        let target = find_path_element(doc.as_bytes(), &path).unwrap().unwrap();
+        assert_eq!(target.key, None);
+        let path = create_path(vec![
+            PathElement::Root(),
+            key("a"),
+            PathElement::ArrayLocator(Some(-3)),
+        ]);
+        assert_eq!(find_path_element(doc.as_bytes(), &path).unwrap(), None);
+    }
+
     /// A child element whose declared size runs past the buffer must not reach
-    /// the slice in `SearchOperation` or the `drain` in `DeleteOperation`.
+    /// the slice of a path search or the `drain` in `DeleteOperation`.
     ///
     /// Blob-sourced documents are validated on the way in, so no SQL input
     /// reaches these ranges today. The checks exist because the sizes are
@@ -6422,12 +6721,9 @@ mod path_operations_tests {
             PathElement::ArrayLocator(Some(0)),
         ]);
 
-        let mut jsonb = Jsonb {
-            data: crate::alloc::vec![0x8B, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        };
-        let mut search = SearchOperation::new();
+        let data = [0x8B, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         assert!(
-            jsonb.operate_on_path(&path, &mut search).is_err(),
+            find_path_element(&data, &path).is_err(),
             "oversized child size must not be sliced out of bounds"
         );
 

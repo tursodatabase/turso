@@ -388,3 +388,145 @@ test json-each-fullkey-keeps-a-backslash-before-a-crlf-line-break-in-the-name {
 expect {
     242E22615C0D0A625C7622
 }
+
+# A correlated subquery opens its json_each or json_tree cursor again for
+# each outer row. Each row starts a new scan, also after a row that had no
+# rows or a NULL document.
+test correlated-json-each-starts-over-for-each-outer-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, j TEXT);
+    INSERT INTO t VALUES (1, '[1,2,3]'), (2, NULL), (3, '{"a":5,"b":[6]}'), (4, '[]'), (5, '[7]'), (6, '[1,[2,[3,4]],5]');
+    SELECT id, (SELECT group_concat(key || '=' || value) FROM json_each(t.j)), (SELECT count(*) FROM json_each(t.j)) FROM t ORDER BY id;
+}
+expect {
+    1|0=1,1=2,2=3|3
+    2||0
+    3|a=5,b=[6]|2
+    4||0
+    5|0=7|1
+    6|0=1,1=[2,[3,4]],2=5|3
+}
+
+test correlated-json-tree-starts-over-for-each-outer-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, j TEXT);
+    INSERT INTO t VALUES (1, '[1,2,3]'), (2, NULL), (3, '{"a":5,"b":[6]}'), (4, '[]'), (5, '[7]'), (6, '[1,[2,[3,4]],5]');
+    SELECT id, (SELECT group_concat(fullkey, ' ') FROM json_tree(t.j)) FROM t ORDER BY id;
+}
+expect {
+    1|$ $[0] $[1] $[2]
+    2|
+    3|$ $.a $.b $.b[0]
+    4|$
+    5|$ $[0]
+    6|$ $[0] $[1] $[1][0] $[1][1] $[1][1][0] $[1][1][1] $[2]
+}
+
+test correlated-json-each-with-a-root-path-starts-over-for-each-outer-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, j TEXT);
+    INSERT INTO t VALUES (1, '[1,2,3]'), (2, NULL), (3, '{"a":5,"b":[6]}'), (4, '[]'), (5, '[7]'), (6, '[1,[2,[3,4]],5]');
+    SELECT id, (SELECT group_concat(value) FROM json_each(t.j, '$[1]')) FROM t ORDER BY id;
+}
+expect {
+    1|2
+    2|
+    3|
+    4|
+    5|
+    6|2,[3,4]
+}
+
+test correlated-exists-over-json-each {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, j TEXT);
+    INSERT INTO t VALUES (1, '[1,2,3]'), (2, NULL), (3, '{"a":5,"b":[6]}'), (4, '[]'), (5, '[7]'), (6, '[1,[2,[3,4]],5]');
+    SELECT id FROM t WHERE EXISTS (SELECT 1 FROM json_each(t.j) WHERE value = 7 OR value = 2) ORDER BY id;
+}
+expect {
+    1
+    5
+}
+
+# The key column of a member whose key has no escape reads the name from the
+# path, which also has the name in quotes when the name needs them.
+test json-each-key-of-members-with-names-that-need-quotes {
+    SELECT key, fullkey FROM json_each('{"a":1,"a b":2,"":3,"é":4,"1x":5,"x.y":6}');
+}
+expect {
+    a|$.a
+    a b|$."a b"
+    |$.""
+    é|$."é"
+    1x|$."1x"
+    x.y|$."x.y"
+}
+
+test json-tree-keys-of-nested-members-with-and-without-escapes {
+    SELECT key, fullkey, path FROM json_tree('{"a b":{"c":[{"d e":1}],"f\"g":2},"h":3}');
+}
+expect {
+    |$|$
+    a b|$."a b"|$
+    c|$."a b".c|$."a b"
+    0|$."a b".c[0]|$."a b".c
+    d e|$."a b".c[0]."d e"|$."a b".c[0]
+    f"g|$."a b"."f\"g"|$."a b"
+    h|$.h|$
+}
+
+test json-tree-key-of-the-root-path-and-of-its-members {
+    SELECT key, fullkey FROM json_tree('{"x y":{"z":1}}', '$."x y"');
+}
+expect {
+    x y|$."x y"
+    z|$."x y".z
+}
+
+# json_each and json_tree read a text document from the JSON cache of the
+# statement when another JSON function of the statement uses the cache. The
+# rows are the same as with a document of their own.
+test json-each-after-arrow-on-the-same-documents {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, doc TEXT);
+    INSERT INTO t VALUES (1, '{"a":1,"tags":["x","y"]}'), (2, '{"a":0,"tags":["y"]}'), (3, '{"a":2,"tags":[]}'), (4, '{"a":3,"tags":["y",{"z":[1,2]}]}');
+    SELECT id FROM t WHERE doc->>'$.a' AND EXISTS (SELECT 1 FROM json_each(doc, '$.tags') WHERE value = 'y') ORDER BY id;
+}
+expect {
+    1
+    4
+}
+
+test json-each-and-arrow-in-one-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, doc TEXT);
+    INSERT INTO t VALUES (1, '{"a":1,"tags":["x","y"]}'), (2, '{"a":0,"tags":["y"]}'), (3, '{"a":2,"tags":[]}'), (4, '{"a":3,"tags":["y",{"z":[1,2]}]}');
+    SELECT t.id, doc->>'$.a', key, value FROM t, json_each(t.doc, '$.tags') ORDER BY t.id, key;
+}
+expect {
+    1|1|0|x
+    1|1|1|y
+    2|0|0|y
+    4|3|0|y
+    4|3|1|{"z":[1,2]}
+}
+
+test json-tree-and-json-extract-in-one-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, doc TEXT);
+    INSERT INTO t VALUES (1, '{"a":1,"tags":["x","y"]}'), (2, '{"a":0,"tags":["y"]}'), (3, '{"a":2,"tags":[]}'), (4, '{"a":3,"tags":["y",{"z":[1,2]}]}');
+    SELECT t.id, j.fullkey, json_extract(t.doc, '$.a') FROM t, json_tree(t.doc) AS j WHERE j.type = 'integer' ORDER BY t.id, j.id;
+}
+expect {
+    1|$.a|1
+    2|$.a|0
+    3|$.a|2
+    4|$.a|3
+    4|$.tags[1].z[0]|3
+    4|$.tags[1].z[1]|3
+}
+
+test correlated-json-tree-after-arrow-on-the-same-documents {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, doc TEXT);
+    INSERT INTO t VALUES (1, '{"a":1,"tags":["x","y"]}'), (2, '{"a":0,"tags":["y"]}'), (3, '{"a":2,"tags":[]}'), (4, '{"a":3,"tags":["y",{"z":[1,2]}]}');
+    SELECT id, (SELECT group_concat(fullkey) FROM json_tree(t.doc, '$.tags')), t.doc -> '$.tags' FROM t ORDER BY id;
+}
+expect {
+    1|$.tags,$.tags[0],$.tags[1]|["x","y"]
+    2|$.tags,$.tags[0]|["y"]
+    3|$.tags|[]
+    4|$.tags,$.tags[0],$.tags[1],$.tags[1].z,$.tags[1].z[0],$.tags[1].z[1]|["y",{"z":[1,2]}]
+}
