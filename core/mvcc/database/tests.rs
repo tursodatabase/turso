@@ -1,3 +1,7 @@
+#[path = "../../io/cursor_steps_test.rs"]
+mod cursor_steps_test;
+
+use self::cursor_steps_test::SeekBtreeSteps;
 use crate::dialect::cannot_parse::DialectThatCannotParse;
 use rustc_hash::FxHashSet as HashSet;
 
@@ -41,6 +45,10 @@ impl FixedYieldInjector {
         Arc::new(Self {
             remaining: Mutex::new(points.into_iter().collect()),
         })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remaining.lock().is_empty()
     }
 }
 
@@ -4142,4 +4150,1146 @@ fn empty_version_chain() -> RowVersionChain<TursoAllocator> {
     <RowVersionChain<TursoAllocator> as TursoVecInExt<RowVersion, TursoAllocator>>::new_in(
         TursoAllocator,
     )
+}
+
+#[test]
+fn test_exact_index_seek_can_continue_past_shadowed_target() {
+    use crate::types::{SeekKey, SeekOp};
+
+    let fixture = CursorTestFixture::integer_rows(Some(false), [(1, 10), (2, 20), (3, 30)]);
+    let conn = &fixture.db.conn;
+    fixture.delete_integer_index_row(2, 20);
+    fixture.insert_integer_rows([(2, 20)]);
+    let record = ImmutableRecord::from_values(&[Value::from_i64(20), Value::from_i64(2)], 2)
+        .expect("index probe must encode");
+    for op in [SeekOp::GE { eq_only: true }, SeekOp::LE { eq_only: true }] {
+        let mut cursor = fixture.cursor();
+        let result = conn
+            .db
+            .io
+            .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+            .expect("exact index seek must succeed");
+        assert!(matches!(result, SeekResult::Found));
+        assert_eq!(
+            conn.db
+                .io
+                .block(|| cursor.rowid())
+                .expect("rowid must decode"),
+            Some(2)
+        );
+        let expected = if matches!(op, SeekOp::GE { .. }) {
+            conn.db
+                .io
+                .block(|| cursor.next())
+                .expect("cursor must advance");
+            3
+        } else {
+            conn.db
+                .io
+                .block(|| cursor.prev())
+                .expect("cursor must retreat");
+            1
+        };
+        assert_eq!(
+            conn.db
+                .io
+                .block(|| cursor.rowid())
+                .expect("rowid must decode"),
+            Some(expected),
+            "exact seek must preserve continuation for {op:?}"
+        );
+    }
+    fixture.rollback();
+}
+
+#[test]
+fn test_exact_index_seek_can_continue_across_mvcc_and_btree_rows() {
+    use crate::types::{SeekKey, SeekOp};
+
+    let fixture = CursorTestFixture::integer_rows(Some(false), (1..=6).map(|id| (id, id * 10)));
+    let conn = &fixture.db.conn;
+    for id in [2, 3, 5] {
+        fixture.delete_integer_index_row(id, id * 10);
+        fixture.insert_integer_rows([(id, id * 10)]);
+    }
+    fixture.insert_integer_rows([(7, 45)]);
+    for (id, op, expected) in [
+        (2, SeekOp::GE { eq_only: true }, vec![2, 3, 4, 7, 5, 6]),
+        (5, SeekOp::LE { eq_only: true }, vec![5, 7, 4, 3, 2, 1]),
+    ] {
+        let points = if matches!(op, SeekOp::GE { .. }) {
+            vec![
+                CursorYieldPoint::SeekStart,
+                CursorYieldPoint::SeekBtreeProgress,
+                CursorYieldPoint::NextStart,
+                CursorYieldPoint::NextBtreeAdvance,
+                CursorYieldPoint::AdvanceBtreeForwardProgress,
+            ]
+        } else {
+            vec![
+                CursorYieldPoint::SeekStart,
+                CursorYieldPoint::SeekBtreeProgress,
+                CursorYieldPoint::PrevBtreeAdvance,
+                CursorYieldPoint::AdvanceBtreeBackwardProgress,
+            ]
+        };
+        let yields = FixedYieldInjector::new(points.into_iter().map(|point| point.point()));
+        conn.set_yield_injector(Some(yields.clone()));
+        let record =
+            ImmutableRecord::from_values(&[Value::from_i64(id * 10), Value::from_i64(id)], 2)
+                .expect("index probe must encode");
+        let mut cursor = fixture.cursor();
+        let result = conn
+            .db
+            .io
+            .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+            .expect("exact index seek must succeed");
+        assert!(matches!(result, SeekResult::Found));
+        let mut actual = Vec::new();
+        while let Some(rowid) = conn
+            .db
+            .io
+            .block(|| cursor.rowid())
+            .expect("rowid must decode")
+        {
+            actual.push(rowid);
+            assert!(actual.len() <= 7, "cursor must not repeat rows");
+            if matches!(op, SeekOp::GE { .. }) {
+                conn.db
+                    .io
+                    .block(|| cursor.next())
+                    .expect("cursor must advance");
+            } else {
+                conn.db
+                    .io
+                    .block(|| cursor.prev())
+                    .expect("cursor must retreat");
+            }
+        }
+        assert_eq!(
+            actual, expected,
+            "cursor must merge both sources after {op:?}"
+        );
+        assert!(
+            yields.is_empty(),
+            "all cursor yield points must be exercised"
+        );
+        conn.set_yield_injector(None);
+    }
+    fixture.rollback();
+}
+
+#[rstest::rstest]
+#[case::nonunique_forward(false, false, false)]
+#[case::nonunique_backward(false, false, true)]
+#[case::unique_forward(true, false, false)]
+#[case::unique_backward(true, false, true)]
+#[case::unique_prefix_forward(true, true, false)]
+#[case::unique_prefix_backward(true, true, true)]
+fn test_exact_index_seek_on_mvcc_only_key_keeps_btree_rows(
+    #[case] unique: bool,
+    #[case] prefix_only: bool,
+    #[case] backwards: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let fixture = CursorTestFixture::integer_rows(Some(unique), [(1, 10), (2, 20), (3, 30)]);
+    let conn = &fixture.db.conn;
+    // These index keys are absent from the B-tree, between its existing keys.
+    fixture.insert_integer_rows([(4, 15), (5, 25)]);
+
+    let (value, id, op, expected) = if backwards {
+        (25, 5, SeekOp::LE { eq_only: true }, vec![5, 2, 4, 1])
+    } else {
+        (15, 4, SeekOp::GE { eq_only: true }, vec![4, 2, 5, 3])
+    };
+    let values = [Value::from_i64(value), Value::from_i64(id)];
+    let columns = if prefix_only { 1 } else { values.len() };
+    let record =
+        ImmutableRecord::from_values(&values[..columns], columns).expect("index probe must encode");
+    let mut cursor = fixture.cursor();
+    let result = conn
+        .db
+        .io
+        .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+        .expect("exact index seek must succeed");
+    assert!(matches!(result, SeekResult::Found));
+
+    let mut actual = Vec::new();
+    while let Some(rowid) = conn
+        .db
+        .io
+        .block(|| cursor.rowid())
+        .expect("rowid must decode")
+    {
+        actual.push(rowid);
+        assert!(
+            actual.len() <= expected.len(),
+            "cursor must not repeat rows"
+        );
+        if backwards {
+            conn.db
+                .io
+                .block(|| cursor.prev())
+                .expect("cursor must retreat");
+        } else {
+            conn.db
+                .io
+                .block(|| cursor.next())
+                .expect("cursor must advance");
+        }
+    }
+    drop(cursor);
+    fixture.rollback();
+    assert_eq!(
+        actual, expected,
+        "exact seek must preserve B-tree rows: unique={unique}, prefix_only={prefix_only}, op={op:?}"
+    );
+}
+
+#[rstest::rstest]
+#[case::table(false, false, false)]
+#[case::nonunique(true, false, false)]
+#[case::unique(true, true, false)]
+#[case::unique_prefix(true, true, true)]
+fn test_exact_seek_miss_can_move_in_opposite_direction(
+    #[case] index: bool,
+    #[case] unique: bool,
+    #[case] prefix_only: bool,
+    #[values(false, true)] backwards: bool,
+    #[values(false, true)] empty_btree: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let rows: &[(i64, i64)] = if empty_btree {
+        &[]
+    } else {
+        &[(10, 10), (30, 30), (50, 50)]
+    };
+    let fixture = CursorTestFixture::integer_rows(index.then_some(unique), rows.iter().copied());
+    let conn = &fixture.db.conn;
+    let op = if backwards {
+        SeekOp::LE { eq_only: true }
+    } else {
+        SeekOp::GE { eq_only: true }
+    };
+    let mut visible = std::collections::BTreeSet::new();
+    if !empty_btree {
+        visible.extend([10, 30, 50]);
+    }
+    for target in [5, 20, 60] {
+        let mut cursor = fixture.cursor();
+        let values = [Value::from_i64(target), Value::from_i64(target)];
+        let columns = if prefix_only { 1 } else { values.len() };
+        let record = ImmutableRecord::from_values(&values[..columns], columns)
+            .expect("index probe must encode");
+        let key = if index {
+            SeekKey::IndexKey(record.as_record_ref())
+        } else {
+            SeekKey::TableRowId(target)
+        };
+        let yields = FixedYieldInjector::new([
+            CursorYieldPoint::SeekStart.point(),
+            CursorYieldPoint::SeekBtreeProgress.point(),
+        ]);
+        conn.set_yield_injector(Some(yields.clone()));
+        let result = conn
+            .db
+            .io
+            .block(|| cursor.seek(key.clone(), op))
+            .expect("missing-key seek must succeed");
+        assert!(matches!(result, SeekResult::NotFound));
+        assert_eq!(
+            conn.db
+                .io
+                .block(|| cursor.rowid())
+                .expect("rowid must decode"),
+            None
+        );
+        if backwards {
+            conn.db
+                .io
+                .block(|| cursor.next())
+                .expect("cursor must advance after a failed seek");
+        } else {
+            conn.db
+                .io
+                .block(|| cursor.prev())
+                .expect("cursor must retreat after a failed seek");
+        }
+        assert_eq!(
+            conn.db
+                .io
+                .block(|| cursor.rowid())
+                .expect("rowid must decode"),
+            None
+        );
+        assert!(yields.is_empty(), "seek must exercise its yield points");
+        conn.set_yield_injector(None);
+
+        let inserted =
+            ImmutableRecord::from_values(&values, values.len()).expect("inserted row must encode");
+        let insert_key = if index {
+            BTreeKey::IndexKey(inserted.as_record_ref())
+        } else {
+            BTreeKey::TableRowId((target, Some(&inserted)))
+        };
+        conn.db
+            .io
+            .block(|| cursor.insert(&insert_key))
+            .expect("cursor must insert after a failed seek");
+        visible.insert(target);
+        let expected = if backwards {
+            visible.iter().rev().copied().find(|id| *id < target)
+        } else {
+            visible.iter().copied().find(|id| *id > target)
+        };
+        if backwards {
+            conn.db
+                .io
+                .block(|| cursor.prev())
+                .expect("cursor must retreat after insertion");
+        } else {
+            conn.db
+                .io
+                .block(|| cursor.next())
+                .expect("cursor must advance after insertion");
+        }
+        assert_eq!(
+            conn.db
+                .io
+                .block(|| cursor.rowid())
+                .expect("rowid must decode"),
+            expected,
+            "insertion after a missed seek must preserve continuation"
+        );
+    }
+    fixture.rollback();
+}
+
+#[rstest::rstest]
+#[case::nonunique(false, false)]
+#[case::unique(false, true)]
+#[case::unique_prefix(true, true)]
+fn test_exact_index_seek_on_mvcc_only_keys_across_pages(
+    #[case] prefix_only: bool,
+    #[case] unique: bool,
+    #[values(false, true)] backwards: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let fixture =
+        CursorTestFixture::integer_rows(Some(unique), (2..=1200).step_by(2).map(|id| (id, id)));
+    let conn = &fixture.db.conn;
+    for id in (8..=1200).step_by(8) {
+        fixture.delete_integer_index_row(id, id);
+    }
+    fixture.insert_integer_rows((1..=1201).step_by(2).map(|id| (id, id)));
+
+    let visible: Vec<i64> = (1..=1201).filter(|id| id % 8 != 0).collect();
+    let op = if backwards {
+        SeekOp::LE { eq_only: true }
+    } else {
+        SeekOp::GE { eq_only: true }
+    };
+    let mut targets: Vec<_> = (1..=1201).step_by(2).collect();
+    if backwards {
+        targets.reverse();
+    }
+    for target in targets {
+        let values = [Value::from_i64(target), Value::from_i64(target)];
+        let columns = if prefix_only { 1 } else { values.len() };
+        let record = ImmutableRecord::from_values(&values[..columns], columns)
+            .expect("index probe must encode");
+        let mut cursor = fixture.cursor();
+        let seek_yields = FixedYieldInjector::new([
+            CursorYieldPoint::SeekStart.point(),
+            CursorYieldPoint::SeekBtreeProgress.point(),
+        ]);
+        conn.set_yield_injector(Some(seek_yields.clone()));
+        let result = conn
+            .db
+            .io
+            .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+            .expect("exact index seek must succeed");
+        assert!(matches!(result, SeekResult::Found));
+        assert_eq!(
+            conn.db
+                .io
+                .block(|| cursor.rowid())
+                .expect("rowid must decode"),
+            Some(target)
+        );
+        assert!(
+            seek_yields.is_empty(),
+            "seek must exercise its yield points"
+        );
+        conn.set_yield_injector(None);
+
+        let expected: Vec<_> = if backwards {
+            visible
+                .iter()
+                .rev()
+                .copied()
+                .filter(|id| *id < target)
+                .take(3)
+                .collect()
+        } else {
+            visible
+                .iter()
+                .copied()
+                .filter(|id| *id > target)
+                .take(3)
+                .collect()
+        };
+        let movement_yields =
+            FixedYieldInjector::new([CursorYieldPoint::SeekBtreeProgress.point()]);
+        conn.set_yield_injector(Some(movement_yields.clone()));
+        let mut actual = Vec::new();
+        for _ in 0..3 {
+            if backwards {
+                conn.db
+                    .io
+                    .block(|| cursor.prev())
+                    .expect("cursor must retreat");
+            } else {
+                conn.db
+                    .io
+                    .block(|| cursor.next())
+                    .expect("cursor must advance");
+            }
+            let Some(id) = conn
+                .db
+                .io
+                .block(|| cursor.rowid())
+                .expect("rowid must decode")
+            else {
+                break;
+            };
+            actual.push(id);
+        }
+        assert_eq!(actual, expected, "target={target}, backwards={backwards}");
+        assert!(
+            movement_yields.is_empty(),
+            "continuation must yield while preparing its B-tree candidate"
+        );
+        conn.set_yield_injector(None);
+    }
+    fixture.rollback();
+}
+
+#[test]
+fn test_exact_index_seek_with_duplicate_and_null_prefixes() {
+    use crate::types::{SeekKey, SeekOp};
+
+    for unique in [false, true] {
+        let mut key = IndexColumn::new("k", 1, CollationSeq::NOCASE);
+        key.order = SortOrder::Desc;
+        let index = cursor_test_index(
+            unique,
+            [key, IndexColumn::new("v", 2, CollationSeq::BINARY)],
+        );
+        let records = (301..=600)
+            .chain(1..=300)
+            .map(|id| (id, duplicate_prefix_record(id)));
+        let fixture = CursorTestFixture::new(Some(index), records);
+        let conn = &fixture.db.conn;
+        for id in (1..=250).chain(301..=550) {
+            fixture.delete_index_row(&duplicate_prefix_record(id));
+        }
+        let steps = Arc::new(SeekBtreeSteps::default());
+        conn.set_yield_injector(Some(steps.clone()));
+        let probes = [
+            (
+                vec![Value::Null, Value::from_i64(0)],
+                Some((251, 300)),
+                false,
+            ),
+            (vec![Value::from_text("a")], Some((551, 600)), false),
+            (
+                vec![Value::from_text("a"), Value::from_i64(551)],
+                Some((551, 551)),
+                unique,
+            ),
+            (
+                vec![Value::Null, Value::from_i64(0), Value::from_i64(1)],
+                None,
+                true,
+            ),
+            (
+                vec![
+                    Value::from_text("a"),
+                    Value::from_i64(301),
+                    Value::from_i64(301),
+                ],
+                None,
+                true,
+            ),
+            (
+                vec![Value::Null, Value::from_i64(0), Value::from_i64(251)],
+                Some((251, 251)),
+                true,
+            ),
+        ];
+        for (values, expected, single_row) in probes {
+            let record = ImmutableRecord::from_values(&values, values.len())
+                .expect("index probe must encode");
+            for op in [SeekOp::GE { eq_only: true }, SeekOp::LE { eq_only: true }] {
+                let mut cursor = fixture.cursor();
+                steps.total.store(0, Ordering::Relaxed);
+                let result = conn
+                    .db
+                    .io
+                    .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+                    .expect("exact index seek must succeed");
+                let expected_id = expected.map(|(first, last)| {
+                    if matches!(op, SeekOp::GE { .. }) {
+                        first
+                    } else {
+                        last
+                    }
+                });
+                assert_eq!(
+                    matches!(result, SeekResult::Found),
+                    expected_id.is_some(),
+                    "unique={unique}, values={values:?}, op={op:?}"
+                );
+                if let Some(expected_id) = expected_id {
+                    assert_eq!(
+                        conn.db
+                            .io
+                            .block(|| cursor.rowid())
+                            .expect("index rowid must decode"),
+                        Some(expected_id)
+                    );
+                }
+                if single_row {
+                    let taken = steps.total.load(Ordering::Relaxed);
+                    assert!(
+                        taken <= 2,
+                        "unique={unique}, values={values:?}, op={op:?}: {taken} B-tree steps"
+                    );
+                }
+            }
+        }
+        conn.set_yield_injector(None);
+        fixture.rollback();
+    }
+}
+
+/// What this test checks: after `exists()` finds a row, stepping returns every row from that
+/// row on, in both directions, whether the row is in the B-tree or only in MVCC.
+#[rstest::rstest]
+#[case::btree_row_forward(10, false)]
+#[case::mvcc_row_forward(20, false)]
+#[case::btree_row_backward(50, true)]
+#[case::mvcc_row_backward(40, true)]
+fn test_cursor_steps_on_from_row_found_by_exists(
+    #[case] target: i64,
+    #[case] backwards: bool,
+    #[values(false, true)] yields: bool,
+    #[values(false, true)] already_positioned: bool,
+) {
+    let fixture = CursorTestFixture::mixed_rows(false);
+    let conn = &fixture.db.conn;
+    let mut cursor = fixture.cursor();
+    let actual = with_cursor_yields(conn, yields, || {
+        if already_positioned {
+            if backwards {
+                conn.db.io.block(|| cursor.last()).unwrap();
+            } else {
+                conn.db.io.block(|| cursor.rewind()).unwrap();
+            }
+        }
+        assert!(conn
+            .db
+            .io
+            .block(|| cursor.exists(&Value::from_i64(target)))
+            .unwrap());
+        rowids_from_current_row(conn, &mut cursor, backwards)
+    });
+    let mut expected: Vec<i64> = [10, 20, 30, 40, 50]
+        .into_iter()
+        .filter(|id| {
+            if backwards {
+                *id <= target
+            } else {
+                *id >= target
+            }
+        })
+        .collect();
+    if backwards {
+        expected.reverse();
+    }
+    drop(cursor);
+    fixture.rollback();
+    assert_eq!(actual, expected);
+}
+
+/// What this test checks: after the cursor inserts a row at a key other than its current
+/// row, stepping forward continues from the inserted row.
+#[rstest::rstest]
+#[case::table(false)]
+#[case::index(true)]
+fn test_cursor_steps_on_from_row_it_inserted(
+    #[case] index: bool,
+    #[values(false, true)] yields: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+    let fixture = CursorTestFixture::mixed_rows(index);
+    let conn = &fixture.db.conn;
+    let mut cursor = fixture.cursor();
+    let record =
+        ImmutableRecord::from_values(&[Value::from_i64(10), Value::from_i64(10)], 2).unwrap();
+    let key = if index {
+        SeekKey::IndexKey(record.as_record_ref())
+    } else {
+        SeekKey::TableRowId(10)
+    };
+    let inserted =
+        ImmutableRecord::from_values(&[Value::from_i64(35), Value::from_i64(35)], 2).unwrap();
+    let inserted_key = if index {
+        BTreeKey::IndexKey(inserted.as_record_ref())
+    } else {
+        BTreeKey::TableRowId((35, Some(&inserted)))
+    };
+    let actual = with_cursor_yields(conn, yields, || {
+        conn.db
+            .io
+            .block(|| cursor.seek(key.clone(), SeekOp::GE { eq_only: false }))
+            .unwrap();
+        conn.db.io.block(|| cursor.insert(&inserted_key)).unwrap();
+        rowids_from_current_row(conn, &mut cursor, false)
+    });
+    drop(cursor);
+    fixture.rollback();
+    assert_eq!(actual, vec![35, 40, 50]);
+}
+
+/// What this test checks: a cursor that steps forward after a seek and then steps back
+/// returns the row it started on, after a range seek and after an exact-match seek.
+#[rstest::rstest]
+#[case::table_range(false, false)]
+#[case::index_range(true, false)]
+#[case::table_exact(false, true)]
+#[case::index_exact(true, true)]
+fn test_cursor_steps_back_after_stepping_forward(
+    #[case] index: bool,
+    #[case] exact: bool,
+    #[values(false, true)] yields: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+    let fixture = CursorTestFixture::mixed_rows(index);
+    let conn = &fixture.db.conn;
+    let mut cursor = fixture.cursor();
+    let record =
+        ImmutableRecord::from_values(&[Value::from_i64(30), Value::from_i64(30)], 2).unwrap();
+    let key = if index {
+        SeekKey::IndexKey(record.as_record_ref())
+    } else {
+        SeekKey::TableRowId(30)
+    };
+    let (next, previous) = with_cursor_yields(conn, yields, || {
+        let result = conn
+            .db
+            .io
+            .block(|| cursor.seek(key.clone(), SeekOp::GE { eq_only: exact }))
+            .unwrap();
+        assert!(matches!(result, SeekResult::Found));
+        conn.db.io.block(|| cursor.next()).unwrap();
+        let next = conn.db.io.block(|| cursor.rowid()).unwrap();
+        conn.db.io.block(|| cursor.prev()).unwrap();
+        let previous = conn.db.io.block(|| cursor.rowid()).unwrap();
+        (next, previous)
+    });
+    drop(cursor);
+    fixture.rollback();
+    assert_eq!((next, previous), (Some(40), Some(30)));
+}
+
+/// What this test checks: an index cursor that steps back over a deleted B-tree row and then
+/// forward again returns the row after the one it stands on, not a row it already passed.
+#[rstest::rstest]
+fn test_index_cursor_steps_forward_after_stepping_back_past_deleted_row(
+    #[values(false, true)] yields: bool,
+) {
+    let fixture = CursorTestFixture::mixed_rows(true);
+    let conn = &fixture.db.conn;
+    fixture.delete_integer_index_row(30, 30);
+    let mut cursor = fixture.cursor();
+    let id = with_cursor_yields(conn, yields, || {
+        conn.db.io.block(|| cursor.rewind()).unwrap();
+        conn.db.io.block(|| cursor.next()).unwrap();
+        conn.db.io.block(|| cursor.next()).unwrap();
+        assert_eq!(conn.db.io.block(|| cursor.rowid()).unwrap(), Some(40));
+        conn.db.io.block(|| cursor.prev()).unwrap();
+        conn.db.io.block(|| cursor.prev()).unwrap();
+        conn.db.io.block(|| cursor.next()).unwrap();
+        conn.db.io.block(|| cursor.rowid()).unwrap()
+    });
+    drop(cursor);
+    fixture.rollback();
+    assert_eq!(id, Some(20));
+}
+
+/// What this test checks: after an exact-match index seek, stepping past the matching rows
+/// returns the rows that follow, in both directions. The seek key is in the B-tree when
+/// `key_in_btree`, so the rows after it that are only in MVCC must not be skipped; otherwise
+/// the key is only in MVCC, so the B-tree rows after it must not be skipped.
+#[rstest::rstest]
+#[case::nonunique_forward(false, false, false)]
+#[case::nonunique_backward(false, false, true)]
+#[case::nonunique_prefix_forward(false, true, false)]
+#[case::nonunique_prefix_backward(false, true, true)]
+#[case::unique_forward(true, false, false)]
+#[case::unique_backward(true, false, true)]
+#[case::unique_prefix_forward(true, true, false)]
+#[case::unique_prefix_backward(true, true, true)]
+fn test_exact_index_seek_steps_past_matching_rows(
+    #[case] unique: bool,
+    #[case] prefix_only: bool,
+    #[case] backwards: bool,
+    #[values(false, true)] key_in_btree: bool,
+    #[values(false, true)] yields: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let fixture = CursorTestFixture::integer_rows(Some(unique), [(1, 10), (2, 20), (3, 30)]);
+    let conn = &fixture.db.conn;
+    // These index keys are only in MVCC, between the B-tree's keys.
+    fixture.insert_integer_rows([(4, 15), (5, 25)]);
+
+    // Index order by v: 10 (1), 15 (4), 20 (2), 25 (5), 30 (3).
+    let ((value, id), op, expected) = match (key_in_btree, backwards) {
+        (false, false) => ((15, 4), SeekOp::GE { eq_only: true }, vec![4, 2, 5, 3]),
+        (false, true) => ((25, 5), SeekOp::LE { eq_only: true }, vec![5, 2, 4, 1]),
+        (true, false) => ((20, 2), SeekOp::GE { eq_only: true }, vec![2, 5, 3]),
+        (true, true) => ((20, 2), SeekOp::LE { eq_only: true }, vec![2, 4, 1]),
+    };
+    let values = [Value::from_i64(value), Value::from_i64(id)];
+    let columns = if prefix_only { 1 } else { values.len() };
+    let record = ImmutableRecord::from_values(&values[..columns], columns).unwrap();
+    let mut cursor = fixture.cursor();
+    let actual = with_cursor_yields(conn, yields, || {
+        let result = conn
+            .db
+            .io
+            .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+            .unwrap();
+        assert!(matches!(result, SeekResult::Found));
+        rowids_from_current_row(conn, &mut cursor, backwards)
+    });
+    drop(cursor);
+    fixture.rollback();
+    assert_eq!(
+        actual, expected,
+        "unique={unique}, prefix_only={prefix_only}, key_in_btree={key_in_btree}, op={op:?}"
+    );
+}
+
+#[rstest::rstest]
+#[case::nonunique(false, Value::from_i64(20))]
+#[case::nullable_unique(true, Value::Null)]
+fn test_duplicate_prefix_seek_continues_after_writes(
+    #[case] unique: bool,
+    #[case] probe: Value,
+    #[values(false, true)] backwards: bool,
+    #[values(false, true)] reverse: bool,
+    #[values(false, true)] yields: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let index = cursor_test_index(
+        unique,
+        [
+            IndexColumn::new("k", 1, CollationSeq::BINARY),
+            IndexColumn::new("v", 2, CollationSeq::BINARY),
+        ],
+    );
+    let index_record = |id, k, v| {
+        ImmutableRecord::from_values(&[Value::from_i64(k), v, Value::from_i64(id)], 3).unwrap()
+    };
+    let fixture = CursorTestFixture::new(
+        Some(index),
+        [
+            (10, index_record(10, 0, Value::from_i64(10))),
+            (30, index_record(30, 1, probe.clone())),
+            (50, index_record(50, 1, probe.clone())),
+            (70, index_record(70, 2, Value::from_i64(50))),
+        ],
+    );
+    let conn = &fixture.db.conn;
+    let io = &conn.db.io;
+    let mut writer = fixture.cursor();
+    for (id, k, v) in [
+        (20, 0, Value::from_i64(20)),
+        (25, 1, probe.clone()),
+        (40, 1, probe.clone()),
+        (55, 1, probe.clone()),
+        (60, 2, Value::from_i64(40)),
+    ] {
+        let record = index_record(id, k, v);
+        let key = CursorTestFixture::btree_key(true, id, &record);
+        io.block(|| writer.insert(&key)).unwrap();
+    }
+
+    let (op, current, inserted, deleted) = if backwards {
+        (SeekOp::LE { eq_only: true }, 55, 53, 50)
+    } else {
+        (SeekOp::GE { eq_only: true }, 25, 27, 30)
+    };
+    let prefix = ImmutableRecord::from_values(&[Value::from_i64(1), probe.clone()], 2).unwrap();
+    let full = index_record(current, 1, probe.clone());
+    let mut cursor = fixture.cursor();
+    let actual = with_cursor_yields(conn, yields, || {
+        for record in [&prefix, &full] {
+            let result = io
+                .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+                .unwrap();
+            assert!(matches!(result, SeekResult::Found));
+            assert_eq!(io.block(|| cursor.rowid()).unwrap(), Some(current));
+        }
+
+        let record = index_record(inserted, 1, probe.clone());
+        let key = CursorTestFixture::btree_key(true, inserted, &record);
+        io.block(|| writer.insert(&key)).unwrap();
+        fixture.delete_index_row(&index_record(deleted, 1, probe));
+
+        rowids_from_current_row(conn, &mut cursor, backwards ^ reverse)
+    });
+    assert_eq!(
+        actual,
+        match (backwards, reverse) {
+            (false, false) => vec![25, 27, 40, 50, 55, 60, 70],
+            (false, true) => vec![25, 20, 10],
+            (true, false) => vec![55, 53, 40, 30, 25, 20, 10],
+            (true, true) => vec![55, 60, 70],
+        }
+    );
+    drop(cursor);
+    drop(writer);
+    fixture.rollback();
+}
+
+#[rstest::rstest]
+#[case::mvcc_forward(false, false, [10, 20, 40, 60, 70])]
+#[case::mvcc_backward(true, false, [70, 60, 40, 20, 10])]
+#[case::btree_forward(false, true, [10, 20, 40, 60, 70])]
+#[case::btree_backward(true, true, [70, 60, 40, 20, 10])]
+fn test_exact_index_cursor_returns_rows_restored_by_savepoint_rollback(
+    #[case] backwards: bool,
+    #[case] first_in_btree: bool,
+    #[case] expected: [i64; 5],
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let mut physical_rows = vec![(20, 1), (40, 1), (60, 1)];
+    let endpoints = [(10, 1), (70, 1)];
+    if first_in_btree {
+        physical_rows.extend(endpoints);
+    }
+    let fixture = CursorTestFixture::integer_rows(Some(false), physical_rows);
+    if !first_in_btree {
+        fixture.insert_integer_rows(endpoints);
+    }
+
+    let store = &fixture.db.mvcc_store;
+    store.begin_named_savepoint(fixture.tx_id, "s".to_owned(), false, 0);
+    fixture.delete_integer_index_row(20, 1);
+    fixture.delete_integer_index_row(60, 1);
+
+    let op = if backwards {
+        SeekOp::LE { eq_only: true }
+    } else {
+        SeekOp::GE { eq_only: true }
+    };
+    let conn = &fixture.db.conn;
+    let key = ImmutableRecord::from_values(&[Value::from_i64(1)], 1).unwrap();
+    let mut cursor = fixture.cursor();
+    let result = conn
+        .db
+        .io
+        .block(|| cursor.seek(SeekKey::IndexKey(key.as_record_ref()), op))
+        .unwrap();
+    assert!(matches!(result, SeekResult::Found));
+    assert_eq!(
+        conn.db.io.block(|| cursor.rowid()).unwrap(),
+        Some(expected[0])
+    );
+
+    assert_eq!(
+        store
+            .rollback_to_named_savepoint(fixture.tx_id, "s")
+            .unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        rowids_from_current_row(conn, &mut cursor, backwards),
+        expected
+    );
+    drop(cursor);
+    fixture.rollback();
+}
+
+struct CursorTestFixture {
+    db: MvccTestDb,
+    table_id: MVTableId,
+    root_page: i64,
+    index: Option<crate::schema::Index>,
+    tx_id: TxID,
+}
+
+impl CursorTestFixture {
+    fn new(
+        index: Option<crate::schema::Index>,
+        records: impl IntoIterator<Item = (i64, ImmutableRecord)>,
+    ) -> Self {
+        use crate::storage::{pager::CreateBTreeFlags, wal::WalAutoActions};
+        use crate::types::{SeekKey, SeekOp};
+
+        let db = MvccTestDb::new();
+        let pager = db.conn.pager.load().clone();
+        let io = &pager.io;
+        pager.begin_read_tx().unwrap();
+        io.block(|| pager.begin_write_tx(WalAutoActions::all_enabled()))
+            .unwrap();
+        let flags = if index.is_some() {
+            CreateBTreeFlags::new_index()
+        } else {
+            CreateBTreeFlags::new_table()
+        };
+        let root_page = io.block(|| pager.btree_create(&flags)).unwrap() as i64;
+        let mut btree = Self::btree_cursor(pager.clone(), root_page, index.as_ref());
+        for (rowid, record) in records {
+            let key = Self::btree_key(index.is_some(), rowid, &record);
+            let seek_key = match &key {
+                BTreeKey::IndexKey(record) => SeekKey::IndexKey(record.clone()),
+                BTreeKey::TableRowId((rowid, _)) => SeekKey::TableRowId(*rowid),
+            };
+            let result = io
+                .block(|| btree.seek(seek_key.clone(), SeekOp::GE { eq_only: true }))
+                .unwrap();
+            if matches!(result, SeekResult::TryAdvance) {
+                io.block(|| btree.next()).unwrap();
+            }
+            io.block(|| btree.insert(&key)).unwrap();
+        }
+        drop(btree);
+        io.block(|| pager.commit_tx(&db.conn, db.conn.get_sync_mode(), true))
+            .unwrap();
+
+        let table_id = new_uncheckpointed_table_id(&db);
+        db.mvcc_store
+            .insert_table_id_to_rootpage(table_id, Some(root_page as u64));
+        pager.begin_read_tx().unwrap();
+        let tx_id = db.mvcc_store.begin_tx(pager).unwrap();
+        Self {
+            db,
+            table_id,
+            root_page,
+            index,
+            tx_id,
+        }
+    }
+
+    fn integer_rows(unique: Option<bool>, rows: impl IntoIterator<Item = (i64, i64)>) -> Self {
+        let index = unique.map(|unique| {
+            cursor_test_index(unique, [IndexColumn::new("v", 1, CollationSeq::BINARY)])
+        });
+        let records = rows
+            .into_iter()
+            .map(|(id, value)| (id, Self::integer_record(unique.is_some(), id, value)));
+        Self::new(index, records)
+    }
+
+    fn mixed_rows(index: bool) -> Self {
+        let fixture = Self::integer_rows(index.then_some(false), [(10, 10), (30, 30), (50, 50)]);
+        fixture.insert_integer_rows([(20, 20), (40, 40)]);
+        fixture
+    }
+
+    fn cursor(&self) -> crate::MvCursor {
+        let cursor_type = match &self.index {
+            Some(index) => {
+                MvccCursorType::Index(Arc::new(IndexInfo::new_from_index(index).unwrap()))
+            }
+            None => MvccCursorType::Table,
+        };
+        let btree = Self::btree_cursor(
+            self.db.conn.pager.load().clone(),
+            self.root_page,
+            self.index.as_ref(),
+        );
+        MvccLazyCursor::new(
+            self.db.mvcc_store.clone(),
+            &self.db.conn,
+            self.tx_id,
+            i64::from(self.table_id),
+            cursor_type,
+            Box::new(btree),
+        )
+        .unwrap()
+    }
+
+    fn insert_integer_rows(&self, rows: impl IntoIterator<Item = (i64, i64)>) {
+        let index = self.index.is_some();
+        let mut cursor = self.cursor();
+        for (id, value) in rows {
+            let record = Self::integer_record(index, id, value);
+            let key = Self::btree_key(index, id, &record);
+            self.db.db.io.block(|| cursor.insert(&key)).unwrap();
+        }
+    }
+
+    fn delete_index_row(&self, record: &ImmutableRecord) {
+        let index = self.index.as_ref().unwrap();
+        let store = &self.db.mvcc_store;
+        let metadata = Arc::new(IndexInfo::new_from_index(index).unwrap());
+        let key = SortableIndexKey::new_from_payload_in(
+            record.as_record_ref(),
+            metadata,
+            store.allocator(),
+        )
+        .unwrap();
+        let id = RowID::new(self.table_id, RowKey::Record(Arc::new(key)));
+        assert!(store
+            .delete_from_table_or_index(self.tx_id, id, Some(self.table_id), Some(record))
+            .unwrap());
+    }
+
+    fn delete_integer_index_row(&self, id: i64, value: i64) {
+        self.delete_index_row(&Self::integer_record(true, id, value));
+    }
+
+    fn rollback(&self) {
+        let pager = self.db.conn.pager.load().clone();
+        self.db
+            .mvcc_store
+            .rollback_tx(self.tx_id, pager.clone(), &self.db.conn, crate::MAIN_DB_ID);
+        pager.end_read_tx();
+    }
+
+    fn integer_record(index: bool, id: i64, value: i64) -> ImmutableRecord {
+        let values = if index {
+            [Value::from_i64(value), Value::from_i64(id)]
+        } else {
+            [Value::Null, Value::from_i64(value)]
+        };
+        ImmutableRecord::from_values(&values, values.len()).unwrap()
+    }
+
+    fn btree_cursor(
+        pager: Arc<Pager>,
+        root_page: i64,
+        index: Option<&crate::schema::Index>,
+    ) -> BTreeCursor {
+        match index {
+            Some(index) => {
+                BTreeCursor::new_index(pager, root_page, index, index.columns.len()).unwrap()
+            }
+            None => BTreeCursor::new(pager, root_page, 2),
+        }
+    }
+
+    fn btree_key(index: bool, id: i64, record: &ImmutableRecord) -> BTreeKey<'_> {
+        if index {
+            BTreeKey::IndexKey(record.as_record_ref())
+        } else {
+            BTreeKey::TableRowId((id, Some(record)))
+        }
+    }
+}
+
+fn cursor_test_index(
+    unique: bool,
+    columns: impl IntoIterator<Item = IndexColumn>,
+) -> crate::schema::Index {
+    crate::schema::Index {
+        name: "test_index".to_string(),
+        table_name: "test".to_string(),
+        root_page: 0,
+        columns: columns.into_iter().try_collect().unwrap(),
+        unique,
+        ephemeral: false,
+        has_rowid: true,
+        where_clause: None,
+        index_method: None,
+        on_conflict: None,
+        constraint_name: None,
+    }
+}
+
+fn duplicate_prefix_record(id: i64) -> ImmutableRecord {
+    let (key, value) = if id <= 300 {
+        (Value::Null, 0)
+    } else {
+        (Value::from_text("A"), id)
+    };
+    ImmutableRecord::from_values(&[key, Value::from_i64(value), Value::from_i64(id)], 3).unwrap()
+}
+
+/// Rowids from the cursor's current row to the end, stepping in one direction.
+fn rowids_from_current_row(
+    conn: &Arc<Connection>,
+    cursor: &mut crate::MvCursor,
+    backwards: bool,
+) -> Vec<i64> {
+    let mut rowids = Vec::new();
+    while let Some(rowid) = conn.db.io.block(|| cursor.rowid()).unwrap() {
+        rowids.push(rowid);
+        assert!(rowids.len() <= 10, "the cursor repeats rows: {rowids:?}");
+        if backwards {
+            conn.db.io.block(|| cursor.prev()).unwrap();
+        } else {
+            conn.db.io.block(|| cursor.next()).unwrap();
+        }
+    }
+    rowids
+}
+
+/// Runs `steps`, with every cursor step yielding once before it finishes when
+/// `yields` is set.
+fn with_cursor_yields<T>(conn: &Arc<Connection>, yields: bool, steps: impl FnOnce() -> T) -> T {
+    if yields {
+        conn.set_yield_injector(Some(Arc::new(YieldAtEveryCursorPoint::default())));
+    }
+    let result = steps();
+    if yields {
+        conn.set_yield_injector(None);
+    }
+    result
+}
+
+/// Yields at every cursor yield point, so each cursor step returns to the
+/// caller before it finishes and must resume from its saved state. A point
+/// that just yielded does not yield again on its next hit: a yield point only
+/// carries an ordinal and a count, so it can also match a hook of another
+/// family that runs again before doing any work when its operation resumes.
+#[derive(Debug, Default)]
+struct YieldAtEveryCursorPoint {
+    last_yield: Mutex<Option<YieldPoint>>,
+}
+
+impl YieldInjector for YieldAtEveryCursorPoint {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        let cursor_points = [
+            CursorYieldPoint::NextStart,
+            CursorYieldPoint::NextBtreeAdvance,
+            CursorYieldPoint::PrevBtreeAdvance,
+            CursorYieldPoint::SeekStart,
+            CursorYieldPoint::SeekBtreeProgress,
+            CursorYieldPoint::AdvanceBtreeForwardProgress,
+            CursorYieldPoint::AdvanceBtreeBackwardProgress,
+        ];
+        if !cursor_points.iter().any(|p| p.point() == point) {
+            return false;
+        }
+        let mut last_yield = self.last_yield.lock();
+        if *last_yield == Some(point) {
+            *last_yield = None;
+            return false;
+        }
+        *last_yield = Some(point);
+        true
+    }
 }
