@@ -4606,13 +4606,15 @@ impl PostgreSQLTranslator {
             _ => func_name,
         };
 
-        // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
+        // PG type-cast functions: float8(x) → CAST(x AS float8), int4(x) → CAST(x AS int4), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
-            "FLOAT8" | "FLOAT4" => Some("REAL"),
-            "INT4" | "INT2" => Some("INTEGER"),
-            "INT8" => Some("BIGINT"),
-            "BOOL" => Some("BOOLEAN"),
-            "TEXT" => Some("TEXT"),
+            "FLOAT8" => Some("float8"),
+            "FLOAT4" => Some("float4"),
+            "INT4" => Some("int4"),
+            "INT2" => Some("int2"),
+            "INT8" => Some("int8"),
+            "BOOL" => Some("bool"),
+            "TEXT" => Some("text"),
             _ => None,
         };
         if let Some(type_name) = cast_type {
