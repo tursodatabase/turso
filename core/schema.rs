@@ -2227,6 +2227,28 @@ impl Schema {
         column.is_array() || self.get_type_def(&column.ty_str, is_strict).is_some()
     }
 
+    /// Whether the column has an array type or a custom type that encodes or
+    /// decodes its values, so that the stored form is not the value.
+    pub fn column_converts_values(&self, column: &Column, is_strict: bool) -> bool {
+        column.is_array()
+            || self
+                .resolve_type(&column.ty_str, is_strict)
+                .ok()
+                .flatten()
+                .is_some_and(|resolved| {
+                    resolved.has_decode()
+                        || resolved.chain.iter().any(|type_def| {
+                            matches!(
+                                &type_def.kind,
+                                TypeDefKind::Custom {
+                                    encode: Some(_),
+                                    ..
+                                }
+                            )
+                        })
+                })
+    }
+
     /// Whether reading the column runs a DECODE, so a read gives a value other
     /// than the stored one.
     pub fn column_has_decode(&self, column: &Column, is_strict: bool) -> bool {
@@ -5970,7 +5992,7 @@ impl BTreeTable {
             }
             let uses_custom_type = std::iter::once(idx)
                 .chain(graph.dependencies[idx].iter())
-                .any(|i| schema.column_has_custom_type(&self.columns[i], self.is_strict));
+                .any(|i| schema.column_converts_values(&self.columns[i], self.is_strict));
             if uses_custom_type {
                 bail_parse_error!("stored generated columns cannot use custom types");
             }
