@@ -217,7 +217,7 @@ impl SimpleQueryHandler for TursoPgHandler {
                 responses.push(execute_non_query(&mut stmt, &parsed)?);
             } else {
                 let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText)?);
-                responses.push(execute_query(&mut stmt, header)?);
+                responses.push(execute_query(&mut stmt, header, &parsed)?);
             }
         }
 
@@ -416,7 +416,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         }
 
         let header = Arc::new(build_field_info(&stmt, &portal.result_column_format)?);
-        execute_query(&mut stmt, header)
+        execute_query(&mut stmt, header, &parsed)
     }
 
     async fn do_describe_statement<C>(
@@ -759,6 +759,7 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
 fn execute_query(
     stmt: &mut turso_pg::Statement,
     header: Arc<Vec<FieldInfo>>,
+    parsed: &ParseResult,
 ) -> PgWireResult<Response> {
     let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
     let header_clone = header.clone();
@@ -787,7 +788,15 @@ fn execute_query(
     result.map_err(pg_error)?;
 
     let data_stream = stream::iter(rows);
-    Ok(Response::Query(QueryResponse::new(header, data_stream)))
+    let mut response = QueryResponse::new(header, data_stream);
+    // pgwire appends the returned row count. INSERT also includes its zero OID.
+    match CommandTag::of(parsed) {
+        CommandTag::Insert => response.set_command_tag("INSERT 0"),
+        CommandTag::Update => response.set_command_tag("UPDATE"),
+        CommandTag::Delete => response.set_command_tag("DELETE"),
+        _ => {}
+    }
+    Ok(Response::Query(response))
 }
 
 /// Stops `stmt` after a row it returned could not be sent, and rolls back the
@@ -1500,6 +1509,37 @@ mod tests {
     }
 
     #[test]
+    fn returning_rows_keep_dml_command_tags() {
+        let (mut client, _) = copy_test_client();
+        query_messages(&mut client, "CREATE TABLE t(x int)");
+        for (sql, expected) in [
+            ("INSERT INTO t VALUES (1),(2) RETURNING x", "INSERT 0 2"),
+            ("UPDATE t SET x=x+10 RETURNING x", "UPDATE 2"),
+            ("DELETE FROM t WHERE x=11 RETURNING x", "DELETE 1"),
+            ("DELETE FROM t WHERE x=999 RETURNING x", "DELETE 0"),
+            ("SELECT * FROM t", "SELECT 1"),
+        ] {
+            let messages = query_messages(&mut client, sql);
+            let tag = messages.iter().find(|message| message.0 == b'C').unwrap();
+            assert_eq!(tag.1, format!("{expected}\0").as_bytes(), "{sql}");
+        }
+        for (sql, expected) in [
+            ("UPDATE t SET x=x+1 RETURNING x", "UPDATE 1"),
+            ("INSERT INTO t VALUES (20) RETURNING x", "INSERT 0 1"),
+            ("DELETE FROM t WHERE x=20 RETURNING x", "DELETE 1"),
+            ("DELETE FROM t WHERE x=999 RETURNING x", "DELETE 0"),
+        ] {
+            let events = execute_with_binary_result(&mut client, sql);
+            assert!(
+                events.iter().any(
+                    |event| matches!(event, BackendEvent::CommandComplete(tag) if tag == expected)
+                ),
+                "{sql}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
     fn binary_numbers_follow_the_column_type() {
         let (_io, db) = turso_pg::open_database(
             ":memory:",
@@ -1601,7 +1641,8 @@ mod tests {
         for sql in ["SELECT i FROM o", "SELECT 1 UNION ALL SELECT 12.5"] {
             let mut stmt = conn.prepare(sql).unwrap();
             let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedBinary).unwrap());
-            let Err(error) = execute_query(&mut stmt, fields) else {
+            let parsed = parse_statement(sql).unwrap();
+            let Err(error) = execute_query(&mut stmt, fields, &parsed) else {
                 panic!("{sql}: no error");
             };
             assert_eq!(sqlstate(error), SQLSTATE_FEATURE_NOT_SUPPORTED, "{sql}");
