@@ -628,6 +628,11 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether an implicit INSERT target list may omit trailing values.
+    fn insert_implicit_target_allows_fewer_values(&self) -> bool {
+        false
+    }
+
     /// Whether INSERT generates a rowid for an `INTEGER PRIMARY KEY` that is
     /// NULL or not given.
     ///
