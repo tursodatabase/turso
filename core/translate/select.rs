@@ -207,6 +207,7 @@ pub(crate) fn prepare_select_plan_from_arms(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
+    let _nested_query = resolver.enter_nested_query()?;
     let mut compound_arms = compound_arms.into_iter().peekable();
     if compound_arms.peek().is_none() {
         return Ok(Plan::Select(Box::new(prepare_one_select_plan(

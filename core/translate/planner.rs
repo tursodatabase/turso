@@ -1255,6 +1255,9 @@ fn plan_cte(
             {
                 continue;
             }
+            // The plan of this CTE holds the plan of the CTE that it reads, so a
+            // chain of CTEs in one WITH clause nests its plans one in another.
+            let nested_query = resolver.enter_nested_query()?;
             let referenced_cte_table = plan_cte(
                 referenced_cte_index,
                 cte_definitions,
@@ -1264,6 +1267,7 @@ fn plan_cte(
                 connection,
                 false,
             )?;
+            drop(nested_query);
             outer_query_refs.push(OuterQueryReference {
                 identifier: referenced_cte_table.identifier.clone(),
                 has_alias: referenced_cte_table.has_alias,

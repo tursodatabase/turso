@@ -1635,6 +1635,12 @@ impl Statement {
         }
     }
 
+    /// Sets the number of trigger and foreign key action programs that execute
+    /// this statement, one inside the other.
+    pub(crate) fn set_subprogram_depth(&mut self, depth: usize) {
+        self.state.subprogram_depth = depth;
+    }
+
     /// Lightweight reset for reusing a cached subprogram statement.
     /// Skips transaction handling and abort(): the caller (op_program) has
     /// already handled trigger execution tracking. Only resets ProgramState

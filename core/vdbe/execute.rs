@@ -6082,6 +6082,14 @@ pub fn op_program(
     loop {
         match std::mem::take(state.active_op_state.program()) {
             OpProgramState::Start => {
+                // The compiler stops at the same depth. But a foreign key action
+                // that cascades to its own table executes one program for each
+                // level of the cascade, with no compilation.
+                if state.subprogram_depth >= crate::vdbe::MAX_TRIGGER_DEPTH {
+                    return Err(
+                        LimboError::SqlError(crate::vdbe::TRIGGER_DEPTH_ERROR.to_string()).into(),
+                    );
+                }
                 // Try to reuse a cached statement for this PC, otherwise create a new one.
                 // When we have triggers or fk-actions with multi-row inserts, we can re-use
                 // cached statements by storing them key'd by the state.pc if we are in a loop
@@ -6101,6 +6109,7 @@ pub fn op_program(
                             false,
                         ))
                     };
+                statement.set_subprogram_depth(state.subprogram_depth + 1);
 
                 // Check if this is a trigger subprogram - if so, track execution
                 // and save last_insert_rowid so it can be restored after the trigger finishes.
@@ -10414,7 +10423,7 @@ fn parse_schema_sql_for_alter(
         }
         return Ok(Some(ast::Cmd::Stmt(stmt)));
     }
-    dialect.parse(sql).map(|(cmd, _)| cmd)
+    dialect.parse_internal(sql).map(|(cmd, _)| cmd)
 }
 
 pub fn op_function(
@@ -17126,7 +17135,7 @@ pub fn op_rename_table(
                 if !sql_might_reference_identifier(&view.sql, &normalized_from) {
                     continue;
                 }
-                let Some(ast::Cmd::Stmt(stmt)) = conn.dialect().parse(&view.sql)?.0 else {
+                let Some(ast::Cmd::Stmt(stmt)) = conn.dialect().parse_internal(&view.sql)?.0 else {
                     continue;
                 };
                 if let Some(rewrite) = rewrite_view_for_table_rename(
