@@ -566,3 +566,43 @@ fn test_wal_with_bad_header_checksum_is_ignored() -> anyhow::Result<()> {
     assert_eq!(count, 51);
     Ok(())
 }
+
+/// Another connection holds the write lock with no frames written. FULL, RESTART and TRUNCATE
+/// try the writer lock first, so they report busy=1 with the WAL totals every time, even when
+/// the WAL is already fully backfilled (SQLite: 1|3|3 on both calls).
+fn assert_checkpoint_busy_while_writer_holds_lock(tmp_db: &TempDatabase, mode: &str) -> Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA wal_autocheckpoint=0;")?;
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY);")?;
+    conn.execute("INSERT INTO t VALUES (1);")?;
+
+    let writer = tmp_db.connect_limbo();
+    writer.execute("BEGIN IMMEDIATE;")?;
+    let sql = format!("PRAGMA wal_checkpoint({mode});");
+    assert_that!(execute_and_get_ints(&conn, &sql)?).is_equal_to(vec![1, 3, 3]);
+    assert_that!(execute_and_get_ints(&conn, &sql)?).is_equal_to(vec![1, 3, 3]);
+    writer.execute("COMMIT;")?;
+    assert_that!(execute_and_get_ints(&conn, &sql)?[0]).is_equal_to(0);
+    Ok(())
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_full_checkpoint_busy_while_writer_holds_lock(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    assert_checkpoint_busy_while_writer_holds_lock(&tmp_db, "FULL")
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_restart_checkpoint_busy_while_writer_holds_lock(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    assert_checkpoint_busy_while_writer_holds_lock(&tmp_db, "RESTART")
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_truncate_checkpoint_busy_while_writer_holds_lock(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    assert_checkpoint_busy_while_writer_holds_lock(&tmp_db, "TRUNCATE")
+}

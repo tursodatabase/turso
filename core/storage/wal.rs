@@ -5011,9 +5011,14 @@ impl WalFile {
                             { "max_frame": max_frame, "nbackfills": nbackfills }
                         );
                     }
-                    if !needs_backfill && !mode.should_restart_log() {
+                    if !needs_backfill
+                        && !mode.should_restart_log()
+                        && !mode.require_all_backfilled()
+                    {
                         // there are no frames to copy over and we don't need to reset
-                        // the log so we can return early success.
+                        // the log, and the mode does not need the writer lock (FULL
+                        // takes it even with nothing to backfill, like SQLite), so we
+                        // can return early success.
                         return Ok(IOResult::Done(CheckpointResult::new(
                             max_frame, nbackfills, 0,
                         )));
