@@ -14,7 +14,8 @@ use crate::sqlstate::{
     SQLSTATE_INVALID_COLUMN_REFERENCE, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
     SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_OBJECT_DEFINITION,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
-    SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
+    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
     SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
     SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
     SQLSTATE_WINDOWING_ERROR,
@@ -6262,34 +6263,23 @@ pub struct SequenceOptions {
 
 impl SequenceOptions {
     /// The options of a sequence of the type `data_type`, or of the type an `AS`
-    /// option names.
+    /// option names. INCREMENT, the bounds and START are checked by core
+    /// (`Sequence::new`), when it creates the sequence.
     pub fn new(
         options: &[pg_query::protobuf::Node],
         data_type: Option<&str>,
     ) -> Result<Self, ParseError> {
-        let mut start = None;
-        let mut increment = None;
-        let mut min_value = None;
-        let mut max_value = None;
         let mut cycle = false;
 
         let mut as_type = data_type.map(str::to_string);
         let mut seen = std::collections::HashSet::new();
         let mut as_type_name = None;
-        let mut cache = None;
+        // The options with a number, read after the loop in the order
+        // PostgreSQL reads them, so that the first error is the one it reports.
+        let (mut start_elem, mut increment_elem, mut min_elem, mut max_elem, mut cache_elem) =
+            (None, None, None, None, None);
         for opt_node in options {
             if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
-                if matches!(
-                    elem.defname.as_str(),
-                    "start" | "increment" | "minvalue" | "maxvalue"
-                ) && elem.arg.is_some()
-                    && extract_def_elem_int(elem).is_none()
-                {
-                    return Err(ParseError::not_supported(format!(
-                        "this {} value in CREATE SEQUENCE",
-                        elem.defname.to_uppercase()
-                    )));
-                }
                 let is_repeated = !seen.insert(elem.defname.as_str())
                     || (elem.defname == "as" && data_type.is_some());
                 if is_repeated {
@@ -6306,25 +6296,15 @@ impl SequenceOptions {
                         };
                         as_type_name = Some(tn);
                     }
-                    "start" => {
-                        start = extract_def_elem_int(elem);
-                    }
-                    "increment" => {
-                        increment = extract_def_elem_int(elem);
-                    }
-                    "minvalue" => {
-                        min_value = extract_def_elem_int(elem);
-                    }
-                    "maxvalue" => {
-                        max_value = extract_def_elem_int(elem);
-                    }
+                    "start" => start_elem = Some(&**elem),
+                    "increment" => increment_elem = Some(&**elem),
+                    "minvalue" => min_elem = Some(&**elem),
+                    "maxvalue" => max_elem = Some(&**elem),
                     "cycle" => {
                         // pg_query emits Boolean(true) for CYCLE, Boolean(false) for NO CYCLE
                         cycle = extract_def_elem_bool(elem);
                     }
-                    "cache" => {
-                        cache = Some(extract_def_elem_int(elem));
-                    }
+                    "cache" => cache_elem = Some(&**elem),
                     "owned_by"
                         if matches!(
                             elem.arg.as_ref().and_then(|n| n.node.as_ref()),
@@ -6345,13 +6325,12 @@ impl SequenceOptions {
             }
         }
 
-        // AS smallint/integer narrows the default bound in the sequence's
-        // direction; bigint is the default range.
         if let Some(type_name) = as_type_name {
             as_type = Some(sequence_data_type(type_name)?.to_string());
         }
-        if let Some(as_type) = as_type {
-            let (type_min, type_max, type_name) = match as_type.to_lowercase().as_str() {
+        let (type_min, type_max, type_name) = match as_type.as_deref().map(str::to_lowercase) {
+            None => (i64::MIN, i64::MAX, "bigint"),
+            Some(as_type) => match as_type.as_str() {
                 "int2" | "smallint" => (i16::MIN as i64, i16::MAX as i64, "smallint"),
                 "int4" | "integer" | "int" => (i32::MIN as i64, i32::MAX as i64, "integer"),
                 "int8" | "bigint" => (i64::MIN, i64::MAX, "bigint"),
@@ -6360,41 +6339,66 @@ impl SequenceOptions {
                         "CREATE SEQUENCE AS {other} is not supported"
                     )))
                 }
-            };
-            for (option, value) in [("MINVALUE", min_value), ("MAXVALUE", max_value)] {
-                if let Some(value) = value.filter(|v| !(type_min..=type_max).contains(v)) {
-                    return Err(ParseError::Sqlstate {
-                        sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
-                        message: format!(
-                            "{option} ({value}) is out of range for sequence data type {type_name}"
-                        ),
-                    });
-                }
+            },
+        };
+        let invalid = |message: String| ParseError::Sqlstate {
+            sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
+            message,
+        };
+        let read = |elem: Option<&pg_query::protobuf::DefElem>| -> Result<Option<i64>, ParseError> {
+            elem.map_or(Ok(None), sequence_option_int)
+        };
+        let read_bound = |option: &str, elem| -> Result<Option<i64>, ParseError> {
+            let value = read(elem)?;
+            match value.filter(|v| !(type_min..=type_max).contains(v)) {
+                Some(value) => Err(invalid(format!(
+                    "{option} ({value}) is out of range for sequence data type {type_name}"
+                ))),
+                None => Ok(value),
             }
-            if increment.unwrap_or(1) > 0 {
-                max_value.get_or_insert(type_max);
-            } else {
-                min_value.get_or_insert(type_min);
-            }
-        }
+        };
 
-        match cache {
-            None | Some(Some(1)) => {}
-            Some(Some(cache)) if cache < 1 => {
-                return Err(ParseError::Sqlstate {
-                    sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
-                    message: format!("CACHE ({cache}) must be greater than zero"),
-                });
+        // The values are read in the order PostgreSQL's init_params reads
+        // them, so that of several numbers it can't read, the one it reports
+        // comes first.
+        let increment = read(increment_elem)?;
+        let ascending = increment.unwrap_or(1) > 0;
+        let mut max_value = read_bound("MAXVALUE", max_elem)?;
+        let mut min_value = read_bound("MINVALUE", min_elem)?;
+        // PostgreSQL checks INCREMENT and the bounds before it reads START, and
+        // START against the bounds before it reads CACHE. Core makes these
+        // checks for a sequence it creates; when START or CACHE can't be read,
+        // the error PostgreSQL would have raised first is reported instead.
+        let checks = EarlierSequenceChecks {
+            increment,
+            min_value,
+            max_value,
+            ascending,
+            type_min,
+            type_max,
+        };
+        let start = read(start_elem).map_err(|e| checks.first_error(None).unwrap_or(e))?;
+        match read(cache_elem).map_err(|e| checks.first_error(Some(start)).unwrap_or(e))? {
+            None | Some(1) => {}
+            Some(cache) if cache < 1 => {
+                return Err(invalid(format!(
+                    "CACHE ({cache}) must be greater than zero"
+                )));
             }
-            Some(Some(cache)) => {
+            Some(cache) => {
                 return Err(ParseError::not_supported(format!(
                     "CACHE {cache} (Turso sequences do not cache values, so CACHE must be 1)"
                 )));
             }
-            Some(None) => {
-                return Err(ParseError::not_supported(
-                    "this CACHE value in CREATE SEQUENCE",
-                ));
+        }
+
+        // AS smallint/integer narrows the default bound in the sequence's
+        // direction; bigint is the default range.
+        if as_type.is_some() {
+            if ascending {
+                max_value.get_or_insert(type_max);
+            } else {
+                min_value.get_or_insert(type_min);
             }
         }
 
@@ -6405,6 +6409,56 @@ impl SequenceOptions {
             max_value,
             cycle,
         })
+    }
+}
+
+/// The values of a sequence's options that PostgreSQL checks before it reads
+/// START and CACHE (see `SequenceOptions::new`).
+struct EarlierSequenceChecks {
+    increment: Option<i64>,
+    min_value: Option<i64>,
+    max_value: Option<i64>,
+    ascending: bool,
+    type_min: i64,
+    type_max: i64,
+}
+
+impl EarlierSequenceChecks {
+    /// The first of PostgreSQL's checks that fails, in its order: INCREMENT,
+    /// MINVALUE against MAXVALUE, and, once START was read (`start` is
+    /// `Some`), START against the bounds. The messages are core's
+    /// (`Sequence::new`).
+    fn first_error(&self, start: Option<Option<i64>>) -> Option<ParseError> {
+        let invalid = |message: String| ParseError::Sqlstate {
+            sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
+            message,
+        };
+        if self.increment == Some(0) {
+            return Some(invalid("INCREMENT must not be zero".to_string()));
+        }
+        let max = self
+            .max_value
+            .unwrap_or(if self.ascending { self.type_max } else { -1 });
+        let min = self
+            .min_value
+            .unwrap_or(if self.ascending { 1 } else { self.type_min });
+        if min >= max {
+            return Some(invalid(format!(
+                "MINVALUE ({min}) must be less than MAXVALUE ({max})"
+            )));
+        }
+        let start = start?.unwrap_or(if self.ascending { min } else { max });
+        if start < min {
+            return Some(invalid(format!(
+                "START value ({start}) cannot be less than MINVALUE ({min})"
+            )));
+        }
+        if start > max {
+            return Some(invalid(format!(
+                "START value ({start}) cannot be greater than MAXVALUE ({max})"
+            )));
+        }
+        None
     }
 }
 
@@ -7709,17 +7763,36 @@ fn check_type_is_supported(name: &str, array_dimensions: usize) -> Result<(), Pa
     )))
 }
 
-/// Extract an integer value from a DefElem's arg node.
-fn extract_def_elem_int(elem: &pg_query::protobuf::DefElem) -> Option<i64> {
+/// The integer value of a sequence option, read as PostgreSQL reads it into a
+/// bigint: a number with a fraction or an exponent, such as `1.5` or `1e3`, is
+/// invalid input (22P02), and an integer past the bigint range is out of range
+/// (22003). The message quotes the number as written. The grammar gives these
+/// options only numbers; None for an option without one.
+fn sequence_option_int(elem: &pg_query::protobuf::DefElem) -> Result<Option<i64>, ParseError> {
     use pg_query::protobuf::node::Node;
-    match elem.arg.as_ref().and_then(|n| n.node.as_ref()) {
-        Some(Node::Integer(i)) => Some(i.ival as i64),
-        Some(Node::Float(f)) => non_decimal_literal_as_decimal(&f.fval)
-            .unwrap_or_else(|| f.fval.clone())
-            .parse::<i64>()
-            .ok(),
-        _ => None,
-    }
+    use std::num::IntErrorKind;
+    let written = match elem.arg.as_ref().and_then(|n| n.node.as_ref()) {
+        Some(Node::Integer(i)) => return Ok(Some(i64::from(i.ival))),
+        // A decimal past int4, such as `3_000_000_000`, is a Float, and may hold
+        // underscores between its digits.
+        Some(Node::Float(f)) => &f.fval,
+        _ => return Ok(None),
+    };
+    let digits =
+        non_decimal_literal_as_decimal(written).unwrap_or_else(|| written.replace('_', ""));
+    digits
+        .parse::<i64>()
+        .map(Some)
+        .map_err(|error| match error.kind() {
+            IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => ParseError::Sqlstate {
+                sqlstate: SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                message: format!("value \"{written}\" is out of range for type bigint"),
+            },
+            _ => ParseError::Sqlstate {
+                sqlstate: SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                message: format!("invalid input syntax for type bigint: \"{written}\""),
+            },
+        })
 }
 
 fn extract_def_elem_bool(elem: &pg_query::protobuf::DefElem) -> bool {
@@ -14531,13 +14604,36 @@ mod tests {
     fn fail_closed_create_sequence_options() {
         assert_not_supported("CREATE TEMP SEQUENCE s", "TEMPORARY SEQUENCE");
         assert_not_supported("CREATE SEQUENCE s OWNED BY t.id", "OWNED BY");
-        assert_not_supported(
-            "CREATE SEQUENCE s MAXVALUE 99999999999999999999",
-            "MAXVALUE value",
-        );
         assert_not_supported("CREATE SEQUENCE s CACHE 10", "CACHE 10");
         assert_not_supported("CREATE SEQUENCE s CACHE 9999999999", "CACHE 9999999999");
-        assert_not_supported("CREATE SEQUENCE s CACHE 1.5", "CACHE value");
+        // A number that does not read as a bigint is refused as PostgreSQL refuses it.
+        for (sql, expected) in [
+            ("CREATE SEQUENCE s MAXVALUE 99999999999999999999", "22003"),
+            ("CREATE SEQUENCE s START -99999999999999999999", "22003"),
+            ("CREATE SEQUENCE s CACHE 1.5", "22P02"),
+            ("CREATE SEQUENCE s INCREMENT 1e3", "22P02"),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            match PostgreSQLTranslator::new().translate_with_prereqs(&parsed) {
+                Err(ParseError::Sqlstate { sqlstate, .. }) => {
+                    assert_eq!(sqlstate, expected, "{sql}")
+                }
+                Err(err) => panic!("{sql}: expected SQLSTATE {expected}, got: {err}"),
+                Ok(_) => panic!("{sql}: expected SQLSTATE {expected}"),
+            }
+        }
+        // The message quotes the number as written.
+        let parsed = crate::parse("CREATE SEQUENCE s MAXVALUE 0xFFFF_FFFF_FFFF_FFFF_F").unwrap();
+        let err = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&parsed)
+            .expect_err("MAXVALUE past bigint");
+        assert!(
+            err.to_string()
+                .contains("value \"0xFFFF_FFFF_FFFF_FFFF_F\" is out of range for type bigint"),
+            "{err}"
+        );
+        // A bigint past the int4 range with underscores reads as its value.
+        assert_translates("CREATE SEQUENCE s START 3_000_000_000 MAXVALUE 4_000_000_000");
         assert_translates("CREATE SEQUENCE s OWNED BY NONE NO MINVALUE NO MAXVALUE CACHE 1");
 
         let parsed = crate::parse("CREATE SEQUENCE s AS integer START WITH 1").unwrap();
