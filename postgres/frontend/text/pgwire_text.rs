@@ -39,6 +39,31 @@ pub(super) fn format_f64(value: f64) -> String {
     buffer.format(value).to_string()
 }
 
+/// An array literal such as `{0.1,{0.2,NULL}}` with each element that is not
+/// NULL written by `write`, which reads the element as it came from the engine.
+pub(super) fn map_array_elements(array: &str, write: impl Fn(&str) -> String) -> String {
+    let mut out = String::with_capacity(array.len());
+    let mut element = String::new();
+    let flush = |element: &mut String, out: &mut String| {
+        if element.is_empty() || element == "NULL" {
+            out.push_str(element);
+        } else {
+            out.push_str(&write(element));
+        }
+        element.clear();
+    };
+    for c in array.chars() {
+        if matches!(c, '{' | '}' | ',') {
+            flush(&mut element, &mut out);
+            out.push(c);
+        } else {
+            element.push(c);
+        }
+    }
+    flush(&mut element, &mut out);
+    out
+}
+
 pub(crate) fn encode_bytea(value: &[u8], array: bool) -> String {
     let mut out = String::new();
     // for a bytea_array, the bytes are enclosed in quotes,
