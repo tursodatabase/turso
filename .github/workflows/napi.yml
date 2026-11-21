@@ -490,6 +490,10 @@ jobs:
         env:
           LOCAL_SYNC_SERVER: ${{ github.workspace }}/target/debug/tursodb
         run: yarn workspace @tursodatabase/sync-wasm test
+
+      - name: Test binary browser metadata and encrypted OPFS reopen
+        working-directory: bindings/javascript
+        run: yarn workspace @tursodatabase/sync-wasm test:encryption
   publish:
     name: Publish
     runs-on: ubuntu-latest
