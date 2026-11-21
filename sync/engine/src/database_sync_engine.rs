@@ -3097,6 +3097,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 ));
             }
             let raw_replay_refresh = replace_base_pages || raw_page_replay_on_sql_conn;
+            // These pulls commit the remote pages before the local replay, so other
+            // connections must be kept out by the SDK's busy gate in between.
+            assert!(
+                !raw_replay_refresh || self.stream_needs_sync_busy_gate(stream_kind),
+                "a pull that commits remote pages before the local replay must need the busy gate"
+            );
             let recreate_cdc =
                 replace_base_pages || had_cdc_table && stream_kind_applies_remote_pages(stream_kind);
 
