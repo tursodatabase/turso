@@ -49,7 +49,7 @@ fn builtin_types(
         (NO_COLLATE, RangeOffsets::None, SORTS, "CREATE TYPE date(value text) BASE text ENCODE temporal_encode(value, 'date') DECODE value OPERATOR '<'"),
         (NO_COLLATE, RangeOffsets::None, SORTS, "CREATE TYPE time(value text) BASE text ENCODE temporal_encode(value, 'time') DECODE value OPERATOR '<'"),
         (NO_COLLATE, RangeOffsets::None, SORTS, "CREATE TYPE timestamp(value text) BASE text ENCODE temporal_encode(value, 'timestamp') DECODE value OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::None, SORTS, "CREATE TYPE timestamptz(value text) BASE text ENCODE temporal_encode(value, 'timestamptz') DECODE value OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, SORTS, "CREATE TYPE timestamptz(value text) BASE text ENCODE temporal_encode(value, 'timestamptz') DECODE value || '+00' OPERATOR '<'"),
         (NO_COLLATE, RangeOffsets::Integer, NO_SORT, "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'"),
         (NO_COLLATE, RangeOffsets::Integer, NO_SORT, "CREATE TYPE bigint(value integer) BASE integer"),
         (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value"),

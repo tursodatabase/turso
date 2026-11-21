@@ -459,6 +459,17 @@ expect {
     1
 }
 
+# A timestamptz prints in UTC with the offset `+00`.
+test datetime-timestamptz-prints-utc-offset {
+    CREATE TABLE t (id int, tz timestamptz);
+    INSERT INTO t VALUES (1, '2024-01-05 10:00:00+02'), (2, '2024-01-05 10:00:00.5');
+    SELECT id, tz, tz::text FROM t ORDER BY id;
+}
+expect {
+    1|2024-01-05 08:00:00+00|2024-01-05 08:00:00+00
+    2|2024-01-05 10:00:00.5+00|2024-01-05 10:00:00.5+00
+}
+
 # A timestamp compared with a timestamptz is read as a timestamptz, whether
 # the query scans the table or seeks an index on either column.
 

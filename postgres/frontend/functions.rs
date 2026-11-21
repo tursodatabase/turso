@@ -114,8 +114,12 @@ fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
     let Value::Text(value) = args[1].get_value() else {
         return Ok(None);
     };
-    let time =
-        NaiveDateTime::parse_from_str(value.as_str(), "%Y-%m-%d %H:%M:%S%.f").map_err(|_| {
+    // A timestamptz reads as its UTC time followed by `+00`.
+    let time = value
+        .as_str()
+        .strip_suffix("+00")
+        .and_then(|utc| NaiveDateTime::parse_from_str(utc, "%Y-%m-%d %H:%M:%S%.f").ok())
+        .ok_or_else(|| {
             not_supported(format!(
                 "date_trunc is not supported for the timestamptz value \"{}\"",
                 value.as_str()
@@ -415,16 +419,19 @@ impl<O: ScalarReturn + 'static> ScalarCall for PgScalarFunction<O> {
     }
 }
 
-/// A `timestamptz` value in its text form, such as `2000-01-01 00:00:00.5`.
-/// Returning one gives the function the type `timestamptz`, so `now() + 1` is
-/// an error as in PostgreSQL instead of adding 1 to text.
+/// A `timestamptz` value: the text of its UTC time, such as
+/// `2000-01-01 00:00:00.5`. Returning one gives the function the type
+/// `timestamptz`, so `now() + 1` is an error as in PostgreSQL instead of
+/// adding 1 to text.
 struct Timestamptz(String);
 
 impl ScalarReturn for Timestamptz {
     const TYPE: Option<ReturnType> = Some(ReturnType::Custom("timestamptz"));
 
+    /// The text a timestamptz column reads as, with the offset `+00`, so the
+    /// result compares equal to a column holding the same time.
     fn into_value(self) -> Value {
-        Value::build_text(self.0)
+        Value::build_text(format!("{}+00", self.0))
     }
 }
 
@@ -1037,7 +1044,7 @@ enum JsonElement {
     Bytea,
     /// A JSON string with a `T` between the date and the time.
     Timestamp,
-    /// Like Timestamp, followed by the UTC offset `+00:00`.
+    /// Like Timestamp, with the UTC offset `+00:00` in place of `+00`.
     Timestamptz,
     /// The value's text, as a JSON string.
     Text,
@@ -1101,10 +1108,10 @@ fn write_json_element(element: &Value, kind: JsonElement, json: &mut String) {
         (JsonElement::Timestamp, Value::Text(text)) => {
             write_json_string(&text.as_str().replacen(' ', "T", 1), json)
         }
-        (JsonElement::Timestamptz, Value::Text(text)) => write_json_string(
-            &format!("{}+00:00", text.as_str().replacen(' ', "T", 1)),
-            json,
-        ),
+        (JsonElement::Timestamptz, Value::Text(text)) => {
+            let utc = text.as_str().strip_suffix("+00").unwrap_or(text.as_str());
+            write_json_string(&format!("{}+00:00", utc.replacen(' ', "T", 1)), json)
+        }
         (JsonElement::Text, Value::Numeric(number)) => {
             write_json_string(&Value::Numeric(*number).to_string(), json)
         }

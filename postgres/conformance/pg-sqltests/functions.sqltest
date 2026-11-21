@@ -3017,6 +3017,50 @@ expect {
     year
 }
 
+# date_trunc returns a timestamptz that equals a column holding the same time.
+test date-trunc-equals-timestamptz-column {
+    CREATE TABLE trunc_days (id int, at timestamptz, day timestamptz);
+    INSERT INTO trunc_days VALUES (1, '2026-10-08 12:34:56+00', '2026-10-08 00:00:00+00'),
+        (2, '2026-10-09 00:30:00+02', '2026-10-08 00:00:00+00');
+    SELECT id, date_trunc('day', at), date_trunc('day', at)::text FROM trunc_days
+    WHERE date_trunc('day', at) = day ORDER BY id;
+}
+expect {
+    1|2026-10-08 00:00:00+00|2026-10-08 00:00:00+00
+    2|2026-10-08 00:00:00+00|2026-10-08 00:00:00+00
+}
+
+# now() and the other clock functions return a timestamptz that equals a
+# column or a cast holding the same time.
+test now-equals-stored-timestamptz {
+    CREATE TABLE stamped (at timestamptz);
+    BEGIN;
+    INSERT INTO stamped VALUES (now());
+    SELECT count(*) FROM stamped WHERE at = now() AND at = transaction_timestamp();
+    SELECT count(*) WHERE now() = now()::text::timestamptz AND now() = CAST(now() AS timestamptz);
+    COMMIT;
+}
+expect {
+    1
+    1
+}
+
+test clock-functions-end-in-utc-offset {
+    SELECT count(*) WHERE now()::text LIKE '%+00' AND statement_timestamp()::text LIKE '%+00'
+        AND clock_timestamp()::text LIKE '%+00';
+}
+expect {
+    1
+}
+
+# A timestamptz in JSON has the offset `+00:00`.
+test array-to-json-writes-timestamptz-with-offset {
+    SELECT array_to_json(ARRAY['2024-01-02 03:04:05'::timestamptz, '2024-01-02 03:04:05.5+02'::timestamptz]);
+}
+expect {
+    ["2024-01-02T03:04:05+00:00","2024-01-02T01:04:05.5+00:00"]
+}
+
 # date_trunc of a timestamptz column, a typical "events per day" query.
 test date-trunc-group-by-day {
     CREATE TABLE trunc_events (at timestamptz);
