@@ -443,6 +443,15 @@ pub fn validate_precision_scale(
     Ok(rounded)
 }
 
+/// The numeric rounded half away from zero to an integer, or None when the
+/// result does not fit in an i64.
+pub fn numeric_to_rounded_i64(val: &Value) -> crate::Result<Option<i64>> {
+    use bigdecimal::{RoundingMode, ToPrimitive};
+    Ok(numeric_from_value(val)?
+        .with_scale_round(0, RoundingMode::HalfUp)
+        .to_i64())
+}
+
 /// The quotient of two numerics, which is not zero-divisor checked, rounded
 /// half away from zero to the scale PostgreSQL picks (`select_div_scale`).
 pub fn numeric_divide(dividend: &BigDecimal, divisor: &BigDecimal) -> BigDecimal {

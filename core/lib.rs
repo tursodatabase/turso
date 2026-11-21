@@ -177,7 +177,11 @@ pub use io::{
     SyscallIO, WriteCompletion, IO,
 };
 pub use namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
-pub use numeric::{nonnan::NonNan, Numeric};
+pub use numeric::{
+    decimal::{format_numeric, numeric_from_value, numeric_to_rounded_i64},
+    nonnan::NonNan,
+    Numeric,
+};
 pub use security::roles::SessionRole;
 pub use statement::{
     ColumnOrigin, ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter,
