@@ -2921,7 +2921,6 @@ impl Database {
             cache_size: AtomicI32::new(default_cache_size),
             next_page_size: AtomicU32::new(0),
             wal_auto_actions: AtomicU8::new(WalAutoActions::all_enabled().bits()),
-            sql_checkpoints_refused: AtomicBool::new(false),
             wal_autocheckpoint: AtomicU32::new(1000),
             #[cfg(feature = "conn_raw_api")]
             portable_logical_changes_enabled: AtomicBool::new(false),
