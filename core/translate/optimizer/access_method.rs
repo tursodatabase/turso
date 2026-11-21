@@ -1218,7 +1218,14 @@ fn find_best_access_method_for_btree<'a>(
             );
         }
 
-        if !has_two_local_constraint_terms(rhs_constraints, where_clause) {
+        // The join search gets here for each join order that it tries.
+        let two_local_terms = match multi_index_work {
+            Some(work) => work.has_two_local_constraint_terms(|| {
+                has_two_local_constraint_terms(rhs_constraints, where_clause)
+            }),
+            None => has_two_local_constraint_terms(rhs_constraints, where_clause),
+        };
+        if !two_local_terms {
             return Ok(Some(best_access_method));
         }
         if let Some(multi_idx_and_method) = consider_multi_index_intersection(

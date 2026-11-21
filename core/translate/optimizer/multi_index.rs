@@ -95,9 +95,19 @@ pub(crate) struct MultiIndexTableWork<'a> {
     and_terms: OnceCell<Option<AndClauseDecomposition>>,
     /// The OR terms that a union scan of the table can use.
     or_terms: OnceCell<Vec<UnionTerm<'a>>>,
+    /// Whether the table has two local constraint terms, which an
+    /// intersection scan needs.
+    two_local_constraint_terms: OnceCell<bool>,
 }
 
 impl MultiIndexTableWork<'_> {
+    /// Return whether the table has two local constraint terms. `compute`
+    /// gives the answer the first time. The terms and their constraints do
+    /// not change during the search.
+    pub(crate) fn has_two_local_constraint_terms(&self, compute: impl FnOnce() -> bool) -> bool {
+        *self.two_local_constraint_terms.get_or_init(compute)
+    }
+
     /// Return false if an earlier call of [consider_multi_index_union] for the
     /// table found that no OR term can give a union scan for any join order.
     /// [consider_multi_index_union] then returns `None`.
