@@ -13,7 +13,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr::expr_references_any_subquery;
 use crate::translate::optimizer::access_method::{
     choose_best_btree_candidate, choose_best_in_seek_candidate, AccessMethod, AccessMethodParams,
-    BranchReadMode, ChosenInSeekCandidate,
+    BranchReadMode, ChosenInSeekCandidate, LhsMaskMemo,
 };
 use crate::translate::optimizer::constraints::{
     analyze_binary_term_for_index, can_use_partial_index, partial_index_predicate_terms,
@@ -398,12 +398,12 @@ fn choose_multi_index_branch_access(
         base_row_count,
         params,
     )?;
-    let chosen_refs_memo = chosen_seek
+    let chosen_memo = chosen_seek
         .as_ref()
-        .and_then(|chosen| chosen.constraint_refs(table_constraints));
-    let chosen_refs: &[RangeConstraintRef] = chosen_refs_memo
+        .and_then(|chosen| chosen.memo(table_constraints));
+    let chosen_refs = chosen_memo
         .as_deref()
-        .map_or(&[], smallvec::SmallVec::as_slice);
+        .map_or(&[][..], LhsMaskMemo::usable_constraint_refs);
 
     let mut best_branch = chosen_seek
         .as_ref()

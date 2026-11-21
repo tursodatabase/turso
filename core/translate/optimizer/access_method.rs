@@ -44,9 +44,9 @@ use super::{
     },
     cost::{
         estimate_btree_depth, estimate_cost_for_scan_or_seek,
-        estimate_cost_for_scan_or_seek_with_depth_memo, estimate_ephemeral_index_build_cost,
+        estimate_cost_for_scan_or_seek_with_memos, estimate_ephemeral_index_build_cost,
         estimate_index_cost, estimate_rows_per_seek, estimate_scan_cost, estimate_sort_cpu_cost,
-        AnalyzeCtx, Cost, IndexInfo,
+        AnalyzeCtx, Cost, IndexInfo, RowsPerSeekMemo,
     },
     join::JoinPlanningContext,
     multi_index::{
@@ -166,8 +166,8 @@ pub enum AccessMethodParams {
 }
 
 /// Result of generic btree candidate selection before it is wrapped into a full
-/// [`AccessMethod`]. [ChosenBtreeCandidate::constraint_refs] gives the
-/// constraint refs of the candidate.
+/// [`AccessMethod`]. [ChosenBtreeCandidate::memo] gives the constraint refs of
+/// the candidate.
 pub(super) struct ChosenBtreeCandidate {
     pub(super) iter_dir: IterationDirection,
     pub(super) index: Option<Arc<Index>>,
@@ -182,19 +182,15 @@ pub(super) struct ChosenBtreeCandidate {
 }
 
 impl ChosenBtreeCandidate {
-    /// Return the usable constraint refs of the candidate, or `None` for a
-    /// table scan. The refs stay in the [LhsMaskMemo] of the candidate until
-    /// the next call of [choose_best_btree_candidate] for `constraints`.
-    pub(super) fn constraint_refs<'a>(
+    /// Return the [LhsMaskMemo] of the candidate, or `None` for a table scan.
+    /// The memo keeps the usable constraint refs of the candidate until the
+    /// next call of [choose_best_btree_candidate] for `constraints`.
+    pub(super) fn memo<'a>(
         &self,
         constraints: &'a TableConstraints,
-    ) -> Option<Ref<'a, SmallVec<[RangeConstraintRef; 2]>>> {
-        self.candidate_idx.map(|candidate_idx| {
-            Ref::map(
-                constraints.candidates[candidate_idx].lhs_mask_memo.borrow(),
-                |memo| &memo.usable_constraint_refs,
-            )
-        })
+    ) -> Option<Ref<'a, LhsMaskMemo>> {
+        self.candidate_idx
+            .map(|candidate_idx| constraints.candidates[candidate_idx].lhs_mask_memo.borrow())
     }
 }
 
@@ -316,6 +312,7 @@ pub(super) fn choose_best_btree_candidate(
                 &mut memo.usable_constraint_refs,
             );
             memo.residual_selectivity = None;
+            memo.rows_per_seek.clear();
         }
         let usable_constraint_refs = &memo.usable_constraint_refs;
         // The unmatched-row pass reads expressions from the table cursor after
@@ -435,7 +432,7 @@ pub(super) fn choose_best_btree_candidate(
             }
             None => base_row_count,
         };
-        let cost = estimate_cost_for_scan_or_seek_with_depth_memo(
+        let cost = estimate_cost_for_scan_or_seek_with_memos(
             index_info,
             &rhs_constraints.constraints,
             usable_constraint_refs,
@@ -445,6 +442,7 @@ pub(super) fn choose_best_btree_candidate(
             params,
             Some(&analyze_ctx),
             Some(&candidate.tree_depth),
+            Some(&memo.rows_per_seek),
         );
 
         // Adjusted output: lower means the loop delivers fewer rows downstream.
@@ -583,6 +581,14 @@ pub(super) struct LhsMaskMemo {
     /// The result of [residual_selectivity] for `usable_constraint_refs`, or
     /// `None` before the first comparison of the candidate needs it.
     residual_selectivity: Option<f64>,
+    /// The rows per seek of a lookup with `usable_constraint_refs`.
+    rows_per_seek: RowsPerSeekMemo,
+}
+
+impl LhsMaskMemo {
+    pub(super) fn usable_constraint_refs(&self) -> &[RangeConstraintRef] {
+        &self.usable_constraint_refs
+    }
 }
 
 fn consumed_where_terms_from_constraint_refs(
@@ -983,29 +989,30 @@ fn find_best_access_method_for_btree<'a>(
         return Ok(None);
     };
 
-    let constraint_refs_memo = best.constraint_refs(rhs_constraints);
-    let constraint_refs: &[RangeConstraintRef] = constraint_refs_memo
+    let memo = best.memo(rhs_constraints);
+    let constraint_refs = memo
         .as_deref()
-        .map_or(&[], SmallVec::as_slice);
+        .map_or(&[][..], LhsMaskMemo::usable_constraint_refs);
     let access_base_row_count = best.base_row_count;
-    let estimated_rows_per_outer_row = if constraint_refs.is_empty() {
-        *access_base_row_count
-    } else {
-        let index_info = best
-            .index_info
-            .expect("a candidate with constraint refs has an IndexInfo");
-        let analyze_ctx = AnalyzeCtx {
-            rhs_table,
-            index: best.index.as_ref(),
-            stats: analyze_stats,
-        };
-        estimate_rows_per_seek(
-            index_info,
-            &rhs_constraints.constraints,
-            constraint_refs,
-            access_base_row_count,
-            Some(&analyze_ctx),
-        )
+    let estimated_rows_per_outer_row = match memo.as_deref() {
+        Some(memo) if !constraint_refs.is_empty() => {
+            let index_info = best
+                .index_info
+                .expect("a candidate with constraint refs has an IndexInfo");
+            let analyze_ctx = AnalyzeCtx {
+                rhs_table,
+                index: best.index.as_ref(),
+                stats: analyze_stats,
+            };
+            memo.rows_per_seek.estimate_rows_per_seek(
+                index_info,
+                &rhs_constraints.constraints,
+                constraint_refs,
+                access_base_row_count,
+                Some(&analyze_ctx),
+            )
+        }
+        _ => *access_base_row_count,
     };
     let mut consumed_where_terms =
         consumed_where_terms_from_constraint_refs(&rhs_constraints.constraints, constraint_refs)?;
@@ -1028,7 +1035,7 @@ fn find_best_access_method_for_btree<'a>(
             constraint_refs: constraint_refs.to_vec(),
         },
     };
-    drop(constraint_refs_memo);
+    drop(memo);
     let mut best_cost_with_filters =
         cost_with_where_work(&best_access_method, ready_where, input_cardinality, params);
 

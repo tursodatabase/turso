@@ -179,6 +179,48 @@ impl BtreeDepthMemo {
     }
 }
 
+/// The result of [estimate_rows_per_seek] for one index candidate and its
+/// usable constraint refs, and the row count of the last call.
+///
+/// The join search tries the same left-side tables, and thus the same refs,
+/// one time for each table that can be the last of them. The owner of the
+/// memo clears it when the refs change.
+#[derive(Debug, Default)]
+pub(crate) struct RowsPerSeekMemo(Cell<Option<(u64, f64)>>);
+
+impl RowsPerSeekMemo {
+    /// Same result as [estimate_rows_per_seek]. The other arguments must be
+    /// the same as in the calls since the last [RowsPerSeekMemo::clear].
+    pub(super) fn estimate_rows_per_seek(
+        &self,
+        index_info: IndexInfo,
+        constraints: &[Constraint],
+        usable_constraint_refs: &[RangeConstraintRef],
+        base_row_count: RowCountEstimate,
+        analyze_ctx: Option<&AnalyzeCtx>,
+    ) -> f64 {
+        let row_count_bits = (*base_row_count).to_bits();
+        if let Some((cached_row_count, rows)) = self.0.get() {
+            if cached_row_count == row_count_bits {
+                return rows;
+            }
+        }
+        let rows = estimate_rows_per_seek(
+            index_info,
+            constraints,
+            usable_constraint_refs,
+            base_row_count,
+            analyze_ctx,
+        );
+        self.0.set(Some((row_count_bits, rows)));
+        rows
+    }
+
+    pub(super) fn clear(&self) {
+        self.0.set(None);
+    }
+}
+
 /// Estimate how many B-tree levels an index search reads.
 pub(super) fn estimate_btree_depth(row_count: f64, rows_per_page: f64) -> f64 {
     if row_count <= 1.0 {
@@ -495,7 +537,7 @@ pub fn estimate_cost_for_scan_or_seek(
     params: &CostModelParams,
     analyze_ctx: Option<&AnalyzeCtx>,
 ) -> Cost {
-    estimate_cost_for_scan_or_seek_with_depth_memo(
+    estimate_cost_for_scan_or_seek_with_memos(
         index_info,
         constraints,
         usable_constraint_refs,
@@ -505,13 +547,15 @@ pub fn estimate_cost_for_scan_or_seek(
         params,
         analyze_ctx,
         None,
+        None,
     )
 }
 
 /// Same result as [estimate_cost_for_scan_or_seek]. When `depth_memo` is
-/// given, it supplies the B-tree depth.
+/// given, it supplies the B-tree depth. When `rows_per_seek_memo` is given,
+/// it supplies the rows per seek.
 #[expect(clippy::too_many_arguments)]
-pub(super) fn estimate_cost_for_scan_or_seek_with_depth_memo(
+pub(super) fn estimate_cost_for_scan_or_seek_with_memos(
     index_info: Option<IndexInfo>,
     constraints: &[Constraint],
     usable_constraint_refs: &[RangeConstraintRef],
@@ -521,6 +565,7 @@ pub(super) fn estimate_cost_for_scan_or_seek_with_depth_memo(
     params: &CostModelParams,
     analyze_ctx: Option<&AnalyzeCtx>,
     depth_memo: Option<&BtreeDepthMemo>,
+    rows_per_seek_memo: Option<&RowsPerSeekMemo>,
 ) -> Cost {
     let base_row_count = *base_row_count;
 
@@ -546,13 +591,22 @@ pub(super) fn estimate_cost_for_scan_or_seek_with_depth_memo(
         );
     }
 
-    let rows_per_seek = estimate_rows_per_seek(
-        index_info,
-        constraints,
-        usable_constraint_refs,
-        RowCountEstimate::AnalyzeStats(base_row_count),
-        analyze_ctx,
-    );
+    let rows_per_seek = match rows_per_seek_memo {
+        Some(memo) => memo.estimate_rows_per_seek(
+            index_info,
+            constraints,
+            usable_constraint_refs,
+            RowCountEstimate::AnalyzeStats(base_row_count),
+            analyze_ctx,
+        ),
+        None => estimate_rows_per_seek(
+            index_info,
+            constraints,
+            usable_constraint_refs,
+            RowCountEstimate::AnalyzeStats(base_row_count),
+            analyze_ctx,
+        ),
+    };
 
     let base_cost = estimate_index_cost(
         base_row_count,
