@@ -804,6 +804,35 @@ fn test_drop_fails_while_insert_waits_for_io_after_abandoned_delete() -> anyhow:
     Ok(())
 }
 
+/// SQLite resolves `false` and `true` in an index WHERE to a column of that
+/// name when the table has one, so these indexes hold the rows where x equals
+/// that column, and a query on `x = 0` or `x = 1` must not read them.
+#[test]
+fn test_sqlite_partial_index_where_true_false_names_a_column() -> anyhow::Result<()> {
+    for (keyword, value) in [("false", 0), ("true", 1)] {
+        let (_tmp_dir, db_path) = create_database_with_sqlite(&format!(
+            "CREATE TABLE t(\"{keyword}\", x, y); \
+             CREATE INDEX ti ON t(y) WHERE x = {keyword}; \
+             INSERT INTO t VALUES (5, 5, 1), ({value}, {value}, 2), (7, {value}, 3);"
+        ))?;
+        let db = TempDatabase::builder().with_db_path(&db_path).build();
+        let conn = db.connect_limbo();
+        for query in [
+            format!("SELECT x, y FROM t WHERE x = {value} AND y > 0 ORDER BY y"),
+            format!("SELECT y, x = {value} FROM t WHERE y > 0 AND x = {value} ORDER BY y"),
+        ] {
+            let rows: Vec<(i64, i64)> = conn.exec_rows(&query);
+            let expected = if query.starts_with("SELECT x") {
+                vec![(value, 2), (value, 3)]
+            } else {
+                vec![(2, 1), (3, 1)]
+            };
+            assert_eq!(rows, expected, "{query}");
+        }
+    }
+    Ok(())
+}
+
 fn next_int(stmt: &mut turso_core::Statement) -> anyhow::Result<Option<i64>> {
     loop {
         match stmt.step()? {

@@ -21,7 +21,7 @@ use crate::{
     },
     types::KeyInfo,
     types::SeekOp,
-    util::exprs_are_equivalent,
+    util::{exprs_are_equivalent, predicate_terms_are_equivalent},
     vdbe::{
         affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder, Subroutine},
@@ -3697,11 +3697,13 @@ impl JoinedTable {
         if columns_mask.is_empty() {
             return;
         }
-        if self
-            .expression_index_usages
-            .iter()
-            .any(|usage| exprs_are_equivalent(&usage.normalized_expr, &normalized_expr))
-        {
+        // `apply_expression_index_coverage` matches usages against a partial
+        // index WHERE with `predicate_terms_are_equivalent`. Deduping with the
+        // same test keeps `x = 0` and `x = FALSE` from counting as two covered
+        // uses of `x` when only one of them is a WHERE term the index proves.
+        if self.expression_index_usages.iter().any(|usage| {
+            predicate_terms_are_equivalent(&usage.normalized_expr, &normalized_expr, self.columns())
+        }) {
             return;
         }
         self.expression_index_usages.push(ExpressionIndexUsage {
@@ -3729,7 +3731,11 @@ impl JoinedTable {
             // Column `name` is not otherwise needed, so we can rely on the
             // expression value from the index and drop the table cursor.
             let matches_where_clause = if let Some(idx_where_clause) = &index.where_clause {
-                exprs_are_equivalent(idx_where_clause, &usage.normalized_expr)
+                predicate_terms_are_equivalent(
+                    idx_where_clause,
+                    &usage.normalized_expr,
+                    self.columns(),
+                )
             } else {
                 false
             };

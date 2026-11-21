@@ -4,7 +4,7 @@ use crate::numeric::StrToF64;
 use crate::schema::CheckConstraint;
 use crate::security::policy::RowPolicy;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
+use crate::translate::expr::{unwrap_parens, walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{BitSet, JoinedTable};
 use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
@@ -800,6 +800,57 @@ fn exprs_match(expr1: &Expr, expr2: &Expr, operands_can_swap: bool) -> bool {
         ) => tbl_1 == tbl_2 && col_1 == col_2 && db1 == db2 && r1 == r2,
         // fall back to naive equality check
         _ => expr1 == expr2,
+    }
+}
+
+/// Like `exprs_are_equivalent`, but also treats TRUE and FALSE as the integers
+/// 1 and 0 when they are an operand of a comparison, so `x = FALSE` matches
+/// `x = 0`. `IS` and `IS NOT` are left out because `x IS FALSE` tests the truth
+/// of x, while `x IS 0` compares values. `columns` are the columns of the table
+/// both expressions read: TRUE or FALSE is not treated as an integer when one of
+/// them has that name.
+pub fn predicate_terms_are_equivalent(expr1: &Expr, expr2: &Expr, columns: &[Column]) -> bool {
+    if exprs_are_equivalent(expr1, expr2) {
+        return true;
+    }
+    let (Expr::Binary(lhs1, op1, rhs1), Expr::Binary(lhs2, op2, rhs2)) = (
+        unwrap_parens(expr1).unwrap_or(expr1),
+        unwrap_parens(expr2).unwrap_or(expr2),
+    ) else {
+        return false;
+    };
+    if op1 != op2 || !op1.is_comparison() || matches!(op1, ast::Operator::Is | ast::Operator::IsNot)
+    {
+        return false;
+    }
+    (comparison_operands_are_equivalent(lhs1, lhs2, columns)
+        && comparison_operands_are_equivalent(rhs1, rhs2, columns))
+        || (op1.is_commutative()
+            && comparison_operands_are_equivalent(lhs1, rhs2, columns)
+            && comparison_operands_are_equivalent(rhs1, lhs2, columns))
+}
+
+fn comparison_operands_are_equivalent(expr1: &Expr, expr2: &Expr, columns: &[Column]) -> bool {
+    // SQLite resolves `true` and `false` to a column of that name when the
+    // table has one, so in an index WHERE that SQLite wrote, `x = false` can
+    // compare x with a column. Turso's parser always makes them literals.
+    let names_no_column = |name: &str| {
+        !columns.iter().any(|c| {
+            c.name
+                .as_ref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
+    };
+    match (expr1, expr2) {
+        (Expr::Literal(Literal::True), Expr::Literal(Literal::Numeric(n)))
+        | (Expr::Literal(Literal::Numeric(n)), Expr::Literal(Literal::True)) => {
+            cmp_numeric_strings(n, "1") && names_no_column("true")
+        }
+        (Expr::Literal(Literal::False), Expr::Literal(Literal::Numeric(n)))
+        | (Expr::Literal(Literal::Numeric(n)), Expr::Literal(Literal::False)) => {
+            cmp_numeric_strings(n, "0") && names_no_column("false")
+        }
+        _ => exprs_are_equivalent(expr1, expr2),
     }
 }
 
