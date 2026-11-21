@@ -868,22 +868,21 @@ pub(crate) fn check_column_type(
             type_name
         );
     };
-    // A type with parameters besides `value` needs each one given, as in `p(10)`.
+    // A column gives one modifier for each type parameter besides `value`, as
+    // in `p(10)`, and none for a type without such parameters.
     let expected = td.user_params().count();
-    if expected > 0 {
-        let provided = match &col_type.size {
-            Some(ast::TypeSize::TypeSize(_, _)) => 2,
-            Some(ast::TypeSize::MaxSize(_)) => 1,
-            None => 0,
-        };
-        if provided != expected {
-            bail_parse_error!(
-                "type \"{}\" requires {} parameter(s), got {}",
-                type_name,
-                expected,
-                provided
-            );
-        }
+    let provided = match &col_type.size {
+        Some(ast::TypeSize::TypeSize(_, _)) => 2,
+        Some(ast::TypeSize::MaxSize(_)) => 1,
+        None => 0,
+    };
+    if provided != expected {
+        bail_parse_error!(
+            "type \"{}\" requires {} parameter(s), got {}",
+            type_name,
+            expected,
+            provided
+        );
     }
     Ok(())
 }
