@@ -194,6 +194,21 @@ async def test_json_functions_extract_patch_and_array_length():
 
 
 @pytest.mark.asyncio
+async def test_bytearray_and_memoryview_blob_parameters():
+    conn = await turso.aio.connect(":memory:")
+    try:
+        cur = conn.cursor()
+        await cur.execute("CREATE TABLE t (id INTEGER, data BLOB)")
+        await cur.execute("INSERT INTO t VALUES (?, ?)", (1, bytearray(b"\x00\xff")))
+        await cur.execute("INSERT INTO t VALUES (?, ?)", (2, memoryview(b"\x00\xff")))
+
+        await cur.execute("SELECT data, typeof(data) FROM t ORDER BY id")
+        assert await cur.fetchall() == [(b"\x00\xff", "blob"), (b"\x00\xff", "blob")]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_async_operations_do_not_block_event_loop():
     import time
 
