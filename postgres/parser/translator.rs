@@ -17,7 +17,7 @@ use crate::sqlstate::{
     SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
     SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
     SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
-    SQLSTATE_WINDOWING_ERROR,
+    SQLSTATE_WINDOWING_ERROR, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -60,6 +60,10 @@ pub struct SerialSequence {
 /// Whether a schema, by name, has a relation of a name.
 type RelationNameCheck = Box<dyn Fn(&str, &str) -> bool>;
 
+/// Whether a function name, called with no arguments, resolves to a function
+/// that is neither an aggregate nor a window function.
+type ScalarFunctionCheck = Box<dyn Fn(&str) -> bool>;
+
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
@@ -68,6 +72,9 @@ pub struct PostgreSQLTranslator {
     translating_table_definition: std::cell::Cell<bool>,
     /// None when nothing is known about the schema, as in tests.
     relation_name_is_taken: Option<RelationNameCheck>,
+    /// None when nothing is known about the functions, as when a table
+    /// stored in the schema is translated again.
+    is_scalar_function: Option<ScalarFunctionCheck>,
     /// Table name in scope while a generation expression is being translated.
     generation_expression_table: std::cell::RefCell<Option<String>>,
     /// Generated columns already present in the table, used for ADD COLUMN validation.
@@ -86,6 +93,21 @@ impl PostgreSQLTranslator {
         is_taken: impl Fn(&str, &str) -> bool + 'static,
     ) -> Self {
         self.relation_name_is_taken = Some(Box::new(is_taken));
+        self
+    }
+
+    /// A translator that rejects `f(*)` when `is_scalar(f)` says that `f`,
+    /// called with no arguments, is neither an aggregate nor a window
+    /// function, as PostgreSQL does.
+    ///
+    /// Only statements that a client sends are checked: a table that an
+    /// older version stored with such a call is translated again when its
+    /// schema loads, and has to keep loading.
+    pub fn with_scalar_function_check(
+        mut self,
+        is_scalar: impl Fn(&str) -> bool + 'static,
+    ) -> Self {
+        self.is_scalar_function = Some(Box::new(is_scalar));
         self
     }
 
@@ -428,6 +450,7 @@ impl PostgreSQLTranslator {
             relation,
             create.inh_relations.is_empty(),
             &[],
+            self.is_scalar_function.as_deref(),
         )?;
 
         for elt in &create.table_elts {
@@ -1287,6 +1310,7 @@ impl PostgreSQLTranslator {
                     relation,
                     false,
                     &self.existing_generated_columns,
+                    self.is_scalar_function.as_deref(),
                 )?;
                 let col = self.translate_column_def(col_def, &name)?;
                 ast::AlterTableBody::AddColumn(col)
@@ -4484,6 +4508,14 @@ impl PostgreSQLTranslator {
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
         let func_name = function_name(&func_call.funcname)?;
+        if func_call.agg_star
+            && self
+                .is_scalar_function
+                .as_ref()
+                .is_some_and(|is_scalar| is_scalar(&func_name))
+        {
+            return Err(star_argument_error(&func_call.funcname));
+        }
         if let Some(result_type) = datetime_result_type(&func_name) {
             check_type_is_supported(result_type, 0)?;
         }
@@ -7790,11 +7822,13 @@ fn check_array_dimensions(dimensions: u32) -> Result<(), ParseError> {
 
 /// Check the generated columns among `table_elts`, which declares every column of the table
 /// when `has_all_columns` is set, in a table that already has `existing_generated_columns`.
+/// `is_scalar_function` is the translator's check of `f(*)`.
 fn validate_generated_columns<'a>(
     table_elts: &'a [pg_query::protobuf::Node],
     relation: &'a pg_query::protobuf::RangeVar,
     has_all_columns: bool,
     existing_generated_columns: &'a [String],
+    is_scalar_function: Option<&'a dyn Fn(&str) -> bool>,
 ) -> Result<(), ParseError> {
     use pg_query::protobuf::node::Node;
     use pg_query::protobuf::ConstrType;
@@ -7825,6 +7859,7 @@ fn validate_generated_columns<'a>(
             .iter()
             .map(String::as_str)
             .collect(),
+        is_scalar_function,
     };
     let mut table_foreign_keys = Vec::new();
     for elt in table_elts {
@@ -7892,6 +7927,9 @@ struct GenerationTable<'a> {
     columns: Vec<(&'a str, Option<&'a pg_query::protobuf::TypeName>)>,
     has_all_columns: bool,
     generated_columns: Vec<&'a str>,
+    /// Whether a function called with `*` is neither an aggregate nor a
+    /// window function; `None` when the translator does not check that.
+    is_scalar_function: Option<&'a dyn Fn(&str) -> bool>,
 }
 
 impl GenerationTable<'_> {
@@ -7952,6 +7990,15 @@ fn validate_generation_expression(
                 let name = last_string(&call.funcname)
                     .unwrap_or_default()
                     .to_lowercase();
+                // PostgreSQL rejects `f(*)` on a function that is not an aggregate
+                // before the checks below.
+                if call.agg_star
+                    && table
+                        .is_scalar_function
+                        .is_some_and(|is_scalar| is_scalar(&name))
+                {
+                    return Err(star_argument_error(&call.funcname));
+                }
                 if call.over.is_some() {
                     return Err(error(
                         SQLSTATE_WINDOWING_ERROR,
@@ -10316,6 +10363,20 @@ fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
             .iter()
             .any(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "||")),
         _ => false,
+    }
+}
+
+/// The error PostgreSQL reports for `f(*)` when the function named by
+/// `names` is neither an aggregate nor a window function. The name is
+/// written as the statement qualifies it.
+fn star_argument_error(names: &[pg_query::protobuf::Node]) -> ParseError {
+    let name = match extract_key_columns(names) {
+        Ok(names) => names.join("."),
+        Err(error) => return error,
+    };
+    ParseError::Sqlstate {
+        sqlstate: SQLSTATE_WRONG_OBJECT_TYPE,
+        message: format!("{name}(*) specified, but {name} is not an aggregate function"),
     }
 }
 

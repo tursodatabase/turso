@@ -625,6 +625,11 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
     }
     for sql in [
         "SELECT version(1)",
+        "SELECT now(1)",
+        "SELECT now(1, 2)",
+        "SELECT clock_timestamp(1)",
+        "SELECT transaction_timestamp(1)",
+        "SELECT statement_timestamp('x')",
         "SELECT quote_ident()",
         "SELECT format_type()",
         "SELECT format_type(23, -1, 0)",
@@ -862,4 +867,39 @@ fn test_pg_application_name_isolation_and_rollback(db: TempDatabase) {
     assert!(conn
         .execute("SELECT current_setting('unknown_builtin')")
         .is_err());
+}
+
+/// Older versions stored `f(*)` on a function that is not an aggregate as a
+/// call with no arguments. The core connection translates without the check
+/// that rejects it, as those versions did, and the tables and views it
+/// creates stay usable after the schema loads again.
+#[turso_macros::test]
+fn test_pg_stored_star_argument_of_scalar_function_still_loads(db: TempDatabase) {
+    let raw = db.connect_limbo();
+    raw.execute(
+        "CREATE TABLE public.star_stored (a float CHECK (random(*) >= 0), b float DEFAULT pi(*), \
+         c timestamptz DEFAULT now(*))",
+    )
+    .unwrap();
+    raw.execute(
+        "CREATE VIEW public.star_stored_view AS SELECT now(*) IS NOT NULL AS x, pi(*) > 3 AS y",
+    )
+    .unwrap();
+    drop(raw);
+    let db = db.reopen();
+    let conn = db.connect_postgres();
+    conn.execute("INSERT INTO star_stored (a) VALUES (1)")
+        .unwrap();
+    assert_eq!(
+        query_integer(
+            &conn,
+            "SELECT count(*) FROM star_stored WHERE b > 3 AND c IS NOT NULL"
+        ),
+        [1]
+    );
+    assert_eq!(
+        query_integer(&conn, "SELECT count(*) FROM star_stored_view WHERE x AND y"),
+        [1]
+    );
+    assert!(conn.execute("SELECT pi(*)").is_err());
 }
