@@ -421,11 +421,9 @@ fn choose_multi_index_branch_access(
         base_row_count,
         params,
     )?;
-    let chosen_memo = chosen_seek
+    let chosen_refs = chosen_seek
         .as_ref()
-        .and_then(|chosen| chosen.memo(table_constraints));
-    let chosen_refs = chosen_memo
-        .as_deref()
+        .and_then(|chosen| chosen.memo.as_deref())
         .map_or(&[][..], LhsMaskMemo::usable_constraint_refs);
 
     let mut best_branch = chosen_seek

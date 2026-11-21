@@ -166,9 +166,9 @@ pub enum AccessMethodParams {
 }
 
 /// Result of generic btree candidate selection before it is wrapped into a full
-/// [`AccessMethod`]. [ChosenBtreeCandidate::memo] gives the constraint refs of
+/// [`AccessMethod`]. [ChosenBtreeCandidate::memo] has the constraint refs of
 /// the candidate.
-pub(super) struct ChosenBtreeCandidate {
+pub(super) struct ChosenBtreeCandidate<'a> {
     pub(super) iter_dir: IterationDirection,
     pub(super) index: Option<Arc<Index>>,
     pub(super) base_row_count: RowCountEstimate,
@@ -176,22 +176,11 @@ pub(super) struct ChosenBtreeCandidate {
     /// The [IndexInfo] that the cost of the candidate used. It is `None` only
     /// for a scan of the table, which has no constraint refs.
     pub(super) index_info: Option<IndexInfo>,
-    /// The position of the candidate in [TableConstraints::candidates], or
-    /// `None` for the table scan that the search starts with.
-    candidate_idx: Option<usize>,
-}
-
-impl ChosenBtreeCandidate {
-    /// Return the [LhsMaskMemo] of the candidate, or `None` for a table scan.
-    /// The memo keeps the usable constraint refs of the candidate until the
-    /// next call of [choose_best_btree_candidate] for `constraints`.
-    pub(super) fn memo<'a>(
-        &self,
-        constraints: &'a TableConstraints,
-    ) -> Option<Ref<'a, LhsMaskMemo>> {
-        self.candidate_idx
-            .map(|candidate_idx| constraints.candidates[candidate_idx].lhs_mask_memo.borrow())
-    }
+    /// The [LhsMaskMemo] of the candidate, or `None` for the table scan that
+    /// the search starts with. The next call of [choose_best_btree_candidate]
+    /// for the table can write other constraint refs into the memo. This
+    /// borrow makes that call panic while the result exists.
+    pub(super) memo: Option<Ref<'a, LhsMaskMemo>>,
 }
 
 #[derive(Debug, Clone)]
@@ -223,13 +212,13 @@ pub(super) enum BranchReadMode {
 ///
 /// This returns `None` if every forced candidate is unsafe for unmatched-right-row output.
 ///
-/// The constraint refs of the returned candidate stay in the [LhsMaskMemo] of
-/// the candidate. They are not in [ChosenBtreeCandidate], because the join
+/// The returned candidate borrows the [LhsMaskMemo] that has its constraint
+/// refs. The refs are not copied into [ChosenBtreeCandidate], because the join
 /// search calls this function for each join order that it tries, and each
 /// move of the candidate then copied the 168 bytes of the refs.
-pub(super) fn choose_best_btree_candidate(
+pub(super) fn choose_best_btree_candidate<'a>(
     rhs_table: &JoinedTable,
-    rhs_constraints: &TableConstraints,
+    rhs_constraints: &'a TableConstraints,
     lhs_mask: &TableMask,
     rhs_table_idx: usize,
     maybe_order_target: Option<&OrderTarget>,
@@ -239,7 +228,7 @@ pub(super) fn choose_best_btree_candidate(
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
-) -> Result<Option<ChosenBtreeCandidate>> {
+) -> Result<Option<ChosenBtreeCandidate<'a>>> {
     let keeps_right_rows = rhs_table
         .join_info
         .as_ref()
@@ -269,8 +258,13 @@ pub(super) fn choose_best_btree_candidate(
         base_row_count,
         cost: best_cost,
         index_info: None,
-        candidate_idx: None,
+        memo: None,
     };
+    // The position of the best candidate in `rhs_constraints.candidates`. The
+    // loop changes the memo of each candidate, so the borrow of the memo of
+    // the best candidate starts after the loop. The index of the best
+    // candidate is cloned after the loop too, one time for each call.
+    let mut best_candidate_idx = None;
     let mut best_adjusted_output = f64::MAX;
     let mut best_is_ordered = false;
 
@@ -473,14 +467,11 @@ pub(super) fn choose_best_btree_candidate(
             best_cost = cost;
             best_adjusted_output = adjusted_output;
             best_is_ordered = is_index_ordered;
-            best_choice = ChosenBtreeCandidate {
-                iter_dir,
-                index: candidate.index.clone(),
-                base_row_count: candidate_base_row_count,
-                cost,
-                index_info,
-                candidate_idx: Some(candidate_idx),
-            };
+            best_choice.iter_dir = iter_dir;
+            best_choice.base_row_count = candidate_base_row_count;
+            best_choice.cost = cost;
+            best_choice.index_info = index_info;
+            best_candidate_idx = Some(candidate_idx);
         }
     }
     if !memos_are_valid {
@@ -489,7 +480,15 @@ pub(super) fn choose_best_btree_candidate(
 
     // `best_choice` starts as a table scan even when INDEXED BY removed that choice.
     // Do not return that placeholder if all forced candidates were rejected.
-    Ok(has_valid_candidate.then_some(best_choice))
+    if !has_valid_candidate {
+        return Ok(None);
+    }
+    if let Some(candidate_idx) = best_candidate_idx {
+        let candidate = &rhs_constraints.candidates[candidate_idx];
+        best_choice.index.clone_from(&candidate.index);
+        best_choice.memo = Some(candidate.lhs_mask_memo.borrow());
+    }
+    Ok(Some(best_choice))
 }
 
 /// Return the product of the selectivities of the constraints that a lookup
@@ -989,7 +988,7 @@ fn find_best_access_method_for_btree<'a>(
         return Ok(None);
     };
 
-    let memo = best.memo(rhs_constraints);
+    let memo = best.memo;
     let constraint_refs = memo
         .as_deref()
         .map_or(&[][..], LhsMaskMemo::usable_constraint_refs);
