@@ -364,15 +364,21 @@ fn accepts_operand(
         OperatorArg::Exact => {
             is_plain_value(signature, operand) && !operand.is_real && !operand.is_blob
         }
+        OperatorArg::Untyped => operand.value_type.is_none(),
+        OperatorArg::UntypedInteger => operand.value_type.is_none() && operand.may_be_integer,
+        OperatorArg::Type(name) => operand
+            .value_type
+            .as_ref()
+            .is_some_and(|t| t.type_def.name.eq_ignore_ascii_case(name)),
         OperatorArg::Real => is_plain_value(signature, operand) && operand.is_real,
     }
 }
 
 fn is_plain_value(signature: &OperatorSignature, operand: &Operand) -> bool {
-    operand
-        .value_type
-        .as_ref()
-        .is_none_or(|t| has_sqlite_operator(&t.type_def, signature))
+    operand.value_type.as_ref().is_none_or(|t| {
+        (t.type_def.is_builtin && t.type_def.stores_plain_integers())
+            || has_sqlite_operator(&t.type_def, signature)
+    })
 }
 
 /// A type whose only way to run the operator of `signature` is SQLite's, such
