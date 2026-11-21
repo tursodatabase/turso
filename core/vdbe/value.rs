@@ -8,7 +8,6 @@ use crate::{
     vdbe::affinity::{real_to_i64, Affinity},
     LimboError, Result, Value,
 };
-use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
@@ -1635,9 +1634,17 @@ impl Value {
             return Value::Null;
         };
 
-        let parts: SmallVec<[Cow<'_, str>; 8]> =
-            registers.filter_map(Value::cast_text_ref).collect();
-        Value::build_text(parts.join(&separator))
+        // SQLite inserts the separator only after at least one byte of an
+        // earlier argument, so an empty leading argument does not start the
+        // result but an empty later one still gets a separator.
+        let mut result = String::new();
+        for part in registers.filter_map(Value::cast_text_ref) {
+            if !result.is_empty() {
+                result.push_str(&separator);
+            }
+            result.push_str(&part);
+        }
+        Value::build_text(result)
     }
 
     pub fn exec_char<'a, T: Iterator<Item = &'a Self>>(values: T) -> Self {

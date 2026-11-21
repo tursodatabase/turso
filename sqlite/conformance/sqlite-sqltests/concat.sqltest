@@ -77,6 +77,32 @@ expect {
     'a-c-1-2.5'
 }
 
+# SQLite inserts the separator only when the result already has content. An
+# empty argument is still concatenated, so an empty one after content gets a
+# separator of its own.
+test concat-ws-empty-arguments {
+    SELECT quote(concat_ws(',', '', 'a'));
+    SELECT quote(concat_ws(',', 'a', '', 'b'));
+    SELECT quote(concat_ws(',', NULL, '', 'a'));
+    SELECT quote(concat_ws(',', '', '', 'a'));
+    SELECT quote(concat_ws(',', 'a', '', ''));
+    SELECT quote(concat_ws('', '', 'a'));
+    SELECT quote(concat_ws(',', NULL, NULL));
+    SELECT quote(concat_ws(',', x'', 'a'));
+    SELECT quote(concat_ws(',', 'a', x'', 'b'));
+}
+expect {
+    'a'
+    'a,,b'
+    'a'
+    'a'
+    'a,,'
+    'a'
+    ''
+    'a'
+    'a,,b'
+}
+
 # `||` converts each side to text. Only a TEXT value is already in that form;
 # every other type is rendered first, so each one needs its own case.
 test concat-value-types {
