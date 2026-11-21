@@ -12,7 +12,7 @@ use crate::{
         Arc, RwLock,
     },
     translate::collate::CollationSeq,
-    types::{IOCompletions, IOResult, Value, ValueRef},
+    types::{AsValueRef, IOCompletions, IOResult, Value, ValueRef},
     vdbe::metrics::HashJoinMetrics,
     CompletionError, Numeric, Result,
 };
@@ -44,11 +44,13 @@ const BLOB_HASH: u8 = 4;
 
 /// Hash function for join keys using rapidhash
 /// Takes collation into account when hashing text values
-fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
+/// The keys can be `Value`s or `ValueRef`s, so that a caller with `Value`s
+/// does not make a `Vec<ValueRef>` for each row.
+fn hash_join_key<V: AsValueRef>(key_values: &[V], collations: &[CollationSeq]) -> u64 {
     turso_assert_eq!(key_values.len(), collations.len());
     let mut hasher = RapidHasher::new(DEFAULT_SEED);
     for (value, collation) in key_values.iter().zip(collations) {
-        collation.hash_value(*value, &mut hasher);
+        collation.hash_value(value.as_value_ref(), &mut hasher);
     }
     hasher.finish()
 }
@@ -75,13 +77,14 @@ fn has_null_key_ref(key_values: &[ValueRef]) -> bool {
 }
 
 /// Check if two key value arrays are equal, taking collation into account.
-fn keys_equal(key1: &[Value], key2: &[ValueRef], collations: &[CollationSeq]) -> bool {
+/// The second keys can be `Value`s or `ValueRef`s, as in [hash_join_key].
+fn keys_equal<V: AsValueRef>(key1: &[Value], key2: &[V], collations: &[CollationSeq]) -> bool {
     if key1.len() != key2.len() {
         return false;
     }
     turso_assert_eq!(key1.len(), collations.len());
     for ((v1, v2), collation) in key1.iter().zip(key2.iter()).zip(collations) {
-        if !values_equal(v1.as_ref(), *v2, *collation) {
+        if !values_equal(v1.as_ref(), v2.as_value_ref(), *collation) {
             return false;
         }
     }
@@ -1178,12 +1181,7 @@ impl HashTable {
         }
 
         // Compute hash of the join keys using collations
-        let key_refs: Vec<ValueRef> = pending
-            .key_values
-            .iter()
-            .map(|value| value.as_ref())
-            .try_collect()?;
-        let hash = hash_join_key(&key_refs, &self.collations);
+        let hash = hash_join_key(&pending.key_values, &self.collations);
         let entry_size = HashEntry::size_from_values(&pending.key_values, &pending.payload_values);
 
         // Check if we would exceed memory budget
@@ -2018,13 +2016,7 @@ impl HashTable {
         }
 
         // Compute hash of probe keys using collations
-        let hash = {
-            let key_refs: Vec<ValueRef> = probe_keys
-                .iter()
-                .map(|value| value.as_ref())
-                .try_collect()?;
-            hash_join_key(&key_refs, &self.collations)
-        };
+        let hash = hash_join_key(&probe_keys, &self.collations);
         self.current_probe_keys = Some(probe_keys);
         self.current_probe_hash = Some(hash);
 
@@ -2057,13 +2049,10 @@ impl HashTable {
             self.current_spill_partition_idx = target_partition;
 
             let match_idx = {
-                let key_refs: Vec<ValueRef> = self
+                let probe_keys = self
                     .current_probe_keys
                     .as_ref()
-                    .expect("probe keys were set")
-                    .iter()
-                    .map(|v| v.as_ref())
-                    .try_collect()?;
+                    .expect("probe keys were set");
                 let spill_state = self.spill_state.as_ref().expect("spill state must exist");
                 let Some(partition) = spill_state.find_partition(target_partition) else {
                     return Ok(None);
@@ -2072,7 +2061,7 @@ impl HashTable {
                 let mut found = None;
                 for (idx, entry) in bucket.entries.iter().enumerate() {
                     if entry.hash == hash
-                        && keys_equal(&entry.key_values, &key_refs, &self.collations)
+                        && keys_equal(&entry.key_values, probe_keys, &self.collations)
                     {
                         found = Some(idx);
                         break;
@@ -2097,18 +2086,15 @@ impl HashTable {
             let bucket_idx = (hash as usize) % self.buckets.len();
             self.probe_bucket_idx = bucket_idx;
             let match_idx = {
-                let key_refs: Vec<ValueRef> = self
+                let probe_keys = self
                     .current_probe_keys
                     .as_ref()
-                    .expect("probe keys were set")
-                    .iter()
-                    .map(|v| v.as_ref())
-                    .try_collect()?;
+                    .expect("probe keys were set");
                 let bucket = &self.buckets[bucket_idx];
                 let mut found = None;
                 for (idx, entry) in bucket.entries.iter().enumerate() {
                     if entry.hash == hash
-                        && keys_equal(&entry.key_values, &key_refs, &self.collations)
+                        && keys_equal(&entry.key_values, probe_keys, &self.collations)
                     {
                         found = Some(idx);
                         break;
@@ -2137,11 +2123,10 @@ impl HashTable {
         let Some(probe_keys) = self.current_probe_keys.as_ref() else {
             return Ok(None);
         };
-        let key_refs: Vec<ValueRef> = probe_keys.iter().map(|v| v.as_ref()).try_collect()?;
         let hash = match self.current_probe_hash {
             Some(h) => h,
             None => {
-                let h = hash_join_key(&key_refs, &self.collations);
+                let h = hash_join_key(probe_keys, &self.collations);
                 self.current_probe_hash = Some(h);
                 h
             }
@@ -2162,7 +2147,7 @@ impl HashTable {
             // Continue from where we left off
             for idx in self.probe_entry_idx..bucket.entries.len() {
                 let entry = &bucket.entries[idx];
-                if entry.hash == hash && keys_equal(&entry.key_values, &key_refs, &self.collations)
+                if entry.hash == hash && keys_equal(&entry.key_values, probe_keys, &self.collations)
                 {
                     self.probe_entry_idx = idx + 1;
                     return Ok(Some(entry));
@@ -2174,7 +2159,7 @@ impl HashTable {
             let bucket = &self.buckets[self.probe_bucket_idx];
             for idx in self.probe_entry_idx..bucket.entries.len() {
                 let entry = &bucket.entries[idx];
-                if entry.hash == hash && keys_equal(&entry.key_values, &key_refs, &self.collations)
+                if entry.hash == hash && keys_equal(&entry.key_values, probe_keys, &self.collations)
                 {
                     // update probe entry index for next call
                     self.probe_entry_idx = idx + 1;
@@ -2718,8 +2703,7 @@ impl HashTable {
             return Ok(None);
         }
 
-        let key_refs: Vec<ValueRef> = probe_keys.iter().map(|v| v.as_ref()).try_collect()?;
-        let hash = hash_join_key(&key_refs, &self.collations);
+        let hash = hash_join_key(probe_keys, &self.collations);
 
         // Store probe keys for subsequent next_match calls
         self.current_probe_keys = Some(probe_keys.iter().cloned().try_collect()?);
@@ -2745,7 +2729,7 @@ impl HashTable {
         self.current_spill_partition_idx = partition_idx;
 
         for (idx, entry) in bucket.entries.iter().enumerate() {
-            if entry.hash == hash && keys_equal(&entry.key_values, &key_refs, &self.collations) {
+            if entry.hash == hash && keys_equal(&entry.key_values, probe_keys, &self.collations) {
                 self.probe_entry_idx = idx + 1;
                 return Ok(Some(entry));
             }
@@ -2759,8 +2743,7 @@ impl HashTable {
             self.spill_state.is_some(),
             "partition_for_keys requires spill state"
         );
-        let key_refs: Vec<ValueRef> = probe_keys.iter().map(|v| v.as_ref()).try_collect()?;
-        let hash = hash_join_key(&key_refs, &self.collations);
+        let hash = hash_join_key(probe_keys, &self.collations);
         Ok(self.partition_index(hash))
     }
 
@@ -2867,8 +2850,7 @@ impl HashTable {
             )?);
         }
 
-        let key_refs: Vec<ValueRef> = key_values.iter().map(|v| v.as_ref()).try_collect()?;
-        let hash = hash_join_key(&key_refs, &self.collations);
+        let hash = hash_join_key(&key_values, &self.collations);
         let partition_idx = partitioning.index(hash);
 
         let entry = HashEntry::new(hash, key_values, probe_rowid);
@@ -3543,6 +3525,36 @@ mod hashtests {
         let collations = vec![CollationSeq::BINARY, CollationSeq::BINARY];
         assert!(keys_equal(&key1, &key2, &collations));
         assert!(!keys_equal(&key1, &key3, &collations));
+    }
+
+    /// The keys of `hash_join_key` and the second keys of `keys_equal` can be
+    /// `Value`s or `ValueRef`s, with the same results.
+    #[test]
+    fn test_hash_and_keys_equal_same_for_values_and_value_refs() {
+        let values = vec![
+            Value::from_i64(10),
+            Value::from_f64(-0.0),
+            Value::Text("Hello ".to_string().into()),
+            Value::from_blob(vec![1, 2, 3]),
+        ];
+        let refs: Vec<ValueRef> = values
+            .iter()
+            .map(|value| value.as_ref())
+            .try_collect()
+            .unwrap();
+        for collation in [
+            CollationSeq::BINARY,
+            CollationSeq::NOCASE,
+            CollationSeq::RTRIM,
+        ] {
+            let collations = vec![collation; values.len()];
+            assert_eq!(
+                hash_join_key(&values, &collations),
+                hash_join_key(&refs, &collations)
+            );
+            assert!(keys_equal(&values, &values, &collations));
+            assert!(keys_equal(&values, &refs, &collations));
+        }
     }
 
     #[test]

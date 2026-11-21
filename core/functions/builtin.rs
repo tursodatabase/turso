@@ -834,14 +834,13 @@ pub fn call_builtin_scalar(
                         "bin_record_json_object: function arguments must be of type TEXT and BLOB correspondingly".to_string()
                     ));
                 };
-                let mut columns_json_array = json::jsonb::Jsonb::from_str(columns_str.as_str())?;
+                let columns_json_array = json::jsonb::Jsonb::from_str(columns_str.as_str())?;
                 let columns_len = columns_json_array.array_len()?;
 
                 let mut payload_iterator = ValueIterator::new(bin_record.as_slice())?;
 
                 let mut json = json::jsonb::Jsonb::make_empty_obj(columns_len)?;
                 for i in 0..columns_len {
-                    let mut op = json::jsonb::SearchOperation::new(0)?;
                     let path = json::path::JsonPath {
                         elements: vec![
                             json::path::PathElement::Root(),
@@ -849,8 +848,11 @@ pub fn call_builtin_scalar(
                         ],
                     };
 
-                    columns_json_array.operate_on_path(&path, &mut op)?;
-                    let column_name = op.result();
+                    let columns = columns_json_array.as_bytes();
+                    let target = json::jsonb::find_path_element(columns, &path)?
+                        .ok_or_else(|| LimboError::ParseError("Not found!".to_string()))?;
+                    let column_name =
+                        json::jsonb::Jsonb::from_raw_data(&columns[target.start..target.end])?;
                     json.append_jsonb_to_end(column_name.data());
 
                     let val = match payload_iterator.next() {

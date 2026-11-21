@@ -15,7 +15,8 @@ use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::sqlite3_ondisk::{
-    read_integer, read_value, read_value_serial_type, read_varint, varint_len, write_varint,
+    read_integer, read_value, read_value_serial_type, read_varint, try_read_integer, varint_len,
+    write_varint,
 };
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
@@ -188,6 +189,32 @@ impl Text {
 
     pub fn as_str(&self) -> &str {
         &self.value
+    }
+
+    /// Replaces the text with `lhs` followed by `rhs`, in the same buffer
+    /// when the buffer is large enough. The subtype becomes TEXT, as for
+    /// [Text::new]. An allocation failure leaves the text as it was.
+    pub(crate) fn replace_with_concat(&mut self, lhs: &str, rhs: &str) -> Result<()> {
+        let needed = lhs.len() + rhs.len();
+        match &mut self.value {
+            Cow::Owned(string) => {
+                if string.capacity() < needed {
+                    string.try_reserve(needed - string.len())?;
+                }
+                string.clear();
+                string.push_str(lhs);
+                string.push_str(rhs);
+            }
+            Cow::Borrowed(_) => {
+                let mut string = String::new();
+                string.try_reserve(needed)?;
+                string.push_str(lhs);
+                string.push_str(rhs);
+                self.value = Cow::Owned(string);
+            }
+        }
+        self.subtype = TextSubtype::Text;
+        Ok(())
     }
 }
 
@@ -906,7 +933,19 @@ impl Value {
         match self {
             Value::Null => None,
             Value::Text(text) => Some(Cow::Borrowed(text.as_str())),
-            other => Some(Cow::Owned(other.to_string())),
+            other => Some(Cow::Owned(other.non_text_to_string())),
+        }
+    }
+
+    /// The same text as `to_string()`, for a value that is not TEXT. A
+    /// number does not go through the formatting machinery. Out of line, so
+    /// that `cast_text_ref` stays small enough to inline.
+    #[inline(never)]
+    fn non_text_to_string(&self) -> String {
+        match self {
+            Value::Numeric(Numeric::Integer(i)) => IntegerText::new(*i).as_str().to_owned(),
+            Value::Numeric(Numeric::Float(f)) => format_float(f64::from(*f)),
+            other => other.to_string(),
         }
     }
 }
@@ -1394,6 +1433,7 @@ impl<'a> TryFrom<ValueRef<'a>> for &'a str {
 
 mod immutable_record {
     use super::*;
+    use smallvec::SmallVec;
 
     /// This struct serves the purpose of not allocating multiple vectors of bytes if not needed.
     /// A value in a record that has already been serialized can stay serialized and what this struct offsers
@@ -1556,6 +1596,11 @@ mod immutable_record {
         let values = iter.try_collect::<Result<_>>()??;
         Ok(values)
     }
+
+    /// The values of a record, decoded by `get_values_inline`. A record with at
+    /// most 8 values keeps them in place, without a heap allocation. A larger
+    /// inline capacity makes each move of the vector a larger copy.
+    pub type InlineValues<'a> = SmallVec<[ValueRef<'a>; 8]>;
 
     fn values_range(payload: &[u8], range: std::ops::Range<usize>) -> Result<Vec<ValueRef<'_>>> {
         let mut iter = iter(payload)?;
@@ -1843,6 +1888,20 @@ mod immutable_record {
             values(self.get_payload())
         }
 
+        /// Decodes all values, like `get_values`, without a heap allocation for
+        /// a record with at most 8 values.
+        #[inline]
+        pub fn get_values_inline(&self) -> Result<InlineValues<'_>> {
+            let mut values = InlineValues::new();
+            for value in iter(self.get_payload())? {
+                let value = value?;
+                // A failed allocation for a longer record is an error, as in `values`.
+                values.try_reserve(1).map_err(|_| LimboError::OutOfMemory)?;
+                values.push(value);
+            }
+            Ok(values)
+        }
+
         pub fn get_two_values(
             &self,
             idx1: usize,
@@ -2105,7 +2164,7 @@ mod immutable_record {
     }
 }
 
-pub use immutable_record::{ImmutableRecord, ImmutableRecordRef, RecordBuf};
+pub use immutable_record::{ImmutableRecord, ImmutableRecordRef, InlineValues, RecordBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Record {
@@ -2225,6 +2284,41 @@ impl<'a> ValueIterator<'a> {
     #[inline(always)]
     pub fn set_data_section(&self, data: &'a [u8]) {
         self.data_section.set(data);
+    }
+
+    /// The next value and its number of data bytes, if the value is an
+    /// integer and all of its bytes are in the record. Else None, also for a
+    /// corrupt record: [Iterator::next] then gives the error. The iterator
+    /// does not move. [Self::skip_value] moves it past the integer.
+    #[inline(always)]
+    pub fn peek_integer(&self) -> Option<(i64, usize)> {
+        let &serial_type = self.header_section.get().first()?;
+        try_read_integer(self.data_section.get(), serial_type)
+    }
+
+    /// The next value, its number of serial type bytes and its number of
+    /// data bytes, if the value is a TEXT whose bytes are all in the record
+    /// and are valid UTF-8. Else None, also for a corrupt record:
+    /// [Iterator::next] then gives the error. The iterator does not move.
+    #[inline(always)]
+    pub fn peek_text(&self) -> Option<(&'a str, usize, usize)> {
+        let (serial_type, header_len) = read_varint(self.header_section.get()).ok()?;
+        if serial_type < 13 || serial_type % 2 == 0 {
+            return None;
+        }
+        let size = usize::try_from((serial_type - 13) / 2).ok()?;
+        let text = validate_utf8(self.data_section.get().get(..size)?)?;
+        Some((text, header_len, size))
+    }
+
+    /// Moves the iterator past a value that [Self::peek_integer] or
+    /// [Self::peek_text] gave, which has `header_len` serial type bytes and
+    /// `data_len` data bytes.
+    #[inline(always)]
+    pub fn skip_value(&self, header_len: usize, data_len: usize) {
+        self.header_section
+            .set(&self.header_section.get()[header_len..]);
+        self.data_section.set(&self.data_section.get()[data_len..]);
     }
 }
 
@@ -4245,6 +4339,34 @@ mod tests {
         let mut iter = ValueIterator::new(&buf).unwrap();
         let _ = iter.next();
         let _ = iter.next();
+    }
+
+    #[test]
+    fn get_values_inline_matches_get_values() {
+        for count in 0..20usize {
+            let values: Vec<Value> = (0..count)
+                .map(|i| match i % 3 {
+                    0 => Value::from_i64(i as i64),
+                    1 => Value::build_text(format!("text-{i}")),
+                    _ => Value::Null,
+                })
+                .try_collect()
+                .unwrap();
+            let record = create_record(values);
+            let record_ref = ImmutableRecordRef::from_bin_record(record.get_payload());
+            let inline = record_ref.get_values_inline().unwrap();
+            assert_eq!(
+                inline.as_slice(),
+                record_ref.get_values().unwrap().as_slice()
+            );
+            assert_eq!(inline.spilled(), count > 8);
+        }
+        // The header says that the second value is a TEXT of 10 bytes, but
+        // the payload ends after 2 of them.
+        let corrupt = [3u8, 1, 33, 7, b'a', b'b'];
+        let record_ref = ImmutableRecordRef::from_bin_record(&corrupt);
+        assert!(record_ref.get_values().is_err());
+        assert!(record_ref.get_values_inline().is_err());
     }
 
     pub fn compare_immutable_for_testing(

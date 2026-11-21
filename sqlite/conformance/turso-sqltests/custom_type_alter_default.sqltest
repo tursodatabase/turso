@@ -477,6 +477,50 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test create-table-refuses-uuid-given-a-parameter {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b uuid(3)) STRICT;
+}
+expect error {
+    type "uuid" requires 0 parameter\(s\), got 1
+}
+
+@requires strict "uses STRICT tables"
+test create-table-refuses-timestamptz-given-a-parameter {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b timestamptz(3)) STRICT;
+}
+expect error {
+    type "timestamptz" requires 0 parameter\(s\), got 1
+}
+
+@requires strict "uses STRICT tables"
+test create-table-refuses-date-given-a-parameter {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b date(2)) STRICT;
+}
+expect error {
+    type "date" requires 0 parameter\(s\), got 1
+}
+
+@requires strict "uses STRICT tables"
+test add-column-refuses-type-without-parameters-given-two {
+    CREATE TYPE q(value text) BASE text;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer) STRICT;
+    ALTER TABLE t ADD COLUMN b q(1, 2);
+}
+expect error {
+    type "q" requires 0 parameter\(s\), got 2
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-refuses-type-without-parameters-given-one {
+    CREATE TYPE q(value text) BASE text;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a integer) STRICT;
+    ALTER TABLE t ALTER COLUMN a TO b q(1);
+}
+expect error {
+    type "q" requires 0 parameter\(s\), got 1
+}
+
+@requires strict "uses STRICT tables"
 test create-table-refuses-no-type-in-strict-table {
     CREATE TABLE t(id INTEGER PRIMARY KEY, b) STRICT;
 }

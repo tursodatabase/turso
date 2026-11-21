@@ -383,12 +383,14 @@ enum WriteState {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
-pub(crate) enum BTreeWriteYieldPoint {
+pub enum BTreeWriteYieldPoint {
     AfterInsertOverflowCellBeforeBalance,
 }
 
 #[cfg(any(test, injected_yields))]
-pub(crate) const BTREE_WRITE_YIELD_FAMILY: u64 = 0x4254_5245_5752_4954;
+/// The yield plan family of B-tree writes. A cursor's selection key is
+/// this family XOR its root page.
+pub const BTREE_WRITE_YIELD_FAMILY: u64 = 0x4254_5245_5752_4954;
 
 #[cfg(any(test, injected_yields))]
 impl YieldPointMarker for BTreeWriteYieldPoint {
@@ -2230,7 +2232,7 @@ impl BTreeCursor {
         index_key: &ImmutableRecordRef<'_>,
         cmp: SeekOp,
     ) -> IOResultOr<()> {
-        let key_values = index_key.get_values()?;
+        let key_values = index_key.get_values_inline()?;
         let record_comparer = {
             let index_info = self
                 .index_info
@@ -2807,7 +2809,7 @@ impl BTreeCursor {
         key: &ImmutableRecordRef<'_>,
         seek_op: SeekOp,
     ) -> IOResultOr<SeekResult> {
-        let key_values = key.get_values()?;
+        let key_values = key.get_values_inline()?;
         let record_comparer = {
             let index_info = self
                 .index_info
@@ -8888,11 +8890,13 @@ impl PartialOrd for IntegrityCheckCellRange {
 /// MINIMUM_CELL_SIZE bytes, the least space any cell takes on a page (a freed cell must be
 /// able to hold a 4-byte freeblock header).
 ///
-/// Only index cells can be smaller: a one-column record of 0, 1, '' or X'' is 2 bytes, so
-/// its cell is 3. A leaf page stores such a cell padded and cell_get_raw_region reports the
-/// padded size, while a divider in the parent stores the cell's real size after its child
-/// pointer. Padding the cell whenever it is headed for a leaf keeps balancing working with
-/// one size; the record's own length prefix keeps readers from ever looking at the padding.
+/// Only leaf cells can be smaller. An index cell holding a one-column record of NULL, 0, 1, ''
+/// or X'' is 3 bytes (the record is 2), and so is a table cell with a rowid from 0 to 127 and an
+/// empty record (the temporary table of rowids an upsert wrote). A leaf page stores such a cell in
+/// a MINIMUM_CELL_SIZE slot and cell_get_raw_region reports the padded size, while an index
+/// divider in the parent stores the cell's real size after its child pointer. Padding the cell
+/// whenever it is headed for a leaf keeps balancing working with one size; the cell's own length
+/// prefix keeps readers from ever looking at the padding.
 fn ensure_min_cell_size(buf: &mut crate::alloc::Vec<u8>, cell_start: usize) {
     const ZEROS: [u8; MINIMUM_CELL_SIZE] = [0; MINIMUM_CELL_SIZE];
     let padding = (cell_start + MINIMUM_CELL_SIZE).saturating_sub(buf.len());
@@ -10353,7 +10357,7 @@ fn _insert_into_cell(
             }
         }
         let mut payload = crate::with_btree_allocation_site!(OverflowCell, payload.try_to_vec())?;
-        if page.page_type()? == PageType::IndexLeaf {
+        if matches!(page.page_type()?, PageType::IndexLeaf | PageType::TableLeaf) {
             // Balancing must see one size for every leaf cell, whether it sits on the page
             // (where cell_get_raw_region reports at least the minimum size) or overflowed.
             ensure_min_cell_size(&mut payload, 0);
@@ -10889,8 +10893,6 @@ fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
 
 #[cfg(test)]
 mod tests {
-    use crate::security::roles::SessionRole;
-    use crate::SqliteDialect;
     use rand::{rng, Rng};
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
@@ -10902,10 +10904,6 @@ mod tests {
     use super::*;
     use crate::{
         io::{Buffer, MemoryIO, OpenFlags, IO},
-        mvcc::{
-            yield_hooks::YieldPointMarker,
-            yield_points::{YieldInjector, YieldPoint},
-        },
         schema::IndexColumn,
         storage::{
             database::DatabaseFile,
@@ -10915,17 +10913,10 @@ mod tests {
         },
         types::Text,
         vdbe::Register,
-        BufferPool, CheckpointMode, Completion, ConnectOpts, Connection, IOContext, StepResult,
-        SyncMode, Wal, WalAutoActions, WalFile, WalFileShared,
+        BufferPool, CheckpointMode, Completion, IOContext, SyncMode, Wal, WalAutoActions, WalFile,
+        WalFileShared,
     };
-    use std::{
-        mem::transmute,
-        ops::Deref,
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        },
-    };
+    use std::{mem::transmute, ops::Deref, sync::Arc};
 
     use crate::{
         storage::{
@@ -10933,7 +10924,7 @@ mod tests {
             sqlite3_ondisk::{BTreeCell, PageContent, PageType, TableLeafCell},
         },
         types::Value,
-        Database, Page, Pager,
+        Page, Pager,
     };
 
     use super::{btree_init_page, defragment_page, drop_cell, insert_into_cell};
@@ -10948,55 +10939,6 @@ mod tests {
             let len = write_varint(&mut expected, value);
 
             assert_eq!(&actual[..], &expected[..len], "value: {value}");
-        }
-    }
-
-    #[derive(Debug)]
-    struct TargetedYieldInjector {
-        point: YieldPoint,
-        selection_key: u64,
-        fired: AtomicBool,
-    }
-
-    impl TargetedYieldInjector {
-        fn new(point: YieldPoint, selection_key: u64) -> Arc<Self> {
-            Arc::new(Self {
-                point,
-                selection_key,
-                fired: AtomicBool::new(false),
-            })
-        }
-
-        fn fired(&self) -> bool {
-            self.fired.load(Ordering::Acquire)
-        }
-    }
-
-    impl YieldInjector for TargetedYieldInjector {
-        fn should_yield(&self, _instance_id: u64, selection_key: u64, point: YieldPoint) -> bool {
-            point == self.point
-                && selection_key == self.selection_key
-                && !self.fired.swap(true, Ordering::AcqRel)
-        }
-    }
-
-    fn btree_write_selection_key(root_page: i64) -> u64 {
-        BTREE_WRITE_YIELD_FAMILY ^ root_page as u64
-    }
-
-    fn query_single_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
-        let mut stmt = conn.prepare(sql).unwrap();
-        match stmt.step().unwrap() {
-            StepResult::Row => stmt.row().unwrap().get::<i64>(0).unwrap(),
-            other => panic!("expected a row, got {other:?}"),
-        }
-    }
-
-    fn query_single_text(conn: &Arc<Connection>, sql: &str) -> String {
-        let mut stmt = conn.prepare(sql).unwrap();
-        match stmt.step().unwrap() {
-            StepResult::Row => stmt.row().unwrap().get::<String>(0).unwrap(),
-            other => panic!("expected a row, got {other:?}"),
         }
     }
 
@@ -11162,207 +11104,6 @@ mod tests {
         assert_alloc_vec(&errors);
         let _ = assert_cursor_buffers;
         let _ = assert_overflow_cell_buffers;
-    }
-
-    #[test]
-    fn wal_reuses_freelist_leaf_after_abandoned_overflowing_insert() {
-        #[allow(clippy::arc_with_non_send_sync)]
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db =
-            Database::open_file(io, "freelist-stale-overflow.db", Arc::new(SqliteDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        conn.execute("PRAGMA journal_mode = WAL").unwrap();
-        conn.execute(
-            "CREATE TABLE red_rain_308 (
-                slow_desk_238 INTEGER NOT NULL,
-                quiet_tree_398 TEXT NOT NULL,
-                smart_dog_422 REAL UNIQUE,
-                new_hill_140 TEXT,
-                light_door_957 REAL,
-                wild_dog_803 TEXT NOT NULL,
-                new_flower_28 BLOB,
-                old_fish_931 TEXT PRIMARY KEY
-            )",
-        )
-        .unwrap();
-        conn.execute(
-            "CREATE TABLE full_fish_194 (
-                brave_star_722 TEXT PRIMARY KEY,
-                hot_star_957 NUMERIC,
-                empty_chair_834 REAL
-            )",
-        )
-        .unwrap();
-
-        conn.execute(
-            "INSERT INTO red_rain_308 (
-                slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
-                light_door_957, wild_dog_803, new_flower_28, old_fish_931
-            ) VALUES (
-                1, 'seed', 0.24, 'seed', 1.0, 'seed', zeroblob(3600), 'existing_unique'
-            )",
-        )
-        .unwrap();
-        for id in 2..260 {
-            conn.execute(format!(
-                "INSERT INTO red_rain_308 (
-                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
-                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
-                ) VALUES (
-                    {id}, 'quiet_tree_{id}', {id}.0, 'new_hill_{id}',
-                    1.5, 'wild_dog_{id}', zeroblob(3600), 'seed_{id}'
-                )"
-            ))
-            .unwrap();
-        }
-
-        conn.execute("BEGIN").unwrap();
-        conn.execute("DELETE FROM red_rain_308 WHERE old_fish_931 = 'seed_2'")
-            .unwrap();
-        conn.execute("SAVEPOINT sp_91").unwrap();
-        conn.execute(
-            "INSERT INTO full_fish_194 (brave_star_722, hot_star_957, empty_chair_834)
-             VALUES ('sweet_fish_597', 328, 7.71)",
-        )
-        .unwrap();
-
-        let red_rain_root_page = query_single_i64(
-            &conn,
-            "SELECT rootpage FROM sqlite_schema
-             WHERE type = 'table' AND name = 'red_rain_308'",
-        );
-        let injector = TargetedYieldInjector::new(
-            BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance.point(),
-            btree_write_selection_key(red_rain_root_page),
-        );
-        conn.set_yield_injector(Some(injector.clone()));
-        let mut abandoned = conn
-            .prepare(
-                "INSERT INTO red_rain_308 (
-                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
-                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
-                ) VALUES (
-                    926, 'dry_hill_411', 9.24, 'blue_hill_65',
-                    7.50, 'happy_moon_474', zeroblob(7200), 'smart_rock_113'
-                )",
-            )
-            .unwrap();
-        assert!(matches!(abandoned.step().unwrap(), StepResult::Yield));
-        assert!(injector.fired());
-        abandoned.reset().unwrap();
-        drop(abandoned);
-        conn.set_yield_injector(None);
-
-        conn.execute("DELETE FROM red_rain_308 WHERE slow_desk_238 BETWEEN 2 AND 240")
-            .unwrap();
-        conn.execute("RELEASE sp_91").unwrap();
-
-        assert!(conn
-            .execute(
-                "INSERT INTO red_rain_308 (
-                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
-                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
-                ) VALUES (
-                    927, 'dry_hill_412', 0.24, 'blue_hill_66',
-                    7.50, 'happy_moon_475', x'736f66745f73746f6e655f313732', 'smart_rock_114'
-                )"
-            )
-            .is_err());
-
-        for id in 300..420 {
-            conn.execute(format!(
-                "INSERT INTO red_rain_308 (
-                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
-                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
-                ) VALUES (
-                    {id}, 'quiet_tree_{id}', {id}.0, 'new_hill_{id}',
-                    1.5, 'wild_dog_{id}', zeroblob(3600), 'reuse_{id}'
-                )"
-            ))
-            .unwrap();
-        }
-
-        conn.execute("ROLLBACK").unwrap();
-        assert_eq!(query_single_text(&conn, "PRAGMA integrity_check"), "ok");
-    }
-
-    #[test]
-    fn wal_overflowing_insert_resumes_after_yield_before_balance() {
-        #[allow(clippy::arc_with_non_send_sync)]
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db =
-            Database::open_file(io, "resume-overflow-yield.db", Arc::new(SqliteDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        conn.execute("PRAGMA journal_mode = WAL").unwrap();
-        conn.execute(
-            "CREATE TABLE red_rain_308 (
-                slow_desk_238 INTEGER NOT NULL,
-                quiet_tree_398 TEXT NOT NULL,
-                smart_dog_422 REAL UNIQUE,
-                new_hill_140 TEXT,
-                light_door_957 REAL,
-                wild_dog_803 TEXT NOT NULL,
-                new_flower_28 BLOB,
-                old_fish_931 TEXT PRIMARY KEY
-            )",
-        )
-        .unwrap();
-
-        for id in 1..260 {
-            conn.execute(format!(
-                "INSERT INTO red_rain_308 (
-                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
-                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
-                ) VALUES (
-                    {id}, 'quiet_tree_{id}', {id}.0, 'new_hill_{id}',
-                    1.5, 'wild_dog_{id}', zeroblob(3600), 'seed_{id}'
-                )"
-            ))
-            .unwrap();
-        }
-
-        let red_rain_root_page = query_single_i64(
-            &conn,
-            "SELECT rootpage FROM sqlite_schema
-             WHERE type = 'table' AND name = 'red_rain_308'",
-        );
-        let injector = TargetedYieldInjector::new(
-            BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance.point(),
-            btree_write_selection_key(red_rain_root_page),
-        );
-        conn.set_yield_injector(Some(injector.clone()));
-        let mut stmt = conn
-            .prepare(
-                "INSERT INTO red_rain_308 (
-                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
-                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
-                ) VALUES (
-                    926, 'dry_hill_411', 9.24, 'blue_hill_65',
-                    7.50, 'happy_moon_474', zeroblob(7200), 'smart_rock_113'
-                )",
-            )
-            .unwrap();
-
-        assert!(matches!(stmt.step().unwrap(), StepResult::Yield));
-        assert!(injector.fired());
-        assert!(matches!(stmt.step().unwrap(), StepResult::Done));
-        drop(stmt);
-        conn.set_yield_injector(None);
-
-        assert_eq!(
-            query_single_i64(
-                &conn,
-                "SELECT COUNT(*) FROM red_rain_308 WHERE old_fish_931 = 'smart_rock_113'",
-            ),
-            1
-        );
-        assert_eq!(query_single_text(&conn, "PRAGMA integrity_check"), "ok");
     }
 
     fn ensure_cell(page: &mut PageContent, cell_idx: usize, payload: &[u8]) {
@@ -14044,6 +13785,51 @@ mod tests {
             contents.cell_content_area(),
             pointer_array_end
         );
+    }
+
+    /// A table leaf cell can be 3 bytes too: a rowid from 0 to 127 and an empty record, as in the
+    /// temporary table of rowids an upsert wrote. When such a cell overflows a full leaf it must
+    /// be padded to MINIMUM_CELL_SIZE, as it would be on the page, or balancing counts and checks
+    /// a cell shorter than any cell on a page.
+    #[test]
+    pub fn test_tiny_cell_overflowing_a_leaf_is_padded() {
+        for page_type in [PageType::TableLeaf, PageType::IndexLeaf] {
+            let page = get_page(2);
+            btree_init_page(&page, page_type, 0, 4096);
+            let contents = page.get_contents();
+            let usable_space = 4096;
+
+            // 681 six-byte slots (a four-byte cell and its pointer) fill 4086 of the 4088 free
+            // bytes. insert_into_cell doesn't read the cells, so one cell repeated will do.
+            let four_byte_cell = [0x02, 0x05, 0x01, 0x00];
+            for i in 0..681 {
+                insert_into_cell(contents, &four_byte_cell, i, usable_space).unwrap();
+            }
+            assert_eq!(compute_free_space(contents, usable_space).unwrap(), 2);
+            let three_byte_cell = [0x01, 0x01, 0x01];
+            insert_into_cell(contents, &three_byte_cell, 681, usable_space).unwrap();
+
+            assert_eq!(
+                contents.overflow_cells.len(),
+                1,
+                "{page_type:?}: the cell overflows"
+            );
+            let overflowed = &contents.overflow_cells[0].payload;
+            assert_eq!(
+                overflowed.len(),
+                MINIMUM_CELL_SIZE,
+                "{page_type:?}: the overflowed cell is padded"
+            );
+            assert_eq!(
+                &overflowed[..3],
+                &three_byte_cell,
+                "{page_type:?}: the cell's bytes are kept"
+            );
+            assert_eq!(
+                overflowed[3], 0,
+                "{page_type:?}: the padding is a zero byte"
+            );
+        }
     }
 
     #[test]

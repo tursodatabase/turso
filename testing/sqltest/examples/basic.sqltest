@@ -3,6 +3,8 @@
 
 @database :memory:
 
+# Gap tests (`@compat-gap`) are for the PostgreSQL frontend suites; see gap.sqltest.
+
 # Setup block for creating test data
 setup users {
     CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);

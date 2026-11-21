@@ -1,10 +1,13 @@
 # Known tursopg gaps against PostgreSQL: A. Params & casts
 #
-# The default `expect` block is the PostgreSQL result. An `expect @tursopg`
-# block is the current wrong tursopg result. When you fix a gap, delete its
-# `@tursopg` block in the same change. See postgres/CONTRIBUTING.md.
-# A test without an `@tursopg` block matches PostgreSQL and guards against
-# regressions.
+# Each test with a `@compat-gap "<kind>:<object>"` label records a known
+# difference: its default `expect` block is PostgreSQL 18's answer and its
+# `expect @tursopg` block is tursopg's current wrong answer. When tursopg
+# gives the PostgreSQL answer, the tursopg run fails with "gap fixed": then
+# delete only `@compat-gap` and the `expect @tursopg` block, and keep the
+# test. A test without `@compat-gap` matches PostgreSQL and guards against
+# regressions. The `# X-NN` comments are the IDs from the audit that found
+# each gap.
 
 @database :memory:
 
@@ -16,8 +19,9 @@ setup t_b {
     CREATE TABLE t (b boolean);
 }
 
-# A-01 (S1): bool literal casts, true forms
-test gap-a-01-bool-literal-casts-true-forms {
+# A-01: bool literal casts, true forms
+@compat-gap "type:bool"
+test bool-literal-casts-true-forms {
     SELECT 't'::boolean, 'true'::boolean, 'yes'::boolean, 'on'::boolean, '1'::boolean, 'TRUE'::boolean, 'y'::boolean;
 }
 expect {
@@ -27,8 +31,9 @@ expect @tursopg {
     0|0|0|0|1|0|0
 }
 
-# A-02 (S1): bool literal casts, false forms
-test gap-a-02-bool-literal-casts-false-forms {
+# A-02: bool literal casts, false forms
+@compat-gap "type:bool"
+test bool-literal-casts-false-forms {
     SELECT 'f'::boolean, 'false'::boolean, 'no'::boolean, 'off'::boolean, '0'::boolean;
 }
 expect {
@@ -38,8 +43,9 @@ expect @tursopg {
     0|0|0|0|0
 }
 
-# A-04 (S1): bool invalid literal
-test gap-a-04-bool-invalid-literal {
+# A-04: bool invalid literal
+@compat-gap "type:bool"
+test bool-invalid-literal {
     SELECT 'maybe'::boolean;
 }
 @sqlstate 22P02
@@ -48,8 +54,9 @@ expect @tursopg {
     0
 }
 
-# A-06 (S1): CAST(... AS boolean) form
-test gap-a-06-cast-as-boolean-form {
+# A-06: CAST(... AS boolean) form
+@compat-gap "type:bool"
+test cast-as-boolean-form {
     SELECT CAST('true' AS boolean), CAST(1 AS boolean), CAST(0 AS boolean);
 }
 expect {
@@ -59,8 +66,9 @@ expect @tursopg {
     0|1|0
 }
 
-# A-07 (S1): int4 overflow literal cast
-test gap-a-07-int4-overflow-literal-cast {
+# A-07: int4 overflow literal cast
+@compat-gap "type:int4"
+test int4-overflow-literal-cast {
     SELECT '2147483648'::int4;
 }
 @sqlstate 22003
@@ -69,8 +77,9 @@ expect @tursopg {
     2147483648
 }
 
-# A-08 (S1): int2 overflow literal cast
-test gap-a-08-int2-overflow-literal-cast {
+# A-08: int2 overflow literal cast
+@compat-gap "type:int2"
+test int2-overflow-literal-cast {
     SELECT '40000'::smallint;
 }
 @sqlstate 22003
@@ -79,8 +88,9 @@ expect @tursopg {
     40000
 }
 
-# A-09 (S1): int8 overflow arithmetic
-test gap-a-09-int8-overflow-arithmetic {
+# A-09: int8 overflow arithmetic
+@compat-gap "operator:int8 + int4"
+test int8-overflow-arithmetic {
     SELECT 9223372036854775807::bigint + 1;
 }
 @sqlstate 22003
@@ -89,8 +99,9 @@ expect @tursopg {
     9.223372036854776e18
 }
 
-# A-10 (S1): int4 overflow arithmetic
-test gap-a-10-int4-overflow-arithmetic {
+# A-10: int4 overflow arithmetic
+@compat-gap "operator:int4 + int4"
+test int4-overflow-arithmetic {
     SELECT 2147483647::int4 + 1;
 }
 @sqlstate 22003
@@ -99,8 +110,9 @@ expect @tursopg {
     2147483648
 }
 
-# A-11 (S1): invalid int literal cast
-test gap-a-11-invalid-int-literal-cast {
+# A-11: invalid int literal cast
+@compat-gap "type:int4"
+test invalid-int-literal-cast {
     SELECT 'abc'::integer;
 }
 @sqlstate 22P02
@@ -109,8 +121,9 @@ expect @tursopg {
     0
 }
 
-# A-13 (S1): '1.5'::int (text) is invalid
-test gap-a-13-1-5-int-text-is-invalid {
+# A-13: '1.5'::int (text) is invalid
+@compat-gap "type:int4"
+test decimal-text-cast-to-int4-is-invalid {
     SELECT '1.5'::integer;
 }
 @sqlstate 22P02
@@ -119,8 +132,9 @@ expect @tursopg {
     1
 }
 
-# A-14 (S1): numeric->int rounds half away from zero
-test gap-a-14-numeric-int-rounds-half-away-from-zero {
+# A-14: numeric->int rounds half away from zero
+@compat-gap "cast:numeric -> int4"
+test numeric-int-rounds-half-away-from-zero {
     SELECT 1.5::integer, 2.5::integer, (-2.5)::integer;
 }
 expect {
@@ -131,15 +145,16 @@ expect @tursopg {
 }
 
 # A-16: int with surrounding spaces
-test gap-a-16-int-with-surrounding-spaces {
+test int-with-surrounding-spaces {
     SELECT ' 42 '::integer;
 }
 expect {
     42
 }
 
-# A-17 (S1): invalid uuid literal cast
-test gap-a-17-invalid-uuid-literal-cast {
+# A-17: invalid uuid literal cast
+@compat-gap "type:uuid"
+test invalid-uuid-literal-cast {
     SELECT 'nope'::uuid;
 }
 @sqlstate 22P02
@@ -148,8 +163,9 @@ expect @tursopg {
     nope
 }
 
-# A-19 (S1): uuid uppercase input normalised
-test gap-a-19-uuid-uppercase-input-normalised {
+# A-19: uuid uppercase input normalised
+@compat-gap "type:uuid"
+test uuid-uppercase-input-normalised {
     SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid;
 }
 expect {
@@ -159,8 +175,9 @@ expect @tursopg {
     A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11
 }
 
-# A-20 (S1): uuid braces / no-hyphen input
-test gap-a-20-uuid-braces-no-hyphen-input {
+# A-20: uuid braces / no-hyphen input
+@compat-gap "type:uuid"
+test uuid-braces-no-hyphen-input {
     SELECT '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid, 'a0eebc999c0b4ef8bb6d6bb9bd380a11'::uuid;
 }
 expect {
@@ -170,8 +187,9 @@ expect @tursopg {
     {a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}|a0eebc999c0b4ef8bb6d6bb9bd380a11
 }
 
-# A-21 (S1): uuid equality across case
-test gap-a-21-uuid-equality-across-case {
+# A-21: uuid equality across case
+@compat-gap "operator:uuid = uuid"
+test uuid-equality-across-case {
     SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid;
 }
 expect {
@@ -181,8 +199,9 @@ expect @tursopg {
     0
 }
 
-# A-22 (S2): numeric(10,2) rounding half away from zero
-test gap-a-22-numeric-10-2-rounding-half-away-from-zero {
+# A-22: numeric(10,2) rounding half away from zero
+@compat-gap "type:numeric"
+test numeric-10-2-rounding-half-away-from-zero {
     SELECT '1.005'::numeric(10,2), '2.675'::numeric(10,2), '-1.005'::numeric(10,2);
 }
 expect {
@@ -191,8 +210,9 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# A-23 (S2): numeric(10,0) rounding
-test gap-a-23-numeric-10-0-rounding {
+# A-23: numeric(10,0) rounding
+@compat-gap "type:numeric"
+test numeric-10-0-rounding {
     SELECT '2.5'::numeric(10,0), '3.5'::numeric(10,0);
 }
 expect {
@@ -201,8 +221,9 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# A-24 (S1): numeric exact decimal arithmetic
-test gap-a-24-numeric-exact-decimal-arithmetic {
+# A-24: numeric exact decimal arithmetic
+@compat-gap "operator:numeric + numeric"
+test numeric-exact-decimal-arithmetic {
     SELECT 0.1::numeric + 0.2::numeric, 1::numeric / 3;
 }
 expect {
@@ -212,8 +233,9 @@ expect @tursopg {
     0.30000000000000004|0.3333333333333333
 }
 
-# A-25 (S1): numeric big precision
-test gap-a-25-numeric-big-precision {
+# A-25: numeric big precision
+@compat-gap "type:numeric"
+test numeric-big-precision {
     SELECT '123456789012345678901234567890.123'::numeric;
 }
 expect {
@@ -223,8 +245,9 @@ expect @tursopg {
     1.2345678901234568e29
 }
 
-# A-26 (S3): numeric overflow on typmod
-test gap-a-26-numeric-overflow-on-typmod {
+# A-26: numeric overflow on typmod
+@compat-gap "type:numeric"
+test numeric-overflow-on-typmod {
     SELECT '123456.1'::numeric(5,2);
 }
 @sqlstate 22003
@@ -232,8 +255,9 @@ expect error {}
 @sqlstate 0A000
 expect @tursopg error {}
 
-# A-27 (S1): invalid numeric
-test gap-a-27-invalid-numeric {
+# A-27: invalid numeric
+@compat-gap "type:numeric"
+test invalid-numeric {
     SELECT 'abc'::numeric;
 }
 @sqlstate 22P02
@@ -242,8 +266,9 @@ expect @tursopg {
     0
 }
 
-# A-28 (S1): numeric exponent input
-test gap-a-28-numeric-exponent-input {
+# A-28: numeric exponent input
+@compat-gap "type:numeric"
+test numeric-exponent-input {
     SELECT '1e3'::numeric, '1.50'::numeric;
 }
 expect {
@@ -254,7 +279,7 @@ expect @tursopg {
 }
 
 # A-30: timestamptz literal with +02 offset
-test gap-a-30-timestamptz-literal-with-02-offset {
+test timestamptz-literal-with-02-offset {
     SELECT '2026-10-08 14:00:00+02'::timestamptz;
 }
 expect {
@@ -262,7 +287,7 @@ expect {
 }
 
 # A-31: timestamptz literal with Z
-test gap-a-31-timestamptz-literal-with-z {
+test timestamptz-literal-with-z {
     SELECT '2026-10-08T12:00:00Z'::timestamptz;
 }
 expect {
@@ -270,7 +295,7 @@ expect {
 }
 
 # A-32: timestamptz with +05:30 and micros
-test gap-a-32-timestamptz-with-05-30-and-micros {
+test timestamptz-with-05-30-and-micros {
     SELECT '2026-10-08T12:00:00.123456+05:30'::timestamptz;
 }
 expect {
@@ -278,7 +303,7 @@ expect {
 }
 
 # A-34: timestamptz from date-only
-test gap-a-34-timestamptz-from-date-only {
+test timestamptz-from-date-only {
     SELECT '2026-10-08'::timestamptz;
 }
 expect {
@@ -286,14 +311,15 @@ expect {
 }
 
 # A-35: invalid timestamptz
-test gap-a-35-invalid-timestamptz {
+test invalid-timestamptz {
     SELECT 'nope'::timestamptz;
 }
 @sqlstate 22007
 expect error {}
 
-# A-36 (S1): timestamptz equality across offsets
-test gap-a-36-timestamptz-equality-across-offsets {
+# A-36: timestamptz equality across offsets
+@compat-gap "operator:timestamptz = timestamptz"
+test timestamptz-equality-across-offsets {
     SELECT '2026-10-08 14:00:00+02'::timestamptz = '2026-10-08 12:00:00Z'::timestamptz;
 }
 expect {
@@ -304,15 +330,16 @@ expect @tursopg {
 }
 
 # A-37: timestamp drops offset
-test gap-a-37-timestamp-drops-offset {
+test timestamp-drops-offset {
     SELECT '2026-10-08 14:00:00+02'::timestamp;
 }
 expect {
     2026-10-08 14:00:00
 }
 
-# A-38 (S2): special values infinity/epoch
-test gap-a-38-special-values-infinity-epoch {
+# A-38: special values infinity/epoch
+@compat-gap "type:timestamptz"
+test special-values-infinity-epoch {
     SELECT 'infinity'::timestamptz, 'epoch'::timestamptz;
 }
 expect {
@@ -321,8 +348,9 @@ expect {
 @sqlstate 22007
 expect @tursopg error {}
 
-# A-39 (S3): invalid date (Feb 30)
-test gap-a-39-invalid-date-feb-30 {
+# A-39: invalid date (Feb 30)
+@compat-gap "type:date"
+test invalid-date-feb-30 {
     SELECT '2026-02-30'::date;
 }
 @sqlstate 22008
@@ -330,8 +358,9 @@ expect error {}
 @sqlstate 0A000
 expect @tursopg error {}
 
-# A-40 (S2): date + int, date - date
-test gap-a-40-date-int-date-date {
+# A-40: date + int, date - date
+@compat-gap "operator:date + int4"
+test date-int-date-date {
     SELECT '2026-10-08'::date + 1, '2026-10-08'::date - '2026-10-01'::date;
 }
 expect {
@@ -340,8 +369,9 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# A-42 (S2): interval input forms
-test gap-a-42-interval-input-forms {
+# A-42: interval input forms
+@compat-gap "type:interval"
+test interval-input-forms {
     SELECT '1 day 2 hours'::interval, '90 minutes'::interval, 'P1DT2H'::interval;
 }
 expect {
@@ -350,8 +380,9 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# A-43 (S2): timestamptz + interval
-test gap-a-43-timestamptz-interval {
+# A-43: timestamptz + interval
+@compat-gap "operator:timestamptz + interval"
+test timestamptz-interval {
     SELECT '2026-10-08 12:00:00+00'::timestamptz + interval '1 day 1 hour';
 }
 expect {
@@ -360,8 +391,9 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# A-44 (S2): now() - interval comparison
-test gap-a-44-now-interval-comparison {
+# A-44: now() - interval comparison
+@compat-gap "operator:timestamptz - interval"
+test now-interval-comparison {
     SELECT now() - interval '1 day' < now();
 }
 expect {
@@ -370,8 +402,9 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# A-45 (S1): jsonb literal key order/whitespace
-test gap-a-45-jsonb-literal-key-order-whitespace {
+# A-45: jsonb literal key order/whitespace
+@compat-gap "type:jsonb"
+test jsonb-literal-key-order-whitespace {
     SELECT '{"b": 2,  "a":1, "aa": [1,  2]}'::jsonb;
 }
 expect {
@@ -381,8 +414,9 @@ expect @tursopg {
     {"b": 2,  "a":1, "aa": [1,  2]}
 }
 
-# A-46 (S1): jsonb duplicate keys keep last
-test gap-a-46-jsonb-duplicate-keys-keep-last {
+# A-46: jsonb duplicate keys keep last
+@compat-gap "type:jsonb"
+test jsonb-duplicate-keys-keep-last {
     SELECT '{"a":1,"a":2}'::jsonb;
 }
 expect {
@@ -393,15 +427,16 @@ expect @tursopg {
 }
 
 # A-47: json literal preserved verbatim
-test gap-a-47-json-literal-preserved-verbatim {
+test json-literal-preserved-verbatim {
     SELECT '{"b": 2,  "a":1}'::json;
 }
 expect {
     {"b": 2,  "a":1}
 }
 
-# A-48 (S1): invalid jsonb literal
-test gap-a-48-invalid-jsonb-literal {
+# A-48: invalid jsonb literal
+@compat-gap "type:jsonb"
+test invalid-jsonb-literal {
     SELECT 'not json'::jsonb;
 }
 @sqlstate 22P02
@@ -411,7 +446,7 @@ expect @tursopg {
 }
 
 # A-50: jsonb number precision
-test gap-a-50-jsonb-number-precision {
+test jsonb-number-precision {
     SELECT '1.50'::jsonb, '12345678901234567890'::jsonb;
 }
 expect {
@@ -419,15 +454,16 @@ expect {
 }
 
 # A-51: int[] literal cast output
-test gap-a-51-int-literal-cast-output {
+test int-literal-cast-output {
     SELECT '{1,2,3}'::int[];
 }
 expect {
     {1,2,3}
 }
 
-# A-52 (S3): invalid int[] literal
-test gap-a-52-invalid-int-literal {
+# A-52: invalid int[] literal
+@compat-gap "type:_int4"
+test invalid-int-literal {
     SELECT '{1,x}'::int[];
 }
 @sqlstate 22P02
@@ -436,7 +472,7 @@ expect error {}
 expect @tursopg error {}
 
 # A-58: ARRAY[] constructor output
-test gap-a-58-array-constructor-output {
+test array-constructor-output {
     SELECT ARRAY[1,2], ARRAY['a','b'];
 }
 expect {
@@ -444,7 +480,7 @@ expect {
 }
 
 # A-59: int + unknown literal
-test gap-a-59-int-unknown-literal {
+test int-unknown-literal {
     SELECT 1 + '2';
 }
 expect {
@@ -452,7 +488,7 @@ expect {
 }
 
 # A-60: int column = text literal
-test gap-a-60-int-column-text-literal {
+test int-column-text-literal {
     CREATE TABLE t (id int);
     INSERT INTO t VALUES (1);
     SELECT id FROM t WHERE id = '1';
@@ -461,8 +497,9 @@ expect {
     1
 }
 
-# A-61 (S1): text column = int literal (PG: no operator)
-test gap-a-61-text-column-int-literal-pg-no-operator {
+# A-61: text column = int literal (PG: no operator)
+@compat-gap "operator:text = int4"
+test text-column-int-literal-pg-no-operator {
     CREATE TABLE t (s text);
     INSERT INTO t VALUES ('1');
     SELECT s FROM t WHERE s = 1;
@@ -475,16 +512,17 @@ expect @tursopg {
 
 # A-62: insert '42' text literal into int column
 @setup t_id
-test gap-a-62-insert-42-text-literal-into-int-column {
+test insert-42-text-literal-into-int-column {
     INSERT INTO t VALUES ('42') RETURNING id;
 }
 expect {
     42
 }
 
-# A-63 (S3): insert 'abc' into int column
+# A-63: insert 'abc' into int column
 @setup t_id
-test gap-a-63-insert-abc-into-int-column {
+@compat-gap "type:int4"
+test insert-abc-into-int-column {
     INSERT INTO t VALUES ('abc') RETURNING id;
 }
 @sqlstate 22P02
@@ -492,9 +530,10 @@ expect error {}
 @sqlstate 23000
 expect @tursopg error {}
 
-# A-64 (S2): insert 1.7 numeric into int column
+# A-64: insert 1.7 numeric into int column
 @setup t_id
-test gap-a-64-insert-1-7-numeric-into-int-column {
+@compat-gap "cast:numeric -> int4"
+test insert-1-7-numeric-into-int-column {
     INSERT INTO t VALUES (1.7) RETURNING id;
 }
 expect {
@@ -505,16 +544,17 @@ expect @tursopg error {}
 
 # A-65: insert 'true' into bool column
 @setup t_b
-test gap-a-65-insert-true-into-bool-column {
+test insert-true-into-bool-column {
     INSERT INTO t VALUES ('true') RETURNING b;
 }
 expect {
     t
 }
 
-# A-66 (S1): insert integer 1 into bool column
+# A-66: insert integer 1 into bool column
 @setup t_b
-test gap-a-66-insert-integer-1-into-bool-column {
+@compat-gap "cast:int4 -> bool"
+test insert-integer-1-into-bool-column {
     INSERT INTO t VALUES (1) RETURNING b;
 }
 @sqlstate 42804
@@ -524,7 +564,7 @@ expect @tursopg {
 }
 
 # A-79: insert literal with short +00 offset into timestamptz column
-test gap-a-79-insert-literal-with-short-00-offset-into-timesta {
+test insert-literal-with-short-00-offset-into-timestamptz {
     CREATE TABLE t (ts timestamptz);
     INSERT INTO t VALUES ('2026-10-08 12:00:00+00') RETURNING ts;
 }
@@ -533,7 +573,7 @@ expect {
 }
 
 # A-80: timestamptz column ORDER BY across offsets
-test gap-a-80-timestamptz-column-order-by-across-offsets {
+test timestamptz-column-order-by-across-offsets {
     CREATE TABLE t (id int, ts timestamptz);
     INSERT INTO t VALUES (1, '2026-10-08T12:00:00Z'), (2, '2026-10-08T13:00:00+02:00');
     SELECT id FROM t ORDER BY ts;
@@ -541,4 +581,15 @@ test gap-a-80-timestamptz-column-order-by-across-offsets {
 expect {
     2
     1
+}
+
+# A-81: numeric(10,2) column rounds on insert
+test numeric-10-2-column-rounds-on-insert {
+    CREATE TABLE t (v numeric(10,2));
+    INSERT INTO t VALUES (1.005), (1.5);
+    SELECT v FROM t;
+}
+expect {
+    1.01
+    1.50
 }

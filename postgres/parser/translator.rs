@@ -17,7 +17,7 @@ use crate::sqlstate::{
     SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
     SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
     SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
-    SQLSTATE_WINDOWING_ERROR,
+    SQLSTATE_WINDOWING_ERROR, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -60,12 +60,21 @@ pub struct SerialSequence {
 /// Whether a schema, by name, has a relation of a name.
 type RelationNameCheck = Box<dyn Fn(&str, &str) -> bool>;
 
+/// Whether a function name, called with no arguments, resolves to a function
+/// that is neither an aggregate nor a window function.
+type ScalarFunctionCheck = Box<dyn Fn(&str) -> bool>;
+
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
     translating_index: std::cell::Cell<bool>,
+    /// Set while a CREATE TABLE or ALTER TABLE statement is being translated.
+    translating_table_definition: std::cell::Cell<bool>,
     /// None when nothing is known about the schema, as in tests.
     relation_name_is_taken: Option<RelationNameCheck>,
+    /// None when nothing is known about the functions, as when a table
+    /// stored in the schema is translated again.
+    is_scalar_function: Option<ScalarFunctionCheck>,
     /// Table name in scope while a generation expression is being translated.
     generation_expression_table: std::cell::RefCell<Option<String>>,
     /// Generated columns already present in the table, used for ADD COLUMN validation.
@@ -84,6 +93,21 @@ impl PostgreSQLTranslator {
         is_taken: impl Fn(&str, &str) -> bool + 'static,
     ) -> Self {
         self.relation_name_is_taken = Some(Box::new(is_taken));
+        self
+    }
+
+    /// A translator that rejects `f(*)` when `is_scalar(f)` says that `f`,
+    /// called with no arguments, is neither an aggregate nor a window
+    /// function, as PostgreSQL does.
+    ///
+    /// Only statements that a client sends are checked: a table that an
+    /// older version stored with such a call is translated again when its
+    /// schema loads, and has to keep loading.
+    pub fn with_scalar_function_check(
+        mut self,
+        is_scalar: impl Fn(&str) -> bool + 'static,
+    ) -> Self {
+        self.is_scalar_function = Some(Box::new(is_scalar));
         self
     }
 
@@ -240,7 +264,12 @@ impl PostgreSQLTranslator {
             NodeRef::TransactionStmt(txn) => self.translate_transaction(txn)?,
             NodeRef::LockStmt(lock) => self.translate_lock_stub(lock)?,
             NodeRef::DropStmt(drop) => self.translate_drop(drop)?,
-            NodeRef::AlterTableStmt(alter) => self.translate_alter_table(alter)?,
+            NodeRef::AlterTableStmt(alter) => {
+                self.translating_table_definition.set(true);
+                let alter_table = self.translate_alter_table(alter);
+                self.translating_table_definition.set(false);
+                alter_table?
+            }
             NodeRef::RenameStmt(rename) => self.translate_rename_stmt(rename)?,
             NodeRef::IndexStmt(idx) => self.translate_create_index(idx)?,
             NodeRef::TruncateStmt(truncate) => self.translate_truncate(truncate)?,
@@ -251,6 +280,10 @@ impl PostgreSQLTranslator {
             NodeRef::CreateRoleStmt(role) => translate_create_role(role)?,
             NodeRef::CreatePolicyStmt(policy) => self.translate_create_policy(policy)?,
             NodeRef::GrantRoleStmt(grant) => translate_grant_role(grant)?,
+            NodeRef::DropRoleStmt(drop) => ast::Stmt::DropRole {
+                if_exists: drop.missing_ok,
+                roles: role_list(&drop.roles, "DROP ROLE")?,
+            },
             NodeRef::CopyStmt(_) => {
                 return Err(ParseError::ParseError(
                     "COPY is handled at the postgres frontend layer".to_string(),
@@ -417,6 +450,7 @@ impl PostgreSQLTranslator {
             relation,
             create.inh_relations.is_empty(),
             &[],
+            self.is_scalar_function.as_deref(),
         )?;
 
         for elt in &create.table_elts {
@@ -548,7 +582,10 @@ impl PostgreSQLTranslator {
         &self,
         create: &pg_query::protobuf::CreateStmt,
     ) -> Result<TranslateResult, ParseError> {
-        let (stmt, serial_sequences) = self.translate_create_table(create)?;
+        self.translating_table_definition.set(true);
+        let create_table = self.translate_create_table(create);
+        self.translating_table_definition.set(false);
+        let (stmt, serial_sequences) = create_table?;
         let ast::Stmt::CreateTable { tbl_name, .. } = &stmt else {
             unreachable!("translate_create_table returns a CREATE TABLE statement");
         };
@@ -1273,6 +1310,7 @@ impl PostgreSQLTranslator {
                     relation,
                     false,
                     &self.existing_generated_columns,
+                    self.is_scalar_function.as_deref(),
                 )?;
                 let col = self.translate_column_def(col_def, &name)?;
                 ast::AlterTableBody::AddColumn(col)
@@ -2366,7 +2404,7 @@ impl PostgreSQLTranslator {
                 select: ast::OneSelect::Values(rows),
                 compounds: vec![],
             };
-            let order_by = self.translate_order_by(&select.sort_clause)?;
+            let order_by = self.translate_select_order_by(&select.sort_clause)?;
             let limit = self.translate_select_limit(select)?;
             let with = self.translate_with_clause(&select.with_clause)?;
             return Ok(ast::Select {
@@ -2399,9 +2437,9 @@ impl PostgreSQLTranslator {
             None
         };
 
-        let order_by = self.translate_order_by(&select.sort_clause)?;
+        let order_by = self.translate_select_order_by(&select.sort_clause)?;
 
-        let distinctness = translate_distinct_clause(&select.distinct_clause)?;
+        let distinctness = self.translate_distinct_clause(select)?;
 
         let group_by = self.translate_group_by(&select.group_clause, &select.having_clause)?;
 
@@ -2484,7 +2522,7 @@ impl PostgreSQLTranslator {
             })
             .collect::<Result<Vec<_>, ParseError>>()?;
 
-        let order_by = self.translate_order_by(&select.sort_clause)?;
+        let order_by = self.translate_select_order_by(&select.sort_clause)?;
         let limit = self.translate_select_limit(select)?;
         let with = self.translate_with_clause(&select.with_clause)?;
 
@@ -2608,7 +2646,7 @@ impl PostgreSQLTranslator {
             None
         };
 
-        let distinctness = translate_distinct_clause(&select.distinct_clause)?;
+        let distinctness = self.translate_distinct_clause(select)?;
 
         let group_by = self.translate_group_by(&select.group_clause, &select.having_clause)?;
 
@@ -2622,6 +2660,49 @@ impl PostgreSQLTranslator {
             group_by,
             window_clause,
         })
+    }
+
+    /// A plain DISTINCT is a list of one empty node; DISTINCT ON is the list of its expressions.
+    fn translate_distinct_clause(
+        &self,
+        select: &pg_query::protobuf::SelectStmt,
+    ) -> Result<Option<ast::SelectDistinctness>, ParseError> {
+        let distinct_clause = &select.distinct_clause;
+        if distinct_clause.is_empty() {
+            return Ok(None);
+        }
+        // A COLLATE that names the binary collation is translated to nothing, so two
+        // expressions that PostgreSQL finds different would compare as the same.
+        if distinct_clause.iter().all(|node| node.node.is_none()) {
+            let has_order_by = !select.sort_clause.is_empty();
+            if has_order_by
+                && Self::has_collate(select.target_list.iter().chain(&select.sort_clause))
+            {
+                return Err(ParseError::not_supported(
+                    "COLLATE in a SELECT DISTINCT with ORDER BY",
+                ));
+            }
+            return Ok(Some(ast::SelectDistinctness::Distinct));
+        }
+        if Self::has_collate(distinct_clause.iter().chain(&select.sort_clause)) {
+            return Err(ParseError::not_supported(
+                "COLLATE in a SELECT DISTINCT ON expression or in its ORDER BY",
+            ));
+        }
+        Self::reject_constant_that_is_not_a_position(distinct_clause, "DISTINCT ON")?;
+        let exprs = distinct_clause
+            .iter()
+            .map(|node| self.translate_expr(node).map(Box::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(ast::SelectDistinctness::DistinctOn(exprs)))
+    }
+
+    fn has_collate<'a>(exprs: impl IntoIterator<Item = &'a pg_query::protobuf::Node>) -> bool {
+        exprs
+            .into_iter()
+            .filter_map(|node| node.node.as_ref())
+            .flat_map(|node| node.nodes())
+            .any(|(node, ..)| matches!(node, NodeRef::CollateClause(_)))
     }
 
     /// Translate multiple FROM items. The first becomes the primary table,
@@ -2931,12 +3012,10 @@ impl PostgreSQLTranslator {
             });
         }
 
-        let qualified_name = function_qualified_name(func_name);
         if let Some(function) = rewritten_function(func_name) {
             return translate_rewritten_function(
                 function,
                 range_func,
-                qualified_name,
                 args,
                 alias,
                 CallShape {
@@ -2967,7 +3046,11 @@ impl PostgreSQLTranslator {
         }
         reject_column_aliases(&range_func.alias, "a function")?;
 
-        Ok(ast::SelectTable::TableCall(qualified_name, args, alias))
+        Ok(ast::SelectTable::TableCall(
+            function_qualified_name(func_name),
+            args,
+            alias,
+        ))
     }
 
     fn translate_json_to_record(
@@ -3646,8 +3729,9 @@ impl PostgreSQLTranslator {
                         | SqlValueFunctionOp::SvfopCurrentTimestampN
                         | SqlValueFunctionOp::SvfopLocaltimeN
                         | SqlValueFunctionOp::SvfopLocaltimestampN)
-                ) && svf.typmod != 0
-                {
+                ) {
+                    // pg_query gives the N variants only when a precision was
+                    // written. PostgreSQL rounds to it; tursopg cannot yet.
                     return Err(ParseError::not_supported(
                         "a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP",
                     ));
@@ -3673,12 +3757,24 @@ impl PostgreSQLTranslator {
                         check_type_is_supported("time", 0)?;
                         Ok(ast::Expr::Literal(ast::Literal::CurrentTime))
                     }
+                    // CURRENT_TIMESTAMP is now(), the time the transaction
+                    // started, and LOCALTIMESTAMP is that time as a timestamp
+                    // in the session's time zone, which is always UTC.
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTimestamp
-                        | SqlValueFunctionOp::SvfopCurrentTimestampN
-                        | SqlValueFunctionOp::SvfopLocaltimestamp
+                        | SqlValueFunctionOp::SvfopCurrentTimestampN,
+                    ) => Ok(function_call("now", vec![])),
+                    Ok(
+                        SqlValueFunctionOp::SvfopLocaltimestamp
                         | SqlValueFunctionOp::SvfopLocaltimestampN,
-                    ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp)),
+                    ) => Ok(ast::Expr::Cast {
+                        expr: Box::new(function_call("now", vec![])),
+                        type_name: Some(ast::Type {
+                            name: "timestamp".to_string(),
+                            size: None,
+                            array_dimensions: 0,
+                        }),
+                    }),
                     // Each role keyword is stored as a call to the function
                     // of the same name, so that the catalogs can show the
                     // keyword that was written.
@@ -4412,6 +4508,14 @@ impl PostgreSQLTranslator {
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
         let func_name = function_name(&func_call.funcname)?;
+        if func_call.agg_star
+            && self
+                .is_scalar_function
+                .as_ref()
+                .is_some_and(|is_scalar| is_scalar(&func_name))
+        {
+            return Err(star_argument_error(&func_call.funcname));
+        }
         if let Some(result_type) = datetime_result_type(&func_name) {
             check_type_is_supported(result_type, 0)?;
         }
@@ -4465,6 +4569,27 @@ impl PostgreSQLTranslator {
         } else {
             None
         };
+
+        if func_call.agg_filter.is_none() && func_call.over.is_none() {
+            if let Some(description) = description_lookup(&func_name, &args) {
+                let unsupported_use = if self.translating_index.get() {
+                    Some("in an index")
+                } else if self.translating_table_definition.get() {
+                    Some("in a table definition")
+                } else if has_aggregate_outside_subqueries(&func_call.args) {
+                    Some("of an aggregate or window function")
+                } else {
+                    None
+                };
+                if let Some(unsupported_use) = unsupported_use {
+                    return Err(ParseError::Sqlstate {
+                        sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+                        message: format!("{func_name} {unsupported_use} is not supported"),
+                    });
+                }
+                return Ok(description);
+            }
+        }
 
         // Rewrite PG-specific function-name spellings to their core-native
         // equivalents so the core resolver doesn't need to carry aliases
@@ -5352,6 +5477,76 @@ impl PostgreSQLTranslator {
         Ok(ast::Expr::Parenthesized(values))
     }
 
+    /// The ORDER BY of a SELECT, where a constant must be an integer that is a position in
+    /// the select list.
+    fn translate_select_order_by(
+        &self,
+        sort_clause: &[pg_query::protobuf::Node],
+    ) -> Result<Vec<ast::SortedColumn>, ParseError> {
+        let sort_exprs = sort_clause.iter().filter_map(|node| match &node.node {
+            Some(pg_query::protobuf::node::Node::SortBy(sort_by)) => sort_by.node.as_deref(),
+            _ => None,
+        });
+        Self::reject_constant_that_is_not_a_position(sort_exprs, "ORDER BY")?;
+        self.translate_order_by(sort_clause)
+    }
+
+    fn reject_constant_that_is_not_a_position<'a>(
+        exprs: impl IntoIterator<Item = &'a pg_query::protobuf::Node>,
+        clause: &str,
+    ) -> Result<(), ParseError> {
+        use pg_query::protobuf::{a_const::Val, node::Node};
+
+        for expr in exprs {
+            match &expr.node {
+                Some(Node::AConst(constant)) if !matches!(constant.val, Some(Val::Ival(_))) => {
+                    return Err(ParseError::Sqlstate {
+                        sqlstate: SQLSTATE_SYNTAX_ERROR,
+                        message: format!("non-integer constant in {clause}"),
+                    });
+                }
+                Some(Node::AConst(_)) => {}
+                _ if Self::is_integer_constant_with_sign_or_collation(expr) => {
+                    return Err(ParseError::not_supported(format!(
+                        "an integer constant with a sign or a COLLATE in {clause}"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the expression is an integer constant under unary `+`, unary `-` or COLLATE,
+    /// such as `+1`. The engine would read it as a position in the select list.
+    fn is_integer_constant_with_sign_or_collation(expr: &pg_query::protobuf::Node) -> bool {
+        use pg_query::protobuf::{a_const::Val, node::Node, AExprKind};
+
+        match &expr.node {
+            Some(Node::AConst(constant)) => matches!(constant.val, Some(Val::Ival(_))),
+            Some(Node::CollateClause(collate)) => collate
+                .arg
+                .as_deref()
+                .is_some_and(Self::is_integer_constant_with_sign_or_collation),
+            Some(Node::AExpr(a_expr)) => {
+                let is_sign = a_expr.kind() == AExprKind::AexprOp
+                    && a_expr.lexpr.is_none()
+                    && matches!(
+                        a_expr.name.as_slice(),
+                        [pg_query::protobuf::Node {
+                            node: Some(Node::String(name)),
+                        }] if name.sval == "+" || name.sval == "-"
+                    );
+                is_sign
+                    && a_expr
+                        .rexpr
+                        .as_deref()
+                        .is_some_and(Self::is_integer_constant_with_sign_or_collation)
+            }
+            _ => false,
+        }
+    }
+
     fn translate_order_by(
         &self,
         sort_clause: &[pg_query::protobuf::Node],
@@ -5635,12 +5830,10 @@ struct CallShape {
 /// the engine here. The call is a SELECT over the engine's table function.
 struct RewrittenFunction {
     name: &'static str,
-    in_main_schema: bool,
+    /// The name of the engine's table function, in the main schema.
+    engine_name: &'static str,
     /// Refuses a call that PostgreSQL refuses for this function.
     check_call: fn(CallShape) -> Result<(), ParseError>,
-    /// The arguments to pass to the engine's table function, given the arguments of the call.
-    #[allow(clippy::vec_box)]
-    prepare_arguments: fn(Vec<Box<ast::Expr>>) -> Vec<Box<ast::Expr>>,
     /// The column of the engine's table function that holds each column of the result,
     /// and the name PostgreSQL gives that column, for a call with this many arguments.
     columns: fn(usize) -> Vec<(ast::Expr, String)>,
@@ -5677,7 +5870,7 @@ const POSTGRES_TABLE_FUNCTIONS: [&str; 3] = [
 const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
     RewrittenFunction {
         name: "unnest",
-        in_main_schema: true,
+        engine_name: "unnest",
         check_call: |call| {
             let count = call.arg_count;
             if count == 0 || (call.schema_qualified && count > 1) {
@@ -5702,7 +5895,6 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
             }
             Ok(())
         },
-        prepare_arguments: |arguments| arguments,
         columns: |count| {
             (1..=count)
                 .map(|array| {
@@ -5716,7 +5908,7 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
     },
     RewrittenFunction {
         name: "generate_series",
-        in_main_schema: true,
+        engine_name: "generate_series",
         check_call: |call| {
             if !(2..=3).contains(&call.arg_count) {
                 return Err(ParseError::Sqlstate {
@@ -5729,12 +5921,11 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
             }
             Ok(())
         },
-        prepare_arguments: |arguments| arguments,
         columns: |_| vec![(ast::Expr::Id(exact_name("value")), "generate_series".into())],
     },
     RewrittenFunction {
         name: "json_each",
-        in_main_schema: false,
+        engine_name: "pg_json_each",
         check_call: |call| {
             if call.arg_count != 1 {
                 return Err(ParseError::Sqlstate {
@@ -5747,52 +5938,9 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
             }
             Ok(())
         },
-        prepare_arguments: |arguments| {
-            arguments
-                .into_iter()
-                .map(|argument| {
-                    Box::new(json_type_or_raise(
-                        json_type(vec![argument.clone()]),
-                        *argument,
-                        "object",
-                        &[(
-                            "array",
-                            "cannot deconstruct an array as an object".to_string(),
-                        )],
-                        "cannot deconstruct a scalar",
-                    ))
-                })
-                .collect()
-        },
         columns: |_| {
-            let column = |name: &str| ast::Expr::Id(exact_name(name));
-            let text = |text: &str| {
-                Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                    "'{text}'"
-                ))))
-            };
-            let json_text = ast::Expr::Case {
-                base: Some(Box::new(column("type"))),
-                when_then_pairs: vec![
-                    (text("object"), Box::new(column("value"))),
-                    (text("array"), Box::new(column("value"))),
-                    (text("true"), text("true")),
-                    (text("false"), text("false")),
-                ],
-                else_expr: Some(Box::new(ast::Expr::FunctionCall {
-                    name: exact_name("json_quote"),
-                    distinctness: None,
-                    args: vec![Box::new(column("value"))],
-                    order_by: vec![],
-                    within_group: vec![],
-                    filter_over: ast::FunctionTail {
-                        filter_clause: None,
-                        over_clause: None,
-                    },
-                })),
-            };
-            let cast = |expr: ast::Expr, type_name: &str| ast::Expr::Cast {
-                expr: Box::new(expr),
+            let cast = |name: &str, type_name: &str| ast::Expr::Cast {
+                expr: Box::new(ast::Expr::Id(exact_name(name))),
                 type_name: Some(ast::Type {
                     name: type_name.to_string(),
                     size: None,
@@ -5800,18 +5948,16 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
                 }),
             };
             vec![
-                (cast(column("key"), "TEXT"), "key".to_string()),
-                (cast(json_text, "JSON"), "value".to_string()),
+                (cast("key", "TEXT"), "key".to_string()),
+                (ast::Expr::Id(exact_name("value")), "value".to_string()),
             ]
         },
     },
 ];
 
 fn function_qualified_name(func_name: &str) -> ast::QualifiedName {
-    let in_main_schema = is_catalog_table_name(func_name)
-        || rewritten_function(func_name).is_some_and(|function| function.in_main_schema);
     let name = exact_name(func_name);
-    if in_main_schema {
+    if is_catalog_table_name(func_name) {
         ast::QualifiedName::fullname(exact_name("main"), name)
     } else {
         ast::QualifiedName::single(name)
@@ -5822,7 +5968,6 @@ fn function_qualified_name(func_name: &str) -> ast::QualifiedName {
 fn translate_rewritten_function(
     function: &RewrittenFunction,
     range_func: &pg_query::protobuf::RangeFunction,
-    qualified_name: ast::QualifiedName,
     args: Vec<Box<ast::Expr>>,
     alias: Option<ast::As>,
     call: CallShape,
@@ -5833,7 +5978,6 @@ fn translate_rewritten_function(
             "a column definition list is only allowed for functions returning \"record\"".into(),
         ));
     }
-    let args = (function.prepare_arguments)(args);
     let (mut sources, mut default_names): (Vec<_>, Vec<_>) =
         (function.columns)(args.len()).into_iter().unzip();
     if let ([name], Some(table_alias)) = (default_names.as_mut_slice(), &range_func.alias) {
@@ -5851,7 +5995,11 @@ fn translate_rewritten_function(
         })
         .collect();
     Ok(ast::SelectTable::Select {
-        select: function_select(qualified_name, args, columns),
+        select: function_select(
+            ast::QualifiedName::fullname(exact_name("main"), exact_name(function.engine_name)),
+            args,
+            columns,
+        ),
         alias: Some(alias.unwrap_or_else(|| ast::As::Elided(exact_name(function.name)))),
         lateral: true,
     })
@@ -7674,11 +7822,13 @@ fn check_array_dimensions(dimensions: u32) -> Result<(), ParseError> {
 
 /// Check the generated columns among `table_elts`, which declares every column of the table
 /// when `has_all_columns` is set, in a table that already has `existing_generated_columns`.
+/// `is_scalar_function` is the translator's check of `f(*)`.
 fn validate_generated_columns<'a>(
     table_elts: &'a [pg_query::protobuf::Node],
     relation: &'a pg_query::protobuf::RangeVar,
     has_all_columns: bool,
     existing_generated_columns: &'a [String],
+    is_scalar_function: Option<&'a dyn Fn(&str) -> bool>,
 ) -> Result<(), ParseError> {
     use pg_query::protobuf::node::Node;
     use pg_query::protobuf::ConstrType;
@@ -7709,6 +7859,7 @@ fn validate_generated_columns<'a>(
             .iter()
             .map(String::as_str)
             .collect(),
+        is_scalar_function,
     };
     let mut table_foreign_keys = Vec::new();
     for elt in table_elts {
@@ -7776,6 +7927,9 @@ struct GenerationTable<'a> {
     columns: Vec<(&'a str, Option<&'a pg_query::protobuf::TypeName>)>,
     has_all_columns: bool,
     generated_columns: Vec<&'a str>,
+    /// Whether a function called with `*` is neither an aggregate nor a
+    /// window function; `None` when the translator does not check that.
+    is_scalar_function: Option<&'a dyn Fn(&str) -> bool>,
 }
 
 impl GenerationTable<'_> {
@@ -7836,6 +7990,15 @@ fn validate_generation_expression(
                 let name = last_string(&call.funcname)
                     .unwrap_or_default()
                     .to_lowercase();
+                // PostgreSQL rejects `f(*)` on a function that is not an aggregate
+                // before the checks below.
+                if call.agg_star
+                    && table
+                        .is_scalar_function
+                        .is_some_and(|is_scalar| is_scalar(&name))
+                {
+                    return Err(star_argument_error(&call.funcname));
+                }
                 if call.over.is_some() {
                     return Err(error(
                         SQLSTATE_WINDOWING_ERROR,
@@ -7843,12 +8006,7 @@ fn validate_generation_expression(
                             .to_string(),
                     ));
                 }
-                if call.agg_star
-                    || call.agg_distinct
-                    || call.agg_filter.is_some()
-                    || !call.agg_order.is_empty()
-                    || pg_func(&name).is_some_and(|f| f.aggregate)
-                {
+                if is_aggregate_call(call) {
                     return Err(error(
                         SQLSTATE_GROUPING_ERROR,
                         "aggregate functions are not allowed in column generation expressions"
@@ -8799,6 +8957,62 @@ pub fn try_extract_drop_schema(parse_result: &ParseResult) -> Option<PgDropSchem
     })
 }
 
+/// DROP TABLE, DROP VIEW or DROP MATERIALIZED VIEW that names several
+/// relations or has CASCADE. The frontend runs it as one DROP statement for
+/// each relation it drops.
+#[derive(Debug, Clone)]
+pub struct PgDropRelationsStmt {
+    /// `TABLE`, `VIEW` or `MATERIALIZED VIEW`.
+    pub kind: &'static str,
+    /// The parts of each name: the relation, or its schema and the relation.
+    pub names: Vec<Vec<String>>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+/// The DROP statement of `parse_result` when the frontend runs it as several
+/// statements: a DROP of tables or views with CASCADE or with several names.
+pub fn try_extract_drop_relations(parse_result: &ParseResult) -> Option<PgDropRelationsStmt> {
+    use pg_query::protobuf::{DropBehavior, ObjectType};
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let NodeRef::DropStmt(drop) = &nodes.first()?.0 else {
+        return None;
+    };
+    let kind = match ObjectType::try_from(drop.remove_type).ok()? {
+        ObjectType::ObjectTable => "TABLE",
+        ObjectType::ObjectView => "VIEW",
+        ObjectType::ObjectMatview => "MATERIALIZED VIEW",
+        _ => return None,
+    };
+    let cascade = DropBehavior::try_from(drop.behavior).ok() == Some(DropBehavior::DropCascade);
+    if !cascade && drop.objects.len() < 2 {
+        return None;
+    }
+    let names = drop
+        .objects
+        .iter()
+        .map(|object| match object.node.as_ref()?.to_ref() {
+            NodeRef::List(list) => list
+                .items
+                .iter()
+                .map(|part| match part.node.as_ref()?.to_ref() {
+                    NodeRef::String(part) => Some(part.sval.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(PgDropRelationsStmt {
+        kind,
+        names,
+        if_exists: drop.missing_ok,
+        cascade,
+    })
+}
+
 /// A REFRESH MATERIALIZED VIEW statement. Turso materialized views are live
 /// (auto-updating), so REFRESH does nothing.
 #[derive(Debug, Clone)]
@@ -9049,25 +9263,158 @@ fn relation_privilege(name: &str, on_sequences: bool) -> Result<ast::Privilege, 
     })
 }
 
-/// A COMMENT ON statement. Comments are accepted for PostgreSQL
-/// compatibility but are not stored.
-#[derive(Debug, Clone)]
-pub struct PgCommentOnStmt {
-    pub target: PgCommentTarget,
+/// Whether one of `args` calls an aggregate or window function that is not
+/// inside a subquery of the argument.
+fn has_aggregate_outside_subqueries(args: &[pg_query::protobuf::Node]) -> bool {
+    let nodes: Vec<NodeRef<'_>> = args
+        .iter()
+        .filter_map(|arg| arg.node.as_ref())
+        .flat_map(|arg| arg.nodes())
+        .map(|(node, ..)| node)
+        .collect();
+    let calls_in_subqueries: Vec<*const pg_query::protobuf::FuncCall> = nodes
+        .iter()
+        .filter_map(|node| match node {
+            NodeRef::SubLink(subquery) => subquery.subselect.as_ref()?.node.as_ref(),
+            _ => None,
+        })
+        .flat_map(|subquery| subquery.nodes())
+        .filter_map(|(node, ..)| match node {
+            NodeRef::FuncCall(call) => Some(std::ptr::from_ref(call)),
+            _ => None,
+        })
+        .collect();
+    nodes.iter().any(|node| match node {
+        NodeRef::FuncCall(call) => {
+            (call.over.is_some() || is_aggregate_call(call))
+                && !calls_in_subqueries.contains(&std::ptr::from_ref(*call))
+        }
+        _ => false,
+    })
 }
 
-/// What a COMMENT ON statement comments on, as far as deciding who may run
-/// it.
-#[derive(Debug, Clone)]
-pub enum PgCommentTarget {
-    /// An object that only its owner may comment on, named the way
-    /// PostgreSQL names it in errors, such as `table t`, or `relation t` for
-    /// a column or constraint of `t`.
-    Owned(String),
-    /// A role. Commenting on it needs the CREATEROLE attribute.
-    Role,
-    /// Any other kind of object.
-    Other,
+fn is_aggregate_call(call: &pg_query::protobuf::FuncCall) -> bool {
+    let name = last_string(&call.funcname)
+        .unwrap_or_default()
+        .to_lowercase();
+    call.agg_star
+        || call.agg_distinct
+        || call.agg_filter.is_some()
+        || !call.agg_order.is_empty()
+        || pg_func(&name).is_some_and(|f| f.aggregate)
+}
+
+/// The subquery that reads the comment for a call of `obj_description` or
+/// `col_description`. None for another function or number of arguments.
+fn description_lookup(func_name: &str, args: &[Box<ast::Expr>]) -> Option<ast::Expr> {
+    let conditions = match (func_name, args) {
+        ("obj_description", [object]) => vec![
+            ("objoid", (**object).clone()),
+            ("objsubid", integer_literal(0)),
+        ],
+        ("obj_description", [object, catalog]) => vec![
+            ("objoid", (**object).clone()),
+            ("classoid", catalog_oid(catalog)),
+            ("objsubid", integer_literal(0)),
+        ],
+        ("col_description", [table, column_number]) => vec![
+            ("objoid", (**table).clone()),
+            ("classoid", integer_literal(PG_CLASS_OID)),
+            ("objsubid", (**column_number).clone()),
+        ],
+        _ => return None,
+    };
+    Some(description_subquery(conditions))
+}
+
+/// `(SELECT description FROM pg_description WHERE column = value AND ... LIMIT 1)`
+/// for the `conditions`, which are pairs of a column and its value.
+fn description_subquery(conditions: Vec<(&str, ast::Expr)>) -> ast::Expr {
+    let mut parser = turso_parser::parser::Parser::new(DESCRIPTION_SELECT.as_bytes());
+    let Ok(Some(ast::Cmd::Stmt(ast::Stmt::Select(mut select)))) = parser.next_cmd() else {
+        unreachable!("DESCRIPTION_SELECT is a SELECT statement");
+    };
+    let ast::OneSelect::Select { where_clause, .. } = &mut select.body.select else {
+        unreachable!("DESCRIPTION_SELECT has no VALUES");
+    };
+    *where_clause = conditions
+        .into_iter()
+        .map(|(column, value)| {
+            let column = ast::Expr::Id(exact_name(format!("_turso_{column}")));
+            ast::Expr::Binary(Box::new(column), ast::Operator::Equals, Box::new(value))
+        })
+        .reduce(|all, condition| {
+            ast::Expr::Binary(Box::new(all), ast::Operator::And, Box::new(condition))
+        })
+        .map(Box::new);
+    ast::Expr::Subquery(Box::new(select))
+}
+
+// The columns are renamed because a value is an expression of the outer
+// query: `oid` in it must not be read as the rowid of pg_description.
+const DESCRIPTION_SELECT: &str = "SELECT _turso_description FROM (\
+    SELECT objoid AS _turso_objoid, classoid AS _turso_classoid, \
+    objsubid AS _turso_objsubid, description AS _turso_description \
+    FROM main.pg_description) LIMIT 1";
+
+/// `CASE catalog WHEN 'pg_class' THEN 1259 WHEN 'pg_namespace' THEN 2615 END`:
+/// the oid of the catalog named `catalog`.
+fn catalog_oid(catalog: &ast::Expr) -> ast::Expr {
+    ast::Expr::Case {
+        base: Some(Box::new(catalog.clone())),
+        when_then_pairs: [
+            ("pg_class", PG_CLASS_OID),
+            ("pg_namespace", PG_NAMESPACE_OID),
+        ]
+        .iter()
+        .map(|(name, oid)| {
+            let name = ast::Expr::Literal(ast::Literal::String(format!("'{name}'")));
+            (Box::new(name), Box::new(integer_literal(*oid)))
+        })
+        .collect(),
+        else_expr: None,
+    }
+}
+
+fn integer_literal(value: i64) -> ast::Expr {
+    ast::Expr::Literal(ast::Literal::Numeric(value.to_string()))
+}
+
+/// PostgreSQL's oid of `pg_class`, the `classoid` of a comment on a relation
+/// or on a column.
+pub const PG_CLASS_OID: i64 = 1259;
+
+/// PostgreSQL's oid of `pg_namespace`, the `classoid` of a comment on a
+/// schema.
+pub const PG_NAMESPACE_OID: i64 = 2615;
+
+/// A COMMENT ON statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgCommentOnStmt {
+    pub object: PgCommentObject,
+    /// The comment, or None when the statement removes it: `IS NULL` and
+    /// `IS ''` both do.
+    pub comment: Option<String>,
+}
+
+/// What a COMMENT ON statement comments on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PgCommentObject {
+    /// A relation, of the kind the statement says it is.
+    Relation {
+        kind: ast::RelationKind,
+        schema: Option<String>,
+        name: String,
+    },
+    Column {
+        schema: Option<String>,
+        table: String,
+        column: String,
+    },
+    Schema(String),
+    /// A kind of object whose comments are not stored, named as the
+    /// statement names it, such as `TYPE`.
+    Unsupported(&'static str),
 }
 
 /// Extracts a COMMENT ON statement.
@@ -9085,28 +9432,64 @@ pub fn try_extract_comment_on(parse_result: &ParseResult) -> Option<PgCommentOnS
         .and_then(|node| node.node.as_ref())
         .map(comment_object_names)
         .unwrap_or_default();
-    let last = || names.last().cloned().unwrap_or_default();
-    let owned = |kind: &str, name: String| PgCommentTarget::Owned(format!("{kind} {name}"));
-    let target = match ObjectType::try_from(comment.objtype) {
-        Ok(ObjectType::ObjectTable) => owned("table", last()),
-        Ok(ObjectType::ObjectView) => owned("view", last()),
-        Ok(ObjectType::ObjectMatview) => owned("materialized view", last()),
-        Ok(ObjectType::ObjectIndex) => owned("index", last()),
-        Ok(ObjectType::ObjectSequence) => owned("sequence", last()),
-        Ok(ObjectType::ObjectSchema) => owned("schema", last()),
-        Ok(ObjectType::ObjectType | ObjectType::ObjectDomain) => owned("type", last()),
-        Ok(ObjectType::ObjectFunction) => owned("function", last()),
-        Ok(ObjectType::ObjectDatabase) => owned("database", last()),
-        Ok(ObjectType::ObjectExtension) => owned("extension", last()),
-        // A column or constraint belongs to its table.
-        Ok(ObjectType::ObjectColumn | ObjectType::ObjectTabconstraint) => owned(
-            "relation",
-            names.iter().rev().nth(1).cloned().unwrap_or_default(),
-        ),
-        Ok(ObjectType::ObjectRole) => PgCommentTarget::Role,
-        _ => PgCommentTarget::Other,
+    let object_type = ObjectType::try_from(comment.objtype).ok();
+    let relation_kind = match object_type {
+        Some(ObjectType::ObjectTable) => Some(ast::RelationKind::Table),
+        Some(ObjectType::ObjectView) => Some(ast::RelationKind::View),
+        Some(ObjectType::ObjectMatview) => Some(ast::RelationKind::MaterializedView),
+        Some(ObjectType::ObjectIndex) => Some(ast::RelationKind::Index),
+        Some(ObjectType::ObjectSequence) => Some(ast::RelationKind::Sequence),
+        _ => None,
     };
-    Some(PgCommentOnStmt { target })
+    let object = match (relation_kind, object_type, names.as_slice()) {
+        (Some(kind), _, [name]) => PgCommentObject::Relation {
+            kind,
+            schema: None,
+            name: name.clone(),
+        },
+        (Some(kind), _, [schema, name]) => PgCommentObject::Relation {
+            kind,
+            schema: Some(schema.clone()),
+            name: name.clone(),
+        },
+        (None, Some(ObjectType::ObjectColumn), [table, column]) => PgCommentObject::Column {
+            schema: None,
+            table: table.clone(),
+            column: column.clone(),
+        },
+        (None, Some(ObjectType::ObjectColumn), [schema, table, column]) => {
+            PgCommentObject::Column {
+                schema: Some(schema.clone()),
+                table: table.clone(),
+                column: column.clone(),
+            }
+        }
+        (None, Some(ObjectType::ObjectSchema), [schema]) => PgCommentObject::Schema(schema.clone()),
+        _ => PgCommentObject::Unsupported(match object_type {
+            Some(ObjectType::ObjectType) => "TYPE",
+            Some(ObjectType::ObjectDomain) => "DOMAIN",
+            Some(ObjectType::ObjectFunction) => "FUNCTION",
+            Some(ObjectType::ObjectTabconstraint | ObjectType::ObjectDomconstraint) => "CONSTRAINT",
+            Some(ObjectType::ObjectDatabase) => "DATABASE",
+            Some(ObjectType::ObjectExtension) => "EXTENSION",
+            Some(ObjectType::ObjectRole) => "ROLE",
+            Some(ObjectType::ObjectTrigger) => "TRIGGER",
+            Some(ObjectType::ObjectPolicy) => "POLICY",
+            Some(ObjectType::ObjectColumn) => "COLUMN with a database name",
+            Some(
+                ObjectType::ObjectTable
+                | ObjectType::ObjectView
+                | ObjectType::ObjectMatview
+                | ObjectType::ObjectIndex
+                | ObjectType::ObjectSequence,
+            ) => "a relation with a database name",
+            _ => "this kind of object",
+        }),
+    };
+    Some(PgCommentOnStmt {
+        object,
+        comment: (!comment.comment.is_empty()).then(|| comment.comment.clone()),
+    })
 }
 
 /// The names in the object of a COMMENT ON statement, such as
@@ -9286,6 +9669,7 @@ pub enum FrontendStmt {
     DiscardAll,
     CreateSchema(PgCreateSchemaStmt),
     DropSchema(PgDropSchemaStmt),
+    DropRelations(PgDropRelationsStmt),
     RefreshMatview(PgRefreshMatviewStmt),
     CommentOn(PgCommentOnStmt),
     Grant(PgGrantStmt),
@@ -9324,6 +9708,9 @@ pub fn frontend_stmt(
     }
     if let Some(stmt) = try_extract_drop_schema(parse_result) {
         return Ok(Some(FrontendStmt::DropSchema(stmt)));
+    }
+    if let Some(stmt) = try_extract_drop_relations(parse_result) {
+        return Ok(Some(FrontendStmt::DropRelations(stmt)));
     }
     if let Some(stmt) = try_extract_refresh_matview(parse_result)? {
         return Ok(Some(FrontendStmt::RefreshMatview(stmt)));
@@ -9448,9 +9835,7 @@ fn deparse_default_expr(node: &pg_query::protobuf::Node) -> Option<String> {
             match SqlValueFunctionOp::try_from(svf.op) {
                 Ok(
                     SqlValueFunctionOp::SvfopCurrentTimestamp
-                    | SqlValueFunctionOp::SvfopCurrentTimestampN
-                    | SqlValueFunctionOp::SvfopLocaltimestamp
-                    | SqlValueFunctionOp::SvfopLocaltimestampN,
+                    | SqlValueFunctionOp::SvfopLocaltimestamp,
                 ) => Some("strftime('%Y-%m-%d %H:%M:%f', 'now')".to_string()),
                 Ok(SqlValueFunctionOp::SvfopCurrentDate) => Some("CURRENT_DATE".to_string()),
                 Ok(
@@ -9944,18 +10329,6 @@ fn compound_operator(
     }
 }
 
-fn translate_distinct_clause(
-    distinct_clause: &[pg_query::protobuf::Node],
-) -> Result<Option<ast::Distinctness>, ParseError> {
-    if distinct_clause.is_empty() {
-        return Ok(None);
-    }
-    if distinct_clause.iter().any(|n| n.node.is_some()) {
-        return Err(ParseError::not_supported("SELECT DISTINCT ON"));
-    }
-    Ok(Some(ast::Distinctness::Distinct))
-}
-
 fn reject_column_aliases(
     alias: &Option<pg_query::protobuf::Alias>,
     what: &str,
@@ -9990,6 +10363,20 @@ fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
             .iter()
             .any(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "||")),
         _ => false,
+    }
+}
+
+/// The error PostgreSQL reports for `f(*)` when the function named by
+/// `names` is neither an aggregate nor a window function. The name is
+/// written as the statement qualifies it.
+fn star_argument_error(names: &[pg_query::protobuf::Node]) -> ParseError {
+    let name = match extract_key_columns(names) {
+        Ok(names) => names.join("."),
+        Err(error) => return error,
+    };
+    ParseError::Sqlstate {
+        sqlstate: SQLSTATE_WRONG_OBJECT_TYPE,
+        message: format!("{name}(*) specified, but {name} is not an aggregate function"),
     }
 }
 
@@ -10068,6 +10455,7 @@ mod tests {
                 FrontendStmt::DiscardAll => "discard all",
                 FrontendStmt::CreateSchema(_) => "create schema",
                 FrontendStmt::DropSchema(_) => "drop schema",
+                FrontendStmt::DropRelations(_) => "drop relations",
                 FrontendStmt::RefreshMatview(_) => "refresh matview",
                 FrontendStmt::CommentOn(_) => "comment on",
                 FrontendStmt::Grant(_) => "grant",
@@ -10975,7 +11363,7 @@ mod tests {
         if let ast::Stmt::Select(select) = translated {
             if let ast::OneSelect::Select { distinctness, .. } = &select.body.select {
                 assert!(
-                    matches!(distinctness, Some(ast::Distinctness::Distinct)),
+                    matches!(distinctness, Some(ast::SelectDistinctness::Distinct)),
                     "Should have DISTINCT"
                 );
             } else {
@@ -11755,7 +12143,7 @@ mod tests {
             panic!("Expected SELECT body");
         };
 
-        let expected = [ast::Expr::Literal(ast::Literal::CurrentTimestamp)];
+        let expected = [function_call("now", vec![])];
 
         assert_eq!(columns.len(), expected.len());
 
@@ -12717,36 +13105,72 @@ mod tests {
     }
 
     #[test]
-    fn comment_on_names_the_object_whose_owner_may_run_it() {
-        let target = |sql: &str| match try_extract_comment_on(&crate::parse(sql).unwrap())
-            .unwrap()
-            .target
-        {
-            PgCommentTarget::Owned(object) => object,
-            PgCommentTarget::Role => "role".to_string(),
-            PgCommentTarget::Other => "other".to_string(),
+    fn comment_on_names_its_object_and_its_comment() {
+        let stmt = |sql: &str| try_extract_comment_on(&crate::parse(sql).unwrap()).unwrap();
+        let relation = |kind, schema: Option<&str>, name: &str| PgCommentObject::Relation {
+            kind,
+            schema: schema.map(str::to_string),
+            name: name.to_string(),
         };
-        for (sql, want) in [
-            ("COMMENT ON TABLE s.t IS 'x'", "table t"),
-            ("COMMENT ON COLUMN s.t.a IS 'x'", "relation t"),
-            ("COMMENT ON CONSTRAINT c ON t IS 'x'", "relation t"),
-            ("COMMENT ON VIEW v IS 'x'", "view v"),
+        for (sql, object) in [
+            (
+                "COMMENT ON TABLE s.t IS 'x'",
+                relation(ast::RelationKind::Table, Some("s"), "t"),
+            ),
+            (
+                "COMMENT ON VIEW v IS 'x'",
+                relation(ast::RelationKind::View, None, "v"),
+            ),
             (
                 "COMMENT ON MATERIALIZED VIEW mv IS 'x'",
-                "materialized view mv",
+                relation(ast::RelationKind::MaterializedView, None, "mv"),
             ),
-            ("COMMENT ON INDEX i IS 'x'", "index i"),
-            ("COMMENT ON SEQUENCE s IS 'x'", "sequence s"),
-            ("COMMENT ON SCHEMA sc IS 'x'", "schema sc"),
-            ("COMMENT ON TYPE ty IS 'x'", "type ty"),
-            ("COMMENT ON DOMAIN d IS 'x'", "type d"),
-            ("COMMENT ON FUNCTION f(int) IS 'x'", "function f"),
-            ("COMMENT ON DATABASE db IS 'x'", "database db"),
-            ("COMMENT ON EXTENSION plpgsql IS 'x'", "extension plpgsql"),
-            ("COMMENT ON ROLE r IS 'x'", "role"),
-            ("COMMENT ON LANGUAGE sql IS 'x'", "other"),
+            (
+                "COMMENT ON INDEX i IS 'x'",
+                relation(ast::RelationKind::Index, None, "i"),
+            ),
+            (
+                "COMMENT ON SEQUENCE s IS 'x'",
+                relation(ast::RelationKind::Sequence, None, "s"),
+            ),
+            (
+                "COMMENT ON COLUMN s.t.a IS 'x'",
+                PgCommentObject::Column {
+                    schema: Some("s".to_string()),
+                    table: "t".to_string(),
+                    column: "a".to_string(),
+                },
+            ),
+            (
+                "COMMENT ON SCHEMA sc IS 'x'",
+                PgCommentObject::Schema("sc".to_string()),
+            ),
+            (
+                "COMMENT ON CONSTRAINT c ON t IS 'x'",
+                PgCommentObject::Unsupported("CONSTRAINT"),
+            ),
+            (
+                "COMMENT ON TYPE ty IS 'x'",
+                PgCommentObject::Unsupported("TYPE"),
+            ),
+            (
+                "COMMENT ON FUNCTION f(int) IS 'x'",
+                PgCommentObject::Unsupported("FUNCTION"),
+            ),
+            (
+                "COMMENT ON ROLE r IS 'x'",
+                PgCommentObject::Unsupported("ROLE"),
+            ),
+            (
+                "COMMENT ON LANGUAGE sql IS 'x'",
+                PgCommentObject::Unsupported("this kind of object"),
+            ),
         ] {
-            assert_eq!(target(sql), want, "{sql}");
+            assert_eq!(stmt(sql).object, object, "{sql}");
+            assert_eq!(stmt(sql).comment.as_deref(), Some("x"), "{sql}");
+        }
+        for sql in ["COMMENT ON TABLE t IS NULL", "COMMENT ON TABLE t IS ''"] {
+            assert_eq!(stmt(sql).comment, None, "{sql}");
         }
     }
 
@@ -12943,6 +13367,28 @@ mod tests {
                 translated.cmd
             );
         }
+    }
+
+    #[test]
+    fn drop_role_keeps_how_each_role_is_named() {
+        let parsed = crate::parse("DROP ROLE IF EXISTS r, \"R\", CURRENT_USER, public").unwrap();
+        let translated = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&parsed)
+            .unwrap();
+
+        let ast::Cmd::Stmt(ast::Stmt::DropRole { if_exists, roles }) = &translated.cmd else {
+            panic!("DROP ROLE translated to {:?}", translated.cmd);
+        };
+        assert!(*if_exists);
+        assert_eq!(
+            roles,
+            &vec![
+                ast::Grantee::Role(ast::RoleSpec::Name("r".to_string())),
+                ast::Grantee::Role(ast::RoleSpec::Name("R".to_string())),
+                ast::Grantee::Role(ast::RoleSpec::CurrentRole),
+                ast::Grantee::Public,
+            ]
+        );
     }
 
     #[test]
@@ -13791,14 +14237,21 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_distinct_on() {
+    fn distinct_on_keeps_its_expressions() {
+        let parsed = crate::parse("SELECT DISTINCT ON (a, b + 1) a, b FROM t").unwrap();
+        let stmt = PostgreSQLTranslator::new().translate(&parsed).unwrap();
+        assert_eq!(
+            stmt.to_string(),
+            "SELECT DISTINCT ON (a, b + 1) a, b FROM t"
+        );
+        assert_translates("SELECT DISTINCT ON (a) a FROM t UNION SELECT 1");
         assert_not_supported(
-            "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b",
-            "DISTINCT ON",
+            "SELECT DISTINCT ON (a) a FROM t ORDER BY a COLLATE \"C\"",
+            "COLLATE",
         );
         assert_not_supported(
-            "SELECT DISTINCT ON (a) a FROM t UNION SELECT 1",
-            "DISTINCT ON",
+            "SELECT DISTINCT ON (lower(a COLLATE \"C\")) a FROM t",
+            "COLLATE",
         );
         assert_translates("SELECT DISTINCT a, b FROM t");
     }
@@ -14031,7 +14484,10 @@ mod tests {
     fn fail_closed_current_timestamp_precision() {
         assert_not_supported("SELECT CURRENT_TIMESTAMP(3)", "fractional-second precision");
         assert_not_supported("SELECT LOCALTIME(6)", "fractional-second precision");
-        assert_translates("SELECT CURRENT_TIMESTAMP(0), CURRENT_TIMESTAMP, LOCALTIMESTAMP");
+        // Precision 0 is refused too: PostgreSQL rounds to it and tursopg cannot.
+        assert_not_supported("SELECT CURRENT_TIMESTAMP(0)", "fractional-second precision");
+        assert_not_supported("SELECT LOCALTIMESTAMP(0)", "fractional-second precision");
+        assert_translates("SELECT CURRENT_TIMESTAMP, LOCALTIMESTAMP");
     }
 
     #[test]

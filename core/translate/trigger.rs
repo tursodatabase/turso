@@ -469,8 +469,15 @@ fn check_one_select_refs(
             from,
             where_clause,
             group_by,
+            distinctness,
             ..
         } => {
+            for expr in distinctness
+                .iter()
+                .flat_map(|distinctness| distinctness.exprs())
+            {
+                check_expr(expr)?;
+            }
             for col in columns {
                 if let ast::ResultColumn::Expr(expr, _) = col {
                     check_expr(expr)?;

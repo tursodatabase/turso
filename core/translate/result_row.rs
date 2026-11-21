@@ -16,6 +16,7 @@ use super::{
         expr_type::{type_of, TypeEnv},
         translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
     },
+    expr_context::ExprContext,
     plan::{Distinctness, QueryDestination, ResultSetColumn, SelectPlan, TableReferences},
 };
 
@@ -35,6 +36,27 @@ pub fn emit_select_result(
     reg_result_cols_start: usize,
     limit_ctx: Option<LimitCtx>,
 ) -> Result<()> {
+    let label_after_row = program.allocate_label();
+    if let Distinctness::DistinctOnRowsInOrder { keys, registers } = &plan.distinctness {
+        let registers = registers
+            .as_ref()
+            .expect("DISTINCT ON registers are allocated before the rows are read");
+        let mut key_collations = Vec::with_capacity(keys.len());
+        for (i, key) in keys.iter().enumerate() {
+            translate_expr(
+                program,
+                Some(&plan.table_references),
+                key,
+                registers.reg_key_start + i,
+                resolver,
+            )?;
+            key_collations.push(
+                ExprContext::new(Some(&plan.table_references), resolver).expr_collation(key)?,
+            );
+        }
+        registers.emit_skip_unless_first_row_of_group(program, key_collations, label_after_row);
+    }
+
     let has_distinct = matches!(plan.distinctness, Distinctness::Distinct { .. });
     if !has_distinct {
         if let (Some(jump_to), Some(_)) = (offset_jump_to, label_on_limit_reached) {
@@ -127,7 +149,7 @@ pub fn emit_select_result(
     }
 
     // Handle SELECT DISTINCT deduplication
-    if let Distinctness::Distinct { ctx } = &plan.distinctness {
+    if let Distinctness::Distinct { ctx, .. } = &plan.distinctness {
         let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
         let num_regs = plan.result_columns.len();
         distinct_ctx.emit_deduplication_insns(program, num_regs, start_reg);
@@ -140,6 +162,7 @@ pub fn emit_select_result(
     }
 
     emit_result_row_and_limit(program, plan, start_reg, limit_ctx, label_on_limit_reached)?;
+    program.preassign_label_to_next_insn(label_after_row);
     Ok(())
 }
 

@@ -1645,6 +1645,36 @@ enum HeaderParseOutcome {
     Invalid,
 }
 
+/// The header bytes of a transaction frame in a stack buffer: the
+/// TX_HEADER_SIZE bytes of the base header and, for an extension frame, the
+/// extension header that follows them.
+struct FrameHeaderBytes {
+    buf: [u8; TX_EXT_HEADER_SIZE],
+    len: usize,
+}
+
+impl FrameHeaderBytes {
+    /// The header bytes that were read.
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    /// Whether the frame has an extension header.
+    fn has_extension_header(&self) -> bool {
+        self.len == TX_EXT_HEADER_SIZE
+    }
+}
+
+/// Outcome of reading the header bytes of a transaction frame.
+enum FrameHeaderRead {
+    Header(FrameHeaderBytes),
+    /// The log ends before the end of the header.
+    Eof,
+    /// The frame magic is not FRAME_MAGIC, or EXT_FRAME_MAGIC where an
+    /// extension frame is permitted.
+    BadMagic,
+}
+
 /// Outcome of parsing a payload phase. Corruption is signalled via
 /// `Err(LimboError::Corrupt(..))` and translated to `Invalid` by the caller,
 /// mirroring the previous control flow.
@@ -1883,6 +1913,34 @@ impl StreamingLogicalLogReader {
     ) -> Result<Option<Vec<ParsedOp>>> {
         let io = io.clone();
         io.block(|| self.next_frame())
+    }
+
+    /// Reads the operations of every remaining transaction frame.
+    #[cfg(feature = "test_helper")]
+    pub fn read_ops_for_testing(
+        &mut self,
+        io: &Arc<dyn crate::IO>,
+    ) -> Result<Vec<LogOpForTesting>> {
+        let mut ops = Vec::new();
+        while let Some(frame) = io.block(|| self.next_frame())? {
+            ops.extend(frame.into_iter().map(|op| match op {
+                ParsedOp::DeleteTable {
+                    rowid,
+                    record_bytes,
+                    pk_record_bytes,
+                    ..
+                } => LogOpForTesting::DeleteTable {
+                    rowid,
+                    record_bytes,
+                    pk_record_bytes,
+                },
+                ParsedOp::UpdateHeader { .. } => LogOpForTesting::UpdateHeader,
+                ParsedOp::UpsertTable { .. }
+                | ParsedOp::UpsertIndex { .. }
+                | ParsedOp::DeleteIndex { .. } => LogOpForTesting::Other,
+            }));
+        }
+        Ok(ops)
     }
 
     /// Reads the next complete transaction frame.
@@ -2566,8 +2624,11 @@ impl StreamingLogicalLogReader {
                         )
                         .into());
                     }
-                    let mut payload = payload;
-                    let record_bytes = payload.split_off(rowid_len);
+                    // The payload is a buffer of its own, so the rowid bytes
+                    // are removed in place instead of copying the record into
+                    // a new buffer.
+                    let mut record_bytes = payload;
+                    record_bytes.drain(..rowid_len);
                     let rowid = RowID::new(table_id, RowKey::Int(rowid_i64));
                     ParsedOp::UpsertTable {
                         table_id,
@@ -2592,8 +2653,9 @@ impl StreamingLogicalLogReader {
                         .into());
                     }
                     let rowid_i64 = rowid_u64 as i64;
-                    let mut payload = payload;
-                    let mut record_bytes = payload.split_off(rowid_len);
+                    // See OP_UPSERT_TABLE: the rowid bytes are removed in place.
+                    let mut record_bytes = payload;
+                    record_bytes.drain(..rowid_len);
                     let mut pk_record_bytes = crate::alloc::vec![];
                     if !portable_extension.is_empty() {
                         let decoded = decode_delete_portable_extension(&portable_extension)?;
@@ -2830,36 +2892,18 @@ impl StreamingLogicalLogReader {
         //
         // TX HEADER v3 extension frames append:
         // extension_size(8) | extension_record_count(4) | frame_flags(4)
-        let mut header_bytes = match return_if_io!(self.try_consume_bytes(TX_HEADER_SIZE)) {
-            Some(bytes) => bytes,
-            None => return Ok(IOResult::Done(HeaderParseOutcome::Eof)),
-        };
-
-        let frame_magic = u32::from_le_bytes([
-            header_bytes[0],
-            header_bytes[1],
-            header_bytes[2],
-            header_bytes[3],
-        ]);
+        // A v2 log has no extension frames.
         let is_v2 = self
             .header
             .as_ref()
             .is_some_and(|header| header.version == LOG_VERSION_V2);
-        let has_extension_header = !is_v2 && frame_magic == EXT_FRAME_MAGIC;
-        if frame_magic != FRAME_MAGIC && !has_extension_header {
-            return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
-        }
-        if is_v2 && frame_magic != FRAME_MAGIC {
-            return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
-        }
-        if has_extension_header {
-            let Some(extension_header) =
-                return_if_io!(self.try_consume_bytes(TX_EXT_HEADER_SIZE - TX_HEADER_SIZE))
-            else {
-                return Ok(IOResult::Done(HeaderParseOutcome::Eof));
-            };
-            header_bytes.extend_from_slice(&extension_header);
-        }
+        let header = match return_if_io!(self.try_consume_frame_header(!is_v2)) {
+            FrameHeaderRead::Header(header) => header,
+            FrameHeaderRead::Eof => return Ok(IOResult::Done(HeaderParseOutcome::Eof)),
+            FrameHeaderRead::BadMagic => return Ok(IOResult::Done(HeaderParseOutcome::Invalid)),
+        };
+        let has_extension_header = header.has_extension_header();
+        let header_bytes = header.bytes();
         let payload_size_u64 = u64::from_le_bytes([
             header_bytes[4],
             header_bytes[5],
@@ -2939,7 +2983,7 @@ impl StreamingLogicalLogReader {
         };
 
         // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC).
-        let running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
+        let running_crc = crc32c::crc32c_append(self.running_crc, header_bytes);
 
         Ok(IOResult::Done(HeaderParseOutcome::Ok(FrameHeader {
             payload_size,
@@ -3146,30 +3190,16 @@ impl StreamingLogicalLogReader {
         }
         let frame_start = self.offset.saturating_sub(self.bytes_can_read());
 
-        let mut header_bytes = match return_if_io!(self.try_consume_bytes(TX_HEADER_SIZE)) {
-            Some(bytes) => bytes,
-            None => return Ok(IOResult::Done(ParseResult::Eof)),
+        let header = match return_if_io!(self.try_consume_frame_header(true)) {
+            FrameHeaderRead::Header(header) => header,
+            FrameHeaderRead::Eof => return Ok(IOResult::Done(ParseResult::Eof)),
+            FrameHeaderRead::BadMagic => {
+                self.last_valid_offset = frame_start;
+                return Ok(IOResult::Done(ParseResult::InvalidFrame));
+            }
         };
-
-        let frame_magic = u32::from_le_bytes([
-            header_bytes[0],
-            header_bytes[1],
-            header_bytes[2],
-            header_bytes[3],
-        ]);
-        let has_extension_header = frame_magic == EXT_FRAME_MAGIC;
-        if frame_magic != FRAME_MAGIC && !has_extension_header {
-            self.last_valid_offset = frame_start;
-            return Ok(IOResult::Done(ParseResult::InvalidFrame));
-        }
-        if has_extension_header {
-            let Some(extension_header) =
-                return_if_io!(self.try_consume_bytes(TX_EXT_HEADER_SIZE - TX_HEADER_SIZE))
-            else {
-                return Ok(IOResult::Done(ParseResult::Eof));
-            };
-            header_bytes.extend_from_slice(&extension_header);
-        }
+        let has_extension_header = header.has_extension_header();
+        let header_bytes = header.bytes();
         let payload_size_u64 = u64::from_le_bytes([
             header_bytes[4],
             header_bytes[5],
@@ -3253,7 +3283,7 @@ impl StreamingLogicalLogReader {
             }
         };
 
-        let running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
+        let running_crc = crc32c::crc32c_append(self.running_crc, header_bytes);
         let encrypted_extension_size = if self.encryption_ctx.is_some() {
             extension_size
         } else {
@@ -3486,6 +3516,44 @@ impl StreamingLogicalLogReader {
         let bytes = crate::types::value_blob_from_slice(&buffer[start..end])?;
         self.buffer_offset = end;
         Ok(IOResult::Done(Some(bytes)))
+    }
+
+    /// Reads the header of a transaction frame into a stack buffer, without
+    /// an allocation for each frame: the base header, then, when its magic is
+    /// EXT_FRAME_MAGIC and `allow_extension` is true, the extension header
+    /// that follows. Any other magic than FRAME_MAGIC gives BadMagic. Always
+    /// inlined, so that the buffer is not copied into the result for each
+    /// frame.
+    #[inline(always)]
+    fn try_consume_frame_header(&mut self, allow_extension: bool) -> IOResultOr<FrameHeaderRead> {
+        let Some(base_header) = return_if_io!(self.try_consume_fixed::<TX_HEADER_SIZE>()) else {
+            return Ok(IOResult::Done(FrameHeaderRead::Eof));
+        };
+        let mut header = FrameHeaderBytes {
+            buf: [0u8; TX_EXT_HEADER_SIZE],
+            len: TX_HEADER_SIZE,
+        };
+        header.buf[..TX_HEADER_SIZE].copy_from_slice(&base_header);
+        let frame_magic = u32::from_le_bytes([
+            base_header[0],
+            base_header[1],
+            base_header[2],
+            base_header[3],
+        ]);
+        let has_extension_header = allow_extension && frame_magic == EXT_FRAME_MAGIC;
+        if frame_magic != FRAME_MAGIC && !has_extension_header {
+            return Ok(IOResult::Done(FrameHeaderRead::BadMagic));
+        }
+        if has_extension_header {
+            let Some(extension_header) =
+                return_if_io!(self.try_consume_fixed::<{ TX_EXT_HEADER_SIZE - TX_HEADER_SIZE }>())
+            else {
+                return Ok(IOResult::Done(FrameHeaderRead::Eof));
+            };
+            header.buf[TX_HEADER_SIZE..].copy_from_slice(&extension_header);
+            header.len = TX_EXT_HEADER_SIZE;
+        }
+        Ok(IOResult::Done(FrameHeaderRead::Header(header)))
     }
 
     fn try_consume_fixed<const N: usize>(&mut self) -> IOResultOr<Option<[u8; N]>> {
@@ -3812,6 +3880,23 @@ pub(crate) enum ParsedOp {
         header: DatabaseHeader,
         commit_ts: u64,
     },
+}
+
+/// A logical log operation, as [`StreamingLogicalLogReader::read_ops_for_testing`]
+/// returns it to integration tests.
+#[cfg(feature = "test_helper")]
+#[derive(Debug)]
+pub enum LogOpForTesting {
+    DeleteTable {
+        rowid: RowID,
+        /// The deleted row's record, which a delete may leave out.
+        record_bytes: crate::ValueBlob,
+        /// A record of the deleted row's primary key values.
+        pk_record_bytes: crate::ValueBlob,
+    },
+    UpdateHeader,
+    /// Any operation that is not one of the above.
+    Other,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

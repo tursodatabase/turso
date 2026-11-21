@@ -1,6 +1,7 @@
 use turso_core::io::MemoryIO;
 use turso_core::io::IO;
 use turso_core::security::roles::SessionRole;
+use turso_core::storage::sqlite3_ondisk::PageSize;
 use turso_core::sync::Arc;
 use turso_sqlite::SqliteDialect;
 
@@ -102,6 +103,28 @@ fn rollback_drops_pinned_pages_that_are_not_loaded() {
     assert!(!pager.cache_contains(unloaded_root));
     assert_eq!(query_i64(&conn, "SELECT count(*) FROM unloaded"), 1);
     drop(db);
+}
+
+#[test]
+fn record_pool_frees_buffers_of_rows_larger_than_a_page() {
+    let (_db, conn) = open_memory_database("record-pool-large-rows.db");
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT NOT NULL, tag TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, CAST(zeroblob(6 * 1024 * 1024) AS TEXT), 'big')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, CAST(zeroblob(5000) AS TEXT), 'small')")
+        .unwrap();
+    conn.execute("SELECT body FROM t WHERE id = 1").unwrap();
+    conn.execute("UPDATE t SET tag = 'updated' WHERE id = 1")
+        .unwrap();
+    conn.execute("UPDATE t SET tag = 'updated' WHERE id = 2")
+        .unwrap();
+
+    let capacities = conn.get_pager().record_pool_capacities();
+    assert!(!capacities.is_empty());
+    for capacity in capacities {
+        assert!(capacity <= PageSize::MAX as usize);
+    }
 }
 
 fn open_memory_database(path: &str) -> (Arc<turso_core::Database>, Arc<turso_core::Connection>) {

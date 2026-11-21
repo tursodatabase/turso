@@ -107,6 +107,15 @@ use tracing::{instrument, Level};
 
 const MAX_CHECK_INTERVAL: u64 = 256;
 
+/// Maximum number of trigger and foreign key action programs that execute one
+/// inside the other, the same as SQLite's `SQLITE_MAX_TRIGGER_DEPTH` (1000).
+/// The compilation and the execution of these programs recurse one time for
+/// each level, so this limit bounds their stack use.
+pub(crate) const MAX_TRIGGER_DEPTH: usize = 1000;
+
+/// The error when a statement goes past [MAX_TRIGGER_DEPTH], the same as in SQLite.
+pub(crate) const TRIGGER_DEPTH_ERROR: &str = "too many levels of trigger recursion";
+
 pub(crate) type MvccCommitStateMachine = CommitStateMachine<MvccClock, DynAllocator>;
 
 /// State machine for applying pending view deltas with I/O handling.
@@ -1145,6 +1154,8 @@ pub struct ProgramState {
     /// The time "now" means for the date and time functions during the
     /// current step. See `StatementClock`.
     pub(crate) current_time: Option<crate::WallClockInstant>,
+    /// See `ScalarFuncContext::statement_times`.
+    pub(crate) statement_times: Option<crate::dialect::StatementTimes>,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     active_op_state: ActiveOpStateSlot,
@@ -1195,6 +1206,9 @@ pub struct ProgramState {
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
     /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
     pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
+    /// Number of trigger and foreign key action programs that execute this
+    /// program, one inside the other. It is 0 for the program of a statement.
+    pub(crate) subprogram_depth: usize,
     /// RowSet objects stored by register index
     rowsets: HashMap<usize, RowSet>,
     // Cache of unused allocated Vecs
@@ -1310,6 +1324,7 @@ impl ProgramState {
             sequence_inner_tx_pending: None,
             sequence_inner_retry_count: 0,
             current_time: None,
+            statement_times: None,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
             active_op_state: ActiveOpStateSlot::default(),
@@ -1344,6 +1359,7 @@ impl ProgramState {
             halt_in_progress: false,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
+            subprogram_depth: 0,
             mv_store_cache: None,
             pending_fresh_tx: None,
         }
@@ -1480,6 +1496,7 @@ impl ProgramState {
         self.query_deadline = None;
         self.explicit_checkpoint_guard = None;
         self.current_time = None;
+        self.statement_times = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
 
@@ -3851,7 +3868,11 @@ impl Program {
                 // Schema updated errors do not cause a rollback; the statement will be reprepared and retried,
                 // and the caller is expected to handle transaction cleanup explicitly if needed.
                 Some(LimboError::SchemaUpdated) => {}
-                Some(LimboError::WriteWriteConflict | LimboError::SchemaConflict) => {
+                Some(
+                    LimboError::WriteWriteConflict
+                    | LimboError::SchemaConflict
+                    | LimboError::CommitDependencyAborted,
+                ) => {
                     // These MVCC errors mean the current transaction cannot
                     // commit. Roll it back even if this statement opened a
                     // statement savepoint, as DDL does.

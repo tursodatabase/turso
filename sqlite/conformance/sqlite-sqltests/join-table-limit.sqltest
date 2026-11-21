@@ -1,0 +1,225 @@
+@database :memory:
+
+# SQLite joins up to 64 tables in one FROM clause and rejects 65 or more with
+# "at most 64 tables in a join" (join.test join-12.2 to join-12.8).
+
+setup t14 {
+    CREATE TABLE t14(x);
+    INSERT INTO t14 VALUES('abcdefghij');
+}
+
+setup chain {
+    CREATE TABLE c0(id INTEGER PRIMARY KEY);
+    CREATE TABLE c1(id INTEGER PRIMARY KEY);
+    CREATE TABLE c2(id INTEGER PRIMARY KEY);
+    CREATE TABLE c3(id INTEGER PRIMARY KEY);
+    CREATE TABLE c4(id INTEGER PRIMARY KEY);
+    CREATE TABLE c5(id INTEGER PRIMARY KEY);
+    CREATE TABLE c6(id INTEGER PRIMARY KEY);
+    CREATE TABLE c7(id INTEGER PRIMARY KEY);
+    CREATE TABLE c8(id INTEGER PRIMARY KEY);
+    CREATE TABLE c9(id INTEGER PRIMARY KEY);
+    CREATE TABLE c10(id INTEGER PRIMARY KEY);
+    CREATE TABLE c11(id INTEGER PRIMARY KEY);
+    CREATE TABLE c12(id INTEGER PRIMARY KEY);
+    CREATE TABLE c13(id INTEGER PRIMARY KEY);
+    CREATE TABLE c14(id INTEGER PRIMARY KEY);
+    CREATE TABLE c15(id INTEGER PRIMARY KEY);
+    CREATE TABLE c16(id INTEGER PRIMARY KEY);
+    CREATE TABLE c17(id INTEGER PRIMARY KEY);
+    CREATE TABLE c18(id INTEGER PRIMARY KEY);
+    CREATE TABLE c19(id INTEGER PRIMARY KEY);
+    CREATE TABLE c20(id INTEGER PRIMARY KEY);
+    CREATE TABLE c21(id INTEGER PRIMARY KEY);
+    CREATE TABLE c22(id INTEGER PRIMARY KEY);
+    CREATE TABLE c23(id INTEGER PRIMARY KEY);
+    CREATE TABLE c24(id INTEGER PRIMARY KEY);
+    CREATE TABLE c25(id INTEGER PRIMARY KEY);
+    CREATE TABLE c26(id INTEGER PRIMARY KEY);
+    CREATE TABLE c27(id INTEGER PRIMARY KEY);
+    CREATE TABLE c28(id INTEGER PRIMARY KEY);
+    CREATE TABLE c29(id INTEGER PRIMARY KEY);
+    CREATE TABLE c30(id INTEGER PRIMARY KEY);
+    CREATE TABLE c31(id INTEGER PRIMARY KEY);
+    CREATE TABLE c32(id INTEGER PRIMARY KEY);
+    CREATE TABLE c33(id INTEGER PRIMARY KEY);
+    CREATE TABLE c34(id INTEGER PRIMARY KEY);
+    CREATE TABLE c35(id INTEGER PRIMARY KEY);
+    CREATE TABLE c36(id INTEGER PRIMARY KEY);
+    CREATE TABLE c37(id INTEGER PRIMARY KEY);
+    CREATE TABLE c38(id INTEGER PRIMARY KEY);
+    CREATE TABLE c39(id INTEGER PRIMARY KEY);
+    CREATE TABLE c40(id INTEGER PRIMARY KEY);
+    CREATE TABLE c41(id INTEGER PRIMARY KEY);
+    CREATE TABLE c42(id INTEGER PRIMARY KEY);
+    CREATE TABLE c43(id INTEGER PRIMARY KEY);
+    CREATE TABLE c44(id INTEGER PRIMARY KEY);
+    CREATE TABLE c45(id INTEGER PRIMARY KEY);
+    CREATE TABLE c46(id INTEGER PRIMARY KEY);
+    CREATE TABLE c47(id INTEGER PRIMARY KEY);
+    CREATE TABLE c48(id INTEGER PRIMARY KEY);
+    CREATE TABLE c49(id INTEGER PRIMARY KEY);
+    CREATE TABLE c50(id INTEGER PRIMARY KEY);
+    CREATE TABLE c51(id INTEGER PRIMARY KEY);
+    CREATE TABLE c52(id INTEGER PRIMARY KEY);
+    CREATE TABLE c53(id INTEGER PRIMARY KEY);
+    CREATE TABLE c54(id INTEGER PRIMARY KEY);
+    CREATE TABLE c55(id INTEGER PRIMARY KEY);
+    CREATE TABLE c56(id INTEGER PRIMARY KEY);
+    CREATE TABLE c57(id INTEGER PRIMARY KEY);
+    CREATE TABLE c58(id INTEGER PRIMARY KEY);
+    CREATE TABLE c59(id INTEGER PRIMARY KEY);
+    CREATE TABLE c60(id INTEGER PRIMARY KEY);
+    CREATE TABLE c61(id INTEGER PRIMARY KEY);
+    CREATE TABLE c62(id INTEGER PRIMARY KEY);
+    CREATE TABLE c63(id INTEGER PRIMARY KEY);
+    CREATE TABLE c64(id INTEGER PRIMARY KEY);
+    INSERT INTO c0 VALUES (1), (2);
+    INSERT INTO c1 VALUES (1), (2);
+    INSERT INTO c2 VALUES (1), (2);
+    INSERT INTO c3 VALUES (1), (2);
+    INSERT INTO c4 VALUES (1), (2);
+    INSERT INTO c5 VALUES (1), (2);
+    INSERT INTO c6 VALUES (1), (2);
+    INSERT INTO c7 VALUES (1), (2);
+    INSERT INTO c8 VALUES (1), (2);
+    INSERT INTO c9 VALUES (1), (2);
+    INSERT INTO c10 VALUES (1), (2);
+    INSERT INTO c11 VALUES (1), (2);
+    INSERT INTO c12 VALUES (1), (2);
+    INSERT INTO c13 VALUES (1), (2);
+    INSERT INTO c14 VALUES (1), (2);
+    INSERT INTO c15 VALUES (1), (2);
+    INSERT INTO c16 VALUES (1), (2);
+    INSERT INTO c17 VALUES (1), (2);
+    INSERT INTO c18 VALUES (1), (2);
+    INSERT INTO c19 VALUES (1), (2);
+    INSERT INTO c20 VALUES (1), (2);
+    INSERT INTO c21 VALUES (1), (2);
+    INSERT INTO c22 VALUES (1), (2);
+    INSERT INTO c23 VALUES (1), (2);
+    INSERT INTO c24 VALUES (1), (2);
+    INSERT INTO c25 VALUES (1), (2);
+    INSERT INTO c26 VALUES (1), (2);
+    INSERT INTO c27 VALUES (1), (2);
+    INSERT INTO c28 VALUES (1), (2);
+    INSERT INTO c29 VALUES (1), (2);
+    INSERT INTO c30 VALUES (1), (2);
+    INSERT INTO c31 VALUES (1), (2);
+    INSERT INTO c32 VALUES (1), (2);
+    INSERT INTO c33 VALUES (1), (2);
+    INSERT INTO c34 VALUES (1), (2);
+    INSERT INTO c35 VALUES (1), (2);
+    INSERT INTO c36 VALUES (1), (2);
+    INSERT INTO c37 VALUES (1), (2);
+    INSERT INTO c38 VALUES (1), (2);
+    INSERT INTO c39 VALUES (1), (2);
+    INSERT INTO c40 VALUES (1), (2);
+    INSERT INTO c41 VALUES (1), (2);
+    INSERT INTO c42 VALUES (1), (2);
+    INSERT INTO c43 VALUES (1), (2);
+    INSERT INTO c44 VALUES (1), (2);
+    INSERT INTO c45 VALUES (1), (2);
+    INSERT INTO c46 VALUES (1), (2);
+    INSERT INTO c47 VALUES (1), (2);
+    INSERT INTO c48 VALUES (1), (2);
+    INSERT INTO c49 VALUES (1), (2);
+    INSERT INTO c50 VALUES (1), (2);
+    INSERT INTO c51 VALUES (1), (2);
+    INSERT INTO c52 VALUES (1), (2);
+    INSERT INTO c53 VALUES (1), (2);
+    INSERT INTO c54 VALUES (1), (2);
+    INSERT INTO c55 VALUES (1), (2);
+    INSERT INTO c56 VALUES (1), (2);
+    INSERT INTO c57 VALUES (1), (2);
+    INSERT INTO c58 VALUES (1), (2);
+    INSERT INTO c59 VALUES (1), (2);
+    INSERT INTO c60 VALUES (1), (2);
+    INSERT INTO c61 VALUES (1), (2);
+    INSERT INTO c62 VALUES (1), (2);
+    INSERT INTO c63 VALUES (1), (2);
+    INSERT INTO c64 VALUES (1), (2);
+}
+
+@setup t14
+test self-join-63-tables {
+    SELECT 1 FROM t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14;
+}
+expect {
+    1
+}
+
+@setup t14
+test self-join-64-tables {
+    SELECT 1 FROM t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14;
+}
+expect {
+    1
+}
+
+@setup t14
+test self-join-65-tables-rejected {
+    SELECT 1 FROM t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14;
+}
+expect error {
+    at most 64 tables in a join
+}
+
+@setup t14
+test self-join-128-tables-rejected {
+    SELECT 1 FROM t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14;
+}
+expect error {
+    at most 64 tables in a join
+}
+
+@setup chain
+test chain-join-64-tables {
+    SELECT count(*) FROM c0 JOIN c1 ON c1.id = c0.id JOIN c2 ON c2.id = c1.id JOIN c3 ON c3.id = c2.id JOIN c4 ON c4.id = c3.id JOIN c5 ON c5.id = c4.id JOIN c6 ON c6.id = c5.id JOIN c7 ON c7.id = c6.id JOIN c8 ON c8.id = c7.id JOIN c9 ON c9.id = c8.id JOIN c10 ON c10.id = c9.id JOIN c11 ON c11.id = c10.id JOIN c12 ON c12.id = c11.id JOIN c13 ON c13.id = c12.id JOIN c14 ON c14.id = c13.id JOIN c15 ON c15.id = c14.id JOIN c16 ON c16.id = c15.id JOIN c17 ON c17.id = c16.id JOIN c18 ON c18.id = c17.id JOIN c19 ON c19.id = c18.id JOIN c20 ON c20.id = c19.id JOIN c21 ON c21.id = c20.id JOIN c22 ON c22.id = c21.id JOIN c23 ON c23.id = c22.id JOIN c24 ON c24.id = c23.id JOIN c25 ON c25.id = c24.id JOIN c26 ON c26.id = c25.id JOIN c27 ON c27.id = c26.id JOIN c28 ON c28.id = c27.id JOIN c29 ON c29.id = c28.id JOIN c30 ON c30.id = c29.id JOIN c31 ON c31.id = c30.id JOIN c32 ON c32.id = c31.id JOIN c33 ON c33.id = c32.id JOIN c34 ON c34.id = c33.id JOIN c35 ON c35.id = c34.id JOIN c36 ON c36.id = c35.id JOIN c37 ON c37.id = c36.id JOIN c38 ON c38.id = c37.id JOIN c39 ON c39.id = c38.id JOIN c40 ON c40.id = c39.id JOIN c41 ON c41.id = c40.id JOIN c42 ON c42.id = c41.id JOIN c43 ON c43.id = c42.id JOIN c44 ON c44.id = c43.id JOIN c45 ON c45.id = c44.id JOIN c46 ON c46.id = c45.id JOIN c47 ON c47.id = c46.id JOIN c48 ON c48.id = c47.id JOIN c49 ON c49.id = c48.id JOIN c50 ON c50.id = c49.id JOIN c51 ON c51.id = c50.id JOIN c52 ON c52.id = c51.id JOIN c53 ON c53.id = c52.id JOIN c54 ON c54.id = c53.id JOIN c55 ON c55.id = c54.id JOIN c56 ON c56.id = c55.id JOIN c57 ON c57.id = c56.id JOIN c58 ON c58.id = c57.id JOIN c59 ON c59.id = c58.id JOIN c60 ON c60.id = c59.id JOIN c61 ON c61.id = c60.id JOIN c62 ON c62.id = c61.id JOIN c63 ON c63.id = c62.id;
+}
+expect {
+    2
+}
+
+@setup chain
+test chain-join-65-tables-rejected {
+    SELECT count(*) FROM c0 JOIN c1 ON c1.id = c0.id JOIN c2 ON c2.id = c1.id JOIN c3 ON c3.id = c2.id JOIN c4 ON c4.id = c3.id JOIN c5 ON c5.id = c4.id JOIN c6 ON c6.id = c5.id JOIN c7 ON c7.id = c6.id JOIN c8 ON c8.id = c7.id JOIN c9 ON c9.id = c8.id JOIN c10 ON c10.id = c9.id JOIN c11 ON c11.id = c10.id JOIN c12 ON c12.id = c11.id JOIN c13 ON c13.id = c12.id JOIN c14 ON c14.id = c13.id JOIN c15 ON c15.id = c14.id JOIN c16 ON c16.id = c15.id JOIN c17 ON c17.id = c16.id JOIN c18 ON c18.id = c17.id JOIN c19 ON c19.id = c18.id JOIN c20 ON c20.id = c19.id JOIN c21 ON c21.id = c20.id JOIN c22 ON c22.id = c21.id JOIN c23 ON c23.id = c22.id JOIN c24 ON c24.id = c23.id JOIN c25 ON c25.id = c24.id JOIN c26 ON c26.id = c25.id JOIN c27 ON c27.id = c26.id JOIN c28 ON c28.id = c27.id JOIN c29 ON c29.id = c28.id JOIN c30 ON c30.id = c29.id JOIN c31 ON c31.id = c30.id JOIN c32 ON c32.id = c31.id JOIN c33 ON c33.id = c32.id JOIN c34 ON c34.id = c33.id JOIN c35 ON c35.id = c34.id JOIN c36 ON c36.id = c35.id JOIN c37 ON c37.id = c36.id JOIN c38 ON c38.id = c37.id JOIN c39 ON c39.id = c38.id JOIN c40 ON c40.id = c39.id JOIN c41 ON c41.id = c40.id JOIN c42 ON c42.id = c41.id JOIN c43 ON c43.id = c42.id JOIN c44 ON c44.id = c43.id JOIN c45 ON c45.id = c44.id JOIN c46 ON c46.id = c45.id JOIN c47 ON c47.id = c46.id JOIN c48 ON c48.id = c47.id JOIN c49 ON c49.id = c48.id JOIN c50 ON c50.id = c49.id JOIN c51 ON c51.id = c50.id JOIN c52 ON c52.id = c51.id JOIN c53 ON c53.id = c52.id JOIN c54 ON c54.id = c53.id JOIN c55 ON c55.id = c54.id JOIN c56 ON c56.id = c55.id JOIN c57 ON c57.id = c56.id JOIN c58 ON c58.id = c57.id JOIN c59 ON c59.id = c58.id JOIN c60 ON c60.id = c59.id JOIN c61 ON c61.id = c60.id JOIN c62 ON c62.id = c61.id JOIN c63 ON c63.id = c62.id JOIN c64 ON c64.id = c63.id;
+}
+expect error {
+    at most 64 tables in a join
+}
+
+# A correlated subquery can run as a join with the outer tables. Its tables do
+# not count toward the limit, so a 64-table join with such a subquery runs.
+
+@setup t14
+test self-join-64-tables-correlated-exists {
+    SELECT 1 FROM t14 AS q, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14 WHERE EXISTS (SELECT 1 FROM t14 AS w WHERE w.x = q.x);
+}
+expect {
+    1
+}
+
+@setup t14
+test self-join-64-tables-correlated-not-exists {
+    SELECT 1 FROM t14 AS q, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14 WHERE NOT EXISTS (SELECT 1 FROM t14 AS w WHERE w.x <> q.x);
+}
+expect {
+    1
+}
+
+@setup t14
+test self-join-64-tables-correlated-in {
+    SELECT 1 FROM t14 AS q, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14 WHERE q.x IN (SELECT w.x FROM t14 AS w WHERE w.x = q.x);
+}
+expect {
+    1
+}
+
+@setup t14
+test self-join-64-tables-correlated-scalar-aggregate {
+    SELECT 1 FROM t14 AS q, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14, t14 WHERE (SELECT count(*) FROM t14 AS w WHERE w.x = q.x) = 1;
+}
+expect {
+    1
+}

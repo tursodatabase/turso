@@ -5,7 +5,7 @@ use crate::sync::{Mutex, RwLock};
 use crate::turso_assert;
 use crate::Result;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{btree_map::Entry, BTreeMap, HashMap},
     sync::Arc,
 };
 use tracing::debug;
@@ -94,6 +94,10 @@ impl IO for MemoryIO {
     fn supports_shared_wal_coordination(&self) -> bool {
         false
     }
+
+    fn is_memory(&self) -> bool {
+        true
+    }
 }
 
 /// In-memory page-backed storage shared by the synchronous [`MemoryIO`] and
@@ -143,13 +147,6 @@ impl MemStore {
         }
     }
 
-    fn get_or_allocate_page(inner: &mut MemStoreInner, page_no: usize) -> &mut MemPage {
-        inner
-            .pages
-            .entry(page_no)
-            .or_insert_with(|| Box::new([0; PAGE_SIZE]))
-    }
-
     fn write_at_inner(inner: &mut MemStoreInner, pos: u64, data: &[u8]) -> usize {
         let buf_len = data.len();
         if buf_len == 0 {
@@ -162,9 +159,22 @@ impl MemStore {
             let page_no = offset / PAGE_SIZE;
             let page_offset = offset % PAGE_SIZE;
             let bytes_to_write = remaining.min(PAGE_SIZE - page_offset);
-            let page = Self::get_or_allocate_page(inner, page_no);
-            page[page_offset..page_offset + bytes_to_write]
-                .copy_from_slice(&data[buf_offset..buf_offset + bytes_to_write]);
+            let src = &data[buf_offset..buf_offset + bytes_to_write];
+            match inner.pages.entry(page_no) {
+                // The write gives all the bytes of this new page, so the page
+                // is made from them instead of a page of zeros that the copy
+                // then overwrites.
+                Entry::Vacant(slot) if bytes_to_write == PAGE_SIZE => {
+                    let page: MemPage = Box::<[u8]>::from(src)
+                        .try_into()
+                        .expect("a full-page write has PAGE_SIZE bytes");
+                    slot.insert(page);
+                }
+                entry => {
+                    let page = entry.or_insert_with(|| Box::new([0; PAGE_SIZE]));
+                    page[page_offset..page_offset + bytes_to_write].copy_from_slice(src);
+                }
+            }
             offset += bytes_to_write;
             buf_offset += bytes_to_write;
             remaining -= bytes_to_write;
@@ -344,6 +354,40 @@ impl File for MemoryFile {
 mod tests {
     use super::*;
     use std::{sync::mpsc, time::Duration};
+
+    /// A write that covers a whole new page makes the page from its bytes,
+    /// and the other writes copy into a page of zeros. Both must give the
+    /// bytes of a flat file, with zeros in the holes.
+    #[test]
+    fn writes_read_back_like_a_flat_file() {
+        let store = MemStore::new();
+        let mut model: Vec<u8> = Vec::new();
+        // (position, length, first byte)
+        let writes = [
+            (0, PAGE_SIZE, 1u8),
+            (PAGE_SIZE * 3 + 100, PAGE_SIZE * 2, 2),
+            (10, 20, 3),
+            (PAGE_SIZE * 6, PAGE_SIZE * 2, 4),
+            (PAGE_SIZE, PAGE_SIZE, 5),
+            (PAGE_SIZE * 6, PAGE_SIZE, 6),
+        ];
+        for (pos, len, first) in writes {
+            let data: Vec<u8> = (0..len).map(|i| first.wrapping_add(i as u8)).collect();
+            assert_eq!(store.write_at(pos as u64, &data), len);
+            if model.len() < pos + len {
+                model.resize(pos + len, 0);
+            }
+            model[pos..pos + len].copy_from_slice(&data);
+        }
+
+        assert_eq!(store.size(), model.len() as u64);
+        let buffer = Buffer::new_temporary(model.len());
+        assert_eq!(store.read_into(0, &buffer) as usize, model.len());
+        assert!(buffer.as_slice() == &model[..]);
+        // No write touched the third page.
+        assert!(store.has_hole(PAGE_SIZE * 2, PAGE_SIZE));
+        assert!(!store.has_hole(PAGE_SIZE, PAGE_SIZE));
+    }
 
     #[test]
     fn vectored_write_is_not_observed_partially() {

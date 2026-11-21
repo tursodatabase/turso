@@ -7,10 +7,10 @@ use crate::ast::{
     JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, LikeOperator, Limit, Literal,
     Materialized, Name, NamedColumnConstraint, NamedTableConstraint, NullsOrder, OneSelect,
     Operator, Over, PragmaBody, PragmaValue, QualifiedName, RefAct, RefArg, ResolveType,
-    ResultColumn, Select, SelectBody, SelectTable, Set, SortOrder, SortedColumn, Stmt,
-    TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent, TriggerTime, Type,
-    TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert, UpsertDo,
-    UpsertIndex, Variable, Window, WindowDef, With, MAX_ARRAY_DIMENSIONS,
+    ResultColumn, Select, SelectBody, SelectDistinctness, SelectTable, Set, SortOrder,
+    SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent,
+    TriggerTime, Type, TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert,
+    UpsertDo, UpsertIndex, Variable, Window, WindowDef, With, MAX_ARRAY_DIMENSIONS,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
@@ -108,6 +108,28 @@ fn expression_tree_too_large_error() -> Error {
     ))
 }
 
+/// The message of the error for a compound SELECT with more terms than
+/// [`MAX_COMPOUND_SELECT`].
+pub const TOO_MANY_COMPOUND_TERMS_MESSAGE: &str = "too many terms in compound SELECT";
+
+#[cold]
+#[inline(never)]
+fn too_many_compound_terms_error() -> Error {
+    Error::ParseError(TOO_MANY_COMPOUND_TERMS_MESSAGE.to_owned())
+}
+
+/// The message of the error for a query nested deeper than [`MAX_QUERY_DEPTH`].
+/// The planner gives the same error for nesting that the SQL text does not show.
+pub fn query_nested_too_deeply_message() -> String {
+    format!("Query is nested too deeply (maximum depth {MAX_QUERY_DEPTH})")
+}
+
+#[cold]
+#[inline(never)]
+fn query_nested_too_deeply_error() -> Error {
+    Error::ParseError(query_nested_too_deeply_message())
+}
+
 #[inline(always)]
 fn from_bytes_as_str(bytes: &[u8]) -> &str {
     unsafe { str::from_utf8_unchecked(bytes) }
@@ -195,6 +217,9 @@ pub struct Parser<'a> {
     type_nesting_depth: u32,
     /// Current expression recursion depth of the parser, bounded by [`MAX_EXPR_DEPTH`]
     expr_nesting_depth: u32,
+    /// Number of queries and parenthesized FROM terms that enclose the current
+    /// position, without the query of the statement, bounded by [`MAX_QUERY_DEPTH`]
+    query_nesting_depth: u32,
     /// Height of the most recently parsed expression (`1 + max(child heights)`,
     /// like SQLite's `Expr.nHeight`), bounded by [`MAX_EXPR_DEPTH`]
     last_expr_height: usize,
@@ -209,6 +234,17 @@ pub struct Parser<'a> {
 /// translator/optimizer uses larger stack frames per nesting level, so a
 /// 1000-deep tree still overflows a default 8 MiB thread stack in debug builds.
 pub const MAX_EXPR_DEPTH: usize = 100;
+
+/// Maximum number of terms in a compound SELECT, the same as SQLite's
+/// `SQLITE_MAX_COMPOUND_SELECT` (default 500). The code generator recurses one
+/// time for each term, so this limit bounds its stack use.
+pub const MAX_COMPOUND_SELECT: usize = 500;
+
+/// Maximum nesting depth of queries: subqueries in a FROM clause or in an
+/// expression, CTE bodies, and parenthesized FROM terms. SQLite has no such
+/// limit. The parser, the planner and the code generator recurse one time for
+/// each level, so this limit bounds their stack use.
+pub const MAX_QUERY_DEPTH: usize = 500;
 
 impl<'a> Iterator for Parser<'a> {
     type Item = Result<Cmd>;
@@ -234,6 +270,7 @@ impl<'a> Parser<'a> {
             named_variables: HashMap::new(),
             type_nesting_depth: 0,
             expr_nesting_depth: 0,
+            query_nesting_depth: 0,
             last_expr_height: 0,
             domain_default_ends_at_not_null: false,
         }
@@ -1861,7 +1898,7 @@ impl<'a> Parser<'a> {
     /// a whole SELECT at every level.
     #[inline(never)]
     fn parse_subquery_expr(&mut self) -> Result<Box<Expr>> {
-        let select = self.parse_select()?;
+        let select = self.parse_nested(Self::parse_select)?;
         eat_expect!(self, TK_RP);
         // Subquery is compiled separately: a leaf for height.
         self.last_expr_height = 1;
@@ -1887,7 +1924,7 @@ impl<'a> Parser<'a> {
     fn parse_exists_expr(&mut self) -> Result<Box<Expr>> {
         eat_assert!(self, TK_EXISTS);
         eat_expect!(self, TK_LP);
-        let select = self.parse_select()?;
+        let select = self.parse_nested(Self::parse_select)?;
         eat_expect!(self, TK_RP);
         // Subquery is compiled separately: a leaf for height.
         self.last_expr_height = 1;
@@ -2435,7 +2472,7 @@ impl<'a> Parser<'a> {
                 let tok = self.peek_no_eof()?;
                 match tok.token_type {
                     TK_SELECT | TK_WITH | TK_VALUES => {
-                        let select = self.parse_select()?;
+                        let select = self.parse_nested(Self::parse_select)?;
                         eat_expect!(self, TK_RP);
                         // The subquery is compiled separately, so it
                         // counts as a leaf for this expression's height.
@@ -2697,7 +2734,7 @@ impl<'a> Parser<'a> {
             _ => Materialized::Any,
         };
         eat_expect!(self, TK_LP);
-        let select = self.parse_select()?;
+        let select = self.parse_nested(Self::parse_select)?;
         eat_expect!(self, TK_RP);
         Ok(CommonTableExpr {
             tbl_name: nm,
@@ -3034,7 +3071,7 @@ impl<'a> Parser<'a> {
                     eat_assert!(self, TK_LP);
                     match self.peek_no_eof()?.token_type {
                         TK_SELECT | TK_WITH | TK_VALUES => {
-                            let select = self.parse_select()?;
+                            let select = self.parse_nested(Self::parse_select)?;
                             eat_expect!(self, TK_RP);
                             let alias = self.parse_as()?;
                             let on_using = self.parse_on_using()?;
@@ -3049,7 +3086,7 @@ impl<'a> Parser<'a> {
                             });
                         }
                         _ => {
-                            let fr = self.parse_from_clause()?;
+                            let fr = self.parse_nested(Self::parse_from_clause)?;
                             eat_expect!(self, TK_RP);
                             let alias = self.parse_as()?;
                             let on_using = self.parse_on_using()?;
@@ -3126,7 +3163,7 @@ impl<'a> Parser<'a> {
                 eat_assert!(self, TK_LP);
                 match self.peek_no_eof()?.token_type {
                     TK_SELECT | TK_WITH | TK_VALUES => {
-                        let select = self.parse_select()?;
+                        let select = self.parse_nested(Self::parse_select)?;
                         eat_expect!(self, TK_RP);
                         let alias = self.parse_as()?;
                         Ok(FromClause {
@@ -3139,7 +3176,7 @@ impl<'a> Parser<'a> {
                         })
                     }
                     _ => {
-                        let fr = self.parse_from_clause()?;
+                        let fr = self.parse_nested(Self::parse_from_clause)?;
                         eat_expect!(self, TK_RP);
                         let alias = self.parse_as()?;
                         Ok(FromClause {
@@ -3161,11 +3198,23 @@ impl<'a> Parser<'a> {
             eat_assert!(self, TK_LP);
             open_parentheses += 1;
         }
-        let select = self.parse_select()?;
+        let select = self.parse_nested(Self::parse_select)?;
         for _ in 0..open_parentheses {
             eat_expect!(self, TK_RP);
         }
         Ok(select)
+    }
+
+    /// Parses a query or a parenthesized FROM term that is nested in another
+    /// one, bounding the nesting depth by [`MAX_QUERY_DEPTH`].
+    fn parse_nested<T>(&mut self, parse: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        if self.query_nesting_depth as usize >= MAX_QUERY_DEPTH {
+            return Err(query_nested_too_deeply_error());
+        }
+        self.query_nesting_depth += 1;
+        let result = parse(self);
+        self.query_nesting_depth -= 1;
+        result
     }
 
     fn parse_from_clause_opt(&mut self) -> Result<Option<FromClause>> {
@@ -3268,7 +3317,7 @@ impl<'a> Parser<'a> {
         let tok = eat_expect!(self, TK_SELECT, TK_VALUES);
         match tok.token_type {
             TK_SELECT => {
-                let distinct = self.parse_distinct()?;
+                let distinct = self.parse_select_distinct()?;
                 let collist = self.parse_select_columns()?;
                 let from = self.parse_from_clause_opt()?;
                 let where_clause = self.parse_where()?;
@@ -3312,6 +3361,23 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_select_distinct(&mut self) -> Result<Option<SelectDistinctness>> {
+        match self.parse_distinct()? {
+            None => Ok(None),
+            Some(Distinctness::All) => Ok(Some(SelectDistinctness::All)),
+            Some(Distinctness::Distinct) => {
+                if !matches!(self.peek()?, Some(tok) if tok.token_type == TK_ON) {
+                    return Ok(Some(SelectDistinctness::Distinct));
+                }
+                eat_assert!(self, TK_ON);
+                eat_expect!(self, TK_LP);
+                let exprs = self.parse_nexpr_list()?;
+                eat_expect!(self, TK_RP);
+                Ok(Some(SelectDistinctness::DistinctOn(exprs)))
+            }
+        }
+    }
+
     fn parse_select_body(&mut self) -> Result<SelectBody> {
         let select = self.parse_one_select()?;
         let mut compounds = vec![];
@@ -3337,6 +3403,12 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
 
+            // The first term and the terms in `compounds`, plus the one to parse.
+            // SQLite does not count a compound whose last term is VALUES. Turso
+            // counts it, because the code generator recurses for its terms too.
+            if compounds.len() + 2 > MAX_COMPOUND_SELECT {
+                return Err(too_many_compound_terms_error());
+            }
             compounds.push(CompoundSelect {
                 operator: op,
                 select: self.parse_one_select()?,
@@ -5671,6 +5743,52 @@ mod tests {
         ] {
             let cmd = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();
             assert_eq!(cmd.to_string(), format!("{sql};"));
+        }
+    }
+
+    #[test]
+    fn test_distinct_on() {
+        for sql in [
+            "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC",
+            "SELECT DISTINCT ON (a, b + 1) * FROM t",
+            "SELECT DISTINCT ON (1) a FROM t UNION ALL SELECT DISTINCT ON (c COLLATE NOCASE) c FROM u",
+            "CREATE VIEW v AS SELECT DISTINCT ON (t.a) t.a, t.b FROM t ORDER BY t.a",
+        ] {
+            let cmd = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();
+            assert_eq!(cmd.to_string(), format!("{sql};"));
+        }
+    }
+
+    #[test]
+    fn test_distinct_on_keeps_its_expressions() {
+        let cmd = Parser::new(b"SELECT DISTINCT ON (a, b) c FROM t")
+            .next_cmd()
+            .unwrap()
+            .unwrap();
+        let Cmd::Stmt(Stmt::Select(select)) = cmd else {
+            panic!("expected a SELECT");
+        };
+        let OneSelect::Select { distinctness, .. } = select.body.select else {
+            panic!("expected a SELECT core");
+        };
+        let Some(SelectDistinctness::DistinctOn(exprs)) = distinctness else {
+            panic!("expected DISTINCT ON, got {distinctness:?}");
+        };
+        assert_eq!(exprs.len(), 2);
+    }
+
+    #[test]
+    fn test_distinct_on_needs_a_parenthesized_expression_list() {
+        for sql in [
+            "SELECT DISTINCT ON a a FROM t",
+            "SELECT DISTINCT ON () a FROM t",
+            "SELECT ALL ON (a) a FROM t",
+            "SELECT count(DISTINCT ON (a) a) FROM t",
+        ] {
+            assert!(
+                Parser::new(sql.as_bytes()).next_cmd().is_err(),
+                "parsed: {sql}"
+            );
         }
     }
 

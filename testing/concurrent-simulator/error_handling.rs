@@ -57,6 +57,7 @@ pub fn classify_op_error(err: &LimboError, in_tx: bool) -> ErrorAction {
         | LimboError::CommitDependencyAborted
         | LimboError::InvalidArgument(..)
         | LimboError::ParseError(..)
+        | LimboError::DependentObjects(..)
         | LimboError::TxError(..)
         | LimboError::TransactionAlreadyActive
         | LimboError::NoActiveTransaction { .. }
@@ -75,6 +76,16 @@ mod tests {
     fn parse_error_in_tx_queues_rollback() {
         let err = LimboError::ParseError("nope".into());
         assert_eq!(classify_op_error(&err, true), ErrorAction::Rollback);
+    }
+
+    #[test]
+    fn refused_drop_of_an_object_with_dependents_is_recoverable() {
+        let err = LimboError::dependent_objects(
+            "sequence s".into(),
+            vec!["the default of column c in table t depends on sequence s".into()],
+        );
+        assert_eq!(classify_op_error(&err, true), ErrorAction::Rollback);
+        assert_eq!(classify_op_error(&err, false), ErrorAction::ClearTxn);
     }
 
     #[test]

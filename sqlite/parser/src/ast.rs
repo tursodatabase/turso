@@ -209,6 +209,14 @@ pub enum Stmt {
         /// role options
         options: RoleOptions,
     },
+    /// `DROP ROLE`. Not SQLite syntax; a frontend with roles translates its
+    /// own DROP ROLE into this.
+    DropRole {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// The roles to drop, as the statement names them.
+        roles: Vec<Grantee>,
+    },
     /// `GRANT`: privileges on relations for roles. Not SQLite syntax; a
     /// frontend with roles translates its own GRANT into this.
     Grant(Grant),
@@ -1105,7 +1113,7 @@ pub enum OneSelect {
     /// `SELECT`
     Select {
         /// `DISTINCT`
-        distinctness: Option<Distinctness>,
+        distinctness: Option<SelectDistinctness>,
         /// columns
         columns: Vec<ResultColumn>,
         /// `FROM` clause
@@ -1132,7 +1140,7 @@ pub struct FromClause {
     pub joins: Vec<JoinedSelectTable>,
 }
 
-/// `SELECT` distinctness
+/// Distinctness of the arguments of a function call
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Distinctness {
@@ -1140,6 +1148,36 @@ pub enum Distinctness {
     Distinct,
     /// `ALL`
     All,
+}
+
+/// `SELECT` distinctness
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SelectDistinctness {
+    /// `DISTINCT`
+    Distinct,
+    /// `ALL`
+    All,
+    /// `DISTINCT ON (exprs)`: the first row of each group of rows where the expressions are equal
+    DistinctOn(Vec<Box<Expr>>),
+}
+
+impl SelectDistinctness {
+    /// The expressions of `DISTINCT ON`; none for `DISTINCT` and `ALL`.
+    pub fn exprs(&self) -> &[Box<Expr>] {
+        match self {
+            Self::DistinctOn(exprs) => exprs,
+            Self::Distinct | Self::All => &[],
+        }
+    }
+
+    /// The expressions of `DISTINCT ON`; none for `DISTINCT` and `ALL`.
+    pub fn exprs_mut(&mut self) -> &mut [Box<Expr>] {
+        match self {
+            Self::DistinctOn(exprs) => exprs,
+            Self::Distinct | Self::All => &mut [],
+        }
+    }
 }
 
 /// `SELECT` or `RETURNING` result column
@@ -1542,6 +1580,30 @@ pub enum RelationKind {
     MaterializedView,
     Sequence,
     Index,
+}
+
+impl RelationKind {
+    /// The kind in words, such as `table` or `materialized view`.
+    pub fn name(self) -> &'static str {
+        match self {
+            RelationKind::Table => "table",
+            RelationKind::View => "view",
+            RelationKind::MaterializedView => "materialized view",
+            RelationKind::Sequence => "sequence",
+            RelationKind::Index => "index",
+        }
+    }
+
+    /// The kind as an error message names it, such as `a table` or `an index`.
+    pub fn with_article(self) -> &'static str {
+        match self {
+            RelationKind::Table => "a table",
+            RelationKind::View => "a view",
+            RelationKind::MaterializedView => "a materialized view",
+            RelationKind::Sequence => "a sequence",
+            RelationKind::Index => "an index",
+        }
+    }
 }
 
 /// A role named in DDL, like PostgreSQL's RoleSpec.
@@ -2194,6 +2256,8 @@ pub enum PragmaName {
     FreelistCount,
     /// Enable or disable foreign key constraint enforcement
     ForeignKeys,
+    /// Reports rows whose foreign key points at a missing parent row
+    ForeignKeyCheck,
     /// Returns information about foreign keys declared by a table
     ForeignKeyList,
     /// Deprecated: control whether column names include table name prefix

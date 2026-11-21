@@ -223,85 +223,25 @@ fn test_postgres_simple_select_literal(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
-fn test_postgres_comment_on_supported_object_forms_are_noops(db: TempDatabase) {
+fn comment_on_a_kind_of_object_without_stored_comments_is_refused(db: TempDatabase) {
     let conn = db.connect_postgres();
 
-    // COMMENT ON is intentionally accepted without validating or storing the
-    // referenced object, so cover the distinct PostgreSQL grammar forms here.
-    for (object_kind, sql) in [
-        ("table", "COMMENT ON TABLE comment_docs IS 'documentation'"),
-        (
-            "column",
-            "COMMENT ON COLUMN comment_docs.title IS 'column documentation'",
-        ),
-        (
-            "constraint",
-            "COMMENT ON CONSTRAINT comment_docs_pkey ON comment_docs IS 'constraint documentation'",
-        ),
-        (
-            "database",
-            "COMMENT ON DATABASE main IS 'database documentation'",
-        ),
-        (
-            "domain",
-            "COMMENT ON DOMAIN email IS 'domain documentation'",
-        ),
-        ("type", "COMMENT ON TYPE status IS 'type documentation'"),
-        (
-            "index",
-            "COMMENT ON INDEX comment_docs_idx IS 'index documentation'",
-        ),
-        (
-            "view",
-            "COMMENT ON VIEW comment_view IS 'view documentation'",
-        ),
-        (
-            "materialized view",
-            "COMMENT ON MATERIALIZED VIEW comment_matview IS 'materialized view documentation'",
-        ),
-        (
-            "schema",
-            "COMMENT ON SCHEMA accounting IS 'schema documentation'",
-        ),
-        (
-            "sequence",
-            "COMMENT ON SEQUENCE comment_docs_id_seq IS 'sequence documentation'",
-        ),
-        (
-            "trigger",
-            "COMMENT ON TRIGGER audit_changes ON comment_docs IS 'trigger documentation'",
-        ),
-        (
-            "function",
-            "COMMENT ON FUNCTION format_comment(integer) IS 'function documentation'",
-        ),
-        (
-            "cast",
-            "COMMENT ON CAST (text AS integer) IS 'cast documentation'",
-        ),
-        (
-            "operator",
-            "COMMENT ON OPERATOR + (integer, integer) IS 'operator documentation'",
-        ),
-        (
-            "operator class",
-            "COMMENT ON OPERATOR CLASS int4_ops USING btree IS 'operator class documentation'",
-        ),
-        (
-            "policy",
-            "COMMENT ON POLICY access_policy ON comment_docs IS 'policy documentation'",
-        ),
-        (
-            "rule",
-            "COMMENT ON RULE update_rule ON comment_docs IS 'rule documentation'",
-        ),
-        (
-            "language",
-            "COMMENT ON LANGUAGE plpgsql IS 'language documentation'",
-        ),
+    for sql in [
+        "COMMENT ON CONSTRAINT comment_docs_pkey ON comment_docs IS 'x'",
+        "COMMENT ON DATABASE main IS 'x'",
+        "COMMENT ON DOMAIN email IS 'x'",
+        "COMMENT ON TYPE status IS 'x'",
+        "COMMENT ON TRIGGER audit_changes ON comment_docs IS 'x'",
+        "COMMENT ON FUNCTION format_comment(integer) IS 'x'",
+        "COMMENT ON OPERATOR CLASS int4_ops USING btree IS 'x'",
+        "COMMENT ON POLICY access_policy ON comment_docs IS 'x'",
+        "COMMENT ON RULE update_rule ON comment_docs IS 'x'",
+        "COMMENT ON LANGUAGE plpgsql IS 'x'",
+        "COMMENT ON ROLE postgres IS 'x'",
+        "COMMENT ON EXTENSION plpgsql IS 'x'",
     ] {
-        conn.execute(sql)
-            .unwrap_or_else(|err| panic!("COMMENT ON {object_kind} should be accepted: {err}"));
+        let error = conn.execute(sql).unwrap_err().to_string();
+        assert!(error.contains("is not supported"), "{sql}: {error}");
     }
 }
 
@@ -689,6 +629,32 @@ fn altering_the_columns_of_a_table_of_a_schema_survives_reopening(db: TempDataba
     assert_eq!(rows_of(&conn, "SELECT * FROM app.u"), ["3"]);
     conn.execute("INSERT INTO t VALUES (5)").unwrap();
     assert_eq!(rows_of(&conn, "SELECT * FROM t"), ["5"]);
+}
+
+#[turso_macros::test]
+fn a_view_with_distinct_on_survives_a_column_rename_and_reopening(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (a int, b int)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (1, 20), (2, 5), (2, 30)")
+        .unwrap();
+    conn.execute("CREATE VIEW v AS SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC")
+        .unwrap();
+    conn.execute("ALTER TABLE t RENAME COLUMN a TO z").unwrap();
+    assert_eq!(rows_of(&conn, "SELECT * FROM v"), ["1|20", "2|30"]);
+
+    let path = db.path.clone();
+    let io = db.io.clone();
+    drop(conn);
+    drop(db);
+    let db = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = turso_pg::Connection::connect(&db).unwrap();
+    assert_eq!(rows_of(&conn, "SELECT * FROM v"), ["1|20", "2|30"]);
 }
 
 fn rows_of(conn: &turso_pg::Connection, sql: &str) -> Vec<String> {
@@ -1913,6 +1879,45 @@ fn test_postgres_window_avg_partition(db: TempDatabase) {
         Value::Numeric(Numeric::Integer(avg)) => assert_eq!(*avg, 150),
         other => panic!("expected numeric, got {other:?}"),
     }
+}
+
+// PostgreSQL rejects `1e308::float8 * 10` as an overflow, so its results
+// below come from the same rows written with 'Infinity'::float8. NaN is
+// returned as NULL.
+#[turso_macros::test(mvcc)]
+fn test_postgres_window_sum_avg_are_finite_after_infinite_values_leave_frame(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (n int, x float8)").unwrap();
+    conn.execute(
+        "INSERT INTO t VALUES (1, 1e308::float8 * 10), (2, 1), (3, 2), (4, 4), \
+         (5, -1e308::float8 * 10), (6, 1e308::float8 * 10), (7, 8)",
+    )
+    .unwrap();
+
+    assert_eq!(
+        rows_of(
+            &conn,
+            "SELECT n, avg(x) OVER (ORDER BY n ROWS BETWEEN CURRENT ROW AND CURRENT ROW) \
+             FROM t ORDER BY n",
+        ),
+        ["1|Inf", "2|1.0", "3|2.0", "4|4.0", "5|-Inf", "6|Inf", "7|8.0"]
+    );
+    assert_eq!(
+        rows_of(
+            &conn,
+            "SELECT n, sum(x) OVER w, avg(x) OVER w FROM t \
+             WINDOW w AS (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) ORDER BY n",
+        ),
+        [
+            "1|Inf|Inf",
+            "2|Inf|Inf",
+            "3|3.0|1.5",
+            "4|6.0|3.0",
+            "5|-Inf|-Inf",
+            "6||",
+            "7|Inf|Inf",
+        ]
+    );
 }
 
 // ==================== OPERATORS: ||, ILIKE, JSON ====================
@@ -4577,7 +4582,7 @@ fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabas
 
     let mut rows = conn
         .inner()
-        .prepare_internal("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB '__turso_internal_*' AND name != 'sqlite_sequence' ORDER BY name")
+        .prepare_internal("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB '__turso_internal_*' AND name NOT IN ('sqlite_sequence', 'pg_description') ORDER BY name")
         .unwrap();
     let mut stored = Vec::new();
     while let StepResult::Row = rows.step().unwrap() {

@@ -1,0 +1,78 @@
+@database :memory:
+
+# Concat writes its result into the TEXT buffer of the destination register
+# when the register holds TEXT from the row before. These rows change the
+# result between longer TEXT, shorter TEXT, NULL and numbers.
+
+setup rows {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    INSERT INTO t VALUES (1, 'x', 'y'), (2, 'long text abcdefghij', 'z'), (3, NULL, 'n'), (4, x'4142', 'c'), (5, 'p', x'44'), (6, 12, 3.5), (7, 'q', -7), (8, '', ''), (9, 'é', 'ü'), (10, 'last', 'row');
+}
+
+@setup rows
+test concat-of-each-row {
+    SELECT a || b FROM t ORDER BY id;
+}
+expect {
+    xy
+    long text abcdefghijz
+    
+    ABc
+    pD
+    123.5
+    q-7
+    
+    éü
+    lastrow
+}
+
+@setup rows
+test concat-type-of-each-row {
+    SELECT typeof(a || b) FROM t ORDER BY id;
+}
+expect {
+    text
+    text
+    null
+    text
+    text
+    text
+    text
+    text
+    text
+    text
+}
+
+@setup rows
+test concat-chain-of-each-row {
+    SELECT a || '-' || b || '-' || id FROM t ORDER BY id;
+}
+expect {
+    x-y-1
+    long text abcdefghij-z-2
+    
+    AB-c-4
+    p-D-5
+    12-3.5-6
+    q--7-7
+    --8
+    é-ü-9
+    last-row-10
+}
+
+@setup rows
+test concat-length-and-bytes-of-each-row {
+    SELECT length(a || b), hex(a || b) FROM t ORDER BY id;
+}
+expect {
+    2|7879
+    21|6C6F6E672074657874206162636465666768696A7A
+    |
+    3|414263
+    2|7044
+    5|3132332E35
+    3|712D37
+    0|
+    2|C3A9C3BC
+    7|6C617374726F77
+}

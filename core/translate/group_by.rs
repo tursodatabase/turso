@@ -421,10 +421,17 @@ fn collect_non_aggregate_expressions<'a>(
     }
     result_columns.extend(&group_by.columns_read_by_group_subqueries);
 
+    let distinct_on_keys: &[ast::Expr] = match &plan.distinctness {
+        Distinctness::DistinctOnRowsInOrder { keys, .. } => keys,
+        _ => &[],
+    };
     for group_expr in &group_by.exprs {
         let expr_appears_in_result_columns = result_columns
             .iter()
             .any(|expr| exprs_are_equivalent(expr, group_expr))
+            || distinct_on_keys
+                .iter()
+                .any(|key| expr_contains(key, group_expr))
             || (!can_return_json_subtype(group_expr)
                 && root_result_columns
                     .iter()
@@ -441,6 +448,16 @@ fn collect_non_aggregate_expressions<'a>(
         }
     }
     Ok(())
+}
+
+fn expr_contains(expr: &ast::Expr, part: &ast::Expr) -> bool {
+    let mut found = false;
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        found |= exprs_are_equivalent(e, part);
+        Ok(WalkControl::Continue)
+    })
+    .expect("walking an expression cannot fail");
+    found
 }
 
 /// Collects columns from different parts of a SELECT that are needed for
@@ -815,7 +832,7 @@ pub fn group_by_process_single_group(
                     agg_result_reg,
                     &t_ctx.resolver,
                 )?;
-                if let Distinctness::Distinct { ctx } = &agg.distinctness {
+                if let Distinctness::Distinct { ctx, .. } = &agg.distinctness {
                     let ctx = ctx
                         .as_ref()
                         .expect("distinct aggregate context not populated");
@@ -873,7 +890,7 @@ pub fn group_by_process_single_group(
                     agg_result_reg,
                     &t_ctx.resolver,
                 )?;
-                if let Distinctness::Distinct { ctx } = &agg.distinctness {
+                if let Distinctness::Distinct { ctx, .. } = &agg.distinctness {
                     let ctx = ctx
                         .as_ref()
                         .expect("distinct aggregate context not populated");
@@ -1044,7 +1061,7 @@ pub fn group_by_emit_row_phase<'a>(
     // If no data, return without outputting a row
     program.preassign_label_to_next_insn(labels.label_group_by_end_without_emitting_row);
     // SELECT DISTINCT also jumps here if there is a duplicate.
-    if let Distinctness::Distinct { ctx } = &plan.distinctness {
+    if let Distinctness::Distinct { ctx, .. } = &plan.distinctness {
         let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
         program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
     }
@@ -1165,7 +1182,7 @@ pub fn group_by_emit_row_phase<'a>(
     plan.aggregates
         .iter()
         .filter_map(|agg| {
-            if let Distinctness::Distinct { ctx } = &agg.distinctness {
+            if let Distinctness::Distinct { ctx, .. } = &agg.distinctness {
                 Some(ctx)
             } else {
                 None
@@ -1175,9 +1192,7 @@ pub fn group_by_emit_row_phase<'a>(
             let ctx = ctx
                 .as_ref()
                 .expect("distinct aggregate context not populated");
-            program.emit_insn(Insn::HashClear {
-                hash_table_id: ctx.hash_table_id,
-            });
+            ctx.emit_reset(program);
         });
 
     program.emit_insn(Insn::Integer {
