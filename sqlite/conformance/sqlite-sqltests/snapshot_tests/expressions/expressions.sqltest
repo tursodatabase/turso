@@ -12,9 +12,9 @@ setup schema {
 
 # Parameters are constant within a query, so the WHERE clause below is fully
 # constant: the zeroblob()/length() calls and the comparison must be emitted
-# in the prologue, before the Rewind/Next scan loop, and evaluated exactly
-# once. If they show up inside the loop, a query binding a large blob would
-# re-allocate it for every row.
+# before the Rewind/Next scan loop, and evaluated exactly once. If they show
+# up inside the loop, a query binding a large blob would re-allocate it for
+# every row.
 @setup schema
 snapshot constant-parameter-hoisted-out-of-scan {
     SELECT COUNT(*) FROM t WHERE LENGTH(zeroblob(?)) = ?;
