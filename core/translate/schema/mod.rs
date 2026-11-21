@@ -1791,12 +1791,13 @@ fn collect_autoindexes(
     tbl_name: &str,
     resolver: &Resolver,
 ) -> Result<Option<Vec<usize>>> {
-    let table = create_table(
+    let mut table = create_table(
         tbl_name,
         body,
         0,
         resolver.catalog.dialect.supports_namespaces(),
     )?;
+    table.resolve_custom_types(resolver.schema())?;
 
     let mut regs: Vec<usize> = Vec::new();
 
@@ -3379,6 +3380,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
         accepts_collate: _,
         range_offsets: _,
         stored_form_sorts_in_value_order: _,
+        can_be_rowid_alias: _,
         sql: _,
         domain_checks,
         kind,

@@ -4598,5 +4598,16 @@ fn emit_custom_type_encode(
         Some(&stored_columns),
         table_name,
         &layout,
-    )
+    )?;
+    if let InsertionKey::RowidAlias(key) = &insertion.key {
+        if key.value_index.is_some() {
+            crate::translate::expr::emit_coerce_rowid(
+                program,
+                key.column,
+                insertion.key_register(),
+                resolver,
+            )?;
+        }
+    }
+    Ok(())
 }

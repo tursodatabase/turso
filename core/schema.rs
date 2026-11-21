@@ -450,6 +450,20 @@ pub struct ResolvedType {
 }
 
 impl ResolvedType {
+    /// Whether a PRIMARY KEY of the type is the rowid: the type says so and
+    /// keeps its values as the plain integers it stores, with no ENCODE or
+    /// DECODE in the chain.
+    pub fn can_be_rowid_alias(&self) -> bool {
+        self.primitive.eq_ignore_ascii_case("integer")
+            && self
+                .base_type()
+                .is_some_and(|type_def| type_def.can_be_rowid_alias)
+            && self
+                .chain
+                .iter()
+                .all(|type_def| type_def.encode().is_none() && type_def.decode().is_none())
+    }
+
     /// The leaf (directly named) type definition.
     pub fn leaf(&self) -> &TypeDef {
         &self.chain[0]
@@ -563,6 +577,11 @@ pub struct TypeDef {
     /// built-in date and time types, which store one text form with a 4-digit
     /// year. False for a domain, whose index then serves only `=`.
     pub stored_form_sorts_in_value_order: bool,
+    /// Whether a single-column PRIMARY KEY of the type is the rowid, as
+    /// `INTEGER PRIMARY KEY` is. Only a built-in type that stores plain
+    /// integers can say so, and only one that no database has a table of yet:
+    /// a table made before the type said so keeps the key in its rows.
+    pub can_be_rowid_alias: bool,
     /// Original SQL for round-trip persistence. Stored verbatim from creation.
     pub sql: String,
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
@@ -863,6 +882,12 @@ impl TypeDef {
                         // A user type's ENCODE may store any form.
                         TypeOrigin::User => false,
                     },
+                    can_be_rowid_alias: match origin {
+                        TypeOrigin::Builtin {
+                            can_be_rowid_alias, ..
+                        } => can_be_rowid_alias,
+                        TypeOrigin::User => false,
+                    },
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Custom {
@@ -899,6 +924,7 @@ impl TypeDef {
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
                     stored_form_sorts_in_value_order: false,
+                    can_be_rowid_alias: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Struct(StructDef {
@@ -934,6 +960,7 @@ impl TypeDef {
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
                     stored_form_sorts_in_value_order: false,
+                    can_be_rowid_alias: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
@@ -965,6 +992,7 @@ impl TypeDef {
             range_offsets: None,
             accepts_collate: None,
             stored_form_sorts_in_value_order: false,
+            can_be_rowid_alias: false,
             sql,
             domain_checks: constraints.to_vec(),
             kind: TypeDefKind::Custom {
@@ -1548,11 +1576,13 @@ pub enum TypeOrigin {
     /// `accepts_collate` says whether values of the type take a COLLATE,
     /// `range_offsets` what kind of number they are in a RANGE frame, and
     /// `stored_form_sorts_in_value_order` whether the stored form sorts in
-    /// the same order as the values.
+    /// the same order as the values, and `can_be_rowid_alias` whether a
+    /// PRIMARY KEY of the type is the rowid.
     Builtin {
         accepts_collate: bool,
         range_offsets: RangeOffsets,
         stored_form_sorts_in_value_order: bool,
+        can_be_rowid_alias: bool,
     },
     User,
 }
@@ -6056,6 +6086,47 @@ impl BTreeTable {
         }
         for col in &mut self.columns {
             col.resolve_custom_type(schema)?;
+        }
+        self.make_integer_type_key_a_rowid_alias(schema)
+    }
+
+    /// A single-column PRIMARY KEY of a type that stores its values as plain
+    /// integers is the rowid, as `INTEGER PRIMARY KEY` is.
+    fn make_integer_type_key_a_rowid_alias(&mut self, schema: &Schema) -> Result<()> {
+        let [(key_name, key_order)] = self.primary_key_columns.as_slice() else {
+            return Ok(());
+        };
+        if !self.has_rowid || (self.primary_key_is_inline && *key_order == ast::SortOrder::Desc) {
+            return Ok(());
+        }
+        let key_name = key_name.clone();
+        let Some(column) = self.columns.iter_mut().find(|col| {
+            col.name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(&key_name))
+        }) else {
+            return Ok(());
+        };
+        if column.is_rowid_alias() || column.is_array() || column.ty_str.is_empty() {
+            return Ok(());
+        }
+        let Some(resolved) = schema.resolve_type_unchecked(&column.ty_str)? else {
+            return Ok(());
+        };
+        if !resolved.can_be_rowid_alias() {
+            return Ok(());
+        }
+        column.set_rowid_alias(true);
+        // As `create_table` does for an INTEGER PRIMARY KEY: the key has no
+        // automatic index.
+        let key_set = self.unique_sets.iter().position(|set| {
+            set.is_primary_key
+                && set.columns.len() == 1
+                && set.columns[0].name.eq_ignore_ascii_case(&key_name)
+        });
+        if let Some(key_set) = key_set {
+            self.rowid_alias_conflict_clause = self.unique_sets[key_set].conflict_clause;
+            self.unique_sets.remove(key_set);
         }
         Ok(())
     }

@@ -781,6 +781,7 @@ pub fn emit_upsert(
                 reg: r,
                 target_pc: None,
             });
+            crate::translate::expr::emit_coerce_rowid(program, col, r, resolver)?;
             new_rowid_reg = Some(r);
         }
     }
