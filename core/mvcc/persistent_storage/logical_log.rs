@@ -59,6 +59,10 @@
 //! ciphertext as AEAD additional data, so tampering with them will cause
 //! decryption to fail. The CRC in the trailer covers the TX header and the body
 //! as written on disk (i.e. the ciphertext when encrypted).
+//! The CRC is not keyed. Frame position/order and the full transaction header,
+//! including the extension/recovery split, are not authenticated. An attacker
+//! able to rewrite storage can rearrange complete frames and recompute CRCs.
+//! Body-chunk tag verification does not provide whole-log tamper detection.
 //!
 //! ### Header fields (56 bytes, little-endian)
 //! - `magic: u32` (`LOG_MAGIC`)
@@ -258,6 +262,8 @@ use crate::{
 use crate::storage::encryption::EncryptionContext;
 use crate::File;
 
+#[cfg(feature = "conn_raw_api")]
+pub mod frame_codec;
 mod serializer;
 use serializer::EncryptedPayload;
 #[cfg(feature = "conn_raw_api")]
@@ -1275,10 +1281,11 @@ fn decode_delete_portable_extension(extension: &[u8]) -> Result<DeletePortableEx
     Ok(decoded)
 }
 
+/// Validate every record, collecting payload bytes only when a type is requested.
 fn find_extension_payload(
     extension_block: &[u8],
     extension_record_count: u32,
-    wanted_type: u16,
+    wanted_type: Option<u16>,
 ) -> Result<Vec<u8>> {
     let mut offset = 0usize;
     let mut payload = Vec::new();
@@ -1318,7 +1325,7 @@ fn find_extension_payload(
                 "extension record payload is truncated".to_string(),
             ));
         }
-        if extension_type == wanted_type {
+        if Some(extension_type) == wanted_type {
             payload.extend_from_slice(&extension_block[payload_start..payload_end]);
         }
         offset = payload_end;
@@ -2811,7 +2818,7 @@ impl StreamingLogicalLogReader {
                     let portable_changes = match find_extension_payload(
                         &bytes,
                         extension_record_count,
-                        EXTENSION_TYPE_PORTABLE_CHANGES,
+                        Some(EXTENSION_TYPE_PORTABLE_CHANGES),
                     ) {
                         Ok(payload) => payload,
                         Err(LimboError::Corrupt(msg)) => {
@@ -2960,13 +2967,7 @@ impl StreamingLogicalLogReader {
                 header_bytes[38],
                 header_bytes[39],
             ]);
-            if frame_flags & !TX_FRAME_FLAG_HAS_EXTENSION_BLOCK != 0 {
-                return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
-            }
-            if extension_size == 0 && extension_record_count != 0 {
-                return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
-            }
-            if extension_size > 0 && frame_flags & TX_FRAME_FLAG_HAS_EXTENSION_BLOCK == 0 {
+            if !valid_extension_header(extension_size as u64, extension_record_count, frame_flags) {
                 return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
             }
             (extension_size, extension_record_count, frame_flags)
@@ -3042,7 +3043,7 @@ impl StreamingLogicalLogReader {
             let portable_changes = find_extension_payload(
                 &plaintext[..extension_size],
                 extension_record_count,
-                EXTENSION_TYPE_PORTABLE_CHANGES,
+                Some(EXTENSION_TYPE_PORTABLE_CHANGES),
             )?;
             let parsed_ops = parse_ops_from_plaintext(
                 &plaintext[recovery_start..recovery_end],
@@ -3249,15 +3250,7 @@ impl StreamingLogicalLogReader {
                 header_bytes[38],
                 header_bytes[39],
             ]);
-            if frame_flags & !TX_FRAME_FLAG_HAS_EXTENSION_BLOCK != 0 {
-                self.last_valid_offset = frame_start;
-                return Ok(IOResult::Done(ParseResult::InvalidFrame));
-            }
-            if extension_size_u64 == 0 && extension_record_count != 0 {
-                self.last_valid_offset = frame_start;
-                return Ok(IOResult::Done(ParseResult::InvalidFrame));
-            }
-            if extension_size_u64 > 0 && frame_flags & TX_FRAME_FLAG_HAS_EXTENSION_BLOCK == 0 {
+            if !valid_extension_header(extension_size_u64, extension_record_count, frame_flags) {
                 self.last_valid_offset = frame_start;
                 return Ok(IOResult::Done(ParseResult::InvalidFrame));
             }
@@ -3323,7 +3316,7 @@ impl StreamingLogicalLogReader {
             let portable_changes = match find_extension_payload(
                 &plaintext[..extension_size],
                 extension_record_count,
-                EXTENSION_TYPE_PORTABLE_CHANGES,
+                Some(EXTENSION_TYPE_PORTABLE_CHANGES),
             ) {
                 Ok(payload) => payload,
                 Err(LimboError::Corrupt(msg)) => {
@@ -3342,7 +3335,7 @@ impl StreamingLogicalLogReader {
                         let portable_changes = match find_extension_payload(
                             &bytes,
                             extension_record_count,
-                            EXTENSION_TYPE_PORTABLE_CHANGES,
+                            Some(EXTENSION_TYPE_PORTABLE_CHANGES),
                         ) {
                             Ok(payload) => payload,
                             Err(LimboError::Corrupt(msg)) => {
@@ -3815,6 +3808,12 @@ enum PayloadParseResult {
     Ok(Vec<ParsedOp>, u32),
     /// Not enough bytes to complete the payload.
     Eof,
+}
+
+fn valid_extension_header(size: u64, count: u32, flags: u32) -> bool {
+    flags & !TX_FRAME_FLAG_HAS_EXTENSION_BLOCK == 0
+        && (size != 0 || count == 0)
+        && (size == 0 || flags & TX_FRAME_FLAG_HAS_EXTENSION_BLOCK != 0)
 }
 
 /// Result of reading and decrypting one encrypted chunk into `decrypt_scratch`.
@@ -5970,6 +5969,243 @@ mod tests {
                 panic!("spliced frame from a different log should NOT validate, got {other:?}")
             }
         }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn strict_frame_codec_matches_reader_for_empty_extension_blocks() {
+        use super::frame_codec::*;
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        for version in [LOG_VERSION_V2, LOG_VERSION] {
+            for flags in [0, super::TX_FRAME_FLAG_HAS_EXTENSION_BLOCK] {
+                let bytes = LogHeader::new_with_version(&io, version).encode();
+                let header = validate_log_header(&bytes).unwrap();
+                let mut frame = vec![0; TX_EXT_HEADER_SIZE];
+                frame[..4].copy_from_slice(&EXT_FRAME_MAGIC.to_le_bytes());
+                frame[16..24].copy_from_slice(&1u64.to_le_bytes());
+                frame[36..40].copy_from_slice(&flags.to_le_bytes());
+                let crc = crc32c::crc32c_append(header.initial_crc(), &frame);
+                frame.extend(crc.to_le_bytes());
+                frame.extend(END_MAGIC.to_le_bytes());
+                let file = open_test_file(&io, &format!("empty-extension-{version}-{flags}"));
+                let mut stored = bytes.to_vec();
+                stored.extend(&frame);
+                overwrite_file_bytes(file.clone(), &io, &stored);
+                let mut reader = StreamingLogicalLogReader::new(file, None);
+                reader.read_header(&io).unwrap();
+                let native = io.block(|| reader.parse_next_transaction()).unwrap();
+                let accepted = version != LOG_VERSION_V2;
+                assert_eq!(matches!(native, ParseResult::Frame(_)), accepted);
+                let mut output = Vec::new();
+                assert_eq!(
+                    validate_frame_into(
+                        &header,
+                        LOG_HDR_SIZE as u64,
+                        &frame,
+                        header.initial_crc(),
+                        None,
+                        &mut output,
+                    )
+                    .is_ok(),
+                    accepted,
+                    "version={version}, flags={flags}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn strict_frame_codec_matches_native_writer() {
+        use super::frame_codec::*;
+        use crate::{CipherMode, EncryptionContext, EncryptionKey};
+
+        for cipher in [
+            CipherMode::Aes128Gcm,
+            CipherMode::Aes256Gcm,
+            CipherMode::Aegis128L,
+            CipherMode::Aegis128X2,
+            CipherMode::Aegis128X4,
+            CipherMode::Aegis256,
+            CipherMode::Aegis256X2,
+            CipherMode::Aegis256X4,
+        ] {
+            let key = if cipher.required_key_size() == 16 {
+                EncryptionKey::new_128([42; 16])
+            } else {
+                EncryptionKey::new_256([42; 32])
+            };
+            let crypto = EncryptionContext::new(cipher, &key, 4096).expect("crypto");
+            for portable in [false, true] {
+                let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+                let file = open_test_file(&io, "codec.db-log");
+                let mut log = LogicalLog::new(file.clone(), io.clone(), Some(crypto.clone()));
+                for size in [0, 100, 32768, 100_000] {
+                    let rows = if size == 0 {
+                        Vec::new()
+                    } else {
+                        vec![make_test_row_version(
+                            (-2).into(),
+                            size,
+                            &"x".repeat(size as usize),
+                            size as u64,
+                        )]
+                    };
+                    let mut tx =
+                        crate::mvcc::database::LogRecord::for_test(size as u64, &rows, None);
+                    tx.portable_changes_enabled = portable;
+                    io.wait_for_completion(log.log_tx(tx).expect("write"))
+                        .expect("complete write");
+                }
+                let stored = read_file_bytes(file, &io);
+                let header = validate_log_header(&stored[..LOG_HDR_SIZE]).expect("header");
+                let mut source_crc = header.initial_crc();
+                let mut wire_crc = source_crc;
+                let mut offset = LOG_HDR_SIZE;
+                let mut normalized = header.bytes().to_vec();
+                let mut output = Vec::new();
+                while offset < stored.len() {
+                    let layout = inspect_frame_prefix(&stored[offset..], Some(&crypto))
+                        .expect("layout")
+                        .expect("complete prefix");
+                    let end = offset + layout.stored_size();
+                    let frame = validate_frame_into(
+                        &header,
+                        offset as u64,
+                        &stored[offset..end],
+                        source_crc,
+                        Some(&crypto),
+                        &mut output,
+                    )
+                    .expect("frame");
+                    assert_eq!(frame.source_end(), end as u64);
+                    assert_eq!(frame.wire_size(), layout.wire_size());
+                    let keyless = inspect_frame_prefix_with_overhead(
+                        &stored[offset..],
+                        Some((cipher.tag_size(), cipher.nonce_size())),
+                    )
+                    .expect("keyless layout")
+                    .expect("complete header");
+                    assert_eq!(keyless.stored_size(), layout.stored_size());
+                    assert_eq!(keyless.wire_size(), frame.wire_size());
+                    assert_eq!(frame.extension().is_empty(), !portable);
+                    let wire = plaintext_wire_parts(&frame, wire_crc);
+                    normalized.extend_from_slice(wire.header);
+                    normalized.extend_from_slice(wire.body);
+                    normalized.extend_from_slice(&wire.trailer);
+                    wire_crc = wire.next_crc;
+                    source_crc = frame.source_crc();
+                    offset = end;
+                }
+                let plain_file = open_test_file(&io, "normalized.db-log");
+                overwrite_file_bytes(plain_file.clone(), &io, &normalized);
+                let mut reader = StreamingLogicalLogReader::new(plain_file, None);
+                reader.read_header(&io).expect("wire header");
+                for expected_ops in [0, 1, 1, 1] {
+                    let ParseResult::Frame(frame) = io
+                        .block(|| reader.parse_next_transaction())
+                        .expect("wire decode")
+                    else {
+                        panic!("expected complete wire frame");
+                    };
+                    assert_eq!(frame.ops.len(), expected_ops);
+                }
+                assert!(matches!(
+                    io.block(|| reader.parse_next_transaction())
+                        .expect("wire EOF"),
+                    ParseResult::Eof
+                ));
+            }
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn strict_frame_codec_rejects_corruption_and_truncation() {
+        use super::frame_codec::*;
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = open_test_file(&io, "codec-corrupt.db-log");
+        let crypto = test_enc_ctx();
+        let mut tx = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[make_test_row_version(
+                (-2).into(),
+                1,
+                &"private".repeat(10_000),
+                10,
+            )],
+            None,
+        );
+        tx.portable_changes_enabled = true;
+        write_first_encrypted_tx(file.clone(), &io, &crypto, tx);
+        let stored = read_file_bytes(file, &io);
+        let header = validate_log_header(&stored[..LOG_HDR_SIZE]).expect("header");
+        let frame = &stored[LOG_HDR_SIZE..];
+        let mut output = Vec::new();
+        for length in [0, 3, 23, 39, 40, 32768, frame.len() - 1] {
+            assert!(validate_frame_into(
+                &header,
+                56,
+                &frame[..length],
+                header.initial_crc(),
+                Some(&crypto),
+                &mut output
+            )
+            .is_err());
+        }
+        let mut corrupt = frame.to_vec();
+        corrupt[TX_EXT_HEADER_SIZE] ^= 1;
+        assert!(validate_frame_into(
+            &header,
+            56,
+            &corrupt,
+            header.initial_crc(),
+            Some(&crypto),
+            &mut output
+        )
+        .is_err());
+        let trailer = corrupt.len() - TX_TRAILER_SIZE;
+        let crc = crc32c::crc32c_append(header.initial_crc(), &corrupt[..trailer]);
+        corrupt[trailer..trailer + 4].copy_from_slice(&crc.to_le_bytes());
+        let error = validate_frame_into(
+            &header,
+            56,
+            &corrupt,
+            header.initial_crc(),
+            Some(&crypto),
+            &mut output,
+        )
+        .expect_err("recomputed CRC must not bypass authentication");
+        assert!(error.to_string().contains("authentication"));
+        assert!(output.is_empty());
+        assert!(validate_frame_into(
+            &header,
+            56,
+            frame,
+            header.initial_crc(),
+            Some(&wrong_key_enc_ctx()),
+            &mut output
+        )
+        .is_err());
+        let mut other_header = stored[..LOG_HDR_SIZE].to_vec();
+        other_header[8] ^= 1;
+        other_header[52..].fill(0);
+        let crc = crc32c::crc32c(&other_header);
+        other_header[52..].copy_from_slice(&crc.to_le_bytes());
+        let other_header = validate_log_header(&other_header).expect("valid different salt");
+        assert!(validate_frame_into(
+            &other_header,
+            56,
+            frame,
+            header.initial_crc(),
+            Some(&crypto),
+            &mut output
+        )
+        .is_err());
+        let mut overflow = frame[..TX_EXT_HEADER_SIZE].to_vec();
+        overflow[4..12].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(inspect_frame_prefix(&overflow, Some(&crypto)).is_err());
+        assert!(inspect_frame_prefix(&overflow, None).is_err());
     }
 
     fn test_enc_ctx() -> crate::storage::encryption::EncryptionContext {
