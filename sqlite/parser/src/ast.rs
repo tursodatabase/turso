@@ -79,6 +79,18 @@ pub struct AlterTable {
     // `ALTER TABLE` body
     pub body: AlterTableBody,
 }
+/// An error in the option list of `CREATE SEQUENCE`. The PostgreSQL frontend
+/// puts it on the statement when `IF NOT EXISTS` can skip the statement, so
+/// the executor reports the error only for a sequence it creates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SequenceOptionError {
+    /// The PostgreSQL error code, when the frontend has one for this error.
+    pub code: Option<String>,
+    /// The error message, as the frontend composed it.
+    pub message: String,
+}
+
 /// SQL statement
 // https://sqlite.org/syntax/sql-stmt.html
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -369,9 +381,9 @@ pub enum Stmt {
         max_value: Option<i64>,
         /// cycle on overflow
         cycle: bool,
-        /// an option name was repeated, deferred so the executor can apply
-        /// `IF NOT EXISTS` before reporting the conflict
-        conflicting_options: bool,
+        /// an option-list error deferred so the executor can apply
+        /// `IF NOT EXISTS` before reporting it
+        option_error: Option<Box<SequenceOptionError>>,
     },
     /// `DROP SEQUENCE`
     DropSequence {

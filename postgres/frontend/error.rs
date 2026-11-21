@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use turso_core::security::permission::{Action, Object, PermissionDenied, Reason};
 use turso_core::{ConstraintKind, ConstraintViolation, DialectError, LimboError, Value};
 use turso_pg_parser::sqlstate::*;
@@ -57,7 +59,7 @@ impl From<LimboError> for Error {
 /// raises itself, also in the PostgreSQL functions that the engine runs.
 pub fn sqlstate_error(sqlstate: &'static str, message: impl Into<String>) -> LimboError {
     LimboError::Dialect(Box::new(DialectError {
-        code: sqlstate,
+        code: Cow::Borrowed(sqlstate),
         message: message.into(),
     }))
 }
@@ -85,7 +87,7 @@ pub(crate) fn in_failed_sql_transaction_error() -> LimboError {
 
 #[derive(Debug, Clone)]
 pub struct ErrorReport {
-    pub sqlstate: &'static str,
+    pub sqlstate: Cow<'static, str>,
     pub message: String,
     pub detail: Option<String>,
     pub table_name: Option<String>,
@@ -228,7 +230,15 @@ fn format_value(value: &Value) -> String {
     }
 }
 
-pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
+pub(crate) fn sqlstate(error: &LimboError) -> Cow<'static, str> {
+    if let LimboError::Dialect(error) = error {
+        return error.code.clone();
+    }
+    Cow::Borrowed(static_sqlstate(error))
+}
+
+/// The SQLSTATE of every error that a dialect did not give a code.
+fn static_sqlstate(error: &LimboError) -> &'static str {
     match error {
         LimboError::ConstraintViolation(cv) => match cv.kind {
             ConstraintKind::PrimaryKey | ConstraintKind::Unique => SQLSTATE_UNIQUE_VIOLATION,
@@ -283,7 +293,7 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::Raise(_, error) => raise_sqlstate(&error.to_string()),
         LimboError::RaiseIgnore => SQLSTATE_ASSERT_FAILURE,
         LimboError::Corrupt(_) | LimboError::NotADB => SQLSTATE_DATA_CORRUPTED,
-        LimboError::Dialect(error) => error.code,
+        LimboError::Dialect(_) => unreachable!("handled by sqlstate"),
         LimboError::PermissionDenied(_) => SQLSTATE_INSUFFICIENT_PRIVILEGE,
         _ => SQLSTATE_INTERNAL_ERROR,
     }

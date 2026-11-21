@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use thiserror::Error;
 
 use crate::storage::page_cache::CacheError;
@@ -64,7 +66,7 @@ impl ConstraintViolation {
 /// change. `code` is an error code that the dialect defines.
 #[derive(Debug, Clone)]
 pub struct DialectError {
-    pub code: &'static str,
+    pub code: Cow<'static, str>,
     pub message: String,
 }
 

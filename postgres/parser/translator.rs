@@ -567,7 +567,7 @@ impl PostgreSQLTranslator {
                 min_value: sequence.options.min_value,
                 max_value: sequence.options.max_value,
                 cycle: sequence.options.cycle,
-                conflicting_options: false,
+                option_error: None,
             })
             .collect();
         // PostgreSQL links a serial column's sequence to the column once the
@@ -5624,14 +5624,15 @@ impl PostgreSQLTranslator {
         let seq_name = self.qualified_name_from_range_var(relation)?;
         reject_temporary(relation, "CREATE TEMPORARY SEQUENCE")?;
 
-        // PostgreSQL checks for a repeated option name before looking at
-        // any option's value, but only once it knows the sequence gets
-        // created: IF NOT EXISTS on a taken name skips the statement
-        // entirely. The conflict is therefore deferred onto the statement
-        // and enforced after the existence check; without IF NOT EXISTS
-        // nothing skips it, so it fails right here.
-        if reject_repeated_options(&seq.options) {
-            if seq.if_not_exists {
+        // PostgreSQL handles the option list only once it knows the
+        // sequence gets created: IF NOT EXISTS on a taken name skips the
+        // statement entirely, including every option error. Defer any such
+        // error onto the statement and let the executor report it after the
+        // existence check; without IF NOT EXISTS nothing skips it, so it
+        // fails right here.
+        let options = match SequenceOptions::new(&seq.options, None) {
+            Ok(options) => options,
+            Err(error) if seq.if_not_exists => {
                 return Ok(ast::Stmt::CreateSequence {
                     if_not_exists: true,
                     seq_name,
@@ -5640,13 +5641,11 @@ impl PostgreSQLTranslator {
                     min_value: None,
                     max_value: None,
                     cycle: false,
-                    conflicting_options: true,
+                    option_error: Some(Box::new(ast::SequenceOptionError::from(error))),
                 });
             }
-            return Err(conflicting_options());
-        }
-
-        let options = SequenceOptions::new(&seq.options, None)?;
+            Err(error) => return Err(error),
+        };
         Ok(ast::Stmt::CreateSequence {
             if_not_exists: seq.if_not_exists,
             seq_name,
@@ -5655,7 +5654,7 @@ impl PostgreSQLTranslator {
             min_value: options.min_value,
             max_value: options.max_value,
             cycle: options.cycle,
-            conflicting_options: false,
+            option_error: None,
         })
     }
 
@@ -6477,6 +6476,21 @@ pub(crate) fn conflicting_options() -> ParseError {
     ParseError::Sqlstate {
         sqlstate: SQLSTATE_SYNTAX_ERROR,
         message: "conflicting or redundant options".to_string(),
+    }
+}
+
+impl From<ParseError> for ast::SequenceOptionError {
+    fn from(error: ParseError) -> Self {
+        match error {
+            ParseError::Sqlstate { sqlstate, message } => Self {
+                code: Some(sqlstate.to_string()),
+                message,
+            },
+            other => Self {
+                code: None,
+                message: other.to_string(),
+            },
+        }
     }
 }
 
@@ -14391,23 +14405,48 @@ mod tests {
     }
 
     #[test]
-    fn create_sequence_if_not_exists_defers_repeated_options() {
-        // Under IF NOT EXISTS the conflict is a flag on the statement: the
+    fn create_sequence_if_not_exists_defers_option_errors() {
+        // Under IF NOT EXISTS every option error waits on the statement: the
         // executor checks whether the name is taken before reporting it.
-        let parsed = crate::parse("CREATE SEQUENCE IF NOT EXISTS s START 1 START 2").unwrap();
-        let result = PostgreSQLTranslator::new()
-            .translate_with_prereqs(&parsed)
-            .unwrap();
-        let ast::Cmd::Stmt(ast::Stmt::CreateSequence {
-            if_not_exists,
-            conflicting_options,
-            ..
-        }) = result.cmd
-        else {
-            panic!("expected CREATE SEQUENCE, got {:?}", result.cmd)
-        };
-        assert!(if_not_exists);
-        assert!(conflicting_options);
+        for (sql, sqlstate, message) in [
+            (
+                "CREATE SEQUENCE IF NOT EXISTS s START 1 START 2",
+                SQLSTATE_SYNTAX_ERROR,
+                "conflicting or redundant options",
+            ),
+            (
+                "CREATE SEQUENCE IF NOT EXISTS s CACHE 0",
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "CACHE (0) must be greater than zero",
+            ),
+            (
+                "CREATE SEQUENCE IF NOT EXISTS s AS text",
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "sequence type must be smallint, integer, or bigint",
+            ),
+            (
+                "CREATE SEQUENCE IF NOT EXISTS s START 1.5",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "this START value in CREATE SEQUENCE is not supported",
+            ),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let result = PostgreSQLTranslator::new()
+                .translate_with_prereqs(&parsed)
+                .unwrap();
+            let ast::Cmd::Stmt(ast::Stmt::CreateSequence {
+                if_not_exists,
+                option_error,
+                ..
+            }) = result.cmd
+            else {
+                panic!("{sql}: expected CREATE SEQUENCE, got {:?}", result.cmd)
+            };
+            assert!(if_not_exists, "{sql}");
+            let error = option_error.expect(sql);
+            assert_eq!(error.code.as_deref(), Some(sqlstate), "{sql}");
+            assert_eq!(error.message, message, "{sql}");
+        }
     }
 
     #[test]
