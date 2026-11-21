@@ -2679,6 +2679,10 @@ pub async fn read_cdc_sequence_watermark<Ctx>(
     }
 }
 
+/// Writes the last synced change id. Creates the sync table if it is missing, but does not
+/// publish it to the schema cache shared by all connections: when the caller is inside a
+/// transaction, the table is not committed yet and other connections must not compile statements
+/// against it.
 pub async fn update_last_change_id<Ctx>(
     coro: &Coro<Ctx>,
     conn: &Arc<turso_core::Connection>,
@@ -2686,13 +2690,13 @@ pub async fn update_last_change_id<Ctx>(
     pull_gen: i64,
     change_id: i64,
 ) -> Result<()> {
+    if !has_table(coro, conn, TURSO_SYNC_TABLE_NAME).await? {
+        create_sync_last_change_id_table(conn)?;
+        tracing::info!("update_last_change_id(client_id={client_id}): initialized table");
+    }
     tracing::info!(
         "update_last_change_id(client_id={client_id}): pull_gen={pull_gen}, change_id={change_id}"
     );
-    if !has_table(coro, conn, TURSO_SYNC_TABLE_NAME).await? {
-        ensure_sync_last_change_id_table(coro, conn, client_id).await?;
-        tracing::info!("update_last_change_id(client_id={client_id}): initialized table");
-    }
     let mut select_stmt = conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID)?;
     select_stmt.bind_at(
         1.try_into().unwrap(),
@@ -2735,72 +2739,17 @@ pub async fn update_last_change_id<Ctx>(
 }
 
 /// Ensures the local high-water mark table exists and publishes schema changes.
-pub async fn ensure_sync_last_change_id_table<Ctx>(
-    coro: &Coro<Ctx>,
-    conn: &Arc<turso_core::Connection>,
-    client_id: &str,
-) -> Result<()> {
-    for attempt in 0..=2 {
-        match conn.execute(TURSO_SYNC_CREATE_TABLE) {
-            Ok(()) => {
-                conn.publish_schema_if_newer();
-                return Ok(());
-            }
-            Err(LimboError::ParseError(err)) if err.contains("already exists") => {
-                tracing::debug!(
-                    "update_last_change_id(client_id={client_id}): sync table already exists while initializing; refreshing schema"
-                );
-                conn.publish_schema_if_newer();
-                return Ok(());
-            }
-            Err(LimboError::SchemaUpdated) => {
-                tracing::debug!(
-                    "update_last_change_id(client_id={client_id}): schema updated while initializing sync table; refreshing schema"
-                );
-                force_reparse_schema_with_retry(conn)?;
-                publish_schema_after_external_restore(
-                    conn,
-                    "sync high-water mark table initialization",
-                )?;
-                if attempt == 2 {
-                    return Ok(());
-                }
-                match has_table(coro, conn, TURSO_SYNC_TABLE_NAME).await {
-                    Ok(true) => return Ok(()),
-                    Ok(false) => continue,
-                    Err(Error::TursoError(LimboError::SchemaUpdated)) => continue,
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(err) => return Err(err.into()),
-        }
-    }
-    Err(Error::DatabaseSyncEngineError(format!(
-        "failed to initialize sync high-water mark table after schema refresh: client_id={client_id}"
-    )))
-}
-
-fn force_reparse_schema_with_retry(conn: &Arc<turso_core::Connection>) -> Result<()> {
-    for attempt in 0..=2 {
-        match conn.force_reparse_schema() {
-            Ok(()) => return Ok(()),
-            Err(LimboError::SchemaUpdated) if attempt < 2 => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
+pub fn ensure_sync_last_change_id_table(conn: &Arc<turso_core::Connection>) -> Result<()> {
+    create_sync_last_change_id_table(conn)?;
+    conn.publish_schema_if_newer();
     Ok(())
 }
 
-fn publish_schema_after_external_restore(
-    conn: &Arc<turso_core::Connection>,
-    context: &str,
-) -> Result<()> {
-    conn.publish_schema_after_external_restore()
-        .map_err(|error| {
-            Error::DatabaseSyncEngineError(format!(
-                "failed to publish schema after {context}: {error}",
-            ))
-        })
+/// Creates the local high-water mark table if it is missing. Does not publish the schema to the
+/// cache shared by all connections. A schema error is returned to the caller.
+fn create_sync_last_change_id_table(conn: &Arc<turso_core::Connection>) -> Result<()> {
+    conn.execute(TURSO_SYNC_CREATE_TABLE)?;
+    Ok(())
 }
 
 pub async fn read_last_change_id<Ctx>(
@@ -5934,6 +5883,66 @@ mod tests {
         assert!(cdc_rows > after_second_high_water_mark);
     }
 
+    /// `ensure_sync_last_change_id_table` runs one `CREATE TABLE IF NOT EXISTS`. When another
+    /// connection has changed the schema since this connection last read it, core reprepares the
+    /// statement itself, so the caller needs no retry.
+    #[test]
+    fn ensure_sync_table_works_on_a_connection_with_a_stale_schema() {
+        let db_temp = NamedTempFile::new().unwrap();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open_file(
+            io.clone(),
+            db_temp.path().to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let stale = db.connect(&coro).await.unwrap();
+                let other = db.connect(&coro).await.unwrap();
+
+                // The sync table is created by another connection after `stale` read its schema.
+                assert!(
+                    !super::has_table(&coro, &stale, super::TURSO_SYNC_TABLE_NAME)
+                        .await
+                        .unwrap()
+                );
+                other.execute(super::TURSO_SYNC_CREATE_TABLE).unwrap();
+                super::ensure_sync_last_change_id_table(&stale).unwrap();
+                update_last_change_id(&coro, &stale, "client-a", 1, 7)
+                    .await
+                    .unwrap();
+
+                // The sync table is dropped by another connection after `stale` read its schema.
+                stale
+                    .execute("SELECT COUNT(*) FROM turso_sync_last_change_id")
+                    .unwrap();
+                other
+                    .execute("DROP TABLE turso_sync_last_change_id")
+                    .unwrap();
+                super::ensure_sync_last_change_id_table(&stale).unwrap();
+                update_last_change_id(&coro, &stale, "client-a", 2, 9)
+                    .await
+                    .unwrap();
+
+                super::read_last_change_id(&coro, &other, "client-a")
+                    .await
+                    .unwrap()
+            }
+        });
+        let last_change_id = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+        assert_eq!(last_change_id, (2, Some(9)));
+    }
+
     #[test]
     fn sql_table_name_filter_agrees_with_is_logically_replayable_table() {
         let names = [
@@ -6009,6 +6018,7 @@ mod tests {
             pull_bytes_threshold: None,
             pull_parallel_requests: None,
             logical_mvcc_pull: Some(true),
+            busy_timeout: crate::database_sync_engine::DEFAULT_SYNC_BUSY_TIMEOUT,
         }
     }
 

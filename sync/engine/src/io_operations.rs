@@ -29,6 +29,7 @@ impl IoOperations for Arc<dyn turso_core::IO> {
             cdc_table: None,
             cdc_mode: Some(if capture { "full" } else { "off" }.to_string()),
             disable_auto_checkpoint: false,
+            busy_timeout: crate::database_sync_engine::DEFAULT_SYNC_BUSY_TIMEOUT,
         };
         tracing::debug!("initialize database tape connection: path={}", path);
         Ok(DatabaseTape::new_with_opts(clean, opts))

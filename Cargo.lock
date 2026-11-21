@@ -7623,15 +7623,19 @@ name = "turso_sync_sdk_kit"
 version = "0.9.0-pre.6"
 dependencies = [
  "bindgen 0.69.5",
+ "bytes",
  "env_logger",
  "genawaiter",
  "parking_lot",
+ "prost 0.14.1",
+ "tempfile",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "turso_core",
  "turso_sdk_kit",
  "turso_sdk_kit_macros",
+ "turso_sqlite",
  "turso_sync_engine",
 ]
 

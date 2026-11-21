@@ -26,19 +26,22 @@ pub struct DatabaseTape {
     pragma_query: String,
     cdc_version: std::sync::RwLock<Option<turso_core::CdcVersion>>,
     disable_auto_checkpoint: bool,
+    busy_timeout: std::time::Duration,
 }
 
 const DEFAULT_CDC_TABLE_NAME: &str = "turso_cdc";
 const DEFAULT_CDC_MODE: &str = "full";
 const DEFAULT_CHANGES_BATCH_SIZE: usize = 100;
 pub const CDC_PRAGMA_NAME: &str = "capture_data_changes_conn";
-const CDC_PRAGMA_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct DatabaseTapeOpts {
     pub cdc_table: Option<String>,
     pub cdc_mode: Option<String>,
     pub disable_auto_checkpoint: bool,
+    /// How long the tape's connections wait for a lock held by another connection before
+    /// they fail with `Busy`.
+    pub busy_timeout: std::time::Duration,
 }
 
 /// Async, coro-threaded counterpart to
@@ -87,9 +90,7 @@ pub(crate) async fn run_stmt_once<'a, Ctx>(
                     "statement was interrupted".to_string(),
                 ))
             }
-            StepResult::Busy => {
-                return Err(Error::DatabaseTapeError("database is busy".to_string()))
-            }
+            StepResult::Busy => return Err(LimboError::Busy.into()),
             StepResult::Row => return Ok(Some(stmt.row().unwrap())),
         }
     }
@@ -121,25 +122,21 @@ pub(crate) async fn exec_stmt<Ctx>(
     coro: &Coro<Ctx>,
     stmt: &mut turso_core::Statement,
 ) -> Result<()> {
-    loop {
-        match stmt.step()? {
-            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
-                coro.yield_(SyncEngineIoResult::IO).await?;
-            }
-            StepResult::Done => {
-                return Ok(());
-            }
-            StepResult::Interrupt => {
-                return Err(Error::DatabaseTapeError(
-                    "statement was interrupted".to_string(),
-                ))
-            }
-            StepResult::Busy => {
-                return Err(Error::DatabaseTapeError("database is busy".to_string()))
-            }
-            StepResult::Row => panic!("statement should not return any rows"),
-        }
+    if run_stmt_once(coro, stmt).await?.is_some() {
+        panic!("statement should not return any rows");
     }
+    Ok(())
+}
+
+/// Runs `BEGIN IMMEDIATE`, returning control to the caller while it waits for the busy
+/// timeout. `Connection::execute` would block the thread for the whole wait, so an app
+/// on the same thread could not finish the transaction that holds the lock.
+pub(crate) async fn begin_immediate<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+) -> Result<()> {
+    let mut stmt = conn.prepare("BEGIN IMMEDIATE")?;
+    exec_stmt(coro, &mut stmt).await
 }
 
 impl DatabaseTape {
@@ -148,6 +145,7 @@ impl DatabaseTape {
             cdc_table: None,
             cdc_mode: None,
             disable_auto_checkpoint: false,
+            busy_timeout: crate::database_sync_engine::DEFAULT_SYNC_BUSY_TIMEOUT,
         };
         Self::new_with_opts(database, opts)
     }
@@ -162,7 +160,11 @@ impl DatabaseTape {
             pragma_query,
             cdc_version: std::sync::RwLock::new(None),
             disable_auto_checkpoint: opts.disable_auto_checkpoint,
+            busy_timeout: opts.busy_timeout,
         }
+    }
+    pub(crate) fn mvcc_enabled(&self) -> bool {
+        self.inner.mvcc_enabled()
     }
     pub(crate) fn connect_untracked(&self) -> Result<Arc<turso_core::Connection>> {
         let connection = self
@@ -171,6 +173,7 @@ impl DatabaseTape {
         if self.disable_auto_checkpoint {
             connection.wal_auto_actions_disable();
         }
+        connection.set_busy_timeout(self.busy_timeout);
         Ok(connection)
     }
     pub async fn connect<Ctx>(&self, coro: &Coro<Ctx>) -> Result<Arc<turso_core::Connection>> {
@@ -183,7 +186,7 @@ impl DatabaseTape {
         tracing::debug!("set '{CDC_PRAGMA_NAME}' for new connection");
         // The CDC pragma takes a write transaction, so it must wait for other writers
         // instead of failing a sync operation with "database is busy".
-        connection.set_busy_timeout(CDC_PRAGMA_BUSY_TIMEOUT);
+        connection.set_busy_timeout(self.busy_timeout);
         let mut stmt = connection.prepare(&self.pragma_query)?;
         run_stmt_ignore_rows(coro, &mut stmt).await?;
         drop(stmt);
@@ -268,7 +271,7 @@ impl DatabaseTape {
     pub async fn start_wal_session<Ctx>(&self, coro: &Coro<Ctx>) -> Result<DatabaseWalSession> {
         let conn = self.connect(coro).await?;
         let mut wal_session = WalSession::new(conn);
-        wal_session.begin()?;
+        wal_session.begin(coro, self.busy_timeout).await?;
         DatabaseWalSession::new(coro, wal_session).await
     }
 
@@ -280,7 +283,7 @@ impl DatabaseTape {
     ) -> Result<DatabaseReplaySession> {
         tracing::debug!("opening replay session");
         let conn = self.connect(coro).await?;
-        conn.execute("BEGIN IMMEDIATE")?;
+        begin_immediate(coro, &conn).await?;
         Ok(DatabaseReplaySession::new(conn, opts))
     }
 }
@@ -740,7 +743,7 @@ impl DatabaseReplaySession {
             DatabaseTapeOperation::RowChange(change) => {
                 if !self.in_txn {
                     tracing::trace!("replay: start txn for replaying changes");
-                    self.conn.execute("BEGIN IMMEDIATE")?;
+                    begin_immediate(coro, &self.conn).await?;
                     self.in_txn = true;
                 }
                 let table = &change.table_name;

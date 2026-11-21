@@ -225,6 +225,7 @@ pub fn py_turso_sync_new(
         pull_bytes_threshold: sync_config.pull_bytes_threshold,
         pull_parallel_requests: None,
         logical_mvcc_pull: sync_config.logical_mvcc_pull,
+        busy_timeout_ms: None,
     };
     let database =
         TursoDatabaseSync::<Vec<u8>>::new(db_config, sync_config).map_err(turso_error_to_py_err)?;

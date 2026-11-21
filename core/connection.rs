@@ -1256,12 +1256,34 @@ impl Connection {
             .store(true, Ordering::SeqCst);
     }
 
+    /// Reads the schema cookie that is committed in the database file. Must be called outside of
+    /// any transaction, because it starts a read transaction by itself.
+    fn read_committed_schema_cookie(&self) -> Result<u32> {
+        if self.mv_store().is_some() {
+            return self.read_current_schema_cookie().or_else(|err| match err {
+                LimboError::Page1NotAlloc => Ok(0),
+                other => Err(other),
+            });
+        }
+        let pager = self.pager.load().clone();
+        pager.begin_read_tx()?;
+        let cookie = pager
+            .io
+            .block(|| pager.with_header(|header| header.schema_cookie));
+        pager.end_read_tx();
+        match cookie {
+            Ok(cookie) => Ok(cookie.get()),
+            // A fresh database has no page 1, so its schema version is 0.
+            Err(LimboError::Page1NotAlloc) => Ok(0),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Parse schema from scratch if version of schema for the connection differs from the schema cookie in the root page.
     /// This function must be called outside of any transaction because internally it will start transaction session by itself.
     /// In multi-process mode, this is the only way to discover schema changes made by other processes.
     pub fn maybe_reparse_schema(self: &Arc<Connection>) -> Result<()> {
         let pager = self.pager.load().clone();
-        let mv_store = self.mv_store();
 
         // maybe_reparse_schema must be called outside any explicit transaction
         // because it starts its own read transaction to load a fresh view of
@@ -1279,32 +1301,7 @@ impl Connection {
             pager.set_schema_cookie(None);
         }
 
-        let on_disk_schema_version = if mv_store.as_ref().is_some() {
-            self.read_current_schema_cookie().or_else(|err| match err {
-                LimboError::Page1NotAlloc => Ok(0),
-                other => Err(other),
-            })?
-        } else {
-            // first, quickly read schema_version from the root page in order to check if schema changed
-            pager.begin_read_tx()?;
-            let on_disk_schema_version = pager
-                .io
-                .block(|| pager.with_header(|header| header.schema_cookie));
-
-            let on_disk_schema_version = match on_disk_schema_version {
-                Ok(db_schema_version) => db_schema_version.get(),
-                Err(LimboError::Page1NotAlloc) => {
-                    // this means this is a fresh db, so return a schema version of 0
-                    0
-                }
-                Err(err) => {
-                    pager.end_read_tx();
-                    return Err(err);
-                }
-            };
-            pager.end_read_tx();
-            on_disk_schema_version
-        };
+        let on_disk_schema_version = self.read_committed_schema_cookie()?;
 
         let db_schema_version = self.db.schema.lock().schema_version;
         tracing::debug!(
@@ -2351,6 +2348,45 @@ impl Connection {
             *current = schema.as_ref().try_clone()?;
             Ok(())
         })?;
+        Ok(())
+    }
+
+    /// Like [`Self::publish_schema_after_external_restore`], for a caller that published its
+    /// last commit and released the write lock before it calls this.
+    ///
+    /// Another connection can commit DDL after that commit. Replacing the shared schema with this
+    /// connection's schema would then hide the other connection's change from every connection
+    /// that opens later, until something forces a reparse. So this reparses first when the
+    /// committed schema cookie differs from the version of this connection's schema. It replaces
+    /// the shared schema only if nothing published a schema since the cookie was read. A commit
+    /// that lands after the replace publishes its own, newer schema.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn publish_schema_after_external_restore_if_current(self: &Arc<Self>) -> Result<()> {
+        const ATTEMPTS: usize = 8;
+        for _ in 0..ATTEMPTS {
+            if self.get_tx_state() != TransactionState::None {
+                return Err(LimboError::Busy);
+            }
+            if self.get_mv_tx().is_some() || self.next_attached_mv_tx().is_some() {
+                return Err(LimboError::Busy);
+            }
+
+            let shared_before = self.db.clone_schema();
+            let schema = self.schema.read().clone();
+            if self.read_committed_schema_cookie()? != schema.schema_version {
+                self.force_reparse_schema_without_publish()?;
+                continue;
+            }
+            let schema = Arc::new(schema.as_ref().try_clone()?);
+            if self.db.replace_schema_if_unchanged(&shared_before, schema) {
+                return Ok(());
+            }
+        }
+        // Other connections kept committing and publishing schemas. Their schemas are newer
+        // than this connection's, so leaving the shared schema alone is correct.
+        tracing::warn!(
+            "schema publish skipped: the shared schema kept changing during {ATTEMPTS} attempts"
+        );
         Ok(())
     }
 

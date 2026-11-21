@@ -426,6 +426,7 @@ impl Builder {
             pull_bytes_threshold: self.pull_bytes_threshold,
             pull_parallel_requests: self.pull_parallel_requests,
             logical_mvcc_pull: self.logical_mvcc_pull,
+            busy_timeout_ms: None,
         };
 
         // Create sync wrapper.

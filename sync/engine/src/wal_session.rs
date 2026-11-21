@@ -1,8 +1,15 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use turso_core::types::WalFrameInfo;
+use turso_core::{
+    busy::{BusyHandler, BusyHandlerState},
+    types::WalFrameInfo,
+    LimboError,
+};
 
-use crate::Result;
+use crate::{
+    types::{Coro, SyncEngineIoResult},
+    Result,
+};
 
 pub struct WalSession {
     conn: Arc<turso_core::Connection>,
@@ -22,9 +29,31 @@ impl WalSession {
     pub fn conn(&self) -> &Arc<turso_core::Connection> {
         &self.conn
     }
-    pub fn begin(&mut self) -> Result<()> {
+
+    /// Starts the WAL transaction. While another connection holds the write lock
+    /// (`Busy`) or committed after our read snapshot was taken (`BusySnapshot`), tries again
+    /// with the same growing delays as a statement's busy timeout. Between attempts it returns
+    /// to the caller, so an app on the same thread can finish the transaction that holds
+    /// the lock. After `busy_timeout` it fails with `Busy`.
+    pub async fn begin<Ctx>(&mut self, coro: &Coro<Ctx>, busy_timeout: Duration) -> Result<()> {
         assert!(!self.in_txn);
-        self.conn.wal_insert_begin()?;
+        let io = self.conn.get_pager().io.clone();
+        let handler = BusyHandler::Timeout(busy_timeout);
+        let mut busy_state = BusyHandlerState::new(io.current_time_monotonic());
+        loop {
+            match self.conn.wal_insert_begin() {
+                Ok(()) => break,
+                Err(LimboError::Busy | LimboError::BusySnapshot) => {
+                    if !busy_state.invoke(&handler, io.current_time_monotonic()) {
+                        return Err(LimboError::Busy.into());
+                    }
+                    while io.current_time_monotonic() < busy_state.timeout() {
+                        coro.yield_(SyncEngineIoResult::IO).await?;
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         self.in_txn = true;
         Ok(())
     }
@@ -215,8 +244,19 @@ mod tests {
         conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
             .unwrap();
 
-        let mut session = WalSession::new(conn.clone());
-        session.begin().unwrap();
+        let mut begin = genawaiter::sync::Gen::new({
+            let conn = conn.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let mut session = WalSession::new(conn);
+                session.begin(&coro, Duration::ZERO).await?;
+                Result::Ok(session)
+            }
+        });
+        let mut session = match begin.resume_with(Ok(())) {
+            genawaiter::GeneratorState::Complete(result) => result.unwrap(),
+            genawaiter::GeneratorState::Yielded(..) => panic!("begin must not wait without a lock"),
+        };
         conn.execute("INSERT INTO t VALUES (1, randomblob(8192))")
             .unwrap();
 
