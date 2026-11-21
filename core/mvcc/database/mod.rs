@@ -2267,77 +2267,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
     ) -> Result<()> {
         // Check for conflicts - iterate in reverse for faster early termination
         for version in row_versions.iter().rev() {
-            // A row that we are trying to commit was deleted/updated by another
-            // committed transaction after our begin timestamp. Even if that
-            // version is now "ended", this is still a write-write conflict.
-            if let Some(TxTimestampOrID::Timestamp(end_ts)) = version.end() {
-                turso_assert!(
-                    end_ts != tx.begin_ts,
-                    "committed end_ts and begin_ts cannot be equal: txn timestamps are strictly monotonic"
-                );
-                if end_ts > tx.begin_ts {
-                    return Err(LimboError::WriteWriteConflict);
-                }
-            }
-
-            // B-tree tombstones (begin: None, end: TxID) act as write locks.
-            // When another transaction has created a tombstone to delete a
-            // B-tree-resident row, that tombstone is effectively a write lock
-            // on the row — same as Hekaton's End field. We must detect this
-            // as a write-write conflict using the same state-based logic used
-            // for begin: TxID checks below.
-            if version.begin().is_none() {
-                // Committed tombstones (end: Timestamp) are already handled by
-                // the check above at lines 1070-1074. Here we only need to check
-                // in-flight tombstones (end: TxID) from other transactions.
-                if let Some(TxTimestampOrID::TxID(other_tx_id)) = version.end() {
-                    if other_tx_id != self.tx_id {
-                        // The other transaction may already have moved from
-                        // `txs` to `finalized_tx_states`; consult both
-                        // instead of panicking on the race.
-                        let other_state = lookup_tx_state(
-                            &mvcc_store.txs,
-                            &mvcc_store.finalized_tx_states,
-                            other_tx_id,
-                        );
-                        match other_state {
-                            Some(TransactionState::Committed(_)) => {
-                                return Err(LimboError::WriteWriteConflict);
-                            }
-                            Some(TransactionState::Preparing(other_end_ts)) => {
-                                if other_end_ts < end_ts {
-                                    return Err(LimboError::WriteWriteConflict);
-                                }
-                            }
-                            Some(TransactionState::Active) => {}
-                            Some(TransactionState::Aborted | TransactionState::Terminated)
-                            | None => {}
-                        }
-                    }
-                }
-                // Tombstones have no meaningful begin field — skip begin checks
-                continue;
-            }
-
             match version.end() {
-                Some(TxTimestampOrID::Timestamp(end_ts)) => {
-                    // Committed deletion. If end_ts > our begin_ts, the conflict
-                    // would have been already caught earlier when we iterate through
-                    // the row versions in reverse. If end_ts < our
-                    // begin_ts, the deletion predates our snapshot — no conflict.
+                Some(TxTimestampOrID::Timestamp(version_end_ts)) => {
+                    // A row that we are trying to commit was deleted/updated by another
+                    // committed transaction after our begin timestamp. Even if that
+                    // version is now "ended", this is still a write-write conflict.
+                    // If the deletion predates our snapshot, the version is not live.
                     turso_assert!(
-                        end_ts < tx.begin_ts,
-                        "row version's end_ts cannot be greater than txns begin_ts"
+                        version_end_ts != tx.begin_ts,
+                        "committed end_ts and begin_ts cannot be equal: txn timestamps are strictly monotonic"
                     );
+                    if version_end_ts > tx.begin_ts {
+                        return Err(LimboError::WriteWriteConflict);
+                    }
                     continue;
                 }
                 Some(TxTimestampOrID::TxID(end_tx_id)) => {
-                    // Deletion not yet finalized; the deleting transaction may still be in Preparing.
                     if end_tx_id == self.tx_id {
                         // We deleted this version ourselves, so it cannot conflict with our commit.
                         continue;
                     }
-
+                    // The deleting transaction may not have replaced its TxID with
+                    // its end timestamp yet. Resolve it the same way as `is_end_visible`.
                     match lookup_tx_state(
                         &mvcc_store.txs,
                         &mvcc_store.finalized_tx_states,
@@ -2353,8 +2304,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                             }
                             continue;
                         }
+                        // Hekaton speculative ignore: the deletion is in our snapshot
+                        // if the deleting transaction commits, so we commit only if it does.
+                        Some(TransactionState::Preparing(other_end_ts))
+                            if other_end_ts < tx.begin_ts =>
+                        {
+                            register_commit_dependency(&mvcc_store.txs, tx, end_tx_id);
+                            continue;
+                        }
+                        Some(TransactionState::Preparing(other_end_ts)) => {
+                            // The deletion is not in our snapshot. A B-tree tombstone
+                            // (begin: None) acts as a write lock on a B-tree-resident row,
+                            // same as Hekaton's End field: lower end_ts wins. Other
+                            // versions fall through to check begin for conflicts.
+                            if version.begin().is_none() && other_end_ts < end_ts {
+                                return Err(LimboError::WriteWriteConflict);
+                            }
+                        }
                         _ => {
-                            // Deleting tx is Active, Preparing, Aborted, or gone.
+                            // Deleting tx is Active, Aborted, or gone.
                             // The deletion may not stick, so this version may still be live.
                             // Fall through to check begin for conflicts.
                         }
@@ -2417,7 +2385,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     return Err(LimboError::WriteWriteConflict);
                 }
                 None => {
-                    // Invalid version
+                    // B-tree tombstone: no begin to check.
                 }
             }
         }
