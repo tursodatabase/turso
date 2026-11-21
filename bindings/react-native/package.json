@@ -36,7 +36,8 @@
     "build": "bob build",
     "build:rust:ios": "make ios",
     "build:rust:android": "make android",
-    "prepare": "bob build"
+    "prepare": "bob build",
+    "test:encryption": "vitest run src/__tests__/encryption.test.ts"
   },
   "keywords": [
     "react-native",
@@ -68,7 +69,8 @@
     "react": "^18.2.0",
     "react-native": "^0.76.0",
     "react-native-builder-bob": "^0.44.1",
-    "typescript": "^5.3.0"
+    "typescript": "^5.3.0",
+    "vitest": "^4.1.11"
   },
   "dependencies": {
     "@babel/runtime": "^7.25.0"
