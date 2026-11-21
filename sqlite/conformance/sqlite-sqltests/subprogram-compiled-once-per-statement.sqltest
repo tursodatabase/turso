@@ -1,0 +1,138 @@
+@database :memory:
+
+# A statement compiles each trigger and each foreign-key action once and calls
+# that program from every place it fires, including inside other triggers and
+# actions. Turso used to compile a new copy at every place, so a table with nine
+# triggers whose bodies fire each other took minutes to compile one INSERT.
+
+test triggers-that-fire-each-other-compile-once {
+    CREATE TABLE t(a INTEGER, b INTEGER);
+    CREATE TRIGGER tr_ins_0 BEFORE INSERT ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    CREATE TRIGGER tr_del_0 BEFORE DELETE ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    CREATE TRIGGER tr_upd_0 BEFORE UPDATE ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    CREATE TRIGGER tr_ins_1 BEFORE INSERT ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    CREATE TRIGGER tr_del_1 BEFORE DELETE ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    CREATE TRIGGER tr_upd_1 BEFORE UPDATE ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    CREATE TRIGGER tr_ins_2 BEFORE INSERT ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    CREATE TRIGGER tr_del_2 BEFORE DELETE ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    CREATE TRIGGER tr_upd_2 BEFORE UPDATE ON t BEGIN INSERT INTO t VALUES(1,1); DELETE FROM t WHERE a=-1; UPDATE t SET b=b WHERE a=-1; END;
+    INSERT INTO t VALUES(5,5);
+    SELECT count(*) FROM t;
+}
+expect {
+    16
+}
+
+# The INSERT fires tr_t first. tr_a is compiled inside tr_t, where tr_a's own
+# call to tr_t is recursive. The INSERT then fires tr_a directly and reuses that
+# program, and there tr_a must fire tr_t, so a trigger that is already running
+# is skipped when the program runs, not when it is compiled.
+test trigger-program-compiled-inside-another-trigger-fires-it-when-reused {
+    CREATE TABLE t(a);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr_t AFTER INSERT ON t WHEN NEW.a < 3 BEGIN INSERT INTO log VALUES('T' || NEW.a); INSERT INTO t VALUES(NEW.a + 1); END;
+    CREATE TRIGGER tr_a AFTER INSERT ON t WHEN NEW.a < 3 BEGIN INSERT INTO log VALUES('A' || NEW.a); INSERT INTO t VALUES(NEW.a + 1); END;
+    INSERT INTO t VALUES(0);
+    SELECT group_concat(x, ',') FROM log;
+    SELECT group_concat(a, ',') FROM t;
+}
+expect {
+    A0,T1,T0,A1
+    0,1,2,1,2
+}
+
+# A trigger that is already running does not fire again, and its WHEN clause
+# is not evaluated for that firing. Here the WHEN clause would fail for the
+# row the trigger inserts. Turso used to evaluate it before skipping the
+# firing, so the INSERT failed.
+test when-clause-of-trigger-that-fires-itself-is-not-evaluated {
+    CREATE TABLE t(a, b);
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN json(new.b) IS NOT NULL BEGIN INSERT INTO t VALUES(new.a + 1, 'notjson'); END;
+    INSERT INTO t VALUES(1, '{}');
+    SELECT * FROM t;
+}
+expect {
+    1|{}
+    2|notjson
+}
+
+# The same through another table's trigger: tr_t fires tr_u, which inserts
+# into t again.
+test when-clause-of-trigger-fired-again-through-another-trigger-is-not-evaluated {
+    CREATE TABLE t(a);
+    CREATE TABLE u(a);
+    CREATE TRIGGER tr_t BEFORE INSERT ON t WHEN abs(new.a) >= 0 BEGIN INSERT INTO u VALUES(new.a); END;
+    CREATE TRIGGER tr_u AFTER INSERT ON u BEGIN INSERT INTO t VALUES(-9223372036854775808); END;
+    INSERT INTO t VALUES(1);
+    SELECT a FROM t ORDER BY a;
+    SELECT a FROM u;
+}
+expect {
+    -9223372036854775808
+    1
+    1
+}
+
+setup two_tables_whose_triggers_fire_each_other {
+    CREATE TABLE p(a INTEGER);
+    CREATE TABLE q(a INTEGER);
+    CREATE TRIGGER p_ai AFTER INSERT ON p BEGIN INSERT INTO q VALUES(NEW.a); DELETE FROM q WHERE a = NEW.a; END;
+    CREATE TRIGGER q_ai AFTER INSERT ON q BEGIN INSERT INTO p VALUES(NEW.a); END;
+    CREATE TRIGGER q_ad AFTER DELETE ON q BEGIN INSERT INTO p VALUES(OLD.a); END;
+}
+
+# Each trigger appears as one subprogram. p_ai's body calls itself through
+# q_ai and q_ad; those calls run the program being compiled and are skipped
+# when they run.
+@skip-if mvcc "mvcc has different root pages"
+@setup two_tables_whose_triggers_fire_each_other
+snapshot triggers-that-fire-each-other-are-one-subprogram-each {
+    INSERT INTO p VALUES(1);
+}
+
+# Each cascade on t runs an UPDATE or DELETE on t, which fires all eight
+# actions again.
+test fk-actions-that-fire-each-other-compile-once {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        c1 INTEGER REFERENCES t(id) ON DELETE CASCADE ON UPDATE CASCADE,
+        c2 INTEGER REFERENCES t(id) ON DELETE CASCADE ON UPDATE CASCADE,
+        c3 INTEGER REFERENCES t(id) ON DELETE CASCADE ON UPDATE CASCADE,
+        c4 INTEGER REFERENCES t(id) ON DELETE CASCADE ON UPDATE CASCADE,
+        c5 INTEGER REFERENCES t(id) ON DELETE CASCADE ON UPDATE CASCADE,
+        c6 INTEGER REFERENCES t(id) ON DELETE CASCADE ON UPDATE CASCADE,
+        c7 INTEGER REFERENCES t(id) ON DELETE CASCADE ON UPDATE CASCADE,
+        c8 INTEGER REFERENCES t(id) ON DELETE CASCADE ON UPDATE CASCADE
+    );
+    INSERT INTO t(id) VALUES(1);
+    INSERT INTO t(id, c1) VALUES(2, 1);
+    INSERT INTO t(id, c4, c8) VALUES(3, 1, 2);
+    INSERT INTO t(id, c8) VALUES(4, 3);
+    INSERT INTO t(id) VALUES(5);
+    UPDATE t SET id = 10 WHERE id = 1;
+    SELECT id, c1, c4, c8 FROM t ORDER BY id;
+    DELETE FROM t WHERE id = 10;
+    SELECT id FROM t;
+}
+expect {
+    2|10||
+    3||10|2
+    4|||3
+    5|||
+    10|||
+    5
+}
+
+setup table_with_two_self_cascades {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER REFERENCES t(id) ON DELETE CASCADE, b INTEGER REFERENCES t(id) ON DELETE CASCADE);
+}
+
+# Each action appears as one subprogram. The action for b is compiled inside
+# the action for a, and the DELETE calls that same program.
+@skip-if mvcc "mvcc has different root pages"
+@setup table_with_two_self_cascades
+snapshot fk-actions-that-fire-each-other-are-one-subprogram-each {
+    DELETE FROM t WHERE id = 1;
+}

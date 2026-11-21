@@ -1,0 +1,75 @@
+---
+source: subprogram-compiled-once-per-statement.sqltest
+expression: DELETE FROM t WHERE id = 1;
+info:
+  statement_type: DELETE
+  tables:
+  - t
+  setup_blocks:
+  - table_with_two_self_cascades
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
+
+BYTECODE
+addr  opcode           p1  p2  p3  p4                 p5  comment
+   0  Init              0  10   0                      0  Start at 10
+   1  OpenWrite         0   2   0                      0  root=2; iDb=0
+   2  SeekRowid         0   1   9                      0  if (r[1]!=cursor 0 for table t.rowid) goto 9
+   3  RowId             0   2   0                      0  r[2]=t.rowid
+   4  RowId             0   3   0                      0  r[3]=t.rowid
+   5      RowId         0   4   0                      0  r[4]=t.rowid
+   6      Delete        0   0   0  t                   0
+   7      Program       3   8   1  fk cascade delete   0  subprogram=fk cascade delete
+   8      Program       4   9   1  fk cascade delete   0  subprogram=fk cascade delete
+   9      Halt          0   0   0                      0
+  10      Transaction   0   2   1                      0  iDb=0 tx_mode=Write
+  11      Integer       1   1   0                      0  r[1]=1
+  12      Goto          0   1   0                      0
+   0      Init          0   1   0                      0  Start at 1
+   1      OpenWrite     0   2   0                      0  root=2; iDb=0
+   2      Null          0   1   0                      0  r[1]=NULL
+   3      OpenRead      0   2   0  k(3,B,B,B)          0  table=t, root=2, iDb=0
+   4      Rewind        0  11   0                      0  Rewind table t
+   5      Variable      1   4   0                      0  r[4]=parameter(1)
+   6      Column        0   1   5                      0  r[5]=t.a
+   7      Ne            4   5  10  Binary              0  if r[4]!=r[5] goto 10
+   8      RowId         0   2   0                      0  r[2]=t.rowid
+   9      RowSetAdd     1   2   0                      0
+  10    Next            0   5   0                      1
+  11    Close           0   0   0                      0
+  12    OpenWrite       0   2   0                      0  root=2; iDb=0
+  13    RowSetRead      1  22   6                      0
+  14    NotExists       0  21   6                      0
+  15    NotExists       0  21   6                      0
+  16    RowId           0   7   0                      0  r[7]=t.rowid
+  17    RowId           0   8   0                      0  r[8]=t.rowid
+  18    Delete          0   0   0  t                   0
+  19    Program         7  20   1  fk cascade delete   0  subprogram=fk cascade delete
+  20    Program         8  21   1  fk cascade delete   0  subprogram=fk cascade delete
+  21    Goto            0  13   0                      0
+  22    Halt            0   0   0  fk action           0
+   0    Init            0   1   0                      0  Start at 1
+   1    OpenWrite       0   2   0                      0  root=2; iDb=0
+   2    Null            0   1   0                      0  r[1]=NULL
+   3    OpenRead        0   2   0  k(3,B,B,B)          0  table=t, root=2, iDb=0
+   4    Rewind          0  11   0                      0  Rewind table t
+   5    Variable        1   4   0                      0  r[4]=parameter(1)
+   6    Column          0   2   5                      0  r[5]=t.b
+   7    Ne              4   5  10  Binary              0  if r[4]!=r[5] goto 10
+   8    RowId           0   2   0                      0  r[2]=t.rowid
+   9    RowSetAdd       1   2   0                      0
+  10  Next              0   5   0                      1
+  11  Close             0   0   0                      0
+  12  OpenWrite         0   2   0                      0  root=2; iDb=0
+  13  RowSetRead        1  22   6                      0
+  14  NotExists         0  21   6                      0
+  15  NotExists         0  21   6                      0
+  16  RowId             0   7   0                      0  r[7]=t.rowid
+  17  RowId             0   8   0                      0  r[8]=t.rowid
+  18  Delete            0   0   0  t                   0
+  19  Program           7  20   1  fk cascade delete   0  subprogram=fk cascade delete
+  20  Program           8  21   1  fk cascade delete   0  subprogram=fk cascade delete
+  21  Goto              0  13   0                      0
+  22  Halt              0   0   0  fk action           0

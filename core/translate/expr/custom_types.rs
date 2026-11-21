@@ -443,14 +443,14 @@ fn untyped_operands_read_as(
 
 /// Whether `expr` takes its type from the value it is compared with: a string
 /// literal, or a parameter. A parameter that stands for a column, such as a
-/// foreign key's parent key, carries the column's type or collation and holds
-/// the column's value. Parentheses don't change this: `('10:00')` is a string
+/// foreign key's parent key, carries the column's type or collation, or says it
+/// is a rowid, and holds the column's value. Parentheses don't change this: `('10:00')` is a string
 /// literal too.
 fn is_untyped_operand(expr: &ast::Expr) -> Result<bool> {
     Ok(match unwrap_parens(expr)? {
         ast::Expr::Literal(ast::Literal::String(_)) => true,
         ast::Expr::Variable(variable) => {
-            variable.custom_type.is_none() && variable.col_collation.is_none()
+            variable.custom_type.is_none() && variable.col_collation.is_none() && !variable.is_rowid
         }
         _ => false,
     })
