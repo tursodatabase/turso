@@ -634,7 +634,9 @@ expect error {
     new row violates row-level security policy for table "rw_docs_26"
 }
 
-test insert-on-conflict-do-update-with-where-skips-the-row-before-checking-it {
+# As in PostgreSQL, the conflicting row is checked before the WHERE of DO
+# UPDATE, so a WHERE that is false does not skip a row the role may not update.
+test insert-on-conflict-do-update-checks-the-row-before-its-where {
     CREATE ROLE rw_alice_27;
     CREATE TABLE rw_docs_27 (id INT PRIMARY KEY, owner TEXT, n INT);
     INSERT INTO rw_docs_27 VALUES (1, 'someone else', 1);
@@ -646,10 +648,10 @@ test insert-on-conflict-do-update-with-where-skips-the-row-before-checking-it {
     SET ROLE rw_alice_27;
     INSERT INTO rw_docs_27 VALUES (1, 'rw_alice_27', 10)
         ON CONFLICT (id) DO UPDATE SET n = excluded.n WHERE rw_docs_27.n > 5;
-    SELECT id, owner, n FROM rw_docs_27;
 }
-expect {
-    1|someone else|1
+@sqlstate 42501
+expect error {
+    new row violates row-level security policy \(USING expression\) for table "rw_docs_27"
 }
 
 test insert-on-conflict-do-nothing-skips-a-row-the-policies-hide {
