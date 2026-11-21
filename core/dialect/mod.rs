@@ -38,7 +38,7 @@ use crate::ast::{self, Cmd, CreateTableBody, IdentityKind, Privilege, QualifiedN
 use crate::{
     function::ScalarFunc,
     namespace::NamespaceId,
-    schema::{BTreeTable, Schema, SchemaBuilder},
+    schema::{BTreeTable, Schema, SchemaBuilder, TypeDef},
     security::{policy::RowPolicy, roles::RoleId},
     vdbe::Register,
     Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value,
@@ -702,6 +702,19 @@ pub trait Dialect: Send + Sync + 'static {
     fn undefined_operator_error(&self, op: &str, operand_types: &[String]) -> LimboError {
         LimboError::ParseError(undefined_operator_message(op, operand_types))
     }
+
+    /// Decides a cast of `operand` to the type `target`, as written. `source`
+    /// gives the type of the operand, and is only called by a dialect that
+    /// needs it.
+    fn apply_cast(
+        &self,
+        _operand: &ast::Expr,
+        _source: &dyn Fn() -> CastSource,
+        _target: &TypeRef,
+        _context: CastContext,
+    ) -> Result<CastDecision> {
+        Ok(CastDecision::EngineRules)
+    }
 }
 
 /// The message of the default [Dialect::undefined_operator_error].
@@ -797,6 +810,66 @@ impl EngineType {
             Self::Blob => "BLOB",
         }
     }
+}
+
+/// Where a cast is written, from the narrowest to the widest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CastContext {
+    Implicit,
+    Assignment,
+    Explicit,
+}
+
+/// What is known about the type of a cast operand.
+#[derive(Debug, Clone)]
+pub enum CastSource {
+    /// A string literal or a parameter. Its type comes from where it is used.
+    Untyped,
+    Typed(TypeRef),
+    /// A value that nothing declares a type for, such as NULL.
+    Unnamed,
+}
+
+/// A type in a cast: the type of the operand, or the target.
+#[derive(Debug, Clone)]
+pub struct TypeRef {
+    pub identity: TypeIdentity,
+    /// 0 for a type that is not an array.
+    pub array_dimensions: u32,
+}
+
+/// How core knows a type.
+#[derive(Debug, Clone)]
+pub enum TypeIdentity {
+    /// A type of the schema's type registry. Every name and alias of the type
+    /// gives this one definition.
+    Registered(Arc<TypeDef>),
+    /// A type that is not registered, by the name it is written with, such
+    /// as `INTEGER`. The same name can stand for different types in a column,
+    /// in a CAST and as the type of an expression.
+    Name(String),
+}
+
+impl TypeRef {
+    /// The name of the type: the one it is registered with, or the one it is
+    /// written with.
+    pub fn name(&self) -> &str {
+        match &self.identity {
+            TypeIdentity::Registered(type_def) => &type_def.name,
+            TypeIdentity::Name(name) => name,
+        }
+    }
+}
+
+/// What `Dialect::apply_cast` decides about a cast.
+#[derive(Debug, Clone)]
+pub enum CastDecision {
+    /// The dialect decided the cast. The engine casts this operand, which
+    /// may be the operand of the cast wrapped in a conversion, to the target
+    /// and checks nothing else.
+    Applied(ast::Expr),
+    /// The dialect leaves the cast to the rules of the engine.
+    EngineRules,
 }
 
 /// How an ORDER BY or DISTINCT ON term is matched to the output columns.
