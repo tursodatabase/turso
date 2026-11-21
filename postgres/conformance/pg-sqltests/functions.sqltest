@@ -2843,3 +2843,110 @@ expect {
 expect @tursopg error {
     a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP is not supported
 }
+
+test now-with-an-argument-errors {
+    SELECT now(1);
+}
+@sqlstate 42883
+expect error {}
+
+test statement-timestamp-with-a-text-argument-errors {
+    SELECT statement_timestamp('x');
+}
+@sqlstate 42883
+expect error {}
+
+test now-with-a-star-argument-errors {
+    SELECT now(*) IS NOT NULL;
+}
+@sqlstate 42809
+expect error {
+    now\(\*\) specified, but now is not an aggregate function
+}
+
+test random-with-a-star-argument-errors {
+    SELECT random(*) IS NOT NULL;
+}
+@sqlstate 42809
+expect error {
+    random\(\*\) specified, but random is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-in-where-errors {
+    SELECT 1 WHERE clock_timestamp(*) IS NOT NULL;
+}
+@sqlstate 42809
+expect error {
+    clock_timestamp\(\*\) specified, but clock_timestamp is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-in-check-errors {
+    CREATE TABLE star_check (a int CHECK (random(*) > 0));
+}
+@sqlstate 42809
+expect error {
+    random\(\*\) specified, but random is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-in-default-errors {
+    CREATE TABLE star_default (a float DEFAULT pi(*));
+}
+@sqlstate 42809
+expect error {
+    pi\(\*\) specified, but pi is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-in-view-errors {
+    CREATE VIEW star_view AS SELECT pg_catalog.now(*) AS t;
+}
+@sqlstate 42809
+expect error {
+    pg_catalog\.now\(\*\) specified, but pg_catalog\.now is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-with-filter-errors {
+    SELECT now(*) FILTER (WHERE true);
+}
+@sqlstate 42809
+expect error {
+    now\(\*\) specified, but now is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-with-over-errors {
+    SELECT random(*) OVER ();
+}
+@sqlstate 42809
+expect error {
+    random\(\*\) specified, but random is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-with-over-in-check-errors {
+    CREATE TABLE star_over_check (a int CHECK (random(*) OVER () > 0));
+}
+@sqlstate 42809
+expect error {
+    random\(\*\) specified, but random is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-in-generated-column-errors {
+    CREATE TABLE star_generated (a int, b float GENERATED ALWAYS AS (random(*)) STORED);
+}
+@sqlstate 42809
+expect error {
+    random\(\*\) specified, but random is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-with-over-in-generated-column-errors {
+    CREATE TABLE star_over_generated (a int, b float GENERATED ALWAYS AS (random(*) OVER ()) STORED);
+}
+@sqlstate 42809
+expect error {
+    random\(\*\) specified, but random is not an aggregate function
+}
+
+test star-argument-of-aggregate-and-window-functions {
+    SELECT count(*), (SELECT row_number(*) OVER ());
+}
+expect {
+    1|1
+}

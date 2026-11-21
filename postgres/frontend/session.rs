@@ -15,6 +15,8 @@ use crate::settings::{
     SettingScope,
 };
 use crate::statement::{PgTxState, PostRunFn, StatementResultKind, TxRole};
+use turso_core::dialect::Dialect;
+use turso_core::function::Func;
 use turso_core::schema::{Schema, Table};
 use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::{
@@ -583,10 +585,12 @@ fn translate_statement<'a>(
         }
     }
     let conn_for_names = Arc::clone(&pg_conn.conn);
+    let conn_for_functions = Arc::clone(&pg_conn.conn);
     let translator = PostgreSQLTranslator::new()
         .with_relation_name_check(move |schema, name| {
             schema_has_relation(&conn_for_names, schema, name)
         })
+        .with_scalar_function_check(move |name| is_scalar_function(&conn_for_functions, name))
         .with_existing_generated_columns(existing_generated);
     let translated = translator
         .translate_with_prereqs(&parse_result)
@@ -1662,6 +1666,26 @@ fn schema_has_relation(conn: &Arc<Connection>, schema: &str, name: &str) -> bool
                 s.relation_kind(namespace.target.id, name).is_some()
             })
         })
+}
+
+/// Whether `name`, called with no arguments, resolves to a function that is
+/// neither an aggregate nor a window function. The lookup order is core's:
+/// the dialect's functions, then the registered ones.
+fn is_scalar_function(conn: &Arc<Connection>, name: &str) -> bool {
+    match PostgresDialect.resolve_function(name, 0) {
+        Ok(Some(Func::Agg(_) | Func::Window(_))) => false,
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            conn.get_syms_functions()
+                .iter()
+                .any(|(function, is_aggregate, arg_count, _)| {
+                    !is_aggregate
+                        && matches!(arg_count, 0 | -1)
+                        && function.eq_ignore_ascii_case(name)
+                })
+        }
+        Err(_) => false,
+    }
 }
 
 /// `sql`, a CREATE TABLE statement, with each serial column whose sequence
