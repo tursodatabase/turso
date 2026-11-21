@@ -5572,26 +5572,52 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         maybe_index_id: Option<MVTableId>,
     ) -> Result<()> {
         tracing::trace!("insert(tx_id={}, row.id={:?})", tx_id, row.id);
+        self.insert_row_version(tx_id, row, maybe_index_id, false)
+    }
+
+    /// Inserts a row that was read from the B-tree (not in MvStore).
+    /// This is used when updating a row that exists in B-tree but hasn't been
+    /// modified in MVCC yet. The btree_resident flag helps the checkpoint logic
+    /// determine if subsequent deletes should be checkpointed to the B-tree file.
+    pub fn insert_btree_resident_to_table_or_index(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+    ) -> Result<()> {
+        tracing::trace!(
+            "insert_btree_resident(tx_id={}, row.id={:?})",
+            tx_id,
+            row.id
+        );
+        self.insert_row_version(tx_id, row, maybe_index_id, true)
+    }
+
+    fn insert_row_version(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+        btree_resident: bool,
+    ) -> Result<()> {
         let tx = self
             .txs
             .get(&tx_id)
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         turso_assert_eq!(tx.state, TransactionState::Active);
+
         let id = row.id.clone();
+        let version_id = self.get_version_id();
+        let row_version = RowVersion::new(
+            version_id,
+            Some(TxTimestampOrID::TxID(tx.tx_id)),
+            None,
+            row.data,
+            btree_resident,
+        );
         match maybe_index_id {
             Some(index_id) => {
-                let version_id = self.get_version_id();
-                let row_version = RowVersion {
-                    id: version_id,
-                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(
-                        tx.tx_id,
-                    ))),
-                    end: crate::mvcc::database::PackedTs::pack(None),
-                    data: row.data.clone(),
-                    btree_resident: false,
-                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-                };
                 let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
                 };
@@ -5613,93 +5639,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // Conflicts are detected at commit time using end_ts comparison.
                 // This allows multiple transactions to insert the same rowid,
                 // with first-committer-wins semantics.
-
-                let version_id = self.get_version_id();
-                let row_version = RowVersion {
-                    id: version_id,
-                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(
-                        tx.tx_id,
-                    ))),
-                    end: crate::mvcc::database::PackedTs::pack(None),
-                    data: row.data,
-                    btree_resident: false,
-                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-                };
                 let (row_versions, chain_in_write_set) =
                     self.insert_version(id.clone(), row_version)?;
-                let allocator = self.get_rowid_allocator(&id.table_id);
-                allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
-                tx.record_created_table_version(id.clone(), version_id);
-                if !chain_in_write_set {
-                    tx.add_to_write_set(id, row_versions);
+                if !btree_resident {
+                    let allocator = self.get_rowid_allocator(&id.table_id);
+                    allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
                 }
-            }
-        }
-        Ok(())
-    }
-
-    /// Inserts a row that was read from the B-tree (not in MvStore).
-    /// This is used when updating a row that exists in B-tree but hasn't been
-    /// modified in MVCC yet. The btree_resident flag helps the checkpoint logic
-    /// determine if subsequent deletes should be checkpointed to the B-tree file.
-    pub fn insert_btree_resident_to_table_or_index(
-        &self,
-        tx_id: TxID,
-        row: Row,
-        maybe_index_id: Option<MVTableId>,
-    ) -> Result<()> {
-        tracing::trace!(
-            "insert_btree_resident(tx_id={}, row.id={:?})",
-            tx_id,
-            row.id
-        );
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-        let tx = tx.value();
-        turso_assert_eq!(tx.state, TransactionState::Active);
-        let id = row.id.clone();
-        match maybe_index_id {
-            Some(index_id) => {
-                let version_id = self.get_version_id();
-                let row_version = RowVersion {
-                    id: version_id,
-                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(
-                        tx.tx_id,
-                    ))),
-                    end: crate::mvcc::database::PackedTs::pack(None),
-                    data: row.data.clone(),
-                    btree_resident: true,
-                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-                };
-                let RowKey::Record(sortable_key) = row.id.row_id else {
-                    panic!("Index writes must be to a record");
-                };
-                let (canonical_key, row_versions, chain_in_write_set) =
-                    self.insert_index_version(index_id, sortable_key, row_version)?;
-                if !chain_in_write_set {
-                    tx.add_to_write_set(
-                        RowID::new(id.table_id, RowKey::Record(canonical_key.clone())),
-                        row_versions,
-                    );
-                }
-                tx.record_created_index_version((index_id, canonical_key), version_id);
-            }
-            None => {
-                let version_id = self.get_version_id();
-                let row_version = RowVersion {
-                    id: version_id,
-                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(
-                        tx.tx_id,
-                    ))),
-                    end: crate::mvcc::database::PackedTs::pack(None),
-                    data: row.data,
-                    btree_resident: true,
-                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-                };
-                let (row_versions, chain_in_write_set) =
-                    self.insert_version(id.clone(), row_version)?;
                 tx.record_created_table_version(id.clone(), version_id);
                 if !chain_in_write_set {
                     tx.add_to_write_set(id, row_versions);
@@ -5828,22 +5773,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     }
                     let chain_in_write_set =
                         chain_has_version_written_by(&locked_row_versions, tx_id);
-                    for rv in locked_row_versions.iter_mut().rev() {
-                        // A transaction cannot delete a version that it cannot see.
-                        // B-tree deletion markers are not visible versions, but their
-                        // end fields can still indicate a write-write conflict.
-                        let visible = rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states);
-                        if (visible || rv.begin().is_none())
-                            && is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
-                        {
-                            return Err(LimboError::WriteWriteConflict);
-                        }
-                        if !visible {
-                            continue;
-                        }
-
-                        let version_id = rv.id;
-                        rv.set_end(Some(TxTimestampOrID::TxID(tx_id)));
+                    if let Some(version_id) =
+                        self.end_visible_version(tx, &mut locked_row_versions)?
+                    {
                         drop(locked_row_versions);
                         self.bump_index_rows_epoch();
                         if !chain_in_write_set {
@@ -5880,22 +5812,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     continue;
                 }
                 let chain_in_write_set = chain_has_version_written_by(&locked_row_versions, tx_id);
-                for rv in locked_row_versions.iter_mut().rev() {
-                    // A transaction cannot delete a version that it cannot see.
-                    // B-tree deletion markers are not visible versions, but their
-                    // end fields can still indicate a write-write conflict.
-                    let visible = rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states);
-                    if (visible || rv.begin().is_none())
-                        && is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
-                    {
-                        return Err(LimboError::WriteWriteConflict);
-                    }
-                    if !visible {
-                        continue;
-                    }
-
-                    let version_id = rv.id;
-                    rv.set_end(Some(TxTimestampOrID::TxID(tx_id)));
+                if let Some(version_id) = self.end_visible_version(tx, &mut locked_row_versions)? {
                     drop(locked_row_versions);
                     self.bump_table_rows_epoch();
                     if !chain_in_write_set {
@@ -5927,6 +5844,29 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 return Ok(true);
             },
         }
+    }
+
+    fn end_visible_version(
+        &self,
+        tx: &Transaction<A>,
+        versions: &mut [RowVersion],
+    ) -> Result<Option<u64>> {
+        for rv in versions.iter_mut().rev() {
+            // A transaction cannot delete a version that it cannot see.
+            // B-tree deletion markers are not visible versions, but their
+            // end fields can still indicate a write-write conflict.
+            let visible = rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states);
+            if (visible || rv.begin().is_none())
+                && is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
+            {
+                return Err(LimboError::WriteWriteConflict);
+            }
+            if visible {
+                rv.set_end(Some(TxTimestampOrID::TxID(tx.tx_id)));
+                return Ok(Some(rv.id));
+            }
+        }
+        Ok(None)
     }
 
     /// Only two readers use the deleted row in a table tombstone: the checkpoint,
