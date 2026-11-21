@@ -1,0 +1,38 @@
+@database :memory:
+
+test parenthesized-i64-min {
+    SELECT -(9223372036854775808), typeof(-(9223372036854775808));
+    SELECT -(((9223372036854775808))), typeof(-(((9223372036854775808))));
+    SELECT -(+9223372036854775808), typeof(-(+9223372036854775808));
+}
+expect {
+    -9223372036854775808|integer
+    -9223372036854775808|integer
+    -9223372036854775808|integer
+}
+
+test default-parenthesized-i64-min {
+    CREATE TABLE t(a, b DEFAULT (-(9223372036854775808)));
+    INSERT INTO t(a) VALUES(1);
+    SELECT b, typeof(b) FROM t;
+}
+expect {
+    -9223372036854775808|integer
+}
+
+test parenthesized-negation-controls {
+    SELECT typeof(-(9223372036854775809));
+    SELECT -(9223372036854775807), typeof(-(9223372036854775807));
+    SELECT -(-2), typeof(-(-2));
+    SELECT -(1.5), typeof(-(1.5));
+    CREATE TABLE nums(n INTEGER);
+    INSERT INTO nums VALUES(12);
+    SELECT -(+n), typeof(-(+n)) FROM nums;
+}
+expect {
+    real
+    -9223372036854775807|integer
+    2|integer
+    -1.5|real
+    -12|integer
+}

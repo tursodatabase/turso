@@ -3398,11 +3398,27 @@ fn translate_unary_expr(
     let ast::Expr::Unary(op, expr) = expr else {
         unreachable!("translate_unary_expr expects Expr::Unary");
     };
+    // Parentheses and unary plus do not change a numeric literal. Look
+    // through them before parsing its sign, so the magnitude of i64::MIN
+    // is not rounded to a REAL before the minus is applied.
+    let mut literal = expr.as_ref();
+    loop {
+        literal = match literal {
+            ast::Expr::Parenthesized(items) if items.len() == 1 => &items[0],
+            ast::Expr::Unary(UnaryOperator::Positive, inner) => inner,
+            _ => break,
+        };
+    }
     match (op, expr.as_ref()) {
         (UnaryOperator::Positive, expr) => {
             translate_expr(program, referenced_tables, expr, target_register, resolver)
         }
-        (UnaryOperator::Negative, ast::Expr::Literal(ast::Literal::Numeric(numeric_value))) => {
+        (UnaryOperator::Negative, _)
+            if matches!(literal, ast::Expr::Literal(ast::Literal::Numeric(_))) =>
+        {
+            let ast::Expr::Literal(ast::Literal::Numeric(numeric_value)) = literal else {
+                unreachable!();
+            };
             let numeric_value = "-".to_owned() + numeric_value;
             match parse_numeric_literal(&numeric_value)? {
                 Value::Numeric(Numeric::Integer(int_value)) => {
