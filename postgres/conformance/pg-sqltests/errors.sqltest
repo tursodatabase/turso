@@ -187,6 +187,18 @@ test error-drop-array-of-custom-type {
 @sqlstate 0A000
 expect error {}
 
+# PostgreSQL 18 has no type regdatabase, so a user type of that name is
+# dropped like any other.
+test drop-user-type-with-a-name-postgresql-does-not-use {
+    DROP TYPE IF EXISTS regdatabase;
+    CREATE TYPE regdatabase AS ENUM ('a');
+    DROP TYPE regdatabase;
+    SELECT 1;
+}
+expect {
+    1
+}
+
 # PostgreSQL has no array type of void, any or pg_node_tree, so these don't
 # exist; record and cstring have one.
 test error-drop-array-of-type-without-arrays {

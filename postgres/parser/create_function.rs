@@ -532,7 +532,9 @@ fn classify_type(type_name: &TypeName) -> Result<TypeClass, ParseError> {
         Some(TypeClass::Pseudo("\"any\"".to_string()))
     } else if PSEUDO_TYPES.contains(&name.as_str()) {
         Some(TypeClass::Pseudo(name.clone()))
-    } else if BASE_TYPES.contains(&name.as_str()) {
+    } else if BASE_TYPES.contains(&name.as_str())
+        || BASE_TYPES_WITHOUT_ARRAYS.contains(&name.as_str())
+    {
         Some(TypeClass::Base)
     } else {
         None
@@ -575,20 +577,11 @@ fn classify_type(type_name: &TypeName) -> Result<TypeClass, ParseError> {
     })
 }
 
-/// Whether PostgreSQL has an array type of the built-in type `name`: of every
-/// base type but a few internal ones, and of the pseudo-types only `record`
-/// and `cstring`.
+/// Whether PostgreSQL has an array type of the built-in type `name`: of the
+/// base types in [`BASE_TYPES`], and of the pseudo-types only `record` and
+/// `cstring`.
 fn has_array_type(name: &str) -> bool {
-    const BASE_TYPES_WITHOUT_ARRAYS: &[&str] = &[
-        "pg_brin_bloom_summary",
-        "pg_brin_minmax_multi_summary",
-        "pg_dependencies",
-        "pg_mcv_list",
-        "pg_ndistinct",
-        "pg_node_tree",
-    ];
-    (BASE_TYPES.contains(&name) && !BASE_TYPES_WITHOUT_ARRAYS.contains(&name))
-        || matches!(name, "record" | "cstring")
+    BASE_TYPES.contains(&name) || matches!(name, "record" | "cstring")
 }
 
 /// The type name as PostgreSQL writes it in an error about a type that does
@@ -657,9 +650,10 @@ const PSEUDO_TYPES: &[&str] = &[
     "unknown",
 ];
 
-/// The built-in base, range and multirange types, by the names pg_query
-/// gives them: `int` is `int4` and `double precision` is `float8`, for
-/// example.
+/// The built-in base, range and multirange types that have an array type, by
+/// the names pg_query gives them: `int` is `int4` and `double precision` is
+/// `float8`, for example. A type is in this list or in
+/// [`BASE_TYPES_WITHOUT_ARRAYS`], never both.
 const BASE_TYPES: &[&str] = &[
     "bool",
     "int2",
@@ -725,13 +719,6 @@ const BASE_TYPES: &[&str] = &[
     "regconfig",
     "regdictionary",
     "regcollation",
-    "regdatabase",
-    "pg_node_tree",
-    "pg_ndistinct",
-    "pg_dependencies",
-    "pg_mcv_list",
-    "pg_brin_bloom_summary",
-    "pg_brin_minmax_multi_summary",
     "int4range",
     "int8range",
     "numrange",
@@ -745,3 +732,35 @@ const BASE_TYPES: &[&str] = &[
     "tsmultirange",
     "tstzmultirange",
 ];
+
+/// The built-in base types that have no array type: the internal ones that
+/// hold planner and index statistics or stored expression trees.
+const BASE_TYPES_WITHOUT_ARRAYS: &[&str] = &[
+    "pg_node_tree",
+    "pg_ndistinct",
+    "pg_dependencies",
+    "pg_mcv_list",
+    "pg_brin_bloom_summary",
+    "pg_brin_minmax_multi_summary",
+];
+
+#[cfg(test)]
+mod type_list_tests {
+    use super::{BASE_TYPES, BASE_TYPES_WITHOUT_ARRAYS, POLYMORPHIC_TYPES, PSEUDO_TYPES};
+
+    /// Each built-in type name is in exactly one list: a base type either has
+    /// an array type or doesn't, and no name is two kinds of type.
+    #[test]
+    fn each_built_in_type_is_in_one_list() {
+        let lists = [
+            BASE_TYPES,
+            BASE_TYPES_WITHOUT_ARRAYS,
+            PSEUDO_TYPES,
+            POLYMORPHIC_TYPES,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for name in lists.iter().flat_map(|list| list.iter()) {
+            assert!(seen.insert(*name), "{name} is in more than one type list");
+        }
+    }
+}
