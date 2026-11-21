@@ -370,6 +370,9 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_DUPLICATE_TABLE
     } else if msg.starts_with("role \"") && msg.ends_with("\" already exists") {
         SQLSTATE_DUPLICATE_OBJECT
+    } else if msg.starts_with("no such type: ") || msg.starts_with("no such domain: ") {
+        // DROP TYPE or DROP DOMAIN of a type that does not exist.
+        SQLSTATE_UNDEFINED_OBJECT
     } else if msg.contains("no such table")
         || msg.starts_with("no such view")
         || msg.contains("table not found")
@@ -653,6 +656,9 @@ mod tests {
             ("no such view: v", SQLSTATE_UNDEFINED_TABLE),
             ("no such column: c", SQLSTATE_UNDEFINED_COLUMN),
             ("no such function: f", SQLSTATE_UNDEFINED_FUNCTION),
+            ("no such type: t", SQLSTATE_UNDEFINED_OBJECT),
+            ("no such domain: d", SQLSTATE_UNDEFINED_OBJECT),
+            ("no such type: no such table", SQLSTATE_UNDEFINED_OBJECT),
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
             ("relation \"t\" already exists", SQLSTATE_DUPLICATE_TABLE),
             ("role \"r\" already exists", SQLSTATE_DUPLICATE_OBJECT),

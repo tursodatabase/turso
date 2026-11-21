@@ -387,6 +387,20 @@ expect @tursopg error {
     a function parameter of array type pg_catalog\.int4\[\] is not supported
 }
 
+# `_int4` is the catalog's name of int4[].
+@compat-gap "syntax:create-function"
+test array-parameter-by-catalog-name {
+    CREATE FUNCTION first_of(_int4) RETURNS int AS $$ SELECT $1[1] $$ LANGUAGE sql;
+    SELECT first_of(ARRAY[4, 5]);
+}
+expect {
+    4
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function parameter of array type _int4 is not supported
+}
+
 @compat-gap "syntax:create-function"
 test column-type-parameter {
     CREATE TABLE t (a int);
@@ -498,6 +512,27 @@ test record-array-parameter {
 @sqlstate 42P13
 expect error {
     SQL functions cannot have arguments of type record\[\]
+}
+
+# PostgreSQL writes the catalog name `_record` as `record[]`.
+test record-array-parameter-by-catalog-name {
+    CREATE FUNCTION f(_record) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+@sqlstate 42P13
+expect error {
+    SQL functions cannot have arguments of type record\[\]
+}
+
+# cstring[] is an ordinary array type, not a pseudo-type like record[].
+@compat-gap "syntax:create-function"
+test cstring-array-parameter {
+    CREATE FUNCTION cstring_array_parameter(_cstring) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function parameter of array type _cstring is not supported
 }
 
 test any-parameter {

@@ -10,14 +10,15 @@ use crate::names::{
 };
 use crate::policy_condition::written_condition;
 use crate::sqlstate::{
-    SQLSTATE_DUPLICATE_OBJECT, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_GROUPING_ERROR,
-    SQLSTATE_INVALID_COLUMN_REFERENCE, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
-    SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_OBJECT_DEFINITION,
-    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
-    SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
-    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
-    SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
-    SQLSTATE_WINDOWING_ERROR, SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST, SQLSTATE_DUPLICATE_OBJECT,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_GROUPING_ERROR, SQLSTATE_INVALID_COLUMN_REFERENCE,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME,
+    SQLSTATE_INVALID_OBJECT_DEFINITION, SQLSTATE_INVALID_PARAMETER_VALUE,
+    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
+    SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_COLUMN,
+    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNDEFINED_PARAMETER,
+    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION, SQLSTATE_WINDOWING_ERROR,
+    SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -1679,6 +1680,56 @@ impl PostgreSQLTranslator {
                 "DROP {}",
                 drop_object_type_name(remove_type)
             )));
+        }
+
+        // A built-in type belongs to the system: PostgreSQL refuses to drop
+        // it, with IF EXISTS or CASCADE too, and DROP DOMAIN says it is not a
+        // domain. The custom type registry does not list these types, so the
+        // engine would find nothing to drop. An array of a type is dropped
+        // only with its element type, which tursopg does not check, so it is
+        // refused rather than dropping the element type.
+        if let (ObjectType::ObjectType | ObjectType::ObjectDomain, [object]) =
+            (remove_type, drop.objects.as_slice())
+        {
+            if let Some(Node::TypeName(tn)) = &object.node {
+                if let Some(name) = crate::create_function::builtin_type_name(tn)? {
+                    return Err(if remove_type == ObjectType::ObjectType {
+                        ParseError::Sqlstate {
+                            sqlstate: SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+                            message: format!(
+                                "cannot drop type {name} because it is required by the database system"
+                            ),
+                        }
+                    } else {
+                        ParseError::Sqlstate {
+                            sqlstate: SQLSTATE_WRONG_OBJECT_TYPE,
+                            message: format!("\"{name}\" is not a domain"),
+                        }
+                    });
+                }
+                if !tn.array_bounds.is_empty() {
+                    // A built-in type without an array type, such as `void[]`.
+                    let element = pg_query::protobuf::TypeName {
+                        array_bounds: Vec::new(),
+                        ..tn.clone()
+                    };
+                    // With IF EXISTS PostgreSQL skips it, but the engine would
+                    // drop a custom type named `"void[]"`, so it is refused below.
+                    if !drop.missing_ok
+                        && crate::create_function::builtin_type_name(&element)?.is_some()
+                    {
+                        let names = extract_key_columns(&tn.names)?.join(".");
+                        return Err(type_does_not_exist(&format!(
+                            "{names}{}",
+                            "[]".repeat(tn.array_bounds.len())
+                        )));
+                    }
+                    return Err(ParseError::not_supported(format!(
+                        "DROP {} of an array type",
+                        drop_object_type_name(remove_type)
+                    )));
+                }
+            }
         }
 
         if drop.behavior == pg_query::protobuf::DropBehavior::DropCascade as i32 {
