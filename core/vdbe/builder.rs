@@ -301,6 +301,9 @@ pub struct ProgramBuilder {
     /// What `Statement::get_column_type_info` reports for each result column. Only
     /// filled in when custom types are enabled.
     pub result_column_types: Vec<Option<crate::statement::ColumnTypeInfo>>,
+    /// The common type of each column of a compound SELECT, which its result
+    /// column types report instead of the types of the leftmost SELECT.
+    pub(crate) compound_result_types: Option<Vec<crate::translate::expr::expr_type::ExprType>>,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
     /// Registry of materialized CTEs, keyed by cte_id.
@@ -884,6 +887,7 @@ impl ProgramBuilder {
             parameters: Parameters::new(),
             result_columns: Vec::new(),
             result_column_types: Vec::new(),
+            compound_result_types: None,
             table_references: TableReferences::new(vec![], vec![]),
             nested_level: 0,
             // These labels will be filled when `prologue()` is called

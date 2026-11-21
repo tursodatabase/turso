@@ -12,17 +12,24 @@ use crate::statement::{ColumnTypeInfo, ColumnTypeKind};
 
 pub(crate) fn result_column_types(
     result_columns: &[ResultSetColumn],
+    compound_types: Option<&[ExprType]>,
     table_references: &TableReferences,
     resolver: &Resolver,
 ) -> Vec<Option<ColumnTypeInfo>> {
     let env = TypeEnv::new(Some(table_references), resolver);
     result_columns
         .iter()
-        .map(|column| match &column.expr {
-            ast::Expr::Column { table, column, .. } => {
-                table_column_type(*table, *column, table_references, resolver.schema())
+        .enumerate()
+        .map(|(index, column)| {
+            if let Some(ty) = compound_types.and_then(|types| types.get(index)) {
+                return expression_type(ty, resolver.schema());
             }
-            expr => expression_type(&type_of(expr, &env), resolver.schema()),
+            match &column.expr {
+                ast::Expr::Column { table, column, .. } => {
+                    table_column_type(*table, *column, table_references, resolver.schema())
+                }
+                expr => expression_type(&type_of(expr, &env), resolver.schema()),
+            }
         })
         .collect()
 }

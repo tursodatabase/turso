@@ -1040,8 +1040,7 @@ fn encode_text(
 
 /// Binary format writes a value in the encoding of its column's type, not of
 /// the stored value: `count(*)` is typed text, and `coalesce(NULL::float8, 1)`
-/// holds an integer. A value that the type cannot hold, such as 12.5 in the
-/// int4 column of `SELECT 1 UNION ALL SELECT 12.5`, is refused with 0A000.
+/// holds an integer. A value that the type cannot hold is refused with 0A000.
 fn encode_binary(
     encoder: &mut DataRowEncoder,
     val: &Value,
@@ -1598,7 +1597,7 @@ mod tests {
             }
         }
         // A value that the column's binary type cannot hold is refused.
-        for sql in ["SELECT i FROM o", "SELECT 1 UNION ALL SELECT 12.5"] {
+        for sql in ["SELECT i FROM o"] {
             let mut stmt = conn.prepare(sql).unwrap();
             let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedBinary).unwrap());
             let Err(error) = execute_query(&mut stmt, fields) else {

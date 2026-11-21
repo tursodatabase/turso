@@ -237,6 +237,19 @@ pub fn emit_program_for_compound_select(
     // so `column_count`/column metadata reflect the compound query, and so that the
     // ORDER BY emitter below sees the correct columns.
     program.result_columns = leftmost_result_columns;
+    program.compound_result_types = Some(
+        (0..num_result_cols)
+            .map(|column| {
+                crate::translate::expr::expr_type::compound_column_type(
+                    left.iter()
+                        .map(|(select, _)| select)
+                        .chain(std::iter::once(right_most.as_ref())),
+                    column,
+                    &right_most_ctx.resolver,
+                )
+            })
+            .collect(),
+    );
 
     // When ORDER BY is present, sort the collected results and emit to the real destination.
     if let (Some(order_by), Some(collection_cursor_id), Some(collection_idx)) =

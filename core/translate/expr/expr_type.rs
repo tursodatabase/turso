@@ -620,9 +620,11 @@ pub(crate) fn compound_column_type<'p>(
     column: usize,
     resolver: &Resolver,
 ) -> ExprType {
-    common_of_types(
+    common_type_of(
         arms.into_iter()
-            .map(|select| select_column_type(select, column, resolver)),
+            .map(|select| select_column_type(select, column, resolver))
+            .collect(),
+        Some(resolver),
         resolver.schema(),
     )
 }

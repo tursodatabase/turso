@@ -657,6 +657,7 @@ fn translate_statement(
     if connection.experimental_custom_types_enabled() {
         program.result_column_types = result_column_types::result_column_types(
             &program.result_columns,
+            program.compound_result_types.as_deref(),
             &program.table_references,
             resolver,
         );
