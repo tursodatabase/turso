@@ -1,3 +1,4 @@
+use crate::error::sql_parse_error;
 use crate::functions::validate_pg_input;
 use crate::roles::{connection_roles, schema_roles, Role, RoleCatalog};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -4103,13 +4104,14 @@ impl VirtualTableCursor for PgInputErrorInfoCursor {
         };
 
         self.row = Some(match validate_pg_input(&input, &type_name) {
-            Some((message, code)) => [
+            Ok(Some((message, code))) => [
                 Value::build_text(message),
                 Value::Null,
                 Value::Null,
                 Value::build_text(code),
             ],
-            None => [Value::Null, Value::Null, Value::Null, Value::Null],
+            Ok(None) => [Value::Null, Value::Null, Value::Null, Value::Null],
+            Err(error) => return Err(Box::new(sql_parse_error(error))),
         });
 
         Ok(IOResult::Done(true))

@@ -337,8 +337,10 @@ fn builtin_ordering(type_name: &str) -> Option<TypeOrdering> {
 fn builtin_value_type(type_name: &str) -> crate::Result<BuiltinType> {
     Ok(match type_name {
         "boolean" | "smallint" | "bigint" => BuiltinType::Integer,
-        "uuid" | "json" | "jsonb" | "numeric" | "varchar" | "date" | "time" | "timestamp"
-        | "timestamptz" | "inet" | "cidr" | "macaddr" | "macaddr8" => BuiltinType::Text,
+        "uuid" | "json" | "jsonb" | "numeric" | "varchar" | "date" | "time" | "timetz"
+        | "timestamp" | "timestamptz" | "inet" | "cidr" | "macaddr" | "macaddr8" => {
+            BuiltinType::Text
+        }
         "bytea" => BuiltinType::Blob,
         _ => {
             return Err(LimboError::InternalError(format!(

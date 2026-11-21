@@ -2695,6 +2695,7 @@ mod tests {
             builtin("jsonb", "'{}'"),
             builtin("inet", "'10.0.0.1'"),
             builtin("numeric(10,2)", "1.5"),
+            builtin("timetz", "'10:00:00+02'"),
         ];
         // User types with every combination of no, an unchanging and a changing
         // ENCODE and DECODE, and a domain over each.

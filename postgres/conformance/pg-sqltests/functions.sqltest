@@ -366,6 +366,15 @@ expect {
     invalid
 }
 
+test pg-input-is-valid-checks-array-elements {
+    SELECT pg_input_is_valid('{1,2,3}', 'int2[]');
+    SELECT pg_input_is_valid('{1,40000}', 'int2[]');
+}
+expect {
+    t
+    f
+}
+
 test pg-input-error-info-date-out-of-range {
     SELECT message, sql_error_code FROM pg_input_error_info('2024-02-30', 'date');
 }
@@ -378,6 +387,13 @@ test pg-input-error-info-date-bad-syntax {
 }
 expect {
     invalid input syntax for type date: "zzz"|22007
+}
+
+test pg-input-error-info-array-element-out-of-range {
+    SELECT message, sql_error_code FROM pg_input_error_info('{1,40000}', 'int2[]');
+}
+expect {
+    value "40000" is out of range for type smallint|22003
 }
 
 test current-setting-numeric-parameter-name-errors {

@@ -357,6 +357,7 @@ expect {
     time(value text)|text|temporal_encode (value, 'time')||value||'<'
     timestamp(value text)|text|temporal_encode (value, 'timestamp')||value||'<'
     timestamptz(value text)|text|temporal_encode (value, 'timestamptz')||value||'<'
+    timetz(value text)|text|temporal_encode (value, 'timetz')||value||'<'
     uuid(value any)|blob|CASE WHEN value IS NULL THEN NULL WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE coalesce (uuid_blob (value), RAISE (ABORT, 'invalid UUID value')) END||uuid_str (value)||'<'
     varchar(value text, maxlen integer)|text||CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
 }
@@ -391,6 +392,7 @@ expect {
     time(value text)|text|temporal_encode (value, 'time')||value||'<'
     timestamp(value text)|text|temporal_encode (value, 'timestamp')||value||'<'
     timestamptz(value text)|text|temporal_encode (value, 'timestamptz')||value||'<'
+    timetz(value text)|text|temporal_encode (value, 'timetz')||value||'<'
     uuid(value any)|blob|CASE WHEN value IS NULL THEN NULL WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE coalesce (uuid_blob (value), RAISE (ABORT, 'invalid UUID value')) END||uuid_str (value)||'<'
     varchar(value text, maxlen integer)|text||CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
 }
