@@ -1,4 +1,4 @@
-use super::{cost_params::CostModelParams, AvailableIndexes};
+use super::{cost::IndexInfo, cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
 use crate::translate::expr_context::{ExprContext, ExprProperties, TableMetadata};
@@ -28,7 +28,7 @@ use crate::{
 };
 use crate::{turso_assert, turso_debug_assert};
 use smallvec::SmallVec;
-use std::{collections::VecDeque, sync::Arc};
+use std::{cell::OnceCell, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
@@ -299,6 +299,20 @@ pub struct ConstraintUseCandidate {
     /// References to the constraints that may be used as an access path for the index.
     /// Refs are sorted by [ConstraintRef::index_col_pos]
     pub refs: Vec<ConstraintRef>,
+    /// The [IndexInfo] of `index` for the table of these constraints, made
+    /// the first time that the join search needs it. The search reads it for
+    /// each join order that it tries, and it does not change during the search.
+    pub(super) index_info: OnceCell<IndexInfo>,
+}
+
+impl ConstraintUseCandidate {
+    pub fn new(index: Option<Arc<Index>>) -> Self {
+        Self {
+            index,
+            refs: Vec::new(),
+            index_info: OnceCell::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -800,18 +814,12 @@ pub fn table_constraints_from_where_clause(
                             || !table_references
                                 .is_left_of_right_or_full_join(table_reference.internal_id)
                     })
-                    .map(|index| ConstraintUseCandidate {
-                        index: Some(index.clone()),
-                        refs: Vec::new(),
-                    })
+                    .map(|index| ConstraintUseCandidate::new(Some(index.clone())))
                     .collect()
             }),
     };
     // Add a candidate for the rowid index, which is always available when the table has a rowid alias.
-    cs.candidates.push(ConstraintUseCandidate {
-        index: None,
-        refs: Vec::new(),
-    });
+    cs.candidates.push(ConstraintUseCandidate::new(None));
 
     let index_for_column = |column_pos| {
         selectivity_index_for_column(schema, table_reference, available_indexes, column_pos)

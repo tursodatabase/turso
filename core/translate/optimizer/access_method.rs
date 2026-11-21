@@ -171,6 +171,9 @@ pub(super) struct ChosenBtreeCandidate {
     pub(super) constraint_refs: SmallVec<[RangeConstraintRef; 2]>,
     pub(super) base_row_count: RowCountEstimate,
     pub(super) cost: Cost,
+    /// The [IndexInfo] that the cost of the candidate used. It is `None` only
+    /// for a scan of the table, which has no constraint refs.
+    pub(super) index_info: Option<IndexInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +246,7 @@ pub(super) fn choose_best_btree_candidate(
         constraint_refs: SmallVec::new(),
         base_row_count,
         cost: best_cost,
+        index_info: None,
     };
     let mut best_adjusted_output = f64::MAX;
     let mut best_is_ordered = false;
@@ -276,7 +280,7 @@ pub(super) fn choose_best_btree_candidate(
         has_valid_candidate = true;
 
         let index_info = match candidate.index.as_ref() {
-            Some(index) => Some(IndexInfo {
+            Some(index) => Some(*candidate.index_info.get_or_init(|| IndexInfo {
                 unique: index.unique,
                 covering: rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
@@ -285,7 +289,7 @@ pub(super) fn choose_best_btree_candidate(
                     rhs_table,
                     params.rows_per_table_page,
                 ),
-            }),
+            })),
             None if usable_constraint_refs.is_empty() => None,
             None => Some(IndexInfo {
                 unique: true,
@@ -480,6 +484,7 @@ pub(super) fn choose_best_btree_candidate(
                 constraint_refs: usable_constraint_refs,
                 base_row_count: candidate_base_row_count,
                 cost,
+                index_info,
             };
         }
     }
@@ -899,24 +904,9 @@ fn find_best_access_method_for_btree<'a>(
     let estimated_rows_per_outer_row = if best.constraint_refs.is_empty() {
         *access_base_row_count
     } else {
-        let index_info = match best.index.as_ref() {
-            Some(index) => IndexInfo {
-                unique: index.unique,
-                covering: rhs_table.index_is_covering(index),
-                column_count: index.columns.len(),
-                rows_per_leaf_page: rows_per_leaf_page_for_index(
-                    index.columns.len(),
-                    rhs_table,
-                    params.rows_per_table_page,
-                ),
-            },
-            None => IndexInfo {
-                unique: true,
-                covering: true,
-                column_count: 1,
-                rows_per_leaf_page: params.rows_per_table_page,
-            },
-        };
+        let index_info = best
+            .index_info
+            .expect("a candidate with constraint refs has an IndexInfo");
         let analyze_ctx = AnalyzeCtx {
             rhs_table,
             index: best.index.as_ref(),
