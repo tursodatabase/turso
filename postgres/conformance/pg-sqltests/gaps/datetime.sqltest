@@ -686,24 +686,18 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-@compat-gap "cast:timestamptz -> date"
 test timestamptz-cast-to-date {
     SELECT timestamptz '2026-01-31 23:30-05'::date;
 }
 expect {
     2026-02-01
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
-@compat-gap "type:date"
 test date-input-invalid {
     SELECT '2026-02-30'::date;
 }
 @sqlstate 22008
 expect error {}
-@sqlstate 0A000
-expect @tursopg error {}
 
 @compat-gap "type:timestamp"
 test timestamp-precision-modifier {
