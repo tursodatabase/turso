@@ -825,10 +825,12 @@ impl TypeDef {
                             "built-in type {type_name} has BASE {base}"
                         )));
                     };
-                    let kinds = ValueKinds {
-                        read: builtin_value_type(type_name)?,
-                        stored,
+                    let read = if decode.is_none() {
+                        stored
+                    } else {
+                        builtin_value_type(type_name)?
                     };
+                    let kinds = ValueKinds { read, stored };
                     (
                         builtin_ordering(type_name),
                         Some(kinds),
