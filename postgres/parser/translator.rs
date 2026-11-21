@@ -7123,19 +7123,15 @@ fn translate_create_role(
         }
     }
     let mut options = ast::RoleOptions::default();
-    let mut seen = std::collections::HashSet::new();
+    if reject_repeated_options(&stmt.options) {
+        return Err(conflicting_options());
+    }
     for option in &stmt.options {
         let Some(pg_query::protobuf::node::Node::DefElem(elem)) = option.node.as_ref() else {
             return Err(ParseError::ParseError(
                 "CREATE ROLE: invalid role option".to_string(),
             ));
         };
-        if !seen.insert(elem.defname.as_str()) {
-            return Err(ParseError::Sqlstate {
-                sqlstate: SQLSTATE_SYNTAX_ERROR,
-                message: "conflicting or redundant options".to_string(),
-            });
-        }
         match elem.defname.as_str() {
             "inherit" => options.inherit = extract_def_elem_bool(elem),
             "bypassrls" => options.bypassrls = extract_def_elem_bool(elem),

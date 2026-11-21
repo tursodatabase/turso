@@ -1,7 +1,6 @@
 use pg_query::protobuf::{node::Node, Token};
 
-use crate::sqlstate::SQLSTATE_SYNTAX_ERROR;
-use crate::translator::reject_repeated_options;
+use crate::translator::{conflicting_options, reject_repeated_options};
 use crate::ParseError;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,10 +66,7 @@ pub(crate) fn try_extract_copy_to_stdout(
         ));
     }
     if reject_repeated_options(&copy.options) {
-        return Err(ParseError::Sqlstate {
-            sqlstate: SQLSTATE_SYNTAX_ERROR,
-            message: "conflicting or redundant options".into(),
-        });
+        return Err(conflicting_options());
     }
     for option in &copy.options {
         let Some(Node::DefElem(option)) = &option.node else {
