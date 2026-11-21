@@ -51,15 +51,192 @@ macro_rules! scalar_functions {
 
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     let options = register_scalar_functions(options);
-    options.extension_function(
-        pg_scalar_function(
-            "array_to_json",
-            FunctionArity::OneOf(&[1, 2]),
-            true,
-            |_, args| exec_array_to_json(args),
+    options
+        .extension_function(
+            pg_scalar_function(
+                "array_to_json",
+                FunctionArity::OneOf(&[1, 2]),
+                true,
+                |_, args| exec_array_to_json(args),
+            )
+            .receiving_argument_types(),
         )
-        .receiving_argument_types(),
-    )
+        .extension_function(
+            pg_scalar_function(
+                "date_trunc",
+                FunctionArity::OneOf(&[2, 3]),
+                true,
+                |_, args| exec_date_trunc(args),
+            )
+            .receiving_argument_types(),
+        )
+}
+
+/// date_trunc(field, timestamptz). The declared return type is timestamptz,
+/// so any other argument type fails with 0A000 instead of returning a
+/// timestamptz for a timestamp or date argument.
+fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
+    // Registered with arity 2 or 3; each argument is followed by its type.
+    if args.len() == 6 {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "date_trunc with a time zone argument is not supported".to_string(),
+            None,
+        ));
+    }
+    let (args, types) = args.split_at(args.len() / 2);
+    let argument_type = types[1].get_value().to_string();
+    if argument_type != "timestamptz" {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("date_trunc is supported only for timestamptz, not {argument_type}"),
+            None,
+        ));
+    }
+    let not_supported = |what: String| sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, what, None);
+    let field = match args[0].get_value() {
+        Value::Text(field) => field,
+        // A SQL NULL unit gives NULL. A typed NULL such as NULL::int is
+        // indistinguishable from it here, because the argument types are
+        // not available for a NULL value.
+        Value::Null => return Ok(None),
+        other => {
+            return Err(sqlstate_error(
+                SQLSTATE_UNDEFINED_FUNCTION,
+                format!(
+                    "function date_trunc({}, timestamp with time zone) does not exist",
+                    types[0].get_value()
+                ),
+                Some(format!("Got a unit argument that is not text: {other}")),
+            ))
+        }
+    };
+    let Value::Text(value) = args[1].get_value() else {
+        return Ok(None);
+    };
+    let time =
+        NaiveDateTime::parse_from_str(value.as_str(), "%Y-%m-%d %H:%M:%S%.f").map_err(|_| {
+            not_supported(format!(
+                "date_trunc is not supported for the timestamptz value \"{}\"",
+                value.as_str()
+            ))
+        })?;
+    let lowered_field = field.as_str().to_ascii_lowercase();
+    if is_time_zone_unit(&lowered_field) {
+        return Err(not_supported(format!(
+            "unit \"{lowered_field}\" not supported for type timestamp with time zone"
+        )));
+    }
+    let Some(unit) = TruncUnit::parse(field.as_str()) else {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            format!("unit \"{lowered_field}\" not recognized for type timestamp with time zone"),
+            None,
+        ));
+    };
+    let truncated = truncate_timestamp(time, unit).ok_or_else(|| {
+        not_supported(format!(
+            "date_trunc is not supported for the unit \"{}\" with the value \"{}\"",
+            field.as_str(),
+            value.as_str()
+        ))
+    })?;
+    Ok(Some(Timestamptz(timestamp_text(truncated))))
+}
+
+/// The units of PostgreSQL's interval unit table that are time zone fields,
+/// not truncation units. date_trunc refuses them with 0A000 rather than 22023.
+/// `lowered` is matched on its first 10 bytes, as in `TruncUnit::parse`.
+fn is_time_zone_unit(lowered: &str) -> bool {
+    let key = &lowered.as_bytes()[..lowered.len().min(10)];
+    matches!(key, b"timezone" | b"timezone_h" | b"timezone_m")
+}
+
+#[derive(Clone, Copy)]
+enum TruncUnit {
+    Microseconds,
+    Milliseconds,
+    Second,
+    Minute,
+    Hour,
+    Day,
+    Week,
+    Month,
+    Quarter,
+    Year,
+    Decade,
+    Century,
+    Millennium,
+}
+
+impl TruncUnit {
+    /// The unit named by `name`, spelled as in PostgreSQL's interval unit
+    /// table (deltatktbl in src/backend/utils/adt/datetime.c). PostgreSQL
+    /// matches the lowercased name on its first 10 bytes only, so
+    /// "microsecondsXY" is the unit "microsecon". None for a name that is
+    /// not a unit of date_trunc.
+    fn parse(name: &str) -> Option<Self> {
+        let lowered = name.to_ascii_lowercase();
+        let key = &lowered.as_bytes()[..lowered.len().min(10)];
+        Some(match key {
+            b"microsecon" | b"us" | b"usec" | b"usecond" | b"useconds" | b"usecs" => {
+                Self::Microseconds
+            }
+            b"millisecon" | b"ms" | b"msec" | b"msecond" | b"mseconds" | b"msecs" => {
+                Self::Milliseconds
+            }
+            b"second" | b"seconds" | b"s" | b"sec" | b"secs" => Self::Second,
+            b"minute" | b"minutes" | b"m" | b"min" | b"mins" => Self::Minute,
+            b"hour" | b"hours" | b"h" | b"hr" | b"hrs" => Self::Hour,
+            b"day" | b"days" | b"d" => Self::Day,
+            b"week" | b"weeks" | b"w" => Self::Week,
+            b"month" | b"months" | b"mon" | b"mons" => Self::Month,
+            b"quarter" | b"qtr" => Self::Quarter,
+            b"year" | b"years" | b"y" | b"yr" | b"yrs" => Self::Year,
+            b"decade" | b"decades" | b"dec" | b"decs" => Self::Decade,
+            b"century" | b"centuries" | b"c" | b"cent" => Self::Century,
+            b"millennium" | b"millennia" | b"mil" | b"mils" => Self::Millennium,
+            _ => return None,
+        })
+    }
+}
+
+/// `time` truncated to `unit`, as PostgreSQL's date_trunc does it, or None
+/// when the result is before year 1: PostgreSQL prints it as BC, which the
+/// timestamptz encoding cannot store. Weeks start on Monday; century and
+/// millennium start at years ending in 01, as in PostgreSQL.
+fn truncate_timestamp(time: NaiveDateTime, unit: TruncUnit) -> Option<NaiveDateTime> {
+    use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Timelike};
+    let date = time.date();
+    let first_day_of_year = |year: i32| NaiveDate::from_ymd_opt(year, 1, 1);
+    let day = match unit {
+        TruncUnit::Microseconds => return Some(time),
+        TruncUnit::Milliseconds => {
+            let nanos = time.nanosecond() / 1_000_000 * 1_000_000;
+            return time.with_nanosecond(nanos);
+        }
+        TruncUnit::Second => return time.with_nanosecond(0),
+        TruncUnit::Minute => return time.with_nanosecond(0)?.with_second(0),
+        TruncUnit::Hour => return time.with_nanosecond(0)?.with_second(0)?.with_minute(0),
+        TruncUnit::Day => date,
+        TruncUnit::Week => date - Duration::days(i64::from(date.weekday().num_days_from_monday())),
+        TruncUnit::Month => date.with_day(1)?,
+        TruncUnit::Quarter => {
+            NaiveDate::from_ymd_opt(date.year(), (date.month() - 1) / 3 * 3 + 1, 1)?
+        }
+        TruncUnit::Year => first_day_of_year(date.year())?,
+        TruncUnit::Decade => first_day_of_year(date.year().div_euclid(10) * 10)?,
+        TruncUnit::Century => first_day_of_year((date.year() - 1).div_euclid(100) * 100 + 1)?,
+        TruncUnit::Millennium => first_day_of_year((date.year() - 1).div_euclid(1000) * 1000 + 1)?,
+    };
+    // A year before 1 is BC in PostgreSQL. Only the decade of years 1 to 9
+    // gets here, because the other units stay in the year of `time` or start
+    // at year 1.
+    assert!(day.year() >= 0, "date_trunc result before year 0");
+    if day.year() < 1 {
+        return None;
+    }
+    Some(day.and_time(NaiveTime::MIN))
 }
 
 fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
@@ -176,14 +353,20 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
 }
 
 /// The timestamptz of `instant`, a reading of the system clock, with
-/// microseconds as PostgreSQL keeps them. Trailing zeros of the fraction and
-/// a dot with no digits after it are left out, as PostgreSQL prints them.
+/// microseconds as PostgreSQL keeps them.
 fn timestamptz_at(instant: WallClockInstant) -> Timestamptz {
     let time: NaiveDateTime = DateTime::from_timestamp(instant.secs, instant.micros * 1_000)
         .expect("a system clock reading is a valid date and time")
         .naive_utc();
+    Timestamptz(timestamp_text(time))
+}
+
+/// The text of `time` with microseconds, without trailing zeros of the
+/// fraction and without a dot that has no digits after it, as PostgreSQL
+/// prints it.
+fn timestamp_text(time: NaiveDateTime) -> String {
     let text = time.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-    Timestamptz(text.trim_end_matches('0').trim_end_matches('.').to_string())
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
