@@ -644,3 +644,35 @@ fn test_truncate_checkpoint_on_readonly_connection_with_clean_wal() -> Result<()
     assert_that!(execute_and_get_ints(&conn, sql)?).is_equal_to(vec![0, 0, 0]);
     Ok(())
 }
+
+/// Finished statements that are kept alive (not reset or dropped) can still pin page 1.
+/// TRUNCATE must still succeed and keep the data; it skips shrinking the DB file then.
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_truncate_checkpoint_with_finished_statements_still_alive(
+    tmp_db: TempDatabase,
+) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+    let mut create = conn.prepare("CREATE TABLE t(x);")?;
+    create.run_with_row_callback(|_| Ok(()))?;
+    let mut insert = conn.prepare("INSERT INTO t VALUES (1), (2);")?;
+    insert.run_with_row_callback(|_| Ok(()))?;
+    let mut schema = conn.prepare("SELECT count(*) FROM sqlite_schema;")?;
+    schema.run_with_row_callback(|_| Ok(()))?;
+
+    let checkpoint = execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
+    assert_that!(checkpoint).is_equal_to(vec![0, 0, 0]);
+    assert_eq!(
+        execute_and_get_ints(&conn, "SELECT count(*) FROM t")?,
+        vec![2]
+    );
+
+    drop((create, insert, schema));
+    let reopened = tmp_db.connect_limbo();
+    assert_eq!(
+        execute_and_get_ints(&reopened, "SELECT count(*) FROM t")?,
+        vec![2]
+    );
+    Ok(())
+}

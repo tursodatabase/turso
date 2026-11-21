@@ -5339,7 +5339,23 @@ impl Pager {
                     // directly to DB file from the WAL, so the checkpointer connections' page 1 may have stale database_size.
                     if !page1_invalidated {
                         let page1_key = PageCacheKey::new(DatabaseHeader::PAGE_ID);
-                        self.page_cache.write().delete(page1_key)?;
+                        match self.page_cache.write().delete(page1_key) {
+                            Ok(()) => {}
+                            // A cursor of a finished statement on this connection still pins page 1,
+                            // so its database_size may be stale. Truncating the DB file to a stale size
+                            // could cut live pages; keep the file as is (it is only larger than needed)
+                            // and go on to the WAL truncation.
+                            Err(CacheError::Pinned { .. }) => {
+                                let mut state = self.checkpoint_state.write();
+                                state.phase = if sync_mode == crate::SyncMode::Off {
+                                    CheckpointPhase::TruncateWalFile { clear_page_cache }
+                                } else {
+                                    CheckpointPhase::SyncDbFile { clear_page_cache }
+                                };
+                                continue;
+                            }
+                            Err(err) => return Err(err.into()),
+                        }
                         let mut state = self.checkpoint_state.write();
                         state.phase = CheckpointPhase::TruncateDbFile {
                             sync_mode,
