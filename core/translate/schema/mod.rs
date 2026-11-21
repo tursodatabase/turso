@@ -752,7 +752,7 @@ fn validate(
         let is_strict = options.contains_strict();
 
         for c in columns {
-            check_column_type(c, table_name, is_strict, resolver.schema())?;
+            check_column_type(c, table_name, is_strict, resolver)?;
         }
 
         // In STRICT tables, validate that CHECK constraint comparisons have
@@ -824,8 +824,9 @@ pub(crate) fn check_column_type(
     column: &ast::ColumnDefinition,
     table_name: &str,
     is_strict: bool,
-    schema: &Schema,
+    catalog: &CatalogContext,
 ) -> Result<()> {
+    let schema = catalog.schema();
     let Some(col_type) = &column.col_type else {
         if is_strict {
             bail_parse_error!("missing datatype for {}.{}", table_name, column.col_name);
@@ -872,14 +873,17 @@ pub(crate) fn check_column_type(
         );
     };
     // A column gives one modifier for each type parameter besides `value`, as
-    // in `p(10)`, and none for a type without such parameters.
+    // in `p(10)`, or none when the type has parameters, as in `numeric`.
     let expected = td.user_params().count();
     let provided = match &col_type.size {
         Some(ast::TypeSize::TypeSize(_, _)) => 2,
         Some(ast::TypeSize::MaxSize(_)) => 1,
         None => 0,
     };
-    if provided != expected {
+    let may_omit_arguments = expected > 0
+        && provided == 0
+        && !catalog.dialect.cast_without_type_arguments_is_sqlite_cast();
+    if provided != expected && !may_omit_arguments {
         bail_parse_error!(
             "type \"{}\" requires {} parameter(s), got {}",
             type_name,

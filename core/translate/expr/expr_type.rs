@@ -9,7 +9,7 @@ use turso_parser::ast;
 
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
-use crate::dialect::OperandType;
+use crate::dialect::{Dialect, OperandType};
 use crate::function::{AggFunc, Func, ResultType, ReturnType, ScalarFunc, WindowFunc};
 use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
@@ -318,7 +318,12 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
         ast::Expr::Cast {
             type_name: Some(type_name),
             ..
-        } => cast_type(type_name, env.schema()),
+        } => cast_type(
+            type_name,
+            env.schema(),
+            env.resolver()
+                .map(|resolver| resolver.catalog.dialect.as_ref()),
+        ),
         ast::Expr::Unary(op, inner) => match op {
             ast::UnaryOperator::Not => ExprType::Builtin(BuiltinType::Boolean),
             ast::UnaryOperator::BitwiseNot => {
@@ -765,9 +770,9 @@ pub(crate) fn column_type(column: &Column, is_strict: bool, schema: &Schema) -> 
     ExprType::array(scalar, column.array_dimensions())
 }
 
-fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
+fn cast_type(type_name: &ast::Type, schema: &Schema, dialect: Option<&dyn Dialect>) -> ExprType {
     let name = crate::util::dequote(&type_name.name);
-    let scalar = match custom_cast_target(&name, type_name, schema) {
+    let scalar = match custom_cast_target(&name, type_name, schema, dialect) {
         Some(custom) => custom,
         None => match Affinity::of_written_type(&name) {
             // A CAST to BLOB always gives a blob.
@@ -782,9 +787,14 @@ fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
     ExprType::array(scalar, type_name.array_dimensions)
 }
 
-fn custom_cast_target(name: &str, type_name: &ast::Type, schema: &Schema) -> Option<ExprType> {
+fn custom_cast_target(
+    name: &str,
+    type_name: &ast::Type,
+    schema: &Schema,
+    dialect: Option<&dyn Dialect>,
+) -> Option<ExprType> {
     let type_def = schema.get_type_def_unchecked(name)?;
-    if super::is_sqlite_cast_to(type_def, type_name) {
+    if super::is_sqlite_cast_to(type_def, type_name, dialect) {
         return None;
     }
     Some(ExprType::Custom {
@@ -811,7 +821,7 @@ fn call_result_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
             type_def: Arc::clone(type_def),
             params: Vec::new(),
         },
-        None => cast_type(type_name, schema),
+        None => cast_type(type_name, schema, None),
     }
 }
 

@@ -1110,7 +1110,7 @@ pub fn translate_alter_table(
                 ));
             }
 
-            check_column_type(&col_def, table_name, btree.is_strict, resolver.schema())?;
+            check_column_type(&col_def, table_name, btree.is_strict, &resolver.catalog)?;
             let default_type_mismatch = btree.is_strict && strict_default_type_mismatch(&column)?;
             if btree.is_strict {
                 column.resolve_custom_type(resolver.schema())?;
@@ -1566,7 +1566,7 @@ pub fn translate_alter_table(
                             &definition,
                             table_name,
                             btree.is_strict,
-                            resolver.schema(),
+                            &resolver.catalog,
                         )?;
                         let replacement_column =
                             btree.column_for_alter(column_index, &definition, resolver.schema())?;

@@ -583,6 +583,17 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether `CAST(x AS numeric)`, written without the type's arguments,
+    /// is SQLite's CAST to the NUMERIC affinity, and a column of such a type
+    /// must give them.
+    ///
+    /// In SQLite it is, so the value becomes an integer or a real. In
+    /// PostgreSQL it gives a numeric with no limits, and a column may leave
+    /// the arguments out.
+    fn cast_without_type_arguments_is_sqlite_cast(&self) -> bool {
+        true
+    }
+
     /// Whether `sum()` and `avg()` add floats one by one.
     ///
     /// SQLite keeps an error term for each addition (Kahan-Babuska-Neumaier),

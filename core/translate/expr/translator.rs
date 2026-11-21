@@ -871,7 +871,11 @@ fn translate_cast_expr(
                 array_dimensions: 0,
                 ..tn.clone()
             };
-            if let Some(resolved) = custom_type_cast_chain(&element_type, resolver.schema())? {
+            if let Some(resolved) = custom_type_cast_chain(
+                &element_type,
+                resolver.schema(),
+                resolver.catalog.dialect.as_ref(),
+            )? {
                 emit_array_leaf_loop(
                     program,
                     target_register,
@@ -913,7 +917,9 @@ fn translate_cast_expr(
             )?;
             return Ok(target_register);
         }
-        if let Some(resolved) = custom_type_cast_chain(tn, resolver.schema())? {
+        if let Some(resolved) =
+            custom_type_cast_chain(tn, resolver.schema(), resolver.catalog.dialect.as_ref())?
+        {
             emit_custom_type_cast(program, resolved, tn, target_register, resolver)?;
             return Ok(target_register);
         }
@@ -1045,6 +1051,7 @@ fn emit_custom_type_cast(
 fn custom_type_cast_chain(
     type_name: &ast::Type,
     schema: &crate::schema::Schema,
+    dialect: &dyn crate::dialect::Dialect,
 ) -> Result<Option<crate::schema::ResolvedType>> {
     if type_name.array_dimensions > 0 {
         return Ok(None);
@@ -1057,7 +1064,7 @@ fn custom_type_cast_chain(
     if resolved.is_domain() {
         return Ok(Some(resolved));
     }
-    if is_sqlite_cast_to(resolved.leaf(), type_name) {
+    if is_sqlite_cast_to(resolved.leaf(), type_name, Some(dialect)) {
         return Ok(None);
     }
     resolved.chain.truncate(1);
@@ -1067,13 +1074,22 @@ fn custom_type_cast_chain(
 /// Whether a CAST to `type_def`, written as `type_name`, is SQLite's CAST
 /// instead: the type takes arguments and `type_name` doesn't give all of them.
 /// CAST(x AS NUMERIC) is a common SQLite idiom.
-pub(crate) fn is_sqlite_cast_to(type_def: &TypeDef, type_name: &ast::Type) -> bool {
+pub(crate) fn is_sqlite_cast_to(
+    type_def: &TypeDef,
+    type_name: &ast::Type,
+    dialect: Option<&dyn crate::dialect::Dialect>,
+) -> bool {
     let type_arg_count = match &type_name.size {
         Some(ast::TypeSize::MaxSize(_)) => 1,
         Some(ast::TypeSize::TypeSize(..)) => 2,
         None => 0,
     };
     let user_param_count = type_def.user_params().count();
+    if type_arg_count == 0
+        && dialect.is_some_and(|dialect| !dialect.cast_without_type_arguments_is_sqlite_cast())
+    {
+        return false;
+    }
     !type_def.is_domain && user_param_count != 0 && type_arg_count != user_param_count
 }
 
