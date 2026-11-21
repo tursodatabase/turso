@@ -3961,6 +3961,9 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
         )> {
             self.inner.truncate(checkpointed_through_ts)
         }
+        fn finish_logical_log_truncate(&self) {
+            self.inner.finish_logical_log_truncate();
+        }
         fn reset_to_fresh_header(&self) -> Result<Completion> {
             self.inner.reset_to_fresh_header()
         }

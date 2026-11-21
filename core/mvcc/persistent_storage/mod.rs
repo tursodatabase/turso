@@ -87,6 +87,10 @@ pub trait DurableStorage: Send + Sync + Debug {
         checkpointed_through_ts: u64,
     ) -> Result<(Completion, LogicalLogTruncateOutcome)>;
 
+    /// Apply a completed logical-log truncate to in-memory state and update the
+    /// cached offset.
+    fn finish_logical_log_truncate(&self);
+
     /// Reset the logical log to a fresh header-only file.
     ///
     /// Used after an external database restore so future MVCC recovery starts
@@ -158,9 +162,11 @@ impl Storage {
         self.log_offset.store(value, Ordering::Relaxed);
     }
 
-    #[inline(always)]
-    fn shadow_offset_advance(&self, bytes: u64) {
-        self.log_offset.fetch_add(bytes, Ordering::Relaxed);
+    fn with_logical_log_mut<R>(&self, f: impl FnOnce(&mut LogicalLog) -> R) -> R {
+        let mut log = self.logical_log.write();
+        let result = f(&mut log);
+        self.shadow_offset_store(log.offset);
+        result
     }
 }
 
@@ -205,21 +211,19 @@ impl DurableStorage for Storage {
         m: LogRecord,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
-        self.logical_log
-            .write()
-            .log_tx_deferred_offset(m, on_serialization_complete)
+        self.with_logical_log_mut(|log| log.log_tx_deferred_offset(m, on_serialization_complete))
     }
 
     fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
-        self.logical_log.write().upgrade_header_for_log_tx(m)
+        self.with_logical_log_mut(|log| log.upgrade_header_for_log_tx(m))
     }
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
-        self.logical_log.write().sync(sync_type)
+        self.with_logical_log_mut(|log| log.sync(sync_type))
     }
 
     fn update_header(&self) -> Result<Completion> {
-        self.logical_log.write().update_header()
+        self.with_logical_log_mut(|log| log.update_header())
     }
 
     #[aristo::intent("after a truncate, once no write is in flight, the in-memory shadow_offset equals the on-disk durable_offset (the tracked end-of-log matches what's been fsync'd)", id = "aristos:logical_log_shadow_offset_matches_durable", verify = "full")]
@@ -227,21 +231,15 @@ impl DurableStorage for Storage {
         &self,
         checkpointed_through_ts: u64,
     ) -> Result<(Completion, LogicalLogTruncateOutcome)> {
-        let mut log = self.logical_log.write();
-        let (c, outcome) = log.truncate(checkpointed_through_ts)?;
-        // Shadow the log's actual offset: 0 if it truncated, unchanged if it
-        // skipped (uncheckpointed frames remain), so should_checkpoint() stays
-        // accurate.
-        let new_offset = log.offset;
-        drop(log);
-        self.shadow_offset_store(new_offset);
-        Ok((c, outcome))
+        self.with_logical_log_mut(|log| log.truncate(checkpointed_through_ts))
+    }
+
+    fn finish_logical_log_truncate(&self) {
+        self.with_logical_log_mut(|log| log.publish_finished_truncate());
     }
 
     fn reset_to_fresh_header(&self) -> Result<Completion> {
-        let c = self.logical_log.write().reset_to_fresh_header()?;
-        self.shadow_offset_store(0);
-        Ok(c)
+        self.with_logical_log_mut(|log| log.reset_to_fresh_header())
     }
 
     fn get_logical_log_file(&self) -> Arc<dyn File> {
@@ -275,25 +273,29 @@ impl DurableStorage for Storage {
     }
 
     fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()> {
-        self.logical_log.write().advance_offset_after_success(bytes);
-        self.shadow_offset_advance(bytes);
+        self.with_logical_log_mut(|log| log.advance_offset_after_success(bytes));
         Ok(())
     }
 
     fn discard_pending_log_write(&self) -> Result<()> {
-        self.logical_log.write().discard_pending_write();
+        self.with_logical_log_mut(|log| log.discard_pending_write());
         Ok(())
     }
 
     fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32) {
-        let mut log = self.logical_log.write();
-        log.offset = offset;
-        log.running_crc = running_crc;
-        self.shadow_offset_store(offset);
+        self.with_logical_log_mut(|log| {
+            log.offset = offset;
+            log.running_crc = running_crc;
+        });
     }
 
     fn set_header(&self, header: logical_log::LogHeader) {
-        self.logical_log.write().set_header(header);
+        self.with_logical_log_mut(|log| log.set_header(header));
+    }
+
+    fn on_checkpoint_end(&self, _result: Result<&CheckpointResult>) -> Result<()> {
+        self.with_logical_log_mut(|log| log.publish_finished_truncate());
+        Ok(())
     }
 }
 

@@ -268,6 +268,7 @@ enum RootMapOp {
 /// The states of the locks held by the state machine - these are tracked for error handling so that they are
 /// released if the state machine fails.
 pub struct LockStates {
+    pager_commit_lock_held: bool,
     blocking_checkpoint_lock_held: bool,
     pager_read_tx: bool,
     pager_write_tx: bool,
@@ -943,6 +944,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         Self {
             state: CheckpointState::PrepareCheckpoint,
             lock_states: LockStates {
+                pager_commit_lock_held: false,
                 blocking_checkpoint_lock_held: false,
                 pager_read_tx: false,
                 pager_write_tx: false,
@@ -1043,6 +1045,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
     /// Drop checkpoint locks. Call only after `on_checkpoint_end`.
     fn release_checkpoint_locks_if_needed(&mut self) {
+        if self.lock_states.pager_commit_lock_held {
+            self.mvstore.commit_coordinator.unlock_pager_commit_lock();
+            self.lock_states.pager_commit_lock_held = false;
+        }
         if self.lock_states.blocking_checkpoint_lock_held {
             tracing::debug!("Releasing blocking checkpoint lock");
             self.checkpoint_lock.unlock();
@@ -1847,6 +1853,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             );
         }
         Ok(c)
+    }
+
+    fn finish_logical_log_truncate_and_unlock(&mut self) {
+        if self.lock_states.pager_commit_lock_held {
+            self.mvstore.storage.finish_logical_log_truncate();
+            if self.clears_whole_logical_log() {
+                turso_assert!(
+                    self.mvstore.storage.logical_log_offset() == 0,
+                    "TRUNCATE checkpoint must reset logical log offset to 0"
+                );
+                turso_assert!(
+                    self.mvstore
+                        .get_logical_log_file()
+                        .size()
+                        .expect("logical log file size should be readable after truncate")
+                        == 0,
+                    "TRUNCATE checkpoint must zero the logical log file"
+                );
+            }
+            self.mvstore.commit_coordinator.unlock_pager_commit_lock();
+            self.lock_states.pager_commit_lock_held = false;
+        }
     }
 
     /// A TRUNCATE checkpoint may clear the whole logical log only when it holds the
@@ -3260,25 +3288,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
 
             CheckpointState::TruncateLogicalLog => {
+                if !self.lock_states.pager_commit_lock_held {
+                    if !self.mvstore.commit_coordinator.pager_commit_lock.write() {
+                        if self.clears_whole_logical_log() {
+                            return Err(crate::LimboError::Busy);
+                        }
+                        self.state = CheckpointState::TruncateWal;
+                        return Ok(TransitionResult::Continue);
+                    }
+                    self.lock_states.pager_commit_lock_held = true;
+                }
                 tracing::debug!("Truncating logical log file");
                 let c = self.truncate_logical_log()?;
                 self.state = CheckpointState::TruncateWal;
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
-                    if self.clears_whole_logical_log() {
-                        turso_assert!(
-                            self.mvstore.storage.logical_log_offset() == 0,
-                            "TRUNCATE checkpoint must reset logical log offset to 0"
-                        );
-                        turso_assert!(
-                            self.mvstore
-                                .get_logical_log_file()
-                                .size()
-                                .expect("logical log file size should be readable after truncate")
-                                == 0,
-                            "TRUNCATE checkpoint must zero the logical log file"
-                        );
-                    }
+                    self.finish_logical_log_truncate_and_unlock();
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions(c)))
@@ -3355,6 +3380,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
 
             CheckpointState::TruncateWal => {
+                self.finish_logical_log_truncate_and_unlock();
                 if self.mode.should_restart_log() {
                     // Truncate/Restart renumbers WAL frames — only safe stop-the-world. Acquire
                     // the lock if the blocking path didn't already. Passive never restarts the
