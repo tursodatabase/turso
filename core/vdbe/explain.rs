@@ -929,6 +929,7 @@ pub fn insn_to_row(
                 index_reg,
                 value_reg,
                 dest,
+                require_array: _,
             } => (
                 "ArraySetElement",
                 *array_reg as i64,

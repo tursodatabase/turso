@@ -1422,9 +1422,21 @@ fn translate_function_call_expr(
                                 Insn::ArrayElement { array_reg, index_reg, dest: target_register })
                 }
                 ScalarFunc::ArraySetElement => {
+                    // `col[i] = v` desugars to this call. When the array argument
+                    // is a column that is not an array, the assignment reads a
+                    // stored value as an array it is not, so it must fail. A
+                    // literal or any other expression (the function called
+                    // directly) keeps the lenient reading.
+                    let require_array = match args[0].as_ref() {
+                        ast::Expr::Column { table, column, .. } => referenced_tables
+                            .and_then(|refs| refs.find_table_by_internal_id(*table))
+                            .and_then(|(_, t)| t.get_column_at(*column))
+                            .is_some_and(|col| !col.is_array()),
+                        _ => false,
+                    };
                     translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
                                 [array_reg <- 0, index_reg <- 1, value_reg <- 2],
-                                Insn::ArraySetElement { array_reg, index_reg, value_reg, dest: target_register })
+                                Insn::ArraySetElement { array_reg, index_reg, value_reg, dest: target_register, require_array })
                 }
                 ScalarFunc::Changes => {
                     if !args.is_empty() {
