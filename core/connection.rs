@@ -411,6 +411,9 @@ pub struct Connection {
     /// because rotating the WAL header invalidates their published
     /// watermarks.
     pub(super) wal_auto_actions: AtomicU8,
+    /// Set when `PRAGMA wal_checkpoint` on the main database fails on this connection, because
+    /// the owner of the database runs its checkpoints. See `refuse_sql_checkpoints`.
+    pub(super) sql_checkpoints_refused: AtomicBool,
     pub(super) wal_autocheckpoint: AtomicU32,
     /// Whether MVCC commits should include portable logical-change metadata in
     /// the logical log.
@@ -2303,6 +2306,18 @@ impl Connection {
     pub fn wal_auto_actions_disable(&self) {
         self.wal_auto_actions
             .store(WalAutoActions::empty().bits(), Ordering::SeqCst);
+    }
+
+    /// Makes `PRAGMA wal_checkpoint` on the main database fail on this connection. The sync engine
+    /// calls this on the connections it gives to the app: it keeps unpushed local frames in the
+    /// WAL until its own checkpoint, and a checkpoint by the app copies them into the database
+    /// file, after which pulls can no longer roll them back.
+    pub fn refuse_sql_checkpoints(&self) {
+        self.sql_checkpoints_refused.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn sql_checkpoints_refused(&self) -> bool {
+        self.sql_checkpoints_refused.load(Ordering::SeqCst)
     }
 
     /// Returns the set of automatic WAL maintenance actions this connection

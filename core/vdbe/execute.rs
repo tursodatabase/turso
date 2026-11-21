@@ -560,6 +560,14 @@ pub fn op_checkpoint(
         return Ok(InsnFunctionStepResult::Step);
     }
 
+    if *database == MAIN_DB_ID && connection.sql_checkpoints_refused() {
+        return Err(LimboError::CheckpointFailed(
+            "this connection belongs to a synced database, whose checkpoints only the sync engine \
+             runs; use the sync API's checkpoint instead of PRAGMA wal_checkpoint"
+                .to_string(),
+        )
+        .into());
+    }
     let pager = connection.get_pager_from_database_index(database)?;
     // Like SQLite, refuse only when this connection's open transaction has already
     // read or written the database. After a plain BEGIN nothing is held yet, so the

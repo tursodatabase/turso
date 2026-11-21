@@ -3234,6 +3234,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             turso_core::WalAutoActions::empty(),
             "tape must be configured to have all auto-WAL actions disabled"
         );
+        // A checkpoint by the app would copy unpushed local frames into the DB file, past the
+        // revert watermark, and every later pull would fail to roll them back.
+        conn.refuse_sql_checkpoints();
         Ok(conn)
     }
 
