@@ -84,11 +84,13 @@ fn expression_type(ty: &ExprType, schema: &Schema) -> Option<ColumnTypeInfo> {
         | ExprType::RowValue
         | ExprType::Array { .. } => return None,
     };
+    let underlying_type =
+        matches!(element, ExprType::Builtin(BuiltinType::Boolean)).then(|| "boolean".to_string());
     Some(ColumnTypeInfo {
         declared_name,
         array_dimensions,
         base_type: None,
-        underlying_type: None,
+        underlying_type,
         kind: ColumnTypeKind::Builtin,
     })
 }
@@ -126,6 +128,7 @@ fn custom_type_info(
 fn builtin_primitive(ty: BuiltinType) -> Option<&'static str> {
     match ty {
         BuiltinType::Integer
+        | BuiltinType::Boolean
         | BuiltinType::Real
         | BuiltinType::Decimal
         | BuiltinType::Numeric

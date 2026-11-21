@@ -66,6 +66,10 @@ pub enum BuiltinType {
     Decimal,
     /// A number that may be an integer or a real.
     Numeric,
+    /// The result of a comparison, `NOT`, `IN`, `LIKE` and the like: 1, 0 or
+    /// NULL. SQLite has no boolean type, so it is an integer wherever SQLite
+    /// computes with it; a dialect that has a boolean type can tell it apart.
+    Boolean,
     Text,
     Blob,
     /// Any value: a column without a declared type, or a SQLite function that may
@@ -76,7 +80,7 @@ pub enum BuiltinType {
 impl BuiltinType {
     pub(crate) fn affinity(self) -> Affinity {
         match self {
-            Self::Integer => Affinity::Integer,
+            Self::Integer | Self::Boolean => Affinity::Integer,
             Self::Real | Self::Decimal => Affinity::Real,
             Self::Numeric => Affinity::Numeric,
             Self::Text => Affinity::Text,
@@ -89,7 +93,7 @@ impl BuiltinType {
     /// written in the statement is a REAL to SQLite.
     pub(crate) fn sqlite_name(self) -> &'static str {
         match self {
-            Self::Integer => "INTEGER",
+            Self::Integer | Self::Boolean => "INTEGER",
             Self::Real | Self::Decimal => "REAL",
             Self::Numeric => "NUMERIC",
             Self::Text => "TEXT",
@@ -161,6 +165,7 @@ impl std::fmt::Display for ExprType {
             } => write!(f, "{element}{}", "[]".repeat(*dimensions as usize)),
             Self::Builtin(builtin) => f.write_str(match builtin {
                 BuiltinType::Integer => "integer",
+                BuiltinType::Boolean => "boolean",
                 BuiltinType::Real => "real",
                 BuiltinType::Decimal | BuiltinType::Numeric => "numeric",
                 BuiltinType::Text => "text",
@@ -315,7 +320,7 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             ..
         } => cast_type(type_name, env.schema()),
         ast::Expr::Unary(op, inner) => match op {
-            ast::UnaryOperator::Not => ExprType::Builtin(BuiltinType::Integer),
+            ast::UnaryOperator::Not => ExprType::Builtin(BuiltinType::Boolean),
             ast::UnaryOperator::BitwiseNot => {
                 custom_operator_type(expr, &[type_of(inner, env)], env)
                     .unwrap_or(ExprType::Builtin(BuiltinType::Integer))
@@ -386,7 +391,7 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
         | ast::Expr::SubqueryResult {
             query_type: ast::SubqueryType::Exists { .. } | ast::SubqueryType::In { .. },
             ..
-        } => ExprType::Builtin(BuiltinType::Integer),
+        } => ExprType::Builtin(BuiltinType::Boolean),
         // `x REGEXP p` calls regexp(p, x), which an extension may define.
         ast::Expr::Like {
             op: ast::LikeOperator::Regexp,
@@ -837,8 +842,8 @@ fn binary_type(
             custom_operator_type(expr, &[type_of(lhs, env), type_of(rhs, env)], env)
                 .unwrap_or(ExprType::Builtin(BuiltinType::Integer))
         }
-        Operator::BitwiseNot
-        | Operator::Equals
+        Operator::BitwiseNot => ExprType::Builtin(BuiltinType::Integer),
+        Operator::Equals
         | Operator::NotEquals
         | Operator::Less
         | Operator::LessEquals
@@ -849,7 +854,7 @@ fn binary_type(
         | Operator::And
         | Operator::Or
         | Operator::ArrayContains
-        | Operator::ArrayOverlap => ExprType::Builtin(BuiltinType::Integer),
+        | Operator::ArrayOverlap => ExprType::Builtin(BuiltinType::Boolean),
         // `||` joins arrays when either side is an array.
         Operator::Concat => {
             let lhs = type_of(lhs, env);
@@ -902,6 +907,7 @@ fn operand_type(ty: ExprType, custom_type: impl FnOnce(&TypeDef) -> ExprType) ->
     match &ty {
         ExprType::Custom { type_def, .. } => custom_type(type_def),
         ExprType::Builtin(BuiltinType::Decimal) => ExprType::Builtin(BuiltinType::Real),
+        ExprType::Builtin(BuiltinType::Boolean) => ExprType::Builtin(BuiltinType::Integer),
         ExprType::Builtin(_)
         | ExprType::Array { .. }
         | ExprType::Untyped
@@ -1024,6 +1030,7 @@ pub(crate) fn value_kind(ty: &ExprType, schema: &Schema) -> Option<BuiltinType> 
         ExprType::Builtin(BuiltinType::Decimal) => Some(BuiltinType::Real),
         ExprType::Builtin(
             builtin @ (BuiltinType::Integer
+            | BuiltinType::Boolean
             | BuiltinType::Real
             | BuiltinType::Numeric
             | BuiltinType::Text
@@ -1168,6 +1175,7 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
             Some(
                 ExprType::Builtin(
                     BuiltinType::Integer
+                    | BuiltinType::Boolean
                     | BuiltinType::Real
                     | BuiltinType::Numeric
                     | BuiltinType::Decimal
@@ -1280,6 +1288,7 @@ pub(crate) fn dialect_operand_type(ty: &ExprType) -> OperandType {
         ExprType::Untyped | ExprType::Builtin(BuiltinType::Any) => OperandType::Untyped,
         ExprType::Null => OperandType::Null,
         ExprType::Builtin(BuiltinType::Integer) => OperandType::Integer,
+        ExprType::Builtin(BuiltinType::Boolean) => OperandType::Boolean,
         ExprType::Builtin(BuiltinType::Real) => OperandType::Real,
         ExprType::Builtin(BuiltinType::Decimal | BuiltinType::Numeric) => OperandType::Decimal,
         ExprType::Builtin(BuiltinType::Text) => OperandType::Text,
@@ -1295,6 +1304,7 @@ fn from_operand_type(ty: OperandType) -> ExprType {
         OperandType::Untyped => ExprType::Untyped,
         OperandType::Null => ExprType::Null,
         OperandType::Integer => ExprType::Builtin(BuiltinType::Integer),
+        OperandType::Boolean => ExprType::Builtin(BuiltinType::Boolean),
         OperandType::Real => ExprType::Builtin(BuiltinType::Real),
         OperandType::Decimal => ExprType::Builtin(BuiltinType::Decimal),
         OperandType::Text => ExprType::Builtin(BuiltinType::Text),
@@ -1354,6 +1364,16 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
             ExprType::Untyped | ExprType::Builtin(Text),
         ) => ExprType::Builtin(Text),
         (ExprType::Builtin(a), ExprType::Builtin(b)) if a == b => ExprType::Builtin(a),
+        (ExprType::Builtin(BuiltinType::Boolean), custom @ ExprType::Custom { .. })
+        | (custom @ ExprType::Custom { .. }, ExprType::Builtin(BuiltinType::Boolean))
+            if matches!(&custom, ExprType::Custom { type_def, .. } if type_def.name == "boolean") =>
+        {
+            custom
+        }
+        (ExprType::Builtin(BuiltinType::Boolean), other)
+        | (other, ExprType::Builtin(BuiltinType::Boolean)) => {
+            common_scalar_type(ExprType::Builtin(Integer), other, schema)
+        }
         (ExprType::Builtin(Decimal), ExprType::Builtin(Integer))
         | (ExprType::Builtin(Integer), ExprType::Builtin(Decimal)) => ExprType::Builtin(Decimal),
         (

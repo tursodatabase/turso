@@ -704,6 +704,8 @@ pub enum OperandType {
     Untyped,
     Null,
     Integer,
+    /// The result of a comparison. SQLite computes with it as an integer.
+    Boolean,
     Real,
     /// A number written in the statement with a decimal point or exponent.
     Decimal,
