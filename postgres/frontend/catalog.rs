@@ -262,6 +262,22 @@ impl Dialect for PostgresDialect {
         crate::pg_types::register_scalar_types(self, builder)
     }
 
+    fn function_result_type(
+        &self,
+        name: &str,
+        args: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+        _schema: &Schema,
+    ) -> Option<turso_core::dialect::OperandType> {
+        crate::typing::function_result_type(name, args)
+    }
+
+    fn common_type(
+        &self,
+        types: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+    ) -> Option<turso_core::dialect::OperandType> {
+        crate::typing::common_type(types)
+    }
+
     fn plan_cast(
         &self,
         source: &dyn Fn() -> turso_core::dialect::OperandType,
@@ -1843,6 +1859,7 @@ impl SnapshotRows for PgTypeTable {
                 name,
                 typtype: "b",
                 typcategory: "A",
+                typispreferred: false,
                 typlen: -1,
                 typarray: 0,
                 typelem,
@@ -1940,38 +1957,38 @@ fn type_storage<'a>(schema: &'a Schema, mut name: &'a str) -> &'static str {
 
 fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
     vec![
-        Value::from_i64(t.oid),                 // oid
-        Value::build_text(t.name),              // typname
-        Value::from_i64(11),                    // typnamespace (pg_catalog)
-        Value::from_i64(10),                    // typowner
-        Value::from_i64(t.typlen),              // typlen
-        Value::from_i64(i64::from(t.typbyval)), // typbyval
-        Value::build_text(t.typtype),           // typtype
-        Value::build_text(t.typcategory),       // typcategory
-        Value::from_i64(0),                     // typispreferred
-        Value::from_i64(1),                     // typisdefined
-        Value::build_text(","),                 // typdelim
-        Value::from_i64(0),                     // typrelid
-        Value::Null,                            // typsubscript
-        Value::from_i64(t.typelem),             // typelem
-        Value::from_i64(t.typarray),            // typarray
-        Value::Null,                            // typinput
-        Value::Null,                            // typoutput
-        Value::Null,                            // typreceive
-        Value::Null,                            // typsend
-        Value::Null,                            // typmodin
-        Value::Null,                            // typmodout
-        Value::Null,                            // typanalyze
-        Value::build_text(t.typalign),          // typalign
-        Value::build_text(t.typstorage),        // typstorage
-        Value::from_i64(0),                     // typnotnull
-        Value::from_i64(0),                     // typbasetype
-        Value::from_i64(-1),                    // typtypmod
-        Value::from_i64(0),                     // typndims
-        Value::from_i64(0),                     // typcollation
-        Value::Null,                            // typdefaultbin
-        Value::Null,                            // typdefault
-        Value::Null,                            // typacl
+        Value::from_i64(t.oid),                       // oid
+        Value::build_text(t.name),                    // typname
+        Value::from_i64(11),                          // typnamespace (pg_catalog)
+        Value::from_i64(10),                          // typowner
+        Value::from_i64(t.typlen),                    // typlen
+        Value::from_i64(i64::from(t.typbyval)),       // typbyval
+        Value::build_text(t.typtype),                 // typtype
+        Value::build_text(t.typcategory),             // typcategory
+        Value::from_i64(i64::from(t.typispreferred)), // typispreferred
+        Value::from_i64(1),                           // typisdefined
+        Value::build_text(","),                       // typdelim
+        Value::from_i64(0),                           // typrelid
+        Value::Null,                                  // typsubscript
+        Value::from_i64(t.typelem),                   // typelem
+        Value::from_i64(t.typarray),                  // typarray
+        Value::Null,                                  // typinput
+        Value::Null,                                  // typoutput
+        Value::Null,                                  // typreceive
+        Value::Null,                                  // typsend
+        Value::Null,                                  // typmodin
+        Value::Null,                                  // typmodout
+        Value::Null,                                  // typanalyze
+        Value::build_text(t.typalign),                // typalign
+        Value::build_text(t.typstorage),              // typstorage
+        Value::from_i64(0),                           // typnotnull
+        Value::from_i64(0),                           // typbasetype
+        Value::from_i64(-1),                          // typtypmod
+        Value::from_i64(0),                           // typndims
+        Value::from_i64(0),                           // typcollation
+        Value::Null,                                  // typdefaultbin
+        Value::Null,                                  // typdefault
+        Value::Null,                                  // typacl
     ]
 }
 

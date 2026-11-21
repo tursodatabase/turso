@@ -21,6 +21,7 @@ mod session;
 mod settings;
 mod statement;
 mod text;
+mod typing;
 mod unique_index;
 mod unnest;
 
