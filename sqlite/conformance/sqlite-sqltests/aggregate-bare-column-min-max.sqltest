@@ -1,0 +1,271 @@
+@database :memory:
+
+# In an aggregate query with min() or max(), a column used outside an aggregate
+# takes its value from the row that holds the minimum or maximum, in the result
+# columns and in HAVING, with or without GROUP BY.
+
+setup five-rows {
+    CREATE TABLE t(a, b, g);
+    INSERT INTO t VALUES (1, 10, 0), (2, 20, 1), (5, 50, 0), (3, 30, 1), (4, 40, 0);
+}
+
+@setup five-rows
+test max-bare-column {
+    SELECT max(a), b FROM t;
+}
+expect {
+    5|50
+}
+
+@setup five-rows
+test min-bare-column {
+    SELECT min(b), a FROM t;
+}
+expect {
+    10|1
+}
+
+@setup five-rows
+test max-bare-column-not-first-or-last-row {
+    SELECT max(a), b, rowid FROM t;
+}
+expect {
+    5|50|3
+}
+
+@setup five-rows
+test max-bare-column-in-aggregate-result-column {
+    SELECT max(a) + b FROM t;
+}
+expect {
+    55
+}
+
+@setup five-rows
+test max-bare-column-in-having {
+    SELECT max(a) FROM t HAVING b = 50;
+}
+expect {
+    5
+}
+
+@setup five-rows
+test max-bare-column-in-having-of-first-row {
+    SELECT max(a) FROM t HAVING b = 10;
+}
+expect {
+}
+
+@setup five-rows
+test min-max-bare-column-in-subquery-of-aggregate-result-column {
+    SELECT min(a) + (SELECT t.b) FROM t UNION ALL SELECT max(a) + (SELECT t.b) FROM t;
+}
+expect {
+    11
+    55
+}
+
+@setup five-rows
+test max-bare-column-in-subquery-result-column {
+    SELECT max(a), (SELECT t.b) FROM t;
+}
+expect {
+    5|50
+}
+
+@setup five-rows
+test max-bare-column-in-subquery-in-having {
+    SELECT max(a) FROM t HAVING (SELECT t.b) = 50;
+}
+expect {
+    5
+}
+
+@setup five-rows
+test max-bare-column-in-subquery-with-outer-aggregate {
+    SELECT count(*) + (SELECT t.b + max(t.a)) FROM t;
+}
+expect {
+    60
+}
+
+@setup five-rows
+test max-bare-column-with-count {
+    SELECT max(a), count(*), b FROM t;
+}
+expect {
+    5|5|50
+}
+
+@setup five-rows
+test max-bare-column-with-where {
+    SELECT max(a), b FROM t WHERE a < 5;
+}
+expect {
+    4|40
+}
+
+# With several min() and max(), the last one in the query decides.
+@setup five-rows
+test max-and-min-last-one-decides {
+    SELECT max(a), min(a), b FROM t;
+}
+expect {
+    5|1|10
+}
+
+@setup five-rows
+test min-and-max-last-one-decides {
+    SELECT min(a), max(a), b FROM t;
+}
+expect {
+    1|5|50
+}
+
+# When every min() and max() has a FILTER, the first row is read even if no
+# FILTER passes.
+@setup five-rows
+test max-with-filter-bare-column {
+    SELECT max(a) FILTER (WHERE a < 4), b FROM t;
+}
+expect {
+    3|30
+}
+
+@setup five-rows
+test max-with-filter-that-never-passes-reads-first-row {
+    SELECT max(a) FILTER (WHERE a > 100), b FROM t;
+}
+expect {
+    |10
+}
+
+@setup five-rows
+test filtered-min-does-not-change-unfiltered-max-row {
+    SELECT max(a), min(a) FILTER (WHERE 0), b FROM t;
+}
+expect {
+    5||50
+}
+
+@setup five-rows
+test max-distinct-bare-column {
+    SELECT max(DISTINCT a % 3), b FROM t;
+}
+expect {
+    2|50
+}
+
+@setup five-rows
+test max-bare-column-group-by {
+    SELECT g, max(a), b FROM t GROUP BY g;
+}
+expect {
+    0|5|50
+    1|3|30
+}
+
+@setup five-rows
+test min-bare-column-group-by {
+    SELECT g, min(a), b FROM t GROUP BY g;
+}
+expect {
+    0|1|10
+    1|2|20
+}
+
+@setup five-rows
+test max-bare-column-in-aggregate-result-column-group-by {
+    SELECT g, max(a) + b FROM t GROUP BY g;
+}
+expect {
+    0|55
+    1|33
+}
+
+@setup five-rows
+test max-bare-column-in-having-group-by {
+    SELECT g, max(a) FROM t GROUP BY g HAVING b >= 40;
+}
+expect {
+    0|5
+}
+
+@setup five-rows
+test max-with-filter-that-never-passes-group-by {
+    SELECT g, max(a) FILTER (WHERE a > 100), b FROM t GROUP BY g;
+}
+expect {
+    0||10
+    1||20
+}
+
+@setup five-rows
+test filtered-min-after-max-group-by {
+    SELECT max(a), min(a) FILTER (WHERE 0), b FROM t GROUP BY g = g;
+}
+expect {
+    5||10
+}
+
+# The value does not depend on the order in which an index returns the rows.
+setup indexed {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (3, 30), (1, 10), (5, 50), (2, 20), (4, 40);
+    CREATE INDEX ta ON t(a);
+}
+
+@setup indexed
+test max-bare-column-index-range {
+    SELECT max(a) + b FROM t WHERE a < 3;
+}
+expect {
+    22
+}
+
+@setup indexed
+test max-bare-column-in-having-index-range {
+    SELECT max(a) FROM t WHERE a < 3 HAVING b = 20;
+}
+expect {
+    2
+}
+
+@setup indexed
+test min-bare-column-index-range {
+    SELECT min(a), b FROM t WHERE a > 2;
+}
+expect {
+    3|30
+}
+
+# Rows whose argument is NULL count until the first non-NULL value, and an
+# equal value does not replace the one found first.
+setup nulls-and-ties {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (NULL, 1), (NULL, 2), (7, 3), (NULL, 4), (7, 5);
+}
+
+@setup nulls-and-ties
+test max-bare-column-skips-null-and-equal-values {
+    SELECT max(a), b FROM t;
+}
+expect {
+    7|3
+}
+
+@setup nulls-and-ties
+test max-of-only-nulls-reads-last-row {
+    SELECT max(a), b FROM t WHERE b IN (1, 2, 4);
+}
+expect {
+    |4
+}
+
+@setup nulls-and-ties
+test max-bare-column-equal-under-collation {
+    SELECT max(x COLLATE NOCASE), y FROM (SELECT 'a' AS x, 1 AS y UNION ALL SELECT 'A', 2 UNION ALL SELECT 'b', 3 UNION ALL SELECT 'B', 4);
+}
+expect {
+    b|3
+}

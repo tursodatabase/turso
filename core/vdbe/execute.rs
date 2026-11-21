@@ -9679,7 +9679,10 @@ fn op_agg_step_min_max(
         state.registers.get_disjoint_mut([data.col, data.acc_reg])
     {
         if let Some(best) = payload.first_mut() {
-            step_min_max(is_max, arg, best, data.collation)?;
+            let kept_best = step_min_max(is_max, arg, best, data.collation)?;
+            if let Some(reg) = data.not_best_row_reg {
+                state.registers[reg] = Register::Value(Value::from_i64(kept_best as i64));
+            }
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
@@ -9690,27 +9693,29 @@ fn op_agg_step_min_max(
 /// One step of MIN (`is_max` false) or MAX (`is_max` true): `best` takes a
 /// copy of `arg` when `arg` is not NULL and `best` is NULL, or when `arg`
 /// orders strictly after (MAX) or before (MIN) `best` under `collation`.
+/// Returns true when `best` was not NULL and keeps its value.
 #[inline(always)]
 fn step_min_max(
     is_max: bool,
     arg: &Value,
     best: &mut Value,
     collation: CollationSeq,
-) -> Result<()> {
+) -> Result<bool> {
     // Two integers under a text collation compare as integers, and the copy
     // of an integer does not allocate.
     if let (Value::Numeric(Numeric::Integer(arg)), Value::Numeric(Numeric::Integer(best))) =
         (arg, &mut *best)
     {
         if matches!(collation, CollationSeq::Text(_)) {
-            if (is_max && *arg > *best) || (!is_max && *arg < *best) {
+            let better = (is_max && *arg > *best) || (!is_max && *arg < *best);
+            if better {
                 *best = *arg;
             }
-            return Ok(());
+            return Ok(!better);
         }
     }
     if matches!(arg, Value::Null) {
-        return Ok(());
+        return Ok(!matches!(best, Value::Null));
     }
     let better = matches!(best, Value::Null) || {
         let order = collation.compare(arg.as_ref(), best.as_ref());
@@ -9723,7 +9728,7 @@ fn step_min_max(
     if better {
         best.try_clone_from(arg)?;
     }
-    Ok(())
+    Ok(!better)
 }
 
 #[inline(never)]
@@ -9738,6 +9743,7 @@ fn op_agg_step_slow(
         delimiter,
         func,
         collation,
+        not_best_row_reg,
     } = data;
 
     if let AccumulatorFunc::Window(win_func) = func {
@@ -9792,6 +9798,34 @@ fn op_agg_step_slow(
     match func {
         AggFunc::External(_) => {
             unreachable!("extension aggregates are stepped above")
+        }
+        AggFunc::Min | AggFunc::Max if not_best_row_reg.is_some() => {
+            let [arg_reg, acc_slot] =
+                state
+                    .registers
+                    .get_disjoint_mut([*col, *acc_reg])
+                    .map_err(|_| {
+                        LimboError::InternalError(format!(
+                        "AggStep: input register {} and accumulator register {} must be distinct",
+                        *col, *acc_reg
+                    ))
+                    })?;
+            let Register::Aggregate(agg) = acc_slot else {
+                return Err(LimboError::InternalError(format!(
+                    "AggStep: register {} does not hold an aggregate accumulator",
+                    *acc_reg
+                ))
+                .into());
+            };
+            let kept_best = step_min_max(
+                matches!(func, AggFunc::Max),
+                arg_reg.get_value(),
+                &mut agg.payload_vec_mut()[0],
+                collation,
+            )?;
+            if let Some(reg) = not_best_row_reg {
+                state.registers[*reg] = Register::Value(Value::from_i64(kept_best as i64));
+            }
         }
         _ => {
             let counts_infinite_inputs =

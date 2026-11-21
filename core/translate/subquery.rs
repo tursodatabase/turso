@@ -240,13 +240,16 @@ pub(crate) fn mark_shared_cte_materialization_requirements(
 /// The appropriate time is determined by whether the subquery is correlated or uncorrelated;
 /// if it is uncorrelated, it can be evaluated as early as possible, but if it is correlated, it must be evaluated after all of its dependencies from the
 /// outer query are 'in scope', i.e. their cursors are open and rewound.
+///
+/// Returns whether a subquery in the result columns moved an aggregate up to this query,
+/// which makes this query an aggregate query.
 #[turso_macros::trace_stack]
 pub fn plan_subqueries_from_select_plan(
     program: &mut ProgramBuilder,
     plan: &mut SelectPlan,
     resolver: &Resolver,
     connection: &Arc<Connection>,
-) -> Result<()> {
+) -> Result<bool> {
     // Common-subexpression elimination for scalar subqueries shared by GROUP BY and the SELECT
     // list (e.g. `SELECT (subq) AS rs ... GROUP BY rs`, where the GROUP BY term is a copy of the
     // result column): plan and evaluate the subquery once instead of once per use.
@@ -331,7 +334,7 @@ pub fn plan_subqueries_from_select_plan(
                 connection,
                 SubqueryPosition::Having,
                 SubqueryOrigin::SelectHaving,
-                !group_by.exprs.is_empty(),
+                SubqueryPosition::Having.allow_correlated(),
                 &mut cse_map,
                 &mut same_query_map,
                 &[],
@@ -340,6 +343,7 @@ pub fn plan_subqueries_from_select_plan(
     }
 
     // Result columns
+    let aggregates_moved_before_result_columns = resolver.count_aggregates_moved_from_subqueries();
     {
         crate::stack::trace_stack!("select_result_columns");
         plan_subqueries_with_outer_query_access(
@@ -357,6 +361,8 @@ pub fn plan_subqueries_from_select_plan(
             &shared_subqueries,
         )?;
     }
+    let result_column_subqueries_moved_an_aggregate =
+        resolver.count_aggregates_moved_from_subqueries() > aggregates_moved_before_result_columns;
 
     // ORDER BY
     {
@@ -411,7 +417,7 @@ pub fn plan_subqueries_from_select_plan(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
     )?;
-    Ok(())
+    Ok(result_column_subqueries_moved_an_aggregate)
 }
 
 /// Compute query plans for subqueries in a LIMIT/OFFSET pair.
@@ -1947,6 +1953,8 @@ pub fn emit_from_clause_subquery(
                     meta_sort: None,
                     reg_agg_start: None,
                     reg_nonagg_emit_once_flag: None,
+                    reg_not_best_row: None,
+                    bare_column_regs: Vec::new(),
                     reg_result_cols_start: None,
                     limit_ctx: None,
                     reg_offset: None,
@@ -2047,6 +2055,8 @@ fn emit_indexed_materialized_subquery(
                 meta_sort: None,
                 reg_agg_start: None,
                 reg_nonagg_emit_once_flag: None,
+                reg_not_best_row: None,
+                bare_column_regs: Vec::new(),
                 reg_result_cols_start: None,
                 limit_ctx: None,
                 reg_offset: None,
@@ -2177,6 +2187,8 @@ fn emit_materialized_subquery_table(
                 meta_sort: None,
                 reg_agg_start: None,
                 reg_nonagg_emit_once_flag: None,
+                reg_not_best_row: None,
+                bare_column_regs: Vec::new(),
                 reg_result_cols_start: None,
                 limit_ctx: None,
                 reg_offset: None,
@@ -2453,6 +2465,7 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver
         .is_some_and(|group_by| !group_by.exprs.is_empty());
     let has_direct_row_output =
         !has_grouped_output && plan.aggregates.is_empty() && plan.window.is_none();
+    let has_ungrouped_aggregate = !has_grouped_output && !plan.aggregates.is_empty();
     let has_unmatched_right_rows = plan.table_references.has_right_or_full_join();
 
     // Subqueries inside an aggregate's arguments or FILTER clause are evaluated
@@ -2473,7 +2486,7 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver
         }
     }
 
-    let mut outer_aggregate_subquery_ids: Vec<ast::TableInternalId> = Vec::new();
+    let mut output_subquery_ids: Vec<ast::TableInternalId> = Vec::new();
     for subquery in plan.non_from_clause_subqueries.iter_mut() {
         // A subquery that reads an aggregate the outer query computes must run
         // in the outer query's aggregate-output phase, after that aggregate has
@@ -2490,7 +2503,23 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver
             } else {
                 SubqueryEvalPhase::UngroupedAggregateOutput
             };
-            outer_aggregate_subquery_ids.push(subquery.internal_id);
+            output_subquery_ids.push(subquery.internal_id);
+            continue;
+        }
+        // Like SQLite, an aggregate query without GROUP BY runs a correlated
+        // subquery of its result columns or HAVING once, after the loop. The subquery
+        // reads the columns saved from the row that the other non-aggregate
+        // columns come from, or NULL when no row reaches the aggregate.
+        if has_ungrouped_aggregate
+            && subquery.correlated
+            && matches!(
+                subquery.origin,
+                SubqueryOrigin::SelectList | SubqueryOrigin::SelectHaving
+            )
+            && !aggregate_subquery_ids.contains(&subquery.internal_id)
+        {
+            subquery.eval_phase = SubqueryEvalPhase::UngroupedAggregateOutput;
+            output_subquery_ids.push(subquery.internal_id);
             continue;
         }
         // These subqueries run once per input row: in output columns and
@@ -2520,20 +2549,19 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver
         };
     }
 
-    // A result column that reads one of these subqueries depends on an
-    // aggregate computed in the output phase, so it must be evaluated there
-    // rather than once per input row — the same treatment SQLite gives any
-    // result-column expression that references an aggregate result (select.c
-    // evaluates those after the aggregation loop, in the output step). Mark it
-    // so the emitter defers it, instead of taking an arbitrary row's NULL
-    // during the scan.
+    // A result column that reads one of these subqueries must be evaluated in
+    // the output phase, after the subquery, rather than once per input row —
+    // the same treatment SQLite gives any result-column expression that
+    // references an aggregate result (select.c evaluates those after the
+    // aggregation loop, in the output step). Mark it so the emitter defers it.
     for rc in plan.result_columns.iter_mut() {
-        if !rc.contains_aggregates && expr_reads_subquery(&rc.expr, &outer_aggregate_subquery_ids) {
+        if !rc.contains_aggregates && expr_reads_subquery(&rc.expr, &output_subquery_ids) {
             rc.contains_aggregates = true;
         }
     }
 
-    let columns_read_by_group_subqueries = columns_read_by_group_subqueries(plan);
+    let columns_read_by_group_subqueries =
+        columns_read_by_subqueries_in_phase(plan, SubqueryEvalPhase::GroupedOutput);
     if let Some(group_by) = plan.group_by.as_mut() {
         group_by.columns_read_by_group_subqueries = columns_read_by_group_subqueries;
     }
@@ -2541,8 +2569,11 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver
 }
 
 /// The columns of `plan`'s own tables that are read by its subqueries that run
-/// once per group.
-fn columns_read_by_group_subqueries(plan: &SelectPlan) -> Vec<ast::Expr> {
+/// in `phase` and are not emitted yet.
+pub(crate) fn columns_read_by_subqueries_in_phase(
+    plan: &SelectPlan,
+    phase: SubqueryEvalPhase,
+) -> Vec<ast::Expr> {
     let mut columns = Vec::new();
     for subquery in &plan.non_from_clause_subqueries {
         let SubqueryState::Unevaluated {
@@ -2551,7 +2582,7 @@ fn columns_read_by_group_subqueries(plan: &SelectPlan) -> Vec<ast::Expr> {
         else {
             continue;
         };
-        if subquery.eval_phase != SubqueryEvalPhase::GroupedOutput {
+        if subquery.eval_phase != phase {
             continue;
         }
         for outer_ref in subquery_plan.used_outer_query_refs() {

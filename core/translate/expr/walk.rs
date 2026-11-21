@@ -219,6 +219,26 @@ pub fn expr_references_any_subquery(expr: &ast::Expr) -> bool {
     found
 }
 
+/// Whether `expr` contains a column reference, bound or not yet bound.
+pub fn expr_reads_a_column(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if matches!(
+            e,
+            ast::Expr::Id(_)
+                | ast::Expr::Qualified(..)
+                | ast::Expr::DoublyQualified(..)
+                | ast::Expr::Column { .. }
+                | ast::Expr::RowId { .. }
+        ) {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
 pub fn expr_references_outer_query(expr: &ast::Expr, table_references: &TableReferences) -> bool {
     let mut has_outer_ref = false;
     walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {

@@ -401,6 +401,10 @@ impl Dialect for PostgresDialect {
         false
     }
 
+    fn aggregate_in_having_makes_query_aggregate(&self) -> bool {
+        true
+    }
+
     fn mod_of_integers_is_integer(&self) -> bool {
         true
     }

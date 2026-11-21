@@ -1221,6 +1221,30 @@ expect {
     200
 }
 
+@setup having_t
+test having-without-group-by-with-an-aggregate-only-in-having {
+    SELECT 1 FROM t HAVING max(y) > 10;
+}
+expect {
+    1
+}
+
+@setup having_t
+test having-without-group-by-with-a-window-function-and-an-aggregate-only-in-having {
+    SELECT count(*) OVER () FROM t HAVING sum(x) > 0;
+}
+expect {
+    1
+}
+
+@setup having_t
+test having-without-group-by-with-a-window-function-over-an-aggregate {
+    SELECT sum(sum(x)) OVER () FROM t HAVING sum(x) > 0;
+}
+expect {
+    3
+}
+
 test having-without-group-by-keeps-one-group-for-an-empty-table {
     CREATE TABLE e (y int);
     SELECT count(*), max(y) FROM e HAVING true;

@@ -1,6 +1,7 @@
 use crate::{
     alloc::{TursoFromIterator, TursoIteratorExt},
     emit_explain,
+    function::AggFunc,
     schema::{BTreeCharacteristics, BTreeTable},
     sync::Arc,
     translate::{
@@ -10,7 +11,8 @@ use crate::{
             MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
             OperationMode, ResultSetColumn, TableMask, TranslateCtx,
         },
-        expr::expr_references_subquery_id,
+        expr::{expr_references_subquery_id, walk_expr, WalkControl},
+        expression_index::selected_expression_index,
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
         optimizer::{constraints::partial_index, mark_partial_index_predicate_terms_consumed},
@@ -24,8 +26,8 @@ use crate::{
         planner::table_mask_from_expr,
         select::emit_simple_count,
         subquery::{
-            emit_from_clause_subqueries, emit_non_from_clause_subqueries_for_eval_at,
-            emit_non_from_clause_subqueries_for_phase,
+            columns_read_by_subqueries_in_phase, emit_from_clause_subqueries,
+            emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subqueries_for_phase,
         },
         values::emit_values,
         window::{emit_window_flush, EmitWindow},
@@ -118,24 +120,43 @@ pub fn emit_query<'a>(
     // Emit FROM clause subqueries first so the results can be read in the main query loop.
     emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
 
-    // For non-grouped aggregation queries that also have non-aggregate columns,
-    // we need to ensure non-aggregate columns are only emitted once.
-    // This flag helps track whether we've already emitted these columns.
-    // It also tells whether any row reached the aggregate, which a correlated
-    // subquery in the result columns needs even when every column contains an
-    // aggregate: if no row did, the subquery runs again against the NULL row.
-    let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
-        && plan.group_by.is_none()
-        && (plan.result_columns.iter().any(|c| !c.contains_aggregates)
-            || plan
-                .non_from_clause_subqueries
-                .iter()
-                .any(|s| s.correlated && s.origin == SubqueryOrigin::SelectList));
+    let has_group_by_exprs = plan
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| !gb.exprs.is_empty());
+
+    // An aggregate query without GROUP BY reads the non-aggregate columns of
+    // its result columns and HAVING from the first row only, or, when it has a
+    // min() or max(), from each row that holds a new minimum or maximum, like
+    // SQLite. The once-flag tells whether the first row has been read.
+    let is_ungrouped_aggregate = !plan.aggregates.is_empty() && !has_group_by_exprs;
+    let bare_columns = if is_ungrouped_aggregate {
+        columns_outside_aggregates(plan)?
+    } else {
+        Vec::new()
+    };
+    let has_ungrouped_nonagg_cols = is_ungrouped_aggregate
+        && (plan.result_columns.iter().any(|c| !c.contains_aggregates) || !bare_columns.is_empty());
 
     if has_ungrouped_nonagg_cols {
         let flag = program.alloc_register();
         program.emit_int(0, flag); // Initialize flag to 0 (not yet emitted)
         t_ctx.reg_nonagg_emit_once_flag = Some(flag);
+        if plan
+            .aggregates
+            .iter()
+            .any(|agg| matches!(agg.func, AggFunc::Min | AggFunc::Max))
+        {
+            let reg = program.alloc_register();
+            program.emit_int(0, reg);
+            t_ctx.reg_not_best_row = Some(reg);
+        }
+    }
+
+    // The registers stay NULL when no row reaches the aggregate.
+    if !bare_columns.is_empty() {
+        let start = program.alloc_registers_and_init_w_null(bare_columns.len());
+        t_ctx.bare_column_regs = bare_columns.into_iter().zip(start..).collect();
     }
 
     // Allocate registers for result columns
@@ -156,11 +177,6 @@ pub fn emit_query<'a>(
             }
         }
     }
-
-    let has_group_by_exprs = plan
-        .group_by
-        .as_ref()
-        .is_some_and(|gb| !gb.exprs.is_empty());
 
     // Initialize cursors and other resources needed for query execution
     if !plan.order_by.is_empty() {
@@ -346,6 +362,59 @@ pub fn emit_query<'a>(
 
     program.preassign_label_to_next_insn(end_label);
     Ok(t_ctx.reg_result_cols_start.unwrap())
+}
+
+/// Column references outside aggregate calls, in the result columns that
+/// contain an aggregate, in HAVING and in the subqueries that run after the
+/// loop. Columns of an outer query are left out: the outer cursor does not
+/// move while this query's loop runs.
+fn columns_outside_aggregates(plan: &SelectPlan) -> Result<Vec<Expr>> {
+    let having = plan
+        .group_by
+        .as_ref()
+        .and_then(|gb| gb.having.as_deref())
+        .unwrap_or_default();
+    let exprs = plan
+        .result_columns
+        .iter()
+        .filter(|rc| rc.contains_aggregates)
+        .map(|rc| &rc.expr)
+        .chain(having);
+    let mut columns: Vec<Expr> = Vec::new();
+    for column in
+        columns_read_by_subqueries_in_phase(plan, SubqueryEvalPhase::UngroupedAggregateOutput)
+    {
+        if !columns.contains(&column) {
+            columns.push(column);
+        }
+    }
+    for expr in exprs {
+        walk_expr(expr, &mut |expr| match expr {
+            // An expression index gives the whole expression from its cursor.
+            _ if selected_expression_index(expr, &plan.table_references).is_some() => {
+                if !columns.contains(expr) {
+                    columns.push(expr.clone());
+                }
+                Ok(WalkControl::SkipChildren)
+            }
+            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
+                if plan
+                    .table_references
+                    .find_joined_table_by_internal_id(*table)
+                    .is_some()
+                    && !columns.contains(expr)
+                {
+                    columns.push(expr.clone());
+                }
+                Ok(WalkControl::SkipChildren)
+            }
+            _ if plan.aggregates.iter().any(|a| a.original_expr == *expr) => {
+                Ok(WalkControl::SkipChildren)
+            }
+            _ => Ok(WalkControl::Continue),
+        })?;
+    }
+    Ok(columns)
 }
 
 #[derive(Debug, Clone)]

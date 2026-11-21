@@ -200,3 +200,16 @@ expect {
     1|0n
     2|0n
 }
+
+# The bare column inside an aggregate result column must be NULL for an outer
+# row with no match, not the value read for an earlier outer row.
+@setup outer-and-inner
+test correlated-aggregate-column-bare-column-zero-rows {
+    SELECT t1.a, (SELECT count(*) + coalesce(t2.c, 100) FROM t2 WHERE t2.a = t1.a) FROM t1 ORDER BY 1;
+}
+expect {
+    1|11
+    2|22
+    3|41
+    4|100
+}
