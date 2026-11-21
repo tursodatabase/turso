@@ -829,6 +829,8 @@ fn get_subquery_parser<'a>(
                     plan.offset.is_some() && plan.distinctness.is_distinct_on();
                 if !offset_counts_distinct_on_groups {
                     plan.order_by.clear();
+                    // Ties do not change whether the subquery returns a row.
+                    plan.limit_with_ties = false;
                     plan.distinctness = crate::translate::plan::Distinctness::NonDistinct;
                 }
                 let correlated = select_plan_has_outer_scope_dependency(&plan);
@@ -987,6 +989,8 @@ fn get_subquery_parser<'a>(
                         },
                     });
                 } else {
+                    // Only the first row is read, so the rows that tie with it are not needed.
+                    plan.limit_with_ties = false;
                     plan.limit = Some(match plan.limit.take() {
                         None => numeric(1),
                         Some(expr) => match parse_signed_number(&expr) {

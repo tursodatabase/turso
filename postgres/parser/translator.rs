@@ -354,6 +354,7 @@ impl PostgreSQLTranslator {
                     },
                 }),
                 offset: None,
+                with_ties: false,
             }),
         }))
     }
@@ -1985,6 +1986,7 @@ impl PostgreSQLTranslator {
             select.limit = Some(ast::Limit {
                 expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".into()))),
                 offset: None,
+                with_ties: false,
             });
         }
 
@@ -5213,7 +5215,11 @@ impl PostgreSQLTranslator {
         };
 
         match (count, offset) {
-            (Some(expr), offset) => Ok(Some(ast::Limit { expr, offset })),
+            (Some(expr), offset) => Ok(Some(ast::Limit {
+                expr,
+                offset,
+                with_ties: false,
+            })),
             (None, Some(off)) => {
                 // OFFSET without LIMIT: use LIMIT -1 (unlimited) with the offset
                 let unlimited =
@@ -5221,6 +5227,7 @@ impl PostgreSQLTranslator {
                 Ok(Some(ast::Limit {
                     expr: unlimited,
                     offset: Some(off),
+                    with_ties: false,
                 }))
             }
             (None, None) => Ok(None),

@@ -1056,6 +1056,8 @@ pub struct SelectPlan {
     pub limit: Option<Box<Expr>>,
     /// offset clause
     pub offset: Option<Box<Expr>>,
+    /// `LIMIT ... WITH TIES`: rows equal to the last counted row in every ORDER BY term follow it.
+    pub limit_with_ties: bool,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
     /// the destination of the resulting rows from this plan.

@@ -775,6 +775,11 @@ impl ToTokens for SelectPlan {
             s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
         }
 
+        if self.limit_with_ties {
+            s.append(TokenType::TK_WITH, None)?;
+            s.append(TokenType::TK_TIES, None)?;
+        }
+
         Ok(())
     }
 }

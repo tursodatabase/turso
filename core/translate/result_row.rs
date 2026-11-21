@@ -1,4 +1,4 @@
-use crate::turso_assert_eq;
+use crate::{turso_assert, turso_assert_eq};
 use crate::{
     vdbe::{
         builder::ProgramBuilder,
@@ -161,6 +161,11 @@ pub fn emit_select_result(
         }
     }
 
+    let limit_counts_unsorted_rows = label_on_limit_reached.is_some() && plan.order_by.is_empty();
+    turso_assert!(
+        !(plan.limit_with_ties && limit_counts_unsorted_rows),
+        "LIMIT WITH TIES reads its rows from a sorter"
+    );
     emit_result_row_and_limit(program, plan, start_reg, limit_ctx, label_on_limit_reached)?;
     program.preassign_label_to_next_insn(label_after_row);
     Ok(())

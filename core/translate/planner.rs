@@ -1526,6 +1526,11 @@ fn prepare_recursive_cte_plan(
         &recursive_query,
         resolver,
     )?;
+    if select.limit.as_ref().is_some_and(|limit| limit.with_ties) {
+        crate::bail_parse_error!(
+            "WITH TIES is not supported in a recursive common table expression"
+        );
+    }
     let (limit, offset) = select
         .limit
         .clone()

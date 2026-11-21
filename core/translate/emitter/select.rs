@@ -172,6 +172,7 @@ pub fn emit_query<'a>(
             &plan.table_references,
             has_group_by_exprs,
             plan.distinctness != Distinctness::NonDistinct,
+            plan.limit_with_ties,
             &plan.aggregates,
         )?;
     }
@@ -1119,6 +1120,7 @@ fn build_materialized_build_input_plan(
         limit: None,
         offset: None,
         contains_constant_false_condition: false,
+        limit_with_ties: false,
         query_destination: QueryDestination::EphemeralTable {
             cursor_id,
             table,

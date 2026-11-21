@@ -9,10 +9,12 @@ use crate::{
     schema::{Index, IndexColumn, PseudoCursorType, Schema},
     translate::{collate::CollationSeq, group_by::is_orderby_agg_or_const, plan::Aggregate},
     turso_assert,
+    types::KeyInfo,
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{to_u32, IdxInsertFlags, Insn, SorterOpenData},
+        BranchOffset,
     },
     Result,
 };
@@ -85,6 +87,15 @@ pub struct SortMetadata {
 }
 pub struct EmitOrderBy;
 
+struct LimitWithTies {
+    /// ORDER BY terms of the last counted row.
+    reg_last_counted_key_start: usize,
+    reg_key_start: usize,
+    /// 0 until the limit has counted its last row.
+    reg_limit_reached: usize,
+    label_limit_reached: BranchOffset,
+}
+
 impl EmitOrderBy {
     /// Initialize resources needed for ORDER BY processing
     #[allow(clippy::too_many_arguments)]
@@ -100,6 +111,7 @@ impl EmitOrderBy {
         referenced_tables: &TableReferences,
         has_group_by: bool,
         has_distinct: bool,
+        limit_with_ties: bool,
         aggregates: &[Aggregate],
     ) -> Result<()> {
         for (expr, _, _) in order_by.iter() {
@@ -121,8 +133,12 @@ impl EmitOrderBy {
             .all(|(e, _, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
 
         let has_explicit_nulls = order_by.iter().any(|(_, _, nulls)| nulls.is_some());
-        let use_heap_sort =
-            !has_distinct && !has_group_by && t_ctx.limit_ctx.is_some() && !has_explicit_nulls;
+        // The heap sort keeps only as many rows as the LIMIT counts, so it loses the ties.
+        let use_heap_sort = !has_distinct
+            && !has_group_by
+            && t_ctx.limit_ctx.is_some()
+            && !has_explicit_nulls
+            && !limit_with_ties;
 
         // only emit sequence column if (we have GROUP BY and ORDER BY is not only aggregates or constants) OR (we decided to use heap-sort)
         let has_sequence = (has_group_by && !only_aggs) || use_heap_sort;
@@ -314,6 +330,27 @@ impl EmitOrderBy {
             _ => None,
         };
 
+        let limit_with_ties = if plan.limit_with_ties && plan.limit.is_some() {
+            turso_assert!(
+                !use_heap_sort,
+                "LIMIT WITH TIES reads its rows from a sorter"
+            );
+            let ties = LimitWithTies {
+                // `Insn::Compare` needs its first run of registers to come before its second.
+                reg_last_counted_key_start: program.alloc_registers(order_by.len()),
+                reg_key_start: program.alloc_registers(order_by.len()),
+                reg_limit_reached: program.alloc_register(),
+                label_limit_reached: program.allocate_label(),
+            };
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: ties.reg_limit_reached,
+            });
+            Some(ties)
+        } else {
+            None
+        };
+
         program.preassign_label_to_next_insn(sort_loop_start_label);
 
         if !use_heap_sort {
@@ -342,6 +379,38 @@ impl EmitOrderBy {
                 key_collations,
                 sort_loop_next_label,
             );
+        }
+
+        if let Some(ties) = &limit_with_ties {
+            // Past the limit, the first row that differs from the last counted row ends the query.
+            let label_row_is_returned = program.allocate_label();
+            program.emit_insn(Insn::IfNot {
+                reg: ties.reg_limit_reached,
+                target_pc: label_row_is_returned,
+                jump_if_null: true,
+            });
+            let mut key_info = std::vec::Vec::with_capacity(order_by.len());
+            for (i, (expr, _, _)) in order_by.iter().enumerate() {
+                program.emit_column_or_rowid(cursor_id, i, ties.reg_key_start + i);
+                key_info.push(KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation: ExprContext::new(Some(&plan.table_references), &t_ctx.resolver)
+                        .expr_collation(expr)?,
+                    nulls_order: None,
+                });
+            }
+            program.emit_insn(Insn::Compare {
+                start_reg_a: ties.reg_last_counted_key_start,
+                start_reg_b: ties.reg_key_start,
+                count: order_by.len(),
+                key_info,
+            });
+            program.emit_insn(Insn::Jump {
+                target_pc_lt: sort_loop_end_label,
+                target_pc_eq: label_row_is_returned,
+                target_pc_gt: sort_loop_end_label,
+            });
+            program.preassign_label_to_next_insn(label_row_is_returned);
         }
 
         emit_offset(program, sort_loop_next_label, t_ctx.reg_offset);
@@ -400,12 +469,26 @@ impl EmitOrderBy {
             plan,
             start_reg,
             t_ctx.limit_ctx,
-            if !use_heap_sort {
-                Some(sort_loop_end_label)
-            } else {
-                None
+            match &limit_with_ties {
+                Some(ties) => Some(ties.label_limit_reached),
+                None if !use_heap_sort => Some(sort_loop_end_label),
+                None => None,
             },
         )?;
+        if let Some(ties) = &limit_with_ties {
+            // A row past the limit takes the counter below zero, so it does not jump here.
+            program.emit_insn(Insn::Goto {
+                target_pc: sort_loop_next_label,
+            });
+            program.preassign_label_to_next_insn(ties.label_limit_reached);
+            for i in 0..order_by.len() {
+                program.emit_column_or_rowid(cursor_id, i, ties.reg_last_counted_key_start + i);
+            }
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: ties.reg_limit_reached,
+            });
+        }
 
         program.preassign_label_to_next_insn(sort_loop_next_label);
         if !use_heap_sort {

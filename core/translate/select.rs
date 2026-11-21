@@ -266,6 +266,9 @@ pub(crate) fn prepare_select_plan_from_arms(
             );
         }
     }
+    if limit.as_ref().is_some_and(|limit| limit.with_ties) {
+        crate::bail_parse_error!("WITH TIES is not supported in a compound SELECT");
+    }
     let (mut limit, mut offset) =
         limit.map_or(Ok((None, None)), |limit| parse_limit(limit, resolver))?;
     let mut cse_map = Vec::new();
@@ -416,6 +419,7 @@ fn prepare_one_select_plan(
                 limit: None,
                 offset: None,
                 contains_constant_false_condition: false,
+                limit_with_ties: false,
                 query_destination,
                 distinctness: match &distinctness {
                     Some(ast::SelectDistinctness::Distinct) => Distinctness::Distinct {
@@ -706,6 +710,10 @@ fn prepare_one_select_plan(
             }
 
             // Parse the ORDER BY clause
+            let limit_with_ties = limit.as_ref().is_some_and(|limit| limit.with_ties);
+            if limit_with_ties && order_by.is_empty() {
+                crate::bail_parse_error!("WITH TIES cannot be specified without ORDER BY clause");
+            }
             let mut key = Vec::new();
             let agg_count_before_order_by = plan.aggregates.len();
             let has_group_by = plan
@@ -884,6 +892,8 @@ fn prepare_one_select_plan(
             {
                 (plan.limit, plan.offset) =
                     limit.map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
+                // A query whose ORDER BY was removed above returns one row, which has no ties.
+                plan.limit_with_ties = limit_with_ties && !plan.order_by.is_empty();
             }
 
             if !windows.is_empty() {
@@ -983,6 +993,7 @@ fn prepare_one_select_plan(
                 limit: None,
                 offset: None,
                 contains_constant_false_condition: false,
+                limit_with_ties: false,
                 query_destination,
                 distinctness: Distinctness::NonDistinct,
                 values,

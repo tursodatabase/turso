@@ -408,6 +408,7 @@ impl Select {
             limit: self.limit.map(|l| ast::Limit {
                 expr: ast::Expr::Literal(ast::Literal::Numeric(l.to_string())).into_boxed(),
                 offset: None,
+                with_ties: false,
             }),
         }
     }

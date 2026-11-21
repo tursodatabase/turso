@@ -1,0 +1,131 @@
+@database :memory:
+
+# LIMIT ... WITH TIES, a Turso extension to SQLite. The rows follow FETCH FIRST ... WITH TIES of
+# PostgreSQL. The spelling, with WITH TIES after the offset, follows ClickHouse.
+
+setup rows {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 'p'), (2, 'q'), (2, 'r'), (2, 's'), (3, 'u'), (NULL, 'n1'), (NULL, 'n2');
+}
+
+setup indexed {
+    CREATE TABLE i(a, b);
+    INSERT INTO i VALUES (1, 'p'), (2, 'q'), (2, 'r'), (2, 's'), (3, 'u');
+    CREATE INDEX i_a ON i(a);
+}
+
+@setup rows
+test rows-equal-to-the-last-counted-row-are-returned {
+    SELECT a, b FROM t ORDER BY a DESC LIMIT 2 WITH TIES;
+}
+expect unordered {
+    3|u
+    2|q
+    2|r
+    2|s
+}
+
+@setup rows
+test nulls-tie-with-each-other {
+    SELECT a, b FROM t ORDER BY a LIMIT 1 WITH TIES;
+}
+expect unordered {
+    |n1
+    |n2
+}
+
+@setup rows
+test with-ties-follows-offset {
+    SELECT a, b FROM t ORDER BY a DESC LIMIT 1 OFFSET 2 WITH TIES;
+}
+expect unordered {
+    2|r
+    2|s
+}
+
+@setup rows
+test negative-limit-returns-every-row {
+    SELECT count(*) FROM (SELECT a FROM t ORDER BY a LIMIT -1 WITH TIES);
+}
+expect {
+    7
+}
+
+@setup rows
+test zero-limit-returns-no-rows {
+    SELECT a FROM t ORDER BY a LIMIT 0 WITH TIES;
+}
+expect {
+}
+
+@setup rows
+test collation-of-the-order-by-term-decides-a-tie {
+    SELECT b FROM (SELECT 'a' AS b UNION ALL SELECT 'A' UNION ALL SELECT 'b')
+    ORDER BY b COLLATE NOCASE LIMIT 1 WITH TIES;
+}
+expect unordered {
+    a
+    A
+}
+
+@setup indexed
+test index-order-still-returns-the-ties {
+    SELECT a, b FROM i ORDER BY a LIMIT 2 WITH TIES;
+}
+expect unordered {
+    1|p
+    2|q
+    2|r
+    2|s
+}
+
+@setup rows
+test scalar-subquery-reads-the-first-row {
+    SELECT (SELECT a FROM t ORDER BY a DESC LIMIT 1 OFFSET 1 WITH TIES);
+}
+expect {
+    2
+}
+
+@setup rows
+test view-keeps-with-ties-in-its-text {
+    CREATE VIEW v AS SELECT a, b FROM t ORDER BY a DESC LIMIT 2 WITH TIES;
+    SELECT sql FROM sqlite_schema WHERE name = 'v';
+    SELECT count(*) FROM v;
+}
+expect {
+    CREATE VIEW v AS SELECT a, b FROM t ORDER BY a DESC LIMIT 2 WITH TIES
+    4
+}
+
+@setup rows
+test error-without-order-by {
+    SELECT a FROM t LIMIT 1 WITH TIES;
+}
+expect error {
+    WITH TIES cannot be specified without ORDER BY clause
+}
+
+@setup rows
+test error-compound-select {
+    SELECT a FROM t UNION ALL SELECT a FROM t ORDER BY 1 LIMIT 1 WITH TIES;
+}
+expect error {
+    WITH TIES is not supported in a compound SELECT
+}
+
+@setup rows
+test with-ties-follows-the-comma-form {
+    SELECT a, b FROM t ORDER BY a DESC LIMIT 2, 1 WITH TIES;
+}
+expect unordered {
+    2|r
+    2|s
+}
+
+@setup rows
+test error-offset-after-with-ties {
+    SELECT a FROM t ORDER BY a LIMIT 1 WITH TIES OFFSET 2;
+}
+expect error {
+}
