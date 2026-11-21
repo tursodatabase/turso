@@ -11028,26 +11028,23 @@ pub fn op_function(
                     let row_namespace =
                         crate::namespace::demangle_name(supports_namespaces, &name).0;
 
-                    // Only the renamed table's own automatic indexes embed its
-                    // name. Another table can share the prefix (`t` and `t_x`),
-                    // so its `sqlite_autoindex_t_x_1` must stay untouched.
-                    let renamed_autoindex = if normalize_ident(&tbl_name) == rename_from {
-                        crate::util::renamed_automatic_index_name(&name, &rename_from, &rename_to)
+                    // Like SQLite, only the rows of the renamed table (matched
+                    // by tbl_name without regard to case) are renamed: the
+                    // table row, its automatic indexes and its triggers.
+                    let (new_name, new_tbl_name) = if tbl_name.eq_ignore_ascii_case(&rename_from) {
+                        let new_name = match entry_type.as_str() {
+                            "table" => original_rename_to.to_string(),
+                            "index" => crate::util::renamed_automatic_index_name(
+                                &normalize_ident(&name),
+                                &rename_from,
+                                original_rename_to.as_str(),
+                            )
+                            .unwrap_or(name),
+                            _ => name,
+                        };
+                        (new_name, original_rename_to.to_string())
                     } else {
-                        None
-                    };
-                    let new_name = if let Some(index_name) = renamed_autoindex {
-                        index_name
-                    } else if name == rename_from {
-                        rename_to.clone()
-                    } else {
-                        name
-                    };
-
-                    let new_tbl_name = if tbl_name == rename_from {
-                        rename_to.clone()
-                    } else {
-                        tbl_name
+                        (name, tbl_name)
                     };
 
                     let new_sql = 'sql: {
@@ -16978,16 +16975,16 @@ pub fn op_rename_table(
             // An automatic index is named after the table's mangled name, the
             // name its schema row has.
             let mangled_from = crate::namespace::mangle_name(*namespace, &normalized_from);
-            let mangled_to = crate::namespace::mangle_name(*namespace, &normalized_to);
+            let mangled_declared_to = crate::namespace::mangle_name(*namespace, to);
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
                 normalized_to.clone_into(&mut index.table_name);
-                if let Some(name) = crate::util::renamed_automatic_index_name(
+                if let Some(declared_name) = crate::util::renamed_automatic_index_name(
                     &index.name,
                     &mangled_from,
-                    &mangled_to,
+                    &mangled_declared_to,
                 ) {
-                    index.name = name;
+                    index.set_name(declared_name);
                 }
             });
 
@@ -17025,7 +17022,7 @@ pub fn op_rename_table(
                 }
 
                 normalized_to.clone_into(&mut btree.name);
-                normalized_to.clone_into(&mut btree.declared_name);
+                to.clone_into(&mut btree.declared_name);
             }
             Table::Virtual(vtab) => {
                 Arc::make_mut(vtab).name.clone_from(&normalized_to);

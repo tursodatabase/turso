@@ -192,7 +192,10 @@ impl VTable for KVStoreTable {
     fn rename(&mut self, new_name: &str) -> Result<(), Self::Error> {
         // not a real extension of course, just asserting test in
         // testing/cli_tests/extensions.py
-        assert_eq!(new_name, "renamed");
+        assert!(
+            matches!(new_name, "renamed" | "NewKv"),
+            "unexpected new name: {new_name}"
+        );
         Ok(())
     }
 

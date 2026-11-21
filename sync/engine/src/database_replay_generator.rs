@@ -889,7 +889,7 @@ impl DatabaseReplayGenerator {
         let object_type = sql_string_literal(object_type);
         let name = sql_string_literal(name);
         let query =
-            format!("SELECT 1 FROM sqlite_schema WHERE type = {object_type} AND name = {name}");
+            format!("SELECT 1 FROM sqlite_schema WHERE type = {object_type} AND name = {name} COLLATE NOCASE");
         let mut stmt = self.conn.prepare(query)?;
         Ok(run_stmt_once(coro, &mut stmt).await?.is_some())
     }

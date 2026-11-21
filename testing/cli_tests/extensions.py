@@ -540,6 +540,14 @@ def _test_kv(exec_name, ext_path):
         lambda res: 'CREATE VIRTUAL TABLE "renamed" USING kv_store',
         "renamed table shows up in sqlite_schema",
     )
+    turso.run_test_fn(
+        'alter table RENAMED rename to "NewKv";', lambda res: "" == res, "can rename to a mixed-case name"
+    )
+    turso.run_test_fn(
+        "select name, tbl_name from sqlite_schema where name = 'NewKv';",
+        lambda res: res == "NewKv|NewKv",
+        "renamed virtual table keeps the declared name in sqlite_schema",
+    )
     turso.quit()
 
 

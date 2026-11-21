@@ -56,6 +56,21 @@ expect {
     main|v1|view|2|0|0
 }
 
+@cross-check-integrity
+test pragma-table-list-mixed-case-names {
+    CREATE TABLE "Pk6"(a, b);
+    CREATE VIEW testView AS SELECT a FROM "Pk6";
+    SELECT schema, name, type, ncol, wr, strict FROM pragma_table_list WHERE name NOT LIKE 'sqlite_%' ORDER BY name;
+    PRAGMA table_list('PK6');
+    PRAGMA table_list('TESTVIEW');
+}
+expect {
+    main|Pk6|table|2|0|0
+    main|testView|view|1|0|0
+    main|Pk6|table|2|0|0
+    main|testView|view|1|0|0
+}
+
 test pragma-table-list-includes-sqlite-schema {
     SELECT schema, name, type, ncol, wr, strict FROM pragma_table_list WHERE name = 'sqlite_schema';
 }
