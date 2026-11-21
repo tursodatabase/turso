@@ -105,7 +105,7 @@ pub(crate) use columns::emit_encoded_default;
 pub use columns::{emit_stored_column, emit_table_column};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_type_operators::{
-    check_custom_operator, custom_operator_call, emit_operator_call_on_registers,
+    check_comparison, check_custom_operator, custom_operator_call, emit_operator_call_on_registers,
 };
 pub(crate) use custom_types::read_untyped_operand_as;
 pub(crate) use custom_types::{

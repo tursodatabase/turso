@@ -250,14 +250,14 @@ impl<'a> TypeEnv<'a> {
         }
     }
 
-    fn tables(&self) -> Option<&TableReferences> {
+    pub(super) fn tables(&self) -> Option<&TableReferences> {
         match self {
             Self::Statement { tables, .. } => *tables,
             Self::Table { .. } | Self::TypeBody { .. } => None,
         }
     }
 
-    fn resolver(&self) -> Option<&Resolver<'a>> {
+    pub(super) fn resolver(&self) -> Option<&Resolver<'a>> {
         match self {
             Self::Statement { resolver, .. } => Some(resolver),
             Self::Table { .. } | Self::TypeBody { .. } => None,

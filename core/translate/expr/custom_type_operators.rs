@@ -6,11 +6,12 @@
 //! Nothing is written into the expression tree.
 
 use super::*;
+use crate::dialect::OperatorResolution;
 use crate::function::Deterministic;
 use crate::schema::{OperatorArg, OperatorSignature, BINARY_OPERATORS, PREFIX_OPERATORS};
 use crate::translate::expr::expr_type::{
-    same_type_def, sqlite_operand_type, type_of, without_wrappers, BuiltinType, ColumnCustomType,
-    ExprType, TypeEnv,
+    dialect_operand_type, same_type_def, sqlite_operand_type, type_of, without_wrappers,
+    BuiltinType, ColumnCustomType, ExprType, TypeEnv,
 };
 
 /// The function that runs the operator expression `expr`, such as `a + b` or
@@ -38,6 +39,87 @@ pub(crate) fn check_custom_operator(expr: &ast::Expr, env: &TypeEnv) -> Result<(
         return Ok(());
     }
     find_operator_call(expr, &types, env).map(|_| ())
+}
+
+/// Fails when the dialect has no comparison for the operands of `expr`, as
+/// PostgreSQL has none for `text = integer`. The comparisons of `expr` are
+/// its own operator, the two of a BETWEEN, and the `=` of each value of an
+/// IN list. An operand whose type is not known yet leaves the decision to a
+/// check once it is known.
+pub(crate) fn check_comparison(expr: &ast::Expr, env: &TypeEnv) -> Result<()> {
+    let Some(resolver) = env.resolver() else {
+        return Ok(());
+    };
+    for (lhs, symbol, rhs) in comparisons_of(expr) {
+        if is_hidden_column(lhs, env) || is_hidden_column(rhs, env) {
+            continue;
+        }
+        let (lhs_type, rhs_type) = (type_of(lhs, env), type_of(rhs, env));
+        if matches!(lhs_type, ExprType::NotKnownYet) || matches!(rhs_type, ExprType::NotKnownYet) {
+            continue;
+        }
+        let operand_types = || {
+            vec![
+                dialect_operand_type(&lhs_type),
+                dialect_operand_type(&rhs_type),
+            ]
+        };
+        if resolver
+            .catalog
+            .dialect
+            .resolve_operator(symbol, &operand_types)
+            == OperatorResolution::Reject
+        {
+            crate::bail_parse_error!("operator does not exist: {lhs_type} {symbol} {rhs_type}");
+        }
+    }
+    Ok(())
+}
+
+/// The comparisons that `expr` makes: left operand, operator, right operand.
+fn comparisons_of(expr: &ast::Expr) -> Vec<(&ast::Expr, &'static str, &ast::Expr)> {
+    match expr {
+        ast::Expr::Binary(lhs, op, rhs) => comparison_symbol(op)
+            .map(|symbol| (lhs.as_ref(), symbol, rhs.as_ref()))
+            .into_iter()
+            .collect(),
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => vec![
+            (lhs.as_ref(), ">=", start.as_ref()),
+            (lhs.as_ref(), "<=", end.as_ref()),
+        ],
+        ast::Expr::InList { lhs, rhs, .. } => rhs
+            .iter()
+            .map(|value| (lhs.as_ref(), "=", value.as_ref()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether `expr` is a hidden column, such as the argument of a table
+/// function, which the engine compares with the argument itself.
+fn is_hidden_column(expr: &ast::Expr, env: &TypeEnv) -> bool {
+    let ast::Expr::Column { table, column, .. } = without_wrappers(expr) else {
+        return false;
+    };
+    env.tables()
+        .and_then(|tables| tables.find_table_by_internal_id(*table))
+        .and_then(|(_, table)| table.get_column_at(*column))
+        .is_some_and(|column| column.hidden())
+}
+
+fn comparison_symbol(op: &ast::Operator) -> Option<&'static str> {
+    use ast::Operator;
+    Some(match op {
+        Operator::Equals => "=",
+        Operator::NotEquals => "<>",
+        Operator::Less => "<",
+        Operator::LessEquals => "<=",
+        Operator::Greater => ">",
+        Operator::GreaterEquals => ">=",
+        _ => return None,
+    })
 }
 
 /// The types of the operands of `expr`, in order, when it is an operator that
@@ -73,6 +155,23 @@ pub(super) fn find_operator_call(
     // An operator on NULL gives NULL whichever function runs it.
     if types.iter().any(|ty| matches!(ty, ExprType::Null)) {
         return Ok(None);
+    }
+    if let Some(resolver) = env.resolver() {
+        let operand_types = || types.iter().map(dialect_operand_type).collect();
+        if resolver
+            .catalog
+            .dialect
+            .resolve_operator(op, &operand_types)
+            == OperatorResolution::Reject
+        {
+            match types {
+                [operand] => crate::bail_parse_error!("operator does not exist: {op} {operand}"),
+                [lhs, rhs] => {
+                    crate::bail_parse_error!("operator does not exist: {lhs} {op} {rhs}")
+                }
+                _ => unreachable!("an operator has one or two operands"),
+            }
+        }
     }
     let operands = operands
         .iter()
