@@ -203,10 +203,20 @@ impl Dialect for PostgresDialect {
         &self,
         input: &str,
         tbl_name: &turso_parser::ast::QualifiedName,
-        _body: &turso_parser::ast::CreateTableBody,
+        body: &turso_parser::ast::CreateTableBody,
     ) -> Result<String> {
-        let sql = turso_pg_parser::name_create_table(input, tbl_name.name.as_str())
-            .unwrap_or_else(|_| input.to_string());
+        // `parse` reads text that PostgreSQL rejects with the SQLite parser,
+        // such as the SQLite text that ALTER TABLE stores and VACUUM replays.
+        // Storing that text with the PostgreSQL marker would make the row
+        // unreadable, so it is stored as SQLite text, like a rewritten table.
+        let Ok(sql) = turso_pg_parser::name_create_table(input, tbl_name.name.as_str()) else {
+            // The SQLite parser skips the identity comment at the start of
+            // that text, so it is copied over to keep the identity columns.
+            let (identity_columns, _) = split_identity_table_sql_marker(input)?;
+            let identity_marker = identity_table_sql_marker(identity_columns);
+            let sql = turso_core::dialect::format_table_sql(tbl_name, body)?;
+            return Ok(format!("{identity_marker}{sql}"));
+        };
         Ok(encode_pg_schema_sql(&sql))
     }
 

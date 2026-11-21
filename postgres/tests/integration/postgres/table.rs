@@ -663,6 +663,54 @@ fn always_identity_error(conn: &turso_pg::Connection, table: &str) -> String {
         .to_string()
 }
 
+/// ALTER TABLE stores an identity table as SQLite text that the PostgreSQL
+/// parser rejects, which VACUUM replays to create the table in the new file.
+#[test]
+fn vacuum_keeps_the_identity_columns_of_a_table_that_alter_table_rewrote() {
+    for kind in ["ALWAYS", "BY DEFAULT"] {
+        for (alter, table) in [
+            ("ALTER TABLE ident ADD COLUMN x int", "ident"),
+            ("ALTER TABLE ident RENAME COLUMN w TO w2", "ident"),
+            ("ALTER TABLE ident DROP COLUMN w", "ident"),
+            ("ALTER TABLE ident RENAME TO ident2", "ident2"),
+        ] {
+            let db = TempDatabase::builder().build();
+            let conn = db.connect_postgres();
+            conn.execute(format!(
+                "CREATE TABLE ident (id bigint GENERATED {kind} AS IDENTITY PRIMARY KEY, v text, w int)"
+            ))
+            .unwrap();
+            conn.execute(alter).unwrap();
+            conn.execute(format!("INSERT INTO {table} (v) VALUES ('a')"))
+                .unwrap();
+            conn.inner()
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            conn.inner().execute("VACUUM").unwrap();
+
+            let explicit_id = conn.execute(format!("INSERT INTO {table} (id, v) VALUES (42, 'z')"));
+            if kind == "ALWAYS" {
+                assert!(
+                    explicit_id
+                        .unwrap_err()
+                        .to_string()
+                        .contains("cannot insert a non-DEFAULT value into column \"id\""),
+                    "{kind} {alter}"
+                );
+            } else {
+                explicit_id.unwrap();
+            }
+            conn.execute(format!("INSERT INTO {table} (v) VALUES ('b')"))
+                .unwrap();
+            let mut expected = vec![(Some(1), "a".to_string()), (Some(2), "b".to_string())];
+            if kind == "BY DEFAULT" {
+                expected.push((Some(42), "z".to_string()));
+            }
+            assert_eq!(key_rows(&conn, table), expected, "{kind} {alter}");
+        }
+    }
+}
+
 #[test]
 fn always_identity_rule_is_kept_after_reopen() {
     let db = TempDatabase::builder().build();
