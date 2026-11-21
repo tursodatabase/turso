@@ -7069,7 +7069,8 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         // Base types (no Turso custom type needed)
         "INTEGER" | "INT" | "INT4" | "SERIAL" | "SERIAL4" | "BIGSERIAL" | "SERIAL8"
         | "SMALLSERIAL" | "SERIAL2" => "INTEGER".into(),
-        "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" => "REAL".into(),
+        "REAL" | "FLOAT4" => "float4".into(),
+        "DOUBLE PRECISION" | "FLOAT8" => "REAL".into(),
         "TEXT" | "BPCHAR" | "NAME" => "TEXT".into(),
         "BLOB" => "BLOB".into(),
 
@@ -10651,7 +10652,8 @@ mod tests {
         // Base types (no Turso custom type)
         assert_eq!(map_pg_type("INTEGER", no_params), Some(s("INTEGER")));
         assert_eq!(map_pg_type("SERIAL", no_params), Some(s("INTEGER")));
-        assert_eq!(map_pg_type("REAL", no_params), Some(s("REAL")));
+        assert_eq!(map_pg_type("REAL", no_params), Some(s("float4")));
+        assert_eq!(map_pg_type("FLOAT4", no_params), Some(s("float4")));
         assert_eq!(map_pg_type("TEXT", no_params), Some(s("TEXT")));
         assert_eq!(map_pg_type("BLOB", no_params), Some(s("BLOB")));
 

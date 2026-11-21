@@ -16,6 +16,8 @@ pub enum TextType {
     Plain,
     /// An integer prints as `t` or `f`.
     Boolean,
+    /// A real prints with the digits of a 32-bit float.
+    Float4,
     /// Text without an offset gets `+00`.
     TimestampTz,
 }
@@ -37,6 +39,7 @@ impl TextType {
             .find_map(
                 |name| match (name.to_ascii_uppercase().as_str(), info.array_dimensions) {
                     ("BOOL" | "BOOLEAN", 0) => Some(TextType::Boolean),
+                    ("FLOAT4", 0) => Some(TextType::Float4),
                     ("TIMESTAMPTZ", 0) => Some(TextType::TimestampTz),
                     _ => None,
                 },
@@ -54,6 +57,9 @@ pub fn value_text(value: &Value, text_type: TextType) -> Option<Cow<'_, str>> {
             Cow::Borrowed(pgwire_text::encode_bool(*i != 0))
         }
         Value::Numeric(Numeric::Integer(i)) => Cow::Owned(pgwire_text::encode_integer(*i)),
+        Value::Numeric(Numeric::Float(f)) if text_type == TextType::Float4 => {
+            Cow::Owned(crate::float_text::float4_text(f64::from(*f) as f32))
+        }
         Value::Numeric(Numeric::Float(f)) => Cow::Owned(pgwire_text::format_f64(f64::from(*f))),
         Value::Text(text) => {
             let text = text.as_str();

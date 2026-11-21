@@ -266,6 +266,14 @@ pub(crate) fn exec_pg_cast(args: &[Register]) -> Result<Value> {
     convert(value, source, target)
 }
 
+/// The value as a float4: the nearest 32-bit float, which is stored as a double.
+pub(crate) fn exec_float4_round(value: &Value) -> Result<Value> {
+    match value {
+        Value::Numeric(_) => to_float(value, Float8, Float4),
+        _ => Ok(value.clone()),
+    }
+}
+
 fn type_arg(arg: &Register) -> Option<CastType> {
     match arg.get_value() {
         Value::Text(name) => CastType::from_name(name.as_str()),
@@ -274,6 +282,13 @@ fn type_arg(arg: &Register) -> Option<CastType> {
 }
 
 fn convert(value: &Value, source: CastType, target: CastType) -> Result<Value> {
+    let narrowed;
+    let value = if source == Float4 {
+        narrowed = exec_float4_round(value)?;
+        &narrowed
+    } else {
+        value
+    };
     if target.is_integer() {
         return to_integer(value, source, target);
     }
@@ -476,6 +491,9 @@ fn to_text(value: &Value, source: CastType) -> Result<Value> {
             if *n == 0 { "false" } else { "true" }.to_string()
         }
         (Value::Numeric(Numeric::Integer(n)), _) => n.to_string(),
+        (Value::Numeric(Numeric::Float(f)), CastType::Float4) => {
+            crate::float_text::float4_text(f64::from(*f) as f32)
+        }
         (Value::Numeric(Numeric::Float(f)), _) => crate::float_text::float8_text(f64::from(*f)),
         (Value::Blob(bytes), _) => {
             let mut hex = String::from("\\x");

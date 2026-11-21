@@ -13,6 +13,7 @@ mod functions;
 mod open;
 mod options;
 mod pg_type;
+mod pg_types;
 mod policies;
 mod roles;
 mod schema_state;

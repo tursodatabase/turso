@@ -251,6 +251,17 @@ impl Dialect for PostgresDialect {
         turso_core::dialect::resolve_builtin_function(name, arg_count)
     }
 
+    fn schema_builder(
+        &self,
+        enable_custom_types: bool,
+    ) -> Result<turso_core::schema::SchemaBuilder> {
+        let builder = turso_core::schema::builtin::schema_builder(self, enable_custom_types)?;
+        if !enable_custom_types {
+            return Ok(builder);
+        }
+        crate::pg_types::register_scalar_types(self, builder)
+    }
+
     fn plan_cast(
         &self,
         source: &dyn Fn() -> turso_core::dialect::OperandType,

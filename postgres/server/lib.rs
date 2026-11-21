@@ -650,6 +650,7 @@ enum BinaryEncoding {
     Bool,
     Int4,
     Int8,
+    Float4,
     Float8,
     Bytea,
 }
@@ -662,6 +663,7 @@ impl BinaryEncoding {
             Type::BOOL => Some(Self::Bool),
             Type::INT4 => Some(Self::Int4),
             Type::INT8 => Some(Self::Int8),
+            Type::FLOAT4 => Some(Self::Float4),
             Type::FLOAT8 => Some(Self::Float8),
             Type::BYTEA => Some(Self::Bytea),
             _ => None,
@@ -908,6 +910,7 @@ fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResul
             BinaryEncoding::Bool
             | BinaryEncoding::Int4
             | BinaryEncoding::Int8
+            | BinaryEncoding::Float4
             | BinaryEncoding::Float8,
         )
         | None => Err(binary_not_supported(&format!("parameter ${n}"), pg_type)),
@@ -1048,7 +1051,7 @@ fn encode_binary(
     text_type: turso_pg::TextType,
 ) -> turso_core::Result<()> {
     use turso_core::Numeric::{Float, Integer};
-    use BinaryEncoding::{Bool, Bytea, Float8, Int4, Int8, Text};
+    use BinaryEncoding::{Bool, Bytea, Float4, Float8, Int4, Int8, Text};
     let encoding = BinaryEncoding::of(pg_type)
         .expect("build_field_info refuses binary format for a type without a binary encoding");
     let written = match (encoding, val) {
@@ -1060,13 +1063,15 @@ fn encode_binary(
             Err(_) => return Err(binary_value_not_supported(pg_type)),
         },
         (Int8, Value::Numeric(Integer(i))) => encoder.encode_field(i),
+        (Float4, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f32)),
+        (Float4, Value::Numeric(Float(f))) => encoder.encode_field(&(f64::from(*f) as f32)),
         (Float8, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f64)),
         (Float8, Value::Numeric(Float(f))) => encoder.encode_field(&f64::from(*f)),
         (Bytea, Value::Blob(b)) => encoder.encode_field(&b.as_slice()),
         (Bool | Int4 | Int8, Value::Numeric(Float(_)))
         | (Bytea, Value::Numeric(_))
-        | (Bool | Int4 | Int8 | Float8 | Bytea, Value::Text(_))
-        | (Bool | Int4 | Int8 | Float8, Value::Blob(_)) => {
+        | (Bool | Int4 | Int8 | Float4 | Float8 | Bytea, Value::Text(_))
+        | (Bool | Int4 | Int8 | Float4 | Float8, Value::Blob(_)) => {
             return Err(binary_value_not_supported(pg_type))
         }
     };
@@ -1086,8 +1091,10 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
     match upper.as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" => Type::INT4,
         "BIGINT" | "INT8" | "BIGSERIAL" => Type::INT8,
-        "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC"
-        | "DECIMAL" => Type::FLOAT8,
+        "FLOAT4" => Type::FLOAT4,
+        "REAL" | "FLOAT" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC" | "DECIMAL" => {
+            Type::FLOAT8
+        }
         "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER VARYING" | "CHARACTER" | "NAME" => Type::TEXT,
         "BLOB" | "BYTEA" => Type::BYTEA,
         "BOOLEAN" | "BOOL" => Type::BOOL,

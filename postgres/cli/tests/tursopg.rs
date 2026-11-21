@@ -1239,6 +1239,7 @@ fn extract_row_description_oids(data: &[u8]) -> Vec<u32> {
 // tests need them.
 const OID_INT4: u32 = 23;
 const OID_TEXT: u32 = 25;
+const OID_FLOAT4: u32 = 700;
 const OID_FLOAT8: u32 = 701;
 
 /// Walk raw PG wire bytes, find the first ErrorResponse ('E') message, and
@@ -1628,6 +1629,10 @@ fn wire_cast_reports_target_type() {
         );
         assert_eq!(
             c.query_column_oids("SELECT CAST(1 AS REAL)"),
+            vec![OID_FLOAT4]
+        );
+        assert_eq!(
+            c.query_column_oids("SELECT CAST(1 AS DOUBLE PRECISION)"),
             vec![OID_FLOAT8]
         );
     });
@@ -1639,10 +1644,12 @@ fn wire_cast_reports_target_type() {
 #[test]
 fn wire_table_columns_report_declared_type() {
     with_pg_client(|c| {
-        c.query_command_tags("CREATE TABLE t(id INTEGER, label TEXT, score REAL)");
+        c.query_command_tags(
+            "CREATE TABLE t(id INTEGER, label TEXT, score REAL, ratio DOUBLE PRECISION)",
+        );
         assert_eq!(
-            c.query_column_oids("SELECT id, label, score FROM t"),
-            vec![OID_INT4, OID_TEXT, OID_FLOAT8]
+            c.query_column_oids("SELECT id, label, score, ratio FROM t"),
+            vec![OID_INT4, OID_TEXT, OID_FLOAT4, OID_FLOAT8]
         );
     });
 }

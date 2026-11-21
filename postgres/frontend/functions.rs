@@ -328,6 +328,24 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             "bigint out of range", None,
         ))?,
+        "float4pl"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_float4_arithmetic(args, |a, b| a + b, false)?
+        },
+        "float4mi"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_float4_arithmetic(args, |a, b| a - b, false)?
+        },
+        "float4mul"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_float4_arithmetic(args, |a, b| a * b, false)?
+        },
+        "float4div"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_float4_arithmetic(args, |a, b| a / b, true)?
+        },
+        "float4um"(FunctionArity::Exact(1), true) => {
+            crate::pg_types::exec_float4_negate(args[0].get_value())?
+        },
+        "pg_float4_round"(FunctionArity::Exact(1), true) => {
+            crate::casts::exec_float4_round(args[0].get_value())?
+        },
         "pg_cast"(FunctionArity::Exact(3), true) => crate::casts::exec_pg_cast(args)?,
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
@@ -1083,7 +1101,7 @@ impl JsonElement {
     fn of_type(name: &str) -> Self {
         match name {
             "boolean" => Self::Boolean,
-            "integer" | "smallint" | "bigint" | "real" | "numeric" => Self::Number,
+            "integer" | "smallint" | "bigint" | "real" | "float4" | "numeric" => Self::Number,
             "json" | "jsonb" => Self::Json,
             // A cast to bytea is a cast to blob, so a blob is a bytea.
             "bytea" | "blob" => Self::Bytea,

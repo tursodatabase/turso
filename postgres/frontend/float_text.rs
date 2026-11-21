@@ -1,31 +1,58 @@
-//! The text of float values as PostgreSQL writes them.
+//! The text of float4 and float8 values as PostgreSQL writes them.
 
-/// The text of a double as PostgreSQL writes it: the shortest digits that read
-/// back the same, in scientific notation when the exponent is below -4 or
-/// above 14.
+/// PostgreSQL writes a float in scientific notation from this exponent up.
+const FLOAT4_PLAIN_BELOW: i32 = 6;
+const FLOAT8_PLAIN_BELOW: i32 = 15;
+
+/// The text of a float8 value.
 pub(crate) fn float8_text(number: f64) -> String {
-    if number.is_nan() {
-        return "NaN".to_string();
-    }
-    if number.is_infinite() {
-        return if number > 0.0 {
-            "Infinity"
-        } else {
-            "-Infinity"
-        }
-        .to_string();
-    }
-    if number == 0.0 {
-        return if number.is_sign_negative() { "-0" } else { "0" }.to_string();
+    if let Some(special) = special_text(number) {
+        return special;
     }
     let scientific = format!("{:e}", number.abs());
+    text_of_digits(number.is_sign_negative(), &scientific, FLOAT8_PLAIN_BELOW)
+}
+
+/// The text of a float4 value: the shortest digits that read back as the same f32.
+pub(crate) fn float4_text(number: f32) -> String {
+    if let Some(special) = special_text(f64::from(number)) {
+        return special;
+    }
+    let scientific = format!("{:e}", number.abs());
+    text_of_digits(number.is_sign_negative(), &scientific, FLOAT4_PLAIN_BELOW)
+}
+
+fn special_text(number: f64) -> Option<String> {
+    if number.is_nan() {
+        return Some("NaN".to_string());
+    }
+    if number.is_infinite() {
+        return Some(
+            if number > 0.0 {
+                "Infinity"
+            } else {
+                "-Infinity"
+            }
+            .to_string(),
+        );
+    }
+    if number == 0.0 {
+        return Some(if number.is_sign_negative() { "-0" } else { "0" }.to_string());
+    }
+    None
+}
+
+/// `scientific` is Rust's `{:e}` of the absolute value, such as `1.5e-7`.
+/// PostgreSQL writes scientific notation when the exponent is below -4 or
+/// `plain_below` or more, and plain digits otherwise.
+fn text_of_digits(negative: bool, scientific: &str, plain_below: i32) -> String {
     let (mantissa, exponent) = scientific
         .split_once('e')
         .expect("`{:e}` of a float has an exponent");
     let exponent: i32 = exponent.parse().expect("the exponent is an integer");
     let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let sign = if number < 0.0 { "-" } else { "" };
-    if !(-4..15).contains(&exponent) {
+    let sign = if negative { "-" } else { "" };
+    if !(-4..plain_below).contains(&exponent) {
         let fraction = if digits.len() > 1 {
             format!(".{}", &digits[1..])
         } else {
