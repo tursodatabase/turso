@@ -1,0 +1,620 @@
+# The operator that PostgreSQL chooses for the operands, or the error when there is none.
+# The answers come from PostgreSQL 18.
+
+@database :memory:
+
+test text-literal-read-as-an-integer {
+    SELECT 1 = '1', 1 + '1', '2' > 1;
+}
+expect {
+    t|2|t
+}
+
+test text-literal-is-not-an-integer {
+    SELECT 1 = 'a';
+}
+@sqlstate 22P02
+expect error {}
+
+test text-literal-is-not-an-integer-in-arithmetic {
+    SELECT 'a' + 1;
+}
+@sqlstate 22P02
+expect error {}
+
+test text-literal-with-a-decimal-point-is-not-an-integer {
+    SELECT 1 + '1.5';
+}
+@sqlstate 22P02
+expect error {}
+
+test text-literal-read-as-a-numeric {
+    SELECT 1.5 = '1.5', 1.5 + '1';
+}
+expect {
+    t|2.5
+}
+
+test text-literal-read-as-a-boolean {
+    SELECT true = 't', true = 'yes';
+}
+expect {
+    t|t
+}
+
+test text-literal-is-not-a-boolean {
+    SELECT true = 'x';
+}
+@sqlstate 22P02
+expect error {}
+
+test text-literal-out-of-range-for-a-bigint {
+    SELECT 1::int8 = '9223372036854775808';
+}
+@sqlstate 22003
+expect error {}
+
+test text-literal-in-a-between {
+    SELECT 1 BETWEEN '0' AND '2';
+}
+expect {
+    t
+}
+
+test text-literal-in-a-between-is-not-an-integer {
+    SELECT 1 BETWEEN 'a' AND 'b';
+}
+@sqlstate 22P02
+expect error {}
+
+test text-literal-in-an-in-list {
+    SELECT 1 IN (2, '1'), '1' IN (1, 2);
+}
+expect {
+    t|t
+}
+
+test text-literal-in-an-in-list-is-not-an-integer {
+    SELECT 'a' IN (1, 2);
+}
+@sqlstate 22P02
+expect error {}
+
+test text-literal-is-distinct-from-an-integer {
+    SELECT 1 IS DISTINCT FROM '1', 1 IS NOT DISTINCT FROM '2';
+}
+expect {
+    f|f
+}
+
+test text-literal-is-distinct-from-is-not-an-integer {
+    SELECT 1 IS DISTINCT FROM 'a';
+}
+@sqlstate 22P02
+expect error {}
+
+test text-literal-in-a-simple-case {
+    SELECT CASE 1 WHEN '1' THEN 'one' END;
+}
+expect {
+    one
+}
+
+test text-literal-in-a-simple-case-is-not-an-integer {
+    SELECT CASE 1 WHEN 'a' THEN 'one' END;
+}
+@sqlstate 22P02
+expect error {}
+
+test text-literal-in-a-column-comparison {
+    CREATE TABLE op_numbers (n int4, b bigint); INSERT INTO op_numbers VALUES (1, 2); SELECT n = '1', b = '2', n < '2' FROM op_numbers;
+}
+expect {
+    t|t|t
+}
+
+test text-literal-in-a-column-comparison-is-not-an-integer {
+    CREATE TABLE op_numbers (n int4); INSERT INTO op_numbers VALUES (1); SELECT n = 'a' FROM op_numbers;
+}
+@sqlstate 22P02
+expect error {}
+
+test text-literal-with-an-index {
+    CREATE TABLE op_numbers (n int4 PRIMARY KEY); INSERT INTO op_numbers VALUES (1), (2); SELECT n FROM op_numbers WHERE n = '2';
+}
+expect {
+    2
+}
+
+test text-column-is-not-an-integer {
+    SELECT 'a'::text = 1;
+}
+@sqlstate 42883
+expect error {}
+
+test text-column-plus-an-integer {
+    SELECT 1 + 'a'::text;
+}
+@sqlstate 42883
+expect error {}
+
+test text-times-an-integer {
+    SELECT 'a'::text * 2;
+}
+@sqlstate 42883
+expect error {}
+
+test negated-text {
+    SELECT - 'a'::text;
+}
+@sqlstate 42883
+expect error {}
+
+test integer-equals-boolean {
+    SELECT 1 = true;
+}
+@sqlstate 42883
+expect error {}
+
+test boolean-equals-integer {
+    SELECT true = 1;
+}
+@sqlstate 42883
+expect error {}
+
+test integer-plus-boolean {
+    SELECT 1 + true;
+}
+@sqlstate 42883
+expect error {}
+
+test boolean-plus-boolean {
+    SELECT true + true;
+}
+@sqlstate 42883
+expect error {}
+
+test negated-boolean {
+    SELECT -true;
+}
+@sqlstate 42883
+expect error {}
+
+test boolean-between-integers {
+    SELECT true BETWEEN 0 AND 1;
+}
+@sqlstate 42883
+expect error {}
+
+test boolean-in-a-list-of-integers {
+    SELECT true IN (1, 2);
+}
+@sqlstate 42883
+expect error {}
+
+test uuid-equals-text {
+    SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::text;
+}
+@sqlstate 42883
+expect error {}
+
+test uuid-orders-with-uuid {
+    SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid < 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12'::uuid;
+}
+expect {
+    t
+}
+
+test bit-and-with-numeric {
+    SELECT 5 & 3.5;
+}
+@sqlstate 42883
+expect error {}
+
+test bit-and-with-boolean {
+    SELECT 5 & true;
+}
+@sqlstate 42883
+expect error {}
+
+test bit-not-of-numeric {
+    SELECT ~5.5;
+}
+@sqlstate 42883
+expect error {}
+
+test bit-and-of-integers {
+    SELECT 5 & 3, 5 | 3;
+}
+expect {
+    1|7
+}
+
+test shift-of-numeric {
+    SELECT 1.5 << 1;
+}
+@sqlstate 42883
+expect error {}
+
+test shift-of-boolean {
+    SELECT true << 1;
+}
+@sqlstate 42883
+expect error {}
+
+test shift-of-int4-wraps-at-32-bits {
+    SELECT 1::int4 << 33, 1::int4 << -1, 256::int4 >> 40;
+}
+expect {
+    2|-2147483648|1
+}
+
+test shift-of-int2-is-cut-to-16-bits {
+    SELECT 1::int2 << 20, 8::int2 >> 1;
+}
+expect {
+    0|4
+}
+
+test shift-of-int8-wraps-at-64-bits {
+    SELECT 1::int8 << 40, 1::int8 << 64;
+}
+expect {
+    1099511627776|1
+}
+
+test shift-of-int8-by-an-int8 {
+    SELECT 1::int8 << 1::int8;
+}
+@sqlstate 42883
+expect error {}
+
+test concatenation-of-integers {
+    SELECT 1 || 2;
+}
+@sqlstate 42883
+expect error {}
+
+test concatenation-of-booleans {
+    SELECT true || false;
+}
+@sqlstate 42883
+expect error {}
+
+test concatenation-of-text-and-integer {
+    SELECT 'a'::text || 1, 1 || 'a'::text;
+}
+expect {
+    a1|1a
+}
+
+@compat-gap "cast:text -> bytea"
+test concatenation-of-bytea {
+    SELECT '\\x01'::bytea || '\\x02'::bytea;
+}
+expect {
+    \\x0102
+}
+expect @tursopg {
+    \\x5c783031\\x5c783032
+}
+
+test like-on-an-integer {
+    SELECT 1 LIKE '1';
+}
+@sqlstate 42883
+expect error {}
+
+test like-on-a-numeric {
+    SELECT 1.5 LIKE '1%';
+}
+@sqlstate 42883
+expect error {}
+
+test like-on-a-boolean {
+    SELECT true LIKE 't';
+}
+@sqlstate 42883
+expect error {}
+
+test regex-match-on-an-integer {
+    SELECT 1 ~ '1';
+}
+@sqlstate 42883
+expect error {}
+
+test regex-match-on-an-integer-negated {
+    SELECT 1 !~ '1';
+}
+@sqlstate 42883
+expect error {}
+
+test similar-to-on-an-integer {
+    SELECT 1 SIMILAR TO '1';
+}
+@sqlstate 42883
+expect error {}
+
+test like-on-text {
+    SELECT 'abc' LIKE 'a%', 'abc'::text LIKE 'b%';
+}
+expect {
+    t|f
+}
+
+test and-of-integers {
+    SELECT 1 AND 2;
+}
+@sqlstate 42804
+expect error {}
+
+test and-of-a-boolean-and-an-integer {
+    SELECT true AND 1;
+}
+@sqlstate 42804
+expect error {}
+
+test or-of-an-integer {
+    SELECT 1 OR false;
+}
+@sqlstate 42804
+expect error {}
+
+test not-of-an-integer {
+    SELECT NOT 1;
+}
+@sqlstate 42804
+expect error {}
+
+test not-of-a-text-literal {
+    SELECT NOT 'true', NOT 'f';
+}
+expect {
+    f|t
+}
+
+test not-of-a-text-literal-is-not-a-boolean {
+    SELECT NOT 'a';
+}
+@sqlstate 22P02
+expect error {}
+
+test and-of-a-text-literal {
+    SELECT 'true' AND true;
+}
+expect {
+    t
+}
+
+test case-when-an-integer {
+    SELECT CASE WHEN 1 THEN 'a' ELSE 'b' END;
+}
+@sqlstate 42804
+expect error {}
+
+test case-when-a-text-literal {
+    SELECT CASE WHEN 't' THEN 'a' ELSE 'b' END;
+}
+expect {
+    a
+}
+
+test case-when-a-text-literal-is-not-a-boolean {
+    SELECT CASE WHEN 'x' THEN 'a' ELSE 'b' END;
+}
+@sqlstate 22P02
+expect error {}
+
+test case-on-a-boolean-with-an-integer {
+    SELECT CASE true WHEN 1 THEN 'y' END;
+}
+@sqlstate 42883
+expect error {}
+
+test integer-compares-with-every-number-type {
+    SELECT 1::int8 = 1::int4, 1::int2 = 1::int8, 1 = 1.0, 1 < 1.5, 2 > 1.5::float4, 1.5::numeric = 1.5::float8;
+}
+expect {
+    t|t|t|t|t|t
+}
+
+test text-compares-with-varchar {
+    SELECT 'a'::text < 'b'::varchar, 'a'::varchar = 'a'::text;
+}
+expect {
+    t|t
+}
+
+
+test is-true-of-an-integer-is-an-error {
+    SELECT 1 IS TRUE;
+}
+@sqlstate 42804
+expect error {}
+
+test is-not-false-of-a-number-is-an-error {
+    SELECT 1.5 IS NOT FALSE;
+}
+@sqlstate 42804
+expect error {}
+
+test is-true-of-a-text-literal-reads-it-as-a-boolean {
+    SELECT 'true' IS TRUE, 'f' IS FALSE, 'no' IS NOT TRUE;
+}
+expect {
+    t|t|t
+}
+
+test is-true-of-a-text-literal-that-is-not-a-boolean {
+    SELECT 'x' IS TRUE;
+}
+@sqlstate 22P02
+expect error {}
+
+test is-true-of-a-boolean-and-of-null {
+    SELECT (1 = 1) IS TRUE, NULL::boolean IS TRUE, NULL::boolean IS NOT TRUE, NULL::boolean IS FALSE;
+}
+expect {
+    t|f|t|f
+}
+
+test is-true-in-a-case-condition-of-an-integer {
+    SELECT CASE WHEN 1 IS TRUE THEN 'a' END;
+}
+@sqlstate 42804
+expect error {}
+
+test is-not-distinct-from-one-keeps-comparing-integers {
+    SELECT 1 IS NOT DISTINCT FROM 1, 1 IS DISTINCT FROM 0, 1::int8 IS DISTINCT FROM 1::int2;
+}
+expect {
+    t|t|f
+}
+
+test is-not-distinct-from-true-needs-a-boolean {
+    SELECT 1 IS NOT DISTINCT FROM true;
+}
+@sqlstate 42883
+expect error {}
+
+test in-list-checks-every-literal-even-after-a-match {
+    SELECT 1 IN (1, 'x');
+}
+@sqlstate 22P02
+expect error {}
+
+test in-list-reads-literals-as-the-type-of-the-left-side {
+    SELECT 1 IN (1, '2'), 3 NOT IN (1, '2');
+}
+expect {
+    t|t
+}
+
+test between-checks-a-literal-bound {
+    SELECT 1 BETWEEN 0 AND 'x';
+}
+@sqlstate 22P02
+expect error {}
+
+test comparison-literal-out-of-range {
+    SELECT 1::int2 = '99999';
+}
+@sqlstate 22003
+expect error {}
+
+test coalesce-reads-a-literal-as-the-type-of-the-column {
+    SELECT pg_typeof(coalesce(NULL::int4, '5')), coalesce(NULL::int4, '5');
+}
+expect {
+    integer|5
+}
+
+test coalesce-with-a-literal-that-is-not-an-integer {
+    SELECT coalesce(NULL::int4, 'x');
+}
+@sqlstate 22P02
+expect error {}
+
+test case-result-with-a-literal-that-is-not-an-integer {
+    SELECT CASE WHEN true THEN 1 ELSE 'x' END;
+}
+@sqlstate 22P02
+expect error {}
+
+test case-result-reads-a-literal-as-the-other-result {
+    SELECT CASE WHEN false THEN 1 ELSE '5' END, pg_typeof(CASE WHEN false THEN 1 ELSE '5' END);
+}
+expect {
+    5|integer
+}
+
+test greatest-with-a-literal-that-is-not-an-integer {
+    SELECT greatest(1, 'x');
+}
+@sqlstate 22P02
+expect error {}
+
+test nullif-with-a-literal-that-is-not-an-integer {
+    SELECT nullif(1, 'x');
+}
+@sqlstate 22P02
+expect error {}
+
+test minus-of-a-text-literal-is-not-unique {
+    SELECT -'5';
+}
+@sqlstate 42725
+expect error {}
+
+test bitwise-not-of-a-text-literal-is-not-unique {
+    SELECT ~'5';
+}
+@sqlstate 42725
+expect error {}
+
+test minus-of-text {
+    SELECT -'a'::text;
+}
+@sqlstate 42883
+expect error {}
+
+test minus-of-numbers {
+    SELECT -5, -(5::int2), -(5::int8), -(1.5::numeric), -(1.5::float4);
+}
+expect {
+    -5|-5|-5|-1.5|-1.5
+}
+
+test bit-operator-results-have-the-width-of-the-operands {
+    CREATE TABLE bit_w (a int, b bigint, c smallint); INSERT INTO bit_w VALUES (2147483647, 9223372036854775807, 3); SELECT pg_typeof(~b), pg_typeof(b & b), pg_typeof(b | 1), pg_typeof(~c), pg_typeof(c & c), pg_typeof(~a) FROM bit_w;
+}
+expect {
+    bigint|bigint|bigint|smallint|smallint|integer
+}
+
+test bit-and-of-an-int4-overflows-when-one-is-added {
+    CREATE TABLE bit_o (a int); INSERT INTO bit_o VALUES (2147483647); SELECT (a & a) + 1 FROM bit_o;
+}
+@sqlstate 22003
+expect error {}
+
+test bit-complement-of-an-int4-overflows-when-one-is-subtracted {
+    CREATE TABLE bit_n (a int); INSERT INTO bit_n VALUES (2147483647); SELECT (~a) - 1 FROM bit_n;
+}
+@sqlstate 22003
+expect error {}
+
+test bit-operators-on-mixed-integer-types {
+    SELECT 5::int8 & 3::int4, 5::int4 | 3::int8, pg_typeof(5::int4 | 3::int8), ~5::int2, 12 & 10;
+}
+expect {
+    1|7|bigint|-6|8
+}
+
+test float8-compared-with-a-decimal {
+    SELECT 0.125::float8 = 0.125, 0.1::float4 = 0.1, 0.25::float4 = 0.25;
+}
+expect {
+    t|f|t
+}
+
+test numeric-compared-with-a-float8-compares-as-doubles {
+    SELECT 9007199254740993::numeric = 9007199254740992::float8, 9007199254740993::numeric < 9007199254740994::float8;
+}
+expect {
+    t|t
+}
+
+test domain-over-real-compared-with-a-string-literal {
+    CREATE DOMAIN f4_dom AS real; CREATE TABLE f4_dom_t (r f4_dom); INSERT INTO f4_dom_t VALUES (0.1); SELECT r = '0.1', r IN ('0.1') FROM f4_dom_t;
+}
+expect {
+    t|t
+}
+
+test delete-by-a-domain-over-real-and-a-string-literal {
+    CREATE DOMAIN f4_dom2 AS real; CREATE TABLE f4_dom_d (r f4_dom2); INSERT INTO f4_dom_d VALUES (0.1); DELETE FROM f4_dom_d WHERE r = '0.1' RETURNING r;
+}
+expect {
+    0.1
+}

@@ -1,0 +1,477 @@
+# The text of an array literal is read as PostgreSQL reads it.
+# The answers come from PostgreSQL 18.
+
+@database :memory:
+
+test array-input-int-array {
+    SELECT array_to_string('\{1,2,3\}'::int[], ',');
+}
+expect {
+    1,2,3
+}
+
+test array-input-skips-spaces {
+    SELECT array_to_string('\{ 1 , 2 \}'::int[], ',');
+}
+expect {
+    1,2
+}
+
+test array-input-quoted-numbers {
+    SELECT array_to_string('\{"1","2"\}'::int[], ',');
+}
+expect {
+    1,2
+}
+
+test array-input-signs {
+    SELECT array_to_string('\{+1,-2\}'::int[], ',');
+}
+expect {
+    1,-2
+}
+
+test array-input-empty {
+    SELECT array_length('\{\}'::int[], 1) IS NULL OR array_length('\{\}'::int[], 1) = 0, '\{\}'::int[] = ARRAY[]::int[];
+}
+expect {
+    t|t
+}
+
+test array-input-null-element {
+    SELECT array_to_string('\{1,NULL,3\}'::int[], ',', '*');
+}
+expect {
+    1,*,3
+}
+
+test array-input-null-is-not-case-sensitive {
+    SELECT array_to_string('\{null,Null\}'::text[], ',', '*');
+}
+expect {
+    *,*
+}
+
+test array-input-quoted-null-is-text {
+    SELECT array_to_string('\{"NULL"\}'::text[], ',', '*');
+}
+expect {
+    NULL
+}
+
+test array-input-bigint {
+    SELECT array_to_string('\{1,9223372036854775807\}'::int8[], ',');
+}
+expect {
+    1,9223372036854775807
+}
+
+test array-input-smallint {
+    SELECT array_to_string('\{1,32767\}'::int2[], ',');
+}
+expect {
+    1,32767
+}
+
+test array-input-int-has-the-type {
+    SELECT pg_typeof('\{1,2\}'::int[]), pg_typeof('\{1,2\}'::int8[]), pg_typeof('\{a\}'::text[]);
+}
+expect {
+    integer[]|bigint[]|text[]
+}
+
+test array-input-text-with-a-comma {
+    SELECT array_length('\{"a,b",c\}'::text[], 1), ('\{"a,b",c\}'::text[])[1];
+}
+expect {
+    2|a,b
+}
+
+test array-input-text-with-a-backslash-comma {
+    SELECT array_length('\{a\\,b\}'::text[], 1), ('\{a\\,b\}'::text[])[1];
+}
+expect {
+    1|a,b
+}
+
+test array-input-text-with-a-quote {
+    SELECT ('\{"a\\"b"\}'::text[])[1];
+}
+expect {
+    a"b
+}
+
+test array-input-text-with-spaces {
+    SELECT ('\{ a b , c \}'::text[])[1], ('\{ a b , c \}'::text[])[2];
+}
+expect {
+    a b|c
+}
+
+test array-input-quoted-text-keeps-spaces {
+    SELECT length(('\{" a "\}'::text[])[1]);
+}
+expect {
+    3
+}
+
+test array-input-uuid {
+    SELECT ('\{A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11\}'::uuid[])[1];
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+test array-input-bool-words {
+    SELECT array_to_json('\{t,f,true,no,on,off,1,0\}'::bool[]);
+}
+expect {
+    [true,false,true,false,true,false,true,false]
+}
+
+test array-input-of-a-text-column {
+    SELECT array_to_string(a::int[], ',') FROM (VALUES ('\{1,2\}'::text)) v(a);
+}
+expect {
+    1,2
+}
+
+test array-input-null-text {
+    SELECT NULL::text::int[] IS NULL;
+}
+expect {
+    t
+}
+
+test array-input-error-word-in-an-int-array {
+    SELECT '\{1,x\}'::int[];
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-error-decimal-in-an-int-array {
+    SELECT '\{1.5\}'::int[];
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-error-exponent-in-an-int-array {
+    SELECT '\{1e2\}'::int[];
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-error-int-array-element-out-of-range {
+    SELECT '\{99999999999\}'::int[];
+}
+@sqlstate 22003
+expect error {}
+
+test array-input-error-smallint-array-element-out-of-range {
+    SELECT '\{40000\}'::smallint[];
+}
+@sqlstate 22003
+expect error {}
+
+test array-input-error-bigint-array-element-out-of-range {
+    SELECT '\{9223372036854775808\}'::int8[];
+}
+@sqlstate 22003
+expect error {}
+
+test array-input-error-word-in-a-bool-array {
+    SELECT '\{x\}'::bool[];
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-error-word-in-a-uuid-array {
+    SELECT '\{x\}'::uuid[];
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-error-word-in-a-float-array {
+    SELECT '\{x\}'::float8[];
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-error-missing-closing-brace {
+    SELECT '\{1,2'::int[];
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-error-extra-closing-brace {
+    SELECT '\{1,2\}\}'::int[];
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-error-missing-braces {
+    SELECT '1,2'::int[];
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-error-empty-text {
+    SELECT ''::int[];
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-error-empty-element {
+    SELECT '\{1,,2\}'::int[];
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-error-only-a-comma {
+    SELECT '\{,\}'::int[];
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-error-sub-arrays-of-different-lengths {
+    SELECT '\{ \{1,2\},\{3\} \}'::int[];
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-error-array-and-element-mixed {
+    SELECT '\{ \{1,2\},3 \}'::int[];
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-error-junk-after-the-array {
+    SELECT '\{1\} x'::int[];
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-error-unquoted-text-array-needs-braces {
+    SELECT 'a'::text[];
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-into-an-int-column {
+    CREATE TABLE a1 (v int[]); INSERT INTO a1 VALUES ('\{1,2\}'); SELECT array_to_string(v, ',') FROM a1;
+}
+expect {
+    1,2
+}
+
+test array-input-into-an-int-column-with-a-bad-element {
+    CREATE TABLE a2 (v int[]); INSERT INTO a2 VALUES ('\{1,x\}');
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-into-an-int-column-out-of-range {
+    CREATE TABLE a3 (v int[]); INSERT INTO a3 VALUES ('\{2147483648\}');
+}
+@sqlstate 22003
+expect error {}
+
+test array-input-into-a-smallint-column-out-of-range {
+    CREATE TABLE a4 (v smallint[]); INSERT INTO a4 VALUES ('\{40000\}');
+}
+@sqlstate 22003
+expect error {}
+
+test array-input-into-a-text-column-keeps-the-escapes {
+    CREATE TABLE a5 (v text[]); INSERT INTO a5 VALUES ('\{"a b",c\\,d\}'); SELECT v[1], v[2], array_length(v, 1) FROM a5;
+}
+expect {
+    a b|c,d|2
+}
+
+test array-input-into-a-malformed-column-value {
+    CREATE TABLE a6 (v int[]); INSERT INTO a6 VALUES ('\{1,2');
+}
+@sqlstate 22P02
+expect error {}
+
+test array-input-of-a-typed-text-is-not-assignable {
+    CREATE TABLE a7 (v int[]); INSERT INTO a7 VALUES ('\{1\}'::text);
+}
+@sqlstate 42804
+expect error {}
+
+test array-input-in-an-update {
+    CREATE TABLE a8 (v int[]); INSERT INTO a8 VALUES ('\{1\}'); UPDATE a8 SET v = '\{3,4\}'; SELECT array_to_string(v, ',') FROM a8;
+}
+expect {
+    3,4
+}
+
+@compat-gap "type:_int4"
+test array-input-in-an-update-with-a-bad-element {
+    CREATE TABLE a9 (v int[]); INSERT INTO a9 VALUES ('\{1\}'); UPDATE a9 SET v = '\{3,x\}';
+}
+@sqlstate 22P02
+expect error {}
+@sqlstate 23000
+expect @tursopg error {}
+
+test array-input-in-a-default {
+    CREATE TABLE a10 (v int[] DEFAULT '\{7,8\}'); INSERT INTO a10 DEFAULT VALUES; SELECT array_to_string(v, ',') FROM a10;
+}
+expect {
+    7,8
+}
+
+test array-input-in-a-comparison {
+    CREATE TABLE a11 (v int[]); INSERT INTO a11 VALUES ('\{1,2\}'), ('\{3\}'); SELECT array_to_string(v, ',') FROM a11 WHERE v = '\{1,2\}';
+}
+expect {
+    1,2
+}
+
+test array-input-in-an-any {
+    SELECT 2 = ANY ('\{1,2\}'::int[]), 5 = ANY ('\{1,2\}'::int[]);
+}
+expect {
+    t|f
+}
+
+@compat-gap "type:_int4"
+test array-input-hexadecimal-element {
+    SELECT array_to_string('\{0x10\}'::int[], ',');
+}
+expect {
+    16
+}
+@sqlstate 22P02
+expect @tursopg error {}
+
+@compat-gap "type:_int4"
+test array-input-with-explicit-bounds {
+    SELECT array_to_string('[1:2]=\{1,2\}'::int[], ',');
+}
+expect {
+    1,2
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:_int4"
+test array-constructor-with-a-word-and-a-number {
+    SELECT ARRAY[1,'x'];
+}
+@sqlstate 22P02
+expect error {}
+expect @tursopg {
+    \{1,x\}
+}
+
+test array-constructor-of-booleans {
+    SELECT ARRAY[true,false];
+}
+expect {
+    \{t,f\}
+}
+
+@compat-gap "type:_int4"
+test array-constructor-cast-rounds-numbers {
+    SELECT ARRAY[1.5,2]::int[];
+}
+expect {
+    \{2,2\}
+}
+expect @tursopg {
+    \{1,2\}
+}
+
+@compat-gap "type:_uuid"
+test array-constructor-cast-of-a-number-to-uuid {
+    SELECT ARRAY[1,2]::uuid[];
+}
+@sqlstate 42846
+expect error {}
+@sqlstate 22P02
+expect @tursopg error {}
+
+test array-constructor-of-arrays-as-json {
+    SELECT array_to_json(ARRAY[ARRAY[1,2],ARRAY[3,4]]);
+}
+expect {
+    [[1,2],[3,4]]
+}
+
+@compat-gap "type:_int4"
+test array-input-of-two-dimensions {
+    SELECT array_to_json('\{ \{1,2\},\{3,4\} \}'::int[][]), ('\{ \{1,2\},\{3,4\} \}'::int[][])[2][1];
+}
+expect {
+    [[1,2],[3,4]]|3
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:_int4"
+test array-input-of-two-dimensions-with-a-one-dimension-type {
+    SELECT array_to_json('\{ \{1,2\},\{3,4\} \}'::int[]);
+}
+expect {
+    [[1,2],[3,4]]
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:_int4"
+test array-constructor-of-arrays-equals-its-literal {
+    SELECT ARRAY[ARRAY[1,2],ARRAY[3,4]] = '\{ \{1,2\},\{3,4\} \}'::int[];
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+test array-of-floats-keeps-the-notation {
+    SELECT '\{1.5,2\}'::float8[];
+}
+expect {
+    \{1.5,2\}
+}
+
+test array-cast-of-an-integer-to-bool-array {
+    SELECT ARRAY[1]::bool[];
+}
+expect {
+    \{t\}
+}
+
+@compat-gap "operator:int4[] || unknown"
+test array-concatenation-with-an-array-literal {
+    SELECT ARRAY[1,2] || '\{3\}';
+}
+expect {
+    \{1,2,3\}
+}
+expect @tursopg {
+    \{1,2,"\{3\}"\}
+}
+
+@compat-gap "function:array_length"
+test array-length-of-an-empty-array {
+    SELECT array_length('\{\}'::int[], 1) IS NULL;
+}
+expect {
+    t
+}
+expect @tursopg {
+    f
+}
+
+test array-in-a-bool-column-prints-booleans {
+    CREATE TABLE ab (v bool[]); INSERT INTO ab VALUES ('\{t,f\}'); SELECT v FROM ab;
+}
+expect {
+    \{t,f\}
+}
+

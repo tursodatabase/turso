@@ -1,0 +1,62 @@
+# float8 and float4 columns keep the sign of a negative zero.
+# The answers come from PostgreSQL 18.
+
+@database :memory:
+
+test negative-zero-float8-column {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('-0');
+    SELECT x::text FROM t;
+}
+expect {
+    -0
+}
+
+test negative-zero-float4-column {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('-0');
+    SELECT x::text FROM t;
+}
+expect {
+    -0
+}
+
+test negative-zero-float8-column-keeps-the-sign-through-a-copy {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('-0');
+    CREATE TABLE t_copy (x float8);
+    INSERT INTO t_copy SELECT x FROM t;
+    SELECT x::text FROM t_copy;
+}
+expect {
+    -0
+}
+
+test negative-zero-expression {
+    SELECT '-0'::float8::text;
+}
+expect {
+    -0
+}
+
+test negative-zero-positive-zero {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES (0);
+    SELECT x::text FROM t;
+}
+expect {
+    0
+}
+
+@compat-gap "type:float8"
+test negative-zero-negated-zero-column {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES (0);
+    SELECT (-x)::text FROM t;
+}
+expect {
+    -0
+}
+expect @tursopg {
+    0
+}

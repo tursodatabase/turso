@@ -1,0 +1,177 @@
+# int2 columns and expressions. The answers come from PostgreSQL 18.
+
+@database :memory:
+
+test int2-plus-int2-is-an-int2 {
+    SELECT 1::int2 + 1::int2, pg_typeof(1::int2 + 1::int2);
+}
+expect {
+    2|smallint
+}
+
+test int2-plus-a-literal-is-an-int4 {
+    SELECT 1::int2 + 1, pg_typeof(1::int2 + 1);
+}
+expect {
+    2|integer
+}
+
+test int2-plus-a-literal-does-not-overflow-as-an-int2 {
+    SELECT 32767::int2 + 1;
+}
+expect {
+    32768
+}
+
+test int2-plus-int4-is-an-int4 {
+    SELECT 1::int2 + 1::int4, pg_typeof(1::int2 + 1::int4);
+}
+expect {
+    2|integer
+}
+
+test int4-plus-int2-is-an-int4 {
+    SELECT 1::int4 + 1::int2, pg_typeof(1::int4 + 1::int2);
+}
+expect {
+    2|integer
+}
+
+test int2-plus-int8-is-an-int8 {
+    SELECT 1::int2 + 1::int8, pg_typeof(1::int2 + 1::int8);
+}
+expect {
+    2|bigint
+}
+
+test int8-plus-int2-is-an-int8 {
+    SELECT 1::int8 + 1::int2, pg_typeof(1::int8 + 1::int2);
+}
+expect {
+    2|bigint
+}
+
+test int2-plus-overflows {
+    SELECT 32767::int2 + 1::int2;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int2-minus-overflows {
+    SELECT (-32768)::int2 - 1::int2;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int2-times-overflows {
+    SELECT 32767::int2 * 2::int2;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int2-column-plus-column-overflows {
+    CREATE TABLE t (a int2, b int2);
+    INSERT INTO t VALUES (32767, 1);
+    SELECT a + b FROM t;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int2-update-by-arithmetic-overflows {
+    CREATE TABLE t (n int2);
+    INSERT INTO t VALUES (32767);
+    UPDATE t SET n = n + 1;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int2-negation-overflows {
+    SELECT -((-32768)::int2);
+}
+@sqlstate 22003
+expect error {
+}
+
+test int2-smallest-divided-by-minus-one-overflows {
+    SELECT (-32768)::int2 / (-1)::int2;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int2-division-by-zero {
+    SELECT 5::int2 / 0::int2;
+}
+@sqlstate 22012
+expect error {
+}
+
+test int2-division-and-remainder-truncate-toward-zero {
+    SELECT 7::int2 / 2::int2, (-7)::int2 / 2::int2, (-7)::int2 % 3::int2;
+}
+expect {
+    3|-3|-1
+}
+
+test int2-plus-float4-is-a-float8 {
+    SELECT 1::int2 + 0.5::float4, pg_typeof(1::int2 + 0.5::float4);
+}
+expect {
+    1.5|double precision
+}
+
+test int2-plus-numeric-is-a-numeric {
+    SELECT 1::int2 + 1.5::numeric;
+}
+expect {
+    2.5
+}
+
+test int2-column-rejects-a-value-above-the-range {
+    CREATE TABLE t (n int2);
+    INSERT INTO t VALUES (32768);
+}
+@sqlstate 22003
+expect error {
+}
+
+test int2-key-accepts-the-largest-value {
+    CREATE TABLE t (id int2 PRIMARY KEY, v int);
+    INSERT INTO t VALUES (32767, 1);
+    SELECT id, v FROM t;
+}
+expect {
+    32767|1
+}
+
+test int2-key-rejects-a-value-above-the-range {
+    CREATE TABLE t (id int2 PRIMARY KEY, v int);
+    INSERT INTO t VALUES (32768, 1);
+}
+@sqlstate 22003
+expect error {
+}
+
+test int2-key-rejects-an-updated-value {
+    CREATE TABLE t (id int2 PRIMARY KEY, v int);
+    INSERT INTO t VALUES (1, 1);
+    UPDATE t SET id = 32768;
+}
+@sqlstate 22003
+expect error {
+}
+
+test smallserial-key-takes-its-values-from-the-sequence {
+    CREATE TABLE t (id smallserial PRIMARY KEY, v int);
+    INSERT INTO t (v) VALUES (10), (20);
+    SELECT id, v, pg_typeof(id) FROM t ORDER BY id;
+}
+expect {
+    1|10|smallint
+    2|20|smallint
+}

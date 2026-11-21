@@ -10464,3 +10464,98 @@ mod column_info {
         }
     }
 }
+
+#[cfg(test)]
+mod rowid_alias_type_tests {
+    use super::*;
+
+    fn schema_with_types(types: &[(&str, bool)]) -> Schema {
+        let mut builder = SchemaBuilder::new().unwrap();
+        for (sql, can_be_rowid_alias) in types {
+            let Some(Cmd::Stmt(Stmt::CreateType {
+                type_name, body, ..
+            })) = turso_parser::parser::Parser::new(sql.as_bytes())
+                .next_cmd()
+                .unwrap()
+            else {
+                panic!("not a CREATE TYPE: {sql}");
+            };
+            let origin = TypeOrigin::Builtin {
+                accepts_collate: false,
+                range_offsets: RangeOffsets::Integer,
+                stored_form_sorts_in_value_order: false,
+                can_be_rowid_alias: *can_be_rowid_alias,
+            };
+            let type_def =
+                TypeDef::from_create_type(&type_name, &body, origin, sql.to_string()).unwrap();
+            builder = builder.type_def(&type_name, Arc::new(type_def));
+        }
+        builder.custom_types(true).build()
+    }
+
+    fn table(schema: &Schema, sql: &str) -> BTreeTable {
+        let Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) =
+            turso_parser::parser::Parser::new(sql.as_bytes())
+                .next_cmd()
+                .unwrap()
+        else {
+            panic!("not a CREATE TABLE: {sql}");
+        };
+        let mut table = create_table(tbl_name.name.as_str(), &body, 2, false).unwrap();
+        table.resolve_custom_types(schema).unwrap();
+        table
+    }
+
+    const SMALL: &str = "CREATE TYPE small(value integer) BASE integer COERCE value";
+    const PLAIN: &str = "CREATE TYPE plain(value integer) BASE integer";
+
+    #[test]
+    fn a_key_of_a_type_that_can_be_a_rowid_alias_is_the_rowid() {
+        let schema = schema_with_types(&[(SMALL, true)]);
+        let table = table(
+            &schema,
+            "CREATE TABLE t(id small PRIMARY KEY, v integer) STRICT",
+        );
+        assert!(table.columns()[0].is_rowid_alias());
+        assert!(table.unique_sets.is_empty());
+    }
+
+    #[test]
+    fn a_key_of_a_type_that_does_not_say_so_is_not_the_rowid() {
+        let schema = schema_with_types(&[(PLAIN, false)]);
+        let table = table(
+            &schema,
+            "CREATE TABLE t(id plain PRIMARY KEY, v integer) STRICT",
+        );
+        assert!(!table.columns()[0].is_rowid_alias());
+        assert_eq!(table.unique_sets.len(), 1);
+    }
+
+    #[test]
+    fn a_type_with_an_encode_is_not_the_rowid() {
+        let schema = schema_with_types(&[(
+            "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END",
+            true,
+        )]);
+        let table = table(
+            &schema,
+            "CREATE TABLE t(id boolean PRIMARY KEY, v integer) STRICT",
+        );
+        assert!(!table.columns()[0].is_rowid_alias());
+    }
+
+    #[test]
+    fn a_key_of_two_columns_or_in_descending_order_is_not_the_rowid() {
+        let schema = schema_with_types(&[(SMALL, true)]);
+        let two = table(
+            &schema,
+            "CREATE TABLE t(a small, b small, PRIMARY KEY (a, b)) STRICT",
+        );
+        assert!(!two.columns()[0].is_rowid_alias());
+        let desc = table(
+            &schema,
+            "CREATE TABLE t(id small PRIMARY KEY DESC, v integer) STRICT",
+        );
+        assert!(!desc.columns()[0].is_rowid_alias());
+    }
+}

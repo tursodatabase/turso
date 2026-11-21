@@ -1,0 +1,4984 @@
+# CAST between PostgreSQL types, as an explicit cast (SELECT 'v'::src::tgt)
+# and as an assignment cast (INSERT of a src value into a tgt column).
+# The answers come from PostgreSQL 18. Each test with a `@compat-gap` label
+# records a case where tursopg gives another answer. Source values that
+# tursopg reads differently from PostgreSQL are left out, so these tests
+# check casts and not the input of the source type.
+
+@database :memory:
+
+test cast-int2-to-int4-explicit-0 {
+    SELECT ('0'::int2::int4);
+}
+expect {
+    0
+}
+
+test cast-int2-to-int4-explicit-1 {
+    SELECT ('1'::int2::int4);
+}
+expect {
+    1
+}
+
+test cast-int2-to-int4-explicit-2 {
+    SELECT ('-1'::int2::int4);
+}
+expect {
+    -1
+}
+
+test cast-int2-to-int4-explicit-3 {
+    SELECT ('32767'::int2::int4);
+}
+expect {
+    32767
+}
+
+test cast-int2-to-int4-assign-0 {
+    CREATE TABLE t (x int4);
+    INSERT INTO t VALUES ('0'::int2);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int2-to-int4-assign-1 {
+    CREATE TABLE t (x int4);
+    INSERT INTO t VALUES ('1'::int2);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int2-to-int8-explicit-0 {
+    SELECT ('0'::int2::int8);
+}
+expect {
+    0
+}
+
+test cast-int2-to-int8-explicit-1 {
+    SELECT ('1'::int2::int8);
+}
+expect {
+    1
+}
+
+test cast-int2-to-int8-explicit-2 {
+    SELECT ('-1'::int2::int8);
+}
+expect {
+    -1
+}
+
+test cast-int2-to-int8-explicit-3 {
+    SELECT ('32767'::int2::int8);
+}
+expect {
+    32767
+}
+
+test cast-int2-to-int8-assign-0 {
+    CREATE TABLE t (x int8);
+    INSERT INTO t VALUES ('0'::int2);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int2-to-int8-assign-1 {
+    CREATE TABLE t (x int8);
+    INSERT INTO t VALUES ('1'::int2);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int2-to-float4-explicit-0 {
+    SELECT ('0'::int2::float4);
+}
+expect {
+    0
+}
+
+test cast-int2-to-float4-explicit-1 {
+    SELECT ('1'::int2::float4);
+}
+expect {
+    1
+}
+
+test cast-int2-to-float4-explicit-2 {
+    SELECT ('-1'::int2::float4);
+}
+expect {
+    -1
+}
+
+test cast-int2-to-float4-explicit-3 {
+    SELECT ('32767'::int2::float4);
+}
+expect {
+    32767
+}
+
+test cast-int2-to-float4-assign-0 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('0'::int2);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int2-to-float4-assign-1 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('1'::int2);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int2-to-float8-explicit-0 {
+    SELECT ('0'::int2::float8);
+}
+expect {
+    0
+}
+
+test cast-int2-to-float8-explicit-1 {
+    SELECT ('1'::int2::float8);
+}
+expect {
+    1
+}
+
+test cast-int2-to-float8-explicit-2 {
+    SELECT ('-1'::int2::float8);
+}
+expect {
+    -1
+}
+
+test cast-int2-to-float8-explicit-3 {
+    SELECT ('32767'::int2::float8);
+}
+expect {
+    32767
+}
+
+test cast-int2-to-float8-assign-0 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('0'::int2);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int2-to-float8-assign-1 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('1'::int2);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int2-to-numeric-explicit-0 {
+    SELECT ('0'::int2::numeric);
+}
+expect {
+    0
+}
+
+test cast-int2-to-numeric-explicit-1 {
+    SELECT ('1'::int2::numeric);
+}
+expect {
+    1
+}
+
+test cast-int2-to-numeric-explicit-2 {
+    SELECT ('-1'::int2::numeric);
+}
+expect {
+    -1
+}
+
+test cast-int2-to-numeric-explicit-3 {
+    SELECT ('32767'::int2::numeric);
+}
+expect {
+    32767
+}
+
+test cast-int2-to-numeric-assign-0 {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('0'::int2);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int2-to-numeric-assign-1 {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('1'::int2);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int2-to-text-explicit-0 {
+    SELECT ('0'::int2::text);
+}
+expect {
+    0
+}
+
+test cast-int2-to-text-explicit-1 {
+    SELECT ('1'::int2::text);
+}
+expect {
+    1
+}
+
+test cast-int2-to-text-explicit-2 {
+    SELECT ('-1'::int2::text);
+}
+expect {
+    -1
+}
+
+test cast-int2-to-text-explicit-3 {
+    SELECT ('32767'::int2::text);
+}
+expect {
+    32767
+}
+
+test cast-int2-to-text-assign-0 {
+    CREATE TABLE t (x text);
+    INSERT INTO t VALUES ('0'::int2);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int2-to-text-assign-1 {
+    CREATE TABLE t (x text);
+    INSERT INTO t VALUES ('1'::int2);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int2-to-bool-explicit-0 {
+    SELECT CASE WHEN ('0'::int2::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int2-to-bool-explicit-1 {
+    SELECT CASE WHEN ('1'::int2::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int2-to-bool-explicit-2 {
+    SELECT CASE WHEN ('-1'::int2::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int2-to-bool-explicit-3 {
+    SELECT CASE WHEN ('32767'::int2::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int2-to-bool-assign-0 {
+    CREATE TABLE t (x bool);
+    INSERT INTO t VALUES ('0'::int2);
+    SELECT CASE WHEN x THEN 'true' ELSE 'false' END FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int2-to-bool-assign-1 {
+    CREATE TABLE t (x bool);
+    INSERT INTO t VALUES ('1'::int2);
+    SELECT CASE WHEN x THEN 'true' ELSE 'false' END FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+@compat-gap "cast:int2 -> date"
+test cast-int2-to-date-explicit-0 {
+    SELECT ('0'::int2::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:int2 -> date"
+test cast-int2-to-date-explicit-1 {
+    SELECT ('1'::int2::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:int2 -> date"
+test cast-int2-to-date-explicit-2 {
+    SELECT ('-1'::int2::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:int2 -> date"
+test cast-int2-to-date-explicit-3 {
+    SELECT ('32767'::int2::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:int2 -> date"
+test cast-int2-to-date-assign-0 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES ('0'::int2);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:int2 -> date"
+test cast-int2-to-date-assign-1 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES ('1'::int2);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+test cast-int2-to-timestamp-explicit-0 {
+    SELECT ('0'::int2::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int2-to-timestamp-explicit-1 {
+    SELECT ('1'::int2::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int2-to-timestamp-explicit-2 {
+    SELECT ('-1'::int2::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int2-to-timestamp-explicit-3 {
+    SELECT ('32767'::int2::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int2-to-timestamp-assign-0 {
+    CREATE TABLE t (x timestamp);
+    INSERT INTO t VALUES ('0'::int2);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int2-to-timestamp-assign-1 {
+    CREATE TABLE t (x timestamp);
+    INSERT INTO t VALUES ('1'::int2);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int2-to-bytea-explicit-0 {
+    SELECT ('0'::int2::bytea);
+}
+expect {
+    \x0000
+}
+
+test cast-int2-to-bytea-explicit-1 {
+    SELECT ('1'::int2::bytea);
+}
+expect {
+    \x0001
+}
+
+test cast-int2-to-bytea-explicit-2 {
+    SELECT ('-1'::int2::bytea);
+}
+expect {
+    \xffff
+}
+
+test cast-int2-to-bytea-explicit-3 {
+    SELECT ('32767'::int2::bytea);
+}
+expect {
+    \x7fff
+}
+
+test cast-int2-to-bytea-assign-0 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES ('0'::int2);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int2-to-bytea-assign-1 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES ('1'::int2);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int2-to-uuid-explicit-0 {
+    SELECT ('0'::int2::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int2-to-uuid-explicit-1 {
+    SELECT ('1'::int2::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int2-to-uuid-explicit-2 {
+    SELECT ('-1'::int2::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int2-to-uuid-explicit-3 {
+    SELECT ('32767'::int2::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int2-to-uuid-assign-0 {
+    CREATE TABLE t (x uuid);
+    INSERT INTO t VALUES ('0'::int2);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int2-to-uuid-assign-1 {
+    CREATE TABLE t (x uuid);
+    INSERT INTO t VALUES ('1'::int2);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int4-to-int2-explicit-0 {
+    SELECT ('0'::int4::int2);
+}
+expect {
+    0
+}
+
+test cast-int4-to-int2-explicit-1 {
+    SELECT ('1'::int4::int2);
+}
+expect {
+    1
+}
+
+test cast-int4-to-int2-explicit-2 {
+    SELECT ('-1'::int4::int2);
+}
+expect {
+    -1
+}
+
+test cast-int4-to-int2-explicit-3 {
+    SELECT ('42'::int4::int2);
+}
+expect {
+    42
+}
+
+test cast-int4-to-int2-explicit-4 {
+    SELECT ('32768'::int4::int2);
+}
+@sqlstate 22003
+expect error {
+}
+
+test cast-int4-to-int2-explicit-5 {
+    SELECT ('2147483647'::int4::int2);
+}
+@sqlstate 22003
+expect error {
+}
+
+test cast-int4-to-int2-assign-0 {
+    CREATE TABLE t (x int2);
+    INSERT INTO t VALUES ('0'::int4);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int4-to-int2-assign-1 {
+    CREATE TABLE t (x int2);
+    INSERT INTO t VALUES ('1'::int4);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int4-to-int8-explicit-0 {
+    SELECT ('0'::int4::int8);
+}
+expect {
+    0
+}
+
+test cast-int4-to-int8-explicit-1 {
+    SELECT ('1'::int4::int8);
+}
+expect {
+    1
+}
+
+test cast-int4-to-int8-explicit-2 {
+    SELECT ('-1'::int4::int8);
+}
+expect {
+    -1
+}
+
+test cast-int4-to-int8-explicit-3 {
+    SELECT ('42'::int4::int8);
+}
+expect {
+    42
+}
+
+test cast-int4-to-int8-explicit-4 {
+    SELECT ('32768'::int4::int8);
+}
+expect {
+    32768
+}
+
+test cast-int4-to-int8-explicit-5 {
+    SELECT ('2147483647'::int4::int8);
+}
+expect {
+    2147483647
+}
+
+test cast-int4-to-int8-assign-0 {
+    CREATE TABLE t (x int8);
+    INSERT INTO t VALUES ('0'::int4);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int4-to-int8-assign-1 {
+    CREATE TABLE t (x int8);
+    INSERT INTO t VALUES ('1'::int4);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int4-to-float4-explicit-0 {
+    SELECT ('0'::int4::float4);
+}
+expect {
+    0
+}
+
+test cast-int4-to-float4-explicit-1 {
+    SELECT ('1'::int4::float4);
+}
+expect {
+    1
+}
+
+test cast-int4-to-float4-explicit-2 {
+    SELECT ('-1'::int4::float4);
+}
+expect {
+    -1
+}
+
+test cast-int4-to-float4-explicit-3 {
+    SELECT ('42'::int4::float4);
+}
+expect {
+    42
+}
+
+test cast-int4-to-float4-explicit-4 {
+    SELECT ('32768'::int4::float4);
+}
+expect {
+    32768
+}
+
+test cast-int4-to-float4-explicit-5 {
+    SELECT ('2147483647'::int4::float4);
+}
+expect {
+    2.1474836e+09
+}
+
+test cast-int4-to-float4-assign-0 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('0'::int4);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int4-to-float4-assign-1 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('1'::int4);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int4-to-float8-explicit-0 {
+    SELECT ('0'::int4::float8);
+}
+expect {
+    0
+}
+
+test cast-int4-to-float8-explicit-1 {
+    SELECT ('1'::int4::float8);
+}
+expect {
+    1
+}
+
+test cast-int4-to-float8-explicit-2 {
+    SELECT ('-1'::int4::float8);
+}
+expect {
+    -1
+}
+
+test cast-int4-to-float8-explicit-3 {
+    SELECT ('42'::int4::float8);
+}
+expect {
+    42
+}
+
+test cast-int4-to-float8-explicit-4 {
+    SELECT ('32768'::int4::float8);
+}
+expect {
+    32768
+}
+
+test cast-int4-to-float8-explicit-5 {
+    SELECT ('2147483647'::int4::float8);
+}
+expect {
+    2147483647
+}
+
+test cast-int4-to-float8-assign-0 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('0'::int4);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int4-to-float8-assign-1 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('1'::int4);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int4-to-numeric-explicit-0 {
+    SELECT ('0'::int4::numeric);
+}
+expect {
+    0
+}
+
+test cast-int4-to-numeric-explicit-1 {
+    SELECT ('1'::int4::numeric);
+}
+expect {
+    1
+}
+
+test cast-int4-to-numeric-explicit-2 {
+    SELECT ('-1'::int4::numeric);
+}
+expect {
+    -1
+}
+
+test cast-int4-to-numeric-explicit-3 {
+    SELECT ('42'::int4::numeric);
+}
+expect {
+    42
+}
+
+test cast-int4-to-numeric-explicit-4 {
+    SELECT ('32768'::int4::numeric);
+}
+expect {
+    32768
+}
+
+test cast-int4-to-numeric-explicit-5 {
+    SELECT ('2147483647'::int4::numeric);
+}
+expect {
+    2147483647
+}
+
+test cast-int4-to-numeric-assign-0 {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('0'::int4);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int4-to-numeric-assign-1 {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('1'::int4);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int4-to-text-explicit-0 {
+    SELECT ('0'::int4::text);
+}
+expect {
+    0
+}
+
+test cast-int4-to-text-explicit-1 {
+    SELECT ('1'::int4::text);
+}
+expect {
+    1
+}
+
+test cast-int4-to-text-explicit-2 {
+    SELECT ('-1'::int4::text);
+}
+expect {
+    -1
+}
+
+test cast-int4-to-text-explicit-3 {
+    SELECT ('42'::int4::text);
+}
+expect {
+    42
+}
+
+test cast-int4-to-text-explicit-4 {
+    SELECT ('32768'::int4::text);
+}
+expect {
+    32768
+}
+
+test cast-int4-to-text-explicit-5 {
+    SELECT ('2147483647'::int4::text);
+}
+expect {
+    2147483647
+}
+
+test cast-int4-to-text-assign-0 {
+    CREATE TABLE t (x text);
+    INSERT INTO t VALUES ('0'::int4);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int4-to-text-assign-1 {
+    CREATE TABLE t (x text);
+    INSERT INTO t VALUES ('1'::int4);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int4-to-bool-explicit-0 {
+    SELECT CASE WHEN ('0'::int4::bool) THEN 'true' ELSE 'false' END;
+}
+expect {
+    false
+}
+
+test cast-int4-to-bool-explicit-1 {
+    SELECT CASE WHEN ('1'::int4::bool) THEN 'true' ELSE 'false' END;
+}
+expect {
+    true
+}
+
+test cast-int4-to-bool-explicit-2 {
+    SELECT CASE WHEN ('-1'::int4::bool) THEN 'true' ELSE 'false' END;
+}
+expect {
+    true
+}
+
+test cast-int4-to-bool-explicit-3 {
+    SELECT CASE WHEN ('42'::int4::bool) THEN 'true' ELSE 'false' END;
+}
+expect {
+    true
+}
+
+test cast-int4-to-bool-explicit-4 {
+    SELECT CASE WHEN ('32768'::int4::bool) THEN 'true' ELSE 'false' END;
+}
+expect {
+    true
+}
+
+test cast-int4-to-bool-explicit-5 {
+    SELECT CASE WHEN ('2147483647'::int4::bool) THEN 'true' ELSE 'false' END;
+}
+expect {
+    true
+}
+
+test cast-int4-to-bool-assign-0 {
+    CREATE TABLE t (x bool);
+    INSERT INTO t VALUES ('0'::int4);
+    SELECT CASE WHEN x THEN 'true' ELSE 'false' END FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int4-to-bool-assign-1 {
+    CREATE TABLE t (x bool);
+    INSERT INTO t VALUES ('1'::int4);
+    SELECT CASE WHEN x THEN 'true' ELSE 'false' END FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+@compat-gap "cast:int4 -> date"
+test cast-int4-to-date-explicit-0 {
+    SELECT ('0'::int4::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:int4 -> date"
+test cast-int4-to-date-explicit-1 {
+    SELECT ('1'::int4::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:int4 -> date"
+test cast-int4-to-date-explicit-2 {
+    SELECT ('-1'::int4::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:int4 -> date"
+test cast-int4-to-date-explicit-3 {
+    SELECT ('42'::int4::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:int4 -> date"
+test cast-int4-to-date-explicit-4 {
+    SELECT ('32768'::int4::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:int4 -> date"
+test cast-int4-to-date-explicit-5 {
+    SELECT ('2147483647'::int4::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:int4 -> date"
+test cast-int4-to-date-assign-0 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES ('0'::int4);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:int4 -> date"
+test cast-int4-to-date-assign-1 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES ('1'::int4);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+test cast-int4-to-timestamp-explicit-0 {
+    SELECT ('0'::int4::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int4-to-timestamp-explicit-1 {
+    SELECT ('1'::int4::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int4-to-timestamp-explicit-2 {
+    SELECT ('-1'::int4::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int4-to-timestamp-explicit-3 {
+    SELECT ('42'::int4::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int4-to-timestamp-explicit-4 {
+    SELECT ('32768'::int4::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int4-to-timestamp-explicit-5 {
+    SELECT ('2147483647'::int4::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int4-to-timestamp-assign-0 {
+    CREATE TABLE t (x timestamp);
+    INSERT INTO t VALUES ('0'::int4);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int4-to-timestamp-assign-1 {
+    CREATE TABLE t (x timestamp);
+    INSERT INTO t VALUES ('1'::int4);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int4-to-bytea-explicit-0 {
+    SELECT ('0'::int4::bytea);
+}
+expect {
+    \x00000000
+}
+
+test cast-int4-to-bytea-explicit-1 {
+    SELECT ('1'::int4::bytea);
+}
+expect {
+    \x00000001
+}
+
+test cast-int4-to-bytea-explicit-2 {
+    SELECT ('-1'::int4::bytea);
+}
+expect {
+    \xffffffff
+}
+
+test cast-int4-to-bytea-explicit-3 {
+    SELECT ('42'::int4::bytea);
+}
+expect {
+    \x0000002a
+}
+
+test cast-int4-to-bytea-explicit-4 {
+    SELECT ('32768'::int4::bytea);
+}
+expect {
+    \x00008000
+}
+
+test cast-int4-to-bytea-explicit-5 {
+    SELECT ('2147483647'::int4::bytea);
+}
+expect {
+    \x7fffffff
+}
+
+test cast-int4-to-bytea-assign-0 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES ('0'::int4);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int4-to-bytea-assign-1 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES ('1'::int4);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int4-to-uuid-explicit-0 {
+    SELECT ('0'::int4::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int4-to-uuid-explicit-1 {
+    SELECT ('1'::int4::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int4-to-uuid-explicit-2 {
+    SELECT ('-1'::int4::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int4-to-uuid-explicit-3 {
+    SELECT ('42'::int4::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int4-to-uuid-explicit-4 {
+    SELECT ('32768'::int4::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int4-to-uuid-explicit-5 {
+    SELECT ('2147483647'::int4::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int4-to-uuid-assign-0 {
+    CREATE TABLE t (x uuid);
+    INSERT INTO t VALUES ('0'::int4);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int4-to-uuid-assign-1 {
+    CREATE TABLE t (x uuid);
+    INSERT INTO t VALUES ('1'::int4);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int8-to-int2-explicit-0 {
+    SELECT ('0'::int8::int2);
+}
+expect {
+    0
+}
+
+test cast-int8-to-int2-explicit-1 {
+    SELECT ('1'::int8::int2);
+}
+expect {
+    1
+}
+
+test cast-int8-to-int2-explicit-2 {
+    SELECT ('2147483648'::int8::int2);
+}
+@sqlstate 22003
+expect error {
+}
+
+test cast-int8-to-int2-explicit-3 {
+    SELECT ('9223372036854775807'::int8::int2);
+}
+@sqlstate 22003
+expect error {
+}
+
+test cast-int8-to-int2-assign-0 {
+    CREATE TABLE t (x int2);
+    INSERT INTO t VALUES ('0'::int8);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int8-to-int2-assign-1 {
+    CREATE TABLE t (x int2);
+    INSERT INTO t VALUES ('1'::int8);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int8-to-int4-explicit-0 {
+    SELECT ('0'::int8::int4);
+}
+expect {
+    0
+}
+
+test cast-int8-to-int4-explicit-1 {
+    SELECT ('1'::int8::int4);
+}
+expect {
+    1
+}
+
+test cast-int8-to-int4-explicit-2 {
+    SELECT ('2147483648'::int8::int4);
+}
+@sqlstate 22003
+expect error {
+}
+
+test cast-int8-to-int4-explicit-3 {
+    SELECT ('9223372036854775807'::int8::int4);
+}
+@sqlstate 22003
+expect error {
+}
+
+test cast-int8-to-int4-assign-0 {
+    CREATE TABLE t (x int4);
+    INSERT INTO t VALUES ('0'::int8);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int8-to-int4-assign-1 {
+    CREATE TABLE t (x int4);
+    INSERT INTO t VALUES ('1'::int8);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int8-to-float4-explicit-0 {
+    SELECT ('0'::int8::float4);
+}
+expect {
+    0
+}
+
+test cast-int8-to-float4-explicit-1 {
+    SELECT ('1'::int8::float4);
+}
+expect {
+    1
+}
+
+test cast-int8-to-float4-explicit-2 {
+    SELECT ('2147483648'::int8::float4);
+}
+expect {
+    2.1474836e+09
+}
+
+test cast-int8-to-float4-explicit-3 {
+    SELECT ('9223372036854775807'::int8::float4);
+}
+expect {
+    9.223372e+18
+}
+
+test cast-int8-to-float4-assign-0 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('0'::int8);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int8-to-float4-assign-1 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('1'::int8);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int8-to-float8-explicit-0 {
+    SELECT ('0'::int8::float8);
+}
+expect {
+    0
+}
+
+test cast-int8-to-float8-explicit-1 {
+    SELECT ('1'::int8::float8);
+}
+expect {
+    1
+}
+
+test cast-int8-to-float8-explicit-2 {
+    SELECT ('2147483648'::int8::float8);
+}
+expect {
+    2147483648
+}
+
+test cast-int8-to-float8-explicit-3 {
+    SELECT ('9223372036854775807'::int8::float8);
+}
+expect {
+    9.223372036854776e+18
+}
+
+test cast-int8-to-float8-assign-0 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('0'::int8);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int8-to-float8-assign-1 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('1'::int8);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int8-to-numeric-explicit-0 {
+    SELECT ('0'::int8::numeric);
+}
+expect {
+    0
+}
+
+test cast-int8-to-numeric-explicit-1 {
+    SELECT ('1'::int8::numeric);
+}
+expect {
+    1
+}
+
+test cast-int8-to-numeric-explicit-2 {
+    SELECT ('2147483648'::int8::numeric);
+}
+expect {
+    2147483648
+}
+
+test cast-int8-to-numeric-explicit-3 {
+    SELECT ('9223372036854775807'::int8::numeric);
+}
+expect {
+    9223372036854775807
+}
+
+test cast-int8-to-numeric-assign-0 {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('0'::int8);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int8-to-numeric-assign-1 {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('1'::int8);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int8-to-text-explicit-0 {
+    SELECT ('0'::int8::text);
+}
+expect {
+    0
+}
+
+test cast-int8-to-text-explicit-1 {
+    SELECT ('1'::int8::text);
+}
+expect {
+    1
+}
+
+test cast-int8-to-text-explicit-2 {
+    SELECT ('2147483648'::int8::text);
+}
+expect {
+    2147483648
+}
+
+test cast-int8-to-text-explicit-3 {
+    SELECT ('9223372036854775807'::int8::text);
+}
+expect {
+    9223372036854775807
+}
+
+test cast-int8-to-text-assign-0 {
+    CREATE TABLE t (x text);
+    INSERT INTO t VALUES ('0'::int8);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-int8-to-text-assign-1 {
+    CREATE TABLE t (x text);
+    INSERT INTO t VALUES ('1'::int8);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test cast-int8-to-bool-explicit-0 {
+    SELECT CASE WHEN ('0'::int8::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int8-to-bool-explicit-1 {
+    SELECT CASE WHEN ('1'::int8::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int8-to-bool-explicit-2 {
+    SELECT CASE WHEN ('2147483648'::int8::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int8-to-bool-explicit-3 {
+    SELECT CASE WHEN ('9223372036854775807'::int8::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int8-to-bool-assign-0 {
+    CREATE TABLE t (x bool);
+    INSERT INTO t VALUES ('0'::int8);
+    SELECT CASE WHEN x THEN 'true' ELSE 'false' END FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int8-to-bool-assign-1 {
+    CREATE TABLE t (x bool);
+    INSERT INTO t VALUES ('1'::int8);
+    SELECT CASE WHEN x THEN 'true' ELSE 'false' END FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+@compat-gap "cast:int8 -> date"
+test cast-int8-to-date-explicit-0 {
+    SELECT ('0'::int8::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:int8 -> date"
+test cast-int8-to-date-explicit-1 {
+    SELECT ('1'::int8::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:int8 -> date"
+test cast-int8-to-date-explicit-2 {
+    SELECT ('2147483648'::int8::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:int8 -> date"
+test cast-int8-to-date-explicit-3 {
+    SELECT ('9223372036854775807'::int8::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:int8 -> date"
+test cast-int8-to-date-assign-0 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES ('0'::int8);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:int8 -> date"
+test cast-int8-to-date-assign-1 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES ('1'::int8);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+test cast-int8-to-timestamp-explicit-0 {
+    SELECT ('0'::int8::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int8-to-timestamp-explicit-1 {
+    SELECT ('1'::int8::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int8-to-timestamp-explicit-2 {
+    SELECT ('2147483648'::int8::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int8-to-timestamp-explicit-3 {
+    SELECT ('9223372036854775807'::int8::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int8-to-timestamp-assign-0 {
+    CREATE TABLE t (x timestamp);
+    INSERT INTO t VALUES ('0'::int8);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int8-to-timestamp-assign-1 {
+    CREATE TABLE t (x timestamp);
+    INSERT INTO t VALUES ('1'::int8);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int8-to-bytea-explicit-0 {
+    SELECT ('0'::int8::bytea);
+}
+expect {
+    \x0000000000000000
+}
+
+test cast-int8-to-bytea-explicit-1 {
+    SELECT ('1'::int8::bytea);
+}
+expect {
+    \x0000000000000001
+}
+
+test cast-int8-to-bytea-explicit-2 {
+    SELECT ('2147483648'::int8::bytea);
+}
+expect {
+    \x0000000080000000
+}
+
+test cast-int8-to-bytea-explicit-3 {
+    SELECT ('9223372036854775807'::int8::bytea);
+}
+expect {
+    \x7fffffffffffffff
+}
+
+test cast-int8-to-bytea-assign-0 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES ('0'::int8);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int8-to-bytea-assign-1 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES ('1'::int8);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int8-to-uuid-explicit-0 {
+    SELECT ('0'::int8::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int8-to-uuid-explicit-1 {
+    SELECT ('1'::int8::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int8-to-uuid-explicit-2 {
+    SELECT ('2147483648'::int8::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int8-to-uuid-explicit-3 {
+    SELECT ('9223372036854775807'::int8::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-int8-to-uuid-assign-0 {
+    CREATE TABLE t (x uuid);
+    INSERT INTO t VALUES ('0'::int8);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-int8-to-uuid-assign-1 {
+    CREATE TABLE t (x uuid);
+    INSERT INTO t VALUES ('1'::int8);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-float4-to-int2-explicit-0 {
+    SELECT ('1.5'::float4::int2);
+}
+expect {
+    2
+}
+
+test cast-float4-to-int2-explicit-1 {
+    SELECT ('2.5'::float4::int2);
+}
+expect {
+    2
+}
+
+test cast-float4-to-int2-explicit-2 {
+    SELECT ('-0.5'::float4::int2);
+}
+expect {
+    0
+}
+
+test cast-float4-to-int2-explicit-3 {
+    SELECT ('0.1'::float4::int2);
+}
+expect {
+    0
+}
+
+test cast-float4-to-int2-assign-0 {
+    CREATE TABLE t (x int2);
+    INSERT INTO t VALUES ('1.5'::float4);
+    SELECT x FROM t;
+}
+expect {
+    2
+}
+
+test cast-float4-to-int2-assign-1 {
+    CREATE TABLE t (x int2);
+    INSERT INTO t VALUES ('2.5'::float4);
+    SELECT x FROM t;
+}
+expect {
+    2
+}
+
+test cast-float4-to-int4-explicit-0 {
+    SELECT ('1.5'::float4::int4);
+}
+expect {
+    2
+}
+
+test cast-float4-to-int4-explicit-1 {
+    SELECT ('2.5'::float4::int4);
+}
+expect {
+    2
+}
+
+test cast-float4-to-int4-explicit-2 {
+    SELECT ('-0.5'::float4::int4);
+}
+expect {
+    0
+}
+
+test cast-float4-to-int4-explicit-3 {
+    SELECT ('0.1'::float4::int4);
+}
+expect {
+    0
+}
+
+test cast-float4-to-int4-assign-0 {
+    CREATE TABLE t (x int4);
+    INSERT INTO t VALUES ('1.5'::float4);
+    SELECT x FROM t;
+}
+expect {
+    2
+}
+
+test cast-float4-to-int4-assign-1 {
+    CREATE TABLE t (x int4);
+    INSERT INTO t VALUES ('2.5'::float4);
+    SELECT x FROM t;
+}
+expect {
+    2
+}
+
+test cast-float4-to-int8-explicit-0 {
+    SELECT ('1.5'::float4::int8);
+}
+expect {
+    2
+}
+
+test cast-float4-to-int8-explicit-1 {
+    SELECT ('2.5'::float4::int8);
+}
+expect {
+    2
+}
+
+test cast-float4-to-int8-explicit-2 {
+    SELECT ('-0.5'::float4::int8);
+}
+expect {
+    0
+}
+
+test cast-float4-to-int8-explicit-3 {
+    SELECT ('0.1'::float4::int8);
+}
+expect {
+    0
+}
+
+test cast-float4-to-int8-assign-0 {
+    CREATE TABLE t (x int8);
+    INSERT INTO t VALUES ('1.5'::float4);
+    SELECT x FROM t;
+}
+expect {
+    2
+}
+
+test cast-float4-to-int8-assign-1 {
+    CREATE TABLE t (x int8);
+    INSERT INTO t VALUES ('2.5'::float4);
+    SELECT x FROM t;
+}
+expect {
+    2
+}
+
+test cast-float4-to-float8-explicit-0 {
+    SELECT ('1.5'::float4::float8);
+}
+expect {
+    1.5
+}
+
+test cast-float4-to-float8-explicit-1 {
+    SELECT ('2.5'::float4::float8);
+}
+expect {
+    2.5
+}
+
+test cast-float4-to-float8-explicit-2 {
+    SELECT ('-0.5'::float4::float8);
+}
+expect {
+    -0.5
+}
+
+test cast-float4-to-float8-explicit-3 {
+    SELECT ('0.1'::float4::float8);
+}
+expect {
+    0.10000000149011612
+}
+
+test cast-float4-to-float8-assign-0 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('1.5'::float4);
+    SELECT x FROM t;
+}
+expect {
+    1.5
+}
+
+test cast-float4-to-float8-assign-1 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('2.5'::float4);
+    SELECT x FROM t;
+}
+expect {
+    2.5
+}
+
+test cast-float4-to-numeric-explicit-0 {
+    SELECT ('1.5'::float4::numeric);
+}
+expect {
+    1.5
+}
+
+test cast-float4-to-numeric-explicit-1 {
+    SELECT ('2.5'::float4::numeric);
+}
+expect {
+    2.5
+}
+
+test cast-float4-to-numeric-explicit-2 {
+    SELECT ('-0.5'::float4::numeric);
+}
+expect {
+    -0.5
+}
+
+test cast-float4-to-numeric-explicit-3 {
+    SELECT ('0.1'::float4::numeric);
+}
+expect {
+    0.1
+}
+
+test cast-float4-to-numeric-assign-0 {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('1.5'::float4);
+    SELECT x FROM t;
+}
+expect {
+    1.5
+}
+
+test cast-float4-to-numeric-assign-1 {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('2.5'::float4);
+    SELECT x FROM t;
+}
+expect {
+    2.5
+}
+
+test cast-float4-to-text-explicit-0 {
+    SELECT ('1.5'::float4::text);
+}
+expect {
+    1.5
+}
+
+test cast-float4-to-text-explicit-1 {
+    SELECT ('2.5'::float4::text);
+}
+expect {
+    2.5
+}
+
+test cast-float4-to-text-explicit-2 {
+    SELECT ('-0.5'::float4::text);
+}
+expect {
+    -0.5
+}
+
+test cast-float4-to-text-explicit-3 {
+    SELECT ('0.1'::float4::text);
+}
+expect {
+    0.1
+}
+
+test cast-float4-to-text-assign-0 {
+    CREATE TABLE t (x text);
+    INSERT INTO t VALUES ('1.5'::float4);
+    SELECT x FROM t;
+}
+expect {
+    1.5
+}
+
+test cast-float4-to-text-assign-1 {
+    CREATE TABLE t (x text);
+    INSERT INTO t VALUES ('2.5'::float4);
+    SELECT x FROM t;
+}
+expect {
+    2.5
+}
+
+test cast-float4-to-bool-explicit-0 {
+    SELECT CASE WHEN ('1.5'::float4::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float4-to-bool-explicit-1 {
+    SELECT CASE WHEN ('2.5'::float4::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float4-to-bool-explicit-2 {
+    SELECT CASE WHEN ('-0.5'::float4::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float4-to-bool-explicit-3 {
+    SELECT CASE WHEN ('0.1'::float4::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float4-to-bool-assign-0 {
+    CREATE TABLE t (x bool);
+    INSERT INTO t VALUES ('1.5'::float4);
+    SELECT CASE WHEN x THEN 'true' ELSE 'false' END FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-float4-to-bool-assign-1 {
+    CREATE TABLE t (x bool);
+    INSERT INTO t VALUES ('2.5'::float4);
+    SELECT CASE WHEN x THEN 'true' ELSE 'false' END FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+@compat-gap "cast:float4 -> date"
+test cast-float4-to-date-explicit-0 {
+    SELECT ('1.5'::float4::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:float4 -> date"
+test cast-float4-to-date-explicit-1 {
+    SELECT ('2.5'::float4::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:float4 -> date"
+test cast-float4-to-date-explicit-2 {
+    SELECT ('-0.5'::float4::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:float4 -> date"
+test cast-float4-to-date-explicit-3 {
+    SELECT ('0.1'::float4::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:float4 -> date"
+test cast-float4-to-date-assign-0 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES ('1.5'::float4);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:float4 -> date"
+test cast-float4-to-date-assign-1 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES ('2.5'::float4);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+test cast-float4-to-timestamp-explicit-0 {
+    SELECT ('1.5'::float4::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float4-to-timestamp-explicit-1 {
+    SELECT ('2.5'::float4::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float4-to-timestamp-explicit-2 {
+    SELECT ('-0.5'::float4::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float4-to-timestamp-explicit-3 {
+    SELECT ('0.1'::float4::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float4-to-timestamp-assign-0 {
+    CREATE TABLE t (x timestamp);
+    INSERT INTO t VALUES ('1.5'::float4);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-float4-to-timestamp-assign-1 {
+    CREATE TABLE t (x timestamp);
+    INSERT INTO t VALUES ('2.5'::float4);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-float4-to-bytea-explicit-0 {
+    SELECT ('1.5'::float4::bytea);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float4-to-bytea-explicit-1 {
+    SELECT ('2.5'::float4::bytea);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float4-to-bytea-explicit-2 {
+    SELECT ('-0.5'::float4::bytea);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float4-to-bytea-explicit-3 {
+    SELECT ('0.1'::float4::bytea);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float4-to-bytea-assign-0 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES ('1.5'::float4);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-float4-to-bytea-assign-1 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES ('2.5'::float4);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-float4-to-uuid-explicit-0 {
+    SELECT ('1.5'::float4::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float4-to-uuid-explicit-1 {
+    SELECT ('2.5'::float4::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float4-to-uuid-explicit-2 {
+    SELECT ('-0.5'::float4::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float4-to-uuid-explicit-3 {
+    SELECT ('0.1'::float4::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float4-to-uuid-assign-0 {
+    CREATE TABLE t (x uuid);
+    INSERT INTO t VALUES ('1.5'::float4);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-float4-to-uuid-assign-1 {
+    CREATE TABLE t (x uuid);
+    INSERT INTO t VALUES ('2.5'::float4);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-float8-to-int2-explicit-0 {
+    SELECT ('1.5'::float8::int2);
+}
+expect {
+    2
+}
+
+test cast-float8-to-int2-explicit-1 {
+    SELECT ('2.5'::float8::int2);
+}
+expect {
+    2
+}
+
+test cast-float8-to-int2-explicit-2 {
+    SELECT ('-2.5'::float8::int2);
+}
+expect {
+    -2
+}
+
+test cast-float8-to-int2-explicit-3 {
+    SELECT ('0.1'::float8::int2);
+}
+expect {
+    0
+}
+
+test cast-float8-to-int2-assign-0 {
+    CREATE TABLE t (x int2);
+    INSERT INTO t VALUES ('1.5'::float8);
+    SELECT x FROM t;
+}
+expect {
+    2
+}
+
+test cast-float8-to-int2-assign-1 {
+    CREATE TABLE t (x int2);
+    INSERT INTO t VALUES ('2.5'::float8);
+    SELECT x FROM t;
+}
+expect {
+    2
+}
+
+test cast-float8-to-int4-explicit-0 {
+    SELECT ('1.5'::float8::int4);
+}
+expect {
+    2
+}
+
+test cast-float8-to-int4-explicit-1 {
+    SELECT ('2.5'::float8::int4);
+}
+expect {
+    2
+}
+
+test cast-float8-to-int4-explicit-2 {
+    SELECT ('-2.5'::float8::int4);
+}
+expect {
+    -2
+}
+
+test cast-float8-to-int4-explicit-3 {
+    SELECT ('0.1'::float8::int4);
+}
+expect {
+    0
+}
+
+test cast-float8-to-int4-assign-0 {
+    CREATE TABLE t (x int4);
+    INSERT INTO t VALUES ('1.5'::float8);
+    SELECT x FROM t;
+}
+expect {
+    2
+}
+
+test cast-float8-to-int4-assign-1 {
+    CREATE TABLE t (x int4);
+    INSERT INTO t VALUES ('2.5'::float8);
+    SELECT x FROM t;
+}
+expect {
+    2
+}
+
+test cast-float8-to-int8-explicit-0 {
+    SELECT ('1.5'::float8::int8);
+}
+expect {
+    2
+}
+
+test cast-float8-to-int8-explicit-1 {
+    SELECT ('2.5'::float8::int8);
+}
+expect {
+    2
+}
+
+test cast-float8-to-int8-explicit-2 {
+    SELECT ('-2.5'::float8::int8);
+}
+expect {
+    -2
+}
+
+test cast-float8-to-int8-explicit-3 {
+    SELECT ('0.1'::float8::int8);
+}
+expect {
+    0
+}
+
+test cast-float8-to-int8-assign-0 {
+    CREATE TABLE t (x int8);
+    INSERT INTO t VALUES ('1.5'::float8);
+    SELECT x FROM t;
+}
+expect {
+    2
+}
+
+test cast-float8-to-int8-assign-1 {
+    CREATE TABLE t (x int8);
+    INSERT INTO t VALUES ('2.5'::float8);
+    SELECT x FROM t;
+}
+expect {
+    2
+}
+
+test cast-float8-to-float4-explicit-0 {
+    SELECT ('1.5'::float8::float4);
+}
+expect {
+    1.5
+}
+
+test cast-float8-to-float4-explicit-1 {
+    SELECT ('2.5'::float8::float4);
+}
+expect {
+    2.5
+}
+
+test cast-float8-to-float4-explicit-2 {
+    SELECT ('-2.5'::float8::float4);
+}
+expect {
+    -2.5
+}
+
+test cast-float8-to-float4-explicit-3 {
+    SELECT ('0.1'::float8::float4);
+}
+expect {
+    0.1
+}
+
+test cast-float8-to-float4-assign-0 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('1.5'::float8);
+    SELECT x FROM t;
+}
+expect {
+    1.5
+}
+
+test cast-float8-to-float4-assign-1 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('2.5'::float8);
+    SELECT x FROM t;
+}
+expect {
+    2.5
+}
+
+test cast-float8-to-numeric-explicit-0 {
+    SELECT ('1.5'::float8::numeric);
+}
+expect {
+    1.5
+}
+
+test cast-float8-to-numeric-explicit-1 {
+    SELECT ('2.5'::float8::numeric);
+}
+expect {
+    2.5
+}
+
+test cast-float8-to-numeric-explicit-2 {
+    SELECT ('-2.5'::float8::numeric);
+}
+expect {
+    -2.5
+}
+
+test cast-float8-to-numeric-explicit-3 {
+    SELECT ('0.1'::float8::numeric);
+}
+expect {
+    0.1
+}
+
+test cast-float8-to-numeric-assign-0 {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('1.5'::float8);
+    SELECT x FROM t;
+}
+expect {
+    1.5
+}
+
+test cast-float8-to-numeric-assign-1 {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('2.5'::float8);
+    SELECT x FROM t;
+}
+expect {
+    2.5
+}
+
+test cast-float8-to-text-explicit-0 {
+    SELECT ('1.5'::float8::text);
+}
+expect {
+    1.5
+}
+
+test cast-float8-to-text-explicit-1 {
+    SELECT ('2.5'::float8::text);
+}
+expect {
+    2.5
+}
+
+test cast-float8-to-text-explicit-2 {
+    SELECT ('-2.5'::float8::text);
+}
+expect {
+    -2.5
+}
+
+test cast-float8-to-text-explicit-3 {
+    SELECT ('0.1'::float8::text);
+}
+expect {
+    0.1
+}
+
+test cast-float8-to-text-assign-0 {
+    CREATE TABLE t (x text);
+    INSERT INTO t VALUES ('1.5'::float8);
+    SELECT x FROM t;
+}
+expect {
+    1.5
+}
+
+test cast-float8-to-text-assign-1 {
+    CREATE TABLE t (x text);
+    INSERT INTO t VALUES ('2.5'::float8);
+    SELECT x FROM t;
+}
+expect {
+    2.5
+}
+
+test cast-float8-to-bool-explicit-0 {
+    SELECT CASE WHEN ('1.5'::float8::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float8-to-bool-explicit-1 {
+    SELECT CASE WHEN ('2.5'::float8::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float8-to-bool-explicit-2 {
+    SELECT CASE WHEN ('-2.5'::float8::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float8-to-bool-explicit-3 {
+    SELECT CASE WHEN ('0.1'::float8::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float8-to-bool-assign-0 {
+    CREATE TABLE t (x bool);
+    INSERT INTO t VALUES ('1.5'::float8);
+    SELECT CASE WHEN x THEN 'true' ELSE 'false' END FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-float8-to-bool-assign-1 {
+    CREATE TABLE t (x bool);
+    INSERT INTO t VALUES ('2.5'::float8);
+    SELECT CASE WHEN x THEN 'true' ELSE 'false' END FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+@compat-gap "cast:float8 -> date"
+test cast-float8-to-date-explicit-0 {
+    SELECT ('1.5'::float8::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:float8 -> date"
+test cast-float8-to-date-explicit-1 {
+    SELECT ('2.5'::float8::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:float8 -> date"
+test cast-float8-to-date-explicit-2 {
+    SELECT ('-2.5'::float8::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:float8 -> date"
+test cast-float8-to-date-explicit-3 {
+    SELECT ('0.1'::float8::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:float8 -> date"
+test cast-float8-to-date-assign-0 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES ('1.5'::float8);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:float8 -> date"
+test cast-float8-to-date-assign-1 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES ('2.5'::float8);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+test cast-float8-to-timestamp-explicit-0 {
+    SELECT ('1.5'::float8::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float8-to-timestamp-explicit-1 {
+    SELECT ('2.5'::float8::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float8-to-timestamp-explicit-2 {
+    SELECT ('-2.5'::float8::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float8-to-timestamp-explicit-3 {
+    SELECT ('0.1'::float8::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float8-to-timestamp-assign-0 {
+    CREATE TABLE t (x timestamp);
+    INSERT INTO t VALUES ('1.5'::float8);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-float8-to-timestamp-assign-1 {
+    CREATE TABLE t (x timestamp);
+    INSERT INTO t VALUES ('2.5'::float8);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-float8-to-bytea-explicit-0 {
+    SELECT ('1.5'::float8::bytea);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float8-to-bytea-explicit-1 {
+    SELECT ('2.5'::float8::bytea);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float8-to-bytea-explicit-2 {
+    SELECT ('-2.5'::float8::bytea);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float8-to-bytea-explicit-3 {
+    SELECT ('0.1'::float8::bytea);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float8-to-bytea-assign-0 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES ('1.5'::float8);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-float8-to-bytea-assign-1 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES ('2.5'::float8);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-float8-to-uuid-explicit-0 {
+    SELECT ('1.5'::float8::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float8-to-uuid-explicit-1 {
+    SELECT ('2.5'::float8::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float8-to-uuid-explicit-2 {
+    SELECT ('-2.5'::float8::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float8-to-uuid-explicit-3 {
+    SELECT ('0.1'::float8::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-float8-to-uuid-assign-0 {
+    CREATE TABLE t (x uuid);
+    INSERT INTO t VALUES ('1.5'::float8);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-float8-to-uuid-assign-1 {
+    CREATE TABLE t (x uuid);
+    INSERT INTO t VALUES ('2.5'::float8);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-numeric-to-int2-explicit-0 {
+    SELECT ('0'::numeric::int2);
+}
+expect {
+    0
+}
+
+test cast-numeric-to-int2-explicit-1 {
+    SELECT ('1.5'::numeric::int2);
+}
+expect {
+    2
+}
+
+test cast-numeric-to-int2-explicit-2 {
+    SELECT ('2.5'::numeric::int2);
+}
+expect {
+    3
+}
+
+test cast-numeric-to-int2-explicit-3 {
+    SELECT ('12.345'::numeric::int2);
+}
+expect {
+    12
+}
+
+test cast-numeric-to-int2-explicit-4 {
+    SELECT ('-0.5'::numeric::int2);
+}
+expect {
+    -1
+}
+
+test cast-numeric-to-int2-assign-0 {
+    CREATE TABLE t (x int2);
+    INSERT INTO t VALUES ('0'::numeric);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-numeric-to-int2-assign-1 {
+    CREATE TABLE t (x int2);
+    INSERT INTO t VALUES ('1.5'::numeric);
+    SELECT x FROM t;
+}
+expect {
+    2
+}
+
+test cast-numeric-to-int4-explicit-0 {
+    SELECT ('0'::numeric::int4);
+}
+expect {
+    0
+}
+
+test cast-numeric-to-int4-explicit-1 {
+    SELECT ('1.5'::numeric::int4);
+}
+expect {
+    2
+}
+
+test cast-numeric-to-int4-explicit-2 {
+    SELECT ('2.5'::numeric::int4);
+}
+expect {
+    3
+}
+
+test cast-numeric-to-int4-explicit-3 {
+    SELECT ('12.345'::numeric::int4);
+}
+expect {
+    12
+}
+
+test cast-numeric-to-int4-explicit-4 {
+    SELECT ('-0.5'::numeric::int4);
+}
+expect {
+    -1
+}
+
+test cast-numeric-to-int4-assign-0 {
+    CREATE TABLE t (x int4);
+    INSERT INTO t VALUES ('0'::numeric);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-numeric-to-int4-assign-1 {
+    CREATE TABLE t (x int4);
+    INSERT INTO t VALUES ('1.5'::numeric);
+    SELECT x FROM t;
+}
+expect {
+    2
+}
+
+test cast-numeric-to-int8-explicit-0 {
+    SELECT ('0'::numeric::int8);
+}
+expect {
+    0
+}
+
+test cast-numeric-to-int8-explicit-1 {
+    SELECT ('1.5'::numeric::int8);
+}
+expect {
+    2
+}
+
+test cast-numeric-to-int8-explicit-2 {
+    SELECT ('2.5'::numeric::int8);
+}
+expect {
+    3
+}
+
+test cast-numeric-to-int8-explicit-3 {
+    SELECT ('12.345'::numeric::int8);
+}
+expect {
+    12
+}
+
+test cast-numeric-to-int8-explicit-4 {
+    SELECT ('-0.5'::numeric::int8);
+}
+expect {
+    -1
+}
+
+test cast-numeric-to-int8-assign-0 {
+    CREATE TABLE t (x int8);
+    INSERT INTO t VALUES ('0'::numeric);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-numeric-to-int8-assign-1 {
+    CREATE TABLE t (x int8);
+    INSERT INTO t VALUES ('1.5'::numeric);
+    SELECT x FROM t;
+}
+expect {
+    2
+}
+
+test cast-numeric-to-float4-explicit-0 {
+    SELECT ('0'::numeric::float4);
+}
+expect {
+    0
+}
+
+test cast-numeric-to-float4-explicit-1 {
+    SELECT ('1.5'::numeric::float4);
+}
+expect {
+    1.5
+}
+
+test cast-numeric-to-float4-explicit-2 {
+    SELECT ('2.5'::numeric::float4);
+}
+expect {
+    2.5
+}
+
+test cast-numeric-to-float4-explicit-3 {
+    SELECT ('12.345'::numeric::float4);
+}
+expect {
+    12.345
+}
+
+test cast-numeric-to-float4-explicit-4 {
+    SELECT ('-0.5'::numeric::float4);
+}
+expect {
+    -0.5
+}
+
+test cast-numeric-to-float4-assign-0 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('0'::numeric);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-numeric-to-float4-assign-1 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('1.5'::numeric);
+    SELECT x FROM t;
+}
+expect {
+    1.5
+}
+
+test cast-numeric-to-float8-explicit-0 {
+    SELECT ('0'::numeric::float8);
+}
+expect {
+    0
+}
+
+test cast-numeric-to-float8-explicit-1 {
+    SELECT ('1.5'::numeric::float8);
+}
+expect {
+    1.5
+}
+
+test cast-numeric-to-float8-explicit-2 {
+    SELECT ('2.5'::numeric::float8);
+}
+expect {
+    2.5
+}
+
+test cast-numeric-to-float8-explicit-3 {
+    SELECT ('12.345'::numeric::float8);
+}
+expect {
+    12.345
+}
+
+test cast-numeric-to-float8-explicit-4 {
+    SELECT ('-0.5'::numeric::float8);
+}
+expect {
+    -0.5
+}
+
+test cast-numeric-to-float8-assign-0 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('0'::numeric);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-numeric-to-float8-assign-1 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('1.5'::numeric);
+    SELECT x FROM t;
+}
+expect {
+    1.5
+}
+
+test cast-numeric-to-text-explicit-0 {
+    SELECT ('0'::numeric::text);
+}
+expect {
+    0
+}
+
+test cast-numeric-to-text-explicit-1 {
+    SELECT ('1.5'::numeric::text);
+}
+expect {
+    1.5
+}
+
+test cast-numeric-to-text-explicit-2 {
+    SELECT ('2.5'::numeric::text);
+}
+expect {
+    2.5
+}
+
+test cast-numeric-to-text-explicit-3 {
+    SELECT ('12.345'::numeric::text);
+}
+expect {
+    12.345
+}
+
+test cast-numeric-to-text-explicit-4 {
+    SELECT ('-0.5'::numeric::text);
+}
+expect {
+    -0.5
+}
+
+test cast-numeric-to-text-assign-0 {
+    CREATE TABLE t (x text);
+    INSERT INTO t VALUES ('0'::numeric);
+    SELECT x FROM t;
+}
+expect {
+    0
+}
+
+test cast-numeric-to-text-assign-1 {
+    CREATE TABLE t (x text);
+    INSERT INTO t VALUES ('1.5'::numeric);
+    SELECT x FROM t;
+}
+expect {
+    1.5
+}
+
+test cast-numeric-to-bool-explicit-0 {
+    SELECT CASE WHEN ('0'::numeric::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-bool-explicit-1 {
+    SELECT CASE WHEN ('1.5'::numeric::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-bool-explicit-2 {
+    SELECT CASE WHEN ('2.5'::numeric::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-bool-explicit-3 {
+    SELECT CASE WHEN ('12.345'::numeric::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-bool-explicit-4 {
+    SELECT CASE WHEN ('-0.5'::numeric::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-bool-assign-0 {
+    CREATE TABLE t (x bool);
+    INSERT INTO t VALUES ('0'::numeric);
+    SELECT CASE WHEN x THEN 'true' ELSE 'false' END FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-numeric-to-bool-assign-1 {
+    CREATE TABLE t (x bool);
+    INSERT INTO t VALUES ('1.5'::numeric);
+    SELECT CASE WHEN x THEN 'true' ELSE 'false' END FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+@compat-gap "cast:numeric -> date"
+test cast-numeric-to-date-explicit-0 {
+    SELECT ('0'::numeric::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:numeric -> date"
+test cast-numeric-to-date-explicit-1 {
+    SELECT ('1.5'::numeric::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:numeric -> date"
+test cast-numeric-to-date-explicit-2 {
+    SELECT ('2.5'::numeric::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:numeric -> date"
+test cast-numeric-to-date-explicit-3 {
+    SELECT ('12.345'::numeric::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:numeric -> date"
+test cast-numeric-to-date-explicit-4 {
+    SELECT ('-0.5'::numeric::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:numeric -> date"
+test cast-numeric-to-date-assign-0 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES ('0'::numeric);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:numeric -> date"
+test cast-numeric-to-date-assign-1 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES ('1.5'::numeric);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+test cast-numeric-to-timestamp-explicit-0 {
+    SELECT ('0'::numeric::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-timestamp-explicit-1 {
+    SELECT ('1.5'::numeric::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-timestamp-explicit-2 {
+    SELECT ('2.5'::numeric::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-timestamp-explicit-3 {
+    SELECT ('12.345'::numeric::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-timestamp-explicit-4 {
+    SELECT ('-0.5'::numeric::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-timestamp-assign-0 {
+    CREATE TABLE t (x timestamp);
+    INSERT INTO t VALUES ('0'::numeric);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-numeric-to-timestamp-assign-1 {
+    CREATE TABLE t (x timestamp);
+    INSERT INTO t VALUES ('1.5'::numeric);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-numeric-to-bytea-explicit-0 {
+    SELECT ('0'::numeric::bytea);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-bytea-explicit-1 {
+    SELECT ('1.5'::numeric::bytea);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-bytea-explicit-2 {
+    SELECT ('2.5'::numeric::bytea);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-bytea-explicit-3 {
+    SELECT ('12.345'::numeric::bytea);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-bytea-explicit-4 {
+    SELECT ('-0.5'::numeric::bytea);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-bytea-assign-0 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES ('0'::numeric);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-numeric-to-bytea-assign-1 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES ('1.5'::numeric);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-numeric-to-uuid-explicit-0 {
+    SELECT ('0'::numeric::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-uuid-explicit-1 {
+    SELECT ('1.5'::numeric::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-uuid-explicit-2 {
+    SELECT ('2.5'::numeric::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-uuid-explicit-3 {
+    SELECT ('12.345'::numeric::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-uuid-explicit-4 {
+    SELECT ('-0.5'::numeric::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-numeric-to-uuid-assign-0 {
+    CREATE TABLE t (x uuid);
+    INSERT INTO t VALUES ('0'::numeric);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-numeric-to-uuid-assign-1 {
+    CREATE TABLE t (x uuid);
+    INSERT INTO t VALUES ('1.5'::numeric);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-int2-explicit-0 {
+    SELECT ('42'::text::int2);
+}
+expect {
+    42
+}
+
+test cast-text-to-int2-explicit-1 {
+    SELECT ('abc'::text::int2);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int2-explicit-2 {
+    SELECT ('1.5'::text::int2);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int2-explicit-3 {
+    SELECT ('t'::text::int2);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int2-explicit-4 {
+    SELECT ('true'::text::int2);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int2-explicit-5 {
+    SELECT ('2024-01-02'::text::int2);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int2-explicit-6 {
+    SELECT (''::text::int2);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int2-assign-0 {
+    CREATE TABLE t (x int2);
+    INSERT INTO t VALUES ('42'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-int2-assign-1 {
+    CREATE TABLE t (x int2);
+    INSERT INTO t VALUES ('abc'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-int4-explicit-0 {
+    SELECT ('42'::text::int4);
+}
+expect {
+    42
+}
+
+test cast-text-to-int4-explicit-1 {
+    SELECT ('abc'::text::int4);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int4-explicit-2 {
+    SELECT ('1.5'::text::int4);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int4-explicit-3 {
+    SELECT ('t'::text::int4);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int4-explicit-4 {
+    SELECT ('true'::text::int4);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int4-explicit-5 {
+    SELECT ('2024-01-02'::text::int4);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int4-explicit-6 {
+    SELECT (''::text::int4);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int4-assign-0 {
+    CREATE TABLE t (x int4);
+    INSERT INTO t VALUES ('42'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-int4-assign-1 {
+    CREATE TABLE t (x int4);
+    INSERT INTO t VALUES ('abc'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-int8-explicit-0 {
+    SELECT ('42'::text::int8);
+}
+expect {
+    42
+}
+
+test cast-text-to-int8-explicit-1 {
+    SELECT ('abc'::text::int8);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int8-explicit-2 {
+    SELECT ('1.5'::text::int8);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int8-explicit-3 {
+    SELECT ('t'::text::int8);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int8-explicit-4 {
+    SELECT ('true'::text::int8);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int8-explicit-5 {
+    SELECT ('2024-01-02'::text::int8);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int8-explicit-6 {
+    SELECT (''::text::int8);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-int8-assign-0 {
+    CREATE TABLE t (x int8);
+    INSERT INTO t VALUES ('42'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-int8-assign-1 {
+    CREATE TABLE t (x int8);
+    INSERT INTO t VALUES ('abc'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-float4-explicit-0 {
+    SELECT ('42'::text::float4);
+}
+expect {
+    42
+}
+
+test cast-text-to-float4-explicit-1 {
+    SELECT ('abc'::text::float4);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-float4-explicit-2 {
+    SELECT ('1.5'::text::float4);
+}
+expect {
+    1.5
+}
+
+test cast-text-to-float4-explicit-3 {
+    SELECT ('t'::text::float4);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-float4-explicit-4 {
+    SELECT ('true'::text::float4);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-float4-explicit-5 {
+    SELECT ('2024-01-02'::text::float4);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-float4-explicit-6 {
+    SELECT (''::text::float4);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-float4-assign-0 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('42'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-float4-assign-1 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('abc'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-float8-explicit-0 {
+    SELECT ('42'::text::float8);
+}
+expect {
+    42
+}
+
+test cast-text-to-float8-explicit-1 {
+    SELECT ('abc'::text::float8);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-float8-explicit-2 {
+    SELECT ('1.5'::text::float8);
+}
+expect {
+    1.5
+}
+
+test cast-text-to-float8-explicit-3 {
+    SELECT ('t'::text::float8);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-float8-explicit-4 {
+    SELECT ('true'::text::float8);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-float8-explicit-5 {
+    SELECT ('2024-01-02'::text::float8);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-float8-explicit-6 {
+    SELECT (''::text::float8);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-float8-assign-0 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('42'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-float8-assign-1 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('abc'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-numeric-explicit-0 {
+    SELECT ('42'::text::numeric);
+}
+expect {
+    42
+}
+
+test cast-text-to-numeric-explicit-1 {
+    SELECT ('abc'::text::numeric);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-numeric-explicit-2 {
+    SELECT ('1.5'::text::numeric);
+}
+expect {
+    1.5
+}
+
+test cast-text-to-numeric-explicit-3 {
+    SELECT ('t'::text::numeric);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-numeric-explicit-4 {
+    SELECT ('true'::text::numeric);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-numeric-explicit-5 {
+    SELECT ('2024-01-02'::text::numeric);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-numeric-explicit-6 {
+    SELECT (''::text::numeric);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-numeric-assign-0 {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('42'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-numeric-assign-1 {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('abc'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-bool-explicit-0 {
+    SELECT CASE WHEN ('42'::text::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-bool-explicit-1 {
+    SELECT CASE WHEN ('abc'::text::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-bool-explicit-2 {
+    SELECT CASE WHEN ('1.5'::text::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-bool-explicit-3 {
+    SELECT CASE WHEN ('t'::text::bool) THEN 'true' ELSE 'false' END;
+}
+expect {
+    true
+}
+
+test cast-text-to-bool-explicit-4 {
+    SELECT CASE WHEN ('true'::text::bool) THEN 'true' ELSE 'false' END;
+}
+expect {
+    true
+}
+
+test cast-text-to-bool-explicit-5 {
+    SELECT CASE WHEN ('2024-01-02'::text::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-bool-explicit-6 {
+    SELECT CASE WHEN (''::text::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-bool-assign-0 {
+    CREATE TABLE t (x bool);
+    INSERT INTO t VALUES ('42'::text);
+    SELECT CASE WHEN x THEN 'true' ELSE 'false' END FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-bool-assign-1 {
+    CREATE TABLE t (x bool);
+    INSERT INTO t VALUES ('abc'::text);
+    SELECT CASE WHEN x THEN 'true' ELSE 'false' END FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+@compat-gap "cast:text -> date"
+test cast-text-to-date-explicit-0 {
+    SELECT ('42'::text::date);
+}
+@sqlstate 22008
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:text -> date"
+test cast-text-to-date-explicit-1 {
+    SELECT ('abc'::text::date);
+}
+@sqlstate 22007
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:text -> date"
+test cast-text-to-date-explicit-2 {
+    SELECT ('1.5'::text::date);
+}
+@sqlstate 22007
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:text -> date"
+test cast-text-to-date-explicit-3 {
+    SELECT ('t'::text::date);
+}
+@sqlstate 22007
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:text -> date"
+test cast-text-to-date-explicit-4 {
+    SELECT ('true'::text::date);
+}
+@sqlstate 22007
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:text -> date"
+test cast-text-to-date-explicit-5 {
+    SELECT ('2024-01-02'::text::date);
+}
+expect {
+    2024-01-02
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:text -> date"
+test cast-text-to-date-explicit-6 {
+    SELECT (''::text::date);
+}
+@sqlstate 22007
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:text -> date"
+test cast-text-to-date-assign-0 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES ('42'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:text -> date"
+test cast-text-to-date-assign-1 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES ('abc'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:text -> timestamp"
+test cast-text-to-timestamp-explicit-0 {
+    SELECT ('42'::text::timestamp);
+}
+@sqlstate 22008
+expect error {
+}
+@sqlstate 22007
+expect @tursopg error {
+}
+
+test cast-text-to-timestamp-explicit-1 {
+    SELECT ('abc'::text::timestamp);
+}
+@sqlstate 22007
+expect error {
+}
+
+test cast-text-to-timestamp-explicit-2 {
+    SELECT ('1.5'::text::timestamp);
+}
+@sqlstate 22007
+expect error {
+}
+
+test cast-text-to-timestamp-explicit-3 {
+    SELECT ('t'::text::timestamp);
+}
+@sqlstate 22007
+expect error {
+}
+
+test cast-text-to-timestamp-explicit-4 {
+    SELECT ('true'::text::timestamp);
+}
+@sqlstate 22007
+expect error {
+}
+
+test cast-text-to-timestamp-explicit-5 {
+    SELECT ('2024-01-02'::text::timestamp);
+}
+expect {
+    2024-01-02 00:00:00
+}
+
+test cast-text-to-timestamp-explicit-6 {
+    SELECT (''::text::timestamp);
+}
+@sqlstate 22007
+expect error {
+}
+
+test cast-text-to-timestamp-assign-0 {
+    CREATE TABLE t (x timestamp);
+    INSERT INTO t VALUES ('42'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-timestamp-assign-1 {
+    CREATE TABLE t (x timestamp);
+    INSERT INTO t VALUES ('abc'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-bytea-explicit-0 {
+    SELECT ('42'::text::bytea);
+}
+expect {
+    \x3432
+}
+
+test cast-text-to-bytea-explicit-1 {
+    SELECT ('abc'::text::bytea);
+}
+expect {
+    \x616263
+}
+
+test cast-text-to-bytea-explicit-2 {
+    SELECT ('1.5'::text::bytea);
+}
+expect {
+    \x312e35
+}
+
+test cast-text-to-bytea-explicit-3 {
+    SELECT ('t'::text::bytea);
+}
+expect {
+    \x74
+}
+
+test cast-text-to-bytea-explicit-4 {
+    SELECT ('true'::text::bytea);
+}
+expect {
+    \x74727565
+}
+
+test cast-text-to-bytea-explicit-5 {
+    SELECT ('2024-01-02'::text::bytea);
+}
+expect {
+    \x323032342d30312d3032
+}
+
+test cast-text-to-bytea-explicit-6 {
+    SELECT (''::text::bytea);
+}
+expect {
+    \x
+}
+
+test cast-text-to-bytea-assign-0 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES ('42'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-bytea-assign-1 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES ('abc'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-uuid-explicit-0 {
+    SELECT ('42'::text::uuid);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-uuid-explicit-1 {
+    SELECT ('abc'::text::uuid);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-uuid-explicit-2 {
+    SELECT ('1.5'::text::uuid);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-uuid-explicit-3 {
+    SELECT ('t'::text::uuid);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-uuid-explicit-4 {
+    SELECT ('true'::text::uuid);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-uuid-explicit-5 {
+    SELECT ('2024-01-02'::text::uuid);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-uuid-explicit-6 {
+    SELECT (''::text::uuid);
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-text-to-uuid-assign-0 {
+    CREATE TABLE t (x uuid);
+    INSERT INTO t VALUES ('42'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-text-to-uuid-assign-1 {
+    CREATE TABLE t (x uuid);
+    INSERT INTO t VALUES ('abc'::text);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-int2-explicit-0 {
+    SELECT (true::bool::int2);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-bool-to-int2-explicit-1 {
+    SELECT (false::bool::int2);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-bool-to-int2-assign-0 {
+    CREATE TABLE t (x int2);
+    INSERT INTO t VALUES (true::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-int2-assign-1 {
+    CREATE TABLE t (x int2);
+    INSERT INTO t VALUES (false::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-int4-explicit-0 {
+    SELECT (true::bool::int4);
+}
+expect {
+    1
+}
+
+test cast-bool-to-int4-explicit-1 {
+    SELECT (false::bool::int4);
+}
+expect {
+    0
+}
+
+test cast-bool-to-int4-assign-0 {
+    CREATE TABLE t (x int4);
+    INSERT INTO t VALUES (true::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-int4-assign-1 {
+    CREATE TABLE t (x int4);
+    INSERT INTO t VALUES (false::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-int8-explicit-0 {
+    SELECT (true::bool::int8);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-bool-to-int8-explicit-1 {
+    SELECT (false::bool::int8);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-bool-to-int8-assign-0 {
+    CREATE TABLE t (x int8);
+    INSERT INTO t VALUES (true::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-int8-assign-1 {
+    CREATE TABLE t (x int8);
+    INSERT INTO t VALUES (false::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-float4-explicit-0 {
+    SELECT (true::bool::float4);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-bool-to-float4-explicit-1 {
+    SELECT (false::bool::float4);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-bool-to-float4-assign-0 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (true::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-float4-assign-1 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (false::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-float8-explicit-0 {
+    SELECT (true::bool::float8);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-bool-to-float8-explicit-1 {
+    SELECT (false::bool::float8);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-bool-to-float8-assign-0 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES (true::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-float8-assign-1 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES (false::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-numeric-explicit-0 {
+    SELECT (true::bool::numeric);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-bool-to-numeric-explicit-1 {
+    SELECT (false::bool::numeric);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-bool-to-numeric-assign-0 {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES (true::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-numeric-assign-1 {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES (false::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-text-explicit-0 {
+    SELECT (true::bool::text);
+}
+expect {
+    true
+}
+
+test cast-bool-to-text-explicit-1 {
+    SELECT (false::bool::text);
+}
+expect {
+    false
+}
+
+test cast-bool-to-text-assign-0 {
+    CREATE TABLE t (x text);
+    INSERT INTO t VALUES (true::bool);
+    SELECT x FROM t;
+}
+expect {
+    true
+}
+
+test cast-bool-to-text-assign-1 {
+    CREATE TABLE t (x text);
+    INSERT INTO t VALUES (false::bool);
+    SELECT x FROM t;
+}
+expect {
+    false
+}
+
+@compat-gap "cast:bool -> date"
+test cast-bool-to-date-explicit-0 {
+    SELECT (true::bool::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:bool -> date"
+test cast-bool-to-date-explicit-1 {
+    SELECT (false::bool::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:bool -> date"
+test cast-bool-to-date-assign-0 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES (true::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:bool -> date"
+test cast-bool-to-date-assign-1 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES (false::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+test cast-bool-to-timestamp-explicit-0 {
+    SELECT (true::bool::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-bool-to-timestamp-explicit-1 {
+    SELECT (false::bool::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-bool-to-timestamp-assign-0 {
+    CREATE TABLE t (x timestamp);
+    INSERT INTO t VALUES (true::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-timestamp-assign-1 {
+    CREATE TABLE t (x timestamp);
+    INSERT INTO t VALUES (false::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-bytea-explicit-0 {
+    SELECT (true::bool::bytea);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-bool-to-bytea-explicit-1 {
+    SELECT (false::bool::bytea);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-bool-to-bytea-assign-0 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES (true::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-bytea-assign-1 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES (false::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-uuid-explicit-0 {
+    SELECT (true::bool::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-bool-to-uuid-explicit-1 {
+    SELECT (false::bool::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-bool-to-uuid-assign-0 {
+    CREATE TABLE t (x uuid);
+    INSERT INTO t VALUES (true::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-bool-to-uuid-assign-1 {
+    CREATE TABLE t (x uuid);
+    INSERT INTO t VALUES (false::bool);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-timestamp-to-int2-explicit-0 {
+    SELECT ('2024-01-02 03:04:05'::timestamp::int2);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-timestamp-to-int2-assign-0 {
+    CREATE TABLE t (x int2);
+    INSERT INTO t VALUES ('2024-01-02 03:04:05'::timestamp);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-timestamp-to-int4-explicit-0 {
+    SELECT ('2024-01-02 03:04:05'::timestamp::int4);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-timestamp-to-int4-assign-0 {
+    CREATE TABLE t (x int4);
+    INSERT INTO t VALUES ('2024-01-02 03:04:05'::timestamp);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-timestamp-to-int8-explicit-0 {
+    SELECT ('2024-01-02 03:04:05'::timestamp::int8);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-timestamp-to-int8-assign-0 {
+    CREATE TABLE t (x int8);
+    INSERT INTO t VALUES ('2024-01-02 03:04:05'::timestamp);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-timestamp-to-float4-explicit-0 {
+    SELECT ('2024-01-02 03:04:05'::timestamp::float4);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-timestamp-to-float4-assign-0 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('2024-01-02 03:04:05'::timestamp);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-timestamp-to-float8-explicit-0 {
+    SELECT ('2024-01-02 03:04:05'::timestamp::float8);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-timestamp-to-float8-assign-0 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('2024-01-02 03:04:05'::timestamp);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-timestamp-to-numeric-explicit-0 {
+    SELECT ('2024-01-02 03:04:05'::timestamp::numeric);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-timestamp-to-numeric-assign-0 {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('2024-01-02 03:04:05'::timestamp);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-timestamp-to-text-explicit-0 {
+    SELECT ('2024-01-02 03:04:05'::timestamp::text);
+}
+expect {
+    2024-01-02 03:04:05
+}
+
+test cast-timestamp-to-text-assign-0 {
+    CREATE TABLE t (x text);
+    INSERT INTO t VALUES ('2024-01-02 03:04:05'::timestamp);
+    SELECT x FROM t;
+}
+expect {
+    2024-01-02 03:04:05
+}
+
+test cast-timestamp-to-bool-explicit-0 {
+    SELECT CASE WHEN ('2024-01-02 03:04:05'::timestamp::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-timestamp-to-bool-assign-0 {
+    CREATE TABLE t (x bool);
+    INSERT INTO t VALUES ('2024-01-02 03:04:05'::timestamp);
+    SELECT CASE WHEN x THEN 'true' ELSE 'false' END FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+@compat-gap "cast:timestamp -> date"
+test cast-timestamp-to-date-explicit-0 {
+    SELECT ('2024-01-02 03:04:05'::timestamp::date);
+}
+expect {
+    2024-01-02
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:timestamp -> date"
+test cast-timestamp-to-date-assign-0 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES ('2024-01-02 03:04:05'::timestamp);
+    SELECT x FROM t;
+}
+expect {
+    2024-01-02
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+test cast-timestamp-to-bytea-explicit-0 {
+    SELECT ('2024-01-02 03:04:05'::timestamp::bytea);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-timestamp-to-bytea-assign-0 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES ('2024-01-02 03:04:05'::timestamp);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-timestamp-to-uuid-explicit-0 {
+    SELECT ('2024-01-02 03:04:05'::timestamp::uuid);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-timestamp-to-uuid-assign-0 {
+    CREATE TABLE t (x uuid);
+    INSERT INTO t VALUES ('2024-01-02 03:04:05'::timestamp);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-uuid-to-int2-explicit-0 {
+    SELECT ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::int2);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-uuid-to-int2-assign-0 {
+    CREATE TABLE t (x int2);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-uuid-to-int4-explicit-0 {
+    SELECT ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::int4);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-uuid-to-int4-assign-0 {
+    CREATE TABLE t (x int4);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-uuid-to-int8-explicit-0 {
+    SELECT ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::int8);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-uuid-to-int8-assign-0 {
+    CREATE TABLE t (x int8);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-uuid-to-float4-explicit-0 {
+    SELECT ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::float4);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-uuid-to-float4-assign-0 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-uuid-to-float8-explicit-0 {
+    SELECT ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::float8);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-uuid-to-float8-assign-0 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-uuid-to-numeric-explicit-0 {
+    SELECT ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::numeric);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-uuid-to-numeric-assign-0 {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-uuid-to-text-explicit-0 {
+    SELECT ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::text);
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+test cast-uuid-to-text-assign-0 {
+    CREATE TABLE t (x text);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid);
+    SELECT x FROM t;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+test cast-uuid-to-bool-explicit-0 {
+    SELECT CASE WHEN ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::bool) THEN 'true' ELSE 'false' END;
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-uuid-to-bool-assign-0 {
+    CREATE TABLE t (x bool);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid);
+    SELECT CASE WHEN x THEN 'true' ELSE 'false' END FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+@compat-gap "cast:uuid -> date"
+test cast-uuid-to-date-explicit-0 {
+    SELECT ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::date);
+}
+@sqlstate 42846
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "cast:uuid -> date"
+test cast-uuid-to-date-assign-0 {
+    CREATE TABLE t (x date);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+test cast-uuid-to-timestamp-explicit-0 {
+    SELECT ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::timestamp);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-uuid-to-timestamp-assign-0 {
+    CREATE TABLE t (x timestamp);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test cast-uuid-to-bytea-explicit-0 {
+    SELECT ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::bytea);
+}
+@sqlstate 42846
+expect error {
+}
+
+test cast-uuid-to-bytea-assign-0 {
+    CREATE TABLE t (x bytea);
+    INSERT INTO t VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid);
+    SELECT x FROM t;
+}
+@sqlstate 42804
+expect error {
+}
+
+test bytea-of-an-int2-reads-as-an-int4-without-sign-extension {
+    SELECT (-1)::int2::bytea::int4, (-1)::int2::bytea::int2, (-32768)::int2::bytea::int8;
+}
+expect {
+    65535|-1|32768
+}
+
+test bytea-of-an-int4-reads-as-an-int8-without-sign-extension {
+    SELECT (-1)::int4::bytea::int8, (-1)::int4::bytea::int4, (-2)::int8::bytea::int8;
+}
+expect {
+    4294967295|-1|-2
+}
+
+test bytea-wider-than-the-integer-is-out-of-range {
+    SELECT 70000::int4::bytea::int2;
+}
+@sqlstate 22003
+expect error {}
+
+@compat-gap "cast:float8 -> numeric"
+test float-infinity-to-numeric {
+    SELECT 'Infinity'::float8::numeric;
+}
+expect {
+    Infinity
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "cast:float4 -> numeric"
+test float4-negative-infinity-to-numeric {
+    SELECT '-Infinity'::float4::numeric;
+}
+expect {
+    -Infinity
+}
+@sqlstate 0A000
+expect @tursopg error {}

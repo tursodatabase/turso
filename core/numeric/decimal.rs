@@ -521,6 +521,34 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
+    fn division_has_the_scale_postgresql_picks() {
+        let cases = [
+            ("1", "3", "0.33333333333333333333"),
+            ("2", "3", "0.66666666666666666667"),
+            ("10", "4", "2.5000000000000000"),
+            ("-2", "3", "-0.66666666666666666667"),
+            ("2", "-3", "-0.66666666666666666667"),
+            ("1", "7000", "0.00014285714285714286"),
+            ("123456789", "7", "17636684.142857142857"),
+            ("1.50", "3", "0.50000000000000000000"),
+            ("1e10", "3", "3333333333.33333333"),
+            ("0", "5", "0.00000000000000000000"),
+            ("1", "0.0003", "3333.3333333333333333"),
+        ];
+        for (dividend, divisor, expected) in cases {
+            let quotient = numeric_divide(
+                &BigDecimal::from_str(dividend).unwrap(),
+                &BigDecimal::from_str(divisor).unwrap(),
+            );
+            assert_eq!(
+                format_numeric(&quotient),
+                expected,
+                "{dividend} / {divisor}"
+            );
+        }
+    }
+
+    #[test]
     fn test_roundtrip_positive() {
         let val = BigDecimal::from_str("123.45").unwrap();
         let blob = bigdecimal_to_blob(&val);

@@ -81,3 +81,41 @@ fn text_of_digits(negative: bool, scientific: &str, plain_below: i32) -> String 
         &digits[integer_digits..]
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn float8_text_follows_float8out() {
+        let cases = [
+            (1.5, "1.5"),
+            (0.1, "0.1"),
+            (10000000000.0, "10000000000"),
+            (1e14, "100000000000000"),
+            (1e15, "1e+15"),
+            (1e20, "1e+20"),
+            (0.0001, "0.0001"),
+            (0.00001, "1e-05"),
+            (1.5e-7, "1.5e-07"),
+            (-2.5, "-2.5"),
+            (123456.789, "123456.789"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+        ];
+        for (number, text) in cases {
+            assert_eq!(float8_text(number), text, "{number}");
+        }
+    }
+
+    #[test]
+    fn float4_text_uses_the_digits_of_an_f32() {
+        assert_eq!(float4_text(0.1), "0.1");
+        assert_eq!(float4_text(2147483648.0), "2.1474836e+09");
+        assert_eq!(float4_text(12.345), "12.345");
+        assert_eq!(float4_text(999999.0), "999999");
+        assert_eq!(float4_text(1e6), "1e+06");
+        assert_eq!(float4_text(1234567.0), "1.234567e+06");
+        assert_eq!(float4_text(0.00001), "1e-05");
+    }
+}

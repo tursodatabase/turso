@@ -1,0 +1,276 @@
+# int4 columns and keys. The answers come from PostgreSQL 18.
+
+@database :memory:
+
+test int4-typeof {
+    CREATE TABLE t (n int4);
+    INSERT INTO t VALUES (1);
+    SELECT pg_typeof(n) FROM t;
+}
+expect {
+    integer
+}
+
+test int4-accepts-the-largest-value {
+    CREATE TABLE t (n int4);
+    INSERT INTO t VALUES (2147483647), (-2147483648);
+    SELECT n FROM t ORDER BY n;
+}
+expect {
+    -2147483648
+    2147483647
+}
+
+test int4-column-rejects-a-value-above-the-range {
+    CREATE TABLE t (n int4);
+    INSERT INTO t VALUES (2147483648);
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-column-rejects-a-value-below-the-range {
+    CREATE TABLE t (n int4);
+    INSERT INTO t VALUES (-2147483649);
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-column-rejects-a-value-in-a-later-row {
+    CREATE TABLE t (n int4);
+    INSERT INTO t VALUES (1), (2147483648);
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-column-rejects-a-selected-value {
+    CREATE TABLE t (n int4);
+    INSERT INTO t SELECT 2147483648;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-column-rejects-an-updated-value {
+    CREATE TABLE t (n int4);
+    INSERT INTO t VALUES (1);
+    UPDATE t SET n = 2147483648;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-key-accepts-the-largest-value {
+    CREATE TABLE t (id int4 PRIMARY KEY, v int);
+    INSERT INTO t VALUES (2147483647, 1);
+    SELECT id, v FROM t;
+}
+expect {
+    2147483647|1
+}
+
+test int4-key-rejects-a-value-above-the-range {
+    CREATE TABLE t (id int4 PRIMARY KEY, v int);
+    INSERT INTO t VALUES (2147483648, 1);
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-key-rejects-a-value-in-a-later-row {
+    CREATE TABLE t (id int4 PRIMARY KEY, v int);
+    INSERT INTO t VALUES (1, 1), (2147483648, 2);
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-key-rejects-a-selected-value {
+    CREATE TABLE t (id int4 PRIMARY KEY, v int);
+    INSERT INTO t SELECT 2147483648, 1;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-key-rejects-an-updated-value {
+    CREATE TABLE t (id int4 PRIMARY KEY, v int);
+    INSERT INTO t VALUES (1, 1);
+    UPDATE t SET id = 2147483648;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-key-rejects-a-value-set-by-an-upsert {
+    CREATE TABLE t (id int4 PRIMARY KEY, v int);
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET id = 2147483648;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-key-keeps-its-rows {
+    CREATE TABLE t (id int4 PRIMARY KEY, v int);
+    INSERT INTO t VALUES (3, 30), (1, 10), (2, 20);
+    UPDATE t SET id = 5 WHERE id = 2;
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|10
+    3|30
+    5|20
+}
+
+test int4-key-rejects-a-duplicate {
+    CREATE TABLE t (id int4 PRIMARY KEY);
+    INSERT INTO t VALUES (1);
+    INSERT INTO t VALUES (1);
+}
+@sqlstate 23505
+expect error {
+}
+
+test int4-key-rejects-a-missing-value {
+    CREATE TABLE t (id int4 PRIMARY KEY, v int);
+    INSERT INTO t (v) VALUES (1);
+}
+@sqlstate 23502
+expect error {
+}
+
+test serial-key-takes-its-values-from-the-sequence {
+    CREATE TABLE t (id serial PRIMARY KEY, v int);
+    INSERT INTO t (v) VALUES (10), (20);
+    SELECT id, v, pg_typeof(id) FROM t ORDER BY id;
+}
+expect {
+    1|10|integer
+    2|20|integer
+}
+
+test int4-plus-int4-is-an-int4 {
+    SELECT 1::int4 + 1::int4, pg_typeof(1::int4 + 1::int4);
+}
+expect {
+    2|integer
+}
+
+test int4-plus-overflows {
+    SELECT 2147483647::int4 + 1::int4;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-minus-overflows {
+    SELECT (-2147483648)::int4 - 1::int4;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-times-overflows {
+    SELECT 2147483647::int4 * 2::int4;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-plus-a-literal-overflows {
+    SELECT 2147483647::int4 + 1;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-column-plus-column-overflows {
+    CREATE TABLE t (a int4, b int4);
+    INSERT INTO t VALUES (2147483647, 1);
+    SELECT a + b FROM t;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-update-by-arithmetic-overflows {
+    CREATE TABLE t (n int4);
+    INSERT INTO t VALUES (2147483647);
+    UPDATE t SET n = n + 1;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-negation-overflows {
+    SELECT -((-2147483648)::int4);
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-smallest-divided-by-minus-one-overflows {
+    SELECT (-2147483648)::int4 / (-1)::int4;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int4-smallest-remainder-minus-one-is-zero {
+    SELECT (-2147483648)::int4 % (-1)::int4;
+}
+expect {
+    0
+}
+
+test int4-division-by-zero {
+    SELECT 5::int4 / 0::int4;
+}
+@sqlstate 22012
+expect error {
+}
+
+test int4-remainder-by-zero {
+    SELECT 5::int4 % 0::int4;
+}
+@sqlstate 22012
+expect error {
+}
+
+test int4-division-and-remainder-truncate-toward-zero {
+    SELECT 7::int4 / 2::int4, (-7)::int4 / 2::int4, (-7)::int4 % 3::int4;
+}
+expect {
+    3|-3|-1
+}
+
+test int4-plus-int2-is-an-int4 {
+    SELECT 1::int4 + 2::int2, pg_typeof(1::int4 + 2::int2);
+}
+expect {
+    3|integer
+}
+
+test int4-plus-float4-is-a-float8 {
+    SELECT 1::int4 + 0.5::float4, pg_typeof(1::int4 + 0.5::float4);
+}
+expect {
+    1.5|double precision
+}
+
+test int4-plus-numeric-is-a-numeric {
+    SELECT 1::int4 + 1.5::numeric;
+}
+expect {
+    2.5
+}
+
+test int4-plus-an-int8-literal-is-an-int8 {
+    SELECT 1::int4 + 3000000000, pg_typeof(1::int4 + 3000000000);
+}
+expect {
+    3000000001|bigint
+}

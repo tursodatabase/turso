@@ -405,6 +405,95 @@ test pg-object-unsupported-catalogs-are-empty {
 }
 expect {}
 
+test pg-cast-lists-the-casts-between-the-frontend-types {
+    SELECT castsource, casttarget, castcontext FROM pg_cast
+    WHERE castsource IN (21, 23, 20, 700, 701, 1700, 25, 16, 2950, 17, 1114, 1184)
+      AND casttarget IN (21, 23, 20, 700, 701, 1700, 25, 16, 2950, 17, 1114, 1184)
+    ORDER BY 1, 2, 3;
+}
+expect {
+    16|23|e
+    16|25|a
+    17|20|e
+    17|21|e
+    17|23|e
+    20|17|e
+    20|21|a
+    20|23|a
+    20|700|i
+    20|701|i
+    20|1700|i
+    21|17|e
+    21|20|i
+    21|23|i
+    21|700|i
+    21|701|i
+    21|1700|i
+    23|16|e
+    23|17|e
+    23|20|i
+    23|21|a
+    23|700|i
+    23|701|i
+    23|1700|i
+    700|20|a
+    700|21|a
+    700|23|a
+    700|701|i
+    700|1700|a
+    701|20|a
+    701|21|a
+    701|23|a
+    701|700|a
+    701|1700|a
+    1114|1114|i
+    1114|1184|i
+    1184|1114|a
+    1184|1184|i
+    1700|20|a
+    1700|21|a
+    1700|23|a
+    1700|700|i
+    1700|701|i
+    1700|1700|i
+}
+
+test pg-cast-and-pg-operator-have-no-user-oids {
+    SELECT (SELECT count(*) FROM pg_cast WHERE oid >= 16384),
+           (SELECT count(*) FROM pg_operator WHERE oid >= 16384);
+}
+expect {
+    0|0
+}
+
+test pg-type-marks-the-preferred-type-of-a-category {
+    SELECT typname, typcategory FROM pg_type WHERE typispreferred AND typname IN ('bool', 'text', 'oid', 'float8', 'inet', 'timestamptz', 'int4', 'numeric', 'uuid') ORDER BY typname;
+}
+expect {
+    bool|B
+    float8|N
+    inet|I
+    oid|N
+    text|S
+    timestamptz|D
+}
+
+@skip-if postgres "PostgreSQL lists every operator, such as || on arrays"
+test pg-operator-lists-the-operators-of-the-frontend {
+    SELECT oprname, oprkind, oprleft, oprright, oprresult
+    FROM pg_operator WHERE oprname IN ('||', '~') ORDER BY oid;
+}
+expect {
+    ~|b|25|25|16
+    |||b|25|25|25
+    |||b|17|17|17
+    |||b|25|2776|25
+    |||b|2776|25|25
+    ~|l|0|21|21
+    ~|l|0|23|23
+    ~|l|0|20|20
+}
+
 test pg-object-operator-is-read-only {
     CREATE ROLE reader_of_object_operator_is_read_only_role;
     SET ROLE reader_of_object_operator_is_read_only_role;

@@ -1,0 +1,265 @@
+# Every operator and function that gives a boolean reports the boolean type.
+# The answers come from PostgreSQL 18.
+
+@database :memory:
+
+test comparison-is-boolean {
+    SELECT pg_typeof(1 = 1);
+}
+expect {
+    boolean
+}
+
+test not-equal-is-boolean {
+    SELECT pg_typeof(1 <> 2);
+}
+expect {
+    boolean
+}
+
+test and-is-boolean {
+    SELECT pg_typeof(true AND false);
+}
+expect {
+    boolean
+}
+
+test or-is-boolean {
+    SELECT pg_typeof(true OR false);
+}
+expect {
+    boolean
+}
+
+test not-is-boolean {
+    SELECT pg_typeof(NOT true);
+}
+expect {
+    boolean
+}
+
+test is-null-is-boolean {
+    SELECT pg_typeof(1 IS NULL);
+}
+expect {
+    boolean
+}
+
+test is-true-is-boolean {
+    SELECT pg_typeof(true IS TRUE);
+}
+expect {
+    boolean
+}
+
+test is-distinct-is-boolean {
+    SELECT pg_typeof(1 IS DISTINCT FROM 2);
+}
+expect {
+    boolean
+}
+
+test between-is-boolean {
+    SELECT pg_typeof(1 BETWEEN 0 AND 2);
+}
+expect {
+    boolean
+}
+
+test in-list-is-boolean {
+    SELECT pg_typeof(1 IN (1, 2));
+}
+expect {
+    boolean
+}
+
+test in-subquery-is-boolean {
+    SELECT pg_typeof(1 IN (SELECT 1));
+}
+expect {
+    boolean
+}
+
+test exists-is-boolean {
+    SELECT pg_typeof(EXISTS (SELECT 1));
+}
+expect {
+    boolean
+}
+
+test like-is-boolean {
+    SELECT pg_typeof('a' LIKE 'a');
+}
+expect {
+    boolean
+}
+
+test ilike-is-boolean {
+    SELECT pg_typeof('a' ILIKE 'A');
+}
+expect {
+    boolean
+}
+
+test regex-match-is-boolean {
+    SELECT pg_typeof('a' ~ 'a');
+}
+expect {
+    boolean
+}
+
+test regex-match-case-insensitive-is-boolean {
+    SELECT pg_typeof('a' ~* 'A');
+}
+expect {
+    boolean
+}
+
+test regex-no-match-is-boolean {
+    SELECT pg_typeof('a' !~ 'b');
+}
+expect {
+    boolean
+}
+
+test regex-no-match-case-insensitive-is-boolean {
+    SELECT pg_typeof('a' !~* 'B');
+}
+expect {
+    boolean
+}
+
+test similar-to-is-boolean {
+    SELECT pg_typeof('a' SIMILAR TO 'a');
+}
+expect {
+    boolean
+}
+
+test not-similar-to-is-boolean {
+    SELECT pg_typeof('a' NOT SIMILAR TO 'b');
+}
+expect {
+    boolean
+}
+
+test array-contains-is-boolean {
+    SELECT pg_typeof(ARRAY[1,2] @> ARRAY[1]);
+}
+expect {
+    boolean
+}
+
+test array-contained-by-is-boolean {
+    SELECT pg_typeof(ARRAY[1] <@ ARRAY[1,2]);
+}
+expect {
+    boolean
+}
+
+test array-overlap-is-boolean {
+    SELECT pg_typeof(ARRAY[1] && ARRAY[2]);
+}
+expect {
+    boolean
+}
+
+test array-equal-is-boolean {
+    SELECT pg_typeof(ARRAY[1] = ARRAY[1]);
+}
+expect {
+    boolean
+}
+
+test any-array-is-boolean {
+    SELECT pg_typeof(1 = ANY (ARRAY[1,2]));
+}
+expect {
+    boolean
+}
+
+test any-text-array-is-boolean {
+    SELECT pg_typeof(1 = ANY ('{1,2}'::int[]));
+}
+expect {
+    boolean
+}
+
+test any-unknown-literal-is-boolean {
+    SELECT pg_typeof(1 = ANY ('{1,2}'));
+}
+expect {
+    boolean
+}
+
+test not-all-unknown-literal-is-boolean {
+    SELECT pg_typeof(3 <> ALL ('{1,2}'));
+}
+expect {
+    boolean
+}
+
+test uuid-equal-is-boolean {
+    SELECT pg_typeof(gen_random_uuid() = gen_random_uuid());
+}
+expect {
+    boolean
+}
+
+test regex-on-uuid-text-is-boolean {
+    SELECT pg_typeof(gen_random_uuid()::text ~ '^[0-9a-f-]{36}$');
+}
+expect {
+    boolean
+}
+
+test case-of-a-comparison-and-a-boolean-is-boolean {
+    SELECT pg_typeof(CASE WHEN true THEN 1 = 1 ELSE false END), pg_typeof(CASE WHEN true THEN false ELSE 1 = 1 END);
+}
+expect {
+    boolean|boolean
+}
+
+test coalesce-of-a-comparison-and-a-boolean-is-boolean {
+    SELECT pg_typeof(coalesce(1 = 1, false));
+}
+expect {
+    boolean
+}
+
+test regex-in-a-subquery-is-boolean {
+    SELECT pg_typeof(x), x FROM (SELECT 'a' ~ 'a' AS x UNION ALL SELECT false) v ORDER BY x;
+}
+expect {
+    boolean|f
+    boolean|t
+}
+
+test regex-union-false-keeps-boolean-type {
+    SELECT pg_typeof(x) FROM (SELECT 'a' ~ 'a' AS x UNION ALL SELECT false) v LIMIT 1;
+}
+expect {
+    boolean
+}
+
+test regex-filters-rows {
+    CREATE TABLE r (s text); INSERT INTO r VALUES ('abc'), ('xyz'); SELECT s FROM r WHERE s ~ '^a' ORDER BY s;
+}
+expect {
+    abc
+}
+
+test regex-or-array-overlap {
+    SELECT 'a' ~ 'a' OR ARRAY[1] && ARRAY[2];
+}
+expect {
+    t
+}
+
+test regex-in-a-case-condition {
+    SELECT CASE WHEN 'a' ~ 'a' THEN 'yes' ELSE 'no' END;
+}
+expect {
+    yes
+}
+
