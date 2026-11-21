@@ -1,0 +1,139 @@
+---
+source: subqueries.sqltest
+expression: |-
+  SELECT count(*)
+      FROM (SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id) a,
+           (SELECT type_id, max(price) AS maxp FROM history_txt GROUP BY type_id) b
+      WHERE a.avgp + b.maxp > 3;
+info:
+  statement_type: SELECT
+  tables:
+  - history_txt
+  setup_blocks:
+  - watchlist_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN a
+|  |--SCAN history_txt
+|  `--USE SORTER FOR GROUP BY
+`--SCAN b
+   |--SCAN history_txt
+   `--USE SORTER FOR GROUP BY
+
+BYTECODE
+addr  opcode          p1   p2   p3  p4            p5  comment
+   0  Init             0  110    0                 0  Start at 110
+   1  InitCoroutine    1   45    2                 0
+   2  Null             0    9    0                 0  r[9]=NULL
+   3  SorterOpen       0    2    0  k(1,B)         0  cursor=0
+   4  Integer          0    6    0                 0  r[6]=0; clear group by abort flag
+   5  Null             0    7    0                 0  r[7]=NULL; initialize group by comparison registers to NULL
+   6  Gosub           13   41    0                 0  ; go to clear accumulator subroutine
+   7  OpenRead         2    3    0  k(3,B,B)       0  table=history_txt, root=3, iDb=0
+   8  Rewind           2   14    0                 0  Rewind table history_txt
+   9    ColumnRange    2    0   11  2              0  r[11..12]=history_txt.type_id..price
+  10    RealAffinity  12    0    0                 0
+  11    MakeRecord    11    2   10                 0  r[10]=mkrec(r[11..12])
+  12    SorterInsert   0   10    0  0              0  key=r[10]
+  13  Next             2    9    0                 1
+  14  OpenPseudo       1   10    2                 0  2 columns in r[10]
+  15  SorterSort       0   30    0                 0
+  16    SorterData     0   10    1                 0  r[10]=data
+  17    Column         1    0   14                 0  r[14]=pseudo.column 0
+  18    Compare        7   14    1  k(1, Binary)   0  r[7..7]==r[14..14]
+  19    Jump          20   24   20                 0  ; start new group if comparison is not equal
+  20    Gosub          4   34    0                 0  ; check if ended group had data, and output if so
+  21    Move          14    7    1                 0  r[7..7]=r[14..14]
+  22    IfPos          6   44    0                 0  r[6]>0 -> r[6]-=0, goto 44; check abort flag
+  23    Gosub         13   41    0                 0  ; goto clear accumulator subroutine
+  24    Column         1    1   15                 0  r[15]=pseudo.column 1
+  25    AggStep        0   15    9  avg            0  accum=r[9] step(r[15])
+  26    If             5   28    0                 0  if r[5] goto 28; don't emit group columns if continuing existing group
+  27    Column         1    0    8                 0  r[8]=pseudo.column 0
+  28    Integer        1    5    0                 0  r[5]=1; indicate data in accumulator
+  29  SorterNext       0   16    0                 0
+  30  Gosub            4   34    0                 0  ; emit row for final group
+  31  Goto             0   44    0                 0  ; group by finished
+  32  Integer          1    6    0                 0  r[6]=1
+  33  Return           4    0    0                 0
+  34  IfPos            5   36    0                 0  r[5]>0 -> r[5]-=0, goto 36; output group by row subroutine start
+  35  Return           4    0    0                 0
+  36  AggFinal         0    9    0  avg            0  accum=r[9]
+  37  Copy             8    2    0                 0  r[2]=r[8]
+  38  Copy             9    3    0                 0  r[3]=r[9]
+  39  Yield            1    0    0                 0
+  40  Return           4    0    0                 0
+  41  Null             0    8    9                 0  r[8..9]=NULL; clear accumulator subroutine start
+  42  Integer          0    5    0                 0  r[5]=0
+  43  Return          13    0    0                 0
+  44  EndCoroutine     1    0    0                 0
+  45  Gosub           18   47    0                 0
+  46  Goto             0   94    0                 0
+  47  Once            93    0    0                 0  goto 93
+  48  OpenEphemeral    3    1    0                 0  cursor=3 is_table=true
+  49  Null             0   26    0                 0  r[26]=NULL
+  50  SorterOpen       4    2    0  k(1,B)         0  cursor=4
+  51  Integer          0   23    0                 0  r[23]=0; clear group by abort flag
+  52  Null             0   24    0                 0  r[24]=NULL; initialize group by comparison registers to NULL
+  53  Gosub           30   90    0                 0  ; go to clear accumulator subroutine
+  54  OpenRead         6    3    0  k(3,B,B)       0  table=history_txt, root=3, iDb=0
+  55  Rewind           6   61    0                 0  Rewind table history_txt
+  56    ColumnRange    6    0   28  2              0  r[28..29]=history_txt.type_id..price
+  57    RealAffinity  29    0    0                 0
+  58    MakeRecord    28    2   27                 0  r[27]=mkrec(r[28..29])
+  59    SorterInsert   4   27    0  0              0  key=r[27]
+  60  Next             6   56    0                 1
+  61  OpenPseudo       5   27    2                 0  2 columns in r[27]
+  62  SorterSort       4   77    0                 0
+  63    SorterData     4   27    5                 0  r[27]=data
+  64    Column         5    0   31                 0  r[31]=pseudo.column 0
+  65    Compare       24   31    1  k(1, Binary)   0  r[24..24]==r[31..31]
+  66    Jump          67   71   67                 0  ; start new group if comparison is not equal
+  67    Gosub         21   81    0                 0  ; check if ended group had data, and output if so
+  68    Move          31   24    1                 0  r[24..24]=r[31..31]
+  69    IfPos         23   93    0                 0  r[23]>0 -> r[23]-=0, goto 93; check abort flag
+  70    Gosub         30   90    0                 0  ; goto clear accumulator subroutine
+  71    Column         5    1   32                 0  r[32]=pseudo.column 1
+  72    AggStep        0   32   26  max(Binary)    0  accum=r[26] step(r[32])
+  73    If            22   75    0                 0  if r[22] goto 75; don't emit group columns if continuing existing group
+  74    Column         5    0   25                 0  r[25]=pseudo.column 0
+  75    Integer        1   22    0                 0  r[22]=1; indicate data in accumulator
+  76  SorterNext       4   63    0                 0
+  77  Gosub           21   81    0                 0  ; emit row for final group
+  78  Goto             0   93    0                 0  ; group by finished
+  79  Integer          1   23    0                 0  r[23]=1
+  80  Return          21    0    0                 0
+  81  IfPos           22   83    0                 0  r[22]>0 -> r[22]-=0, goto 83; output group by row subroutine start
+  82  Return          21    0    0                 0
+  83  AggFinal         0   26    0  max            0  accum=r[26]
+  84  Copy            25   19    0                 0  r[19]=r[25]
+  85  Copy            26   20    0                 0  r[20]=r[26]
+  86  MakeRecord      19    2   33                 0  r[33]=mkrec(r[19..20]); for
+  87  NewRowid         3   34    0                 0  r[34]=rowid
+  88  Insert           3   33   34                 4  intkey=r[34] data=r[33]
+  89  Return          21    0    0                 0
+  90  Null             0   25   26                 0  r[25..26]=NULL; clear accumulator subroutine start
+  91  Integer          0   22    0                 0  r[22]=0
+  92  Return          30    0    0                 0
+  93  Return          18    0    0                 0
+  94  Null             0   36    0                 0  r[36]=NULL
+  95  InitCoroutine    1    0    2                 0
+  96    Yield          1  106    0                 0
+  97    Rewind         3  105    0                 0  Rewind  ephemeral()
+  98      Column       3    1   17                 0  r[17]=ephemeral().maxp
+  99      Copy         3   40    0                 0  r[40]=r[3]
+ 100      Copy        17   41    0                 0  r[41]=r[17]
+ 101      Add         40   41   38                 0  r[38]=r[40]+r[41]
+ 102      Le          38   39  104  Binary         0  if r[38]<=r[39] goto 104
+ 103      AggStep      0   42   36  count          0  accum=r[36] step(r[42])
+ 104    Next           3   98    0                 0
+ 105  Goto             0   96    0                 0
+ 106  AggFinal         0   36    0  count          0  accum=r[36]
+ 107  Copy            36   35    0                 0  r[35]=r[36]
+ 108  ResultRow       35    1    0                 0  output=r[35]
+ 109  Halt             0    0    0                 0
+ 110  Transaction      0    1    2                 0  iDb=0 tx_mode=Read
+ 111  Integer          3   39    0                 0  r[39]=3
+ 112  Integer          1   42    0                 0  r[42]=1
+ 113  Goto             0    1    0                 0

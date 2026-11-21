@@ -1,0 +1,260 @@
+@database :memory:
+
+# A FROM-clause subquery that an outer join, a CROSS JOIN or an earlier
+# subquery keeps in an inner loop is stored in a table once instead of running
+# as a coroutine for each outer row. These tests check the rows of that plan,
+# including NULL-extended rows of the LEFT JOIN. The REAL values are cast to
+# INTEGER because the JS backend prints a REAL 6.0 as 6.
+
+setup schema {
+    CREATE TABLE watchlist (type_id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE history_txt (type_id VARCHAR, price REAL);
+    INSERT INTO watchlist VALUES (1, '10'), (2, '300'), (3, 'x'), (4, NULL), (5, '200');
+    INSERT INTO history_txt VALUES ('1', 5), ('1', 7), ('2', 100), ('3', 500), ('3', NULL), (NULL, 4), ('9', 1);
+}
+
+@setup schema
+test left-join-subquery-text-key {
+    SELECT w.type_id, h.type_id, CAST(h.avgp AS INTEGER) FROM watchlist w LEFT JOIN (SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id) h ON w.type_id = h.type_id ORDER BY w.type_id;
+}
+expect {
+    1|1|6
+    2|2|100
+    3|3|500
+    4||
+    5||
+}
+
+@setup schema
+test left-join-subquery-non-equality {
+    SELECT w.type_id, h.type_id, CAST(h.avgp AS INTEGER) FROM watchlist w LEFT JOIN (SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id) h ON w.name > h.avgp ORDER BY w.type_id, h.type_id;
+}
+expect {
+    1|9|1
+    2|2|100
+    2|9|1
+    3||4
+    3|1|6
+    3|2|100
+    3|3|500
+    3|9|1
+    4||
+    5|2|100
+    5|9|1
+}
+
+@setup schema
+test cross-join-subquery {
+    SELECT w.type_id, h.type_id FROM watchlist w CROSS JOIN (SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id) h WHERE w.name > h.avgp ORDER BY w.type_id, h.type_id;
+}
+expect {
+    1|9
+    2|2
+    2|9
+    3|
+    3|1
+    3|2
+    3|3
+    3|9
+    5|2
+    5|9
+}
+
+@setup schema
+test subquery-after-left-join {
+    SELECT w.type_id, CAST(t.price AS INTEGER), h.type_id FROM watchlist w LEFT JOIN history_txt t ON t.price = w.type_id JOIN (SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id) h ON w.name > h.avgp ORDER BY w.type_id, h.type_id;
+}
+expect {
+    1|1|9
+    2||2
+    2||9
+    3||
+    3||1
+    3||2
+    3||3
+    3||9
+    5|5|2
+    5|5|9
+}
+
+@setup schema
+test subquery-after-subquery {
+    SELECT a.type_id, b.type_id FROM (SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id) a, (SELECT type_id, max(price) AS maxp FROM history_txt GROUP BY type_id) b WHERE a.avgp + b.maxp > 100 ORDER BY a.type_id, b.type_id;
+}
+expect {
+    |2
+    |3
+    1|2
+    1|3
+    2|
+    2|1
+    2|2
+    2|3
+    2|9
+    3|
+    3|1
+    3|2
+    3|3
+    3|9
+    9|2
+    9|3
+}
+
+@setup schema
+test left-join-cte {
+    WITH h AS (SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id) SELECT w.type_id, h.type_id FROM watchlist w LEFT JOIN h ON w.name > h.avgp ORDER BY w.type_id, h.type_id;
+}
+expect {
+    1|9
+    2|2
+    2|9
+    3|
+    3|1
+    3|2
+    3|3
+    3|9
+    4|
+    5|2
+    5|9
+}
+
+@setup schema
+test exists-subquery {
+    SELECT w.type_id FROM watchlist w WHERE EXISTS (SELECT 1 FROM (SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id) h WHERE w.name > h.avgp AND h.avgp > 50) ORDER BY w.type_id;
+}
+expect {
+    2
+    3
+    5
+}
+
+@setup schema
+test not-exists-subquery {
+    SELECT w.type_id FROM watchlist w WHERE NOT EXISTS (SELECT 1 FROM (SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id) h WHERE w.name > h.avgp AND h.avgp > 50) ORDER BY w.type_id;
+}
+expect {
+    1
+    4
+}
+
+# SQLite may flatten a subquery without aggregates, DISTINCT, LIMIT or a
+# compound operator other than UNION ALL into the outer query, so its
+# expressions run once per outer row. Such a subquery keeps its coroutine. A
+# subquery that SQLite never flattens is stored in a table once, so random() in
+# it runs once per row of the subquery. Each count(DISTINCT random()) counts the
+# times random() ran.
+
+setup three_rows {
+    CREATE TABLE w (v INTEGER);
+    INSERT INTO w VALUES (1), (2), (3);
+}
+
+@setup three_rows
+test flattenable-subquery-runs-per-outer-row {
+    SELECT count(DISTINCT h.r) FROM w LEFT JOIN (SELECT random() AS r FROM w) h ON 1;
+}
+expect {
+    9
+}
+
+@setup three_rows
+test flattenable-view-runs-per-outer-row {
+    CREATE VIEW random_rows AS SELECT random() AS r FROM w;
+    SELECT count(DISTINCT h.r) FROM w LEFT JOIN random_rows h ON 1;
+}
+expect {
+    9
+}
+
+@setup three_rows
+test distinct-subquery-runs-once {
+    SELECT count(DISTINCT h.r) FROM w LEFT JOIN (SELECT DISTINCT random() AS r FROM w) h ON 1;
+}
+expect {
+    3
+}
+
+@setup three_rows
+test limit-subquery-runs-once {
+    SELECT count(DISTINCT h.r) FROM w LEFT JOIN (SELECT random() AS r FROM w LIMIT 2) h ON 1;
+}
+expect {
+    2
+}
+
+# SQLite turns the LEFT JOIN into an inner join because the WHERE clause
+# rejects NULL h rows, and then flattens the join subquery.
+@setup three_rows
+test join-subquery-right-of-reduced-left-join-runs-per-outer-row {
+    SELECT count(DISTINCT h.r) FROM w LEFT JOIN (SELECT random() AS r FROM w a, w b) h ON 1 WHERE h.r IS NOT NULL;
+}
+expect {
+    27
+}
+
+@setup three_rows
+test subquery-right-of-reduced-left-join-under-distinct-runs-per-outer-row {
+    SELECT count(*) FROM (SELECT DISTINCT h.r FROM w LEFT JOIN (SELECT random() AS r FROM w) h ON 1 WHERE h.r IS NOT NULL);
+}
+expect {
+    9
+}
+
+@setup three_rows
+test union-subquery-runs-once {
+    SELECT count(DISTINCT h.r) FROM w LEFT JOIN (SELECT random() AS r FROM w UNION SELECT random() FROM w) h ON 1;
+}
+expect {
+    6
+}
+
+@setup three_rows
+test compound-subquery-with-limit-runs-once {
+    SELECT count(DISTINCT h.r) FROM w LEFT JOIN (SELECT random() AS r FROM w UNION ALL SELECT random() FROM w LIMIT 5) h ON 1;
+}
+expect {
+    5
+}
+
+# The SET subquery runs for each updated row. SQLite flattens the subquery
+# without aggregates, so it reads the rows that the UPDATE already changed.
+test update-reads-flattenable-subquery-per-row {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    UPDATE t SET x = (SELECT sum(h.x) FROM t AS o LEFT JOIN (SELECT a, x FROM t) h ON h.a < o.a WHERE o.a = t.a);
+    SELECT * FROM t;
+}
+expect {
+    1|
+    2|
+    3|
+}
+
+# SQLite turns the LEFT JOIN into an inner join because the WHERE clause
+# rejects NULL h rows, and then flattens the join subquery, so it reads the rows
+# that the UPDATE already changed.
+test update-reads-join-subquery-right-of-reduced-left-join-per-row {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    UPDATE t SET x = (SELECT sum(h.x) FROM t AS o LEFT JOIN (SELECT p.a, p.x FROM t AS p, t AS q WHERE p.a = q.a) h ON h.a = o.a - 1 WHERE h.a IS NOT NULL AND o.a = t.a);
+    SELECT * FROM t;
+}
+expect {
+    1|
+    2|
+    3|
+}
+
+# SQLite stores the GROUP BY subquery in a table when the SET subquery first
+# runs and reads that table for the later rows.
+test update-reads-grouped-subquery-once {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    UPDATE t SET x = (SELECT sum(h.x) FROM t AS o LEFT JOIN (SELECT a, sum(x) AS x FROM t GROUP BY a) h ON h.a < o.a WHERE o.a = t.a);
+    SELECT * FROM t;
+}
+expect {
+    1|
+    2|10
+    3|30
+}
