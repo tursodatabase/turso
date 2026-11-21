@@ -87,6 +87,26 @@ fn test_truncate_checkpoint_not_busy_after_rollback(tmp_db: TempDatabase) -> Res
     Ok(())
 }
 
+/// A busy checkpoint must still return three integers (SQLite: 1, -1, -1), never NULLs.
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_truncate_checkpoint_busy_returns_three_integers(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(x);")?;
+    conn.execute("INSERT INTO t VALUES (1);")?;
+
+    let reader = tmp_db.connect_limbo();
+    reader.execute("BEGIN;")?;
+    assert_eq!(execute_and_get_ints(&reader, "SELECT x FROM t")?, vec![1]);
+    conn.execute("INSERT INTO t VALUES (2);")?;
+
+    let checkpoint = execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
+    assert_that!(checkpoint).is_equal_to(vec![1, -1, -1]);
+    reader.execute("COMMIT;")?;
+    Ok(())
+}
+
 #[allow(clippy::arc_with_non_send_sync)]
 #[turso_macros::test]
 fn test_savepoint_rollback_after_cache_spill_preserves_wal_pages(
