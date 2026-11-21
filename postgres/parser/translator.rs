@@ -3590,7 +3590,7 @@ impl PostgreSQLTranslator {
                 if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
                     expr = Box::new(int8_cast_operand(arg, *expr));
                 }
-                let type_name = pg_type_name_to_ast_type(pg_type_name)?;
+                let type_name = cast_target_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
                     expr,
                     type_name: Some(type_name),
@@ -7809,6 +7809,29 @@ fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
         .map(|d| char::from_digit(*d, 10).unwrap())
         .collect();
     Some(format!("{sign}{digits}"))
+}
+
+/// The type of a CAST, with the name of the PostgreSQL type for the types whose
+/// casts the dialect plans.
+fn cast_target_type(type_name: &pg_query::protobuf::TypeName) -> Result<ast::Type, ParseError> {
+    let mut target = pg_type_name_to_ast_type(type_name)?;
+    if target.array_dimensions == 0 {
+        let name = match supported_type_name(type_name)?.to_uppercase().as_str() {
+            "INTEGER" | "INT" | "INT4" => Some("int4"),
+            "SMALLINT" | "INT2" => Some("int2"),
+            "BIGINT" | "INT8" => Some("int8"),
+            "REAL" | "FLOAT4" => Some("float4"),
+            "DOUBLE PRECISION" | "FLOAT8" => Some("float8"),
+            "TEXT" => Some("text"),
+            "UUID" => Some("uuid"),
+            "BYTEA" => Some("bytea"),
+            _ => None,
+        };
+        if let Some(name) = name {
+            target.name = name.to_string();
+        }
+    }
+    Ok(target)
 }
 
 /// FIXME(pg-catalog): This lowers PostgreSQL types to SQLite types in the parser (smallint and oid to INTEGER; numeric and money to REAL; json, inet and uuid to TEXT), so the PostgreSQL type is gone before the cast is checked. A pg_type lookup and a typed expression tree that keeps the type replace this.

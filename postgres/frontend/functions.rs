@@ -305,6 +305,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             "bigint out of range", None,
         ))?,
+        "pg_cast"(FunctionArity::Exact(3), true) => crate::casts::exec_pg_cast(args)?,
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
