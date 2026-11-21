@@ -87,6 +87,80 @@ fn test_truncate_checkpoint_not_busy_after_rollback(tmp_db: TempDatabase) -> Res
     Ok(())
 }
 
+/// With a reader pinned to an old snapshot, FULL/RESTART/TRUNCATE backfill what the
+/// reader allows and report busy=1, the WAL frame count and the backfilled count.
+fn assert_blocked_checkpoint_row(tmp_db: &TempDatabase, mode: &str) -> Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(x);")?;
+    conn.execute("INSERT INTO t VALUES (1);")?;
+
+    let reader = tmp_db.connect_limbo();
+    reader.execute("BEGIN;")?;
+    assert_eq!(execute_and_get_ints(&reader, "SELECT x FROM t")?, vec![1]);
+    conn.execute("INSERT INTO t VALUES (2);")?;
+
+    let checkpoint = execute_and_get_ints(&conn, &format!("PRAGMA wal_checkpoint({mode});"))?;
+    assert_that!(checkpoint).is_equal_to(vec![1, 4, 3]);
+    reader.execute("COMMIT;")?;
+    Ok(())
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_truncate_checkpoint_blocked_by_reader_reports_frames(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    assert_blocked_checkpoint_row(&tmp_db, "TRUNCATE")
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_restart_checkpoint_blocked_by_reader_reports_frames(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    assert_blocked_checkpoint_row(&tmp_db, "RESTART")
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_full_checkpoint_blocked_by_reader_reports_frames(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    assert_blocked_checkpoint_row(&tmp_db, "FULL")
+}
+
+/// PASSIVE never reports busy: with the reader pinned it backfills up to the reader (SQLite: 0|4|3).
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_passive_checkpoint_with_reader_is_not_busy(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(x);")?;
+    conn.execute("INSERT INTO t VALUES (1);")?;
+
+    let reader = tmp_db.connect_limbo();
+    reader.execute("BEGIN;")?;
+    assert_eq!(execute_and_get_ints(&reader, "SELECT x FROM t")?, vec![1]);
+    conn.execute("INSERT INTO t VALUES (2);")?;
+
+    let checkpoint = execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(PASSIVE);")?;
+    assert_that!(checkpoint).is_equal_to(vec![0, 4, 3]);
+    reader.execute("COMMIT;")?;
+    Ok(())
+}
+
+/// Without readers TRUNCATE succeeds and empties the WAL (SQLite: 0|0|0).
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_truncate_checkpoint_without_reader_is_not_busy(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(x);")?;
+    conn.execute("INSERT INTO t VALUES (1);")?;
+    conn.execute("INSERT INTO t VALUES (2);")?;
+
+    let checkpoint = execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
+    assert_that!(checkpoint).is_equal_to(vec![0, 0, 0]);
+    Ok(())
+}
+
 #[allow(clippy::arc_with_non_send_sync)]
 #[turso_macros::test]
 fn test_savepoint_rollback_after_cache_spill_preserves_wal_pages(
