@@ -32,9 +32,7 @@ use crate::translate::emitter::{prepare_cdc_if_necessary, Resolver};
 use crate::translate::expr::expr_type::{
     base_value_type, decode_type, iif_values, value_type, ExprType,
 };
-use crate::translate::expr::{
-    custom_cast_type_def, is_sqlite_cast_to, takes_input_of_type, walk_expr, WalkControl,
-};
+use crate::translate::expr::{is_sqlite_cast_to, takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
@@ -321,13 +319,15 @@ fn resolve_check_expr_type(
                     "cannot determine type of CAST in CHECK constraint; use CAST with explicit type"
                 );
             };
-            if let Some(type_def) = custom_cast_type_def(type_name, resolver.schema()) {
-                return resolve_type_name(&type_def.name, resolver);
+            let name = dequote(&type_name.name);
+            let type_def = resolver.schema().get_type_def_unchecked(&name);
+            if type_def.is_some_and(|type_def| !is_sqlite_cast_to(type_def, type_name)) {
+                return resolve_type_name(&name, resolver);
             }
             // SQLite's CAST gives a value of the storage class that the
             // affinity of the type name names. For NUMERIC that is an integer
             // or a real.
-            Ok(match Affinity::of_written_type(&dequote(&type_name.name)) {
+            Ok(match Affinity::of_written_type(&name) {
                 Affinity::Integer => CheckExprType::Integer,
                 Affinity::Real => CheckExprType::Real,
                 Affinity::Text => CheckExprType::Text,

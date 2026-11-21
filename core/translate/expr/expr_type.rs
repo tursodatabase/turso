@@ -746,11 +746,8 @@ pub(crate) fn column_type(column: &Column, is_strict: bool, schema: &Schema) -> 
 
 fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
     let name = crate::util::dequote(&type_name.name);
-    let scalar = match super::custom_cast_type_def(type_name, schema) {
-        Some(type_def) => ExprType::Custom {
-            type_def: Arc::clone(type_def),
-            params: written_type_params(type_name),
-        },
+    let scalar = match custom_cast_target(&name, type_name, schema) {
+        Some(custom) => custom,
         None => match Affinity::of_written_type(&name) {
             // A CAST to BLOB always gives a blob.
             Affinity::Blob => ExprType::Builtin(BuiltinType::Blob),
@@ -762,6 +759,17 @@ fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
         },
     };
     ExprType::array(scalar, type_name.array_dimensions)
+}
+
+fn custom_cast_target(name: &str, type_name: &ast::Type, schema: &Schema) -> Option<ExprType> {
+    let type_def = schema.get_type_def_unchecked(name)?;
+    if super::is_sqlite_cast_to(type_def, type_name) {
+        return None;
+    }
+    Some(ExprType::Custom {
+        type_def: Arc::clone(type_def),
+        params: written_type_params(type_name),
+    })
 }
 
 /// The arguments written after a type name: `10, 2` in `numeric(10, 2)`.
