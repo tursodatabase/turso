@@ -399,10 +399,16 @@ func sliceRefToStringCopy(s turso_slice_ref_t) string {
 func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncDatabaseConfig) (TursoSyncDatabase, error) {
 	// Build C database config
 	var cdb turso_database_config_t
-	var pathBytes, expBytes []byte
+	var pathBytes, expBytes, localCipherBytes, localKeyBytes []byte
 	pathBytes, cdb.path = makeCStringBytes(dbConfig.Path)
 	if dbConfig.ExperimentalFeatures != "" {
 		expBytes, cdb.experimental_features = makeCStringBytes(dbConfig.ExperimentalFeatures)
+	}
+	if dbConfig.Encryption.Cipher != "" {
+		localCipherBytes, cdb.encryption_cipher = makeCStringBytes(dbConfig.Encryption.Cipher)
+	}
+	if dbConfig.Encryption.Hexkey != "" {
+		localKeyBytes, cdb.encryption_hexkey = makeCStringBytes(dbConfig.Encryption.Hexkey)
 	}
 	cdb.async_io = 0
 	if dbConfig.AsyncIO {
@@ -443,6 +449,8 @@ func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncD
 	runtime.KeepAlive(pathBytes)
 	runtime.KeepAlive(remoteUrlBytes)
 	runtime.KeepAlive(expBytes)
+	runtime.KeepAlive(localCipherBytes)
+	runtime.KeepAlive(localKeyBytes)
 	runtime.KeepAlive(syncPathBytes)
 	runtime.KeepAlive(clientNameBytes)
 	runtime.KeepAlive(queryBytes)
