@@ -97,6 +97,19 @@ pub(crate) struct MultiIndexTableWork<'a> {
     or_terms: OnceCell<Vec<UnionTerm<'a>>>,
 }
 
+impl MultiIndexTableWork<'_> {
+    /// Return false if an earlier call of [consider_multi_index_union] for the
+    /// table found that no OR term can give a union scan for any join order.
+    /// [consider_multi_index_union] then returns `None`.
+    pub(crate) fn may_give_union_scan(&self) -> bool {
+        self.or_terms.get().is_none_or(|or_terms| {
+            or_terms
+                .iter()
+                .any(|or_term| !or_term.has_branch_without_lookup.get())
+        })
+    }
+}
+
 /// An OR term that a union scan of a table can use.
 struct UnionTerm<'a> {
     where_term_idx: usize,

@@ -1182,22 +1182,32 @@ fn find_best_access_method_for_btree<'a>(
             return Ok(Some(best_access_method));
         }
 
-        if let Some(multi_idx_method) = consider_multi_index_union(
-            rhs_table,
-            where_clause,
-            available_indexes,
-            table_references,
-            subqueries,
-            schema,
-            input_cardinality,
-            base_row_count,
-            params,
-            best_cost_with_filters,
-            lhs_mask,
-            analyze_stats,
-            resolver,
-            multi_index_work,
-        )? {
+        // The join search gets here for each join order that it tries. After
+        // the first call for the table, the work of the table knows if an OR
+        // term can still give a union scan.
+        let union_scan_is_possible =
+            multi_index_work.is_none_or(MultiIndexTableWork::may_give_union_scan);
+        let multi_idx_method = if union_scan_is_possible {
+            consider_multi_index_union(
+                rhs_table,
+                where_clause,
+                available_indexes,
+                table_references,
+                subqueries,
+                schema,
+                input_cardinality,
+                base_row_count,
+                params,
+                best_cost_with_filters,
+                lhs_mask,
+                analyze_stats,
+                resolver,
+                multi_index_work,
+            )?
+        } else {
+            None
+        };
+        if let Some(multi_idx_method) = multi_idx_method {
             replace_if_cheaper(
                 &mut best_access_method,
                 &mut best_cost_with_filters,
