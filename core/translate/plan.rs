@@ -4313,6 +4313,13 @@ impl Aggregate {
     pub fn is_distinct(&self) -> bool {
         self.distinctness.is_distinct()
     }
+
+    /// Whether this is a MIN or MAX whose AggStep runs once per row, so that the
+    /// step can tell whether the row holds the MIN/MAX value. The columns read
+    /// outside an aggregate function come from that row, like in SQLite.
+    pub fn selects_min_max_row(&self) -> bool {
+        matches!(self.func, AggFunc::Min | AggFunc::Max) && self.order_cursor.is_none()
+    }
 }
 
 /// Represents the window definition and all window functions associated with a single SELECT.

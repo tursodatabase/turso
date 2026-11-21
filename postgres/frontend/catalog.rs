@@ -405,6 +405,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn having_aggregates_make_query_aggregate(&self) -> bool {
+        true
+    }
+
     fn add_column_computes_default_for_existing_rows(&self) -> bool {
         true
     }

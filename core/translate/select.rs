@@ -17,6 +17,7 @@ use crate::translate::expr::{
     walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
+use crate::translate::insert::expr_contains_subquery;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
 use crate::translate::plan::{
     GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
@@ -694,11 +695,22 @@ fn prepare_one_select_plan(
                     && resolver.move_aggregate_to_enclosing_query(agg.clone()))
             });
 
-            // HAVING without GROUP BY requires aggregates in the SELECT
+            // SQLite raises "HAVING clause on a non-aggregate query" before it
+            // resolves HAVING. When no result column holds an aggregate or a
+            // subquery that could move one up to this query, raise it now,
+            // before planning a HAVING subquery fails for another reason.
+            // plan_subqueries_from_select_plan checks the other queries.
             if let Some(ref group_by) = plan.group_by {
                 if group_by.exprs.is_empty()
                     && group_by.having.is_some()
-                    && plan.aggregates.is_empty()
+                    && !resolver
+                        .catalog
+                        .dialect
+                        .having_aggregates_make_query_aggregate()
+                    && !plan
+                        .result_columns
+                        .iter()
+                        .any(|rc| rc.contains_aggregates || expr_contains_subquery(&rc.expr))
                 {
                     crate::bail_parse_error!("HAVING clause on a non-aggregate query");
                 }

@@ -4815,7 +4815,7 @@ mod tests {
                     &main_path,
                     Arc::new(SqliteDialect),
                 )?;
-                let verify_conn = verify_db.connect(ConnectOpts::new())?;
+                let verify_conn = verify_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
                 let mut stmt = verify_conn.prepare("SELECT id, value FROM items")?;
                 let mut rows = Vec::new();
                 while let Some(row) = run_stmt_once(&coro, &mut stmt).await? {

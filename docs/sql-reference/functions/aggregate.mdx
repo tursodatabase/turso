@@ -181,6 +181,8 @@ min(X)
 
 `max(X)` returns the maximum non-NULL value of X. `min(X)` returns the minimum non-NULL value of X. Values are compared using the standard SQLite comparison rules. Returns NULL if all values are NULL.
 
+As in SQLite, when a query has a single `max(X)` or `min(X)`, a column outside any aggregate in the result columns or in `HAVING` reads its value from the row holding the maximum or minimum. For example, `SELECT name, max(amount) FROM sales` returns the name of the largest sale. Without `max()` or `min()`, such a column reads the first row of the group.
+
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | X | any | The expression to find the maximum or minimum value of |

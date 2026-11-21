@@ -340,6 +340,7 @@ pub fn plan_subqueries_from_select_plan(
     }
 
     // Result columns
+    let aggregates_moved_before_result_columns = resolver.count_aggregates_moved_from_subqueries();
     {
         crate::stack::trace_stack!("select_result_columns");
         plan_subqueries_with_outer_query_access(
@@ -357,6 +358,18 @@ pub fn plan_subqueries_from_select_plan(
             &shared_subqueries,
         )?;
     }
+
+    // A subquery in a result column that holds an aggregate of this query's
+    // columns makes this query an aggregate query, like an aggregate in the
+    // result column itself. Only a subquery one level down moves such an
+    // aggregate up to this query. One further down computes the aggregate in
+    // its own plan, which would give a wrong result here, so that case raises
+    // the error instead.
+    let result_columns_have_aggregates = (!plan.aggregates.is_empty()
+        && plan.result_columns.iter().any(|rc| rc.contains_aggregates))
+        || resolver.count_aggregates_moved_from_subqueries()
+            > aggregates_moved_before_result_columns;
+    validate_having_without_group_by(plan, resolver, result_columns_have_aggregates)?;
 
     // ORDER BY
     {
@@ -411,6 +424,39 @@ pub fn plan_subqueries_from_select_plan(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
     )?;
+    Ok(())
+}
+
+/// Return the error SQLite returns for HAVING without GROUP BY in a query that
+/// is not an aggregate query.
+///
+/// SQLite counts only the aggregates of the result columns, including those in
+/// their subqueries that read only this query's columns, so
+/// `SELECT 1 FROM t HAVING max(x) > 0` fails. PostgreSQL counts aggregates
+/// anywhere in the query.
+fn validate_having_without_group_by(
+    plan: &SelectPlan,
+    resolver: &Resolver,
+    result_columns_have_aggregates: bool,
+) -> Result<()> {
+    let Some(group_by) = &plan.group_by else {
+        return Ok(());
+    };
+    if !group_by.exprs.is_empty() || group_by.having.is_none() {
+        return Ok(());
+    }
+    let is_aggregate_query = if resolver
+        .catalog
+        .dialect
+        .having_aggregates_make_query_aggregate()
+    {
+        !plan.aggregates.is_empty() || resolver.count_aggregates_moved_from_subqueries() > 0
+    } else {
+        result_columns_have_aggregates
+    };
+    if !is_aggregate_query {
+        crate::bail_parse_error!("HAVING clause on a non-aggregate query");
+    }
     Ok(())
 }
 
@@ -1947,6 +1993,7 @@ pub fn emit_from_clause_subquery(
                     meta_sort: None,
                     reg_agg_start: None,
                     reg_nonagg_emit_once_flag: None,
+                    ungrouped_column_regs: Vec::new(),
                     reg_result_cols_start: None,
                     limit_ctx: None,
                     reg_offset: None,
@@ -2047,6 +2094,7 @@ fn emit_indexed_materialized_subquery(
                 meta_sort: None,
                 reg_agg_start: None,
                 reg_nonagg_emit_once_flag: None,
+                ungrouped_column_regs: Vec::new(),
                 reg_result_cols_start: None,
                 limit_ctx: None,
                 reg_offset: None,
@@ -2177,6 +2225,7 @@ fn emit_materialized_subquery_table(
                 meta_sort: None,
                 reg_agg_start: None,
                 reg_nonagg_emit_once_flag: None,
+                ungrouped_column_regs: Vec::new(),
                 reg_result_cols_start: None,
                 limit_ctx: None,
                 reg_offset: None,
