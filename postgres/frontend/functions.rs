@@ -70,6 +70,12 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             )
             .receiving_argument_types(),
         )
+        .extension_function(
+            pg_scalar_function("pg_typeof", FunctionArity::Exact(1), true, |_, args| {
+                Ok(exec_pg_typeof(&text_arg(args, 1)))
+            })
+            .receiving_argument_types(),
+        )
 }
 
 /// date_trunc(field, timestamptz). The declared return type is timestamptz,
@@ -237,6 +243,32 @@ fn truncate_timestamp(time: NaiveDateTime, unit: TruncUnit) -> Option<NaiveDateT
         return None;
     }
     Some(day.and_time(NaiveTime::MIN))
+}
+
+/// `pg_typeof(value)`: the name of the type of the argument, which the engine
+/// passes as one more argument.
+fn exec_pg_typeof(engine_type_name: &str) -> String {
+    match engine_type_name.strip_suffix("[]") {
+        Some(element) => format!("{}[]", exec_pg_typeof(element)),
+        None => pg_type_display_name(engine_type_name).to_string(),
+    }
+}
+
+/// The name PostgreSQL gives a type, from the name the engine gives it. The
+/// engine's `real` is SQLite's REAL, a double precision, where PostgreSQL's
+/// `real` is the float4 type.
+fn pg_type_display_name(engine_type_name: &str) -> &str {
+    match engine_type_name {
+        "real" => "double precision",
+        "float4" => "real",
+        "blob" => "bytea",
+        "varchar" => "character varying",
+        "time" => "time without time zone",
+        "timestamp" => "timestamp without time zone",
+        "timestamptz" => "timestamp with time zone",
+        "null" | "any" => "unknown",
+        other => other,
+    }
 }
 
 fn register_scalar_functions(options: OpenOptions) -> OpenOptions {

@@ -473,15 +473,12 @@ expect @tursopg {
 
 # C-43: result column type of bool comparison via pg_typeof
 @setup t_b_n_ts_j_jb_arr_u_with_rows
-@compat-gap "function:pg_typeof"
 test result-column-types-via-pg-typeof {
     SELECT pg_typeof(b), pg_typeof(n), pg_typeof(ts), pg_typeof(jb), pg_typeof(arr) FROM t;
 }
 expect {
     boolean|numeric|timestamp with time zone|jsonb|text[]
 }
-@sqlstate 42883
-expect @tursopg error {}
 
 # C-44: row_to_json of whole row
 @setup t_b_n_ts_j_jb_arr_u_with_rows

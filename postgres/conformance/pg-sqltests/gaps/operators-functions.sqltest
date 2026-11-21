@@ -845,15 +845,12 @@ expect {
 }
 
 # B-81: pg_typeof
-@compat-gap "function:pg_typeof"
 test pg-typeof {
     SELECT pg_typeof(1), pg_typeof(1.5), pg_typeof('a'::text), pg_typeof(true);
 }
 expect {
     integer|numeric|text|boolean
 }
-@sqlstate 42883
-expect @tursopg error {}
 
 # B-82: integer division truncates
 @compat-gap "type:numeric"

@@ -134,8 +134,8 @@ forms; the first schema of `search_path` that exists), `current_schemas(boolean)
 `obj_description()`/`col_description()` read `pg_description`; `obj_description()`
 knows the catalogs `pg_class` and `pg_namespace` and returns NULL for any other.
 A call of either in a column DEFAULT, a CHECK constraint or an index, or with an aggregate or window function in an argument, is rejected with 0A000.
-DML against pg_catalog is rejected. `pg_typeof` is not
-implemented.
+DML against pg_catalog is rejected. `pg_typeof` names the type the engine gives the
+argument, so it is wrong where the engine's type is: an untyped string literal is text, and a domain is its base type.
 Configuration settings functions: `set_config()` and `current_setting()`,
 for `search_path` and for custom parameters (see Configuration Management).
 Setting changes follow the transaction as in PostgreSQL: a value that
