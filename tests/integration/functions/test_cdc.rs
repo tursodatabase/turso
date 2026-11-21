@@ -1088,6 +1088,80 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
     );
 }
 
+// TODO: cannot use mvcc because of indexes
+#[turso_macros::test()]
+fn test_cdc_schema_changes_alter_table_rename(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_y ON t(y)").unwrap();
+    conn.execute("CREATE TRIGGER t_ins AFTER INSERT ON t BEGIN SELECT new.y; END")
+        .unwrap();
+    conn.execute("CREATE VIEW v AS SELECT y FROM t").unwrap();
+    conn.execute("DELETE FROM turso_cdc").unwrap();
+    conn.execute("ALTER TABLE t RENAME TO t2").unwrap();
+    conn.execute("ALTER TABLE t2 RENAME COLUMN y TO z").unwrap();
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+
+    let table_row = |name: &str, sql: &str| {
+        record([
+            Value::Text("table".to_string()),
+            Value::Text(name.to_string()),
+            Value::Text(name.to_string()),
+            Value::Integer(7),
+            Value::Text(sql.to_string()),
+        ])
+    };
+    let sql_updated_to = |statement: &str| {
+        record([
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(1),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Text(statement.to_string()),
+        ])
+    };
+    assert_eq!(
+        rows,
+        vec![
+            v2_row(
+                0,
+                "sqlite_schema",
+                6,
+                Some(table_row("t", "CREATE TABLE t (x INTEGER PRIMARY KEY, y)")),
+                Some(table_row(
+                    "t2",
+                    "CREATE TABLE t2 (x INTEGER PRIMARY KEY, y)"
+                )),
+                Some(sql_updated_to("ALTER TABLE t RENAME TO t2")),
+            ),
+            v2_commit(),
+            v2_row(
+                0,
+                "sqlite_schema",
+                6,
+                Some(table_row(
+                    "t2",
+                    "CREATE TABLE t2 (x INTEGER PRIMARY KEY, y)"
+                )),
+                Some(table_row(
+                    "t2",
+                    "CREATE TABLE t2 (x INTEGER PRIMARY KEY, z)"
+                )),
+                Some(sql_updated_to("ALTER TABLE t2 RENAME COLUMN y TO z")),
+            ),
+            v2_commit(),
+        ]
+    );
+}
+
 #[turso_macros::test]
 fn test_cdc_version_table_created(db: TempDatabase) {
     let conn = db.connect_limbo();
