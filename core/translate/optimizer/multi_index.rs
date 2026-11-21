@@ -385,7 +385,6 @@ fn choose_multi_index_branch_access(
     params: &CostModelParams,
 ) -> Result<Option<MultiIdxBranch>> {
     turso_debug_assert!(branch_has_lookup_constraint(table_constraints));
-    let mut chosen_refs = smallvec::SmallVec::new();
     let chosen_seek = choose_best_btree_candidate(
         rhs_table,
         table_constraints,
@@ -398,8 +397,13 @@ fn choose_multi_index_branch_access(
         1.0,
         base_row_count,
         params,
-        &mut chosen_refs,
     )?;
+    let chosen_refs_memo = chosen_seek
+        .as_ref()
+        .and_then(|chosen| chosen.constraint_refs(table_constraints));
+    let chosen_refs: &[RangeConstraintRef] = chosen_refs_memo
+        .as_deref()
+        .map_or(&[], smallvec::SmallVec::as_slice);
 
     let mut best_branch = chosen_seek
         .as_ref()
@@ -420,7 +424,7 @@ fn choose_multi_index_branch_access(
             let branch_cost = estimate_cost_for_scan_or_seek(
                 Some(index_info),
                 &table_constraints.constraints,
-                &chosen_refs,
+                chosen_refs,
                 1.0,
                 base_row_count,
                 false,
@@ -437,7 +441,7 @@ fn choose_multi_index_branch_access(
                 estimated_rows: estimate_rows_per_seek(
                     index_info,
                     &table_constraints.constraints,
-                    &chosen_refs,
+                    chosen_refs,
                     base_row_count,
                     Some(&analyze_ctx),
                 ),
