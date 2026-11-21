@@ -1058,6 +1058,15 @@ pub struct TranslateCtx<'a> {
     // we want to emit the non-aggregate columns (foo and bar) only once.
     // This register is a flag that tracks whether we have already done that.
     pub reg_nonagg_emit_once_flag: Option<usize>,
+    // For an aggregate query with a min() or max() and non-aggregate columns:
+    // the register they set to 1 when the current row does not hold a new
+    // minimum or maximum (see `AggStepData::not_best_row_reg`). The
+    // non-aggregate columns are read from each row that leaves it 0.
+    pub reg_not_best_row: Option<usize>,
+    // For an aggregate query without GROUP BY: each column used outside aggregate
+    // calls by a result column with an aggregate or by HAVING (e.g. `a` in
+    // SELECT sum(b) + a FROM t), and the register it is read into on the first row.
+    pub bare_column_regs: Vec<(ast::Expr, usize)>,
     // First register of the result columns of the query
     pub reg_result_cols_start: Option<usize>,
     pub limit_ctx: Option<LimitCtx>,
@@ -1130,6 +1139,8 @@ impl<'a> TranslateCtx<'a> {
             label_main_loop_end: None,
             reg_agg_start: None,
             reg_nonagg_emit_once_flag: None,
+            reg_not_best_row: None,
+            bare_column_regs: Vec::new(),
             limit_ctx: None,
             reg_offset: None,
             reg_limit_offset_sum: None,

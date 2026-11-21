@@ -1,4 +1,5 @@
 use crate::alloc::TursoIteratorExt;
+use crate::function::AggFunc;
 use crate::translate::expr_context::ExprContext;
 use turso_parser::ast::{self, SortOrder};
 
@@ -9,7 +10,9 @@ use super::{
     result_row::emit_select_result,
 };
 use crate::translate::{
-    aggregation::{emit_aggregate_final, emit_aggregate_step, AggArgumentSource},
+    aggregation::{
+        emit_aggregate_final, emit_aggregate_step, emit_min_max_filter_default, AggArgumentSource,
+    },
     expression_index::selected_expression_index,
     order_by::EmitOrderBy,
     plan::{Aggregate, NonFromClauseSubquery},
@@ -138,6 +141,14 @@ impl EmitGroupBy {
                 Some(program.alloc_registers_and_init_w_null(plan.aggregates.len()));
         }
         // END BLOCK
+
+        if plan
+            .aggregates
+            .iter()
+            .any(|agg| matches!(agg.func, AggFunc::Min | AggFunc::Max))
+        {
+            t_ctx.reg_not_best_row = Some(program.alloc_register());
+        }
 
         let reg_sorter_key = program.alloc_register();
         let column_count = if !group_by.sort_elided {
@@ -801,6 +812,13 @@ pub fn group_by_process_single_group(
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
 
+                emit_min_max_filter_default(
+                    program,
+                    agg,
+                    t_ctx.reg_not_best_row,
+                    registers.reg_data_in_acc_flag,
+                );
+
                 // FILTER: skip AggStep if filter condition is false
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
                     let label = program.allocate_label();
@@ -831,6 +849,7 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    t_ctx.reg_not_best_row,
                 )?;
                 if let Distinctness::Distinct { ctx, .. } = &agg.distinctness {
                     let ctx = ctx
@@ -854,6 +873,13 @@ pub fn group_by_process_single_group(
                     .reg_agg_start
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
+
+                emit_min_max_filter_default(
+                    program,
+                    agg,
+                    t_ctx.reg_not_best_row,
+                    registers.reg_data_in_acc_flag,
+                );
 
                 // FILTER: skip AggStep if filter condition is false
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
@@ -889,6 +915,7 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    t_ctx.reg_not_best_row,
                 )?;
                 if let Distinctness::Distinct { ctx, .. } = &agg.distinctness {
                     let ctx = ctx
@@ -906,7 +933,8 @@ pub fn group_by_process_single_group(
         }
     }
 
-    // We only need to store non-aggregate columns once per group
+    // We only need to store non-aggregate columns once per group, or, with a
+    // min() or max(), again for each row that holds a new minimum or maximum.
     // Skip if we've already stored them for this group
     program.add_comment(
         program.offset(),
@@ -914,7 +942,9 @@ pub fn group_by_process_single_group(
     );
     program.emit_insn(Insn::If {
         target_pc: labels.label_acc_indicator_set_flag_true,
-        reg: registers.reg_data_in_acc_flag,
+        reg: t_ctx
+            .reg_not_best_row
+            .unwrap_or(registers.reg_data_in_acc_flag),
         jump_if_null: false,
     });
 

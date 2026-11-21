@@ -276,6 +276,15 @@ Aggregate functions that can be used with GROUP BY:
 | `GROUP_CONCAT(expression, separator)` | Concatenation of values |
 | `STRING_AGG(expression, separator)` | Alias for GROUP_CONCAT |
 
+A column used outside an aggregate function, in the select list or in HAVING, takes its value from one row of the group, as in SQLite. When the query uses `MIN()` or `MAX()`, that is the row holding the minimum or maximum (with several of them, the last one in the query decides). Otherwise it is the first row read.
+
+```sql
+-- The name of the employee with the highest salary in each department
+SELECT department, MAX(salary), name
+FROM employees
+GROUP BY department;
+```
+
 ### HAVING
 
 Filters groups after aggregation. WHERE filters individual rows before grouping; HAVING filters groups after.
@@ -285,6 +294,12 @@ SELECT department, COUNT(*) AS headcount
 FROM employees
 GROUP BY department
 HAVING COUNT(*) >= 5;
+```
+
+Without GROUP BY, HAVING treats all rows as one group. The select list must contain an aggregate function; otherwise the query fails with `HAVING clause on a non-aggregate query`.
+
+```sql
+SELECT COUNT(*) FROM employees HAVING COUNT(*) > 100;
 ```
 
 ### GROUP BY with Expressions

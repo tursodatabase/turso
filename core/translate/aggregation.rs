@@ -21,8 +21,8 @@ use super::{
         ConditionMetadata, NoConstantOptReason,
     },
     plan::{
-        Aggregate, Distinctness, EvalAt, NonFromClauseSubquery, SelectPlan, SubqueryEvalPhase,
-        SubqueryOrigin, SubqueryState, TableReferences,
+        Aggregate, Distinctness, NonFromClauseSubquery, SelectPlan, SubqueryEvalPhase,
+        TableReferences,
     },
     result_row::emit_select_result,
     subquery::emit_non_from_clause_subqueries_for_phase,
@@ -153,24 +153,6 @@ pub fn emit_ungrouped_aggregation<'a>(
                             },
                         });
                     }
-                }
-            }
-        }
-        // A result column subquery that runs inside the loop last ran for a
-        // row that never reached the aggregate. Run it again so that it reads
-        // the NULL row too.
-        for subquery in output_subqueries.iter() {
-            if let SubqueryState::Evaluated {
-                evaluated_at: EvalAt::Loop(_),
-                subroutine: Some(subroutine),
-                ..
-            } = &subquery.state
-            {
-                if subquery.origin == SubqueryOrigin::SelectList {
-                    program.emit_insn(Insn::Gosub {
-                        target_pc: subroutine.label,
-                        return_reg: subroutine.return_reg,
-                    });
                 }
             }
         }
@@ -329,6 +311,7 @@ pub fn emit_aggregate_step(
     source: AggArgumentSource,
     target_register: usize,
     resolver: &Resolver,
+    not_best_row_reg: Option<usize>,
 ) -> Result<usize> {
     let Some(cursor_id) = aggregate.order_cursor else {
         return translate_aggregation_step(
@@ -338,6 +321,7 @@ pub fn emit_aggregate_step(
             target_register,
             resolver,
             aggregate.fraction_reg,
+            not_best_row_reg,
         );
     };
     let span_idx = program.constant_spans_next_idx();
@@ -377,6 +361,28 @@ pub fn emit_aggregate_step(
     super::order_by::sorter_insert(program, start, column_count, cursor_id, record_reg);
     program.constant_spans_invalidate_after(span_idx);
     Ok(target_register)
+}
+
+/// Emitted before the FILTER of `aggregate`. If it is a min() or max(), sets
+/// `not_best_row_reg` to `row_read_flag`, so that when the FILTER skips the
+/// min() or max(), the non-aggregate columns are read only if no row has been
+/// read yet. SQLite does the same, so these columns come from the first row
+/// when no FILTER passes.
+pub fn emit_min_max_filter_default(
+    program: &mut ProgramBuilder,
+    aggregate: &Aggregate,
+    not_best_row_reg: Option<usize>,
+    row_read_flag: usize,
+) {
+    if let (Some(not_best_row_reg), Some(_), AggFunc::Min | AggFunc::Max) =
+        (not_best_row_reg, &aggregate.filter_expr, &aggregate.func)
+    {
+        program.emit_insn(Insn::Copy {
+            src_reg: row_read_flag,
+            dst_reg: not_best_row_reg,
+            extra_amount: 0,
+        });
+    }
 }
 
 pub fn emit_aggregate_final(
@@ -444,6 +450,7 @@ pub fn emit_aggregate_final(
             target_register,
             resolver,
             aggregate.fraction_reg,
+            None,
         )?;
         if let Some(label) = duplicate {
             program.preassign_label_to_next_insn(label);
@@ -518,6 +525,8 @@ pub fn translate_aggregation_step(
     // For `percentile_cont` / `percentile_disc`: register pre-evaluated by
     // `InitLoop::emit`. `None` for any other aggregate.
     fraction_reg: Option<usize>,
+    // For `min` / `max`: see `AggStepData::not_best_row_reg`.
+    not_best_row_reg: Option<usize>,
 ) -> Result<usize> {
     let num_args = agg_arg_source.num_args();
     let func = agg_arg_source.agg_func();
@@ -535,6 +544,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Avg),
                     collation: CollationSeq::BINARY,
+                    not_best_row_reg: None,
                 }),
             });
             target_register
@@ -550,6 +560,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Count0),
                     collation: CollationSeq::BINARY,
+                    not_best_row_reg: None,
                 }),
             });
             target_register
@@ -567,6 +578,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Count),
                     collation: CollationSeq::BINARY,
+                    not_best_row_reg: None,
                 }),
             });
             target_register
@@ -594,6 +606,7 @@ pub fn translate_aggregation_step(
                     delimiter: delimiter_reg,
                     func: AccumulatorFunc::Agg(AggFunc::GroupConcat),
                     collation: CollationSeq::BINARY,
+                    not_best_row_reg: None,
                 }),
             });
 
@@ -615,6 +628,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Max),
                     collation: arg_collation,
+                    not_best_row_reg,
                 }),
             });
             target_register
@@ -635,6 +649,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Min),
                     collation: arg_collation,
+                    not_best_row_reg,
                 }),
             });
             target_register
@@ -655,6 +670,7 @@ pub fn translate_aggregation_step(
                     delimiter: value_reg,
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupObject),
                     collation: CollationSeq::BINARY,
+                    not_best_row_reg: None,
                 }),
             });
             target_register
@@ -673,6 +689,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupArray),
                     collation: CollationSeq::BINARY,
+                    not_best_row_reg: None,
                 }),
             });
             target_register
@@ -693,6 +710,7 @@ pub fn translate_aggregation_step(
                     delimiter: delimiter_reg,
                     func: AccumulatorFunc::Agg(AggFunc::StringAgg),
                     collation: CollationSeq::BINARY,
+                    not_best_row_reg: None,
                 }),
             });
 
@@ -711,6 +729,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Sum),
                     collation: CollationSeq::BINARY,
+                    not_best_row_reg: None,
                 }),
             });
             target_register
@@ -728,6 +747,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Total),
                     collation: CollationSeq::BINARY,
+                    not_best_row_reg: None,
                 }),
             });
             target_register
@@ -746,6 +766,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::ArrayAgg),
                     collation: CollationSeq::BINARY,
+                    not_best_row_reg: None,
                 }),
             });
             target_register
@@ -770,6 +791,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Mode),
                     collation: arg_collation,
+                    not_best_row_reg: None,
                 }),
             });
             target_register
@@ -798,6 +820,7 @@ pub fn translate_aggregation_step(
                     delimiter: fraction_reg,
                     func: AccumulatorFunc::Agg(func.clone()),
                     collation: arg_collation,
+                    not_best_row_reg: None,
                 }),
             });
             target_register
@@ -839,6 +862,7 @@ pub fn translate_aggregation_step(
                         func.clone()
                     })),
                     collation: CollationSeq::BINARY,
+                    not_best_row_reg: None,
                 }),
             });
             target_register
