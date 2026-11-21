@@ -87,6 +87,7 @@ test concat-ws-empty-arguments {
     SELECT quote(concat_ws(',', '', '', 'a'));
     SELECT quote(concat_ws(',', 'a', '', ''));
     SELECT quote(concat_ws('', '', 'a'));
+    SELECT quote(concat_ws(',', '', ''));
     SELECT quote(concat_ws(',', NULL, NULL));
     SELECT quote(concat_ws(',', x'', 'a'));
     SELECT quote(concat_ws(',', 'a', x'', 'b'));
@@ -98,6 +99,7 @@ expect {
     'a'
     'a,,'
     'a'
+    ''
     ''
     'a'
     'a,,b'
