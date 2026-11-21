@@ -8,7 +8,7 @@ use crate::error::io_error;
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::unix::{
     is_ignorable_dir_sync_errno, open_parent_dir, resolve_parent_dir, unix_shared_wal_lock_byte,
-    unix_shared_wal_map, unix_shared_wal_unlock_byte,
+    unix_shared_wal_map, unix_shared_wal_unlock_byte, ParentDir,
 };
 use crate::storage::wal::CKPT_BATCH_PAGES;
 use crate::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +16,6 @@ use crate::sync::Mutex;
 use crate::turso_assert;
 use crate::{CompletionError, LimboError, Result};
 use rustix::fs::{self, FlockOperation};
-use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::{
     collections::{HashMap, VecDeque},
@@ -260,6 +259,7 @@ fn permission_denied_message(disabled: Option<&str>) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirSyncPhase {
     FileSync,
     DirSync,
@@ -771,7 +771,7 @@ pub struct UringFile {
     state: Arc<Mutex<RingState>>,
     caps: Arc<UringCapabilities>,
     file: std::fs::File,
-    parent_dir: Option<PathBuf>,
+    parent_dir: Option<ParentDir>,
     dir_needs_sync: Arc<AtomicBool>,
 }
 
@@ -1159,6 +1159,108 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_rejects_replaced_parent_dir() {
+        let io = match UringIO::new() {
+            Ok(io) => io,
+            Err(LimboError::IoBackendUnavailable(_)) => return,
+            Err(e) => panic!("unexpected UringIO::new error: {e}"),
+        };
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        let sub_moved = root.path().join("sub_moved");
+        std::fs::create_dir(&sub).unwrap();
+        let db_path = sub.join("test.db");
+
+        let file = io
+            .open_file(db_path.to_str().unwrap(), OpenFlags::Create, false)
+            .unwrap();
+        let buf = Arc::new(crate::Buffer::new_temporary(4096));
+        let w = file.pwrite(0, buf, Completion::new_write(|_| {})).unwrap();
+        io.wait_for_completion(w).unwrap();
+
+        std::fs::rename(&sub, &sub_moved).unwrap();
+        std::fs::create_dir(&sub).unwrap();
+        let res = file.sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync);
+        assert!(
+            res.is_err(),
+            "first sync must fail when parent dir is replaced"
+        );
+
+        std::fs::remove_dir(&sub).unwrap();
+        std::fs::rename(&sub_moved, &sub).unwrap();
+        let s1 = file
+            .sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync)
+            .expect("retry sync must submit once original parent dir is restored");
+        io.wait_for_completion(s1).unwrap();
+
+        std::fs::rename(&sub, &sub_moved).unwrap();
+        let s2 = file
+            .sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync)
+            .expect("subsequent sync must not re-open parent dir");
+        io.wait_for_completion(s2).unwrap();
+    }
+
+    #[test]
+    fn test_dir_sync_inter_phase_completion_group_waits_for_dir_sync() {
+        use crate::io::CompletionGroup;
+        use crate::sync::atomic::AtomicUsize;
+
+        let io = match UringIO::new() {
+            Ok(io) => io,
+            Err(LimboError::IoBackendUnavailable(_)) => return,
+            Err(e) => panic!("unexpected UringIO::new error: {e}"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dir_fd = open_parent_dir(&ParentDir {
+            path: dir.path().to_path_buf(),
+            identity: None,
+        })
+        .unwrap();
+        assert!(dir_fd.is_some());
+
+        let dir_needs_sync = Arc::new(AtomicBool::new(true));
+        let group_calls = Arc::new(AtomicUsize::new(0));
+        let group_calls_cb = group_calls.clone();
+        let mut group = CompletionGroup::new(move |res| {
+            assert_eq!(res, Ok(0));
+            group_calls_cb.fetch_add(1, Ordering::SeqCst);
+        });
+        let sync_c = Completion::new_sync(|res| assert_eq!(res, Ok(0)));
+        group.add(&sync_c);
+        let group_c = group.build();
+        let key = get_key(sync_c.clone());
+        let dstate = DirSyncState {
+            dir_fd,
+            dir_needs_sync: dir_needs_sync.clone(),
+            phase: DirSyncPhase::FileSync,
+        };
+
+        {
+            let mut state = io.state.lock();
+            unsafe {
+                state
+                    .handle_dir_sync_completion(&io.ring, dstate, key, 0)
+                    .unwrap();
+            }
+            assert!(!sync_c.finished());
+            assert!(!group_c.finished());
+            assert_eq!(group_calls.load(Ordering::SeqCst), 0);
+            assert!(dir_needs_sync.load(Ordering::SeqCst));
+            assert_eq!(
+                state.dir_sync_states.get(&key).map(|s| s.phase),
+                Some(DirSyncPhase::DirSync)
+            );
+        }
+
+        io.wait_for_completion(group_c.clone()).unwrap();
+        assert!(sync_c.finished());
+        assert!(group_c.finished());
+        assert_eq!(group_calls.load(Ordering::SeqCst), 1);
+        assert!(!dir_needs_sync.load(Ordering::SeqCst));
+        assert!(io.state.lock().dir_sync_states.is_empty());
+    }
+
+    #[test]
     fn test_dir_sync_state_machine_transitions() {
         let io = match UringIO::new() {
             Ok(io) => io,
@@ -1166,7 +1268,6 @@ mod tests {
             Err(e) => panic!("unexpected UringIO::new error: {e}"),
         };
 
-        // 1. DirSync phase with -EIO leaves dir_needs_sync == true and invokes error callback.
         {
             let dir_needs_sync = Arc::new(AtomicBool::new(true));
             let err_seen = Arc::new(AtomicBool::new(false));
@@ -1191,7 +1292,6 @@ mod tests {
             assert!(err_seen.load(Ordering::SeqCst));
         }
 
-        // 2. DirSync phase with -EINVAL and -EROFS clears dir_needs_sync and completes Ok(0).
         for errno in [libc::EINVAL, libc::EROFS] {
             let dir_needs_sync = Arc::new(AtomicBool::new(true));
             let ok_seen = Arc::new(AtomicBool::new(false));
@@ -1216,12 +1316,15 @@ mod tests {
             assert!(ok_seen.load(Ordering::SeqCst));
         }
 
-        // 3. FileSync phase with result == 0 when aborted does not submit Phase 2 or clear flag.
         {
             use crate::sync::atomic::AtomicUsize;
 
             let dir = tempfile::tempdir().unwrap();
-            let dir_fd = open_parent_dir(dir.path()).unwrap();
+            let dir_fd = open_parent_dir(&ParentDir {
+                path: dir.path().to_path_buf(),
+                identity: None,
+            })
+            .unwrap();
             let dir_needs_sync = Arc::new(AtomicBool::new(true));
             let calls = Arc::new(AtomicUsize::new(0));
             let calls_cb = calls.clone();
@@ -1248,8 +1351,6 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), 1);
         }
 
-        // 4. FileSync phase with dir_fd: None (PermissionDenied):
-        //    -EIO leaves dir_needs_sync == true; result == 0 clears flag and completes Ok(0).
         {
             let dir_needs_sync = Arc::new(AtomicBool::new(true));
             let err_seen = Arc::new(AtomicBool::new(false));
