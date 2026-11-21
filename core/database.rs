@@ -3959,6 +3959,12 @@ impl Database {
         self.opts.enable_without_rowid
     }
 
+    /// Sets the last WAL frame that checkpoints of this database may copy into the database
+    /// file. `None` removes the cap. See [`CheckpointFrameCap`].
+    pub fn set_checkpoint_frame_cap(&self, cap: Option<crate::CheckpointFrameCap>) {
+        *self.shared_wal.read().runtime.checkpoint_frame_cap.lock() = cap;
+    }
+
     /// check if database is currently in MVCC mode
     pub fn mvcc_enabled(&self) -> bool {
         self.mv_store.load().is_some()
