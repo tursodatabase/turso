@@ -957,12 +957,12 @@ pub fn translate_insert(
     //
     // REPLACE (whether statement-level OR REPLACE or constraint-level ON CONFLICT REPLACE)
     // deletes conflicting rows in preflight; the new index entries are still inserted
-    // in the commit phase. When there's no statement-level override (e.g. INSERT OR ...)
-    // and no UPSERT, individual constraints keep their DDL modes, so some of them can
-    // use REPLACE while others don't. This mixed-mode detection is unnecessary when a
-    // statement override exists, because the override applies uniformly to all constraints.
+    // in the commit phase. It applies to every constraint that no UPSERT clause handles.
+    // When there's no statement-level override (e.g. INSERT OR ...), individual
+    // constraints keep their DDL modes, so some of them can use REPLACE while others
+    // don't. This mixed-mode detection is unnecessary when a statement override exists,
+    // because the override applies uniformly to all constraints.
     let has_ddl_replace = ctx.statement_on_conflict.is_none()
-        && upsert_actions.is_empty()
         && resolver.with_schema(ctx.namespace.database_id, |schema| {
             any_index_or_ipk_has_replace(
                 ctx.table.rowid_alias_conflict_clause,
@@ -971,8 +971,7 @@ pub fn translate_insert(
                     .map(|idx| idx.on_conflict),
             )
         });
-    let on_replace = (matches!(ctx.on_conflict, ResolveType::Replace) && upsert_actions.is_empty())
-        || has_ddl_replace;
+    let on_replace = matches!(ctx.on_conflict, ResolveType::Replace) || has_ddl_replace;
     let recheck_after_replace_reg = (on_replace && has_fks).then(|| {
         let reg = program.alloc_register();
         program.emit_insn(Insn::Integer {
@@ -2371,16 +2370,7 @@ fn bind_insert(
             upsert = upsert_opt.take();
         }
     }
-    if let ResolveType::Ignore = on_conflict {
-        program.set_resolve_type(ResolveType::Ignore);
-        upsert.replace(Box::new(ast::Upsert {
-            do_clause: UpsertDo::Nothing,
-            index: None,
-            next: None,
-        }));
-    } else {
-        program.set_resolve_type(on_conflict);
-    }
+    program.set_resolve_type(on_conflict);
     while let Some(mut upsert_opt) = upsert.take() {
         if let UpsertDo::Set {
             ref mut sets,
@@ -3275,19 +3265,6 @@ fn emit_pk_uniqueness_check(
     // Conflict on rowid: attempt to route through UPSERT if it targets the PK, otherwise raise constraint.
     // emit Halt for every case *except* when upsert handles the conflict
     'emit_halt: {
-        if preflight.on_replace {
-            // copy the conflicting rowid into the key register and delete the existing row inline
-            program.emit_insn(Insn::Copy {
-                src_reg: insertion.key_register(),
-                dst_reg: ctx.conflict_rowid_reg,
-                extra_amount: 0,
-            });
-            emit_replace_delete_conflicting_row(program, resolver, ctx, preflight)?;
-            program.emit_insn(Insn::Goto {
-                target_pc: make_record_label,
-            });
-            break 'emit_halt;
-        }
         if let Some(position) = position.or(upsert_catch_all) {
             // PK conflict: the conflicting rowid is exactly the attempted key.
             // Upsert clause takes precedence over column-level ON CONFLICT.
@@ -3298,6 +3275,19 @@ fn emit_pk_uniqueness_check(
             });
             program.emit_insn(Insn::Goto {
                 target_pc: preflight.upsert_actions[position].1,
+            });
+            break 'emit_halt;
+        }
+        if preflight.on_replace {
+            // copy the conflicting rowid into the key register and delete the existing row inline
+            program.emit_insn(Insn::Copy {
+                src_reg: insertion.key_register(),
+                dst_reg: ctx.conflict_rowid_reg,
+                extra_amount: 0,
+            });
+            emit_replace_delete_conflicting_row(program, resolver, ctx, preflight)?;
+            program.emit_insn(Insn::Goto {
+                target_pc: make_record_label,
             });
             break 'emit_halt;
         }
@@ -3428,37 +3418,47 @@ fn emit_unique_index_check(
         affinities: aff,
     });
 
-    if !preflight.upsert_actions.is_empty() {
-        let next_check = program.allocate_label();
-        program.emit_insn(Insn::NoConflict {
-            cursor_id: idx_cursor_id,
-            target_pc: next_check,
-            record_reg: idx_start_reg,
-            num_regs: num_cols,
-        });
-        // Conflict detected, figure out if this UPSERT handles the conflict
-        if let Some(position) = position.or(upsert_catch_all) {
-            match &preflight.upsert_actions[position].2.do_clause {
-                UpsertDo::Nothing => {
-                    // Bail out without writing anything
-                    program.emit_insn(Insn::Goto {
-                        target_pc: ctx.loop_labels.row_done,
-                    });
-                }
-                UpsertDo::Set { .. } => {
-                    // Route to DO UPDATE: capture conflicting rowid then jump
-                    program.emit_insn(Insn::IdxRowId {
-                        cursor_id: idx_cursor_id,
-                        dest: ctx.conflict_rowid_reg,
-                    });
-                    program.emit_insn(Insn::Goto {
-                        target_pc: preflight.upsert_actions[position].1,
-                    });
-                }
+    let ok = program.allocate_label();
+    program.emit_insn(Insn::NoConflict {
+        cursor_id: idx_cursor_id,
+        target_pc: ok,
+        record_reg: idx_start_reg,
+        num_regs: num_cols,
+    });
+    if let Some(position) = position.or(upsert_catch_all) {
+        match &preflight.upsert_actions[position].2.do_clause {
+            UpsertDo::Nothing => {
+                // Bail out without writing anything
+                program.emit_insn(Insn::Goto {
+                    target_pc: ctx.loop_labels.row_done,
+                });
+            }
+            UpsertDo::Set { .. } => {
+                // Route to DO UPDATE: capture conflicting rowid then jump
+                program.emit_insn(Insn::IdxRowId {
+                    cursor_id: idx_cursor_id,
+                    dest: ctx.conflict_rowid_reg,
+                });
+                program.emit_insn(Insn::Goto {
+                    target_pc: preflight.upsert_actions[position].1,
+                });
             }
         }
-        // No matching UPSERT handler so we emit constraint error
-        // (if conflict clause matched - VM will jump to later instructions and skip halt)
+    } else if preflight.on_replace {
+        // REPLACE: delete conflicting row immediately, then insert eagerly.
+        program.emit_insn(Insn::IdxRowId {
+            cursor_id: idx_cursor_id,
+            dest: ctx.conflict_rowid_reg,
+        });
+        emit_replace_delete_conflicting_row(program, resolver, ctx, preflight)?;
+        program.emit_insn(Insn::Goto { target_pc: ok });
+    } else if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
+        // IGNORE: skip this row entirely on unique conflict.
+        program.emit_insn(Insn::Goto {
+            target_pc: ctx.loop_labels.row_done,
+        });
+    } else {
+        // ABORT/FAIL/ROLLBACK: halt on conflict.
         let raw_desc = format_unique_violation_desc(ctx.table, index);
         let mut constraint_info = ConstraintInfo::unique_index(
             ctx.table,
@@ -3474,51 +3474,8 @@ fn emit_unique_index_check(
             on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
             description_reg: None,
         });
-
-        // continue preflight with next constraint
-        program.preassign_label_to_next_insn(next_check);
-    } else {
-        // No UPSERT: probe for conflicts.
-        let ok = program.allocate_label();
-        program.emit_insn(Insn::NoConflict {
-            cursor_id: idx_cursor_id,
-            target_pc: ok,
-            record_reg: idx_start_reg,
-            num_regs: num_cols,
-        });
-        if preflight.on_replace {
-            // REPLACE: delete conflicting row immediately, then insert eagerly.
-            program.emit_insn(Insn::IdxRowId {
-                cursor_id: idx_cursor_id,
-                dest: ctx.conflict_rowid_reg,
-            });
-            emit_replace_delete_conflicting_row(program, resolver, ctx, preflight)?;
-            program.emit_insn(Insn::Goto { target_pc: ok });
-        } else if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
-            // IGNORE: skip this row entirely on unique conflict.
-            program.emit_insn(Insn::Goto {
-                target_pc: ctx.loop_labels.row_done,
-            });
-        } else {
-            // ABORT/FAIL/ROLLBACK: halt on conflict.
-            let raw_desc = format_unique_violation_desc(ctx.table, index);
-            let mut constraint_info = ConstraintInfo::unique_index(
-                ctx.table,
-                index,
-                (0..num_cols).map(|i| idx_start_reg + i).collect(),
-            );
-            emit_constraint_values_decode(program, resolver, ctx.table, &mut constraint_info)?;
-            let err_code = constraint_info.kind.sqlite_extended_result_code();
-            program.emit_insn(Insn::Halt {
-                constraint_info: Some(Box::new(constraint_info)),
-                err_code,
-                description: raw_desc,
-                on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
-                description_reg: None,
-            });
-        }
-        program.preassign_label_to_next_insn(ok);
     }
+    program.preassign_label_to_next_insn(ok);
     Ok(())
 }
 
@@ -3558,20 +3515,23 @@ fn emit_preflight_constraint_checks(
                 ResolvedUpsertTarget::CatchAll => unreachable!(),
             }
         };
+        // An UPSERT clause that handles the constraint takes precedence over REPLACE.
+        let on_replace = effective == ResolveType::Replace
+            && position.or(constraints.upsert_catch_all_position).is_none();
         // REPLACE constraints must sort after all non-REPLACE ones
-        // (schema.rs:add_index + IPK deferral ensure this).
-        if effective == ResolveType::Replace {
-            seen_replace = true;
-        } else {
+        // (schema.rs:add_index, IPK deferral and UPSERT targets sorting first ensure this).
+        // The rowid check of an UPSERT statement is not deferred, as in SQLite.
+        let is_upsert_rowid_check = matches!(constraint, ResolvedUpsertTarget::PrimaryKey)
+            && !preflight.upsert_actions.is_empty();
+        if on_replace {
+            seen_replace |= !is_upsert_rowid_check;
+        } else if !is_upsert_rowid_check {
             turso_assert!(
                 !seen_replace,
                 "non-REPLACE constraint after REPLACE constraint — sort order invariant violated"
             );
         }
-
-        let effective_on_replace =
-            matches!(effective, ResolveType::Replace) && preflight.upsert_actions.is_empty();
-        preflight.on_replace = effective_on_replace;
+        preflight.on_replace = on_replace;
         preflight.effective_on_conflict = effective;
 
         match constraint {
@@ -3603,13 +3563,9 @@ fn emit_preflight_constraint_checks(
     }
     // Foreign key actions run by a REPLACE delete can insert a row that
     // conflicts with the new row again. When any REPLACE delete ran, check the
-    // rowid and every UNIQUE index once more, failing with ABORT on a conflict,
-    // like SQLite's `sqlite3GenerateConstraintChecks`.
+    // rowid and every UNIQUE index once more, failing with ABORT on a conflict
+    // even for an UPSERT target, like SQLite's `sqlite3GenerateConstraintChecks`.
     if let Some(recheck_reg) = preflight.recheck_after_replace_reg {
-        turso_assert!(
-            preflight.upsert_actions.is_empty(),
-            "REPLACE deletes never run together with UPSERT"
-        );
         let recheck_done = program.allocate_label();
         program.emit_insn(Insn::IfNot {
             reg: recheck_reg,
@@ -3848,12 +3804,13 @@ fn build_constraints_to_check(
     // When IPK has REPLACE and other
     // constraints exist with potentially different modes, the IPK check
     // runs last to avoid premature row deletion before FAIL/IGNORE fires.
+    // With UPSERT clauses SQLite does not defer it (`upsertIpkDelay` in
+    // `sqlite3GenerateConstraintChecks`): the rowid is checked right after the
+    // UPSERT target indexes, before the other indexes.
     let defer_ipk_replace_after_other_checks = !has_statement_conflict
         && rowid_alias_conflict_clause == Some(ResolveType::Replace)
         && constraints_to_check.len() > 1
-        && !upsert_actions
-            .iter()
-            .any(|(t, ..)| matches!(t, ResolvedUpsertTarget::PrimaryKey));
+        && upsert_actions.is_empty();
     if defer_ipk_replace_after_other_checks {
         if let Some(pos) = constraints_to_check
             .iter()
@@ -3864,15 +3821,29 @@ fn build_constraints_to_check(
         }
     }
 
+    let upsert_catch_all_position =
+        if let Some((ResolvedUpsertTarget::CatchAll, ..)) = upsert_actions.last() {
+            Some(upsert_actions.len() - 1)
+        } else {
+            None
+        };
+
     // Post-condition: when no statement-level override exists, all REPLACE
-    // constraints (by DDL mode) must form a contiguous suffix. When a statement
-    // override exists, all constraints get the same effective mode, so the DDL
-    // ordering is irrelevant.
+    // constraints (by DDL mode) that no UPSERT clause handles must form a
+    // contiguous suffix, except the rowid check of an UPSERT statement (see
+    // above). When a statement override exists, all constraints get the same
+    // effective mode, so the DDL ordering is irrelevant.
     turso_debug_assert!(
         has_statement_conflict || {
             let mut saw_replace = false;
-            constraints_to_check.iter().all(|(c, _)| {
+            constraints_to_check.iter().all(|(c, position)| {
+                if position.or(upsert_catch_all_position).is_some() {
+                    return !saw_replace;
+                }
                 let mode = match c {
+                    ResolvedUpsertTarget::PrimaryKey if !upsert_actions.is_empty() => {
+                        return true;
+                    }
                     ResolvedUpsertTarget::PrimaryKey => {
                         rowid_alias_conflict_clause.unwrap_or(ResolveType::Abort)
                     }
@@ -3892,12 +3863,6 @@ fn build_constraints_to_check(
         "constraints must have all REPLACE entries at the end"
     );
 
-    let upsert_catch_all_position =
-        if let Some((ResolvedUpsertTarget::CatchAll, ..)) = upsert_actions.last() {
-            Some(upsert_actions.len() - 1)
-        } else {
-            None
-        };
     ConstraintsToCheck {
         constraints_to_check,
         upsert_catch_all_position,
