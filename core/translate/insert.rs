@@ -2600,7 +2600,7 @@ fn init_source_emission<'a>(
                                         ))
                                     })
                             })
-                            .collect::<Result<crate::alloc::Vec<_>>>()?
+                            .try_collect::<Result<crate::alloc::Vec<_>>>()??
                     };
                     let affinity_str = value_columns
                         .iter()
