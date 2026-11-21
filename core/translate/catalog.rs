@@ -193,6 +193,17 @@ impl<'a> CatalogContext<'a> {
         TextCollation::new(name)
     }
 
+    /// The collation a statement compares with for a collation from the
+    /// schema. An unknown collation is the one this connection registered
+    /// under its name, and a `no such collation sequence` error when there is
+    /// none.
+    pub fn resolve_schema_collation(&self, collation: TextCollation) -> Result<TextCollation> {
+        match collation {
+            TextCollation::Unknown(_) => self.resolve_collation(&collation.name()),
+            collation => Ok(collation),
+        }
+    }
+
     /// Access schema for a database using a closure pattern to avoid cloning
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         match database_id {
