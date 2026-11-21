@@ -65,3 +65,22 @@ test last-insert-rowid-unchanged-by-cdc-internal-inserts {
 expect {
     42
 }
+
+@cross-check-integrity
+test last-insert-rowid-unchanged-after-window-use {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    INSERT INTO t VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+    INSERT INTO t(k) VALUES('f');
+    SELECT last_insert_rowid();
+    SELECT count(*) FROM (SELECT row_number() OVER (ORDER BY k) FROM t WHERE id < 3);
+    SELECT last_insert_rowid();
+    SELECT count(*) FROM (SELECT row_number() OVER (ORDER BY k) FROM t WHERE id < 5);
+    SELECT last_insert_rowid();
+}
+expect {
+    6
+    2
+    6
+    4
+    6
+}
