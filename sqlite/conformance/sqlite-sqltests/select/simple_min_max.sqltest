@@ -625,3 +625,36 @@ expect {
     2|
     3|5
 }
+
+test indexed-min-inside-coalesce {
+    CREATE TABLE t(a INTEGER, b INTEGER, c INTEGER, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES (1, 5, NULL), (1, 3, 7), (1, 9, 2), (2, 4, NULL), (3, 1, NULL);
+
+    SELECT COALESCE(MIN(b), 0) FROM t WHERE a = 1;
+    SELECT COALESCE(MIN(b), 0) FROM t WHERE a = 99;
+    SELECT COALESCE(MAX(b), -1) FROM t WHERE a = 1;
+    SELECT MIN(b) + 1 FROM t WHERE a = 2;
+    SELECT CASE WHEN MAX(b) > 4 THEN 'big' ELSE 'small' END FROM t WHERE a = 1;
+}
+expect {
+    3
+    0
+    9
+    5
+    big
+}
+
+test indexed-min-inside-coalesce-skips-nulls {
+    CREATE TABLE t(a INTEGER, c INTEGER);
+    CREATE INDEX tac ON t(a, c);
+    INSERT INTO t VALUES (1, NULL), (1, 7), (1, 2), (2, NULL);
+
+    SELECT COALESCE(MIN(c), 42) FROM t WHERE a = 1;
+    SELECT COALESCE(MIN(c), 42) FROM t WHERE a = 2;
+    SELECT COALESCE(MAX(c), 42) FROM t WHERE a = 2;
+}
+expect {
+    2
+    42
+    42
+}
