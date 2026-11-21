@@ -3066,6 +3066,51 @@ expect error {
     unit "foo" not recognized for type timestamp with time zone
 }
 
+# PostgreSQL prints the lowercased unit.
+test date-trunc-unit-not-recognized-uppercase {
+    SELECT date_trunc('FOO', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 22023
+expect error {
+    unit "foo" not recognized for type timestamp with time zone
+}
+
+# The time zone fields of the interval unit table are not truncation units.
+test date-trunc-unit-timezone {
+    SELECT date_trunc('TIMEZONE', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 0A000
+expect error {
+    unit "timezone" not supported for type timestamp with time zone
+}
+
+test date-trunc-unit-timezone-h {
+    SELECT date_trunc('timezone_h', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 0A000
+expect error {
+    unit "timezone_h" not supported for type timestamp with time zone
+}
+
+test date-trunc-unit-timezone-m {
+    SELECT date_trunc('timezone_m', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 0A000
+expect error {
+    unit "timezone_m" not supported for type timestamp with time zone
+}
+
+# PostgreSQL runs the 3-argument form; tursopg refuses it.
+@compat-gap "function:date_trunc"
+test date-trunc-time-zone-argument {
+    SELECT date_trunc('day', '2026-10-08 12:34:56+00'::timestamptz, 'Europe/Helsinki');
+}
+expect {
+    2026-10-07 21:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
 test date-trunc-unit-leading-space {
     SELECT date_trunc(' day', '2026-10-08 12:34:56+00'::timestamptz);
 }

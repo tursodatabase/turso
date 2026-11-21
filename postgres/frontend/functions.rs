@@ -62,9 +62,12 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             .receiving_argument_types(),
         )
         .extension_function(
-            pg_scalar_function("date_trunc", FunctionArity::Exact(2), true, |_, args| {
-                exec_date_trunc(args)
-            })
+            pg_scalar_function(
+                "date_trunc",
+                FunctionArity::OneOf(&[2, 3]),
+                true,
+                |_, args| exec_date_trunc(args),
+            )
             .receiving_argument_types(),
         )
 }
@@ -73,6 +76,14 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
 /// so any other argument type fails with 0A000 instead of returning a
 /// timestamptz for a timestamp or date argument.
 fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
+    // Registered with arity 2 or 3; each argument is followed by its type.
+    if args.len() == 6 {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "date_trunc with a time zone argument is not supported".to_string(),
+            None,
+        ));
+    }
     let (args, types) = args.split_at(args.len() / 2);
     let argument_type = types[1].get_value().to_string();
     if argument_type != "timestamptz" {
@@ -110,13 +121,16 @@ fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
                 value.as_str()
             ))
         })?;
+    let lowered_field = field.as_str().to_ascii_lowercase();
+    if is_time_zone_unit(&lowered_field) {
+        return Err(not_supported(format!(
+            "unit \"{lowered_field}\" not supported for type timestamp with time zone"
+        )));
+    }
     let Some(unit) = TruncUnit::parse(field.as_str()) else {
         return Err(sqlstate_error(
             SQLSTATE_INVALID_PARAMETER_VALUE,
-            format!(
-                "unit \"{}\" not recognized for type timestamp with time zone",
-                field.as_str()
-            ),
+            format!("unit \"{lowered_field}\" not recognized for type timestamp with time zone"),
             None,
         ));
     };
@@ -128,6 +142,14 @@ fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
         ))
     })?;
     Ok(Some(Timestamptz(timestamp_text(truncated))))
+}
+
+/// The units of PostgreSQL's interval unit table that are time zone fields,
+/// not truncation units. date_trunc refuses them with 0A000 rather than 22023.
+/// `lowered` is matched on its first 10 bytes, as in `TruncUnit::parse`.
+fn is_time_zone_unit(lowered: &str) -> bool {
+    let key = &lowered.as_bytes()[..lowered.len().min(10)];
+    matches!(key, b"timezone" | b"timezone_h" | b"timezone_m")
 }
 
 #[derive(Clone, Copy)]
