@@ -16066,7 +16066,7 @@ pub fn op_concat(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _connection: &Arc<Connection>,
+    connection: &Arc<Connection>,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Concat { lhs, rhs, dest }, insn);
@@ -16084,9 +16084,10 @@ pub fn op_concat(
             return Ok(InsnFunctionStepResult::Step);
         }
     }
-    let value = state.registers[*lhs]
-        .get_value()
-        .exec_concat(state.registers[*rhs].get_value())?;
+    let value = state.registers[*lhs].get_value().exec_concat(
+        state.registers[*rhs].get_value(),
+        connection.dialect().concat_of_blobs_is_blob(),
+    )?;
     state.registers[*dest].set_value(value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
