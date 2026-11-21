@@ -832,7 +832,9 @@ mod tests {
         let Value::Blob(blob) = &arr else {
             panic!("Expected Blob");
         };
-        let text = serialize_array_from_blob(blob, &crate::SqliteDialect).unwrap();
+        let text =
+            serialize_array_from_blob(blob, &crate::dialect::cannot_parse::DialectThatCannotParse)
+                .unwrap();
         assert_eq!(text, r#"{1,hello,NULL,"X'6162'"}"#);
     }
 
