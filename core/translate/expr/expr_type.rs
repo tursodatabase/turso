@@ -1348,6 +1348,18 @@ fn reads_only_declared_types(expr: &ast::Expr, env: &TypeEnv) -> bool {
     declared
 }
 
+/// The source of a value read from `column`.
+pub(crate) fn cast_source_of_column_type(column: &Column, schema: &Schema) -> CastSource {
+    if column.ty_str.is_empty() {
+        return CastSource::Unnamed;
+    }
+    CastSource::Typed(type_ref_of_name(
+        &column.ty_str,
+        column.array_dimensions(),
+        schema,
+    ))
+}
+
 /// The source of a value that is the result of `expr`, as a dialect sees it.
 /// A parameter has no type of its own, as a string literal has none.
 pub(crate) fn cast_source_of(expr: &ast::Expr, env: &TypeEnv, schema: &Schema) -> CastSource {

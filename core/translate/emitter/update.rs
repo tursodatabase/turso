@@ -136,6 +136,22 @@ pub fn emit_program_for_update(
     let target_tables =
         TableReferences::for_update_target(plan.target_table.clone(), &plan.from_tables);
     let write_set_plan = plan.write_set_plan.take();
+    // The write set select reads the FROM tables, which the write phase no
+    // longer has, so the SET expressions are typed against its tables.
+    let tables_read_by_set_expressions = write_set_plan
+        .as_ref()
+        .map_or(&target_tables, |plan| &plan.select.table_references);
+    let target_is_strict = matches!(&target_table.table, Table::BTree(btree) if btree.is_strict);
+    let set_value_sources = if target_is_strict {
+        set_value_sources(
+            target_table.table.columns().len(),
+            tables_read_by_set_expressions,
+            plan.set_clauses.iter().map(|c| (c.column_index, &*c.expr)),
+            resolver,
+        )
+    } else {
+        Vec::new()
+    };
     let temp_cursor_id = match write_set_plan.as_ref() {
         Some(plan) => {
             let QueryDestination::EphemeralTable { cursor_id, .. } = &plan.select.query_destination
@@ -453,6 +469,7 @@ pub fn emit_program_for_update(
         connection,
         &mut write_phase_tables,
         &plan.set_clauses,
+        &set_value_sources,
         plan.cdc_update_alter_statement.as_deref(),
         &plan.indexes_to_update,
         plan.returning.as_ref(),
@@ -1108,6 +1125,26 @@ fn emit_deferred_notnull_checks<'a>(
     Ok(())
 }
 
+/// The source of the new value of each column of a table with `column_count`
+/// columns. `set_values` gives the column index and the expression of each
+/// SET item, and `table_references` has the tables the expressions read.
+pub(crate) fn set_value_sources<'e>(
+    column_count: usize,
+    table_references: &TableReferences,
+    set_values: impl Iterator<Item = (usize, &'e ast::Expr)>,
+    resolver: &Resolver,
+) -> Vec<crate::dialect::CastSource> {
+    let env = crate::translate::expr::expr_type::TypeEnv::new(Some(table_references), resolver);
+    let mut sources = vec![crate::dialect::CastSource::Unnamed; column_count];
+    for (column_index, expr) in set_values {
+        if let Some(source) = sources.get_mut(column_index) {
+            *source =
+                crate::translate::expr::expr_type::cast_source_of(expr, &env, resolver.schema());
+        }
+    }
+    sources
+}
+
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
 /// Emits the instructions for the UPDATE loop.
@@ -1124,6 +1161,7 @@ fn emit_update_insns<'a>(
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
     set_clauses: &[UpdateSetClause],
+    set_value_sources: &[crate::dialect::CastSource],
     cdc_update_alter_statement: Option<&str>,
     indexes_to_update: &[Arc<Index>],
     returning: Option<&'a Vec<ResultSetColumn>>,
@@ -1487,6 +1525,7 @@ fn emit_update_insns<'a>(
                     start,
                     &layout,
                     StatementValues::Only(&user_value_columns),
+                    set_value_sources,
                 )?;
                 // NEW row values are already in 'start' registers.
                 // If the rowid is being updated (INTEGER PRIMARY KEY in SET clause),
@@ -1650,6 +1689,7 @@ fn emit_update_insns<'a>(
             start,
             &layout,
             StatementValues::Only(&user_value_columns),
+            set_value_sources,
         )?;
         if notnull_checks_follow_type_check {
             // Before the generated columns are computed again below, so that

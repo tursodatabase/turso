@@ -2528,25 +2528,39 @@ fn emit_rewrite_table_rows(
             // Computed again for each row, so that e.g. gen_random_uuid() gives
             // each row its own value. Not hoisted because the encode below
             // rewrites the register in place.
-            if source_column_by_schema_idx[column_index].is_none() {
-                let default = rewritten_table.columns()[column_index]
-                    .default
-                    .as_deref()
-                    .expect("a rewritten column without a source value must have a default");
-                translate_expr_no_constant_opt(
-                    program,
-                    None,
-                    default,
-                    layout.to_register(base_dest_reg, column_index),
-                    resolver,
-                    NoConstantOptReason::CustomTypeEncode,
-                )?;
-            }
+            let value_source = match source_column_by_schema_idx[column_index] {
+                Some(source_column_idx) => {
+                    crate::translate::expr::expr_type::cast_source_of_column_type(
+                        &original_btree.columns()[source_column_idx],
+                        resolver.schema(),
+                    )
+                }
+                None => {
+                    let default = rewritten_table.columns()[column_index]
+                        .default
+                        .as_deref()
+                        .expect("a rewritten column without a source value must have a default");
+                    translate_expr_no_constant_opt(
+                        program,
+                        None,
+                        default,
+                        layout.to_register(base_dest_reg, column_index),
+                        resolver,
+                        NoConstantOptReason::CustomTypeEncode,
+                    )?;
+                    crate::translate::expr::expr_type::cast_source_of(
+                        default,
+                        &crate::translate::expr::expr_type::TypeEnv::new(None, resolver),
+                        resolver.schema(),
+                    )
+                }
+            };
             if rewritten_table.is_strict {
                 emit_strict_column_conversion(
                     program,
                     resolver,
                     column_index,
+                    value_source,
                     &original_btree,
                     rewritten_table,
                     base_dest_reg,
@@ -2586,11 +2600,14 @@ fn emit_rewrite_table_rows(
 /// Convert the stored value of the altered column the same way INSERT
 /// converts a new value: decode it with the old custom type (if any), check it
 /// against the new type, encode it with the new custom type (if any), and check
-/// the encoded value against the storage type.
+/// the encoded value against the storage type. `value_source` is the source of
+/// the value before the conversion.
+#[allow(clippy::too_many_arguments)]
 fn emit_strict_column_conversion(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     column_index: usize,
+    value_source: crate::dialect::CastSource,
     original_table: &BTreeTable,
     rewritten_table: &BTreeTable,
     start_reg: usize,
@@ -2619,6 +2636,8 @@ fn emit_strict_column_conversion(
             reg: layout.to_register(start_reg, column_index),
         });
     }
+    let mut sources = vec![crate::dialect::CastSource::Unnamed; rewritten_table.columns().len()];
+    sources[column_index] = value_source;
     crate::translate::emitter::new_values::emit_input_conversion(
         program,
         resolver,
@@ -2626,6 +2645,7 @@ fn emit_strict_column_conversion(
         start_reg,
         layout,
         crate::translate::emitter::new_values::StatementValues::Only(&column_mask),
+        &sources,
     )?;
     crate::translate::expr::emit_custom_type_encode_columns(
         program,
