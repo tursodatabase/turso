@@ -253,6 +253,21 @@ test check_constraint_strict_type_violation {
 expect error {
 }
 
+# A CAST in a CHECK of a STRICT table gives the type it gives in a query: a
+# number for DECIMAL(10,2), text for NVARCHAR(3).
+@requires strict "uses STRICT tables"
+test check_constraint_strict_cast_to_type_name_with_affinity {
+    CREATE TABLE t(
+        a TEXT CHECK (CAST(a AS DECIMAL(10,2)) > 0),
+        b TEXT CHECK (CAST(b AS NVARCHAR(3)) > 'a')
+    ) STRICT;
+    INSERT INTO t VALUES ('5', 'b');
+    SELECT a, b FROM t;
+}
+expect {
+    5|b
+}
+
 @cross-check-integrity
 test check_constraint_strict_numeric_string_coercion {
     CREATE TABLE employees (

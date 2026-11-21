@@ -986,19 +986,27 @@ fn custom_type_cast_chain(
     if type_name.array_dimensions > 0 {
         return Ok(None);
     }
-    let Some(mut resolved) =
-        schema.resolve_type_unchecked(&crate::util::dequote(&type_name.name))?
-    else {
+    let Some(type_def) = custom_cast_type_def(type_name, schema) else {
         return Ok(None);
     };
-    if resolved.is_domain() {
-        return Ok(Some(resolved));
-    }
-    if is_sqlite_cast_to(resolved.leaf(), type_name) {
+    let Some(mut resolved) = schema.resolve_type_unchecked(&type_def.name)? else {
         return Ok(None);
+    };
+    if !resolved.is_domain() {
+        resolved.chain.truncate(1);
     }
-    resolved.chain.truncate(1);
     Ok(Some(resolved))
+}
+
+/// The custom type a CAST to `type_name` converts to, or None when the CAST is
+/// SQLite's CAST: the name is not a custom type, or is one whose arguments the
+/// CAST doesn't give (see `is_sqlite_cast_to`).
+pub(crate) fn custom_cast_type_def<'a>(
+    type_name: &ast::Type,
+    schema: &'a crate::schema::Schema,
+) -> Option<&'a Arc<TypeDef>> {
+    let type_def = schema.get_type_def_unchecked(&crate::util::dequote(&type_name.name))?;
+    (!is_sqlite_cast_to(type_def, type_name)).then_some(type_def)
 }
 
 /// Whether a CAST to `type_def`, written as `type_name`, is SQLite's CAST
