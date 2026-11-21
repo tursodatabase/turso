@@ -7,6 +7,8 @@ mod assert_details;
 mod assertions;
 mod attach;
 mod blob_io;
+#[cfg(feature = "unstable-btree-api")]
+mod btree_cursor_api;
 mod checkpoint_crash_atomicity;
 mod checkpoint_stale_page_size;
 mod checkpoint_write_failure;

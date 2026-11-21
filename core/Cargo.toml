@@ -37,6 +37,9 @@ conn_raw_api = []
 # version, pending running CRC) and construct LogRecords. Off by default;
 # production builds carry zero instrumentation.
 aristo-instr = ["aristo/aristo_instrument"]
+# Exposes `storage::btree` (BTreeCursor, CursorTrait) for direct B-tree access.
+# No stability guarantee.
+unstable-btree-api = []
 fs = ["turso_ext/vfs"]
 json = []
 uuid = []
