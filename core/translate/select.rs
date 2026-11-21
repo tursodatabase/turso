@@ -909,12 +909,7 @@ fn prepare_one_select_plan(
             Ok(plan)
         }
         ast::OneSelect::Values(mut values) => {
-            if !order_by.is_empty() {
-                crate::bail_parse_error!("ORDER BY clause is not allowed with VALUES clause");
-            }
-            if limit.is_some() {
-                crate::bail_parse_error!("LIMIT clause is not allowed with VALUES clause");
-            }
+            check_values_has_no_order_by_or_limit(&order_by, limit.as_ref())?;
             let len = values[0].len();
             if len > crate::types::MAX_COLUMN {
                 crate::bail_parse_error!("too many columns in result set");
@@ -998,6 +993,21 @@ fn prepare_one_select_plan(
             Ok(plan)
         }
     }
+}
+
+/// A VALUES list cannot have ORDER BY or LIMIT; SQLite rejects both as a
+/// syntax error.
+pub(super) fn check_values_has_no_order_by_or_limit(
+    order_by: &[ast::SortedColumn],
+    limit: Option<&ast::Limit>,
+) -> Result<()> {
+    if !order_by.is_empty() {
+        crate::bail_parse_error!("ORDER BY clause is not allowed with VALUES clause");
+    }
+    if limit.is_some() {
+        crate::bail_parse_error!("LIMIT clause is not allowed with VALUES clause");
+    }
+    Ok(())
 }
 
 /// Whether a result column calls an aggregate, also one inside a window function

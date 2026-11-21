@@ -7,6 +7,7 @@ use crate::translate::emitter::RegisterColumn;
 use crate::translate::emitter::{
     emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
 };
+use crate::translate::select::check_values_has_no_order_by_or_limit;
 use crate::translate::update::bind_set_expr;
 use crate::translate::{roles, row_security};
 use crate::turso_debug_assert;
@@ -3613,12 +3614,18 @@ fn translate_virtual_table_insert(
     if virtual_table.readonly() && !allow_dbpage_write {
         crate::bail_constraint_error!("Table is read-only: {}", virtual_table.name);
     }
-    let (num_values, value) = match &mut body {
+    let (num_values, rows) = match &mut body {
+        InsertBody::Select(select, None) if !select.body.compounds.is_empty() => {
+            crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT")
+        }
         InsertBody::Select(select, None) => match &mut select.body.select {
-            OneSelect::Values(values) => (values[0].len(), values.pop().unwrap()),
+            OneSelect::Values(values) => {
+                check_values_has_no_order_by_or_limit(&select.order_by, select.limit.as_ref())?;
+                (values[0].len(), std::mem::take(values))
+            }
             _ => crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT"),
         },
-        InsertBody::DefaultValues => (0, vec![]),
+        InsertBody::DefaultValues => (0, vec![vec![]]),
         _ => crate::bail_parse_error!("Unsupported INSERT body for virtual tables"),
     };
     let table = Table::Virtual(virtual_table.clone());
@@ -3641,16 +3648,18 @@ fn translate_virtual_table_insert(
      * argv[2..] = column values
      * */
     let insertion = build_insertion(program, &table, &columns, num_values, true)?;
-
-    translate_rows_single(program, &value, &insertion, resolver, false)?;
     let conflict_action = on_conflict.as_ref().map(|c| c.bit_value()).unwrap_or(0) as u16;
 
-    program.emit_insn(Insn::VUpdate {
-        cursor_id,
-        arg_count: insertion.col_mappings.len() + 2, // +1 for NULL, +1 for rowid
-        start_reg: registers_start,
-        conflict_action,
-    });
+    // Like SQLite, call the module's update once for each VALUES row.
+    for row in &rows {
+        translate_rows_single(program, row, &insertion, resolver, false)?;
+        program.emit_insn(Insn::VUpdate {
+            cursor_id,
+            arg_count: insertion.col_mappings.len() + 2, // +1 for NULL, +1 for rowid
+            start_reg: registers_start,
+            conflict_action,
+        });
+    }
 
     program.emit_insn(Insn::Close { cursor_id });
 
