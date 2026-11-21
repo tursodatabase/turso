@@ -542,3 +542,60 @@ test outer-update-replace-overrides-trigger-ignore {
 expect {
     1|updated
 }
+
+# Test: OR IGNORE of the outer statement does not replace an upsert in the trigger body
+@cross-check-integrity
+test outer-ignore-keeps-trigger-upsert-do-update {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, n INTEGER NOT NULL);
+    CREATE TABLE k(a TEXT PRIMARY KEY);
+    CREATE TRIGGER k_ai AFTER INSERT ON k BEGIN
+      INSERT INTO u VALUES(1,1) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    END;
+    INSERT OR IGNORE INTO k VALUES('a');
+    INSERT OR IGNORE INTO k VALUES('b');
+    INSERT OR IGNORE INTO k VALUES('c');
+    INSERT OR IGNORE INTO k VALUES('d');
+    SELECT n FROM u;
+}
+expect {
+    4
+}
+
+# Test: OR IGNORE of a statement in a trigger body carries into the next trigger's upsert
+@cross-check-integrity
+test nested-trigger-ignore-keeps-upsert-do-update {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, n INTEGER NOT NULL);
+    CREATE TABLE k(a TEXT PRIMARY KEY);
+    CREATE TABLE t(a TEXT PRIMARY KEY);
+    CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN
+      INSERT OR IGNORE INTO k VALUES(NEW.a);
+    END;
+    CREATE TRIGGER k_ai AFTER INSERT ON k BEGIN
+      INSERT INTO u VALUES(1,1) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    END;
+    INSERT INTO t VALUES('a'),('b'),('c');
+    INSERT INTO t VALUES('d');
+    SELECT n FROM u;
+}
+expect {
+    4
+}
+
+# Test: OR REPLACE of the outer statement applies to the constraints that the trigger's upsert does not target
+@cross-check-integrity
+test outer-replace-applies-to-trigger-upsert-other-constraints {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, n INTEGER NOT NULL, b UNIQUE);
+    CREATE TABLE k(id INTEGER, b TEXT);
+    CREATE TRIGGER k_ai AFTER INSERT ON k BEGIN
+      INSERT INTO u VALUES(NEW.id,0,NEW.b) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    END;
+    INSERT OR REPLACE INTO k VALUES(1,'x');
+    INSERT OR REPLACE INTO k VALUES(2,'y');
+    INSERT OR REPLACE INTO k VALUES(2,'z');
+    INSERT OR REPLACE INTO k VALUES(3,'x');
+    SELECT * FROM u ORDER BY id;
+}
+expect {
+    2|1|y
+    3|0|x
+}
