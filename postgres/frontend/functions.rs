@@ -179,8 +179,12 @@ impl TruncUnit {
         let lowered = name.to_ascii_lowercase();
         let key = &lowered.as_bytes()[..lowered.len().min(10)];
         Some(match key {
-            b"microsecon" | b"us" | b"usec" | b"useconds" | b"usecs" => Self::Microseconds,
-            b"millisecon" | b"ms" | b"msec" | b"mseconds" | b"msecs" => Self::Milliseconds,
+            b"microsecon" | b"us" | b"usec" | b"usecond" | b"useconds" | b"usecs" => {
+                Self::Microseconds
+            }
+            b"millisecon" | b"ms" | b"msec" | b"msecond" | b"mseconds" | b"msecs" => {
+                Self::Milliseconds
+            }
             b"second" | b"seconds" | b"s" | b"sec" | b"secs" => Self::Second,
             b"minute" | b"minutes" | b"m" | b"min" | b"mins" => Self::Minute,
             b"hour" | b"hours" | b"h" | b"hr" | b"hrs" => Self::Hour,
