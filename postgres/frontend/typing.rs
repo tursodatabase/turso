@@ -38,9 +38,21 @@ pub(crate) fn function_result_type(
     })
 }
 
-/// PostgreSQL has no arithmetic or bitwise operator on a boolean.
-pub(crate) fn rejects_operator(_op: &str, operands: &dyn Fn() -> Vec<OperandType>) -> bool {
-    operands()
+/// PostgreSQL has no arithmetic or bitwise operator on a boolean, and no
+/// comparison of a text with a number. A string literal or a parameter is not
+/// a text: its type comes from the other operand.
+pub(crate) fn rejects_operator(op: &str, operands: &dyn Fn() -> Vec<OperandType>) -> bool {
+    let operands = operands();
+    if matches!(op, "=" | "<>" | "<" | "<=" | ">" | ">=") {
+        return match operands.as_slice() {
+            [left, right] => {
+                (is_text(left) && is_numeric_operand(right))
+                    || (is_numeric_operand(left) && is_text(right))
+            }
+            _ => false,
+        };
+    }
+    operands
         .iter()
         .any(|operand| matches!(operand, OperandType::Boolean))
 }
@@ -67,6 +79,25 @@ pub(crate) fn uses_sqlite_arithmetic(op: &str, operands: &dyn Fn() -> Vec<Operan
 
 fn is_custom(operand: &OperandType, names: &[&str]) -> bool {
     matches!(operand, OperandType::Custom(type_def) if names.contains(&type_def.name.as_str()))
+}
+
+fn is_text(operand: &OperandType) -> bool {
+    match operand {
+        OperandType::Text => true,
+        OperandType::Custom(type_def) => type_def.name == "varchar",
+        _ => false,
+    }
+}
+
+fn is_numeric_operand(operand: &OperandType) -> bool {
+    match operand {
+        OperandType::Integer | OperandType::Real => true,
+        OperandType::Custom(type_def) => matches!(
+            type_def.name.as_str(),
+            "smallint" | "int4" | "bigint" | "float4" | "numeric"
+        ),
+        _ => false,
+    }
 }
 
 /// The type PostgreSQL gives values that meet in a CASE, coalesce or UNION,

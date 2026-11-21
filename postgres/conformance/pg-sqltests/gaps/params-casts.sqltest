@@ -418,7 +418,6 @@ expect {
 }
 
 # A-61: text column = int literal (PG: no operator)
-@compat-gap "operator:text = int4"
 test text-column-int-literal-pg-no-operator {
     CREATE TABLE t (s text);
     INSERT INTO t VALUES ('1');
@@ -426,9 +425,6 @@ test text-column-int-literal-pg-no-operator {
 }
 @sqlstate 42883
 expect error {}
-expect @tursopg {
-    1
-}
 
 # A-62: insert '42' text literal into int column
 @setup t_id
