@@ -9,8 +9,9 @@ use turso_core::Connection;
 // FIXME: three places that do not know about each other say what a type
 // name is:
 //
-// - the built-in lists of turso_pg_parser (`BASE_TYPES`, `PSEUDO_TYPES` and
-//   `POLYMORPHIC_TYPES` in create_function.rs),
+// - the built-in lists of turso_pg_parser (`BASE_TYPES`,
+//   `BASE_TYPES_WITHOUT_ARRAYS`, `PSEUDO_TYPES` and `POLYMORPHIC_TYPES` in
+//   create_function.rs),
 // - the custom type registry (`get_type_def_unchecked`),
 // - the relations of a schema (`relation_kind`), which give the row types.
 //

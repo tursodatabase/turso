@@ -612,7 +612,7 @@ pub(crate) fn builtin_type_name(type_name: &TypeName) -> Result<Option<String>, 
     })
 }
 
-// FIXME: the three lists that follow are written by hand, and they must
+// FIXME: the four lists that follow are written by hand, and they must
 // follow the PostgreSQL version of pg_query. They are also one of three
 // places that say what a type name is. The FIXME in
 // postgres/frontend/pg_type.rs gives the plan for one type lookup.
