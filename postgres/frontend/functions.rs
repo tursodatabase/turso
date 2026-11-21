@@ -3,7 +3,7 @@ use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{DateTime, NaiveDateTime};
-use std::fmt;
+use std::{borrow::Cow, fmt};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::security::roles::RoleId;
 
@@ -51,15 +51,48 @@ macro_rules! scalar_functions {
 
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     let options = register_scalar_functions(options);
-    options.extension_function(
-        pg_scalar_function(
-            "array_to_json",
-            FunctionArity::OneOf(&[1, 2]),
-            true,
-            |_, args| exec_array_to_json(args),
+    options
+        .extension_function(
+            pg_scalar_function(
+                "array_to_json",
+                FunctionArity::OneOf(&[1, 2]),
+                true,
+                |_, args| exec_array_to_json(args),
+            )
+            .receiving_argument_types(),
         )
-        .receiving_argument_types(),
-    )
+        // These take text arguments. They get the argument types because a
+        // number such as 5 and an untyped bind parameter such as '5' are both
+        // stored as integers, and only the type tells that PostgreSQL refuses
+        // the first.
+        .extension_function(
+            pg_scalar_function("quote_ident", FunctionArity::Exact(1), true, |_, args| {
+                Ok(text_arg("quote_ident", args, 0)?
+                    .map(|name| turso_pg_parser::quote_identifier(&name)))
+            })
+            .receiving_argument_types(),
+        )
+        .extension_function(
+            pg_scalar_function(
+                "to_char",
+                FunctionArity::Exact(2),
+                true,
+                |_, args| match text_arg("to_char", args, 1)? {
+                    Some(format) => exec_to_char(args[0].get_value(), &format),
+                    None => Ok(None),
+                },
+            )
+            .receiving_argument_types(),
+        )
+        .extension_function(
+            pg_scalar_function(
+                "pg_input_is_valid",
+                FunctionArity::Exact(2),
+                true,
+                |_, args| exec_pg_input_is_valid(args),
+            )
+            .receiving_argument_types(),
+        )
 }
 
 fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
@@ -78,10 +111,6 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         | "pg_get_function_arguments"
         | "pg_get_statisticsobjdef_columns"(FunctionArity::Exact(1), true) => None::<String>,
         "pg_relation_is_publishable"(FunctionArity::Exact(1), true) => None::<Boolean>,
-        "quote_ident"(FunctionArity::Exact(1), true) => match args[0].get_value() {
-            Value::Null => None,
-            _ => Some(turso_pg_parser::quote_identifier(&text_arg(args, 0))),
-        },
         "quote_literal"(FunctionArity::Exact(1), true) => {
             exec_quote_literal(args[0].get_value())
         },
@@ -96,14 +125,6 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             .and_then(|oid| crate::catalog::pg_get_indexdef(connection, oid)),
         "pg_get_triggerdef"(FunctionArity::OneOf(&[1, 2]), false) => None::<String>,
         "pg_get_expr"(FunctionArity::OneOf(&[2, 3]), true) => exec_pg_get_expr(args)?,
-        "to_char"(FunctionArity::Exact(2), true) => {
-            // to_char is strict: a NULL argument gives NULL for every argument type.
-            if args.iter().any(|arg| matches!(arg.get_value(), Value::Null)) {
-                None
-            } else {
-                exec_to_char(args[0].get_value(), &text_arg(args, 1))?
-            }
-        },
         // Registered so that the core time extension's to_timestamp, which
         // returns a blob, never answers a PostgreSQL query.
         "to_timestamp"(FunctionArity::OneOf(&[1, 2]), true) => Err::<Timestamptz, _>(
@@ -112,9 +133,6 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
                 "to_timestamp is not supported", None,
             )
         )?,
-        "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
-            exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))
-        },
         "int8_out_of_range"(FunctionArity::Exact(0), false) => Err::<i64, _>(sqlstate_error(
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             "bigint out of range", None,
@@ -491,11 +509,62 @@ fn parse_oid(text: &str) -> Result<i64> {
     Ok(i64::from(oid))
 }
 
-fn text_arg(args: &[Register], i: usize) -> String {
-    match args.get(i).map(Register::get_value) {
-        Some(Value::Text(t)) => t.as_str().to_string(),
-        _ => String::new(),
+/// A text argument of the function `name`, or `None` for NULL. The function
+/// receives its argument types after its arguments. A text value is read as
+/// it is. A number is read as its text when its declared type is a string
+/// type, because PostgreSQL text can reach the function as a number: an
+/// untyped bind parameter such as '12' and `->>` of a JSON number are both
+/// stored as numbers. Any other number, and a blob, is an error, as PostgreSQL
+/// has no function of that name for it.
+fn text_arg<'a>(name: &str, args: &'a [Register], i: usize) -> Result<Option<Cow<'a, str>>> {
+    assert!(
+        args.len() % 2 == 0,
+        "{name} must be registered with receiving_argument_types()"
+    );
+    let (values, types) = args.split_at(args.len() / 2);
+    let value = values[i].get_value();
+    // Text and NULL are not checked against the declared type, because the
+    // declared type of a column of a VALUES list is integer whatever the
+    // column holds. Giving the column its real type makes the SELECT that the
+    // PostgreSQL frontend wraps around `(VALUES ...) a(e)` decode an array
+    // column to text before the outer query reads it, as it already does for
+    // `(SELECT ARRAY[...]) a(e)`.
+    let is_text = match value {
+        Value::Text(_) | Value::Null => true,
+        Value::Numeric(_) => is_text_argument_type(&types[i].get_value().to_string()),
+        Value::Blob(_) => false,
+    };
+    if !is_text {
+        let arg_types: Vec<String> = types
+            .iter()
+            .map(|ty| match ty.get_value().to_string().as_str() {
+                "null" | "any" => "unknown".to_string(),
+                "blob" => "bytea".to_string(),
+                ty => ty.to_string(),
+            })
+            .collect();
+        let arg_types: Vec<&str> = arg_types.iter().map(String::as_str).collect();
+        return Err(undefined_function(name, &arg_types));
     }
+    Ok(value.cast_text_ref())
+}
+
+/// Whether an argument of the declared type `type_name` can be passed where
+/// PostgreSQL expects text. `any` is a value whose type is not known when the
+/// statement is translated, such as the result of `->>`.
+fn is_text_argument_type(type_name: &str) -> bool {
+    matches!(
+        type_name.to_ascii_lowercase().as_str(),
+        "text"
+            | "varchar"
+            | "character varying"
+            | "bpchar"
+            | "char"
+            | "character"
+            | "name"
+            | "any"
+            | "unknown"
+    )
 }
 
 fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<String> {
@@ -632,7 +701,7 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
         Value::Blob(_) => return Err(LimboError::InvalidArgument("datatype mismatch".to_string())),
     };
     if value < 0 {
-        let clause = text_arg(args, 1);
+        let clause = args[1].get_value().to_string();
         let sqlstate = if clause == "OFFSET" {
             SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE
         } else {
@@ -1376,13 +1445,12 @@ fn to_char_not_supported() -> LimboError {
 
 /// pg_input_is_valid(text, type) → boolean
 /// Returns true if the text is valid input for the given type.
-fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Option<Boolean> {
-    let s = match input {
-        Value::Text(t) => t.as_str().to_string(),
-        Value::Null => return None,
-        v => v.to_string(),
-    };
-    Some(Boolean(validate_pg_input(&s, type_name).is_none()))
+fn exec_pg_input_is_valid(args: &[Register]) -> Result<Option<Boolean>> {
+    let input = text_arg("pg_input_is_valid", args, 0)?;
+    let type_name = text_arg("pg_input_is_valid", args, 1)?;
+    Ok(input
+        .zip(type_name)
+        .map(|(input, type_name)| Boolean(validate_pg_input(&input, &type_name).is_none())))
 }
 
 fn exec_pg_get_expr(args: &[Register]) -> Result<Option<String>> {
