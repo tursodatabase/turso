@@ -15,7 +15,7 @@ public enum TursoRemoteEncryptionCipher
 
 public sealed class TursoRemoteEncryptionOptions
 {
-    public required string Key { get; init; }
+    public string? Key { get; init; }
     public required TursoRemoteEncryptionCipher Cipher { get; init; }
 
     internal int ReservedBytes => Cipher switch
@@ -46,9 +46,10 @@ public sealed class TursoRemoteEncryptionOptions
         _ => throw new ArgumentOutOfRangeException(nameof(Cipher), Cipher, null),
     };
 
-    internal void Validate()
+    internal void Validate(bool requireKey = true)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(Key);
+        if (requireKey || Key is not null)
+            ArgumentException.ThrowIfNullOrWhiteSpace(Key);
         _ = ReservedBytes;
     }
 
@@ -114,6 +115,8 @@ public sealed class TursoSyncDatabaseOptions
     public bool BootstrapIfEmpty { get; init; } = true;
     public TursoPartialSyncOptions? PartialSync { get; init; }
     public TursoRemoteEncryptionOptions? RemoteEncryption { get; init; }
+    /// <summary>Hex local key, using RemoteEncryption.Cipher. Never sent to the server.</summary>
+    public string? LocalEncryptionKey { get; init; }
     public long? PushOperationsThreshold { get; init; }
     public long? PullBytesThreshold { get; init; }
     public bool ForceLogicalMvccPull { get; init; }
@@ -148,6 +151,12 @@ public sealed class TursoSyncDatabaseOptions
             Password = string.Empty,
         };
         return builder.Uri;
+    }
+
+    internal static void ValidateConnectionStringKey(string keyword, object? value)
+    {
+        if ((keyword is "Local Encryption Key" or "Remote Encryption Key") && value is string key)
+            ArgumentException.ThrowIfNullOrWhiteSpace(key, keyword);
     }
 
     internal void Validate()
@@ -192,7 +201,15 @@ public sealed class TursoSyncDatabaseOptions
                 "Partial sync on Windows requires native sparse-file hole detection that is not yet implemented.");
         }
 
-        RemoteEncryption?.Validate();
+        if (LocalEncryptionKey is not null)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(LocalEncryptionKey);
+            if (RemoteEncryption is null)
+                throw new InvalidOperationException("LocalEncryptionKey requires RemoteEncryption.Cipher.");
+            if (RemoteEncryption.Cipher == TursoRemoteEncryptionCipher.ChaCha20Poly1305)
+                throw new InvalidOperationException("ChaCha20 is not supported for local native encryption.");
+        }
+        RemoteEncryption?.Validate(requireKey: LocalEncryptionKey is null);
     }
 
     private static void ValidateNativeSize(long? value, string parameterName)
