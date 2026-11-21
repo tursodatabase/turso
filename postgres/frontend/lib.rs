@@ -8,6 +8,7 @@ mod deparse;
 mod descriptions;
 mod error;
 mod functions;
+mod json_object;
 mod open;
 mod options;
 mod pg_type;
