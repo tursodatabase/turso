@@ -1,12 +1,14 @@
 mod acl;
 mod auth_functions;
 mod auth_members;
+mod casts;
 mod catalog;
 mod classes;
 mod copy;
 mod deparse;
 mod descriptions;
 mod error;
+mod float_text;
 mod functions;
 mod open;
 mod options;

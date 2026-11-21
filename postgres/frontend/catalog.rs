@@ -251,6 +251,15 @@ impl Dialect for PostgresDialect {
         turso_core::dialect::resolve_builtin_function(name, arg_count)
     }
 
+    fn plan_cast(
+        &self,
+        source: &dyn Fn() -> turso_core::dialect::OperandType,
+        target: &turso_parser::ast::Type,
+        context: turso_core::dialect::CastContext,
+    ) -> Result<Option<turso_core::dialect::CastPlan>> {
+        crate::casts::plan_cast(source, target, context)
+    }
+
     fn requires_custom_types(&self) -> bool {
         true
     }

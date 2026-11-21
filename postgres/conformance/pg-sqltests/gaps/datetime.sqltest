@@ -159,15 +159,11 @@ expect @tursopg {
     0
 }
 
-@compat-gap "cast:timestamptz -> int8"
 test timestamptz-cast-to-bigint {
     SELECT timestamptz '2026-01-31Z'::bigint;
 }
 @sqlstate 42846
 expect error {}
-expect @tursopg {
-    2026
-}
 
 @compat-gap "type:timestamptz"
 test timestamptz-offset-out-of-range {

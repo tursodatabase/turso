@@ -468,7 +468,7 @@ expect {
     true|1.50|2026-10-08 12:00:00+00|{"y": 2}|{a}|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
 expect @tursopg {
-    1|1.50|2026-10-08 12:00:00|{"y":2}|a|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    true|1.50|2026-10-08 12:00:00|{"y":2}|a|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
 
 # C-43: result column type of bool comparison via pg_typeof

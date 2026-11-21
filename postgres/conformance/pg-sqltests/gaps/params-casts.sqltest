@@ -20,73 +20,49 @@ setup t_b {
 }
 
 # A-01: bool literal casts, true forms
-@compat-gap "type:bool"
 test bool-literal-casts-true-forms {
     SELECT 't'::boolean, 'true'::boolean, 'yes'::boolean, 'on'::boolean, '1'::boolean, 'TRUE'::boolean, 'y'::boolean;
 }
 expect {
     t|t|t|t|t|t|t
 }
-expect @tursopg {
-    0|0|0|0|1|0|0
-}
 
 # A-02: bool literal casts, false forms
-@compat-gap "type:bool"
 test bool-literal-casts-false-forms {
     SELECT 'f'::boolean, 'false'::boolean, 'no'::boolean, 'off'::boolean, '0'::boolean;
 }
 expect {
     f|f|f|f|f
 }
-expect @tursopg {
-    0|0|0|0|0
-}
 
 # A-04: bool invalid literal
-@compat-gap "type:bool"
 test bool-invalid-literal {
     SELECT 'maybe'::boolean;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    0
-}
 
 # A-06: CAST(... AS boolean) form
-@compat-gap "type:bool"
 test cast-as-boolean-form {
     SELECT CAST('true' AS boolean), CAST(1 AS boolean), CAST(0 AS boolean);
 }
 expect {
     t|t|f
 }
-expect @tursopg {
-    0|1|0
-}
 
 # A-07: int4 overflow literal cast
-@compat-gap "type:int4"
 test int4-overflow-literal-cast {
     SELECT '2147483648'::int4;
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-    2147483648
-}
 
 # A-08: int2 overflow literal cast
-@compat-gap "type:int2"
 test int2-overflow-literal-cast {
     SELECT '40000'::smallint;
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-    40000
-}
 
 # A-09: int8 overflow arithmetic
 @compat-gap "operator:int8 + int4"
@@ -111,37 +87,25 @@ expect @tursopg {
 }
 
 # A-11: invalid int literal cast
-@compat-gap "type:int4"
 test invalid-int-literal-cast {
     SELECT 'abc'::integer;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    0
-}
 
 # A-13: '1.5'::int (text) is invalid
-@compat-gap "type:int4"
 test decimal-text-cast-to-int4-is-invalid {
     SELECT '1.5'::integer;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    1
-}
 
 # A-14: numeric->int rounds half away from zero
-@compat-gap "cast:numeric -> int4"
 test numeric-int-rounds-half-away-from-zero {
     SELECT 1.5::integer, 2.5::integer, (-2.5)::integer;
 }
 expect {
     2|3|-3
-}
-expect @tursopg {
-    1|2|-2
 }
 
 # A-16: int with surrounding spaces
@@ -153,38 +117,26 @@ expect {
 }
 
 # A-17: invalid uuid literal cast
-@compat-gap "type:uuid"
 test invalid-uuid-literal-cast {
     SELECT 'nope'::uuid;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    nope
-}
 
 # A-19: uuid uppercase input normalised
-@compat-gap "type:uuid"
 test uuid-uppercase-input-normalised {
     SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid;
 }
 expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
-expect @tursopg {
-    A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11
-}
 
 # A-20: uuid braces / no-hyphen input
-@compat-gap "type:uuid"
 test uuid-braces-no-hyphen-input {
     SELECT '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid, 'a0eebc999c0b4ef8bb6d6bb9bd380a11'::uuid;
 }
 expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
-}
-expect @tursopg {
-    {a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}|a0eebc999c0b4ef8bb6d6bb9bd380a11
 }
 
 # A-21: uuid equality across case
@@ -196,7 +148,7 @@ expect {
     t
 }
 expect @tursopg {
-    0
+    1
 }
 
 # A-22: numeric(10,2) rounding half away from zero

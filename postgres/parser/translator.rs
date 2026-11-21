@@ -3586,7 +3586,7 @@ impl PostgreSQLTranslator {
                 if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
                     expr = Box::new(int8_cast_operand(arg, *expr));
                 }
-                let type_name = pg_type_name_to_ast_type(pg_type_name)?;
+                let type_name = cast_target_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
                     expr,
                     type_name: Some(type_name),
@@ -7654,6 +7654,30 @@ fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types. Other names are kept as
 /// written so that enums and domains resolve to their custom type.
+/// The type of a CAST, with the name of the PostgreSQL type for the types whose
+/// casts the dialect plans.
+fn cast_target_type(type_name: &pg_query::protobuf::TypeName) -> Result<ast::Type, ParseError> {
+    let mut target = pg_type_name_to_ast_type(type_name)?;
+    if target.array_dimensions == 0 {
+        let name = match supported_type_name(type_name)?.to_uppercase().as_str() {
+            "INTEGER" | "INT" | "INT4" => Some("int4"),
+            "SMALLINT" | "INT2" => Some("int2"),
+            "BIGINT" | "INT8" => Some("int8"),
+            "REAL" | "FLOAT4" => Some("float4"),
+            "DOUBLE PRECISION" | "FLOAT8" => Some("float8"),
+            "BOOLEAN" | "BOOL" => Some("bool"),
+            "TEXT" => Some("text"),
+            "UUID" => Some("uuid"),
+            "BYTEA" => Some("bytea"),
+            _ => None,
+        };
+        if let Some(name) = name {
+            target.name = name.to_string();
+        }
+    }
+    Ok(target)
+}
+
 fn pg_type_name_to_ast_type(
     type_name: &pg_query::protobuf::TypeName,
 ) -> Result<ast::Type, ParseError> {
