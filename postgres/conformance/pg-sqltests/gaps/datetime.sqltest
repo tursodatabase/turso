@@ -469,15 +469,12 @@ expect @tursopg {
     2026-01-01 09:00:00
 }
 
-@compat-gap "function:date_trunc"
 test date-trunc-day {
     SELECT date_trunc('day', timestamptz '2026-08-19 13:45:56.789012+00');
 }
 expect {
     2026-08-19 00:00:00+00
 }
-@sqlstate 42883
-expect @tursopg error {}
 
 @compat-gap "function:date_trunc"
 test date-trunc-with-zone {
@@ -486,17 +483,14 @@ test date-trunc-with-zone {
 expect {
     2026-08-18 15:00:00+00
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {}
 
-@compat-gap "function:date_trunc"
 test date-trunc-invalid-field {
     SELECT date_trunc('fortnight', timestamptz '2026-08-19 13:45:56.789012+00');
 }
 @sqlstate 22023
 expect error {}
-@sqlstate 42883
-expect @tursopg error {}
 
 # to_char on a timestamp is refused.
 @compat-gap "function:to_char"
