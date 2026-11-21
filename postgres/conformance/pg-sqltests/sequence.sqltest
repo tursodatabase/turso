@@ -16,6 +16,7 @@ expect {
     1|2
 }
 
+@compat-gap "syntax:create-sequence"
 test create-sequence-with-cache-10 {
     CREATE SEQUENCE cache_ten CACHE 10;
     SELECT nextval('cache_ten');
@@ -30,6 +31,7 @@ expect @tursopg error {
     CACHE 10 \(Turso sequences do not cache values, so CACHE must be 1\) is not supported
 }
 
+@compat-gap "syntax:create-sequence"
 test create-sequence-with-cache-too-large-for-int4 {
     CREATE SEQUENCE cache_large CACHE 9999999999;
     SELECT cache_size FROM pg_sequences WHERE sequencename = 'cache_large';
@@ -58,6 +60,7 @@ expect error {
     CACHE \(-1\) must be greater than zero
 }
 
+@compat-gap "syntax:create-sequence"
 test create-sequence-with-fractional-cache {
     CREATE SEQUENCE cache_fraction CACHE 1.5;
 }
@@ -70,6 +73,7 @@ expect @tursopg error {
     this CACHE value in CREATE SEQUENCE is not supported
 }
 
+@compat-gap "syntax:create-sequence"
 test create-sequence-with-cache-too-large-for-bigint {
     CREATE SEQUENCE cache_huge CACHE 99999999999999999999;
 }
@@ -505,4 +509,84 @@ test drop-column-refuses-when-its-check-constraint-uses-its-sequence-but-not-the
 @sqlstate 2BP01
 expect error {
     cannot drop column id of table zz_unrelated_check because other objects depend on it
+}
+
+test create-sequence-rejects-a-repeated-option {
+    DROP SEQUENCE IF EXISTS zz_seq_twice;
+    CREATE SEQUENCE zz_seq_twice START 1 START 9;
+}
+@sqlstate 42601
+expect error {
+    conflicting or redundant options
+}
+
+test create-sequence-rejects-a-repeated-as-option {
+    DROP SEQUENCE IF EXISTS zz_seq_as_twice;
+    CREATE SEQUENCE zz_seq_as_twice AS integer AS bigint;
+}
+@sqlstate 42601
+expect error {
+    conflicting or redundant options
+}
+
+test create-sequence-as-a-type-that-is-not-an-integer-is-rejected {
+    DROP SEQUENCE IF EXISTS zz_seq_as_text;
+    CREATE SEQUENCE zz_seq_as_text AS text;
+}
+@sqlstate 22023
+expect error {
+    sequence type must be smallint, integer, or bigint
+}
+
+test create-sequence-as-a-type-of-another-schema-does-not-exist {
+    DROP SEQUENCE IF EXISTS zz_seq_as_public;
+    CREATE SEQUENCE zz_seq_as_public AS public.int4;
+}
+@sqlstate 42704
+expect error {
+    type "public.int4" does not exist
+}
+
+test create-sequence-as-a-type-of-a-missing-schema-fails-on-the-schema {
+    CREATE SEQUENCE zz_seq_as_missing_schema AS zz_no_such_schema.int4;
+}
+@sqlstate 3F000
+expect error {
+    schema "zz_no_such_schema" does not exist
+}
+
+test create-sequence-as-a-quoted-type-with-capitals-does-not-exist {
+    DROP SEQUENCE IF EXISTS zz_seq_as_quoted;
+    CREATE SEQUENCE zz_seq_as_quoted AS "INT4";
+}
+@sqlstate 42704
+expect error {
+    type "INT4" does not exist
+}
+
+test create-sequence-reports-a-repeated-option-before-a-bad-cache {
+    DROP SEQUENCE IF EXISTS zz_seq_cache_order;
+    CREATE SEQUENCE zz_seq_cache_order CACHE 0 START 1 START 9;
+}
+@sqlstate 42601
+expect error {
+    conflicting or redundant options
+}
+
+test create-sequence-as-pg-catalog-integer-type {
+    DROP SEQUENCE IF EXISTS zz_seq_as_catalog;
+    CREATE SEQUENCE zz_seq_as_catalog AS pg_catalog.int2;
+    SELECT max_value FROM pg_sequences WHERE sequencename = 'zz_seq_as_catalog';
+}
+expect {
+    32767
+}
+
+test create-sequence-reports-a-repeated-as-before-a-bad-type {
+    DROP SEQUENCE IF EXISTS zz_seq_as_order;
+    CREATE SEQUENCE zz_seq_as_order AS text AS bigint;
+}
+@sqlstate 42601
+expect error {
+    conflicting or redundant options
 }

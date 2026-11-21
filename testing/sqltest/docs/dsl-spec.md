@@ -238,6 +238,7 @@ Decorators appear before the `test` keyword:
 | `@skip-if <condition> "reason"` | Skip this test conditionally based on runtime configuration |
 | `@backend <name>` | Only run this test on the specified backend (`rust`, `cli`, `js`, `tursopg`, `postgres`) |
 | `@requires <capability> "reason"` | Only run if the backend supports the capability |
+| `@compat-gap "<kind>:<object>"` | Mark a known difference from PostgreSQL (see [Compatibility Gaps](#compatibility-gaps)) |
 
 #### Skip Conditions
 
@@ -293,6 +294,92 @@ Rules:
 - A SQLSTATE has 5 characters. Each character is `0-9` or `A-Z`.
 - `@sqlstate` applies only to the next `expect` block, and that block must be an `expect error` block. Put `@sqlstate` before each backend-specific block that must have the code.
 - Only the errors of the `tursopg` and `postgres` backends have a SQLSTATE. On other backends, a test that requires a SQLSTATE fails with an error.
+
+### Compatibility Gaps
+
+A gap test records a known difference between tursopg and PostgreSQL 18. It is a normal test with a `@compat-gap "<kind>:<object>"` decorator. In a `@compat-gap` test, the default `expect` block is the reference engine's answer (PostgreSQL 18 for pg-sqltests, which the run on the `postgres` backend proves), and the `expect @<backend>` override is that backend's current wrong answer. Today the only such backend is `tursopg`:
+
+```sql
+@compat-gap "type:bool"
+test like-returns-bool {
+    SELECT 'ABC' LIKE 'abc', 'abc' LIKE 'a%';
+}
+# PostgreSQL 18's answer
+expect {
+    f|t
+}
+# tursopg's current answer (wrong)
+expect @tursopg {
+    0|1
+}
+```
+
+On the `tursopg` and `tursopg-embedded` backends:
+
+| tursopg output | Result |
+|----------------|--------|
+| matches the `expect @tursopg` block | pass: a known gap |
+| matches the default block | fail: `gap fixed: remove @compat-gap and the expect @tursopg override` |
+| anything else | fail |
+
+An error matches the default block when it has the default block's SQLSTATE; on tursopg the PostgreSQL message does not count. An `expect @tursopg` error block may give the tursopg message, and the tursopg run compares it.
+
+Both failure messages name the two answers, for example `known gap type:bool: tursopg returns 1|0, PostgreSQL returns f|t, recorded tursopg answer 0|1`. `sqltest gaps` lists every gap test with both answers.
+
+On the `postgres` backend the test checks the default block, including the message of an error block. On any other backend a `@compat-gap` test fails with an error: gap tests are for the PostgreSQL frontend suites only.
+
+#### Labels
+
+A label is `<kind>:<object>`. The object is the PostgreSQL object that the fix changes, with its PostgreSQL catalog name. A test has one label.
+
+| Kind | Object | Examples |
+|------|--------|----------|
+| `function` | `pg_proc.proname` | `function:age`, `function:to_char` |
+| `type` | `pg_type.typname`; array types use the `_` name | `type:int4`, `type:timestamptz`, `type:_text` |
+| `operator` | `<left typname> <oprname> <right typname>`, or `<oprname> <typname>` for a prefix operator | `operator:jsonb @> jsonb`, `operator:text ~~* text` |
+| `cast` | `<source typname> -> <target typname>` | `cast:timestamptz -> date` |
+| `syntax` | a statement or clause form | `syntax:on-conflict`, `syntax:catalog` |
+
+A literal such as `'abc'::int4` tests the input of a type, so its label is `type:int4`.
+
+#### Rules
+
+The gap lints run when `run` or `check` gets `--compat-gaps`; `postgres/conformance/Makefile` passes it on every target, and `sqltest gaps` always runs them. Without the flag, a `@compat-gap` test is a parse error, so gap tests can only be in the suites whose commands pass it. With the flag, `sqltest check` and every run reject a file when:
+
+- a `@compat-gap` test has no `expect @tursopg` block, or has an override for another backend;
+- a `@compat-gap` test does not run on PostgreSQL: it has `@skip`, `@skip-if postgres`, `@backend`, or its file has `@skip-file` or `@skip-file-if postgres`;
+- a `@compat-gap` test has an `expect pattern` block;
+- an error block of a `@compat-gap` test has no `@sqlstate`;
+- the two blocks of a `@compat-gap` test can match the same output under the comparison rules: an `expect unordered` block compares row sets, so repeated rows count once, and two error blocks with the same SQLSTATE match the same error, whatever their messages;
+- a label has an unknown kind, or a `cast` label has no ` -> `;
+- an `expect @tursopg` block without `@compat-gap` does more than change the error message: both the PostgreSQL block and the `@tursopg` block must be errors with the same `@sqlstate`.
+
+#### Classes
+
+The runner derives a class from the two blocks:
+
+| Class | PostgreSQL | tursopg |
+|-------|------------|---------|
+| `refused` | rows | an error with any SQLSTATE |
+| `error-mismatch` | error | error with a different SQLSTATE |
+| `accepts-invalid` | error | rows |
+| `wrong` | everything else, for example different rows | |
+
+#### Counts
+
+A pretty-format run prints the gap counts after the summary: by kind, by class and by label. `sqltest gaps <paths>` prints only these tables, as Markdown, without running the tests. A test counts once, however many databases its file declares.
+
+#### Removed Gap Tests
+
+When tursopg gets a gap right, the test stays: the change removes only `@compat-gap` and the `expect @tursopg` block, and the test keeps checking the PostgreSQL answer. `sqltest gap-removals --base <dir> --head <dir>` compares the test files of two trees and fails for each gap test of the base tree that the head tree does not keep. The head tree keeps a gap test when a test with the same file and name either is still a gap test, or is the same test without `@compat-gap` and the `expect @tursopg` block:
+
+- its SQL and setups equal the base test's after trimming whitespace, and its default `expect` block equals the base test's as parsed: the parser removes the indentation of each row, except in an `expect raw` block;
+- its `@skip`, `@skip-if`, `@backend` and `@requires` modifiers, and the file-level skip and requires directives of its file, equal the base test's;
+- it has no `expect @tursopg` block, or an `expect @tursopg` error block with the default block's SQLSTATE that only changes the message.
+
+A deleted test, a renamed test and a test moved to another file count as removed. The command fails when `--base` or `--head` is not a directory, or when the base directory has no `.sqltest` files.
+
+CI runs `make -C postgres/conformance check-gap-removals` on pull requests, with the target branch as the base tree. A change that must delete a gap test fails this check, and a reviewer decides whether it merges.
 
 ### Output Format
 
@@ -585,6 +672,7 @@ decorator       = "@setup" IDENTIFIER NEWLINE
                 | "@skip-if" skip_condition STRING NEWLINE
                 | "@backend" IDENTIFIER NEWLINE
                 | "@requires" capability STRING NEWLINE
+                | "@compat-gap" STRING NEWLINE
 
 skip_condition  = "mvcc"
                 | "sqlite"
@@ -621,6 +709,7 @@ NEWLINE         = '\n'
 1. Test names must be unique within a file
 2. Setup names in `@setup` decorators must reference defined setups
 3. SQL must end with semicolon
+4. A test takes at most one `@compat-gap` decorator; see [Compatibility Gaps](#compatibility-gaps) for its rules
 
 ### Snapshot-Level Validation
 

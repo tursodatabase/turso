@@ -28,8 +28,7 @@ use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::instrument;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
-    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, Index, IndexColumn, Schema,
-    Table,
+    BTreeTable, CheckConstraint, Column, ColumnLayout, Index, IndexColumn, Schema, Table,
 };
 use crate::security::roles::RoleId;
 use crate::translate::expr::expr_type::{column_type, BuiltinType, ExprType};
@@ -54,7 +53,7 @@ use crate::{
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
@@ -183,6 +182,10 @@ pub struct Resolver<'a> {
     /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
+    /// Number of queries that the planner plans one inside the other: subqueries,
+    /// the bodies of CTEs and views, and the subquery of each window. Forks
+    /// share it, because they plan parts of the same statement.
+    query_nesting_depth: Rc<Cell<usize>>,
     /// The statement is compiled for a role that is not a superuser, which may
     /// not use a sequence or a PRAGMA anywhere, including inside a view.
     pub(crate) role_is_not_superuser: bool,
@@ -375,8 +378,8 @@ impl SelfTableScope {
 
 #[cfg(test)]
 impl Resolver<'static> {
-    /// A resolver over an empty main schema with the SQLite dialect. Its state is leaked so
-    /// that unit tests can create one in a single call.
+    /// A resolver over an empty main schema with a dialect that cannot parse.
+    /// Its state is leaked so that unit tests can create one in a single call.
     pub(crate) fn empty_for_tests() -> Self {
         Self::new(
             Box::leak(Box::new(Schema::default())),
@@ -387,7 +390,7 @@ impl Resolver<'static> {
             Box::leak(Box::new(SymbolTable::new())),
             true,
             DoubleQuotedDml::Enabled,
-            Arc::new(crate::EngineDialect),
+            Arc::new(crate::dialect::cannot_parse::DialectThatCannotParse),
             None,
             RoleId::SUPERUSER,
         )
@@ -444,6 +447,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             fk_action_compile_stack: FkActionCompileStack::default(),
+            query_nesting_depth: Rc::default(),
             role_is_not_superuser: false,
             row_security_role,
         }
@@ -482,6 +486,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            query_nesting_depth: self.query_nesting_depth.clone(),
             role_is_not_superuser: self.role_is_not_superuser,
             row_security_role: self.row_security_role,
         }
@@ -502,9 +507,25 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            query_nesting_depth: self.query_nesting_depth.clone(),
             role_is_not_superuser: self.role_is_not_superuser,
             row_security_role: self.row_security_role,
         }
+    }
+
+    /// Counts one more level of nested query until the returned guard is
+    /// dropped. The planner and the code generator recurse one time for each
+    /// level, so the depth is bounded by [turso_parser::MAX_QUERY_DEPTH], as in
+    /// the parser.
+    pub(crate) fn enter_nested_query(&self) -> Result<NestedQueryGuard<'_>> {
+        let depth = self.query_nesting_depth.get();
+        if depth > turso_parser::MAX_QUERY_DEPTH {
+            return Err(query_nested_too_deeply_error());
+        }
+        self.query_nesting_depth.set(depth + 1);
+        Ok(NestedQueryGuard {
+            depth: &self.query_nesting_depth,
+        })
     }
 
     pub fn require_custom_types(&self, feature: &str) -> crate::Result<()> {
@@ -856,6 +877,24 @@ impl<'a> Resolver<'a> {
     }
 }
 
+/// Decrements the depth that [Resolver::enter_nested_query] counted, when the
+/// planner leaves the nested query.
+pub(crate) struct NestedQueryGuard<'r> {
+    depth: &'r Cell<usize>,
+}
+
+impl Drop for NestedQueryGuard<'_> {
+    fn drop(&mut self) {
+        self.depth.set(self.depth.get() - 1);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn query_nested_too_deeply_error() -> LimboError {
+    LimboError::ParseError(turso_parser::query_nested_too_deeply_message())
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct LimitCtx {
     /// Register holding the LIMIT value (e.g. LIMIT 5)
@@ -1158,12 +1197,11 @@ pub fn emit_program(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     plan: Plan,
-    after: impl FnOnce(&mut ProgramBuilder),
 ) -> Result<()> {
     match plan {
         Plan::Select(plan) => emit_program_for_select(program, resolver, *plan),
         Plan::Delete(plan) => emit_program_for_delete(connection, resolver, program, *plan),
-        Plan::Update(plan) => emit_program_for_update(connection, resolver, program, *plan, after),
+        Plan::Update(plan) => emit_program_for_update(connection, resolver, program, *plan),
         mut plan @ Plan::CompoundSelect { .. } => {
             emit_program_for_compound_select(program, resolver, &mut plan).map(|_| ())
         }
@@ -2014,8 +2052,8 @@ pub(crate) fn init_limit(
     Ok(())
 }
 
-/// Emits `target_columns`, plus the stored columns needed by `target_columns`, into a
-/// DML row context. This takes into account stored columns, and any stored columns
+/// Emits `target_columns`, plus the columns needed by `target_columns`, into a
+/// DML row context. This takes into account stored columns, and any columns
 /// required by virtual columns in `target_columns`.
 ///
 /// Non-rowid target columns are allocated in target order, once per distinct column.
@@ -2046,7 +2084,7 @@ pub(crate) fn emit_columns_and_dependencies(
     for (pos, idx) in non_rowid_targets.iter().copied().enumerate() {
         non_rowid_target_positions[idx] = Some(pos);
     }
-    let dependencies = table.dependencies_of_columns(targets.iter().copied())?;
+    let needed_columns = table.columns_with_dependencies(targets.iter().copied())?;
 
     let target_base = if non_rowid_targets.is_empty() {
         0
@@ -2054,7 +2092,7 @@ pub(crate) fn emit_columns_and_dependencies(
         program.alloc_registers(non_rowid_targets.len())
     };
     let extra_base = {
-        let mut dependencies_not_in_targets: ColumnMask = dependencies.try_clone()?;
+        let mut dependencies_not_in_targets: ColumnMask = needed_columns.try_clone()?;
         dependencies_not_in_targets -= &target_mask;
 
         let extra_count = table
@@ -2082,9 +2120,11 @@ pub(crate) fn emit_columns_and_dependencies(
             reg
         } else if col.is_rowid_alias() {
             rowid_reg
-        } else if dependencies.get(idx) {
+        } else if needed_columns.get(idx) {
             let reg = extra_base + extra_idx;
-            emit_stored_column(program, cursor_id, idx, reg, resolver)?;
+            if !col.is_virtual_generated() {
+                emit_stored_column(program, cursor_id, idx, reg, resolver)?;
+            }
             extra_idx += 1;
             reg
         } else {
@@ -2105,7 +2145,7 @@ pub(crate) fn emit_columns_and_dependencies(
     let table_arc = Arc::new(table.clone());
     gencol::compute_virtual_columns(
         program,
-        &table.columns_topo_sort()?,
+        &table.columns_topo_sort()?.retain_columns(&needed_columns),
         &dml_ctx,
         resolver,
         &table_arc,
@@ -2223,7 +2263,8 @@ fn generated_column(
 }
 
 /// Emit code to load the value of an IndexColumn from the NEW image of the row being updated.
-/// Handling expression indexes and regular columns
+/// Handling expression indexes and regular columns. A virtual column is copied from its
+/// register, because UPDATE computes the virtual columns of the NEW image before the index keys.
 #[allow(clippy::too_many_arguments)]
 fn emit_index_column_value_new_image(
     program: &mut ProgramBuilder,
@@ -2262,42 +2303,16 @@ fn emit_index_column_value_new_image(
         let col_in_table = columns
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
-        match col_in_table.generated_type() {
-            GeneratedType::Virtual { .. } => {
-                gencol::emit_gencol_expr_from_registers(
-                    program,
-                    col_in_table,
-                    dest_reg,
-                    columns_start_reg,
-                    columns,
-                    resolver,
-                    rowid_reg,
-                    layout,
-                    table,
-                )?;
-                program.emit_column_affinity(dest_reg, col_in_table.affinity());
-            }
-            GeneratedType::Stored { .. } => {
-                let src_reg = layout.to_register(columns_start_reg, idx_col.pos_in_table);
-                program.emit_insn(Insn::Copy {
-                    src_reg,
-                    dst_reg: dest_reg,
-                    extra_amount: 0,
-                });
-            }
-            GeneratedType::NotGenerated => {
-                let src_reg = if col_in_table.is_rowid_alias() {
-                    rowid_reg
-                } else {
-                    layout.to_register(columns_start_reg, idx_col.pos_in_table)
-                };
-                program.emit_insn(Insn::Copy {
-                    src_reg,
-                    dst_reg: dest_reg,
-                    extra_amount: 0,
-                });
-            }
-        }
+        let src_reg = if col_in_table.is_rowid_alias() {
+            rowid_reg
+        } else {
+            layout.to_register(columns_start_reg, idx_col.pos_in_table)
+        };
+        program.emit_insn(Insn::Copy {
+            src_reg,
+            dst_reg: dest_reg,
+            extra_amount: 0,
+        });
     }
     Ok(())
 }

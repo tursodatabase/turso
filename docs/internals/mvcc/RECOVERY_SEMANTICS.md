@@ -43,7 +43,7 @@ Recovery classifies startup state using two checks:
 | Case | Startup artifacts | Recovery behavior |
 |---|---|---|
 | 1 | WAL has committed frames + log header valid | Complete interrupted checkpoint: backfill WAL into DB, sync DB, truncate WAL. Then run logical-log recovery with metadata cutoff. |
-| 2 | WAL has committed frames + log header missing (`NoLog`) | Fail closed with `Corrupt`. |
+| 2 | WAL has committed frames + log header missing (`NoLog`) | Complete interrupted checkpoint (as case 1), then write a fresh log header. A TRUNCATE checkpoint leaves this state when killed between steps 8 and 10; the log is only cleared once the WAL holds every frame it had. Passive checkpoints leave it as their steady state. |
 | 3 | WAL has committed frames + log header invalid/torn | Fail closed with `Corrupt`. |
 | 4 | WAL has no committed frames | Truncate/discard WAL tail bytes and continue logical-log recovery. |
 | 5 | No WAL + log header invalid/torn | Fail closed with `Corrupt`. |
@@ -66,12 +66,20 @@ Notes:
 6. Checkpoint WAL (backfill WAL frames into DB file).
 7. Fsync DB file (unless `SyncMode::Off`).
 8. Truncate logical log to 0 (salt regenerated in memory; header written with next frame).
-9. Fsync logical log (unless `SyncMode::Off`).
-10. Truncate WAL.
-11. Finalize: GC checkpointed versions, release lock.
+9. Truncate WAL.
+10. Finalize: GC checkpointed versions, release lock.
 
-WAL truncation is last. Until the DB file and logical-log cleanup are durable,
-the WAL remains the authoritative recovery source.
+WAL truncation is last. Until the DB file is durable, the WAL remains the
+authoritative recovery source.
+
+The logical log needs no fsync after step 8. If a crash loses the truncation,
+the old frames come back, but their `commit_ts` is at or below
+`persistent_tx_ts_max`, so recovery skips them (invariant 5).
+
+A switch from MVCC to WAL mode (`PRAGMA journal_mode = 'wal'`) is different. It
+fsyncs the logical log after the checkpoint, before it writes the WAL-mode
+header, because a database in WAL mode does not open while its logical log has
+frames.
 
 ## Correctness Invariants
 

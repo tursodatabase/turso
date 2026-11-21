@@ -1,6 +1,7 @@
 mod abandoned_create_index;
 mod abandoned_statement_pager;
 mod alloc;
+mod alter_table;
 mod assert_details;
 #[macro_use]
 mod assertions;
@@ -8,6 +9,7 @@ mod attach;
 mod blob_io;
 mod checkpoint_crash_atomicity;
 mod checkpoint_stale_page_size;
+mod checkpoint_write_failure;
 mod common;
 mod conflict_resolution;
 mod connection;
@@ -46,6 +48,7 @@ mod statement;
 mod statement_lifecycle;
 mod statement_metadata;
 mod statement_reset;
+mod stats;
 mod stmt_journal;
 mod stmt_readonly;
 mod storage;

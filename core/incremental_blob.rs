@@ -354,7 +354,7 @@ impl Connection {
         let root = table_ref.root_page;
         let program = build_blob_program(self, table_ref, root, record_column, rowid, read_write)?;
         let pager = self.get_pager();
-        let mut stmt = Statement::new(program, pager.clone(), QueryMode::Normal, 0);
+        let mut stmt = Statement::new(program, self.clone(), pager.clone(), QueryMode::Normal, 0);
         // Excluded from the explicit-checkpoint guard's active-statement
         // count: the handle parks at its row for its whole lifetime, and an
         // open blob handle must not block checkpointing until it is closed.
@@ -564,6 +564,6 @@ fn build_blob_program(
     b.preassign_label_to_next_insn(l_end);
 
     conn.with_schema_mut(|schema| b.epilogue(schema))?;
-    b.build(conn.clone(), false, "incremental blob io")
+    b.build(conn, false, "incremental blob io")
         .map_err(|e| LimboError::InternalError(format!("blob program build failed: {e}")))
 }

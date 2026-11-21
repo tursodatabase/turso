@@ -11,7 +11,10 @@
 // contract (the outer `Statement::step()` must return
 // `StepResult::IO` rather than blocking).
 
-use crate::dialect::{CatalogChange, NewOwner, OwnerColumn};
+use crate::dialect::{
+    AccessStatement, CatalogCmd, CmdContext, CmdOrigin, CreateSequence, DropSequence, NewOwner,
+    OwnerColumn,
+};
 use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
 
@@ -25,7 +28,11 @@ use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::functions::{names_mangled_sequence, qualify_sequence_argument};
 use crate::translate::expr::{walk_expr_mut, WalkControl};
-use crate::translate::schema::{self, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
+use crate::translate::schema;
+use crate::translate::schema::{
+    emit_delete_sequence_backing_table_row, emit_schema_entry, open_sqlite_schema_for_write,
+    SchemaEntryType,
+};
 use crate::translate::trigger_exec::rewrite_select_expressions;
 use crate::util::{escape_sql_string_literal, normalize_ident};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -58,9 +65,11 @@ pub fn sequence_backing_table_sql(seq_name: &str) -> String {
     )
 }
 
-/// Emit bytecode to create a sequence backing table (B-tree + sqlite_schema entry +
-/// initial row + ParseSchema). Used by both CREATE SEQUENCE and CREATE TABLE with
-/// AUTOINCREMENT. The sqlite_schema cursor must already be open for writing.
+/// Emit bytecode to create the backing table of the sequence that CREATE
+/// TABLE makes for an AUTOINCREMENT column (B-tree + sqlite_schema entry +
+/// initial row + ParseSchema). It is an engine table, so its sqlite_schema
+/// row is written here. The sqlite_schema cursor must already be open for
+/// writing.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_sequence_backing_table(
     program: &mut ProgramBuilder,
@@ -75,15 +84,7 @@ pub fn emit_sequence_backing_table(
     cycle: bool,
 ) -> Result<()> {
     let backing_table_name = sequence_backing_table_name(seq_name);
-    let sql = sequence_backing_table_sql(seq_name);
-
-    let table_root_reg = program.alloc_register();
-    program.emit_insn(Insn::CreateBtree {
-        db: database_id,
-        root: table_root_reg,
-        flags: CreateBTreeFlags::new_table(),
-    });
-
+    let table_root_reg = emit_create_sequence_btree(program, database_id);
     emit_schema_entry(
         program,
         resolver,
@@ -93,11 +94,60 @@ pub fn emit_sequence_backing_table(
         &backing_table_name,
         &backing_table_name,
         table_root_reg,
-        Some(sql.clone()),
+        Some(sequence_backing_table_sql(seq_name)),
     )?;
+    emit_sequence_initial_row(
+        program,
+        resolver,
+        database_id,
+        seq_name,
+        table_root_reg,
+        start,
+        increment,
+        min_value,
+        max_value,
+        cycle,
+    )
+}
+
+/// Emits the creation of the B-tree of a sequence's backing table. Returns
+/// the register that holds its root page.
+fn emit_create_sequence_btree(program: &mut ProgramBuilder, database_id: usize) -> usize {
+    let table_root_reg = program.alloc_register();
+    program.emit_insn(Insn::CreateBtree {
+        db: database_id,
+        root: table_root_reg,
+        flags: CreateBTreeFlags::new_table(),
+    });
+    table_root_reg
+}
+
+/// Inserts the initial row into the new backing table of sequence
+/// `seq_name`, whose root page is in `table_root_reg`, and emits the
+/// ParseSchema that reads the table's `sqlite_schema` row.
+#[allow(clippy::too_many_arguments)]
+fn emit_sequence_initial_row(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    seq_name: &str,
+    table_root_reg: usize,
+    start: i64,
+    increment: i64,
+    min_value: i64,
+    max_value: i64,
+    cycle: bool,
+) -> Result<()> {
+    let backing_table_name = sequence_backing_table_name(seq_name);
+    let sql = sequence_backing_table_sql(seq_name);
 
     // Open the newly-created table by its root page register and insert the initial row.
-    let seq_btree = Arc::new(BTreeTable::from_sql(&sql, 0)?);
+    let seq_btree = Arc::new(BTreeTable::from_stored_sql(
+        resolver.catalog.dialect.as_ref(),
+        &sql,
+        0,
+        false,
+    )?);
     let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_btree));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: seq_cursor_id,
@@ -718,7 +768,7 @@ pub(crate) fn emit_backing_table_compaction(
 ///
 /// Returns `Ok(false)` and emits nothing if the `sqlite_sequence`
 /// table does not exist in this database — the schema-bootstrap path
-/// in `translate/schema.rs` creates it lazily on first need; until
+/// in `translate/schema/mod.rs` creates it lazily on first need; until
 /// then no AUTOINCREMENT activity is possible so there is nothing to
 /// sync.
 pub(crate) fn emit_sqlite_sequence_sync(
@@ -1040,46 +1090,33 @@ pub fn translate_create_sequence(
         cycle,
     )?;
 
-    // Open cursor to sqlite_schema (in the target database)
-    let table = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            .unwrap()
-    });
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
-
-    emit_sequence_backing_table(
+    let cmd_context = CmdContext::new(connection, resolver, database_id);
+    // The statement has always opened sqlite_schema before it creates the
+    // B-tree. A catalog that writes a row for the sequence finds the cursor
+    // open.
+    cmd_context.sqlite_schema_cursor(program);
+    let root_reg = emit_create_sequence_btree(program, database_id);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::CreateSequence(CreateSequence {
+            namespace: namespace.id,
+            name: &normalized_name,
+            root_reg,
+        }),
+    )?;
+    emit_sequence_initial_row(
         program,
         resolver,
         database_id,
-        sqlite_schema_cursor_id,
         &mangled_seq_name,
+        root_reg,
         seq.start_value,
         seq.increment_by,
         seq.min_value,
         seq.max_value,
         seq.cycle,
     )?;
-
-    // The sequence is a relation of the dialect's; its backing table is an
-    // engine object and is not.
-    if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_catalog_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[CatalogChange::Create {
-                namespace: namespace.id,
-                name: normalized_name.clone(),
-                kind: crate::schema::RelationKind::Sequence,
-                table: None,
-            }],
-        )?;
-    }
 
     // Add the fully-configured Sequence to the in-memory schema
     program.emit_insn(Insn::AddSequence {
@@ -1107,7 +1144,8 @@ pub fn translate_create_sequence(
 }
 
 /// Emit the cursor / sqlite_schema-delete / Destroy / DropSequence bytecode
-/// for removing a single sequence from `database_id`. Callers must wrap this
+/// for removing a single sequence from `database_id` whose `sqlite_schema`
+/// row the dialect's catalog does not delete. Callers must wrap this
 /// with their own `begin_write_on_database` + `SetCookie` (so that callers
 /// dropping several schema objects in one statement — e.g. `DROP TABLE` on an
 /// AUTOINCREMENT table cleaning up its implicit sequence — share a single
@@ -1122,88 +1160,50 @@ pub(crate) fn emit_drop_sequence_cleanup(
     namespace: NamespaceRef,
     seq_name: &str,
 ) -> Result<bool> {
-    let database_id = namespace.database_id;
+    let Some(root_page) = sequence_backing_table_root_page(resolver, namespace, seq_name) else {
+        return Ok(false);
+    };
+    let sqlite_schema_cursor_id =
+        open_sqlite_schema_for_write(program, resolver, namespace.database_id);
+    emit_delete_sequence_backing_table_row(
+        program,
+        sqlite_schema_cursor_id,
+        sequence_backing_table_name(&resolver.mangle_name(namespace, seq_name)),
+    );
+    emit_destroy_sequence(program, namespace, seq_name, root_page);
+    Ok(true)
+}
+
+/// The root page of the backing table of sequence `seq_name` of
+/// `namespace`. None when the sequence or its backing table is missing.
+fn sequence_backing_table_root_page(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    seq_name: &str,
+) -> Option<i64> {
     let backing_table_name =
         sequence_backing_table_name(&resolver.mangle_name(namespace, seq_name));
-    let root_page = resolver.with_schema(database_id, |s| {
+    resolver.with_schema(namespace.database_id, |s| {
         s.get_sequence(namespace.id, seq_name)?;
         Some(
             s.get_btree_table(NamespaceId::ROOT, &backing_table_name)?
                 .root_page,
         )
-    });
-    let Some(root_page) = root_page else {
-        return Ok(false);
-    };
+    })
+}
 
-    // Open sqlite_schema for writing (in the target database)
-    let schema_table = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            .unwrap()
-    });
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
-
-    let seq_name_reg = program.alloc_register();
-    let type_str_reg = program.alloc_register();
-    program.emit_insn(Insn::String8 {
-        dest: seq_name_reg,
-        value: backing_table_name,
-    });
-    program.emit_insn(Insn::String8 {
-        dest: type_str_reg,
-        value: "table".to_string(),
-    });
-
-    // Scan sqlite_schema for (type='table' AND name=backing_table_name) and delete the row.
-    let end_loop_label = program.allocate_label();
-    let loop_start_label = program.allocate_label();
-    program.emit_insn(Insn::Rewind {
-        cursor_id: sqlite_schema_cursor_id,
-        pc_if_empty: end_loop_label,
-    });
-    program.preassign_label_to_next_insn(loop_start_label);
-    let col0_reg = program.alloc_register();
-    let col1_reg = program.alloc_register();
-    program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, col0_reg);
-    program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, col1_reg);
-    let skip_delete_label = program.allocate_label();
-    program.emit_insn(Insn::Ne {
-        lhs: col0_reg,
-        rhs: type_str_reg,
-        target_pc: skip_delete_label,
-        flags: CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
-    });
-    program.emit_insn(Insn::Ne {
-        lhs: col1_reg,
-        rhs: seq_name_reg,
-        target_pc: skip_delete_label,
-        flags: CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
-    });
-    program.emit_insn(Insn::Delete {
-        cursor_id: sqlite_schema_cursor_id,
-        table_name: "sqlite_schema".to_string(),
-        is_part_of_update: false,
-    });
-    program.preassign_label_to_next_insn(skip_delete_label);
-    program.emit_insn(Insn::Next {
-        cursor_id: sqlite_schema_cursor_id,
-        pc_if_next: loop_start_label,
-        fullscan: false,
-        is_index: false,
-    });
-    program.preassign_label_to_next_insn(end_loop_label);
-
-    // Destroy the B-tree root page
+/// Destroys the B-tree of the backing table of sequence `seq_name`, whose
+/// root page is `root_page`, and removes the sequence from the schema in
+/// memory.
+fn emit_destroy_sequence(
+    program: &mut ProgramBuilder,
+    namespace: NamespaceRef,
+    seq_name: &str,
+    root_page: i64,
+) {
     let former_root_reg = program.alloc_register();
     program.emit_insn(Insn::Destroy {
-        db: database_id,
+        db: namespace.database_id,
         root: root_page,
         former_root_reg,
         is_temp: 0,
@@ -1211,11 +1211,10 @@ pub(crate) fn emit_drop_sequence_cleanup(
 
     // Remove from the in-memory schema (sequences + tables maps)
     program.emit_insn(Insn::DropSequence {
-        db: database_id,
+        db: namespace.database_id,
         namespace: namespace.id,
         seq_name: seq_name.to_string(),
     });
-    Ok(true)
 }
 
 /// Translate DROP SEQUENCE into bytecode that removes the definition from sqlite_schema.
@@ -1240,9 +1239,20 @@ pub fn translate_drop_sequence(
         std::slice::from_ref(&normalized_name),
         schema::DroppedWithSequences::Nothing,
     )? {
-        bail_parse_error!(
-            "cannot drop sequence {normalized_name} because other objects depend on it: {usage}"
-        );
+        return Err(crate::LimboError::dependent_objects(
+            format!(
+                "sequence {}",
+                resolver.with_schema(namespace.database_id, |schema| {
+                    connection.dialect().relation_name_in_messages(
+                        connection,
+                        schema,
+                        namespace.id,
+                        &normalized_name,
+                    )
+                })
+            ),
+            vec![usage],
+        ));
     }
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
@@ -1268,7 +1278,7 @@ pub fn translate_drop_sequence(
 }
 
 /// Emits the removal of sequence `seq_name` of `namespace` from the schema
-/// and from the dialect's schema state. Returns false, emitting nothing,
+/// and from the dialect's catalog. Returns false, emitting nothing,
 /// when the sequence does not exist.
 pub(crate) fn emit_drop_sequence(
     program: &mut ProgramBuilder,
@@ -1277,20 +1287,19 @@ pub(crate) fn emit_drop_sequence(
     namespace: NamespaceRef,
     seq_name: &str,
 ) -> Result<bool> {
-    if !emit_drop_sequence_cleanup(program, resolver, namespace, seq_name)? {
+    let Some(root_page) = sequence_backing_table_root_page(resolver, namespace, seq_name) else {
         return Ok(false);
-    }
-    if schema::dialect_relation_hooks_apply(connection, namespace.database_id)? {
-        resolver.catalog.dialect.translate_catalog_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[CatalogChange::Drop {
-                namespace: namespace.id,
-                name: seq_name.to_string(),
-            }],
-        )?;
-    }
+    };
+    let cmd_context = CmdContext::new(connection, resolver, namespace.database_id);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::DropSequence(DropSequence {
+            namespace: namespace.id,
+            name: seq_name,
+        }),
+    )?;
+    emit_destroy_sequence(program, namespace, seq_name, root_page);
     Ok(true)
 }
 
@@ -1338,6 +1347,7 @@ pub(crate) fn bind_sequence_names_in_stored_expressions(
         | ast::Stmt::CreateVirtualTable(_)
         | ast::Stmt::CreateType { .. }
         | ast::Stmt::CreateRole { .. }
+        | ast::Stmt::DropRole { .. }
         | ast::Stmt::Grant(_)
         | ast::Stmt::CreateDomain { .. }
         | ast::Stmt::Delete { .. }
@@ -1413,7 +1423,8 @@ fn bind_sequence_names_in_column_constraints(
             | ast::ColumnConstraint::Unique(_)
             | ast::ColumnConstraint::Collate { .. }
             | ast::ColumnConstraint::ForeignKey { .. }
-            | ast::ColumnConstraint::Generated { .. } => {}
+            | ast::ColumnConstraint::Generated { .. }
+            | ast::ColumnConstraint::Identity(_) => {}
         }
     }
     Ok(bound)
@@ -1502,6 +1513,9 @@ pub fn translate_alter_sequence_owned_by(
     let Some(namespace) = sequence_namespace(seq_name, resolver)? else {
         bail_parse_error!("sequence \"{normalized_name}\" does not exist");
     };
+    if is_identity_sequence(resolver, namespace, &normalized_name) {
+        bail_parse_error!("cannot change ownership of identity sequence");
+    }
     let owner_column = match owner {
         Some((table_name, column)) => {
             let normalized_table = normalize_ident(table_name.name.as_str());
@@ -1548,23 +1562,51 @@ pub fn translate_alter_sequence_owned_by(
         }
         None => None,
     };
-    if !schema::dialect_relation_hooks_apply(connection, namespace.database_id)? {
+    let cmd_context = CmdContext::new(connection, resolver, namespace.database_id);
+    resolver.catalog.dialect.catalog().emit_access(
+        program,
+        &cmd_context,
+        &AccessStatement::ChangeOwner {
+            namespace: namespace.id,
+            name: &normalized_name,
+            owner: &NewOwner::Column(owner_column),
+        },
+    )?;
+    // A catalog stores the owner column only for a user's statement about
+    // a sequence of the main database. Any other statement stored nothing,
+    // so it changes no schema.
+    if cmd_context.origin == CmdOrigin::Engine || namespace.database_id != crate::MAIN_DB_ID {
         return Ok(());
     }
     let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
     program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
-    resolver.catalog.dialect.translate_catalog_changes(
-        program,
-        resolver.schema(),
-        connection,
-        &[CatalogChange::ChangeOwner {
-            namespace: namespace.id,
-            name: normalized_name,
-            owner: NewOwner::Column(owner_column),
-        }],
-    )?;
     schema::emit_schema_cookie(resolver, program);
     Ok(())
+}
+
+fn is_identity_sequence(resolver: &Resolver, namespace: NamespaceRef, sequence: &str) -> bool {
+    let dialect = &resolver.catalog.dialect;
+    resolver.with_schema(namespace.database_id, |schema| {
+        schema
+            .tables(namespace.id)
+            .filter_map(|table| table.btree())
+            .any(|table| {
+                table.columns().iter().any(|column| {
+                    column.identity.is_some()
+                        && column.name.as_deref().is_some_and(|column_name| {
+                            dialect
+                                .owned_sequences(
+                                    schema,
+                                    namespace.id,
+                                    table.name.as_str(),
+                                    Some(column_name),
+                                )
+                                .iter()
+                                .any(|owned| owned == sequence)
+                        })
+                })
+            })
+    })
 }
 
 /// The namespace and bare name of the sequence `name` names: `schema.name`,

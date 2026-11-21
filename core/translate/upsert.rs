@@ -6,12 +6,17 @@ use std::sync::Arc;
 
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
-use super::emitter::gencol::compute_generated_columns;
+use super::emitter::gencol::{
+    compute_generated_columns, compute_virtual_columns, emit_row_from_cursor,
+    sets_custom_type_column,
+};
 use super::insert::column_default_expr;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_ERROR};
 use crate::namespace::{NamespaceId, NamespaceRef};
-use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
+use crate::schema::{
+    BTreeTable, Column, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL,
+};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -19,7 +24,8 @@ use crate::translate::fkeys::{
     fire_fk_update_actions, ParentKeyNewProbeMode,
 };
 use crate::translate::insert::{
-    emit_remember_written_rowid, format_unique_violation_desc, InsertEmitCtx,
+    emit_remember_written_rowid, emit_returning_subqueries, format_unique_violation_desc,
+    InsertEmitCtx,
 };
 use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
@@ -39,11 +45,12 @@ use crate::{
         },
         expr::{
             emit_constraint_values_decode, emit_returning_results, emit_table_column,
-            expr_type::column_custom_type_names, translate_expr, translate_expr_no_constant_opt,
-            walk_expr_mut, NoConstantOptReason,
+            expr_type::column_custom_type_names, process_returning_clause, translate_expr,
+            translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
         },
         insert::Insertion,
         plan::{ResultSetColumn, TableReferences},
+        subquery::plan_subqueries_from_returning,
     },
     util::{exprs_are_equivalent, normalize_ident},
     vdbe::{
@@ -470,7 +477,9 @@ pub fn resolve_upsert_target(
 /// 4. Enforce NOT NULL constraints and (if STRICT) type checks on NEW.
 /// 5. Rebuild indexes (delete keys using BEFORE, insert keys using NEW).
 /// 6. Rewrite the table row payload at the same rowid with NEW.
-/// 7. Emit CDC rows and RETURNING output if requested.
+/// 7. Emit CDC rows and RETURNING output if requested. When the RETURNING
+///    clause has subqueries, `returning_with_subqueries` holds it as written,
+///    and it is planned again here instead of using `returning`.
 /// 8. Jump to `row_done_label`.
 ///
 /// Semantics reference: https://sqlite.org/lang_upsert.html
@@ -487,6 +496,7 @@ pub fn emit_upsert(
     where_clause: &mut Option<Box<ast::Expr>>,
     resolver: &mut Resolver,
     returning: &mut [ResultSetColumn],
+    returning_with_subqueries: Option<&[ast::ResultColumn]>,
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
     table_alias: Option<&str>,
@@ -526,20 +536,10 @@ pub fn emit_upsert(
         .expect("upsert must have a target table")
         .internal_id;
     let current_start = program.alloc_registers(num_cols);
-    for i in 0..num_cols {
-        let col = &table.columns()[i];
-        let reg = layout.to_register(current_start, i);
-        emit_table_column(
-            program,
-            ctx.cursor_id,
-            table_ref_id,
-            table_references,
-            col,
-            i,
-            reg,
-            resolver,
-        )?;
-    }
+    let current_regs: Vec<usize> = (0..num_cols)
+        .map(|i| layout.to_register(current_start, i))
+        .collect();
+    emit_row_from_cursor(program, ctx.table, ctx.cursor_id, &current_regs, resolver)?;
 
     // BEFORE for index maintenance / CDC
     let before_start = if ctx.cdc_table.is_some() || !ctx.idx_cursors.is_empty() {
@@ -833,7 +833,23 @@ pub fn emit_upsert(
         DmlRowForm::UserFacing,
         resolver,
     )?;
-    emit_generated_column_notnull_checks(program, ctx, new_start, &layout, constraint_on_error);
+    let updated_positions: ColumnMask = set_pairs
+        .iter()
+        .map(|(col_idx, _)| *col_idx)
+        .try_collect()?;
+    // When a SET column has a custom type, the virtual columns are computed again
+    // after ENCODE, below, and their NOT NULL checks wait for these values.
+    let computes_virtual_columns_after_encode = table.btree().is_some_and(|bt| {
+        bt.is_strict && sets_custom_type_column(&bt, &updated_positions, resolver)
+    });
+    emit_generated_column_notnull_checks(
+        program,
+        ctx,
+        new_start,
+        &layout,
+        constraint_on_error,
+        |column| !(computes_virtual_columns_after_encode && column.is_virtual_generated()),
+    );
 
     if let Some(bt) = table.btree() {
         if bt.is_strict {
@@ -850,6 +866,26 @@ pub fn emit_upsert(
                 &layout,
             )?;
 
+            // The virtual columns were computed from the SET values. When a SET column
+            // has a custom type, a read of the row can give other values, so compute
+            // them again from the encoded row, as a read of the row gives them.
+            if computes_virtual_columns_after_encode {
+                let dml_ctx = DmlColumnContext::layout(
+                    bt.columns(),
+                    new_start,
+                    new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+                    layout.clone(),
+                    DmlRowForm::Stored,
+                );
+                compute_virtual_columns(
+                    program,
+                    &bt.columns_topo_sort()?,
+                    &dml_ctx,
+                    resolver,
+                    &bt,
+                )?;
+            }
+
             // Post-encode TypeCheck: validate encoded values match storage type.
             program.emit_insn(Insn::TypeCheck {
                 start_reg: new_start,
@@ -857,6 +893,17 @@ pub fn emit_upsert(
                 check_generated: true,
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
+
+            if computes_virtual_columns_after_encode {
+                emit_generated_column_notnull_checks(
+                    program,
+                    ctx,
+                    new_start,
+                    &layout,
+                    constraint_on_error,
+                    Column::is_virtual_generated,
+                );
+            }
         }
 
         // Rows that row-level security does not let the role write fail
@@ -901,10 +948,6 @@ pub fn emit_upsert(
     // Fire BEFORE UPDATE triggers
     let upsert_namespace: NamespaceRef = ctx.namespace;
     let upsert_database_id = upsert_namespace.database_id;
-    let updated_positions: ColumnMask = set_pairs
-        .iter()
-        .map(|(col_idx, _)| *col_idx)
-        .try_collect()?;
     let table_btree = table.btree();
     let affected_parent_fks = match (connection.foreign_keys_enabled(), table_btree.as_deref()) {
         (true, Some(table)) => {
@@ -982,18 +1025,10 @@ pub fn emit_upsert(
             // index deletion must use the row as it is on disk now, or the
             // trigger's index entries are left behind (#8744).
             if let Some(before) = before_start {
-                for (i, column) in table.columns().iter().enumerate() {
-                    emit_table_column(
-                        program,
-                        ctx.cursor_id,
-                        table_ref_id,
-                        table_references,
-                        column,
-                        i,
-                        layout.to_register(before, i),
-                        resolver,
-                    )?;
-                }
+                let before_regs: Vec<usize> = (0..num_cols)
+                    .map(|i| layout.to_register(before, i))
+                    .collect();
+                emit_row_from_cursor(program, ctx.table, ctx.cursor_id, &before_regs, resolver)?;
             }
 
             // Same for the NEW image: like SQLite, columns not in the SET list
@@ -1030,6 +1065,7 @@ pub fn emit_upsert(
                 new_start,
                 &layout,
                 constraint_on_error,
+                |_| true,
             );
 
             let has_relevant_after_triggers = has_triggers_including_temp(
@@ -1628,13 +1664,59 @@ pub fn emit_upsert(
                 bt.name.as_str(),
                 ctx.conflict_rowid_reg, // old_rowid_reg
                 current_start,          // old_values_start
-                new_start,              // new_values_start
+                &layout,
+                new_start,                                       // new_values_start
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg), // new_rowid_reg
                 connection,
                 upsert_namespace,
                 &affected_parent_fks,
             )?;
         }
+    }
+
+    // RETURNING from NEW image + final rowid. It reads the row before the
+    // AFTER triggers run, as in SQLite, so a subquery in it does not see what
+    // a trigger writes.
+    if !returning.is_empty() {
+        let final_rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+        let upsert_returning_columns;
+        let returning: &[ResultSetColumn] = match returning_with_subqueries {
+            Some(returning_with_subqueries) => {
+                let mut returning_ast = returning_with_subqueries.to_vec();
+                let mut returning_subqueries = vec![];
+                plan_subqueries_from_returning(
+                    program,
+                    &mut returning_subqueries,
+                    table_references,
+                    &mut returning_ast,
+                    resolver,
+                    connection,
+                )?;
+                upsert_returning_columns =
+                    process_returning_clause(&mut returning_ast, table_references, resolver)?;
+                emit_returning_subqueries(
+                    program,
+                    resolver,
+                    table_references,
+                    &mut returning_subqueries,
+                    new_start,
+                    final_rowid_reg,
+                    &layout,
+                )?;
+                &upsert_returning_columns
+            }
+            None => &*returning,
+        };
+        emit_returning_results(
+            program,
+            table_references,
+            returning,
+            new_start,
+            final_rowid_reg,
+            resolver,
+            ctx.returning_buffer.as_ref(),
+            &layout,
+        )?;
     }
 
     // Fire AFTER UPDATE triggers
@@ -1666,8 +1748,7 @@ pub fn emit_upsert(
             )
             .with_override_conflict(ast::ResolveType::Abort);
 
-            // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
-            // not skip post-row work (RETURNING).
+            // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body.
             let after_trigger_done = program.allocate_label();
             for trigger in relevant_triggers {
                 fire_trigger(
@@ -1682,33 +1763,6 @@ pub fn emit_upsert(
             }
             program.preassign_label_to_next_insn(after_trigger_done);
         }
-    }
-
-    // Compute the generated columns of the NEW image for RETURNING
-    if !returning.is_empty() {
-        compute_new_row_generated_columns(
-            program,
-            ctx,
-            new_start,
-            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            &layout,
-            DmlRowForm::Stored,
-            resolver,
-        )?;
-    }
-
-    // RETURNING from NEW image + final rowid
-    if !returning.is_empty() {
-        emit_returning_results(
-            program,
-            table_references,
-            returning,
-            new_start,
-            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            resolver,
-            ctx.returning_buffer.as_ref(),
-            &layout,
-        )?;
     }
 
     program.emit_insn(Insn::Goto {
@@ -1764,9 +1818,10 @@ fn emit_generated_column_notnull_checks(
     new_start: usize,
     layout: &ColumnLayout,
     on_error: Option<ast::ResolveType>,
+    include_column: impl Fn(&Column) -> bool,
 ) {
     for (idx, column) in ctx.table.columns().iter().enumerate() {
-        if !column.is_generated() || !column.notnull() {
+        if !column.is_generated() || !column.notnull() || !include_column(column) {
             continue;
         }
         program.emit_insn(Insn::HaltIfNull {
@@ -1820,6 +1875,7 @@ pub fn collect_set_clauses_for_upsert(
                 Some(idx) => {
                     let col = &table.columns()[*idx];
                     col.ensure_not_generated("UPDATE", cn.as_str())?;
+                    col.ensure_update_value_allowed(&e, cn.as_str())?;
                     if matches!(e.as_ref(), ast::Expr::Default) {
                         e = column_default_expr(col, table.is_strict(), resolver);
                     }

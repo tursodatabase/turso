@@ -74,15 +74,21 @@ fn check_integer_bounds(value: i64, width: IntegerWidth) -> Result<i64> {
 
 fn integer_out_of_range_error(width: IntegerWidth) -> LimboError {
     match width {
-        IntegerWidth::Int16 => {
-            sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, "smallint out of range")
-        }
-        IntegerWidth::Int32 => {
-            sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, "integer out of range")
-        }
-        IntegerWidth::Int64 => {
-            sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, "bigint out of range")
-        }
+        IntegerWidth::Int16 => sqlstate_error(
+            SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+            "smallint out of range",
+            None,
+        ),
+        IntegerWidth::Int32 => sqlstate_error(
+            SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+            "integer out of range",
+            None,
+        ),
+        IntegerWidth::Int64 => sqlstate_error(
+            SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+            "bigint out of range",
+            None,
+        ),
     }
 }
 
@@ -158,15 +164,21 @@ pub fn str_to_integer_checked(
 fn map_parse_int_err_kind(err: ParseIntError, width: IntegerWidth) -> LimboError {
     match err.kind() {
         IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => match width {
-            IntegerWidth::Int16 => {
-                sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, "smallint out of range")
-            }
-            IntegerWidth::Int32 => {
-                sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, "integer out of range")
-            }
-            IntegerWidth::Int64 => {
-                sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, "bigint out of range")
-            }
+            IntegerWidth::Int16 => sqlstate_error(
+                SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                "smallint out of range",
+                None,
+            ),
+            IntegerWidth::Int32 => sqlstate_error(
+                SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                "integer out of range",
+                None,
+            ),
+            IntegerWidth::Int64 => sqlstate_error(
+                SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                "bigint out of range",
+                None,
+            ),
         },
         IntErrorKind::InvalidDigit | IntErrorKind::Empty => {
             let type_name = match width {
@@ -178,11 +190,13 @@ fn map_parse_int_err_kind(err: ParseIntError, width: IntegerWidth) -> LimboError
             sqlstate_error(
                 SQLSTATE_INVALID_TEXT_REPRESENTATION,
                 format!("invalid input syntax for type {type_name}"),
+                None,
             )
         }
         _ => sqlstate_error(
             SQLSTATE_INVALID_TEXT_REPRESENTATION,
             "invalid input syntax for integer",
+            None,
         ),
     }
 }

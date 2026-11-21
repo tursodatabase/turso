@@ -381,6 +381,7 @@ impl SyncEngine {
                 .map(turso_sync_engine::types::Secret::new),
             push_operations_threshold: self.opts.push_operations_threshold,
             pull_bytes_threshold: self.opts.pull_bytes_threshold,
+            pull_parallel_requests: None,
             logical_mvcc_pull: self.opts.logical_mvcc_pull,
         };
 

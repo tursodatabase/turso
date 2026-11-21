@@ -345,6 +345,131 @@ fn drop_sequence_of_a_serial_column_is_refused() {
 }
 
 #[test]
+fn refused_drop_names_the_view_that_reads_the_relation() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE base (a int)").unwrap();
+    conn.execute("INSERT INTO base VALUES (7)").unwrap();
+    conn.execute("CREATE VIEW reader AS SELECT a FROM base")
+        .unwrap();
+    conn.execute("CREATE SCHEMA other").unwrap();
+    conn.execute("CREATE VIEW other.reader_of_reader AS SELECT a FROM public.reader")
+        .unwrap();
+
+    let error = conn.execute("DROP TABLE base").unwrap_err();
+    assert_eq!(
+        error.message,
+        "cannot drop table base because other objects depend on it"
+    );
+    assert_eq!(
+        error.detail.as_deref(),
+        Some(
+            "view reader depends on table base\n\
+             view other.reader_of_reader depends on view reader"
+        )
+    );
+    let error = conn.execute("DROP VIEW reader").unwrap_err();
+    assert_eq!(
+        error.message,
+        "cannot drop view reader because other objects depend on it"
+    );
+    assert_eq!(
+        error.detail.as_deref(),
+        Some("view other.reader_of_reader depends on view reader")
+    );
+
+    let rows = conn
+        .query("SELECT a FROM other.reader_of_reader")
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows[0][0].to_string(), "7");
+}
+
+#[test]
+fn refused_drop_quotes_names_and_names_the_schema_the_search_path_lacks() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute(r#"CREATE TABLE "T" (a int)"#).unwrap();
+    conn.execute(r#"CREATE VIEW "my view" AS SELECT a FROM "T""#)
+        .unwrap();
+    let error = conn.execute(r#"DROP TABLE "T""#).unwrap_err();
+    assert_eq!(
+        error.message,
+        r#"cannot drop table "T" because other objects depend on it"#
+    );
+    assert_eq!(
+        error.detail.as_deref(),
+        Some(r#"view "my view" depends on table "T""#)
+    );
+
+    conn.execute("CREATE SCHEMA o").unwrap();
+    conn.execute("CREATE TABLE o.f (a int, b int)").unwrap();
+    conn.execute("CREATE VIEW o.fv AS SELECT b FROM o.f")
+        .unwrap();
+    let error = conn.execute("ALTER TABLE o.f DROP COLUMN b").unwrap_err();
+    assert_eq!(
+        error.message,
+        "cannot drop column b of table o.f because other objects depend on it"
+    );
+    assert_eq!(
+        error.detail.as_deref(),
+        Some("view o.fv depends on column b of table o.f")
+    );
+
+    conn.execute("CREATE SEQUENCE o.s").unwrap();
+    conn.execute("CREATE TABLE u (n bigint DEFAULT nextval('o.s'))")
+        .unwrap();
+    let error = conn.execute("DROP SEQUENCE o.s").unwrap_err();
+    assert_eq!(
+        error.message,
+        "cannot drop sequence o.s because other objects depend on it"
+    );
+}
+
+#[test]
+fn failed_drop_of_several_relations_drops_none() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE kept (a int)").unwrap();
+    conn.execute("INSERT INTO kept VALUES (6)").unwrap();
+    conn.execute("CREATE VIEW kept_view AS SELECT a FROM kept")
+        .unwrap();
+    conn.execute("CREATE TABLE owner (id serial)").unwrap();
+    conn.execute("CREATE TABLE borrower (n bigint DEFAULT nextval('owner_id_seq'))")
+        .unwrap();
+
+    let error = conn.execute("DROP TABLE kept, missing").unwrap_err();
+    assert_eq!(error.sqlstate, "42P01", "{error}");
+    let error = conn.execute("DROP VIEW kept_view, missing").unwrap_err();
+    assert_eq!(error.message, "no such view: missing");
+    let error = conn.execute("DROP TABLE borrower, kept").unwrap_err();
+    assert_eq!(
+        error.message,
+        "cannot drop desired object(s) because other objects depend on them"
+    );
+    assert_eq!(
+        error.detail.as_deref(),
+        Some("view kept_view depends on table kept")
+    );
+    assert_eq!(
+        error.hint.as_deref(),
+        Some("Use DROP ... CASCADE to drop the dependent objects too.")
+    );
+    let error = conn.execute("DROP TABLE kept, owner CASCADE").unwrap_err();
+    assert_eq!(error.sqlstate, "0A000", "{error}");
+
+    let rows = conn
+        .query("SELECT a FROM kept_view")
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows[0][0].to_string(), "6");
+}
+
+#[test]
 fn refused_drop_leaves_the_sequence_and_the_other_default_working() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();
@@ -529,5 +654,135 @@ fn insert_into_a_serial_primary_key_needs_usage_on_its_sequence() {
     assert!(
         error.contains("permission denied for sequence t_id_seq"),
         "{error}"
+    );
+}
+
+fn always_identity_error(conn: &turso_pg::Connection, table: &str) -> String {
+    conn.execute(format!("INSERT INTO {table} (id) VALUES (42)"))
+        .unwrap_err()
+        .to_string()
+}
+
+#[test]
+fn always_identity_rule_is_kept_after_reopen() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    conn.execute(
+        "CREATE TABLE bound (id bigint GENERATED ALWAYS AS IDENTITY, v bigint DEFAULT nextval('s'))",
+    )
+    .unwrap();
+    for table in ["added", "dropped", "renamed", "renamed_column"] {
+        conn.execute(format!(
+            "CREATE TABLE {table} (id bigint GENERATED ALWAYS AS IDENTITY, v text, w text)"
+        ))
+        .unwrap();
+    }
+    conn.execute("ALTER TABLE added ADD COLUMN x text").unwrap();
+    conn.execute("ALTER TABLE dropped DROP COLUMN w").unwrap();
+    conn.execute("ALTER TABLE renamed RENAME TO renamed2")
+        .unwrap();
+    conn.execute("ALTER TABLE renamed_column RENAME COLUMN v TO v2")
+        .unwrap();
+    conn.execute("CREATE TABLE shifted (v text, w text, id bigint GENERATED ALWAYS AS IDENTITY)")
+        .unwrap();
+    conn.execute("ALTER TABLE shifted DROP COLUMN v").unwrap();
+    conn.close().unwrap();
+    drop(conn);
+
+    let db = db.reopen();
+    let conn = db.connect_postgres();
+    for table in [
+        "bound",
+        "added",
+        "dropped",
+        "renamed2",
+        "renamed_column",
+        "shifted",
+    ] {
+        assert!(
+            always_identity_error(&conn, table)
+                .contains("cannot insert a non-DEFAULT value into column \"id\""),
+            "{table}"
+        );
+    }
+    conn.execute("INSERT INTO bound (id, v) VALUES (DEFAULT, DEFAULT)")
+        .unwrap();
+    conn.execute("INSERT INTO shifted (w) VALUES ('a')")
+        .unwrap();
+    let mut rows = conn.query("SELECT id, v FROM bound").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected a row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(row.get_value(0), &Value::Numeric(Numeric::Integer(1)));
+    assert_eq!(row.get_value(1), &Value::Numeric(Numeric::Integer(1)));
+}
+
+#[test]
+fn identity_kind_is_kept_after_reopen() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute(
+        "CREATE TABLE kinds (a int GENERATED ALWAYS AS IDENTITY, b int GENERATED BY DEFAULT AS IDENTITY, c text)",
+    )
+    .unwrap();
+    conn.execute("ALTER TABLE kinds ADD COLUMN d text").unwrap();
+    conn.close().unwrap();
+    drop(conn);
+
+    let db = db.reopen();
+    let conn = db.connect_postgres();
+    let mut rows = conn
+        .query(
+            "SELECT a.attname, a.attidentity FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid \
+             WHERE c.relname = 'kinds' AND a.attnum > 0 ORDER BY a.attnum",
+        )
+        .unwrap()
+        .unwrap();
+    let mut kinds = Vec::new();
+    while let StepResult::Row = rows.step().unwrap() {
+        let row = rows.row().unwrap();
+        kinds.push((row.get_value(0).to_string(), row.get_value(1).to_string()));
+    }
+    let kinds: Vec<(&str, &str)> = kinds
+        .iter()
+        .map(|(n, k)| (n.as_str(), k.as_str()))
+        .collect();
+    assert_eq!(kinds, [("a", "a"), ("b", "d"), ("c", ""), ("d", "")]);
+}
+
+#[test]
+fn vacuum_keeps_identity_values_and_the_always_rule() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE ident (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text)")
+        .unwrap();
+    conn.execute("INSERT INTO ident (v) VALUES ('a'), ('b')")
+        .unwrap();
+    conn.execute("DELETE FROM ident WHERE v = 'a'").unwrap();
+    conn.inner()
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    conn.inner().execute("VACUUM").unwrap();
+
+    assert_eq!(key_rows(&conn, "ident"), vec![(Some(2), "b".to_string())]);
+    conn.execute("INSERT INTO ident (v) VALUES ('c')").unwrap();
+    assert!(always_identity_error(&conn, "ident")
+        .contains("cannot insert a non-DEFAULT value into column \"id\""));
+    conn.close().unwrap();
+    drop(conn);
+
+    let db = db.reopen();
+    let conn = db.connect_postgres();
+    conn.execute("INSERT INTO ident (v) VALUES ('d')").unwrap();
+    assert_eq!(
+        key_rows(&conn, "ident"),
+        vec![
+            (Some(2), "b".to_string()),
+            (Some(3), "c".to_string()),
+            (Some(4), "d".to_string())
+        ]
     );
 }

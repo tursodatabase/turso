@@ -957,3 +957,85 @@ matrix hash-join-result-matrix {
     ORDER BY l.id, r.id
     $limit;
 }
+
+# The hash build input for b is materialized from the join prefix a, d, b,
+# which holds the whole RIGHT JOIN. A WHERE term that reads the RIGHT JOIN's
+# left table and the probe table runs in the probe loop.
+setup right-join-in-hash-build-prefix {
+    CREATE TABLE a(k INTEGER PRIMARY KEY, s);
+    CREATE TABLE b(k INTEGER PRIMARY KEY);
+    CREATE TABLE c(u, r);
+    CREATE TABLE d(x);
+    INSERT INTO a VALUES(1,1);
+    INSERT INTO b VALUES(1);
+    INSERT INTO c VALUES(1,0);
+    INSERT INTO d VALUES(1);
+    ANALYZE;
+}
+
+@setup right-join-in-hash-build-prefix
+@skip-if sqlite "SQLite does not have a hash join plan"
+test right-join-in-hash-build-prefix-materializes-the-build-input {
+    EXPLAIN QUERY PLAN
+    SELECT 1 FROM a RIGHT JOIN d JOIN b ON a.k=b.k JOIN c ON b.k=c.u WHERE c.r OR a.s;
+}
+expect pattern {
+    (?s)MATERIALIZE hash build input for b.*RIGHT-JOIN d.*HASH JOIN c
+}
+
+@setup right-join-in-hash-build-prefix
+test right-join-in-hash-build-prefix-where-reads-left-and-probe-tables {
+    SELECT 1 FROM a RIGHT JOIN d JOIN b ON a.k=b.k JOIN c ON b.k=c.u WHERE c.r OR a.s;
+}
+expect {
+    1
+}
+
+# Unmatched rows of d reach the probe loop with a set to NULL, and the WHERE
+# term must check them too.
+setup right-join-unmatched-rows-in-hash-build-prefix {
+    CREATE TABLE a(k INTEGER PRIMARY KEY, s);
+    CREATE TABLE b(k INTEGER PRIMARY KEY);
+    CREATE TABLE c(u, r);
+    CREATE TABLE d(x);
+    INSERT INTO a VALUES(1,1),(2,0),(3,NULL);
+    INSERT INTO b VALUES(1),(2),(3),(4),(5);
+    INSERT INTO c VALUES(1,0),(2,1),(3,0),(4,1),(5,0),(1,1);
+    INSERT INTO d VALUES(1),(2),(3),(4),(5);
+    ANALYZE;
+}
+
+@setup right-join-unmatched-rows-in-hash-build-prefix
+@skip-if sqlite "SQLite does not have a hash join plan"
+test right-join-unmatched-rows-in-hash-build-prefix-materializes-the-build-input {
+    EXPLAIN QUERY PLAN
+    SELECT a.k, d.x, b.k, c.r
+    FROM a RIGHT JOIN d ON a.k=d.x JOIN b ON d.x=b.k JOIN c ON b.k=c.u
+    WHERE c.r OR a.s;
+}
+expect pattern {
+    (?s)MATERIALIZE hash build input for b.*RIGHT-JOIN d.*HASH JOIN c
+}
+
+@setup right-join-unmatched-rows-in-hash-build-prefix
+@skip-if sqlite "SQLite does not have a hash join plan"
+test full-join-unmatched-rows-in-hash-build-prefix-materializes-the-build-input {
+    EXPLAIN QUERY PLAN
+    SELECT a.k, d.x, b.k, c.r
+    FROM a FULL JOIN d ON a.k=d.x JOIN b ON d.x=b.k JOIN c ON b.k=c.u
+    WHERE c.r OR a.s;
+}
+expect pattern {
+    (?s)MATERIALIZE hash build input for b.*RIGHT-JOIN d.*HASH JOIN c
+}
+
+
+@setup right-join-unmatched-rows-in-hash-build-prefix
+@var join_type { RIGHT JOIN | FULL JOIN }
+@var filter { c.r OR a.s | c.r OR a.s IS NULL | coalesce(a.s, c.r) = c.r }
+matrix right-join-unmatched-rows-in-hash-build-prefix-where-filters-rows {
+    SELECT a.k, d.x, b.k, c.r
+    FROM a $join_type d ON a.k=d.x JOIN b ON d.x=b.k JOIN c ON b.k=c.u
+    WHERE $filter
+    ORDER BY 1, 2, 3, 4;
+}

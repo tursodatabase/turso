@@ -95,8 +95,14 @@ fn run_blob_program(
     b.emit_halt_err(1, "row not found".to_string());
     b.preassign_label_to_next_insn(l_end);
     conn.with_schema_mut(|schema| b.epilogue(schema)).unwrap();
-    let program = b.build(conn.clone(), false, "blob io test").unwrap();
-    let mut stmt = Statement::new(program, conn.get_pager(), QueryMode::Normal, 0);
+    let program = b.build(conn, false, "blob io test").unwrap();
+    let mut stmt = Statement::new(
+        program,
+        conn.clone(),
+        conn.get_pager(),
+        QueryMode::Normal,
+        0,
+    );
     stmt.run_collect_rows().unwrap()
 }
 
@@ -866,6 +872,35 @@ struct SecretTableDialect;
 impl Dialect for SecretTableDialect {
     fn name(&self) -> &'static str {
         "secret-table-test"
+    }
+
+    fn parse(&self, sql: &str) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        turso_sqlite::SqliteDialect.parse(sql)
+    }
+
+    fn parse_internal(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        turso_sqlite::SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+        turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn parameter_marker_ranges(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<Vec<std::ops::Range<usize>>> {
+        turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
+    }
+
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
     }
 
     fn role_has_privilege(

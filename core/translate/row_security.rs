@@ -8,7 +8,7 @@
 //!
 //! Which tables have row-level security, and their policies, are the
 //! dialect's schema state, like the owner of a table. The module compiles the
-//! statements that change them into a [`CatalogChange`] for the dialect to
+//! statements that change them into an [`AccessStatement`] for the dialect to
 //! record.
 
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use turso_parser::ast;
 
 use crate::{
     bail_parse_error,
-    dialect::CatalogChange,
+    dialect::{AccessStatement, CmdContext},
     function::Func,
     namespace::{NamespaceId, NamespaceRef},
     schema::{collect_column_dependencies_of_expr, BTreeTable, Column, Schema, Table},
@@ -306,7 +306,7 @@ pub(crate) fn check_blob_open(
         policy_for(
             dialect.as_ref(),
             schema,
-            role,
+            &|other| dialect.role_has_privileges_of(schema, role, other),
             dialect.role_bypass_rls(schema, role),
             NamespaceId::ROOT,
             table_name,
@@ -342,12 +342,14 @@ fn policy(
     } else {
         roles::table_reader(resolver, resolver.row_security_role)
     };
-    let bypass_rls = dialect.role_bypass_rls(resolver.schema(), role);
+    let main_schema = resolver.schema();
+    let bypass_rls = dialect.role_bypass_rls(main_schema, role);
+    let has_privileges_of = |other| dialect.role_has_privileges_of(main_schema, role, other);
     resolver.with_schema(namespace.database_id, |schema| {
         policy_for(
             dialect,
             schema,
-            role,
+            &has_privileges_of,
             bypass_rls,
             namespace.id,
             table_name,
@@ -357,16 +359,18 @@ fn policy(
 }
 
 /// Whether row-level security limits the rows of table `table_name` of
-/// `namespace` in `schema` that `role` may access for `command`, and the
-/// policies that then decide. As in PostgreSQL's `check_enable_rls`,
-/// row-level security does not limit a role that bypasses it, such as a
-/// superuser, or the table's owner. Whether `role` bypasses row-level
-/// security comes from the main database, which the role was set from, and
-/// `schema` may be another one.
+/// `namespace` in `schema` that a role may access for `command`, and the
+/// policies that then decide. `has_privileges_of` says whether the role has
+/// the privileges of another role. As in PostgreSQL, row-level security does
+/// not limit a role that bypasses it, such as a superuser, or a role with
+/// the privileges of the table's owner, and a policy applies to the roles
+/// with the privileges of its roles. What the role bypasses and whose
+/// privileges it has come from the main database, which the role was set
+/// from, and `schema` may be another one.
 fn policy_for(
     dialect: &dyn Dialect,
     schema: &Schema,
-    role: RoleId,
+    has_privileges_of: &dyn Fn(RoleId) -> bool,
     bypass_rls: bool,
     namespace: NamespaceId,
     table_name: &str,
@@ -375,7 +379,9 @@ fn policy_for(
     let table_name = normalize_ident(table_name);
     if bypass_rls
         || !dialect.table_rls_enabled(schema, namespace, &table_name)
-        || dialect.relation_owner(schema, namespace, &table_name) == Some(role)
+        || dialect
+            .relation_owner(schema, namespace, &table_name)
+            .is_some_and(has_privileges_of)
     {
         return Policy::Allow;
     }
@@ -387,7 +393,7 @@ fn policy_for(
         dialect
             .row_security_policies(schema, namespace, &table_name)
             .iter()
-            .filter(|policy| policy.applies_to(command, role))
+            .filter(|policy| policy.applies_to(command, has_privileges_of))
             .cloned()
             .collect(),
     )
@@ -585,10 +591,10 @@ pub(crate) fn translate_set_row_security(
     connection: &Arc<Connection>,
 ) -> Result<()> {
     let (namespace, table) = row_security_table(qualified_name, resolver)?;
-    translate_change(
-        CatalogChange::SetRowSecurity {
+    translate_access_statement(
+        &AccessStatement::SetRowSecurity {
             namespace: namespace.id,
-            name: normalize_ident(&table.declared_name),
+            name: &normalize_ident(&table.declared_name),
             enabled,
         },
         resolver,
@@ -635,11 +641,11 @@ pub(crate) fn translate_create_policy(
     {
         prepare_policy_expr(expr, namespace, &table, resolver)?;
     }
-    translate_change(
-        CatalogChange::CreatePolicy {
+    translate_access_statement(
+        &AccessStatement::CreatePolicy {
             namespace: namespace.id,
-            name: normalize_ident(&table.declared_name),
-            policy: Box::new(stored),
+            name: &normalize_ident(&table.declared_name),
+            policy: &stored,
         },
         resolver,
         program,
@@ -670,11 +676,11 @@ pub(crate) fn translate_drop_policy(
         return Ok(());
     }
     let (namespace, table) = row_security_table(tbl_name, resolver)?;
-    translate_change(
-        CatalogChange::DropPolicy {
+    translate_access_statement(
+        &AccessStatement::DropPolicy {
             namespace: namespace.id,
-            name: normalize_ident(&table.declared_name),
-            policy_name: policy_name.as_str().to_string(),
+            name: &normalize_ident(&table.declared_name),
+            policy_name: policy_name.as_str(),
             if_exists,
         },
         resolver,
@@ -754,20 +760,23 @@ fn row_security_table(
     }
 }
 
-/// Records `change` through the dialect, in a write transaction that bumps
-/// the schema cookie so that other connections load it.
-pub(crate) fn translate_change(
-    change: CatalogChange,
+/// Has the dialect's catalog store what `statement` changes, in a write
+/// transaction that bumps the schema cookie so that other connections load
+/// what it stored.
+pub(crate) fn translate_access_statement(
+    statement: &AccessStatement<'_>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
     let schema = resolver.schema();
     program.begin_write_on_database(MAIN_DB_ID, schema.schema_version)?;
+    let cmd_context = CmdContext::new(connection, resolver, MAIN_DB_ID);
     resolver
         .catalog
         .dialect
-        .translate_catalog_changes(program, schema, connection, &[change])?;
+        .catalog()
+        .emit_access(program, &cmd_context, statement)?;
     emit_schema_cookie(resolver, program);
     Ok(())
 }
@@ -853,7 +862,7 @@ fn policy_column(name: &ast::Name, table: &BTreeTable) -> Result<ast::Expr> {
 fn check_policy_function(name: &str, arg_count: usize, resolver: &Resolver) -> Result<()> {
     match resolver.resolve_function(name, arg_count)? {
         None => bail_parse_error!("function {name} does not exist"),
-        Some(Func::Agg(_)) => {
+        Some(func) if func.is_aggregate() => {
             bail_parse_error!("aggregate functions are not allowed in policy expressions")
         }
         Some(Func::Window(_)) => {
@@ -928,18 +937,18 @@ mod tests {
     use super::{
         conditions_of, policy, using_condition, with_check_condition, Command, Condition, Policy,
     };
-    use crate::dialect::{Dialect, EngineDialect};
-    use crate::function::Func;
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
+    use crate::dialect::Dialect;
     use crate::namespace::{NamespaceId, NamespaceRef};
-    use crate::schema::{BTreeTable, Schema};
+    use crate::schema::Schema;
     use crate::security::policy::RowPolicy;
     use crate::security::roles::RoleId;
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
     use crate::{DatabaseCatalog, Qualifiers, RwLock, SymbolTable};
 
-    /// The engine dialect, except that every table of a schema with dialect
-    /// schema state has row-level security, and table `documents` has a
-    /// policy that lets every role access every row.
+    /// A dialect in which every table of a schema with dialect schema state
+    /// has row-level security, and table `documents` has a policy that lets
+    /// every role access every row. It cannot parse SQL.
     struct RowSecurityInSchemasWithState;
 
     static ACCESS_EVERY_ROW: std::sync::LazyLock<Vec<RowPolicy>> = std::sync::LazyLock::new(|| {
@@ -955,44 +964,30 @@ mod tests {
 
     impl Dialect for RowSecurityInSchemasWithState {
         fn name(&self) -> &'static str {
-            EngineDialect.name()
+            "row-security-in-schemas-with-state"
         }
 
         fn parse(&self, sql: &str) -> crate::Result<(Option<ast::Cmd>, usize)> {
-            EngineDialect.parse(sql)
+            DialectThatCannotParse.parse(sql)
         }
 
-        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
-            EngineDialect.parse_table_sql(sql, root_page)
+        fn parse_internal(&self, sql: &str) -> crate::Result<(Option<ast::Cmd>, usize)> {
+            DialectThatCannotParse.parse_internal(sql)
         }
 
-        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<ast::Stmt> {
-            EngineDialect.parse_table_sql_ast(sql)
-        }
-
-        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
-            EngineDialect.table_sql_for_replay(sql)
-        }
-
-        fn format_table_sql(
+        fn parse_internal_column_definition(
             &self,
-            input: &str,
-            tbl_name: &ast::QualifiedName,
-            body: &ast::CreateTableBody,
-        ) -> crate::Result<String> {
-            EngineDialect.format_table_sql(input, tbl_name, body)
+            sql: &str,
+        ) -> crate::Result<ast::ColumnDefinition> {
+            DialectThatCannotParse.parse_internal_column_definition(sql)
         }
 
-        fn register_catalog(
-            &self,
-            schema: &mut Schema,
-            enable_custom_types: bool,
-        ) -> crate::Result<()> {
-            EngineDialect.register_catalog(schema, enable_custom_types)
+        fn parameter_marker_ranges(&self, sql: &str) -> crate::Result<Vec<std::ops::Range<usize>>> {
+            DialectThatCannotParse.parameter_marker_ranges(sql)
         }
 
-        fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
-            EngineDialect.resolve_function(name, arg_count)
+        fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+            Arc::new(DialectThatCannotParse)
         }
 
         fn table_rls_enabled(&self, schema: &Schema, _namespace: NamespaceId, _name: &str) -> bool {
@@ -1019,9 +1014,9 @@ mod tests {
     #[test]
     fn conditions_combine_permissive_policies_and_keep_restrictive_ones_apart() {
         let policies = [
-            row_policy("a", true, Some("a = 1"), None),
-            row_policy("b", true, Some("b = 1"), Some("b = 2")),
-            row_policy("r", false, Some("r = 1"), None),
+            row_policy("a", true, Some(equals("a", 1)), None),
+            row_policy("b", true, Some(equals("b", 1)), Some(equals("b", 2))),
+            row_policy("r", false, Some(equals("r", 1)), None),
         ];
 
         assert_eq!(
@@ -1045,8 +1040,8 @@ mod tests {
     #[test]
     fn conditions_without_a_permissive_policy_pass_no_row() {
         let policies = [
-            row_policy("insert_only", true, None, Some("a = 1")),
-            row_policy("r", false, Some("r = 1"), None),
+            row_policy("insert_only", true, None, Some(equals("a", 1))),
+            row_policy("r", false, Some(equals("r", 1)), None),
         ];
 
         assert_eq!(
@@ -1062,31 +1057,26 @@ mod tests {
     fn row_policy(
         name: &str,
         permissive: bool,
-        using_expr: Option<&str>,
-        check_expr: Option<&str>,
+        using_expr: Option<ast::Expr>,
+        check_expr: Option<ast::Expr>,
     ) -> RowPolicy {
-        let expr = |sql: &str| {
-            let Some(ast::Cmd::Stmt(ast::Stmt::Select(select))) =
-                EngineDialect.parse(&format!("SELECT {sql}")).unwrap().0
-            else {
-                panic!("{sql} is not an expression");
-            };
-            let ast::OneSelect::Select { columns, .. } = select.body.select else {
-                panic!("{sql} is not an expression");
-            };
-            let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
-                panic!("{sql} is not an expression");
-            };
-            *expr.clone()
-        };
         RowPolicy {
             name: name.to_string(),
             permissive,
             command: ast::PolicyCommand::All,
             roles: vec![RoleId::PUBLIC],
-            using_expr: using_expr.map(expr),
-            check_expr: check_expr.map(expr),
+            using_expr,
+            check_expr,
         }
+    }
+
+    /// `<column> = <value>`
+    fn equals(column: &str, value: i64) -> ast::Expr {
+        ast::Expr::Binary(
+            Box::new(ast::Expr::Id(ast::Name::exact(column.to_string()))),
+            ast::Operator::Equals,
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric(value.to_string()))),
+        )
     }
 
     fn texts(conditions: &[Condition]) -> Vec<(Option<String>, String)> {

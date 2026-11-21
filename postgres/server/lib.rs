@@ -2,19 +2,23 @@ use std::fmt::Debug;
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 use async_trait::async_trait;
 use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
-use turso_core::{ConnectOpts, Database, Value};
+use turso_core::{ConnectOpts, Database, StatementTimes, Value, WallClockInstant};
 use turso_pg::{
-    split_statements, sql_parse_error, PgConnection, StatementResultKind, TransactionState,
+    split_statements, sql_parse_error, sqlstate_error, PgConnection, StatementResultKind,
+    TransactionState,
 };
 use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_PROTOCOL_VIOLATION,
+};
 use turso_pg_parser::ParseResult;
 
 use pgwire::api::auth::StartupHandler;
@@ -27,15 +31,16 @@ use pgwire::api::results::{
     DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
     QueryResponse, Response, Tag,
 };
-use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
+use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
     ClientInfo, ClientPortalStore, NoopHandler, PgWireConnectionState, PgWireServerHandlers, Type,
+    DEFAULT_NAME,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyOutResponse};
 use pgwire::messages::data::DataRow;
-use pgwire::messages::extendedquery::{Describe, Execute};
+use pgwire::messages::extendedquery::{Bind, BindComplete, Describe, Execute, Sync as PgSync};
 use pgwire::messages::response::{
     EmptyQueryResponse, ErrorResponse, ReadyForQuery, TransactionStatus,
 };
@@ -108,10 +113,7 @@ impl TursoPgServer {
                                 }
                             };
                             let factory = Arc::new(TursoPgFactory {
-                                handler: Arc::new(TursoPgHandler {
-                                    conn: session.clone(),
-                                    query_parser: Arc::new(NoopQueryParser::new()),
-                                }),
+                                handler: Arc::new(TursoPgHandler::new(session.clone())),
                             });
                             tokio::spawn(async move {
                                 if let Err(e) = process_socket(socket, None, factory).await {
@@ -145,7 +147,24 @@ impl TursoPgServer {
 
 struct TursoPgHandler {
     conn: PgConnection,
-    query_parser: Arc<NoopQueryParser>,
+    query_parser: Arc<TimedQueryParser>,
+    message_times: Arc<MessageTimes>,
+}
+
+impl TursoPgHandler {
+    fn new(conn: PgConnection) -> Self {
+        let message_times = Arc::new(MessageTimes {
+            conn: conn.clone(),
+            implicit_transaction_start: Mutex::new(None),
+        });
+        Self {
+            conn,
+            query_parser: Arc::new(TimedQueryParser {
+                message_times: message_times.clone(),
+            }),
+            message_times,
+        }
+    }
 }
 
 struct TursoPgFactory {
@@ -174,9 +193,9 @@ impl SimpleQueryHandler for TursoPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        let _times = self.message_times.simple_query_received();
         let result = self.run_simple_query(client, query).await;
-        let status = wire_transaction_status(&self.conn);
-        finish_query(client, result, false, status).await
+        finish_query(client, result, false, &self.conn).await
     }
 
     async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
@@ -197,7 +216,7 @@ impl SimpleQueryHandler for TursoPgHandler {
             if stmt.result_kind() != StatementResultKind::Rows {
                 responses.push(execute_non_query(&mut stmt, &parsed)?);
             } else {
-                let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+                let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText)?);
                 responses.push(execute_query(&mut stmt, header)?);
             }
         }
@@ -218,13 +237,8 @@ impl TursoPgHandler {
         }
         client.set_state(PgWireConnectionState::QueryInProgress);
         let conn = &self.conn;
-        // Errors raised here never reach PgConnection::prepare, so report
-        // them to the session: any error inside a transaction block aborts
-        // the block.
-        let parse_error = |error: turso_pg_parser::ParseError| {
-            conn.abort_transaction_block_on_error();
-            pg_error(sql_parse_error(error).into())
-        };
+        let parse_error =
+            |error: turso_pg_parser::ParseError| pg_error(sql_parse_error(error).into());
         turso_pg_parser::parse(&query.query).map_err(parse_error)?;
         let statements = turso_pg_parser::split_statements(&query.query).map_err(parse_error)?;
         if statements.is_empty() {
@@ -305,7 +319,7 @@ where
 #[async_trait]
 impl ExtendedQueryHandler for TursoPgHandler {
     type Statement = String;
-    type QueryParser = NoopQueryParser;
+    type QueryParser = TimedQueryParser;
 
     async fn on_execute<C>(&self, client: &mut C, message: Execute) -> PgWireResult<()>
     where
@@ -314,9 +328,49 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        let _times = self.message_times.extended_message_received();
+        let in_transaction_block = !self.conn.inner().get_auto_commit();
         let result = self._on_execute(client, message).await;
-        let status = wire_transaction_status(&self.conn);
-        finish_query(client, result, true, status).await
+        if in_transaction_block && self.conn.inner().get_auto_commit() {
+            self.message_times.transaction_ended();
+        }
+        finish_query(client, result, true, &self.conn).await
+    }
+
+    async fn on_bind<C>(&self, client: &mut C, message: Bind) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        self.message_times.extended_message_received();
+        let statement_name = message.statement_name.as_deref().unwrap_or(DEFAULT_NAME);
+        let Some(statement) = client.portal_store().get_statement(statement_name) else {
+            return Err(PgWireError::StatementNotFound(statement_name.to_owned()));
+        };
+        let portal = Portal::try_new(&message, statement)?;
+        client.portal_store().put_portal(Arc::new(portal));
+        client
+            .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
+            .await?;
+        Ok(())
+    }
+
+    async fn on_sync<C>(&self, client: &mut C, _message: PgSync) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        self.message_times.sync_received();
+        client
+            .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                client.transaction_status(),
+            )))
+            .await?;
+        client.flush().await?;
+        Ok(())
     }
 
     async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
@@ -326,9 +380,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        let _times = self.message_times.extended_message_received();
         let result = self._on_describe(client, message).await;
-        let status = wire_transaction_status(&self.conn);
-        finish_query(client, result, true, status).await
+        finish_query(client, result, true, &self.conn).await
     }
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
@@ -346,6 +400,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
     {
         let conn = &self.conn;
         let query = &portal.statement.statement;
+        if has_no_statements(query)? {
+            return Ok(Response::EmptyQuery);
+        }
 
         let mut stmt = conn.prepare(query).map_err(pg_error)?;
 
@@ -358,7 +415,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
                 .map(|response| with_transaction_state(conn, response));
         }
 
-        let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
+        let header = Arc::new(build_field_info(&stmt, &portal.result_column_format)?);
         execute_query(&mut stmt, header)
     }
 
@@ -371,6 +428,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = &self.conn;
+        if has_no_statements(&target.statement)? {
+            return Ok(DescribeStatementResponse::new(vec![], vec![]));
+        }
         let stmt = conn.prepare(&target.statement).map_err(pg_error)?;
 
         let param_types: Vec<Type> = target
@@ -379,7 +439,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
             .map(|t| t.clone().unwrap_or(Type::TEXT))
             .collect();
 
-        let fields = describe_fields(&stmt, &Format::UnifiedText);
+        let fields = describe_fields(&stmt, &Format::UnifiedText)?;
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -392,19 +452,118 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = &self.conn;
+        if has_no_statements(&portal.statement.statement)? {
+            return Ok(DescribePortalResponse::new(vec![]));
+        }
         let stmt = conn
             .prepare(&portal.statement.statement)
             .map_err(pg_error)?;
 
-        let fields = describe_fields(&stmt, &portal.result_column_format);
+        let fields = describe_fields(&stmt, &portal.result_column_format)?;
         Ok(DescribePortalResponse::new(fields))
     }
 }
 
+/// The clock of the messages of one session, for the times that
+/// `now()` and `statement_timestamp()` report. PostgreSQL takes the time of
+/// a statement from the time it received the client message, and an
+/// implicit transaction starts with the first message after the previous
+/// Sync.
+struct MessageTimes {
+    conn: PgConnection,
+    /// The first extended-protocol message since the last Sync or the end
+    /// of a transaction block.
+    implicit_transaction_start: Mutex<Option<WallClockInstant>>,
+}
+
+impl MessageTimes {
+    /// A Query message is a whole implicit transaction.
+    fn simple_query_received(&self) -> CommandTimesGuard<'_> {
+        let now = self.conn.inner().current_time_wall_clock();
+        self.set(StatementTimes {
+            statement: now,
+            transaction: now,
+        })
+    }
+
+    fn extended_message_received(&self) -> CommandTimesGuard<'_> {
+        let now = self.conn.inner().current_time_wall_clock();
+        let transaction = *self
+            .implicit_transaction_start
+            .lock()
+            .expect("the lock is not held across a panic")
+            .get_or_insert(now);
+        self.set(StatementTimes {
+            statement: now,
+            transaction,
+        })
+    }
+
+    fn sync_received(&self) {
+        self.transaction_ended();
+    }
+
+    /// The next message starts a new transaction, as after COMMIT or
+    /// ROLLBACK of a transaction block in PostgreSQL.
+    fn transaction_ended(&self) {
+        *self
+            .implicit_transaction_start
+            .lock()
+            .expect("the lock is not held across a panic") = None;
+    }
+
+    fn set(&self, times: StatementTimes) -> CommandTimesGuard<'_> {
+        self.conn.inner().set_command_times(Some(times));
+        CommandTimesGuard(&self.conn)
+    }
+}
+
+/// Clears the times of the message when its handling ends.
+struct CommandTimesGuard<'a>(&'a PgConnection);
+
+impl Drop for CommandTimesGuard<'_> {
+    fn drop(&mut self) {
+        self.0.inner().set_command_times(None);
+    }
+}
+
+/// Keeps the text of a statement as it is, and starts the implicit
+/// transaction at the Parse message when it is the first message since Sync.
+struct TimedQueryParser {
+    message_times: Arc<MessageTimes>,
+}
+
+#[async_trait]
+impl QueryParser for TimedQueryParser {
+    type Statement = String;
+
+    async fn parse_sql<C>(
+        &self,
+        _client: &C,
+        sql: &str,
+        _types: &[Option<Type>],
+    ) -> PgWireResult<Self::Statement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        self.message_times.extended_message_received();
+        Ok(sql.to_owned())
+    }
+}
+
+/// Whether `sql` holds only whitespace, semicolons and comments. PostgreSQL
+/// answers Describe of such a query with NoData and Execute with
+/// EmptyQueryResponse, not an error.
+fn has_no_statements(sql: &str) -> PgWireResult<bool> {
+    let statements = turso_pg_parser::split_statements(sql)
+        .map_err(|error| pg_error(sql_parse_error(error).into()))?;
+    Ok(statements.is_empty())
+}
+
 /// The fields of an ordinary result set, or none for commands and COPY.
-fn describe_fields(stmt: &turso_pg::Statement, format: &Format) -> Vec<FieldInfo> {
+fn describe_fields(stmt: &turso_pg::Statement, format: &Format) -> PgWireResult<Vec<FieldInfo>> {
     if stmt.result_kind() != StatementResultKind::Rows {
-        return vec![];
+        return Ok(vec![]);
     }
     build_field_info(stmt, format)
 }
@@ -414,14 +573,100 @@ fn parse_statement(sql: &str) -> PgWireResult<ParseResult> {
 }
 
 /// Build FieldInfo metadata from a prepared statement's column information.
-fn build_field_info(stmt: &turso_pg::Statement, format: &Format) -> Vec<FieldInfo> {
+/// A column the client asks for in binary format is refused, before any row
+/// is produced, when tursopg cannot send its type in binary format.
+fn build_field_info(stmt: &turso_pg::Statement, format: &Format) -> PgWireResult<Vec<FieldInfo>> {
+    let binary = binary_formats(format, stmt.num_columns(), "result column")?;
     (0..stmt.num_columns())
         .map(|i| {
             let name = stmt.get_column_name(i).into_owned();
             let pg_type = resolve_pg_type_for_column(stmt, i);
-            FieldInfo::new(name, None, None, pg_type, format.format_for(i))
+            if !binary[i] {
+                return Ok(FieldInfo::new(name, None, None, pg_type, FieldFormat::Text));
+            }
+            if BinaryEncoding::of(&pg_type).is_none() {
+                return Err(binary_not_supported(
+                    &format!("result column {name}"),
+                    &pg_type,
+                ));
+            }
+            Ok(FieldInfo::new(
+                name,
+                None,
+                None,
+                pg_type,
+                FieldFormat::Binary,
+            ))
         })
         .collect()
+}
+
+/// For each of `count` parameters or result columns, whether the client
+/// asked for binary format (code 1) rather than text (code 0).
+fn binary_formats(format: &Format, count: usize, kind: &str) -> PgWireResult<Vec<bool>> {
+    let codes = match format {
+        Format::UnifiedText => return Ok(vec![false; count]),
+        Format::UnifiedBinary => return Ok(vec![true; count]),
+        Format::Individual(codes) => codes,
+    };
+    if codes.len() != count {
+        let message = format!(
+            "bind message has {} {kind} formats but {count} {kind}s",
+            codes.len()
+        );
+        return Err(wire_error(SQLSTATE_PROTOCOL_VIOLATION, message));
+    }
+    codes
+        .iter()
+        .map(|code| match code {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(wire_error(
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                format!("unsupported format code: {code}"),
+            )),
+        })
+        .collect()
+}
+
+fn binary_not_supported(what: &str, pg_type: &Type) -> PgWireError {
+    let message = format!(
+        "binary format is not supported for {what} of type {}; use text format",
+        pg_type.name()
+    );
+    wire_error(SQLSTATE_FEATURE_NOT_SUPPORTED, message)
+}
+
+fn wire_error(sqlstate: &'static str, message: String) -> PgWireError {
+    pg_error(sqlstate_error(sqlstate, message, None).into())
+}
+
+/// How tursopg reads or writes a value of a type in binary format.
+#[derive(Clone, Copy)]
+enum BinaryEncoding {
+    /// The binary format of these types is the text's UTF-8 bytes, the same
+    /// bytes as their text format.
+    Text,
+    Bool,
+    Int4,
+    Int8,
+    Float8,
+    Bytea,
+}
+
+impl BinaryEncoding {
+    /// None for a type whose binary format tursopg neither reads nor writes.
+    fn of(pg_type: &Type) -> Option<Self> {
+        match *pg_type {
+            Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => Some(Self::Text),
+            Type::BOOL => Some(Self::Bool),
+            Type::INT4 => Some(Self::Int4),
+            Type::INT8 => Some(Self::Int8),
+            Type::FLOAT8 => Some(Self::Float8),
+            Type::BYTEA => Some(Self::Bytea),
+            _ => None,
+        }
+    }
 }
 
 /// Decide the PG wire type for a result column.
@@ -517,23 +762,44 @@ fn execute_query(
 ) -> PgWireResult<Response> {
     let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
     let header_clone = header.clone();
+    let text_types: Vec<turso_pg::TextType> = (0..stmt.num_columns())
+        .map(|i| turso_pg::TextType::of_column(stmt, i))
+        .collect();
+    let mut encode_failed = false;
 
-    stmt.run_with_row_callback(|row| {
+    let result = stmt.run_with_row_callback(|row| {
         let mut encoder = DataRowEncoder::new(header_clone.clone());
         for (i, val) in row.get_values().enumerate() {
             let (pg_type, format) = header_clone
                 .get(i)
                 .map(|fi| (fi.datatype().clone(), fi.format()))
                 .unwrap_or((Type::TEXT, FieldFormat::Text));
-            encode_value(&mut encoder, val, &pg_type, format)?;
+            encode_value(&mut encoder, val, &pg_type, format, text_types[i]).inspect_err(|_| {
+                encode_failed = true;
+            })?;
         }
         rows.push(encoder.finish());
         Ok(())
-    })
-    .map_err(pg_error)?;
+    });
+    if encode_failed {
+        stop_statement(stmt)?;
+    }
+    result.map_err(pg_error)?;
 
     let data_stream = stream::iter(rows);
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
+}
+
+/// Stops `stmt` after a row it returned could not be sent, and rolls back the
+/// statement's changes. Resetting the statement instead would commit the rows
+/// that an autocommit `INSERT ... RETURNING` has already written.
+fn stop_statement(stmt: &mut turso_pg::Statement) -> PgWireResult<()> {
+    stmt.interrupt();
+    match stmt.run_ignore_rows() {
+        Err(error) if matches!(error.core_error(), turso_core::LimboError::Interrupt) => Ok(()),
+        Err(error) => Err(pg_error(error)),
+        Ok(()) => unreachable!("a statement interrupted after returning a row ran to its end"),
+    }
 }
 
 /// Execute a non-SELECT statement and build an Execution response.
@@ -597,17 +863,22 @@ fn bind_portal_parameters(
     stmt: &mut turso_pg::Statement,
     portal: &Portal<String>,
 ) -> PgWireResult<()> {
-    for i in 0..portal.parameter_len() {
-        let value = match &portal.parameters[i] {
+    let binary = binary_formats(
+        &portal.parameter_format,
+        portal.parameter_len(),
+        "parameter",
+    )?;
+    for (i, (bytes, binary)) in portal.parameters.iter().zip(binary).enumerate() {
+        let declared = portal.statement.parameter_types.get(i);
+        let value = match bytes {
             None => Value::Null,
             Some(bytes) => {
-                let pg_type = portal
-                    .statement
-                    .parameter_types
-                    .get(i)
-                    .and_then(|t| t.as_ref())
-                    .unwrap_or(&Type::UNKNOWN);
-                pg_bytes_to_value(bytes, pg_type)?
+                let pg_type = declared.and_then(|t| t.as_ref()).unwrap_or(&Type::UNKNOWN);
+                if binary {
+                    binary_parameter_value(bytes, pg_type, i + 1)?
+                } else {
+                    pg_bytes_to_value(bytes, pg_type)?
+                }
             }
         };
         // Portal parameter i corresponds to PostgreSQL $N where N = i + 1.
@@ -622,6 +893,25 @@ fn bind_portal_parameters(
         let _ = stmt.bind_at(idx, value);
     }
     Ok(())
+}
+
+/// Reads parameter `$n` sent in binary format as `pg_type`, the type Parse
+/// declared for it. A type whose binary format is its text is read as in text
+/// format. A parameter whose type Parse left out or left unspecified (OID 0)
+/// has type `unknown` and is refused: PostgreSQL works out its type from the
+/// query, and tursopg cannot.
+fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Value> {
+    match BinaryEncoding::of(pg_type) {
+        Some(BinaryEncoding::Text) => pg_bytes_to_value(bytes, pg_type),
+        Some(BinaryEncoding::Bytea) => Ok(Value::from_blob(bytes.to_vec())),
+        Some(
+            BinaryEncoding::Bool
+            | BinaryEncoding::Int4
+            | BinaryEncoding::Int8
+            | BinaryEncoding::Float8,
+        )
+        | None => Err(binary_not_supported(&format!("parameter ${n}"), pg_type)),
+    }
 }
 
 /// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
@@ -722,104 +1012,74 @@ fn encode_value(
     val: &Value,
     pg_type: &Type,
     format: FieldFormat,
+    text_type: turso_pg::TextType,
 ) -> turso_core::Result<()> {
-    match val {
-        Value::Null => encoder
-            .encode_field(&None::<i8>)
-            .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
-        Value::Numeric(n) if format == FieldFormat::Binary => {
-            encode_binary_number(encoder, n, pg_type)
-                .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
-        }
-        Value::Numeric(turso_core::Numeric::Integer(i)) => {
-            // Boolean columns: encode as true/false instead of 0/1
-            if *pg_type == Type::BOOL {
-                encoder
-                    .encode_field(&(*i != 0))
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
-            } else {
-                encoder
-                    .encode_field(i)
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
-            }
-        }
-        Value::Numeric(turso_core::Numeric::Float(f)) => encoder
-            .encode_field(&f64::from(*f))
-            .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
-        Value::Text(t) => {
-            let text = t.value.as_ref();
-            // For TIMESTAMPTZ columns, ensure timezone info is present so clients
-            // parse the value correctly (as UTC, not local time).
-            // TIMESTAMP (without TZ) should NOT have timezone suffix.
-            if *pg_type == Type::TIMESTAMPTZ
-                && !text.contains('+')
-                && !text.contains('Z')
-                && !text.ends_with("-00")
-            {
-                let with_tz = format!("{text}+00");
-                encoder
-                    .encode_field(&with_tz.as_str())
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
-            } else if pg_type.name().starts_with('_') {
-                // Array types: pgwire's to_sql_text quotes strings containing
-                // {, }, or commas when the type is Kind::Array. Since we store
-                // array values as pre-formatted PG array literals (e.g.
-                // "{1,2,3}"), encode with Type::TEXT to bypass the quoting.
-                encoder
-                    .encode_field_with_type_and_format(
-                        &text,
-                        &Type::TEXT,
-                        FieldFormat::Text,
-                        &FormatOptions::default(),
-                    )
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
-            } else {
-                encoder
-                    .encode_field(&text)
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
-            }
-        }
-        Value::Blob(b) => encoder
-            .encode_field(&b.as_slice())
+    match format {
+        FieldFormat::Binary => encode_binary(encoder, val, pg_type, text_type),
+        FieldFormat::Text => encode_text(encoder, val, text_type)
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
     }
 }
 
-/// Binary format writes a number with the width of its Rust type, so the
-/// encoding follows the column's type, not the stored value: `count(*)` is
-/// typed text, and `coalesce(NULL::float8, 1)` holds an integer. For a type
-/// without a binary number encoding here, the value is sent as its text, the
-/// same bytes as in text format.
-fn encode_binary_number(
+/// Writes `val` in text format, whatever format the column's header names.
+fn encode_text(
     encoder: &mut DataRowEncoder,
-    n: &turso_core::Numeric,
-    pg_type: &Type,
+    val: &Value,
+    text_type: turso_pg::TextType,
 ) -> PgWireResult<()> {
+    let text = turso_pg::value_text(val, text_type);
+    // pgwire writes a string as it is for Type::TEXT. For an array type it
+    // would quote the string, which already is an array literal like {1,2,3}.
+    encoder.encode_field_with_type_and_format(
+        &text.as_deref(),
+        &Type::TEXT,
+        FieldFormat::Text,
+        &FormatOptions::default(),
+    )
+}
+
+/// Binary format writes a value in the encoding of its column's type, not of
+/// the stored value: `count(*)` is typed text, and `coalesce(NULL::float8, 1)`
+/// holds an integer. A value that the type cannot hold, such as 12.5 in the
+/// int4 column of `SELECT 1 UNION ALL SELECT 12.5`, is refused with 0A000.
+fn encode_binary(
+    encoder: &mut DataRowEncoder,
+    val: &Value,
+    pg_type: &Type,
+    text_type: turso_pg::TextType,
+) -> turso_core::Result<()> {
     use turso_core::Numeric::{Float, Integer};
-    match *n {
-        Integer(i) if *pg_type == Type::BOOL => encoder.encode_field(&(i != 0)),
-        // A value outside the i32 range, stored in an int column, keeps
-        // the i64 encoding as before, which binary clients still misread.
-        Integer(i) if *pg_type == Type::INT4 => match i32::try_from(i) {
+    use BinaryEncoding::{Bool, Bytea, Float8, Int4, Int8, Text};
+    let encoding = BinaryEncoding::of(pg_type)
+        .expect("build_field_info refuses binary format for a type without a binary encoding");
+    let written = match (encoding, val) {
+        (Text, _) => encode_text(encoder, val, text_type),
+        (_, Value::Null) => encoder.encode_field(&None::<i8>),
+        (Bool, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i != 0)),
+        (Int4, Value::Numeric(Integer(i))) => match i32::try_from(*i) {
             Ok(i) => encoder.encode_field(&i),
-            Err(_) => encoder.encode_field(&i),
+            Err(_) => return Err(binary_value_not_supported(pg_type)),
         },
-        Integer(i) if *pg_type == Type::INT8 => encoder.encode_field(&i),
-        Integer(i) if *pg_type == Type::FLOAT8 => encoder.encode_field(&(i as f64)),
-        Float(f) if *pg_type == Type::FLOAT8 => encoder.encode_field(&f64::from(f)),
-        Integer(i) => encoder.encode_field_with_type_and_format(
-            &i,
-            pg_type,
-            FieldFormat::Text,
-            &FormatOptions::default(),
-        ),
-        Float(f) => encoder.encode_field_with_type_and_format(
-            &f64::from(f),
-            pg_type,
-            FieldFormat::Text,
-            &FormatOptions::default(),
-        ),
-    }
+        (Int8, Value::Numeric(Integer(i))) => encoder.encode_field(i),
+        (Float8, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f64)),
+        (Float8, Value::Numeric(Float(f))) => encoder.encode_field(&f64::from(*f)),
+        (Bytea, Value::Blob(b)) => encoder.encode_field(&b.as_slice()),
+        (Bool | Int4 | Int8, Value::Numeric(Float(_)))
+        | (Bytea, Value::Numeric(_))
+        | (Bool | Int4 | Int8 | Float8 | Bytea, Value::Text(_))
+        | (Bool | Int4 | Int8 | Float8, Value::Blob(_)) => {
+            return Err(binary_value_not_supported(pg_type))
+        }
+    };
+    written.map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+}
+
+fn binary_value_not_supported(pg_type: &Type) -> turso_core::LimboError {
+    let message = format!(
+        "cannot send this value in binary format as type {}; use text format",
+        pg_type.name()
+    );
+    sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, message, None)
 }
 
 fn sqlite_type_to_pg_type(type_str: &str) -> Type {
@@ -883,13 +1143,17 @@ async fn finish_query<C>(
     client: &mut C,
     result: PgWireResult<()>,
     wait_for_sync: bool,
-    status: TransactionStatus,
+    conn: &PgConnection,
 ) -> PgWireResult<()>
 where
     C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     C::Error: Debug,
     PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
 {
+    if result.is_err() {
+        // Any error inside a transaction block aborts the block, as in PostgreSQL.
+        conn.abort_transaction_block_on_error();
+    }
     let Err(PgWireError::ApiError(error)) = result else {
         return result;
     };
@@ -904,6 +1168,7 @@ where
     ];
     for (tag, value) in [
         (b'D', &error.detail),
+        (b'H', &error.hint),
         (b't', &error.table_name),
         (b'c', &error.column_name),
         (b'n', &error.constraint_name),
@@ -917,6 +1182,7 @@ where
             fields,
         )))
         .await?;
+    let status = wire_transaction_status(conn);
     client.set_transaction_status(status);
     if wait_for_sync {
         client.set_state(PgWireConnectionState::AwaitingSync);
@@ -1160,10 +1426,7 @@ mod tests {
         )
         .unwrap();
         let conn = PgConnection::connect(&db).unwrap();
-        let handler = Arc::new(TursoPgHandler {
-            conn: conn.clone(),
-            query_parser: Arc::new(NoopQueryParser::new()),
-        });
+        let handler = Arc::new(TursoPgHandler::new(conn.clone()));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1288,13 +1551,6 @@ mod tests {
                 b"\0\0\0\x08\0\0\0\x02\x18\x71\x1a\0",
                 b"\0\0\0\x0a9000000000",
             ),
-            // Out of the int4 range: still 8 bytes, until #10826.
-            (
-                "SELECT i FROM o",
-                Type::INT4,
-                b"\0\0\0\x08\0\0\0\0\xb2\xd0\x5e\0",
-                b"\0\0\0\x0a3000000000",
-            ),
             (
                 "SELECT 1.5::float8",
                 Type::FLOAT8,
@@ -1309,6 +1565,13 @@ mod tests {
                 b"\0\0\0\x011",
                 b"\0\0\0\x011",
             ),
+            // json_each() returns the text of a member, which is not a number.
+            (
+                "SELECT value FROM json_each('{\"a\":\"s\"}')",
+                Type::TEXT,
+                b"\0\0\0\x03\"s\"",
+                b"\0\0\0\x03\"s\"",
+            ),
             (
                 "SELECT coalesce(NULL::float8, 1)",
                 Type::FLOAT8,
@@ -1319,7 +1582,7 @@ mod tests {
             for (format, expected) in [(Format::UnifiedBinary, binary), (Format::UnifiedText, text)]
             {
                 let mut stmt = conn.prepare(sql).unwrap();
-                let fields = Arc::new(build_field_info(&stmt, &format));
+                let fields = Arc::new(build_field_info(&stmt, &format).unwrap());
                 assert_eq!(*fields[0].datatype(), expected_type, "{sql}");
                 let rows = stmt.run_collect_rows().unwrap();
                 let mut encoder = DataRowEncoder::new(fields.clone());
@@ -1328,11 +1591,288 @@ mod tests {
                     &rows[0][0],
                     fields[0].datatype(),
                     fields[0].format(),
+                    turso_pg::TextType::of_column(&stmt, 0),
                 )
                 .unwrap();
                 assert_eq!(&encoder.finish().unwrap().data[..], expected, "{sql}");
             }
         }
+        // A value that the column's binary type cannot hold is refused.
+        for sql in ["SELECT i FROM o", "SELECT 1 UNION ALL SELECT 12.5"] {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedBinary).unwrap());
+            let Err(error) = execute_query(&mut stmt, fields) else {
+                panic!("{sql}: no error");
+            };
+            assert_eq!(sqlstate(error), SQLSTATE_FEATURE_NOT_SUPPORTED, "{sql}");
+        }
+    }
+
+    #[test]
+    fn unsupported_binary_formats_are_refused() {
+        let conn = memory_connection();
+        let timestamptz = conn
+            .prepare("SELECT CAST('2024-01-05 10:00+00' AS timestamptz)")
+            .unwrap();
+        let error = build_field_info(&timestamptz, &Format::UnifiedBinary).unwrap_err();
+        assert_eq!(sqlstate(error), SQLSTATE_FEATURE_NOT_SUPPORTED);
+
+        let codes = |codes: Vec<i16>, count| binary_formats(&Format::Individual(codes), count, "x");
+        assert_eq!(codes(vec![0, 1], 2).unwrap(), [false, true]);
+        assert_eq!(
+            sqlstate(codes(vec![1, 1], 1).unwrap_err()),
+            SQLSTATE_PROTOCOL_VIOLATION
+        );
+        let error = codes(vec![0, 2], 2).unwrap_err();
+        assert_eq!(sqlstate(error), SQLSTATE_INVALID_PARAMETER_VALUE);
+
+        // Parameter types declared in Parse, the binary bytes, and the value
+        // bound, or None for a refused parameter.
+        for (declared, bytes, expected) in [
+            (
+                vec![Some(Type::TEXT)],
+                &b"42"[..],
+                Some(Value::from_text("42")),
+            ),
+            // Type OID 0: PostgreSQL reads `SELECT $1::int4` with these bytes
+            // as 42.
+            (vec![None], b"\0\0\0\x2a", None),
+            (
+                vec![Some(Type::BYTEA)],
+                b"\\x41",
+                Some(Value::from_blob(b"\\x41".to_vec())),
+            ),
+            (vec![Some(Type::INT8)], b"\0\0\0\0\0\0\0\x2a", None),
+            (vec![Some(Type::TIMESTAMPTZ)], b"\0\0\0\0\0\0\0\0", None),
+            (vec![], b"42", None),
+        ] {
+            let mut portal = Portal::<String>::default();
+            portal.statement =
+                Arc::new(StoredStatement::new(String::new(), String::new(), declared));
+            portal.parameter_format = Format::UnifiedBinary;
+            portal.parameters = vec![Some(bytes.to_vec().into())];
+            let mut stmt = conn.prepare("SELECT $1").unwrap();
+            match (bind_portal_parameters(&mut stmt, &portal), expected) {
+                (Ok(()), Some(value)) => assert_eq!(stmt.run_collect_rows().unwrap(), [[value]]),
+                (Err(error), None) => assert_eq!(sqlstate(error), SQLSTATE_FEATURE_NOT_SUPPORTED),
+                (result, expected) => panic!("{bytes:?}: {result:?}, expected {expected:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_binary_format_aborts_the_transaction_block() {
+        let (mut client, _conn) = copy_test_client();
+        client.simple_query("CREATE TABLE u (u uuid)").unwrap();
+        client.simple_query("BEGIN").unwrap();
+        let events = execute_with_binary_result(&mut client, "SELECT u FROM u");
+        assert_refused(&events, b'E');
+        let events = client.simple_query("COMMIT").unwrap();
+        assert!(matches!(&events[0], BackendEvent::CommandComplete(tag) if tag == "ROLLBACK"));
+    }
+
+    #[test]
+    fn an_empty_extended_query_keeps_the_transaction_block() {
+        let (mut client, _conn) = copy_test_client();
+        client.simple_query("CREATE TABLE q (i int)").unwrap();
+        client.simple_query("BEGIN").unwrap();
+        client.simple_query("INSERT INTO q VALUES (1)").unwrap();
+        for sql in ["", ";", "-- c", "/* c */"] {
+            // Parse, Describe statement, Bind, Describe portal, Execute, Sync.
+            let mut parse = vec![0];
+            parse.extend_from_slice(sql.as_bytes());
+            parse.extend_from_slice(b"\0\0\0");
+            client.write_message(b'P', &parse).unwrap();
+            client.write_message(b'D', b"S\0").unwrap();
+            client.write_message(b'B', b"\0\0\0\0\0\0\0\0").unwrap();
+            client.write_message(b'D', b"P\0").unwrap();
+            client.write_message(b'E', b"\0\0\0\0\0").unwrap();
+            client.write_message(b'S', b"").unwrap();
+            let mut events = Vec::new();
+            while !matches!(events.last(), Some(BackendEvent::ReadyForQuery(_))) {
+                events.push(client.read_event().unwrap());
+            }
+            // ParseComplete, ParameterDescription, NoData, BindComplete, NoData.
+            let [BackendEvent::Other(b'1'), BackendEvent::Other(b't'), BackendEvent::Other(b'n'), BackendEvent::Other(b'2'), BackendEvent::Other(b'n'), BackendEvent::EmptyQueryResponse, BackendEvent::ReadyForQuery(b'T')] =
+                &events[..]
+            else {
+                panic!("{sql:?}: {events:?}");
+            };
+        }
+        let events = client.simple_query("COMMIT").unwrap();
+        assert!(matches!(&events[0], BackendEvent::CommandComplete(tag) if tag == "COMMIT"));
+        assert_row_count(&mut client, "q", "1");
+    }
+
+    const THREE_TIMES: &str = "SELECT now(), statement_timestamp(), clock_timestamp()";
+
+    fn data_rows(events: &[BackendEvent]) -> Vec<Vec<Option<String>>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                BackendEvent::DataRow(row) => Some(row.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Sends Parse, Bind and Execute of `sql`, without Sync.
+    fn send_extended(client: &mut PgConn, sql: &str) {
+        let mut parse = vec![0];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(b"\0\0\0");
+        client.write_message(b'P', &parse).unwrap();
+        client.write_message(b'B', b"\0\0\0\0\0\0\0\0").unwrap();
+        client.write_message(b'E', b"\0\0\0\0\0").unwrap();
+    }
+
+    fn sync_and_read(client: &mut PgConn) -> Vec<BackendEvent> {
+        client.write_message(b'S', b"").unwrap();
+        let mut events = Vec::new();
+        while !matches!(events.last(), Some(BackendEvent::ReadyForQuery(_))) {
+            events.push(client.read_event().unwrap());
+        }
+        events
+    }
+
+    #[test]
+    fn the_statements_of_one_query_message_share_now_and_statement_timestamp() {
+        let (mut client, _conn) = copy_test_client();
+        let events = client
+            .simple_query(&format!(
+                "{THREE_TIMES}; SELECT count(*) FROM generate_series(1, 100000); {THREE_TIMES}"
+            ))
+            .unwrap();
+        let rows = data_rows(&events);
+        let [first, _, second] = &rows[..] else {
+            panic!("{events:?}");
+        };
+        assert_eq!(first[0], second[0], "now()");
+        assert_eq!(first[1], second[1], "statement_timestamp()");
+        // Windows reads the clock in steps of about 15 ms, so two
+        // statements of one message can read the same time.
+        assert!(first[2] <= second[2], "clock_timestamp()");
+        // A later message is a later statement and transaction.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let later = data_rows(&client.simple_query(THREE_TIMES).unwrap());
+        assert_ne!(first[0], later[0][0]);
+        assert_ne!(first[1], later[0][1]);
+    }
+
+    #[test]
+    fn an_extended_batch_shares_now_until_sync() {
+        let (mut client, _conn) = copy_test_client();
+        send_extended(&mut client, THREE_TIMES);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        send_extended(&mut client, THREE_TIMES);
+        let rows = data_rows(&sync_and_read(&mut client));
+        let [first, second] = &rows[..] else {
+            panic!("{rows:?}");
+        };
+        assert_eq!(first[0], second[0], "now() lasts until Sync");
+        assert_ne!(first[1], second[1], "each Execute has its own time");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        send_extended(&mut client, THREE_TIMES);
+        let after_sync = data_rows(&sync_and_read(&mut client));
+        assert_ne!(first[0], after_sync[0][0], "Sync ends the transaction");
+    }
+
+    #[test]
+    fn a_transaction_after_commit_in_an_extended_batch_has_its_own_now() {
+        let (mut client, _conn) = copy_test_client();
+        send_extended(&mut client, "BEGIN");
+        send_extended(&mut client, THREE_TIMES);
+        send_extended(&mut client, "COMMIT");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        send_extended(&mut client, THREE_TIMES);
+        let rows = data_rows(&sync_and_read(&mut client));
+        let [first, second] = &rows[..] else {
+            panic!("{rows:?}");
+        };
+        assert_ne!(first[0], second[0], "COMMIT ends the transaction");
+    }
+
+    // 3000000000 doesn't fit the int4 column, so the second row is refused
+    // after the first row is inserted.
+    const INSERT_RETURNING_MISFIT: &str = "INSERT INTO r VALUES (1), (3000000000) RETURNING i";
+
+    #[test]
+    fn a_refused_returning_row_rolls_back_the_insert() {
+        let (mut client, _conn) = copy_test_client();
+        client.simple_query("CREATE TABLE r (i int)").unwrap();
+        let events = execute_with_binary_result(&mut client, INSERT_RETURNING_MISFIT);
+        assert_refused(&events, b'I');
+        assert_row_count(&mut client, "r", "0");
+    }
+
+    #[test]
+    fn a_refused_returning_row_in_a_block_is_not_committed() {
+        let (mut client, _conn) = copy_test_client();
+        client.simple_query("CREATE TABLE r (i int)").unwrap();
+        client.simple_query("BEGIN").unwrap();
+        let events = execute_with_binary_result(&mut client, INSERT_RETURNING_MISFIT);
+        assert_refused(&events, b'E');
+        let events = client.simple_query("COMMIT").unwrap();
+        assert!(matches!(&events[0], BackendEvent::CommandComplete(tag) if tag == "ROLLBACK"));
+        assert_row_count(&mut client, "r", "0");
+    }
+
+    /// Sends Parse, Bind asking for the one result column in binary format,
+    /// Execute and Sync, and returns the events up to ReadyForQuery.
+    fn execute_with_binary_result(client: &mut PgConn, sql: &str) -> Vec<BackendEvent> {
+        let mut parse = vec![0];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(b"\0\0\0");
+        client.write_message(b'P', &parse).unwrap();
+        client
+            .write_message(b'B', b"\0\0\0\0\0\0\0\x01\0\x01")
+            .unwrap();
+        client.write_message(b'E', b"\0\0\0\0\0").unwrap();
+        client.write_message(b'S', b"").unwrap();
+        let mut events = Vec::new();
+        while !matches!(events.last(), Some(BackendEvent::ReadyForQuery(_))) {
+            events.push(client.read_event().unwrap());
+        }
+        events
+    }
+
+    /// Checks that Execute got 0A000 and no rows, followed by ReadyForQuery
+    /// with the transaction status `status`.
+    fn assert_refused(events: &[BackendEvent], status: u8) {
+        let [_, _, BackendEvent::ErrorResponse(fields), BackendEvent::ReadyForQuery(got)] = events
+        else {
+            panic!("{events:?}");
+        };
+        assert_eq!(fields[&b'C'], SQLSTATE_FEATURE_NOT_SUPPORTED);
+        assert_eq!(*got, status, "{events:?}");
+    }
+
+    fn assert_row_count(client: &mut PgConn, table: &str, count: &str) {
+        let events = client
+            .simple_query(&format!("SELECT count(*) FROM {table}"))
+            .unwrap();
+        let Some(BackendEvent::DataRow(row)) = events.get(1) else {
+            panic!("{events:?}");
+        };
+        assert_eq!(row[0].as_deref(), Some(count));
+    }
+
+    fn memory_connection() -> PgConnection {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        PgConnection::connect(&db).unwrap()
+    }
+
+    fn sqlstate(error: PgWireError) -> &'static str {
+        let PgWireError::ApiError(error) = error else {
+            panic!("not an SQL error: {error:?}");
+        };
+        error.downcast::<turso_pg::Error>().unwrap().sqlstate
     }
 
     #[test]
@@ -1352,7 +1892,7 @@ mod tests {
         ] {
             for format in [Format::UnifiedText, Format::UnifiedBinary] {
                 let mut stmt = conn.prepare(sql).unwrap();
-                let fields = Arc::new(build_field_info(&stmt, &format));
+                let fields = Arc::new(build_field_info(&stmt, &format).unwrap());
                 assert_eq!(*fields[0].datatype(), Type::TEXT, "{sql}");
                 let rows = stmt.run_collect_rows().unwrap();
                 assert_eq!(rows.len(), 1);
@@ -1362,6 +1902,7 @@ mod tests {
                     &rows[0][0],
                     fields[0].datatype(),
                     fields[0].format(),
+                    turso_pg::TextType::of_column(&stmt, 0),
                 )
                 .unwrap();
                 let row = encoder.finish().unwrap();
@@ -1370,7 +1911,7 @@ mod tests {
             }
         }
         let stmt = conn.prepare("SELECT 7 AS pg_is_in_recovery").unwrap();
-        let fields = build_field_info(&stmt, &Format::UnifiedText);
+        let fields = build_field_info(&stmt, &Format::UnifiedText).unwrap();
         assert_eq!(*fields[0].datatype(), Type::INT4);
     }
 
@@ -1435,7 +1976,7 @@ mod tests {
             "SELECT coalesce(x, 2) FROM t",
         ] {
             let stmt = conn.prepare(sql).unwrap();
-            let fields = build_field_info(&stmt, &Format::UnifiedText);
+            let fields = build_field_info(&stmt, &Format::UnifiedText).unwrap();
             assert_eq!(*fields[0].datatype(), Type::INT4, "{sql}");
         }
     }
@@ -1456,19 +1997,22 @@ mod tests {
             ("SELECT booleq(true, true)", Type::BOOL),
             ("SELECT now()", Type::TIMESTAMPTZ),
             ("SELECT auth.uid()", Type::UUID),
-            ("SELECT CAST(1 AS timestamptz)", Type::TIMESTAMPTZ),
+            (
+                "SELECT CAST('2024-01-05 10:00:00+00' AS timestamptz)",
+                Type::TIMESTAMPTZ,
+            ),
             ("SELECT random()", Type::FLOAT8),
             ("SELECT random() * 10", Type::FLOAT8),
             ("SELECT array_to_json(ARRAY[1])", Type::JSON),
         ] {
             let mut stmt = conn.prepare(sql).unwrap();
-            let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+            let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText).unwrap());
             assert_eq!(*fields[0].datatype(), expected_type, "{sql}");
             let _ = stmt.run_collect_rows().unwrap();
         }
 
         let mut stmt = conn.prepare("SELECT booleq(true, true)").unwrap();
-        let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+        let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText).unwrap());
         let rows = stmt.run_collect_rows().unwrap();
         let mut encoder = DataRowEncoder::new(fields.clone());
         encode_value(
@@ -1476,6 +2020,7 @@ mod tests {
             &rows[0][0],
             fields[0].datatype(),
             fields[0].format(),
+            turso_pg::TextType::of_column(&stmt, 0),
         )
         .unwrap();
         assert_eq!(&encoder.finish().unwrap().data[..], b"\0\0\0\x01t");
@@ -1500,12 +2045,15 @@ mod tests {
         ] {
             let stmt = conn.prepare(sql).unwrap();
             for format in [Format::UnifiedText, Format::UnifiedBinary] {
-                assert!(describe_fields(&stmt, &format).is_empty(), "{sql}");
+                assert!(describe_fields(&stmt, &format).unwrap().is_empty(), "{sql}");
             }
         }
         let sql = "SELECT 'LOCK TABLE items'";
         let query = conn.prepare(sql).unwrap();
-        assert_eq!(describe_fields(&query, &Format::UnifiedText).len(), 1);
+        assert_eq!(
+            describe_fields(&query, &Format::UnifiedText).unwrap().len(),
+            1
+        );
     }
 
     #[test]

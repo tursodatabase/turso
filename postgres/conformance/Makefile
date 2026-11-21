@@ -33,10 +33,13 @@ SQLTEST := cargo run --manifest-path $(RUNNER_DIR)/Cargo.toml --bin sqltest $(CA
 PG_TESTS := pg-sqltests
 SHARED_TESTS := ../../testing/shared-sqltests
 
+# Every target that reads pg-sqltests passes --compat-gaps, which turns on the
+# gap lints (see the @compat-gap section of testing/sqltest/docs/dsl-spec.md).
+
 # 2 * num_cpu (arbitrary multiplier)
 POSTGRES_JOBS ?= $(shell expr 2 \* $$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2))
 
-.PHONY: all build build-tursopg build-runner check run test run-one run-postgres run-one-postgres run-sqlstate-fuzzer test-pgdump fuzz-pgdump build-dump-fuzzer run-upstream clean
+.PHONY: all build build-tursopg build-runner check run test run-one run-embedded run-one-embedded run-postgres run-one-postgres gaps check-gap-removals run-sqlstate-fuzzer test-pgdump fuzz-pgdump build-dump-fuzzer run-upstream clean
 
 # Build everything
 all: build
@@ -54,28 +57,54 @@ build-runner:
 
 # Check syntax of all test files
 check: build-runner
-	$(SQLTEST) check $(PG_TESTS) $(SHARED_TESTS)
+	$(SQLTEST) check $(PG_TESTS) $(SHARED_TESTS) --compat-gaps
 
 # Run all tests against a spawned tursopg server
 run: build
-	$(SQLTEST) run $(PG_TESTS) $(SHARED_TESTS) --timeout 600 --backend tursopg --binary $(TURSOPG)
+	$(SQLTEST) run $(PG_TESTS) $(SHARED_TESTS) --timeout 600 --backend tursopg --binary $(TURSOPG) --compat-gaps
 
 # Alias for run
 test: run
 
 # Run a single test file: make run-one FILE=pg-sqltests/select.sqltest
 run-one: build
-	$(SQLTEST) run $(FILE) --backend tursopg --binary $(TURSOPG)
+	$(SQLTEST) run $(FILE) --backend tursopg --binary $(TURSOPG) --compat-gaps
+
+# Run all tests against turso_pg in the test runner process, without the
+# pgwire server.
+run-embedded: build-runner
+	$(SQLTEST) run $(PG_TESTS) $(SHARED_TESTS) --timeout 600 --backend tursopg-embedded --compat-gaps
+
+# Run a single test file against turso_pg without the pgwire server:
+# make run-one-embedded FILE=pg-sqltests/select.sqltest
+run-one-embedded: build-runner
+	$(SQLTEST) run $(FILE) --backend tursopg-embedded --compat-gaps
 
 # Run all tests against a real PostgreSQL server. Uses the server at PG_DSN,
 # or starts a throwaway Docker container (see with-postgres.sh).
 run-postgres: build-runner
-	./with-postgres.sh sh -c '$(SQLTEST) run $(PG_TESTS) $(SHARED_TESTS) --jobs $(POSTGRES_JOBS) --backend postgres --postgres-dsn "$$PG_DSN"'
+	./with-postgres.sh sh -c '$(SQLTEST) run $(PG_TESTS) $(SHARED_TESTS) --jobs $(POSTGRES_JOBS) --backend postgres --postgres-dsn "$$PG_DSN" --compat-gaps'
 
 # Run a single test file against a real PostgreSQL server:
 # make run-one-postgres FILE=pg-sqltests/select.sqltest
 run-one-postgres: build-runner
-	./with-postgres.sh sh -c '$(SQLTEST) run $(FILE) --jobs $(POSTGRES_JOBS) --backend postgres --postgres-dsn "$$PG_DSN"'
+	./with-postgres.sh sh -c '$(SQLTEST) run $(FILE) --jobs $(POSTGRES_JOBS) --backend postgres --postgres-dsn "$$PG_DSN" --compat-gaps'
+
+# Print the counts of gap tests (known differences from PostgreSQL) as
+# Markdown tables, without running the tests.
+# CI appends the output to the job summary: make -s --no-print-directory gaps
+gaps: build-runner
+	@$(SQLTEST) gaps $(PG_TESTS) $(SHARED_TESTS)
+
+# Fail when a gap test in the checkout at $(BASE) is gone from this one:
+# deleted, renamed, or converted into a plain test with other SQL, setups or
+# PostgreSQL answer. A fixed gap keeps its test and loses only @compat-gap and
+# the expect @tursopg block. CI runs it on pull requests with BASE set to the
+# target branch:
+# make check-gap-removals BASE=/path/to/base/checkout
+check-gap-removals: build-runner
+	@test -n "$(BASE)" || { echo "set BASE to the checkout to compare with" >&2; exit 2; }
+	$(SQLTEST) gap-removals --base $(BASE)/postgres/conformance/$(PG_TESTS) --head $(PG_TESTS)
 
 # Differential SQLSTATE fuzzer: generates a random schema, data, and
 # statements and compares every outcome's error code against a real

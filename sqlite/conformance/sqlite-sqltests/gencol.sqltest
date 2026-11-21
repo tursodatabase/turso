@@ -2994,6 +2994,69 @@ expect {
     AFTER|1|2|10|2
 }
 
+test gencol_after_update_trigger_new_virtual_column_uses_new_rowid {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT, c AS (id * 10));
+    CREATE TABLE log(old_id, old_c, new_id, new_c);
+    CREATE TRIGGER t_au AFTER UPDATE ON t BEGIN
+        INSERT INTO log VALUES (OLD.id, OLD.c, NEW.id, NEW.c);
+    END;
+    INSERT INTO t(id, x) VALUES (1, 0);
+    UPDATE t SET id = 5 WHERE id = 1;
+    SELECT * FROM log;
+}
+expect {
+    1|10|5|50
+}
+
+setup gencol_virtual_columns_after_update_trigger {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2));
+    CREATE TABLE log(x, y);
+    CREATE TRIGGER t_au AFTER UPDATE ON t BEGIN INSERT INTO log VALUES (NEW.d, OLD.d); END;
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_virtual_columns_after_update_trigger
+snapshot gencol_update_after_trigger_reuses_virtual_columns {
+    UPDATE t SET a = 5;
+}
+
+# COERCE stores the SET value 3.5 as 3.50, so the AFTER trigger must see the
+# virtual column that a read of the row gives.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_after_update_trigger_virtual_column_reads_coerced_set_value {
+    CREATE TABLE prices(id INTEGER PRIMARY KEY, val numeric(10,2), doubled ANY AS (val * 2) VIRTUAL) STRICT;
+    CREATE TABLE log(v ANY) STRICT;
+    CREATE TRIGGER au AFTER UPDATE ON prices BEGIN INSERT INTO log VALUES (NEW.doubled); END;
+    INSERT INTO prices(id, val) VALUES (1, 1.50);
+    UPDATE prices SET val = 3.5;
+    SELECT v FROM log;
+    SELECT doubled FROM prices;
+}
+expect {
+    7.00
+    7.00
+}
+
+# A type with only a DECODE reads the stored 5 as 10, so the AFTER trigger must
+# see the virtual column that a read of the row gives.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_after_update_trigger_virtual_column_reads_decoded_set_value {
+    CREATE TYPE dbl BASE integer DECODE value * 2;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v dbl, c INT AS (CAST(v AS INTEGER) * 1)) STRICT;
+    CREATE TABLE log(x ANY) STRICT;
+    CREATE TRIGGER au AFTER UPDATE ON t BEGIN INSERT INTO log VALUES (NEW.c); END;
+    INSERT INTO t(id, v) VALUES (1, 1);
+    UPDATE t SET v = 5;
+    SELECT x FROM log;
+    SELECT c FROM t;
+}
+expect {
+    10
+    10
+}
+
 # =============================================================================
 # 13. UPSERT
 # =============================================================================
@@ -4039,6 +4102,146 @@ test gencol_error_exists {
 }
 expect error {
     subqueries prohibited in generated columns
+}
+
+# --- RAISE prohibited outside triggers ---
+
+test gencol_error_raise_ignore {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)));
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+test gencol_error_raise_abort {
+    CREATE TABLE t1(a, b AS (RAISE(ABORT, 'x')));
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+test gencol_error_raise_nested {
+    CREATE TABLE t1(a, b AS (coalesce(a, RAISE(FAIL, 'x'))) VIRTUAL);
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+# SQLite's check compiles `SELECT * FROM t`, which reads STORED columns from
+# the row, so a RAISE in a STORED column is reported only when a row is written.
+test gencol_raise_stored_is_accepted {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)) STORED);
+    CREATE TABLE t2(a, b AS (coalesce(a, RAISE(ABORT, 'x'))) STORED, c AS (b + 1));
+    SELECT name FROM sqlite_schema ORDER BY name;
+}
+expect {
+    t1
+    t2
+}
+
+test gencol_raise_stored_fails_on_insert {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)) STORED);
+    INSERT INTO t1(a) VALUES (1);
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+# The parser replaces `x IN ()` with 0 and `x NOT IN ()` with 1, so the RAISE
+# in them is never compiled.
+test gencol_raise_in_empty_in_list {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE) IN ()), c AS (RAISE(FAIL, 'x') NOT IN ()));
+    INSERT INTO t1(a) VALUES (1);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    1|0|1
+}
+
+# SQLite's parser replaces `0 AND RAISE(...)` with 0 and accepts the table.
+# Turso compiles both sides of AND, so it rejects the table instead of
+# creating one that every INSERT and SELECT fails on.
+@skip-if sqlite "SQLite's parser folds 0 AND X to 0"
+test gencol_error_raise_in_and_with_zero {
+    CREATE TABLE t1(a, b AS (0 AND RAISE(IGNORE)));
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+test gencol_error_raise_in_or_with_one {
+    CREATE TABLE t1(a, b AS (1 OR RAISE(IGNORE)));
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+# CREATE TABLE IF NOT EXISTS on an existing name does nothing, so the
+# RAISE is never compiled.
+test gencol_raise_if_not_exists_table {
+    CREATE TABLE t1(a);
+    CREATE TABLE IF NOT EXISTS t1(a, b AS (RAISE(IGNORE)));
+    SELECT name FROM sqlite_schema;
+}
+expect {
+    t1
+}
+
+test gencol_raise_if_not_exists_view {
+    CREATE VIEW v1 AS SELECT 1;
+    CREATE TABLE IF NOT EXISTS v1(a, b AS (RAISE(IGNORE)));
+    SELECT name FROM sqlite_schema;
+}
+expect {
+    v1
+}
+
+# SQLite finds the RAISE after every other column check, so those errors
+# are reported first.
+test gencol_raise_after_unknown_column {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)), c AS (zzz));
+}
+expect error {
+    no such column: zzz
+}
+
+test gencol_raise_after_aggregate {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)), c AS (max(a, 1) + count(*)));
+}
+expect error {
+    (aggregate functions prohibited|misuse of aggregate function)
+}
+
+test gencol_raise_after_generated_column_loop {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE) + c), c AS (b));
+}
+expect error {
+    (circular dependency|generated column loop)
+}
+
+test gencol_raise_after_generated_primary_key {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)), PRIMARY KEY(b));
+}
+expect error {
+    generated column.*cannot be part of the PRIMARY KEY
+}
+
+test gencol_raise_after_unknown_primary_key_column {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)), PRIMARY KEY(zz));
+}
+expect error {
+    (no such column: zz|Column zz not found)
+}
+
+# SQLite checks RAISE only at CREATE TABLE: ADD COLUMN stores the column and
+# the error is reported when a statement reads it.
+test gencol_alter_add_raise_fails_on_read {
+    CREATE TABLE t1(a);
+    ALTER TABLE t1 ADD COLUMN b AS (RAISE(IGNORE));
+    SELECT a, b FROM t1;
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
 }
 
 # --- Aggregates prohibited ---
@@ -5691,6 +5894,117 @@ test gencol-virtual-index-key-on-custom-type-column-uses-type-operators {
     ok
 }
 
+# UPDATE and UPSERT compute the virtual columns from the SET values before
+# ENCODE. COERCE stores the SET value 2.5 as 2.50, so all that reads the new row
+# after ENCODE must see the virtual column that a read of the row gives.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_update_returning_virtual_column_reads_coerced_set_value {
+    CREATE TABLE prices(id INTEGER PRIMARY KEY, val numeric(10,2), doubled ANY AS (val * 2) VIRTUAL) STRICT;
+    INSERT INTO prices(id, val) VALUES (1, 1.50);
+    UPDATE prices SET val = 2.5 RETURNING doubled;
+    SELECT doubled FROM prices;
+} expect {
+    5.00
+    5.00
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_update_check_on_virtual_column_reads_coerced_set_value {
+    CREATE TABLE prices(id INTEGER PRIMARY KEY, val numeric(10,2), d ANY AS (typeof(val)) VIRTUAL CHECK (d = 'text')) STRICT;
+    INSERT INTO prices(id, val) VALUES (1, 1.50);
+    UPDATE prices SET val = 2.5 RETURNING d;
+    SELECT d FROM prices;
+} expect {
+    text
+    text
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_upsert_index_key_reads_coerced_set_value {
+    CREATE TABLE prices(id INTEGER PRIMARY KEY, val numeric(10,2), doubled ANY AS (val * 2) VIRTUAL) STRICT;
+    CREATE INDEX prices_doubled ON prices(doubled);
+    INSERT INTO prices(id, val) VALUES (1, 1.50);
+    INSERT INTO prices(id, val) VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET val = 2.5;
+    PRAGMA integrity_check;
+    UPDATE prices SET val = 3.5;
+    SELECT id, doubled FROM prices INDEXED BY prices_doubled WHERE doubled = (SELECT val * 2 FROM prices);
+    PRAGMA integrity_check;
+} expect {
+    ok
+    1|7.00
+    ok
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_upsert_after_update_trigger_virtual_column_reads_coerced_set_value {
+    CREATE TABLE prices(id INTEGER PRIMARY KEY, val numeric(10,2), doubled ANY AS (val * 2) VIRTUAL) STRICT;
+    CREATE TABLE log(v ANY) STRICT;
+    CREATE TRIGGER au AFTER UPDATE ON prices BEGIN INSERT INTO log VALUES (NEW.doubled); END;
+    INSERT INTO prices(id, val) VALUES (1, 1.50);
+    INSERT INTO prices(id, val) VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET val = 7.5;
+    SELECT v FROM log;
+    SELECT doubled FROM prices;
+} expect {
+    15.00
+    15.00
+}
+
+# NOT NULL on a virtual column must see the value that a read of the row gives,
+# as in INSERT. This DECODE reads the stored 5 as NULL.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_update_not_null_virtual_column_reads_decoded_set_value {
+    CREATE TYPE null_five BASE integer DECODE CASE WHEN value = 5 THEN NULL ELSE value END;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v null_five, c INT NOT NULL AS (v)) STRICT;
+    INSERT INTO t VALUES (1, 1);
+    UPDATE t SET v = 5;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_upsert_not_null_virtual_column_reads_decoded_set_value {
+    CREATE TYPE null_five BASE integer DECODE CASE WHEN value = 5 THEN NULL ELSE value END;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v null_five, c INT NOT NULL AS (v)) STRICT;
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET v = 5;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+# COERCE stores the SET value 2.5 as the text 2.50. The virtual column is NULL
+# only for the value before ENCODE, so the NOT NULL check passes, as in INSERT.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_update_not_null_virtual_column_reads_coerced_set_value {
+    CREATE TABLE prices(id INTEGER PRIMARY KEY, val numeric(10,2), d ANY AS (nullif(typeof(val), 'real')) VIRTUAL NOT NULL) STRICT;
+    INSERT INTO prices(id, val) VALUES (1, 1.50);
+    UPDATE prices SET val = 2.5 RETURNING d;
+    SELECT val, d FROM prices;
+} expect {
+    text
+    2.50|text
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_upsert_not_null_virtual_column_reads_coerced_set_value {
+    CREATE TABLE prices(id INTEGER PRIMARY KEY, val numeric(10,2), d ANY AS (nullif(typeof(val), 'real')) VIRTUAL NOT NULL) STRICT;
+    INSERT INTO prices(id, val) VALUES (1, 1.50);
+    INSERT INTO prices(id, val) VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET val = 2.5 RETURNING d;
+    SELECT val, d FROM prices;
+} expect {
+    text
+    2.50|text
+}
+
 @cross-check-integrity
 test update-covering-index-chained-virtual-gencol {
     CREATE TABLE t (a, c, e AS (a), d AS (e));
@@ -6755,4 +7069,277 @@ test gencol_strict_alter_add_virtual_check_error_when_type_passes {
 }
 expect error {
     CHECK constraint failed
+}
+
+test gencol_update_not_null_virtual_column_sees_column_affinity {
+    CREATE TABLE t(a INTEGER, c AS (nullif(typeof(a), 'text')) NOT NULL);
+    INSERT INTO t(a) VALUES (1);
+    UPDATE t SET a = '5';
+    SELECT a, c FROM t;
+}
+expect {
+    5|integer
+}
+
+test gencol_update_not_null_virtual_column_checked_after_before_trigger {
+    CREATE TABLE t(a INTEGER, c AS (nullif(a, 0)) NOT NULL);
+    CREATE TABLE log(x);
+    CREATE TRIGGER t_bu BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES (NEW.a); END;
+    INSERT INTO t(a) VALUES (1);
+    UPDATE t SET a = 0;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+# The BEFORE UPDATE trigger changes a, which the SET clause does not change,
+# so c is NULL only after the trigger.
+test gencol_upsert_not_null_virtual_column_checked_after_before_trigger {
+    CREATE TABLE t(k INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c AS (nullif(a + b, 0)) NOT NULL);
+    CREATE TRIGGER t_bu BEFORE UPDATE ON t BEGIN UPDATE t SET a = 5 WHERE k = NEW.k; END;
+    INSERT INTO t(k, a, b) VALUES (1, 1, 1);
+    INSERT INTO t(k, a, b) VALUES (1, 1, 1) ON CONFLICT(k) DO UPDATE SET b = -5;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+test gencol_update_not_null_ignore_virtual_column_skips_row {
+    CREATE TABLE t(a INTEGER, c AS (nullif(a, 0)) NOT NULL ON CONFLICT IGNORE);
+    INSERT INTO t(a) VALUES (1), (2);
+    UPDATE t SET a = a - 1;
+    SELECT a, c FROM t;
+}
+expect {
+    1|1
+    1|1
+}
+
+setup gencol_virtual_columns_update {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2));
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_virtual_columns_update
+snapshot gencol_update_computes_virtual_columns_once {
+    UPDATE t SET a = 5 WHERE b = 3;
+}
+
+test gencol_upsert_check_on_virtual_column_sees_column_affinity {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b INTEGER, c AS (typeof(b)) CHECK (c = 'integer'));
+    INSERT INTO t(id, b) VALUES (1, 5);
+    INSERT INTO t(id, b) VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET b = '6';
+    SELECT id, b, c FROM t;
+}
+expect {
+    1|6|integer
+}
+
+setup gencol_virtual_columns_upsert {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b INTEGER, c AS (id + b), d AS (c * 2));
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_virtual_columns_upsert
+snapshot gencol_upsert_computes_virtual_columns_once {
+    INSERT INTO t(id, b) VALUES (1, 2) ON CONFLICT(id) DO UPDATE SET b = excluded.b + 1 RETURNING c, d;
+}
+
+# COERCE stores the SET value 2.5 as 2.50, so RETURNING must show the virtual
+# column that a read of the row gives.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_upsert_returning_virtual_column_reads_coerced_set_value {
+    CREATE TABLE prices(id INTEGER PRIMARY KEY, val numeric(10,2), doubled ANY AS (val * 2) VIRTUAL) STRICT;
+    INSERT INTO prices(id, val) VALUES (1, 1.50);
+    INSERT INTO prices(id, val) VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET val = 2.5 RETURNING doubled;
+    SELECT doubled FROM prices;
+}
+expect {
+    5.00
+    5.00
+}
+
+# A type with only a DECODE reads the stored 5 as 10, so RETURNING must show the
+# virtual column that a read of the row gives.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_upsert_returning_virtual_column_reads_decoded_set_value {
+    CREATE TYPE dbl BASE integer DECODE value * 2;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v dbl, c INT AS (CAST(v AS INTEGER) * 1)) STRICT;
+    INSERT INTO t(id, v) VALUES (1, 1);
+    INSERT INTO t(id, v) VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET v = 5 RETURNING c;
+    SELECT c FROM t;
+}
+expect {
+    10
+    10
+}
+
+test fk-gencol-parent-delete-key-reads-two-virtual-columns {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER, c AS (a + 1), e AS (b + 100), k AS (c + e) UNIQUE);
+    CREATE TABLE ch(x REFERENCES p(k));
+    INSERT INTO p(a, b) VALUES (1, 2);
+    INSERT INTO ch VALUES (104);
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-gencol-parent-update-key-reads-two-virtual-columns {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER, c AS (a + 1), e AS (b + 100), k AS (c + e) UNIQUE);
+    CREATE TABLE ch(x REFERENCES p(k));
+    INSERT INTO p(a, b) VALUES (1, 2);
+    INSERT INTO ch VALUES (104);
+    UPDATE p SET a = 5;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# The ON UPDATE actions read the OLD parent key from the OLD row registers. A
+# virtual column before the key must not move the key to another register.
+test fk-gencol-parent-update-cascade-key-reads-two-virtual-columns {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER, c AS (a + 1), e AS (b + 100), k AS (c + e) UNIQUE);
+    CREATE TABLE ch(x REFERENCES p(k) ON UPDATE CASCADE);
+    CREATE TABLE ch2(x REFERENCES p(k) ON UPDATE SET NULL);
+    INSERT INTO p(a, b) VALUES (1, 2);
+    INSERT INTO ch VALUES (104);
+    INSERT INTO ch2 VALUES (104);
+    UPDATE p SET a = 5;
+    SELECT x FROM ch;
+    SELECT quote(x) FROM ch2;
+}
+expect {
+    108
+    NULL
+}
+
+test fk-gencol-parent-update-cascade-key-after-virtual-column {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, c AS (a * 2), k INTEGER UNIQUE);
+    CREATE TABLE ch(x REFERENCES p(k) ON UPDATE CASCADE);
+    INSERT INTO p(a, k) VALUES (1, 10);
+    INSERT INTO ch VALUES (10);
+    UPDATE p SET k = 20;
+    SELECT x FROM ch;
+}
+expect {
+    20
+}
+
+test fk-gencol-parent-update-cascade-two-virtual-key-columns {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER, k AS (a + 1), m AS (b + 1), UNIQUE(k, m));
+    CREATE TABLE ch(x, y, FOREIGN KEY(x, y) REFERENCES p(k, m) ON UPDATE CASCADE);
+    INSERT INTO p(a, b) VALUES (1, 2);
+    INSERT INTO ch VALUES (2, 3);
+    UPDATE p SET a = 5, b = 6;
+    SELECT x, y FROM ch;
+}
+expect {
+    6|7
+}
+
+test fk-gencol-parent-upsert-cascade-key-after-virtual-column {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, a INTEGER, c AS (a * 2), k INTEGER UNIQUE);
+    CREATE TABLE ch(x REFERENCES p(k) ON UPDATE CASCADE);
+    INSERT INTO p(id, a, k) VALUES (1, 1, 10);
+    INSERT INTO ch VALUES (10);
+    INSERT INTO p(id, a, k) VALUES (1, 0, 0) ON CONFLICT(id) DO UPDATE SET k = 20;
+    SELECT x FROM ch;
+}
+expect {
+    20
+}
+
+setup gencol_fk_parent_virtual_key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER, k AS (a + b) UNIQUE, z AS (a * 7));
+    CREATE TABLE c(x INTEGER REFERENCES p(k));
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_fk_parent_virtual_key
+snapshot gencol_fk_parent_delete_computes_only_key_columns {
+    DELETE FROM p WHERE a = 1;
+}
+
+setup gencol_indexed_virtual_columns {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c AS (a + b), e AS (a * 3) UNIQUE);
+    CREATE INDEX tc ON t(c);
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_indexed_virtual_columns
+snapshot gencol_insert_index_keys_copy_virtual_columns {
+    INSERT INTO t(id, a, b) VALUES (1, 1, 2);
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_indexed_virtual_columns
+snapshot gencol_update_index_keys_copy_virtual_columns {
+    UPDATE t SET a = 5 WHERE id = 1;
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_indexed_virtual_columns
+snapshot gencol_upsert_index_keys_copy_virtual_columns {
+    INSERT INTO t(id, a, b) VALUES (1, 1, 2) ON CONFLICT(id) DO UPDATE SET a = 7;
+}
+
+@cross-check-integrity
+test gencol_index_keys_match_virtual_columns_after_writes {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c AS (a + b), e AS (a * 3) UNIQUE);
+    CREATE INDEX tc ON t(c);
+    INSERT INTO t(id, a, b) VALUES (1, 1, 2), (2, 2, 2);
+    UPDATE t SET a = 5 WHERE id = 1;
+    INSERT INTO t(id, a, b) VALUES (2, 0, 0) ON CONFLICT(id) DO UPDATE SET a = 7;
+    SELECT id, c FROM t INDEXED BY tc WHERE c > 0 ORDER BY c;
+    SELECT id, e FROM t WHERE e = 21;
+    PRAGMA integrity_check;
+}
+expect {
+    1|7
+    2|9
+    2|21
+    ok
+}
+
+# A type with only a DECODE reads the stored 5 as 10, so the key of an index on
+# the virtual column must hold the value that a read of the row gives.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_update_index_key_reads_decoded_set_value {
+    CREATE TYPE dbl BASE integer DECODE value * 2;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v dbl, c INT AS (CAST(v AS INTEGER) * 1)) STRICT;
+    CREATE INDEX tc ON t(c);
+    INSERT INTO t(id, v) VALUES (1, 1);
+    UPDATE t SET v = 5;
+    SELECT id, c FROM t INDEXED BY tc WHERE c = 10;
+    PRAGMA integrity_check;
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    1|10
+    ok
+    0
+}
+
+setup gencol_virtual_columns_delete_trigger {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2));
+    CREATE TABLE log(x, y);
+    CREATE TRIGGER t_bd BEFORE DELETE ON t BEGIN INSERT INTO log VALUES (OLD.c, OLD.d); END;
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_virtual_columns_delete_trigger
+snapshot gencol_delete_old_row_computes_virtual_columns_from_registers {
+    DELETE FROM t WHERE b = 3;
 }

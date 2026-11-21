@@ -214,7 +214,7 @@ impl PostgresServer {
     /// Remembers the roles that `sql` creates, so that they are dropped
     /// after the run. SQL that does not parse creates no role.
     fn remember_created_roles(&self, sql: &str) {
-        let Ok(parsed) = pg_query::parse(sql) else {
+        let Ok(parsed) = pg_query::parse(sql, pg_query::ParserOptions::DEFAULT) else {
             return;
         };
         let mut created_roles = self.created_roles.lock().unwrap();

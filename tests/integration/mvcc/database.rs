@@ -9,6 +9,8 @@ use super::checkpoint::{
     assert_integrity_ok, get_rows, wal_path_for_db, FixedFailureInjector, FixedYieldInjector,
 };
 use super::test_db::MvccTestDbNoConn;
+use super::transactions::{generate_simple_string_row, get_record_value, write_synthetic_row};
+use crate::unreliable_io::UnreliableIo;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -30,15 +32,21 @@ use turso_core::mvcc::database::MvStore;
 use turso_core::mvcc::database::RowID;
 use turso_core::mvcc::database::*;
 #[cfg(feature = "conn_raw_api")]
-use turso_core::mvcc::persistent_storage::logical_log::StreamingLogicalLogReader;
-use turso_core::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE;
+use turso_core::mvcc::persistent_storage::logical_log::{
+    LogOpForTesting, StreamingLogicalLogReader,
+};
+use turso_core::mvcc::persistent_storage::logical_log::{
+    LogicalLog, ENCRYPTED_PAYLOAD_CHUNK_SIZE, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE,
+};
 use turso_core::mvcc::yield_hooks::YieldPointMarker;
 use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};
 use turso_core::namespace::NamespaceId;
+use turso_core::schema::{Schema, Table};
 use turso_core::state_machine::{StateTransition, TransitionResult};
 use turso_core::storage::sqlite3_ondisk::checksum_wal;
 use turso_core::storage::sqlite3_ondisk::read_varint;
 use turso_core::storage::sqlite3_ondisk::write_varint;
+use turso_core::storage::sqlite3_ondisk::DatabaseHeader;
 use turso_core::storage::sqlite3_ondisk::WalHeader;
 use turso_core::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 use turso_core::storage::sqlite3_ondisk::WAL_HEADER_SIZE;
@@ -58,9 +66,11 @@ use turso_core::IOExt;
 use turso_core::MemoryIO;
 use turso_core::Numeric;
 use turso_core::OpenFlags;
+use turso_core::ReparseSchemaState;
 use turso_core::Result;
 use turso_core::Statement;
 use turso_core::StatementStatusCounter;
+use turso_core::TransactionMode;
 use turso_core::ValueRef;
 use turso_core::{
     CheckpointMode, ConnectOpts, Connection, LimboError, SessionRole, StepResult, Value,
@@ -1892,6 +1902,158 @@ impl MvccTestDb {
 }
 
 #[test]
+fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let schema = reparse_physical_schema(&db.conn);
+    let table_root = match schema
+        .get_table(NamespaceId::ROOT, "t")
+        .expect("table t")
+        .as_ref()
+    {
+        Table::BTree(btree) => btree.root_page,
+        _ => panic!("expected btree table"),
+    };
+    let index_root = schema
+        .indices_including_backing(NamespaceId::ROOT, "t")
+        .next()
+        .map(|index| index.root_page)
+        .expect("index idx_t_v");
+
+    let mut header = DatabaseHeader::default();
+    header.schema_cookie = 77.into();
+
+    db.mvcc_store
+        .with_global_header_mut_for_testing(|header| *header = DatabaseHeader::default())
+        .unwrap();
+    db.mvcc_store
+        .insert_table_id_to_rootpage(MVTableId::from(-999_i64), Some(999));
+
+    db.mvcc_store
+        .reset_after_vacuum_for_testing(header, schema.as_ref());
+
+    assert_eq!(
+        db.mvcc_store
+            .with_header(|header| header.schema_cookie.get(), None)
+            .unwrap(),
+        77
+    );
+    assert_eq!(
+        db.mvcc_store
+            .current_root_page(&SQLITE_SCHEMA_MVCC_TABLE_ID),
+        Some(1)
+    );
+    assert_eq!(
+        db.mvcc_store
+            .current_root_page(&MVTableId::from(-(table_root))),
+        Some(table_root as u64)
+    );
+    assert_eq!(
+        db.mvcc_store
+            .current_root_page(&MVTableId::from(-(index_root))),
+        Some(index_root as u64)
+    );
+    assert!(
+        db.mvcc_store
+            .table_id_to_rootpage
+            .get(&MVTableId::from(-999_i64))
+            .is_none(),
+        "stale root-page entries must be cleared"
+    );
+}
+
+#[test]
+fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+
+    db.conn
+        .execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+    db.conn
+        .execute("UPDATE t SET v = 'z' WHERE id = 1")
+        .unwrap();
+    db.conn.execute("DELETE FROM t WHERE id = 2").unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Checkpoint-time GC removes the buckets it empties (it runs under the
+    // blocking lock), so recreate the condition VACUUM reset must handle:
+    // lazy background GC empties chains but leaves the buckets in the maps.
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("INSERT INTO t VALUES (4, 'd')").unwrap();
+    db.conn.execute("ROLLBACK").unwrap();
+    db.mvcc_store.drop_unused_row_versions();
+
+    let empty_row_ids = db
+        .mvcc_store
+        .rows
+        .iter()
+        .filter(|entry| entry.value().read().is_empty())
+        .map(|entry| entry.key().clone())
+        .collect::<Vec<_>>();
+    let empty_index_ids = db
+        .mvcc_store
+        .index_rows
+        .iter()
+        .filter(|entry| {
+            entry
+                .value()
+                .iter()
+                .all(|row_entry| row_entry.value().read().is_empty())
+        })
+        .map(|entry| *entry.key())
+        .collect::<Vec<_>>();
+    assert!(
+        !empty_row_ids.is_empty(),
+        "lazy GC should leave empty table row buckets before VACUUM reset"
+    );
+    assert!(
+        !empty_index_ids.is_empty(),
+        "lazy GC should leave empty index buckets before VACUUM reset"
+    );
+
+    let schema = reparse_physical_schema(&db.conn);
+
+    db.mvcc_store
+        .reset_after_vacuum_for_testing(DatabaseHeader::default(), schema.as_ref());
+
+    for row_id in empty_row_ids {
+        assert!(
+            db.mvcc_store.rows.get(&row_id).is_none(),
+            "empty table row buckets must be cleared across VACUUM reset"
+        );
+    }
+    for index_id in empty_index_ids {
+        assert!(
+            db.mvcc_store.index_rows.get(&index_id).is_none(),
+            "empty index buckets must be cleared across VACUUM reset"
+        );
+    }
+}
+
+/// Reads the schema from the B-tree image, as VACUUM does after it rewrote it,
+/// instead of from the MVCC store.
+fn reparse_physical_schema(conn: &Arc<Connection>) -> Arc<Schema> {
+    conn.demote_to_mvcc_connection();
+    let mut state = ReparseSchemaState::default();
+    conn.get_pager()
+        .io
+        .block(|| conn.reparse_schema_nonblock(&mut state))
+        .unwrap();
+    let schema = conn.current_schema();
+    conn.promote_to_regular_connection();
+    schema
+}
+
+#[test]
 fn mvcc_pragma_page_size_propagates_to_global_header() {
     // MvStore captures global_header from the pager during bootstrap (before any user PRAGMA
     // can run), so without explicit propagation a later `PRAGMA page_size = N` updates the
@@ -2793,6 +2955,52 @@ fn test_bootstrap_recovers_committed_wal_without_log_file() {
     assert_eq!(rows.len(), 1, "committed row must survive recovery");
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
     assert_eq!(rows[0][1].to_string(), "x");
+}
+
+/// A TRUNCATE checkpoint truncates the logical log (step 8) before it truncates the WAL
+/// (step 10). A process killed between the two leaves a committed WAL and a 0-byte log.
+/// Every frame the log held is at or below the boundary committed to the WAL, so recovery
+/// must complete the checkpoint, not fail closed with "logical log header is missing"
+/// (#7480). Passive checkpoints stay OFF here: this is the default-mode crash window.
+#[test]
+fn test_bootstrap_recovers_truncate_checkpoint_killed_before_wal_truncate() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        for i in 0..50 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+                .unwrap();
+        }
+        let mvcc_store = db.get_mvcc_store();
+        // Stop right after the pager commit: the WAL holds the committed frames.
+        advance_checkpoint_until_wal_has_commit_frame(mvcc_store.clone(), &conn);
+        // The crash window: logical log already truncated to 0, WAL not yet truncated.
+        let log_file = mvcc_store.get_logical_log_file();
+        let c = log_file.truncate(0, Completion::new_trunc(|_| {})).unwrap();
+        conn.db.io.wait_for_completion(c).unwrap();
+    }
+    db.close();
+    let wal_path = wal_path_for_db(&db_path);
+    assert!(wal_path.metadata().map(|m| m.len()).unwrap_or(0) > 0);
+
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file(io, &db_path, Arc::new(SqliteDialect))
+        .expect("a TRUNCATE checkpoint killed before its WAL truncate must stay openable");
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .expect("connect should complete the checkpoint");
+    let rows = get_rows(&conn, "SELECT count(*), min(id), max(id) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 50);
+    assert_eq!(rows[0][1].as_int().unwrap(), 0);
+    assert_eq!(rows[0][2].as_int().unwrap(), 49);
+    assert_eq!(wal_path.metadata().map(|m| m.len()).unwrap_or(0), 0);
+    assert_integrity_ok(&conn);
+    conn.execute("INSERT INTO t VALUES (100, 'after')").unwrap();
+    let rows = get_rows(&conn, "SELECT count(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 51);
 }
 
 /// MVCC supports only Passive and Truncate, so a requested FULL checkpoint maps to
@@ -9234,6 +9442,122 @@ fn test_mvcc_portable_changes_metadata_does_not_auto_enable_or_get_consumed() {
 
 #[cfg(feature = "conn_raw_api")]
 #[test]
+fn test_mvcc_portable_changes_emit_header_only_commits() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn.execute("PRAGMA user_version = 42").unwrap();
+    db.conn.execute("PRAGMA application_id = 1337").unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let recovery_ops = collect_mvcc_log_ops(&db.conn);
+
+    // Header-only commits touch no user object, but a portable-enabled writer
+    // still emits the extension block so readers can tell an empty change set
+    // apart from pre-portable history. The payload therefore carries the frame
+    // cursor and commit timestamp and nothing else.
+    let txns = decode_portable_change_txns(&portable_changes);
+    assert_eq!(txns.len(), 2);
+    assert!(decoded_object_maps(&txns).is_empty());
+    assert!(txns.iter().all(|txn| txn.metadata.is_empty()));
+    assert_eq!(
+        recovery_ops
+            .iter()
+            .filter(|op| matches!(op, LogOpForTesting::UpdateHeader))
+            .count(),
+        2
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_delete_carries_pk_projection_not_old_record() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id TEXT PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES ('item-a', 'alpha')")
+        .unwrap();
+    db.conn
+        .execute("DELETE FROM items WHERE id = 'item-a'")
+        .unwrap();
+
+    let recovery_ops = collect_mvcc_log_ops(&db.conn);
+
+    let delete_pk_record = recovery_ops.iter().find_map(|op| match op {
+        LogOpForTesting::DeleteTable {
+            rowid,
+            record_bytes,
+            pk_record_bytes,
+            ..
+        } if rowid.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID => {
+            assert!(
+                record_bytes.is_empty(),
+                "data DELETE must not duplicate the full row record"
+            );
+            Some(pk_record_bytes.clone())
+        }
+        _ => None,
+    });
+    let delete_pk_record = delete_pk_record.expect("expected data DELETE op");
+    let pk_values = ImmutableRecord::from_bin_record(delete_pk_record)
+        .get_values_owned()
+        .unwrap();
+    assert_eq!(
+        pk_values,
+        vec![Value::Text(Text::new("item-a".to_string()))]
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_delete_of_checkpointed_row_carries_pk_projection() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id TEXT PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES ('item-a', 'alpha')")
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    db.conn
+        .execute("DELETE FROM items WHERE id = 'item-a'")
+        .unwrap();
+
+    let delete_pk_record = collect_mvcc_log_ops(&db.conn)
+        .into_iter()
+        .find_map(|op| match op {
+            LogOpForTesting::DeleteTable {
+                rowid,
+                pk_record_bytes,
+                ..
+            } if rowid.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID => Some(pk_record_bytes),
+            _ => None,
+        })
+        .expect("expected data DELETE op");
+    let pk_values = ImmutableRecord::from_bin_record(delete_pk_record)
+        .get_values_owned()
+        .unwrap();
+    assert_eq!(
+        pk_values,
+        vec![Value::Text(Text::new("item-a".to_string()))]
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn collect_mvcc_log_ops(conn: &Arc<Connection>) -> Vec<LogOpForTesting> {
+    let mv_store = conn
+        .mv_store()
+        .as_ref()
+        .expect("test database must be in MVCC mode")
+        .clone();
+    let io = conn.get_pager().io.clone();
+    let mut reader = StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), None);
+    reader.read_header(&io).unwrap();
+    reader.read_ops_for_testing(&io).unwrap()
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
 fn test_mvcc_portable_changes_are_encrypted_with_log_body() {
     use turso_core::{CipherMode, EncryptionContext};
 
@@ -12228,4 +12552,1254 @@ fn step_until_busy_then_release(
             other => panic!("unexpected step result: {other:?}"),
         }
     }
+}
+
+/// What this test checks: Recovery replays a transaction frame in which data ops precede the
+/// sqlite_schema op that registers their table, and the recovered table is queryable afterwards.
+/// Why this matters: Logs written before the schema-first frame serialization fix (#7218) sorted
+/// the whole write set, so a same-transaction CREATE TABLE + INSERT could serialize the data row
+/// before the schema row. Recovery must stay tolerant to logs written by those older versions.
+#[test]
+fn test_recovery_replays_schema_op_after_data_op_in_frame() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+
+    let mvcc_store = db.get_mvcc_store();
+    let io = db.get_db().io.clone();
+    let file = mvcc_store.get_logical_log_file();
+
+    let c = file.truncate(0, Completion::new_trunc(|_| {})).unwrap();
+    io.wait_for_completion(c).unwrap();
+
+    // A CREATE TABLE t2 + INSERT INTO t2 transaction as serialized by a pre-#7218 writer:
+    // the data row comes before the sqlite_schema row that registers its table_id.
+    let table_id = MVTableId::from(-999);
+    let commit_ts = 1u64 << 40;
+    let data_version = RowVersion::new(
+        1,
+        Some(TxTimestampOrID::Timestamp(commit_ts)),
+        None,
+        generate_simple_string_row(table_id, 1, "data").data,
+        false,
+    );
+    let schema_record = ImmutableRecord::from_values(
+        &[
+            Value::Text(Text::new("table".to_string())),
+            Value::Text(Text::new("t2".to_string())),
+            Value::Text(Text::new("t2".to_string())),
+            Value::from_i64(i64::from(table_id)),
+            Value::Text(Text::new("CREATE TABLE t2 (v TEXT)".to_string())),
+        ],
+        5,
+    )
+    .unwrap();
+    let schema_version = RowVersion::new(
+        2,
+        Some(TxTimestampOrID::Timestamp(commit_ts)),
+        None,
+        Row::new_table_row(
+            RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(2)),
+            schema_record.as_blob(),
+        )
+        .unwrap()
+        .data,
+        false,
+    );
+    let tx = LogRecord::for_test(
+        commit_ts,
+        &[
+            (RowID::new(table_id, RowKey::Int(1)), data_version),
+            (
+                RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(2)),
+                schema_version,
+            ),
+        ],
+        None,
+    );
+
+    let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+    let c = log.log_tx(tx).unwrap();
+    io.wait_for_completion(c).unwrap();
+    drop(log);
+    drop(file);
+    drop(mvcc_store);
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT v FROM t2");
+    assert_eq!(rows, vec![vec![Value::Text(Text::new("data".to_string()))]]);
+}
+
+#[test]
+fn abandoned_journal_mode_checkpoint_releases_pager_transaction_and_lock() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'one')").unwrap();
+
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforePagerCommit.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut stmt = conn.prepare("PRAGMA journal_mode = 'wal'").unwrap();
+    for _ in 0..10_000 {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Yield if injector.is_empty() => break,
+            turso_core::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            turso_core::StepResult::Yield => {}
+            other => {
+                panic!("journal-mode checkpoint completed before pager-commit yield: {other:?}")
+            }
+        }
+    }
+    assert!(injector.is_empty(), "checkpoint did not reach pager commit");
+
+    stmt.reset().unwrap();
+    conn.set_yield_injector(None);
+
+    let tx_state = conn.get_tx_state();
+    assert!(
+        tx_state == turso_core::connection::TransactionState::None,
+        "reset left the journal-mode checkpoint's transaction open: {tx_state:?}"
+    );
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("a checkpoint lock that the reset did not release makes this checkpoint Busy");
+}
+
+/// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
+/// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
+#[test]
+fn test_bootstrap_rejects_torn_log_header_with_committed_wal() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    let wal_path = wal_path_for_db(&db_path);
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'y')").unwrap();
+        let mvcc_store = db.get_mvcc_store();
+        advance_checkpoint_until_wal_has_commit_frame(mvcc_store, &conn);
+    }
+
+    overwrite_log_header_byte(&db_path, 0, 0x00);
+
+    db.close();
+
+    let io = Arc::new(PlatformIO::new().unwrap());
+    match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
+        Ok(db) => match db.connect(ConnectOpts::new(SessionRole::Superuser)) {
+            Ok(_) => panic!("expected connect to fail with Corrupt"),
+            Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+        },
+        Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+    }
+    let wal_len = wal_path.metadata().map(|m| m.len()).unwrap_or(0);
+    assert!(
+        wal_len > 0,
+        "failed bootstrap must not truncate WAL before header validation"
+    );
+}
+
+/// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
+/// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
+#[test]
+fn test_bootstrap_rejects_corrupt_log_header_without_wal() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+    }
+
+    overwrite_log_header_byte(&db_path, 0, 0x00);
+
+    {
+        let wal_path = wal_path_for_db(&db_path);
+        let _ = std::fs::remove_file(&wal_path);
+        overwrite_file_with_junk(&wal_path, 0, 0x00);
+    }
+
+    db.close();
+
+    let io = Arc::new(PlatformIO::new().unwrap());
+    match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
+        Ok(db) => match db.connect(ConnectOpts::new(SessionRole::Superuser)) {
+            Ok(_) => panic!("expected connect to fail with Corrupt"),
+            Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+        },
+        Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+    }
+}
+
+/// What this test checks: WAL frames without a commit marker are treated as non-committed tail and ignored.
+/// Why this matters: Recovery must preserve availability by discarding invalid WAL tail bytes instead of failing startup.
+#[test]
+fn test_bootstrap_ignores_wal_frames_without_commit_marker() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    let wal_path = wal_path_for_db(&db_path);
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+        let mvcc_store = db.get_mvcc_store();
+        advance_checkpoint_until_wal_has_commit_frame(mvcc_store, &conn);
+    }
+
+    rewrite_wal_frames_as_non_commit(&wal_path);
+    db.close();
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db2 =
+        Database::open_file(io, &db_path, Arc::new(SqliteDialect)).expect("open should succeed");
+    let conn2 = db2
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .expect("connect should succeed");
+    let rows = get_rows(&conn2, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "x");
+}
+
+fn overwrite_log_header_byte(path: &str, offset: u64, value: u8) {
+    let log_path = std::path::Path::new(path).with_extension("db-log");
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(log_path)
+        .unwrap();
+    use std::io::{Seek, SeekFrom, Write};
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(&[value]).unwrap();
+    file.sync_all().unwrap();
+}
+
+fn rewrite_wal_frames_as_non_commit(path: &std::path::Path) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    assert!(bytes.len() >= WAL_HEADER_SIZE);
+
+    let header = WalHeader {
+        magic: u32::from_be_bytes(bytes[0..4].try_into().unwrap()),
+        file_format: u32::from_be_bytes(bytes[4..8].try_into().unwrap()),
+        page_size: u32::from_be_bytes(bytes[8..12].try_into().unwrap()),
+        checkpoint_seq: u32::from_be_bytes(bytes[12..16].try_into().unwrap()),
+        salt_1: u32::from_be_bytes(bytes[16..20].try_into().unwrap()),
+        salt_2: u32::from_be_bytes(bytes[20..24].try_into().unwrap()),
+        checksum_1: u32::from_be_bytes(bytes[24..28].try_into().unwrap()),
+        checksum_2: u32::from_be_bytes(bytes[28..32].try_into().unwrap()),
+    };
+    let use_native_endian = cfg!(target_endian = "big") == ((header.magic & 1) != 0);
+    let frame_size = WAL_FRAME_HEADER_SIZE + header.page_size as usize;
+    let mut frame_offset = WAL_HEADER_SIZE;
+    let mut prev_checksums = (header.checksum_1, header.checksum_2);
+
+    while frame_offset + frame_size <= bytes.len() {
+        let frame = &mut bytes[frame_offset..frame_offset + frame_size];
+        frame[4..8].copy_from_slice(&0u32.to_be_bytes());
+        let header_checksum =
+            checksum_wal(&frame[0..8], &header, prev_checksums, use_native_endian);
+        let final_checksum = checksum_wal(
+            &frame[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + header.page_size as usize],
+            &header,
+            header_checksum,
+            use_native_endian,
+        );
+        frame[16..20].copy_from_slice(&final_checksum.0.to_be_bytes());
+        frame[20..24].copy_from_slice(&final_checksum.1.to_be_bytes());
+        prev_checksums = final_checksum;
+        frame_offset += frame_size;
+    }
+
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(&bytes).unwrap();
+    file.sync_all().unwrap();
+}
+
+/// What this test checks: The checkpoint does not fsync the logical log after it truncates it,
+/// so a power loss right after the checkpoint brings back frames that the checkpoint already
+/// wrote to the database file. Recovery skips these frames, because their `commit_ts` is at or
+/// below `persistent_tx_ts_max`.
+/// Why this matters: A replay of such a frame writes an old value over a newer one.
+#[test]
+fn test_power_loss_after_checkpoint_recovery_skips_checkpointed_log_frames() {
+    let db_path = "mvcc-power-loss-after-checkpoint.db";
+    let io = Arc::new(UnreliableIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    // This checkpoint truncates the log. The fsync of the INSERT commit makes the truncation
+    // durable, so that only the INSERT frame comes back after the power loss.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'old')").unwrap();
+    // With synchronous=NORMAL, the commit does not fsync the logical log. The update becomes
+    // durable only when the checkpoint writes it to the database file.
+    conn.execute("PRAGMA synchronous = NORMAL").unwrap();
+    conn.execute("UPDATE t SET v = 'new' WHERE id = 1").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let durable_log_len = io.durable_files()[&format!("{db_path}-log")].len();
+    assert!(
+        durable_log_len > LOG_HDR_SIZE,
+        "after a power loss, the logical log must still have the INSERT frame"
+    );
+
+    let (_dir, recovered) = io.crash_now_and_recover(db_path).unwrap();
+    assert_eq!(
+        get_rows(&recovered, "SELECT id, v FROM t"),
+        vec![vec![
+            Value::from_i64(1),
+            Value::from_text("new".to_string())
+        ]]
+    );
+    assert_integrity_ok(&recovered);
+}
+
+/// What this test checks: A switch from MVCC to WAL mode makes the truncation of the logical log
+/// durable before the header says WAL.
+/// Why this matters: A database in WAL mode does not open while its logical log has frames.
+#[test]
+fn test_switch_from_mvcc_to_wal_survives_power_loss() {
+    let db_path = "mvcc-power-loss-after-switch-to-wal.db";
+    let io = Arc::new(UnreliableIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
+    // This checkpoint fsyncs the database file, so the WAL-mode header becomes durable.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    assert_eq!(
+        io.durable_files()[db_path][18..20],
+        [2, 2],
+        "the header on disk must say WAL"
+    );
+
+    let (_dir, recovered) = io.crash_now_and_recover(db_path).unwrap();
+    assert_eq!(
+        get_rows(&recovered, "SELECT id, v FROM t"),
+        vec![vec![Value::from_i64(1), Value::from_text("a".to_string())]]
+    );
+}
+
+/// Replay gate uses metadata boundary and never applies frames at or below it.
+#[test]
+#[cfg_attr(
+    feature = "checksum",
+    ignore = "byte-level tamper caught by checksum layer"
+)]
+fn test_meta_recovery_case_12_replay_gate_skips_at_or_below_metadata_boundary() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    let boundary = {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let root_page = metadata_root_page(&conn);
+        conn.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+        let ts3 = db.get_mvcc_store().watermarks().last_committed_tx_ts;
+        drop(conn);
+        db.close();
+        tamper_db_metadata_row_value_by_key(
+            &db_path,
+            root_page,
+            "persistent_tx_ts_max",
+            ts3 as i64,
+        );
+        ts3
+    };
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+
+    let meta = get_rows(
+        &conn,
+        "SELECT v FROM __turso_internal_mvcc_meta WHERE k = 'persistent_tx_ts_max'",
+    );
+    assert_eq!(meta.len(), 1);
+    assert_eq!(meta[0][0].as_int().unwrap() as u64, boundary);
+}
+
+fn tamper_db_metadata_row_value_by_key(
+    db_path: &str,
+    metadata_root_page: u32,
+    target_key: &str,
+    new_value: i64,
+) {
+    let page_size = read_db_page_size(db_path);
+    let mut page = read_db_page(db_path, metadata_root_page, page_size);
+    let mut updated = false;
+    for loc in table_leaf_cell_locs(&page, metadata_root_page) {
+        let payload = &page[loc.payload_offset..loc.payload_offset + loc.payload_len];
+        let record = ImmutableRecordRef::from_bin_record(payload);
+        let key = record
+            .get_value_opt(0)
+            .expect("metadata key column missing");
+        let ValueRef::Text(key) = key else {
+            panic!("metadata key must be text");
+        };
+        if key.as_str() != target_key {
+            continue;
+        }
+        let new_record = ImmutableRecord::from_values(
+            &[
+                Value::Text(Text::new(target_key.to_string())),
+                Value::from_i64(new_value),
+            ],
+            2,
+        )
+        .unwrap();
+        rewrite_table_leaf_cell_payload(&mut page, loc, new_record.as_blob());
+        updated = true;
+    }
+    assert!(updated, "expected metadata key {target_key} to exist");
+    write_db_page(db_path, metadata_root_page, page_size, &page);
+}
+
+#[test]
+fn test_ddl_upgrade_sets_cached_tx_mode_to_write() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mv_store = db.get_mvcc_store();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    // BEGIN CONCURRENT is deferred: no MVCC tx is open yet at BEGIN time.
+    assert!(
+        conn.get_mv_tx().is_none(),
+        "no MVCC tx before first statement"
+    );
+
+    conn.execute("CREATE TABLE u(y INTEGER)").unwrap();
+    let (tx_id_after, mode_after) = conn.get_mv_tx().expect("DDL must materialize the MVCC tx");
+    assert_eq!(mode_after, TransactionMode::Write);
+    assert!(mv_store.is_exclusive_tx(&tx_id_after));
+
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_analyze_in_concurrent_tx_upgrades_to_exclusive() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let other = db.connect();
+    let mv_store = db.get_mvcc_store();
+
+    conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    other.execute("BEGIN CONCURRENT").unwrap();
+    other.execute("INSERT INTO t VALUES (2)").unwrap();
+
+    conn.execute("ANALYZE").unwrap();
+    let (tx_id, mode) = conn
+        .get_mv_tx()
+        .expect("ANALYZE must keep the outer tx open");
+    assert_eq!(mode, TransactionMode::Write);
+    assert!(mv_store.is_exclusive_tx(&tx_id));
+
+    other
+        .execute("COMMIT")
+        .expect_err("other concurrent commit must fail while ANALYZE holds exclusive");
+
+    conn.execute("COMMIT").unwrap();
+    let rows = get_rows(&conn, "SELECT count(*) FROM sqlite_stat1");
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0][0].as_int().unwrap() > 0,
+        "ANALYZE must write sqlite_stat1"
+    );
+}
+
+#[test]
+fn test_ddl_on_attached_db_in_concurrent_tx_upgrades() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir.path().join("aux.db");
+
+    let conn = db.connect();
+    drive_attach(&conn, aux_path.to_str().unwrap(), "aux");
+    conn.execute("CREATE TABLE aux.t (x INTEGER)").unwrap();
+
+    let other = db.connect();
+    drive_attach(&other, aux_path.to_str().unwrap(), "aux");
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    other.execute("BEGIN CONCURRENT").unwrap();
+    other.execute("INSERT INTO aux.t VALUES (1)").unwrap();
+
+    conn.execute("CREATE TABLE aux.u (y INTEGER)").unwrap();
+
+    let aux_db_id = conn.get_database_id_by_name("aux").unwrap();
+    let aux_mv_store = conn
+        .mv_store_for_db(aux_db_id)
+        .expect("attached aux database must be MVCC");
+    let (aux_tx_id, aux_mode) = conn
+        .get_mv_tx_for_db(aux_db_id)
+        .expect("attached MVCC tx must be open after DDL");
+    assert_eq!(aux_mode, TransactionMode::Write);
+    assert!(
+        aux_mv_store.is_exclusive_tx(&aux_tx_id),
+        "schema write on attached DB must upgrade that DB to exclusive"
+    );
+
+    other
+        .execute("COMMIT")
+        .expect_err("other concurrent commit on attached DB must fail while exclusive");
+
+    conn.execute("COMMIT").unwrap();
+    let rows = get_rows(&conn, "SELECT count(*) FROM aux.u");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 0);
+}
+
+/// Like the test above, but the writer pauses in `FinalizeCommit`, after it is
+/// `Committed` and before it raises `last_committed_tx_ts`. The check after the
+/// CAS must still see it.
+#[test]
+fn test_create_index_exclusive_acquire_rechecks_committed_tx_after_cas() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+    setup.close().unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (2, 200)").unwrap();
+    writer.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeGlobalHeaderUpdate.point(),
+    ])));
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN DEFERRED").unwrap();
+    let mut read = ddl.prepare("SELECT COUNT(*) FROM t").unwrap();
+    read.run_ignore_rows().unwrap();
+    drop(read);
+
+    let mvcc_store = db.get_mvcc_store();
+    let ddl_tx_id = ddl
+        .get_mv_tx()
+        .map(|(tx_id, _)| tx_id)
+        .expect("DDL connection should have an active MVCC transaction");
+    let injector = CommitWriterOnExclusiveAcquireInjector::new(
+        ExclusiveTxYieldPoint::AfterTimestampCheckBeforeCas.point(),
+        ddl_tx_id,
+        writer.clone(),
+    );
+    ddl.set_yield_injector(Some(injector.clone()));
+
+    let result = ddl.execute("CREATE INDEX idx_v ON t(v)");
+    let mut writer_commit = injector
+        .writer_commit
+        .lock()
+        .take()
+        .expect("writer COMMIT should pause before publishing last_committed_tx_ts");
+    assert!(
+        matches!(result, Err(turso_core::LimboError::Busy)),
+        "DDL transaction older than an already-committed writer should return Busy: {result:?}"
+    );
+    assert!(!mvcc_store.is_exclusive_tx(&ddl_tx_id));
+    ddl.set_yield_injector(None);
+    ddl.execute("ROLLBACK").unwrap();
+
+    writer.set_yield_injector(None);
+    writer_commit.run_ignore_rows().unwrap();
+    drop(writer_commit);
+
+    let observer = db.connect();
+    observer.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    let rows = get_rows(&observer, "SELECT id FROM t INDEXED BY idx_v WHERE v = 200");
+    assert_eq!(rows.len(), 1);
+}
+
+/// Regression for abandoned COMMIT cleanup with attached MVCC databases.
+/// Dropping the COMMIT while the main-db CommitStateMachine is paused must
+/// also roll back attached MVCC txs opened by the same SQL transaction.
+#[test]
+fn dropped_main_commit_rolls_back_attached_mvcc_txs() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir.path().join("aux.db");
+
+    let conn = db.connect();
+    drive_attach(&conn, aux_path.to_str().unwrap(), "aux");
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE aux.u (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'main')").unwrap();
+    conn.execute("INSERT INTO aux.u VALUES (1, 'aux')").unwrap();
+
+    let aux_db_id = conn.get_database_id_by_name("aux").unwrap();
+    let aux_mv_store = conn
+        .mv_store_for_db(aux_db_id)
+        .expect("attached aux database must be MVCC");
+    let aux_pager = conn.get_pager_from_database_index(&aux_db_id).unwrap();
+    let aux_tx_id = conn
+        .get_mv_tx_for_db(aux_db_id)
+        .map(|(tx_id, _)| tx_id)
+        .expect("attached MVCC tx must be open after INSERT");
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    {
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            turso_core::StepResult::Yield => {}
+            other => panic!("expected yield at LogRecordPrepared; got {other:?}"),
+        }
+    }
+    conn.set_yield_injector(None);
+
+    assert!(
+        conn.get_mv_tx_for_db(aux_db_id).is_none(),
+        "attached MVCC tx slot must be cleared when abandoned COMMIT is rolled back"
+    );
+    assert!(
+        aux_mv_store.tx_snapshot(aux_tx_id).is_none(),
+        "attached MVCC tx must be removed from txs"
+    );
+    assert!(
+        !aux_pager.holds_read_lock(),
+        "attached pager read lock must be released"
+    );
+
+    let rows = get_rows(&conn, "SELECT id FROM aux.u ORDER BY id");
+    assert!(
+        rows.is_empty(),
+        "abandoned attached INSERT must not become visible"
+    );
+}
+
+/// Regression for abandoning COMMIT after it has advanced from the main
+/// MVCC phase into an attached MVCC CommitStateMachine.
+#[test]
+fn dropped_attached_commit_releases_attached_read_lock() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir.path().join("aux.db");
+
+    let conn = db.connect();
+    drive_attach(&conn, aux_path.to_str().unwrap(), "aux");
+    conn.execute("CREATE TABLE aux.u (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO aux.u VALUES (1, 'aux')").unwrap();
+
+    let aux_db_id = conn.get_database_id_by_name("aux").unwrap();
+    let aux_mv_store = conn
+        .mv_store_for_db(aux_db_id)
+        .expect("attached aux database must be MVCC");
+    let aux_pager = conn.get_pager_from_database_index(&aux_db_id).unwrap();
+    let aux_tx_id = conn
+        .get_mv_tx_for_db(aux_db_id)
+        .map(|(tx_id, _)| tx_id)
+        .expect("attached MVCC tx must be open after INSERT");
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    {
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            turso_core::StepResult::Yield => {}
+            other => panic!("expected yield at attached LogRecordPrepared; got {other:?}"),
+        }
+    }
+    conn.set_yield_injector(None);
+
+    assert!(
+        conn.get_mv_tx_for_db(aux_db_id).is_none(),
+        "attached MVCC tx slot must be cleared"
+    );
+    assert!(
+        aux_mv_store.tx_snapshot(aux_tx_id).is_none(),
+        "attached MVCC tx must be removed from txs"
+    );
+    assert!(
+        !aux_pager.holds_read_lock(),
+        "attached pager read lock must be released"
+    );
+}
+
+/// Regression for abandoning COMMIT while one attached MVCC database is
+/// paused mid-commit and another attached MVCC transaction is still pending.
+#[test]
+fn dropped_attached_commit_rolls_back_remaining_attached_mvcc_txs() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux1_path = aux_dir.path().join("aux1.db");
+    let aux2_path = aux_dir.path().join("aux2.db");
+
+    let conn = db.connect();
+    drive_attach(&conn, aux1_path.to_str().unwrap(), "aux1");
+    drive_attach(&conn, aux2_path.to_str().unwrap(), "aux2");
+    conn.execute("CREATE TABLE aux1.u (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE aux2.v (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO aux1.u VALUES (1, 'aux1')")
+        .unwrap();
+    conn.execute("INSERT INTO aux2.v VALUES (1, 'aux2')")
+        .unwrap();
+
+    let aux1_db_id = conn.get_database_id_by_name("aux1").unwrap();
+    let aux2_db_id = conn.get_database_id_by_name("aux2").unwrap();
+    let aux1_mv_store = conn
+        .mv_store_for_db(aux1_db_id)
+        .expect("attached aux1 database must be MVCC");
+    let aux2_mv_store = conn
+        .mv_store_for_db(aux2_db_id)
+        .expect("attached aux2 database must be MVCC");
+    let aux1_pager = conn.get_pager_from_database_index(&aux1_db_id).unwrap();
+    let aux2_pager = conn.get_pager_from_database_index(&aux2_db_id).unwrap();
+    let aux1_tx_id = conn
+        .get_mv_tx_for_db(aux1_db_id)
+        .map(|(tx_id, _)| tx_id)
+        .expect("attached aux1 MVCC tx must be open after INSERT");
+    let aux2_tx_id = conn
+        .get_mv_tx_for_db(aux2_db_id)
+        .map(|(tx_id, _)| tx_id)
+        .expect("attached aux2 MVCC tx must be open after INSERT");
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    {
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            turso_core::StepResult::Yield => {}
+            other => panic!("expected yield at attached LogRecordPrepared; got {other:?}"),
+        }
+    }
+    conn.set_yield_injector(None);
+
+    assert!(
+        conn.get_mv_tx_for_db(aux1_db_id).is_none(),
+        "attached aux1 MVCC tx slot must be cleared"
+    );
+    assert!(
+        conn.get_mv_tx_for_db(aux2_db_id).is_none(),
+        "attached aux2 MVCC tx slot must be cleared"
+    );
+    assert!(
+        aux1_mv_store.tx_snapshot(aux1_tx_id).is_none(),
+        "attached aux1 MVCC tx must be removed from txs"
+    );
+    assert!(
+        aux2_mv_store.tx_snapshot(aux2_tx_id).is_none(),
+        "attached aux2 MVCC tx must be removed from txs"
+    );
+    assert!(
+        !aux1_pager.holds_read_lock(),
+        "attached aux1 pager read lock must be released"
+    );
+    assert!(
+        !aux2_pager.holds_read_lock(),
+        "attached aux2 pager read lock must be released"
+    );
+}
+
+fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) {
+    let mut state = turso_core::attach::AttachDatabaseState::default();
+    loop {
+        match conn.attach_database(path, alias, &mut state).unwrap() {
+            turso_core::IOResult::Done(()) => return,
+            turso_core::IOResult::IO(io) => io.wait(conn.db.io.as_ref()).unwrap(),
+        }
+    }
+}
+
+/// Encrypted MVCC: write rows, restart with same key, verify recovery replays them.
+/// Then swap to a wrong key and verify that restart fails.
+#[test]
+fn test_mvcc_encrypted_log_recovery_and_wrong_key() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    write_synthetic_row(&db, "encrypted_value");
+
+    // --- Verify the raw log file is encrypted (no plaintext leakage) ---
+    {
+        let log_path = std::path::PathBuf::from(db.path()).with_extension("db-log");
+        let log_bytes = std::fs::read(&log_path).expect("MVCC log file should exist");
+        assert!(
+            log_bytes.len() > 56,
+            "MVCC log should contain data beyond the header"
+        );
+        let plaintext = b"encrypted_value";
+        assert!(
+            !log_bytes.windows(plaintext.len()).any(|w| w == plaintext),
+            "MVCC log must not contain plaintext data when encryption is enabled"
+        );
+    }
+
+    // --- Restart with correct key: recovery should replay the encrypted log ---
+    db.restart();
+    {
+        let conn = db.connect();
+        let mvcc_store = db.get_mvcc_store();
+        let max_root_page = get_rows(
+            &conn,
+            "SELECT COALESCE(MAX(rootpage), 0) FROM sqlite_schema WHERE rootpage > 0",
+        )[0][0]
+            .as_int()
+            .unwrap();
+        let synthetic_table_id = MVTableId::new(-(max_root_page + 100));
+        let tx_id = mvcc_store.begin_tx(conn.get_pager()).unwrap();
+        let row = mvcc_store
+            .read(tx_id, &RowID::new(synthetic_table_id, RowKey::Int(1)))
+            .unwrap()
+            .unwrap();
+        let record = get_record_value(&row);
+        match record.get_value(0).unwrap() {
+            ValueRef::Text(text) => assert_eq!(text.as_str(), "encrypted_value"),
+            other => panic!("Expected Text, got {other:?}"),
+        }
+        conn.close().unwrap();
+    }
+
+    // --- Restart with wrong key: should fail ---
+    let wrong_key = "ff0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    db.set_encryption(Some(turso_core::EncryptionOpts {
+        cipher: "aes256gcm".to_string(),
+        hexkey: wrong_key.to_string(),
+    }));
+    assert!(
+        db.restart_result().is_err(),
+        "Expected error when reopening encrypted MVCC DB with wrong key"
+    );
+}
+
+#[test]
+fn test_encrypted_recovery_large_payload_multi_chunk() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let large_value = "x".repeat(ENCRYPTED_PAYLOAD_CHUNK_SIZE * 3);
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute(format!("INSERT INTO t VALUES (1, '{large_value}')"))
+            .unwrap();
+    }
+
+    let log_path = std::path::PathBuf::from(db.path()).with_extension("db-log");
+    assert!(log_path.exists(), "db-log should exist before restart");
+    assert_log_payloads_decrypt(&log_path, hex_key, turso_core::CipherMode::Aes256Gcm);
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(
+        &conn,
+        "SELECT id, length(v), substr(v, 1, 16), substr(v, length(v) - 15, 16) FROM t",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), large_value.len() as i64);
+    assert_eq!(rows[0][2].to_string(), "xxxxxxxxxxxxxxxx");
+    assert_eq!(rows[0][3].to_string(), "xxxxxxxxxxxxxxxx");
+}
+
+#[test]
+fn test_encrypted_recovery_corrupted_later_chunk_keeps_checkpointed_prefix() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let large_value = "z".repeat(ENCRYPTED_PAYLOAD_CHUNK_SIZE * 3);
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let log_path = std::path::PathBuf::from(db.path()).with_extension("db-log");
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'survives')")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute(format!("INSERT INTO t VALUES (2, '{large_value}')"))
+            .unwrap();
+    }
+
+    let mut log_bytes = std::fs::read(&log_path).expect("db-log should exist");
+    let payload_size = u64::from_le_bytes(
+        log_bytes[LOG_HDR_SIZE + 4..LOG_HDR_SIZE + 12]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let chunk_count = payload_size.div_ceil(ENCRYPTED_PAYLOAD_CHUNK_SIZE);
+    assert!(
+        chunk_count >= 3,
+        "expected multi-chunk encrypted recovery tail"
+    );
+
+    let enc_ctx = turso_core::EncryptionContext::new(
+        turso_core::CipherMode::Aes256Gcm,
+        &EncryptionKey::from_hex_string(hex_key).unwrap(),
+        4096,
+    )
+    .unwrap();
+    let first_chunk_on_disk_size =
+        ENCRYPTED_PAYLOAD_CHUNK_SIZE + enc_ctx.tag_size() + enc_ctx.nonce_size();
+    let corrupt_offset = LOG_HDR_SIZE + TX_BASE_HEADER_SIZE + first_chunk_on_disk_size + 1;
+    log_bytes[corrupt_offset] ^= 0xFF;
+    std::fs::write(&log_path, &log_bytes).unwrap();
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "survives");
+}
+
+/// Encrypted version of test_recovery_checkpoint_then_more_writes.
+/// Checkpoint some rows, write more without checkpointing, restart, verify all rows survive.
+#[test]
+fn test_encrypted_recovery_checkpoint_then_more_writes() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+    }
+
+    let log_path = std::path::PathBuf::from(db.path()).with_extension("db-log");
+    assert!(log_path.exists(), "db-log file should exist before restart");
+    assert_log_payloads_decrypt(&log_path, hex_key, turso_core::CipherMode::Aes256Gcm);
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "a");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][1].to_string(), "b");
+    assert_eq!(rows[2][0].as_int().unwrap(), 3);
+    assert_eq!(rows[2][1].to_string(), "c");
+}
+
+/// Write, restart, write more, restart again, verify all data accumulates correctly.
+#[test]
+fn test_encrypted_recovery_multiple_restart_cycles() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let log_path = std::path::PathBuf::from(db.path()).with_extension("db-log");
+
+    // Cycle 1: create table + insert
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
+    }
+
+    assert!(log_path.exists(), "db-log file should exist after cycle 1");
+    assert_log_payloads_decrypt(&log_path, hex_key, turso_core::CipherMode::Aes256Gcm);
+    db.restart();
+
+    // Cycle 2: insert more rows
+    {
+        let conn = db.connect();
+        conn.execute("INSERT INTO t VALUES (2, 'second')").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'third')").unwrap();
+    }
+
+    db.restart();
+
+    // Verify all rows survived two restart cycles
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][1].to_string(), "first");
+    assert_eq!(rows[1][1].to_string(), "second");
+    assert_eq!(rows[2][1].to_string(), "third");
+}
+
+/// Corrupt ciphertext bytes in the encrypted log payload. Recovery should treat the
+/// corrupted frame as a torn tail and stop cleanly without losing earlier valid frames.
+#[test]
+fn test_encrypted_recovery_corrupted_ciphertext() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let log_path = std::path::PathBuf::from(db.path()).with_extension("db-log");
+
+    // Write two transactions: checkpoint the first, leave the second only in the log.
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'survives')")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'corrupted')")
+            .unwrap();
+    }
+
+    assert!(
+        log_path.exists(),
+        "db-log file should exist before corruption"
+    );
+    assert_log_payloads_decrypt(&log_path, hex_key, turso_core::CipherMode::Aes256Gcm);
+
+    // Corrupt the portable_changes of the second (non-checkpointed) frame in the log file.
+    // The log header is 56 bytes, then the TX header is 24 bytes. Flip a byte
+    // in the encrypted payload area right after that.
+    {
+        let mut log_bytes = std::fs::read(&log_path).expect("log file should exist");
+        assert!(
+            log_bytes.len() > 56 + 24 + 1,
+            "log should have data beyond header + tx header"
+        );
+        // Flip a byte in the encrypted payload region
+        let corrupt_offset = 56 + 24 + 1;
+        log_bytes[corrupt_offset] ^= 0xFF;
+        std::fs::write(&log_path, &log_bytes).unwrap();
+    }
+
+    // Restart: recovery should discard the corrupted frame but the checkpointed
+    // row (id=1) must survive because it's already in the DB file.
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "survives");
+}
+
+/// Read the raw db-log file and verify every TX frame portable_changes can be decrypted.
+/// Panics if the file is missing, has no frames, or any portable_changes fails to decrypt.
+fn assert_log_payloads_decrypt(
+    log_path: &std::path::Path,
+    hex_key: &str,
+    cipher: turso_core::CipherMode,
+) {
+    use turso_core::EncryptionContext;
+
+    let log_bytes = std::fs::read(log_path).expect("db-log file should exist");
+    assert!(
+        log_bytes.len() > LOG_HDR_SIZE,
+        "db-log should contain data beyond the header"
+    );
+
+    let key = EncryptionKey::from_hex_string(hex_key).unwrap();
+    let enc_ctx = EncryptionContext::new(cipher, &key, 4096).unwrap();
+    let nonce_size = enc_ctx.nonce_size();
+    let tag_size = enc_ctx.tag_size();
+
+    // Parse salt from log header (bytes 8..16, little-endian u64)
+    let salt = u64::from_le_bytes(log_bytes[8..16].try_into().unwrap());
+
+    let mut offset = LOG_HDR_SIZE;
+    let mut frame_count = 0;
+
+    while offset + TX_BASE_HEADER_SIZE + TX_TRAILER_SIZE <= log_bytes.len() {
+        // TX Header: frame_magic(4) | payload_size(8) | op_count(4) | commit_ts(8)
+        // | extension_size(8) | extension_record_count(4) | frame_flags(4)
+        let frame_magic = u32::from_le_bytes(log_bytes[offset..offset + 4].try_into().unwrap());
+        let (header_size, extension_size) = if frame_magic == FRAME_MAGIC {
+            (TX_BASE_HEADER_SIZE, 0)
+        } else if frame_magic == EXT_FRAME_MAGIC {
+            if offset + TX_EXT_HEADER_SIZE + TX_TRAILER_SIZE > log_bytes.len() {
+                break;
+            }
+            (
+                TX_EXT_HEADER_SIZE,
+                u64::from_le_bytes(log_bytes[offset + 24..offset + 32].try_into().unwrap())
+                    as usize,
+            )
+        } else {
+            break; // not a valid frame
+        };
+        let payload_size =
+            u64::from_le_bytes(log_bytes[offset + 4..offset + 12].try_into().unwrap()) as usize;
+        let op_count = u32::from_le_bytes(log_bytes[offset + 12..offset + 16].try_into().unwrap());
+        let commit_ts = u64::from_le_bytes(log_bytes[offset + 16..offset + 24].try_into().unwrap());
+
+        let encrypted_plaintext_size = payload_size + extension_size;
+        let mut payload_offset = offset + header_size;
+        let chunk_count = if encrypted_plaintext_size == 0 {
+            0
+        } else {
+            encrypted_plaintext_size.div_ceil(ENCRYPTED_PAYLOAD_CHUNK_SIZE)
+        };
+
+        let mut frame_complete = true;
+        for chunk_index in 0..chunk_count {
+            let chunk_plaintext_len = (encrypted_plaintext_size
+                - chunk_index * ENCRYPTED_PAYLOAD_CHUNK_SIZE)
+                .min(ENCRYPTED_PAYLOAD_CHUNK_SIZE);
+            let chunk_on_disk_size = chunk_plaintext_len + tag_size + nonce_size;
+            if payload_offset + chunk_on_disk_size + TX_TRAILER_SIZE > log_bytes.len() {
+                frame_complete = false;
+                break;
+            }
+
+            let blob = &log_bytes[payload_offset..payload_offset + chunk_on_disk_size];
+            let ciphertext = &blob[..chunk_plaintext_len + tag_size];
+            let nonce = &blob[chunk_plaintext_len + tag_size..];
+
+            let mut aad = [0u8; 32];
+            aad[..8].copy_from_slice(&salt.to_le_bytes());
+            if chunk_index + 1 == chunk_count {
+                aad[8..16].copy_from_slice(&(encrypted_plaintext_size as u64).to_le_bytes());
+            }
+            aad[16..20].copy_from_slice(&op_count.to_le_bytes());
+            aad[20..28].copy_from_slice(&commit_ts.to_le_bytes());
+            aad[28..32].copy_from_slice(&(chunk_index as u32).to_le_bytes());
+
+            enc_ctx
+                .decrypt_chunk(ciphertext, nonce, &aad)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "failed to decrypt frame {frame_count} chunk {chunk_index} at offset {offset}: {e}"
+                    )
+                });
+
+            payload_offset += chunk_on_disk_size;
+        }
+        if !frame_complete {
+            break;
+        }
+
+        frame_count += 1;
+        offset = payload_offset + TX_TRAILER_SIZE; // skip encrypted body and trailer
+    }
+
+    assert!(
+        frame_count > 0,
+        "db-log should contain at least one TX frame"
+    );
+}
+
+const TX_BASE_HEADER_SIZE: usize = 24;
+
+const TX_EXT_HEADER_SIZE: usize = 40;
+
+const TX_TRAILER_SIZE: usize = 8;
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_resolve_user_table_after_cross_connection_checkpoint() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let creator = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    creator.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    creator.set_portable_logical_changes_enabled(true);
+    creator
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    let rows = get_rows(
+        &creator,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 'items'",
+    );
+    let initial_rootpage = rows[0][0].as_int().unwrap();
+    assert!(initial_rootpage < 0);
+
+    let checkpoint = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    checkpoint
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let rows = get_rows(
+        &checkpoint,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 'items'",
+    );
+    let rootpage = rows[0][0].as_int().unwrap();
+    assert!(rootpage > 0);
+    {
+        let schema = checkpoint.db.clone_schema();
+        assert_eq!(schema.table_name_for_root_page(rootpage), Some("items"));
+        assert_eq!(schema.table_name_for_root_page(initial_rootpage), None);
+    }
+    {
+        let schema = checkpoint.current_schema();
+        assert_eq!(schema.table_name_for_root_page(rootpage), Some("items"));
+        assert_eq!(schema.table_name_for_root_page(initial_rootpage), None);
+    }
+
+    let writer = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    writer.set_portable_logical_changes_enabled(true);
+    writer
+        .execute("INSERT INTO items(id, payload) VALUES (1, 'after-checkpoint')")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&writer);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+
+    assert!(
+        objects.iter().any(|object| object.name == "items"),
+        "DML-only portable frame should resolve user table after cross-connection checkpoint"
+    );
 }

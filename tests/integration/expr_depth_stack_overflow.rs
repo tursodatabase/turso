@@ -2,7 +2,9 @@ use std::sync::Arc;
 use turso_sqlite::SqliteDialect;
 
 use turso_core::{ConnectOpts, Database, MemoryIO, SessionRole, IO};
-use turso_parser::MAX_EXPR_DEPTH;
+use turso_parser::{
+    MAX_COMPOUND_SELECT, MAX_EXPR_DEPTH, MAX_QUERY_DEPTH, TOO_MANY_COMPOUND_TERMS_MESSAGE,
+};
 
 struct GenExpr {
     name: &'static str,
@@ -49,6 +51,15 @@ const GEN_EXPRS: &[GenExpr] = &[
     GenExpr {
         name: "function-call",
         build: |depth| nest("abs(", "1", ")", depth),
+    },
+    // https://github.com/tursodatabase/turso/issues/4197
+    GenExpr {
+        name: "unary-plus",
+        build: |depth| nest("+", "1", "", depth),
+    },
+    GenExpr {
+        name: "unary-minus",
+        build: |depth| nest("- ", "1", "", depth),
     },
     // A wide chain wrapped in a single node whose parse recursion is shallow: the
     // parser consumes the `OR` chain iteratively (so the recursion guard never
@@ -187,4 +198,399 @@ fn upsert_with_a_change_check_per_column_runs_on_a_1_mib_stack() {
     );
 
     run_with_stack(1 << 20, vec![create, upsert.clone(), upsert]).unwrap();
+}
+
+/// A statement with `depth` levels of one kind of nested query. Each statement
+/// reads the table that [`CREATE_T`] makes.
+struct NestedQuery {
+    name: &'static str,
+    build: fn(depth: usize) -> String,
+}
+
+const CREATE_T: &str = "CREATE TABLE t(x)";
+
+const NESTED_QUERIES: &[NestedQuery] = &[
+    // https://github.com/tursodatabase/turso/issues/4900
+    NestedQuery {
+        name: "from-subquery",
+        build: |depth| {
+            format!(
+                "SELECT * FROM {}t{}",
+                "(SELECT * FROM ".repeat(depth),
+                ")".repeat(depth)
+            )
+        },
+    },
+    NestedQuery {
+        name: "from-parentheses",
+        build: |depth| format!("SELECT * FROM {}t{}", "(".repeat(depth), ")".repeat(depth)),
+    },
+    // https://github.com/tursodatabase/turso/issues/8105
+    NestedQuery {
+        name: "cte",
+        build: |depth| {
+            let mut sql = String::new();
+            for i in (1..depth).rev() {
+                sql.push_str(&format!("WITH n{i} AS ("));
+            }
+            sql.push_str("WITH n0 AS (SELECT x FROM t) SELECT * FROM n0");
+            for i in 1..depth {
+                sql.push_str(&format!(") SELECT * FROM n{i}"));
+            }
+            sql
+        },
+    },
+];
+
+fn query_nested_too_deeply() -> String {
+    format!("Query is nested too deeply (maximum depth {MAX_QUERY_DEPTH})")
+}
+
+#[test]
+fn query_nesting_over_the_limit_is_an_error() {
+    for nested in NESTED_QUERIES {
+        for depth in [MAX_QUERY_DEPTH + 1, 100_000] {
+            let err = run_with_stack(
+                WORKER_STACK,
+                vec![CREATE_T.to_string(), (nested.build)(depth)],
+            )
+            .expect_err(nested.name);
+            assert_eq!(
+                err.to_string(),
+                query_nested_too_deeply(),
+                "{} at depth {depth}: {err:?}",
+                nested.name
+            );
+        }
+    }
+}
+
+#[test]
+fn query_nesting_at_the_limit_completes() {
+    for nested in NESTED_QUERIES {
+        run_with_stack(
+            WORKER_STACK,
+            vec![CREATE_T.to_string(), (nested.build)(MAX_QUERY_DEPTH)],
+        )
+        .unwrap_or_else(|err| panic!("{}: {err:?}", nested.name));
+    }
+}
+
+#[test]
+fn view_and_trigger_over_the_query_nesting_limit_are_errors() {
+    let select = (NESTED_QUERIES[0].build)(MAX_QUERY_DEPTH + 1);
+    for sql in [
+        format!("CREATE VIEW v AS {select}"),
+        format!("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO t {select}; END"),
+    ] {
+        let err = run_with_stack(WORKER_STACK, vec![CREATE_T.to_string(), sql])
+            .expect_err("statement over the limit");
+        assert_eq!(err.to_string(), query_nested_too_deeply(), "{err:?}");
+    }
+}
+
+#[test]
+fn sibling_subqueries_do_not_count_toward_the_query_nesting_limit() {
+    let columns = vec!["(SELECT 1)"; MAX_QUERY_DEPTH + 100].join(", ");
+    run_with_stack(WORKER_STACK, vec![format!("SELECT {columns}")]).unwrap();
+}
+
+/// Statements whose SQL text is flat, but whose plan nests one query in another
+/// `depth` times. Only the planner can count this depth.
+struct PlannedNesting {
+    name: &'static str,
+    build: fn(depth: usize) -> Vec<String>,
+}
+
+const PLANNED_NESTINGS: &[PlannedNesting] = &[
+    PlannedNesting {
+        name: "cte-chain",
+        build: |depth| {
+            let ctes = std::iter::once("n0 AS (SELECT x FROM t)".to_string())
+                .chain((1..depth).map(|i| format!("n{i} AS (SELECT * FROM n{})", i - 1)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            vec![
+                CREATE_T.to_string(),
+                format!("WITH {ctes} SELECT * FROM n{}", depth - 1),
+            ]
+        },
+    },
+    PlannedNesting {
+        name: "view-chain",
+        build: |depth| {
+            let mut statements = vec![
+                CREATE_T.to_string(),
+                "CREATE VIEW v0 AS SELECT x FROM t".to_string(),
+            ];
+            statements.extend(
+                (1..depth).map(|i| format!("CREATE VIEW v{i} AS SELECT * FROM v{}", i - 1)),
+            );
+            statements.push(format!("SELECT * FROM v{}", depth - 1));
+            statements
+        },
+    },
+    // Each different window adds one level of subquery to the plan.
+    PlannedNesting {
+        name: "windows",
+        build: |depth| {
+            let columns = (0..depth)
+                .map(|i| format!("sum(x) OVER (ORDER BY x ROWS {i} PRECEDING)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            vec![CREATE_T.to_string(), format!("SELECT {columns} FROM t")]
+        },
+    },
+];
+
+#[test]
+fn planned_nesting_over_the_limit_is_an_error() {
+    for nesting in PLANNED_NESTINGS {
+        let err = run_with_stack(WORKER_STACK, (nesting.build)(MAX_QUERY_DEPTH + 1))
+            .expect_err(nesting.name);
+        assert_eq!(
+            err.to_string(),
+            query_nested_too_deeply(),
+            "{}: {err:?}",
+            nesting.name
+        );
+    }
+}
+
+#[test]
+fn planned_nesting_at_the_limit_completes() {
+    for nesting in PLANNED_NESTINGS.iter().filter(|n| n.name != "windows") {
+        run_with_stack(WORKER_STACK, (nesting.build)(MAX_QUERY_DEPTH))
+            .unwrap_or_else(|err| panic!("{}: {err:?}", nesting.name));
+    }
+}
+
+/// A separate test, because 500 windows take long to plan in a debug build,
+/// and separate tests run in parallel.
+#[test]
+fn windows_at_the_query_nesting_limit_complete() {
+    let windows = PLANNED_NESTINGS
+        .iter()
+        .find(|n| n.name == "windows")
+        .unwrap();
+    run_with_stack(WORKER_STACK, (windows.build)(MAX_QUERY_DEPTH)).unwrap();
+}
+
+/// SQLite's `SQLITE_MAX_TRIGGER_DEPTH`, which Turso also uses.
+const MAX_TRIGGER_DEPTH: usize = 1000;
+
+const TRIGGER_DEPTH_ERROR: &str = "too many levels of trigger recursion";
+
+/// Statements that make a chain of `triggers` triggers: an insert into `t0`
+/// fires the first one, and each one inserts into the table of the next one.
+fn trigger_chain(triggers: usize) -> Vec<String> {
+    let tables = (0..=triggers).map(|i| format!("CREATE TABLE t{i}(x)"));
+    let chain = (0..triggers).map(|i| {
+        format!(
+            "CREATE TRIGGER tr{i} AFTER INSERT ON t{i} BEGIN INSERT INTO t{} VALUES (NEW.x); END",
+            i + 1
+        )
+    });
+    tables.chain(chain).collect()
+}
+
+/// Statements that make a table of `rows` rows, where each row is the parent of
+/// the next one, with ON DELETE CASCADE.
+fn cascade_chain(rows: usize) -> Vec<String> {
+    vec![
+        "PRAGMA foreign_keys = ON".to_string(),
+        "CREATE TABLE p(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES p(id) ON DELETE CASCADE)"
+            .to_string(),
+        format!(
+            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < {rows}) \
+             INSERT INTO p SELECT i, CASE WHEN i = 1 THEN NULL ELSE i - 1 END FROM c"
+        ),
+    ]
+}
+
+// https://github.com/tursodatabase/turso/issues/9431
+#[test]
+fn trigger_chain_at_the_trigger_depth_limit_completes() {
+    let (result, rows) = run_then_count(
+        WORKER_STACK,
+        trigger_chain(MAX_TRIGGER_DEPTH),
+        "INSERT INTO t0 VALUES (1)",
+        format!("SELECT count(*) FROM t{MAX_TRIGGER_DEPTH}"),
+    );
+    result.unwrap();
+    assert_eq!(rows, 1);
+}
+
+#[test]
+fn trigger_chain_over_the_trigger_depth_limit_is_an_error_and_rolls_back() {
+    let (result, rows) = run_then_count(
+        WORKER_STACK,
+        trigger_chain(MAX_TRIGGER_DEPTH + 1),
+        "INSERT INTO t0 VALUES (1)",
+        "SELECT count(*) FROM t0".to_string(),
+    );
+    assert_eq!(result.unwrap_err().to_string(), TRIGGER_DEPTH_ERROR);
+    assert_eq!(rows, 0);
+}
+
+#[test]
+fn cascade_at_the_trigger_depth_limit_completes() {
+    let (result, rows) = run_then_count(
+        WORKER_STACK,
+        cascade_chain(MAX_TRIGGER_DEPTH),
+        "DELETE FROM p WHERE id = 1",
+        "SELECT count(*) FROM p".to_string(),
+    );
+    result.unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[test]
+fn cascade_over_the_trigger_depth_limit_is_an_error_and_rolls_back() {
+    let (result, rows) = run_then_count(
+        WORKER_STACK,
+        cascade_chain(MAX_TRIGGER_DEPTH + 1),
+        "DELETE FROM p WHERE id = 1",
+        "SELECT count(*) FROM p".to_string(),
+    );
+    assert_eq!(result.unwrap_err().to_string(), TRIGGER_DEPTH_ERROR);
+    assert_eq!(rows, (MAX_TRIGGER_DEPTH + 1) as i64);
+}
+
+/// Runs `setup`, then `statement`, then `count`, on a thread with `stack_size`
+/// bytes of stack. Returns the result of `statement`, and the integer that
+/// `count` returns after it.
+fn run_then_count(
+    stack_size: usize,
+    setup: Vec<String>,
+    statement: &'static str,
+    count: String,
+) -> (turso_core::Result<()>, i64) {
+    std::thread::Builder::new()
+        .stack_size(stack_size)
+        .spawn(move || {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            for sql in &setup {
+                conn.execute(sql).unwrap();
+            }
+            let result = conn.execute(statement);
+            let rows = crate::common::limbo_exec_rows(&conn, &count);
+            let rusqlite::types::Value::Integer(n) = rows[0][0] else {
+                panic!("{count} did not return an integer: {rows:?}");
+            };
+            (result, n)
+        })
+        .expect("failed to spawn worker thread")
+        .join()
+        .expect("worker thread panicked")
+}
+
+/// SQLite has no limit on the nesting of queries, and it does not count the
+/// terms of a compound whose last term is VALUES. So a database that it wrote
+/// can store views past the limits of Turso. Turso reads the SQL of these views
+/// with the same limits as the SQL of statements, so such a view is
+/// unavailable, and `ALTER TABLE` stops with the error of the limit. The other
+/// views and tables stay available, and `DROP VIEW` removes such a view.
+#[test]
+fn stored_views_past_the_limits_are_unavailable() {
+    on_worker_thread(|| {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("deep.db");
+        let nested = (NESTED_QUERIES[0].build)(MAX_QUERY_DEPTH + 100);
+        let compound_at_the_limit = compound_ending_in_values(MAX_COMPOUND_SELECT);
+        let compound_over_the_limit = compound_ending_in_values(MAX_COMPOUND_SELECT + 1);
+        write_database_with_sqlite(
+            &path,
+            &format!(
+                "CREATE TABLE t(x); CREATE VIEW v AS {nested}; \
+                 CREATE VIEW w AS {compound_at_the_limit}; \
+                 CREATE VIEW x AS {compound_over_the_limit};"
+            ),
+        );
+
+        let db = crate::common::TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        let rows = crate::common::limbo_exec_rows(&conn, "SELECT count(*) FROM w");
+        assert_eq!(
+            rows,
+            vec![vec![rusqlite::types::Value::Integer(
+                MAX_COMPOUND_SELECT as i64
+            )]]
+        );
+        for view in ["v", "x"] {
+            let err = conn.execute(format!("SELECT * FROM {view}")).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("view '{view}' could not be loaded")),
+                "{view}: {err}"
+            );
+        }
+        let err = conn.execute("ALTER TABLE t RENAME TO t2").unwrap_err();
+        assert!(
+            err.to_string().contains(&query_nested_too_deeply()),
+            "{err}"
+        );
+        conn.execute("DROP VIEW v").unwrap();
+        let err = conn.execute("ALTER TABLE t RENAME TO t2").unwrap_err();
+        assert!(
+            err.to_string().contains(TOO_MANY_COMPOUND_TERMS_MESSAGE),
+            "{err}"
+        );
+        conn.execute("DROP VIEW x").unwrap();
+        conn.execute("ALTER TABLE t RENAME TO t2").unwrap();
+    });
+}
+
+/// A trigger past a limit stops the open of the database, as other trigger SQL
+/// that does not parse does.
+#[test]
+fn stored_trigger_past_the_nesting_limit_stops_the_open() {
+    on_worker_thread(|| {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("deep.db");
+        let nested = (NESTED_QUERIES[0].build)(MAX_QUERY_DEPTH + 100);
+        write_database_with_sqlite(
+            &path,
+            &format!(
+                "CREATE TABLE t(x); CREATE TABLE u(x); \
+                 CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO t {nested}; END;"
+            ),
+        );
+
+        let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let Err(err) = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))
+        else {
+            panic!("the open must fail");
+        };
+        assert!(err.to_string().starts_with("invalid trigger sql"), "{err}");
+    });
+}
+
+/// A compound SELECT of `terms` terms whose last term is VALUES.
+fn compound_ending_in_values(terms: usize) -> String {
+    format!(
+        "{} UNION ALL VALUES (2)",
+        vec!["SELECT 1"; terms - 1].join(" UNION ALL ")
+    )
+}
+
+/// Writes a database in WAL mode with SQLite, and runs `sql` in it.
+fn write_database_with_sqlite(path: &std::path::Path, sql: &str) {
+    let sqlite = rusqlite::Connection::open(path).unwrap();
+    sqlite.pragma_update(None, "journal_mode", "wal").unwrap();
+    sqlite.execute_batch(sql).unwrap();
+}
+
+/// Runs `f` on a thread with [WORKER_STACK] bytes of stack.
+fn on_worker_thread(f: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(WORKER_STACK)
+        .spawn(f)
+        .expect("failed to spawn worker thread")
+        .join()
+        .expect("worker thread panicked");
 }

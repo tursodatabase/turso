@@ -53,21 +53,58 @@ impl From<LimboError> for Error {
 }
 
 /// An engine error with the message `message`, which reports SQLSTATE
-/// `sqlstate` to the client. Use it for errors that the PostgreSQL frontend
-/// raises itself, also in the PostgreSQL functions that the engine runs.
-pub(crate) fn sqlstate_error(sqlstate: &'static str, message: impl Into<String>) -> LimboError {
+/// `sqlstate` to the client, with the DETAIL `detail` if there is one. Use
+/// it for errors that the PostgreSQL frontend raises itself, also in the
+/// PostgreSQL functions that the engine runs.
+pub fn sqlstate_error(
+    sqlstate: &'static str,
+    message: impl Into<String>,
+    detail: Option<String>,
+) -> LimboError {
     LimboError::Dialect(Box::new(DialectError {
         code: sqlstate,
         message: message.into(),
+        detail,
+        hint: None,
+    }))
+}
+
+const DROP_CASCADE_HINT: &str = "Use DROP ... CASCADE to drop the dependent objects too.";
+
+/// The error of a DROP of several objects that `error` refused because other
+/// objects depend on one of them. PostgreSQL does not say which one.
+pub fn several_dropped_objects_have_dependents(error: LimboError) -> LimboError {
+    let LimboError::DependentObjects(refusal) = error else {
+        return error;
+    };
+    LimboError::Dialect(Box::new(DialectError {
+        code: SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+        message: "cannot drop desired object(s) because other objects depend on them".into(),
+        detail: Some(refusal.dependents.join("\n")),
+        hint: Some(DROP_CASCADE_HINT.into()),
     }))
 }
 
 /// The engine error for SQL that `turso_pg_parser::parse` refuses, which
 /// keeps the SQLSTATE that the parser gave it.
+/// The error of a DROP that names a relation of another kind than the one
+/// it drops, with the DROP statement that removes that kind.
+pub fn wrong_relation_kind(name: &str, expected_kind: &str, kind: &str) -> LimboError {
+    LimboError::Dialect(Box::new(DialectError {
+        code: SQLSTATE_WRONG_OBJECT_TYPE,
+        message: format!("\"{name}\" is not a {expected_kind}"),
+        detail: None,
+        hint: Some(format!(
+            "Use DROP {} to remove a {kind}.",
+            kind.to_uppercase()
+        )),
+    }))
+}
+
 pub fn sql_parse_error(error: turso_pg_parser::ParseError) -> LimboError {
     match error {
         turso_pg_parser::ParseError::Sqlstate { sqlstate, message } => {
-            sqlstate_error(sqlstate, message)
+            sqlstate_error(sqlstate, message, None)
         }
         other => LimboError::ParseError(other.to_string()),
     }
@@ -80,6 +117,7 @@ pub(crate) fn in_failed_sql_transaction_error() -> LimboError {
     sqlstate_error(
         turso_pg_parser::sqlstate::SQLSTATE_IN_FAILED_SQL_TRANSACTION,
         "current transaction is aborted, commands ignored until end of transaction block",
+        None,
     )
 }
 
@@ -88,6 +126,7 @@ pub struct ErrorReport {
     pub sqlstate: &'static str,
     pub message: String,
     pub detail: Option<String>,
+    pub hint: Option<String>,
     pub table_name: Option<String>,
     pub constraint_name: Option<String>,
     pub column_name: Option<String>,
@@ -99,6 +138,7 @@ impl From<&LimboError> for ErrorReport {
             sqlstate: sqlstate(error),
             message: error.to_string(),
             detail: None,
+            hint: None,
             table_name: None,
             constraint_name: None,
             column_name: None,
@@ -117,8 +157,21 @@ impl From<&LimboError> for ErrorReport {
                 report.detail = constraint_detail(violation);
             }
         }
+        if let LimboError::DependentObjects(refusal) = error {
+            report.message = format!(
+                "cannot drop {} because other objects depend on it",
+                refusal.dropped
+            );
+            report.detail = Some(refusal.dependents.join("\n"));
+            report.hint = Some(DROP_CASCADE_HINT.into());
+        }
         if let LimboError::PermissionDenied(denial) = error {
             report.message = permission_denied_message(denial);
+            report.detail = permission_denied_detail(denial);
+        }
+        if let LimboError::Dialect(error) = error {
+            report.detail.clone_from(&error.detail);
+            report.hint.clone_from(&error.hint);
         }
         report
     }
@@ -252,6 +305,7 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::InvalidDate(_)
         | LimboError::InvalidTime(_)
         | LimboError::InvalidModifier(_) => SQLSTATE_INVALID_DATETIME_FORMAT,
+        LimboError::DatetimeFieldOverflow(_) => SQLSTATE_DATETIME_FIELD_OVERFLOW,
         LimboError::InvalidArgument(msg) => invalid_argument_sqlstate(msg),
         LimboError::ConversionError(_) | LimboError::InvalidFormatter(_) => SQLSTATE_DATA_EXCEPTION,
         LimboError::ParseIntError(_) | LimboError::ParseFloatError(_) => {
@@ -284,6 +338,7 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::Corrupt(_) | LimboError::NotADB => SQLSTATE_DATA_CORRUPTED,
         LimboError::Dialect(error) => error.code,
         LimboError::PermissionDenied(_) => SQLSTATE_INSUFFICIENT_PRIVILEGE,
+        LimboError::DependentObjects(_) => SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
         _ => SQLSTATE_INTERNAL_ERROR,
     }
 }
@@ -299,7 +354,6 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
 fn parse_error_sqlstate(msg: &str) -> &'static str {
     if (msg.starts_with("cannot drop column") && msg.contains(": referenced in VIEW "))
         || msg.starts_with("cannot drop type")
-        || (msg.starts_with("cannot drop ") && msg.contains(" because other objects depend on it"))
         || (msg.starts_with("cannot change column \"") && msg.contains("\" because policy \""))
         || (msg.starts_with("error in table ")
             && msg.contains(" after drop column: no such column"))
@@ -307,13 +361,17 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST
     } else if msg.starts_with("cannot INSERT into generated column ")
         || msg.starts_with("cannot UPDATE generated column ")
+        || is_identity_write_error(msg)
     {
         SQLSTATE_GENERATED_ALWAYS
+    } else if is_invalid_sequence_parameter(msg) {
+        SQLSTATE_INVALID_PARAMETER_VALUE
     } else if is_duplicate_object_error(msg) {
         SQLSTATE_DUPLICATE_TABLE
     } else if msg.starts_with("role \"") && msg.ends_with("\" already exists") {
         SQLSTATE_DUPLICATE_OBJECT
     } else if msg.contains("no such table")
+        || msg.starts_with("no such view")
         || msg.contains("table not found")
         || msg.starts_with("no such object")
     {
@@ -324,7 +382,7 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.contains("already exists") {
         SQLSTATE_DUPLICATE_TABLE
-    } else if msg.starts_with("ambiguous column name") {
+    } else if msg.starts_with("ambiguous column name") || msg.ends_with("\" is ambiguous") {
         SQLSTATE_AMBIGUOUS_COLUMN
     } else if msg.starts_with("misuse of aggregate")
         || msg.starts_with("aggregate functions are not allowed")
@@ -334,7 +392,11 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         || msg.starts_with("window functions are not allowed")
     {
         SQLSTATE_WINDOWING_ERROR
-    } else if msg.starts_with("invalid reference to FROM-clause entry") {
+    } else if msg.starts_with("invalid reference to FROM-clause entry")
+        || msg == "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+        || msg == "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+        || msg.contains(" term out of range - should be between ")
+    {
         SQLSTATE_INVALID_COLUMN_REFERENCE
     } else if msg == "malformed JSON" {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
@@ -348,7 +410,9 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         && (msg.contains("\" is not a") || msg.ends_with("\" is an index"))
     {
         SQLSTATE_WRONG_OBJECT_TYPE
-    } else if msg.starts_with("cannot change owner of sequence \"") {
+    } else if msg.starts_with("cannot change owner of sequence \"")
+        || msg.starts_with("cannot change ownership of identity sequence")
+    {
         SQLSTATE_FEATURE_NOT_SUPPORTED
     } else if msg.starts_with("column \"") && msg.ends_with("\" does not exist") {
         SQLSTATE_UNDEFINED_COLUMN
@@ -356,7 +420,9 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.starts_with("there is no parameter $") {
         SQLSTATE_UNDEFINED_PARAMETER
-    } else if msg == "subqueries in policies are not supported" {
+    } else if msg == "subqueries in policies are not supported"
+        || (msg.contains("DISTINCT ON") && msg.ends_with(" is not supported"))
+    {
         SQLSTATE_FEATURE_NOT_SUPPORTED
     } else if msg == "sequence must have same owner as table it is linked to" {
         SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE
@@ -393,6 +459,17 @@ fn is_duplicate_object_error(msg: &str) -> bool {
         && !msg.contains(" has no column named ")
 }
 
+fn is_identity_write_error(msg: &str) -> bool {
+    msg.starts_with("cannot insert a non-DEFAULT value into column \"")
+        || (msg.starts_with("column \"") && msg.ends_with("\" can only be updated to DEFAULT"))
+}
+
+fn is_invalid_sequence_parameter(msg: &str) -> bool {
+    msg == "INCREMENT must not be zero"
+        || (msg.starts_with("MINVALUE (") && msg.contains(") must be less than MAXVALUE ("))
+        || (msg.starts_with("START value (") && msg.contains(") cannot be "))
+}
+
 fn invalid_argument_sqlstate(msg: &str) -> &'static str {
     if msg.starts_with("no such database") {
         SQLSTATE_INVALID_SCHEMA_NAME
@@ -417,9 +494,7 @@ fn sql_error_sqlstate(msg: &str) -> &'static str {
 /// The SQLSTATE of a RAISE. The translator and the types of the engine check
 /// values with RAISE, and PostgreSQL gives these checks their own SQLSTATE.
 fn raise_sqlstate(msg: &str) -> &'static str {
-    if msg == "invalid date value" || msg == "invalid timestamp value" {
-        SQLSTATE_INVALID_DATETIME_FORMAT
-    } else if msg.starts_with("invalid input value for enum ") {
+    if msg.starts_with("invalid input value for enum ") {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
     } else if msg == "integer out of range for smallint" {
         SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
@@ -467,6 +542,7 @@ fn permission_denied_message(denial: &PermissionDenied) -> String {
     match (denial.action, &denial.object) {
         (Action::CreateTemporary, _) => "permission denied to create temporary objects".into(),
         (Action::Create, Object::Role(_)) => "permission denied to create role".into(),
+        (Action::Drop, Object::Role(_)) => "permission denied to drop role".into(),
         (Action::Write, Object::Setting(name)) => {
             format!("permission denied to set parameter \"{name}\"")
         }
@@ -482,6 +558,21 @@ fn permission_denied_message(denial: &PermissionDenied) -> String {
         }
         (_, Object::File(_)) => "permission denied to COPY from a file".into(),
         (_, object) => format!("permission denied for {}", object_name(object)),
+    }
+}
+
+/// The DETAIL PostgreSQL gives with a denial, for the denials that have one.
+fn permission_denied_detail(denial: &PermissionDenied) -> Option<String> {
+    match (&denial.reason, denial.action, &denial.object) {
+        (Reason::Privilege, Action::Create, Object::Role(_)) => {
+            Some("Only roles with the CREATEROLE attribute may create roles.".to_string())
+        }
+        (Reason::Privilege, Action::Drop, Object::Role(_)) => Some(
+            "Only roles with the CREATEROLE attribute and the ADMIN option on the target roles \
+             may drop roles."
+                .to_string(),
+        ),
+        _ => None,
     }
 }
 
@@ -559,6 +650,7 @@ mod tests {
     fn parse_errors_classify_by_message() {
         for (msg, code) in [
             ("no such table: t", SQLSTATE_UNDEFINED_TABLE),
+            ("no such view: v", SQLSTATE_UNDEFINED_TABLE),
             ("no such column: c", SQLSTATE_UNDEFINED_COLUMN),
             ("no such function: f", SQLSTATE_UNDEFINED_FUNCTION),
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
@@ -567,6 +659,39 @@ mod tests {
             (
                 "role \"no such table\" already exists",
                 SQLSTATE_DUPLICATE_OBJECT,
+            ),
+            (
+                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+                SQLSTATE_INVALID_COLUMN_REFERENCE,
+            ),
+            (
+                "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+                SQLSTATE_INVALID_COLUMN_REFERENCE,
+            ),
+            (
+                "1st DISTINCT ON term out of range - should be between 1 and 2",
+                SQLSTATE_INVALID_COLUMN_REFERENCE,
+            ),
+            (
+                "1st ORDER BY term out of range - should be between 1 and 2",
+                SQLSTATE_INVALID_COLUMN_REFERENCE,
+            ),
+            ("ORDER BY \"a\" is ambiguous", SQLSTATE_AMBIGUOUS_COLUMN),
+            (
+                "SELECT DISTINCT ON with a volatile function in the select list is not supported",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+            ),
+            (
+                "an aggregate in a SELECT DISTINCT ON expression of a query with no other aggregate is not supported",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+            ),
+            (
+                "a DISTINCT ON expression that is neither a GROUP BY expression nor an aggregate is not supported",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+            ),
+            (
+                "a SELECT DISTINCT ON expression that computes on an aggregate in a query without GROUP BY is not supported",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
             ),
             ("\"t\" is not a sequence", SQLSTATE_WRONG_OBJECT_TYPE),
             ("\"t\" is not an index", SQLSTATE_WRONG_OBJECT_TYPE),

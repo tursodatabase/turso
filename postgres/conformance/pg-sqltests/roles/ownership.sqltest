@@ -36,6 +36,135 @@ expect error {
     must be owner of relation sr_column_commented
 }
 
+test owner-may-comment-on-the-table-and-its-columns {
+    CREATE ROLE sr_comment_owner;
+    CREATE TABLE sr_owner_commented (x int);
+    ALTER TABLE sr_owner_commented OWNER TO sr_comment_owner;
+    SET ROLE sr_comment_owner;
+    COMMENT ON TABLE sr_owner_commented IS 'mine';
+    COMMENT ON COLUMN sr_owner_commented.x IS 'my column';
+    SELECT obj_description(oid, 'pg_class'), col_description(oid, 1) FROM pg_class
+    WHERE relname = 'sr_owner_commented';
+}
+expect {
+    mine|my column
+}
+
+test member-of-the-owner-may-comment-on-the-table {
+    CREATE ROLE sr_comment_group;
+    CREATE ROLE sr_comment_member;
+    GRANT sr_comment_group TO sr_comment_member;
+    CREATE TABLE sr_group_commented (x int);
+    ALTER TABLE sr_group_commented OWNER TO sr_comment_group;
+    SET ROLE sr_comment_member;
+    COMMENT ON TABLE sr_group_commented IS 'ours';
+    SELECT obj_description(oid, 'pg_class') FROM pg_class WHERE relname = 'sr_group_commented';
+}
+expect {
+    ours
+}
+
+test role-that-is-not-the-owner-reads-the-comment {
+    CREATE TABLE sr_comment_read (x int);
+    COMMENT ON TABLE sr_comment_read IS 'for everyone';
+    COMMENT ON COLUMN sr_comment_read.x IS 'the x';
+    CREATE ROLE sr_comment_reader;
+    SET ROLE sr_comment_reader;
+    SELECT obj_description(oid, 'pg_class'), col_description(oid, 1) FROM pg_class
+    WHERE relname = 'sr_comment_read';
+    SELECT count(*) FROM pg_description WHERE description = 'for everyone';
+}
+expect {
+    for everyone|the x
+    1
+}
+
+test role-that-is-not-the-owner-cannot-replace-the-comment {
+    CREATE ROLE sr_comment_first_owner;
+    CREATE ROLE sr_comment_intruder;
+    CREATE TABLE sr_comment_kept (x int);
+    ALTER TABLE sr_comment_kept OWNER TO sr_comment_first_owner;
+    COMMENT ON TABLE sr_comment_kept IS 'original';
+    SET ROLE sr_comment_intruder;
+    COMMENT ON TABLE sr_comment_kept IS 'replaced';
+}
+@sqlstate 42501
+expect error {
+    must be owner of table sr_comment_kept
+}
+
+test role-that-is-not-the-owner-cannot-remove-the-comment {
+    CREATE ROLE sr_comment_remover;
+    CREATE TABLE sr_comment_not_removed (x int);
+    COMMENT ON TABLE sr_comment_not_removed IS 'original';
+    SET ROLE sr_comment_remover;
+    COMMENT ON TABLE sr_comment_not_removed IS NULL;
+}
+@sqlstate 42501
+expect error {
+    must be owner of table sr_comment_not_removed
+}
+
+test role-without-privileges-cannot-comment-on-index {
+    CREATE TABLE sr_index_commented (x int);
+    CREATE INDEX sr_index_commented_x ON sr_index_commented (x);
+    CREATE ROLE sr_index_commenter;
+    SET ROLE sr_index_commenter;
+    COMMENT ON INDEX sr_index_commented_x IS 'x';
+}
+@sqlstate 42501
+expect error {
+    must be owner of index sr_index_commented_x
+}
+
+test role-without-privileges-cannot-comment-on-sequence {
+    CREATE SEQUENCE sr_sequence_commented;
+    CREATE ROLE sr_sequence_commenter;
+    SET ROLE sr_sequence_commenter;
+    COMMENT ON SEQUENCE sr_sequence_commented IS 'x';
+}
+@sqlstate 42501
+expect error {
+    must be owner of sequence sr_sequence_commented
+}
+
+test role-without-privileges-cannot-comment-on-view {
+    CREATE TABLE sr_view_commented_base (x int);
+    CREATE VIEW sr_view_commented AS SELECT x FROM sr_view_commented_base;
+    CREATE ROLE sr_view_commenter;
+    SET ROLE sr_view_commenter;
+    COMMENT ON VIEW sr_view_commented IS 'x';
+}
+@sqlstate 42501
+expect error {
+    must be owner of view sr_view_commented
+}
+
+test role-without-privileges-cannot-comment-on-schema {
+    CREATE SCHEMA sr_schema_commented;
+    CREATE ROLE sr_schema_commenter;
+    SET ROLE sr_schema_commenter;
+    COMMENT ON SCHEMA sr_schema_commented IS 'x';
+}
+@sqlstate 42501
+expect error {
+    must be owner of schema sr_schema_commented
+}
+
+test role-without-privileges-cannot-write-pg-description {
+    CREATE ROLE sr_description_writer;
+    SET ROLE sr_description_writer;
+    INSERT INTO pg_description VALUES (1, 1, 0, 'x');
+}
+@sqlstate 42501
+expect error {
+    permission denied for table pg_description
+}
+@sqlstate 42501
+expect @tursopg error {
+    cannot insert into pg_catalog table "pg_description"
+}
+
 test relowner-is-the-creating-role {
     CREATE TABLE ro_created (x int);
     SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_created';
@@ -487,4 +616,49 @@ test owner-alters-the-columns-of-its-own-table {
 }
 expect {
     1
+}
+
+# ALTER ... OWNER TO needs the current role to be able to SET ROLE to the new
+# owner, which a member of the new owner can.
+test owner-may-give-its-table-to-a-role-it-is-a-member-of {
+    CREATE ROLE ro_member_owner;
+    CREATE TABLE ro_member_given (x INT);
+    ALTER TABLE ro_member_given OWNER TO ro_member_owner;
+    GRANT postgres TO ro_member_owner;
+    SET ROLE ro_member_owner;
+    ALTER TABLE ro_member_given OWNER TO postgres;
+    RESET ROLE;
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_member_given';
+}
+expect {
+    postgres
+}
+
+# The new owner also needs CREATE on the relation's schema, which only a
+# superuser has here and in PostgreSQL's public schema.
+test owner-may-not-give-its-table-to-a-role-without-create-on-the-schema {
+    CREATE ROLE ro_no_create_owner;
+    CREATE ROLE ro_no_create_group;
+    CREATE TABLE ro_no_create_given (x INT);
+    ALTER TABLE ro_no_create_given OWNER TO ro_no_create_owner;
+    GRANT ro_no_create_group TO ro_no_create_owner;
+    SET ROLE ro_no_create_owner;
+    ALTER TABLE ro_no_create_given OWNER TO ro_no_create_group;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema public
+}
+
+test owner-may-give-its-table-to-itself-without-create-on-the-schema {
+    CREATE ROLE ro_same_owner;
+    CREATE TABLE ro_same_owner_kept (x INT);
+    ALTER TABLE ro_same_owner_kept OWNER TO ro_same_owner;
+    SET ROLE ro_same_owner;
+    ALTER TABLE ro_same_owner_kept OWNER TO ro_same_owner;
+    RESET ROLE;
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_same_owner_kept';
+}
+expect {
+    ro_same_owner
 }

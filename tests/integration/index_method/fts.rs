@@ -1,6 +1,11 @@
+use turso_core::index_method::fts::FtsIndexAttachment;
+use turso_core::index_method::IndexMethodConfiguration;
+use turso_core::schema::IndexColumn;
 use turso_core::security::roles::SessionRole;
 use turso_core::sync::Arc;
+use turso_core::CollationSeq;
 use turso_core::Connection;
+use turso_core::LimboError;
 use turso_core::Value;
 use turso_sqlite::SqliteDialect;
 
@@ -121,5 +126,55 @@ fn fts_score_from_the_index_has_no_column_collation() {
             )
         ),
         vec![vec![Value::from_i64(9)]]
+    );
+}
+
+#[test]
+fn field_weights_reject_non_finite_and_non_positive_values() {
+    let mut accepted = Vec::new();
+    for weight in [
+        "NaN",
+        "nan",
+        "+NaN",
+        "-NaN",
+        "inf",
+        "+inf",
+        "-inf",
+        "Infinity",
+        "+INFINITY",
+        "-infinity",
+        "1e39",
+        "-1e39",
+        "0",
+        "-0",
+        "-1",
+        "1e-46",
+    ] {
+        let result = FtsIndexAttachment::new(
+            &SqliteDialect,
+            IndexMethodConfiguration {
+                table_name: "w".to_string(),
+                index_name: "wx".to_string(),
+                columns: turso_core::alloc::vec![
+                    IndexColumn::new("title", 0, CollationSeq::BINARY),
+                    IndexColumn::new("body", 1, CollationSeq::BINARY)
+                ],
+                parameters: turso_core::HashMap::from_iter([(
+                    "weights".to_string(),
+                    Value::from_text(format!("title={weight},body=1")),
+                )]),
+            },
+        );
+        match result {
+            Ok(_) => accepted.push(weight),
+            Err(error) => assert!(
+                matches!(error, LimboError::ParseError(_)),
+                "{weight}: {error}"
+            ),
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "accepted invalid weights: {accepted:?}"
     );
 }

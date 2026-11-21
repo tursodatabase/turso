@@ -1940,13 +1940,14 @@ pub enum Insn {
         /// The full CREATE TYPE SQL string
         sql: String,
     },
-    /// Tell the dialect that its catalog of database `db` changed, after the
-    /// statement wrote the dialect's own schema state for it, so the
-    /// in-memory copy follows. `value_regs` name the registers the dialect
-    /// reads back, such as the id its state gave a created relation.
-    CatalogChange {
+    /// Make the change `apply` to the dialect's state in the in-memory
+    /// schema of database `db`, after the statement wrote the same change to
+    /// the dialect's own tables. `value_regs` name the registers whose
+    /// values `apply` gets, such as the id a created relation was stored
+    /// under.
+    CatalogApply {
         db: usize,
-        change: Box<crate::dialect::CatalogChange>,
+        apply: Arc<dyn crate::dialect::CatalogApply>,
         value_regs: Vec<usize>,
     },
 
@@ -2603,7 +2604,7 @@ impl InsnVariants {
             InsnVariants::SequenceBeginInnerTx => execute::op_sequence_begin_inner_tx,
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
-            InsnVariants::CatalogChange => execute::op_catalog_change,
+            InsnVariants::CatalogApply => execute::op_catalog_apply,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
@@ -2674,7 +2675,7 @@ impl InsnVariants {
 
 impl Insn {
     /// The collations this instruction compares values with.
-    #[cfg(test)]
+    #[cfg(feature = "test_helper")]
     pub(crate) fn collations(&self) -> Vec<CollationSeq> {
         match self {
             Insn::Eq { collation, .. }
@@ -2750,7 +2751,7 @@ impl Insn {
             | Self::SequenceBeginInnerTx { .. }
             | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }
-            | Self::CatalogChange { .. }
+            | Self::CatalogApply { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }

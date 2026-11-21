@@ -3,6 +3,7 @@ pub mod copy;
 mod create_function;
 pub mod functions;
 mod names;
+mod policy_condition;
 use pg_query::NodeEnum;
 pub use pg_query::ParseResult;
 use thiserror::Error;
@@ -78,7 +79,7 @@ impl FunctionTypeUse {
 
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
-    pg_query::parse(sql).map_err(parse_error)
+    pg_query::parse(sql, pg_query::ParserOptions::DEFAULT).map_err(parse_error)
 }
 
 /// The error for SQL that pg_query refuses. pg_query gives only the message
@@ -108,10 +109,22 @@ fn is_reserved_role_name_error(message: &str) -> bool {
 pub fn returns_rows(parsed: &ParseResult) -> bool {
     match first_statement(parsed) {
         Some(NodeEnum::SelectStmt(select)) => select.into_clause.is_none(),
-        Some(NodeEnum::InsertStmt(insert)) => !insert.returning_list.is_empty(),
-        Some(NodeEnum::UpdateStmt(update)) => !update.returning_list.is_empty(),
-        Some(NodeEnum::DeleteStmt(delete)) => !delete.returning_list.is_empty(),
-        Some(NodeEnum::MergeStmt(merge)) => !merge.returning_list.is_empty(),
+        Some(NodeEnum::InsertStmt(insert)) => insert
+            .returning_clause
+            .as_ref()
+            .is_some_and(|clause| !clause.exprs.is_empty()),
+        Some(NodeEnum::UpdateStmt(update)) => update
+            .returning_clause
+            .as_ref()
+            .is_some_and(|clause| !clause.exprs.is_empty()),
+        Some(NodeEnum::DeleteStmt(delete)) => delete
+            .returning_clause
+            .as_ref()
+            .is_some_and(|clause| !clause.exprs.is_empty()),
+        Some(NodeEnum::MergeStmt(merge)) => merge
+            .returning_clause
+            .as_ref()
+            .is_some_and(|clause| !clause.exprs.is_empty()),
         Some(NodeEnum::ExplainStmt(_) | NodeEnum::VariableShowStmt(_)) => true,
         _ => false,
     }
@@ -150,9 +163,13 @@ pub fn normalize(sql: &str) -> Result<String, ParseError> {
 
 /// Get a fingerprint for a query (for caching/deduplication)
 pub fn fingerprint(sql: &str) -> Result<String, ParseError> {
-    pg_query::fingerprint(sql)
-        .map(|fp| fp.hex)
-        .map_err(|e| ParseError::ParseError(e.to_string()))
+    pg_query::fingerprint(
+        sql,
+        pg_query::ParserOptions::DEFAULT,
+        pg_query::FingerprintOptions::DEFAULT,
+    )
+    .map(|fp| fp.hex)
+    .map_err(|e| ParseError::ParseError(e.to_string()))
 }
 
 /// Quote an identifier following PostgreSQL's server-side quote_identifier()
@@ -188,11 +205,13 @@ pub fn name_create_index(sql: &str, location: usize, name: &str) -> String {
     sql
 }
 
-/// `sql`, a CREATE TABLE statement, with its serial column `column` written
-/// out as what `serial` stands for: the integer type, NOT NULL and a
-/// DEFAULT of `nextval` of `sequence`, the string the stored text passes to
-/// `nextval`. A table is loaded from its stored text, so the text has to
-/// name the sequence when the sequence is not named `<table>_<column>_seq`.
+/// `sql`, a CREATE TABLE statement, with its serial or identity column
+/// `column` written out with its sequence `sequence`, the name the stored
+/// text gives it. A serial column becomes what `serial` stands for: the
+/// integer type, NOT NULL and a DEFAULT of `nextval` of `sequence`. An
+/// identity column keeps its kind and gets a `SEQUENCE NAME` option. A table
+/// is loaded from its stored text, so the text has to name the sequence when
+/// the sequence is not named `<table>_<column>_seq`.
 pub fn write_out_serial_column(
     sql: &str,
     column: &str,
@@ -208,16 +227,49 @@ pub fn write_out_serial_column(
             "not a CREATE TABLE statement".to_string(),
         ));
     };
-    let type_name = create
+    let col_def = create
         .table_elts
         .iter()
         .find_map(|element| match &element.node {
-            Some(Node::ColumnDef(col_def)) if col_def.colname == column => {
-                col_def.type_name.as_ref()
-            }
+            Some(Node::ColumnDef(col_def)) if col_def.colname == column => Some(col_def),
             _ => None,
         })
         .ok_or_else(|| ParseError::ParseError(format!("no column \"{column}\"")))?;
+    let identity = col_def
+        .constraints
+        .iter()
+        .find_map(|constraint| match &constraint.node {
+            Some(Node::Constraint(constraint))
+                if constraint.contype == pg_query::protobuf::ConstrType::ConstrIdentity as i32 =>
+            {
+                Some(constraint)
+            }
+            _ => None,
+        });
+    if let Some(identity) = identity {
+        let kind = if identity.generated_when == "a" {
+            "ALWAYS"
+        } else {
+            "BY DEFAULT"
+        };
+        let start = identity.location as usize;
+        let end = identity_constraint_end(sql, start)?;
+        let name = match sequence.split_once('.') {
+            Some((schema, name)) => {
+                format!("{}.{}", quote_identifier(schema), quote_identifier(name))
+            }
+            None => quote_identifier(sequence),
+        };
+        return Ok(format!(
+            "{}GENERATED {kind} AS IDENTITY (SEQUENCE NAME {name}){}",
+            &sql[..start],
+            &sql[end..]
+        ));
+    }
+    let type_name = col_def
+        .type_name
+        .as_ref()
+        .ok_or_else(|| ParseError::ParseError(format!("column \"{column}\" has no type")))?;
     let type_word = type_name.names.last().and_then(|name| match &name.node {
         Some(Node::String(word)) => Some(word.sval.to_lowercase()),
         _ => None,
@@ -228,7 +280,7 @@ pub fn write_out_serial_column(
         Some("smallserial" | "serial2") => "smallint",
         _ => {
             return Err(ParseError::ParseError(format!(
-                "column \"{column}\" is not a serial column"
+                "column \"{column}\" is not a serial or identity column"
             )))
         }
     };
@@ -380,6 +432,42 @@ pub fn name_at(sql: &str, location: usize, name: &str) -> Result<String, ParseEr
         quote_identifier(name),
         &sql[end..]
     ))
+}
+
+/// The byte offset just past the identity constraint that starts at byte
+/// offset `location` of `sql`, with the options in parentheses after it.
+fn identity_constraint_end(sql: &str, location: usize) -> Result<usize, ParseError> {
+    use pg_query::protobuf::Token;
+
+    let scan = pg_query::scan(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+    let mut tokens = scan
+        .tokens
+        .iter()
+        .skip_while(|token| (token.start as usize) < location)
+        .skip_while(|token| token.token != Token::IdentityP as i32);
+    let identity = tokens
+        .next()
+        .ok_or_else(|| ParseError::ParseError("no IDENTITY at the location".to_string()))?;
+    let mut end = identity.end as usize;
+    let mut rest = tokens.peekable();
+    if rest
+        .peek()
+        .is_some_and(|token| token.token == Token::Ascii40 as i32)
+    {
+        let mut depth = 0;
+        for token in rest {
+            if token.token == Token::Ascii40 as i32 {
+                depth += 1;
+            } else if token.token == Token::Ascii41 as i32 {
+                depth -= 1;
+            }
+            end = token.end as usize;
+            if depth == 0 {
+                break;
+            }
+        }
+    }
+    Ok(end)
 }
 
 /// The byte offset just past the name that starts at byte offset

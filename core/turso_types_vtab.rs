@@ -1,9 +1,10 @@
 use crate::sync::Arc;
 use crate::sync::RwLock;
-use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
+use crate::vtab::{column_definition, InternalVirtualTable, InternalVirtualTableCursor};
 use crate::MAIN_DB_ID;
 use crate::{Connection, Result, Value};
 use turso_ext::{ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode};
+use turso_parser::ast;
 
 #[derive(Debug)]
 pub struct TursoTypesTable;
@@ -25,8 +26,11 @@ impl InternalVirtualTable for TursoTypesTable {
         "sqlite_turso_types".to_string()
     }
 
-    fn sql(&self) -> String {
-        "CREATE TABLE sqlite_turso_types(name TEXT, sql TEXT)".to_string()
+    fn columns(&self) -> Vec<ast::ColumnDefinition> {
+        vec![
+            column_definition("name", "TEXT"),
+            column_definition("sql", "TEXT"),
+        ]
     }
 
     fn superuser_only(&self) -> bool {

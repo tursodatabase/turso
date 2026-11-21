@@ -77,7 +77,7 @@ pub fn translate_update(
 
     let opts = ProgramBuilderOpts::new(1, 20, 4);
     program.extend(&opts);
-    emit_program(connection, resolver, program, plan, |_| {})?;
+    emit_program(connection, resolver, program, plan)?;
     Ok(())
 }
 
@@ -151,7 +151,6 @@ pub fn translate_update_for_schema_change(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     ddl_query: &str,
-    after: impl FnOnce(&mut ProgramBuilder),
 ) -> crate::Result<()> {
     let plan = prepare_and_optimize_update_plan(
         program,
@@ -163,7 +162,7 @@ pub fn translate_update_for_schema_change(
     )?;
     let opts = ProgramBuilderOpts::new(1, 20, 4);
     program.extend(&opts);
-    emit_program(connection, resolver, program, plan, after)?;
+    emit_program(connection, resolver, program, plan)?;
     Ok(())
 }
 
@@ -625,6 +624,7 @@ fn collect_update_set_clauses(
                 Some(idx) => {
                     let col = &table.columns()[*idx];
                     col.ensure_not_generated("UPDATE", col_name.as_str())?;
+                    col.ensure_update_value_allowed(&expr, col_name.as_str())?;
                     if matches!(expr.as_ref(), Expr::Default) {
                         expr = column_default_expr(col, table.is_strict(), resolver);
                     }

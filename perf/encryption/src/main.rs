@@ -173,7 +173,6 @@ async fn main() -> Result<()> {
     for thread_id in 0..args.threads {
         let db_clone = db.clone();
         let barrier = Arc::clone(&start_barrier);
-        let encryption_opts_clone = encryption_opts.clone();
         let shared_state_clone = shared_state.clone();
 
         let handle = tokio::task::spawn(worker_thread(
@@ -183,7 +182,6 @@ async fn main() -> Result<()> {
             args.iterations,
             barrier,
             read_ratio,
-            encryption_opts_clone,
             args.think,
             timeout,
             shared_state_clone,
@@ -320,13 +318,6 @@ async fn setup_database(
     let db = builder.build().await?;
     let conn = db.connect()?;
 
-    if let Some(config) = encryption_opts {
-        conn.execute(&format!("PRAGMA cipher='{}'", config.cipher), ())
-            .await?;
-        conn.execute(&format!("PRAGMA hexkey='{}'", config.hexkey), ())
-            .await?;
-    }
-
     // todo(v): probably store blobs and then have option of randomblob size
     conn.execute(
         "CREATE TABLE IF NOT EXISTS test_table (
@@ -349,7 +340,6 @@ async fn worker_thread(
     iterations: usize,
     start_barrier: Arc<Barrier>,
     read_ratio: u8,
-    encryption_opts: Option<EncryptionOpts>,
     think_ms: u64,
     timeout: Duration,
     shared_state: SharedState,
@@ -374,13 +364,6 @@ async fn worker_thread(
 
     for iteration in 0..iterations {
         let conn = db.connect()?;
-
-        if let Some(config) = &encryption_opts {
-            conn.execute(&format!("PRAGMA cipher='{}'", config.cipher), ())
-                .await?;
-            conn.execute(&format!("PRAGMA hexkey='{}'", config.hexkey), ())
-                .await?;
-        }
 
         conn.busy_timeout(timeout)?;
 

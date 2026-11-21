@@ -44,6 +44,9 @@ apilevel = "2.0"
 threadsafety = 1  # 1 means: Threads may share the module, but not connections.
 paramstyle = "qmark"  # Only positional parameters are supported.
 
+# DB-API 2.0 type constructor
+Binary = memoryview
+
 
 def _get_sqlite_version() -> tuple[str, tuple[int, int, int]]:
     """Get SQLite version from a temporary connection."""

@@ -1,7 +1,9 @@
 use std::sync::Arc;
+use std::task::Waker;
 use turso_core::security::roles::SessionRole;
 use turso_core::vdbe::{ProgramExecutionState, StepResult};
 use turso_core::ConnectOpts;
+use turso_core::ConstraintKind;
 use turso_core::Database;
 use turso_core::DatabaseOpts;
 use turso_core::LimboError;
@@ -22,6 +24,264 @@ fn public_helper_statement_errors_preserve_sqlite_variants() {
     assert!(matches!(error, LimboError::Constraint(_)), "{error:?}");
     assert_eq!(error.to_string(), "UNIQUE constraint failed: parent.id");
     assert_eq!(error.sqlite_result_code(), 19);
+}
+
+#[test]
+fn public_constraint_errors_preserve_sqlite_variants() {
+    for (sql, _, message, foreign_key, _) in constraint_error_cases() {
+        for with_waker in [false, true] {
+            let conn = constraint_test_connection();
+            let mut stmt = conn.prepare(sql).unwrap();
+            let error = loop {
+                let result = if with_waker {
+                    stmt.step_with_waker(Waker::noop())
+                } else {
+                    stmt.step()
+                };
+                match result {
+                    Err(error) => break error,
+                    Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
+                        stmt._io().step().unwrap();
+                    }
+                    Ok(result) => panic!("expected constraint error, got {result:?}: {sql}"),
+                }
+            };
+            if foreign_key {
+                assert!(
+                    matches!(error, LimboError::ForeignKeyConstraint(_)),
+                    "{sql}: {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error, LimboError::Constraint(_)),
+                    "{sql}: {error:?}"
+                );
+            }
+            assert_eq!(error.to_string(), message, "{sql}");
+            assert_eq!(error.sqlite_result_code(), 19, "{sql}");
+        }
+    }
+}
+
+#[test]
+fn public_reset_preserves_sqlite_foreign_key_error() {
+    let conn = constraint_test_connection();
+    let mut stmt = conn
+        .prepare("INSERT INTO deferred_child VALUES (99) RETURNING pid")
+        .unwrap();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => break,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                stmt._io().step().unwrap();
+            }
+            result => panic!("expected RETURNING row, got {result:?}"),
+        }
+    }
+    let error = stmt.reset().unwrap_err();
+    assert!(
+        matches!(error, LimboError::ForeignKeyConstraint(_)),
+        "{error:?}"
+    );
+    assert_eq!(error.to_string(), "FOREIGN KEY constraint failed");
+    assert_eq!(error.sqlite_result_code(), 19);
+}
+
+/// RAISE and a constraint's own ON CONFLICT clause halt with their own
+/// resolve type, and the error still reports the halt's result code.
+#[test]
+fn errors_with_their_own_resolve_type_keep_the_extended_result_code() {
+    for (sql, message, extended_code) in [
+        ("INSERT INTO raise_abort VALUES (1)", "nope", 1811),
+        (
+            "INSERT INTO unique_rollback VALUES (1)",
+            "UNIQUE constraint failed: unique_rollback.a",
+            2067,
+        ),
+    ] {
+        let conn = constraint_test_connection();
+        let mut stmt = conn.prepare(sql).unwrap();
+        let error = loop {
+            match stmt.step_with_structured_errors() {
+                Err(error) => break error,
+                Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
+                    stmt._io().step().unwrap();
+                }
+                Ok(result) => panic!("expected constraint error, got {result:?}: {sql}"),
+            }
+        };
+        assert!(matches!(error, LimboError::Raise(..)), "{sql}: {error:?}");
+        assert_eq!(error.to_string(), message, "{sql}");
+        assert_eq!(error.sqlite_result_code(), 19, "{sql}");
+        assert_eq!(error.sqlite_extended_result_code(), extended_code, "{sql}");
+    }
+}
+
+#[test]
+fn internal_constraint_errors_are_structured() {
+    for (sql, kind, message, foreign_key, extended_code) in constraint_error_cases() {
+        let conn = constraint_test_connection();
+        let mut stmt = conn.prepare(sql).unwrap();
+        let error = step_until_structured_error(&mut stmt, sql);
+        let LimboError::ConstraintViolation(violation) = &error else {
+            panic!("{sql}: {error:?}");
+        };
+        assert_eq!(violation.kind, kind, "{sql}");
+        assert_eq!(error.to_string(), message, "{sql}");
+        assert_eq!(
+            violation.kind == ConstraintKind::ForeignKey,
+            foreign_key,
+            "{sql}"
+        );
+        assert_eq!(error.sqlite_result_code(), 19, "{sql}");
+        assert_eq!(error.sqlite_extended_result_code(), extended_code, "{sql}");
+    }
+}
+
+/// The instructions that fail a constraint (Halt, HaltIfNull and
+/// FkCounter) carry the table, the columns and the values of the
+/// violation.
+#[test]
+fn constraint_violations_name_their_table_columns_and_values() {
+    for (sql, kind, table, column) in [
+        (
+            "INSERT INTO parent VALUES (1, 'b', 1)",
+            ConstraintKind::PrimaryKey,
+            "parent",
+            "id",
+        ),
+        (
+            "INSERT INTO parent VALUES (2, NULL, 1)",
+            ConstraintKind::NotNull,
+            "parent",
+            "code",
+        ),
+        (
+            "UPDATE child SET pid = 99",
+            ConstraintKind::ForeignKey,
+            "child",
+            "pid",
+        ),
+    ] {
+        let conn = constraint_test_connection();
+        let mut stmt = conn.prepare(sql).unwrap();
+        let error = step_until_structured_error(&mut stmt, sql);
+        let LimboError::ConstraintViolation(violation) = error else {
+            panic!("{sql}: expected a structured constraint error, got {error:?}");
+        };
+        assert_eq!(violation.kind, kind, "{sql}");
+        assert_eq!(violation.table_name.as_deref(), Some(table), "{sql}");
+        assert_eq!(violation.column_names, vec![column], "{sql}");
+        assert!(!violation.values.is_empty(), "{sql}");
+    }
+}
+
+fn step_until_structured_error(stmt: &mut turso_core::Statement, sql: &str) -> LimboError {
+    loop {
+        match stmt.step_with_structured_errors() {
+            Err(error) => return error,
+            Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
+                stmt._io().step().unwrap();
+            }
+            Ok(result) => panic!("expected constraint error, got {result:?}: {sql}"),
+        }
+    }
+}
+
+fn constraint_error_cases() -> [(&'static str, ConstraintKind, &'static str, bool, i32); 13] {
+    [
+        (
+            "INSERT INTO parent VALUES (1, 'b', 1)",
+            ConstraintKind::PrimaryKey,
+            "UNIQUE constraint failed: parent.id",
+            false,
+            1555,
+        ),
+        (
+            "INSERT INTO parent VALUES (2, 'a', 1)",
+            ConstraintKind::Unique,
+            "UNIQUE constraint failed: parent.code",
+            false,
+            2067,
+        ),
+        (
+            "INSERT INTO parent VALUES (2, NULL, 1)",
+            ConstraintKind::NotNull,
+            "NOT NULL constraint failed: parent.code",
+            false,
+            1299,
+        ),
+        (
+            "INSERT INTO parent VALUES (2, 'b', -1)",
+            ConstraintKind::Check,
+            "CHECK constraint failed: positive",
+            false,
+            275,
+        ),
+        (
+            "INSERT INTO child VALUES (99)",
+            ConstraintKind::ForeignKey,
+            "FOREIGN KEY constraint failed",
+            true,
+            787,
+        ),
+        (
+            "DELETE FROM parent",
+            ConstraintKind::ForeignKey,
+            "FOREIGN KEY constraint failed",
+            true,
+            787,
+        ),
+        (
+            "INSERT INTO deferred_child VALUES (99)",
+            ConstraintKind::ForeignKey,
+            "FOREIGN KEY constraint failed",
+            true,
+            787,
+        ),
+        (
+            "INSERT INTO trigger_source VALUES (1)",
+            ConstraintKind::PrimaryKey,
+            "UNIQUE constraint failed: parent.id",
+            false,
+            1555,
+        ),
+        (
+            "INSERT INTO text_key VALUES ('k')",
+            ConstraintKind::PrimaryKey,
+            "UNIQUE constraint failed: text_key.k",
+            false,
+            1555,
+        ),
+        (
+            "INSERT INTO pair_key VALUES (1, 1)",
+            ConstraintKind::PrimaryKey,
+            "UNIQUE constraint failed: pair_key.a, pair_key.b",
+            false,
+            1555,
+        ),
+        (
+            "UPDATE pair_key SET b = 1 WHERE b = 2",
+            ConstraintKind::PrimaryKey,
+            "UNIQUE constraint failed: pair_key.a, pair_key.b",
+            false,
+            1555,
+        ),
+        (
+            "INSERT INTO pair_key VALUES (1, 2) ON CONFLICT DO UPDATE SET b = 1",
+            ConstraintKind::PrimaryKey,
+            "UNIQUE constraint failed: pair_key.a, pair_key.b",
+            false,
+            1555,
+        ),
+        (
+            "INSERT INTO strict_int VALUES ('x')",
+            ConstraintKind::Datatype,
+            "cannot store TEXT value in INTEGER column strict_int.a",
+            false,
+            3091,
+        ),
+    ]
 }
 
 fn constraint_test_connection() -> Arc<turso_core::Connection> {
@@ -403,4 +663,42 @@ fn normal_step_preserves_execution_state_with_and_without_tracing() {
         assert!(matches!(stmt.step().unwrap(), StepResult::Interrupt));
         assert_eq!(stmt.execution_state(), ProgramExecutionState::Interrupted);
     }
+}
+
+/// A hash join inside a correlated subquery is built once and probed once per
+/// outer row. The budget is forced down so the build spills in every build
+/// profile; the second and third passes then go through the grace phase and
+/// must count the same rows as the first (#9774).
+#[test]
+fn test_spilled_hash_join_counts_the_same_on_every_probe_pass() {
+    let conn = open_test_connection().unwrap();
+    for sql in [
+        "CREATE TABLE a(x INTEGER PRIMARY KEY, y INT)",
+        "CREATE TABLE c(k INT, v INT)",
+        "CREATE TABLE d(k INT, w INT)",
+        "INSERT INTO a VALUES (1, 0), (2, 1000000), (3, 1000000)",
+        "INSERT INTO c SELECT value % 50, value FROM generate_series(1, 1000)",
+        "INSERT INTO d SELECT value % 70, value FROM generate_series(1, 1000)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let mut stmt = conn
+        .prepare("SELECT a.x, (SELECT count(*) FROM c JOIN d ON c.k = d.k AND d.w < a.y) FROM a")
+        .unwrap();
+    let hash_builds = stmt.set_hash_build_mem_budget(32 * 1024);
+    assert_eq!(hash_builds, 1, "the join must be built once and reused");
+
+    let rows = stmt.run_collect_rows().unwrap();
+    let expected: Vec<Vec<Value>> = [[1, 0], [2, 14400], [3, 14400]]
+        .iter()
+        .map(|row| row.iter().copied().map(Value::from_i64).collect())
+        .collect();
+    assert_eq!(rows, expected);
+
+    let metrics = stmt.metrics().hash_join;
+    assert!(metrics.spill_chunks > 0, "build did not spill: {metrics:?}");
+    assert!(
+        metrics.grace_partitions_processed > 0,
+        "no pass went through grace: {metrics:?}"
+    );
 }

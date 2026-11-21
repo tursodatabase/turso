@@ -1254,3 +1254,116 @@ fn wal_get_frame_does_not_write_into_buffer_after_it_returns_error() {
         "the read wrote into the buffer after wal_get_frame returned"
     );
 }
+
+/// Copies the frames `source` committed after `from_frame` into `target`'s WAL. Each commit
+/// frame becomes visible to other connections as it is inserted, before `wal_insert_end`
+/// refreshes the shared schema.
+fn copy_frames(
+    source: &Arc<turso_core::Connection>,
+    target: &Arc<turso_core::Connection>,
+    from_frame: u64,
+) {
+    let mut frame = [0u8; 24 + 4096];
+    for frame_id in from_frame + 1..=source.wal_state().unwrap().max_frame {
+        source.wal_get_frame(frame_id, &mut frame).unwrap();
+        target.wal_insert_frame(frame_id, &frame).unwrap();
+    }
+}
+
+fn read_x(conn: &Arc<turso_core::Connection>) -> Result<Vec<i64>, LimboError> {
+    let mut stmt = conn.prepare("SELECT x FROM t ORDER BY x")?;
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get::<i64>(0)?);
+        Ok(())
+    })?;
+    Ok(rows)
+}
+
+/// A transaction whose snapshot already has a schema that the shared schema cache does not have
+/// yet must read with its snapshot's schema.
+#[test]
+fn test_wal_transaction_reads_schema_committed_before_it_is_published() {
+    let source = TempDatabase::new_empty();
+    let source_conn = source.connect_limbo();
+    source_conn
+        .execute("CREATE TABLE t(x INTEGER PRIMARY KEY)")
+        .unwrap();
+    source_conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    let target = TempDatabase::new_empty();
+    let writer = target.connect_limbo();
+    writer.wal_insert_begin().unwrap();
+    copy_frames(&source_conn, &writer, 0);
+    writer.wal_insert_end(false).unwrap();
+    let reader = target.connect_limbo();
+    assert_eq!(read_x(&reader).unwrap(), vec![1]);
+
+    let copied = source_conn.wal_state().unwrap().max_frame;
+    source_conn.execute("CREATE TABLE u(y)").unwrap();
+    source_conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    writer.wal_insert_begin().unwrap();
+    copy_frames(&source_conn, &writer, copied);
+
+    reader.execute("BEGIN").unwrap();
+    assert_eq!(read_x(&reader).unwrap(), vec![1, 2]);
+    assert_eq!(read_x(&reader).unwrap(), vec![1, 2]);
+    reader.execute("COMMIT").unwrap();
+    writer.wal_insert_end(false).unwrap();
+}
+
+/// A statement prepared before another connection's committed and published DDL must still read
+/// correctly when it is reprepared inside a transaction.
+#[test]
+fn test_wal_transaction_reprepares_after_other_connection_published_ddl() {
+    let db = TempDatabase::new_empty();
+    let conn_a = db.connect_limbo();
+    let conn_b = db.connect_limbo();
+    conn_a
+        .execute("CREATE TABLE t(x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let mut stmt = conn_a.prepare("SELECT x FROM t ORDER BY x").unwrap();
+    conn_b.execute("CREATE TABLE u(y)").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2)").unwrap();
+
+    conn_a.execute("BEGIN").unwrap();
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get::<i64>(0)?);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(rows, vec![1, 2]);
+    conn_a.execute("INSERT INTO u VALUES (1)").unwrap();
+    conn_a.execute("COMMIT").unwrap();
+}
+
+/// A stale statement stepped in a transaction must still run when another connection published a
+/// newer schema after the transaction took its read snapshot.
+#[test]
+fn test_wal_transaction_reprepares_when_shared_schema_is_newer_than_snapshot() {
+    let db = TempDatabase::new_empty();
+    let conn_a = db.connect_limbo();
+    let conn_b = db.connect_limbo();
+    conn_a
+        .execute("CREATE TABLE t0(x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn_a.execute("INSERT INTO t0 VALUES (1)").unwrap();
+
+    let mut stmt = conn_a.prepare("SELECT x FROM t0 ORDER BY x").unwrap();
+    conn_a.execute("CREATE TABLE t(z)").unwrap();
+
+    conn_a.execute("BEGIN").unwrap();
+    conn_a.execute("SELECT x FROM t0").unwrap();
+    conn_b.execute("CREATE TABLE u(y)").unwrap();
+
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get::<i64>(0)?);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(rows, vec![1]);
+    conn_a.execute("COMMIT").unwrap();
+}

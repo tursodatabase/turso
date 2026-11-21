@@ -8,8 +8,8 @@ use crate::{
         emitter::{
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_index_column_value_old_image, emit_partial_index_where_old_image,
-            emit_program_for_select, get_triggers_including_temp, has_triggers_including_temp,
-            OperationMode, TriggerTime,
+            emit_program_for_select, gencol::emit_row_from_cursor, get_triggers_including_temp,
+            has_triggers_including_temp, OperationMode, TriggerTime,
         },
         eqp::eqp_detail_for_table_op,
         expr::{
@@ -580,18 +580,14 @@ fn emit_delete_insns<'a>(
             let columns_start_reg = program.alloc_registers(cols_len);
 
             // Read all column values from the row to be deleted
-            for (i, column) in unsafe { &*table_reference }.columns().iter().enumerate() {
-                emit_table_column(
-                    program,
-                    main_table_cursor_id,
-                    internal_id,
-                    table_references,
-                    column,
-                    i,
-                    columns_start_reg + i,
-                    resolver,
-                )?;
-            }
+            emit_deleted_row(
+                program,
+                table_references,
+                unsafe { &*table_reference },
+                main_table_cursor_id,
+                columns_start_reg,
+                resolver,
+            )?;
 
             (Some(columns_start_reg), rowid_reg)
         }
@@ -958,23 +954,18 @@ fn emit_delete_insns_when_triggers_present(
     };
     let cols_len = unsafe { &*table_reference }.columns().len();
 
-    let internal_id = unsafe { (*table_reference).internal_id };
     let columns_start_reg = if !has_returning && !has_delete_triggers {
         None
     } else {
         let columns_start_reg = program.alloc_registers(cols_len);
-        for (i, column) in unsafe { &*table_reference }.columns().iter().enumerate() {
-            emit_table_column(
-                program,
-                main_table_cursor_id,
-                internal_id,
-                table_references,
-                column,
-                i,
-                columns_start_reg + i,
-                resolver,
-            )?;
-        }
+        emit_deleted_row(
+            program,
+            table_references,
+            unsafe { &*table_reference },
+            main_table_cursor_id,
+            columns_start_reg,
+            resolver,
+        )?;
         Some(columns_start_reg)
     };
 
@@ -1093,4 +1084,36 @@ fn emit_delete_insns_when_triggers_present(
     program.preassign_label_to_next_insn(skip_not_found_label);
 
     Ok(())
+}
+
+fn emit_deleted_row(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    table: &JoinedTable,
+    cursor_id: usize,
+    columns_start_reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let column_regs: Vec<usize> =
+        (columns_start_reg..columns_start_reg + table.columns().len()).collect();
+    match table.btree() {
+        Some(btree_table) => {
+            emit_row_from_cursor(program, &btree_table, cursor_id, &column_regs, resolver)
+        }
+        None => {
+            for (i, column) in table.columns().iter().enumerate() {
+                emit_table_column(
+                    program,
+                    cursor_id,
+                    table.internal_id,
+                    table_references,
+                    column,
+                    i,
+                    column_regs[i],
+                    resolver,
+                )?;
+            }
+            Ok(())
+        }
+    }
 }

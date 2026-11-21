@@ -83,6 +83,10 @@ pub struct DatabaseSyncEngineOpts {
     /// `Query` bootstrap strategy** — the server picks the page set, so the
     /// client can't chunk it locally.
     pub pull_bytes_threshold: Option<usize>,
+    /// Maximum number of bootstrap chunk requests in flight at once when
+    /// `pull_bytes_threshold` splits the bootstrap. All chunks after the first
+    /// are pinned to the first chunk's server revision. `None` means 1.
+    pub pull_parallel_requests: Option<usize>,
     /// Sync-protocol override for incremental pulls.
     ///
     /// `None` (default) auto-detects the remote protocol from the first
@@ -923,6 +927,15 @@ fn use_pushed_change_hint_for_local_replay(
     !raw_page_replay_on_sql_conn && matches!(stream_kind, DbChangesStreamKind::LegacyPages)
 }
 
+/// Main WAL state after the PASSIVE checkpoint of its synced frames.
+struct SyncedWalCheckpoint {
+    main_wal_salt: Option<Vec<u32>>,
+    /// Main WAL frames up to this one hold the last synced state.
+    watermark: u64,
+    /// Main WAL frames up to this one are in the DB file.
+    backfilled: u64,
+}
+
 impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     pub async fn read_db_meta<Ctx>(
         coro: &Coro<Ctx>,
@@ -1020,6 +1033,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     opts.protocol_version_hint,
                     partial_sync_opts,
                     opts.pull_bytes_threshold,
+                    opts.pull_parallel_requests,
                 )
                 .await?;
                 let remote_pull_protocol = forced_protocol.unwrap_or(detected_protocol);
@@ -1370,7 +1384,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         Ok(conn)
     }
 
-    async fn checkpoint_passive<Ctx>(&self, coro: &Coro<Ctx>) -> Result<(Option<Vec<u32>>, u64)> {
+    async fn checkpoint_passive<Ctx>(&self, coro: &Coro<Ctx>) -> Result<SyncedWalCheckpoint> {
         let watermark = self.meta().revert_since_wal_watermark;
         tracing::info!(
             "checkpoint(path={:?}): revert_since_wal_watermark={}",
@@ -1398,10 +1412,25 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 meta.revert_since_wal_salt = main_wal_salt.clone();
             })
             .await?;
-            return Ok((main_wal_salt, 0));
+            return Ok(SyncedWalCheckpoint {
+                main_wal_salt,
+                watermark: 0,
+                backfilled: 0,
+            });
         }
         // we do this Passive checkpoint in order to transfer all synced frames to the DB file and make history of revert DB valid
         // if we will not do that we will be in situation where WAL in the revert DB is not valid relative to the DB file
+        // the checkpoint stops early if another connection reads a snapshot older than the watermark
+        aristo::intent_stmt!(
+            "This PASSIVE checkpoint does not copy frames after the revert watermark. \
+             These frames contain local changes that are not synced. Sync checkpoints and \
+             pulls read pages as they were at the revert watermark. For a correct read, \
+             the DB file must not contain these changes. If you remove the upper bound, \
+             the checkpoint copies these changes to the DB file.",
+            verify = "test",
+            id = "passive_checkpoint_stops_at_revert_watermark",
+            parent = "db_file_contains_exactly_synced_frames_before_revert_wal"
+        );
         let result = main_conn.checkpoint(turso_core::CheckpointMode::Passive {
             upper_bound_inclusive: Some(watermark),
         })?;
@@ -1415,7 +1444,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 format!("unable to checkpoint synced portion of WAL: result={result:?}, watermark={watermark}"),
             ));
         }
-        Ok((main_wal_salt, watermark))
+        Ok(SyncedWalCheckpoint {
+            main_wal_salt,
+            watermark,
+            backfilled: result.wal_total_backfilled,
+        })
     }
 
     pub async fn stats<Ctx>(&self, coro: &Coro<Ctx>) -> Result<SyncEngineStats> {
@@ -1483,12 +1516,34 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             return Ok(());
         }
 
-        let (main_wal_salt, watermark) = self.checkpoint_passive(coro).await?;
+        let SyncedWalCheckpoint {
+            main_wal_salt,
+            watermark,
+            backfilled,
+        } = self.checkpoint_passive(coro).await?;
 
         tracing::info!(
             "checkpoint(path={:?}): passive checkpoint is done",
             self.main_db_path
         );
+        aristo::intent_stmt!(
+            "For a correct revert WAL, the DB file must contain all synced frames and no \
+             other frames. If a reader has a snapshot that ends before the revert \
+             watermark, a PASSIVE checkpoint stops at that snapshot. The checkpoint does \
+             not return an error. Without this check, the sync checkpoint writes an \
+             incorrect revert WAL. Then a later pull damages b-trees.",
+            verify = "test",
+            id = "db_file_contains_exactly_synced_frames_before_revert_wal"
+        );
+        if backfilled < watermark {
+            tracing::info!(
+                "checkpoint(path={:?}): only {} of {} synced WAL frames are in the DB file because a connection reads an older snapshot",
+                self.main_db_path,
+                backfilled,
+                watermark
+            );
+            return Err(LimboError::Busy.into());
+        }
         let revert_conn = self.open_revert_db_conn(coro).await?;
 
         let mut page = [0u8; PAGE_SIZE];
@@ -2176,7 +2231,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     ) -> Result<(u64, BTreeMap<u64, String>, Option<DatabasePullRevision>)> {
         tracing::info!("apply_changes(path={})", self.main_db_path);
 
-        let (_, watermark) = self.checkpoint_passive(coro).await?;
+        // Unlike `checkpoint`, a pull does not need every synced frame in the DB
+        // file: it copies revert WAL frames as raw pages and reads the pages of
+        // local changes as of the watermark.
+        let watermark = self.checkpoint_passive(coro).await?.watermark;
 
         let revert_conn = self.open_revert_db_conn(coro).await?;
         let main_conn = connect_untracked(&self.main_tape)?;
@@ -2412,7 +2470,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                 },
                             )?;
                             if let Some(sync) = mv_store
-                                .sync_logical_log_after_external_restore(&main_conn)
+                                .sync_logical_log(&main_conn)
                                 .map_err(|error| {
                                     Error::DatabaseSyncEngineError(format!(
                                         "failed to sync MVCC logical log after replace-base snapshot: {error}",
@@ -3759,6 +3817,7 @@ mod tests {
             remote_encryption_key: None,
             push_operations_threshold: None,
             pull_bytes_threshold: None,
+            pull_parallel_requests: None,
             logical_mvcc_pull: Some(true),
         }
     }
@@ -4679,6 +4738,128 @@ mod tests {
         }
     }
 
+    fn wal_frame(page_no: u32, db_size: u32) -> Vec<u8> {
+        let mut frame = vec![0; super::WAL_FRAME_SIZE];
+        turso_core::types::WalFrameInfo { page_no, db_size }.put_to_frame_header(&mut frame);
+        frame
+    }
+
+    /// Applies a page-stream changes file made of `changes_bytes` to a replica
+    /// that has one local row. The changes file comes from the network and the
+    /// disk, so a broken one must come back as an error: the process must not
+    /// abort, the synced revision must not move, and the local row must survive.
+    fn assert_broken_changes_file_is_rejected(changes_bytes: Vec<u8>) {
+        let main_file = NamedTempFile::new().unwrap();
+        let changes_file = NamedTempFile::new().unwrap();
+        let main_path = main_file.path().to_str().unwrap().to_string();
+        let changes_path = changes_file.path().to_str().unwrap().to_string();
+        std::fs::write(&changes_path, changes_bytes).unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let sync_engine_io = SyncEngineIoStats::new(Arc::new(NoopSyncEngineIo));
+        let old_revision = DatabasePullRevision::V1 {
+            revision: "old-revision".to_string(),
+        };
+        let new_revision = DatabasePullRevision::V1 {
+            revision: "new-revision".to_string(),
+        };
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let engine = DatabaseSyncEngine::create_db(
+                    &coro,
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &main_path,
+                    default_test_opts(),
+                )
+                .await?;
+                engine
+                    .update_meta(&coro, |meta| {
+                        meta.synced_revision = Some(old_revision.clone());
+                        meta.remote_pull_protocol = RemotePullProtocol::Pages;
+                    })
+                    .await?;
+                let conn = engine.connect_rw(&coro).await?;
+                conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")?;
+                conn.execute("INSERT INTO items VALUES (1, 'local')")?;
+
+                let changes_file =
+                    io.open_file(&changes_path, turso_core::OpenFlags::None, false)?;
+                let result = engine
+                    .apply_changes_from_remote(
+                        &coro,
+                        DbChangesStatus {
+                            time: turso_core::WallClockInstant {
+                                secs: 10,
+                                micros: 0,
+                            },
+                            revision: new_revision,
+                            file_slot: Some(MutexSlot {
+                                value: changes_file,
+                                slot: Arc::new(Mutex::new(None)),
+                            }),
+                            stream_kind: DbChangesStreamKind::Pages,
+                        },
+                    )
+                    .await;
+                assert!(result.is_err(), "a broken changes file must be rejected");
+                assert_eq!(engine.meta().synced_revision, Some(old_revision));
+
+                drop(conn);
+                drop(engine);
+                let verify_db = turso_core::Database::open_file(
+                    io.clone(),
+                    &main_path,
+                    Arc::new(SqliteDialect),
+                )?;
+                let verify_conn = verify_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+                let mut stmt = verify_conn.prepare("SELECT id, value FROM items")?;
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await? {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                assert_eq!(
+                    rows,
+                    vec![vec![
+                        turso_core::Value::from_i64(1),
+                        turso_core::Value::Text(turso_core::types::Text::new("local")),
+                    ]]
+                );
+                Result::Ok(())
+            }
+        });
+
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn apply_changes_from_remote_rejects_an_empty_changes_file() {
+        assert_broken_changes_file_is_rejected(Vec::new());
+    }
+
+    #[test]
+    fn apply_changes_from_remote_rejects_a_changes_file_cut_in_the_middle_of_a_frame() {
+        let mut bytes = wal_frame(1, 1);
+        bytes.extend_from_slice(&wal_frame(2, 2)[..100]);
+        assert_broken_changes_file_is_rejected(bytes);
+    }
+
+    #[test]
+    fn apply_changes_from_remote_rejects_a_changes_file_without_a_commit_frame() {
+        assert_broken_changes_file_is_rejected(wal_frame(1, 0));
+    }
+
     /// Full-fidelity page-stream response: header (with the given protocol
     /// hint) followed by one PageData message per page of `db_bytes`.
     fn encoded_page_stream_response(
@@ -5272,6 +5453,312 @@ mod tests {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
         let result = bootstrap_and_checkpoint_twice(io, None, "full.db");
         assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    /// A checkpoint first copies the synced main WAL frames into the DB file
+    /// with a PASSIVE checkpoint, then writes the revert WAL relative to that
+    /// file. A read transaction that started before a pull stops the PASSIVE
+    /// checkpoint before the pulled frames. Before the fix, the checkpoint went
+    /// on anyway and read the schema of the revert database from pages past
+    /// the end of the DB file ("short read on page N"). The checkpoint must
+    /// fail with Busy until the reader is done.
+    #[test]
+    fn checkpoint_is_busy_while_a_reader_is_older_than_the_pulled_frames() {
+        // Enough tables that sqlite_schema no longer fits in page 1. Its new
+        // pages are then past the end of the reader's version of the DB file.
+        let mut second_pull = (0..64)
+            .map(|i| {
+                format!("CREATE TABLE table_with_a_long_name_that_fills_the_schema_{i}(key, value)")
+            })
+            .collect::<Vec<_>>();
+        second_pull.push("INSERT INTO t VALUES (2, randomblob(16 * 4096))".to_string());
+        let responses = page_pull_responses(&remote_db_versions(&[
+            vec!["CREATE TABLE t(x INTEGER PRIMARY KEY, y BLOB)".to_string()],
+            vec!["INSERT INTO t VALUES (1, randomblob(4096))".to_string()],
+            second_pull,
+            vec!["INSERT INTO t VALUES (4, randomblob(4096))".to_string()],
+        ]));
+        let (io, sync_engine_io, main_path, opts, _temp_dir) = replica_setup(responses);
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let engine = DatabaseSyncEngine::create_db(
+                    &coro,
+                    io.clone(),
+                    sync_engine_io,
+                    &main_path,
+                    opts,
+                )
+                .await?;
+                pull(&coro, &engine).await?;
+                let reader = engine.connect_rw(&coro).await?;
+                reader.execute("BEGIN")?;
+                assert_eq!(
+                    select_x_and_length_of_y(&coro, &reader).await?,
+                    vec![(1, 4096)]
+                );
+
+                pull(&coro, &engine).await?;
+                let writer = engine.connect_rw(&coro).await?;
+                writer.execute("INSERT INTO t VALUES (3, randomblob(8 * 4096))")?;
+
+                let result = engine.checkpoint(&coro).await;
+                assert!(
+                    matches!(result, Err(Error::TursoError(turso_core::LimboError::Busy))),
+                    "checkpoint must wait for the reader: {result:?}"
+                );
+                assert_eq!(
+                    select_x_and_length_of_y(&coro, &reader).await?,
+                    vec![(1, 4096)]
+                );
+                reader.execute("COMMIT")?;
+                engine.checkpoint(&coro).await?;
+
+                // This pull reverts the local insert with the revert WAL that
+                // the checkpoint wrote, then replays it on the remote changes.
+                pull(&coro, &engine).await?;
+                assert_eq!(
+                    select_x_and_length_of_y(&coro, &writer).await?,
+                    vec![(1, 4096), (2, 16 * 4096), (3, 8 * 4096), (4, 4096)]
+                );
+                assert_integrity_check_ok(&coro, &writer).await
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        }
+    }
+
+    /// Same race as
+    /// [`checkpoint_is_busy_while_a_reader_is_older_than_the_pulled_frames`],
+    /// but the schema fits in page 1, so the checkpoint never reads a missing
+    /// page. Before the fix, the checkpoint then returned Busy only from its
+    /// final TRUNCATE step, after it had already written a revert WAL that
+    /// missed the pulled pages. The pull after the next checkpoint reverted
+    /// the local inserts with that revert WAL and broke the index b-tree.
+    #[test]
+    fn pull_after_checkpoint_blocked_by_a_reader_keeps_the_index_valid() {
+        // Long index keys give the index several levels of interior pages, all
+        // past the end of the reader's version of the DB file.
+        let mut second_pull = vec![
+            "CREATE TABLE u(x INTEGER PRIMARY KEY, y TEXT)".to_string(),
+            "CREATE INDEX u_y ON u(y)".to_string(),
+        ];
+        for i in 0..300 {
+            second_pull.push(format!(
+                "INSERT INTO u VALUES ({i}, printf('%0900d', {i} * 2))"
+            ));
+        }
+        let responses = page_pull_responses(&remote_db_versions(&[
+            vec!["CREATE TABLE t(x INTEGER PRIMARY KEY, y BLOB)".to_string()],
+            vec!["INSERT INTO t VALUES (1, randomblob(4096))".to_string()],
+            second_pull,
+            vec!["INSERT INTO t VALUES (2, randomblob(4096))".to_string()],
+        ]));
+        let (io, sync_engine_io, main_path, opts, _temp_dir) = replica_setup(responses);
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let engine = DatabaseSyncEngine::create_db(
+                    &coro,
+                    io.clone(),
+                    sync_engine_io,
+                    &main_path,
+                    opts,
+                )
+                .await?;
+                pull(&coro, &engine).await?;
+                let reader = engine.connect_rw(&coro).await?;
+                reader.execute("BEGIN")?;
+                assert_eq!(
+                    select_x_and_length_of_y(&coro, &reader).await?,
+                    vec![(1, 4096)]
+                );
+
+                pull(&coro, &engine).await?;
+                // Keys between the remote ones split index pages all over the
+                // b-tree.
+                let writer = engine.connect_rw(&coro).await?;
+                for i in 0..300 {
+                    writer.execute(format!(
+                        "INSERT INTO u VALUES ({}, printf('%0900d', {i} * 2 + 1))",
+                        1000 + i
+                    ))?;
+                }
+
+                let result = engine.checkpoint(&coro).await;
+                assert!(
+                    matches!(result, Err(Error::TursoError(turso_core::LimboError::Busy))),
+                    "checkpoint must wait for the reader: {result:?}"
+                );
+                reader.execute("COMMIT")?;
+                engine.checkpoint(&coro).await?;
+
+                pull(&coro, &engine).await?;
+                let expected_sum = (0..300).sum::<i64>() + (1000..1300).sum::<i64>();
+                let mut stmt = writer.prepare("SELECT COUNT(*), SUM(x) FROM u")?;
+                let row = run_stmt_once(&coro, &mut stmt).await?.unwrap();
+                assert_eq!(
+                    (row.get::<i64>(0)?, row.get::<i64>(1)?),
+                    (600, expected_sum)
+                );
+                let mut stmt =
+                    writer.prepare("SELECT COUNT(*) FROM u INDEXED BY u_y WHERE y > ''")?;
+                let row = run_stmt_once(&coro, &mut stmt).await?.unwrap();
+                assert_eq!(row.get::<i64>(0)?, 600);
+                drop(stmt);
+                assert_integrity_check_ok(&coro, &writer).await
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        }
+    }
+
+    /// Runs each batch of SQL on a fresh database and returns the database
+    /// file after each batch.
+    fn remote_db_versions(batches: &[Vec<String>]) -> Vec<Vec<u8>> {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir
+            .path()
+            .join("remote.db")
+            .to_string_lossy()
+            .to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open_file(io, &path, Arc::new(SqliteDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        batches
+            .iter()
+            .map(|batch| {
+                for sql in batch {
+                    conn.execute(sql).unwrap();
+                }
+                let max_frame = conn.wal_state().unwrap().max_frame;
+                conn.checkpoint(turso_core::CheckpointMode::Truncate {
+                    upper_bound_inclusive: Some(max_frame),
+                })
+                .unwrap();
+                std::fs::read(&path).unwrap()
+            })
+            .collect()
+    }
+
+    /// Server responses for a bootstrap from the first version and one pull
+    /// per later version. Like the server, a pull sends only the pages that
+    /// changed since the previous version.
+    fn page_pull_responses(versions: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let mut responses = vec![encoded_page_stream_response(
+            &versions[0],
+            "g1:o0",
+            PullUpdatesProtocol::Pages,
+        )];
+        for (i, pair) in versions.windows(2).enumerate() {
+            let (old_db, new_db) = (&pair[0], &pair[1]);
+            let header = PullUpdatesRespProtoBody {
+                server_revision: format!("g1:o{}", i + 1),
+                db_size: (new_db.len() / super::PAGE_SIZE) as u64,
+                raw_encoding: Some(PageSetRawEncodingProto {}),
+                zstd_encoding: None,
+                stream_kind: PullUpdatesStreamKind::Pages as i32,
+                apply_mode: PullUpdatesApplyMode::Incremental as i32,
+                mvcc_log: None,
+                protocol: PullUpdatesProtocol::Pages as i32,
+            };
+            let mut response = header.encode_length_delimited_to_vec();
+            for (page_idx, page) in new_db.chunks_exact(super::PAGE_SIZE).enumerate() {
+                let offset = page_idx * super::PAGE_SIZE;
+                if old_db.get(offset..offset + super::PAGE_SIZE) == Some(page) {
+                    continue;
+                }
+                let page_data = PageData {
+                    page_id: page_idx as u64,
+                    encoded_page: Bytes::copy_from_slice(page),
+                };
+                response.extend_from_slice(&page_data.encode_length_delimited_to_vec());
+            }
+            responses.push(response);
+        }
+        responses
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn replica_setup(
+        responses: Vec<Vec<u8>>,
+    ) -> (
+        Arc<dyn turso_core::IO>,
+        SyncEngineIoStats<QueuedSyncEngineIo>,
+        String,
+        DatabaseSyncEngineOpts,
+        tempfile::TempDir,
+    ) {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let main_path = temp_dir
+            .path()
+            .join("local.db")
+            .to_string_lossy()
+            .to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let sync_io = Arc::new(QueuedSyncEngineIo {
+            responses: Mutex::new(responses.into_iter().collect()),
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut opts = default_test_opts();
+        opts.remote_url = Some("https://example.com".to_string());
+        opts.bootstrap_if_empty = true;
+        opts.logical_mvcc_pull = Some(false);
+        (
+            io,
+            SyncEngineIoStats::new(sync_io),
+            main_path,
+            opts,
+            temp_dir,
+        )
+    }
+
+    async fn pull(coro: &Coro<()>, engine: &DatabaseSyncEngine<QueuedSyncEngineIo>) -> Result<()> {
+        let changes = engine.wait_changes_from_remote(coro).await?;
+        engine.apply_changes_from_remote(coro, changes).await
+    }
+
+    async fn select_x_and_length_of_y(
+        coro: &Coro<()>,
+        conn: &Arc<turso_core::Connection>,
+    ) -> Result<Vec<(i64, i64)>> {
+        let mut stmt = conn.prepare("SELECT x, length(y) FROM t")?;
+        let mut rows = Vec::new();
+        while let Some(row) = run_stmt_once(coro, &mut stmt).await? {
+            rows.push((row.get::<i64>(0)?, row.get::<i64>(1)?));
+        }
+        Ok(rows)
+    }
+
+    async fn assert_integrity_check_ok(
+        coro: &Coro<()>,
+        conn: &Arc<turso_core::Connection>,
+    ) -> Result<()> {
+        let mut stmt = conn.prepare("PRAGMA integrity_check")?;
+        let row = run_stmt_once(coro, &mut stmt)
+            .await?
+            .map(|row| row.get_values().cloned().collect::<Vec<_>>());
+        assert_eq!(
+            row,
+            Some(vec![turso_core::Value::Text(turso_core::types::Text::new(
+                "ok".to_string()
+            ))])
+        );
+        Ok(())
     }
 
     /// `read_wal_salt` is the first read `checkpoint()` performs, and it is

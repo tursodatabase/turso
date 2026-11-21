@@ -16,10 +16,10 @@ use crate::{
         optimizer::{constraints::partial_index, mark_partial_index_predicate_terms_consumed},
         order_by::EmitOrderBy,
         plan::{
-            BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
-            NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekKeyComponent,
-            SelectPlan, SimpleAggregate, SubqueryEvalPhase, SubqueryOrigin, SubqueryState,
-            TableReferences,
+            BitSet, DistinctOnRegisters, Distinctness, EphemeralRowidMode, EvalAt,
+            IndexMethodQuery, JoinOrderMember, NonFromClauseSubquery, Operation, QueryDestination,
+            Scan, Search, SeekKeyComponent, SelectPlan, SimpleAggregate, SubqueryEvalPhase,
+            SubqueryOrigin, SubqueryState, TableReferences,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -208,14 +208,25 @@ pub fn emit_query<'a>(
     } else {
         None
     };
-    if let Distinctness::Distinct { ctx } = &mut plan.distinctness {
+    if let Distinctness::Distinct { ctx, .. } = &mut plan.distinctness {
         *ctx = distinct_ctx
     }
-    if let Distinctness::Distinct { ctx: Some(ctx) } = &plan.distinctness {
-        program.emit_insn(Insn::HashClear {
-            hash_table_id: ctx.hash_table_id,
-        });
-        emit_explain!(program, false, crate::translate::eqp::EqpDetail::Distinct);
+    if let Distinctness::Distinct { ctx: Some(ctx), .. } = &plan.distinctness {
+        ctx.emit_reset(program);
+        if !ctx.is_ordered() {
+            emit_explain!(program, false, crate::translate::eqp::EqpDetail::Distinct);
+        }
+    }
+
+    if let Distinctness::DistinctOn { key_count } = plan.distinctness {
+        turso_assert!(
+            plan.order_by.len() >= key_count,
+            "the DISTINCT ON keys are the first ORDER BY terms"
+        );
+    }
+    if let Distinctness::DistinctOnRowsInOrder { keys, registers } = &mut plan.distinctness {
+        *registers = Some(DistinctOnRegisters::alloc(program, keys.len()));
+        emit_explain!(program, false, crate::translate::eqp::EqpDetail::DistinctOn);
     }
 
     let end_label = program.allocate_label();
@@ -258,7 +269,7 @@ pub fn emit_query<'a>(
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::Count))
         && emit_simple_count(program, t_ctx, plan)?
     {
-        if let Distinctness::Distinct { ctx } = &plan.distinctness {
+        if let Distinctness::Distinct { ctx, .. } = &plan.distinctness {
             let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
             program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
         }

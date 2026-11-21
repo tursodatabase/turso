@@ -112,6 +112,10 @@ pub struct Builder {
     // from the first pull-updates response; Some(true) forces MVCC logical-log
     // pulls; Some(false) forces page-stream pulls.
     logical_mvcc_pull: Option<bool>,
+    // Bootstrap chunk size in bytes; None bootstraps in one request.
+    pull_bytes_threshold: Option<usize>,
+    // Maximum number of bootstrap chunk requests in flight; None means 1.
+    pull_parallel_requests: Option<usize>,
     // Experimental engine features to enable on the local synced database.
     // These mirror the local [`crate::Builder`] flags so synced databases
     // expose the same SQL surface as their local-only counterparts. Local
@@ -142,6 +146,8 @@ impl Builder {
             remote_encryption_key: None,
             remote_encryption_cipher: None,
             logical_mvcc_pull: None,
+            pull_bytes_threshold: None,
+            pull_parallel_requests: None,
             enable_attach: false,
             enable_custom_types: false,
             enable_index_method: false,
@@ -310,6 +316,22 @@ impl Builder {
         self
     }
 
+    /// Split the initial bootstrap download into `/pull-updates` requests of
+    /// at least `bytes` each. By default the bootstrap is one request. Has no
+    /// effect with the query partial-sync bootstrap strategy.
+    pub fn with_pull_bytes_threshold(mut self, bytes: usize) -> Self {
+        self.pull_bytes_threshold = Some(bytes);
+        self
+    }
+
+    /// Maximum number of bootstrap chunk requests in flight at once when the
+    /// bootstrap is split with [`Builder::with_pull_bytes_threshold`].
+    /// Defaults to 1. With 0, [`Builder::build`] returns an error.
+    pub fn with_pull_parallel_requests(mut self, requests: usize) -> Self {
+        self.pull_parallel_requests = Some(requests);
+        self
+    }
+
     /// Compose the `experimental_features` comma-separated string consumed by
     /// [`turso_sdk_kit::rsapi::TursoDatabaseConfig`] (and ultimately
     /// `turso_core::DatabaseOpts::with_experimental_feature`) from the boolean
@@ -350,6 +372,12 @@ impl Builder {
 
     // Build the synced database object, initialize and open it.
     pub async fn build(self) -> Result<Database> {
+        if self.pull_parallel_requests == Some(0) {
+            return Err(Error::Misuse(
+                "pull_parallel_requests must be at least 1".to_string(),
+            ));
+        }
+
         // Compose the experimental_features string from the boolean flags
         // exposed on this Builder.
         let experimental_features = self.experimental_features_string();
@@ -395,7 +423,8 @@ impl Builder {
             partial_sync_opts: self.partial_sync_config_experimental.clone(),
             remote_encryption_key: self.remote_encryption_key.clone(),
             push_operations_threshold: None,
-            pull_bytes_threshold: None,
+            pull_bytes_threshold: self.pull_bytes_threshold,
+            pull_parallel_requests: self.pull_parallel_requests,
             logical_mvcc_pull: self.logical_mvcc_pull,
         };
 
@@ -805,6 +834,7 @@ impl IoWorker {
         wakers: Arc<Mutex<Vec<Waker>>>,
         client: Client<HttpsConnector<HttpConnector>, ChunkedBody>,
     ) {
+        let open_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         while rx.recv().await.is_some() {
             let Some(sync) = sync.upgrade() else {
                 break;
@@ -815,7 +845,12 @@ impl IoWorker {
                 let item = sync.take_io_item();
                 let Some(item) = item else {
                     sync.step_io_callbacks();
-                    IoWorker::notify_progress(&wakers);
+                    // An open HTTP request wakes the waiting futures itself
+                    // when it has progress. Waking them here as well would
+                    // make them poll and kick this loop without pause.
+                    if open_requests.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                        IoWorker::notify_progress(&wakers);
+                    }
                     break;
                 };
 
@@ -832,20 +867,33 @@ impl IoWorker {
                         body,
                         headers,
                     } => {
-                        IoWorker::process_http(
-                            &sync,
-                            base_url.as_deref(),
-                            auth_token.as_ref(),
-                            &wakers,
-                            &client,
-                            url.as_deref(),
-                            &method,
-                            &path,
-                            body.map(Bytes::from),
-                            &headers,
-                            completion,
-                        )
-                        .await;
+                        // Each request streams its body on its own task, so
+                        // requests the engine issues together run in parallel.
+                        let sync = sync.clone();
+                        let base_url = base_url.clone();
+                        let auth_token = auth_token.clone();
+                        let wakers = wakers.clone();
+                        let client = client.clone();
+                        let open_requests = open_requests.clone();
+                        open_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tokio::spawn(async move {
+                            IoWorker::process_http(
+                                &sync,
+                                base_url.as_deref(),
+                                auth_token.as_ref(),
+                                &wakers,
+                                &client,
+                                url.as_deref(),
+                                &method,
+                                &path,
+                                body.map(Bytes::from),
+                                &headers,
+                                completion,
+                            )
+                            .await;
+                            open_requests.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            IoWorker::notify_progress(&wakers);
+                        });
                     }
                     turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullRead { path } => {
                         IoWorker::process_full_read(&path, completion, &sync).await;
@@ -1828,6 +1876,64 @@ mod tests {
                 vec![Value::Text("sync".to_string())],
             ]
         );
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_bootstrap_parallel_chunks() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        server
+            .db_sql("CREATE TABLE t(x INTEGER PRIMARY KEY, y BLOB)")
+            .await
+            .unwrap();
+        server
+            .db_sql("INSERT INTO t SELECT value, randomblob(1024) FROM generate_series(1, 200)")
+            .await
+            .unwrap();
+        // The token provider runs at the start of every HTTP request. It
+        // stays open for 20 ms and records how many calls were open together.
+        let open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
+            .with_pull_bytes_threshold(8192)
+            .with_pull_parallel_requests(4)
+            .with_auth_token_fn({
+                let open = open.clone();
+                let max_open = max_open.clone();
+                move || {
+                    let open = open.clone();
+                    let max_open = max_open.clone();
+                    async move {
+                        let now = open.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        max_open.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        open.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok("token".to_string())
+                    }
+                }
+            })
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(max_open.load(std::sync::atomic::Ordering::SeqCst), 4);
+        let conn = db.connect().await.unwrap();
+        let rows = conn
+            .query("SELECT COUNT(*), SUM(x), SUM(length(y)) FROM t", ())
+            .await
+            .unwrap();
+        let all = all_rows(rows).await.unwrap();
+        assert_eq!(
+            all,
+            vec![vec![
+                Value::Integer(200),
+                Value::Integer(20100),
+                Value::Integer(200 * 1024)
+            ]]
+        );
+        let rows = conn.query("PRAGMA integrity_check", ()).await.unwrap();
+        let all = all_rows(rows).await.unwrap();
+        assert_eq!(all, vec![vec![Value::Text("ok".to_string())]]);
     }
 
     #[tokio::test]
@@ -2883,6 +2989,42 @@ mod tests {
         });
 
         (url, captured, notify)
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_open_request_does_not_poll_in_a_loop() {
+        // The first request stays open for 500 ms in the token provider,
+        // then fails.
+        let build = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url("http://127.0.0.1:9")
+            .with_auth_token_fn(|| async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Err(crate::Error::Error("no token".to_string()))
+            })
+            .build();
+        let mut build = std::pin::pin!(build);
+        let mut polls = 0;
+        let result = std::future::poll_fn(|cx| {
+            polls += 1;
+            std::future::Future::poll(build.as_mut(), cx)
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(polls < 100, "build was polled {polls} times");
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_zero_pull_parallel_requests_is_an_error() {
+        let result = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url("http://127.0.0.1:9")
+            .with_pull_parallel_requests(0)
+            .build()
+            .await;
+        let message = result.err().map(|e| e.to_string());
+        assert_eq!(
+            message.as_deref(),
+            Some("pull_parallel_requests must be at least 1")
+        );
     }
 
     fn extract_bearer_token(headers: &[String]) -> Option<String> {

@@ -1221,6 +1221,7 @@ expect {
     kept_seq
 }
 
+@compat-gap "syntax:catalog"
 test pg-primary-key-dump-catalogs {
     CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT UNIQUE);
     CREATE SEQUENCE after_indexes;
@@ -1262,6 +1263,7 @@ expect {
     u|1|0|UNIQUE (a)
 }
 
+@compat-gap "syntax:catalog"
 test pg-primary-key-named-and-quoted {
     CREATE TABLE "quoted table" (payload TEXT, "key column" INTEGER CONSTRAINT "custom key" PRIMARY KEY);
     SELECT c.conname, i.indkey, pg_get_constraintdef(c.oid), pg_get_indexdef(c.conindid)
@@ -1294,6 +1296,7 @@ expect {
     t|t_pkey|p|PRIMARY KEY (a)|1
 }
 
+@compat-gap "syntax:catalog"
 test pg-primary-key-index-name-collisions {
     CREATE TABLE t_pkey(x INTEGER);
     CREATE INDEX t_pkey1 ON t_pkey(x);
@@ -1381,6 +1384,419 @@ expect {
     2200|2615|0|standard public schema
 }
 
+test obj-description-reads-the-comment-of-the-public-schema {
+    SELECT obj_description(oid, 'pg_namespace'), obj_description(oid, 'pg_class')
+    FROM pg_namespace WHERE nspname = 'public';
+}
+expect {
+    standard public schema|
+}
+
+test obj-description-of-a-subquery-with-an-aggregate {
+    SELECT obj_description((SELECT max(oid) FROM pg_namespace WHERE nspname = 'public'), 'pg_namespace');
+}
+expect {
+    standard public schema
+}
+
+@skip-if postgres "PostgreSQL looks up the comment of an aggregate"
+test obj-description-of-an-aggregate-is-not-supported {
+    SELECT obj_description(max(oid), 'pg_namespace') FROM pg_namespace WHERE nspname = 'public';
+}
+@sqlstate 0A000
+expect error {
+    obj_description of an aggregate or window function is not supported
+}
+
+@skip-if postgres "PostgreSQL looks up the comment of a window function"
+test col-description-of-a-window-function-is-not-supported {
+    SELECT col_description(oid, row_number() OVER ()) FROM pg_namespace WHERE nspname = 'public';
+}
+@sqlstate 0A000
+expect error {
+    col_description of an aggregate or window function is not supported
+}
+
+@skip-if postgres "PostgreSQL accepts obj_description in a column default"
+test obj-description-in-a-column-default-is-not-supported {
+    CREATE TABLE description_default (x int, y text DEFAULT obj_description(1, 'pg_class'));
+}
+@sqlstate 0A000
+expect error {
+    obj_description in a table definition is not supported
+}
+
+@skip-if postgres "PostgreSQL accepts col_description in a CHECK constraint"
+test col-description-in-a-check-constraint-is-not-supported {
+    CREATE TABLE description_check (x int, CHECK (col_description(x, 1) IS NULL));
+}
+@sqlstate 0A000
+expect error {
+    col_description in a table definition is not supported
+}
+
+@skip-if postgres "PostgreSQL accepts obj_description in the default of an added column"
+test obj-description-in-the-default-of-an-added-column-is-not-supported {
+    CREATE TABLE description_added (x int);
+    ALTER TABLE description_added ADD COLUMN y text DEFAULT obj_description(1, 'pg_class');
+}
+@sqlstate 0A000
+expect error {
+    obj_description in a table definition is not supported
+}
+
+@skip-if postgres "PostgreSQL refuses it as not immutable"
+test obj-description-in-an-index-is-not-supported {
+    CREATE TABLE description_indexed (x int);
+    CREATE INDEX description_index ON description_indexed ((obj_description(x, 'pg_class')));
+}
+@sqlstate 0A000
+expect error {
+    obj_description in an index is not supported
+}
+
+test obj-description-in-create-table-as {
+    CREATE TABLE description_copy AS
+        SELECT obj_description(oid, 'pg_namespace') AS d FROM pg_namespace WHERE nspname = 'public';
+    SELECT d FROM description_copy;
+}
+expect {
+    standard public schema
+}
+
+test comment-on-table-is-stored-and-replaced {
+    CREATE TABLE commented_table (a int);
+    COMMENT ON TABLE commented_table IS 'first';
+    SELECT obj_description(c.oid, 'pg_class'), obj_description(c.oid)
+    FROM pg_class c WHERE c.relname = 'commented_table';
+    COMMENT ON TABLE commented_table IS 'it''s the second';
+    SELECT obj_description(oid, 'pg_class') FROM pg_class WHERE relname = 'commented_table';
+    SELECT count(*) FROM pg_description d JOIN pg_class c ON c.oid = d.objoid
+    WHERE c.relname = 'commented_table' AND d.classoid = 1259;
+}
+expect {
+    first|first
+    it's the second
+    1
+}
+
+test comment-on-table-is-removed-by-null-and-by-empty-text {
+    CREATE TABLE uncommented_table (a int);
+    CREATE TABLE emptied_table (a int);
+    COMMENT ON TABLE uncommented_table IS 'x';
+    COMMENT ON TABLE emptied_table IS 'x';
+    COMMENT ON TABLE uncommented_table IS NULL;
+    COMMENT ON TABLE emptied_table IS '';
+    SELECT relname, coalesce(obj_description(oid, 'pg_class'), 'no comment') FROM pg_class
+    WHERE relname IN ('uncommented_table', 'emptied_table') ORDER BY relname;
+    SELECT count(*) FROM pg_description d JOIN pg_class c ON c.oid = d.objoid
+    WHERE c.relname IN ('uncommented_table', 'emptied_table');
+}
+expect {
+    emptied_table|no comment
+    uncommented_table|no comment
+    0
+}
+
+test comment-on-column-is-read-by-col-description {
+    CREATE TABLE commented_columns (a int, b int, c int);
+    COMMENT ON COLUMN commented_columns.a IS 'the a';
+    COMMENT ON COLUMN public.commented_columns.c IS 'the c';
+    SELECT a.attname, col_description(a.attrelid, a.attnum)
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'commented_columns' AND a.attnum > 0 ORDER BY a.attnum;
+    SELECT obj_description(oid, 'pg_class') FROM pg_class WHERE relname = 'commented_columns';
+}
+expect {
+    a|the a
+    b|
+    c|the c
+    
+}
+
+test comment-on-index-is-stored {
+    CREATE TABLE commented_indexed (a int);
+    CREATE INDEX commented_index ON commented_indexed (a);
+    COMMENT ON INDEX commented_index IS 'an index';
+    SELECT relname, obj_description(oid, 'pg_class') FROM pg_class
+    WHERE relname IN ('commented_indexed', 'commented_index') ORDER BY relname;
+}
+expect {
+    commented_index|an index
+    commented_indexed|
+}
+
+test comment-on-sequence-is-stored {
+    CREATE SEQUENCE commented_sequence;
+    COMMENT ON SEQUENCE commented_sequence IS 'a sequence';
+    SELECT obj_description(oid, 'pg_class') FROM pg_class WHERE relname = 'commented_sequence';
+}
+expect {
+    a sequence
+}
+
+test comment-on-schema-is-stored {
+    CREATE SCHEMA commented_schema;
+    COMMENT ON SCHEMA commented_schema IS 'a schema';
+    SELECT obj_description(oid, 'pg_namespace') FROM pg_namespace
+    WHERE nspname = 'commented_schema';
+}
+expect {
+    a schema
+}
+
+test comment-on-quoted-names-with-capital-letters {
+    CREATE SCHEMA "CommentUp";
+    CREATE TABLE "CommentUp"."MixT" ("ColA" int, b int);
+    COMMENT ON SCHEMA "CommentUp" IS 'mixed schema';
+    COMMENT ON TABLE "CommentUp"."MixT" IS 'mixed table';
+    COMMENT ON COLUMN "CommentUp"."MixT"."ColA" IS 'mixed column';
+    SELECT objsubid, description FROM pg_description
+    WHERE description LIKE 'mixed %' ORDER BY description;
+}
+expect {
+    1|mixed column
+    0|mixed schema
+    0|mixed table
+}
+
+test comment-on-view-is-stored-and-dropped-with-the-view {
+    CREATE TABLE commented_view_base (a int);
+    CREATE VIEW commented_view AS SELECT a FROM commented_view_base;
+    COMMENT ON VIEW commented_view IS 'a commented view';
+    SELECT objsubid, description FROM pg_description WHERE description = 'a commented view';
+    DROP VIEW commented_view;
+    SELECT count(*) FROM pg_description WHERE description = 'a commented view';
+}
+expect {
+    0|a commented view
+    0
+}
+
+test comment-is-rolled-back-with-its-transaction {
+    CREATE TABLE comment_rolled_back (a int);
+    COMMENT ON TABLE comment_rolled_back IS 'kept';
+    BEGIN;
+    COMMENT ON TABLE comment_rolled_back IS 'undone';
+    COMMENT ON COLUMN comment_rolled_back.a IS 'undone';
+    ROLLBACK;
+    SELECT obj_description(oid, 'pg_class'), col_description(oid, 1) FROM pg_class
+    WHERE relname = 'comment_rolled_back';
+}
+expect {
+    kept|
+}
+
+test dropping-a-relation-deletes-its-comments {
+    CREATE TABLE comment_dropped (a int, b int);
+    CREATE INDEX comment_dropped_index ON comment_dropped (b);
+    CREATE TABLE comment_kept (a int);
+    CREATE SEQUENCE comment_dropped_sequence;
+    COMMENT ON TABLE comment_dropped IS 'table';
+    COMMENT ON COLUMN comment_dropped.a IS 'column';
+    COMMENT ON INDEX comment_dropped_index IS 'index';
+    COMMENT ON SEQUENCE comment_dropped_sequence IS 'sequence';
+    COMMENT ON TABLE comment_kept IS 'kept';
+    DROP TABLE comment_dropped;
+    DROP SEQUENCE comment_dropped_sequence;
+    SELECT description FROM pg_description
+    WHERE description IN ('table', 'column', 'index', 'sequence', 'kept');
+}
+expect {
+    kept
+}
+
+test dropping-a-schema-deletes-its-comment {
+    CREATE SCHEMA comment_dropped_schema;
+    COMMENT ON SCHEMA comment_dropped_schema IS 'dropped schema';
+    DROP SCHEMA comment_dropped_schema;
+    SELECT count(*) FROM pg_description WHERE description = 'dropped schema';
+}
+expect {
+    0
+}
+
+@skip-if postgres "PostgreSQL keeps the number of a column when a column before it is dropped"
+test dropping-a-column-deletes-its-comment-and-keeps-the-others {
+    CREATE TABLE comment_column_dropped (a int, b int, c int);
+    COMMENT ON TABLE comment_column_dropped IS 'the table';
+    COMMENT ON COLUMN comment_column_dropped.a IS 'the a';
+    COMMENT ON COLUMN comment_column_dropped.b IS 'the b';
+    COMMENT ON COLUMN comment_column_dropped.c IS 'the c';
+    ALTER TABLE comment_column_dropped DROP COLUMN b;
+    SELECT a.attname, col_description(a.attrelid, a.attnum)
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'comment_column_dropped' ORDER BY a.attnum;
+    SELECT obj_description(oid, 'pg_class') FROM pg_class
+    WHERE relname = 'comment_column_dropped';
+    SELECT count(*) FROM pg_description WHERE description = 'the b';
+}
+expect {
+    a|the a
+    c|the c
+    the table
+    0
+}
+
+test dropping-a-column-is-rolled-back-with-its-comments {
+    CREATE TABLE comment_drop_undone (a int, b int);
+    COMMENT ON COLUMN comment_drop_undone.a IS 'undone a';
+    COMMENT ON COLUMN comment_drop_undone.b IS 'undone b';
+    BEGIN;
+    ALTER TABLE comment_drop_undone DROP COLUMN a;
+    ROLLBACK;
+    SELECT a.attname, col_description(a.attrelid, a.attnum)
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'comment_drop_undone' AND a.attnum > 0 ORDER BY a.attnum;
+}
+expect {
+    a|undone a
+    b|undone b
+}
+
+test dropping-a-column-of-a-quoted-table-keeps-the-other-comments {
+    CREATE TABLE "MixDrop" ("ColA" int, "ColB" int);
+    COMMENT ON COLUMN "MixDrop"."ColA" IS 'mixdrop a';
+    COMMENT ON COLUMN "MixDrop"."ColB" IS 'mixdrop b';
+    ALTER TABLE "MixDrop" DROP COLUMN "ColA";
+    SELECT a.attname, col_description(a.attrelid, a.attnum)
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'MixDrop' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum;
+    SELECT count(*) FROM pg_description WHERE description = 'mixdrop a';
+}
+expect {
+    ColB|mixdrop b
+    0
+}
+
+test comment-on-missing-relation-fails {
+    COMMENT ON TABLE comment_no_such_table IS 'x';
+}
+@sqlstate 42P01
+expect error {
+    relation "comment_no_such_table" does not exist
+}
+
+test comment-on-missing-column-fails {
+    CREATE TABLE comment_no_such_column (a int);
+    COMMENT ON COLUMN comment_no_such_column.b IS 'x';
+}
+@sqlstate 42703
+expect error {
+    column "b" of relation "comment_no_such_column" does not exist
+}
+
+test comment-on-missing-schema-fails {
+    COMMENT ON SCHEMA comment_no_such_schema IS 'x';
+}
+@sqlstate 3F000
+expect error {
+    schema "comment_no_such_schema" does not exist
+}
+
+test comment-on-relation-of-another-kind-fails {
+    CREATE TABLE comment_not_an_index (a int);
+    COMMENT ON INDEX comment_not_an_index IS 'x';
+}
+@sqlstate 42809
+expect error {
+    "comment_not_an_index" is not an index
+}
+
+@skip-if postgres "PostgreSQL stores comments on types"
+test comment-on-type-is-not-supported {
+    CREATE TYPE comment_mood AS ENUM ('sad', 'happy');
+    COMMENT ON TYPE comment_mood IS 'x';
+}
+@sqlstate 0A000
+expect error {
+    COMMENT ON TYPE is not supported
+}
+
+@skip-if postgres "PostgreSQL stores comments on constraints"
+test comment-on-constraint-is-not-supported {
+    CREATE TABLE comment_constrained (a int CONSTRAINT comment_check CHECK (a > 0));
+    COMMENT ON CONSTRAINT comment_check ON comment_constrained IS 'x';
+}
+@sqlstate 0A000
+expect error {
+    COMMENT ON CONSTRAINT is not supported
+}
+
+@skip-if postgres "PostgreSQL stores comments on the columns of views"
+test comment-on-view-column-is-not-supported {
+    CREATE TABLE comment_view_base (a int);
+    CREATE VIEW comment_view AS SELECT a FROM comment_view_base;
+    COMMENT ON COLUMN comment_view.a IS 'x';
+}
+@sqlstate 0A000
+expect error {
+    COMMENT ON COLUMN of a view is not supported
+}
+
+@skip-if postgres "a PostgreSQL superuser may comment on a catalog relation"
+test comment-on-catalog-table-is-not-supported {
+    COMMENT ON TABLE pg_class IS 'x';
+}
+@sqlstate 0A000
+expect error {
+    COMMENT ON a system catalog relation is not supported
+}
+
+@skip-if postgres "a PostgreSQL superuser may comment on a catalog relation"
+test comment-on-catalog-view-is-not-supported {
+    COMMENT ON VIEW information_schema.tables IS 'x';
+}
+@sqlstate 0A000
+expect error {
+    COMMENT ON a system catalog relation is not supported
+}
+
+@skip-if postgres "a PostgreSQL superuser may comment on a catalog relation"
+test comment-on-catalog-column-is-not-supported {
+    COMMENT ON COLUMN pg_catalog.pg_class.relname IS 'x';
+}
+@sqlstate 0A000
+expect error {
+    COMMENT ON a system catalog relation is not supported
+}
+
+@skip-if postgres "PostgreSQL stores comments on the index of a constraint"
+test comment-on-primary-key-index-is-not-supported {
+    CREATE TABLE comment_keyed (id int PRIMARY KEY, a int UNIQUE);
+    COMMENT ON INDEX comment_keyed_pkey IS 'x';
+}
+@sqlstate 0A000
+expect error {
+    COMMENT ON the index of a constraint is not supported
+}
+
+@skip-if postgres "PostgreSQL stores comments on the index of a constraint"
+test comment-on-unique-constraint-index-is-not-supported {
+    CREATE TABLE comment_unique (a int UNIQUE, b int, CONSTRAINT comment_named_unique UNIQUE (b));
+    COMMENT ON INDEX comment_named_unique IS 'x';
+}
+@sqlstate 0A000
+expect error {
+    COMMENT ON the index of a constraint is not supported
+}
+
+test comment-on-missing-relation-of-pg-catalog-fails {
+    COMMENT ON TABLE pg_catalog.comment_no_such_relation IS 'x';
+}
+@sqlstate 42P01
+expect error {
+    relation "pg_catalog.comment_no_such_relation" does not exist
+}
+
+@skip-if postgres "a PostgreSQL superuser may write pg_description"
+test pg-description-rejects-writes {
+    INSERT INTO pg_description VALUES (1, 1, 0, 'x');
+}
+@sqlstate 42501
+expect error {
+}
+
 test pg-attribute-default-storage {
     CREATE TABLE storage_types (
         id INTEGER PRIMARY KEY, body TEXT, label VARCHAR(40), data BYTEA,
@@ -1443,6 +1859,90 @@ expect {
     Fk X|FOREIGN KEY ("Child Key") REFERENCES "Parent"("Mixed Key") ON UPDATE CASCADE ON DELETE SET NULL
     U q|UNIQUE ("Code")
     FOREIGN KEY ("Child Key") REFERENCES public."Parent"("Mixed Key") ON UPDATE CASCADE ON DELETE SET NULL
+}
+
+test pg-get-constraintdef-check-constraints {
+    CREATE TABLE checked (
+        id int, owner text, code varchar(10), price numeric(10, 2), done boolean,
+        CONSTRAINT a_positive CHECK (id > 0),
+        CONSTRAINT b_like CHECK (owner LIKE 'a%'),
+        CONSTRAINT c_text CHECK (code <> 'x'),
+        CONSTRAINT d_in CHECK (id IN (1, 2)),
+        CONSTRAINT e_numeric CHECK (price > 0),
+        CONSTRAINT f_and CHECK (id > 0 AND id < 10),
+        CONSTRAINT g_flag CHECK (done)
+    );
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    CHECK ((id > 0))
+    CHECK ((owner ~~ 'a%'::text))
+    CHECK (((code)::text <> 'x'::text))
+    CHECK ((id = ANY (ARRAY[1, 2])))
+    CHECK ((price > (0)::numeric))
+    CHECK (((id > 0) AND (id < 10)))
+    CHECK (done)
+}
+
+test pg-get-constraintdef-check-constraint-with-lowest-number {
+    CREATE TABLE checked (
+        id int, big bigint,
+        CONSTRAINT a_integer CHECK (id > -2147483648),
+        CONSTRAINT b_bigint CHECK (big > -9223372036854775808)
+    );
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    CHECK ((id > '-2147483648'::integer))
+    CHECK ((big > '-9223372036854775808'::bigint))
+}
+
+# tursopg compiles COLLATE "default" to nothing, as it leaves the collation
+# as it is, so the condition is shown without it.
+@compat-gap "function:pg_get_constraintdef"
+test pg-get-constraintdef-check-constraint-with-collate {
+    CREATE TABLE checked (
+        owner text, code varchar(10),
+        CONSTRAINT a_literal CHECK (owner < 'a' COLLATE "C"),
+        CONSTRAINT b_column CHECK (owner COLLATE "C" > 'b'),
+        CONSTRAINT c_varchar CHECK (code COLLATE "C" <> 'x'),
+        CONSTRAINT d_default CHECK (owner COLLATE "default" <> 'd')
+    );
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    CHECK ((owner < ('a'::text COLLATE "C")))
+    CHECK (((owner COLLATE "C") > 'b'::text))
+    CHECK ((((code)::text COLLATE "C") <> 'x'::text))
+    CHECK (((owner COLLATE "default") <> 'd'::text))
+}
+expect @tursopg {
+    CHECK ((owner < ('a'::text COLLATE "C")))
+    CHECK (((owner COLLATE "C") > 'b'::text))
+    CHECK ((((code)::text COLLATE "C") <> 'x'::text))
+    CHECK ((owner <> 'd'::text))
+}
+
+test pg-attrdef-default-with-collate {
+    CREATE TABLE defaulted (owner text DEFAULT ('x' COLLATE "C"));
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef;
+}
+expect {
+    ('x'::text COLLATE "C")
+}
+
+# tursopg does not print the casts of the || operator and shows the condition
+# as the engine stores it.
+@compat-gap "function:pg_get_constraintdef"
+test pg-get-constraintdef-check-constraint-with-concatenation {
+    CREATE TABLE checked (owner text CHECK (owner || 'x' <> 'ax'));
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0;
+}
+expect {
+    CHECK (((owner || 'x'::text) <> 'ax'::text))
+}
+expect @tursopg {
+    CHECK ((owner || 'x') != 'ax')
 }
 
 test pg-mixed-case-names-in-separate-schemas {
@@ -1629,4 +2129,114 @@ test constraint-oids-are-not-relation-oids {
 }
 expect {
     0
+}
+
+test pg-attribute-identity-columns {
+    CREATE TABLE zz_identity_attrs (
+        a int GENERATED ALWAYS AS IDENTITY,
+        b bigint GENERATED BY DEFAULT AS IDENTITY,
+        c serial,
+        d int
+    );
+    SELECT a.attname, a.attnotnull, a.atthasdef, a.attidentity
+    FROM pg_attribute a
+    JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'zz_identity_attrs' AND a.attnum > 0
+    ORDER BY a.attnum;
+}
+expect {
+    a|t|f|a
+    b|t|f|d
+    c|t|t|
+    d|f|f|
+}
+
+test pg-attrdef-skips-identity-columns {
+    CREATE TABLE zz_identity_defaults (
+        a int GENERATED ALWAYS AS IDENTITY,
+        b bigint GENERATED BY DEFAULT AS IDENTITY,
+        c serial
+    );
+    SELECT d.adnum FROM pg_attrdef d
+    JOIN pg_class c ON c.oid = d.adrelid
+    WHERE c.relname = 'zz_identity_defaults'
+    ORDER BY d.adnum;
+}
+expect {
+    3
+}
+
+test pg-depend-identity-sequence-belongs-to-its-column {
+    CREATE TABLE zz_identity_depend (
+        a int GENERATED ALWAYS AS IDENTITY,
+        b text,
+        c bigint GENERATED BY DEFAULT AS IDENTITY
+    );
+    SELECT s.relname, d.refobjsubid, d.deptype
+    FROM pg_depend d
+    JOIN pg_class s ON s.oid = d.objid
+    JOIN pg_class t ON t.oid = d.refobjid
+    WHERE d.deptype = 'i' AND s.relkind = 'S' AND t.relname = 'zz_identity_depend'
+    ORDER BY d.refobjsubid;
+}
+expect {
+    zz_identity_depend_a_seq|1|i
+    zz_identity_depend_c_seq|3|i
+}
+
+test pg-depend-identity-sequence-survives-add-column {
+    CREATE TABLE zz_identity_depend_alter (a int GENERATED ALWAYS AS IDENTITY, b text);
+    ALTER TABLE zz_identity_depend_alter ADD COLUMN f int;
+    SELECT s.relname, d.refobjsubid, d.deptype
+    FROM pg_depend d
+    JOIN pg_class s ON s.oid = d.objid
+    JOIN pg_class t ON t.oid = d.refobjid
+    WHERE d.deptype = 'i' AND s.relkind = 'S' AND t.relname = 'zz_identity_depend_alter'
+    ORDER BY d.refobjsubid;
+}
+expect {
+    zz_identity_depend_alter_a_seq|1|i
+}
+
+test pg-depend-serial-and-owned-sequences-depend-automatically {
+    CREATE TABLE zz_serial_depend (a serial, b text, c bigserial);
+    CREATE SEQUENCE zz_serial_depend_owned_seq;
+    ALTER SEQUENCE zz_serial_depend_owned_seq OWNED BY zz_serial_depend.b;
+    SELECT s.relname, d.refobjsubid, d.deptype
+    FROM pg_depend d
+    JOIN pg_class s ON s.oid = d.objid
+    JOIN pg_class t ON t.oid = d.refobjid
+    WHERE d.deptype IN ('a', 'i') AND s.relkind = 'S' AND t.relname = 'zz_serial_depend'
+    ORDER BY d.refobjsubid;
+}
+expect {
+    zz_serial_depend_a_seq|1|a
+    zz_serial_depend_owned_seq|2|a
+    zz_serial_depend_c_seq|3|a
+}
+
+test pg-description-rejects-ddl {
+    DROP TABLE pg_description;
+}
+@sqlstate 42501
+expect error {
+    permission denied: "pg_description" is a system catalog
+}
+
+test pg-depend-has-the-relations-that-a-view-reads {
+    CREATE TABLE dep_base (a int);
+    CREATE TABLE dep_other (a int);
+    CREATE TABLE dep_unread (a int);
+    CREATE VIEW dep_inner AS SELECT a FROM dep_base;
+    CREATE VIEW dep_outer AS
+        SELECT a FROM dep_inner WHERE EXISTS (SELECT 1 FROM dep_other);
+    SELECT DISTINCT t.relname, d.deptype
+    FROM pg_depend d JOIN pg_class t ON t.oid = d.refobjid
+    WHERE d.classid = 2618 AND d.refclassid = 1259
+      AND t.relname IN ('dep_base', 'dep_other', 'dep_unread')
+    ORDER BY 1;
+}
+expect {
+    dep_base|n
+    dep_other|n
 }

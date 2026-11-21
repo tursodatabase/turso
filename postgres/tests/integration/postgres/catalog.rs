@@ -1,4 +1,5 @@
 use crate::common::TempDatabase;
+use std::sync::Arc;
 use turso_core::Value;
 
 #[turso_macros::test(mvcc)]
@@ -265,4 +266,162 @@ fn test_alter_table_preserves_catalog_names_after_reopen(db: TempDatabase) {
             vec![Value::build_text("public"), Value::build_text("Mixed")],
         ]
     );
+}
+
+/// Opening a database and reading its schema again go through the same
+/// steps, so the catalogs must report the same objects after both.
+#[test]
+fn catalogs_report_the_same_objects_after_open_and_after_the_schema_is_read_again() {
+    let db = TempDatabase::builder().build();
+    {
+        let conn = db.connect_postgres();
+        conn.execute("CREATE SCHEMA app").unwrap();
+        conn.execute("CREATE SEQUENCE app.ids START WITH 5")
+            .unwrap();
+        conn.execute("CREATE TYPE mood AS ENUM ('happy', 'sad')")
+            .unwrap();
+        conn.execute("CREATE ROLE alice").unwrap();
+        conn.execute("CREATE TABLE app.docs (id int PRIMARY KEY, feeling mood)")
+            .unwrap();
+        conn.execute("CREATE INDEX docs_feeling ON app.docs (feeling)")
+            .unwrap();
+        conn.execute("ALTER TABLE app.docs OWNER TO alice").unwrap();
+    }
+    let db = db.reopen();
+    let conn = db.connect_postgres();
+
+    let after_open = catalog_rows(&conn);
+    conn.inner().force_reparse_schema_without_publish().unwrap();
+    let after_reading_again = catalog_rows(&conn);
+
+    for name in ["app", "ids", "mood", "alice", "docs", "docs_feeling"] {
+        assert!(
+            after_open
+                .iter()
+                .any(|row| row.contains(&Value::build_text(name))),
+            "{name} is missing from the catalogs: {after_open:?}"
+        );
+    }
+    assert_eq!(after_open, after_reading_again);
+}
+
+/// What the catalogs report about schemas, relations, sequences, types and
+/// roles.
+fn catalog_rows(conn: &turso_pg::Connection) -> Vec<Vec<Value>> {
+    let mut rows = Vec::new();
+    for sql in [
+        "SELECT oid, nspname, nspowner FROM pg_namespace ORDER BY oid",
+        "SELECT oid, relname, relnamespace, relkind, relowner FROM pg_class ORDER BY oid",
+        "SELECT schemaname, sequencename, start_value, increment_by FROM pg_sequences \
+         ORDER BY schemaname, sequencename",
+        "SELECT oid, typname, typnamespace, typtype FROM pg_type ORDER BY oid",
+        "SELECT oid, rolname, rolsuper FROM pg_roles ORDER BY oid",
+        "SELECT attrelid, attname, atttypid FROM pg_attribute ORDER BY attrelid, attnum",
+    ] {
+        let mut stmt = conn.query(sql).unwrap().unwrap();
+        rows.extend(stmt.run_collect_rows().unwrap());
+    }
+    rows
+}
+
+/// How the database of
+/// [`a_schema_a_role_and_a_table_are_present_after_open`] is stored when it
+/// is opened again.
+#[derive(Debug, Clone, Copy)]
+enum StoredAs {
+    /// Without MVCC.
+    Wal,
+    /// With MVCC, and the rows are only in the logical log. Opening replays
+    /// them, and the tables that the open reads have no pages yet.
+    MvccLogicalLog,
+    /// With MVCC, and a checkpoint wrote the rows to the database file.
+    MvccCheckpointed,
+}
+
+/// Opening reads the names of the schemas and then the dialect's own tables
+/// with statements. The second read must see the schemas of the first.
+#[test]
+fn a_schema_a_role_and_a_table_are_present_after_open() {
+    for stored_as in [
+        StoredAs::Wal,
+        StoredAs::MvccLogicalLog,
+        StoredAs::MvccCheckpointed,
+    ] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("main.db");
+        let open = || {
+            let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+            let file = io
+                .open_file(
+                    path.to_str().unwrap(),
+                    turso_core::OpenFlags::default(),
+                    true,
+                )
+                .unwrap();
+            let options = turso_core::OpenOptions::new(Arc::new(turso_pg::PostgresDialect))
+                .storage(Arc::new(turso_core::storage::database::DatabaseFile::new(
+                    file,
+                )))
+                .db_opts(
+                    turso_core::DatabaseOpts::new().with_mvcc(!matches!(stored_as, StoredAs::Wal)),
+                );
+            let mut state = turso_pg::OpenDatabaseState::default();
+            let db = loop {
+                match turso_pg::open_database_async(
+                    &mut state,
+                    io.clone(),
+                    path.to_str().unwrap(),
+                    &options,
+                    turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser),
+                )
+                .unwrap()
+                {
+                    turso_core::IOResult::Done(db) => break db,
+                    turso_core::IOResult::IO(completions) => {
+                        completions.wait(io.as_ref()).unwrap();
+                    }
+                }
+            };
+            turso_pg::Connection::connect(&db).unwrap()
+        };
+        {
+            let conn = open();
+            conn.execute("CREATE SCHEMA app").unwrap();
+            conn.execute("CREATE ROLE alice").unwrap();
+            conn.execute("CREATE TABLE app.docs (id int PRIMARY KEY)")
+                .unwrap();
+            conn.execute("ALTER TABLE app.docs OWNER TO alice").unwrap();
+            if matches!(stored_as, StoredAs::MvccCheckpointed) {
+                conn.inner()
+                    .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .unwrap();
+            }
+        }
+        let log_size = std::fs::metadata(path.with_extension("db-log")).map(|log| log.len());
+        match stored_as {
+            StoredAs::Wal => assert!(log_size.is_err(), "{stored_as:?}"),
+            StoredAs::MvccLogicalLog => assert!(log_size.unwrap() > 0, "{stored_as:?}"),
+            StoredAs::MvccCheckpointed => assert_eq!(log_size.unwrap(), 0, "{stored_as:?}"),
+        }
+
+        let conn = open();
+
+        let mut stmt = conn
+            .query(
+                "SELECT schemaname, tablename, tableowner FROM pg_tables WHERE schemaname = 'app'",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![
+                Value::build_text("app"),
+                Value::build_text("docs"),
+                Value::build_text("alice"),
+            ]],
+            "{stored_as:?}"
+        );
+        conn.execute("SET ROLE alice").unwrap();
+        conn.execute("INSERT INTO app.docs VALUES (1)").unwrap();
+    }
 }

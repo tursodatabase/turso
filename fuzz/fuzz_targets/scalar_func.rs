@@ -484,7 +484,8 @@ fn execute_scalar_func(call: ScalarFuncCall) {
         ScalarFuncCall::JsonType(val, path) => {
             let v: CoreValue = val.into();
             let path_v: Option<CoreValue> = path.map(|p| p.into());
-            let _ = json_type(&v, path_v.as_ref());
+            let cache = JsonCacheCell::new();
+            let _ = json_type(&v, path_v.as_ref(), &cache);
         }
         ScalarFuncCall::JsonValid(val) => {
             let v: CoreValue = val.into();

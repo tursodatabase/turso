@@ -209,6 +209,14 @@ pub enum Stmt {
         /// role options
         options: RoleOptions,
     },
+    /// `DROP ROLE`. Not SQLite syntax; a frontend with roles translates its
+    /// own DROP ROLE into this.
+    DropRole {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// The roles to drop, as the statement names them.
+        roles: Vec<Grantee>,
+    },
     /// `GRANT`: privileges on relations for roles. Not SQLite syntax; a
     /// frontend with roles translates its own GRANT into this.
     Grant(Grant),
@@ -304,6 +312,9 @@ pub enum Stmt {
         body: InsertBody,
         /// `RETURNING`
         returning: Vec<ResultColumn>,
+        /// PostgreSQL `OVERRIDING SYSTEM VALUE`: the INSERT may write values to
+        /// `GENERATED ALWAYS AS IDENTITY` columns. Not printed in SQL.
+        overriding_system_value: bool,
     },
     /// `PRAGMA`: pragma name, body
     Pragma {
@@ -1102,7 +1113,7 @@ pub enum OneSelect {
     /// `SELECT`
     Select {
         /// `DISTINCT`
-        distinctness: Option<Distinctness>,
+        distinctness: Option<SelectDistinctness>,
         /// columns
         columns: Vec<ResultColumn>,
         /// `FROM` clause
@@ -1129,7 +1140,7 @@ pub struct FromClause {
     pub joins: Vec<JoinedSelectTable>,
 }
 
-/// `SELECT` distinctness
+/// Distinctness of the arguments of a function call
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Distinctness {
@@ -1137,6 +1148,36 @@ pub enum Distinctness {
     Distinct,
     /// `ALL`
     All,
+}
+
+/// `SELECT` distinctness
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SelectDistinctness {
+    /// `DISTINCT`
+    Distinct,
+    /// `ALL`
+    All,
+    /// `DISTINCT ON (exprs)`: the first row of each group of rows where the expressions are equal
+    DistinctOn(Vec<Box<Expr>>),
+}
+
+impl SelectDistinctness {
+    /// The expressions of `DISTINCT ON`; none for `DISTINCT` and `ALL`.
+    pub fn exprs(&self) -> &[Box<Expr>] {
+        match self {
+            Self::DistinctOn(exprs) => exprs,
+            Self::Distinct | Self::All => &[],
+        }
+    }
+
+    /// The expressions of `DISTINCT ON`; none for `DISTINCT` and `ALL`.
+    pub fn exprs_mut(&mut self) -> &mut [Box<Expr>] {
+        match self {
+            Self::DistinctOn(exprs) => exprs,
+            Self::Distinct | Self::All => &mut [],
+        }
+    }
 }
 
 /// `SELECT` or `RETURNING` result column
@@ -1541,6 +1582,30 @@ pub enum RelationKind {
     Index,
 }
 
+impl RelationKind {
+    /// The kind in words, such as `table` or `materialized view`.
+    pub fn name(self) -> &'static str {
+        match self {
+            RelationKind::Table => "table",
+            RelationKind::View => "view",
+            RelationKind::MaterializedView => "materialized view",
+            RelationKind::Sequence => "sequence",
+            RelationKind::Index => "index",
+        }
+    }
+
+    /// The kind as an error message names it, such as `a table` or `an index`.
+    pub fn with_article(self) -> &'static str {
+        match self {
+            RelationKind::Table => "a table",
+            RelationKind::View => "a view",
+            RelationKind::MaterializedView => "a materialized view",
+            RelationKind::Sequence => "a sequence",
+            RelationKind::Index => "an index",
+        }
+    }
+}
+
 /// A role named in DDL, like PostgreSQL's RoleSpec.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1574,20 +1639,33 @@ impl Default for RoleOptions {
     }
 }
 
-/// `GRANT privileges ON relations TO grantees`, or `REVOKE privileges ON
-/// relations FROM grantees` when `revoke` is set. The relations are named
-/// one by one: a frontend expands a form like `ALL TABLES IN SCHEMA` before
-/// it builds this.
+/// `GRANT objects TO grantees`, or `REVOKE objects FROM grantees` when
+/// `revoke` is set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Grant {
     pub revoke: bool,
-    pub privileges: Vec<Privilege>,
-    /// Whether the statement grants on `SEQUENCE`s rather than on tables,
-    /// which names any relation.
-    pub on_sequences: bool,
-    pub relations: Vec<QualifiedName>,
+    pub objects: GrantObjects,
     pub grantees: Vec<Grantee>,
+}
+
+/// What a `GRANT` gives or a `REVOKE` takes away.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum GrantObjects {
+    /// `privileges ON relations`. The relations are named one by one: a
+    /// frontend expands a form like `ALL TABLES IN SCHEMA` before it builds
+    /// this.
+    Relations {
+        privileges: Vec<Privilege>,
+        /// Whether the statement grants on `SEQUENCE`s rather than on
+        /// tables, which names any relation.
+        on_sequences: bool,
+        relations: Vec<QualifiedName>,
+    },
+    /// `roles`: each grantee becomes a member of each of the roles, which
+    /// are named.
+    Roles(Vec<String>),
 }
 
 /// A privilege on a relation.
@@ -1635,6 +1713,11 @@ pub struct CreatePolicy {
     pub using_expr: Option<Box<Expr>>,
     /// `WITH CHECK`: which new rows the policy lets the roles write
     pub check_expr: Option<Box<Expr>>,
+    /// `using_expr` as the statement wrote it, in the SQL of the frontend
+    /// that parsed it, for catalogs that show the condition in that SQL
+    pub using_sql: Option<String>,
+    /// `check_expr` as the statement wrote it, like `using_sql`
+    pub check_sql: Option<String>,
 }
 
 /// The command a policy applies to.
@@ -1744,6 +1827,16 @@ pub struct ColumnDefinition {
     pub constraints: Vec<NamedColumnConstraint>,
 }
 
+impl ColumnDefinition {
+    /// The kind of the column's `GENERATED ... AS IDENTITY` constraint, if it has one.
+    pub fn identity_kind(&self) -> Option<IdentityKind> {
+        self.constraints.iter().find_map(|c| match c.constraint {
+            ColumnConstraint::Identity(kind) => Some(kind),
+            _ => None,
+        })
+    }
+}
+
 /// Named column constraint
 // https://sqlite.org/syntax/column-constraint.html
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1818,6 +1911,20 @@ pub enum ColumnConstraint {
         /// `STORED` / `VIRTUAL`
         typ: Option<GeneratedColumnType>,
     },
+    /// `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` — emitted by the PostgreSQL
+    /// translator alongside `Default(nextval(...))` and `NotNull` constraints.
+    /// Not printed in SQL; stored table SQL lists these columns in a comment.
+    Identity(IdentityKind),
+}
+
+/// Whether an identity column accepts values other than DEFAULT.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum IdentityKind {
+    /// `GENERATED ALWAYS AS IDENTITY`: only DEFAULT is accepted.
+    Always,
+    /// `GENERATED BY DEFAULT AS IDENTITY`: any value is accepted.
+    ByDefault,
 }
 
 /// Generated column type
@@ -2149,6 +2256,8 @@ pub enum PragmaName {
     FreelistCount,
     /// Enable or disable foreign key constraint enforcement
     ForeignKeys,
+    /// Reports rows whose foreign key points at a missing parent row
+    ForeignKeyCheck,
     /// Returns information about foreign keys declared by a table
     ForeignKeyList,
     /// Deprecated: control whether column names include table name prefix
