@@ -1620,6 +1620,19 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     });
                     turso_assert_eq!(join_order.len(), subset_size);
 
+                    // Without an order target, the code below drops a plan
+                    // that costs more than the plan kept for this subset and
+                    // this last table. With that cost as the bound,
+                    // join_lhs_and_rhs returns None for such a plan before
+                    // it builds the plan.
+                    let rel_cost_upper_bound = match (
+                        planning_context.maybe_order_target,
+                        best_for_mask_by_last.get(&rhs_idx),
+                    ) {
+                        (None, Some(existing)) if existing.cost < cost_upper_bound => existing.cost,
+                        _ => cost_upper_bound,
+                    };
+
                     // Calculate the best way to join LHS with RHS.
                     let arena_len = access_methods_arena.len();
                     let rel = join_lhs_and_rhs(
@@ -1632,7 +1645,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         &join_order,
                         planning_context,
                         access_methods_arena,
-                        cost_upper_bound,
+                        rel_cost_upper_bound,
                         joined_tables,
                         where_clause,
                         &multi_index_work,
