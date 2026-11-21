@@ -606,3 +606,41 @@ fn test_truncate_checkpoint_busy_while_writer_holds_lock(tmp_db: TempDatabase) -
     maybe_setup_tracing();
     assert_checkpoint_busy_while_writer_holds_lock(&tmp_db, "TRUNCATE")
 }
+
+/// A read-only connection on a database with an empty WAL has nothing to truncate:
+/// TRUNCATE returns 0|0|0 instead of failing on the read-only WAL file (SQLite: 0|0|0).
+#[test]
+fn test_truncate_checkpoint_on_readonly_connection_with_clean_wal() -> Result<()> {
+    maybe_setup_tracing();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("ro_clean_truncate.db");
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("PRAGMA wal_autocheckpoint=0;")?;
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY);")?;
+        conn.execute("INSERT INTO t VALUES (1);")?;
+        assert_that!(execute_and_get_ints(
+            &conn,
+            "PRAGMA wal_checkpoint(TRUNCATE);"
+        )?)
+        .is_equal_to(vec![0, 0, 0]);
+        conn.close()?;
+    }
+    let wal_path = dir.path().join("ro_clean_truncate.db-wal");
+    assert_eq!(
+        std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0),
+        0
+    );
+
+    let db = TempDatabase::new_with_existent_with_flags(
+        &path,
+        turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
+    );
+    let conn = db.connect_limbo();
+    assert_that!(execute_and_get_ints(&conn, "SELECT count(*) FROM t")?).is_equal_to(vec![1]);
+    let sql = "PRAGMA wal_checkpoint(TRUNCATE);";
+    assert_that!(execute_and_get_ints(&conn, sql)?).is_equal_to(vec![0, 0, 0]);
+    assert_that!(execute_and_get_ints(&conn, sql)?).is_equal_to(vec![0, 0, 0]);
+    Ok(())
+}

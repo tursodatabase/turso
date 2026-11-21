@@ -5412,6 +5412,15 @@ impl WalFile {
     ) -> IOResultOr<()> {
         let file = self.coordination.prepare_truncate()?;
 
+        // An already-empty log has nothing to truncate or sync. Skipping keeps TRUNCATE
+        // a no-op on a read-only connection, as in SQLite.
+        if !result.wal_truncate_sent && matches!(file.size(), Ok(0)) {
+            result.wal_truncate_sent = true;
+            result.wal_sync_sent = true;
+            result.wal_max_frame = 0;
+            result.wal_total_backfilled = 0;
+            return Ok(IOResult::Done(()));
+        }
         if !result.wal_truncate_sent {
             let c = Completion::new_trunc({
                 move |res| {
