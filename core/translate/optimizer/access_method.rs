@@ -1134,8 +1134,10 @@ fn find_best_access_method_for_btree<'a>(
     // is specified — the user explicitly requested a specific index or no index.
     if rhs_table.indexed.is_none() && rhs_table.btree().is_some_and(|b| b.has_rowid) {
         // Without an IN constraint, consider_in_seek_access_method returns
-        // None. The check is here because the join search gets here for each
-        // join order that it tries.
+        // None, because choose_best_in_seek_candidate does the same check for
+        // all of its callers. The check is also here because the join search
+        // gets here for each join order that it tries, and a call of the
+        // function for each join order costs more than the check.
         let in_seek_method = if rhs_constraints.has_in_seek_constraint() {
             consider_in_seek_access_method(
                 rhs_table,
@@ -1183,7 +1185,9 @@ fn find_best_access_method_for_btree<'a>(
 
         // The join search gets here for each join order that it tries. After
         // the first call for the table, the work of the table knows if an OR
-        // term can still give a union scan.
+        // term can still give a union scan. consider_multi_index_union also
+        // skips each OR term that cannot give one, but a call of the function
+        // for each join order costs more than this check.
         let union_scan_is_possible =
             multi_index_work.is_none_or(MultiIndexTableWork::may_give_union_scan);
         let multi_idx_method = if union_scan_is_possible {
