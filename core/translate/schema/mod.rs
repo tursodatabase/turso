@@ -952,7 +952,10 @@ fn derive_ctas_schema(
     // Collect names first, then deduplicate using SQLite's :N suffix convention.
     let mut names: Vec<String> = result_columns
         .iter()
-        .map(|col| col.name_or_expr(table_refs))
+        .map(|col| {
+            col.output_column_name(table_refs)
+                .map_or_else(|| col.expr.to_string(), String::from)
+        })
         .collect();
 
     let mut seen: HashMap<String, usize> = HashMap::default();

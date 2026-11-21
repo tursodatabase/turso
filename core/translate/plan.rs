@@ -41,6 +41,7 @@ use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
 use super::expr::expr_type::{compound_column_type, type_of, type_ordering, ExprType};
+use super::expr::unwrap_parens;
 
 /// Infer the affinity of a subquery result column from its expression.
 ///
@@ -126,7 +127,47 @@ impl ResultSetColumn {
         if let Some(alias) = &self.alias {
             return Some(alias);
         }
-        match &self.expr {
+        // SQLite's parser keeps no node for parentheses, so `(t.x)` is named x.
+        self.expr_name(unwrap_parens(&self.expr).unwrap_or(&self.expr), tables)
+    }
+
+    /// The name of the column this result column gives a FROM subquery, a
+    /// CTE or CREATE TABLE AS. SQLite's sqlite3ColumnsFromExprList() names
+    /// it: unlike `name`, it also looks through COLLATE, so
+    /// `t.x COLLATE nocase` is named x, and it names a trigger's NEW.x or
+    /// OLD.x x. The result set itself is named by `name`, as SQLite's
+    /// sqlite3GenerateColumnNames() names it `t.x COLLATE nocase`, and ORDER
+    /// BY terms do not match the name x of NEW.x.
+    pub fn output_column_name<'a>(&'a self, tables: &'a TableReferences) -> Option<&'a str> {
+        if let Some(alias) = &self.alias {
+            return Some(alias);
+        }
+        let mut expr = &self.expr;
+        loop {
+            match expr {
+                ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => expr = &exprs[0],
+                ast::Expr::Collate(inner, _) => expr = inner,
+                _ => break,
+            }
+        }
+        match expr {
+            ast::Expr::Variable(ast::Variable {
+                column_name: Some(name),
+                ..
+            }) => Some(name),
+            _ => self.expr_name(expr, tables),
+        }
+    }
+
+    /// The name of `expr`, which is this column's expression or a part of it
+    /// that names the column: the name of a column reference, else
+    /// `implicit_column_name`.
+    fn expr_name<'a>(
+        &'a self,
+        expr: &'a ast::Expr,
+        tables: &'a TableReferences,
+    ) -> Option<&'a str> {
+        match expr {
             ast::Expr::Column { table, column, .. } => {
                 if let Some(joined_table_ref) = tables.find_joined_table_by_internal_id(*table) {
                     if let Operation::IndexMethodQuery(module) = &joined_table_ref.op {
@@ -162,13 +203,6 @@ impl ResultSetColumn {
             }
             _ => self.implicit_column_name.as_deref(),
         }
-    }
-
-    /// Returns the column name, falling back to the expression's display form.
-    pub fn name_or_expr(&self, tables: &TableReferences) -> String {
-        self.name(tables)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| self.expr.to_string())
     }
 
     /// Returns the canonical short type name for this column's affinity,
@@ -3403,7 +3437,11 @@ pub(super) fn query_output_columns(
         .map(|(column_index, result_column)| {
             let name = explicit_columns
                 .and_then(|names| names.get(column_index).cloned())
-                .or_else(|| result_column.name(table_references).map(String::from));
+                .or_else(|| {
+                    result_column
+                        .output_column_name(table_references)
+                        .map(String::from)
+                });
             let affinity = compound_arms
                 .as_ref()
                 .map(|arms| compound_column_affinity(arms, column_index))

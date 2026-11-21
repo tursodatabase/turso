@@ -1,0 +1,160 @@
+@database :memory:
+
+# In a trigger body, a FROM subquery that selects NEW.x or OLD.x names its
+# column x, as a subquery that selects t.x does.
+
+setup schema {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x);
+    CREATE TABLE u(y);
+}
+
+@setup schema
+test trigger-insert-new-column-subquery-name {
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+      INSERT INTO u SELECT x FROM (SELECT new.x);
+    END;
+    INSERT INTO t VALUES(1, 7);
+    SELECT * FROM u;
+}
+expect {
+    7
+}
+
+@setup schema
+test trigger-delete-old-column-subquery-name {
+    INSERT INTO t VALUES(1, 3);
+    CREATE TRIGGER tr AFTER DELETE ON t BEGIN
+      INSERT INTO u SELECT x FROM (SELECT old.x);
+    END;
+    DELETE FROM t;
+    SELECT * FROM u;
+}
+expect {
+    3
+}
+
+@setup schema
+test trigger-update-new-and-old-column-subquery-name {
+    INSERT INTO t VALUES(1, 3);
+    CREATE TRIGGER tr AFTER UPDATE ON t BEGIN
+      INSERT INTO u SELECT x FROM (SELECT new.x);
+      INSERT INTO u SELECT x FROM (SELECT old.x);
+    END;
+    UPDATE t SET x = 5;
+    SELECT * FROM u;
+}
+expect {
+    5
+    3
+}
+
+@setup schema
+test trigger-new-column-qualified-subquery-name {
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+      INSERT INTO u SELECT s.x FROM (SELECT new.x) AS s;
+    END;
+    INSERT INTO t VALUES(1, 7);
+    SELECT * FROM u;
+}
+expect {
+    7
+}
+
+# The name is the column name as the reference writes it: new.rowid names
+# the column rowid, and new.id names it id.
+@setup schema
+test trigger-new-rowid-subquery-name {
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+      INSERT INTO u SELECT rowid FROM (SELECT new.rowid);
+      INSERT INTO u SELECT id FROM (SELECT new.id);
+      INSERT INTO u SELECT x FROM (SELECT new."X");
+    END;
+    INSERT INTO t VALUES(4, 7);
+    SELECT * FROM u;
+}
+expect {
+    4
+    4
+    7
+}
+
+@setup schema
+test trigger-new-column-cte-and-compound-name {
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+      INSERT INTO u WITH c AS (SELECT new.x) SELECT x FROM c;
+      INSERT INTO u SELECT x FROM (SELECT new.x UNION ALL SELECT 8);
+      INSERT INTO u SELECT x FROM (SELECT new.x) JOIN (SELECT new.x) USING (x);
+    END;
+    INSERT INTO t VALUES(1, 7);
+    SELECT * FROM u;
+}
+expect {
+    7
+    7
+    8
+    7
+}
+
+@setup schema
+test trigger-new-column-alias-names-subquery-column {
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+      INSERT INTO u SELECT x FROM (SELECT new.x AS z);
+    END;
+    INSERT INTO t VALUES(1, 7);
+}
+expect error {
+    no such column: x
+}
+
+# An ORDER BY term of a compound SELECT does not match new.x by the name x.
+@setup schema
+test trigger-compound-order-by-does-not-match-new-column-name {
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+      INSERT INTO u SELECT new.x UNION SELECT 8 ORDER BY x;
+    END;
+    INSERT INTO t VALUES(1, 7);
+}
+expect error {
+    1st ORDER BY term does not match any column in the result set
+}
+
+# An ORDER BY term of a compound SELECT matches the same NEW column however
+# the reference spells it.
+@setup schema
+test trigger-compound-order-by-matches-new-column-spellings {
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+      INSERT INTO u SELECT new.x UNION SELECT 8 ORDER BY NEW.X DESC;
+      INSERT INTO u SELECT new.rowid UNION SELECT 8 ORDER BY new.oid DESC;
+      INSERT INTO u SELECT new.id UNION SELECT 8 ORDER BY new.rowid;
+    END;
+    INSERT INTO t VALUES(4, 7);
+    SELECT * FROM u;
+}
+expect {
+    8
+    7
+    8
+    4
+    4
+    8
+}
+
+# Parentheses and COLLATE around NEW.x or OLD.x keep the name x.
+@setup schema
+test trigger-new-old-column-in-parentheses-or-collate-subquery-name {
+    INSERT INTO t VALUES(1, 3);
+    CREATE TRIGGER tr AFTER UPDATE ON t BEGIN
+      INSERT INTO u SELECT x FROM (SELECT (new.x));
+      INSERT INTO u SELECT x FROM (SELECT ((old.x)));
+      INSERT INTO u SELECT x FROM (SELECT new.x COLLATE nocase);
+      INSERT INTO u SELECT s.x FROM (SELECT (old.x COLLATE nocase)) AS s;
+    END;
+    UPDATE t SET x = 5;
+    SELECT * FROM u;
+}
+expect {
+    5
+    3
+    5
+    3
+}
