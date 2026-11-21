@@ -1223,6 +1223,11 @@ pub fn allow_user_dml(table_name: &str) -> bool {
 /// name without forcing a schema reparse.
 #[derive(Debug, Clone)]
 pub struct Sequence {
+    /// Unique in the process. A dropped sequence and a new sequence of the
+    /// same name have different ids, and a rollback that brings a dropped
+    /// sequence back brings back its id. A connection keeps its `currval`
+    /// by this id, as PostgreSQL keeps it by the sequence's oid.
+    pub id: u64,
     pub name: String,
     pub start_value: i64,
     pub increment_by: i64,
@@ -1267,7 +1272,13 @@ impl Sequence {
                 "START value ({start_val}) cannot be greater than MAXVALUE ({max_val})"
             )));
         }
+        // std, not crate::sync: a shuttle-tracked static that outlives a
+        // shuttle test execution corrupts shuttle's vector clocks (see the
+        // database incarnation counter in `Database`).
+        static NEXT_SEQUENCE_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
         Ok(Self {
+            id: NEXT_SEQUENCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             name,
             start_value: start_val,
             increment_by,
@@ -1275,6 +1286,25 @@ impl Sequence {
             max_value: max_val,
             cycle,
         })
+    }
+
+    /// Whether `other` has the same name and options, ignoring the id.
+    fn has_definition_of(&self, other: &Sequence) -> bool {
+        let Sequence {
+            id: _,
+            name,
+            start_value,
+            increment_by,
+            min_value,
+            max_value,
+            cycle,
+        } = self;
+        *name == other.name
+            && *start_value == other.start_value
+            && *increment_by == other.increment_by
+            && *min_value == other.min_value
+            && *max_value == other.max_value
+            && *cycle == other.cycle
     }
 }
 
@@ -2096,6 +2126,24 @@ impl Schema {
         self.namespace_mut(namespace)
             .sequences
             .insert(name, Arc::new(sequence));
+    }
+
+    /// Replaces each sequence that has the same namespace, name and
+    /// definition as a sequence in `previous` with that one, so it keeps its
+    /// [`Sequence::id`].
+    pub(crate) fn keep_sequence_ids(&mut self, previous: &SequencesByNamespace) {
+        for (namespace, sequences) in previous {
+            let Some(objects) = self.namespaces.get_mut(namespace) else {
+                continue;
+            };
+            for (name, previous) in sequences {
+                if let Some(sequence) = objects.sequences.get_mut(name) {
+                    if sequence.has_definition_of(previous) {
+                        *sequence = previous.clone();
+                    }
+                }
+            }
+        }
     }
 
     /// Puts `sequence`, read from the backing table of the sequence stored

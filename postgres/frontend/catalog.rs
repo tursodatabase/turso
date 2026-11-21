@@ -2798,7 +2798,7 @@ impl SnapshotRows for PgSequencesTable {
                 // currval is per-connection; expose this connection's last
                 // value via the connection currval map, falling back to start.
                 let last_val = conn
-                    .get_sequence_currval(MAIN_DB_ID, &mangle_name(namespace, &seq_name))
+                    .get_sequence_currval(MAIN_DB_ID, seq)
                     .unwrap_or(seq.start_value);
                 let owner_name = relation_owner_name(conn, &schema, namespace, &seq_name);
                 let may_read = conn.may_read_sequence(

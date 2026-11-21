@@ -200,6 +200,36 @@ expect error {
     currval of sequence "s" is not yet defined in this session
 }
 
+test currval-after-rolled-back-drop-and-recreate-of-an-attached-sequence {
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE SEQUENCE aux.s START 42;
+    SELECT nextval('aux.s');
+    BEGIN;
+    DROP SEQUENCE aux.s;
+    CREATE SEQUENCE aux.s;
+    SELECT nextval('aux.s');
+    ROLLBACK;
+    SELECT currval('aux.s');
+}
+expect {
+    42
+    1
+    42
+}
+
+test currval-of-a-recreated-attached-sequence-after-a-rolled-back-create {
+    ATTACH DATABASE ':memory:' AS aux;
+    BEGIN;
+    CREATE SEQUENCE aux.s;
+    SELECT nextval('aux.s');
+    ROLLBACK;
+    CREATE SEQUENCE aux.s;
+    SELECT currval('aux.s');
+}
+expect error {
+    currval of sequence "s" is not yet defined in this session
+}
+
 test drop-sequence-refuses-an-attached-sequence-a-main-table-uses {
     ATTACH DATABASE ':memory:' AS aux;
     CREATE SEQUENCE aux.du_seq;
