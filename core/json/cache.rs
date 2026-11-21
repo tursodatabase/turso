@@ -673,7 +673,7 @@ mod tests {
         }
         // An error is returned each time, and is not cached.
         for _ in 0..3 {
-            assert!(cell.path("$[", true).is_err());
+            assert!(cell.path("[0]", true).is_err());
         }
     }
 

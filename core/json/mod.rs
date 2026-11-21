@@ -443,7 +443,7 @@ where
         if let Some(path) = json_edit_path(json_cache, &first, &second)? {
             let value = convert_dbtype_to_jsonb(second, Conv::SetValue)?;
             let mut op = SetOperation::new(value);
-            let _ = json.operate_on_path(&path, &mut op);
+            json.operate_on_path(&path, &mut op)?;
         }
     }
 
@@ -485,7 +485,7 @@ where
         if let Some(path) = json_edit_path(json_cache, &first, &second)? {
             let value = convert_dbtype_to_jsonb(second, Conv::SetValue)?;
             let mut op = SetOperation::new(value);
-            let _ = json.operate_on_path(&path, &mut op);
+            json.operate_on_path(&path, &mut op)?;
         }
     }
 
@@ -565,9 +565,9 @@ fn read_path_element<R>(
         let Some(path) = cached_json_path(json_cache, path, strict_path)? else {
             return Ok(None);
         };
-        match find_path_element(json.as_bytes(), &path) {
-            Ok(Some(target)) => read(FoundElement::InDocument(json, target)).map(Some),
-            _ => Ok(None),
+        match find_path_element(json.as_bytes(), &path)? {
+            Some(target) => read(FoundElement::InDocument(json, target)).map(Some),
+            None => Ok(None),
         }
     })
 }
@@ -747,10 +747,7 @@ where
                 InBlob::Malformed => return Ok(None),
             }
         } else {
-            match find_path_element(json, &path) {
-                Ok(Some(target)) => Some(&json[target.start..target.end]),
-                _ => None,
-            }
+            find_path_element(json, &path)?.map(|target| &json[target.start..target.end])
         };
         match element {
             Some(element) => result.append_to_array_unsafe(element),
@@ -992,7 +989,7 @@ pub fn json_type(
         }
         let json = convert_dbtype_to_jsonb(value, Conv::Strict)?;
 
-        if let Ok(Some(target)) = find_path_element(json.as_bytes(), &path) {
+        if let Some(target) = find_path_element(json.as_bytes(), &path)? {
             let element_type = json.element_type_at(target.start)?;
             Ok(Value::Text(Text::new(String::from(element_type))))
         } else {

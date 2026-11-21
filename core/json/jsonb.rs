@@ -8,7 +8,7 @@ use crate::types::{validate_utf8, value_blob_from_slice, ValueBlob, ValueRef};
 use crate::{bail_parse_error, LimboError, Result};
 use std::{borrow::Cow, fmt::Write};
 
-use super::path::{JsonPath, PathElement};
+use super::path::{bad_path_error, JsonPath, MalformedStep, MalformedStepKind, PathElement};
 
 const SIZE_MARKER_8BIT: u8 = 12;
 const SIZE_MARKER_16BIT: u8 = 13;
@@ -2825,16 +2825,27 @@ impl Jsonb {
         array_len(&self.data)
     }
 
+    /// Walks `path` from the root, creating the containers that `mode`
+    /// allows it to create. Returns the elements that each step found, None
+    /// when a step finds nothing, or the error of a malformed step that the
+    /// walk reaches.
     pub fn navigate_path(
         &mut self,
         path: &JsonPath,
         mode: PathOperationMode,
-    ) -> Result<TraversalStack> {
+    ) -> Result<Option<TraversalStack>> {
         let mut path_iter = path.elements.iter().peekable();
         let mut pos = 0;
         let mut stack = TraversalStack::with_capacity(path.elements.len());
 
         while let Some(current) = path_iter.next() {
+            if let PathElement::Malformed(step) = current {
+                if malformed_step_finds_nothing(&self.data[pos..], step)? {
+                    return Ok(None);
+                }
+                return Err(bad_path_error(&step.path));
+            }
+
             let next_is_array = matches!(path_iter.peek(), Some(PathElement::ArrayLocator(_)))
                 && !matches!(current, PathElement::ArrayLocator(_));
 
@@ -2869,13 +2880,25 @@ impl Jsonb {
             // A value this segment creates is either overwritten by the final
             // operation or entered by the next segment, so it is created as the
             // container the next segment expects.
-            let placeholder_type = if matches!(path_iter.peek(), Some(PathElement::ArrayLocator(_)))
-            {
+            let placeholder_type = if matches!(
+                path_iter.peek(),
+                Some(
+                    PathElement::ArrayLocator(_)
+                        | PathElement::Malformed(MalformedStep {
+                            kind: MalformedStepKind::Array { .. },
+                            ..
+                        })
+                )
+            ) {
                 ElementType::ARRAY
             } else {
                 ElementType::OBJECT
             };
-            let result = self.navigate_to_segment(segment, pos, segment_mode, placeholder_type)?;
+            // navigate_to_segment fails when the segment finds nothing.
+            let Ok(result) = self.navigate_to_segment(segment, pos, segment_mode, placeholder_type)
+            else {
+                return Ok(None);
+            };
 
             pos = match &result.array_position_info {
                 Some(ArrayPositionKind::SpecificIndex(idx)) => *idx,
@@ -2885,10 +2908,13 @@ impl Jsonb {
             stack.push(result);
         }
 
-        Ok(stack)
+        Ok(Some(stack))
     }
 
-    pub fn operate_on_path<T>(&mut self, path: &JsonPath, operation: &mut T) -> Result<()>
+    /// Applies `operation` to the element at `path`. Returns whether the path
+    /// found the element and the operation succeeded on it, or the error of
+    /// a malformed step that the walk reaches.
+    pub fn operate_on_path<T>(&mut self, path: &JsonPath, operation: &mut T) -> Result<bool>
     where
         T: PathOperation,
     {
@@ -2906,10 +2932,11 @@ impl Jsonb {
             None
         };
         let result = match self.navigate_path(path, mode) {
-            Ok(stack) => operation.execute(self, stack),
+            Ok(Some(stack)) => Ok(operation.execute(self, stack).is_ok()),
+            Ok(None) => Ok(false),
             Err(e) => Err(e),
         };
-        if result.is_err() {
+        if !matches!(result, Ok(true)) {
             if let Some(snapshot) = snapshot {
                 self.data = snapshot;
             }
@@ -3393,10 +3420,7 @@ impl Jsonb {
                     }
                 }
             }
-            _ => {
-                // BracketQuotedKey: SQLite compat — never matches,
-                // falls through to "Not found" → NULL
-            }
+            other => unreachable!("navigate_path does not make the segment {other:?}"),
         };
 
         Err(LimboError::ParseError("Not found".to_string()))
@@ -3871,7 +3895,8 @@ pub(crate) struct PathTarget {
 /// and no copy of it. Returns None when the path selects no element: a key
 /// that the object does not have, an index that the array does not have, a
 /// step into an element of a different type, an append locator (`[#]`) or a
-/// bracket-quoted key.
+/// malformed step that SQLite does not read on the element that it reaches.
+/// Returns the error of a malformed step that SQLite reads.
 ///
 /// Each header is read with checked bounds, and an element that does not fit
 /// in its container is an error. Thus a document that was not validated gives
@@ -3890,7 +3915,14 @@ pub(crate) fn find_path_element(data: &[u8], path: &JsonPath) -> Result<Option<P
                 find_object_member(data, target, key.as_bytes(), *quoted)?
             }
             PathElement::ArrayLocator(Some(index)) => find_array_element(data, target, *index)?,
-            PathElement::ArrayLocator(None) | PathElement::BracketQuotedKey(_) => None,
+            PathElement::ArrayLocator(None) => None,
+            PathElement::Malformed(step) => {
+                if malformed_step_finds_nothing(&data[target.start..target.end], step)? {
+                    None
+                } else {
+                    return Err(bad_path_error(&step.path));
+                }
+            }
         };
         let Some(found) = found else {
             return Ok(None);
@@ -3898,6 +3930,25 @@ pub(crate) fn find_path_element(data: &[u8], path: &JsonPath) -> Result<Option<P
         target = found;
     }
     Ok(Some(target))
+}
+
+/// Returns whether the malformed `step` finds nothing in the element at the
+/// start of `element`. SQLite returns "not found" for such a step before it
+/// reads the step, so the step is not an error.
+fn malformed_step_finds_nothing(element: &[u8], step: &MalformedStep) -> Result<bool> {
+    match step.kind {
+        MalformedStepKind::Array { from_end } => {
+            let (JsonbHeader(element_type, _), _) = JsonbHeader::from_slice(0, element)?;
+            if element_type != ElementType::ARRAY {
+                return Ok(true);
+            }
+            match from_end {
+                Some(n) => Ok(n as usize > array_len(element)?),
+                None => Ok(false),
+            }
+        }
+        MalformedStepKind::Other => Ok(false),
+    }
 }
 
 /// Finds the value of the first member of the object `object` whose key is
@@ -6252,8 +6303,7 @@ mod path_operations_tests {
         let result = jsonb.navigate_path(&path, PathOperationMode::ReplaceExisting);
 
         // Verify navigation succeeds
-        assert!(result.is_ok());
-        let stack = result.unwrap();
+        let stack = result.unwrap().unwrap();
         assert_eq!(stack.len(), 1);
         assert_eq!(stack[0].field_value_index, 0);
         assert_eq!(stack[0].field_key_index, JsonLocationKind::DocumentRoot);
@@ -6274,8 +6324,7 @@ mod path_operations_tests {
         let result = jsonb.navigate_path(&path, PathOperationMode::ReplaceExisting);
 
         // Verify navigation succeeds and points to the correct value
-        assert!(result.is_ok());
-        let stack = result.unwrap();
+        let stack = result.unwrap().unwrap();
         assert_eq!(stack.len(), 2);
 
         // Verify we can get the value at this position
@@ -6305,8 +6354,7 @@ mod path_operations_tests {
         let result = jsonb.navigate_path(&path, PathOperationMode::ReplaceExisting);
 
         // Verify navigation succeeds
-        assert!(result.is_ok());
-        let stack = result.unwrap();
+        let stack = result.unwrap().unwrap();
         assert_eq!(stack.len(), 3);
     }
 
@@ -6326,8 +6374,7 @@ mod path_operations_tests {
         let result = jsonb.navigate_path(&path, PathOperationMode::ReplaceExisting);
 
         // Verify navigation succeeds
-        assert!(result.is_ok());
-        let stack = result.unwrap();
+        let stack = result.unwrap().unwrap();
         assert_eq!(stack.len(), 2);
 
         // Verify we can get the value at the array position
@@ -6359,8 +6406,7 @@ mod path_operations_tests {
         let result = jsonb.navigate_path(&path, PathOperationMode::ReplaceExisting);
 
         // Verify navigation succeeds
-        assert!(result.is_ok());
-        let stack = result.unwrap();
+        let stack = result.unwrap().unwrap();
         assert_eq!(stack.len(), 2);
 
         // Verify we can get the value at the array position
@@ -6384,7 +6430,7 @@ mod path_operations_tests {
 
         // Execute the operation
         let result = jsonb.operate_on_path(&path, &mut operation);
-        assert!(result.is_ok());
+        assert!(matches!(result, Ok(true)));
 
         // Verify the value was updated
         let updated_json = jsonb.to_string().unwrap();
@@ -6408,7 +6454,7 @@ mod path_operations_tests {
 
         // Execute the operation
         let result = jsonb.operate_on_path(&path, &mut operation);
-        assert!(result.is_ok());
+        assert!(matches!(result, Ok(true)));
 
         // Verify the value was inserted
         let updated_json = jsonb.to_string().unwrap();
@@ -6431,7 +6477,7 @@ mod path_operations_tests {
 
         // Execute the operation
         let result = jsonb.operate_on_path(&path, &mut operation);
-        assert!(result.is_ok());
+        assert!(matches!(result, Ok(true)));
 
         // Verify the property was deleted
         let updated_json = jsonb.to_string().unwrap();
@@ -6456,7 +6502,7 @@ mod path_operations_tests {
 
         // Execute the operation
         let result = jsonb.operate_on_path(&path, &mut operation);
-        assert!(result.is_ok());
+        assert!(matches!(result, Ok(true)));
 
         // Verify the value was replaced
         let updated_json = jsonb.to_string().unwrap();
@@ -6498,7 +6544,7 @@ mod path_operations_tests {
 
         // Execute the operation - should fail because path doesn't exist
         let result = jsonb.operate_on_path(&path, &mut operation);
-        assert!(result.is_err());
+        assert!(matches!(result, Ok(false)));
     }
 
     #[test]
@@ -6521,7 +6567,7 @@ mod path_operations_tests {
 
         // Execute the operation
         let result = jsonb.operate_on_path(&path, &mut operation);
-        assert!(result.is_ok());
+        assert!(matches!(result, Ok(true)));
 
         // Verify the deep value was updated
         let updated_json = jsonb.to_string().unwrap();
@@ -6548,7 +6594,7 @@ mod path_operations_tests {
         ]);
 
         let result = jsonb.operate_on_path(&path, &mut operation);
-        assert!(result.is_err());
+        assert!(matches!(result, Ok(false)));
 
         // 2. InsertNew mode - should succeed for new paths
         let json_str = r#"{"name": "John"}"#;
@@ -6563,7 +6609,7 @@ mod path_operations_tests {
         ]);
 
         let result = jsonb.operate_on_path(&path, &mut operation);
-        assert!(result.is_ok());
+        assert!(matches!(result, Ok(true)));
 
         let updated_json = jsonb.to_string().unwrap();
         assert_eq!(updated_json, r#"{"name":"John","age":30}"#);
@@ -6573,7 +6619,7 @@ mod path_operations_tests {
         operation.mode = PathOperationMode::InsertNew;
 
         let result = jsonb.operate_on_path(&path, &mut operation);
-        assert!(result.is_err());
+        assert!(matches!(result, Ok(false)));
 
         // 4. Upsert mode - should work for both existing and new paths
         let json_str = r#"{"name": "John", "age": 30}"#;
@@ -6589,7 +6635,7 @@ mod path_operations_tests {
         ]);
 
         let result = jsonb.operate_on_path(&path, &mut operation);
-        assert!(result.is_ok());
+        assert!(matches!(result, Ok(true)));
 
         // Insert new value with Upsert
         let mut operation = SetOperation::new(Jsonb::from_str("\"Doe\"").unwrap());
@@ -6601,7 +6647,7 @@ mod path_operations_tests {
         ]);
 
         let result = jsonb.operate_on_path(&path, &mut operation);
-        assert!(result.is_ok());
+        assert!(matches!(result, Ok(true)));
 
         let updated_json = jsonb.to_string().unwrap();
         assert_eq!(updated_json, r#"{"name":"John","age":31,"surname":"Doe"}"#);
@@ -6732,7 +6778,7 @@ mod path_operations_tests {
         };
         let mut delete = DeleteOperation::new();
         assert!(
-            jsonb.operate_on_path(&path, &mut delete).is_err(),
+            matches!(jsonb.operate_on_path(&path, &mut delete), Ok(false)),
             "oversized child size must not be drained out of bounds"
         );
     }
