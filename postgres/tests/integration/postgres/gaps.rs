@@ -120,6 +120,20 @@ fn gap_a_33_timestamptz_n_param_with_offset(db: TempDatabase) {
     assert_eq!(out, "2026-10-08 12:00:00");
 }
 
+// A timestamptz or timestamp $n param plus an interval literal. The
+// timestamptz param has an offset, and the timestamp param has a T separator,
+// so the stored values differ from the param text.
+#[turso_macros::test(views)]
+fn timestamp_n_param_plus_interval(db: TempDatabase) {
+    let out = GapCase {
+        sql: "SELECT $1::timestamptz + interval '1 day', $2::timestamp + interval '1 day'",
+        params: &[P::Text("2026-01-01 10:00+05"), P::Text("2026-01-01T10:00")],
+        ..GapCase::default()
+    }
+    .run(db);
+    assert_eq!(out, "2026-01-02 05:00:00+00|2026-01-02 10:00:00");
+}
+
 // A-41: date $n param
 #[turso_macros::test(views)]
 fn gap_a_41_date_n_param(db: TempDatabase) {

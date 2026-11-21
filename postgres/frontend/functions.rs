@@ -70,6 +70,104 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             )
             .receiving_argument_types(),
         )
+        .extension_function(
+            pg_scalar_function(
+                turso_pg_parser::TIMESTAMP_PLUS_INTERVAL_FUNCTION,
+                FunctionArity::Exact(4),
+                true,
+                |_, args| exec_timestamp_plus_interval(args),
+            )
+            .receiving_argument_types()
+            .returning_first_argument_type(),
+        )
+}
+
+/// `timestamp + interval` and `timestamptz + interval` for an interval
+/// literal, which the translator passes as its months, days and microseconds:
+/// `(time, months, days, microseconds)`. The result has the type of `time`.
+/// The parts are added as PostgreSQL's timestamp_pl_interval adds them: the
+/// months first, moving a day past the end of the month back to its last day,
+/// then the days, then the microseconds. Only UTC is supported, so timestamptz
+/// is computed like timestamp. Other types of `time`, such as date, fail with
+/// 0A000, because PostgreSQL gives them a different result type.
+fn exec_timestamp_plus_interval(args: &[Register]) -> Result<Value> {
+    use chrono::Datelike;
+    let (args, types) = args.split_at(args.len() / 2);
+    let time_type = types[0].get_value().to_string();
+    if !matches!(time_type.as_str(), "timestamp" | "timestamptz") {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "adding an interval is supported only for timestamp and timestamptz, not {time_type}"
+            ),
+            None,
+        ));
+    }
+    // The function can be called by name with any arguments, and a value
+    // typed timestamp can reach it in a form the ENCODE of timestamp would
+    // not write, so unexpected arguments are errors, not assertions.
+    let not_supported = |what: String| sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, what, None);
+    let text = match args[0].get_value() {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(text) => text.as_str(),
+        other => {
+            return Err(not_supported(format!(
+                "adding an interval to the {time_type} value {other} is not supported"
+            )))
+        }
+    };
+    let integer = |register: &Register| match register.get_value() {
+        Value::Numeric(Numeric::Integer(value)) => Ok(*value),
+        other => Err(not_supported(format!(
+            "an interval part that is not an integer, {other}, is not supported"
+        ))),
+    };
+    let (months, days, micros) = (integer(&args[1])?, integer(&args[2])?, integer(&args[3])?);
+    let unreadable = || {
+        not_supported(format!(
+            "adding an interval to the {time_type} value \"{text}\" is not supported"
+        ))
+    };
+    let utc_text = match time_type.as_str() {
+        "timestamptz" => text.strip_suffix("+00").ok_or_else(unreadable)?,
+        _ => text,
+    };
+    let time = NaiveDateTime::parse_from_str(utc_text, "%Y-%m-%d %H:%M:%S%.f")
+        .map_err(|_| unreadable())?;
+    let sum = add_interval(time, months, days, micros)
+        .filter(|sum| (1..=9999).contains(&sum.year()))
+        .ok_or_else(|| {
+            sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "a result outside the years 1 to 9999 is not supported",
+                None,
+            )
+        })?;
+    let sum = timestamp_text(sum);
+    Ok(Value::build_text(match time_type.as_str() {
+        "timestamptz" => format!("{sum}+00"),
+        _ => sum,
+    }))
+}
+
+/// `time` plus `months`, then `days`, then `micros`, as PostgreSQL's
+/// timestamp_pl_interval adds them, or None if a step leaves chrono's range.
+fn add_interval(time: NaiveDateTime, months: i64, days: i64, micros: i64) -> Option<NaiveDateTime> {
+    use chrono::{Datelike, Duration, NaiveDate};
+    let date = time.date();
+    let month_index = i64::from(date.year())
+        .checked_mul(12)?
+        .checked_add(i64::from(date.month0()))?
+        .checked_add(months)?;
+    let year = i32::try_from(month_index.div_euclid(12)).ok()?;
+    let month = u32::try_from(month_index.rem_euclid(12)).ok()? + 1;
+    let first_of_month = NaiveDate::from_ymd_opt(year, month, 1)?;
+    let first_of_next_month = first_of_month.checked_add_months(chrono::Months::new(1))?;
+    let last_day = first_of_next_month.pred_opt()?.day();
+    let date = first_of_month.with_day(date.day().min(last_day))?;
+    let date = date.checked_add_signed(Duration::try_days(days)?)?;
+    date.and_time(time.time())
+        .checked_add_signed(Duration::microseconds(micros))
 }
 
 /// date_trunc(field, timestamptz). The declared return type is timestamptz,

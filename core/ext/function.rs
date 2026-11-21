@@ -31,6 +31,7 @@ impl ExternalFunc {
                 deterministic,
                 return_type: <<F::Call as ScalarCall>::Output as ScalarReturn>::TYPE,
                 receives_argument_types: false,
+                returns_first_argument_type: false,
                 function: Arc::new(function),
             },
         })
@@ -49,6 +50,27 @@ impl ExternalFunc {
             panic!("only a native scalar function can receive its argument types");
         };
         *receives_argument_types = true;
+        self
+    }
+
+    /// Gives the function's result the type of its first argument, as
+    /// `nullif` has, for a function whose result type depends on the type of
+    /// its first argument. The function returns `Value`, which declares no
+    /// type of its own.
+    pub fn returning_first_argument_type(mut self) -> Self {
+        let ExtFunc::NativeScalar {
+            return_type,
+            returns_first_argument_type,
+            ..
+        } = &mut self.func
+        else {
+            panic!("only a native scalar function can return its first argument's type");
+        };
+        assert!(
+            return_type.is_none(),
+            "a function that returns its first argument's type declares no return type"
+        );
+        *returns_first_argument_type = true;
         self
     }
 

@@ -127,6 +127,9 @@ pub enum ExtFunc {
         /// Whether a call also gets the type name of each argument, such as
         /// `boolean[]`, as one more text argument per argument, after them.
         receives_argument_types: bool,
+        /// Whether the result has the type of the first argument, instead of
+        /// `return_type`.
+        returns_first_argument_type: bool,
         function: Arc<dyn crate::native_ext::ScalarFactory>,
     },
     NativeAggregate {
@@ -193,6 +196,20 @@ impl ExtFunc {
                 ..
             }
         )
+    }
+
+    /// How the type of the function's result follows from its arguments.
+    pub fn result_type(&self) -> ResultType {
+        match self {
+            Self::NativeScalar {
+                returns_first_argument_type: true,
+                ..
+            } => ResultType::FirstArgument,
+            _ => match self.return_type() {
+                Some(return_type) => ResultType::Declared(return_type),
+                None => ResultType::Unknown,
+            },
+        }
     }
 
     pub fn return_type(&self) -> Option<crate::native_ext::ReturnType> {
@@ -1957,7 +1974,7 @@ impl Func {
             #[cfg(feature = "json")]
             Self::Json(func) => declared(func.return_type()),
             Self::Vector(func) => declared(func.return_type()),
-            Self::External(func) => declared(func.func.return_type()),
+            Self::External(func) => func.func.result_type(),
             Self::Agg(AggFunc::Min | AggFunc::Max) => ResultType::OneOfTheArguments,
             Self::Window(WindowFunc::Lag | WindowFunc::Lead) => {
                 ResultType::OneOfTheFirstAndThirdArguments
