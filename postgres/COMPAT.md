@@ -183,7 +183,8 @@ return date, time, timetz or interval, such as `age` and `make_date`.
 transaction started, and `LOCALTIMESTAMP` is that time as a timestamp in UTC;
 `statement_timestamp()` is the time the client's query arrived, shared by all
 statements of one query string;
-`clock_timestamp()` reads the clock at each call.
+`clock_timestamp()` reads the clock at each call. All of them have microsecond
+precision.
 
 | Feature | Status | Notes |
 |---------|--------|-------|

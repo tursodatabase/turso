@@ -715,18 +715,37 @@ fn test_pg_native_timestamps_are_registered_before_connection_wrapping(db: TempD
         let Value::Text(timestamp) = &rows[0][0] else {
             panic!("expected timestamp text for {name}")
         };
-        assert_eq!(timestamp.as_str().len(), 23);
-        for (index, separator) in [
-            (4, b'-'),
-            (7, b'-'),
-            (10, b' '),
-            (13, b':'),
-            (16, b':'),
-            (19, b'.'),
-        ] {
-            assert_eq!(timestamp.as_str().as_bytes()[index], separator, "{name}");
-        }
+        assert!(
+            is_timestamp_text(timestamp.as_str()),
+            "{name} returned {}",
+            timestamp.as_str()
+        );
     }
+}
+
+/// Whether `text` is `YYYY-MM-DD HH:MM:SS`, optionally followed by `.` and one
+/// to six digits, the form PostgreSQL prints a timestamp in.
+fn is_timestamp_text(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() < 19 {
+        return false;
+    }
+    let (seconds, fraction) = bytes.split_at(19);
+    let seconds_match = seconds
+        .iter()
+        .zip(b"0000-00-00 00:00:00")
+        .all(|(byte, pattern)| match pattern {
+            b'0' => byte.is_ascii_digit(),
+            _ => byte == pattern,
+        });
+    let fraction_match = match fraction {
+        [] => true,
+        [b'.', digits @ ..] => {
+            (1..=6).contains(&digits.len()) && digits.iter().all(u8::is_ascii_digit)
+        }
+        _ => false,
+    };
+    seconds_match && fraction_match
 }
 
 #[turso_macros::test(mvcc)]

@@ -175,12 +175,15 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
     })
 }
 
-/// The timestamptz of `instant`, a reading of the system clock.
+/// The timestamptz of `instant`, a reading of the system clock, with
+/// microseconds as PostgreSQL keeps them. Trailing zeros of the fraction and
+/// a dot with no digits after it are left out, as PostgreSQL prints them.
 fn timestamptz_at(instant: WallClockInstant) -> Timestamptz {
     let time: NaiveDateTime = DateTime::from_timestamp(instant.secs, instant.micros * 1_000)
         .expect("a system clock reading is a valid date and time")
         .naive_utc();
-    Timestamptz(time.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+    let text = time.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+    Timestamptz(text.trim_end_matches('0').trim_end_matches('.').to_string())
 }
 
 pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
