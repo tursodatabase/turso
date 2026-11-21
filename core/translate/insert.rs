@@ -1,4 +1,4 @@
-use crate::alloc::TursoFromIterator;
+use crate::alloc::{TursoFromIterator, TursoIteratorExt};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::ColumnLayout;
 use crate::security::permission::Object;
@@ -13,8 +13,8 @@ use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY},
     schema::{
-        self, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn, ResolvedFkRef, Table,
-        SQLITE_SEQUENCE_TABLE_NAME,
+        self, BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn,
+        ResolvedFkRef, Table, SQLITE_SEQUENCE_TABLE_NAME,
     },
     sync::Arc,
     translate::{
@@ -524,15 +524,12 @@ pub fn translate_insert(
     // Open an ephemeral table for buffering RETURNING results.
     // All DML completes before any RETURNING rows are yielded to the caller.
     if !result_columns.is_empty() {
-        let ret_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(btree_table.clone()));
-        program.emit_insn(Insn::OpenEphemeral {
-            cursor_id: ret_cursor_id,
-            is_table: true,
-        });
-        ctx.returning_buffer = Some(ReturningBufferCtx {
-            cursor_id: ret_cursor_id,
-            num_columns: result_columns.len(),
-        });
+        ctx.returning_buffer = Some(ReturningBufferCtx::open(
+            program,
+            &btree_table.name,
+            &result_columns,
+            &table_references,
+        )?);
     }
 
     if resolver
@@ -2566,8 +2563,62 @@ fn init_source_emission<'a>(
                  ** temp table in the case of row triggers.
                  */
                 if program.is_table_open(table) || has_insert_triggers {
+                    // The temp table holds the SELECT's values in the order of the
+                    // insert's column list, so each of its columns is named after the
+                    // table column the value goes to.
+                    let value_column = |name: Option<String>, affinity: Affinity| {
+                        let mut column = Column::new_default_text(name, String::new(), None);
+                        column.override_affinity(affinity);
+                        column
+                    };
+                    let value_columns = if columns.is_empty() {
+                        ctx.table
+                            .columns()
+                            .iter()
+                            .filter(|col| !col.hidden() && !col.is_generated())
+                            .map(|col| value_column(col.name.clone(), col.affinity()))
+                            .try_collect()?
+                    } else {
+                        columns
+                            .iter()
+                            .map(|col_name| {
+                                let column_name = normalize_ident(col_name.as_str());
+                                if ROWID_STRS
+                                    .iter()
+                                    .any(|s| s.eq_ignore_ascii_case(&column_name))
+                                {
+                                    return Ok(value_column(Some(column_name), Affinity::Integer));
+                                }
+                                table
+                                    .get_column_by_name(&column_name)
+                                    .map(|(_, col)| value_column(col.name.clone(), col.affinity()))
+                                    .ok_or_else(|| {
+                                        crate::error::LimboError::ParseError(format!(
+                                            "table {} has no column named {}",
+                                            table.get_name(),
+                                            column_name
+                                        ))
+                                    })
+                            })
+                            .collect::<Result<crate::alloc::Vec<_>>>()?
+                    };
+                    let affinity_str = value_columns
+                        .iter()
+                        .map(|col| col.affinity().aff_mask())
+                        .collect::<String>();
+                    let temp_table = Arc::new(BTreeTable::new(
+                        0,
+                        ctx.table.name.clone(),
+                        crate::alloc::vec![],
+                        value_columns,
+                        BTreeCharacteristics::HAS_ROWID,
+                        crate::alloc::vec![],
+                        crate::alloc::vec![],
+                        crate::alloc::vec![],
+                        None,
+                    ));
                     let temp_cursor_id =
-                        program.alloc_cursor_id(CursorType::BTreeTable(ctx.table.clone()));
+                        program.alloc_cursor_id(CursorType::BTreeTable(temp_table));
                     ctx.temp_table_ctx = Some(TempTableCtx {
                         cursor_id: temp_cursor_id,
                         loop_start_label: program.allocate_label(),
@@ -2590,38 +2641,6 @@ fn init_source_emission<'a>(
                     });
 
                     let record_reg = program.alloc_register();
-                    let affinity_str = if columns.is_empty() {
-                        ctx.table
-                            .columns()
-                            .iter()
-                            .filter(|col| !col.hidden() && !col.is_generated())
-                            .map(|col| col.affinity().aff_mask())
-                            .collect::<String>()
-                    } else {
-                        columns
-                            .iter()
-                            .map(|col_name| {
-                                let column_name = normalize_ident(col_name.as_str());
-                                if ROWID_STRS
-                                    .iter()
-                                    .any(|s| s.eq_ignore_ascii_case(&column_name))
-                                {
-                                    return Ok(Affinity::Integer.aff_mask());
-                                }
-                                table
-                                    .get_column_by_name(&column_name)
-                                    .map(|(_, col)| col.affinity().aff_mask())
-                                    .ok_or_else(|| {
-                                        crate::error::LimboError::ParseError(format!(
-                                            "table {} has no column named {}",
-                                            table.get_name(),
-                                            column_name
-                                        ))
-                                    })
-                            })
-                            .collect::<Result<String>>()?
-                    };
-
                     program.emit_insn(Insn::MakeRecord {
                         start_reg: to_u32(program.reg_result_cols_start.unwrap_or(yield_reg + 1)),
                         count: to_u32(num_result_cols),

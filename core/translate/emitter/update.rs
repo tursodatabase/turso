@@ -57,7 +57,7 @@ use crate::{
     util::normalize_ident,
     vdbe::{
         affinity::Affinity,
-        builder::{CursorKey, CursorType, DmlColumnContext, DmlRowForm},
+        builder::{CursorKey, DmlColumnContext, DmlRowForm},
         insn::{
             to_u32, CmpInsFlags, ConstraintInfo, IdxInsertFlags, InsertFlags, Insn,
             RegisterOrLiteral,
@@ -114,30 +114,22 @@ pub fn emit_program_for_update(
         .flags
         .set_has_statement_conflict(plan.or_conflict.is_some());
 
-    // Open an ephemeral table for buffering RETURNING results.
-    // All DML completes before any RETURNING rows are yielded to the caller.
-    let returning_buffer = if plan.returning.as_ref().is_some_and(|r| !r.is_empty()) {
-        let btree_table = plan
-            .target_table
-            .table
-            .btree()
-            .expect("UPDATE target must be a BTree table");
-        let ret_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(btree_table));
-        program.emit_insn(Insn::OpenEphemeral {
-            cursor_id: ret_cursor_id,
-            is_table: true,
-        });
-        Some(ReturningBufferCtx {
-            cursor_id: ret_cursor_id,
-            num_columns: plan.returning.as_ref().unwrap().len(),
-        })
-    } else {
-        None
-    };
-
     let target_table = Arc::new(plan.target_table.clone());
     let target_tables =
         TableReferences::for_update_target(plan.target_table.clone(), &plan.from_tables);
+
+    // Open an ephemeral table for buffering RETURNING results.
+    // All DML completes before any RETURNING rows are yielded to the caller.
+    let returning_buffer = match plan.returning.as_deref() {
+        Some(returning) if !returning.is_empty() => Some(ReturningBufferCtx::open(
+            program,
+            plan.target_table.table.get_name(),
+            returning,
+            &target_tables,
+        )?),
+        _ => None,
+    };
+
     let write_set_plan = plan.write_set_plan.take();
     let temp_cursor_id = match write_set_plan.as_ref() {
         Some(plan) => {

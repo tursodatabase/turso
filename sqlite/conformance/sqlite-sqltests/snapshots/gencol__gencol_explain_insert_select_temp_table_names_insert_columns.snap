@@ -1,0 +1,54 @@
+---
+source: gencol.sqltest
+expression: INSERT INTO t(d, c) SELECT a, c FROM t;
+info:
+  statement_type: INSERT
+  tables:
+  - t
+  setup_blocks:
+  - gencol_stored_columns_after_virtual
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN t
+
+BYTECODE
+addr  opcode         p1  p2  p3  p4              p5  comment
+   0  Init            0  35   0                   0  Start at 35
+   1  InitCoroutine   2   9   2                   0
+   2  OpenRead        0   2   0  k(6,B,B,B,B,B)   0  table=t, root=2, iDb=0
+   3  Rewind          0   8   0                   0  Rewind table t
+   4    Column        0   0   3                   0  r[3]=t.a
+   5    Column        0   2   4                   0  r[4]=t.c
+   6    Yield         2   0   0                   0
+   7  Next            0   4   0                   1
+   8  EndCoroutine    2   0   0                   0
+   9  OpenEphemeral   2   1   0                   0  cursor=2 is_table=true
+  10    Yield         2  15   0                   0
+  11    MakeRecord    3   2   5                   0  r[5]=mkrec(r[3..4])
+  12    NewRowid      2   6   0                   0  r[6]=rowid
+  13    Insert        2   5   6                   6  intkey=r[6] data=r[5]
+  14  Goto            0  10   0                   0
+  15  OpenWrite       1   2   0                   0  root=2; iDb=0
+  16  Rewind          2  32   0                   0  Rewind  ephemeral(t)
+  17    Null          0   8   0                   0  r[8]=NULL
+  18    Null          0   9   0                   0  r[9]=NULL
+  19    Column        2   1  10                   0  r[10]=ephemeral(t).c
+  20    Column        2   0  11                   0  r[11]=ephemeral(t).d
+  21    Affinity      8   4   0                   0  r[8..12] = D, D, B, D
+  22    NewRowid      1   7   0                   0  r[7]=rowid
+  23    Copy          8  16   0                   0  r[16]=r[8]
+  24    Multiply     16  17  14                   0  r[14]=r[16]*r[17]
+  25    Copy          9  15   0                   0  r[15]=r[9]
+  26    Add          14  15  12                   0  r[12]=r[14]+r[15]
+  27    Affinity     12   1   0                   0  r[12..13] = D
+  28    MakeRecord    8   4  13                   0  r[13]=mkrec(r[8..11])
+  29    Insert        1  13   7  t                0  intkey=r[7] data=r[13]
+  30    Goto          0  31   0                   0
+  31  Next            2  17   0                   0
+  32  Close           2   0   0                   0
+  33  Goto            0  34   0                   0
+  34  Halt            0   0   0                   0
+  35  Transaction     0   2   1                   0  iDb=0 tx_mode=Write
+  36  Integer         2  17   0                   0  r[17]=2
+  37  Goto            0   1   0                   0
