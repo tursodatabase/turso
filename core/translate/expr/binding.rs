@@ -654,6 +654,7 @@ pub(crate) fn check_custom_types(
     // exist for a date, not because its result has no type.
     walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
         check_custom_operator(expr, &context.type_env())?;
+        check_comparison(expr, &context.type_env())?;
         Ok(WalkControl::Continue)
     })?;
     walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {

@@ -654,6 +654,20 @@ pub trait Dialect: Send + Sync + 'static {
         None
     }
 
+    /// Whether the dialect has an operator `op` for operands of the given
+    /// types, which PostgreSQL has not for `boolean + integer` or `text =
+    /// integer`. `op` is an arithmetic or bit operator, or one of `= <> < <=
+    /// > >=`. With Reject the statement fails with "operator does not
+    /// exist". The default has every operator, as SQLite does: it adds a
+    /// comparison to a number.
+    fn resolve_operator(
+        &self,
+        _op: &str,
+        _operands: &dyn Fn() -> std::vec::Vec<OperandType>,
+    ) -> OperatorResolution {
+        OperatorResolution::Keep
+    }
+
     /// Plans a CAST of a value of type `source()` to the type `target`, as
     /// written. None leaves the CAST to the engine, which converts the value
     /// as SQLite's CAST or the target custom type does. `source` works out
@@ -675,6 +689,16 @@ pub enum CastContext {
     Implicit,
     Assignment,
     Explicit,
+}
+
+/// The dialect's choice of an operator for the operands of a call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorResolution {
+    /// The engine's operator runs on the operands as they are.
+    Keep,
+    /// The dialect has no such operator: the statement fails with "operator
+    /// does not exist".
+    Reject,
 }
 
 /// The type of an operand, as far as a dialect needs to know it.
