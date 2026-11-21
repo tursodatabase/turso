@@ -6082,9 +6082,20 @@ pub fn op_program(
     loop {
         match std::mem::take(state.active_op_state.program()) {
             OpProgramState::Start => {
-                // The compiler stops at the same depth. But a foreign key action
-                // that cascades to its own table executes one program for each
-                // level of the cascade, with no compilation.
+                // Recursive triggers are disabled, as in SQLite without PRAGMA
+                // recursive_triggers: a trigger does not fire while it is running.
+                // The statement compiles each trigger once and calls it from every
+                // place it fires, so this cannot be decided when compiling.
+                if let Some(trigger) = &subprogram.trigger {
+                    if connection.is_trigger_executing(trigger) {
+                        state.pc += 1;
+                        state.active_op_state.clear();
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
+                }
+                // The compiler stops at the same depth. But a subprogram compiled
+                // once runs at every level where it fires, for example a foreign
+                // key action that cascades to its own table, with no compilation.
                 if state.subprogram_depth >= crate::vdbe::MAX_TRIGGER_DEPTH {
                     return Err(
                         LimboError::SqlError(crate::vdbe::TRIGGER_DEPTH_ERROR.to_string()).into(),
@@ -16495,27 +16506,6 @@ pub fn op_once(
         return Ok(InsnFunctionStepResult::Step);
     }
     state.once.push(offset);
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
-/// Execute the [Insn::ResetOnce] instruction.
-///
-/// Forgets that any [Insn::Once] between this instruction and `region_end` has
-/// run, so a re-executed inlined trigger body re-evaluates its run-once blocks
-/// instead of reusing a value cached during an earlier firing.
-pub fn op_reset_once(
-    _program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _connection: &Arc<Connection>,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(ResetOnce { region_end }, insn);
-    assert!(region_end.is_offset());
-    let start = state.pc;
-    let end = region_end.as_offset_int();
-    state.once.retain(|pc| *pc <= start || *pc >= end);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

@@ -239,3 +239,28 @@ test rowid-keeps-integer-affinity {
 expect {
     fired
 }
+# A trigger body reads NEW and OLD as parameters. The rowid and a rowid alias
+# keep INTEGER affinity there too, as in the WHEN clause.
+test body-rowid-and-rowid-alias-keep-integer-affinity {
+    CREATE TABLE t12(id INTEGER PRIMARY KEY, v);
+    CREATE TABLE log12(msg);
+    CREATE TRIGGER tr12_ins AFTER INSERT ON t12
+      BEGIN
+        INSERT INTO log12 SELECT 'new.id' WHERE NEW.id = '1';
+        INSERT INTO log12 SELECT 'new.rowid' WHERE NEW.rowid = '1';
+      END;
+    CREATE TRIGGER tr12_del AFTER DELETE ON t12
+      BEGIN
+        INSERT INTO log12 SELECT 'old.id' WHERE OLD.id = '1';
+        INSERT INTO log12 SELECT 'old.rowid' WHERE OLD.rowid = '1';
+      END;
+    INSERT INTO t12 VALUES(1, 'x');
+    DELETE FROM t12;
+    SELECT * FROM log12;
+}
+expect {
+    new.id
+    new.rowid
+    old.id
+    old.rowid
+}

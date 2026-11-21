@@ -29,20 +29,22 @@ use turso_parser::ast::{ResolveType, SortOrder};
 /// The program run by an `Insn::Program` instruction.
 ///
 /// Most callers already have a finished trigger or foreign-key action program.
-/// Recursive foreign-key actions are different: while compiling one action
-/// program, the generated SQL can need to emit a call back to that same action
+/// Recursive foreign-key actions and triggers are different: while compiling
+/// one program, the generated SQL can need to emit a call back to that same
 /// program before it has finished compiling.
 #[derive(Debug, Clone)]
 pub enum Subprogram {
     /// A finished trigger or foreign-key action program.
     PreparedProgram(Arc<PreparedProgram>),
-    /// A recursive foreign-key action program that is still being compiled.
+    /// A foreign-key action or trigger program that is still being compiled.
     ///
     /// Example: `t(id PRIMARY KEY, parent REFERENCES t(id) ON DELETE CASCADE)`.
     /// The action that deletes child rows from `t` can itself delete more rows
     /// from `t`, so it must call the same action program that is being built.
-    /// The slot is filled after compilation finishes. The stored reference is
-    /// weak so the finished program does not own itself.
+    /// A trigger body that fires the same trigger also calls the program being
+    /// built; that call is skipped when it runs. The slot is filled after
+    /// compilation finishes. The stored reference is weak so the finished
+    /// program does not own itself.
     Pending(Arc<OnceLock<Weak<PreparedProgram>>>),
 }
 
@@ -51,15 +53,12 @@ impl Subprogram {
     ///
     /// `Pending` must have been filled during compilation before execution
     /// reaches the instruction. If it has not been filled, compilation emitted
-    /// a recursive foreign-key action call without connecting it to the
-    /// finished action program.
+    /// a recursive call without connecting it to the finished program.
     pub(super) fn prepared_program(&self) -> crate::Result<Arc<PreparedProgram>> {
         match self {
             Self::PreparedProgram(program) => Ok(program.clone()),
             Self::Pending(program) => program.get().and_then(Weak::upgrade).ok_or_else(|| {
-                crate::LimboError::InternalError(
-                    "recursive foreign-key action subprogram was not resolved".into(),
-                )
+                crate::LimboError::InternalError("recursive subprogram was not resolved".into())
             }),
         }
     }
@@ -2107,16 +2106,6 @@ pub enum Insn {
     Once {
         target_pc_when_reentered: BranchOffset,
     },
-    /// Forget that any [Insn::Once] between this instruction and `region_end`
-    /// has already run. Trigger bodies are inlined and re-executed once per
-    /// affected row, so their run-once blocks (uncorrelated subqueries,
-    /// hash/ephemeral builds) must re-run each firing instead of reusing a
-    /// value cached during an earlier firing. Emitted at the start of each
-    /// trigger firing, this restores the fresh once-state that SQLite gets from
-    /// a per-invocation trigger sub-program.
-    ResetOnce {
-        region_end: BranchOffset,
-    },
     /// Search for a record in the index cursor.
     /// If any entry for which the key is a prefix exists, jump to target_pc.
     /// Otherwise, continue to the next instruction.
@@ -2626,7 +2615,6 @@ impl InsnVariants {
             InsnVariants::SetCookie => execute::op_set_cookie,
             InsnVariants::OpenEphemeral | InsnVariants::OpenAutoindex => execute::op_open_ephemeral,
             InsnVariants::Once => execute::op_once,
-            InsnVariants::ResetOnce => execute::op_reset_once,
             InsnVariants::Found | InsnVariants::NotFound => execute::op_found,
             InsnVariants::Affinity => execute::op_affinity,
             InsnVariants::IdxDelete => execute::op_idx_delete,

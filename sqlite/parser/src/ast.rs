@@ -719,6 +719,10 @@ pub struct Variable {
     /// name; their "?N" spelling is derived from the index on demand.
     #[cfg_attr(feature = "serde", serde(default))]
     pub numbered: bool,
+    /// True if the variable stands for a rowid (trigger NEW/OLD rewrite). As
+    /// in SQLite, a rowid reference has INTEGER affinity.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub is_rowid: bool,
 }
 
 impl Variable {
@@ -729,6 +733,7 @@ impl Variable {
             custom_type: None,
             col_collation: None,
             numbered: false,
+            is_rowid: false,
         }
     }
 
@@ -740,15 +745,18 @@ impl Variable {
             custom_type: None,
             col_collation: None,
             numbered: true,
+            is_rowid: false,
         }
     }
 
     /// A variable that stands for a column with the given custom type and
-    /// collation.
+    /// collation. `is_rowid` is true if the column is the rowid or a rowid
+    /// alias.
     pub fn for_column(
         index: NonZeroU32,
         custom_type: Option<Type>,
         col_collation: Option<&str>,
+        is_rowid: bool,
     ) -> Self {
         Self {
             index,
@@ -756,6 +764,7 @@ impl Variable {
             custom_type: custom_type.map(Box::new),
             col_collation: col_collation.map(Into::into),
             numbered: false,
+            is_rowid,
         }
     }
 
@@ -766,6 +775,7 @@ impl Variable {
             custom_type: None,
             col_collation: None,
             numbered: false,
+            is_rowid: false,
         }
     }
 

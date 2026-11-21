@@ -2957,7 +2957,6 @@ impl Database {
                 crate::incremental::vdbe_maintenance::MaintenanceProgramCache::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
             nestedness: AtomicI32::new(0),
-            compiling_triggers: RwLock::new(Vec::new()),
             executing_triggers: RwLock::new(Vec::new()),
             encryption_key,
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
