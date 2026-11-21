@@ -375,26 +375,24 @@ expect {
 expect @tursopg error {}
 
 # A-43: timestamptz + interval
-@compat-gap "operator:timestamptz + interval"
 test timestamptz-interval {
     SELECT '2026-10-08 12:00:00+00'::timestamptz + interval '1 day 1 hour';
 }
 expect {
     2026-10-09 13:00:00+00
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
 # A-44: now() - interval comparison
-@compat-gap "operator:timestamptz - interval"
+@compat-gap "type:bool"
 test now-interval-comparison {
     SELECT now() - interval '1 day' < now();
 }
 expect {
     t
 }
-@sqlstate 0A000
-expect @tursopg error {}
+expect @tursopg {
+    1
+}
 
 # A-45: jsonb literal key order/whitespace
 @compat-gap "type:jsonb"

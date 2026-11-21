@@ -4144,6 +4144,17 @@ impl PostgreSQLTranslator {
             };
         }
 
+        if matches!(op_name, "+" | "-") {
+            let rhs = a_expr.rexpr.as_deref();
+            if let Some(interval) = rhs.map(interval_literal).transpose()?.flatten() {
+                return self.translate_plus_interval(
+                    a_expr.lexpr.as_deref().unwrap(),
+                    op_name == "-",
+                    interval,
+                );
+            }
+        }
+
         // Translate left and right expressions
         let left = Box::new(self.translate_operand(a_expr.lexpr.as_ref().unwrap())?);
 
@@ -4260,6 +4271,61 @@ impl PostgreSQLTranslator {
         Ok(ast::Expr::Binary(left, binary_op, right))
     }
 
+    /// `lhs + interval '...'` or `lhs - interval '...'`, as a call of the
+    /// frontend function that adds the interval's parts. The function refuses
+    /// a `lhs` whose type is not timestamp or timestamptz, and its result has
+    /// the type of `lhs`.
+    fn translate_plus_interval(
+        &self,
+        lhs: &pg_query::protobuf::Node,
+        subtract: bool,
+        interval: IntervalParts,
+    ) -> Result<ast::Expr, ParseError> {
+        // Index and generation expressions run without the frontend's
+        // functions.
+        if self.translating_index.get() {
+            return Err(ParseError::not_supported(
+                "an interval in an index expression",
+            ));
+        }
+        if self.generation_expression_table.borrow().is_some() {
+            return Err(ParseError::not_supported(
+                "an interval in a generated column",
+            ));
+        }
+        let interval = if subtract {
+            interval.negated()
+        } else {
+            Some(interval)
+        }
+        .ok_or_else(|| ParseError::not_supported("this interval value"))?;
+        let integer = |value: i64| {
+            let literal = Box::new(ast::Expr::Literal(ast::Literal::Numeric(
+                value.unsigned_abs().to_string(),
+            )));
+            Box::new(if value < 0 {
+                ast::Expr::Unary(ast::UnaryOperator::Negative, literal)
+            } else {
+                *literal
+            })
+        };
+        Ok(ast::Expr::FunctionCall {
+            name: exact_name(crate::TIMESTAMP_PLUS_INTERVAL_FUNCTION),
+            distinctness: None,
+            args: vec![
+                Box::new(self.translate_operand(lhs)?),
+                integer(i64::from(interval.months)),
+                integer(i64::from(interval.days)),
+                integer(interval.micros),
+            ],
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        })
+    }
     fn translate_in_expr(
         &self,
         a_expr: &pg_query::protobuf::AExpr,
@@ -7744,6 +7810,121 @@ fn check_type_is_supported(name: &str, array_dimensions: usize) -> Result<(), Pa
         "type \"{name}{}\"",
         "[]".repeat(array_dimensions)
     )))
+}
+
+/// The months, days and microseconds of an interval literal, the three fields
+/// PostgreSQL keeps an interval in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IntervalParts {
+    months: i32,
+    days: i32,
+    micros: i64,
+}
+
+impl IntervalParts {
+    /// The interval with each part negated, as PostgreSQL's interval_um
+    /// negates it, or None if a part has no negation in its range.
+    fn negated(self) -> Option<Self> {
+        Some(Self {
+            months: self.months.checked_neg()?,
+            days: self.days.checked_neg()?,
+            micros: self.micros.checked_neg()?,
+        })
+    }
+}
+
+/// The parts of `node` if it is an interval literal, `interval '...'` or
+/// `'...'::interval`, or None if it is something else. An interval literal
+/// with a type modifier, such as `interval '1' day`, or with text that
+/// `interval_parts` does not read is an error.
+fn interval_literal(node: &pg_query::protobuf::Node) -> Result<Option<IntervalParts>, ParseError> {
+    use pg_query::protobuf::{a_const::Val, node::Node};
+    let Some(Node::TypeCast(cast)) = &node.node else {
+        return Ok(None);
+    };
+    let Some(type_name) = cast.type_name.as_ref() else {
+        return Ok(None);
+    };
+    let names: Vec<_> = type_name
+        .names
+        .iter()
+        .map(|name| match &name.node {
+            Some(Node::String(name)) => Some(name.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    if !matches!(
+        names.as_slice(),
+        [Some("interval")] | [Some("pg_catalog"), Some("interval")]
+    ) || !type_name.array_bounds.is_empty()
+    {
+        return Ok(None);
+    }
+    let text = match cast.arg.as_deref().and_then(|arg| arg.node.as_ref()) {
+        Some(Node::AConst(constant)) => match &constant.val {
+            Some(Val::Sval(text)) => text.sval.as_str(),
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    if !type_name.typmods.is_empty() {
+        return Err(ParseError::not_supported(
+            "an interval literal with a type modifier",
+        ));
+    }
+    interval_parts(text)
+        .map(Some)
+        .ok_or_else(|| ParseError::not_supported(format!("the interval literal \"{text}\"")))
+}
+
+/// The parts of the interval text `text`, or None unless it is a list of
+/// optionally signed integers, each followed by a unit: microsecond,
+/// millisecond, second, minute, hour, day, week, month or year, singular or
+/// plural. As in PostgreSQL, the units are read without regard to case, a
+/// unit may appear only once, and a value out of the range of its part is an
+/// error. PostgreSQL reads many more forms, such as `1:30` or `1 day ago`,
+/// which are not supported.
+fn interval_parts(text: &str) -> Option<IntervalParts> {
+    let mut words = text.split_ascii_whitespace();
+    let mut parts = IntervalParts {
+        months: 0,
+        days: 0,
+        micros: 0,
+    };
+    let mut seen_units = Vec::new();
+    let mut any = false;
+    while let Some(number) = words.next() {
+        let digits = number.strip_prefix(['+', '-']).unwrap_or(number);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let value: i64 = number.parse().ok()?;
+        let unit = words.next()?.to_ascii_lowercase();
+        let unit = unit.strip_suffix('s').unwrap_or(&unit).to_string();
+        if seen_units.contains(&unit) {
+            return None;
+        }
+        let small = |value: i64| i32::try_from(value).ok();
+        match unit.as_str() {
+            "microsecond" => parts.micros = parts.micros.checked_add(value)?,
+            "millisecond" => parts.micros = parts.micros.checked_add(value.checked_mul(1_000)?)?,
+            "second" => parts.micros = parts.micros.checked_add(value.checked_mul(1_000_000)?)?,
+            "minute" => parts.micros = parts.micros.checked_add(value.checked_mul(60_000_000)?)?,
+            "hour" => {
+                parts.micros = parts
+                    .micros
+                    .checked_add(value.checked_mul(3_600_000_000)?)?
+            }
+            "day" => parts.days = parts.days.checked_add(small(value)?)?,
+            "week" => parts.days = parts.days.checked_add(small(value.checked_mul(7)?)?)?,
+            "month" => parts.months = parts.months.checked_add(small(value)?)?,
+            "year" => parts.months = parts.months.checked_add(small(value.checked_mul(12)?)?)?,
+            _ => return None,
+        }
+        seen_units.push(unit);
+        any = true;
+    }
+    any.then_some(parts)
 }
 
 /// Extract an integer value from a DefElem's arg node.

@@ -1,0 +1,512 @@
+# timestamp + interval and timestamp - interval with an interval literal. The
+# left side is a timestamp or timestamptz column, now() or a cast, and the
+# result has its type. The session time zone is UTC on both servers.
+#
+# tursopg reads only interval literals of integers with the units microsecond
+# to year, and refuses every other use of interval with 0A000.
+
+@database :memory:
+
+test timestamp-plus-interval-units {
+    SELECT timestamp '2026-01-01' + interval '2 weeks 3 days 4 hours 5 minutes 6 seconds',
+           timestamp '2026-01-01 00:00:00.5' + interval '250 milliseconds',
+           timestamp '2026-01-01' + interval '1 second 5 milliseconds 7 microseconds',
+           timestamp '2026-01-01' + interval '1 year 1 month';
+}
+expect {
+    2026-01-18 04:05:06|2026-01-01 00:00:00.75|2026-01-01 00:00:01.005007|2027-02-01 00:00:00
+}
+
+test timestamp-plus-interval-unit-spellings {
+    SELECT timestamp '2026-01-01' + interval '1 DAY',
+           timestamp '2026-01-01' + interval '1 Days',
+           timestamp '2026-01-01' + interval '  1   day  ',
+           timestamp '2026-01-01' + interval '+1 day -2 hours',
+           timestamp '2026-01-01' + '1 day'::interval;
+}
+expect {
+    2026-01-02 00:00:00|2026-01-02 00:00:00|2026-01-02 00:00:00|2026-01-01 22:00:00|2026-01-02 00:00:00
+}
+
+test timestamptz-minus-interval-clamps-to-month-end {
+    SELECT timestamptz '2026-03-31 10:00:00+00' - interval '1 month',
+           timestamp '2024-01-31' + interval '1 month',
+           timestamp '2023-01-31' + interval '1 month',
+           timestamp '2026-05-31' - interval '1 month 1 day';
+}
+expect {
+    2026-02-28 10:00:00+00|2024-02-29 00:00:00|2023-02-28 00:00:00|2026-04-29 00:00:00
+}
+
+test timestamp-plus-interval-adds-months-before-days {
+    SELECT timestamp '2024-01-31' + interval '1 month 1 day',
+           timestamp '2026-03-31' + interval '-1 month +2 days -3 hours';
+}
+expect {
+    2024-03-01 00:00:00|2026-03-01 21:00:00
+}
+
+test timestamp-plus-interval-leap-years {
+    SELECT timestamp '2024-02-29' + interval '1 year',
+           timestamp '2024-02-29 12:00' - interval '1 year',
+           timestamp '2028-02-29' - interval '4 years';
+}
+expect {
+    2025-02-28 00:00:00|2023-02-28 12:00:00|2024-02-29 00:00:00
+}
+
+test timestamp-minus-negative-interval {
+    SELECT timestamp '2026-03-01' - interval '-1 month',
+           timestamp '2026-01-01' + interval '-0 days';
+}
+expect {
+    2026-04-01 00:00:00|2026-01-01 00:00:00
+}
+
+test timestamptz-plus-interval-crosses-the-year {
+    SELECT timestamptz '2026-12-31 23:59:59.999999+00' + interval '1 microsecond';
+}
+expect {
+    2027-01-01 00:00:00+00
+}
+
+test timestamp-plus-interval-twice {
+    SELECT (timestamp '2026-01-01' + interval '1 day') + interval '1 day'
+    WHERE timestamptz '2026-01-01 00:00:00+00' + interval '1 day' = timestamptz '2026-01-02 00:00:00+00';
+}
+expect {
+    2026-01-03 00:00:00
+}
+
+test now-minus-interval-is-timestamptz {
+    SELECT 'ok'
+    WHERE now() - interval '7 days' < now()
+      AND now() + interval '1 hour' > now()
+      AND now() - interval '7 days' = now() - interval '1 week'
+      AND now() - interval '7 days' < now() - interval '6 days 23 hours 59 minutes 59 seconds 999999 microseconds';
+}
+expect {
+    ok
+}
+
+test timestamp-columns-plus-interval {
+    CREATE TABLE t (id int, ts timestamp, tz timestamptz);
+    INSERT INTO t VALUES (1, '2026-01-31 08:00', '2026-01-31 08:00+00'), (2, NULL, NULL);
+    SELECT id, ts + interval '1 month', tz - interval '30 minutes' FROM t ORDER BY id;
+}
+expect {
+    1|2026-02-28 08:00:00|2026-01-31 07:30:00+00
+    2||
+}
+
+test todo-app-recent-rows {
+    CREATE TABLE todos (id int PRIMARY KEY, title text, created_at timestamptz NOT NULL DEFAULT now());
+    CREATE INDEX todos_created_at ON todos (created_at);
+    INSERT INTO todos (id, title) VALUES (1, 'new');
+    INSERT INTO todos VALUES (2, 'last week', now() - interval '6 days');
+    INSERT INTO todos VALUES (3, 'old', now() - interval '8 days');
+    INSERT INTO todos VALUES (4, 'older', '2026-01-01 00:00:00+00');
+    SELECT id, title FROM todos WHERE created_at > now() - interval '7 days' ORDER BY created_at DESC;
+}
+expect {
+    1|new
+    2|last week
+}
+
+test fixed-time-window-on-indexed-column {
+    CREATE TABLE todos (id int PRIMARY KEY, created_at timestamptz);
+    CREATE INDEX todos_created_at ON todos (created_at);
+    INSERT INTO todos VALUES (1, '2026-01-09 12:00+00'), (2, '2026-01-03 00:00:01+00'), (3, '2026-01-03 00:00:00+00'), (4, '2025-12-31 00:00:00+00');
+    SELECT id FROM todos WHERE created_at > timestamptz '2026-01-10 00:00:00+00' - interval '7 days' ORDER BY created_at DESC;
+}
+expect {
+    1
+    2
+}
+
+test timestamp-column-compared-with-timestamptz-minus-interval {
+    CREATE TABLE t (id int, ts timestamp);
+    INSERT INTO t VALUES (1, '2026-01-05 00:00'), (2, '2026-01-02 00:00');
+    SELECT id FROM t WHERE ts >= timestamptz '2026-01-10 00:00:00+00' - interval '7 days' ORDER BY id;
+}
+expect {
+    1
+}
+
+test insert-timestamptz-minus-interval-into-column {
+    CREATE TABLE t (tz timestamptz, ts timestamp);
+    INSERT INTO t VALUES (timestamptz '2026-03-31 00:00+00' - interval '1 month', timestamp '2026-03-31' - interval '1 month');
+    SELECT tz, ts FROM t;
+}
+expect {
+    2026-02-28 00:00:00+00|2026-02-28 00:00:00
+}
+
+# Each interval is added in turn: the month first clamps 2026-01-31 to
+# 2026-02-28, then the day gives 2026-03-01.
+test timestamp-plus-two-intervals {
+    SELECT timestamp '2026-01-31' + interval '1 month' + interval '1 day';
+}
+expect {
+    2026-03-01 00:00:00
+}
+
+test now-minus-two-intervals {
+    SELECT 'equal'
+    WHERE now() - interval '7 days' - interval '1 hour' = now() - interval '7 days 1 hour';
+}
+expect {
+    equal
+}
+
+# Values written in another form than the stored one: an offset, a T
+# separator, a date without a time, a cast from text.
+test timestamp-plus-interval-other-input-forms {
+    SELECT '2026-01-01 10:00+05'::timestamptz + interval '1 day',
+           '2026-01-01'::timestamp + interval '1 day',
+           CAST('2026-01-01T10:00' AS timestamp) + interval '1 day',
+           '2026-01-01 10:00'::text::timestamptz + interval '1 day';
+}
+expect {
+    2026-01-02 05:00:00+00|2026-01-02 00:00:00|2026-01-02 10:00:00|2026-01-02 10:00:00+00
+}
+
+test timestamp-columns-plus-interval-other-input-forms {
+    CREATE TABLE ts_forms (tz timestamptz, ts timestamp);
+    INSERT INTO ts_forms VALUES ('2026-01-01 10:00+05', '2026-01-01');
+    SELECT tz + interval '1 hour', ts + interval '1 day', ts::text::timestamptz + interval '1 day'
+    FROM ts_forms;
+}
+expect {
+    2026-01-01 06:00:00+00|2026-01-02 00:00:00|2026-01-02 00:00:00+00
+}
+
+test scalar-subquery-plus-interval {
+    CREATE TABLE ts_max (tz timestamptz, ts timestamp);
+    INSERT INTO ts_max VALUES ('2026-01-01 10:00+05', '2026-01-01');
+    SELECT (SELECT max(tz) FROM ts_max) + interval '1 day',
+           (SELECT max(ts) FROM ts_max) + interval '1 day';
+}
+expect {
+    2026-01-02 05:00:00+00|2026-01-02 00:00:00
+}
+
+# The function the translator calls can also be called by name.
+@skip-if postgres "pg_timestamp_plus_interval is a tursopg function"
+test timestamp-plus-interval-function-with-fractional-part {
+    SELECT pg_timestamp_plus_interval(timestamp '2026-01-01', 1.5, 0, 0);
+}
+@sqlstate 0A000
+expect error {
+    an interval part that is not an integer, 1.5, is not supported
+}
+
+@skip-if postgres "PostgreSQL accepts years past 9999 and BC"
+test timestamp-plus-interval-out-of-range {
+    SELECT timestamp '9999-12-31' + interval '1 day';
+}
+@sqlstate 0A000
+expect error {
+    a result outside the years 1 to 9999 is not supported
+}
+
+@skip-if postgres "PostgreSQL accepts years past 9999 and BC"
+test timestamp-minus-interval-before-year-1 {
+    SELECT timestamp '0001-01-01' - interval '1 day';
+}
+@sqlstate 0A000
+expect error {
+    a result outside the years 1 to 9999 is not supported
+}
+
+@compat-gap "type:interval"
+test interval-plus-timestamptz {
+    SELECT interval '1 day' + timestamptz '2026-01-01 00:00:00+00';
+}
+expect {
+    2026-01-02 00:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
+
+@compat-gap "operator:timestamptz - timestamptz"
+test timestamptz-minus-timestamptz {
+    SELECT timestamptz '2026-01-02 00:00:00+00' - timestamptz '2026-01-01 00:00:00+00';
+}
+expect {
+    1 day
+}
+@sqlstate 42601
+expect @tursopg error {
+    operator does not exist: timestamptz - timestamptz
+}
+
+@compat-gap "type:interval"
+test interval-times-number {
+    SELECT interval '1 day' * 2;
+}
+expect {
+    2 days
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
+
+@compat-gap "type:interval"
+test bare-interval-literal {
+    SELECT interval '1 day';
+}
+expect {
+    1 day
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
+
+@compat-gap "type:interval"
+test timestamptz-minus-computed-interval {
+    SELECT now() - ('1 ' || 'day')::interval > timestamptz '2000-01-01 00:00:00+00';
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
+
+@compat-gap "operator:date + interval"
+test date-plus-interval {
+    SELECT date '2026-01-31' + interval '1 month';
+}
+expect {
+    2026-02-28 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    adding an interval is supported only for timestamp and timestamptz, not date
+}
+
+@compat-gap "type:interval"
+test untyped-literal-minus-interval {
+    SELECT '2026-01-01' - interval '1 day';
+}
+@sqlstate 22007
+expect error {
+    invalid input syntax for type interval: "2026-01-01"
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+@compat-gap "type:interval"
+test interval-literal-unknown-unit {
+    SELECT timestamp '2026-01-01' + interval '1 fortnight';
+}
+@sqlstate 22007
+expect error {
+    invalid input syntax for type interval: "1 fortnight"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    the interval literal "1 fortnight" is not supported
+}
+
+@compat-gap "type:interval"
+test interval-literal-repeated-unit {
+    SELECT timestamp '2026-01-01' + interval '1 day 1 days';
+}
+@sqlstate 22007
+expect error {
+    invalid input syntax for type interval: "1 day 1 days"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    the interval literal "1 day 1 days" is not supported
+}
+
+@compat-gap "type:interval"
+test interval-literal-empty {
+    SELECT timestamp '2026-01-01' + interval '';
+}
+@sqlstate 22007
+expect error {
+    invalid input syntax for type interval: ""
+}
+@sqlstate 0A000
+expect @tursopg error {
+    the interval literal "" is not supported
+}
+
+@compat-gap "type:interval"
+test interval-literal-out-of-range {
+    SELECT timestamp '2026-01-01' + interval '2147483648 days';
+}
+@sqlstate 22015
+expect error {
+    interval field value out of range: "2147483648 days"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    the interval literal "2147483648 days" is not supported
+}
+
+@compat-gap "type:interval"
+test interval-literal-time-form {
+    SELECT timestamp '2026-01-01' + interval '1:30';
+}
+expect {
+    2026-01-01 01:30:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    the interval literal "1:30" is not supported
+}
+
+@compat-gap "type:interval"
+test interval-literal-ago {
+    SELECT timestamp '2026-01-01' + interval '1 day ago';
+}
+expect {
+    2025-12-31 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    the interval literal "1 day ago" is not supported
+}
+
+@compat-gap "type:interval"
+test interval-literal-fraction {
+    SELECT timestamp '2026-01-01' + interval '1.5 days';
+}
+expect {
+    2026-01-02 12:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    the interval literal "1.5 days" is not supported
+}
+
+@compat-gap "type:interval"
+test interval-literal-with-field {
+    SELECT timestamp '2026-01-01' + interval '1' day;
+}
+expect {
+    2026-01-02 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    an interval literal with a type modifier is not supported
+}
+
+@compat-gap "type:interval"
+test generated-column-timestamp-plus-interval {
+    CREATE TABLE t (ts timestamp, g timestamp GENERATED ALWAYS AS (ts + interval '1 day') STORED);
+    INSERT INTO t (ts) VALUES ('2026-01-01');
+    SELECT g FROM t;
+}
+expect {
+    2026-01-02 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    an interval in a generated column is not supported
+}
+
+@compat-gap "type:interval"
+test index-expression-timestamp-plus-interval {
+    CREATE TABLE t (ts timestamp);
+    CREATE INDEX i ON t ((ts + interval '1 day'));
+    INSERT INTO t VALUES ('2026-01-01');
+    SELECT ts FROM t;
+}
+expect {
+    2026-01-01 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    an interval in an index expression is not supported
+}
+
+test default-and-check-with-interval {
+    CREATE TABLE t (id int, due timestamptz DEFAULT now() + interval '1 day', ts timestamp CHECK (ts > timestamp '2026-01-01' - interval '1 day'));
+    INSERT INTO t (id, ts) VALUES (1, '2026-01-01');
+    SELECT id FROM t WHERE due > now();
+}
+expect {
+    1
+}
+
+test check-with-interval-rejects-row {
+    CREATE TABLE t (ts timestamp CHECK (ts > timestamp '2026-01-01' - interval '1 day'));
+    INSERT INTO t VALUES ('2025-12-31');
+}
+@sqlstate 23514
+expect error {
+    new row for relation "t" violates check constraint "t_ts_check"
+}
+
+test update-set-timestamptz-plus-interval {
+    CREATE TABLE t (a timestamptz);
+    INSERT INTO t VALUES ('2026-01-31 00:00+00');
+    UPDATE t SET a = a + interval '1 month';
+    SELECT a FROM t;
+}
+expect {
+    2026-02-28 00:00:00+00
+}
+
+test group-by-date-trunc-of-timestamptz-plus-interval {
+    CREATE TABLE t (a timestamptz);
+    INSERT INTO t VALUES ('2026-01-31 00:00+00'), ('2026-01-31 05:00+00'), ('2026-02-01 00:00+00');
+    SELECT date_trunc('day', a + interval '1 day'), count(*) FROM t GROUP BY 1 ORDER BY 1;
+}
+expect {
+    2026-02-01 00:00:00+00|2
+    2026-02-02 00:00:00+00|1
+}
+
+@compat-gap "operator:text - interval"
+test text-column-minus-interval {
+    CREATE TABLE t (a text);
+    INSERT INTO t VALUES ('2026-01-01');
+    SELECT a - interval '1 day' FROM t;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text - interval
+}
+@sqlstate 0A000
+expect @tursopg error {
+    adding an interval is supported only for timestamp and timestamptz, not text
+}
+
+@compat-gap "function:coalesce(timestamp, timestamptz)"
+test coalesce-timestamp-timestamptz-plus-interval {
+    CREATE TABLE ts_coalesce (ts timestamp);
+    INSERT INTO ts_coalesce VALUES ('2026-01-01');
+    SELECT coalesce(ts, now()) + interval '1 day' FROM ts_coalesce;
+}
+expect {
+    2026-01-02 00:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    adding an interval is supported only for timestamp and timestamptz, not text
+}
+
+@compat-gap "type:interval"
+test interval-plus-interval {
+    SELECT interval '1 day' + interval '1 day';
+}
+expect {
+    2 days
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}

@@ -11,6 +11,11 @@ use thiserror::Error;
 pub mod sqlstate;
 pub mod translator;
 
+/// The frontend function that the translator calls for `timestamp + interval`
+/// and `timestamp - interval` with an interval literal. Its arguments are the
+/// timestamp and the interval's months, days and microseconds.
+pub const TIMESTAMP_PLUS_INTERVAL_FUNCTION: &str = "pg_timestamp_plus_interval";
+
 #[derive(Debug, Error)]
 pub enum ParseError {
     #[error("{0}")]

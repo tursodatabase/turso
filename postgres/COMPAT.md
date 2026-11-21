@@ -184,6 +184,22 @@ supported (0A000) in column types, casts, typed literals and domains. So are
 return date, time, timetz or interval, such as `age`, `make_date`, `to_date`
 and `date()`.
 
+The one use of interval that works is a timestamp or timestamptz plus or
+minus an interval literal, such as `now() - interval '7 days'` or
+`created_at + '1 hour'::interval`. The left side must be a timestamp or
+timestamptz: a column, `now()` or another function that returns one, a cast or
+a typed literal. The result has the type of the left side. The literal is a
+list of integers, each optionally signed and followed by one of the units
+microsecond, millisecond, second, minute, hour, day, week, month or year
+(singular or plural, any case), such as `'1 day 2 hours'` or `'-1 month'`. The
+months are added first, and a day past the end of the month becomes its last
+day (`timestamp '2026-03-31' - interval '1 month'` is 2026-02-28), then the
+days, then the time, as in PostgreSQL. A result before year 1 or after 9999
+fails with 0A000. Other interval literals (`'1:30'`, `'1 day ago'`, `'1.5
+days'`, `interval '1' day`), `interval + timestamp`, a date or a value of
+unknown type on the left, a computed or parameter interval, and an interval
+in a generated column or an index expression fail with 0A000.
+
 `now()`, `transaction_timestamp()` and `CURRENT_TIMESTAMP` are the time the
 transaction started, and `LOCALTIMESTAMP` is that time as a timestamp in UTC;
 `statement_timestamp()` is the time the client's query arrived, shared by all
@@ -277,7 +293,7 @@ date, timestamp or timestamptz with a value of another custom type, such as
 | Row-wise comparison | ❌ Not supported | Row constructors `(a,b) < (c,d)` fail to translate |
 | SELECT ... FOR UPDATE/SHARE | ❌ Not supported | Rejected |
 | SELECT FOR NO KEY UPDATE/SELECT FOR KEY SHARE lock modes | ❌ Not supported | Rejected |
-| SQL standard interval handling | ❌ Not supported | interval is rejected (0A000) |
+| SQL standard interval handling | ❌ Not supported | interval is rejected (0A000), except timestamp ± interval literal |
 | SYSTEM_USER | ❌ Not supported | current_user, current_role and session_user are supported |
 | TABLE statement | ✅ Supported | |
 | Underscores (_) for thousands separators | ✅ Supported | |
