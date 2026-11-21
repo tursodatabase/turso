@@ -282,6 +282,17 @@ pub(super) fn choose_best_btree_candidate(
     let mut rhs_table_mask = TableMask::default();
     rhs_table_mask.set(rhs_table_idx)?;
 
+    // The sort that an ordered candidate saves does not depend on the
+    // candidate. The cost is computed here and not in the loop, because the
+    // compiler moved the logarithm out of the loop and computed it also for
+    // a search without an order target.
+    let order_target_and_sort_cost = maybe_order_target.map(|order_target| {
+        (
+            order_target,
+            estimate_sort_cpu_cost(*base_row_count, params),
+        )
+    });
+
     // Estimate cost for each candidate index (including the rowid index) and
     // keep the best candidate.
     let mut lhs_mask_key = rhs_constraints.lhs_mask_key.borrow_mut();
@@ -343,7 +354,7 @@ pub(super) fn choose_best_btree_candidate(
         };
 
         let (iter_dir, is_index_ordered, order_satisfiability_bonus) =
-            if let Some(order_target) = maybe_order_target {
+            if let Some((order_target, sort_cost_saved)) = order_target_and_sort_cost {
                 // Reuse the same index-vs-order matching logic as final plan
                 // validation, but allow any equality-constrained seek prefix to
                 // be skipped here. Candidate scoring only needs to know whether
@@ -377,7 +388,6 @@ pub(super) fn choose_best_btree_candidate(
 
                 let satisfies_order = all_same_direction || all_opposite_direction;
                 if satisfies_order {
-                    let sort_cost_saved = estimate_sort_cpu_cost(*base_row_count, params);
                     (
                         if all_same_direction {
                             IterationDirection::Forwards
