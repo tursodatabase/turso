@@ -2,15 +2,17 @@ use turso_core::EncryptionContext;
 
 use crate::{database_sync_operations::WAL_FRAME_SIZE, errors::Error, Result};
 
+/// Format/version marker written at the start of encrypted metadata.
+/// Also serves as metadata's complete AAD and the prefix of change-chunk AAD.
+/// Chunk AAD appends the batch ID, record kind, record index, record length and
+/// chunk index, so its complete AAD differs from metadata's.
 const INFO_HEADER: &[u8; 10] = b"TSYNMETA\x01\x00";
-const INFO_AAD: &[u8] = b"turso-sync/info/v1\0TSYNMETA\x01\x00";
-const CHANGES_DOMAIN: &[u8] = b"turso-sync/changes/chunk/v2\0";
-const CHUNK_AAD_SIZE: usize = CHANGES_DOMAIN.len() + 16 + 1 + 3 * 8;
+const CHUNK_AAD_SIZE: usize = INFO_HEADER.len() + 16 + 1 + 3 * 8;
 pub(crate) const CHUNK_SIZE: usize = 32 * 1024;
 
 pub(crate) fn seal_metadata(crypto: &EncryptionContext, plaintext: &[u8]) -> Result<Vec<u8>> {
     let mut bytes = INFO_HEADER.to_vec();
-    bytes.extend(seal(crypto, plaintext, INFO_AAD)?);
+    bytes.extend(seal(crypto, plaintext, INFO_HEADER)?);
     Ok(bytes)
 }
 
@@ -18,7 +20,7 @@ pub(crate) fn open_metadata(crypto: &EncryptionContext, bytes: &[u8]) -> Result<
     if !bytes.starts_with(INFO_HEADER) {
         return Err(invalid("invalid encrypted metadata header"));
     }
-    open(crypto, &bytes[INFO_HEADER.len()..], INFO_AAD)
+    open(crypto, &bytes[INFO_HEADER.len()..], INFO_HEADER)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,7 +108,7 @@ impl ChangeIdentity {
         let mut aad = [0; CHUNK_AAD_SIZE];
         let mut offset = 0;
         for field in [
-            CHANGES_DOMAIN,
+            INFO_HEADER.as_slice(),
             self.id.as_slice(),
             &[self.kind as u8],
             &record_index.to_le_bytes(),

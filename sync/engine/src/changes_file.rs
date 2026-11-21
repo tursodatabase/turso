@@ -1,3 +1,14 @@
+//! A reusable scratch file for downloaded sync changes.
+//!
+//! Each download follows reset -> append records -> finish -> read records.
+//! A batch contains either logical records or page frames, with optional
+//! authenticated encryption. Readers check its size and record counts against
+//! the completed batch's in-memory descriptor.
+//!
+//! Pending I/O and write buffers survive coroutine cancellation. Reset waits
+//! for accepted I/O before truncating the file. Completed batches need no
+//! fsync because scratch data is discarded and downloaded again after restart.
+
 use std::sync::{Arc, Mutex};
 
 use turso_core::{Buffer, Completion, EncryptionContext, File};
@@ -12,10 +23,22 @@ use crate::{
 
 const READ_BUFFER_SIZE: usize = 64 * 1024;
 
+/// Expected contents of a batch whose writes have completed.
+///
+/// Readers use this in-memory description to reject incomplete or extended
+/// files. EOF alone cannot establish completeness: removing an entire final
+/// encrypted record would leave the preceding records able to authenticate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SealedChanges {
+    /// Fresh random batch ID and record kind (logical records or page frames).
+    /// Encrypted chunks authenticate both, preventing substitution across batches.
     identity: ChangeIdentity,
+    /// Expected number of records and total plaintext payload bytes.
+    /// `bytes` excludes length prefixes, authentication tags and nonces; the
+    /// reader compares it with the total payload bytes recovered from records.
     counts: ChangeCounts,
+    /// Expected physical file length, including length prefixes and encryption
+    /// overhead. Unlike `counts.bytes`, this measures the stored representation.
     size: u64,
 }
 
@@ -29,6 +52,11 @@ impl SealedChanges {
 }
 
 enum State {
+    /// Newly constructed; no batch has been prepared.
+    Init,
+    /// The file is being used directly by the legacy sync path.
+    Legacy,
+    /// A managed operation failed or was interrupted.
     Invalid,
     Writing {
         identity: ChangeIdentity,
@@ -51,7 +79,7 @@ impl ChangesFile {
         Self {
             file,
             crypto,
-            state: State::Invalid,
+            state: State::Init,
             pending: None,
             write_result: Arc::new(Mutex::new(None)),
         }
@@ -82,7 +110,9 @@ impl ChangesFile {
             return Err(invalid("encrypted staging does not support legacy sync"));
         }
         self.state = State::Invalid;
-        self.wait_pending(coro).await
+        self.wait_pending(coro).await?;
+        self.state = State::Legacy;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -125,6 +155,10 @@ impl ChangesFile {
         Ok(())
     }
 
+    /// Append a logical record or page frame to the current batch.
+    /// Logical length prefixes remain plaintext; encrypted payloads are stored in
+    /// authenticated chunks. Failure or cancellation leaves the batch Invalid
+    /// until reset.
     pub(crate) async fn append_record<Ctx>(
         &mut self,
         coro: &Coro<Ctx>,
@@ -191,6 +225,9 @@ impl ChangesFile {
         Ok(())
     }
 
+    /// Append a page frame to a batch prepared for pages.
+    /// Plaintext writes use the supplied buffer without copying its contents.
+    /// Encrypted writes delegate to append_record to encrypt the frame.
     pub(crate) async fn append_page<Ctx>(
         &mut self,
         coro: &Coro<Ctx>,
@@ -226,8 +263,9 @@ impl ChangesFile {
         Ok(())
     }
 
-    /// Seal only in memory: this scratch batch is abandoned after restart, so
-    /// completed writes must be visible to readers but need no durability flush.
+    /// Wait for pending writes, then capture the batch identity, counts and file size.
+    /// Completion is recorded only in memory. Scratch data is downloaded again
+    /// after restart, so completed writes need no fsync.
     pub(crate) async fn finish<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<SealedChanges> {
         let State::Writing {
             identity,
@@ -247,6 +285,9 @@ impl ChangesFile {
         Ok(sealed)
     }
 
+    /// Open a reader after checking the completed batch's file length and optional
+    /// expected record kind. Encrypted chunks are authenticated as records are
+    /// read; final record and payload-byte counts are checked at EOF.
     pub(crate) async fn open_reader<'a, Ctx>(
         &'a mut self,
         coro: &Coro<Ctx>,
@@ -278,6 +319,9 @@ impl ChangesFile {
             .await
     }
 
+    /// Wait for prior I/O, then write the buffer and verify that every byte was written.
+    /// The completion and buffer remain owned across cancellation so reset can
+    /// drain an accepted write before truncating the file.
     async fn write_buffer<Ctx>(
         &mut self,
         coro: &Coro<Ctx>,
@@ -307,6 +351,9 @@ impl ChangesFile {
         }
     }
 
+    /// Collect exactly length stored bytes, continuing after partial reads.
+    /// Each read requests at most READ_BUFFER_SIZE bytes; premature EOF is an error.
+    /// Returns raw file bytes without decoding or decrypting them.
     async fn read_exact<Ctx>(
         &mut self,
         coro: &Coro<Ctx>,
@@ -351,6 +398,13 @@ impl ChangesFile {
     }
 }
 
+/// A sequential read cursor over one completed batch in a ChangesFile.
+///
+/// Borrows the file mutably so it cannot be reset or appended through
+/// ChangesFile while this reader exists. Buffers file reads and returns
+/// plaintext records, authenticating and decrypting encrypted chunks as needed.
+/// Tracks consumed records and payload bytes, checking them against the sealed
+/// batch's counts and file size before reporting EOF.
 pub(crate) struct ChangesReader<'a> {
     file: &'a mut ChangesFile,
     sealed: SealedChanges,
@@ -366,6 +420,9 @@ impl ChangesReader<'_> {
         self.sealed.is_empty()
     }
 
+    /// Return the next plaintext record, or None after verifying the batch's end.
+    /// The batch remains Invalid during the read and returns to Sealed only on
+    /// success. Failed or cancelled reads require reset before the batch is reused.
     pub(crate) async fn next_record<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<Option<Vec<u8>>> {
         if self.finished {
             return Ok(None);
@@ -383,6 +440,10 @@ impl ChangesReader<'_> {
         result
     }
 
+    /// Read a record using its length prefix or the fixed page-frame size.
+    /// Check its payload and stored lengths against the remaining batch limits,
+    /// then read plaintext bytes or authenticate and decrypt each encrypted chunk.
+    /// After all expected records, verify counts and file size before returning None.
     async fn read_record<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<Option<Vec<u8>>> {
         if self.counts.records == self.sealed.counts.records {
             if self.offset != self.sealed.size
@@ -453,6 +514,9 @@ impl ChangesReader<'_> {
         Ok(Some(bytes))
     }
 
+    /// Decode a logical record's plaintext length prefix across buffer boundaries.
+    /// Reject zero, noncanonical encodings, unterminated values and u64 overflow.
+    /// read_record checks the decoded length against the remaining batch limits.
     async fn read_length<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<u64> {
         let mut length = 0u64;
         for index in 0..10 {
@@ -471,6 +535,9 @@ impl ChangesReader<'_> {
         Err(invalid("unterminated change protobuf length"))
     }
 
+    /// Consume one stored byte, fetching more data if the read buffer is empty.
+    /// Advance both the buffer position and file offset by one.
+    /// Performs no decoding or decryption.
     async fn read_byte<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<u8> {
         self.refill(coro).await?;
         let byte = self.read_buffer[self.read_buffer_pos];
@@ -479,6 +546,10 @@ impl ChangesReader<'_> {
         Ok(byte)
     }
 
+    /// Append exactly length stored bytes to output across read-buffer boundaries.
+    /// Advance the buffer position and file offset as bytes are consumed, without
+    /// decoding or decrypting them. Failure or cancellation may leave output
+    /// containing only part of the requested data.
     async fn read_buffered<Ctx>(
         &mut self,
         coro: &Coro<Ctx>,
@@ -497,6 +568,10 @@ impl ChangesReader<'_> {
         Ok(())
     }
 
+    /// Fetch another block only after all buffered bytes have been consumed.
+    /// Read at most READ_BUFFER_SIZE bytes, bounded by the sealed file size.
+    /// Reaching that boundary here is unexpected EOF; read_record handles normal
+    /// completion. Prefetching does not advance the file offset; consuming bytes does.
     async fn refill<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<()> {
         if self.read_buffer_pos == self.read_buffer.len() {
             let wanted = (self.sealed.size - self.offset).min(READ_BUFFER_SIZE as u64) as usize;
