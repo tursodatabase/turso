@@ -1089,6 +1089,8 @@ pub fn translate_create_sequence(
             Some(code) => LimboError::Dialect(Box::new(DialectError {
                 code: code.into(),
                 message: error.message,
+                detail: None,
+                hint: None,
             })),
             None => LimboError::ParseError(error.message),
         });

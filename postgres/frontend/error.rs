@@ -80,7 +80,7 @@ pub fn several_dropped_objects_have_dependents(error: LimboError) -> LimboError 
         return error;
     };
     LimboError::Dialect(Box::new(DialectError {
-        code: SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+        code: Cow::Borrowed(SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST),
         message: "cannot drop desired object(s) because other objects depend on them".into(),
         detail: Some(refusal.dependents.join("\n")),
         hint: Some(DROP_CASCADE_HINT.into()),
@@ -93,7 +93,7 @@ pub fn several_dropped_objects_have_dependents(error: LimboError) -> LimboError 
 /// it drops, with the DROP statement that removes that kind.
 pub fn wrong_relation_kind(name: &str, expected_kind: &str, kind: &str) -> LimboError {
     LimboError::Dialect(Box::new(DialectError {
-        code: SQLSTATE_WRONG_OBJECT_TYPE,
+        code: Cow::Borrowed(SQLSTATE_WRONG_OBJECT_TYPE),
         message: format!("\"{name}\" is not a {expected_kind}"),
         detail: None,
         hint: Some(format!(
