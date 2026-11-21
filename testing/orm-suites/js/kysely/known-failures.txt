@@ -1,0 +1,37 @@
+sqlite: delete::should order and limit the amount of deleted rows and return
+sqlite: introspect getTables implicit autoincrement::should detect autoincrement on implicitly auto incrementing columns
+sqlite: introspect getTables::should get table metadata
+sqlite: migration getMigrations::should get migrations
+sqlite: migration migrateDown Migrate up should work when timestamps are equal::should use the same ordering strategy for migrations for both not executed migrations and executed migrations
+sqlite: migration migrateDown::should migrate down one step
+sqlite: migration migrateDown::should migrate down one step with allowUnorderedMigrations enabled
+sqlite: migration migrateDown::should return an error if a new migration is added before the last executed one
+sqlite: migration migrateTo with allowUnorderedMigrations enabled::should migrate all the way down
+sqlite: migration migrateTo with allowUnorderedMigrations enabled::should migrate down if allowUnorderedMigrations is enabled and migration names are not in order
+sqlite: migration migrateTo with allowUnorderedMigrations enabled::should migrate down to a specific migration
+sqlite: migration migrateTo with allowUnorderedMigrations enabled::should migrate up to a specific migration
+sqlite: migration migrateTo::should migrate all the way down
+sqlite: migration migrateTo::should migrate all the way down with a foreign NO_MIGRATIONS object
+sqlite: migration migrateTo::should migrate down to a specific migration
+sqlite: migration migrateTo::should migrate up to a specific migration
+sqlite: migration migrateToLatest using folder of migration files::should run migrations from a folder
+sqlite: migration migrateToLatest with allowUnorderedMigrations::should return an error if a previously executed migration is missing
+sqlite: migration migrateToLatest with allowUnorderedMigrations::should return an error if a the last executed migration is not found
+sqlite: migration migrateToLatest::should return an error if a new migration is added before the last executed one
+sqlite: migration migrateToLatest::should return an error if a previously executed migration is missing
+sqlite: migration migrateToLatest::should return an error if a the last executed migration is not found
+sqlite: migration migrateToLatest::should return an error if one of the migrations fails
+sqlite: migration migrateToLatest::should run a new migration added before the last executed one with allowUnorderedMigrations enabled
+sqlite: migration migrateToLatest::should run all unexecuted migrations
+sqlite: migration migrateToLatest::should work correctly when run in parallel
+sqlite: migration migrateUp::should execute in transaction if disableTransactions is false on the `Migrator` instance and transactionDdl supported
+sqlite: migration migrateUp::should execute in transaction when `migrateUp` is called with disableTransactions false even though the Migrator instance has disableTransactions true
+sqlite: migration migrateUp::should migrate up one step
+sqlite: migration migrateUp::should migrate up one step with allowUnorderedMigrations enabled
+sqlite: migration migrateUp::should not execute in transaction if disableTransactions is true on the `Migrator` instance
+sqlite: migration migrateUp::should not execute in transaction if disableTransactions is true when calling `migrateUp`
+sqlite: migration migrateUp::should refuse to run migrations using a provided transaction due to lack of support for transactional DDL
+sqlite: migration migrateUp::should return an error when migrating up if a new migration is added before the last executed one
+sqlite: schema create table::should create a table with all data types
+sqlite: select::should not allow SQL injection in column refs
+sqlite: update::should order and limit the amount of updated rows and return
