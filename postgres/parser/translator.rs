@@ -7740,7 +7740,10 @@ fn pg_type_name_to_ast_type(
         }
         // For CAST expressions, map all text-like PG types to TEXT and
         // boolean to INTEGER for SQLite VDBE compatibility
-        "BOOLEAN" | "BOOL" => "INTEGER",
+        // Affinity resolver returns INTEGER for any string with substring INT
+        // this mechanism allows for preserving INTEGER affinity cast execution path
+        // while identifying the original BOOL cast type in inject_cast_metadata
+        "BOOLEAN" | "BOOL" => "BOOLINT",
         "DATE" => "date",
         "TIME" => "time",
         "TIMESTAMP" => "timestamp",

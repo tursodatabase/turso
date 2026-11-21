@@ -900,12 +900,6 @@ fn translate_cast_expr(
             return Ok(target_register);
         }
         if let Some(resolved) = custom_type_cast_chain(tn, resolver.schema())? {
-            let _ = resolver.catalog.dialect.inject_cast_metadata(
-                program,
-                type_name,
-                target_register,
-                resolver.schema(),
-            );
             emit_custom_type_cast(program, resolved, tn, target_register, resolver)?;
             return Ok(target_register);
         }
@@ -965,10 +959,18 @@ fn emit_custom_type_cast(
     // does: CAST(5.5 AS smallint) is 5, as are CAST(5.5 AS bigint) and
     // CAST(5.5 AS d) for a domain d over integer.
     match resolver.schema().plain_input_type(&resolved)? {
-        StrictType::Stores(storage_class) => program.emit_insn(Insn::Cast {
-            reg,
-            affinity: storage_class.affinity(),
-        }),
+        StrictType::Stores(storage_class) => {
+            let _ = resolver.catalog.dialect.inject_cast_metadata(
+                program,
+                &Some(type_name.clone()),
+                reg,
+                resolver.schema(),
+            );
+            program.emit_insn(Insn::Cast {
+                reg,
+                affinity: storage_class.affinity(),
+            });
+        }
         StrictType::Any => {}
     }
     emit_store_value(

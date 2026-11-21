@@ -438,7 +438,7 @@ impl Dialect for PostgresDialect {
 
         // First check whether this is a direct PostgreSQL integer type.
         let integer_width = match name.to_ascii_uppercase().as_str() {
-            "INT2" | "SMALLINT" => Some(IntegerWidth::Int16),
+            "INT2" | "SMALLINT" | "BOOLINT" => Some(IntegerWidth::Int16),
             "INT4" | "INTEGER" | "INT" => Some(IntegerWidth::Int32),
             "INT8" | "BIGINT" => Some(IntegerWidth::Int64),
             _ => None,
@@ -462,12 +462,22 @@ impl Dialect for PostgresDialect {
 
         let metadata_reg_first = program.alloc_registers(2);
 
-        // Preserve the original operand.
-        program.emit_insn(Insn::Copy {
-            src_reg: target_register,
-            dst_reg: metadata_reg_first,
-            extra_amount: 0,
-        });
+        if matches!(name.to_ascii_uppercase().as_str(), "BOOLINT") {
+            // all non decimal strings are cast to 0 for INTEGER affinity
+            program.emit_insn(Insn::Int64 {
+                _p1: 0,
+                out_reg: metadata_reg_first,
+                _p3: 0,
+                value: 0,
+            })
+        } else {
+            // Preserve the original operand.
+            program.emit_insn(Insn::Copy {
+                src_reg: target_register,
+                dst_reg: metadata_reg_first,
+                extra_amount: 0,
+            });
+        }
 
         // Store either the direct integer width or the domain name.
         if let Some(width) = integer_width {

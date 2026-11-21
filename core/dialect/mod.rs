@@ -647,10 +647,6 @@ pub trait Dialect: Send + Sync + 'static {
         out.push_str("'\"");
     }
 
-    fn cast_to_integer(&self, value: &Value, _: &ProgramState, _: &Schema) -> Result<Value> {
-        Ok(value.exec_cast("INTEGER")?)
-    }
-
     fn inject_cast_metadata(
         &self,
         _: &mut ProgramBuilder,
@@ -659,6 +655,10 @@ pub trait Dialect: Send + Sync + 'static {
         _: &Schema,
     ) -> Result<()> {
         Ok(())
+    }
+
+    fn cast_to_integer(&self, value: &Value, _: &ProgramState, _: &Schema) -> Result<Value> {
+        Ok(value.exec_cast("INTEGER")?)
     }
 }
 
