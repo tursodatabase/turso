@@ -677,6 +677,12 @@ snapshot max-with-equality-prefix-bytecode {
     SELECT MAX(value) FROM measurements WHERE category = 'a';
 }
 
+# COALESCE(MIN(x), 0) stops at the first index entry, like MIN(x).
+@setup min_max_equality_prefix
+snapshot coalesce-min-with-equality-prefix-bytecode {
+    SELECT COALESCE(MIN(value), 0) FROM measurements WHERE category = 'a';
+}
+
 @setup schema
 snapshot-eqp index-for-max-materialized-cte {
     WITH prices(price) AS MATERIALIZED (

@@ -898,9 +898,17 @@ fn detect_simple_aggregate(
     let agg = plan.aggregates.first().unwrap();
     let result_expr = &plan.result_columns.first().unwrap().expr;
 
-    // The result column must be exactly the aggregate expression (not wrapped in
-    // something like `length(count(*))`).
-    if !exprs_are_equivalent(result_expr, &agg.original_expr) {
+    // The COUNT fast path writes the count straight into the result register,
+    // so its result column must be exactly the aggregate (not wrapped in
+    // something like `length(count(*))`). The MIN/MAX fast path only stops the
+    // loop at the first qualifying row and then computes the result column as
+    // usual, so it also accepts a wrapper such as `COALESCE(MIN(x), 0)`, like
+    // SQLite's minMaxQuery().
+    let result_is_aggregate = exprs_are_equivalent(result_expr, &agg.original_expr);
+    if !result_is_aggregate
+        && (!matches!(agg.func, AggFunc::Min | AggFunc::Max)
+            || !wrapper_reads_only_aggregate(result_expr, &agg.original_expr)?)
+    {
         return Ok(None);
     }
 
@@ -948,6 +956,50 @@ fn detect_simple_aggregate(
         }
         _ => None,
     })
+}
+
+/// Returns true when `result_expr` reads no table column, subquery or
+/// register outside `aggregate`. The MIN/MAX fast path leaves the cursor on the
+/// extremum row, so a column read outside the aggregate would see that row
+/// instead of the row the normal aggregate loop leaves behind.
+fn wrapper_reads_only_aggregate(result_expr: &Expr, aggregate: &Expr) -> Result<bool> {
+    let mut reads_only_aggregate = true;
+    walk_expr(result_expr, &mut |expr: &Expr| -> Result<WalkControl> {
+        if exprs_are_equivalent(expr, aggregate) {
+            return Ok(WalkControl::SkipChildren);
+        }
+        // Allow only expressions that compute a value from their operands.
+        // Everything else (columns, subqueries, registers, unresolved names)
+        // could read state outside the aggregate.
+        let is_window_call = matches!(
+            expr,
+            Expr::FunctionCall { filter_over, .. } if filter_over.over_clause.is_some()
+        );
+        if !is_window_call
+            && matches!(
+                expr,
+                Expr::Literal(..)
+                    | Expr::Variable(..)
+                    | Expr::FunctionCall { .. }
+                    | Expr::Binary(..)
+                    | Expr::Unary(..)
+                    | Expr::Parenthesized(..)
+                    | Expr::Cast { .. }
+                    | Expr::Collate(..)
+                    | Expr::Case { .. }
+                    | Expr::Between { .. }
+                    | Expr::InList { .. }
+                    | Expr::IsNull(..)
+                    | Expr::NotNull(..)
+                    | Expr::Like { .. }
+            )
+        {
+            return Ok(WalkControl::Continue);
+        }
+        reads_only_aggregate = false;
+        Ok(WalkControl::SkipChildren)
+    })?;
+    Ok(reads_only_aggregate)
 }
 
 /// The table reads chosen by the join search.

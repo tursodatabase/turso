@@ -3,7 +3,7 @@ use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
 use crate::translate::expr_context::{ExprContext, ExprProperties, TableMetadata};
 use crate::{
-    schema::{Column, Index, IndexColumn, Schema},
+    schema::{Column, Index, IndexColumn, Schema, Table},
     translate::{
         collate::{comparison_collation, in_list_collation, CollationSeq},
         expr::{
@@ -408,8 +408,16 @@ fn estimate_selectivity(
 
     match op {
         ConstraintOperator::AstNativeOperator(ast::Operator::Equals) => {
-            let is_pk_or_rowid_alias =
-                is_rowid || column.is_some_and(|c| c.is_rowid_alias() || c.primary_key());
+            // One column of a primary key with several columns is not unique
+            // on its own, so it takes the indexed-column estimate below.
+            let is_single_column_primary_key = column.is_some_and(|c| c.primary_key())
+                && matches!(
+                    &table_reference.table,
+                    Table::BTree(table) if table.primary_key_columns.len() == 1
+                );
+            let is_pk_or_rowid_alias = is_rowid
+                || column.is_some_and(|c| c.is_rowid_alias())
+                || is_single_column_primary_key;
 
             let selectivity_when_unique = if row_count > 0 {
                 1.0 / row_count as f64

@@ -109,6 +109,7 @@ int main(int argc, char *argv[]) {
   struct itimerval itval;
   struct sigaction sigact;
   int fd, seed;
+  int seed_given = 0;
 
   printf("CHECKING IF SQLITE IS THREADSAFE: RETURN VALUE = %d\n",
          sqlite3_threadsafe());
@@ -150,7 +151,7 @@ int main(int argc, char *argv[]) {
 
   /* Parse args */
 
-  while ((c = getopt(argc, argv, "w:c:r:l:i:m:o:t:0:1:2:3:4:")) != -1) {
+  while ((c = getopt(argc, argv, "w:c:r:l:i:m:o:t:s:0:1:2:3:4:")) != -1) {
     switch (c) {
     case 'w':
       printf("option w with value '%s'\n", optarg);
@@ -179,6 +180,11 @@ int main(int argc, char *argv[]) {
     case 't':
       printf("option t (number of transactions) with value '%s'\n", optarg);
       num_trans = atoi(optarg);
+      break;
+    case 's':
+      printf("option s (random seed) with value '%s'\n", optarg);
+      seed = atoi(optarg);
+      seed_given = 1;
       break;
     case 'i':
       printf("option i with value '%s'\n", optarg);
@@ -320,20 +326,23 @@ int main(int argc, char *argv[]) {
     exit(1);
   }
 
-  fd = open("/dev/urandom", O_RDONLY);
-  if (fd == -1) {
-    fd = open("/dev/random", O_RDONLY);
+  /* -s fixes the seed, so that with -c 1 and -t a run is repeatable. */
+  if (!seed_given) {
+    fd = open("/dev/urandom", O_RDONLY);
     if (fd == -1) {
-      struct timeval tv;
-      gettimeofday(&tv, NULL);
-      seed = (tv.tv_sec ^ tv.tv_usec) * tv.tv_sec * tv.tv_usec ^ tv.tv_sec;
+      fd = open("/dev/random", O_RDONLY);
+      if (fd == -1) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        seed = (tv.tv_sec ^ tv.tv_usec) * tv.tv_sec * tv.tv_usec ^ tv.tv_sec;
+      } else {
+        read(fd, &seed, sizeof(seed));
+        close(fd);
+      }
     } else {
       read(fd, &seed, sizeof(seed));
       close(fd);
     }
-  } else {
-    read(fd, &seed, sizeof(seed));
-    close(fd);
   }
   SetSeed(seed);
 
@@ -394,46 +403,53 @@ int main(int argc, char *argv[]) {
                    (void *)&(thd_arg[t_num]));
   }
 
-  printf("\nRAMP-UP TIME.(%d sec.)\n", lampup_time);
-  fflush(stdout);
-  sleep(lampup_time);
-  printf("\nMEASURING START.\n\n");
-  fflush(stdout);
+  if (num_trans > 0) {
+    /* With -t, each thread stops after its transaction count. Count every
+       transaction and wait for the threads, so a run does the same work
+       every time (used for instruction-count profiling). */
+    counting_on = 1;
+  } else {
+    printf("\nRAMP-UP TIME.(%d sec.)\n", lampup_time);
+    fflush(stdout);
+    sleep(lampup_time);
+    printf("\nMEASURING START.\n\n");
+    fflush(stdout);
 
-  /* sleep(measure_time); */
-  /* start timer */
+    /* sleep(measure_time); */
+    /* start timer */
 
 #ifndef _SLEEP_ONLY_
-  if (setitimer(ITIMER_REAL, &itval, NULL) == -1) {
-    fprintf(stderr, "error in setitimer()\n");
-  }
+    if (setitimer(ITIMER_REAL, &itval, NULL) == -1) {
+      fprintf(stderr, "error in setitimer()\n");
+    }
 #endif
 
-  counting_on = 1;
-  /* wait for measurement period */
-  for (i = 0; i < (measure_time / PRINT_INTERVAL); i++) {
+    counting_on = 1;
+    /* wait for measurement period */
+    for (i = 0; i < (measure_time / PRINT_INTERVAL); i++) {
 #ifndef _SLEEP_ONLY_
-    pause();
+      pause();
 #else
-    sleep(PRINT_INTERVAL);
-    alarm_dummy();
+      sleep(PRINT_INTERVAL);
+      alarm_dummy();
 #endif
-  }
-  counting_on = 0;
+    }
+    counting_on = 0;
 
 #ifndef _SLEEP_ONLY_
-  /* stop timer */
-  itval.it_interval.tv_sec = 0;
-  itval.it_interval.tv_usec = 0;
-  itval.it_value.tv_sec = 0;
-  itval.it_value.tv_usec = 0;
-  if (setitimer(ITIMER_REAL, &itval, NULL) == -1) {
-    fprintf(stderr, "error in setitimer()\n");
-  }
+    /* stop timer */
+    itval.it_interval.tv_sec = 0;
+    itval.it_interval.tv_usec = 0;
+    itval.it_value.tv_sec = 0;
+    itval.it_value.tv_usec = 0;
+    if (setitimer(ITIMER_REAL, &itval, NULL) == -1) {
+      fprintf(stderr, "error in setitimer()\n");
+    }
 #endif
 
-  printf("\nSTOPPING THREADS");
-  activate_transaction = 0;
+    printf("\nSTOPPING THREADS");
+    activate_transaction = 0;
+  }
 
   /* wait threads' ending and close connections*/
   for (i = 0; i < num_conn; i++) {

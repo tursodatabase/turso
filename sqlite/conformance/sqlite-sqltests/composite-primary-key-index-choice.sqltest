@@ -1,0 +1,98 @@
+# Index choice for tables with a composite primary key, without ANALYZE stats.
+# One column of a composite primary key is not unique on its own, so `= ?` on
+# it must not be estimated as a one-row lookup. These statements come from TPC-C.
+
+@database :memory:
+
+setup tpcc_like {
+    CREATE TABLE warehouse (w_id INTEGER PRIMARY KEY, w_tax REAL);
+
+    CREATE TABLE customer (
+        c_w_id INTEGER, c_d_id INTEGER, c_id INTEGER,
+        c_last TEXT, c_first TEXT, c_credit TEXT, c_discount REAL,
+        PRIMARY KEY (c_w_id, c_d_id, c_id)
+    );
+    CREATE INDEX idx_customer ON customer (c_w_id, c_d_id, c_last, c_first);
+
+    CREATE TABLE orders (
+        o_w_id INTEGER, o_d_id INTEGER, o_id INTEGER, o_c_id INTEGER, o_carrier_id INTEGER,
+        PRIMARY KEY (o_w_id, o_d_id, o_id)
+    );
+    CREATE INDEX idx_orders ON orders (o_w_id, o_d_id, o_c_id, o_id);
+
+    CREATE TABLE stock (
+        s_w_id INTEGER, s_i_id INTEGER, s_quantity INTEGER, s_data TEXT,
+        PRIMARY KEY (s_w_id, s_i_id)
+    );
+    CREATE INDEX fkey_stock_2 ON stock (s_i_id);
+}
+
+@setup tpcc_like
+@skip-if sqlite "Turso prints query plan rows in a different format"
+test full-primary-key-beats-index-on-key-prefix {
+    EXPLAIN QUERY PLAN
+    SELECT c_last FROM customer WHERE c_w_id = 1 AND c_d_id = 2 AND c_id = 3;
+}
+expect {
+    1|0|0|SEARCH customer USING INDEX sqlite_autoindex_customer_1 (c_w_id=? AND c_d_id=? AND c_id=?)
+}
+
+@setup tpcc_like
+@skip-if sqlite "Turso prints query plan rows in a different format"
+test full-primary-key-beats-index-on-key-prefix-in-join {
+    EXPLAIN QUERY PLAN
+    SELECT c_discount, c_last, c_credit, w_tax FROM customer, warehouse
+    WHERE w_id = 1 AND c_w_id = w_id AND c_d_id = 2 AND c_id = 3;
+}
+expect {
+    1|0|0|SEARCH warehouse USING INTEGER PRIMARY KEY (rowid=?)
+    2|0|0|SEARCH customer USING INDEX sqlite_autoindex_customer_1 (c_w_id=? AND c_d_id=? AND c_id=?)
+}
+
+@setup tpcc_like
+@skip-if sqlite "Turso prints query plan rows in a different format"
+test full-primary-key-beats-covering-index-on-key-prefix {
+    EXPLAIN QUERY PLAN
+    SELECT o_c_id FROM orders WHERE o_id = 1 AND o_d_id = 2 AND o_w_id = 3;
+}
+expect {
+    1|0|0|SEARCH orders USING INDEX sqlite_autoindex_orders_1 (o_w_id=? AND o_d_id=? AND o_id=?)
+}
+
+@setup tpcc_like
+@skip-if sqlite "Turso prints query plan rows in a different format"
+test full-primary-key-beats-index-on-one-key-column {
+    EXPLAIN QUERY PLAN
+    SELECT s_quantity FROM stock WHERE s_i_id = 1 AND s_w_id = 2;
+}
+expect {
+    1|0|0|SEARCH stock USING INDEX sqlite_autoindex_stock_1 (s_w_id=? AND s_i_id=?)
+}
+
+@setup tpcc_like
+@skip-if sqlite "Turso prints query plan rows in a different format"
+test index-matching-more-columns-beats-primary-key-prefix {
+    EXPLAIN QUERY PLAN
+    SELECT count(c_id) FROM customer WHERE c_w_id = 1 AND c_d_id = 2 AND c_last = 'BAR';
+}
+expect {
+    1|0|0|SEARCH customer USING INDEX idx_customer (c_w_id=? AND c_d_id=? AND c_last=?)
+}
+
+# `d = ?` on the second column of a composite primary key, outside a primary
+# key search, filters like `=` on any indexed column.
+setup non_leading_key_column {
+    CREATE TABLE t (w INTEGER, d INTEGER, id INTEGER, x INTEGER, PRIMARY KEY (w, d, id));
+    CREATE INDEX t_d_x ON t (d, x);
+    CREATE INDEX t_x ON t (x);
+}
+
+@setup non_leading_key_column
+@skip-if sqlite "Turso prints query plan rows in a different format"
+test index-on-non-leading-key-column-and-other-column {
+    EXPLAIN QUERY PLAN
+    SELECT id FROM t WHERE d = 2 AND x = 52;
+}
+expect {
+    1|0|0|SEARCH t USING INDEX t_d_x (d=? AND x=?)
+}
