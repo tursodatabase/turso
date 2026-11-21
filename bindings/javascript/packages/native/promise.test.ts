@@ -716,25 +716,33 @@ test('batch validates every bigint before executing the first statement', async 
     expect(await stmt.all([])).toEqual([{ n: 0 }]);
 })
 
-test('batch coerces bind values once during validation', async () => {
+test('batch refuses a value with no SQLite type before executing the first statement', async () => {
     const db = await connect(":memory:");
-    await db.exec("CREATE TABLE t_batch_coercion (x TEXT)");
-    let coercions = 0;
-    const value = {
-        toString() {
-            coercions++;
-            if (coercions > 1) throw new Error("value was coerced twice");
-            return "coerced";
-        },
-    };
+    await db.exec("CREATE TABLE t_batch_unbindable (x)");
 
-    await db.batch([
-        { sql: "INSERT INTO t_batch_coercion VALUES (?)", args: [value] },
+    let error: any;
+    try {
+        await db.batch([
+            { sql: "INSERT INTO t_batch_unbindable VALUES (?)", args: [1] },
+            { sql: "INSERT INTO t_batch_unbindable VALUES (?)", args: [new Date(0)] },
+        ]);
+    } catch (caught) {
+        error = caught;
+    }
+
+    expect(error).toBeInstanceOf(TypeError);
+    expect(error.message).toContain("SQLite3 can only bind numbers, strings, bigints, buffers, and null");
+    expect(error.batchIndex).toBe(1);
+    const stmt = await db.prepare("SELECT COUNT(*) AS n FROM t_batch_unbindable");
+    expect(await stmt.all([])).toEqual([{ n: 0 }]);
+})
+
+test('batch binds a DataView as its bytes', async () => {
+    const db = await connect(":memory:");
+    const [result] = await db.batch([
+        { sql: "SELECT hex(?) AS x", args: [new DataView(new Uint8Array([9, 1, 2, 3]).buffer, 1, 2)] },
     ]);
-
-    expect(coercions).toBe(1);
-    const stmt = await db.prepare("SELECT x FROM t_batch_coercion");
-    expect(await stmt.all([])).toEqual([{ x: "coerced" }]);
+    expect(result.rows).toEqual([{ x: "0102" }]);
 })
 
 test('atomic batch rejects transaction control before BEGIN', async () => {
