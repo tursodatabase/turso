@@ -858,11 +858,25 @@ fn translate_cast_expr(
     let ast::Expr::Cast { expr, type_name } = expr else {
         unreachable!("translate_cast_expr expects Expr::Cast");
     };
+    let converted = plan_cast_conversion(
+        referenced_tables,
+        expr,
+        type_name.as_ref(),
+        crate::dialect::CastContext::Explicit,
+        resolver,
+    )?;
+    let operand = converted.as_ref().unwrap_or(expr);
     // A CAST to a custom type gives the value a column of the type reads, after
     // ENCODE and then DECODE, so that operators, functions and comparisons see
     // both alike: `CAST(42 AS cents)` is 42, and `-CAST(1.5 AS numeric(10,2))`
     // runs numeric's `-` on 1.50.
-    translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+    translate_expr(
+        program,
+        referenced_tables,
+        operand,
+        target_register,
+        resolver,
+    )?;
 
     if let Some(tn) = type_name {
         let source = type_of(expr, &TypeEnv::new(referenced_tables, resolver));
@@ -938,6 +952,55 @@ fn translate_cast_expr(
         affinity: type_affinity,
     });
     Ok(target_register)
+}
+
+/// The operand wrapped in the conversion that the dialect plans for the CAST,
+/// or None when the dialect leaves the CAST to the engine.
+fn plan_cast_conversion(
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    type_name: Option<&ast::Type>,
+    context: crate::dialect::CastContext,
+    resolver: &Resolver,
+) -> Result<Option<ast::Expr>> {
+    let Some(type_name) = type_name else {
+        return Ok(None);
+    };
+    let source = || cast_source(referenced_tables, operand, resolver);
+    let plan = resolver
+        .catalog
+        .dialect
+        .plan_cast(&source, type_name, context)?;
+    let Some(conversion) = plan.and_then(|plan| plan.convert) else {
+        return Ok(None);
+    };
+    let args = std::iter::once(operand.clone())
+        .chain(conversion.extra_args)
+        .map(Box::new)
+        .collect();
+    Ok(Some(ast::Expr::FunctionCall {
+        name: ast::Name::exact(conversion.function),
+        distinctness: None,
+        args,
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }))
+}
+
+fn cast_source(
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    resolver: &Resolver,
+) -> crate::dialect::OperandType {
+    use super::expr_type::{dialect_operand_type, type_of, TypeEnv};
+    dialect_operand_type(&type_of(
+        operand,
+        &TypeEnv::new(referenced_tables, resolver),
+    ))
 }
 
 /// Emits a CAST of the value in `reg` to the custom type `type_name`, whose

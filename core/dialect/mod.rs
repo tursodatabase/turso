@@ -653,6 +653,60 @@ pub trait Dialect: Send + Sync + 'static {
     fn json_contains_function(&self) -> Option<&'static str> {
         None
     }
+
+    /// Plans a CAST of a value of type `source()` to the type `target`, as
+    /// written. None leaves the CAST to the engine, which converts the value
+    /// as SQLite's CAST or the target custom type does. `source` works out
+    /// the type of the operand, so a dialect that plans no casts never pays
+    /// for it.
+    fn plan_cast(
+        &self,
+        _source: &dyn Fn() -> OperandType,
+        _target: &ast::Type,
+        _context: CastContext,
+    ) -> Result<Option<CastPlan>> {
+        Ok(None)
+    }
+}
+
+/// Where a cast is written, from the narrowest to the widest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CastContext {
+    Implicit,
+    Assignment,
+    Explicit,
+}
+
+/// The type of an operand, as far as a dialect needs to know it.
+#[derive(Debug, Clone)]
+pub enum OperandType {
+    /// A string literal or a parameter. Its type comes from where it is used.
+    Untyped,
+    Null,
+    Integer,
+    Real,
+    /// A number written in the statement with a decimal point or exponent.
+    Decimal,
+    Text,
+    Blob,
+    Custom(Arc<crate::schema::TypeDef>),
+    Array,
+    Unknown,
+}
+
+/// What the engine does for a cast: the conversion of the operand, then the
+/// store of the converted value as the target type does.
+#[derive(Debug, Clone)]
+pub struct CastPlan {
+    pub convert: Option<CastConversion>,
+}
+
+/// The call of a function on the operand, which gives the value in the form
+/// the target type takes as input. `extra_args` follow the operand.
+#[derive(Debug, Clone)]
+pub struct CastConversion {
+    pub function: String,
+    pub extra_args: Vec<ast::Expr>,
 }
 
 /// How an ORDER BY or DISTINCT ON term is matched to the output columns.
