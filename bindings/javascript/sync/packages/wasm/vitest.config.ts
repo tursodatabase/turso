@@ -1,4 +1,4 @@
-import { defineConfig } from 'vitest/config'
+import { configDefaults, defineConfig } from 'vitest/config'
 import { playwright } from '@vitest/browser-playwright'
 
 const DEFAULT_LOCAL_SYNC_SERVER_URL = 'http://localhost:10001';
@@ -19,6 +19,7 @@ export default defineConfig({
     },
   },
   test: {
+    exclude: [...configDefaults.exclude, 'encryption.test.ts'],
     globalSetup: './turso-server-setup.ts',
     browser: {
       enabled: true,

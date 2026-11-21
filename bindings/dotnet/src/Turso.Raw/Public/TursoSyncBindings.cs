@@ -89,10 +89,7 @@ public static class TursoSyncBindings
         using var localEncryptionKey = NativeUtf8String.From(configuration.LocalEncryptionKey);
         if (configuration.LocalEncryptionKey is not null)
             ArgumentException.ThrowIfNullOrWhiteSpace(configuration.RemoteEncryptionCipher);
-        var features = configuration.ExperimentalFeatures;
-        if (configuration.LocalEncryptionKey is not null)
-            features = string.IsNullOrEmpty(features) ? "encryption" : features + ",encryption";
-        using var experimentalFeatures = NativeUtf8String.From(features);
+        using var experimentalFeatures = NativeUtf8String.From(configuration.ExperimentalFeatures);
 
         var databaseConfig = new TursoDatabaseConfig
         {

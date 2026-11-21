@@ -27,6 +27,8 @@ pub struct InProcessServer {
     empty_base: bool,
     pub metadata_write_failure: Arc<AtomicU8>,
     pub host_files: Option<SharedHostFiles>,
+    pub bootstrap_failure: Arc<AtomicU8>,
+    pub force_page_updates: bool,
 }
 
 type SharedHostFiles = Arc<Mutex<HashMap<String, Vec<u8>>>>;
@@ -40,6 +42,8 @@ impl InProcessServer {
             empty_base: false,
             metadata_write_failure: Arc::new(AtomicU8::new(0)),
             host_files: None,
+            bootstrap_failure: Arc::new(AtomicU8::new(0)),
+            force_page_updates: false,
         }
     }
 
@@ -63,6 +67,8 @@ impl InProcessServer {
             empty_base: false,
             metadata_write_failure: Arc::new(AtomicU8::new(0)),
             host_files: None,
+            bootstrap_failure: Arc::new(AtomicU8::new(0)),
+            force_page_updates: false,
         }
     }
 }
@@ -135,7 +141,18 @@ impl SyncEngineIo for InProcessServer {
     ) -> Result<Response> {
         match (method, path) {
             ("POST", "/pull-updates") => {
-                Ok(Response::new(self.pull_updates(&body.unwrap_or_default())?))
+                let mut bytes = self.pull_updates(&body.unwrap_or_default())?;
+                let failure = self.bootstrap_failure.swap(0, Ordering::SeqCst);
+                if failure == 1 {
+                    let mut rest = bytes.as_slice();
+                    PullUpdatesRespProtoBody::decode_length_delimited(&mut rest).unwrap();
+                    PageData::decode_length_delimited(&mut rest).unwrap();
+                    let length = bytes.len() - rest.len();
+                    bytes.truncate(length);
+                }
+                let mut response = Response::new(bytes);
+                response.fail_after_body = failure == 1;
+                Ok(response)
             }
             _ => Err(Error::DatabaseSyncEngineError(format!(
                 "the in-process server does not handle {method} {path}"
@@ -152,7 +169,7 @@ impl InProcessServer {
     fn pull_updates(&self, body: &[u8]) -> Result<Vec<u8>> {
         let request = PullUpdatesReqProtoBody::decode(body)
             .map_err(|error| Error::DatabaseSyncEngineError(error.to_string()))?;
-        if request.client_revision.is_empty() {
+        if request.client_revision.is_empty() || self.force_page_updates {
             self.page_bootstrap(false)
         } else if self.replace_once.swap(false, Ordering::SeqCst) {
             self.page_bootstrap(true)
@@ -184,13 +201,21 @@ impl InProcessServer {
                 PullUpdatesApplyMode::Incremental
             } as i32,
             mvcc_log: None,
-            protocol: PullUpdatesProtocol::MvccLogical as i32,
+            protocol: if self.force_page_updates {
+                PullUpdatesProtocol::Pages
+            } else {
+                PullUpdatesProtocol::MvccLogical
+            } as i32,
         };
         let mut response = header.encode_length_delimited_to_vec();
         for (page_id, page) in database.chunks_exact(PAGE_SIZE).enumerate() {
+            let mut page = page.to_vec();
+            if self.bootstrap_failure.load(Ordering::SeqCst) == 2 && page_id == 0 {
+                page[PAGE_SIZE - 1] = 1;
+            }
             let page = PageData {
                 page_id: page_id as u64,
-                encoded_page: Bytes::copy_from_slice(page),
+                encoded_page: Bytes::from(page),
             };
             response.extend(page.encode_length_delimited_to_vec());
         }
@@ -320,6 +345,7 @@ pub struct Response {
     body: Vec<u8>,
     status: u16,
     sent: AtomicBool,
+    fail_after_body: bool,
 }
 
 impl Response {
@@ -328,6 +354,7 @@ impl Response {
             body,
             status: 200,
             sent: AtomicBool::new(false),
+            fail_after_body: false,
         }
     }
 }
@@ -341,11 +368,16 @@ impl DataCompletion<u8> for Response {
 
     fn poll_data(&self) -> Result<Option<Chunk>> {
         let already_sent = self.sent.swap(true, Ordering::AcqRel);
+        if already_sent && self.fail_after_body {
+            return Err(Error::IoError(
+                "injected interrupted bootstrap download".into(),
+            ));
+        }
         Ok((!already_sent && !self.body.is_empty()).then(|| Chunk(self.body.clone())))
     }
 
     fn is_done(&self) -> Result<bool> {
-        Ok(self.body.is_empty() || self.sent.load(Ordering::Acquire))
+        Ok(!self.fail_after_body && (self.body.is_empty() || self.sent.load(Ordering::Acquire)))
     }
 }
 

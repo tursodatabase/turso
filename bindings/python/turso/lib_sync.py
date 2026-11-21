@@ -464,7 +464,7 @@ def connect_sync(
     - experimental_features, isolation_level, timeout: passed to underlying connection
     - remote_encryption_key: base64-encoded encryption key for encrypted Turso Cloud databases
     - remote_encryption_cipher: shared encryption cipher for the cloud and local replica
-    - local_encryption_key: optional hex-encoded key for the local database and sync files
+    - local_encryption_key: hex key for local sync files; requires experimental_features="sync_encryption"
     - push_operations_threshold: optional cap on the number of CDC operations packed into a single
       push HTTP batch; push splits on transaction boundaries once the current batch accumulated at
       least this many operations (a single transaction is never split). None (default) sends the
@@ -489,7 +489,6 @@ def connect_sync(
         local_encryption = PyTursoEncryptionConfig(
             cipher=remote_encryption_cipher.cipher_name, hexkey=local_encryption_key
         )
-        experimental_features = ",".join(filter(None, [experimental_features, "encryption"]))
 
     # Database config: async_io must be True to let Python drive IO
     db_cfg = PyTursoDatabaseConfig(
