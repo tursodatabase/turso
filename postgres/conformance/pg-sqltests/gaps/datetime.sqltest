@@ -660,25 +660,19 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-@compat-gap "function:make_timestamptz"
 test make-timestamptz {
     SELECT make_timestamptz(2026, 8, 19, 13, 45, 56.5);
 }
 expect {
     2026-08-19 13:45:56.5+00
 }
-@sqlstate 42883
-expect @tursopg error {}
 
-@compat-gap "function:make_timestamp"
 test make-timestamp-fractional-seconds {
     SELECT make_timestamp(2026, 8, 19, 13, 45, 56.5);
 }
 expect {
     2026-08-19 13:45:56.5
 }
-@sqlstate XX000
-expect @tursopg error {}
 
 @compat-gap "function:generate_series"
 test generate-series-timestamp {

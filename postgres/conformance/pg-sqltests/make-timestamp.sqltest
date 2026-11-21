@@ -1,0 +1,107 @@
+# make_timestamp and make_timestamptz. tursopg stores timestamps as text
+# with 4-digit years in UTC, so it refuses years outside 1 to 9999 and time
+# zones other than UTC with 0A000. The refusals are gap tests: `expect` shows
+# PostgreSQL's answer and `expect @tursopg` the refusal.
+
+@database :memory:
+
+test make-timestamp-whole-seconds {
+    SELECT make_timestamp(2020, 1, 2, 3, 4, 5);
+}
+expect {
+    2020-01-02 03:04:05
+}
+
+test make-timestamp-rounds-to-microseconds {
+    SELECT make_timestamp(2020, 1, 2, 3, 4, 5.1234567);
+}
+expect {
+    2020-01-02 03:04:05.123457
+}
+
+test make-timestamp-hour-24-is-next-day {
+    SELECT make_timestamp(1999, 12, 31, 24, 0, 0);
+}
+expect {
+    2000-01-01 00:00:00
+}
+
+test make-timestamp-month-13 {
+    SELECT make_timestamp(2026, 13, 1, 0, 0, 0);
+}
+@sqlstate 22008
+expect error {}
+
+test make-timestamp-february-30 {
+    SELECT make_timestamp(2026, 2, 30, 0, 0, 0);
+}
+@sqlstate 22008
+expect error {}
+
+test make-timestamp-year-0 {
+    SELECT make_timestamp(0, 7, 15, 12, 30, 15);
+}
+@sqlstate 22008
+expect error {}
+
+test make-timestamp-seconds-61 {
+    SELECT make_timestamp(2026, 1, 1, 0, 0, 61);
+}
+@sqlstate 22008
+expect error {}
+
+test make-timestamp-minute-60 {
+    SELECT make_timestamp(2026, 1, 1, 0, 60, 0);
+}
+@sqlstate 22008
+expect error {}
+
+test make-timestamptz-utc {
+    SELECT make_timestamptz(2026, 1, 1, 10, 0, 0, 'UTC');
+}
+expect {
+    2026-01-01 10:00:00+00
+}
+
+test make-timestamptz-plus-00 {
+    SELECT make_timestamptz(2026, 1, 1, 10, 0, 0.25, '+00');
+}
+expect {
+    2026-01-01 10:00:00.25+00
+}
+
+test make-timestamptz-month-13 {
+    SELECT make_timestamptz(2026, 13, 1, 0, 0, 0);
+}
+@sqlstate 22008
+expect error {}
+
+@compat-gap "function:make_timestamptz"
+test make-timestamptz-named-time-zone {
+    SELECT make_timestamptz(2026, 1, 1, 12, 0, 0, 'Europe/Helsinki');
+}
+expect {
+    2026-01-01 10:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "function:make_timestamp"
+test make-timestamp-bc {
+    SELECT make_timestamp(-44, 3, 15, 12, 30, 15);
+}
+expect {
+    0044-03-15 12:30:15 BC
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "function:make_timestamp"
+test make-timestamp-year-10000 {
+    SELECT make_timestamp(10000, 1, 1, 0, 0, 0);
+}
+expect {
+    10000-01-01 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {}

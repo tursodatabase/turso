@@ -2,7 +2,7 @@ use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
-use chrono::{DateTime, NaiveDateTime};
+use chrono::{DateTime, Datelike, NaiveDateTime, Timelike};
 use std::fmt;
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::security::roles::RoleId;
@@ -172,6 +172,12 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "clock_timestamp"(FunctionArity::Exact(0), false) => {
             timestamptz_at(context.current_time())
         },
+        "make_timestamp"(FunctionArity::Exact(6), true) => {
+            exec_make_timestamp(args)?.map(Timestamp)
+        },
+        "make_timestamptz"(FunctionArity::OneOf(&[6, 7]), true) => {
+            exec_make_timestamptz(args)?.map(Timestamptz)
+        },
     })
 }
 
@@ -184,6 +190,115 @@ fn timestamptz_at(instant: WallClockInstant) -> Timestamptz {
         .naive_utc();
     let text = time.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
     Timestamptz(text.trim_end_matches('0').trim_end_matches('.').to_string())
+}
+
+/// `make_timestamptz(year, month, mday, hour, min, sec [, timezone])`. The
+/// session time zone is UTC, so without a time zone the fields are read as
+/// UTC. Other time zones are refused because converting from them is not
+/// supported.
+fn exec_make_timestamptz(args: &[Register]) -> Result<Option<String>> {
+    if let Some(zone) = args.get(6) {
+        match zone.get_value() {
+            Value::Null => return Ok(None),
+            Value::Text(text) if is_utc_zone(text.as_str()) => {}
+            value => {
+                return Err(sqlstate_error(
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    format!("make_timestamptz with time zone \"{value}\" is not supported"),
+                    None,
+                ))
+            }
+        }
+    }
+    exec_make_timestamp(&args[..6])
+}
+
+fn is_utc_zone(zone: &str) -> bool {
+    zone.eq_ignore_ascii_case("UTC") || zone == "+00"
+}
+
+/// `make_timestamp(year, month, mday, hour, min, sec)` in the stored text
+/// form of `timestamp`, such as `2020-01-02 03:04:05.5`. The checks follow
+/// PostgreSQL's `make_timestamp_internal`.
+fn exec_make_timestamp(args: &[Register]) -> Result<Option<String>> {
+    let mut fields = [0i64; 5];
+    for (i, field) in fields.iter_mut().enumerate() {
+        match args[i].get_value() {
+            Value::Null => return Ok(None),
+            Value::Numeric(Numeric::Integer(n)) => *field = *n,
+            value => return Err(make_timestamp_argument_error(value)),
+        }
+    }
+    let sec = match args[5].get_value() {
+        Value::Null => return Ok(None),
+        value @ Value::Numeric(_) => value.as_float(),
+        value => return Err(make_timestamp_argument_error(value)),
+    };
+    let [year, month, day, hour, min] = fields;
+    // PostgreSQL reads a negative year as BC and allows years past 9999. The
+    // stored text form of timestamp cannot hold either.
+    if !(0..=9999).contains(&year) {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "timestamps before year 1 or after year 9999 are not supported",
+            None,
+        ));
+    }
+    let date = u32::try_from(month)
+        .ok()
+        .zip(u32::try_from(day).ok())
+        .and_then(|(month, day)| chrono::NaiveDate::from_ymd_opt(year as i32, month, day))
+        .filter(|_| year != 0)
+        .ok_or_else(|| {
+            sqlstate_error(
+                SQLSTATE_DATETIME_FIELD_OVERFLOW,
+                format!("date field value out of range: {year}-{month:02}-{day:02}"),
+                None,
+            )
+        })?;
+    // As in PostgreSQL, 60 seconds and 24:00:00 are allowed and carry over to
+    // the next minute or day.
+    if !(0..=24).contains(&hour)
+        || !(0..=59).contains(&min)
+        || !(0.0..=60.0).contains(&sec)
+        || (hour == 24 && (min > 0 || sec > 0.0))
+    {
+        let sec = if sec.fract() == 0.0 && sec.is_finite() {
+            format!("{:02}", sec as i64)
+        } else {
+            sec.to_string()
+        };
+        return Err(sqlstate_error(
+            SQLSTATE_DATETIME_FIELD_OVERFLOW,
+            format!("time field value out of range: {hour}:{min:02}:{sec}"),
+            None,
+        ));
+    }
+    let micros = (hour * 60 + min) * 60 * 1_000_000 + (sec * 1_000_000.0).round_ties_even() as i64;
+    let timestamp = NaiveDateTime::from(date) + chrono::Duration::microseconds(micros);
+    if timestamp.year() > 9999 {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "timestamps after year 9999 are not supported",
+            None,
+        ));
+    }
+    let mut text = timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
+    let fraction = timestamp.nanosecond() / 1000;
+    if fraction != 0 {
+        let digits = format!("{fraction:06}");
+        text.push('.');
+        text.push_str(digits.trim_end_matches('0'));
+    }
+    Ok(Some(text))
+}
+
+fn make_timestamp_argument_error(value: &Value) -> LimboError {
+    sqlstate_error(
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        format!("make_timestamp argument \"{value}\" is not a number of the expected type"),
+        None,
+    )
 }
 
 pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
@@ -236,6 +351,19 @@ impl<O: ScalarReturn + 'static> ScalarCall for PgScalarFunction<O> {
 /// Returning one gives the function the type `timestamptz`, so `now() + 1` is
 /// an error as in PostgreSQL instead of adding 1 to text.
 struct Timestamptz(String);
+
+/// A `timestamp` value in its stored text form, such as
+/// `2000-01-01 00:00:00.5`. Returning one gives the function the type
+/// `timestamp`.
+struct Timestamp(String);
+
+impl ScalarReturn for Timestamp {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Custom("timestamp"));
+
+    fn into_value(self) -> Value {
+        Value::build_text(self.0)
+    }
+}
 
 impl ScalarReturn for Timestamptz {
     const TYPE: Option<ReturnType> = Some(ReturnType::Custom("timestamptz"));
