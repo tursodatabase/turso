@@ -44,7 +44,7 @@ pub(crate) fn register_scalar_types(
         builder,
         INT2,
         RangeOffsets::Integer,
-        false,
+        true,
         integer_operators(INT2_WIDTH),
         &["int2"],
     )?;
@@ -53,7 +53,7 @@ pub(crate) fn register_scalar_types(
         builder,
         INT8,
         RangeOffsets::Integer,
-        false,
+        true,
         integer_operators(INT8_WIDTH),
         &["int8"],
     )
