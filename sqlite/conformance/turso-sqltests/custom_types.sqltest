@@ -355,9 +355,9 @@ expect {
     numeric(value any, precision integer, scale integer)|blob|numeric_encode (value)|numeric_fit (value, precision, scale)|numeric_decode (value)||
     smallint(value integer)|integer||CASE WHEN value BETWEEN - 32768 AND 32767 THEN value ELSE RAISE (ABORT, 'integer out of range for smallint') END|||'<'
     time(value text)|text|temporal_encode (value, 'time')||value||'<'
-    timetz(value text)|text|temporal_encode (value, 'timetz')||value||'<'
     timestamp(value text)|text|temporal_encode (value, 'timestamp')||value||'<'
     timestamptz(value text)|text|temporal_encode (value, 'timestamptz')||value||'<'
+    timetz(value text)|text|temporal_encode (value, 'timetz')||value||'<'
     uuid(value any)|blob|CASE WHEN value IS NULL THEN NULL WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE coalesce (uuid_blob (value), RAISE (ABORT, 'invalid UUID value')) END||uuid_str (value)||'<'
     varchar(value text, maxlen integer)|text||CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
 }
@@ -390,9 +390,9 @@ expect {
     smallint(value integer)|integer||CASE WHEN value BETWEEN - 32768 AND 32767 THEN value ELSE RAISE (ABORT, 'integer out of range for smallint') END|||'<'
     test_uint(value any)|text|test_uint_encode (value)||test_uint_decode (value)|0|
     time(value text)|text|temporal_encode (value, 'time')||value||'<'
-    timetz(value text)|text|temporal_encode (value, 'timetz')||value||'<'
     timestamp(value text)|text|temporal_encode (value, 'timestamp')||value||'<'
     timestamptz(value text)|text|temporal_encode (value, 'timestamptz')||value||'<'
+    timetz(value text)|text|temporal_encode (value, 'timetz')||value||'<'
     uuid(value any)|blob|CASE WHEN value IS NULL THEN NULL WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE coalesce (uuid_blob (value), RAISE (ABORT, 'invalid UUID value')) END||uuid_str (value)||'<'
     varchar(value text, maxlen integer)|text||CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
 }

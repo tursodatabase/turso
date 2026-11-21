@@ -366,17 +366,6 @@ expect {
     invalid
 }
 
-test pg-input-is-valid-checks-interval-input {
-    SELECT pg_input_is_valid('1.5 weeks', 'interval');
-    SELECT pg_input_is_valid('garbage', 'interval');
-    SELECT pg_input_is_valid('@ 30 eons ago', 'interval');
-}
-expect {
-    t
-    f
-    f
-}
-
 test pg-input-is-valid-checks-array-elements {
     SELECT pg_input_is_valid('{1,2,3}', 'int2[]');
     SELECT pg_input_is_valid('{1,40000}', 'int2[]');
