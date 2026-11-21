@@ -507,7 +507,7 @@ fn sql_error_sqlstate(msg: &str) -> &'static str {
 fn raise_sqlstate(msg: &str) -> &'static str {
     if msg.starts_with("invalid input value for enum ") || msg == "invalid UUID value" {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
-    } else if msg == "integer out of range for smallint" {
+    } else if msg == "integer out of range for smallint" || msg == "integer out of range" {
         SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
     } else if msg == "value too long for varchar" {
         SQLSTATE_STRING_DATA_RIGHT_TRUNCATION

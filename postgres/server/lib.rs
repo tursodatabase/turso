@@ -1523,8 +1523,6 @@ mod tests {
         let conn = PgConnection::connect(&db).unwrap();
         conn.execute("CREATE TABLE t (i int, b bigint)").unwrap();
         conn.execute("INSERT INTO t VALUES (42, 42)").unwrap();
-        conn.execute("CREATE TABLE o (i int)").unwrap();
-        conn.execute("INSERT INTO o VALUES (3000000000)").unwrap();
         // Each field is a 4-byte length followed by the value.
         for (sql, expected_type, binary, text) in [
             (
@@ -1608,15 +1606,6 @@ mod tests {
                 .unwrap();
                 assert_eq!(&encoder.finish().unwrap().data[..], expected, "{sql}");
             }
-        }
-        // A value that the column's binary type cannot hold is refused.
-        for sql in ["SELECT i FROM o"] {
-            let mut stmt = conn.prepare(sql).unwrap();
-            let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedBinary).unwrap());
-            let Err(error) = execute_query(&mut stmt, fields) else {
-                panic!("{sql}: no error");
-            };
-            assert_eq!(sqlstate(error), SQLSTATE_FEATURE_NOT_SUPPORTED, "{sql}");
         }
     }
 
@@ -1802,31 +1791,6 @@ mod tests {
             panic!("{rows:?}");
         };
         assert_ne!(first[0], second[0], "COMMIT ends the transaction");
-    }
-
-    // 3000000000 doesn't fit the int4 column, so the second row is refused
-    // after the first row is inserted.
-    const INSERT_RETURNING_MISFIT: &str = "INSERT INTO r VALUES (1), (3000000000) RETURNING i";
-
-    #[test]
-    fn a_refused_returning_row_rolls_back_the_insert() {
-        let (mut client, _conn) = copy_test_client();
-        client.simple_query("CREATE TABLE r (i int)").unwrap();
-        let events = execute_with_binary_result(&mut client, INSERT_RETURNING_MISFIT);
-        assert_refused(&events, b'I');
-        assert_row_count(&mut client, "r", "0");
-    }
-
-    #[test]
-    fn a_refused_returning_row_in_a_block_is_not_committed() {
-        let (mut client, _conn) = copy_test_client();
-        client.simple_query("CREATE TABLE r (i int)").unwrap();
-        client.simple_query("BEGIN").unwrap();
-        let events = execute_with_binary_result(&mut client, INSERT_RETURNING_MISFIT);
-        assert_refused(&events, b'E');
-        let events = client.simple_query("COMMIT").unwrap();
-        assert!(matches!(&events[0], BackendEvent::CommandComplete(tag) if tag == "ROLLBACK"));
-        assert_row_count(&mut client, "r", "0");
     }
 
     /// Sends Parse, Bind asking for the one result column in binary format,

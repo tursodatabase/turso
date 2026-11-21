@@ -337,14 +337,11 @@ expect @tursopg error {}
 
 # D-33: int4 column overflow
 @setup t_n
-@compat-gap "type:int4"
 test int4-column-overflow {
     INSERT INTO t VALUES (2147483648);
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-}
 
 # D-34: smallint column overflow
 test smallint-column-overflow {

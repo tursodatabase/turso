@@ -70,12 +70,13 @@ fn is_custom(operand: &OperandType, names: &[&str]) -> bool {
 }
 
 /// The type PostgreSQL gives values that meet in a CASE, coalesce or UNION,
-/// when one of them is a float4: the first type that every other type can be
-/// implicitly cast to, where a type that the first can be cast to takes its
-/// place unless the first is the preferred type of its category (float8).
+/// when one of them is a float4 or when they are integers of different widths:
+/// the first type that every other type can be implicitly cast to, where a
+/// type that the first can be cast to takes its place unless the first is the
+/// preferred type of its category (float8).
 pub(crate) fn common_type(types: &dyn Fn() -> Vec<OperandType>) -> Option<OperandType> {
     let types = types();
-    if !types.iter().any(is_float4) {
+    if !types.iter().any(is_float4) && !mixes_integer_widths(&types) {
         return None;
     }
     let mut candidate: Option<(CastType, &OperandType)> = None;
@@ -101,6 +102,25 @@ pub(crate) fn common_type(types: &dyn Fn() -> Vec<OperandType>) -> Option<Operan
         };
     }
     candidate.map(|(_, operand)| operand.clone())
+}
+
+fn mixes_integer_widths(types: &[OperandType]) -> bool {
+    let mut widths = Vec::new();
+    for operand in types {
+        match (operand, source_type(operand)) {
+            (OperandType::Untyped | OperandType::Null, _) => {}
+            (
+                OperandType::Custom(_),
+                Some(ty @ (CastType::Int2 | CastType::Int4 | CastType::Int8)),
+            ) => {
+                if !widths.contains(&ty) {
+                    widths.push(ty);
+                }
+            }
+            _ => return false,
+        }
+    }
+    widths.len() > 1
 }
 
 fn is_float4(operand: &OperandType) -> bool {

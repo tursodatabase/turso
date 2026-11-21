@@ -270,6 +270,7 @@ fn pg_type_display_name(engine_type_name: &str) -> &str {
     match engine_type_name {
         "real" => "double precision",
         "float4" => "real",
+        "int4" => "integer",
         "blob" => "bytea",
         "varchar" => "character varying",
         "time" => "time without time zone",
@@ -337,6 +338,87 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             "bigint out of range", None,
         ))?,
+        "int4pl"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Add, 32)?
+        },
+        "int4mi"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Subtract, 32)?
+        },
+        "int4mul"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Multiply, 32)?
+        },
+        "int4div"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Divide, 32)?
+        },
+        "int4mod"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Remainder, 32)?
+        },
+        "int2and"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::And, 16)?
+        },
+        "int2or"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Or, 16)?
+        },
+        "int2not"(FunctionArity::Exact(1), true) => {
+            crate::pg_types::exec_integer_not(args[0].get_value())?
+        },
+        "int4and"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::And, 32)?
+        },
+        "int4or"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Or, 32)?
+        },
+        "int4not"(FunctionArity::Exact(1), true) => {
+            crate::pg_types::exec_integer_not(args[0].get_value())?
+        },
+        "int8and"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::And, 64)?
+        },
+        "int8or"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Or, 64)?
+        },
+        "int8not"(FunctionArity::Exact(1), true) => {
+            crate::pg_types::exec_integer_not(args[0].get_value())?
+        },
+        "int4um"(FunctionArity::Exact(1), true) => {
+            crate::pg_types::exec_integer_negate(args[0].get_value(), 32)?
+        },
+        "int8pl"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Add, 64)?
+        },
+        "int8mi"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Subtract, 64)?
+        },
+        "int8mul"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Multiply, 64)?
+        },
+        "int8div"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Divide, 64)?
+        },
+        "int8mod"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Remainder, 64)?
+        },
+        "int8um"(FunctionArity::Exact(1), true) => {
+            crate::pg_types::exec_integer_negate(args[0].get_value(), 64)?
+        },
+        "int2pl"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Add, 16)?
+        },
+        "int2mi"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Subtract, 16)?
+        },
+        "int2mul"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Multiply, 16)?
+        },
+        "int2div"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Divide, 16)?
+        },
+        "int2mod"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Remainder, 16)?
+        },
+        "int2um"(FunctionArity::Exact(1), true) => {
+            crate::pg_types::exec_integer_negate(args[0].get_value(), 16)?
+        },
         "float4pl"(FunctionArity::Exact(2), true) => {
             crate::pg_types::exec_float4_arithmetic(args, |a, b| a + b, false)?
         },
@@ -1127,7 +1209,9 @@ impl JsonElement {
     fn of_type(name: &str) -> Self {
         match name {
             "boolean" => Self::Boolean,
-            "integer" | "smallint" | "bigint" | "real" | "float4" | "numeric" => Self::Number,
+            "integer" | "int4" | "smallint" | "bigint" | "real" | "float4" | "numeric" => {
+                Self::Number
+            }
             "json" | "jsonb" => Self::Json,
             // A cast to bytea is a cast to blob, so a blob is a bytea.
             "bytea" | "blob" => Self::Bytea,
