@@ -1,0 +1,213 @@
+@database :memory:
+
+# A loop that returns at most one row fixes every column of its table, and an
+# inner index column equal to one of those columns is fixed as well. SQLite
+# uses the index order in these plans instead of sorting.
+setup one_row_join {
+    CREATE TABLE dim(k INTEGER PRIMARY KEY, label TEXT, u INT UNIQUE);
+    CREATE TABLE ev(id INTEGER PRIMARY KEY, a INT, b INT, c INT);
+    CREATE INDEX ev_abc ON ev(a, b, c);
+    INSERT INTO dim VALUES (1, 'x', 10), (2, 'x', 20), (3, 'y', NULL);
+    INSERT INTO ev VALUES
+        (1, 1, 2, 30), (2, 1, 2, 10), (3, 2, 2, 5), (4, 1, 3, 1),
+        (5, 1, 2, 20), (6, 10, 2, 7), (7, 10, 2, 3), (8, 20, 2, 4),
+        (9, 2, 2, 1), (10, 1, 2, NULL);
+}
+
+@setup one_row_join
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test one-row-join-order-by-inner-index-plan {
+    EXPLAIN QUERY PLAN
+    SELECT ev.c FROM dim JOIN ev ON ev.a = dim.k WHERE dim.k = 1 AND ev.b = 2 ORDER BY ev.c;
+}
+expect {
+    1|0|0|SEARCH dim USING INTEGER PRIMARY KEY (rowid=?)
+    2|0|0|SEARCH ev USING COVERING INDEX ev_abc (a=? AND b=?)
+}
+
+@setup one_row_join
+test one-row-join-order-by-inner-index {
+    SELECT ev.c FROM dim JOIN ev ON ev.a = dim.k WHERE dim.k = 1 AND ev.b = 2 ORDER BY ev.c;
+}
+expect {
+
+    10
+    20
+    30
+}
+
+@setup one_row_join
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test one-row-join-order-by-fixed-column-first-plan {
+    EXPLAIN QUERY PLAN
+    SELECT dim.label, ev.c FROM dim JOIN ev ON ev.a = dim.k
+    WHERE dim.k = 1 AND ev.b = 2 ORDER BY dim.label, ev.c;
+}
+expect {
+    1|0|0|SEARCH dim USING INTEGER PRIMARY KEY (rowid=?)
+    2|0|0|SEARCH ev USING COVERING INDEX ev_abc (a=? AND b=?)
+}
+
+@setup one_row_join
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test one-row-join-order-by-fixed-column-last-plan {
+    EXPLAIN QUERY PLAN
+    SELECT ev.c, dim.label FROM dim JOIN ev ON ev.a = dim.k
+    WHERE dim.k = 1 AND ev.b = 2 ORDER BY ev.c, dim.label;
+}
+expect {
+    1|0|0|SEARCH dim USING INTEGER PRIMARY KEY (rowid=?)
+    2|0|0|SEARCH ev USING COVERING INDEX ev_abc (a=? AND b=?)
+}
+
+@setup one_row_join
+test one-row-join-order-by-fixed-column-last {
+    SELECT ev.c, dim.label FROM dim JOIN ev ON ev.a = dim.k
+    WHERE dim.k = 1 AND ev.b = 2 ORDER BY ev.c, dim.label;
+}
+expect {
+    |x
+    10|x
+    20|x
+    30|x
+}
+
+@setup one_row_join
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test one-row-join-order-by-joined-index-column-plan {
+    EXPLAIN QUERY PLAN
+    SELECT ev.a, ev.b, ev.c FROM dim JOIN ev ON ev.a = dim.u
+    WHERE dim.u = 10 ORDER BY ev.a, ev.b, ev.c;
+}
+expect {
+    1|0|0|SEARCH dim USING COVERING INDEX sqlite_autoindex_dim_1 (u=?)
+    2|0|0|SEARCH ev USING COVERING INDEX ev_abc (a=?)
+}
+
+@setup one_row_join
+test one-row-join-order-by-joined-index-column {
+    SELECT ev.a, ev.b, ev.c FROM dim JOIN ev ON ev.a = dim.u
+    WHERE dim.u = 10 ORDER BY ev.a, ev.b, ev.c;
+}
+expect {
+    10|2|3
+    10|2|7
+}
+
+@setup one_row_join
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test one-row-order-by-own-column-plan {
+    EXPLAIN QUERY PLAN
+    SELECT label FROM dim WHERE k = 2 ORDER BY label;
+}
+expect {
+    1|0|0|SEARCH dim USING INTEGER PRIMARY KEY (rowid=?)
+}
+
+# dim returns two rows, so the ev rows of each dim row must be merged by a sort.
+@setup one_row_join
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test many-row-join-order-by-inner-index-uses-sorter {
+    EXPLAIN QUERY PLAN
+    SELECT ev.c FROM dim JOIN ev ON ev.a = dim.k WHERE dim.label = 'x' AND ev.b = 2 ORDER BY ev.c;
+}
+expect pattern {
+    (?s)SEARCH ev USING COVERING INDEX ev_abc \(a=\? AND b=\?\).*USE SORTER FOR ORDER BY
+}
+
+@setup one_row_join
+test many-row-join-order-by-inner-index {
+    SELECT ev.c FROM dim JOIN ev ON ev.a = dim.k WHERE dim.label = 'x' AND ev.b = 2 ORDER BY ev.c;
+}
+expect {
+
+    1
+    5
+    10
+    20
+    30
+}
+
+# For one outer row, a LEFT JOIN emits either the matching ev rows in index
+# order or a single row with NULLs, so no sort is needed.
+@setup one_row_join
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test one-row-left-join-order-by-inner-index-plan {
+    EXPLAIN QUERY PLAN
+    SELECT ev.c FROM dim LEFT JOIN ev ON ev.a = dim.k AND ev.b = 2 WHERE dim.k = 1 ORDER BY ev.c;
+}
+expect {
+    1|0|0|SEARCH dim USING INTEGER PRIMARY KEY (rowid=?)
+    2|0|0|SEARCH ev USING COVERING INDEX ev_abc (a=? AND b=?) LEFT-JOIN
+}
+
+@setup one_row_join
+test one-row-left-join-order-by-inner-index {
+    SELECT ev.c FROM dim LEFT JOIN ev ON ev.a = dim.k AND ev.b = 2 WHERE dim.k = 1 ORDER BY ev.c;
+}
+expect {
+
+    10
+    20
+    30
+}
+
+@setup one_row_join
+test one-row-left-join-order-by-inner-index-no-match {
+    SELECT dim.k, ev.c FROM dim LEFT JOIN ev ON ev.a = dim.k AND ev.b = 2 WHERE dim.k = 3 ORDER BY ev.c;
+}
+expect {
+    3|
+}
+
+@setup one_row_join
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test rowid-scan-left-join-order-by-inner-index-plan {
+    EXPLAIN QUERY PLAN
+    SELECT dim.k, ev.b, ev.c FROM dim LEFT JOIN ev ON ev.a = dim.k AND ev.b = 2
+    ORDER BY dim.k, ev.b, ev.c;
+}
+expect {
+    1|0|0|SCAN dim
+    2|0|0|SEARCH ev USING COVERING INDEX ev_abc (a=? AND b=?) LEFT-JOIN
+}
+
+@setup one_row_join
+test rowid-scan-left-join-order-by-inner-index {
+    SELECT dim.k, ev.b, ev.c FROM dim LEFT JOIN ev ON ev.a = dim.k AND ev.b = 2
+    ORDER BY dim.k, ev.b, ev.c;
+}
+expect {
+    1|2|
+    1|2|10
+    1|2|20
+    1|2|30
+    2|2|1
+    2|2|5
+    3||
+}
+
+# The NULL row of k = 3 and the ev rows of k = 1 and k = 2 must be merged by a sort.
+@setup one_row_join
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test many-row-left-join-order-by-inner-index-uses-sorter {
+    EXPLAIN QUERY PLAN
+    SELECT dim.k, ev.c FROM dim LEFT JOIN ev ON ev.a = dim.k AND ev.b = 2 ORDER BY ev.c;
+}
+expect pattern {
+    (?s)SEARCH ev USING COVERING INDEX ev_abc \(a=\? AND b=\?\) LEFT-JOIN.*USE SORTER FOR ORDER BY
+}
+
+@setup one_row_join
+test many-row-left-join-order-by-inner-index {
+    SELECT dim.k, ev.c FROM dim LEFT JOIN ev ON ev.a = dim.k AND ev.b = 2 ORDER BY ev.c, dim.k;
+}
+expect {
+    1|
+    3|
+    2|1
+    2|5
+    1|10
+    1|20
+    1|30
+}
