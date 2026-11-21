@@ -11,48 +11,6 @@ env:
   CARGO_NET_RETRY: 10
 
 jobs:
-  bench:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - bench: benchmark
-            features: "--features bench"
-          - bench: mvcc_benchmark
-            features: "--features bench"
-          - bench: json_benchmark
-            features: "--features bench"
-          - bench: sql_functions
-            features: "--features bench"
-          - bench: hash_spill_benchmark
-            features: "--features bench"
-          - bench: write_perf_benchmark
-            features: "--features bench"
-          - bench: fts_benchmark
-            features: "--features bench"
-          - bench: parser_benchmark
-            features: ""
-          - bench: graph_queries_benchmark
-            features: "--features bench"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Generate graph-queries DB
-        if: matrix.bench == 'graph_queries_benchmark'
-        run: |
-          python3 perf/graph-queries/generate_seed.py | sqlite3 perf/graph-queries/graph-queries.db
-          cp perf/graph-queries/graph-queries.db perf/graph-queries/graph-queries-analyzed.db
-          sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
-      - name: Bench ${{ matrix.bench }}
-        run: cargo bench --bench ${{ matrix.bench }} ${{ matrix.features }}
-
   clickbench:
     runs-on: ubuntu-latest
     timeout-minutes: 30
