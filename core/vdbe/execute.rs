@@ -2611,7 +2611,7 @@ pub fn op_column_has_field(
 }
 
 pub fn op_type_check(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _connection: &Arc<Connection>,
@@ -2644,7 +2644,9 @@ pub fn op_type_check(
             }
             match col.strict_type(&table_reference.name)? {
                 StrictType::Stores(expected_type) => {
-                    if let Err(value_type) = convert_to_strict_type(reg, expected_type) {
+                    if let Err(value_type) = convert_to_strict_type(reg, expected_type, || {
+                        program.prepare_context.real_columns_keep_negative_zero()
+                    }) {
                         return Err(datatype_violation(format!(
                             "cannot store {} value in {} column {}.{}",
                             value_type,
@@ -2665,7 +2667,7 @@ pub fn op_type_check(
 }
 
 pub fn op_convert_to_type(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _connection: &Arc<Connection>,
@@ -2681,7 +2683,9 @@ pub fn op_convert_to_type(
     );
     let reg = &mut state.registers[*reg];
     if !matches!(reg.get_value(), Value::Null) {
-        if let Err(actual) = convert_to_strict_type(reg, *storage_class) {
+        if let Err(actual) = convert_to_strict_type(reg, *storage_class, || {
+            program.prepare_context.real_columns_keep_negative_zero()
+        }) {
             return Err(
                 datatype_violation(format!("cannot store {actual} value {description}")).into(),
             );
@@ -2847,7 +2851,9 @@ fn convert_array_elements(
                 let mut reg = Register::Value(element);
                 match *element_kind {
                     StrictType::Stores(storage_class) => {
-                        if let Err(value_type) = convert_to_strict_type(&mut reg, storage_class) {
+                        if let Err(value_type) =
+                            convert_to_strict_type(&mut reg, storage_class, || false)
+                        {
                             return Err(datatype_violation(format!(
                                 "cannot store {value_type} value in {element_type}"
                             )));
@@ -2870,8 +2876,9 @@ fn convert_array_elements(
 fn convert_to_strict_type(
     reg: &mut Register,
     storage_class: StorageClass,
+    keeps_negative_zero: impl FnOnce() -> bool,
 ) -> Result<(), ValueType> {
-    apply_affinity_char(reg, storage_class.affinity());
+    apply_affinity_char_keeping_negative_zero(reg, storage_class.affinity(), keeps_negative_zero);
     let actual = reg.get_value().value_type();
     if actual == storage_class.value_type() {
         Ok(())
@@ -3341,7 +3348,7 @@ pub fn op_array_slice(
 }
 
 pub fn op_make_record<C, P>(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _connection: &C,
@@ -3373,7 +3380,11 @@ pub fn op_make_record<C, P>(
         }
         let registers = &mut state.registers[start_reg..start_reg + count];
         for (register, &affinity_code) in registers.iter_mut().zip(affinity_str.as_bytes()) {
-            apply_affinity_char(register, Affinity::from_char_code(affinity_code));
+            apply_affinity_char_keeping_negative_zero(
+                register,
+                Affinity::from_char_code(affinity_code),
+                || program.prepare_context.real_columns_keep_negative_zero(),
+            );
         }
     }
 
@@ -16583,7 +16594,7 @@ pub fn op_found(
 }
 
 pub fn op_affinity(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _connection: &Arc<Connection>,
@@ -16607,7 +16618,11 @@ pub fn op_affinity(
 
     let registers = &mut state.registers[*start_reg..*start_reg + count.get()];
     for (register, &affinity_code) in registers.iter_mut().zip(affinities.as_bytes()) {
-        apply_affinity_char(register, Affinity::from_char_code(affinity_code));
+        apply_affinity_char_keeping_negative_zero(
+            register,
+            Affinity::from_char_code(affinity_code),
+            || program.prepare_context.real_columns_keep_negative_zero(),
+        );
     }
 
     state.pc += 1;
@@ -18892,6 +18907,25 @@ pub fn op_hash_grace_advance_partition(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Like [`apply_affinity_char`], except that a REAL value of negative zero
+/// stays one when the dialect says its REAL columns keep the sign. SQLite
+/// reads it back as 0.0. The dialect is asked only for a negative zero.
+#[inline(always)]
+fn apply_affinity_char_keeping_negative_zero(
+    target: &mut Register,
+    affinity: Affinity,
+    keeps_negative_zero: impl FnOnce() -> bool,
+) -> bool {
+    if affinity == Affinity::Real {
+        if let Register::Value(Value::Numeric(Numeric::Float(f))) = target {
+            if *f == 0.0 && f64::from(*f).is_sign_negative() && keeps_negative_zero() {
+                return true;
+            }
+        }
+    }
+    apply_affinity_char(target, affinity)
+}
+
 #[inline(always)]
 fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
     // handle the common cases that don't require a conversion inline
@@ -20238,6 +20272,7 @@ mod tests {
         let prepare_context = PrepareContext {
             database_ptr: 0,
             generation: 0,
+            real_columns_keep_negative_zero: false,
         };
         let prepared = builder
             .build_prepared_program(prepare_context, Vec::new(), false, "")

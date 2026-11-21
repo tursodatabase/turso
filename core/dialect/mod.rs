@@ -575,6 +575,14 @@ pub trait Dialect: Send + Sync + 'static {
         SortTermMatching::Sqlite
     }
 
+    /// Whether a REAL column keeps the sign of a negative zero.
+    ///
+    /// SQLite stores a whole-number real as an integer, so it reads -0.0 back
+    /// as 0.0. PostgreSQL keeps -0.
+    fn real_columns_keep_negative_zero(&self) -> bool {
+        false
+    }
+
     /// Whether integer division by zero raises an error.
     ///
     /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.
