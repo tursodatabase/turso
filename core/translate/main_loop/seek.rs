@@ -1,6 +1,6 @@
 use super::*;
 use crate::schema::Column;
-use crate::translate::expr::expr_type::{column_type, ExprType, TypeEnv};
+use crate::translate::expr::expr_type::{column_type, type_of, ExprType, TypeEnv};
 use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
@@ -53,15 +53,17 @@ pub(super) fn encode_seek_keys_for_custom_types<'e>(
         let idx_col = &seek_index.columns[idx_col_pos];
         let reg = start_reg + i;
         // A scan reads a string literal or parameter compared with a value of
-        // a custom type as a value of the type, so the key is converted as the
-        // scan converts it. A column holds the stored value; an expression
-        // column holds the expression's value, which is the value as read.
+        // a custom type as a value of the type, and a date compared with a
+        // timestamp as a timestamp, so the key is converted as the scan
+        // converts it. A column holds the stored value; an expression column
+        // holds the expression's value, which is the value as read.
         let read_as = match key {
-            Some(key) => {
-                crate::translate::expr::read_untyped_operand_as(key, resolver.schema(), || {
-                    index_column_value_type(table, idx_col, resolver)
-                })?
-            }
+            Some(key) => crate::translate::expr::read_compared_operand_as(
+                key,
+                resolver.schema(),
+                || type_of(key, &TypeEnv::new(Some(tables), resolver)),
+                || index_column_value_type(table, idx_col, resolver),
+            )?,
             None => None,
         };
         if let Some(resolved) = read_as {

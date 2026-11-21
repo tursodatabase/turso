@@ -190,6 +190,12 @@ statements of one query string;
 `clock_timestamp()` reads the clock at each call. All of them have microsecond
 precision.
 
+A timestamp compared with a timestamptz is read as a timestamptz, as in
+PostgreSQL, with the session time zone UTC. Comparing a timestamp or
+timestamptz with a value of another custom type, such as `timestamptz` with
+`json`, fails with `cannot compare type x with type y` (42601, where
+PostgreSQL gives 42883).
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |
