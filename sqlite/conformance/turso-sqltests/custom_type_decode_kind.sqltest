@@ -274,6 +274,27 @@ expect error {
     cannot create type b: type a already casts to it; create b before a
 }
 
+# A CAST that doesn't give the new type's argument stays SQLite's CAST once the
+# type exists, so creating the type changes nothing it gives.
+@requires strict "uses STRICT tables"
+test create-type-allowed-when-a-view-casts-without-its-arguments {
+    CREATE VIEW v AS SELECT CAST('5' AS money) AS m;
+    CREATE TYPE money(value text, cur integer) BASE text ENCODE value DECODE value;
+    SELECT m, typeof(m) FROM v;
+}
+expect {
+    5|integer
+}
+
+@requires strict "uses STRICT tables"
+test create-type-refused-when-a-view-casts-with-its-arguments {
+    CREATE VIEW v AS SELECT CAST('5' AS money(1)) AS m;
+    CREATE TYPE money(value text, cur integer) BASE text ENCODE value DECODE value;
+}
+expect error {
+    cannot create type money: view v already casts to it
+}
+
 @requires strict "uses STRICT tables"
 test create-type-refused-when-two-types-would-cast-to-each-other {
     -- The kinds of a and b would each depend on the other's.

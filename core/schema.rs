@@ -2507,7 +2507,7 @@ impl Schema {
             let type_def = &self.type_registry[key];
             let mut names = std::vec::Vec::new();
             for other in &pending {
-                if type_def_uses_type(type_def, other)? {
+                if type_def_uses_type(type_def, &self.type_registry[other])? {
                     names.push(other.clone());
                 }
             }

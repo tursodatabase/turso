@@ -32,7 +32,7 @@ use crate::translate::emitter::{prepare_cdc_if_necessary, Resolver};
 use crate::translate::expr::expr_type::{
     base_value_type, decode_type, iif_values, value_type, ExprType,
 };
-use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
+use crate::translate::expr::{is_sqlite_cast_to, takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
@@ -43,6 +43,7 @@ use crate::util::{
     is_builtin_strict_type, normalize_ident, quote_identifier, walk_expr_with_subqueries,
     walk_schema_expressions, SchemaExprOwner, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
     to_u32, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
@@ -313,13 +314,26 @@ fn resolve_check_expr_type(
         }
         ast::Expr::Collate(inner, _) => resolve_check_expr_type(inner, columns, resolver),
         ast::Expr::Cast { type_name, .. } => {
-            if let Some(ref tn) = type_name {
-                resolve_type_name(&dequote(&tn.name), resolver)
-            } else {
+            let Some(type_name) = type_name else {
                 bail_parse_error!(
                     "cannot determine type of CAST in CHECK constraint; use CAST with explicit type"
                 );
+            };
+            let name = dequote(&type_name.name);
+            let type_def = resolver.schema().get_type_def_unchecked(&name);
+            if type_def.is_some_and(|type_def| !is_sqlite_cast_to(type_def, type_name)) {
+                return resolve_type_name(&name, resolver);
             }
+            // SQLite's CAST gives a value of the storage class that the
+            // affinity of the type name names. For NUMERIC that is an integer
+            // or a real.
+            Ok(match Affinity::of_written_type(&name) {
+                Affinity::Integer => CheckExprType::Integer,
+                Affinity::Real => CheckExprType::Real,
+                Affinity::Text => CheckExprType::Text,
+                Affinity::Blob => CheckExprType::Blob,
+                Affinity::Numeric | Affinity::None => CheckExprType::Any,
+            })
         }
         ast::Expr::Unary(op, inner) => match op {
             UnaryOperator::Negative | UnaryOperator::Positive => {
@@ -2867,7 +2881,9 @@ pub fn translate_create_type(
         }
         bail_parse_error!("type {normalized_name} already exists");
     }
-    check_name_not_cast_to("type", &normalized_name, resolver)?;
+    let type_def =
+        TypeDef::from_create_type(&normalized_name, body, TypeOrigin::User, String::new())?;
+    check_name_not_cast_to("type", &type_def, resolver)?;
 
     // Validate encode/coerce/decode expressions for safety (only for custom types)
     if let ast::CreateTypeBody::CustomType {
@@ -2888,14 +2904,12 @@ pub fn translate_create_type(
             validate_type_expr(decode, "DECODE", &resolver.catalog)?;
         }
         crate::schema::check_type_param_use(params, encode, decode)?;
-        let type_def =
-            TypeDef::from_create_type(&normalized_name, body, TypeOrigin::User, String::new())?;
         resolver
             .schema()
             .plain_value_type(&normalized_name, type_def.value_input_type())?;
         // A CAST to the type from its own DECODE would run that DECODE again
         // without end.
-        if type_def_uses_type(&type_def, &type_registry_key(&normalized_name))? {
+        if type_def_uses_type(&type_def, &type_def)? {
             bail_parse_error!("cannot create type {normalized_name}: it casts to itself");
         }
         check_decode_type(&type_def, resolver)?;
@@ -3067,7 +3081,15 @@ pub fn translate_create_domain(
         }
         bail_parse_error!("type {normalized_name} already exists");
     }
-    check_name_not_cast_to("domain", &normalized_name, resolver)?;
+    let domain_def = TypeDef::from_domain(
+        &normalized_name,
+        base_type,
+        not_null,
+        constraints,
+        default.clone(),
+        String::new(),
+    );
+    check_name_not_cast_to("domain", &domain_def, resolver)?;
 
     // Validate base type exists — must be a primitive or a registered type
     let base_normalized = normalize_ident(base_type);
@@ -3100,13 +3122,12 @@ pub fn translate_create_domain(
     }
     // A CAST to the domain from its own CHECK or DEFAULT would run that
     // expression again without end.
-    let registry_key = type_registry_key(&normalized_name);
     for expr in constraints
         .iter()
         .map(|c| c.check.as_ref())
         .chain(default.as_deref())
     {
-        if expr_casts_to_type(expr, &registry_key)? {
+        if expr_casts_to_type(expr, &domain_def)? {
             bail_parse_error!("cannot create domain {normalized_name}: it casts to itself");
         }
     }
@@ -3132,14 +3153,13 @@ pub fn translate_create_domain(
     persist_type_definition(normalized_name, sql, resolver, program)
 }
 
-/// Refuse a new type or domain whose name an existing type or stored
+/// Refuse a new type or domain `type_def` that an existing type or stored
 /// expression already casts to. That CAST follows SQLite's rules for the name
 /// (`CAST(x AS b)` gives a NUMERIC), and creating the type would change the
 /// values it gives, such as those stored in an index.
-fn check_name_not_cast_to(kind: &str, normalized_name: &str, resolver: &Resolver) -> Result<()> {
-    let registry_key = type_registry_key(normalized_name);
-    if let Some(name) =
-        find_in_any_database(resolver, |schema| find_type_using(schema, &registry_key))?
+fn check_name_not_cast_to(kind: &str, type_def: &TypeDef, resolver: &Resolver) -> Result<()> {
+    let normalized_name = &type_def.name;
+    if let Some(name) = find_in_any_database(resolver, |schema| find_type_using(schema, type_def))?
     {
         bail_parse_error!(
             "cannot create {kind} {normalized_name}: type {name} already casts to it; \
@@ -3147,7 +3167,7 @@ fn check_name_not_cast_to(kind: &str, normalized_name: &str, resolver: &Resolver
         );
     }
     if let Some(owner) = find_in_any_database(resolver, |schema| {
-        find_cast_to_type(schema, resolver.catalog.dialect.as_ref(), &registry_key)
+        find_cast_to_type(schema, resolver.catalog.dialect.as_ref(), type_def)
     })? {
         bail_parse_error!("cannot create {kind} {normalized_name}: {owner} already casts to it");
     }
@@ -3190,16 +3210,14 @@ pub fn translate_drop_type(
     }
 
     // Check if anything in any database uses this type
-    let registry_key = type_registry_key(type_name);
     if let Some(type_use) = find_in_any_database(resolver, |schema| {
-        find_type_use(schema, resolver.catalog.dialect.as_ref(), &registry_key)
+        find_type_use(schema, resolver.catalog.dialect.as_ref(), type_def)
     })? {
         bail_parse_error!("cannot drop type {normalized_name}: used by {type_use}");
     }
 
     // Check if any other type/domain depends on this type
-    if let Some(name) =
-        find_in_any_database(resolver, |schema| find_type_using(schema, &registry_key))?
+    if let Some(name) = find_in_any_database(resolver, |schema| find_type_using(schema, type_def))?
     {
         bail_parse_error!("cannot drop type {normalized_name}: type {name} depends on it");
     }
@@ -3305,8 +3323,9 @@ fn find_in_any_database(
 fn find_type_use(
     schema: &Schema,
     dialect: &dyn crate::dialect::Dialect,
-    registry_key: &str,
+    target: &TypeDef,
 ) -> Result<Option<String>> {
+    let registry_key = type_registry_key(&target.name);
     for namespace in schema.namespace_ids() {
         for table in schema.tables(namespace) {
             for column in table.columns() {
@@ -3320,18 +3339,18 @@ fn find_type_use(
             }
         }
     }
-    find_cast_to_type(schema, dialect, registry_key)
+    find_cast_to_type(schema, dialect, target)
 }
 
 /// Describes the first stored expression in `schema` that casts to the type.
 fn find_cast_to_type(
     schema: &Schema,
     dialect: &dyn crate::dialect::Dialect,
-    registry_key: &str,
+    target: &TypeDef,
 ) -> Result<Option<String>> {
     let mut type_use = None;
     walk_schema_expressions(schema, dialect, &mut |_, owner, expr| {
-        if type_use.is_none() && is_cast_to_type(expr, registry_key) {
+        if type_use.is_none() && is_cast_to_type(expr, target) {
             type_use = Some(owner.to_string());
         }
         Ok(if type_use.is_some() {
@@ -3345,18 +3364,20 @@ fn find_cast_to_type(
 
 /// The name of the first other type or domain whose definition names the
 /// type (see type_def_uses_type).
-fn find_type_using(schema: &Schema, registry_key: &str) -> Result<Option<String>> {
+fn find_type_using(schema: &Schema, target: &TypeDef) -> Result<Option<String>> {
+    let registry_key = type_registry_key(&target.name);
     for (name, type_def) in schema.type_registry.iter() {
-        if type_registry_key(name) != registry_key && type_def_uses_type(type_def, registry_key)? {
+        if type_registry_key(name) != registry_key && type_def_uses_type(type_def, target)? {
             return Ok(Some(name.clone()));
         }
     }
     Ok(None)
 }
 
-/// Whether the definition of `type_def` names the type `registry_key`. Every
-/// field is listed by name, so a new field has to say whether it can name one.
-pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Result<bool> {
+/// Whether the definition of `type_def` names the type `target`. Every field is
+/// listed by name, so a new field has to say whether it can name one.
+pub(crate) fn type_def_uses_type(type_def: &TypeDef, target: &TypeDef) -> Result<bool> {
+    let registry_key = type_registry_key(&target.name);
     let TypeDef {
         name: _,
         is_builtin: _,
@@ -3421,26 +3442,30 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
     }
     let domain_checks = domain_checks.iter().map(|c| c.check.as_ref());
     for expr in exprs.into_iter().chain(domain_checks) {
-        if expr_casts_to_type(expr, registry_key)? {
+        if expr_casts_to_type(expr, target)? {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-fn expr_casts_to_type(expr: &ast::Expr, registry_key: &str) -> Result<bool> {
+fn expr_casts_to_type(expr: &ast::Expr, target: &TypeDef) -> Result<bool> {
     let mut found = false;
     walk_expr_with_subqueries(expr, &mut |expr| {
-        found |= is_cast_to_type(expr, registry_key);
+        found |= is_cast_to_type(expr, target);
         Ok(WalkControl::Continue)
     })?;
     Ok(found)
 }
 
-fn is_cast_to_type(expr: &ast::Expr, registry_key: &str) -> bool {
+/// Whether `expr` is a CAST whose result depends on the type `target`. A CAST
+/// that is SQLite's CAST doesn't, unless it is to an array, whose elements are
+/// checked against the type's BASE.
+fn is_cast_to_type(expr: &ast::Expr, target: &TypeDef) -> bool {
     matches!(
         expr,
         ast::Expr::Cast { type_name: Some(type_name), .. }
-            if type_registry_key(&type_name.name) == registry_key
+            if type_registry_key(&type_name.name) == type_registry_key(&target.name)
+                && (type_name.array_dimensions > 0 || !is_sqlite_cast_to(target, type_name))
     )
 }

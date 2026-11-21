@@ -678,6 +678,53 @@ expect error {
     cannot drop type cents: used by view v
 }
 
+# CAST(x AS money) without money's argument is SQLite's CAST, which doesn't
+# use the type.
+@requires strict "uses STRICT tables"
+test drop-type-not-used-by-sqlite-cast-in-view {
+    CREATE TYPE money(value text, cur integer) BASE text ENCODE value DECODE value;
+    CREATE VIEW v AS SELECT CAST('5' AS money) AS m;
+    DROP TYPE money;
+    SELECT m, typeof(m) FROM v;
+}
+expect {
+    5|integer
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-not-used-by-sqlite-cast-in-check {
+    CREATE TYPE money(value text, cur integer) BASE text ENCODE value DECODE value;
+    CREATE TABLE t(a TEXT CHECK (CAST(a AS money) > 0)) STRICT;
+    DROP TYPE money;
+    INSERT INTO t VALUES ('5');
+    SELECT a FROM t;
+}
+expect {
+    5
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-in-use-by-cast-with-arguments-in-view {
+    CREATE TYPE money(value text, cur integer) BASE text ENCODE value DECODE value;
+    CREATE VIEW v AS SELECT CAST('5' AS money(1)) AS m;
+    DROP TYPE money;
+}
+expect error {
+    cannot drop type money: used by view v
+}
+
+# A CAST to an array of money checks the elements against money's BASE, so it
+# uses the type even without the argument.
+@requires strict "uses STRICT tables"
+test drop-type-in-use-by-array-cast-without-arguments-in-view {
+    CREATE TYPE money(value text, cur integer) BASE text ENCODE value DECODE value;
+    CREATE VIEW v AS SELECT CAST('{5}' AS money[]) AS m;
+    DROP TYPE money;
+}
+expect error {
+    cannot drop type money: used by view v
+}
+
 @requires strict "uses STRICT tables"
 @requires trigger "uses triggers"
 test drop-type-in-use-by-trigger-when {
