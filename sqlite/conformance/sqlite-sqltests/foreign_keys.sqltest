@@ -5321,3 +5321,274 @@ expect {
     2|2
     3|3
 }
+
+@cross-check-integrity
+test fk-self-ref-delete-all-rows-of-a-chain {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1), (3, 2);
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-ref-delete-parent-and-child-keeps-unrelated-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1), (3, NULL);
+    DELETE FROM t WHERE id IN (1, 2);
+    SELECT id FROM t;
+}
+expect {
+    3
+}
+
+@cross-check-integrity
+test fk-self-ref-delete-parent-with-many-children {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1), (3, 1), (4, 1);
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-ref-delete-two-row-cycle {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    UPDATE t SET p = 2 WHERE id = 1;
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-ref-delete-text-parent-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INT, k TEXT UNIQUE, p TEXT REFERENCES t(k));
+    INSERT INTO t VALUES (1, 'a', NULL), (2, 'b', 'a'), (3, 'c', 'b');
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-ref-delete-composite-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(a INT, b INT, pa INT, pb INT, PRIMARY KEY(a, b), FOREIGN KEY(pa, pb) REFERENCES t(a, b));
+    INSERT INTO t VALUES (1, 1, NULL, NULL), (2, 2, 1, 1), (3, 3, 2, 2);
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-ref-delete-inside-transaction {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    BEGIN;
+    DELETE FROM t;
+    COMMIT;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-ref-delete-returning {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    DELETE FROM t RETURNING id;
+}
+expect {
+    1
+    2
+}
+
+@cross-check-integrity
+test fk-self-ref-delete-with-orphan-row-elsewhere {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1), (3, 99);
+    PRAGMA foreign_keys=ON;
+    DELETE FROM t WHERE id IN (1, 3);
+    SELECT id, p FROM t;
+}
+expect {
+    2|1
+}
+
+@cross-check-integrity
+test fk-self-ref-delete-cascade-from-other-table {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE g(id INTEGER PRIMARY KEY);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id), gid INT REFERENCES g(id) ON DELETE CASCADE);
+    INSERT INTO g VALUES (1);
+    INSERT INTO t VALUES (1, NULL, 1), (2, 1, 1), (3, 2, 1);
+    DELETE FROM g;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-ref-replace-removes-parent-and-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id), u INT UNIQUE);
+    INSERT INTO t VALUES (1, NULL, 10), (2, 1, 20);
+    REPLACE INTO t VALUES (3, NULL, 10), (4, NULL, 20);
+    SELECT id, p, u FROM t ORDER BY id;
+}
+expect {
+    3||10
+    4||20
+}
+
+@cross-check-integrity
+test fk-self-ref-update-or-replace-removes-parent-and-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id), u INT UNIQUE);
+    INSERT INTO t VALUES (1, NULL, 10), (2, 1, 20), (3, NULL, 30), (4, NULL, 40);
+    UPDATE OR REPLACE t SET u = u - 20 WHERE id IN (3, 4);
+    SELECT id, p, u FROM t ORDER BY id;
+}
+expect {
+    3||10
+    4||20
+}
+
+@cross-check-integrity
+test fk-self-ref-insert-or-replace-removes-parent-and-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id), u INT UNIQUE);
+    INSERT INTO t VALUES (1, NULL, 10), (2, 1, 20);
+    INSERT OR REPLACE INTO t SELECT id + 10, NULL, u FROM t;
+    SELECT id, p, u FROM t ORDER BY id;
+}
+expect {
+    11||10
+    12||20
+}
+
+@cross-check-integrity
+test fk-deferred-self-ref-delete-parent-keeps-violation-of-its-child {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO t VALUES (1, 99), (2, 1);
+    PRAGMA foreign_keys=ON;
+    DELETE FROM t WHERE id = 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-self-ref-delete-parent-but-not-child-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    DELETE FROM t WHERE id = 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-self-ref-delete-parent-and-middle-but-not-leaf-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1), (3, 2);
+    DELETE FROM t WHERE id IN (1, 2);
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-self-ref-delete-one-of-two-children-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1), (3, 1);
+    DELETE FROM t WHERE id IN (1, 2);
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-self-ref-delete-parent-with-orphan-child-fails {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id));
+    INSERT INTO t VALUES (1, 99), (2, 1);
+    PRAGMA foreign_keys=ON;
+    DELETE FROM t WHERE id = 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-self-ref-delete-still-checks-other-referencing-tables {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id));
+    CREATE TABLE c(x INT REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    INSERT INTO c VALUES (2);
+    DELETE FROM t;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-self-ref-delete-row-that-references-itself {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL);
+    UPDATE t SET p = 1;
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-ref-restrict-delete-child-before-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id) ON DELETE RESTRICT);
+    INSERT INTO t VALUES (2, NULL), (1, 2);
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-ref-restrict-delete-parent-before-child-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INT REFERENCES t(id) ON DELETE RESTRICT);
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    DELETE FROM t;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}

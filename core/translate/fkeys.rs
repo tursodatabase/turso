@@ -1291,11 +1291,7 @@ pub fn emit_fk_child_update_counters(
 
         // Pass 2: NEW tuple handling
         let fk_ok = program.allocate_label();
-        let is_self_ref = fk_ref.child_namespace == fk_ref.fk.parent_namespace
-            && fk_ref
-                .child_table
-                .name
-                .eq_ignore_ascii_case(&fk_ref.fk.parent_table);
+        let is_self_ref = fk_ref.is_self_referencing();
         for cname in &fk_ref.fk.child_columns {
             let (i, col) = child_tbl.get_column(cname).unwrap();
             let src = if col.is_rowid_alias() {
