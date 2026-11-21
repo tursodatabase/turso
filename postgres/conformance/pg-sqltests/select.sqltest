@@ -1333,6 +1333,53 @@ expect {
     5
 }
 
+test values-as-set-operation-operand {
+    VALUES (1) UNION ALL SELECT 2 ORDER BY 1;
+    SELECT 1 UNION ALL VALUES (2);
+    VALUES (1), (2) INTERSECT SELECT 2;
+    SELECT 1 EXCEPT VALUES (2);
+    WITH c AS (VALUES (2)) SELECT 1 UNION ALL SELECT * FROM c ORDER BY 1;
+    SELECT n FROM (VALUES (1) UNION ALL SELECT 2) AS s(n) ORDER BY n;
+    SELECT 1 UNION ALL (VALUES (2), (3)) ORDER BY 1;
+}
+expect {
+    1
+    2
+    1
+    2
+    2
+    1
+    1
+    2
+    1
+    2
+    1
+    2
+    3
+}
+
+test values-set-operation-default-column-name {
+    SELECT column1 FROM (VALUES (1) UNION ALL SELECT 2) AS s ORDER BY column1;
+}
+expect {
+    1
+    2
+}
+
+setup values_set_insert {
+    CREATE TABLE values_set_target (n int);
+}
+
+@setup values_set_insert
+test values-as-set-operation-in-insert {
+    INSERT INTO values_set_target VALUES (1) UNION ALL SELECT 2;
+    SELECT n FROM values_set_target ORDER BY n;
+}
+expect {
+    1
+    2
+}
+
 test parenthesized-set-operation-on-the-right {
     SELECT 1 AS n EXCEPT (SELECT 2 UNION SELECT 1) UNION SELECT 7;
     (SELECT 1 UNION SELECT 2) INTERSECT (SELECT 2 UNION SELECT 3);
