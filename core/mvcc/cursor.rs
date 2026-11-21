@@ -584,9 +584,6 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     peeks_valid_for: Option<IterationDirection>,
     /// A retained B-tree peek can still have a bounded MVCC iterator from an exact seek.
     mvcc_peek_needs_reseek: bool,
-    /// The seek past the current row that a step started, so that a step that
-    /// returned IO resumes it.
-    seek_past_current: Option<SeekOp>,
 }
 
 pub enum NextRowidResult {
@@ -658,7 +655,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             mvcc_peek_epoch: 0,
             peeks_valid_for: None,
             mvcc_peek_needs_reseek: false,
-            seek_past_current: None,
         })
     }
 
@@ -1363,12 +1359,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         }
     }
 
-    /// Whether a step in `dir` must first seek past the current row, because
-    /// the peeks are not the rows next to it in that direction.
+    /// Whether a step in `dir` must start or resume a seek past the current row.
     fn step_needs_seek(&self, dir: IterationDirection) -> bool {
-        self.state.is_none()
-            && matches!(self.current_pos, CursorPosition::Loaded { .. })
-            && self.peeks_valid_for != Some(dir)
+        // A seek that yielded already records its progress in the cursor state.
+        matches!(self.state, Some(MvccLazyCursorState::Seek(..)))
+            || (self.state.is_none()
+                && matches!(self.current_pos, CursorPosition::Loaded { .. })
+                && self.peeks_valid_for != Some(dir))
     }
 
     /// Moves to the first visible row past the current row in `op`'s
@@ -1378,24 +1375,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             unreachable!("only a cursor on a row can seek past it");
         };
         let key = row_id.row_id.clone();
-        self.seek_past_current = Some(op);
-        let result = match &key {
+        return_if_io!(match &key {
             RowKey::Int(rowid) => CursorTrait::seek(self, SeekKey::TableRowId(*rowid), op),
             RowKey::Record(record) => {
                 CursorTrait::seek(self, SeekKey::IndexKey(record.key.clone()), op)
             }
-        };
-        match result {
-            Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
-            Ok(IOResult::Done(_)) => {
-                self.seek_past_current = None;
-                Ok(IOResult::Done(()))
-            }
-            Err(e) => {
-                self.seek_past_current = None;
-                Err(e)
-            }
-        }
+        });
+        Ok(IOResult::Done(()))
     }
 
     /// Initialize MVCC iterator for forward iteration (used when next() is called without rewind())
@@ -1517,9 +1503,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn next(&mut self) -> IOResultOr<()> {
-        if let Some(op) = self.seek_past_current {
-            return self.seek_past_current_row(op);
-        }
         if self.step_needs_seek(IterationDirection::Forwards) {
             return self.seek_past_current_row(SeekOp::GT);
         }
@@ -1621,9 +1604,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn prev(&mut self) -> IOResultOr<()> {
-        if let Some(op) = self.seek_past_current {
-            return self.seek_past_current_row(op);
-        }
         if self.step_needs_seek(IterationDirection::Backwards) {
             return self.seek_past_current_row(SeekOp::LT);
         }
