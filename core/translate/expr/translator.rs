@@ -1963,6 +1963,70 @@ fn translate_function_call_expr(
                     let first_reg = program.alloc_register();
                     let second_reg = program.alloc_register();
                     if matches!(srf, ScalarFunc::Nullif) {
+                        let env = TypeEnv::new(referenced_tables, resolver);
+                        let first_read_as_later = later_date_time_type(
+                            &type_of(&args[0], &env),
+                            &type_of(&args[1], &env),
+                            resolver.schema(),
+                        )?
+                        .is_some();
+                        if first_read_as_later {
+                            // The first argument is compared as the later date/time type but
+                            // nullif returns it as it is, so the function gets a converted
+                            // copy and its result is replaced by the original when not NULL.
+                            let original_reg = program.alloc_register();
+                            translate_expr(
+                                program,
+                                referenced_tables,
+                                &args[0],
+                                original_reg,
+                                resolver,
+                            )?;
+                            let resolved = compared_operand_type(
+                                &args[0],
+                                &args[1],
+                                referenced_tables,
+                                resolver,
+                            )?
+                            .ok_or_else(|| {
+                                LimboError::InternalError(
+                                    "date/time comparison has no type to read as".to_string(),
+                                )
+                            })?;
+                            program.emit_insn(Insn::Copy {
+                                src_reg: original_reg,
+                                dst_reg: first_reg,
+                                extra_amount: 0,
+                            });
+                            emit_untyped_operand_store(program, &resolved, first_reg, resolver)?;
+                            emit_decode(program, &resolved, first_reg, resolver)?;
+                            translate_compared_operand(
+                                program,
+                                referenced_tables,
+                                &args[1],
+                                &args[0],
+                                second_reg,
+                                resolver,
+                            )?;
+                            program.emit_insn(Insn::Function {
+                                constant_mask: 0,
+                                start_reg: first_reg,
+                                dest: target_register,
+                                func: func_ctx,
+                            });
+                            let label_done = program.allocate_label();
+                            program.emit_insn(Insn::IsNull {
+                                reg: target_register,
+                                target_pc: label_done,
+                            });
+                            program.emit_insn(Insn::Copy {
+                                src_reg: original_reg,
+                                dst_reg: target_register,
+                                extra_amount: 0,
+                            });
+                            program.preassign_label_to_next_insn(label_done);
+                            return Ok(target_register);
+                        }
                         translate_compared_pair(
                             program,
                             referenced_tables,

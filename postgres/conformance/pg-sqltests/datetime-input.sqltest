@@ -799,3 +799,16 @@ expect error {
 expect @tursopg error {
     type "time" is not supported
 }
+
+# nullif compares its arguments as = does, but returns the first argument as
+# it is, in its own type.
+
+test datetime-nullif-timestamp-timestamptz-keeps-timestamp {
+    CREATE TABLE n (ts timestamp, tz timestamptz);
+    INSERT INTO n VALUES ('2024-01-05 12:00:00', '2024-01-05 12:00:00+00'), ('2024-01-05 13:00:00', '2024-01-05 12:00:00+00');
+    SELECT COALESCE(NULLIF(ts, tz)::text, 'null') FROM n ORDER BY ts;
+}
+expect {
+    null
+    2024-01-05 13:00:00
+}

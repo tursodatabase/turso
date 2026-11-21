@@ -1883,3 +1883,24 @@ test cmp-date-time-types-in-subquery-is-an-error {
 expect error {
     cannot compare type timestamp with type date in IN \(SELECT \.\.\.\)
 }
+
+
+@requires strict "uses STRICT tables"
+test cmp-nullif-returns-the-first-date-time-argument-unchanged {
+    -- nullif compares a date with a timestamp as = does, but returns the
+    -- date itself, not the date read as a timestamp.
+    CREATE TABLE t(d date, ts timestamp, tz timestamptz) STRICT;
+    INSERT INTO t VALUES ('2024-01-06', '2024-01-05 12:00:00', '2024-01-05 12:00:00'),
+        ('2024-01-05', '2024-01-05 00:00:00', '2024-01-05 01:00:00');
+    SELECT 'd-ts', IFNULL(CAST(NULLIF(d, ts) AS text), 'null') FROM t ORDER BY d;
+    SELECT 'ts-tz', IFNULL(CAST(NULLIF(ts, tz) AS text), 'null') FROM t ORDER BY d;
+    SELECT 'd-tz', IFNULL(CAST(NULLIF(d, tz) AS text), 'null') FROM t ORDER BY d;
+}
+expect {
+    d-ts|null
+    d-ts|2024-01-06
+    ts-tz|2024-01-05 00:00:00
+    ts-tz|null
+    d-tz|2024-01-05
+    d-tz|2024-01-06
+}
