@@ -1,0 +1,251 @@
+@database :memory:
+
+# Two FROM items can have the same alias. When a USING or NATURAL join merges
+# a column, a qualified name for it binds like an unqualified name: INNER and
+# LEFT JOIN keep the left copy, RIGHT JOIN reads the right copy, and FULL JOIN
+# reads the first non-NULL copy.
+
+# Minimized from the differential fuzzer.
+@cross-check-integrity
+test natural-right-join-with-repeated-alias-reads-right-copy {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b REAL, c BLOB NOT NULL);
+    INSERT INTO t VALUES(1, NULL, X'21'), (2, 2.5, X'22');
+    SELECT t1.a, t1.b FROM t AS t1 NATURAL RIGHT JOIN t AS t1;
+    SELECT count(*) FROM t AS t1 NATURAL RIGHT JOIN t AS t1 WHERE t1.a;
+    SELECT t1.a FROM t AS t1 NATURAL RIGHT JOIN t AS t1 ORDER BY t1.a;
+}
+expect {
+    2|2.5
+    1|
+    2
+    1
+    2
+}
+
+@cross-check-integrity
+test right-join-using-with-repeated-alias-reads-right-copy {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE u(a TEXT, b INT);
+    INSERT INTO t VALUES(1, 'x'), (3, 'z');
+    INSERT INTO u VALUES('2', 'y'), ('3', 'q');
+    SELECT x.a, typeof(x.a) FROM t AS x RIGHT JOIN u AS x USING(a) ORDER BY x.a;
+    SELECT (SELECT x.a) FROM t AS x RIGHT JOIN u AS x USING(a) ORDER BY 1;
+    SELECT main.x.a FROM t AS x RIGHT JOIN u AS x USING(a) ORDER BY 1;
+}
+expect {
+    2|text
+    3|text
+    2
+    3
+    2
+    3
+}
+
+@cross-check-integrity
+test full-join-using-with-repeated-alias-reads-first-non-null-copy {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE u(a TEXT, b INT);
+    INSERT INTO t VALUES(1, 'x'), (3, 'z');
+    INSERT INTO u VALUES('2', 'y'), ('3', 'q');
+    SELECT x.a, typeof(x.a) FROM t AS x FULL JOIN u AS x USING(a) ORDER BY x.a;
+    SELECT (SELECT x.a) FROM t AS x FULL JOIN u AS x USING(a) ORDER BY 1;
+    SELECT x.a, count(*) FROM t AS x FULL JOIN u AS x USING(a) GROUP BY x.a ORDER BY x.a;
+}
+expect {
+    1|integer
+    3|integer
+    2|text
+    1
+    3
+    2
+    1|1
+    3|1
+    2|1
+}
+
+# A subquery or CTE names a merged FULL JOIN column `x.a` as `a`.
+test subquery-names-full-join-column-with-repeated-alias-by-column-name {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE u(a TEXT, b INT);
+    INSERT INTO t VALUES(1, 'x'), (3, 'z');
+    INSERT INTO u VALUES('2', 'y'), ('3', 'q');
+    SELECT s.a FROM (SELECT x.a FROM t AS x FULL JOIN u AS x USING(a)) AS s ORDER BY s.a;
+    WITH c AS (SELECT x.a FROM t AS x FULL JOIN u AS x USING(a)) SELECT c.a FROM c ORDER BY c.a;
+    SELECT * FROM (SELECT x.a, t.a FROM t AS x FULL JOIN u AS x USING(a) JOIN t USING(a)) AS s WHERE "a:1" = 1;
+}
+expect {
+    1
+    3
+    2
+    1
+    3
+    2
+    1|1
+}
+
+@cross-check-integrity
+test left-join-using-with-repeated-alias-reads-left-copy {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE u(a TEXT, b INT);
+    INSERT INTO t VALUES(1, 'x'), (3, 'z');
+    INSERT INTO u VALUES('2', 'y'), ('3', 'q');
+    SELECT x.a, typeof(x.a) FROM t AS x LEFT JOIN u AS x USING(a) ORDER BY x.a;
+}
+expect {
+    1|integer
+    3|integer
+}
+
+# A later RIGHT JOIN USING replaces the copies that earlier joins merged.
+@cross-check-integrity
+test right-join-using-after-inner-join-with-repeated-alias {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE u(a TEXT, b INT);
+    INSERT INTO t VALUES(1, 'x'), (3, 'z');
+    INSERT INTO u VALUES('2', 'y'), ('3', 'q');
+    SELECT x.a, typeof(x.a) FROM t AS x JOIN t AS x USING(a) RIGHT JOIN u AS x USING(a) ORDER BY x.a;
+}
+expect {
+    2|text
+    3|text
+}
+
+test column-not-merged-by-using-with-repeated-alias-is-ambiguous {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE u(a TEXT, b INT);
+    SELECT x.b FROM t AS x RIGHT JOIN u AS x USING(a);
+}
+expect error {
+    ambiguous column name: x.b
+}
+
+# x.* adds the columns of every FROM item with the alias x, and each column
+# binds like x.<column>.
+@cross-check-integrity
+test table-star-with-repeated-alias-expands-every-item {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE u(a TEXT, d INT);
+    INSERT INTO t VALUES(1, 'x'), (2, 'y');
+    INSERT INTO u VALUES('2', 5), ('3', 6);
+    SELECT x.* FROM t AS x RIGHT JOIN u AS x USING(a) ORDER BY 1;
+    SELECT x.* FROM t AS x FULL JOIN u AS x USING(a) ORDER BY 1;
+    SELECT x.* FROM t AS x LEFT JOIN u AS x USING(a) ORDER BY 1;
+    SELECT x.* FROM t AS x NATURAL JOIN t AS x ORDER BY 1;
+}
+expect {
+    2|y|2|5
+    3||3|6
+    1|x|1|
+    2|y|2|5
+    3||3|6
+    1|x|1|
+    2|y|2|5
+    1|x|1|x
+    2|y|2|y
+}
+
+test table-star-with-repeated-alias-and-unmerged-column-is-ambiguous {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE w(a TEXT, b INT);
+    SELECT x.* FROM t AS x JOIN w AS x USING(a);
+}
+expect error {
+    ambiguous column name
+}
+
+# SQLite expands x.* to <schema>.x.<column>, so with a subquery or a table
+# of another database named x, each column binds to its own FROM item. Turso
+# expands x.* this way only when all FROM items named x are tables of one
+# database, and reports the error otherwise.
+@skip-if sqlite "SQLite expands x.* by schema; Turso reports the error"
+test table-star-with-repeated-alias-in-other-schema-is-ambiguous {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TEMP TABLE u(a TEXT, d INT);
+    SELECT x.* FROM t AS x FULL JOIN u AS x USING(a);
+}
+expect error {
+    ambiguous column name
+}
+
+@skip-if sqlite "SQLite expands x.* by schema; Turso reports the error"
+test table-star-with-repeated-alias-of-subquery-is-ambiguous {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    SELECT x.* FROM (SELECT 2 AS a) AS x FULL JOIN t AS x USING(a);
+}
+expect error {
+    ambiguous column name
+}
+
+# A declared column named rowid wins over the implicit rowid of the other
+# FROM item with the same alias, in either order.
+@cross-check-integrity
+test declared-rowid-column-wins-over-implicit-rowid-with-repeated-alias {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE w(a, rowid);
+    INSERT INTO t VALUES(5, 'x');
+    INSERT INTO w VALUES(5, 6);
+    SELECT x.rowid FROM t AS x JOIN w AS x USING(a);
+    SELECT x.rowid FROM w AS x JOIN t AS x USING(a);
+}
+expect {
+    6
+    6
+}
+
+# A view's column metadata binds x.a with the same rule as a query.
+test view-column-type-with-repeated-alias-follows-join-type {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE u(a TEXT, d INT);
+    CREATE VIEW v_left AS SELECT x.a FROM t AS x LEFT JOIN u AS x USING(a);
+    CREATE VIEW v_right AS SELECT x.a, x.d FROM t AS x RIGHT JOIN u AS x USING(a);
+    CREATE VIEW v_full AS SELECT x.a AS a FROM t AS x FULL JOIN u AS x USING(a);
+    SELECT name, type FROM pragma_table_info('v_left');
+    SELECT name, type FROM pragma_table_info('v_right');
+    SELECT name, type FROM pragma_table_info('v_full');
+}
+expect {
+    a|INTEGER
+    a|TEXT
+    d|INT
+    a|
+}
+
+# An unqualified FULL JOIN USING column in a subquery, CTE or view keeps the
+# name written in the query. CREATE TABLE AS shows the name.
+test subquery-names-unqualified-full-join-column-as-written {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE u(a TEXT, b INT);
+    CREATE VIEW v AS SELECT A FROM t FULL JOIN u USING(a);
+    CREATE TABLE from_view AS SELECT * FROM v;
+    CREATE TABLE from_subquery AS SELECT * FROM (SELECT A FROM t FULL JOIN u USING(a));
+    CREATE TABLE from_cte AS WITH c AS (SELECT A FROM t FULL JOIN u USING(a)) SELECT * FROM c;
+    SELECT name FROM pragma_table_info('from_view');
+    SELECT name FROM pragma_table_info('from_subquery');
+    SELECT name FROM pragma_table_info('from_cte');
+}
+expect {
+    A
+    A
+    A
+}
+
+# A view's `x.*` columns come from every FROM item named x, and each column
+# takes its type the way `x.<column>` does.
+test view-table-star-with-repeated-alias-lists-every-item {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE u(a TEXT, d INT);
+    CREATE VIEW v_right AS SELECT x.* FROM t AS x RIGHT JOIN u AS x USING(a);
+    CREATE VIEW v_full AS SELECT x.* FROM t AS x FULL JOIN u AS x USING(a);
+    SELECT name, type FROM pragma_table_info('v_right');
+    SELECT name, type FROM pragma_table_info('v_full');
+}
+expect {
+    a|TEXT
+    b|TEXT
+    a:1|TEXT
+    d|INT
+    a|
+    b|TEXT
+    a:1|
+    d|INT
+}
