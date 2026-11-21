@@ -60,9 +60,8 @@ impl IO for UnixIO {
         }
 
         let file = file.open(path).map_err(|e| io_error(e, "open"))?;
-        let dir_needs_sync =
-            flags.contains(OpenFlags::Create) && !flags.contains(OpenFlags::ReadOnly);
-        let parent_dir = dir_needs_sync.then(|| resolve_parent_dir(path));
+        let parent_dir = parent_dir_for_open(path, flags);
+        let dir_needs_sync = parent_dir.is_some();
 
         #[allow(clippy::arc_with_non_send_sync)]
         let unix_file = Arc::new(UnixFile {
@@ -93,50 +92,36 @@ impl IO for UnixIO {
 pub struct UnixFile {
     file: std::fs::File,
     path: String,
-    parent_dir: Option<ParentDir>,
+    parent_dir: Option<PathBuf>,
     dir_needs_sync: AtomicBool,
 }
 
-pub(crate) struct ParentDir {
-    pub(crate) path: PathBuf,
-    pub(crate) identity: Option<(u64, u64)>,
-}
-
-#[allow(clippy::unnecessary_cast)]
-fn dir_identity(st: &rustix::fs::Stat) -> (u64, u64) {
-    (st.st_dev as u64, st.st_ino as u64)
-}
-
-pub(crate) fn resolve_parent_dir(path: &str) -> ParentDir {
-    let dir = if let Some(parent) = std::fs::canonicalize(path)
+fn resolve_parent_dir(path: &str) -> PathBuf {
+    std::fs::canonicalize(path)
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
-    {
-        parent
-    } else {
-        let parent = Path::new(path)
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        if parent.is_relative() {
-            if let Ok(cwd) = std::env::current_dir() {
-                cwd.join(parent)
+        .unwrap_or_else(|| {
+            let dir = Path::new(path)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            if dir.is_relative() {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(dir))
+                    .unwrap_or_else(|_| dir.to_path_buf())
             } else {
-                parent.to_path_buf()
+                dir.to_path_buf()
             }
-        } else {
-            parent.to_path_buf()
-        }
-    };
-    let identity = fs::stat(&dir).ok().map(|st| dir_identity(&st));
-    ParentDir {
-        path: dir,
-        identity,
-    }
+        })
 }
 
-pub(crate) fn open_parent_dir(dir: &ParentDir) -> Result<Option<OwnedFd>> {
-    let c_path = CString::new(dir.path.as_os_str().as_bytes()).map_err(|_| {
+pub(crate) fn parent_dir_for_open(path: &str, flags: OpenFlags) -> Option<PathBuf> {
+    (flags.contains(OpenFlags::Create) && !flags.contains(OpenFlags::ReadOnly))
+        .then(|| resolve_parent_dir(path))
+}
+
+pub(crate) fn open_parent_dir(dir: &Path) -> Result<Option<OwnedFd>> {
+    let c_path = CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
         LimboError::InvalidArgument("parent directory path contains interior NUL byte".into())
     })?;
     loop {
@@ -147,32 +132,15 @@ pub(crate) fn open_parent_dir(dir: &ParentDir) -> Result<Option<OwnedFd>> {
             )
         };
         if fd != -1 {
-            let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-            if let Some(expected) = dir.identity {
-                let st = fs::fstat(&owned_fd)
-                    .map_err(|err| io_error(std::io::Error::from(err), "open_parent_dir"))?;
-                if dir_identity(&st) != expected {
-                    return Err(io_error(
-                        std::io::Error::new(
-                            ErrorKind::NotFound,
-                            format!(
-                                "parent directory '{}' was replaced before sync",
-                                dir.path.display()
-                            ),
-                        ),
-                        "open_parent_dir",
-                    ));
-                }
-            }
-            return Ok(Some(owned_fd));
+            return Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }));
         }
         let err = std::io::Error::last_os_error();
         match err.kind() {
             ErrorKind::Interrupted => continue,
-            ErrorKind::PermissionDenied => {
+            ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::NotADirectory => {
                 debug!(
                     "skipping parent directory sync for '{}': {}",
-                    dir.path.display(),
+                    dir.display(),
                     err
                 );
                 return Ok(None);
@@ -186,7 +154,7 @@ pub(crate) fn is_ignorable_dir_sync_errno(errno: i32) -> bool {
     matches!(errno, libc::EINVAL | libc::EROFS)
 }
 
-fn sync_parent_dir(dir: &ParentDir, sync_type: FileSyncType) -> Result<()> {
+fn sync_parent_dir(dir: &Path, sync_type: FileSyncType) -> Result<()> {
     let Some(dir_fd) = open_parent_dir(dir)? else {
         return Ok(());
     };
@@ -204,7 +172,7 @@ fn sync_parent_dir(dir: &ParentDir, sync_type: FileSyncType) -> Result<()> {
             }
             if matches!(
                 err.raw_os_error(),
-                Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::EINVAL | libc::ENOTTY)
+                Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::EINVAL | libc::ENOTTY | libc::EROFS)
             ) {
                 break;
             }
@@ -775,105 +743,94 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_fsyncs_parent_dir_once_for_newly_created_file() {
-        for sync_type in [FileSyncType::Fsync, FileSyncType::FullFsync] {
-            let root = tempfile::tempdir().unwrap();
-            let sub = root.path().join("sub");
-            let sub_moved = root.path().join("sub_moved");
-            std::fs::create_dir(&sub).unwrap();
-            let db_path = sub.join("test.db");
+    fn test_parent_dir_for_open_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("existing.db");
+        std::fs::write(&db_path, b"seed").unwrap();
+        let expected_parent = std::fs::canonicalize(&db_path)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let path_str = db_path.to_str().unwrap();
 
-            let io = UnixIO::new().unwrap();
-            let file = io
-                .open_file(db_path.to_str().unwrap(), OpenFlags::Create, false)
-                .unwrap();
-            let buf = Arc::new(crate::Buffer::new_temporary(4096));
-            let w = file.pwrite(0, buf, Completion::new_write(|_| {})).unwrap();
-            io.wait_for_completion(w).unwrap();
-
-            std::fs::rename(&sub, &sub_moved).unwrap();
-            let res = file.sync(Completion::new_sync(|_| {}), sync_type);
-            assert!(
-                res.is_err(),
-                "first sync ({sync_type:?}) must fail when parent dir is missing"
-            );
-
-            std::fs::rename(&sub_moved, &sub).unwrap();
-            let c1 = file
-                .sync(Completion::new_sync(|_| {}), sync_type)
-                .expect("retry sync must succeed once parent dir is restored");
-            io.wait_for_completion(c1).unwrap();
-
-            std::fs::rename(&sub, &sub_moved).unwrap();
-            let c2 = file
-                .sync(Completion::new_sync(|_| {}), sync_type)
-                .expect("subsequent sync must not re-open parent dir");
-            io.wait_for_completion(c2).unwrap();
-        }
+        assert_eq!(parent_dir_for_open(path_str, OpenFlags::None), None);
+        assert_eq!(parent_dir_for_open(path_str, OpenFlags::ReadOnly), None);
+        assert_eq!(
+            parent_dir_for_open(path_str, OpenFlags::Create | OpenFlags::ReadOnly),
+            None
+        );
+        assert_eq!(
+            parent_dir_for_open(path_str, OpenFlags::Create),
+            Some(expected_parent)
+        );
     }
 
     #[test]
-    fn test_sync_skips_parent_dir_for_existing_and_readonly_files() {
-        for flags in [
-            OpenFlags::None,
-            OpenFlags::ReadOnly,
-            OpenFlags::Create | OpenFlags::ReadOnly,
-        ] {
-            let root = tempfile::tempdir().unwrap();
-            let sub = root.path().join("sub");
-            let sub_moved = root.path().join("sub_moved");
-            std::fs::create_dir(&sub).unwrap();
-            let db_path = sub.join("existing.db");
-            std::fs::write(&db_path, b"seed").unwrap();
-
-            let io = UnixIO::new().unwrap();
-            let file = io
-                .open_file(db_path.to_str().unwrap(), flags, false)
-                .unwrap();
-
-            std::fs::rename(&sub, &sub_moved).unwrap();
-            let c = file
-                .sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)
-                .expect("sync should not touch parent dir for non-Create or ReadOnly open");
-            io.wait_for_completion(c).unwrap();
-        }
-    }
-
-    #[test]
-    fn test_resolve_parent_dir_relative_path_uses_cwd() {
-        let resolved = resolve_parent_dir("nonexistent-turso-dirsync-test.db");
-        assert!(!resolved.path.as_os_str().is_empty());
-        assert_eq!(resolved.path, std::env::current_dir().unwrap().join("."));
-    }
-
-    #[test]
-    fn test_open_parent_dir_ignores_permission_denied() {
+    fn test_open_parent_dir_handles_existing_missing_not_a_dir_and_permission_denied() {
         use std::os::unix::fs::PermissionsExt;
 
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
-        struct RestorePerms(PathBuf);
-        impl Drop for RestorePerms {
-            fn drop(&mut self) {
-                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
-            }
-        }
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o300)).unwrap();
-        let _restore = RestorePerms(path.clone());
+        assert!(open_parent_dir(dir.path()).unwrap().is_some());
 
-        let parent = ParentDir {
-            path,
-            identity: None,
-        };
-        let fd = open_parent_dir(&parent).expect("permission denied must not error");
-        assert!(fd.is_none());
+        let missing = dir.path().join("does_not_exist");
+        assert!(open_parent_dir(&missing).unwrap().is_none());
+
+        let regular_file = dir.path().join("regular.db");
+        std::fs::write(&regular_file, b"seed").unwrap();
+        assert!(open_parent_dir(&regular_file).unwrap().is_none());
+
+        if unsafe { libc::geteuid() } != 0 {
+            struct RestorePerms(PathBuf);
+            impl Drop for RestorePerms {
+                fn drop(&mut self) {
+                    let _ =
+                        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+                }
+            }
+            let restricted = dir.path().join("restricted");
+            std::fs::create_dir(&restricted).unwrap();
+            std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o300)).unwrap();
+            let _restore = RestorePerms(restricted.clone());
+
+            assert!(open_parent_dir(&restricted)
+                .expect("permission denied must not error")
+                .is_none());
+        }
     }
 
     #[test]
-    fn test_sync_rejects_replaced_parent_dir() {
+    fn test_sync_succeeds_after_parent_dir_renamed_while_open() {
+        for sync_type in [FileSyncType::Fsync, FileSyncType::FullFsync] {
+            let root = tempfile::tempdir().unwrap();
+            let sub = root.path().join("sub");
+            let sub_moved = root.path().join("sub_moved");
+            std::fs::create_dir(&sub).unwrap();
+            let db_path = sub.join("test.db");
+
+            let io = UnixIO::new().unwrap();
+            let file = io
+                .open_file(db_path.to_str().unwrap(), OpenFlags::Create, false)
+                .unwrap();
+            let buf = Arc::new(crate::Buffer::new_temporary(4096));
+            let w = file.pwrite(0, buf, Completion::new_write(|_| {})).unwrap();
+            io.wait_for_completion(w).unwrap();
+
+            std::fs::rename(&sub, &sub_moved).unwrap();
+            let c1 = file
+                .sync(Completion::new_sync(|_| {}), sync_type)
+                .expect("first sync must succeed after parent dir rename");
+            io.wait_for_completion(c1).unwrap();
+
+            let c2 = file
+                .sync(Completion::new_sync(|_| {}), sync_type)
+                .expect("subsequent sync must succeed");
+            io.wait_for_completion(c2).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_sync_succeeds_after_parent_dir_renamed_and_recreated() {
         for sync_type in [FileSyncType::Fsync, FileSyncType::FullFsync] {
             let root = tempfile::tempdir().unwrap();
             let sub = root.path().join("sub");
@@ -891,24 +848,42 @@ mod tests {
 
             std::fs::rename(&sub, &sub_moved).unwrap();
             std::fs::create_dir(&sub).unwrap();
-            let res = file.sync(Completion::new_sync(|_| {}), sync_type);
-            assert!(
-                res.is_err(),
-                "first sync ({sync_type:?}) must fail when parent dir is replaced"
-            );
-
-            std::fs::remove_dir(&sub).unwrap();
-            std::fs::rename(&sub_moved, &sub).unwrap();
             let c1 = file
                 .sync(Completion::new_sync(|_| {}), sync_type)
-                .expect("retry sync must succeed once original parent dir is restored");
+                .expect("first sync must succeed after parent dir rename and recreate");
             io.wait_for_completion(c1).unwrap();
 
-            std::fs::rename(&sub, &sub_moved).unwrap();
             let c2 = file
                 .sync(Completion::new_sync(|_| {}), sync_type)
-                .expect("subsequent sync must not re-open parent dir");
+                .expect("subsequent sync must succeed");
             io.wait_for_completion(c2).unwrap();
         }
+    }
+
+    #[test]
+    fn test_database_open_and_sync_succeeds_after_parent_dir_renamed_while_open() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        let sub_moved = root.path().join("sub_moved");
+        std::fs::create_dir(&sub).unwrap();
+        let db_path = sub.join("test.db");
+
+        let io = Arc::new(UnixIO::new().unwrap());
+        let db = crate::Database::open_file(
+            io.clone(),
+            db_path.to_str().unwrap(),
+            Arc::new(crate::dialect::cannot_parse::DialectThatCannotParse),
+        )
+        .unwrap();
+        let _conn = db
+            .connect(crate::ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
+
+        std::fs::rename(&sub, &sub_moved).unwrap();
+        let c = db
+            .db_file
+            .sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)
+            .expect("database file sync must succeed after parent dir rename");
+        io.wait_for_completion(c).unwrap();
     }
 }
