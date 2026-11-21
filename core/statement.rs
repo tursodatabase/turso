@@ -1068,6 +1068,14 @@ impl Statement {
 
     fn rollback_autocommit_txn(&mut self) -> Result<()> {
         let conn = self.connection.clone();
+        // A sibling root statement may own the connection's implicit
+        // transaction. Repreparing this statement must not discard its work.
+        if conn.get_auto_commit()
+            && conn.n_active_root_statements.load(Ordering::SeqCst)
+                > i32::from(self.counted_as_active_root)
+        {
+            return Ok(());
+        }
         let main_pager = conn.pager.load().clone();
 
         // SchemaUpdated bypasses the normal abort rollback path, so in
