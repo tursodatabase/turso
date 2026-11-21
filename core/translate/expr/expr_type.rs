@@ -409,9 +409,11 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
         ast::Expr::Raise(..) => ExprType::Null,
         // Expressions whose value is never a custom-type value. SQLite's affinity
         // gives their built-in type.
-        ast::Expr::FunctionCallStar { .. }
+        ast::Expr::FunctionCallStar { name, .. } => {
+            function_star_type(name, env).unwrap_or_else(|| affinity_type(expr, env))
+        }
         // `CAST(x AS)`, a SQLite cast with no type name.
-        | ast::Expr::Cast {
+        ast::Expr::Cast {
             type_name: None, ..
         } => affinity_type(expr, env),
         ast::Expr::Id(name) | ast::Expr::Name(name) => env.name_type(name.as_str()),
@@ -1059,7 +1061,32 @@ fn arithmetic_type(lhs: &ExprType, rhs: &ExprType) -> ExprType {
     })
 }
 
+fn function_star_type(name: &ast::Name, env: &TypeEnv) -> Option<ExprType> {
+    let resolver = env.resolver()?;
+    let no_args = || Vec::new();
+    resolver
+        .catalog
+        .dialect
+        .function_result_type(name.as_str(), &no_args, env.schema())
+        .map(from_operand_type)
+}
+
 fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> ExprType {
+    if let Some(resolver) = env.resolver() {
+        let arg_types = || {
+            args.iter()
+                .map(|arg| dialect_operand_type(&type_of(arg, env)))
+                .collect()
+        };
+        if let Some(ty) =
+            resolver
+                .catalog
+                .dialect
+                .function_result_type(name.as_str(), &arg_types, env.schema())
+        {
+            return from_operand_type(ty);
+        }
+    }
     let Ok(Some(func)) = env.resolve_function(name.as_str(), args.len()) else {
         return ExprType::Builtin(BuiltinType::Any);
     };
@@ -1219,7 +1246,19 @@ pub(crate) fn common_type<'e>(
     exprs: impl Iterator<Item = &'e ast::Expr>,
     env: &TypeEnv,
 ) -> ExprType {
-    common_of_types(exprs.map(|expr| type_of(expr, env)), env.schema())
+    let types: Vec<ExprType> = exprs.map(|expr| type_of(expr, env)).collect();
+    common_type_of(types, env.resolver(), env.schema())
+}
+
+/// The common type of `types`, as the dialect gives it or else as the engine does.
+fn common_type_of(types: Vec<ExprType>, resolver: Option<&Resolver>, schema: &Schema) -> ExprType {
+    if let Some(resolver) = resolver {
+        let operand_types = || types.iter().map(dialect_operand_type).collect();
+        if let Some(ty) = resolver.catalog.dialect.common_type(&operand_types) {
+            return from_operand_type(ty);
+        }
+    }
+    common_of_types(types.into_iter(), schema)
 }
 
 /// The type of an operand as a dialect sees it.
@@ -1235,6 +1274,23 @@ pub(crate) fn dialect_operand_type(ty: &ExprType) -> OperandType {
         ExprType::Custom { type_def, .. } => OperandType::Custom(Arc::clone(type_def)),
         ExprType::Array { .. } => OperandType::Array,
         _ => OperandType::Unknown,
+    }
+}
+
+fn from_operand_type(ty: OperandType) -> ExprType {
+    match ty {
+        OperandType::Untyped => ExprType::Untyped,
+        OperandType::Null => ExprType::Null,
+        OperandType::Integer => ExprType::Builtin(BuiltinType::Integer),
+        OperandType::Real => ExprType::Builtin(BuiltinType::Real),
+        OperandType::Decimal => ExprType::Builtin(BuiltinType::Decimal),
+        OperandType::Text => ExprType::Builtin(BuiltinType::Text),
+        OperandType::Blob => ExprType::Builtin(BuiltinType::Blob),
+        OperandType::Custom(type_def) => ExprType::Custom {
+            type_def,
+            params: Vec::new(),
+        },
+        OperandType::Array | OperandType::Unknown => ExprType::Unknown,
     }
 }
 

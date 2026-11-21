@@ -656,6 +656,24 @@ pub trait Dialect: Send + Sync + 'static {
         out.push_str("'\"");
     }
 
+    /// The type of a call of the function `name`, when the dialect decides it.
+    /// None leaves it to the engine. `args` works out the types of the
+    /// arguments, so a dialect that looks at no call never pays for it.
+    fn function_result_type(
+        &self,
+        _name: &str,
+        _args: &dyn Fn() -> std::vec::Vec<OperandType>,
+        _schema: &crate::schema::Schema,
+    ) -> Option<OperandType> {
+        None
+    }
+
+    /// The type that values of the given types have together, as the results
+    /// of a CASE or coalesce do. None leaves it to the engine.
+    fn common_type(&self, _types: &dyn Fn() -> std::vec::Vec<OperandType>) -> Option<OperandType> {
+        None
+    }
+
     /// Plans a CAST of a value of type `source()` to the type `target`, as
     /// written. None leaves the CAST to the engine, which converts the value
     /// as SQLite's CAST or the target custom type does. `source` works out
