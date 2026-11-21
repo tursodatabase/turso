@@ -143,11 +143,27 @@ fn index_column_value_type(
                 resolver.catalog.symbol_table,
             )
         }
-        None => Ok(column_type(
-            index_table_column(table, idx_col)?,
-            table.is_strict(),
-            resolver.schema(),
-        )),
+        // A subquery, view or CTE column has no declared type; the subquery
+        // records the type of its result column, which a scan reads.
+        None => match table {
+            Table::FromClauseSubquery(subquery) => subquery
+                .column_types
+                .get(idx_col.pos_in_table)
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    Err(crate::LimboError::InternalError(format!(
+                        "index column {} is not a column of subquery {}",
+                        idx_col.pos_in_table,
+                        table.get_name()
+                    )))
+                }),
+            _ => Ok(column_type(
+                index_table_column(table, idx_col)?,
+                table.is_strict(),
+                resolver.schema(),
+            )),
+        },
     }
 }
 

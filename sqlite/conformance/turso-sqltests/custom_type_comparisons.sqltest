@@ -1904,3 +1904,52 @@ expect {
     d-tz|2024-01-05
     d-tz|2024-01-06
 }
+
+@requires strict "uses STRICT tables"
+test cmp-date-column-equals-subquery-timestamp-in-join {
+    CREATE TABLE t(id int, d date) STRICT;
+    CREATE TABLE u(ts timestamp) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-05'), (2, '2024-01-06');
+    INSERT INTO u VALUES ('2024-01-05 00:00:00'), ('2024-01-06 12:00:00');
+    SELECT t.id FROM t, (SELECT ts FROM u) s WHERE t.d = s.ts;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-column-equals-view-timestamp-in-join {
+    CREATE TABLE t(id int, d date) STRICT;
+    CREATE TABLE u(ts timestamp) STRICT;
+    CREATE VIEW v AS SELECT ts FROM u;
+    INSERT INTO t VALUES (1, '2024-01-05'), (2, '2024-01-06');
+    INSERT INTO u VALUES ('2024-01-05 00:00:00'), ('2024-01-06 12:00:00');
+    SELECT t.id FROM t, v WHERE t.d = v.ts;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-column-equals-cte-timestamp-in-join {
+    CREATE TABLE t(id int, d date) STRICT;
+    CREATE TABLE u(ts timestamp) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-05'), (2, '2024-01-06');
+    INSERT INTO u VALUES ('2024-01-05 00:00:00'), ('2024-01-06 12:00:00');
+    WITH c AS (SELECT ts FROM u) SELECT t.id FROM t, c WHERE t.d = c.ts;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-timestamp-column-equals-subquery-date-in-join {
+    CREATE TABLE t(id int, ts timestamp) STRICT;
+    CREATE TABLE u(d date) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-05 00:00:00'), (2, '2024-01-06 12:00:00');
+    INSERT INTO u VALUES ('2024-01-05'), ('2024-01-06');
+    SELECT t.id FROM t, (SELECT d FROM u) s WHERE t.ts = s.d;
+}
+expect {
+    1
+}
