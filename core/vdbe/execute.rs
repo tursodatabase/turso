@@ -12068,22 +12068,14 @@ fn normalize_table_change_record(
 
     values.try_reserve(table.columns().len() - values.len())?;
     for column in table.columns().iter().skip(values.len()) {
-        let mut value = if column.is_rowid_alias() {
+        let value = if column.is_rowid_alias() {
             Value::from_i64(rowid)
         } else if let Some(default) = column.default.as_deref() {
-            crate::translate::alter::eval_constant_default_value(default)?
+            crate::translate::alter::column_default_value(default, column.affinity())?
         } else {
             Value::Null
         };
-        if let Some(converted) = column.affinity().convert(&value) {
-            value = match converted {
-                Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
-                Either::Left(_) => {
-                    unreachable!("affinity conversion returned an unexpected borrowed value")
-                }
-                Either::Right(value) => value,
-            };
-        }
+        // The default has already been converted with the column affinity.
         values.push(value);
     }
 

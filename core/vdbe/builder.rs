@@ -2534,12 +2534,6 @@ impl ProgramBuilder {
             // evaluated at INSERT time via translate_expr. The Column default
             // only matters for pre-existing rows after ALTER TABLE ADD COLUMN,
             // and ALTER TABLE already validates that the default is constant.
-            let mut value = match crate::translate::alter::eval_constant_default_value(default_expr)
-            {
-                Ok(v) => v,
-                Err(_) => break 'value None,
-            };
-
             // Apply column affinity to the default value, matching SQLite's
             // sqlite3ColumnDefault which calls sqlite3ValueFromExpr with
             // pCol->affinity. This ensures e.g. ALTER TABLE ADD COLUMN c TEXT
@@ -2549,15 +2543,11 @@ impl ProgramBuilder {
                 CursorType::MaterializedView(btree, _) => btree.columns()[column].affinity(),
                 _ => Affinity::Blob,
             };
-            if let Some(converted) = affinity.convert(&value) {
-                value = match converted {
-                    either::Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
-                    either::Either::Left(_) => {
-                        unreachable!("affinity conversion returned an unexpected borrowed value")
-                    }
-                    either::Either::Right(val) => val,
+            let mut value =
+                match crate::translate::alter::column_default_value(default_expr, affinity) {
+                    Ok(v) => v,
+                    Err(_) => break 'value None,
                 };
-            }
 
             if matches!(affinity, Affinity::Integer | Affinity::Numeric) {
                 if let Some(ValueRef::Numeric(integer)) =

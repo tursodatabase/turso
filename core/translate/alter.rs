@@ -232,6 +232,39 @@ fn apply_affinity_to_value(value: &mut Value, affinity: Affinity) {
     }
 }
 
+/// The default read for a pre-existing row follows sqlite3ValueFromExpr:
+/// TEXT affinity retains the spelling of a decimal REAL literal, while an
+/// integer literal is converted from its integer value as usual.
+pub(crate) fn column_default_value(expr: &ast::Expr, affinity: Affinity) -> Result<Value> {
+    let mut value = eval_constant_default_value(expr)?;
+    if affinity == Affinity::Text && matches!(value, Value::Numeric(Numeric::Float(_))) {
+        let mut literal = expr;
+        let mut negative = false;
+        loop {
+            literal = match literal {
+                ast::Expr::Parenthesized(items) if items.len() == 1 => &items[0],
+                ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => inner,
+                ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
+                    negative = !negative;
+                    inner
+                }
+                _ => break,
+            };
+        }
+        if let ast::Expr::Literal(ast::Literal::Numeric(text)) = literal {
+            if !text.starts_with("0x") && !text.starts_with("0X") {
+                return Ok(Value::from_text(if negative {
+                    format!("-{text}")
+                } else {
+                    text.clone()
+                }));
+            }
+        }
+    }
+    apply_affinity_to_value(&mut value, affinity);
+    Ok(value)
+}
+
 fn strict_default_type_mismatch(column: &Column) -> Result<bool> {
     let Some(default_expr) = column.default.as_ref() else {
         return Ok(false);
