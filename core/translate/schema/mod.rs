@@ -34,7 +34,7 @@ use crate::translate::expr::expr_type::{
 };
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
-use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
+use crate::translate::plan::{compound_column_affinities, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
@@ -43,6 +43,7 @@ use crate::util::{
     is_builtin_strict_type, normalize_ident, quote_identifier, walk_expr_with_subqueries,
     walk_schema_expressions, SchemaExprOwner, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
     to_u32, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
@@ -907,6 +908,10 @@ pub(crate) fn validate_generated_function_calls(
 struct CtasInfo {
     plan: Plan,
     schema_sql: String,
+    /// For each column, whether its values are stored without converting
+    /// them to the column's affinity (see
+    /// [crate::translate::plan::CompoundColumnAffinity::flexible_numeric]).
+    stores_values_unchanged: Vec<bool>,
 }
 
 /// Pre-plan the SELECT to derive the schema for a CTAS table.
@@ -936,7 +941,8 @@ fn derive_ctas_schema(
         }
         _ => bail_parse_error!("unexpected plan type for CTAS"),
     };
-    // SQLite derives a compound output affinity from all arms, not only the leftmost arm.
+    // SQLite derives a compound output affinity from all arms, not only the leftmost arm,
+    // and a VALUES list's affinity from its rows.
     let compound_arms = match &plan {
         Plan::CompoundSelect {
             left, right_most, ..
@@ -946,6 +952,7 @@ fn derive_ctas_schema(
             arms.push(right_most);
             Some(arms)
         }
+        Plan::Select(select) if !select.values.is_empty() => Some(vec![&**select]),
         _ => None,
     };
 
@@ -967,12 +974,29 @@ fn derive_ctas_schema(
 
     let mut sql_parts = Vec::with_capacity(result_columns.len());
     let mut col_defs = Vec::with_capacity(result_columns.len());
+    let mut stores_values_unchanged = Vec::with_capacity(result_columns.len());
+    let mut compound_affinities = compound_arms
+        .as_ref()
+        .map(|arms| compound_column_affinities(arms, resolver).into_iter());
 
-    for (column_index, (col, name)) in result_columns.iter().zip(names).enumerate() {
+    for (col, name) in result_columns.iter().zip(names) {
         // Names come from the leftmost arm, but compound affinity can weaken its type.
-        let ty = compound_arms
-            .as_ref()
-            .map(|arms| compound_column_affinity(arms, column_index).short_type_name())
+        let compound_affinity = compound_affinities
+            .as_mut()
+            .and_then(|affinities| affinities.next());
+        stores_values_unchanged.push(
+            compound_affinity
+                .as_ref()
+                .is_some_and(|affinity| affinity.flexible_numeric),
+        );
+        let ty = compound_affinity
+            .map(|affinity| {
+                if affinity.flexible_numeric {
+                    Affinity::Numeric.short_type_name()
+                } else {
+                    affinity.affinity.short_type_name()
+                }
+            })
             .unwrap_or_else(|| col.declared_type(table_refs));
 
         let quoted = quote_identifier(&name);
@@ -1001,6 +1025,7 @@ fn derive_ctas_schema(
     let info = CtasInfo {
         plan,
         schema_sql: format!("CREATE TABLE {table_name_in_sql}({})", sql_parts.join(",")),
+        stores_values_unchanged,
     };
     Ok((info, col_defs))
 }
@@ -1013,6 +1038,7 @@ fn emit_ctas_insert(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     mut plan: Plan,
+    stores_values_unchanged: &[bool],
     body: &ast::CreateTableBody,
     table_root_reg: usize,
     col_count: usize,
@@ -1075,7 +1101,14 @@ fn emit_ctas_insert(
     let affinity_str = ctas_btree
         .columns()
         .iter()
-        .map(|column| column.affinity().aff_mask())
+        .zip(stores_values_unchanged)
+        .map(|(column, &unchanged)| {
+            if unchanged {
+                Affinity::Blob.aff_mask()
+            } else {
+                column.affinity().aff_mask()
+            }
+        })
         .collect();
     let new_table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ctas_btree));
     program.emit_insn(Insn::OpenWrite {
@@ -1547,6 +1580,7 @@ pub fn translate_create_table(
             program,
             resolver,
             info.plan,
+            &info.stores_values_unchanged,
             &body,
             table_root_reg,
             col_count,
