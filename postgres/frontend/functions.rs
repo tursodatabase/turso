@@ -54,6 +54,15 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     options
         .extension_function(
             pg_scalar_function(
+                "current_setting",
+                FunctionArity::OneOf(&[1, 2]),
+                false,
+                |context, args| exec_current_setting(context.connection, args),
+            )
+            .receiving_argument_types(),
+        )
+        .extension_function(
+            pg_scalar_function(
                 "array_to_json",
                 FunctionArity::OneOf(&[1, 2]),
                 true,
@@ -353,9 +362,6 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "booleq"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() == args[1].get_value()),
         "boolne"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() != args[1].get_value()),
         "set_config"(FunctionArity::Exact(3), false) => exec_set_config(connection, args)?,
-        "current_setting"(FunctionArity::OneOf(&[1, 2]), false) => {
-            exec_current_setting(connection, args)?
-        },
         "version"(FunctionArity::Exact(0), true) => exec_version(),
         "current_database"(FunctionArity::Exact(0), false) => {
             crate::catalog::db_name_from_path(connection.db_file_path())
@@ -778,14 +784,25 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<String> {
 }
 
 fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Option<String>> {
+    let (args, types) = args.split_at(args.len() / 2);
     if args
         .iter()
         .any(|arg| matches!(arg.get_value(), Value::Null))
     {
         return Ok(None);
     }
+    let first_type = types[0].get_value().to_string();
+    let is_name = matches!(
+        first_type.as_str(),
+        "text" | "varchar" | "unknown" | "any" | "null"
+    );
     let Value::Text(name) = args[0].get_value() else {
         let mut arg_types = vec![pg_type_name(args[0].get_value())];
+        arg_types.extend(args[1..].iter().map(|_| "boolean"));
+        return Err(undefined_function("current_setting", &arg_types));
+    };
+    if !is_name {
+        let mut arg_types = vec![first_type.as_str()];
         arg_types.extend(args[1..].iter().map(|_| "boolean"));
         return Err(undefined_function("current_setting", &arg_types));
     };
@@ -856,18 +873,27 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
             }
             rounded as i64
         }
-        Value::Text(text) => text.as_str().trim().parse().map_err(|_| {
-            sqlstate_error(
-                SQLSTATE_INVALID_TEXT_REPRESENTATION,
-                format!(
-                    "invalid input syntax for type bigint: \"{}\"",
-                    text.as_str()
-                ),
-                None,
-            )
-        })?,
+        Value::Text(text) => {
+            let text = text.as_str().trim();
+            if let Ok(Some(rounded)) = turso_core::numeric_to_rounded_i64(args[0].get_value()) {
+                if text.parse::<i64>().is_err() && text.parse::<f64>().is_ok() {
+                    return limit_value_checked(args, rounded);
+                }
+            }
+            text.parse().map_err(|_| {
+                sqlstate_error(
+                    SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                    format!("invalid input syntax for type bigint: \"{text}\""),
+                    None,
+                )
+            })?
+        }
         Value::Blob(_) => return Err(LimboError::InvalidArgument("datatype mismatch".to_string())),
     };
+    limit_value_checked(args, value)
+}
+
+fn limit_value_checked(args: &[Register], value: i64) -> Result<Option<i64>> {
     if value < 0 {
         let clause = text_arg(args, 1);
         let sqlstate = if clause == "OFFSET" {

@@ -9,11 +9,14 @@ use crate::error::sqlstate_error;
 use crate::functions::{parse_pg_bool, validate_pg_input};
 use crate::pg_type::{PgTypeInfo, PG_BASE_TYPES};
 use turso_core::dialect::{CastContext, CastConversion, CastPlan, OperandType};
-use turso_core::{LimboError, Numeric, Register, Result, Value};
+use turso_core::{
+    format_numeric, numeric_from_value, numeric_to_rounded_i64, LimboError, Numeric, Register,
+    Result, Value,
+};
 use turso_parser::ast;
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_CANNOT_COERCE, SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_INVALID_TEXT_REPRESENTATION,
-    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_CANNOT_COERCE, SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_FEATURE_NOT_SUPPORTED,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,6 +323,7 @@ fn convert(value: &Value, source: CastType, target: CastType) -> Result<Value> {
     }
     match target {
         Bytea => integer_to_bytea(value, source),
+        Numeric => to_numeric(value, source),
         Text => to_text(value, source),
         Bool => to_bool(value),
         _ => Ok(value.clone()),
@@ -328,6 +332,9 @@ fn convert(value: &Value, source: CastType, target: CastType) -> Result<Value> {
 
 fn to_integer(value: &Value, source: CastType, target: CastType) -> Result<Value> {
     let number = match (value, source) {
+        (Value::Text(text), CastType::Numeric) => numeric_to_rounded_i64(value)
+            .map_err(|_| input_error(text.as_str(), "numeric"))?
+            .ok_or_else(|| out_of_range(target))?,
         (Value::Text(text), _) => {
             return parse_integer(text.as_str(), target).map(Value::from_i64);
         }
@@ -506,6 +513,36 @@ fn parse_float(text: &str, target: CastType) -> Result<f64> {
         Ok(number) if !invalid => Ok(number),
         _ => Err(input_error(text, type_name)),
     }
+}
+
+fn to_numeric(value: &Value, source: CastType) -> Result<Value> {
+    match value {
+        Value::Text(text) if source == CastType::Text => {
+            numeric_from_value(value).map_err(|_| input_error(text.as_str(), "numeric"))?;
+            Ok(Value::build_text(text.as_str().trim().to_string()))
+        }
+        Value::Numeric(Numeric::Float(f)) => {
+            float_to_numeric_text(f64::from(*f), source).map(Value::build_text)
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
+/// The digits of a float that PostgreSQL keeps when it converts one to
+/// numeric, with no trailing zeros: 6 significant digits for a float4 and 15
+/// for a float8.
+fn float_to_numeric_text(number: f64, source: CastType) -> Result<String> {
+    if !number.is_finite() {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "numeric infinity is not supported",
+            None,
+        ));
+    }
+    let digits = if source == Float4 { 5 } else { 14 };
+    let rounded = format!("{number:.digits$e}");
+    let value = numeric_from_value(&Value::build_text(rounded)).unwrap_or_default();
+    Ok(format_numeric(&value.normalized()))
 }
 
 fn to_text(value: &Value, source: CastType) -> Result<Value> {

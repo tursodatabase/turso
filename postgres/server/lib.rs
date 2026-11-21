@@ -1099,9 +1099,8 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" => Type::INT4,
         "BIGINT" | "INT8" | "BIGSERIAL" => Type::INT8,
         "FLOAT4" => Type::FLOAT4,
-        "REAL" | "FLOAT" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC" | "DECIMAL" => {
-            Type::FLOAT8
-        }
+        "REAL" | "FLOAT" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" => Type::FLOAT8,
+        "NUMERIC" | "DECIMAL" => Type::NUMERIC,
         "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER VARYING" | "CHARACTER" | "NAME" => Type::TEXT,
         "BLOB" | "BYTEA" => Type::BYTEA,
         "BOOLEAN" | "BOOL" => Type::BOOL,

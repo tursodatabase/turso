@@ -170,27 +170,19 @@ expect {
 expect @tursopg error {}
 
 # A-24: numeric exact decimal arithmetic
-@compat-gap "operator:numeric + numeric"
 test numeric-exact-decimal-arithmetic {
     SELECT 0.1::numeric + 0.2::numeric, 1::numeric / 3;
 }
 expect {
     0.3|0.33333333333333333333
 }
-expect @tursopg {
-    0.30000000000000004|0.3333333333333333
-}
 
 # A-25: numeric big precision
-@compat-gap "type:numeric"
 test numeric-big-precision {
     SELECT '123456789012345678901234567890.123'::numeric;
 }
 expect {
     123456789012345678901234567890.123
-}
-expect @tursopg {
-    1.2345678901234568e29
 }
 
 # A-26: numeric overflow on typmod
@@ -204,26 +196,18 @@ expect error {}
 expect @tursopg error {}
 
 # A-27: invalid numeric
-@compat-gap "type:numeric"
 test invalid-numeric {
     SELECT 'abc'::numeric;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    0
-}
 
 # A-28: numeric exponent input
-@compat-gap "type:numeric"
 test numeric-exponent-input {
     SELECT '1e3'::numeric, '1.50'::numeric;
 }
 expect {
     1000|1.50
-}
-expect @tursopg {
-    1000.0|1.5
 }
 
 # A-30: timestamptz literal with +02 offset

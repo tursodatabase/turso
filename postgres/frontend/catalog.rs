@@ -315,6 +315,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn cast_without_type_arguments_is_sqlite_cast(&self) -> bool {
+        false
+    }
+
     fn requires_custom_types(&self) -> bool {
         true
     }

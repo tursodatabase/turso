@@ -7064,7 +7064,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
             return match params {
                 [p, s] => Some(PgTypeMapping::with_params("numeric", vec![*p, *s])),
                 [p] => Some(PgTypeMapping::with_params("numeric", vec![*p, 0])),
-                _ => Some(PgTypeMapping::scalar("REAL")),
+                _ => Some(PgTypeMapping::scalar("numeric")),
             };
         }
 
@@ -7672,6 +7672,7 @@ fn cast_target_type(type_name: &pg_query::protobuf::TypeName) -> Result<ast::Typ
             "TEXT" => Some("text"),
             "UUID" => Some("uuid"),
             "BYTEA" => Some("bytea"),
+            "NUMERIC" | "DECIMAL" if type_name.typmods.is_empty() => Some("numeric"),
             _ => None,
         };
         if let Some(name) = name {
@@ -10690,7 +10691,7 @@ mod tests {
             map_pg_type("NUMERIC", &[10]),
             Some(PgTypeMapping::with_params("numeric", vec![10, 0]))
         );
-        assert_eq!(map_pg_type("NUMERIC", no_params), Some(s("REAL")));
+        assert_eq!(map_pg_type("NUMERIC", no_params), Some(s("numeric")));
 
         // Network types → custom types
         assert_eq!(map_pg_type("CIDR", no_params), Some(s("cidr")));
