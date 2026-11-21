@@ -1884,6 +1884,34 @@ expect error {
     cannot compare type timestamp with type date in IN \(SELECT \.\.\.\)
 }
 
+@requires strict "uses STRICT tables"
+test cmp-date-time-types-in-subquery-with-index-on-left-is-an-error {
+    -- A seek on the index of the left side would look up the subquery's
+    -- values as they are stored, and find no timestamp equal to a date.
+    CREATE TABLE a(d date) STRICT;
+    CREATE TABLE b(ts timestamp) STRICT;
+    CREATE INDEX b_ts ON b(ts);
+    INSERT INTO a VALUES ('2024-01-05');
+    INSERT INTO b VALUES ('2024-01-05 00:00:00');
+    SELECT count(*) FROM b WHERE ts IN (SELECT d FROM a);
+}
+expect error {
+    cannot compare type timestamp with type date in IN \(SELECT \.\.\.\)
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-time-types-in-subquery-with-index-on-date-is-an-error {
+    CREATE TABLE a(d date) STRICT;
+    CREATE TABLE b(ts timestamp) STRICT;
+    CREATE INDEX a_d ON a(d);
+    INSERT INTO a VALUES ('2024-01-05');
+    INSERT INTO b VALUES ('2024-01-05 00:00:00');
+    SELECT count(*) FROM a WHERE d IN (SELECT ts FROM b);
+}
+expect error {
+    cannot compare type date with type timestamp in IN \(SELECT \.\.\.\)
+}
+
 
 @requires strict "uses STRICT tables"
 test cmp-nullif-returns-the-first-date-time-argument-unchanged {

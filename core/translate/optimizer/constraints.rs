@@ -1,6 +1,7 @@
 use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
-use crate::translate::expr::{compared_operand_type, comparison_affinity};
+use crate::translate::expr::expr_type::{type_of, TypeEnv};
+use crate::translate::expr::{compared_operand_type, comparison_affinity, later_date_time_type};
 use crate::translate::expr_context::{ExprContext, ExprProperties, TableMetadata};
 use crate::{
     schema::{Column, Index, IndexColumn, Schema},
@@ -1278,8 +1279,19 @@ pub fn table_constraints_from_where_clause(
                     .then(|| affinity_str.chars().next().map(Affinity::from_char))
                     .flatten();
                 let cmp_collation = Some(in_subquery_collation(subquery)?);
+                let lhs_and_result_differ_in_date_time_type = in_subquery_mixes_date_time_types(
+                    lhs_expr,
+                    *subquery_id,
+                    table_references,
+                    resolver,
+                )?;
 
                 match lhs_expr.as_ref() {
+                    // The seek would look up the subquery's values in the
+                    // index as they are stored, without reading them as the
+                    // indexed column's date/time type. Without the seek the
+                    // translator refuses the comparison.
+                    _ if lhs_and_result_differ_in_date_time_type => {}
                     ast::Expr::Column { table, column, .. }
                         if *table == table_reference.internal_id =>
                     {
@@ -1454,6 +1466,34 @@ fn decide_once(
     let collation = decide()?;
     *slot = Some(collation);
     Ok(collation)
+}
+
+/// Whether `lhs IN (SELECT ...)` compares a left side and a subquery result
+/// column that are two different types among date, timestamp and timestamptz.
+fn in_subquery_mixes_date_time_types(
+    lhs: &ast::Expr,
+    subquery_id: TableInternalId,
+    table_references: &TableReferences,
+    resolver: &Resolver,
+) -> Result<bool> {
+    let lhs_type = type_of(lhs, &TypeEnv::new(Some(table_references), resolver));
+    let column_types = resolver
+        .in_subquery_column_types
+        .get(subquery_id)
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "IN subquery {subquery_id} has no column types"
+            ))
+        })?;
+    let Some(rhs_type) = column_types.first() else {
+        return Err(crate::LimboError::InternalError(format!(
+            "IN subquery {subquery_id} has no result column"
+        )));
+    };
+    Ok(
+        later_date_time_type(&lhs_type, rhs_type, resolver.schema())?.is_some()
+            || later_date_time_type(rhs_type, &lhs_type, resolver.schema())?.is_some(),
+    )
 }
 
 /// The collation `x IN (SELECT y ...)` compares with. The subquery's ephemeral
