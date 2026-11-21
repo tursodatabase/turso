@@ -153,6 +153,10 @@ pub struct ColumnTypeInfo {
     /// from "the user wrote `cents`, which happens to be INTEGER underneath"
     /// (base_type: `Some("INTEGER")`).
     pub base_type: Option<String>,
+    /// The type that a domain is based on, or the type itself when it is not a
+    /// domain: `float4` for a column of `CREATE DOMAIN d AS float4`. `None`
+    /// for a built-in primitive and for a domain over one.
+    pub underlying_type: Option<String>,
     /// Classification of the declared type. Distinguishes `BUILTIN` (the
     /// declared name is a primitive) from the four `CREATE TYPE`/`CREATE
     /// DOMAIN` flavours.
