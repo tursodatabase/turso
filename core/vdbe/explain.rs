@@ -1386,7 +1386,13 @@ pub fn insn_to_row(
                     data.func.as_str().to_string()
                 }),
                 0,
-                format!("accum=r[{}] step(r[{}])", data.acc_reg, data.col),
+                match data.minmax_keeps_best_reg {
+                    Some(reg) => format!(
+                        "accum=r[{}] step(r[{}]); r[{}]=1 if accum kept its value",
+                        data.acc_reg, data.col, reg
+                    ),
+                    None => format!("accum=r[{}] step(r[{}])", data.acc_reg, data.col),
+                },
             ),
             Insn::AggInverse {
                 func,

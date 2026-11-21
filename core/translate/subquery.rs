@@ -11,6 +11,7 @@ use super::{
     main_loop::LoopLabels,
     plan::{Aggregate, Operation, QueryDestination, Search, SelectPlan},
     planner::{resolve_window_and_aggregate_functions, TableMask},
+    select::first_aggregate_without_over_clause,
 };
 use crate::translate::expr::comparison_affinity;
 use crate::translate::expr::expr_type::{type_of, TypeEnv};
@@ -331,7 +332,7 @@ pub fn plan_subqueries_from_select_plan(
                 connection,
                 SubqueryPosition::Having,
                 SubqueryOrigin::SelectHaving,
-                !group_by.exprs.is_empty(),
+                SubqueryPosition::Having.allow_correlated(),
                 &mut cse_map,
                 &mut same_query_map,
                 &[],
@@ -1947,6 +1948,7 @@ pub fn emit_from_clause_subquery(
                     meta_sort: None,
                     reg_agg_start: None,
                     reg_nonagg_emit_once_flag: None,
+                    ungrouped_agg_bare_columns: Vec::new(),
                     reg_result_cols_start: None,
                     limit_ctx: None,
                     reg_offset: None,
@@ -2047,6 +2049,7 @@ fn emit_indexed_materialized_subquery(
                 meta_sort: None,
                 reg_agg_start: None,
                 reg_nonagg_emit_once_flag: None,
+                ungrouped_agg_bare_columns: Vec::new(),
                 reg_result_cols_start: None,
                 limit_ctx: None,
                 reg_offset: None,
@@ -2177,6 +2180,7 @@ fn emit_materialized_subquery_table(
                 meta_sort: None,
                 reg_agg_start: None,
                 reg_nonagg_emit_once_flag: None,
+                ungrouped_agg_bare_columns: Vec::new(),
                 reg_result_cols_start: None,
                 limit_ctx: None,
                 reg_offset: None,
@@ -2453,6 +2457,8 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver
         .is_some_and(|group_by| !group_by.exprs.is_empty());
     let has_direct_row_output =
         !has_grouped_output && plan.aggregates.is_empty() && plan.window.is_none();
+    let has_ungrouped_aggregate_output =
+        !has_grouped_output && !plan.aggregates.is_empty() && plan.window.is_none();
     let has_unmatched_right_rows = plan.table_references.has_right_or_full_join();
 
     // Subqueries inside an aggregate's arguments or FILTER clause are evaluated
@@ -2473,8 +2479,15 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver
         }
     }
 
-    let mut outer_aggregate_subquery_ids: Vec<ast::TableInternalId> = Vec::new();
+    let mut output_phase_subquery_ids: Vec<ast::TableInternalId> = Vec::new();
     for subquery in plan.non_from_clause_subqueries.iter_mut() {
+        // Code generation finds an aggregate by its register, and a subquery
+        // that runs after this query's aggregation loop would find this
+        // query's register for an aggregate in its WHERE clause. SQLite never
+        // allows an aggregate in a WHERE clause, so reject it here.
+        if let Some(func) = aggregate_in_subquery_where(subquery, resolver) {
+            crate::bail_parse_error!("misuse of aggregate function {}()", func);
+        }
         // A subquery that reads an aggregate the outer query computes must run
         // in the outer query's aggregate-output phase, after that aggregate has
         // been finalized into a register; run earlier, the aggregate expression
@@ -2490,7 +2503,7 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver
             } else {
                 SubqueryEvalPhase::UngroupedAggregateOutput
             };
-            outer_aggregate_subquery_ids.push(subquery.internal_id);
+            output_phase_subquery_ids.push(subquery.internal_id);
             continue;
         }
         // These subqueries run once per input row: in output columns and
@@ -2516,24 +2529,45 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver
             {
                 SubqueryEvalPhase::GroupedOutput
             }
+            // HAVING without GROUP BY filters the one aggregate row, so a
+            // correlated subquery in it reads the row values saved for it.
+            SubqueryOrigin::SelectHaving
+                if subquery.correlated
+                    && !aggregate_subquery_ids.contains(&subquery.internal_id) =>
+            {
+                SubqueryEvalPhase::UngroupedAggregateOutput
+            }
+            // A correlated subquery in the result columns of an aggregate query
+            // without GROUP BY reads the same saved row as the bare columns.
+            // Run in the loop, it would read the last row when its result
+            // column is computed after the loop.
+            SubqueryOrigin::SelectList
+                if subquery.correlated
+                    && has_ungrouped_aggregate_output
+                    && !aggregate_subquery_ids.contains(&subquery.internal_id) =>
+            {
+                output_phase_subquery_ids.push(subquery.internal_id);
+                SubqueryEvalPhase::UngroupedAggregateOutput
+            }
             _ => subquery.origin.phase_floor(),
         };
     }
 
-    // A result column that reads one of these subqueries depends on an
-    // aggregate computed in the output phase, so it must be evaluated there
+    // A result column that reads one of these subqueries depends on a value
+    // computed in the output phase, so it must be evaluated there
     // rather than once per input row — the same treatment SQLite gives any
     // result-column expression that references an aggregate result (select.c
     // evaluates those after the aggregation loop, in the output step). Mark it
     // so the emitter defers it, instead of taking an arbitrary row's NULL
     // during the scan.
     for rc in plan.result_columns.iter_mut() {
-        if !rc.contains_aggregates && expr_reads_subquery(&rc.expr, &outer_aggregate_subquery_ids) {
+        if !rc.contains_aggregates && expr_reads_subquery(&rc.expr, &output_phase_subquery_ids) {
             rc.contains_aggregates = true;
         }
     }
 
-    let columns_read_by_group_subqueries = columns_read_by_group_subqueries(plan);
+    let columns_read_by_group_subqueries =
+        columns_read_by_subqueries(plan, SubqueryEvalPhase::GroupedOutput);
     if let Some(group_by) = plan.group_by.as_mut() {
         group_by.columns_read_by_group_subqueries = columns_read_by_group_subqueries;
     }
@@ -2541,8 +2575,11 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver
 }
 
 /// The columns of `plan`'s own tables that are read by its subqueries that run
-/// once per group.
-fn columns_read_by_group_subqueries(plan: &SelectPlan) -> Vec<ast::Expr> {
+/// in `phase`.
+pub(crate) fn columns_read_by_subqueries(
+    plan: &SelectPlan,
+    phase: SubqueryEvalPhase,
+) -> Vec<ast::Expr> {
     let mut columns = Vec::new();
     for subquery in &plan.non_from_clause_subqueries {
         let SubqueryState::Unevaluated {
@@ -2551,7 +2588,7 @@ fn columns_read_by_group_subqueries(plan: &SelectPlan) -> Vec<ast::Expr> {
         else {
             continue;
         };
-        if subquery.eval_phase != SubqueryEvalPhase::GroupedOutput {
+        if subquery.eval_phase != phase {
             continue;
         }
         for outer_ref in subquery_plan.used_outer_query_refs() {
@@ -2595,6 +2632,26 @@ fn expr_reads_subquery(expr: &ast::Expr, subquery_ids: &[ast::TableInternalId]) 
         Ok(WalkControl::Continue)
     });
     found
+}
+
+/// The name of an aggregate function, called without an `OVER` clause, in the
+/// WHERE clause of `subquery`. Subqueries nested in that WHERE clause are not
+/// searched: they own their aggregates.
+fn aggregate_in_subquery_where(
+    subquery: &NonFromClauseSubquery,
+    resolver: &Resolver,
+) -> Option<String> {
+    let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
+        return None;
+    };
+    let Plan::Select(select) = plan.as_ref() else {
+        return None;
+    };
+    select.where_clause.iter().find_map(|term| {
+        first_aggregate_without_over_clause(&term.expr, resolver)
+            .expect("walking an expression with an infallible visitor cannot fail")
+            .map(str::to_string)
+    })
 }
 
 /// The name of an aggregate in a result column of the subquery whose value the

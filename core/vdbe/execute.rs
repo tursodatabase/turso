@@ -9670,10 +9670,18 @@ fn op_agg_step_min_max(
         state.registers.get_disjoint_mut([data.col, data.acc_reg])
     {
         if let Some(best) = payload.first_mut() {
-            step_min_max(is_max, arg, best, data.collation)?;
+            let keeps_best = step_min_max(is_max, arg, best, data.collation)?;
+            if let Some(reg) = data.minmax_keeps_best_reg {
+                state.registers[reg].set_int(keeps_best as i64);
+            }
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
+    }
+    // The accumulator is not initialized yet, so no earlier row set a minimum
+    // or maximum.
+    if let Some(reg) = data.minmax_keeps_best_reg {
+        state.registers[reg].set_int(0);
     }
     op_agg_step_slow(state, data, connection)
 }
@@ -9681,13 +9689,14 @@ fn op_agg_step_min_max(
 /// One step of MIN (`is_max` false) or MAX (`is_max` true): `best` takes a
 /// copy of `arg` when `arg` is not NULL and `best` is NULL, or when `arg`
 /// orders strictly after (MAX) or before (MIN) `best` under `collation`.
+/// Returns true when `best` was not NULL and keeps its value.
 #[inline(always)]
 fn step_min_max(
     is_max: bool,
     arg: &Value,
     best: &mut Value,
     collation: CollationSeq,
-) -> Result<()> {
+) -> Result<bool> {
     // Two integers under a text collation compare as integers, and the copy
     // of an integer does not allocate.
     if let (Value::Numeric(Numeric::Integer(arg)), Value::Numeric(Numeric::Integer(best))) =
@@ -9696,12 +9705,13 @@ fn step_min_max(
         if matches!(collation, CollationSeq::Text(_)) {
             if (is_max && *arg > *best) || (!is_max && *arg < *best) {
                 *best = *arg;
+                return Ok(false);
             }
-            return Ok(());
+            return Ok(true);
         }
     }
     if matches!(arg, Value::Null) {
-        return Ok(());
+        return Ok(!matches!(best, Value::Null));
     }
     let better = matches!(best, Value::Null) || {
         let order = collation.compare(arg.as_ref(), best.as_ref());
@@ -9714,7 +9724,7 @@ fn step_min_max(
     if better {
         best.try_clone_from(arg)?;
     }
-    Ok(())
+    Ok(!better)
 }
 
 #[inline(never)]
@@ -9729,6 +9739,7 @@ fn op_agg_step_slow(
         delimiter,
         func,
         collation,
+        minmax_keeps_best_reg: _,
     } = data;
 
     if let AccumulatorFunc::Window(win_func) = func {
