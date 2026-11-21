@@ -359,26 +359,20 @@ expect {
 
 # A-63: insert 'abc' into int column
 @setup t_id
-@compat-gap "type:int4"
 test insert-abc-into-int-column {
     INSERT INTO t VALUES ('abc') RETURNING id;
 }
 @sqlstate 22P02
 expect error {}
-@sqlstate 23000
-expect @tursopg error {}
 
 # A-64: insert 1.7 numeric into int column
 @setup t_id
-@compat-gap "cast:numeric -> int4"
 test insert-1-7-numeric-into-int-column {
     INSERT INTO t VALUES (1.7) RETURNING id;
 }
 expect {
     2
 }
-@sqlstate 23000
-expect @tursopg error {}
 
 # A-65: insert 'true' into bool column
 @setup t_b
@@ -391,15 +385,11 @@ expect {
 
 # A-66: insert integer 1 into bool column
 @setup t_b
-@compat-gap "cast:int4 -> bool"
 test insert-integer-1-into-bool-column {
     INSERT INTO t VALUES (1) RETURNING b;
 }
 @sqlstate 42804
 expect error {}
-expect @tursopg {
-    t
-}
 
 # A-79: insert literal with short +00 offset into timestamptz column
 test insert-literal-with-short-00-offset-into-timestamptz {

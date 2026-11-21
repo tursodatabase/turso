@@ -15,8 +15,8 @@ use crate::text::{value_text, TextType};
 use turso_core::dialect::CastContext;
 use turso_core::{LimboError, Numeric, Result, Value};
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_CANNOT_COERCE, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_TEXT_REPRESENTATION,
-    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_CANNOT_COERCE, SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_FEATURE_NOT_SUPPORTED,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,11 +152,21 @@ pub(crate) fn resolve(
     if listed || through_text {
         return Ok(Resolution::Convert);
     }
-    Err(sqlstate_error(
-        SQLSTATE_CANNOT_COERCE,
-        format!("cannot cast type {} to {}", source.name(), target.name()),
-        None,
-    ))
+    let (sqlstate, message) = match context {
+        CastContext::Assignment => (
+            SQLSTATE_DATATYPE_MISMATCH,
+            format!(
+                "a value of type {} cannot be assigned to type {}",
+                source.name(),
+                target.name()
+            ),
+        ),
+        _ => (
+            SQLSTATE_CANNOT_COERCE,
+            format!("cannot cast type {} to {}", source.name(), target.name()),
+        ),
+    };
+    Err(sqlstate_error(sqlstate, message, None))
 }
 
 pub(crate) fn convert(value: &Value, source: CastType, target: CastType) -> Result<Value> {

@@ -17,9 +17,6 @@ pub(crate) fn apply_cast(
     target: &TypeRef,
     context: CastContext,
 ) -> Result<CastDecision> {
-    if context != CastContext::Explicit {
-        return Ok(CastDecision::EngineRules);
-    }
     let Some(cast) = table_cast(source, target, context)? else {
         return Ok(CastDecision::EngineRules);
     };
@@ -46,7 +43,11 @@ fn table_cast(
     target: &TypeRef,
     context: CastContext,
 ) -> Result<Option<TableCast>> {
-    let CastRule::Table(target) = cast_rule(target, NamePlace::CastTarget)? else {
+    let target_place = match context {
+        CastContext::Assignment => NamePlace::Column,
+        _ => NamePlace::CastTarget,
+    };
+    let CastRule::Table(target) = cast_rule(target, target_place)? else {
         return Ok(None);
     };
     let (source, context) = match source() {
@@ -187,6 +188,8 @@ fn registered_cast_type(name: &str) -> Option<CastType> {
 /// types a name stands for depends on the place.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NamePlace {
+    /// The type of a column, as the schema keeps it.
+    Column,
     /// The type a CAST names.
     CastTarget,
     /// The type core gives an expression.
@@ -197,19 +200,19 @@ enum NamePlace {
 /// The type of `CASTS` that the lowercase name `name` of a type that is not
 /// registered stands for.
 fn named_cast_type(name: &str, place: NamePlace) -> Option<CastType> {
-    use NamePlace::{CastTarget, Value};
+    use NamePlace::{CastTarget, Column, Value};
     Some(match (name, place) {
         // FIXME(pg-catalog): An integer written in the statement and the result of a function have no registered type, and core types them INTEGER. They are read as int4, also when PostgreSQL types them bigint, so `count(*)::boolean` is accepted where PostgreSQL has no cast from bigint. The target type still checks its range. Result types from pg_proc, and a literal typed by its size, give the expression its real type.
         ("integer", Value) => Int4,
         ("float4", _) => Float4,
         ("float8", _) => Float8,
-        // FIXME(pg-catalog): Core types every float expression REAL, so a float4 expression is typed float8. A registered float4 type gives it its own type.
-        ("real", Value) => Float8,
+        // FIXME(pg-catalog): A float4 column is REAL in the schema, so it is only checked for the range of float8, and a float4 expression is typed float8. A registered float4 type fixes both.
+        ("real", Column | Value) => Float8,
         // A decimal literal, which core types NUMERIC.
         ("numeric", Value) => Numeric,
         // FIXME(pg-catalog): The translator lowers a CAST to varchar, char, name, json, jsonb, inet, cidr, macaddr and xml to a CAST to TEXT, so all of them are cast as text here. Registered types that keep their name in the CAST replace this.
         ("text", _) => Text,
-        (_, CastTarget | Value) => return None,
+        (_, Column | CastTarget | Value) => return None,
     })
 }
 
@@ -240,12 +243,13 @@ const ENGINE_RULE_TYPES: &[&str] = &[
     "regcollation",
 ];
 
-/// FIXME(pg-catalog): These are SQLite type names that the translator writes for PostgreSQL types `named_cast_type` cannot tell apart: a CAST to INTEGER is a cast to oid, regclass, regtype or a serial type, a CAST to REAL is a cast to numeric, decimal or money, and BLOB is bytea. The engine casts them as it did before. Registered oid, numeric and bytea types, whose names reach the cast, replace this.
+/// FIXME(pg-catalog): These are SQLite type names that the translator writes for PostgreSQL types `named_cast_type` cannot tell apart: an INTEGER column is an oid or a reg type, a CAST to INTEGER is a cast to one of those or to a serial type, a CAST to REAL is a cast to numeric, decimal or money, and BLOB is bytea. The engine casts them as it did before. Registered oid, numeric and bytea types, whose names reach the cast, replace this.
 /// Whether the lowercase `name`, written at `place`, is a SQLite type name
 /// that stands for a PostgreSQL type whose casts the engine decides.
 fn is_lowered_type_name(name: &str, place: NamePlace) -> bool {
     match name {
-        "integer" | "real" => place == NamePlace::CastTarget,
+        "integer" => place != NamePlace::Value,
+        "real" => place == NamePlace::CastTarget,
         "blob" | "any" => true,
         _ => false,
     }

@@ -2051,6 +2051,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_text_parameter_with_a_fraction_written_to_an_integer_column_fails() {
+        let (mut client, _conn) = copy_test_client();
+        client
+            .simple_query("CREATE TABLE fraction (n int)")
+            .unwrap();
+        let events =
+            execute_with_text_parameter(&mut client, "INSERT INTO fraction VALUES ($1)", "2.5");
+        assert_eq!(
+            error_sqlstate(&events),
+            Some(SQLSTATE_INVALID_TEXT_REPRESENTATION),
+            "{events:?}"
+        );
+        assert_row_count(&mut client, "fraction", "0");
+    }
+
     /// Sends Parse, Bind with the one parameter `parameter` in text format,
     /// Execute and Sync, and returns the events up to ReadyForQuery.
     fn execute_with_text_parameter(
