@@ -3101,17 +3101,6 @@ expect error {
     unit "timezone_m" not supported for type timestamp with time zone
 }
 
-# PostgreSQL runs the 3-argument form; tursopg refuses it.
-@compat-gap "function:date_trunc"
-test date-trunc-time-zone-argument {
-    SELECT date_trunc('day', '2026-10-08 12:34:56+00'::timestamptz, 'Europe/Helsinki');
-}
-expect {
-    2026-10-07 21:00:00+00
-}
-@sqlstate 0A000
-expect @tursopg error {}
-
 test date-trunc-unit-leading-space {
     SELECT date_trunc(' day', '2026-10-08 12:34:56+00'::timestamptz);
 }

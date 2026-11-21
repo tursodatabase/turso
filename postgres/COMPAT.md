@@ -123,8 +123,10 @@ other forms; relation oid and pretty printing do not change the output),
 `transaction_timestamp`/`statement_timestamp`. `to_timestamp` fails with 0A000.
 `date_trunc(text, timestamptz)` for the units microseconds, milliseconds,
 second, minute, hour, day, week, month, quarter, year, decade, century and
-millennium; other units and other argument types, such as timestamp, fail with
-0A000.
+millennium, with every spelling in PostgreSQL's units table. An unknown unit fails
+with 22023. The units `timezone`, `timezone_h` and `timezone_m`, the
+three-argument form with a time zone, and other argument types, such as
+timestamp, fail with 0A000.
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
 forms; the first schema of `search_path` that exists), `current_schemas(boolean)`
@@ -292,7 +294,7 @@ precision.
 | DROP object IF EXISTS | ✅ Supported | TABLE, INDEX, VIEW, MATERIALIZED VIEW, TYPE, DOMAIN, SEQUENCE, SCHEMA |
 | ON COMMIT clause for CREATE TEMPORARY TABLE | ❌ Not supported | Rejected, like TEMP itself |
 | REINDEX CONCURRENTLY | ❌ Not supported | REINDEX not supported at all |
-| Stored generated columns | 🟡 Partial | GENERATED ALWAYS AS (...) STORED, including ADD COLUMN; the type of the expression is not checked against the column type at CREATE, so a mismatch fails at INSERT instead; immutability is checked against a list of known non-immutable functions, and date/time casts and functions are checked using the declared types of the columns they read; `+`, `-`, `||` and casts to text or date/time types need the type of their operands, which is known for a literal, a cast, a column of the table being created, and the result of an operator with a known type rule, so any other operand (a function result, a `CASE` or `COALESCE`, or any column in `ADD COLUMN`) is rejected as not supported (0A000); a generated column of a custom type such as `timestamp`, or one whose expression reads such a column, is rejected with 42601; `extract`, `date_part` and `date_trunc` are not implemented |
+| Stored generated columns | 🟡 Partial | GENERATED ALWAYS AS (...) STORED, including ADD COLUMN; the type of the expression is not checked against the column type at CREATE, so a mismatch fails at INSERT instead; immutability is checked against a list of known non-immutable functions, and date/time casts and functions are checked using the declared types of the columns they read; `+`, `-`, `||` and casts to text or date/time types need the type of their operands, which is known for a literal, a cast, a column of the table being created, and the result of an operator with a known type rule, so any other operand (a function result, a `CASE` or `COALESCE`, or any column in `ADD COLUMN`) is rejected as not supported (0A000); a generated column of a custom type such as `timestamp`, or one whose expression reads such a column, is rejected with 42601; `extract` and `date_part` are not implemented |
 | Temporal constraints | ❌ Not supported | |
 | Temporary tables (CREATE TEMP TABLE) | ❌ Not supported | Rejected (UNLOGGED is accepted and creates an ordinary table) |
 | Typed tables | ❌ Not supported | |
