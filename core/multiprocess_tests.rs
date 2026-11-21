@@ -294,6 +294,10 @@ fn multiprocess_paused_creator_child_process() {
     .unwrap();
 }
 
+/// User version the paused-creator tests write into the existing database, to
+/// check that the open sees that database.
+const SEED_USER_VERSION: i32 = 5;
+
 /// Open an existing database with `flags` while a child process is paused at
 /// `pause` as the creator of its coordination file, and return the open's
 /// result.
@@ -314,14 +318,12 @@ fn open_while_creator_paused(
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     {
-        let db = Database::open_file(io.clone(), &db_path_str, Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io.clone(), &db_path_str, Arc::new(DialectThatCannotParse))
+            .unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
-        conn.execute("create table test(id integer primary key, value text)")
-            .unwrap();
-        conn.execute("insert into test(value) values ('seed')")
-            .unwrap();
+        commit_user_version(&conn, SEED_USER_VERSION);
     }
     remove_file_from_database_registry(&db_path_str);
 
@@ -330,7 +332,7 @@ fn open_while_creator_paused(
         let db = open_multiprocess_db_with_flags(io, &db_path_str, flags)?;
         let attached = db.shared_wal_coordination()?.is_some();
         let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-        Ok((attached, count_test_rows(&conn)))
+        Ok((attached, i64::from(read_header(&conn).1)))
     });
     std::thread::sleep(Duration::from_millis(200));
     let finished_early = opener.is_finished();
@@ -346,7 +348,7 @@ fn open_while_creator_paused(
 
 #[test]
 fn readonly_multiprocess_open_waits_for_concurrent_creator() {
-    let (attached, rows) = open_while_creator_paused(
+    let (attached, user_version) = open_while_creator_paused(
         "readonly-waits-for-creator.db",
         OpenFlags::ReadOnly,
         CreatorPause::BeforeInitialize,
@@ -357,12 +359,12 @@ fn readonly_multiprocess_open_waits_for_concurrent_creator() {
         attached,
         "reader must attach to the published coordination file"
     );
-    assert_eq!(rows, 1);
+    assert_eq!(user_version, i64::from(SEED_USER_VERSION));
 }
 
 #[test]
 fn writable_multiprocess_open_waits_for_concurrent_creator() {
-    let (attached, rows) = open_while_creator_paused(
+    let (attached, user_version) = open_while_creator_paused(
         "writable-waits-for-creator.db",
         OpenFlags::default(),
         CreatorPause::BeforeInitialize,
@@ -373,7 +375,7 @@ fn writable_multiprocess_open_waits_for_concurrent_creator() {
         attached,
         "opener must attach to the published coordination file"
     );
-    assert_eq!(rows, 1);
+    assert_eq!(user_version, i64::from(SEED_USER_VERSION));
 }
 
 /// A read-only open must wait for a creator that has probed the lifetime byte
@@ -382,7 +384,7 @@ fn writable_multiprocess_open_waits_for_concurrent_creator() {
 /// because it sees no live creator.
 #[test]
 fn readonly_multiprocess_open_waits_for_creator_that_has_not_locked_yet() {
-    let (attached, rows) = open_while_creator_paused(
+    let (attached, user_version) = open_while_creator_paused(
         "readonly-waits-for-unlocked-creator.db",
         OpenFlags::ReadOnly,
         CreatorPause::AfterProbe,
@@ -393,7 +395,7 @@ fn readonly_multiprocess_open_waits_for_creator_that_has_not_locked_yet() {
         attached,
         "reader must attach to the published coordination file"
     );
-    assert_eq!(rows, 1);
+    assert_eq!(user_version, i64::from(SEED_USER_VERSION));
 }
 
 /// A writable open must not decide the open mode while a creator is between
@@ -402,7 +404,7 @@ fn readonly_multiprocess_open_waits_for_creator_that_has_not_locked_yet() {
 /// the creator.
 #[test]
 fn writable_multiprocess_open_waits_for_creator_that_has_not_locked_yet() {
-    let (attached, rows) = open_while_creator_paused(
+    let (attached, user_version) = open_while_creator_paused(
         "writable-waits-for-unlocked-creator.db",
         OpenFlags::default(),
         CreatorPause::AfterProbe,
@@ -413,7 +415,7 @@ fn writable_multiprocess_open_waits_for_creator_that_has_not_locked_yet() {
         attached,
         "opener must attach to the published coordination file"
     );
-    assert_eq!(rows, 1);
+    assert_eq!(user_version, i64::from(SEED_USER_VERSION));
 }
 
 /// A child that opens the coordination file as one of two concurrent first
@@ -572,7 +574,7 @@ fn multiprocess_first_opener_child_process() {
 /// A process that opened a new database and has not written yet must notice
 /// that another process created it. Its in-memory page 1 describes an empty
 /// database; building the first write on it would write a second page 1 and a
-/// second sqlite_schema over the other process's committed table.
+/// second sqlite_schema over the other process's committed header.
 #[test]
 fn process_holding_an_empty_database_adopts_one_created_by_another_process() {
     let dir = tempfile::tempdir().unwrap();
@@ -598,22 +600,16 @@ fn process_holding_an_empty_database_adopts_one_created_by_another_process() {
         String::from_utf8_lossy(&child_output.stderr)
     );
 
-    // Prepared while this process still believes the database is empty.
-    conn.execute("create table if not exists t(x)").unwrap();
-    conn.execute("insert into t values (2)").unwrap();
+    // This process still believes the database is empty. Its first write must
+    // adopt the creator's page 1 and keep the user version the creator set.
+    commit_new_pages(&conn, 1);
 
-    let xs = |conn: &Arc<Connection>| {
-        get_rows(conn, "select x from t order by x")
-            .into_iter()
-            .map(|row| row[0].clone())
-            .collect::<Vec<_>>()
-    };
-    let expected = vec![Value::from_i64(1), Value::from_i64(2)];
-    assert_eq!(xs(&conn), expected);
+    let expected = (2, 1);
+    assert_eq!(read_header(&conn), expected);
     let fresh = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
-    assert_eq!(xs(&fresh), expected);
+    assert_eq!(read_header(&fresh), expected);
 }
 
 /// Child half of `process_holding_an_empty_database_adopts_one_created_by_another_process`.
@@ -627,8 +623,7 @@ fn multiprocess_new_db_creator_child_process() {
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
-    conn.execute("create table t(x)").unwrap();
-    conn.execute("insert into t values (1)").unwrap();
+    commit_user_version(&conn, 1);
     conn.close().unwrap();
 }
 
@@ -780,7 +775,7 @@ fn multiprocess_open_ignores_legacy_lock_when_file_locks_are_disabled() {
     let db_path = dir.path().join("disabled-file-lock.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let _db = Database::open_file(io, db_path_str, Arc::new(EngineDialect)).unwrap();
+    let _db = Database::open_file(io, db_path_str, Arc::new(DialectThatCannotParse)).unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
     let child_output = Command::new(&current_exe)
