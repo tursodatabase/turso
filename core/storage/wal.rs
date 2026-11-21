@@ -746,6 +746,9 @@ pub trait Wal: Debug + Send + Sync {
     /// Return a handle to the underlying File.
     fn wal_file(&self) -> Result<Arc<dyn File>>;
 
+    /// Whether the WAL file on disk is already 0 bytes. False if the size is unknown.
+    fn is_file_empty(&self) -> bool;
+
     /// Write a bunch of frames to the WAL.
     /// db_size is the database size in pages after the transaction finishes.
     /// db_size is set  -> last frame written in transaction
@@ -4696,6 +4699,12 @@ impl Wal for WalFile {
         self.coordination.wal_file()
     }
 
+    fn is_file_empty(&self) -> bool {
+        self.coordination
+            .wal_file()
+            .is_ok_and(|file| wal_file_is_empty(file.as_ref()))
+    }
+
     /// Use pwritev to append many frames to the log at once.
     ///
     /// # Safety:
@@ -5414,7 +5423,7 @@ impl WalFile {
 
         // An already-empty log has nothing to truncate or sync. Skipping keeps TRUNCATE
         // a no-op on a read-only connection, as in SQLite.
-        if !result.wal_truncate_sent && matches!(file.size(), Ok(0)) {
+        if !result.wal_truncate_sent && wal_file_is_empty(file.as_ref()) {
             result.wal_truncate_sent = true;
             result.wal_sync_sent = true;
             result.wal_max_frame = 0;
@@ -5585,7 +5594,10 @@ impl WalFile {
     }
 }
 
-#[cfg(host_shared_wal)]
+fn wal_file_is_empty(file: &dyn File) -> bool {
+    matches!(file.size(), Ok(0))
+}
+
 fn read_exact_bytes_from_file(
     io: &Arc<dyn IO>,
     file: &Arc<dyn File>,

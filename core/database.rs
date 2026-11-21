@@ -3681,6 +3681,9 @@ impl Database {
         )?;
         pager.set_authenticated_header(header)?;
         pager.enable_encryption(self.opts.enable_encryption);
+        if self.is_readonly() {
+            pager.mark_read_only();
+        }
         if self.initialized() {
             self.buffer_pool
                 .finalize_with_page_size(pager.get_page_size_unchecked().get() as usize)?;
