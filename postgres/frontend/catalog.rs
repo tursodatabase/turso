@@ -297,6 +297,16 @@ impl Dialect for PostgresDialect {
         crate::functions::undefined_operator_of(op, &names)
     }
 
+    fn apply_cast(
+        &self,
+        operand: &turso_core::ast::Expr,
+        source: &dyn Fn() -> turso_core::dialect::CastSource,
+        target: &turso_core::dialect::TypeRef,
+        context: turso_core::dialect::CastContext,
+    ) -> Result<turso_core::dialect::CastDecision> {
+        crate::cast_planning::apply_cast(operand, source, target, context)
+    }
+
     fn requires_custom_types(&self) -> bool {
         true
     }

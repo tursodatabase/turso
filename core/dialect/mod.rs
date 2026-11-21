@@ -599,7 +599,7 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// FIXME(pg-catalog): This hand-codes the absence of pg_cast entries from date, timestamp, json and inet to numbers, booleans and bytea. A lookup in a pg_cast table replaces this.
+    /// FIXME(pg-catalog): This hand-codes the absence of pg_cast entries from date, json and inet to numbers, booleans and bytea. It decides a CAST only when `apply_cast` gives `CastDecision::EngineRules`, which the PostgreSQL frontend gives for the types of its `ENGINE_RULE_TYPES`. It also decides what such a column stores, which no cast table covers. Rows for these types in the frontend's cast table replace the CAST half.
     /// Whether a CAST from a custom type that reads text and has an ENCODE
     /// (such as date, timestamp, json or inet) is refused when its target does
     /// not read text.

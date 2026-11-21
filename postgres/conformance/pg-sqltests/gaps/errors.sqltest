@@ -256,15 +256,12 @@ expect error {}
 expect @tursopg error {}
 
 # D-23: invalid uuid into uuid column
-@compat-gap "type:uuid"
 test invalid-uuid-into-uuid-column {
     CREATE TABLE t (u uuid);
     INSERT INTO t VALUES ('nope');
 }
 @sqlstate 22P02
 expect error {}
-@sqlstate P0001
-expect @tursopg error {}
 
 # D-24: invalid timestamptz into column
 test invalid-timestamptz-into-column {
@@ -422,9 +419,8 @@ test unknown-type-in-cast {
 }
 @sqlstate 42704
 expect error {}
-expect @tursopg {
-    1
-}
+@sqlstate 0A000
+expect @tursopg error {}
 
 # D-45: wrong arg type to function
 @compat-gap "function:lower"

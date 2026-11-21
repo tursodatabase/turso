@@ -763,7 +763,7 @@ pub(crate) fn emit_coerce_rowid(
     )
 }
 
-/// FIXME(pg-catalog): This decides by type properties whether a pg_cast entry from `source` to `target` exists, and the text-reading target test stands in for the target side of that lookup. A source that casts to numbers and booleans skips the check for every target, so jsonb::bytea is not refused, although pg_cast has no entry from jsonb to bytea. A lookup in a pg_cast table replaces this.
+/// FIXME(pg-catalog): This decides by type properties whether a pg_cast entry from `source` to `target` exists, and the text-reading target test stands in for the target side of that lookup. A source that casts to numbers and booleans skips the check for every target, so jsonb::bytea is not refused, although pg_cast has no entry from jsonb to bytea. It runs only when `Dialect::apply_cast` gives `CastDecision::EngineRules`: in the PostgreSQL frontend that is a source or a target of `ENGINE_RULE_TYPES`, a type made by CREATE TYPE or CREATE DOMAIN, an array, or a source with no known type. Rows for those types in the frontend's cast table replace this.
 /// Fails when a CAST of a value of the custom type `source` to `target`, which
 /// `custom_type_cast_chain` resolves for a custom type and is None for a plain
 /// type written as `target_name`, would read the text of `source` as another

@@ -88,7 +88,7 @@ fn bool_encode(value: &Value, _params: &[Value]) -> Result<Value> {
     }
 }
 
-/// FIXME(pg-catalog): This hand-codes the pg_cast entry from integer to boolean (function bool(integer)). pg_cast has no entry from smallint or bigint to boolean, but this cast applies to every integer value. A lookup in a pg_cast table replaces this.
+/// FIXME(pg-catalog): This hand-codes the pg_cast entry from integer to boolean (function bool(integer)) for every integer value. The cast table of casts.rs decides a cast to boolean from a value whose type core can name, and refuses smallint and bigint. This function still decides for a value with no known type, such as the result of most functions: `length('ab')::boolean` is true here, as in PostgreSQL, and so is a bigint function result, which PostgreSQL refuses. A typed expression tree, where every expression has a registered type, lets the cast table decide these too and removes this function.
 /// PostgreSQL casts an integer to boolean, but does not store one in a boolean
 /// column: every nonzero integer is true in a cast. Other values are left
 /// as they are, and `bool_encode` reads them as it does for a column.

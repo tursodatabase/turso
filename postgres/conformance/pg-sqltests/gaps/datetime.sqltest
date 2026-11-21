@@ -15,8 +15,6 @@
 
 @database :memory:
 
-# A stored timestamptz cast to text loses its +00 offset.
-@compat-gap "cast:timestamptz -> text"
 test stored-timestamptz-text-cast {
     CREATE TABLE t (id int, created_at timestamptz);
     INSERT INTO t VALUES (1, '2026-01-01 10:00:00.25+02');
@@ -24,9 +22,6 @@ test stored-timestamptz-text-cast {
 }
 expect {
     2026-01-01 08:00:00.25+00
-}
-expect @tursopg {
-    2026-01-01 08:00:00.25
 }
 
 # Concatenation converts the value with the same cast.
@@ -43,8 +38,6 @@ expect @tursopg {
     at 2026-01-01 08:00:00.25
 }
 
-# Without the offset, the text comparison on tursopg returns no rows.
-@compat-gap "cast:timestamptz -> text"
 test where-timestamptz-text-compare {
     CREATE TABLE t (id int, ts timestamptz);
     INSERT INTO t VALUES (1, '2026-01-01 00:00Z'), (2, '2026-01-01 01:00+01'), (3, '2025-12-31 21:00-03');
@@ -54,8 +47,6 @@ expect {
     1
     2
     3
-}
-expect @tursopg {
 }
 
 @compat-gap "type:_timestamptz"
