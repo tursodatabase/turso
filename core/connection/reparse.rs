@@ -23,16 +23,13 @@ pub struct ReparseSchemaInner {
     /// Held for the whole reparse so a concurrent reparse on this connection
     /// trips the recursion assert. Dropped when the schema is finalized.
     _guard: SchemaReparseGuard,
-    /// Runs the steps that read the schema, and holds the schema that is
-    /// being read.
-    loader: SchemaLoader,
     phase: ReparsePhase,
 }
 
 enum ReparsePhase {
     /// Running the steps of the schema loader.
-    RunLoadSteps,
-    /// Best-effort ANALYZE-stats refresh before finalizing.
+    RunLoadSteps { loader: SchemaLoader },
+    /// Best-effort ANALYZE-stats refresh after installing the rebuilt schema.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
     },
@@ -144,13 +141,13 @@ impl Connection {
         }
         Ok(ReparseSchemaInner {
             _guard: guard,
-            loader,
-            phase: ReparsePhase::RunLoadSteps,
+            phase: ReparsePhase::RunLoadSteps { loader },
         })
     }
 
     /// Drive the schema-rebuild phases held in `state` (must be `Building`).
-    /// Yields IO; on completion installs the finished schema and resets `state`.
+    /// Yields IO; on completion installs the finished schema (including any
+    /// ANALYZE statistics loaded from `sqlite_stat1`) and resets `state`.
     fn drive_reparse_building(
         self: &Arc<Connection>,
         state: &mut ReparseSchemaState,
@@ -161,28 +158,38 @@ impl Connection {
                 unreachable!("drive_reparse_building requires Building state");
             };
             match &mut inner.phase {
-                ReparsePhase::RunLoadSteps => {
-                    crate::return_if_io!(inner.loader.run(self));
-                    inner.phase = ReparsePhase::RefreshStats {
-                        stats: Default::default(),
+                ReparsePhase::RunLoadSteps { loader } => {
+                    crate::return_if_io!(loader.run(self));
+                    // Install the rebuilt schema before refreshing stats so the
+                    // `sqlite_stat1` scan sees the freshly loaded tables and
+                    // the refresh updates this schema instead of being
+                    // overwritten afterward. `_guard` stays held until
+                    // `RefreshStats` finishes.
+                    let ReparsePhase::RunLoadSteps { loader } = std::mem::replace(
+                        &mut inner.phase,
+                        ReparsePhase::RefreshStats {
+                            stats: Default::default(),
+                        },
+                    ) else {
+                        unreachable!("phase is RunLoadSteps");
                     };
-                }
-                ReparsePhase::RefreshStats { stats } => {
-                    // Best-effort load stats if sqlite_stat1 is present.
-                    crate::return_if_io!(crate::stats::refresh_analyze_stats_nonblock(self, stats));
-
-                    // Finalize: install the rebuilt schema. Take ownership so the
-                    // guard drops and `state` is reusable.
-                    let ReparseSchemaState::Building(inner) = std::mem::take(state) else {
-                        unreachable!("state is Building");
-                    };
-                    let fresh = inner.loader.into_schema();
+                    let fresh = loader.into_schema();
                     tracing::debug!(
                         "reparse_schema: schema_version={}, tables={:?}",
                         fresh.schema_version,
                         fresh.table_names(NamespaceId::ROOT).collect::<Vec<_>>()
                     );
                     *self.schema.write() = fresh;
+                }
+                ReparsePhase::RefreshStats { stats } => {
+                    // Best-effort load stats if sqlite_stat1 is present.
+                    crate::return_if_io!(
+                        crate::stats::refresh_analyze_stats_connection_only_nonblock(self, stats)
+                    );
+
+                    // Finalize: drop the reparse guard and reset `state` so it
+                    // is reusable.
+                    let _ = std::mem::take(state);
                     return Ok(IOResult::Done(()));
                 }
             }

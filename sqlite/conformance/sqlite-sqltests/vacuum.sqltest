@@ -67,3 +67,51 @@ test vacuum-rejects-active-transaction {
 expect error {
     cannot VACUUM from within a transaction
 }
+
+@skip-if mvcc "plain VACUUM requires PRAGMA wal_checkpoint(TRUNCATE) first on an MVCC database"
+test vacuum-preserves-analyze-stats {
+    CREATE TABLE t(a, b);
+    CREATE INDEX ia ON t(a);
+    CREATE INDEX ib ON t(b);
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 2000)
+    INSERT INTO t SELECT 1, x FROM c;
+    ANALYZE;
+    VACUUM;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5;
+}
+expect pattern {
+    SEARCH t USING INDEX ib \(b>\?\)
+}
+
+@skip-if mvcc "plain VACUUM requires PRAGMA wal_checkpoint(TRUNCATE) first on an MVCC database"
+test vacuum-reloads-updated-sqlite-stat1 {
+    CREATE TABLE t(a, b);
+    CREATE INDEX ia ON t(a);
+    CREATE INDEX ib ON t(b);
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 2000)
+    INSERT INTO t SELECT x, 1 FROM c;
+    ANALYZE;
+    UPDATE sqlite_stat1 SET stat = '2000 2000' WHERE idx = 'ia';
+    UPDATE sqlite_stat1 SET stat = '2000 1' WHERE idx = 'ib';
+    VACUUM;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5;
+}
+expect pattern {
+    SEARCH t USING INDEX ib \(b>\?\)
+}
+
+@skip-if mvcc "plain VACUUM requires PRAGMA wal_checkpoint(TRUNCATE) first on an MVCC database"
+test vacuum-reloads-cleared-sqlite-stat1 {
+    CREATE TABLE t(a, b);
+    CREATE INDEX ia ON t(a);
+    CREATE INDEX ib ON t(b);
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 2000)
+    INSERT INTO t SELECT 1, x FROM c;
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    VACUUM;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5;
+}
+expect pattern {
+    SEARCH t USING INDEX ia \(a=\?\)
+}
