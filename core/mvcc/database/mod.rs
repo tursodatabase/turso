@@ -9328,12 +9328,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// top of the restored database image. To make the reset durable, call
     /// `sync_logical_log` after the completion finishes.
     pub fn reset_logical_log_after_external_restore(&self) -> Result<Completion> {
-        if self.storage.encryption_ctx().is_some() {
-            return Err(LimboError::InvalidArgument(
-                "external restore is not supported with built-in encryption".into(),
-            ));
-        }
-
         self.storage.reset_to_fresh_header()
     }
 

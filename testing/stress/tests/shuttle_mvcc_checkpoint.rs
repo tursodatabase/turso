@@ -32,7 +32,7 @@ async fn truncate_checkpoint(conn: &turso::Connection) -> turso::Result<bool> {
     Ok(succeeded)
 }
 
-async fn passive_truncate_late_commit_scenario() -> bool {
+async fn passive_truncate_late_commit_scenario() {
     const CHECKPOINT_ROWS: i64 = 256;
     const LATE_WRITES: i64 = 128;
 
@@ -127,6 +127,14 @@ async fn passive_truncate_late_commit_scenario() -> bool {
         "every acknowledged row must be visible before restart"
     );
 
+    // A successful concurrent checkpoint must reach the restart check without another checkpoint.
+    if !checkpoint_succeeded {
+        assert!(
+            truncate_checkpoint(&setup).await.unwrap(),
+            "TRUNCATE must succeed after the concurrent writer has finished"
+        );
+    }
+
     drop(setup);
     drop(db);
 
@@ -142,23 +150,11 @@ async fn passive_truncate_late_commit_scenario() -> bool {
         "TRUNCATE discarded an acknowledged concurrent commit \
          (checkpoint succeeded: {checkpoint_succeeded})"
     );
-
-    checkpoint_succeeded
 }
 
 #[test]
 fn shuttle_test_passive_truncate_preserves_late_commit() {
     let scheduler = PctScheduler::new(3, 100);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    let saw_successful_checkpoint = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let completed = saw_successful_checkpoint.clone();
-    runner.run(move || {
-        if shuttle::future::block_on(passive_truncate_late_commit_scenario()) {
-            completed.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    });
-    assert!(
-        saw_successful_checkpoint.load(std::sync::atomic::Ordering::SeqCst),
-        "at least one explored schedule must complete TRUNCATE"
-    );
+    runner.run(|| shuttle::future::block_on(passive_truncate_late_commit_scenario()));
 }

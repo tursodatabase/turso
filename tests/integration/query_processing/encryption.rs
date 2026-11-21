@@ -2671,7 +2671,43 @@ fn connect_async_yields_and_cancellation_releases_read_transactions() -> anyhow:
 }
 
 #[test]
-fn encrypted_restore_rejects_storage_changes_but_allows_schema_publication() -> anyhow::Result<()> {
+fn encrypted_restore_rejects_a_file_encrypted_with_another_key() -> anyhow::Result<()> {
+    for cipher in [CIPHER_A, CIPHER_B] {
+        for mvcc in [false, true] {
+            let target = TempDatabaseBuilder::new()
+                .with_encryption(cipher, KEY_A)
+                .with_mvcc(mvcc)
+                .build();
+            let source = TempDatabaseBuilder::new()
+                .with_encryption(cipher, KEY_B)
+                .with_mvcc(mvcc)
+                .build();
+            let owner = target.connect_limbo();
+            let foreign = source.connect_limbo();
+            for conn in [&owner, &foreign] {
+                conn.execute("CREATE TABLE secrets(value TEXT)")?;
+                conn.execute("INSERT INTO secrets VALUES ('protected value')")?;
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            }
+            let original = std::fs::read(&target.path)?;
+            std::fs::copy(&source.path, &target.path)?;
+            let error = owner.reload_wal_after_external_restore().unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::CompletionError(CompletionError::DecryptionError { .. })
+            ));
+            std::fs::write(&target.path, original)?;
+            owner.reload_wal_after_external_restore()?;
+            owner.publish_schema_after_external_restore()?;
+            let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
+            assert_eq!(rows, [("protected value".into(),)]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn encrypted_restore_requires_the_current_key_and_preserves_page_layout() -> anyhow::Result<()> {
     for cipher in [CIPHER_A, CIPHER_B] {
         for mvcc in [false, true] {
             let tmp = TempDatabaseBuilder::new()
@@ -2681,6 +2717,7 @@ fn encrypted_restore_rejects_storage_changes_but_allows_schema_publication() -> 
             let owner = tmp.connect_limbo();
             owner.execute("CREATE TABLE secrets(value TEXT)")?;
             owner.execute("INSERT INTO secrets VALUES ('protected value')")?;
+            owner.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
             let before: Vec<_> = [
                 tmp.path.clone(),
                 std::path::PathBuf::from(format!("{}-wal", tmp.path.display())),
@@ -2690,14 +2727,27 @@ fn encrypted_restore_rejects_storage_changes_but_allows_schema_publication() -> 
             .map(|path| (path.clone(), std::fs::read(path).ok()))
             .collect();
             assert!(tmp.db.reload_wal_after_external_restore().is_err());
-            assert!(owner.reload_wal_after_external_restore().is_err());
-            owner.publish_schema_after_external_restore()?;
-            if let Some(store) = owner.mv_store().as_ref() {
-                assert!(store.reset_logical_log_after_external_restore().is_err());
-                if let Some(completion) = store.sync_logical_log(&owner)? {
-                    tmp.io.wait_for_completion(completion)?;
+            assert!(tmp
+                .db
+                .reload_wal_after_external_restore_with_encryption_key(Some(
+                    EncryptionKey::from_hex_string(KEY_B)?,
+                ))
+                .is_err());
+            let original = std::fs::read(&tmp.path)?;
+            for change_page_size in [false, true] {
+                let mut replaced = original.clone();
+                if change_page_size {
+                    replaced[16..18].copy_from_slice(&8192u16.to_be_bytes());
+                } else {
+                    replaced[20] ^= 1;
                 }
+                std::fs::write(&tmp.path, replaced)?;
+                let error = owner.reload_wal_after_external_restore().unwrap_err();
+                assert!(error.to_string().contains("page layout"), "{error}");
+                std::fs::write(&tmp.path, &original)?;
             }
+            owner.reload_wal_after_external_restore()?;
+            owner.publish_schema_after_external_restore()?;
             for (path, bytes) in before {
                 assert_eq!(std::fs::read(path).ok(), bytes);
             }
@@ -2973,5 +3023,84 @@ fn async_connect_authenticates_before_resolving_the_original_role() -> anyhow::R
             }
         }
     }
+    Ok(())
+}
+
+#[cfg(all(feature = "fs", feature = "encryption", feature = "conn_raw_api"))]
+#[test]
+fn encrypted_mvcc_reload_preserves_key_and_log_encryption() -> anyhow::Result<()> {
+    let dir = tempfile::TempDir::new().expect("temporary directory");
+    let path = dir.path().join("reload.db");
+    let path = path.to_str().expect("UTF-8 path");
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+    let encryption = EncryptionOpts {
+        cipher: "aes256gcm".into(),
+        hexkey: "17".repeat(32),
+    };
+    let key = EncryptionKey::from_hex_string(&encryption.hexkey)?;
+    let options = DatabaseOpts::new().with_encryption(true);
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path,
+            OpenFlags::Create,
+            options,
+            Some(encryption.clone()),
+            Arc::new(SqliteDialect),
+        )?;
+        let conn = db.connect(
+            ConnectOpts::new(SessionRole::Superuser).with_encryption_key(Some(key.clone())),
+        )?;
+        conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+        conn.execute("CREATE TABLE t(value TEXT)")?;
+        conn.execute("INSERT INTO t VALUES ('before reload')")?;
+        conn.reload_wal_after_external_restore()?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let store = conn.mv_store();
+        let store = store.as_ref().expect("MVCC store");
+        io.wait_for_completion(store.reset_logical_log_after_external_restore()?)?;
+        if let Some(completion) = store.sync_logical_log(&conn)? {
+            io.wait_for_completion(completion)?;
+        }
+        drop(conn);
+        db.reload_wal_after_external_restore_with_encryption_key(Some(key.clone()))?;
+        let conn = db.connect(
+            ConnectOpts::new(SessionRole::Superuser).with_encryption_key(Some(key.clone())),
+        )?;
+        conn.execute("INSERT INTO t VALUES ('after reload')")?;
+    }
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path,
+            OpenFlags::None,
+            options,
+            Some(encryption.clone()),
+            Arc::new(SqliteDialect),
+        )?;
+        let conn = db.connect(
+            ConnectOpts::new(SessionRole::Superuser).with_encryption_key(Some(key.clone())),
+        )?;
+        let mut stmt = conn.prepare("SELECT value FROM t ORDER BY rowid")?;
+        for expected in ["before reload", "after reload"] {
+            assert!(matches!(stmt.step()?, turso_core::StepResult::Row));
+            assert_eq!(stmt.row().expect("row").get::<String>(0)?, expected);
+        }
+        assert!(matches!(stmt.step()?, turso_core::StepResult::Done));
+        drop(stmt);
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    }
+    let db = Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::None,
+        options,
+        Some(encryption),
+        Arc::new(SqliteDialect),
+    )?;
+    let conn =
+        db.connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(Some(key)))?;
+    let rows = conn.prepare("SELECT count(*) FROM t")?.run_collect_rows()?;
+    assert_eq!(rows, vec![vec![turso_core::Value::from_i64(2)]]);
     Ok(())
 }
