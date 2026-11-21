@@ -1051,17 +1051,33 @@ impl IntegerText {
 // call this function, and the call costs more than the loop.
 #[inline(always)]
 pub(crate) fn write_decimal_digits(buf: &mut [u8; 20], mut n: u64) -> &[u8] {
+    // Two digits for each division: a division costs more than the copy
+    // of two bytes from the table.
     let mut start = buf.len();
-    loop {
+    while n >= 100 {
+        let pair = usize::from((n % 100) as u8) * 2;
+        n /= 100;
+        start -= 2;
+        buf[start..start + 2].copy_from_slice(&DIGIT_PAIRS[pair..pair + 2]);
+    }
+    if n >= 10 {
+        let pair = usize::from(n as u8) * 2;
+        start -= 2;
+        buf[start..start + 2].copy_from_slice(&DIGIT_PAIRS[pair..pair + 2]);
+    } else {
         start -= 1;
-        buf[start] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
+        buf[start] = b'0' + n as u8;
     }
     &buf[start..]
 }
+
+/// The two decimal digits of each number from 0 to 99, in order.
+const DIGIT_PAIRS: &[u8; 200] = b"\
+    0001020304050607080910111213141516171819\
+    2021222324252627282930313233343536373839\
+    4041424344454647484950515253545556575859\
+    6061626364656667686970717273747576777879\
+    8081828384858687888990919293949596979899";
 
 pub fn format_float_for_quote(v: f64) -> String {
     if v.is_nan() {
@@ -1107,6 +1123,23 @@ fn integer_text_matches_to_string() {
         -(10_i64.pow(18)),
     ]) {
         assert_eq!(IntegerText::new(value).as_str(), value.to_string());
+    }
+}
+
+#[test]
+fn write_decimal_digits_matches_to_string() {
+    // Each power of ten and its neighbors, where the number of digits and
+    // the number of digit pairs change.
+    let mut values: Vec<u64> = (0..1_000).chain([u64::MAX - 1, u64::MAX]).collect();
+    for exponent in 1..=19 {
+        let power = 10u64.pow(exponent);
+        values.extend([power - 1, power, power + 1, power + 10]);
+        values.extend(power.checked_mul(9).and_then(|v| v.checked_add(99)));
+    }
+    for value in values {
+        let mut buf = [0u8; 20];
+        let digits = write_decimal_digits(&mut buf, value);
+        assert_eq!(digits, value.to_string().as_bytes(), "{value}");
     }
 }
 
