@@ -1772,33 +1772,6 @@ impl Connection {
         self.fk_deferred_violations.fetch_add(v, Ordering::AcqRel);
     }
 
-    /// Query the `(id, name)` rows of the namespaces table. The connection's
-    /// schema must already contain the table definitions so that `prepare`
-    /// can resolve the table name. Returns an empty Vec if the database has
-    /// no namespaces table.
-    pub(crate) fn query_stored_namespaces(self: &Arc<Connection>) -> Result<Vec<(i64, String)>> {
-        let has_namespaces_table = {
-            let s = self.schema.read();
-            s.has_table(
-                NamespaceId::ROOT,
-                crate::schema::TURSO_NAMESPACES_TABLE_NAME,
-            )
-        };
-        if !has_namespaces_table {
-            return Ok(Vec::new());
-        }
-        let mut stmt = self.prepare_internal(format!(
-            "SELECT id, name FROM {}",
-            crate::schema::TURSO_NAMESPACES_TABLE_NAME
-        ))?;
-        let mut rows = Vec::new();
-        stmt.run_with_row_callback(|row| {
-            rows.push((row.get::<i64>(0)?, row.get::<&str>(1)?.to_string()));
-            Ok(())
-        })?;
-        Ok(rows)
-    }
-
     pub fn maybe_update_schema(&self) {
         if self.schema_reparse_in_progress() {
             return;

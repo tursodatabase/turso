@@ -80,7 +80,9 @@ pub(crate) enum QueryFailure {
 
 /// A schema that is being read.
 pub(crate) struct SchemaLoad {
-    pub(crate) schema: Schema,
+    /// The connection or the database may share this schema. A step that
+    /// changes it then changes a copy, which [`Schema::try_make_mut`] makes.
+    schema: Arc<Schema>,
     /// Indexes and materialized views of the schema rows. They are built
     /// after the types are loaded, and None after that.
     unbuilt: Option<UnbuiltViewsAndIndexes>,
@@ -97,12 +99,20 @@ struct UnbuiltViewsAndIndexes {
 }
 
 impl SchemaLoad {
-    pub(crate) fn new(schema: Schema) -> Self {
+    pub(crate) fn new(schema: Arc<Schema>) -> Self {
         Self {
             schema,
             unbuilt: Some(UnbuiltViewsAndIndexes::new()),
             type_sqls: Vec::new(),
         }
+    }
+
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    pub(crate) fn schema_mut(&mut self) -> Result<&mut Schema> {
+        Ok(Schema::try_make_mut(&mut self.schema)?)
     }
 }
 
@@ -129,17 +139,39 @@ pub(crate) struct SchemaLoader {
     steps: VecDeque<Box<dyn LoadStep>>,
     /// The statement of the current step that is being read.
     statement: Option<Box<Statement>>,
+    install: SchemaInstall,
     /// Whether the connection's schema is the one that the current step
     /// started with.
     current_step_schema_installed: bool,
 }
 
+/// Where the loader puts the schema read so far before it prepares the
+/// first statement of a step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SchemaInstall {
+    /// A copy becomes the connection's own schema, and the database's shared
+    /// schema stays as it is. For a connection that reads its schema again
+    /// while other connections use the database. The connection must be in
+    /// a schema reparse: outside of one, in MVCC mode, preparing a statement
+    /// replaces a schema of the connection's own with the shared schema.
+    ConnectionCopy,
+    /// The schema becomes the database's shared schema, and the connection
+    /// uses that same schema. For opening a database, when no other
+    /// connection exists yet.
+    Shared,
+}
+
 impl SchemaLoader {
-    pub(crate) fn new(schema: Schema, steps: Vec<Box<dyn LoadStep>>) -> Self {
+    pub(crate) fn new(
+        schema: Arc<Schema>,
+        steps: Vec<Box<dyn LoadStep>>,
+        install: SchemaInstall,
+    ) -> Self {
         Self {
             load: SchemaLoad::new(schema),
             steps: steps.into(),
             statement: None,
+            install,
             current_step_schema_installed: false,
         }
     }
@@ -186,7 +218,15 @@ impl SchemaLoader {
                 continue;
             };
             if !self.current_step_schema_installed {
-                conn.install_schema_keeping_dialect_schema(&self.load.schema)?;
+                match self.install {
+                    SchemaInstall::ConnectionCopy => {
+                        conn.install_schema_keeping_dialect_schema(&self.load.schema)?;
+                    }
+                    SchemaInstall::Shared => {
+                        conn.db.replace_schema(self.load.schema.clone());
+                        *conn.schema.write() = self.load.schema.clone();
+                    }
+                }
                 self.current_step_schema_installed = true;
             }
             let statement = match query {
@@ -199,9 +239,47 @@ impl SchemaLoader {
         }
     }
 
-    pub(crate) fn into_schema(self) -> Schema {
+    pub(crate) fn into_schema(self) -> Arc<Schema> {
         self.load.schema
     }
+}
+
+/// Which read of the schema the steps of [`load_steps`] are for.
+pub(crate) enum StepsFor {
+    /// A connection reads the whole schema again. VACUUM passes the
+    /// sequences it kept from before it rebuilt the file, and they replace
+    /// reading the backing tables.
+    Reload {
+        preserved_sequences: Option<SequencesByNamespace>,
+    },
+    /// A database is opened. `Schema::make_from_btree` has read the schema
+    /// rows with a cursor, and has built the sequences, custom types, views
+    /// and indexes from them.
+    Open,
+}
+
+/// The steps that read a schema, in the order they run. A step that is not
+/// under `if reads_schema_rows` runs both when a database is opened and when
+/// a connection reads its schema again.
+pub(crate) fn load_steps(conn: &Arc<Connection>, steps_for: StepsFor) -> Vec<Box<dyn LoadStep>> {
+    let (reads_schema_rows, preserved_sequences) = match steps_for {
+        StepsFor::Reload {
+            preserved_sequences,
+        } => (true, preserved_sequences),
+        StepsFor::Open => (false, None),
+    };
+    let mut steps: Vec<Box<dyn LoadStep>> = Vec::new();
+    if reads_schema_rows {
+        steps.push(Box::new(SchemaRows::new(conn.clone())));
+    }
+    steps.push(Box::new(NamespaceNames::new(conn.clone())));
+    if reads_schema_rows {
+        steps.push(Box::new(Sequences::new(conn.clone(), preserved_sequences)));
+        steps.push(Box::new(CustomTypes::new(conn.clone())));
+        steps.push(Box::new(ViewsAndIndexes::new(conn.clone())));
+    }
+    steps.push(Box::new(DialectState::new(conn.clone())));
+    steps
 }
 
 /// Reads the schema rows: tables, views, triggers, and the indexes and
@@ -246,7 +324,7 @@ impl LoadStep for SchemaRows {
         let table_name = row.get::<&str>(2)?;
         let root_page = row.get::<i64>(3)?;
         let sql = row.get::<&str>(4).ok();
-        load.schema.handle_schema_row(
+        Schema::try_make_mut(&mut load.schema)?.handle_schema_row(
             ty,
             name,
             table_name,
@@ -283,22 +361,24 @@ impl NamespaceNames {
 
 impl LoadStep for NamespaceNames {
     fn next_query(&mut self, load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
-        if self.queried {
+        // The names are loaded already in a schema without namespaces, and
+        // in one that the MVCC bootstrap read while the database was opened.
+        if self.queried || load.schema().namespace_names_loaded() {
             return Ok(None);
         }
         self.queried = true;
         // Under a dialect without namespaces, a table of that name is an
         // ordinary table.
-        if load.schema.supports_namespaces()
+        if load.schema().supports_namespaces()
             && load
-                .schema
+                .schema()
                 .has_table(NamespaceId::ROOT, TURSO_NAMESPACES_TABLE_NAME)
         {
             return Ok(Some(LoadQuery::internal_helper(format!(
                 "SELECT id, name FROM {TURSO_NAMESPACES_TABLE_NAME}"
             ))));
         }
-        load.schema
+        load.schema_mut()?
             .load_namespace_names(self.conn.db.dialect().as_ref(), &[])?;
         Ok(None)
     }
@@ -310,7 +390,7 @@ impl LoadStep for NamespaceNames {
     }
 
     fn end_of_rows(&mut self, load: &mut SchemaLoad) -> Result<()> {
-        load.schema
+        load.schema_mut()?
             .load_namespace_names(self.conn.db.dialect().as_ref(), &self.rows)
     }
 }
@@ -372,10 +452,10 @@ impl LoadStep for Sequences {
     fn next_query(&mut self, load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
         if self.backing_tables.is_none() {
             if let Some(sequences) = self.preserved.take() {
-                load.schema.set_sequences_by_namespace(sequences);
+                load.schema_mut()?.set_sequences_by_namespace(sequences);
                 self.backing_tables = Some(crate::alloc::vec![]);
             } else {
-                self.backing_tables = Some(load.schema.sequence_backing_table_names());
+                self.backing_tables = Some(load.schema().sequence_backing_table_names());
             }
         }
         let backing_tables = self.backing_tables.as_ref().expect("set above");
@@ -399,8 +479,8 @@ impl LoadStep for Sequences {
         );
         while let Some((backing_table_name, mangled_name)) = backing_tables.get(self.current) {
             let normalized = crate::util::normalize_ident(mangled_name);
-            let (namespace, sequence_name) = load.schema.demangle_name(&normalized);
-            if load.schema.has_sequence(namespace, sequence_name) {
+            let (namespace, sequence_name) = load.schema().demangle_name(&normalized);
+            if load.schema().has_sequence(namespace, sequence_name) {
                 self.current += 1;
                 continue;
             }
@@ -436,7 +516,7 @@ impl LoadStep for Sequences {
         let normalized = crate::util::normalize_ident(mangled_name);
         match std::mem::replace(&mut self.read, SequenceRead::NotStarted) {
             SequenceRead::Descriptor { row } => {
-                let (_, sequence_name) = load.schema.demangle_name(&normalized);
+                let (_, sequence_name) = load.schema().demangle_name(&normalized);
                 let sequence = Connection::sequence_from_descriptor_meta(
                     sequence_name,
                     backing_table_name,
@@ -450,7 +530,7 @@ impl LoadStep for Sequences {
                 if let Some(mv_store) = self.conn.db.get_mv_store().as_ref() {
                     mv_store.set_sequence_watermark(&normalized, watermark);
                 }
-                load.schema
+                load.schema_mut()?
                     .insert_sequence_under_mangled_name(&normalized, Arc::new(sequence));
                 self.current += 1;
             }
@@ -527,7 +607,7 @@ impl LoadStep for CustomTypes {
         self.queried = true;
         if self.conn.experimental_custom_types_enabled()
             && load
-                .schema
+                .schema()
                 .has_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME)
         {
             return Ok(Some(LoadQuery::internal_helper(format!(
@@ -562,7 +642,7 @@ impl LoadStep for ViewsAndIndexes {
             .unbuilt
             .take()
             .expect("views and indexes are built once");
-        load.schema.populate_types_views_then_indices(
+        Schema::try_make_mut(&mut load.schema)?.populate_types_views_then_indices(
             self.conn.db.dialect().as_ref(),
             &self.conn.syms.read(),
             &load.type_sqls,
@@ -614,7 +694,7 @@ impl LoadStep for DialectState {
             self.conn
                 .db
                 .dialect()
-                .schema_state_queries(&load.schema)
+                .schema_state_queries(load.schema())
                 .into()
         });
         Ok(queries.pop_front().map(LoadQuery::engine_metadata_read))
@@ -633,13 +713,142 @@ impl LoadStep for DialectState {
         self.results.push(std::mem::take(&mut self.rows));
         let queries = self.queries.as_ref().expect("set by next_query");
         if queries.is_empty() {
-            load.schema.dialect_schema = Some(
-                self.conn
-                    .db
-                    .dialect()
-                    .build_schema_state(&load.schema, &self.results)?,
-            );
+            let state = self
+                .conn
+                .db
+                .dialect()
+                .build_schema_state(load.schema(), &self.results)?;
+            load.schema_mut()?.dialect_schema = Some(state);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
+    use crate::security::roles::SessionRole;
+    use crate::sync::atomic::{AtomicBool, Ordering};
+    use crate::util::IOExt;
+    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenOptions};
+
+    const NAMESPACE: NamespaceId = NamespaceId::new(7);
+
+    /// Reads `sqlite_schema`, then names [`NAMESPACE`] in the schema being
+    /// read. Unit tests of this crate have no SQL parser, and this read needs
+    /// none.
+    #[derive(Default)]
+    struct NamesANamespace {
+        queried: bool,
+    }
+
+    impl LoadStep for NamesANamespace {
+        fn next_query(&mut self, _load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
+            let query = (!self.queried).then_some(LoadQuery::SchemaTableRead);
+            self.queried = true;
+            Ok(query)
+        }
+
+        fn row(&mut self, _load: &mut SchemaLoad, _row: &Row) -> Result<()> {
+            Ok(())
+        }
+
+        fn end_of_rows(&mut self, load: &mut SchemaLoad) -> Result<()> {
+            load.schema_mut()?.name_namespace(NAMESPACE, "seven");
+            Ok(())
+        }
+    }
+
+    /// Reads `sqlite_schema`, and records whether the connection's schema
+    /// has the name of [`NAMESPACE`] once its statement has run.
+    struct LooksForTheNamespace {
+        conn: Arc<Connection>,
+        queried: bool,
+        found: Arc<AtomicBool>,
+    }
+
+    impl LoadStep for LooksForTheNamespace {
+        fn next_query(&mut self, _load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
+            let query = (!self.queried).then_some(LoadQuery::SchemaTableRead);
+            self.queried = true;
+            Ok(query)
+        }
+
+        fn row(&mut self, _load: &mut SchemaLoad, _row: &Row) -> Result<()> {
+            Ok(())
+        }
+
+        fn end_of_rows(&mut self, _load: &mut SchemaLoad) -> Result<()> {
+            let found = self.conn.schema.read().namespace_name(NAMESPACE) == Some("seven");
+            self.found.store(found, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Opening a database runs the steps on a connection that is not in a
+    /// schema reparse. In MVCC mode, preparing a statement on such a
+    /// connection replaces a schema of the connection's own with the shared
+    /// schema, which would lose what the step before read.
+    #[test]
+    fn a_step_sees_what_the_step_before_read_when_the_schema_is_installed_as_shared() {
+        for mvcc in [false, true] {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open(
+                io.clone(),
+                ":memory:",
+                OpenOptions::new(Arc::new(DialectThatCannotParse))
+                    .db_opts(DatabaseOpts::new().with_mvcc(mvcc)),
+            )
+            .unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            assert_eq!(conn.mvcc_enabled(), mvcc);
+            let found = Arc::new(AtomicBool::new(false));
+            let mut loader = SchemaLoader::new(
+                db.schema.lock().clone(),
+                vec![
+                    Box::new(NamesANamespace::default()),
+                    Box::new(LooksForTheNamespace {
+                        conn: conn.clone(),
+                        queried: false,
+                        found: found.clone(),
+                    }),
+                ],
+                SchemaInstall::Shared,
+            );
+
+            io.block(|| loader.run(&conn)).unwrap();
+
+            assert!(found.load(Ordering::SeqCst), "mvcc={mvcc}");
+            assert_eq!(
+                db.schema.lock().namespace_name(NAMESPACE),
+                Some("seven"),
+                "mvcc={mvcc}"
+            );
+        }
+    }
+
+    /// Most databases have no namespace names and no dialect state to read.
+    /// Opening them must not copy the schema.
+    #[test]
+    fn steps_that_change_nothing_leave_the_shared_schema_uncopied() {
+        let io = Arc::new(MemoryIO::new());
+        let db =
+            Database::open_file(io.clone(), ":memory:", Arc::new(DialectThatCannotParse)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let shared = db.schema.lock().clone();
+        let mut loader = SchemaLoader::new(
+            shared.clone(),
+            load_steps(&conn, StepsFor::Open),
+            SchemaInstall::Shared,
+        );
+
+        io.block(|| loader.run(&conn)).unwrap();
+
+        assert!(Arc::ptr_eq(&loader.into_schema(), &shared));
     }
 }
