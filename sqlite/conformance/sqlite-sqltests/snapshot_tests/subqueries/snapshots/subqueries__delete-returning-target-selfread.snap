@@ -57,7 +57,7 @@ addr  opcode         p1  p2  p3  p4          p5  comment
   35  Next            1   5   0               0
   36  FkCheck         0   0   0               0
   37  Rewind          0  41   0               0  Rewind  ephemeral(t)
-  38    ColumnRange   0   0  23  2            0  r[23..24]=ephemeral(t).id..grp
+  38    ColumnRange   0   0  23  2            0  r[23..24]=ephemeral(t).id..(SELECT count(*) FROM t)
   39    ResultRow    23   2   0               0  output=r[23..24]
   40  Next            0  38   0               0
   41  Halt            0   0   0               0
