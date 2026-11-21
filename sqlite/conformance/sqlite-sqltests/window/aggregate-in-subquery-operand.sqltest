@@ -1,0 +1,61 @@
+@database :memory:
+
+# A query with a window function moves each result expression that holds a
+# subquery into the window's source subquery. An aggregate in such an
+# expression, e.g. the left operand of `max(x) IN (SELECT ...)`, must still
+# be computed there: it was rejected as a misuse of the aggregate, and an
+# aggregate from an extension crashed the process.
+
+setup items {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1), (3);
+}
+
+@setup items
+test aggregate-in-operand-of-in-subquery-with-window {
+    SELECT max(x) IN (SELECT 1), max(x) IN (SELECT 3), count(*) OVER () FROM t;
+}
+expect {
+    0|1|1
+}
+
+@setup items
+test aggregate-in-operand-of-not-in-subquery-with-window {
+    SELECT sum(x) NOT IN (SELECT 4), sum(x) NOT IN (SELECT 5), row_number() OVER () FROM t;
+}
+expect {
+    0|1|1
+}
+
+@setup items
+test count-star-in-operand-of-in-subquery-with-window {
+    SELECT count(*) IN (SELECT 2), count(*) OVER () FROM t;
+}
+expect {
+    1|1
+}
+
+@setup items
+test aggregate-in-operand-of-in-subquery-window-in-order-by {
+    SELECT max(x) IN (SELECT 3) FROM t ORDER BY sum(x) OVER ();
+}
+expect {
+    1
+}
+
+@setup items
+test aggregate-in-operand-of-in-subquery-with-window-and-group-by {
+    SELECT x % 2, max(x) IN (SELECT 3), count(*) OVER () FROM t GROUP BY x % 2;
+}
+expect {
+    1|1|1
+}
+
+@setup items
+@skip-if sqlite "the CI SQLite build has no median() or percentile_disc()"
+test extension-aggregate-in-operand-of-in-subquery-with-window {
+    SELECT median(x) IN (SELECT 2), percentile_disc(x, 1) IN (SELECT 3), count(*) OVER () FROM t;
+}
+expect {
+    1|1|1
+}
