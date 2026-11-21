@@ -3,7 +3,7 @@
 
 use crate::dialect::{AddColumn, AlterColumn, CmdContext, DropColumn, RenameColumn, RenameTable};
 use crate::function::{AlterTableFunc, Func, FuncCtx};
-use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
 use crate::sync::Arc;
 use crate::translate::alter::database_uses_mvcc;
@@ -11,6 +11,7 @@ use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::sqlite_schema_rows::open_sqlite_schema_for_write;
 use crate::translate::schema::SQLITE_TABLEID;
+use crate::translate::sequence::emit_find_sqlite_sequence_row_name;
 use crate::translate::update::translate_update_for_schema_change;
 use crate::util::escape_sql_string_literal;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -37,24 +38,36 @@ pub(super) fn emit_rename_table_rows(
     } else {
         stored_old_name
     };
+    // The rewrite function stores the new name as written in the SQL text.
+    let new_name_argument = if table.is_virtual {
+        stored_new_name.to_string()
+    } else {
+        mangle_name(table.namespace, table.written_new_name)
+    };
     emit_rewrite_of_every_row(
         program,
         ctx,
         AlterTableFunc::RenameTable,
-        &[old_name_argument.to_string(), stored_new_name.to_string()],
+        &[old_name_argument.to_string(), new_name_argument.clone()],
         table.written_old_name,
     );
     if table.is_virtual {
         return Ok(());
     }
 
+    let renamed_table = resolver
+        .with_schema(ctx.database_id, |s| {
+            s.get_btree_table(table.namespace, table.old_name)
+        })
+        .ok_or_else(|| LimboError::ParseError(format!("no such table: {}", table.old_name)))?;
     emit_rename_sqlite_sequence_entry(
         program,
         resolver,
         ctx.connection,
         ctx.database_id,
-        stored_old_name,
-        stored_new_name,
+        &renamed_table,
+        &mangle_name(table.namespace, &renamed_table.declared_name),
+        &new_name_argument,
     );
     let has_autoincrement_backing_table = resolver.with_schema(ctx.database_id, |s| {
         s.get_sequence(
@@ -396,8 +409,9 @@ fn emit_rename_sqlite_sequence_entry(
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
     database_id: usize,
-    old_table_name_norm: &str,
-    new_table_name_norm: &str,
+    old_table: &BTreeTable,
+    old_table_name: &str,
+    new_table_name: &str,
 ) {
     let Some(sqlite_sequence) = resolver.with_schema(database_id, |s| {
         s.get_btree_table(NamespaceId::ROOT, crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
@@ -408,9 +422,9 @@ fn emit_rename_sqlite_sequence_entry(
     let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_sequence.clone()));
     let sequence_name_reg = program.alloc_register();
     let sequence_value_reg = program.alloc_register();
-    let row_name_to_replace_reg = program.emit_string8_new_reg(old_table_name_norm.to_string());
+    let row_name_to_replace_reg = program.emit_string8_new_reg(old_table_name.to_string());
     program.mark_last_insn_constant();
-    let replacement_row_name_reg = program.emit_string8_new_reg(new_table_name_norm.to_string());
+    let replacement_row_name_reg = program.emit_string8_new_reg(new_table_name.to_string());
     program.mark_last_insn_constant();
 
     let affinity_str = sqlite_sequence
@@ -424,6 +438,14 @@ fn emit_rename_sqlite_sequence_entry(
         root_page: RegisterOrLiteral::Literal(sqlite_sequence.root_page),
         db: database_id,
     });
+    // Like SQLite, any table's row named exactly as the table is renamed. Only
+    // an AUTOINCREMENT table can have a row written by older Turso versions
+    // whose name differs from the table's only in case.
+    let table_row_name_reg = if old_table.has_autoincrement {
+        emit_find_sqlite_sequence_row_name(program, seq_cursor_id, row_name_to_replace_reg)
+    } else {
+        row_name_to_replace_reg
+    };
 
     program.cursor_loop(seq_cursor_id, |program, rowid| {
         program.emit_column_or_rowid(seq_cursor_id, 0, sequence_name_reg);
@@ -431,7 +453,7 @@ fn emit_rename_sqlite_sequence_entry(
         let continue_loop_label = program.allocate_label();
         program.emit_insn(Insn::Ne {
             lhs: sequence_name_reg,
-            rhs: row_name_to_replace_reg,
+            rhs: table_row_name_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default().jump_if_null(),
             collation: CollationSeq::for_internal_values(),
