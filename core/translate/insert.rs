@@ -37,8 +37,8 @@ use crate::{
             open_read_table, table_scan_match_any, ForeignKeyActions,
         },
         plan::{
-            ColumnMask, ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination,
-            ResultSetColumn, TableReferences,
+            ColumnMask, ColumnUsedMask, EvalAt, JoinedTable, NonFromClauseSubquery, Operation,
+            QueryDestination, ResultSetColumn, TableReferences,
         },
         planner::{collect_subquery_table_refs_in_expr, plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
@@ -415,6 +415,20 @@ pub fn translate_insert(
         connection,
     )?;
 
+    let updates_on_conflict = upsert_actions
+        .iter()
+        .any(|(_, _, upsert)| matches!(upsert.do_clause, ast::UpsertDo::Set { .. }));
+    // Emitting a subquery consumes its plan, so each DO UPDATE arm plans the
+    // RETURNING subqueries again from the clause as written.
+    let upsert_returning = if updates_on_conflict
+        && returning.iter().any(
+            |column| matches!(column, ResultColumn::Expr(expr, _) if expr_contains_subquery(expr)),
+        ) {
+        Some(returning.clone())
+    } else {
+        None
+    };
+
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)
     let mut returning_subqueries = vec![];
@@ -430,9 +444,6 @@ pub fn translate_insert(
     // Process RETURNING clause using shared module
     let mut result_columns =
         process_returning_clause(&mut returning, &mut table_references, resolver)?;
-    let updates_on_conflict = upsert_actions
-        .iter()
-        .any(|(_, _, upsert)| matches!(upsert.do_clause, ast::UpsertDo::Set { .. }));
     let reads_columns = updates_on_conflict
         || upsert_actions
             .iter()
@@ -1098,6 +1109,34 @@ pub fn translate_insert(
         )?;
     }
 
+    // RETURNING reads the row before the AFTER triggers run, as in SQLite, so
+    // a subquery in it does not see what a trigger writes.
+    if !returning_subqueries.is_empty() {
+        emit_returning_subqueries(
+            program,
+            resolver,
+            &table_references,
+            &mut returning_subqueries,
+            insertion.first_col_register(),
+            insertion.key_register(),
+            &btree_table.column_layout()?,
+        )?;
+    }
+
+    // Emit RETURNING results if specified
+    if !result_columns.is_empty() {
+        emit_returning_results(
+            program,
+            &table_references,
+            &result_columns,
+            insertion.first_col_register(),
+            insertion.key_register(),
+            resolver,
+            ctx.returning_buffer.as_ref(),
+            &btree_table.column_layout()?,
+        )?;
+    }
+
     // Fire AFTER INSERT triggers
     let relevant_after_triggers = get_triggers_including_temp(
         resolver,
@@ -1140,7 +1179,7 @@ pub fn translate_insert(
             None => trigger_ctx_after,
         };
         // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
-        // not skip post-row work (FK counters, autoincrement, CDC, RETURNING).
+        // not skip post-row work (FK counters, autoincrement, CDC).
         // Use a label that falls through to the next instruction after the trigger loop.
         let after_trigger_done = program.allocate_label();
         for trigger in relevant_after_triggers {
@@ -1171,54 +1210,6 @@ pub fn translate_insert(
         )?;
     }
 
-    if !returning_subqueries.is_empty() {
-        let target_table = table_references
-            .joined_tables()
-            .first()
-            .expect("INSERT RETURNING target table must exist");
-        let cache_state = seed_returning_row_image_in_cache(
-            program,
-            &table_references,
-            insertion.first_col_register(),
-            insertion.key_register(),
-            resolver,
-            &btree_table.column_layout()?,
-        )?;
-        let result: Result<()> = (|| {
-            for subquery in returning_subqueries
-                .iter_mut()
-                .filter(|s| !s.has_been_evaluated())
-            {
-                let rerun_for_target_scan =
-                    subquery.reads_table(target_table.namespace, target_table.table.get_name());
-                let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
-                emit_non_from_clause_subquery(
-                    program,
-                    resolver,
-                    *subquery_plan,
-                    &subquery.query_type,
-                    subquery.correlated || rerun_for_target_scan,
-                )?;
-            }
-            Ok(())
-        })();
-        restore_returning_row_image_in_cache(resolver, cache_state);
-        result?;
-    }
-
-    // Emit RETURNING results if specified
-    if !result_columns.is_empty() {
-        emit_returning_results(
-            program,
-            &table_references,
-            &result_columns,
-            insertion.first_col_register(),
-            insertion.key_register(),
-            resolver,
-            ctx.returning_buffer.as_ref(),
-            &btree_table.column_layout()?,
-        )?;
-    }
     program.emit_insn(Insn::Goto {
         target_pc: ctx.loop_labels.row_done,
     });
@@ -1232,6 +1223,7 @@ pub fn translate_insert(
             &insertion,
             &table,
             &mut result_columns,
+            upsert_returning.as_deref(),
             connection,
             &mut table_references,
             tbl_name.alias.as_ref().map(|alias| alias.as_str()),
@@ -1275,6 +1267,51 @@ pub fn translate_insert(
     program.result_columns = result_columns;
     program.table_references.extend(table_references);
     Ok(())
+}
+
+/// Emits the RETURNING subqueries of an INSERT against the row whose column
+/// values start at `reg_columns_start` and whose rowid is in `rowid_reg`.
+pub(crate) fn emit_returning_subqueries(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    table_references: &TableReferences,
+    returning_subqueries: &mut [NonFromClauseSubquery],
+    reg_columns_start: usize,
+    rowid_reg: usize,
+    layout: &ColumnLayout,
+) -> Result<()> {
+    let target_table = table_references
+        .joined_tables()
+        .first()
+        .expect("INSERT RETURNING target table must exist");
+    let cache_state = seed_returning_row_image_in_cache(
+        program,
+        table_references,
+        reg_columns_start,
+        rowid_reg,
+        resolver,
+        layout,
+    )?;
+    let result: Result<()> = (|| {
+        for subquery in returning_subqueries
+            .iter_mut()
+            .filter(|s| !s.has_been_evaluated())
+        {
+            let rerun_for_target_scan =
+                subquery.reads_table(target_table.namespace, target_table.table.get_name());
+            let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
+            emit_non_from_clause_subquery(
+                program,
+                resolver,
+                *subquery_plan,
+                &subquery.query_type,
+                subquery.correlated || rerun_for_target_scan,
+            )?;
+        }
+        Ok(())
+    })();
+    restore_returning_row_image_in_cache(resolver, cache_state);
+    result
 }
 
 pub(crate) fn emit_remember_written_rowid(
@@ -1734,6 +1771,7 @@ fn resolve_upserts(
     insertion: &Insertion,
     table: &Table,
     result_columns: &mut [ResultSetColumn],
+    returning_with_subqueries: Option<&[ResultColumn]>,
     connection: &Arc<crate::Connection>,
     table_references: &mut TableReferences,
     table_alias: Option<&str>,
@@ -1778,6 +1816,7 @@ fn resolve_upserts(
                 where_clause,
                 resolver,
                 result_columns,
+                returning_with_subqueries,
                 connection,
                 table_references,
                 table_alias,
