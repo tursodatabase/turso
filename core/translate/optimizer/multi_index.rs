@@ -390,6 +390,7 @@ fn choose_multi_index_branch_access(
     {
         return Ok(None);
     }
+    let mut chosen_refs = smallvec::SmallVec::new();
     let chosen_seek = choose_best_btree_candidate(
         rhs_table,
         table_constraints,
@@ -402,11 +403,12 @@ fn choose_multi_index_branch_access(
         1.0,
         base_row_count,
         params,
+        &mut chosen_refs,
     )?;
 
     let mut best_branch = chosen_seek
         .as_ref()
-        .filter(|chosen| !chosen.constraint_refs.is_empty())
+        .filter(|_| !chosen_refs.is_empty())
         .map(|chosen| {
             let index_info = index_info_for_branch(
                 chosen.index.as_deref(),
@@ -423,7 +425,7 @@ fn choose_multi_index_branch_access(
             let branch_cost = estimate_cost_for_scan_or_seek(
                 Some(index_info),
                 &table_constraints.constraints,
-                &chosen.constraint_refs,
+                &chosen_refs,
                 1.0,
                 base_row_count,
                 false,
@@ -434,13 +436,13 @@ fn choose_multi_index_branch_access(
                 index: chosen.index.clone(),
                 access: MultiIdxBranchAccess::Seek {
                     constraints: table_constraints.constraints.clone(),
-                    constraint_refs: chosen.constraint_refs.to_vec(),
+                    constraint_refs: chosen_refs.to_vec(),
                 },
                 cost: branch_cost,
                 estimated_rows: estimate_rows_per_seek(
                     index_info,
                     &table_constraints.constraints,
-                    &chosen.constraint_refs,
+                    &chosen_refs,
                     base_row_count,
                     Some(&analyze_ctx),
                 ),

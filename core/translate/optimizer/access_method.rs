@@ -164,11 +164,11 @@ pub enum AccessMethodParams {
 }
 
 /// Result of generic btree candidate selection before it is wrapped into a full
-/// [`AccessMethod`].
+/// [`AccessMethod`]. The constraint refs of the candidate are in the buffer
+/// that the caller gives to [choose_best_btree_candidate].
 pub(super) struct ChosenBtreeCandidate {
     pub(super) iter_dir: IterationDirection,
     pub(super) index: Option<Arc<Index>>,
-    pub(super) constraint_refs: SmallVec<[RangeConstraintRef; 2]>,
     pub(super) base_row_count: RowCountEstimate,
     pub(super) cost: Cost,
     /// The [IndexInfo] that the cost of the candidate used. It is `None` only
@@ -204,6 +204,11 @@ pub(super) enum BranchReadMode {
 /// current join-order prefix.
 ///
 /// This returns `None` if every forced candidate is unsafe for unmatched-right-row output.
+///
+/// The constraint refs of the returned candidate go into `best_constraint_refs`.
+/// They are not in [ChosenBtreeCandidate], because the join search calls this
+/// function for each join order that it tries, and each move of the candidate
+/// then copied the 168 bytes of the refs.
 pub(super) fn choose_best_btree_candidate(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
@@ -216,6 +221,7 @@ pub(super) fn choose_best_btree_candidate(
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
+    best_constraint_refs: &mut SmallVec<[RangeConstraintRef; 2]>,
 ) -> Result<Option<ChosenBtreeCandidate>> {
     let keeps_right_rows = rhs_table
         .join_info
@@ -243,11 +249,11 @@ pub(super) fn choose_best_btree_candidate(
     let mut best_choice = ChosenBtreeCandidate {
         iter_dir: IterationDirection::Forwards,
         index: None,
-        constraint_refs: SmallVec::new(),
         base_row_count,
         cost: best_cost,
         index_info: None,
     };
+    best_constraint_refs.clear();
     let mut best_adjusted_output = f64::MAX;
     let mut best_is_ordered = false;
 
@@ -481,11 +487,11 @@ pub(super) fn choose_best_btree_candidate(
             best_choice = ChosenBtreeCandidate {
                 iter_dir,
                 index: candidate.index.clone(),
-                constraint_refs: usable_constraint_refs,
                 base_row_count: candidate_base_row_count,
                 cost,
                 index_info,
             };
+            *best_constraint_refs = usable_constraint_refs;
         }
     }
 
@@ -883,6 +889,7 @@ fn find_best_access_method_for_btree<'a>(
     multi_index_work: Option<&MultiIndexTableWork<'a>>,
 ) -> Result<Option<AccessMethod>> {
     let rhs_table_idx = join_order.last().unwrap().original_idx;
+    let mut constraint_refs = SmallVec::new();
     let Some(best) = choose_best_btree_candidate(
         rhs_table,
         rhs_constraints,
@@ -895,13 +902,14 @@ fn find_best_access_method_for_btree<'a>(
         input_cardinality,
         base_row_count,
         params,
+        &mut constraint_refs,
     )?
     else {
         return Ok(None);
     };
 
     let access_base_row_count = best.base_row_count;
-    let estimated_rows_per_outer_row = if best.constraint_refs.is_empty() {
+    let estimated_rows_per_outer_row = if constraint_refs.is_empty() {
         *access_base_row_count
     } else {
         let index_info = best
@@ -915,15 +923,13 @@ fn find_best_access_method_for_btree<'a>(
         estimate_rows_per_seek(
             index_info,
             &rhs_constraints.constraints,
-            &best.constraint_refs,
+            &constraint_refs,
             access_base_row_count,
             Some(&analyze_ctx),
         )
     };
-    let mut consumed_where_terms = consumed_where_terms_from_constraint_refs(
-        &rhs_constraints.constraints,
-        &best.constraint_refs,
-    )?;
+    let mut consumed_where_terms =
+        consumed_where_terms_from_constraint_refs(&rhs_constraints.constraints, &constraint_refs)?;
     if let Some(index) = partial_index(best.index.as_ref()) {
         consume_partial_index_predicate_terms(
             &mut consumed_where_terms,
@@ -940,7 +946,7 @@ fn find_best_access_method_for_btree<'a>(
             iter_dir: best.iter_dir,
             index: best.index,
             build_index: false,
-            constraint_refs: best.constraint_refs.into_vec(),
+            constraint_refs: constraint_refs.into_vec(),
         },
     };
     let mut best_cost_with_filters =
