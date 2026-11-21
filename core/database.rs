@@ -2619,21 +2619,38 @@ impl Database {
                 "new WAL state unexpectedly shared during external restore reload".to_string(),
             )
         })?;
-        self.shared_wal
-            .write()
-            .replace_after_external_restore(new_shared_wal.into_inner());
-        if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
+        let new_shared_wal = new_shared_wal.into_inner();
+        if let Some(context) = encryption_context.as_ref() {
+            self.validate_external_restore_wal(&new_shared_wal, context)?;
+        }
+        let new_mv_store = if self.mvcc_enabled()
+            || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
         {
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
                 &self.path,
                 self.open_flags,
                 self.durable_storage.clone(),
-                encryption_context,
+                encryption_context.clone(),
                 self.allocators.mv_store.clone(),
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
-            self.mv_store.store(Some(mv_store.clone()));
+            if encryption_context.is_some() {
+                mvcc::persistent_storage::logical_log::StreamingLogicalLogReader::new(
+                    mv_store.get_logical_log_file(),
+                    encryption_context,
+                )
+                .validate_encryption_key(&self.io)?;
+            }
+            Some(mv_store)
+        } else {
+            None
+        };
+        self.shared_wal
+            .write()
+            .replace_after_external_restore(new_shared_wal);
+        self.mv_store.store(new_mv_store.clone());
+        if let Some(mv_store) = new_mv_store {
             let mvcc_bootstrap_conn = self._connect(
                 ConnectOpts::new(SessionRole::Superuser).with_encryption_key(encryption_key),
                 ConnectionContext::default(),
@@ -2649,8 +2666,62 @@ impl Database {
                 }
                 Err(error) => return Err(error),
             }
-        } else {
-            self.mv_store.store(None);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    fn validate_external_restore_wal(
+        &self,
+        wal: &WalFileShared,
+        context: &EncryptionContext,
+    ) -> Result<()> {
+        use storage::sqlite3_ondisk::{
+            parse_wal_frame_header, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
+        };
+        let Some(file) = wal.runtime.file.as_ref() else {
+            return Ok(());
+        };
+        let max_frame = wal.metadata.max_frame.load(Ordering::Acquire);
+        if max_frame == 0 {
+            return Ok(());
+        }
+        if wal.page_size() as usize != context.page_size() {
+            return Err(LimboError::InvalidArgument(
+                "restored WAL page size does not match the database".into(),
+            ));
+        }
+        let context = Arc::new(context.clone());
+        let buffer = Arc::new(Buffer::new_temporary(
+            context.page_size() + WAL_FRAME_HEADER_SIZE,
+        ));
+        for frame in 1..=max_frame {
+            let offset = WAL_HEADER_SIZE as u64
+                + (frame - 1) * (WAL_FRAME_HEADER_SIZE as u64 + wal.page_size() as u64);
+            let context = context.clone();
+            let complete = Box::new(
+                move |result: std::result::Result<(Arc<Buffer>, i32), CompletionError>| {
+                    let Ok((buffer, actual)) = result else {
+                        return None;
+                    };
+                    if actual as usize != buffer.len() {
+                        return Some(CompletionError::ShortReadWalFrame {
+                            offset,
+                            expected: buffer.len(),
+                            actual: actual as usize,
+                        });
+                    }
+                    let (header, page) = parse_wal_frame_header(buffer.as_slice());
+                    context
+                        .decrypt_page(page, header.page_number as usize)
+                        .err()
+                        .map(|_| CompletionError::DecryptionError {
+                            page_idx: header.page_number as usize,
+                        })
+                },
+            );
+            let completion = file.pread(offset, Completion::new_read(buffer.clone(), complete))?;
+            self.io.wait_for_completion(completion)?;
         }
         Ok(())
     }

@@ -1753,6 +1753,9 @@ pub struct StreamingLogicalLogReader {
     // Reused scratch buffer for decrypted chunk plaintext. Kept on the reader so encrypted
     // recovery can reuse the allocation across chunks and transaction frames.
     decrypt_scratch: Vec<u8>,
+    // Restore checks frame integrity before treating decryption failure as a wrong key.
+    #[cfg(feature = "conn_raw_api")]
+    validate_encryption: bool,
     /// Set when a read has been issued but its completion has not yet been
     /// observed by the calling IOResult method. Cleared on completion.
     in_flight_read: Option<InFlightRead>,
@@ -1790,9 +1793,20 @@ impl StreamingLogicalLogReader {
             #[cfg(test)]
             pending_ops: std::collections::VecDeque::new(),
             decrypt_scratch,
+            #[cfg(feature = "conn_raw_api")]
+            validate_encryption: false,
             in_flight_read: None,
             frame_in_progress: None,
         }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub(crate) fn validate_encryption_key(mut self, io: &Arc<dyn crate::IO>) -> Result<()> {
+        self.validate_encryption = self.encryption_ctx.is_some();
+        if matches!(self.try_read_header(io)?, HeaderReadResult::Valid(_)) {
+            while io.block(|| self.next_frame())?.is_some() {}
+        }
+        Ok(())
     }
 
     pub fn new(file: Arc<dyn File>, encryption_ctx: Option<EncryptionContext>) -> Self {
@@ -2175,9 +2189,13 @@ impl StreamingLogicalLogReader {
             let nonce = &blob[plaintext_len + payload_ctx.tag_size..];
             encryption_ctx
                 .decrypt_chunk_into(ciphertext, nonce, &aad, decrypt_scratch)
-                .map_err(|e| {
+                .map_err(|error| {
+                    #[cfg(feature = "conn_raw_api")]
+                    if self.validate_encryption {
+                        return error;
+                    }
                     LimboError::Corrupt(format!(
-                        "decrypt_chunk failed for chunk {chunk_index}: {e}"
+                        "decrypt_chunk failed for chunk {chunk_index}: {error}"
                     ))
                 })?;
             (next_crc, decrypt_scratch.len())
@@ -2828,22 +2846,30 @@ impl StreamingLogicalLogReader {
                     }
                     self.advance_checkpoint();
                 }
-                FramePhase::Payload => match self.parse_payload_phase() {
-                    Ok(IOResult::Done(PayloadOutcome::Ok)) => {
-                        self.frame_in_progress
-                            .as_mut()
-                            .expect("frame in progress")
-                            .phase = FramePhase::Trailer;
-                        self.advance_checkpoint();
-                    }
-                    Ok(IOResult::Done(PayloadOutcome::Eof)) => return self.abort_frame_eof(),
-                    Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
-                    Err(err) if matches!(*err, LimboError::Corrupt(_)) => {
-                        tracing::warn!("corrupt payload: {err}");
+                FramePhase::Payload => {
+                    #[cfg(feature = "conn_raw_api")]
+                    if self.validate_encryption
+                        && !return_if_io!(self.validate_encrypted_frame_checksum())
+                    {
                         return self.invalidate_frame();
                     }
-                    Err(e) => return Err(e),
-                },
+                    match self.parse_payload_phase() {
+                        Ok(IOResult::Done(PayloadOutcome::Ok)) => {
+                            self.frame_in_progress
+                                .as_mut()
+                                .expect("frame in progress")
+                                .phase = FramePhase::Trailer;
+                            self.advance_checkpoint();
+                        }
+                        Ok(IOResult::Done(PayloadOutcome::Eof)) => return self.abort_frame_eof(),
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Err(err) if matches!(*err, LimboError::Corrupt(_)) => {
+                            tracing::warn!("corrupt payload: {err}");
+                            return self.invalidate_frame();
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
                 FramePhase::Trailer => {
                     // TX TRAILER layout (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
                     let trailer_bytes =
@@ -2878,6 +2904,30 @@ impl StreamingLogicalLogReader {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    fn validate_encrypted_frame_checksum(&mut self) -> IOResultOr<bool> {
+        let frame = self.frame_in_progress.as_ref().expect("frame in progress");
+        let Some(plaintext_size) = frame.payload_size.checked_add(frame.extension_size) else {
+            return Ok(IOResult::Done(false));
+        };
+        if plaintext_size > self.remaining_bytes() {
+            return Ok(IOResult::Done(false));
+        }
+        let header_crc = frame.running_crc;
+        let payload_size = self.encrypted_payload_on_disk_size(plaintext_size)?;
+        let Some(crc) = return_if_io!(self.consume_and_crc_bytes(payload_size, header_crc)) else {
+            return Ok(IOResult::Done(false));
+        };
+        let Some(trailer) = return_if_io!(self.try_consume_fixed::<TX_TRAILER_SIZE>()) else {
+            return Ok(IOResult::Done(false));
+        };
+        // Keep the payload buffered for decryption after its on-disk checksum verifies.
+        self.buffer_offset = self.frame_anchor;
+        Ok(IOResult::Done(
+            trailer[..4] == crc.to_le_bytes() && trailer[4..] == END_MAGIC.to_le_bytes(),
+        ))
     }
 
     /// Parse and validate the transaction header (a re-entrant atomic unit).

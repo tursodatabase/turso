@@ -2671,7 +2671,43 @@ fn connect_async_yields_and_cancellation_releases_read_transactions() -> anyhow:
 }
 
 #[test]
-fn encrypted_restore_rejects_a_file_encrypted_with_another_key() -> anyhow::Result<()> {
+fn encrypted_restore_recovers_torn_sidecar_tail() -> anyhow::Result<()> {
+    for cipher in [CIPHER_A, CIPHER_B] {
+        for mvcc in [false, true] {
+            let target = TempDatabaseBuilder::new()
+                .with_encryption(cipher, KEY_A)
+                .with_mvcc(mvcc)
+                .build();
+            let owner = target.connect_limbo();
+            owner.execute("CREATE TABLE secrets(value TEXT)")?;
+            owner.execute("INSERT INTO secrets VALUES ('checkpointed')")?;
+            owner.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            let committed = "committed".repeat(16_384);
+            owner.execute(format!("INSERT INTO secrets VALUES ('{committed}')"))?;
+            owner.reload_wal_after_external_restore()?;
+            owner.publish_schema_after_external_restore()?;
+            owner.execute(format!("INSERT INTO secrets VALUES ('{committed}')"))?;
+            let suffix = if mvcc { "-log" } else { "-wal" };
+            let path = format!("{}{suffix}", target.path.display());
+            let mut bytes = std::fs::read(&path)?;
+            let damaged_byte = bytes.len() - 16;
+            bytes[damaged_byte] ^= 1;
+            std::fs::write(path, bytes)?;
+            owner.reload_wal_after_external_restore()?;
+            owner.publish_schema_after_external_restore()?;
+            let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
+            assert_eq!(rows, [("checkpointed".into(),), (committed,)]);
+            owner.execute("INSERT INTO secrets VALUES ('after recovery')")?;
+            owner.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
+            assert_eq!(rows.len(), 3);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn encrypted_restore_rejects_files_encrypted_with_another_key() -> anyhow::Result<()> {
     for cipher in [CIPHER_A, CIPHER_B] {
         for mvcc in [false, true] {
             let target = TempDatabaseBuilder::new()
@@ -2688,19 +2724,46 @@ fn encrypted_restore_rejects_a_file_encrypted_with_another_key() -> anyhow::Resu
                 conn.execute("CREATE TABLE secrets(value TEXT)")?;
                 conn.execute("INSERT INTO secrets VALUES ('protected value')")?;
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+                conn.execute("INSERT INTO secrets VALUES ('in sidecar'), ('in sidecar2')")?;
             }
-            let original = std::fs::read(&target.path)?;
-            std::fs::copy(&source.path, &target.path)?;
-            let error = owner.reload_wal_after_external_restore().unwrap_err();
-            assert!(matches!(
-                error,
-                LimboError::CompletionError(CompletionError::DecryptionError { .. })
-            ));
-            std::fs::write(&target.path, original)?;
+            let sidecar_suffix = if mvcc { "-log" } else { "-wal" };
+            let sidecar_path = format!("{}{sidecar_suffix}", target.path.display());
+            let mut incomplete_tail = std::fs::read(&sidecar_path)?;
+            incomplete_tail.extend_from_slice(&[0; 7]);
+            std::fs::write(&sidecar_path, incomplete_tail)?;
             owner.reload_wal_after_external_restore()?;
             owner.publish_schema_after_external_restore()?;
             let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
-            assert_eq!(rows, [("protected value".into(),)]);
+            assert_eq!(rows.len(), 3, "incomplete tail lost committed rows");
+            for suffix in ["", sidecar_suffix] {
+                let target_path = format!("{}{suffix}", target.path.display());
+                let source_path = format!("{}{suffix}", source.path.display());
+                let original = std::fs::read(&target_path)?;
+                let restored = std::fs::read(source_path)?;
+                std::fs::write(&target_path, &restored)?;
+                let result = owner.reload_wal_after_external_restore();
+                let after_reload = std::fs::read(&target_path)?;
+                std::fs::write(&target_path, original)?;
+                let error = result.expect_err(&format!("accepted {cipher} mvcc={mvcc} {suffix}"));
+                assert!(
+                    error.to_string().to_ascii_lowercase().contains("decrypt"),
+                    "{error}"
+                );
+                assert_eq!(after_reload, restored, "rejected restore changed the file");
+                let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
+                assert_eq!(rows.len(), 3, "rejected restore changed the live database");
+                owner.reload_wal_after_external_restore()?;
+                owner.publish_schema_after_external_restore()?;
+                let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
+                assert_eq!(
+                    rows,
+                    [
+                        ("protected value".into(),),
+                        ("in sidecar".into(),),
+                        ("in sidecar2".into(),)
+                    ]
+                );
+            }
         }
     }
     Ok(())
