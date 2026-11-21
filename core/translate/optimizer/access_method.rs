@@ -648,7 +648,7 @@ pub(super) fn choose_best_in_seek_candidate(
             "consider_in_seek_access_method called on non-BTree table".into(),
         ));
     };
-    if !has_in_seek_constraint(rhs_constraints) {
+    if !rhs_constraints.has_in_seek_constraint() {
         return Ok(None);
     }
 
@@ -773,14 +773,6 @@ pub(super) fn choose_best_in_seek_candidate(
     }
 
     Ok(best_in_seek)
-}
-
-/// Whether a constraint of the table is an `IN` that can drive an IN seek.
-pub(super) fn has_in_seek_constraint(constraints: &TableConstraints) -> bool {
-    constraints
-        .constraints
-        .iter()
-        .any(|c| matches!(c.operator, ConstraintOperator::In { not: false, .. }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1135,17 +1127,25 @@ fn find_best_access_method_for_btree<'a>(
     // Skip alternative access methods (in-seek, multi-index) when INDEXED BY or NOT INDEXED
     // is specified — the user explicitly requested a specific index or no index.
     if rhs_table.indexed.is_none() && rhs_table.btree().is_some_and(|b| b.has_rowid) {
-        if let Some(in_seek_method) = consider_in_seek_access_method(
-            rhs_table,
-            rhs_constraints,
-            lhs_mask,
-            where_clause,
-            table_references,
-            input_cardinality,
-            base_row_count,
-            params,
-            best_cost_with_filters,
-        )? {
+        // Without an IN constraint, consider_in_seek_access_method returns
+        // None. The check is here because the join search gets here for each
+        // join order that it tries.
+        let in_seek_method = if rhs_constraints.has_in_seek_constraint() {
+            consider_in_seek_access_method(
+                rhs_table,
+                rhs_constraints,
+                lhs_mask,
+                where_clause,
+                table_references,
+                input_cardinality,
+                base_row_count,
+                params,
+                best_cost_with_filters,
+            )?
+        } else {
+            None
+        };
+        if let Some(in_seek_method) = in_seek_method {
             let mut in_seek_method = in_seek_method;
             if let AccessMethodParams::InSeek { index, .. } = &in_seek_method.params {
                 if let Some(index) = partial_index(index.as_ref()) {

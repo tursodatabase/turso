@@ -349,6 +349,22 @@ pub struct TableConstraints {
     /// the last of them, so the candidates keep their values for the last
     /// left-side tables that the search tried.
     pub(super) lhs_mask_key: RefCell<Option<(usize, TableMask)>>,
+    /// Whether a constraint is an `IN` that can drive an IN seek, computed the
+    /// first time that the join search needs it. The search asks for each
+    /// join order that it tries, and the operators of the constraints do not
+    /// change.
+    in_seek_constraint_exists: OnceCell<bool>,
+}
+
+impl TableConstraints {
+    /// Whether a constraint of the table is an `IN` that can drive an IN seek.
+    pub(super) fn has_in_seek_constraint(&self) -> bool {
+        *self.in_seek_constraint_exists.get_or_init(|| {
+            self.constraints
+                .iter()
+                .any(|c| matches!(c.operator, ConstraintOperator::In { not: false, .. }))
+        })
+    }
 }
 
 /// Build the search terms for an automatic index.
@@ -823,6 +839,7 @@ pub fn table_constraints_from_where_clause(
         constraints: Vec::new(),
         temporary_index_terms: SmallVec::new(),
         lhs_mask_key: RefCell::new(None),
+        in_seek_constraint_exists: OnceCell::new(),
         candidates: available_indexes
             .indexes_for_table(table_reference.internal_id)
             .map_or(Vec::new(), |indexes| {

@@ -12,8 +12,8 @@ use crate::stats::AnalyzeStats;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::expr_references_any_subquery;
 use crate::translate::optimizer::access_method::{
-    choose_best_btree_candidate, choose_best_in_seek_candidate, has_in_seek_constraint,
-    AccessMethod, AccessMethodParams, BranchReadMode, ChosenInSeekCandidate,
+    choose_best_btree_candidate, choose_best_in_seek_candidate, AccessMethod, AccessMethodParams,
+    BranchReadMode, ChosenInSeekCandidate,
 };
 use crate::translate::optimizer::constraints::{
     analyze_binary_term_for_index, can_use_partial_index, partial_index_predicate_terms,
@@ -1244,7 +1244,7 @@ fn branch_has_lookup_constraint(table_constraints: &TableConstraints) -> bool {
         .candidates
         .iter()
         .all(|candidate| candidate.refs.is_empty())
-        || has_in_seek_constraint(table_constraints)
+        || table_constraints.has_in_seek_constraint()
 }
 
 /// Analyze top-level AND terms for AND-by-intersection optimization.
