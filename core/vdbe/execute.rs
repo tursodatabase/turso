@@ -11038,7 +11038,7 @@ pub fn op_function(
                     };
                     let new_name = if let Some(index_name) = renamed_autoindex {
                         index_name
-                    } else if name == rename_from {
+                    } else if entry_type.as_str() == "table" && name == rename_from {
                         rename_to.clone()
                     } else {
                         name
