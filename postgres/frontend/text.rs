@@ -35,6 +35,7 @@ impl TextType {
             return TextType::Plain;
         }
         std::iter::once(info.declared_name.as_str())
+            .chain(info.underlying_type.as_deref())
             .chain(info.base_type.as_deref())
             .find_map(
                 |name| match (name.to_ascii_uppercase().as_str(), info.array_dimensions) {

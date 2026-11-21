@@ -140,15 +140,11 @@ expect {
 }
 
 # A-21: uuid equality across case
-@compat-gap "operator:uuid = uuid"
 test uuid-equality-across-case {
     SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid;
 }
 expect {
     t
-}
-expect @tursopg {
-    1
 }
 
 # A-22: numeric(10,2) rounding half away from zero
@@ -270,15 +266,11 @@ test invalid-timestamptz {
 expect error {}
 
 # A-36: timestamptz equality across offsets
-@compat-gap "operator:timestamptz = timestamptz"
 test timestamptz-equality-across-offsets {
     SELECT '2026-10-08 14:00:00+02'::timestamptz = '2026-10-08 12:00:00Z'::timestamptz;
 }
 expect {
     t
-}
-expect @tursopg {
-    1
 }
 
 # A-37: timestamp drops offset

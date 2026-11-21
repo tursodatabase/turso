@@ -12,6 +12,12 @@ pub(crate) fn function_result_type(
     args: &dyn Fn() -> Vec<OperandType>,
 ) -> Option<OperandType> {
     let name = name.to_ascii_lowercase();
+    if matches!(
+        name.as_str(),
+        "regexp" | "array_contains" | "array_contains_all" | "array_overlap"
+    ) {
+        return Some(OperandType::Boolean);
+    }
     if !matches!(name.as_str(), "abs" | "sum" | "min" | "max" | "avg") {
         return None;
     }

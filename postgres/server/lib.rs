@@ -692,10 +692,17 @@ fn resolve_pg_type_for_column(stmt: &turso_pg::Statement, idx: usize) -> Type {
     let mut base = match info.kind {
         ColumnTypeKind::Struct | ColumnTypeKind::Union => Type::JSONB,
         _ => {
-            // Prefer the declared name (the user-visible type), then fall
-            // back to the resolved base for custom/domain types whose
-            // declared name isn't in the lookup table.
-            let mapped = sqlite_type_to_pg_type(&info.declared_name);
+            // Prefer the type a domain is based on, or a boolean that the
+            // engine stores as an INTEGER, then the declared name (the
+            // user-visible type), then fall back to the resolved base for
+            // custom/domain types whose declared name isn't in the lookup
+            // table.
+            let underlying = info
+                .underlying_type
+                .as_deref()
+                .map(sqlite_type_to_pg_type)
+                .filter(|pg_type| *pg_type != Type::TEXT);
+            let mapped = underlying.unwrap_or_else(|| sqlite_type_to_pg_type(&info.declared_name));
             if mapped == Type::TEXT {
                 info.base_type
                     .as_deref()

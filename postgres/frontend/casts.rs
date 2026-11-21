@@ -248,7 +248,8 @@ pub(crate) fn plan_cast(
 pub(crate) fn source_type(source: &OperandType) -> Option<CastType> {
     Some(match source {
         OperandType::Untyped | OperandType::Text => Text,
-        OperandType::Integer | OperandType::Boolean => Int4,
+        OperandType::Integer => Int4,
+        OperandType::Boolean => Bool,
         OperandType::Real => Float8,
         OperandType::Decimal => Numeric,
         OperandType::Blob => Bytea,
