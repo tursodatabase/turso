@@ -1049,8 +1049,7 @@ fn encode_text(
 }
 
 /// Binary format writes a value in the encoding of its column's type, not of
-/// the stored value: `count(*)` is typed text, and `coalesce(NULL::float8, 1)`
-/// holds an integer. A value that the type cannot hold is refused with 0A000.
+/// the stored value: `coalesce(NULL::float8, 1)` holds an integer. A value that the type cannot hold is refused with 0A000.
 fn encode_binary(
     encoder: &mut DataRowEncoder,
     val: &Value,
@@ -1568,11 +1567,10 @@ mod tests {
                 b"\0\0\0\x031.5",
             ),
             ("SELECT true", Type::BOOL, b"\0\0\0\x01\x01", b"\0\0\0\x01t"),
-            // The column's type, not the stored value, picks the encoding.
             (
                 "SELECT count(*) FROM t",
-                Type::TEXT,
-                b"\0\0\0\x011",
+                Type::INT8,
+                b"\0\0\0\x08\0\0\0\0\0\0\0\x01",
                 b"\0\0\0\x011",
             ),
             // json_each() returns the text of a member, which is not a number.

@@ -4,14 +4,20 @@
 
 use crate::casts::{source_type, CastType};
 use turso_core::dialect::OperandType;
+use turso_core::schema::Schema;
 
-/// abs, sum, min, max and avg of a float8 are a float8, abs, sum, min and max
-/// of a float4 are a float4, and avg of one is a float8.
+/// count is a bigint, sum of a smallint or an integer is a bigint, abs, sum,
+/// min, max and avg of a float8 are a float8, abs, sum, min and max of a float4
+/// are a float4, and avg of one is a float8.
 pub(crate) fn function_result_type(
     name: &str,
     args: &dyn Fn() -> Vec<OperandType>,
+    schema: &Schema,
 ) -> Option<OperandType> {
     let name = name.to_ascii_lowercase();
+    if name == "count" {
+        return bigint(schema);
+    }
     if matches!(
         name.as_str(),
         "regexp" | "array_contains" | "array_contains_all" | "array_overlap"
@@ -25,6 +31,9 @@ pub(crate) fn function_result_type(
     let [arg] = args.as_slice() else {
         return None;
     };
+    if name == "sum" && is_custom(arg, &["smallint", "int4"]) {
+        return bigint(schema);
+    }
     if matches!(arg, OperandType::Real) {
         return Some(OperandType::Real);
     }
@@ -36,6 +45,17 @@ pub(crate) fn function_result_type(
     } else {
         arg.clone()
     })
+}
+
+fn bigint(schema: &Schema) -> Option<OperandType> {
+    schema
+        .get_type_def_unchecked("bigint")
+        .cloned()
+        .map(OperandType::Custom)
+}
+
+fn is_custom(operand: &OperandType, names: &[&str]) -> bool {
+    matches!(operand, OperandType::Custom(type_def) if names.contains(&type_def.name.as_str()))
 }
 
 /// PostgreSQL has no arithmetic or bitwise operator on a boolean, and no
@@ -75,10 +95,6 @@ pub(crate) fn uses_sqlite_arithmetic(op: &str, operands: &dyn Fn() -> Vec<Operan
         matches!(operand, OperandType::Decimal) || is_custom(operand, &["numeric"])
     };
     (is_float(left) && is_numeric(right)) || (is_numeric(left) && is_float(right))
-}
-
-fn is_custom(operand: &OperandType, names: &[&str]) -> bool {
-    matches!(operand, OperandType::Custom(type_def) if names.contains(&type_def.name.as_str()))
 }
 
 fn is_text(operand: &OperandType) -> bool {

@@ -266,9 +266,9 @@ impl Dialect for PostgresDialect {
         &self,
         name: &str,
         args: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
-        _schema: &Schema,
+        schema: &Schema,
     ) -> Option<turso_core::dialect::OperandType> {
-        crate::typing::function_result_type(name, args)
+        crate::typing::function_result_type(name, args, schema)
     }
 
     fn resolve_operator(
