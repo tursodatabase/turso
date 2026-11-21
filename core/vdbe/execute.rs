@@ -15742,6 +15742,12 @@ pub fn op_read_cookie(
 ) -> InsnResult {
     load_insn!(ReadCookie { db, dest, cookie }, insn);
     let pager = connection.get_pager_from_database_index(db)?;
+    if let Cookie::DataVersion = cookie {
+        state.registers[*dest]
+            .set_int(pager.wal.as_ref().map_or(0, |wal| wal.data_version()) as i64);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     let mv_store = connection.mv_store_for_db(*db);
 
     let cookie_value =
@@ -15873,6 +15879,7 @@ pub fn op_set_cookie(
                 "page size is not set via SetCookie; changing it is deferred to Connection::reset_page_size"
             ),
             Cookie::FreePageCount => unreachable!("freelist page count is not set via SetCookie"),
+            Cookie::DataVersion => unreachable!("data_version is read-only"),
         };
         Ok(())
     })? {
