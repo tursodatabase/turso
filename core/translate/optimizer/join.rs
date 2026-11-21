@@ -479,6 +479,10 @@ struct WhereTermsInfo {
     /// The positions of the unconsumed terms that do more work than one simple
     /// condition.
     terms_with_extra_work: Vec<usize>,
+    /// The tables after which a term of `terms_with_extra_work` can be ready:
+    /// the outer table of an ON term of an outer join, and the tables of the
+    /// other terms.
+    tables_with_extra_work: TableMask,
 }
 
 impl JoinN {
@@ -2386,17 +2390,37 @@ impl WhereTermsInfo {
     ) -> Result<Self> {
         let terms = build_where_term_info(where_clause, table_references, subqueries, resolver)?;
         let table_connections = table_connections(num_tables, &terms)?;
-        let terms_with_extra_work = where_clause
+        let terms_with_extra_work: Vec<usize> = where_clause
             .iter()
             .zip(&terms)
             .enumerate()
             .filter(|(_, (term, info))| !term.consumed && info.extra_steps > 0)
             .map(|(term_idx, _)| term_idx)
             .collect();
+        let mut tables_with_extra_work = TableMask::default();
+        for &term_idx in &terms_with_extra_work {
+            match where_clause[term_idx]
+                .origin
+                .join_origin()
+                .and_then(JoinOrigin::outer_table)
+            {
+                Some(table_id) => {
+                    if let Some(table_idx) = table_references
+                        .joined_tables()
+                        .iter()
+                        .position(|table| table.internal_id == table_id)
+                    {
+                        tables_with_extra_work.set(table_idx)?;
+                    }
+                }
+                None => tables_with_extra_work.union_with(&terms[term_idx].table_mask)?,
+            }
+        }
         Ok(Self {
             terms,
             table_connections,
             terms_with_extra_work,
+            tables_with_extra_work,
         })
     }
 }
@@ -2441,6 +2465,11 @@ fn ready_where_work(
     rhs_table_number: usize,
     rhs_table_id: TableInternalId,
 ) -> SmallVec<[(usize, usize); 4]> {
+    // The join search calls this for each join order that it tries. After a
+    // table that is in no term with extra work, no such term can be ready.
+    if !where_terms.tables_with_extra_work.get(rhs_table_number) {
+        return SmallVec::new();
+    }
     where_terms
         .terms_with_extra_work
         .iter()
