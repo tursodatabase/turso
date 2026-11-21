@@ -1,0 +1,41 @@
+@database :memory:
+
+test json_group_object_label_ends_at_nul {
+    SELECT json_group_object(char(97,0,98), 1),
+           json(jsonb_group_object(char(97,0,98), 1)),
+           json_group_object(char(0,98), 1);
+}
+expect {
+    {"a":1}|{"a":1}|{"":1}
+}
+
+test json_object_label_keeps_nul {
+    SELECT json_object(char(97,0,98), 1);
+}
+expect {
+    {"a\u0000b":1}
+}
+
+test json_group_object_label_ends_at_nul_in_window {
+    SELECT json_group_object(k, 1) OVER (ROWS BETWEEN CURRENT ROW AND CURRENT ROW)
+    FROM (SELECT char(97,0,98) AS k);
+}
+expect {
+    {"a":1}
+}
+
+test json_group_object_blob_label_is_text {
+    SELECT json_group_object(x'610062', 1),
+           json_group_object(x'5b315d', 1),
+           json(jsonb_group_object(jsonb('{"a":2}'), 1));
+}
+expect {
+    {"a":1}|{"[1]":1}|{"L\u0017a\u00132":1}
+}
+
+test json_group_object_number_label_is_text {
+    SELECT json_group_object(7, 1), json_group_object(-1.5, 2);
+}
+expect {
+    {"7":1}|{"-1.5":2}
+}

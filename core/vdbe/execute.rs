@@ -176,7 +176,7 @@ use crate::{
     json::json_patch, json::json_quote, json::json_remove, json::json_replace, json::json_set,
     json::json_type, json::jsonb, json::jsonb_array, json::jsonb_extract, json::jsonb_insert,
     json::jsonb_object, json::jsonb_patch, json::jsonb_remove, json::jsonb_replace,
-    json::jsonb_set, json::raw_jsonb_element_len, json::Conv,
+    json::jsonb_set, json::raw_jsonb_element_len, json::Conv, vdbe::value::sqlite_text_prefix,
 };
 
 use super::{Program, ProgramState, Register};
@@ -7901,9 +7901,9 @@ fn update_agg_payload(
             };
             // SQLite skips rows whose object label is SQL NULL. A NULL value is
             // still encoded as JSON null, so only the key is filtered here.
-            if matches!(arg, Value::Null) {
+            let Some(label) = arg.cast_text_ref() else {
                 return Ok(());
-            }
+            };
             ensure_blob_arg_is_jsonb(value.as_value_ref())?;
             let Value::Blob(vec) = &mut payload[0] else {
                 mark_unlikely();
@@ -7920,7 +7920,9 @@ fn update_agg_payload(
                     // bits for obj header
                     vec.push(12);
                 }
-                append_dbtype_as_jsonb(vec, arg.as_value_ref(), Conv::ToString)?;
+                // Like jsonObjectStep in SQLite, the label is the text of the
+                // value up to its first NUL, while json_object() keeps the NUL.
+                jsonb::append_string_literal(vec, sqlite_text_prefix(&label))?;
                 append_dbtype_as_jsonb(vec, value.as_value_ref(), Conv::NotStrict)
             })();
             if appended.is_err() {

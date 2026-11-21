@@ -535,7 +535,7 @@ jsonb_group_object(label, value)
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `label` | TEXT | The key for each entry |
+| `label` | TEXT | The key for each entry. A number or BLOB is converted to text. The key ends at the first NUL character, unlike a `json_object()` label. A row with a NULL label is skipped. |
 | `value` | any | The value for each entry |
 
 **Returns:** TEXT (json_group_object) or BLOB (jsonb_group_object) -- a JSON object.
