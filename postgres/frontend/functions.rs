@@ -1509,7 +1509,7 @@ pub(crate) fn validate_pg_input(
         },
         "numeric" | "decimal" => match trimmed.parse::<f64>() {
             Ok(v) if v.is_nan() || v.is_infinite() => invalid(
-                "22003",
+                "22P02",
                 format!("invalid input syntax for type numeric: \"{input}\""),
             ),
             Ok(_) => Ok(None),
@@ -1566,7 +1566,6 @@ pub(crate) fn validate_pg_input(
         }
         "time" | "time without time zone" => Ok(check_temporal_input(input, "time")),
         "timetz" | "time with time zone" => Ok(check_temporal_input(input, "timetz")),
-        "interval" => Ok(check_interval_input(input)),
         "json" | "jsonb" => {
             if is_valid_json(trimmed) {
                 Ok(None)
@@ -1675,226 +1674,6 @@ fn check_temporal_input(input: &str, type_name: &'static str) -> Option<(String,
     }
 }
 
-/// Checks the text forms accepted by PostgreSQL's interval input function.
-///
-/// TursoPG does not store interval values yet, but `pg_input_is_valid` and
-/// `pg_input_error_info` still need to validate interval text independently of
-/// interval casts and columns.
-fn check_interval_input(input: &str) -> Option<(String, String)> {
-    let invalid = || {
-        Some((
-            format!("invalid input syntax for type interval: \"{input}\""),
-            SQLSTATE_INVALID_TEXT_REPRESENTATION.to_string(),
-        ))
-    };
-    let trimmed = input.trim();
-    if trimmed.is_empty()
-        || trimmed.eq_ignore_ascii_case("infinity")
-        || trimmed.eq_ignore_ascii_case("-infinity")
-    {
-        return if trimmed.is_empty() { invalid() } else { None };
-    }
-
-    let mut tokens: Vec<&str> = trimmed.split_ascii_whitespace().collect();
-    if tokens.first().is_some_and(|token| token.contains("@")) {
-        tokens.remove(0);
-    } else if tokens.iter().any(|token| token.contains("@")) {
-        return invalid();
-    }
-    if tokens
-        .last()
-        .is_some_and(|token| token.eq_ignore_ascii_case("ago"))
-    {
-        tokens.pop();
-    }
-    if tokens.is_empty() || tokens.iter().any(|token| token.eq_ignore_ascii_case("ago")) {
-        return invalid();
-    }
-    if tokens.len() == 1 && is_iso_interval(tokens[0]) {
-        return None;
-    }
-
-    let mut seen_units = [false; 9];
-    let mut saw_bare_number = false;
-    let mut saw_clock = false;
-    let mut index = 0;
-    while index < tokens.len() {
-        let token = tokens[index];
-        if is_interval_clock(token) {
-            if saw_clock {
-                return invalid();
-            }
-            saw_clock = true;
-            index += 1;
-            continue;
-        }
-        if is_interval_year_month(token) {
-            if seen_units[0] {
-                return invalid();
-            }
-            seen_units[0] = true;
-            index += 1;
-            continue;
-        }
-        if !is_interval_number(token) {
-            return invalid();
-        }
-
-        let Some(unit) = tokens.get(index + 1) else {
-            if saw_bare_number {
-                return invalid();
-            }
-            saw_bare_number = true;
-            index += 1;
-            continue;
-        };
-        let Some(unit_kind) = interval_unit(unit) else {
-            if saw_bare_number {
-                return invalid();
-            }
-            saw_bare_number = true;
-            index += 1;
-            continue;
-        };
-        if seen_units[unit_kind] {
-            return invalid();
-        }
-        seen_units[unit_kind] = true;
-        index += 2;
-    }
-
-    if seen_units.iter().any(|seen| *seen) || saw_bare_number || saw_clock {
-        None
-    } else {
-        invalid()
-    }
-}
-
-/// Returns the interval unit group. Duplicate units are rejected by the
-/// caller, as PostgreSQL's interval input function does.
-fn interval_unit(unit: &str) -> Option<usize> {
-    match unit.to_ascii_lowercase().as_str() {
-        "millennium" | "millenniums" | "millennia" | "century" | "centuries" | "decade"
-        | "decades" | "year" | "years" | "y" => Some(0),
-        "month" | "months" | "mon" | "mons" => Some(1),
-        "week" | "weeks" | "w" => Some(2),
-        "day" | "days" | "d" => Some(3),
-        "hour" | "hours" | "hr" | "hrs" => Some(4),
-        "minute" | "minutes" | "min" | "mins" => Some(5),
-        "second" | "seconds" | "sec" | "secs" => Some(6),
-        "millisecond" | "milliseconds" | "msec" | "msecs" | "ms" => Some(7),
-        "microsecond" | "microseconds" | "usec" | "usecs" | "us" => Some(8),
-        _ => None,
-    }
-}
-
-fn is_interval_number(text: &str) -> bool {
-    let text = text.strip_prefix(['+', '-']).unwrap_or(text);
-    if text.is_empty() {
-        return false;
-    }
-    let mut digits = 0;
-    let mut dots = 0;
-    let mut exponent = false;
-    for (index, byte) in text.bytes().enumerate() {
-        match byte {
-            b'0'..=b'9' => digits += 1,
-            b'.' if !exponent => dots += 1,
-            b'e' | b'E' if !exponent && digits > 0 => {
-                exponent = true;
-                if index + 1 == text.len() {
-                    return false;
-                }
-            }
-            b'+' | b'-' if exponent && index > 0 => {}
-            _ => return false,
-        }
-    }
-    dots <= 1 && digits > 0 && text.parse::<f64>().is_ok_and(f64::is_finite)
-}
-
-fn is_interval_year_month(text: &str) -> bool {
-    let text = text.strip_prefix(['+', '-']).unwrap_or(text);
-    let Some((year, month)) = text.split_once('-') else {
-        return false;
-    };
-    !year.is_empty()
-        && !month.is_empty()
-        && year.chars().all(|c| c.is_ascii_digit())
-        && month.chars().all(|c| c.is_ascii_digit())
-}
-
-fn is_interval_clock(text: &str) -> bool {
-    let text = text.strip_prefix(['+', '-']).unwrap_or(text);
-    let parts: Vec<&str> = text.split(':').collect();
-    if !(parts.len() == 2 || parts.len() == 3) || !is_interval_number(parts[0]) {
-        return false;
-    }
-    if parts[1].parse::<u8>().map_or(true, |minutes| minutes > 59) {
-        return false;
-    }
-    parts.len() == 2
-        || parts[2]
-            .parse::<f64>()
-            .is_ok_and(|seconds| seconds.is_finite() && (0.0..60.0).contains(&seconds))
-}
-
-fn is_iso_interval(text: &str) -> bool {
-    let Some(rest) = text.strip_prefix(['P', 'p']) else {
-        return false;
-    };
-    let Some((date, time)) = rest.split_once(['T', 't']) else {
-        return is_iso_interval_date(rest);
-    };
-    !date.is_empty() && is_iso_interval_date(date) && is_iso_interval_time(time)
-        || date.is_empty() && is_iso_interval_time(time)
-}
-
-fn is_iso_interval_date(text: &str) -> bool {
-    if text.is_empty() {
-        return false;
-    }
-    if text.chars().all(|c| c.is_ascii_digit()) {
-        return matches!(text.len(), 4 | 6 | 8);
-    }
-    if text
-        .split('-')
-        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
-    {
-        return (1..=3).contains(&text.split('-').count());
-    }
-    is_iso_interval_designated(text, &['Y', 'M', 'W', 'D'])
-}
-
-fn is_iso_interval_time(text: &str) -> bool {
-    if text.is_empty() {
-        return false;
-    }
-    if text.chars().all(|c| c.is_ascii_digit()) {
-        return true;
-    }
-    if text.contains(':') {
-        return is_interval_clock(text);
-    }
-    is_iso_interval_designated(text, &['H', 'M', 'S'])
-}
-
-fn is_iso_interval_designated(mut text: &str, units: &[char]) -> bool {
-    let mut count = 0;
-    while !text.is_empty() {
-        let Some(unit_index) = text.find(|c: char| units.contains(&c.to_ascii_uppercase())) else {
-            return false;
-        };
-        let (number, rest) = text.split_at(unit_index);
-        if !is_interval_number(number) {
-            return false;
-        }
-        text = &rest[1..];
-        count += 1;
-    }
-    count > 0
-}
-
 /// Check array values as in range with `element_type`
 fn check_array_input(
     input: &str,
@@ -1905,10 +1684,7 @@ fn check_array_input(
     };
     let elements = parse_text_array_of_texts(input);
     let Some(elements) = elements else {
-        return invalid(
-            SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-            format!("malformed array literal: \"{input}\""),
-        );
+        return invalid("22P02", format!("malformed array literal: \"{input}\""));
     };
 
     for element in elements {
