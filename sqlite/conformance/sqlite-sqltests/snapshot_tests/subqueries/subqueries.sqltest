@@ -942,9 +942,8 @@ snapshot-eqp cte-materialized-order-outer-beyond-cte {
 # FROM-CLAUSE SUBQUERY IN AN INNER LOOP
 # =============================================================================
 
-# A FROM-clause subquery that an outer join, a CROSS JOIN or an earlier
-# subquery keeps in an inner loop is stored in a table once, as SQLite does,
-# instead of running as a coroutine again for each outer row.
+# A FROM-clause subquery that is not first in the join order is stored in a
+# table once instead of running as a coroutine again for each outer row.
 
 setup watchlist_schema {
     CREATE TABLE watchlist (type_id INTEGER PRIMARY KEY, name TEXT);
@@ -1040,4 +1039,21 @@ snapshot left-join-flattenable-subquery-coroutine {
     SELECT w.type_id, h.price
     FROM watchlist w
     LEFT JOIN (SELECT type_id, price FROM history_txt WHERE price > 10) h ON w.type_id + h.price > 20;
+}
+
+setup groups_watchlist_schema {
+    CREATE TABLE watchlist (type_id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE history_txt (type_id VARCHAR, price REAL);
+    CREATE TABLE groups (a INTEGER);
+}
+
+# The planner puts the subquery after both inner-joined tables.
+@setup groups_watchlist_schema
+snapshot inner-join-subquery-after-tables-materialized {
+    SELECT count(*)
+    FROM groups g
+    JOIN watchlist w ON g.a = w.type_id
+    JOIN (
+        SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id
+    ) h ON w.name = h.avgp;
 }

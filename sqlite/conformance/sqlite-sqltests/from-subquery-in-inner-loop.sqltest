@@ -1,8 +1,7 @@
 @database :memory:
 
-# A FROM-clause subquery that an outer join, a CROSS JOIN or an earlier
-# subquery keeps in an inner loop is stored in a table once instead of running
-# as a coroutine for each outer row. These tests check the rows of that plan,
+# A FROM-clause subquery that is not first in the join order is stored in a
+# table once instead of running as a coroutine for each outer row. These tests check the rows of that plan,
 # including NULL-extended rows of the LEFT JOIN. The REAL values are cast to
 # INTEGER because the JS backend prints a REAL 6.0 as 6.
 
@@ -75,6 +74,26 @@ expect {
     3||9
     5|5|2
     5|5|9
+}
+
+# The planner puts the subquery after both inner-joined tables.
+@setup schema
+test inner-join-subquery-after-tables {
+    CREATE TABLE g (a INTEGER);
+    INSERT INTO g VALUES (1), (2), (2), (3), (7);
+    SELECT g.a, h.type_id FROM g JOIN watchlist w ON g.a = w.type_id JOIN (SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id) h ON w.name > h.avgp ORDER BY g.a, h.type_id;
+}
+expect {
+    1|9
+    2|2
+    2|2
+    2|9
+    2|9
+    3|
+    3|1
+    3|2
+    3|3
+    3|9
 }
 
 @setup schema
