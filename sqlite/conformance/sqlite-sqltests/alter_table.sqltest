@@ -2433,6 +2433,47 @@ expect {
     900
 }
 
+# A TEMP trigger on a main table lives in the temp schema, but its table is in
+# main. RENAME COLUMN on any other table (in main or attached) must still find
+# that table and leave the trigger alone.
+test alter-table-rename-column-attached-with-temp-trigger-on-main {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE tt_main_m (x);
+    CREATE TABLE aux.tt_aux_s (a);
+    CREATE TEMP TRIGGER tt_main_tr AFTER INSERT ON main.tt_main_m BEGIN SELECT 1; END;
+    ALTER TABLE aux.tt_aux_s RENAME COLUMN a TO z;
+    SELECT sql FROM aux.sqlite_schema WHERE name = 'tt_aux_s';
+}
+expect {
+    CREATE TABLE tt_aux_s (z)
+}
+
+test alter-table-rename-column-other-table-with-temp-trigger-on-main {
+    CREATE TABLE tt_m2 (x);
+    CREATE TABLE tt_s2 (a);
+    CREATE TEMP TRIGGER tt_tr2 AFTER INSERT ON tt_m2 BEGIN SELECT 1; END;
+    ALTER TABLE tt_s2 RENAME COLUMN a TO z;
+    SELECT sql FROM sqlite_schema WHERE name = 'tt_s2';
+}
+expect {
+    CREATE TABLE tt_s2 (z)
+}
+
+test alter-table-rename-column-of-main-table-with-temp-trigger {
+    CREATE TABLE tt_m3 (x);
+    CREATE TABLE tt_log3 (v);
+    CREATE TEMP TRIGGER tt_tr3 AFTER UPDATE OF x ON main.tt_m3 BEGIN
+        INSERT INTO tt_log3 VALUES (new.x);
+    END;
+    ALTER TABLE tt_m3 RENAME COLUMN x TO y;
+    INSERT INTO tt_m3 VALUES (5);
+    UPDATE tt_m3 SET y = 7;
+    SELECT * FROM tt_log3;
+}
+expect {
+    7
+}
+
 test temp-trigger-attached-read-cross-table {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.src_temp_aux_read (a INTEGER PRIMARY KEY, b);
