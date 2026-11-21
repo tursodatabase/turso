@@ -309,7 +309,7 @@ test.serial("Statement.run() [named]", async (t) => {
   t.is(info.lastInsertRowid, 3);
 });
 
-test.skip("Statement.run() with array bind parameter", async (t) => {
+test.serial("Statement.run() with array bind parameter", async (t) => {
   const db = t.context.db;
 
   db.exec(`
