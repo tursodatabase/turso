@@ -299,6 +299,10 @@ impl Dialect for PostgresDialect {
         crate::casts::plan_cast(source, target, context)
     }
 
+    fn real_columns_keep_negative_zero(&self) -> bool {
+        true
+    }
+
     fn requires_custom_types(&self) -> bool {
         true
     }
