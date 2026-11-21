@@ -2037,7 +2037,9 @@ fn rewrite_expr_to_registers(
                             } else if let Some(cm) = ins.get_col_mapping_by_name(&c) {
                                 // Use decoded excluded registers when available
                                 // to prevent double-encoding of custom type values
-                                if let Some(decoded_start) = excluded_decoded_start {
+                                if cm.column.is_rowid_alias() {
+                                    *expr = Expr::register(ins.key_register());
+                                } else if let Some(decoded_start) = excluded_decoded_start {
                                     let (col_idx, _) =
                                         table.get_column_by_name(&c).expect("column exists");
                                     *expr = decoded_column(
