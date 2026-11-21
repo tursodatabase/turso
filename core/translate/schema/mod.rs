@@ -1408,6 +1408,27 @@ pub fn translate_create_table(
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
 
     let index_regs = collect_autoindexes(&body, program, &mangled_tbl_name, resolver)?;
+
+    // SQLite compiles `SELECT * FROM t` at the end of CREATE TABLE, after all other
+    // checks, and that fails on a RAISE outside a trigger. The SELECT reads STORED
+    // columns from the row, so only VIRTUAL columns are checked. ALTER TABLE ADD
+    // COLUMN does not compile it, so this check is not in `validate_generated_expr`.
+    if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = &body {
+        for constraint in columns.iter().flat_map(|c| &c.constraints) {
+            if let ast::ColumnConstraint::Generated { expr, typ, .. } = &constraint.constraint {
+                if matches!(typ, Some(ast::GeneratedColumnType::Stored)) {
+                    continue;
+                }
+                walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+                    if matches!(e, ast::Expr::Raise(..)) {
+                        bail_parse_error!("RAISE() may only be used within a trigger-program");
+                    }
+                    Ok(WalkControl::Continue)
+                })?;
+            }
+        }
+    }
+
     if let Some(index_regs) = index_regs.as_ref() {
         for index_reg in index_regs.iter() {
             program.emit_insn(Insn::CreateBtree {
