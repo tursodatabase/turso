@@ -2268,7 +2268,6 @@ expect {
     1
 }
 
-@compat-gap "operator:timestamptz + int4"
 test now-plus-an-integer-errors {
     SELECT now() + 1;
 }
@@ -2276,7 +2275,7 @@ test now-plus-an-integer-errors {
 expect error {
     operator does not exist: timestamp with time zone \+ integer
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {
     operator does not exist: timestamptz \+ integer
 }

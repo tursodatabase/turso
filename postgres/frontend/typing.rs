@@ -38,6 +38,13 @@ pub(crate) fn function_result_type(
     })
 }
 
+/// PostgreSQL has no arithmetic or bitwise operator on a boolean.
+pub(crate) fn rejects_operator(_op: &str, operands: &dyn Fn() -> Vec<OperandType>) -> bool {
+    operands()
+        .iter()
+        .any(|operand| matches!(operand, OperandType::Boolean))
+}
+
 /// The type PostgreSQL gives values that meet in a CASE, coalesce or UNION,
 /// when one of them is a float4: the first type that every other type can be
 /// implicitly cast to, where a type that the first can be cast to takes its

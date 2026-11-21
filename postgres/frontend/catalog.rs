@@ -271,6 +271,18 @@ impl Dialect for PostgresDialect {
         crate::typing::function_result_type(name, args)
     }
 
+    fn resolve_operator(
+        &self,
+        op: &str,
+        operands: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+    ) -> turso_core::dialect::OperatorResolution {
+        if crate::typing::rejects_operator(op, operands) {
+            turso_core::dialect::OperatorResolution::Reject
+        } else {
+            turso_core::dialect::OperatorResolution::Keep
+        }
+    }
+
     fn common_type(
         &self,
         types: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,

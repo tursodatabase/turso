@@ -381,7 +381,10 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_TABLE
     } else if msg.contains("no such column") || msg.contains("column not found") {
         SQLSTATE_UNDEFINED_COLUMN
-    } else if msg.contains("no such function") || msg.contains("no such window") {
+    } else if msg.contains("no such function")
+        || msg.contains("no such window")
+        || msg.starts_with("operator does not exist: ")
+    {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.starts_with("cannot compare type ") {
         // tursopg refuses comparisons that PostgreSQL may run, and it does not know

@@ -365,7 +365,7 @@ test timestamptz-plus-untyped-literal {
 expect {
     2026-02-01 10:00:00+00
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {}
 
 # PostgreSQL resolves the untyped literal of now() - '7 days' as timestamptz.
@@ -377,7 +377,7 @@ test now-minus-untyped-literal {
 }
 @sqlstate 22007
 expect error {}
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {}
 
 @compat-gap "operator:timestamptz - timestamptz"
@@ -389,7 +389,7 @@ test timestamptz-minus-timestamptz {
 expect {
     2 days 02:30:00
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {}
 
 @compat-gap "operator:timestamp - timestamp"
@@ -401,7 +401,7 @@ test timestamp-minus-timestamp {
 expect {
     30 days 10:20:30.5
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {}
 
 # The common type of timestamptz and timestamp is timestamptz.
