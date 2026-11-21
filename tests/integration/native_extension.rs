@@ -1782,6 +1782,36 @@ fn native_writes_yield_and_keep_existing_transaction_callbacks() {
 }
 
 #[test]
+fn native_insert_returning_writes_and_returns_every_row() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let rows = Arc::new(Mutex::new(Vec::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+        "native_store",
+        VTabKind::VirtualTable,
+        RowsModule {
+            queue: queue.clone(),
+            rows: rows.clone(),
+            events: events.clone(),
+            writable: true,
+        },
+    ));
+    conn.execute("CREATE VIRTUAL TABLE store USING native_store")
+        .unwrap();
+    let mut insert = conn
+        .prepare("INSERT INTO store(value) VALUES (13), (27) RETURNING value, rowid")
+        .unwrap();
+    assert_eq!(
+        collect(&mut insert, &queue),
+        vec![
+            vec![Value::from_i64(13), Value::from_i64(-1)],
+            vec![Value::from_i64(27), Value::from_i64(-1)],
+        ]
+    );
+    assert_eq!(*rows.lock(), vec![(1, 13), (2, 27)]);
+}
+
+#[test]
 fn abandoned_native_write_does_not_apply_the_pending_update() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(Vec::new()));
