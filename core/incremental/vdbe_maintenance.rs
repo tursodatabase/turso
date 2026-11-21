@@ -181,6 +181,7 @@ fn compile_maintenance_plan(
             approx_num_labels: 48,
         },
         connection.mvcc_enabled(),
+        0,
     );
     program.prologue();
     emit_plan_to_sink(

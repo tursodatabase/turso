@@ -146,6 +146,10 @@ pub enum Token {
     #[token("@verify-materialized-views")]
     AtVerifyMaterializedViews,
 
+    /// `@compat-gap` (a test of a known difference from PostgreSQL)
+    #[token("@compat-gap")]
+    AtGap,
+
     /// `@sqlstate` (the SQLSTATE that the next `expect error` block requires)
     #[token("@sqlstate")]
     AtSqlstate,
@@ -276,6 +280,7 @@ impl fmt::Display for Token {
             Token::AtVar => write!(f, "@var"),
             Token::AtVerifyMaterializedViews => write!(f, "@verify-materialized-views"),
             Token::AtSqlstate => write!(f, "@sqlstate"),
+            Token::AtGap => write!(f, "@compat-gap"),
             Token::AtIdentifier(s) => write!(f, "@{s}"),
             Token::Setup => write!(f, "setup"),
             Token::Test => write!(f, "test"),

@@ -17,7 +17,6 @@ use crate::function::Func;
 use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
 use crate::pragma::pragma_for;
 use crate::schema::{BTreeTable, Index, IndexColumn, Schema, Table, EXPR_INDEX_SENTINEL};
-use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::CacheSize;
@@ -697,17 +696,10 @@ fn update_pragma(
             schema_was_explicit,
             program,
         ),
-        PragmaName::EncryptionKey => {
-            let value = parse_string(&value)?;
-            let key = EncryptionKey::from_hex_string(&value)?;
-            connection.set_encryption_key(key)?;
-            Ok(TransactionMode::None)
-        }
-        PragmaName::EncryptionCipher => {
-            let value = parse_string(&value)?;
-            let cipher = CipherMode::try_from(value.as_str())?;
-            connection.set_encryption_cipher(cipher)?;
-            Ok(TransactionMode::None)
+        PragmaName::EncryptionKey | PragmaName::EncryptionCipher => {
+            Err(LimboError::InvalidArgument(
+                "encryption must be configured when opening the database".into(),
+            ))
         }
         PragmaName::Synchronous => {
             use crate::SyncMode;
@@ -1748,7 +1740,7 @@ fn query_pragma(
         }
         PragmaName::EncryptionKey => {
             let msg = {
-                if connection.encryption_key.read().is_some() {
+                if connection.encryption_key.is_some() {
                     "encryption key is set for this session"
                 } else {
                     "encryption key is not set for this session"

@@ -2,20 +2,22 @@ use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
-use chrono::Utc;
-use std::{fmt, sync::Arc};
+use chrono::{DateTime, NaiveDateTime};
+use std::fmt;
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::security::roles::RoleId;
 
 use crate::roles::{connection_roles, RoleCatalog};
+use turso_core::dialect::ScalarFuncContext;
 use turso_core::types::IOResultOr;
 use turso_core::{
     exec_temporal_encode, Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions,
-    Register, Result, Value,
+    Register, Result, Value, WallClockInstant,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_DATETIME_FORMAT,
-    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
+    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR,
+    SQLSTATE_INVALID_DATETIME_FORMAT, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
     SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
     SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
     SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
@@ -26,13 +28,14 @@ use turso_pg_parser::sqlstate::{
 /// Rust type of the body (see `ScalarReturn`), so it cannot drift from what
 /// the body returns.
 macro_rules! scalar_functions {
-    ($options:expr, |$connection:ident, $args:ident| {
+    ($options:expr, |$context:ident, $connection:ident, $args:ident| {
         $($($name:literal)|+ ($arity:expr, $deterministic:expr) => $body:expr,)*
     }) => {{
         let mut options = $options;
         $($(
             #[allow(unused_variables)]
-            let step = |$connection: &Arc<Connection>, $args: &[Register]| -> Result<_> {
+            let step = |$context: &ScalarFuncContext<'_>, $args: &[Register]| -> Result<_> {
+                let $connection = $context.connection;
                 Ok($body)
             };
             options = options.extension_function(pg_scalar_function(
@@ -48,19 +51,196 @@ macro_rules! scalar_functions {
 
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     let options = register_scalar_functions(options);
-    options.extension_function(
-        pg_scalar_function(
-            "array_to_json",
-            FunctionArity::OneOf(&[1, 2]),
-            true,
-            |_, args| exec_array_to_json(args),
+    options
+        .extension_function(
+            pg_scalar_function(
+                "array_to_json",
+                FunctionArity::OneOf(&[1, 2]),
+                true,
+                |_, args| exec_array_to_json(args),
+            )
+            .receiving_argument_types(),
         )
-        .receiving_argument_types(),
-    )
+        .extension_function(
+            pg_scalar_function(
+                "date_trunc",
+                FunctionArity::OneOf(&[2, 3]),
+                true,
+                |_, args| exec_date_trunc(args),
+            )
+            .receiving_argument_types(),
+        )
+}
+
+/// date_trunc(field, timestamptz). The declared return type is timestamptz,
+/// so any other argument type fails with 0A000 instead of returning a
+/// timestamptz for a timestamp or date argument.
+fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
+    // Registered with arity 2 or 3; each argument is followed by its type.
+    if args.len() == 6 {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "date_trunc with a time zone argument is not supported".to_string(),
+            None,
+        ));
+    }
+    let (args, types) = args.split_at(args.len() / 2);
+    let argument_type = types[1].get_value().to_string();
+    if argument_type != "timestamptz" {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("date_trunc is supported only for timestamptz, not {argument_type}"),
+            None,
+        ));
+    }
+    let not_supported = |what: String| sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, what, None);
+    let field = match args[0].get_value() {
+        Value::Text(field) => field,
+        // A SQL NULL unit gives NULL. A typed NULL such as NULL::int is
+        // indistinguishable from it here, because the argument types are
+        // not available for a NULL value.
+        Value::Null => return Ok(None),
+        other => {
+            return Err(sqlstate_error(
+                SQLSTATE_UNDEFINED_FUNCTION,
+                format!(
+                    "function date_trunc({}, timestamp with time zone) does not exist",
+                    types[0].get_value()
+                ),
+                Some(format!("Got a unit argument that is not text: {other}")),
+            ))
+        }
+    };
+    let Value::Text(value) = args[1].get_value() else {
+        return Ok(None);
+    };
+    let time =
+        NaiveDateTime::parse_from_str(value.as_str(), "%Y-%m-%d %H:%M:%S%.f").map_err(|_| {
+            not_supported(format!(
+                "date_trunc is not supported for the timestamptz value \"{}\"",
+                value.as_str()
+            ))
+        })?;
+    let lowered_field = field.as_str().to_ascii_lowercase();
+    if is_time_zone_unit(&lowered_field) {
+        return Err(not_supported(format!(
+            "unit \"{lowered_field}\" not supported for type timestamp with time zone"
+        )));
+    }
+    let Some(unit) = TruncUnit::parse(field.as_str()) else {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            format!("unit \"{lowered_field}\" not recognized for type timestamp with time zone"),
+            None,
+        ));
+    };
+    let truncated = truncate_timestamp(time, unit).ok_or_else(|| {
+        not_supported(format!(
+            "date_trunc is not supported for the unit \"{}\" with the value \"{}\"",
+            field.as_str(),
+            value.as_str()
+        ))
+    })?;
+    Ok(Some(Timestamptz(timestamp_text(truncated))))
+}
+
+/// The units of PostgreSQL's interval unit table that are time zone fields,
+/// not truncation units. date_trunc refuses them with 0A000 rather than 22023.
+/// `lowered` is matched on its first 10 bytes, as in `TruncUnit::parse`.
+fn is_time_zone_unit(lowered: &str) -> bool {
+    let key = &lowered.as_bytes()[..lowered.len().min(10)];
+    matches!(key, b"timezone" | b"timezone_h" | b"timezone_m")
+}
+
+#[derive(Clone, Copy)]
+enum TruncUnit {
+    Microseconds,
+    Milliseconds,
+    Second,
+    Minute,
+    Hour,
+    Day,
+    Week,
+    Month,
+    Quarter,
+    Year,
+    Decade,
+    Century,
+    Millennium,
+}
+
+impl TruncUnit {
+    /// The unit named by `name`, spelled as in PostgreSQL's interval unit
+    /// table (deltatktbl in src/backend/utils/adt/datetime.c). PostgreSQL
+    /// matches the lowercased name on its first 10 bytes only, so
+    /// "microsecondsXY" is the unit "microsecon". None for a name that is
+    /// not a unit of date_trunc.
+    fn parse(name: &str) -> Option<Self> {
+        let lowered = name.to_ascii_lowercase();
+        let key = &lowered.as_bytes()[..lowered.len().min(10)];
+        Some(match key {
+            b"microsecon" | b"us" | b"usec" | b"usecond" | b"useconds" | b"usecs" => {
+                Self::Microseconds
+            }
+            b"millisecon" | b"ms" | b"msec" | b"msecond" | b"mseconds" | b"msecs" => {
+                Self::Milliseconds
+            }
+            b"second" | b"seconds" | b"s" | b"sec" | b"secs" => Self::Second,
+            b"minute" | b"minutes" | b"m" | b"min" | b"mins" => Self::Minute,
+            b"hour" | b"hours" | b"h" | b"hr" | b"hrs" => Self::Hour,
+            b"day" | b"days" | b"d" => Self::Day,
+            b"week" | b"weeks" | b"w" => Self::Week,
+            b"month" | b"months" | b"mon" | b"mons" => Self::Month,
+            b"quarter" | b"qtr" => Self::Quarter,
+            b"year" | b"years" | b"y" | b"yr" | b"yrs" => Self::Year,
+            b"decade" | b"decades" | b"dec" | b"decs" => Self::Decade,
+            b"century" | b"centuries" | b"c" | b"cent" => Self::Century,
+            b"millennium" | b"millennia" | b"mil" | b"mils" => Self::Millennium,
+            _ => return None,
+        })
+    }
+}
+
+/// `time` truncated to `unit`, as PostgreSQL's date_trunc does it, or None
+/// when the result is before year 1: PostgreSQL prints it as BC, which the
+/// timestamptz encoding cannot store. Weeks start on Monday; century and
+/// millennium start at years ending in 01, as in PostgreSQL.
+fn truncate_timestamp(time: NaiveDateTime, unit: TruncUnit) -> Option<NaiveDateTime> {
+    use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Timelike};
+    let date = time.date();
+    let first_day_of_year = |year: i32| NaiveDate::from_ymd_opt(year, 1, 1);
+    let day = match unit {
+        TruncUnit::Microseconds => return Some(time),
+        TruncUnit::Milliseconds => {
+            let nanos = time.nanosecond() / 1_000_000 * 1_000_000;
+            return time.with_nanosecond(nanos);
+        }
+        TruncUnit::Second => return time.with_nanosecond(0),
+        TruncUnit::Minute => return time.with_nanosecond(0)?.with_second(0),
+        TruncUnit::Hour => return time.with_nanosecond(0)?.with_second(0)?.with_minute(0),
+        TruncUnit::Day => date,
+        TruncUnit::Week => date - Duration::days(i64::from(date.weekday().num_days_from_monday())),
+        TruncUnit::Month => date.with_day(1)?,
+        TruncUnit::Quarter => {
+            NaiveDate::from_ymd_opt(date.year(), (date.month() - 1) / 3 * 3 + 1, 1)?
+        }
+        TruncUnit::Year => first_day_of_year(date.year())?,
+        TruncUnit::Decade => first_day_of_year(date.year().div_euclid(10) * 10)?,
+        TruncUnit::Century => first_day_of_year((date.year() - 1).div_euclid(100) * 100 + 1)?,
+        TruncUnit::Millennium => first_day_of_year((date.year() - 1).div_euclid(1000) * 1000 + 1)?,
+    };
+    // A year before 1 is BC in PostgreSQL. Only the decade of years 1 to 9
+    // gets here, because the other units stay in the year of `time` or start
+    // at year 1.
+    assert!(day.year() >= 0, "date_trunc result before year 0");
+    if day.year() < 1 {
+        return None;
+    }
+    Some(day.and_time(NaiveTime::MIN))
 }
 
 fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
-    scalar_functions!(options, |connection, args| {
+    scalar_functions!(options, |context, connection, args| {
         "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(connection, args)?,
         "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
             oid_arg(args, 0)?.map(|oid| exec_pg_get_user_by_id(connection, oid))
@@ -92,24 +272,35 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "pg_get_indexdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
             .and_then(|oid| crate::catalog::pg_get_indexdef(connection, oid)),
         "pg_get_triggerdef"(FunctionArity::OneOf(&[1, 2]), false) => None::<String>,
-        "obj_description"(FunctionArity::OneOf(&[1, 2]), true) => None::<String>,
         "pg_get_expr"(FunctionArity::OneOf(&[2, 3]), true) => exec_pg_get_expr(args)?,
         "to_char"(FunctionArity::Exact(2), true) => {
-            exec_to_char(args[0].get_value(), &text_arg(args, 1))
+            // to_char is strict: a NULL argument gives NULL for every argument type.
+            if args.iter().any(|arg| matches!(arg.get_value(), Value::Null)) {
+                None
+            } else {
+                exec_to_char(args[0].get_value(), &text_arg(args, 1))?
+            }
         },
+        // Registered so that the core time extension's to_timestamp, which
+        // returns a blob, never answers a PostgreSQL query.
+        "to_timestamp"(FunctionArity::OneOf(&[1, 2]), true) => Err::<Timestamptz, _>(
+            sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "to_timestamp is not supported", None,
+            )
+        )?,
         "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
             exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))
         },
         "int8_out_of_range"(FunctionArity::Exact(0), false) => Err::<i64, _>(sqlstate_error(
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-            "bigint out of range",
+            "bigint out of range", None,
         ))?,
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
         "booleq"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() == args[1].get_value()),
         "boolne"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() != args[1].get_value()),
-        "col_description"(FunctionArity::Exact(2), true) => None::<String>,
         "set_config"(FunctionArity::Exact(3), false) => exec_set_config(connection, args)?,
         "current_setting"(FunctionArity::OneOf(&[1, 2]), false) => {
             exec_current_setting(connection, args)?
@@ -146,17 +337,43 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
         },
-        "now" | "clock_timestamp" | "transaction_timestamp" | "statement_timestamp"(
-            FunctionArity::Variadic, false
-        ) => Timestamptz(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
+        // The time the transaction started, or the statement outside a
+        // transaction.
+        "now" | "transaction_timestamp"(FunctionArity::Exact(0), false) => {
+            timestamptz_at(context.statement_times().transaction)
+        },
+        "statement_timestamp"(FunctionArity::Exact(0), false) => {
+            timestamptz_at(context.statement_times().statement)
+        },
+        // The clock at each call.
+        "clock_timestamp"(FunctionArity::Exact(0), false) => {
+            timestamptz_at(context.current_time())
+        },
     })
+}
+
+/// The timestamptz of `instant`, a reading of the system clock, with
+/// microseconds as PostgreSQL keeps them.
+fn timestamptz_at(instant: WallClockInstant) -> Timestamptz {
+    let time: NaiveDateTime = DateTime::from_timestamp(instant.secs, instant.micros * 1_000)
+        .expect("a system clock reading is a valid date and time")
+        .naive_utc();
+    Timestamptz(timestamp_text(time))
+}
+
+/// The text of `time` with microseconds, without trailing zeros of the
+/// fraction and without a dot that has no digits after it, as PostgreSQL
+/// prints it.
+fn timestamp_text(time: NaiveDateTime) -> String {
+    let text = time.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
     name: &'static str,
     arity: FunctionArity,
     deterministic: bool,
-    step: fn(&Arc<Connection>, &[Register]) -> Result<O>,
+    step: fn(&ScalarFuncContext<'_>, &[Register]) -> Result<O>,
 ) -> ExternalFunc {
     ExternalFunc::new_native_scalar(
         name.to_string(),
@@ -170,7 +387,7 @@ pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
 /// A PostgreSQL function that computes its result without I/O.
 struct PgScalarFunction<O> {
     name: &'static str,
-    step: fn(&Arc<Connection>, &[Register]) -> Result<O>,
+    step: fn(&ScalarFuncContext<'_>, &[Register]) -> Result<O>,
 }
 
 impl<O> fmt::Debug for PgScalarFunction<O> {
@@ -193,8 +410,8 @@ impl<O: ScalarReturn + 'static> ScalarFunction for PgScalarFunction<O> {
 impl<O: ScalarReturn + 'static> ScalarCall for PgScalarFunction<O> {
     type Output = O;
 
-    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<O> {
-        Ok(IOResult::Done((self.step)(connection, args)?))
+    fn step(&mut self, context: &ScalarFuncContext<'_>, args: &[Register]) -> IOResultOr<O> {
+        Ok(IOResult::Done((self.step)(context, args)?))
     }
 }
 
@@ -259,6 +476,7 @@ fn exec_current_schemas(conn: &Connection, argument: &Value) -> Result<Option<St
                     "invalid input syntax for type boolean: \"{}\"",
                     text.as_str()
                 ),
+                None,
             )
         })?,
         value => match value.as_int() {
@@ -326,6 +544,7 @@ fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Option<Strin
             sqlstate_error(
                 SQLSTATE_INTERNAL_ERROR,
                 format!("unrecognized object type abbreviation: {kind_code}"),
+                None,
             )
         })?;
     let (public_privileges, owner_privileges) = kind.default_privileges();
@@ -529,6 +748,7 @@ fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Option<S
                     "invalid input syntax for type boolean: \"{}\"",
                     text.as_str()
                 ),
+                None,
             )
         })?,
         Some(value) => match value.as_int() {
@@ -557,6 +777,7 @@ fn unrecognized_parameter(name: &str) -> LimboError {
     sqlstate_error(
         SQLSTATE_UNDEFINED_OBJECT,
         format!("unrecognized configuration parameter \"{name}\""),
+        None,
     )
 }
 
@@ -579,6 +800,7 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
                 return Err(sqlstate_error(
                     SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
                     "bigint out of range",
+                    None,
                 ));
             }
             rounded as i64
@@ -590,6 +812,7 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
                     "invalid input syntax for type bigint: \"{}\"",
                     text.as_str()
                 ),
+                None,
             )
         })?,
         Value::Blob(_) => return Err(LimboError::InvalidArgument("datatype mismatch".to_string())),
@@ -604,6 +827,7 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
         return Err(sqlstate_error(
             sqlstate,
             format!("{clause} must not be negative"),
+            None,
         ));
     }
     Ok(Some(value))
@@ -621,6 +845,7 @@ pub(crate) fn role_name_in(roles: &RoleCatalog, role: RoleId) -> Result<String> 
         None => Err(sqlstate_error(
             SQLSTATE_UNDEFINED_OBJECT,
             format!("invalid role OID: {}", crate::catalog::role_oid(role)),
+            None,
         )),
     }
 }
@@ -689,6 +914,66 @@ fn exec_json_strip_nulls(value: &Value) -> Result<Option<String>> {
     Ok(Some(stripped))
 }
 
+/// Appends the rows of PostgreSQL's json_each(json): the key of each member
+/// unescaped and the text of its value as the input writes it, in the order of
+/// the input and with repeated keys kept. The engine's json_each() is SQLite's,
+/// which turns a number member into a SQL value and writes it again.
+pub(crate) fn exec_json_each(value: &Value, rows: &mut Vec<[Value; 2]>) -> Result<()> {
+    let json = match value {
+        Value::Null => return Ok(()),
+        Value::Text(text) => text.as_str(),
+        other => return Err(undefined_function("json_each", &[pg_type_name(other)])),
+    };
+    // Validate first, so the walk below can assume well-formed input.
+    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
+    let bytes = json.as_bytes();
+    let mut pos = 0;
+    skip_json_whitespace(bytes, &mut pos);
+    match bytes[pos] {
+        b'{' => pos += 1,
+        b'[' => {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "cannot deconstruct an array as an object",
+                None,
+            ))
+        }
+        _ => {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "cannot deconstruct a scalar",
+                None,
+            ))
+        }
+    }
+    // The walk decodes every string in a value, so a \u0000 or a lone surrogate
+    // anywhere in it errors as in PostgreSQL. Its copy of the value is not used.
+    let mut walked_value = String::new();
+    loop {
+        skip_json_whitespace(bytes, &mut pos);
+        match bytes[pos] {
+            b'}' => break,
+            b',' => {
+                pos += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let key = decode_json_string(json, &mut pos)?;
+        skip_json_whitespace(bytes, &mut pos);
+        pos += 1; // ':'
+        skip_json_whitespace(bytes, &mut pos);
+        let start = pos;
+        walked_value.clear();
+        copy_without_null_fields(json, &mut pos, 1, &mut walked_value)?;
+        rows.push([
+            Value::build_text(key),
+            Value::build_text(json[start..pos].to_string()),
+        ]);
+    }
+    Ok(())
+}
+
 /// `array_to_json(array [, pretty])`: the array as a JSON array, with line
 /// feeds between its elements when `pretty` is true. After the arguments come
 /// their type names, such as `boolean[]`, because an element's stored value
@@ -707,6 +992,7 @@ fn exec_array_to_json(args: &[Register]) -> Result<Option<Json>> {
                     "invalid input syntax for type boolean: \"{}\"",
                     text.as_str()
                 ),
+                None,
             )
         })?,
         Some(pretty) => !matches!(pretty, Value::Numeric(Numeric::Integer(0))),
@@ -872,6 +1158,7 @@ pub(crate) fn invalid_json() -> LimboError {
     sqlstate_error(
         SQLSTATE_INVALID_TEXT_REPRESENTATION,
         "invalid input syntax for type json",
+        None,
     )
 }
 
@@ -879,6 +1166,7 @@ pub(crate) fn unsupported_unicode_escape() -> LimboError {
     sqlstate_error(
         SQLSTATE_UNTRANSLATABLE_CHARACTER,
         "unsupported Unicode escape sequence",
+        None,
     )
 }
 
@@ -896,6 +1184,7 @@ fn copy_without_null_fields(
         return Err(sqlstate_error(
             SQLSTATE_STATEMENT_TOO_COMPLEX,
             "stack depth limit exceeded",
+            None,
         ));
     }
     match bytes[*pos] {
@@ -1045,6 +1334,7 @@ fn like_matches(text: &str, pattern: &str) -> Result<bool> {
         sqlstate_error(
             SQLSTATE_INVALID_ESCAPE_SEQUENCE,
             "LIKE pattern must not end with escape character",
+            None,
         )
     };
     let (text_bytes, pattern_bytes) = (text.as_bytes(), pattern.as_bytes());
@@ -1152,6 +1442,7 @@ fn exec_like_escape(args: &[Register]) -> Result<Option<String>> {
             return Err(sqlstate_error(
                 SQLSTATE_INVALID_ESCAPE_SEQUENCE,
                 "invalid escape string: Escape string must be empty or one character.",
+                None,
             ));
         }
     };
@@ -1174,7 +1465,7 @@ fn exec_similar_to_escape(args: &[Register]) -> Result<Option<String>> {
     match turso_pg_parser::translator::similar_to_regex(&pattern, &escape) {
         Ok(regex) => Ok(Some(regex)),
         Err(turso_pg_parser::ParseError::Sqlstate { sqlstate, message }) => {
-            Err(sqlstate_error(sqlstate, message))
+            Err(sqlstate_error(sqlstate, message, None))
         }
         Err(error) => Err(LimboError::ParseError(error.to_string())),
     }
@@ -1246,14 +1537,27 @@ fn format_type(type_oid: i64, typemod: i64) -> String {
 
 /// Simplified to_char: formats a number with the given format pattern.
 /// Supports basic PG numeric format patterns (9, 0, S, MI, FM, D, G, PR, TH, L).
-fn exec_to_char(value: &Value, format: &str) -> Option<String> {
+/// Any other argument, such as a timestamp, fails with 0A000 instead of
+/// returning NULL.
+fn exec_to_char(value: &Value, format: &str) -> Result<Option<String>> {
     let num = match value {
-        Value::Null => return None,
+        Value::Null => return Ok(None),
         Value::Numeric(_) => value.as_float(),
-        Value::Text(t) => t.as_str().parse::<f64>().ok()?,
-        _ => return None,
+        Value::Text(t) => match t.as_str().parse::<f64>() {
+            Ok(num) => num,
+            Err(_) => return Err(to_char_not_supported()),
+        },
+        _ => return Err(to_char_not_supported()),
     };
-    Some(pg_to_char_numeric(num, format))
+    Ok(Some(pg_to_char_numeric(num, format)))
+}
+
+fn to_char_not_supported() -> LimboError {
+    sqlstate_error(
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        "to_char is supported only for numbers",
+        None,
+    )
 }
 
 /// pg_input_is_valid(text, type) → boolean
@@ -1295,6 +1599,7 @@ fn undefined_function(name: &str, arg_types: &[&str]) -> LimboError {
     sqlstate_error(
         SQLSTATE_UNDEFINED_FUNCTION,
         format!("function {name}({}) does not exist", arg_types.join(", ")),
+        None,
     )
 }
 

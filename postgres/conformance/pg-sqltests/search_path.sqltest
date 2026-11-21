@@ -721,3 +721,97 @@ test cte-hides-table-of-search-path {
 expect {
     2
 }
+
+test view-keeps-its-table-when-search-path-changes {
+    CREATE SCHEMA IF NOT EXISTS sp_vt;
+    DROP VIEW IF EXISTS public.sp_vt_v;
+    DROP TABLE IF EXISTS sp_vt.t;
+    CREATE TABLE sp_vt.t (x int);
+    INSERT INTO sp_vt.t VALUES (1);
+    SET search_path TO sp_vt, public;
+    CREATE VIEW public.sp_vt_v AS SELECT t.x FROM t;
+    SET search_path TO public;
+    SELECT x FROM sp_vt_v;
+}
+expect {
+    1
+}
+
+test view-keeps-the-table-of-a-subquery-when-search-path-changes {
+    CREATE SCHEMA IF NOT EXISTS sp_vs;
+    DROP VIEW IF EXISTS public.sp_vs_v;
+    DROP TABLE IF EXISTS sp_vs.t;
+    CREATE TABLE sp_vs.t (x int);
+    INSERT INTO sp_vs.t VALUES (4);
+    SET search_path TO sp_vs, public;
+    CREATE VIEW public.sp_vs_v AS
+        SELECT (SELECT max(x) FROM t) AS m
+        WHERE EXISTS (SELECT 1 FROM (SELECT x FROM t) s)
+        ORDER BY (SELECT min(x) FROM t);
+    SET search_path TO public;
+    SELECT m FROM sp_vs_v;
+}
+expect {
+    4
+}
+
+test view-reads-the-table-it-was-created-on-not-a-later-table-of-its-own-schema {
+    CREATE SCHEMA IF NOT EXISTS sp_vl;
+    DROP VIEW IF EXISTS public.sp_vl_v;
+    DROP TABLE IF EXISTS sp_vl.sp_vl_t;
+    DROP TABLE IF EXISTS public.sp_vl_t;
+    CREATE TABLE sp_vl.sp_vl_t (x int);
+    INSERT INTO sp_vl.sp_vl_t VALUES (1);
+    SET search_path TO sp_vl, public;
+    CREATE VIEW public.sp_vl_v AS SELECT x FROM sp_vl_t;
+    CREATE TABLE public.sp_vl_t (x int);
+    INSERT INTO public.sp_vl_t VALUES (2);
+    SELECT x FROM public.sp_vl_v;
+}
+expect {
+    1
+}
+
+test view-cte-is-not-bound-to-a-table-of-the-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_vc;
+    DROP VIEW IF EXISTS public.sp_vc_v;
+    DROP TABLE IF EXISTS sp_vc.t;
+    CREATE TABLE sp_vc.t (x int);
+    INSERT INTO sp_vc.t VALUES (1);
+    SET search_path TO sp_vc, public;
+    CREATE VIEW public.sp_vc_v AS WITH t AS (SELECT 2 AS x) SELECT x FROM t;
+    SET search_path TO public;
+    SELECT x FROM sp_vc_v;
+}
+expect {
+    2
+}
+
+test drop-table-refuses-when-a-view-found-it-through-the-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_vd;
+    DROP VIEW IF EXISTS public.sp_vd_v;
+    DROP TABLE IF EXISTS sp_vd.t;
+    CREATE TABLE sp_vd.t (x int);
+    SET search_path TO sp_vd, public;
+    CREATE VIEW public.sp_vd_v AS SELECT x FROM t;
+    SET search_path TO public;
+    DROP TABLE sp_vd.t;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop table sp_vd.t because other objects depend on it
+}
+
+test drop-table-refuses-when-a-view-reads-it-by-schema-next-to-a-cte-of-its-name {
+    DROP VIEW IF EXISTS sp_vq_v;
+    DROP TABLE IF EXISTS sp_vq;
+    CREATE TABLE sp_vq (x int);
+    CREATE VIEW sp_vq_v AS
+        WITH sp_vq AS (SELECT 9 AS x)
+        SELECT x FROM sp_vq UNION ALL SELECT x FROM public.sp_vq;
+    DROP TABLE sp_vq;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop table sp_vq because other objects depend on it
+}

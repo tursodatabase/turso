@@ -366,6 +366,60 @@ impl Statement {
         &self.program
     }
 
+    /// Sets the memory budget of every hash table the statement builds and
+    /// returns the number of hash tables it builds.
+    #[cfg(feature = "test_helper")]
+    pub fn set_hash_build_mem_budget(&mut self, bytes: usize) -> usize {
+        let mut hash_builds = 0;
+        for (insn, _) in &mut Arc::make_mut(&mut self.program.prepared).insns {
+            if let vdbe::insn::Insn::HashBuild { data } = insn {
+                data.mem_budget = bytes;
+                hash_builds += 1;
+            }
+        }
+        hash_builds
+    }
+
+    /// Each place in the program that compares values, with the collation it
+    /// compares them with: the instructions, and the keys of the ephemeral
+    /// indexes. Functions and aggregates that never compare values carry an
+    /// unused collation, so they are left out.
+    #[cfg(feature = "test_helper")]
+    pub fn comparison_collations(&self) -> Vec<(String, crate::CollationSeq)> {
+        use vdbe::{builder::CursorType, insn::Insn};
+
+        let program = &self.program.prepared;
+        let instructions = program
+            .insns
+            .iter()
+            .filter(|(insn, _)| match insn {
+                Insn::Function { func, .. } => func.func.needs_collation(),
+                Insn::AggStep { data } => data.func.compares_values(),
+                _ => true,
+            })
+            .flat_map(|(insn, _)| {
+                insn.collations()
+                    .into_iter()
+                    .map(move |collation| (format!("{insn:?}"), collation))
+            });
+        let index_keys = program
+            .cursor_ref
+            .iter()
+            .filter_map(|(_, cursor_type)| match cursor_type {
+                CursorType::BTreeIndex(index) if index.ephemeral => Some(index),
+                _ => None,
+            })
+            .flat_map(|index| {
+                index.columns.iter().map(move |column| {
+                    (
+                        format!("key {} of index {}", column.name, index.name),
+                        column.collation,
+                    )
+                })
+            });
+        instructions.chain(index_keys).collect()
+    }
+
     pub fn get_connection(&self) -> &Arc<Connection> {
         &self.connection
     }
@@ -853,6 +907,12 @@ impl Statement {
     /// the statement that runs it, as SQLite does.
     pub(crate) fn set_current_time(&mut self, now: crate::WallClockInstant) {
         self.state.current_time = Some(now);
+    }
+
+    /// Makes a trigger or foreign key action see the statement and
+    /// transaction times of the statement that runs it.
+    pub(crate) fn set_statement_times(&mut self, times: crate::dialect::StatementTimes) {
+        self.state.statement_times = Some(times);
     }
 
     /// Makes a trigger or foreign key action stop at the deadline of the
@@ -1461,46 +1521,44 @@ impl Statement {
 
     /// Returns the SQL text with every parameter marker replaced by the
     /// literal of its currently bound value (NULL when unbound), following
-    /// SQLite's sqlite3_expanded_sql rendering. The text is re-tokenized
-    /// with the lexer — whose token stream partitions the input, emitting
-    /// whitespace and comments as TK_NONE tokens carrying their bytes — so
-    /// string literals, quoted identifiers and comments are never mistaken
-    /// for markers. Each TK_VARIABLE token resolves to its bind index from
-    /// its own text: `?N` carries the number, named markers are looked up
-    /// in the parameter table (the same marker can occur several times),
+    /// SQLite's sqlite3_expanded_sql rendering. The dialect finds the
+    /// markers, so string literals, quoted identifiers and comments are
+    /// never mistaken for markers. Each marker resolves to its bind index
+    /// from its own text: `?N` carries the number, named markers are looked
+    /// up in the parameter table (the same marker can occur several times),
     /// and a bare `?` takes one more than the largest number assigned so
     /// far, which is SQLite's numbering rule.
     pub fn expanded_sql(&self) -> String {
         let sql = self.get_sql();
+        let Ok(markers) = self.connection.dialect().parameter_marker_ranges(sql) else {
+            // The statement already parsed once, so finding its markers
+            // cannot fail; return the unexpanded SQL if it somehow does.
+            return sql.to_string();
+        };
         let params = &self.program.parameters;
         let mut out = String::with_capacity(sql.len());
         let mut max_index = 0usize;
-        for token in turso_parser::lexer::Lexer::new(sql.as_bytes()) {
-            let Ok(token) = token else {
-                // The statement already parsed once, so re-lexing its text
-                // cannot fail; return the unexpanded SQL if it somehow does.
-                return sql.to_string();
-            };
-            if token.token_type == turso_parser::token::TokenType::TK_VARIABLE {
-                let text = String::from_utf8_lossy(token.value);
-                let index = if let Some(digits) = text.strip_prefix('?') {
-                    if digits.is_empty() {
-                        max_index + 1
-                    } else {
-                        digits.parse().unwrap_or(0)
-                    }
+        let mut copied_up_to = 0;
+        for marker in markers {
+            out.push_str(&sql[copied_up_to..marker.start]);
+            copied_up_to = marker.end;
+            let text = &sql[marker];
+            let index = if let Some(digits) = text.strip_prefix('?') {
+                if digits.is_empty() {
+                    max_index + 1
                 } else {
-                    params.index(text.as_ref()).map_or(0, |i| i.get())
-                };
-                max_index = max_index.max(index);
-                let value = NonZero::new(index)
-                    .map(|i| self.state.get_parameter(i))
-                    .unwrap_or(Value::Null);
-                append_expanded_literal(&mut out, &value);
+                    digits.parse().unwrap_or(0)
+                }
             } else {
-                out.push_str(&String::from_utf8_lossy(token.value));
-            }
+                params.index(text).map_or(0, |i| i.get())
+            };
+            max_index = max_index.max(index);
+            let value = NonZero::new(index)
+                .map(|i| self.state.get_parameter(i))
+                .unwrap_or(Value::Null);
+            append_expanded_literal(&mut out, &value);
         }
+        out.push_str(&sql[copied_up_to..]);
         out
     }
 
@@ -1575,6 +1633,12 @@ impl Statement {
                 tracing::error!("Statement reset panicked during best-effort cleanup");
             }
         }
+    }
+
+    /// Sets the number of trigger and foreign key action programs that execute
+    /// this statement, one inside the other.
+    pub(crate) fn set_subprogram_depth(&mut self, depth: usize) {
+        self.state.subprogram_depth = depth;
     }
 
     /// Lightweight reset for reusing a cached subprogram statement.
@@ -1868,9 +1932,6 @@ fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::roles::SessionRole;
-    use crate::SqliteDialect;
-    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
 
     /// Callers move a `Statement` by value while they build it and wrap it,
     /// and every copy is a stack slot in the caller's frame. Those frames stay
@@ -1879,328 +1940,5 @@ mod tests {
     #[test]
     fn statement_stays_small() {
         assert!(std::mem::size_of::<Statement>() <= 1024);
-    }
-
-    #[test]
-    fn cloned_halt_retains_constraint_context() {
-        assert_cloned_constraint_context(
-            "INSERT INTO parent VALUES (1, 'b', 1)",
-            crate::ConstraintKind::PrimaryKey,
-            "parent",
-            "id",
-        );
-    }
-
-    #[test]
-    fn cloned_halt_if_null_retains_constraint_context() {
-        assert_cloned_constraint_context(
-            "INSERT INTO parent VALUES (2, NULL, 1)",
-            crate::ConstraintKind::NotNull,
-            "parent",
-            "code",
-        );
-    }
-
-    #[test]
-    fn cloned_fk_counter_retains_constraint_context() {
-        assert_cloned_constraint_context(
-            "UPDATE child SET pid = 99",
-            crate::ConstraintKind::ForeignKey,
-            "child",
-            "pid",
-        );
-    }
-
-    fn assert_cloned_constraint_context(
-        sql: &str,
-        kind: crate::ConstraintKind,
-        table: &str,
-        column: &str,
-    ) {
-        use crate::vdbe::{execute, insn::Insn};
-
-        let conn = constraint_test_connection();
-        let mut stmt = conn.prepare(sql).unwrap();
-        let insn = stmt
-            .program
-            .insns
-            .iter()
-            .find_map(|(insn, _)| {
-                let matches = match kind {
-                    crate::ConstraintKind::PrimaryKey => matches!(
-                        insn,
-                        Insn::Halt {
-                            err_code: crate::error::SQLITE_CONSTRAINT_PRIMARYKEY,
-                            ..
-                        }
-                    ),
-                    crate::ConstraintKind::NotNull => matches!(insn, Insn::HaltIfNull { .. }),
-                    crate::ConstraintKind::ForeignKey => matches!(
-                        insn,
-                        Insn::FkCounter {
-                            increment_value: 1,
-                            deferred: false,
-                            ..
-                        }
-                    ),
-                    _ => unreachable!(),
-                };
-                matches.then(|| insn.clone())
-            })
-            .expect("constraint instruction");
-        for index in 0..stmt.state.column_count() {
-            stmt.state
-                .set_register(index, vdbe::Register::Value(Value::from_i64(99)));
-        }
-        let error = match &insn {
-            Insn::Halt { .. } => execute::op_halt(
-                &stmt.program,
-                &mut stmt.state,
-                &insn,
-                &stmt.connection,
-                &stmt.pager,
-            )
-            .err()
-            .expect("constraint error"),
-            Insn::HaltIfNull { target_reg, .. } => {
-                stmt.state
-                    .set_register(*target_reg, vdbe::Register::Value(Value::Null));
-                execute::op_halt_if_null(
-                    &stmt.program,
-                    &mut stmt.state,
-                    &insn,
-                    &stmt.connection,
-                    &stmt.pager,
-                )
-                .err()
-                .expect("constraint error")
-            }
-            Insn::FkCounter { .. } => {
-                execute::op_fk_counter(
-                    &stmt.program,
-                    &mut stmt.state,
-                    &insn,
-                    &stmt.connection,
-                    &stmt.pager,
-                )
-                .unwrap();
-                Box::new(stmt.state.immediate_foreign_key_error())
-            }
-            _ => unreachable!(),
-        };
-        let LimboError::ConstraintViolation(violation) = *error else {
-            panic!("expected structured constraint: {error:?}");
-        };
-        assert_eq!(violation.kind, kind);
-        assert_eq!(violation.table_name.as_deref(), Some(table));
-        assert_eq!(violation.column_names, vec![column]);
-        assert!(!violation.values.is_empty());
-    }
-
-    #[test]
-    fn internal_constraint_errors_are_structured() {
-        for (sql, kind, message, foreign_key, extended_code) in constraint_error_cases() {
-            let conn = constraint_test_connection();
-            let mut stmt = conn.prepare(sql).unwrap();
-            let error = loop {
-                match stmt.step_with_structured_errors() {
-                    Err(error) => break error,
-                    Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
-                        stmt.pager.io.step().unwrap();
-                    }
-                    Ok(result) => panic!("expected constraint error, got {result:?}: {sql}"),
-                }
-            };
-            let LimboError::ConstraintViolation(violation) = &error else {
-                panic!("{sql}: {error:?}");
-            };
-            assert_eq!(violation.kind, kind, "{sql}");
-            assert_eq!(error.to_string(), message, "{sql}");
-            assert_eq!(error.is_foreign_key_constraint(), foreign_key, "{sql}");
-            assert_eq!(error.sqlite_result_code(), 19, "{sql}");
-            assert_eq!(error.sqlite_extended_result_code(), extended_code, "{sql}");
-        }
-    }
-
-    fn constraint_error_cases(
-    ) -> [(&'static str, crate::ConstraintKind, &'static str, bool, i32); 13] {
-        [
-            (
-                "INSERT INTO parent VALUES (1, 'b', 1)",
-                crate::ConstraintKind::PrimaryKey,
-                "UNIQUE constraint failed: parent.id",
-                false,
-                1555,
-            ),
-            (
-                "INSERT INTO parent VALUES (2, 'a', 1)",
-                crate::ConstraintKind::Unique,
-                "UNIQUE constraint failed: parent.code",
-                false,
-                2067,
-            ),
-            (
-                "INSERT INTO parent VALUES (2, NULL, 1)",
-                crate::ConstraintKind::NotNull,
-                "NOT NULL constraint failed: parent.code",
-                false,
-                1299,
-            ),
-            (
-                "INSERT INTO parent VALUES (2, 'b', -1)",
-                crate::ConstraintKind::Check,
-                "CHECK constraint failed: positive",
-                false,
-                275,
-            ),
-            (
-                "INSERT INTO child VALUES (99)",
-                crate::ConstraintKind::ForeignKey,
-                "FOREIGN KEY constraint failed",
-                true,
-                787,
-            ),
-            (
-                "DELETE FROM parent",
-                crate::ConstraintKind::ForeignKey,
-                "FOREIGN KEY constraint failed",
-                true,
-                787,
-            ),
-            (
-                "INSERT INTO deferred_child VALUES (99)",
-                crate::ConstraintKind::ForeignKey,
-                "FOREIGN KEY constraint failed",
-                true,
-                787,
-            ),
-            (
-                "INSERT INTO trigger_source VALUES (1)",
-                crate::ConstraintKind::PrimaryKey,
-                "UNIQUE constraint failed: parent.id",
-                false,
-                1555,
-            ),
-            (
-                "INSERT INTO text_key VALUES ('k')",
-                crate::ConstraintKind::PrimaryKey,
-                "UNIQUE constraint failed: text_key.k",
-                false,
-                1555,
-            ),
-            (
-                "INSERT INTO pair_key VALUES (1, 1)",
-                crate::ConstraintKind::PrimaryKey,
-                "UNIQUE constraint failed: pair_key.a, pair_key.b",
-                false,
-                1555,
-            ),
-            (
-                "UPDATE pair_key SET b = 1 WHERE b = 2",
-                crate::ConstraintKind::PrimaryKey,
-                "UNIQUE constraint failed: pair_key.a, pair_key.b",
-                false,
-                1555,
-            ),
-            (
-                "INSERT INTO pair_key VALUES (1, 2) ON CONFLICT DO UPDATE SET b = 1",
-                crate::ConstraintKind::PrimaryKey,
-                "UNIQUE constraint failed: pair_key.a, pair_key.b",
-                false,
-                1555,
-            ),
-            (
-                "INSERT INTO strict_int VALUES ('x')",
-                crate::ConstraintKind::Datatype,
-                "cannot store TEXT value in INTEGER column strict_int.a",
-                false,
-                3091,
-            ),
-        ]
-    }
-
-    fn constraint_test_connection() -> Arc<crate::Connection> {
-        let conn = open_test_connection().unwrap();
-        conn.set_foreign_keys_enabled(true);
-        for sql in [
-            "CREATE TABLE parent (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, score INTEGER CONSTRAINT positive CHECK (score > 0))",
-            "CREATE TABLE child (pid INTEGER REFERENCES parent(id))",
-            "CREATE TABLE deferred_child (pid INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
-            "CREATE TABLE trigger_source (id INTEGER)",
-            "CREATE TRIGGER duplicate_parent AFTER INSERT ON trigger_source BEGIN INSERT INTO parent VALUES (NEW.id, 'b', 1); END",
-            "INSERT INTO parent VALUES (1, 'a', 1)",
-            "INSERT INTO child VALUES (1)",
-            "CREATE TABLE text_key (k TEXT PRIMARY KEY)",
-            "INSERT INTO text_key VALUES ('k')",
-            "CREATE TABLE pair_key (a, b, PRIMARY KEY (a, b))",
-            "INSERT INTO pair_key VALUES (1, 1), (1, 2)",
-            "CREATE TABLE strict_int (a INTEGER) STRICT",
-            "CREATE TABLE raise_abort (a)",
-            "CREATE TRIGGER raise_abort_trigger BEFORE INSERT ON raise_abort BEGIN SELECT RAISE(ABORT, 'nope'); END",
-            "CREATE TABLE unique_rollback (a UNIQUE ON CONFLICT ROLLBACK)",
-            "INSERT INTO unique_rollback VALUES (1)",
-        ] {
-            conn.execute(sql).unwrap();
-        }
-        conn
-    }
-
-    fn open_test_connection() -> crate::Result<Arc<crate::Connection>> {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            ":memory:",
-            OpenFlags::Create,
-            DatabaseOpts::new(),
-            None,
-            Arc::new(SqliteDialect),
-        )?;
-        db.connect(ConnectOpts::new(SessionRole::Superuser))
-    }
-
-    /// A hash join inside a correlated subquery is built once and probed once per
-    /// outer row. The budget is forced down so the build spills in every build
-    /// profile; the second and third passes then go through the grace phase and
-    /// must count the same rows as the first (#9774).
-    #[test]
-    fn test_spilled_hash_join_counts_the_same_on_every_probe_pass() {
-        let conn = open_test_connection().unwrap();
-        for sql in [
-            "CREATE TABLE a(x INTEGER PRIMARY KEY, y INT)",
-            "CREATE TABLE c(k INT, v INT)",
-            "CREATE TABLE d(k INT, w INT)",
-            "INSERT INTO a VALUES (1, 0), (2, 1000000), (3, 1000000)",
-            "INSERT INTO c SELECT value % 50, value FROM generate_series(1, 1000)",
-            "INSERT INTO d SELECT value % 70, value FROM generate_series(1, 1000)",
-        ] {
-            conn.execute(sql).unwrap();
-        }
-        let mut stmt = conn
-            .prepare(
-                "SELECT a.x, (SELECT count(*) FROM c JOIN d ON c.k = d.k AND d.w < a.y) FROM a",
-            )
-            .unwrap();
-        let mut hash_builds = 0;
-        for (insn, _) in &mut Arc::make_mut(&mut stmt.program.prepared).insns {
-            if let vdbe::insn::Insn::HashBuild { data } = insn {
-                data.mem_budget = 32 * 1024;
-                hash_builds += 1;
-            }
-        }
-        assert_eq!(hash_builds, 1, "the join must be built once and reused");
-
-        let rows = stmt.run_collect_rows().unwrap();
-        let expected: Vec<Vec<Value>> = [[1, 0], [2, 14400], [3, 14400]]
-            .iter()
-            .map(|row| row.iter().copied().map(Value::from_i64).collect())
-            .collect();
-        assert_eq!(rows, expected);
-
-        let metrics = stmt.metrics().hash_join;
-        assert!(metrics.spill_chunks > 0, "build did not spill: {metrics:?}");
-        assert!(
-            metrics.grace_partitions_processed > 0,
-            "no pass went through grace: {metrics:?}"
-        );
     }
 }

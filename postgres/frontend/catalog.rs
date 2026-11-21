@@ -21,12 +21,14 @@ use turso_core::{
     text_array_literal, walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError,
     NamespaceId, NamespaceRef, OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
 };
+use turso_core::{Dependent, DependentObject};
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{self, RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
 
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
+use turso_pg_parser::translator::{PG_CLASS_OID, PG_NAMESPACE_OID};
 
 /// PostgreSQL uses OID zero when no object is referenced.
 const PG_INVALID_OID: i64 = 0;
@@ -97,6 +99,10 @@ impl Dialect for PostgresDialect {
         sql: &str,
     ) -> Result<turso_parser::ast::ColumnDefinition> {
         Ok(turso_parser::parser::Parser::new(sql.as_bytes()).parse_column_definition(true)?)
+    }
+
+    fn parameter_marker_ranges(&self, sql: &str) -> Result<Vec<std::ops::Range<usize>>> {
+        turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
     }
 
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
@@ -252,16 +258,31 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn relation_name_in_messages(
+        &self,
+        connection: &Connection,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> String {
+        relation_name(connection, schema, namespace, name)
+    }
+
+    fn relation_dependents(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Vec<Dependent> {
+        relation_dependents(schema, namespace, name)
+    }
+
     fn supports_namespaces(&self) -> bool {
         true
     }
 
     fn relation_names_unique_across_kinds(&self) -> bool {
         true
-    }
-
-    fn supports_relation_ddl_in_attached_databases(&self) -> bool {
-        false
     }
 
     fn supports_capture_data_changes(&self) -> bool {
@@ -280,36 +301,8 @@ impl Dialect for PostgresDialect {
         crate::schema_state::build_schema_state(schema, results)
     }
 
-    fn translate_relation_changes(
-        &self,
-        program: &mut turso_core::ProgramBuilder,
-        schema: &Schema,
-        connection: &Arc<Connection>,
-        changes: &[turso_core::RelationChange<'_>],
-    ) -> turso_core::Result<()> {
-        crate::classes::translate_relation_changes(program, schema, connection, changes)
-    }
-
-    fn translate_access_statement(
-        &self,
-        program: &mut turso_core::ProgramBuilder,
-        schema: &Schema,
-        connection: &Arc<Connection>,
-        statement: &turso_core::AccessStatement<'_>,
-    ) -> turso_core::Result<()> {
-        match statement {
-            turso_core::AccessStatement::CreateRole { name, options } => {
-                crate::roles::translate_create_role(program, schema, name, options)
-            }
-            turso_core::AccessStatement::GrantRole {
-                revoke,
-                roles,
-                grantees,
-            } => crate::auth_members::translate_grant_role(
-                program, schema, connection, *revoke, roles, grantees,
-            ),
-            _ => crate::classes::translate_access_statement(program, schema, connection, statement),
-        }
+    fn catalog(&self) -> &dyn turso_core::Catalog {
+        &crate::classes::PostgresCatalog
     }
 
     /// The built-in superuser is found by its name, `postgres`, too.
@@ -390,6 +383,10 @@ impl Dialect for PostgresDialect {
 
     fn errors_on_zero_divisor(&self) -> bool {
         true
+    }
+
+    fn write_array_blob_element(&self, out: &mut String, blob: &[u8]) {
+        out.push_str(&crate::text::encode_bytea(blob, true));
     }
 
     fn sort_term_matching(&self) -> SortTermMatching {
@@ -504,13 +501,13 @@ fn schema_name_of(schema: &Schema, namespace: NamespaceId) -> &str {
 }
 
 /// OID of the public schema, which initdb gives it.
-const PUBLIC_NAMESPACE_OID: i64 = 2200;
+pub(crate) const PUBLIC_NAMESPACE_OID: i64 = 2200;
 
 /// What is added to the id of a namespace to get the OID of its
 /// schema.
 const FIRST_USER_SCHEMA_OID: i64 = 16384;
 
-fn namespace_oid(schema: &Schema, namespace: NamespaceId) -> i64 {
+pub(crate) fn namespace_oid(schema: &Schema, namespace: NamespaceId) -> i64 {
     if schema.namespace_name(namespace) == Some("public") {
         return PUBLIC_NAMESPACE_OID;
     }
@@ -692,7 +689,7 @@ impl SnapshotRows for PgClassTable {
         )";
     /// Fixed PostgreSQL OID of pg_class, which describes tables and indexes.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(1259);
+    const TABLE_OID: Option<i64> = Some(PG_CLASS_OID);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -851,7 +848,7 @@ impl SnapshotRows for PgNamespaceTable {
         )";
     /// Fixed PostgreSQL OID of pg_namespace, which describes schemas.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(2615);
+    const TABLE_OID: Option<i64> = Some(PG_NAMESPACE_OID);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 5;
 
@@ -893,25 +890,6 @@ impl SnapshotRows for PgNamespaceTable {
             ]);
         }
         rows
-    }
-}
-
-#[derive(Debug)]
-struct PgDescriptionTable;
-
-impl SnapshotRows for PgDescriptionTable {
-    const SCHEMA: &'static str = "CREATE TABLE pg_description (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)";
-    const TABLE_OID: Option<i64> = None;
-    const ESTIMATED_COST: f64 = 1.0;
-    const ESTIMATED_ROWS: u32 = 1;
-
-    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        vec![vec![
-            Value::from_i64(2200),
-            Value::from_i64(PgNamespaceTable::TABLE_OID.unwrap()),
-            Value::from_i64(0),
-            Value::build_text("standard public schema"),
-        ]]
     }
 }
 
@@ -2400,10 +2378,7 @@ impl SnapshotRows for PgConstraintTable {
                     .iter()
                     .find(|index| index.table_oid == table_oid && index.primary)
                     .expect("rowid primary keys have a catalog index");
-                let conname = btree
-                    .primary_key_constraint_name
-                    .clone()
-                    .unwrap_or_else(|| format!("{table_name}_pkey"));
+                let conname = primary_key_constraint_name(btree);
                 let conkey: String = btree
                     .primary_key_columns
                     .iter()
@@ -2456,15 +2431,9 @@ impl SnapshotRows for PgConstraintTable {
                 };
                 let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
                 let conname = if primary {
-                    btree
-                        .primary_key_constraint_name
-                        .clone()
-                        .unwrap_or_else(|| format!("{table_name}_pkey"))
+                    primary_key_constraint_name(btree)
                 } else {
-                    us.constraint_name.clone().unwrap_or_else(|| {
-                        let cols_str = col_names.join("_");
-                        format!("{table_name}_{cols_str}_key")
-                    })
+                    unique_constraint_name(btree, us)
                 };
 
                 // Build conkey: space-separated 1-based attnums
@@ -2870,9 +2839,20 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         crate::unnest::Unnest,
     );
     options = options.native_module(
+        "pg_json_each",
+        VTabKind::TableValuedFunction,
+        crate::options::TwoColumnFunction {
+            schema: "CREATE TABLE pg_json_each (key TEXT, value TEXT, input TEXT HIDDEN)",
+            append_rows: crate::functions::exec_json_each,
+        },
+    );
+    options = options.native_module(
         "pg_options_to_table",
         VTabKind::TableValuedFunction,
-        crate::options::PgOptionsToTable,
+        crate::options::TwoColumnFunction {
+            schema: "CREATE TABLE pg_options_to_table (option_name TEXT, option_value TEXT, options_array TEXT HIDDEN)",
+            append_rows: crate::options::append_options,
+        },
     );
     options = options.native_module(
         "pg_class",
@@ -3048,11 +3028,6 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             )"
             .to_string(),
         },
-    );
-    options = options.native_module(
-        "pg_description",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgDescriptionTable>(PhantomData),
     );
     options = options.native_module(
         "pg_seclabels",
@@ -3368,7 +3343,7 @@ impl SnapshotRows for PgSettingsTable {
     }
 }
 
-#[derive(strum::IntoStaticStr)]
+#[derive(Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
 enum DependencyKind {
     #[strum(serialize = "n")]
     Normal,
@@ -3378,6 +3353,7 @@ enum DependencyKind {
     Internal,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct ObjectAddress {
     catalog_oid: i64,
     object_oid: i64,
@@ -3543,6 +3519,13 @@ impl SnapshotRows for PgDependTable {
 
         // A sequence owned by a column depends on it: internally for identity columns, automatically otherwise.
         let schema = conn.current_schema();
+        rows.extend(
+            view_rule_dependencies(&schema)
+                .into_iter()
+                .map(|dependency| {
+                    dependency_row(dependency.dependent, dependency.referenced, dependency.kind)
+                }),
+        );
         for (namespace, table_name, table, table_oid) in user_tables_with_oids(&schema) {
             for (index, column) in table.columns().iter().enumerate() {
                 let Some(column_name) = column.name.as_deref() else {
@@ -3574,6 +3557,150 @@ impl SnapshotRows for PgDependTable {
         rows
     }
 }
+
+/// One row of pg_depend: `dependent` depends on `referenced`.
+struct Dependency {
+    dependent: ObjectAddress,
+    referenced: ObjectAddress,
+    kind: DependencyKind,
+}
+
+/// The pg_depend rows of the views' `_RETURN` rules: each rule is part of
+/// its view, and depends on every table and view that the view reads.
+fn view_rule_dependencies(schema: &Schema) -> Vec<Dependency> {
+    let mut dependencies = Vec::new();
+    for rule in view_rules(schema) {
+        let rule_address = ObjectAddress::rule(rule.oid);
+        dependencies.push(Dependency {
+            dependent: rule_address,
+            referenced: ObjectAddress::whole::<PgClassTable>(rule.view_oid),
+            kind: DependencyKind::Internal,
+        });
+        let mut read_oids: Vec<i64> = schema
+            .referenced_tables_of(rule.namespace, &rule.view.select_stmt)
+            .iter()
+            .filter_map(|(namespace, name)| stored_relation_oid(schema, *namespace, name))
+            .collect();
+        read_oids.sort_unstable();
+        read_oids.dedup();
+        for read_oid in read_oids {
+            dependencies.push(Dependency {
+                dependent: rule_address,
+                referenced: ObjectAddress::whole::<PgClassTable>(read_oid),
+                kind: DependencyKind::Normal,
+            });
+        }
+    }
+    dependencies
+}
+
+/// The views that depend on the table or view `name` of `namespace` in
+/// pg_depend, directly or through other views, each before the relations it
+/// reads.
+pub(crate) fn relation_dependents(
+    schema: &Schema,
+    namespace: NamespaceId,
+    name: &str,
+) -> Vec<Dependent> {
+    fn visit(
+        relation_oid: i64,
+        dependencies: &[Dependency],
+        classes: &crate::classes::ClassCatalog,
+        seen: &mut HashSet<i64>,
+        dependents: &mut Vec<Dependent>,
+    ) {
+        let Some(relation) = classes.get_by_oid(relation_oid) else {
+            return;
+        };
+        let rules_that_read = dependencies.iter().filter(|dependency| {
+            dependency.kind == DependencyKind::Normal
+                && dependency.referenced == ObjectAddress::whole::<PgClassTable>(relation_oid)
+                && dependency.dependent.catalog_oid == PG_REWRITE_OID
+        });
+        let mut view_oids: Vec<i64> = rules_that_read
+            .filter_map(|read| {
+                dependencies.iter().find(|dependency| {
+                    dependency.kind == DependencyKind::Internal
+                        && dependency.dependent == read.dependent
+                })
+            })
+            .map(|rule_of_view| rule_of_view.referenced.object_oid)
+            .collect();
+        view_oids.sort_unstable();
+        for view_oid in view_oids {
+            let Some(view) = classes.get_by_oid(view_oid) else {
+                continue;
+            };
+            if !seen.insert(view_oid) {
+                continue;
+            }
+            visit(view_oid, dependencies, classes, seen, dependents);
+            dependents.push(Dependent {
+                object: DependentObject::View {
+                    namespace: view.relnamespace,
+                    name: view.relname.clone(),
+                },
+                depends_on: (relation.relnamespace, relation.relname.clone()),
+            });
+        }
+    }
+
+    let Some(classes) = crate::classes::class_catalog(schema) else {
+        return Vec::new();
+    };
+    let Some(relation) = classes.get_by_name(namespace, name) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::default();
+    seen.insert(relation.oid);
+    let mut dependents = Vec::new();
+    visit(
+        relation.oid,
+        &view_rule_dependencies(schema),
+        classes,
+        &mut seen,
+        &mut dependents,
+    );
+    dependents
+}
+
+/// Fixed PostgreSQL OID of pg_rewrite, which has the rewrite rules of views.
+const PG_REWRITE_OID: i64 = 2618;
+
+/// The `_RETURN` rule of a view, which pg_depend describes. pg_rewrite does
+/// not list the rules while pg_class does not list the views: pg_dump stops
+/// at a rule whose view it cannot find.
+struct ViewRule<'a> {
+    oid: i64,
+    view_oid: i64,
+    namespace: NamespaceId,
+    view: &'a turso_core::schema::View,
+}
+
+/// The rules of the views that have a class row, ordered by oid.
+fn view_rules(schema: &Schema) -> Vec<ViewRule<'_>> {
+    let mut rules: Vec<ViewRule> = schema
+        .namespace_ids()
+        .flat_map(|namespace| {
+            schema.views(namespace).filter_map(move |(name, view)| {
+                let view_oid = stored_relation_oid(schema, namespace, name)?;
+                Some(ViewRule {
+                    oid: view_oid + VIEW_RULE_OID_OFFSET,
+                    view_oid,
+                    namespace,
+                    view,
+                })
+            })
+        })
+        .collect();
+    rules.sort_by_key(|rule| rule.oid);
+    rules
+}
+
+/// What is added to the oid of a view to make the oid of its `_RETURN` rule.
+/// The oids of relations stay below `CONSTRAINT_OID_START`, and the oids
+/// from `ROWID_PK_INDEX_OID_OFFSET` up to this offset are those of indexes.
+const VIEW_RULE_OID_OFFSET: i64 = 3 << 30;
 
 fn catalog_column_numbers(text: Option<&str>) -> Vec<i64> {
     match text {
@@ -3615,6 +3742,14 @@ impl ObjectAddress {
         Self {
             catalog_oid: T::TABLE_OID.expect("dependency catalogs have OIDs"),
             object_oid,
+            column_number: WHOLE_OBJECT_COLUMN_NUMBER,
+        }
+    }
+
+    const fn rule(rule_oid: i64) -> Self {
+        Self {
+            catalog_oid: PG_REWRITE_OID,
+            object_oid: rule_oid,
             column_number: WHOLE_OBJECT_COLUMN_NUMBER,
         }
     }
@@ -4284,7 +4419,6 @@ fn ref_act_to_sql(code: &str) -> &'static str {
 pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
     let schema = conn.current_schema();
     let tables = user_tables_sorted(&schema);
-    let indexes = catalog_indexes(&schema);
     let mut constraint_oid = CONSTRAINT_OID_START;
 
     for (_, _, table) in &tables {
@@ -4366,37 +4500,8 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
                         fk.parent_columns.iter().map(String::as_str),
                     )
                 };
-                let parent_name = parent.as_ref().map_or(fk.parent_table.as_str(), |parent| {
-                    parent.declared_name.as_str()
-                });
-                let visible = conn
-                    .search_order()
-                    .into_iter()
-                    .find(|namespace| {
-                        schema
-                            .get_table(namespace.target.id, &fk.parent_table)
-                            .is_some()
-                            || schema
-                                .get_view(namespace.target.id, &fk.parent_table)
-                                .is_some()
-                            || schema
-                                .get_sequence(namespace.target.id, &fk.parent_table)
-                                .is_some()
-                            || indexes.iter().any(|index| {
-                                index.namespace == namespace.target.id
-                                    && index.name == fk.parent_table
-                            })
-                    })
-                    .is_some_and(|namespace| namespace.target.id == fk.parent_namespace);
-                let parent_name = if visible {
-                    quote_identifier(parent_name)
-                } else {
-                    format!(
-                        "{}.{}",
-                        quote_identifier(schema_name_of(&schema, fk.parent_namespace)),
-                        quote_identifier(parent_name),
-                    )
-                };
+                let parent_name =
+                    relation_name(conn, &schema, fk.parent_namespace, &fk.parent_table);
                 let mut def =
                     format!("FOREIGN KEY ({child_cols}) REFERENCES {parent_name}({parent_cols})");
                 let on_update = ref_act_to_char(&fk.on_update);
@@ -4425,6 +4530,38 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
     }
 
     None
+}
+
+/// The name of relation `name` of `namespace` as PostgreSQL writes it in
+/// definitions and messages: bare when the search path finds this relation
+/// by that name, and qualified with its schema otherwise, each part quoted
+/// where needed. A table is named as it was created, as pg_class shows it.
+pub(crate) fn relation_name(
+    conn: &Connection,
+    schema: &Schema,
+    namespace: NamespaceId,
+    name: &str,
+) -> String {
+    let declared_name = schema
+        .get_btree_table(namespace, name)
+        .map_or_else(|| name.to_string(), |table| table.declared_name.clone());
+    let found = conn
+        .search_order()
+        .into_iter()
+        .filter(|qualifier| qualifier.target.database_id == MAIN_DB_ID)
+        .map(|qualifier| qualifier.target.id)
+        .find(|search_namespace| {
+            crate::classes::class_catalog(schema)
+                .is_some_and(|catalog| catalog.get_by_name(*search_namespace, name).is_some())
+        });
+    if found == Some(namespace) {
+        return quote_identifier(&declared_name);
+    }
+    format!(
+        "{}.{}",
+        quote_identifier(schema_name_of(schema, namespace)),
+        quote_identifier(&declared_name)
+    )
 }
 
 fn constraint_column_list<'a>(
@@ -4669,6 +4806,36 @@ struct CatalogIndexColumn {
     order: SortOrder,
 }
 
+/// The names of the PRIMARY KEY and UNIQUE constraints of `table`. PostgreSQL
+/// gives the index of each constraint the same name.
+pub(crate) fn key_constraint_names(table: &BTreeTable) -> Vec<String> {
+    let rowid_primary_key = table
+        .get_rowid_alias_column()
+        .map(|_| primary_key_constraint_name(table));
+    let unique_sets = table.unique_sets.iter().map(|set| {
+        if unique_set_is_primary_key(table, set) {
+            primary_key_constraint_name(table)
+        } else {
+            unique_constraint_name(table, set)
+        }
+    });
+    rowid_primary_key.into_iter().chain(unique_sets).collect()
+}
+
+fn primary_key_constraint_name(table: &BTreeTable) -> String {
+    table
+        .primary_key_constraint_name
+        .clone()
+        .unwrap_or_else(|| format!("{}_pkey", table.declared_name))
+}
+
+fn unique_constraint_name(table: &BTreeTable, set: &UniqueSet) -> String {
+    set.constraint_name.clone().unwrap_or_else(|| {
+        let columns: Vec<&str> = set.columns.iter().map(|c| c.name.as_str()).collect();
+        format!("{}_{}_key", table.declared_name, columns.join("_"))
+    })
+}
+
 fn unique_set_is_primary_key(table: &BTreeTable, set: &UniqueSet) -> bool {
     table.get_rowid_alias_column().is_none()
         && set.columns.len() == table.primary_key_columns.len()
@@ -4804,7 +4971,6 @@ mod tests {
             "pg_foreign_table",
             "pg_partitioned_table",
             "pg_collation",
-            "pg_description",
             "pg_publication",
             "pg_publication_namespace",
             "pg_publication_rel",
@@ -5107,6 +5273,202 @@ mod tests {
                 .run_collect_rows()
                 .unwrap(),
             vec![vec![Value::from_i64(3)]]
+        );
+    }
+
+    #[test]
+    fn indexes_of_an_attached_database_cannot_be_created_or_dropped() {
+        let dir = tempdir().unwrap();
+        let attached_path = dir.path().join("attached.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let opts = crate::DatabaseOpts::new().with_attach(true);
+        // A file of the PostgreSQL dialect keeps its tables in schemas, which
+        // a statement cannot name through an attached database. A file of
+        // the SQLite dialect keeps them where `aux.other` finds them.
+        {
+            let attached = Database::open_file_with_flags(
+                io.clone(),
+                attached_path.to_str().unwrap(),
+                crate::OpenFlags::default(),
+                opts,
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = attached
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            conn.execute("PRAGMA journal_mode = mvcc").unwrap();
+            conn.execute("CREATE TABLE other (v INT, w INT)").unwrap();
+            conn.execute("CREATE INDEX other_v ON other (v)").unwrap();
+            conn.close().unwrap();
+        }
+        let db = crate::session::open_database_with_io(
+            io,
+            dir.path().join("main.db").to_str().unwrap(),
+            crate::OpenFlags::default(),
+            opts,
+        )
+        .unwrap();
+        let conn = connect_with_public(&db);
+        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
+            .unwrap();
+        // The relation catalog covers only the main database.
+        for sql in [
+            "CREATE INDEX other_w ON aux.other (w)",
+            "DROP INDEX aux.other_v",
+        ] {
+            let err = conn.execute(sql).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("relations in an attached database is not supported"),
+                "{sql}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn sequences_and_tables_of_an_attached_database_cannot_be_created_or_dropped() {
+        let dir = tempdir().unwrap();
+        let attached_path = dir.path().join("attached.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        // `aux.name` finds only objects that are in no schema, which a file
+        // made with the SQLite dialect has.
+        {
+            let attached = Database::open_file_with_flags(
+                io.clone(),
+                attached_path.to_str().unwrap(),
+                crate::OpenFlags::default(),
+                crate::DatabaseOpts::new().with_mvcc(true),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = attached
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+                .unwrap();
+            conn.execute("CREATE SEQUENCE s").unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        let db = crate::session::open_database_with_io(
+            io,
+            dir.path().join("main.db").to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_attach(true),
+        )
+        .unwrap();
+        let conn = connect_with_public(&db);
+        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
+            .unwrap();
+        for sql in [
+            "CREATE SEQUENCE aux.other",
+            "DROP SEQUENCE aux.s",
+            "DROP TABLE aux.t",
+        ] {
+            let err = conn.execute(sql).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("relations in an attached database is not supported"),
+                "{sql}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_column_of_a_sequence_of_an_attached_database_cannot_be_changed() {
+        let dir = tempdir().unwrap();
+        let attached_path = dir.path().join("attached.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        {
+            let attached = Database::open_file_with_flags(
+                io.clone(),
+                attached_path.to_str().unwrap(),
+                crate::OpenFlags::default(),
+                crate::DatabaseOpts::new().with_mvcc(true),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = attached
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+                .unwrap();
+            conn.execute("CREATE SEQUENCE s").unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        let db = crate::session::open_database_with_io(
+            io,
+            dir.path().join("main.db").to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_attach(true),
+        )
+        .unwrap();
+        let conn = connect_with_public(&db);
+        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
+            .unwrap();
+        for sql in [
+            "ALTER SEQUENCE aux.s OWNED BY aux.t.v",
+            "ALTER SEQUENCE aux.s OWNED BY NONE",
+        ] {
+            let err = conn.execute(sql).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("relations in an attached database is not supported"),
+                "{sql}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn views_of_an_attached_database_cannot_be_created_or_dropped() {
+        let dir = tempdir().unwrap();
+        let attached_path = dir.path().join("attached.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        {
+            let attached = Database::open(
+                io.clone(),
+                attached_path.to_str().unwrap(),
+                turso_core::OpenOptions::new(Arc::new(turso_sqlite::SqliteDialect))
+                    .db_opts(crate::DatabaseOpts::new().with_mvcc(true)),
+            )
+            .unwrap();
+            let conn = attached
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            conn.execute("CREATE VIEW existing AS SELECT 1 AS one")
+                .unwrap();
+            conn.close().unwrap();
+        }
+        let db = crate::session::open_database_with_io(
+            io,
+            dir.path().join("main.db").to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_attach(true),
+        )
+        .unwrap();
+        let conn = connect_with_public(&db);
+        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
+            .unwrap();
+        for sql in [
+            "CREATE VIEW aux.added AS SELECT 2 AS two",
+            "DROP VIEW aux.existing",
+        ] {
+            let err = conn.execute(sql).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("relations in an attached database is not supported"),
+                "{sql}: {err}"
+            );
+        }
+        assert_eq!(
+            conn.prepare("SELECT name FROM aux.sqlite_schema WHERE type = 'view'")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::build_text("existing")]]
         );
     }
 

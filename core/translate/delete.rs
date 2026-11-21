@@ -211,7 +211,7 @@ pub fn translate_delete(
     super::stmt_journal::set_delete_stmt_journal_flags(program, delete, resolver, connection)?;
     let opts = ProgramBuilderOpts::new(1, estimate_num_instructions(delete), 0);
     program.extend(&opts);
-    emit_program(connection, resolver, program, delete_plan, |_| {})?;
+    emit_program(connection, resolver, program, delete_plan)?;
     Ok(())
 }
 

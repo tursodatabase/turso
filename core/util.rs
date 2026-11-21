@@ -216,16 +216,7 @@ pub fn table_name_for_error(name: &turso_parser::ast::QualifiedName) -> String {
 /// Quote a SQL identifier with double quotes when necessary.
 /// Always safe to call — returns the bare name when no quoting is needed.
 pub fn quote_identifier(name: &str) -> String {
-    let needs_quoting = name.is_empty()
-        || name.as_bytes()[0].is_ascii_digit()
-        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        || turso_parser::lexer::is_quotable_keyword(name.as_bytes());
-    if needs_quoting {
-        let escaped = name.replace('"', "\"\"");
-        format!("\"{escaped}\"")
-    } else {
-        name.to_string()
-    }
+    ast::Name::exact(name.to_string()).as_ident()
 }
 
 pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
@@ -1437,6 +1428,12 @@ pub trait AstVisitor {
         Ok(())
     }
 
+    /// Before the CTEs and the body of a SELECT that has a WITH clause.
+    fn enter_with(&mut self, _with: &ast::With) {}
+
+    /// After the SELECT whose WITH clause `enter_with` reported.
+    fn leave_with(&mut self) {}
+
     /// Visit in SQLite's name resolution order: each query level's FROM
     /// clause before its SELECT list, and the left operand of `IN (SELECT ...)`
     /// before the subquery. Off by default: the walk visits in source order so
@@ -1715,6 +1712,7 @@ pub fn visit_stmt<V: AstVisitor>(stmt: &ast::Stmt, visitor: &mut V) -> Result<()
         | ast::Stmt::AlterSequenceOwnedBy { .. }
         | ast::Stmt::CreateSchema { .. }
         | ast::Stmt::CreateRole { .. }
+        | ast::Stmt::DropRole { .. }
         | ast::Stmt::Grant(_)
         | ast::Stmt::CreatePolicy(_)
         | ast::Stmt::DropPolicy { .. }
@@ -1853,6 +1851,9 @@ where
 /// Walk a SELECT: the tables it reads and all of its expressions, including
 /// subqueries.
 pub fn visit_select<V: AstVisitor>(select: &ast::Select, visitor: &mut V) -> Result<()> {
+    if let Some(with) = &select.with {
+        visitor.enter_with(with);
+    }
     visit_with(select.with.as_ref(), visitor)?;
 
     visit_one_select(&select.body.select, visitor)?;
@@ -1869,6 +1870,10 @@ pub fn visit_select<V: AstVisitor>(select: &ast::Select, visitor: &mut V) -> Res
         if let Some(offset) = &limit.offset {
             visit_expr_with_subqueries(offset, visitor)?;
         }
+    }
+
+    if select.with.is_some() {
+        visitor.leave_with();
     }
 
     Ok(())

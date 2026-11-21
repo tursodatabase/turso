@@ -5,6 +5,15 @@ pub(crate) use shuttle_adapter::*;
 pub use std_adapter::*;
 
 #[cfg(shuttle)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EncryptionSchedulePoint(pub bool);
+
+#[cfg(shuttle)]
+pub(crate) fn encryption_schedule_point(active: bool) {
+    shuttle::current::set_label_for_task(shuttle::current::me(), EncryptionSchedulePoint(active));
+}
+
+#[cfg(shuttle)]
 mod shuttle_adapter {
     pub use shuttle::sync::atomic;
     pub use shuttle::sync::{Arc, Weak};

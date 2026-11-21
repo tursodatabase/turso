@@ -120,7 +120,7 @@ pub fn emit_select_plan(
     };
 
     program.extend(&opts);
-    emit_program(connection, resolver, program, plan, |_| {})?;
+    emit_program(connection, resolver, program, plan)?;
     Ok(num_result_cols)
 }
 
@@ -207,6 +207,7 @@ pub(crate) fn prepare_select_plan_from_arms(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
+    let _nested_query = resolver.enter_nested_query()?;
     let mut compound_arms = compound_arms.into_iter().peekable();
     if compound_arms.peek().is_none() {
         return Ok(Plan::Select(Box::new(prepare_one_select_plan(
@@ -1043,15 +1044,11 @@ fn aggregate_call_name<'a>(expr: &'a ast::Expr, resolver: &Resolver) -> Option<&
     if filter_over.over_clause.is_some() {
         return None;
     }
-    let is_aggregate = match crate::function::Func::resolve_function(name.as_str(), args_count) {
-        Ok(Some(crate::function::Func::Agg(_))) => true,
-        _ => resolver
-            .catalog
-            .symbol_table
-            .resolve_function(name.as_str(), args_count)
-            .is_some_and(|f| f.func.is_aggregate()),
-    };
-    is_aggregate.then_some(name.as_str())
+    matches!(
+        resolver.resolve_function(name.as_str(), args_count),
+        Ok(Some(func)) if func.is_aggregate()
+    )
+    .then_some(name.as_str())
 }
 
 /// Validate that all expressions in the plan return the correct number of values;

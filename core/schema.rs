@@ -2428,6 +2428,15 @@ impl Schema {
         self.update_value_types(syms)
     }
 
+    /// Adds a type to the in-memory registry. `syms` has the functions its
+    /// DECODE may call.
+    #[cfg(test)]
+    pub(crate) fn add_type(&mut self, type_def: TypeDef, syms: &SymbolTable) -> crate::Result<()> {
+        self.type_registry
+            .insert(type_registry_key(&type_def.name), Arc::new(type_def));
+        self.update_value_types(syms)
+    }
+
     /// Parse a CREATE TYPE or CREATE DOMAIN SQL string and add the type to the
     /// in-memory registry without working out the kind its DECODE gives.
     fn insert_type_from_sql(
@@ -4057,7 +4066,7 @@ impl Schema {
 
     /// Every name a materialized view's dependency must be registered under:
     /// the tables its query reads (including tables read only inside
-    /// subqueries, see [IncrementalView::referenced_table_names]), with each
+    /// subqueries, see [view::referenced_tables]), with each
     /// plain `VIEW` among them expanded recursively, since a view can itself
     /// select from another view, down to the real tables it reads. A write
     /// only ever lands on a real table, so if a dependency were left naming
@@ -4110,13 +4119,13 @@ impl Schema {
     /// The tables `select` reads, with the namespace each resolves to when
     /// the select is the body of a view of `namespace`. A table of a
     /// namespace the schema does not know is left out.
-    fn referenced_tables_of(
+    pub fn referenced_tables_of(
         &self,
         namespace: NamespaceId,
         select: &ast::Select,
     ) -> Vec<(NamespaceId, String)> {
         let mut tables = vec![];
-        for (qualifier, name) in IncrementalView::referenced_tables(select) {
+        for (qualifier, name) in view::referenced_tables(select) {
             let table_namespace = match qualifier.as_deref() {
                 None => namespace,
                 Some("main") => NamespaceId::ROOT,
@@ -9347,84 +9356,47 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::roles::SessionRole;
-    use crate::SqliteDialect;
-
-    #[test]
-    fn builtin_types_read_as_the_kind_their_decode_gives() {
-        use crate::{
-            translate::expr::expr_type::value_type, ConnectOpts, Database, DatabaseOpts, MemoryIO,
-            OpenFlags, IO, MAIN_DB_ID,
-        };
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            ":memory:",
-            OpenFlags::Create,
-            DatabaseOpts::new().with_custom_types(true),
-            None,
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        let syms = conn.syms.read();
-        conn.with_schema(MAIN_DB_ID, |schema| {
-            assert!(schema.type_registry.values().all(|t| t.is_builtin));
-            for (name, type_def) in &schema.type_registry {
-                assert_eq!(
-                    Some(type_def.value_type()),
-                    value_type(type_def, schema, &syms),
-                    "built-in type {name}"
-                );
-            }
-        });
-    }
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
 
     #[test]
     #[should_panic(expected = "kinds of type price were read before they were worked out")]
     fn reading_the_kind_of_a_type_not_yet_worked_out_panics() {
-        let mut schema = Schema::new();
-        schema
-            .insert_type_from_sql(
-                &SqliteDialect,
-                "CREATE TYPE price(value any) BASE text ENCODE value DECODE CAST(value AS real)",
-            )
-            .unwrap();
-        schema.get_type_def_unchecked("price").unwrap().value_type();
+        // CREATE TYPE price(value any) BASE text ENCODE value DECODE CAST(value AS real)
+        let value = || Box::new(Expr::Id(Name::exact("value".to_string())));
+        let body = ast::CreateTypeBody::CustomType {
+            params: std::vec![ast::TypeParam {
+                name: "value".to_string(),
+                ty: Some("any".to_string()),
+            }],
+            base: "text".to_string(),
+            encode: Some(value()),
+            coerce: None,
+            decode: Some(Box::new(Expr::Cast {
+                expr: value(),
+                type_name: Some(ast::Type {
+                    name: "real".to_string(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            })),
+            operators: std::vec![],
+            default: None,
+        };
+        let price =
+            TypeDef::from_create_type("price", &body, TypeOrigin::User, String::new()).unwrap();
+        price.value_type();
     }
 
     #[test]
     fn persisted_materialized_views_are_loaded_in_dependency_order() {
-        let mut views = HashMap::default();
-        views.insert(
-            "third".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW third AS SELECT * FROM second".to_string(),
-                5,
-            ),
-        );
-        views.insert(
-            "first".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW first AS SELECT * FROM base".to_string(),
-                3,
-            ),
-        );
-        views.insert(
-            "second".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW second AS SELECT * FROM first".to_string(),
-                4,
-            ),
-        );
+        let (views, dialect) = stored_views_selecting_from(&[
+            ("third", "second", 5),
+            ("first", "base", 3),
+            ("second", "first", 4),
+        ]);
 
         let ordered = Schema::new()
-            .order_persisted_materialized_views(&SqliteDialect, views)
+            .order_persisted_materialized_views(&dialect, views)
             .unwrap();
         assert_eq!(
             ordered
@@ -9437,28 +9409,103 @@ mod tests {
 
     #[test]
     fn persisted_materialized_view_cycle_is_corrupt() {
-        let mut views = HashMap::default();
-        views.insert(
-            "left_view".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW left_view AS SELECT * FROM right_view".to_string(),
-                3,
-            ),
-        );
-        views.insert(
-            "right_view".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW right_view AS SELECT * FROM left_view".to_string(),
-                4,
-            ),
-        );
+        let (views, dialect) = stored_views_selecting_from(&[
+            ("left_view", "right_view", 3),
+            ("right_view", "left_view", 4),
+        ]);
 
         let error = Schema::new()
-            .order_persisted_materialized_views(&SqliteDialect, views)
+            .order_persisted_materialized_views(&dialect, views)
             .unwrap_err();
         assert!(matches!(error, LimboError::Corrupt(_)));
+    }
+
+    /// Materialized views as stored in `sqlite_schema`, given as
+    /// `(view, table it selects every row of, root page)`, and a dialect
+    /// that reads their SQL.
+    fn stored_views_selecting_from(
+        views: &[(&str, &str, i64)],
+    ) -> (HashMap<String, StoredMaterializedView>, StoredViewsDialect) {
+        let mut stored = HashMap::default();
+        let mut dialect = StoredViewsDialect { views: vec![] };
+        for &(view, table, root_page) in views {
+            let sql = format!("CREATE MATERIALIZED VIEW {view} AS SELECT * FROM {table}");
+            stored.insert(
+                view.to_string(),
+                (NamespaceId::ROOT, sql.clone(), root_page),
+            );
+            dialect
+                .views
+                .push((sql, create_materialized_view_selecting_from(view, table)));
+        }
+        (stored, dialect)
+    }
+
+    /// `CREATE MATERIALIZED VIEW <view> AS SELECT * FROM <table>`
+    fn create_materialized_view_selecting_from(view: &str, table: &str) -> Stmt {
+        let name = |name: &str| ast::QualifiedName::single(Name::exact(name.to_string()));
+        Stmt::CreateMaterializedView {
+            if_not_exists: false,
+            view_name: name(view),
+            columns: std::vec![],
+            select: ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns: std::vec![ResultColumn::Star],
+                        from: Some(ast::FromClause {
+                            select: Box::new(ast::SelectTable::Table(name(table), None, None)),
+                            joins: std::vec![],
+                        }),
+                        where_clause: None,
+                        group_by: None,
+                        window_clause: std::vec![],
+                    },
+                    compounds: std::vec![],
+                },
+                order_by: std::vec![],
+                limit: None,
+            },
+        }
+    }
+
+    /// A dialect that reads only the SQL of the views it holds, each given
+    /// with the statement it reads as.
+    struct StoredViewsDialect {
+        views: Vec<(String, Stmt)>,
+    }
+
+    impl crate::dialect::Dialect for StoredViewsDialect {
+        fn name(&self) -> &'static str {
+            "stored-views"
+        }
+
+        fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+            self.parse_internal(sql)
+        }
+
+        fn parse_internal(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+            match self.views.iter().find(|(view_sql, _)| view_sql == sql) {
+                Some((_, stmt)) => Ok((Some(Cmd::Stmt(stmt.clone())), sql.len())),
+                None => DialectThatCannotParse.parse_internal(sql),
+            }
+        }
+
+        fn parse_internal_column_definition(&self, sql: &str) -> Result<ColumnDefinition> {
+            DialectThatCannotParse.parse_internal_column_definition(sql)
+        }
+
+        fn parameter_marker_ranges(
+            &self,
+            sql: &str,
+        ) -> Result<std::vec::Vec<std::ops::Range<usize>>> {
+            DialectThatCannotParse.parameter_marker_ranges(sql)
+        }
+
+        fn get_internal_dialect(&self) -> Arc<dyn crate::dialect::Dialect> {
+            Arc::new(DialectThatCannotParse)
+        }
     }
 
     #[test]
@@ -9487,18 +9534,24 @@ mod tests {
     #[test]
     fn stateless_materialized_view_requires_current_version_marker() -> Result<()> {
         fn add_marker(schema: &mut Schema, name: &str, root_page: i64) -> Result<()> {
-            let sql = format!(
-                "CREATE TABLE {} (version INTEGER)",
-                crate::util::quote_identifier(name)
+            let version = Column::new_default_integer(
+                Some("version".to_string()),
+                "INTEGER".to_string(),
+                None,
             );
             schema.add_btree_table(
                 NamespaceId::ROOT,
-                Arc::new(BTreeTable::from_stored_sql(
-                    &SqliteDialect,
-                    &sql,
+                Arc::new(BTreeTable::new(
                     root_page,
-                    false,
-                )?),
+                    name.to_string(),
+                    vec![],
+                    vec![version],
+                    BTreeCharacteristics::HAS_ROWID,
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                )),
             )
         }
 
@@ -9695,7 +9748,7 @@ mod tests {
 
     #[test]
     fn gencol_graph_no_virtual_columns() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(&SqliteDialect, "CREATE TABLE t(a, b)", 0, false)?;
+        let t = table_t(vec![stored_column("a"), stored_column("b")])?;
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0]);
         assert_eq!(indices(&t.columns_affected_by_update([0, 1])?), vec![0, 1]);
         assert_eq!(stored(&t.dependencies_of_columns([0])?), vec![0]);
@@ -9705,12 +9758,11 @@ mod tests {
 
     #[test]
     fn gencol_graph_linear_chain() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (b) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            virtual_column("b", &["a"]),
+            virtual_column("c", &["b"]),
+        ])?;
         // affected-by({a}) = {a, b, c}
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 1, 2]);
         // affected-by({b}) = {b, c} (b is virtual, but updating it still propagates through dependents)
@@ -9726,12 +9778,12 @@ mod tests {
 
     #[test]
     fn gencol_graph_diamond() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (a) VIRTUAL, d AS (b + c) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            virtual_column("b", &["a"]),
+            virtual_column("c", &["a"]),
+            virtual_column("d", &["b", "c"]),
+        ])?;
         assert_eq!(
             indices(&t.columns_affected_by_update([0])?),
             vec![0, 1, 2, 3]
@@ -9749,12 +9801,11 @@ mod tests {
 
     #[test]
     fn gencol_graph_multiple_stored_roots() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b, c AS (a + b) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            stored_column("b"),
+            virtual_column("c", &["a", "b"]),
+        ])?;
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 2]);
         assert_eq!(indices(&t.columns_affected_by_update([1])?), vec![1, 2]);
         assert_eq!(
@@ -9767,12 +9818,7 @@ mod tests {
 
     #[test]
     fn gencol_graph_empty_input() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![stored_column("a"), virtual_column("b", &["a"])])?;
         assert!(t.columns_affected_by_update(std::iter::empty())?.is_empty());
         assert!(t.dependencies_of_columns(std::iter::empty())?.is_empty());
         Ok(())
@@ -9780,12 +9826,12 @@ mod tests {
 
     #[test]
     fn gencol_graph_disjoint_components() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c, d AS (c) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            virtual_column("b", &["a"]),
+            stored_column("c"),
+            virtual_column("d", &["c"]),
+        ])?;
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 1]);
         assert_eq!(indices(&t.columns_affected_by_update([2])?), vec![2, 3]);
         assert_eq!(stored(&t.dependencies_of_columns([1])?), vec![0]);
@@ -9796,12 +9842,7 @@ mod tests {
     #[test]
     fn gencol_graph_deep_chain() -> Result<()> {
         // Build 50-long chain: c0 (stored), c1 := c0, c2 := c1, ... c49 := c48.
-        let mut sql = String::from("CREATE TABLE t(c0");
-        for i in 1..50 {
-            sql.push_str(&format!(", c{i} AS (c{prev}) VIRTUAL", prev = i - 1));
-        }
-        sql.push(')');
-        let t = BTreeTable::from_stored_sql(&SqliteDialect, &sql, 0, false)?;
+        let t = table_t(chain(50))?;
         // affected-by({c0}) = {c0..c49}
         let affected = t.columns_affected_by_update([0])?;
         assert_eq!(affected.count(), 50);
@@ -9814,12 +9855,7 @@ mod tests {
     fn gencol_graph_very_deep_chain_no_stack_overflow() -> Result<()> {
         // Validates that the iterative Kahn's + DP don't blow the stack on
         // realistic worst-case generated-column depth.
-        let mut sql = String::from("CREATE TABLE t(c0");
-        for i in 1..500 {
-            sql.push_str(&format!(", c{i} AS (c{prev}) VIRTUAL", prev = i - 1));
-        }
-        sql.push(')');
-        let t = BTreeTable::from_stored_sql(&SqliteDialect, &sql, 0, false)?;
+        let t = table_t(chain(500))?;
         assert_eq!(t.columns_affected_by_update([0])?.count(), 500);
         assert_eq!(stored(&t.dependencies_of_columns([499])?), vec![0]);
         Ok(())
@@ -9827,12 +9863,7 @@ mod tests {
 
     #[test]
     fn gencol_graph_rowid_sentinel_passthrough() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![stored_column("a"), virtual_column("b", &["a"])])?;
         let affected = t.columns_affected_by_update([ROWID_SENTINEL])?;
         // ROWID_SENTINEL is preserved in the mask flag but does not propagate through the graph
         // (no generated column can depend on ROWID_SENTINEL directly).
@@ -9843,12 +9874,12 @@ mod tests {
 
     #[test]
     fn gencol_graph_transpose_duality() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (b) VIRTUAL, d AS (a + c) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            virtual_column("b", &["a"]),
+            virtual_column("c", &["b"]),
+            virtual_column("d", &["a", "c"]),
+        ])?;
         let graph = t.column_graph()?;
         // j ∈ dependencies[i] iff i ∈ dependents[j]
         for i in 0..graph.dependencies.len() {
@@ -9871,12 +9902,12 @@ mod tests {
     #[test]
     fn gencol_graph_idempotence() -> Result<()> {
         // affected_by(affected_by(xs)) == affected_by(xs).
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b, c AS (a) VIRTUAL, d AS (b + c) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            stored_column("b"),
+            virtual_column("c", &["a"]),
+            virtual_column("d", &["b", "c"]),
+        ])?;
         let once = t.columns_affected_by_update([0, 1])?;
         let twice = t.columns_affected_by_update(once.iter())?;
         assert_eq!(indices(&twice), indices(&once));
@@ -9886,12 +9917,13 @@ mod tests {
     #[test]
     fn gencol_graph_union_monotonicity() -> Result<()> {
         // affected_by(A ∪ B) == affected_by(A) ∪ affected_by(B).
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b, c AS (a) VIRTUAL, d AS (b) VIRTUAL, e AS (c + d) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            stored_column("b"),
+            virtual_column("c", &["a"]),
+            virtual_column("d", &["b"]),
+            virtual_column("e", &["c", "d"]),
+        ])?;
         let mut expected = t.columns_affected_by_update([0])?;
         let b_mask = t.columns_affected_by_update([1])?;
         expected.union_with(&b_mask).unwrap();
@@ -9906,12 +9938,7 @@ mod tests {
         // After cloning a BTreeTable, the cache is fresh. Mutating columns on
         // the clone via `columns_mut()` keeps it fresh; `prepare_generated_columns`
         // rebuilds correctly.
-        let original = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let original = table_t(vec![stored_column("a"), virtual_column("b", &["a"])])?;
         // Force the cache to be populated on the original.
         let _ = original.columns_affected_by_update([0])?;
         assert!(original.peek_column_dependencies().is_some());
@@ -9935,12 +9962,7 @@ mod tests {
 
     #[test]
     fn gencol_graph_columns_mut_invalidates_cache() -> Result<()> {
-        let mut t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let mut t = table_t(vec![stored_column("a"), virtual_column("b", &["a"])])?;
         // Force the cache to be populated.
         let _ = t.columns_affected_by_update([0])?;
         assert!(t.peek_column_dependencies().is_some());
@@ -9953,7 +9975,7 @@ mod tests {
 
     #[test]
     fn gencol_graph_of_table_without_generated_columns_is_built_on_first_use() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(&SqliteDialect, "CREATE TABLE t(a, b)", 0, false)?;
+        let t = table_t(vec![stored_column("a"), stored_column("b")])?;
         assert!(t.peek_column_dependencies().is_none());
 
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0]);
@@ -9964,7 +9986,8 @@ mod tests {
     #[test]
     fn schema_copy_shares_a_table_until_the_copy_changes_it() -> Result<()> {
         let mut schema = Schema::new();
-        let table = BTreeTable::from_stored_sql(&SqliteDialect, "CREATE TABLE t(a, b)", 2, false)?;
+        let mut table = table_t(vec![stored_column("a"), stored_column("b")])?;
+        table.root_page = 2;
         schema.add_btree_table(NamespaceId::ROOT, Arc::new(table))?;
 
         let mut copy = schema.try_clone()?;
@@ -9984,6 +10007,66 @@ mod tests {
         assert_eq!(root_page(&schema), 2);
         assert_eq!(root_page(&copy), 3);
         Ok(())
+    }
+
+    /// A rowid table named `t` with the given columns, set up the way a
+    /// `CREATE TABLE` sets up its generated columns.
+    fn table_t(columns: Vec<Column>) -> Result<BTreeTable> {
+        let mut table = BTreeTable::new(
+            0,
+            "t".to_string(),
+            vec![],
+            columns,
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        table.prepare_generated_columns()?;
+        Ok(table)
+    }
+
+    /// A column without a declared type, like `a` in `CREATE TABLE t(a)`.
+    fn stored_column(name: &str) -> Column {
+        Column::new(
+            Some(name.to_string()),
+            String::new(),
+            None,
+            None,
+            Type::Null,
+            None,
+            ColDef::default(),
+        )
+    }
+
+    /// A virtual column that adds up the named columns, like
+    /// `c AS (a + b) VIRTUAL`.
+    fn virtual_column(name: &str, sources: &[&str]) -> Column {
+        let expr = sources
+            .iter()
+            .map(|source| Expr::Id(ast::Name::exact(source.to_string())))
+            .reduce(|sum, next| Expr::Binary(Box::new(sum), ast::Operator::Add, Box::new(next)))
+            .expect("a generated column needs at least one source column");
+        Column::new(
+            Some(name.to_string()),
+            String::new(),
+            None,
+            Some(GeneratedType::new(Box::new(expr), false)),
+            Type::Null,
+            None,
+            ColDef::default(),
+        )
+    }
+
+    /// Columns `c0` to `c{len - 1}` where `c0` is stored and each later
+    /// column is a virtual copy of the one before it.
+    fn chain(len: usize) -> Vec<Column> {
+        let mut columns = vec![stored_column("c0")];
+        for i in 1..len {
+            columns.push(virtual_column(&format!("c{i}"), &[&format!("c{}", i - 1)]));
+        }
+        columns
     }
 
     /// `install_sequence_descriptor` must surface an error when the

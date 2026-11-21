@@ -1022,6 +1022,12 @@ fn optimize_select_plan_with_cache(
     if !unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)? {
         return optimize_select_plan_form(plan, resolver, cache);
     }
+    // The join limit counts only the tables of the FROM clause, as in SQLite.
+    // When the rewrite moves subquery tables into the join past that limit,
+    // run the subqueries in their correlated form instead.
+    if rewritten.table_references.joined_tables().len() > TableReferences::MAX_JOINED_TABLES {
+        return optimize_select_plan_form(plan, resolver, cache);
+    }
 
     #[cfg(feature = "simulator")]
     if resolver.subquery_unnesting_mode() == crate::SubqueryUnnestingMode::Forced {
@@ -2687,7 +2693,7 @@ fn find_table_access_plan(
     }
     if table_references.joined_tables().len() > TableReferences::MAX_JOINED_TABLES {
         crate::bail_parse_error!(
-            "Only up to {} tables can be joined",
+            "at most {} tables in a join",
             TableReferences::MAX_JOINED_TABLES
         );
     }
@@ -5101,7 +5107,7 @@ mod tests {
             syms,
             true,
             DoubleQuotedDml::Enabled,
-            crate::sync::Arc::new(crate::SqliteDialect),
+            crate::sync::Arc::new(crate::dialect::cannot_parse::DialectThatCannotParse),
             None,
             crate::security::roles::RoleId::SUPERUSER,
         )

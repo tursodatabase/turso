@@ -9,6 +9,7 @@ use crate::snapshot::{SnapshotInfo, SnapshotManager, SnapshotResult, SnapshotUpd
 use async_trait::async_trait;
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -128,6 +129,15 @@ impl Runnable for TestCase {
     }
 
     fn check_backend_support(&self, options: &RunOptions) -> Option<String> {
+        if self.gap.is_some()
+            && !matches!(options.backend_type, Backend::Tursopg | Backend::Postgres)
+        {
+            return Some(format!(
+                "@compat-gap tests record differences between tursopg and PostgreSQL and run only on \
+                 the tursopg and postgres backends, not on the {} backend",
+                options.backend_type
+            ));
+        }
         let expectation = self.expectations.for_backend(options.backend_type);
         if expectation.sqlstate().is_some() && !options.backend_reports_sqlstate {
             return Some(format!(
@@ -159,12 +169,71 @@ impl Runnable for TestCase {
         // Tests use only the first (and only) result
         assert!(results.len() == 1);
         let result = results.first().unwrap();
+        if self.gap.is_some() && options.backend_type == Backend::Tursopg {
+            return evaluate_gap_test(self, result);
+        }
         let expectation = self.expectations.for_backend(options.backend_type);
         let comparison = compare(result, expectation);
         match comparison {
             ComparisonResult::Match => TestOutcome::Passed,
             ComparisonResult::Mismatch { reason } => TestOutcome::Failed { reason },
         }
+    }
+}
+
+/// The message of a gap test that tursopg now answers like PostgreSQL.
+pub const GAP_FIXED: &str = "gap fixed: remove @compat-gap and the expect @tursopg override";
+
+/// Evaluates a gap test on the tursopg backend. The PostgreSQL answer is
+/// checked first, so that a fixed gap fails the run instead of passing as a
+/// known gap. Both failure messages name the tursopg and the PostgreSQL
+/// answer.
+fn evaluate_gap_test(test: &TestCase, result: &QueryResult) -> TestOutcome {
+    let label = test
+        .gap
+        .as_deref()
+        .expect("evaluate_gap_test runs only for @compat-gap tests");
+    let actual = crate::gap::describe_result(result);
+    let postgres = crate::gap::describe_expectation(&test.expectations.default);
+    // The default error block may hold the PostgreSQL message, which only the
+    // postgres backend checks. tursopg fixes an error gap when it returns the
+    // PostgreSQL SQLSTATE, whatever its message.
+    let reference = match &test.expectations.default {
+        Expectation::Error { sqlstate, .. } => Cow::Owned(Expectation::Error {
+            sqlstate: sqlstate.clone(),
+            pattern: None,
+        }),
+        expectation => Cow::Borrowed(expectation),
+    };
+    if compare(result, &reference).is_match() {
+        let message_note = if compare(result, &test.expectations.default).is_match() {
+            ""
+        } else {
+            "\ntursopg returns the PostgreSQL SQLSTATE with another message: keep an \
+             `expect @tursopg error` block with the same @sqlstate and the tursopg message"
+        };
+        return TestOutcome::Failed {
+            reason: format!(
+                "{GAP_FIXED}\n{label}: tursopg returns {actual}, PostgreSQL returns {postgres}{message_note}"
+            ),
+        };
+    }
+    let tursopg = test
+        .expectations
+        .overrides
+        .get(&Backend::Tursopg)
+        .expect("the gap lints reject a @compat-gap test without an `expect @tursopg` block");
+    match compare(result, tursopg) {
+        ComparisonResult::Match => TestOutcome::Passed,
+        ComparisonResult::Mismatch { reason } => TestOutcome::Failed {
+            reason: format!(
+                "known gap {label}: tursopg returns {actual}, PostgreSQL returns {postgres}, \
+                 recorded tursopg answer {recorded}; tursopg gives neither the PostgreSQL answer \
+                 nor the recorded gap answer (the comparison below is against the \
+                 `expect @tursopg` block)\n{reason}",
+                recorded = crate::gap::describe_expectation(tursopg),
+            ),
+        },
     }
 }
 
@@ -707,9 +776,12 @@ impl LoadedTests {
 ///
 /// This function handles:
 /// - Resolving directories (globbing for .sqltest files)
-/// - Reading and parsing each file
+/// - Reading and parsing each file, running `lint` on each test
 /// - Collecting parse errors separately for reporting
-pub async fn load_test_files(paths: &[PathBuf]) -> Result<LoadedTests, BackendError> {
+pub async fn load_test_files(
+    paths: &[PathBuf],
+    lint: crate::parser::TestLint<'_>,
+) -> Result<LoadedTests, BackendError> {
     let mut files = Vec::new();
     let mut errors = Vec::new();
 
@@ -723,7 +795,7 @@ pub async fn load_test_files(paths: &[PathBuf]) -> Result<LoadedTests, BackendEr
             {
                 match entry {
                     Ok(file_path) => {
-                        load_single_file(&file_path, &mut files, &mut errors).await;
+                        load_single_file(&file_path, lint, &mut files, &mut errors).await;
                     }
                     Err(e) => {
                         return Err(BackendError::Execute(format!("glob error: {e}")));
@@ -731,7 +803,7 @@ pub async fn load_test_files(paths: &[PathBuf]) -> Result<LoadedTests, BackendEr
                 }
             }
         } else if path.is_file() {
-            load_single_file(path, &mut files, &mut errors).await;
+            load_single_file(path, lint, &mut files, &mut errors).await;
         }
     }
 
@@ -740,11 +812,12 @@ pub async fn load_test_files(paths: &[PathBuf]) -> Result<LoadedTests, BackendEr
 
 async fn load_single_file(
     path: &PathBuf,
+    lint: crate::parser::TestLint<'_>,
     files: &mut Vec<(PathBuf, TestFile)>,
     errors: &mut Vec<FileResult>,
 ) {
     match tokio::fs::read_to_string(path).await {
-        Ok(content) => match crate::parse(&content) {
+        Ok(content) => match crate::parser::parse_with_lint(&content, lint) {
             Ok(test_file) => {
                 files.push((path.clone(), test_file));
             }
@@ -1271,7 +1344,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
     where
         F: FnMut(&TestResult),
     {
-        let loaded = load_test_files(paths).await?;
+        let loaded = load_test_files(paths, &crate::parser::reject_compat_gap).await?;
         self.run_loaded_tests(loaded, on_result).await
     }
 
@@ -1933,6 +2006,224 @@ expect error {
             self: Box<Self>,
         ) -> Result<crate::backends::DatabaseFileHandle, BackendError> {
             Ok(crate::backends::DatabaseFileHandle::none())
+        }
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    const GAP_TEST: &str = r#"@database :memory:
+
+@compat-gap "type:bool"
+test g {
+    SELECT true;
+}
+expect {
+    t
+}
+expect @tursopg {
+    1
+}
+"#;
+
+    fn gap_test() -> TestCase {
+        crate::gap::parse_with_gap_lints(GAP_TEST)
+            .unwrap()
+            .tests
+            .remove(0)
+    }
+
+    fn options(backend_type: Backend) -> RunOptions {
+        RunOptions {
+            file_path: PathBuf::from("g.sqltest"),
+            db_config: DatabaseConfig {
+                location: DatabaseLocation::Memory,
+                readonly: false,
+            },
+            setups: HashMap::new(),
+            mvcc: false,
+            global_skip: Vec::new(),
+            global_requires: Vec::new(),
+            backend_capabilities: HashSet::new(),
+            backend_type,
+            backend_is_sqlite: false,
+            backend_reports_sqlstate: true,
+            snapshot_update_mode: SnapshotUpdateMode::No,
+            cross_check_binary: None,
+            verify_materialized_views: false,
+        }
+    }
+
+    fn rows(value: &str) -> QueryResult {
+        QueryResult {
+            rows: vec![vec![value.to_string()]],
+            error: None,
+            sqlstate: None,
+        }
+    }
+
+    async fn outcome(backend_type: Backend, result: QueryResult) -> TestOutcome {
+        gap_test()
+            .evaluate_results(vec![result], &options(backend_type))
+            .await
+    }
+
+    #[tokio::test]
+    async fn tursopg_with_the_recorded_gap_answer_passes() {
+        assert!(matches!(
+            outcome(Backend::Tursopg, rows("1")).await,
+            TestOutcome::Passed
+        ));
+    }
+
+    #[tokio::test]
+    async fn tursopg_with_the_postgres_answer_fails_as_gap_fixed() {
+        match outcome(Backend::Tursopg, rows("t")).await {
+            TestOutcome::Failed { reason } => {
+                assert!(reason.starts_with(GAP_FIXED), "{reason}");
+                assert!(
+                    reason.contains("type:bool: tursopg returns t, PostgreSQL returns t"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tursopg_with_another_answer_fails() {
+        match outcome(Backend::Tursopg, rows("2")).await {
+            TestOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains(
+                        "known gap type:bool: tursopg returns 2, PostgreSQL returns t, \
+                         recorded tursopg answer 1"
+                    ),
+                    "{reason}"
+                )
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_checks_the_default_block() {
+        assert!(matches!(
+            outcome(Backend::Postgres, rows("t")).await,
+            TestOutcome::Passed
+        ));
+        assert!(matches!(
+            outcome(Backend::Postgres, rows("1")).await,
+            TestOutcome::Failed { .. }
+        ));
+    }
+
+    /// A gap test whose PostgreSQL answer is an error with a message.
+    const ERROR_GAP_TEST: &str = r#"@database :memory:
+
+@compat-gap "type:int4"
+test e {
+    SELECT 'x'::int4;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax
+}
+expect @tursopg {
+    0
+}
+"#;
+
+    fn error(sqlstate: &str, message: &str) -> QueryResult {
+        QueryResult {
+            rows: Vec::new(),
+            error: Some(message.to_string()),
+            sqlstate: Some(sqlstate.to_string()),
+        }
+    }
+
+    async fn error_gap_outcome(backend_type: Backend, result: QueryResult) -> TestOutcome {
+        crate::gap::parse_with_gap_lints(ERROR_GAP_TEST)
+            .unwrap()
+            .tests
+            .remove(0)
+            .evaluate_results(vec![result], &options(backend_type))
+            .await
+    }
+
+    #[tokio::test]
+    async fn tursopg_fixes_an_error_gap_with_the_postgres_sqlstate_and_any_message() {
+        match error_gap_outcome(Backend::Tursopg, error("22P02", "invalid input syntax")).await {
+            TestOutcome::Failed { reason } => {
+                assert!(reason.starts_with(GAP_FIXED), "{reason}");
+                assert!(!reason.contains("another message"), "{reason}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        match error_gap_outcome(Backend::Tursopg, error("22P02", "bad integer")).await {
+            TestOutcome::Failed { reason } => {
+                assert!(reason.starts_with(GAP_FIXED), "{reason}");
+                assert!(reason.contains("another message"), "{reason}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert!(matches!(
+            error_gap_outcome(Backend::Tursopg, rows("0")).await,
+            TestOutcome::Passed
+        ));
+    }
+
+    #[tokio::test]
+    async fn postgres_checks_the_message_of_an_error_gap() {
+        assert!(matches!(
+            error_gap_outcome(Backend::Postgres, error("22P02", "invalid input syntax")).await,
+            TestOutcome::Passed
+        ));
+        assert!(matches!(
+            error_gap_outcome(Backend::Postgres, error("22P02", "bad integer")).await,
+            TestOutcome::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn tursopg_checks_the_message_of_its_error_gap_block() {
+        let test = crate::gap::parse_with_gap_lints(
+            "@database :memory:\n\n@compat-gap \"function:f\"\ntest e {\n    SELECT f();\n}\nexpect {\n    1\n}\n@sqlstate 0A000\nexpect @tursopg error {\n    f is not supported\n}\n",
+        )
+        .unwrap()
+        .tests
+        .remove(0);
+        let options = options(Backend::Tursopg);
+        assert!(matches!(
+            test.evaluate_results(vec![error("0A000", "f is not supported")], &options)
+                .await,
+            TestOutcome::Passed
+        ));
+        assert!(matches!(
+            test.evaluate_results(vec![error("0A000", "something else")], &options)
+                .await,
+            TestOutcome::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn gap_test_is_an_error_on_sqlite_backends() {
+        let test = gap_test();
+        assert!(
+            test.check_backend_support(&options(Backend::Tursopg))
+                .is_none()
+        );
+        assert!(
+            test.check_backend_support(&options(Backend::Postgres))
+                .is_none()
+        );
+        for backend in [Backend::Rust, Backend::Cli, Backend::Js] {
+            let error = test
+                .check_backend_support(&options(backend))
+                .expect("a @compat-gap test must not run on a SQLite backend");
+            assert!(error.contains("@compat-gap"), "{error}");
         }
     }
 }

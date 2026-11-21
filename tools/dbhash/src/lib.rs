@@ -29,9 +29,7 @@ pub struct DbHashOptions {
     pub without_schema: bool,
     /// If true, print each value to stderr as it's hashed.
     pub debug_trace: bool,
-    /// Cipher and key of an encrypted database. Hashing fails if this process already has
-    /// the database open and it was encrypted with `PRAGMA cipher`/`PRAGMA hexkey`: that
-    /// open `Database` has no cipher set, so a new connection cannot use the key.
+    /// Cipher and key of an encrypted database.
     pub encryption: Option<EncryptionOpts>,
 }
 

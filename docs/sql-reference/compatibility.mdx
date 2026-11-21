@@ -28,16 +28,64 @@ These features extend Turso beyond SQLite compatibility:
 | stddev() | Standard deviation aggregate function |
 | [DEFAULT in VALUES](/docs/sql-reference/statements/insert#default-keyword-in-values) | SQL-standard DEFAULT keyword in INSERT VALUES lists |
 
+## Limits
+
+Turso stops a statement with an error when the statement goes past one of these
+limits. Where SQLite has the same limit, Turso uses the same value and the same
+message.
+
+| Limit | Turso | SQLite | Error |
+|-------|-------|--------|-------|
+| Depth of an expression | 100 | 1000 | `Expression tree is too large (maximum depth 100)` |
+| Terms in a compound `SELECT` | 500 | 500 | `too many terms in compound SELECT` |
+| Depth of nested queries | 500 | No limit | `Query is nested too deeply (maximum depth 500)` |
+| Levels of triggers and foreign key actions | 1000 | 1000 | `too many levels of trigger recursion` |
+
+A `VALUES` list with many rows is one term. SQLite does not count the terms of
+a compound `SELECT` whose last term is `VALUES`, but Turso counts them.
+
+The depth of nested queries counts subqueries in a `FROM` clause or in an
+expression, CTE bodies, and parenthesized `FROM` terms. It also counts each
+view or CTE that a query reads through another view or CTE, and each
+different window in a `SELECT`, because each of these adds one level of
+subquery to the plan. Sibling subqueries do not add to the depth.
+
+The levels of triggers count the trigger programs and the foreign key action
+programs that execute one inside the other, for example a chain of triggers or
+an `ON DELETE CASCADE` through a chain of rows. As in SQLite, the error occurs
+only when a statement gets to level 1001, and the statement rolls back.
+
+The limits on compound terms and on nested queries also apply when Turso reads
+the views and triggers that a database stores. SQLite and older versions of
+Turso can have written them without these limits, but SQL this deep can
+overflow the stack of Turso. Thus Turso does not load such a view: a statement
+that reads it gets an error, `ALTER TABLE` gets the error of the limit, and
+`DROP VIEW` removes the view. A database with such a trigger does not open.
+
 ## PostgreSQL schema metadata
 
 The PostgreSQL opening functions initialize the relation catalog before returning
 the database, including for asynchronous server opens. Relations receive stable,
 persisted OIDs when created, and column `attrelid` values identify those relations.
 
-The PostgreSQL frontend exposes the default `standard public schema` comment in
-`pg_catalog.pg_description`. This lets `pg_dump` preserve the default comment on
-`public` without emitting an empty `COMMENT ON SCHEMA` statement. User-defined
-comments are not persisted.
+`pg_catalog.pg_description` is a table in the database file. `COMMENT ON`
+stores the comment of a table, view, materialized view, index, sequence, table
+column or schema in it, in the transaction of the statement, and `COMMENT ON
+... IS NULL` deletes it. Dropping the relation, the column or the schema
+deletes its comments. `obj_description(oid, 'pg_class')`,
+`obj_description(oid, 'pg_namespace')` and `col_description(table_oid,
+column_number)` read them. `COMMENT ON` any other kind of object, such as a
+type, a function or a constraint, on a column of a view, and on a catalog
+relation such as `pg_class`, fails with SQLSTATE 0A000. So does `COMMENT ON
+INDEX` for the index of a `PRIMARY KEY` or `UNIQUE` constraint, such as
+`t_pkey`. A call of `obj_description` or `col_description` fails with SQLSTATE
+0A000 in a column `DEFAULT`, in a `CHECK` constraint, in an index, and with an
+aggregate or window function in an argument, such as `obj_description(max(oid),
+'pg_class')`; an aggregate inside a subquery in the argument works. Only the owner of a relation or a superuser comments on it,
+and only a superuser comments on a schema. A new database has the default
+`standard public schema` comment of `public`, so `pg_dump` does not emit an
+empty `COMMENT ON SCHEMA` statement for it. Every role reads `pg_description`,
+and no statement of a user writes it other than `COMMENT ON`.
 
 The public schema reports `pg_database_owner` as its owner, with `CREATE` and
 `USAGE` for that role and `USAGE` for `PUBLIC`, matching PostgreSQL's defaults.

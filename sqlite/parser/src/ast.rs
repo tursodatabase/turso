@@ -221,6 +221,14 @@ pub enum Stmt {
         /// role options
         options: RoleOptions,
     },
+    /// `DROP ROLE`. Not SQLite syntax; a frontend with roles translates its
+    /// own DROP ROLE into this.
+    DropRole {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// The roles to drop, as the statement names them.
+        roles: Vec<Grantee>,
+    },
     /// `GRANT`: privileges on relations for roles. Not SQLite syntax; a
     /// frontend with roles translates its own GRANT into this.
     Grant(Grant),
@@ -1587,6 +1595,30 @@ pub enum RelationKind {
     MaterializedView,
     Sequence,
     Index,
+}
+
+impl RelationKind {
+    /// The kind in words, such as `table` or `materialized view`.
+    pub fn name(self) -> &'static str {
+        match self {
+            RelationKind::Table => "table",
+            RelationKind::View => "view",
+            RelationKind::MaterializedView => "materialized view",
+            RelationKind::Sequence => "sequence",
+            RelationKind::Index => "index",
+        }
+    }
+
+    /// The kind as an error message names it, such as `a table` or `an index`.
+    pub fn with_article(self) -> &'static str {
+        match self {
+            RelationKind::Table => "a table",
+            RelationKind::View => "a view",
+            RelationKind::MaterializedView => "a materialized view",
+            RelationKind::Sequence => "a sequence",
+            RelationKind::Index => "an index",
+        }
+    }
 }
 
 /// A role named in DDL, like PostgreSQL's RoleSpec.

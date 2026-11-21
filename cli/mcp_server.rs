@@ -84,6 +84,7 @@ impl StmtClass {
             | Stmt::CreateType { .. }
             | Stmt::CreateDomain { .. }
             | Stmt::CreateRole { .. }
+            | Stmt::DropRole { .. }
             | Stmt::Grant(_)
             | Stmt::CreateSequence { .. }
             | Stmt::CreateSchema { .. }

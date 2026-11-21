@@ -1,12 +1,15 @@
-use rand::{rng, RngCore, SeedableRng};
+use rand::{rng, seq::SliceRandom, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rusqlite::params;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering as StdOrdering};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use turso_core::io::{FileId, FileSyncType};
 use turso_core::{
-    Clock, ConnectOpts, Connection, Database, Dialect, FromValueRow, Row, SessionRole, IO,
+    Buffer, Clock, Completion, ConnectOpts, Connection, Database, Dialect, File, FromValueRow,
+    MemoryIO, MonotonicInstant, OpenFlags, Row, SessionRole, WallClockInstant, IO,
 };
 use turso_sqlite::SqliteDialect;
 
@@ -39,6 +42,7 @@ pub struct TempDatabase {
     pub init_sql: Option<String>,
     #[allow(dead_code)]
     pub enable_mvcc: bool,
+    pub encryption: Option<turso_core::EncryptionOpts>,
 }
 unsafe impl Send for TempDatabase {}
 
@@ -53,6 +57,8 @@ pub struct TempDatabaseBuilder {
     io_uring: bool,
     enable_views: bool,
     dialect: Option<Arc<dyn Dialect>>,
+    encryption: Option<turso_core::EncryptionOpts>,
+    page_size: Option<turso_core::storage::sqlite3_ondisk::PageSize>,
 }
 
 struct TestIo {
@@ -139,6 +145,8 @@ impl TempDatabaseBuilder {
             io_uring: false,
             enable_views: false,
             dialect: None,
+            encryption: None,
+            page_size: None,
         }
     }
 
@@ -200,6 +208,19 @@ impl TempDatabaseBuilder {
         self
     }
 
+    pub fn with_encryption(mut self, cipher: &str, hexkey: &str) -> Self {
+        self.encryption = Some(turso_core::EncryptionOpts {
+            cipher: cipher.into(),
+            hexkey: hexkey.into(),
+        });
+        self
+    }
+
+    pub fn with_page_size(mut self, size: u32) -> Self {
+        self.page_size = Some(turso_core::storage::sqlite3_ondisk::PageSize::new(size).unwrap());
+        self
+    }
+
     pub fn build(self) -> TempDatabase {
         let mut opts = self
             .opts
@@ -250,21 +271,25 @@ impl TempDatabaseBuilder {
             }
         };
         let dialect = self.dialect.unwrap_or_else(|| Arc::new(SqliteDialect));
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            db_path.to_str().unwrap(),
-            flags,
-            opts,
-            None,
-            dialect,
-        )
-        .unwrap();
+        let mut options = turso_core::OpenOptions::new(dialect)
+            .flags(flags)
+            .db_opts(opts)
+            .encryption(self.encryption.clone());
+        if let Some(size) = self.page_size {
+            options = options.page_size(size);
+        }
+        let db = Database::open(io.clone(), db_path.to_str().unwrap(), options).unwrap();
+        let connect_opts = || {
+            ConnectOpts::new(SessionRole::Superuser).with_encryption_key(
+                self.encryption
+                    .as_ref()
+                    .map(|opts| turso_core::EncryptionKey::from_hex_string(&opts.hexkey).unwrap()),
+            )
+        };
 
         // Enable MVCC via turso connection if requested
         if self.enable_mvcc {
-            let conn = db
-                .connect(ConnectOpts::new(SessionRole::Superuser))
-                .unwrap();
+            let conn = db.connect(connect_opts()).unwrap();
             conn.pragma_update("journal_mode", "'mvcc'")
                 .expect("enable mvcc");
         }
@@ -277,6 +302,7 @@ impl TempDatabaseBuilder {
             db_flags: flags,
             init_sql: self.init_sql,
             enable_mvcc: self.enable_mvcc,
+            encryption: self.encryption,
         }
     }
 }
@@ -331,7 +357,13 @@ impl TempDatabase {
 
         let conn = self
             .db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .connect(
+                ConnectOpts::new(SessionRole::Superuser).with_encryption_key(
+                    self.encryption.as_ref().map(|opts| {
+                        turso_core::EncryptionKey::from_hex_string(&opts.hexkey).unwrap()
+                    }),
+                ),
+            )
             .unwrap();
         log::debug!("connected to limbo");
         conn
@@ -569,6 +601,19 @@ pub fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
     (rng, seed as u64)
 }
 
+/// Set ENCRYPTION_TEST_FULL=1 for every case; SEED replays sampled cases.
+pub fn sample_encryption_cases<T>(mut cases: Vec<T>, count: usize, rng: &mut ChaCha8Rng) -> Vec<T> {
+    if !full_encryption_tests() {
+        cases.shuffle(rng);
+        cases.truncate(count);
+    }
+    cases
+}
+
+pub fn full_encryption_tests() -> bool {
+    std::env::var("ENCRYPTION_TEST_FULL").as_deref() == Ok("1")
+}
+
 pub fn run_query(tmp_db: &TempDatabase, conn: &Arc<Connection>, query: &str) -> anyhow::Result<()> {
     run_query_core(tmp_db, conn, query, None::<fn(&Row)>)
 }
@@ -714,6 +759,137 @@ impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4);
 impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5);
 impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5, T6: 6);
 impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5, T6: 6, T7: 7);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyncCounts {
+    pub db: usize,
+    pub wal: usize,
+}
+
+/// Memory IO that counts the fsyncs of one database file and of its WAL.
+pub struct SyncCountingIo {
+    inner: Arc<MemoryIO>,
+    tracked_db_path: String,
+    tracked_wal_path: String,
+    db_syncs: Arc<AtomicUsize>,
+    wal_syncs: Arc<AtomicUsize>,
+}
+
+impl SyncCountingIo {
+    pub fn new(tracked_db_path: &str) -> Self {
+        Self {
+            inner: Arc::new(MemoryIO::new()),
+            tracked_db_path: tracked_db_path.to_string(),
+            tracked_wal_path: format!("{tracked_db_path}-wal"),
+            db_syncs: Arc::new(AtomicUsize::new(0)),
+            wal_syncs: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn counts(&self) -> SyncCounts {
+        SyncCounts {
+            db: self.db_syncs.load(StdOrdering::SeqCst),
+            wal: self.wal_syncs.load(StdOrdering::SeqCst),
+        }
+    }
+}
+
+impl Clock for SyncCountingIo {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for SyncCountingIo {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn File>> {
+        let inner = self.inner.open_file(path, flags, direct)?;
+        Ok(Arc::new(SyncCountingFile {
+            inner,
+            count_as_db_sync: path == self.tracked_db_path,
+            count_as_wal_sync: path == self.tracked_wal_path,
+            db_syncs: self.db_syncs.clone(),
+            wal_syncs: self.wal_syncs.clone(),
+        }))
+    }
+
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn step(&self) -> turso_core::Result<()> {
+        self.inner.step()
+    }
+
+    fn drain_completions(&self, completions: &[Completion]) -> turso_core::Result<()> {
+        self.inner.drain_completions(completions)
+    }
+
+    fn cancel(&self, completions: &[Completion]) -> turso_core::Result<()> {
+        self.inner.cancel(completions)
+    }
+
+    fn file_id(&self, path: &str) -> turso_core::Result<FileId> {
+        self.inner.file_id(path)
+    }
+}
+
+struct SyncCountingFile {
+    inner: Arc<dyn File>,
+    count_as_db_sync: bool,
+    count_as_wal_sync: bool,
+    db_syncs: Arc<AtomicUsize>,
+    wal_syncs: Arc<AtomicUsize>,
+}
+
+impl File for SyncCountingFile {
+    fn lock_file(&self, exclusive: bool) -> turso_core::Result<()> {
+        self.inner.lock_file(exclusive)
+    }
+
+    fn unlock_file(&self) -> turso_core::Result<()> {
+        self.inner.unlock_file()
+    }
+
+    fn pread(&self, pos: u64, c: Completion) -> turso_core::Result<Completion> {
+        self.inner.pread(pos, c)
+    }
+
+    fn pwrite(
+        &self,
+        pos: u64,
+        buffer: Arc<Buffer>,
+        c: Completion,
+    ) -> turso_core::Result<Completion> {
+        self.inner.pwrite(pos, buffer, c)
+    }
+
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
+        if self.count_as_db_sync {
+            self.db_syncs.fetch_add(1, StdOrdering::SeqCst);
+        }
+        if self.count_as_wal_sync {
+            self.wal_syncs.fetch_add(1, StdOrdering::SeqCst);
+        }
+        self.inner.sync(c, sync_type)
+    }
+
+    fn size(&self) -> turso_core::Result<u64> {
+        self.inner.size()
+    }
+
+    fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
+        self.inner.truncate(len, c)
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -110,6 +110,16 @@ ON CONFLICT (email) DO NOTHING;
 At most one `ON CONFLICT` clause can omit the conflict target. A clause without a conflict target acts as a catch-all and must appear last. Only `DO NOTHING` is allowed without a conflict target.
 </Info>
 
+### Combining with an OR Clause
+
+An `INSERT OR IGNORE` (or another `OR` clause) can also have `ON CONFLICT` clauses. A conflict on a constraint that an `ON CONFLICT` clause targets runs that clause. The `OR` clause applies to every other constraint violation. An `OR` clause on the statement that fires a trigger also applies to the statements in the trigger body, in the same way.
+
+```sql
+-- A conflict on id updates the row; a conflict on email skips it
+INSERT OR IGNORE INTO users (id, email, name) VALUES (1, 'alice@example.com', 'Alice')
+ON CONFLICT (id) DO UPDATE SET name = excluded.name;
+```
+
 ## Examples
 
 ### Upsert a counter

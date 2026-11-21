@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use miette::{NamedSource, Report};
 use owo_colors::OwoColorize;
+use sqltest::gap::GapReport;
 use sqltest::{
     DatabaseLocation, DefaultDatabases, Format, GeneratorConfig, INTEGRITY_FIXTURE_RELATIVE_PATHS,
     OutputFormat, ParseError, RunnerConfig, SnapshotUpdateMode, TestRunner,
@@ -102,6 +103,32 @@ enum Commands {
         /// Stop at the first failed test or error
         #[arg(long)]
         fail_fast: bool,
+
+        /// Turn on the gap lints, which the PostgreSQL suites need; without
+        /// them a `@compat-gap` test does not parse.
+        #[arg(long)]
+        compat_gaps: bool,
+    },
+
+    /// Print the gap-test counts of test files as Markdown tables, without
+    /// running the tests. The gap lints are on.
+    Gaps {
+        /// Test files or directories
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+
+    /// Fail when a gap test of the base tree is gone from the head tree: deleted,
+    /// renamed, or converted into a plain test with other SQL, setups or
+    /// PostgreSQL answer
+    GapRemovals {
+        /// Test directory in the base tree, for example the target branch
+        #[arg(long)]
+        base: PathBuf,
+
+        /// The same test directory in the head tree
+        #[arg(long)]
+        head: PathBuf,
     },
 
     /// Validate test file syntax and check for pending snapshots
@@ -109,6 +136,11 @@ enum Commands {
         /// Test files or directories
         #[arg(required = true)]
         paths: Vec<PathBuf>,
+
+        /// Turn on the gap lints, which the PostgreSQL suites need; without
+        /// them a `@compat-gap` test does not parse.
+        #[arg(long)]
+        compat_gaps: bool,
     },
 
     /// Convert Tcl .test files to .sqltest format
@@ -173,6 +205,7 @@ async fn main() -> ExitCode {
             cross_check_binary,
             postgres_dsn,
             fail_fast,
+            compat_gaps,
         } => {
             run_tests(
                 paths,
@@ -190,10 +223,13 @@ async fn main() -> ExitCode {
                 cross_check_binary,
                 postgres_dsn,
                 fail_fast,
+                compat_gaps,
             )
             .await
         }
-        Commands::Check { paths } => check_files(paths).await,
+        Commands::Check { paths, compat_gaps } => check_files(paths, compat_gaps).await,
+        Commands::Gaps { paths } => print_gaps(paths).await,
+        Commands::GapRemovals { base, head } => check_gap_removals(base, head).await,
         Commands::Convert {
             paths,
             output_dir,
@@ -248,6 +284,7 @@ async fn run_tests(
     cross_check_binary: Option<PathBuf>,
     postgres_dsn: Option<String>,
     fail_fast: bool,
+    compat_gaps: bool,
 ) -> ExitCode {
     match (&postgres_dsn, backend_type.as_str()) {
         (None, "postgres") => {
@@ -304,12 +341,23 @@ async fn run_tests(
     };
 
     // Load and parse test files
-    let loaded = match load_test_files(&paths).await {
+    let loaded = match load_test_files(&paths, &sqltest::gap::lint(compat_gaps)).await {
         Ok(loaded) => loaded,
         Err(e) => {
             eprintln!("Error loading test files: {e}");
             return ExitCode::from(1);
         }
+    };
+
+    let gap_report = if compat_gaps {
+        GapReport::from_files(
+            loaded
+                .files
+                .iter()
+                .map(|(path, file)| (path.as_path(), file)),
+        )
+    } else {
+        GapReport::default()
     };
 
     let integrity_fixtures = collect_integrity_fixtures(loaded.test_files());
@@ -540,8 +588,67 @@ async fn run_tests(
     output.write_summary(&summary);
     output.flush();
 
+    if output_format == "pretty" && !gap_report.is_empty() {
+        println!();
+        println!("{}", gap_report.to_markdown());
+    }
     // Return appropriate exit code
     if summary.is_success() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+/// Prints the gap report of the test files as Markdown, for the `gaps`
+/// command. The tests are parsed but not run.
+async fn print_gaps(paths: Vec<PathBuf>) -> ExitCode {
+    let loaded = match load_test_files(&paths, &sqltest::gap::lint(true)).await {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("Error loading test files: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    // A file that does not parse would be left out of the counts, so the
+    // command fails instead of printing counts that are too low.
+    if !loaded.errors.is_empty() {
+        for error in &loaded.errors {
+            eprintln!(
+                "Error: {} does not parse; run `sqltest check` on it",
+                error.file.display()
+            );
+        }
+        return ExitCode::from(1);
+    }
+    let report = GapReport::from_files(
+        loaded
+            .files
+            .iter()
+            .map(|(path, file)| (path.as_path(), file)),
+    );
+    println!("{}", report.to_markdown());
+    ExitCode::SUCCESS
+}
+
+/// Checks that the head tree keeps every gap test of the base tree, for the
+/// `gap-removals` command.
+async fn check_gap_removals(base: PathBuf, head: PathBuf) -> ExitCode {
+    let mut trees = Vec::new();
+    for (root, is_base) in [(&base, true), (&head, false)] {
+        match sqltest::gap_removals::load_tree(root, is_base).await {
+            Ok(files) => trees.push(files),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let errors = sqltest::gap_removals::removed_gaps(&trees[0], &trees[1]);
+    for error in &errors {
+        eprintln!("{} {error}", "Removed gap:".red().bold());
+    }
+    if errors.is_empty() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
@@ -561,7 +668,8 @@ impl sqltest::DefaultDatabaseResolver for DefaultDatabasesResolver {
     }
 }
 
-async fn check_files(paths: Vec<PathBuf>) -> ExitCode {
+async fn check_files(paths: Vec<PathBuf>, compat_gaps: bool) -> ExitCode {
+    let lint = sqltest::gap::lint(compat_gaps);
     let mut has_errors = false;
 
     // Check for pending snapshot files
@@ -607,7 +715,7 @@ async fn check_files(paths: Vec<PathBuf>) -> ExitCode {
                     for entry in entries {
                         match entry {
                             Ok(file_path) => {
-                                if !check_single_file(&file_path) {
+                                if !check_single_file(&file_path, &lint) {
                                     has_errors = true;
                                 }
                             }
@@ -624,7 +732,7 @@ async fn check_files(paths: Vec<PathBuf>) -> ExitCode {
                 }
             }
         } else if path.is_file() {
-            if !check_single_file(path) {
+            if !check_single_file(path, &lint) {
                 has_errors = true;
             }
         } else {
@@ -640,9 +748,9 @@ async fn check_files(paths: Vec<PathBuf>) -> ExitCode {
     }
 }
 
-fn check_single_file(path: &PathBuf) -> bool {
+fn check_single_file(path: &PathBuf, lint: sqltest::parser::TestLint<'_>) -> bool {
     match std::fs::read_to_string(path) {
-        Ok(content) => match sqltest::parse(&content) {
+        Ok(content) => match sqltest::parser::parse_with_lint(&content, lint) {
             Ok(file) => {
                 let snapshots_str = if file.snapshots.is_empty() {
                     String::new()

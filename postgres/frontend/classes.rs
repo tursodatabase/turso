@@ -38,9 +38,9 @@ use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::security::roles::RoleId;
 use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, AccessStatement,
-    CatalogApply, CmpInsFlags, CollationSeq, Connection, CursorType, InsertFlags, Insn, LimboError,
-    NewOwner, Numeric, OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationChange,
-    RelationName, Value,
+    Catalog, CatalogApply, CatalogCmd, CmdContext, CmdOrigin, CmpInsFlags, CollationSeq,
+    Connection, CursorType, DropColumn, InsertFlags, Insn, LimboError, NewOwner, Numeric,
+    OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationName, SqliteCatalog, Value,
 };
 use turso_parser::ast;
 
@@ -56,6 +56,7 @@ use crate::auth_members::{
     CREATE_AUTH_MEMBERS_TABLE_SQL,
 };
 use crate::catalog::{engine_role_by_name, role_oid, role_oid_by_name};
+use crate::descriptions::{emit_delete_comments, is_stored_catalog_table, Dropped};
 use crate::error::sqlstate_error;
 use crate::policies::{self, TablePolicies};
 use crate::roles::{
@@ -171,6 +172,9 @@ impl ClassCatalog {
     pub(crate) fn build(schema: &Schema, rows: &[Vec<Value>]) -> turso_core::Result<Self> {
         let catalog = Self::new(rows)?;
         for (namespace, name, _) in schema.user_relations() {
+            if is_stored_catalog_table(namespace, &name) {
+                continue;
+            }
             if catalog.get_by_name(namespace, &name).is_none() {
                 return Err(LimboError::Corrupt(format!(
                     "relation \"{name}\" of namespace {} has no row in {CLASSES_TABLE_NAME}",
@@ -205,6 +209,10 @@ impl ClassCatalog {
     /// The class rows, ordered by oid.
     pub(crate) fn classes(&self) -> impl Iterator<Item = &RelationClass> {
         self.by_oid.values()
+    }
+
+    pub(crate) fn get_by_oid(&self, oid: i64) -> Option<&RelationClass> {
+        self.by_oid.get(&oid)
     }
 
     pub(crate) fn get_by_name(&self, namespace: NamespaceId, name: &str) -> Option<&RelationClass> {
@@ -390,6 +398,9 @@ pub(crate) fn role_has_privilege(
     role: RoleId,
     privilege: ast::Privilege,
 ) -> bool {
+    if is_stored_catalog_table(namespace, name) {
+        return privilege == ast::Privilege::Select;
+    }
     let Some(class) =
         class_catalog(schema).and_then(|catalog| catalog.get_by_name(namespace, name))
     else {
@@ -435,116 +446,403 @@ pub(crate) fn row_security_policies<'a>(
         .map_or(&[], |class| class.relpolicies.as_slice())
 }
 
-/// [`turso_core::Dialect::translate_relation_changes`] for the PostgreSQL
-/// frontend: a class row per created relation, owned by the current role,
-/// which is what PostgreSQL's `GetUserId()` gives after `SET ROLE`; no row
-/// for a dropped one; a rename keeps the oid and owner.
-pub(crate) fn translate_relation_changes(
-    program: &mut ProgramBuilder,
-    schema: &Schema,
-    connection: &Arc<Connection>,
-    changes: &[RelationChange<'_>],
-) -> turso_core::Result<()> {
-    let allocates_oids = changes
-        .iter()
-        .any(|change| matches!(change, RelationChange::Created { .. }));
-    let Some(cursors) = open_class_table_for_writing(program, schema, allocates_oids)? else {
-        return Ok(());
-    };
-    for change in changes {
-        match change {
-            RelationChange::Created {
-                namespace,
-                name,
-                kind,
-                table,
-            } => {
-                // Relation names are unique per schema across kinds.
-                if is_user_relation_name(*kind, name)
-                    && class_catalog(schema)
-                        .is_some_and(|catalog| catalog.get_by_name(*namespace, name).is_some())
-                {
-                    return Err(LimboError::ParseError(format!(
-                        "relation \"{name}\" already exists"
-                    )));
-                }
-                // An index is owned by its table's owner, anything else by
-                // the current role, which is what PostgreSQL's GetUserId()
-                // gives after SET ROLE.
-                let owner = table
-                    .and_then(|table| relation_owner(schema, *namespace, table))
-                    .unwrap_or_else(|| connection.current_role());
-                emit_class_row_insert(program, &cursors, *namespace, name, *kind, owner)
-            }
-            RelationChange::Dropped { namespace, name } => {
-                // An engine relation has no row and nothing to do.
-                if class_catalog(schema)
-                    .and_then(|catalog| catalog.get_by_name(*namespace, name))
-                    .is_none()
-                {
-                    continue;
-                }
-                emit_class_row_delete(program, &cursors, *namespace, name)
-            }
-            RelationChange::ColumnRenamed {
-                namespace,
-                table,
-                old_name,
-                new_name,
-            } => {
-                let owned: Vec<(String, i64)> = class_catalog(schema)
-                    .and_then(|catalog| {
-                        let table = catalog.get_by_name(*namespace, table)?;
-                        Some(
-                            catalog
-                                .owned_by(table.oid)
-                                .filter(|owned| owned.is_owned_by_column(old_name))
-                                .map(|owned| (owned.relname.clone(), table.oid))
-                                .collect(),
-                        )
-                    })
-                    .unwrap_or_default();
-                if owned.is_empty() {
-                    continue;
-                }
-                for (sequence, table_oid) in owned {
-                    emit_class_row_set_owned_by(
+/// The catalog of a PostgreSQL database: the engine's `sqlite_schema` rows,
+/// and a class row for each relation of the main database.
+#[derive(Debug)]
+pub(crate) struct PostgresCatalog;
+
+impl Catalog for PostgresCatalog {
+    fn emit(
+        &self,
+        program: &mut ProgramBuilder,
+        ctx: &CmdContext<'_>,
+        cmd: &CatalogCmd<'_>,
+    ) -> turso_core::Result<()> {
+        SqliteCatalog.emit(program, ctx, cmd)?;
+        match cmd {
+            CatalogCmd::CreateTable(table) => {
+                if let Some(rows) = ClassRowWriter::open(program, ctx, true)? {
+                    rows.new_relation(
                         program,
-                        &cursors,
-                        *namespace,
-                        &sequence,
-                        table_oid,
-                        Some(new_name),
-                    );
+                        table.namespace,
+                        table.name,
+                        RelationKind::Table,
+                        None,
+                    )?;
+                    for index in table.automatic_indexes {
+                        rows.new_relation(
+                            program,
+                            table.namespace,
+                            &index.name,
+                            RelationKind::Index,
+                            Some(table.name),
+                        )?;
+                    }
                 }
-                OwnerColumnRenamed {
-                    namespace: *namespace,
-                    table: table.to_string(),
-                    old_name: old_name.to_string(),
-                    new_name: new_name.to_string(),
-                }
-                .emit(program);
             }
-            RelationChange::Renamed {
-                namespace,
-                old_name,
-                new_name,
-            } => {
-                let has_row = class_catalog(schema)
-                    .is_some_and(|catalog| catalog.get_by_name(*namespace, old_name).is_some());
-                if has_row {
-                    emit_class_row_rename(program, &cursors, *namespace, old_name, new_name);
+            CatalogCmd::CreateIndex(index) => {
+                if let Some(rows) = ClassRowWriter::open(program, ctx, true)? {
+                    rows.new_relation(
+                        program,
+                        index.namespace,
+                        index.name,
+                        RelationKind::Index,
+                        Some(index.table),
+                    )?;
+                }
+            }
+            CatalogCmd::DropIndex(index) => {
+                if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
+                    rows.dropped_relation(program, index.namespace, index.name);
+                }
+            }
+            CatalogCmd::CreateSequence(sequence) => {
+                if let Some(rows) = ClassRowWriter::open(program, ctx, true)? {
+                    rows.new_relation(
+                        program,
+                        sequence.namespace,
+                        sequence.name,
+                        RelationKind::Sequence,
+                        None,
+                    )?;
+                }
+            }
+            CatalogCmd::DropSequence(sequence) => {
+                if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
+                    rows.dropped_relation(program, sequence.namespace, sequence.name);
+                }
+            }
+            CatalogCmd::DropTable(table) => {
+                // A virtual table has no class row, in any database.
+                if table.is_virtual {
+                    return Ok(());
+                }
+                // The class rows that go away with the table: its own and
+                // those of its indexes.
+                if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
+                    rows.dropped_relation(program, table.namespace, table.name);
+                    for index in table.indexes {
+                        rows.dropped_relation(program, table.namespace, index);
+                    }
+                }
+            }
+            CatalogCmd::CreateView(view) => {
+                if let Some(rows) = ClassRowWriter::open(program, ctx, true)? {
+                    rows.new_relation(
+                        program,
+                        view.namespace,
+                        view.name,
+                        RelationKind::View,
+                        None,
+                    )?;
+                }
+            }
+            CatalogCmd::CreateMaterializedView(view) => {
+                if let Some(rows) = ClassRowWriter::open(program, ctx, true)? {
+                    rows.new_relation(
+                        program,
+                        view.namespace,
+                        view.name,
+                        RelationKind::MaterializedView,
+                        None,
+                    )?;
+                }
+            }
+            CatalogCmd::DropView(view) => {
+                if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
+                    rows.dropped_relation(program, view.namespace, view.name);
+                }
+            }
+            CatalogCmd::RenameTable(table) => {
+                // A virtual table has no class row, in any database.
+                if table.is_virtual {
+                    return Ok(());
+                }
+                // The automatic indexes get their new names with the table.
+                if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
+                    rows.renamed_relation(program, table.namespace, table.old_name, table.new_name);
+                    for (old_name, new_name) in table.renamed_automatic_indexes() {
+                        rows.renamed_relation(program, table.namespace, old_name, &new_name);
+                    }
+                }
+            }
+            CatalogCmd::RenameColumn(column) => {
+                rename_owner_column(
+                    program,
+                    ctx,
+                    column.namespace,
+                    column.table,
+                    column.old_name,
+                    column.new_name.as_str(),
+                )?;
+            }
+            CatalogCmd::AlterColumn(column) => {
+                rename_owner_column(
+                    program,
+                    ctx,
+                    column.namespace,
+                    column.table,
+                    column.old_name,
+                    column.definition.col_name.as_str(),
+                )?;
+            }
+            // A new column owns no sequence, so no class row changes.
+            CatalogCmd::AddColumn(_) => {}
+            // The statement drops the sequences that the column owns
+            // itself, each with its class row.
+            CatalogCmd::DropColumn(column) => {
+                if ctx.origin != CmdOrigin::Engine && ctx.database_id == MAIN_DB_ID {
+                    emit_dropped_column_comments(program, ctx, column);
                 }
             }
         }
+        Ok(())
+    }
+
+    fn emit_access(
+        &self,
+        program: &mut ProgramBuilder,
+        ctx: &CmdContext<'_>,
+        statement: &AccessStatement<'_>,
+    ) -> turso_core::Result<()> {
+        match statement {
+            AccessStatement::CreateRole { name, options } => {
+                crate::roles::translate_create_role(program, ctx.schema, name, options)
+            }
+            AccessStatement::DropRole { if_exists, roles } => crate::roles::translate_drop_role(
+                program,
+                ctx.schema,
+                ctx.connection,
+                *if_exists,
+                roles,
+            ),
+            AccessStatement::GrantRole {
+                revoke,
+                roles,
+                grantees,
+            } => crate::auth_members::translate_grant_role(
+                program,
+                ctx.schema,
+                ctx.connection,
+                *revoke,
+                roles,
+                grantees,
+            ),
+            // The owner column of a sequence is in the sequence's class row.
+            AccessStatement::ChangeOwner {
+                owner: NewOwner::Column(_),
+                ..
+            } if !writes_class_rows(ctx)? => Ok(()),
+            _ => translate_access_statement(program, ctx.schema, ctx.connection, statement),
+        }
+    }
+}
+
+/// Deletes the comment of the column that `column.table` no longer has, and
+/// moves the comments of the later columns to the numbers those columns now
+/// have.
+fn emit_dropped_column_comments(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    column: &DropColumn<'_>,
+) {
+    // An engine table has no row and no comments.
+    let Some(class) = class_catalog(ctx.schema)
+        .and_then(|catalog| catalog.get_by_name(column.namespace, column.name))
+    else {
+        return;
+    };
+    let Some(table_before) = ctx.schema.get_btree_table(column.namespace, column.name) else {
+        return;
+    };
+    let remaining = column.table.columns();
+    let position = table_before
+        .columns()
+        .iter()
+        .zip(remaining)
+        .position(|(before, after)| before.name != after.name)
+        .unwrap_or(remaining.len());
+    let column_number = position as i64 + 1;
+    emit_delete_comments(
+        program,
+        ctx.schema,
+        class.oid,
+        Dropped::Column(column_number),
+    );
+}
+
+/// Stores the new name of column `old_name` of `table` in the class rows
+/// of the sequences that the column owns. A column that keeps its name owns
+/// the same sequences as before.
+fn rename_owner_column(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    namespace: NamespaceId,
+    table: &str,
+    old_name: &str,
+    new_name: &str,
+) -> turso_core::Result<()> {
+    if old_name == new_name {
+        return Ok(());
+    }
+    if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
+        rows.renamed_owner_column(program, namespace, table, old_name, new_name);
     }
     Ok(())
 }
 
-/// [`turso_core::Dialect::translate_access_statement`] for the statements
-/// that change a class row. `ALTER ... OWNER TO` sets the owner, with
-/// PostgreSQL's errors for a missing role (42704) and a catalog relation
-/// (42501). A sequence a serial column owns changes owner with its table
+/// Writes the class rows that one statement changes, with cursors that it
+/// opens once.
+struct ClassRowWriter<'a> {
+    schema: &'a Schema,
+    connection: &'a Arc<Connection>,
+    cursors: ClassTableCursors,
+}
+
+impl<'a> ClassRowWriter<'a> {
+    /// Opens the class table for the statement of `ctx`. None when the
+    /// relations of the statement have no class rows, see
+    /// [`writes_class_rows`], or the database has no class table.
+    /// `allocates_oids` says that the statement adds a class row.
+    fn open(
+        program: &mut ProgramBuilder,
+        ctx: &CmdContext<'a>,
+        allocates_oids: bool,
+    ) -> turso_core::Result<Option<Self>> {
+        if !writes_class_rows(ctx)? {
+            return Ok(None);
+        }
+        let cursors = open_class_table_for_writing(program, ctx.schema, allocates_oids)?;
+        Ok(cursors.map(|cursors| Self {
+            schema: ctx.schema,
+            connection: ctx.connection,
+            cursors,
+        }))
+    }
+
+    /// Inserts the class row of a relation that the statement creates.
+    /// `table` is the table of an index, in the same namespace: its owner
+    /// owns the index. Anything else is owned by the current role, which is
+    /// what PostgreSQL's `GetUserId()` gives after `SET ROLE`.
+    fn new_relation(
+        &self,
+        program: &mut ProgramBuilder,
+        namespace: NamespaceId,
+        name: &str,
+        kind: RelationKind,
+        table: Option<&str>,
+    ) -> turso_core::Result<()> {
+        // Relation names are unique per schema across kinds.
+        if is_user_relation_name(kind, name)
+            && class_catalog(self.schema)
+                .is_some_and(|catalog| catalog.get_by_name(namespace, name).is_some())
+        {
+            return Err(LimboError::ParseError(format!(
+                "relation \"{name}\" already exists"
+            )));
+        }
+        let owner = table
+            .and_then(|table| relation_owner(self.schema, namespace, table))
+            .unwrap_or_else(|| self.connection.current_role());
+        emit_class_row_insert(program, &self.cursors, namespace, name, kind, owner);
+        Ok(())
+    }
+
+    /// Deletes the class row of a relation that the statement drops.
+    fn dropped_relation(&self, program: &mut ProgramBuilder, namespace: NamespaceId, name: &str) {
+        // An engine relation has no row and nothing to do.
+        let Some(class) =
+            class_catalog(self.schema).and_then(|catalog| catalog.get_by_name(namespace, name))
+        else {
+            return;
+        };
+        emit_delete_comments(program, self.schema, class.oid, Dropped::Relation);
+        emit_class_row_delete(program, &self.cursors, namespace, name)
+    }
+
+    /// Stores the new name of a relation. Its row keeps its oid and owner.
+    fn renamed_relation(
+        &self,
+        program: &mut ProgramBuilder,
+        namespace: NamespaceId,
+        old_name: &str,
+        new_name: &str,
+    ) {
+        let has_row = class_catalog(self.schema)
+            .is_some_and(|catalog| catalog.get_by_name(namespace, old_name).is_some());
+        if has_row {
+            emit_class_row_rename(program, &self.cursors, namespace, old_name, new_name);
+        }
+    }
+
+    /// Stores the new name of column `old_name` of `table` in the class
+    /// rows of the sequences that the column owns.
+    fn renamed_owner_column(
+        &self,
+        program: &mut ProgramBuilder,
+        namespace: NamespaceId,
+        table: &str,
+        old_name: &str,
+        new_name: &str,
+    ) {
+        let owned: Vec<(String, i64)> = class_catalog(self.schema)
+            .and_then(|catalog| {
+                let table = catalog.get_by_name(namespace, table)?;
+                Some(
+                    catalog
+                        .owned_by(table.oid)
+                        .filter(|owned| owned.is_owned_by_column(old_name))
+                        .map(|owned| (owned.relname.clone(), table.oid))
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
+        if owned.is_empty() {
+            return;
+        }
+        for (sequence, table_oid) in owned {
+            emit_class_row_set_owned_by(
+                program,
+                &self.cursors,
+                namespace,
+                &sequence,
+                table_oid,
+                Some(new_name),
+            );
+        }
+        OwnerColumnRenamed {
+            namespace,
+            table: table.to_string(),
+            old_name: old_name.to_string(),
+            new_name: new_name.to_string(),
+        }
+        .emit(program);
+    }
+}
+
+/// Whether the relations of the statement get class rows. Only the
+/// relations a user creates in the main database do. A statement of the
+/// engine copies or replays a database whose class rows are stored as data
+/// already, and the temp database has no class table. Fails for a user's
+/// statement against an attached database: the class table covers only the
+/// main database, so a database file with relations made while it was
+/// attached could not be opened later.
+fn writes_class_rows(ctx: &CmdContext<'_>) -> turso_core::Result<bool> {
+    if ctx.origin == CmdOrigin::Engine {
+        return Ok(false);
+    }
+    if turso_core::is_attached_db(ctx.database_id) {
+        return Err(LimboError::ParseError(
+            "creating, renaming or dropping relations in an attached database is not supported"
+                .to_string(),
+        ));
+    }
+    Ok(ctx.database_id == MAIN_DB_ID)
+}
+
+/// Emits the bytecode of the [`AccessStatement`]s that change a class row.
+/// `ALTER ... OWNER TO` sets the owner, with PostgreSQL's errors for a
+/// missing role (42704) and a catalog relation (42501). A sequence a serial column owns changes owner with its table
 /// only, as in PostgreSQL: on its own it fails with `cannot change owner of
 /// sequence` (0A000). `GRANT` adds to the access control list when the owner
 /// or a superuser runs it; anyone else grants nothing, as in PostgreSQL,
@@ -688,6 +986,7 @@ pub(crate) fn translate_access_statement(
                         return Err(sqlstate_error(
                             SQLSTATE_FEATURE_NOT_SUPPORTED,
                             format!("{statement} on internal table {name} is not supported"),
+                            None,
                         ));
                     }
                     if *revoke {
@@ -697,6 +996,7 @@ pub(crate) fn translate_access_statement(
                                 "REVOKE on system catalog {} is not supported",
                                 catalog_view_name(name)
                             ),
+                            None,
                         ));
                     }
                     continue;
@@ -709,6 +1009,7 @@ pub(crate) fn translate_access_statement(
                     return Err(sqlstate_error(
                         SQLSTATE_INVALID_GRANT_OPERATION,
                         "invalid privilege type USAGE for table",
+                        None,
                     ));
                 }
                 let owner = role_oid(class.relowner);
@@ -781,6 +1082,7 @@ pub(crate) fn translate_access_statement(
                 return Err(sqlstate_error(
                     SQLSTATE_DUPLICATE_OBJECT,
                     format!("policy \"{policy_name}\" for table \"{name}\" already exists"),
+                    None,
                 ));
             }
             let roles = policy
@@ -834,6 +1136,7 @@ pub(crate) fn translate_access_statement(
                 return Err(sqlstate_error(
                     SQLSTATE_UNDEFINED_OBJECT,
                     format!("policy \"{policy_name}\" for table \"{name}\" does not exist"),
+                    None,
                 ));
             }
             let relpolicies = class.relpolicies.without(policy_name);
@@ -844,7 +1147,9 @@ pub(crate) fn translate_access_statement(
             };
             emit_class_row_set_policies(program, &cursors, *namespace, name, stored);
         }
-        AccessStatement::CreateRole { .. } | AccessStatement::GrantRole { .. } => {
+        AccessStatement::CreateRole { .. }
+        | AccessStatement::DropRole { .. }
+        | AccessStatement::GrantRole { .. } => {
             unreachable!("statements about roles do not change a class row")
         }
     }
@@ -2051,6 +2356,7 @@ pub(crate) fn initialize_schema(
         statements.push(CREATE_AUTH_MEMBERS_TABLE_SQL.to_string());
         statements.push(CREATE_AUTH_MEMBERS_ROLE_MEMBER_INDEX_SQL.to_string());
     }
+    statements.extend(crate::descriptions::initialize_statements(schema));
     Ok(statements)
 }
 
@@ -2299,5 +2605,64 @@ mod tests {
             .unwrap();
         }
         classes
+    }
+
+    /// A table that a user can name in an attached database is in no
+    /// schema, as in a file that the SQLite frontend made.
+    #[test]
+    fn alter_table_in_an_attached_database_refuses_renames_only() {
+        use turso_core::{ConnectOpts, SessionRole};
+
+        let dir = tempfile::tempdir().unwrap();
+        let attached_path = dir.path().join("attached.db");
+        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let opts = turso_core::DatabaseOpts::new().with_attach(true);
+        let attached = turso_core::Database::open_file_with_flags(
+            io.clone(),
+            attached_path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts.with_mvcc(true),
+            None,
+            Arc::new(turso_sqlite::SqliteDialect),
+        )
+        .unwrap()
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+        attached
+            .execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER)")
+            .unwrap();
+        attached.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        attached.close().unwrap();
+        drop(attached);
+
+        let conn = crate::session::open_database_with_io(
+            io,
+            dir.path().join("main.db").to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts,
+        )
+        .unwrap()
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
+            .unwrap();
+
+        for rename in [
+            "ALTER TABLE aux.t RENAME TO t2",
+            "ALTER TABLE aux.t RENAME COLUMN b TO z",
+        ] {
+            let err = conn.execute(rename).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "creating, renaming or dropping relations in an attached database is not supported",
+                "{rename}"
+            );
+        }
+        conn.execute("ALTER TABLE aux.t RENAME COLUMN b TO b")
+            .unwrap();
+        conn.execute("ALTER TABLE aux.t ADD COLUMN d INT").unwrap();
+        conn.execute("ALTER TABLE aux.t DROP COLUMN c").unwrap();
+        conn.execute("INSERT INTO aux.t (a, b, d) VALUES (1, 2, 3)")
+            .unwrap();
     }
 }

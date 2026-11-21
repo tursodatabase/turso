@@ -6,8 +6,9 @@ use crate::translate::emitter::emit_columns_and_dependencies;
 use crate::translate::expr::{emit_constraint_values_decode, emit_stored_column};
 use crate::translate::plan::ColumnMask;
 use crate::turso_assert;
+use crate::vdbe::{MAX_TRIGGER_DEPTH, TRIGGER_DEPTH_ERROR};
 use crate::{
-    error::SQLITE_CONSTRAINT_FOREIGNKEY,
+    error::{SQLITE_CONSTRAINT_FOREIGNKEY, SQLITE_ERROR},
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef},
     sync::{Arc, OnceLock, Weak},
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
@@ -1039,7 +1040,9 @@ fn emit_fk_parent_key_probe(
 
 /// An index on exactly the child key columns that can find the child rows of
 /// a parent key: its key columns must compare with the parent key's
-/// collations, otherwise a seek would miss or wrongly find child rows.
+/// collations, otherwise a seek would miss or wrongly find child rows. A
+/// partial index cannot find them all, because it has no entries for the
+/// child rows that fail its WHERE clause.
 pub(super) fn child_index_for_fk(
     resolver: &Resolver,
     database_id: usize,
@@ -1049,7 +1052,8 @@ pub(super) fn child_index_for_fk(
     resolver.with_schema(database_id, |s| {
         s.get_indices(fk_ref.child_namespace, &fk_ref.child_table.name)
             .find(|ix| {
-                ix.columns.len() == child_cols.len()
+                ix.where_clause.is_none()
+                    && ix.columns.len() == child_cols.len()
                     && ix
                         .columns
                         .iter()
@@ -1894,11 +1898,18 @@ fn emit_fk_action_subprogram(
         );
         Subprogram::Pending(slot)
     } else {
+        let depth = program.subprogram_depth() + 1;
+        if depth > MAX_TRIGGER_DEPTH {
+            // As in SQLite, the error occurs only if the statement gets to this level.
+            program.emit_halt_err(SQLITE_ERROR, TRIGGER_DEPTH_ERROR.to_string());
+            return Ok(());
+        }
         let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
             QueryMode::Normal,
             program.capture_data_changes_info().clone(),
             FK_SUBPROGRAM_OPTS,
             program.is_mvcc_enabled(),
+            depth,
         );
         subprogram_builder
             .flags
