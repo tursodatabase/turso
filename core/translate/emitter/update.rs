@@ -1,7 +1,4 @@
-use super::gencol::{
-    compute_generated_columns, compute_virtual_columns, emit_row_from_cursor,
-    sets_custom_type_column,
-};
+use super::gencol::{compute_generated_columns, emit_row_from_cursor, sets_custom_type_column};
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::ast::{RefAct, ResolveType, TriggerEvent, TriggerTime};
@@ -1695,9 +1692,9 @@ fn emit_update_insns<'a>(
         }
     }
 
-    // When a SET column has a custom type, the virtual columns are computed again
+    // When a SET column has a custom type, the generated columns are computed again
     // after ENCODE, below, and their NOT NULL checks wait for these values.
-    let computes_virtual_columns_after_encode = target_table.table.btree().is_some_and(|btree| {
+    let computes_generated_columns_after_encode = target_table.table.btree().is_some_and(|btree| {
         btree.is_strict && sets_custom_type_column(&btree, &user_value_columns, &t_ctx.resolver)
     });
 
@@ -1710,10 +1707,7 @@ fn emit_update_insns<'a>(
         &column_ctx,
         skip_row_label,
         t_ctx,
-        |column| {
-            column.is_generated()
-                && !(computes_virtual_columns_after_encode && column.is_virtual_generated())
-        },
+        |column| column.is_generated() && !computes_generated_columns_after_encode,
     )?;
     emit_cdc_updates_of_generated_columns(program, &target_table, &column_ctx);
 
@@ -1794,10 +1788,10 @@ fn emit_update_insns<'a>(
                 &layout,
             )?;
 
-            // The virtual columns were computed from the SET values before ENCODE. When a
+            // The generated columns were computed from the SET values before ENCODE. When a
             // SET column has a custom type, a read of the row can give other values, so
             // compute them again from the encoded row, as a read of the row gives them.
-            if computes_virtual_columns_after_encode {
+            if computes_generated_columns_after_encode {
                 let dml_ctx = DmlColumnContext::layout(
                     btree_table.columns(),
                     start,
@@ -1805,7 +1799,7 @@ fn emit_update_insns<'a>(
                     layout.clone(),
                     DmlRowForm::Stored,
                 );
-                compute_virtual_columns(
+                compute_generated_columns(
                     program,
                     &btree_table.columns_topo_sort()?,
                     &dml_ctx,
@@ -1826,7 +1820,7 @@ fn emit_update_insns<'a>(
                 ),
             });
 
-            if computes_virtual_columns_after_encode {
+            if computes_generated_columns_after_encode {
                 emit_deferred_notnull_checks(
                     program,
                     table_references,
@@ -1834,7 +1828,7 @@ fn emit_update_insns<'a>(
                     &column_ctx,
                     skip_row_label,
                     t_ctx,
-                    Column::is_virtual_generated,
+                    Column::is_generated,
                 )?;
             }
         }

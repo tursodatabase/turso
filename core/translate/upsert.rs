@@ -8,8 +8,7 @@ use std::sync::Arc;
 use crate::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::{
-    compute_generated_columns, compute_virtual_columns, emit_row_from_cursor,
-    sets_custom_type_column,
+    compute_generated_columns, emit_row_from_cursor, sets_custom_type_column,
 };
 use super::insert::column_default_expr;
 use crate::alloc::{TryClone, TursoIteratorExt};
@@ -878,9 +877,9 @@ pub fn emit_upsert(
         .iter()
         .map(|(col_idx, _)| *col_idx)
         .try_collect()?;
-    // When a SET column has a custom type, the virtual columns are computed again
+    // When a SET column has a custom type, the generated columns are computed again
     // after ENCODE, below, and their NOT NULL checks wait for these values.
-    let computes_virtual_columns_after_encode = table.btree().is_some_and(|bt| {
+    let computes_generated_columns_after_encode = table.btree().is_some_and(|bt| {
         bt.is_strict && sets_custom_type_column(&bt, &updated_positions, resolver)
     });
     emit_generated_column_notnull_checks(
@@ -889,7 +888,7 @@ pub fn emit_upsert(
         new_start,
         &layout,
         constraint_on_error,
-        |column| !(computes_virtual_columns_after_encode && column.is_virtual_generated()),
+        |_| !computes_generated_columns_after_encode,
     );
 
     if let Some(bt) = table.btree() {
@@ -907,10 +906,10 @@ pub fn emit_upsert(
                 &layout,
             )?;
 
-            // The virtual columns were computed from the SET values. When a SET column
+            // The generated columns were computed from the SET values. When a SET column
             // has a custom type, a read of the row can give other values, so compute
             // them again from the encoded row, as a read of the row gives them.
-            if computes_virtual_columns_after_encode {
+            if computes_generated_columns_after_encode {
                 let dml_ctx = DmlColumnContext::layout(
                     bt.columns(),
                     new_start,
@@ -918,7 +917,7 @@ pub fn emit_upsert(
                     layout.clone(),
                     DmlRowForm::Stored,
                 );
-                compute_virtual_columns(
+                compute_generated_columns(
                     program,
                     &bt.columns_topo_sort()?,
                     &dml_ctx,
@@ -935,14 +934,14 @@ pub fn emit_upsert(
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
 
-            if computes_virtual_columns_after_encode {
+            if computes_generated_columns_after_encode {
                 emit_generated_column_notnull_checks(
                     program,
                     ctx,
                     new_start,
                     &layout,
                     constraint_on_error,
-                    Column::is_virtual_generated,
+                    Column::is_generated,
                 );
             }
         }

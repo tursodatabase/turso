@@ -4556,8 +4556,8 @@ pub fn emit_parent_side_fk_decrement_on_insert(
 /// Emit encode expressions for columns with custom types.
 /// For each column that has a custom type with an encode expression,
 /// evaluates the expression with `value` bound to the column register.
-/// Virtual columns are skipped: their registers are not computed yet, and
-/// `compute_virtual_columns` encodes them when it computes them.
+/// Generated columns are skipped: their registers are not computed yet, and
+/// `compute_generated_columns` encodes them when it computes them.
 fn emit_custom_type_encode(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -4574,7 +4574,7 @@ fn emit_custom_type_encode(
         columns
             .iter()
             .enumerate()
-            .filter(|(_, column)| !column.is_virtual_generated())
+            .filter(|(_, column)| !column.is_generated())
             .map(|(i, _)| i),
     )?;
     crate::translate::expr::emit_custom_type_encode_columns(
