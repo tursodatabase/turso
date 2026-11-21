@@ -2844,6 +2844,23 @@ expect @tursopg error {
     a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP is not supported
 }
 
+# to_char formats numbers. Other argument types are covered in
+# gaps/operators-functions.sqltest.
+test to-char-number {
+    SELECT to_char(-1234.5, '9999.9'), to_char(NULL::int, '999');
+}
+expect {
+    -1234.5|
+}
+
+# to_char is strict: a NULL argument gives NULL whatever the other types are.
+test to-char-null-format {
+    SELECT coalesce(to_char(timestamp '2024-01-01', NULL::text), 'null'), coalesce(to_char(1, NULL), 'null');
+}
+expect {
+    null|null
+}
+
 test now-with-an-argument-errors {
     SELECT now(1);
 }

@@ -15,12 +15,12 @@ use turso_core::{
     Register, Result, Value, WallClockInstant,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_DATETIME_FORMAT,
-    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_PARAMETER_VALUE,
-    SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
-    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
-    SQLSTATE_UNTRANSLATABLE_CHARACTER,
+    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR,
+    SQLSTATE_INVALID_DATETIME_FORMAT, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
+    SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
+    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -97,8 +97,21 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "pg_get_triggerdef"(FunctionArity::OneOf(&[1, 2]), false) => None::<String>,
         "pg_get_expr"(FunctionArity::OneOf(&[2, 3]), true) => exec_pg_get_expr(args)?,
         "to_char"(FunctionArity::Exact(2), true) => {
-            exec_to_char(args[0].get_value(), &text_arg(args, 1))
+            // to_char is strict: a NULL argument gives NULL for every argument type.
+            if args.iter().any(|arg| matches!(arg.get_value(), Value::Null)) {
+                None
+            } else {
+                exec_to_char(args[0].get_value(), &text_arg(args, 1))?
+            }
         },
+        // Registered so that the core time extension's to_timestamp, which
+        // returns a blob, never answers a PostgreSQL query.
+        "to_timestamp"(FunctionArity::OneOf(&[1, 2]), true) => Err::<Timestamptz, _>(
+            sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "to_timestamp is not supported", None,
+            )
+        )?,
         "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
             exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))
         },
@@ -1338,14 +1351,27 @@ fn format_type(type_oid: i64, typemod: i64) -> String {
 
 /// Simplified to_char: formats a number with the given format pattern.
 /// Supports basic PG numeric format patterns (9, 0, S, MI, FM, D, G, PR, TH, L).
-fn exec_to_char(value: &Value, format: &str) -> Option<String> {
+/// Any other argument, such as a timestamp, fails with 0A000 instead of
+/// returning NULL.
+fn exec_to_char(value: &Value, format: &str) -> Result<Option<String>> {
     let num = match value {
-        Value::Null => return None,
+        Value::Null => return Ok(None),
         Value::Numeric(_) => value.as_float(),
-        Value::Text(t) => t.as_str().parse::<f64>().ok()?,
-        _ => return None,
+        Value::Text(t) => match t.as_str().parse::<f64>() {
+            Ok(num) => num,
+            Err(_) => return Err(to_char_not_supported()),
+        },
+        _ => return Err(to_char_not_supported()),
     };
-    Some(pg_to_char_numeric(num, format))
+    Ok(Some(pg_to_char_numeric(num, format)))
+}
+
+fn to_char_not_supported() -> LimboError {
+    sqlstate_error(
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        "to_char is supported only for numbers",
+        None,
+    )
 }
 
 /// pg_input_is_valid(text, type) → boolean

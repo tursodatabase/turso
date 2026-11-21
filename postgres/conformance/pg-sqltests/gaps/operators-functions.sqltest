@@ -1276,8 +1276,77 @@ test to-char-timestamptz {
 expect {
     2026-10-08 12:00
 }
-expect @tursopg {
+@sqlstate 0A000
+expect @tursopg error {}
+
+# PostgreSQL has no to_char for boolean, text or jsonb. tursopg decides from
+# each row's value, so it formats a row that holds a number and returns NULL
+# for a NULL row.
+@compat-gap "function:to_char"
+test to-char-boolean-column {
+    CREATE TABLE to_char_flags (flag boolean);
+    INSERT INTO to_char_flags VALUES (true);
+    SELECT to_char(flag, '99') FROM to_char_flags;
 }
+@sqlstate 42883
+expect error {
+    function to_char\(boolean, unknown\) does not exist
+}
+expect @tursopg raw {
+  1
+}
+
+@compat-gap "function:to_char"
+test to-char-text-column {
+    CREATE TABLE to_char_texts (t text);
+    INSERT INTO to_char_texts VALUES ('12');
+    SELECT to_char(t, '99') FROM to_char_texts;
+}
+@sqlstate 42883
+expect error {
+    function to_char\(text, unknown\) does not exist
+}
+expect @tursopg raw {
+ 12
+}
+
+@compat-gap "function:to_char"
+test to-char-jsonb-column {
+    CREATE TABLE to_char_documents (doc jsonb);
+    INSERT INTO to_char_documents VALUES ('12');
+    SELECT to_char(doc, '99') FROM to_char_documents;
+}
+@sqlstate 42883
+expect error {
+    function to_char\(jsonb, unknown\) does not exist
+}
+expect @tursopg raw {
+ 12
+}
+
+@compat-gap "function:to_char"
+test to-char-null-timestamptz-row {
+    CREATE TABLE to_char_times (at timestamptz);
+    INSERT INTO to_char_times VALUES (NULL);
+    SELECT to_char(at, 'YYYY') IS NULL FROM to_char_times;
+}
+expect {
+    t
+}
+expect @tursopg {
+    1
+}
+
+# to_timestamp(double precision)
+@compat-gap "function:to_timestamp"
+test to-timestamp-epoch {
+    SELECT to_timestamp(0);
+}
+expect {
+    1970-01-01 00:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {}
 
 # B-124: 64 nested scalar subqueries
 @compat-gap "syntax:nested-subquery"
@@ -1375,3 +1444,50 @@ expect {
 }
 @sqlstate 42883
 expect @tursopg error {}
+
+# to_char with the numeric format patterns: PostgreSQL's answers recorded
+# below come from PostgreSQL 18; the tursopg answers are filled in from a run.
+@compat-gap "function:to_char"
+test to-char-group-separator-bigint {
+    SELECT to_char(100000::bigint, '999,999');
+}
+expect raw {
+ 100,000
+}
+expect @tursopg raw {
+ 100000
+}
+
+@compat-gap "function:to_char"
+test to-char-fm-no-leading-space {
+    SELECT to_char(12, 'FM999');
+}
+expect {
+    12
+}
+expect @tursopg raw {
+ 12
+}
+
+@compat-gap "function:to_char"
+test to-char-overflow-hashes {
+    SELECT to_char(12345, '999'), to_char(99.99, '9.9');
+}
+expect raw {
+ ###| #.#
+}
+expect @tursopg raw {
+ 12345| 100.0
+}
+
+@compat-gap "function:to_char"
+test to-char-unknown-literal-is-ambiguous {
+    SELECT to_char('12', '99');
+}
+@sqlstate 42725
+expect error {
+    function to_char\(unknown, unknown\) is not unique
+}
+expect @tursopg raw {
+ 12
+}
