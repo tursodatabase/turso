@@ -118,7 +118,7 @@ test compare-timestamptz-with-integer {
 @sqlstate 42883
 expect error {}
 expect @tursopg {
-    0
+    1
 }
 
 @compat-gap "cast:int4 -> timestamptz"

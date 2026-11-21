@@ -2692,7 +2692,7 @@ impl PostgreSQLTranslator {
         Self::reject_constant_that_is_not_a_position(distinct_clause, "DISTINCT ON")?;
         let exprs = distinct_clause
             .iter()
-            .map(|node| self.translate_expr(node).map(Box::new))
+            .map(|node| self.translate_position_expr(node).map(Box::new))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Some(ast::SelectDistinctness::DistinctOn(exprs)))
     }
@@ -3929,6 +3929,22 @@ impl PostgreSQLTranslator {
         }
     }
 
+    fn translate_position_expr(
+        &self,
+        node: &pg_query::protobuf::Node,
+    ) -> Result<ast::Expr, ParseError> {
+        if let Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
+            val: Some(pg_query::protobuf::a_const::Val::Ival(i)),
+            ..
+        })) = &node.node
+        {
+            return Ok(ast::Expr::Literal(ast::Literal::Numeric(
+                i.ival.to_string(),
+            )));
+        }
+        self.translate_expr(node)
+    }
+
     fn translate_const(
         &self,
         a_const: &pg_query::protobuf::AConst,
@@ -3938,8 +3954,9 @@ impl PostgreSQLTranslator {
         }
         if let Some(val) = &a_const.val {
             match val {
-                pg_query::protobuf::a_const::Val::Ival(i) => Ok(ast::Expr::Literal(
+                pg_query::protobuf::a_const::Val::Ival(i) => Ok(typed_integer_literal(
                     ast::Literal::Numeric(i.ival.to_string()),
+                    "int4",
                 )),
                 pg_query::protobuf::a_const::Val::Sval(s) => {
                     // Turso's AST expects string literals to include surrounding single quotes
@@ -3950,7 +3967,8 @@ impl PostgreSQLTranslator {
                 pg_query::protobuf::a_const::Val::Fval(f) => {
                     let text =
                         non_decimal_literal_as_decimal(&f.fval).unwrap_or_else(|| f.fval.clone());
-                    Ok(ast::Expr::Literal(ast::Literal::Numeric(text)))
+                    Ok(integer_literal_beyond_int4(&text)
+                        .unwrap_or(ast::Expr::Literal(ast::Literal::Numeric(text))))
                 }
                 pg_query::protobuf::a_const::Val::Boolval(b) => Ok(ast::Expr::Cast {
                     expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
@@ -4923,7 +4941,7 @@ impl PostgreSQLTranslator {
 
         let exprs: Vec<Box<ast::Expr>> = group_clause
             .iter()
-            .map(|node| Ok(Box::new(self.translate_expr(node)?)))
+            .map(|node| Ok(Box::new(self.translate_position_expr(node)?)))
             .collect::<Result<Vec<_>, ParseError>>()?;
 
         let having = if let Some(having_node) = having_clause {
@@ -5237,7 +5255,7 @@ impl PostgreSQLTranslator {
         clause: &str,
         when_null: &str,
     ) -> Result<Option<Box<ast::Expr>>, ParseError> {
-        let value = self.translate_expr(node)?;
+        let value = self.translate_position_expr(node)?;
         match &value {
             ast::Expr::Literal(ast::Literal::Null) => return Ok(None),
             ast::Expr::Literal(ast::Literal::Numeric(n))
@@ -5558,7 +5576,7 @@ impl PostgreSQLTranslator {
             match &node.node {
                 Some(pg_query::protobuf::node::Node::SortBy(sort_by)) => {
                     let expr = if let Some(ref sort_node) = sort_by.node {
-                        Box::new(self.translate_expr(sort_node)?)
+                        Box::new(self.translate_position_expr(sort_node)?)
                     } else {
                         return Err(ParseError::ParseError(
                             "Missing sort expression".to_string(),
@@ -7614,6 +7632,39 @@ fn numeric_literal_exceeds_int8(literal: &str) -> bool {
         magnitude += 1;
     }
     magnitude > limit
+}
+
+fn typed_integer_literal(literal: ast::Literal, type_name: &str) -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(ast::Expr::Literal(literal)),
+        type_name: Some(ast::Type {
+            name: type_name.to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    }
+}
+
+fn integer_literal_beyond_int4(text: &str) -> Option<ast::Expr> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if let Ok(value) = text.parse::<i64>() {
+        let type_name = if i32::try_from(value).is_ok() {
+            "int4"
+        } else {
+            "bigint"
+        };
+        return Some(typed_integer_literal(
+            ast::Literal::Numeric(text.to_string()),
+            type_name,
+        ));
+    }
+    Some(typed_integer_literal(
+        ast::Literal::String(format!("'{text}'")),
+        "numeric",
+    ))
 }
 
 /// Writes a hex (`0x`), octal (`0o`) or binary (`0b`) integer literal in
@@ -10575,11 +10626,11 @@ mod tests {
         for (sql, expected) in [
             (
                 "SELECT * FROM (SELECT 1, 2) AS s(p, q)",
-                "SELECT * FROM (WITH s (p, q) AS (SELECT 1, 2) SELECT * FROM s) s",
+                "SELECT * FROM (WITH s (p, q) AS (SELECT CAST (1 AS int4), CAST (2 AS int4)) SELECT * FROM s) s",
             ),
             (
                 "SELECT * FROM (VALUES (1, 2)) AS v(a)",
-                "SELECT * FROM (WITH v (a, column2) AS (VALUES (1, 2)) SELECT * FROM v) v",
+                "SELECT * FROM (WITH v (a, column2) AS (VALUES (CAST (1 AS int4), CAST (2 AS int4))) SELECT * FROM v) v",
             ),
             (
                 "SELECT * FROM (SELECT * FROM v) AS v(a)",
@@ -10587,15 +10638,15 @@ mod tests {
             ),
             (
                 "SELECT g.n FROM generate_series(1, 3) AS g(n)",
-                "SELECT g.n FROM LATERAL (SELECT value n FROM main.generate_series (1, 3)) g",
+                "SELECT g.n FROM LATERAL (SELECT value n FROM main.generate_series (CAST (1 AS int4), CAST (3 AS int4))) g",
             ),
             (
                 "SELECT g FROM generate_series(1, 3) g",
-                "SELECT g FROM LATERAL (SELECT value g FROM main.generate_series (1, 3)) g",
+                "SELECT g FROM LATERAL (SELECT value g FROM main.generate_series (CAST (1 AS int4), CAST (3 AS int4))) g",
             ),
             (
                 "SELECT * FROM generate_series(1, 3)",
-                "SELECT * FROM LATERAL (SELECT value generate_series FROM main.generate_series (1, 3)) generate_series",
+                "SELECT * FROM LATERAL (SELECT value generate_series FROM main.generate_series (CAST (1 AS int4), CAST (3 AS int4))) generate_series",
             ),
         ] {
             assert_eq!(translate(sql).unwrap(), expected, "{sql}");
@@ -10621,9 +10672,11 @@ mod tests {
                 .translate(&crate::parse(sql).unwrap())
                 .map(|stmt| stmt.to_string())
         };
+        const ROW_EQUALS_ROW: &str =
+            "SELECT (CAST (1 AS int4), CAST (2 AS int4)) = (CAST (1 AS int4), CAST (2 AS int4))";
         for (sql, expected) in [
-            ("SELECT (1, 2) = (1, 2)", "SELECT (1, 2) = (1, 2)"),
-            ("SELECT ROW(1, 2) = ROW(1, 2)", "SELECT (1, 2) = (1, 2)"),
+            ("SELECT (1, 2) = (1, 2)", ROW_EQUALS_ROW),
+            ("SELECT ROW(1, 2) = ROW(1, 2)", ROW_EQUALS_ROW),
         ] {
             assert_eq!(translate(sql).unwrap(), expected, "{sql}");
         }
@@ -11035,8 +11088,8 @@ mod tests {
 
                         // Right side should be literal 1
                         assert!(
-                            matches!(**right, ast::Expr::Literal(_)),
-                            "Expected Literal expression for right side"
+                            matches!(**right, ast::Expr::Cast { .. }),
+                            "Expected a typed integer literal for right side"
                         );
                         if let ast::Expr::Literal(literal) = &**right {
                             assert!(
@@ -11121,11 +11174,7 @@ mod tests {
 
                 // Check integer literal
                 if let ast::ResultColumn::Expr(expr, _) = &columns[1] {
-                    if let ast::Expr::Literal(ast::Literal::Numeric(n)) = &**expr {
-                        assert_eq!(n, "42");
-                    } else {
-                        panic!("Expected numeric literal");
-                    }
+                    assert_eq!(expr.to_string(), "CAST (42 AS int4)");
                 } else {
                     panic!("Expected expression result column");
                 }
@@ -11823,7 +11872,7 @@ mod tests {
             ),
             (
                 "SELECT * FROM t1, (SELECT 1) s",
-                "SELECT * FROM t1, (SELECT 1) s",
+                "SELECT * FROM t1, (SELECT CAST (1 AS int4)) s",
             ),
         ] {
             let parsed = crate::parse(sql).unwrap();
@@ -13632,7 +13681,7 @@ mod tests {
             .expect("translation must succeed");
         let output = result.cmd.to_string();
         assert!(
-            output.contains("AS (a * 2) STORED"),
+            output.contains("AS (a * CAST (2 AS int4)) STORED"),
             "STORED generated column must keep its expression: {output}"
         );
     }
@@ -14098,7 +14147,7 @@ mod tests {
     fn fail_closed_insert_defaults() {
         assert_eq!(
             translate_to_sql("INSERT INTO t VALUES (DEFAULT, 5)"),
-            "INSERT INTO t VALUES (DEFAULT, 5)"
+            "INSERT INTO t VALUES (DEFAULT, CAST (5 AS int4))"
         );
         assert_eq!(
             translate_to_sql("INSERT INTO t DEFAULT VALUES"),
@@ -14181,19 +14230,19 @@ mod tests {
     fn right_nested_set_operations_become_subquery_members() {
         assert_eq!(
             translate_to_sql("SELECT 1 UNION SELECT 2 INTERSECT SELECT 3"),
-            "SELECT 1 UNION SELECT * FROM (SELECT 2 INTERSECT SELECT 3)"
+            "SELECT CAST (1 AS int4) UNION SELECT * FROM (SELECT CAST (2 AS int4) INTERSECT SELECT CAST (3 AS int4))"
         );
         assert_eq!(
             translate_to_sql("SELECT 1 EXCEPT (SELECT 1 UNION SELECT 2)"),
-            "SELECT 1 EXCEPT SELECT * FROM (SELECT 1 UNION SELECT 2)"
+            "SELECT CAST (1 AS int4) EXCEPT SELECT * FROM (SELECT CAST (1 AS int4) UNION SELECT CAST (2 AS int4))"
         );
         assert_eq!(
             translate_to_sql("SELECT 1 UNION SELECT 2 UNION ALL SELECT 3 EXCEPT SELECT 4"),
-            "SELECT 1 UNION SELECT 2 UNION ALL SELECT 3 EXCEPT SELECT 4"
+            "SELECT CAST (1 AS int4) UNION SELECT CAST (2 AS int4) UNION ALL SELECT CAST (3 AS int4) EXCEPT SELECT CAST (4 AS int4)"
         );
         assert_eq!(
             translate_to_sql("(SELECT 1 UNION SELECT 2) INTERSECT SELECT 3"),
-            "SELECT 1 UNION SELECT 2 INTERSECT SELECT 3"
+            "SELECT CAST (1 AS int4) UNION SELECT CAST (2 AS int4) INTERSECT SELECT CAST (3 AS int4)"
         );
         assert_not_supported(
             "SELECT 1 UNION (SELECT 1 EXCEPT ALL SELECT 1)",
@@ -14219,11 +14268,11 @@ mod tests {
         );
         assert_eq!(
             translate_to_sql("((SELECT 1 UNION SELECT 2) LIMIT 1) UNION SELECT 3"),
-            "SELECT * FROM (SELECT 1 UNION SELECT 2 LIMIT 1) UNION SELECT 3"
+            "SELECT * FROM (SELECT CAST (1 AS int4) UNION SELECT CAST (2 AS int4) LIMIT 1) UNION SELECT CAST (3 AS int4)"
         );
         assert_eq!(
             translate_to_sql("(WITH c AS (SELECT 1 AS x) SELECT x FROM c) UNION SELECT 2"),
-            "SELECT * FROM (WITH c AS (SELECT 1 x) SELECT x FROM c) UNION SELECT 2"
+            "SELECT * FROM (WITH c AS (SELECT CAST (1 AS int4) x) SELECT x FROM c) UNION SELECT CAST (2 AS int4)"
         );
         assert_eq!(
             translate_to_sql("SELECT a FROM t UNION SELECT a FROM u ORDER BY 1 LIMIT 2"),
@@ -14272,7 +14321,7 @@ mod tests {
         let stmt = PostgreSQLTranslator::new().translate(&parsed).unwrap();
         assert_eq!(
             stmt.to_string(),
-            "SELECT DISTINCT ON (a, b + 1) a, b FROM t"
+            "SELECT DISTINCT ON (a, b + CAST (1 AS int4)) a, b FROM t"
         );
         assert_translates("SELECT DISTINCT ON (a) a FROM t UNION SELECT 1");
         assert_not_supported(

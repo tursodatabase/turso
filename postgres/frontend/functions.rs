@@ -957,12 +957,20 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
         }
         Value::Text(text) => {
             let text = text.as_str().trim();
+            let digits = text.strip_prefix(['-', '+']).unwrap_or(text);
             if let Ok(Some(rounded)) = turso_core::numeric_to_rounded_i64(args[0].get_value()) {
                 if text.parse::<i64>().is_err() && text.parse::<f64>().is_ok() {
                     return limit_value_checked(args, rounded);
                 }
             }
             text.parse().map_err(|_| {
+                if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return sqlstate_error(
+                        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                        "bigint out of range",
+                        None,
+                    );
+                }
                 sqlstate_error(
                     SQLSTATE_INVALID_TEXT_REPRESENTATION,
                     format!("invalid input syntax for type bigint: \"{text}\""),

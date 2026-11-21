@@ -6,9 +6,10 @@ use crate::casts::{source_type, CastType};
 use turso_core::dialect::OperandType;
 use turso_core::schema::Schema;
 
-/// count is a bigint, sum of a smallint or an integer is a bigint, abs, sum,
-/// min, max and avg of a float8 are a float8, abs, sum, min and max of a float4
-/// are a float4, and avg of one is a float8.
+/// count is a bigint, sum of a smallint or an integer is a bigint, abs, min
+/// and max of an integer type are that type, abs, sum, min, max and avg of a
+/// float8 are a float8, abs, sum, min and max of a float4 are a float4, and avg
+/// of one is a float8.
 pub(crate) fn function_result_type(
     name: &str,
     args: &dyn Fn() -> Vec<OperandType>,
@@ -33,6 +34,11 @@ pub(crate) fn function_result_type(
     };
     if name == "sum" && is_custom(arg, &["smallint", "int4"]) {
         return bigint(schema);
+    }
+    if matches!(name.as_str(), "abs" | "min" | "max")
+        && is_custom(arg, &["smallint", "int4", "bigint"])
+    {
+        return Some(arg.clone());
     }
     if matches!(arg, OperandType::Real) {
         return Some(OperandType::Real);

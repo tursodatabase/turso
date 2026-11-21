@@ -98,46 +98,38 @@ fn register_type(
 }
 
 /// An integer type of PostgreSQL: its name in the registry, the prefix of its
-/// functions, the narrower integer types, and the type of the result with an
-/// integer written in the statement, which PostgreSQL types as an int4.
+/// functions and the narrower integer types.
 #[derive(Clone, Copy)]
 struct IntegerWidth {
     type_name: &'static str,
     prefix: &'static str,
     narrower: &'static [&'static str],
-    literal_type_name: &'static str,
-    literal_prefix: &'static str,
 }
 
 const INT2_WIDTH: IntegerWidth = IntegerWidth {
     type_name: "smallint",
     prefix: "int2",
     narrower: &[],
-    literal_type_name: "int4",
-    literal_prefix: "int4",
 };
 
 const INT8_WIDTH: IntegerWidth = IntegerWidth {
     type_name: "bigint",
     prefix: "int8",
     narrower: &["int4", "smallint"],
-    literal_type_name: "bigint",
-    literal_prefix: "int8",
 };
 
 const INT4_WIDTH: IntegerWidth = IntegerWidth {
     type_name: "int4",
     prefix: "int4",
     narrower: &["smallint"],
-    literal_type_name: "int4",
-    literal_prefix: "int4",
 };
 
-/// The operators on an integer type. With a value of its own type, an
-/// integer written in the statement or a narrower integer type, `+ - * / %`
-/// and `-x` give the type and fail with 22003 when the result does not fit.
-/// With any other plain value, such as a decimal, SQLite's operators run. The
-/// bit operators are SQLite's.
+/// The operators on an integer type. With a value of its own type or a
+/// narrower integer type, `+ - * / %` and `-x` give the type and fail with
+/// 22003 when the result does not fit. A plain integer, such as the result of
+/// a function, has no known width and computes as an int8. With any other
+/// plain value, such as a decimal, SQLite's operators run. The bit operators
+/// are SQLite's.
 fn integer_operators(width: IntegerWidth) -> Vec<OperatorSignature> {
     use OperatorArg::{PlainValue, Type, Untyped, UntypedInteger, Value};
     let signature = |op, args: Vec<OperatorArg>, function: Option<String>, result: &'static str| {
@@ -159,25 +151,24 @@ fn integer_operators(width: IntegerWidth) -> Vec<OperatorSignature> {
         ("|", "or"),
     ] {
         let own = || Some(format!("{}{suffix}", width.prefix));
-        let with_literal = || Some(format!("{}{suffix}", width.literal_prefix));
+        let with_plain = || Some(format!("int8{suffix}"));
         let own_type = width.type_name;
         signatures.push(signature(op, vec![Value, Value], own(), own_type));
         for narrower in width.narrower {
             signatures.push(signature(op, vec![Value, Type(narrower)], own(), own_type));
             signatures.push(signature(op, vec![Type(narrower), Value], own(), own_type));
         }
-        let literal_type = width.literal_type_name;
         signatures.push(signature(
             op,
             vec![Value, UntypedInteger],
-            with_literal(),
-            literal_type,
+            with_plain(),
+            "bigint",
         ));
         signatures.push(signature(
             op,
             vec![UntypedInteger, Value],
-            with_literal(),
-            literal_type,
+            with_plain(),
+            "bigint",
         ));
         signatures.push(signature(op, vec![Value, Untyped], None, own_type));
         signatures.push(signature(op, vec![Untyped, Value], None, own_type));

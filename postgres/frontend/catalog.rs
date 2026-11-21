@@ -4373,7 +4373,7 @@ fn check_condition_text(condition: &ast::Expr, table: &BTreeTable) -> String {
 }
 
 fn render_expr(expr: &ast::Expr) -> String {
-    let mut expr = expr.clone();
+    let mut expr = crate::deparse::without_literal_types(expr);
     walk_expr_mut(&mut expr, &mut |expr| {
         // The translator compiles PostgreSQL's binary collations to BINARY.
         if let ast::Expr::Collate(_, collation) = expr {
@@ -4570,13 +4570,19 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                                 .expect("index columns have names")
                         },
                         position: column.pos_in_table,
-                        expression: column.expr.as_ref().map(ToString::to_string),
+                        expression: column
+                            .expr
+                            .as_ref()
+                            .map(|expr| crate::deparse::without_literal_types(expr).to_string()),
                         order: column.order,
                     })
                     .collect(),
                 unique: index.unique,
                 primary,
-                where_clause: index.where_clause.as_ref().map(ToString::to_string),
+                where_clause: index
+                    .where_clause
+                    .as_ref()
+                    .map(|expr| crate::deparse::without_literal_types(expr).to_string()),
             });
         }
     }

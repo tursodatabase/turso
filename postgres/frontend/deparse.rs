@@ -12,6 +12,7 @@
 //! does not know how to print as PostgreSQL does gives None.
 
 use turso_core::schema::BTreeTable;
+use turso_core::{walk_expr_mut, WalkControl};
 use turso_parser::ast;
 use turso_pg_parser::quote_identifier;
 use turso_pg_parser::translator::role_keyword;
@@ -22,7 +23,7 @@ use crate::functions::quote_literal;
 /// PostgreSQL's text of `condition`, a condition on the columns of `table`,
 /// or None when it has a form this module does not print.
 pub(crate) fn condition_text(condition: &ast::Expr, table: &BTreeTable) -> Option<String> {
-    let printed = Printer { table }.expr(condition)?;
+    let printed = Printer { table }.expr(&without_literal_types(condition))?;
     Some(printed.typed_text(None))
 }
 
@@ -36,7 +37,7 @@ pub(crate) fn default_text(
     table: &BTreeTable,
     declared_type: &str,
 ) -> Option<String> {
-    let printed = Printer { table }.expr(default)?;
+    let printed = Printer { table }.expr(&without_literal_types(default))?;
     if printed.ty != PgType::UnknownLiteral {
         return Some(printed.text);
     }
@@ -603,6 +604,48 @@ fn coalesce(args: &[Printed]) -> Option<Printed> {
         return None;
     };
     Some(Printed::new(format!("COALESCE({})", texts.join(", ")), ty))
+}
+
+/// `condition` with the integers the translator wrote as `CAST(5 AS int4)`,
+/// `CAST(5 AS bigint)` or `CAST('5' AS numeric)` turned back into plain
+/// constants, which is how the printers see them.
+pub(crate) fn without_literal_types(condition: &ast::Expr) -> ast::Expr {
+    let mut condition = condition.clone();
+    walk_expr_mut(&mut condition, &mut |expr| {
+        if let Some(literal) = typed_integer_literal(expr) {
+            *expr = ast::Expr::Literal(literal);
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("replacing literals does not fail");
+    condition
+}
+
+fn typed_integer_literal(expr: &ast::Expr) -> Option<ast::Literal> {
+    let ast::Expr::Cast {
+        expr,
+        type_name: Some(type_name),
+    } = expr
+    else {
+        return None;
+    };
+    match (expr.as_ref(), type_name.name.to_ascii_lowercase().as_str()) {
+        (ast::Expr::Literal(literal @ ast::Literal::Numeric(_)), "int4" | "bigint") => {
+            Some(literal.clone())
+        }
+        (ast::Expr::Unary(ast::UnaryOperator::Negative, operand), "int4" | "bigint") => {
+            match operand.as_ref() {
+                ast::Expr::Literal(ast::Literal::Numeric(digits)) => {
+                    Some(ast::Literal::Numeric(format!("-{digits}")))
+                }
+                _ => None,
+            }
+        }
+        (ast::Expr::Literal(ast::Literal::String(quoted)), "numeric") => {
+            Some(ast::Literal::Numeric(unquote(quoted)?))
+        }
+        _ => None,
+    }
 }
 
 fn literal_text(literal: &ast::Literal) -> Option<Printed> {

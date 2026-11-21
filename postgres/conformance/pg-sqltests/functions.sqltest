@@ -2277,7 +2277,7 @@ expect error {
 }
 @sqlstate 42883
 expect @tursopg error {
-    operator does not exist: timestamptz \+ integer
+    operator does not exist: timestamptz \+ int4
 }
 
 test numeric-column-plus-round-and-mod-of-exact-numbers-is-exact {
@@ -2304,8 +2304,13 @@ expect {
 test booleq-plus-an-integer-errors {
     SELECT booleq(true, true) + 1;
 }
+@sqlstate 42883
 expect error {
     operator does not exist: boolean \+ integer
+}
+@sqlstate 42883
+expect @tursopg error {
+    operator does not exist: boolean \+ int4
 }
 
 # booleq() returns boolean, so the client sees t and f, not 1 and 0.
