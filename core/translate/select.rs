@@ -1043,15 +1043,11 @@ fn aggregate_call_name<'a>(expr: &'a ast::Expr, resolver: &Resolver) -> Option<&
     if filter_over.over_clause.is_some() {
         return None;
     }
-    let is_aggregate = match crate::function::Func::resolve_function(name.as_str(), args_count) {
-        Ok(Some(crate::function::Func::Agg(_))) => true,
-        _ => resolver
-            .catalog
-            .symbol_table
-            .resolve_function(name.as_str(), args_count)
-            .is_some_and(|f| f.func.is_aggregate()),
-    };
-    is_aggregate.then_some(name.as_str())
+    matches!(
+        resolver.resolve_function(name.as_str(), args_count),
+        Ok(Some(func)) if func.is_aggregate()
+    )
+    .then_some(name.as_str())
 }
 
 /// Validate that all expressions in the plan return the correct number of values;

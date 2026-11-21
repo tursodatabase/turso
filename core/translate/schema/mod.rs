@@ -111,7 +111,7 @@ pub(crate) fn validate_check_expr(
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }
                 if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
-                    if matches!(func, Func::Agg(..)) {
+                    if func.is_aggregate() {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
                     }
                     if matches!(func, Func::Window(..)) {
@@ -126,7 +126,7 @@ pub(crate) fn validate_check_expr(
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }
                 if let Some(func) = resolver.resolve_function(name.as_str(), 0)? {
-                    if matches!(func, Func::Agg(..)) {
+                    if func.is_aggregate() {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
                     }
                     if matches!(func, Func::Window(..)) {
@@ -439,7 +439,7 @@ fn resolve_func_return_type(
     columns: &[&ast::ColumnDefinition],
     resolver: &CatalogContext,
 ) -> Result<CheckExprType> {
-    if let Func::Agg(_) = func {
+    if func.is_aggregate() {
         bail_parse_error!("misuse of aggregate function {}()", name);
     }
     let type_of = |arg: &ast::Expr| resolve_check_expr_type(arg, columns, resolver);
@@ -2687,7 +2687,7 @@ fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &CatalogContext) -
                     bail_parse_error!("window functions prohibited in {kind} expressions");
                 }
                 if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
-                    if matches!(func, Func::Agg(..)) {
+                    if func.is_aggregate() {
                         bail_parse_error!(
                             "aggregate functions prohibited in {kind} expressions: {}",
                             name.as_str()
