@@ -302,6 +302,76 @@ expect error {
     HAVING clause on a non-aggregate query
 }
 
+# As in SQLite, the HAVING error comes before errors in ORDER BY.
+@setup five-rows
+test having-error-before-order-by-aggregate-error {
+    SELECT a FROM t HAVING 1 ORDER BY count(*);
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+@setup five-rows
+test having-error-before-order-by-out-of-range-error {
+    SELECT a FROM t HAVING 1 ORDER BY 5;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+@setup five-rows
+test having-error-before-order-by-unknown-column-error {
+    SELECT a FROM t HAVING 1 ORDER BY nosuch;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+# A subquery in the result columns without an aggregate that reads a column
+# cannot make the query an aggregate query, so the HAVING error still comes
+# before the ORDER BY error.
+@setup five-rows
+test having-error-before-order-by-scalar-subquery {
+    SELECT (SELECT 1) FROM t HAVING 1 ORDER BY 5;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+@setup five-rows
+test having-error-before-order-by-in-subquery {
+    SELECT a IN (SELECT 1) FROM t HAVING 1 ORDER BY nosuch;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+@setup five-rows
+test having-error-before-order-by-exists-subquery {
+    SELECT EXISTS (SELECT 1) FROM t HAVING 1 ORDER BY sum(a);
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+@setup five-rows
+test having-error-before-order-by-subquery-with-count-star {
+    SELECT (SELECT count(*) FROM t) FROM t HAVING 1 ORDER BY 5;
+}
+expect error {
+    HAVING clause on a non-aggregate query
+}
+
+# Here the subquery moves sum(t.a) up, so the query is an aggregate query and
+# the ORDER BY error is the one raised.
+@setup five-rows
+test having-subquery-moves-aggregate-up-order-by-error {
+    SELECT (SELECT sum(t.a)) FROM t HAVING 1 ORDER BY 5;
+}
+expect error {
+    1st ORDER BY term out of range - should be between 1 and 1
+}
+
 # A window function does not make the query an aggregate query.
 @setup five-rows
 test having-with-only-a-window-function {

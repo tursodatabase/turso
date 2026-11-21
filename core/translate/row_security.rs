@@ -27,8 +27,9 @@ use crate::{
     translate::{
         emitter::{with_columns_in_registers, Resolver},
         expr::{
-            bind_and_rewrite_expr, translate_expr, translate_expr_no_constant_opt, walk_expr,
-            walk_expr_mut, BindingBehavior, NoConstantOptReason, WalkControl,
+            bind_and_rewrite_expr, expr_reads_a_column, translate_expr,
+            translate_expr_no_constant_opt, walk_expr, walk_expr_mut, BindingBehavior,
+            NoConstantOptReason, WalkControl,
         },
         plan::{JoinInfo, JoinOrigin, JoinedTable, TableReferences, WhereTerm, WhereTermOrigin},
         planner::break_predicate_at_and_boundaries,
@@ -517,7 +518,7 @@ fn compute_scalar_selects_once(
             .expect("CREATE POLICY stores no other subqueries")
             .clone();
         compute_scalar_selects_once(&mut value, table_references, resolver, program)?;
-        if reads_a_column(&value)? {
+        if expr_reads_a_column(&value) {
             *expr = parenthesized(value);
             return Ok(WalkControl::SkipChildren);
         }
@@ -539,24 +540,6 @@ fn compute_scalar_selects_once(
         Ok(WalkControl::SkipChildren)
     })?;
     Ok(())
-}
-
-fn reads_a_column(expr: &ast::Expr) -> Result<bool> {
-    let mut reads_column = false;
-    walk_expr(expr, &mut |expr| {
-        if matches!(
-            expr,
-            ast::Expr::Id(_)
-                | ast::Expr::Qualified(..)
-                | ast::Expr::DoublyQualified(..)
-                | ast::Expr::Column { .. }
-                | ast::Expr::RowId { .. }
-        ) {
-            reads_column = true;
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(reads_column)
 }
 
 /// The columns of the table `internal_id` that the bound `expr` reads.
