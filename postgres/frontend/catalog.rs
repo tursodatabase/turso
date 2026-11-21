@@ -1827,6 +1827,30 @@ const PG_BASE_TYPES: &[PgTypeInfo] = &[
         typstorage: "x",
     },
     PgTypeInfo {
+        oid: 18,
+        name: "char",
+        typtype: "b",
+        typcategory: "Z",
+        typlen: 1,
+        typarray: 1002,
+        typelem: 0,
+        typbyval: true,
+        typalign: "c",
+        typstorage: "p",
+    },
+    PgTypeInfo {
+        oid: 19,
+        name: "name",
+        typtype: "b",
+        typcategory: "S",
+        typlen: 64,
+        typarray: 1003,
+        typelem: 18,
+        typbyval: false,
+        typalign: "c",
+        typstorage: "p",
+    },
+    PgTypeInfo {
         oid: 20,
         name: "int8",
         typtype: "b",
@@ -1959,6 +1983,18 @@ const PG_BASE_TYPES: &[PgTypeInfo] = &[
         typstorage: "m",
     },
     PgTypeInfo {
+        oid: 1042,
+        name: "bpchar",
+        typtype: "b",
+        typcategory: "S",
+        typlen: -1,
+        typarray: 1014,
+        typelem: 0,
+        typbyval: false,
+        typalign: "i",
+        typstorage: "x",
+    },
+    PgTypeInfo {
         oid: 1043,
         name: "varchar",
         typtype: "b",
@@ -2019,6 +2055,18 @@ const PG_BASE_TYPES: &[PgTypeInfo] = &[
         typstorage: "p",
     },
     PgTypeInfo {
+        oid: 1186,
+        name: "interval",
+        typtype: "b",
+        typcategory: "T",
+        typlen: 16,
+        typarray: 1187,
+        typelem: 0,
+        typbyval: false,
+        typalign: "d",
+        typstorage: "p",
+    },
+    PgTypeInfo {
         oid: 1700,
         name: "numeric",
         typtype: "b",
@@ -2029,6 +2077,42 @@ const PG_BASE_TYPES: &[PgTypeInfo] = &[
         typbyval: false,
         typalign: "i",
         typstorage: "m",
+    },
+    PgTypeInfo {
+        oid: 2205,
+        name: "regclass",
+        typtype: "b",
+        typcategory: "N",
+        typlen: 4,
+        typarray: 2210,
+        typelem: 0,
+        typbyval: true,
+        typalign: "i",
+        typstorage: "p",
+    },
+    PgTypeInfo {
+        oid: 2206,
+        name: "regtype",
+        typtype: "b",
+        typcategory: "N",
+        typlen: 4,
+        typarray: 2211,
+        typelem: 0,
+        typbyval: true,
+        typalign: "i",
+        typstorage: "p",
+    },
+    PgTypeInfo {
+        oid: 2278,
+        name: "void",
+        typtype: "p",
+        typcategory: "P",
+        typlen: 4,
+        typarray: 0,
+        typelem: 0,
+        typbyval: true,
+        typalign: "i",
+        typstorage: "p",
     },
     PgTypeInfo {
         oid: 2950,
@@ -2063,9 +2147,12 @@ const PG_ARRAY_TYPES: &[(i64, &str, i64)] = &[
     (651, "_cidr", 650),
     (1000, "_bool", 16),
     (1001, "_bytea", 17),
+    (1002, "_char", 18),
+    (1003, "_name", 19),
     (1005, "_int2", 21),
     (1007, "_int4", 23),
     (1009, "_text", 25),
+    (1014, "_bpchar", 1042),
     (1015, "_varchar", 1043),
     (1016, "_int8", 20),
     (1021, "_float4", 700),
@@ -2077,7 +2164,10 @@ const PG_ARRAY_TYPES: &[(i64, &str, i64)] = &[
     (1182, "_date", 1082),
     (1183, "_time", 1083),
     (1185, "_timestamptz", 1184),
+    (1187, "_interval", 1186),
     (1231, "_numeric", 1700),
+    (2210, "_regclass", 2205),
+    (2211, "_regtype", 2206),
     (2951, "_uuid", 2950),
     (3807, "_jsonb", 3802),
 ];
@@ -2238,6 +2328,26 @@ fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
         Value::Null,                            // typdefault
         Value::Null,                            // typacl
     ]
+}
+
+/// The `typname` of the `pg_type` row with oid `oid`, and the oid of its
+/// element type when it is an array type, which `format_type` prints as its
+/// element type followed by `[]`.
+pub(crate) fn pg_type_by_oid(conn: &Connection, oid: i64) -> Option<(String, Option<i64>)> {
+    let row = PgTypeTable::load_rows(conn)
+        .into_iter()
+        .find(|row| row[0].as_int() == Some(oid))?;
+    let name = row[1]
+        .to_text()
+        .expect("pg_type names are text")
+        .to_string();
+    // PostgreSQL's IsTrueArrayType: only the rows of PG_ARRAY_TYPES. `name`
+    // has an element type too, but is not an array type.
+    let element_oid = PG_ARRAY_TYPES
+        .iter()
+        .find(|&&(array_oid, _, _)| array_oid == oid)
+        .map(|&(_, _, typelem)| typelem);
+    Some((name, element_oid))
 }
 
 // ──────────────────────────────────────────────────────────────────────

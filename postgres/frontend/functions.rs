@@ -88,8 +88,13 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "json_strip_nulls"(FunctionArity::Exact(1), true) => {
             exec_json_strip_nulls(args[0].get_value())?
         },
-        "format_type"(FunctionArity::OneOf(&[1, 2]), true) => oid_arg(args, 0)?
-            .map(|type_oid| format_type(type_oid, int_arg(args, 1, -1))),
+        "format_type"(FunctionArity::OneOf(&[1, 2]), false) => {
+            let typemod = match args.get(1) {
+                Some(_) => int4_arg(args, 1)?,
+                None => None,
+            };
+            oid_arg(args, 0)?.map(|type_oid| format_type(connection, type_oid, typemod))
+        },
         "pg_get_constraintdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
             .and_then(|oid| crate::catalog::pg_get_constraintdef(connection, oid)),
         "pg_get_indexdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
@@ -452,6 +457,20 @@ fn oid_arg(args: &[Register], i: usize) -> Result<Option<i64>> {
         value => value.as_int().map(Some).ok_or_else(|| {
             LimboError::ConversionError(format!("invalid input syntax for type oid: \"{value}\""))
         }),
+    }
+}
+
+/// Argument `i` as a PostgreSQL `integer`, or None when it is NULL. Text is
+/// read the way a quoted literal is cast to `integer`.
+fn int4_arg(args: &[Register], i: usize) -> Result<Option<i64>> {
+    match args[i].get_value() {
+        Value::Null => Ok(None),
+        Value::Text(text) => {
+            parse_pg_integer(text.as_str(), "integer", i32::MIN.into(), i32::MAX.into())
+                .map(Some)
+                .map_err(|(message, sqlstate)| sqlstate_error(sqlstate, message, None))
+        }
+        value => Ok(value.as_int()),
     }
 }
 
@@ -1296,59 +1315,72 @@ fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {
     }
 }
 
-/// The name of a type as `format_type` prints it.
-fn format_type(type_oid: i64, typemod: i64) -> String {
-    match type_oid {
-        16 => "boolean".to_string(),
-        17 => "bytea".to_string(),
-        18 => "\"char\"".to_string(),
-        19 => "name".to_string(),
-        20 => "bigint".to_string(),
-        21 => "smallint".to_string(),
-        23 => "integer".to_string(),
-        25 => "text".to_string(),
-        26 => "oid".to_string(),
-        114 => "json".to_string(),
-        700 => "real".to_string(),
-        701 => "double precision".to_string(),
-        1000 => "boolean[]".to_string(),
-        1007 => "integer[]".to_string(),
-        1009 => "text[]".to_string(),
-        1022 => "double precision[]".to_string(),
-        1042 => {
-            if typemod > 4 {
-                format!("character({})", typemod - 4)
-            } else {
-                "character".to_string()
-            }
+/// The name of type `type_oid` as `format_type` prints it, with the type
+/// modifier `typemod` when the call gives one.
+fn format_type(conn: &Connection, type_oid: i64, typemod: Option<i64>) -> String {
+    if type_oid == 0 {
+        return "-".to_string();
+    }
+    let Some((name, element_oid)) = crate::catalog::pg_type_by_oid(conn, type_oid) else {
+        return "???".to_string();
+    };
+    let Some(element_oid) = element_oid else {
+        return format_type_name(type_oid, &name, typemod);
+    };
+    let (element_name, _) = crate::catalog::pg_type_by_oid(conn, element_oid)
+        .expect("the element types of PG_ARRAY_TYPES are in PG_BASE_TYPES");
+    format!(
+        "{}[]",
+        format_type_name(element_oid, &element_name, typemod)
+    )
+}
+
+/// The name of type `type_oid` named `name`, which is not an array type, as
+/// `format_type` prints it. `typemod` is None when the call gives no modifier or NULL, and a
+/// negative modifier means none too.
+fn format_type_name(type_oid: i64, name: &str, typemod: Option<i64>) -> String {
+    let modifier = typemod.filter(|&typemod| typemod >= 0);
+    // The types matched by oid print the SQL standard names that PostgreSQL's
+    // format_type_extended prints. Every other type prints its pg_type name.
+    match (type_oid, modifier) {
+        (16, _) => "boolean".to_string(),
+        (20, _) => "bigint".to_string(),
+        (21, _) => "smallint".to_string(),
+        (23, _) => "integer".to_string(),
+        (114, _) => "json".to_string(),
+        (700, _) => "real".to_string(),
+        (701, _) => "double precision".to_string(),
+        (1042, Some(typemod)) => format!("character{}", char_typmod(typemod)),
+        // bpchar with modifier -1 has no length, while `character` means
+        // character(1), so PostgreSQL prints the catalog name instead.
+        (1042, None) if typemod.is_none() => "character".to_string(),
+        (1043, Some(typemod)) => format!("character varying{}", char_typmod(typemod)),
+        (1043, None) => "character varying".to_string(),
+        (1083, Some(typemod)) => format!("time({typemod}) without time zone"),
+        (1083, None) => "time without time zone".to_string(),
+        (1114, Some(typemod)) => format!("timestamp({typemod}) without time zone"),
+        (1114, None) => "timestamp without time zone".to_string(),
+        (1184, Some(typemod)) => format!("timestamp({typemod}) with time zone"),
+        (1184, None) => "timestamp with time zone".to_string(),
+        (1186, _) => "interval".to_string(),
+        (1700, Some(typemod)) if typemod >= 4 => {
+            let precision = ((typemod - 4) >> 16) & 0xffff;
+            let scale = (((typemod - 4) & 0x7ff) ^ 1024) - 1024;
+            format!("numeric({precision},{scale})")
         }
-        1043 => {
-            if typemod > 4 {
-                format!("character varying({})", typemod - 4)
-            } else {
-                "character varying".to_string()
-            }
-        }
-        1082 => "date".to_string(),
-        1083 => "time without time zone".to_string(),
-        1114 => "timestamp without time zone".to_string(),
-        1184 => "timestamp with time zone".to_string(),
-        1186 => "interval".to_string(),
-        1700 => {
-            if typemod > 4 {
-                let precision = ((typemod - 4) >> 16) & 0xffff;
-                let scale = (typemod - 4) & 0xffff;
-                format!("numeric({precision},{scale})")
-            } else {
-                "numeric".to_string()
-            }
-        }
-        2205 => "regclass".to_string(),
-        2206 => "regtype".to_string(),
-        2278 => "void".to_string(),
-        2950 => "uuid".to_string(),
-        3802 => "jsonb".to_string(),
-        _ => "unknown".to_string(),
+        (1700, _) => "numeric".to_string(),
+        (_, Some(typemod)) => format!("{}({typemod})", turso_pg_parser::quote_identifier(name)),
+        (_, None) => turso_pg_parser::quote_identifier(name),
+    }
+}
+
+/// The length modifier of `character` and `character varying`, which store
+/// the length plus 4 in `typemod`.
+fn char_typmod(typemod: i64) -> String {
+    if typemod > 4 {
+        format!("({})", typemod - 4)
+    } else {
+        String::new()
     }
 }
 
@@ -1460,44 +1492,19 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 ))
             }
         }
-        "int2" | "smallint" => match trimmed.parse::<i64>() {
-            Ok(v) if v < i16::MIN as i64 || v > i16::MAX as i64 => Some((
-                format!("value \"{input}\" is out of range for type smallint"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type smallint: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "int4" | "integer" | "int" => match trimmed.parse::<i64>() {
-            Ok(v) if v < i32::MIN as i64 || v > i32::MAX as i64 => Some((
-                format!("value \"{input}\" is out of range for type integer"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type integer: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "int8" | "bigint" => match trimmed.parse::<i64>() {
-            Ok(_) => None,
-            Err(_) => {
-                if trimmed.parse::<i128>().is_ok() {
-                    Some((
-                        format!("value \"{input}\" is out of range for type bigint"),
-                        "22003".to_string(),
-                    ))
-                } else {
-                    Some((
-                        format!("invalid input syntax for type bigint: \"{input}\""),
-                        "22P02".to_string(),
-                    ))
-                }
-            }
-        },
+        "int2" | "smallint" => {
+            parse_pg_integer(input, "smallint", i16::MIN.into(), i16::MAX.into())
+                .err()
+                .map(|(message, sqlstate)| (message, sqlstate.to_string()))
+        }
+        "int4" | "integer" | "int" => {
+            parse_pg_integer(input, "integer", i32::MIN.into(), i32::MAX.into())
+                .err()
+                .map(|(message, sqlstate)| (message, sqlstate.to_string()))
+        }
+        "int8" | "bigint" => parse_pg_integer(input, "bigint", i64::MIN, i64::MAX)
+            .err()
+            .map(|(message, sqlstate)| (message, sqlstate.to_string())),
         "float4" | "real" => match trimmed.parse::<f32>() {
             Ok(v) if v.is_infinite() => Some((
                 format!("value \"{input}\" is out of range for type real"),
@@ -1649,6 +1656,39 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
         _ => Some((
             format!("type \"{type_name}\" does not exist"),
             "42704".to_string(),
+        )),
+    }
+}
+
+/// Parses `input` as a value of the PostgreSQL integer type `type_name`, whose
+/// values run from `min` to `max`. An error is the message and the SQLSTATE
+/// PostgreSQL gives.
+fn parse_pg_integer(
+    input: &str,
+    type_name: &str,
+    min: i64,
+    max: i64,
+) -> std::result::Result<i64, (String, &'static str)> {
+    let out_of_range = || {
+        (
+            format!("value \"{input}\" is out of range for type {type_name}"),
+            SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+        )
+    };
+    match input.trim().parse::<i64>() {
+        Ok(value) if (min..=max).contains(&value) => Ok(value),
+        Ok(_) => Err(out_of_range()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow
+            ) =>
+        {
+            Err(out_of_range())
+        }
+        Err(_) => Err((
+            format!("invalid input syntax for type {type_name}: \"{input}\""),
+            SQLSTATE_INVALID_TEXT_REPRESENTATION,
         )),
     }
 }
