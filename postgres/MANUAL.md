@@ -314,6 +314,67 @@ SELECT rolname FROM pg_roles;
 (2 rows)
 ```
 
+### `DROP ROLE` — remove a role
+
+**Synopsis:**
+
+```sql
+DROP ROLE [ IF EXISTS ] name [, ...]
+```
+
+**Description:**
+
+`DROP ROLE` removes the roles from the database, together with their
+memberships: those that make the role a member of other roles, and those
+that make other roles members of it. `DROP USER` and `DROP GROUP` are the
+same statement. A role named twice is dropped once.
+
+**Parameters:**
+
+- `IF EXISTS`: A role that does not exist is skipped instead of failing the
+  statement. PostgreSQL also prints a NOTICE, which Turso does not.
+- `name`: The name of a role. Role names are case-sensitive.
+
+**Notes:**
+
+Only a superuser may drop roles. Any other role gets `permission denied to
+drop role` (SQLSTATE 42501), even with `IF EXISTS`.
+
+The statement fails, and drops none of its roles, when a role:
+
+- does not exist, without `IF EXISTS` (SQLSTATE 42704);
+- is written as `CURRENT_USER`, `CURRENT_ROLE`, `SESSION_USER` or `PUBLIC`
+  (SQLSTATE 22023);
+- is the current role or the role the session logged in as (SQLSTATE 55006);
+- is `postgres` or one of PostgreSQL's predefined roles, such as
+  `pg_database_owner` or `pg_monitor`, which the database needs (SQLSTATE
+  2BP01). This is so even with `IF EXISTS`, though Turso has no role but
+  `pg_database_owner` of these;
+- owns a table, view, materialized view or sequence, has privileges on one,
+  or is a role of a row-level security policy (SQLSTATE 2BP01). A policy
+  that also names `PUBLIC` applies to `PUBLIC` alone, as in PostgreSQL, so
+  its other roles may be dropped. The DETAIL of the error lists these
+  objects. PostgreSQL lists them in the order it recorded them; Turso lists
+  them in the order they were created. A table named like a `pg_catalog`
+  relation, such as `public.pg_roles`, is listed without its schema;
+  PostgreSQL adds the schema.
+
+PostgreSQL lets a superuser drop a role that another session is logged in
+as, and so does Turso: that session keeps running, without the privileges
+of the dropped role.
+
+`DROP OWNED` and `REASSIGN OWNED` are not supported, so the objects of a
+role are dropped or given to another role one at a time, with `DROP` and
+`ALTER ... OWNER TO`, and its privileges are taken away with `REVOKE`.
+
+**Examples:**
+
+```sql
+CREATE ROLE temp_role;
+DROP ROLE temp_role;
+DROP ROLE IF EXISTS temp_role;
+```
+
 ### `GRANT` — give roles privileges on tables
 
 **Synopsis:**
@@ -346,7 +407,9 @@ engine's own tables, which have no row in `pg_class`, can only be read and
 written by a superuser: the `__turso_internal_*` tables, which hold catalogs
 such as the roles and the privileges of each table, and `sqlite_sequence`.
 Roles read the catalogs through `pg_class`, `pg_roles` and the other
-`pg_catalog` views.
+`pg_catalog` views. `pg_description` is a stored table too, which every role
+reads and no statement of a user writes. `COMMENT ON` writes it for the owner
+of the object.
 
 The privileges are stored in the database file, in the table's access
 control list, which `pg_class.relacl` shows in PostgreSQL's form: after
@@ -562,7 +625,8 @@ none of its memberships.
 
 `WITH ADMIN OPTION`, `WITH INHERIT`, `WITH SET`, `ADMIN OPTION FOR`,
 `INHERIT OPTION FOR`, `SET OPTION FOR`, `GRANTED BY` and `CASCADE` fail as
-not supported (SQLSTATE 0A000). There is no `DROP ROLE` yet.
+not supported (SQLSTATE 0A000). `DROP ROLE` removes a role's memberships
+with the role.
 
 **Examples:**
 

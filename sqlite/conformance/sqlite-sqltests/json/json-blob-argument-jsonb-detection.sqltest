@@ -261,3 +261,136 @@ test json_arrow_text5_short_hex_escape_is_malformed {
 expect error {
     malformed JSON
 }
+
+# A JSONB argument that passes jsonArgIsJsonb is searched as it is. Like
+# SQLite, a function that reads a path checks only the elements on the path
+# and the element at the path. X'8C1761133117621BFF' is {"a":1,"b":[...]},
+# where the array of "b" holds the malformed element X'FF'.
+test jsonb_value_outside_the_path_is_not_checked {
+    SELECT json_extract(X'8C1761133117621BFF', '$.a'), X'8C1761133117621BFF' ->> '$.a',
+           X'8C1761133117621BFF' -> '$.a', json_type(X'8C1761133117621BFF', '$.a');
+}
+expect {
+    1|1|1|integer
+}
+
+test jsonb_missing_key_skips_malformed_values {
+    SELECT X'8C1761133117621BFF' ->> '$.c' IS NULL, json_extract(X'8C1761133117621BFF', '$.c') IS NULL,
+           json_type(X'8C1761133117621BFF', '$.c') IS NULL;
+}
+expect {
+    1|1|1
+}
+
+test jsonb_null_path_does_not_check_the_document {
+    SELECT X'8C1761133117621BFF' ->> NULL IS NULL;
+}
+expect {
+    1
+}
+
+test jsonb_several_paths_outside_a_malformed_value {
+    SELECT json_extract(X'8C1761133117621BFF', '$.a', '$.a'),
+           hex(jsonb_extract(X'8C1761133117621BFF', '$.a', '$.c'));
+}
+expect {
+    [1,1]|3B133100
+}
+
+# json_type reads only the header of the element at the path.
+test jsonb_json_type_of_a_malformed_array {
+    SELECT json_type(X'8C1761133117621BFF', '$.b');
+}
+expect {
+    array
+}
+
+# X'4B13311BFF' is the array [1,[...]], and X'BC17614B1331133217621BFF' is
+# {"a":[1,2],"b":[...]}, where [...] holds the malformed element X'FF'.
+test jsonb_array_elements_before_a_malformed_element {
+    SELECT X'4B13311BFF' ->> '$[0]', X'4B13311BFF' ->> '$[#-2]',
+           json_extract(X'4B13311BFF', '$[0]', '$[2]');
+}
+expect {
+    1|1|[1,null]
+}
+
+test jsonb_container_outside_a_malformed_value {
+    SELECT json_array_length(X'BC17614B1331133217621BFF', '$.a'),
+           X'BC17614B1331133217621BFF' -> '$.a',
+           hex(jsonb_extract(X'BC17614B1331133217621BFF', '$.a'));
+}
+expect {
+    2|[1,2]|4B13311332
+}
+
+test jsonb_malformed_value_at_the_path_with_json_extract {
+    SELECT json_extract(X'8C1761133117621BFF', '$.b');
+}
+expect error {
+    malformed JSON
+}
+
+test jsonb_malformed_value_at_the_path_with_arrow {
+    SELECT X'8C1761133117621BFF' -> '$.b';
+}
+expect error {
+    malformed JSON
+}
+
+test jsonb_malformed_value_at_the_path_with_double_arrow {
+    SELECT X'4B13311BFF' ->> '$[1]';
+}
+expect error {
+    malformed JSON
+}
+
+test jsonb_malformed_value_at_one_of_several_paths {
+    SELECT json_extract(X'8C1761133117621BFF', '$.a', '$.b');
+}
+expect error {
+    malformed JSON
+}
+
+# json_each and json_tree with a root path read a JSONB argument as the
+# functions above do: only the element at the root path is checked.
+test jsonb_json_each_at_a_path_outside_a_malformed_value {
+    SELECT key, value, type, atom, id, parent, fullkey, path FROM json_each(X'8C1761133117621BFF', '$.a');
+}
+expect {
+    |1|integer|1|1||$.a|$.a
+}
+
+test jsonb_json_each_of_a_container_outside_a_malformed_value {
+    SELECT key, value, id, fullkey, path FROM json_each(X'BC17614B1331133217621BFF', '$.a');
+}
+expect {
+    0|1|4|$.a[0]|$.a
+    1|2|6|$.a[1]|$.a
+}
+
+test jsonb_json_tree_of_a_container_outside_a_malformed_value {
+    SELECT key, value, id, parent, fullkey, path FROM json_tree(X'BC17614B1331133217621BFF', '$.a');
+}
+expect {
+    a|[1,2]|1||$.a|$
+    0|1|4|1|$.a[0]|$.a
+    1|2|6|1|$.a[1]|$.a
+}
+
+test jsonb_json_each_of_a_missing_key_skips_malformed_values {
+    SELECT count(*) FROM json_each(X'8C1761133117621BFF', '$.c');
+}
+expect {
+    0
+}
+
+# SQLite 3.50.2 does not finish this query: its json_each loops on the
+# malformed element. Thus the test does not run on SQLite.
+@skip-if sqlite "SQLite 3.50.2 does not finish json_each of this malformed element"
+test jsonb_json_each_of_a_malformed_value_at_the_path {
+    SELECT count(*) FROM json_each(X'8C1761133117621BFF', '$.b');
+}
+expect error {
+    malformed JSON
+}

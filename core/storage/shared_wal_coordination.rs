@@ -686,7 +686,7 @@ pub(crate) struct MappedSharedWalCoordination {
     sanitized_backfill_proof_on_open: bool,
     /// Canonical path used as the key in `PROCESS_LOCAL_COORDINATION_OPENS`.
     registry_path: Option<PathBuf>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     frame_index_blocks_scanned: AtomicU64,
 }
 
@@ -754,6 +754,11 @@ type ProcessMappingResult = (
     Arc<Mutex<ProcessLocalOwnershipState>>,
 );
 
+#[cfg(test)]
+thread_local! {
+    static FRAME_BLOCK_PROBE_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl MappedSharedWalCoordination {
     const fn default_ownership_mode() -> SharedWalOwnershipMode {
         if cfg!(target_os = "linux") {
@@ -807,7 +812,7 @@ impl MappedSharedWalCoordination {
             open_mode,
             sanitized_backfill_proof_on_open: false,
             registry_path: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             frame_index_blocks_scanned: AtomicU64::new(0),
         }
     }
@@ -916,7 +921,7 @@ impl MappedSharedWalCoordination {
             .store(1, Ordering::Release);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub(crate) fn take_frame_index_blocks_scanned_for_tests(&self) -> u64 {
         self.frame_index_blocks_scanned.swap(0, Ordering::Relaxed)
     }
@@ -2482,7 +2487,7 @@ impl MappedSharedWalCoordination {
         let first_block = slots.start / FRAME_INDEX_BLOCK_CAPACITY;
         let last_block = (slots.end - 1) / FRAME_INDEX_BLOCK_CAPACITY;
         for block_index in (first_block..=last_block).rev() {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             self.frame_index_blocks_scanned
                 .fetch_add(1, Ordering::Relaxed);
             let block_start_slot = block_index * FRAME_INDEX_BLOCK_CAPACITY;
@@ -2539,7 +2544,7 @@ impl MappedSharedWalCoordination {
         let first_block = slots.start / FRAME_INDEX_BLOCK_CAPACITY;
         let last_block = (slots.end - 1) / FRAME_INDEX_BLOCK_CAPACITY;
         for block_index in (first_block..=last_block).rev() {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             self.frame_index_blocks_scanned
                 .fetch_add(1, Ordering::Relaxed);
             let block_start_slot = block_index * FRAME_INDEX_BLOCK_CAPACITY;
@@ -2801,16 +2806,16 @@ impl MappedSharedWalCoordination {
         let mut slot = Self::hash_page_id(page_id);
         let mut latest = None;
         for _ in 0..FRAME_INDEX_BLOCK_HASH_SLOTS {
+            #[cfg(test)]
+            FRAME_BLOCK_PROBE_STEPS.with(|steps| steps.set(steps.get() + 1));
             let local_plus_one = hash[slot];
             if local_plus_one == 0 {
                 break;
             }
             let local_index = local_plus_one as u32 - 1;
             if local_index >= visible_entries {
-                // In a linear-probing hash table, an entry beyond visible_entries
-                // does not terminate the probe chain — valid entries may follow.
-                // (A writer may have built the hash with more entries than this
-                // reader's snapshot makes visible.)
+                // Not visible to this reader, but the probe chain goes on.
+                slot = (slot + 1) % FRAME_INDEX_BLOCK_HASH_SLOTS as usize;
                 continue;
             }
             let entry = unsafe { *mapping.entries_ptr.as_ptr().add(local_index as usize) };
@@ -4423,6 +4428,28 @@ mod tests {
             mapped.iter_latest_frames(0, 10),
             vec![(colliding[0], 6), (colliding[1], 10), (colliding[2], 8),]
         );
+    }
+
+    #[test]
+    fn find_frame_does_not_spin_on_an_entry_its_reader_cannot_see() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_mapping(&path);
+        let colliding = colliding_page_ids(3);
+
+        mapped.record_frame(colliding[0], 2);
+        mapped.record_frame(colliding[1], 4);
+        mapped.record_frame(colliding[0], 6);
+        mapped.record_frame(colliding[2], 8);
+        mapped.record_frame(colliding[1], 10);
+
+        FRAME_BLOCK_PROBE_STEPS.with(|steps| steps.set(0));
+        let found = mapped.find_frame(colliding[1], 0, 10, Some(9));
+        let probe_steps = FRAME_BLOCK_PROBE_STEPS.with(|steps| steps.get());
+
+        assert_eq!(found, Some(4));
+        // 5 entries in the chain plus the empty slot that ends it.
+        assert!(probe_steps <= 6, "probed {probe_steps} slots");
     }
 
     #[test]

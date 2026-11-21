@@ -137,6 +137,16 @@ fn key_info() -> KeyInfo {
 /// Memory budget for Tantivy's per-segment writer arena.
 pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
+/// Memory budget of the segment writer for each buffered document. A batch of
+/// `BATCH_COMMIT_SIZE` documents gets an initial term table of 2^15 entries,
+/// which holds 16,384 terms before it grows.
+const SEGMENT_MEMORY_BUDGET_BYTES_PER_DOC: usize = 1024;
+
+/// The smallest memory budget of the segment writer. It gives Tantivy's
+/// smallest initial term table (2^10 entries). Tantivy refuses a budget of
+/// 24 KiB or less.
+const MIN_SEGMENT_MEMORY_BUDGET_BYTES: usize = 32 * 1024;
+
 /// Chunk size (512 KiB) for splitting segment files into backing rows.
 pub const DEFAULT_CHUNK_SIZE: usize = 512 * 1024;
 
@@ -693,6 +703,17 @@ impl FtsIndexAttachment {
         dialect: &dyn crate::dialect::Dialect,
         cfg: IndexMethodConfiguration,
     ) -> Result<Self> {
+        let pattern_sql = query_pattern_sql(&cfg);
+        let patterns = parse_patterns(dialect, &pattern_sql.each_ref().map(String::as_str))?;
+        Self::with_patterns(cfg, patterns)
+    }
+
+    /// Build the attachment with already parsed query patterns, in the
+    /// order of [`query_pattern_sql`].
+    pub(crate) fn with_patterns(
+        cfg: IndexMethodConfiguration,
+        patterns: Vec<Select>,
+    ) -> Result<Self> {
         // Validate WITH clause keys the same way bad values are validated:
         // a typo like `tokenzier` must be an error, not a silently different
         // index. Keys are matched case-insensitively.
@@ -867,52 +888,6 @@ impl FtsIndexAttachment {
 
         let schema = schema_builder.build();
 
-        // Build query patterns for FTS
-        // Order matters: more specific patterns should come first
-        let cols = cfg
-            .columns
-            .iter()
-            .map(|c| crate::util::quote_identifier(&c.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let table = crate::util::quote_identifier(&cfg.table_name);
-
-        // Pattern 0: score with ORDER BY DESC LIMIT
-        let score_pattern = format!(
-            "SELECT fts_score({cols}, ?) as score FROM {table} ORDER BY score DESC LIMIT ?"
-        );
-        // Pattern 1: combined + ORDER BY DESC + LIMIT (most specific)
-        let combined_ordered_limit = format!(
-            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) ORDER BY score DESC LIMIT ?"
-        );
-        // Pattern 2: combined + ORDER BY DESC (no LIMIT)
-        let combined_ordered = format!(
-            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) ORDER BY score DESC"
-        );
-        // Pattern 3: combined + LIMIT (no ORDER BY)
-        let combined_limit = format!(
-            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) LIMIT ?"
-        );
-        // Pattern 4: combined (no ORDER BY, no LIMIT)
-        let combined = format!(
-            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1)"
-        );
-        // Pattern 5: match + LIMIT
-        let match_limit = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?) LIMIT ?");
-        // Pattern 6: match (no LIMIT)
-        let match_pattern = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?)");
-        let patterns = parse_patterns(
-            dialect,
-            &[
-                &score_pattern,          // 0
-                &combined_ordered_limit, // 1
-                &combined_ordered,       // 2
-                &combined_limit,         // 3
-                &combined,               // 4
-                &match_limit,            // 5
-                &match_pattern,          // 6
-            ],
-        )?;
         Ok(Self {
             cfg,
             schema,
@@ -926,6 +901,36 @@ impl FtsIndexAttachment {
             shared: Arc::new(FtsShared::default()),
         })
     }
+}
+
+/// The SQL of the query patterns of an FTS index on `cfg`, more specific
+/// patterns first.
+fn query_pattern_sql(cfg: &IndexMethodConfiguration) -> [String; 7] {
+    let cols = cfg
+        .columns
+        .iter()
+        .map(|c| crate::util::quote_identifier(&c.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = crate::util::quote_identifier(&cfg.table_name);
+    let score = format!("fts_score({cols}, ?1) as score FROM {table}");
+    let fts_match = format!("WHERE fts_match({cols}, ?1)");
+    [
+        // 0: score with ORDER BY DESC LIMIT
+        format!("SELECT fts_score({cols}, ?) as score FROM {table} ORDER BY score DESC LIMIT ?"),
+        // 1: combined + ORDER BY DESC + LIMIT (most specific)
+        format!("SELECT {score} {fts_match} ORDER BY score DESC LIMIT ?"),
+        // 2: combined + ORDER BY DESC (no LIMIT)
+        format!("SELECT {score} {fts_match} ORDER BY score DESC"),
+        // 3: combined + LIMIT (no ORDER BY)
+        format!("SELECT {score} {fts_match} LIMIT ?"),
+        // 4: combined (no ORDER BY, no LIMIT)
+        format!("SELECT {score} {fts_match}"),
+        // 5: match + LIMIT
+        format!("SELECT * FROM {table} WHERE fts_match({cols}, ?) LIMIT ?"),
+        // 6: match (no LIMIT)
+        format!("SELECT * FROM {table} WHERE fts_match({cols}, ?)"),
+    ]
 }
 
 fn parse_json_fields(value: Option<&Value>, columns: &[IndexColumn]) -> Result<HashSet<String>> {
@@ -2201,7 +2206,8 @@ impl FtsCursor {
         self.register_tokenizers(&index);
         let segment_id = self.mint_segment_id();
         let segment = index.segment(index.new_segment_meta(segment_id, 0));
-        let mut writer = SegmentWriter::for_segment(DEFAULT_MEMORY_BUDGET_BYTES, segment)
+        let memory_budget = Self::segment_memory_budget(self.doc_buffer.len());
+        let mut writer = SegmentWriter::for_segment(memory_budget, segment)
             .map_err(|e| build_dir.write_error(e, "FTS segment writer"))?;
         let identity_base = self.mint_identity_base();
         let mut added = 0u32;
@@ -2244,6 +2250,22 @@ impl FtsCursor {
         );
         let captured = build_dir.captured_files();
         segment_rows_from_files(segment_id, max_doc, captured, identities)
+    }
+
+    /// The memory budget of the segment writer for `doc_count` buffered
+    /// documents.
+    ///
+    /// Tantivy uses the budget only to size the initial hash table of terms:
+    /// the largest power of two from 2^10 to 2^19 entries of 8 bytes that
+    /// is less than a third of the budget. The table grows when it is half
+    /// full, and the writer sorts the terms before it writes them, so the
+    /// size does not change the segment files. Each build fills the table
+    /// and `finalize` reads all of it, so a table that is too large for the
+    /// batch makes the build slow.
+    fn segment_memory_budget(doc_count: usize) -> usize {
+        doc_count
+            .saturating_mul(SEGMENT_MEMORY_BUDGET_BYTES_PER_DOC)
+            .clamp(MIN_SEGMENT_MEMORY_BUDGET_BYTES, DEFAULT_MEMORY_BUDGET_BYTES)
     }
 
     /// Drive the in-flight publication (row deletions, then row inserts,

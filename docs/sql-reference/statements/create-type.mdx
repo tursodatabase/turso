@@ -121,6 +121,8 @@ CREATE TABLE users (
 
 The first parameter is always the input `value`. Additional parameters are the arguments provided in the column type declaration, in order.
 
+A column of a STRICT table gives one argument for each additional parameter. A type without additional parameters takes no arguments: `CREATE TABLE t(a uuid(3)) STRICT` fails with `type "uuid" requires 0 parameter(s), got 1`.
+
 ### COERCE
 
 The COERCE expression fits an already encoded value to what the column may store, such as the maximum length of a `varchar(100)`, the scale of a `numeric(10,2)` or the range of a `smallint`. `value` is the output of ENCODE, and each parameter is the column's argument for it. COERCE may only round, pad, cut or reject the value (with RAISE), so the result stays the same value in the type's order: a COERCE like `value * f` would make stored values disagree with values that were only encoded, such as index lookup keys. Put limit checks in COERCE, not ENCODE: ENCODE also runs on values that are only compared, so a range check there would make `smallint_col < 100000` fail.

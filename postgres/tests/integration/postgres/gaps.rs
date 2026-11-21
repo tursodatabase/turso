@@ -9,6 +9,9 @@
 //! the PostgreSQL result and remove `tursopg_returns_wrong_result` from the
 //! name. See postgres/CONTRIBUTING.md.
 //!
+//! The gap counts of `make -C postgres/conformance gaps` come from the `@compat-gap`
+//! tests in the .sqltest files and do not include these tests.
+//!
 //! Results are rows joined by ` ; ` and cells joined by `|`, or
 //! `ERROR <sqlstate>`. PostgreSQL results are the PostgreSQL 18 results in
 //! the form the embedded API returns them: booleans as `1` and `0`, and

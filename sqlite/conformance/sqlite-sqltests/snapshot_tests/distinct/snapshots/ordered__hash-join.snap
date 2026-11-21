@@ -1,0 +1,63 @@
+---
+source: ordered.sqltest
+expression: SELECT DISTINCT t.a FROM t JOIN u ON u.id = t.b;
+info:
+  statement_type: SELECT
+  tables:
+  - t
+  - u
+  - u.id
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--HASH JOIN t
+|--SCAN u
+`--USE HASH TABLE FOR DISTINCT
+
+BYTECODE
+addr  opcode                      p1  p2  p3  p4                                        p5  comment
+   0  Init                         0  41   0                                             0  Start at 41
+   1  HashClear           1073741824   0   0                                             0
+   2  OpenRead                     0   2   0  k(5,B,B,B,NoCase,B)                        0  table=t, root=2, iDb=0
+   3  OpenRead                     1   5   0  k(3,B,B,B)                                 0  table=u, root=5, iDb=0
+   4  Once                        13   0   0                                             0  goto 13
+   5  OpenRead                     2   5   0  k(3,B,B,B)                                 0  table=u, root=5, iDb=0
+   6  Rewind                       2  12   0                                             0  Rewind table u
+   7    RowId                      2   2   0                                             0  r[2]=u.rowid
+   8    Affinity                   2   1   0                                             0  r[2..3] = C
+   9    RowId                      2   3   0                                             0  r[3]=u.rowid
+  10    HashBuild                  2   2   1  r=[2] budget=67108864 payload=r[3]..r[3]   0
+  11  Next                         2   7   0                                             0
+  12  HashBuildFinalize            2   0   0                                             0
+  13  HashProbeInit                2   0   0                                             0
+  14  Rewind                       0  27   0                                             0  Rewind table t
+  15    Column                     0   2   4                                             0  r[4]=t.b
+  16    Affinity                   4   1   0                                             0  r[4..5] = C
+  17    RowId                      0   6   0                                             0  r[6]=t.rowid
+  18    Integer                    0   7   0                                             0  r[7]=0
+  19    HashProbe                  2   4   1  r[8]=26 payload=r[5]..r[5]                 0
+  20    Column                     0   1   1                                             0  r[1]=t.a
+  21    HashDistinct      1073741824   1   1  jmp=23                                     0
+  22    ResultRow                  1   1   0                                             0  output=r[1]
+  23    IfPos                      7  34   0                                             0  r[7]>0 -> r[7]-=0, goto 34
+  24    HashNext                   2   8  26   payload=r[5]..r[5]                        0
+  25    Goto                       0  20   0                                             0
+  26  Next                         0  15   0                                             0
+  27  HashGraceInit                2   0  39                                             0  hash_table_id=2
+  28  Integer                      1   7   0                                             0  r[7]=1
+  29  HashGraceLoadPart            2   0  38                                             0  hash_table_id=2
+  30  HashGraceNextProbe           2   4  36                                             0  hash_table_id=2 keys=r[4]..r[4] probe_rowid_dest=r[6]
+  31  SeekRowid                    0   6  30                                             0  if (r[6]!=cursor 0 for table t.rowid) goto 30
+  32  HashProbe                    2   4   1  r[8]=30 payload=r[5]..r[5]                 0
+  33  Goto                         0  20   0                                             0
+  34  HashNext                     2   8  30   payload=r[5]..r[5]                        0
+  35  Goto                         0  20   0                                             0
+  36  HashGraceAdvPart             2   0  38                                             0  hash_table_id=2
+  37  Goto                         0  29   0                                             0
+  38  Integer                      0   7   0                                             0  r[7]=0
+  39  HashClose                    2   0   0                                             0
+  40  Halt                         0   0   0                                             0
+  41  Transaction                  0   1   5                                             0  iDb=0 tx_mode=Read
+  42  Goto                         0   1   0                                             0

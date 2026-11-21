@@ -108,10 +108,16 @@ impl WorkerResponse {
 /// (e.g. `"Corrupt database: {0}"`); the receiver would then
 /// reconstruct `LimboError::Corrupt("Corrupt database: ...")`. A
 /// `SequenceExhausted` sends its sequence name; the direction rides in
-/// the error kind.
+/// the error kind. `DependentObjects` sends what was dropped and then each
+/// dependent object, one per line.
 pub fn limbo_error_to_message(err: &LimboError) -> String {
     match err {
         LimboError::SequenceExhausted { name, .. } => name.clone(),
+        LimboError::DependentObjects(refusal) => std::iter::once(&refusal.dropped)
+            .chain(&refusal.dependents)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n"),
         LimboError::Corrupt(s)
         | LimboError::InternalError(s)
         | LimboError::ParseError(s)
@@ -143,6 +149,7 @@ pub fn limbo_error_to_kind(err: &LimboError) -> &'static str {
         LimboError::Conflict(_) => "Conflict",
         LimboError::CheckpointFailed(_) => "CheckpointFailed",
         LimboError::ParseError(_) => "ParseError",
+        LimboError::DependentObjects(_) => "DependentObjects",
         LimboError::TxError(_) => "TxError",
         LimboError::TransactionAlreadyActive => "TransactionAlreadyActive",
         LimboError::NoActiveTransaction { op: "commit" } => "NoActiveTransactionCommit",
@@ -178,6 +185,11 @@ fn error_kind_to_limbo_error(kind: &str, message: &str) -> LimboError {
         "Conflict" => LimboError::Conflict(message.to_string()),
         "CheckpointFailed" => LimboError::CheckpointFailed(message.to_string()),
         "ParseError" => LimboError::ParseError(message.to_string()),
+        "DependentObjects" => {
+            let mut lines = message.lines().map(str::to_string);
+            let dropped = lines.next().unwrap_or_default();
+            LimboError::dependent_objects(dropped, lines.collect())
+        }
         "TxError" => LimboError::TxError(message.to_string()),
         "TransactionAlreadyActive" => LimboError::TransactionAlreadyActive,
         "NoActiveTransactionCommit" => LimboError::NoActiveTransaction { op: "commit" },
@@ -199,6 +211,21 @@ fn error_kind_to_limbo_error(kind: &str, message: &str) -> LimboError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_round_trips_a_refused_drop_with_its_dependent_objects() {
+        let sent = LimboError::dependent_objects(
+            "table t".into(),
+            vec![
+                "view v depends on table t".into(),
+                "view w depends on view v".into(),
+            ],
+        );
+        let received =
+            error_kind_to_limbo_error(limbo_error_to_kind(&sent), &limbo_error_to_message(&sent));
+        assert_eq!(received.to_string(), sent.to_string());
+        assert!(matches!(received, LimboError::DependentObjects(_)));
+    }
 
     /// Every `LimboError` variant the multiprocess handler relies on for
     /// classification must round-trip through `limbo_error_to_kind` +

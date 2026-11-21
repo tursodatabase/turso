@@ -7,7 +7,7 @@ use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{
     DeletePlan, DmlSafety, DmlSafetyReason, IterationDirection, JoinOrderMember, Operation, Plan,
-    QueryDestination, ResultSetColumn, Scan, SelectPlan,
+    QueryDestination, ResultSetColumn, Scan, Search, SelectPlan,
 };
 use crate::translate::planner::{
     collect_subquery_table_refs_in_expr, parse_where, plan_ctes_as_outer_refs,
@@ -175,7 +175,7 @@ pub fn translate_delete(
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
         // Re-check after optimization: chosen access paths can make "delete while scanning"
         // unsafe, so we may need to collect rowids first.
-        record_delete_optimizer_safety(delete_plan_inner);
+        record_delete_optimizer_safety(delete_plan_inner, resolver, connection)?;
         if delete_plan_inner.safety.requires_stable_write_set() {
             ensure_delete_uses_rowset(program, delete_plan_inner);
         }
@@ -211,7 +211,7 @@ pub fn translate_delete(
     super::stmt_journal::set_delete_stmt_journal_flags(program, delete, resolver, connection)?;
     let opts = ProgramBuilderOpts::new(1, estimate_num_instructions(delete), 0);
     program.extend(&opts);
-    emit_program(connection, resolver, program, delete_plan, |_| {})?;
+    emit_program(connection, resolver, program, delete_plan)?;
     Ok(())
 }
 
@@ -382,22 +382,9 @@ pub fn prepare_delete_plan(
         })
         .unwrap_or(false);
 
-    let has_fk_actions = match btree_table_for_triggers.as_ref() {
-        Some(bt) if connection.foreign_keys_enabled() => resolver
-            .with_schema(database_id, |s| {
-                s.resolved_fks_referencing(namespace.id, &bt.name)
-            })?
-            .iter()
-            .any(|fk_ref| !matches!(fk_ref.fk.on_delete, RefAct::NoAction | RefAct::Restrict)),
-        _ => false,
-    };
-
     let mut safety = DmlSafety::default();
     if has_delete_triggers {
         safety.require(DmlSafetyReason::Trigger);
-    }
-    if has_fk_actions {
-        safety.require(DmlSafetyReason::FkCascade);
     }
     if where_clause_has_subquery(&where_predicates) {
         safety.require(DmlSafetyReason::SubqueryInWhere);
@@ -453,7 +440,33 @@ fn estimate_num_instructions(plan: &DeletePlan) -> usize {
 }
 
 /// Add post-optimizer reasons that force "collect rowids first, then delete".
-fn record_delete_optimizer_safety(plan: &mut DeletePlan) {
+fn record_delete_optimizer_safety(
+    plan: &mut DeletePlan,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    let table = plan
+        .table_references
+        .joined_tables()
+        .first()
+        .expect("DELETE should have one target table");
+    // FK actions fire after the row is deleted, and a rowid equality search never steps to
+    // a next row, so the actions cannot change which rows this DELETE visits.
+    if connection.foreign_keys_enabled()
+        && !matches!(table.op, Operation::Search(Search::RowidEq { .. }))
+    {
+        if let Some(bt) = table.btree() {
+            let has_fk_actions = resolver
+                .with_schema(table.namespace.database_id, |s| {
+                    s.resolved_fks_referencing(table.namespace.id, &bt.name)
+                })?
+                .iter()
+                .any(|fk_ref| !matches!(fk_ref.fk.on_delete, RefAct::NoAction | RefAct::Restrict));
+            if has_fk_actions {
+                plan.safety.require(DmlSafetyReason::FkCascade);
+            }
+        }
+    }
     if plan
         .table_references
         .joined_tables()
@@ -475,6 +488,7 @@ fn record_delete_optimizer_safety(plan: &mut DeletePlan) {
                 .require(DmlSafetyReason::IndexMethodNotMaterialized);
         }
     }
+    Ok(())
 }
 
 /// Convert a DELETE plan into a RowSet-driven delete:

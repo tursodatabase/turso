@@ -68,6 +68,13 @@ impl Dialect for TestDialect {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
     }
 
+    fn parameter_marker_ranges(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<Vec<std::ops::Range<usize>>> {
+        turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
+    }
+
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
         Arc::new(SqliteDialect)
     }
@@ -166,6 +173,13 @@ impl Dialect for StrictTestDialect {
         sql: &str,
     ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn parameter_marker_ranges(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<Vec<std::ops::Range<usize>>> {
+        turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
     }
 
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
@@ -551,6 +565,13 @@ impl Dialect for NoFunctionsDialect {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
     }
 
+    fn parameter_marker_ranges(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<Vec<std::ops::Range<usize>>> {
+        turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
+    }
+
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
         Arc::new(SqliteDialect)
     }
@@ -611,6 +632,13 @@ impl Dialect for ShoutingUpperDialect {
         sql: &str,
     ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn parameter_marker_ranges(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<Vec<std::ops::Range<usize>>> {
+        turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
     }
 
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
@@ -1134,6 +1162,13 @@ impl Dialect for NamespacesAndOwnBuilderDialect {
         sql: &str,
     ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn parameter_marker_ranges(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<Vec<std::ops::Range<usize>>> {
+        turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
     }
 
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {

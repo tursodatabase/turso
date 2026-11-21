@@ -325,6 +325,18 @@ test('conflict-bug', async () => {
     ]);
 })
 
+test('columns() gives each column its origin and declared type, as in better-sqlite3', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, created BIGINT NOT NULL, name VARCHAR(40))");
+    const stmt = await db.prepare("SELECT id, created, name AS display, id + 1 AS next FROM users");
+    expect(stmt.columns()).toEqual([
+        { name: "id", column: "id", table: "users", database: "main", type: "INTEGER" },
+        { name: "created", column: "created", table: "users", database: "main", type: "BIGINT" },
+        { name: "display", column: "name", table: "users", database: "main", type: "VARCHAR(40)" },
+        { name: "next", column: null, table: null, database: null, type: null },
+    ]);
+})
+
 test('on-disk db', async () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
     try {
@@ -332,14 +344,14 @@ test('on-disk db', async () => {
         await db1.exec("CREATE TABLE t(x)");
         await db1.exec("INSERT INTO t VALUES (1), (2), (3)");
         const stmt1 = await db1.prepare("SELECT * FROM t WHERE x % 2 = ?");
-        expect(stmt1.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
+        expect(stmt1.columns()).toEqual([{ name: "x", column: "x", database: "main", table: "t", type: null }]);
         const rows1 = await stmt1.all([1]);
         expect(rows1).toEqual([{ x: 1 }, { x: 3 }]);
         db1.close();
 
         const db2 = await connect(path);
         const stmt2 = await db2.prepare("SELECT * FROM t WHERE x % 2 = ?");
-        expect(stmt2.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
+        expect(stmt2.columns()).toEqual([{ name: "x", column: "x", database: "main", table: "t", type: null }]);
         const rows2 = await stmt2.all([1]);
         expect(rows2).toEqual([{ x: 1 }, { x: 3 }]);
         db2.close();
@@ -363,7 +375,7 @@ test('attach', async () => {
         await db1.exec(`ATTACH '${path2}' as secondary`);
 
         const stmt = await db1.prepare("SELECT * FROM t UNION ALL SELECT * FROM secondary.q");
-        expect(stmt.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
+        expect(stmt.columns()).toEqual([{ name: "x", column: "x", database: "main", table: "t", type: null }]);
         const rows = await stmt.all([1]);
         expect(rows).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }, { x: 5 }, { x: 6 }]);
     } finally {

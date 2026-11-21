@@ -237,6 +237,9 @@ fn build_select_plan_dag(
     plan: &SelectPlan,
     resolver: &Resolver,
 ) -> Result<dag::NodeId> {
+    if plan.distinctness.is_distinct_on() {
+        return unsupported("DISTINCT ON");
+    }
     if !plan.order_by.is_empty() {
         return unsupported("ORDER BY");
     }
@@ -986,6 +989,7 @@ pub(crate) fn plan_view(
         None,
         ProgramBuilderOpts::new(8, 32, 8),
         connection.mvcc_enabled(),
+        0,
     );
     let mut relational_plan = prepare_select_plan(
         select.clone(),

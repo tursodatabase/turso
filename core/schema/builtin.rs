@@ -150,35 +150,10 @@ fn pragma_vtabs() -> crate::Result<Vec<Arc<VirtualTable>>> {
 
 #[cfg(test)]
 mod tests {
-    use crate::dialect::Dialect;
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
     use crate::security::roles::SessionRole;
     use crate::sync::Arc;
-    use crate::{ConnectOpts, Database, LimboError, MemoryIO, Result};
-    use turso_parser::ast;
-
-    struct DialectThatCannotParse;
-
-    impl Dialect for DialectThatCannotParse {
-        fn name(&self) -> &'static str {
-            "cannot-parse"
-        }
-
-        fn parse(&self, sql: &str) -> Result<(Option<ast::Cmd>, usize)> {
-            self.parse_internal(sql)
-        }
-
-        fn parse_internal(&self, sql: &str) -> Result<(Option<ast::Cmd>, usize)> {
-            Err(LimboError::ParseError(format!("asked to parse: {sql}")))
-        }
-
-        fn parse_internal_column_definition(&self, sql: &str) -> Result<ast::ColumnDefinition> {
-            Err(LimboError::ParseError(format!("asked to parse: {sql}")))
-        }
-
-        fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
-            Arc::new(DialectThatCannotParse)
-        }
-    }
+    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenOptions};
 
     #[test]
     fn opening_a_new_database_parses_no_sql() {
@@ -188,6 +163,20 @@ mod tests {
             Arc::new(DialectThatCannotParse),
         )
         .unwrap();
+        db.connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+    }
+
+    #[test]
+    fn opening_a_new_mvcc_database_parses_no_sql() {
+        let db = Database::open(
+            Arc::new(MemoryIO::new()),
+            ":memory:",
+            OpenOptions::new(Arc::new(DialectThatCannotParse))
+                .db_opts(DatabaseOpts::default().with_mvcc(true)),
+        )
+        .unwrap();
+        assert!(db.get_mv_store().is_some());
         db.connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
     }

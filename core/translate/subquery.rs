@@ -401,7 +401,7 @@ pub fn plan_subqueries_from_select_plan(
         recollect_aggregates(plan, resolver)?;
     }
 
-    assign_select_subquery_eval_phases(plan)?;
+    assign_select_subquery_eval_phases(plan, resolver)?;
     mark_shared_cte_materialization_requirements(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
@@ -823,9 +823,14 @@ fn get_subquery_parser<'a>(
                 // never evaluated: an ORDER BY term that would error at
                 // runtime (e.g. an integer overflow) must not fail the query.
                 // LIMIT and OFFSET stay: with DISTINCT gone they count plain
-                // rows, which matches SQLite.
-                plan.order_by.clear();
-                plan.distinctness = crate::translate::plan::Distinctness::NonDistinct;
+                // rows, which matches SQLite. An OFFSET after DISTINCT ON
+                // counts groups, as in PostgreSQL, so that pair stays whole.
+                let offset_counts_distinct_on_groups =
+                    plan.offset.is_some() && plan.distinctness.is_distinct_on();
+                if !offset_counts_distinct_on_groups {
+                    plan.order_by.clear();
+                    plan.distinctness = crate::translate::plan::Distinctness::NonDistinct;
+                }
                 let correlated = select_plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 if !correlated || origin.is_write_statement() {
@@ -2441,7 +2446,7 @@ pub fn emit_non_from_clause_subqueries_for_eval_at(
     )
 }
 
-fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) -> Result<()> {
+fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
     let has_grouped_output = plan
         .group_by
         .as_ref()
@@ -2474,7 +2479,7 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) -> Result<()> {
         // in the outer query's aggregate-output phase, after that aggregate has
         // been finalized into a register; run earlier, the aggregate expression
         // inside the subquery has no register to read.
-        if let Some(func) = outer_aggregate_read_by_subquery(subquery) {
+        if let Some(func) = outer_aggregate_read_by_subquery(subquery, resolver) {
             // An aggregate's arguments are evaluated for each input row, before
             // this query has computed the aggregate the subquery reads.
             if aggregate_subquery_ids.contains(&subquery.internal_id) {
@@ -2601,7 +2606,10 @@ fn expr_reads_subquery(expr: &ast::Expr, subquery_ids: &[ast::TableInternalId]) 
 /// Window functions (an aggregate name with an `OVER` clause) are computed by
 /// the subquery itself, not the outer query, so they are not counted here even
 /// though they also do not appear in `aggregates`.
-fn outer_aggregate_read_by_subquery(subquery: &NonFromClauseSubquery) -> Option<String> {
+fn outer_aggregate_read_by_subquery(
+    subquery: &NonFromClauseSubquery,
+    resolver: &Resolver,
+) -> Option<String> {
     // EXISTS only checks whether a row comes out and never evaluates its
     // result columns, as in SQLite.
     if matches!(subquery.query_type, SubqueryType::Exists { .. }) {
@@ -2625,8 +2633,8 @@ fn outer_aggregate_read_by_subquery(subquery: &NonFromClauseSubquery) -> Option<
             {
                 let is_plain_aggregate = filter_over.over_clause.is_none()
                     && matches!(
-                        crate::function::Func::resolve_function(name.as_str(), args.len()),
-                        Ok(Some(crate::function::Func::Agg(_)))
+                        resolver.resolve_function(name.as_str(), args.len()),
+                        Ok(Some(func)) if func.is_aggregate()
                     );
                 if is_plain_aggregate && !select.aggregates.iter().any(|a| a.original_expr == *e) {
                     found = Some(name.as_str().to_string());

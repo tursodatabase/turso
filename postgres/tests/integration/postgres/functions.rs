@@ -616,7 +616,6 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
             Value::build_text("x + 7"),
         ),
         ("SELECT pg_get_expr('x + 7', NULL, 1)", Value::Null),
-        ("SELECT length(now(1, 2, 3))", Value::from_i64(23)),
     ] {
         assert_eq!(
             conn.prepare(sql).unwrap().run_collect_rows().unwrap(),
@@ -626,6 +625,11 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
     }
     for sql in [
         "SELECT version(1)",
+        "SELECT now(1)",
+        "SELECT now(1, 2)",
+        "SELECT clock_timestamp(1)",
+        "SELECT transaction_timestamp(1)",
+        "SELECT statement_timestamp('x')",
         "SELECT quote_ident()",
         "SELECT format_type()",
         "SELECT format_type(23, -1, 0)",
@@ -647,7 +651,7 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
         [
             ("format_type", 1, 2048),
             ("format_type", 2, 2048),
-            ("now", -1, 0),
+            ("now", 0, 0),
             ("pg_get_constraintdef", 1, 0),
             ("pg_get_constraintdef", 2, 0),
             ("quote_ident", 1, 2048),
@@ -673,7 +677,7 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
         [
             ("format_type", 1, "i"),
             ("format_type", 2, "i"),
-            ("now", -1, "v"),
+            ("now", 0, "v"),
             ("pg_get_constraintdef", 1, "v"),
             ("pg_get_constraintdef", 2, "v"),
             ("quote_ident", 1, "i"),
@@ -700,7 +704,7 @@ fn test_pg_native_timestamps_are_registered_before_connection_wrapping(db: TempD
         assert!(conn.get_syms_functions().iter().any(
             |(registered, is_agg, argc, deterministic)| registered == name
                 && !is_agg
-                && *argc == -1
+                && *argc == 0
                 && !deterministic
         ));
         let rows = conn
@@ -760,13 +764,11 @@ fn test_pg_quote_literal(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
-fn test_pg_description_stubs_return_null(db: TempDatabase) {
+fn description_lookups_return_null_for_an_object_without_a_comment(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE t (id integer PRIMARY KEY)")
         .unwrap();
 
-    // Comments are not stored, so description lookups report none rather
-    // than erroring.
     for sql in [
         "SELECT obj_description(16384, 'pg_class')",
         "SELECT obj_description(16384)",
@@ -865,4 +867,39 @@ fn test_pg_application_name_isolation_and_rollback(db: TempDatabase) {
     assert!(conn
         .execute("SELECT current_setting('unknown_builtin')")
         .is_err());
+}
+
+/// Older versions stored `f(*)` on a function that is not an aggregate as a
+/// call with no arguments. The core connection translates without the check
+/// that rejects it, as those versions did, and the tables and views it
+/// creates stay usable after the schema loads again.
+#[turso_macros::test]
+fn test_pg_stored_star_argument_of_scalar_function_still_loads(db: TempDatabase) {
+    let raw = db.connect_limbo();
+    raw.execute(
+        "CREATE TABLE public.star_stored (a float CHECK (random(*) >= 0), b float DEFAULT pi(*), \
+         c timestamptz DEFAULT now(*))",
+    )
+    .unwrap();
+    raw.execute(
+        "CREATE VIEW public.star_stored_view AS SELECT now(*) IS NOT NULL AS x, pi(*) > 3 AS y",
+    )
+    .unwrap();
+    drop(raw);
+    let db = db.reopen();
+    let conn = db.connect_postgres();
+    conn.execute("INSERT INTO star_stored (a) VALUES (1)")
+        .unwrap();
+    assert_eq!(
+        query_integer(
+            &conn,
+            "SELECT count(*) FROM star_stored WHERE b > 3 AND c IS NOT NULL"
+        ),
+        [1]
+    );
+    assert_eq!(
+        query_integer(&conn, "SELECT count(*) FROM star_stored_view WHERE x AND y"),
+        [1]
+    );
+    assert!(conn.execute("SELECT pi(*)").is_err());
 }

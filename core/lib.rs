@@ -94,20 +94,6 @@ mod uuid;
 mod vdbe;
 pub mod vtab;
 
-// `turso_sqlite` depends on this crate, so the unit tests of this crate
-// cannot link it: its `SqliteDialect` implements the `Dialect` trait of the
-// copy of this crate built without tests. The unit tests compile the source
-// of `turso_sqlite` as a module instead, and open databases with the same
-// dialect that users do.
-#[cfg(test)]
-extern crate self as turso_core;
-#[cfg(test)]
-#[allow(unused_imports)]
-#[path = "../sqlite/frontend/lib.rs"]
-mod turso_sqlite;
-#[cfg(test)]
-pub(crate) use turso_sqlite::SqliteDialect;
-
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
 pub use function::{ExternalFunc, Func, ScalarFunc};
@@ -123,7 +109,6 @@ use crate::{
     busy::{BusyHandler, BusyHandlerCallback},
     index_method::IndexMethod,
     schema::Trigger,
-    storage::encryption::AtomicCipherMode,
     sync::{atomic::AtomicBool, Arc, RwLock},
     vdbe::metrics::ConnectionMetrics,
 };
@@ -160,7 +145,12 @@ pub(crate) use database::{DatabaseCatalog, InitState};
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 pub use dialect::{
-    AccessStatement, CatalogApply, Dialect, NewOwner, OwnerColumn, RelationChange, RelationName,
+    AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
+    CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,
+    CreateView, Dependent, DependentObject, Dialect, DropColumn, DropIndex, DropSequence,
+    DropTable, DropView, NewOwner, OwnerColumn, RelationName, RenameColumn, RenameTable,
+    RewrittenTrigger, RewrittenView, SqliteCatalog, StatementTimes, TableText,
+    TempTriggerOfRenamedTable,
 };
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
@@ -189,7 +179,9 @@ pub use io::{
 pub use namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use security::roles::SessionRole;
-pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
+pub use statement::{
+    ColumnOrigin, ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter,
+};
 pub use storage::{
     buffer_pool::BufferPool,
     database::{DatabaseStorage, IOContext},

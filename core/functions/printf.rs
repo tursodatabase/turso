@@ -1455,9 +1455,41 @@ pub fn exec_printf_values(format: &Value, args: &[&Value]) -> crate::Result<Valu
     Ok(Value::build_text(result))
 }
 
+/// Append `value` as `printf('%.<precision>g', value)` writes it.
+pub(crate) fn push_general_format(output: &mut String, value: &Value, precision: usize) {
+    let spec = FormatSpec {
+        flags: FormatFlags::default(),
+        width: None,
+        precision: Some(precision),
+        spec_type: 'g',
+    };
+    format_general(output, value, &spec, false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_general_format_writes_the_text_of_printf() {
+        for f in [
+            0.0,
+            -0.0,
+            2460513.1046875,
+            2460513.104687512,
+            -123.456,
+            1e-300,
+            1.5e300,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            let value = Value::from_f64(f);
+            let mut text = String::new();
+            push_general_format(&mut text, &value, 16);
+            let printf = exec_printf_values(&Value::build_text("%.16g"), &[&value]).unwrap();
+            assert_eq!(Value::build_text(text), printf);
+        }
+    }
 
     fn text(value: &str) -> Register {
         Register::Value(Value::build_text(value.to_string()))

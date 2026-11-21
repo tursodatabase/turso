@@ -5,6 +5,7 @@ mod catalog;
 mod classes;
 mod copy;
 mod deparse;
+mod descriptions;
 mod error;
 mod functions;
 mod open;

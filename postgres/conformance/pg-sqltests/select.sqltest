@@ -478,6 +478,7 @@ expect error {
     invalid input value for enum "it's ""x""": "b"
 }
 
+@compat-gap "type:date"
 test select-cast-to-domain {
     CREATE DOMAIN dd AS date;
     SELECT '2024-01-01'::dd;
@@ -517,6 +518,7 @@ test select-cast-text-that-is-not-a-boolean-to-domain-over-boolean-errors {
 }
 expect error {}
 
+@compat-gap "type:date"
 test select-cast-text-to-date-and-time {
     SELECT '2024-01-15 10:30:00'::date, CAST('2024-01-15 10:30:00' AS time);
 }
@@ -535,6 +537,7 @@ expect {
     2024-01-15 10:30:00
 }
 
+@compat-gap "type:date"
 test select-cast-invalid-text-to-date {
     SELECT 'hello'::date;
 }
@@ -869,6 +872,7 @@ test exists-subquery-with-empty-select-list-rejects-group-by-position {
 expect error {
 }
 
+@compat-gap "type:date"
 test select-current-data-and-time {
     SELECT 'ok'
     WHERE CURRENT_DATE IS NOT NULL
@@ -1179,7 +1183,8 @@ expect {
     2
 }
 
-@skip "ARRAY subqueries cannot yet read aggregates computed by an outer query"
+# ARRAY subqueries cannot yet read aggregates computed by an outer query.
+@compat-gap "syntax:array-subquery"
 test array-subquery-compound-outer-aggregate {
     CREATE TABLE t(g INTEGER, x INTEGER);
     INSERT INTO t VALUES (1,10), (1,20), (2,7);
@@ -1191,6 +1196,9 @@ expect {
     1|{30,0}
     2|{7,0}
     {37,0}
+}
+@sqlstate 42803
+expect @tursopg error {
 }
 
 setup having_t {
@@ -1221,22 +1229,26 @@ expect {
     0|
 }
 
+@compat-gap "syntax:having"
 test having-without-group-by-or-aggregate-errors-instead-of-ignoring-having {
     SELECT 1 HAVING 1 = 0;
 }
 expect {
 }
+@sqlstate 42601
 expect @tursopg error {
     HAVING clause on a non-aggregate query
 }
 
 @setup having_t
+@compat-gap "syntax:having"
 test having-in-subquery-with-only-an-outer-aggregate-errors-instead-of-ignoring-having {
     SELECT (SELECT max(t1.y) FROM t AS t2 HAVING max(t1.y) > 0 LIMIT 1) FROM t AS t1;
 }
 expect {
     200
 }
+@sqlstate 42601
 expect @tursopg error {
     HAVING clause on a non-aggregate query
 }
@@ -2079,6 +2091,7 @@ expect error {
     invalid input syntax for type bigint: "abc"
 }
 
+@compat-gap "type:time"
 test where-on-indexed-time-and-date-columns-converts-the-literal {
     CREATE TABLE seek_m(x time PRIMARY KEY);
     INSERT INTO seek_m VALUES ('12:00');
@@ -2099,6 +2112,7 @@ expect @tursopg error {
     type "time" is not supported
 }
 
+@compat-gap "type:time"
 test where-in-on-indexed-columns-returns-a-row-once-for-two-spellings-of-its-value {
     CREATE TABLE in_spellings(id int, t time, tz timetz, ts timestamp, u uuid, b boolean);
     INSERT INTO in_spellings VALUES
@@ -2152,6 +2166,7 @@ test window-range-offset-over-date-is-an-error {
     CREATE TABLE range_dates(d date);
     SELECT count(*) OVER (ORDER BY d RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM range_dates;
 }
+@sqlstate 0A000
 expect error {
     RANGE with offset PRECEDING/FOLLOWING is not supported for column type date
 }
@@ -2187,6 +2202,7 @@ expect {
 # A text compared with a time or timestamp takes the column's type first:
 # '10:00' is the time 10:00:00. Every query runs before and after the indexes
 # exist, so the expected rows are listed twice.
+@compat-gap "type:time"
 test compare-time-with-text-same-rows-with-and-without-index {
     CREATE TABLE cmp_time (id int PRIMARY KEY, tm time, ts timestamp);
     INSERT INTO cmp_time VALUES (1, '09:30', '2024-01-05 09:30'), (2, '10:00', '2024-01-05 10:00'), (3, '23:59:59', '2024-01-06 00:00'), (4, NULL, NULL);
@@ -2278,6 +2294,7 @@ expect @tursopg error {
 # x IN (a, b) is x = a OR x = b, so a text on the left of IN is read as a time
 # when it is compared with a time: '09:45' IN (tm) is '09:45:00' = tm. That
 # holds for a list and a subquery, correlated or not.
+@compat-gap "type:time"
 test compare-text-on-the-left-of-in-with-time {
     CREATE TABLE in_left_ev (id int PRIMARY KEY, tm time);
     INSERT INTO in_left_ev VALUES (1, '09:45:00'), (2, '10:00:00');
@@ -2314,6 +2331,7 @@ expect @tursopg error {
 
 # DELETE and UPDATE find their rows with the converted text, by a scan and
 # through an index.
+@compat-gap "type:time"
 test compare-time-with-text-delete-and-update {
     CREATE TABLE cmp_time_a (id int PRIMARY KEY, tm time);
     CREATE TABLE cmp_time_b (id int PRIMARY KEY, tm time);
@@ -2634,6 +2652,7 @@ expect error {
 
 # A text in a row value compared with a time is read as a time, component by
 # component, in a comparison, an IN list and a row subquery.
+@compat-gap "type:time"
 test row-constructor-compares-text-with-time {
     CREATE TABLE row_time (id int, tm time);
     INSERT INTO row_time VALUES (1, '09:30'), (2, '10:00');
@@ -2653,4 +2672,225 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {
     type "time" is not supported
+}
+
+test order-by-expression-reads-the-input-column-not-the-output-name {
+    CREATE TABLE order_names (a int, b int);
+    INSERT INTO order_names VALUES (1, 20), (2, 10);
+    SELECT b AS a FROM order_names ORDER BY a;
+    SELECT b AS a FROM order_names ORDER BY a + 0;
+    SELECT b AS a FROM order_names ORDER BY -a;
+    DROP TABLE order_names;
+}
+expect {
+    10
+    20
+    20
+    10
+    10
+    20
+}
+
+test error-order-by-expression-names-only-an-output-column {
+    SELECT 1 AS z ORDER BY z + 1;
+}
+@sqlstate 42703
+expect error {}
+
+test order-by-name-of-two-different-output-columns-is-ambiguous {
+    CREATE TABLE order_shared_names (a int, b int);
+    INSERT INTO order_shared_names VALUES (1, 10), (2, 5);
+    SELECT a, order_shared_names.a AS a FROM order_shared_names ORDER BY a;
+    SELECT b AS a, a FROM order_shared_names ORDER BY a + 0;
+    SELECT b AS a, a FROM order_shared_names ORDER BY a;
+}
+@sqlstate 42702
+expect error {}
+
+# PostgreSQL sorts by the constant. tursopg would read it as a position.
+@compat-gap "syntax:order-by"
+test order-by-plus-number-is-a-constant-not-a-position {
+    SELECT a FROM (VALUES (2), (1), (3)) AS v(a) ORDER BY +1, a DESC;
+}
+expect {
+    3
+    2
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:order-by"
+test order-by-negated-plus-number-is-a-constant-not-a-position {
+    SELECT a FROM (VALUES (2), (1), (3)) AS v(a) ORDER BY -(+1), a DESC;
+}
+expect {
+    3
+    2
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:order-by"
+test error-order-by-number-with-a-collation {
+    SELECT a FROM (VALUES (2), (1), (3)) AS v(a) ORDER BY 1 COLLATE "C";
+}
+@sqlstate 42804
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+test error-order-by-fractional-constant {
+    SELECT 1 AS a ORDER BY 1.5;
+}
+@sqlstate 42601
+expect error {}
+
+test error-order-by-string-constant {
+    SELECT 1 AS a UNION ALL SELECT 2 ORDER BY 'k';
+}
+@sqlstate 42601
+expect error {}
+
+test error-order-by-null-constant {
+    SELECT 1 AS a ORDER BY NULL;
+}
+@sqlstate 42601
+expect error {}
+
+test error-order-by-position-past-the-select-list {
+    SELECT 1 AS a ORDER BY 2;
+}
+@sqlstate 42P10
+expect error {}
+
+test error-order-by-negative-position {
+    SELECT 1 AS a ORDER BY -1;
+}
+@sqlstate 42P10
+expect error {}
+
+test error-order-by-position-past-the-select-list-of-a-union {
+    SELECT 1 AS a UNION ALL SELECT 2 ORDER BY 5;
+}
+@sqlstate 42P10
+expect error {}
+
+test order-by-constant-inside-a-window-is-not-a-position {
+    SELECT sum(x) OVER (ORDER BY 'k') FROM (VALUES (1), (2)) AS v(x);
+}
+expect {
+    3
+    3
+}
+
+setup distinct_rows {
+    CREATE TABLE distinct_rows (a int, b int, c text);
+    INSERT INTO distinct_rows VALUES (2, 10, 'x'), (1, 20, 'y'), (1, 20, 'z'), (2, 30, 'w');
+}
+
+@setup distinct_rows
+test distinct-order-by-terms-that-are-in-the-select-list {
+    SELECT DISTINCT a FROM distinct_rows ORDER BY a DESC;
+    SELECT DISTINCT a, b FROM distinct_rows ORDER BY 2 DESC, distinct_rows.a;
+    SELECT DISTINCT a + b AS total FROM distinct_rows ORDER BY total;
+    SELECT DISTINCT a + b FROM distinct_rows ORDER BY a + b DESC;
+    SELECT DISTINCT a AS x FROM distinct_rows ORDER BY a;
+    SELECT DISTINCT a, count(*) FROM distinct_rows GROUP BY a ORDER BY count(*), a;
+    SELECT DISTINCT * FROM distinct_rows ORDER BY b, c DESC;
+}
+expect {
+    2
+    1
+    2|30
+    1|20
+    2|10
+    12
+    21
+    32
+    32
+    21
+    12
+    1
+    2
+    1|2
+    2|2
+    2|10|x
+    1|20|z
+    1|20|y
+    2|30|w
+}
+
+@setup distinct_rows
+test error-distinct-order-by-column-outside-the-select-list {
+    SELECT DISTINCT a FROM distinct_rows ORDER BY b;
+}
+@sqlstate 42P10
+expect error {}
+
+@setup distinct_rows
+test error-distinct-order-by-expression-over-a-selected-column {
+    SELECT DISTINCT a FROM distinct_rows ORDER BY a + 0;
+}
+@sqlstate 42P10
+expect error {}
+
+@setup distinct_rows
+test error-distinct-order-by-expression-with-operands-swapped {
+    SELECT DISTINCT a + b FROM distinct_rows ORDER BY b + a;
+}
+@sqlstate 42P10
+expect error {}
+
+@setup distinct_rows
+test error-distinct-order-by-aggregate-outside-the-select-list {
+    SELECT DISTINCT a FROM distinct_rows GROUP BY a ORDER BY count(*);
+}
+@sqlstate 42P10
+expect error {}
+
+@setup distinct_rows
+test error-distinct-in-a-subquery-order-by-column-outside-the-select-list {
+    SELECT * FROM (SELECT DISTINCT a FROM distinct_rows ORDER BY b) AS s;
+}
+@sqlstate 42P10
+expect error {}
+
+# tursopg has one collation and cannot tell these expressions apart.
+@setup distinct_rows
+@compat-gap "syntax:order-by"
+test error-distinct-order-by-with-another-collation {
+    SELECT DISTINCT c FROM distinct_rows ORDER BY c COLLATE "C";
+}
+@sqlstate 42P10
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@setup distinct_rows
+test distinct-all-rows-order-by-column-outside-the-select-list {
+    SELECT ALL a FROM distinct_rows ORDER BY b, c;
+}
+expect {
+    2
+    1
+    1
+    2
+}
+
+test bytea-array-elements-print-as-hex {
+    CREATE TABLE bytea_arrays (id int PRIMARY KEY, a bytea[]);
+    INSERT INTO bytea_arrays VALUES (1, ARRAY['ab'::bytea]);
+    SELECT a, a[1] FROM bytea_arrays;
+}
+expect {
+    {"\\\\x6162"}|\\x6162
+}
+
+test bytea-array-literal-elements-print-as-hex {
+    SELECT ARRAY['ab'::bytea, 'c'::bytea], ARRAY[''::bytea], ARRAY[NULL::bytea, 'a"b'::bytea];
+}
+expect {
+    {"\\\\x6162","\\\\x63"}|{"\\\\x"}|{NULL,"\\\\x612262"}
 }

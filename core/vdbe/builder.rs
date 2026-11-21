@@ -391,6 +391,10 @@ pub struct ProgramBuilder {
     /// `PreparedProgram::has_materialized_views`), so this can't go stale
     /// while the built program runs.
     has_materialized_views: bool,
+    /// Nesting level of this program: 0 for the program of a statement, and one
+    /// more than the level of the parent program for a trigger or foreign key
+    /// action program.
+    subprogram_depth: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -797,18 +801,23 @@ impl ProgramBuilder {
             None,
             false,
             false,
+            0,
         )
     }
     /// Create a ProgramBuilder for a trigger subprogram. `mvcc_enabled` must match the
     /// parent program's `is_mvcc_enabled()`: a trigger runs inside the same transaction
     /// as its parent statement, so code emitted for it (e.g. CDC change id allocation)
     /// must take the same MVCC-aware or MVCC-unaware path the parent takes.
+    ///
+    /// `subprogram_depth` is the nesting level of the trigger program: one more
+    /// than the level of the program that fires the trigger.
     pub fn new_for_trigger(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
         trigger: Arc<Trigger>,
         mvcc_enabled: bool,
+        subprogram_depth: usize,
     ) -> Self {
         ProgramBuilder::_new(
             query_mode,
@@ -817,6 +826,7 @@ impl ProgramBuilder {
             Some(trigger),
             true,
             mvcc_enabled,
+            subprogram_depth,
         )
     }
     /// Create a ProgramBuilder for a subprogram (FK actions, etc.) that runs within
@@ -826,11 +836,16 @@ impl ProgramBuilder {
     /// subprogram runs inside the same transaction as its parent statement, so code
     /// emitted for it (e.g. CDC change id allocation) must take the same MVCC-aware
     /// or MVCC-unaware path the parent takes.
+    ///
+    /// `subprogram_depth` is the nesting level of the subprogram: one more than the
+    /// level of the program that executes it, or 0 for a program that no other
+    /// program executes.
     pub fn new_for_subprogram(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
         mvcc_enabled: bool,
+        subprogram_depth: usize,
     ) -> Self {
         ProgramBuilder::_new(
             query_mode,
@@ -839,6 +854,7 @@ impl ProgramBuilder {
             None,
             true,
             mvcc_enabled,
+            subprogram_depth,
         )
     }
 
@@ -851,6 +867,7 @@ impl ProgramBuilder {
         trigger: Option<Arc<Trigger>>,
         is_subprogram: bool,
         mvcc_enabled: bool,
+        subprogram_depth: usize,
     ) -> Self {
         Self {
             table_reference_counter: TableRefIdCounter::new(),
@@ -898,6 +915,7 @@ impl ProgramBuilder {
             next_subquery_eqp_id: 1,
             target_union_type: None,
             has_materialized_views: false,
+            subprogram_depth,
         }
     }
 
@@ -1121,6 +1139,13 @@ impl ProgramBuilder {
         &self.capture_data_changes_info
     }
 
+    /// Nesting level of this program: 0 for the program of a statement, and one
+    /// more than the level of the parent program for a trigger or foreign key
+    /// action program.
+    pub const fn subprogram_depth(&self) -> usize {
+        self.subprogram_depth
+    }
+
     /// Whether the main database uses MVCC journal mode. See `Self::mvcc_enabled`.
     pub const fn is_mvcc_enabled(&self) -> bool {
         self.mvcc_enabled
@@ -1145,6 +1170,17 @@ impl ProgramBuilder {
         self.cursor_ref.reserve(opts.num_cursors);
         self.label_to_resolved_offset
             .reserve(opts.approx_num_labels);
+    }
+
+    /// Make room for at least `additional` more instructions. The capacity
+    /// grows to a power of two, as repeated doubling of the `Vec` would make
+    /// it, but the instructions are copied only once.
+    pub fn reserve_insns(&mut self, additional: usize) {
+        let needed = self.insns.len() + additional;
+        if needed > self.insns.capacity() {
+            self.insns
+                .reserve_exact(needed.next_power_of_two() - self.insns.len());
+        }
     }
 
     /// Start a new constant span. The next instruction to be emitted will be the first
@@ -1584,10 +1620,6 @@ impl ProgramBuilder {
         });
     }
 
-    // no users yet, but I want to avoid someone else in the future
-    // just adding parameters to emit_halt! If you use this, remove the
-    // clippy warning please.
-    #[allow(dead_code)]
     pub fn emit_halt_err(&mut self, err_code: usize, description: String) {
         self.emit_insn(Insn::Halt {
             constraint_info: None,
@@ -1699,7 +1731,10 @@ impl ProgramBuilder {
         // Since spans are sorted and non-overlapping, we track our position
         // in the span list and never look back - O(n + m) total, where
         // n = number of instructions, m = number of constant spans.
-        let mut non_constant = Vec::with_capacity(self.insns.len());
+        // One more slot for the `Goto` that `epilogue` emits after the constant
+        // instructions. Without it, that push copies the whole program to a
+        // larger buffer.
+        let mut non_constant = Vec::with_capacity(self.insns.len() + 1);
         let mut constant = Vec::new();
         let mut span_idx = 0;
 

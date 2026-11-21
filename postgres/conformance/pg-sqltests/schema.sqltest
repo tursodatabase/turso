@@ -510,6 +510,7 @@ expect {
 }
 
 # PostgreSQL drops the default of public.dc_outside_user.n with the schema.
+@compat-gap "syntax:drop-schema"
 test drop-schema-cascade-when-a-table-of-another-schema-uses-its-sequence {
     CREATE SCHEMA dc_outside;
     CREATE TABLE dc_outside.a (id serial);
@@ -523,4 +524,20 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {
     DROP SCHEMA "dc_outside" CASCADE is not supported when an object of another schema depends on an object of the schema
+}
+
+test drop-schema-cascade-drops-views-of-other-schemas-that-read-it {
+    CREATE SCHEMA dc_view_outside;
+    CREATE TABLE dc_view_outside.t (a int);
+    CREATE VIEW dc_view_outside.inside AS SELECT a FROM dc_view_outside.t;
+    CREATE VIEW dc_view_reader AS SELECT a FROM dc_view_outside.inside;
+    CREATE VIEW dc_view_reader_of_reader AS SELECT a FROM dc_view_reader;
+    DROP SCHEMA dc_view_outside CASCADE;
+    CREATE VIEW dc_view_reader AS SELECT 1 AS a;
+    CREATE VIEW dc_view_reader_of_reader AS SELECT 2 AS a;
+    SELECT a FROM dc_view_reader UNION ALL SELECT a FROM dc_view_reader_of_reader ORDER BY 1;
+}
+expect {
+    1
+    2
 }

@@ -24,7 +24,8 @@ use crate::translate::fkeys::{
     fire_fk_update_actions, ParentKeyNewProbeMode,
 };
 use crate::translate::insert::{
-    emit_remember_written_rowid, format_unique_violation_desc, InsertEmitCtx,
+    emit_remember_written_rowid, emit_returning_subqueries, format_unique_violation_desc,
+    InsertEmitCtx,
 };
 use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
@@ -44,11 +45,12 @@ use crate::{
         },
         expr::{
             emit_constraint_values_decode, emit_returning_results, emit_table_column,
-            expr_type::column_custom_type_names, translate_expr, translate_expr_no_constant_opt,
-            walk_expr_mut, NoConstantOptReason,
+            expr_type::column_custom_type_names, process_returning_clause, translate_expr,
+            translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
         },
         insert::Insertion,
         plan::{ResultSetColumn, TableReferences},
+        subquery::plan_subqueries_from_returning,
     },
     util::{exprs_are_equivalent, normalize_ident},
     vdbe::{
@@ -475,7 +477,9 @@ pub fn resolve_upsert_target(
 /// 4. Enforce NOT NULL constraints and (if STRICT) type checks on NEW.
 /// 5. Rebuild indexes (delete keys using BEFORE, insert keys using NEW).
 /// 6. Rewrite the table row payload at the same rowid with NEW.
-/// 7. Emit CDC rows and RETURNING output if requested.
+/// 7. Emit CDC rows and RETURNING output if requested. When the RETURNING
+///    clause has subqueries, `returning_with_subqueries` holds it as written,
+///    and it is planned again here instead of using `returning`.
 /// 8. Jump to `row_done_label`.
 ///
 /// Semantics reference: https://sqlite.org/lang_upsert.html
@@ -492,6 +496,7 @@ pub fn emit_upsert(
     where_clause: &mut Option<Box<ast::Expr>>,
     resolver: &mut Resolver,
     returning: &mut [ResultSetColumn],
+    returning_with_subqueries: Option<&[ast::ResultColumn]>,
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
     table_alias: Option<&str>,
@@ -1669,6 +1674,51 @@ pub fn emit_upsert(
         }
     }
 
+    // RETURNING from NEW image + final rowid. It reads the row before the
+    // AFTER triggers run, as in SQLite, so a subquery in it does not see what
+    // a trigger writes.
+    if !returning.is_empty() {
+        let final_rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+        let upsert_returning_columns;
+        let returning: &[ResultSetColumn] = match returning_with_subqueries {
+            Some(returning_with_subqueries) => {
+                let mut returning_ast = returning_with_subqueries.to_vec();
+                let mut returning_subqueries = vec![];
+                plan_subqueries_from_returning(
+                    program,
+                    &mut returning_subqueries,
+                    table_references,
+                    &mut returning_ast,
+                    resolver,
+                    connection,
+                )?;
+                upsert_returning_columns =
+                    process_returning_clause(&mut returning_ast, table_references, resolver)?;
+                emit_returning_subqueries(
+                    program,
+                    resolver,
+                    table_references,
+                    &mut returning_subqueries,
+                    new_start,
+                    final_rowid_reg,
+                    &layout,
+                )?;
+                &upsert_returning_columns
+            }
+            None => &*returning,
+        };
+        emit_returning_results(
+            program,
+            table_references,
+            returning,
+            new_start,
+            final_rowid_reg,
+            resolver,
+            ctx.returning_buffer.as_ref(),
+            &layout,
+        )?;
+    }
+
     // Fire AFTER UPDATE triggers
     if let (Some(btree_table), Some(old_regs)) = (table.btree(), preserved_old_registers) {
         let relevant_triggers = get_triggers_including_temp(
@@ -1698,8 +1748,7 @@ pub fn emit_upsert(
             )
             .with_override_conflict(ast::ResolveType::Abort);
 
-            // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
-            // not skip post-row work (RETURNING).
+            // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body.
             let after_trigger_done = program.allocate_label();
             for trigger in relevant_triggers {
                 fire_trigger(
@@ -1714,20 +1763,6 @@ pub fn emit_upsert(
             }
             program.preassign_label_to_next_insn(after_trigger_done);
         }
-    }
-
-    // RETURNING from NEW image + final rowid
-    if !returning.is_empty() {
-        emit_returning_results(
-            program,
-            table_references,
-            returning,
-            new_start,
-            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            resolver,
-            ctx.returning_buffer.as_ref(),
-            &layout,
-        )?;
     }
 
     program.emit_insn(Insn::Goto {

@@ -200,6 +200,95 @@ fn full_commit_right_after_truncate_checkpoint_survives_power_loss() -> anyhow::
     Ok(())
 }
 
+/// Closing the last connection to an MVCC database does not fsync the WAL,
+/// because the MVCC checkpoint has already synced or truncated everything it
+/// wrote there. A power loss right after the close must keep every
+/// `synchronous=FULL` commit.
+#[test]
+fn mvcc_full_commits_survive_power_loss_after_last_connection_closes() -> anyhow::Result<()> {
+    let db_path_sim = "mvcc-power-loss-after-close.db";
+    let io = Arc::new(UnreliableIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path_sim,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+    conn.execute("PRAGMA synchronous=FULL")?;
+    conn.execute("CREATE TABLE t(x)")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    conn.execute("INSERT INTO t VALUES (2)")?;
+    conn.close()?;
+
+    assert!(
+        !io.has_unsynced_writes(&format!("{db_path_sim}-wal")),
+        "the MVCC checkpoint left unsynced WAL writes"
+    );
+    let (_dir, recovered) = io.crash_now_and_recover(db_path_sim)?;
+    let rows = query_rows(&recovered, "SELECT x FROM t ORDER BY x")?;
+    assert_eq!(
+        rows,
+        vec!["1".to_string(), "2".to_string()],
+        "a synchronous=FULL commit was lost by a power loss after close"
+    );
+    Ok(())
+}
+
+/// Frames copied into an MVCC database through the raw WAL API under
+/// `synchronous=NORMAL` are not fsynced at commit and are not in the database
+/// file, so closing the last connection must fsync the WAL.
+#[test]
+fn mvcc_raw_wal_frames_survive_power_loss_after_last_connection_closes() -> anyhow::Result<()> {
+    let source_path = "mvcc-raw-wal-frames-source.db";
+    let target_path = "mvcc-raw-wal-frames-target.db";
+    let io = Arc::new(UnreliableIo::new());
+    let open = |path: &str| {
+        Database::open_file_with_flags(
+            io.clone(),
+            path,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+    };
+    let source_db = open(source_path)?;
+    let source = source_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    source.execute("CREATE TABLE t(x)")?;
+    source.execute("INSERT INTO t VALUES (1), (2)")?;
+
+    let target_db = open(target_path)?;
+    let target = target_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    target.execute("PRAGMA journal_mode = 'mvcc'")?;
+    target.execute("PRAGMA synchronous=NORMAL")?;
+    let mut frame = vec![0; 24 + 4096];
+    target.wal_insert_begin()?;
+    for frame_no in 1..=source.wal_state()?.max_frame {
+        source.wal_get_frame(frame_no, &mut frame)?;
+        target.wal_insert_frame(frame_no, &frame)?;
+    }
+    target.wal_insert_end(true)?;
+    target.close()?;
+
+    assert!(
+        !io.has_unsynced_writes(&format!("{target_path}-wal")),
+        "closing the last connection left raw WAL frames unsynced"
+    );
+    let (_dir, recovered) = io.crash_now_and_recover(target_path)?;
+    let rows = query_rows(&recovered, "SELECT x FROM t ORDER BY x")?;
+    assert_eq!(
+        rows,
+        vec!["1".to_string(), "2".to_string()],
+        "raw WAL frames were lost by a power loss after close"
+    );
+    Ok(())
+}
+
 #[test]
 fn savepoint_spill_crash_image_matches_sqlite_recovery() -> anyhow::Result<()> {
     let db_path_sim = "savepoint-spill-sqlite-recovery.db";

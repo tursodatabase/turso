@@ -678,6 +678,9 @@ fn write_pg_error(w: &mut dyn Write, error: &Error) {
     if let Some(detail) = &error.detail {
         let _ = writeln!(w, "DETAIL:  {detail}");
     }
+    if let Some(hint) = &error.hint {
+        let _ = writeln!(w, "HINT:  {hint}");
+    }
 }
 
 fn print_result_set(

@@ -153,6 +153,7 @@ expect {
 }
 
 @setup auth_functions
+@compat-gap "type:uuid"
 test auth-uid-of-a-uuid-with-a-hyphen-after-every-four-digits {
     SELECT set_config('request.jwt.claim.sub', 'a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11', false);
     SELECT auth.uid();
@@ -167,6 +168,7 @@ expect @tursopg error {
 }
 
 @setup auth_functions
+@compat-gap "type:uuid"
 test auth-uid-of-32-digits-in-braces {
     SELECT set_config('request.jwt.claim.sub', '{a0eebc999c0b4ef8bb6d6bb9bd380a11}', false);
     SELECT auth.uid();
@@ -181,6 +183,7 @@ expect @tursopg error {
 }
 
 @setup auth_functions
+@compat-gap "type:uuid"
 test auth-uid-of-a-urn {
     SELECT set_config('request.jwt.claim.sub', 'urn:uuid:a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
     SELECT auth.uid();
@@ -353,6 +356,7 @@ expect {
 }
 
 @setup auth_functions
+@compat-gap "type:jsonb"
 test auth-email-of-claims-that-are-objects-or-arrays-prints-them-as-jsonb {
     SELECT set_config('request.jwt.claims', '{"email": {"b": 1, "a": [1, "x", null]}}', false);
     SELECT auth.email();
@@ -367,6 +371,7 @@ expect @tursopg {
 }
 
 @setup auth_functions
+@compat-gap "type:jsonb"
 test auth-email-of-claims-that-are-numbers-prints-them-as-jsonb {
     SELECT set_config('request.jwt.claims', '{"email": 1.50}', false);
     SELECT auth.email();
@@ -393,6 +398,7 @@ expect @tursopg {
 }
 
 @setup auth_functions
+@compat-gap "type:jsonb"
 test auth-jwt-prints-numbers-as-jsonb {
     SELECT set_config('request.jwt.claims', '[-0, -0.0, 0e-5, 1.5e-3, 1.2345e2, -1e-5, 10e-1, 1E+2, 0.0001e4]', false);
     SELECT auth.jwt();
@@ -578,6 +584,7 @@ expect {
 }
 
 @setup auth_functions
+@compat-gap "type:jsonb"
 test auth-email-of-claims-with-a-nul-escape-before-a-syntax-error-reports-the-escape {
     SELECT set_config('request.jwt.claims', '{"a": "\u0000", "email": }', false);
     SELECT auth.email();
@@ -602,6 +609,7 @@ expect error {
 }
 
 @setup auth_functions
+@compat-gap "type:jsonb"
 test auth-email-of-claims-with-a-number-outside-the-range-of-a-double {
     SELECT set_config('request.jwt.claims', '{"n": 1e400, "email": "user@example.com"}', false);
     SELECT auth.email();
@@ -616,6 +624,7 @@ expect @tursopg error {
 }
 
 @setup auth_functions
+@compat-gap "type:jsonb"
 test auth-functions-of-claims-with-numbers-at-the-limits-of-numeric {
     SELECT set_config('request.jwt.claims', '{"a": 1e131071, "b": 1e-16383, "email": "user@example.com"}', false);
     SELECT auth.email(), length(auth.jwt()::text);
@@ -630,6 +639,7 @@ expect @tursopg error {
 }
 
 @setup auth_functions
+@compat-gap "type:jsonb"
 test auth-email-of-claims-with-a-number-too-large-for-numeric-errors {
     SELECT set_config('request.jwt.claims', '{"n": 1e131072, "email": "user@example.com"}', false);
     SELECT auth.email();
@@ -644,6 +654,7 @@ expect @tursopg error {
 }
 
 @setup auth_functions
+@compat-gap "type:jsonb"
 test auth-email-of-claims-with-a-number-too-small-for-numeric-errors {
     SELECT set_config('request.jwt.claims', '{"n": 1e-16384, "email": "user@example.com"}', false);
     SELECT auth.email();
@@ -658,6 +669,7 @@ expect @tursopg {
 }
 
 @setup auth_functions
+@compat-gap "type:jsonb"
 test auth-email-of-claims-with-an-exponent-too-large-for-numeric-errors {
     SELECT set_config('request.jwt.claims', '{"n": 0e1073741824, "email": "user@example.com"}', false);
     SELECT auth.email();
@@ -672,6 +684,7 @@ expect @tursopg {
 }
 
 @setup auth_functions
+@compat-gap "type:jsonb"
 test auth-email-checks-the-token-after-a-number-before-the-size-of-the-number {
     SELECT set_config('request.jwt.claims', '{"n": 1e131072 "\u0000", "email": "user@example.com"}', false);
     SELECT auth.email();
@@ -686,6 +699,7 @@ expect @tursopg error {
 }
 
 @setup auth_functions
+@compat-gap "type:jsonb"
 test auth-email-of-claims-nested-200-levels-deep {
     SELECT set_config('request.jwt.claims', '{"x": {{repeat:200:[}}{{repeat:200:]}}, "email": "user@example.com"}', false);
     SELECT auth.email();
@@ -700,6 +714,7 @@ expect @tursopg error {
 }
 
 @setup auth_functions
+@compat-gap "type:jsonb"
 test auth-functions-of-claims-nested-5000-levels-deep {
     SELECT length(set_config('request.jwt.claims', '{"x": {{repeat:5000:[}}{{repeat:5000:]}}, "email": "user@example.com"}', false));
     SELECT auth.email(), length(auth.jwt()::text);
@@ -870,8 +885,9 @@ expect {
 
 # tursopg refuses a function that is not deterministic, such as random(), in
 # CREATE INDEX with the SQLSTATE 42601, not 42P17. So the tursopg blocks of
-# the next two tests have no SQLSTATE.
+# the next two tests differ from PostgreSQL in the SQLSTATE.
 @setup auth_functions
+@compat-gap "syntax:create-index"
 test auth-uid-in-an-index-expression-errors {
     CREATE TABLE notes (owner uuid);
     CREATE INDEX notes_owner ON notes ((auth.uid()));
@@ -880,11 +896,13 @@ test auth-uid-in-an-index-expression-errors {
 expect error {
     index
 }
+@sqlstate 42601
 expect @tursopg error {
     index
 }
 
 @setup auth_functions
+@compat-gap "syntax:create-index"
 test auth-uid-in-a-partial-index-predicate-errors {
     CREATE TABLE notes (owner uuid);
     CREATE INDEX notes_owner ON notes (owner) WHERE owner = auth.uid();
@@ -893,6 +911,7 @@ test auth-uid-in-a-partial-index-predicate-errors {
 expect error {
     index
 }
+@sqlstate 42601
 expect @tursopg error {
     index
 }
@@ -983,6 +1002,7 @@ expect @tursopg error {
 }
 
 @setup auth_functions
+@compat-gap "type:jsonb"
 test auth-jwt-prints-the-claims-as-jsonb {
     SELECT set_config('request.jwt.claims', '{"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"user@example.com","aud":"authenticated","n":1.50,"n":1e2}', false);
     SELECT auth.jwt();
@@ -997,6 +1017,7 @@ expect @tursopg {
 }
 
 @setup auth_functions
+@compat-gap "type:jsonb"
 test auth-jwt-prints-escapes-as-jsonb {
     SELECT set_config('request.jwt.claims', '{"a": "x\ny\u0001\"\/\u00e9\t"}', false);
     SELECT auth.jwt();
@@ -1052,6 +1073,7 @@ expect {
 }
 
 @setup auth_functions
+@compat-gap "syntax:case"
 test auth-uid-in-case-in-a-check-constraint-on-a-uuid-column {
     SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
     CREATE TABLE owned (owner uuid CHECK (owner = CASE WHEN true THEN auth.uid() END));
@@ -1062,6 +1084,7 @@ expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
+@sqlstate 42601
 expect @tursopg error {
     cannot determine type of expression in CHECK constraint
 }
