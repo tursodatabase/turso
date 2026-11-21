@@ -385,6 +385,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn write_array_blob_element(&self, out: &mut String, blob: &[u8]) {
+        out.push_str(&crate::text::encode_bytea(blob, true));
+    }
+
     fn sort_term_matching(&self) -> SortTermMatching {
         SortTermMatching::Sql92
     }

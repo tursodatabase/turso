@@ -636,6 +636,16 @@ pub trait Dialect: Send + Sync + 'static {
     fn generates_integer_primary_keys(&self) -> bool {
         true
     }
+
+    /// Appends a blob element of an array to the array's text, as in
+    /// `{"X'6162'"}`.
+    ///
+    /// PostgreSQL writes a bytea element as quoted hex: `{"\\x6162"}`.
+    fn write_array_blob_element(&self, out: &mut String, blob: &[u8]) {
+        out.push_str("\"X'");
+        crate::vdbe::value::push_hex_upper(out, blob);
+        out.push_str("'\"");
+    }
 }
 
 /// How an ORDER BY or DISTINCT ON term is matched to the output columns.

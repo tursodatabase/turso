@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
+use crate::dialect::Dialect;
 use crate::numeric::Numeric;
 use crate::types::{ImmutableRecord, Value, ValueIterator};
 use crate::Result;
@@ -175,7 +176,8 @@ pub(crate) fn values_to_record_blob(values: &[Value]) -> Result<Value> {
 /// - NULL elements → uppercase `NULL` (unquoted)
 /// - Text elements → double-quoted if they contain special chars, unquoted otherwise
 /// - Numeric elements → unquoted
-pub(crate) fn serialize_array_from_blob(blob: &[u8]) -> Result<String> {
+/// - Blob elements → as `dialect` writes them
+pub(crate) fn serialize_array_from_blob(blob: &[u8], dialect: &dyn Dialect) -> Result<String> {
     let iter = ValueIterator::new(blob)?;
     let mut result = String::from("{");
     let mut first = true;
@@ -185,7 +187,7 @@ pub(crate) fn serialize_array_from_blob(blob: &[u8]) -> Result<String> {
             result.push(',');
         }
         first = false;
-        write_value_ref_pg(&mut result, &vref);
+        write_value_ref_pg(&mut result, &vref, dialect);
     }
     result.push('}');
     Ok(result)
@@ -205,7 +207,7 @@ pub fn text_array_literal<'a>(elements: impl IntoIterator<Item = &'a str>) -> St
     result
 }
 
-fn write_value_ref_pg(result: &mut String, val: &crate::ValueRef<'_>) {
+fn write_value_ref_pg(result: &mut String, val: &crate::ValueRef<'_>, dialect: &dyn Dialect) {
     match val {
         crate::ValueRef::Null => result.push_str("NULL"),
         crate::ValueRef::Numeric(Numeric::Integer(n)) => {
@@ -224,13 +226,7 @@ fn write_value_ref_pg(result: &mut String, val: &crate::ValueRef<'_>) {
         crate::ValueRef::Text(t) => {
             write_pg_text_element(result, t.as_str());
         }
-        crate::ValueRef::Blob(b) => {
-            result.push_str("\"X'");
-            for byte in *b {
-                let _ = write!(result, "{byte:02X}");
-            }
-            result.push_str("'\"");
-        }
+        crate::ValueRef::Blob(b) => dialect.write_array_blob_element(result, b),
     }
 }
 
@@ -826,14 +822,18 @@ mod tests {
 
     #[test]
     fn test_serialize_array_from_blob() {
-        let arr =
-            values_to_record_blob(&[Value::from_i64(1), Value::build_text("hello"), Value::Null])
-                .unwrap();
+        let arr = values_to_record_blob(&[
+            Value::from_i64(1),
+            Value::build_text("hello"),
+            Value::Null,
+            Value::Blob(crate::alloc::vec![b'a', b'b']),
+        ])
+        .unwrap();
         let Value::Blob(blob) = &arr else {
             panic!("Expected Blob");
         };
-        let text = serialize_array_from_blob(blob).unwrap();
-        assert_eq!(text, "{1,hello,NULL}");
+        let text = serialize_array_from_blob(blob, &crate::SqliteDialect).unwrap();
+        assert_eq!(text, r#"{1,hello,NULL,"X'6162'"}"#);
     }
 
     #[test]
