@@ -3729,10 +3729,6 @@ pub fn halt(
         }
     }
 
-    if err_code > 0 {
-        vtab_rollback_all(connection)?;
-    }
-
     // RAISE(IGNORE) signals the parent to skip the current row
     if on_error == Some(ResolveType::Ignore) {
         // RAISE(IGNORE) is not an error: the frame unwinds, but everything

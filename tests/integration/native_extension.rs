@@ -1862,6 +1862,68 @@ fn failed_native_write_rolls_back_earlier_rows() {
 }
 
 #[test]
+fn failed_unrelated_statement_keeps_virtual_table_transaction() {
+    for (begin, finish) in [("BEGIN", "COMMIT"), ("SAVEPOINT s", "RELEASE s")] {
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+            "native_store",
+            VTabKind::VirtualTable,
+            RowsModule {
+                queue: queue.clone(),
+                rows: rows.clone(),
+                events: events.clone(),
+                writable: true,
+            },
+        ));
+        conn.execute("CREATE VIRTUAL TABLE store USING native_store")
+            .unwrap();
+        conn.execute("CREATE TABLE t(x NOT NULL)").unwrap();
+        conn.execute(begin).unwrap();
+        let mut insert = conn
+            .prepare("INSERT INTO store(value) VALUES (13)")
+            .unwrap();
+        collect(&mut insert, &queue);
+        assert!(conn.execute("INSERT INTO t VALUES (NULL)").is_err());
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute(finish).unwrap();
+        assert_eq!(*rows.lock(), vec![(1, 13)]);
+        assert_eq!(*events.lock(), vec!["begin", "write", "commit"]);
+    }
+}
+
+#[test]
+fn constraint_rollback_aborts_virtual_table_transaction() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let rows = Arc::new(Mutex::new(Vec::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+        "native_store",
+        VTabKind::VirtualTable,
+        RowsModule {
+            queue: queue.clone(),
+            rows: rows.clone(),
+            events: events.clone(),
+            writable: true,
+        },
+    ));
+    conn.execute("CREATE VIRTUAL TABLE store USING native_store")
+        .unwrap();
+    conn.execute("CREATE TABLE t(x NOT NULL)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    let mut insert = conn
+        .prepare("INSERT INTO store(value) VALUES (13)")
+        .unwrap();
+    collect(&mut insert, &queue);
+    assert!(conn
+        .execute("INSERT OR ROLLBACK INTO t VALUES (NULL)")
+        .is_err());
+    assert!(rows.lock().is_empty());
+    assert_eq!(*events.lock(), vec!["begin", "write", "rollback"]);
+}
+
+#[test]
 fn pending_native_write_blocks_another_writer_and_commit() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(Vec::new()));
