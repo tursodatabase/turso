@@ -32,24 +32,8 @@ impl UnixIO {
         debug!("Using IO backend 'syscall'");
         Ok(Self {})
     }
-}
 
-impl Clock for UnixIO {
-    fn current_time_monotonic(&self) -> MonotonicInstant {
-        DefaultClock.current_time_monotonic()
-    }
-
-    fn current_time_wall_clock(&self) -> WallClockInstant {
-        DefaultClock.current_time_wall_clock()
-    }
-}
-
-impl IO for UnixIO {
-    fn supports_shared_wal_coordination(&self) -> bool {
-        true
-    }
-
-    fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
+    fn open_unix_file(&self, path: &str, flags: OpenFlags) -> Result<Arc<UnixFile>> {
         trace!("open_file(path = {})", path);
         let mut file = std::fs::File::options();
         file.read(true);
@@ -76,6 +60,26 @@ impl IO for UnixIO {
             unix_file.lock_file(true)?;
         }
         Ok(unix_file)
+    }
+}
+
+impl Clock for UnixIO {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        DefaultClock.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        DefaultClock.current_time_wall_clock()
+    }
+}
+
+impl IO for UnixIO {
+    fn supports_shared_wal_coordination(&self) -> bool {
+        true
+    }
+
+    fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
+        Ok(self.open_unix_file(path, flags)?)
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {
@@ -736,10 +740,7 @@ mod tests {
         assert_eq!(mapped.len(), 81920);
         let slice = unsafe { std::slice::from_raw_parts(mapped.ptr().as_ptr(), mapped.len()) };
         assert_eq!(&slice[..128], &bytes[4096..4096 + 128]);
-        assert_eq!(
-            &slice[mapped.len() - 128..],
-            &bytes[4096 + 81920 - 128..4096 + 81920]
-        );
+        assert_eq!(&slice[mapped.len() - 128..], &bytes[4096 + 81920 - 128..4096 + 81920]);
     }
 
     #[test]
@@ -800,6 +801,79 @@ mod tests {
     }
 
     #[test]
+    fn test_first_sync_executes_parent_dir_sync_and_clears_flag() {
+        let eloop_kind = std::io::Error::from_raw_os_error(libc::ELOOP).kind();
+        for sync_type in [FileSyncType::Fsync, FileSyncType::FullFsync] {
+            let root = tempfile::tempdir().unwrap();
+            let sub = root.path().join("sub");
+            let sub_moved = root.path().join("sub_moved");
+            std::fs::create_dir(&sub).unwrap();
+            let db_path = sub.join("test.db");
+
+            let io = UnixIO::new().unwrap();
+            let file = io
+                .open_unix_file(db_path.to_str().unwrap(), OpenFlags::Create)
+                .unwrap();
+            let buf = Arc::new(crate::Buffer::new_temporary(4096));
+            let w = file.pwrite(0, buf, Completion::new_write(|_| {})).unwrap();
+            io.wait_for_completion(w).unwrap();
+            assert!(file.dir_needs_sync.load(Ordering::SeqCst));
+
+            std::fs::rename(&sub, &sub_moved).unwrap();
+            std::os::unix::fs::symlink("sub", &sub).unwrap();
+
+            for _ in 0..2 {
+                let c = Completion::new_sync(|_| {});
+                let err = file.sync(c.clone(), sync_type).unwrap_err();
+                assert!(
+                    matches!(
+                        err,
+                        LimboError::CompletionError(CompletionError::IOError(
+                            kind,
+                            "open_parent_dir"
+                        )) if kind == eloop_kind
+                    ),
+                    "expected ELOOP from open_parent_dir, got {err:?}"
+                );
+                assert!(!c.finished());
+                assert!(file.dir_needs_sync.load(Ordering::SeqCst));
+            }
+
+            std::fs::remove_file(&sub).unwrap();
+            std::fs::rename(&sub_moved, &sub).unwrap();
+            let c1 = file
+                .sync(Completion::new_sync(|_| {}), sync_type)
+                .expect("first sync must succeed after parent dir restored");
+            io.wait_for_completion(c1).unwrap();
+            assert!(!file.dir_needs_sync.load(Ordering::SeqCst));
+
+            std::fs::rename(&sub, &sub_moved).unwrap();
+            std::os::unix::fs::symlink("sub", &sub).unwrap();
+            let c2 = file
+                .sync(Completion::new_sync(|_| {}), sync_type)
+                .expect("subsequent sync must not reopen parent dir");
+            io.wait_for_completion(c2).unwrap();
+
+            std::fs::remove_file(&sub).unwrap();
+            std::fs::rename(&sub_moved, &sub).unwrap();
+            drop(file);
+
+            let existing = io
+                .open_unix_file(db_path.to_str().unwrap(), OpenFlags::None)
+                .unwrap();
+            assert!(!existing.dir_needs_sync.load(Ordering::SeqCst));
+            assert!(existing.parent_dir.is_none());
+
+            std::fs::rename(&sub, &sub_moved).unwrap();
+            std::os::unix::fs::symlink("sub", &sub).unwrap();
+            let c3 = existing
+                .sync(Completion::new_sync(|_| {}), sync_type)
+                .expect("sync on non-Create open must not open parent dir");
+            io.wait_for_completion(c3).unwrap();
+        }
+    }
+
+    #[test]
     fn test_sync_succeeds_after_parent_dir_renamed_while_open() {
         for sync_type in [FileSyncType::Fsync, FileSyncType::FullFsync] {
             let root = tempfile::tempdir().unwrap();
@@ -810,17 +884,19 @@ mod tests {
 
             let io = UnixIO::new().unwrap();
             let file = io
-                .open_file(db_path.to_str().unwrap(), OpenFlags::Create, false)
+                .open_unix_file(db_path.to_str().unwrap(), OpenFlags::Create)
                 .unwrap();
             let buf = Arc::new(crate::Buffer::new_temporary(4096));
             let w = file.pwrite(0, buf, Completion::new_write(|_| {})).unwrap();
             io.wait_for_completion(w).unwrap();
+            assert!(file.dir_needs_sync.load(Ordering::SeqCst));
 
             std::fs::rename(&sub, &sub_moved).unwrap();
             let c1 = file
                 .sync(Completion::new_sync(|_| {}), sync_type)
                 .expect("first sync must succeed after parent dir rename");
             io.wait_for_completion(c1).unwrap();
+            assert!(!file.dir_needs_sync.load(Ordering::SeqCst));
 
             let c2 = file
                 .sync(Completion::new_sync(|_| {}), sync_type)
@@ -840,11 +916,12 @@ mod tests {
 
             let io = UnixIO::new().unwrap();
             let file = io
-                .open_file(db_path.to_str().unwrap(), OpenFlags::Create, false)
+                .open_unix_file(db_path.to_str().unwrap(), OpenFlags::Create)
                 .unwrap();
             let buf = Arc::new(crate::Buffer::new_temporary(4096));
             let w = file.pwrite(0, buf, Completion::new_write(|_| {})).unwrap();
             io.wait_for_completion(w).unwrap();
+            assert!(file.dir_needs_sync.load(Ordering::SeqCst));
 
             std::fs::rename(&sub, &sub_moved).unwrap();
             std::fs::create_dir(&sub).unwrap();
@@ -852,6 +929,7 @@ mod tests {
                 .sync(Completion::new_sync(|_| {}), sync_type)
                 .expect("first sync must succeed after parent dir rename and recreate");
             io.wait_for_completion(c1).unwrap();
+            assert!(!file.dir_needs_sync.load(Ordering::SeqCst));
 
             let c2 = file
                 .sync(Completion::new_sync(|_| {}), sync_type)
