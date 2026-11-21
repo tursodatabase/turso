@@ -1,0 +1,209 @@
+@database :temp:
+
+# A full UNIQUE key identifies one row only when every key component is
+# non-NULL. Runtime IS keys, partial prefixes, and non-unique indexes must
+# still visit all matching rows.
+
+setup schema {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT COLLATE NOCASE, part INTEGER, v TEXT);
+    CREATE UNIQUE INDEX t_key ON t(k DESC, part);
+    CREATE INDEX t_k ON t(k);
+    INSERT INTO t VALUES
+        (1,'a',1,'one'), (2,'A',2,'two'),
+        (3,NULL,1,'three'), (4,NULL,1,'four'),
+        (5,'a',NULL,'five'), (6,'A',NULL,'six'),
+        (7,NULL,NULL,'seven'), (8,NULL,NULL,'eight'),
+        (9,'b',1,'nine');
+}
+
+@setup schema
+test unique-full-key-with-runtime-is-values {
+    SELECT id FROM t INDEXED BY t_key
+    WHERE k IS lower('A') AND part IS abs(-1);
+}
+expect {
+    1
+}
+
+@setup schema
+test unique-full-key-with-one-null-is-value {
+    SELECT id FROM t INDEXED BY t_key
+    WHERE k IS nullif('x','x') AND part IS abs(-1) ORDER BY id;
+    SELECT id FROM t INDEXED BY t_key
+    WHERE k IS lower('A') AND part IS nullif(1,1) ORDER BY id;
+}
+expect {
+    3
+    4
+    5
+    6
+}
+
+@setup schema
+test unique-full-key-with-two-null-is-values {
+    SELECT id FROM t INDEXED BY t_key
+    WHERE k IS nullif('x','x') AND part IS nullif(1,1) ORDER BY id;
+}
+expect {
+    7
+    8
+}
+
+@setup schema
+test unique-null-key-with-reverse-order {
+    SELECT id FROM t INDEXED BY t_key
+    WHERE k IS nullif('x','x') AND part IS abs(-1) ORDER BY id DESC;
+    SELECT id FROM t INDEXED BY t_key
+    WHERE k IS lower('A') AND part IS nullif(1,1) ORDER BY id DESC;
+}
+expect {
+    4
+    3
+    6
+    5
+}
+
+@setup schema
+test unique-full-key-with-mixed-equality-and-is {
+    SELECT id FROM t INDEXED BY t_key
+    WHERE k = lower('A') AND part IS nullif(1,1) ORDER BY id;
+    SELECT id FROM t INDEXED BY t_key
+    WHERE k IS nullif('x','x') AND part = abs(-1) ORDER BY id;
+}
+expect {
+    5
+    6
+    3
+    4
+}
+
+@setup schema
+test unique-prefix-keeps-all-matches {
+    SELECT id FROM t INDEXED BY t_key WHERE k IS lower('A') ORDER BY id;
+}
+expect {
+    1
+    2
+    5
+    6
+}
+
+@setup schema
+test nonunique-key-keeps-all-matches {
+    SELECT id FROM t INDEXED BY t_k WHERE k IS lower('A') ORDER BY id;
+}
+expect {
+    1
+    2
+    5
+    6
+}
+
+@setup schema
+test unique-is-seek-repeats-with-null-and-nonnull-outer-keys {
+    CREATE TABLE probes(seq INTEGER PRIMARY KEY, k TEXT, part INTEGER);
+    INSERT INTO probes VALUES (1,NULL,1),(2,'a',1),(3,'missing',1),
+                              (4,'a',NULL),(5,NULL,NULL),(6,'b',1);
+    SELECT probes.seq,coalesce(t.id,-1) FROM probes
+    LEFT JOIN t INDEXED BY t_key ON t.k IS probes.k AND t.part IS probes.part
+    ORDER BY probes.seq,t.id;
+}
+expect {
+    1|3
+    1|4
+    2|1
+    3|-1
+    4|5
+    4|6
+    5|7
+    5|8
+    6|9
+}
+
+@setup schema
+test unique-is-seek-in-full-join-unmatched-read {
+    CREATE TABLE probes(seq INTEGER PRIMARY KEY, k TEXT, part INTEGER);
+    INSERT INTO probes VALUES (1,'a',1),(2,NULL,1),(3,'missing',1);
+    SELECT probes.seq,t.id FROM probes
+    FULL JOIN t INDEXED BY t_key ON t.k IS probes.k AND t.part IS probes.part
+    WHERE t.k IS lower('A') AND t.part IS abs(-1)
+    ORDER BY probes.seq,t.id;
+    SELECT probes.seq,t.id FROM probes
+    FULL JOIN t INDEXED BY t_key ON t.k IS probes.k AND t.part IS probes.part
+    WHERE t.k IS nullif('x','x') AND t.part IS abs(-1)
+    ORDER BY probes.seq,t.id;
+}
+expect {
+    1|1
+    2|3
+    2|4
+}
+
+@setup schema
+test unique-is-delete-keeps-null-duplicates {
+    DELETE FROM t WHERE k IS lower('A') AND part IS nullif(1,1);
+    SELECT id FROM t ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+    7
+    8
+    9
+}
+
+@setup schema
+test unique-is-delete-nonnull-key {
+    DELETE FROM t WHERE k IS lower('A') AND part IS abs(-1);
+    SELECT id FROM t ORDER BY id;
+}
+expect {
+    2
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+}
+
+@setup schema
+test unique-is-update-keeps-null-duplicates {
+    UPDATE t SET v='changed' WHERE k IS nullif('x','x') AND part IS abs(-1);
+    SELECT id FROM t WHERE v='changed' ORDER BY id;
+}
+expect {
+    3
+    4
+}
+
+@setup schema
+test unique-is-prefix-delete-keeps-all-matches {
+    DELETE FROM t WHERE k IS lower('A');
+    SELECT id FROM t ORDER BY id;
+}
+expect {
+    3
+    4
+    7
+    8
+    9
+}
+
+@setup schema
+test unique-expression-is-keeps-null-duplicates {
+    CREATE TABLE expressions(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE UNIQUE INDEX expressions_key ON expressions(lower(k));
+    INSERT INTO expressions VALUES(1,'a'),(2,NULL),(3,NULL),(4,'b');
+    SELECT id FROM expressions WHERE lower(k) IS lower('A');
+    DELETE FROM expressions WHERE lower(k) IS nullif('x','x');
+    SELECT id FROM expressions ORDER BY id;
+}
+expect {
+    1
+    1
+    4
+}

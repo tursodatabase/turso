@@ -1107,6 +1107,9 @@ pub struct TranslateCtx<'a> {
     pub meta_window: Option<WindowMetadata<'a>>,
     /// Metadata stored during `open_loop` for `Search::InSeek`, consumed by `close_loop`.
     pub meta_in_seeks: Vec<Option<InSeekMetadata>>,
+    /// First seek-key register for each cursor. The loop's end can use the
+    /// saved key to distinguish a single unique match from NULL duplicates.
+    pub seek_key_registers: HashMap<CursorID, usize>,
     pub unsafe_testing: bool,
 }
 
@@ -1147,6 +1150,7 @@ impl<'a> TranslateCtx<'a> {
             cdc_cursor_id: None,
             meta_window: None,
             meta_in_seeks: (0..table_count).map(|_| None).collect(),
+            seek_key_registers: HashMap::default(),
             unsafe_testing,
         }
     }
