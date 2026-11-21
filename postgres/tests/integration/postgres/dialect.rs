@@ -4269,21 +4269,21 @@ fn test_pg_input_error_info_extended_types(db: TempDatabase) {
     assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
     drop(rows);
 
-    // unknown type: error
-    let mut rows = conn
-        .query("SELECT message, sql_error_code FROM pg_input_error_info('x', 'nonexistent_type')")
-        .unwrap()
-        .unwrap();
-    let StepResult::Row = rows.step().unwrap() else {
-        panic!("expected row");
-    };
-    let row = rows.row().unwrap();
-    assert_eq!(
-        row.get_value(0).to_string(),
-        "type \"nonexistent_type\" does not exist"
-    );
-    assert_eq!(row.get_value(1).to_string(), "42704");
-    drop(rows);
+    // Unknown types fail before input validation, as in PostgreSQL.
+    for sql in [
+        "SELECT pg_input_is_valid('x', 'nonexistent_type')",
+        "SELECT message, sql_error_code FROM pg_input_error_info('x', 'nonexistent_type')",
+    ] {
+        let error = match conn.query(sql) {
+            Ok(_) => panic!("expected unknown-type error for {sql}"),
+            Err(error) => error,
+        };
+        assert_eq!(error.sqlstate, "42704", "{sql}: {error}");
+        assert_eq!(
+            error.to_string(),
+            "type \"nonexistent_type\" does not exist"
+        );
+    }
 
     // oid: valid
     let mut rows = conn
