@@ -343,6 +343,56 @@ expect {
     6
 }
 
+test table-index-expression-with-qualified-column-and-table-alias {
+    CREATE TABLE t_qualified_index (a int, b int);
+    INSERT INTO t_qualified_index VALUES (1, 1), (2, 2);
+    CREATE INDEX t_qualified_index_b ON t_qualified_index ((t_qualified_index.b + 1));
+    UPDATE t_qualified_index AS t SET b = 5 WHERE a = 2;
+    DELETE FROM t_qualified_index t WHERE a = 1;
+    SELECT a, b FROM t_qualified_index WHERE b + 1 = 6;
+}
+expect {
+    2|5
+}
+
+test table-index-expression-with-schema-qualified-column-and-table-alias {
+    CREATE TABLE t_schema_index (a int, b int);
+    INSERT INTO t_schema_index VALUES (1, 1), (2, 2);
+    CREATE INDEX t_schema_index_b ON t_schema_index ((public.t_schema_index.b * 2));
+    UPDATE t_schema_index AS t SET b = 5 WHERE a = 2;
+    DELETE FROM t_schema_index t WHERE a = 1;
+    SELECT a, b FROM t_schema_index WHERE b * 2 = 10;
+}
+expect {
+    2|5
+}
+
+test table-index-expression-qualified-with-its-own-schema {
+    CREATE SCHEMA idx_own_schema;
+    CREATE TABLE idx_own_schema.t (a int, b int);
+    CREATE INDEX t_b ON idx_own_schema.t ((idx_own_schema.t.b + 1));
+    INSERT INTO idx_own_schema.t VALUES (1, 2);
+    SELECT a FROM idx_own_schema.t WHERE b + 1 = 3;
+}
+expect {
+    1
+}
+
+# A column qualified with another schema is not the indexed table's column.
+# PostgreSQL reports the table reference (42P01); tursopg reports the column
+# (42703), as it does on main.
+@compat-gap "syntax:create-index"
+test table-index-expression-with-other-schema-rejected {
+    CREATE TABLE t_other_schema (a int, b int);
+    CREATE INDEX t_other_schema_b ON t_other_schema ((zz.t_other_schema.b + 3));
+}
+@sqlstate 42P01
+expect error {}
+@sqlstate 42703
+expect @tursopg error {
+    no such column: zz.t_other_schema.b
+}
+
 test table-numeric-column-compared-with-expression {
     CREATE TABLE nm (v numeric(10,2));
     INSERT INTO nm VALUES (1.50);
