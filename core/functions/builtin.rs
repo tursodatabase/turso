@@ -1200,7 +1200,7 @@ pub fn call_builtin_scalar(
                         ),
                         ScalarFunc::NumericDiv | ScalarFunc::NumericMod => {
                             if b.is_zero() {
-                                return Err(LimboError::Constraint("division by zero".to_string()));
+                                return Err(LimboError::DivisionByZero);
                             }
                             if matches!(func, ScalarFunc::NumericDiv) {
                                 numeric_divide(&a, &b)
