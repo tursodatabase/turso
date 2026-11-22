@@ -1857,9 +1857,9 @@ fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
     ))
 }
 
-/// Refuses a statement that changes the definition of a catalog table, as
-/// PostgreSQL does. A table of the same name in a schema of the user's is
-/// not a catalog table.
+/// Refuses a statement that changes the definition of a catalog table or
+/// drops the index of one, as PostgreSQL does. A table of the same name in
+/// a schema of the user's is not a catalog table.
 fn reject_catalog_ddl(stmt: &ast::Stmt) -> Result<()> {
     let (schema, table_name) = match stmt {
         ast::Stmt::AlterTable(ast::AlterTable { name, .. }) => {
@@ -1871,14 +1871,20 @@ fn reject_catalog_ddl(stmt: &ast::Stmt) -> Result<()> {
         ast::Stmt::CreateIndex {
             idx_name, tbl_name, ..
         } => (idx_name.namespace.as_ref(), tbl_name),
+        ast::Stmt::DropIndex { idx_name, .. } => (idx_name.namespace.as_ref(), &idx_name.name),
         _ => return Ok(()),
     };
     let table_name = table_name.as_str();
     let is_in_catalog_schema = schema.is_none_or(|schema| schema.as_str() == "main");
-    if !is_in_catalog_schema
-        || !catalog::is_catalog_table_name(table_name)
-        || catalog::is_catalog_view_name(table_name)
-    {
+    let is_catalog_relation = match stmt {
+        ast::Stmt::DropIndex { .. } => {
+            crate::schema_init::is_stored_catalog_relation(NamespaceId::ROOT, table_name)
+        }
+        _ => {
+            catalog::is_catalog_table_name(table_name) && !catalog::is_catalog_view_name(table_name)
+        }
+    };
+    if !is_in_catalog_schema || !is_catalog_relation {
         return Ok(());
     }
     Err(sqlstate_error(

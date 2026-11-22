@@ -41,7 +41,8 @@ use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, AccessStatement,
     Catalog, CatalogApply, CatalogCmd, CmdContext, CmdOrigin, CmpInsFlags, CollationSeq,
     Connection, CursorType, DropColumn, InsertFlags, Insn, LimboError, LoadStep, NewOwner, Numeric,
-    OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationName, SqliteCatalog, Value,
+    OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationName, RenameColumn, SqliteCatalog,
+    Value,
 };
 
 use turso_core::MAIN_DB_ID;
@@ -51,12 +52,13 @@ use turso_pg_parser::sqlstate::{
 };
 
 use crate::acl::{Acl, Privileges, PUBLIC_OID};
-use crate::catalog::{engine_role_by_name, role_oid, role_oid_by_name};
+use crate::attributes::{emit_delete_attributes, emit_insert_attributes, emit_replace_attributes};
+use crate::catalog::{engine_role_by_name, role_oid, role_oid_by_name, stored_relation_oid};
 use crate::descriptions::{emit_delete_comments, Dropped};
 use crate::error::sqlstate_error;
 use crate::policies::{self, TablePolicies};
 use crate::roles::schema_roles;
-use crate::schema_init::{is_stored_catalog_table, TableInit};
+use crate::schema_init::{is_stored_catalog_relation, is_stored_catalog_table, TableInit};
 use crate::schema_state::{change_schema_state, emit_catalog_apply, schema_state};
 use crate::unique_index::emit_unique_index_insert;
 use turso_core::security::policy::RowPolicy;
@@ -205,7 +207,7 @@ impl ClassCatalog {
     pub(crate) fn build(schema: &Schema, rows: &[Vec<Value>]) -> turso_core::Result<Self> {
         let catalog = Self::new(rows)?;
         for (namespace, name, _) in schema.user_relations() {
-            if is_stored_catalog_table(namespace, &name) {
+            if is_stored_catalog_relation(namespace, &name) {
                 continue;
             }
             if catalog.get_by_name(namespace, &name).is_none() {
@@ -480,7 +482,8 @@ pub(crate) fn row_security_policies<'a>(
 }
 
 /// The catalog of a PostgreSQL database: the engine's `sqlite_schema` rows,
-/// and a class row for each relation of the main database.
+/// a class row for each relation of the main database, and a `pg_attribute`
+/// row for each column of its tables.
 #[derive(Debug)]
 pub(crate) struct PostgresCatalog;
 
@@ -495,13 +498,16 @@ impl Catalog for PostgresCatalog {
         match cmd {
             CatalogCmd::CreateTable(table) => {
                 if let Some(rows) = ClassRowWriter::open(program, ctx, true)? {
-                    rows.new_relation(
+                    let oid_reg = rows.new_relation(
                         program,
                         table.namespace,
                         table.name,
                         RelationKind::Table,
                         None,
                     )?;
+                    if let Some(oid_reg) = oid_reg {
+                        emit_insert_attributes(program, ctx.schema, oid_reg, table.table)?;
+                    }
                     for index in table.automatic_indexes {
                         rows.new_relation(
                             program,
@@ -553,6 +559,10 @@ impl Catalog for PostgresCatalog {
                 // The class rows that go away with the table: its own and
                 // those of its indexes.
                 if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
+                    if let Some(oid) = stored_relation_oid(ctx.schema, table.namespace, table.name)
+                    {
+                        emit_delete_attributes(program, ctx.schema, oid)?;
+                    }
                     rows.dropped_relation(program, table.namespace, table.name);
                     for index in table.indexes {
                         rows.dropped_relation(program, table.namespace, index);
@@ -608,8 +618,20 @@ impl Catalog for PostgresCatalog {
                     column.old_name,
                     column.new_name.as_str(),
                 )?;
+                emit_renamed_column_attributes(program, ctx, column)?;
             }
             CatalogCmd::AlterColumn(column) => {
+                // The PostgreSQL parser refuses every ALTER COLUMN, but the
+                // engine's connection to the database takes the engine's
+                // own form of it. It would leave the table's pg_attribute
+                // rows as they were.
+                if writes_catalog_rows(ctx) {
+                    return Err(sqlstate_error(
+                        SQLSTATE_FEATURE_NOT_SUPPORTED,
+                        "ALTER COLUMN is not supported in a PostgreSQL database",
+                        None,
+                    ));
+                }
                 rename_owner_column(
                     program,
                     ctx,
@@ -619,14 +641,30 @@ impl Catalog for PostgresCatalog {
                     column.definition.col_name.as_str(),
                 )?;
             }
-            // A new column owns no sequence, so no class row changes.
-            CatalogCmd::AddColumn(_) => {}
+            // A new column owns no sequence, so no class row changes. Only
+            // the attribute rows do.
+            CatalogCmd::AddColumn(column) => {
+                emit_altered_table_attributes(
+                    program,
+                    ctx,
+                    column.namespace,
+                    column.name,
+                    column.table,
+                )?;
+            }
             // The statement drops the sequences that the column owns
             // itself, each with its class row.
             CatalogCmd::DropColumn(column) => {
-                if ctx.origin != CmdOrigin::Engine && ctx.database_id == MAIN_DB_ID {
+                if writes_catalog_rows(ctx) {
                     emit_dropped_column_comments(program, ctx, column);
                 }
+                emit_altered_table_attributes(
+                    program,
+                    ctx,
+                    column.namespace,
+                    column.name,
+                    column.table,
+                )?;
             }
             // A trigger has no class row, and neither has a virtual table.
             CatalogCmd::CreateTrigger(_)
@@ -677,6 +715,48 @@ impl Catalog for PostgresCatalog {
     fn load_steps(&self) -> Vec<Box<dyn LoadStep>> {
         crate::schema_state::load_steps()
     }
+}
+
+/// Stores the new name of the column that `column` renames.
+fn emit_renamed_column_attributes(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    column: &RenameColumn<'_>,
+) -> turso_core::Result<()> {
+    if !writes_catalog_rows(ctx) {
+        return Ok(());
+    }
+    let table = ctx
+        .schema
+        .get_btree_table(column.namespace, column.table)
+        .expect("the statement renames a column of a table of the schema");
+    let (position, _) = table
+        .get_column(column.old_name)
+        .expect("the statement checked that the table has the column");
+    // The engine renames the column when the statement runs, so the table
+    // with the new name does not exist yet.
+    let mut renamed_table = BTreeTable::clone(&table);
+    renamed_table.columns_mut()[position].name = Some(column.new_name.as_str().to_string());
+    emit_altered_table_attributes(program, ctx, column.namespace, column.table, &renamed_table)
+}
+
+/// Stores the columns of table `name` of `namespace` as `altered_table` has
+/// them: the table after the running statement.
+fn emit_altered_table_attributes(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    namespace: NamespaceId,
+    name: &str,
+    altered_table: &BTreeTable,
+) -> turso_core::Result<()> {
+    if !writes_catalog_rows(ctx) {
+        return Ok(());
+    }
+    // An engine table has no class row and no attribute rows.
+    if let Some(oid) = stored_relation_oid(ctx.schema, namespace, name) {
+        emit_replace_attributes(program, ctx.schema, oid, altered_table)?;
+    }
+    Ok(())
 }
 
 /// Deletes the comment of the column that `column.table` no longer has, and
@@ -764,7 +844,9 @@ impl<'a> ClassRowWriter<'a> {
     /// Inserts the class row of a relation that the statement creates.
     /// `table` is the table of an index, in the same namespace: its owner
     /// owns the index. Anything else is owned by the current role, which is
-    /// what PostgreSQL's `GetUserId()` gives after `SET ROLE`.
+    /// what PostgreSQL's `GetUserId()` gives after `SET ROLE`. Returns the
+    /// register with the oid of the relation, or None for an engine
+    /// relation, which gets no row.
     fn new_relation(
         &self,
         program: &mut ProgramBuilder,
@@ -772,7 +854,7 @@ impl<'a> ClassRowWriter<'a> {
         name: &str,
         kind: RelationKind,
         table: Option<&str>,
-    ) -> turso_core::Result<()> {
+    ) -> turso_core::Result<Option<usize>> {
         // Relation names are unique per schema across kinds.
         if is_user_relation_name(kind, name)
             && class_catalog(self.schema)
@@ -785,8 +867,14 @@ impl<'a> ClassRowWriter<'a> {
         let owner = table
             .and_then(|table| relation_owner(self.schema, namespace, table))
             .unwrap_or_else(|| self.connection.current_role());
-        emit_class_row_insert(program, &self.cursors, namespace, name, kind, owner);
-        Ok(())
+        Ok(emit_class_row_insert(
+            program,
+            &self.cursors,
+            namespace,
+            name,
+            kind,
+            owner,
+        ))
     }
 
     /// Deletes the class row of a relation that the statement drops.
@@ -861,24 +949,27 @@ impl<'a> ClassRowWriter<'a> {
     }
 }
 
-/// Whether the relations of the statement get class rows. Only the
-/// relations a user creates in the main database do. A statement of the
-/// engine copies or replays a database whose class rows are stored as data
-/// already, and the temp database has no class table. Fails for a user's
-/// statement against an attached database: the class table covers only the
-/// main database, so a database file with relations made while it was
-/// attached could not be opened later.
+/// Whether the relations of the statement get class rows. Fails for a
+/// user's statement against an attached database: the class table covers
+/// only the main database, so a database file with relations made while it
+/// was attached could not be opened later.
 fn writes_class_rows(ctx: &CmdContext<'_>) -> turso_core::Result<bool> {
-    if ctx.origin == CmdOrigin::Engine {
-        return Ok(false);
-    }
-    if turso_core::is_attached_db(ctx.database_id) {
+    if ctx.origin == CmdOrigin::User && turso_core::is_attached_db(ctx.database_id) {
         return Err(LimboError::ParseError(
             "creating, renaming or dropping relations in an attached database is not supported"
                 .to_string(),
         ));
     }
-    Ok(ctx.database_id == MAIN_DB_ID)
+    Ok(writes_catalog_rows(ctx))
+}
+
+/// Whether the statement writes the frontend's catalog rows for its
+/// relations. Only a user's statement on the main database does. A
+/// statement of the engine copies or replays a database whose catalog rows
+/// are stored as data already, and the catalog tables cover neither the
+/// temp database nor an attached one.
+fn writes_catalog_rows(ctx: &CmdContext<'_>) -> bool {
+    ctx.origin == CmdOrigin::User && ctx.database_id == MAIN_DB_ID
 }
 
 /// Emits the bytecode of the [`AccessStatement`]s that change a class row.
@@ -1362,7 +1453,8 @@ fn open_class_table_for_writing(
 }
 
 /// Inserts the class row of relation `name` of `namespace` under the next
-/// oid, owned by `owner`. Engine relations get no row.
+/// oid, owned by `owner`, and returns the register with the oid. Engine
+/// relations get no row.
 fn emit_class_row_insert(
     program: &mut ProgramBuilder,
     cursors: &ClassTableCursors,
@@ -1370,9 +1462,9 @@ fn emit_class_row_insert(
     name: &str,
     kind: RelationKind,
     owner: RoleId,
-) {
+) -> Option<usize> {
     if !is_user_relation_name(kind, name) {
-        return;
+        return None;
     }
     let oid_reg = emit_allocate_oid(program, cursors);
 
@@ -1442,6 +1534,7 @@ fn emit_class_row_insert(
         kind,
     }
     .emit(program, oid_reg, first_column_reg + 4);
+    Some(oid_reg)
 }
 
 /// Puts the next oid in the returned register and records it as the

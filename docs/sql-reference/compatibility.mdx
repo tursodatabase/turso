@@ -87,6 +87,19 @@ and only a superuser comments on a schema. A new database has the default
 empty `COMMENT ON SCHEMA` statement for it. Every role reads `pg_description`,
 and no statement of a user writes it other than `COMMENT ON`.
 
+`pg_catalog.pg_attribute` is a table in the database file too, with one row
+per column of each table. `CREATE TABLE`, `CREATE TABLE AS`, `SELECT INTO`,
+`ALTER TABLE ... ADD COLUMN`, `DROP COLUMN` and `RENAME COLUMN`, and `DROP
+TABLE` write the rows in the transaction of the statement, so a rolled back
+statement leaves none. `DROP COLUMN` deletes the row of the column and
+renumbers the columns after it, where PostgreSQL keeps the row and sets
+`attisdropped`. A database gets the table when it is created: a database that
+an earlier version made opens with an empty `pg_attribute`, and only tables
+created or altered from then on get rows. Every role reads `pg_attribute`,
+and no statement of a user writes it directly. Its unique index on `(attrelid,
+attnum)` is `pg_attribute_relid_attnum_index`, as in PostgreSQL; `DROP INDEX`
+on it fails with SQLSTATE 42501.
+
 The public schema reports `pg_database_owner` as its owner, with `CREATE` and
 `USAGE` for that role and `USAGE` for `PUBLIC`, matching PostgreSQL's defaults.
 The catalogs and role-name lookup expose this built-in role alongside `turso`.

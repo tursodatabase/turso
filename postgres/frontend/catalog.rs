@@ -112,36 +112,41 @@ impl Dialect for PostgresDialect {
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
-        let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            let turso_core::ast::Stmt::CreateTable { tbl_name, body, .. } =
-                canonical_table_sql_ast(self, sql)?
-            else {
-                unreachable!("canonical_table_sql_ast returned a non-CREATE TABLE statement");
-            };
-            let table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)?;
-            if !table.has_rowid {
-                return Err(LimboError::ParseError(format!(
-                    "PostgreSQL does not support WITHOUT ROWID table '{}'",
-                    table.name
-                )));
+        let mut table = match decode_stored_pg_schema_sql(sql) {
+            None => {
+                let turso_core::ast::Stmt::CreateTable { tbl_name, body, .. } =
+                    canonical_table_sql_ast(self, sql)?
+                else {
+                    unreachable!("canonical_table_sql_ast returned a non-CREATE TABLE statement");
+                };
+                let table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)?;
+                if !table.has_rowid {
+                    return Err(LimboError::ParseError(format!(
+                        "PostgreSQL does not support WITHOUT ROWID table '{}'",
+                        table.name
+                    )));
+                }
+                table
             }
-            return Ok(table);
+            Some(raw_sql) => {
+                let parse_result = turso_pg_parser::parse(raw_sql)
+                    .map_err(|e| LimboError::ParseError(e.to_string()))?;
+                let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
+                let stmt = translator
+                    .translate(&parse_result)
+                    .map_err(|e| LimboError::ParseError(e.to_string()))?;
+                let turso_core::ast::Stmt::CreateTable { tbl_name, body, .. } = stmt else {
+                    return Err(LimboError::ParseError(
+                        "expected CREATE TABLE statement".to_string(),
+                    ));
+                };
+                BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)?
+            }
         };
-
-        let parse_result =
-            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
-        let stmt = translator
-            .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
-        match stmt {
-            turso_core::ast::Stmt::CreateTable { tbl_name, body, .. } => {
-                BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)
-            }
-            _ => Err(LimboError::ParseError(
-                "expected CREATE TABLE statement".to_string(),
-            )),
-        }
+        // A catalog table can have either kind of text: VACUUM stores it
+        // again as PostgreSQL text.
+        crate::schema_init::hide_system_columns(&mut table);
+        Ok(table)
     }
 
     fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_core::ast::Stmt> {
@@ -516,7 +521,7 @@ pub(crate) fn is_system_table_name(name: &str) -> bool {
 
 /// Map a SQLite type string to a PostgreSQL type OID.
 /// Strips parenthesized parameters (e.g. `varchar(100)` -> `VARCHAR`) before matching.
-fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
+pub(crate) fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
     pg_type_oid(ty_str).unwrap_or(25) // default to text
 }
 
@@ -560,7 +565,11 @@ pub(crate) fn pg_type_oid(ty_str: &str) -> Option<i64> {
 /// Every relation has one: the frontend refuses a database whose relations
 /// predate the catalog, so None means the schema and the catalog are out of
 /// step, and the caller serves 0 rather than inventing an oid.
-fn stored_relation_oid(schema: &Schema, namespace: NamespaceId, name: &str) -> Option<i64> {
+pub(crate) fn stored_relation_oid(
+    schema: &Schema,
+    namespace: NamespaceId,
+    name: &str,
+) -> Option<i64> {
     Some(
         crate::classes::class_catalog(schema)?
             .get_by_name(namespace, name)?
@@ -933,109 +942,6 @@ impl SnapshotRows for SchemataTable {
                 ]
             })
             .collect()
-    }
-}
-
-/// Virtual table implementation for pg_catalog.pg_attribute
-/// Maps column information to PostgreSQL's pg_attribute
-#[derive(Debug)]
-struct PgAttributeTable;
-
-impl SnapshotRows for PgAttributeTable {
-    const SCHEMA: &'static str = "CREATE TABLE pg_attribute (
-            attrelid INTEGER,
-            attname TEXT,
-            atttypid INTEGER,
-            attstattarget INTEGER,
-            attlen INTEGER,
-            attnum INTEGER,
-            attndims INTEGER,
-            attcacheoff INTEGER,
-            atttypmod INTEGER,
-            attbyval BOOLEAN,
-            attstorage TEXT,
-            attalign TEXT,
-            attcompression TEXT,
-            attnotnull BOOLEAN,
-            atthasdef BOOLEAN,
-            atthasmissing BOOLEAN,
-            attidentity TEXT,
-            attgenerated TEXT,
-            attisdropped BOOLEAN,
-            attislocal BOOLEAN,
-            attinhcount INTEGER,
-            attcollation INTEGER,
-            attacl TEXT,
-            attoptions TEXT,
-            attfdwoptions TEXT,
-            attmissingval TEXT,
-            tableoid INTEGER HIDDEN
-        )";
-    const TABLE_OID: Option<i64> = Some(1249);
-    const ESTIMATED_COST: f64 = 1000.0;
-    const ESTIMATED_ROWS: u32 = 1000;
-
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
-        let schema = conn.current_schema();
-        let mut rows = Vec::new();
-
-        for (_, _, table, table_oid) in user_tables_with_oids(&schema) {
-            let columns = table.columns();
-            for (i, col) in columns.iter().enumerate() {
-                let col_name = col.name.clone().unwrap_or_default();
-                let type_oid = match schema.get_type_def(&col.ty_str, table.is_strict()) {
-                    Some(td) if !td.is_builtin => user_type_oid(&td.name),
-                    _ => sqlite_type_to_pg_oid(&col.ty_str),
-                };
-                let storage = if col.is_array() {
-                    "x"
-                } else {
-                    type_storage(&schema, &col.ty_str)
-                };
-                let attnum = (i + 1) as i64; // 1-based
-                let notnull = i64::from(col.notnull());
-                let has_def = i64::from(
-                    (col.default.is_some() && col.identity.is_none()) || col.is_stored_generated(),
-                );
-                let generated = if col.is_stored_generated() { "s" } else { "" };
-                let identity = match col.identity {
-                    Some(ast::IdentityKind::Always) => "a",
-                    Some(ast::IdentityKind::ByDefault) => "d",
-                    None => "",
-                };
-
-                rows.push(vec![
-                    Value::from_i64(table_oid),   // attrelid
-                    Value::Text(col_name.into()), // attname
-                    Value::from_i64(type_oid),    // atttypid
-                    Value::from_i64(-1),          // attstattarget
-                    Value::from_i64(-1),          // attlen
-                    Value::from_i64(attnum),      // attnum
-                    Value::from_i64(0),           // attndims
-                    Value::from_i64(-1),          // attcacheoff
-                    Value::from_i64(-1),          // atttypmod
-                    Value::from_i64(1),           // attbyval
-                    Value::build_text(storage),   // attstorage
-                    Value::Text("i".into()),      // attalign (int)
-                    Value::Text("".into()),
-                    Value::from_i64(notnull),      // attnotnull
-                    Value::from_i64(has_def),      // atthasdef
-                    Value::from_i64(0),            // atthasmissing
-                    Value::Text(identity.into()),  // attidentity
-                    Value::Text(generated.into()), // attgenerated
-                    Value::from_i64(0),            // attisdropped
-                    Value::from_i64(1),            // attislocal
-                    Value::from_i64(0),            // attinhcount
-                    Value::from_i64(0),            // attcollation
-                    Value::Null,                   // attacl
-                    Value::Null,                   // attoptions
-                    Value::Null,                   // attfdwoptions
-                    Value::Null,                   // attmissingval
-                ]);
-            }
-        }
-
-        rows
     }
 }
 
@@ -2169,7 +2075,7 @@ impl SnapshotRows for PgTypeTable {
     }
 }
 
-fn user_type_oid(name: &str) -> i64 {
+pub(crate) fn user_type_oid(name: &str) -> i64 {
     50000
         + (name
             .as_bytes()
@@ -2178,7 +2084,7 @@ fn user_type_oid(name: &str) -> i64 {
             % 10000) as i64
 }
 
-fn type_storage<'a>(schema: &'a Schema, mut name: &'a str) -> &'static str {
+pub(crate) fn type_storage<'a>(schema: &'a Schema, mut name: &'a str) -> &'static str {
     while let Some(ty) = schema.get_type_def_unchecked(name) {
         if ty.is_builtin {
             break;
@@ -2856,11 +2762,6 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         "pg_namespace",
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgNamespaceTable>(PhantomData),
-    );
-    options = options.native_module(
-        "pg_attribute",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgAttributeTable>(PhantomData),
     );
     options = options.native_module(
         "pg_roles",
@@ -4937,7 +4838,6 @@ mod tests {
         let catalog_names = [
             "pg_class",
             "pg_namespace",
-            "pg_attribute",
             "pg_roles",
             "pg_auth_members",
             "pg_am",
