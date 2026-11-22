@@ -249,7 +249,9 @@ pub struct Statement {
     nested_guard_active: bool,
     /// The command the statement was prepared from, when its SQL text cannot
     /// be parsed again, so that preparing it again translates the command.
-    reprepare_cmd: Option<Cmd>,
+    /// Boxed because a `Cmd` is about 440 bytes, and most statements have no
+    /// command here: each move of a statement copies all of its bytes.
+    reprepare_cmd: Option<Box<Cmd>>,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -1125,7 +1127,7 @@ impl Statement {
     /// Makes preparing the statement again translate `cmd`, the command it
     /// was prepared from, instead of parsing its SQL text.
     pub(crate) fn reprepare_from(&mut self, cmd: Cmd) {
-        self.reprepare_cmd = Some(cmd);
+        self.reprepare_cmd = Some(Box::new(cmd));
     }
 
     fn reprepare(&mut self) -> Result<()> {
@@ -1141,7 +1143,7 @@ impl Statement {
         conn.refresh_schema_for_reprepare()?;
         let new_program = {
             let cmd = match &self.reprepare_cmd {
-                Some(cmd) => cmd.clone(),
+                Some(cmd) => Cmd::clone(cmd),
                 None => {
                     let (cmd, _) = conn.parse_sql(&self.program.sql)?;
                     cmd.expect("Same SQL string should be able to be parsed")
@@ -1936,9 +1938,10 @@ mod tests {
     /// Callers move a `Statement` by value while they build it and wrap it,
     /// and every copy is a stack slot in the caller's frame. Those frames stay
     /// on the stack while statements are prepared, so a large `Statement`
-    /// overflows small coroutine stacks.
+    /// overflows small coroutine stacks. Each move also copies all the bytes
+    /// of the statement.
     #[test]
     fn statement_stays_small() {
-        assert!(std::mem::size_of::<Statement>() <= 1024);
+        assert!(std::mem::size_of::<Statement>() <= 256);
     }
 }
