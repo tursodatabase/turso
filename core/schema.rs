@@ -627,6 +627,18 @@ impl TypeDef {
         }
     }
 
+    /// Whether a column of this type is not the same as a column of its base type: a
+    /// domain, STRUCT or UNION, or a type that converts values when it stores or
+    /// reads them. A type with at most a COERCE check, such as varchar(n), is not,
+    /// because its values stay what they were stored as.
+    pub fn changes_stored_value(&self) -> bool {
+        self.is_domain
+            || self.is_struct()
+            || self.is_union()
+            || self.encode().is_some()
+            || !self.decode_returns_value_unchanged()
+    }
+
     /// True when stored values are read back unchanged (no DECODE, or `DECODE value`).
     pub fn decode_returns_value_unchanged(&self) -> bool {
         self.decode().is_none_or(

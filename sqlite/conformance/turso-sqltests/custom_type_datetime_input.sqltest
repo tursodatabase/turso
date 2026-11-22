@@ -383,18 +383,22 @@ expect {
     3
 }
 
-# timestamptz is stored as the UTC instant with no offset, so it equals the
-# same timestamp and SQLite's date functions can read it.
+# A timestamp and a timestamptz are stored as different texts (a timestamptz is
+# the UTC instant), and nothing says how one reads as the other, so comparing
+# them is an error.
 @requires strict "uses STRICT tables"
-test datetime-timestamp-equals-timestamptz {
+test datetime-timestamp-equals-timestamptz-is-an-error {
     CREATE TABLE t(id INTEGER, ts timestamp, tz timestamptz) STRICT;
     INSERT INTO t VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00');
     INSERT INTO t VALUES (2, '2024-01-05 10:00:00', '2024-01-05 10:00:00+02');
     SELECT id FROM t WHERE ts = tz;
 }
-expect {
-    1
+expect error {
+    cannot compare type timestamp with type timestamptz
 }
+
+# SQLite's date functions can read a timestamptz, which is stored as the UTC
+# instant with no offset.
 
 @requires strict "uses STRICT tables"
 test datetime-timestamptz-in-sqlite-date-functions {

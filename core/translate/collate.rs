@@ -7,13 +7,13 @@ use turso_parser::ast::{Expr, UnaryOperator};
 
 use crate::{
     function::ExternalCollation,
-    schema::Schema,
+    schema::{Schema, TypeDef},
     sync::{Arc, LazyLock, RwLock, Weak},
     translate::{
         catalog::CatalogContext,
         emitter::Resolver,
         expr::{
-            expr_type::{query_column_type, type_of, type_ordering, ExprType},
+            expr_type::{query_column_type, same_type_def, type_of, type_ordering, ExprType},
             row_value_component_expr, row_value_len,
         },
         expr_context::{ExprContext, ExprProperties},
@@ -508,6 +508,7 @@ pub fn comparison_collation_across_queries(
     rhs: &Expr,
     rhs_context: &ExprContext<'_, '_>,
 ) -> Result<CollationSeq> {
+    check_comparable_exprs(lhs, lhs_context, rhs, rhs_context)?;
     if let Some(ordering) = common_type_ordering([(lhs, lhs_context), (rhs, rhs_context)])? {
         return Ok(CollationSeq::Type(ordering));
     }
@@ -546,6 +547,7 @@ pub fn in_subquery_collation(
         type_of(lhs, &lhs_context.type_env()),
         query_column_type(query, column, resolver),
     ];
+    check_comparable(&types[0], &types[1], resolver.schema())?;
     let has_collate = has_collate_operator(lhs) || has_collate_operator(rhs);
     if let Some(ordering) = common_ordering(&types, resolver.schema(), has_collate)? {
         return Ok(CollationSeq::Type(ordering));
@@ -562,6 +564,7 @@ pub fn in_list_collation(
     rhs: &[Box<Expr>],
     context: &ExprContext<'_, '_>,
 ) -> Result<CollationSeq> {
+    check_in_list_comparable(lhs, rhs, context)?;
     let operands = std::iter::once(lhs)
         .chain(rhs.iter().map(|item| item.as_ref()))
         .map(|expr| (expr, context));
@@ -785,6 +788,7 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
             let operands =
                 std::iter::once(lhs.as_ref()).chain(rhs.iter().map(|item| item.as_ref()));
             common_type_ordering(operands.map(|expr| (expr, context)))?;
+            check_in_list_comparable(lhs, rhs, context)?;
             Ok(())
         }
         // Compiled as `base = when` for each WHEN.
@@ -800,6 +804,7 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
                 .catalog()
                 .resolve_function(name.as_str(), args.len())?;
             if func.is_some_and(|func| func.needs_collation()) {
+                check_comparable_args(args, context)?;
                 common_type_ordering(args.iter().map(|arg| (arg.as_ref(), context)))?;
             }
             Ok(())
@@ -853,6 +858,7 @@ fn check_comparison(lhs: &Expr, rhs: &Expr, context: &ExprContext<'_, '_>) -> Re
         }
         return Ok(());
     }
+    check_comparable_exprs(lhs, context, rhs, context)?;
     common_type_ordering([(lhs, context), (rhs, context)])?;
     Ok(())
 }
@@ -884,6 +890,107 @@ fn check_type_accepts_collate(ty: &ExprType, schema: &Schema) -> Result<()> {
     Err(LimboError::ParseError(format!(
         "collations are not supported by type {ty}"
     )))
+}
+
+/// The one decision that two values of different custom types do not compare.
+/// A domain compares as the type it is declared on, so two domains over one
+/// type, or a domain and its base, compare as that type does. After that,
+/// two different types compare when neither changes the values it stores (a
+/// STRUCT or UNION, a type with ENCODE or a DECODE; varchar(n) and
+/// smallint do not), or when their types already have one order in common,
+/// as `numeric` and `bigint` do. Any other pair, such as `timestamp` with
+/// `timestamptz` or `timestamptz` with `varchar(n)`, is refused, because one
+/// stored form is not the other's and no rule converts one into the other, so
+/// comparing the stored forms would give wrong answers. Every place that picks
+/// the collation of a comparison calls this, so a comparison turned into an
+/// index seek, a hash join key or an ephemeral index key is refused like the
+/// one compiled as written. A custom type compared with a built-in type or an
+/// untyped literal is not checked here.
+fn check_comparable(a: &ExprType, b: &ExprType, schema: &Schema) -> Result<()> {
+    let (Some(x), Some(y)) = (domain_base(a, schema), domain_base(b, schema)) else {
+        return Ok(());
+    };
+    if same_type_def(&x, &y) || !(x.changes_stored_value() || y.changes_stored_value()) {
+        return Ok(());
+    }
+    // The orders of the types themselves, not of their bases: a domain over
+    // numeric has the order of numeric, and common_ordering follows domains.
+    if common_ordering(&[a.clone(), b.clone()], schema, false)?.is_some() {
+        return Ok(());
+    }
+    Err(cannot_compare(a, b))
+}
+
+/// The type that values of `ty` compare as: `ty` itself, or the type a domain
+/// is declared on, followed through domains. `None` when `ty` is not a custom
+/// type or a domain over a built-in type.
+fn domain_base(ty: &ExprType, schema: &Schema) -> Option<Arc<TypeDef>> {
+    let ExprType::Custom { type_def, .. } = ty else {
+        return None;
+    };
+    if !type_def.is_domain {
+        return Some(type_def.clone());
+    }
+    match schema.resolve_type_unchecked(&type_def.name) {
+        Ok(Some(resolved)) => resolved.chain.iter().find(|link| !link.is_domain).cloned(),
+        // A type that cannot be resolved has no known base to compare with.
+        Ok(None) | Err(_) => None,
+    }
+}
+
+/// [check_comparable] for the types of `lhs` and `rhs`.
+fn check_comparable_exprs(
+    lhs: &Expr,
+    lhs_context: &ExprContext<'_, '_>,
+    rhs: &Expr,
+    rhs_context: &ExprContext<'_, '_>,
+) -> Result<()> {
+    check_comparable(
+        &type_of(lhs, &lhs_context.type_env()),
+        &type_of(rhs, &rhs_context.type_env()),
+        lhs_context.schema(),
+    )
+}
+
+/// [check_comparable] for `lhs` compared with each item of `x IN (items)`.
+fn check_in_list_comparable(
+    lhs: &Expr,
+    items: &[Box<Expr>],
+    context: &ExprContext<'_, '_>,
+) -> Result<()> {
+    let env = context.type_env();
+    let lhs_type = type_of(lhs, &env);
+    items
+        .iter()
+        .try_for_each(|item| check_comparable(&lhs_type, &type_of(item, &env), context.schema()))
+}
+
+/// [check_comparable] for every pair of `args`, which a function such as
+/// `min` or `nullif` compares with each other.
+pub(crate) fn check_comparable_args(
+    args: &[Box<Expr>],
+    context: &ExprContext<'_, '_>,
+) -> Result<()> {
+    let env = context.type_env();
+    // Different custom types are few, so keep one type of each name.
+    let mut seen: SmallVec<[ExprType; 2]> = SmallVec::new();
+    for arg in args {
+        let ty = type_of(arg, &env);
+        let ExprType::Custom { type_def, .. } = &ty else {
+            continue;
+        };
+        let is_new = seen.iter().all(|other| {
+            matches!(other, ExprType::Custom { type_def: other, .. } if !same_type_def(other, type_def))
+        });
+        if !is_new {
+            continue;
+        }
+        for other in &seen {
+            check_comparable(other, &ty, context.schema())?;
+        }
+        seen.push(ty);
+    }
+    Ok(())
 }
 
 fn cannot_compare(a: &ExprType, b: &ExprType) -> LimboError {

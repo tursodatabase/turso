@@ -1097,6 +1097,7 @@ fn translate_function_call_expr(
 
     let func = func_type.unwrap();
     let collation = if func.needs_collation() {
+        check_comparable_args(args, &ExprContext::new(referenced_tables, resolver))?;
         first_collation(
             args.iter()
                 .map(|arg| (arg.as_ref(), ExprContext::new(referenced_tables, resolver))),
