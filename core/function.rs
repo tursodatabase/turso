@@ -1989,6 +1989,27 @@ impl Func {
         )
     }
 
+    /// Whether the arguments, taking the elements of an array argument in its
+    /// place, are values of one array: the function compares them with each
+    /// other, as `array_position(a, x)` and `a && b` do, or makes them the
+    /// elements of its result, as `ARRAY[x, y]` and `array_append(a, x)` do.
+    pub fn arguments_are_values_of_one_array(&self) -> bool {
+        matches!(
+            self,
+            Self::Scalar(
+                ScalarFunc::Array
+                    | ScalarFunc::ArrayAppend
+                    | ScalarFunc::ArrayPrepend
+                    | ScalarFunc::ArrayCat
+                    | ScalarFunc::ArrayRemove
+                    | ScalarFunc::ArrayContains
+                    | ScalarFunc::ArrayPosition
+                    | ScalarFunc::ArrayOverlap
+                    | ScalarFunc::ArrayContainsAll
+            )
+        )
+    }
+
     /// Whether the function is an aggregate, built in or from an extension.
     pub fn is_aggregate(&self) -> bool {
         match self {

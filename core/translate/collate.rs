@@ -1,6 +1,6 @@
 use std::{borrow::Borrow, cmp::Ordering, collections::HashMap, hash::Hasher, str::FromStr as _};
 
-use crate::ast::{Expr, UnaryOperator};
+use crate::ast::{Expr, Operator, UnaryOperator};
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
 use smallvec::SmallVec;
@@ -787,6 +787,10 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
     match expr {
         Expr::Collate(operand, _) => check_collate_operand(operand, context),
         Expr::Binary(lhs, op, rhs) if op.is_comparison() => check_comparison(lhs, rhs, context),
+        // Compiled as array_contains_all(lhs, rhs) and array_overlap(lhs, rhs).
+        Expr::Binary(lhs, Operator::ArrayContains | Operator::ArrayOverlap, rhs) => {
+            check_comparable_array_values([lhs.as_ref(), rhs.as_ref()].into_iter(), context)
+        }
         // Compiled as `lhs >= start AND lhs <= end`.
         Expr::Between {
             lhs, start, end, ..
@@ -827,6 +831,12 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
             if needs_collation {
                 check_comparable_results(args.iter().map(|arg| arg.as_ref()), context)?;
                 common_type_ordering(args.iter().map(|arg| (arg.as_ref(), context)))?;
+            }
+            if func
+                .as_ref()
+                .is_some_and(|func| func.arguments_are_values_of_one_array())
+            {
+                check_comparable_array_values(args.iter().map(|arg| arg.as_ref()), context)?;
             }
             // The result is one of these arguments, so they have one type. A function
             // that needs a collation, such as min and max, was checked above.
@@ -1013,6 +1023,24 @@ pub(crate) fn check_comparable_results<'a>(
 ) -> Result<()> {
     let env = context.type_env();
     check_comparable_types(exprs.map(|expr| (type_of(expr, &env), context.schema())))
+}
+
+/// [check_comparable] for every pair of values of one array, where `args`
+/// are the arguments of a function whose
+/// [arguments_are_values_of_one_array](crate::function::Func::arguments_are_values_of_one_array)
+/// holds: each argument that is not an array, and the elements of each one that is.
+fn check_comparable_array_values<'a>(
+    args: impl Iterator<Item = &'a Expr>,
+    context: &ExprContext<'_, '_>,
+) -> Result<()> {
+    let env = context.type_env();
+    check_comparable_types(args.map(|arg| {
+        let value_type = match type_of(arg, &env) {
+            ExprType::Array { element, .. } => *element,
+            ty => ty,
+        };
+        (value_type, context.schema())
+    }))
 }
 
 /// [check_comparable] for every pair of `types`. This is the one place that
