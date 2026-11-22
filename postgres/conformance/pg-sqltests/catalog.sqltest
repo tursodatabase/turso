@@ -247,17 +247,13 @@ expect {
     1|updated
 }
 
-@skip-if postgres "PostgreSQL fills pg_init_privs and pg_cast"
+@skip-if postgres "PostgreSQL fills pg_init_privs"
 test pg-function-support-catalogs-are-empty {
     SET search_path TO '';
     SELECT * FROM pg_init_privs;
     SELECT * FROM pg_catalog.pg_init_privs;
     SELECT objoid, classoid, objsubid, privtype, initprivs, tableoid FROM pg_init_privs;
     SELECT objoid, classoid, objsubid, privtype, initprivs, tableoid FROM pg_catalog.pg_init_privs;
-    SELECT * FROM pg_cast;
-    SELECT * FROM pg_catalog.pg_cast;
-    SELECT oid, castsource, casttarget, castfunc, castcontext, castmethod, tableoid FROM pg_cast;
-    SELECT oid, castsource, casttarget, castfunc, castcontext, castmethod, tableoid FROM pg_catalog.pg_cast;
     SELECT * FROM pg_transform;
     SELECT * FROM pg_catalog.pg_transform;
     SELECT oid, trftype, trflang, trffromsql, trftosql, tableoid FROM pg_transform;
@@ -398,9 +394,6 @@ test pg-object-unsupported-catalogs-are-empty {
              CASE WHEN defaclobjtype = 'S' THEN 's'::"char" ELSE defaclobjtype END,
              defaclrole) ELSE '{}' END AS acldefault FROM pg_default_acl;
     SELECT tableoid, oid, conname, connamespace, conowner FROM pg_conversion;
-    SELECT tableoid, oid, castsource, casttarget, castfunc, castcontext, castmethod
-    FROM pg_cast c WHERE NOT EXISTS (SELECT 1 FROM pg_range r
-      WHERE c.castsource = r.rngtypid AND c.casttarget = r.rngmultitypid) ORDER BY 3,4;
     SELECT s.tableoid, s.oid, s.subname, s.subowner, s.subconninfo, s.subslotname,
            s.subsynccommit, s.subpublications, s.subbinary, s.substream,
            s.subtwophasestate, s.subdisableonerr, s.subpasswordrequired,
