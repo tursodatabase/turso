@@ -1734,8 +1734,18 @@ impl ProgramBuilder {
         // One more slot for the `Goto` that `epilogue` emits after the constant
         // instructions. Without it, that push copies the whole program to a
         // larger buffer.
-        let mut non_constant = Vec::with_capacity(self.insns.len() + 1);
-        let mut constant = Vec::new();
+        let len = self.insns.len();
+        let mut non_constant = Vec::with_capacity(len + 1);
+        // The spans are inclusive, so their lengths add up to the number of
+        // constant instructions. A `Vec` that starts empty copies all of its
+        // instructions each time it doubles.
+        let num_constant = self
+            .constant_spans
+            .iter()
+            .map(|&(start, end)| end.saturating_add(1).min(len).saturating_sub(start))
+            .sum::<usize>()
+            .min(len);
+        let mut constant = Vec::with_capacity(num_constant);
         let mut span_idx = 0;
 
         for item in self.insns.drain(..) {
