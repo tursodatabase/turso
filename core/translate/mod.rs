@@ -572,6 +572,7 @@ fn translate_statement(
             min_value,
             max_value,
             cycle,
+            option_error,
         } => {
             sequence::translate_create_sequence(
                 &seq_name,
@@ -581,6 +582,7 @@ fn translate_statement(
                 &min_value,
                 &max_value,
                 cycle,
+                option_error,
                 resolver,
                 connection,
                 program,

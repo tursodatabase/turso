@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use turso_core::security::permission::{Action, Object, PermissionDenied, Reason};
 use turso_core::{ConstraintKind, ConstraintViolation, DialectError, LimboError, Value};
 use turso_pg_parser::sqlstate::*;
@@ -62,7 +64,7 @@ pub fn sqlstate_error(
     detail: Option<String>,
 ) -> LimboError {
     LimboError::Dialect(Box::new(DialectError {
-        code: sqlstate,
+        code: Cow::Borrowed(sqlstate),
         message: message.into(),
         detail,
         hint: None,
@@ -78,7 +80,7 @@ pub fn several_dropped_objects_have_dependents(error: LimboError) -> LimboError 
         return error;
     };
     LimboError::Dialect(Box::new(DialectError {
-        code: SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+        code: Cow::Borrowed(SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST),
         message: "cannot drop desired object(s) because other objects depend on them".into(),
         detail: Some(refusal.dependents.join("\n")),
         hint: Some(DROP_CASCADE_HINT.into()),
@@ -91,7 +93,7 @@ pub fn several_dropped_objects_have_dependents(error: LimboError) -> LimboError 
 /// it drops, with the DROP statement that removes that kind.
 pub fn wrong_relation_kind(name: &str, expected_kind: &str, kind: &str) -> LimboError {
     LimboError::Dialect(Box::new(DialectError {
-        code: SQLSTATE_WRONG_OBJECT_TYPE,
+        code: Cow::Borrowed(SQLSTATE_WRONG_OBJECT_TYPE),
         message: format!("\"{name}\" is not a {expected_kind}"),
         detail: None,
         hint: Some(format!(
@@ -123,7 +125,7 @@ pub(crate) fn in_failed_sql_transaction_error() -> LimboError {
 
 #[derive(Debug, Clone)]
 pub struct ErrorReport {
-    pub sqlstate: &'static str,
+    pub sqlstate: Cow<'static, str>,
     pub message: String,
     pub detail: Option<String>,
     pub hint: Option<String>,
@@ -281,7 +283,15 @@ fn format_value(value: &Value) -> String {
     }
 }
 
-pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
+pub(crate) fn sqlstate(error: &LimboError) -> Cow<'static, str> {
+    if let LimboError::Dialect(error) = error {
+        return error.code.clone();
+    }
+    Cow::Borrowed(static_sqlstate(error))
+}
+
+/// The SQLSTATE of every error that a dialect did not give a code.
+fn static_sqlstate(error: &LimboError) -> &'static str {
     match error {
         LimboError::ConstraintViolation(cv) => match cv.kind {
             ConstraintKind::PrimaryKey | ConstraintKind::Unique => SQLSTATE_UNIQUE_VIOLATION,
@@ -336,7 +346,7 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::Raise(_, error) => raise_sqlstate(&error.to_string()),
         LimboError::RaiseIgnore => SQLSTATE_ASSERT_FAILURE,
         LimboError::Corrupt(_) | LimboError::NotADB => SQLSTATE_DATA_CORRUPTED,
-        LimboError::Dialect(error) => error.code,
+        LimboError::Dialect(_) => unreachable!("handled by sqlstate"),
         LimboError::PermissionDenied(_) => SQLSTATE_INSUFFICIENT_PRIVILEGE,
         LimboError::DependentObjects(_) => SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
         _ => SQLSTATE_INTERNAL_ERROR,

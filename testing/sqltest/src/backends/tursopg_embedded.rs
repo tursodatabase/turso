@@ -166,9 +166,10 @@ fn run_query(conn: &Connection, sql: &str) -> QueryResult {
     let mut rows = Vec::new();
     match run_statements(conn, sql, &mut rows) {
         Ok(()) => QueryResult::success(rows),
-        Err(error) => {
-            QueryResult::error_with_sqlstate(error.message.clone(), Some(error.sqlstate.into()))
-        }
+        Err(error) => QueryResult::error_with_sqlstate(
+            error.message.clone(),
+            Some(error.sqlstate.to_string()),
+        ),
     }
 }
 

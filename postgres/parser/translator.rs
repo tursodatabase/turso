@@ -604,6 +604,7 @@ impl PostgreSQLTranslator {
                 min_value: sequence.options.min_value,
                 max_value: sequence.options.max_value,
                 cycle: sequence.options.cycle,
+                option_error: None,
             })
             .collect();
         // PostgreSQL links a serial column's sequence to the column once the
@@ -644,6 +645,11 @@ impl PostgreSQLTranslator {
             return Err(ParseError::not_supported("ALTER SEQUENCE IF EXISTS"));
         }
         let seq_name = self.qualified_name_from_range_var(sequence)?;
+        // PostgreSQL scans the option names before reading any of them, so a
+        // repeated OWNED BY reports even when both values would parse.
+        if reject_repeated_options(&alter.options) {
+            return Err(conflicting_options());
+        }
         let mut owner = None;
         for option in &alter.options {
             let Some(Node::DefElem(elem)) = option.node.as_ref() else {
@@ -5700,7 +5706,28 @@ impl PostgreSQLTranslator {
         let seq_name = self.qualified_name_from_range_var(relation)?;
         reject_temporary(relation, "CREATE TEMPORARY SEQUENCE")?;
 
-        let options = SequenceOptions::new(&seq.options, None)?;
+        // PostgreSQL handles the option list only once it knows the
+        // sequence gets created: IF NOT EXISTS on a taken name skips the
+        // statement entirely, including every option error. Defer any such
+        // error onto the statement and let the executor report it after the
+        // existence check; without IF NOT EXISTS nothing skips it, so it
+        // fails right here.
+        let options = match SequenceOptions::new(&seq.options, None) {
+            Ok(options) => options,
+            Err(error) if seq.if_not_exists => {
+                return Ok(ast::Stmt::CreateSequence {
+                    if_not_exists: true,
+                    seq_name,
+                    start: None,
+                    increment: None,
+                    min_value: None,
+                    max_value: None,
+                    cycle: false,
+                    option_error: Some(Box::new(ast::SequenceOptionError::from(error))),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         Ok(ast::Stmt::CreateSequence {
             if_not_exists: seq.if_not_exists,
             seq_name,
@@ -5709,6 +5736,7 @@ impl PostgreSQLTranslator {
             min_value: options.min_value,
             max_value: options.max_value,
             cycle: options.cycle,
+            option_error: None,
         })
     }
 
@@ -6306,9 +6334,11 @@ impl SequenceOptions {
         let mut cycle = false;
 
         let mut as_type = data_type.map(str::to_string);
-        let mut seen = std::collections::HashSet::new();
         let mut as_type_name = None;
         let mut cache = None;
+        if reject_repeated_options(options) {
+            return Err(conflicting_options());
+        }
         for opt_node in options {
             if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
                 if matches!(
@@ -6322,9 +6352,8 @@ impl SequenceOptions {
                         elem.defname.to_uppercase()
                     )));
                 }
-                let is_repeated = !seen.insert(elem.defname.as_str())
-                    || (elem.defname == "as" && data_type.is_some());
-                if is_repeated {
+                // AS repeats the data type the sequence already has.
+                if elem.defname == "as" && data_type.is_some() {
                     return Err(conflicting_options());
                 }
                 match elem.defname.as_str() {
@@ -6478,10 +6507,25 @@ fn type_does_not_exist(name: &str) -> ParseError {
     }
 }
 
-fn conflicting_options() -> ParseError {
+pub(crate) fn conflicting_options() -> ParseError {
     ParseError::Sqlstate {
         sqlstate: SQLSTATE_SYNTAX_ERROR,
         message: "conflicting or redundant options".to_string(),
+    }
+}
+
+impl From<ParseError> for ast::SequenceOptionError {
+    fn from(error: ParseError) -> Self {
+        match error {
+            ParseError::Sqlstate { sqlstate, message } => Self {
+                code: Some(sqlstate.to_string()),
+                message,
+            },
+            other => Self {
+                code: None,
+                message: other.to_string(),
+            },
+        }
     }
 }
 
@@ -7128,19 +7172,15 @@ fn translate_create_role(
         }
     }
     let mut options = ast::RoleOptions::default();
-    let mut seen = std::collections::HashSet::new();
+    if reject_repeated_options(&stmt.options) {
+        return Err(conflicting_options());
+    }
     for option in &stmt.options {
         let Some(pg_query::protobuf::node::Node::DefElem(elem)) = option.node.as_ref() else {
             return Err(ParseError::ParseError(
                 "CREATE ROLE: invalid role option".to_string(),
             ));
         };
-        if !seen.insert(elem.defname.as_str()) {
-            return Err(ParseError::Sqlstate {
-                sqlstate: SQLSTATE_SYNTAX_ERROR,
-                message: "conflicting or redundant options".to_string(),
-            });
-        }
         match elem.defname.as_str() {
             "inherit" => options.inherit = extract_def_elem_bool(elem),
             "bypassrls" => options.bypassrls = extract_def_elem_bool(elem),
@@ -9570,6 +9610,12 @@ pub fn try_extract_copy_from(
         Some(extract_key_columns(&copy.attlist)?)
     };
 
+    // PostgreSQL checks for a repeated option name before looking at any
+    // option's value.
+    if reject_repeated_options(&copy.options) {
+        return Err(conflicting_options());
+    }
+
     let mut delimiter = None;
     let mut header = false;
     let mut null_string = None;
@@ -9651,6 +9697,20 @@ pub fn try_extract_copy_from(
         header,
         null_string,
     }))
+}
+
+/// PostgreSQL scans option names before looking at any option's value and
+/// reports "conflicting or redundant options" on a repeat; pg_query emits
+/// an option and its NO form under the same defname.
+pub(crate) fn reject_repeated_options(options: &[pg_query::protobuf::Node]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    options.iter().any(|option| {
+        matches!(
+            &option.node,
+            Some(pg_query::protobuf::node::Node::DefElem(elem))
+                if !seen.insert(elem.defname.as_str())
+        )
+    })
 }
 
 /// A statement that the PostgreSQL frontend runs itself instead of
@@ -13263,6 +13323,29 @@ mod tests {
     }
 
     #[test]
+    fn copy_from_rejects_repeated_options() {
+        for sql in [
+            "COPY t FROM '/tmp/d' WITH (DELIMITER ',', DELIMITER ';')",
+            "COPY t FROM '/tmp/d' WITH (NULL '', NULL 'x')",
+            "COPY t FROM '/tmp/d' WITH (HEADER true, HEADER false)",
+            "COPY t FROM '/tmp/d' WITH (FORMAT text, FORMAT text)",
+            "COPY t FROM '/tmp/d' WITH (ENCODING 'utf8', ENCODING 'utf-8')",
+            "COPY t FROM '/tmp/d' WITH (FREEZE false, FREEZE true)",
+            "COPY t FROM '/tmp/d' DELIMITER ',' DELIMITER ';'",
+            // PostgreSQL reports the repeat, not the bad first value.
+            "COPY t FROM '/tmp/d' WITH (DELIMITER '::', DELIMITER ',')",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let err = try_extract_copy_from(&parsed).expect_err(sql);
+            let ParseError::Sqlstate { sqlstate, message } = &err else {
+                panic!("{sql}: {err}")
+            };
+            assert_eq!(*sqlstate, SQLSTATE_SYNTAX_ERROR, "{sql}");
+            assert_eq!(message, "conflicting or redundant options", "{sql}");
+        }
+    }
+
+    #[test]
     fn test_try_extract_copy_from_with_columns() {
         let parsed = crate::parse("COPY users (id, name) FROM '/tmp/data.tsv'").unwrap();
         let copy = try_extract_copy_from(&parsed).unwrap().unwrap();
@@ -14625,6 +14708,93 @@ mod tests {
         };
         assert_eq!(min_value, Some(i16::MIN as i64));
         assert_eq!(max_value, None);
+    }
+
+    #[test]
+    fn create_sequence_rejects_repeated_options() {
+        for sql in [
+            "CREATE SEQUENCE s START 1 START 2",
+            "CREATE SEQUENCE s START WITH 1 START 2",
+            "CREATE SEQUENCE s INCREMENT 1 INCREMENT 2",
+            "CREATE SEQUENCE s MINVALUE 1 NO MINVALUE",
+            "CREATE SEQUENCE s NO MINVALUE NO MINVALUE",
+            "CREATE SEQUENCE s NO MAXVALUE MAXVALUE 5",
+            "CREATE SEQUENCE s CYCLE NO CYCLE",
+            "CREATE SEQUENCE s CACHE 1 CACHE 2",
+            "CREATE SEQUENCE s AS int AS bigint",
+            "CREATE SEQUENCE s OWNED BY NONE OWNED BY NONE",
+            "CREATE SEQUENCE s MINVALUE 1 START 2 MINVALUE 3",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let err = PostgreSQLTranslator::new()
+                .translate_with_prereqs(&parsed)
+                .expect_err(sql);
+            let ParseError::Sqlstate { sqlstate, message } = &err else {
+                panic!("{sql}: {err}")
+            };
+            assert_eq!(*sqlstate, SQLSTATE_SYNTAX_ERROR, "{sql}");
+            assert_eq!(message, "conflicting or redundant options", "{sql}");
+        }
+        assert_translates("CREATE SEQUENCE s NO MINVALUE NO MAXVALUE START 1 INCREMENT 2");
+    }
+
+    #[test]
+    fn alter_sequence_rejects_repeated_options() {
+        let parsed = crate::parse("ALTER SEQUENCE s OWNED BY t.a OWNED BY NONE").unwrap();
+        let err = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&parsed)
+            .expect_err("repeated OWNED BY");
+        let ParseError::Sqlstate { sqlstate, message } = &err else {
+            panic!("{err}")
+        };
+        assert_eq!(*sqlstate, SQLSTATE_SYNTAX_ERROR);
+        assert_eq!(message, "conflicting or redundant options");
+        assert_translates("ALTER SEQUENCE s OWNED BY t.a");
+    }
+
+    #[test]
+    fn create_sequence_if_not_exists_defers_option_errors() {
+        // Under IF NOT EXISTS every option error waits on the statement: the
+        // executor checks whether the name is taken before reporting it.
+        for (sql, sqlstate, message) in [
+            (
+                "CREATE SEQUENCE IF NOT EXISTS s START 1 START 2",
+                SQLSTATE_SYNTAX_ERROR,
+                "conflicting or redundant options",
+            ),
+            (
+                "CREATE SEQUENCE IF NOT EXISTS s CACHE 0",
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "CACHE (0) must be greater than zero",
+            ),
+            (
+                "CREATE SEQUENCE IF NOT EXISTS s AS text",
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "sequence type must be smallint, integer, or bigint",
+            ),
+            (
+                "CREATE SEQUENCE IF NOT EXISTS s START 1.5",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "this START value in CREATE SEQUENCE is not supported",
+            ),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let result = PostgreSQLTranslator::new()
+                .translate_with_prereqs(&parsed)
+                .unwrap();
+            let ast::Cmd::Stmt(ast::Stmt::CreateSequence {
+                if_not_exists,
+                option_error,
+                ..
+            }) = result.cmd
+            else {
+                panic!("{sql}: expected CREATE SEQUENCE, got {:?}", result.cmd)
+            };
+            assert!(if_not_exists, "{sql}");
+            let error = option_error.expect(sql);
+            assert_eq!(error.code.as_deref(), Some(sqlstate), "{sql}");
+            assert_eq!(error.message, message, "{sql}");
+        }
     }
 
     #[test]

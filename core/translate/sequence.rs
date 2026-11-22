@@ -40,7 +40,7 @@ use crate::vdbe::insn::{
     to_u32, AddSequenceData, CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral,
 };
 use crate::Connection;
-use crate::Result;
+use crate::{DialectError, LimboError, Result};
 use turso_parser::ast;
 
 pub fn sequence_backing_table_name(seq_name: &str) -> String {
@@ -1021,6 +1021,7 @@ pub fn translate_create_sequence(
     min_value: &Option<i64>,
     max_value: &Option<i64>,
     cycle: bool,
+    option_error: Option<Box<ast::SequenceOptionError>>,
     resolver: &Resolver,
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
@@ -1078,6 +1079,21 @@ pub fn translate_create_sequence(
             return Ok(());
         }
         bail_parse_error!("sequence \"{}\" already exists", normalized_name);
+    }
+
+    // PostgreSQL validates the option list only for a sequence it is about
+    // to create, so an error deferred here by the frontend reports after the
+    // existence check, never on the IF NOT EXISTS skip path above.
+    if let Some(error) = option_error {
+        return Err(match error.code {
+            Some(code) => LimboError::Dialect(Box::new(DialectError {
+                code: code.into(),
+                message: error.message,
+                detail: None,
+                hint: None,
+            })),
+            None => LimboError::ParseError(error.message),
+        });
     }
 
     // Validate parameters early (gives immediate error instead of deferred)

@@ -564,6 +564,16 @@ expect error {
     type "INT4" does not exist
 }
 
+test create-sequence-if-not-exists-on-a-taken-name-skips-option-errors {
+    DROP SEQUENCE IF EXISTS zz_seq_if_not_exists;
+    CREATE SEQUENCE zz_seq_if_not_exists;
+    CREATE SEQUENCE IF NOT EXISTS zz_seq_if_not_exists CACHE 0;
+    CREATE SEQUENCE IF NOT EXISTS zz_seq_if_not_exists AS text;
+    CREATE SEQUENCE IF NOT EXISTS zz_seq_if_not_exists START 1 START 2;
+}
+expect {
+}
+
 test create-sequence-reports-a-repeated-option-before-a-bad-cache {
     DROP SEQUENCE IF EXISTS zz_seq_cache_order;
     CREATE SEQUENCE zz_seq_cache_order CACHE 0 START 1 START 9;

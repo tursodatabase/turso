@@ -1868,11 +1868,15 @@ mod tests {
         PgConnection::connect(&db).unwrap()
     }
 
-    fn sqlstate(error: PgWireError) -> &'static str {
+    fn sqlstate(error: PgWireError) -> String {
         let PgWireError::ApiError(error) = error else {
             panic!("not an SQL error: {error:?}");
         };
-        error.downcast::<turso_pg::Error>().unwrap().sqlstate
+        error
+            .downcast::<turso_pg::Error>()
+            .unwrap()
+            .sqlstate
+            .to_string()
     }
 
     #[test]
