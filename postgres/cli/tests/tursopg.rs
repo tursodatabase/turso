@@ -1242,6 +1242,7 @@ const OID_INT4: u32 = 23;
 const OID_TEXT: u32 = 25;
 const OID_FLOAT4: u32 = 700;
 const OID_FLOAT8: u32 = 701;
+const OID_NUMERIC: u32 = 1700;
 
 /// Walk raw PG wire bytes, find the first ErrorResponse ('E') message, and
 /// return its fields as a map from the one-byte field type to the value string.
@@ -1521,13 +1522,12 @@ fn wire_server_version_parameter_matches_version_function() {
     });
 }
 
-/// `SELECT 3.14` reports FLOAT8. PG normally returns NUMERIC for unannotated
-/// numeric literals; FLOAT8 is the tursopg choice because Turso stores
-/// reals as 64-bit floats and the client decodes the wire bytes directly.
+/// `SELECT 3.14` reports NUMERIC, as PostgreSQL does for a decimal written in
+/// the statement.
 #[test]
-fn wire_real_literal_reports_float8() {
+fn wire_decimal_literal_reports_numeric() {
     with_pg_client(|c| {
-        assert_eq!(c.query_column_oids("SELECT 3.14"), vec![OID_FLOAT8]);
+        assert_eq!(c.query_column_oids("SELECT 3.14"), vec![OID_NUMERIC]);
     });
 }
 
@@ -1555,12 +1555,12 @@ fn wire_integer_arithmetic_reports_int4() {
     });
 }
 
-/// Mixed numeric arithmetic widens INTEGER+REAL → REAL → wire FLOAT8.
+/// An integer with a decimal gives a NUMERIC, as in PostgreSQL.
 #[test]
-fn wire_mixed_arithmetic_widens_to_float8() {
+fn wire_mixed_arithmetic_widens_to_numeric() {
     with_pg_client(|c| {
-        assert_eq!(c.query_column_oids("SELECT 42 + 1.5"), vec![OID_FLOAT8]);
-        assert_eq!(c.query_column_oids("SELECT 3.14 * 2"), vec![OID_FLOAT8]);
+        assert_eq!(c.query_column_oids("SELECT 42 + 1.5"), vec![OID_NUMERIC]);
+        assert_eq!(c.query_column_oids("SELECT 3.14 * 2"), vec![OID_NUMERIC]);
     });
 }
 
@@ -1662,7 +1662,7 @@ fn wire_multi_column_select_classifies_each() {
     with_pg_client(|c| {
         assert_eq!(
             c.query_column_oids("SELECT 1, 'two', 3.0, 1 + 1, 'a' || 'b'"),
-            vec![OID_INT4, OID_TEXT, OID_FLOAT8, OID_INT4, OID_TEXT]
+            vec![OID_INT4, OID_TEXT, OID_NUMERIC, OID_INT4, OID_TEXT]
         );
     });
 }

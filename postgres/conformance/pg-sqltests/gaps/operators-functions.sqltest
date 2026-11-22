@@ -818,15 +818,11 @@ expect {
 }
 
 # B-82: integer division truncates
-@compat-gap "type:numeric"
 test integer-division-truncates {
     SELECT 5 / 2, -7 / 2, 7 % 3, 5 / 2.0;
 }
 expect {
     2|-3|1|2.5000000000000000
-}
-expect @tursopg {
-    2|-3|1|2.5
 }
 
 # B-83: ^ is power

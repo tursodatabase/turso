@@ -3968,8 +3968,9 @@ impl PostgreSQLTranslator {
                 pg_query::protobuf::a_const::Val::Fval(f) => {
                     let text =
                         non_decimal_literal_as_decimal(&f.fval).unwrap_or_else(|| f.fval.clone());
-                    Ok(integer_literal_beyond_int4(&text)
-                        .unwrap_or(ast::Expr::Literal(ast::Literal::Numeric(text))))
+                    Ok(integer_literal_beyond_int4(&text).unwrap_or_else(|| {
+                        typed_integer_literal(ast::Literal::String(format!("'{text}'")), "numeric")
+                    }))
                 }
                 pg_query::protobuf::a_const::Val::Boolval(b) => Ok(ast::Expr::Cast {
                     expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
@@ -11262,11 +11263,7 @@ mod tests {
 
                 // Check float literal
                 if let ast::ResultColumn::Expr(expr, _) = &columns[2] {
-                    if let ast::Expr::Literal(ast::Literal::Numeric(n)) = &**expr {
-                        assert_eq!(n, "3.14");
-                    } else {
-                        panic!("Expected numeric literal");
-                    }
+                    assert_eq!(expr.to_string(), "CAST ('3.14' AS numeric)");
                 } else {
                     panic!("Expected expression result column");
                 }
