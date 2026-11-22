@@ -380,6 +380,24 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "int8not"(FunctionArity::Exact(1), true) => {
             crate::pg_types::exec_integer_not(args[0].get_value())?
         },
+        "int2shl"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_shift(args, true, 16)?
+        },
+        "int2shr"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_shift(args, false, 16)?
+        },
+        "int4shl"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_shift(args, true, 32)?
+        },
+        "int4shr"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_shift(args, false, 32)?
+        },
+        "int8shl"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_shift(args, true, 64)?
+        },
+        "int8shr"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_shift(args, false, 64)?
+        },
         "int4um"(FunctionArity::Exact(1), true) => {
             crate::pg_types::exec_integer_negate(args[0].get_value(), 32)?
         },

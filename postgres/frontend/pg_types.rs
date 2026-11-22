@@ -173,13 +173,15 @@ fn integer_operators(width: IntegerWidth) -> Vec<OperatorSignature> {
         signatures.push(signature(op, vec![Value, Untyped], None, own_type));
         signatures.push(signature(op, vec![Untyped, Value], None, own_type));
     }
-    for op in ["<<", ">>"] {
-        signatures.push(signature(
-            op,
-            vec![Value, PlainValue],
-            None,
-            width.type_name,
-        ));
+    for (op, suffix) in [("<<", "shl"), (">>", "shr")] {
+        let own = || Some(format!("{}{suffix}", width.prefix));
+        let mut counts = vec![PlainValue, UntypedInteger, Type("int4"), Type("smallint")];
+        if width.type_name != "bigint" {
+            counts.push(Value);
+        }
+        for count in counts {
+            signatures.push(signature(op, vec![Value, count], own(), width.type_name));
+        }
         signatures.push(signature(
             op,
             vec![PlainValue, Value],
@@ -251,6 +253,41 @@ pub(crate) fn exec_integer_not(value: &Value) -> Result<Value> {
             other => Ok(number(other).map_or(Value::Null, |n| Value::from_i64(!(n as i64)))),
         },
     }
+}
+
+/// `int2shl`, `int4shr` and the like: the shift of an integer of `bits` bits.
+/// The count wraps at the width of the machine integer, as PostgreSQL's does
+/// on the processors it runs on, and an int2 shifts as an int4 and is cut
+/// back to 16 bits.
+pub(crate) fn exec_integer_shift(args: &[Register], left: bool, bits: u32) -> Result<Value> {
+    let (value, count) = (args[0].get_value(), args[1].get_value());
+    if matches!(value, Value::Null) || matches!(count, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let (Some(value), Some(count)) = (integer(value)?, integer(count)?) else {
+        return Ok(Value::Null);
+    };
+    let shifted = if bits == 64 {
+        let count = (count & 63) as u32;
+        if left {
+            value.wrapping_shl(count)
+        } else {
+            value >> count
+        }
+    } else {
+        let (value, count) = (value as i32, (count & 31) as u32);
+        let shifted = if left {
+            value.wrapping_shl(count)
+        } else {
+            value >> count
+        };
+        if bits == 16 {
+            i64::from(shifted as i16)
+        } else {
+            i64::from(shifted)
+        }
+    };
+    Ok(Value::from_i64(shifted))
 }
 
 /// `int2um`, `int4um` and `int8um`: the negation as an integer of `bits` bits.
