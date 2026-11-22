@@ -670,6 +670,10 @@ fn emit_percentile_fraction_check(
 
     let fraction_reg = program.alloc_register();
     translate_expr(program, Some(tables), &agg.args[1], fraction_reg, resolver)?;
+    program.emit_insn(Insn::Cast {
+        reg: fraction_reg,
+        affinity: crate::vdbe::affinity::Affinity::Real,
+    });
 
     // NULL skips the range check and propagates to a NULL result in finalize.
     // Use one scratch register for both bounds: success falls through to `done`
