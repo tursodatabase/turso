@@ -4,6 +4,7 @@ use crate::roles::{connection_roles, schema_roles, Role, RoleCatalog};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::marker::PhantomData;
+use std::str::FromStr;
 use std::sync::Arc;
 use turso_core::schema::{RelationKind, ResolvedType};
 use turso_core::ProgramState;
@@ -438,9 +439,10 @@ impl Dialect for PostgresDialect {
 
         // First check whether this is a direct PostgreSQL integer type.
         let integer_width = match name.to_ascii_uppercase().as_str() {
-            "INT2" | "SMALLINT" | "BOOLINT" => Some(IntegerWidth::Int16),
-            "INT4" | "INTEGER" | "INT" => Some(IntegerWidth::Int32),
-            "INT8" | "BIGINT" => Some(IntegerWidth::Int64),
+            "INT2" | "SMALLINT" => Some(String::from_str("INT2").unwrap()),
+            "INT4" | "INTEGER" | "INT" => Some(String::from_str("INT4").unwrap()),
+            "INT8" | "BIGINT" => Some(String::from_str("INT8").unwrap()),
+            "BOOLINT" => Some(String::from_str("BOOLINT").unwrap()),
             _ => None,
         };
 
@@ -462,30 +464,18 @@ impl Dialect for PostgresDialect {
 
         let metadata_reg_first = program.alloc_registers(2);
 
-        if matches!(name.to_ascii_uppercase().as_str(), "BOOLINT") {
-            // all non decimal strings are cast to 0 for INTEGER affinity
-            program.emit_insn(Insn::Int64 {
-                _p1: 0,
-                out_reg: metadata_reg_first,
-                _p3: 0,
-                value: 0,
-            })
-        } else {
-            // Preserve the original operand.
-            program.emit_insn(Insn::Copy {
-                src_reg: target_register,
-                dst_reg: metadata_reg_first,
-                extra_amount: 0,
-            });
-        }
+        // Preserve the original operand.
+        program.emit_insn(Insn::Copy {
+            src_reg: target_register,
+            dst_reg: metadata_reg_first,
+            extra_amount: 0,
+        });
 
         // Store either the direct integer width or the domain name.
         if let Some(width) = integer_width {
-            program.emit_insn(Insn::Int64 {
-                _p1: 0,
-                out_reg: metadata_reg_first + 1,
-                _p3: 0,
-                value: width as i64,
+            program.emit_insn(Insn::String8 {
+                value: width,
+                dest: metadata_reg_first + 1,
             });
         } else if let Some(domain_name) = domain_name {
             program.emit_insn(Insn::String8 {
@@ -523,25 +513,23 @@ impl Dialect for PostgresDialect {
         let metadata = program.get_register((*pointer + 1) as usize).get_value();
 
         let integer_width = match metadata {
-            Value::Numeric(Numeric::Integer(width)) => {
-                IntegerWidth::try_from(*width).map_err(|_| {
-                    LimboError::InternalError(format!(
-                        "invalid PostgreSQL integer width metadata: {width}"
-                    ))
-                })?
-            }
+            Value::Text(cast_type) => match cast_type.as_ref() {
+                "INT2" => IntegerWidth::Int16,
+                "INT4" => IntegerWidth::Int32,
+                "INT8" => IntegerWidth::Int64,
+                "BOOLINT" => return Ok(operand.exec_cast("INTEGER")?),
+                _ => {
+                    let resolved = schema
+                        .resolve_type_unchecked(cast_type.as_ref())?
+                        .ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "PostgreSQL domain {cast_type} is not registered"
+                            ))
+                        })?;
 
-            Value::Text(domain_name) => {
-                let resolved = schema
-                    .resolve_type_unchecked(domain_name.as_ref())?
-                    .ok_or_else(|| {
-                        LimboError::InternalError(format!(
-                            "PostgreSQL domain {domain_name} is not registered"
-                        ))
-                    })?;
-
-                integer_width_from_resolved_type(&resolved)?
-            }
+                    integer_width_from_resolved_type(&resolved)?
+                }
+            },
 
             _ => {
                 return Err(LimboError::InternalError(
