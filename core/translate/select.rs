@@ -972,6 +972,19 @@ fn prepare_one_select_plan(
                 connection,
             )?;
 
+            // The values of a column are one result, so they have one type.
+            let context =
+                crate::translate::expr_context::ExprContext::new(Some(&table_references), resolver);
+            for column in 0..len {
+                crate::translate::collate::check_comparable_results(
+                    values
+                        .iter()
+                        .filter_map(|row| row.get(column))
+                        .map(|v| v.as_ref()),
+                    &context,
+                )?;
+            }
+
             let plan = SelectPlan {
                 join_order: vec![],
                 table_references,

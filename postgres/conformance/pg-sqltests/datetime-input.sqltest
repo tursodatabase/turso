@@ -1033,6 +1033,105 @@ expect @tursopg error {
     cannot compare type timestamp with type timestamptz
 }
 
+@compat-gap "operator:timestamp UNION timestamptz"
+@setup datetime-compare-ts-tz-no-index
+test datetime-result-union {
+    SELECT ts FROM a UNION SELECT tz FROM b ORDER BY 1;
+}
+expect {
+    2024-01-05 09:00:00+00
+    2024-01-05 10:00:00+00
+    2024-01-05 11:00:00+00
+}
+@sqlstate 42883
+expect @tursopg error {
+    cannot compare type timestamp with type timestamptz
+}
+
+@compat-gap "operator:timestamp UNION ALL timestamptz"
+@setup datetime-compare-ts-tz-no-index
+test datetime-result-union-all {
+    SELECT ts FROM a UNION ALL SELECT tz FROM b ORDER BY 1;
+}
+expect {
+    2024-01-05 09:00:00+00
+    2024-01-05 10:00:00+00
+    2024-01-05 10:00:00+00
+    2024-01-05 10:00:00+00
+    2024-01-05 11:00:00+00
+}
+@sqlstate 42883
+expect @tursopg error {
+    cannot compare type timestamp with type timestamptz
+}
+
+@compat-gap "operator:timestamp INTERSECT timestamptz"
+@setup datetime-compare-ts-tz-no-index
+test datetime-result-intersect {
+    SELECT ts FROM a INTERSECT SELECT tz FROM b ORDER BY 1;
+}
+expect {
+    2024-01-05 10:00:00+00
+}
+@sqlstate 42883
+expect @tursopg error {
+    cannot compare type timestamp with type timestamptz
+}
+
+@compat-gap "operator:timestamp EXCEPT timestamptz"
+@setup datetime-compare-ts-tz-no-index
+test datetime-result-except {
+    SELECT ts FROM a EXCEPT SELECT tz FROM b ORDER BY 1;
+}
+expect {
+    2024-01-05 09:00:00+00
+    2024-01-05 11:00:00+00
+}
+@sqlstate 42883
+expect @tursopg error {
+    cannot compare type timestamp with type timestamptz
+}
+
+@compat-gap "operator:timestamp coalesce timestamptz"
+@setup datetime-compare-ts-tz-no-index
+test datetime-result-coalesce {
+    SELECT coalesce(a.ts, b.tz) FROM a, b WHERE a.id = 1 AND b.id = 1;
+}
+expect {
+    2024-01-05 09:00:00+00
+}
+@sqlstate 42883
+expect @tursopg error {
+    cannot compare type timestamp with type timestamptz
+}
+
+@compat-gap "operator:timestamp CASE timestamptz"
+@setup datetime-compare-ts-tz-no-index
+test datetime-result-case {
+    SELECT CASE WHEN a.id = 1 THEN a.ts ELSE b.tz END FROM a, b WHERE a.id = 1 AND b.id = 1;
+}
+expect {
+    2024-01-05 09:00:00+00
+}
+@sqlstate 42883
+expect @tursopg error {
+    cannot compare type timestamp with type timestamptz
+}
+
+@compat-gap "operator:timestamp VALUES timestamptz"
+@setup datetime-compare-ts-tz-no-index
+test datetime-result-values {
+    SELECT * FROM (VALUES ('2024-01-05 09:00:00'::timestamp), ('2024-01-05 10:00:00+00'::timestamptz)) v(x) ORDER BY 1;
+}
+expect {
+    2024-01-05 09:00:00+00
+    2024-01-05 10:00:00+00
+}
+@sqlstate 42883
+expect @tursopg error {
+    cannot compare type timestamp with type timestamptz
+}
+
 # No operator compares a timestamptz with a varchar, in either backend.
 test datetime-compare-timestamptz-eq-varchar-is-an-error {
     CREATE TABLE tv (tz timestamptz, v varchar(40));

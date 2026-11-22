@@ -201,10 +201,12 @@ domains over one type compare as that type. So a `timestamp` with a
 The error is `cannot compare type x with type y` with SQLSTATE 42883, as
 PostgreSQL gives when no comparison operator exists. It covers `=`, `<`,
 `IS DISTINCT FROM`, BETWEEN, IN and `IN (SELECT ...)`, `CASE x WHEN`, `NULLIF`,
-`min` and `max`, and joins, with or without an index. A string literal
-compared with a custom type is read as that type, and two types that only
-check a value, such as `varchar(n)` and `smallint`, compare as they do in
-PostgreSQL.
+`min` and `max`, and joins, with or without an index. The same two types in
+one result column fail the same way: in UNION, UNION ALL, INTERSECT, EXCEPT, a
+multi-row VALUES, a recursive CTE, the results of CASE, and `coalesce`, `ifnull`
+and `iif`. A string literal compared with a custom type is read as that type,
+and two types that only check a value, such as `varchar(n)` and `smallint`,
+compare as they do in PostgreSQL.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
