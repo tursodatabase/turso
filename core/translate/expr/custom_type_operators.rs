@@ -173,6 +173,16 @@ pub(super) fn find_operator_call(
             }
         }
     }
+    if let Some(resolver) = env.resolver() {
+        let operand_types = || types.iter().map(dialect_operand_type).collect();
+        if resolver
+            .catalog
+            .dialect
+            .uses_sqlite_arithmetic(op, &operand_types)
+        {
+            return Ok(None);
+        }
+    }
     let operands = operands
         .iter()
         .zip(types)

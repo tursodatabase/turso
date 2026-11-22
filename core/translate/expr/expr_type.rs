@@ -840,6 +840,9 @@ fn binary_type(
         | Operator::Divide
         | Operator::Modulus => {
             let types = [type_of(lhs, env), type_of(rhs, env)];
+            if dialect_uses_sqlite_arithmetic(op, &types, env) {
+                return ExprType::Builtin(BuiltinType::Real);
+            }
             custom_operator_type(expr, &types, env).unwrap_or_else(|| {
                 let [lhs_type, rhs_type] = types;
                 arithmetic_type(
@@ -883,6 +886,26 @@ fn binary_type(
         // `->>` gives the SQL value it extracts, whose kind varies.
         Operator::ArrowRightShift => affinity_type(expr, env),
     }
+}
+
+/// Whether the dialect runs SQLite's arithmetic on operands of these types.
+fn dialect_uses_sqlite_arithmetic(op: &ast::Operator, types: &[ExprType], env: &TypeEnv) -> bool {
+    let Some(resolver) = env.resolver() else {
+        return false;
+    };
+    let symbol = match op {
+        ast::Operator::Add => "+",
+        ast::Operator::Subtract => "-",
+        ast::Operator::Multiply => "*",
+        ast::Operator::Divide => "/",
+        ast::Operator::Modulus => "%",
+        _ => return false,
+    };
+    let operand_types = || types.iter().map(dialect_operand_type).collect();
+    resolver
+        .catalog
+        .dialect
+        .uses_sqlite_arithmetic(symbol, &operand_types)
 }
 
 /// The type of the operator expression `expr` when a custom type's function runs

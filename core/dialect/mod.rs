@@ -717,6 +717,18 @@ pub trait Dialect: Send + Sync + 'static {
         OperatorResolution::Keep
     }
 
+    /// Whether the arithmetic operator `op` on operands of the given types is
+    /// SQLite's operator on the values the operands read as, even though an
+    /// operand is a custom type that has its own operator. PostgreSQL adds a
+    /// double precision and a numeric as doubles.
+    fn uses_sqlite_arithmetic(
+        &self,
+        _op: &str,
+        _operands: &dyn Fn() -> std::vec::Vec<OperandType>,
+    ) -> bool {
+        false
+    }
+
     /// The type that values of the given types have together, as the results
     /// of a CASE or coalesce do. None leaves it to the engine.
     fn common_type(&self, _types: &dyn Fn() -> std::vec::Vec<OperandType>) -> Option<OperandType> {
