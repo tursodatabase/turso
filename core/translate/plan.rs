@@ -40,7 +40,9 @@ use turso_parser::ast::{
 use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
-use super::expr::expr_type::{compound_column_type, type_of, type_ordering, ExprType};
+use super::expr::expr_type::{
+    compound_column_type, select_column_type, type_of, type_ordering, ExprType,
+};
 
 /// Infer the affinity of a subquery result column from its expression.
 ///
@@ -3436,7 +3438,12 @@ pub(super) fn query_output_columns(
         // `compound_column_collation`, which looks at every SELECT.
         let result_type = match &compound_arms {
             Some(arms) => compound_column_type(arms.iter().copied(), column_index, resolver),
-            None => type_of(result_expr, &env),
+            None => match plan {
+                Plan::Select(select) if !select.values.is_empty() => {
+                    select_column_type(select, column_index, resolver)
+                }
+                _ => type_of(result_expr, &env),
+            },
         };
         let text_collation = expr_text_collation(result_expr, &context, context.catalog())?;
         let dimensions = result_type.array_dimensions();

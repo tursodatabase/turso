@@ -627,12 +627,23 @@ pub(crate) fn compound_column_type<'p>(
     )
 }
 
-fn select_column_type(select: &SelectPlan, column: usize, resolver: &Resolver) -> ExprType {
+pub(crate) fn select_column_type(
+    select: &SelectPlan,
+    column: usize,
+    resolver: &Resolver,
+) -> ExprType {
+    let env = TypeEnv::new(Some(&select.table_references), resolver);
+    if !select.values.is_empty() {
+        let types = select
+            .values
+            .iter()
+            .filter_map(|row| row.get(column))
+            .map(|value| type_of(value, &env))
+            .collect();
+        return common_type_of(types, Some(resolver), resolver.schema());
+    }
     match select.result_columns.get(column) {
-        Some(result_column) => type_of(
-            &result_column.expr,
-            &TypeEnv::new(Some(&select.table_references), resolver),
-        ),
+        Some(result_column) => type_of(&result_column.expr, &env),
         None => ExprType::Unknown,
     }
 }
