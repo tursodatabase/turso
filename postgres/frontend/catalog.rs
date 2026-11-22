@@ -2890,13 +2890,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_cast",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable {
-            create_sql: "CREATE TABLE pg_cast (
-                oid INTEGER, castsource INTEGER, casttarget INTEGER, castfunc INTEGER,
-                castcontext TEXT, castmethod TEXT, tableoid INTEGER HIDDEN
-            )"
-            .to_string(),
-        },
+        SnapshotCatalog::<PgCastTable>(PhantomData),
     );
     options = options.native_module(
         "pg_transform",
@@ -3078,6 +3072,35 @@ impl SnapshotRows for PgLanguageTable {
                     Value::from_i64(0),
                     Value::from_i64(0),
                     Value::Null,
+                ]
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct PgCastTable;
+
+impl SnapshotRows for PgCastTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_cast (
+        oid INTEGER, castsource INTEGER, casttarget INTEGER, castfunc INTEGER,
+        castcontext TEXT, castmethod TEXT, tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2605);
+    const ESTIMATED_COST: f64 = 1.0;
+    const ESTIMATED_ROWS: u32 = 50;
+
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        crate::casts::cast_rows()
+            .enumerate()
+            .map(|(index, (source, target, context, method))| {
+                vec![
+                    Value::from_i64(crate::casts::FIRST_CAST_OID + index as i64),
+                    Value::from_i64(source.oid()),
+                    Value::from_i64(target.oid()),
+                    Value::from_i64(0),
+                    Value::build_text(context),
+                    Value::build_text(method),
                 ]
             })
             .collect()
