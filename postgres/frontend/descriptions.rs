@@ -34,6 +34,7 @@ use crate::catalog::{key_constraint_names, namespace_oid, PUBLIC_NAMESPACE_OID};
 use crate::classes::{class_catalog, RelationClass};
 use crate::error::sqlstate_error;
 use crate::roles::schema_roles;
+use crate::schema_init::TableInit;
 use crate::session::relation_lookup_namespaces;
 
 pub(crate) const DESCRIPTION_TABLE_NAME: &str = "pg_description";
@@ -44,35 +45,24 @@ const OBJSUBID_COLUMN: usize = 2;
 const DESCRIPTION_COLUMN: usize = 3;
 const DESCRIPTION_COLUMN_COUNT: usize = 4;
 
-/// Whether `name` in the root namespace is a catalog table that this
-/// frontend stores. Every role reads such a table and no user statement
-/// writes it.
-pub(crate) fn is_stored_catalog_table(namespace: NamespaceId, name: &str) -> bool {
-    namespace.is_root() && name.eq_ignore_ascii_case(DESCRIPTION_TABLE_NAME)
-}
+const CREATE_DESCRIPTION_TABLE_SQL: &str = "CREATE TABLE pg_description \
+     (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)";
 
-/// The statements that create the table, with the comment that PostgreSQL
-/// gives the public schema. None when `schema` has the table.
-pub(crate) fn initialize_statements(schema: &Schema) -> Vec<String> {
-    if schema
-        .get_btree_table(NamespaceId::ROOT, DESCRIPTION_TABLE_NAME)
-        .is_some()
-    {
-        return Vec::new();
-    }
-    let public_schema = DescribedObject {
-        objoid: PUBLIC_NAMESPACE_OID,
-        classoid: PG_NAMESPACE_OID,
-        objsubid: 0,
-    };
-    vec![
-        format!(
-            "CREATE TABLE {DESCRIPTION_TABLE_NAME} \
-             (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)"
-        ),
-        public_schema.insert_statement("standard public schema"),
-    ]
-}
+/// The comment that PostgreSQL gives the public schema.
+const INSERT_PUBLIC_SCHEMA_COMMENT_SQL: &str =
+    "INSERT INTO pg_description (objoid, classoid, objsubid, description) \
+     VALUES (2200, 2615, 0, 'standard public schema')";
+
+// The statement above spells the oids so that it can be a constant.
+const _: () = assert!(PUBLIC_NAMESPACE_OID == 2200 && PG_NAMESPACE_OID == 2615);
+
+pub(crate) const TABLE_INIT: TableInit = TableInit {
+    table: DESCRIPTION_TABLE_NAME,
+    statements: &[
+        CREATE_DESCRIPTION_TABLE_SQL,
+        INSERT_PUBLIC_SCHEMA_COMMENT_SQL,
+    ],
+};
 
 /// The engine statements that `stmt` runs: they replace the comment of its
 /// object, or delete it.
