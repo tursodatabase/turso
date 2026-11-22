@@ -380,6 +380,9 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_COLUMN
     } else if msg.contains("no such function") || msg.contains("no such window") {
         SQLSTATE_UNDEFINED_FUNCTION
+    } else if msg.starts_with("cannot compare type ") {
+        // PostgreSQL has no comparison operator for the two types.
+        SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.contains("already exists") {
         SQLSTATE_DUPLICATE_TABLE
     } else if msg.starts_with("ambiguous column name") || msg.ends_with("\" is ambiguous") {

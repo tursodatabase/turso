@@ -192,6 +192,20 @@ statements of one query string;
 `clock_timestamp()` reads the clock at each call. All of them have microsecond
 precision.
 
+Comparing values of two different custom types fails when either type changes
+the values it stores (a STRUCT or UNION, a type with ENCODE or a DECODE other
+than `value`), unless the two already have one order in common, as `numeric`
+and `bigint` do. A domain compares as the type it is declared on, so two
+domains over one type compare as that type. So a `timestamp` with a
+`timestamptz`, and a `timestamptz` with a `varchar(n)`, fail, as in PostgreSQL.
+The error is `cannot compare type x with type y` with SQLSTATE 42883, as
+PostgreSQL gives when no comparison operator exists. It covers `=`, `<`,
+`IS DISTINCT FROM`, BETWEEN, IN and `IN (SELECT ...)`, `CASE x WHEN`, `NULLIF`,
+`min` and `max`, and joins, with or without an index. A string literal
+compared with a custom type is read as that type, and two types that only
+check a value, such as `varchar(n)` and `smallint`, compare as they do in
+PostgreSQL.
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |
