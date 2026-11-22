@@ -376,3 +376,16 @@ test('a whole number binds as INTEGER only inside the int64 range', async () => 
     expect(await stmt.get(-(2 ** 63))).toEqual({ type: "integer", above_max: 0 });
     await db.close();
 })
+
+test('undefined binds as NULL and a value with no SQLite type is refused', async () => {
+    const db = await connect(":memory:");
+    const stmt = await db.prepare("SELECT typeof(?) AS a, typeof(?) AS b");
+    expect(await stmt.get(1, undefined)).toEqual({ a: "integer", b: "null" });
+    expect(await stmt.get([undefined, 1])).toEqual({ a: "null", b: "integer" });
+    for (const value of [new Date(0), { a: 1 }, new Map(), new ArrayBuffer(2), () => 1, Symbol("s")]) {
+        const error = await stmt.get(1, value).catch((e) => e);
+        expect(error).toBeInstanceOf(TypeError);
+        expect(error.message).toBe("SQLite3 can only bind numbers, strings, bigints, buffers, and null");
+    }
+    await db.close();
+})
