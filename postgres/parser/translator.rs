@@ -3580,13 +3580,14 @@ impl PostgreSQLTranslator {
                     .type_name
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("TypeCast missing type name".into()))?;
-                if !pg_type_name.typmods.is_empty() {
-                    return Err(ParseError::not_supported("a type modifier in a cast"));
-                }
                 if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
                     expr = Box::new(int8_cast_operand(arg, *expr));
                 }
-                let type_name = cast_target_type(pg_type_name)?;
+                let type_name = if pg_type_name.typmods.is_empty() {
+                    cast_target_type(pg_type_name)?
+                } else {
+                    cast_target_type_with_modifier(pg_type_name)?
+                };
                 Ok(ast::Expr::Cast {
                     expr,
                     type_name: Some(type_name),
@@ -7732,6 +7733,87 @@ fn cast_target_type(type_name: &pg_query::protobuf::TypeName) -> Result<ast::Typ
         }
     }
     Ok(target)
+}
+
+/// The target of a cast to `numeric(p, s)` or `varchar(n)`. A modifier on any
+/// other type is refused.
+fn cast_target_type_with_modifier(
+    type_name: &pg_query::protobuf::TypeName,
+) -> Result<ast::Type, ParseError> {
+    use pg_query::protobuf::a_const::Val;
+    use pg_query::protobuf::node::Node;
+
+    let invalid = |message: String| ParseError::Sqlstate {
+        sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
+        message,
+    };
+    let not_supported = || ParseError::not_supported("a type modifier in a cast");
+    if !type_name.array_bounds.is_empty() {
+        return Err(not_supported());
+    }
+    let mut modifiers = Vec::new();
+    for node in &type_name.typmods {
+        let value = match &node.node {
+            Some(Node::Integer(i)) => i64::from(i.ival),
+            Some(Node::AConst(a_const)) => match &a_const.val {
+                Some(Val::Ival(i)) => i64::from(i.ival),
+                _ => return Err(not_supported()),
+            },
+            _ => return Err(not_supported()),
+        };
+        modifiers.push(value);
+    }
+    let integer = |value: i64| {
+        let literal = ast::Expr::Literal(ast::Literal::Numeric(value.unsigned_abs().to_string()));
+        Box::new(if value < 0 {
+            ast::Expr::Unary(ast::UnaryOperator::Negative, Box::new(literal))
+        } else {
+            literal
+        })
+    };
+    match supported_type_name(type_name)?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "numeric" | "decimal" => {
+            let (precision, scale) = match modifiers[..] {
+                [precision] => (precision, 0),
+                [precision, scale] => (precision, scale),
+                _ => return Err(not_supported()),
+            };
+            if !(1..=1000).contains(&precision) {
+                return Err(invalid(format!(
+                    "NUMERIC precision {precision} must be between 1 and 1000"
+                )));
+            }
+            if !(-1000..=1000).contains(&scale) {
+                return Err(invalid(format!(
+                    "NUMERIC scale {scale} must be between -1000 and 1000"
+                )));
+            }
+            Ok(ast::Type {
+                name: "numeric".to_string(),
+                size: Some(ast::TypeSize::TypeSize(integer(precision), integer(scale))),
+                array_dimensions: 0,
+            })
+        }
+        "varchar" => {
+            let [length] = modifiers[..] else {
+                return Err(not_supported());
+            };
+            if length < 1 {
+                return Err(invalid(
+                    "length for type varchar must be at least 1".to_string(),
+                ));
+            }
+            Ok(ast::Type {
+                name: "varchar".to_string(),
+                size: Some(ast::TypeSize::MaxSize(integer(length))),
+                array_dimensions: 0,
+            })
+        }
+        _ => Err(not_supported()),
+    }
 }
 
 fn pg_type_name_to_ast_type(
@@ -14550,11 +14632,9 @@ mod tests {
 
     #[test]
     fn fail_closed_cast_type_modifiers() {
-        assert_not_supported("SELECT '1.239'::numeric(5, 2)", "a type modifier in a cast");
-        assert_not_supported(
-            "SELECT CAST('abcdef' AS varchar(3))",
-            "a type modifier in a cast",
-        );
+        assert_translates("SELECT '1.239'::numeric(5, 2), CAST('abcdef' AS varchar(3))");
+        assert_not_supported("SELECT 'abc'::char(2)", "a type modifier in a cast");
+        assert_not_supported("SELECT '1'::numeric(5,2)[]", "a type modifier in a cast");
         assert_not_supported("SELECT now()::timestamp(0)", "a type modifier in a cast");
         assert_translates("SELECT '1.5'::numeric, 'a'::varchar, 1::int[]");
     }

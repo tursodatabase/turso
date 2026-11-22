@@ -218,6 +218,7 @@ pub(crate) fn plan_cast(
         return Ok(None);
     }
     let target_name = target.name.to_ascii_lowercase();
+    let varchar_length = varchar_length(target);
     let target = match context {
         CastContext::Assignment => CastType::from_column_type(&target_name),
         _ => CastType::from_name(&target_name),
@@ -233,6 +234,18 @@ pub(crate) fn plan_cast(
     let Some(source) = source_type(&source) else {
         return Ok(None);
     };
+    if let Some(length) = varchar_length {
+        resolve(source, Text, context)?;
+        return Ok(Some(CastPlan {
+            convert: Some(CastConversion {
+                function: "pg_cast_varchar".to_string(),
+                extra_args: vec![
+                    ast::Expr::Literal(ast::Literal::String(format!("'{}'", source.name()))),
+                    ast::Expr::Literal(ast::Literal::Numeric(length.to_string())),
+                ],
+            }),
+        }));
+    }
     let Resolution::Convert = resolve(source, target, context)? else {
         return Ok(Some(CastPlan { convert: None }));
     };
@@ -246,6 +259,42 @@ pub(crate) fn plan_cast(
             extra_args: vec![name(source.name()), name(target.name())],
         }),
     }))
+}
+
+/// The length of a `varchar(n)` target, which truncates the text.
+fn varchar_length(target: &ast::Type) -> Option<i64> {
+    if !target.name.eq_ignore_ascii_case("varchar") {
+        return None;
+    }
+    let Some(ast::TypeSize::MaxSize(length)) = &target.size else {
+        return None;
+    };
+    let ast::Expr::Literal(ast::Literal::Numeric(length)) = length.as_ref() else {
+        return None;
+    };
+    length.parse().ok()
+}
+
+/// `pg_cast_varchar(value, source, length)`: the value as text, cut to
+/// `length` characters, as an explicit cast to `varchar(length)` does.
+pub(crate) fn exec_pg_cast_varchar(args: &[Register]) -> Result<Value> {
+    let value = args[0].get_value();
+    let (Some(source), Some(length)) = (type_arg(&args[1]), args[2].get_value().as_int()) else {
+        return Err(LimboError::InternalError(
+            "pg_cast_varchar needs a type name and a length".to_string(),
+        ));
+    };
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let text = match to_text(value, source)? {
+        Value::Text(text) => text.as_str().to_string(),
+        other => other.to_string(),
+    };
+    let length = usize::try_from(length).unwrap_or(usize::MAX);
+    Ok(Value::build_text(
+        text.chars().take(length).collect::<String>(),
+    ))
 }
 
 pub(crate) fn source_type(source: &OperandType) -> Option<CastType> {

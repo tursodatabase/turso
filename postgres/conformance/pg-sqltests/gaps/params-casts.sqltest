@@ -140,26 +140,20 @@ expect {
 }
 
 # A-22: numeric(10,2) rounding half away from zero
-@compat-gap "type:numeric"
 test numeric-10-2-rounding-half-away-from-zero {
     SELECT '1.005'::numeric(10,2), '2.675'::numeric(10,2), '-1.005'::numeric(10,2);
 }
 expect {
     1.01|2.68|-1.01
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
 # A-23: numeric(10,0) rounding
-@compat-gap "type:numeric"
 test numeric-10-0-rounding {
     SELECT '2.5'::numeric(10,0), '3.5'::numeric(10,0);
 }
 expect {
     3|4
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
 # A-24: numeric exact decimal arithmetic
 test numeric-exact-decimal-arithmetic {
@@ -178,14 +172,11 @@ expect {
 }
 
 # A-26: numeric overflow on typmod
-@compat-gap "type:numeric"
 test numeric-overflow-on-typmod {
     SELECT '123456.1'::numeric(5,2);
 }
 @sqlstate 22003
 expect error {}
-@sqlstate 0A000
-expect @tursopg error {}
 
 # A-27: invalid numeric
 test invalid-numeric {
