@@ -283,6 +283,12 @@ fn format_value(value: &Value) -> String {
 
 pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
     match error {
+        LimboError::ConstraintViolation(cv)
+            if cv.kind == ConstraintKind::Other
+                && cv.message.starts_with("numeric value out of range") =>
+        {
+            SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
+        }
         LimboError::ConstraintViolation(cv) => match cv.kind {
             ConstraintKind::PrimaryKey | ConstraintKind::Unique => SQLSTATE_UNIQUE_VIOLATION,
             ConstraintKind::ForeignKey => SQLSTATE_FK_VIOLATION,
