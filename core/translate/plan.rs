@@ -1947,25 +1947,39 @@ pub fn left_using_column_sources<'a, S>(
 pub fn merge_columns<'a>(
     sources: impl IntoIterator<Item = (TableInternalId, &'a Table, usize)>,
 ) -> ResolvedColumn {
-    let mut expressions = Vec::new();
-    let mut source_columns = SmallVec::new();
-    for (table_id, table, column_index) in sources {
-        expressions.push(Box::new(Expr::Column {
+    let column_expr =
+        |table_id: TableInternalId, table: &Table, column_index: usize| Expr::Column {
             database: None,
             table: table_id,
             column: column_index,
             is_rowid_alias: table.columns()[column_index].is_rowid_alias(),
-        }));
+        };
+    let mut sources = sources.into_iter();
+    let (table_id, table, column_index) = sources
+        .next()
+        .expect("a merged column has at least one source");
+    let mut source_columns = SmallVec::new();
+    source_columns.push((table_id, column_index));
+    let first = column_expr(table_id, table, column_index);
+    // Almost all columns have one source, and their value is the plain column.
+    // Return it without the Vec and the Box of a merged column.
+    let Some((table_id, table, column_index)) = sources.next() else {
+        return ResolvedColumn {
+            expr: first,
+            source_columns,
+        };
+    };
+    source_columns.push((table_id, column_index));
+    let mut expressions = vec![
+        Box::new(first),
+        Box::new(column_expr(table_id, table, column_index)),
+    ];
+    for (table_id, table, column_index) in sources {
+        expressions.push(Box::new(column_expr(table_id, table, column_index)));
         source_columns.push((table_id, column_index));
     }
-    assert!(!expressions.is_empty());
-    let expr = if expressions.len() == 1 {
-        *expressions.pop().unwrap()
-    } else {
-        Expr::MergedColumn(expressions)
-    };
     ResolvedColumn {
-        expr,
+        expr: Expr::MergedColumn(expressions),
         source_columns,
     }
 }
