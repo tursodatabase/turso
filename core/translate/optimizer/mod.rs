@@ -37,7 +37,7 @@ use crate::{
             },
             cost::RowCountEstimate,
             multi_index::{MultiIndexBranchAccessParams, MultiIndexBranchParams},
-            order::{ColumnTarget, OrderTarget},
+            order::OrderTarget,
         },
         plan::{
             DmlSafetyReason, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
@@ -3491,12 +3491,6 @@ fn apply_table_access_plan(
                     )?));
                     *build_index = false;
                 }
-                maybe_remove_index_candidate(
-                    index,
-                    &table_references.joined_tables()[table_idx],
-                    maybe_order_target.as_ref(),
-                    sort_eliminated,
-                );
                 if constraint_refs.is_empty() {
                     if let Some(index) = partial_index(index.as_ref()) {
                         let is_outer_join = table_references.joined_tables()[table_idx]
@@ -4083,47 +4077,6 @@ fn eliminate_constant_conditions(
     }
 
     Ok(ConstantConditionEliminationResult::Continue)
-}
-
-/// Check if the order target collation matches index column collations.
-/// Only remove the index when sort elimination selected this plan.
-fn maybe_remove_index_candidate(
-    index: &mut Option<Arc<Index>>,
-    table_reference: &JoinedTable,
-    order_target: Option<&OrderTarget>,
-    sort_eliminated: bool,
-) {
-    if !sort_eliminated {
-        return;
-    }
-    if let Some((idx, order_target)) = index.as_mut().zip(order_target) {
-        for col_order in &order_target.columns {
-            // Only check columns from this table
-            if col_order.table_id != table_reference.internal_id {
-                continue;
-            }
-
-            // Find matching index column
-            let matching_idx_col = match &col_order.target {
-                ColumnTarget::Column(col_no) => {
-                    idx.columns.iter().find(|ic| ic.pos_in_table == *col_no)
-                }
-                ColumnTarget::RowId => {
-                    continue;
-                }
-                ColumnTarget::Expr(_expr) => {
-                    continue;
-                }
-            };
-
-            if let Some(idx_col) = matching_idx_col {
-                if col_order.collation != idx_col.collation {
-                    *index = None;
-                    return;
-                }
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

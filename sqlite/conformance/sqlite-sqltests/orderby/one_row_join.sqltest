@@ -211,3 +211,52 @@ expect {
     1|20
     1|30
 }
+
+# A UNIQUE lookup returns at most one row, so the ORDER BY needs no sort even
+# when its collation differs from the index column's. The plan must still
+# search the index, not the rowid.
+setup unique_lookup_collation {
+    CREATE TABLE t(a TEXT COLLATE BINARY, b TEXT COLLATE NOCASE, c TEXT COLLATE RTRIM, UNIQUE(a));
+    CREATE TABLE u(a TEXT COLLATE NOCASE, b TEXT COLLATE NOCASE, c TEXT, UNIQUE(b));
+    CREATE TABLE v(a TEXT COLLATE NOCASE, b INT, c TEXT, UNIQUE(a, b));
+    INSERT INTO t VALUES ('aa ', 'AA   ', 'foo'), ('aa', 'x', 'bar');
+    INSERT INTO u VALUES ('B  ', 'B', ' C'), ('A', 'a', 'z');
+    INSERT INTO v VALUES ('x', 1, 'p'), ('X ', 1, 'q'), ('y', 2, 'r');
+}
+
+@setup unique_lookup_collation
+test unique-lookup-order-by-other-collation {
+    SELECT a, b, c FROM t WHERE a = 'aa '
+    ORDER BY a COLLATE RTRIM ASC, c COLLATE BINARY DESC, b COLLATE RTRIM ASC, rowid ASC;
+}
+expect {
+    aa |AA   |foo
+}
+
+@setup unique_lookup_collation
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test unique-lookup-order-by-other-collation-plan {
+    EXPLAIN QUERY PLAN
+    SELECT a, b, c FROM t WHERE a = 'aa '
+    ORDER BY a COLLATE RTRIM ASC, c COLLATE BINARY DESC, b COLLATE RTRIM ASC, rowid ASC;
+}
+expect {
+    1|0|0|SEARCH t USING INDEX sqlite_autoindex_t_1 (a=?)
+}
+
+@setup unique_lookup_collation
+test unique-lookup-nocase-order-by-other-collation {
+    SELECT a, b, c FROM u WHERE b = 'B'
+    ORDER BY c COLLATE NOCASE ASC, a ASC, b COLLATE BINARY ASC, rowid ASC;
+}
+expect {
+    B  |B| C
+}
+
+@setup unique_lookup_collation
+test unique-two-column-lookup-order-by-other-collation {
+    SELECT a, b, c FROM v WHERE a = 'x' AND b = 1 ORDER BY a COLLATE BINARY, c;
+}
+expect {
+    x|1|p
+}
