@@ -1951,6 +1951,17 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test cmp-insert-values-with-a-cte-converts-each-row {
+    -- A WITH clause does not make the rows of an INSERT one result column.
+    CREATE TABLE c(z timestamp) STRICT;
+    WITH x AS (SELECT 1) INSERT INTO c(z) VALUES (CAST('2024-01-05' AS date)), (CAST('2024-01-05 00:00:00' AS timestamp));
+    SELECT count(*) FROM c;
+}
+expect {
+    2
+}
+
+@requires strict "uses STRICT tables"
 test cmp-coalesce-of-date-and-timestamp-is-an-error {
     CREATE TABLE t(d date, ts timestamp) STRICT;
     SELECT coalesce(d, ts) FROM t;

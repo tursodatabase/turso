@@ -49,13 +49,57 @@ pub fn translate_select(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    let plan = prepare_select_plan(
+    translate_select_with_source(
         select,
+        resolver,
+        program,
+        query_destination,
+        connection,
+        false,
+    )
+}
+
+/// [translate_select] for the rows of `INSERT INTO t VALUES (...), (...)`. An
+/// INSERT converts each row to its target column, so a bare VALUES source does
+/// not need one type for the rows of a column, whatever WITH clause it carries.
+pub fn translate_insert_source_select(
+    select: ast::Select,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    query_destination: QueryDestination,
+    connection: &Arc<crate::Connection>,
+) -> Result<usize> {
+    translate_select_with_source(
+        select,
+        resolver,
+        program,
+        query_destination,
+        connection,
+        true,
+    )
+}
+
+#[turso_macros::trace_stack]
+fn translate_select_with_source(
+    select: ast::Select,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    query_destination: QueryDestination,
+    connection: &Arc<crate::Connection>,
+    is_insert_source: bool,
+) -> Result<usize> {
+    let plan = prepare_select_plan_from_arms(
+        select.body.select,
+        select.body.compounds,
+        select.with,
+        select.order_by,
+        select.limit,
         resolver,
         program,
         &[],
         query_destination,
         connection,
+        is_insert_source,
     )?;
     if program.trigger.is_some() {
         if let Some(virtual_table) = plan_first_virtual_table_name(&plan) {
@@ -186,6 +230,7 @@ pub fn prepare_select_plan(
         outer_query_refs,
         query_destination,
         connection,
+        false,
     )
 }
 
@@ -206,6 +251,7 @@ pub(crate) fn prepare_select_plan_from_arms(
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    is_insert_source: bool,
 ) -> Result<Plan> {
     let _nested_query = resolver.enter_nested_query()?;
     let mut compound_arms = compound_arms.into_iter().peekable();
@@ -220,6 +266,7 @@ pub(crate) fn prepare_select_plan_from_arms(
             outer_query_refs,
             query_destination,
             connection,
+            is_insert_source,
         )?)));
     }
 
@@ -235,6 +282,7 @@ pub(crate) fn prepare_select_plan_from_arms(
         outer_query_refs,
         query_destination.clone(),
         connection,
+        false,
     )?;
 
     let mut left = Vec::with_capacity(compound_arms.size_hint().0);
@@ -254,6 +302,7 @@ pub(crate) fn prepare_select_plan_from_arms(
             outer_query_refs,
             query_destination.clone(),
             connection,
+            false,
         )?;
     }
 
@@ -311,6 +360,7 @@ fn prepare_one_select_plan(
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    is_insert_source: bool,
 ) -> Result<SelectPlan> {
     match select {
         ast::OneSelect::Select {
@@ -910,8 +960,6 @@ fn prepare_one_select_plan(
             Ok(plan)
         }
         ast::OneSelect::Values(mut values) => {
-            // Taken before any subquery in the rows is planned, so that only this VALUES counts.
-            let is_insert_source = resolver.take_values_select_is_insert_source();
             if !order_by.is_empty() {
                 crate::bail_parse_error!("ORDER BY clause is not allowed with VALUES clause");
             }

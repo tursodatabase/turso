@@ -169,9 +169,6 @@ pub struct Resolver<'a> {
     /// removes it — folding the collected aggregates into its own aggregate
     /// list — afterwards.
     enclosing_query_aggregates: RefCell<Vec<Vec<Aggregate>>>,
-    /// Set while the planner plans the VALUES of an INSERT. Each row converts to the
-    /// target column, so the rows of one column need not share a type.
-    values_select_is_insert_source: Cell<bool>,
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
     pub dqs_dml: DoubleQuotedDml,
@@ -445,7 +442,6 @@ impl<'a> Resolver<'a> {
             in_subquery_column_types: Rc::default(),
             self_table_scope: RefCell::new(None),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
-            values_select_is_insert_source: Cell::new(false),
             dqs_dml,
             automatic_index: true,
             #[cfg(feature = "simulator")]
@@ -485,7 +481,6 @@ impl<'a> Resolver<'a> {
             in_subquery_column_types: self.in_subquery_column_types.fork(),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
-            values_select_is_insert_source: Cell::new(false),
             dqs_dml: self.dqs_dml,
             automatic_index: self.automatic_index,
             #[cfg(feature = "simulator")]
@@ -507,7 +502,6 @@ impl<'a> Resolver<'a> {
             in_subquery_column_types: self.in_subquery_column_types.fork(),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
-            values_select_is_insert_source: Cell::new(false),
             dqs_dml: self.dqs_dml,
             automatic_index: self.automatic_index,
             #[cfg(feature = "simulator")]
@@ -665,16 +659,6 @@ impl<'a> Resolver<'a> {
     /// Start collecting aggregates that this query's subqueries find to belong
     /// to this query, before planning those subqueries.
     /// [`Self::take_aggregates_from_subqueries`] retrieves them afterwards.
-    /// Marks the next VALUES that the planner reaches as the row source of an INSERT.
-    pub(crate) fn set_values_select_is_insert_source(&self, value: bool) {
-        self.values_select_is_insert_source.set(value);
-    }
-
-    /// Returns and clears the mark that [Self::set_values_select_is_insert_source] set.
-    pub(crate) fn take_values_select_is_insert_source(&self) -> bool {
-        self.values_select_is_insert_source.replace(false)
-    }
-
     pub(crate) fn begin_collecting_aggregates_from_subqueries(&self) {
         self.enclosing_query_aggregates
             .borrow_mut()
