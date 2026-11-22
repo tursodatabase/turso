@@ -204,9 +204,11 @@ PostgreSQL gives when no comparison operator exists. It covers `=`, `<`,
 `min` and `max`, and joins, with or without an index. The same two types in
 one result column fail the same way: in UNION, UNION ALL, INTERSECT, EXCEPT, a
 multi-row VALUES, a recursive CTE, the results of CASE, and `coalesce`, `ifnull`
-and `iif`. A string literal compared with a custom type is read as that type,
-and two types that only check a value, such as `varchar(n)` and `smallint`,
-compare as they do in PostgreSQL.
+and `iif`. A string literal compared with a custom type is read as that type.
+Two arrays compare when their element types compare, so `date[]` with
+`timestamp[]` fails. Two types that only check a value, such as `varchar(n)` and
+`smallint`, compare as they did before this check, as stored. PostgreSQL refuses
+that pair, so Turso accepts a comparison that PostgreSQL rejects.
 
 | Feature | Status | Notes |
 |---------|--------|-------|

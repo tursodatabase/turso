@@ -2399,3 +2399,36 @@ test cmp-domain-over-timestamptz-with-its-base-and-another-domain-compare {
 expect {
     1|1|1
 }
+
+@requires strict "uses STRICT tables"
+test cmp-array-of-date-with-array-of-timestamp-is-an-error {
+    -- Arrays compare element by element, so the elements must compare.
+    CREATE TABLE t(ad date[], ats timestamp[]) STRICT;
+    INSERT INTO t VALUES (ARRAY[CAST('2024-01-05' AS date)], ARRAY[CAST('2024-01-05 00:00:00' AS timestamp)]);
+    SELECT ad = ats FROM t;
+}
+expect error {
+    cannot compare type date\[\] with type timestamp\[\]
+}
+
+@requires strict "uses STRICT tables"
+test cmp-array-of-date-union-array-of-timestamp-is-an-error {
+    CREATE TABLE t(ad date[], ats timestamp[]) STRICT;
+    INSERT INTO t VALUES (ARRAY[CAST('2024-01-05' AS date)], ARRAY[CAST('2024-01-05 00:00:00' AS timestamp)]);
+    SELECT ad FROM t UNION SELECT ats FROM t;
+}
+expect error {
+    cannot compare type date\[\] with type timestamp\[\]
+}
+
+@requires strict "uses STRICT tables"
+test cmp-arrays-of-the-same-type-compare {
+    CREATE TABLE t(a date[], b date[]) STRICT;
+    INSERT INTO t VALUES (ARRAY[CAST('2024-01-05' AS date)], ARRAY[CAST('2024-01-05' AS date)]);
+    SELECT a = b FROM t;
+    SELECT a FROM t UNION SELECT b FROM t;
+}
+expect {
+    1
+    {2024-01-05}
+}

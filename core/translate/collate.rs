@@ -935,7 +935,15 @@ fn check_type_accepts_collate(ty: &ExprType, schema: &Schema) -> Result<()> {
 /// one compiled as written. A custom type compared with a built-in type or an
 /// untyped literal is not checked here.
 fn check_comparable(a: &ExprType, b: &ExprType, schema: &Schema) -> Result<()> {
-    let (Some(x), Some(y)) = (domain_base(a, schema), domain_base(b, schema)) else {
+    // Two arrays compare element by element, so their elements must compare.
+    if let (ExprType::Array { element: x, .. }, ExprType::Array { element: y, .. }) = (a, b) {
+        return check_comparable(x, y, schema).map_err(|_| cannot_compare(a, b));
+    }
+    let (ExprType::Custom { type_def: x, .. }, ExprType::Custom { type_def: y, .. }) = (a, b)
+    else {
+        return Ok(());
+    };
+    let (Some(x), Some(y)) = (schema.without_domains(x)?, schema.without_domains(y)?) else {
         return Ok(());
     };
     if same_type_def(&x, &y) || !(x.changes_stored_value() || y.changes_stored_value()) {
@@ -947,23 +955,6 @@ fn check_comparable(a: &ExprType, b: &ExprType, schema: &Schema) -> Result<()> {
         return Ok(());
     }
     Err(cannot_compare(a, b))
-}
-
-/// The type that values of `ty` compare as: `ty` itself, or the type a domain
-/// is declared on, followed through domains. `None` when `ty` is not a custom
-/// type or a domain over a built-in type.
-fn domain_base(ty: &ExprType, schema: &Schema) -> Option<Arc<TypeDef>> {
-    let ExprType::Custom { type_def, .. } = ty else {
-        return None;
-    };
-    if !type_def.is_domain {
-        return Some(type_def.clone());
-    }
-    match schema.resolve_type_unchecked(&type_def.name) {
-        Ok(Some(resolved)) => resolved.chain.iter().find(|link| !link.is_domain).cloned(),
-        // A type that cannot be resolved has no known base to compare with.
-        Ok(None) | Err(_) => None,
-    }
 }
 
 /// [check_comparable] for the types of `lhs` and `rhs`.
@@ -1013,11 +1004,13 @@ fn check_comparable_types<'s>(types: impl Iterator<Item = (ExprType, &'s Schema)
     // Different custom types are few, so keep one type of each name.
     let mut seen: SmallVec<[ExprType; 2]> = SmallVec::new();
     for (ty, schema) in types {
-        let ExprType::Custom { type_def, .. } = &ty else {
+        // An array is checked against arrays through its element type.
+        let Some(type_def) = custom_type_of(&ty) else {
             continue;
         };
         let is_new = seen.iter().all(|other| {
-            matches!(other, ExprType::Custom { type_def: other, .. } if !same_type_def(other, type_def))
+            std::mem::discriminant(other) != std::mem::discriminant(&ty)
+                || custom_type_of(other).is_none_or(|other| !same_type_def(other, type_def))
         });
         if !is_new {
             continue;
@@ -1028,6 +1021,15 @@ fn check_comparable_types<'s>(types: impl Iterator<Item = (ExprType, &'s Schema)
         seen.push(ty);
     }
     Ok(())
+}
+
+/// The custom type of `ty`, or of the elements of an array of it.
+fn custom_type_of(ty: &ExprType) -> Option<&Arc<TypeDef>> {
+    match ty {
+        ExprType::Custom { type_def, .. } => Some(type_def),
+        ExprType::Array { element, .. } => custom_type_of(element),
+        _ => None,
+    }
 }
 
 fn cannot_compare(a: &ExprType, b: &ExprType) -> LimboError {
