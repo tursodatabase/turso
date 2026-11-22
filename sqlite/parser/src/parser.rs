@@ -92,8 +92,6 @@ fn unexpected_token_error(
 ) -> Error {
     Error::ParseUnexpectedToken {
         parsed_offset: (offset, token.value.len()).into(),
-        expected,
-        got: token.token_type,
         token_text: token.to_utf8(),
         offset,
         expected_display: TokenType::format_expected_tokens(expected),
@@ -380,13 +378,10 @@ impl<'a> Parser<'a> {
                 }
                 Some(token) => {
                     if !found_semi {
-                        let tt = token.token_type;
                         let token_text = token.to_utf8();
                         let offset = self.offset();
                         return Err(Error::ParseUnexpectedToken {
                             parsed_offset: (offset, 1).into(),
-                            expected: &[TK_SEMI],
-                            got: tt,
                             token_text,
                             offset,
                             expected_display: crate::token::TokenType::format_expected_tokens(&[
@@ -1274,8 +1269,6 @@ impl<'a> Parser<'a> {
             let token_text = token.to_utf8();
             return Err(Error::ParseUnexpectedToken {
                 parsed_offset: (offset, token_len).into(),
-                expected: &[TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW, TK_LBRACKET],
-                got: token.token_type,
                 token_text,
                 offset,
                 expected_display: crate::token::TokenType::format_expected_tokens(&[
@@ -2088,8 +2081,6 @@ impl<'a> Parser<'a> {
                     let offset = self.offset();
                     return Err(Error::ParseUnexpectedToken {
                         parsed_offset: (self.offset() - name.len(), name.len()).into(),
-                        got: TK_STRING,
-                        expected: &[TK_ID, TK_INDEXED, TK_JOIN_KW],
                         token_text,
                         offset,
                         expected_display: crate::token::TokenType::format_expected_tokens(&[

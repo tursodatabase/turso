@@ -1,5 +1,3 @@
-use crate::token::TokenType;
-
 /// SQL lexer and parser errors
 #[non_exhaustive]
 #[derive(Clone, Debug, miette::Diagnostic, thiserror::Error)]
@@ -88,8 +86,6 @@ pub enum Error {
         #[label("here")]
         parsed_offset: miette::SourceSpan,
 
-        got: TokenType,
-        expected: &'static [TokenType],
         token_text: String,
         offset: usize,
         expected_display: String,
