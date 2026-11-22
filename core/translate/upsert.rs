@@ -1,6 +1,7 @@
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::RegisterColumn;
 use rustc_hash::FxHashMap as HashMap;
+use std::borrow::Cow;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -31,8 +32,7 @@ use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::row_security::{emit_row_checks, UpsertRowChecks};
 use crate::translate::trigger_exec::{
-    fire_trigger, get_triggers_including_temp, has_triggers_including_temp,
-    rewrite_select_expressions, TriggerContext,
+    fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
 };
 use crate::translate::update::{rowid_name_column_index, split_update_set_values};
 use crate::vdbe::insn::{to_u32, CmpInsFlags, ConstraintInfo};
@@ -51,7 +51,10 @@ use crate::{
             translate_expr, translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
         },
         insert::Insertion,
-        plan::{EvalAt, NonFromClauseSubquery, ResultSetColumn, SubqueryOrigin, TableReferences},
+        plan::{
+            ColumnUsedMask, EvalAt, OuterQueryReference, ResultSetColumn, SubqueryOrigin,
+            TableReferences,
+        },
         subquery::{
             emit_non_from_clause_subquery, plan_subqueries_from_returning,
             plan_subqueries_from_upsert_do_update,
@@ -670,9 +673,11 @@ pub fn emit_upsert(
     // registers say which type they hold.
     let decoded_column_types: Option<Vec<Option<Box<ast::Type>>>> = decoded_current_start
         .map(|_| column_custom_type_names(table.columns(), is_strict, resolver.schema()));
-    let rewrite_to_registers = |expr: &mut ast::Expr| {
+
+    // WHERE on target row
+    if let Some(pred) = where_clause.as_mut() {
         rewrite_expr_to_registers(
-            expr,
+            pred,
             table,
             expr_current_start,
             ctx.conflict_rowid_reg,
@@ -683,21 +688,17 @@ pub fn emit_upsert(
             excluded_decoded_start,
             decoded_column_types.as_deref(),
             &layout,
-        )
-    };
-
-    // WHERE on target row
-    if let Some(pred) = where_clause.as_mut() {
-        rewrite_to_registers(pred.as_mut())?;
+        )?;
         emit_do_update_subqueries(
             program,
             resolver,
             connection,
             table_references,
             table_alias,
+            insertion,
+            excluded_decoded_start,
             std::iter::once(pred.as_mut()),
             SubqueryOrigin::DmlWhere,
-            &rewrite_to_registers,
             current_start,
             ctx.conflict_rowid_reg,
             &layout,
@@ -732,7 +733,19 @@ pub fn emit_upsert(
     // planned before the SET clauses are split, so that `SET (a, b) = (SELECT ...)`
     // knows how many values the subquery gives.
     for set in sets.iter_mut() {
-        rewrite_to_registers(set.expr.as_mut())?;
+        rewrite_expr_to_registers(
+            &mut set.expr,
+            table,
+            expr_current_start,
+            ctx.conflict_rowid_reg,
+            Some(table.get_name()),
+            table_alias,
+            Some(insertion),
+            true,
+            excluded_decoded_start,
+            decoded_column_types.as_deref(),
+            &layout,
+        )?;
     }
     emit_do_update_subqueries(
         program,
@@ -740,9 +753,10 @@ pub fn emit_upsert(
         connection,
         table_references,
         table_alias,
+        insertion,
+        excluded_decoded_start,
         sets.iter_mut().map(|set| set.expr.as_mut()),
         SubqueryOrigin::DmlSet,
-        &rewrite_to_registers,
         current_start,
         ctx.conflict_rowid_reg,
         &layout,
@@ -1810,9 +1824,10 @@ fn emit_do_update_subqueries<'a>(
     connection: &Arc<Connection>,
     table_references: &TableReferences,
     table_alias: Option<&str>,
+    insertion: &Insertion,
+    excluded_decoded_start: Option<usize>,
     exprs: impl Iterator<Item = &'a mut ast::Expr>,
     origin: SubqueryOrigin,
-    rewrite_to_registers: &dyn Fn(&mut ast::Expr) -> crate::Result<WalkControl>,
     current_start: usize,
     rowid_reg: usize,
     layout: &ColumnLayout,
@@ -1824,182 +1839,102 @@ fn emit_do_update_subqueries<'a>(
     // DO UPDATE names the target by its alias when the INSERT gives one, where
     // RETURNING names it by the table's name.
     let mut table_references = table_references.clone();
+    let target = &mut table_references.joined_tables_mut()[0];
     if let Some(alias) = table_alias {
-        let target = &mut table_references.joined_tables_mut()[0];
         target.identifier = normalize_ident(alias);
         target.has_alias = true;
     }
+    // `excluded` is a table of the scope around the target's, as in SQLite, so
+    // the target's columns come first for an unqualified name, a table the
+    // subquery calls `excluded` hides it, and a subquery that reads it at any
+    // depth is correlated.
+    let excluded = OuterQueryReference {
+        identifier: "excluded".to_string(),
+        has_alias: true,
+        internal_id: program.table_reference_counter.next(),
+        table: target.table.clone(),
+        namespace: target.namespace,
+        join_info: None,
+        col_used_mask: ColumnUsedMask::default(),
+        cte_select: None,
+        cte_explicit_columns: Vec::new(),
+        cte_id: None,
+        cte_definition_only: false,
+        rowid_referenced: false,
+        outer_join_may_null_extend: false,
+        scope_depth: 0,
+    };
+    let excluded_id = excluded.internal_id;
+    table_references.add_outer_query_reference(excluded);
 
-    // Each subquery, and whether it reads `excluded`.
-    let mut subqueries: Vec<(NonFromClauseSubquery, bool)> = vec![];
-    for expr in exprs {
-        walk_expr_mut(
-            expr,
-            &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-                if !matches!(
-                    e,
-                    ast::Expr::Exists(_) | ast::Expr::Subquery(_) | ast::Expr::InSelect { .. }
-                ) {
-                    return Ok(WalkControl::Continue);
-                }
-                let reads_excluded = rewrite_excluded_in_subqueries(e, rewrite_to_registers)?;
-                let mut planned = vec![];
-                plan_subqueries_from_upsert_do_update(
-                    program,
-                    &mut planned,
-                    &mut table_references,
-                    e,
-                    origin,
-                    resolver,
-                    connection,
-                )?;
-                subqueries.extend(
-                    planned
-                        .into_iter()
-                        .map(|subquery| (subquery, reads_excluded)),
-                );
-                Ok(WalkControl::SkipChildren)
-            },
+    let mut subqueries = vec![];
+    plan_subqueries_from_upsert_do_update(
+        program,
+        &mut subqueries,
+        &mut table_references,
+        exprs.into_iter(),
+        origin,
+        resolver,
+        connection,
+    )?;
+
+    // Only a correlated subquery reads the conflicting row or `excluded`.
+    let cache_state = if subqueries.iter().any(|subquery| subquery.correlated) {
+        let cache_state = seed_returning_row_image_in_cache(
+            program,
+            &table_references,
+            current_start,
+            rowid_reg,
+            resolver,
+            layout,
         )?;
-    }
-
-    // Only a correlated subquery reads the conflicting row.
-    let cache_state = subqueries
-        .iter()
-        .any(|(subquery, _)| subquery.correlated)
-        .then(|| {
-            seed_returning_row_image_in_cache(
-                program,
-                &table_references,
-                current_start,
-                rowid_reg,
-                resolver,
-                layout,
-            )
-        })
-        .transpose()?;
-    let result: crate::Result<()> = (|| {
-        for (mut subquery, reads_excluded) in subqueries {
-            let plan = subquery.consume_plan(EvalAt::Loop(0));
-            // The planner does not see `excluded` read through a register, so a
-            // subquery nested in this one that reads it is guarded by Once.
-            // Clear those guards, as each trigger firing does, so that it runs
-            // again for every row.
-            let region_end = reads_excluded.then(|| {
-                let region_end = program.allocate_label();
-                program.emit_insn(Insn::ResetOnce { region_end });
-                region_end
-            });
-            emit_non_from_clause_subquery(
-                program,
-                resolver,
-                *plan,
-                &subquery.query_type,
-                subquery.correlated || reads_excluded,
-            )?;
-            if let Some(region_end) = region_end {
-                program.preassign_label_to_next_insn(region_end);
-            }
+        let excluded_start =
+            excluded_decoded_start.unwrap_or_else(|| insertion.first_col_register());
+        resolver.cache_expr_reg(
+            Cow::Owned(ast::Expr::RowId {
+                database: None,
+                table: excluded_id,
+            }),
+            insertion.key_register(),
+            false,
+        );
+        for (i, column) in table_references.joined_tables()[0]
+            .columns()
+            .iter()
+            .enumerate()
+        {
+            let reg = if column.is_rowid_alias() {
+                insertion.key_register()
+            } else {
+                layout.to_register(excluded_start, i)
+            };
+            let expr = ast::Expr::Column {
+                database: None,
+                table: excluded_id,
+                column: i,
+                is_rowid_alias: column.is_rowid_alias(),
+            };
+            resolver.cache_expr_reg(Cow::Owned(expr), reg, false);
         }
-        Ok(())
-    })();
+        Some(cache_state)
+    } else {
+        None
+    };
+    let result = subqueries.iter_mut().try_for_each(|subquery| {
+        let plan = subquery.consume_plan(EvalAt::Loop(0));
+        emit_non_from_clause_subquery(
+            program,
+            resolver,
+            *plan,
+            &subquery.query_type,
+            subquery.correlated,
+        )
+        .map(|_| ())
+    });
     if let Some(cache_state) = cache_state {
         restore_returning_row_image_in_cache(resolver, cache_state);
     }
     result
-}
-
-/// Rewrites each `excluded.<column>` inside the subqueries of `expr` as
-/// `rewrite_to_registers` rewrites it outside them, and says whether there was
-/// one. Every other name in a subquery is left for the subquery's planning,
-/// which looks it up in the subquery's own tables before the target table.
-fn rewrite_excluded_in_subqueries(
-    expr: &mut ast::Expr,
-    rewrite_to_registers: &dyn Fn(&mut ast::Expr) -> crate::Result<WalkControl>,
-) -> crate::Result<bool> {
-    let mut reads_excluded = false;
-    walk_expr_mut(
-        expr,
-        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-            rewrite_excluded_name(e, rewrite_to_registers, &mut reads_excluded)?;
-            Ok(WalkControl::Continue)
-        },
-    )?;
-    Ok(reads_excluded)
-}
-
-fn rewrite_excluded_name(
-    expr: &mut ast::Expr,
-    rewrite_to_registers: &dyn Fn(&mut ast::Expr) -> crate::Result<WalkControl>,
-    reads_excluded: &mut bool,
-) -> crate::Result<()> {
-    if let ast::Expr::Exists(select)
-    | ast::Expr::Subquery(select)
-    | ast::Expr::InSelect { rhs: select, .. } = expr
-    {
-        // A table the subquery calls `excluded` hides the inserted row from it,
-        // and from the subqueries inside it.
-        if select_names_excluded(select) {
-            return Ok(());
-        }
-        return rewrite_select_expressions(select, &mut |e: &mut ast::Expr| {
-            rewrite_excluded_name(e, rewrite_to_registers, reads_excluded)
-        });
-    }
-    if names_excluded(expr) {
-        *reads_excluded = true;
-        rewrite_to_registers(expr)?;
-    }
-    Ok(())
-}
-
-fn names_excluded(expr: &ast::Expr) -> bool {
-    matches!(
-        expr,
-        ast::Expr::Qualified(ns, _) | ast::Expr::DoublyQualified(_, ns, _)
-            if normalize_ident(ns.as_str()) == "excluded"
-    )
-}
-
-/// Whether a FROM clause of `select`, outside its subqueries, has a table
-/// named or aliased `excluded`.
-fn select_names_excluded(select: &ast::Select) -> bool {
-    std::iter::once(&select.body.select)
-        .chain(
-            select
-                .body
-                .compounds
-                .iter()
-                .map(|compound| &compound.select),
-        )
-        .any(|one_select| {
-            matches!(
-                one_select,
-                ast::OneSelect::Select { from: Some(from), .. } if from_clause_names_excluded(from)
-            )
-        })
-}
-
-fn from_clause_names_excluded(from: &ast::FromClause) -> bool {
-    std::iter::once(from.select.as_ref())
-        .chain(from.joins.iter().map(|join| join.table.as_ref()))
-        .any(|table| {
-            let name = match table {
-                ast::SelectTable::Table(name, alias, _)
-                | ast::SelectTable::TableCall(name, _, alias) => {
-                    alias.as_ref().map_or(&name.name, ast::As::name)
-                }
-                ast::SelectTable::Select { alias, .. } => match alias {
-                    Some(alias) => alias.name(),
-                    None => return false,
-                },
-                ast::SelectTable::Sub(from, alias) => match alias {
-                    Some(alias) => alias.name(),
-                    None => return from_clause_names_excluded(from),
-                },
-            };
-            normalize_ident(name.as_str()) == "excluded"
-        })
 }
 
 /// The resolve type a constraint Halt in the DO UPDATE arm carries. SQLite

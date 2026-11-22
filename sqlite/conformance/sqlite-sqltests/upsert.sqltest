@@ -276,6 +276,23 @@ expect {
     2|205|1
 }
 
+# The subquery that reads excluded runs for each conflict, and the count inside
+# it still runs once: row 2 gets the count from the first conflict.
+@cross-check-integrity
+test upsert-do-update-subquery-in-one-that-reads-excluded-runs-once {
+    CREATE TABLE s3 (id INTEGER PRIMARY KEY, c);
+    INSERT INTO s3 VALUES (1, 0), (2, 0);
+    INSERT INTO s3 VALUES (3, 0), (1, 100), (4, 0), (2, 200)
+      ON CONFLICT(id) DO UPDATE SET c = (SELECT excluded.c + (SELECT count(*) FROM s3));
+    SELECT * FROM s3;
+}
+expect {
+    1|103
+    2|203
+    3|0
+    4|0
+}
+
 @cross-check-integrity
 test upsert-do-update-subquery-names-target-by-alias {
     CREATE TABLE ta (id INTEGER PRIMARY KEY, c);

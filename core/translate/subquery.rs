@@ -591,14 +591,14 @@ pub fn plan_subqueries_from_returning(
     Ok(())
 }
 
-/// Compute query plans for subqueries in an UPSERT's DO UPDATE SET value or
+/// Compute query plans for subqueries in an UPSERT's DO UPDATE SET values or
 /// WHERE clause, which can reference the row of the target table that
-/// conflicted.
-pub fn plan_subqueries_from_upsert_do_update(
+/// conflicted and the row that failed to insert.
+pub fn plan_subqueries_from_upsert_do_update<'a>(
     program: &mut ProgramBuilder,
     non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
     table_references: &mut TableReferences,
-    expr: &mut ast::Expr,
+    exprs: impl Iterator<Item = &'a mut ast::Expr>,
     origin: SubqueryOrigin,
     resolver: &Resolver,
     connection: &Arc<Connection>,
@@ -613,7 +613,7 @@ pub fn plan_subqueries_from_upsert_do_update(
         non_from_clause_subqueries,
         table_references,
         resolver,
-        std::iter::once(expr),
+        exprs,
         connection,
         position,
         origin,
