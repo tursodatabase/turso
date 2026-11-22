@@ -5,6 +5,7 @@
 //! function of the target type, as in PostgreSQL. Any other pair of types is
 //! refused with SQLSTATE 42846.
 
+use crate::catalog::{PgTypeInfo, PG_BASE_TYPES};
 use crate::error::sqlstate_error;
 use crate::functions::{parse_pg_bool, validate_pg_input};
 use turso_core::ast;
@@ -31,6 +32,20 @@ pub(crate) enum CastType {
 }
 
 impl CastType {
+    pub(crate) const ALL: [CastType; 11] = [
+        Self::Int2,
+        Self::Int4,
+        Self::Int8,
+        Self::Float4,
+        Self::Float8,
+        Self::Numeric,
+        Self::Text,
+        Self::Bool,
+        Self::Bytea,
+        Self::Timestamp,
+        Self::TimestampTz,
+    ];
+
     fn name(self) -> &'static str {
         match self {
             Self::Int2 => "int2",
@@ -47,7 +62,22 @@ impl CastType {
         }
     }
 
-    fn from_name(name: &str) -> Option<Self> {
+    fn info(self) -> &'static PgTypeInfo {
+        PG_BASE_TYPES
+            .iter()
+            .find(|info| info.name == self.name())
+            .expect("every cast type is a row of pg_type")
+    }
+
+    pub(crate) fn oid(self) -> i64 {
+        self.info().oid
+    }
+
+    pub(crate) fn is_number(self) -> bool {
+        self.info().typcategory == "N"
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "int2" | "smallint" => Self::Int2,
             "int4" => Self::Int4,
@@ -144,6 +174,12 @@ const CASTS: &[Cast] = &[
     cast(TimestampTz, Timestamp, A),
 ];
 
+pub(crate) fn has_implicit_cast(source: CastType, target: CastType) -> bool {
+    CASTS.iter().any(|cast| {
+        cast.source == source && cast.target == target && cast.context == CastContext::Implicit
+    })
+}
+
 enum Resolution {
     Unchanged,
     Convert,
@@ -220,7 +256,7 @@ pub(crate) fn plan_cast(
     }))
 }
 
-fn source_type(source: &OperandType) -> Option<CastType> {
+pub(crate) fn source_type(source: &OperandType) -> Option<CastType> {
     Some(match source {
         OperandType::Untyped | OperandType::Text => Text,
         OperandType::Integer => Int4,

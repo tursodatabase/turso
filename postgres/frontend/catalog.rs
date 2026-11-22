@@ -253,6 +253,14 @@ impl Dialect for PostgresDialect {
         turso_core::dialect::resolve_builtin_function(name, arg_count)
     }
 
+    fn resolve_operator(
+        &self,
+        op: &str,
+        operands: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+    ) -> turso_core::dialect::OperatorResolution {
+        crate::operators::resolve_operator(op, &operands())
+    }
+
     fn plan_cast(
         &self,
         source: &dyn Fn() -> turso_core::dialect::OperandType,
@@ -1805,11 +1813,11 @@ impl SnapshotRows for PgIndexesTable {
 // pg_type
 // ──────────────────────────────────────────────────────────────────────
 
-struct PgTypeInfo {
-    oid: i64,
-    name: &'static str,
+pub(crate) struct PgTypeInfo {
+    pub(crate) oid: i64,
+    pub(crate) name: &'static str,
     typtype: &'static str,
-    typcategory: &'static str,
+    pub(crate) typcategory: &'static str,
     typlen: i64,
     typarray: i64,
     typelem: i64,
@@ -1818,7 +1826,7 @@ struct PgTypeInfo {
     typstorage: &'static str,
 }
 
-const PG_BASE_TYPES: &[PgTypeInfo] = &[
+pub(crate) const PG_BASE_TYPES: &[PgTypeInfo] = &[
     PgTypeInfo {
         oid: 16,
         name: "bool",
@@ -3126,16 +3134,12 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgLanguageTable>(PhantomData),
     );
+    options = options.native_module(
+        "pg_operator",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgOperatorTable>(PhantomData),
+    );
     for (name, create_sql) in [
-        (
-            "pg_operator",
-            "CREATE TABLE pg_operator (
-            oid INTEGER, oprname TEXT, oprnamespace INTEGER, oprowner INTEGER,
-            oprkind TEXT, oprcanmerge BOOLEAN, oprcanhash BOOLEAN, oprleft INTEGER,
-            oprright INTEGER, oprresult INTEGER, oprcom INTEGER, oprnegate INTEGER,
-            oprcode INTEGER, oprrest INTEGER, oprjoin INTEGER, tableoid INTEGER HIDDEN
-        )",
-        ),
         (
             "pg_opclass",
             "CREATE TABLE pg_opclass (
@@ -3294,6 +3298,47 @@ impl SnapshotRows for PgLanguageTable {
                     Value::from_i64(0),
                     Value::from_i64(0),
                     Value::Null,
+                ]
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct PgOperatorTable;
+
+impl SnapshotRows for PgOperatorTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_operator (
+        oid INTEGER, oprname TEXT, oprnamespace INTEGER, oprowner INTEGER,
+        oprkind TEXT, oprcanmerge BOOLEAN, oprcanhash BOOLEAN, oprleft INTEGER,
+        oprright INTEGER, oprresult INTEGER, oprcom INTEGER, oprnegate INTEGER,
+        oprcode INTEGER, oprrest INTEGER, oprjoin INTEGER, tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2617);
+    const ESTIMATED_COST: f64 = 1.0;
+    const ESTIMATED_ROWS: u32 = 400;
+
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        crate::operators::operators()
+            .iter()
+            .enumerate()
+            .map(|(index, operator)| {
+                vec![
+                    Value::from_i64(crate::operators::FIRST_OPERATOR_OID + index as i64),
+                    Value::build_text(operator.name),
+                    Value::from_i64(11),
+                    Value::from_i64(10),
+                    Value::build_text("b"),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(operator.left.oid()),
+                    Value::from_i64(operator.right.oid()),
+                    Value::from_i64(operator.result.oid()),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
                 ]
             })
             .collect()
