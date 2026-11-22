@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { unlinkSync, writeFileSync } from "node:fs";
 import { expect, test } from 'vitest'
 import { Database, connect, SqliteError, Transaction } from './promise.js'
@@ -5,7 +6,7 @@ import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 
 test('drizzle-orm', async () => {
-    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    const path = `test-${randomUUID()}.db`;
     try {
         const conn = await connect(path);
         const db = drizzle(conn);
@@ -61,7 +62,7 @@ test('concurrent calls on one prepared statement use their own parameters', asyn
 })
 
 test('busy timeout gives up on time when the write lock is never released', async () => {
-    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    const path = `test-${randomUUID()}.db`;
     try {
         const conn1 = await connect(path);
         await conn1.exec("CREATE TABLE t(x)");
@@ -88,7 +89,7 @@ test('busy timeout gives up on time when the write lock is never released', asyn
 })
 
 test('busy timeout sleeps instead of blocking the event loop', async () => {
-    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    const path = `test-${randomUUID()}.db`;
     try {
         const conn1 = await connect(path);
         await conn1.exec("CREATE TABLE t(x)");
@@ -139,7 +140,7 @@ test('expanded rows collapse duplicate column names like better-sqlite3', async 
 })
 
 test('readonly-db', async () => {
-    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    const path = `test-${randomUUID()}.db`;
     try {
         {
             const rw = await connect(path);
@@ -160,7 +161,7 @@ test('readonly-db', async () => {
 })
 
 test('file-must-exist', async () => {
-    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    const path = `test-${randomUUID()}.db`;
     const error = await connect(path, { fileMustExist: true }).then(() => undefined, (e) => e);
     expect(error).toBeInstanceOf(SqliteError);
     expect(error.code).toBe('SQLITE_CANTOPEN');
@@ -176,7 +177,7 @@ test('implicit connect', async () => {
 })
 
 test('errors carry the SQLite message and result code name', async () => {
-    const notADatabase = `test-${(Math.random() * 10000) | 0}.db`;
+    const notADatabase = `test-${randomUUID()}.db`;
     writeFileSync(notADatabase, Buffer.alloc(8192, 7));
     const db = await connect(':memory:');
     await db.exec('PRAGMA foreign_keys = ON');
@@ -338,7 +339,7 @@ test('columns() gives each column its origin and declared type, as in better-sql
 })
 
 test('on-disk db', async () => {
-    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    const path = `test-${randomUUID()}.db`;
     try {
         const db1 = await connect(path);
         await db1.exec("CREATE TABLE t(x)");
@@ -362,8 +363,8 @@ test('on-disk db', async () => {
 })
 
 test('attach', async () => {
-    const path1 = `test-${(Math.random() * 10000) | 0}.db`;
-    const path2 = `test-${(Math.random() * 10000) | 0}.db`;
+    const path1 = `test-${randomUUID()}.db`;
+    const path2 = `test-${randomUUID()}.db`;
     try {
         const db1 = await connect(path1, { experimental: ["attach"] });
         await db1.exec("CREATE TABLE t(x)");
@@ -429,7 +430,7 @@ test('blobs', async () => {
 })
 
 test('encryption', async () => {
-    const path = `test-encryption-${(Math.random() * 10000) | 0}.db`;
+    const path = `test-encryption-${randomUUID()}.db`;
     const hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';
     const wrongKey = 'aaaaaaa4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';
     try {
