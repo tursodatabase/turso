@@ -1608,10 +1608,10 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/serverless@npm:^0.2.2":
-  version: 0.2.4
-  resolution: "@tursodatabase/serverless@npm:0.2.4"
-  checksum: 10c0/4032c2312e0a04ed72cfef51f8e20ac5f4df9a98e3a361581953a8c7b7d80c862d5168e78eedbee976637347a1146baf0f25a629a8329af8b3d6c98c1d6c14b2
+"@tursodatabase/serverless@npm:^1.4.1":
+  version: 1.4.1
+  resolution: "@tursodatabase/serverless@npm:1.4.1"
+  checksum: 10c0/a9360b24fda5b748b2bd76205d778e7140ca7cf2349e416f670445b9e6b320fa9dbee588c22c1046bc688ba715b4bf55800b6e57643d5a9ce65a93a2ac370ade
   languageName: node
   linkType: hard
 
@@ -1620,7 +1620,7 @@ __metadata:
   resolution: "@tursodatabase/sync-common@workspace:sync/packages/common"
   dependencies:
     "@tursodatabase/database-common": "npm:^0.9.0-pre.6"
-    "@tursodatabase/serverless": "npm:^0.2.2"
+    "@tursodatabase/serverless": "npm:^1.4.1"
     "@types/node": "npm:^24.12.2"
     typescript: "npm:^5.9.2"
   languageName: unknown

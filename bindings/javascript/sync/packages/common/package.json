@@ -25,6 +25,6 @@
   },
   "dependencies": {
     "@tursodatabase/database-common": "^0.9.0-pre.6",
-    "@tursodatabase/serverless": "^0.2.2"
+    "@tursodatabase/serverless": "^1.4.1"
   }
 }

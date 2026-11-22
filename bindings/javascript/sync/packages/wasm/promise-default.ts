@@ -149,7 +149,7 @@ class Database extends DatabasePromise {
             this.#remoteWriter = new RemoteWriter({
                 url,
                 authToken: opts.authToken,
-                remoteEncryptionKey: opts.remoteEncryption?.key,
+                remoteEncryption: opts.remoteEncryption,
             });
         }
     }

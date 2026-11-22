@@ -1,9 +1,10 @@
 import { Session, type SessionConfig } from "@tursodatabase/serverless";
+import type { EncryptionOpts } from "./types.js";
 
 export interface RemoteWriterConfig {
     url: string;
     authToken?: string | (() => Promise<string>);
-    remoteEncryptionKey?: string;
+    remoteEncryption?: EncryptionOpts;
 }
 
 /**
@@ -28,11 +29,16 @@ export class RemoteWriter {
     }
 
     private async createSession(): Promise<Session> {
+        const encryption = this.config.remoteEncryption;
+        if (encryption && (!encryption.cipher || !encryption.key)) {
+            throw new Error("encrypted sync requests require both a cipher and a cloud key");
+        }
         const authToken = await this.resolveAuthToken();
         const sessionConfig: SessionConfig = {
             url: this.config.url,
             authToken,
-            remoteEncryptionKey: this.config.remoteEncryptionKey,
+            remoteEncryptionKey: encryption?.key,
+            requestHeaders: encryption ? { "x-turso-encryption-cipher": encryption.cipher } : undefined,
         };
         return new Session(sessionConfig);
     }
