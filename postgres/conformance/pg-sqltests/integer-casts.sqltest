@@ -1373,3 +1373,11 @@ expect {
     123456
     12345678901
 }
+
+test oid-domain-cast {
+    CREATE DOMAIN doid AS oid;
+    SELECT '3000000000'::doid;
+}
+expect {
+    3000000000
+}

@@ -7077,7 +7077,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         // Types with Turso custom type equivalents
         "BOOLEAN" | "BOOL" => "boolean".into(),
         "SMALLINT" | "INT2" => "smallint".into(),
-        "BIGINT" | "INT8" => "bigint".into(),
+        "BIGINT" | "OID" | "INT8" => "bigint".into(),
         "UUID" => "uuid".into(),
         "DATE" => "date".into(),
         "TIME" => "time".into(),
@@ -7118,7 +7118,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "XML" | "TSVECTOR" | "TSQUERY" => "TEXT".into(),
         "MONEY" => "REAL".into(),
         "BIT" | "VARBIT" => "TEXT".into(),
-        "OID" | "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR"
+        "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR"
         | "REGCONFIG" | "REGDICTIONARY" | "REGNAMESPACE" | "REGROLE" => "INTEGER".into(),
         "VOID" => "TEXT".into(),
 
