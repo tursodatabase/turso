@@ -295,6 +295,12 @@ pub struct ProgramBuilder {
     /// `anchor_offset + 1` so it tracks whichever instruction ends up at that
     /// position, even after `emit_constant_insns` reorders the program.
     label_to_resolved_offset: Vec<Option<InsnReference>>,
+    /// The largest anchor in `label_to_resolved_offset`. While instructions
+    /// are emitted, a label is only anchored to the last instruction or to the
+    /// anchor of another label, so no anchor is past the last instruction, and
+    /// a label targets the next instruction exactly when this anchor is the
+    /// last instruction.
+    max_label_anchor: Option<InsnReference>,
     explain: ExplainInfo,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
@@ -880,6 +886,7 @@ impl ProgramBuilder {
             cursor_ref: Vec::with_capacity(opts.num_cursors),
             constant_spans: Vec::new(),
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
+            max_label_anchor: None,
             explain: ExplainInfo::default(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
@@ -1557,7 +1564,12 @@ impl ProgramBuilder {
             return false;
         };
         let last = last as u32;
-        self.label_to_resolved_offset.contains(&Some(last))
+        let targets = self.max_label_anchor == Some(last);
+        crate::turso_debug_assert!(
+            targets == self.label_to_resolved_offset.contains(&Some(last)),
+            "the largest label anchor gives another answer than the labels"
+        );
+        targets
     }
 
     /// Emit an instruction that should not start or extend a constant span on its own.
@@ -1781,6 +1793,12 @@ impl ProgramBuilder {
                 *resolved_offset = Some(old_to_new[*old_offset as usize] as u32);
             }
         }
+        self.max_label_anchor = self
+            .label_to_resolved_offset
+            .iter()
+            .flatten()
+            .copied()
+            .max();
 
         self.explain.remap_insn_indices(&old_to_new);
 
@@ -1833,6 +1851,7 @@ impl ProgramBuilder {
         };
         let anchor = self.offset().as_offset_int().saturating_sub(1);
         self.label_to_resolved_offset[label_number as usize] = Some(anchor);
+        self.max_label_anchor = self.max_label_anchor.max(Some(anchor));
     }
 
     /// Resolve `dest` so that it ends up pointing at the same final offset as
@@ -1857,6 +1876,7 @@ impl ProgramBuilder {
         let resolution = self.label_to_resolved_offset[anchor_n as usize]
             .expect("anchor label must already be preassigned/resolved");
         self.label_to_resolved_offset[dest_n as usize] = Some(resolution);
+        self.max_label_anchor = self.max_label_anchor.max(Some(resolution));
     }
 
     /// Resolve unresolved labels to a specific offset in the instruction list.
@@ -2104,6 +2124,7 @@ impl ProgramBuilder {
             }
         }
         self.label_to_resolved_offset.clear();
+        self.max_label_anchor = None;
         Ok(())
     }
 
