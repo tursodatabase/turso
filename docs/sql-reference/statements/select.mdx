@@ -406,7 +406,7 @@ Always use ORDER BY with LIMIT and OFFSET. Without ORDER BY, the set of rows ski
 SELECT * FROM employees ORDER BY salary DESC LIMIT 3 WITH TIES;
 ```
 
-`WITH TIES` needs an ORDER BY clause. NULL values tie with each other. `WITH TIES` is written after OFFSET, and the rows that OFFSET skips are not counted. A compound SELECT and a recursive common table expression do not accept `WITH TIES`. A query with `WITH TIES` always sorts its rows, also when an index provides the ORDER BY order.
+`WITH TIES` needs an ORDER BY clause. NULL values tie with each other. `WITH TIES` is written after OFFSET, and the rows that OFFSET skips are not counted. A recursive common table expression does not accept `WITH TIES`. A query with `WITH TIES` always sorts its rows, also when an index provides the ORDER BY order.
 
 ## Subqueries
 

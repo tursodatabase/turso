@@ -87,15 +87,6 @@ pub struct SortMetadata {
 }
 pub struct EmitOrderBy;
 
-struct LimitWithTies {
-    /// ORDER BY terms of the last counted row.
-    reg_last_counted_key_start: usize,
-    reg_key_start: usize,
-    /// 0 until the limit has counted its last row.
-    reg_limit_reached: usize,
-    label_limit_reached: BranchOffset,
-}
-
 impl EmitOrderBy {
     /// Initialize resources needed for ORDER BY processing
     #[allow(clippy::too_many_arguments)]
@@ -335,18 +326,14 @@ impl EmitOrderBy {
                 !use_heap_sort,
                 "LIMIT WITH TIES reads its rows from a sorter"
             );
-            let ties = LimitWithTies {
-                // `Insn::Compare` needs its first run of registers to come before its second.
-                reg_last_counted_key_start: program.alloc_registers(order_by.len()),
-                reg_key_start: program.alloc_registers(order_by.len()),
-                reg_limit_reached: program.alloc_register(),
-                label_limit_reached: program.allocate_label(),
-            };
-            program.emit_insn(Insn::Integer {
-                value: 0,
-                dest: ties.reg_limit_reached,
-            });
-            Some(ties)
+            let mut key_collations = std::vec::Vec::with_capacity(order_by.len());
+            for (expr, _, _) in order_by.iter() {
+                key_collations.push(
+                    ExprContext::new(Some(&plan.table_references), &t_ctx.resolver)
+                        .expr_collation(expr)?,
+                );
+            }
+            Some(LimitWithTies::alloc(program, key_collations))
         } else {
             None
         };
@@ -382,35 +369,7 @@ impl EmitOrderBy {
         }
 
         if let Some(ties) = &limit_with_ties {
-            // Past the limit, the first row that differs from the last counted row ends the query.
-            let label_row_is_returned = program.allocate_label();
-            program.emit_insn(Insn::IfNot {
-                reg: ties.reg_limit_reached,
-                target_pc: label_row_is_returned,
-                jump_if_null: true,
-            });
-            let mut key_info = std::vec::Vec::with_capacity(order_by.len());
-            for (i, (expr, _, _)) in order_by.iter().enumerate() {
-                program.emit_column_or_rowid(cursor_id, i, ties.reg_key_start + i);
-                key_info.push(KeyInfo {
-                    sort_order: SortOrder::Asc,
-                    collation: ExprContext::new(Some(&plan.table_references), &t_ctx.resolver)
-                        .expr_collation(expr)?,
-                    nulls_order: None,
-                });
-            }
-            program.emit_insn(Insn::Compare {
-                start_reg_a: ties.reg_last_counted_key_start,
-                start_reg_b: ties.reg_key_start,
-                count: order_by.len(),
-                key_info,
-            });
-            program.emit_insn(Insn::Jump {
-                target_pc_lt: sort_loop_end_label,
-                target_pc_eq: label_row_is_returned,
-                target_pc_gt: sort_loop_end_label,
-            });
-            program.preassign_label_to_next_insn(label_row_is_returned);
+            ties.emit_stop_after_the_last_tie(program, cursor_id, sort_loop_end_label);
         }
 
         emit_offset(program, sort_loop_next_label, t_ctx.reg_offset);
@@ -476,18 +435,7 @@ impl EmitOrderBy {
             },
         )?;
         if let Some(ties) = &limit_with_ties {
-            // A row past the limit takes the counter below zero, so it does not jump here.
-            program.emit_insn(Insn::Goto {
-                target_pc: sort_loop_next_label,
-            });
-            program.preassign_label_to_next_insn(ties.label_limit_reached);
-            for i in 0..order_by.len() {
-                program.emit_column_or_rowid(cursor_id, i, ties.reg_last_counted_key_start + i);
-            }
-            program.emit_insn(Insn::Integer {
-                value: 1,
-                dest: ties.reg_limit_reached,
-            });
+            ties.emit_keep_last_counted_row(program, cursor_id, sort_loop_next_label);
         }
 
         program.preassign_label_to_next_insn(sort_loop_next_label);
@@ -733,6 +681,104 @@ impl EmitOrderBy {
             );
         }
         Ok(())
+    }
+}
+
+/// Registers and labels for `LIMIT ... WITH TIES` in a loop that reads rows from a sorter
+/// whose first columns are the ORDER BY terms.
+pub(crate) struct LimitWithTies {
+    /// ORDER BY terms of the last counted row.
+    reg_last_counted_key_start: usize,
+    reg_key_start: usize,
+    /// 0 until the limit has counted its last row.
+    reg_limit_reached: usize,
+    key_collations: std::vec::Vec<CollationSeq>,
+    /// The LIMIT check jumps here, instead of ending the loop, when it counts its last row.
+    pub(crate) label_limit_reached: BranchOffset,
+}
+
+impl LimitWithTies {
+    /// `key_collations` are the collations the sorter orders the ORDER BY terms by. With other
+    /// collations the ties would end at a different row than the sort order does.
+    pub(crate) fn alloc(
+        program: &mut ProgramBuilder,
+        key_collations: std::vec::Vec<CollationSeq>,
+    ) -> Self {
+        let key_count = key_collations.len();
+        let ties = Self {
+            // `Insn::Compare` needs its first run of registers to come before its second.
+            reg_last_counted_key_start: program.alloc_registers(key_count),
+            reg_key_start: program.alloc_registers(key_count),
+            reg_limit_reached: program.alloc_register(),
+            key_collations,
+            label_limit_reached: program.allocate_label(),
+        };
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: ties.reg_limit_reached,
+        });
+        ties
+    }
+
+    /// Once the limit has counted its last row, jumps to `label_end` at the first row of
+    /// `cursor_id` that differs from that row in an ORDER BY term.
+    pub(crate) fn emit_stop_after_the_last_tie(
+        &self,
+        program: &mut ProgramBuilder,
+        cursor_id: usize,
+        label_end: BranchOffset,
+    ) {
+        let label_row_is_returned = program.allocate_label();
+        program.emit_insn(Insn::IfNot {
+            reg: self.reg_limit_reached,
+            target_pc: label_row_is_returned,
+            jump_if_null: true,
+        });
+        for i in 0..self.key_collations.len() {
+            program.emit_column_or_rowid(cursor_id, i, self.reg_key_start + i);
+        }
+        program.emit_insn(Insn::Compare {
+            start_reg_a: self.reg_last_counted_key_start,
+            start_reg_b: self.reg_key_start,
+            count: self.key_collations.len(),
+            key_info: self
+                .key_collations
+                .iter()
+                .map(|&collation| KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation,
+                    nulls_order: None,
+                })
+                .collect(),
+        });
+        program.emit_insn(Insn::Jump {
+            target_pc_lt: label_end,
+            target_pc_eq: label_row_is_returned,
+            target_pc_gt: label_end,
+        });
+        program.preassign_label_to_next_insn(label_row_is_returned);
+    }
+
+    /// Emits a jump to `label_next_row`, then the code at `label_limit_reached`, which keeps the
+    /// ORDER BY terms of the row of `cursor_id` that the limit counted last.
+    pub(crate) fn emit_keep_last_counted_row(
+        &self,
+        program: &mut ProgramBuilder,
+        cursor_id: usize,
+        label_next_row: BranchOffset,
+    ) {
+        // A row past the limit takes the counter below zero, so it does not jump here.
+        program.emit_insn(Insn::Goto {
+            target_pc: label_next_row,
+        });
+        program.preassign_label_to_next_insn(self.label_limit_reached);
+        for i in 0..self.key_collations.len() {
+            program.emit_column_or_rowid(cursor_id, i, self.reg_last_counted_key_start + i);
+        }
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: self.reg_limit_reached,
+        });
     }
 }
 

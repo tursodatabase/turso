@@ -106,12 +106,20 @@ expect error {
     WITH TIES cannot be specified without ORDER BY clause
 }
 
+test compound-select-ties-use-the-order-by-collation {
+    SELECT 'a' AS b UNION ALL SELECT 'B' UNION ALL SELECT 'A' ORDER BY 1 COLLATE NOCASE LIMIT 1 WITH TIES;
+}
+expect unordered {
+    a
+    A
+}
+
 @setup rows
-test error-compound-select {
-    SELECT a FROM t UNION ALL SELECT a FROM t ORDER BY 1 LIMIT 1 WITH TIES;
+test error-compound-select-without-order-by {
+    SELECT a FROM t UNION ALL SELECT a FROM t LIMIT 1 WITH TIES;
 }
 expect error {
-    WITH TIES is not supported in a compound SELECT
+    WITH TIES cannot be specified without ORDER BY clause
 }
 
 @setup rows

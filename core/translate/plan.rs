@@ -465,6 +465,8 @@ pub enum Plan {
         right_most: Box<SelectPlan>,
         limit: Option<Box<Expr>>,
         offset: Option<Box<Expr>>,
+        /// `LIMIT ... WITH TIES`: rows equal to the last counted row in every ORDER BY term follow it.
+        limit_with_ties: bool,
         /// ORDER BY for compound selects, or `None` when the query has none.
         order_by: Option<Vec<CompoundOrderByKey>>,
     },

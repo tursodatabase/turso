@@ -266,8 +266,9 @@ pub(crate) fn prepare_select_plan_from_arms(
             );
         }
     }
-    if limit.as_ref().is_some_and(|limit| limit.with_ties) {
-        crate::bail_parse_error!("WITH TIES is not supported in a compound SELECT");
+    let limit_with_ties = limit.as_ref().is_some_and(|limit| limit.with_ties);
+    if limit_with_ties && order_by.is_empty() {
+        crate::bail_parse_error!("WITH TIES cannot be specified without ORDER BY clause");
     }
     let (mut limit, mut offset) =
         limit.map_or(Ok((None, None)), |limit| parse_limit(limit, resolver))?;
@@ -298,6 +299,7 @@ pub(crate) fn prepare_select_plan_from_arms(
         right_most: Box::new(last),
         limit,
         offset,
+        limit_with_ties,
         order_by,
     })
 }
