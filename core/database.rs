@@ -2614,14 +2614,8 @@ impl Database {
                 WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
             }
         };
-        let new_shared_wal = Arc::try_unwrap(new_shared_wal).map_err(|_| {
-            LimboError::InternalError(
-                "new WAL state unexpectedly shared during external restore reload".to_string(),
-            )
-        })?;
-        let new_shared_wal = new_shared_wal.into_inner();
         if let Some(context) = encryption_context.as_ref() {
-            self.validate_external_restore_wal(&new_shared_wal, context)?;
+            self.validate_external_restore_wal(&new_shared_wal.read(), context)?;
         }
         let new_mv_store = if self.mvcc_enabled()
             || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
@@ -2647,9 +2641,15 @@ impl Database {
         } else {
             None
         };
+        // Completed recovery callbacks may retain the Arc; leave them an empty state.
+        let restored = std::mem::replace(
+            &mut *new_shared_wal.write(),
+            WalFileShared::new_noop_state(),
+        );
         self.shared_wal
             .write()
-            .replace_after_external_restore(new_shared_wal);
+            .replace_after_external_restore(restored);
+        drop(new_shared_wal);
         self.mv_store.store(new_mv_store.clone());
         if let Some(mv_store) = new_mv_store {
             let mvcc_bootstrap_conn = self._connect(
@@ -2744,7 +2744,13 @@ impl Database {
         let key = key.ok_or_else(|| {
             LimboError::InvalidArgument("encrypted database requires an encryption key".into())
         })?;
-        self.pager_state.verify_encryption_key(key)?;
+        let mut context = self.pager_state.verify_encryption_key(key)?;
+        if self.db_file.size()? == 0 {
+            if let Some(page_size) = self.pager_state.page_size() {
+                context.set_page_size(page_size);
+            }
+            return Ok(Some(context));
+        }
         let mut state = HeaderAuthenticationState::default();
         let header = self
             .io

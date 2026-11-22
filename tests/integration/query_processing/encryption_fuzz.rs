@@ -46,6 +46,11 @@ fn seeded_encryption_state_machine() {
     campaign(seed, cases);
 }
 
+#[test]
+fn encrypted_reload_with_retained_completions_regression() {
+    campaign(11283090107835449216, 6);
+}
+
 fn campaign(seed: u64, cases: u64) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     for index in 0..cases {

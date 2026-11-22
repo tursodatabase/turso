@@ -830,7 +830,7 @@ Every open and connection independently authenticates its credentials before sha
 
 Each encrypted attachment requires its own cipher/key URI. Non-NULL `ATTACH ... KEY` values are rejected before opening or creating the target. `KEY NULL` uses the URI credentials. Serialize other opens of a fresh target until ATTACH completes. In-place VACUUM preserves encryption for the main database and rejects encrypted attached databases. VACUUM INTO produces a plaintext destination.
 
-External storage restore is not supported with built-in encryption. Sync encryption is not supported.
+After an external storage restore, reload through the connection with its current encryption key. Reload rejects database or sidecar files encrypted with another key and cannot change the page size or reserved bytes. Sync encryption is not supported.
 
 Built-in encryption protects database storage, WAL, and encrypted MVCC storage. Serialize writes until the first page of a new database has been initialized, including across connections, raw/custom-storage opens, and separate processes. Recovery after a failed or abandoned initial write is not guaranteed.
 

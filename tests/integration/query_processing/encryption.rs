@@ -2671,6 +2671,82 @@ fn connect_async_yields_and_cancellation_releases_read_transactions() -> anyhow:
 }
 
 #[test]
+fn encrypted_reload_accepts_an_unwritten_database() -> anyhow::Result<()> {
+    for cipher in [CIPHER_A, CIPHER_B] {
+        let tmp = TempDatabaseBuilder::new()
+            .with_encryption(cipher, KEY_A)
+            .build();
+        let owner = tmp.connect_limbo();
+        assert_eq!(std::fs::metadata(&tmp.path)?.len(), 0);
+        assert!(tmp.db.reload_wal_after_external_restore().is_err());
+        assert!(tmp
+            .db
+            .reload_wal_after_external_restore_with_encryption_key(Some(
+                EncryptionKey::from_hex_string(KEY_B)?,
+            ))
+            .is_err());
+        std::fs::write(&tmp.path, [0; 16])?;
+        assert!(owner.reload_wal_after_external_restore().is_err());
+        assert_eq!(std::fs::read(&tmp.path)?, [0; 16]);
+        std::fs::write(&tmp.path, [])?;
+        let foreign = TempDatabaseBuilder::new()
+            .with_encryption(cipher, KEY_B)
+            .build();
+        let foreign_owner = foreign.connect_limbo();
+        foreign_owner.execute("CREATE TABLE secrets(value TEXT)")?;
+        foreign_owner.execute("INSERT INTO secrets VALUES ('foreign')")?;
+        let wal_path = format!("{}-wal", tmp.path.display());
+        let original_wal = std::fs::read(&wal_path)?;
+        let foreign_wal = std::fs::read(format!("{}-wal", foreign.path.display()))?;
+        assert!(!foreign_wal.is_empty());
+        std::fs::write(&wal_path, &foreign_wal)?;
+        let error = owner.reload_wal_after_external_restore().unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("decrypt"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&wal_path)?, foreign_wal);
+        std::fs::write(&wal_path, original_wal)?;
+        owner.reload_wal_after_external_restore()?;
+        assert_eq!(std::fs::metadata(&tmp.path)?.len(), 0);
+        owner.execute("CREATE TABLE secrets(value TEXT)")?;
+        owner.execute("INSERT INTO secrets VALUES ('after reload')")?;
+        owner.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
+        assert_eq!(rows, [("after reload".into(),)]);
+    }
+    Ok(())
+}
+
+#[test]
+fn encrypted_reload_with_retained_completions() -> anyhow::Result<()> {
+    for cipher in [CIPHER_A, CIPHER_B] {
+        for mvcc in [false, true] {
+            let database = Database::open(
+                Arc::new(crate::queued_io::QueuedIo::new()),
+                "retained-completions.db",
+                attach_matrix_options(Some(cipher), mvcc, KEY_A),
+            )?;
+            let owner = database.connect(
+                ConnectOpts::new(SessionRole::Superuser)
+                    .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?)),
+            )?;
+            owner.execute("CREATE TABLE secrets(value TEXT)")?;
+            owner.execute("INSERT INTO secrets VALUES ('before reload')")?;
+            owner.reload_wal_after_external_restore()?;
+            owner.publish_schema_after_external_restore()?;
+            let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
+            assert_eq!(rows, [("before reload".into(),)]);
+            owner.execute("INSERT INTO secrets VALUES ('after reload')")?;
+            owner.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            let rows: Vec<(i64,)> = owner.exec_rows("SELECT count(*) FROM secrets");
+            assert_eq!(rows, [(2,)]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn encrypted_restore_recovers_torn_sidecar_tail() -> anyhow::Result<()> {
     for cipher in [CIPHER_A, CIPHER_B] {
         for mvcc in [false, true] {
