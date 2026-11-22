@@ -1684,7 +1684,7 @@ fn parse_from_clause_table(
                     join_info: None,
                     col_used_mask: ColumnUsedMask::default(),
                     cte_select: (!cte_definition.references_itself)
-                        .then(|| cte_definition.select.clone()),
+                        .then(|| Arc::new(cte_definition.select.clone())),
                     cte_explicit_columns: cte_definition.explicit_columns.clone(),
                     cte_id: Some(cte_definition.cte_id),
                     cte_definition_only: true,
@@ -2111,7 +2111,7 @@ fn parse_table(
                 // Plan each use separately so two uses do not receive the same
                 // table or cursor IDs.
                 let cte_query_plan = prepare_select_plan(
-                    cte_select,
+                    ast::Select::clone(&cte_select),
                     resolver,
                     program,
                     table_references.outer_query_refs(),
@@ -2607,7 +2607,8 @@ fn add_ctes_read_by_subqueries_as_outer_refs(
             table: joined_table.table,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
-            cte_select: (!cte_definition.references_itself).then(|| cte_definition.select.clone()),
+            cte_select: (!cte_definition.references_itself)
+                .then(|| Arc::new(cte_definition.select.clone())),
             cte_explicit_columns: cte_definition.explicit_columns.clone(),
             cte_id: Some(cte_definition.cte_id),
             // This entry only lets a nested FROM clause find the CTE name.

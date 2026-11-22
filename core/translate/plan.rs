@@ -2078,8 +2078,9 @@ pub struct OuterQueryReference {
     pub col_used_mask: ColumnUsedMask,
     /// Original CTE SELECT AST for re-planning. When a CTE is referenced
     /// multiple times, each reference needs a fresh plan with unique
-    /// internal_ids to avoid cursor key collisions.
-    pub cte_select: Option<ast::Select>,
+    /// internal_ids to avoid cursor key collisions. Shared, because the outer
+    /// query references are copied into the scope of each nested query.
+    pub cte_select: Option<Arc<ast::Select>>,
     /// Explicit column names from WITH t(a, b) AS (...) syntax.
     pub cte_explicit_columns: Vec<String>,
     /// CTE ID if this is a CTE reference. Used to track CTE reference counts
