@@ -2067,3 +2067,38 @@ expect {
     1
     {2024-01-05}
 }
+
+# A VALUES subquery's column has the type of its rows, so comparing it with
+# another custom type fails like comparing the rows' values would, through an
+# IN subquery and a scalar subquery.
+
+@requires strict "uses STRICT tables"
+test cmp-date-in-values-of-timestamp-is-an-error {
+    CREATE TABLE t(d date, ts timestamp) STRICT;
+    SELECT d IN (VALUES (ts)) FROM t;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-eq-scalar-values-of-timestamp-is-an-error {
+    CREATE TABLE t(d date, ts timestamp) STRICT;
+    SELECT d = (VALUES (ts)) FROM t;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-text-in-values-is-read-as-the-type-of-the-values {
+    -- The text is read as a timestamptz, so its offset is applied before the
+    -- values are compared.
+    CREATE TABLE t(tz timestamptz) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 00:00:00+00');
+    SELECT '2024-01-05 02:00:00+02' IN (VALUES (tz)) FROM t;
+}
+expect {
+    1
+}
+
