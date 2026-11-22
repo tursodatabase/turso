@@ -843,7 +843,18 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
                         context,
                     )?;
                 }
-                _ => {}
+                Some(
+                    ResultType::OneOfTheArguments
+                    | ResultType::Declared(_)
+                    | ResultType::FirstArgument
+                    | ResultType::NumberOfTheFirstArgumentsType
+                    | ResultType::AbsOfTheFirstArgument
+                    | ResultType::RealForARealArgument
+                    | ResultType::TextOrBlobLikeTheFirstArgument
+                    | ResultType::ElementOfTheFirstArgument
+                    | ResultType::Unknown,
+                )
+                | None => {}
             }
             Ok(())
         }
