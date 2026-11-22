@@ -41,7 +41,7 @@ use crate::{
             QueryDestination, ResultSetColumn, TableReferences,
         },
         planner::{collect_subquery_table_refs_in_expr, plan_ctes_as_outer_refs, ROWID_STRS},
-        select::translate_select,
+        select::translate_insert_source_select,
         stmt_journal::{any_index_or_ipk_has_replace, set_insert_stmt_journal_flags},
         subquery::{
             emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery,
@@ -2538,7 +2538,13 @@ fn init_source_emission<'a>(
                     coroutine_implementation_start: ctx.halt_label,
                 };
                 let num_result_cols = program.nested(|program| {
-                    translate_select(select, resolver, program, query_destination, connection)
+                    translate_insert_source_select(
+                        select,
+                        resolver,
+                        program,
+                        query_destination,
+                        connection,
+                    )
                 })?;
                 if num_result_cols != required_column_count {
                     crate::bail_parse_error!(

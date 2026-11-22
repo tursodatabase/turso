@@ -192,6 +192,30 @@ statements of one query string;
 `clock_timestamp()` reads the clock at each call. All of them have microsecond
 precision.
 
+Comparing values of two different custom types fails when either type changes
+the values it stores (a STRUCT or UNION, a type with ENCODE or a DECODE other
+than `value`), unless the two already have one order in common, as `numeric`
+and `bigint` do. A domain compares as the type it is declared on, so two
+domains over one type compare as that type. So a `timestamp` with a
+`timestamptz`, and a `timestamptz` with a `varchar(n)`, fail. PostgreSQL refuses
+the second pair too, with 42883.
+The error is `cannot compare type x with type y` with SQLSTATE 0A000. Turso
+refuses comparisons that PostgreSQL may run and does not know which ones, so
+the code differs from PostgreSQL's 42883 where PostgreSQL also refuses. It covers `=`, `<`,
+`IS DISTINCT FROM`, BETWEEN, IN and `IN (SELECT ...)`, `CASE x WHEN`, `NULLIF`,
+`min` and `max`, and joins, with or without an index. The same two types in
+one result column fail the same way: in UNION, UNION ALL, INTERSECT, EXCEPT, a
+multi-row VALUES that is not the row source of an INSERT, a recursive CTE with
+UNION, the results of CASE, `coalesce`, `ifnull` and `iif`, and `lag` and `lead`
+with a default of another type. Not refused yet, and compared as stored: a
+recursive CTE with UNION ALL, a comparison with a VALUES subquery such as
+`d IN (VALUES (ts))`, and array functions that compare elements, such as
+`array_position`. PostgreSQL converts or refuses these. A string literal compared with a custom type is read as that type.
+Two arrays compare when their element types compare, so `date[]` with
+`timestamp[]` fails. Two types that only check a value, such as `varchar(n)` and
+`smallint`, compare as they did before this check, as stored. PostgreSQL refuses
+that pair, so Turso accepts a comparison that PostgreSQL rejects.
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |

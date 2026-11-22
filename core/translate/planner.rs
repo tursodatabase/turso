@@ -1448,6 +1448,7 @@ fn prepare_recursive_cte_plan(
         outer_query_refs,
         QueryDestination::placeholder_for_subquery(),
         connection,
+        false,
     )?;
 
     let explicit_columns = (!cte_definition.explicit_columns.is_empty())
@@ -1509,6 +1510,7 @@ fn prepare_recursive_cte_plan(
         &recursive_query_outer_refs,
         QueryDestination::placeholder_for_subquery(),
         connection,
+        false,
     )?;
 
     if initial_query.select_result_columns().len() != recursive_query.select_result_columns().len()
