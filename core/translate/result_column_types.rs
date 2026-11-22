@@ -7,7 +7,7 @@ use turso_parser::ast;
 use super::emitter::Resolver;
 use super::expr::expr_type::{type_of, BuiltinType, ExprType, TypeEnv};
 use super::plan::{ResultSetColumn, TableReferences};
-use crate::schema::Schema;
+use crate::schema::{Schema, Table};
 use crate::statement::{ColumnTypeInfo, ColumnTypeKind};
 
 pub(crate) fn result_column_types(
@@ -25,13 +25,27 @@ pub(crate) fn result_column_types(
                 return expression_type(ty, resolver.schema());
             }
             match &column.expr {
-                ast::Expr::Column { table, column, .. } => {
+                ast::Expr::Column { table, column, .. }
+                    if !is_derived_table(*table, table_references) =>
+                {
                     table_column_type(*table, *column, table_references, resolver.schema())
                 }
                 expr => expression_type(&type_of(expr, &env), resolver.schema()),
             }
         })
         .collect()
+}
+
+/// The columns of a subquery or recursive CTE have the types of the
+/// expressions that computed them, not a declared type.
+fn is_derived_table(table: ast::TableInternalId, table_references: &TableReferences) -> bool {
+    matches!(
+        table_references.find_table_by_internal_id(table),
+        Some((
+            _,
+            Table::FromClauseSubquery(_) | Table::RecursiveCteInput(_)
+        ))
+    )
 }
 
 /// A table column reports the type name it was declared with.
