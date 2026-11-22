@@ -1922,7 +1922,7 @@ pub(crate) async fn wal_apply_from_staging<Ctx>(
         db_size = info.db_size;
         session.append_page(info.page_no, &record[WAL_FRAME_HEADER..])?;
     }
-    if !reader.is_empty() && db_size == 0 {
+    if db_size == 0 {
         return Err(Error::DatabaseSyncEngineError(
             "page changes lack a final commit marker".into(),
         ));

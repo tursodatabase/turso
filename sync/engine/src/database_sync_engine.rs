@@ -5255,6 +5255,13 @@ mod tests {
 
                 let changes_file =
                     io.open_file(&changes_path, turso_core::OpenFlags::None, false)?;
+                let records = changes_file.size()? as usize / super::WAL_FRAME_SIZE;
+                let changes_file = crate::changes_file::ChangesFile::from_plaintext_test_file(
+                    changes_file,
+                    crate::sync_cipher::ChangeKind::Pages,
+                    records,
+                    records * super::WAL_FRAME_SIZE,
+                );
                 let result = engine
                     .apply_changes_from_remote(
                         &coro,
@@ -5265,7 +5272,7 @@ mod tests {
                             },
                             revision: new_revision,
                             file_slot: Some(MutexSlot {
-                                value: changes_file,
+                                value: Some(changes_file),
                                 slot: Arc::new(Mutex::new(None)),
                             }),
                             stream_kind: DbChangesStreamKind::Pages,
