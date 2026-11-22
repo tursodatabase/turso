@@ -1,6 +1,7 @@
 use crate::functions::validate_pg_input;
 use crate::roles::{connection_roles, schema_roles, Role, RoleCatalog};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::borrow::Cow;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -453,19 +454,11 @@ fn concat_ws_joining_empty_arguments(args: &[Register]) -> Value {
     let Some(separator) = separator.get_value().cast_text_ref() else {
         return Value::Null;
     };
-    let mut result = String::new();
-    let mut joined_any = false;
-    for argument in arguments {
-        let Some(part) = argument.get_value().cast_text_ref() else {
-            continue;
-        };
-        if joined_any {
-            result.push_str(&separator);
-        }
-        joined_any = true;
-        result.push_str(&part);
-    }
-    Value::build_text(result)
+    let parts: Vec<Cow<'_, str>> = arguments
+        .iter()
+        .filter_map(|argument| argument.get_value().cast_text_ref())
+        .collect();
+    Value::build_text(parts.join(&separator))
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
