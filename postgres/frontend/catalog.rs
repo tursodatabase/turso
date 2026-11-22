@@ -286,6 +286,13 @@ impl Dialect for PostgresDialect {
         crate::operators::resolve_boolean_argument(operand)
     }
 
+    fn common_untyped_type(
+        &self,
+        types: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+    ) -> Option<String> {
+        crate::operators::common_untyped_type(&types())
+    }
+
     fn check_literal_cast(&self, text: &str, type_name: &str) -> Result<()> {
         crate::casts::check_literal_cast(text, type_name)
     }

@@ -133,12 +133,22 @@ fn operand_slots(expr: &mut ast::Expr) -> Vec<&mut ast::Expr> {
         ast::Expr::Case {
             base,
             when_then_pairs,
-            ..
-        } => base
-            .iter_mut()
-            .map(|base| base.as_mut())
-            .chain(when_then_pairs.iter_mut().map(|(when, _)| when.as_mut()))
-            .collect(),
+            else_expr,
+        } => {
+            let mut slots: Vec<&mut ast::Expr> =
+                base.iter_mut().map(|base| base.as_mut()).collect();
+            let (whens, thens): (Vec<_>, Vec<_>) = when_then_pairs
+                .iter_mut()
+                .map(|(when, then)| (when.as_mut(), then.as_mut()))
+                .unzip();
+            slots.extend(whens);
+            slots.extend(thens);
+            slots.extend(else_expr.iter_mut().map(|value| value.as_mut()));
+            slots
+        }
+        ast::Expr::FunctionCall { name, args, .. } if unifies_arguments(name, args.len()) => {
+            args.iter_mut().map(|arg| arg.as_mut()).collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -150,6 +160,8 @@ struct OperatorUses<'a> {
     slots: Vec<&'a ast::Expr>,
     pairs: Vec<(usize, &'static str, usize)>,
     booleans: Vec<(usize, &'static str)>,
+    prefixes: Vec<(usize, &'static str)>,
+    unified: Vec<usize>,
 }
 
 fn operator_uses<'a>(expr: &'a ast::Expr) -> Option<OperatorUses<'a>> {
@@ -157,6 +169,8 @@ fn operator_uses<'a>(expr: &'a ast::Expr) -> Option<OperatorUses<'a>> {
         slots: Vec::new(),
         pairs: Vec::new(),
         booleans: Vec::new(),
+        prefixes: Vec::new(),
+        unified: Vec::new(),
     };
     match expr {
         ast::Expr::Binary(lhs, op, rhs) => {
@@ -184,9 +198,14 @@ fn operator_uses<'a>(expr: &'a ast::Expr) -> Option<OperatorUses<'a>> {
                 }
             }
         }
-        ast::Expr::Unary(ast::UnaryOperator::Not, operand) => {
+        ast::Expr::Unary(op, operand) => {
             uses.slots = vec![operand.as_ref()];
-            uses.booleans = vec![(0, "NOT")];
+            match op {
+                ast::UnaryOperator::Not => uses.booleans = vec![(0, "NOT")],
+                ast::UnaryOperator::Negative => uses.prefixes = vec![(0, "-")],
+                ast::UnaryOperator::Positive => {}
+                ast::UnaryOperator::BitwiseNot => uses.prefixes = vec![(0, "~")],
+            }
         }
         ast::Expr::Like { lhs, op, rhs, .. } => {
             let symbol = match op {
@@ -212,23 +231,36 @@ fn operator_uses<'a>(expr: &'a ast::Expr) -> Option<OperatorUses<'a>> {
         ast::Expr::Case {
             base,
             when_then_pairs,
-            ..
+            else_expr,
         } => {
             let whens = when_then_pairs.iter().map(|(when, _)| when.as_ref());
+            let results = when_then_pairs
+                .iter()
+                .map(|(_, then)| then.as_ref())
+                .chain(else_expr.as_deref());
+            let conditions: Vec<&ast::Expr> = match base {
+                Some(base) => std::iter::once(base.as_ref()).chain(whens).collect(),
+                None => whens.collect(),
+            };
             match base {
-                Some(base) => {
-                    uses.slots = std::iter::once(base.as_ref()).chain(whens).collect();
+                Some(_) => {
                     uses.pairs = (1..=when_then_pairs.len())
                         .map(|index| (0, "=", index))
                         .collect();
                 }
                 None => {
-                    uses.slots = whens.collect();
                     uses.booleans = (0..when_then_pairs.len())
                         .map(|index| (index, "CASE/WHEN"))
                         .collect();
                 }
             }
+            let first_result = conditions.len();
+            uses.slots = conditions.into_iter().chain(results).collect();
+            uses.unified = (first_result..uses.slots.len()).collect();
+        }
+        ast::Expr::FunctionCall { name, args, .. } if unifies_arguments(name, args.len()) => {
+            uses.slots = args.iter().map(|arg| arg.as_ref()).collect();
+            uses.unified = (0..args.len()).collect();
         }
         _ => return None,
     }
@@ -246,6 +278,8 @@ fn literal_casts(expr: &ast::Expr, env: &TypeEnv) -> Result<Vec<(usize, String)>
         slots,
         pairs,
         booleans,
+        prefixes,
+        unified,
     } = uses;
     if slots.iter().any(|slot| is_hidden_column(slot, env)) {
         return Ok(Vec::new());
@@ -283,6 +317,13 @@ fn literal_casts(expr: &ast::Expr, env: &TypeEnv) -> Result<Vec<(usize, String)>
                 let (lhs, rhs) = (&types[left], &types[right]);
                 crate::bail_parse_error!("operator does not exist: {lhs} {symbol} {rhs}");
             }
+            OperatorResolution::Ambiguous => {
+                crate::bail_parse_error!(
+                    "operator is not unique: {} {symbol} {}",
+                    types[left],
+                    types[right]
+                );
+            }
             OperatorResolution::CastUntyped(type_name) => {
                 add_cast(left, &type_name, false);
                 add_cast(right, &type_name, false);
@@ -294,6 +335,41 @@ fn literal_casts(expr: &ast::Expr, env: &TypeEnv) -> Result<Vec<(usize, String)>
                     }
                 }
             }
+        }
+    }
+    if unified.len() > 1 {
+        let unified_types = || {
+            unified
+                .iter()
+                .map(|slot| dialect_operand_type(&types[*slot]))
+                .collect()
+        };
+        if let Some(type_name) = resolver.catalog.dialect.common_untyped_type(&unified_types) {
+            for slot in unified {
+                add_cast(slot, &type_name, false);
+            }
+        }
+    }
+    for (slot, symbol) in prefixes {
+        if matches!(types[slot], ExprType::NotKnownYet) {
+            continue;
+        }
+        let operand_types = || vec![dialect_operand_type(&types[slot])];
+        match resolver
+            .catalog
+            .dialect
+            .resolve_operator(symbol, &operand_types)
+        {
+            OperatorResolution::Keep => {}
+            OperatorResolution::CastUntyped(type_name) => add_cast(slot, &type_name, false),
+            OperatorResolution::Reject => {
+                let ty = &types[slot];
+                crate::bail_parse_error!("operator does not exist: {symbol} {ty}");
+            }
+            OperatorResolution::Ambiguous => {
+                crate::bail_parse_error!("operator is not unique: {symbol} unknown");
+            }
+            OperatorResolution::CastOperands(..) => {}
         }
     }
     for (slot, what) in booleans {
@@ -316,9 +392,21 @@ fn literal_casts(expr: &ast::Expr, env: &TypeEnv) -> Result<Vec<(usize, String)>
                 crate::bail_parse_error!("argument of {what} must be type boolean, not type {ty}");
             }
             OperatorResolution::CastUntyped(type_name) => add_cast(slot, &type_name, false),
+            OperatorResolution::Ambiguous | OperatorResolution::CastOperands(..) => {}
         }
     }
     Ok(casts)
+}
+
+/// Whether a call of `name` gives one of its arguments back, so they must
+/// have one type: coalesce, nullif and the scalar min and max.
+fn unifies_arguments(name: &ast::Name, argument_count: usize) -> bool {
+    let name = name.as_str().to_ascii_lowercase();
+    match name.as_str() {
+        "coalesce" | "nullif" => argument_count > 1,
+        "min" | "max" => argument_count > 1,
+        _ => false,
+    }
 }
 
 /// The comparisons that `expr` makes: left operand, operator, right operand.

@@ -755,6 +755,16 @@ pub trait Dialect: Send + Sync + 'static {
         None
     }
 
+    /// The type that string literals take where values of the given types
+    /// meet, as in `coalesce(int_column, '5')`. None leaves the literals as
+    /// they are.
+    fn common_untyped_type(
+        &self,
+        _types: &dyn Fn() -> std::vec::Vec<OperandType>,
+    ) -> Option<String> {
+        None
+    }
+
     /// Plans a CAST of a value of type `source()` to the type `target`, as
     /// written. None leaves the CAST to the engine, which converts the value
     /// as SQLite's CAST or the target custom type does. `source` works out
@@ -786,6 +796,9 @@ pub enum OperatorResolution {
     /// The dialect has no such operator: the statement fails with "operator
     /// does not exist".
     Reject,
+    /// Several operators fit an operand whose type is not known yet, as for
+    /// `-'5'`, and the dialect has no way to choose one.
+    Ambiguous,
     /// The operator exists once the string literal operands are cast to this
     /// type, as in `int_column = '5'`.
     CastUntyped(String),

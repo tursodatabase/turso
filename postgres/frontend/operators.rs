@@ -174,6 +174,20 @@ pub(crate) fn resolve_operator(op: &str, operands: &[OperandType]) -> OperatorRe
     }
 }
 
+/// The type that string literals take where values meet in a CASE, coalesce
+/// or the like: the type of the other values, when they have one type.
+pub(crate) fn common_untyped_type(types: &[OperandType]) -> Option<String> {
+    let mut known = types
+        .iter()
+        .filter(|operand| !matches!(operand, OperandType::Untyped | OperandType::Null))
+        .map(known_type);
+    let first = known.next()??;
+    if first == Text || known.any(|ty| ty != Some(first)) {
+        return None;
+    }
+    Some(first.name().to_string())
+}
+
 /// PostgreSQL requires the operand of AND, OR, NOT and a CASE condition to be
 /// a boolean, and reads a string literal as one.
 pub(crate) fn resolve_boolean_argument(operand: &OperandType) -> OperatorResolution {
@@ -188,7 +202,7 @@ pub(crate) fn resolve_boolean_argument(operand: &OperandType) -> OperatorResolut
 
 fn resolve_prefix(op: &str, operand: &OperandType) -> OperatorResolution {
     let Some(ty) = known_type(operand) else {
-        return OperatorResolution::Keep;
+        return resolve_untyped_prefix(op, operand);
     };
     let found = operators()
         .iter()
@@ -197,6 +211,20 @@ fn resolve_prefix(op: &str, operand: &OperandType) -> OperatorResolution {
         OperatorResolution::Keep
     } else {
         OperatorResolution::Reject
+    }
+}
+
+/// A string literal after a prefix operator. When every operator of the name
+/// takes a number, the literal is read as the preferred number type, double
+/// precision. Otherwise, as for `-` (which also takes an interval) and `~`
+/// (which also takes bit strings), there is no way to choose.
+fn resolve_untyped_prefix(op: &str, operand: &OperandType) -> OperatorResolution {
+    if !matches!(operand, OperandType::Untyped) {
+        return OperatorResolution::Keep;
+    }
+    match op {
+        "+" => OperatorResolution::CastUntyped(Float8.name().to_string()),
+        _ => OperatorResolution::Ambiguous,
     }
 }
 

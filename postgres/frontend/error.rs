@@ -397,6 +397,8 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         // which ones. PostgreSQL itself reports 42883 for some of these, so this
         // code differs from 42883 only where PostgreSQL also refuses.
         SQLSTATE_FEATURE_NOT_SUPPORTED
+    } else if msg.starts_with("operator is not unique: ") {
+        SQLSTATE_AMBIGUOUS_FUNCTION
     } else if msg.starts_with("argument of ") && msg.contains(" must be type boolean, not type ") {
         SQLSTATE_DATATYPE_MISMATCH
     } else if msg.contains("already exists") {
