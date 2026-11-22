@@ -9395,12 +9395,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         };
                         continue;
                     }
-                    if is_readonly {
-                        return Err(LimboError::Corrupt(
-                            "Cannot reconcile interrupted MVCC checkpoint in read-only mode"
-                                .to_string(),
-                        )
-                        .into());
+                    if is_readonly && !matches!(header_result, HeaderReadResult::Invalid) {
+                        // A read-only open cannot backfill the WAL, so it reads the
+                        // committed WAL frames in place, as WAL mode does. The pager
+                        // sees the same pages and `persistent_tx_ts_max` row that a
+                        // completed checkpoint would leave in the database file, so
+                        // logical-log recovery applies the same replay boundary.
+                        *st = CompleteCheckpointState::Start;
+                        return Ok(IOResult::Done(()));
                     }
                     match header_result {
                         HeaderReadResult::Valid(header) => {
