@@ -171,20 +171,14 @@ impl DatabaseTape {
         self
     }
     pub(crate) fn connect_untracked(&self) -> Result<Arc<turso_core::Connection>> {
-        let connection = self.inner.connect(
-            ConnectOpts::new(SessionRole::Superuser)
-                .with_encryption_key(self.encryption_key.clone()),
-        )?;
+        let connection = self.inner.connect(self.connect_options())?;
         if self.disable_auto_checkpoint {
             connection.wal_auto_actions_disable();
         }
         Ok(connection)
     }
     pub async fn connect<Ctx>(&self, coro: &Coro<Ctx>) -> Result<Arc<turso_core::Connection>> {
-        let connection = self.inner.connect(
-            ConnectOpts::new(SessionRole::Superuser)
-                .with_encryption_key(self.encryption_key.clone()),
-        )?;
+        let connection = self.inner.connect(self.connect_options())?;
         if self.disable_auto_checkpoint {
             connection.wal_auto_actions_disable();
         }
@@ -245,10 +239,7 @@ impl DatabaseTape {
         opts: DatabaseChangesIteratorOpts,
     ) -> Result<DatabaseChangesIterator> {
         tracing::debug!("opening changes iterator with options {:?}", opts);
-        let conn = self.inner.connect(
-            ConnectOpts::new(SessionRole::Superuser)
-                .with_encryption_key(self.encryption_key.clone()),
-        )?;
+        let conn = self.inner.connect(self.connect_options())?;
         if self.disable_auto_checkpoint {
             conn.wal_auto_actions_disable();
         }
@@ -273,6 +264,10 @@ impl DatabaseTape {
             max_change_id_exclusive: opts.max_change_id_exclusive,
         })
     }
+    fn connect_options(&self) -> ConnectOpts {
+        ConnectOpts::new(SessionRole::Superuser).with_encryption_key(self.encryption_key.clone())
+    }
+
     /// Start raw WAL edit session which can append or rollback pages directly in the current WAL
     pub async fn start_wal_session<Ctx>(&self, coro: &Coro<Ctx>) -> Result<DatabaseWalSession> {
         let conn = self.connect(coro).await?;

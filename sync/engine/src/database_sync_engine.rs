@@ -4121,15 +4121,37 @@ mod tests {
             assert_eq!(decoded.remote_url(), opts.remote_url);
             assert!(DatabaseMetadata::load_with_encryption(&updated, None).is_err());
             drop(engine);
-            let reopened = DatabaseSyncEngine::create_db(
+            let main_db = turso_core::Database::open(
+                io.clone(),
+                &path,
+                turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+                    .db_opts(opts.db_opts)
+                    .encryption(opts.local_options()),
+            )?;
+            let _guard =
+                ReplaceBaseApplyGuard::create(&coro, io.clone(), stats.clone(), &path, None)
+                    .await?;
+            let interrupted = main_db.connect(opts.connect_options())?;
+            interrupted.execute("INSERT INTO private_table VALUES ('interrupted replacement')")?;
+            drop(interrupted);
+            std::fs::write(create_meta_path(&path), b"interrupted metadata")?;
+            let reopened = DatabaseSyncEngine::open_db(
                 &coro,
                 io.clone(),
                 stats.clone(),
-                &path,
+                main_db,
                 opts.clone(),
             )
             .await?;
             assert_eq!(reopened.meta().last_push_unix_time, Some(123));
+            assert_replace_base_backups_removed(&path);
+            let conn = reopened.connect_rw(&coro).await?;
+            assert_eq!(
+                conn.prepare("SELECT count(*) FROM private_table")?
+                    .run_collect_rows()?,
+                vec![vec![turso_core::Value::from_i64(2)]]
+            );
+            conn.execute("INSERT INTO private_table VALUES ('after recovery')")?;
             Ok::<_, crate::errors::Error>(())
         });
         loop {
