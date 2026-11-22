@@ -2102,3 +2102,15 @@ expect {
     1
 }
 
+@requires strict "uses STRICT tables"
+test cmp-recursive-cte-union-all-of-timestamp-and-timestamptz-is-an-error {
+    CREATE TABLE t(ts timestamp, tz timestamptz) STRICT;
+    WITH RECURSIVE r(x, n) AS (
+        SELECT ts, 0 FROM t UNION ALL SELECT tz, n + 1 FROM t, r WHERE n < 1
+    )
+    SELECT x FROM r;
+}
+expect error {
+    cannot compare type timestamp with type timestamptz
+}
+

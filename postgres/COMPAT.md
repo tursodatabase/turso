@@ -209,10 +209,9 @@ in a CTE, such as `WITH v(x) AS (VALUES (ts)) SELECT * FROM t, v WHERE d = x`.
 The same two types in
 one result column fail the same way: in UNION, UNION ALL, INTERSECT, EXCEPT, a
 multi-row VALUES that is not the row source of an INSERT, a recursive CTE with
-UNION, the results of CASE, `coalesce`, `ifnull` and `iif`, and `lag` and `lead`
-with a default of another type. Not refused yet, and compared as stored: a
-recursive CTE with UNION ALL, and array functions that compare elements, such
-as `array_position`. PostgreSQL converts or refuses these. A string literal compared with a custom type is read as that type.
+UNION or UNION ALL, the results of CASE, `coalesce`, `ifnull` and `iif`, and `lag` and `lead`
+with a default of another type. Not refused yet, and compared as stored: array
+functions that compare elements, such as `array_position`. PostgreSQL converts or refuses these. A string literal compared with a custom type is read as that type.
 Two arrays compare when their element types compare, so `date[]` with
 `timestamp[]` fails. Two types that only check a value, such as `varchar(n)` and
 `smallint`, compare as they did before this check, as stored. PostgreSQL refuses

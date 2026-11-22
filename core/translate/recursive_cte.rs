@@ -27,6 +27,12 @@ pub(crate) fn emit_recursive_cte(
     recursive_cte: &mut RecursiveCtePlan,
 ) -> Result<usize> {
     let num_result_columns = recursive_cte.initial_query.select_result_columns().len();
+    // Each column is one result of both queries, so this is computed also for
+    // UNION ALL, which compares no rows: it fails when the queries give a
+    // column two types that do not compare, as for a compound SELECT.
+    let collations = (0..num_result_columns)
+        .map(|column| recursive_cte_result_column_collation(recursive_cte, column, resolver))
+        .collect::<Result<Vec<_>>>()?;
     let input_record_reg = program.alloc_register();
     let input_cursor_id = program.alloc_cursor_id_keyed_if_not_exists(
         CursorKey::table(recursive_cte.input_table_id),
@@ -63,11 +69,7 @@ pub(crate) fn emit_recursive_cte(
             }
             let collation = match explicit_collation {
                 Some(collation) => *collation,
-                None => recursive_cte_result_column_collation(
-                    recursive_cte,
-                    *result_column_index,
-                    resolver,
-                )?,
+                None => collations[*result_column_index],
             };
             queue_index_columns.try_push(IndexColumn {
                 name: format!("priority-{}", queue_sort_keys.len()),
@@ -121,17 +123,13 @@ pub(crate) fn emit_recursive_cte(
         None
     } else {
         let mut seen_row_index_columns = crate::alloc::try_vec![]?;
-        for result_column_index in 0..num_result_columns {
+        for (result_column_index, collation) in collations.iter().enumerate() {
             seen_row_index_columns.try_push(IndexColumn {
                 name: format!("distinct-{result_column_index}"),
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table: result_column_index,
-                collation: recursive_cte_result_column_collation(
-                    recursive_cte,
-                    result_column_index,
-                    resolver,
-                )?,
+                collation: *collation,
                 explicit_collation: None,
                 default: None,
                 expr: None,
