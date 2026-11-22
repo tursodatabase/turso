@@ -535,6 +535,7 @@ impl VacuumTargetBuildContext {
 
 /// Runs the error cleanup of a VACUUM target build on `target_conn` while the
 /// build holds `schema_stmt` in its schema collection phase.
+#[allow(dead_code)]
 #[cfg(feature = "test_helper")]
 pub fn clean_up_target_build_after_error(
     target_conn: Arc<Connection>,
