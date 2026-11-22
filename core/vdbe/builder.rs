@@ -768,6 +768,9 @@ macro_rules! emit_explain {
 impl ProgramBuilder {
     /// Register an `ast::Variable` in the parameter list. Returns the
     /// `NonZeroUsize` index for use in `Insn::Variable`.
+    // Translation registers each variable of a statement two times, and a
+    // multirow INSERT can have thousands of variables.
+    #[inline]
     pub fn register_variable(&mut self, variable: &ast::Variable) -> NonZeroUsize {
         let index = usize::try_from(variable.index.get())
             .expect("u32 variable index must fit into usize")
