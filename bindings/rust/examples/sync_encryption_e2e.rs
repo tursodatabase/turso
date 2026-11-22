@@ -13,17 +13,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "none" => None,
         value => Some(value.to_string()),
     };
-    let cipher = std::env::var("SYNC_E2E_CIPHER")
-        .unwrap_or_else(|_| "aes256gcm".into())
-        .parse::<RemoteEncryptionCipher>()?;
-    let mut builder = Builder::new_remote(path).with_encryption(
-        cipher,
-        key("SYNC_E2E_LOCAL_KEY", "16".repeat(32)),
-        key(
-            "SYNC_E2E_CLOUD_KEY",
-            "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws=".into(),
-        ),
-    );
+    let cipher = std::env::var("SYNC_E2E_CIPHER").unwrap_or_else(|_| "aes256gcm".into());
+    let mut builder = Builder::new_remote(path);
+    if cipher != "none" {
+        builder = builder.with_encryption(
+            cipher.parse::<RemoteEncryptionCipher>()?,
+            key("SYNC_E2E_LOCAL_KEY", "16".repeat(32)),
+            key(
+                "SYNC_E2E_CLOUD_KEY",
+                "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws=".into(),
+            ),
+        );
+    }
     if let Ok(token) = std::env::var("SYNC_E2E_AUTH_TOKEN") {
         builder = builder.with_auth_token(token);
     }

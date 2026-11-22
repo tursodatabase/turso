@@ -131,6 +131,12 @@ Start a sync server for database replication, listening at the given address.
 tursodb --sync-server 0.0.0.0:8080 mydata.db
 ```
 
+Bootstrap includes checkpointed database pages, and both plaintext and encrypted
+servers write portable MVCC changes for subsequent pulls. Before serving an
+existing MVCC database with recovery-only log frames, run
+`PRAGMA wal_checkpoint(TRUNCATE)` on it. Enabling portable changes affects new
+transactions; it does not rewrite existing log frames.
+
 ### `--sync-encryption-cipher <CIPHER>` and `--sync-encryption-key-file <PATH>`
 
 Serve encrypted databases with the sample sync server. Both options are required

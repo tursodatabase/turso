@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use base64::Engine;
 use bytes::Bytes;
+use itertools::Either;
 use prost::Message;
 use roaring::RoaringBitmap;
 use tracing::{debug, error, info};
@@ -107,9 +108,7 @@ impl TursoSyncServer {
         anyhow::ensure!(conn.get_encryption_cipher_mode() == encryption.as_ref().map(|e| e.cipher()),
             "encrypted sync requires matching --sync-encryption-cipher and --sync-encryption-key-file");
         conn.wal_auto_actions_disable();
-        if encryption.is_some() {
-            conn.set_portable_logical_changes_enabled(true);
-        }
+        conn.set_portable_logical_changes_enabled(true);
 
         Ok(Self {
             address,
@@ -721,11 +720,20 @@ impl TursoSyncServer {
         let conn = db.conn.lock().expect("database connection lock poisoned");
 
         let wal_state = conn.wal_state()?;
-        if conn.get_encryption_cipher_mode().is_some() && req.client_revision.is_empty() {
-            anyhow::ensure!(
-                req.server_pages_selector.is_empty(),
-                "encrypted bootstrap requires a full snapshot"
-            );
+        let server_revision: u64 = if req.server_revision.is_empty() {
+            wal_state.max_frame
+        } else {
+            req.server_revision.parse().unwrap_or(wal_state.max_frame)
+        };
+        let pages_selector: Option<RoaringBitmap> = if !req.server_pages_selector.is_empty() {
+            Some(
+                RoaringBitmap::deserialize_from(&req.server_pages_selector[..])
+                    .map_err(|e| anyhow!("Failed to parse server_pages_selector: {}", e))?,
+            )
+        } else {
+            None
+        };
+        if req.client_revision.is_empty() && req.server_query_selector.is_empty() {
             let protocol = if conn.mvcc_enabled() {
                 PullUpdatesProtocol::MvccLogical
             } else {
@@ -734,18 +742,19 @@ impl TursoSyncServer {
             let revision = if conn.mvcc_enabled() {
                 "g1:o0".to_string()
             } else {
-                wal_state.max_frame.to_string()
+                server_revision.to_string()
             };
             drop(conn);
-            return self.handle_snapshot_pages(db, revision, apply_mode, protocol);
+            return self.handle_snapshot_pages(
+                db,
+                revision,
+                apply_mode,
+                protocol,
+                Some(server_revision),
+                pages_selector.as_ref(),
+            );
         }
         debug!("WAL state: max_frame={}", wal_state.max_frame);
-
-        let server_revision: u64 = if req.server_revision.is_empty() {
-            wal_state.max_frame
-        } else {
-            req.server_revision.parse().unwrap_or(wal_state.max_frame)
-        };
 
         let client_revision: u64 = if req.client_revision.is_empty() {
             0
@@ -757,15 +766,6 @@ impl TursoSyncServer {
             "Using server_revision={}, client_revision={}",
             server_revision, client_revision
         );
-
-        let pages_selector: Option<RoaringBitmap> = if !req.server_pages_selector.is_empty() {
-            Some(
-                RoaringBitmap::deserialize_from(&req.server_pages_selector[..])
-                    .map_err(|e| anyhow!("Failed to parse server_pages_selector: {}", e))?,
-            )
-        } else {
-            None
-        };
 
         let mut seen_pages: HashSet<u32> = HashSet::new();
         let mut pages_to_send: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -820,7 +820,7 @@ impl TursoSyncServer {
         );
         pages_to_send.reverse();
 
-        let db_size = current_sync_db_size_pages(&conn, wal_state.max_frame)?;
+        let db_size = current_snapshot_db_size_pages(&conn, wal_state.max_frame)?;
 
         let header = PullUpdatesRespProtoBody {
             server_revision: server_revision.to_string(),
@@ -876,7 +876,7 @@ impl TursoSyncServer {
             let conn = db.conn.lock().expect("database connection lock poisoned");
             let wal_state = conn.wal_state()?;
             (
-                current_sync_db_size_pages(&conn, wal_state.max_frame)?,
+                current_snapshot_db_size_pages(&conn, wal_state.max_frame)?,
                 format!("page:{}", wal_state.max_frame),
                 wal_state.max_frame.to_string(),
             )
@@ -908,7 +908,7 @@ impl TursoSyncServer {
             }
             Err(err) => return Err(err.into()),
         };
-        if self.encryption.is_some() && log.len() == MVCC_LOG_HEADER_SIZE {
+        if log.len() == MVCC_LOG_HEADER_SIZE {
             frame_codec::validate_log_header(&log)?;
             let start = parse_mvcc_revision_offset(&req.client_revision, log.len() as u64)?;
             anyhow::ensure!(
@@ -1062,6 +1062,8 @@ impl TursoSyncServer {
             server_revision,
             PullUpdatesApplyMode::ReplaceBase,
             PullUpdatesProtocol::MvccLogical,
+            None,
+            None,
         )
     }
 
@@ -1071,8 +1073,10 @@ impl TursoSyncServer {
         server_revision: String,
         apply_mode: PullUpdatesApplyMode,
         protocol: PullUpdatesProtocol,
+        frame_watermark: Option<u64>,
+        pages_selector: Option<&RoaringBitmap>,
     ) -> Result<HttpResponse> {
-        let (db_size, pages) = self.read_replace_base_pages(db)?;
+        let (db_size, pages) = self.read_snapshot_pages(db, frame_watermark, pages_selector)?;
 
         let header = PullUpdatesRespProtoBody {
             server_revision,
@@ -1106,28 +1110,43 @@ impl TursoSyncServer {
     }
 
     #[allow(clippy::type_complexity)]
-    fn read_replace_base_pages(&self, db: &DbHandle) -> Result<(u64, Vec<(u64, Vec<u8>)>)> {
+    fn read_snapshot_pages(
+        &self,
+        db: &DbHandle,
+        frame_watermark: Option<u64>,
+        pages_selector: Option<&RoaringBitmap>,
+    ) -> Result<(u64, Vec<(u64, Vec<u8>)>)> {
         let conn = db.conn.lock().expect("database connection lock poisoned");
         let wal_state = conn.wal_state()?;
-        let frame_watermark = Some(wal_state.max_frame);
-        let db_size = current_snapshot_db_size_pages(&conn, wal_state.max_frame)?;
-        let pages_capacity = usize::try_from(db_size)
+        let max_frame = frame_watermark.unwrap_or(wal_state.max_frame);
+        anyhow::ensure!(
+            max_frame <= wal_state.max_frame,
+            "requested WAL revision is no longer available"
+        );
+        let db_size = current_snapshot_db_size_pages(&conn, max_frame)?;
+        let pages_capacity = pages_selector.map_or(db_size, |pages| pages.len().min(db_size));
+        let pages_capacity = usize::try_from(pages_capacity)
             .map_err(|_| anyhow!("database page count does not fit usize: {db_size}"))?;
         let mut pages = Vec::with_capacity(pages_capacity);
 
-        for page_no in 1..=db_size {
+        let page_ids = match pages_selector {
+            Some(selected) => Either::Left(selected.iter().map(u64::from)),
+            None => Either::Right(0..db_size),
+        };
+        for page_id in page_ids.take_while(|&id| id < db_size) {
+            let page_no = page_id + 1;
             let page_no_u32 = u32::try_from(page_no)
                 .map_err(|_| anyhow!("database page number does not fit u32: {page_no}"))?;
             let mut page = vec![0; PAGE_SIZE];
             let found =
-                conn.try_wal_watermark_read_page(page_no_u32, &mut page, frame_watermark)?;
+                conn.try_wal_watermark_read_page(page_no_u32, &mut page, Some(max_frame))?;
             if !found {
                 return Err(anyhow!(
                     "database page {} is missing from replace-base snapshot",
                     page_no
                 ));
             }
-            pages.push((page_no - 1, page));
+            pages.push((page_id, page));
         }
 
         Ok((db_size, pages))
@@ -1349,14 +1368,6 @@ fn parse_mvcc_revision_offset(revision: &str, legacy_default: u64) -> Result<u64
 fn is_nonportable_mvcc_log_error(err: &anyhow::Error) -> bool {
     let message = err.to_string();
     message.starts_with("unsupported MVCC logical log version ")
-}
-
-fn current_sync_db_size_pages(conn: &Connection, max_frame: u64) -> Result<u64> {
-    if conn.get_encryption_cipher_mode().is_some() {
-        current_snapshot_db_size_pages(conn, max_frame)
-    } else {
-        current_db_size_pages(conn, max_frame)
-    }
 }
 
 fn current_db_size_pages(conn: &Connection, max_frame: u64) -> Result<u64> {
@@ -1676,9 +1687,7 @@ fn open_db_handle(path: &Path, config: &OpenConfig) -> Result<Arc<DbHandle>> {
         conn.get_encryption_cipher_mode() == config.encryption.as_ref().map(|e| e.cipher()),
         "database cipher does not match the sync server configuration"
     );
-    if config.encryption.is_some() {
-        conn.set_portable_logical_changes_enabled(true);
-    }
+    conn.set_portable_logical_changes_enabled(true);
     conn.wal_auto_actions_disable();
     Ok(Arc::new(DbHandle {
         conn: Mutex::new(conn),
@@ -2138,49 +2147,41 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_bootstrap_pages_advertise_sync_support() {
-        for mvcc in [false, true] {
+    fn bootstrap_pages_advertise_sync_support() {
+        for (mvcc, encrypted) in [(false, false), (true, false), (false, true), (true, true)] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("source.db");
-            let io = Arc::new(turso_core::PlatformIO::new().unwrap());
-            let db = Database::open_file_with_flags(
-                io,
-                path.to_str().unwrap(),
-                OpenFlags::Create,
-                DatabaseOpts::new().with_encryption(true),
-                Some(turso_core::EncryptionOpts {
-                    cipher: "aes256gcm".into(),
-                    hexkey: "0b".repeat(32),
-                }),
-                Arc::new(SqliteDialect),
-            )
-            .unwrap();
-            let conn = db
-                .connect(
-                    ConnectOpts::new(SessionRole::Superuser)
-                        .with_encryption_key(Some(turso_core::EncryptionKey::new_256([11; 32]))),
-                )
-                .unwrap();
-            if mvcc {
-                conn.execute("PRAGMA journal_mode=mvcc").unwrap();
-            }
-            conn.execute("CREATE TABLE secrets(value TEXT)").unwrap();
-            conn.execute("INSERT INTO secrets VALUES ('sample private value')")
-                .unwrap();
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-            let handle = DbHandle {
-                conn: Mutex::new(conn),
-                path: path.to_string_lossy().into_owned(),
-            };
-            let mut server = dir_server(dir.path());
-            server.encryption = Some(
+            let encryption = encrypted.then(|| {
                 SyncEncryption::new(
                     CipherMode::Aes256Gcm,
                     Some(EncryptionKey::new_256([11; 32])),
                     None,
                 )
-                .unwrap(),
-            );
+                .unwrap()
+            });
+            let handle = open_db_handle(
+                &path,
+                &OpenConfig {
+                    vfs: None,
+                    flags: OpenFlags::Create,
+                    db_opts: DatabaseOpts::new(),
+                    max_open: 1,
+                    encryption: encryption.clone(),
+                },
+            )
+            .unwrap();
+            {
+                let conn = handle.conn.lock().unwrap();
+                if mvcc {
+                    conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+                }
+                conn.execute("CREATE TABLE secrets(value TEXT)").unwrap();
+                conn.execute("INSERT INTO secrets VALUES ('sample private value')")
+                    .unwrap();
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            }
+            let mut server = dir_server(dir.path());
+            server.encryption = encryption;
             let request = PullUpdatesReqProtoBody::default().encode_to_vec();
             let response = server.handle_pull_updates(&handle, &request).unwrap();
             let mut bytes = response.body.as_slice();
@@ -2215,6 +2216,109 @@ mod tests {
             assert_eq!(incremental.db_size, header.db_size);
             assert!(bytes.is_empty());
         }
+    }
+
+    #[test]
+    fn plaintext_server_commits_have_portable_changes() {
+        for directory in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let server = plaintext_server(dir.path(), directory);
+            let handle = server
+                .resolve_db(directory.then_some("source"))
+                .unwrap_or_else(|_| panic!("open source"));
+            let conn = handle.conn.lock().unwrap();
+            conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+            conn.execute("CREATE TABLE items(value TEXT)").unwrap();
+            conn.execute("INSERT INTO items VALUES ('portable row')")
+                .unwrap();
+            let log = std::fs::read(logical_log_path(&handle.path).unwrap()).unwrap();
+            let normalized = normalize_mvcc_log(&log, None).unwrap();
+            let mut offset = MVCC_LOG_HEADER_SIZE;
+            while offset < normalized.body.len() {
+                let frame = frame_codec::inspect_frame_prefix(&normalized.body[offset..], None)
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    frame.extension_size() > 0,
+                    "recovery-only frame in directory={directory}"
+                );
+                offset += frame.stored_size();
+            }
+            assert!(offset > MVCC_LOG_HEADER_SIZE);
+        }
+    }
+
+    #[test]
+    fn plaintext_bootstrap_honors_page_selector_and_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = plaintext_server(dir.path(), false);
+        let handle = server
+            .resolve_db(None)
+            .unwrap_or_else(|_| panic!("open source"));
+        let mut selector = RoaringBitmap::new();
+        selector.insert(1);
+        selector.insert(u32::MAX);
+        let mut selector_bytes = Vec::new();
+        selector.serialize_into(&mut selector_bytes).unwrap();
+        let mut request = PullUpdatesReqProtoBody {
+            server_pages_selector: selector_bytes.into(),
+            ..Default::default()
+        };
+        {
+            let conn = handle.conn.lock().unwrap();
+            conn.execute("CREATE TABLE items(value TEXT)").unwrap();
+            conn.execute("INSERT INTO items VALUES ('old value')")
+                .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        for pinned in [false, true] {
+            if pinned {
+                let conn = handle.conn.lock().unwrap();
+                conn.execute("INSERT INTO items VALUES ('another old value')")
+                    .unwrap();
+                request.server_revision = conn.wal_state().unwrap().max_frame.to_string();
+                conn.execute("UPDATE items SET value = 'new value'")
+                    .unwrap();
+            }
+            let response = server
+                .handle_pull_updates(&handle, &request.encode_to_vec())
+                .unwrap();
+            let mut bytes = response.body.as_slice();
+            let header = PullUpdatesRespProtoBody::decode_length_delimited(&mut bytes).unwrap();
+            assert_eq!(header.db_size, 2);
+            if pinned {
+                assert_eq!(header.server_revision, request.server_revision);
+            }
+            let page = PageData::decode_length_delimited(&mut bytes).unwrap();
+            assert_eq!(page.page_id, 1);
+            assert!(bytes.is_empty(), "only the selected page may be returned");
+            assert!(page.encoded_page.windows(9).any(|w| w == b"old value"));
+            assert!(!page.encoded_page.windows(9).any(|w| w == b"new value"));
+        }
+    }
+
+    #[test]
+    fn plaintext_incremental_pull_reports_checkpointed_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = plaintext_server(dir.path(), false);
+        let handle = server
+            .resolve_db(None)
+            .unwrap_or_else(|_| panic!("open source"));
+        {
+            let conn = handle.conn.lock().unwrap();
+            conn.execute("CREATE TABLE items(value TEXT)").unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        let request = PullUpdatesReqProtoBody {
+            client_revision: "0".into(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let response = server.handle_pull_updates(&handle, &request).unwrap();
+        let mut bytes = response.body.as_slice();
+        let header = PullUpdatesRespProtoBody::decode_length_delimited(&mut bytes).unwrap();
+        assert_eq!(header.db_size, 2);
+        assert!(bytes.is_empty());
     }
 
     #[test]
@@ -2314,6 +2418,34 @@ mod tests {
 
     const TEST_MAX_OPEN: usize = 4;
     const TEST_WORKERS: usize = 4;
+
+    fn plaintext_server(base: &Path, directory: bool) -> TursoSyncServer {
+        if directory {
+            return dir_server(base);
+        }
+        let path = base.join("source.db");
+        let db = Database::open_file_with_flags(
+            Arc::new(turso_core::PlatformIO::new().unwrap()),
+            path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        TursoSyncServer::new(
+            "127.0.0.1:0".into(),
+            path.to_string_lossy().into_owned(),
+            conn,
+            Arc::new(AtomicUsize::new(0)),
+            TEST_WORKERS,
+            None,
+        )
+        .unwrap()
+    }
 
     fn dir_server(base: &Path) -> TursoSyncServer {
         TursoSyncServer::new_dir(

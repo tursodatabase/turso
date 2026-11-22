@@ -1,4 +1,4 @@
-"""Real HTTP encrypted sync tests, using the Rust SDK test driver.
+"""Real HTTP plaintext and encrypted sync tests, using the Rust SDK test driver.
 
 Build first:
   cargo build -p turso_cli -p turso --bin tursodb --example sync_encryption_e2e --features turso/sync
@@ -38,15 +38,26 @@ class EncryptedSync(unittest.TestCase):
                 port = sock.getsockname()[1]
             address = f"127.0.0.1:{port}"
             url = f"http://{address}" + ("/db/example" if directory else "")
-            args = [str(CLI), "--sync-server", address,
-                    "--sync-encryption-cipher", cipher,
-                    "--sync-encryption-key-file", str(key)]
+            args = [str(CLI), "--sync-server", address]
+            if cipher:
+                args += ["--sync-encryption-cipher", cipher,
+                         "--sync-encryption-key-file", str(key)]
             args += ["--sync-dir", str(dbs)] if directory else [str(tmp / "source.db")]
             headers = {"x-turso-encryption-key": base64.b64encode(bytes([11]) * 32).decode(),
-                       "x-turso-encryption-cipher": cipher}
-            key_only_headers = {"x-turso-encryption-key": headers["x-turso-encryption-key"]}
-            env = {**os.environ, "SYNC_E2E_CIPHER": cipher}
+                       "x-turso-encryption-cipher": cipher} if cipher else {}
+            key_only_headers = {name: value for name, value in headers.items()
+                                if name == "x-turso-encryption-key"}
+            env = {**os.environ, "SYNC_E2E_CIPHER": cipher or "none"}
             replica = tmp / "replica.db"
+            source = dbs / "example/data" if directory else tmp / "source.db"
+            if mvcc and not cipher:
+                source.parent.mkdir(parents=True, exist_ok=True)
+                prepared = subprocess.run(
+                    [str(CLI), str(source), "PRAGMA journal_mode=mvcc; CREATE TABLE legacy(value); "
+                     "INSERT INTO legacy VALUES ('existing row'); PRAGMA wal_checkpoint(TRUNCATE);"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
 
             def run(action, sql=None, path=replica, environment=env, remote=url):
                 result = subprocess.run([str(DRIVER), str(path), remote, action] + ([sql] if sql else []),
@@ -73,9 +84,9 @@ class EncryptedSync(unittest.TestCase):
             try:
                 start()
                 # Reject missing/wrong credentials before opening or mutating a database.
-                for bad in [{}, {**headers, "x-turso-encryption-key": base64.b64encode(bytes(32)).decode()},
+                for bad in ([{}, {**headers, "x-turso-encryption-key": base64.b64encode(bytes(32)).decode()},
                             {"x-turso-encryption-key": base64.b64encode(bytes(32)).decode()},
-                            {**headers, "x-turso-encryption-cipher": "aes128gcm"}]:
+                            {**headers, "x-turso-encryption-cipher": "aes128gcm"}] if cipher else []):
                     with self.assertRaises(urllib.error.HTTPError) as error:
                         pipeline("CREATE TABLE forbidden(x)", bad)
                     self.assertEqual(error.exception.code, 400)
@@ -83,6 +94,8 @@ class EncryptedSync(unittest.TestCase):
                 if mvcc:
                     pipeline("PRAGMA journal_mode=mvcc")
                 run("bootstrap")
+                if mvcc and not cipher:
+                    self.assertEqual(run("scalar", "SELECT count(*) FROM legacy")["value"], 1)
                 run("exec", "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
                 run("exec", "INSERT INTO items VALUES (1, 'client secret')")
                 run("push")
@@ -98,7 +111,9 @@ class EncryptedSync(unittest.TestCase):
                 pipeline("INSERT INTO items VALUES (3, 'after restart')")
                 run("pull")
                 self.assertEqual(run("scalar", "SELECT count(*) FROM items")["value"], 3)
-                # A fresh replica after restart exercises encrypted base-page bootstrap.
+                if not mvcc:
+                    pipeline("PRAGMA wal_checkpoint(TRUNCATE)")
+                # Fresh replicas need base pages even when the WAL is empty.
                 fresh = tmp / "fresh.db"
                 run("bootstrap", path=fresh)
                 self.assertEqual(run("scalar", "SELECT count(*) FROM items", path=fresh)["value"], 3)
@@ -108,10 +123,9 @@ class EncryptedSync(unittest.TestCase):
                 self.assertEqual(
                     run("scalar", "SELECT count(*) FROM items", path=plain, environment=plain_env)["value"], 3
                 )
-                source = dbs / "example/data" if directory else tmp / "source.db"
                 for path in [source, Path(str(source) + "-wal"), source.with_suffix(".db-log"), replica,
                              Path(str(replica) + "-info")]:
-                    if path.exists():
+                    if cipher and path.exists():
                         data = path.read_bytes()
                         self.assertNotIn(b"client secret", data, str(path))
                         self.assertNotIn(b"server secret", data, str(path))
@@ -152,15 +166,16 @@ class EncryptedSync(unittest.TestCase):
         self.fail("sample server did not start")
 
     def test_mvcc(self):
-        for cipher in ["aes256gcm", "aegis256"]:
+        for cipher in [None, "aes256gcm", "aegis256"]:
             for directory in [False, True]:
                 with self.subTest(cipher=cipher, directory=directory):
                     self.scenario(cipher, directory, mvcc=True)
 
     def test_wal(self):
-        for directory in [False, True]:
-            with self.subTest(directory=directory):
-                self.scenario("aes256gcm", directory, mvcc=False)
+        for cipher in [None, "aes256gcm"]:
+            for directory in [False, True]:
+                with self.subTest(cipher=cipher, directory=directory):
+                    self.scenario(cipher, directory, mvcc=False)
 
 
 def stop_server(process):
