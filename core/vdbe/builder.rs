@@ -1173,7 +1173,11 @@ impl ProgramBuilder {
     }
 
     pub fn extend(&mut self, opts: &ProgramBuilderOpts) {
-        self.insns.reserve(opts.approx_num_insns);
+        let needed = self.insns.len() + opts.approx_num_insns;
+        if needed > self.insns.capacity() {
+            // At least double the capacity, as `Vec::reserve` does.
+            self.move_insns_to_capacity(needed.max(2 * self.insns.capacity()));
+        }
         self.cursor_ref.reserve(opts.num_cursors);
         self.label_to_resolved_offset
             .reserve(opts.approx_num_labels);
@@ -1185,9 +1189,19 @@ impl ProgramBuilder {
     pub fn reserve_insns(&mut self, additional: usize) {
         let needed = self.insns.len() + additional;
         if needed > self.insns.capacity() {
-            self.insns
-                .reserve_exact(needed.next_power_of_two() - self.insns.len());
+            self.move_insns_to_capacity(needed.next_power_of_two());
         }
+    }
+
+    /// Move the instructions to a new allocation for `capacity` instructions.
+    /// `Vec::reserve` calls `realloc`, which copies all of the old allocation,
+    /// because it does not know which part of it holds instructions. When a
+    /// statement reserves its estimate, only a few of the 32 instructions that
+    /// the builder starts with are in use.
+    fn move_insns_to_capacity(&mut self, capacity: usize) {
+        let mut insns = Vec::with_capacity(capacity);
+        insns.append(&mut self.insns);
+        self.insns = insns;
     }
 
     /// Start a new constant span. The next instruction to be emitted will be the first
