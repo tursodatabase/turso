@@ -32,24 +32,27 @@ impl SyncEncryption {
     pub fn from_options(
         remote_cipher: Option<&str>,
         local_options: Option<&EncryptionOpts>,
+        cloud_key: Option<Secret>,
     ) -> Result<Option<Self>> {
         let local = local_options.map(Self::from_local_options).transpose()?;
-        // Remote-only encryption may use a cipher that native core does not support.
-        let cipher = match remote_cipher.map(CipherMode::try_from) {
-            Some(Ok(cipher)) => Some(cipher),
-            Some(Err(error)) if local.is_some() => return Err(error.into()),
-            _ => None,
-        };
-        match (local, cipher) {
+        let cipher = remote_cipher.map(CipherMode::try_from).transpose()?;
+        let mut config = match (local, cipher) {
             (Some(local), Some(cipher)) if local.cipher != cipher => {
                 Err(Error::DatabaseSyncEngineError(
                     "sync uses a single cipher for both local and cloud encryption".into(),
                 ))
             }
             (Some(local), _) => Ok(Some(local)),
-            (None, Some(cipher)) => Self::new(cipher, None).map(Some),
+            (None, Some(cipher)) => Self::new(cipher, None, None).map(Some),
+            (None, None) if cloud_key.is_some() => Err(Error::DatabaseSyncEngineError(
+                "encrypted sync requires an explicit cipher".into(),
+            )),
             (None, None) => Ok(None),
+        }?;
+        if let Some(config) = &mut config {
+            config.cloud_key = cloud_key;
         }
+        Ok(config)
     }
 
     pub fn from_local_options(options: &EncryptionOpts) -> Result<Self> {
@@ -99,6 +102,15 @@ impl SyncEncryption {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_key_requires_a_supported_cipher() {
+        for cipher in [None, Some("chacha20poly1305"), Some("future-cloud-cipher")] {
+            assert!(
+                SyncEncryption::from_options(cipher, None, Some(Secret::new("cloud-key"))).is_err()
+            );
+        }
+    }
 
     #[test]
     fn validates_keys_and_redacts_debug() {

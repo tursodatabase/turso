@@ -261,18 +261,18 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         db_config: turso_sdk_kit::rsapi::TursoDatabaseConfig,
         sync_config: TursoDatabaseSyncConfig,
     ) -> Result<Arc<Self>, turso_sdk_kit::rsapi::TursoError> {
-        if sync_config.remote_encryption_key.is_some() {
-            return Err(turso_sdk_kit::rsapi::TursoError::Misuse(
-                "encrypted sync requires an explicit cipher".into(),
-            ));
-        }
         // Mirror the database's experimental features onto the connections the
         // sync engine opens internally (e.g. the revert connection), so they
         // match the main database opened via TursoDatabase below.
         let db_opts = db_config.database_opts();
+        let cloud_key = sync_config
+            .remote_encryption_key
+            .clone()
+            .map(turso_sync_engine::types::Secret::new);
         let encryption = turso_sync_engine::sync_encryption::SyncEncryption::from_options(
             sync_config.cipher.as_deref(),
             db_config.encryption.as_ref(),
+            cloud_key,
         )
         .map_err(|error| TursoError::Misuse(error.to_string()))?;
         let sync_engine_opts = turso_sync_engine::database_sync_engine::DatabaseSyncEngineOpts {
@@ -676,23 +676,26 @@ mod tests {
             pull_parallel_requests: None,
             logical_mvcc_pull: None,
         };
-        let mut legacy_database = config.clone();
-        legacy_database.encryption = None;
-        let mut legacy_sync = sync_config.clone();
-        legacy_sync.cipher = Some("chacha20poly1305".into());
-        for cipher in [
-            "chacha20poly1305",
-            "chacha20-poly1305",
-            "ChaCha20Poly1305",
-            "future-cloud-cipher",
-        ] {
-            legacy_sync.cipher = Some(cipher.into());
-            let legacy =
-                TursoDatabaseSync::<Vec<u8>>::new(legacy_database.clone(), legacy_sync.clone())
-                    .unwrap();
-            assert!(legacy.sync_engine_opts.encryption.is_none());
+        let mut cloud_database = config.clone();
+        cloud_database.encryption = None;
+        let mut cloud_sync = sync_config.clone();
+        cloud_sync.remote_encryption_key = Some("cloud-key".into());
+        for cipher in [None, Some("chacha20poly1305"), Some("future-cloud-cipher")] {
+            cloud_sync.cipher = cipher.map(str::to_string);
+            assert!(
+                TursoDatabaseSync::<Vec<u8>>::new(cloud_database.clone(), cloud_sync.clone())
+                    .is_err()
+            );
+            assert!(io
+                .open_file(":memory:-info", OpenFlags::None, false)
+                .is_err());
         }
-        assert!(TursoDatabaseSync::<Vec<u8>>::new(config.clone(), legacy_sync).is_err());
+        cloud_sync.cipher = Some("aes256gcm".into());
+        let cloud = TursoDatabaseSync::<Vec<u8>>::new(cloud_database, cloud_sync).unwrap();
+        let encryption = cloud.sync_engine_opts.encryption.as_ref().unwrap();
+        assert_eq!(encryption.cipher(), turso_core::CipherMode::Aes256Gcm);
+        assert!(encryption.local_key().is_none());
+        assert_eq!(encryption.cloud_key().unwrap().expose(), "cloud-key");
         let mut mismatched = sync_config.clone();
         mismatched.cipher = Some("aes128gcm".into());
         assert!(TursoDatabaseSync::<Vec<u8>>::new(config.clone(), mismatched).is_err());

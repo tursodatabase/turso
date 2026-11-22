@@ -299,7 +299,7 @@ impl Builder {
     }
 
     /// Set encryption key (base64-encoded) and cipher for the Turso Cloud database.
-    /// The cipher is used to calculate the correct reserved_bytes for the database.
+    /// Both credentials are sent on encrypted sync requests.
     pub fn with_remote_encryption(
         mut self,
         base64_key: impl Into<String>,
@@ -332,9 +332,8 @@ impl Builder {
     }
 
     /// Set encryption key (base64-encoded) for the Turso Cloud database.
-    /// The key will be sent as x-turso-encryption-key header with sync HTTP requests.
-    /// Note: For deferred sync (no initial bootstrap), use with_remote_encryption() instead
-    /// to also specify the cipher for correct reserved_bytes calculation.
+    /// A cipher must also be configured before `build`; use `with_remote_encryption`
+    /// to set both. Key-only encrypted sync configurations are rejected.
     pub fn with_remote_encryption_key(mut self, base64_key: impl Into<String>) -> Self {
         self.remote_encryption_key = Some(base64_key.into());
         self
