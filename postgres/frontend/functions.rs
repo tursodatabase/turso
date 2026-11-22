@@ -1,7 +1,7 @@
 use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
-use crate::numeric::{cast_value_to_integer, IntegerWidth};
+use crate::numeric::{cast_value_to_integer, str_to_integer_checked, IntegerWidth};
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{DateTime, NaiveDateTime};
 use std::fmt;
@@ -1683,6 +1683,29 @@ fn pg_type_name(value: &Value) -> &'static str {
     }
 }
 
+fn validate_integer_input(
+    input: &str,
+    width: IntegerWidth,
+    type_name: &str,
+) -> Option<(String, String)> {
+    match str_to_integer_checked(input, width) {
+        Ok(_) => None,
+        Err(err) => {
+            let (message, sqlstate) = match err.kind() {
+                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => (
+                    format!("value \"{input}\" is out of range for type {type_name}"),
+                    "22003",
+                ),
+                _ => (
+                    format!("invalid input syntax for type {type_name}: \"{input}\""),
+                    "22P02",
+                ),
+            };
+            Some((message, sqlstate.to_string()))
+        }
+    }
+}
+
 /// Validate input for a PostgreSQL type, returning error info if invalid.
 ///
 /// Returns `None` for valid input, or `Some((message, sql_error_code))` for invalid input.
@@ -1712,44 +1735,9 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 ))
             }
         }
-        "int2" | "smallint" => match trimmed.parse::<i64>() {
-            Ok(v) if v < i16::MIN as i64 || v > i16::MAX as i64 => Some((
-                format!("value \"{input}\" is out of range for type smallint"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type smallint: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "int4" | "integer" | "int" => match trimmed.parse::<i64>() {
-            Ok(v) if v < i32::MIN as i64 || v > i32::MAX as i64 => Some((
-                format!("value \"{input}\" is out of range for type integer"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type integer: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "int8" | "bigint" => match trimmed.parse::<i64>() {
-            Ok(_) => None,
-            Err(_) => {
-                if trimmed.parse::<i128>().is_ok() {
-                    Some((
-                        format!("value \"{input}\" is out of range for type bigint"),
-                        "22003".to_string(),
-                    ))
-                } else {
-                    Some((
-                        format!("invalid input syntax for type bigint: \"{input}\""),
-                        "22P02".to_string(),
-                    ))
-                }
-            }
-        },
+        "int2" | "smallint" => validate_integer_input(input, IntegerWidth::Int16, "smallint"),
+        "int4" | "integer" | "int" => validate_integer_input(input, IntegerWidth::Int32, "integer"),
+        "int8" | "bigint" => validate_integer_input(input, IntegerWidth::Int64, "bigint"),
         "float4" | "real" => match trimmed.parse::<f32>() {
             Ok(v) if v.is_infinite() => Some((
                 format!("value \"{input}\" is out of range for type real"),
