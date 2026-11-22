@@ -248,7 +248,7 @@ precision.
 |---------|--------|-------|
 | ANY_VALUE aggregate | ❌ Not supported | |
 | DISTINCT ON | 🟡 Partial | Rejected: COLLATE in a DISTINCT ON expression or in its ORDER BY; a volatile function such as `nextval()` or `random()` in the select list; in a query with aggregates, an expression that reads a column outside GROUP BY (PostgreSQL accepts a column that depends on a grouped primary key); an aggregate that appears only in a DISTINCT ON expression; an expression computed on an aggregate when there is no GROUP BY |
-| FETCH FIRST .. WITH TIES | 🟡 Partial | Rejected on a set operation (`UNION`, `INTERSECT`, `EXCEPT`), which includes a recursive `WITH` query |
+| FETCH FIRST .. WITH TIES | ✅ Supported | Rejected in a recursive `WITH` query, as in PostgreSQL |
 | GROUPING SETS, CUBE and ROLLUP support | ❌ Not supported | Translation error |
 | INSERT/UPDATE/DELETE RETURNING | ✅ Supported | Including `RETURNING *`; on UPDATE ... FROM, `RETURNING *` is rejected (it would omit the FROM tables' columns) |
 | LATERAL clause | 🟡 Partial | LATERAL subqueries work with a comma, [CROSS] JOIN, and LEFT JOIN. Column alias lists such as `AS s(x)` work on subqueries, unnest(), generate_series(), current_schema(), current_database() and version(); outer columns in LIMIT/OFFSET are not supported; LATERAL tvf() is not supported     |

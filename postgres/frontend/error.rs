@@ -422,6 +422,7 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_PARAMETER
     } else if msg == "subqueries in policies are not supported"
         || (msg.contains("DISTINCT ON") && msg.ends_with(" is not supported"))
+        || msg == "WITH TIES is not supported in a recursive common table expression"
     {
         SQLSTATE_FEATURE_NOT_SUPPORTED
     } else if msg == "sequence must have same owner as table it is linked to" {

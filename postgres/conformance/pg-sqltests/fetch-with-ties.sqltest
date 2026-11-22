@@ -448,9 +448,8 @@ test error-skip-locked {
 @sqlstate 42601
 expect error {}
 
-# tursopg sorts a set operation with other code than a single SELECT.
+# A set operation is sorted by other code than a single SELECT.
 @setup rows
-@compat-gap "syntax:fetch-with-ties"
 test set-operation {
     SELECT a FROM t WHERE a = 2 UNION ALL SELECT a FROM t WHERE a = 1 ORDER BY 1 FETCH FIRST 2 ROWS WITH TIES;
 }
@@ -460,6 +459,35 @@ expect {
     2
     2
 }
-@sqlstate 0A000
-expect @tursopg error {
+
+@setup rows
+test set-operation-compares-every-order-by-term-after-the-offset {
+    SELECT a, b FROM t UNION ALL SELECT a, b FROM t ORDER BY a, b OFFSET 1 FETCH FIRST 2 ROWS WITH TIES;
 }
+expect {
+    1|p
+    2|q
+    2|q
+}
+
+@setup rows
+test union-returns-the-ties {
+    SELECT a, b FROM t UNION SELECT a, 'x' FROM t ORDER BY 1 FETCH FIRST 3 ROWS WITH TIES;
+}
+expect unordered {
+    1|p
+    1|x
+    2|q
+    2|r
+    2|s
+    2|x
+}
+
+test error-recursive-query {
+    WITH RECURSIVE r(n) AS (
+        SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3 ORDER BY 1 FETCH FIRST 1 ROW WITH TIES
+    )
+    SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {}
