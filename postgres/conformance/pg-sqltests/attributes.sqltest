@@ -1,0 +1,337 @@
+# pg_attribute is a stored table. The statement that creates, alters or drops
+# a table writes its rows.
+
+@database :memory:
+
+setup people {
+    CREATE TABLE people (id int PRIMARY KEY, name text NOT NULL, age int DEFAULT 1);
+}
+
+test pg-attribute-create-table-writes-one-row-per-column {
+    CREATE TABLE made (id bigint NOT NULL, name text DEFAULT 'x', flag boolean, body bytea);
+    SELECT attname, atttypid, attnum, attnotnull, atthasdef
+    FROM pg_attribute
+    WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'made') AND attnum > 0
+    ORDER BY attnum;
+}
+expect {
+    id|20|1|t|f
+    name|25|2|f|t
+    flag|16|3|f|f
+    body|17|4|f|f
+}
+
+test pg-attribute-create-table-in-a-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.made (a int, b text);
+    SELECT a.attname, a.attnum
+    FROM pg_attribute a
+    JOIN pg_class c ON c.oid = a.attrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'app' AND a.attnum > 0
+    ORDER BY a.attnum;
+}
+expect {
+    a|1
+    b|2
+}
+
+test pg-attribute-create-table-as-select {
+    CREATE TABLE source (a int, b text);
+    CREATE TABLE copied AS SELECT a, b FROM source;
+    SELECT attname, atttypid, attnum
+    FROM pg_attribute
+    WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'copied') AND attnum > 0
+    ORDER BY attnum;
+}
+expect {
+    a|23|1
+    b|25|2
+}
+
+test pg-attribute-two-tables-keep-their-own-rows {
+    CREATE TABLE first (a int);
+    CREATE TABLE second (b int, c int);
+    SELECT c.relname, a.attname
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname IN ('first', 'second') AND a.attnum > 0
+    ORDER BY c.relname, a.attnum;
+}
+expect {
+    first|a
+    second|b
+    second|c
+}
+
+@setup people
+test pg-attribute-add-column {
+    ALTER TABLE people ADD COLUMN email text NOT NULL DEFAULT '';
+    SELECT attname, atttypid, attnotnull, atthasdef
+    FROM pg_attribute
+    WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'people') AND attnum > 0
+    ORDER BY attnum;
+}
+expect {
+    id|23|t|f
+    name|25|t|f
+    age|23|f|t
+    email|25|t|t
+}
+
+# PostgreSQL keeps the row of a dropped column and marks it. Turso deletes
+# it, so the query leaves dropped columns and column numbers out.
+@setup people
+test pg-attribute-drop-column {
+    ALTER TABLE people DROP COLUMN name;
+    SELECT attname
+    FROM pg_attribute
+    WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'people')
+        AND attnum > 0 AND NOT attisdropped
+    ORDER BY attnum;
+}
+expect {
+    id
+    age
+}
+
+@setup people
+test pg-attribute-rename-column {
+    ALTER TABLE people RENAME COLUMN name TO full_name;
+    SELECT attname, attnum, attnotnull
+    FROM pg_attribute
+    WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'people') AND attnum > 0
+    ORDER BY attnum;
+}
+expect {
+    id|1|t
+    full_name|2|t
+    age|3|f
+}
+
+@setup people
+test pg-attribute-rename-table-keeps-the-rows {
+    ALTER TABLE people RENAME TO persons;
+    SELECT attname
+    FROM pg_attribute
+    WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'persons') AND attnum > 0
+    ORDER BY attnum;
+}
+expect {
+    id
+    name
+    age
+}
+
+test pg-attribute-drop-table-deletes-only-its-rows {
+    CREATE TABLE dropped (dropped_a int, dropped_b text);
+    CREATE TABLE kept (kept_a int);
+    DROP TABLE dropped;
+    SELECT attname FROM pg_attribute
+    WHERE attname IN ('dropped_a', 'dropped_b', 'kept_a')
+    ORDER BY attname;
+}
+expect {
+    kept_a
+}
+
+@setup people
+test pg-attribute-several-changes-in-a-row {
+    ALTER TABLE people ADD COLUMN a text;
+    ALTER TABLE people RENAME COLUMN a TO b;
+    ALTER TABLE people DROP COLUMN age;
+    ALTER TABLE people ADD COLUMN c int;
+    SELECT attname
+    FROM pg_attribute
+    WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'people')
+        AND attnum > 0 AND NOT attisdropped
+    ORDER BY attnum;
+}
+expect {
+    id
+    name
+    b
+    c
+}
+
+test pg-attribute-rolled-back-create-table-leaves-no-rows {
+    BEGIN;
+    CREATE TABLE undone (undone_a int, undone_b int);
+    SELECT count(*) FROM pg_attribute WHERE attname IN ('undone_a', 'undone_b');
+    ROLLBACK;
+    SELECT count(*) FROM pg_attribute WHERE attname IN ('undone_a', 'undone_b');
+}
+expect {
+    2
+    0
+}
+
+@setup people
+test pg-attribute-rolled-back-alter-table-keeps-the-old-rows {
+    BEGIN;
+    ALTER TABLE people ADD COLUMN email text;
+    ALTER TABLE people RENAME COLUMN name TO full_name;
+    ALTER TABLE people DROP COLUMN age;
+    ROLLBACK;
+    SELECT attname
+    FROM pg_attribute
+    WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'people')
+        AND attnum > 0 AND NOT attisdropped
+    ORDER BY attnum;
+}
+expect {
+    id
+    name
+    age
+}
+
+@setup people
+test pg-attribute-rolled-back-drop-table-keeps-the-rows {
+    BEGIN;
+    DROP TABLE people;
+    ROLLBACK;
+    SELECT attname
+    FROM pg_attribute
+    WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'people') AND attnum > 0
+    ORDER BY attnum;
+}
+expect {
+    id
+    name
+    age
+}
+
+test pg-attribute-views-indexes-and-sequences-have-no-rows {
+    CREATE TABLE base (base_a int);
+    CREATE INDEX base_idx ON base (base_a);
+    CREATE VIEW base_view AS SELECT base_a AS view_a FROM base;
+    CREATE SEQUENCE base_seq;
+    SELECT c.relname, a.attname
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'base' AND a.attnum > 0;
+    DROP VIEW base_view;
+    DROP INDEX base_idx;
+    DROP SEQUENCE base_seq;
+    SELECT count(*) FROM pg_attribute WHERE attname = 'base_a';
+}
+expect {
+    base|base_a
+    1
+}
+
+test pg-attribute-drop-schema-cascade-deletes-the-rows {
+    CREATE SCHEMA gone;
+    CREATE TABLE gone.t (gone_a int, gone_b int);
+    DROP SCHEMA gone CASCADE;
+    SELECT count(*) FROM pg_attribute WHERE attname IN ('gone_a', 'gone_b');
+}
+expect {
+    0
+}
+
+test pg-attribute-select-into {
+    CREATE TABLE source (a int, b text);
+    SELECT a, b INTO copied FROM source;
+    SELECT attname, atttypid
+    FROM pg_attribute
+    WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'copied') AND attnum > 0
+    ORDER BY attnum;
+}
+expect {
+    a|23
+    b|25
+}
+
+test pg-attribute-serial-identity-and-generated-columns {
+    CREATE TABLE made (
+        a serial,
+        b int GENERATED ALWAYS AS IDENTITY,
+        c int GENERATED BY DEFAULT AS IDENTITY,
+        d int,
+        e int GENERATED ALWAYS AS (d * 2) STORED
+    );
+    SELECT attname, attnotnull, atthasdef, attidentity, attgenerated
+    FROM pg_attribute
+    WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'made') AND attnum > 0
+    ORDER BY attnum;
+}
+expect {
+    a|t|t||
+    b|t|f|a|
+    c|t|f|d|
+    d|f|f||
+    e|f|t||s
+}
+
+test pg-attribute-domain-and-enum-columns {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE DOMAIN positive AS int CHECK (VALUE > 0);
+    CREATE TABLE made (m mood, p positive);
+    SELECT a.attname, t.typname
+    FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+    WHERE a.attrelid = (SELECT oid FROM pg_class WHERE relname = 'made') AND a.attnum > 0
+    ORDER BY a.attnum;
+}
+expect {
+    m|mood
+    p|positive
+}
+
+test pg-attribute-role-without-privileges-reads-it {
+    CREATE TABLE made (made_a int);
+    CREATE ROLE attribute_reader;
+    SET ROLE attribute_reader;
+    SELECT attname FROM pg_attribute WHERE attname = 'made_a';
+}
+expect {
+    made_a
+}
+
+test pg-attribute-tableoid {
+    CREATE TABLE made (a int);
+    SELECT DISTINCT tableoid FROM pg_catalog.pg_attribute;
+}
+expect {
+    1249
+}
+
+@skip-if postgres "a PostgreSQL superuser may write pg_attribute"
+test pg-attribute-rejects-insert {
+    INSERT INTO pg_attribute (attrelid, attname) VALUES (1, 'x');
+}
+expect error {
+    cannot insert into pg_catalog table "pg_attribute"
+}
+
+@skip-if postgres "a PostgreSQL superuser may write pg_attribute"
+test pg-attribute-rejects-delete {
+    DELETE FROM pg_attribute;
+}
+expect error {
+    cannot delete from pg_catalog table "pg_attribute"
+}
+
+test pg-attribute-rejects-ddl {
+    DROP TABLE pg_attribute;
+}
+@sqlstate 42501
+expect error {
+    permission denied: "pg_attribute" is a system catalog
+}
+
+test pg-attribute-index-rejects-drop {
+    DROP INDEX pg_catalog.pg_attribute_relid_attnum_index;
+}
+@sqlstate 42501
+expect error {
+    permission denied: "pg_attribute_relid_attnum_index" is a system catalog
+}
+
+test pg-attribute-index-is-not-a-user-index {
+    CREATE TABLE made (a int);
+    SELECT count(*) FROM pg_indexes WHERE indexname = 'pg_attribute_relid_attnum_index' AND schemaname = 'public';
+    SELECT count(*) FROM pg_class WHERE relname = 'pg_attribute_relid_attnum_index' AND relnamespace = 2200;
+}
+expect {
+    0
+    0
+}

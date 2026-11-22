@@ -1,3 +1,4 @@
+mod attributes;
 mod catalog;
 mod classes;
 mod copy;
