@@ -15,8 +15,8 @@ use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
-    compare_immutable_iter, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
-    SeekResult, Value,
+    compare_immutable_iter, IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef,
+    IndexInfo, SeekKey, SeekOp, SeekResult, Value,
 };
 use crate::vdbe::Register;
 use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
@@ -168,6 +168,40 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> ProvidesYieldContext
             cursor_yield_key(self.tx_id, self.table_id),
         )
     }
+}
+
+fn current_pos_is_only_row_of_seek_key(
+    current_row_id: &RowKey,
+    seek_key: &SeekKey<'_>,
+    mv_cursor_type: &MvccCursorType,
+) -> Result<bool> {
+    Ok(match (current_row_id, seek_key, mv_cursor_type) {
+        (RowKey::Int(current), SeekKey::TableRowId(target), MvccCursorType::Table) => {
+            *current == *target
+        }
+        (RowKey::Record(_), SeekKey::IndexKey(target), MvccCursorType::Index(index_info)) => {
+            index_key_matches_at_most_one_row(target, index_info)?
+                && row_matches_seek_key(current_row_id, seek_key, mv_cursor_type)?
+        }
+        _ => false,
+    })
+}
+
+fn index_key_matches_at_most_one_row(
+    key: &ImmutableRecordRef<'_>,
+    index_info: &IndexInfo,
+) -> Result<bool> {
+    // num_cols counts the rowid when the index stores one. So a key this long
+    // ends with the rowid, and two rows never share a rowid. An index without
+    // a rowid (an index method's backing B-tree) stores each whole key once.
+    let column_count = key.column_count();
+    if column_count == index_info.num_cols {
+        return Ok(true);
+    }
+    // In a UNIQUE index, the indexed columns alone also name one row, unless a
+    // value is NULL: a UNIQUE index can hold any number of rows with NULL there.
+    let indexed_columns = index_info.num_cols - usize::from(index_info.has_rowid);
+    Ok(index_info.is_unique && column_count == indexed_columns && !key.contains_null()?)
 }
 
 #[cfg(any(test, injected_yields))]
@@ -1207,8 +1241,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             self.state = None;
             return Ok(IOResult::Done(()));
         }
-        let at_most_one_match =
-            op.eq_only() && seek_key_matches_at_most_one_row(&seek_key, &self.mv_cursor_type)?;
+        let at_most_one_match = op.eq_only()
+            && match (&seek_key, &self.mv_cursor_type) {
+                (SeekKey::TableRowId(_), MvccCursorType::Table) => true,
+                (SeekKey::IndexKey(target), MvccCursorType::Index(index_info)) => {
+                    index_key_matches_at_most_one_row(target, index_info)?
+                }
+                _ => false,
+            };
 
         loop {
             let Some(MvccLazyCursorState::Seek(SeekState::SeekBtree(btree_seek_state), direction)) =
@@ -1710,9 +1750,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 row_id, in_btree, ..
             } = &self.current_pos
             {
-                if seek_key_matches_at_most_one_row(&seek_key, &self.mv_cursor_type)?
-                    && row_matches_seek_key(&row_id.row_id, &seek_key, &self.mv_cursor_type)?
-                {
+                if current_pos_is_only_row_of_seek_key(
+                    &row_id.row_id,
+                    &seek_key,
+                    &self.mv_cursor_type,
+                )? {
                     let maybe_index_id = match &self.mv_cursor_type {
                         MvccCursorType::Index(_) => Some(self.table_id),
                         MvccCursorType::Table => None,
@@ -1877,14 +1919,16 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                 row_matches_seek_key(&winner_key, &seek_key, &self.mv_cursor_type)?;
                             if found {
                                 // A peek ahead of the winner can skip a row restored by rollback.
-                                if in_btree
-                                    && !seek_key_matches_at_most_one_row(
-                                        &seek_key,
-                                        &self.mv_cursor_type,
-                                    )?
+                                if let (
+                                    true,
+                                    SeekKey::IndexKey(index_key),
+                                    MvccCursorType::Index(index_info),
+                                ) = (in_btree, &seek_key, &self.mv_cursor_type)
                                 {
-                                    self.peeks_valid_for = Some(direction);
-                                    self.mvcc_peek_needs_reseek = true;
+                                    if !index_key_matches_at_most_one_row(index_key, index_info)? {
+                                        self.peeks_valid_for = Some(direction);
+                                        self.mvcc_peek_needs_reseek = true;
+                                    }
                                 }
                                 return Ok(IOResult::Done(SeekResult::Found));
                             } else {
@@ -2420,28 +2464,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for MvccLazyCursor<Clock
             .field("btree_cursor", &())
             .finish()
     }
-}
-
-/// Whether a seek key identifies at most one stored row.
-fn seek_key_matches_at_most_one_row(
-    seek_key: &SeekKey<'_>,
-    cursor_type: &MvccCursorType,
-) -> Result<bool> {
-    Ok(match (seek_key, cursor_type) {
-        (SeekKey::TableRowId(_), MvccCursorType::Table) => true,
-        (SeekKey::IndexKey(key), MvccCursorType::Index(index_info)) => {
-            // A complete stored key includes the rowid when the index has one.
-            // Without a rowid, each complete key is stored only once.
-            let column_count = key.column_count();
-            if column_count == index_info.num_cols {
-                return Ok(true);
-            }
-            // UNIQUE permits duplicate keys when any indexed column is NULL.
-            let indexed_columns = index_info.num_cols - usize::from(index_info.has_rowid);
-            index_info.is_unique && column_count == indexed_columns && !key.contains_null()?
-        }
-        _ => false,
-    })
 }
 
 /// Compare a stored row key with a seek prefix using the index's comparison rules.
