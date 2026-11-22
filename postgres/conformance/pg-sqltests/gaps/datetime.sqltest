@@ -165,9 +165,8 @@ test timestamptz-cast-to-bigint {
 }
 @sqlstate 42846
 expect error {}
-expect @tursopg {
-    @error 22P02
-}
+@sqlstate 22P02
+expect @tursopg error {}
 
 @compat-gap "type:timestamptz"
 test timestamptz-offset-out-of-range {
