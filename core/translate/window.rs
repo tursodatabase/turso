@@ -206,6 +206,14 @@ fn prepare_window_subquery(
         )?;
     }
 
+    // An outer layer pushes each call of this window into its subquery as a
+    // whole expression and reuses one column for equivalent calls, as SQLite's
+    // `selectWindowRewriteExprCb` does. `link_with_window` keeps one entry per
+    // occurrence for calls with nondeterministic functions such as `random()`
+    // or `date()`, so the entries of the calls that were merged into an earlier
+    // equivalent call match no expression in this layer and compute nothing.
+    current_window.functions.retain(|f| f.rewritten.is_some());
+
     // When there is no ORDER BY or PARTITION BY clause, the window function takes zero arguments,
     // and no other columns are selected (e.g., "SELECT count() OVER () FROM products"),
     // `subquery_result_columns` may be empty. Add a constant expression to keep the query valid.
