@@ -2,6 +2,7 @@ use crate::{alloc::TryReserveError, turso_assert_eq, turso_assert_greater_than};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
+use std::cell::Cell;
 
 use turso_parser::ast::{Operator, SubqueryType, TableInternalId};
 
@@ -467,6 +468,10 @@ struct WhereTermInfo {
     table_mask: TableMask,
     extra_steps: usize,
     equal_tables: Option<(TableInternalId, TableInternalId, Option<TableInternalId>)>,
+    /// Whether the term reads a table of an outer query. It is found the first
+    /// time that a hash join candidate needs it, because most searches have no
+    /// such candidate.
+    reads_an_outer_query: Cell<Option<bool>>,
 }
 
 /// What the join order search reads about the `WHERE` terms. The search does
@@ -1151,7 +1156,8 @@ fn join_lhs_and_rhs<'a, 'w>(
 }
 
 /// The tables of each term are the ones that `where_terms` read once for the
-/// search, so the terms are not walked again for each hash join candidate.
+/// search, and each term is walked for outer query references at most once in
+/// the search, so the terms are not walked again for each hash join candidate.
 fn materialized_build_input_reads_an_outer_query(
     where_clause: &[WhereTerm],
     where_terms: &WhereTermsInfo,
@@ -1161,12 +1167,31 @@ fn materialized_build_input_reads_an_outer_query(
 ) -> Result<bool> {
     for (term, term_info) in where_clause.iter().zip(&where_terms.terms) {
         if build_input_mask.contains_all_set_bits_of(&term_info.table_mask)
-            && expr_reads_an_outer_query(&term.expr, table_references, subqueries)?
+            && term_info.reads_an_outer_query(term, table_references, subqueries)?
         {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+impl WhereTermInfo {
+    /// The answer of `expr_reads_an_outer_query` for `term`, the term of this
+    /// info. The terms, the table references and the subqueries do not change
+    /// during the search, so the answer is the same each time.
+    fn reads_an_outer_query(
+        &self,
+        term: &WhereTerm,
+        table_references: &TableReferences,
+        subqueries: &[NonFromClauseSubquery],
+    ) -> Result<bool> {
+        if let Some(reads) = self.reads_an_outer_query.get() {
+            return Ok(reads);
+        }
+        let reads = expr_reads_an_outer_query(&term.expr, table_references, subqueries)?;
+        self.reads_an_outer_query.set(Some(reads));
+        Ok(reads)
+    }
 }
 
 fn can_replace_build_index_with_hash(
@@ -2421,6 +2446,7 @@ fn build_where_term_info(
                         term.origin.join_origin().and_then(JoinOrigin::outer_table),
                     )
                 }),
+                reads_an_outer_query: Cell::new(None),
             })
         })
         .collect()
