@@ -305,6 +305,51 @@ fn encrypted_bootstrap_failures_around_sync_and_metadata_publication() {
 }
 
 #[test]
+fn plaintext_bootstrap_retries_all_zero_placeholders() {
+    let remote = Remote::new(&[
+        "CREATE TABLE items(value TEXT)",
+        "INSERT INTO items VALUES ('retry before first page')",
+    ])
+    .unwrap();
+    for empty_metadata in [false, true] {
+        let directory = Arc::new(tempfile::tempdir().unwrap());
+        let main = directory.path().join("replica.db");
+        if empty_metadata {
+            std::fs::write(directory.path().join("replica.db-info"), []).unwrap();
+        }
+        // A zero header alone does not make nonzero data safe to overwrite.
+        let mut placeholder = vec![0; 64 * 1024 + 13];
+        *placeholder.last_mut().unwrap() = 1;
+        for invalid in [placeholder.as_slice(), b"SQLite f"] {
+            std::fs::write(&main, invalid).unwrap();
+            assert!(Replica::open(
+                &directory,
+                InProcessServer::new(remote.clone()),
+                super::harness::database_opts()
+            )
+            .is_err());
+            assert_eq!(std::fs::read(&main).unwrap(), invalid);
+        }
+        *placeholder.last_mut().unwrap() = 0;
+        std::fs::write(&main, &placeholder).unwrap();
+        assert!(Replica::open_encrypted(
+            &directory,
+            InProcessServer::new(remote.clone()),
+            Some([22; 32])
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&main).unwrap(), placeholder);
+        let replica = Replica::open(
+            &directory,
+            InProcessServer::new(remote.clone()),
+            super::harness::database_opts(),
+        )
+        .expect("retry after preallocating a plaintext bootstrap");
+        assert_eq!(replica.snapshot().unwrap(), remote.snapshot().unwrap());
+    }
+}
+
+#[test]
 fn interrupted_bootstrap_requires_cleanup_only_for_encrypted_replicas() {
     let remote = Remote::new_encrypted(&[
         "CREATE TABLE items(value TEXT)",

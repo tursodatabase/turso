@@ -194,7 +194,7 @@ fn is_memory(main_db_path: &str) -> bool {
     main_db_path == ":memory:"
 }
 pub fn sync_database_file_paths(main_db_path: &str) -> Vec<String> {
-    vec![
+    let mut paths = vec![
         // Core opens the database and its WAL.
         main_db_path.to_string(),
         create_main_db_wal_path(main_db_path),
@@ -204,7 +204,13 @@ pub fn sync_database_file_paths(main_db_path: &str) -> Vec<String> {
         create_changes_path(main_db_path),
         // MVCC may be selected only after the remote protocol is known.
         create_main_db_log_path(main_db_path),
-    ]
+        create_replace_base_marker_path(main_db_path),
+    ];
+    paths.extend(
+        replace_base_file_specs(main_db_path)
+            .map(|(_, name)| replace_base_backup_path(main_db_path, name)),
+    );
+    paths
 }
 fn create_main_db_wal_path(main_db_path: &str) -> String {
     format!("{main_db_path}-wal")
@@ -291,86 +297,101 @@ struct ReplaceBaseApplyGuard<IO: SyncEngineIo> {
     manifest: ReplaceBaseBackupManifest,
 }
 
-/// caller has no access to the memory io - so we handle it here implicitly
-/// ideally, we should add necessary methods to the turso_core::IO trait - but so far I am struggling with nice interface to do that
-/// so, I decided to keep a little bit of mess in sync-engine for a little bit longer
+/// Metadata uses host storage except for in-memory databases; recovery files
+/// always use core IO, alongside the database files they preserve.
 async fn full_read<Ctx, IO: SyncEngineIo>(
     coro: &Coro<Ctx>,
     io: Option<Arc<dyn turso_core::IO>>,
     sync_engine_io: Arc<IO>,
     path: &str,
-    is_memory: bool,
+    use_core_io: bool,
 ) -> Result<Option<Vec<u8>>> {
-    if !is_memory {
+    if !use_core_io {
         let completion = sync_engine_io.full_read(path)?;
         let data = wait_all_results(coro, &completion, None).await?;
-        if data.is_empty() {
-            return Ok(None);
-        } else {
-            return Ok(Some(data));
-        }
+        return Ok((!data.is_empty()).then_some(data));
     }
     let Some(io) = io else {
-        return Err(Error::DatabaseSyncEngineError(
-            "MemoryIO must be set".to_string(),
-        ));
+        return Err(Error::DatabaseSyncEngineError("core IO must be set".into()));
     };
-    let Ok(file) = io.open_file(path, OpenFlags::None, false) else {
+    let Some(file) = io.try_open(path)? else {
         return Ok(None);
     };
     let mut content = Vec::new();
     let mut offset = 0;
-    let buffer = Arc::new(Buffer::new_temporary(4096));
+    let buffer = Arc::new(Buffer::new_temporary(64 * 1024));
     let read_len = Arc::new(Mutex::new(0));
     loop {
         let c = Completion::new_read(buffer.clone(), {
             let read_len = read_len.clone();
+            let read_file = file.clone();
             move |r| {
-                *read_len.lock().unwrap() = r.expect("memory io must not fail").1;
+                let _keep_alive = &read_file;
+                if let Ok((_, length)) = r {
+                    *read_len.lock().unwrap() = length;
+                }
                 None
             }
         });
-        let read = file.pread(offset, c).expect("memory io must not fail");
-        assert!(read.finished(), "memory io must complete immediately");
-        let read_len = *read_len.lock().unwrap();
+        let read = file.pread(offset, c)?;
+        wait_file_completion(coro, &read).await?;
+        let read_len = *read_len.lock().unwrap() as usize;
         if read_len == 0 {
             break;
         }
-        content.extend_from_slice(&buffer.as_slice()[0..read_len as usize]);
+        if read_len > buffer.len() {
+            return Err(Error::IoError("invalid recovery file read length".into()));
+        }
+        content.extend_from_slice(&buffer.as_slice()[..read_len]);
         offset += read_len as u64;
     }
     Ok(Some(content))
 }
 
-/// caller has no access to the memory io - so we handle it here implicitly
-/// ideally, we should add necessary methods to the turso_core::IO trait - but so far I am struggling with nice interface to do that
-/// so, I decided to keep a little bit of mess in sync-engine for a little bit longer
 async fn full_write<Ctx, IO: SyncEngineIo>(
     coro: &Coro<Ctx>,
     io: Arc<dyn turso_core::IO>,
     sync_engine_io: Arc<IO>,
     path: &str,
-    is_memory: bool,
+    use_core_io: bool,
     content: Vec<u8>,
 ) -> Result<()> {
-    if !is_memory {
+    if !use_core_io {
         let completion = sync_engine_io.full_write(path, content)?;
         wait_all_results(coro, &completion, None).await?;
         return Ok(());
     }
     let file = io.open_file(path, OpenFlags::Create, false)?;
-    let trunc = file
-        .truncate(0, Completion::new_trunc(|_| {}))
-        .expect("memory io must not fail");
-    assert!(trunc.finished(), "memory io must complete immediately");
-    let write = file
-        .pwrite(
-            0,
-            Arc::new(Buffer::new(content)),
-            Completion::new_write(|_| {}),
-        )
-        .expect("memory io must nof fail");
-    assert!(write.finished(), "memory io must complete immediately");
+    let trunc = file.truncate(
+        0,
+        Completion::new_trunc({
+            let truncate_file = file.clone();
+            move |_| {
+                let _keep_alive = &truncate_file;
+            }
+        }),
+    )?;
+    wait_file_completion(coro, &trunc).await?;
+    let expected = content.len();
+    let written = Arc::new(Mutex::new(0));
+    let write = file.pwrite(
+        0,
+        Arc::new(Buffer::new(content)),
+        Completion::new_write({
+            let written = written.clone();
+            let write_file = file.clone();
+            move |result| {
+                let _keep_alive = &write_file;
+                if let Ok(length) = result {
+                    *written.lock().unwrap() = length as usize;
+                }
+            }
+        }),
+    )?;
+    wait_file_completion(coro, &write).await?;
+    if *written.lock().unwrap() != expected {
+        return Err(Error::IoError("short recovery file write".into()));
+    }
     Ok(())
 }
 
@@ -383,15 +404,37 @@ async fn sync_path_if_present<Ctx>(
         return Ok(());
     };
     let sync = file.sync(
-        Completion::new_sync(|_| {}),
+        Completion::new_sync({
+            let sync_file = file.clone();
+            move |_| {
+                let _keep_alive = &sync_file;
+            }
+        }),
         turso_core::io::FileSyncType::Fsync,
     )?;
     wait_file_completion(coro, &sync).await?;
     Ok(())
 }
 
-fn remove_file_if_present(io: &Arc<dyn turso_core::IO>, path: &str) -> Result<()> {
-    if io.try_open(path)?.is_some() {
+async fn remove_file_if_present<Ctx>(
+    coro: &Coro<Ctx>,
+    io: &Arc<dyn turso_core::IO>,
+    path: &str,
+) -> Result<()> {
+    if let Some(file) = io.try_open(path)? {
+        // OPFS keeps pre-registered handles and cannot unlink through core IO.
+        // Persist an empty file before removal so both backends clear recovery.
+        let trunc = file.truncate(
+            0,
+            Completion::new_trunc({
+                let truncate_file = file.clone();
+                move |_| {
+                    let _keep_alive = &truncate_file;
+                }
+            }),
+        )?;
+        wait_file_completion(coro, &trunc).await?;
+        sync_path_if_present(coro, io, path).await?;
         io.remove_file(path)?;
     }
     Ok(())
@@ -439,18 +482,18 @@ async fn copy_sync_engine_file<Ctx, IO: SyncEngineIo>(
     sync_engine_io: Arc<IO>,
     source_path: &str,
     target_path: &str,
-    is_memory: bool,
+    metadata_path: &str,
 ) -> Result<bool> {
     let Some(content) = full_read(
         coro,
         Some(io.clone()),
         sync_engine_io.clone(),
         source_path,
-        is_memory,
+        source_path != metadata_path,
     )
     .await?
     else {
-        remove_file_if_present(&io, target_path)?;
+        remove_file_if_present(coro, &io, target_path).await?;
         return Ok(false);
     };
     full_write(
@@ -458,7 +501,7 @@ async fn copy_sync_engine_file<Ctx, IO: SyncEngineIo>(
         io.clone(),
         sync_engine_io,
         target_path,
-        is_memory,
+        target_path != metadata_path,
         content,
     )
     .await?;
@@ -480,7 +523,7 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
                 "replace-base local replay preservation requires durable local storage".to_string(),
             ));
         }
-        let is_memory = is_memory(main_db_path);
+        let metadata_path = create_meta_path(main_db_path);
         let file_specs = replace_base_file_specs(main_db_path);
         let mut files = Vec::with_capacity(file_specs.len());
         for (path, name) in file_specs {
@@ -491,7 +534,7 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
                 sync_engine_io.io.clone(),
                 &path,
                 &backup_path,
-                is_memory,
+                &metadata_path,
             )
             .await?;
             files.push(ReplaceBaseBackupFile {
@@ -513,7 +556,7 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
             io.clone(),
             sync_engine_io.io.clone(),
             &marker_path,
-            is_memory,
+            true,
             serde_json::to_vec(&manifest)?,
         )
         .await?;
@@ -539,16 +582,15 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
         main_db_path: &str,
     ) -> Result<bool> {
         let marker_path = create_replace_base_marker_path(main_db_path);
-        let is_memory = is_memory(main_db_path);
         let Some(marker) = full_read(
             coro,
             Some(io.clone()),
             sync_engine_io.io.clone(),
             &marker_path,
-            is_memory,
+            true,
         )
         .await?
-        else {
+        .filter(|marker| !marker.is_empty()) else {
             return Ok(false);
         };
         let manifest: ReplaceBaseBackupManifest =
@@ -573,7 +615,7 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
     }
 
     async fn restore<Ctx>(&self, coro: &Coro<Ctx>) -> Result<()> {
-        let is_memory = is_memory(&self.main_db_path);
+        let metadata_path = create_meta_path(&self.main_db_path);
         for file in &self.manifest.files {
             if file.present {
                 let restored = copy_sync_engine_file(
@@ -582,7 +624,7 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
                     self.sync_engine_io.io.clone(),
                     &file.backup_path,
                     &file.path,
-                    is_memory,
+                    &metadata_path,
                 )
                 .await?;
                 if !restored {
@@ -592,14 +634,25 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
                     )));
                 }
             } else {
-                remove_file_if_present(&self.io, &file.path)?;
+                if file.path == metadata_path {
+                    full_write(
+                        coro,
+                        self.io.clone(),
+                        self.sync_engine_io.io.clone(),
+                        &file.path,
+                        false,
+                        Vec::new(),
+                    )
+                    .await?;
+                }
+                remove_file_if_present(coro, &self.io, &file.path).await?;
             }
         }
         self.cleanup(coro).await
     }
 
     async fn cleanup<Ctx>(&self, coro: &Coro<Ctx>) -> Result<()> {
-        // Remove the marker BEFORE the backups. The marker is the sole signal
+        // Clear and sync the marker BEFORE removing the backups. The marker is the sole signal
         // that "backups are authoritative and must be restored on recovery", so
         // its removal must be made durable before any backup disappears.
         // Removing backups first would let a crash in this window leave a marker
@@ -607,12 +660,14 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
         // bricks the database. Once the marker is durably gone, leftover backups
         // are merely orphaned files (harmless, overwritten by the next apply).
         remove_file_if_present(
+            coro,
             &self.io,
             &create_replace_base_marker_path(&self.main_db_path),
-        )?;
+        )
+        .await?;
         sync_parent_dir(&self.main_db_path)?;
         for file in &self.manifest.files {
-            remove_file_if_present(&self.io, &file.backup_path)?;
+            remove_file_if_present(coro, &self.io, &file.backup_path).await?;
         }
         sync_path_if_present(coro, &self.io, &self.main_db_path).await?;
         Ok(())
@@ -1039,8 +1094,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
             // Recovery runs before bootstrap. Remaining artifacts must not be
             // silently reused by fresh creation, even when they are empty.
-            // Keep this separate from sync_database_file_paths: the browser
-            // eagerly creates/registers every path in that public inventory.
+            // The browser pre-registers empty core files; host storage still
+            // distinguishes user artifacts from those automatically created files.
             let recovery_paths = std::iter::once(create_replace_base_marker_path(main_db_path))
                 .chain(
                     replace_base_file_specs(main_db_path)
@@ -1103,7 +1158,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     }),
                 )?;
                 wait_file_completion(coro, &completion).await?;
-                if header.as_slice() != plaintext_magic {
+                if header.as_slice() != plaintext_magic
+                    && (!opts.bootstrap_if_empty || !bootstrap_file_is_zeroed(coro, &file).await?)
+                {
                     return Err(LimboError::NotADB.into());
                 }
             }
@@ -3456,6 +3513,46 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     }
 }
 
+// Bootstrap resizes the file before receiving its first page. A retry may
+// overwrite that zero placeholder, but must preserve any nonzero contents.
+async fn bootstrap_file_is_zeroed<Ctx>(
+    coro: &Coro<Ctx>,
+    file: &Arc<dyn turso_core::File>,
+) -> Result<bool> {
+    let buffer = Arc::new(Buffer::new_temporary(64 * 1024));
+    let read_len = Arc::new(AtomicUsize::new(0));
+    let mut offset = 0;
+    loop {
+        let completion = file.pread(
+            offset,
+            Completion::new_read(buffer.clone(), {
+                let read_len = read_len.clone();
+                let read_file = file.clone();
+                move |result| {
+                    let _keep_alive = &read_file;
+                    if let Ok((_, length)) = result {
+                        read_len.store(length as usize, Ordering::SeqCst);
+                    }
+                    None
+                }
+            }),
+        )?;
+        wait_file_completion(coro, &completion).await?;
+        let length = read_len.load(Ordering::SeqCst);
+        let bytes = buffer
+            .as_slice()
+            .get(..length)
+            .ok_or_else(|| Error::IoError("invalid bootstrap file read length".into()))?;
+        if bytes.iter().any(|byte| *byte != 0) {
+            return Ok(false);
+        }
+        if length == 0 {
+            return Ok(true);
+        }
+        offset += length as u64;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3515,6 +3612,12 @@ mod tests {
                 "replica.sqlite-info",
                 "replica.sqlite-changes",
                 "replica.db-log",
+                "replica.sqlite-replace-base-apply",
+                "replica.sqlite-replace-base-apply-main-db.backup",
+                "replica.sqlite-replace-base-apply-main-wal.backup",
+                "replica.sqlite-replace-base-apply-main-log.backup",
+                "replica.sqlite-replace-base-apply-revert-wal.backup",
+                "replica.sqlite-replace-base-apply-metadata.backup",
             ]
         );
     }
@@ -4287,6 +4390,163 @@ mod tests {
             coro.yield_(SyncEngineIoResult::IO).await?;
         }
         Ok(changes_file)
+    }
+
+    // OPFS pre-registers paths, completes IO asynchronously, and cannot unlink
+    // files through core IO. Its metadata lives in a separate host store.
+    struct RegisteredFilesIo(turso_core::MemoryYieldIO);
+
+    impl turso_core::Clock for RegisteredFilesIo {
+        fn current_time_monotonic(&self) -> turso_core::MonotonicInstant {
+            turso_core::MonotonicInstant::now()
+        }
+        fn current_time_wall_clock(&self) -> turso_core::WallClockInstant {
+            turso_core::WallClockInstant::now()
+        }
+    }
+
+    impl turso_core::IO for RegisteredFilesIo {
+        fn open_file(
+            &self,
+            path: &str,
+            _: turso_core::OpenFlags,
+            _: bool,
+        ) -> turso_core::Result<Arc<dyn turso_core::File>> {
+            self.0.open_file(path, turso_core::OpenFlags::None, false)
+        }
+        fn remove_file(&self, _: &str) -> turso_core::Result<()> {
+            Ok(())
+        }
+        fn step(&self) -> turso_core::Result<()> {
+            self.0.step()
+        }
+        fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
+            self.0.file_id(path)
+        }
+    }
+
+    struct SeparateMetadataIo {
+        path: String,
+        content: Mutex<Vec<u8>>,
+    }
+
+    impl SyncEngineIo for SeparateMetadataIo {
+        type DataCompletionBytes = EmptyCompletion<u8>;
+        type DataCompletionTransform = EmptyCompletion<crate::types::DatabaseRowTransformResult>;
+        fn full_read(&self, path: &str) -> Result<Self::DataCompletionBytes> {
+            assert_eq!(
+                path, self.path,
+                "database files must be read through core IO"
+            );
+            Ok(EmptyCompletion::with_data(
+                self.content.lock().unwrap().clone(),
+            ))
+        }
+        fn full_write(&self, path: &str, content: Vec<u8>) -> Result<Self::DataCompletionBytes> {
+            assert_eq!(
+                path, self.path,
+                "database files must be written through core IO"
+            );
+            *self.content.lock().unwrap() = content;
+            Ok(EmptyCompletion::empty())
+        }
+        fn transform(
+            &self,
+            _: Vec<crate::types::DatabaseRowMutation>,
+        ) -> Result<Self::DataCompletionTransform> {
+            unreachable!()
+        }
+        fn http(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<Vec<u8>>,
+            _: &[(&str, &str)],
+        ) -> Result<Self::DataCompletionBytes> {
+            unreachable!()
+        }
+        fn add_io_callback(&self, _: Box<dyn FnMut() -> bool + Send>) {}
+        fn step_io_callbacks(&self) {}
+    }
+
+    #[test]
+    fn replace_base_guard_recovers_with_separate_host_storage_and_registered_files() {
+        use turso_core::{Buffer, Completion, OpenFlags, IO};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replica.db").to_string_lossy().to_string();
+        let registered = RegisteredFilesIo(turso_core::MemoryYieldIO::new());
+        for file_path in sync_database_file_paths(&path) {
+            registered
+                .0
+                .open_file(&file_path, OpenFlags::Create, false)
+                .unwrap();
+        }
+        let io: Arc<dyn IO> = Arc::new(registered);
+        let original: Vec<u8> = (0..(64 * 1024 + 13)).map(|i| (i % 256) as u8).collect();
+        let file = io.open_file(&path, OpenFlags::None, false).unwrap();
+        let write = file
+            .pwrite(
+                0,
+                Arc::new(Buffer::new(original.clone())),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap();
+        io.wait_for_completion(write).unwrap();
+        let host = Arc::new(SeparateMetadataIo {
+            path: create_meta_path(&path),
+            content: Mutex::new(b"original metadata".to_vec()),
+        });
+        let stats = SyncEngineIoStats::new(host.clone());
+        let mut gen = genawaiter::sync::Gen::new(|co| async {
+            let coro: Coro<()> = co.into();
+            let _guard =
+                ReplaceBaseApplyGuard::create(&coro, io.clone(), stats.clone(), &path, None)
+                    .await?;
+            super::full_write(
+                &coro,
+                io.clone(),
+                host.clone(),
+                &path,
+                true,
+                b"replacement".to_vec(),
+            )
+            .await?;
+            *host.content.lock().unwrap() = b"replacement metadata".to_vec();
+            assert!(
+                ReplaceBaseApplyGuard::recover_pending(&coro, io.clone(), stats.clone(), &path)
+                    .await?
+            );
+            assert_eq!(
+                super::full_read(&coro, Some(io.clone()), host.clone(), &path, true).await?,
+                Some(original)
+            );
+            assert_eq!(*host.content.lock().unwrap(), b"original metadata");
+            assert!(
+                !ReplaceBaseApplyGuard::recover_pending(&coro, io.clone(), stats.clone(), &path)
+                    .await?
+            );
+            let mut guard =
+                ReplaceBaseApplyGuard::create(&coro, io.clone(), stats, &path, None).await?;
+            guard.mark_complete(&coro).await?;
+            for name in std::iter::once(create_replace_base_marker_path(&path)).chain(
+                super::replace_base_file_specs(&path)
+                    .map(|(_, name)| replace_base_backup_path(&path, name)),
+            ) {
+                assert_eq!(
+                    io.open_file(&name, OpenFlags::None, false)?.size()?,
+                    0,
+                    "cleared artifact: {name}"
+                );
+            }
+            Ok::<_, Error>(())
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(_) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        }
     }
 
     #[test]
