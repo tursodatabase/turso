@@ -294,6 +294,8 @@ pub struct ProgramBuilder {
     /// before* the label's logical "next-insn" anchor. The label resolves to
     /// `anchor_offset + 1` so it tracks whichever instruction ends up at that
     /// position, even after `emit_constant_insns` reorders the program.
+    /// Only `set_label_anchor` writes an anchor, so that `max_label_anchor`
+    /// stays correct.
     label_to_resolved_offset: Vec<Option<InsnReference>>,
     /// The largest anchor in `label_to_resolved_offset`. While instructions
     /// are emitted, a label is only anchored to the last instruction or to the
@@ -1798,17 +1800,15 @@ impl ProgramBuilder {
             old_to_new[*old_idx] = new_pos;
         }
 
-        for resolved_offset in self.label_to_resolved_offset.iter_mut() {
-            if let Some(old_offset) = resolved_offset {
-                *resolved_offset = Some(old_to_new[*old_offset as usize] as u32);
+        // A remapped anchor can be smaller than before, so the largest anchor
+        // is found again.
+        self.max_label_anchor = None;
+        for label_index in 0..self.label_to_resolved_offset.len() {
+            if let Some(old_offset) = self.label_to_resolved_offset[label_index] {
+                let new_offset = old_to_new[old_offset as usize] as InsnReference;
+                self.set_label_anchor(label_index, new_offset);
             }
         }
-        self.max_label_anchor = self
-            .label_to_resolved_offset
-            .iter()
-            .flatten()
-            .copied()
-            .max();
 
         self.explain.remap_insn_indices(&old_to_new);
 
@@ -1860,8 +1860,7 @@ impl ProgramBuilder {
             unreachable!("preassign_label_to_next_insn requires a Label, got {label:?}");
         };
         let anchor = self.offset().as_offset_int().saturating_sub(1);
-        self.label_to_resolved_offset[label_number as usize] = Some(anchor);
-        self.max_label_anchor = self.max_label_anchor.max(Some(anchor));
+        self.set_label_anchor(label_number as usize, anchor);
     }
 
     /// Resolve `dest` so that it ends up pointing at the same final offset as
@@ -1885,8 +1884,15 @@ impl ProgramBuilder {
         };
         let resolution = self.label_to_resolved_offset[anchor_n as usize]
             .expect("anchor label must already be preassigned/resolved");
-        self.label_to_resolved_offset[dest_n as usize] = Some(resolution);
-        self.max_label_anchor = self.max_label_anchor.max(Some(resolution));
+        self.set_label_anchor(dest_n as usize, resolution);
+    }
+
+    /// Anchor the label with index `label_index` at the instruction offset
+    /// `anchor`, and keep `max_label_anchor` the largest anchor.
+    #[inline]
+    fn set_label_anchor(&mut self, label_index: usize, anchor: InsnReference) {
+        self.label_to_resolved_offset[label_index] = Some(anchor);
+        self.max_label_anchor = self.max_label_anchor.max(Some(anchor));
     }
 
     /// Resolve unresolved labels to a specific offset in the instruction list.
