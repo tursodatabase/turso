@@ -1,12 +1,9 @@
 use core::fmt;
 use std::fmt::{Display, Formatter};
-use turso_parser::{
-    ast::{
-        self,
-        fmt::{BlankContext, ToSqlContext, ToTokens, TokenStream},
-        SortOrder, TableInternalId,
-    },
-    token::TokenType,
+use turso_parser::ast::{
+    self,
+    fmt::{BlankContext, SqlWriter, ToSqlContext, ToTokens},
+    SortOrder, TableInternalId,
 };
 
 use crate::{schema::Table, translate::plan::TableReferences};
@@ -526,11 +523,7 @@ impl ToSqlContext for PlanContext<'_> {
 }
 
 impl ToTokens for Plan {
-    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
-        &self,
-        s: &mut S,
-        context: &C,
-    ) -> Result<(), S::Error> {
+    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::Select(select) => {
                 select.to_tokens(s, &PlanContext(&[&select.table_references]))?;
@@ -557,8 +550,8 @@ impl ToTokens for Plan {
                 right_most.to_tokens(s, context)?;
 
                 if let Some(order_by) = order_by {
-                    s.append(TokenType::TK_ORDER, None)?;
-                    s.append(TokenType::TK_BY, None)?;
+                    s.keyword("ORDER")?;
+                    s.keyword("BY")?;
 
                     s.comma(
                         order_by
@@ -575,13 +568,13 @@ impl ToTokens for Plan {
                 }
 
                 if let Some(limit) = &limit {
-                    s.append(TokenType::TK_LIMIT, None)?;
-                    s.append(TokenType::TK_FLOAT, Some(&limit.to_string()))?;
+                    s.keyword("LIMIT")?;
+                    s.text(&limit.to_string())?;
                 }
 
                 if let Some(offset) = &offset {
-                    s.append(TokenType::TK_OFFSET, None)?;
-                    s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
+                    s.keyword("OFFSET")?;
+                    s.text(&offset.to_string())?;
                 }
             }
             Self::RecursiveCte(plan) => {
@@ -608,28 +601,24 @@ impl Display for JoinedTable {
 }
 
 impl ToTokens for JoinedTable {
-    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
-        &self,
-        s: &mut S,
-        _context: &C,
-    ) -> Result<(), S::Error> {
+    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _context: &C) -> fmt::Result {
         match &self.table {
             Table::BTree(..) | Table::Virtual(..) | Table::RecursiveCteInput(..) => {
                 let name = self.table.get_name();
-                s.append(TokenType::TK_ID, Some(name))?;
+                s.text(name)?;
                 if self.identifier != name {
-                    s.append(TokenType::TK_AS, None)?;
-                    s.append(TokenType::TK_ID, Some(&self.identifier))?;
+                    s.keyword("AS")?;
+                    s.text(&self.identifier)?;
                 }
             }
             Table::FromClauseSubquery(from_clause_subquery) => {
-                s.append(TokenType::TK_LP, None)?;
+                s.punct("(")?;
                 // Plan::to_tokens creates its own context internally, so we pass BlankContext here.
                 from_clause_subquery.plan.to_tokens(s, &BlankContext)?;
-                s.append(TokenType::TK_RP, None)?;
+                s.punct(")")?;
 
-                s.append(TokenType::TK_AS, None)?;
-                s.append(TokenType::TK_ID, Some(&self.identifier))?;
+                s.keyword("AS")?;
+                s.text(&self.identifier)?;
             }
         };
 
@@ -639,38 +628,34 @@ impl ToTokens for JoinedTable {
 
 // TODO: currently cannot print the original CTE as it is optimized into a subquery
 impl ToTokens for SelectPlan {
-    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
-        &self,
-        s: &mut S,
-        context: &C,
-    ) -> Result<(), S::Error> {
+    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         if !self.values.is_empty() {
             ast::OneSelect::Values(self.values.clone()).to_tokens(s, context)?;
         } else {
-            s.append(TokenType::TK_SELECT, None)?;
+            s.keyword("SELECT")?;
             if self.distinctness.is_distinct() {
-                s.append(TokenType::TK_DISTINCT, None)?;
+                s.keyword("DISTINCT")?;
             }
 
             for (i, ResultSetColumn { expr, alias, .. }) in self.result_columns.iter().enumerate() {
                 if i != 0 {
-                    s.append(TokenType::TK_COMMA, None)?;
+                    s.punct(",")?;
                 }
 
                 expr.to_tokens(s, context)?;
                 if let Some(alias) = alias {
-                    s.append(TokenType::TK_AS, None)?;
-                    s.append(TokenType::TK_ID, Some(alias))?;
+                    s.keyword("AS")?;
+                    s.text(alias)?;
                 }
             }
-            s.append(TokenType::TK_FROM, None)?;
+            s.keyword("FROM")?;
 
             for (i, order) in self.join_order.iter().enumerate() {
                 if i != 0 {
                     if order.is_outer {
-                        s.append(TokenType::TK_ORDER, None)?;
+                        s.keyword("ORDER")?;
                     }
-                    s.append(TokenType::TK_JOIN, None)?;
+                    s.keyword("JOIN")?;
                 }
 
                 let table_ref = self.joined_tables().get(order.original_idx).unwrap();
@@ -678,7 +663,7 @@ impl ToTokens for SelectPlan {
             }
 
             if !self.where_clause.is_empty() {
-                s.append(TokenType::TK_WHERE, None)?;
+                s.keyword("WHERE")?;
 
                 for (i, expr) in self
                     .where_clause
@@ -687,7 +672,7 @@ impl ToTokens for SelectPlan {
                     .enumerate()
                 {
                     if i != 0 {
-                        s.append(TokenType::TK_AND, None)?;
+                        s.keyword("AND")?;
                     }
                     expr.to_tokens(s, context)?;
                 }
@@ -695,19 +680,19 @@ impl ToTokens for SelectPlan {
 
             if let Some(group_by) = &self.group_by {
                 if !group_by.exprs.is_empty() {
-                    s.append(TokenType::TK_GROUP, None)?;
-                    s.append(TokenType::TK_BY, None)?;
+                    s.keyword("GROUP")?;
+                    s.keyword("BY")?;
 
                     s.comma(group_by.exprs.iter(), context)?;
                 }
 
                 // TODO: not sure where I need to place the group_by.sort_order
                 if let Some(having) = &group_by.having {
-                    s.append(TokenType::TK_HAVING, None)?;
+                    s.keyword("HAVING")?;
 
                     for (i, expr) in having.iter().enumerate() {
                         if i != 0 {
-                            s.append(TokenType::TK_AND, None)?;
+                            s.keyword("AND")?;
                         }
                         expr.to_tokens(s, context)?;
                     }
@@ -717,21 +702,21 @@ impl ToTokens for SelectPlan {
 
         if let Some(window) = &self.window {
             if let Some(window_name) = &window.name {
-                s.append(TokenType::TK_WINDOW, None)?;
-                s.append(TokenType::TK_ID, Some(window_name))?;
-                s.append(TokenType::TK_AS, None)?;
+                s.keyword("WINDOW")?;
+                s.text(window_name)?;
+                s.keyword("AS")?;
 
-                s.append(TokenType::TK_LP, None)?;
+                s.punct("(")?;
 
                 if !window.partition_by.is_empty() {
-                    s.append(TokenType::TK_PARTITION, None)?;
-                    s.append(TokenType::TK_BY, None)?;
+                    s.keyword("PARTITION")?;
+                    s.keyword("BY")?;
                     s.comma(window.partition_by.iter(), context)?;
                 }
 
                 if !window.order_by.is_empty() {
-                    s.append(TokenType::TK_ORDER, None)?;
-                    s.append(TokenType::TK_BY, None)?;
+                    s.keyword("ORDER")?;
+                    s.keyword("BY")?;
                     s.comma(
                         window
                             .order_by
@@ -745,13 +730,13 @@ impl ToTokens for SelectPlan {
                     )?;
                 }
 
-                s.append(TokenType::TK_RP, None)?;
+                s.punct(")")?;
             }
         }
 
         if !self.order_by.is_empty() {
-            s.append(TokenType::TK_ORDER, None)?;
-            s.append(TokenType::TK_BY, None)?;
+            s.keyword("ORDER")?;
+            s.keyword("BY")?;
 
             s.comma(
                 self.order_by
@@ -766,13 +751,13 @@ impl ToTokens for SelectPlan {
         }
 
         if let Some(limit) = &self.limit {
-            s.append(TokenType::TK_LIMIT, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&limit.to_string()))?;
+            s.keyword("LIMIT")?;
+            s.text(&limit.to_string())?;
         }
 
         if let Some(offset) = &self.offset {
-            s.append(TokenType::TK_OFFSET, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
+            s.keyword("OFFSET")?;
+            s.text(&offset.to_string())?;
         }
 
         Ok(())
@@ -780,11 +765,7 @@ impl ToTokens for SelectPlan {
 }
 
 impl ToTokens for DeletePlan {
-    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
-        &self,
-        s: &mut S,
-        _: &C,
-    ) -> Result<(), S::Error> {
+    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         let table = self
             .table_references
             .joined_tables()
@@ -793,12 +774,12 @@ impl ToTokens for DeletePlan {
         let context = &[&self.table_references];
         let context = &PlanContext(context);
 
-        s.append(TokenType::TK_DELETE, None)?;
-        s.append(TokenType::TK_FROM, None)?;
-        s.append(TokenType::TK_ID, Some(table.table.get_name()))?;
+        s.keyword("DELETE")?;
+        s.keyword("FROM")?;
+        s.text(table.table.get_name())?;
 
         if !self.where_clause.is_empty() {
-            s.append(TokenType::TK_WHERE, None)?;
+            s.keyword("WHERE")?;
 
             for (i, expr) in self
                 .where_clause
@@ -807,7 +788,7 @@ impl ToTokens for DeletePlan {
                 .enumerate()
             {
                 if i != 0 {
-                    s.append(TokenType::TK_AND, None)?;
+                    s.keyword("AND")?;
                 }
                 expr.to_tokens(s, context)?;
             }
@@ -818,19 +799,15 @@ impl ToTokens for DeletePlan {
 }
 
 impl ToTokens for UpdatePlan {
-    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
-        &self,
-        s: &mut S,
-        _: &C,
-    ) -> Result<(), S::Error> {
+    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         let table = &self.target_table;
         let read_scope_tables = self.build_read_scope_tables();
         let context = [&read_scope_tables];
         let context = &PlanContext(&context);
 
-        s.append(TokenType::TK_UPDATE, None)?;
-        s.append(TokenType::TK_ID, Some(table.table.get_name()))?;
-        s.append(TokenType::TK_SET, None)?;
+        s.keyword("UPDATE")?;
+        s.text(table.table.get_name())?;
+        s.keyword("SET")?;
 
         s.comma(
             self.set_clauses.iter().map(|set_clause| {
@@ -852,7 +829,7 @@ impl ToTokens for UpdatePlan {
         )?;
 
         if !self.where_clause.is_empty() {
-            s.append(TokenType::TK_WHERE, None)?;
+            s.keyword("WHERE")?;
 
             let mut iter = self
                 .where_clause
@@ -862,7 +839,7 @@ impl ToTokens for UpdatePlan {
                 .expect("should not be empty")
                 .to_tokens(s, context)?;
             for expr in iter {
-                s.append(TokenType::TK_AND, None)?;
+                s.keyword("AND")?;
                 expr.to_tokens(s, context)?;
             }
         }
