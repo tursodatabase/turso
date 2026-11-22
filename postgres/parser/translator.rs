@@ -13,11 +13,12 @@ use crate::sqlstate::{
     SQLSTATE_DUPLICATE_OBJECT, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_GROUPING_ERROR,
     SQLSTATE_INVALID_COLUMN_REFERENCE, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
     SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_OBJECT_DEFINITION,
-    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
-    SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
-    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
-    SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
-    SQLSTATE_WINDOWING_ERROR, SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_RECURSION,
+    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
+    SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_COLUMN,
+    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNDEFINED_PARAMETER,
+    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION, SQLSTATE_WINDOWING_ERROR,
+    SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -5122,6 +5123,15 @@ impl PostgreSQLTranslator {
 
             let tbl_name = exact_name(&cte.ctename);
 
+            // PostgreSQL checks the form of a recursive query before it
+            // analyzes the query and its SEARCH and CYCLE clauses, also when
+            // no query reads the CTE.
+            if with_clause.recursive {
+                if let Some(error) = recursive_cte_error(cte) {
+                    return Err(error);
+                }
+            }
+
             // PostgreSQL evaluates SEARCH/CYCLE by adding computed columns to
             // the recursion; silently dropping them would change results (and
             // a CYCLE clause is often what makes the query terminate at all).
@@ -6895,6 +6905,97 @@ fn collect_lateral_items<'a>(
         }
         _ => {}
     }
+}
+
+/// The error of PostgreSQL's `checkWellFormedRecursion` for CTE `cte` of a
+/// WITH RECURSIVE, without the checks of the arms of the UNION. None when the
+/// query of the CTE is not a SELECT, does not refer to the CTE or has the form
+/// that PostgreSQL accepts. For a query that refers to the CTE, the engine
+/// would run ORDER BY as the order of the recursion queue and LIMIT and OFFSET
+/// as stops of the recursion, as SQLite does.
+fn recursive_cte_error(cte: &pg_query::protobuf::CommonTableExpr) -> Option<ParseError> {
+    let query = cte.ctequery.as_ref()?.node.as_ref()?;
+    let pg_query::NodeEnum::SelectStmt(select) = query else {
+        return None;
+    };
+    if !refers_to_cte(query, &cte.ctename) {
+        return None;
+    }
+    if select.op() != pg_query::protobuf::SetOperation::SetopUnion {
+        return Some(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_INVALID_RECURSION,
+            message: format!(
+                "recursive query \"{}\" does not have the form non-recursive-term UNION [ALL] recursive-term",
+                cte.ctename
+            ),
+        });
+    }
+    // LIMIT ALL, LIMIT NULL and OFFSET NULL count too: the parse tree has
+    // them as a NULL constant.
+    let clause = if !select.sort_clause.is_empty() {
+        "ORDER BY"
+    } else if select.limit_offset.is_some() {
+        "OFFSET"
+    } else if select.limit_count.is_some() {
+        "LIMIT"
+    } else if !select.locking_clause.is_empty() {
+        "FOR UPDATE/SHARE"
+    } else {
+        return None;
+    };
+    Some(ParseError::Sqlstate {
+        sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+        message: format!("{clause} in a recursive query is not implemented"),
+    })
+}
+
+/// Whether `query` names the CTE `cte_name` as an unqualified table, outside
+/// the part of `query` where a WITH inside it gives the name to a CTE of its
+/// own. A WITH RECURSIVE gives the name to all of its CTEs and its main query;
+/// a WITH gives it to the CTEs after that CTE and to its main query.
+fn refers_to_cte(query: &pg_query::NodeEnum, cte_name: &str) -> bool {
+    // A node is found again in a copy by its location in the query text.
+    let references = |node: &pg_query::NodeEnum| -> Vec<i32> {
+        node.nodes()
+            .into_iter()
+            .filter_map(|(node, ..)| match node {
+                NodeRef::RangeVar(table)
+                    if table.schemaname.is_empty() && table.relname == cte_name =>
+                {
+                    Some(table.location)
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let mut shadowed = std::collections::HashSet::new();
+    for (node, ..) in query.nodes() {
+        let NodeRef::SelectStmt(select) = node else {
+            continue;
+        };
+        let Some(with) = &select.with_clause else {
+            continue;
+        };
+        let Some(position) = with.ctes.iter().position(|cte| {
+            matches!(&cte.node, Some(pg_query::NodeEnum::CommonTableExpr(cte)) if cte.ctename == cte_name)
+        }) else {
+            continue;
+        };
+        let outer_ctes = if with.recursive { 0 } else { position + 1 };
+        let outer: Vec<i32> = with.ctes[..outer_ctes]
+            .iter()
+            .filter_map(|cte| cte.node.as_ref())
+            .flat_map(&references)
+            .collect();
+        shadowed.extend(
+            references(&pg_query::NodeEnum::SelectStmt(Box::new(select.clone())))
+                .into_iter()
+                .filter(|location| !outer.contains(location)),
+        );
+    }
+    references(query)
+        .iter()
+        .any(|location| !shadowed.contains(location))
 }
 
 /// The names that a FROM item, a join or a CTE gives to its rows. For a
