@@ -424,7 +424,7 @@ expect {
     2026-01-01 08:00:00+00
     2026-01-01 10:00:00+00
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type timestamptz with type timestamp
 }
@@ -439,7 +439,7 @@ expect {
     2026-01-01 08:00:00+00
     2026-01-01 09:00:00+00
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type timestamptz with type timestamp
 }

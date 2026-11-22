@@ -197,13 +197,15 @@ the values it stores (a STRUCT or UNION, a type with ENCODE or a DECODE other
 than `value`), unless the two already have one order in common, as `numeric`
 and `bigint` do. A domain compares as the type it is declared on, so two
 domains over one type compare as that type. So a `timestamp` with a
-`timestamptz`, and a `timestamptz` with a `varchar(n)`, fail, as in PostgreSQL.
-The error is `cannot compare type x with type y` with SQLSTATE 42883, as
-PostgreSQL gives when no comparison operator exists. It covers `=`, `<`,
+`timestamptz`, and a `timestamptz` with a `varchar(n)`, fail. PostgreSQL refuses
+the second pair too, with 42883.
+The error is `cannot compare type x with type y` with SQLSTATE 0A000. Turso
+refuses comparisons that PostgreSQL may run and does not know which ones, so
+the code differs from PostgreSQL's 42883 where PostgreSQL also refuses. It covers `=`, `<`,
 `IS DISTINCT FROM`, BETWEEN, IN and `IN (SELECT ...)`, `CASE x WHEN`, `NULLIF`,
 `min` and `max`, and joins, with or without an index. The same two types in
 one result column fail the same way: in UNION, UNION ALL, INTERSECT, EXCEPT, a
-multi-row VALUES, a recursive CTE, the results of CASE, and `coalesce`, `ifnull`
+multi-row VALUES that is not the row source of an INSERT, a recursive CTE, the results of CASE, and `coalesce`, `ifnull`
 and `iif`. A string literal compared with a custom type is read as that type.
 Two arrays compare when their element types compare, so `date[]` with
 `timestamp[]` fails. Two types that only check a value, such as `varchar(n)` and
