@@ -15,7 +15,8 @@ use crate::{
         emitter::Resolver,
         expr::{
             expr_type::{
-                iif_values, query_column_type, same_type_def, type_of, type_ordering, ExprType,
+                first_and_third_arguments, iif_values, query_column_type, same_type_def, type_of,
+                type_ordering, ExprType,
             },
             row_value_component_expr, row_value_len,
         },
@@ -835,6 +836,12 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
                 }
                 Some(ResultType::OneOfTheIifValues) => {
                     check_comparable_results(iif_values(args).map(|arg| arg.as_ref()), context)?;
+                }
+                Some(ResultType::OneOfTheFirstAndThirdArguments) => {
+                    check_comparable_results(
+                        first_and_third_arguments(args).map(|arg| arg.as_ref()),
+                        context,
+                    )?;
                 }
                 _ => {}
             }

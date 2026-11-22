@@ -1074,16 +1074,6 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
                 .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),
             1,
         ),
-        // A value of another row: its own argument's type, or for lag and
-        // lead the common type of the argument and the default (the third
-        // argument).
-        Func::Window(WindowFunc::Lag | WindowFunc::Lead) => common_type(
-            args.iter()
-                .enumerate()
-                .filter(|(i, _)| *i != 1)
-                .map(|(_, arg)| arg.as_ref()),
-            env,
-        ),
         Func::Window(WindowFunc::FirstValue | WindowFunc::LastValue | WindowFunc::NthValue) => args
             .first()
             .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),
@@ -1102,6 +1092,9 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
         ResultType::FirstArgument => first_argument().unwrap_or(any),
         ResultType::OneOfTheArguments => common_type(args.iter().map(|arg| arg.as_ref()), env),
         ResultType::OneOfTheIifValues => common_type(iif_values(args).map(|arg| arg.as_ref()), env),
+        ResultType::OneOfTheFirstAndThirdArguments => {
+            common_type(first_and_third_arguments(args).map(|arg| arg.as_ref()), env)
+        }
         ResultType::NumberOfTheFirstArgumentsType => match first_argument() {
             Some(ty) => negated_type(ty),
             None => any,
@@ -1161,6 +1154,17 @@ pub(crate) fn iif_values(args: &[Box<ast::Expr>]) -> impl Iterator<Item = &Box<a
     args.iter()
         .enumerate()
         .filter(move |(i, _)| i % 2 == 1 || (has_else && *i == args.len() - 1))
+        .map(|(_, arg)| arg)
+}
+
+/// The arguments of `lag(x, n, default)` that the result is one of: x and the
+/// default.
+pub(crate) fn first_and_third_arguments(
+    args: &[Box<ast::Expr>],
+) -> impl Iterator<Item = &Box<ast::Expr>> + Clone {
+    args.iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 1)
         .map(|(_, arg)| arg)
 }
 
