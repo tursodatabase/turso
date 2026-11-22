@@ -438,6 +438,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             crate::casts::exec_float4_round(args[0].get_value())?
         },
         "pg_cast"(FunctionArity::Exact(3), true) => crate::casts::exec_pg_cast(args)?,
+        "pg_array_in"(FunctionArity::Exact(2), true) => crate::array_input::exec_pg_array_in(args)?,
         "pg_cast_varchar"(FunctionArity::Exact(3), true) => crate::casts::exec_pg_cast_varchar(args)?,
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,

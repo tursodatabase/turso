@@ -373,14 +373,11 @@ expect {
 }
 
 # A-52: invalid int[] literal
-@compat-gap "type:_int4"
 test invalid-int-literal {
     SELECT '{1,x}'::int[];
 }
 @sqlstate 22P02
 expect error {}
-@sqlstate 23000
-expect @tursopg error {}
 
 # A-58: ARRAY[] constructor output
 test array-constructor-output {

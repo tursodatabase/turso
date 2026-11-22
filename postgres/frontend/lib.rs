@@ -1,4 +1,5 @@
 mod acl;
+mod array_input;
 mod auth_functions;
 mod auth_members;
 mod casts;

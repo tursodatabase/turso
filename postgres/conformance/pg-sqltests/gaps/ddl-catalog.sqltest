@@ -1100,7 +1100,7 @@ test indkey-cast-to-int2-array {
 expect {
     [0:1]={1,2}
 }
-@sqlstate 23000
+@sqlstate 22P02
 expect @tursopg error {}
 
 # E-104: unquoted name does not find a quoted mixed-case schema

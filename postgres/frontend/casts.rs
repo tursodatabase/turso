@@ -215,7 +215,7 @@ pub(crate) fn plan_cast(
     context: CastContext,
 ) -> Result<Option<CastPlan>> {
     if target.array_dimensions > 0 {
-        return Ok(None);
+        return plan_array_cast(source, target, context);
     }
     let target_name = target.name.to_ascii_lowercase();
     let varchar_length = varchar_length(target);
@@ -257,6 +257,45 @@ pub(crate) fn plan_cast(
         convert: Some(CastConversion {
             function: "pg_cast".to_string(),
             extra_args: vec![name(source.name()), name(target.name())],
+        }),
+    }))
+}
+
+/// A cast of a text to an array reads the text as an array literal of the
+/// element type. Any other source is left to the engine.
+fn plan_array_cast(
+    source: &dyn Fn() -> OperandType,
+    target: &ast::Type,
+    context: CastContext,
+) -> Result<Option<CastPlan>> {
+    let element_name = target.name.to_ascii_lowercase();
+    let element = match (element_name.as_str(), context) {
+        ("real", _) => Some(Float8),
+        (_, CastContext::Assignment) => CastType::from_column_type(&element_name),
+        _ => CastType::from_name(&element_name),
+    };
+    let Some(element) = element.filter(|element| crate::array_input::reads_elements_of(*element))
+    else {
+        return Ok(None);
+    };
+    let source = source();
+    let context = match source {
+        OperandType::Untyped => CastContext::Explicit,
+        _ => context,
+    };
+    if !matches!(source, OperandType::Untyped | OperandType::Text) {
+        return Ok(None);
+    }
+    if element != Text {
+        resolve(Text, element, context)?;
+    }
+    Ok(Some(CastPlan {
+        convert: Some(CastConversion {
+            function: "pg_array_in".to_string(),
+            extra_args: vec![ast::Expr::Literal(ast::Literal::String(format!(
+                "'{}'",
+                element.name()
+            )))],
         }),
     }))
 }

@@ -7714,23 +7714,22 @@ fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
 /// casts the dialect plans.
 fn cast_target_type(type_name: &pg_query::protobuf::TypeName) -> Result<ast::Type, ParseError> {
     let mut target = pg_type_name_to_ast_type(type_name)?;
-    if target.array_dimensions == 0 {
-        let name = match supported_type_name(type_name)?.to_uppercase().as_str() {
-            "INTEGER" | "INT" | "INT4" => Some("int4"),
-            "SMALLINT" | "INT2" => Some("int2"),
-            "BIGINT" | "INT8" => Some("int8"),
-            "REAL" | "FLOAT4" => Some("float4"),
-            "DOUBLE PRECISION" | "FLOAT8" => Some("float8"),
-            "BOOLEAN" | "BOOL" => Some("bool"),
-            "TEXT" => Some("text"),
-            "UUID" => Some("uuid"),
-            "BYTEA" => Some("bytea"),
-            "NUMERIC" | "DECIMAL" if type_name.typmods.is_empty() => Some("numeric"),
-            _ => None,
-        };
-        if let Some(name) = name {
-            target.name = name.to_string();
-        }
+    let is_array = target.array_dimensions > 0;
+    let name = match supported_type_name(type_name)?.to_uppercase().as_str() {
+        "INTEGER" | "INT" | "INT4" => Some("int4"),
+        "SMALLINT" | "INT2" => Some("int2"),
+        "BIGINT" | "INT8" => Some("int8"),
+        "REAL" | "FLOAT4" => Some("float4"),
+        "BOOLEAN" | "BOOL" => Some("bool"),
+        "TEXT" => Some("text"),
+        "UUID" => Some("uuid"),
+        "DOUBLE PRECISION" | "FLOAT8" if !is_array => Some("float8"),
+        "BYTEA" if !is_array => Some("bytea"),
+        "NUMERIC" | "DECIMAL" if !is_array && type_name.typmods.is_empty() => Some("numeric"),
+        _ => None,
+    };
+    if let Some(name) = name {
+        target.name = name.to_string();
     }
     Ok(target)
 }
