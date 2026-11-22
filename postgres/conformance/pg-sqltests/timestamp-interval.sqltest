@@ -133,7 +133,7 @@ test timestamp-column-compared-with-timestamptz-minus-interval {
 expect {
     1
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type timestamp with type timestamptz
 }
@@ -499,7 +499,7 @@ test coalesce-timestamp-timestamptz-plus-interval {
 expect {
     2026-01-02 00:00:00+00
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type timestamp with type timestamptz
 }
