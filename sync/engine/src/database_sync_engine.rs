@@ -7,6 +7,7 @@ use std::{
 };
 use turso_sqlite::SqliteDialect;
 
+use turso_core::storage::sqlite3_ondisk::DatabaseHeader;
 use turso_core::{
     Buffer, Completion, ConnectOpts, DatabaseStorage, LimboError, OpenDbAsyncState, OpenFlags,
 };
@@ -21,9 +22,9 @@ use crate::{
         is_logically_replayable_table, list_user_tables, max_local_change_id,
         pull_updates_to_staging, push_logical_changes, read_last_change_id,
         read_logical_replay_table_map, read_wal_salt, reset_wal_file, should_replay_local_change,
-        sync_file, update_last_change_id, wait_all_results, wait_file_completion, wal_apply_from_file,
-        wal_apply_from_staging, wal_pull_to_staging, PullUpdatesV1Result, SyncEngineIoStats,
-        SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        sync_file, update_last_change_id, wait_all_results, wait_file_completion,
+        wal_apply_from_file, wal_apply_from_staging, wal_pull_to_staging, PullUpdatesV1Result,
+        SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
     database_tape::{
         replay_without_triggers, run_stmt_ignore_rows, try_wal_watermark_read_page,
@@ -1068,10 +1069,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 }
             }
             for path in sync_database_file_paths(main_db_path) {
-                // Validate the main file through core after checking sidecars.
-                if path == main_db_path {
-                    continue;
-                }
                 if let Some(file) = io.try_open(&path)? {
                     if file.size()? != 0 {
                         return Err(Error::DatabaseSyncEngineError(format!(
@@ -1088,35 +1085,26 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 .transpose()?
                 .is_some_and(|size| size != 0);
             if nonempty {
-                // Validate before bootstrap can replace the existing file. Read-only
-                // mode leaves damaged files and missing recovery sidecars untouched.
-                let options = turso_core::OpenOptions::new(Arc::new(SqliteDialect))
-                    .storage(Arc::new(turso_core::storage::database::DatabaseFile::new(
-                        io.open_file(main_db_path, OpenFlags::ReadOnly, false)?,
-                    )))
-                    .flags(OpenFlags::ReadOnly)
-                    .db_opts(opts.db_opts)
-                    .encryption(opts.local_options());
-                let mut state = OpenDbAsyncState::new();
-                loop {
-                    match turso_core::Database::open_async(
-                        &mut state,
-                        io.clone(),
-                        main_db_path,
-                        &options,
-                    )? {
-                        turso_core::IOResult::Done(_) => break,
-                        turso_core::IOResult::IO(completion) => {
-                            while !completion.finished() {
-                                coro.yield_(SyncEngineIoResult::IO).await?;
+                // Omitting the local key must not let bootstrap overwrite encrypted data.
+                let plaintext_magic = DatabaseHeader::default().magic;
+                let header = Arc::new(Buffer::new_temporary(plaintext_magic.len()));
+                let file = io.open_file(main_db_path, OpenFlags::ReadOnly, false)?;
+                let read_file = file.clone();
+                let completion = file.pread(
+                    0,
+                    Completion::new_read(header.clone(), move |result| {
+                        let _keep_alive = &read_file;
+                        if let Ok((buffer, length)) = result {
+                            if length as usize != buffer.len() {
+                                buffer.as_mut_slice().fill(0);
                             }
                         }
-                    }
-                }
-                if local_crypto.is_some() {
-                    return Err(Error::DatabaseSyncEngineError(
-                        "cannot bootstrap over an existing encrypted database without valid metadata".into(),
-                    ));
+                        None
+                    }),
+                )?;
+                wait_file_completion(coro, &completion).await?;
+                if header.as_slice() != plaintext_magic {
+                    return Err(LimboError::NotADB.into());
                 }
             }
         }

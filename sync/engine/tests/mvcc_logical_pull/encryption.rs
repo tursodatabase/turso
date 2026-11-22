@@ -26,6 +26,12 @@ fn encrypted_replica_without_metadata_preserves_all_files() {
                 .unwrap();
             replica.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
             drop(replica);
+            for suffix in ["-wal", "-log"] {
+                let sidecar = directory.path().join(format!("replica.db{suffix}"));
+                if sidecar.exists() {
+                    std::fs::remove_file(sidecar).unwrap();
+                }
+            }
             let metadata = directory.path().join("replica.db-info");
             if empty_metadata {
                 std::fs::write(metadata, []).unwrap();
@@ -42,10 +48,13 @@ fn encrypted_replica_without_metadata_preserves_all_files() {
                     .collect::<std::collections::BTreeMap<_, _>>()
             };
             let before = files();
-            assert!(
-                Replica::open_encrypted(&directory, InProcessServer::new(remote), open_key)
-                    .is_err()
-            );
+            let server = InProcessServer::new(remote);
+            let reopened = if open_key.is_some() {
+                Replica::open_encrypted(&directory, server, open_key)
+            } else {
+                Replica::open(&directory, server, super::harness::database_opts())
+            };
+            assert!(reopened.is_err());
             assert_eq!(files(), before);
         }
     }
@@ -296,7 +305,7 @@ fn encrypted_bootstrap_failures_around_sync_and_metadata_publication() {
 }
 
 #[test]
-fn interrupted_bootstrap_requires_explicit_cleanup_before_retry() {
+fn interrupted_bootstrap_requires_cleanup_only_for_encrypted_replicas() {
     let remote = Remote::new_encrypted(&[
         "CREATE TABLE items(value TEXT)",
         "INSERT INTO items VALUES ('retry after failure')",
@@ -336,9 +345,20 @@ fn interrupted_bootstrap_requires_explicit_cleanup_before_retry() {
                 }
                 let main = directory.path().join("replica.db");
                 let before = std::fs::read(&main).unwrap();
-                assert!(Replica::open_encrypted(&directory, server(), local_key).is_err());
-                assert_eq!(std::fs::read(&main).unwrap(), before);
-                std::fs::remove_file(main).unwrap();
+                let reopened = Replica::open_encrypted(&directory, server(), local_key);
+                if local_key.is_some() {
+                    assert!(reopened.is_err());
+                    assert_eq!(std::fs::read(&main).unwrap(), before);
+                    std::fs::remove_file(main).unwrap();
+                } else {
+                    assert_eq!(
+                        reopened
+                            .expect("plaintext bootstrap retry")
+                            .snapshot()
+                            .unwrap(),
+                        remote.snapshot().unwrap()
+                    );
+                }
                 let retry = Replica::open_encrypted(&directory, server(), local_key)
                     .unwrap_or_else(|error| panic!(
                         "retry failed: local_key={}, host_storage={host_storage}, empty_metadata={empty_metadata}: {error}",
@@ -619,7 +639,7 @@ fn encrypted_creation_refuses_conflicting_sidecars_and_incompatible_pages() {
         let original = b"existing replica data must not be overwritten";
         let main = directory.path().join("replica.db");
         let sidecar = directory.path().join(format!("replica.db{suffix}"));
-        std::fs::write(&main, original).unwrap();
+        std::fs::write(&main, []).unwrap();
         std::fs::write(&sidecar, original).unwrap();
         let error = Replica::open_encrypted(
             &directory,
@@ -636,7 +656,7 @@ fn encrypted_creation_refuses_conflicting_sidecars_and_incompatible_pages() {
             error.to_string().contains(sidecar.to_str().unwrap()),
             "{error}"
         );
-        assert_eq!(std::fs::read(main).unwrap(), original);
+        assert!(std::fs::read(main).unwrap().is_empty());
         assert_eq!(std::fs::read(sidecar).unwrap(), original);
         assert!(!directory.path().join("replica.db-info").exists());
     }
