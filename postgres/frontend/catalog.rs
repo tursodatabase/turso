@@ -169,6 +169,10 @@ impl Dialect for PostgresDialect {
         decode_stored_pg_schema_sql(sql).is_some()
     }
 
+    fn numeric_scale_may_leave_precision(&self) -> bool {
+        true
+    }
+
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
             return turso_core::dialect::table_sql_for_replay(self, sql);

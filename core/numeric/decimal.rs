@@ -396,7 +396,8 @@ pub fn format_numeric(bd: &BigDecimal) -> String {
 
 /// Validate that a BigDecimal fits within the given precision and scale.
 /// Precision = total number of significant digits.
-/// Scale = number of digits after the decimal point.
+/// Scale = number of digits after the decimal point, which may be negative or
+/// larger than the precision.
 pub fn validate_precision_scale(
     val: &BigDecimal,
     precision: i64,
@@ -407,16 +408,6 @@ pub fn validate_precision_scale(
     if precision <= 0 {
         return Err(LimboError::Constraint(format!(
             "numeric precision must be positive, got {precision}"
-        )));
-    }
-    if scale < 0 {
-        return Err(LimboError::Constraint(format!(
-            "numeric scale must be non-negative, got {scale}"
-        )));
-    }
-    if scale > precision {
-        return Err(LimboError::Constraint(format!(
-            "numeric scale ({scale}) must not exceed precision ({precision})"
         )));
     }
 

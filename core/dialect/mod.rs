@@ -594,6 +594,13 @@ pub trait Dialect: Send + Sync + 'static {
         true
     }
 
+    /// Whether a numeric column may have a scale below zero or above its
+    /// precision, as `numeric(3,-2)` and `numeric(2,4)` in PostgreSQL 15 and
+    /// later. SQLite's custom numeric type refuses both.
+    fn numeric_scale_may_leave_precision(&self) -> bool {
+        false
+    }
+
     /// Whether `sum()` and `avg()` add floats one by one.
     ///
     /// SQLite keeps an error term for each addition (Kahan-Babuska-Neumaier),
