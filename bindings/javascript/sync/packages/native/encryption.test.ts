@@ -80,7 +80,7 @@ test('encrypted remoteWritesExperimental uses the real RemoteWriter and never se
             const pipeline = requests.find(request => request.path.endsWith('/v3/pipeline'))!;
             expect(pipeline).toBeDefined();
             expect(pipeline.headers.get('x-turso-encryption-key')).toBe(server.cloudKey);
-            expect(pipeline.headers.get('x-turso-encryption-cipher')).toBeNull();
+            expect(pipeline.headers.get('x-turso-encryption-cipher')).toBe(server.cipher);
             for (const request of requests) expect(JSON.stringify([...request.headers])).not.toContain(server.localKey);
         } finally { await db.close(); }
     } finally { intercepted.mockRestore(); await server.close(); rmSync(directory, { recursive: true, force: true }); }
