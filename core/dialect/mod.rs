@@ -715,6 +715,13 @@ pub trait Dialect: Send + Sync + 'static {
         OperatorResolution::Keep
     }
 
+    /// Fails when the string literal `text` is not a value of the type that
+    /// `CastUntyped` names. PostgreSQL reads the literal when it plans the
+    /// statement, so a bad one fails even where the statement never uses it.
+    fn check_literal_cast(&self, _text: &str, _type_name: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether the arithmetic operator `op` on operands of the given types is
     /// SQLite's operator on the values the operands read as, even though an
     /// operand is a custom type that has its own operator. PostgreSQL adds a
@@ -772,6 +779,13 @@ pub enum OperatorResolution {
     /// The dialect has no such operator: the statement fails with "operator
     /// does not exist".
     Reject,
+    /// The operator exists once the string literal operands are cast to this
+    /// type, as in `int_column = '5'`.
+    CastUntyped(String),
+    /// The operator exists once each operand that has a type name is cast to
+    /// it, as PostgreSQL compares a double precision with a numeric as two
+    /// doubles. The names are for the left and the right operand.
+    CastOperands(Option<String>, Option<String>),
 }
 
 /// The type of an operand, as far as a dialect needs to know it.

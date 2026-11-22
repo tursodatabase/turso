@@ -279,6 +279,10 @@ impl Dialect for PostgresDialect {
         crate::operators::resolve_operator(op, &operands())
     }
 
+    fn check_literal_cast(&self, text: &str, type_name: &str) -> Result<()> {
+        crate::casts::check_literal_cast(text, type_name)
+    }
+
     fn concatenates_as_text(
         &self,
         operands: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,

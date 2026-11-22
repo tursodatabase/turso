@@ -51,7 +51,7 @@ impl CastType {
         Self::TimestampTz,
     ];
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Int2 => "int2",
             Self::Int4 => "int4",
@@ -412,6 +412,13 @@ fn type_arg(arg: &Register) -> Option<CastType> {
         Value::Text(name) => CastType::from_name(name.as_str()),
         _ => None,
     }
+}
+
+pub(crate) fn check_literal_cast(text: &str, type_name: &str) -> Result<()> {
+    if let Some(target) = CastType::from_name(type_name) {
+        convert(&Value::build_text(text.to_string()), Text, target)?;
+    }
+    Ok(())
 }
 
 fn convert(value: &Value, source: CastType, target: CastType) -> Result<Value> {
