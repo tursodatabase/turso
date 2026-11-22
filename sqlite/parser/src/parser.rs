@@ -3510,11 +3510,24 @@ impl<'a> Parser<'a> {
             },
             _ => (expr, None),
         };
+        let with_ties = self.parse_with_ties()?;
 
         Ok(Some(Limit {
             expr: limit,
             offset,
+            with_ties,
         }))
+    }
+
+    /// `WITH TIES` ends the `LIMIT` clause, after the offset, as in ClickHouse.
+    fn parse_with_ties(&mut self) -> Result<bool> {
+        match self.peek()? {
+            Some(tok) if tok.token_type == TK_WITH => {}
+            _ => return Ok(false),
+        }
+        eat_assert!(self, TK_WITH);
+        eat_expect!(self, TK_TIES);
+        Ok(true)
     }
 
     fn parse_select_without_cte(&mut self, with: Option<With>) -> Result<Select> {
@@ -9569,6 +9582,7 @@ mod tests {
                     limit: Some(Limit {
                         expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                         offset: None,
+                        with_ties: false,
                     }),
                 }))],
             ),
@@ -9594,6 +9608,7 @@ mod tests {
                     limit: Some(Limit {
                         expr: Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                         offset: Some(Box::new(Expr::Literal(Literal::Numeric("1".to_owned())))),
+                        with_ties: false,
                     }),
                 }))],
             ),
@@ -9619,6 +9634,7 @@ mod tests {
                     limit: Some(Limit {
                         expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                         offset: Some(Box::new(Expr::Literal(Literal::Numeric("2".to_owned())))),
+                        with_ties: false,
                     }),
                 }))],
             ),

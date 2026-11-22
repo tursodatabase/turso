@@ -1,0 +1,493 @@
+# FETCH FIRST ... WITH TIES.
+# PostgreSQL 18 gave every expected result.
+
+@database :memory:
+
+setup rows {
+    CREATE TABLE t (a int, b text);
+    INSERT INTO t VALUES (1, 'p'), (2, 'q'), (2, 'r'), (2, 's'), (3, 'u'),
+                         (NULL, 'n1'), (NULL, 'n2');
+}
+
+setup indexed {
+    CREATE TABLE i (a int NOT NULL, b text);
+    INSERT INTO i VALUES (1, 'p'), (2, 'q'), (2, 'r'), (2, 's'), (3, 'u');
+    CREATE INDEX i_a ON i (a);
+}
+
+setup written_differently {
+    CREATE TABLE g (id int, n numeric, f float8);
+    INSERT INTO g VALUES (1, 1.0, 0.0), (2, 1.00, -0.0), (3, 2, 1);
+}
+
+# A tie is decided by the equality of the type, not by how a value is written.
+@setup written_differently
+test numeric-values-of-different-scale-tie {
+    SELECT id FROM g ORDER BY n FETCH FIRST 1 ROW WITH TIES;
+}
+expect unordered {
+    1
+    2
+}
+
+@setup written_differently
+test positive-and-negative-zero-tie {
+    SELECT id FROM g ORDER BY f FETCH FIRST 1 ROW WITH TIES;
+}
+expect unordered {
+    1
+    2
+}
+
+setup typed {
+    CREATE TABLE ty (id int, u uuid, ts timestamptz, b boolean, v varchar(10), n numeric(10,2), arr int[]);
+    INSERT INTO ty VALUES
+        (1, 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', '2024-01-01 12:00:00+00', true, 'x', 1.5, '{1,2}'),
+        (2, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-01-01 14:00:00+02', 't', 'x', 1.50, '{1,2}'),
+        (3, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2025-01-01 00:00:00+00', false, 'y', 2, '{3}');
+}
+
+@setup typed
+test uuid-values-written-in-different-case-tie {
+    SELECT id FROM ty ORDER BY u FETCH FIRST 1 ROW WITH TIES;
+}
+expect unordered {
+    1
+    2
+}
+
+@setup typed
+test timestamptz-values-of-the-same-instant-tie {
+    SELECT id FROM ty ORDER BY ts FETCH FIRST 1 ROW WITH TIES;
+}
+expect unordered {
+    1
+    2
+}
+
+@setup typed
+test boolean-values-tie {
+    SELECT id FROM ty ORDER BY b DESC FETCH FIRST 1 ROW WITH TIES;
+}
+expect unordered {
+    1
+    2
+}
+
+@setup typed
+test varchar-values-tie {
+    SELECT id FROM ty ORDER BY v FETCH FIRST 1 ROW WITH TIES;
+}
+expect unordered {
+    1
+    2
+}
+
+@setup typed
+test numeric-with-scale-values-tie {
+    SELECT id FROM ty ORDER BY n FETCH FIRST 1 ROW WITH TIES;
+}
+expect unordered {
+    1
+    2
+}
+
+@setup typed
+test array-values-tie {
+    SELECT id FROM ty ORDER BY arr FETCH FIRST 1 ROW WITH TIES;
+}
+expect unordered {
+    1
+    2
+}
+
+@setup rows
+test error-negative-offset {
+    SELECT a FROM t ORDER BY a OFFSET (-1) ROWS FETCH FIRST 1 ROW WITH TIES;
+}
+@sqlstate 2201X
+expect error {}
+
+@setup rows
+test rows-equal-to-the-last-counted-row-are-returned {
+    SELECT a, b FROM t ORDER BY a FETCH FIRST 2 ROWS WITH TIES;
+}
+expect unordered {
+    1|p
+    2|q
+    2|r
+    2|s
+}
+
+@setup rows
+test last-counted-row-without-ties-returns-the-count {
+    SELECT a, b FROM t ORDER BY a FETCH FIRST 1 ROW WITH TIES;
+}
+expect {
+    1|p
+}
+
+@setup rows
+test count-that-ends-on-the-last-row-of-a-group-adds-no-rows {
+    SELECT a, b FROM t ORDER BY a FETCH FIRST 4 ROWS WITH TIES;
+}
+expect unordered {
+    1|p
+    2|q
+    2|r
+    2|s
+}
+
+@setup rows
+test missing-count-is-one {
+    SELECT a, b FROM t ORDER BY a DESC NULLS LAST FETCH FIRST ROW WITH TIES;
+}
+expect {
+    3|u
+}
+
+@setup rows
+test nulls-tie-with-each-other {
+    SELECT a, b FROM t ORDER BY a DESC FETCH FIRST 1 ROW WITH TIES;
+}
+expect unordered {
+    |n1
+    |n2
+}
+
+@setup rows
+test every-order-by-term-must-be-equal {
+    SELECT a, b FROM t ORDER BY a, b FETCH FIRST 2 ROWS WITH TIES;
+}
+expect {
+    1|p
+    2|q
+}
+
+@setup rows
+test descending-term-breaks-the-tie {
+    SELECT a, b FROM t ORDER BY a, b DESC FETCH FIRST 2 ROWS WITH TIES;
+}
+expect {
+    1|p
+    2|s
+}
+
+@setup rows
+test offset-rows-are-skipped-before-the-count {
+    SELECT a, b FROM t ORDER BY a OFFSET 2 ROWS FETCH FIRST 1 ROW WITH TIES;
+}
+expect unordered {
+    2|r
+    2|s
+}
+
+@setup rows
+test offset-past-the-last-row-returns-no-rows {
+    SELECT a, b FROM t ORDER BY a OFFSET 7 ROWS FETCH FIRST 1 ROW WITH TIES;
+}
+expect {
+}
+
+@setup rows
+test zero-count-returns-no-rows {
+    SELECT a, b FROM t ORDER BY a FETCH FIRST 0 ROWS WITH TIES;
+}
+expect {
+}
+
+@setup rows
+test count-above-the-row-count-returns-every-row {
+    SELECT count(*) FROM (SELECT a FROM t ORDER BY a FETCH FIRST 100 ROWS WITH TIES) s;
+}
+expect {
+    7
+}
+
+@setup rows
+test count-can-be-an-expression {
+    SELECT b FROM t ORDER BY a FETCH FIRST (1 + 1) ROWS WITH TIES;
+}
+expect unordered {
+    p
+    q
+    r
+    s
+}
+
+@setup rows
+test null-count-expression-returns-every-row {
+    SELECT count(*) FROM (SELECT a FROM t ORDER BY a FETCH FIRST (NULL + 1) ROWS WITH TIES) s;
+}
+expect {
+    7
+}
+
+@setup rows
+test order-by-term-outside-the-select-list {
+    SELECT b FROM t ORDER BY a FETCH FIRST 2 ROWS WITH TIES;
+}
+expect unordered {
+    p
+    q
+    r
+    s
+}
+
+@setup rows
+test order-by-expression {
+    SELECT b FROM t ORDER BY a % 2, a FETCH FIRST 1 ROW WITH TIES;
+}
+expect unordered {
+    q
+    r
+    s
+}
+
+@setup rows
+test function-call-ties {
+    SELECT b FROM t ORDER BY length(b) DESC FETCH FIRST 1 ROW WITH TIES;
+}
+expect unordered {
+    n1
+    n2
+}
+
+@setup indexed
+test index-order-still-returns-the-ties {
+    SELECT a, b FROM i ORDER BY a FETCH FIRST 2 ROWS WITH TIES;
+}
+expect unordered {
+    1|p
+    2|q
+    2|r
+    2|s
+}
+
+@setup indexed
+test index-order-descending {
+    SELECT a, b FROM i ORDER BY a DESC FETCH FIRST 2 ROWS WITH TIES;
+}
+expect unordered {
+    3|u
+    2|q
+    2|r
+    2|s
+}
+
+@setup indexed
+test where-clause-is-applied-before-the-count {
+    SELECT a, b FROM i WHERE b <> 'p' ORDER BY a FETCH FIRST 1 ROW WITH TIES;
+}
+expect unordered {
+    2|q
+    2|r
+    2|s
+}
+
+@setup rows
+test groups-tie-on-an-aggregate {
+    SELECT a, count(*) FROM t GROUP BY a ORDER BY count(*) FETCH FIRST 1 ROW WITH TIES;
+}
+expect unordered {
+    1|1
+    3|1
+}
+
+@setup rows
+test groups-tie-on-the-largest-aggregate {
+    SELECT a, count(*) FROM t GROUP BY a ORDER BY count(*) DESC, a FETCH FIRST 1 ROW WITH TIES;
+}
+expect {
+    2|3
+}
+
+@setup rows
+test distinct-rows-are-counted-after-duplicates-are-removed {
+    SELECT DISTINCT a FROM t ORDER BY a FETCH FIRST 2 ROWS WITH TIES;
+}
+expect {
+    1
+    2
+}
+
+@setup indexed
+test distinct-on-groups-are-counted {
+    SELECT DISTINCT ON (a) a, b FROM i ORDER BY a, b FETCH FIRST 2 ROWS WITH TIES;
+}
+expect {
+    1|p
+    2|q
+}
+
+@setup rows
+test window-function-rows-tie {
+    SELECT b, rank() OVER (ORDER BY a) FROM t ORDER BY 2 FETCH FIRST 2 ROWS WITH TIES;
+}
+expect unordered {
+    p|1
+    q|2
+    r|2
+    s|2
+}
+
+@setup rows
+test subquery-in-from {
+    SELECT b FROM (SELECT a, b FROM t ORDER BY a FETCH FIRST 2 ROWS WITH TIES) s ORDER BY b DESC;
+}
+expect {
+    s
+    r
+    q
+    p
+}
+
+@setup rows
+test in-subquery-reads-the-ties {
+    SELECT b FROM t WHERE a IN (SELECT a FROM t ORDER BY a DESC NULLS LAST OFFSET 1 FETCH FIRST 1 ROW WITH TIES) ORDER BY b;
+}
+expect {
+    q
+    r
+    s
+}
+
+@setup rows
+test exists-subquery {
+    SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM t ORDER BY a FETCH FIRST 1 ROW WITH TIES);
+}
+expect {
+    7
+}
+
+@setup rows
+test scalar-subquery-with-one-row {
+    SELECT (SELECT b FROM t ORDER BY a FETCH FIRST 1 ROW WITH TIES);
+}
+expect {
+    p
+}
+
+@setup rows
+test error-scalar-subquery-with-ties {
+    SELECT (SELECT b FROM t ORDER BY a OFFSET 1 ROW FETCH FIRST 1 ROW WITH TIES);
+}
+@sqlstate 21000
+expect error {}
+
+@setup rows
+test correlated-subquery {
+    SELECT b FROM t o
+    WHERE b IN (SELECT b FROM t n WHERE n.a = o.a ORDER BY n.a FETCH FIRST 1 ROW WITH TIES)
+    ORDER BY b;
+}
+expect {
+    p
+    q
+    r
+    s
+    u
+}
+
+@setup rows
+test view-keeps-the-ties {
+    CREATE VIEW v AS SELECT a, b FROM t ORDER BY a FETCH FIRST 2 ROWS WITH TIES;
+    SELECT b FROM v ORDER BY b;
+}
+expect {
+    p
+    q
+    r
+    s
+}
+
+@setup rows
+test common-table-expression {
+    WITH firsts AS (SELECT a, b FROM t ORDER BY a FETCH FIRST 2 ROWS WITH TIES)
+    SELECT count(*) FROM firsts;
+}
+expect {
+    4
+}
+
+@setup rows
+test insert-select {
+    CREATE TABLE copy (a int, b text);
+    INSERT INTO copy SELECT a, b FROM t ORDER BY a FETCH FIRST 2 ROWS WITH TIES;
+    SELECT count(*) FROM copy;
+}
+expect {
+    4
+}
+
+@setup rows
+test error-without-order-by {
+    SELECT a FROM t FETCH FIRST 1 ROW WITH TIES;
+}
+@sqlstate 42601
+expect error {}
+
+@setup rows
+test error-null-count {
+    SELECT a FROM t ORDER BY a FETCH FIRST NULL ROWS WITH TIES;
+}
+@sqlstate 2201W
+expect error {}
+
+@setup rows
+test error-negative-count {
+    SELECT a FROM t ORDER BY a FETCH FIRST (-1) ROWS WITH TIES;
+}
+@sqlstate 2201W
+expect error {}
+
+@setup rows
+test error-skip-locked {
+    SELECT a FROM t ORDER BY a FETCH FIRST 1 ROW WITH TIES FOR UPDATE SKIP LOCKED;
+}
+@sqlstate 42601
+expect error {}
+
+# A set operation is sorted by other code than a single SELECT.
+@setup rows
+test set-operation {
+    SELECT a FROM t WHERE a = 2 UNION ALL SELECT a FROM t WHERE a = 1 ORDER BY 1 FETCH FIRST 2 ROWS WITH TIES;
+}
+expect {
+    1
+    2
+    2
+    2
+}
+
+@setup rows
+test set-operation-compares-every-order-by-term-after-the-offset {
+    SELECT a, b FROM t UNION ALL SELECT a, b FROM t ORDER BY a, b OFFSET 1 FETCH FIRST 2 ROWS WITH TIES;
+}
+expect {
+    1|p
+    2|q
+    2|q
+}
+
+@setup rows
+test union-returns-the-ties {
+    SELECT a, b FROM t UNION SELECT a, 'x' FROM t ORDER BY 1 FETCH FIRST 3 ROWS WITH TIES;
+}
+expect unordered {
+    1|p
+    1|x
+    2|q
+    2|r
+    2|s
+    2|x
+}
+
+test error-recursive-query {
+    WITH RECURSIVE r(n) AS (
+        SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3 ORDER BY 1 FETCH FIRST 1 ROW WITH TIES
+    )
+    SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {}

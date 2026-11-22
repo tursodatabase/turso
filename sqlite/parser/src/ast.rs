@@ -2179,6 +2179,8 @@ pub struct Limit {
     pub expr: Box<Expr>,
     /// `OFFSET`
     pub offset: Option<Box<Expr>>, // TODO distinction between LIMIT offset, count and LIMIT count OFFSET offset
+    /// `WITH TIES`: rows equal to the last counted row in every `ORDER BY` term follow it.
+    pub with_ties: bool,
 }
 
 /// `INSERT` body

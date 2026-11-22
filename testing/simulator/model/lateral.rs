@@ -250,6 +250,7 @@ impl LateralSelect {
         select.limit = join.limit.map(|limit| ast::Limit {
             expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(limit.to_string()))),
             offset: None,
+            with_ties: false,
         });
         select
     }

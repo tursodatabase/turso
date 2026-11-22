@@ -8,7 +8,7 @@ use crate::translate::emitter::{
 };
 use crate::translate::eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod};
 use crate::translate::expr::translate_expr;
-use crate::translate::order_by::sorter_insert;
+use crate::translate::order_by::{sorter_insert, LimitWithTies};
 use crate::translate::plan::{
     CompoundOrderByKey, EvalAt, Plan, QueryDestination, SelectPlan, SubqueryOrigin,
 };
@@ -36,11 +36,13 @@ pub fn emit_program_for_compound_select(
         right_most,
         limit,
         offset,
+        limit_with_ties,
         order_by,
     } = plan
     else {
         crate::bail_parse_error!("expected compound select plan");
     };
+    let limit_with_ties = *limit_with_ties;
     let has_order_by = order_by.is_some();
     let order_by_owned = order_by.clone();
     let limit_owned = limit.clone();
@@ -250,6 +252,7 @@ pub fn emit_program_for_compound_select(
             num_result_cols,
             limit_owned.as_deref(),
             offset_owned.as_deref(),
+            limit_with_ties,
             &real_query_destination,
             &right_most_ctx,
         )?;
@@ -856,6 +859,7 @@ fn emit_compound_order_by(
     num_result_cols: usize,
     limit: Option<&Expr>,
     offset: Option<&Expr>,
+    limit_with_ties: bool,
     real_destination: &QueryDestination,
     right_most_ctx: &TranslateCtx,
 ) -> crate::Result<Option<usize>> {
@@ -908,6 +912,14 @@ fn emit_compound_order_by(
         })
         .try_collect()?;
     let sorter_column_count = order_by.len() + 1 + non_dedup_count;
+
+    let limit_with_ties = limit_with_ties.then(|| {
+        let key_collations = order_collations_nulls[..order_by.len()]
+            .iter()
+            .map(|&(_, collation, _)| collation)
+            .collect();
+        LimitWithTies::alloc(program, key_collations)
+    });
 
     let sort_cursor = program.alloc_cursor_id(CursorType::Sorter);
     program.emit_insn(Insn::SorterOpen {
@@ -1122,6 +1134,10 @@ fn emit_compound_order_by(
         pseudo_cursor,
     });
 
+    if let Some(ties) = &limit_with_ties {
+        ties.emit_stop_after_the_last_tie(program, pseudo_cursor, sort_loop_end);
+    }
+
     // Read result columns from the pseudo cursor, remapping from sorter order to SELECT order
     let result_start_reg = program.alloc_registers(num_result_cols);
     for (col_idx, &(sorter_idx, _deduplicated)) in
@@ -1135,10 +1151,17 @@ fn emit_compound_order_by(
 
     // Apply LIMIT
     if let Some(limit_reg) = limit_ctx {
+        let label_limit_reached = match &limit_with_ties {
+            Some(ties) => ties.label_limit_reached,
+            None => sort_loop_end,
+        };
         program.emit_insn(Insn::DecrJumpZero {
             reg: limit_reg,
-            target_pc: sort_loop_end,
+            target_pc: label_limit_reached,
         });
+    }
+    if let Some(ties) = &limit_with_ties {
+        ties.emit_keep_last_counted_row(program, pseudo_cursor, sort_loop_next);
     }
 
     program.preassign_label_to_next_insn(sort_loop_next);

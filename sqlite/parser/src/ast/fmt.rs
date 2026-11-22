@@ -2471,6 +2471,10 @@ impl ToTokens for Limit {
             s.append(TK_OFFSET, None)?;
             offset.to_tokens(s, context)?;
         }
+        if self.with_ties {
+            s.append(TK_WITH, None)?;
+            s.append(TK_TIES, None)?;
+        }
         Ok(())
     }
 }

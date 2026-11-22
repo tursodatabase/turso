@@ -239,6 +239,7 @@ fn prepare_window_subquery(
         limit: None,
         offset: None,
         contains_constant_false_condition: false,
+        limit_with_ties: false,
         query_destination: QueryDestination::placeholder_for_subquery(),
         distinctness: Distinctness::NonDistinct,
         values: vec![],

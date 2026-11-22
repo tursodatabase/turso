@@ -9,10 +9,12 @@ use crate::{
     schema::{Index, IndexColumn, PseudoCursorType, Schema},
     translate::{collate::CollationSeq, group_by::is_orderby_agg_or_const, plan::Aggregate},
     turso_assert,
+    types::KeyInfo,
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{to_u32, IdxInsertFlags, Insn, SorterOpenData},
+        BranchOffset,
     },
     Result,
 };
@@ -100,6 +102,7 @@ impl EmitOrderBy {
         referenced_tables: &TableReferences,
         has_group_by: bool,
         has_distinct: bool,
+        limit_with_ties: bool,
         aggregates: &[Aggregate],
     ) -> Result<()> {
         for (expr, _, _) in order_by.iter() {
@@ -121,8 +124,12 @@ impl EmitOrderBy {
             .all(|(e, _, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
 
         let has_explicit_nulls = order_by.iter().any(|(_, _, nulls)| nulls.is_some());
-        let use_heap_sort =
-            !has_distinct && !has_group_by && t_ctx.limit_ctx.is_some() && !has_explicit_nulls;
+        // The heap sort keeps only as many rows as the LIMIT counts, so it loses the ties.
+        let use_heap_sort = !has_distinct
+            && !has_group_by
+            && t_ctx.limit_ctx.is_some()
+            && !has_explicit_nulls
+            && !limit_with_ties;
 
         // only emit sequence column if (we have GROUP BY and ORDER BY is not only aggregates or constants) OR (we decided to use heap-sort)
         let has_sequence = (has_group_by && !only_aggs) || use_heap_sort;
@@ -314,6 +321,23 @@ impl EmitOrderBy {
             _ => None,
         };
 
+        let limit_with_ties = if plan.limit_with_ties && plan.limit.is_some() {
+            turso_assert!(
+                !use_heap_sort,
+                "LIMIT WITH TIES reads its rows from a sorter"
+            );
+            let mut key_collations = std::vec::Vec::with_capacity(order_by.len());
+            for (expr, _, _) in order_by.iter() {
+                key_collations.push(
+                    ExprContext::new(Some(&plan.table_references), &t_ctx.resolver)
+                        .expr_collation(expr)?,
+                );
+            }
+            Some(LimitWithTies::alloc(program, key_collations))
+        } else {
+            None
+        };
+
         program.preassign_label_to_next_insn(sort_loop_start_label);
 
         if !use_heap_sort {
@@ -342,6 +366,10 @@ impl EmitOrderBy {
                 key_collations,
                 sort_loop_next_label,
             );
+        }
+
+        if let Some(ties) = &limit_with_ties {
+            ties.emit_stop_after_the_last_tie(program, cursor_id, sort_loop_end_label);
         }
 
         emit_offset(program, sort_loop_next_label, t_ctx.reg_offset);
@@ -400,12 +428,15 @@ impl EmitOrderBy {
             plan,
             start_reg,
             t_ctx.limit_ctx,
-            if !use_heap_sort {
-                Some(sort_loop_end_label)
-            } else {
-                None
+            match &limit_with_ties {
+                Some(ties) => Some(ties.label_limit_reached),
+                None if !use_heap_sort => Some(sort_loop_end_label),
+                None => None,
             },
         )?;
+        if let Some(ties) = &limit_with_ties {
+            ties.emit_keep_last_counted_row(program, cursor_id, sort_loop_next_label);
+        }
 
         program.preassign_label_to_next_insn(sort_loop_next_label);
         if !use_heap_sort {
@@ -650,6 +681,104 @@ impl EmitOrderBy {
             );
         }
         Ok(())
+    }
+}
+
+/// Registers and labels for `LIMIT ... WITH TIES` in a loop that reads rows from a sorter
+/// whose first columns are the ORDER BY terms.
+pub(crate) struct LimitWithTies {
+    /// ORDER BY terms of the last counted row.
+    reg_last_counted_key_start: usize,
+    reg_key_start: usize,
+    /// 0 until the limit has counted its last row.
+    reg_limit_reached: usize,
+    key_collations: std::vec::Vec<CollationSeq>,
+    /// The LIMIT check jumps here, instead of ending the loop, when it counts its last row.
+    pub(crate) label_limit_reached: BranchOffset,
+}
+
+impl LimitWithTies {
+    /// `key_collations` are the collations the sorter orders the ORDER BY terms by. With other
+    /// collations the ties would end at a different row than the sort order does.
+    pub(crate) fn alloc(
+        program: &mut ProgramBuilder,
+        key_collations: std::vec::Vec<CollationSeq>,
+    ) -> Self {
+        let key_count = key_collations.len();
+        let ties = Self {
+            // `Insn::Compare` needs its first run of registers to come before its second.
+            reg_last_counted_key_start: program.alloc_registers(key_count),
+            reg_key_start: program.alloc_registers(key_count),
+            reg_limit_reached: program.alloc_register(),
+            key_collations,
+            label_limit_reached: program.allocate_label(),
+        };
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: ties.reg_limit_reached,
+        });
+        ties
+    }
+
+    /// Once the limit has counted its last row, jumps to `label_end` at the first row of
+    /// `cursor_id` that differs from that row in an ORDER BY term.
+    pub(crate) fn emit_stop_after_the_last_tie(
+        &self,
+        program: &mut ProgramBuilder,
+        cursor_id: usize,
+        label_end: BranchOffset,
+    ) {
+        let label_row_is_returned = program.allocate_label();
+        program.emit_insn(Insn::IfNot {
+            reg: self.reg_limit_reached,
+            target_pc: label_row_is_returned,
+            jump_if_null: true,
+        });
+        for i in 0..self.key_collations.len() {
+            program.emit_column_or_rowid(cursor_id, i, self.reg_key_start + i);
+        }
+        program.emit_insn(Insn::Compare {
+            start_reg_a: self.reg_last_counted_key_start,
+            start_reg_b: self.reg_key_start,
+            count: self.key_collations.len(),
+            key_info: self
+                .key_collations
+                .iter()
+                .map(|&collation| KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation,
+                    nulls_order: None,
+                })
+                .collect(),
+        });
+        program.emit_insn(Insn::Jump {
+            target_pc_lt: label_end,
+            target_pc_eq: label_row_is_returned,
+            target_pc_gt: label_end,
+        });
+        program.preassign_label_to_next_insn(label_row_is_returned);
+    }
+
+    /// Emits a jump to `label_next_row`, then the code at `label_limit_reached`, which keeps the
+    /// ORDER BY terms of the row of `cursor_id` that the limit counted last.
+    pub(crate) fn emit_keep_last_counted_row(
+        &self,
+        program: &mut ProgramBuilder,
+        cursor_id: usize,
+        label_next_row: BranchOffset,
+    ) {
+        // A row past the limit takes the counter below zero, so it does not jump here.
+        program.emit_insn(Insn::Goto {
+            target_pc: label_next_row,
+        });
+        program.preassign_label_to_next_insn(self.label_limit_reached);
+        for i in 0..self.key_collations.len() {
+            program.emit_column_or_rowid(cursor_id, i, self.reg_last_counted_key_start + i);
+        }
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: self.reg_limit_reached,
+        });
     }
 }
 

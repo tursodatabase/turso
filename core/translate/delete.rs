@@ -541,6 +541,7 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
             .collect(),
         offset: None,
         contains_constant_false_condition: false,
+        limit_with_ties: false,
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
         window: None,

@@ -1208,6 +1208,7 @@ fn find_select_plan_form(
 
     plan.simple_aggregate = detect_simple_aggregate(plan, resolver)?;
     let distinct_on_order_by = order_by_of_distinct_on(plan);
+    let limit_with_ties_order_by = plan.limit_with_ties.then(|| plan.order_by.clone());
     let mut table_plan = find_table_access_plan(
         schema,
         resolver,
@@ -1224,9 +1225,10 @@ fn find_select_plan_form(
         plan.input_cardinality_hint.unwrap_or(1.0),
         cost_limit,
         // Every row the WHERE clause keeps reaches the LIMIT unless an aggregate or DISTINCT
-        // comes between.
-        !plan.distinctness.is_distinct() && plan.aggregates.is_empty(),
+        // comes between. An index method that applies the LIMIT does not return the ties.
+        !plan.distinctness.is_distinct() && plan.aggregates.is_empty() && !plan.limit_with_ties,
     )?;
+    keep_order_by_of_limit_with_ties(plan, limit_with_ties_order_by);
     keep_distinct_on_if_order_by_was_removed(plan, distinct_on_order_by);
 
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
@@ -1371,6 +1373,7 @@ fn apply_select_table_plan(
     };
     mark_distinct_ordered(plan, &table_plan, resolver)?;
     let distinct_on_order_by = order_by_of_distinct_on(plan);
+    let limit_with_ties_order_by = plan.limit_with_ties.then(|| plan.order_by.clone());
     plan.join_order = apply_table_access_plan(
         resolver,
         &mut plan.table_references,
@@ -1379,6 +1382,7 @@ fn apply_select_table_plan(
         &mut plan.group_by,
         table_plan,
     )?;
+    keep_order_by_of_limit_with_ties(plan, limit_with_ties_order_by);
     keep_distinct_on_if_order_by_was_removed(plan, distinct_on_order_by);
     Ok(())
 }
@@ -1446,6 +1450,16 @@ fn keep_distinct_on_if_order_by_was_removed(plan: &mut SelectPlan, order_by: Opt
             .collect(),
         registers: None,
     };
+}
+
+/// The tie check reads its keys from the ORDER BY sorter, so the sort cannot be removed.
+fn keep_order_by_of_limit_with_ties(plan: &mut SelectPlan, order_by: Option<OrderBy>) {
+    let Some(order_by) = order_by else {
+        return;
+    };
+    if plan.order_by.is_empty() {
+        plan.order_by = order_by;
+    }
 }
 
 type OrderBy = Vec<(
@@ -1841,6 +1855,7 @@ fn build_update_write_set_plan(
         join_order,
         offset: None,
         contains_constant_false_condition: false,
+        limit_with_ties: false,
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
         window: None,

@@ -72,6 +72,7 @@ impl Display for Plan {
                 limit,
                 offset,
                 order_by,
+                ..
             } => {
                 for (plan, operator) in left {
                     plan.fmt(f)?;
@@ -540,6 +541,7 @@ impl ToTokens for Plan {
                 right_most,
                 limit,
                 offset,
+                limit_with_ties,
                 order_by,
             } => {
                 let all_refs = left
@@ -582,6 +584,11 @@ impl ToTokens for Plan {
                 if let Some(offset) = &offset {
                     s.append(TokenType::TK_OFFSET, None)?;
                     s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
+                }
+
+                if *limit_with_ties {
+                    s.append(TokenType::TK_WITH, None)?;
+                    s.append(TokenType::TK_TIES, None)?;
                 }
             }
             Self::RecursiveCte(plan) => {
@@ -773,6 +780,11 @@ impl ToTokens for SelectPlan {
         if let Some(offset) = &self.offset {
             s.append(TokenType::TK_OFFSET, None)?;
             s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
+        }
+
+        if self.limit_with_ties {
+            s.append(TokenType::TK_WITH, None)?;
+            s.append(TokenType::TK_TIES, None)?;
         }
 
         Ok(())
