@@ -2693,6 +2693,10 @@ fn encrypted_restore_recovers_torn_sidecar_tail() -> anyhow::Result<()> {
             let damaged_byte = bytes.len() - 16;
             bytes[damaged_byte] ^= 1;
             std::fs::write(path, bytes)?;
+            let fresh_dir = tempfile::tempdir()?;
+            let fresh_path = fresh_dir.path().join("fresh.db");
+            copy_encrypted_test_files(&target, &fresh_path)?;
+            assert_eq!(fresh_encrypted_rows(&fresh_path, cipher)?.len(), 2);
             owner.reload_wal_after_external_restore()?;
             owner.publish_schema_after_external_restore()?;
             let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
@@ -2707,7 +2711,7 @@ fn encrypted_restore_recovers_torn_sidecar_tail() -> anyhow::Result<()> {
 }
 
 #[test]
-fn encrypted_restore_rejects_files_encrypted_with_another_key() -> anyhow::Result<()> {
+fn encrypted_recovery_rejects_files_encrypted_with_another_key() -> anyhow::Result<()> {
     for cipher in [CIPHER_A, CIPHER_B] {
         for mvcc in [false, true] {
             let target = TempDatabaseBuilder::new()
@@ -2743,6 +2747,9 @@ fn encrypted_restore_rejects_files_encrypted_with_another_key() -> anyhow::Resul
                 std::fs::write(&target_path, &restored)?;
                 let result = owner.reload_wal_after_external_restore();
                 let after_reload = std::fs::read(&target_path)?;
+                let fresh_dir = tempfile::tempdir()?;
+                let fresh_path = fresh_dir.path().join("fresh.db");
+                copy_encrypted_test_files(&target, &fresh_path)?;
                 std::fs::write(&target_path, original)?;
                 let error = result.expect_err(&format!("accepted {cipher} mvcc={mvcc} {suffix}"));
                 assert!(
@@ -2750,6 +2757,14 @@ fn encrypted_restore_rejects_files_encrypted_with_another_key() -> anyhow::Resul
                     "{error}"
                 );
                 assert_eq!(after_reload, restored, "rejected restore changed the file");
+                let error = fresh_encrypted_rows(&fresh_path, cipher)
+                    .expect_err("fresh recovery accepted files encrypted under another key");
+                assert!(error.to_string().to_ascii_lowercase().contains("decrypt"));
+                assert_eq!(
+                    std::fs::read(format!("{}{suffix}", fresh_path.display()))?,
+                    restored,
+                    "rejected fresh recovery changed the file"
+                );
                 let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
                 assert_eq!(rows.len(), 3, "rejected restore changed the live database");
                 owner.reload_wal_after_external_restore()?;
@@ -2767,6 +2782,41 @@ fn encrypted_restore_rejects_files_encrypted_with_another_key() -> anyhow::Resul
         }
     }
     Ok(())
+}
+
+fn copy_encrypted_test_files(source: &TempDatabase, path: &std::path::Path) -> anyhow::Result<()> {
+    for suffix in ["", "-wal", "-log"] {
+        let source_path = format!("{}{suffix}", source.path.display());
+        if std::path::Path::new(&source_path).exists() {
+            std::fs::copy(source_path, format!("{}{suffix}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn fresh_encrypted_rows(
+    path: &std::path::Path,
+    cipher: &str,
+) -> anyhow::Result<Vec<Vec<turso_core::Value>>> {
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::None,
+        DatabaseOpts::new().with_encryption(true),
+        Some(EncryptionOpts {
+            cipher: cipher.into(),
+            hexkey: KEY_A.into(),
+        }),
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect(
+        ConnectOpts::new(SessionRole::Superuser)
+            .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?)),
+    )?;
+    Ok(conn
+        .prepare("SELECT value FROM secrets")?
+        .run_collect_rows()?)
 }
 
 #[test]

@@ -2636,6 +2636,7 @@ impl Database {
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             if encryption_context.is_some() {
+                // Authenticate before publication so rejection preserves the live state.
                 mvcc::persistent_storage::logical_log::StreamingLogicalLogReader::new(
                     mv_store.get_logical_log_file(),
                     encryption_context,

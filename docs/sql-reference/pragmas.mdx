@@ -834,6 +834,8 @@ External storage restore is not supported with built-in encryption. Sync encrypt
 
 Built-in encryption protects database storage, WAL, and encrypted MVCC storage. Serialize writes until the first page of a new database has been initialized, including across connections, raw/custom-storage opens, and separate processes. Recovery after a failed or abandoned initial write is not guaranteed.
 
+MVCC recovery ignores an incomplete or checksum-invalid log tail and keeps the preceding committed frames. A checksum-valid encrypted frame that cannot be decrypted with the configured key causes opening or recovery to fail.
+
 ## Custom Types
 
 <Info>
