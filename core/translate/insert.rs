@@ -2537,7 +2537,11 @@ fn init_source_emission<'a>(
                     yield_reg,
                     coroutine_implementation_start: ctx.halt_label,
                 };
+                let is_bare_values = select.with.is_none()
+                    && select.body.compounds.is_empty()
+                    && matches!(select.body.select, OneSelect::Values(_));
                 let num_result_cols = program.nested(|program| {
+                    resolver.set_values_select_is_insert_source(is_bare_values);
                     translate_select(select, resolver, program, query_destination, connection)
                 })?;
                 if num_result_cols != required_column_count {

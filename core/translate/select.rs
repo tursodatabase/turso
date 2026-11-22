@@ -910,6 +910,8 @@ fn prepare_one_select_plan(
             Ok(plan)
         }
         ast::OneSelect::Values(mut values) => {
+            // Taken before any subquery in the rows is planned, so that only this VALUES counts.
+            let is_insert_source = resolver.take_values_select_is_insert_source();
             if !order_by.is_empty() {
                 crate::bail_parse_error!("ORDER BY clause is not allowed with VALUES clause");
             }
@@ -973,16 +975,21 @@ fn prepare_one_select_plan(
             )?;
 
             // The values of a column are one result, so they have one type.
-            let context =
-                crate::translate::expr_context::ExprContext::new(Some(&table_references), resolver);
-            for column in 0..len {
-                crate::translate::collate::check_comparable_results(
-                    values
-                        .iter()
-                        .filter_map(|row| row.get(column))
-                        .map(|v| v.as_ref()),
-                    &context,
-                )?;
+            // An INSERT converts each row to its target column, so its rows may differ in type.
+            if !is_insert_source {
+                let context = crate::translate::expr_context::ExprContext::new(
+                    Some(&table_references),
+                    resolver,
+                );
+                for column in 0..len {
+                    crate::translate::collate::check_comparable_results(
+                        values
+                            .iter()
+                            .filter_map(|row| row.get(column))
+                            .map(|v| v.as_ref()),
+                        &context,
+                    )?;
+                }
             }
 
             let plan = SelectPlan {

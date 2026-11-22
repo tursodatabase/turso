@@ -2247,6 +2247,18 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test cmp-insert-values-of-date-and-timestamp-converts-each-row {
+    -- INSERT converts each row to the target column, so rows of different
+    -- types are not compared with each other.
+    CREATE TABLE c(z timestamp) STRICT;
+    INSERT INTO c(z) VALUES (CAST('2024-01-05' AS date)), (CAST('2024-01-05 00:00:00' AS timestamp));
+    SELECT count(*) FROM c;
+}
+expect {
+    2
+}
+
+@requires strict "uses STRICT tables"
 test cmp-recursive-cte-of-date-and-timestamp-is-an-error {
     CREATE TABLE t(d date, ts timestamp) STRICT;
     WITH RECURSIVE c(x) AS (SELECT d FROM t UNION ALL SELECT ts FROM t) SELECT * FROM c;
