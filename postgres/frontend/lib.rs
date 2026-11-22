@@ -12,6 +12,7 @@ mod error;
 mod float_text;
 mod functions;
 mod open;
+mod operators;
 mod options;
 mod pg_type;
 mod pg_types;

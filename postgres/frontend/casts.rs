@@ -36,6 +36,21 @@ pub(crate) enum CastType {
 }
 
 impl CastType {
+    pub(crate) const ALL: [CastType; 12] = [
+        Self::Int2,
+        Self::Int4,
+        Self::Int8,
+        Self::Float4,
+        Self::Float8,
+        Self::Numeric,
+        Self::Text,
+        Self::Bool,
+        Self::Bytea,
+        Self::Uuid,
+        Self::Timestamp,
+        Self::TimestampTz,
+    ];
+
     fn name(self) -> &'static str {
         match self {
             Self::Int2 => "int2",
@@ -58,6 +73,10 @@ impl CastType {
             .iter()
             .find(|info| info.name == self.name())
             .expect("every cast type is a row of pg_type")
+    }
+
+    pub(crate) fn oid(self) -> i64 {
+        self.info().oid
     }
 
     pub(crate) fn is_number(self) -> bool {

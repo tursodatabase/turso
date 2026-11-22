@@ -80,6 +80,16 @@ fn concat_operands_as_text(
             cast_source(referenced_tables, e2, resolver),
         ]
     };
+    if resolver
+        .catalog
+        .dialect
+        .resolve_operator("||", &operand_types)
+        == crate::dialect::OperatorResolution::Reject
+    {
+        let types = operand_types();
+        let (lhs, rhs) = (operand_type_name(&types[0]), operand_type_name(&types[1]));
+        crate::bail_parse_error!("operator does not exist: {lhs} || {rhs}");
+    }
     if !resolver
         .catalog
         .dialect
@@ -102,6 +112,23 @@ fn concat_operands_as_text(
         lhs.unwrap_or_else(|| e1.clone()),
         rhs.unwrap_or_else(|| e2.clone()),
     )))
+}
+
+fn operand_type_name(operand: &crate::dialect::OperandType) -> String {
+    use crate::dialect::OperandType;
+    match operand {
+        OperandType::Untyped => "unknown".to_string(),
+        OperandType::Null => "null".to_string(),
+        OperandType::Integer => "integer".to_string(),
+        OperandType::Boolean => "boolean".to_string(),
+        OperandType::Real => "double precision".to_string(),
+        OperandType::Decimal => "numeric".to_string(),
+        OperandType::Text => "text".to_string(),
+        OperandType::Blob => "bytea".to_string(),
+        OperandType::Custom(type_def) => type_def.name.clone(),
+        OperandType::Array => "array".to_string(),
+        OperandType::Unknown => "unknown".to_string(),
+    }
 }
 
 /// Row-valued comparisons are rare, so they get their own function that is

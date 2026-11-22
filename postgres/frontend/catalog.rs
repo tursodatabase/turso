@@ -276,11 +276,7 @@ impl Dialect for PostgresDialect {
         op: &str,
         operands: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
     ) -> turso_core::dialect::OperatorResolution {
-        if crate::typing::rejects_operator(op, operands) {
-            turso_core::dialect::OperatorResolution::Reject
-        } else {
-            turso_core::dialect::OperatorResolution::Keep
-        }
+        crate::operators::resolve_operator(op, &operands())
     }
 
     fn concatenates_as_text(
@@ -2900,16 +2896,12 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgLanguageTable>(PhantomData),
     );
+    options = options.native_module(
+        "pg_operator",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgOperatorTable>(PhantomData),
+    );
     for (name, create_sql) in [
-        (
-            "pg_operator",
-            "CREATE TABLE pg_operator (
-            oid INTEGER, oprname TEXT, oprnamespace INTEGER, oprowner INTEGER,
-            oprkind TEXT, oprcanmerge BOOLEAN, oprcanhash BOOLEAN, oprleft INTEGER,
-            oprright INTEGER, oprresult INTEGER, oprcom INTEGER, oprnegate INTEGER,
-            oprcode INTEGER, oprrest INTEGER, oprjoin INTEGER, tableoid INTEGER HIDDEN
-        )",
-        ),
         (
             "pg_opclass",
             "CREATE TABLE pg_opclass (
@@ -3068,6 +3060,47 @@ impl SnapshotRows for PgLanguageTable {
                     Value::from_i64(0),
                     Value::from_i64(0),
                     Value::Null,
+                ]
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct PgOperatorTable;
+
+impl SnapshotRows for PgOperatorTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_operator (
+        oid INTEGER, oprname TEXT, oprnamespace INTEGER, oprowner INTEGER,
+        oprkind TEXT, oprcanmerge BOOLEAN, oprcanhash BOOLEAN, oprleft INTEGER,
+        oprright INTEGER, oprresult INTEGER, oprcom INTEGER, oprnegate INTEGER,
+        oprcode INTEGER, oprrest INTEGER, oprjoin INTEGER, tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2617);
+    const ESTIMATED_COST: f64 = 1.0;
+    const ESTIMATED_ROWS: u32 = 400;
+
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        crate::operators::operators()
+            .iter()
+            .enumerate()
+            .map(|(index, operator)| {
+                vec![
+                    Value::from_i64(crate::operators::FIRST_OPERATOR_OID + index as i64),
+                    Value::build_text(operator.name),
+                    Value::from_i64(11),
+                    Value::from_i64(10),
+                    Value::build_text(if operator.left.is_some() { "b" } else { "l" }),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(operator.left.map_or(0, crate::operators::arg_oid)),
+                    Value::from_i64(crate::operators::arg_oid(operator.right)),
+                    Value::from_i64(crate::operators::arg_oid(operator.result)),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
                 ]
             })
             .collect()

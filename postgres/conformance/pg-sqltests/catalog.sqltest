@@ -351,8 +351,6 @@ expect {}
 @skip-if postgres "PostgreSQL fills these catalogs, and only a superuser can read pg_subscription"
 test pg-object-unsupported-catalogs-are-empty {
     SET search_path TO '';
-    SELECT tableoid FROM pg_operator;
-    SELECT tableoid FROM pg_catalog.pg_operator;
     SELECT tableoid FROM pg_opclass;
     SELECT tableoid FROM pg_catalog.pg_opclass;
     SELECT tableoid FROM pg_opfamily;
@@ -386,8 +384,6 @@ test pg-object-unsupported-catalogs-are-empty {
     SELECT tableoid FROM pg_amproc;
     SELECT tableoid FROM pg_catalog.pg_amproc;
 
-    SELECT tableoid, oid, oprname, oprnamespace, oprowner, oprkind, oprleft,
-           oprright, oprcode::oid AS oprcode FROM pg_operator;
     SELECT tableoid, oid, opcmethod, opcname, opcnamespace, opcowner FROM pg_opclass;
     SELECT tableoid, oid, opfmethod, opfname, opfnamespace, opfowner FROM pg_opfamily;
     SELECT tableoid, oid, prsname, prsnamespace, prsstart::oid, prstoken::oid,

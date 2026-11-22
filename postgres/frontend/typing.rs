@@ -64,25 +64,6 @@ fn is_custom(operand: &OperandType, names: &[&str]) -> bool {
     matches!(operand, OperandType::Custom(type_def) if names.contains(&type_def.name.as_str()))
 }
 
-/// PostgreSQL has no arithmetic or bitwise operator on a boolean, and no
-/// comparison of a text with a number. A string literal or a parameter is not
-/// a text: its type comes from the other operand.
-pub(crate) fn rejects_operator(op: &str, operands: &dyn Fn() -> Vec<OperandType>) -> bool {
-    let operands = operands();
-    if matches!(op, "=" | "<>" | "<" | "<=" | ">" | ">=") {
-        return match operands.as_slice() {
-            [left, right] => {
-                (is_text(left) && is_numeric_operand(right))
-                    || (is_numeric_operand(left) && is_text(right))
-            }
-            _ => false,
-        };
-    }
-    operands
-        .iter()
-        .any(|operand| matches!(operand, OperandType::Boolean))
-}
-
 /// PostgreSQL adds a double precision (or a real) and a numeric as doubles,
 /// because a numeric casts to double precision implicitly and not the other
 /// way.
@@ -108,25 +89,6 @@ pub(crate) fn concatenates_as_text(operands: &dyn Fn() -> Vec<OperandType>) -> b
     !operands()
         .iter()
         .any(|operand| matches!(operand, OperandType::Blob))
-}
-
-fn is_text(operand: &OperandType) -> bool {
-    match operand {
-        OperandType::Text => true,
-        OperandType::Custom(type_def) => type_def.name == "varchar",
-        _ => false,
-    }
-}
-
-fn is_numeric_operand(operand: &OperandType) -> bool {
-    match operand {
-        OperandType::Integer | OperandType::Real => true,
-        OperandType::Custom(type_def) => matches!(
-            type_def.name.as_str(),
-            "smallint" | "int4" | "bigint" | "float4" | "numeric"
-        ),
-        _ => false,
-    }
 }
 
 /// The type PostgreSQL gives values that meet in a CASE, coalesce or UNION,

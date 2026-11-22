@@ -703,12 +703,10 @@ pub trait Dialect: Send + Sync + 'static {
         None
     }
 
-    /// Whether the dialect has an operator `op` for operands of the given
-    /// types, which PostgreSQL has not for `boolean + integer` or `text =
-    /// integer`. `op` is an arithmetic or bit operator, or one of `= <> < <=
-    /// > >=`. With Reject the statement fails with "operator does not
-    /// exist". The default has every operator, as SQLite does: it adds a
-    /// comparison to a number.
+    /// How the dialect resolves the operator `op` for operands of the given
+    /// types. `op` is an arithmetic, bit or comparison operator, or `||`. The
+    /// default has every operator, as SQLite does: it adds a comparison to a
+    /// number.
     fn resolve_operator(
         &self,
         _op: &str,
