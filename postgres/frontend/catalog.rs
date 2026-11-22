@@ -503,9 +503,7 @@ impl Dialect for PostgresDialect {
         schema: &Schema,
     ) -> Result<Value> {
         let Value::Numeric(Numeric::Integer(pointer)) = value else {
-            unreachable!(
-                "pointer semantics contract enforces target register to contain an index to the operand register index for postgres integer casts"
-            );
+            return Ok(value.exec_cast("INTEGER")?); // SELECT '(1,2)'::point; is a compatibility gap
         };
 
         let operand = program.get_register(*pointer as usize).get_value();

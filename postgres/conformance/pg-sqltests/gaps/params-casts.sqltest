@@ -581,3 +581,15 @@ expect {
     1.01
     1.50
 }
+
+# Point input cast
+@compat-gap "type:point"
+test point-cast {
+    SELECT '(1,2)'::point;
+}
+expect {
+    (1,2)
+}
+expect @tursopg {
+    0
+}
