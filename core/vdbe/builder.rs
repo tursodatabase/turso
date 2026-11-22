@@ -1754,14 +1754,14 @@ impl ProgramBuilder {
         // where they are executed once after Init jumps to it.
 
         // Stable partition: non-constant instructions first, then constant.
+        // `extract_if` takes the constant instructions out and moves the other
+        // instructions back in the same buffer, so the instructions before the
+        // first constant one stay where they are, and no second buffer for
+        // the whole program is necessary.
         // Since spans are sorted and non-overlapping, we track our position
         // in the span list and never look back - O(n + m) total, where
         // n = number of instructions, m = number of constant spans.
-        // One more slot for the `Goto` that `epilogue` emits after the constant
-        // instructions. Without it, that push copies the whole program to a
-        // larger buffer.
         let len = self.insns.len();
-        let mut non_constant = Vec::with_capacity(len + 1);
         // The spans are inclusive, so their lengths add up to the number of
         // constant instructions. A `Vec` that starts empty copies all of its
         // instructions each time it doubles.
@@ -1772,28 +1772,21 @@ impl ProgramBuilder {
             .sum::<usize>()
             .min(len);
         let mut constant = Vec::with_capacity(num_constant);
+        let spans = &self.constant_spans;
         let mut span_idx = 0;
-
-        for item in self.insns.drain(..) {
-            let idx = item.1;
-
+        constant.extend(self.insns.extract_if(.., |&mut (_, idx)| {
             // Advance past spans we've completely passed
-            while span_idx < self.constant_spans.len() && self.constant_spans[span_idx].1 < idx {
+            while span_idx < spans.len() && spans[span_idx].1 < idx {
                 span_idx += 1;
             }
 
             // Check if current span contains this index
-            let is_constant =
-                span_idx < self.constant_spans.len() && self.constant_spans[span_idx].0 <= idx;
+            span_idx < spans.len() && spans[span_idx].0 <= idx
+        }));
 
-            if is_constant {
-                constant.push(item);
-            } else {
-                non_constant.push(item);
-            }
-        }
-
-        self.insns = non_constant;
+        // One more slot for the `Goto` that `epilogue` emits after the constant
+        // instructions. Without it, a full buffer doubles for that push.
+        self.insns.reserve_exact(constant.len() + 1);
         self.insns.extend(constant);
 
         // Build old index -> new position mapping
