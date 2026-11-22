@@ -174,7 +174,10 @@ pub enum CatalogCmd<'a> {
 }
 
 /// A new table. The statement has already emitted the creation of its
-/// B-tree and of the B-trees of its automatic indexes.
+/// B-tree and of the B-trees of its automatic indexes. `table` is the table
+/// that the statement creates, as the schema will hold it after loading it,
+/// with two differences: it has no root page yet, and its name still has the
+/// prefix of its namespace. Use `name` for the table's name.
 #[derive(Debug, Clone, Copy)]
 pub struct CreateTable<'a> {
     pub namespace: NamespaceId,
@@ -183,6 +186,7 @@ pub struct CreateTable<'a> {
     pub temporary: bool,
     pub if_not_exists: bool,
     pub body: &'a ast::CreateTableBody,
+    pub table: &'a BTreeTable,
     pub text: TableText<'a>,
     pub root_reg: usize,
     pub automatic_indexes: &'a [AutomaticIndex],
