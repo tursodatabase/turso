@@ -8,7 +8,7 @@ use std::{
 };
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{fmt::ToTokens, Cmd};
+use turso_parser::ast::{fmt::WriteSql, Cmd};
 
 use crate::alloc::TursoIteratorExt;
 use crate::{

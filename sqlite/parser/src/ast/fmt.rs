@@ -110,13 +110,13 @@ impl<'a> SqlWriter<'a> {
     pub fn comma<I, C: ToSqlContext>(&mut self, items: I, context: &C) -> fmt::Result
     where
         I: IntoIterator,
-        I::Item: ToTokens,
+        I::Item: WriteSql,
     {
         for (i, item) in items.into_iter().enumerate() {
             if i != 0 {
                 self.punct(",")?;
             }
-            item.to_tokens(self, context)?;
+            item.write_sql(self, context)?;
         }
         Ok(())
     }
@@ -126,30 +126,30 @@ pub struct BlankContext;
 
 impl ToSqlContext for BlankContext {}
 
-pub struct SqlDisplayer<'a, 'b, C: ToSqlContext, T: ToTokens> {
+pub struct SqlDisplayer<'a, 'b, C: ToSqlContext, T: WriteSql> {
     ctx: &'a C,
     start_node: &'b T,
 }
 
-impl<'a, 'b, C: ToSqlContext, T: ToTokens> SqlDisplayer<'a, 'b, C, T> {
+impl<'a, 'b, C: ToSqlContext, T: WriteSql> SqlDisplayer<'a, 'b, C, T> {
     /// Create a new displayer with the specified context and AST node
     pub fn new(ctx: &'a C, start_node: &'b T) -> Self {
         Self { ctx, start_node }
     }
 }
 
-impl<'a, 'b, C: ToSqlContext, T: ToTokens> Display for SqlDisplayer<'a, 'b, C, T> {
+impl<'a, 'b, C: ToSqlContext, T: WriteSql> Display for SqlDisplayer<'a, 'b, C, T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let mut stream = SqlWriter::new(f);
-        self.start_node.to_tokens(&mut stream, self.ctx)
+        let mut writer = SqlWriter::new(f);
+        self.start_node.write_sql(&mut writer, self.ctx)
     }
 }
 
-/// Generate token(s) from AST node
+/// An AST node that can be written as SQL text.
 /// Also implements Display to make sure devs won't forget Display
-pub trait ToTokens: Display {
-    /// Send token(s) to the specified stream with context
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result;
+pub trait WriteSql: Display {
+    /// Writes the node to `s`, with the names that `context` gives
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result;
 
     // Return displayer representation with context
     fn displayer<'a, 'b, C: ToSqlContext>(&'b self, ctx: &'a C) -> SqlDisplayer<'a, 'b, C, Self>
@@ -160,7 +160,7 @@ pub trait ToTokens: Display {
     }
 }
 
-macro_rules! impl_display_for_to_tokens {
+macro_rules! impl_display_for_write_sql {
     ($struct:ty) => {
         impl Display for $struct {
             fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -170,31 +170,31 @@ macro_rules! impl_display_for_to_tokens {
     };
 }
 
-impl<T: ?Sized + ToTokens> ToTokens for &T {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
-        ToTokens::to_tokens(&**self, s, context)
+impl<T: ?Sized + WriteSql> WriteSql for &T {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+        WriteSql::write_sql(&**self, s, context)
     }
 }
 
-impl<T: ?Sized + ToTokens> ToTokens for Box<T> {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
-        ToTokens::to_tokens(self.as_ref(), s, context)
+impl<T: ?Sized + WriteSql> WriteSql for Box<T> {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+        WriteSql::write_sql(self.as_ref(), s, context)
     }
 }
 
-impl ToTokens for String {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl WriteSql for String {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         s.text(self.as_ref())
     }
 }
 
-impl_display_for_to_tokens!(Cmd);
-impl ToTokens for Cmd {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(Cmd);
+impl WriteSql for Cmd {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::Explain(stmt) => {
                 s.keyword("EXPLAIN")?;
-                stmt.to_tokens(s, context)?;
+                stmt.write_sql(s, context)?;
             }
             Self::ExplainQueryPlan { stmt, format } => {
                 s.keyword("EXPLAIN")?;
@@ -205,52 +205,52 @@ impl ToTokens for Cmd {
                     s.punct("=")?;
                     s.text("JSON")?;
                 }
-                stmt.to_tokens(s, context)?;
+                stmt.write_sql(s, context)?;
             }
             Self::Stmt(stmt) => {
-                stmt.to_tokens(s, context)?;
+                stmt.write_sql(s, context)?;
             }
         }
         s.punct(";")
     }
 }
 
-impl_display_for_to_tokens!(Stmt);
-impl ToTokens for Stmt {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(Stmt);
+impl WriteSql for Stmt {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::AlterTable(AlterTable { name, body }) => {
                 s.keyword("ALTER")?;
                 s.keyword("TABLE")?;
-                name.to_tokens(s, context)?;
-                body.to_tokens(s, context)
+                name.write_sql(s, context)?;
+                body.write_sql(s, context)
             }
             Self::Analyze { name } => {
                 s.keyword("ANALYZE")?;
                 if let Some(name) = name {
-                    name.to_tokens(s, context)?;
+                    name.write_sql(s, context)?;
                 }
                 Ok(())
             }
             Self::Attach { expr, db_name, key } => {
                 s.keyword("ATTACH")?;
-                expr.to_tokens(s, context)?;
+                expr.write_sql(s, context)?;
                 s.keyword("AS")?;
-                db_name.to_tokens(s, context)?;
+                db_name.write_sql(s, context)?;
                 if let Some(key) = key {
                     s.keyword("KEY")?;
-                    key.to_tokens(s, context)?;
+                    key.write_sql(s, context)?;
                 }
                 Ok(())
             }
             Self::Begin { typ, name, .. } => {
                 s.keyword("BEGIN")?;
                 if let Some(typ) = typ {
-                    typ.to_tokens(s, context)?;
+                    typ.write_sql(s, context)?;
                 }
                 if let Some(name) = name {
                     s.keyword("TRANSACTION")?;
-                    name.to_tokens(s, context)?;
+                    name.write_sql(s, context)?;
                 }
                 Ok(())
             }
@@ -258,7 +258,7 @@ impl ToTokens for Stmt {
                 s.keyword("COMMIT")?;
                 if let Some(name) = name {
                     s.keyword("TRANSACTION")?;
-                    name.to_tokens(s, context)?;
+                    name.write_sql(s, context)?;
                 }
                 Ok(())
             }
@@ -282,12 +282,12 @@ impl ToTokens for Stmt {
                     s.keyword("NOT")?;
                     s.keyword("EXISTS")?;
                 }
-                idx_name.to_tokens(s, context)?;
+                idx_name.write_sql(s, context)?;
                 s.keyword("ON")?;
-                tbl_name.to_tokens(s, context)?;
+                tbl_name.write_sql(s, context)?;
                 if let Some(using) = using {
                     s.keyword("USING")?;
-                    using.to_tokens(s, context)?;
+                    using.write_sql(s, context)?;
                 }
                 s.punct("(")?;
                 comma(columns, s, context)?;
@@ -301,15 +301,15 @@ impl ToTokens for Stmt {
                             s.punct(",")?;
                         }
                         first = false;
-                        name.to_tokens(s, context)?;
+                        name.write_sql(s, context)?;
                         s.punct("=")?;
-                        value.to_tokens(s, context)?;
+                        value.write_sql(s, context)?;
                     }
                     s.punct(")")?;
                 }
                 if let Some(where_clause) = where_clause {
                     s.keyword("WHERE")?;
-                    where_clause.to_tokens(s, context)?;
+                    where_clause.write_sql(s, context)?;
                 }
                 Ok(())
             }
@@ -329,8 +329,8 @@ impl ToTokens for Stmt {
                     s.keyword("NOT")?;
                     s.keyword("EXISTS")?;
                 }
-                tbl_name.to_tokens(s, context)?;
-                body.to_tokens(s, context)
+                tbl_name.write_sql(s, context)?;
+                body.write_sql(s, context)
             }
             Self::CreateTrigger {
                 temporary,
@@ -353,13 +353,13 @@ impl ToTokens for Stmt {
                     s.keyword("NOT")?;
                     s.keyword("EXISTS")?;
                 }
-                trigger_name.to_tokens(s, context)?;
+                trigger_name.write_sql(s, context)?;
                 if let Some(time) = time {
-                    time.to_tokens(s, context)?;
+                    time.write_sql(s, context)?;
                 }
-                event.to_tokens(s, context)?;
+                event.write_sql(s, context)?;
                 s.keyword("ON")?;
-                tbl_name.to_tokens(s, context)?;
+                tbl_name.write_sql(s, context)?;
                 if *for_each_row {
                     s.keyword("FOR")?;
                     s.keyword("EACH")?;
@@ -367,12 +367,12 @@ impl ToTokens for Stmt {
                 }
                 if let Some(when_clause) = when_clause {
                     s.keyword("WHEN")?;
-                    when_clause.to_tokens(s, context)?;
+                    when_clause.write_sql(s, context)?;
                 }
                 s.keyword("BEGIN")?;
                 s.newline()?;
                 for command in commands {
-                    command.to_tokens(s, context)?;
+                    command.write_sql(s, context)?;
                     s.punct(";")?;
                     s.newline()?;
                 }
@@ -395,14 +395,14 @@ impl ToTokens for Stmt {
                     s.keyword("NOT")?;
                     s.keyword("EXISTS")?;
                 }
-                view_name.to_tokens(s, context)?;
+                view_name.write_sql(s, context)?;
                 if !columns.is_empty() {
                     s.punct("(")?;
                     comma(columns, s, context)?;
                     s.punct(")")?;
                 }
                 s.keyword("AS")?;
-                select.to_tokens(s, context)
+                select.write_sql(s, context)
             }
             Self::CreateMaterializedView {
                 if_not_exists,
@@ -418,14 +418,14 @@ impl ToTokens for Stmt {
                     s.keyword("NOT")?;
                     s.keyword("EXISTS")?;
                 }
-                view_name.to_tokens(s, context)?;
+                view_name.write_sql(s, context)?;
                 if !columns.is_empty() {
                     s.punct("(")?;
                     comma(columns, s, context)?;
                     s.punct(")")?;
                 }
                 s.keyword("AS")?;
-                select.to_tokens(s, context)
+                select.write_sql(s, context)
             }
             Self::CreateVirtualTable(CreateVirtualTable {
                 if_not_exists,
@@ -441,9 +441,9 @@ impl ToTokens for Stmt {
                     s.keyword("NOT")?;
                     s.keyword("EXISTS")?;
                 }
-                tbl_name.to_tokens(s, context)?;
+                tbl_name.write_sql(s, context)?;
                 s.keyword("USING")?;
-                module_name.to_tokens(s, context)?;
+                module_name.write_sql(s, context)?;
                 s.punct("(")?;
                 if !args.is_empty() {
                     comma(args, s, context)?;
@@ -461,17 +461,17 @@ impl ToTokens for Stmt {
                 truncate: _,
             } => {
                 if let Some(with) = with {
-                    with.to_tokens(s, context)?;
+                    with.write_sql(s, context)?;
                 }
                 s.keyword("DELETE")?;
                 s.keyword("FROM")?;
-                tbl_name.to_tokens(s, context)?;
+                tbl_name.write_sql(s, context)?;
                 if let Some(indexed) = indexed {
-                    indexed.to_tokens(s, context)?;
+                    indexed.write_sql(s, context)?;
                 }
                 if let Some(where_clause) = where_clause {
                     s.keyword("WHERE")?;
-                    where_clause.to_tokens(s, context)?;
+                    where_clause.write_sql(s, context)?;
                 }
                 if !returning.is_empty() {
                     s.keyword("RETURNING")?;
@@ -481,7 +481,7 @@ impl ToTokens for Stmt {
             }
             Self::Detach { name } => {
                 s.keyword("DETACH")?;
-                name.to_tokens(s, context)
+                name.write_sql(s, context)
             }
             Self::DropIndex {
                 if_exists,
@@ -493,7 +493,7 @@ impl ToTokens for Stmt {
                     s.keyword("IF")?;
                     s.keyword("EXISTS")?;
                 }
-                idx_name.to_tokens(s, context)
+                idx_name.write_sql(s, context)
             }
             Self::DropTable {
                 if_exists,
@@ -505,7 +505,7 @@ impl ToTokens for Stmt {
                     s.keyword("IF")?;
                     s.keyword("EXISTS")?;
                 }
-                tbl_name.to_tokens(s, context)
+                tbl_name.write_sql(s, context)
             }
             Self::DropTrigger {
                 if_exists,
@@ -517,7 +517,7 @@ impl ToTokens for Stmt {
                     s.keyword("IF")?;
                     s.keyword("EXISTS")?;
                 }
-                trigger_name.to_tokens(s, context)
+                trigger_name.write_sql(s, context)
             }
             Self::DropView {
                 if_exists,
@@ -529,7 +529,7 @@ impl ToTokens for Stmt {
                     s.keyword("IF")?;
                     s.keyword("EXISTS")?;
                 }
-                view_name.to_tokens(s, context)
+                view_name.write_sql(s, context)
             }
             Self::Insert {
                 with,
@@ -541,7 +541,7 @@ impl ToTokens for Stmt {
                 ..
             } => {
                 if let Some(with) = with {
-                    with.to_tokens(s, context)?;
+                    with.write_sql(s, context)?;
                 }
                 if let Some(ResolveType::Replace) = or_conflict {
                     s.keyword("REPLACE")?;
@@ -549,17 +549,17 @@ impl ToTokens for Stmt {
                     s.keyword("INSERT")?;
                     if let Some(or_conflict) = or_conflict {
                         s.keyword("OR")?;
-                        or_conflict.to_tokens(s, context)?;
+                        or_conflict.write_sql(s, context)?;
                     }
                 }
                 s.keyword("INTO")?;
-                tbl_name.to_tokens(s, context)?;
+                tbl_name.write_sql(s, context)?;
                 if !columns.is_empty() {
                     s.punct("(")?;
                     comma(columns, s, context)?;
                     s.punct(")")?;
                 }
-                body.to_tokens(s, context)?;
+                body.write_sql(s, context)?;
                 if !returning.is_empty() {
                     s.keyword("RETURNING")?;
                     comma(returning, s, context)?;
@@ -568,16 +568,16 @@ impl ToTokens for Stmt {
             }
             Self::Pragma { name, body } => {
                 s.keyword("PRAGMA")?;
-                name.to_tokens(s, context)?;
+                name.write_sql(s, context)?;
                 if let Some(body) = body {
-                    body.to_tokens(s, context)?;
+                    body.write_sql(s, context)?;
                 }
                 Ok(())
             }
             Self::Reindex { name } => {
                 s.keyword("REINDEX")?;
                 if let Some(name) = name {
-                    name.to_tokens(s, context)?;
+                    name.write_sql(s, context)?;
                 }
                 Ok(())
             }
@@ -585,13 +585,13 @@ impl ToTokens for Stmt {
                 s.keyword("OPTIMIZE")?;
                 s.keyword("INDEX")?;
                 if let Some(name) = idx_name {
-                    name.to_tokens(s, context)?;
+                    name.write_sql(s, context)?;
                 }
                 Ok(())
             }
             Self::Release { name } => {
                 s.keyword("RELEASE")?;
-                name.to_tokens(s, context)
+                name.write_sql(s, context)
             }
             Self::Rollback {
                 tx_name,
@@ -600,19 +600,19 @@ impl ToTokens for Stmt {
                 s.keyword("ROLLBACK")?;
                 if let Some(tx_name) = tx_name {
                     s.keyword("TRANSACTION")?;
-                    tx_name.to_tokens(s, context)?;
+                    tx_name.write_sql(s, context)?;
                 }
                 if let Some(savepoint_name) = savepoint_name {
                     s.keyword("TO")?;
-                    savepoint_name.to_tokens(s, context)?;
+                    savepoint_name.write_sql(s, context)?;
                 }
                 Ok(())
             }
             Self::Savepoint { name } => {
                 s.keyword("SAVEPOINT")?;
-                name.to_tokens(s, context)
+                name.write_sql(s, context)
             }
-            Self::Select(select) => select.to_tokens(s, context),
+            Self::Select(select) => select.write_sql(s, context),
             Self::Update(Update {
                 with,
                 or_conflict,
@@ -624,26 +624,26 @@ impl ToTokens for Stmt {
                 returning,
             }) => {
                 if let Some(with) = with {
-                    with.to_tokens(s, context)?;
+                    with.write_sql(s, context)?;
                 }
                 s.keyword("UPDATE")?;
                 if let Some(or_conflict) = or_conflict {
                     s.keyword("OR")?;
-                    or_conflict.to_tokens(s, context)?;
+                    or_conflict.write_sql(s, context)?;
                 }
-                tbl_name.to_tokens(s, context)?;
+                tbl_name.write_sql(s, context)?;
                 if let Some(indexed) = indexed {
-                    indexed.to_tokens(s, context)?;
+                    indexed.write_sql(s, context)?;
                 }
                 s.keyword("SET")?;
                 comma(sets, s, context)?;
                 if let Some(from) = from {
                     s.keyword("FROM")?;
-                    from.to_tokens(s, context)?;
+                    from.write_sql(s, context)?;
                 }
                 if let Some(where_clause) = where_clause {
                     s.keyword("WHERE")?;
-                    where_clause.to_tokens(s, context)?;
+                    where_clause.write_sql(s, context)?;
                 }
                 if !returning.is_empty() {
                     s.keyword("RETURNING")?;
@@ -654,11 +654,11 @@ impl ToTokens for Stmt {
             Self::Vacuum { name, into } => {
                 s.keyword("VACUUM")?;
                 if let Some(ref name) = name {
-                    name.to_tokens(s, context)?;
+                    name.write_sql(s, context)?;
                 }
                 if let Some(ref into) = into {
                     s.keyword("INTO")?;
-                    into.to_tokens(s, context)?;
+                    into.write_sql(s, context)?;
                 }
                 Ok(())
             }
@@ -683,7 +683,7 @@ impl ToTokens for Stmt {
                 }
                 s.comma(roles, context)
             }
-            Self::Grant(grant) => grant.to_tokens(s, context),
+            Self::Grant(grant) => grant.write_sql(s, context),
             Self::CreateType {
                 if_not_exists,
                 type_name,
@@ -701,12 +701,12 @@ impl ToTokens for Stmt {
                     CreateTypeBody::Struct(fields) => {
                         s.keyword("AS")?;
                         s.text("STRUCT")?;
-                        type_fields_to_tokens(fields, s, context)?;
+                        write_type_fields(fields, s, context)?;
                     }
                     CreateTypeBody::Union(fields) => {
                         s.keyword("AS")?;
                         s.text("UNION")?;
-                        type_fields_to_tokens(fields, s, context)?;
+                        write_type_fields(fields, s, context)?;
                     }
                     CreateTypeBody::CustomType {
                         params,
@@ -737,22 +737,22 @@ impl ToTokens for Stmt {
                         // ENCODE
                         if let Some(ref encode) = encode {
                             s.text("ENCODE")?;
-                            encode.to_tokens(s, context)?;
+                            encode.write_sql(s, context)?;
                         }
                         // COERCE
                         if let Some(ref coerce) = coerce {
                             s.text("COERCE")?;
-                            coerce.to_tokens(s, context)?;
+                            coerce.write_sql(s, context)?;
                         }
                         // DECODE
                         if let Some(ref decode) = decode {
                             s.text("DECODE")?;
-                            decode.to_tokens(s, context)?;
+                            decode.write_sql(s, context)?;
                         }
                         // DEFAULT
                         if let Some(ref default) = default {
                             s.text("DEFAULT")?;
-                            default.to_tokens(s, context)?;
+                            default.write_sql(s, context)?;
                         }
                         // OPERATOR clauses
                         for op in operators {
@@ -786,7 +786,7 @@ impl ToTokens for Stmt {
                 s.text(base_type)?;
                 if let Some(ref def) = default {
                     s.keyword("DEFAULT")?;
-                    def.to_tokens(s, context)?;
+                    def.write_sql(s, context)?;
                 }
                 if *not_null {
                     s.keyword("NOT")?;
@@ -799,7 +799,7 @@ impl ToTokens for Stmt {
                     }
                     s.keyword("CHECK")?;
                     s.punct("(")?;
-                    c.check.to_tokens(s, context)?;
+                    c.check.write_sql(s, context)?;
                     s.punct(")")?;
                 }
                 Ok(())
@@ -833,7 +833,7 @@ impl ToTokens for Stmt {
                     s.keyword("NOT")?;
                     s.keyword("EXISTS")?;
                 }
-                seq_name.to_tokens(s, context)?;
+                seq_name.write_sql(s, context)?;
                 if let Some(v) = start {
                     s.text("START")?;
                     s.text("WITH")?;
@@ -867,20 +867,20 @@ impl ToTokens for Stmt {
                     s.keyword("IF")?;
                     s.keyword("EXISTS")?;
                 }
-                seq_name.to_tokens(s, context)?;
+                seq_name.write_sql(s, context)?;
                 Ok(())
             }
             Self::AlterSequenceOwnedBy { seq_name, owner } => {
                 s.keyword("ALTER")?;
                 s.text("SEQUENCE")?;
-                seq_name.to_tokens(s, context)?;
+                seq_name.write_sql(s, context)?;
                 s.text("OWNED")?;
                 s.keyword("BY")?;
                 match owner {
                     Some((table, column)) => {
-                        table.to_tokens(s, context)?;
+                        table.write_sql(s, context)?;
                         s.punct(".")?;
-                        column.to_tokens(s, context)
+                        column.write_sql(s, context)
                     }
                     None => s.text("NONE"),
                 }
@@ -888,16 +888,16 @@ impl ToTokens for Stmt {
             Self::CreateSchema { name } => {
                 s.keyword("CREATE")?;
                 s.text("SCHEMA")?;
-                name.to_tokens(s, context)?;
+                name.write_sql(s, context)?;
                 Ok(())
             }
             Self::DropSchema { name } => {
                 s.keyword("DROP")?;
                 s.text("SCHEMA")?;
-                name.to_tokens(s, context)?;
+                name.write_sql(s, context)?;
                 Ok(())
             }
-            Self::CreatePolicy(policy) => policy.to_tokens(s, context),
+            Self::CreatePolicy(policy) => policy.write_sql(s, context),
             Self::DropPolicy {
                 if_exists,
                 policy_name,
@@ -909,9 +909,9 @@ impl ToTokens for Stmt {
                     s.keyword("IF")?;
                     s.keyword("EXISTS")?;
                 }
-                policy_name.to_tokens(s, context)?;
+                policy_name.write_sql(s, context)?;
                 s.keyword("ON")?;
-                tbl_name.to_tokens(s, context)
+                tbl_name.write_sql(s, context)
             }
             Self::DropDomain {
                 if_exists,
@@ -930,9 +930,9 @@ impl ToTokens for Stmt {
     }
 }
 
-impl_display_for_to_tokens!(Expr);
-impl ToTokens for Expr {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(Expr);
+impl WriteSql for Expr {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::SubqueryResult { .. } => {
                 // FIXME: what to put here? This is a highly "artificial" AST node that has no meaning when stringified.
@@ -944,19 +944,19 @@ impl ToTokens for Expr {
                 start,
                 end,
             } => {
-                lhs.to_tokens(s, context)?;
+                lhs.write_sql(s, context)?;
                 if *not {
                     s.keyword("NOT")?;
                 }
                 s.keyword("BETWEEN")?;
-                start.to_tokens(s, context)?;
+                start.write_sql(s, context)?;
                 s.keyword("AND")?;
-                end.to_tokens(s, context)
+                end.write_sql(s, context)
             }
             Self::Binary(lhs, op, rhs) => {
-                lhs.to_tokens(s, context)?;
-                op.to_tokens(s, context)?;
-                rhs.to_tokens(s, context)
+                lhs.write_sql(s, context)?;
+                op.write_sql(s, context)?;
+                rhs.write_sql(s, context)
             }
             Self::Register { register: reg, .. } => {
                 // This is for internal use only, not part of SQL syntax
@@ -970,46 +970,46 @@ impl ToTokens for Expr {
             } => {
                 s.keyword("CASE")?;
                 if let Some(ref base) = base {
-                    base.to_tokens(s, context)?;
+                    base.write_sql(s, context)?;
                 }
                 for (when, then) in when_then_pairs {
                     s.keyword("WHEN")?;
-                    when.to_tokens(s, context)?;
+                    when.write_sql(s, context)?;
                     s.keyword("THEN")?;
-                    then.to_tokens(s, context)?;
+                    then.write_sql(s, context)?;
                 }
                 if let Some(ref else_expr) = else_expr {
                     s.keyword("ELSE")?;
-                    else_expr.to_tokens(s, context)?;
+                    else_expr.write_sql(s, context)?;
                 }
                 s.keyword("END")
             }
             Self::Cast { expr, type_name } => {
                 s.keyword("CAST")?;
                 s.punct("(")?;
-                expr.to_tokens(s, context)?;
+                expr.write_sql(s, context)?;
                 s.keyword("AS")?;
                 if let Some(ref type_name) = type_name {
-                    type_name.to_tokens(s, context)?;
+                    type_name.write_sql(s, context)?;
                 }
                 s.punct(")")
             }
             Self::Collate(expr, collation) => {
-                expr.to_tokens(s, context)?;
+                expr.write_sql(s, context)?;
                 s.keyword("COLLATE")?;
                 s.text(&collation.as_ident())
             }
             Self::DoublyQualified(db_name, tbl_name, col_name) => {
-                db_name.to_tokens(s, context)?;
+                db_name.write_sql(s, context)?;
                 s.punct(".")?;
-                tbl_name.to_tokens(s, context)?;
+                tbl_name.write_sql(s, context)?;
                 s.punct(".")?;
-                col_name.to_tokens(s, context)
+                col_name.write_sql(s, context)
             }
             Self::Exists(subquery) => {
                 s.keyword("EXISTS")?;
                 s.punct("(")?;
-                subquery.to_tokens(s, context)?;
+                subquery.write_sql(s, context)?;
                 s.punct(")")
             }
             Self::FunctionCall {
@@ -1020,10 +1020,10 @@ impl ToTokens for Expr {
                 within_group,
                 filter_over,
             } => {
-                name.to_tokens(s, context)?;
+                name.write_sql(s, context)?;
                 s.punct("(")?;
                 if let Some(distinctness) = distinctness {
-                    distinctness.to_tokens(s, context)?;
+                    distinctness.write_sql(s, context)?;
                 }
                 if !args.is_empty() {
                     comma(args, s, context)?;
@@ -1043,15 +1043,15 @@ impl ToTokens for Expr {
                     comma(within_group, s, context)?;
                     s.punct(")")?;
                 }
-                filter_over.to_tokens(s, context)?;
+                filter_over.write_sql(s, context)?;
                 Ok(())
             }
             Self::FunctionCallStar { name, filter_over } => {
-                name.to_tokens(s, context)?;
+                name.write_sql(s, context)?;
                 s.punct("(")?;
                 s.punct("*")?;
                 s.punct(")")?;
-                filter_over.to_tokens(s, context)?;
+                filter_over.write_sql(s, context)?;
                 Ok(())
             }
             Self::MergedColumn(columns) => {
@@ -1061,7 +1061,7 @@ impl ToTokens for Expr {
                 comma(columns, s, context)?;
                 s.punct(")")
             }
-            Self::Id(id) => id.to_tokens(s, context),
+            Self::Id(id) => id.write_sql(s, context),
             Self::Column { table, column, .. } => {
                 let (tbl_name, col_name) = context.get_table_and_column_names(*table, *column);
                 s.text(tbl_name.as_ref())?;
@@ -1069,7 +1069,7 @@ impl ToTokens for Expr {
                 s.text(col_name.as_ref())
             }
             Self::InList { lhs, not, rhs } => {
-                lhs.to_tokens(s, context)?;
+                lhs.write_sql(s, context)?;
                 if *not {
                     s.keyword("NOT")?;
                 }
@@ -1081,13 +1081,13 @@ impl ToTokens for Expr {
                 s.punct(")")
             }
             Self::InSelect { lhs, not, rhs } => {
-                lhs.to_tokens(s, context)?;
+                lhs.write_sql(s, context)?;
                 if *not {
                     s.keyword("NOT")?;
                 }
                 s.keyword("IN")?;
                 s.punct("(")?;
-                rhs.to_tokens(s, context)?;
+                rhs.write_sql(s, context)?;
                 s.punct(")")
             }
             Self::InTable {
@@ -1096,12 +1096,12 @@ impl ToTokens for Expr {
                 rhs,
                 args,
             } => {
-                lhs.to_tokens(s, context)?;
+                lhs.write_sql(s, context)?;
                 if *not {
                     s.keyword("NOT")?;
                 }
                 s.keyword("IN")?;
-                rhs.to_tokens(s, context)?;
+                rhs.write_sql(s, context)?;
                 if !args.is_empty() {
                     s.punct("(")?;
                     comma(args, s, context)?;
@@ -1110,7 +1110,7 @@ impl ToTokens for Expr {
                 Ok(())
             }
             Self::IsNull(sub_expr) => {
-                sub_expr.to_tokens(s, context)?;
+                sub_expr.write_sql(s, context)?;
                 s.keyword("ISNULL")
             }
             Self::Like {
@@ -1120,22 +1120,22 @@ impl ToTokens for Expr {
                 rhs,
                 escape,
             } => {
-                lhs.to_tokens(s, context)?;
+                lhs.write_sql(s, context)?;
                 if *not {
                     s.keyword("NOT")?;
                 }
-                op.to_tokens(s, context)?;
-                rhs.to_tokens(s, context)?;
+                op.write_sql(s, context)?;
+                rhs.write_sql(s, context)?;
                 if let Some(escape) = escape {
                     s.keyword("ESCAPE")?;
-                    escape.to_tokens(s, context)?;
+                    escape.write_sql(s, context)?;
                 }
                 Ok(())
             }
-            Self::Literal(lit) => lit.to_tokens(s, context),
-            Self::Name(name) => name.to_tokens(s, context),
+            Self::Literal(lit) => lit.write_sql(s, context),
+            Self::Name(name) => name.write_sql(s, context),
             Self::NotNull(sub_expr) => {
-                sub_expr.to_tokens(s, context)?;
+                sub_expr.write_sql(s, context)?;
                 s.keyword("NOTNULL")
             }
             Self::Parenthesized(exprs) => {
@@ -1144,34 +1144,34 @@ impl ToTokens for Expr {
                 s.punct(")")
             }
             Self::Qualified(qualifier, qualified) => {
-                qualifier.to_tokens(s, context)?;
+                qualifier.write_sql(s, context)?;
                 s.punct(".")?;
-                qualified.to_tokens(s, context)
+                qualified.write_sql(s, context)
             }
             Self::FieldAccess { base, field, .. } => {
-                base.to_tokens(s, context)?;
+                base.write_sql(s, context)?;
                 s.punct(".")?;
-                field.to_tokens(s, context)
+                field.write_sql(s, context)
             }
             Self::Raise(rt, err) => {
                 s.keyword("RAISE")?;
                 s.punct("(")?;
-                rt.to_tokens(s, context)?;
+                rt.write_sql(s, context)?;
                 if let Some(err) = err {
                     s.punct(",")?;
-                    err.to_tokens(s, context)?;
+                    err.write_sql(s, context)?;
                 }
                 s.punct(")")
             }
             Self::RowId { .. } => Ok(()),
             Self::Subquery(query) => {
                 s.punct("(")?;
-                query.to_tokens(s, context)?;
+                query.write_sql(s, context)?;
                 s.punct(")")
             }
             Self::Unary(op, sub_expr) => {
-                op.to_tokens(s, context)?;
-                sub_expr.to_tokens(s, context)
+                op.write_sql(s, context)?;
+                sub_expr.write_sql(s, context)
             }
             Self::Variable(var) => {
                 if let Some(name) = var.name.as_deref() {
@@ -1189,18 +1189,18 @@ impl ToTokens for Expr {
                 s.punct("]")
             }
             Self::Subscript { base, index } => {
-                base.to_tokens(s, context)?;
+                base.write_sql(s, context)?;
                 s.punct("[")?;
-                index.to_tokens(s, context)?;
+                index.write_sql(s, context)?;
                 s.punct("]")
             }
         }
     }
 }
 
-impl_display_for_to_tokens!(Literal);
-impl ToTokens for Literal {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl_display_for_write_sql!(Literal);
+impl WriteSql for Literal {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         match self {
             Self::Numeric(ref num) => s.text(num), // TODO validate that this is a number
             Self::String(ref str) => s.text(str),
@@ -1216,9 +1216,9 @@ impl ToTokens for Literal {
     }
 }
 
-impl_display_for_to_tokens!(LikeOperator);
-impl ToTokens for LikeOperator {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl_display_for_write_sql!(LikeOperator);
+impl WriteSql for LikeOperator {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         s.text(match self {
             Self::Glob => "GLOB",
             Self::Like => "LIKE",
@@ -1228,9 +1228,9 @@ impl ToTokens for LikeOperator {
     }
 }
 
-impl_display_for_to_tokens!(Operator);
-impl ToTokens for Operator {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl_display_for_write_sql!(Operator);
+impl WriteSql for Operator {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         match self {
             Self::Add => s.punct("+"),
             Self::And => s.keyword("AND"),
@@ -1264,9 +1264,9 @@ impl ToTokens for Operator {
     }
 }
 
-impl_display_for_to_tokens!(UnaryOperator);
-impl ToTokens for UnaryOperator {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl_display_for_write_sql!(UnaryOperator);
+impl WriteSql for UnaryOperator {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         match self {
             Self::BitwiseNot => s.punct("~"),
             Self::Negative => s.punct("-"),
@@ -1276,47 +1276,47 @@ impl ToTokens for UnaryOperator {
     }
 }
 
-impl_display_for_to_tokens!(Select);
-impl ToTokens for Select {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(Select);
+impl WriteSql for Select {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         if let Some(ref with) = self.with {
-            with.to_tokens(s, context)?;
+            with.write_sql(s, context)?;
         }
-        self.body.to_tokens(s, context)?;
+        self.body.write_sql(s, context)?;
         if !self.order_by.is_empty() {
             s.keyword("ORDER")?;
             s.keyword("BY")?;
             comma(&self.order_by, s, context)?;
         }
         if let Some(ref limit) = self.limit {
-            limit.to_tokens(s, context)?;
+            limit.write_sql(s, context)?;
         }
         Ok(())
     }
 }
 
-impl_display_for_to_tokens!(SelectBody);
-impl ToTokens for SelectBody {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
-        self.select.to_tokens(s, context)?;
+impl_display_for_write_sql!(SelectBody);
+impl WriteSql for SelectBody {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+        self.select.write_sql(s, context)?;
         for compound in &self.compounds {
-            compound.to_tokens(s, context)?;
+            compound.write_sql(s, context)?;
         }
         Ok(())
     }
 }
 
-impl_display_for_to_tokens!(CompoundSelect);
-impl ToTokens for CompoundSelect {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
-        self.operator.to_tokens(s, context)?;
-        self.select.to_tokens(s, context)
+impl_display_for_write_sql!(CompoundSelect);
+impl WriteSql for CompoundSelect {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+        self.operator.write_sql(s, context)?;
+        self.select.write_sql(s, context)
     }
 }
 
-impl_display_for_to_tokens!(CompoundOperator);
-impl ToTokens for CompoundOperator {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl_display_for_write_sql!(CompoundOperator);
+impl WriteSql for CompoundOperator {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         match self {
             Self::Union => s.keyword("UNION"),
             Self::UnionAll => {
@@ -1329,9 +1329,9 @@ impl ToTokens for CompoundOperator {
     }
 }
 
-impl_display_for_to_tokens!(OneSelect);
-impl ToTokens for OneSelect {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(OneSelect);
+impl WriteSql for OneSelect {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::Select {
                 distinctness,
@@ -1343,19 +1343,19 @@ impl ToTokens for OneSelect {
             } => {
                 s.keyword("SELECT")?;
                 if let Some(ref distinctness) = distinctness {
-                    distinctness.to_tokens(s, context)?;
+                    distinctness.write_sql(s, context)?;
                 }
                 comma(columns, s, context)?;
                 if let Some(ref from) = from {
                     s.keyword("FROM")?;
-                    from.to_tokens(s, context)?;
+                    from.write_sql(s, context)?;
                 }
                 if let Some(ref where_clause) = where_clause {
                     s.keyword("WHERE")?;
-                    where_clause.to_tokens(s, context)?;
+                    where_clause.write_sql(s, context)?;
                 }
                 if let Some(ref group_by) = group_by {
-                    group_by.to_tokens(s, context)?;
+                    group_by.write_sql(s, context)?;
                 }
                 if !window_clause.is_empty() {
                     s.keyword("WINDOW")?;
@@ -1380,21 +1380,21 @@ impl ToTokens for OneSelect {
     }
 }
 
-impl_display_for_to_tokens!(FromClause);
-impl ToTokens for FromClause {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
-        self.select.as_ref().to_tokens(s, context)?;
+impl_display_for_write_sql!(FromClause);
+impl WriteSql for FromClause {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+        self.select.as_ref().write_sql(s, context)?;
         for join in &self.joins {
-            join.to_tokens(s, context)?;
+            join.write_sql(s, context)?;
         }
 
         Ok(())
     }
 }
 
-impl_display_for_to_tokens!(SelectDistinctness);
-impl ToTokens for SelectDistinctness {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(SelectDistinctness);
+impl WriteSql for SelectDistinctness {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::Distinct => s.keyword("DISTINCT"),
             Self::All => s.keyword("ALL"),
@@ -1409,9 +1409,9 @@ impl ToTokens for SelectDistinctness {
     }
 }
 
-impl_display_for_to_tokens!(Distinctness);
-impl ToTokens for Distinctness {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl_display_for_write_sql!(Distinctness);
+impl WriteSql for Distinctness {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         match self {
             Self::Distinct => s.keyword("DISTINCT"),
             Self::All => s.keyword("ALL"),
@@ -1419,20 +1419,20 @@ impl ToTokens for Distinctness {
     }
 }
 
-impl_display_for_to_tokens!(ResultColumn);
-impl ToTokens for ResultColumn {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(ResultColumn);
+impl WriteSql for ResultColumn {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::Expr(expr, alias) => {
-                expr.to_tokens(s, context)?;
+                expr.write_sql(s, context)?;
                 if let Some(alias) = alias {
-                    alias.to_tokens(s, context)?;
+                    alias.write_sql(s, context)?;
                 }
                 Ok(())
             }
             Self::Star => s.punct("*"),
             Self::TableStar(tbl_name) => {
-                tbl_name.to_tokens(s, context)?;
+                tbl_name.write_sql(s, context)?;
                 s.punct(".")?;
                 s.punct("*")
             }
@@ -1440,53 +1440,53 @@ impl ToTokens for ResultColumn {
     }
 }
 
-impl_display_for_to_tokens!(As);
-impl ToTokens for As {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(As);
+impl WriteSql for As {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::As(ref name) => {
                 s.keyword("AS")?;
-                name.to_tokens(s, context)
+                name.write_sql(s, context)
             }
-            Self::Elided(ref name) => name.to_tokens(s, context),
+            Self::Elided(ref name) => name.write_sql(s, context),
             Self::ImplicitColumnName(_) => Ok(()),
         }
     }
 }
 
-impl_display_for_to_tokens!(JoinedSelectTable);
-impl ToTokens for JoinedSelectTable {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
-        self.operator.to_tokens(s, context)?;
-        self.table.to_tokens(s, context)?;
+impl_display_for_write_sql!(JoinedSelectTable);
+impl WriteSql for JoinedSelectTable {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+        self.operator.write_sql(s, context)?;
+        self.table.write_sql(s, context)?;
         if let Some(ref constraint) = self.constraint {
-            constraint.to_tokens(s, context)?;
+            constraint.write_sql(s, context)?;
         }
         Ok(())
     }
 }
 
-impl_display_for_to_tokens!(SelectTable);
-impl ToTokens for SelectTable {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(SelectTable);
+impl WriteSql for SelectTable {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::Table(name, alias, indexed) => {
-                name.to_tokens(s, context)?;
+                name.write_sql(s, context)?;
                 if let Some(alias) = alias {
-                    alias.to_tokens(s, context)?;
+                    alias.write_sql(s, context)?;
                 }
                 if let Some(indexed) = indexed {
-                    indexed.to_tokens(s, context)?;
+                    indexed.write_sql(s, context)?;
                 }
                 Ok(())
             }
             Self::TableCall(name, exprs, alias) => {
-                name.to_tokens(s, context)?;
+                name.write_sql(s, context)?;
                 s.punct("(")?;
                 comma(exprs, s, context)?;
                 s.punct(")")?;
                 if let Some(alias) = alias {
-                    alias.to_tokens(s, context)?;
+                    alias.write_sql(s, context)?;
                 }
                 Ok(())
             }
@@ -1499,19 +1499,19 @@ impl ToTokens for SelectTable {
                     s.keyword("LATERAL")?;
                 }
                 s.punct("(")?;
-                select.to_tokens(s, context)?;
+                select.write_sql(s, context)?;
                 s.punct(")")?;
                 if let Some(alias) = alias {
-                    alias.to_tokens(s, context)?;
+                    alias.write_sql(s, context)?;
                 }
                 Ok(())
             }
             Self::Sub(from, alias) => {
                 s.punct("(")?;
-                from.to_tokens(s, context)?;
+                from.write_sql(s, context)?;
                 s.punct(")")?;
                 if let Some(alias) = alias {
-                    alias.to_tokens(s, context)?;
+                    alias.write_sql(s, context)?;
                 }
                 Ok(())
             }
@@ -1519,14 +1519,14 @@ impl ToTokens for SelectTable {
     }
 }
 
-impl_display_for_to_tokens!(JoinOperator);
-impl ToTokens for JoinOperator {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(JoinOperator);
+impl WriteSql for JoinOperator {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::Comma => s.punct(","),
             Self::TypedJoin(join_type) => {
                 if let Some(ref join_type) = join_type {
-                    join_type.to_tokens(s, context)?;
+                    join_type.write_sql(s, context)?;
                 }
                 s.keyword("JOIN")
             }
@@ -1534,9 +1534,9 @@ impl ToTokens for JoinOperator {
     }
 }
 
-impl_display_for_to_tokens!(JoinType);
-impl ToTokens for JoinType {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl_display_for_write_sql!(JoinType);
+impl WriteSql for JoinType {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         if self.contains(Self::NATURAL) {
             s.text("NATURAL")?;
         }
@@ -1563,13 +1563,13 @@ impl ToTokens for JoinType {
     }
 }
 
-impl_display_for_to_tokens!(JoinConstraint);
-impl ToTokens for JoinConstraint {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(JoinConstraint);
+impl WriteSql for JoinConstraint {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::On(expr) => {
                 s.keyword("ON")?;
-                expr.to_tokens(s, context)
+                expr.write_sql(s, context)
             }
             Self::Using(col_names) => {
                 s.keyword("USING")?;
@@ -1581,9 +1581,9 @@ impl ToTokens for JoinConstraint {
     }
 }
 
-impl_display_for_to_tokens!(GroupBy);
-impl ToTokens for GroupBy {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(GroupBy);
+impl WriteSql for GroupBy {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         if !self.exprs.is_empty() {
             s.keyword("GROUP")?;
             s.keyword("BY")?;
@@ -1591,82 +1591,82 @@ impl ToTokens for GroupBy {
         }
         if let Some(ref having) = self.having {
             s.keyword("HAVING")?;
-            having.to_tokens(s, context)?;
+            having.write_sql(s, context)?;
         }
         Ok(())
     }
 }
 
-impl_display_for_to_tokens!(Name);
-impl ToTokens for Name {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl_display_for_write_sql!(Name);
+impl WriteSql for Name {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         s.text(&self.as_ident())
     }
 }
 
-impl_display_for_to_tokens!(QualifiedName);
-impl ToTokens for QualifiedName {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(QualifiedName);
+impl WriteSql for QualifiedName {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         if let Some(ref db_name) = self.namespace {
-            db_name.to_tokens(s, context)?;
+            db_name.write_sql(s, context)?;
             s.punct(".")?;
         }
-        self.name.to_tokens(s, context)?;
+        self.name.write_sql(s, context)?;
         if let Some(ref alias) = self.alias {
             s.keyword("AS")?;
-            alias.to_tokens(s, context)?;
+            alias.write_sql(s, context)?;
         }
         Ok(())
     }
 }
 
-impl_display_for_to_tokens!(AlterTableBody);
-impl ToTokens for AlterTableBody {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(AlterTableBody);
+impl WriteSql for AlterTableBody {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::RenameTo(name) => {
                 s.keyword("RENAME")?;
                 s.keyword("TO")?;
-                name.to_tokens(s, context)
+                name.write_sql(s, context)
             }
             Self::AddColumn(def) => {
                 s.keyword("ADD")?;
                 s.keyword("COLUMN")?;
-                def.to_tokens(s, context)
+                def.write_sql(s, context)
             }
             Self::AlterColumn { old, new } => {
                 s.keyword("ALTER")?;
                 s.keyword("COLUMN")?;
-                old.to_tokens(s, context)?;
+                old.write_sql(s, context)?;
                 s.keyword("TO")?;
-                new.to_tokens(s, context)
+                new.write_sql(s, context)
             }
             Self::RenameColumn { old, new } => {
                 s.keyword("RENAME")?;
                 s.keyword("COLUMN")?;
-                old.to_tokens(s, context)?;
+                old.write_sql(s, context)?;
                 s.keyword("TO")?;
-                new.to_tokens(s, context)
+                new.write_sql(s, context)
             }
             Self::DropColumn(name) => {
                 s.keyword("DROP")?;
                 s.keyword("COLUMN")?;
-                name.to_tokens(s, context)
+                name.write_sql(s, context)
             }
             Self::OwnerTo { role, .. } => {
                 s.text("OWNER")?;
                 s.keyword("TO")?;
-                role.to_tokens(s, context)
+                role.write_sql(s, context)
             }
-            Self::EnableRowSecurity => row_security_to_tokens(s, "ENABLE"),
-            Self::DisableRowSecurity => row_security_to_tokens(s, "DISABLE"),
+            Self::EnableRowSecurity => write_row_security(s, "ENABLE"),
+            Self::DisableRowSecurity => write_row_security(s, "DISABLE"),
         }
     }
 }
 
-impl_display_for_to_tokens!(RoleSpec);
-impl ToTokens for RoleSpec {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _context: &C) -> fmt::Result {
+impl_display_for_write_sql!(RoleSpec);
+impl WriteSql for RoleSpec {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _context: &C) -> fmt::Result {
         match self {
             Self::Name(name) => s.text(name),
             Self::CurrentRole => s.text("CURRENT_ROLE"),
@@ -1675,9 +1675,9 @@ impl ToTokens for RoleSpec {
     }
 }
 
-impl_display_for_to_tokens!(Grant);
-impl ToTokens for Grant {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(Grant);
+impl WriteSql for Grant {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         s.text(if self.revoke { "REVOKE" } else { "GRANT" })?;
         match &self.objects {
             GrantObjects::Relations {
@@ -1710,9 +1710,9 @@ impl ToTokens for Grant {
     }
 }
 
-impl_display_for_to_tokens!(Privilege);
-impl ToTokens for Privilege {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _context: &C) -> fmt::Result {
+impl_display_for_write_sql!(Privilege);
+impl WriteSql for Privilege {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _context: &C) -> fmt::Result {
         match self {
             Self::Select => s.keyword("SELECT"),
             Self::Insert => s.keyword("INSERT"),
@@ -1728,24 +1728,24 @@ impl ToTokens for Privilege {
     }
 }
 
-impl_display_for_to_tokens!(Grantee);
-impl ToTokens for Grantee {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(Grantee);
+impl WriteSql for Grantee {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::Public => s.text("PUBLIC"),
-            Self::Role(role) => role.to_tokens(s, context),
+            Self::Role(role) => role.write_sql(s, context),
         }
     }
 }
 
-impl_display_for_to_tokens!(CreatePolicy);
-impl ToTokens for CreatePolicy {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(CreatePolicy);
+impl WriteSql for CreatePolicy {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         s.keyword("CREATE")?;
         s.text("POLICY")?;
-        self.policy_name.to_tokens(s, context)?;
+        self.policy_name.write_sql(s, context)?;
         s.keyword("ON")?;
-        self.tbl_name.to_tokens(s, context)?;
+        self.tbl_name.write_sql(s, context)?;
         s.keyword("AS")?;
         s.text(if self.permissive {
             "PERMISSIVE"
@@ -1765,14 +1765,14 @@ impl ToTokens for CreatePolicy {
         if let Some(expr) = &self.using_expr {
             s.keyword("USING")?;
             s.punct("(")?;
-            expr.to_tokens(s, context)?;
+            expr.write_sql(s, context)?;
             s.punct(")")?;
         }
         if let Some(expr) = &self.check_expr {
             s.keyword("WITH")?;
             s.keyword("CHECK")?;
             s.punct("(")?;
-            expr.to_tokens(s, context)?;
+            expr.write_sql(s, context)?;
             s.punct(")")?;
         }
         Ok(())
@@ -1780,16 +1780,16 @@ impl ToTokens for CreatePolicy {
 }
 
 /// `ENABLE ROW LEVEL SECURITY` or `DISABLE ROW LEVEL SECURITY`.
-fn row_security_to_tokens(s: &mut SqlWriter<'_>, enable_or_disable: &str) -> fmt::Result {
+fn write_row_security(s: &mut SqlWriter<'_>, enable_or_disable: &str) -> fmt::Result {
     for word in [enable_or_disable, "ROW", "LEVEL", "SECURITY"] {
         s.text(word)?;
     }
     Ok(())
 }
 
-impl_display_for_to_tokens!(CreateTableBody);
-impl ToTokens for CreateTableBody {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(CreateTableBody);
+impl WriteSql for CreateTableBody {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::ColumnsAndConstraints {
                 columns,
@@ -1805,7 +1805,7 @@ impl ToTokens for CreateTableBody {
                 s.punct(")")?;
                 // Use the original text if available
                 if let Some(ref without_rowid) = options.without_rowid_text {
-                    // Split "WITHOUT ROWID" back into tokens
+                    // Split "WITHOUT ROWID" back into its two words
                     let parts: Vec<&str> = without_rowid.split_whitespace().collect();
                     if parts.len() == 2 {
                         s.keyword("WITHOUT")?;
@@ -1822,40 +1822,40 @@ impl ToTokens for CreateTableBody {
             }
             Self::AsSelect(select) => {
                 s.keyword("AS")?;
-                select.to_tokens(s, context)
+                select.write_sql(s, context)
             }
         }
     }
 }
 
-impl_display_for_to_tokens!(ColumnDefinition);
-impl ToTokens for ColumnDefinition {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
-        self.col_name.to_tokens(s, context)?;
+impl_display_for_write_sql!(ColumnDefinition);
+impl WriteSql for ColumnDefinition {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+        self.col_name.write_sql(s, context)?;
         if let Some(ref col_type) = self.col_type {
-            col_type.to_tokens(s, context)?;
+            col_type.write_sql(s, context)?;
         }
         for constraint in &self.constraints {
-            constraint.to_tokens(s, context)?;
+            constraint.write_sql(s, context)?;
         }
         Ok(())
     }
 }
 
-impl_display_for_to_tokens!(NamedColumnConstraint);
-impl ToTokens for NamedColumnConstraint {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(NamedColumnConstraint);
+impl WriteSql for NamedColumnConstraint {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         if let Some(ref name) = self.name {
             s.keyword("CONSTRAINT")?;
-            name.to_tokens(s, context)?;
+            name.write_sql(s, context)?;
         }
-        self.constraint.to_tokens(s, context)
+        self.constraint.write_sql(s, context)
     }
 }
 
-impl_display_for_to_tokens!(ColumnConstraint);
-impl ToTokens for ColumnConstraint {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(ColumnConstraint);
+impl WriteSql for ColumnConstraint {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::PrimaryKey {
                 order,
@@ -1865,12 +1865,12 @@ impl ToTokens for ColumnConstraint {
                 s.keyword("PRIMARY")?;
                 s.keyword("KEY")?;
                 if let Some(order) = order {
-                    order.to_tokens(s, context)?;
+                    order.write_sql(s, context)?;
                 }
                 if let Some(conflict_clause) = conflict_clause {
                     s.keyword("ON")?;
                     s.keyword("CONFLICT")?;
-                    conflict_clause.to_tokens(s, context)?;
+                    conflict_clause.write_sql(s, context)?;
                 }
                 if *auto_increment {
                     s.keyword("AUTOINCREMENT")?;
@@ -1888,7 +1888,7 @@ impl ToTokens for ColumnConstraint {
                 if let Some(conflict_clause) = conflict_clause {
                     s.keyword("ON")?;
                     s.keyword("CONFLICT")?;
-                    conflict_clause.to_tokens(s, context)?;
+                    conflict_clause.write_sql(s, context)?;
                 }
                 Ok(())
             }
@@ -1897,7 +1897,7 @@ impl ToTokens for ColumnConstraint {
                 if let Some(conflict_clause) = conflict_clause {
                     s.keyword("ON")?;
                     s.keyword("CONFLICT")?;
-                    conflict_clause.to_tokens(s, context)?;
+                    conflict_clause.write_sql(s, context)?;
                 }
                 Ok(())
             }
@@ -1916,7 +1916,7 @@ impl ToTokens for ColumnConstraint {
                             s.text("\n")?;
                         }
                     }
-                    _ => expr.to_tokens(s, context)?,
+                    _ => expr.write_sql(s, context)?,
                 }
                 s.punct(")")
             }
@@ -1930,24 +1930,24 @@ impl ToTokens for ColumnConstraint {
                     _ => false,
                 };
                 if parses_without_parentheses {
-                    return expr.to_tokens(s, context);
+                    return expr.write_sql(s, context);
                 }
                 s.punct("(")?;
-                expr.to_tokens(s, context)?;
+                expr.write_sql(s, context)?;
                 s.punct(")")
             }
             Self::Collate { collation_name } => {
                 s.keyword("COLLATE")?;
-                collation_name.to_tokens(s, context)
+                collation_name.write_sql(s, context)
             }
             Self::ForeignKey {
                 clause,
                 defer_clause,
             } => {
                 s.keyword("REFERENCES")?;
-                clause.to_tokens(s, context)?;
+                clause.write_sql(s, context)?;
                 if let Some(defer_clause) = defer_clause {
-                    defer_clause.to_tokens(s, context)?;
+                    defer_clause.write_sql(s, context)?;
                 }
                 Ok(())
             }
@@ -1962,7 +1962,7 @@ impl ToTokens for ColumnConstraint {
                 }
                 s.keyword("AS")?;
                 s.punct("(")?;
-                expr.to_tokens(s, context)?;
+                expr.write_sql(s, context)?;
                 s.punct(")")?;
                 if let Some(typ) = typ {
                     match typ {
@@ -1977,20 +1977,20 @@ impl ToTokens for ColumnConstraint {
     }
 }
 
-impl_display_for_to_tokens!(NamedTableConstraint);
-impl ToTokens for NamedTableConstraint {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(NamedTableConstraint);
+impl WriteSql for NamedTableConstraint {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         if let Some(ref name) = self.name {
             s.keyword("CONSTRAINT")?;
-            name.to_tokens(s, context)?;
+            name.write_sql(s, context)?;
         }
-        self.constraint.to_tokens(s, context)
+        self.constraint.write_sql(s, context)
     }
 }
 
-impl_display_for_to_tokens!(TableConstraint);
-impl ToTokens for TableConstraint {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(TableConstraint);
+impl WriteSql for TableConstraint {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::PrimaryKey {
                 columns,
@@ -2008,7 +2008,7 @@ impl ToTokens for TableConstraint {
                 if let Some(conflict_clause) = conflict_clause {
                     s.keyword("ON")?;
                     s.keyword("CONFLICT")?;
-                    conflict_clause.to_tokens(s, context)?;
+                    conflict_clause.write_sql(s, context)?;
                 }
                 Ok(())
             }
@@ -2023,7 +2023,7 @@ impl ToTokens for TableConstraint {
                 if let Some(conflict_clause) = conflict_clause {
                     s.keyword("ON")?;
                     s.keyword("CONFLICT")?;
-                    conflict_clause.to_tokens(s, context)?;
+                    conflict_clause.write_sql(s, context)?;
                 }
                 Ok(())
             }
@@ -2042,7 +2042,7 @@ impl ToTokens for TableConstraint {
                             s.text("\n")?;
                         }
                     }
-                    _ => expr.to_tokens(s, context)?,
+                    _ => expr.write_sql(s, context)?,
                 }
                 s.punct(")")
             }
@@ -2057,9 +2057,9 @@ impl ToTokens for TableConstraint {
                 comma(columns, s, context)?;
                 s.punct(")")?;
                 s.keyword("REFERENCES")?;
-                clause.to_tokens(s, context)?;
+                clause.write_sql(s, context)?;
                 if let Some(defer_clause) = defer_clause {
-                    defer_clause.to_tokens(s, context)?;
+                    defer_clause.write_sql(s, context)?;
                 }
                 Ok(())
             }
@@ -2067,9 +2067,9 @@ impl ToTokens for TableConstraint {
     }
 }
 
-impl_display_for_to_tokens!(SortOrder);
-impl ToTokens for SortOrder {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl_display_for_write_sql!(SortOrder);
+impl WriteSql for SortOrder {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         match self {
             Self::Asc => s.keyword("ASC"),
             Self::Desc => s.keyword("DESC"),
@@ -2077,9 +2077,9 @@ impl ToTokens for SortOrder {
     }
 }
 
-impl_display_for_to_tokens!(NullsOrder);
-impl ToTokens for NullsOrder {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl_display_for_write_sql!(NullsOrder);
+impl WriteSql for NullsOrder {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         s.keyword("NULLS")?;
         match self {
             Self::First => s.keyword("FIRST"),
@@ -2088,52 +2088,52 @@ impl ToTokens for NullsOrder {
     }
 }
 
-impl_display_for_to_tokens!(ForeignKeyClause);
-impl ToTokens for ForeignKeyClause {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
-        self.tbl_name.to_tokens(s, context)?;
+impl_display_for_write_sql!(ForeignKeyClause);
+impl WriteSql for ForeignKeyClause {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+        self.tbl_name.write_sql(s, context)?;
         if !self.columns.is_empty() {
             s.punct("(")?;
             comma(&self.columns, s, context)?;
             s.punct(")")?;
         }
         for arg in &self.args {
-            arg.to_tokens(s, context)?;
+            arg.write_sql(s, context)?;
         }
         Ok(())
     }
 }
 
-impl_display_for_to_tokens!(RefArg);
-impl ToTokens for RefArg {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(RefArg);
+impl WriteSql for RefArg {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::OnDelete(ref action) => {
                 s.keyword("ON")?;
                 s.keyword("DELETE")?;
-                action.to_tokens(s, context)
+                action.write_sql(s, context)
             }
             Self::OnInsert(ref action) => {
                 s.keyword("ON")?;
                 s.keyword("INSERT")?;
-                action.to_tokens(s, context)
+                action.write_sql(s, context)
             }
             Self::OnUpdate(ref action) => {
                 s.keyword("ON")?;
                 s.keyword("UPDATE")?;
-                action.to_tokens(s, context)
+                action.write_sql(s, context)
             }
             Self::Match(ref name) => {
                 s.keyword("MATCH")?;
-                name.to_tokens(s, context)
+                name.write_sql(s, context)
             }
         }
     }
 }
 
-impl_display_for_to_tokens!(RefAct);
-impl ToTokens for RefAct {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl_display_for_write_sql!(RefAct);
+impl WriteSql for RefAct {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         match self {
             Self::SetNull => {
                 s.keyword("SET")?;
@@ -2153,23 +2153,23 @@ impl ToTokens for RefAct {
     }
 }
 
-impl_display_for_to_tokens!(DeferSubclause);
-impl ToTokens for DeferSubclause {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(DeferSubclause);
+impl WriteSql for DeferSubclause {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         if !self.deferrable {
             s.keyword("NOT")?;
         }
         s.keyword("DEFERRABLE")?;
         if let Some(init_deferred) = self.init_deferred {
-            init_deferred.to_tokens(s, context)?;
+            init_deferred.write_sql(s, context)?;
         }
         Ok(())
     }
 }
 
-impl_display_for_to_tokens!(InitDeferredPred);
-impl ToTokens for InitDeferredPred {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl_display_for_write_sql!(InitDeferredPred);
+impl WriteSql for InitDeferredPred {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         s.keyword("INITIALLY")?;
         match self {
             Self::InitiallyDeferred => s.keyword("DEFERRED"),
@@ -2178,29 +2178,29 @@ impl ToTokens for InitDeferredPred {
     }
 }
 
-impl_display_for_to_tokens!(IndexedColumn);
-impl ToTokens for IndexedColumn {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
-        self.col_name.to_tokens(s, context)?;
+impl_display_for_write_sql!(IndexedColumn);
+impl WriteSql for IndexedColumn {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+        self.col_name.write_sql(s, context)?;
         if let Some(ref collation_name) = self.collation_name {
             s.keyword("COLLATE")?;
-            collation_name.to_tokens(s, context)?;
+            collation_name.write_sql(s, context)?;
         }
         if let Some(order) = self.order {
-            order.to_tokens(s, context)?;
+            order.write_sql(s, context)?;
         }
         Ok(())
     }
 }
 
-impl_display_for_to_tokens!(Indexed);
-impl ToTokens for Indexed {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(Indexed);
+impl WriteSql for Indexed {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::IndexedBy(ref name) => {
                 s.keyword("INDEXED")?;
                 s.keyword("BY")?;
-                name.to_tokens(s, context)
+                name.write_sql(s, context)
             }
             Self::NotIndexed => {
                 s.keyword("NOT")?;
@@ -2210,41 +2210,41 @@ impl ToTokens for Indexed {
     }
 }
 
-impl_display_for_to_tokens!(SortedColumn);
-impl ToTokens for SortedColumn {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
-        self.expr.to_tokens(s, context)?;
+impl_display_for_write_sql!(SortedColumn);
+impl WriteSql for SortedColumn {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+        self.expr.write_sql(s, context)?;
         if let Some(ref order) = self.order {
-            order.to_tokens(s, context)?;
+            order.write_sql(s, context)?;
         }
         if let Some(ref nulls) = self.nulls {
-            nulls.to_tokens(s, context)?;
+            nulls.write_sql(s, context)?;
         }
         Ok(())
     }
 }
 
-impl_display_for_to_tokens!(Limit);
-impl ToTokens for Limit {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(Limit);
+impl WriteSql for Limit {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         s.keyword("LIMIT")?;
-        self.expr.to_tokens(s, context)?;
+        self.expr.write_sql(s, context)?;
         if let Some(ref offset) = self.offset {
             s.keyword("OFFSET")?;
-            offset.to_tokens(s, context)?;
+            offset.write_sql(s, context)?;
         }
         Ok(())
     }
 }
 
-impl_display_for_to_tokens!(InsertBody);
-impl ToTokens for InsertBody {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(InsertBody);
+impl WriteSql for InsertBody {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::Select(select, upsert) => {
-                select.to_tokens(s, context)?;
+                select.write_sql(s, context)?;
                 if let Some(upsert) = upsert {
-                    upsert.to_tokens(s, context)?;
+                    upsert.write_sql(s, context)?;
                 }
                 Ok(())
             }
@@ -2256,9 +2256,9 @@ impl ToTokens for InsertBody {
     }
 }
 
-impl_display_for_to_tokens!(Set);
-impl ToTokens for Set {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(Set);
+impl WriteSql for Set {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         if self.col_names.len() == 1 {
             comma(&self.col_names, s, context)?;
         } else {
@@ -2267,30 +2267,30 @@ impl ToTokens for Set {
             s.punct(")")?;
         }
         s.punct("=")?;
-        self.expr.to_tokens(s, context)
+        self.expr.write_sql(s, context)
     }
 }
 
-impl_display_for_to_tokens!(PragmaBody);
-impl ToTokens for PragmaBody {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(PragmaBody);
+impl WriteSql for PragmaBody {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::Equals(value) => {
                 s.punct("=")?;
-                value.to_tokens(s, context)
+                value.write_sql(s, context)
             }
             Self::Call(value) => {
                 s.punct("(")?;
-                value.to_tokens(s, context)?;
+                value.write_sql(s, context)?;
                 s.punct(")")
             }
         }
     }
 }
 
-impl_display_for_to_tokens!(TriggerTime);
-impl ToTokens for TriggerTime {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl_display_for_write_sql!(TriggerTime);
+impl WriteSql for TriggerTime {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         match self {
             Self::Before => s.keyword("BEFORE"),
             Self::After => s.keyword("AFTER"),
@@ -2302,9 +2302,9 @@ impl ToTokens for TriggerTime {
     }
 }
 
-impl_display_for_to_tokens!(TriggerEvent);
-impl ToTokens for TriggerEvent {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(TriggerEvent);
+impl WriteSql for TriggerEvent {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::Delete => s.keyword("DELETE"),
             Self::Insert => s.keyword("INSERT"),
@@ -2318,9 +2318,9 @@ impl ToTokens for TriggerEvent {
     }
 }
 
-impl_display_for_to_tokens!(TriggerCmd);
-impl ToTokens for TriggerCmd {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(TriggerCmd);
+impl WriteSql for TriggerCmd {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::Update {
                 or_conflict,
@@ -2332,18 +2332,18 @@ impl ToTokens for TriggerCmd {
                 s.keyword("UPDATE")?;
                 if let Some(or_conflict) = or_conflict {
                     s.keyword("OR")?;
-                    or_conflict.to_tokens(s, context)?;
+                    or_conflict.write_sql(s, context)?;
                 }
-                tbl_name.to_tokens(s, context)?;
+                tbl_name.write_sql(s, context)?;
                 s.keyword("SET")?;
                 comma(sets, s, context)?;
                 if let Some(from) = from {
                     s.keyword("FROM")?;
-                    from.to_tokens(s, context)?;
+                    from.write_sql(s, context)?;
                 }
                 if let Some(where_clause) = where_clause {
                     s.keyword("WHERE")?;
-                    where_clause.to_tokens(s, context)?;
+                    where_clause.write_sql(s, context)?;
                 }
                 Ok(())
             }
@@ -2361,19 +2361,19 @@ impl ToTokens for TriggerCmd {
                     s.keyword("INSERT")?;
                     if let Some(or_conflict) = or_conflict {
                         s.keyword("OR")?;
-                        or_conflict.to_tokens(s, context)?;
+                        or_conflict.write_sql(s, context)?;
                     }
                 }
                 s.keyword("INTO")?;
-                tbl_name.to_tokens(s, context)?;
+                tbl_name.write_sql(s, context)?;
                 if !col_names.is_empty() {
                     s.punct("(")?;
                     comma(col_names, s, context)?;
                     s.punct(")")?;
                 }
-                select.to_tokens(s, context)?;
+                select.write_sql(s, context)?;
                 if let Some(upsert) = upsert {
-                    upsert.to_tokens(s, context)?;
+                    upsert.write_sql(s, context)?;
                 }
                 if !returning.is_empty() {
                     s.keyword("RETURNING")?;
@@ -2387,21 +2387,21 @@ impl ToTokens for TriggerCmd {
             } => {
                 s.keyword("DELETE")?;
                 s.keyword("FROM")?;
-                tbl_name.to_tokens(s, context)?;
+                tbl_name.write_sql(s, context)?;
                 if let Some(where_clause) = where_clause {
                     s.keyword("WHERE")?;
-                    where_clause.to_tokens(s, context)?;
+                    where_clause.write_sql(s, context)?;
                 }
                 Ok(())
             }
-            Self::Select(select) => select.to_tokens(s, context),
+            Self::Select(select) => select.write_sql(s, context),
         }
     }
 }
 
-impl_display_for_to_tokens!(ResolveType);
-impl ToTokens for ResolveType {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl_display_for_write_sql!(ResolveType);
+impl WriteSql for ResolveType {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         match self {
             Self::Rollback => s.keyword("ROLLBACK"),
             Self::Abort => s.keyword("ABORT"),
@@ -2412,9 +2412,9 @@ impl ToTokens for ResolveType {
     }
 }
 
-impl_display_for_to_tokens!(With);
-impl ToTokens for With {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(With);
+impl WriteSql for With {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         s.keyword("WITH")?;
         if self.recursive {
             s.keyword("RECURSIVE")?;
@@ -2423,10 +2423,10 @@ impl ToTokens for With {
     }
 }
 
-impl_display_for_to_tokens!(CommonTableExpr);
-impl ToTokens for CommonTableExpr {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
-        self.tbl_name.to_tokens(s, context)?;
+impl_display_for_write_sql!(CommonTableExpr);
+impl WriteSql for CommonTableExpr {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+        self.tbl_name.write_sql(s, context)?;
         if !self.columns.is_empty() {
             s.punct("(")?;
             comma(&self.columns, s, context)?;
@@ -2444,18 +2444,18 @@ impl ToTokens for CommonTableExpr {
             }
         };
         s.punct("(")?;
-        self.select.to_tokens(s, context)?;
+        self.select.write_sql(s, context)?;
         s.punct(")")
     }
 }
 
-impl_display_for_to_tokens!(Type);
-impl ToTokens for Type {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(Type);
+impl WriteSql for Type {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         s.text(&self.name)?;
         if let Some(ref size) = self.size {
             s.punct("(")?;
-            size.to_tokens(s, context)?;
+            size.write_sql(s, context)?;
             s.punct(")")?;
         }
         for _ in 0..self.array_dimensions {
@@ -2466,23 +2466,23 @@ impl ToTokens for Type {
     }
 }
 
-impl_display_for_to_tokens!(TypeSize);
-impl ToTokens for TypeSize {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(TypeSize);
+impl WriteSql for TypeSize {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
-            Self::MaxSize(size) => size.to_tokens(s, context),
+            Self::MaxSize(size) => size.write_sql(s, context),
             Self::TypeSize(size1, size2) => {
-                size1.to_tokens(s, context)?;
+                size1.write_sql(s, context)?;
                 s.punct(",")?;
-                size2.to_tokens(s, context)
+                size2.write_sql(s, context)
             }
         }
     }
 }
 
-impl_display_for_to_tokens!(TransactionType);
-impl ToTokens for TransactionType {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl_display_for_write_sql!(TransactionType);
+impl WriteSql for TransactionType {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         match self {
             Self::Deferred => s.keyword("DEFERRED"),
             Self::Immediate => s.keyword("IMMEDIATE"),
@@ -2492,39 +2492,39 @@ impl ToTokens for TransactionType {
     }
 }
 
-impl_display_for_to_tokens!(Upsert);
-impl ToTokens for Upsert {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(Upsert);
+impl WriteSql for Upsert {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         s.keyword("ON")?;
         s.keyword("CONFLICT")?;
         if let Some(ref index) = self.index {
-            index.to_tokens(s, context)?;
+            index.write_sql(s, context)?;
         }
-        self.do_clause.to_tokens(s, context)?;
+        self.do_clause.write_sql(s, context)?;
         if let Some(ref next) = self.next {
-            next.to_tokens(s, context)?;
+            next.write_sql(s, context)?;
         }
         Ok(())
     }
 }
 
-impl_display_for_to_tokens!(UpsertIndex);
-impl ToTokens for UpsertIndex {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(UpsertIndex);
+impl WriteSql for UpsertIndex {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         s.punct("(")?;
         comma(&self.targets, s, context)?;
         s.punct(")")?;
         if let Some(ref where_clause) = self.where_clause {
             s.keyword("WHERE")?;
-            where_clause.to_tokens(s, context)?;
+            where_clause.write_sql(s, context)?;
         }
         Ok(())
     }
 }
 
-impl_display_for_to_tokens!(UpsertDo);
-impl ToTokens for UpsertDo {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(UpsertDo);
+impl WriteSql for UpsertDo {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::Set { sets, where_clause } => {
                 s.keyword("DO")?;
@@ -2533,7 +2533,7 @@ impl ToTokens for UpsertDo {
                 comma(sets, s, context)?;
                 if let Some(where_clause) = where_clause {
                     s.keyword("WHERE")?;
-                    where_clause.to_tokens(s, context)?;
+                    where_clause.write_sql(s, context)?;
                 }
                 Ok(())
             }
@@ -2545,49 +2545,49 @@ impl ToTokens for UpsertDo {
     }
 }
 
-impl_display_for_to_tokens!(FunctionTail);
-impl ToTokens for FunctionTail {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(FunctionTail);
+impl WriteSql for FunctionTail {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         if let Some(ref filter_clause) = self.filter_clause {
             s.keyword("FILTER")?;
             s.punct("(")?;
             s.keyword("WHERE")?;
-            filter_clause.to_tokens(s, context)?;
+            filter_clause.write_sql(s, context)?;
             s.punct(")")?;
         }
         if let Some(ref over_clause) = self.over_clause {
             s.keyword("OVER")?;
-            over_clause.to_tokens(s, context)?;
+            over_clause.write_sql(s, context)?;
         }
         Ok(())
     }
 }
 
-impl_display_for_to_tokens!(Over);
-impl ToTokens for Over {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(Over);
+impl WriteSql for Over {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
-            Self::Window(ref window) => window.to_tokens(s, context),
-            Self::Name(ref name) => name.to_tokens(s, context),
+            Self::Window(ref window) => window.write_sql(s, context),
+            Self::Name(ref name) => name.write_sql(s, context),
         }
     }
 }
 
-impl_display_for_to_tokens!(WindowDef);
-impl ToTokens for WindowDef {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
-        self.name.to_tokens(s, context)?;
+impl_display_for_write_sql!(WindowDef);
+impl WriteSql for WindowDef {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+        self.name.write_sql(s, context)?;
         s.keyword("AS")?;
-        self.window.to_tokens(s, context)
+        self.window.write_sql(s, context)
     }
 }
 
-impl_display_for_to_tokens!(Window);
-impl ToTokens for Window {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(Window);
+impl WriteSql for Window {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         s.punct("(")?;
         if let Some(ref base) = self.base {
-            base.to_tokens(s, context)?;
+            base.write_sql(s, context)?;
         }
         if !self.partition_by.is_empty() {
             s.keyword("PARTITION")?;
@@ -2600,35 +2600,35 @@ impl ToTokens for Window {
             comma(&self.order_by, s, context)?;
         }
         if let Some(ref frame_clause) = self.frame_clause {
-            frame_clause.to_tokens(s, context)?;
+            frame_clause.write_sql(s, context)?;
         }
         s.punct(")")
     }
 }
 
-impl_display_for_to_tokens!(FrameClause);
-impl ToTokens for FrameClause {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
-        self.mode.to_tokens(s, context)?;
+impl_display_for_write_sql!(FrameClause);
+impl WriteSql for FrameClause {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+        self.mode.write_sql(s, context)?;
         if let Some(ref end) = self.end {
             s.keyword("BETWEEN")?;
-            self.start.to_tokens(s, context)?;
+            self.start.write_sql(s, context)?;
             s.keyword("AND")?;
-            end.to_tokens(s, context)?;
+            end.write_sql(s, context)?;
         } else {
-            self.start.to_tokens(s, context)?;
+            self.start.write_sql(s, context)?;
         }
         if let Some(ref exclude) = self.exclude {
             s.keyword("EXCLUDE")?;
-            exclude.to_tokens(s, context)?;
+            exclude.write_sql(s, context)?;
         }
         Ok(())
     }
 }
 
-impl_display_for_to_tokens!(FrameMode);
-impl ToTokens for FrameMode {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl_display_for_write_sql!(FrameMode);
+impl WriteSql for FrameMode {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         match self {
             Self::Groups => s.keyword("GROUPS"),
             Self::Range => s.keyword("RANGE"),
@@ -2637,20 +2637,20 @@ impl ToTokens for FrameMode {
     }
 }
 
-impl_display_for_to_tokens!(FrameBound);
-impl ToTokens for FrameBound {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl_display_for_write_sql!(FrameBound);
+impl WriteSql for FrameBound {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::CurrentRow => {
                 s.keyword("CURRENT")?;
                 s.keyword("ROW")
             }
             Self::Following(value) => {
-                value.to_tokens(s, context)?;
+                value.write_sql(s, context)?;
                 s.keyword("FOLLOWING")
             }
             Self::Preceding(value) => {
-                value.to_tokens(s, context)?;
+                value.write_sql(s, context)?;
                 s.keyword("PRECEDING")
             }
             Self::UnboundedFollowing => {
@@ -2665,9 +2665,9 @@ impl ToTokens for FrameBound {
     }
 }
 
-impl_display_for_to_tokens!(FrameExclude);
-impl ToTokens for FrameExclude {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl_display_for_write_sql!(FrameExclude);
+impl WriteSql for FrameExclude {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         match self {
             Self::NoOthers => {
                 s.keyword("NO")?;
@@ -2684,7 +2684,7 @@ impl ToTokens for FrameExclude {
 }
 
 /// Emit a parenthesized, comma-separated list of `name Type` pairs.
-fn type_fields_to_tokens<C: ToSqlContext>(
+fn write_type_fields<C: ToSqlContext>(
     fields: &[TypeField],
     s: &mut SqlWriter<'_>,
     context: &C,
@@ -2694,8 +2694,8 @@ fn type_fields_to_tokens<C: ToSqlContext>(
         if i > 0 {
             s.punct(",")?;
         }
-        field.name.to_tokens(s, context)?;
-        field.field_type.to_tokens(s, context)?;
+        field.name.write_sql(s, context)?;
+        field.field_type.write_sql(s, context)?;
     }
     s.punct(")")
 }
@@ -2703,7 +2703,7 @@ fn type_fields_to_tokens<C: ToSqlContext>(
 fn comma<I, C: ToSqlContext>(items: I, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result
 where
     I: IntoIterator,
-    I::Item: ToTokens,
+    I::Item: WriteSql,
 {
     s.comma(items, context)
 }

@@ -2,7 +2,7 @@ use core::fmt;
 use std::fmt::{Display, Formatter};
 use turso_parser::ast::{
     self,
-    fmt::{BlankContext, SqlWriter, ToSqlContext, ToTokens},
+    fmt::{BlankContext, SqlWriter, ToSqlContext, WriteSql},
     SortOrder, TableInternalId,
 };
 
@@ -522,11 +522,11 @@ impl ToSqlContext for PlanContext<'_> {
     }
 }
 
-impl ToTokens for Plan {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl WriteSql for Plan {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         match self {
             Self::Select(select) => {
-                select.to_tokens(s, &PlanContext(&[&select.table_references]))?;
+                select.write_sql(s, &PlanContext(&[&select.table_references]))?;
             }
             Self::CompoundSelect {
                 left,
@@ -543,11 +543,11 @@ impl ToTokens for Plan {
                 let context = &PlanContext(all_refs.as_slice());
 
                 for (plan, operator) in left {
-                    plan.to_tokens(s, context)?;
-                    operator.to_tokens(s, context)?;
+                    plan.write_sql(s, context)?;
+                    operator.write_sql(s, context)?;
                 }
 
-                right_most.to_tokens(s, context)?;
+                right_most.write_sql(s, context)?;
 
                 if let Some(order_by) = order_by {
                     s.keyword("ORDER")?;
@@ -578,16 +578,16 @@ impl ToTokens for Plan {
                 }
             }
             Self::RecursiveCte(plan) => {
-                plan.initial_query.to_tokens(s, context)?;
+                plan.initial_query.write_sql(s, context)?;
                 if plan.union_all {
-                    ast::CompoundOperator::UnionAll.to_tokens(s, context)?;
+                    ast::CompoundOperator::UnionAll.write_sql(s, context)?;
                 } else {
-                    ast::CompoundOperator::Union.to_tokens(s, context)?;
+                    ast::CompoundOperator::Union.write_sql(s, context)?;
                 }
-                plan.recursive_query.to_tokens(s, context)?;
+                plan.recursive_query.write_sql(s, context)?;
             }
-            Self::Delete(delete) => delete.to_tokens(s, context)?,
-            Self::Update(update) => update.to_tokens(s, context)?,
+            Self::Delete(delete) => delete.write_sql(s, context)?,
+            Self::Update(update) => update.write_sql(s, context)?,
         }
 
         Ok(())
@@ -600,8 +600,8 @@ impl Display for JoinedTable {
     }
 }
 
-impl ToTokens for JoinedTable {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _context: &C) -> fmt::Result {
+impl WriteSql for JoinedTable {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _context: &C) -> fmt::Result {
         match &self.table {
             Table::BTree(..) | Table::Virtual(..) | Table::RecursiveCteInput(..) => {
                 let name = self.table.get_name();
@@ -613,8 +613,8 @@ impl ToTokens for JoinedTable {
             }
             Table::FromClauseSubquery(from_clause_subquery) => {
                 s.punct("(")?;
-                // Plan::to_tokens creates its own context internally, so we pass BlankContext here.
-                from_clause_subquery.plan.to_tokens(s, &BlankContext)?;
+                // Plan::write_sql creates its own context internally, so we pass BlankContext here.
+                from_clause_subquery.plan.write_sql(s, &BlankContext)?;
                 s.punct(")")?;
 
                 s.keyword("AS")?;
@@ -627,10 +627,10 @@ impl ToTokens for JoinedTable {
 }
 
 // TODO: currently cannot print the original CTE as it is optimized into a subquery
-impl ToTokens for SelectPlan {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
+impl WriteSql for SelectPlan {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, context: &C) -> fmt::Result {
         if !self.values.is_empty() {
-            ast::OneSelect::Values(self.values.clone()).to_tokens(s, context)?;
+            ast::OneSelect::Values(self.values.clone()).write_sql(s, context)?;
         } else {
             s.keyword("SELECT")?;
             if self.distinctness.is_distinct() {
@@ -642,7 +642,7 @@ impl ToTokens for SelectPlan {
                     s.punct(",")?;
                 }
 
-                expr.to_tokens(s, context)?;
+                expr.write_sql(s, context)?;
                 if let Some(alias) = alias {
                     s.keyword("AS")?;
                     s.text(alias)?;
@@ -659,7 +659,7 @@ impl ToTokens for SelectPlan {
                 }
 
                 let table_ref = self.joined_tables().get(order.original_idx).unwrap();
-                table_ref.to_tokens(s, context)?;
+                table_ref.write_sql(s, context)?;
             }
 
             if !self.where_clause.is_empty() {
@@ -674,7 +674,7 @@ impl ToTokens for SelectPlan {
                     if i != 0 {
                         s.keyword("AND")?;
                     }
-                    expr.to_tokens(s, context)?;
+                    expr.write_sql(s, context)?;
                 }
             }
 
@@ -694,7 +694,7 @@ impl ToTokens for SelectPlan {
                         if i != 0 {
                             s.keyword("AND")?;
                         }
-                        expr.to_tokens(s, context)?;
+                        expr.write_sql(s, context)?;
                     }
                 }
             }
@@ -764,8 +764,8 @@ impl ToTokens for SelectPlan {
     }
 }
 
-impl ToTokens for DeletePlan {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl WriteSql for DeletePlan {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         let table = self
             .table_references
             .joined_tables()
@@ -790,7 +790,7 @@ impl ToTokens for DeletePlan {
                 if i != 0 {
                     s.keyword("AND")?;
                 }
-                expr.to_tokens(s, context)?;
+                expr.write_sql(s, context)?;
             }
         }
 
@@ -798,8 +798,8 @@ impl ToTokens for DeletePlan {
     }
 }
 
-impl ToTokens for UpdatePlan {
-    fn to_tokens<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
+impl WriteSql for UpdatePlan {
+    fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
         let table = &self.target_table;
         let read_scope_tables = self.build_read_scope_tables();
         let context = [&read_scope_tables];
@@ -837,10 +837,10 @@ impl ToTokens for UpdatePlan {
                 .map(|where_clause| where_clause.expr.clone());
             iter.next()
                 .expect("should not be empty")
-                .to_tokens(s, context)?;
+                .write_sql(s, context)?;
             for expr in iter {
                 s.keyword("AND")?;
-                expr.to_tokens(s, context)?;
+                expr.write_sql(s, context)?;
             }
         }
 
