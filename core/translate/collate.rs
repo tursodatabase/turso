@@ -822,13 +822,15 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
             let func = context
                 .catalog()
                 .resolve_function(name.as_str(), args.len())?;
-            if func.as_ref().is_some_and(|func| func.needs_collation()) {
+            let needs_collation = func.as_ref().is_some_and(|func| func.needs_collation());
+            if needs_collation {
                 check_comparable_results(args.iter().map(|arg| arg.as_ref()), context)?;
                 common_type_ordering(args.iter().map(|arg| (arg.as_ref(), context)))?;
             }
-            // The result is one of these arguments, so they have one type.
+            // The result is one of these arguments, so they have one type. A function
+            // that needs a collation, such as min and max, was checked above.
             match func.as_ref().map(|func| func.result_type()) {
-                Some(ResultType::OneOfTheArguments) => {
+                Some(ResultType::OneOfTheArguments) if !needs_collation => {
                     check_comparable_results(args.iter().map(|arg| arg.as_ref()), context)?;
                 }
                 Some(ResultType::OneOfTheIifValues) => {

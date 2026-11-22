@@ -1153,3 +1153,39 @@ test datetime-compare-timestamptz-gt-varchar-is-an-error {
 expect error {
     operator does not exist|cannot compare type timestamptz with type varchar
 }
+
+# lag's result is one type in PostgreSQL: the timestamp rows convert to
+# timestamptz, in the session time zone (UTC).
+@compat-gap "function:lag"
+test datetime-lag-timestamp-with-timestamptz-default {
+    CREATE TABLE lg (i int, ts timestamp, tz timestamptz);
+    INSERT INTO lg VALUES (1, '2024-01-01 00:00:00', '2024-06-01 00:00:00+00');
+    INSERT INTO lg VALUES (2, '2024-01-02 00:00:00', '2024-06-02 00:00:00+00');
+    SELECT lag(ts, 1, tz) OVER (ORDER BY i) FROM lg ORDER BY i;
+}
+expect {
+    2024-06-01 00:00:00+00
+    2024-01-01 00:00:00+00
+}
+expect @tursopg {
+    2024-06-01 00:00:00
+    2024-01-01 00:00:00
+}
+
+# lead's result is one type in PostgreSQL: the timestamp rows convert to
+# timestamptz, in the session time zone (UTC).
+@compat-gap "function:lead"
+test datetime-lead-timestamp-with-timestamptz-default {
+    CREATE TABLE ld (i int, ts timestamp, tz timestamptz);
+    INSERT INTO ld VALUES (1, '2024-01-01 00:00:00', '2024-06-01 00:00:00+00');
+    INSERT INTO ld VALUES (2, '2024-01-02 00:00:00', '2024-06-02 00:00:00+00');
+    SELECT lead(ts, 1, tz) OVER (ORDER BY i) FROM ld ORDER BY i;
+}
+expect {
+    2024-01-02 00:00:00+00
+    2024-06-02 00:00:00+00
+}
+expect @tursopg {
+    2024-01-02 00:00:00
+    2024-06-02 00:00:00
+}
