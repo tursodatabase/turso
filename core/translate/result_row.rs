@@ -137,8 +137,14 @@ pub fn emit_select_result(
 
     // Emit ArrayDecode for result columns that produce array blobs.
     // Array values are stored as record-format blobs internally; decode
-    // them to JSON text for user-facing display.
-    if !skip_column_eval {
+    // them to JSON text for user-facing display. A subquery keeps the blobs
+    // so the outer query can read the elements.
+    if !skip_column_eval
+        && !matches!(
+            plan.query_destination,
+            QueryDestination::CoroutineYield { .. }
+        )
+    {
         emit_array_decode_for_results(
             program,
             &plan.result_columns,
