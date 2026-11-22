@@ -14091,19 +14091,6 @@ fn test_mvcc_portable_changes_resolve_user_table_after_cross_connection_checkpoi
     );
 }
 
-/// Counts complete cursor seeks, including a re-seek caused by Next/Prev.
-#[derive(Debug, Default)]
-struct CursorSeekStarts(AtomicU64);
-
-impl YieldInjector for CursorSeekStarts {
-    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
-        if point == CursorYieldPoint::SeekStart.point() {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-        false
-    }
-}
-
 /// A complete non-NULL unique lookup needs only the index and table seeks.
 /// Stepping its index again scans unrelated tombstones in a replay transaction.
 #[test]
@@ -14151,7 +14138,7 @@ fn assert_unique_point_delete_does_not_seek_next(
     let mut stmt = conn
         .prepare(format!("DELETE FROM t WHERE {predicate}"))
         .unwrap();
-    let seeks = Arc::new(CursorSeekStarts::default());
+    let seeks = Arc::new(SeekBtreeSteps::default());
     conn.set_yield_injector(Some(seeks.clone()));
     for row in (1..=9).rev() {
         stmt.reset().unwrap();
@@ -14164,11 +14151,11 @@ fn assert_unique_point_delete_does_not_seek_next(
             stmt.bind_at(std::num::NonZeroUsize::new(2).unwrap(), Value::from_i64(7))
                 .unwrap();
         }
-        seeks.0.store(0, Ordering::Relaxed);
+        seeks.seek_starts.store(0, Ordering::Relaxed);
         stmt.run_collect_rows().unwrap();
         assert_eq!(stmt.n_change(), 1);
         assert_eq!(
-            seeks.0.load(Ordering::Relaxed),
+            seeks.seek_starts.load(Ordering::Relaxed),
             2,
             "a unique point DELETE must not seek a following index row: {predicate}, descending={descending}, row={row}"
         );
