@@ -67,26 +67,20 @@ expect @tursopg {
 }
 
 # A-07: int4 overflow literal cast
-@compat-gap "type:int4"
+# Fixed: int4 overflow literal cast now matches PostgreSQL in PR #11803
 test int4-overflow-literal-cast {
     SELECT '2147483648'::int4;
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-    2147483648
-}
 
 # A-08: int2 overflow literal cast
-@compat-gap "type:int2"
+# Fixed: int2 overflow literal cast now matches PostgreSQL in PR #11803
 test int2-overflow-literal-cast {
     SELECT '40000'::smallint;
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-    40000
-}
 
 # A-09: int8 overflow arithmetic
 @compat-gap "operator:int8 + int4"
@@ -111,26 +105,20 @@ expect @tursopg {
 }
 
 # A-11: invalid int literal cast
-@compat-gap "type:int4"
+# Fixed: invalid int literal cast now matches PostgreSQL in PR #11803
 test invalid-int-literal-cast {
     SELECT 'abc'::integer;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    0
-}
 
 # A-13: '1.5'::int (text) is invalid
-@compat-gap "type:int4"
+# Fixed: '1.5'::int (text) is invalid now matches PostgreSQL in PR #11803
 test decimal-text-cast-to-int4-is-invalid {
     SELECT '1.5'::integer;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    1
-}
 
 # A-14: numeric->int rounds half away from zero
 @compat-gap "cast:numeric -> int4"

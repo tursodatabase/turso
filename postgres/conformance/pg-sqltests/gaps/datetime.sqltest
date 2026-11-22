@@ -166,7 +166,7 @@ test timestamptz-cast-to-bigint {
 @sqlstate 42846
 expect error {}
 expect @tursopg {
-    2026
+    @error 22P02
 }
 
 @compat-gap "type:timestamptz"
