@@ -1068,7 +1068,9 @@ pub struct SelectPlan {
     pub values: Vec<Vec<Box<Expr>>>,
     /// The window definition and all window functions associated with it. There is at most one
     /// window per SELECT. If the original query contains more, they are pushed down into subqueries.
-    pub window: Option<Window>,
+    /// Boxed because only queries with window functions have a window, and each move of a
+    /// `SelectPlan` would copy its 152 bytes.
+    pub window: Option<Box<Window>>,
     /// Subqueries that appear in any part of the query apart from the FROM clause
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
     /// Estimated number of times this SELECT will be invoked by its parent scope.

@@ -279,7 +279,7 @@ fn prepare_window_subquery(
         {"SUBQUERY_DATABASE_ID": SUBQUERY_DATABASE_ID}
     );
 
-    outer_plan.window = Some(current_window);
+    outer_plan.window = Some(Box::new(current_window));
     outer_plan.table_references.add_joined_table(subquery);
 
     Ok(())
@@ -1280,7 +1280,7 @@ impl EmitWindow {
             );
         }
 
-        t_ctx.meta_window = Some(WindowMetadata {
+        t_ctx.meta_window = Some(Box::new(WindowMetadata {
             labels: WindowLabels {
                 flush_buffer: program.allocate_label(),
                 row_output: program.allocate_label(),
@@ -1355,7 +1355,7 @@ impl EmitWindow {
             expressions_referencing_subquery,
             buffer_table_name: buffer_table.name.clone(),
             minmax,
-        });
+        }));
 
         Ok(())
     }
