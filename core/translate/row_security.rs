@@ -99,7 +99,7 @@ pub(crate) fn filter_rows(
                 WhereTermOrigin::Where
             };
             let mut parts: Vec<ast::Expr> = Vec::new();
-            break_predicate_at_and_boundaries(&filter, &mut parts);
+            break_predicate_at_and_boundaries(filter.clone(), &mut parts);
             terms.extend(parts.into_iter().map(|expr| WhereTerm {
                 expr,
                 origin,

@@ -20,8 +20,8 @@ use crate::translate::{
     emitter::Resolver,
     expr::{
         expr_contains_function_that_changes_within_statement,
-        expr_contains_nondeterministic_scalar_function, expr_vector_size, unwrap_parens,
-        BindingBehavior, WalkControl,
+        expr_contains_nondeterministic_scalar_function, expr_vector_size, BindingBehavior,
+        WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
     subquery::outer_query_refs_for_correlated_subquery,
@@ -2659,7 +2659,7 @@ fn replace_select_table_alias(table: ast::SelectTable, alias: Option<ast::As>) -
 
 #[turso_macros::trace_stack]
 pub fn parse_where(
-    where_clause: Option<&Expr>,
+    where_clause: Option<Box<Expr>>,
     table_references: &mut TableReferences,
     result_columns: Option<&[ResultSetColumn]>,
     out_where_clause: &mut Vec<WhereTerm>,
@@ -2667,7 +2667,7 @@ pub fn parse_where(
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
         let start_idx = out_where_clause.len();
-        break_predicate_at_and_boundaries(where_expr, out_where_clause);
+        break_predicate_at_and_boundaries(*where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
             rewrite_between_exprs(&mut expr.expr, Some(resolver))?;
             bind_and_rewrite_expr(
@@ -2690,7 +2690,7 @@ pub fn parse_where(
             ) {
                 let term = out_where_clause.remove(i);
                 let mut new_terms: Vec<WhereTerm> = Vec::new();
-                break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
+                break_predicate_at_and_boundaries(term.expr, &mut new_terms);
                 // Preserve the source from the original term.
                 for new_term in new_terms.iter_mut() {
                     new_term.origin = term.origin;
@@ -3195,9 +3195,9 @@ fn parse_join(
 
     if let Some(constraint) = constraint {
         match constraint {
-            ast::JoinConstraint::On(ref expr) => {
+            ast::JoinConstraint::On(expr) => {
                 let start_idx = out_where_clause.len();
-                break_predicate_at_and_boundaries(expr, out_where_clause);
+                break_predicate_at_and_boundaries(*expr, out_where_clause);
                 for predicate in out_where_clause[start_idx..].iter_mut() {
                     predicate.origin = WhereTermOrigin::Join(join_origin);
                     bind_and_rewrite_expr(
@@ -3416,22 +3416,28 @@ fn vtab_predicate_table_id(expr: &Expr) -> Option<TableInternalId> {
         _ => None,
     }
 }
+
+/// Splits `predicate` at its top-level ANDs and adds the parts to
+/// `out_predicates`. The parts are moved out of `predicate`, not copied.
 pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
-    predicate: &Expr,
+    predicate: Expr,
     out_predicates: &mut Vec<T>,
 ) {
-    // Unwrap single-element parenthesized expressions recursively: ((expr)) -> expr.
-    // This is semantically equivalent since single-element Parenthesized is purely
-    // syntactic grouping. Multi-element Parenthesized (row values like (x, y)) are
-    // left as-is by unwrap_parens.
-    let predicate = unwrap_parens(predicate).unwrap_or(predicate);
     match predicate {
         Expr::Binary(left, ast::Operator::And, right) => {
-            break_predicate_at_and_boundaries(left, out_predicates);
-            break_predicate_at_and_boundaries(right, out_predicates);
+            break_predicate_at_and_boundaries(*left, out_predicates);
+            break_predicate_at_and_boundaries(*right, out_predicates);
         }
-        _ => {
-            out_predicates.push(predicate.clone().into());
+        // Unwrap single-element parenthesized expressions recursively: ((expr)) -> expr.
+        // This is semantically equivalent since single-element Parenthesized is purely
+        // syntactic grouping. Multi-element Parenthesized (row values like (x, y)) are
+        // left as-is.
+        Expr::Parenthesized(mut exprs) if exprs.len() == 1 => {
+            let inner = exprs.pop().expect("one expression in the parentheses");
+            break_predicate_at_and_boundaries(*inner, out_predicates);
+        }
+        predicate => {
+            out_predicates.push(predicate.into());
         }
     }
 }
