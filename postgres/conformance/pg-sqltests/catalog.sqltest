@@ -247,17 +247,13 @@ expect {
     1|updated
 }
 
-@skip-if postgres "PostgreSQL fills pg_init_privs and pg_cast"
+@skip-if postgres "PostgreSQL fills pg_init_privs"
 test pg-function-support-catalogs-are-empty {
     SET search_path TO '';
     SELECT * FROM pg_init_privs;
     SELECT * FROM pg_catalog.pg_init_privs;
     SELECT objoid, classoid, objsubid, privtype, initprivs, tableoid FROM pg_init_privs;
     SELECT objoid, classoid, objsubid, privtype, initprivs, tableoid FROM pg_catalog.pg_init_privs;
-    SELECT * FROM pg_cast;
-    SELECT * FROM pg_catalog.pg_cast;
-    SELECT oid, castsource, casttarget, castfunc, castcontext, castmethod, tableoid FROM pg_cast;
-    SELECT oid, castsource, casttarget, castfunc, castcontext, castmethod, tableoid FROM pg_catalog.pg_cast;
     SELECT * FROM pg_transform;
     SELECT * FROM pg_catalog.pg_transform;
     SELECT oid, trftype, trflang, trffromsql, trftosql, tableoid FROM pg_transform;
@@ -274,6 +270,54 @@ test pg-init-privs-is-read-only {
 expect error {permission denied for table pg_init_privs}
 @sqlstate 42501
 expect @tursopg error {cannot delete from pg_catalog table "pg_init_privs"}
+
+test pg-cast-lists-the-casts-among-the-number-text-boolean-and-timestamp-types {
+    SELECT s.typname, t.typname, c.castcontext, c.castmethod
+    FROM pg_cast c
+    JOIN pg_type s ON s.oid = c.castsource
+    JOIN pg_type t ON t.oid = c.casttarget
+    WHERE s.typname IN ('int2', 'int4', 'int8', 'float4', 'float8', 'numeric', 'text', 'bool', 'timestamp', 'timestamptz')
+      AND t.typname IN ('int2', 'int4', 'int8', 'float4', 'float8', 'numeric', 'text', 'bool', 'timestamp', 'timestamptz')
+      AND s.typname <> t.typname
+    ORDER BY 1, 2;
+}
+expect {
+    bool|int4|e|f
+    bool|text|a|f
+    float4|float8|i|f
+    float4|int2|a|f
+    float4|int4|a|f
+    float4|int8|a|f
+    float4|numeric|a|f
+    float8|float4|a|f
+    float8|int2|a|f
+    float8|int4|a|f
+    float8|int8|a|f
+    float8|numeric|a|f
+    int2|float4|i|f
+    int2|float8|i|f
+    int2|int4|i|f
+    int2|int8|i|f
+    int2|numeric|i|f
+    int4|bool|e|f
+    int4|float4|i|f
+    int4|float8|i|f
+    int4|int2|a|f
+    int4|int8|i|f
+    int4|numeric|i|f
+    int8|float4|i|f
+    int8|float8|i|f
+    int8|int2|a|f
+    int8|int4|a|f
+    int8|numeric|i|f
+    numeric|float4|i|f
+    numeric|float8|i|f
+    numeric|int2|a|f
+    numeric|int4|a|f
+    numeric|int8|a|f
+    timestamp|timestamptz|i|f
+    timestamptz|timestamp|a|f
+}
 
 test pg-cast-is-read-only {
     CREATE ROLE reader_of_cast_is_read_only_role;
@@ -397,9 +441,6 @@ test pg-object-unsupported-catalogs-are-empty {
              CASE WHEN defaclobjtype = 'S' THEN 's'::"char" ELSE defaclobjtype END,
              defaclrole) ELSE '{}' END AS acldefault FROM pg_default_acl;
     SELECT tableoid, oid, conname, connamespace, conowner FROM pg_conversion;
-    SELECT tableoid, oid, castsource, casttarget, castfunc, castcontext, castmethod
-    FROM pg_cast c WHERE NOT EXISTS (SELECT 1 FROM pg_range r
-      WHERE c.castsource = r.rngtypid AND c.casttarget = r.rngmultitypid) ORDER BY 3,4;
     SELECT s.tableoid, s.oid, s.subname, s.subowner, s.subconninfo, s.subslotname,
            s.subsynccommit, s.subpublications, s.subbinary, s.substream,
            s.subtwophasestate, s.subdisableonerr, s.subpasswordrequired,

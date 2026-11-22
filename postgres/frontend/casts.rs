@@ -50,6 +50,10 @@ impl CastType {
         }
     }
 
+    pub(crate) fn oid(self) -> i64 {
+        crate::catalog::pg_type_oid(self.name()).expect("every cast type has a pg_type oid")
+    }
+
     /// The type with the name that `name()` gives.
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         Some(match name {
@@ -130,6 +134,24 @@ const CASTS: &[Cast] = &[
     cast(Timestamp, TimestampTz, I),
     cast(TimestampTz, Timestamp, A),
 ];
+
+/// The `oid` of the first row of `pg_cast`.
+pub(crate) const FIRST_CAST_OID: i64 = 10_000;
+
+/// The rows of `pg_cast`: source, target, the letter of the context and the
+/// letter of the method. Every cast in `CASTS` goes through a conversion
+/// function.
+pub(crate) fn cast_rows() -> impl Iterator<Item = (CastType, CastType, &'static str, &'static str)>
+{
+    CASTS.iter().map(|cast| {
+        let context = match cast.context {
+            CastContext::Implicit => "i",
+            CastContext::Assignment => "a",
+            CastContext::Explicit => "e",
+        };
+        (cast.source, cast.target, context, "f")
+    })
+}
 
 pub(crate) enum Resolution {
     Unchanged,
