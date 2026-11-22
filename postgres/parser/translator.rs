@@ -10497,6 +10497,9 @@ const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &[
     "pg_cast_oid",
     "pg_cast_regtype",
     "pg_cast_regclass",
+    "pg_cast_int2",
+    "pg_cast_int4",
+    "pg_cast_int8",
 ];
 
 fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
