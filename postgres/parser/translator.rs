@@ -3656,22 +3656,22 @@ impl PostgreSQLTranslator {
                     Ok(BoolTestType::IsTrue) => Ok(ast::Expr::Binary(
                         Box::new(expr),
                         ast::Operator::Is,
-                        Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".into()))),
+                        Box::new(ast::Expr::Literal(ast::Literal::True)),
                     )),
                     Ok(BoolTestType::IsNotTrue) => Ok(ast::Expr::Binary(
                         Box::new(expr),
                         ast::Operator::IsNot,
-                        Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".into()))),
+                        Box::new(ast::Expr::Literal(ast::Literal::True)),
                     )),
                     Ok(BoolTestType::IsFalse) => Ok(ast::Expr::Binary(
                         Box::new(expr),
                         ast::Operator::Is,
-                        Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".into()))),
+                        Box::new(ast::Expr::Literal(ast::Literal::False)),
                     )),
                     Ok(BoolTestType::IsNotFalse) => Ok(ast::Expr::Binary(
                         Box::new(expr),
                         ast::Operator::IsNot,
-                        Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".into()))),
+                        Box::new(ast::Expr::Literal(ast::Literal::False)),
                     )),
                     Ok(BoolTestType::IsUnknown) => Ok(ast::Expr::IsNull(Box::new(expr))),
                     Ok(BoolTestType::IsNotUnknown) => Ok(ast::Expr::NotNull(Box::new(expr))),

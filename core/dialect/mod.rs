@@ -715,6 +715,13 @@ pub trait Dialect: Send + Sync + 'static {
         OperatorResolution::Keep
     }
 
+    /// How the dialect resolves an operand of AND, OR, NOT or a CASE
+    /// condition. PostgreSQL needs a boolean there and reads a string literal
+    /// as one; SQLite takes any value.
+    fn resolve_boolean_argument(&self, _operand: &OperandType) -> OperatorResolution {
+        OperatorResolution::Keep
+    }
+
     /// Fails when the string literal `text` is not a value of the type that
     /// `CastUntyped` names. PostgreSQL reads the literal when it plans the
     /// statement, so a bad one fails even where the statement never uses it.

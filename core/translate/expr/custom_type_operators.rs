@@ -144,37 +144,49 @@ fn operand_slots(expr: &mut ast::Expr) -> Vec<&mut ast::Expr> {
 }
 
 /// The operators that `expr` applies to its operand slots, as pairs of slots
-/// with the operator's name.
+/// with the operator's name, and the slots that must be booleans with the
+/// name of what needs the boolean.
 struct OperatorUses<'a> {
     slots: Vec<&'a ast::Expr>,
     pairs: Vec<(usize, &'static str, usize)>,
+    booleans: Vec<(usize, &'static str)>,
 }
 
 fn operator_uses<'a>(expr: &'a ast::Expr) -> Option<OperatorUses<'a>> {
     let mut uses = OperatorUses {
         slots: Vec::new(),
         pairs: Vec::new(),
+        booleans: Vec::new(),
     };
     match expr {
         ast::Expr::Binary(lhs, op, rhs) => {
             uses.slots = vec![lhs.as_ref(), rhs.as_ref()];
             match op {
+                ast::Operator::And => uses.booleans = vec![(0, "AND"), (1, "AND")],
+                ast::Operator::Or => uses.booleans = vec![(0, "OR"), (1, "OR")],
                 ast::Operator::Is | ast::Operator::IsNot => {
-                    let is_boolean_test = matches!(
-                        rhs.as_ref(),
-                        ast::Expr::Literal(ast::Literal::Numeric(value))
-                            if value == "0" || value == "1"
-                    );
-                    if !is_boolean_test {
-                        uses.pairs = vec![(0, "=", 1)];
+                    let tested = match rhs.as_ref() {
+                        ast::Expr::Literal(ast::Literal::True) => Some("TRUE"),
+                        ast::Expr::Literal(ast::Literal::False) => Some("FALSE"),
+                        _ => None,
+                    };
+                    match (tested, op) {
+                        (Some("TRUE"), ast::Operator::Is) => uses.booleans = vec![(0, "IS TRUE")],
+                        (Some("TRUE"), _) => uses.booleans = vec![(0, "IS NOT TRUE")],
+                        (Some(_), ast::Operator::Is) => uses.booleans = vec![(0, "IS FALSE")],
+                        (Some(_), _) => uses.booleans = vec![(0, "IS NOT FALSE")],
+                        (None, _) => uses.pairs = vec![(0, "=", 1)],
                     }
                 }
-                ast::Operator::And | ast::Operator::Or => return None,
                 _ => {
                     let symbol = comparison_symbol(op).or_else(|| binary_symbol(op))?;
                     uses.pairs = vec![(0, symbol, 1)];
                 }
             }
+        }
+        ast::Expr::Unary(ast::UnaryOperator::Not, operand) => {
+            uses.slots = vec![operand.as_ref()];
+            uses.booleans = vec![(0, "NOT")];
         }
         ast::Expr::Like { lhs, op, rhs, .. } => {
             let symbol = match op {
@@ -210,7 +222,12 @@ fn operator_uses<'a>(expr: &'a ast::Expr) -> Option<OperatorUses<'a>> {
                         .map(|index| (0, "=", index))
                         .collect();
                 }
-                None => return None,
+                None => {
+                    uses.slots = whens.collect();
+                    uses.booleans = (0..when_then_pairs.len())
+                        .map(|index| (index, "CASE/WHEN"))
+                        .collect();
+                }
             }
         }
         _ => return None,
@@ -219,12 +236,17 @@ fn operator_uses<'a>(expr: &'a ast::Expr) -> Option<OperatorUses<'a>> {
 }
 
 /// The slots of `expr` whose string literal the dialect casts, with the type
-/// to cast to. Fails when the dialect has no operator for the operands.
+/// to cast to. Fails when the dialect has no operator for the operands, or an
+/// operand that must be a boolean is another type.
 fn literal_casts(expr: &ast::Expr, env: &TypeEnv) -> Result<Vec<(usize, String)>> {
     let (Some(resolver), Some(uses)) = (env.resolver(), operator_uses(expr)) else {
         return Ok(Vec::new());
     };
-    let OperatorUses { slots, pairs } = uses;
+    let OperatorUses {
+        slots,
+        pairs,
+        booleans,
+    } = uses;
     if slots.iter().any(|slot| is_hidden_column(slot, env)) {
         return Ok(Vec::new());
     }
@@ -272,6 +294,28 @@ fn literal_casts(expr: &ast::Expr, env: &TypeEnv) -> Result<Vec<(usize, String)>
                     }
                 }
             }
+        }
+    }
+    for (slot, what) in booleans {
+        // A column of a SQLite type may hold a boolean, as the columns of the
+        // catalogs do, so only a literal or a value of a registered type is
+        // refused.
+        let is_exact = matches!(types[slot], ExprType::Custom { .. })
+            || matches!(without_wrappers(slots[slot]), ast::Expr::Literal(_));
+        if !is_exact {
+            continue;
+        }
+        match resolver
+            .catalog
+            .dialect
+            .resolve_boolean_argument(&dialect_operand_type(&types[slot]))
+        {
+            OperatorResolution::Keep => {}
+            OperatorResolution::Reject => {
+                let ty = &types[slot];
+                crate::bail_parse_error!("argument of {what} must be type boolean, not type {ty}");
+            }
+            OperatorResolution::CastUntyped(type_name) => add_cast(slot, &type_name, false),
         }
     }
     Ok(casts)

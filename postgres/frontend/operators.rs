@@ -174,6 +174,18 @@ pub(crate) fn resolve_operator(op: &str, operands: &[OperandType]) -> OperatorRe
     }
 }
 
+/// PostgreSQL requires the operand of AND, OR, NOT and a CASE condition to be
+/// a boolean, and reads a string literal as one.
+pub(crate) fn resolve_boolean_argument(operand: &OperandType) -> OperatorResolution {
+    match operand {
+        OperandType::Untyped => OperatorResolution::CastUntyped("bool".to_string()),
+        operand => match known_type(operand) {
+            Some(Bool) | None => OperatorResolution::Keep,
+            Some(_) => OperatorResolution::Reject,
+        },
+    }
+}
+
 fn resolve_prefix(op: &str, operand: &OperandType) -> OperatorResolution {
     let Some(ty) = known_type(operand) else {
         return OperatorResolution::Keep;

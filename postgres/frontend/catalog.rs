@@ -279,6 +279,13 @@ impl Dialect for PostgresDialect {
         crate::operators::resolve_operator(op, &operands())
     }
 
+    fn resolve_boolean_argument(
+        &self,
+        operand: &turso_core::dialect::OperandType,
+    ) -> turso_core::dialect::OperatorResolution {
+        crate::operators::resolve_boolean_argument(operand)
+    }
+
     fn check_literal_cast(&self, text: &str, type_name: &str) -> Result<()> {
         crate::casts::check_literal_cast(text, type_name)
     }

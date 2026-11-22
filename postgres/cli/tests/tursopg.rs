@@ -1583,8 +1583,8 @@ fn wire_comparison_and_logical_report_bool() {
         assert_eq!(c.query_column_oids("SELECT 1 = 1"), vec![OID_BOOL]);
         assert_eq!(c.query_column_oids("SELECT 2 < 3"), vec![OID_BOOL]);
         assert_eq!(c.query_column_oids("SELECT 5 > 4"), vec![OID_BOOL]);
-        assert_eq!(c.query_column_oids("SELECT 1 AND 0"), vec![OID_BOOL]);
-        assert_eq!(c.query_column_oids("SELECT 1 OR 0"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT true AND false"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT true OR false"), vec![OID_BOOL]);
         // Nested: arithmetic feeding a comparison still propagates correctly.
         assert_eq!(c.query_column_oids("SELECT 42 + 1 = 43"), vec![OID_BOOL]);
     });
@@ -1610,7 +1610,7 @@ fn wire_unary_and_parens_propagate() {
         assert_eq!(c.query_column_oids("SELECT -42"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT +5"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT (1 + 2) * 3"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT NOT 1"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT NOT true"), vec![OID_BOOL]);
     });
 }
 
