@@ -495,7 +495,7 @@ fn access_method_emits_unique_order_prefix(
         AccessMethodParams::Subquery { .. }
         | AccessMethodParams::RecursiveCteInput
         | AccessMethodParams::HashJoin { .. }
-        | AccessMethodParams::VirtualTable { .. }
+        | AccessMethodParams::VirtualTable(_)
         | AccessMethodParams::IndexMethod { .. }
         | AccessMethodParams::MultiIndexScan { .. }
         | AccessMethodParams::InSeek { .. } => false,

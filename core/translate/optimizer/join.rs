@@ -1085,7 +1085,7 @@ fn join_lhs_and_rhs<'a, 'w>(
                 estimated_rows_per_outer_row: cost_estimate.estimated_rows as f64,
                 consumed_where_terms: candidate.where_covered.into_iter().try_collect()?,
                 params: AccessMethodParams::IndexMethod {
-                    query: candidate.to_query(),
+                    query: Box::new(candidate.to_query()),
                     where_covered: candidate.where_covered,
                 },
             };
