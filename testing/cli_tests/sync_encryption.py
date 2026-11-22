@@ -50,14 +50,7 @@ class EncryptedSync(unittest.TestCase):
             env = {**os.environ, "SYNC_E2E_CIPHER": cipher or "none"}
             replica = tmp / "replica.db"
             source = dbs / "example/data" if directory else tmp / "source.db"
-            if mvcc and not cipher:
-                source.parent.mkdir(parents=True, exist_ok=True)
-                prepared = subprocess.run(
-                    [str(CLI), str(source), "PRAGMA journal_mode=mvcc; CREATE TABLE legacy(value); "
-                     "INSERT INTO legacy VALUES ('existing row'); PRAGMA wal_checkpoint(TRUNCATE);"],
-                    capture_output=True, text=True, timeout=30,
-                )
-                self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+            self.prepare_legacy_source(source, mvcc and not cipher)
 
             def run(action, sql=None, path=replica, environment=env, remote=url):
                 result = subprocess.run([str(DRIVER), str(path), remote, action] + ([sql] if sql else []),
@@ -112,6 +105,7 @@ class EncryptedSync(unittest.TestCase):
                 run("pull")
                 self.assertEqual(run("scalar", "SELECT count(*) FROM items")["value"], 3)
                 if not mvcc:
+                    self.check_partial_checkpoint_reads(run, pipeline, cipher)
                     pipeline("PRAGMA wal_checkpoint(TRUNCATE)")
                 # Fresh replicas need base pages even when the WAL is empty.
                 fresh = tmp / "fresh.db"
@@ -123,12 +117,10 @@ class EncryptedSync(unittest.TestCase):
                 self.assertEqual(
                     run("scalar", "SELECT count(*) FROM items", path=plain, environment=plain_env)["value"], 3
                 )
-                for path in [source, Path(str(source) + "-wal"), source.with_suffix(".db-log"), replica,
-                             Path(str(replica) + "-info")]:
-                    if cipher and path.exists():
-                        data = path.read_bytes()
-                        self.assertNotIn(b"client secret", data, str(path))
-                        self.assertNotIn(b"server secret", data, str(path))
+                self.assert_encrypted_files(cipher, [
+                    source, Path(str(source) + "-wal"), source.with_suffix(".db-log"), replica,
+                    Path(str(replica) + "-info"),
+                ])
                 if mvcc:
                     before = run("scalar", "SELECT count(*) FROM items", remote="-")
                     source_log = source.with_suffix(".db-log")
@@ -152,6 +144,36 @@ class EncryptedSync(unittest.TestCase):
             finally:
                 stop_server(process)
                 log.close()
+
+    def check_partial_checkpoint_reads(self, run, pipeline, cipher):
+        if cipher:
+            return
+        pipeline("CREATE TABLE lazy_items(id INTEGER PRIMARY KEY, value TEXT)")
+        pipeline("INSERT INTO lazy_items SELECT value, 'old'||printf('%0500d', value) "
+                 "FROM generate_series(1, 200)")
+        for mode in ["PASSIVE", "FULL"]:
+            pipeline("UPDATE lazy_items SET value = 'old'||substr(value, 4)")
+            self.assertEqual(run("partial-checkpoint", mode, path=Path(":memory:"))["value"], 200)
+
+    def prepare_legacy_source(self, source, enabled):
+        if not enabled:
+            return
+        source.parent.mkdir(parents=True, exist_ok=True)
+        prepared = subprocess.run(
+            [str(CLI), str(source), "PRAGMA journal_mode=mvcc; CREATE TABLE legacy(value); "
+             "INSERT INTO legacy VALUES ('existing row'); PRAGMA wal_checkpoint(TRUNCATE);"],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+
+    def assert_encrypted_files(self, cipher, paths):
+        if not cipher:
+            return
+        for path in paths:
+            if path.exists():
+                data = path.read_bytes()
+                self.assertNotIn(b"client secret", data, str(path))
+                self.assertNotIn(b"server secret", data, str(path))
 
     def wait_for_server(self, process, log, port):
         for _ in range(100):

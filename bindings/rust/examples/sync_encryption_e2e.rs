@@ -1,5 +1,6 @@
 //! Real HTTP test driver used by the server's encrypted sync end-to-end suite.
-use turso::sync::{Builder, RemoteEncryptionCipher};
+use turso::sync::{Builder, PartialSyncOpts, RemoteEncryptionCipher};
+use turso_sync_sdk_kit::rsapi::PartialBootstrapStrategy;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,6 +16,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let cipher = std::env::var("SYNC_E2E_CIPHER").unwrap_or_else(|_| "aes256gcm".into());
     let mut builder = Builder::new_remote(path);
+    if action == "partial-checkpoint" {
+        builder = builder.with_partial_sync_opts_experimental(PartialSyncOpts {
+            bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix { length: 8192 }),
+            segment_size: 4096,
+            prefetch: false,
+        });
+    }
     if cipher != "none" {
         builder = builder.with_encryption(
             cipher.parse::<RemoteEncryptionCipher>()?,
@@ -53,6 +61,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "checkpoint" => {
             db.checkpoint().await?;
+        }
+        "partial-checkpoint" => {
+            let mode = args.get(4).expect("checkpoint mode");
+            assert!(matches!(mode.as_str(), "PASSIVE" | "FULL"));
+            for sql in [
+                "UPDATE lazy_items SET value = 'new'||substr(value, 4)".to_string(),
+                format!("PRAGMA wal_checkpoint({mode})"),
+            ] {
+                let response: serde_json::Value = reqwest::Client::new()
+                    .post(format!("{url}/v2/pipeline"))
+                    .json(&serde_json::json!({"requests": [{"type": "execute", "stmt": {"sql": sql}}]}))
+                    .send().await?.error_for_status()?.json().await?;
+                assert_eq!(response["results"][0]["type"], "ok", "{response}");
+            }
+            let mut rows = conn
+                .query("SELECT sum(value LIKE 'old%') FROM lazy_items", ())
+                .await?;
+            value = Some(rows.next().await?.expect("one row").get::<i64>(0)?);
+            let mut rows = conn
+                .query(
+                    "SELECT count(*)||' '||sum(value LIKE 'new%') FROM lazy_items",
+                    (),
+                )
+                .await?;
+            assert_eq!(rows.next().await?.unwrap().get::<String>(0)?, "200 0");
+            let mut rows = conn.query("PRAGMA integrity_check", ()).await?;
+            assert_eq!(rows.next().await?.unwrap().get::<String>(0)?, "ok");
         }
         _ => panic!("unknown action"),
     }

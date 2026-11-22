@@ -1128,12 +1128,40 @@ impl TursoSyncServer {
         let pages_capacity = usize::try_from(pages_capacity)
             .map_err(|_| anyhow!("database page count does not fit usize: {db_size}"))?;
         let mut pages = Vec::with_capacity(pages_capacity);
+        let mut historical_pages = HashMap::new();
+        if max_frame < wal_state.max_frame && pages_capacity > 0 {
+            // A checkpoint can advance the database file past this revision
+            // while its older page versions are still retained in the WAL.
+            let mut frame = vec![0; WAL_FRAME_HEADER_SIZE + PAGE_SIZE];
+            for frame_no in (1..=max_frame).rev() {
+                let info = conn.wal_get_frame(frame_no, &mut frame)?;
+                let page_id = info
+                    .page_no
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow!("WAL frame has an invalid page number"))?;
+                if u64::from(page_id) >= db_size
+                    || pages_selector.is_some_and(|selected| !selected.contains(page_id))
+                {
+                    continue;
+                }
+                historical_pages
+                    .entry(u64::from(page_id))
+                    .or_insert_with(|| frame[WAL_FRAME_HEADER_SIZE..].to_vec());
+                if historical_pages.len() == pages_capacity {
+                    break;
+                }
+            }
+        }
 
         let page_ids = match pages_selector {
             Some(selected) => Either::Left(selected.iter().map(u64::from)),
             None => Either::Right(0..db_size),
         };
         for page_id in page_ids.take_while(|&id| id < db_size) {
+            if let Some(page) = historical_pages.remove(&page_id) {
+                pages.push((page_id, page));
+                continue;
+            }
             let page_no = page_id + 1;
             let page_no_u32 = u32::try_from(page_no)
                 .map_err(|_| anyhow!("database page number does not fit u32: {page_no}"))?;
@@ -2295,6 +2323,75 @@ mod tests {
             assert!(page.encoded_page.windows(9).any(|w| w == b"old value"));
             assert!(!page.encoded_page.windows(9).any(|w| w == b"new value"));
         }
+    }
+
+    #[test]
+    fn plaintext_pinned_pages_survive_nontruncating_checkpoints() {
+        for mode in ["PASSIVE", "FULL"] {
+            let dir = tempfile::tempdir().unwrap();
+            let server = plaintext_server(dir.path(), false);
+            let handle = server
+                .resolve_db(None)
+                .unwrap_or_else(|_| panic!("open source"));
+            let mut selector = Vec::new();
+            RoaringBitmap::from_iter([1, u32::MAX])
+                .serialize_into(&mut selector)
+                .unwrap();
+            let revision = {
+                let conn = handle.conn.lock().unwrap();
+                conn.execute("CREATE TABLE items(value TEXT)").unwrap();
+                conn.execute("INSERT INTO items VALUES ('old value')")
+                    .unwrap();
+                conn.wal_state().unwrap().max_frame.to_string()
+            };
+            let request = PullUpdatesReqProtoBody {
+                server_revision: revision,
+                server_pages_selector: selector.into(),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            let original = server.handle_pull_updates(&handle, &request).unwrap();
+            {
+                let conn = handle.conn.lock().unwrap();
+                conn.execute("UPDATE items SET value = 'new value'")
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO items SELECT printf('%0500d', value) FROM generate_series(1, 200)",
+                )
+                .unwrap();
+                conn.execute(format!("PRAGMA wal_checkpoint({mode})"))
+                    .unwrap();
+            }
+            let response = server.handle_pull_updates(&handle, &request).unwrap();
+            assert_eq!(response.body, original.body, "{mode}");
+        }
+    }
+
+    #[test]
+    fn pinned_pages_missing_from_retained_wal_do_not_read_newer_main() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = plaintext_server(dir.path(), false);
+        let handle = server
+            .resolve_db(None)
+            .unwrap_or_else(|_| panic!("open source"));
+        let revision = {
+            let conn = handle.conn.lock().unwrap();
+            conn.execute("CREATE TABLE items(value TEXT)").unwrap();
+            conn.execute("INSERT INTO items VALUES ('old value')")
+                .unwrap();
+            conn.execute("CREATE TABLE other(value TEXT)").unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.execute("INSERT INTO other VALUES ('pin')").unwrap();
+            let revision = conn.wal_state().unwrap().max_frame;
+            conn.execute("UPDATE items SET value = 'new value'")
+                .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+            revision
+        };
+        let selector = RoaringBitmap::from_iter([1]);
+        assert!(server
+            .read_snapshot_pages(&handle, Some(revision), Some(&selector))
+            .is_err());
     }
 
     #[test]
