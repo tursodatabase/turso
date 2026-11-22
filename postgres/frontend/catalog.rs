@@ -165,6 +165,10 @@ impl Dialect for PostgresDialect {
         }
     }
 
+    fn is_frontend_table_sql(&self, sql: &str) -> bool {
+        decode_stored_pg_schema_sql(sql).is_some()
+    }
+
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
             return turso_core::dialect::table_sql_for_replay(self, sql);

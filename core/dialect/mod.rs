@@ -220,6 +220,15 @@ pub trait Dialect: Send + Sync + 'static {
         table_sql_for_replay(self, sql)
     }
 
+    /// Whether `sql`, as stored in `sqlite_schema`, was written by this
+    /// dialect's frontend, so that it replays through the dialect's parser. SQL
+    /// that the engine wrote itself, such as the table behind a sequence, is
+    /// SQLite text and replays as such. The default treats every table as
+    /// frontend SQL.
+    fn is_frontend_table_sql(&self, _sql: &str) -> bool {
+        true
+    }
+
     /// Produce the SQL text to store in `sqlite_schema` for a
     /// `CREATE TABLE`.
     ///
