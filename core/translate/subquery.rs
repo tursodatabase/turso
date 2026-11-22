@@ -591,6 +591,42 @@ pub fn plan_subqueries_from_returning(
     Ok(())
 }
 
+/// Compute query plans for subqueries in an UPSERT's DO UPDATE SET value or
+/// WHERE clause, which can reference the row of the target table that
+/// conflicted.
+pub fn plan_subqueries_from_upsert_do_update(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    expr: &mut ast::Expr,
+    origin: SubqueryOrigin,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let position = match origin {
+        SubqueryOrigin::DmlSet => SubqueryPosition::ResultColumn,
+        SubqueryOrigin::DmlWhere => SubqueryPosition::Where,
+        _ => unreachable!("DO UPDATE has only SET values and a WHERE clause"),
+    };
+    plan_subqueries_with_outer_query_access(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        resolver,
+        std::iter::once(expr),
+        connection,
+        position,
+        origin,
+        position.allow_correlated(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &[],
+    )?;
+
+    update_column_used_masks(table_references, non_from_clause_subqueries)?;
+    Ok(())
+}
+
 /// Plan subqueries in an expression that has no FROM clause, such as a trigger
 /// WHEN clause or a VACUUM INTO path, so there are no outer query references.
 /// Trigger NEW/OLD references should already be rewritten to Expr::Register.

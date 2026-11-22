@@ -24,16 +24,17 @@ use crate::translate::fkeys::{
     fire_fk_update_actions, ParentKeyNewProbeMode,
 };
 use crate::translate::insert::{
-    emit_remember_written_rowid, emit_returning_subqueries, format_unique_violation_desc,
-    InsertEmitCtx,
+    emit_remember_written_rowid, emit_returning_subqueries, expr_contains_subquery,
+    format_unique_violation_desc, InsertEmitCtx,
 };
 use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::row_security::{emit_row_checks, UpsertRowChecks};
 use crate::translate::trigger_exec::{
-    fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
+    fire_trigger, get_triggers_including_temp, has_triggers_including_temp,
+    rewrite_select_expressions, TriggerContext,
 };
-use crate::translate::update::rowid_name_column_index;
+use crate::translate::update::{rowid_name_column_index, split_update_set_values};
 use crate::vdbe::insn::{to_u32, CmpInsFlags, ConstraintInfo};
 use crate::{
     bail_parse_error,
@@ -45,12 +46,16 @@ use crate::{
         },
         expr::{
             emit_constraint_values_decode, emit_returning_results, emit_table_column,
-            expr_type::column_custom_type_names, process_returning_clause, translate_expr,
-            translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
+            expr_type::column_custom_type_names, process_returning_clause,
+            restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
+            translate_expr, translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
         },
         insert::Insertion,
-        plan::{ResultSetColumn, TableReferences},
-        subquery::plan_subqueries_from_returning,
+        plan::{EvalAt, NonFromClauseSubquery, ResultSetColumn, SubqueryOrigin, TableReferences},
+        subquery::{
+            emit_non_from_clause_subquery, plan_subqueries_from_returning,
+            plan_subqueries_from_upsert_do_update,
+        },
     },
     util::{exprs_are_equivalent, normalize_ident},
     vdbe::{
@@ -491,7 +496,7 @@ pub fn emit_upsert(
     table: &Table,
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
-    set_pairs: &mut [(usize, Box<ast::Expr>)],
+    sets: &mut [ast::Set],
     set_column_names: &[ast::Name],
     where_clause: &mut Option<Box<ast::Expr>>,
     resolver: &mut Resolver,
@@ -665,11 +670,9 @@ pub fn emit_upsert(
     // registers say which type they hold.
     let decoded_column_types: Option<Vec<Option<Box<ast::Type>>>> = decoded_current_start
         .map(|_| column_custom_type_names(table.columns(), is_strict, resolver.schema()));
-
-    // WHERE on target row
-    if let Some(pred) = where_clause.as_mut() {
+    let rewrite_to_registers = |expr: &mut ast::Expr| {
         rewrite_expr_to_registers(
-            pred,
+            expr,
             table,
             expr_current_start,
             ctx.conflict_rowid_reg,
@@ -679,6 +682,24 @@ pub fn emit_upsert(
             true,
             excluded_decoded_start,
             decoded_column_types.as_deref(),
+            &layout,
+        )
+    };
+
+    // WHERE on target row
+    if let Some(pred) = where_clause.as_mut() {
+        rewrite_to_registers(pred.as_mut())?;
+        emit_do_update_subqueries(
+            program,
+            resolver,
+            connection,
+            table_references,
+            table_alias,
+            std::iter::once(pred.as_mut()),
+            SubqueryOrigin::DmlWhere,
+            &rewrite_to_registers,
+            current_start,
+            ctx.conflict_rowid_reg,
             &layout,
         )?;
         let pr = program.alloc_register();
@@ -707,22 +728,28 @@ pub fn emit_upsert(
         }),
     )?;
 
-    // Apply SET; capture rowid change if any
+    // Apply SET; capture rowid change if any. As in UPDATE, the subqueries are
+    // planned before the SET clauses are split, so that `SET (a, b) = (SELECT ...)`
+    // knows how many values the subquery gives.
+    for set in sets.iter_mut() {
+        rewrite_to_registers(set.expr.as_mut())?;
+    }
+    emit_do_update_subqueries(
+        program,
+        resolver,
+        connection,
+        table_references,
+        table_alias,
+        sets.iter_mut().map(|set| set.expr.as_mut()),
+        SubqueryOrigin::DmlSet,
+        &rewrite_to_registers,
+        current_start,
+        ctx.conflict_rowid_reg,
+        &layout,
+    )?;
+    let set_pairs = &collect_set_clauses_for_upsert(table, sets, resolver)?;
     let mut new_rowid_reg: Option<usize> = None;
-    for (col_idx, expr) in set_pairs.iter_mut() {
-        rewrite_expr_to_registers(
-            expr,
-            table,
-            expr_current_start,
-            ctx.conflict_rowid_reg,
-            Some(table.get_name()),
-            table_alias,
-            Some(insertion),
-            true,
-            excluded_decoded_start,
-            decoded_column_types.as_deref(),
-            &layout,
-        )?;
+    for (col_idx, expr) in set_pairs {
         if *col_idx == ROWID_SENTINEL {
             let r = program.alloc_register();
             translate_expr_no_constant_opt(
@@ -1771,6 +1798,210 @@ pub fn emit_upsert(
     Ok(())
 }
 
+/// Plans and emits the subqueries in DO UPDATE SET values or in its WHERE
+/// clause, leaving each expression to read the results from registers. A
+/// subquery sees the conflicting row as it was before the update. As in SQLite,
+/// a subquery that reads that row or `excluded` runs for every conflicting row,
+/// and any other runs once, at the first conflict.
+#[allow(clippy::too_many_arguments)]
+fn emit_do_update_subqueries<'a>(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    connection: &Arc<Connection>,
+    table_references: &TableReferences,
+    table_alias: Option<&str>,
+    exprs: impl Iterator<Item = &'a mut ast::Expr>,
+    origin: SubqueryOrigin,
+    rewrite_to_registers: &dyn Fn(&mut ast::Expr) -> crate::Result<WalkControl>,
+    current_start: usize,
+    rowid_reg: usize,
+    layout: &ColumnLayout,
+) -> crate::Result<()> {
+    let exprs: Vec<&mut ast::Expr> = exprs.filter(|e| expr_contains_subquery(e)).collect();
+    if exprs.is_empty() {
+        return Ok(());
+    }
+    // DO UPDATE names the target by its alias when the INSERT gives one, where
+    // RETURNING names it by the table's name.
+    let mut table_references = table_references.clone();
+    if let Some(alias) = table_alias {
+        let target = &mut table_references.joined_tables_mut()[0];
+        target.identifier = normalize_ident(alias);
+        target.has_alias = true;
+    }
+
+    // Each subquery, and whether it reads `excluded`.
+    let mut subqueries: Vec<(NonFromClauseSubquery, bool)> = vec![];
+    for expr in exprs {
+        walk_expr_mut(
+            expr,
+            &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+                if !matches!(
+                    e,
+                    ast::Expr::Exists(_) | ast::Expr::Subquery(_) | ast::Expr::InSelect { .. }
+                ) {
+                    return Ok(WalkControl::Continue);
+                }
+                let reads_excluded = rewrite_excluded_in_subqueries(e, rewrite_to_registers)?;
+                let mut planned = vec![];
+                plan_subqueries_from_upsert_do_update(
+                    program,
+                    &mut planned,
+                    &mut table_references,
+                    e,
+                    origin,
+                    resolver,
+                    connection,
+                )?;
+                subqueries.extend(
+                    planned
+                        .into_iter()
+                        .map(|subquery| (subquery, reads_excluded)),
+                );
+                Ok(WalkControl::SkipChildren)
+            },
+        )?;
+    }
+
+    // Only a correlated subquery reads the conflicting row.
+    let cache_state = subqueries
+        .iter()
+        .any(|(subquery, _)| subquery.correlated)
+        .then(|| {
+            seed_returning_row_image_in_cache(
+                program,
+                &table_references,
+                current_start,
+                rowid_reg,
+                resolver,
+                layout,
+            )
+        })
+        .transpose()?;
+    let result: crate::Result<()> = (|| {
+        for (mut subquery, reads_excluded) in subqueries {
+            let plan = subquery.consume_plan(EvalAt::Loop(0));
+            // The planner does not see `excluded` read through a register, so a
+            // subquery nested in this one that reads it is guarded by Once.
+            // Clear those guards, as each trigger firing does, so that it runs
+            // again for every row.
+            let region_end = reads_excluded.then(|| {
+                let region_end = program.allocate_label();
+                program.emit_insn(Insn::ResetOnce { region_end });
+                region_end
+            });
+            emit_non_from_clause_subquery(
+                program,
+                resolver,
+                *plan,
+                &subquery.query_type,
+                subquery.correlated || reads_excluded,
+            )?;
+            if let Some(region_end) = region_end {
+                program.preassign_label_to_next_insn(region_end);
+            }
+        }
+        Ok(())
+    })();
+    if let Some(cache_state) = cache_state {
+        restore_returning_row_image_in_cache(resolver, cache_state);
+    }
+    result
+}
+
+/// Rewrites each `excluded.<column>` inside the subqueries of `expr` as
+/// `rewrite_to_registers` rewrites it outside them, and says whether there was
+/// one. Every other name in a subquery is left for the subquery's planning,
+/// which looks it up in the subquery's own tables before the target table.
+fn rewrite_excluded_in_subqueries(
+    expr: &mut ast::Expr,
+    rewrite_to_registers: &dyn Fn(&mut ast::Expr) -> crate::Result<WalkControl>,
+) -> crate::Result<bool> {
+    let mut reads_excluded = false;
+    walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            rewrite_excluded_name(e, rewrite_to_registers, &mut reads_excluded)?;
+            Ok(WalkControl::Continue)
+        },
+    )?;
+    Ok(reads_excluded)
+}
+
+fn rewrite_excluded_name(
+    expr: &mut ast::Expr,
+    rewrite_to_registers: &dyn Fn(&mut ast::Expr) -> crate::Result<WalkControl>,
+    reads_excluded: &mut bool,
+) -> crate::Result<()> {
+    if let ast::Expr::Exists(select)
+    | ast::Expr::Subquery(select)
+    | ast::Expr::InSelect { rhs: select, .. } = expr
+    {
+        // A table the subquery calls `excluded` hides the inserted row from it,
+        // and from the subqueries inside it.
+        if select_names_excluded(select) {
+            return Ok(());
+        }
+        return rewrite_select_expressions(select, &mut |e: &mut ast::Expr| {
+            rewrite_excluded_name(e, rewrite_to_registers, reads_excluded)
+        });
+    }
+    if names_excluded(expr) {
+        *reads_excluded = true;
+        rewrite_to_registers(expr)?;
+    }
+    Ok(())
+}
+
+fn names_excluded(expr: &ast::Expr) -> bool {
+    matches!(
+        expr,
+        ast::Expr::Qualified(ns, _) | ast::Expr::DoublyQualified(_, ns, _)
+            if normalize_ident(ns.as_str()) == "excluded"
+    )
+}
+
+/// Whether a FROM clause of `select`, outside its subqueries, has a table
+/// named or aliased `excluded`.
+fn select_names_excluded(select: &ast::Select) -> bool {
+    std::iter::once(&select.body.select)
+        .chain(
+            select
+                .body
+                .compounds
+                .iter()
+                .map(|compound| &compound.select),
+        )
+        .any(|one_select| {
+            matches!(
+                one_select,
+                ast::OneSelect::Select { from: Some(from), .. } if from_clause_names_excluded(from)
+            )
+        })
+}
+
+fn from_clause_names_excluded(from: &ast::FromClause) -> bool {
+    std::iter::once(from.select.as_ref())
+        .chain(from.joins.iter().map(|join| join.table.as_ref()))
+        .any(|table| {
+            let name = match table {
+                ast::SelectTable::Table(name, alias, _)
+                | ast::SelectTable::TableCall(name, _, alias) => {
+                    alias.as_ref().map_or(&name.name, ast::As::name)
+                }
+                ast::SelectTable::Select { alias, .. } => match alias {
+                    Some(alias) => alias.name(),
+                    None => return false,
+                },
+                ast::SelectTable::Sub(from, alias) => match alias {
+                    Some(alias) => alias.name(),
+                    None => return from_clause_names_excluded(from),
+                },
+            };
+            normalize_ident(name.as_str()) == "excluded"
+        })
+}
+
 /// The resolve type a constraint Halt in the DO UPDATE arm carries. SQLite
 /// runs that UPDATE with ABORT whatever the statement's OR clause is
 /// (`sqlite3UpsertDoUpdate` passes `OE_Abort`). A Halt without an override
@@ -1840,12 +2071,13 @@ fn emit_generated_column_notnull_checks(
 
 /// Normalize the `SET` clause into `(column_index, Expr)` pairs using table layout.
 ///
-/// Supports multi-target row-value SETs: `SET (a, b) = (expr1, expr2)`.
+/// Supports multi-target row-value SETs: `SET (a, b) = (expr1, expr2)` and
+/// `SET (a, b) = (SELECT ...)`, whose subquery is planned already.
 /// Enforces same number of column names and RHS values.
 /// If the same column is assigned multiple times, the last assignment wins.
-pub fn collect_set_clauses_for_upsert(
+fn collect_set_clauses_for_upsert(
     table: &Table,
-    set_items: &mut [ast::Set],
+    set_items: &[ast::Set],
     resolver: &Resolver,
 ) -> crate::Result<Vec<(usize, Box<ast::Expr>)>> {
     let lookup: HashMap<String, usize> = table
@@ -1858,18 +2090,9 @@ pub fn collect_set_clauses_for_upsert(
     let mut out: Vec<(usize, Box<ast::Expr>)> = vec![];
 
     for set in set_items {
-        let values: Vec<Box<ast::Expr>> = match set.expr.as_ref() {
-            ast::Expr::Parenthesized(v) => v.clone(),
-            e => vec![e.clone().into()],
-        };
-        if set.col_names.len() != values.len() {
-            bail_parse_error!(
-                "{} columns assigned {} values",
-                set.col_names.len(),
-                values.len()
-            );
-        }
-        for (cn, mut e) in set.col_names.iter().zip(values.into_iter()) {
+        let values = split_update_set_values(set.expr.as_ref().clone(), set.col_names.len())?;
+        for (cn, e) in set.col_names.iter().zip(values) {
+            let mut e = Box::new(e);
             let ident = normalize_ident(cn.as_str());
             let idx = match lookup.get(&ident) {
                 Some(idx) => {
