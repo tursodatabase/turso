@@ -1,21 +1,30 @@
 use turso_core::{CipherMode, ConnectOpts, EncryptionContext, EncryptionKey, EncryptionOpts};
 
-use crate::{errors::Error, Result};
+use crate::{errors::Error, types::Secret, Result};
 
 #[derive(Clone, Debug)]
 pub struct SyncEncryption {
     cipher: CipherMode,
     local_key: Option<EncryptionKey>,
+    cloud_key: Option<Secret>,
 }
 
 impl SyncEncryption {
-    pub fn new(cipher: CipherMode, local_key: Option<EncryptionKey>) -> Result<Self> {
+    pub fn new(
+        cipher: CipherMode,
+        local_key: Option<EncryptionKey>,
+        cloud_key: Option<Secret>,
+    ) -> Result<Self> {
         if cipher == CipherMode::None {
             return Err(Error::DatabaseSyncEngineError(
                 "sync encryption requires a cipher".into(),
             ));
         }
-        let config = Self { cipher, local_key };
+        let config = Self {
+            cipher,
+            local_key,
+            cloud_key,
+        };
         config.local_context()?;
         Ok(config)
     }
@@ -24,6 +33,7 @@ impl SyncEncryption {
         Self::new(
             CipherMode::try_from(options.cipher.as_str())?,
             Some(EncryptionKey::from_hex_string(&options.hexkey)?),
+            None,
         )
     }
 
@@ -33,6 +43,10 @@ impl SyncEncryption {
 
     pub fn local_key(&self) -> Option<&EncryptionKey> {
         self.local_key.as_ref()
+    }
+
+    pub fn cloud_key(&self) -> Option<&Secret> {
+        self.cloud_key.as_ref()
     }
 
     pub(crate) fn local_context(&self) -> Result<Option<EncryptionContext>> {
@@ -65,23 +79,27 @@ mod tests {
 
     #[test]
     fn validates_keys_and_redacts_debug() {
-        assert!(SyncEncryption::new(CipherMode::None, None).is_err());
-        assert!(
-            SyncEncryption::new(CipherMode::Aes256Gcm, Some(EncryptionKey::new_128([1; 16])))
-                .is_err()
-        );
+        assert!(SyncEncryption::new(CipherMode::None, None, None).is_err());
+        assert!(SyncEncryption::new(
+            CipherMode::Aes256Gcm,
+            Some(EncryptionKey::new_128([1; 16])),
+            None
+        )
+        .is_err());
         let config = SyncEncryption::new(
             CipherMode::Aes256Gcm,
             Some(EncryptionKey::new_256([0xab; 32])),
+            Some(Secret::new("cloud-secret")),
         )
         .expect("config");
         assert!(!format!("{config:?}").contains(&"ab".repeat(32)));
+        assert!(!format!("{config:?}").contains("cloud-secret"));
         assert_eq!(
             config.local_options().expect("local options").hexkey,
             "ab".repeat(32)
         );
         let plaintext =
-            SyncEncryption::new(CipherMode::Aes256Gcm, None).expect("plaintext replica");
+            SyncEncryption::new(CipherMode::Aes256Gcm, None, None).expect("plaintext replica");
         assert!(plaintext.local_context().expect("local context").is_none());
     }
 }

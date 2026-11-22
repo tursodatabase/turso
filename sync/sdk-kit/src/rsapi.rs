@@ -273,7 +273,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             reserved_bytes: sync_config.reserved_bytes.unwrap_or(0),
             db_opts,
             partial_sync_opts: sync_config.partial_sync_opts.clone(),
-            remote_encryption_key: sync_config
+            legacy_remote_encryption_key: sync_config
                 .remote_encryption_key
                 .clone()
                 .map(turso_sync_engine::types::Secret::new),
@@ -334,7 +334,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_io.clone(),
                     &metadata,
                     &main_db_path,
-                    sync_engine_opts.remote_encryption_key.as_ref(),
+                    sync_engine_opts.remote_encryption_key(),
                 )?;
                 let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
                     turso_sdk_kit::rsapi::TursoDatabaseConfig {
@@ -397,7 +397,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_io.clone(),
                     &metadata,
                     &main_db_path,
-                    sync_engine_opts.remote_encryption_key.as_ref(),
+                    sync_engine_opts.remote_encryption_key(),
                 )?;
                 let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
                     turso_sdk_kit::rsapi::TursoDatabaseConfig {

@@ -67,8 +67,8 @@ pub struct DatabaseSyncEngineOpts {
     /// databases opened internally by the engine.
     pub db_opts: turso_core::DatabaseOpts,
     pub partial_sync_opts: Option<PartialSyncOpts>,
-    /// Base64-encoded encryption key for the Turso Cloud database
-    pub remote_encryption_key: Option<Secret>,
+    /// Cloud key for legacy page sync without a native encryption configuration.
+    pub legacy_remote_encryption_key: Option<Secret>,
     /// When set, [`DatabaseSyncEngine::push_changes_to_remote`] sends the local change set to the
     /// remote in multiple HTTP batches, sealing the current batch as soon as it
     /// has accumulated >= `push_operations_threshold` operations *and* the
@@ -106,6 +106,13 @@ pub struct DataStats {
 }
 
 impl DatabaseSyncEngineOpts {
+    pub fn remote_encryption_key(&self) -> Option<&Secret> {
+        match &self.encryption {
+            Some(config) => config.cloud_key(),
+            None => self.legacy_remote_encryption_key.as_ref(),
+        }
+    }
+
     pub fn local_encryption_context(&self) -> Result<Option<turso_core::EncryptionContext>> {
         let crypto = self
             .encryption
@@ -1036,7 +1043,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         tracing::info!("bootstrap_db(path={}): opts={:?}", main_db_path, opts);
         let local_crypto = opts.local_encryption_context()?;
         if local_crypto.is_some() && meta.is_none() {
-            if !opts.bootstrap_if_empty || opts.remote_encryption_key.is_none() {
+            if !opts.bootstrap_if_empty || opts.remote_encryption_key().is_none() {
                 return Err(Error::DatabaseSyncEngineError(
                     "encrypted sync creation requires a cloud key and full bootstrap".into(),
                 ));
@@ -1147,7 +1154,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
             ensure_logical_mvcc_pull_supported(
                 partial,
-                opts.remote_encryption_key.as_ref(),
+                opts.remote_encryption_key(),
                 opts.encryption.as_ref(),
             )?;
         }
@@ -1171,7 +1178,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 if meta.remote_pull_protocol == RemotePullProtocol::MvccLogical {
                     ensure_logical_mvcc_pull_supported(
                         partial,
-                        opts.remote_encryption_key.as_ref(),
+                        opts.remote_encryption_key(),
                         opts.encryption.as_ref(),
                     )?;
                 }
@@ -1195,9 +1202,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         coro,
                         &sync_engine_io,
                         opts.remote_url.clone(),
-                        opts.remote_encryption_key.as_ref(),
-                    )
-                    .with_encryption_config(opts.encryption.as_ref()),
+                        opts.legacy_remote_encryption_key.as_ref(),
+                        opts.encryption.as_ref(),
+                    ),
                     &io,
                     main_db_path,
                     opts.protocol_version_hint,
@@ -1211,7 +1218,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 if remote_pull_protocol == RemotePullProtocol::MvccLogical {
                     ensure_logical_mvcc_pull_supported(
                         partial,
-                        opts.remote_encryption_key.as_ref(),
+                        opts.remote_encryption_key(),
                         opts.encryption.as_ref(),
                     )?;
                 }
@@ -1514,7 +1521,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             sync_engine_io.clone(),
             &meta,
             main_db_path,
-            opts.remote_encryption_key.as_ref(),
+            opts.remote_encryption_key(),
         )?;
 
         // Use async database opening that yields on IO for large schemas
@@ -1956,9 +1963,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             coro,
             &self.sync_engine_io,
             self.meta().remote_url(),
-            self.opts.remote_encryption_key.as_ref(),
-        )
-        .with_encryption_config(self.opts.encryption.as_ref());
+            self.opts.legacy_remote_encryption_key.as_ref(),
+            self.opts.encryption.as_ref(),
+        );
         let stream_kind;
         let remote_pull_protocol = resolve_remote_pull_protocol(
             self.opts.logical_mvcc_pull,
@@ -2043,7 +2050,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 if detected == RemotePullProtocol::MvccLogical {
                     ensure_logical_mvcc_pull_supported(
                         self.opts.partial_sync_opts.is_some(),
-                        self.opts.remote_encryption_key.as_ref(),
+                        self.opts.remote_encryption_key(),
                         self.opts.encryption.as_ref(),
                     )?;
                     // Deferred replicas may still be in WAL mode locally; the
@@ -2338,8 +2345,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         coro,
                         &self.sync_engine_io,
                         self.meta().remote_url(),
-                        self.opts.remote_encryption_key.as_ref(),
-                    ).with_encryption_config(self.opts.encryption.as_ref());
+                        self.opts.legacy_remote_encryption_key.as_ref(),
+                        self.opts.encryption.as_ref(),
+                    );
                     Some(apply_transformation(ctx, &local_changes, &local_replay.generator).await?)
                 } else {
                     None
@@ -2785,8 +2793,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                 coro,
                                 &self.sync_engine_io,
                                 self.meta().remote_url(),
-                                self.opts.remote_encryption_key.as_ref(),
-                            ).with_encryption_config(self.opts.encryption.as_ref());
+                                self.opts.legacy_remote_encryption_key.as_ref(),
+                                self.opts.encryption.as_ref(),
+                            );
                             match pull_updates_to_staging(ctx, changes_file, revision, None, true).await? {
                                 (next_revision, PullUpdatesV1Result::Logical { txns, ops }, _) => {
                                     tracing::info!(
@@ -3110,8 +3119,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                             coro,
                             &self.sync_engine_io,
                             self.meta().remote_url(),
-                            self.opts.remote_encryption_key.as_ref(),
-                        ).with_encryption_config(self.opts.encryption.as_ref());
+                            self.opts.legacy_remote_encryption_key.as_ref(),
+                            self.opts.encryption.as_ref(),
+                        );
                         Some(apply_transformation(ctx, &transform_changes, &replay.generator).await?)
                     } else {
                         None
@@ -3422,9 +3432,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             coro,
             &self.sync_engine_io,
             self.meta().remote_url(),
-            self.opts.remote_encryption_key.as_ref(),
-        )
-        .with_encryption_config(self.opts.encryption.as_ref());
+            self.opts.legacy_remote_encryption_key.as_ref(),
+            self.opts.encryption.as_ref(),
+        );
         let (pull_gen, replay_floor_change_id, change_id) =
             push_logical_changes(ctx, &self.main_tape, &self.client_unique_id, &self.opts).await?;
 
@@ -4034,7 +4044,7 @@ mod tests {
             reserved_bytes: 0,
             db_opts: turso_core::DatabaseOpts::default(),
             partial_sync_opts: None::<PartialSyncOpts>,
-            remote_encryption_key: None,
+            legacy_remote_encryption_key: None,
             push_operations_threshold: None,
             pull_bytes_threshold: None,
             pull_parallel_requests: None,
@@ -4045,10 +4055,10 @@ mod tests {
     #[test]
     fn opts_debug_output_hides_the_remote_encryption_key() {
         let mut opts = default_test_opts();
-        opts.remote_encryption_key = Some(Secret::new("c2VjcmV0LWtleQ=="));
+        opts.legacy_remote_encryption_key = Some(Secret::new("c2VjcmV0LWtleQ=="));
         let printed = format!("{opts:?}");
         assert!(!printed.contains("c2VjcmV0LWtleQ=="));
-        assert!(printed.contains("remote_encryption_key: Some(<redacted>)"));
+        assert!(printed.contains("legacy_remote_encryption_key: Some(<redacted>)"));
         assert!(printed.contains("client_name: \"test-client\""));
     }
 
@@ -4065,6 +4075,7 @@ mod tests {
             crate::sync_encryption::SyncEncryption::new(
                 turso_core::CipherMode::Aes256Gcm,
                 Some(turso_core::EncryptionKey::new_256([11; 32])),
+                None,
             )
             .expect("config"),
         );

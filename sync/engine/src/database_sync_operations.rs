@@ -876,27 +876,25 @@ pub struct SyncOperationCtx<'a, IO: SyncEngineIo, Ctx> {
 
 impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
     /// Create a sync operation context.
-    /// `remote_encryption_key` should be base64-encoded if provided.
+    /// Native credentials come from `encryption`; otherwise use the legacy cloud key.
     pub fn new(
         coro: &'a Coro<Ctx>,
         io: &'a SyncEngineIoStats<IO>,
         remote_url: Option<String>,
-        remote_encryption_key: Option<&Secret>,
+        legacy_remote_encryption_key: Option<&Secret>,
+        encryption: Option<&crate::sync_encryption::SyncEncryption>,
     ) -> Self {
         Self {
             coro,
             io,
             remote_url: remote_url.map(|x| x.to_string()),
-            remote_encryption_key: remote_encryption_key.cloned(),
-            encryption_cipher: None,
+            remote_encryption_key: match encryption {
+                Some(config) => config.cloud_key(),
+                None => legacy_remote_encryption_key,
+            }
+            .cloned(),
+            encryption_cipher: encryption.map(|config| config.cipher()),
         }
-    }
-    pub fn with_encryption_config(
-        mut self,
-        config: Option<&crate::sync_encryption::SyncEncryption>,
-    ) -> Self {
-        self.encryption_cipher = config.map(|config| config.cipher());
-        self
     }
     pub fn http(
         &self,
@@ -4525,40 +4523,61 @@ mod tests {
     }
 
     #[test]
-    fn request_sends_cipher_and_cloud_key_without_local_key() {
-        let io = Arc::new(TestHttpIo {
-            response: Vec::new(),
-            chunk: 7,
-            request: Mutex::new(None),
-            headers: Mutex::new(Vec::new()),
-        });
-        let config = crate::sync_encryption::SyncEncryption::new(
-            turso_core::CipherMode::Aes256Gcm,
-            Some(turso_core::EncryptionKey::new_256([0xab; 32])),
-        )
-        .expect("local config");
-        let mut gen = genawaiter::sync::Gen::new(|co| async {
-            let coro: Coro<()> = co.into();
-            let stats = SyncEngineIoStats::new(io.clone());
-            let cloud_key = crate::types::Secret::new("Y2xvdWQta2V5");
-            let ctx = SyncOperationCtx::new(&coro, &stats, None, Some(&cloud_key))
-                .with_encryption_config(Some(&config));
-            let _completion = ctx
-                .http("POST", "/v2/pipeline", None, &[])
-                .expect("request");
-        });
-        assert!(matches!(
-            gen.resume_with(Ok(())),
-            genawaiter::GeneratorState::Complete(())
-        ));
-        let headers = io.headers.lock().expect("headers");
-        assert!(headers
-            .iter()
-            .any(|(name, value)| name == super::ENCRYPTION_CIPHER_HEADER && value == "aes256gcm"));
-        assert!(headers
-            .iter()
-            .any(|(name, value)| name == super::ENCRYPTION_KEY_HEADER && value == "Y2xvdWQta2V5"));
-        assert!(!format!("{headers:?}").contains(&"ab".repeat(32)));
+    fn requests_select_native_or_legacy_cloud_credentials() {
+        for (native, cloud_key) in [(false, None), (true, Some("Y2xvdWQta2V5")), (true, None)] {
+            let io = Arc::new(TestHttpIo::default());
+            let config = crate::sync_encryption::SyncEncryption::new(
+                turso_core::CipherMode::Aes256Gcm,
+                Some(turso_core::EncryptionKey::new_256([0xab; 32])),
+                cloud_key.map(crate::types::Secret::new),
+            )
+            .unwrap();
+            let mut gen = genawaiter::sync::Gen::new(|co| async {
+                let coro: Coro<()> = co.into();
+                let stats = SyncEngineIoStats::new(io.clone());
+                let legacy_key = crate::types::Secret::new("bGVnYWN5");
+                let ctx = SyncOperationCtx::new(
+                    &coro,
+                    &stats,
+                    None,
+                    Some(&legacy_key),
+                    native.then_some(&config),
+                );
+                let result = ctx.http("POST", "/v2/pipeline", None, &[]);
+                if native && cloud_key.is_none() {
+                    assert!(
+                        matches!(result, Err(crate::errors::Error::DatabaseSyncEngineError(message))
+                        if message.contains("cloud key is required"))
+                    );
+                } else {
+                    result.expect("request");
+                }
+            });
+            assert!(matches!(
+                gen.resume_with(Ok(())),
+                genawaiter::GeneratorState::Complete(())
+            ));
+            let headers = io.headers.lock().unwrap();
+            if native && cloud_key.is_none() {
+                assert!(headers.is_empty());
+                continue;
+            }
+            let expected_key = if native { "Y2xvdWQta2V5" } else { "bGVnYWN5" };
+            assert!(
+                headers
+                    .iter()
+                    .any(|(name, value)| name == super::ENCRYPTION_KEY_HEADER
+                        && value == expected_key)
+            );
+            assert_eq!(
+                headers
+                    .iter()
+                    .any(|(name, value)| name == super::ENCRYPTION_CIPHER_HEADER
+                        && value == "aes256gcm"),
+                native
+            );
+            assert!(!format!("{headers:?}").contains(&"ab".repeat(32)));
+        }
     }
 
     /// `reset_wal_file` resets the revert WAL and then records the new revert
@@ -5568,6 +5587,7 @@ mod tests {
                     &stats,
                     Some("https://example.com".to_string()),
                     None,
+                    None,
                 );
                 if transformed {
                     ctx.encryption_cipher = Some(turso_core::CipherMode::Aes256Gcm);
@@ -5663,6 +5683,7 @@ mod tests {
                     &coro,
                     &stats,
                     Some("https://example.com".to_string()),
+                    None,
                     None,
                 );
                 let mut staging =
@@ -5762,6 +5783,7 @@ mod tests {
                     &stats,
                     Some("https://example.com".to_string()),
                     None,
+                    None,
                 );
                 let (revision, result, _) =
                     pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
@@ -5830,6 +5852,7 @@ mod tests {
                     &stats,
                     Some("https://example.com".to_string()),
                     None,
+                    None,
                 );
                 let err = wal_pull_to_file_v1(&ctx, &file, "g1:o40", None)
                     .await
@@ -5895,6 +5918,7 @@ mod tests {
                     &stats,
                     Some("https://example.com".to_string()),
                     None,
+                    None,
                 );
                 let loaded = pull_pages_v1(&ctx, "g1:o40", &[2]).await?;
                 assert_eq!(loaded.db_pages, 3);
@@ -5949,6 +5973,7 @@ mod tests {
                     &stats,
                     Some("https://example.com".to_string()),
                     Some(&Secret::new("dGVzdC1lbmNyeXB0aW9uLWtleQ==")),
+                    None,
                 );
                 let err = pull_updates_v1(&ctx, &file, "g1:o40", None, true)
                     .await
@@ -6596,7 +6621,7 @@ mod tests {
             reserved_bytes: 0,
             db_opts: turso_core::DatabaseOpts::default(),
             partial_sync_opts: None,
-            remote_encryption_key: None,
+            legacy_remote_encryption_key: None,
             push_operations_threshold: None,
             pull_bytes_threshold: None,
             pull_parallel_requests: None,
@@ -6636,6 +6661,7 @@ mod tests {
                     let config = SyncEncryption::new(
                         CipherMode::Aes256Gcm,
                         local.then(|| EncryptionKey::new_256([22; 32])),
+                        Some(crate::types::Secret::new("cloud-key")),
                     )
                     .unwrap();
                     let crypto = config.local_context().unwrap();
@@ -6655,8 +6681,13 @@ mod tests {
                     let key = crate::types::Secret::new("cloud-key");
                     let mut generator = genawaiter::sync::Gen::new(|co| async {
                         let coro: Coro<()> = co.into();
-                        let ctx = SyncOperationCtx::new(&coro, &stats, None, Some(&key))
-                            .with_encryption_config(request_config.then_some(&config));
+                        let ctx = SyncOperationCtx::new(
+                            &coro,
+                            &stats,
+                            None,
+                            Some(&key),
+                            request_config.then_some(&config),
+                        );
                         super::bootstrap_db_file_v1(
                             &ctx,
                             &io,
@@ -6764,7 +6795,7 @@ mod tests {
             }));
             let mut gen = genawaiter::sync::Gen::new(|co| async {
                 let coro: Coro<()> = co.into();
-                let ctx = SyncOperationCtx::new(&coro, &stats, None, None);
+                let ctx = SyncOperationCtx::new(&coro, &stats, None, None, None);
                 super::bootstrap_db_file_v1(
                     &ctx,
                     &io,
@@ -6829,9 +6860,11 @@ mod tests {
         let source_key = EncryptionKey::new_256([11; 32]);
         let local_key = EncryptionKey::new_256([22; 32]);
         let source_config =
-            crate::sync_encryption::SyncEncryption::new(cipher, Some(source_key.clone())).unwrap();
+            crate::sync_encryption::SyncEncryption::new(cipher, Some(source_key.clone()), None)
+                .unwrap();
         let local_config =
-            crate::sync_encryption::SyncEncryption::new(cipher, Some(local_key.clone())).unwrap();
+            crate::sync_encryption::SyncEncryption::new(cipher, Some(local_key.clone()), None)
+                .unwrap();
         let source_crypto = EncryptionContext::new(cipher, &source_key, super::PAGE_SIZE).unwrap();
         let local_crypto = EncryptionContext::new(cipher, &local_key, super::PAGE_SIZE).unwrap();
         {
@@ -6885,7 +6918,7 @@ mod tests {
         let stats = SyncEngineIoStats::new(http);
         let mut gen = genawaiter::sync::Gen::new(|co| async {
             let coro: Coro<()> = co.into();
-            let ctx = SyncOperationCtx::new(&coro, &stats, None, None);
+            let ctx = SyncOperationCtx::new(&coro, &stats, None, None, None);
             super::bootstrap_db_file_v1(
                 &ctx,
                 &core_io,
@@ -7341,6 +7374,7 @@ mod tests {
                         &coro,
                         &stats,
                         Some("https://example.com".to_string()),
+                        None,
                         None,
                     );
                     let (revision, _) = bootstrap_db_file_v1(

@@ -566,6 +566,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
                     &sync_engine_io,
                     remote_url,
                     remote_encryption_key.as_ref(),
+                    None,
                 );
                 read_page(
                     ctx,

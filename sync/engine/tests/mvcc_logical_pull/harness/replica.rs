@@ -65,8 +65,8 @@ impl Replica {
         opts.encryption = Some(turso_sync_engine::sync_encryption::SyncEncryption::new(
             turso_core::CipherMode::Aes256Gcm,
             local_key.map(turso_core::EncryptionKey::new_256),
+            Some(turso_sync_engine::types::Secret::new("cloud-test-key")),
         )?);
-        opts.remote_encryption_key = Some(turso_sync_engine::types::Secret::new("cloud-test-key"));
         Self::open_with_io_at_path(dir, server, opts, io, db_path)
     }
 
@@ -180,7 +180,7 @@ fn replica_opts(db_opts: DatabaseOpts) -> DatabaseSyncEngineOpts {
         reserved_bytes: 0,
         db_opts,
         partial_sync_opts: None,
-        remote_encryption_key: None,
+        legacy_remote_encryption_key: None,
         push_operations_threshold: None,
         pull_bytes_threshold: None,
         pull_parallel_requests: None,
