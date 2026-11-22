@@ -1073,9 +1073,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 }
             }
             for path in sync_database_file_paths(main_db_path) {
-                // Bootstrap can leave downloaded pages before metadata is
-                // published. Missing or empty metadata permits retrying over
-                // the main file, just as it does for plaintext replicas.
+                // Validate the main file through core after checking sidecars.
                 if path == main_db_path {
                     continue;
                 }
@@ -1085,6 +1083,45 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                             "cannot bootstrap encrypted sync over existing replica file without valid metadata: {path}"
                         )));
                     }
+                }
+            }
+        }
+        if meta.is_none() {
+            let nonempty = io
+                .try_open(main_db_path)?
+                .map(|file| file.size())
+                .transpose()?
+                .is_some_and(|size| size != 0);
+            if nonempty {
+                // Validate before bootstrap can replace the existing file. Read-only
+                // mode leaves damaged files and missing recovery sidecars untouched.
+                let options = turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+                    .storage(Arc::new(turso_core::storage::database::DatabaseFile::new(
+                        io.open_file(main_db_path, OpenFlags::ReadOnly, false)?,
+                    )))
+                    .flags(OpenFlags::ReadOnly)
+                    .db_opts(opts.db_opts)
+                    .encryption(opts.local_options());
+                let mut state = OpenDbAsyncState::new();
+                loop {
+                    match turso_core::Database::open_async(
+                        &mut state,
+                        io.clone(),
+                        main_db_path,
+                        &options,
+                    )? {
+                        turso_core::IOResult::Done(_) => break,
+                        turso_core::IOResult::IO(completion) => {
+                            while !completion.finished() {
+                                coro.yield_(SyncEngineIoResult::IO).await?;
+                            }
+                        }
+                    }
+                }
+                if local_crypto.is_some() {
+                    return Err(Error::DatabaseSyncEngineError(
+                        "cannot bootstrap over an existing encrypted database without valid metadata".into(),
+                    ));
                 }
             }
         }

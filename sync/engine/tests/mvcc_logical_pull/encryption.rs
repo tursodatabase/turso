@@ -7,6 +7,50 @@ use turso_core::{Buffer, Completion, File, OpenFlags, PlatformIO, IO};
 
 const PRIVATE_MARKER: &[u8] = b"encrypted bootstrap failure marker";
 
+#[test]
+fn encrypted_replica_without_metadata_preserves_all_files() {
+    for empty_metadata in [false, true] {
+        for open_key in [Some([22; 32]), Some([33; 32]), None] {
+            let remote = Remote::new_encrypted(&["CREATE TABLE items(value TEXT)"]).unwrap();
+            let directory = Arc::new(tempfile::tempdir().unwrap());
+            let path = directory.path().join("replica.db");
+            std::fs::write(&path, []).unwrap();
+            let replica = Replica::open_encrypted(
+                &directory,
+                InProcessServer::new(remote.clone()),
+                Some([22; 32]),
+            )
+            .unwrap();
+            replica
+                .execute("INSERT INTO items VALUES ('unpushed local row')")
+                .unwrap();
+            replica.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            drop(replica);
+            let metadata = directory.path().join("replica.db-info");
+            if empty_metadata {
+                std::fs::write(metadata, []).unwrap();
+            } else {
+                std::fs::remove_file(metadata).unwrap();
+            }
+            let files = || {
+                std::fs::read_dir(directory.path())
+                    .unwrap()
+                    .map(|entry| {
+                        let path = entry.unwrap().path();
+                        (path.clone(), std::fs::read(path).unwrap())
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let before = files();
+            assert!(
+                Replica::open_encrypted(&directory, InProcessServer::new(remote), open_key)
+                    .is_err()
+            );
+            assert_eq!(files(), before);
+        }
+    }
+}
+
 // Observe writes before they reach storage, and stop bootstrap on either side
 // of its main-file sync. Host metadata publication is injected separately.
 struct BootstrapIo {
@@ -230,16 +274,14 @@ fn encrypted_bootstrap_failures_around_sync_and_metadata_publication() {
             InProcessServer::new(remote.clone()),
             Some([22; 32]),
         );
-        if stage == 5 {
-            // Nonempty partial metadata must remain an authentication error.
-            let meta = meta_before_retry.unwrap();
-            assert!(!meta.is_empty());
+        if stage != 4 {
+            // A nonempty main file needs valid metadata before encrypted reopen.
             assert!(reopened.is_err());
             assert_eq!(
                 std::fs::read(directory.path().join("replica.db")).unwrap(),
                 main
             );
-            assert_eq!(std::fs::read(meta_path).unwrap(), meta);
+            assert_eq!(std::fs::read(meta_path).ok(), meta_before_retry);
         } else {
             assert_eq!(
                 reopened
@@ -254,7 +296,7 @@ fn encrypted_bootstrap_failures_around_sync_and_metadata_publication() {
 }
 
 #[test]
-fn encrypted_bootstrap_retries_after_failed_metadata_write() {
+fn interrupted_bootstrap_requires_explicit_cleanup_before_retry() {
     let remote = Remote::new_encrypted(&[
         "CREATE TABLE items(value TEXT)",
         "INSERT INTO items VALUES ('retry after failure')",
@@ -292,6 +334,11 @@ fn encrypted_bootstrap_retries_after_failed_metadata_write() {
                         std::fs::write(path, []).unwrap();
                     }
                 }
+                let main = directory.path().join("replica.db");
+                let before = std::fs::read(&main).unwrap();
+                assert!(Replica::open_encrypted(&directory, server(), local_key).is_err());
+                assert_eq!(std::fs::read(&main).unwrap(), before);
+                std::fs::remove_file(main).unwrap();
                 let retry = Replica::open_encrypted(&directory, server(), local_key)
                     .unwrap_or_else(|error| panic!(
                         "retry failed: local_key={}, host_storage={host_storage}, empty_metadata={empty_metadata}: {error}",
@@ -305,7 +352,7 @@ fn encrypted_bootstrap_retries_after_failed_metadata_write() {
 }
 
 #[test]
-fn encrypted_bootstrap_recovers_after_process_exit() {
+fn encrypted_bootstrap_after_process_exit_preserves_the_main_file() {
     const CHILD_PATH: &str = "TURSO_TEST_BOOTSTRAP_CRASH_PATH";
     let remote = Remote::new_encrypted(&[
         "CREATE TABLE items(value TEXT)",
@@ -332,7 +379,7 @@ fn encrypted_bootstrap_recovers_after_process_exit() {
     let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
         .args([
             "--exact",
-            "encryption::encrypted_bootstrap_recovers_after_process_exit",
+            "encryption::encrypted_bootstrap_after_process_exit_preserves_the_main_file",
             "--nocapture",
         ])
         .env(CHILD_PATH, &path)
@@ -342,16 +389,14 @@ fn encrypted_bootstrap_recovers_after_process_exit() {
     assert_eq!(output.status.code(), Some(86), "{output:?}");
     assert!(!directory.path().join("replica.db-info").exists());
     assert!(!directory.path().join("replica.db-bootstrap").exists());
-    let replica = Replica::open_encrypted(
+    let before = std::fs::read(&path).unwrap();
+    assert!(Replica::open_encrypted(
         &directory,
         InProcessServer::new(remote.clone()),
         Some([22; 32]),
     )
-    .expect("retry after process exit");
-    assert_eq!(
-        replica.snapshot().expect("replica"),
-        remote.snapshot().expect("remote")
-    );
+    .is_err());
+    assert_eq!(std::fs::read(path).unwrap(), before);
 }
 
 #[test]
