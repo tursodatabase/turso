@@ -53,7 +53,7 @@ test('encrypted OPFS bootstrap, checkpoint, offline reopen, and wrong key', asyn
         remoteEncryption: { cipher: 'aes256gcm' } })).rejects.toThrow();
 });
 
-test.each(['missing', 'empty', 'partial'] as const)('encrypted OPFS bootstrap handles %s metadata after failure', async (state) => {
+test.each(['missing', 'empty', 'partial'] as const)('encrypted OPFS bootstrap refuses retry after %s metadata failure', async (state) => {
     const path = `interrupted-${crypto.randomUUID()}.db`;
     let requests = 0;
     const header = Uint8Array.from([10, 3, 114, 101, 118, 26, 0, 64, 1]);
@@ -75,22 +75,11 @@ test.each(['missing', 'empty', 'partial'] as const)('encrypted OPFS bootstrap ha
     } finally {
         interrupted.mockRestore();
     }
-    if (state === 'partial') {
-        const stored = localStorage.getItem(path + '-info');
-        requests = 0;
-        await expect(connect(options)).rejects.toThrow();
-        expect(requests).toBe(0);
-        expect(localStorage.getItem(path + '-info')).toBe(stored);
-        return;
-    }
-    const db = await connect(options);
-    await db.exec("CREATE TABLE t(value TEXT); INSERT INTO t VALUES ('retried')");
-    await db.checkpoint();
-    await db.close();
-    const reopened = await connect({ ...options, url: () => null,
-        fetch: async () => { throw new Error('offline'); } });
-    expect(await (await reopened.prepare('SELECT value FROM t')).get()).toEqual({ value: 'retried' });
-    await reopened.close();
+    const stored = localStorage.getItem(path + '-info');
+    requests = 0;
+    await expect(connect(options)).rejects.toThrow();
+    expect(requests).toBe(0);
+    expect(localStorage.getItem(path + '-info')).toBe(stored);
 });
 
 test('plaintext OPFS metadata stays JSON through checkpoint and reopen', async () => {
