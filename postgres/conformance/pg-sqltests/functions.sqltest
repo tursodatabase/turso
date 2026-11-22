@@ -2977,3 +2977,188 @@ test clock-timestamp-has-microseconds {
 expect {
     1
 }
+
+# date_trunc truncates a timestamptz to each unit. Weeks start on Monday, and
+# centuries and millennia start at years ending in 01. Each row whose
+# truncated value equals the expected value is listed.
+test date-trunc-timestamptz-units {
+    CREATE TABLE trunc_units (unit text, expected timestamptz);
+    INSERT INTO trunc_units VALUES
+        ('microseconds', '2026-10-08 12:34:56.789123+00'),
+        ('milliseconds', '2026-10-08 12:34:56.789+00'),
+        ('second', '2026-10-08 12:34:56+00'),
+        ('minute', '2026-10-08 12:34:00+00'),
+        ('hour', '2026-10-08 12:00:00+00'),
+        ('day', '2026-10-08 00:00:00+00'),
+        ('week', '2026-10-05 00:00:00+00'),
+        ('month', '2026-10-01 00:00:00+00'),
+        ('quarter', '2026-10-01 00:00:00+00'),
+        ('year', '2026-01-01 00:00:00+00'),
+        ('decade', '2020-01-01 00:00:00+00'),
+        ('century', '2001-01-01 00:00:00+00'),
+        ('millennium', '2001-01-01 00:00:00+00');
+    SELECT unit FROM trunc_units
+    WHERE date_trunc(unit, '2026-10-08 12:34:56.789123+00'::timestamptz) = expected
+    ORDER BY unit;
+}
+expect {
+    century
+    day
+    decade
+    hour
+    microseconds
+    millennium
+    milliseconds
+    minute
+    month
+    quarter
+    second
+    week
+    year
+}
+
+# date_trunc of a timestamptz column, a typical "events per day" query.
+test date-trunc-group-by-day {
+    CREATE TABLE trunc_events (at timestamptz);
+    INSERT INTO trunc_events VALUES ('2026-10-08 01:00:00+00'), ('2026-10-08 23:59:59.999999+00'),
+        ('2026-10-09 00:00:00+00'), (NULL);
+    SELECT count(*) FROM trunc_events GROUP BY date_trunc('day', at) ORDER BY date_trunc('day', at) NULLS LAST;
+}
+expect {
+    2
+    1
+    1
+}
+
+# date_trunc accepts the unit spellings of PostgreSQL's interval unit table,
+# in any letter case. A name longer than 10 characters matches on its first 10.
+test date-trunc-unit-aliases {
+    SELECT count(*) FROM (VALUES
+        ('hours', '2026-10-08 12:00:00+00'), ('HRS', '2026-10-08 12:00:00+00'), ('h', '2026-10-08 12:00:00+00'),
+        ('Mins', '2026-10-08 12:34:00+00'), ('m', '2026-10-08 12:34:00+00'),
+        ('secs', '2026-10-08 12:34:56+00'), ('s', '2026-10-08 12:34:56+00'),
+        ('ms', '2026-10-08 12:34:56.789+00'), ('millisecond', '2026-10-08 12:34:56.789+00'),
+        ('milliseconds', '2026-10-08 12:34:56.789+00'), ('msecs', '2026-10-08 12:34:56.789+00'),
+        ('us', '2026-10-08 12:34:56.789123+00'), ('microsecond', '2026-10-08 12:34:56.789123+00'),
+        ('microseconds', '2026-10-08 12:34:56.789123+00'), ('usecs', '2026-10-08 12:34:56.789123+00'),
+        ('days', '2026-10-08 00:00:00+00'), ('d', '2026-10-08 00:00:00+00'),
+        ('weeks', '2026-10-05 00:00:00+00'), ('w', '2026-10-05 00:00:00+00'),
+        ('mon', '2026-10-01 00:00:00+00'), ('mons', '2026-10-01 00:00:00+00'), ('months', '2026-10-01 00:00:00+00'),
+        ('qtr', '2026-10-01 00:00:00+00'),
+        ('y', '2026-01-01 00:00:00+00'), ('yr', '2026-01-01 00:00:00+00'), ('YEARS', '2026-01-01 00:00:00+00'),
+        ('dec', '2020-01-01 00:00:00+00'), ('decades', '2020-01-01 00:00:00+00'),
+        ('c', '2001-01-01 00:00:00+00'), ('cent', '2001-01-01 00:00:00+00'), ('centuries', '2001-01-01 00:00:00+00'),
+        ('mil', '2001-01-01 00:00:00+00'), ('mils', '2001-01-01 00:00:00+00'), ('millennia', '2001-01-01 00:00:00+00'),
+        ('usecond', '2026-10-08 12:34:56.789123+00'), ('msecond', '2026-10-08 12:34:56.789+00'),
+        ('microsecondsXY', '2026-10-08 12:34:56.789123+00'), ('DAY', '2026-10-08 00:00:00+00')
+    ) AS t(unit, expected)
+    WHERE date_trunc(unit, '2026-10-08 12:34:56.789123+00'::timestamptz) = expected::timestamptz;
+}
+expect {
+    38
+}
+
+# An unrecognized unit is an invalid parameter value, not a missing feature.
+test date-trunc-unit-not-recognized {
+    SELECT date_trunc('foo', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 22023
+expect error {
+    unit "foo" not recognized for type timestamp with time zone
+}
+
+# PostgreSQL prints the lowercased unit.
+test date-trunc-unit-not-recognized-uppercase {
+    SELECT date_trunc('FOO', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 22023
+expect error {
+    unit "foo" not recognized for type timestamp with time zone
+}
+
+# The time zone fields of the interval unit table are not truncation units.
+test date-trunc-unit-timezone {
+    SELECT date_trunc('TIMEZONE', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 0A000
+expect error {
+    unit "timezone" not supported for type timestamp with time zone
+}
+
+test date-trunc-unit-timezone-h {
+    SELECT date_trunc('timezone_h', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 0A000
+expect error {
+    unit "timezone_h" not supported for type timestamp with time zone
+}
+
+test date-trunc-unit-timezone-m {
+    SELECT date_trunc('timezone_m', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 0A000
+expect error {
+    unit "timezone_m" not supported for type timestamp with time zone
+}
+
+test date-trunc-unit-leading-space {
+    SELECT date_trunc(' day', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 22023
+expect error {}
+
+test date-trunc-unit-empty {
+    SELECT date_trunc('', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 22023
+expect error {}
+
+# A unit that is not text matches no date_trunc signature. A SQL NULL unit
+# gives NULL.
+test date-trunc-integer-unit {
+    SELECT date_trunc(5, '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 42883
+expect error {}
+
+test date-trunc-null-unit {
+    SELECT (date_trunc(NULL, '2026-10-08 12:34:56+00'::timestamptz) IS NULL)::int;
+}
+expect {
+    1
+}
+
+# A typed NULL unit needs function signature typing in tursopg, which
+# returns NULL.
+@compat-gap "function:date_trunc"
+test date-trunc-typed-null-unit {
+    SELECT (date_trunc(NULL::int, '2026-10-08 12:34:56+00'::timestamptz) IS NULL)::int;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    1
+}
+
+# PostgreSQL has no year 0. A decade that starts before year 1 is BC in
+# PostgreSQL, which tursopg cannot store, so it refuses.
+@compat-gap "function:date_trunc"
+test date-trunc-decade-before-year-1 {
+    SELECT date_trunc('decade', '0001-05-03 00:00:00+00'::timestamptz);
+}
+expect {
+    0001-01-01 00:00:00+00 BC
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# Centuries and millennia of years 1 to 99 and 1 to 999 start at year 1.
+test date-trunc-century-millennium-low-years {
+    SELECT date_trunc('century', '0001-05-03 00:00:00+00'::timestamptz),
+        date_trunc('century', '0099-05-03 00:00:00+00'::timestamptz),
+        date_trunc('millennium', '0999-05-03 00:00:00+00'::timestamptz),
+        date_trunc('decade', '0010-05-03 00:00:00+00'::timestamptz);
+}
+expect {
+    0001-01-01 00:00:00+00|0001-01-01 00:00:00+00|0001-01-01 00:00:00+00|0010-01-01 00:00:00+00
+}
