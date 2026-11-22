@@ -2474,6 +2474,64 @@ expect {
     7
 }
 
+# A TEMP trigger on main.m is not on aux.m or temp.m, even though the names
+# match. Renaming a column of one of those tables must leave the trigger's
+# NEW/OLD references and its UPDATE OF list alone.
+test alter-table-rename-column-attached-same-name-keeps-temp-trigger-on-main {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE tt_m4 (x);
+    CREATE TABLE aux.tt_m4 (x);
+    CREATE TABLE tt_log4 (v);
+    CREATE TEMP TRIGGER tt_tr4 AFTER INSERT ON main.tt_m4 BEGIN
+        INSERT INTO tt_log4 VALUES (new.x);
+    END;
+    ALTER TABLE aux.tt_m4 RENAME COLUMN x TO y;
+    INSERT INTO main.tt_m4 VALUES (1);
+    SELECT * FROM tt_log4;
+    SELECT sql FROM aux.sqlite_schema WHERE name = 'tt_m4';
+}
+expect {
+    1
+    CREATE TABLE tt_m4 (y)
+}
+
+test alter-table-rename-column-attached-same-name-keeps-update-of {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE tt_m5 (x);
+    CREATE TABLE aux.tt_m5 (x);
+    CREATE TABLE tt_log5 (v);
+    CREATE TEMP TRIGGER tt_tr5 AFTER UPDATE OF x ON main.tt_m5 BEGIN
+        INSERT INTO tt_log5 VALUES (new.x);
+    END;
+    ALTER TABLE aux.tt_m5 RENAME COLUMN x TO y;
+    INSERT INTO main.tt_m5 VALUES (1);
+    UPDATE main.tt_m5 SET x = 2;
+    SELECT * FROM tt_log5;
+    SELECT sql FROM aux.sqlite_schema WHERE name = 'tt_m5';
+}
+expect {
+    2
+    CREATE TABLE tt_m5 (y)
+}
+
+test alter-table-rename-column-temp-same-name-keeps-temp-trigger-on-main {
+    CREATE TABLE tt_m6 (x);
+    CREATE TEMP TABLE tt_m6 (x);
+    CREATE TABLE tt_log6 (v);
+    CREATE TEMP TRIGGER tt_tr6 AFTER UPDATE OF x ON main.tt_m6 BEGIN
+        INSERT INTO tt_log6 VALUES (new.x);
+    END;
+    ALTER TABLE temp.tt_m6 RENAME COLUMN x TO y;
+    INSERT INTO main.tt_m6 VALUES (1);
+    UPDATE main.tt_m6 SET x = 2;
+    SELECT * FROM tt_log6;
+    SELECT sql FROM sqlite_temp_schema WHERE name = 'tt_m6';
+}
+expect {
+    2
+    CREATE TABLE tt_m6 (y)
+}
+
 test temp-trigger-attached-read-cross-table {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.src_temp_aux_read (a INTEGER PRIMARY KEY, b);
