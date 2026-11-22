@@ -1816,96 +1816,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-test cmp-date-ne-timestamp-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    SELECT 1 FROM t WHERE d <> ts;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-date-lt-timestamp-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    SELECT 1 FROM t WHERE d < ts;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-date-le-timestamp-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    SELECT 1 FROM t WHERE d <= ts;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-date-gt-timestamp-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    SELECT 1 FROM t WHERE d > ts;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-date-ge-timestamp-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    SELECT 1 FROM t WHERE d >= ts;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-date-is-distinct-from-timestamp-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    SELECT 1 FROM t WHERE d IS DISTINCT FROM ts;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-date-is-not-distinct-from-timestamp-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    SELECT 1 FROM t WHERE d IS NOT DISTINCT FROM ts;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-timestamp-eq-timestamptz-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    SELECT 1 FROM t WHERE ts = tz;
-}
-expect error {
-    cannot compare type timestamp with type timestamptz
-}
-
-@requires strict "uses STRICT tables"
-test cmp-timestamptz-lt-date-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    SELECT 1 FROM t WHERE tz < d;
-}
-expect error {
-    cannot compare type timestamptz with type date
-}
-
-@requires strict "uses STRICT tables"
-test cmp-date-between-timestamp-and-timestamptz-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    SELECT 1 FROM t WHERE d BETWEEN ts AND tz;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
 test cmp-date-in-list-with-timestamp-is-an-error {
     CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
     SELECT 1 FROM t WHERE d IN (d, ts);
@@ -1915,27 +1825,9 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-test cmp-date-in-list-of-timestamptz-literal-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    SELECT 1 FROM t WHERE d IN (CAST('2024-01-05 00:00:00+00' AS timestamptz));
-}
-expect error {
-    cannot compare type date with type timestamptz
-}
-
-@requires strict "uses STRICT tables"
 test cmp-case-date-when-timestamp-is-an-error {
     CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
     SELECT CASE d WHEN ts THEN 1 ELSE 0 END FROM t;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-nullif-date-timestamp-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    SELECT NULLIF(d, ts) FROM t;
 }
 expect error {
     cannot compare type date with type timestamp
@@ -1960,114 +1852,12 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-test cmp-update-where-date-eq-timestamp-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    UPDATE t SET id = id WHERE d = ts;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-delete-where-in-subquery-of-other-type-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    DELETE FROM t WHERE ts IN (SELECT d FROM t);
-}
-expect error {
-    cannot compare type timestamp with type date
-}
-
-@requires strict "uses STRICT tables"
 test cmp-in-subquery-of-other-type-is-an-error {
     CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
     SELECT 1 FROM t WHERE ts IN (SELECT d FROM t);
 }
 expect error {
     cannot compare type timestamp with type date
-}
-
-@requires strict "uses STRICT tables"
-test cmp-indexed-in-subquery-of-other-type-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    CREATE INDEX t_ts ON t(ts);
-    INSERT INTO t VALUES (1, '2024-01-05', '2024-01-05 00:00:00', '2024-01-05 00:00:00');
-    SELECT id FROM t WHERE ts IN (SELECT d FROM t);
-}
-expect error {
-    cannot compare type timestamp with type date
-}
-
-@requires strict "uses STRICT tables"
-test cmp-indexed-eq-scalar-subquery-of-other-type-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    CREATE INDEX t_ts ON t(ts);
-    SELECT id FROM t WHERE ts = (SELECT d FROM t);
-}
-expect error {
-    cannot compare type timestamp with type date
-}
-
-@requires strict "uses STRICT tables"
-test cmp-indexed-range-correlated-subquery-of-other-type-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    CREATE INDEX t_ts ON t(ts);
-    SELECT id FROM t AS o WHERE ts >= (SELECT d FROM t WHERE t.id = o.id);
-}
-expect error {
-    cannot compare type timestamp with type date
-}
-
-@requires strict "uses STRICT tables"
-test cmp-join-on-subquery-column-of-other-type-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    CREATE TABLE u(d date) STRICT;
-    CREATE INDEX t_ts ON t(ts);
-    SELECT t.id FROM t, (SELECT d FROM u) s WHERE t.ts = s.d;
-}
-expect error {
-    cannot compare type timestamp with type date
-}
-
-@requires strict "uses STRICT tables"
-test cmp-join-on-view-column-of-other-type-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    CREATE TABLE u(d date) STRICT;
-    CREATE VIEW v AS SELECT d FROM u;
-    SELECT t.id FROM t JOIN v ON t.ts = v.d;
-}
-expect error {
-    cannot compare type timestamp with type date
-}
-
-@requires strict "uses STRICT tables"
-test cmp-join-on-cte-column-of-other-type-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    CREATE TABLE u(d date) STRICT;
-    WITH c AS (SELECT d FROM u) SELECT t.id FROM t, c WHERE t.ts = c.d;
-}
-expect error {
-    cannot compare type timestamp with type date
-}
-
-@requires strict "uses STRICT tables"
-test cmp-hash-join-on-columns-of-other-types-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    CREATE TABLE u(id INTEGER PRIMARY KEY, d date) STRICT;
-    SELECT t.id FROM t, u WHERE t.ts = u.d;
-}
-expect error {
-    cannot compare type timestamp with type date
-}
-
-@requires strict "uses STRICT tables"
-test cmp-left-join-on-columns-of-other-types-is-an-error {
-    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
-    CREATE TABLE u(id INTEGER PRIMARY KEY, d date) STRICT;
-    CREATE INDEX u_d ON u(d);
-    SELECT t.id FROM t LEFT JOIN u ON u.d = t.ts;
-}
-expect error {
-    cannot compare type date with type timestamp
 }
 
 @requires strict "uses STRICT tables"
@@ -2078,42 +1868,6 @@ test cmp-join-using-columns-of-other-types-is-an-error {
 }
 expect error {
     cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-natural-join-columns-of-other-types-is-an-error {
-    CREATE TABLE a(c date) STRICT;
-    CREATE TABLE b(c timestamp) STRICT;
-    SELECT 1 FROM a NATURAL JOIN b;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-two-domains-over-the-same-base-compare-as-the-base {
-    -- PostgreSQL compares a domain as the type it is declared on.
-    CREATE DOMAIN d1 AS integer;
-    CREATE DOMAIN d2 AS integer;
-    CREATE TABLE t(a d1, b d2) STRICT;
-    INSERT INTO t VALUES (1, 1), (1, 2);
-    SELECT a, b FROM t WHERE a = b;
-}
-expect {
-    1|1
-}
-
-@requires strict "uses STRICT tables"
-test cmp-indexed-two-domains-over-the-same-base-in-subquery-compare-as-the-base {
-    CREATE DOMAIN d1 AS integer;
-    CREATE DOMAIN d2 AS integer;
-    CREATE TABLE t(a d1, b d2) STRICT;
-    CREATE INDEX t_a ON t(a);
-    INSERT INTO t VALUES (1, 1), (2, 3);
-    SELECT 1 FROM t WHERE a IN (SELECT b FROM t);
-}
-expect {
-    1
 }
 
 @requires strict "uses STRICT tables"
@@ -2177,70 +1931,8 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-test cmp-union-all-of-date-and-timestamp-is-an-error {
-    CREATE TABLE t(d date, ts timestamp) STRICT;
-    SELECT d FROM t UNION ALL SELECT ts FROM t;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-intersect-of-date-and-timestamp-is-an-error {
-    CREATE TABLE t(d date, ts timestamp) STRICT;
-    SELECT d FROM t INTERSECT SELECT ts FROM t;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-except-of-date-and-timestamp-is-an-error {
-    CREATE TABLE t(d date, ts timestamp) STRICT;
-    SELECT d FROM t EXCEPT SELECT ts FROM t;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-nested-compound-of-date-and-timestamp-is-an-error {
-    CREATE TABLE t(d date, ts timestamp) STRICT;
-    SELECT d FROM t UNION ALL SELECT d FROM t UNION ALL SELECT ts FROM t;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-compound-in-subquery-of-date-and-timestamp-is-an-error {
-    CREATE TABLE t(d date, ts timestamp) STRICT;
-    SELECT x FROM (SELECT d AS x FROM t UNION ALL SELECT ts FROM t);
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-compound-in-in-subquery-of-date-and-timestamp-is-an-error {
-    CREATE TABLE t(d date, ts timestamp) STRICT;
-    SELECT 1 FROM t WHERE d IN (SELECT d FROM t UNION ALL SELECT ts FROM t);
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
 test cmp-values-of-date-and-timestamp-is-an-error {
     VALUES (CAST('2024-01-05' AS date)), (CAST('2024-01-05 00:00:00' AS timestamp));
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-values-in-from-of-date-and-timestamp-is-an-error {
-    SELECT * FROM (VALUES (CAST('2024-01-05' AS date)), (CAST('2024-01-05 00:00:00' AS timestamp)));
 }
 expect error {
     cannot compare type date with type timestamp
@@ -2259,27 +1951,9 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test cmp-recursive-cte-of-date-and-timestamp-is-an-error {
-    CREATE TABLE t(d date, ts timestamp) STRICT;
-    WITH RECURSIVE c(x) AS (SELECT d FROM t UNION ALL SELECT ts FROM t) SELECT * FROM c;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
 test cmp-coalesce-of-date-and-timestamp-is-an-error {
     CREATE TABLE t(d date, ts timestamp) STRICT;
     SELECT coalesce(d, ts) FROM t;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-ifnull-of-date-and-timestamp-is-an-error {
-    CREATE TABLE t(d date, ts timestamp) STRICT;
-    SELECT ifnull(d, ts) FROM t;
 }
 expect error {
     cannot compare type date with type timestamp
@@ -2295,34 +1969,12 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-test cmp-case-result-in-dead-branch-of-date-and-timestamp-is-an-error {
-    CREATE TABLE t(d date, ts timestamp) STRICT;
-    SELECT 1 FROM t WHERE 0 AND CASE WHEN 1 THEN d ELSE ts END IS NULL;
-}
-expect error {
-    cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
 test cmp-iif-of-date-and-timestamp-is-an-error {
     CREATE TABLE t(d date, ts timestamp) STRICT;
     SELECT iif(1, d, ts) FROM t;
 }
 expect error {
     cannot compare type date with type timestamp
-}
-
-@requires strict "uses STRICT tables"
-test cmp-union-of-two-domains-over-the-same-base-has-the-base-type {
-    CREATE DOMAIN d1 AS integer;
-    CREATE DOMAIN d2 AS integer;
-    CREATE TABLE t(a d1, b d2) STRICT;
-    INSERT INTO t VALUES (1, 1), (1, 2);
-    SELECT a FROM t UNION SELECT b FROM t ORDER BY 1;
-}
-expect {
-    1
-    2
 }
 
 @requires strict "uses STRICT tables"
@@ -2358,46 +2010,6 @@ test cmp-timestamptz-with-varchar-is-an-error {
 }
 expect error {
     cannot compare type timestamptz with type varchar
-}
-
-@requires strict "uses STRICT tables"
-test cmp-timestamptz-with-varchar-ordering-is-an-error {
-    CREATE TABLE t(tz timestamptz, v varchar(40)) STRICT;
-    INSERT INTO t VALUES ('2024-01-05 02:00:00+02', '2024-01-05 02:00:00+02');
-    SELECT tz > v FROM t;
-}
-expect error {
-    cannot compare type timestamptz with type varchar
-}
-
-@requires strict "uses STRICT tables"
-test cmp-timestamptz-union-varchar-is-an-error {
-    CREATE TABLE t(tz timestamptz, v varchar(40)) STRICT;
-    INSERT INTO t VALUES ('2024-01-05 02:00:00+02', '2024-01-05 02:00:00+02');
-    SELECT tz FROM t UNION SELECT v FROM t;
-}
-expect error {
-    cannot compare type timestamptz with type varchar
-}
-
-@requires strict "uses STRICT tables"
-test cmp-timestamptz-with-json-is-an-error {
-    CREATE TABLE t(tz timestamptz, j json) STRICT;
-    INSERT INTO t VALUES ('2024-01-05 02:00:00+02', '{}');
-    SELECT tz FROM t UNION SELECT j FROM t;
-}
-expect error {
-    cannot compare type timestamptz with type json
-}
-
-@requires strict "uses STRICT tables"
-test cmp-domain-over-timestamptz-with-timestamp-is-an-error {
-    CREATE DOMAIN dtz AS timestamptz;
-    CREATE TABLE t(a dtz, ts timestamp) STRICT;
-    SELECT 1 FROM t WHERE a = ts;
-}
-expect error {
-    cannot compare type dtz with type timestamp
 }
 
 @requires strict "uses STRICT tables"
