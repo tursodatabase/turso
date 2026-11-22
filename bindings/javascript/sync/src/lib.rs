@@ -182,7 +182,6 @@ struct SyncEngineOptsFilled {
     pub protocol_version: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
     pub db_opts: turso_core::DatabaseOpts,
-    pub encryption: Option<turso_sync_engine::sync_encryption::SyncEncryption>,
     pub partial_sync_opts: Option<PartialSyncOpts>,
     pub push_operations_threshold: Option<usize>,
     pub pull_bytes_threshold: Option<usize>,
@@ -193,25 +192,6 @@ struct SyncEngineOptsFilled {
 impl SyncEngine {
     #[napi(constructor)]
     pub fn new(opts: SyncEngineOpts) -> napi::Result<Self> {
-        let encryption = match opts.remote_encryption_cipher.as_deref() {
-            Some(cipher) => Some(
-                turso_sync_engine::sync_encryption::SyncEncryption::new(
-                    turso_core::CipherMode::try_from(cipher)
-                        .map_err(|error| napi::Error::from_reason(error.to_string()))?,
-                    None,
-                    opts.remote_encryption_key
-                        .clone()
-                        .map(turso_sync_engine::types::Secret::new),
-                )
-                .map_err(|error| napi::Error::from_reason(error.to_string()))?,
-            ),
-            None if opts.remote_encryption_key.is_some() => {
-                return Err(napi::Error::from_reason(
-                    "encrypted sync requires an explicit cipher",
-                ))
-            }
-            None => None,
-        };
         let is_memory = opts.path == ":memory:";
         let io: Arc<dyn turso_core::IO> = if is_memory {
             Arc::new(turso_core::MemoryIO::new())
@@ -263,9 +243,14 @@ impl SyncEngine {
                     cipher: opts.remote_encryption_cipher.clone().unwrap(),
                     hexkey: key.clone(),
                 });
+        let cloud_key = opts
+            .remote_encryption_key
+            .clone()
+            .map(turso_sync_engine::types::Secret::new);
         let encryption = turso_sync_engine::sync_encryption::SyncEncryption::from_options(
             opts.remote_encryption_cipher.as_deref(),
             local_encryption.as_ref(),
+            cloud_key,
         )
         .map_err(|error| napi::Error::from_reason(error.to_string()))?;
         if opts.local_encryption_key.is_some()
@@ -342,7 +327,6 @@ impl SyncEngine {
             },
             bootstrap_if_empty: opts.bootstrap_if_empty,
             db_opts,
-            encryption,
             partial_sync_opts: match opts.partial_sync_opts {
                 Some(partial_sync_opts) => match partial_sync_opts.bootstrap_strategy {
                     JsPartialBootstrapStrategy::Prefix { length } => Some(PartialSyncOpts {
