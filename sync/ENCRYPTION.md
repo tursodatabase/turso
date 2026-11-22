@@ -21,13 +21,19 @@ recovery marker or known replacement backup, including empty files. The error
 identifies the conflicting path and leaves the artifacts untouched. Reopening an
 initialized replica still permits orphaned backups left by interrupted cleanup.
 
-With bootstrap enabled, missing or empty `-info` metadata permits downloading
-again over the main database, matching plaintext bootstrap behavior. No bootstrap
-marker or additional persistent state is written. Nonempty metadata must
-successfully authenticate and parse; failures leave the replica untouched.
+Missing or empty `-info` permits encrypted creation only when the main database
+is absent or empty. Before bootstrap can replace a nonempty main file, core
+must open it read-only with the supplied credentials. Missing or wrong keys and
+invalid or incomplete databases fail validation. Even with the correct local
+key, an encrypted database without metadata is preserved and creation fails.
+A plaintext database that passes this read-only open can still be bootstrapped.
+
+An interrupted encrypted bootstrap that leaves a nonempty main file requires
+explicit cleanup of the failed download or a new path before retrying. No
+bootstrap marker or additional persistent state is written. Nonempty metadata
+must authenticate and parse successfully; failures leave the replica untouched.
 Conflicting nonempty WAL, MVCC log, revert WAL, or staging files still block fresh
-creation. A database whose metadata was deleted cannot be distinguished from an
-interrupted bootstrap, so its main file can also be overwritten in this case.
+creation.
 
 ## Local sample server
 
@@ -109,8 +115,8 @@ Encrypted browser host sidecars are base64 encoded in localStorage to preserve
 arbitrary bytes. Plaintext replicas keep writing JSON text. Both representations
 remain readable, so plaintext metadata written as base64 by an earlier build
 returns to JSON on its next write. The database itself uses OPFS; metadata
-existence is determined by the host storage. Empty plaintext metadata retains
-the missing-metadata behavior; empty encrypted metadata is rejected.
+existence is determined by the host storage. Empty metadata is treated as missing;
+encrypted bootstrap can be retried automatically only if the main file is also empty.
 
 ## Go
 
@@ -167,11 +173,11 @@ AES-128-GCM, AES-256-GCM, and all six native AEGIS variants are supported. ChaCh
 remains supported only by the existing legacy remote-encryption path.
 
 Authentication errors are returned to the application; they do not trigger
-file deletion, key regeneration, or bootstrap. Retrying creation may restart
-bootstrap when metadata is missing or empty, subject to the artifact checks
-above. A failed response does not publish its revision. A page-apply failure can
-leave partial local changes; applications choose whether to reopen or recreate
-the replica.
+file deletion, key regeneration, or bootstrap. Retrying encrypted creation may
+restart bootstrap only while the main file is absent or empty, subject to the
+artifact checks above. A failed response does not publish its revision. A
+page-apply failure can leave partial local changes; applications choose whether
+to reopen or recreate the replica.
 
 The server validates the requested cipher against database metadata and the cloud
 key against stored data. Pull responses carry no encryption capability flag or
