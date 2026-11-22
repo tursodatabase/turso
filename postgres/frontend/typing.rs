@@ -103,6 +103,13 @@ pub(crate) fn uses_sqlite_arithmetic(op: &str, operands: &dyn Fn() -> Vec<Operan
     (is_float(left) && is_numeric(right)) || (is_numeric(left) && is_float(right))
 }
 
+/// `bytea || bytea` joins two byte strings; every other `||` joins text.
+pub(crate) fn concatenates_as_text(operands: &dyn Fn() -> Vec<OperandType>) -> bool {
+    !operands()
+        .iter()
+        .any(|operand| matches!(operand, OperandType::Blob))
+}
+
 fn is_text(operand: &OperandType) -> bool {
     match operand {
         OperandType::Text => true,

@@ -19,6 +19,22 @@ pub(super) fn binary_expr_shared(
     }
 
     if lhs_arity == 1 {
+        if matches!(op, ast::Operator::Concat) {
+            if let Some((lhs, rhs)) = concat_operands_as_text(referenced_tables, e1, e2, resolver)?
+            {
+                emit_binary_expr_scalar(
+                    program,
+                    referenced_tables,
+                    &lhs,
+                    &rhs,
+                    op,
+                    target_register,
+                    resolver,
+                    emit_mode,
+                )?;
+                return Ok(target_register);
+            }
+        }
         emit_binary_expr_scalar(
             program,
             referenced_tables,
@@ -43,6 +59,49 @@ pub(super) fn binary_expr_shared(
         resolver,
         emit_mode,
     )
+}
+
+/// The operands of `||` as the dialect casts them to text, or None when the
+/// dialect leaves them as they are. An operand that is not text is written
+/// with the output function of its type, as in PostgreSQL's `true || 'x'`.
+#[inline(never)]
+fn concat_operands_as_text(
+    referenced_tables: Option<&TableReferences>,
+    e1: &ast::Expr,
+    e2: &ast::Expr,
+    resolver: &Resolver,
+) -> Result<Option<(ast::Expr, ast::Expr)>> {
+    if is_array(e1, referenced_tables, resolver) || is_array(e2, referenced_tables, resolver) {
+        return Ok(None);
+    }
+    let operand_types = || {
+        vec![
+            cast_source(referenced_tables, e1, resolver),
+            cast_source(referenced_tables, e2, resolver),
+        ]
+    };
+    if !resolver
+        .catalog
+        .dialect
+        .concatenates_as_text(&operand_types)
+    {
+        return Ok(None);
+    }
+    let text = ast::Type {
+        name: "text".to_string(),
+        size: None,
+        array_dimensions: 0,
+    };
+    let context = crate::dialect::CastContext::Assignment;
+    let lhs = plan_cast_conversion(referenced_tables, e1, Some(&text), context, resolver)?;
+    let rhs = plan_cast_conversion(referenced_tables, e2, Some(&text), context, resolver)?;
+    if lhs.is_none() && rhs.is_none() {
+        return Ok(None);
+    }
+    Ok(Some((
+        lhs.unwrap_or_else(|| e1.clone()),
+        rhs.unwrap_or_else(|| e2.clone()),
+    )))
 }
 
 /// Row-valued comparisons are rare, so they get their own function that is

@@ -729,6 +729,14 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether `||` writes its operands as text with the cast to text of the
+    /// dialect before it joins them, as PostgreSQL's `true || 'x'` does. A
+    /// dialect that joins some operands another way, such as two byte
+    /// strings, says no for them.
+    fn concatenates_as_text(&self, _operands: &dyn Fn() -> std::vec::Vec<OperandType>) -> bool {
+        true
+    }
+
     /// The type that values of the given types have together, as the results
     /// of a CASE or coalesce do. None leaves it to the engine.
     fn common_type(&self, _types: &dyn Fn() -> std::vec::Vec<OperandType>) -> Option<OperandType> {

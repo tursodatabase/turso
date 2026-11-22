@@ -973,7 +973,7 @@ pub(crate) fn plan_cast_conversion(
     }))
 }
 
-fn cast_source(
+pub(crate) fn cast_source(
     referenced_tables: Option<&TableReferences>,
     operand: &ast::Expr,
     resolver: &Resolver,

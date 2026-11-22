@@ -20,6 +20,12 @@ pub enum TextType {
     Float4,
     /// An array of reals: each element prints with the digits of a 32-bit float.
     Float4Array,
+    /// A float8: the shortest digits that read back as the same double.
+    Float8,
+    /// An array of float8, written element by element as a float8 is.
+    Float8Array,
+    /// An array of booleans: each element prints as `t` or `f`.
+    BooleanArray,
     /// Text without an offset gets `+00`.
     TimestampTz,
 }
@@ -44,6 +50,9 @@ impl TextType {
                     ("BOOL" | "BOOLEAN", 0) => Some(TextType::Boolean),
                     ("FLOAT4", 0) => Some(TextType::Float4),
                     ("FLOAT4", 1..) => Some(TextType::Float4Array),
+                    ("BOOL" | "BOOLEAN", 1..) => Some(TextType::BooleanArray),
+                    ("REAL" | "FLOAT8" | "DOUBLE PRECISION", 0) => Some(TextType::Float8),
+                    ("REAL" | "FLOAT8" | "DOUBLE PRECISION", 1..) => Some(TextType::Float8Array),
                     ("TIMESTAMPTZ", 0) => Some(TextType::TimestampTz),
                     _ => None,
                 },
@@ -64,6 +73,9 @@ pub fn value_text(value: &Value, text_type: TextType) -> Option<Cow<'_, str>> {
         Value::Numeric(Numeric::Float(f)) if text_type == TextType::Float4 => {
             Cow::Owned(crate::float_text::float4_text(f64::from(*f) as f32))
         }
+        Value::Numeric(Numeric::Float(f)) if text_type == TextType::Float8 => {
+            Cow::Owned(crate::float_text::float8_text(f64::from(*f)))
+        }
         Value::Numeric(Numeric::Float(f)) => Cow::Owned(pgwire_text::format_f64(f64::from(*f))),
         Value::Text(text) if text_type == TextType::Float4Array => {
             Cow::Owned(pgwire_text::map_array_elements(text.as_str(), |element| {
@@ -73,6 +85,20 @@ pub fn value_text(value: &Value, text_type: TextType) -> Option<Cow<'_, str>> {
                 )
             }))
         }
+        Value::Text(text) if text_type == TextType::Float8Array => {
+            Cow::Owned(pgwire_text::map_array_elements(text.as_str(), |element| {
+                element
+                    .parse::<f64>()
+                    .map_or_else(|_| element.to_string(), crate::float_text::float8_text)
+            }))
+        }
+        Value::Text(text) if text_type == TextType::BooleanArray => Cow::Owned(
+            pgwire_text::map_array_elements(text.as_str(), |element| match element {
+                "1" => "t".to_string(),
+                "0" => "f".to_string(),
+                other => other.to_string(),
+            }),
+        ),
         Value::Text(text) => {
             let text = text.as_str();
             // A timestamptz stored without an offset is in UTC. The `+00`

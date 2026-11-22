@@ -79,9 +79,9 @@ use expr_type::*;
 use functions::*;
 #[allow(unused_imports)]
 use metadata::*;
-pub(crate) use translator::plan_cast_conversion;
 #[allow(unused_imports)]
 use translator::*;
+pub(crate) use translator::{cast_source, plan_cast_conversion};
 #[allow(unused_imports)]
 use utils::*;
 #[allow(unused_imports)]

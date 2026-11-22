@@ -1091,7 +1091,7 @@ fn copy_text_encoding_returns_one_record_per_row() {
     let encoder = turso_pg::CopyTextEncoder::new(&stmt);
     let expected = [
         "t\t-17\t1.25\t\\\\N\\t\\n\\r\\b\\f\\vé\t{2,7}\t2026-10-31 12:34:56+00\t2026-10-31 12:34:56\t\\\\x00ff\n",
-        "f\t0\t1e100\t\t{}\t\\N\t\\N\t\\N\n",
+        "f\t0\t1e+100\t\t{}\t\\N\t\\N\t\\N\n",
         "\\N\t\\N\t-1e-100\t\\N\t\\N\t\\N\t\\N\t\\N\n",
     ];
     let mut rows = 0;

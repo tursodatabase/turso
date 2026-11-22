@@ -283,6 +283,13 @@ impl Dialect for PostgresDialect {
         }
     }
 
+    fn concatenates_as_text(
+        &self,
+        operands: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+    ) -> bool {
+        crate::typing::concatenates_as_text(operands)
+    }
+
     fn uses_sqlite_arithmetic(
         &self,
         op: &str,
