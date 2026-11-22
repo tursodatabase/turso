@@ -283,6 +283,14 @@ impl Dialect for PostgresDialect {
         }
     }
 
+    fn uses_sqlite_arithmetic(
+        &self,
+        op: &str,
+        operands: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+    ) -> bool {
+        crate::typing::uses_sqlite_arithmetic(op, operands)
+    }
+
     fn common_type(
         &self,
         types: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,

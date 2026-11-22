@@ -45,6 +45,30 @@ pub(crate) fn rejects_operator(_op: &str, operands: &dyn Fn() -> Vec<OperandType
         .any(|operand| matches!(operand, OperandType::Boolean))
 }
 
+/// PostgreSQL adds a double precision (or a real) and a numeric as doubles,
+/// because a numeric casts to double precision implicitly and not the other
+/// way.
+pub(crate) fn uses_sqlite_arithmetic(op: &str, operands: &dyn Fn() -> Vec<OperandType>) -> bool {
+    if !matches!(op, "+" | "-" | "*" | "/" | "%") {
+        return false;
+    }
+    let operands = operands();
+    let [left, right] = operands.as_slice() else {
+        return false;
+    };
+    let is_float = |operand: &OperandType| {
+        matches!(operand, OperandType::Real) || is_custom(operand, &["float4"])
+    };
+    let is_numeric = |operand: &OperandType| {
+        matches!(operand, OperandType::Decimal) || is_custom(operand, &["numeric"])
+    };
+    (is_float(left) && is_numeric(right)) || (is_numeric(left) && is_float(right))
+}
+
+fn is_custom(operand: &OperandType, names: &[&str]) -> bool {
+    matches!(operand, OperandType::Custom(type_def) if names.contains(&type_def.name.as_str()))
+}
+
 /// The type PostgreSQL gives values that meet in a CASE, coalesce or UNION,
 /// when one of them is a float4: the first type that every other type can be
 /// implicitly cast to, where a type that the first can be cast to takes its
