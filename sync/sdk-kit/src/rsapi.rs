@@ -254,6 +254,11 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         db_config: turso_sdk_kit::rsapi::TursoDatabaseConfig,
         sync_config: TursoDatabaseSyncConfig,
     ) -> Result<Arc<Self>, turso_sdk_kit::rsapi::TursoError> {
+        if sync_config.remote_encryption_key.is_some() {
+            return Err(turso_sdk_kit::rsapi::TursoError::Misuse(
+                "encrypted sync requires an explicit cipher".into(),
+            ));
+        }
         // Mirror the database's experimental features onto the connections the
         // sync engine opens internally (e.g. the revert connection), so they
         // match the main database opened via TursoDatabase below.
@@ -273,10 +278,6 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             reserved_bytes: sync_config.reserved_bytes.unwrap_or(0),
             db_opts,
             partial_sync_opts: sync_config.partial_sync_opts.clone(),
-            legacy_remote_encryption_key: sync_config
-                .remote_encryption_key
-                .clone()
-                .map(turso_sync_engine::types::Secret::new),
             push_operations_threshold: sync_config.push_operations_threshold,
             pull_bytes_threshold: sync_config.pull_bytes_threshold,
             pull_parallel_requests: sync_config.pull_parallel_requests,
@@ -334,7 +335,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_io.clone(),
                     &metadata,
                     &main_db_path,
-                    sync_engine_opts.remote_encryption_key(),
+                    sync_engine_opts.encryption.as_ref(),
                 )?;
                 let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
                     turso_sdk_kit::rsapi::TursoDatabaseConfig {
@@ -397,7 +398,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_io.clone(),
                     &metadata,
                     &main_db_path,
-                    sync_engine_opts.remote_encryption_key(),
+                    sync_engine_opts.encryption.as_ref(),
                 )?;
                 let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
                     turso_sdk_kit::rsapi::TursoDatabaseConfig {

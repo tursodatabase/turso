@@ -180,43 +180,36 @@ struct SyncEngineOptsFilled {
     pub protocol_version: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
     pub db_opts: turso_core::DatabaseOpts,
-    pub remote_encryption_cipher: Option<CipherMode>,
-    pub remote_encryption_key: Option<String>,
+    pub encryption: Option<turso_sync_engine::sync_encryption::SyncEncryption>,
     pub partial_sync_opts: Option<PartialSyncOpts>,
     pub push_operations_threshold: Option<usize>,
     pub pull_bytes_threshold: Option<usize>,
     pub logical_mvcc_pull: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum CipherMode {
-    Aes256Gcm,
-    Aes128Gcm,
-    ChaCha20Poly1305,
-    Aegis128L,
-    Aegis128X2,
-    Aegis128X4,
-    Aegis256,
-    Aegis256X2,
-    Aegis256X4,
-}
-
-impl CipherMode {
-    /// Returns the total metadata size (nonce + tag) for this cipher mode.
-    /// These values match the Turso Cloud encryption settings.
-    fn required_metadata_size(&self) -> usize {
-        match self {
-            CipherMode::Aes256Gcm | CipherMode::Aes128Gcm | CipherMode::ChaCha20Poly1305 => 28,
-            CipherMode::Aegis128L | CipherMode::Aegis128X2 | CipherMode::Aegis128X4 => 32,
-            CipherMode::Aegis256 | CipherMode::Aegis256X2 | CipherMode::Aegis256X4 => 48,
-        }
-    }
-}
-
 #[napi]
 impl SyncEngine {
     #[napi(constructor)]
     pub fn new(opts: SyncEngineOpts) -> napi::Result<Self> {
+        let encryption = match opts.remote_encryption_cipher.as_deref() {
+            Some(cipher) => Some(
+                turso_sync_engine::sync_encryption::SyncEncryption::new(
+                    turso_core::CipherMode::try_from(cipher)
+                        .map_err(|error| napi::Error::from_reason(error.to_string()))?,
+                    None,
+                    opts.remote_encryption_key
+                        .clone()
+                        .map(turso_sync_engine::types::Secret::new),
+                )
+                .map_err(|error| napi::Error::from_reason(error.to_string()))?,
+            ),
+            None if opts.remote_encryption_key.is_some() => {
+                return Err(napi::Error::from_reason(
+                    "encrypted sync requires an explicit cipher",
+                ))
+            }
+            None => None,
+        };
         let is_memory = opts.path == ":memory:";
         let io: Arc<dyn turso_core::IO> = if is_memory {
             Arc::new(turso_core::MemoryIO::new())
@@ -296,28 +289,7 @@ impl SyncEngine {
             },
             bootstrap_if_empty: opts.bootstrap_if_empty,
             db_opts,
-            remote_encryption_cipher: match opts.remote_encryption_cipher.as_deref() {
-                Some("aes256gcm") | Some("aes-256-gcm") => Some(CipherMode::Aes256Gcm),
-                Some("aes128gcm") | Some("aes-128-gcm") => Some(CipherMode::Aes128Gcm),
-                Some("chacha20poly1305") | Some("chacha20-poly1305") => {
-                    Some(CipherMode::ChaCha20Poly1305)
-                }
-                Some("aegis128l") | Some("aegis-128l") => Some(CipherMode::Aegis128L),
-                Some("aegis128x2") | Some("aegis-128x2") => Some(CipherMode::Aegis128X2),
-                Some("aegis128x4") | Some("aegis-128x4") => Some(CipherMode::Aegis128X4),
-                Some("aegis256") | Some("aegis-256") => Some(CipherMode::Aegis256),
-                Some("aegis256x2") | Some("aegis-256x2") => Some(CipherMode::Aegis256X2),
-                Some("aegis256x4") | Some("aegis-256x4") => Some(CipherMode::Aegis256X4),
-                None => None,
-                _ => {
-                    return Err(napi::Error::new(
-                        napi::Status::GenericFailure,
-                        "unsupported remote cipher. Supported: aes256gcm, aes128gcm, \
-                         chacha20poly1305, aegis128l, aegis128x2, aegis128x4, aegis256, \
-                         aegis256x2, aegis256x4",
-                    ))
-                }
-            },
+            encryption,
             partial_sync_opts: match opts.partial_sync_opts {
                 Some(partial_sync_opts) => match partial_sync_opts.bootstrap_strategy {
                     JsPartialBootstrapStrategy::Prefix { length } => Some(PartialSyncOpts {
@@ -335,7 +307,6 @@ impl SyncEngine {
                 },
                 None => None,
             },
-            remote_encryption_key: opts.remote_encryption_key.clone(),
             push_operations_threshold: opts.push_operations_threshold.map(|x| x as usize),
             pull_bytes_threshold: opts.pull_bytes_threshold.map(|x| x as usize),
             logical_mvcc_pull: opts.logical_mvcc_pull,
@@ -359,7 +330,7 @@ impl SyncEngine {
     #[napi]
     pub fn connect(&mut self) -> napi::Result<GeneratorHolder> {
         let opts = DatabaseSyncEngineOpts {
-            encryption: None,
+            encryption: self.opts.encryption.clone(),
             client_name: self.opts.client_name.clone(),
             remote_url: self.opts.remote_url.clone(),
             wal_pull_batch_size: self.opts.wal_pull_batch_size as u64,
@@ -371,15 +342,11 @@ impl SyncEngine {
             db_opts: self.opts.db_opts,
             reserved_bytes: self
                 .opts
-                .remote_encryption_cipher
-                .map(|x| x.required_metadata_size())
+                .encryption
+                .as_ref()
+                .map(|config| config.cipher().metadata_size())
                 .unwrap_or(0),
             partial_sync_opts: self.opts.partial_sync_opts.clone(),
-            legacy_remote_encryption_key: self
-                .opts
-                .remote_encryption_key
-                .clone()
-                .map(turso_sync_engine::types::Secret::new),
             push_operations_threshold: self.opts.push_operations_threshold,
             pull_bytes_threshold: self.opts.pull_bytes_threshold,
             pull_parallel_requests: None,
