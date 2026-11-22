@@ -465,7 +465,7 @@ test datetime-compare-date-eq-timestamp-scan {
 expect {
     2|1
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type date with type timestamp
 }
@@ -480,7 +480,7 @@ expect {
     1|2
     2|2
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type date with type timestamp
 }
@@ -495,7 +495,7 @@ expect {
     3|1
     3|2
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type date with type timestamp
 }
@@ -508,7 +508,7 @@ test datetime-compare-date-eq-timestamptz-scan {
 expect {
     2|1
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type date with type timestamptz
 }
@@ -525,7 +525,7 @@ expect {
     3|1
     3|2
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type date with type timestamptz
 }
@@ -541,7 +541,7 @@ expect {
     2|1
     2|2
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type date with type timestamptz
 }
@@ -555,7 +555,7 @@ expect {
     3|1
     3|2
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type date with type timestamptz
 }
@@ -570,7 +570,7 @@ expect {
     2|1
     2|2
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type timestamp with type date
 }
@@ -583,7 +583,7 @@ test datetime-compare-date-literal-in-timestamptz-scan {
 expect {
     1
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type timestamptz with type date
 }
@@ -597,7 +597,7 @@ expect {
     2
     3
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type date with type timestamp
 }
@@ -610,7 +610,7 @@ test datetime-compare-date-eq-timestamp-index {
 expect {
     2|1
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type date with type timestamp
 }
@@ -625,7 +625,7 @@ expect {
     1|2
     2|2
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type date with type timestamp
 }
@@ -640,7 +640,7 @@ expect {
     3|1
     3|2
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type date with type timestamp
 }
@@ -653,7 +653,7 @@ test datetime-compare-date-eq-timestamptz-index {
 expect {
     2|1
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type date with type timestamptz
 }
@@ -670,7 +670,7 @@ expect {
     3|1
     3|2
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type date with type timestamptz
 }
@@ -686,7 +686,7 @@ expect {
     2|1
     2|2
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type date with type timestamptz
 }
@@ -700,7 +700,7 @@ expect {
     3|1
     3|2
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type date with type timestamptz
 }
@@ -715,7 +715,7 @@ expect {
     2|1
     2|2
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type timestamp with type date
 }
@@ -728,7 +728,7 @@ test datetime-compare-date-literal-in-timestamptz-index {
 expect {
     1
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type timestamptz with type date
 }
@@ -742,7 +742,7 @@ expect {
     2
     3
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
     cannot compare type date with type timestamp
 }
