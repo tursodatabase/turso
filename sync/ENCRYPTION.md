@@ -13,7 +13,7 @@ existing plaintext replica, and key rotation are not supported.
 Locally encrypted bootstrap requires `pull_bytes_threshold` to be unset or zero.
 Positive values return an error before opening the target file or sending a
 request. Plaintext local replicas retain chunked bootstrap support, including
-legacy encrypted cloud databases. Native MVCC servers reject filtered bootstrap
+cloud-encrypted databases. Native MVCC servers reject filtered bootstrap
 requests themselves; use an unset or zero threshold for those sources.
 
 After pending replacement recovery, fresh encrypted creation rejects any remaining
@@ -53,9 +53,9 @@ local hex key. The sample server validates encryption credentials for both
 pull and SQL push requests. It verifies native page/body-chunk tags and serves
 decrypted pages and MVCC frames over HTTP; keep it on loopback or use an HTTPS
 proxy for network access.
-SQL pipeline requests may send only the cloud key, as JavaScript's
-`remoteWritesExperimental` path does. Any supplied cipher must match the server's
-configuration; pull requests require both the cloud key and cipher headers.
+Encrypted sync requests, including `remoteWritesExperimental` SQL requests,
+send both the cloud key and cipher headers. The cipher must match the server
+configuration.
 It supports one MVCC generation, without production retained-generation storage.
 Corrupt MVCC headers fail the pull before any replacement fallback; the client's
 existing data and sync revision remain unchanged.
@@ -169,8 +169,11 @@ cloud key. In JavaScript, retain `localEncryptionKey` and
 `remoteEncryption: { cipher: "aes256gcm" }` when omitting `url` and the cloud key.
 
 Omit the local key to use a plaintext local replica of an encrypted source.
-AES-128-GCM, AES-256-GCM, and all six native AEGIS variants are supported. ChaCha20
-remains supported only by the existing legacy remote-encryption path.
+AES-128-GCM, AES-256-GCM, and all six native AEGIS variants are supported.
+Encrypted sync requires an explicit supported cipher and cloud key. Key-only
+configurations and unsupported cipher names are rejected before IO. This is a
+breaking change from the legacy key-only sync path. Offline reopen can omit the
+cloud key; the next encrypted network request requires it.
 
 Authentication errors are returned to the application; they do not trigger
 file deletion, key regeneration, or bootstrap. Retrying encrypted creation may
