@@ -4126,6 +4126,7 @@ mod tests {
                 crate::sync_encryption::SyncEncryption::new(
                     turso_core::CipherMode::Aes256Gcm,
                     Some(turso_core::EncryptionKey::new_256([22; 32])),
+                    None,
                 )
                 .unwrap(),
             );
@@ -4148,6 +4149,7 @@ mod tests {
             opts.encryption = Some(
                 crate::sync_encryption::SyncEncryption::new(
                     turso_core::CipherMode::Aes256Gcm,
+                    None,
                     None,
                 )
                 .unwrap(),
