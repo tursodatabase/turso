@@ -95,6 +95,11 @@ expect {
     2026-02|1.5|100.0
     2026-03|2.0|50.0
 }
+expect @js {
+    2026-01|1|
+    2026-02|1.5|100
+    2026-03|2|50
+}
 
 @setup multi_window_months
 test repeated-lag-of-aggregate-ordered-by-date {
@@ -110,6 +115,11 @@ expect {
     2026-02-02|1.5|100.0
     2026-03-03|2.0|50.0
 }
+expect @js {
+    2026-01-01|1|
+    2026-02-02|1.5|100
+    2026-03-03|2|50
+}
 
 # SQLite evaluates the merged calls once, so both read the same random() value.
 @setup multi_window_months
@@ -122,6 +132,11 @@ expect {
     1.0|
     1.5|1
     2.0|1
+}
+expect @js {
+    1|
+    1.5|1
+    2|1
 }
 
 @setup multi_window_months
@@ -137,4 +152,9 @@ expect {
     1|1.0|8|4
     2|1.5|12|12
     3|2.0||20
+}
+expect @js {
+    1|1|8|4
+    2|1.5|12|12
+    3|2||20
 }
