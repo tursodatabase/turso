@@ -255,15 +255,13 @@ impl HashEntry {
 
         // Write number of keys and key values
         let varint_buf = &mut [0u8; 9];
-        let len = write_varint(varint_buf, self.key_values.len() as u64);
-        buf.extend_from_slice(&varint_buf[..len]);
+        push_varint(buf, varint_buf, self.key_values.len() as u64);
         for value in &self.key_values {
             Self::serialize_value(value, buf, varint_buf);
         }
 
         // Write number of payload values and payload values
-        let len = write_varint(varint_buf, self.payload_values.len() as u64);
-        buf.extend_from_slice(&varint_buf[..len]);
+        push_varint(buf, varint_buf, self.payload_values.len() as u64);
         for value in &self.payload_values {
             Self::serialize_value(value, buf, varint_buf);
         }
@@ -286,14 +284,12 @@ impl HashEntry {
             Value::Text(t) => {
                 buf.push(TEXT_HASH);
                 let bytes = t.as_str().as_bytes();
-                let len = write_varint(varint_buf, bytes.len() as u64);
-                buf.extend_from_slice(&varint_buf[..len]);
+                push_varint(buf, varint_buf, bytes.len() as u64);
                 buf.extend_from_slice(bytes);
             }
             Value::Blob(b) => {
                 buf.push(BLOB_HASH);
-                let len = write_varint(varint_buf, b.len() as u64);
-                buf.extend_from_slice(&varint_buf[..len]);
+                push_varint(buf, varint_buf, b.len() as u64);
                 buf.extend_from_slice(b);
             }
         }
@@ -1543,8 +1539,7 @@ impl HashTable {
 
         let file_offset = spill_state.next_spill_offset;
         for (entry, &entry_size) in partition.entries.iter().zip(entry_sizes.iter()) {
-            let len = write_varint(varint_buf, entry_size as u64);
-            data.extend_from_slice(&varint_buf[..len]);
+            push_varint(&mut data, varint_buf, entry_size as u64);
             record_distinct_key_on_disk(
                 &mut spill_state.distinct_key_places[partition_idx],
                 entry.hash,
@@ -1704,8 +1699,7 @@ impl HashTable {
             let partition = &spill_state.partition_buffers[meta.idx];
 
             for (entry, &entry_size) in partition.entries.iter().zip(meta.entry_sizes.iter()) {
-                let len = write_varint(varint_buf, entry_size as u64);
-                data.extend_from_slice(&varint_buf[..len]);
+                push_varint(&mut data, varint_buf, entry_size as u64);
                 record_distinct_key_on_disk(
                     &mut spill_state.distinct_key_places[meta.idx],
                     entry.hash,
@@ -2884,8 +2878,7 @@ impl HashTable {
         data.try_reserve_exact(total_size)?;
         let varint_buf = &mut [0u8; 9];
         for (entry, &entry_size) in partition.entries.iter().zip(entry_sizes.iter()) {
-            let len = write_varint(varint_buf, entry_size as u64);
-            data.extend_from_slice(&varint_buf[..len]);
+            push_varint(&mut data, varint_buf, entry_size as u64);
             entry.append_to(&mut data);
         }
         turso_assert!(data.len() == total_size, "serialized size mismatch");
@@ -3367,12 +3360,46 @@ fn record_distinct_key_on_disk(
     }
 }
 
+/// Appends the varint of `value` to `buf`, the bytes of a spill. A value of
+/// less than 128, as the size of most entries and the number of their values,
+/// is a varint of one byte that is the value itself. It is pushed directly:
+/// a copy of `varint_buf[..len]` has a length that is not known at compile
+/// time, and costs a call of `memcpy` for each varint.
+fn push_varint(buf: &mut std::vec::Vec<u8>, varint_buf: &mut [u8; 9], value: u64) {
+    if value < 0x80 {
+        buf.push(value as u8);
+    } else {
+        let len = write_varint(varint_buf, value);
+        buf.extend_from_slice(&varint_buf[..len]);
+    }
+}
+
 #[cfg(test)]
 mod hashtests {
     use super::*;
     use crate::alloc::vec;
     use crate::io::Buffer;
     use crate::MemoryIO;
+
+    #[test]
+    fn push_varint_writes_the_bytes_of_write_varint() {
+        for value in [
+            0,
+            1,
+            0x7f,
+            0x80,
+            0x3fff,
+            0x4000,
+            u64::from(u32::MAX),
+            u64::MAX,
+        ] {
+            let mut expected = [0u8; 9];
+            let len = write_varint(&mut expected, value);
+            let mut pushed = std::vec::Vec::new();
+            push_varint(&mut pushed, &mut [0u8; 9], value);
+            assert_eq!(pushed, &expected[..len], "varint of {value}");
+        }
+    }
 
     #[test]
     fn test_hash_table_rejects_custom_collations() {
