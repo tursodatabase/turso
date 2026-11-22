@@ -111,7 +111,7 @@ pub(crate) fn filter_rows(
         for column in used_columns {
             table.mark_column_used(column);
         }
-        table.row_filter = Some(filter);
+        table.row_filter = Some(Box::new(filter));
     }
     where_clause.splice(0..0, terms);
     Ok(())

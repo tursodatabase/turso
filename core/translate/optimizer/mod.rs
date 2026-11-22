@@ -3697,7 +3697,7 @@ fn apply_table_access_plan(
         .iter_mut()
         .zip(unmatched_right_rows_plans)
     {
-        table.unmatched_right_rows_plan = plan;
+        table.unmatched_right_rows_plan = plan.map(Box::new);
     }
 
     let mut probe_pos_by_table: Vec<Option<usize>> =

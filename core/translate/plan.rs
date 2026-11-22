@@ -1996,7 +1996,9 @@ pub struct JoinedTable {
     pub op: Operation,
     /// How a RIGHT or FULL JOIN reads unmatched right rows after the main join loop.
     /// SQLite plans this read separately from the main loop. `None` means a default scan.
-    pub unmatched_right_rows_plan: Option<UnmatchedRightRowsPlan>,
+    /// Boxed because only RIGHT and FULL joins have this plan, and each move of a
+    /// `JoinedTable` would copy its 360 bytes.
+    pub unmatched_right_rows_plan: Option<Box<UnmatchedRightRowsPlan>>,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
@@ -2034,7 +2036,8 @@ pub struct JoinedTable {
     /// The condition that row-level security puts on the rows of the table.
     /// It is checked as soon as the loop reads a row, before any other
     /// condition, so no expression of the query sees a row it fails.
-    pub row_filter: Option<ast::Expr>,
+    /// Boxed because only tables with row-level security have this condition.
+    pub row_filter: Option<Box<ast::Expr>>,
 }
 
 /// Cost and row estimates for one table in a selected join plan.
@@ -5001,6 +5004,14 @@ mod tests {
     };
 
     type TestResult = std::result::Result<(), alloc::TryReserveError>;
+
+    /// The planner moves and clones joined tables by value, and each move
+    /// copies all the bytes of a `JoinedTable`.
+    #[test]
+    fn joined_table_stays_small() {
+        let size = std::mem::size_of::<JoinedTable>();
+        assert!(size <= 640, "JoinedTable is {size} bytes");
+    }
 
     #[test]
     fn test_column_used_mask_empty() -> TestResult {
