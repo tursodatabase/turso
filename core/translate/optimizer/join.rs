@@ -1379,6 +1379,13 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         );
     }
 
+    // Each plan that the search keeps adds its access method to the arena.
+    // For nine of ten searches of the TPC-H, TPC-DS, JOB and ClickBench
+    // queries, the arena ends with at most 2^(n+1) access methods for n
+    // tables. Reserve them at once: each time the arena doubles, all of its
+    // access methods are copied.
+    access_methods_arena.reserve(2 << num_tables);
+
     // Compute naive left-to-right plan to use as pruning threshold
     let naive_plan = compute_naive_left_deep_plan(
         joined_tables,
