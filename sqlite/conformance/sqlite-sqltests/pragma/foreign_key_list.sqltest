@@ -133,3 +133,16 @@ expect {
     0|0|p|e||NO ACTION|NO ACTION|NONE
     0|0|p|a||NO ACTION|NO ACTION|NONE
 }
+
+# The bare keywords ON, DEFAULT and DELETE are read as a table name too.
+@cross-check-integrity
+test pragma-foreign-key-list-keyword-table-name {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE "on"(a REFERENCES p);
+    PRAGMA foreign_key_list(on);
+    PRAGMA foreign_key_list = ON;
+}
+expect {
+    0|0|p|a||NO ACTION|NO ACTION|NONE
+    0|0|p|a||NO ACTION|NO ACTION|NONE
+}

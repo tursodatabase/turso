@@ -2106,9 +2106,19 @@ fn emit_columns_for_table_info(
 /// or `foreign_key_list`. As in SQLite's `sqlite3Pragma`, a number names the
 /// object whose name is its text: `-1` names the table `"-1"` and `+2` names
 /// the table `"2"`, since the grammar keeps the minus sign but not the plus.
+/// The bare keywords `ON`, `DELETE` and `DEFAULT` are names there too (the
+/// `nmnum` rule), so `PRAGMA table_info(on)` reads the table `"on"`. Other
+/// keywords are not names in that rule, so they still name nothing.
 fn pragma_value_name(value: &ast::Expr) -> Option<String> {
     match value {
         Expr::Name(name) => Some(name.as_str().to_string()),
+        Expr::Literal(Literal::Keyword(kw))
+            if ["on", "delete", "default"]
+                .iter()
+                .any(|name| kw.eq_ignore_ascii_case(name)) =>
+        {
+            Some(kw.clone())
+        }
         Expr::Literal(Literal::Numeric(digits)) => Some(digits.clone()),
         Expr::Unary(op, inner) => match (op, inner.as_ref()) {
             (ast::UnaryOperator::Negative, Expr::Literal(Literal::Numeric(digits))) => {
