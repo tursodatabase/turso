@@ -948,6 +948,7 @@ fn join_lhs_and_rhs<'a, 'w>(
                         let materialization_reads_an_outer_query = needs_materialization
                             && materialized_build_input_reads_an_outer_query(
                                 where_clause,
+                                where_terms,
                                 table_references,
                                 subqueries,
                                 &lhs_mask,
@@ -1149,15 +1150,17 @@ fn join_lhs_and_rhs<'a, 'w>(
     }))
 }
 
+/// The tables of each term are the ones that `where_terms` read once for the
+/// search, so the terms are not walked again for each hash join candidate.
 fn materialized_build_input_reads_an_outer_query(
     where_clause: &[WhereTerm],
+    where_terms: &WhereTermsInfo,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     build_input_mask: &TableMask,
 ) -> Result<bool> {
-    for term in where_clause.iter() {
-        let term_mask = table_mask_from_expr(&term.expr, table_references, subqueries)?;
-        if build_input_mask.contains_all_set_bits_of(&term_mask)
+    for (term, term_info) in where_clause.iter().zip(&where_terms.terms) {
+        if build_input_mask.contains_all_set_bits_of(&term_info.table_mask)
             && expr_reads_an_outer_query(&term.expr, table_references, subqueries)?
         {
             return Ok(true);
