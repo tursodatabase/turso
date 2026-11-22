@@ -639,9 +639,7 @@ async fn read_proto_file_chunk<Ctx>(
         }
     });
     let c = file.pread(*file_offset, c)?;
-    while !c.succeeded() {
-        coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    wait_file_completion(coro, &c).await?;
     let read_len = read_len.lock().unwrap().clone()?;
     if read_len == 0 {
         return Err(Error::DatabaseSyncEngineError(
@@ -852,9 +850,7 @@ async fn truncate_file<Ctx>(coro: &Coro<Ctx>, file: &Arc<dyn turso_core::File>) 
         assert_eq!(rc, 0);
     });
     let c = file.truncate(0, c)?;
-    while !c.succeeded() {
-        coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    wait_file_completion(coro, &c).await?;
     Ok(())
 }
 
@@ -876,9 +872,7 @@ async fn append_file_bytes<Ctx>(
         assert_eq!(size as usize, len);
     });
     let c = file.pwrite(*offset, buffer, c)?;
-    while !c.succeeded() {
-        coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    wait_file_completion(coro, &c).await?;
     *offset += len as u64;
     Ok(())
 }
@@ -1815,9 +1809,7 @@ pub async fn db_bootstrap<IO: SyncEngineIo, Ctx>(
                 assert!(size as usize == content_len);
             });
             let c = db.pwrite(pos, buffer.clone(), c)?;
-            while !c.succeeded() {
-                ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-            }
+            wait_file_completion(ctx.coro, &c).await?;
             pos += content_len as u64;
         }
         if done {
@@ -1859,9 +1851,7 @@ pub async fn wal_apply_from_file<Ctx>(
             None
         });
         let c = frames_file.pread(offset, c)?;
-        while !c.succeeded() {
-            coro.yield_(SyncEngineIoResult::IO).await?;
-        }
+        wait_file_completion(coro, &c).await?;
         let info = WalFrameInfo::from_frame_header(buffer.as_slice());
         tracing::debug!("got frame: {:?}", info);
         db_size = info.db_size;
@@ -1890,9 +1880,7 @@ pub async fn wal_pull_to_file<IO: SyncEngineIo, Ctx>(
         assert!(rc as usize == 0);
     });
     let c = frames_file.truncate(0, c)?;
-    while !c.succeeded() {
-        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    wait_file_completion(ctx.coro, &c).await?;
     match revision {
         Some(DatabasePullRevision::Legacy {
             generation,
@@ -2048,9 +2036,7 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
                 });
 
                 let c = frames_file.pwrite(offset, buffer.clone(), c)?;
-                while !c.succeeded() {
-                    ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-                }
+                wait_file_completion(ctx.coro, &c).await?;
                 offset += WAL_FRAME_SIZE as u64;
             }
 
@@ -2193,9 +2179,7 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
         });
 
         let c = frames_file.pwrite(offset, buffer.clone(), c)?;
-        while !c.succeeded() {
-            ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-        }
+        wait_file_completion(ctx.coro, &c).await?;
         offset += WAL_FRAME_SIZE as u64;
     }
 
@@ -2368,9 +2352,7 @@ pub async fn wal_pull_to_file_legacy<IO: SyncEngineIo, Ctx>(
                         assert!(size as usize == WAL_FRAME_SIZE);
                     });
                     let c = frames_file.pwrite(last_offset, buffer.clone(), c)?;
-                    while !c.succeeded() {
-                        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-                    }
+                    wait_file_completion(ctx.coro, &c).await?;
 
                     last_offset += WAL_FRAME_SIZE as u64;
                     buffer_len = 0;
@@ -2411,9 +2393,7 @@ pub async fn wal_pull_to_file_legacy<IO: SyncEngineIo, Ctx>(
         assert!(rc as usize == 0);
     });
     let c = frames_file.truncate(committed_len, c)?;
-    while !c.succeeded() {
-        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    wait_file_completion(ctx.coro, &c).await?;
 
     sync_file(ctx.coro, frames_file).await?;
 
@@ -3342,9 +3322,7 @@ pub async fn read_wal_salt<Ctx>(
         None
     });
     let c = wal.pread(0, c)?;
-    while !c.succeeded() {
-        coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    wait_file_completion(coro, &c).await?;
     if buffer.as_mut_slice() == [0u8; WAL_HEADER] {
         return Ok(None);
     }
@@ -3482,9 +3460,7 @@ async fn write_bootstrap_page<Ctx>(
         assert!(size as usize == PAGE_SIZE);
     });
     let c = file.pwrite(offset, buffer.clone(), c)?;
-    while !c.succeeded() {
-        coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    wait_file_completion(coro, &c).await?;
     Ok(())
 }
 
@@ -3531,9 +3507,7 @@ async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
         assert!(rc as usize == 0);
     });
     let c = file.truncate(header.db_size * PAGE_SIZE as u64, c)?;
-    while !c.succeeded() {
-        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    wait_file_completion(ctx.coro, &c).await?;
     #[allow(clippy::arc_with_non_send_sync)]
     let buffer = Arc::new(Buffer::new_temporary(PAGE_SIZE));
     while let Some(page_data) = wait_proto_message::<Ctx, PageData>(
@@ -3822,9 +3796,7 @@ pub async fn reset_wal_file<Ctx>(
         assert!(rc as usize == 0);
     });
     let c = wal.truncate(wal_size, c)?;
-    while !c.succeeded() {
-        coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    wait_file_completion(coro, &c).await?;
     // Persist the truncation: without fsync a crash could leave stale revert
     // frames on disk while the metadata already records the new revert
     // watermark, which would corrupt the next rollback.

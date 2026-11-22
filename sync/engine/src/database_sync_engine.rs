@@ -21,8 +21,9 @@ use crate::{
         is_logically_replayable_table, list_user_tables, max_local_change_id, pull_updates_v1,
         push_logical_changes, read_last_change_id, read_logical_replay_table_map, read_wal_salt,
         reset_wal_file, should_replay_local_change, sync_file, update_last_change_id,
-        wait_all_results, wal_apply_from_file, wal_pull_to_file, PullUpdatesV1Result,
-        SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        wait_all_results, wait_file_completion, wal_apply_from_file, wal_pull_to_file,
+        PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER,
+        WAL_FRAME_SIZE,
     },
     database_tape::{
         replay_without_triggers, run_stmt_ignore_rows, try_wal_watermark_read_page,
@@ -327,9 +328,7 @@ async fn sync_path_if_present<Ctx>(
         Completion::new_sync(|_| {}),
         turso_core::io::FileSyncType::Fsync,
     )?;
-    while !sync.succeeded() {
-        coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    wait_file_completion(coro, &sync).await?;
     Ok(())
 }
 
@@ -842,9 +841,7 @@ async fn drive_core_completion<Ctx>(
     io: &Arc<dyn turso_core::IO>,
     completion: Completion,
 ) -> Result<()> {
-    while !completion.succeeded() {
-        coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    wait_file_completion(coro, &completion).await?;
     io.wait_for_completion(completion)?;
     Ok(())
 }

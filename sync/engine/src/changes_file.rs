@@ -819,6 +819,7 @@ mod tests {
         delay: AtomicBool,
         fail_write: AtomicBool,
         fail_sync: AtomicBool,
+        fail_truncate: AtomicBool,
         read_limit: AtomicUsize,
         reads: AtomicUsize,
         truncates: AtomicUsize,
@@ -835,6 +836,7 @@ mod tests {
                 delay: AtomicBool::new(false),
                 fail_write: AtomicBool::new(false),
                 fail_sync: AtomicBool::new(false),
+                fail_truncate: AtomicBool::new(false),
                 read_limit: AtomicUsize::new(usize::MAX),
                 reads: AtomicUsize::new(0),
                 truncates: AtomicUsize::new(0),
@@ -936,8 +938,28 @@ mod tests {
         }
         fn truncate(&self, size: u64, c: Completion) -> turso_core::Result<Completion> {
             self.truncates.fetch_add(1, Ordering::SeqCst);
+            if self.fail_truncate.load(Ordering::SeqCst) {
+                c.error(turso_core::CompletionError::IOError(
+                    std::io::ErrorKind::Other,
+                    "injected truncate failure",
+                ));
+                return Ok(c);
+            }
             self.inner.truncate(size, c)
         }
+    }
+
+    #[test]
+    fn reset_wal_file_propagates_failed_truncate() {
+        let file = Arc::new(ControlledFile::new());
+        file.fail_truncate.store(true, Ordering::SeqCst);
+        let error = run(|coro| async move {
+            crate::database_sync_operations::reset_wal_file(&coro, file, 0).await
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::IoError(message) if message.contains("injected truncate failure"))
+        );
     }
 
     #[test]
