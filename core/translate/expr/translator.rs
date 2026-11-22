@@ -1416,9 +1416,31 @@ fn translate_function_call_expr(
                     )
                 }
                 ScalarFunc::ArrayElement => {
-                    translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
-                                [array_reg <- 0, index_reg <- 1],
-                                Insn::ArrayElement { array_reg, index_reg, dest: target_register })
+                    let array_reg = program.alloc_register();
+                    translate_expr(program, referenced_tables, &args[0], array_reg, resolver)?;
+                    if yields_array_as_text(&args[0], referenced_tables) {
+                        let dimensions =
+                            type_of(&args[0], &TypeEnv::new(referenced_tables, resolver))
+                                .array_dimensions()
+                                .max(1);
+                        program.emit_insn(Insn::ArrayEncode {
+                            data: Box::new(crate::vdbe::insn::ArrayEncodeData {
+                                reg: array_reg,
+                                element_type: "ANY".into(),
+                                element_kind: StrictType::Any,
+                                dimensions,
+                                target: crate::vdbe::insn::ArrayEncodeTarget::Cast,
+                            }),
+                        });
+                    }
+                    let index_reg = program.alloc_register();
+                    translate_expr(program, referenced_tables, &args[1], index_reg, resolver)?;
+                    program.emit_insn(Insn::ArrayElement {
+                        array_reg,
+                        index_reg,
+                        dest: target_register,
+                    });
+                    Ok(target_register)
                 }
                 ScalarFunc::ArraySetElement => {
                     translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
@@ -3632,4 +3654,18 @@ fn translate_merged_column(
     }
     program.preassign_label_to_next_insn(end_label);
     Ok(target_register)
+}
+
+/// A subquery gives its array columns as array literal text, not as the array.
+fn yields_array_as_text(expr: &ast::Expr, referenced_tables: Option<&TableReferences>) -> bool {
+    match expr {
+        ast::Expr::Column { table, .. } => referenced_tables
+            .and_then(|tables| tables.find_table_by_internal_id(*table))
+            .is_some_and(|(_, table)| matches!(table, Table::FromClauseSubquery(_))),
+        ast::Expr::SubqueryResult {
+            query_type: ast::SubqueryType::RowValue { .. },
+            ..
+        } => true,
+        _ => false,
+    }
 }

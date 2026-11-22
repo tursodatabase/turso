@@ -3091,3 +3091,111 @@ test bytea-array-literal-elements-print-as-hex {
 expect {
     {"\\\\x6162","\\\\x63"}|{"\\\\x"}|{NULL,"\\\\x612262"}
 }
+
+test subquery-yields-an-array-the-outer-query-can-subscript {
+    SELECT x[2] FROM (SELECT ARRAY[10, 20, 30] AS x) q;
+}
+expect {
+    20
+}
+
+test subquery-array-prints-as-an-array-literal {
+    SELECT x FROM (SELECT ARRAY[10, 20, 30] AS x) q;
+}
+expect {
+    \{10,20,30\}
+}
+
+test cte-yields-an-array-the-outer-query-can-subscript {
+    WITH c AS (SELECT ARRAY[10, 20, 30] AS x) SELECT x[2], x[3] FROM c;
+}
+expect {
+    20|30
+}
+
+test nested-subqueries-keep-the-array {
+    SELECT y[1] FROM (SELECT x AS y FROM (SELECT ARRAY['a', 'b'] AS x) p) q;
+}
+expect {
+    a
+}
+
+test subquery-array-converts-to-text {
+    SELECT x::text, length(x::text) FROM (SELECT ARRAY[1, 2] AS x) q;
+}
+expect {
+    {1,2}|5
+}
+
+test insert-select-of-an-array-into-a-text-column {
+    CREATE TABLE subquery_array_text(a text);
+    INSERT INTO subquery_array_text SELECT ARRAY[1, 2];
+    SELECT a FROM subquery_array_text;
+}
+expect {
+    {1,2}
+}
+
+test materialized-cte-yields-an-array-the-outer-query-can-subscript {
+    WITH c AS MATERIALIZED (SELECT ARRAY[10, 20, 30] AS x) SELECT x[1] FROM c;
+}
+expect {
+    10
+}
+
+test cte-used-twice-yields-an-array-the-outer-query-can-subscript {
+    WITH c AS (SELECT ARRAY[10, 20, 30] AS x) SELECT a.x[1], b.x[3] FROM c a, c b;
+}
+expect {
+    10|30
+}
+
+test scalar-subquery-array-can-be-subscripted {
+    SELECT (SELECT ARRAY[1, 2])[2];
+}
+expect {
+    2
+}
+
+test union-subquery-yields-an-array-the-outer-query-can-subscript {
+    SELECT x[2] FROM (SELECT ARRAY[1, 2] AS x UNION ALL SELECT ARRAY[3, 4]) q ORDER BY 1;
+}
+expect {
+    2
+    4
+}
+
+test ordered-subquery-yields-an-array-the-outer-query-can-subscript {
+    SELECT x[1] FROM (SELECT ARRAY[1, 2] AS x ORDER BY 1) q;
+}
+expect {
+    1
+}
+
+test text-array-subscript-from-subquery-keeps-integer-type {
+    SELECT x[2] + 1 FROM (SELECT ARRAY[10, 20] AS x) q;
+}
+expect {
+    21
+}
+
+test values-subquery-yields-an-array-the-outer-query-can-subscript {
+    SELECT x[2] FROM (VALUES (ARRAY[1, 2])) q(x);
+}
+expect {
+    2
+}
+
+test subquery-text-array-elements-with-commas-and-quotes-can-be-subscripted {
+    SELECT x[1], x[2] FROM (SELECT ARRAY['a,b', 'c"d'] AS x) q;
+}
+expect {
+    a,b|c"d
+}
+
+test subquery-null-array-subscript-is-null {
+    SELECT coalesce(x[1]::text, 'none') FROM (SELECT NULL::int[] AS x) q;
+}
+expect {
+    none
+}
