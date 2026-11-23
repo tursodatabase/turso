@@ -2302,7 +2302,7 @@ pub unsafe extern "C" fn sqlite3_column_double(stmt: *mut sqlite3_stmt, idx: ffi
 fn value_to_int64(value: &Value) -> i64 {
     match value {
         Value::Numeric(turso_core::Numeric::Integer(i)) => *i,
-        v => match v.exec_cast("INTEGER") {
+        v => match v.exec_cast(turso_core::Affinity::Integer) {
             Ok(Value::Numeric(turso_core::Numeric::Integer(i))) => i,
             _ => 0,
         },
@@ -2313,7 +2313,7 @@ fn value_to_int64(value: &Value) -> i64 {
 fn value_to_double(value: &Value) -> f64 {
     match value {
         Value::Numeric(turso_core::Numeric::Float(f)) => f64::from(*f),
-        v => match v.exec_cast("REAL") {
+        v => match v.exec_cast(turso_core::Affinity::Real) {
             Ok(Value::Numeric(n)) => match n {
                 turso_core::Numeric::Float(f) => f64::from(f),
                 turso_core::Numeric::Integer(i) => i as f64,

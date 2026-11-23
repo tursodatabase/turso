@@ -17008,13 +17008,7 @@ pub fn op_cast(
     load_insn!(Cast { reg, affinity }, insn);
 
     let value = state.registers[*reg].get_value().clone();
-    let result = match affinity {
-        Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
-        Affinity::Text => value.exec_cast("TEXT"),
-        Affinity::Numeric => value.exec_cast("NUMERIC"),
-        Affinity::Integer => value.exec_cast("INTEGER"),
-        Affinity::Real => value.exec_cast("REAL"),
-    }?;
+    let result = value.exec_cast(*affinity)?;
 
     state.registers[*reg].set_value(result);
     state.pc += 1;

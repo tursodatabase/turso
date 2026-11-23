@@ -501,10 +501,15 @@ mod tests {
                 fiber_idx: 14,
                 execution_id: 15,
             });
-            assert!(blob.exec_cast("BLOB").is_err());
+            assert!(blob.exec_cast(turso_core::Affinity::Blob).is_err());
         }
         assert_eq!(injector.injected_faults(), before + 1);
-        assert_eq!(blob.exec_cast("BLOB").unwrap().to_blob(), blob.to_blob());
+        assert_eq!(
+            blob.exec_cast(turso_core::Affinity::Blob)
+                .unwrap()
+                .to_blob(),
+            blob.to_blob()
+        );
 
         let before = injector.injected_faults();
         {
