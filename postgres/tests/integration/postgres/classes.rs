@@ -475,6 +475,31 @@ fn a_database_with_relations_but_no_catalog_is_refused() {
     }
 }
 
+/// The SQLite frontend makes such a file: it creates `sqlite_sequence` for
+/// an AUTOINCREMENT table and keeps it when the table is dropped.
+#[test]
+fn a_database_that_already_has_the_sequence_table_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("has-sequence-table.db");
+    let path = path.to_str().unwrap();
+    {
+        let db = open_without_catalog(path);
+        let conn = db
+            .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.prepare_engine_schema_statement("CREATE TABLE sqlite_sequence(name,seq)")
+            .unwrap()
+            .run_ignore_rows()
+            .unwrap();
+    }
+
+    let db = open_like_server(path);
+    let pg = turso_pg::PgConnection::connect(&db).unwrap();
+    pg.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    let (oid, ..) = class_row(pg.inner(), "t").unwrap();
+    assert_eq!(oid, 16384);
+}
+
 #[test]
 fn a_rolled_back_create_leaves_no_class_row_behind() {
     let db = TempDatabase::builder().build();
