@@ -37,6 +37,8 @@ pub enum StatementAllocationSite {
     /// The statement that executes a nested trigger or foreign key action
     /// program.
     SubprogramStatement,
+    /// The builder of the program of a statement.
+    ProgramBuilder,
 }
 
 impl From<StatementAllocationSite> for AllocationSite {

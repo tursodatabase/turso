@@ -37,6 +37,14 @@ fn statement_allocation_sites_fail_only_the_statement() {
         conn.execute(sql).unwrap();
     }
 
+    // The compilation of a statement fails.
+    arm_fault(StatementAllocationSite::ProgramBuilder);
+    let Err(err) = conn.prepare("SELECT count(*) FROM t") else {
+        panic!("the compilation of the statement must fail");
+    };
+    assert!(matches!(err, LimboError::OutOfMemory), "{err}");
+    disarm_fault();
+
     // The compilation of the trigger program fails.
     arm_fault(StatementAllocationSite::TriggerProgramBuilder);
     let Err(err) = conn.prepare("INSERT INTO t VALUES (1)") else {

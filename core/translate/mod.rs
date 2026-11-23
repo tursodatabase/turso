@@ -53,6 +53,7 @@ mod values;
 pub(crate) mod view;
 mod window;
 
+use crate::alloc::{DynBox, TursoBoxExt};
 use crate::ast;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
@@ -100,13 +101,7 @@ pub fn translate(
     } else {
         connection.get_capture_data_changes_info().clone()
     };
-    // Boxed so the ~800 B builder sits on the heap instead of the prepare frame.
-    let mut program = Box::new(ProgramBuilder::new(
-        query_mode,
-        capture_data_changes_info,
-        // These options will be extended whithin each translate program
-        ProgramBuilderOpts::new(1, 32, 2),
-    ));
+    let mut program = new_program_builder(&connection, query_mode, capture_data_changes_info)?;
     program.set_mvcc_enabled(connection.mvcc_enabled());
     program.flags.set_reads_stored_values(matches!(
         origin,
@@ -198,7 +193,43 @@ pub fn translate(
 
     program.epilogue(schema);
 
-    program.build(&connection, change_cnt_on, input)
+    build_program(program, &connection, change_cnt_on, input)
+}
+
+/// Makes the builder of the program of a statement in memory from the statement
+/// allocator of the database. Rust makes the builder on the stack and then
+/// copies it into the box. This function is not inlined, so that the builder is
+/// in the stack frame of this function, and not in the frame of [translate].
+#[inline(never)]
+fn new_program_builder(
+    connection: &Connection,
+    query_mode: QueryMode,
+    capture_data_changes_info: Option<crate::CaptureDataChangesInfo>,
+) -> Result<DynBox<ProgramBuilder>> {
+    let builder = ProgramBuilder::new(
+        query_mode,
+        capture_data_changes_info,
+        // These options will be extended whithin each translate program
+        ProgramBuilderOpts::new(1, 32, 2),
+    );
+    let alloc = connection.db.allocators.statement.clone();
+    let builder =
+        crate::with_statement_allocation_site!(ProgramBuilder, DynBox::try_new_in(builder, alloc))?;
+    Ok(builder)
+}
+
+/// Builds the program of a statement. [ProgramBuilder::build] takes the builder
+/// as a value, so the builder leaves its box here. This function is not
+/// inlined, so that the builder is in the stack frame of this function, and not
+/// in the frame of [translate].
+#[inline(never)]
+fn build_program(
+    builder: DynBox<ProgramBuilder>,
+    connection: &Arc<Connection>,
+    change_cnt_on: bool,
+    input: &str,
+) -> Result<Program> {
+    TursoBoxExt::into_inner(builder).build(connection, change_cnt_on, input)
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
