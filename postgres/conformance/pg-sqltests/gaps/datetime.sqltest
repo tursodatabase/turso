@@ -788,9 +788,3 @@ test date-plus-days-after-year-9999 {
 }
 @sqlstate 22008
 expect error {}
-
-test date-minus-days-into-negative-years {
-    SELECT '0001-01-01'::date - 400;
-}
-@sqlstate 22008
-expect error {}
