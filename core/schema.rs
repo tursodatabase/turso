@@ -2305,6 +2305,19 @@ impl Schema {
         Ok(Some(ResolvedType { primitive, chain }))
     }
 
+    /// The affinity that comparisons with a value of the registered type
+    /// `type_name` use: the affinity of the values the type reads as, or of the
+    /// values it stores when it has its own order. The same affinity a column
+    /// of the type gets. None for a name that is not a registered type.
+    pub fn type_comparison_affinity(&self, type_name: &str) -> Option<Affinity> {
+        let resolved = self.resolve_type_unchecked(type_name).ok().flatten()?;
+        let stored_affinity = Affinity::affinity(&resolved.primitive);
+        Some(match resolved.ordering() {
+            Some(_) => stored_affinity,
+            None => resolved.leaf().value_type().affinity(),
+        })
+    }
+
     /// The plain SQL type the type takes as input: its input type, followed
     /// through custom types. A type declared `(value date)` takes text, as
     /// date is declared `(value text)`. Fails for a name a STRICT column
