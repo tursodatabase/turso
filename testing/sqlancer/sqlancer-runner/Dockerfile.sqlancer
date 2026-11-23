@@ -27,6 +27,8 @@ RUN --mount=type=bind,source=.,target=/app \
 FROM chef AS builder
 
 COPY --from=planner /tmp/recipe.json recipe.json
+# The recipe has .cargo/config.toml, and its linker is this script.
+COPY scripts/link-with-rust-lld.sh scripts/link-with-rust-lld.sh
 RUN cargo chef cook --release -p turso-java --recipe-path recipe.json
 
 # Copy full source

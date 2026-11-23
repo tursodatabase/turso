@@ -13,6 +13,7 @@ mod options;
 mod pg_type;
 mod policies;
 mod roles;
+mod schema_init;
 mod schema_state;
 mod session;
 mod settings;

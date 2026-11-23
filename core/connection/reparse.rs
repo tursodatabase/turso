@@ -245,7 +245,7 @@ mod tests {
             schema.dialect_schema = Some(Arc::new(()));
         })
         .unwrap();
-        let fresh = crate::schema::builtin::schema_builder(&DialectThatCannotParse, false)
+        let fresh = crate::schema::builtin::schema_builder(false)
             .unwrap()
             .build();
         assert!(fresh.dialect_schema.is_none());

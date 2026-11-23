@@ -493,6 +493,13 @@ test select-cast-to-domain-checks-constraint {
 @sqlstate 23514
 expect error {}
 
+test select-cast-function-integer-to-boolean {
+    SELECT bool(5), bool(0);
+}
+expect {
+    t|f
+}
+
 test select-cast-integer-to-domain-over-boolean {
     CREATE DOMAIN db AS boolean;
     CREATE DOMAIN true_db AS db CHECK (VALUE);

@@ -1,6 +1,6 @@
 use super::*;
 use crate::schema::ResolvedType;
-use crate::types::{StorageClass, StrictType};
+use crate::types::{Conversion, StorageClass, StrictType};
 
 /// Get the effective type name of a literal expression.
 pub(super) fn literal_type_name(expr: &ast::Expr) -> Option<&'static str> {
@@ -566,8 +566,8 @@ pub(crate) fn emit_decode(
 
     // Apply decode in reverse order (parent/ancestor first, then child)
     for td in resolved.chain.iter().rev() {
-        if let Some(decode_expr) = td.decode() {
-            emit_type_expr(program, decode_expr, reg, reg, resolver)?;
+        if let Some(decode) = td.decode() {
+            emit_conversion(program, td, "DECODE", decode, reg, resolver)?;
         }
     }
 
@@ -699,15 +699,15 @@ pub(crate) fn emit_store_value(
     });
     for type_def in &resolved.chain {
         if let Some(encode) = type_def.encode() {
-            emit_type_expr(program, encode, reg, reg, resolver)?;
+            emit_conversion(program, type_def, "ENCODE", encode, reg, resolver)?;
         }
         let type_params = match coerce {
             Coerce::WithArgs(type_params) => type_params,
             Coerce::Skip => continue,
         };
-        if let Some(coerce_expr) = coerce_to_run(type_def, type_params) {
+        if let Some(coerce) = coerce_to_run(type_def, type_params) {
             program.emit_insn(convert.clone());
-            emit_coerce(program, type_def, coerce_expr, reg, type_params, resolver)?;
+            emit_coerce(program, type_def, coerce, reg, type_params, resolver)?;
         }
     }
     program.emit_insn(convert);
@@ -771,7 +771,7 @@ pub(crate) fn emit_encode_for_comparison(
 ) -> Result<()> {
     for type_def in chain {
         if let Some(encode) = type_def.encode() {
-            emit_type_expr(program, encode, reg, reg, resolver)?;
+            emit_conversion(program, type_def, "ENCODE", encode, reg, resolver)?;
         }
     }
     program.emit_insn(Insn::Affinity {
@@ -782,16 +782,31 @@ pub(crate) fn emit_encode_for_comparison(
     Ok(())
 }
 
-/// Emit bytecode for a custom type ENCODE or DECODE expression, with `value`
-/// referencing `value_reg`. The result is written to `dest_reg`.
-pub(crate) fn emit_type_expr(
+/// Emits `conversion`, which is the ENCODE or DECODE of `type_def` as `clause`
+/// says, on the value in `reg`. A SQL expression is compiled with `value`
+/// referencing `reg`. A Rust function is called, unless the value is NULL.
+pub(crate) fn emit_conversion(
     program: &mut ProgramBuilder,
-    expr: &ast::Expr,
-    value_reg: usize,
-    dest_reg: usize,
+    type_def: &TypeDef,
+    clause: &str,
+    conversion: &Conversion,
+    reg: usize,
     resolver: &Resolver,
-) -> Result<usize> {
-    emit_expr_with_bindings(program, expr, value_reg, dest_reg, &[], resolver)
+) -> Result<()> {
+    match conversion {
+        Conversion::Unchanged => {}
+        Conversion::Function(function) => program.emit_insn(Insn::TypeConversion {
+            function: *function,
+            reg,
+            params_reg: reg,
+            param_count: 0,
+            description: format!("{} {clause}", type_def.name),
+        }),
+        Conversion::Expr(expr) => {
+            emit_expr_with_bindings(program, expr, reg, reg, &[], resolver)?;
+        }
+    }
+    Ok(())
 }
 
 /// The type's COERCE, unless the type has parameters and is used without
@@ -799,7 +814,7 @@ pub(crate) fn emit_type_expr(
 fn coerce_to_run<'a>(
     type_def: &'a TypeDef,
     type_params: &[Box<ast::Expr>],
-) -> Option<&'a ast::Expr> {
+) -> Option<&'a Conversion> {
     let coerce = type_def.coerce()?;
     if type_params.is_empty() && type_def.user_params().next().is_some() {
         return None;
@@ -812,7 +827,7 @@ fn coerce_to_run<'a>(
 fn emit_coerce(
     program: &mut ProgramBuilder,
     type_def: &TypeDef,
-    coerce: &ast::Expr,
+    coerce: &Conversion,
     reg: usize,
     type_params: &[Box<ast::Expr>],
     resolver: &Resolver,
@@ -832,7 +847,25 @@ fn emit_coerce(
         reg,
         target_pc: skip_null,
     });
-    emit_expr_with_bindings(program, coerce, reg, reg, &bindings, resolver)?;
+    match coerce {
+        Conversion::Unchanged => {}
+        Conversion::Function(function) => {
+            let params_reg = program.alloc_registers(bindings.len());
+            for (i, (_, arg)) in bindings.iter().enumerate() {
+                translate_expr(program, None, arg, params_reg + i, resolver)?;
+            }
+            program.emit_insn(Insn::TypeConversion {
+                function: *function,
+                reg,
+                params_reg,
+                param_count: bindings.len(),
+                description: format!("{} COERCE", type_def.name),
+            });
+        }
+        Conversion::Expr(expr) => {
+            emit_expr_with_bindings(program, expr, reg, reg, &bindings, resolver)?;
+        }
+    }
     program.preassign_label_to_next_insn(skip_null);
     Ok(())
 }

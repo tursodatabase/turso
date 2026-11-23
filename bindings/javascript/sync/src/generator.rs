@@ -65,7 +65,7 @@ impl SyncEngineChanges {
         let Some(changes) = self.status.as_ref() else {
             return true;
         };
-        changes.file_slot.is_none()
+        changes.is_empty()
     }
 }
 

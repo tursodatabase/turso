@@ -67,6 +67,7 @@ fn run_sync_server(app: app::Limbo) -> anyhow::Result<()> {
                 flags: app.opts.flags,
                 db_opts: app.db_opts,
                 max_open: app.opts.sync_max_databases,
+                encryption: app.sync_encryption.clone(),
             },
             app.opts.sync_workers,
         )?,
@@ -76,6 +77,7 @@ fn run_sync_server(app: app::Limbo) -> anyhow::Result<()> {
             app.get_connection(),
             interrupt_count,
             app.opts.sync_workers,
+            app.sync_encryption.clone(),
         )?,
     };
 

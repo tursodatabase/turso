@@ -1107,7 +1107,9 @@ pub struct TranslateCtx<'a> {
     pub agg_leaf_columns: Vec<Expr>,
     /// Cursor id for cdc table (if capture_data_changes PRAGMA is set and query can modify the data)
     pub cdc_cursor_id: Option<usize>,
-    pub meta_window: Option<WindowMetadata<'a>>,
+    /// Boxed because only queries with window functions have this metadata,
+    /// and each `TranslateCtx` that a statement makes would hold its 392 bytes.
+    pub meta_window: Option<Box<WindowMetadata<'a>>>,
     /// Metadata stored during `open_loop` for `Search::InSeek`, consumed by `close_loop`.
     pub meta_in_seeks: Vec<Option<InSeekMetadata>>,
     pub unsafe_testing: bool,

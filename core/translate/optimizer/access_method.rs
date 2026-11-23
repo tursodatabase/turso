@@ -88,18 +88,9 @@ pub enum AccessMethodParams {
         /// a non-empty list means a search.
         constraint_refs: Vec<RangeConstraintRef>,
     },
-    VirtualTable {
-        /// Index identifier returned by the table's `best_index` method.
-        idx_num: i32,
-        /// Optional index string returned by the table's `best_index` method.
-        idx_str: Option<String>,
-        /// Constraint descriptors passed to the virtual table’s `filter` method.
-        /// Each corresponds to a column/operator pair from the WHERE clause.
-        constraints: Vec<ConstraintInfo>,
-        /// Information returned by the virtual table's `best_index` method
-        /// describing how each constraint will be used.
-        constraint_usages: Vec<ConstraintUsage>,
-    },
+    /// Boxed, as the query of `IndexMethod`: these two variants are the
+    /// largest, and the planner moves many access methods of other tables.
+    VirtualTable(Box<VirtualTableAccess>),
     /// FROM-subquery scan. Coroutine-backed scans run forwards; materialized
     /// subqueries may also be scanned backwards when their intrinsic order
     /// matches the requested extremum order.
@@ -139,7 +130,7 @@ pub enum AccessMethodParams {
     /// should be used for table access in a join query.
     IndexMethod {
         /// The fully constructed IndexMethodQuery operation to apply to this table.
-        query: IndexMethodQuery,
+        query: Box<IndexMethodQuery>,
         /// Index in WHERE clause that was covered by this index method (if any).
         where_covered: Option<usize>,
     },
@@ -160,6 +151,21 @@ pub enum AccessMethodParams {
         affinity: Affinity,
         where_term_idx: usize,
     },
+}
+
+/// How the planner reads a virtual table: what its `best_index` method chose.
+#[derive(Debug, Clone)]
+pub struct VirtualTableAccess {
+    /// Index identifier returned by the table's `best_index` method.
+    pub idx_num: i32,
+    /// Optional index string returned by the table's `best_index` method.
+    pub idx_str: Option<String>,
+    /// Constraint descriptors passed to the virtual table’s `filter` method.
+    /// Each corresponds to a column/operator pair from the WHERE clause.
+    pub constraints: Vec<ConstraintInfo>,
+    /// Information returned by the virtual table's `best_index` method
+    /// describing how each constraint will be used.
+    pub constraint_usages: Vec<ConstraintUsage>,
 }
 
 /// Result of generic btree candidate selection before it is wrapped into a full
@@ -1268,12 +1274,12 @@ fn find_best_access_method_for_vtab(
                 ),
                 estimated_rows_per_outer_row,
                 consumed_where_terms,
-                params: AccessMethodParams::VirtualTable {
+                params: AccessMethodParams::VirtualTable(Box::new(VirtualTableAccess {
                     idx_num: index_info.idx_num,
                     idx_str: index_info.idx_str,
                     constraints: vtab_constraints,
                     constraint_usages: index_info.constraint_usages,
-                },
+                })),
             }))
         }
         Err(ResultCode::ConstraintViolation) => Ok(None),
@@ -2289,4 +2295,17 @@ fn materialized_subquery_order_properties(
         true,
         order_bonus,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AccessMethod;
+
+    /// The join order search moves access methods by value many times. On
+    /// x86-64 the compiler copies a value of up to 128 bytes with inline
+    /// loads and stores, and calls memcpy for a larger one.
+    #[test]
+    fn access_method_stays_small() {
+        assert!(std::mem::size_of::<AccessMethod>() <= 128);
+    }
 }

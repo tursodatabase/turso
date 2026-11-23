@@ -529,7 +529,7 @@ fn prepare_update_plan(
     let columns = table.columns();
     // As in SQLite, WHERE cannot name a RETURNING alias.
     parse_where(
-        body.where_clause.as_deref(),
+        body.where_clause,
         &mut read_scope_tables,
         None,
         &mut where_clause,
