@@ -214,6 +214,10 @@ pub enum CheckpointState {
     /// truncation, the old frames come back, but their `commit_ts` is at or below
     /// `persistent_tx_ts_max`, so recovery skips them.
     TruncateLogicalLog,
+    /// Apply the finished truncate of the logical log to the in-memory log
+    /// state. A truncate that completes after `DurableStorage::truncate`
+    /// returned leaves the old log offset in place until this step.
+    FinishTruncateLogicalLog,
     /// Truncate the WAL file after the DB file is durable.
     TruncateWal,
     GcTableRows {
@@ -3262,27 +3266,33 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             CheckpointState::TruncateLogicalLog => {
                 tracing::debug!("Truncating logical log file");
                 let c = self.truncate_logical_log()?;
-                self.state = CheckpointState::TruncateWal;
+                self.state = CheckpointState::FinishTruncateLogicalLog;
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
-                    if self.clears_whole_logical_log() {
-                        turso_assert!(
-                            self.mvstore.storage.logical_log_offset() == 0,
-                            "TRUNCATE checkpoint must reset logical log offset to 0"
-                        );
-                        turso_assert!(
-                            self.mvstore
-                                .get_logical_log_file()
-                                .size()
-                                .expect("logical log file size should be readable after truncate")
-                                == 0,
-                            "TRUNCATE checkpoint must zero the logical log file"
-                        );
-                    }
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions(c)))
                 }
+            }
+
+            CheckpointState::FinishTruncateLogicalLog => {
+                self.mvstore.storage.finish_truncate();
+                if self.clears_whole_logical_log() {
+                    turso_assert!(
+                        self.mvstore.storage.logical_log_offset() == 0,
+                        "TRUNCATE checkpoint must reset logical log offset to 0"
+                    );
+                    turso_assert!(
+                        self.mvstore
+                            .get_logical_log_file()
+                            .size()
+                            .expect("logical log file size should be readable after truncate")
+                            == 0,
+                        "TRUNCATE checkpoint must zero the logical log file"
+                    );
+                }
+                self.state = CheckpointState::TruncateWal;
+                Ok(TransitionResult::Continue)
             }
 
             CheckpointState::CheckpointWal => {
