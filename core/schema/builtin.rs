@@ -25,8 +25,6 @@ fn builtin_types(
     dialect: &(impl crate::dialect::Dialect + ?Sized),
     mut builder: SchemaBuilder,
 ) -> crate::Result<SchemaBuilder> {
-    use crate::ast::{Cmd, Stmt};
-
     // Whether values of the type take a COLLATE. In PostgreSQL only text
     // types do, so of the types below only varchar does.
     const COLLATE: bool = true;
@@ -60,40 +58,55 @@ fn builtin_types(
         (NO_COLLATE, RangeOffsets::Numeric, NO_SORT, "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)"),
     ];
 
-    let aliases: &[(&str, &str)] = &[
+    for &(accepts_collate, range_offsets, stored_form_sorts_in_value_order, sql) in types {
+        let origin = TypeOrigin::Builtin {
+            accepts_collate,
+            range_offsets,
+            stored_form_sorts_in_value_order,
+        };
+        builder = builtin_type(dialect, builder, origin, sql)?;
+    }
+    Ok(builder)
+}
+
+/// Adds the built-in type that the CREATE TYPE statement `sql` defines, under
+/// its name and under the other names of the type, such as `bool` for
+/// `boolean`. A type that already has one of these names is replaced, so a
+/// dialect can define a built-in type differently from the other dialects.
+pub fn builtin_type(
+    dialect: &(impl crate::dialect::Dialect + ?Sized),
+    mut builder: SchemaBuilder,
+    origin: TypeOrigin,
+    sql: &str,
+) -> crate::Result<SchemaBuilder> {
+    use crate::ast::{Cmd, Stmt};
+
+    const ALIASES: &[(&str, &str)] = &[
         ("bool", "boolean"),
         ("int2", "smallint"),
         ("int8", "bigint"),
     ];
-    for &(accepts_collate, range_offsets, stored_form_sorts_in_value_order, sql) in types {
-        let Ok(Some(Cmd::Stmt(Stmt::CreateType {
-            type_name, body, ..
-        }))) = crate::dialect::parse_statement(dialect, sql)
-        else {
-            return Err(crate::LimboError::InternalError(format!(
-                "failed to parse built-in type SQL: {sql}"
-            )));
-        };
+    let Ok(Some(Cmd::Stmt(Stmt::CreateType {
+        type_name, body, ..
+    }))) = crate::dialect::parse_statement(dialect, sql)
+    else {
+        return Err(crate::LimboError::InternalError(format!(
+            "failed to parse built-in type SQL: {sql}"
+        )));
+    };
 
-        let type_def = TypeDef::from_create_type(
-            &type_name,
-            &body,
-            TypeOrigin::Builtin {
-                accepts_collate,
-                range_offsets,
-                stored_form_sorts_in_value_order,
-            },
-            sql.to_string(),
-        )?;
-        let type_def = Arc::new(type_def);
-        for (alias, target) in aliases {
-            if type_name.eq_ignore_ascii_case(target) {
-                builder = builder.type_def(alias, Arc::clone(&type_def));
-            }
+    let type_def = Arc::new(TypeDef::from_create_type(
+        &type_name,
+        &body,
+        origin,
+        sql.to_string(),
+    )?);
+    for (alias, target) in ALIASES {
+        if type_name.eq_ignore_ascii_case(target) {
+            builder = builder.type_def(alias, Arc::clone(&type_def));
         }
-        builder = builder.type_def(&type_name, type_def);
     }
-    Ok(builder)
+    Ok(builder.type_def(&type_name, type_def))
 }
 
 /// Adds the standard SQLite-style catalog tables.
