@@ -104,6 +104,12 @@ async fn passive_truncate_late_commit_scenario() -> bool {
                 Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => {}
                 Err(err) => panic!("late writer failed unexpectedly: {err:?}"),
             }
+            // TRUNCATE takes WAL read lock 0 exclusively and returns Busy when it cannot.
+            // A statement holds that lock while it runs, and the writer otherwise yields
+            // only inside a statement. Without this yield the checkpoint reaches the WAL
+            // only while the writer holds the lock, and TRUNCATE completes in about 2 of
+            // 100 schedules, so some runs complete none.
+            shuttle::future::yield_now().await;
         }
         acknowledged
     });
