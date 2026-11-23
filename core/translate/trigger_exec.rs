@@ -1,5 +1,4 @@
 use crate::ast::{self, Expr, TriggerEvent, TriggerTime};
-use crate::error::SQLITE_ERROR;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{BTreeTable, Column, Trigger};
 use crate::sync::Arc;
@@ -19,7 +18,7 @@ use crate::turso_assert;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::DmlRowForm;
 use crate::vdbe::insn::{Insn, Subprogram};
-use crate::vdbe::{BranchOffset, MAX_TRIGGER_DEPTH, TRIGGER_DEPTH_ERROR};
+use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, QueryMode, Result};
 use std::cell::RefCell;
 use std::num::NonZero;
@@ -528,12 +527,9 @@ fn execute_trigger_commands(
         // Do not recursively compile the same trigger
         return Ok(false);
     }
-    let depth = program.subprogram_depth() + 1;
-    if depth > MAX_TRIGGER_DEPTH {
-        // As in SQLite, the error occurs only if the statement gets to this level.
-        program.emit_halt_err(SQLITE_ERROR, TRIGGER_DEPTH_ERROR.to_string());
+    let Some(depth) = program.nested_subprogram_depth() else {
         return Ok(true);
-    }
+    };
     connection.start_trigger_compilation(trigger.clone());
     let _trigger_compilation_guard = TriggerCompilationGuard {
         connection: connection.clone(),
