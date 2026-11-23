@@ -80,6 +80,48 @@ pub struct PostgreSQLTranslator {
     generation_expression_table: std::cell::RefCell<Option<String>>,
     /// Generated columns already present in the table, used for ADD COLUMN validation.
     existing_generated_columns: Vec<String>,
+    /// None when the types of the result are not asked about, as in tests.
+    types: Option<std::sync::Arc<dyn ast::TypeResolver>>,
+}
+
+/// Builds the types of the translated statement, with the handle the
+/// dialect gives each one.
+#[derive(Clone, Copy)]
+struct Types<'a>(Option<&'a dyn ast::TypeResolver>);
+
+impl Types<'_> {
+    fn column(self, name: String, size: Option<ast::TypeSize>, array_dimensions: u32) -> ast::Type {
+        self.written(name, size, array_dimensions, ast::TypePlace::Column)
+    }
+
+    fn cast_target(self, name: &str) -> ast::Type {
+        self.cast_target_array(name, 0)
+    }
+
+    fn cast_target_array(self, name: &str, array_dimensions: u32) -> ast::Type {
+        self.written(
+            name.to_string(),
+            None,
+            array_dimensions,
+            ast::TypePlace::Cast,
+        )
+    }
+
+    fn written(
+        self,
+        name: String,
+        size: Option<ast::TypeSize>,
+        array_dimensions: u32,
+        place: ast::TypePlace,
+    ) -> ast::Type {
+        let resolved = self.0.map(|types| types.resolve(&name, place));
+        ast::Type {
+            name,
+            size,
+            array_dimensions,
+            resolved,
+        }
+    }
 }
 
 impl PostgreSQLTranslator {
@@ -113,6 +155,16 @@ impl PostgreSQLTranslator {
     }
 
     /// Translate an `ALTER TABLE ... ADD COLUMN` of a table with these generated columns.
+    /// A translator that asks `types` for the handle of each type it writes.
+    pub fn with_types(mut self, types: std::sync::Arc<dyn ast::TypeResolver>) -> Self {
+        self.types = Some(types);
+        self
+    }
+
+    fn types(&self) -> Types<'_> {
+        Types(self.types.as_deref())
+    }
+
     pub fn with_existing_generated_columns(mut self, columns: Vec<String>) -> Self {
         self.existing_generated_columns = columns;
         self
@@ -857,11 +909,10 @@ impl PostgreSQLTranslator {
                 )))),
                 _ => None,
             };
-            Some(ast::Type {
-                name: mapping.type_name.clone(),
-                size,
-                array_dimensions: mapping.array_dimensions,
-            })
+            Some(
+                self.types()
+                    .column(mapping.type_name.clone(), size, mapping.array_dimensions),
+            )
         };
 
         // Build constraints list
@@ -1502,11 +1553,10 @@ impl PostgreSQLTranslator {
             )))),
             _ => None,
         };
-        let col_type = Some(ast::Type {
-            name: mapping.type_name,
-            size,
-            array_dimensions: mapping.array_dimensions,
-        });
+        let col_type = Some(
+            self.types()
+                .column(mapping.type_name, size, mapping.array_dimensions),
+        );
 
         let mut constraints = Vec::new();
         for constraint_node in &col_def.constraints {
@@ -2972,11 +3022,7 @@ impl PostgreSQLTranslator {
             };
             let cast = ast::Expr::Cast {
                 expr: Box::new(call),
-                type_name: Some(ast::Type {
-                    name: "TEXT".to_string(),
-                    size: None,
-                    array_dimensions: 0,
-                }),
+                type_name: Some(self.types().cast_target("TEXT")),
             };
             let select = ast::Select {
                 with: None,
@@ -2985,7 +3031,10 @@ impl PostgreSQLTranslator {
                         distinctness: None,
                         columns: [
                             cast,
-                            bigint(ast::Expr::Literal(ast::Literal::Numeric("1".into()))),
+                            bigint(
+                                ast::Expr::Literal(ast::Literal::Numeric("1".into())),
+                                self.types(),
+                            ),
                         ]
                         .into_iter()
                         .zip(names)
@@ -3024,6 +3073,7 @@ impl PostgreSQLTranslator {
                     schema_qualified: func_call.funcname.len() > 1,
                     has_column_definition_list: !column_definitions.is_empty(),
                 },
+                self.types(),
             );
         }
         if returns_record {
@@ -3191,7 +3241,7 @@ impl PostgreSQLTranslator {
                         .as_str(),
                     "json" | "jsonb"
                 );
-                let cast_type = Some(pg_type_name_to_ast_type(type_name)?);
+                let cast_type = Some(pg_type_name_to_ast_type(type_name, self.types())?);
                 // jsonb_field() finds the field as -> does: of two fields with
                 // the same name, the last one counts, as in PostgreSQL. A JSON
                 // path of SQLite finds the first one. SQLite's operators then
@@ -3242,7 +3292,7 @@ impl PostgreSQLTranslator {
         if range_func.ordinality {
             let name = names.last().expect("WITH ORDINALITY adds a column name");
             columns.push(ast::ResultColumn::Expr(
-                Box::new(row_number()),
+                Box::new(row_number(self.types())),
                 Some(ast::As::Elided(exact_name(name.clone()))),
             ));
         }
@@ -3590,7 +3640,7 @@ impl PostgreSQLTranslator {
                 if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
                     expr = Box::new(int8_cast_operand(arg, *expr));
                 }
-                let type_name = pg_type_name_to_ast_type(pg_type_name)?;
+                let type_name = pg_type_name_to_ast_type(pg_type_name, self.types())?;
                 Ok(ast::Expr::Cast {
                     expr,
                     type_name: Some(type_name),
@@ -3747,11 +3797,7 @@ impl PostgreSQLTranslator {
                     // transaction started, in the session time zone (UTC).
                     Ok(SqlValueFunctionOp::SvfopCurrentDate) => Ok(ast::Expr::Cast {
                         expr: Box::new(function_call("now", vec![])),
-                        type_name: Some(ast::Type {
-                            name: "date".to_string(),
-                            size: None,
-                            array_dimensions: 0,
-                        }),
+                        type_name: Some(self.types().cast_target("date")),
                     }),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTime
@@ -3778,11 +3824,7 @@ impl PostgreSQLTranslator {
                         | SqlValueFunctionOp::SvfopLocaltimestampN,
                     ) => Ok(ast::Expr::Cast {
                         expr: Box::new(function_call("now", vec![])),
-                        type_name: Some(ast::Type {
-                            name: "timestamp".to_string(),
-                            size: None,
-                            array_dimensions: 0,
-                        }),
+                        type_name: Some(self.types().cast_target("timestamp")),
                     }),
                     // Each role keyword is stored as a call to the function
                     // of the same name, so that the catalogs can show the
@@ -3965,11 +4007,7 @@ impl PostgreSQLTranslator {
                     expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
                         if b.boolval { "1" } else { "0" }.to_string(),
                     ))),
-                    type_name: Some(ast::Type {
-                        name: "boolean".to_string(),
-                        size: None,
-                        array_dimensions: 0,
-                    }),
+                    type_name: Some(self.types().cast_target("boolean")),
                 }),
                 _ => Err(ParseError::ParseError(
                     "Unsupported constant type".to_string(),
@@ -4690,11 +4728,7 @@ impl PostgreSQLTranslator {
                 }
                 return Ok(ast::Expr::Cast {
                     expr: operand,
-                    type_name: Some(ast::Type {
-                        name: type_name.to_string(),
-                        size: None,
-                        array_dimensions: 0,
-                    }),
+                    type_name: Some(self.types().cast_target(type_name)),
                 });
             }
         }
@@ -5903,7 +5937,7 @@ struct RewrittenFunction {
     check_call: fn(CallShape) -> Result<(), ParseError>,
     /// The column of the engine's table function that holds each column of the result,
     /// and the name PostgreSQL gives that column, for a call with this many arguments.
-    columns: fn(usize) -> Vec<(ast::Expr, String)>,
+    columns: fn(usize, Types) -> Vec<(ast::Expr, String)>,
 }
 
 /// The most arrays one call of unnest() in FROM can take.
@@ -5962,7 +5996,7 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
             }
             Ok(())
         },
-        columns: |count| {
+        columns: |count, _| {
             (1..=count)
                 .map(|array| {
                     (
@@ -5988,7 +6022,7 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
             }
             Ok(())
         },
-        columns: |_| vec![(ast::Expr::Id(exact_name("value")), "generate_series".into())],
+        columns: |_, _| vec![(ast::Expr::Id(exact_name("value")), "generate_series".into())],
     },
     RewrittenFunction {
         name: "json_each",
@@ -6005,14 +6039,10 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
             }
             Ok(())
         },
-        columns: |_| {
+        columns: |_, types| {
             let cast = |name: &str, type_name: &str| ast::Expr::Cast {
                 expr: Box::new(ast::Expr::Id(exact_name(name))),
-                type_name: Some(ast::Type {
-                    name: type_name.to_string(),
-                    size: None,
-                    array_dimensions: 0,
-                }),
+                type_name: Some(types.cast_target(type_name)),
             };
             vec![
                 (cast("key", "TEXT"), "key".to_string()),
@@ -6038,6 +6068,7 @@ fn translate_rewritten_function(
     args: Vec<Box<ast::Expr>>,
     alias: Option<ast::As>,
     call: CallShape,
+    types: Types,
 ) -> Result<ast::SelectTable, ParseError> {
     (function.check_call)(call)?;
     if call.has_column_definition_list {
@@ -6046,13 +6077,13 @@ fn translate_rewritten_function(
         ));
     }
     let (mut sources, mut default_names): (Vec<_>, Vec<_>) =
-        (function.columns)(args.len()).into_iter().unzip();
+        (function.columns)(args.len(), types).into_iter().unzip();
     if let ([name], Some(table_alias)) = (default_names.as_mut_slice(), &range_func.alias) {
         name.clone_from(&table_alias.aliasname);
     }
     let names = range_function_column_names(range_func, default_names)?;
     if range_func.ordinality {
-        sources.push(row_number());
+        sources.push(row_number(types));
     }
     let columns = sources
         .into_iter()
@@ -6100,35 +6131,34 @@ fn function_select(
     }
 }
 
-fn bigint(expr: ast::Expr) -> ast::Expr {
+fn bigint(expr: ast::Expr, types: Types) -> ast::Expr {
     ast::Expr::Cast {
         expr: Box::new(expr),
-        type_name: Some(ast::Type {
-            name: "BIGINT".to_string(),
-            size: None,
-            array_dimensions: 0,
-        }),
+        type_name: Some(types.cast_target("BIGINT")),
     }
 }
 
 /// The number of a row of a function in FROM, counted from 1 for each call of the function.
-fn row_number() -> ast::Expr {
-    bigint(ast::Expr::FunctionCall {
-        name: exact_name("row_number"),
-        distinctness: None,
-        args: vec![],
-        order_by: vec![],
-        within_group: vec![],
-        filter_over: ast::FunctionTail {
-            filter_clause: None,
-            over_clause: Some(Box::new(ast::Over::Window(ast::Window {
-                base: None,
-                partition_by: vec![],
-                order_by: vec![],
-                frame_clause: None,
-            }))),
+fn row_number(types: Types) -> ast::Expr {
+    bigint(
+        ast::Expr::FunctionCall {
+            name: exact_name("row_number"),
+            distinctness: None,
+            args: vec![],
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: Some(Box::new(ast::Over::Window(ast::Window {
+                    base: None,
+                    partition_by: vec![],
+                    order_by: vec![],
+                    frame_clause: None,
+                }))),
+            },
         },
-    })
+        types,
+    )
 }
 
 /// The names of the columns of a function in FROM. `function_columns` are the
@@ -7818,6 +7848,7 @@ fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
 /// enums and domains resolve to their custom type.
 fn pg_type_name_to_ast_type(
     type_name: &pg_query::protobuf::TypeName,
+    types: Types,
 ) -> Result<ast::Type, ParseError> {
     let pg_type = supported_type_name(type_name)?;
 
@@ -7845,11 +7876,7 @@ fn pg_type_name_to_ast_type(
 
     let array_dimensions = type_name.array_bounds.len() as u32;
     check_array_dimensions(array_dimensions)?;
-    Ok(ast::Type {
-        name: name.to_string(),
-        size: None,
-        array_dimensions,
-    })
+    Ok(types.cast_target_array(name, array_dimensions))
 }
 
 fn extract_type_name_from_typename(

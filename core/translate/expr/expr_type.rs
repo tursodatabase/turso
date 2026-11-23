@@ -535,6 +535,7 @@ impl ColumnCustomType {
             name: self.type_def.name.clone(),
             size,
             array_dimensions: 0,
+            resolved: None,
         }
     }
 
@@ -1797,6 +1798,7 @@ mod tests {
             name: name.to_string(),
             size: None,
             array_dimensions: dimensions,
+            resolved: None,
         }
     }
 
@@ -1809,6 +1811,7 @@ mod tests {
                 Box::new(int(scale)),
             )),
             array_dimensions: 0,
+            resolved: None,
         }
     }
 
