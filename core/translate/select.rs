@@ -1083,7 +1083,7 @@ fn result_columns_contain_aggregate(
     Ok(false)
 }
 
-fn first_aggregate_without_over_clause<'a>(
+pub(crate) fn first_aggregate_without_over_clause<'a>(
     expr: &'a ast::Expr,
     resolver: &Resolver,
 ) -> Result<Option<&'a str>> {

@@ -263,6 +263,7 @@ fn emit_loop_source<'a>(
                         delimiter: 0,
                         func: crate::function::AccumulatorFunc::Agg(min_max.func.clone()),
                         collation: min_max.collation,
+                        minmax_keeps_best_reg: None,
                     }),
                 });
                 program.emit_insn(Insn::Goto {
@@ -279,8 +280,14 @@ fn emit_loop_source<'a>(
             // a more complex expression. Some examples: length(sum(x)), sum(x) + avg(y), sum(x) + 1, etc.
             // The result of those more complex expressions depends on the final result of the aggregate, so we don't translate the complete expressions here.
             // Instead, we accumulate the intermediate results of all aggreagates, and evaluate any expressions that do not contain aggregates.
+            let bare_column_row_check = t_ctx
+                .reg_nonagg_emit_once_flag
+                .map(|flag| BareColumnRowCheck::new(program, &plan.aggregates, flag, false));
             for (i, agg) in plan.aggregates.iter().enumerate() {
                 let reg = start_reg + i;
+                let minmax_keeps_best_reg = bare_column_row_check
+                    .as_ref()
+                    .and_then(|check| check.emit_before_step(program, agg));
 
                 // FILTER: skip AggStep if filter condition is false
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
@@ -310,6 +317,7 @@ fn emit_loop_source<'a>(
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
                     reg,
                     &t_ctx.resolver,
+                    minmax_keeps_best_reg,
                 )?;
                 if let Distinctness::Distinct { ctx, .. } = &agg.distinctness {
                     let ctx = ctx
@@ -323,10 +331,10 @@ fn emit_loop_source<'a>(
                 }
             }
 
-            let label_emit_nonagg_only_once = if let Some(flag) = t_ctx.reg_nonagg_emit_once_flag {
+            let label_emit_nonagg_only_once = if let Some(check) = &bare_column_row_check {
                 let if_label = program.allocate_label();
                 program.emit_insn(Insn::If {
-                    reg: flag,
+                    reg: check.skip_reg(),
                     target_pc: if_label,
                     jump_if_null: false,
                 });
@@ -360,52 +368,19 @@ fn emit_loop_source<'a>(
                 )?;
             }
 
-            // For result columns that contain aggregates but also reference
-            // non-aggregate columns (e.g. CASE WHEN SUM(1) THEN a ELSE b END),
-            // pre-read those column references while the cursor is still valid.
-            // They are cached in expr_to_reg_cache so that when the full
-            // expression is evaluated after AggFinal, translate_expr finds
-            // the cached values instead of reading from the exhausted cursor.
-            // Columns of an outer query are not pre-read: the outer cursor does
-            // not move while this loop runs, and a value read here would be stale
-            // for an outer row where this loop finds no rows.
-            for rc in plan
-                .result_columns
-                .iter()
-                .filter(|rc| rc.contains_aggregates)
-            {
-                walk_expr(&rc.expr, &mut |expr: &Expr| -> Result<WalkControl> {
-                    match expr {
-                        Expr::Column { table, .. } | Expr::RowId { table, .. }
-                            if plan
-                                .table_references
-                                .find_joined_table_by_internal_id(*table)
-                                .is_none() =>
-                        {
-                            Ok(WalkControl::SkipChildren)
-                        }
-                        Expr::Column { .. } | Expr::RowId { .. } => {
-                            let reg = program.alloc_register();
-                            translate_expr(
-                                program,
-                                Some(&plan.table_references),
-                                expr,
-                                reg,
-                                &t_ctx.resolver,
-                            )?;
-                            t_ctx
-                                .resolver
-                                .cache_expr_reg(Cow::Owned(expr.clone()), reg, false);
-                            Ok(WalkControl::SkipChildren)
-                        }
-                        _ => {
-                            if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
-                                return Ok(WalkControl::SkipChildren);
-                            }
-                            Ok(WalkControl::Continue)
-                        }
-                    }
-                })?;
+            // Save the values of the columns that are read after the loop,
+            // where the cursors no longer point at this row.
+            for (column, reg) in &t_ctx.ungrouped_agg_bare_columns {
+                translate_expr(
+                    program,
+                    Some(&plan.table_references),
+                    column,
+                    *reg,
+                    &t_ctx.resolver,
+                )?;
+                t_ctx
+                    .resolver
+                    .cache_expr_reg(Cow::Owned(column.clone()), *reg, false);
             }
 
             if let Some(label) = label_emit_nonagg_only_once {
