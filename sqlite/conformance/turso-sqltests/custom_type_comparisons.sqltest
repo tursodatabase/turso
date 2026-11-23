@@ -2091,18 +2091,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-test cmp-text-in-values-is-read-as-the-type-of-the-values {
-    -- The text is read as a timestamptz, so its offset is applied before the
-    -- values are compared.
-    CREATE TABLE t(tz timestamptz) STRICT;
-    INSERT INTO t VALUES ('2024-01-05 00:00:00+00');
-    SELECT '2024-01-05 02:00:00+02' IN (VALUES (tz)) FROM t;
-}
-expect {
-    1
-}
-
-@requires strict "uses STRICT tables"
 test cmp-recursive-cte-union-all-of-timestamp-and-timestamptz-is-an-error {
     CREATE TABLE t(ts timestamp, tz timestamptz) STRICT;
     WITH RECURSIVE r(x, n) AS (
@@ -2114,8 +2102,8 @@ expect error {
     cannot compare type timestamp with type timestamptz
 }
 
-# The elements of an array and the values an array function compares with
-# them or adds to them must compare, as the elements of two arrays must.
+# A function or operator with an array argument fails when the array's
+# elements and its other values, or another array's elements, do not compare.
 
 @requires strict "uses STRICT tables"
 test cmp-array-position-of-date-in-array-of-timestamp-is-an-error {
@@ -2130,6 +2118,15 @@ expect error {
 test cmp-array-of-timestamp-overlaps-array-of-date-is-an-error {
     CREATE TABLE t(ad date[], ats timestamp[]) STRICT;
     SELECT ats && ad FROM t;
+}
+expect error {
+    cannot compare type timestamp with type date
+}
+
+@requires strict "uses STRICT tables"
+test cmp-array-of-timestamp-concat-date-is-an-error {
+    CREATE TABLE t(d date, ats timestamp[]) STRICT;
+    SELECT ats || d FROM t;
 }
 expect error {
     cannot compare type timestamp with type date

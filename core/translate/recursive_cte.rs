@@ -27,9 +27,9 @@ pub(crate) fn emit_recursive_cte(
     recursive_cte: &mut RecursiveCtePlan,
 ) -> Result<usize> {
     let num_result_columns = recursive_cte.initial_query.select_result_columns().len();
-    // Each column is one result of both queries, so this is computed also for
-    // UNION ALL, which compares no rows: it fails when the queries give a
-    // column two types that do not compare, as for a compound SELECT.
+    // Computed for UNION ALL too, which compares no rows: each column is one
+    // result of both queries, so this fails when they give it two types that
+    // do not compare, as for a compound SELECT.
     let collations = (0..num_result_columns)
         .map(|column| recursive_cte_result_column_collation(recursive_cte, column, resolver))
         .collect::<Result<Vec<_>>>()?;

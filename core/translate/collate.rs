@@ -787,10 +787,11 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
     match expr {
         Expr::Collate(operand, _) => check_collate_operand(operand, context),
         Expr::Binary(lhs, op, rhs) if op.is_comparison() => check_comparison(lhs, rhs, context),
-        // Compiled as array_contains_all(lhs, rhs) and array_overlap(lhs, rhs).
-        Expr::Binary(lhs, Operator::ArrayContains | Operator::ArrayOverlap, rhs) => {
-            check_comparable_array_values([lhs.as_ref(), rhs.as_ref()].into_iter(), context)
-        }
+        Expr::Binary(
+            lhs,
+            Operator::ArrayContains | Operator::ArrayOverlap | Operator::Concat,
+            rhs,
+        ) => check_comparable_array_values([lhs.as_ref(), rhs.as_ref()].into_iter(), context),
         // Compiled as `lhs >= start AND lhs <= end`.
         Expr::Between {
             lhs, start, end, ..
@@ -832,12 +833,7 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
                 check_comparable_results(args.iter().map(|arg| arg.as_ref()), context)?;
                 common_type_ordering(args.iter().map(|arg| (arg.as_ref(), context)))?;
             }
-            if func
-                .as_ref()
-                .is_some_and(|func| func.arguments_are_values_of_one_array())
-            {
-                check_comparable_array_values(args.iter().map(|arg| arg.as_ref()), context)?;
-            }
+            check_comparable_array_values(args.iter().map(|arg| arg.as_ref()), context)?;
             // The result is one of these arguments, so they have one type. A function
             // that needs a collation, such as min and max, was checked above.
             match func.as_ref().map(|func| func.result_type()) {
@@ -1025,17 +1021,24 @@ pub(crate) fn check_comparable_results<'a>(
     check_comparable_types(exprs.map(|expr| (type_of(expr, &env), context.schema())))
 }
 
-/// [check_comparable] for every pair of values of one array, where `args`
-/// are the arguments of a function whose
-/// [arguments_are_values_of_one_array](crate::function::Func::arguments_are_values_of_one_array)
-/// holds: each argument that is not an array, and the elements of each one that is.
+/// [check_comparable] for every pair of the values of `args`, the arguments of
+/// a function or operator, when one of them is an array: the value of an array
+/// argument is its element. A function or operator with an array argument
+/// compares its values with the elements, as `array_position(a, x)` and
+/// `a && b` do, or makes them elements of one array, as `array_append(a, x)`
+/// and `a || x` do. Arguments that are not values, such as the index of
+/// `array_length(a, 1)`, have built-in types, which compare with any type.
 fn check_comparable_array_values<'a>(
     args: impl Iterator<Item = &'a Expr>,
     context: &ExprContext<'_, '_>,
 ) -> Result<()> {
     let env = context.type_env();
-    check_comparable_types(args.map(|arg| {
-        let value_type = match type_of(arg, &env) {
+    let types: SmallVec<[ExprType; 4]> = args.map(|arg| type_of(arg, &env)).collect();
+    if !types.iter().any(ExprType::is_array) {
+        return Ok(());
+    }
+    check_comparable_types(types.into_iter().map(|ty| {
+        let value_type = match ty {
             ExprType::Array { element, .. } => *element,
             ty => ty,
         };
