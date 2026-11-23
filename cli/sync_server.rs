@@ -1129,7 +1129,12 @@ impl TursoSyncServer {
             .map_err(|_| anyhow!("database page count does not fit usize: {db_size}"))?;
         let mut pages = Vec::with_capacity(pages_capacity);
         let mut historical_pages = HashMap::new();
-        if max_frame < wal_state.max_frame && pages_capacity > 0 {
+        if conn
+            .get_pager()
+            .wal_backfill_frame()
+            .is_some_and(|backfill| max_frame < backfill)
+            && pages_capacity > 0
+        {
             // A checkpoint can advance the database file past this revision
             // while its older page versions are still retained in the WAL.
             let mut frame = vec![0; WAL_FRAME_HEADER_SIZE + PAGE_SIZE];
