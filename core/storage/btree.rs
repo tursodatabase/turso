@@ -10740,9 +10740,14 @@ fn fill_cell_payload(
                             );
                             turso_assert!(*dst_data_offset == overflow_page_pointer_size, "data must be copied to overflow page pointer offset on overflow pages", { "dst_data_offset": dst_data_offset, "overflow_page_pointer_size": overflow_page_pointer_size });
                             let contents = cur_page.get_contents();
-                            let buf = &mut contents.as_ptr()
-                                [*dst_data_offset..*dst_data_offset + amount_to_copy];
-                            buf.copy_from_slice(record_offset_slice_to_copy);
+                            let page_buf = contents.as_ptr();
+                            let payload_end = *dst_data_offset + amount_to_copy;
+                            page_buf[*dst_data_offset..payload_end]
+                                .copy_from_slice(record_offset_slice_to_copy);
+                            // `allocate_overflow_page` does not clear the page. The
+                            // bytes after the payload are zero: the end of the payload
+                            // on the last page, and the reserved bytes on each page.
+                            page_buf[payload_end..].fill(0);
                         } else {
                             // Copy data into the cell payload on the btree page.
                             let buf = &mut cell_payload
@@ -10772,6 +10777,10 @@ fn fill_cell_payload(
                             "new overflow page is not loaded"
                         );
                         let new_overflow_page_id = new_overflow_page.get().id() as u32;
+                        // The pointer to the next overflow page is zero until the next
+                        // page is allocated, and stays zero on the last page.
+                        new_overflow_page.get_contents().as_ptr()[..overflow_page_pointer_size]
+                            .fill(0);
 
                         if let Some(prev_page) = current_overflow_page {
                             // Update the previous overflow page's "next overflow page" pointer to point to the new overflow page.
@@ -14544,6 +14553,45 @@ mod tests {
                 .unwrap();
             assert_eq!(rowid, i as i64, "got!=expected");
         }
+    }
+
+    /// `allocate_overflow_page` does not clear the page, and a buffer of the
+    /// buffer pool can hold the bytes of an earlier page. The overflow pages of
+    /// a cell get the payload and zeros, and no byte of the earlier page.
+    #[test]
+    pub fn test_overflow_pages_hold_no_bytes_of_an_earlier_page() {
+        let (pager, root_page) = empty_btree();
+        // Put bytes that are not zero into the free page buffers of the pool, as
+        // a page that used a buffer before does.
+        let buffers: Vec<Buffer> = (0..512).map(|_| pager.buffer_pool.get_page()).collect();
+        for buffer in &buffers {
+            buffer.as_mut_slice().fill(0xAB);
+        }
+        drop(buffers);
+
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+        // The payload fills two overflow pages and a part of a third one.
+        let blob = Value::Blob(crate::alloc::vec![0x11; 3 * pager.usable_space()]);
+        insert_record(&mut cursor, &pager, 1, blob).unwrap();
+
+        let (leaf, _c) = cursor.read_page_blocking(root_page).unwrap();
+        let cell = leaf
+            .get_contents()
+            .cell_get(0, pager.usable_space())
+            .unwrap();
+        let mut next_page = cell.first_overflow_page().expect("the cell overflows");
+        let mut overflow_pages = 0;
+        while next_page != 0 {
+            let (page, _c) = cursor.read_page_blocking(next_page as i64).unwrap();
+            let bytes = page.get_contents().as_ptr();
+            assert!(
+                !bytes.contains(&0xAB),
+                "overflow page {next_page} holds bytes of an earlier page"
+            );
+            next_page = u32::from_be_bytes(bytes[..4].try_into().unwrap());
+            overflow_pages += 1;
+        }
+        assert_eq!(overflow_pages, 3);
     }
 
     fn run_until_done<T>(action: impl FnMut() -> IOResultOr<T>, pager: &Pager) -> Result<T> {

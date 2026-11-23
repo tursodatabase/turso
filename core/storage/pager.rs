@@ -3133,16 +3133,13 @@ impl Pager {
 
     /// Allocate a new overflow page.
     /// This is done when a cell overflows and new space is needed.
+    ///
+    /// The page can contain bytes from an earlier use of its buffer. The caller
+    /// writes every byte of the page.
     // FIXME: handle no room in page cache
     pub fn allocate_overflow_page(&self) -> IOResultOr<PageRef> {
         let page = return_if_io!(self.allocate_page());
         tracing::debug!("Pager::allocate_overflow_page(id={})", page.get().id());
-
-        // setup overflow page
-        let contents = page.get_contents();
-        let buf = contents.as_ptr();
-        buf.fill(0);
-
         Ok(IOResult::Done(page))
     }
 
