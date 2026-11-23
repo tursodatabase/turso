@@ -118,12 +118,13 @@ column defaults in `pg_attrdef.adbin`, as PostgreSQL does for the forms the
 manual lists under `CREATE POLICY`, and return TursoPG's stored SQL for
 other forms; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
-Casting a value that is not text to date, time, timestamp, timestamptz or an
-enum, and casting a value of date, time, timestamp, timestamptz, json, inet,
-cidr, macaddr, macaddr8 or an enum to a type that does not read text, fails
-with 42846. Assigning a value that is not text to a column of one of these
-types or of jsonb fails too (PostgreSQL gives 42804 for the assignment).
-`date::json` and `date::inet` are still accepted, as are `1::json`, `1::jsonb`,
+Casting a value of date, time, timestamp, timestamptz, json, inet, cidr,
+macaddr, macaddr8 or an enum to a type that does not read text fails with
+42846. A number cast to, or stored in a column of, one of these types or jsonb
+is read as its text: `20200101::date` and storing 20200101 in a date column
+give 2020-01-01, where PostgreSQL refuses both. TursoPG binds a parameter sent
+without a type as a number when its text is one, so refusing numbers would
+refuse such parameters too. `date::json` and `date::inet` are still accepted, as are `1::json`, `1::jsonb`,
 `1::inet`, `1::cidr` and `1::macaddr`, which PostgreSQL refuses. A jsonb value
 may be cast to a number: `'1'::jsonb::int`, `::bigint`, `::numeric`, `::float8`.
 `'true'::jsonb::boolean` gives 0 where PostgreSQL gives true, as does `'true'::text::boolean`.
