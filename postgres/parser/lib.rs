@@ -10,6 +10,9 @@ use thiserror::Error;
 
 pub mod sqlstate;
 pub mod translator;
+mod type_oid;
+
+pub use type_oid::{type_oid, BOOL_OID};
 
 #[derive(Debug, Error)]
 pub enum ParseError {
