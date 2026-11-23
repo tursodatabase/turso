@@ -256,6 +256,7 @@ fn allocation_site_id(site: AllocationSite) -> u64 {
             StatementAllocationSite::TriggerProgramBuilder => 43,
             StatementAllocationSite::SubprogramStatement => 44,
             StatementAllocationSite::ProgramBuilder => 45,
+            StatementAllocationSite::ProgramState => 46,
         },
         AllocationSite::Vector(site) => match site {
             VectorAllocationSite::Parse => 15,

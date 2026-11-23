@@ -1378,7 +1378,7 @@ impl TursoConnection {
                     self.connection.get_pager(),
                     cached.query_mode,
                     0,
-                );
+                )?;
                 let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
                 let stmt_id = self.track_stmt(&handle);
                 return Ok(Box::new(TursoStatement {

@@ -1164,7 +1164,7 @@ impl Connection {
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
 
-            Ok(Statement::new_with_origin(
+            Statement::new_with_origin(
                 program,
                 self.clone(),
                 pager,
@@ -1172,7 +1172,7 @@ impl Connection {
                 byte_offset_end,
                 origin,
                 needs_nested_guard,
-            ))
+            )
         })();
         if result.is_err() && needs_nested_guard {
             self.end_nested();
@@ -1221,7 +1221,7 @@ impl Connection {
         }
         let result = (|| {
             let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
-            Ok(Statement::new_with_origin(
+            Statement::new_with_origin(
                 program,
                 self.clone(),
                 pager,
@@ -1229,7 +1229,7 @@ impl Connection {
                 0,
                 origin,
                 needs_nested_guard,
-            ))
+            )
         })();
         if result.is_err() && needs_nested_guard {
             self.end_nested();
@@ -1509,7 +1509,7 @@ impl Connection {
                 .unwrap()
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-            Statement::new(program, self.clone(), pager, mode, 0).run_ignore_rows()?;
+            Statement::new(program, self.clone(), pager, mode, 0)?.run_ignore_rows()?;
             remaining = &remaining[byte_offset_end..];
         }
         Ok(())
@@ -1531,7 +1531,7 @@ impl Connection {
             return Ok(None);
         };
         let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-        Ok(Some(Statement::new(program, self.clone(), pager, mode, 0)))
+        Ok(Some(Statement::new(program, self.clone(), pager, mode, 0)?))
     }
 
     /// Execute will run a query from start to finish taking ownership of I/O because it will run pending I/Os if it didn't finish.
@@ -1551,7 +1551,7 @@ impl Connection {
             let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
             {
                 crate::stack::trace_stack!("run");
-                Statement::new(program, self.clone(), pager.clone(), mode, 0).run_ignore_rows()?;
+                Statement::new(program, self.clone(), pager.clone(), mode, 0)?.run_ignore_rows()?;
             }
             remaining = &remaining[byte_offset_end..];
         }
@@ -1574,7 +1574,7 @@ impl Connection {
             .unwrap()
             .trim();
         let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-        let stmt = Statement::new(program, self.clone(), pager, mode, 0);
+        let stmt = Statement::new(program, self.clone(), pager, mode, 0)?;
         Ok(Some((stmt, byte_offset_end)))
     }
 

@@ -89,7 +89,8 @@ fn statement_allocator_gives_the_memory_of_nested_programs() {
     conn.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO u VALUES (new.x); END")
         .unwrap();
 
-    // Each statement makes the builder of its program with this allocator.
+    // Each statement makes the builder of its program and its state with this
+    // allocator.
     let before = allocations.load(Relaxed);
     conn.execute("INSERT INTO u VALUES (1)").unwrap();
     let without_trigger = allocations.load(Relaxed) - before;

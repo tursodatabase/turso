@@ -39,6 +39,9 @@ pub enum StatementAllocationSite {
     SubprogramStatement,
     /// The builder of the program of a statement.
     ProgramBuilder,
+    /// The state of a statement, which keeps its registers and cursors while
+    /// the statement executes.
+    ProgramState,
 }
 
 impl From<StatementAllocationSite> for AllocationSite {

@@ -45,6 +45,15 @@ fn statement_allocation_sites_fail_only_the_statement() {
     assert!(matches!(err, LimboError::OutOfMemory), "{err}");
     disarm_fault();
 
+    // The preparation of a statement fails when it makes the state of the
+    // statement.
+    arm_fault(StatementAllocationSite::ProgramState);
+    let Err(err) = conn.prepare("SELECT count(*) FROM t") else {
+        panic!("the preparation of the statement must fail");
+    };
+    assert!(matches!(err, LimboError::OutOfMemory), "{err}");
+    disarm_fault();
+
     // The compilation of the trigger program fails.
     arm_fault(StatementAllocationSite::TriggerProgramBuilder);
     let Err(err) = conn.prepare("INSERT INTO t VALUES (1)") else {
