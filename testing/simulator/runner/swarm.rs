@@ -5,9 +5,10 @@
 //! and frequent checkpoints keep the WAL short. With `--swarm`, each run turns
 //! off a random set of statements, changes the weights of the other statements,
 //! turns off a random set of properties and faults, and picks its own
-//! connection count and I/O latency. All choices come from the seed, so a run
-//! with the same seed and flags makes the same choices.
+//! connection count, I/O backend, I/O latency and clock ticks. All choices come
+//! from the seed, so a run with the same seed and flags makes the same choices.
 
+use clap::ValueEnum;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use sql_generation::generation::{
@@ -16,6 +17,7 @@ use sql_generation::generation::{
 };
 
 use crate::profiles::{Profile, query::QueryProfile};
+use crate::runner::cli::{IoBackend, SimulatorCLI};
 use crate::runner::env::SimulatorOpts;
 
 /// The simulator uses stream 0 of the seed and stream 0 of the seed plus one.
@@ -27,6 +29,16 @@ const SWITCH_STREAM: u64 = 3;
 
 /// The percent of I/O operations that the simulated I/O delays.
 const LATENCY_PROBABILITIES: [u8; 3] = [0, 1, 10];
+/// Only the memory backend can simulate a power loss, so the other backends
+/// run without the power loss faults and without FsyncNoWait. The list has no
+/// io_uring: io_uring exists only on Linux, and some hosts block it, so a seed
+/// that picks it cannot run on all hosts.
+const IO_BACKENDS: [IoBackend; 2] = [IoBackend::Memory, IoBackend::Default];
+/// Ranges of `--min-tick` and `--max-tick`, in microseconds. Each read of the
+/// simulated clock moves it forward by a tick from the range, and a delayed
+/// I/O completes 5 to 20 ms later. Thus small ticks let more work run before a
+/// delayed I/O completes.
+const TICK_RANGES: [(u64, u64); 3] = [(1, 10), (10, 50), (50, 500)];
 
 /// The properties and the faults that the swarm can turn off, each with the
 /// flag that turns it off. Each property in this list writes to the database.
@@ -70,34 +82,58 @@ macro_rules! switches {
     }};
 }
 
-/// Changes the profile and the options of a run to the choices that the seed
-/// makes. For statements, properties and faults, the swarm only turns off or
-/// reweights what the profile and the flags turn on: a weight of 0 stays 0,
-/// and a property or a fault that a flag turns off stays off. The connection
-/// count is 1 to the connection count of the profile. If `latency_given` is
-/// true, `--latency-prob` keeps its value.
+/// Changes the profile, the options and the I/O backend of a run to the
+/// choices that the seed makes. For statements, properties and faults, the
+/// swarm only turns off or reweights what the profile and the flags turn on: a
+/// weight of 0 stays 0, and a property or a fault that a flag turns off stays
+/// off. The connection count is 1 to the connection count of the profile.
+/// `--io-backend` and `--latency-prob` keep the values that `cli_opts` gives.
+/// If `cli_opts` gives `--min-tick` or `--max-tick`, the tick range does not
+/// change.
 pub(crate) fn apply(
     seed: u64,
+    cli_opts: &SimulatorCLI,
     profile: &mut Profile,
     opts: &mut SimulatorOpts,
-    latency_given: bool,
+    io_backend: &mut IoBackend,
 ) {
+    // The draws come before the checks of the flags, so that a flag does not
+    // change the draws that come after it.
     let mut rng = seeded_stream(seed, SETTINGS_STREAM);
     profile.max_connections = rng.random_range(1..=profile.max_connections);
     let latency_probability = *pick(&LATENCY_PROBABILITIES, &mut rng);
-    if !latency_given {
+    if cli_opts.latency_probability.is_none() {
         profile.io.latency.latency_probability = latency_probability;
+    }
+    let picked_io_backend = *pick(&IO_BACKENDS, &mut rng);
+    if cli_opts.io_backend.is_none() {
+        *io_backend = picked_io_backend;
+    }
+    let (min_tick, max_tick) = *pick(&TICK_RANGES, &mut rng);
+    if cli_opts.min_tick.is_none() && cli_opts.max_tick.is_none() {
+        profile.io.latency.min_tick = min_tick;
+        profile.io.latency.max_tick = max_tick;
     }
     pick_query_weights(&mut seeded_stream(seed, QUERY_STREAM), &mut profile.query);
     turn_off(&mut seeded_stream(seed, SWITCH_STREAM), switches!(opts));
 }
 
 /// The lines that show the settings of a swarm run.
-pub(crate) fn describe(profile: &Profile, opts: &SimulatorOpts) -> Vec<String> {
-    let mut flags = vec![format!(
-        "--latency-prob {}",
-        profile.io.latency.latency_probability
-    )];
+pub(crate) fn describe(
+    profile: &Profile,
+    opts: &SimulatorOpts,
+    io_backend: IoBackend,
+) -> Vec<String> {
+    let latency = &profile.io.latency;
+    let io_backend = io_backend
+        .to_possible_value()
+        .expect("each I/O backend has a flag value");
+    let mut flags = vec![
+        format!("--io-backend {}", io_backend.get_name()),
+        format!("--latency-prob {}", latency.latency_probability),
+        format!("--min-tick {}", latency.min_tick),
+        format!("--max-tick {}", latency.max_tick),
+    ];
     flags.extend(
         switches!(opts)
             .into_iter()
@@ -171,9 +207,17 @@ mod tests {
     use clap::Parser as _;
 
     use super::*;
-    use crate::runner::cli::SimulatorCLI;
     use crate::runner::env::{Paths, SimulationType, SimulatorEnv};
 
+    /// The settings of a run that `apply` changes.
+    #[derive(Clone)]
+    struct Settings {
+        profile: Profile,
+        opts: SimulatorOpts,
+        io_backend: IoBackend,
+    }
+
+    /// An environment with memory I/O, so that the test writes no database files.
     fn env(seed: u64, args: &[&str], profile: &Profile) -> SimulatorEnv {
         let output = tempfile::tempdir().expect("create a directory for the run");
         let args = ["limbo_sim", "--io-backend", "memory"]
@@ -189,16 +233,32 @@ mod tests {
         )
     }
 
-    /// The profile and the options of a run of the default profile without `--swarm`.
-    fn base() -> (Profile, SimulatorOpts) {
+    /// The settings of a run of the default profile without `--swarm`.
+    fn base() -> Settings {
         let env = env(1, &[], &Profile::default());
-        (env.profile, env.opts)
+        Settings {
+            profile: env.profile,
+            opts: env.opts,
+            io_backend: env.io_backend,
+        }
     }
 
-    fn swarm(seed: u64, (profile, opts): &(Profile, SimulatorOpts)) -> (Profile, SimulatorOpts) {
-        let (mut profile, mut opts) = (profile.clone(), opts.clone());
-        apply(seed, &mut profile, &mut opts, false);
-        (profile, opts)
+    /// The settings that `--swarm` picks for `seed` when the command line gives no other flag.
+    fn swarm(seed: u64, base: &Settings) -> Settings {
+        let mut settings = base.clone();
+        let cli_opts = SimulatorCLI::parse_from(["limbo_sim", "--swarm"]);
+        apply(
+            seed,
+            &cli_opts,
+            &mut settings.profile,
+            &mut settings.opts,
+            &mut settings.io_backend,
+        );
+        settings
+    }
+
+    fn lines(settings: &Settings) -> Vec<String> {
+        describe(&settings.profile, &settings.opts, settings.io_backend)
     }
 
     fn weights(profile: &Profile) -> Vec<(&'static str, u32)> {
@@ -216,34 +276,46 @@ mod tests {
     fn same_seed_makes_the_same_choices() {
         let base = base();
         for seed in 0..100 {
-            let (first, second) = (swarm(seed, &base), swarm(seed, &base));
-            assert_eq!(describe(&first.0, &first.1), describe(&second.0, &second.1));
+            assert_eq!(lines(&swarm(seed, &base)), lines(&swarm(seed, &base)));
         }
     }
 
     #[test]
-    fn seeds_change_the_connections_and_the_latency() {
+    fn seeds_change_the_connections_the_io_and_the_ticks() {
         let base = base();
-        let runs: Vec<(Profile, SimulatorOpts)> = (0..100).map(|seed| swarm(seed, &base)).collect();
-        let connections: BTreeSet<usize> = runs
-            .iter()
-            .map(|(profile, _)| profile.max_connections)
-            .collect();
-        assert_eq!(connections, (1..=base.0.max_connections).collect());
+        let runs: Vec<Settings> = (0..100).map(|seed| swarm(seed, &base)).collect();
+        let connections: BTreeSet<usize> =
+            runs.iter().map(|run| run.profile.max_connections).collect();
+        assert_eq!(connections, (1..=base.profile.max_connections).collect());
         let latencies: BTreeSet<u8> = runs
             .iter()
-            .map(|(profile, _)| profile.io.latency.latency_probability)
+            .map(|run| run.profile.io.latency.latency_probability)
             .collect();
         assert_eq!(latencies, LATENCY_PROBABILITIES.into_iter().collect());
+        let io_backends: BTreeSet<IoBackend> = runs.iter().map(|run| run.io_backend).collect();
+        assert_eq!(
+            io_backends,
+            BTreeSet::from([IoBackend::Memory, IoBackend::Default])
+        );
+        let ticks: BTreeSet<(u64, u64)> = runs
+            .iter()
+            .map(|run| {
+                (
+                    run.profile.io.latency.min_tick,
+                    run.profile.io.latency.max_tick,
+                )
+            })
+            .collect();
+        assert_eq!(ticks, TICK_RANGES.into_iter().collect());
     }
 
     #[test]
     fn seeds_turn_each_query_on_and_off_except_select_and_insert() {
         let base = base();
         let runs: Vec<Vec<(&str, u32)>> = (0..100)
-            .map(|seed| weights(&swarm(seed, &base).0))
+            .map(|seed| weights(&swarm(seed, &base).profile))
             .collect();
-        for (index, (name, base_weight)) in weights(&base.0).into_iter().enumerate() {
+        for (index, (name, base_weight)) in weights(&base.profile).into_iter().enumerate() {
             assert!(base_weight > 0, "{name} is off in the default profile");
             let runs_on = runs.iter().filter(|run| run[index].1 > 0).count();
             if ["select", "insert"].contains(&name) {
@@ -262,7 +334,7 @@ mod tests {
         let base = base();
         let mut runs_with_drop = 0;
         for seed in 0..1000 {
-            let query = swarm(seed, &base).0.query;
+            let query = swarm(seed, &base).profile.query;
             if query.drop_table_weight > 0 {
                 runs_with_drop += 1;
                 assert!(
@@ -277,9 +349,9 @@ mod tests {
     #[test]
     fn seeds_turn_each_write_property_and_fault_on_and_off() {
         let base = base();
-        assert!(disabled(&base.1).iter().all(|(_, disabled)| !disabled));
-        let runs: Vec<SimulatorOpts> = (0..100).map(|seed| swarm(seed, &base).1).collect();
-        for (index, (flag, _)) in disabled(&base.1).into_iter().enumerate() {
+        assert!(disabled(&base.opts).iter().all(|(_, disabled)| !disabled));
+        let runs: Vec<SimulatorOpts> = (0..100).map(|seed| swarm(seed, &base).opts).collect();
+        for (index, (flag, _)) in disabled(&base.opts).into_iter().enumerate() {
             let runs_off = runs.iter().filter(|opts| disabled(opts)[index].1).count();
             assert!(
                 (20..=80).contains(&runs_off),
@@ -309,18 +381,38 @@ mod tests {
             "--swarm",
             "--latency-prob",
             "7",
+            "--min-tick",
+            "3",
+            "--max-tick",
+            "7",
             "--disable-reopen-database",
         ];
         let mut connections = BTreeSet::new();
         for seed in 0..20 {
             let env = env(seed, &args, &profile);
             connections.insert(env.profile.max_connections);
+            assert_eq!(env.io_backend, IoBackend::Memory);
             assert_eq!(env.profile.io.latency.latency_probability, 7);
+            assert_eq!(env.profile.io.latency.min_tick, 3);
+            assert_eq!(env.profile.io.latency.max_tick, 7);
             assert!(env.opts.disable_reopen_database);
             assert_eq!(env.profile.query.update_weight, 0);
             assert_eq!(env.profile.query.delete_weight, 0);
             assert_eq!(env.connections.len(), env.profile.max_connections);
         }
         assert_eq!(connections, (1..=3).collect());
+    }
+
+    /// The swarm picks the minimum and the maximum tick together, so one tick
+    /// flag keeps both ticks. Otherwise the picked maximum could be smaller than
+    /// the given minimum.
+    #[test]
+    fn one_tick_flag_keeps_both_ticks() {
+        let profile = Profile::default();
+        for seed in 0..20 {
+            let env = env(seed, &["--swarm", "--min-tick", "20"], &profile);
+            assert_eq!(env.profile.io.latency.min_tick, 20);
+            assert_eq!(env.profile.io.latency.max_tick, profile.io.latency.max_tick);
+        }
     }
 }

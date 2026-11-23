@@ -2023,20 +2023,15 @@ impl SimulatorEnv {
             // SQLite does not have LATERAL joins, so we can't use this property.
             opts.disable_lateral_matches_json_each = true;
         }
+        let mut io_backend = cli_opts.io_backend.unwrap_or_default();
         if cli_opts.swarm {
-            swarm::apply(
-                seed,
-                &mut profile,
-                &mut opts,
-                cli_opts.latency_probability.is_some(),
-            );
+            swarm::apply(seed, cli_opts, &mut profile, &mut opts, &mut io_backend);
         }
 
         profile.validate().unwrap();
 
         let latency_prof = &profile.io.latency;
 
-        let io_backend = cli_opts.io_backend;
         let io: Arc<dyn SimIO> = match io_backend {
             IoBackend::Memory => Arc::new(MemorySimIO::new(
                 opts.seed,

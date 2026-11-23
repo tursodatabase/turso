@@ -454,7 +454,7 @@ fn setup_simulation(
 
     let env = SimulatorEnv::new(seed, cli_opts, paths, SimulationType::Default, profile);
     if cli_opts.swarm {
-        for line in runner::swarm::describe(&env.profile, &env.opts) {
+        for line in runner::swarm::describe(&env.profile, &env.opts, env.io_backend) {
             println!("{line}");
         }
     }

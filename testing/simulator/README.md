@@ -128,7 +128,9 @@ With `--swarm`, the seed of each run also picks these settings:
 - The properties that write, for example `Savepoint-Rollback` and `Delete-Select`. Each one is off in about half of the runs.
 - The faults: database reopen and power loss, faulty queries, and `FsyncNoWait`. Each one is off in about half of the runs.
 - The connections: 1 to the connection count of the profile. The default profile has 10 connections.
+- The I/O backend: `memory` or `default`. Only `memory` can simulate a power loss, so runs on `default` have no power loss faults and no `FsyncNoWait`. The swarm does not pick `io_uring`, because `io_uring` exists only on Linux and some hosts block it.
 - The I/O latency probability: 0, 1, or 10 percent.
+- The clock ticks: 1 to 10, 10 to 50, or 50 to 500 microseconds. Each read of the simulated clock moves it forward by one tick. A delayed I/O completes 5 to 20 ms later, so small ticks let more work run before it completes.
 
 Three rules apply:
 
@@ -139,13 +141,14 @@ Three rules apply:
 The swarm changes the profile that you select with `--profile`.
 It does not turn on a statement, a property, or a fault that the profile or a flag turns off.
 For example, `--swarm --disable-reopen-database` never reopens the database, and `--swarm --profile faultless` injects no I/O faults.
-If you give `--latency-prob`, it keeps its value.
+If you give `--io-backend` or `--latency-prob`, it keeps its value.
+If you give `--min-tick` or `--max-tick`, the swarm does not change the ticks.
 
 The output shows the settings of the run:
 
 ```text
 swarm: connections 9
-swarm: --latency-prob 10 --disable-delete-select --disable-drop-select --disable-savepoint-rollback --disable-fsync-no-wait --disable-reopen-database
+swarm: --io-backend default --latency-prob 10 --min-tick 1 --max-tick 10 --disable-delete-select --disable-drop-select --disable-savepoint-rollback --disable-fsync-no-wait --disable-reopen-database
 swarm: queries select:240 create_table:60 create_index:2 insert:120 update:20 delete:40 drop_table:8 alter_table:1 drop_index:4 setval:2
 swarm: queries off pragma create_sequence drop_sequence nextval
 ```
