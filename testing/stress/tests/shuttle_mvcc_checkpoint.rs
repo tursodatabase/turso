@@ -150,15 +150,18 @@ async fn passive_truncate_late_commit_scenario() -> bool {
 fn shuttle_test_passive_truncate_preserves_late_commit() {
     let scheduler = PctScheduler::new(3, 100);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    let saw_successful_checkpoint = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let completed = saw_successful_checkpoint.clone();
+    let executions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     runner.run(move || {
-        if shuttle::future::block_on(passive_truncate_late_commit_scenario()) {
-            completed.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+        let first = executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        let completed = shuttle::future::block_on(passive_truncate_late_commit_scenario());
+        // The first PCT schedule makes no random priority changes, so in it the
+        // checkpoint task has a higher priority than the writer task, which was
+        // spawned later. TRUNCATE completes in this schedule. The random schedules
+        // complete it less often, so a check on them fails only on some runs when a
+        // change makes TRUNCATE rare. This check fails on every run of such a change.
+        assert!(
+            !first || completed,
+            "the first explored schedule must complete TRUNCATE"
+        );
     });
-    assert!(
-        saw_successful_checkpoint.load(std::sync::atomic::Ordering::SeqCst),
-        "at least one explored schedule must complete TRUNCATE"
-    );
 }
