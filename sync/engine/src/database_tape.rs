@@ -2088,6 +2088,78 @@ mod tests {
         );
     }
 
+    #[test]
+    pub fn test_database_tape_replay_drop_quoted_schema_objects() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let db2 =
+            turso_core::Database::open_file(io.clone(), db_path2, Arc::new(SqliteDialect)).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db1 = db1.clone();
+            let db2 = db2.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn1 = db1.connect(&coro).await.unwrap();
+                let conn2 = db2.connect(&coro).await.unwrap();
+                let schema = [
+                    r#"CREATE TABLE "my ""t"" table"(x)"#,
+                    r#"CREATE INDEX "my ""i"" index" ON "my ""t"" table"(x)"#,
+                    r#"CREATE VIEW "my ""v"" view" AS SELECT x FROM "my ""t"" table""#,
+                    r#"CREATE TRIGGER "my ""tr"" trigger" AFTER INSERT ON "my ""t"" table" BEGIN SELECT 1; END"#,
+                ];
+                for sql in schema {
+                    conn1.execute(sql).unwrap();
+                }
+                conn1
+                    .execute(r#"DROP TRIGGER "my ""tr"" trigger""#)
+                    .unwrap();
+                conn1.execute(r#"DROP VIEW "my ""v"" view""#).unwrap();
+                conn1.execute(r#"DROP INDEX "my ""i"" index""#).unwrap();
+                conn1.execute(r#"DROP TABLE "my ""t"" table""#).unwrap();
+
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+                    let opts = DatabaseChangesIteratorOpts {
+                        ignore_schema_changes: false,
+                        ..Default::default()
+                    };
+                    let mut iterator = db1.iterate_changes(opts).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                }
+                let mut stmt = conn2
+                    .prepare("SELECT type, name FROM sqlite_schema WHERE name LIKE 'my %'")
+                    .unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                rows
+            }
+        });
+        let rows = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(rows) => break rows,
+            }
+        };
+        assert_eq!(rows, Vec::<Vec<turso_core::Value>>::new());
+    }
+
     /// A `DatabaseReplaySession` (what the MVCC logical pull and the rebase of
     /// unpushed local changes use locally, not the push to a remote server —
     /// see #10147) replaying onto a database with the same AFTER INSERT
