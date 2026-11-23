@@ -108,10 +108,9 @@ pub(crate) use custom_type_operators::{
 };
 pub(crate) use custom_types::read_untyped_operand_as;
 pub(crate) use custom_types::{
-    check_store_source_for_column, emit_constraint_values_decode, emit_decode,
-    emit_dml_expr_index_value, emit_encode_for_comparison, emit_store_value,
-    emit_trigger_decode_registers, emit_type_expr, emit_untyped_operand_store,
-    emit_user_facing_column_value, known_source_type,
+    emit_constraint_values_decode, emit_decode, emit_dml_expr_index_value,
+    emit_encode_for_comparison, emit_store_value, emit_trigger_decode_registers, emit_type_expr,
+    emit_untyped_operand_store, emit_user_facing_column_value,
 };
 pub(crate) use custom_types::{runs_custom_type_function, takes_input_of_type};
 pub use emission::{

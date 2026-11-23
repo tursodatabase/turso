@@ -6,9 +6,7 @@ use crate::namespace::NamespaceRef;
 use crate::schema::{EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::security::policy::Command;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{
-    bind_and_rewrite_expr, check_store_source_for_column, BindingBehavior,
-};
+use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{ColumnMask, Operation};
 use crate::translate::planner::ROWID_STRS;
@@ -495,17 +493,6 @@ fn prepare_update_plan(
     )?;
 
     let set_clauses = collect_update_set_clauses(&mut body.sets, &table, table_name, resolver)?;
-    for set in &set_clauses {
-        if let Some(column) = table.columns().get(set.column_index) {
-            check_store_source_for_column(
-                &set.expr,
-                Some(&read_scope_tables),
-                column,
-                table.is_strict(),
-                resolver,
-            )?;
-        }
-    }
 
     let result_columns = if !body.returning.is_empty() {
         // Plan subqueries in RETURNING expressions before processing

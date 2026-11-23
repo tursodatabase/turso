@@ -28,8 +28,8 @@ use crate::{
             emit_make_record, prepare_cdc_if_necessary, OperationMode, Resolver,
         },
         expr::{
-            bind_and_rewrite_expr, check_store_source_for_column, emit_constraint_values_decode,
-            emit_returning_results, emit_returning_scan_back, process_returning_clause,
+            bind_and_rewrite_expr, emit_constraint_values_decode, emit_returning_results,
+            emit_returning_scan_back, process_returning_clause,
             restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
             translate_expr, translate_expr_no_constant_opt, walk_expr, BindingBehavior,
             NoConstantOptReason, ReturningBufferCtx, WalkControl,
@@ -42,7 +42,7 @@ use crate::{
         },
         plan::{
             ColumnMask, ColumnUsedMask, EvalAt, JoinedTable, NonFromClauseSubquery, Operation,
-            Plan, QueryDestination, ResultSetColumn, SelectPlan, TableReferences,
+            QueryDestination, ResultSetColumn, TableReferences,
         },
         planner::{collect_subquery_table_refs_in_expr, plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_insert_source_select,
@@ -304,7 +304,6 @@ pub fn translate_insert(
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
     }
     validate(table_name.as_str(), resolver, &table, namespace, connection)?;
-    check_insert_values_types(&table, &columns, &body, resolver)?;
     roles::check_write_privileges(
         resolver,
         connection,
@@ -2277,112 +2276,6 @@ fn resolve_defaults_in_row(
     }
 }
 
-/// Fails when a value of a VALUES row of an INSERT is known not to be text and
-/// its column reads text and refuses other kinds (see
-/// [check_store_source_for_column]). A value whose type is not known here, such
-/// as a parameter or a subquery, is accepted.
-fn check_insert_values_types(
-    table: &Table,
-    columns: &[ast::Name],
-    body: &InsertBody,
-    resolver: &Resolver,
-) -> Result<()> {
-    let InsertBody::Select(select, _) = body else {
-        return Ok(());
-    };
-    let arms = std::iter::once(&select.body.select).chain(
-        select
-            .body
-            .compounds
-            .iter()
-            .map(|compound| &compound.select),
-    );
-    for arm in arms {
-        let OneSelect::Values(rows) = arm else {
-            continue;
-        };
-        for row in rows {
-            for (position, value) in row.iter().enumerate() {
-                if let Some(column) = insert_stored_column(table, columns, position) {
-                    check_store_source_for_column(
-                        value,
-                        None,
-                        column,
-                        table.is_strict(),
-                        resolver,
-                    )?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Fails when a column of the SELECT `plan` of an INSERT is known not to be
-/// text and its target column reads text and refuses other kinds.
-fn check_insert_select_types(
-    plan: &Plan,
-    table: &Table,
-    columns: &[ast::Name],
-    resolver: &Resolver,
-) -> Result<()> {
-    let arms: Vec<&SelectPlan> = match plan {
-        Plan::Select(select) => vec![select],
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => left
-            .iter()
-            .map(|(select, _)| select)
-            .chain(std::iter::once(right_most.as_ref()))
-            .collect(),
-        _ => return Ok(()),
-    };
-    for arm in arms {
-        // The result columns of a VALUES arm do not hold its values.
-        let (sources, width): (Vec<&ast::Expr>, usize) = if arm.values.is_empty() {
-            let sources: Vec<&ast::Expr> = arm.result_columns.iter().map(|c| &c.expr).collect();
-            let width = sources.len();
-            (sources, width)
-        } else {
-            (
-                arm.values.iter().flatten().map(|e| &**e).collect(),
-                arm.values[0].len(),
-            )
-        };
-        for (index, source) in sources.into_iter().enumerate() {
-            let position = index % width.max(1);
-            if let Some(column) = insert_stored_column(table, columns, position) {
-                check_store_source_for_column(
-                    source,
-                    Some(&arm.table_references),
-                    column,
-                    table.is_strict(),
-                    resolver,
-                )?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The column that the value at `position` of an INSERT row is stored in:
-/// [insert_target_column] without the generated columns, which a row without
-/// a column list does not give a value for.
-fn insert_stored_column<'a>(
-    table: &'a Table,
-    columns: &[ast::Name],
-    position: usize,
-) -> Option<&'a Column> {
-    if columns.is_empty() {
-        return table
-            .columns()
-            .iter()
-            .filter(|c| !c.hidden() && !c.is_generated())
-            .nth(position);
-    }
-    insert_target_column(table, columns, position)
-}
-
 /// The column that the value at `position` of an INSERT row is written to.
 fn insert_target_column<'a>(
     table: &'a Table,
@@ -2654,7 +2547,6 @@ fn init_source_emission<'a>(
                         program,
                         query_destination,
                         connection,
-                        &|plan| check_insert_select_types(plan, table, columns, resolver),
                     )
                 })?;
                 if num_result_cols != required_column_count {

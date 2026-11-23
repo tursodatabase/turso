@@ -1697,6 +1697,28 @@ mod tests {
         );
     }
 
+    /// Known gap: PostgreSQL stores the text 'true' of an untyped parameter in
+    /// a jsonb column as the JSON value true. tursopg binds it as a boolean,
+    /// which the column stores as the number 1.
+    #[test]
+    fn untyped_parameter_true_in_jsonb_is_a_known_gap() {
+        let conn = memory_connection();
+        conn.execute("CREATE TABLE w (j jsonb)").unwrap();
+        let mut portal = Portal::<String>::default();
+        portal.statement = Arc::new(StoredStatement::new(
+            String::new(),
+            String::new(),
+            vec![None],
+        ));
+        portal.parameters = vec![Some(b"true".to_vec().into())];
+        let mut stmt = conn.prepare("INSERT INTO w VALUES ($1)").unwrap();
+        bind_portal_parameters(&mut stmt, &portal).unwrap();
+        stmt.run_collect_rows().unwrap();
+        let mut stmt = conn.prepare("SELECT j::text FROM w").unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(rows, [[Value::from_text("1")]]);
+    }
+
     #[test]
     fn a_refused_binary_format_aborts_the_transaction_block() {
         let (mut client, _conn) = copy_test_client();
