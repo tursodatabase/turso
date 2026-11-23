@@ -587,3 +587,17 @@ expect {
     1.01
     1.50
 }
+
+# The frontend reads ::boolean as a cast to integer, so a jsonb true becomes 0.
+@compat-gap "cast:jsonb -> bool"
+test jsonb-column-cast-to-boolean {
+    CREATE TABLE j (b jsonb);
+    INSERT INTO j VALUES ('true');
+    SELECT b::boolean FROM j;
+}
+expect {
+    t
+}
+expect @tursopg {
+    0
+}
