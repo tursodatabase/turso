@@ -645,7 +645,7 @@ fn prepare_one_select_plan(
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
             {
                 parse_where(
-                    where_clause.as_deref(),
+                    where_clause,
                     &mut plan.table_references,
                     Some(&plan.result_columns),
                     &mut plan.where_clause,
@@ -668,7 +668,7 @@ fn prepare_one_select_plan(
                     // Process HAVING clause if present
                     let having_predicates = if let Some(having) = group_by.having {
                         Some(process_having_clause(
-                            having,
+                            *having,
                             &mut plan.table_references,
                             &plan.result_columns,
                             resolver,
@@ -2057,14 +2057,14 @@ fn aggregate_belongs_to_enclosing_query(
 }
 
 fn process_having_clause(
-    having: Box<ast::Expr>,
+    having: ast::Expr,
     table_references: &mut TableReferences,
     result_columns: &[ResultSetColumn],
     resolver: &Resolver,
     aggregate_expressions: &mut Vec<super::plan::Aggregate>,
 ) -> Result<Vec<ast::Expr>> {
     let mut predicates = vec![];
-    break_predicate_at_and_boundaries(&having, &mut predicates);
+    break_predicate_at_and_boundaries(having, &mut predicates);
 
     // Before alias resolution replaces identifiers with their underlying expressions,
     // check for aliased aggregate misuse. SQLite does this during name resolution by

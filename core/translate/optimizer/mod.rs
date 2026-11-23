@@ -3208,18 +3208,13 @@ fn operation_for_unmatched_right_rows(
                 resolver,
             )
         }
-        AccessMethodParams::VirtualTable {
-            idx_num,
-            idx_str,
-            constraints,
-            constraint_usages,
-        } => build_vtab_scan_op(
+        AccessMethodParams::VirtualTable(access) => build_vtab_scan_op(
             where_clause_for_unmatched_rows,
             table_constraints,
-            &idx_num,
-            &idx_str,
-            &constraints,
-            &constraint_usages,
+            &access.idx_num,
+            &access.idx_str,
+            &access.constraints,
+            &access.constraint_usages,
             Some(table_references),
             false,
         ),
@@ -3507,20 +3502,15 @@ fn apply_table_access_plan(
                     )?;
                 }
             }
-            AccessMethodParams::VirtualTable {
-                idx_num,
-                idx_str,
-                constraints,
-                constraint_usages,
-            } => {
+            AccessMethodParams::VirtualTable(access) => {
                 let table_id = table_references.joined_tables()[table_idx].internal_id;
                 table_references.joined_tables_mut()[table_idx].op = build_vtab_scan_op(
                     where_clause,
                     &constraints_per_table[table_idx],
-                    idx_num,
-                    idx_str,
-                    constraints,
-                    constraint_usages,
+                    &access.idx_num,
+                    &access.idx_str,
+                    &access.constraints,
+                    &access.constraint_usages,
                     Some(table_references),
                     table_references.outer_join_may_null_extend(table_id),
                 )?;
@@ -3604,7 +3594,7 @@ fn apply_table_access_plan(
                 }
                 // Set up the index method query operation
                 table_references.joined_tables_mut()[table_idx].op =
-                    Operation::IndexMethodQuery(query.clone());
+                    Operation::IndexMethodQuery(IndexMethodQuery::clone(query));
             }
             AccessMethodParams::MultiIndexScan {
                 branches,
@@ -3666,7 +3656,7 @@ fn apply_table_access_plan(
         .iter_mut()
         .zip(unmatched_right_rows_plans)
     {
-        table.unmatched_right_rows_plan = plan;
+        table.unmatched_right_rows_plan = plan.map(Box::new);
     }
 
     let mut probe_pos_by_table: Vec<Option<usize>> =

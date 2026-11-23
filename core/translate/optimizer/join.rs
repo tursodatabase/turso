@@ -2,6 +2,7 @@ use crate::{alloc::TryReserveError, turso_assert_eq, turso_assert_greater_than};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
+use std::cell::Cell;
 
 use crate::ast::{Operator, SubqueryType, TableInternalId};
 
@@ -467,6 +468,10 @@ struct WhereTermInfo {
     table_mask: TableMask,
     extra_steps: usize,
     equal_tables: Option<(TableInternalId, TableInternalId, Option<TableInternalId>)>,
+    /// Whether the term reads a table of an outer query. It is found the first
+    /// time that a hash join candidate needs it, because most searches have no
+    /// such candidate.
+    reads_an_outer_query: Cell<Option<bool>>,
 }
 
 /// What the join order search reads about the `WHERE` terms. The search does
@@ -948,6 +953,7 @@ fn join_lhs_and_rhs<'a, 'w>(
                         let materialization_reads_an_outer_query = needs_materialization
                             && materialized_build_input_reads_an_outer_query(
                                 where_clause,
+                                where_terms,
                                 table_references,
                                 subqueries,
                                 &lhs_mask,
@@ -1085,7 +1091,7 @@ fn join_lhs_and_rhs<'a, 'w>(
                 estimated_rows_per_outer_row: cost_estimate.estimated_rows as f64,
                 consumed_where_terms: candidate.where_covered.into_iter().try_collect()?,
                 params: AccessMethodParams::IndexMethod {
-                    query: candidate.to_query(),
+                    query: Box::new(candidate.to_query()),
                     where_covered: candidate.where_covered,
                 },
             };
@@ -1149,21 +1155,43 @@ fn join_lhs_and_rhs<'a, 'w>(
     }))
 }
 
+/// The tables of each term are the ones that `where_terms` read once for the
+/// search, and each term is walked for outer query references at most once in
+/// the search, so the terms are not walked again for each hash join candidate.
 fn materialized_build_input_reads_an_outer_query(
     where_clause: &[WhereTerm],
+    where_terms: &WhereTermsInfo,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     build_input_mask: &TableMask,
 ) -> Result<bool> {
-    for term in where_clause.iter() {
-        let term_mask = table_mask_from_expr(&term.expr, table_references, subqueries)?;
-        if build_input_mask.contains_all_set_bits_of(&term_mask)
-            && expr_reads_an_outer_query(&term.expr, table_references, subqueries)?
+    for (term, term_info) in where_clause.iter().zip(&where_terms.terms) {
+        if build_input_mask.contains_all_set_bits_of(&term_info.table_mask)
+            && term_info.reads_an_outer_query(term, table_references, subqueries)?
         {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+impl WhereTermInfo {
+    /// The answer of `expr_reads_an_outer_query` for `term`, the term of this
+    /// info. The terms, the table references and the subqueries do not change
+    /// during the search, so the answer is the same each time.
+    fn reads_an_outer_query(
+        &self,
+        term: &WhereTerm,
+        table_references: &TableReferences,
+        subqueries: &[NonFromClauseSubquery],
+    ) -> Result<bool> {
+        if let Some(reads) = self.reads_an_outer_query.get() {
+            return Ok(reads);
+        }
+        let reads = expr_reads_an_outer_query(&term.expr, table_references, subqueries)?;
+        self.reads_an_outer_query.set(Some(reads));
+        Ok(reads)
+    }
 }
 
 fn can_replace_build_index_with_hash(
@@ -1378,6 +1406,14 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             schema,
         );
     }
+
+    // Each plan that the search keeps adds its access method to the arena.
+    // For the searches of the TPC-H, TPC-DS, JOB and ClickBench queries, the
+    // arena ends with at most 2^(n+2) access methods for n tables, except for
+    // a few searches of 6 tables. Reserve them at once: each time the arena
+    // doubles, all of its access methods are copied. The reserved memory that
+    // the search does not use is never written.
+    access_methods_arena.reserve(4 << num_tables);
 
     // Compute naive left-to-right plan to use as pruning threshold
     let naive_plan = compute_naive_left_deep_plan(
@@ -2411,6 +2447,7 @@ fn build_where_term_info(
                         term.origin.join_origin().and_then(JoinOrigin::outer_table),
                     )
                 }),
+                reads_an_outer_query: Cell::new(None),
             })
         })
         .collect()

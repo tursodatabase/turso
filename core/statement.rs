@@ -232,6 +232,10 @@ pub struct Statement {
     /// Byte offset in the original SQL string where this statement ends.
     /// Used by sqlite3_prepare_v2 to set the *pzTail output parameter.
     tail_offset: usize,
+    /// True once the statement has been stepped. Only a step changes the
+    /// connection or starts a transaction, so the drop of a statement that
+    /// was never stepped has nothing to reset.
+    stepped: bool,
     origin: StatementOrigin,
     /// True once this root statement has started executing and incremented
     /// `Connection::n_active_root_statements`.
@@ -249,7 +253,9 @@ pub struct Statement {
     nested_guard_active: bool,
     /// The command the statement was prepared from, when its SQL text cannot
     /// be parsed again, so that preparing it again translates the command.
-    reprepare_cmd: Option<Cmd>,
+    /// Boxed because a `Cmd` is about 440 bytes, and most statements have no
+    /// command here: each move of a statement copies all of its bytes.
+    reprepare_cmd: Option<Box<Cmd>>,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -330,6 +336,7 @@ impl Statement {
             query_timeout_override: None,
             has_returned_row: false,
             tail_offset,
+            stepped: false,
             origin,
             counted_as_active_root: false,
             is_blob_handle: false,
@@ -564,6 +571,7 @@ impl Statement {
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        self.stepped = true;
         // ANALYZE already ran to Done; only its stats refresh is outstanding.
         // Checked first: the root-statement count was released at Done, so
         // `prepare_step` must not re-register this statement as a root.
@@ -888,6 +896,7 @@ impl Statement {
     /// The parent statement handles all of those concerns.
     #[inline]
     pub fn step_subprogram(&mut self) -> Result<StepResult> {
+        self.stepped = true;
         self.program
             .step(
                 &mut self.state,
@@ -1125,7 +1134,7 @@ impl Statement {
     /// Makes preparing the statement again translate `cmd`, the command it
     /// was prepared from, instead of parsing its SQL text.
     pub(crate) fn reprepare_from(&mut self, cmd: Cmd) {
-        self.reprepare_cmd = Some(cmd);
+        self.reprepare_cmd = Some(Box::new(cmd));
     }
 
     fn reprepare(&mut self) -> Result<()> {
@@ -1141,7 +1150,7 @@ impl Statement {
         conn.refresh_schema_for_reprepare()?;
         let new_program = {
             let cmd = match &self.reprepare_cmd {
-                Some(cmd) => cmd.clone(),
+                Some(cmd) => Cmd::clone(cmd),
                 None => {
                     let (cmd, _) = conn.parse_sql(&self.program.sql)?;
                     cmd.expect("Same SQL string should be able to be parsed")
@@ -1906,7 +1915,9 @@ impl Drop for Statement {
         // That cleanup consults `is_nested_stmt()` to decide whether top-level
         // transaction/savepoint finalization belongs to this statement or to its
         // parent, so we release the nested guard only after reset completes.
-        self.reset_best_effort();
+        if self.stepped {
+            self.reset_best_effort();
+        }
         if self.nested_guard_active {
             self.connection.end_nested();
             self.nested_guard_active = false;
@@ -1936,9 +1947,10 @@ mod tests {
     /// Callers move a `Statement` by value while they build it and wrap it,
     /// and every copy is a stack slot in the caller's frame. Those frames stay
     /// on the stack while statements are prepared, so a large `Statement`
-    /// overflows small coroutine stacks.
+    /// overflows small coroutine stacks. Each move also copies all the bytes
+    /// of the statement.
     #[test]
     fn statement_stays_small() {
-        assert!(std::mem::size_of::<Statement>() <= 1024);
+        assert!(std::mem::size_of::<Statement>() <= 256);
     }
 }

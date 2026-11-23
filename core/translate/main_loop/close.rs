@@ -331,7 +331,8 @@ fn emit_unmatched_right_rows(
         conditions: mut unmatched_rows_conditions,
     } = main_table
         .unmatched_right_rows_plan
-        .clone()
+        .as_deref()
+        .cloned()
         .unwrap_or_else(|| UnmatchedRightRowsPlan {
             operation: Operation::default_scan_for(&main_table.table),
             subqueries: Vec::new(),
