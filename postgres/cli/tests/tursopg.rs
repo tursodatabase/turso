@@ -1237,9 +1237,11 @@ fn extract_row_description_oids(data: &[u8]) -> Vec<u32> {
 // PostgreSQL versions, so test expectations stay valid. Only the OIDs the
 // current wire tests assert against are declared; add more here as new
 // tests need them.
+const OID_INT2: u32 = 21;
 const OID_INT4: u32 = 23;
 const OID_TEXT: u32 = 25;
 const OID_FLOAT8: u32 = 701;
+const OID_VARCHAR: u32 = 1043;
 
 /// Walk raw PG wire bytes, find the first ErrorResponse ('E') message, and
 /// return its fields as a map from the one-byte field type to the value string.
@@ -1643,6 +1645,11 @@ fn wire_table_columns_report_declared_type() {
         assert_eq!(
             c.query_column_oids("SELECT id, label, score FROM t"),
             vec![OID_INT4, OID_TEXT, OID_FLOAT8]
+        );
+        c.query_command_tags("CREATE TABLE s(n smallint, name varchar(10))");
+        assert_eq!(
+            c.query_column_oids("SELECT n, name FROM s"),
+            vec![OID_INT2, OID_VARCHAR]
         );
     });
 }

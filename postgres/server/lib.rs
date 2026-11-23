@@ -648,6 +648,7 @@ enum BinaryEncoding {
     /// bytes as their text format.
     Text,
     Bool,
+    Int2,
     Int4,
     Int8,
     Float8,
@@ -660,6 +661,7 @@ impl BinaryEncoding {
         match *pg_type {
             Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => Some(Self::Text),
             Type::BOOL => Some(Self::Bool),
+            Type::INT2 => Some(Self::Int2),
             Type::INT4 => Some(Self::Int4),
             Type::INT8 => Some(Self::Int8),
             Type::FLOAT8 => Some(Self::Float8),
@@ -687,9 +689,10 @@ fn resolve_pg_type_for_column(stmt: &turso_pg::Statement, idx: usize) -> Type {
     // STRUCT and UNION columns live as BLOBs on disk, but exposing them as
     // BYTEA would force clients to deal with raw bytes. Map them to JSONB so
     // libpq/psql/JDBC see structured data they can introspect.
-    let mut base = match info.kind {
-        ColumnTypeKind::Struct | ColumnTypeKind::Union => Type::JSONB,
-        _ => {
+    let mut base = match (info.kind, annotated_pg_type(&info)) {
+        (ColumnTypeKind::Struct | ColumnTypeKind::Union, _) => Type::JSONB,
+        (_, Some(annotated)) => annotated,
+        (_, None) => {
             // Prefer the declared name (the user-visible type), then fall
             // back to the resolved base for custom/domain types whose
             // declared name isn't in the lookup table.
@@ -710,10 +713,23 @@ fn resolve_pg_type_for_column(stmt: &turso_pg::Statement, idx: usize) -> Type {
     base
 }
 
+/// The type that the frontend annotated the type of the column with, when
+/// tursopg can send values of it in both formats.
+///
+/// For a type it can send only as text, such as numeric, the column keeps the
+/// type that its name maps to, which is one that a client that asks for binary
+/// results can read. Reporting the annotated type would refuse those clients.
+fn annotated_pg_type(info: &turso_core::ColumnTypeInfo) -> Option<Type> {
+    let annotated = Type::from_oid(info.ty_annotation?.type_id)?;
+    BinaryEncoding::of(&annotated).map(|_| annotated)
+}
+
 /// Map a scalar PG type to its array counterpart.
 fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
     if *scalar == Type::INT4 {
         Type::INT4_ARRAY
+    } else if *scalar == Type::INT2 {
+        Type::INT2_ARRAY
     } else if *scalar == Type::INT8 {
         Type::INT8_ARRAY
     } else if *scalar == Type::FLOAT8 {
@@ -906,6 +922,7 @@ fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResul
         Some(BinaryEncoding::Bytea) => Ok(Value::from_blob(bytes.to_vec())),
         Some(
             BinaryEncoding::Bool
+            | BinaryEncoding::Int2
             | BinaryEncoding::Int4
             | BinaryEncoding::Int8
             | BinaryEncoding::Float8,
@@ -1049,13 +1066,17 @@ fn encode_binary(
     text_type: turso_pg::TextType,
 ) -> turso_core::Result<()> {
     use turso_core::Numeric::{Float, Integer};
-    use BinaryEncoding::{Bool, Bytea, Float8, Int4, Int8, Text};
+    use BinaryEncoding::{Bool, Bytea, Float8, Int2, Int4, Int8, Text};
     let encoding = BinaryEncoding::of(pg_type)
         .expect("build_field_info refuses binary format for a type without a binary encoding");
     let written = match (encoding, val) {
         (Text, _) => encode_text(encoder, val, text_type),
         (_, Value::Null) => encoder.encode_field(&None::<i8>),
         (Bool, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i != 0)),
+        (Int2, Value::Numeric(Integer(i))) => match i16::try_from(*i) {
+            Ok(i) => encoder.encode_field(&i),
+            Err(_) => return Err(binary_value_not_supported(pg_type)),
+        },
         (Int4, Value::Numeric(Integer(i))) => match i32::try_from(*i) {
             Ok(i) => encoder.encode_field(&i),
             Err(_) => return Err(binary_value_not_supported(pg_type)),
@@ -1064,10 +1085,10 @@ fn encode_binary(
         (Float8, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f64)),
         (Float8, Value::Numeric(Float(f))) => encoder.encode_field(&f64::from(*f)),
         (Bytea, Value::Blob(b)) => encoder.encode_field(&b.as_slice()),
-        (Bool | Int4 | Int8, Value::Numeric(Float(_)))
+        (Bool | Int2 | Int4 | Int8, Value::Numeric(Float(_)))
         | (Bytea, Value::Numeric(_))
-        | (Bool | Int4 | Int8 | Float8 | Bytea, Value::Text(_))
-        | (Bool | Int4 | Int8 | Float8, Value::Blob(_)) => {
+        | (Bool | Int2 | Int4 | Int8 | Float8 | Bytea, Value::Text(_))
+        | (Bool | Int2 | Int4 | Int8 | Float8, Value::Blob(_)) => {
             return Err(binary_value_not_supported(pg_type))
         }
     };
@@ -1606,6 +1627,53 @@ mod tests {
             };
             assert_eq!(sqlstate(error), SQLSTATE_FEATURE_NOT_SUPPORTED, "{sql}");
         }
+    }
+
+    /// A column is described as the PostgreSQL type that it is declared with,
+    /// and a value is sent in the encoding of that type.
+    #[test]
+    fn columns_are_described_as_their_postgresql_type() {
+        let conn = memory_connection();
+        conn.execute("CREATE TABLE t (s smallint, v varchar(10), a smallint[])")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (7, 'ab', '{1,2}')")
+            .unwrap();
+        // Each field is a 4-byte length followed by the value.
+        for (sql, expected_type, binary, text) in [
+            (
+                "SELECT s FROM t",
+                Type::INT2,
+                &b"\0\0\0\x02\0\x07"[..],
+                &b"\0\0\0\x017"[..],
+            ),
+            (
+                "SELECT v FROM t",
+                Type::VARCHAR,
+                b"\0\0\0\x02ab",
+                b"\0\0\0\x02ab",
+            ),
+        ] {
+            for (format, expected) in [(Format::UnifiedBinary, binary), (Format::UnifiedText, text)]
+            {
+                let mut stmt = conn.prepare(sql).unwrap();
+                let fields = Arc::new(build_field_info(&stmt, &format).unwrap());
+                assert_eq!(*fields[0].datatype(), expected_type, "{sql}");
+                let rows = stmt.run_collect_rows().unwrap();
+                let mut encoder = DataRowEncoder::new(fields.clone());
+                encode_value(
+                    &mut encoder,
+                    &rows[0][0],
+                    fields[0].datatype(),
+                    fields[0].format(),
+                    turso_pg::TextType::of_column(&stmt, 0),
+                )
+                .unwrap();
+                assert_eq!(&encoder.finish().unwrap().data[..], expected, "{sql}");
+            }
+        }
+        let array = conn.prepare("SELECT a FROM t").unwrap();
+        let fields = build_field_info(&array, &Format::UnifiedText).unwrap();
+        assert_eq!(*fields[0].datatype(), Type::INT2_ARRAY);
     }
 
     #[test]
