@@ -909,11 +909,45 @@ fn translate_cast_expr(
     let type_affinity = cast_type_name
         .map(|name| Affinity::of_written_type(&name))
         .unwrap_or(Affinity::Numeric);
+    if type_affinity == Affinity::Text {
+        emit_builtin_type_text_suffix(program, referenced_tables, expr, target_register, resolver);
+    }
     program.emit_insn(Insn::Cast {
         reg: target_register,
         affinity: type_affinity,
     });
     Ok(target_register)
+}
+
+/// Appends the text the dialect adds when a value of a built-in custom type is
+/// cast to text, such as the `+00` PostgreSQL prints after a timestamptz. The
+/// stored and decoded value stays as it is, so indexes and comparisons do not
+/// change.
+fn emit_builtin_type_text_suffix(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    reg: usize,
+    resolver: &Resolver,
+) {
+    let env = super::expr_type::TypeEnv::new(referenced_tables, resolver);
+    let super::expr_type::ExprType::Custom { type_def, .. } =
+        super::expr_type::type_of(operand, &env)
+    else {
+        return;
+    };
+    if !type_def.is_builtin {
+        return;
+    }
+    let Some(suffix) = resolver.catalog.dialect.text_cast_suffix(&type_def.name) else {
+        return;
+    };
+    let suffix_reg = program.emit_string8_new_reg(suffix.to_string());
+    program.emit_insn(Insn::Concat {
+        lhs: reg,
+        rhs: suffix_reg,
+        dest: reg,
+    });
 }
 
 /// Emits a CAST of the value in `reg` to the custom type `type_name`, whose

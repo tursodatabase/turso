@@ -411,6 +411,17 @@ expect {
     2024-01-05 10:00:00|2024-01-05|1704448800
 }
 
+# The SQLite frontend casts a timestamptz to the text it stores, with no offset.
+@requires custom_types "date and time types are custom types"
+test datetime-timestamptz-cast-to-text-has-no-offset {
+    CREATE TABLE t(tz timestamptz) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 12:00:00+02');
+    SELECT CAST(tz AS TEXT), datetime(tz) FROM t;
+}
+expect {
+    2024-01-05 10:00:00|2024-01-05 10:00:00
+}
+
 # The order of the fields matters, as in PostgreSQL: `T` needs a date before
 # it and a time after it, a date cannot follow a time, and the order of a
 # date's numbers and month name is limited.

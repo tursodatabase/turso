@@ -618,6 +618,15 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// The text a cast to text appends to a value of the built-in custom type
+    /// `type_name`, or None when the cast gives the decoded value.
+    ///
+    /// PostgreSQL prints a timestamptz with the offset `+00`, which the stored
+    /// and decoded value does not have.
+    fn text_cast_suffix(&self, _type_name: &str) -> Option<&'static str> {
+        None
+    }
+
     /// Whether constraint errors report the values that broke the constraint.
     ///
     /// PostgreSQL shows them in the error DETAIL, so custom type and array

@@ -192,6 +192,11 @@ statements of one query string;
 `clock_timestamp()` reads the clock at each call. All of them have microsecond
 precision.
 
+A timestamptz prints in UTC with the offset `+00`, such as
+`2024-01-05 08:00:00+00`, and so does a CAST to text. The stored value has no
+offset, so other conversions to text, such as `||`, `concat` and `format`,
+leave it out.
+
 Comparing values of two different custom types fails when either type changes
 the values it stores (a STRUCT or UNION, a type with ENCODE or a DECODE other
 than `value`), unless the two already have one order in common, as `numeric`

@@ -420,6 +420,10 @@ impl Dialect for PostgresDialect {
     fn casts_nonzero_integer_to_true(&self) -> bool {
         true
     }
+
+    fn text_cast_suffix(&self, type_name: &str) -> Option<&'static str> {
+        (type_name == "timestamptz").then_some("+00")
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
