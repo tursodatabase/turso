@@ -1,9 +1,9 @@
 //! AST node format
 use std::fmt::{self, Display, Formatter, Write};
 
-use crate::ast::*;
+use crate::*;
 
-use crate::ast::TableInternalId;
+use crate::TableInternalId;
 
 /// Context to be used in ToSqlString
 pub trait ToSqlContext {

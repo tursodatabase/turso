@@ -1,4 +1,4 @@
-use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
+use crate::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::namespace::NamespaceRef;

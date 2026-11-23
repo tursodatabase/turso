@@ -715,7 +715,8 @@ impl Database {
     /// Classify SQL statement. Returns "read", "write", "begin", "commit", or "rollback".
     #[napi(js_name = "classifySql")]
     pub fn classify_sql(&self, sql: String) -> napi::Result<String> {
-        use turso_parser::{ast::Stmt, parser::Parser};
+        use turso_core::ast::Stmt;
+        use turso_parser::parser::Parser;
         let mut parser = Parser::new(sql.as_bytes());
         match parser.next_cmd() {
             Ok(Some(cmd)) => {

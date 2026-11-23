@@ -22,8 +22,8 @@ use crate::sqlstate::{
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
-use turso_parser::ast;
-use turso_parser::ast::GroupBy;
+use turso_ast as ast;
+use turso_ast::GroupBy;
 
 /// Result of translating a PostgreSQL command, which may include
 /// prerequisite statements (e.g., implicit CREATE SEQUENCE for serial columns).
@@ -9329,33 +9329,87 @@ fn description_lookup(func_name: &str, args: &[Box<ast::Expr>]) -> Option<ast::E
 
 /// `(SELECT description FROM pg_description WHERE column = value AND ... LIMIT 1)`
 /// for the `conditions`, which are pairs of a column and its value.
+///
+/// The subquery reads pg_description through an inner query that renames
+/// its columns, because a value is an expression of the outer query: `oid`
+/// in it must not be read as the rowid of pg_description.
 fn description_subquery(conditions: Vec<(&str, ast::Expr)>) -> ast::Expr {
-    let mut parser = turso_parser::parser::Parser::new(DESCRIPTION_SELECT.as_bytes());
-    let Ok(Some(ast::Cmd::Stmt(ast::Stmt::Select(mut select)))) = parser.next_cmd() else {
-        unreachable!("DESCRIPTION_SELECT is a SELECT statement");
-    };
-    let ast::OneSelect::Select { where_clause, .. } = &mut select.body.select else {
-        unreachable!("DESCRIPTION_SELECT has no VALUES");
-    };
-    *where_clause = conditions
+    let renamed = |column: &str| exact_name(format!("_turso_{column}"));
+    let where_clause = conditions
         .into_iter()
         .map(|(column, value)| {
-            let column = ast::Expr::Id(exact_name(format!("_turso_{column}")));
+            let column = ast::Expr::Id(renamed(column));
             ast::Expr::Binary(Box::new(column), ast::Operator::Equals, Box::new(value))
         })
         .reduce(|all, condition| {
             ast::Expr::Binary(Box::new(all), ast::Operator::And, Box::new(condition))
         })
         .map(Box::new);
-    ast::Expr::Subquery(Box::new(select))
+    let renamed_columns = ["objoid", "classoid", "objsubid", "description"]
+        .into_iter()
+        .map(|column| {
+            ast::ResultColumn::Expr(
+                Box::new(ast::Expr::Id(exact_name(column))),
+                Some(ast::As::As(renamed(column))),
+            )
+        })
+        .collect();
+    let pg_description = ast::Select {
+        with: None,
+        body: ast::SelectBody {
+            select: ast::OneSelect::Select {
+                distinctness: None,
+                columns: renamed_columns,
+                from: Some(ast::FromClause {
+                    select: Box::new(ast::SelectTable::Table(
+                        ast::QualifiedName::fullname(
+                            exact_name("main"),
+                            exact_name("pg_description"),
+                        ),
+                        None,
+                        None,
+                    )),
+                    joins: vec![],
+                }),
+                where_clause: None,
+                group_by: None,
+                window_clause: vec![],
+            },
+            compounds: vec![],
+        },
+        order_by: vec![],
+        limit: None,
+    };
+    ast::Expr::Subquery(Box::new(ast::Select {
+        with: None,
+        body: ast::SelectBody {
+            select: ast::OneSelect::Select {
+                distinctness: None,
+                columns: vec![ast::ResultColumn::Expr(
+                    Box::new(ast::Expr::Id(renamed("description"))),
+                    Some(ast::As::ImplicitColumnName(renamed("description"))),
+                )],
+                from: Some(ast::FromClause {
+                    select: Box::new(ast::SelectTable::Select {
+                        select: pg_description,
+                        alias: None,
+                        lateral: false,
+                    }),
+                    joins: vec![],
+                }),
+                where_clause,
+                group_by: None,
+                window_clause: vec![],
+            },
+            compounds: vec![],
+        },
+        order_by: vec![],
+        limit: Some(ast::Limit {
+            expr: Box::new(integer_literal(1)),
+            offset: None,
+        }),
+    }))
 }
-
-// The columns are renamed because a value is an expression of the outer
-// query: `oid` in it must not be read as the rowid of pg_description.
-const DESCRIPTION_SELECT: &str = "SELECT _turso_description FROM (\
-    SELECT objoid AS _turso_objoid, classoid AS _turso_classoid, \
-    objsubid AS _turso_objsubid, description AS _turso_description \
-    FROM main.pg_description) LIMIT 1";
 
 /// `CASE catalog WHEN 'pg_class' THEN 1259 WHEN 'pg_namespace' THEN 2615 END`:
 /// the oid of the catalog named `catalog`.

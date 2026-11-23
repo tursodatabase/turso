@@ -665,9 +665,9 @@ impl DatabaseReplayGenerator {
         create_table: &str,
     ) -> Result<()> {
         let mut parser = Parser::new(create_table.as_bytes());
-        let Some(Ok(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateTable {
+        let Some(Ok(turso_core::ast::Cmd::Stmt(turso_core::ast::Stmt::CreateTable {
             tbl_name,
-            body: turso_parser::ast::CreateTableBody::ColumnsAndConstraints { columns, .. },
+            body: turso_core::ast::CreateTableBody::ColumnsAndConstraints { columns, .. },
             ..
         }))) = parser.next()
         else {
@@ -693,11 +693,11 @@ impl DatabaseReplayGenerator {
         return Ok(());
 
         fn renamed_and_dropped_columns<'a>(
-            local_columns: &'a [turso_parser::ast::ColumnDefinition],
-            remote_columns: &'a [turso_parser::ast::ColumnDefinition],
+            local_columns: &'a [turso_core::ast::ColumnDefinition],
+            remote_columns: &'a [turso_core::ast::ColumnDefinition],
         ) -> (
-            Vec<(&'a turso_parser::ast::Name, &'a turso_parser::ast::Name)>,
-            Vec<&'a turso_parser::ast::Name>,
+            Vec<(&'a turso_core::ast::Name, &'a turso_core::ast::Name)>,
+            Vec<&'a turso_core::ast::Name>,
         ) {
             let mut renamed = Vec::new();
             let mut dropped = Vec::new();
@@ -735,12 +735,12 @@ impl DatabaseReplayGenerator {
     /// back to direct execution for other DDL.
     pub async fn execute_ddl_idempotent<Ctx>(&self, coro: &Coro<Ctx>, ddl: &str) -> Result<()> {
         let mut parser = Parser::new(ddl.as_bytes());
-        let Some(Ok(turso_parser::ast::Cmd::Stmt(mut stmt))) = parser.next() else {
+        let Some(Ok(turso_core::ast::Cmd::Stmt(mut stmt))) = parser.next() else {
             self.execute_ddl(ddl)?;
             return Ok(());
         };
         match &mut stmt {
-            turso_parser::ast::Stmt::CreateTable {
+            turso_core::ast::Stmt::CreateTable {
                 if_not_exists,
                 tbl_name,
                 body,
@@ -755,7 +755,7 @@ impl DatabaseReplayGenerator {
                     self.execute_ddl(ddl)?;
                     return Ok(());
                 };
-                if let turso_parser::ast::CreateTableBody::ColumnsAndConstraints {
+                if let turso_core::ast::CreateTableBody::ColumnsAndConstraints {
                     columns: remote_columns,
                     ..
                 } = body
@@ -784,7 +784,7 @@ impl DatabaseReplayGenerator {
                 }
                 Ok(())
             }
-            turso_parser::ast::Stmt::CreateIndex { idx_name, .. } => {
+            turso_core::ast::Stmt::CreateIndex { idx_name, .. } => {
                 if self
                     .schema_object_exists(coro, "index", idx_name.name.as_str())
                     .await?
@@ -794,7 +794,7 @@ impl DatabaseReplayGenerator {
                 self.execute_ddl(ddl)?;
                 Ok(())
             }
-            turso_parser::ast::Stmt::CreateTrigger { trigger_name, .. } => {
+            turso_core::ast::Stmt::CreateTrigger { trigger_name, .. } => {
                 if self
                     .schema_object_exists(coro, "trigger", trigger_name.name.as_str())
                     .await?
@@ -804,8 +804,8 @@ impl DatabaseReplayGenerator {
                 self.execute_ddl(ddl)?;
                 Ok(())
             }
-            turso_parser::ast::Stmt::CreateMaterializedView { view_name, .. }
-            | turso_parser::ast::Stmt::CreateView { view_name, .. } => {
+            turso_core::ast::Stmt::CreateMaterializedView { view_name, .. }
+            | turso_core::ast::Stmt::CreateView { view_name, .. } => {
                 if self
                     .schema_object_exists(coro, "view", view_name.name.as_str())
                     .await?
@@ -815,9 +815,9 @@ impl DatabaseReplayGenerator {
                 self.execute_ddl(ddl)?;
                 Ok(())
             }
-            turso_parser::ast::Stmt::AlterTable(turso_parser::ast::AlterTable {
+            turso_core::ast::Stmt::AlterTable(turso_core::ast::AlterTable {
                 name: tbl_name,
-                body: turso_parser::ast::AlterTableBody::AddColumn(col_def),
+                body: turso_core::ast::AlterTableBody::AddColumn(col_def),
             }) => {
                 let table_name = tbl_name.name.as_str();
                 let local_columns = self
@@ -847,7 +847,7 @@ impl DatabaseReplayGenerator {
         &self,
         coro: &Coro<Ctx>,
         table_name: &str,
-    ) -> Result<Option<Vec<turso_parser::ast::ColumnDefinition>>> {
+    ) -> Result<Option<Vec<turso_core::ast::ColumnDefinition>>> {
         let table_name_literal = sql_string_literal(table_name);
         let mut stmt = self.conn.prepare(format!(
             "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = {table_name_literal} COLLATE NOCASE"
@@ -862,8 +862,8 @@ impl DatabaseReplayGenerator {
         };
         let sql = sql.as_str().to_string();
         let mut parser = Parser::new(sql.as_bytes());
-        let Some(Ok(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateTable {
-            body: turso_parser::ast::CreateTableBody::ColumnsAndConstraints { columns, .. },
+        let Some(Ok(turso_core::ast::Cmd::Stmt(turso_core::ast::Stmt::CreateTable {
+            body: turso_core::ast::CreateTableBody::ColumnsAndConstraints { columns, .. },
             ..
         }))) = parser.next()
         else {
@@ -973,8 +973,8 @@ impl DatabaseReplayGenerator {
 
 /// returns true if a local column is generated and the remote either removed it or modified it
 fn generated_column_changed_between_local_and_remote(
-    local_column: &turso_parser::ast::ColumnDefinition,
-    remote_columns: &[turso_parser::ast::ColumnDefinition],
+    local_column: &turso_core::ast::ColumnDefinition,
+    remote_columns: &[turso_core::ast::ColumnDefinition],
 ) -> bool {
     if !is_generated(local_column) {
         return false;
@@ -991,17 +991,17 @@ fn generated_column_changed_between_local_and_remote(
     };
     return is_generated(remote_column) && remote_column.to_string() != local_column.to_string();
 
-    fn is_generated(column: &turso_parser::ast::ColumnDefinition) -> bool {
+    fn is_generated(column: &turso_core::ast::ColumnDefinition) -> bool {
         column.constraints.iter().any(|constraint| {
             matches!(
                 constraint.constraint,
-                turso_parser::ast::ColumnConstraint::Generated { .. }
+                turso_core::ast::ColumnConstraint::Generated { .. }
             )
         })
     }
 }
 
-fn has_column(columns: &[turso_parser::ast::ColumnDefinition], name: &str) -> bool {
+fn has_column(columns: &[turso_core::ast::ColumnDefinition], name: &str) -> bool {
     columns
         .iter()
         .any(|column| column.col_name.as_str().eq_ignore_ascii_case(name))

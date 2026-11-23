@@ -10,10 +10,10 @@
 //! granted privileges on, which row-level security limits, and switches
 //! roles. It may not use a sequence or change the schema it does not own.
 
+use crate::ast;
 use crate::namespace::NamespaceRef;
 use crate::sync::Arc;
 use crate::Connection;
-use turso_parser::ast;
 
 use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::security::roles::RoleId;

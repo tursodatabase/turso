@@ -4,7 +4,7 @@ use rustc_hash::FxHashMap as HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
+use crate::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::{
     compute_generated_columns, compute_virtual_columns, emit_row_from_cursor,

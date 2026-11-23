@@ -613,10 +613,10 @@ enum BooleanResultType {
 // from the resolved expression instead. Inferring it from expression shapes here
 // is fragile: new expressions and rewrites can lose the boolean type.
 fn boolean_result_type(
-    expr: &turso_parser::ast::Expr,
+    expr: &turso_core::ast::Expr,
     program: &turso_core::Program,
 ) -> BooleanResultType {
-    use turso_parser::ast::{Expr, Literal};
+    use turso_core::ast::{Expr, Literal};
 
     match expr {
         Expr::Literal(Literal::Null) => BooleanResultType::Null,

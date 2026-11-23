@@ -1,4 +1,10 @@
-use crate::ast::{
+use crate::lexer::{Lexer, Token};
+use crate::token::TokenType::{self, *};
+use crate::Result;
+use std::collections::HashMap;
+use std::num::NonZeroU32;
+use turso_ast::error::Error;
+use turso_ast::{
     check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint, ColumnDefinition,
     CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateTypeBody,
     CreateVirtualTable, DeferSubclause, Distinctness, DomainConstraint, EqpFormat, Expr,
@@ -12,12 +18,7 @@ use crate::ast::{
     TriggerTime, Type, TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert,
     UpsertDo, UpsertIndex, Variable, Window, WindowDef, With, MAX_ARRAY_DIMENSIONS,
 };
-use crate::error::Error;
-use crate::lexer::{Lexer, Token};
-use crate::token::TokenType::{self, *};
-use crate::Result;
-use std::collections::HashMap;
-use std::num::NonZeroU32;
+use turso_ast::{query_nested_too_deeply_message, MAX_QUERY_DEPTH};
 use turso_macros::match_ignore_ascii_case;
 
 macro_rules! peek_expect {
@@ -114,12 +115,6 @@ pub const TOO_MANY_COMPOUND_TERMS_MESSAGE: &str = "too many terms in compound SE
 #[inline(never)]
 fn too_many_compound_terms_error() -> Error {
     Error::ParseError(TOO_MANY_COMPOUND_TERMS_MESSAGE.to_owned())
-}
-
-/// The message of the error for a query nested deeper than [`MAX_QUERY_DEPTH`].
-/// The planner gives the same error for nesting that the SQL text does not show.
-pub fn query_nested_too_deeply_message() -> String {
-    format!("Query is nested too deeply (maximum depth {MAX_QUERY_DEPTH})")
 }
 
 #[cold]
@@ -237,12 +232,6 @@ pub const MAX_EXPR_DEPTH: usize = 100;
 /// `SQLITE_MAX_COMPOUND_SELECT` (default 500). The code generator recurses one
 /// time for each term, so this limit bounds its stack use.
 pub const MAX_COMPOUND_SELECT: usize = 500;
-
-/// Maximum nesting depth of queries: subqueries in a FROM clause or in an
-/// expression, CTE bodies, and parenthesized FROM terms. SQLite has no such
-/// limit. The parser, the planner and the code generator recurse one time for
-/// each level, so this limit bounds their stack use.
-pub const MAX_QUERY_DEPTH: usize = 500;
 
 impl<'a> Iterator for Parser<'a> {
     type Item = Result<Cmd>;
@@ -384,9 +373,7 @@ impl<'a> Parser<'a> {
                             parsed_offset: (offset, 1).into(),
                             token_text,
                             offset,
-                            expected_display: crate::token::TokenType::format_expected_tokens(&[
-                                TK_SEMI,
-                            ]),
+                            expected_display: TokenType::format_expected_tokens(&[TK_SEMI]),
                         });
                     }
 
@@ -1271,7 +1258,7 @@ impl<'a> Parser<'a> {
                 parsed_offset: (offset, token_len).into(),
                 token_text,
                 offset,
-                expected_display: crate::token::TokenType::format_expected_tokens(&[
+                expected_display: TokenType::format_expected_tokens(&[
                     TK_ID,
                     TK_STRING,
                     TK_INDEXED,
@@ -2083,7 +2070,7 @@ impl<'a> Parser<'a> {
                         parsed_offset: (self.offset() - name.len(), name.len()).into(),
                         token_text,
                         offset,
-                        expected_display: crate::token::TokenType::format_expected_tokens(&[
+                        expected_display: TokenType::format_expected_tokens(&[
                             TK_ID, TK_INDEXED, TK_JOIN_KW,
                         ]),
                     });

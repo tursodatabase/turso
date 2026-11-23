@@ -1042,7 +1042,7 @@ pub(super) struct AutoIndexBuild<'a> {
     pub(super) affinity_str: Option<&'a Arc<String>>,
     /// Table columns needed for transparent virtual column computation.
     pub(super) table_columns: Option<&'a [crate::schema::Column]>,
-    pub(super) table_ref_id: turso_parser::ast::TableInternalId,
+    pub(super) table_ref_id: crate::ast::TableInternalId,
     pub(super) table_references: &'a TableReferences,
     pub(super) resolver: &'a Resolver<'a>,
 }

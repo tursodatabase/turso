@@ -1,4 +1,5 @@
 use crate::alloc::TursoIteratorExt;
+use crate::ast;
 use crate::namespace::NamespaceId;
 use crate::schema::ColDef;
 use crate::translate::expr::WalkControl;
@@ -15,7 +16,6 @@ use crate::{
     LimboError, Result,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use turso_parser::ast;
 
 /// Information about a table referenced in a view
 #[derive(Debug, Clone)]
@@ -716,7 +716,7 @@ pub fn extract_view_columns(
 
 /// The tables `select` reads, each with the namespace it is written
 /// with, if any. A name that is a CTE of the select is not a table.
-pub(crate) fn referenced_tables(select: &ast::Select) -> std::vec::Vec<(Option<String>, String)> {
+pub fn referenced_tables(select: &ast::Select) -> std::vec::Vec<(Option<String>, String)> {
     #[derive(Default)]
     struct TablesRead {
         /// The names of the CTEs of each enclosing WITH clause.
@@ -760,81 +760,4 @@ pub(crate) fn referenced_tables(select: &ast::Select) -> std::vec::Vec<(Option<S
     let mut tables_read = TablesRead::default();
     visit_select(select, &mut tables_read).expect("collecting the tables of a query cannot fail");
     tables_read.tables.into_iter().collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn tables_read_by(sql: &str) -> Vec<(Option<String>, String)> {
-        let cmd = turso_parser::parser::Parser::new(sql.as_bytes())
-            .next_cmd()
-            .unwrap();
-        let Some(ast::Cmd::Stmt(ast::Stmt::Select(select))) = cmd else {
-            panic!("not a SELECT: {sql}");
-        };
-        let mut tables = referenced_tables(&select);
-        tables.sort();
-        tables
-    }
-
-    fn table(name: &str) -> (Option<String>, String) {
-        (None, name.to_string())
-    }
-
-    #[test]
-    fn referenced_tables_finds_subqueries_of_order_by_limit_and_values() {
-        assert_eq!(
-            tables_read_by("SELECT a FROM u ORDER BY (SELECT max(a) FROM t)"),
-            [table("t"), table("u")]
-        );
-        assert_eq!(
-            tables_read_by(
-                "SELECT a FROM u LIMIT (SELECT count(*) FROM t) OFFSET (SELECT 1 FROM w)"
-            ),
-            [table("t"), table("u"), table("w")]
-        );
-        assert_eq!(
-            tables_read_by("VALUES ((SELECT max(a) FROM t))"),
-            [table("t")]
-        );
-    }
-
-    #[test]
-    fn referenced_tables_finds_subqueries_of_window_clauses_and_table_function_arguments() {
-        assert_eq!(
-            tables_read_by(
-                "SELECT sum(a) OVER w FROM u WINDOW w AS (PARTITION BY (SELECT max(a) FROM t))"
-            ),
-            [table("t"), table("u")]
-        );
-        assert_eq!(
-            tables_read_by("SELECT value FROM json_each((SELECT j FROM t))"),
-            [table("t")]
-        );
-    }
-
-    #[test]
-    fn referenced_tables_leaves_out_a_cte_only_where_it_is_in_scope() {
-        assert_eq!(
-            tables_read_by(
-                "SELECT a FROM t WHERE EXISTS (WITH t AS (SELECT 1 AS a) SELECT a FROM t)"
-            ),
-            [table("t")]
-        );
-        assert_eq!(
-            tables_read_by("WITH c AS (SELECT a FROM t) SELECT a FROM c"),
-            [table("t")]
-        );
-    }
-
-    #[test]
-    fn referenced_tables_finds_a_table_named_with_a_schema_next_to_a_cte_of_its_name() {
-        assert_eq!(
-            tables_read_by(
-                "WITH t AS (SELECT 1 AS a) SELECT a FROM t UNION ALL SELECT a FROM main.t"
-            ),
-            [(Some("main".to_string()), "t".to_string())]
-        );
-    }
 }

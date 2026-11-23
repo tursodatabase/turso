@@ -1,4 +1,8 @@
 use crate::alloc::TursoFromIterator;
+use crate::ast::{
+    self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
+    TriggerTime, Upsert, UpsertDo, With,
+};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::ColumnLayout;
 use crate::security::permission::Object;
@@ -72,10 +76,6 @@ use crate::{
 use gencol::compute_generated_columns;
 use std::num::NonZeroUsize;
 use turso_macros::turso_assert;
-use turso_parser::ast::{
-    self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
-    TriggerTime, Upsert, UpsertDo, With,
-};
 
 /// Validate anything with this insert statement that should throw an early parse error
 fn validate(

@@ -1,6 +1,6 @@
 use crate::alloc::TursoVecExt;
+use crate::ast;
 use crate::translate::expr_context::ExprContext;
-use turso_parser::ast;
 
 use crate::{
     function::{AccumulatorFunc, AggFunc},

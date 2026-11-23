@@ -8,7 +8,7 @@ use crate::{
     Result,
 };
 
-use turso_parser::ast;
+use crate::ast;
 
 use super::{
     emitter::{LimitCtx, Resolver},

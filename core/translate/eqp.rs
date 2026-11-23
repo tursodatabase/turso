@@ -5,7 +5,7 @@
 
 use std::fmt::{self, Display, Formatter, Write as _};
 
-use turso_parser::ast::SortOrder;
+use crate::ast::SortOrder;
 
 use crate::{
     schema::Index,

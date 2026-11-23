@@ -1,6 +1,7 @@
 use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 
+use crate::ast::{self, Expr};
 use crate::namespace::NamespaceRef;
 use crate::schema::{EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::security::policy::Command;
@@ -17,7 +18,6 @@ use crate::{
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     CaptureDataChangesExt, Connection,
 };
-use turso_parser::ast::{self, Expr};
 
 use super::emitter::emit_program;
 use super::expr::process_returning_clause;
@@ -683,7 +683,7 @@ fn compose_update_set_clause(existing: &mut UpdateSetClause, expr: Box<Expr>) {
                 args: composed_args,
                 order_by: vec![],
                 within_group: vec![],
-                filter_over: turso_parser::ast::FunctionTail {
+                filter_over: crate::ast::FunctionTail {
                     filter_clause: None,
                     over_clause: None,
                 },

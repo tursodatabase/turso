@@ -8,6 +8,7 @@ use super::plan::OperatorStateDef;
 use super::stream::{
     emit_operator_rowid_delta, open_ephemeral_delta, DeltaIdentity, EphemeralDelta,
 };
+use crate::ast;
 use crate::incremental::dag;
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
@@ -18,7 +19,6 @@ use crate::vdbe::insn::{
     to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral,
 };
 use crate::{LimboError, Result};
-use turso_parser::ast;
 
 /// Emit one compound-query node from its already-materialized branch deltas.
 ///

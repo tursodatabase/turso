@@ -1,10 +1,10 @@
-use core::fmt;
-use std::fmt::{Display, Formatter};
-use turso_parser::ast::{
+use crate::ast::{
     self,
     fmt::{BlankContext, SqlWriter, ToSqlContext, WriteSql},
     SortOrder, TableInternalId,
 };
+use core::fmt;
+use std::fmt::{Display, Formatter};
 
 use crate::{schema::Table, translate::plan::TableReferences};
 
@@ -17,17 +17,17 @@ fn fmt_order_by_item(
     f: &mut fmt::Formatter<'_>,
     expr: &impl fmt::Display,
     dir: SortOrder,
-    nulls: Option<turso_parser::ast::NullsOrder>,
+    nulls: Option<crate::ast::NullsOrder>,
 ) -> fmt::Result {
     let dir_str = match dir {
         SortOrder::Asc => "ASC",
         SortOrder::Desc => "DESC",
     };
     match nulls {
-        Some(turso_parser::ast::NullsOrder::First) => {
+        Some(crate::ast::NullsOrder::First) => {
             writeln!(f, "  - {expr} {dir_str} NULLS FIRST")
         }
-        Some(turso_parser::ast::NullsOrder::Last) => writeln!(f, "  - {expr} {dir_str} NULLS LAST"),
+        Some(crate::ast::NullsOrder::Last) => writeln!(f, "  - {expr} {dir_str} NULLS LAST"),
         None => writeln!(f, "  - {expr} {dir_str}"),
     }
 }

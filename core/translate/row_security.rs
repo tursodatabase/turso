@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use turso_parser::ast;
+use crate::ast;
 
 use crate::{
     bail_parse_error,
@@ -931,8 +931,8 @@ fn single_value_of_mut(select: &mut ast::Select) -> Option<&mut ast::Expr> {
 mod tests {
     use std::sync::Arc;
 
+    use crate::ast;
     use rustc_hash::FxHashMap;
-    use turso_parser::ast;
 
     use super::{
         conditions_of, policy, using_condition, with_check_condition, Command, Condition, Policy,

@@ -1,8 +1,8 @@
+use crate::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 use crate::error::{SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
 use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::turso_assert;
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
 use super::collate::{
     check_collate_operand, check_expr_collation, comparison_collation, first_collation,

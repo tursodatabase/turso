@@ -1,3 +1,4 @@
+use crate::ast::{self, Expr, Literal, UnaryOperator};
 use crate::dialect::Dialect;
 use crate::namespace::NamespaceId;
 use crate::numeric::StrToF64;
@@ -19,7 +20,6 @@ use either::Either;
 use rustc_hash::FxHashMap as HashMap;
 use std::future::Future;
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{self, Expr, Literal, UnaryOperator};
 
 #[macro_export]
 macro_rules! io_yield_one {
@@ -134,7 +134,7 @@ pub fn escape_sql_string_literal(literal: &str) -> String {
 /// Format an identifier for error messages the way SQLite's `%T` does: the
 /// token exactly as the user wrote it, keeping the original quote characters.
 /// `CREATE TABLE "t"` reports an existing table as `table "t" already exists`.
-pub fn identifier_token_for_error(name: &turso_parser::ast::Name) -> String {
+pub fn identifier_token_for_error(name: &crate::ast::Name) -> String {
     if name.quoted() {
         name.as_ident()
     } else {
@@ -206,7 +206,7 @@ pub fn dequote(source: &str) -> String {
 /// Format a table reference for error messages the way SQLite does: the name
 /// as the user wrote it with quotes stripped, keeping any database prefix.
 /// `SELECT * FROM main."T1"` reports the missing table as `main.T1`.
-pub fn table_name_for_error(name: &turso_parser::ast::QualifiedName) -> String {
+pub fn table_name_for_error(name: &crate::ast::QualifiedName) -> String {
     match &name.namespace {
         Some(db) => format!("{}.{}", db.as_str(), name.name.as_str()),
         None => name.name.as_str().to_owned(),
@@ -2178,8 +2178,8 @@ pub fn check_expr_references_column(expr: &ast::Expr, col_name_normalized: &str)
 pub mod tests {
     use super::*;
 
+    use crate::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type, Variable};
     use crate::schema::Type as SchemaValueType;
-    use turso_parser::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type, Variable};
 
     #[test]
     fn test_normalize_ident() {
@@ -3491,7 +3491,7 @@ pub mod tests {
 
     #[test]
     fn capture_parameters_treats_numbered_markers_as_placeholders() {
-        use turso_parser::ast::{Literal, Variable};
+        use crate::ast::{Literal, Variable};
         // Index-method patterns use ?N to share one captured argument
         // across several call sites (fts_score/fts_match); a numbered
         // marker carries its "?N" spelling as its name and must still

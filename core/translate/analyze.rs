@@ -2,6 +2,7 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 
+use crate::ast;
 use crate::{
     bail_parse_error,
     function::{Func, FuncCtx, ScalarFunc},
@@ -20,7 +21,6 @@ use crate::{
     },
     Result,
 };
-use turso_parser::ast;
 
 /// A table paired with an optional specific index to analyze.
 type AnalyzeTarget = (Arc<BTreeTable>, Option<Arc<Index>>);

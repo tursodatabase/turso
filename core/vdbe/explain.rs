@@ -1,10 +1,10 @@
+use crate::ast::SortOrder;
 use crate::translate::collate::CollationSeq;
 use crate::vdbe::{
     builder::CursorType,
     insn::{ClearBtreeCount, IntegrityCkData, RegisterOrLiteral, SorterOpenData},
 };
 use crate::HashSet;
-use turso_parser::ast::SortOrder;
 
 use super::{Insn, InsnReference, PreparedProgram, Value};
 use crate::function::{Func, ScalarFunc};
@@ -1489,8 +1489,8 @@ pub fn insn_to_row(
                             coll => format!("{sign}{coll}"),
                         };
                         match nulls {
-                            Some(turso_parser::ast::NullsOrder::First) => format!("{coll_str} NF"),
-                            Some(turso_parser::ast::NullsOrder::Last) => format!("{coll_str} NL"),
+                            Some(crate::ast::NullsOrder::First) => format!("{coll_str} NF"),
+                            Some(crate::ast::NullsOrder::Last) => format!("{coll_str} NL"),
                             None => coll_str,
                         }
                     })
