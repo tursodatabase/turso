@@ -82,6 +82,7 @@ fn database_allocators_preserve_distinct_concrete_types() {
             allocations: allocations.clone(),
             deallocations: deallocations.clone(),
         },
+        statement: DynAllocator::default(),
     };
     let cloned = allocators.clone();
     let layout = Layout::new::<u64>();

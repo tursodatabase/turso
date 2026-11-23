@@ -57,6 +57,7 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
                     allocations: fts_allocations.clone(),
                     deallocations: StdArc::new(AtomicUsize::new(0)),
                 }),
+                statement: DynAllocator::default(),
             }),
     )
     .unwrap();

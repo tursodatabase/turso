@@ -34,6 +34,7 @@ fn database_fts_build_and_merge_use_only_the_fts_allocator() {
                     allocations: allocations.clone(),
                     deallocations: deallocations.clone(),
                 }),
+                statement: DynAllocator::default(),
             }),
     )
     .unwrap();
