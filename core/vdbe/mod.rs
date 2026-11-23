@@ -1205,7 +1205,7 @@ pub struct ProgramState {
     pub(crate) pending_cdc_info: Option<Option<CaptureDataChangesInfo>>,
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
     /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
-    pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
+    pub(crate) subprogram_stmt_cache: HashMap<usize, crate::alloc::DynBox<Statement>>,
     /// Number of trigger and foreign key action programs that execute this
     /// program, one inside the other. It is 0 for the program of a statement.
     pub(crate) subprogram_depth: usize,

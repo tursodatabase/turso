@@ -34,6 +34,9 @@ impl From<FtsAllocationSite> for AllocationSite {
 pub enum StatementAllocationSite {
     /// The program builder of a nested trigger program.
     TriggerProgramBuilder,
+    /// The statement that executes a nested trigger or foreign key action
+    /// program.
+    SubprogramStatement,
 }
 
 impl From<StatementAllocationSite> for AllocationSite {

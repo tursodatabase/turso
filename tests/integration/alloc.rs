@@ -93,8 +93,9 @@ fn statement_allocator_gives_the_memory_of_nested_programs() {
     conn.execute("INSERT INTO u VALUES (1)").unwrap();
     assert_eq!(allocations.load(Relaxed), 0);
 
-    // The compilation of the trigger program uses this allocator, and it gives
-    // back all the memory.
+    // The compilation of the trigger program and the statement that executes
+    // it use this allocator. They give back all the memory when the statement
+    // ends.
     conn.execute("INSERT INTO t VALUES (2)").unwrap();
     assert!(allocations.load(Relaxed) > 0);
     assert_eq!(deallocations.load(Relaxed), allocations.load(Relaxed));
@@ -106,9 +107,14 @@ fn statement_allocator_failure_stops_only_the_statement() {
     let (_db, conn) =
         open_with_statement_allocator(DynAllocator::new(FailOnDemandAlloc(fail.clone())));
     for sql in [
+        "PRAGMA foreign_keys = ON",
         "CREATE TABLE t(x)",
         "CREATE TABLE u(y)",
         "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO u VALUES (new.x); END",
+        "CREATE TABLE parent(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE child(pid REFERENCES parent(id) ON DELETE CASCADE)",
+        "INSERT INTO parent VALUES (1)",
+        "INSERT INTO child VALUES (1)",
     ] {
         conn.execute(sql).unwrap();
     }
@@ -120,11 +126,32 @@ fn statement_allocator_failure_stops_only_the_statement() {
     };
     assert!(matches!(err, LimboError::OutOfMemory), "{err}");
 
-    // The failed statement changed nothing, and the connection continues to
+    // The trigger program compiles, but the statement that executes it fails.
+    fail.store(false, Relaxed);
+    let mut stmt = conn.prepare("INSERT INTO t VALUES (2)").unwrap();
+    fail.store(true, Relaxed);
+    let err = stmt.run_ignore_rows().unwrap_err();
+    assert!(matches!(err, LimboError::OutOfMemory), "{err}");
+    drop(stmt);
+
+    // The statement that executes a foreign key action program fails too.
+    fail.store(false, Relaxed);
+    let mut stmt = conn.prepare("DELETE FROM parent").unwrap();
+    fail.store(true, Relaxed);
+    let err = stmt.run_ignore_rows().unwrap_err();
+    assert!(matches!(err, LimboError::OutOfMemory), "{err}");
+    drop(stmt);
+
+    // The failed statements changed nothing, and the connection continues to
     // work.
     fail.store(false, Relaxed);
     conn.execute("INSERT INTO t VALUES (3)").unwrap();
-    for (sql, expected) in [("SELECT x FROM t", 3), ("SELECT y FROM u", 3)] {
+    for (sql, expected) in [
+        ("SELECT x FROM t", 3),
+        ("SELECT y FROM u", 3),
+        ("SELECT id FROM parent", 1),
+        ("SELECT pid FROM child", 1),
+    ] {
         assert_eq!(
             limbo_exec_rows(&conn, sql),
             vec![vec![Value::Integer(expected)]],
