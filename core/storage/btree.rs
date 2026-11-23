@@ -401,6 +401,11 @@ impl YieldPointMarker for BTreeWriteYieldPoint {
     }
 }
 
+/// The largest buffer that an overflow read reserves before it reads the
+/// overflow pages. A larger payload grows the buffer while the read copies the
+/// pages.
+const OVERFLOW_READ_MAX_RESERVE: usize = 16 * 1024 * 1024;
+
 struct ReadPayloadOverflow {
     payload: crate::alloc::Vec<u8>,
     next_page: u32,
@@ -1638,8 +1643,19 @@ impl BTreeCursor {
                 // page that doesn't exist yet, and re-entry would skip the
                 // `is_none()` branch entirely.
                 let (page, c) = return_if_io!(self.read_page(start_next_page as i64));
-                let payload =
-                    crate::with_btree_allocation_site!(OverflowRead, payload.try_to_vec())?;
+                // Reserve the whole payload, so that the copies of the overflow
+                // pages do not grow the buffer, which copies all the bytes read
+                // before. The size comes from the cell, which can be corrupt,
+                // so the reservation has a limit.
+                let capacity = (payload_size.min(OVERFLOW_READ_MAX_RESERVE as u64) as usize)
+                    .max(payload.len());
+                let mut payload_buf = crate::alloc::vec![];
+                crate::with_btree_allocation_site!(
+                    OverflowRead,
+                    payload_buf.try_reserve_exact(capacity)
+                )?;
+                payload_buf.extend_from_slice(payload);
+                let payload = payload_buf;
                 self.read_overflow_state.replace(ReadPayloadOverflow {
                     payload,
                     next_page: start_next_page,
@@ -1685,10 +1701,10 @@ impl BTreeCursor {
                 page,
             } = self.read_overflow_state.as_mut().unwrap();
             let buf = page.get_contents().as_ptr();
-            crate::with_btree_allocation_site!(
-                OverflowRead,
-                payload.try_extend(buf[4..4 + to_read].iter().copied())
-            )?;
+            // The buffer usually has the capacity already. `extend_from_slice`
+            // copies with `memcpy`, where the iterator could copy byte by byte.
+            crate::with_btree_allocation_site!(OverflowRead, payload.try_reserve(to_read))?;
+            payload.extend_from_slice(&buf[4..4 + to_read]);
             *remaining_to_read -= to_read;
 
             if let Some((new_page, c)) = new_page_and_c {
@@ -1731,16 +1747,9 @@ impl BTreeCursor {
                 .expect("read_overflow_state was checked above")
                 .payload;
 
+            // The record takes the buffer, so the payload is not copied again.
             let mut reuse_immutable = self.get_immutable_record_or_create()?;
-            reuse_immutable.as_mut().unwrap().invalidate();
-
-            crate::with_btree_allocation_site!(
-                RecordPayload,
-                reuse_immutable
-                    .as_mut()
-                    .unwrap()
-                    .start_serialization(&payload_swap)
-            )?;
+            reuse_immutable.as_mut().unwrap().set_payload(payload_swap);
 
             break Ok(IOResult::Done(()));
         }

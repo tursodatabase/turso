@@ -2119,6 +2119,13 @@ mod immutable_record {
             self.as_blob_mut().clear();
         }
 
+        /// Makes `payload` the bytes of the record. The record takes the
+        /// buffer, so the bytes are not copied.
+        #[inline]
+        pub fn set_payload(&mut self, payload: ValueBlob) {
+            *self.as_blob_mut() = payload;
+        }
+
         #[inline]
         pub const fn is_invalidated(&self) -> bool {
             self.as_blob().is_empty()
