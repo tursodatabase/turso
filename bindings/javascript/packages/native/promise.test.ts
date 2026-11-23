@@ -836,3 +836,12 @@ test('a call binds each value it passes, and undefined as NULL', async () => {
     expect(await pair.get([1], 2)).toEqual({ x: 1, y: 2 });
     expect(await pair.get(1, [2])).toEqual({ x: 1, y: 2 });
 })
+
+test('bind() binds the values that later calls run with', async () => {
+    const db = await connect(":memory:");
+    const stmt = await db.prepare("SELECT ? AS a, ? AS b");
+    expect(await stmt.bind(1, 2).get()).toEqual({ a: 1, b: 2 });
+    expect(await (await db.prepare("SELECT 1 AS a")).bind().get()).toEqual({ a: 1 });
+    const unbindable = await db.prepare("SELECT ? AS a");
+    expect(() => unbindable.bind(Symbol("s"))).toThrow(TypeError);
+})

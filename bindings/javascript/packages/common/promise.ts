@@ -1359,7 +1359,7 @@ class Statement {
    */
   bind(...bindParameters) {
     try {
-      bindParams(this.stmt, bindParameters);
+      bindParams(this.stmt.must(), bindParameters);
       return this;
     } catch (err) {
       throw convertError(err);
