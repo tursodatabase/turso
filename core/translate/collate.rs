@@ -660,9 +660,7 @@ fn compound_column_exprs<'a, 's>(
 ) -> impl Iterator<Item = (&'a Expr, ExprContext<'a, 's>)> + Clone + 'a {
     arms.iter().flat_map(move |select| {
         let context = ExprContext::new(Some(&select.table_references), resolver);
-        select
-            .column_exprs(column)
-            .map(move |expr| (expr, context))
+        select.column_exprs(column).map(move |expr| (expr, context))
     })
 }
 
