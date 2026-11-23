@@ -150,3 +150,14 @@ expect {
     1|10
     2|20
 }
+
+# A VALUES subquery's column has the affinity of its first row, so the text
+# '1' is converted to an integer before it is compared.
+test values-subquery-column-has-affinity-of-first-row {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1);
+    SELECT '1' = (VALUES (a)), '1' IN (VALUES (a)) FROM t;
+}
+expect {
+    1|1
+}
