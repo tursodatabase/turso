@@ -23,8 +23,8 @@ use turso_core::namespace::NamespaceId;
 use turso_core::schema::Schema;
 use turso_core::security::roles::RoleId;
 use turso_core::{
-    to_u32, CatalogApply, Connection, CursorType, InsertFlags, Insn, LimboError, Numeric,
-    ProgramBuilder, RegisterOrLiteral, Value, MAIN_DB_ID, SQLITE_ERROR,
+    to_u32, CatalogApply, Connection, InsertFlags, Insn, LimboError, Numeric, ProgramBuilder,
+    Value, SQLITE_ERROR,
 };
 use turso_pg_parser::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE,
@@ -37,7 +37,7 @@ use crate::functions::role_name_in;
 use crate::roles::{schema_roles, RoleCatalog};
 use crate::schema_init::TableInit;
 use crate::schema_state::{change_schema_state, emit_catalog_apply};
-use crate::unique_index::emit_unique_index_insert;
+use crate::unique_index::{emit_unique_index_insert, open_table_and_index, Cursors};
 
 /// The table that stores the memberships that `GRANT role TO role` makes.
 pub(crate) const AUTH_MEMBERS_TABLE_NAME: &str = "__turso_internal_auth_members";
@@ -387,45 +387,15 @@ pub(crate) fn emit_memberships_delete(
     Ok(())
 }
 
-/// The cursors that GRANT, REVOKE and DROP ROLE write the membership table
-/// through.
-struct Cursors {
-    table: usize,
-    role_member_index: usize,
-}
-
-/// Opens [`Cursors`] for writing the membership table of `schema`.
+/// Opens the membership table of `schema` and its index for writing.
 fn open_cursors(program: &mut ProgramBuilder, schema: &Schema) -> turso_core::Result<Cursors> {
-    let Some(table) = schema.get_btree_table(NamespaceId::ROOT, AUTH_MEMBERS_TABLE_NAME) else {
-        return Err(LimboError::ParseError(
-            "the database has no role membership table".to_string(),
-        ));
-    };
-    let role_member_index = schema
-        .get_indices(NamespaceId::ROOT, AUTH_MEMBERS_TABLE_NAME)
-        .find(|index| index.name == AUTH_MEMBERS_ROLE_MEMBER_INDEX_NAME)
-        .cloned()
-        .ok_or_else(|| {
-            LimboError::Corrupt(format!(
-                "{AUTH_MEMBERS_TABLE_NAME} has no role and member index"
-            ))
-        })?;
-    let table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: table_cursor_id,
-        root_page: RegisterOrLiteral::Literal(table.root_page),
-        db: MAIN_DB_ID,
-    });
-    let index_cursor_id = program.alloc_cursor_index(None, &role_member_index)?;
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: index_cursor_id,
-        root_page: RegisterOrLiteral::Literal(role_member_index.root_page),
-        db: MAIN_DB_ID,
-    });
-    Ok(Cursors {
-        table: table_cursor_id,
-        role_member_index: index_cursor_id,
-    })
+    open_table_and_index(
+        program,
+        schema,
+        AUTH_MEMBERS_TABLE_NAME,
+        AUTH_MEMBERS_ROLE_MEMBER_INDEX_NAME,
+    )?
+    .ok_or_else(|| LimboError::ParseError("the database has no role membership table".to_string()))
 }
 
 /// Inserts `membership` under a new rowid and tells the engine to add it to
@@ -493,7 +463,7 @@ fn emit_role_member_index_insert(
     let key_reg = emit_role_member_key(program, membership, id_reg);
     emit_unique_index_insert(
         program,
-        cursors.role_member_index,
+        cursors.index,
         AUTH_MEMBERS_ROLE_MEMBER_INDEX_NAME,
         key_reg,
         4,
@@ -536,7 +506,7 @@ fn emit_membership_delete(
     program.emit_insn(Insn::IdxDelete {
         start_reg: key_reg,
         num_regs: 4,
-        cursor_id: cursors.role_member_index,
+        cursor_id: cursors.index,
         raise_error_if_no_matching_entry: true,
     });
     program.emit_insn(Insn::Delete {

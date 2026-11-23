@@ -26,8 +26,8 @@ use turso_core::namespace::NamespaceId;
 use turso_core::schema::{RelationKind, Schema};
 use turso_core::security::roles::RoleId;
 use turso_core::{
-    to_u32, CatalogApply, Connection, CursorType, InsertFlags, Insn, LimboError, Numeric,
-    ProgramBuilder, RegisterOrLiteral, Value, MAIN_DB_ID, SQLITE_ERROR,
+    to_u32, CatalogApply, Connection, InsertFlags, Insn, LimboError, Numeric, ProgramBuilder,
+    Value, MAIN_DB_ID, SQLITE_ERROR,
 };
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST, SQLSTATE_DUPLICATE_OBJECT,
@@ -40,7 +40,7 @@ use crate::classes::class_catalog;
 use crate::error::sqlstate_error;
 use crate::schema_init::TableInit;
 use crate::schema_state::{change_schema_state, emit_catalog_apply};
-use crate::unique_index::emit_unique_index_insert;
+use crate::unique_index::{emit_unique_index_insert, open_table_and_index};
 
 /// The table that stores the roles created with `CREATE ROLE`.
 pub(crate) const AUTHID_TABLE_NAME: &str = "__turso_internal_authid";
@@ -593,29 +593,9 @@ fn open_authid_cursors(
     program: &mut ProgramBuilder,
     schema: &Schema,
 ) -> turso_core::Result<(usize, usize)> {
-    let Some(table) = schema.get_btree_table(NamespaceId::ROOT, AUTHID_TABLE_NAME) else {
-        return Err(LimboError::ParseError(
-            "the database has no roles table".to_string(),
-        ));
-    };
-    let name_index = schema
-        .get_indices(NamespaceId::ROOT, AUTHID_TABLE_NAME)
-        .find(|index| index.name == AUTHID_NAME_INDEX_NAME)
-        .cloned()
-        .ok_or_else(|| LimboError::Corrupt(format!("{AUTHID_TABLE_NAME} has no name index")))?;
-    let table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: table_cursor_id,
-        root_page: RegisterOrLiteral::Literal(table.root_page),
-        db: MAIN_DB_ID,
-    });
-    let index_cursor_id = program.alloc_cursor_index(None, &name_index)?;
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: index_cursor_id,
-        root_page: RegisterOrLiteral::Literal(name_index.root_page),
-        db: MAIN_DB_ID,
-    });
-    Ok((table_cursor_id, index_cursor_id))
+    let cursors = open_table_and_index(program, schema, AUTHID_TABLE_NAME, AUTHID_NAME_INDEX_NAME)?
+        .ok_or_else(|| LimboError::ParseError("the database has no roles table".to_string()))?;
+    Ok((cursors.table, cursors.index))
 }
 
 /// Deletes the row of `role` and its name index entry, and tells the engine
