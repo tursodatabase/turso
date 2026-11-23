@@ -10,6 +10,8 @@
 //! PULL_MATRIX_CASES=scaling-250k-200k-padded,key-composite selects scenarios.
 //! PULL_MATRIX_ROUNDS=2 changes rounds per fixture. For a small validation run,
 //! PULL_MATRIX_ROWS=200 PULL_MATRIX_UPDATES=120 overrides every scenario's size.
+//! PULL_MATRIX_CHECKPOINT_POLICIES=after_pull runs one isolated replica.
+//! The default is automatic,after_pull; reverse that list to reverse its order.
 //! CLI --sample-count changes the number of independent fixtures per scenario.
 //! This manual matrix is ignored by default, including in cargo test --all-targets.
 //!
@@ -213,13 +215,24 @@ fn run_case(case: Case) -> Result<()> {
     let setup = schema(case);
     let remote = Remote::new(&setup.iter().map(String::as_str).collect::<Vec<_>>())?;
     seed(&remote, case)?;
-    // Bootstrap both before writing changes: the transport serves one remote
-    // log generation, and bootstrap checkpoints that remote.
-    let directories = [
-        Arc::new(tempfile::tempdir()?),
-        Arc::new(tempfile::tempdir()?),
-    ];
-    for directory in &directories {
+    // Bootstrap the selected replicas before writing changes: the transport
+    // serves one remote log generation, and bootstrap checkpoints that remote.
+    // A single policy isolates its memory and allocation costs from the other
+    // replica in this process. The default retains the original paired run.
+    let policies = std::env::var("PULL_MATRIX_CHECKPOINT_POLICIES")
+        .unwrap_or_else(|_| "automatic,after_pull".to_string());
+    let directories = policies
+        .split(',')
+        .map(|policy| {
+            let policy = match policy.trim() {
+                "automatic" => 0,
+                "after_pull" => 1,
+                name => panic!("unknown PULL_MATRIX_CHECKPOINT_POLICIES entry: {name}"),
+            };
+            tempfile::tempdir().map(|directory| (policy, Arc::new(directory)))
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    for (_, directory) in &directories {
         let replica = Replica::open(
             directory,
             InProcessServer::new(remote.clone()),
@@ -248,8 +261,9 @@ fn run_case(case: Case) -> Result<()> {
         let remote_seconds = start.elapsed().as_secs_f64();
         for order in 0..directories.len() {
             // Alternate policy order, keeping identical remote writes for both.
-            let policy = (round - 1 + order) % directories.len();
-            let directory = &directories[policy];
+            let slot = (round - 1 + order) % directories.len();
+            let (policy, directory) = &directories[slot];
+            let policy = *policy;
             let start = Instant::now();
             let replica = Replica::open_existing(
                 directory,
@@ -288,7 +302,7 @@ fn run_case(case: Case) -> Result<()> {
         }
     }
     let expected = remote.snapshot()?;
-    for directory in &directories {
+    for (_, directory) in &directories {
         let replica = Replica::open_existing(
             directory,
             InProcessServer::new(remote.clone()),
@@ -315,7 +329,7 @@ fn run_case(case: Case) -> Result<()> {
         );
     }
     eprintln!(
-        "verified {}: both checkpoint policies match all remote rows and schema",
+        "verified {}: selected checkpoint policies match all remote rows and schema",
         case.name
     );
     Ok(())
