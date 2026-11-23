@@ -684,8 +684,19 @@ fn gc_keeps_sole_current_version_for_reader_that_began_after_lwm_sample() {
 
 impl MvccTestDbNoConn {
     pub fn new() -> Self {
+        Self::new_with_opts(DatabaseOpts::new().with_mvcc(true))
+    }
+
+    pub fn new_passive() -> Self {
+        Self::new_with_opts(
+            DatabaseOpts::new()
+                .with_mvcc(true)
+                .with_experimental_mvcc_passive_checkpoint(true),
+        )
+    }
+
+    fn new_with_opts(opts: DatabaseOpts) -> Self {
         let io = Arc::new(MemoryIO::new());
-        let opts = DatabaseOpts::new().with_mvcc(true);
         let db = Database::open_file_with_flags(
             io,
             ":memory:",

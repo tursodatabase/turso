@@ -3433,7 +3433,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 if let Some(io) = self.gc_checkpointed_index_versions() {
                     return Ok(TransitionResult::Io(io));
                 }
-                self.state = CheckpointState::PruneDirtyKeys;
+                // With the passive checkpoint off, commits record no dirty keys, and the
+                // full-scan request is never cleared, so every checkpoint reads every key.
+                self.state = if self.mvstore.uses_passive_checkpoint() {
+                    CheckpointState::PruneDirtyKeys
+                } else {
+                    CheckpointState::Finalize
+                };
                 Ok(TransitionResult::Continue)
             }
 
@@ -4210,9 +4216,11 @@ mod tests {
         (row.id, version)
     }
 
+    /// A checkpoint on a store with the passive checkpoint on, because only that store walks
+    /// the dirty keys.
     fn checkpoint_for_collect_tests(
     ) -> CheckpointStateMachine<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator> {
-        let db = MvccTestDbNoConn::new();
+        let db = MvccTestDbNoConn::new_passive();
         let conn = db.connect();
         let mvstore = db.get_mvcc_store();
         let pager = conn.pager.load().clone();
