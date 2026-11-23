@@ -9,7 +9,7 @@ use sql_generation::model::{
 };
 use turso_parser::ast::{
     self,
-    fmt::{BlankContext, ToTokens},
+    fmt::{BlankContext, WriteSql},
 };
 
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
