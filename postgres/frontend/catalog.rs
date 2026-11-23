@@ -420,6 +420,11 @@ impl Dialect for PostgresDialect {
     fn casts_nonzero_integer_to_true(&self) -> bool {
         true
     }
+
+    fn type_annotation(&self, ty: &ast::Type) -> Option<ast::TypeAnnotation> {
+        let oid = pg_type_oid(&ty.name)?;
+        u32::try_from(oid).ok().map(ast::TypeAnnotation::new)
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
