@@ -462,15 +462,31 @@ expect @tursopg error {}
 
 # C-42: ::text cast of each type
 @setup t_b_n_ts_j_jb_arr_u_with_rows
-@compat-gap "cast:bool -> text"
+@compat-gap "cast:timestamptz -> text"
 test text-cast-of-each-type {
-    SELECT b::text, n::text, ts::text, jb::text, arr::text, u::text FROM t;
+    SELECT n::text, ts::text, jb::text, arr::text, u::text FROM t;
 }
 expect {
-    true|1.50|2026-10-08 12:00:00+00|{"y": 2}|{a}|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    1.50|2026-10-08 12:00:00+00|{"y": 2}|{a}|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
 expect @tursopg {
-    1|1.50|2026-10-08 12:00:00|{"y":2}|a|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    1.50|2026-10-08 12:00:00|{"y":2}|a|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+# C-42: ::text cast of a boolean
+@compat-gap "cast:bool -> text"
+test text-cast-of-boolean {
+    CREATE TABLE flags (b boolean);
+    INSERT INTO flags VALUES (true), (false);
+    SELECT b::text, true::text, false::text FROM flags ORDER BY b;
+}
+expect {
+    false|true|false
+    true|true|false
+}
+expect @tursopg {
+    0|1|0
+    1|1|0
 }
 
 # C-43: result column type of bool comparison via pg_typeof
