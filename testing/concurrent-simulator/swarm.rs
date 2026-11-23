@@ -10,8 +10,11 @@
 use std::any::Any;
 use std::ops::RangeInclusive;
 
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha8Rng;
+use rand::Rng;
+use sql_generation::generation::{
+    pick,
+    swarm::{scale_weight, seeded_stream},
+};
 
 use crate::workloads::{BeginWorkload, CommitWorkload, RollbackWorkload, Workload};
 
@@ -30,8 +33,6 @@ const ALLOCATION_FAULT_PROBABILITIES: [f64; 4] = [0.0, 0.001, 0.01, 0.05];
 const CHECKPOINT_PROBE_PROBABILITIES: [f64; 3] = [0.0, 0.01, 0.1];
 const KILL_PROBABILITIES: [f64; 3] = [0.0, 0.001, 0.01];
 const MVCC_CHECKPOINT_THRESHOLDS: [Option<i64>; 3] = [None, Some(1024), Some(64 * 1024)];
-/// Weight multipliers in quarters: 1/4, 1/2, 1, 2 and 4.
-const WEIGHT_QUARTERS: [u32; 5] = [1, 2, 4, 8, 16];
 
 /// The settings that `--swarm` picks from the seed. Each field has the meaning
 /// of the command-line flag with the same name.
@@ -61,11 +62,11 @@ impl SwarmConfig {
             max_connections: rng.random_range(CONNECTIONS),
             processes: rng.random_range(PROCESSES),
             connections_per_process: rng.random_range(CONNECTIONS_PER_PROCESS),
-            reopen_probability: pick(&mut rng, &REOPEN_PROBABILITIES),
-            allocation_fault_probability: pick(&mut rng, &ALLOCATION_FAULT_PROBABILITIES),
-            checkpoint_probe_probability: pick(&mut rng, &CHECKPOINT_PROBE_PROBABILITIES),
-            kill_probability: pick(&mut rng, &KILL_PROBABILITIES),
-            mvcc_checkpoint_threshold: pick(&mut rng, &MVCC_CHECKPOINT_THRESHOLDS),
+            reopen_probability: *pick(&REOPEN_PROBABILITIES, &mut rng),
+            allocation_fault_probability: *pick(&ALLOCATION_FAULT_PROBABILITIES, &mut rng),
+            checkpoint_probe_probability: *pick(&CHECKPOINT_PROBE_PROBABILITIES, &mut rng),
+            kill_probability: *pick(&KILL_PROBABILITIES, &mut rng),
+            mvcc_checkpoint_threshold: *pick(&MVCC_CHECKPOINT_THRESHOLDS, &mut rng),
         }
     }
 
@@ -94,7 +95,11 @@ impl SwarmConfig {
             .into_iter()
             .map(|(weight, workload)| {
                 let on = rng.random_bool(0.5) || workload.checks_results();
-                let weight = if on { scale(weight, &mut rng) } else { 0 };
+                let weight = if on {
+                    scale_weight(weight, &mut rng)
+                } else {
+                    0
+                };
                 (weight, workload)
             })
             .collect();
@@ -117,24 +122,10 @@ impl SwarmConfig {
                 "the workload list has BEGIN, but no COMMIT or ROLLBACK"
             );
             let index = ends[rng.random_range(0..ends.len())];
-            workloads[index].0 = scale(base_weights[index], &mut rng);
+            workloads[index].0 = scale_weight(base_weights[index], &mut rng);
         }
         workloads
     }
-}
-
-fn seeded_stream(seed: u64, stream: u64) -> ChaCha8Rng {
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    rng.set_stream(stream);
-    rng
-}
-
-fn pick<T: Copy>(rng: &mut ChaCha8Rng, values: &[T]) -> T {
-    values[rng.random_range(0..values.len())]
-}
-
-fn scale(weight: u32, rng: &mut ChaCha8Rng) -> u32 {
-    (weight * pick(rng, &WEIGHT_QUARTERS)).div_ceil(4)
 }
 
 fn is_on<W: Workload>(workloads: &[(u32, Box<dyn Workload>)]) -> bool {
