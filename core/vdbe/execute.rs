@@ -2691,6 +2691,58 @@ pub fn op_convert_to_type(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_type_conversion(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _connection: &Arc<Connection>,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        TypeConversion {
+            function,
+            reg,
+            params_reg,
+            param_count,
+            description: _
+        },
+        insn
+    );
+    let value = state.registers[*reg].get_value();
+    if !matches!(value, Value::Null) {
+        let params: SmallVec<[Value; 2]> = state.registers[*params_reg..*params_reg + *param_count]
+            .iter()
+            .map(|param| param.get_value().clone())
+            .collect();
+        let converted = function(value, &params).map_err(|error| {
+            if program.trigger.is_some() {
+                raised_in_trigger(error)
+            } else {
+                error
+            }
+        })?;
+        state.registers[*reg].set_value(converted);
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// A type conversion raises a range or format error as RAISE(ABORT) does
+/// outside a trigger: a plain error. Inside a trigger RAISE(ABORT) is a
+/// trigger constraint error, so `error` becomes one.
+fn raised_in_trigger(error: LimboError) -> LimboError {
+    let LimboError::Raise(resolve_type, raised) = error else {
+        return error;
+    };
+    let raised = match *raised {
+        LimboError::SqlError(message) => LimboError::ConstraintViolation(Box::new(
+            ConstraintViolation::new(ConstraintKind::Trigger, message),
+        )),
+        other => other,
+    };
+    LimboError::Raise(resolve_type, Box::new(raised))
+}
+
 pub fn op_is_type(
     _program: &Program,
     state: &mut ProgramState,

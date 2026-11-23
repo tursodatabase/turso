@@ -260,7 +260,7 @@ pub trait Dialect: Send + Sync + 'static {
     ///
     /// [`Dialect::new_schema`] finishes the schema.
     fn schema_builder(&self, enable_custom_types: bool) -> Result<SchemaBuilder> {
-        crate::schema::builtin::schema_builder(self, enable_custom_types)
+        crate::schema::builtin::schema_builder(enable_custom_types)
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {

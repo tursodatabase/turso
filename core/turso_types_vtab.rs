@@ -68,8 +68,9 @@ impl InternalVirtualTable for TursoTypesTable {
 
 pub struct TursoTypesCursor {
     conn: Arc<Connection>,
-    /// Snapshot of type entries: (display_name, sql_string)
-    entries: Vec<(String, String)>,
+    /// Snapshot of type entries: (display_name, sql_string). A built-in type
+    /// is written in Rust and has no SQL.
+    entries: Vec<(String, Option<String>)>,
     index: usize,
 }
 
@@ -107,7 +108,8 @@ impl TursoTypesCursor {
                         .collect();
                     format!("{}({})", td.name, params.join(", "))
                 };
-                self.entries.push((display_name, td.to_sql().to_string()));
+                let sql = (!td.is_builtin).then(|| td.to_sql().to_string());
+                self.entries.push((display_name, sql));
             }
         });
     }
@@ -132,7 +134,7 @@ impl InternalVirtualTableCursor for TursoTypesCursor {
         let (ref name, ref sql) = self.entries[self.index];
         match column {
             0 => Ok(Value::from_text(name.clone())),
-            1 => Ok(Value::from_text(sql.clone())),
+            1 => Ok(sql.clone().map_or(Value::Null, Value::from_text)),
             _ => Ok(Value::Null),
         }
     }

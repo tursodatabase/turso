@@ -363,16 +363,17 @@ impl EmitOrderBy {
                     &plan.table_references,
                     t_ctx.resolver.schema(),
                 ) {
-                    if let Some(decode_expr) = type_def.decode() {
+                    if let Some(decode) = type_def.decode() {
                         let skip_label = program.allocate_label();
                         program.emit_insn(Insn::IsNull {
                             reg,
                             target_pc: skip_label,
                         });
-                        super::expr::emit_type_expr(
+                        super::expr::emit_conversion(
                             program,
-                            decode_expr,
-                            reg,
+                            &type_def,
+                            "DECODE",
+                            decode,
                             reg,
                             &t_ctx.resolver,
                         )?;

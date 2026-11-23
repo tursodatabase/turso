@@ -16,7 +16,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::{Plan, SelectPlan, TableReferences};
 use crate::type_ordering::TypeOrdering;
-use crate::types::{StorageClass, StrictType};
+use crate::types::{Conversion, StorageClass, StrictType};
 use crate::vdbe::affinity::Affinity;
 use crate::{Result, SymbolTable};
 
@@ -954,7 +954,13 @@ pub(crate) fn decode_type(
     if type_def.decode_returns_value_unchanged() {
         return None;
     }
-    let decode = type_def.decode()?;
+    let decode = match type_def.decode()? {
+        Conversion::Expr(decode) => decode,
+        // A type written in Rust says what its DECODE gives when it is
+        // registered.
+        Conversion::Function(_) => return Some(ExprType::Builtin(type_def.value_type())),
+        Conversion::Unchanged => return None,
+    };
     Some(type_of(
         decode,
         &TypeEnv::TypeBody {
@@ -1413,7 +1419,7 @@ mod tests {
     use super::*;
     use crate::ast::{Expr, Literal, Name, Operator, UnaryOperator};
     use crate::dialect::cannot_parse::DialectThatCannotParse;
-    use crate::schema::{RangeOffsets, SchemaBuilder, TypeOrigin};
+    use crate::schema::SchemaBuilder;
     use crate::translate::emitter::DoubleQuotedDml;
     use crate::{DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
@@ -1806,8 +1812,8 @@ mod tests {
         let mut schema = SchemaBuilder::new()
             .unwrap()
             .custom_types(true)
-            .type_def("numeric", Arc::new(builtin_numeric()))
-            .type_def("smallint", Arc::new(builtin_smallint()))
+            .type_def("numeric", Arc::new(builtin_type("numeric")))
+            .type_def("smallint", Arc::new(builtin_type("smallint")))
             .build();
         let sql = "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100";
         let cents = ast::CreateTypeBody::CustomType {
@@ -1819,86 +1825,18 @@ mod tests {
             operators: vec![],
             default: None,
         };
-        let cents =
-            TypeDef::from_create_type("cents", &cents, TypeOrigin::User, sql.to_string()).unwrap();
+        let cents = TypeDef::from_create_type("cents", &cents, sql.to_string()).unwrap();
         schema.add_type(cents, &SymbolTable::new()).unwrap();
         schema
     }
 
-    /// The built-in type numeric, as the database creates it when custom
+    /// The built-in type `name`, as the database creates it when custom
     /// types are on.
-    fn builtin_numeric() -> TypeDef {
-        let sql = "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob \
-                   ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) \
-                   DECODE numeric_decode(value)";
-        let body = ast::CreateTypeBody::CustomType {
-            params: vec![
-                type_param("value", "any"),
-                type_param("precision", "integer"),
-                type_param("scale", "integer"),
-            ],
-            base: "blob".to_string(),
-            encode: Some(Box::new(call("numeric_encode", vec![id("value")]))),
-            coerce: Some(Box::new(call(
-                "numeric_fit",
-                vec![id("value"), id("precision"), id("scale")],
-            ))),
-            decode: Some(Box::new(call("numeric_decode", vec![id("value")]))),
-            operators: vec![],
-            default: None,
-        };
-        let origin = TypeOrigin::Builtin {
-            accepts_collate: false,
-            range_offsets: RangeOffsets::Numeric,
-            stored_form_sorts_in_value_order: false,
-        };
-        TypeDef::from_create_type("numeric", &body, origin, sql.to_string()).unwrap()
-    }
-
-    /// The built-in type smallint, as the database creates it when custom
-    /// types are on.
-    fn builtin_smallint() -> TypeDef {
-        let sql = "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value \
-                   BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range \
-                   for smallint') END OPERATOR '<'";
-        let in_range = Expr::Between {
-            lhs: Box::new(id("value")),
-            not: false,
-            start: Box::new(neg(int(32768))),
-            end: Box::new(int(32767)),
-        };
-        let out_of_range = Expr::Raise(
-            ast::ResolveType::Abort,
-            Some(Box::new(text("integer out of range for smallint"))),
-        );
-        let body = ast::CreateTypeBody::CustomType {
-            params: vec![type_param("value", "integer")],
-            base: "integer".to_string(),
-            encode: None,
-            coerce: Some(Box::new(case_when(
-                in_range,
-                id("value"),
-                Some(out_of_range),
-            ))),
-            decode: None,
-            operators: vec![ast::TypeOperator {
-                op: "<".to_string(),
-                func_name: None,
-            }],
-            default: None,
-        };
-        let origin = TypeOrigin::Builtin {
-            accepts_collate: false,
-            range_offsets: RangeOffsets::Integer,
-            stored_form_sorts_in_value_order: false,
-        };
-        TypeDef::from_create_type("smallint", &body, origin, sql.to_string()).unwrap()
-    }
-
-    fn type_param(name: &str, ty: &str) -> ast::TypeParam {
-        ast::TypeParam {
-            name: name.to_string(),
-            ty: Some(ty.to_string()),
-        }
+    fn builtin_type(name: &str) -> TypeDef {
+        let ty = crate::types::builtin_types()
+            .into_iter()
+            .find(|ty| ty.name() == name)
+            .expect("no such built-in type");
+        TypeDef::builtin(ty.as_ref()).unwrap()
     }
 }

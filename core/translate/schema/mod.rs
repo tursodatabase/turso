@@ -21,7 +21,7 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
     BTreeTable, ColDef, Column, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
-    TypeDefKind, TypeOrigin, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME,
+    TypeDefKind, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME,
     TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
@@ -38,6 +38,7 @@ use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
+use crate::types::Conversion;
 use crate::util::{
     check_expr_references_column, column_declared_type, dequote, escape_sql_string_literal,
     is_builtin_strict_type, normalize_ident, quote_identifier, walk_expr_with_subqueries,
@@ -2894,8 +2895,7 @@ pub fn translate_create_type(
             validate_type_expr(decode, "DECODE", &resolver.catalog)?;
         }
         crate::schema::check_type_param_use(params, encode, decode)?;
-        let type_def =
-            TypeDef::from_create_type(&normalized_name, body, TypeOrigin::User, String::new())?;
+        let type_def = TypeDef::from_create_type(&normalized_name, body, String::new())?;
         resolver
             .schema()
             .plain_value_type(&normalized_name, type_def.value_input_type())?;
@@ -3395,10 +3395,12 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
                 // with inner_t.
                 .chain(params.iter().filter_map(|param| param.ty.as_deref()))
                 .collect(),
-            [encode, coerce, decode, default]
+            // A conversion written in Rust names no type.
+            [encode, coerce, decode]
                 .into_iter()
                 .flatten()
-                .map(|expr| expr.as_ref())
+                .filter_map(Conversion::expr)
+                .chain(default.as_deref())
                 .collect(),
         ),
         TypeDefKind::Struct(StructDef { fields }) => (

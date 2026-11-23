@@ -767,6 +767,21 @@ pub fn insn_to_row(
                 0,
                 description.clone(),
             ),
+            Insn::TypeConversion {
+                function: _,
+                reg,
+                params_reg,
+                param_count,
+                description,
+            } => (
+                "TypeConversion",
+                *reg as i64,
+                *params_reg as i64,
+                *param_count as i64,
+                Value::build_text(""),
+                0,
+                description.clone(),
+            ),
             Insn::ArrayEncode { data } => (
                 "ArrayEncode",
                 data.reg as i64,

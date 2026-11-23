@@ -291,20 +291,23 @@ Lists all available types, including built-in and user-defined. The columns are 
 
 ```sql
 PRAGMA list_types;
--- type                                                 | parent | encode                | coerce                                 | ...
--- numeric(value any, precision integer, scale integer) | blob   | numeric_encode(value) | numeric_fit(value, precision, scale)   | ...
--- varchar(value text, maxlen integer)                  | text   |                       | CASE WHEN length(value) <= maxlen ...  | ...
+-- type                                                 | parent | encode   | coerce   | ...
+-- numeric(value any, precision integer, scale integer) | blob   | built-in | built-in | ...
+-- varchar(value text, maxlen integer)                  | text   |          | built-in | ...
 -- ...
 ```
 
+The `encode`, `coerce` and `decode` columns show the SQL expression of a user-defined type. For a built-in type they show `built-in`, because Turso runs its own code for the conversion.
+
 ### sqlite_turso_types Virtual Table
 
-The `sqlite_turso_types` virtual table provides the name and SQL definition of each type:
+The `sqlite_turso_types` virtual table provides the name and SQL definition of each type. A built-in type has no SQL definition, so its `sql` is NULL:
 
 ```sql
 SELECT name, sql FROM sqlite_turso_types;
--- name    | sql
--- boolean | CREATE TYPE boolean(value any) BASE integer ENCODE ...
+-- name                              | sql
+-- boolean(value any)                |
+-- cents                             | CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100
 -- ...
 ```
 
