@@ -420,8 +420,9 @@ jobs:
             iterations: 10
             args: "--maximum-tests 1000 --differential --io-backend=memory"
           # Swarm testing: each iteration picks its statement mix, properties,
-          # faults and connection count from its seed. The log shows the
-          # picked settings, and the same seed repeats the run. Pull requests
+          # faults, connection count, I/O backend, I/O latency and clock ticks
+          # from its seed, so the job gives none of these flags. The log shows
+          # the picked settings, and the same seed repeats the run. Pull requests
           # use the seeds 1 to `iterations`, which pass on main, so a failure
           # on a pull request comes from its change. All other runs (pushes
           # to main and manual runs) use random seeds to try new settings.
@@ -429,7 +430,7 @@ jobs:
           # an unrelated pull request.
           - name: Swarm
             iterations: 100
-            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --io-backend=memory --swarm"
+            args: "--maximum-tests 1000 --swarm"
             swarm: true
     steps:
       - uses: actions/checkout@v4
