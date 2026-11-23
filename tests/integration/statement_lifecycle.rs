@@ -40,7 +40,7 @@ struct ContinuationProbeIndexMethod;
 struct ContinuationProbeAttachment {
     table_name: String,
     index_name: String,
-    patterns: Vec<turso_parser::ast::Select>,
+    patterns: Vec<turso_core::ast::Select>,
 }
 
 struct ContinuationProbeCursor {
@@ -89,7 +89,7 @@ impl IndexMethod for ContinuationProbeIndexMethod {
             configuration.table_name, configuration.columns[0].name
         );
         let select = match turso_core::dialect::parse_statement(dialect, &pattern)? {
-            Some(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::Select(select))) => select,
+            Some(turso_core::ast::Cmd::Stmt(turso_core::ast::Stmt::Select(select))) => select,
             _ => unreachable!(),
         };
         Ok(Arc::new(ContinuationProbeAttachment {
