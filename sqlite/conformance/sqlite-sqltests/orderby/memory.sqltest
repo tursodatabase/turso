@@ -392,6 +392,7 @@ expect {
 }
 
 # A rowid seek beats a full scan of another index that gives the order.
+# A rowid seek with `=` returns at most one row, so it needs no sorter either.
 setup seek_or_ordered_scan {
     CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT);
     CREATE INDEX ta ON t(a);
@@ -405,7 +406,6 @@ test orderby_other_index_keeps_rowid_eq_seek {
 }
 expect {
     1|0|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
-    10|0|0|USE SORTER FOR ORDER BY
 }
 
 @setup seek_or_ordered_scan
@@ -425,7 +425,6 @@ test groupby_other_index_keeps_rowid_eq_seek {
 }
 expect {
     1|0|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
-    4|0|0|USE SORTER FOR GROUP BY
 }
 
 @setup seek_or_ordered_scan
@@ -436,5 +435,4 @@ test orderby_other_index_keeps_join_rowid_eq_seek {
 expect {
     1|0|0|SEARCH u USING INTEGER PRIMARY KEY (rowid=?)
     2|0|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
-    16|0|0|USE SORTER FOR ORDER BY
 }

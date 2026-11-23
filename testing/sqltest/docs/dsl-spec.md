@@ -348,6 +348,7 @@ The gap lints run when `run` or `check` gets `--compat-gaps`; `postgres/conforma
 
 - a `@compat-gap` test has no `expect @tursopg` block, or has an override for another backend;
 - a `@compat-gap` test does not run on PostgreSQL: it has `@skip`, `@skip-if postgres`, `@backend`, or its file has `@skip-file` or `@skip-file-if postgres`;
+- a `@compat-gap` test has `@requires`, or its file has `@requires-file`: the postgres and tursopg backends have no capabilities, so both skip the test and no run would check the gap that `sqltest gaps` counts;
 - a `@compat-gap` test has an `expect pattern` block;
 - an error block of a `@compat-gap` test has no `@sqlstate`;
 - the two blocks of a `@compat-gap` test can match the same output under the comparison rules: an `expect unordered` block compares row sets, so repeated rows count once, and two error blocks with the same SQLSTATE match the same error, whatever their messages;

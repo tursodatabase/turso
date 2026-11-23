@@ -1,5 +1,6 @@
 //! Bytecode that writes rows of `sqlite_schema`.
 
+use crate::ast;
 use crate::dialect::{
     Catalog, CatalogCmd, CmdContext, CreateIndex, CreateMaterializedView, CreateSequence,
     CreateTable, CreateView, DropIndex, DropSequence, DropTable, DropView, TableText,
@@ -24,7 +25,6 @@ use crate::translate::ProgramBuilder;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
 use crate::{CaptureDataChangesExt, Result, MAIN_DB_ID};
-use turso_parser::ast;
 
 /// The catalog of a SQLite database: a row of `sqlite_schema` per object,
 /// with the SQL text that creates it.

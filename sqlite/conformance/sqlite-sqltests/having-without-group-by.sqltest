@@ -1,0 +1,306 @@
+@database :memory:
+
+# An aggregate query without GROUP BY makes one group of all rows, and HAVING
+# filters that group. As in SQLite, a column read after the aggregation loop,
+# in HAVING, in a result column that contains an aggregate, or in a subquery
+# correlated to the aggregated table, has its value from the first row that
+# reached the aggregates, and NULL when no row did. With a min() or max(), it
+# has its value from the row that set the minimum or maximum.
+
+setup tables {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
+    CREATE TABLE u(c);
+    INSERT INTO u VALUES (1), (2), (10), (20);
+}
+
+@setup tables
+test correlated-scalar-subquery-in-having {
+    SELECT count(*) FROM t HAVING (SELECT t.a) IS NOT NULL;
+}
+expect {
+    3
+}
+
+@setup tables
+test correlated-exists-in-having {
+    SELECT count(*) FROM t HAVING EXISTS (SELECT 1 WHERE t.a IS NOT NULL);
+}
+expect {
+    3
+}
+
+@setup tables
+test correlated-not-exists-in-having {
+    SELECT count(*) FROM t HAVING NOT EXISTS (SELECT 1 WHERE t.a IS NULL);
+}
+expect {
+    3
+}
+
+# The subquery reads only the enclosing query's row, no value of t.
+@setup tables
+test having-subquery-correlated-to-enclosing-query {
+    SELECT u.c FROM u WHERE (SELECT count(*) FROM t HAVING (SELECT u.c) > 5) > 0;
+}
+expect {
+    10
+    20
+}
+
+@setup tables
+test having-aggregate-compared-with-correlated-subquery {
+    SELECT sum(a) FROM t HAVING sum(a) > (SELECT count(*) FROM u WHERE u.c = t.b);
+}
+expect {
+    6
+}
+
+@setup tables
+test having-correlated-subquery-in-list {
+    SELECT count(*) FROM t HAVING (SELECT t.b) IN (SELECT c FROM u);
+}
+expect {
+    3
+}
+
+@setup tables
+test having-correlated-subquery-aliased-table {
+    SELECT count(*) FROM t x HAVING (SELECT x.b) IS NOT NULL;
+}
+expect {
+    3
+}
+
+@setup tables
+test having-correlated-subquery-in-derived-table {
+    SELECT * FROM (SELECT count(*) AS n FROM t HAVING (SELECT t.a) IS NOT NULL);
+}
+expect {
+    3
+}
+
+@setup tables
+test having-correlated-subquery-reads-first-row {
+    SELECT count(*), (SELECT t.a) FROM t HAVING (SELECT t.a) = 1;
+}
+expect {
+    3|1
+}
+
+@setup tables
+test having-correlated-subquery-does-not-read-last-row {
+    SELECT count(*) FROM t HAVING (SELECT t.a) = 3;
+}
+expect {
+}
+
+@setup tables
+test having-correlated-subquery-no-rows-reads-null {
+    SELECT count(*) FROM t WHERE 0 HAVING (SELECT t.a) IS NULL;
+}
+expect {
+    0
+}
+
+# Each run of the outer subquery starts again from NULL: for u.c = 10 and 20
+# no row of t reaches the aggregate.
+@setup tables
+test having-correlated-subquery-rerun-with-no-rows {
+    SELECT u.c, (SELECT count(*) FROM t WHERE t.a = u.c HAVING (SELECT t.a) IS NULL) FROM u;
+}
+expect {
+    1|
+    2|
+    10|0
+    20|0
+}
+
+@setup tables
+test having-bare-column-reads-first-row {
+    SELECT count(*) FROM t HAVING a = 1;
+}
+expect {
+    3
+}
+
+@setup tables
+test having-bare-column-no-rows-reads-null {
+    SELECT count(*) FROM t WHERE 0 HAVING a IS NULL;
+}
+expect {
+    0
+}
+
+@setup tables
+test having-bare-column-rerun-with-no-rows {
+    SELECT u.c, (SELECT count(*) FROM t WHERE t.a = u.c HAVING t.a IS NULL) FROM u;
+}
+expect {
+    1|
+    2|
+    10|0
+    20|0
+}
+
+@setup tables
+test having-with-bare-result-column {
+    SELECT count(*), a FROM t HAVING 1;
+}
+expect {
+    3|1
+}
+
+@setup tables
+test having-with-bare-result-column-no-rows {
+    SELECT count(*), a FROM t WHERE 0 HAVING 1;
+}
+expect {
+    0|
+}
+
+@setup tables
+test result-column-with-aggregate-reads-first-row {
+    SELECT count(*) + a FROM t;
+}
+expect {
+    4
+}
+
+@setup tables
+test result-column-with-aggregate-rerun-with-no-rows {
+    SELECT u.c, (SELECT count(*) + coalesce(t.a, 100) FROM t WHERE t.a = u.c) FROM u;
+}
+expect {
+    1|2
+    2|3
+    10|100
+    20|100
+}
+
+# sum(t.a) is an aggregate of the outer query, so the subquery runs after the
+# loop and reads t.b from the first row.
+@setup tables
+test subquery-reading-outer-aggregate-and-column {
+    SELECT (SELECT sum(t.a) + t.b) FROM t;
+}
+expect {
+    7
+}
+
+@setup tables
+test having-correlated-subquery-over-join {
+    SELECT count(*) FROM t JOIN u ON u.c = t.a HAVING (SELECT t.b + u.c) = 2;
+}
+expect {
+    2
+}
+
+@setup tables
+test having-correlated-subquery-in-compound-select {
+    SELECT count(*) FROM t WHERE 0 HAVING (SELECT t.a) IS NULL
+    UNION ALL
+    SELECT sum(c) FROM u HAVING (SELECT u.c) = 1;
+}
+expect {
+    0
+    33
+}
+
+# Controls that worked before.
+@setup tables
+test having-uncorrelated-subquery {
+    SELECT count(*) FROM t HAVING (SELECT 1) = 1;
+}
+expect {
+    3
+}
+
+@setup tables
+test where-correlated-subquery {
+    SELECT count(*) FROM t WHERE (SELECT t.a) IS NOT NULL;
+}
+expect {
+    3
+}
+
+@setup tables
+test having-correlated-subquery-with-group-by {
+    SELECT count(*) FROM t GROUP BY a HAVING (SELECT t.a) IS NOT NULL;
+}
+expect {
+    1
+    1
+    1
+}
+
+setup minmax {
+    CREATE TABLE m(a, b);
+    INSERT INTO m VALUES (1, 10), (3, 30), (2, 20);
+}
+
+@setup minmax
+test having-correlated-subquery-reads-max-row {
+    SELECT max(a) FROM m HAVING (SELECT m.b) = 30;
+}
+expect {
+    3
+}
+
+@setup minmax
+test having-bare-column-reads-min-row {
+    SELECT min(a) FROM m HAVING b = 10;
+}
+expect {
+    1
+}
+
+@setup minmax
+test result-column-with-max-reads-max-row {
+    SELECT max(a) + b FROM m;
+}
+expect {
+    33
+}
+
+# An expression that an index stores is read from the index while the loop
+# runs. After the loop the index cursor no longer points at the chosen row, so
+# the expression's value is saved whole, also when the index covers the query
+# and the table cursor is never opened.
+setup expression-index {
+    CREATE TABLE e(a, b);
+    CREATE INDEX e_ab ON e(a + b);
+    INSERT INTO e VALUES (1, 10), (2, 20), (5, 6);
+}
+
+@setup expression-index
+test having-indexed-expression-covering-index {
+    SELECT count(*) FROM e HAVING a + b = 11;
+}
+expect {
+    3
+}
+
+@setup expression-index
+test having-indexed-expression-index-search {
+    SELECT count(*) FROM e WHERE a + b > 0 HAVING a + b = 11;
+}
+expect {
+    3
+}
+
+@setup expression-index
+test result-column-with-aggregate-and-indexed-expression {
+    SELECT count(*) + (a + b) FROM e WHERE a + b > 0;
+}
+expect {
+    14
+}
+
+@setup expression-index
+test result-column-with-max-and-indexed-expression {
+    SELECT max(a + b) * 100 + (a + b) FROM e WHERE a + b > 0;
+}
+expect {
+    2222
+}

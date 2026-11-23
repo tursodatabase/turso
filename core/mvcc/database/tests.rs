@@ -236,7 +236,7 @@ fn index_key_payload_allocation_uses_passed_allocator() {
     let index_info = Arc::new(
         IndexInfo::new(
             [crate::types::KeyInfo {
-                sort_order: turso_parser::ast::SortOrder::Asc,
+                sort_order: crate::ast::SortOrder::Asc,
                 collation: crate::translate::collate::CollationSeq::BINARY,
                 nulls_order: None,
             }],
@@ -264,8 +264,8 @@ fn index_key_payload_allocation_uses_passed_allocator() {
 /// keys of different lengths.
 #[test]
 fn index_key_order_matches_compare_immutable() {
+    use crate::ast::SortOrder;
     use crate::translate::collate::CollationSeq;
-    use turso_parser::ast::SortOrder;
 
     let integers = [
         0,
@@ -373,8 +373,8 @@ fn index_key_order_matches_compare_immutable() {
 /// the error of the general path, from both sides.
 #[test]
 fn index_key_compare_reports_corrupt_values() {
+    use crate::ast::SortOrder;
     use crate::translate::collate::CollationSeq;
-    use turso_parser::ast::SortOrder;
 
     let info = Arc::new(
         IndexInfo::new(
@@ -684,8 +684,19 @@ fn gc_keeps_sole_current_version_for_reader_that_began_after_lwm_sample() {
 
 impl MvccTestDbNoConn {
     pub fn new() -> Self {
+        Self::new_with_opts(DatabaseOpts::new().with_mvcc(true))
+    }
+
+    pub fn new_passive() -> Self {
+        Self::new_with_opts(
+            DatabaseOpts::new()
+                .with_mvcc(true)
+                .with_experimental_mvcc_passive_checkpoint(true),
+        )
+    }
+
+    fn new_with_opts(opts: DatabaseOpts) -> Self {
         let io = Arc::new(MemoryIO::new());
-        let opts = DatabaseOpts::new().with_mvcc(true);
         let db = Database::open_file_with_flags(
             io,
             ":memory:",
@@ -1559,7 +1570,7 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
     let info = std::sync::Arc::new(
         crate::types::IndexInfo::new(
             crate::alloc::vec![crate::types::KeyInfo {
-                sort_order: turso_parser::ast::SortOrder::Asc,
+                sort_order: crate::ast::SortOrder::Asc,
                 collation: crate::translate::collate::CollationSeq::BINARY,
                 nulls_order: None,
             }],
@@ -3960,6 +3971,9 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
             crate::mvcc::persistent_storage::LogicalLogTruncateOutcome,
         )> {
             self.inner.truncate(checkpointed_through_ts)
+        }
+        fn finish_truncate(&self) {
+            self.inner.finish_truncate()
         }
         fn reset_to_fresh_header(&self) -> Result<Completion> {
             self.inner.reset_to_fresh_header()

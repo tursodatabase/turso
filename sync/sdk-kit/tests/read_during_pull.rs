@@ -267,6 +267,7 @@ fn open(
             open_flags: OpenFlags::default(),
         },
         TursoDatabaseSyncConfig {
+            cipher: None,
             remote_url: Some("http://in-process".to_string()),
             path: path.to_string(),
             client_name: "test".to_string(),

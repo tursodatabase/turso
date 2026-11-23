@@ -1,4 +1,5 @@
 use crate::alloc::TursoIteratorExt;
+use crate::ast::{self, TableInternalId};
 use crate::dialect::{
     AccessStatement, AddColumn, AlterColumn, CatalogCmd, CmdContext, DropColumn, NewOwner,
     RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, TempTriggerOfRenamedTable,
@@ -9,7 +10,6 @@ use crate::sync::Arc;
 use crate::translate::row_security;
 use crate::types::StrictType;
 use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
-use turso_parser::ast::{self, TableInternalId};
 
 use super::{
     index::emit_refill_index,

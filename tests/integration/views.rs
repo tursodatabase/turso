@@ -3,7 +3,7 @@ use super::common::{ExecRows, TempDatabase};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use turso_core::namespace::NamespaceId;
-use turso_core::schema::view::extract_view_columns;
+use turso_core::schema::view::{extract_view_columns, referenced_tables};
 use turso_core::ConnectOpts;
 use turso_core::SessionRole;
 
@@ -94,4 +94,64 @@ fn a_view_body_reads_the_tables_of_the_view_namespace() {
         column_names(&extract_view_columns(other, &qualified, &schema).unwrap()),
         ["a"]
     );
+}
+
+#[test]
+fn referenced_tables_finds_subqueries_of_order_by_limit_and_values() {
+    assert_eq!(
+        tables_read_by("SELECT a FROM u ORDER BY (SELECT max(a) FROM t)"),
+        [table("t"), table("u")]
+    );
+    assert_eq!(
+        tables_read_by("SELECT a FROM u LIMIT (SELECT count(*) FROM t) OFFSET (SELECT 1 FROM w)"),
+        [table("t"), table("u"), table("w")]
+    );
+    assert_eq!(
+        tables_read_by("VALUES ((SELECT max(a) FROM t))"),
+        [table("t")]
+    );
+}
+
+#[test]
+fn referenced_tables_finds_subqueries_of_window_clauses_and_table_function_arguments() {
+    assert_eq!(
+        tables_read_by(
+            "SELECT sum(a) OVER w FROM u WINDOW w AS (PARTITION BY (SELECT max(a) FROM t))"
+        ),
+        [table("t"), table("u")]
+    );
+    assert_eq!(
+        tables_read_by("SELECT value FROM json_each((SELECT j FROM t))"),
+        [table("t")]
+    );
+}
+
+#[test]
+fn referenced_tables_leaves_out_a_cte_only_where_it_is_in_scope() {
+    assert_eq!(
+        tables_read_by("SELECT a FROM t WHERE EXISTS (WITH t AS (SELECT 1 AS a) SELECT a FROM t)"),
+        [table("t")]
+    );
+    assert_eq!(
+        tables_read_by("WITH c AS (SELECT a FROM t) SELECT a FROM c"),
+        [table("t")]
+    );
+}
+
+#[test]
+fn referenced_tables_finds_a_table_named_with_a_schema_next_to_a_cte_of_its_name() {
+    assert_eq!(
+        tables_read_by("WITH t AS (SELECT 1 AS a) SELECT a FROM t UNION ALL SELECT a FROM main.t"),
+        [(Some("main".to_string()), "t".to_string())]
+    );
+}
+
+fn tables_read_by(sql: &str) -> Vec<(Option<String>, String)> {
+    let mut tables = referenced_tables(&select(sql));
+    tables.sort();
+    tables
+}
+
+fn table(name: &str) -> (Option<String>, String) {
+    (None, name.to_string())
 }

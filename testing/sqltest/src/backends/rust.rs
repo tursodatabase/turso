@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 use turso::{Builder, Connection, Database, Value};
-use turso_parser::ast::{Cmd, Stmt};
+use turso_ast::{Cmd, Stmt};
 
 const TURSO_RUST_EXPERIMENTAL_FEATURES: &[&str] = &[
     "attach",

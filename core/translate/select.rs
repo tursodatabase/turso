@@ -5,6 +5,9 @@ use super::plan::{
     NamedWindowDef, Operation, OuterQueryReference, QueryDestination, Search, TableReferences,
     Window,
 };
+use crate::ast::ResultColumn;
+use crate::ast::SortOrder;
+use crate::ast::{self, CompoundSelect, Expr};
 use crate::dialect::SortTermMatching;
 use crate::schema::Table;
 use crate::security::policy::Command;
@@ -37,9 +40,6 @@ use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
 use std::borrow::Cow;
-use turso_parser::ast::ResultColumn;
-use turso_parser::ast::SortOrder;
-use turso_parser::ast::{self, CompoundSelect, Expr};
 
 #[turso_macros::trace_stack]
 pub fn translate_select(
@@ -49,13 +49,57 @@ pub fn translate_select(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    let plan = prepare_select_plan(
+    translate_select_with_source(
         select,
+        resolver,
+        program,
+        query_destination,
+        connection,
+        false,
+    )
+}
+
+/// [translate_select] for the rows of `INSERT INTO t VALUES (...), (...)`. An
+/// INSERT converts each row to its target column, so a bare VALUES source does
+/// not need one type for the rows of a column, whatever WITH clause it carries.
+pub fn translate_insert_source_select(
+    select: ast::Select,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    query_destination: QueryDestination,
+    connection: &Arc<crate::Connection>,
+) -> Result<usize> {
+    translate_select_with_source(
+        select,
+        resolver,
+        program,
+        query_destination,
+        connection,
+        true,
+    )
+}
+
+#[turso_macros::trace_stack]
+fn translate_select_with_source(
+    select: ast::Select,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    query_destination: QueryDestination,
+    connection: &Arc<crate::Connection>,
+    is_insert_source: bool,
+) -> Result<usize> {
+    let plan = prepare_select_plan_from_arms(
+        select.body.select,
+        select.body.compounds,
+        select.with,
+        select.order_by,
+        select.limit,
         resolver,
         program,
         &[],
         query_destination,
         connection,
+        is_insert_source,
     )?;
     if program.trigger.is_some() {
         if let Some(virtual_table) = plan_first_virtual_table_name(&plan) {
@@ -186,6 +230,7 @@ pub fn prepare_select_plan(
         outer_query_refs,
         query_destination,
         connection,
+        false,
     )
 }
 
@@ -206,6 +251,7 @@ pub(crate) fn prepare_select_plan_from_arms(
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    is_insert_source: bool,
 ) -> Result<Plan> {
     let _nested_query = resolver.enter_nested_query()?;
     let mut compound_arms = compound_arms.into_iter().peekable();
@@ -220,6 +266,7 @@ pub(crate) fn prepare_select_plan_from_arms(
             outer_query_refs,
             query_destination,
             connection,
+            is_insert_source,
         )?)));
     }
 
@@ -235,6 +282,7 @@ pub(crate) fn prepare_select_plan_from_arms(
         outer_query_refs,
         query_destination.clone(),
         connection,
+        false,
     )?;
 
     let mut left = Vec::with_capacity(compound_arms.size_hint().0);
@@ -254,6 +302,7 @@ pub(crate) fn prepare_select_plan_from_arms(
             outer_query_refs,
             query_destination.clone(),
             connection,
+            false,
         )?;
     }
 
@@ -311,6 +360,7 @@ fn prepare_one_select_plan(
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    is_insert_source: bool,
 ) -> Result<SelectPlan> {
     match select {
         ast::OneSelect::Select {
@@ -595,7 +645,7 @@ fn prepare_one_select_plan(
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
             {
                 parse_where(
-                    where_clause.as_deref(),
+                    where_clause,
                     &mut plan.table_references,
                     Some(&plan.result_columns),
                     &mut plan.where_clause,
@@ -618,7 +668,7 @@ fn prepare_one_select_plan(
                     // Process HAVING clause if present
                     let having_predicates = if let Some(having) = group_by.having {
                         Some(process_having_clause(
-                            having,
+                            *having,
                             &mut plan.table_references,
                             &plan.result_columns,
                             resolver,
@@ -972,6 +1022,24 @@ fn prepare_one_select_plan(
                 connection,
             )?;
 
+            // The values of a column are one result, so they have one type.
+            // An INSERT converts each row to its target column, so its rows may differ in type.
+            if !is_insert_source {
+                let context = crate::translate::expr_context::ExprContext::new(
+                    Some(&table_references),
+                    resolver,
+                );
+                for column in 0..len {
+                    crate::translate::collate::check_comparable_results(
+                        values
+                            .iter()
+                            .filter_map(|row| row.get(column))
+                            .map(|v| v.as_ref()),
+                        &context,
+                    )?;
+                }
+            }
+
             let plan = SelectPlan {
                 join_order: vec![],
                 table_references,
@@ -1015,7 +1083,7 @@ fn result_columns_contain_aggregate(
     Ok(false)
 }
 
-fn first_aggregate_without_over_clause<'a>(
+pub(crate) fn first_aggregate_without_over_clause<'a>(
     expr: &'a ast::Expr,
     resolver: &Resolver,
 ) -> Result<Option<&'a str>> {
@@ -1989,14 +2057,14 @@ fn aggregate_belongs_to_enclosing_query(
 }
 
 fn process_having_clause(
-    having: Box<ast::Expr>,
+    having: ast::Expr,
     table_references: &mut TableReferences,
     result_columns: &[ResultSetColumn],
     resolver: &Resolver,
     aggregate_expressions: &mut Vec<super::plan::Aggregate>,
 ) -> Result<Vec<ast::Expr>> {
     let mut predicates = vec![];
-    break_predicate_at_and_boundaries(&having, &mut predicates);
+    break_predicate_at_and_boundaries(having, &mut predicates);
 
     // Before alias resolution replaces identifiers with their underlying expressions,
     // check for aliased aggregate misuse. SQLite does this during name resolution by

@@ -3,6 +3,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "ast",
     "bindings/java",
     "bindings/javascript",
     "bindings/javascript/sync",
@@ -62,6 +63,7 @@ members = [
 ]
 
 default-members = [
+    "ast",
     "bindings/java",
     "bindings/javascript",
     "bindings/javascript/sync",
@@ -122,6 +124,7 @@ turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.9.0-pre.6" }
 turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.9.0-pre.6" }
 limbo_completion = { path = "extensions/completion", version = "0.9.0-pre.6" }
 limbo_csv = { path = "extensions/csv", version = "0.9.0-pre.6" }
+turso_ast = { path = "ast", version = "0.9.0-pre.6" }
 turso_core = { path = "core", version = "0.9.0-pre.6" }
 turso_sync_engine = { path = "sync/engine", version = "0.9.0-pre.6" }
 turso_ext = { path = "extensions/core", version = "0.9.0-pre.6" }
@@ -193,8 +196,33 @@ windows-sys = "0.61.2"
 loom = { version = "0.7" }
 shuttle = { version = "0.8.1" }
 
+# Proc macros run inside rustc each time that a crate that uses them compiles.
+# For example, #[turso_macros::test] runs on more than 800 functions in each
+# rebuild of tests/integration. Proc macros spend most of their time in syn,
+# proc-macro2 and quote, so these crates and turso_macros are optimized.
+[profile.dev.package.turso_macros]
+opt-level = 3
+
+[profile.dev.package.syn]
+opt-level = 3
+
+[profile.dev.package.proc-macro2]
+opt-level = 3
+
+[profile.dev.package.quote]
+opt-level = 3
+
 [profile.dev.package.similar]
 opt-level = 3
+
+# CI runs the simulator built with this profile. A simulation runs about ten
+# times faster than with the dev profile, and a rebuild after a change to
+# turso_core takes about twice as long. opt-level 2 runs no faster than 1.
+# Debug assertions and overflow checks stay on, as in dev.
+[profile.simulator]
+inherits = "dev"
+opt-level = 1
+debug = "line-tables-only"
 
 [profile.release]
 debug = "line-tables-only"

@@ -12,6 +12,23 @@ const LOG_WITH_ARRAY_COLUMN: &[&str] = &[
 ];
 
 #[test]
+fn plaintext_zero_page_generation_base_starts_in_mvcc_mode() -> Result<()> {
+    let remote = Remote::new(&[
+        "CREATE TABLE items(value TEXT)",
+        "INSERT INTO items VALUES ('log-only value')",
+    ])?;
+    let dir = Arc::new(tempfile::tempdir()?);
+    let replica = Replica::open(
+        &dir,
+        InProcessServer::with_empty_base(remote.clone()),
+        database_opts(),
+    )?;
+    assert!(replica.is_mvcc());
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
+#[test]
 fn failed_catch_up_after_bootstrap_is_retried_on_next_open() -> Result<()> {
     let empty_base = Remote::new(&[])?;
     let remote = Remote::new(LOG_WITH_ARRAY_COLUMN)?;

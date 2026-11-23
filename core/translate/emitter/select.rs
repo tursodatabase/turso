@@ -1,10 +1,11 @@
+use crate::ast::{self, Expr};
 use crate::{
     alloc::{TursoFromIterator, TursoIteratorExt},
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable},
     sync::Arc,
     translate::{
-        aggregation::emit_ungrouped_aggregation,
+        aggregation::{columns_read_after_ungrouped_aggregation, emit_ungrouped_aggregation},
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
             MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
@@ -36,7 +37,6 @@ use crate::{
 };
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
-use turso_parser::ast::{self, Expr};
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_select(
@@ -118,15 +118,32 @@ pub fn emit_query<'a>(
     // Emit FROM clause subqueries first so the results can be read in the main query loop.
     emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
 
+    let has_group_by_exprs = plan
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| !gb.exprs.is_empty());
+    let is_ungrouped_aggregation = !plan.aggregates.is_empty() && !has_group_by_exprs;
+    if is_ungrouped_aggregation {
+        let columns = columns_read_after_ungrouped_aggregation(plan)?;
+        if !columns.is_empty() {
+            // NULL at the start of each run, so that a run where no row
+            // reaches the aggregates does not read an earlier run's values.
+            let start_reg = program.alloc_registers_and_init_w_null(columns.len());
+            t_ctx.ungrouped_agg_bare_columns = columns.into_iter().zip(start_reg..).collect();
+        }
+    }
+
     // For non-grouped aggregation queries that also have non-aggregate columns,
-    // we need to ensure non-aggregate columns are only emitted once.
-    // This flag helps track whether we've already emitted these columns.
+    // we need to ensure non-aggregate columns are only emitted once, or once
+    // per new minimum or maximum (see `BareColumnRowCheck`).
+    // This flag tracks whether we've already emitted these columns and saved
+    // the columns that are read after the loop.
     // It also tells whether any row reached the aggregate, which a correlated
     // subquery in the result columns needs even when every column contains an
     // aggregate: if no row did, the subquery runs again against the NULL row.
-    let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
-        && plan.group_by.is_none()
+    let has_ungrouped_nonagg_cols = is_ungrouped_aggregation
         && (plan.result_columns.iter().any(|c| !c.contains_aggregates)
+            || !t_ctx.ungrouped_agg_bare_columns.is_empty()
             || plan
                 .non_from_clause_subqueries
                 .iter()
@@ -156,11 +173,6 @@ pub fn emit_query<'a>(
             }
         }
     }
-
-    let has_group_by_exprs = plan
-        .group_by
-        .as_ref()
-        .is_some_and(|gb| !gb.exprs.is_empty());
 
     // Initialize cursors and other resources needed for query execution
     if !plan.order_by.is_empty() {

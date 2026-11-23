@@ -65,11 +65,11 @@ pub struct Trigger {
     pub name: String,
     pub sql: String,
     pub table_name: String,
-    pub time: turso_parser::ast::TriggerTime,
-    pub event: turso_parser::ast::TriggerEvent,
+    pub time: crate::ast::TriggerTime,
+    pub event: crate::ast::TriggerEvent,
     pub for_each_row: bool,
-    pub when_clause: Option<turso_parser::ast::Expr>,
-    pub commands: std::vec::Vec<turso_parser::ast::TriggerCmd>,
+    pub when_clause: Option<crate::ast::Expr>,
+    pub commands: std::vec::Vec<crate::ast::TriggerCmd>,
     pub temporary: bool,
     /// For temp triggers that target a table in a specific database.
     /// - `None` — the trigger was created without a db qualifier and
@@ -91,11 +91,11 @@ impl Trigger {
         name: String,
         sql: String,
         table_name: String,
-        time: Option<turso_parser::ast::TriggerTime>,
-        event: turso_parser::ast::TriggerEvent,
+        time: Option<crate::ast::TriggerTime>,
+        event: crate::ast::TriggerEvent,
         for_each_row: bool,
-        when_clause: Option<turso_parser::ast::Expr>,
-        commands: std::vec::Vec<turso_parser::ast::TriggerCmd>,
+        when_clause: Option<crate::ast::Expr>,
+        commands: std::vec::Vec<crate::ast::TriggerCmd>,
         temporary: bool,
         target_database_id: Option<usize>,
     ) -> Self {
@@ -103,7 +103,7 @@ impl Trigger {
             name,
             sql,
             table_name,
-            time: time.unwrap_or(turso_parser::ast::TriggerTime::Before),
+            time: time.unwrap_or(crate::ast::TriggerTime::Before),
             event,
             for_each_row,
             when_clause,
@@ -114,6 +114,11 @@ impl Trigger {
     }
 }
 
+use crate::ast::{
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, NullsOrder, RefAct, ResolveType,
+    SortOrder, TableInternalId, TypeOperator,
+};
+use crate::ast::{Cmd, CreateTableBody, ResultColumn, Stmt};
 use crate::dialect::identity_table_sql_marker;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
@@ -135,11 +140,6 @@ use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 use tracing::trace;
-use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, NullsOrder, RefAct, ResolveType,
-    SortOrder, TableInternalId, TypeOperator,
-};
-use turso_parser::ast::{Cmd, CreateTableBody, ResultColumn, Stmt};
 
 pub const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 pub const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
@@ -627,6 +627,17 @@ impl TypeDef {
         }
     }
 
+    /// Whether a column of this type is not the same as a column of its base type: a
+    /// STRUCT or UNION, or a type that converts values when it stores or reads them.
+    /// A type with at most a COERCE check, such as varchar(n), is not, because its
+    /// values stay what they were stored as.
+    pub fn changes_stored_value(&self) -> bool {
+        self.is_struct()
+            || self.is_union()
+            || self.encode().is_some()
+            || !self.decode_returns_value_unchanged()
+    }
+
     /// True when stored values are read back unchanged (no DECODE, or `DECODE value`).
     pub fn decode_returns_value_unchanged(&self) -> bool {
         self.decode().is_none_or(
@@ -983,7 +994,7 @@ impl TypeDef {
     }
 
     /// The non-value params (user-provided at column declaration time).
-    pub fn user_params(&self) -> impl Iterator<Item = &turso_parser::ast::TypeParam> {
+    pub fn user_params(&self) -> impl Iterator<Item = &crate::ast::TypeParam> {
         self.params()
             .iter()
             .filter(|p| !p.name.eq_ignore_ascii_case("value"))
@@ -1335,7 +1346,7 @@ pub struct Schema {
 /// What kind of relation a schema object is, for the relations that
 /// [`Schema::user_relations`] lists. The parser defines it, because
 /// `ALTER ... OWNER TO` names a kind.
-pub use turso_parser::ast::RelationKind;
+pub use crate::ast::RelationKind;
 
 /// Materialized views the loader read before the names of the namespaces,
 /// with the roots of their state tables. A view body names tables by their
@@ -2444,7 +2455,7 @@ impl Schema {
         dialect: &dyn crate::dialect::Dialect,
         sql: &str,
     ) -> crate::Result<()> {
-        use turso_parser::ast::{Cmd, Stmt};
+        use crate::ast::{Cmd, Stmt};
 
         let cmd = crate::dialect::parse_statement(dialect, sql);
         match cmd {
@@ -4509,8 +4520,8 @@ impl Schema {
                 }
             }
             "view" => {
+                use crate::ast::{Cmd, Stmt};
                 use crate::schema::View;
-                use turso_parser::ast::{Cmd, Stmt};
 
                 let sql = maybe_sql.expect("sql should be present for view");
                 let (namespace, view_name) = self.demangle_name(name);
@@ -4567,7 +4578,7 @@ impl Schema {
                 }
             }
             "trigger" => {
-                use turso_parser::ast::{Cmd, Stmt};
+                use crate::ast::{Cmd, Stmt};
 
                 let sql = maybe_sql.expect("sql should be present for trigger");
                 let (namespace, trigger_name) = self.demangle_name(name);
@@ -5041,7 +5052,7 @@ impl TryClone for UniqueSet {
 
 // Copy enums stored as `Vec` elements: their clone cannot allocate.
 crate::alloc::impl_try_clone_via_clone!(
-    turso_parser::ast::SortOrder,
+    crate::ast::SortOrder,
     crate::translate::collate::CollationSeq,
 );
 
@@ -8389,7 +8400,7 @@ impl Column {
             None => (Type::Null, false),
         };
 
-        let ty_params: std::vec::Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
+        let ty_params: std::vec::Vec<Box<crate::ast::Expr>> = match &value.col_type {
             Some(ast::Type {
                 size: Some(ast::TypeSize::MaxSize(ref expr)),
                 ..
@@ -8890,7 +8901,7 @@ macro_rules! impl_effective_nulls_order {
             pub fn effective_nulls_order_when_iterated(
                 &self,
                 iter_dir: $crate::translate::plan::IterationDirection,
-            ) -> turso_parser::ast::NullsOrder {
+            ) -> crate::ast::NullsOrder {
                 match iter_dir {
                     $crate::translate::plan::IterationDirection::Forwards => {
                         self.effective_nulls_order()
@@ -8901,9 +8912,9 @@ macro_rules! impl_effective_nulls_order {
                 }
             }
 
-            pub fn effective_nulls_order(&self) -> turso_parser::ast::NullsOrder {
+            pub fn effective_nulls_order(&self) -> crate::ast::NullsOrder {
                 self.nulls_order
-                    .unwrap_or_else(|| turso_parser::ast::NullsOrder::default_for(self.order))
+                    .unwrap_or_else(|| crate::ast::NullsOrder::default_for(self.order))
             }
         }
     };
@@ -10296,9 +10307,9 @@ mod column_info {
         #[inline]
         pub fn set_array_dimensions(&mut self, dims: u32) {
             assert!(
-                dims <= turso_parser::ast::MAX_ARRAY_DIMENSIONS,
+                dims <= crate::ast::MAX_ARRAY_DIMENSIONS,
                 "array dimensions must be <= {}",
-                turso_parser::ast::MAX_ARRAY_DIMENSIONS
+                crate::ast::MAX_ARRAY_DIMENSIONS
             );
             self.0 = (self.0 & !ARRAY_DIM_MASK) | (dims << ARRAY_DIM_SHIFT);
         }

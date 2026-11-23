@@ -59,7 +59,7 @@ Basics not enumerated by the official feature matrix.
 | CREATE TABLE AS / SELECT INTO | ✅ Supported | Schema derived from the SELECT; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP, WITH (...), TABLESPACE, USING and ON COMMIT rejected; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
 | ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN, OWNER TO, ENABLE/DISABLE ROW LEVEL SECURITY work (RENAME TABLE, like CREATE INDEX, needs CREATE on the schema, which only a superuser has until GRANT exists); one subcommand per statement; ALTER COLUMN TYPE, IF [NOT] EXISTS (except for OWNER TO) and CASCADE rejected; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
 | ALTER TABLE/VIEW/MATERIALIZED VIEW/SEQUENCE/INDEX ... OWNER TO | 🟡 Partial | Changes the stored owner, which may then alter and drop the relation; a table's indexes and serial sequences move with it, ALTER INDEX changes nothing, and a serial column's sequence refuses its own OWNER TO (0A000); superuser-only for now, so an owner cannot transfer ownership |
-| CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
+| CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS. An index expression or a WHERE clause that uses `->` or `->>` fails with `0A000` |
 | CREATE VIEW | ✅ Supported | A table named without a schema is bound to the schema it is found in when the view is created, so the view keeps reading it when `search_path` changes; column aliases supported when they name every select-list column; TEMP, UNLOGGED, OR REPLACE, WITH (options) and WITH CHECK OPTION rejected |
 | COMMENT ON | 🟡 Partial | Stored in `pg_description` for tables, views, materialized views, indexes, sequences, table columns and schemas. Any other kind of object, a column of a view, a catalog relation such as `pg_class`, and the index of a PRIMARY KEY or UNIQUE constraint, is rejected with 0A000 |
 | CREATE SCHEMA / DROP SCHEMA | ✅ Supported | A schema is stored in the main database under an id; its objects are stored under names that start with `__turso_ns<id>_`, which no user object may be named; an object qualified with `main` or `temp` is an error, since PostgreSQL has no such schemas; `public` is a schema like any other, created when a new database is made, and once dropped it stays dropped until CREATE SCHEMA public; DROP ... CASCADE; AUTHORIZATION rejected; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists; CREATE SCHEMA can contain CREATE TABLE, VIEW, INDEX and SEQUENCE statements, which create their objects in the new schema, but not inside a transaction block. Databases with schemas in `turso-postgres-schema-*.db` files from earlier versions are not supported; their schemas must be recreated. A database made by an earlier version, whose tables are in no schema, is refused when a session connects. |
@@ -118,8 +118,15 @@ column defaults in `pg_attrdef.adbin`, as PostgreSQL does for the forms the
 manual lists under `CREATE POLICY`, and return TursoPG's stored SQL for
 other forms; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
-`pg_input_is_valid`, `to_char` (numeric), `now`/`clock_timestamp`/
-`transaction_timestamp`/`statement_timestamp`.
+`pg_input_is_valid`, `to_char` (numeric; other argument types fail with
+0A000), `now`/`clock_timestamp`/
+`transaction_timestamp`/`statement_timestamp`. `to_timestamp` fails with 0A000.
+`date_trunc(text, timestamptz)` for the units microseconds, milliseconds,
+second, minute, hour, day, week, month, quarter, year, decade, century and
+millennium, with every spelling in PostgreSQL's units table. An unknown unit fails
+with 22023. The units `timezone`, `timezone_h` and `timezone_m`, the
+three-argument form with a time zone, and other argument types, such as
+timestamp, fail with 0A000.
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
 forms; the first schema of `search_path` that exists), `current_schemas(boolean)`
@@ -182,7 +189,32 @@ return date, time, timetz or interval, such as `age` and `make_date`.
 transaction started, and `LOCALTIMESTAMP` is that time as a timestamp in UTC;
 `statement_timestamp()` is the time the client's query arrived, shared by all
 statements of one query string;
-`clock_timestamp()` reads the clock at each call.
+`clock_timestamp()` reads the clock at each call. All of them have microsecond
+precision.
+
+Comparing values of two different custom types fails when either type changes
+the values it stores (a STRUCT or UNION, a type with ENCODE or a DECODE other
+than `value`), unless the two already have one order in common, as `numeric`
+and `bigint` do. A domain compares as the type it is declared on, so two
+domains over one type compare as that type. So a `timestamp` with a
+`timestamptz`, and a `timestamptz` with a `varchar(n)`, fail. PostgreSQL refuses
+the second pair too, with 42883.
+The error is `cannot compare type x with type y` with SQLSTATE 0A000. Turso
+refuses comparisons that PostgreSQL may run and does not know which ones, so
+the code differs from PostgreSQL's 42883 where PostgreSQL also refuses. It covers `=`, `<`,
+`IS DISTINCT FROM`, BETWEEN, IN and `IN (SELECT ...)`, `CASE x WHEN`, `NULLIF`,
+`min` and `max`, and joins, with or without an index. The same two types in
+one result column fail the same way: in UNION, UNION ALL, INTERSECT, EXCEPT, a
+multi-row VALUES that is not the row source of an INSERT, a recursive CTE with
+UNION, the results of CASE, `coalesce`, `ifnull` and `iif`, and `lag` and `lead`
+with a default of another type. Not refused yet, and compared as stored: a
+recursive CTE with UNION ALL, a comparison with a VALUES subquery such as
+`d IN (VALUES (ts))`, and array functions that compare elements, such as
+`array_position`. PostgreSQL converts or refuses these. A string literal compared with a custom type is read as that type.
+Two arrays compare when their element types compare, so `date[]` with
+`timestamp[]` fails. Two types that only check a value, such as `varchar(n)` and
+`smallint`, compare as they did before this check, as stored. PostgreSQL refuses
+that pair, so Turso accepts a comparison that PostgreSQL rejects.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -254,7 +286,7 @@ statements of one query string;
 | ORDER BY a signed integer constant | ❌ Not supported | `ORDER BY +1` and `ORDER BY -(+1)`, also as a DISTINCT ON expression, are rejected. PostgreSQL sorts by the constant, where the engine would read a position in the select list |
 | ORDER BY USING operator | 🟡 Partial | Built-in `<` and `>` (including `pg_catalog` qualification) are translated to ascending and descending order; other operators are rejected |
 | range_agg range type aggregation function | ❌ Not supported | |
-| Recursive queries | 🟡 Partial | WITH RECURSIVE works with SQLite semantics (row-at-a-time recursive term, so e.g. DISTINCT in the recursive term over a multi-row anchor can differ from PG); SEARCH/CYCLE clauses are rejected |
+| Recursive queries | 🟡 Partial | WITH RECURSIVE works with SQLite semantics (row-at-a-time recursive term, so e.g. DISTINCT in the recursive term over a multi-row anchor can differ from PG); SEARCH/CYCLE clauses are rejected; a recursive query whose top-level set operation is not UNION or UNION ALL raises 42P19, and ORDER BY, LIMIT, OFFSET and FOR UPDATE/SHARE on it raise 0A000, as in PostgreSQL |
 | regexp_count, regexp_instr, regexp_like | ❌ Not supported | Regex *operators* (`~`, `~*`, SIMILAR TO) work |
 | Return OLD and NEW values from modified rows | ❌ Not supported | |
 | Row-wise comparison | ❌ Not supported | Row constructors `(a,b) < (c,d)` fail to translate |
@@ -286,7 +318,7 @@ statements of one query string;
 | DROP object IF EXISTS | ✅ Supported | TABLE, INDEX, VIEW, MATERIALIZED VIEW, TYPE, DOMAIN, SEQUENCE, SCHEMA |
 | ON COMMIT clause for CREATE TEMPORARY TABLE | ❌ Not supported | Rejected, like TEMP itself |
 | REINDEX CONCURRENTLY | ❌ Not supported | REINDEX not supported at all |
-| Stored generated columns | 🟡 Partial | GENERATED ALWAYS AS (...) STORED, including ADD COLUMN; the type of the expression is not checked against the column type at CREATE, so a mismatch fails at INSERT instead; immutability is checked against a list of known non-immutable functions, and date/time casts and functions are checked using the declared types of the columns they read; `+`, `-`, `||` and casts to text or date/time types need the type of their operands, which is known for a literal, a cast, a column of the table being created, and the result of an operator with a known type rule, so any other operand (a function result, a `CASE` or `COALESCE`, or any column in `ADD COLUMN`) is rejected as not supported (0A000); a generated column of a custom type such as `timestamp`, or one whose expression reads such a column, is rejected with 42601; `extract`, `date_part` and `date_trunc` are not implemented |
+| Stored generated columns | 🟡 Partial | GENERATED ALWAYS AS (...) STORED, including ADD COLUMN; the type of the expression is not checked against the column type at CREATE, so a mismatch fails at INSERT instead; immutability is checked against a list of known non-immutable functions, and date/time casts and functions are checked using the declared types of the columns they read; `+`, `-`, `||` and casts to text or date/time types need the type of their operands, which is known for a literal, a cast, a column of the table being created, and the result of an operator with a known type rule, so any other operand (a function result, a `CASE` or `COALESCE`, or any column in `ADD COLUMN`) is rejected as not supported (0A000); a generated column of a custom type such as `timestamp`, or one whose expression reads such a column, is rejected with 42601; `extract` and `date_part` are not implemented; an expression that uses `->` or `->>` fails with `0A000` |
 | Temporal constraints | ❌ Not supported | |
 | Temporary tables (CREATE TEMP TABLE) | ❌ Not supported | Rejected (UNLOGGED is accepted and creates an ordinary table) |
 | Typed tables | ❌ Not supported | |
@@ -356,7 +388,7 @@ statements of one query string;
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Improved set of JSON functions and operators | ❌ Not supported | |
-| JSONB data type | 🟡 Partial | jsonb columns supported (Turso custom type); `->` and `->>` operators work; `#>`, `#>>`, `?`, `?&`, `?\|`, `@@` fail to translate |
+| JSONB data type | 🟡 Partial | jsonb columns supported (Turso custom type). `->` and `->>` work: a text key is the name of a field, not a JSON path, and of two fields with the same name the last one counts. `->>` returns text, and it writes a number as jsonb does (`1e2` as `100`), where PostgreSQL's json keeps the text of the input. A number with more digits than numeric allows makes `->>` fail with `22003`, where PostgreSQL fails when it makes the jsonb value. An object or an array comes back as it is stored, where PostgreSQL uses the jsonb output format (`{"h": 10, "w": 20}`). `->` returns text, not jsonb, with a number as it is stored. The types of the operands are checked for each value when the query runs: a text left operand and a bigint key work, and a table without rows gives no error, where PostgreSQL reports `42883`. An integer key on a scalar returns NULL, as PostgreSQL does for json. For jsonb, PostgreSQL reads a scalar as an array of one element: `'"x"'::jsonb ->> 0` is `x`. A `CREATE INDEX` or a stored generated column that uses `->` or `->>` fails with `0A000`. `@>` and `<@` on jsonb values return NULL. `#>`, `#>>`, `?`, `?&`, `?\|`, `@@` fail to translate |
 | JSONB-modifying operators and functions | ❌ Not supported | |
 | JSONB subscripting | ❌ Not supported | |
 | JSON data type | 🟡 Partial | Same as jsonb (see above) |
@@ -364,7 +396,7 @@ statements of one query string;
 | json_strip_nulls | 🟡 Partial | Input nested deeper than 1000 levels errors with `stack depth limit exceeded`, where PostgreSQL's limit depends on `max_stack_depth`; a text or jsonb argument is accepted, where PostgreSQL only takes json; `jsonb_strip_nulls` is not supported |
 | json_each | 🟡 Partial | Returns `key` (text) and `value` (json), accepts WITH ORDINALITY and column aliases. The wire protocol describes `value` as `text` (OID 25), where PostgreSQL describes it as `json` (OID 114). Input nested deeper than 1000 levels errors with `stack depth limit exceeded`, where PostgreSQL's limit depends on `max_stack_depth`; a text or jsonb argument is accepted, where PostgreSQL only takes json. `jsonb_each`, `json_each_text`, `jsonb_each_text` and the other functions that return members are not supported |
 | Table functions of SQLite (json_tree, completion, ...) | ❌ Not supported | Refused with `0A000` as a function in FROM; PostgreSQL has no such function and reports `42883`. The `pragma_*` functions work and check the privilege of the PRAGMA |
-| json_to_record / json_to_recordset (and jsonb_ variants) | 🟡 Partial | Work with a column definition list, after the alias or inside ROWS FROM (); WITH ORDINALITY works on the ROWS FROM form; ROWS FROM with several functions is not supported; error messages for malformed input differ from PostgreSQL; a repeated key reads its first value, like `->>`; a json/jsonb column drops whitespace (`{"y": 2}` comes back as `{"y":2}`), like `->`; an array column (`int[]`) accepts only an array literal string such as `"{1,2}"`, not a JSON array |
+| json_to_record / json_to_recordset (and jsonb_ variants) | 🟡 Partial | Work with a column definition list, after the alias or inside ROWS FROM (); WITH ORDINALITY works on the ROWS FROM form; ROWS FROM with several functions is not supported; error messages for malformed input differ from PostgreSQL; a json/jsonb column drops whitespace (`{"y": 2}` comes back as `{"y":2}`); an array column (`int[]`) accepts only an array literal string such as `"{1,2}"`, not a JSON array |
 | SQL/JSON constructors | ❌ Not supported | |
 | SQL/JSON: datetime() | ❌ Not supported | |
 | SQL/JSON IS JSON | ❌ Not supported | |

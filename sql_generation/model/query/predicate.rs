@@ -1,9 +1,9 @@
 use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
-use turso_parser::ast::{
+use turso_core::ast::{
     self,
-    fmt::{BlankContext, ToTokens},
+    fmt::{BlankContext, WriteSql},
 };
 
 use crate::model::table::{SimValue, Table, TableContext};

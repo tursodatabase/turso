@@ -10,6 +10,7 @@ pub fn to_u32(v: usize) -> u32 {
 }
 
 use super::{execute, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
+use crate::ast::{ResolveType, SortOrder};
 use crate::function::AccumulatorFunc;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::{
@@ -24,7 +25,6 @@ use crate::{
 use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
-use turso_parser::ast::{ResolveType, SortOrder};
 
 /// The program run by an `Insn::Program` instruction.
 ///
@@ -296,7 +296,7 @@ pub struct AlterColumnData {
     pub namespace: NamespaceId,
     pub table: String,
     pub column_index: usize,
-    pub definition: turso_parser::ast::ColumnDefinition,
+    pub definition: crate::ast::ColumnDefinition,
     pub rename: bool,
     pub rewritten_triggers: Vec<(NamespaceRef, String, String)>,
     pub renamed_index_methods: Vec<(String, Arc<dyn crate::index_method::IndexMethodAttachment>)>,
@@ -331,11 +331,8 @@ pub struct SorterOpenData {
     pub cursor_id: CursorID, // P1
     pub columns: usize,      // P2
     /// Combined order, collation, and nulls ordering per column.
-    pub order_collations_nulls: crate::alloc::Vec<(
-        SortOrder,
-        CollationSeq,
-        Option<turso_parser::ast::NullsOrder>,
-    )>,
+    pub order_collations_nulls:
+        crate::alloc::Vec<(SortOrder, CollationSeq, Option<crate::ast::NullsOrder>)>,
 }
 
 /// Data for AggStep instruction (boxed to keep Insn small).
@@ -348,6 +345,11 @@ pub struct AggStepData {
     /// The collation MIN, MAX, mode and percentile compare the argument with.
     /// BINARY for the aggregates that do not compare values.
     pub collation: CollationSeq,
+    /// For MIN and MAX: a register that the step sets to 1 when the row keeps
+    /// the minimum or maximum of an earlier row, and to 0 otherwise. Bare
+    /// columns of the query take their values from the rows where it is 0,
+    /// as SQLite's OP_CollSeq register does. None for the other aggregates.
+    pub minmax_keeps_best_reg: Option<usize>,
 }
 
 /// Which of SUM, TOTAL, or AVG an `IvmSumFinalize` instruction computes. The

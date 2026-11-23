@@ -2,7 +2,7 @@
 //! column. It is worked out while the statement is compiled, when the tables,
 //! registers and types the result columns refer to are known.
 
-use turso_parser::ast;
+use crate::ast;
 
 use super::emitter::Resolver;
 use super::expr::expr_type::{type_of, BuiltinType, ExprType, TypeEnv};

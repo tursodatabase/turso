@@ -1,9 +1,9 @@
 use std::sync::Arc;
+use turso_core::ast;
 use turso_core::security::roles::SessionRole;
 use turso_core::Connection;
 use turso_core::Database;
 use turso_core::MemoryIO;
-use turso_parser::ast;
 use turso_sqlite::SqliteDialect;
 
 #[test]

@@ -6,7 +6,7 @@ use crate::{
     error::LimboError,
     io::{Buffer, Completion, TempFile, IO},
     io_yield_one, return_if_io,
-    storage::sqlite3_ondisk::{read_varint, read_varint_partial, varint_len, write_varint},
+    storage::sqlite3_ondisk::{read_varint, read_varint_partial, varint_len, write_varint_to_vec},
     sync::{
         atomic::{self, AtomicUsize},
         Arc, RwLock,
@@ -235,99 +235,39 @@ impl HashEntry {
             + self.payload_values.iter().map(Self::value_serialized_size).sum::<usize>()
     }
 
-    /// Serialize this entry directly to a slice, returns bytes written.
-    /// The caller must ensure the slice is large enough (use serialized_size()).
-    fn serialize_to_slice(&self, buf: &mut [u8]) -> usize {
-        let mut offset = 0;
-
-        // Write hash and rowid
-        buf[offset..offset + 8].copy_from_slice(&self.hash.to_le_bytes());
-        offset += 8;
-        buf[offset..offset + 8].copy_from_slice(&self.rowid.to_le_bytes());
-        offset += 8;
-
-        // Write number of keys and key values
-        offset += write_varint(&mut buf[offset..], self.key_values.len() as u64);
-        for value in &self.key_values {
-            offset += Self::serialize_value_to_slice(value, &mut buf[offset..]);
-        }
-
-        // Write number of payload values and payload values
-        offset += write_varint(&mut buf[offset..], self.payload_values.len() as u64);
-        for value in &self.payload_values {
-            offset += Self::serialize_value_to_slice(value, &mut buf[offset..]);
-        }
-
-        offset
-    }
-
-    /// Helper to serialize a single Value directly to a slice. Returns bytes written.
-    #[inline]
-    fn serialize_value_to_slice(value: &Value, buf: &mut [u8]) -> usize {
-        let mut offset = 0;
-        match value {
-            Value::Null => {
-                buf[offset] = NULL_HASH;
-                offset += 1;
-            }
-            Value::Numeric(Numeric::Integer(i)) => {
-                buf[offset] = INT_HASH;
-                offset += 1;
-                buf[offset..offset + 8].copy_from_slice(&i.to_le_bytes());
-                offset += 8;
-            }
-            Value::Numeric(Numeric::Float(f)) => {
-                buf[offset] = FLOAT_HASH;
-                offset += 1;
-                buf[offset..offset + 8].copy_from_slice(&f64::from(*f).to_le_bytes());
-                offset += 8;
-            }
-            Value::Text(t) => {
-                buf[offset] = TEXT_HASH;
-                offset += 1;
-                let bytes = t.as_str().as_bytes();
-                offset += write_varint(&mut buf[offset..], bytes.len() as u64);
-                buf[offset..offset + bytes.len()].copy_from_slice(bytes);
-                offset += bytes.len();
-            }
-            Value::Blob(b) => {
-                buf[offset] = BLOB_HASH;
-                offset += 1;
-                offset += write_varint(&mut buf[offset..], b.len() as u64);
-                buf[offset..offset + b.len()].copy_from_slice(b);
-                offset += b.len();
-            }
-        }
-        offset
-    }
-
     /// Serialize this entry to bytes for disk storage.
     /// Format: [hash:8][rowid:8][num_keys:varint][keys...][num_payload:varint][payload...]
     /// Each value is: [type:1][len:varint (for text/blob)][data]
-    fn serialize(&self, buf: &mut Vec<u8>) -> Result<()> {
+    fn serialize(&self, buf: &mut std::vec::Vec<u8>) -> Result<()> {
         buf.try_reserve(self.serialized_size())?;
+        self.append_to(buf);
+        Ok(())
+    }
+
+    /// Appends the bytes of [Self::serialize] to `buf`. The caller reserves
+    /// [Self::serialized_size] bytes of `buf` first, so that the append does
+    /// not allocate. `buf` is a `std::vec::Vec` because the spilled bytes go
+    /// into a [Buffer], and on `--cfg nightly` builds the `Vec` of
+    /// `crate::alloc` has another allocator.
+    fn append_to(&self, buf: &mut std::vec::Vec<u8>) {
         buf.extend_from_slice(&self.hash.to_le_bytes());
         buf.extend_from_slice(&self.rowid.to_le_bytes());
 
         // Write number of keys and key values
-        let varint_buf = &mut [0u8; 9];
-        let len = write_varint(varint_buf, self.key_values.len() as u64);
-        buf.extend_from_slice(&varint_buf[..len]);
+        write_varint_to_vec(self.key_values.len() as u64, buf);
         for value in &self.key_values {
-            Self::serialize_value(value, buf, varint_buf);
+            Self::serialize_value(value, buf);
         }
 
         // Write number of payload values and payload values
-        let len = write_varint(varint_buf, self.payload_values.len() as u64);
-        buf.extend_from_slice(&varint_buf[..len]);
+        write_varint_to_vec(self.payload_values.len() as u64, buf);
         for value in &self.payload_values {
-            Self::serialize_value(value, buf, varint_buf);
+            Self::serialize_value(value, buf);
         }
-        Ok(())
     }
 
     /// Helper to serialize a single Value to bytes.
-    fn serialize_value(value: &Value, buf: &mut Vec<u8>, varint_buf: &mut [u8; 9]) {
+    fn serialize_value(value: &Value, buf: &mut std::vec::Vec<u8>) {
         match value {
             Value::Null => {
                 buf.push(NULL_HASH);
@@ -343,14 +283,12 @@ impl HashEntry {
             Value::Text(t) => {
                 buf.push(TEXT_HASH);
                 let bytes = t.as_str().as_bytes();
-                let len = write_varint(varint_buf, bytes.len() as u64);
-                buf.extend_from_slice(&varint_buf[..len]);
+                write_varint_to_vec(bytes.len() as u64, buf);
                 buf.extend_from_slice(bytes);
             }
             Value::Blob(b) => {
                 buf.push(BLOB_HASH);
-                let len = write_varint(varint_buf, b.len() as u64);
-                buf.extend_from_slice(&varint_buf[..len]);
+                write_varint_to_vec(b.len() as u64, buf);
                 buf.extend_from_slice(b);
             }
         }
@@ -1591,24 +1529,26 @@ impl HashTable {
             total_size += varint_len(entry_size as u64) + entry_size;
         }
 
-        // Allocate I/O buffer and serialize using cached sizes
-        let buffer = Buffer::new_temporary(total_size);
-        let buf = buffer.as_mut_slice();
-        let mut offset = 0;
+        // Serialize using cached sizes. The entries are appended to a Vec that
+        // has room for all of them, so the I/O buffer is not filled with zeros
+        // that the entries then overwrite.
+        let mut data = Vec::new();
+        data.try_reserve_exact(total_size)?;
 
         let file_offset = spill_state.next_spill_offset;
         for (entry, &entry_size) in partition.entries.iter().zip(entry_sizes.iter()) {
-            offset += write_varint(&mut buf[offset..], entry_size as u64);
+            write_varint_to_vec(entry_size as u64, &mut data);
             record_distinct_key_on_disk(
                 &mut spill_state.distinct_key_places[partition_idx],
                 entry.hash,
-                file_offset + offset as u64,
+                file_offset + data.len() as u64,
                 entry_size,
             );
-            offset += entry.serialize_to_slice(&mut buf[offset..]);
+            entry.append_to(&mut data);
         }
 
-        turso_assert!(offset == total_size, "serialized size mismatch");
+        turso_assert!(data.len() == total_size, "serialized size mismatch");
+        let buffer = Buffer::new(data);
 
         let data_size = total_size;
         let num_entries = spill_state.partition_buffers[partition_idx].entries.len();
@@ -1739,10 +1679,11 @@ impl HashTable {
             return Ok(None);
         }
 
-        // Allocate single I/O buffer and serialize all partitions
-        let buffer = Buffer::new_temporary(total_size);
-        let buf = buffer.as_mut_slice();
-        let mut offset = 0;
+        // Serialize all partitions into a single I/O buffer. The entries are
+        // appended to a Vec that has room for all of them, so the buffer is not
+        // filled with zeros that the entries then overwrite.
+        let mut data = Vec::new();
+        data.try_reserve_exact(total_size)?;
         let base_file_offset = spill_state.next_spill_offset;
 
         // Track where each partition's data starts in the buffer
@@ -1750,23 +1691,24 @@ impl HashTable {
 
         for meta in &metas {
             partition_offsets
-                .push_within_capacity(offset)
+                .push_within_capacity(data.len())
                 .expect("partition offsets vector was preallocated");
             let partition = &spill_state.partition_buffers[meta.idx];
 
             for (entry, &entry_size) in partition.entries.iter().zip(meta.entry_sizes.iter()) {
-                offset += write_varint(&mut buf[offset..], entry_size as u64);
+                write_varint_to_vec(entry_size as u64, &mut data);
                 record_distinct_key_on_disk(
                     &mut spill_state.distinct_key_places[meta.idx],
                     entry.hash,
-                    base_file_offset + offset as u64,
+                    base_file_offset + data.len() as u64,
                     entry_size,
                 );
-                offset += entry.serialize_to_slice(&mut buf[offset..]);
+                entry.append_to(&mut data);
             }
         }
 
-        turso_assert!(offset == total_size, "serialized size mismatch");
+        turso_assert!(data.len() == total_size, "serialized size mismatch");
+        let buffer = Buffer::new(data);
 
         // Update partition metadata and clear buffers
         let mut total_mem_freed = 0usize;
@@ -2926,15 +2868,17 @@ impl HashTable {
             total_size += varint_len(s as u64) + s;
         }
 
-        // Serialize into I/O buffer
-        let buffer = Buffer::new_temporary(total_size);
-        let buf = buffer.as_mut_slice();
-        let mut offset = 0;
+        // Serialize into the I/O buffer. The entries are appended to a Vec that
+        // has room for all of them, so the buffer is not filled with zeros that
+        // the entries then overwrite.
+        let mut data = Vec::new();
+        data.try_reserve_exact(total_size)?;
         for (entry, &entry_size) in partition.entries.iter().zip(entry_sizes.iter()) {
-            offset += write_varint(&mut buf[offset..], entry_size as u64);
-            offset += entry.serialize_to_slice(&mut buf[offset..]);
+            write_varint_to_vec(entry_size as u64, &mut data);
+            entry.append_to(&mut data);
         }
-        turso_assert!(offset == total_size, "serialized size mismatch");
+        turso_assert!(data.len() == total_size, "serialized size mismatch");
+        let buffer = Buffer::new(data);
 
         let file_offset = probe_state.next_spill_offset;
         let num_entries = partition.entries.len();
@@ -3690,7 +3634,7 @@ mod hashtests {
             100,
         );
 
-        let mut buf = vec![];
+        let mut buf = std::vec::Vec::new();
         entry.serialize(&mut buf).unwrap();
 
         let (deserialized, consumed) = HashEntry::deserialize(&buf).unwrap();
@@ -3715,8 +3659,8 @@ mod hashtests {
     }
 
     #[test]
-    fn test_serialize_to_slice_matches_serialize() {
-        // Test that serialize_to_slice produces identical output to serialize
+    fn test_append_to_matches_serialize() {
+        // The spill paths append entries with append_to after other bytes
         let entry = HashEntry::new_with_payload(
             12345,
             vec![
@@ -3732,30 +3676,28 @@ mod hashtests {
             ],
         );
 
-        // Serialize using the Vec-based method
-        let mut vec_buf = vec![];
-        entry.serialize(&mut vec_buf).unwrap();
-
-        // Serialize using the slice-based method
+        let mut serialized = std::vec::Vec::new();
+        entry.serialize(&mut serialized).unwrap();
         let size = entry.serialized_size();
         assert_eq!(
             size,
-            vec_buf.len(),
+            serialized.len(),
             "serialized_size must match actual size"
         );
 
-        let mut slice_buf = vec![0u8; size];
-        let written = entry.serialize_to_slice(&mut slice_buf);
-        assert_eq!(written, size, "bytes written must match serialized_size");
-
-        // Both methods must produce identical output
+        let prefix = [0xAB, 0xCD, 0xEF];
+        let mut appended = prefix.to_vec();
+        appended.reserve_exact(size);
+        entry.append_to(&mut appended);
+        assert_eq!(&appended[..prefix.len()], &prefix);
         assert_eq!(
-            vec_buf, slice_buf,
-            "serialize and serialize_to_slice must produce identical output"
+            &appended[prefix.len()..],
+            &serialized[..],
+            "append_to must append the bytes of serialize"
         );
 
         // Verify the output is valid by deserializing
-        let (deserialized, consumed) = HashEntry::deserialize(&slice_buf).unwrap();
+        let (deserialized, consumed) = HashEntry::deserialize(&appended[prefix.len()..]).unwrap();
         assert_eq!(consumed, size);
         assert_eq!(deserialized.hash, entry.hash);
         assert_eq!(deserialized.rowid, entry.rowid);
@@ -3966,7 +3908,7 @@ mod hashtests {
         let mut ht = HashTable::new(config, io.clone()).unwrap();
 
         let entry = HashEntry::new(1, vec![Value::from_i64(1)], 7);
-        let mut buf = vec![];
+        let mut buf = std::vec::Vec::new();
         entry.serialize(&mut buf).unwrap();
         let truncated = &buf[..buf.len() - 1];
 
@@ -4119,7 +4061,7 @@ mod hashtests {
     fn test_hash_entry_deserialization_truncated() {
         let entry = HashEntry::new(123, vec![Value::from_i64(1), Value::Text("abc".into())], 42);
 
-        let mut buf = vec![];
+        let mut buf = std::vec::Vec::new();
         entry.serialize(&mut buf).unwrap();
 
         // Cut off the buffer mid-entry
@@ -4135,7 +4077,7 @@ mod hashtests {
     #[test]
     fn test_hash_entry_deserialization_garbage_type_tag() {
         let entry = HashEntry::new(1, vec![Value::from_i64(10)], 7);
-        let mut buf = vec![];
+        let mut buf = std::vec::Vec::new();
         entry.serialize(&mut buf).unwrap();
 
         // Compute the exact offset of the *first* type tag.
@@ -4781,7 +4723,7 @@ mod hashtests {
             ],
         );
 
-        let mut buf = vec![];
+        let mut buf = std::vec::Vec::new();
         entry.serialize(&mut buf).unwrap();
 
         let (deserialized, bytes_consumed) = HashEntry::deserialize(&buf).unwrap();
@@ -4821,7 +4763,7 @@ mod hashtests {
         assert!(entry.payload_values.is_empty());
 
         // Serialization should still work
-        let mut buf = vec![];
+        let mut buf = std::vec::Vec::new();
         entry.serialize(&mut buf).unwrap();
 
         let (deserialized, _) = HashEntry::deserialize(&buf).unwrap();

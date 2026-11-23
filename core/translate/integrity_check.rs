@@ -1,4 +1,5 @@
 use crate::alloc::Arc;
+use crate::ast::{self, TableInternalId};
 use crate::namespace::NamespaceRef;
 use crate::schema::Column;
 use crate::translate::collate::CollationSeq;
@@ -21,7 +22,6 @@ use crate::{
     HashSet,
 };
 use crate::{types::StrictType, Result};
-use turso_parser::ast::{self, TableInternalId};
 
 /// Maximum number of errors to report with integrity check. If we exceed this number we will
 /// short circuit the procedure and return early to not waste time. SQLite uses 100 as default.
