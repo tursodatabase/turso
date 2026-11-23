@@ -36,6 +36,10 @@
           src = ./.;
           pname = "turso";
           nativeBuildInputs = with pkgs; [ python3 ];
+          # .cargo/config.toml sets scripts/link-with-rust-lld.sh as the
+          # linker, but the dummy source of buildDepsOnly has no scripts/
+          # directory. In a Nix build, that script runs cc anyway.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = "cc";
         };
 
         commonArgs = {
@@ -44,6 +48,8 @@
           src = ./.;
           nativeBuildInputs = with pkgs; [ python3 ];
           strictDeps = true;
+          # The same linker as cargoArtifacts, so that Cargo reuses its build.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = "cc";
         };
 
         craneLib = ((crane.mkLib pkgs).overrideToolchain toolchain);
