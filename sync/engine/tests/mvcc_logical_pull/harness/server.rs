@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -22,6 +22,9 @@ const FRAME_END_MAGIC: u32 = 0x4554564D;
 pub struct InProcessServer {
     remote: Arc<Remote>,
     bootstrap_base: Arc<Remote>,
+    /// Set when every pull is answered with the whole database as pages. Counts the pulls,
+    /// so each answer has a new revision.
+    page_pulls: Option<AtomicUsize>,
 }
 
 impl InProcessServer {
@@ -29,6 +32,7 @@ impl InProcessServer {
         Self {
             bootstrap_base: remote.clone(),
             remote,
+            page_pulls: None,
         }
     }
 
@@ -36,6 +40,16 @@ impl InProcessServer {
         Self {
             remote,
             bootstrap_base,
+            page_pulls: None,
+        }
+    }
+
+    /// Answers every pull with the whole remote database as pages.
+    pub fn pages_only(remote: Arc<Remote>) -> Self {
+        Self {
+            bootstrap_base: remote.clone(),
+            remote,
+            page_pulls: Some(AtomicUsize::new(0)),
         }
     }
 }
@@ -92,25 +106,41 @@ impl InProcessServer {
     fn pull_updates(&self, body: &[u8]) -> Result<Vec<u8>> {
         let request = PullUpdatesReqProtoBody::decode(body)
             .map_err(|error| Error::DatabaseSyncEngineError(error.to_string()))?;
-        if request.client_revision.is_empty() {
-            self.page_bootstrap()
+        let pull = self
+            .page_pulls
+            .as_ref()
+            .map(|pulls| pulls.fetch_add(1, Ordering::Relaxed) + 1);
+        if let Some(pull) = pull {
+            let database = self.remote.checkpoint_and_read_database_file()?;
+            Ok(Self::pages(&self.remote, database, revision_at(pull)))
+        } else if request.client_revision.is_empty() {
+            let database = self.bootstrap_base.checkpoint_and_read_database_file()?;
+            let log_end = self.bootstrap_base.read_logical_log()?.len();
+            Ok(Self::pages(
+                &self.bootstrap_base,
+                database,
+                revision_at(log_end),
+            ))
         } else {
             self.logical_log_since(log_offset_of(&request.client_revision)?)
         }
     }
 
-    fn page_bootstrap(&self) -> Result<Vec<u8>> {
-        let database = self.bootstrap_base.checkpoint_and_read_database_file()?;
-        let log_end = self.bootstrap_base.read_logical_log()?.len();
+    fn pages(source: &Remote, database: Vec<u8>, server_revision: String) -> Vec<u8> {
+        let protocol = if source.mvcc {
+            PullUpdatesProtocol::MvccLogical
+        } else {
+            PullUpdatesProtocol::Pages
+        };
         let header = PullUpdatesRespProtoBody {
-            server_revision: revision_at(log_end),
+            server_revision,
             db_size: (database.len() / PAGE_SIZE) as u64,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,
             stream_kind: PullUpdatesStreamKind::Pages as i32,
             apply_mode: PullUpdatesApplyMode::Incremental as i32,
             mvcc_log: None,
-            protocol: PullUpdatesProtocol::MvccLogical as i32,
+            protocol: protocol as i32,
         };
         let mut response = header.encode_length_delimited_to_vec();
         for (page_id, page) in database.chunks_exact(PAGE_SIZE).enumerate() {
@@ -120,7 +150,7 @@ impl InProcessServer {
             };
             response.extend(page.encode_length_delimited_to_vec());
         }
-        Ok(response)
+        response
     }
 
     fn logical_log_since(&self, offset: usize) -> Result<Vec<u8>> {

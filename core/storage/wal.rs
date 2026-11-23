@@ -2960,6 +2960,18 @@ pub struct WalSharedMetadata {
     pub initialized: AtomicBool,
 }
 
+/// The last WAL frame that a checkpoint may copy into the database file, for one WAL generation.
+/// The sync engine sets it to its revert watermark: the frames after it hold local changes that
+/// a pull must still be able to read the older page versions of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointFrameCap {
+    /// Salts of the WAL header that `max_frame` counts frames of. `None` means the current WAL.
+    /// Every frame of a WAL with other salts was written after the cap was set, so for that WAL
+    /// the cap is 0.
+    pub wal_salt: Option<(u32, u32)>,
+    pub max_frame: u64,
+}
+
 /// Process-local coordination and caches layered around the shared WAL metadata.
 pub struct WalSharedRuntime {
     // Frame cache maps a Page to all the frames it has stored in WAL in ascending order.
@@ -3004,6 +3016,8 @@ pub struct WalSharedRuntime {
     /// Tracks how far the process-local `frame_cache` is known to be complete
     /// for overflow fallback in the current WAL generation.
     pub overflow_fallback_coverage: Arc<SpinLock<OverflowFallbackCoverage>>,
+    /// Every checkpoint of this WAL stops at this frame. See [`CheckpointFrameCap`].
+    pub checkpoint_frame_cap: SpinLock<Option<CheckpointFrameCap>>,
     #[cfg(test)]
     pub(crate) frames_compared: AtomicU64,
 }
@@ -4937,6 +4951,17 @@ impl WalFile {
         self.coordination.open_mode_name()
     }
 
+    /// The last frame of the current WAL that a checkpoint may copy, or `None` when there is
+    /// no cap. The caller holds the checkpoint lock, so the WAL header cannot change meanwhile.
+    fn checkpoint_frame_cap(&self) -> Option<u64> {
+        let cap = self.with_shared(|shared| *shared.runtime.checkpoint_frame_cap.lock())?;
+        let header = self.coordination.wal_header();
+        match cap.wal_salt {
+            Some(salt) if salt != (header.salt_1, header.salt_2) => Some(0),
+            _ => Some(cap.max_frame),
+        }
+    }
+
     fn with_shared<F, R>(&self, func: F) -> R
     where
         F: FnOnce(&WalFileShared) -> R,
@@ -5042,6 +5067,12 @@ impl WalFile {
                     } = mode
                     {
                         max_frame = max_frame.min(upper_bound);
+                    }
+                    // With a cap, FULL, RESTART and TRUNCATE copy the frames up to the cap and
+                    // then return Busy below, as they do when a reader holds an older snapshot.
+                    // The cap never moves the backfill position back.
+                    if let Some(cap) = self.checkpoint_frame_cap() {
+                        max_frame = max_frame.min(cap).max(nbackfills);
                     }
 
                     {
@@ -5958,6 +5989,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                checkpoint_frame_cap: SpinLock::new(None),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -6036,6 +6068,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                checkpoint_frame_cap: SpinLock::new(None),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -6080,6 +6113,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                checkpoint_frame_cap: SpinLock::new(None),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },

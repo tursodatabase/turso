@@ -11,6 +11,7 @@ use super::snapshot::Snapshot;
 use turso_core::SessionRole;
 
 pub struct Remote {
+    pub(super) mvcc: bool,
     conn: Arc<Connection>,
     db_path: PathBuf,
     _db: Arc<Database>,
@@ -19,15 +20,20 @@ pub struct Remote {
 
 impl Remote {
     pub fn new(setup: &[&str]) -> Result<Arc<Self>> {
-        Self::with_portable_changes(setup, true)
+        Self::open(setup, true, true)
     }
 
     /// A remote whose commits write plain frames with no portable changes.
     pub fn without_portable_changes(setup: &[&str]) -> Result<Arc<Self>> {
-        Self::with_portable_changes(setup, false)
+        Self::open(setup, true, false)
     }
 
-    fn with_portable_changes(setup: &[&str], enabled: bool) -> Result<Arc<Self>> {
+    /// A remote in plain WAL mode, without MVCC.
+    pub fn new_wal(setup: &[&str]) -> Result<Arc<Self>> {
+        Self::open(setup, false, false)
+    }
+
+    fn open(setup: &[&str], mvcc: bool, portable_changes: bool) -> Result<Arc<Self>> {
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("remote.db");
         let db = Database::open(
@@ -36,12 +42,15 @@ impl Remote {
             OpenOptions::new(Arc::new(SqliteDialect)).db_opts(database_opts()),
         )?;
         let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-        conn.execute("PRAGMA journal_mode = 'mvcc'")?;
-        conn.set_portable_logical_changes_enabled(enabled);
+        if mvcc {
+            conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+            conn.set_portable_logical_changes_enabled(portable_changes);
+        }
         for sql in setup {
             conn.execute(sql)?;
         }
         Ok(Arc::new(Self {
+            mvcc,
             conn,
             db_path,
             _db: db,
