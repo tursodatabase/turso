@@ -422,22 +422,18 @@ pub(super) fn choose_best_btree_candidate(
         allowed_mask.union_with(&rhs_table_mask)?;
 
         // Collect which constraint positions are consumed by the index seek.
-        // A push for each position costs less than a `collect` of a
-        // `flat_map` over the three positions of each ref. The join order
-        // search does this for each candidate index of each table that it
-        // tries.
-        let mut consumed: SmallVec<[usize; 8]> = SmallVec::new();
-        for ucref in usable_constraint_refs.iter() {
-            if let Some(eq) = &ucref.eq {
-                consumed.push(eq.constraint_pos);
-            }
-            if let Some(lower_bound) = ucref.lower_bound {
-                consumed.push(lower_bound);
-            }
-            if let Some(upper_bound) = ucref.upper_bound {
-                consumed.push(upper_bound);
-            }
-        }
+        let consumed: SmallVec<[usize; 8]> = usable_constraint_refs
+            .iter()
+            .flat_map(|ucref| {
+                [
+                    ucref.eq.as_ref().map(|e| e.constraint_pos),
+                    ucref.lower_bound,
+                    ucref.upper_bound,
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .collect();
 
         // Multiply selectivities of residual constraints whose prerequisites
         // are within the allowed mask (i.e. already satisfied by this loop).
