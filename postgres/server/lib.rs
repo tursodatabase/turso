@@ -650,6 +650,7 @@ enum BinaryEncoding {
     Bool,
     Int4,
     Int8,
+    Float4,
     Float8,
     Bytea,
 }
@@ -662,6 +663,7 @@ impl BinaryEncoding {
             Type::BOOL => Some(Self::Bool),
             Type::INT4 => Some(Self::Int4),
             Type::INT8 => Some(Self::Int8),
+            Type::FLOAT4 => Some(Self::Float4),
             Type::FLOAT8 => Some(Self::Float8),
             Type::BYTEA => Some(Self::Bytea),
             _ => None,
@@ -690,10 +692,17 @@ fn resolve_pg_type_for_column(stmt: &turso_pg::Statement, idx: usize) -> Type {
     let mut base = match info.kind {
         ColumnTypeKind::Struct | ColumnTypeKind::Union => Type::JSONB,
         _ => {
-            // Prefer the declared name (the user-visible type), then fall
-            // back to the resolved base for custom/domain types whose
-            // declared name isn't in the lookup table.
-            let mapped = sqlite_type_to_pg_type(&info.declared_name);
+            // Prefer the type a domain is based on, or a boolean that the
+            // engine stores as an INTEGER, then the declared name (the
+            // user-visible type), then fall back to the resolved base for
+            // custom/domain types whose declared name isn't in the lookup
+            // table.
+            let underlying = info
+                .underlying_type
+                .as_deref()
+                .map(sqlite_type_to_pg_type)
+                .filter(|pg_type| *pg_type != Type::TEXT);
+            let mapped = underlying.unwrap_or_else(|| sqlite_type_to_pg_type(&info.declared_name));
             if mapped == Type::TEXT {
                 info.base_type
                     .as_deref()
@@ -908,6 +917,7 @@ fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResul
             BinaryEncoding::Bool
             | BinaryEncoding::Int4
             | BinaryEncoding::Int8
+            | BinaryEncoding::Float4
             | BinaryEncoding::Float8,
         )
         | None => Err(binary_not_supported(&format!("parameter ${n}"), pg_type)),
@@ -1039,9 +1049,7 @@ fn encode_text(
 }
 
 /// Binary format writes a value in the encoding of its column's type, not of
-/// the stored value: `count(*)` is typed text, and `coalesce(NULL::float8, 1)`
-/// holds an integer. A value that the type cannot hold, such as 12.5 in the
-/// int4 column of `SELECT 1 UNION ALL SELECT 12.5`, is refused with 0A000.
+/// the stored value: `coalesce(NULL::float8, 1)` holds an integer. A value that the type cannot hold is refused with 0A000.
 fn encode_binary(
     encoder: &mut DataRowEncoder,
     val: &Value,
@@ -1049,7 +1057,7 @@ fn encode_binary(
     text_type: turso_pg::TextType,
 ) -> turso_core::Result<()> {
     use turso_core::Numeric::{Float, Integer};
-    use BinaryEncoding::{Bool, Bytea, Float8, Int4, Int8, Text};
+    use BinaryEncoding::{Bool, Bytea, Float4, Float8, Int4, Int8, Text};
     let encoding = BinaryEncoding::of(pg_type)
         .expect("build_field_info refuses binary format for a type without a binary encoding");
     let written = match (encoding, val) {
@@ -1061,13 +1069,15 @@ fn encode_binary(
             Err(_) => return Err(binary_value_not_supported(pg_type)),
         },
         (Int8, Value::Numeric(Integer(i))) => encoder.encode_field(i),
+        (Float4, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f32)),
+        (Float4, Value::Numeric(Float(f))) => encoder.encode_field(&(f64::from(*f) as f32)),
         (Float8, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f64)),
         (Float8, Value::Numeric(Float(f))) => encoder.encode_field(&f64::from(*f)),
         (Bytea, Value::Blob(b)) => encoder.encode_field(&b.as_slice()),
         (Bool | Int4 | Int8, Value::Numeric(Float(_)))
         | (Bytea, Value::Numeric(_))
-        | (Bool | Int4 | Int8 | Float8 | Bytea, Value::Text(_))
-        | (Bool | Int4 | Int8 | Float8, Value::Blob(_)) => {
+        | (Bool | Int4 | Int8 | Float4 | Float8 | Bytea, Value::Text(_))
+        | (Bool | Int4 | Int8 | Float4 | Float8, Value::Blob(_)) => {
             return Err(binary_value_not_supported(pg_type))
         }
     };
@@ -1087,8 +1097,9 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
     match upper.as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" => Type::INT4,
         "BIGINT" | "INT8" | "BIGSERIAL" => Type::INT8,
-        "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC"
-        | "DECIMAL" => Type::FLOAT8,
+        "FLOAT4" => Type::FLOAT4,
+        "REAL" | "FLOAT" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" => Type::FLOAT8,
+        "NUMERIC" | "DECIMAL" => Type::NUMERIC,
         "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER VARYING" | "CHARACTER" | "NAME" => Type::TEXT,
         "BLOB" | "BYTEA" => Type::BYTEA,
         "BOOLEAN" | "BOOL" => Type::BOOL,
@@ -1511,8 +1522,6 @@ mod tests {
         let conn = PgConnection::connect(&db).unwrap();
         conn.execute("CREATE TABLE t (i int, b bigint)").unwrap();
         conn.execute("INSERT INTO t VALUES (42, 42)").unwrap();
-        conn.execute("CREATE TABLE o (i int)").unwrap();
-        conn.execute("INSERT INTO o VALUES (3000000000)").unwrap();
         // Each field is a 4-byte length followed by the value.
         for (sql, expected_type, binary, text) in [
             (
@@ -1558,11 +1567,10 @@ mod tests {
                 b"\0\0\0\x031.5",
             ),
             ("SELECT true", Type::BOOL, b"\0\0\0\x01\x01", b"\0\0\0\x01t"),
-            // The column's type, not the stored value, picks the encoding.
             (
                 "SELECT count(*) FROM t",
-                Type::TEXT,
-                b"\0\0\0\x011",
+                Type::INT8,
+                b"\0\0\0\x08\0\0\0\0\0\0\0\x01",
                 b"\0\0\0\x011",
             ),
             // json_each() returns the text of a member, which is not a number.
@@ -1596,15 +1604,6 @@ mod tests {
                 .unwrap();
                 assert_eq!(&encoder.finish().unwrap().data[..], expected, "{sql}");
             }
-        }
-        // A value that the column's binary type cannot hold is refused.
-        for sql in ["SELECT i FROM o", "SELECT 1 UNION ALL SELECT 12.5"] {
-            let mut stmt = conn.prepare(sql).unwrap();
-            let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedBinary).unwrap());
-            let Err(error) = execute_query(&mut stmt, fields) else {
-                panic!("{sql}: no error");
-            };
-            assert_eq!(sqlstate(error), SQLSTATE_FEATURE_NOT_SUPPORTED, "{sql}");
         }
     }
 
@@ -1790,31 +1789,6 @@ mod tests {
             panic!("{rows:?}");
         };
         assert_ne!(first[0], second[0], "COMMIT ends the transaction");
-    }
-
-    // 3000000000 doesn't fit the int4 column, so the second row is refused
-    // after the first row is inserted.
-    const INSERT_RETURNING_MISFIT: &str = "INSERT INTO r VALUES (1), (3000000000) RETURNING i";
-
-    #[test]
-    fn a_refused_returning_row_rolls_back_the_insert() {
-        let (mut client, _conn) = copy_test_client();
-        client.simple_query("CREATE TABLE r (i int)").unwrap();
-        let events = execute_with_binary_result(&mut client, INSERT_RETURNING_MISFIT);
-        assert_refused(&events, b'I');
-        assert_row_count(&mut client, "r", "0");
-    }
-
-    #[test]
-    fn a_refused_returning_row_in_a_block_is_not_committed() {
-        let (mut client, _conn) = copy_test_client();
-        client.simple_query("CREATE TABLE r (i int)").unwrap();
-        client.simple_query("BEGIN").unwrap();
-        let events = execute_with_binary_result(&mut client, INSERT_RETURNING_MISFIT);
-        assert_refused(&events, b'E');
-        let events = client.simple_query("COMMIT").unwrap();
-        assert!(matches!(&events[0], BackendEvent::CommandComplete(tag) if tag == "ROLLBACK"));
-        assert_row_count(&mut client, "r", "0");
     }
 
     /// Sends Parse, Bind asking for the one result column in binary format,

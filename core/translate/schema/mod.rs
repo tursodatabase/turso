@@ -752,7 +752,7 @@ fn validate(
         let is_strict = options.contains_strict();
 
         for c in columns {
-            check_column_type(c, table_name, is_strict, resolver.schema())?;
+            check_column_type(c, table_name, is_strict, resolver)?;
         }
 
         // In STRICT tables, validate that CHECK constraint comparisons have
@@ -824,8 +824,9 @@ pub(crate) fn check_column_type(
     column: &ast::ColumnDefinition,
     table_name: &str,
     is_strict: bool,
-    schema: &Schema,
+    catalog: &CatalogContext,
 ) -> Result<()> {
+    let schema = catalog.schema();
     let Some(col_type) = &column.col_type else {
         if is_strict {
             bail_parse_error!("missing datatype for {}.{}", table_name, column.col_name);
@@ -872,14 +873,24 @@ pub(crate) fn check_column_type(
         );
     };
     // A column gives one modifier for each type parameter besides `value`, as
-    // in `p(10)`, and none for a type without such parameters.
+    // in `p(10)`, or none when the type has parameters, as in `numeric`.
     let expected = td.user_params().count();
     let provided = match &col_type.size {
         Some(ast::TypeSize::TypeSize(_, _)) => 2,
         Some(ast::TypeSize::MaxSize(_)) => 1,
         None => 0,
     };
-    if provided != expected {
+    if type_name.eq_ignore_ascii_case("numeric")
+        && !catalog.dialect.numeric_scale_may_leave_precision()
+    {
+        if let Some(ast::TypeSize::TypeSize(precision, scale)) = &col_type.size {
+            check_numeric_scale(signed_integer(precision), signed_integer(scale))?;
+        }
+    }
+    let may_omit_arguments = expected > 0
+        && provided == 0
+        && !catalog.dialect.cast_without_type_arguments_is_sqlite_cast();
+    if provided != expected && !may_omit_arguments {
         bail_parse_error!(
             "type \"{}\" requires {} parameter(s), got {}",
             type_name,
@@ -1780,12 +1791,13 @@ fn collect_autoindexes(
     tbl_name: &str,
     resolver: &Resolver,
 ) -> Result<Option<Vec<usize>>> {
-    let table = create_table(
+    let mut table = create_table(
         tbl_name,
         body,
         0,
         resolver.catalog.dialect.supports_namespaces(),
     )?;
+    table.resolve_custom_types(resolver.schema())?;
 
     let mut regs: Vec<usize> = Vec::new();
 
@@ -3368,6 +3380,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
         accepts_collate: _,
         range_offsets: _,
         stored_form_sorts_in_value_order: _,
+        can_be_rowid_alias: _,
         sql: _,
         domain_checks,
         kind,
@@ -3446,4 +3459,29 @@ fn is_cast_to_type(expr: &ast::Expr, registry_key: &str) -> bool {
         ast::Expr::Cast { type_name: Some(type_name), .. }
             if type_registry_key(&type_name.name) == registry_key
     )
+}
+
+fn signed_integer(expr: &ast::Expr) -> Option<i64> {
+    match expr {
+        ast::Expr::Literal(ast::Literal::Numeric(text)) => text.parse().ok(),
+        ast::Expr::Unary(ast::UnaryOperator::Negative, operand) => {
+            signed_integer(operand).map(|value| -value)
+        }
+        ast::Expr::Unary(ast::UnaryOperator::Positive, operand) => signed_integer(operand),
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => signed_integer(&exprs[0]),
+        _ => None,
+    }
+}
+
+fn check_numeric_scale(precision: Option<i64>, scale: Option<i64>) -> Result<()> {
+    let (Some(precision), Some(scale)) = (precision, scale) else {
+        return Ok(());
+    };
+    if scale < 0 {
+        bail_parse_error!("numeric scale must be non-negative, got {scale}");
+    }
+    if scale > precision {
+        bail_parse_error!("numeric scale ({scale}) must not exceed precision ({precision})");
+    }
+    Ok(())
 }

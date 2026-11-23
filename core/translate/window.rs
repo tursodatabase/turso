@@ -2808,7 +2808,9 @@ enum RangeType {
 fn range_type(ty: &ExprType) -> RangeType {
     match ty {
         ExprType::Null | ExprType::Untyped => RangeType::ReadWhenRun,
-        ExprType::Builtin(BuiltinType::Integer) => RangeType::Sqlite(RangeOffsets::Integer),
+        ExprType::Builtin(BuiltinType::Integer | BuiltinType::Boolean) => {
+            RangeType::Sqlite(RangeOffsets::Integer)
+        }
         ExprType::Builtin(BuiltinType::Decimal) => RangeType::Sqlite(RangeOffsets::Numeric),
         ExprType::Builtin(
             BuiltinType::Real

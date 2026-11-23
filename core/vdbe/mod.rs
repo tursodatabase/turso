@@ -2245,6 +2245,11 @@ pub struct PrepareContext {
     /// attach/detach, extension registration, etc.) without rebuilding the full
     /// context on every step.
     generation: u64,
+    /// Whether the dialect keeps the sign of a negative zero in a REAL column.
+    /// The write opcodes ask the program, not the dialect, for each row.
+    real_columns_keep_negative_zero: bool,
+    /// Whether sum() and avg() add floats one by one, with no error term.
+    sums_floats_naively: bool,
 }
 
 impl PrepareContext {
@@ -2252,7 +2257,17 @@ impl PrepareContext {
         Self {
             database_ptr: connection.database_ptr(),
             generation: connection.prepare_context_generation(),
+            real_columns_keep_negative_zero: connection.dialect().real_columns_keep_negative_zero(),
+            sums_floats_naively: connection.dialect().sums_floats_naively(),
         }
+    }
+
+    pub(crate) fn real_columns_keep_negative_zero(&self) -> bool {
+        self.real_columns_keep_negative_zero
+    }
+
+    pub(crate) fn sums_floats_naively(&self) -> bool {
+        self.sums_floats_naively
     }
 
     #[inline]

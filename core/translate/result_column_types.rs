@@ -7,24 +7,45 @@ use turso_parser::ast;
 use super::emitter::Resolver;
 use super::expr::expr_type::{type_of, BuiltinType, ExprType, TypeEnv};
 use super::plan::{ResultSetColumn, TableReferences};
-use crate::schema::Schema;
+use crate::schema::{Schema, Table};
 use crate::statement::{ColumnTypeInfo, ColumnTypeKind};
 
 pub(crate) fn result_column_types(
     result_columns: &[ResultSetColumn],
+    compound_types: Option<&[ExprType]>,
     table_references: &TableReferences,
     resolver: &Resolver,
 ) -> Vec<Option<ColumnTypeInfo>> {
     let env = TypeEnv::new(Some(table_references), resolver);
     result_columns
         .iter()
-        .map(|column| match &column.expr {
-            ast::Expr::Column { table, column, .. } => {
-                table_column_type(*table, *column, table_references, resolver.schema())
+        .enumerate()
+        .map(|(index, column)| {
+            if let Some(ty) = compound_types.and_then(|types| types.get(index)) {
+                return expression_type(ty, resolver.schema());
             }
-            expr => expression_type(&type_of(expr, &env), resolver.schema()),
+            match &column.expr {
+                ast::Expr::Column { table, column, .. }
+                    if !is_derived_table(*table, table_references) =>
+                {
+                    table_column_type(*table, *column, table_references, resolver.schema())
+                }
+                expr => expression_type(&type_of(expr, &env), resolver.schema()),
+            }
         })
         .collect()
+}
+
+/// The columns of a subquery or recursive CTE have the types of the
+/// expressions that computed them, not a declared type.
+fn is_derived_table(table: ast::TableInternalId, table_references: &TableReferences) -> bool {
+    matches!(
+        table_references.find_table_by_internal_id(table),
+        Some((
+            _,
+            Table::FromClauseSubquery(_) | Table::RecursiveCteInput(_)
+        ))
+    )
 }
 
 /// A table column reports the type name it was declared with.
@@ -36,11 +57,13 @@ fn table_column_type(
 ) -> Option<ColumnTypeInfo> {
     let (_, table) = table_references.find_table_by_internal_id(table)?;
     let column = table.get_column_at(column)?;
-    let (base_type, kind) = custom_type_info(&column.ty_str, table.is_strict(), schema);
+    let (base_type, kind, underlying_type) =
+        custom_type_info(&column.ty_str, table.is_strict(), schema);
     Some(ColumnTypeInfo {
         declared_name: column.ty_str.clone(),
         array_dimensions: column.array_dimensions(),
         base_type,
+        underlying_type,
         kind,
     })
 }
@@ -60,11 +83,12 @@ fn expression_type(ty: &ExprType, schema: &Schema) -> Option<ColumnTypeInfo> {
         ExprType::Builtin(builtin) => builtin_primitive(*builtin)?.to_string(),
         ExprType::Untyped => "TEXT".to_string(),
         ExprType::Custom { type_def, .. } => {
-            let (base_type, kind) = custom_type_info(&type_def.name, true, schema);
+            let (base_type, kind, underlying_type) = custom_type_info(&type_def.name, true, schema);
             return Some(ColumnTypeInfo {
                 declared_name: type_def.name.clone(),
                 array_dimensions,
                 base_type,
+                underlying_type,
                 kind,
             });
         }
@@ -74,10 +98,13 @@ fn expression_type(ty: &ExprType, schema: &Schema) -> Option<ColumnTypeInfo> {
         | ExprType::RowValue
         | ExprType::Array { .. } => return None,
     };
+    let underlying_type =
+        matches!(element, ExprType::Builtin(BuiltinType::Boolean)).then(|| "boolean".to_string());
     Some(ColumnTypeInfo {
         declared_name,
         array_dimensions,
         base_type: None,
+        underlying_type,
         kind: ColumnTypeKind::Builtin,
     })
 }
@@ -90,9 +117,9 @@ fn custom_type_info(
     type_name: &str,
     is_strict: bool,
     schema: &Schema,
-) -> (Option<String>, ColumnTypeKind) {
+) -> (Option<String>, ColumnTypeKind, Option<String>) {
     let Some(resolved) = schema.resolve_type(type_name, is_strict).ok().flatten() else {
-        return (None, ColumnTypeKind::Builtin);
+        return (None, ColumnTypeKind::Builtin, None);
     };
     let leaf = resolved.leaf();
     let kind = if leaf.is_struct() {
@@ -104,12 +131,18 @@ fn custom_type_info(
     } else {
         ColumnTypeKind::Custom
     };
-    (Some(resolved.primitive.to_uppercase()), kind)
+    let underlying_type = resolved.base_type().map(|type_def| type_def.name.clone());
+    (
+        Some(resolved.primitive.to_uppercase()),
+        kind,
+        underlying_type,
+    )
 }
 
 fn builtin_primitive(ty: BuiltinType) -> Option<&'static str> {
     match ty {
         BuiltinType::Integer
+        | BuiltinType::Boolean
         | BuiltinType::Real
         | BuiltinType::Decimal
         | BuiltinType::Numeric

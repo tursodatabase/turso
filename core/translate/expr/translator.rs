@@ -840,11 +840,25 @@ fn translate_cast_expr(
     let ast::Expr::Cast { expr, type_name } = expr else {
         unreachable!("translate_cast_expr expects Expr::Cast");
     };
+    let converted = plan_cast_conversion(
+        referenced_tables,
+        expr,
+        type_name.as_ref(),
+        crate::dialect::CastContext::Explicit,
+        resolver,
+    )?;
+    let operand = converted.as_ref().unwrap_or(expr);
     // A CAST to a custom type gives the value a column of the type reads, after
     // ENCODE and then DECODE, so that operators, functions and comparisons see
     // both alike: `CAST(42 AS cents)` is 42, and `-CAST(1.5 AS numeric(10,2))`
     // runs numeric's `-` on 1.50.
-    translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+    translate_expr(
+        program,
+        referenced_tables,
+        operand,
+        target_register,
+        resolver,
+    )?;
 
     let cast_type_name = type_name.as_ref().map(|tn| crate::util::dequote(&tn.name));
 
@@ -857,7 +871,11 @@ fn translate_cast_expr(
                 array_dimensions: 0,
                 ..tn.clone()
             };
-            if let Some(resolved) = custom_type_cast_chain(&element_type, resolver.schema())? {
+            if let Some(resolved) = custom_type_cast_chain(
+                &element_type,
+                resolver.schema(),
+                resolver.catalog.dialect.as_ref(),
+            )? {
                 emit_array_leaf_loop(
                     program,
                     target_register,
@@ -899,7 +917,9 @@ fn translate_cast_expr(
             )?;
             return Ok(target_register);
         }
-        if let Some(resolved) = custom_type_cast_chain(tn, resolver.schema())? {
+        if let Some(resolved) =
+            custom_type_cast_chain(tn, resolver.schema(), resolver.catalog.dialect.as_ref())?
+        {
             emit_custom_type_cast(program, resolved, tn, target_register, resolver)?;
             return Ok(target_register);
         }
@@ -914,6 +934,55 @@ fn translate_cast_expr(
         affinity: type_affinity,
     });
     Ok(target_register)
+}
+
+/// The operand wrapped in the conversion that the dialect plans for the CAST,
+/// or None when the dialect leaves the CAST to the engine.
+pub(crate) fn plan_cast_conversion(
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    type_name: Option<&ast::Type>,
+    context: crate::dialect::CastContext,
+    resolver: &Resolver,
+) -> Result<Option<ast::Expr>> {
+    let Some(type_name) = type_name else {
+        return Ok(None);
+    };
+    let source = || cast_source(referenced_tables, operand, resolver);
+    let plan = resolver
+        .catalog
+        .dialect
+        .plan_cast(&source, type_name, context)?;
+    let Some(conversion) = plan.and_then(|plan| plan.convert) else {
+        return Ok(None);
+    };
+    let args = std::iter::once(operand.clone())
+        .chain(conversion.extra_args)
+        .map(Box::new)
+        .collect();
+    Ok(Some(ast::Expr::FunctionCall {
+        name: ast::Name::exact(conversion.function),
+        distinctness: None,
+        args,
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }))
+}
+
+pub(crate) fn cast_source(
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    resolver: &Resolver,
+) -> crate::dialect::OperandType {
+    use super::expr_type::{dialect_operand_type, type_of, TypeEnv};
+    dialect_operand_type(&type_of(
+        operand,
+        &TypeEnv::new(referenced_tables, resolver),
+    ))
 }
 
 /// Emits a CAST of the value in `reg` to the custom type `type_name`, whose
@@ -982,6 +1051,7 @@ fn emit_custom_type_cast(
 fn custom_type_cast_chain(
     type_name: &ast::Type,
     schema: &crate::schema::Schema,
+    dialect: &dyn crate::dialect::Dialect,
 ) -> Result<Option<crate::schema::ResolvedType>> {
     if type_name.array_dimensions > 0 {
         return Ok(None);
@@ -994,7 +1064,7 @@ fn custom_type_cast_chain(
     if resolved.is_domain() {
         return Ok(Some(resolved));
     }
-    if is_sqlite_cast_to(resolved.leaf(), type_name) {
+    if is_sqlite_cast_to(resolved.leaf(), type_name, Some(dialect)) {
         return Ok(None);
     }
     resolved.chain.truncate(1);
@@ -1004,13 +1074,22 @@ fn custom_type_cast_chain(
 /// Whether a CAST to `type_def`, written as `type_name`, is SQLite's CAST
 /// instead: the type takes arguments and `type_name` doesn't give all of them.
 /// CAST(x AS NUMERIC) is a common SQLite idiom.
-pub(crate) fn is_sqlite_cast_to(type_def: &TypeDef, type_name: &ast::Type) -> bool {
+pub(crate) fn is_sqlite_cast_to(
+    type_def: &TypeDef,
+    type_name: &ast::Type,
+    dialect: Option<&dyn crate::dialect::Dialect>,
+) -> bool {
     let type_arg_count = match &type_name.size {
         Some(ast::TypeSize::MaxSize(_)) => 1,
         Some(ast::TypeSize::TypeSize(..)) => 2,
         None => 0,
     };
     let user_param_count = type_def.user_params().count();
+    if type_arg_count == 0
+        && dialect.is_some_and(|dialect| !dialect.cast_without_type_arguments_is_sqlite_cast())
+    {
+        return false;
+    }
     !type_def.is_domain && user_param_count != 0 && type_arg_count != user_param_count
 }
 

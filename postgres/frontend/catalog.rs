@@ -1,4 +1,5 @@
 use crate::functions::validate_pg_input;
+use crate::pg_type::{PgTypeInfo, PG_ARRAY_TYPES, PG_BASE_TYPES};
 use crate::roles::{connection_roles, schema_roles, Role, RoleCatalog};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
@@ -165,6 +166,14 @@ impl Dialect for PostgresDialect {
         }
     }
 
+    fn is_frontend_table_sql(&self, sql: &str) -> bool {
+        decode_stored_pg_schema_sql(sql).is_some()
+    }
+
+    fn numeric_scale_may_leave_precision(&self) -> bool {
+        true
+    }
+
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
             return turso_core::dialect::table_sql_for_replay(self, sql);
@@ -240,6 +249,95 @@ impl Dialect for PostgresDialect {
             return Ok(None);
         }
         turso_core::dialect::resolve_builtin_function(name, arg_count)
+    }
+
+    fn schema_builder(
+        &self,
+        enable_custom_types: bool,
+    ) -> Result<turso_core::schema::SchemaBuilder> {
+        let builder = turso_core::schema::builtin::schema_builder(self, enable_custom_types)?;
+        if !enable_custom_types {
+            return Ok(builder);
+        }
+        crate::pg_types::register_scalar_types(self, builder)
+    }
+
+    fn function_result_type(
+        &self,
+        name: &str,
+        args: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+        schema: &Schema,
+    ) -> Option<turso_core::dialect::OperandType> {
+        crate::typing::function_result_type(name, args, schema)
+    }
+
+    fn resolve_operator(
+        &self,
+        op: &str,
+        operands: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+    ) -> turso_core::dialect::OperatorResolution {
+        crate::operators::resolve_operator(op, &operands())
+    }
+
+    fn resolve_boolean_argument(
+        &self,
+        operand: &turso_core::dialect::OperandType,
+    ) -> turso_core::dialect::OperatorResolution {
+        crate::operators::resolve_boolean_argument(operand)
+    }
+
+    fn common_untyped_type(
+        &self,
+        types: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+    ) -> Option<String> {
+        crate::operators::common_untyped_type(&types())
+    }
+
+    fn check_literal_cast(&self, text: &str, type_name: &str) -> Result<()> {
+        crate::casts::check_literal_cast(text, type_name)
+    }
+
+    fn concatenates_as_text(
+        &self,
+        operands: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+    ) -> bool {
+        crate::typing::concatenates_as_text(operands)
+    }
+
+    fn uses_sqlite_arithmetic(
+        &self,
+        op: &str,
+        operands: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+    ) -> bool {
+        crate::typing::uses_sqlite_arithmetic(op, operands)
+    }
+
+    fn common_type(
+        &self,
+        types: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+    ) -> Option<turso_core::dialect::OperandType> {
+        crate::typing::common_type(types)
+    }
+
+    fn plan_cast(
+        &self,
+        source: &dyn Fn() -> turso_core::dialect::OperandType,
+        target: &turso_parser::ast::Type,
+        context: turso_core::dialect::CastContext,
+    ) -> Result<Option<turso_core::dialect::CastPlan>> {
+        crate::casts::plan_cast(source, target, context)
+    }
+
+    fn real_columns_keep_negative_zero(&self) -> bool {
+        true
+    }
+
+    fn sums_floats_naively(&self) -> bool {
+        true
+    }
+
+    fn cast_without_type_arguments_is_sqlite_cast(&self) -> bool {
+        false
     }
 
     fn requires_custom_types(&self) -> bool {
@@ -1788,300 +1886,6 @@ impl SnapshotRows for PgIndexesTable {
 // pg_type
 // ──────────────────────────────────────────────────────────────────────
 
-struct PgTypeInfo {
-    oid: i64,
-    name: &'static str,
-    typtype: &'static str,
-    typcategory: &'static str,
-    typlen: i64,
-    typarray: i64,
-    typelem: i64,
-    typbyval: bool,
-    typalign: &'static str,
-    typstorage: &'static str,
-}
-
-const PG_BASE_TYPES: &[PgTypeInfo] = &[
-    PgTypeInfo {
-        oid: 16,
-        name: "bool",
-        typtype: "b",
-        typcategory: "B",
-        typlen: 1,
-        typarray: 1000,
-        typelem: 0,
-        typbyval: true,
-        typalign: "c",
-        typstorage: "p",
-    },
-    PgTypeInfo {
-        oid: 17,
-        name: "bytea",
-        typtype: "b",
-        typcategory: "U",
-        typlen: -1,
-        typarray: 1001,
-        typelem: 0,
-        typbyval: false,
-        typalign: "i",
-        typstorage: "x",
-    },
-    PgTypeInfo {
-        oid: 20,
-        name: "int8",
-        typtype: "b",
-        typcategory: "N",
-        typlen: 8,
-        typarray: 1016,
-        typelem: 0,
-        typbyval: true,
-        typalign: "d",
-        typstorage: "p",
-    },
-    PgTypeInfo {
-        oid: 21,
-        name: "int2",
-        typtype: "b",
-        typcategory: "N",
-        typlen: 2,
-        typarray: 1005,
-        typelem: 0,
-        typbyval: true,
-        typalign: "s",
-        typstorage: "p",
-    },
-    PgTypeInfo {
-        oid: 23,
-        name: "int4",
-        typtype: "b",
-        typcategory: "N",
-        typlen: 4,
-        typarray: 1007,
-        typelem: 0,
-        typbyval: true,
-        typalign: "i",
-        typstorage: "p",
-    },
-    PgTypeInfo {
-        oid: 25,
-        name: "text",
-        typtype: "b",
-        typcategory: "S",
-        typlen: -1,
-        typarray: 1009,
-        typelem: 0,
-        typbyval: false,
-        typalign: "i",
-        typstorage: "x",
-    },
-    PgTypeInfo {
-        oid: 26,
-        name: "oid",
-        typtype: "b",
-        typcategory: "N",
-        typlen: 4,
-        typarray: 1028,
-        typelem: 0,
-        typbyval: true,
-        typalign: "i",
-        typstorage: "p",
-    },
-    PgTypeInfo {
-        oid: 114,
-        name: "json",
-        typtype: "b",
-        typcategory: "U",
-        typlen: -1,
-        typarray: 199,
-        typelem: 0,
-        typbyval: false,
-        typalign: "i",
-        typstorage: "x",
-    },
-    PgTypeInfo {
-        oid: 650,
-        name: "cidr",
-        typtype: "b",
-        typcategory: "I",
-        typlen: -1,
-        typarray: 651,
-        typelem: 0,
-        typbyval: false,
-        typalign: "i",
-        typstorage: "m",
-    },
-    PgTypeInfo {
-        oid: 700,
-        name: "float4",
-        typtype: "b",
-        typcategory: "N",
-        typlen: 4,
-        typarray: 1021,
-        typelem: 0,
-        typbyval: true,
-        typalign: "i",
-        typstorage: "p",
-    },
-    PgTypeInfo {
-        oid: 701,
-        name: "float8",
-        typtype: "b",
-        typcategory: "N",
-        typlen: 8,
-        typarray: 1022,
-        typelem: 0,
-        typbyval: true,
-        typalign: "d",
-        typstorage: "p",
-    },
-    PgTypeInfo {
-        oid: 829,
-        name: "macaddr",
-        typtype: "b",
-        typcategory: "U",
-        typlen: 6,
-        typarray: 1040,
-        typelem: 0,
-        typbyval: false,
-        typalign: "i",
-        typstorage: "p",
-    },
-    PgTypeInfo {
-        oid: 869,
-        name: "inet",
-        typtype: "b",
-        typcategory: "I",
-        typlen: -1,
-        typarray: 1041,
-        typelem: 0,
-        typbyval: false,
-        typalign: "i",
-        typstorage: "m",
-    },
-    PgTypeInfo {
-        oid: 1043,
-        name: "varchar",
-        typtype: "b",
-        typcategory: "S",
-        typlen: -1,
-        typarray: 1015,
-        typelem: 0,
-        typbyval: false,
-        typalign: "i",
-        typstorage: "x",
-    },
-    PgTypeInfo {
-        oid: 1082,
-        name: "date",
-        typtype: "b",
-        typcategory: "D",
-        typlen: 4,
-        typarray: 1182,
-        typelem: 0,
-        typbyval: true,
-        typalign: "i",
-        typstorage: "p",
-    },
-    PgTypeInfo {
-        oid: 1083,
-        name: "time",
-        typtype: "b",
-        typcategory: "D",
-        typlen: 8,
-        typarray: 1183,
-        typelem: 0,
-        typbyval: true,
-        typalign: "d",
-        typstorage: "p",
-    },
-    PgTypeInfo {
-        oid: 1114,
-        name: "timestamp",
-        typtype: "b",
-        typcategory: "D",
-        typlen: 8,
-        typarray: 1115,
-        typelem: 0,
-        typbyval: true,
-        typalign: "d",
-        typstorage: "p",
-    },
-    PgTypeInfo {
-        oid: 1184,
-        name: "timestamptz",
-        typtype: "b",
-        typcategory: "D",
-        typlen: 8,
-        typarray: 1185,
-        typelem: 0,
-        typbyval: true,
-        typalign: "d",
-        typstorage: "p",
-    },
-    PgTypeInfo {
-        oid: 1700,
-        name: "numeric",
-        typtype: "b",
-        typcategory: "N",
-        typlen: -1,
-        typarray: 1231,
-        typelem: 0,
-        typbyval: false,
-        typalign: "i",
-        typstorage: "m",
-    },
-    PgTypeInfo {
-        oid: 2950,
-        name: "uuid",
-        typtype: "b",
-        typcategory: "U",
-        typlen: 16,
-        typarray: 2951,
-        typelem: 0,
-        typbyval: false,
-        typalign: "c",
-        typstorage: "p",
-    },
-    PgTypeInfo {
-        oid: 3802,
-        name: "jsonb",
-        typtype: "b",
-        typcategory: "U",
-        typlen: -1,
-        typarray: 3807,
-        typelem: 0,
-        typbyval: false,
-        typalign: "i",
-        typstorage: "x",
-    },
-];
-
-/// Static PG array type definitions:
-/// (oid, name, typelem)
-const PG_ARRAY_TYPES: &[(i64, &str, i64)] = &[
-    (199, "_json", 114),
-    (651, "_cidr", 650),
-    (1000, "_bool", 16),
-    (1001, "_bytea", 17),
-    (1005, "_int2", 21),
-    (1007, "_int4", 23),
-    (1009, "_text", 25),
-    (1015, "_varchar", 1043),
-    (1016, "_int8", 20),
-    (1021, "_float4", 700),
-    (1022, "_float8", 701),
-    (1028, "_oid", 26),
-    (1040, "_macaddr", 829),
-    (1041, "_inet", 869),
-    (1115, "_timestamp", 1114),
-    (1182, "_date", 1082),
-    (1183, "_time", 1083),
-    (1185, "_timestamptz", 1184),
-    (1231, "_numeric", 1700),
-    (2951, "_uuid", 2950),
-    (3807, "_jsonb", 3802),
-];
-
 const PG_TYPE_SQL: &str = "CREATE TABLE pg_type (oid INTEGER, typname TEXT, typnamespace INTEGER, typowner INTEGER, typlen INTEGER, typbyval BOOLEAN, typtype TEXT, typcategory TEXT, typispreferred BOOLEAN, typisdefined BOOLEAN, typdelim TEXT, typrelid INTEGER, typsubscript TEXT, typelem INTEGER, typarray INTEGER, typinput TEXT, typoutput TEXT, typreceive TEXT, typsend TEXT, typmodin TEXT, typmodout TEXT, typanalyze TEXT, typalign TEXT, typstorage TEXT, typnotnull BOOLEAN, typbasetype INTEGER, typtypmod INTEGER, typndims INTEGER, typcollation INTEGER, typdefaultbin TEXT, typdefault TEXT, typacl TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
@@ -2108,6 +1912,7 @@ impl SnapshotRows for PgTypeTable {
                 name,
                 typtype: "b",
                 typcategory: "A",
+                typispreferred: false,
                 typlen: -1,
                 typarray: 0,
                 typelem,
@@ -2205,38 +2010,38 @@ fn type_storage<'a>(schema: &'a Schema, mut name: &'a str) -> &'static str {
 
 fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
     vec![
-        Value::from_i64(t.oid),                 // oid
-        Value::build_text(t.name),              // typname
-        Value::from_i64(11),                    // typnamespace (pg_catalog)
-        Value::from_i64(10),                    // typowner
-        Value::from_i64(t.typlen),              // typlen
-        Value::from_i64(i64::from(t.typbyval)), // typbyval
-        Value::build_text(t.typtype),           // typtype
-        Value::build_text(t.typcategory),       // typcategory
-        Value::from_i64(0),                     // typispreferred
-        Value::from_i64(1),                     // typisdefined
-        Value::build_text(","),                 // typdelim
-        Value::from_i64(0),                     // typrelid
-        Value::Null,                            // typsubscript
-        Value::from_i64(t.typelem),             // typelem
-        Value::from_i64(t.typarray),            // typarray
-        Value::Null,                            // typinput
-        Value::Null,                            // typoutput
-        Value::Null,                            // typreceive
-        Value::Null,                            // typsend
-        Value::Null,                            // typmodin
-        Value::Null,                            // typmodout
-        Value::Null,                            // typanalyze
-        Value::build_text(t.typalign),          // typalign
-        Value::build_text(t.typstorage),        // typstorage
-        Value::from_i64(0),                     // typnotnull
-        Value::from_i64(0),                     // typbasetype
-        Value::from_i64(-1),                    // typtypmod
-        Value::from_i64(0),                     // typndims
-        Value::from_i64(0),                     // typcollation
-        Value::Null,                            // typdefaultbin
-        Value::Null,                            // typdefault
-        Value::Null,                            // typacl
+        Value::from_i64(t.oid),                       // oid
+        Value::build_text(t.name),                    // typname
+        Value::from_i64(11),                          // typnamespace (pg_catalog)
+        Value::from_i64(10),                          // typowner
+        Value::from_i64(t.typlen),                    // typlen
+        Value::from_i64(i64::from(t.typbyval)),       // typbyval
+        Value::build_text(t.typtype),                 // typtype
+        Value::build_text(t.typcategory),             // typcategory
+        Value::from_i64(i64::from(t.typispreferred)), // typispreferred
+        Value::from_i64(1),                           // typisdefined
+        Value::build_text(","),                       // typdelim
+        Value::from_i64(0),                           // typrelid
+        Value::Null,                                  // typsubscript
+        Value::from_i64(t.typelem),                   // typelem
+        Value::from_i64(t.typarray),                  // typarray
+        Value::Null,                                  // typinput
+        Value::Null,                                  // typoutput
+        Value::Null,                                  // typreceive
+        Value::Null,                                  // typsend
+        Value::Null,                                  // typmodin
+        Value::Null,                                  // typmodout
+        Value::Null,                                  // typanalyze
+        Value::build_text(t.typalign),                // typalign
+        Value::build_text(t.typstorage),              // typstorage
+        Value::from_i64(0),                           // typnotnull
+        Value::from_i64(0),                           // typbasetype
+        Value::from_i64(-1),                          // typtypmod
+        Value::from_i64(0),                           // typndims
+        Value::from_i64(0),                           // typcollation
+        Value::Null,                                  // typdefaultbin
+        Value::Null,                                  // typdefault
+        Value::Null,                                  // typacl
     ]
 }
 
@@ -3085,13 +2890,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_cast",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable {
-            create_sql: "CREATE TABLE pg_cast (
-                oid INTEGER, castsource INTEGER, casttarget INTEGER, castfunc INTEGER,
-                castcontext TEXT, castmethod TEXT, tableoid INTEGER HIDDEN
-            )"
-            .to_string(),
-        },
+        SnapshotCatalog::<PgCastTable>(PhantomData),
     );
     options = options.native_module(
         "pg_transform",
@@ -3109,16 +2908,12 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgLanguageTable>(PhantomData),
     );
+    options = options.native_module(
+        "pg_operator",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgOperatorTable>(PhantomData),
+    );
     for (name, create_sql) in [
-        (
-            "pg_operator",
-            "CREATE TABLE pg_operator (
-            oid INTEGER, oprname TEXT, oprnamespace INTEGER, oprowner INTEGER,
-            oprkind TEXT, oprcanmerge BOOLEAN, oprcanhash BOOLEAN, oprleft INTEGER,
-            oprright INTEGER, oprresult INTEGER, oprcom INTEGER, oprnegate INTEGER,
-            oprcode INTEGER, oprrest INTEGER, oprjoin INTEGER, tableoid INTEGER HIDDEN
-        )",
-        ),
         (
             "pg_opclass",
             "CREATE TABLE pg_opclass (
@@ -3277,6 +3072,76 @@ impl SnapshotRows for PgLanguageTable {
                     Value::from_i64(0),
                     Value::from_i64(0),
                     Value::Null,
+                ]
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct PgCastTable;
+
+impl SnapshotRows for PgCastTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_cast (
+        oid INTEGER, castsource INTEGER, casttarget INTEGER, castfunc INTEGER,
+        castcontext TEXT, castmethod TEXT, tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2605);
+    const ESTIMATED_COST: f64 = 1.0;
+    const ESTIMATED_ROWS: u32 = 50;
+
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        crate::casts::cast_rows()
+            .enumerate()
+            .map(|(index, (source, target, context, method))| {
+                vec![
+                    Value::from_i64(crate::casts::FIRST_CAST_OID + index as i64),
+                    Value::from_i64(source.oid()),
+                    Value::from_i64(target.oid()),
+                    Value::from_i64(0),
+                    Value::build_text(context),
+                    Value::build_text(method),
+                ]
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct PgOperatorTable;
+
+impl SnapshotRows for PgOperatorTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_operator (
+        oid INTEGER, oprname TEXT, oprnamespace INTEGER, oprowner INTEGER,
+        oprkind TEXT, oprcanmerge BOOLEAN, oprcanhash BOOLEAN, oprleft INTEGER,
+        oprright INTEGER, oprresult INTEGER, oprcom INTEGER, oprnegate INTEGER,
+        oprcode INTEGER, oprrest INTEGER, oprjoin INTEGER, tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2617);
+    const ESTIMATED_COST: f64 = 1.0;
+    const ESTIMATED_ROWS: u32 = 400;
+
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        crate::operators::operators()
+            .iter()
+            .enumerate()
+            .map(|(index, operator)| {
+                vec![
+                    Value::from_i64(crate::operators::FIRST_OPERATOR_OID + index as i64),
+                    Value::build_text(operator.name),
+                    Value::from_i64(11),
+                    Value::from_i64(10),
+                    Value::build_text(if operator.left.is_some() { "b" } else { "l" }),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(operator.left.map_or(0, crate::operators::arg_oid)),
+                    Value::from_i64(crate::operators::arg_oid(operator.right)),
+                    Value::from_i64(crate::operators::arg_oid(operator.result)),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
                 ]
             })
             .collect()
@@ -4589,7 +4454,7 @@ fn check_condition_text(condition: &ast::Expr, table: &BTreeTable) -> String {
 }
 
 fn render_expr(expr: &ast::Expr) -> String {
-    let mut expr = expr.clone();
+    let mut expr = crate::deparse::without_literal_types(expr);
     walk_expr_mut(&mut expr, &mut |expr| {
         // The translator compiles PostgreSQL's binary collations to BINARY.
         if let ast::Expr::Collate(_, collation) = expr {
@@ -4786,13 +4651,19 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                                 .expect("index columns have names")
                         },
                         position: column.pos_in_table,
-                        expression: column.expr.as_ref().map(ToString::to_string),
+                        expression: column
+                            .expr
+                            .as_ref()
+                            .map(|expr| crate::deparse::without_literal_types(expr).to_string()),
                         order: column.order,
                     })
                     .collect(),
                 unique: index.unique,
                 primary,
-                where_clause: index.where_clause.as_ref().map(ToString::to_string),
+                where_clause: index
+                    .where_clause
+                    .as_ref()
+                    .map(|expr| crate::deparse::without_literal_types(expr).to_string()),
             });
         }
     }

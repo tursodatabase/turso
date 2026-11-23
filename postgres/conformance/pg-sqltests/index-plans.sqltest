@@ -1,0 +1,157 @@
+# Which comparisons of an indexed column with a literal seek the index.
+
+@skip-file-if postgres "EXPLAIN shows the Turso query plan"
+
+@database :memory:
+
+setup indexed_types {
+    CREATE TABLE x (id uuid, ts timestamptz, d double precision, f real, bt bytea, i int, b bigint, s smallint, t text);
+    CREATE INDEX x_id ON x (id);
+    CREATE INDEX x_ts ON x (ts);
+    CREATE INDEX x_d ON x (d);
+    CREATE INDEX x_f ON x (f);
+    CREATE INDEX x_bt ON x (bt);
+    CREATE INDEX x_i ON x (i);
+    CREATE INDEX x_b ON x (b);
+    CREATE INDEX x_s ON x (s);
+    CREATE INDEX x_t ON x (t);
+    CREATE TABLE xn (n numeric, n2 numeric(10,2));
+    CREATE INDEX xn_n ON xn (n);
+    CREATE INDEX xn_n2 ON xn (n2);
+}
+
+@setup indexed_types
+test uuid-equal-to-a-literal-uses-the-index {
+    EXPLAIN SELECT * FROM x WHERE id = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+}
+expect {
+    1|0|0|SEARCH x USING INDEX x_id (id=?)
+}
+
+@setup indexed_types
+test timestamptz-range-of-literals-uses-the-index {
+    EXPLAIN SELECT * FROM x WHERE ts >= '2023-01-01' AND ts < '2025-01-01';
+}
+expect {
+    1|0|0|SEARCH x USING INDEX x_ts (ts>=? AND ts<?)
+}
+
+@setup indexed_types
+test timestamptz-between-literals-uses-the-index {
+    EXPLAIN SELECT * FROM x WHERE ts BETWEEN '2023-01-01' AND '2025-01-01';
+}
+expect {
+    1|0|0|SEARCH x USING INDEX x_ts (ts>=? AND ts<=?)
+}
+
+@setup indexed_types
+test float8-equal-to-a-decimal-uses-the-index {
+    EXPLAIN SELECT * FROM x WHERE d = 0.125;
+}
+expect {
+    1|0|0|SEARCH x USING INDEX x_d (d=?)
+}
+
+@setup indexed_types
+test float8-range-of-decimals-uses-the-index {
+    EXPLAIN SELECT * FROM x WHERE d > 0.1 AND d < 0.2;
+}
+expect {
+    1|0|0|SEARCH x USING INDEX x_d (d>? AND d<?)
+}
+
+@setup indexed_types
+test float4-equal-to-a-decimal-uses-the-index {
+    EXPLAIN SELECT * FROM x WHERE f = 0.25;
+}
+expect {
+    1|0|0|SEARCH x USING INDEX x_f (f=?)
+}
+
+@setup indexed_types
+test bytea-equal-to-a-literal-uses-the-index {
+    EXPLAIN SELECT * FROM x WHERE bt = 'abc';
+}
+expect {
+    1|0|0|SEARCH x USING INDEX x_bt (bt=?)
+}
+
+@setup indexed_types
+test int-equal-to-a-literal-uses-the-index {
+    EXPLAIN SELECT * FROM x WHERE i = '5';
+}
+expect {
+    1|0|0|SEARCH x USING INDEX x_i (i=?)
+}
+
+@setup indexed_types
+test int-range-uses-the-index {
+    EXPLAIN SELECT * FROM x WHERE i > 5;
+}
+expect {
+    1|0|0|SEARCH x USING INDEX x_i (i>?)
+}
+
+@setup indexed_types
+test bigint-between-uses-the-index {
+    EXPLAIN SELECT * FROM x WHERE b BETWEEN 1 AND 3;
+}
+expect {
+    1|0|0|SEARCH x USING INDEX x_b (b>=? AND b<=?)
+}
+
+@setup indexed_types
+test smallint-range-uses-the-index {
+    EXPLAIN SELECT * FROM x WHERE s >= 1;
+}
+expect {
+    1|0|0|SEARCH x USING INDEX x_s (s>=?)
+}
+
+@setup indexed_types
+test text-equal-to-a-literal-uses-the-index {
+    EXPLAIN SELECT * FROM x WHERE t = 'a';
+}
+expect {
+    1|0|0|SEARCH x USING INDEX x_t (t=?)
+}
+
+@setup indexed_types
+test update-by-uuid-literal-uses-the-index {
+    EXPLAIN UPDATE x SET i = 1 WHERE id = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+}
+expect {
+    4|0|0|SEARCH x USING COVERING INDEX x_id (id=?)
+}
+
+@setup indexed_types
+test numeric-equal-to-a-string-literal-uses-the-index {
+    EXPLAIN SELECT * FROM xn WHERE n = '1.5';
+}
+expect {
+    1|0|0|SEARCH xn USING INDEX xn_n (n=?)
+}
+
+@setup indexed_types
+test numeric-equal-to-a-decimal-uses-the-index {
+    EXPLAIN SELECT * FROM xn WHERE n = 1.5;
+}
+expect {
+    1|0|0|SEARCH xn USING INDEX xn_n (n=?)
+}
+
+@setup indexed_types
+test numeric-range-uses-the-index {
+    EXPLAIN SELECT * FROM xn WHERE n > 1.5;
+}
+expect {
+    1|0|0|SEARCH xn USING INDEX xn_n (n>?)
+}
+
+@setup indexed_types
+test numeric-with-a-scale-range-uses-the-index {
+    EXPLAIN SELECT * FROM xn WHERE n2 > 1.5;
+}
+expect {
+    1|0|0|SEARCH xn USING INDEX xn_n2 (n2>?)
+}

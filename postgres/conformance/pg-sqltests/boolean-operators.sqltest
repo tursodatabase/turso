@@ -1,0 +1,90 @@
+# PostgreSQL has no arithmetic or bitwise operator on a boolean.
+# The answers come from PostgreSQL 18.
+
+@database :memory:
+
+test boolean-operator-plus-integer {
+    SELECT (1 = 1) + 1;
+}
+@sqlstate 42883
+expect error {
+}
+
+test boolean-operator-negate {
+    SELECT -(1 = 1);
+}
+@sqlstate 42883
+expect error {
+}
+
+test boolean-operator-bitwise-and {
+    SELECT (1 = 1) & 1;
+}
+@sqlstate 42883
+expect error {
+}
+
+test boolean-operator-bitwise-not {
+    SELECT ~(1 = 1);
+}
+@sqlstate 42883
+expect error {
+}
+
+test boolean-operator-times {
+    SELECT (2 > 1) * 5;
+}
+@sqlstate 42883
+expect error {
+}
+
+test boolean-operator-shift {
+    SELECT (1 = 1) << 2;
+}
+@sqlstate 42883
+expect error {
+}
+
+test boolean-operator-column-comparison {
+    CREATE TABLE t (a int, b int);
+    INSERT INTO t VALUES (1, 1);
+    SELECT (a = b) + 1 FROM t;
+}
+@sqlstate 42883
+expect error {
+}
+
+test boolean-operator-in-list {
+    SELECT (1 IN (1, 2)) + 1;
+}
+@sqlstate 42883
+expect error {
+}
+
+test boolean-operator-between {
+    SELECT (1 BETWEEN 0 AND 2) - 1;
+}
+@sqlstate 42883
+expect error {
+}
+
+test boolean-operator-cast-to-integer-first {
+    SELECT (1 = 1)::int4 + 1;
+}
+expect {
+    2
+}
+
+test boolean-operator-integer-arithmetic-still-works {
+    SELECT 1 + 1;
+}
+expect {
+    2
+}
+
+test boolean-operator-count-plus-integer {
+    SELECT count(*) + 1 FROM generate_series(1, 3);
+}
+expect {
+    4
+}

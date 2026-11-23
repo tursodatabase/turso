@@ -1,0 +1,21 @@
+# The result types of count and sum. The answers come from PostgreSQL 18.
+
+@database :memory:
+
+test aggregate-result-types {
+    CREATE TABLE t (a int2, b int4, c int8);
+    INSERT INTO t VALUES (1, 1, 1);
+    SELECT pg_typeof(count(*)), pg_typeof(sum(a)), pg_typeof(sum(b)), pg_typeof(min(b)), pg_typeof(max(c)) FROM t;
+}
+expect {
+    bigint|bigint|bigint|integer|bigint
+}
+
+test count-plus-a-large-int4-is-bigint {
+    CREATE TABLE t (a int4);
+    INSERT INTO t VALUES (1);
+    SELECT count(*) + 2147483647 FROM t;
+}
+expect {
+    2147483648
+}

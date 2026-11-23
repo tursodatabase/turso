@@ -1,0 +1,254 @@
+# int8 columns and expressions. The answers come from PostgreSQL 18.
+
+@database :memory:
+
+test int8-plus-int8-is-an-int8 {
+    SELECT 1::int8 + 1::int8, pg_typeof(1::int8 + 1::int8);
+}
+expect {
+    2|bigint
+}
+
+test int8-plus-int4-is-an-int8 {
+    SELECT 1::int8 + 1::int4, pg_typeof(1::int8 + 1::int4);
+}
+expect {
+    2|bigint
+}
+
+test int4-plus-int8-is-an-int8 {
+    SELECT 1::int4 + 1::int8, pg_typeof(1::int4 + 1::int8);
+}
+expect {
+    2|bigint
+}
+
+test int8-plus-a-literal-is-an-int8 {
+    SELECT 3000000000::int8 + 1, pg_typeof(3000000000::int8 + 1);
+}
+expect {
+    3000000001|bigint
+}
+
+test int4-plus-an-int8-value-does-not-overflow-as-an-int4 {
+    SELECT 2147483647::int4 + 1::int8;
+}
+expect {
+    2147483648
+}
+
+test int8-plus-overflows {
+    SELECT 9223372036854775807::int8 + 1::int4;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int8-minus-overflows {
+    SELECT (-9223372036854775807)::int8 - 2::int8;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int8-times-overflows {
+    SELECT 9223372036854775807::int8 * 2::int8;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int8-column-plus-column-overflows {
+    CREATE TABLE t (a int8, b int8);
+    INSERT INTO t VALUES (9223372036854775807, 1);
+    SELECT a + b FROM t;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int8-update-by-arithmetic-overflows {
+    CREATE TABLE t (n int8);
+    INSERT INTO t VALUES (9223372036854775807);
+    UPDATE t SET n = n + 1;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int8-negation-overflows {
+    SELECT -((-9223372036854775807 - 1)::int8);
+}
+@sqlstate 22003
+expect error {
+}
+
+test int8-smallest-divided-by-minus-one-overflows {
+    SELECT (-9223372036854775807 - 1)::int8 / (-1)::int8;
+}
+@sqlstate 22003
+expect error {
+}
+
+test int8-division-by-zero {
+    SELECT 5::int8 / 0::int8;
+}
+@sqlstate 22012
+expect error {
+}
+
+test int8-division-and-remainder-truncate-toward-zero {
+    SELECT 7::int8 / 2::int8, (-7)::int8 / 2::int8, (-7)::int8 % 3::int8;
+}
+expect {
+    3|-3|-1
+}
+
+test int8-plus-float8-is-a-float8 {
+    SELECT 1::int8 + 0.5::float8, pg_typeof(1::int8 + 0.5::float8);
+}
+expect {
+    1.5|double precision
+}
+
+test int8-plus-numeric-is-a-numeric {
+    SELECT 1::int8 + 1.5::numeric;
+}
+expect {
+    2.5
+}
+
+test int8-sum-of-int4-keeps-working {
+    CREATE TABLE t (n int4);
+    INSERT INTO t VALUES (1), (2);
+    SELECT sum(n) FROM t;
+}
+expect {
+    3
+}
+
+test int8-key-accepts-the-largest-value {
+    CREATE TABLE t (id int8 PRIMARY KEY, v int);
+    INSERT INTO t VALUES (9223372036854775807, 1);
+    SELECT id, v FROM t;
+}
+expect {
+    9223372036854775807|1
+}
+
+test int8-key-keeps-its-rows {
+    CREATE TABLE t (id int8 PRIMARY KEY, v int);
+    INSERT INTO t VALUES (3, 30), (1, 10), (2, 20);
+    UPDATE t SET id = id + 10 WHERE id = 2;
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|10
+    3|30
+    12|20
+}
+
+test int8-key-update-by-arithmetic-overflows {
+    CREATE TABLE t (id int8 PRIMARY KEY);
+    INSERT INTO t VALUES (9223372036854775807);
+    UPDATE t SET id = id + 1;
+}
+@sqlstate 22003
+expect error {
+}
+
+test bigserial-key-takes-its-values-from-the-sequence {
+    CREATE TABLE t (id bigserial PRIMARY KEY, v int);
+    INSERT INTO t (v) VALUES (10), (20);
+    SELECT id, v, pg_typeof(id) FROM t ORDER BY id;
+}
+expect {
+    1|10|bigint
+    2|20|bigint
+}
+
+test int8-value-of-a-function-plus-one {
+    CREATE TABLE int8_fn (c int8); INSERT INTO int8_fn VALUES (5000000000); SELECT abs(c) + 1, coalesce(c, 0) + 1, greatest(c, 1) + 1 FROM int8_fn;
+}
+expect {
+    5000000001|5000000001|5000000001
+}
+
+test int8-sum-plus-one {
+    CREATE TABLE int8_sum (c int8); INSERT INTO int8_sum VALUES (5000000000); SELECT sum(c) + 1 FROM int8_sum;
+}
+expect {
+    5000000001
+}
+
+test int8-value-of-a-case-plus-one {
+    CREATE TABLE int8_case (c int8); INSERT INTO int8_case VALUES (5000000000); SELECT CASE WHEN c < 0 THEN 0 ELSE c END + 1 FROM int8_case;
+}
+expect {
+    5000000001
+}
+
+test int8-bit-operator-result-plus-one {
+    CREATE TABLE int8_bit (c int8); INSERT INTO int8_bit VALUES (5000000000); SELECT (c | 0) + 1 FROM int8_bit;
+}
+expect {
+    5000000001
+}
+
+test generate-series-of-int8-plus-one {
+    SELECT g + 1 FROM generate_series(5000000000, 5000000001) g;
+}
+expect {
+    5000000001
+    5000000002
+}
+
+test abs-of-an-int4-is-an-int4 {
+    SELECT pg_typeof(abs(1::int4)), pg_typeof(abs(1::int8)), pg_typeof(abs(1::int2));
+}
+expect {
+    integer|bigint|smallint
+}
+
+test int4-plus-abs-of-int8-is-an-int8 {
+    SELECT 2147483647::int4 + abs(1::int8), pg_typeof(2147483647::int4 + abs(1::int8));
+}
+expect {
+    2147483648|bigint
+}
+
+test coalesce-of-int4-and-int8-is-an-int8 {
+    SELECT coalesce(2147483647, 2::int8) + 1, pg_typeof(coalesce(1::int2, 2::int8));
+}
+expect {
+    2147483648|bigint
+}
+
+test case-of-int2-and-int4-is-an-int4 {
+    SELECT pg_typeof(CASE WHEN true THEN 1::int2 ELSE 2::int4 END);
+}
+expect {
+    integer
+}
+
+test greatest-of-int2-and-int8-is-an-int8 {
+    SELECT greatest(1::int2, 2::int8) + 9223372036854775800;
+}
+expect {
+    9223372036854775802
+}
+
+test values-of-int4-and-int8-are-int8 {
+    SELECT x + 2147483647 FROM (VALUES (1), (5000000000)) v(x);
+}
+expect {
+    2147483648
+    7147483647
+}
+
+test modulo-of-mixed-integer-types {
+    SELECT 5::int2 % 3::int4, 5::int8 % 3::int4, pg_typeof(5::int2 % 3::int8);
+}
+expect {
+    2|2|bigint
+}

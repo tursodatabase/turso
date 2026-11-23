@@ -4680,6 +4680,31 @@ expect error {
     stored generated columns cannot use custom types
 }
 
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_with_coerce_only_type_checks_the_value {
+    CREATE TYPE byte BASE integer COERCE CASE WHEN value BETWEEN 0 AND 255 THEN value ELSE RAISE(ABORT, 'out of range') END;
+    CREATE TABLE t1(a INTEGER, s byte AS (a) STORED) STRICT;
+    INSERT INTO t1(a) VALUES (255);
+    INSERT INTO t1(a) VALUES (256);
+}
+expect error {
+    out of range
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_with_coerce_only_type_is_stored {
+    CREATE TYPE byte BASE integer COERCE CASE WHEN value BETWEEN 0 AND 255 THEN value ELSE RAISE(ABORT, 'out of range') END;
+    CREATE TABLE t1(a INTEGER, s byte AS (a) STORED) STRICT;
+    INSERT INTO t1(a) VALUES (255);
+    UPDATE t1 SET a = 7;
+    SELECT s FROM t1;
+}
+expect {
+    7
+}
+
 @skip-if sqlite "SQLite doesn't support array types"
 @requires custom_types "uses array types"
 test gencol_stored_with_array_type_rejected {

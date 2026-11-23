@@ -15,7 +15,7 @@ use crate::info;
 use crate::json;
 use crate::namespace::{mangle_name, NamespaceId};
 use crate::numeric::decimal::{
-    bigdecimal_to_blob, blob_to_bigdecimal, check_numeric_limits, format_numeric,
+    bigdecimal_to_blob, blob_to_bigdecimal, check_numeric_limits, format_numeric, numeric_divide,
     numeric_from_value, validate_precision_scale, MAX_FRACTION_DIGITS,
 };
 use crate::numeric::Numeric;
@@ -1200,10 +1200,10 @@ pub fn call_builtin_scalar(
                         ),
                         ScalarFunc::NumericDiv | ScalarFunc::NumericMod => {
                             if b.is_zero() {
-                                return Err(LimboError::Constraint("division by zero".to_string()));
+                                return Err(LimboError::DivisionByZero);
                             }
                             if matches!(func, ScalarFunc::NumericDiv) {
-                                a / b
+                                numeric_divide(&a, &b)
                             } else {
                                 (a % b).with_scale(a_scale.max(b_scale))
                             }

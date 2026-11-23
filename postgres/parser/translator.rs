@@ -2692,7 +2692,7 @@ impl PostgreSQLTranslator {
         Self::reject_constant_that_is_not_a_position(distinct_clause, "DISTINCT ON")?;
         let exprs = distinct_clause
             .iter()
-            .map(|node| self.translate_expr(node).map(Box::new))
+            .map(|node| self.translate_position_expr(node).map(Box::new))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Some(ast::SelectDistinctness::DistinctOn(exprs)))
     }
@@ -3580,13 +3580,14 @@ impl PostgreSQLTranslator {
                     .type_name
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("TypeCast missing type name".into()))?;
-                if !pg_type_name.typmods.is_empty() {
-                    return Err(ParseError::not_supported("a type modifier in a cast"));
-                }
                 if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
                     expr = Box::new(int8_cast_operand(arg, *expr));
                 }
-                let type_name = pg_type_name_to_ast_type(pg_type_name)?;
+                let type_name = if pg_type_name.typmods.is_empty() {
+                    cast_target_type(pg_type_name)?
+                } else {
+                    cast_target_type_with_modifier(pg_type_name)?
+                };
                 Ok(ast::Expr::Cast {
                     expr,
                     type_name: Some(type_name),
@@ -3655,22 +3656,22 @@ impl PostgreSQLTranslator {
                     Ok(BoolTestType::IsTrue) => Ok(ast::Expr::Binary(
                         Box::new(expr),
                         ast::Operator::Is,
-                        Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".into()))),
+                        Box::new(ast::Expr::Literal(ast::Literal::True)),
                     )),
                     Ok(BoolTestType::IsNotTrue) => Ok(ast::Expr::Binary(
                         Box::new(expr),
                         ast::Operator::IsNot,
-                        Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".into()))),
+                        Box::new(ast::Expr::Literal(ast::Literal::True)),
                     )),
                     Ok(BoolTestType::IsFalse) => Ok(ast::Expr::Binary(
                         Box::new(expr),
                         ast::Operator::Is,
-                        Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".into()))),
+                        Box::new(ast::Expr::Literal(ast::Literal::False)),
                     )),
                     Ok(BoolTestType::IsNotFalse) => Ok(ast::Expr::Binary(
                         Box::new(expr),
                         ast::Operator::IsNot,
-                        Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".into()))),
+                        Box::new(ast::Expr::Literal(ast::Literal::False)),
                     )),
                     Ok(BoolTestType::IsUnknown) => Ok(ast::Expr::IsNull(Box::new(expr))),
                     Ok(BoolTestType::IsNotUnknown) => Ok(ast::Expr::NotNull(Box::new(expr))),
@@ -3929,6 +3930,22 @@ impl PostgreSQLTranslator {
         }
     }
 
+    fn translate_position_expr(
+        &self,
+        node: &pg_query::protobuf::Node,
+    ) -> Result<ast::Expr, ParseError> {
+        if let Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
+            val: Some(pg_query::protobuf::a_const::Val::Ival(i)),
+            ..
+        })) = &node.node
+        {
+            return Ok(ast::Expr::Literal(ast::Literal::Numeric(
+                i.ival.to_string(),
+            )));
+        }
+        self.translate_expr(node)
+    }
+
     fn translate_const(
         &self,
         a_const: &pg_query::protobuf::AConst,
@@ -3938,8 +3955,9 @@ impl PostgreSQLTranslator {
         }
         if let Some(val) = &a_const.val {
             match val {
-                pg_query::protobuf::a_const::Val::Ival(i) => Ok(ast::Expr::Literal(
+                pg_query::protobuf::a_const::Val::Ival(i) => Ok(typed_integer_literal(
                     ast::Literal::Numeric(i.ival.to_string()),
+                    "int4",
                 )),
                 pg_query::protobuf::a_const::Val::Sval(s) => {
                     // Turso's AST expects string literals to include surrounding single quotes
@@ -3950,7 +3968,9 @@ impl PostgreSQLTranslator {
                 pg_query::protobuf::a_const::Val::Fval(f) => {
                     let text =
                         non_decimal_literal_as_decimal(&f.fval).unwrap_or_else(|| f.fval.clone());
-                    Ok(ast::Expr::Literal(ast::Literal::Numeric(text)))
+                    Ok(integer_literal_beyond_int4(&text).unwrap_or_else(|| {
+                        typed_integer_literal(ast::Literal::String(format!("'{text}'")), "numeric")
+                    }))
                 }
                 pg_query::protobuf::a_const::Val::Boolval(b) => Ok(ast::Expr::Cast {
                     expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
@@ -4606,13 +4626,15 @@ impl PostgreSQLTranslator {
             _ => func_name,
         };
 
-        // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
+        // PG type-cast functions: float8(x) → CAST(x AS float8), int4(x) → CAST(x AS int4), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
-            "FLOAT8" | "FLOAT4" => Some("REAL"),
-            "INT4" | "INT2" => Some("INTEGER"),
-            "INT8" => Some("BIGINT"),
-            "BOOL" => Some("BOOLEAN"),
-            "TEXT" => Some("TEXT"),
+            "FLOAT8" => Some("float8"),
+            "FLOAT4" => Some("float4"),
+            "INT4" => Some("int4"),
+            "INT2" => Some("int2"),
+            "INT8" => Some("int8"),
+            "BOOL" => Some("bool"),
+            "TEXT" => Some("text"),
             _ => None,
         };
         if let Some(type_name) = cast_type {
@@ -4921,7 +4943,7 @@ impl PostgreSQLTranslator {
 
         let exprs: Vec<Box<ast::Expr>> = group_clause
             .iter()
-            .map(|node| Ok(Box::new(self.translate_expr(node)?)))
+            .map(|node| Ok(Box::new(self.translate_position_expr(node)?)))
             .collect::<Result<Vec<_>, ParseError>>()?;
 
         let having = if let Some(having_node) = having_clause {
@@ -5235,7 +5257,7 @@ impl PostgreSQLTranslator {
         clause: &str,
         when_null: &str,
     ) -> Result<Option<Box<ast::Expr>>, ParseError> {
-        let value = self.translate_expr(node)?;
+        let value = self.translate_position_expr(node)?;
         match &value {
             ast::Expr::Literal(ast::Literal::Null) => return Ok(None),
             ast::Expr::Literal(ast::Literal::Numeric(n))
@@ -5556,7 +5578,7 @@ impl PostgreSQLTranslator {
             match &node.node {
                 Some(pg_query::protobuf::node::Node::SortBy(sort_by)) => {
                     let expr = if let Some(ref sort_node) = sort_by.node {
-                        Box::new(self.translate_expr(sort_node)?)
+                        Box::new(self.translate_position_expr(sort_node)?)
                     } else {
                         return Err(ParseError::ParseError(
                             "Missing sort expression".to_string(),
@@ -7062,14 +7084,16 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
             return match params {
                 [p, s] => Some(PgTypeMapping::with_params("numeric", vec![*p, *s])),
                 [p] => Some(PgTypeMapping::with_params("numeric", vec![*p, 0])),
-                _ => Some(PgTypeMapping::scalar("REAL")),
+                _ => Some(PgTypeMapping::scalar("numeric")),
             };
         }
 
         // Base types (no Turso custom type needed)
-        "INTEGER" | "INT" | "INT4" | "SERIAL" | "SERIAL4" | "BIGSERIAL" | "SERIAL8"
-        | "SMALLSERIAL" | "SERIAL2" => "INTEGER".into(),
-        "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" => "REAL".into(),
+        "INTEGER" | "INT" | "INT4" | "SERIAL" | "SERIAL4" => "int4".into(),
+        "BIGSERIAL" | "SERIAL8" => "bigint".into(),
+        "SMALLSERIAL" | "SERIAL2" => "smallint".into(),
+        "REAL" | "FLOAT4" => "float4".into(),
+        "DOUBLE PRECISION" | "FLOAT8" => "REAL".into(),
         "TEXT" | "BPCHAR" | "NAME" => "TEXT".into(),
         "BLOB" => "BLOB".into(),
 
@@ -7612,6 +7636,39 @@ fn numeric_literal_exceeds_int8(literal: &str) -> bool {
     magnitude > limit
 }
 
+fn typed_integer_literal(literal: ast::Literal, type_name: &str) -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(ast::Expr::Literal(literal)),
+        type_name: Some(ast::Type {
+            name: type_name.to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    }
+}
+
+fn integer_literal_beyond_int4(text: &str) -> Option<ast::Expr> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if let Ok(value) = text.parse::<i64>() {
+        let type_name = if i32::try_from(value).is_ok() {
+            "int4"
+        } else {
+            "bigint"
+        };
+        return Some(typed_integer_literal(
+            ast::Literal::Numeric(text.to_string()),
+            type_name,
+        ));
+    }
+    Some(typed_integer_literal(
+        ast::Literal::String(format!("'{text}'")),
+        "numeric",
+    ))
+}
+
 /// Writes a hex (`0x`), octal (`0o`) or binary (`0b`) integer literal in
 /// decimal digits. Turso's numeric literal parser reads only decimal and hex
 /// text, and reads hex the SQLite way, so a value above i64 wraps around.
@@ -7654,6 +7711,111 @@ fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types. Other names are kept as
 /// written so that enums and domains resolve to their custom type.
+/// The type of a CAST, with the name of the PostgreSQL type for the types whose
+/// casts the dialect plans.
+fn cast_target_type(type_name: &pg_query::protobuf::TypeName) -> Result<ast::Type, ParseError> {
+    let mut target = pg_type_name_to_ast_type(type_name)?;
+    let is_array = target.array_dimensions > 0;
+    let name = match supported_type_name(type_name)?.to_uppercase().as_str() {
+        "INTEGER" | "INT" | "INT4" => Some("int4"),
+        "SMALLINT" | "INT2" => Some("int2"),
+        "BIGINT" | "INT8" => Some("int8"),
+        "REAL" | "FLOAT4" => Some("float4"),
+        "BOOLEAN" | "BOOL" => Some("bool"),
+        "TEXT" => Some("text"),
+        "UUID" => Some("uuid"),
+        "DOUBLE PRECISION" | "FLOAT8" if !is_array => Some("float8"),
+        "BYTEA" if !is_array => Some("bytea"),
+        "NUMERIC" | "DECIMAL" if !is_array && type_name.typmods.is_empty() => Some("numeric"),
+        _ => None,
+    };
+    if let Some(name) = name {
+        target.name = name.to_string();
+    }
+    Ok(target)
+}
+
+/// The target of a cast to `numeric(p, s)` or `varchar(n)`. A modifier on any
+/// other type is refused.
+fn cast_target_type_with_modifier(
+    type_name: &pg_query::protobuf::TypeName,
+) -> Result<ast::Type, ParseError> {
+    use pg_query::protobuf::a_const::Val;
+    use pg_query::protobuf::node::Node;
+
+    let invalid = |message: String| ParseError::Sqlstate {
+        sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
+        message,
+    };
+    let not_supported = || ParseError::not_supported("a type modifier in a cast");
+    if !type_name.array_bounds.is_empty() {
+        return Err(not_supported());
+    }
+    let mut modifiers = Vec::new();
+    for node in &type_name.typmods {
+        let value = match &node.node {
+            Some(Node::Integer(i)) => i64::from(i.ival),
+            Some(Node::AConst(a_const)) => match &a_const.val {
+                Some(Val::Ival(i)) => i64::from(i.ival),
+                _ => return Err(not_supported()),
+            },
+            _ => return Err(not_supported()),
+        };
+        modifiers.push(value);
+    }
+    let integer = |value: i64| {
+        let literal = ast::Expr::Literal(ast::Literal::Numeric(value.unsigned_abs().to_string()));
+        Box::new(if value < 0 {
+            ast::Expr::Unary(ast::UnaryOperator::Negative, Box::new(literal))
+        } else {
+            literal
+        })
+    };
+    match supported_type_name(type_name)?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "numeric" | "decimal" => {
+            let (precision, scale) = match modifiers[..] {
+                [precision] => (precision, 0),
+                [precision, scale] => (precision, scale),
+                _ => return Err(not_supported()),
+            };
+            if !(1..=1000).contains(&precision) {
+                return Err(invalid(format!(
+                    "NUMERIC precision {precision} must be between 1 and 1000"
+                )));
+            }
+            if !(-1000..=1000).contains(&scale) {
+                return Err(invalid(format!(
+                    "NUMERIC scale {scale} must be between -1000 and 1000"
+                )));
+            }
+            Ok(ast::Type {
+                name: "numeric".to_string(),
+                size: Some(ast::TypeSize::TypeSize(integer(precision), integer(scale))),
+                array_dimensions: 0,
+            })
+        }
+        "varchar" => {
+            let [length] = modifiers[..] else {
+                return Err(not_supported());
+            };
+            if length < 1 {
+                return Err(invalid(
+                    "length for type varchar must be at least 1".to_string(),
+                ));
+            }
+            Ok(ast::Type {
+                name: "varchar".to_string(),
+                size: Some(ast::TypeSize::MaxSize(integer(length))),
+                array_dimensions: 0,
+            })
+        }
+        _ => Err(not_supported()),
+    }
+}
+
 fn pg_type_name_to_ast_type(
     type_name: &pg_query::protobuf::TypeName,
 ) -> Result<ast::Type, ParseError> {
@@ -10546,11 +10708,11 @@ mod tests {
         for (sql, expected) in [
             (
                 "SELECT * FROM (SELECT 1, 2) AS s(p, q)",
-                "SELECT * FROM (WITH s (p, q) AS (SELECT 1, 2) SELECT * FROM s) s",
+                "SELECT * FROM (WITH s (p, q) AS (SELECT CAST (1 AS int4), CAST (2 AS int4)) SELECT * FROM s) s",
             ),
             (
                 "SELECT * FROM (VALUES (1, 2)) AS v(a)",
-                "SELECT * FROM (WITH v (a, column2) AS (VALUES (1, 2)) SELECT * FROM v) v",
+                "SELECT * FROM (WITH v (a, column2) AS (VALUES (CAST (1 AS int4), CAST (2 AS int4))) SELECT * FROM v) v",
             ),
             (
                 "SELECT * FROM (SELECT * FROM v) AS v(a)",
@@ -10558,15 +10720,15 @@ mod tests {
             ),
             (
                 "SELECT g.n FROM generate_series(1, 3) AS g(n)",
-                "SELECT g.n FROM LATERAL (SELECT value n FROM main.generate_series (1, 3)) g",
+                "SELECT g.n FROM LATERAL (SELECT value n FROM main.generate_series (CAST (1 AS int4), CAST (3 AS int4))) g",
             ),
             (
                 "SELECT g FROM generate_series(1, 3) g",
-                "SELECT g FROM LATERAL (SELECT value g FROM main.generate_series (1, 3)) g",
+                "SELECT g FROM LATERAL (SELECT value g FROM main.generate_series (CAST (1 AS int4), CAST (3 AS int4))) g",
             ),
             (
                 "SELECT * FROM generate_series(1, 3)",
-                "SELECT * FROM LATERAL (SELECT value generate_series FROM main.generate_series (1, 3)) generate_series",
+                "SELECT * FROM LATERAL (SELECT value generate_series FROM main.generate_series (CAST (1 AS int4), CAST (3 AS int4))) generate_series",
             ),
         ] {
             assert_eq!(translate(sql).unwrap(), expected, "{sql}");
@@ -10592,9 +10754,11 @@ mod tests {
                 .translate(&crate::parse(sql).unwrap())
                 .map(|stmt| stmt.to_string())
         };
+        const ROW_EQUALS_ROW: &str =
+            "SELECT (CAST (1 AS int4), CAST (2 AS int4)) = (CAST (1 AS int4), CAST (2 AS int4))";
         for (sql, expected) in [
-            ("SELECT (1, 2) = (1, 2)", "SELECT (1, 2) = (1, 2)"),
-            ("SELECT ROW(1, 2) = ROW(1, 2)", "SELECT (1, 2) = (1, 2)"),
+            ("SELECT (1, 2) = (1, 2)", ROW_EQUALS_ROW),
+            ("SELECT ROW(1, 2) = ROW(1, 2)", ROW_EQUALS_ROW),
         ] {
             assert_eq!(translate(sql).unwrap(), expected, "{sql}");
         }
@@ -10625,9 +10789,10 @@ mod tests {
         let a = PgTypeMapping::array;
 
         // Base types (no Turso custom type)
-        assert_eq!(map_pg_type("INTEGER", no_params), Some(s("INTEGER")));
-        assert_eq!(map_pg_type("SERIAL", no_params), Some(s("INTEGER")));
-        assert_eq!(map_pg_type("REAL", no_params), Some(s("REAL")));
+        assert_eq!(map_pg_type("INTEGER", no_params), Some(s("int4")));
+        assert_eq!(map_pg_type("SERIAL", no_params), Some(s("int4")));
+        assert_eq!(map_pg_type("REAL", no_params), Some(s("float4")));
+        assert_eq!(map_pg_type("FLOAT4", no_params), Some(s("float4")));
         assert_eq!(map_pg_type("TEXT", no_params), Some(s("TEXT")));
         assert_eq!(map_pg_type("BLOB", no_params), Some(s("BLOB")));
 
@@ -10662,7 +10827,7 @@ mod tests {
             map_pg_type("NUMERIC", &[10]),
             Some(PgTypeMapping::with_params("numeric", vec![10, 0]))
         );
-        assert_eq!(map_pg_type("NUMERIC", no_params), Some(s("REAL")));
+        assert_eq!(map_pg_type("NUMERIC", no_params), Some(s("numeric")));
 
         // Network types → custom types
         assert_eq!(map_pg_type("CIDR", no_params), Some(s("cidr")));
@@ -10670,14 +10835,14 @@ mod tests {
         assert_eq!(map_pg_type("MACADDR8", no_params), Some(s("macaddr8")));
 
         // Array types → base type + dimensions
-        assert_eq!(map_pg_type("INTEGER[]", no_params), Some(a("INTEGER", 1)));
+        assert_eq!(map_pg_type("INTEGER[]", no_params), Some(a("int4", 1)));
         assert_eq!(map_pg_type("TEXT[]", no_params), Some(a("TEXT", 1)));
         assert_eq!(map_pg_type("TEXT[][]", no_params), Some(a("TEXT", 2)));
         assert_eq!(map_pg_type("BOOLEAN[]", no_params), Some(a("boolean", 1)));
         assert_eq!(map_pg_type("BIGINT[]", no_params), Some(a("bigint", 1)));
         assert_eq!(map_pg_type("VARCHAR[]", no_params), Some(a("TEXT", 1)));
         // PG internal array notation
-        assert_eq!(map_pg_type("_int4", no_params), Some(a("INTEGER", 1)));
+        assert_eq!(map_pg_type("_int4", no_params), Some(a("int4", 1)));
         assert_eq!(map_pg_type("_text", no_params), Some(a("TEXT", 1)));
 
         // Unknown types pass through as-is (for user-defined enums etc.)
@@ -11005,8 +11170,8 @@ mod tests {
 
                         // Right side should be literal 1
                         assert!(
-                            matches!(**right, ast::Expr::Literal(_)),
-                            "Expected Literal expression for right side"
+                            matches!(**right, ast::Expr::Cast { .. }),
+                            "Expected a typed integer literal for right side"
                         );
                         if let ast::Expr::Literal(literal) = &**right {
                             assert!(
@@ -11091,22 +11256,14 @@ mod tests {
 
                 // Check integer literal
                 if let ast::ResultColumn::Expr(expr, _) = &columns[1] {
-                    if let ast::Expr::Literal(ast::Literal::Numeric(n)) = &**expr {
-                        assert_eq!(n, "42");
-                    } else {
-                        panic!("Expected numeric literal");
-                    }
+                    assert_eq!(expr.to_string(), "CAST (42 AS int4)");
                 } else {
                     panic!("Expected expression result column");
                 }
 
                 // Check float literal
                 if let ast::ResultColumn::Expr(expr, _) = &columns[2] {
-                    if let ast::Expr::Literal(ast::Literal::Numeric(n)) = &**expr {
-                        assert_eq!(n, "3.14");
-                    } else {
-                        panic!("Expected numeric literal");
-                    }
+                    assert_eq!(expr.to_string(), "CAST ('3.14' AS numeric)");
                 } else {
                     panic!("Expected expression result column");
                 }
@@ -11793,7 +11950,7 @@ mod tests {
             ),
             (
                 "SELECT * FROM t1, (SELECT 1) s",
-                "SELECT * FROM t1, (SELECT 1) s",
+                "SELECT * FROM t1, (SELECT CAST (1 AS int4)) s",
             ),
         ] {
             let parsed = crate::parse(sql).unwrap();
@@ -13602,7 +13759,7 @@ mod tests {
             .expect("translation must succeed");
         let output = result.cmd.to_string();
         assert!(
-            output.contains("AS (a * 2) STORED"),
+            output.contains("AS (a * CAST (2 AS int4)) STORED"),
             "STORED generated column must keep its expression: {output}"
         );
     }
@@ -14068,7 +14225,7 @@ mod tests {
     fn fail_closed_insert_defaults() {
         assert_eq!(
             translate_to_sql("INSERT INTO t VALUES (DEFAULT, 5)"),
-            "INSERT INTO t VALUES (DEFAULT, 5)"
+            "INSERT INTO t VALUES (DEFAULT, CAST (5 AS int4))"
         );
         assert_eq!(
             translate_to_sql("INSERT INTO t DEFAULT VALUES"),
@@ -14151,19 +14308,19 @@ mod tests {
     fn right_nested_set_operations_become_subquery_members() {
         assert_eq!(
             translate_to_sql("SELECT 1 UNION SELECT 2 INTERSECT SELECT 3"),
-            "SELECT 1 UNION SELECT * FROM (SELECT 2 INTERSECT SELECT 3)"
+            "SELECT CAST (1 AS int4) UNION SELECT * FROM (SELECT CAST (2 AS int4) INTERSECT SELECT CAST (3 AS int4))"
         );
         assert_eq!(
             translate_to_sql("SELECT 1 EXCEPT (SELECT 1 UNION SELECT 2)"),
-            "SELECT 1 EXCEPT SELECT * FROM (SELECT 1 UNION SELECT 2)"
+            "SELECT CAST (1 AS int4) EXCEPT SELECT * FROM (SELECT CAST (1 AS int4) UNION SELECT CAST (2 AS int4))"
         );
         assert_eq!(
             translate_to_sql("SELECT 1 UNION SELECT 2 UNION ALL SELECT 3 EXCEPT SELECT 4"),
-            "SELECT 1 UNION SELECT 2 UNION ALL SELECT 3 EXCEPT SELECT 4"
+            "SELECT CAST (1 AS int4) UNION SELECT CAST (2 AS int4) UNION ALL SELECT CAST (3 AS int4) EXCEPT SELECT CAST (4 AS int4)"
         );
         assert_eq!(
             translate_to_sql("(SELECT 1 UNION SELECT 2) INTERSECT SELECT 3"),
-            "SELECT 1 UNION SELECT 2 INTERSECT SELECT 3"
+            "SELECT CAST (1 AS int4) UNION SELECT CAST (2 AS int4) INTERSECT SELECT CAST (3 AS int4)"
         );
         assert_not_supported(
             "SELECT 1 UNION (SELECT 1 EXCEPT ALL SELECT 1)",
@@ -14189,11 +14346,11 @@ mod tests {
         );
         assert_eq!(
             translate_to_sql("((SELECT 1 UNION SELECT 2) LIMIT 1) UNION SELECT 3"),
-            "SELECT * FROM (SELECT 1 UNION SELECT 2 LIMIT 1) UNION SELECT 3"
+            "SELECT * FROM (SELECT CAST (1 AS int4) UNION SELECT CAST (2 AS int4) LIMIT 1) UNION SELECT CAST (3 AS int4)"
         );
         assert_eq!(
             translate_to_sql("(WITH c AS (SELECT 1 AS x) SELECT x FROM c) UNION SELECT 2"),
-            "SELECT * FROM (WITH c AS (SELECT 1 x) SELECT x FROM c) UNION SELECT 2"
+            "SELECT * FROM (WITH c AS (SELECT CAST (1 AS int4) x) SELECT x FROM c) UNION SELECT CAST (2 AS int4)"
         );
         assert_eq!(
             translate_to_sql("SELECT a FROM t UNION SELECT a FROM u ORDER BY 1 LIMIT 2"),
@@ -14242,7 +14399,7 @@ mod tests {
         let stmt = PostgreSQLTranslator::new().translate(&parsed).unwrap();
         assert_eq!(
             stmt.to_string(),
-            "SELECT DISTINCT ON (a, b + 1) a, b FROM t"
+            "SELECT DISTINCT ON (a, b + CAST (1 AS int4)) a, b FROM t"
         );
         assert_translates("SELECT DISTINCT ON (a) a FROM t UNION SELECT 1");
         assert_not_supported(
@@ -14471,11 +14628,9 @@ mod tests {
 
     #[test]
     fn fail_closed_cast_type_modifiers() {
-        assert_not_supported("SELECT '1.239'::numeric(5, 2)", "a type modifier in a cast");
-        assert_not_supported(
-            "SELECT CAST('abcdef' AS varchar(3))",
-            "a type modifier in a cast",
-        );
+        assert_translates("SELECT '1.239'::numeric(5, 2), CAST('abcdef' AS varchar(3))");
+        assert_not_supported("SELECT 'abc'::char(2)", "a type modifier in a cast");
+        assert_not_supported("SELECT '1'::numeric(5,2)[]", "a type modifier in a cast");
         assert_not_supported("SELECT now()::timestamp(0)", "a type modifier in a cast");
         assert_translates("SELECT '1.5'::numeric, 'a'::varchar, 1::int[]");
     }

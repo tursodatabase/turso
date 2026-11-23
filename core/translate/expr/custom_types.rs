@@ -714,6 +714,30 @@ pub(crate) fn emit_store_value(
     Ok(())
 }
 
+/// Runs the COERCE of the type of the rowid alias column `column` on the rowid
+/// in `reg`. The rowid is not stored through the column's register, so the
+/// column's own encode step never sees it.
+pub(crate) fn emit_coerce_rowid(
+    program: &mut ProgramBuilder,
+    column: &Column,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    if column.ty_str.is_empty() {
+        return Ok(());
+    }
+    let Some(resolved) = resolver.schema().resolve_type_unchecked(&column.ty_str)? else {
+        return Ok(());
+    };
+    emit_store_value(
+        program,
+        &resolved,
+        reg,
+        Coerce::WithArgs(&column.ty_params),
+        resolver,
+    )
+}
+
 /// Emits what comparing the value in `reg` with stored values of `chain`'s
 /// types runs: each type's ENCODE, then the affinity of `storage_class`, so
 /// the value has the kind the stored values have. COERCE does not run, and a

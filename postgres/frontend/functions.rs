@@ -54,6 +54,15 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     options
         .extension_function(
             pg_scalar_function(
+                "current_setting",
+                FunctionArity::OneOf(&[1, 2]),
+                false,
+                |context, args| exec_current_setting(context.connection, args),
+            )
+            .receiving_argument_types(),
+        )
+        .extension_function(
+            pg_scalar_function(
                 "array_to_json",
                 FunctionArity::OneOf(&[1, 2]),
                 true,
@@ -68,6 +77,12 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
                 true,
                 |_, args| exec_date_trunc(args),
             )
+            .receiving_argument_types(),
+        )
+        .extension_function(
+            pg_scalar_function("pg_typeof", FunctionArity::Exact(1), true, |_, args| {
+                Ok(exec_pg_typeof(&text_arg(args, 1)))
+            })
             .receiving_argument_types(),
         )
 }
@@ -239,6 +254,33 @@ fn truncate_timestamp(time: NaiveDateTime, unit: TruncUnit) -> Option<NaiveDateT
     Some(day.and_time(NaiveTime::MIN))
 }
 
+/// `pg_typeof(value)`: the name of the type of the argument, which the engine
+/// passes as one more argument.
+fn exec_pg_typeof(engine_type_name: &str) -> String {
+    match engine_type_name.strip_suffix("[]") {
+        Some(element) => format!("{}[]", exec_pg_typeof(element)),
+        None => pg_type_display_name(engine_type_name).to_string(),
+    }
+}
+
+/// The name PostgreSQL gives a type, from the name the engine gives it. The
+/// engine's `real` is SQLite's REAL, a double precision, where PostgreSQL's
+/// `real` is the float4 type.
+fn pg_type_display_name(engine_type_name: &str) -> &str {
+    match engine_type_name {
+        "real" => "double precision",
+        "float4" => "real",
+        "int4" => "integer",
+        "blob" => "bytea",
+        "varchar" => "character varying",
+        "time" => "time without time zone",
+        "timestamp" => "timestamp without time zone",
+        "timestamptz" => "timestamp with time zone",
+        "null" | "any" => "unknown",
+        other => other,
+    }
+}
+
 fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
     scalar_functions!(options, |context, connection, args| {
         "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(connection, args)?,
@@ -296,15 +338,132 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             "bigint out of range", None,
         ))?,
+        "int4pl"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Add, 32)?
+        },
+        "int4mi"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Subtract, 32)?
+        },
+        "int4mul"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Multiply, 32)?
+        },
+        "int4div"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Divide, 32)?
+        },
+        "int4mod"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Remainder, 32)?
+        },
+        "int2and"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::And, 16)?
+        },
+        "int2or"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Or, 16)?
+        },
+        "int2not"(FunctionArity::Exact(1), true) => {
+            crate::pg_types::exec_integer_not(args[0].get_value())?
+        },
+        "int4and"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::And, 32)?
+        },
+        "int4or"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Or, 32)?
+        },
+        "int4not"(FunctionArity::Exact(1), true) => {
+            crate::pg_types::exec_integer_not(args[0].get_value())?
+        },
+        "int8and"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::And, 64)?
+        },
+        "int8or"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Or, 64)?
+        },
+        "int8not"(FunctionArity::Exact(1), true) => {
+            crate::pg_types::exec_integer_not(args[0].get_value())?
+        },
+        "int2shl"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_shift(args, true, 16)?
+        },
+        "int2shr"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_shift(args, false, 16)?
+        },
+        "int4shl"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_shift(args, true, 32)?
+        },
+        "int4shr"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_shift(args, false, 32)?
+        },
+        "int8shl"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_shift(args, true, 64)?
+        },
+        "int8shr"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_shift(args, false, 64)?
+        },
+        "int4um"(FunctionArity::Exact(1), true) => {
+            crate::pg_types::exec_integer_negate(args[0].get_value(), 32)?
+        },
+        "int8pl"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Add, 64)?
+        },
+        "int8mi"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Subtract, 64)?
+        },
+        "int8mul"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Multiply, 64)?
+        },
+        "int8div"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Divide, 64)?
+        },
+        "int8mod"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Remainder, 64)?
+        },
+        "int8um"(FunctionArity::Exact(1), true) => {
+            crate::pg_types::exec_integer_negate(args[0].get_value(), 64)?
+        },
+        "int2pl"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Add, 16)?
+        },
+        "int2mi"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Subtract, 16)?
+        },
+        "int2mul"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Multiply, 16)?
+        },
+        "int2div"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Divide, 16)?
+        },
+        "int2mod"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_integer_arithmetic(args, crate::pg_types::IntegerOperation::Remainder, 16)?
+        },
+        "int2um"(FunctionArity::Exact(1), true) => {
+            crate::pg_types::exec_integer_negate(args[0].get_value(), 16)?
+        },
+        "float4pl"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_float4_arithmetic(args, |a, b| a + b, false)?
+        },
+        "float4mi"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_float4_arithmetic(args, |a, b| a - b, false)?
+        },
+        "float4mul"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_float4_arithmetic(args, |a, b| a * b, false)?
+        },
+        "float4div"(FunctionArity::Exact(2), true) => {
+            crate::pg_types::exec_float4_arithmetic(args, |a, b| a / b, true)?
+        },
+        "float4um"(FunctionArity::Exact(1), true) => {
+            crate::pg_types::exec_float4_negate(args[0].get_value())?
+        },
+        "pg_float4_round"(FunctionArity::Exact(1), true) => {
+            crate::casts::exec_float4_round(args[0].get_value())?
+        },
+        "pg_cast"(FunctionArity::Exact(3), true) => crate::casts::exec_pg_cast(args)?,
+        "pg_array_in"(FunctionArity::Exact(2), true) => crate::array_input::exec_pg_array_in(args)?,
+        "pg_cast_varchar"(FunctionArity::Exact(3), true) => crate::casts::exec_pg_cast_varchar(args)?,
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
         "booleq"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() == args[1].get_value()),
         "boolne"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() != args[1].get_value()),
         "set_config"(FunctionArity::Exact(3), false) => exec_set_config(connection, args)?,
-        "current_setting"(FunctionArity::OneOf(&[1, 2]), false) => {
-            exec_current_setting(connection, args)?
-        },
         "version"(FunctionArity::Exact(0), true) => exec_version(),
         "current_database"(FunctionArity::Exact(0), false) => {
             crate::catalog::db_name_from_path(connection.db_file_path())
@@ -727,14 +886,25 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<String> {
 }
 
 fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Option<String>> {
+    let (args, types) = args.split_at(args.len() / 2);
     if args
         .iter()
         .any(|arg| matches!(arg.get_value(), Value::Null))
     {
         return Ok(None);
     }
+    let first_type = types[0].get_value().to_string();
+    let is_name = matches!(
+        first_type.as_str(),
+        "text" | "varchar" | "unknown" | "any" | "null"
+    );
     let Value::Text(name) = args[0].get_value() else {
         let mut arg_types = vec![pg_type_name(args[0].get_value())];
+        arg_types.extend(args[1..].iter().map(|_| "boolean"));
+        return Err(undefined_function("current_setting", &arg_types));
+    };
+    if !is_name {
+        let mut arg_types = vec![first_type.as_str()];
         arg_types.extend(args[1..].iter().map(|_| "boolean"));
         return Err(undefined_function("current_setting", &arg_types));
     };
@@ -805,18 +975,35 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
             }
             rounded as i64
         }
-        Value::Text(text) => text.as_str().trim().parse().map_err(|_| {
-            sqlstate_error(
-                SQLSTATE_INVALID_TEXT_REPRESENTATION,
-                format!(
-                    "invalid input syntax for type bigint: \"{}\"",
-                    text.as_str()
-                ),
-                None,
-            )
-        })?,
+        Value::Text(text) => {
+            let text = text.as_str().trim();
+            let digits = text.strip_prefix(['-', '+']).unwrap_or(text);
+            if let Ok(Some(rounded)) = turso_core::numeric_to_rounded_i64(args[0].get_value()) {
+                if text.parse::<i64>().is_err() && text.parse::<f64>().is_ok() {
+                    return limit_value_checked(args, rounded);
+                }
+            }
+            text.parse().map_err(|_| {
+                if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return sqlstate_error(
+                        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                        "bigint out of range",
+                        None,
+                    );
+                }
+                sqlstate_error(
+                    SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                    format!("invalid input syntax for type bigint: \"{text}\""),
+                    None,
+                )
+            })?
+        }
         Value::Blob(_) => return Err(LimboError::InvalidArgument("datatype mismatch".to_string())),
     };
+    limit_value_checked(args, value)
+}
+
+fn limit_value_checked(args: &[Register], value: i64) -> Result<Option<i64>> {
     if value < 0 {
         let clause = text_arg(args, 1);
         let sqlstate = if clause == "OFFSET" {
@@ -1050,7 +1237,9 @@ impl JsonElement {
     fn of_type(name: &str) -> Self {
         match name {
             "boolean" => Self::Boolean,
-            "integer" | "smallint" | "bigint" | "real" | "numeric" => Self::Number,
+            "integer" | "int4" | "smallint" | "bigint" | "real" | "float4" | "numeric" => {
+                Self::Number
+            }
             "json" | "jsonb" => Self::Json,
             // A cast to bytea is a cast to blob, so a blob is a bytea.
             "bytea" | "blob" => Self::Bytea,

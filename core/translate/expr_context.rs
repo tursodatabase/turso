@@ -26,6 +26,11 @@ pub(crate) trait ExprProperties<
     fn register_affinity(&self, register: usize) -> Option<Affinity>;
     fn register_collation(&self, register: usize) -> Option<TextCollation>;
     fn subquery_affinity(&self, query: SubqueryId, result_reg: usize) -> Option<Affinity>;
+    /// The affinity of a CAST to the registered type `type_name`, when the
+    /// context knows the registered types.
+    fn cast_affinity(&self, _type_name: &str) -> Option<Affinity> {
+        None
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -117,6 +122,13 @@ impl ExprProperties for ExprContext<'_, '_> {
     fn subquery_affinity(&self, query: TableInternalId, result_reg: usize) -> Option<Affinity> {
         let subquery = self.resolver.row_value_subqueries.get(query)?;
         Some(subquery.column(result_reg)?.affinity)
+    }
+
+    fn cast_affinity(&self, type_name: &str) -> Option<Affinity> {
+        if !self.resolver.catalog.dialect.requires_custom_types() {
+            return None;
+        }
+        self.resolver.schema().type_comparison_affinity(type_name)
     }
 }
 

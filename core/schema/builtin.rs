@@ -82,6 +82,7 @@ fn builtin_types(
                 accepts_collate,
                 range_offsets,
                 stored_form_sorts_in_value_order,
+                can_be_rowid_alias: false,
             },
             sql.to_string(),
         )?;

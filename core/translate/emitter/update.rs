@@ -865,6 +865,14 @@ fn emit_update_column_values<'a>(
                         reg: rowid_set_clause_reg,
                         target_pc: None,
                     });
+                    if table_column.is_rowid_alias() {
+                        crate::translate::expr::emit_coerce_rowid(
+                            program,
+                            table_column,
+                            rowid_set_clause_reg,
+                            &t_ctx.resolver,
+                        )?;
+                    }
 
                     program.emit_null(target_reg, None);
                 } else {

@@ -19,6 +19,22 @@ pub(super) fn binary_expr_shared(
     }
 
     if lhs_arity == 1 {
+        if matches!(op, ast::Operator::Concat) {
+            if let Some((lhs, rhs)) = concat_operands_as_text(referenced_tables, e1, e2, resolver)?
+            {
+                emit_binary_expr_scalar(
+                    program,
+                    referenced_tables,
+                    &lhs,
+                    &rhs,
+                    op,
+                    target_register,
+                    resolver,
+                    emit_mode,
+                )?;
+                return Ok(target_register);
+            }
+        }
         emit_binary_expr_scalar(
             program,
             referenced_tables,
@@ -43,6 +59,76 @@ pub(super) fn binary_expr_shared(
         resolver,
         emit_mode,
     )
+}
+
+/// The operands of `||` as the dialect casts them to text, or None when the
+/// dialect leaves them as they are. An operand that is not text is written
+/// with the output function of its type, as in PostgreSQL's `true || 'x'`.
+#[inline(never)]
+fn concat_operands_as_text(
+    referenced_tables: Option<&TableReferences>,
+    e1: &ast::Expr,
+    e2: &ast::Expr,
+    resolver: &Resolver,
+) -> Result<Option<(ast::Expr, ast::Expr)>> {
+    if is_array(e1, referenced_tables, resolver) || is_array(e2, referenced_tables, resolver) {
+        return Ok(None);
+    }
+    let operand_types = || {
+        vec![
+            cast_source(referenced_tables, e1, resolver),
+            cast_source(referenced_tables, e2, resolver),
+        ]
+    };
+    if resolver
+        .catalog
+        .dialect
+        .resolve_operator("||", &operand_types)
+        == crate::dialect::OperatorResolution::Reject
+    {
+        let types = operand_types();
+        let (lhs, rhs) = (operand_type_name(&types[0]), operand_type_name(&types[1]));
+        crate::bail_parse_error!("operator does not exist: {lhs} || {rhs}");
+    }
+    if !resolver
+        .catalog
+        .dialect
+        .concatenates_as_text(&operand_types)
+    {
+        return Ok(None);
+    }
+    let text = ast::Type {
+        name: "text".to_string(),
+        size: None,
+        array_dimensions: 0,
+    };
+    let context = crate::dialect::CastContext::Assignment;
+    let lhs = plan_cast_conversion(referenced_tables, e1, Some(&text), context, resolver)?;
+    let rhs = plan_cast_conversion(referenced_tables, e2, Some(&text), context, resolver)?;
+    if lhs.is_none() && rhs.is_none() {
+        return Ok(None);
+    }
+    Ok(Some((
+        lhs.unwrap_or_else(|| e1.clone()),
+        rhs.unwrap_or_else(|| e2.clone()),
+    )))
+}
+
+fn operand_type_name(operand: &crate::dialect::OperandType) -> String {
+    use crate::dialect::OperandType;
+    match operand {
+        OperandType::Untyped => "unknown".to_string(),
+        OperandType::Null => "null".to_string(),
+        OperandType::Integer => "integer".to_string(),
+        OperandType::Boolean => "boolean".to_string(),
+        OperandType::Real => "double precision".to_string(),
+        OperandType::Decimal => "numeric".to_string(),
+        OperandType::Text => "text".to_string(),
+        OperandType::Blob => "bytea".to_string(),
+        OperandType::Custom(type_def) => type_def.name.clone(),
+        OperandType::Array => "array".to_string(),
+        OperandType::Unknown => "unknown".to_string(),
+    }
 }
 
 /// Row-valued comparisons are rare, so they get their own function that is

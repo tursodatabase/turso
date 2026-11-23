@@ -20,128 +20,84 @@ setup t_b {
 }
 
 # A-01: bool literal casts, true forms
-@compat-gap "type:bool"
 test bool-literal-casts-true-forms {
     SELECT 't'::boolean, 'true'::boolean, 'yes'::boolean, 'on'::boolean, '1'::boolean, 'TRUE'::boolean, 'y'::boolean;
 }
 expect {
     t|t|t|t|t|t|t
 }
-expect @tursopg {
-    0|0|0|0|1|0|0
-}
 
 # A-02: bool literal casts, false forms
-@compat-gap "type:bool"
 test bool-literal-casts-false-forms {
     SELECT 'f'::boolean, 'false'::boolean, 'no'::boolean, 'off'::boolean, '0'::boolean;
 }
 expect {
     f|f|f|f|f
 }
-expect @tursopg {
-    0|0|0|0|0
-}
 
 # A-04: bool invalid literal
-@compat-gap "type:bool"
 test bool-invalid-literal {
     SELECT 'maybe'::boolean;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    0
-}
 
 # A-06: CAST(... AS boolean) form
-@compat-gap "type:bool"
 test cast-as-boolean-form {
     SELECT CAST('true' AS boolean), CAST(1 AS boolean), CAST(0 AS boolean);
 }
 expect {
     t|t|f
 }
-expect @tursopg {
-    0|1|0
-}
 
 # A-07: int4 overflow literal cast
-@compat-gap "type:int4"
 test int4-overflow-literal-cast {
     SELECT '2147483648'::int4;
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-    2147483648
-}
 
 # A-08: int2 overflow literal cast
-@compat-gap "type:int2"
 test int2-overflow-literal-cast {
     SELECT '40000'::smallint;
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-    40000
-}
 
 # A-09: int8 overflow arithmetic
-@compat-gap "operator:int8 + int4"
 test int8-overflow-arithmetic {
     SELECT 9223372036854775807::bigint + 1;
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-    9.223372036854776e18
-}
 
 # A-10: int4 overflow arithmetic
-@compat-gap "operator:int4 + int4"
 test int4-overflow-arithmetic {
     SELECT 2147483647::int4 + 1;
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-    2147483648
-}
 
 # A-11: invalid int literal cast
-@compat-gap "type:int4"
 test invalid-int-literal-cast {
     SELECT 'abc'::integer;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    0
-}
 
 # A-13: '1.5'::int (text) is invalid
-@compat-gap "type:int4"
 test decimal-text-cast-to-int4-is-invalid {
     SELECT '1.5'::integer;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    1
-}
 
 # A-14: numeric->int rounds half away from zero
-@compat-gap "cast:numeric -> int4"
 test numeric-int-rounds-half-away-from-zero {
     SELECT 1.5::integer, 2.5::integer, (-2.5)::integer;
 }
 expect {
     2|3|-3
-}
-expect @tursopg {
-    1|2|-2
 }
 
 # A-16: int with surrounding spaces
@@ -153,129 +109,88 @@ expect {
 }
 
 # A-17: invalid uuid literal cast
-@compat-gap "type:uuid"
 test invalid-uuid-literal-cast {
     SELECT 'nope'::uuid;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    nope
-}
 
 # A-19: uuid uppercase input normalised
-@compat-gap "type:uuid"
 test uuid-uppercase-input-normalised {
     SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid;
 }
 expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
-expect @tursopg {
-    A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11
-}
 
 # A-20: uuid braces / no-hyphen input
-@compat-gap "type:uuid"
 test uuid-braces-no-hyphen-input {
     SELECT '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid, 'a0eebc999c0b4ef8bb6d6bb9bd380a11'::uuid;
 }
 expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
-expect @tursopg {
-    {a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}|a0eebc999c0b4ef8bb6d6bb9bd380a11
-}
 
 # A-21: uuid equality across case
-@compat-gap "operator:uuid = uuid"
 test uuid-equality-across-case {
     SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid;
 }
 expect {
     t
 }
-expect @tursopg {
-    0
-}
 
 # A-22: numeric(10,2) rounding half away from zero
-@compat-gap "type:numeric"
 test numeric-10-2-rounding-half-away-from-zero {
     SELECT '1.005'::numeric(10,2), '2.675'::numeric(10,2), '-1.005'::numeric(10,2);
 }
 expect {
     1.01|2.68|-1.01
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
 # A-23: numeric(10,0) rounding
-@compat-gap "type:numeric"
 test numeric-10-0-rounding {
     SELECT '2.5'::numeric(10,0), '3.5'::numeric(10,0);
 }
 expect {
     3|4
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
 # A-24: numeric exact decimal arithmetic
-@compat-gap "operator:numeric + numeric"
 test numeric-exact-decimal-arithmetic {
     SELECT 0.1::numeric + 0.2::numeric, 1::numeric / 3;
 }
 expect {
     0.3|0.33333333333333333333
 }
-expect @tursopg {
-    0.30000000000000004|0.3333333333333333
-}
 
 # A-25: numeric big precision
-@compat-gap "type:numeric"
 test numeric-big-precision {
     SELECT '123456789012345678901234567890.123'::numeric;
 }
 expect {
     123456789012345678901234567890.123
 }
-expect @tursopg {
-    1.2345678901234568e29
-}
 
 # A-26: numeric overflow on typmod
-@compat-gap "type:numeric"
 test numeric-overflow-on-typmod {
     SELECT '123456.1'::numeric(5,2);
 }
 @sqlstate 22003
 expect error {}
-@sqlstate 0A000
-expect @tursopg error {}
 
 # A-27: invalid numeric
-@compat-gap "type:numeric"
 test invalid-numeric {
     SELECT 'abc'::numeric;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    0
-}
 
 # A-28: numeric exponent input
-@compat-gap "type:numeric"
 test numeric-exponent-input {
     SELECT '1e3'::numeric, '1.50'::numeric;
 }
 expect {
     1000|1.50
-}
-expect @tursopg {
-    1000.0|1.5
 }
 
 # A-30: timestamptz literal with +02 offset
@@ -318,15 +233,11 @@ test invalid-timestamptz {
 expect error {}
 
 # A-36: timestamptz equality across offsets
-@compat-gap "operator:timestamptz = timestamptz"
 test timestamptz-equality-across-offsets {
     SELECT '2026-10-08 14:00:00+02'::timestamptz = '2026-10-08 12:00:00Z'::timestamptz;
 }
 expect {
     t
-}
-expect @tursopg {
-    1
 }
 
 # A-37: timestamp drops offset
@@ -462,14 +373,11 @@ expect {
 }
 
 # A-52: invalid int[] literal
-@compat-gap "type:_int4"
 test invalid-int-literal {
     SELECT '{1,x}'::int[];
 }
 @sqlstate 22P02
 expect error {}
-@sqlstate 23000
-expect @tursopg error {}
 
 # A-58: ARRAY[] constructor output
 test array-constructor-output {
@@ -498,7 +406,6 @@ expect {
 }
 
 # A-61: text column = int literal (PG: no operator)
-@compat-gap "operator:text = int4"
 test text-column-int-literal-pg-no-operator {
     CREATE TABLE t (s text);
     INSERT INTO t VALUES ('1');
@@ -506,9 +413,6 @@ test text-column-int-literal-pg-no-operator {
 }
 @sqlstate 42883
 expect error {}
-expect @tursopg {
-    1
-}
 
 # A-62: insert '42' text literal into int column
 @setup t_id
@@ -521,26 +425,20 @@ expect {
 
 # A-63: insert 'abc' into int column
 @setup t_id
-@compat-gap "type:int4"
 test insert-abc-into-int-column {
     INSERT INTO t VALUES ('abc') RETURNING id;
 }
 @sqlstate 22P02
 expect error {}
-@sqlstate 23000
-expect @tursopg error {}
 
 # A-64: insert 1.7 numeric into int column
 @setup t_id
-@compat-gap "cast:numeric -> int4"
 test insert-1-7-numeric-into-int-column {
     INSERT INTO t VALUES (1.7) RETURNING id;
 }
 expect {
     2
 }
-@sqlstate 23000
-expect @tursopg error {}
 
 # A-65: insert 'true' into bool column
 @setup t_b
@@ -553,15 +451,11 @@ expect {
 
 # A-66: insert integer 1 into bool column
 @setup t_b
-@compat-gap "cast:int4 -> bool"
 test insert-integer-1-into-bool-column {
     INSERT INTO t VALUES (1) RETURNING b;
 }
 @sqlstate 42804
 expect error {}
-expect @tursopg {
-    t
-}
 
 # A-79: insert literal with short +00 offset into timestamptz column
 test insert-literal-with-short-00-offset-into-timestamptz {

@@ -6,6 +6,7 @@ use crate::error::LimboError;
 use crate::io::{Buffer, Completion, CompletionGroup, WriteBatch as IOWriteBatch};
 use crate::schema::{BTreeTable, Schema, SequencesByNamespace, TypeDef};
 use crate::security::roles::SessionRole;
+use crate::statement::StatementOrigin;
 use crate::storage::pager::{AutoVacuumMode, Page, PageRef, Pager};
 use crate::storage::sqlite3_ondisk::{
     CacheSize, DatabaseHeader, PageSize, RawVersion, TextEncoding, WAL_FRAME_HEADER_SIZE,
@@ -805,8 +806,17 @@ pub(crate) fn vacuum_target_build_step(
                 // order. The guard is only for prepare: keeping it during step()
                 // would make this CREATE TABLE look nested, so its Transaction
                 // opcode would skip write setup.
+                let origin = if state
+                    .target_conn
+                    .dialect()
+                    .is_frontend_table_sql(&entry.sql)
+                {
+                    StatementOrigin::Root
+                } else {
+                    StatementOrigin::EngineSchemaWrite
+                };
                 state.target_conn.start_nested();
-                let target_stmt = state.target_conn.prepare(&sql);
+                let target_stmt = state.target_conn.prepare_with_origin(&sql, origin);
                 state.target_conn.end_nested();
                 let target_stmt = target_stmt?;
                 state.phase = VacuumTargetBuildPhase::StepCreateTable {

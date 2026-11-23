@@ -1237,9 +1237,12 @@ fn extract_row_description_oids(data: &[u8]) -> Vec<u32> {
 // PostgreSQL versions, so test expectations stay valid. Only the OIDs the
 // current wire tests assert against are declared; add more here as new
 // tests need them.
+const OID_BOOL: u32 = 16;
 const OID_INT4: u32 = 23;
 const OID_TEXT: u32 = 25;
+const OID_FLOAT4: u32 = 700;
 const OID_FLOAT8: u32 = 701;
+const OID_NUMERIC: u32 = 1700;
 
 /// Walk raw PG wire bytes, find the first ErrorResponse ('E') message, and
 /// return its fields as a map from the one-byte field type to the value string.
@@ -1519,13 +1522,12 @@ fn wire_server_version_parameter_matches_version_function() {
     });
 }
 
-/// `SELECT 3.14` reports FLOAT8. PG normally returns NUMERIC for unannotated
-/// numeric literals; FLOAT8 is the tursopg choice because Turso stores
-/// reals as 64-bit floats and the client decodes the wire bytes directly.
+/// `SELECT 3.14` reports NUMERIC, as PostgreSQL does for a decimal written in
+/// the statement.
 #[test]
-fn wire_real_literal_reports_float8() {
+fn wire_decimal_literal_reports_numeric() {
     with_pg_client(|c| {
-        assert_eq!(c.query_column_oids("SELECT 3.14"), vec![OID_FLOAT8]);
+        assert_eq!(c.query_column_oids("SELECT 3.14"), vec![OID_NUMERIC]);
     });
 }
 
@@ -1553,12 +1555,12 @@ fn wire_integer_arithmetic_reports_int4() {
     });
 }
 
-/// Mixed numeric arithmetic widens INTEGER+REAL → REAL → wire FLOAT8.
+/// An integer with a decimal gives a NUMERIC, as in PostgreSQL.
 #[test]
-fn wire_mixed_arithmetic_widens_to_float8() {
+fn wire_mixed_arithmetic_widens_to_numeric() {
     with_pg_client(|c| {
-        assert_eq!(c.query_column_oids("SELECT 42 + 1.5"), vec![OID_FLOAT8]);
-        assert_eq!(c.query_column_oids("SELECT 3.14 * 2"), vec![OID_FLOAT8]);
+        assert_eq!(c.query_column_oids("SELECT 42 + 1.5"), vec![OID_NUMERIC]);
+        assert_eq!(c.query_column_oids("SELECT 3.14 * 2"), vec![OID_NUMERIC]);
     });
 }
 
@@ -1573,19 +1575,18 @@ fn wire_bitwise_ops_report_int4() {
     });
 }
 
-/// Comparison and logical ops return INT4 — SQLite returns 0/1 as INTEGER
-/// at runtime; tursopg's wire layer reports INT4 here. A future change
-/// could map these to BOOL OID, but for now stable + assertable.
+/// Comparison and logical ops return BOOL, as in PostgreSQL. The engine
+/// computes them as 0 and 1.
 #[test]
-fn wire_comparison_and_logical_report_int4() {
+fn wire_comparison_and_logical_report_bool() {
     with_pg_client(|c| {
-        assert_eq!(c.query_column_oids("SELECT 1 = 1"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 2 < 3"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 5 > 4"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 1 AND 0"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 1 OR 0"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 1 = 1"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 2 < 3"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 5 > 4"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT true AND false"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT true OR false"), vec![OID_BOOL]);
         // Nested: arithmetic feeding a comparison still propagates correctly.
-        assert_eq!(c.query_column_oids("SELECT 42 + 1 = 43"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 42 + 1 = 43"), vec![OID_BOOL]);
     });
 }
 
@@ -1609,7 +1610,7 @@ fn wire_unary_and_parens_propagate() {
         assert_eq!(c.query_column_oids("SELECT -42"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT +5"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT (1 + 2) * 3"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT NOT 1"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT NOT true"), vec![OID_BOOL]);
     });
 }
 
@@ -1628,6 +1629,10 @@ fn wire_cast_reports_target_type() {
         );
         assert_eq!(
             c.query_column_oids("SELECT CAST(1 AS REAL)"),
+            vec![OID_FLOAT4]
+        );
+        assert_eq!(
+            c.query_column_oids("SELECT CAST(1 AS DOUBLE PRECISION)"),
             vec![OID_FLOAT8]
         );
     });
@@ -1639,10 +1644,12 @@ fn wire_cast_reports_target_type() {
 #[test]
 fn wire_table_columns_report_declared_type() {
     with_pg_client(|c| {
-        c.query_command_tags("CREATE TABLE t(id INTEGER, label TEXT, score REAL)");
+        c.query_command_tags(
+            "CREATE TABLE t(id INTEGER, label TEXT, score REAL, ratio DOUBLE PRECISION)",
+        );
         assert_eq!(
-            c.query_column_oids("SELECT id, label, score FROM t"),
-            vec![OID_INT4, OID_TEXT, OID_FLOAT8]
+            c.query_column_oids("SELECT id, label, score, ratio FROM t"),
+            vec![OID_INT4, OID_TEXT, OID_FLOAT4, OID_FLOAT8]
         );
     });
 }
@@ -1655,7 +1662,7 @@ fn wire_multi_column_select_classifies_each() {
     with_pg_client(|c| {
         assert_eq!(
             c.query_column_oids("SELECT 1, 'two', 3.0, 1 + 1, 'a' || 'b'"),
-            vec![OID_INT4, OID_TEXT, OID_FLOAT8, OID_INT4, OID_TEXT]
+            vec![OID_INT4, OID_TEXT, OID_NUMERIC, OID_INT4, OID_TEXT]
         );
     });
 }

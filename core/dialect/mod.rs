@@ -220,6 +220,15 @@ pub trait Dialect: Send + Sync + 'static {
         table_sql_for_replay(self, sql)
     }
 
+    /// Whether `sql`, as stored in `sqlite_schema`, was written by this
+    /// dialect's frontend, so that it replays through the dialect's parser. SQL
+    /// that the engine wrote itself, such as the table behind a sequence, is
+    /// SQLite text and replays as such. The default treats every table as
+    /// frontend SQL.
+    fn is_frontend_table_sql(&self, _sql: &str) -> bool {
+        true
+    }
+
     /// Produce the SQL text to store in `sqlite_schema` for a
     /// `CREATE TABLE`.
     ///
@@ -566,6 +575,41 @@ pub trait Dialect: Send + Sync + 'static {
         SortTermMatching::Sqlite
     }
 
+    /// Whether a REAL column keeps the sign of a negative zero.
+    ///
+    /// SQLite stores a whole-number real as an integer, so it reads -0.0 back
+    /// as 0.0. PostgreSQL keeps -0.
+    fn real_columns_keep_negative_zero(&self) -> bool {
+        false
+    }
+
+    /// Whether `CAST(x AS numeric)`, written without the type's arguments,
+    /// is SQLite's CAST to the NUMERIC affinity, and a column of such a type
+    /// must give them.
+    ///
+    /// In SQLite it is, so the value becomes an integer or a real. In
+    /// PostgreSQL it gives a numeric with no limits, and a column may leave
+    /// the arguments out.
+    fn cast_without_type_arguments_is_sqlite_cast(&self) -> bool {
+        true
+    }
+
+    /// Whether a numeric column may have a scale below zero or above its
+    /// precision, as `numeric(3,-2)` and `numeric(2,4)` in PostgreSQL 15 and
+    /// later. SQLite's custom numeric type refuses both.
+    fn numeric_scale_may_leave_precision(&self) -> bool {
+        false
+    }
+
+    /// Whether `sum()` and `avg()` add floats one by one.
+    ///
+    /// SQLite keeps an error term for each addition (Kahan-Babuska-Neumaier),
+    /// so the total is closer to the exact sum. PostgreSQL adds the floats
+    /// one by one, so its total can differ in the last digits.
+    fn sums_floats_naively(&self) -> bool {
+        false
+    }
+
     /// Whether integer division by zero raises an error.
     ///
     /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.
@@ -646,6 +690,156 @@ pub trait Dialect: Send + Sync + 'static {
         crate::vdbe::value::push_hex_upper(out, blob);
         out.push_str("'\"");
     }
+
+    /// The type of a call of the function `name`, when the dialect decides it.
+    /// None leaves it to the engine. `args` works out the types of the
+    /// arguments, so a dialect that looks at no call never pays for it.
+    fn function_result_type(
+        &self,
+        _name: &str,
+        _args: &dyn Fn() -> std::vec::Vec<OperandType>,
+        _schema: &crate::schema::Schema,
+    ) -> Option<OperandType> {
+        None
+    }
+
+    /// How the dialect resolves the operator `op` for operands of the given
+    /// types. `op` is an arithmetic, bit or comparison operator, or `||`. The
+    /// default has every operator, as SQLite does: it adds a comparison to a
+    /// number.
+    fn resolve_operator(
+        &self,
+        _op: &str,
+        _operands: &dyn Fn() -> std::vec::Vec<OperandType>,
+    ) -> OperatorResolution {
+        OperatorResolution::Keep
+    }
+
+    /// How the dialect resolves an operand of AND, OR, NOT or a CASE
+    /// condition. PostgreSQL needs a boolean there and reads a string literal
+    /// as one; SQLite takes any value.
+    fn resolve_boolean_argument(&self, _operand: &OperandType) -> OperatorResolution {
+        OperatorResolution::Keep
+    }
+
+    /// Fails when the string literal `text` is not a value of the type that
+    /// `CastUntyped` names. PostgreSQL reads the literal when it plans the
+    /// statement, so a bad one fails even where the statement never uses it.
+    fn check_literal_cast(&self, _text: &str, _type_name: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether the arithmetic operator `op` on operands of the given types is
+    /// SQLite's operator on the values the operands read as, even though an
+    /// operand is a custom type that has its own operator. PostgreSQL adds a
+    /// double precision and a numeric as doubles.
+    fn uses_sqlite_arithmetic(
+        &self,
+        _op: &str,
+        _operands: &dyn Fn() -> std::vec::Vec<OperandType>,
+    ) -> bool {
+        false
+    }
+
+    /// Whether `||` writes its operands as text with the cast to text of the
+    /// dialect before it joins them, as PostgreSQL's `true || 'x'` does. A
+    /// dialect that joins some operands another way, such as two byte
+    /// strings, says no for them.
+    fn concatenates_as_text(&self, _operands: &dyn Fn() -> std::vec::Vec<OperandType>) -> bool {
+        true
+    }
+
+    /// The type that values of the given types have together, as the results
+    /// of a CASE or coalesce do. None leaves it to the engine.
+    fn common_type(&self, _types: &dyn Fn() -> std::vec::Vec<OperandType>) -> Option<OperandType> {
+        None
+    }
+
+    /// The type that string literals take where values of the given types
+    /// meet, as in `coalesce(int_column, '5')`. None leaves the literals as
+    /// they are.
+    fn common_untyped_type(
+        &self,
+        _types: &dyn Fn() -> std::vec::Vec<OperandType>,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Plans a CAST of a value of type `source()` to the type `target`, as
+    /// written. None leaves the CAST to the engine, which converts the value
+    /// as SQLite's CAST or the target custom type does. `source` works out
+    /// the type of the operand, so a dialect that plans no casts never pays
+    /// for it.
+    fn plan_cast(
+        &self,
+        _source: &dyn Fn() -> OperandType,
+        _target: &ast::Type,
+        _context: CastContext,
+    ) -> Result<Option<CastPlan>> {
+        Ok(None)
+    }
+}
+
+/// Where a cast is written, from the narrowest to the widest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CastContext {
+    Implicit,
+    Assignment,
+    Explicit,
+}
+
+/// The dialect's choice of an operator for the operands of a call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorResolution {
+    /// The engine's operator runs on the operands as they are.
+    Keep,
+    /// The dialect has no such operator: the statement fails with "operator
+    /// does not exist".
+    Reject,
+    /// Several operators fit an operand whose type is not known yet, as for
+    /// `-'5'`, and the dialect has no way to choose one.
+    Ambiguous,
+    /// The operator exists once the string literal operands are cast to this
+    /// type, as in `int_column = '5'`.
+    CastUntyped(String),
+    /// The operator exists once each operand that has a type name is cast to
+    /// it, as PostgreSQL compares a double precision with a numeric as two
+    /// doubles. The names are for the left and the right operand.
+    CastOperands(Option<String>, Option<String>),
+}
+
+/// The type of an operand, as far as a dialect needs to know it.
+#[derive(Debug, Clone)]
+pub enum OperandType {
+    /// A string literal or a parameter. Its type comes from where it is used.
+    Untyped,
+    Null,
+    Integer,
+    /// The result of a comparison. SQLite computes with it as an integer.
+    Boolean,
+    Real,
+    /// A number written in the statement with a decimal point or exponent.
+    Decimal,
+    Text,
+    Blob,
+    Custom(Arc<crate::schema::TypeDef>),
+    Array,
+    Unknown,
+}
+
+/// What the engine does for a cast: the conversion of the operand, then the
+/// store of the converted value as the target type does.
+#[derive(Debug, Clone)]
+pub struct CastPlan {
+    pub convert: Option<CastConversion>,
+}
+
+/// The call of a function on the operand, which gives the value in the form
+/// the target type takes as input. `extra_args` follow the operand.
+#[derive(Debug, Clone)]
+pub struct CastConversion {
+    pub function: String,
+    pub extra_args: Vec<ast::Expr>,
 }
 
 /// How an ORDER BY or DISTINCT ON term is matched to the output columns.

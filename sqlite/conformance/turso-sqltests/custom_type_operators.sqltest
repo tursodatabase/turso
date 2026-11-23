@@ -55,8 +55,8 @@ test op-numeric-div-literal-multi-row {
     SELECT id, val / 10 FROM t1 ORDER BY id;
 }
 expect {
-    1|10.00
-    2|3.00
+    1|10.0000000000000000
+    2|3.0000000000000000
 }
 
 # As in PostgreSQL, numeric with a REAL value gives a REAL, while a decimal

@@ -283,6 +283,12 @@ fn format_value(value: &Value) -> String {
 
 pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
     match error {
+        LimboError::ConstraintViolation(cv)
+            if cv.kind == ConstraintKind::Other
+                && cv.message.starts_with("numeric value out of range") =>
+        {
+            SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
+        }
         LimboError::ConstraintViolation(cv) => match cv.kind {
             ConstraintKind::PrimaryKey | ConstraintKind::Unique => SQLSTATE_UNIQUE_VIOLATION,
             ConstraintKind::ForeignKey => SQLSTATE_FK_VIOLATION,
@@ -293,6 +299,9 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
             }
         },
         LimboError::ForeignKeyConstraint(_) => SQLSTATE_FK_VIOLATION,
+        LimboError::Constraint(msg) if msg.starts_with("invalid input for type boolean") => {
+            SQLSTATE_INVALID_TEXT_REPRESENTATION
+        }
         LimboError::Constraint(_) => SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION,
         LimboError::LexerError(_) => SQLSTATE_SYNTAX_ERROR,
         LimboError::ParseError(msg) => parse_error_sqlstate(msg),
@@ -378,13 +387,20 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_TABLE
     } else if msg.contains("no such column") || msg.contains("column not found") {
         SQLSTATE_UNDEFINED_COLUMN
-    } else if msg.contains("no such function") || msg.contains("no such window") {
+    } else if msg.contains("no such function")
+        || msg.contains("no such window")
+        || msg.starts_with("operator does not exist: ")
+    {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.starts_with("cannot compare type ") {
         // tursopg refuses comparisons that PostgreSQL may run, and it does not know
         // which ones. PostgreSQL itself reports 42883 for some of these, so this
         // code differs from 42883 only where PostgreSQL also refuses.
         SQLSTATE_FEATURE_NOT_SUPPORTED
+    } else if msg.starts_with("operator is not unique: ") {
+        SQLSTATE_AMBIGUOUS_FUNCTION
+    } else if msg.starts_with("argument of ") && msg.contains(" must be type boolean, not type ") {
+        SQLSTATE_DATATYPE_MISMATCH
     } else if msg.contains("already exists") {
         SQLSTATE_DUPLICATE_TABLE
     } else if msg.starts_with("ambiguous column name") || msg.ends_with("\" is ambiguous") {
@@ -499,9 +515,9 @@ fn sql_error_sqlstate(msg: &str) -> &'static str {
 /// The SQLSTATE of a RAISE. The translator and the types of the engine check
 /// values with RAISE, and PostgreSQL gives these checks their own SQLSTATE.
 fn raise_sqlstate(msg: &str) -> &'static str {
-    if msg.starts_with("invalid input value for enum ") {
+    if msg.starts_with("invalid input value for enum ") || msg == "invalid UUID value" {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
-    } else if msg == "integer out of range for smallint" {
+    } else if msg == "integer out of range for smallint" || msg == "integer out of range" {
         SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
     } else if msg == "value too long for varchar" {
         SQLSTATE_STRING_DATA_RIGHT_TRUNCATION

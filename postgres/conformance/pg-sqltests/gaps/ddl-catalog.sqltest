@@ -258,7 +258,7 @@ expect {
     t
 }
 expect @tursopg {
-    0
+    f
 }
 
 # E-20: view in pg_class relkind v
@@ -505,7 +505,7 @@ expect {
     c_pid_fkey|t|{2}|{1}
 }
 expect @tursopg {
-    c_pid_fkey|1|2|1
+    c_pid_fkey|t|2|1
 }
 
 # E-40: COMMENT ON TABLE + obj_description
@@ -831,7 +831,6 @@ expect {
 }
 
 # E-73: omitted nullable uuid column stays NULL
-@compat-gap "type:uuid"
 test omitted-nullable-uuid-column-stays-null {
     CREATE TABLE t (id int PRIMARY KEY, u uuid);
     INSERT INTO t (id) VALUES (1);
@@ -839,9 +838,6 @@ test omitted-nullable-uuid-column-stays-null {
 }
 expect {
     1|t
-}
-expect @tursopg {
-    1|1
 }
 
 # E-74: quoted identifier keeps its case in pg_class
@@ -1104,7 +1100,7 @@ test indkey-cast-to-int2-array {
 expect {
     [0:1]={1,2}
 }
-@sqlstate 23000
+@sqlstate 22P02
 expect @tursopg error {}
 
 # E-104: unquoted name does not find a quoted mixed-case schema

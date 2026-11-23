@@ -396,7 +396,8 @@ pub fn format_numeric(bd: &BigDecimal) -> String {
 
 /// Validate that a BigDecimal fits within the given precision and scale.
 /// Precision = total number of significant digits.
-/// Scale = number of digits after the decimal point.
+/// Scale = number of digits after the decimal point, which may be negative or
+/// larger than the precision.
 pub fn validate_precision_scale(
     val: &BigDecimal,
     precision: i64,
@@ -407,16 +408,6 @@ pub fn validate_precision_scale(
     if precision <= 0 {
         return Err(LimboError::Constraint(format!(
             "numeric precision must be positive, got {precision}"
-        )));
-    }
-    if scale < 0 {
-        return Err(LimboError::Constraint(format!(
-            "numeric scale must be non-negative, got {scale}"
-        )));
-    }
-    if scale > precision {
-        return Err(LimboError::Constraint(format!(
-            "numeric scale ({scale}) must not exceed precision ({precision})"
         )));
     }
 
@@ -443,11 +434,119 @@ pub fn validate_precision_scale(
     Ok(rounded)
 }
 
+/// The numeric rounded half away from zero to an integer, or None when the
+/// result does not fit in an i64.
+pub fn numeric_to_rounded_i64(val: &Value) -> crate::Result<Option<i64>> {
+    use bigdecimal::{RoundingMode, ToPrimitive};
+    Ok(numeric_from_value(val)?
+        .with_scale_round(0, RoundingMode::HalfUp)
+        .to_i64())
+}
+
+/// The quotient of two numerics, which is not zero-divisor checked, rounded
+/// half away from zero to the scale PostgreSQL picks (`select_div_scale`).
+pub fn numeric_divide(dividend: &BigDecimal, divisor: &BigDecimal) -> BigDecimal {
+    let scale = division_scale(dividend, divisor);
+    let (a, a_exp) = dividend.as_bigint_and_exponent();
+    let (b, b_exp) = divisor.as_bigint_and_exponent();
+    // dividend / divisor * 10^scale = a * 10^(b_exp + scale - a_exp) / b
+    let shift = b_exp + scale - a_exp;
+    let (numerator, denominator) = if shift >= 0 {
+        (a * pow10(shift as u64), b)
+    } else {
+        (a, b * pow10(shift.unsigned_abs()))
+    };
+    let twice = &numerator * 2 + &denominator * numerator.sign().mul_sign(denominator.sign());
+    let quotient = twice / (&denominator * 2);
+    BigDecimal::new(quotient, scale)
+}
+
+fn pow10(exponent: u64) -> BigInt {
+    num_traits::pow(BigInt::from(10), exponent as usize)
+}
+
+trait MulSign {
+    fn mul_sign(self, other: Sign) -> BigInt;
+}
+
+impl MulSign for Sign {
+    fn mul_sign(self, other: Sign) -> BigInt {
+        match (self, other) {
+            (Sign::NoSign, _) | (_, Sign::NoSign) => BigInt::from(0),
+            (a, b) if a == b => BigInt::from(1),
+            _ => BigInt::from(-1),
+        }
+    }
+}
+
+/// Digits after the decimal point of a quotient: enough for 16 significant
+/// digits, and never fewer than either input has. PostgreSQL's
+/// `select_div_scale`, which counts weights in groups of four digits.
+fn division_scale(dividend: &BigDecimal, divisor: &BigDecimal) -> i64 {
+    let (weight1, first1) = base_10000_weight_and_first_digit(dividend);
+    let (weight2, first2) = base_10000_weight_and_first_digit(divisor);
+    let mut quotient_weight = weight1 - weight2;
+    if first1 <= first2 {
+        quotient_weight -= 1;
+    }
+    let scale = 16 - quotient_weight * 4;
+    scale
+        .max(dividend.fractional_digit_count())
+        .max(divisor.fractional_digit_count())
+        .clamp(0, MAX_FRACTION_DIGITS.min(1000))
+}
+
+/// The weight (a power of 10000) of the leading base-10000 digit of `value`,
+/// and that digit. A zero has weight 0 and digit 0.
+fn base_10000_weight_and_first_digit(value: &BigDecimal) -> (i64, i64) {
+    if value.is_zero() {
+        return (0, 0);
+    }
+    let (unscaled, exponent) = value.as_bigint_and_exponent();
+    let digits = unscaled.magnitude().to_string();
+    let decimal_weight = digits.len() as i64 - 1 - exponent;
+    let weight = decimal_weight.div_euclid(4);
+    let leading_digits = (decimal_weight - weight * 4 + 1) as usize;
+    let mut leading = digits.chars().take(leading_digits).collect::<String>();
+    while leading.len() < leading_digits {
+        leading.push('0');
+    }
+    (weight, leading.parse().unwrap_or(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::AsValueRef;
     use std::str::FromStr;
+
+    #[test]
+    fn division_has_the_scale_postgresql_picks() {
+        let cases = [
+            ("1", "3", "0.33333333333333333333"),
+            ("2", "3", "0.66666666666666666667"),
+            ("10", "4", "2.5000000000000000"),
+            ("-2", "3", "-0.66666666666666666667"),
+            ("2", "-3", "-0.66666666666666666667"),
+            ("1", "7000", "0.00014285714285714286"),
+            ("123456789", "7", "17636684.142857142857"),
+            ("1.50", "3", "0.50000000000000000000"),
+            ("1e10", "3", "3333333333.33333333"),
+            ("0", "5", "0.00000000000000000000"),
+            ("1", "0.0003", "3333.3333333333333333"),
+        ];
+        for (dividend, divisor, expected) in cases {
+            let quotient = numeric_divide(
+                &BigDecimal::from_str(dividend).unwrap(),
+                &BigDecimal::from_str(divisor).unwrap(),
+            );
+            assert_eq!(
+                format_numeric(&quotient),
+                expected,
+                "{dividend} / {divisor}"
+            );
+        }
+    }
 
     #[test]
     fn test_roundtrip_positive() {

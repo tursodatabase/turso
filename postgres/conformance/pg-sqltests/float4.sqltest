@@ -1,0 +1,450 @@
+# float4 columns and expressions. The answers come from PostgreSQL 18.
+# A test with a `@compat-gap` label records a case where tursopg differs.
+
+@database :memory:
+
+test float4-roundtrip {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1);
+    SELECT x FROM t;
+}
+expect {
+    0.1
+}
+
+test float4-roundtrip-text-literal {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('0.1');
+    SELECT x FROM t;
+}
+expect {
+    0.1
+}
+
+test float4-typeof {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1);
+    SELECT pg_typeof(x) FROM t;
+}
+expect {
+    real
+}
+
+test float4-to-text {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1);
+    SELECT x::text FROM t;
+}
+expect {
+    0.1
+}
+
+test float4-to-float8 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1);
+    SELECT x::float8 FROM t;
+}
+expect {
+    0.10000000149011612
+}
+
+test float4-to-int4 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (2.5);
+    SELECT x::int4 FROM t;
+}
+expect {
+    2
+}
+
+test float4-plus-int {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1);
+    SELECT x + 1 FROM t;
+}
+expect {
+    1.1000000014901161
+}
+
+test float4-plus-float8 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1);
+    SELECT x + 0.1::float8 FROM t;
+}
+expect {
+    0.20000000149011612
+}
+
+test float4-times-self {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1);
+    SELECT x * x FROM t;
+}
+expect {
+    0.010000001
+}
+
+test float4-plus-self {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1);
+    SELECT x + x FROM t;
+}
+expect {
+    0.2
+}
+
+test float4-minus-self {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.3);
+    SELECT x - x * 2 FROM t;
+}
+expect {
+    -0.30000001192092896
+}
+
+test float4-div {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (1);
+    SELECT x / 3 FROM t;
+}
+expect {
+    0.3333333333333333
+}
+
+test float4-div-self {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (1);
+    SELECT x / (x * 3) FROM t;
+}
+expect {
+    0.3333333333333333
+}
+
+test float4-div-zero {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (1);
+    SELECT x / 0 FROM t;
+}
+@sqlstate 22012
+expect error {
+}
+
+test float4-neg {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1);
+    SELECT -x FROM t;
+}
+expect {
+    -0.1
+}
+
+test float4-abs {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (-0.1);
+    SELECT abs(x) FROM t;
+}
+expect {
+    0.1
+}
+
+test float4-overflow {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (3.5e38::float8 * 10);
+    SELECT x FROM t;
+}
+@sqlstate 22003
+expect error {
+}
+
+test float4-overflow-text {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('1e39');
+    SELECT x FROM t;
+}
+@sqlstate 22003
+expect error {
+}
+
+test float4-bad-text {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('abc');
+    SELECT x FROM t;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test float4-int-literal {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (16777217);
+    SELECT x FROM t;
+}
+expect {
+    1.6777216e+07
+}
+
+test float4-compare-lit {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1);
+    SELECT x = 0.1 FROM t;
+}
+expect {
+    f
+}
+
+test float4-compare-gt {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1);
+    SELECT x > 0.05 FROM t;
+}
+expect {
+    t
+}
+
+test float4-order {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.3), (0.1), (0.2);
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+    0.1
+    0.2
+    0.3
+}
+
+test float4-sum {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1), (0.2);
+    SELECT sum(x) FROM t;
+}
+expect {
+    0.3
+}
+
+test float4-avg {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1), (0.2);
+    SELECT avg(x) FROM t;
+}
+expect {
+    0.15000000223517418
+}
+
+test float4-max {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1), (0.2);
+    SELECT max(x) FROM t;
+}
+expect {
+    0.2
+}
+
+test float4-min {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1), (0.2);
+    SELECT min(x) FROM t;
+}
+expect {
+    0.1
+}
+
+test float4-cast-expr {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1);
+    SELECT x::float4 FROM t;
+}
+expect {
+    0.1
+}
+
+test float4-update-set {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1);
+    UPDATE t SET x = 0.2;
+    SELECT x FROM t;
+}
+expect {
+    0.2
+}
+
+test float4-update-arith {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1);
+    UPDATE t SET x = x * 3;
+    SELECT x FROM t;
+}
+expect {
+    0.3
+}
+
+test float4-insert-select {
+    CREATE TABLE t (x float4);
+    INSERT INTO t SELECT 0.1::float8;
+    SELECT x FROM t;
+}
+expect {
+    0.1
+}
+
+test float4-multi-row {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1), (0.2);
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+    0.1
+    0.2
+}
+
+test float4-default {
+    CREATE TABLE t (x float4 DEFAULT 0.1, y int);
+    INSERT INTO t(y) VALUES (1);
+    SELECT x FROM t;
+}
+expect {
+    0.1
+}
+
+test float4-generated {
+    CREATE TABLE t (y float8, x float4 GENERATED ALWAYS AS (y) STORED);
+    INSERT INTO t(y) VALUES (0.1);
+    SELECT x FROM t;
+}
+expect {
+    0.1
+}
+
+test float4-domain {
+    CREATE DOMAIN d_float4 AS float4;
+    CREATE TABLE t (x d_float4);
+    INSERT INTO t VALUES (0.1);
+    SELECT x FROM t;
+}
+expect {
+    0.1
+}
+
+test float4-generated-stored-value {
+    CREATE TABLE t (y float8, x float4 GENERATED ALWAYS AS (y) STORED);
+    INSERT INTO t(y) VALUES (0.1);
+    SELECT x = 0.1 FROM t;
+}
+expect {
+    f
+}
+
+test float4-array {
+    CREATE TABLE t (x float4[]);
+    INSERT INTO t VALUES ('{0.1,0.2}');
+    SELECT x FROM t;
+}
+expect {
+    {0.1,0.2}
+}
+
+test float4-array-elem {
+    CREATE TABLE t (x float4[]);
+    INSERT INTO t VALUES ('{0.1,0.2}');
+    SELECT x[1] FROM t;
+}
+expect {
+    0.1
+}
+
+test float4-index-lookup {
+    CREATE TABLE t (x float4);
+    CREATE INDEX i ON t(x);
+    INSERT INTO t VALUES (0.3), (0.1), (0.2);
+    SELECT x FROM t WHERE x > 0.15 ORDER BY x;
+}
+expect {
+    0.2
+    0.3
+}
+
+test float4-unique {
+    CREATE TABLE t (x float4) ;
+    CREATE UNIQUE INDEX u ON t(x);
+    INSERT INTO t VALUES (0.1);
+    INSERT INTO t VALUES (0.1);
+}
+@sqlstate 23505
+expect error {
+}
+
+test float4-coalesce {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (NULL);
+    SELECT coalesce(x, 1) FROM t;
+}
+expect {
+    1
+}
+
+test float4-union-float8 {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1);
+    SELECT x FROM t UNION ALL SELECT 1.5::float8;
+}
+expect {
+    0.10000000149011612
+    1.5
+}
+
+test float4-case {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1);
+    SELECT CASE WHEN x > 0 THEN x ELSE 0 END FROM t;
+}
+expect {
+    0.1
+}
+
+test float4-group-by {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1), (0.1), (0.2);
+    SELECT x, count(*) FROM t GROUP BY x ORDER BY x;
+}
+expect {
+    0.1|2
+    0.2|1
+}
+
+test float4-distinct {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES (0.1), (0.1);
+    SELECT DISTINCT x FROM t;
+}
+expect {
+    0.1
+}
+
+@compat-gap "type:float4"
+test float4-nan {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('NaN');
+    SELECT x::text FROM t;
+}
+expect {
+    NaN
+}
+expect @tursopg {
+}
+
+test float4-inf {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('Infinity');
+    SELECT x::text FROM t;
+}
+expect {
+    Infinity
+}
+
+test float4-neg-zero {
+    CREATE TABLE t (x float4);
+    INSERT INTO t VALUES ('-0');
+    SELECT x::text FROM t;
+}
+expect {
+    -0
+}

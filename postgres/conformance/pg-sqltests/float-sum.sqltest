@@ -1,0 +1,72 @@
+# sum() and avg() of floats add one value at a time, with no error term.
+# The answers come from PostgreSQL 18.
+
+@database :memory:
+
+test float8-sum-of-tenths {
+    SELECT sum(x) FROM (SELECT 0.1::float8 AS x FROM generate_series(1,10)) s;
+}
+expect {
+    0.9999999999999999
+}
+
+test float8-avg-of-tenths {
+    SELECT avg(x) FROM (SELECT 0.1::float8 AS x FROM generate_series(1,10)) s;
+}
+expect {
+    0.09999999999999999
+}
+
+test float8-sum-loses-small-values-next-to-large-ones {
+    SELECT sum(x) FROM (VALUES (1e16::float8), (1::float8), (1::float8), (-1e16::float8)) v(x);
+}
+expect {
+    0
+}
+
+test float8-sum-over-a-moving-window {
+    SELECT sum(x) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+    FROM (VALUES (1, 0.1::float8), (2, 0.2), (3, 0.3), (4, 0.4)) v(i, x)
+    ORDER BY i;
+}
+expect {
+    0.1
+    0.30000000000000004
+    0.5
+    0.7
+}
+
+test float8-sum-and-avg-print-as-doubles {
+    CREATE TABLE f8_agg (d double precision); INSERT INTO f8_agg VALUES (16.0), (1e20), (0.5); SELECT sum(d) FROM f8_agg WHERE d = 16.0;
+}
+expect {
+    16
+}
+
+test float8-avg-prints-as-a-double {
+    CREATE TABLE f8_avg (d double precision); INSERT INTO f8_avg VALUES (16.0); SELECT avg(d), sum(d) + 1, sum(d)::text FROM f8_avg;
+}
+expect {
+    16|17|16
+}
+
+test float8-sum-of-a-large-value {
+    CREATE TABLE f8_big (d double precision); INSERT INTO f8_big VALUES (1e20); SELECT sum(d), max(d), min(d) FROM f8_big;
+}
+expect {
+    1e+20|1e+20|1e+20
+}
+
+test float8-sum-through-a-derived-table {
+    CREATE TABLE f8_der (d double precision); INSERT INTO f8_der VALUES (16.0); SELECT x.s * 2 FROM (SELECT sum(d) AS s FROM f8_der) x;
+}
+expect {
+    32
+}
+
+test float8-sum-as-a-window-function {
+    CREATE TABLE f8_win (d double precision); INSERT INTO f8_win VALUES (16.0); SELECT sum(d) OVER () FROM f8_win;
+}
+expect {
+    16
+}

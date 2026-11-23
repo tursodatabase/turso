@@ -1,0 +1,155 @@
+# pg_typeof, which names the type the engine gives its argument.
+# The answers come from PostgreSQL 18.
+
+@database :memory:
+
+test pg-typeof-integer {
+    SELECT pg_typeof(1);
+}
+expect {
+    integer
+}
+
+test pg-typeof-smallint {
+    SELECT pg_typeof(1::int2);
+}
+expect {
+    smallint
+}
+
+test pg-typeof-bigint {
+    SELECT pg_typeof(1::int8);
+}
+expect {
+    bigint
+}
+
+test pg-typeof-numeric-literal {
+    SELECT pg_typeof(1.5);
+}
+expect {
+    numeric
+}
+
+test pg-typeof-float8 {
+    SELECT pg_typeof(1.5::float8);
+}
+expect {
+    double precision
+}
+
+test pg-typeof-float4 {
+    SELECT pg_typeof(1.5::float4);
+}
+expect {
+    real
+}
+
+test pg-typeof-text {
+    SELECT pg_typeof('a'::text);
+}
+expect {
+    text
+}
+
+test pg-typeof-boolean {
+    SELECT pg_typeof(true);
+}
+expect {
+    boolean
+}
+
+test pg-typeof-timestamp {
+    SELECT pg_typeof('2024-01-01 00:00:00'::timestamp);
+}
+expect {
+    timestamp without time zone
+}
+
+test pg-typeof-timestamptz {
+    SELECT pg_typeof(now());
+}
+expect {
+    timestamp with time zone
+}
+
+test pg-typeof-bytea {
+    SELECT pg_typeof('x'::bytea);
+}
+expect {
+    bytea
+}
+
+test pg-typeof-integer-array {
+    SELECT pg_typeof(ARRAY[1,2]);
+}
+expect {
+    integer[]
+}
+
+test pg-typeof-float4-array {
+    SELECT pg_typeof(ARRAY[1.5::float4]);
+}
+expect {
+    real[]
+}
+
+test pg-typeof-null {
+    SELECT pg_typeof(NULL);
+}
+expect {
+    unknown
+}
+
+@compat-gap "function:pg_typeof"
+test pg-typeof-unknown-literal {
+    SELECT pg_typeof('a');
+}
+expect {
+    unknown
+}
+expect @tursopg {
+    text
+}
+
+test pg-typeof-comparison {
+    SELECT pg_typeof(1 = 1);
+}
+expect {
+    boolean
+}
+
+test pg-typeof-integer-sum {
+    SELECT pg_typeof(1 + 1);
+}
+expect {
+    integer
+}
+
+test pg-typeof-float4-plus-integer {
+    SELECT pg_typeof(1.5::float4 + 1);
+}
+expect {
+    double precision
+}
+
+test pg-typeof-float4-times-float4 {
+    SELECT pg_typeof(1.5::float4 * 1.5::float4);
+}
+expect {
+    real
+}
+
+test pg-typeof-float4-abs {
+    SELECT pg_typeof(abs(1.5::float4));
+}
+expect {
+    real
+}
+
+test pg-typeof-float4-column {
+    CREATE TABLE t (x float4);
+    SELECT pg_typeof(x) FROM t;
+}
+expect {
+}

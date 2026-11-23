@@ -1,0 +1,226 @@
+# PostgreSQL has no comparison of a text with a number. A string literal or a
+# parameter is not a text: it takes the type of the other operand. The answers
+# come from PostgreSQL 18.
+
+@database :memory:
+
+test text-column-equals-an-integer-column {
+    CREATE TABLE t (s text, n int4);
+    SELECT s = n FROM t;
+}
+@sqlstate 42883
+expect error {
+}
+
+test integer-column-equals-a-text-column {
+    CREATE TABLE t (s text, n int4);
+    SELECT n = s FROM t;
+}
+@sqlstate 42883
+expect error {
+}
+
+test int2-column-equals-a-text-cast {
+    CREATE TABLE t (n int2);
+    SELECT n = 'a'::text FROM t;
+}
+@sqlstate 42883
+expect error {
+}
+
+test int8-column-equals-a-text-cast {
+    CREATE TABLE t (n int8);
+    SELECT n = 'a'::text FROM t;
+}
+@sqlstate 42883
+expect error {
+}
+
+test float4-column-equals-a-text-cast {
+    CREATE TABLE t (f float4);
+    SELECT f = 'a'::text FROM t;
+}
+@sqlstate 42883
+expect error {
+}
+
+test float8-column-equals-a-text-cast {
+    CREATE TABLE t (f float8);
+    SELECT f = 'a'::text FROM t;
+}
+@sqlstate 42883
+expect error {
+}
+
+test numeric-column-equals-a-text-cast {
+    CREATE TABLE t (n numeric);
+    SELECT n = 'a'::text FROM t;
+}
+@sqlstate 42883
+expect error {
+}
+
+test text-less-than-an-integer {
+    SELECT 'a'::text < 1;
+}
+@sqlstate 42883
+expect error {
+}
+
+test text-not-equal-to-an-integer {
+    SELECT 'a'::text <> 1::int4;
+}
+@sqlstate 42883
+expect error {
+}
+
+test varchar-column-equals-an-integer {
+    CREATE TABLE t (s varchar(5));
+    SELECT s = 1 FROM t;
+}
+@sqlstate 42883
+expect error {
+}
+
+test text-compared-with-an-integer-in-where {
+    CREATE TABLE t (s text, n int4);
+    INSERT INTO t VALUES ('1', 1);
+    SELECT 1 FROM t WHERE s = n;
+}
+@sqlstate 42883
+expect error {
+}
+
+test text-compared-with-an-integer-in-a-join {
+    CREATE TABLE a (s text);
+    CREATE TABLE b (n int4);
+    SELECT 1 FROM a JOIN b ON a.s = b.n;
+}
+@sqlstate 42883
+expect error {
+}
+
+test integer-column-equals-a-string-literal {
+    CREATE TABLE t (n int4);
+    INSERT INTO t VALUES (1);
+    SELECT n = '1', n < '2', n <> '1' FROM t;
+}
+expect {
+    t|t|f
+}
+
+test text-column-equals-a-string-literal {
+    CREATE TABLE t (s text);
+    INSERT INTO t VALUES ('1');
+    SELECT s = '1', s < '2' FROM t;
+}
+expect {
+    t|t
+}
+
+test text-column-equals-a-text-cast-of-an-integer {
+    CREATE TABLE t (s text, n int4);
+    INSERT INTO t VALUES ('1', 1);
+    SELECT s = n::text FROM t;
+}
+expect {
+    t
+}
+
+test integer-column-equals-an-integer-cast-of-a-text {
+    CREATE TABLE t (s text, n int4);
+    INSERT INTO t VALUES ('1', 1);
+    SELECT n = s::int4 FROM t;
+}
+expect {
+    t
+}
+
+test integer-columns-compare {
+    CREATE TABLE t (a int4, b int8, c int2);
+    INSERT INTO t VALUES (1, 1, 1);
+    SELECT a = b, b = c, a < c, a <> b FROM t;
+}
+expect {
+    t|t|f|f
+}
+
+test text-column-in-a-list-of-integers {
+    CREATE TABLE t (s text);
+    SELECT 1 FROM t WHERE s IN (1, 2);
+}
+@sqlstate 42883
+expect error {
+}
+
+test text-column-not-in-a-list-of-integers {
+    CREATE TABLE t (s text);
+    SELECT 1 FROM t WHERE s NOT IN (1, 2);
+}
+@sqlstate 42883
+expect error {
+}
+
+test integer-column-in-a-list-with-a-text {
+    CREATE TABLE t (n int4);
+    SELECT 1 FROM t WHERE n IN (1, 'a'::text);
+}
+@sqlstate 42883
+expect error {
+}
+
+test text-column-between-integers {
+    CREATE TABLE t (s text);
+    SELECT 1 FROM t WHERE s BETWEEN 1 AND 2;
+}
+@sqlstate 42883
+expect error {
+}
+
+test integer-column-between-texts {
+    CREATE TABLE t (n int4);
+    SELECT 1 FROM t WHERE n BETWEEN 'a'::text AND 'b'::text;
+}
+@sqlstate 42883
+expect error {
+}
+
+test integer-column-in-a-list-of-integers-and-string-literals {
+    CREATE TABLE t (n int4);
+    INSERT INTO t VALUES (1), (2), (5);
+    SELECT n FROM t WHERE n IN (1, '2') ORDER BY n;
+}
+expect {
+    1
+    2
+}
+
+test integer-column-between-integers-and-a-string-literal {
+    CREATE TABLE t (n int4);
+    INSERT INTO t VALUES (1), (2), (5);
+    SELECT n FROM t WHERE n BETWEEN 2 AND '5' ORDER BY n;
+}
+expect {
+    2
+    5
+}
+
+test text-column-in-a-list-of-string-literals {
+    CREATE TABLE t (s text);
+    INSERT INTO t VALUES ('a'), ('b'), ('c');
+    SELECT s FROM t WHERE s IN ('a', 'c') AND s BETWEEN 'a' AND 'b';
+}
+expect {
+    a
+}
+
+@compat-gap "operator:text = int4"
+test text-column-in-a-subquery-of-integers {
+    CREATE TABLE t (s text);
+    SELECT 1 FROM t WHERE s IN (SELECT 1);
+}
+@sqlstate 42883
+expect error {
+}
+expect @tursopg {
+}

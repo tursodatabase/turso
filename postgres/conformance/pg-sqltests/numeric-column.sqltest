@@ -1,0 +1,163 @@
+# A numeric column with no type modifier keeps its values exactly, as
+# PostgreSQL does. The answers come from PostgreSQL 18.
+
+@database :memory:
+
+test numeric-column-keeps-values-beyond-float-precision {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('12345678901234567890.123456789');
+    SELECT x FROM t;
+}
+expect {
+    12345678901234567890.123456789
+}
+
+test numeric-column-keeps-the-scale-of-each-value {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('1.50'), ('12.345'), ('2');
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+    1.50
+    2
+    12.345
+}
+
+test numeric-column-compares-equal-values-of-different-scale {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('1.5'), ('1.50'), ('1.500');
+    SELECT count(DISTINCT x) FROM t;
+}
+expect {
+    1
+}
+
+test numeric-column-adds-without-rounding {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('0.1');
+    SELECT x + '0.2'::numeric FROM t;
+}
+expect {
+    0.3
+}
+
+test numeric-column-is-a-numeric {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('1');
+    SELECT pg_typeof(x) FROM t;
+}
+expect {
+    numeric
+}
+
+test numeric-column-keeps-large-values-exact {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('1000000000000000000000000000000');
+    SELECT x + 1 FROM t;
+}
+expect {
+    1000000000000000000000000000001
+}
+
+test numeric-column-casts-to-an-integer-half-away-from-zero {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('12.5'), ('-2.5'), ('2.4999');
+    SELECT x::int4 FROM t ORDER BY x;
+}
+expect {
+    -3
+    2
+    13
+}
+
+test numeric-column-cast-to-integer-checks-the-range {
+    CREATE TABLE t (x numeric);
+    INSERT INTO t VALUES ('1000000000000000000000000000000');
+    SELECT x::int8 FROM t;
+}
+@sqlstate 22003
+expect error {}
+
+test indexed-numeric-equal-to-a-string-literal {
+    CREATE TABLE nx_idx (n numeric, n2 numeric(10,2), id uuid, ts timestamptz); CREATE INDEX nx_idx_n ON nx_idx (n); CREATE INDEX nx_idx_n2 ON nx_idx (n2); CREATE INDEX nx_idx_id ON nx_idx (id); CREATE INDEX nx_idx_ts ON nx_idx (ts); INSERT INTO nx_idx VALUES (1.5, 1.50, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-01-01Z'), (2.25, 2.25, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2025-06-01Z'), (10, 10, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2023-01-01Z'), (-3.5, -3.5, 'd0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2022-01-01Z'); SELECT count(*) FROM nx_idx WHERE n = '1.5';
+}
+expect {
+    1
+}
+
+test indexed-numeric-equal-to-a-decimal-with-trailing-zero {
+    CREATE TABLE nx_idx (n numeric, n2 numeric(10,2), id uuid, ts timestamptz); CREATE INDEX nx_idx_n ON nx_idx (n); CREATE INDEX nx_idx_n2 ON nx_idx (n2); CREATE INDEX nx_idx_id ON nx_idx (id); CREATE INDEX nx_idx_ts ON nx_idx (ts); INSERT INTO nx_idx VALUES (1.5, 1.50, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-01-01Z'), (2.25, 2.25, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2025-06-01Z'), (10, 10, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2023-01-01Z'), (-3.5, -3.5, 'd0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2022-01-01Z'); SELECT count(*) FROM nx_idx WHERE n = 1.50;
+}
+expect {
+    1
+}
+
+test indexed-numeric-greater-than-a-decimal {
+    CREATE TABLE nx_idx (n numeric, n2 numeric(10,2), id uuid, ts timestamptz); CREATE INDEX nx_idx_n ON nx_idx (n); CREATE INDEX nx_idx_n2 ON nx_idx (n2); CREATE INDEX nx_idx_id ON nx_idx (id); CREATE INDEX nx_idx_ts ON nx_idx (ts); INSERT INTO nx_idx VALUES (1.5, 1.50, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-01-01Z'), (2.25, 2.25, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2025-06-01Z'), (10, 10, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2023-01-01Z'), (-3.5, -3.5, 'd0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2022-01-01Z'); SELECT count(*) FROM nx_idx WHERE n > 1.5;
+}
+expect {
+    2
+}
+
+test indexed-numeric-less-than-a-decimal {
+    CREATE TABLE nx_idx (n numeric, n2 numeric(10,2), id uuid, ts timestamptz); CREATE INDEX nx_idx_n ON nx_idx (n); CREATE INDEX nx_idx_n2 ON nx_idx (n2); CREATE INDEX nx_idx_id ON nx_idx (id); CREATE INDEX nx_idx_ts ON nx_idx (ts); INSERT INTO nx_idx VALUES (1.5, 1.50, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-01-01Z'), (2.25, 2.25, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2025-06-01Z'), (10, 10, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2023-01-01Z'), (-3.5, -3.5, 'd0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2022-01-01Z'); SELECT count(*) FROM nx_idx WHERE n < 2.25;
+}
+expect {
+    2
+}
+
+test indexed-numeric-between-integers {
+    CREATE TABLE nx_idx (n numeric, n2 numeric(10,2), id uuid, ts timestamptz); CREATE INDEX nx_idx_n ON nx_idx (n); CREATE INDEX nx_idx_n2 ON nx_idx (n2); CREATE INDEX nx_idx_id ON nx_idx (id); CREATE INDEX nx_idx_ts ON nx_idx (ts); INSERT INTO nx_idx VALUES (1.5, 1.50, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-01-01Z'), (2.25, 2.25, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2025-06-01Z'), (10, 10, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2023-01-01Z'), (-3.5, -3.5, 'd0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2022-01-01Z'); SELECT count(*) FROM nx_idx WHERE n BETWEEN 1 AND 3;
+}
+expect {
+    2
+}
+
+test indexed-numeric-with-a-scale-equal-to-a-string-literal {
+    CREATE TABLE nx_idx (n numeric, n2 numeric(10,2), id uuid, ts timestamptz); CREATE INDEX nx_idx_n ON nx_idx (n); CREATE INDEX nx_idx_n2 ON nx_idx (n2); CREATE INDEX nx_idx_id ON nx_idx (id); CREATE INDEX nx_idx_ts ON nx_idx (ts); INSERT INTO nx_idx VALUES (1.5, 1.50, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-01-01Z'), (2.25, 2.25, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2025-06-01Z'), (10, 10, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2023-01-01Z'), (-3.5, -3.5, 'd0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2022-01-01Z'); SELECT count(*) FROM nx_idx WHERE n2 = '2.25';
+}
+expect {
+    1
+}
+
+test indexed-numeric-with-a-scale-at-least-a-decimal {
+    CREATE TABLE nx_idx (n numeric, n2 numeric(10,2), id uuid, ts timestamptz); CREATE INDEX nx_idx_n ON nx_idx (n); CREATE INDEX nx_idx_n2 ON nx_idx (n2); CREATE INDEX nx_idx_id ON nx_idx (id); CREATE INDEX nx_idx_ts ON nx_idx (ts); INSERT INTO nx_idx VALUES (1.5, 1.50, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-01-01Z'), (2.25, 2.25, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2025-06-01Z'), (10, 10, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2023-01-01Z'), (-3.5, -3.5, 'd0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2022-01-01Z'); SELECT count(*) FROM nx_idx WHERE n2 >= 2.25;
+}
+expect {
+    2
+}
+
+test indexed-numeric-with-a-scale-negative {
+    CREATE TABLE nx_idx (n numeric, n2 numeric(10,2), id uuid, ts timestamptz); CREATE INDEX nx_idx_n ON nx_idx (n); CREATE INDEX nx_idx_n2 ON nx_idx (n2); CREATE INDEX nx_idx_id ON nx_idx (id); CREATE INDEX nx_idx_ts ON nx_idx (ts); INSERT INTO nx_idx VALUES (1.5, 1.50, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-01-01Z'), (2.25, 2.25, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2025-06-01Z'), (10, 10, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2023-01-01Z'), (-3.5, -3.5, 'd0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2022-01-01Z'); SELECT count(*) FROM nx_idx WHERE n2 < 0;
+}
+expect {
+    1
+}
+
+test indexed-uuid-equal-to-a-literal {
+    CREATE TABLE nx_idx (n numeric, n2 numeric(10,2), id uuid, ts timestamptz); CREATE INDEX nx_idx_n ON nx_idx (n); CREATE INDEX nx_idx_n2 ON nx_idx (n2); CREATE INDEX nx_idx_id ON nx_idx (id); CREATE INDEX nx_idx_ts ON nx_idx (ts); INSERT INTO nx_idx VALUES (1.5, 1.50, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-01-01Z'), (2.25, 2.25, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2025-06-01Z'), (10, 10, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2023-01-01Z'), (-3.5, -3.5, 'd0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2022-01-01Z'); SELECT count(*) FROM nx_idx WHERE id = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+}
+expect {
+    1
+}
+
+test indexed-uuid-greater-than-a-literal {
+    CREATE TABLE nx_idx (n numeric, n2 numeric(10,2), id uuid, ts timestamptz); CREATE INDEX nx_idx_n ON nx_idx (n); CREATE INDEX nx_idx_n2 ON nx_idx (n2); CREATE INDEX nx_idx_id ON nx_idx (id); CREATE INDEX nx_idx_ts ON nx_idx (ts); INSERT INTO nx_idx VALUES (1.5, 1.50, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-01-01Z'), (2.25, 2.25, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2025-06-01Z'), (10, 10, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2023-01-01Z'), (-3.5, -3.5, 'd0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2022-01-01Z'); SELECT count(*) FROM nx_idx WHERE id > 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+}
+expect {
+    2
+}
+
+test indexed-timestamptz-range-of-literals {
+    CREATE TABLE nx_idx (n numeric, n2 numeric(10,2), id uuid, ts timestamptz); CREATE INDEX nx_idx_n ON nx_idx (n); CREATE INDEX nx_idx_n2 ON nx_idx (n2); CREATE INDEX nx_idx_id ON nx_idx (id); CREATE INDEX nx_idx_ts ON nx_idx (ts); INSERT INTO nx_idx VALUES (1.5, 1.50, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-01-01Z'), (2.25, 2.25, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2025-06-01Z'), (10, 10, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2023-01-01Z'), (-3.5, -3.5, 'd0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2022-01-01Z'); SELECT count(*) FROM nx_idx WHERE ts >= '2023-01-01' AND ts < '2025-01-01';
+}
+expect {
+    2
+}
+
+test indexed-timestamptz-equal-to-a-literal {
+    CREATE TABLE nx_idx (n numeric, n2 numeric(10,2), id uuid, ts timestamptz); CREATE INDEX nx_idx_n ON nx_idx (n); CREATE INDEX nx_idx_n2 ON nx_idx (n2); CREATE INDEX nx_idx_id ON nx_idx (id); CREATE INDEX nx_idx_ts ON nx_idx (ts); INSERT INTO nx_idx VALUES (1.5, 1.50, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-01-01Z'), (2.25, 2.25, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2025-06-01Z'), (10, 10, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2023-01-01Z'), (-3.5, -3.5, 'd0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2022-01-01Z'); SELECT count(*) FROM nx_idx WHERE ts = '2025-06-01Z';
+}
+expect {
+    1
+}

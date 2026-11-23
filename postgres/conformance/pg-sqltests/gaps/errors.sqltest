@@ -246,25 +246,19 @@ expect error {}
 
 # D-22: invalid int into int column
 @setup t_n
-@compat-gap "type:int4"
 test invalid-int-into-int-column {
     INSERT INTO t VALUES ('abc');
 }
 @sqlstate 22P02
 expect error {}
-@sqlstate 23000
-expect @tursopg error {}
 
 # D-23: invalid uuid into uuid column
-@compat-gap "type:uuid"
 test invalid-uuid-into-uuid-column {
     CREATE TABLE t (u uuid);
     INSERT INTO t VALUES ('nope');
 }
 @sqlstate 22P02
 expect error {}
-@sqlstate P0001
-expect @tursopg error {}
 
 # D-24: invalid timestamptz into column
 test invalid-timestamptz-into-column {
@@ -283,15 +277,12 @@ test invalid-json-into-jsonb-column {
 expect error {}
 
 # D-26: invalid bool into bool column
-@compat-gap "type:bool"
 test invalid-bool-into-bool-column {
     CREATE TABLE t (b boolean);
     INSERT INTO t VALUES ('maybe');
 }
 @sqlstate 22P02
 expect error {}
-@sqlstate 23000
-expect @tursopg error {}
 
 # D-27: integer division by zero
 test integer-division-by-zero {
@@ -334,26 +325,20 @@ expect error {}
 expect @tursopg error {}
 
 # D-32: numeric(p,s) overflow
-@compat-gap "type:numeric"
 test numeric-p-s-overflow {
     CREATE TABLE t (n numeric(5,2));
     INSERT INTO t VALUES (12345.678);
 }
 @sqlstate 22003
 expect error {}
-@sqlstate 23000
-expect @tursopg error {}
 
 # D-33: int4 column overflow
 @setup t_n
-@compat-gap "type:int4"
 test int4-column-overflow {
     INSERT INTO t VALUES (2147483648);
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-}
 
 # D-34: smallint column overflow
 test smallint-column-overflow {

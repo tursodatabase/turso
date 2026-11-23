@@ -9,6 +9,7 @@ use turso_parser::ast;
 
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
+use crate::dialect::{Dialect, OperandType};
 use crate::function::{AggFunc, Func, ResultType, ReturnType, ScalarFunc, WindowFunc};
 use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
@@ -65,6 +66,10 @@ pub enum BuiltinType {
     Decimal,
     /// A number that may be an integer or a real.
     Numeric,
+    /// The result of a comparison, `NOT`, `IN`, `LIKE` and the like: 1, 0 or
+    /// NULL. SQLite has no boolean type, so it is an integer wherever SQLite
+    /// computes with it; a dialect that has a boolean type can tell it apart.
+    Boolean,
     Text,
     Blob,
     /// Any value: a column without a declared type, or a SQLite function that may
@@ -75,7 +80,7 @@ pub enum BuiltinType {
 impl BuiltinType {
     pub(crate) fn affinity(self) -> Affinity {
         match self {
-            Self::Integer => Affinity::Integer,
+            Self::Integer | Self::Boolean => Affinity::Integer,
             Self::Real | Self::Decimal => Affinity::Real,
             Self::Numeric => Affinity::Numeric,
             Self::Text => Affinity::Text,
@@ -88,7 +93,7 @@ impl BuiltinType {
     /// written in the statement is a REAL to SQLite.
     pub(crate) fn sqlite_name(self) -> &'static str {
         match self {
-            Self::Integer => "INTEGER",
+            Self::Integer | Self::Boolean => "INTEGER",
             Self::Real | Self::Decimal => "REAL",
             Self::Numeric => "NUMERIC",
             Self::Text => "TEXT",
@@ -160,6 +165,7 @@ impl std::fmt::Display for ExprType {
             } => write!(f, "{element}{}", "[]".repeat(*dimensions as usize)),
             Self::Builtin(builtin) => f.write_str(match builtin {
                 BuiltinType::Integer => "integer",
+                BuiltinType::Boolean => "boolean",
                 BuiltinType::Real => "real",
                 BuiltinType::Decimal | BuiltinType::Numeric => "numeric",
                 BuiltinType::Text => "text",
@@ -244,14 +250,14 @@ impl<'a> TypeEnv<'a> {
         }
     }
 
-    fn tables(&self) -> Option<&TableReferences> {
+    pub(super) fn tables(&self) -> Option<&TableReferences> {
         match self {
             Self::Statement { tables, .. } => *tables,
             Self::Table { .. } | Self::TypeBody { .. } => None,
         }
     }
 
-    fn resolver(&self) -> Option<&Resolver<'a>> {
+    pub(super) fn resolver(&self) -> Option<&Resolver<'a>> {
         match self {
             Self::Statement { resolver, .. } => Some(resolver),
             Self::Table { .. } | Self::TypeBody { .. } => None,
@@ -312,9 +318,14 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
         ast::Expr::Cast {
             type_name: Some(type_name),
             ..
-        } => cast_type(type_name, env.schema()),
+        } => cast_type(
+            type_name,
+            env.schema(),
+            env.resolver()
+                .map(|resolver| resolver.catalog.dialect.as_ref()),
+        ),
         ast::Expr::Unary(op, inner) => match op {
-            ast::UnaryOperator::Not => ExprType::Builtin(BuiltinType::Integer),
+            ast::UnaryOperator::Not => ExprType::Builtin(BuiltinType::Boolean),
             ast::UnaryOperator::BitwiseNot => {
                 custom_operator_type(expr, &[type_of(inner, env)], env)
                     .unwrap_or(ExprType::Builtin(BuiltinType::Integer))
@@ -385,7 +396,7 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
         | ast::Expr::SubqueryResult {
             query_type: ast::SubqueryType::Exists { .. } | ast::SubqueryType::In { .. },
             ..
-        } => ExprType::Builtin(BuiltinType::Integer),
+        } => ExprType::Builtin(BuiltinType::Boolean),
         // `x REGEXP p` calls regexp(p, x), which an extension may define.
         ast::Expr::Like {
             op: ast::LikeOperator::Regexp,
@@ -408,9 +419,11 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
         ast::Expr::Raise(..) => ExprType::Null,
         // Expressions whose value is never a custom-type value. SQLite's affinity
         // gives their built-in type.
-        ast::Expr::FunctionCallStar { .. }
+        ast::Expr::FunctionCallStar { name, .. } => {
+            function_star_type(name, env).unwrap_or_else(|| affinity_type(expr, env))
+        }
         // `CAST(x AS)`, a SQLite cast with no type name.
-        | ast::Expr::Cast {
+        ast::Expr::Cast {
             type_name: None, ..
         } => affinity_type(expr, env),
         ast::Expr::Id(name) | ast::Expr::Name(name) => env.name_type(name.as_str()),
@@ -617,19 +630,32 @@ pub(crate) fn compound_column_type<'p>(
     column: usize,
     resolver: &Resolver,
 ) -> ExprType {
-    common_of_types(
+    common_type_of(
         arms.into_iter()
-            .map(|select| select_column_type(select, column, resolver)),
+            .map(|select| select_column_type(select, column, resolver))
+            .collect(),
+        Some(resolver),
         resolver.schema(),
     )
 }
 
-fn select_column_type(select: &SelectPlan, column: usize, resolver: &Resolver) -> ExprType {
+pub(crate) fn select_column_type(
+    select: &SelectPlan,
+    column: usize,
+    resolver: &Resolver,
+) -> ExprType {
+    let env = TypeEnv::new(Some(&select.table_references), resolver);
+    if !select.values.is_empty() {
+        let types = select
+            .values
+            .iter()
+            .filter_map(|row| row.get(column))
+            .map(|value| type_of(value, &env))
+            .collect();
+        return common_type_of(types, Some(resolver), resolver.schema());
+    }
     match select.result_columns.get(column) {
-        Some(result_column) => type_of(
-            &result_column.expr,
-            &TypeEnv::new(Some(&select.table_references), resolver),
-        ),
+        Some(result_column) => type_of(&result_column.expr, &env),
         None => ExprType::Unknown,
     }
 }
@@ -744,9 +770,9 @@ pub(crate) fn column_type(column: &Column, is_strict: bool, schema: &Schema) -> 
     ExprType::array(scalar, column.array_dimensions())
 }
 
-fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
+fn cast_type(type_name: &ast::Type, schema: &Schema, dialect: Option<&dyn Dialect>) -> ExprType {
     let name = crate::util::dequote(&type_name.name);
-    let scalar = match custom_cast_target(&name, type_name, schema) {
+    let scalar = match custom_cast_target(&name, type_name, schema, dialect) {
         Some(custom) => custom,
         None => match Affinity::of_written_type(&name) {
             // A CAST to BLOB always gives a blob.
@@ -761,9 +787,14 @@ fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
     ExprType::array(scalar, type_name.array_dimensions)
 }
 
-fn custom_cast_target(name: &str, type_name: &ast::Type, schema: &Schema) -> Option<ExprType> {
+fn custom_cast_target(
+    name: &str,
+    type_name: &ast::Type,
+    schema: &Schema,
+    dialect: Option<&dyn Dialect>,
+) -> Option<ExprType> {
     let type_def = schema.get_type_def_unchecked(name)?;
-    if super::is_sqlite_cast_to(type_def, type_name) {
+    if super::is_sqlite_cast_to(type_def, type_name, dialect) {
         return None;
     }
     Some(ExprType::Custom {
@@ -790,7 +821,7 @@ fn call_result_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
             type_def: Arc::clone(type_def),
             params: Vec::new(),
         },
-        None => cast_type(type_name, schema),
+        None => cast_type(type_name, schema, None),
     }
 }
 
@@ -809,6 +840,9 @@ fn binary_type(
         | Operator::Divide
         | Operator::Modulus => {
             let types = [type_of(lhs, env), type_of(rhs, env)];
+            if dialect_uses_sqlite_arithmetic(op, &types, env) {
+                return ExprType::Builtin(BuiltinType::Real);
+            }
             custom_operator_type(expr, &types, env).unwrap_or_else(|| {
                 let [lhs_type, rhs_type] = types;
                 arithmetic_type(
@@ -821,8 +855,8 @@ fn binary_type(
             custom_operator_type(expr, &[type_of(lhs, env), type_of(rhs, env)], env)
                 .unwrap_or(ExprType::Builtin(BuiltinType::Integer))
         }
-        Operator::BitwiseNot
-        | Operator::Equals
+        Operator::BitwiseNot => ExprType::Builtin(BuiltinType::Integer),
+        Operator::Equals
         | Operator::NotEquals
         | Operator::Less
         | Operator::LessEquals
@@ -833,7 +867,7 @@ fn binary_type(
         | Operator::And
         | Operator::Or
         | Operator::ArrayContains
-        | Operator::ArrayOverlap => ExprType::Builtin(BuiltinType::Integer),
+        | Operator::ArrayOverlap => ExprType::Builtin(BuiltinType::Boolean),
         // `||` joins arrays when either side is an array.
         Operator::Concat => {
             let lhs = type_of(lhs, env);
@@ -852,6 +886,26 @@ fn binary_type(
         // `->>` gives the SQL value it extracts, whose kind varies.
         Operator::ArrowRightShift => affinity_type(expr, env),
     }
+}
+
+/// Whether the dialect runs SQLite's arithmetic on operands of these types.
+fn dialect_uses_sqlite_arithmetic(op: &ast::Operator, types: &[ExprType], env: &TypeEnv) -> bool {
+    let Some(resolver) = env.resolver() else {
+        return false;
+    };
+    let symbol = match op {
+        ast::Operator::Add => "+",
+        ast::Operator::Subtract => "-",
+        ast::Operator::Multiply => "*",
+        ast::Operator::Divide => "/",
+        ast::Operator::Modulus => "%",
+        _ => return false,
+    };
+    let operand_types = || types.iter().map(dialect_operand_type).collect();
+    resolver
+        .catalog
+        .dialect
+        .uses_sqlite_arithmetic(symbol, &operand_types)
 }
 
 /// The type of the operator expression `expr` when a custom type's function runs
@@ -886,6 +940,7 @@ fn operand_type(ty: ExprType, custom_type: impl FnOnce(&TypeDef) -> ExprType) ->
     match &ty {
         ExprType::Custom { type_def, .. } => custom_type(type_def),
         ExprType::Builtin(BuiltinType::Decimal) => ExprType::Builtin(BuiltinType::Real),
+        ExprType::Builtin(BuiltinType::Boolean) => ExprType::Builtin(BuiltinType::Integer),
         ExprType::Builtin(_)
         | ExprType::Array { .. }
         | ExprType::Untyped
@@ -1008,6 +1063,7 @@ pub(crate) fn value_kind(ty: &ExprType, schema: &Schema) -> Option<BuiltinType> 
         ExprType::Builtin(BuiltinType::Decimal) => Some(BuiltinType::Real),
         ExprType::Builtin(
             builtin @ (BuiltinType::Integer
+            | BuiltinType::Boolean
             | BuiltinType::Real
             | BuiltinType::Numeric
             | BuiltinType::Text
@@ -1058,7 +1114,32 @@ fn arithmetic_type(lhs: &ExprType, rhs: &ExprType) -> ExprType {
     })
 }
 
+fn function_star_type(name: &ast::Name, env: &TypeEnv) -> Option<ExprType> {
+    let resolver = env.resolver()?;
+    let no_args = || Vec::new();
+    resolver
+        .catalog
+        .dialect
+        .function_result_type(name.as_str(), &no_args, env.schema())
+        .map(from_operand_type)
+}
+
 fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> ExprType {
+    if let Some(resolver) = env.resolver() {
+        let arg_types = || {
+            args.iter()
+                .map(|arg| dialect_operand_type(&type_of(arg, env)))
+                .collect()
+        };
+        if let Some(ty) =
+            resolver
+                .catalog
+                .dialect
+                .function_result_type(name.as_str(), &arg_types, env.schema())
+        {
+            return from_operand_type(ty);
+        }
+    }
     let Ok(Some(func)) = env.resolve_function(name.as_str(), args.len()) else {
         return ExprType::Builtin(BuiltinType::Any);
     };
@@ -1127,6 +1208,7 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
             Some(
                 ExprType::Builtin(
                     BuiltinType::Integer
+                    | BuiltinType::Boolean
                     | BuiltinType::Real
                     | BuiltinType::Numeric
                     | BuiltinType::Decimal
@@ -1218,7 +1300,54 @@ pub(crate) fn common_type<'e>(
     exprs: impl Iterator<Item = &'e ast::Expr>,
     env: &TypeEnv,
 ) -> ExprType {
-    common_of_types(exprs.map(|expr| type_of(expr, env)), env.schema())
+    let types: Vec<ExprType> = exprs.map(|expr| type_of(expr, env)).collect();
+    common_type_of(types, env.resolver(), env.schema())
+}
+
+/// The common type of `types`, as the dialect gives it or else as the engine does.
+fn common_type_of(types: Vec<ExprType>, resolver: Option<&Resolver>, schema: &Schema) -> ExprType {
+    if let Some(resolver) = resolver {
+        let operand_types = || types.iter().map(dialect_operand_type).collect();
+        if let Some(ty) = resolver.catalog.dialect.common_type(&operand_types) {
+            return from_operand_type(ty);
+        }
+    }
+    common_of_types(types.into_iter(), schema)
+}
+
+/// The type of an operand as a dialect sees it.
+pub(crate) fn dialect_operand_type(ty: &ExprType) -> OperandType {
+    match ty {
+        ExprType::Untyped | ExprType::Builtin(BuiltinType::Any) => OperandType::Untyped,
+        ExprType::Null => OperandType::Null,
+        ExprType::Builtin(BuiltinType::Integer) => OperandType::Integer,
+        ExprType::Builtin(BuiltinType::Boolean) => OperandType::Boolean,
+        ExprType::Builtin(BuiltinType::Real) => OperandType::Real,
+        ExprType::Builtin(BuiltinType::Decimal | BuiltinType::Numeric) => OperandType::Decimal,
+        ExprType::Builtin(BuiltinType::Text) => OperandType::Text,
+        ExprType::Builtin(BuiltinType::Blob) => OperandType::Blob,
+        ExprType::Custom { type_def, .. } => OperandType::Custom(Arc::clone(type_def)),
+        ExprType::Array { .. } => OperandType::Array,
+        _ => OperandType::Unknown,
+    }
+}
+
+fn from_operand_type(ty: OperandType) -> ExprType {
+    match ty {
+        OperandType::Untyped => ExprType::Untyped,
+        OperandType::Null => ExprType::Null,
+        OperandType::Integer => ExprType::Builtin(BuiltinType::Integer),
+        OperandType::Boolean => ExprType::Builtin(BuiltinType::Boolean),
+        OperandType::Real => ExprType::Builtin(BuiltinType::Real),
+        OperandType::Decimal => ExprType::Builtin(BuiltinType::Decimal),
+        OperandType::Text => ExprType::Builtin(BuiltinType::Text),
+        OperandType::Blob => ExprType::Builtin(BuiltinType::Blob),
+        OperandType::Custom(type_def) => ExprType::Custom {
+            type_def,
+            params: Vec::new(),
+        },
+        OperandType::Array | OperandType::Unknown => ExprType::Unknown,
+    }
 }
 
 fn common_of_types(types: impl Iterator<Item = ExprType>, schema: &Schema) -> ExprType {
@@ -1268,6 +1397,16 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
             ExprType::Untyped | ExprType::Builtin(Text),
         ) => ExprType::Builtin(Text),
         (ExprType::Builtin(a), ExprType::Builtin(b)) if a == b => ExprType::Builtin(a),
+        (ExprType::Builtin(BuiltinType::Boolean), custom @ ExprType::Custom { .. })
+        | (custom @ ExprType::Custom { .. }, ExprType::Builtin(BuiltinType::Boolean))
+            if matches!(&custom, ExprType::Custom { type_def, .. } if type_def.name == "boolean") =>
+        {
+            custom
+        }
+        (ExprType::Builtin(BuiltinType::Boolean), other)
+        | (other, ExprType::Builtin(BuiltinType::Boolean)) => {
+            common_scalar_type(ExprType::Builtin(Integer), other, schema)
+        }
         (ExprType::Builtin(Decimal), ExprType::Builtin(Integer))
         | (ExprType::Builtin(Integer), ExprType::Builtin(Decimal)) => ExprType::Builtin(Decimal),
         (
@@ -1851,6 +1990,7 @@ mod tests {
             accepts_collate: false,
             range_offsets: RangeOffsets::Numeric,
             stored_form_sorts_in_value_order: false,
+            can_be_rowid_alias: false,
         };
         TypeDef::from_create_type("numeric", &body, origin, sql.to_string()).unwrap()
     }
@@ -1891,6 +2031,7 @@ mod tests {
             accepts_collate: false,
             range_offsets: RangeOffsets::Integer,
             stored_form_sorts_in_value_order: false,
+            can_be_rowid_alias: false,
         };
         TypeDef::from_create_type("smallint", &body, origin, sql.to_string()).unwrap()
     }

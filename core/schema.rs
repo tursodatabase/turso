@@ -299,14 +299,24 @@ pub enum OperatorArg {
     EncodableLiteral,
     /// Any value of this type.
     Value,
-    /// A value SQLite can compute with: anything without a custom type, or a
-    /// value of a type whose only way to run the operator is SQLite's.
+    /// A value SQLite can compute with: anything without a custom type, a
+    /// value of a type whose only way to run the operator is SQLite's, or a
+    /// value of a type that stores plain integers.
     PlainValue,
     /// A `PlainValue` that is an integer, or whose type is not known before the
     /// statement runs, such as a parameter. The function rejects anything else.
     Integer,
     /// A `PlainValue` that is neither a `Real` nor a blob.
     Exact,
+    /// Any value without a custom type. Unlike `PlainValue`, a value of a type
+    /// that stores plain integers is not one.
+    Untyped,
+    /// An `Untyped` value that is an integer, or whose type is not known before
+    /// the statement runs.
+    UntypedInteger,
+    /// A value of the named type, which is not the type that declares the
+    /// signature.
+    Type(&'static str),
     /// A REAL value: a REAL column, a CAST to REAL, arithmetic on two plain
     /// values. A decimal written in the statement, such as `0.5`, `-0.5` or
     /// the `0.5` of `(SELECT 0.5)`, is not one: as in PostgreSQL, it is an
@@ -450,6 +460,20 @@ pub struct ResolvedType {
 }
 
 impl ResolvedType {
+    /// Whether a PRIMARY KEY of the type is the rowid: the type says so and
+    /// keeps its values as the plain integers it stores, with no ENCODE or
+    /// DECODE in the chain.
+    pub fn can_be_rowid_alias(&self) -> bool {
+        self.primitive.eq_ignore_ascii_case("integer")
+            && self
+                .base_type()
+                .is_some_and(|type_def| type_def.can_be_rowid_alias)
+            && self
+                .chain
+                .iter()
+                .all(|type_def| type_def.encode().is_none() && type_def.decode().is_none())
+    }
+
     /// The leaf (directly named) type definition.
     pub fn leaf(&self) -> &TypeDef {
         &self.chain[0]
@@ -563,6 +587,11 @@ pub struct TypeDef {
     /// built-in date and time types, which store one text form with a 4-digit
     /// year. False for a domain, whose index then serves only `=`.
     pub stored_form_sorts_in_value_order: bool,
+    /// Whether a single-column PRIMARY KEY of the type is the rowid, as
+    /// `INTEGER PRIMARY KEY` is. Only a built-in type that stores plain
+    /// integers can say so, and only one that no database has a table of yet:
+    /// a table made before the type said so keeps the key in its rows.
+    pub can_be_rowid_alias: bool,
     /// Original SQL for round-trip persistence. Stored verbatim from creation.
     pub sql: String,
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
@@ -643,6 +672,14 @@ impl TypeDef {
         self.decode().is_none_or(
             |decode| matches!(decode, ast::Expr::Id(name) if name.as_str().eq_ignore_ascii_case("value")),
         )
+    }
+
+    /// Whether the type keeps its values as plain integers: its BASE is
+    /// integer and it has no ENCODE and no DECODE.
+    pub fn stores_plain_integers(&self) -> bool {
+        self.base().eq_ignore_ascii_case("integer")
+            && self.encode().is_none()
+            && self.decode().is_none()
     }
 
     /// Returns the base type name.
@@ -825,10 +862,12 @@ impl TypeDef {
                             "built-in type {type_name} has BASE {base}"
                         )));
                     };
-                    let kinds = ValueKinds {
-                        read: builtin_value_type(type_name)?,
-                        stored,
+                    let read = if decode.is_none() {
+                        stored
+                    } else {
+                        builtin_value_type(type_name)?
                     };
+                    let kinds = ValueKinds { read, stored };
                     (
                         builtin_ordering(type_name),
                         Some(kinds),
@@ -859,6 +898,12 @@ impl TypeDef {
                             ..
                         } => stored_form_sorts_in_value_order,
                         // A user type's ENCODE may store any form.
+                        TypeOrigin::User => false,
+                    },
+                    can_be_rowid_alias: match origin {
+                        TypeOrigin::Builtin {
+                            can_be_rowid_alias, ..
+                        } => can_be_rowid_alias,
                         TypeOrigin::User => false,
                     },
                     sql,
@@ -897,6 +942,7 @@ impl TypeDef {
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
                     stored_form_sorts_in_value_order: false,
+                    can_be_rowid_alias: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Struct(StructDef {
@@ -932,6 +978,7 @@ impl TypeDef {
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
                     stored_form_sorts_in_value_order: false,
+                    can_be_rowid_alias: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
@@ -963,6 +1010,7 @@ impl TypeDef {
             range_offsets: None,
             accepts_collate: None,
             stored_form_sorts_in_value_order: false,
+            can_be_rowid_alias: false,
             sql,
             domain_checks: constraints.to_vec(),
             kind: TypeDefKind::Custom {
@@ -1546,11 +1594,13 @@ pub enum TypeOrigin {
     /// `accepts_collate` says whether values of the type take a COLLATE,
     /// `range_offsets` what kind of number they are in a RANGE frame, and
     /// `stored_form_sorts_in_value_order` whether the stored form sorts in
-    /// the same order as the values.
+    /// the same order as the values, and `can_be_rowid_alias` whether a
+    /// PRIMARY KEY of the type is the rowid.
     Builtin {
         accepts_collate: bool,
         range_offsets: RangeOffsets,
         stored_form_sorts_in_value_order: bool,
+        can_be_rowid_alias: bool,
     },
     User,
 }
@@ -2227,6 +2277,28 @@ impl Schema {
         column.is_array() || self.get_type_def(&column.ty_str, is_strict).is_some()
     }
 
+    /// Whether the column has an array type or a custom type that encodes or
+    /// decodes its values, so that the stored form is not the value.
+    pub fn column_converts_values(&self, column: &Column, is_strict: bool) -> bool {
+        column.is_array()
+            || self
+                .resolve_type(&column.ty_str, is_strict)
+                .ok()
+                .flatten()
+                .is_some_and(|resolved| {
+                    resolved.has_decode()
+                        || resolved.chain.iter().any(|type_def| {
+                            matches!(
+                                &type_def.kind,
+                                TypeDefKind::Custom {
+                                    encode: Some(_),
+                                    ..
+                                }
+                            )
+                        })
+                })
+    }
+
     /// Whether reading the column runs a DECODE, so a read gives a value other
     /// than the stored one.
     pub fn column_has_decode(&self, column: &Column, is_strict: bool) -> bool {
@@ -2303,6 +2375,19 @@ impl Schema {
         }
         let (primitive, chain) = self.resolve_base_type_chain(type_name)?;
         Ok(Some(ResolvedType { primitive, chain }))
+    }
+
+    /// The affinity that comparisons with a value of the registered type
+    /// `type_name` use: the affinity of the values the type reads as, or of the
+    /// values it stores when it has its own order. The same affinity a column
+    /// of the type gets. None for a name that is not a registered type.
+    pub fn type_comparison_affinity(&self, type_name: &str) -> Option<Affinity> {
+        let resolved = self.resolve_type_unchecked(type_name).ok().flatten()?;
+        let stored_affinity = Affinity::affinity(&resolved.primitive);
+        Some(match resolved.ordering() {
+            Some(_) => stored_affinity,
+            None => resolved.leaf().value_type().affinity(),
+        })
     }
 
     /// The plain SQL type the type takes as input: its input type, followed
@@ -5957,7 +6042,7 @@ impl BTreeTable {
             }
             let uses_custom_type = std::iter::once(idx)
                 .chain(graph.dependencies[idx].iter())
-                .any(|i| schema.column_has_custom_type(&self.columns[i], self.is_strict));
+                .any(|i| schema.column_converts_values(&self.columns[i], self.is_strict));
             if uses_custom_type {
                 bail_parse_error!("stored generated columns cannot use custom types");
             }
@@ -6019,6 +6104,47 @@ impl BTreeTable {
         }
         for col in &mut self.columns {
             col.resolve_custom_type(schema)?;
+        }
+        self.make_integer_type_key_a_rowid_alias(schema)
+    }
+
+    /// A single-column PRIMARY KEY of a type that stores its values as plain
+    /// integers is the rowid, as `INTEGER PRIMARY KEY` is.
+    fn make_integer_type_key_a_rowid_alias(&mut self, schema: &Schema) -> Result<()> {
+        let [(key_name, key_order)] = self.primary_key_columns.as_slice() else {
+            return Ok(());
+        };
+        if !self.has_rowid || (self.primary_key_is_inline && *key_order == ast::SortOrder::Desc) {
+            return Ok(());
+        }
+        let key_name = key_name.clone();
+        let Some(column) = self.columns.iter_mut().find(|col| {
+            col.name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(&key_name))
+        }) else {
+            return Ok(());
+        };
+        if column.is_rowid_alias() || column.is_array() || column.ty_str.is_empty() {
+            return Ok(());
+        }
+        let Some(resolved) = schema.resolve_type_unchecked(&column.ty_str)? else {
+            return Ok(());
+        };
+        if !resolved.can_be_rowid_alias() {
+            return Ok(());
+        }
+        column.set_rowid_alias(true);
+        // As `create_table` does for an INTEGER PRIMARY KEY: the key has no
+        // automatic index.
+        let key_set = self.unique_sets.iter().position(|set| {
+            set.is_primary_key
+                && set.columns.len() == 1
+                && set.columns[0].name.eq_ignore_ascii_case(&key_name)
+        });
+        if let Some(key_set) = key_set {
+            self.rowid_alias_conflict_clause = self.unique_sets[key_set].conflict_clause;
+            self.unique_sets.remove(key_set);
         }
         Ok(())
     }
@@ -10336,5 +10462,100 @@ mod column_info {
             let v: u32 = affinity as u32;
             self.0 = (self.0 & !BASE_AFF_MASK) | ((v << BASE_AFF_SHIFT) & BASE_AFF_MASK);
         }
+    }
+}
+
+#[cfg(test)]
+mod rowid_alias_type_tests {
+    use super::*;
+
+    fn schema_with_types(types: &[(&str, bool)]) -> Schema {
+        let mut builder = SchemaBuilder::new().unwrap();
+        for (sql, can_be_rowid_alias) in types {
+            let Some(Cmd::Stmt(Stmt::CreateType {
+                type_name, body, ..
+            })) = turso_parser::parser::Parser::new(sql.as_bytes())
+                .next_cmd()
+                .unwrap()
+            else {
+                panic!("not a CREATE TYPE: {sql}");
+            };
+            let origin = TypeOrigin::Builtin {
+                accepts_collate: false,
+                range_offsets: RangeOffsets::Integer,
+                stored_form_sorts_in_value_order: false,
+                can_be_rowid_alias: *can_be_rowid_alias,
+            };
+            let type_def =
+                TypeDef::from_create_type(&type_name, &body, origin, sql.to_string()).unwrap();
+            builder = builder.type_def(&type_name, Arc::new(type_def));
+        }
+        builder.custom_types(true).build()
+    }
+
+    fn table(schema: &Schema, sql: &str) -> BTreeTable {
+        let Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) =
+            turso_parser::parser::Parser::new(sql.as_bytes())
+                .next_cmd()
+                .unwrap()
+        else {
+            panic!("not a CREATE TABLE: {sql}");
+        };
+        let mut table = create_table(tbl_name.name.as_str(), &body, 2, false).unwrap();
+        table.resolve_custom_types(schema).unwrap();
+        table
+    }
+
+    const SMALL: &str = "CREATE TYPE small(value integer) BASE integer COERCE value";
+    const PLAIN: &str = "CREATE TYPE plain(value integer) BASE integer";
+
+    #[test]
+    fn a_key_of_a_type_that_can_be_a_rowid_alias_is_the_rowid() {
+        let schema = schema_with_types(&[(SMALL, true)]);
+        let table = table(
+            &schema,
+            "CREATE TABLE t(id small PRIMARY KEY, v integer) STRICT",
+        );
+        assert!(table.columns()[0].is_rowid_alias());
+        assert!(table.unique_sets.is_empty());
+    }
+
+    #[test]
+    fn a_key_of_a_type_that_does_not_say_so_is_not_the_rowid() {
+        let schema = schema_with_types(&[(PLAIN, false)]);
+        let table = table(
+            &schema,
+            "CREATE TABLE t(id plain PRIMARY KEY, v integer) STRICT",
+        );
+        assert!(!table.columns()[0].is_rowid_alias());
+        assert_eq!(table.unique_sets.len(), 1);
+    }
+
+    #[test]
+    fn a_type_with_an_encode_is_not_the_rowid() {
+        let schema = schema_with_types(&[(
+            "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END",
+            true,
+        )]);
+        let table = table(
+            &schema,
+            "CREATE TABLE t(id boolean PRIMARY KEY, v integer) STRICT",
+        );
+        assert!(!table.columns()[0].is_rowid_alias());
+    }
+
+    #[test]
+    fn a_key_of_two_columns_or_in_descending_order_is_not_the_rowid() {
+        let schema = schema_with_types(&[(SMALL, true)]);
+        let two = table(
+            &schema,
+            "CREATE TABLE t(a small, b small, PRIMARY KEY (a, b)) STRICT",
+        );
+        assert!(!two.columns()[0].is_rowid_alias());
+        let desc = table(
+            &schema,
+            "CREATE TABLE t(id small PRIMARY KEY DESC, v integer) STRICT",
+        );
+        assert!(!desc.columns()[0].is_rowid_alias());
     }
 }

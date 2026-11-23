@@ -1,0 +1,74 @@
+# Function-style casts such as int4(x) and float4(x), which cast as x::int4 does.
+# The answers come from PostgreSQL 18.
+
+@database :memory:
+
+test cast-function-float4-to-float8 {
+    SELECT float4(0.1)::float8;
+}
+expect {
+    0.10000000149011612
+}
+
+test cast-function-float8-from-text {
+    SELECT float8('1.5');
+}
+expect {
+    1.5
+}
+
+test cast-function-int4-rounds-a-decimal {
+    SELECT int4(2.5);
+}
+expect {
+    3
+}
+
+test cast-function-int4-rounds-half-away-for-numeric {
+    SELECT int4(3.5);
+}
+expect {
+    4
+}
+
+test cast-function-int2-out-of-range {
+    SELECT int2(70000);
+}
+@sqlstate 22003
+expect error {
+}
+
+test cast-function-int4-bad-text {
+    SELECT int4('x');
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-function-int8-rounds-a-decimal {
+    SELECT int8(1.5);
+}
+expect {
+    2
+}
+
+test cast-function-bool-of-integer-as-text {
+    SELECT bool(1)::text;
+}
+expect {
+    true
+}
+
+test cast-function-text-of-a-decimal {
+    SELECT text(1.5);
+}
+expect {
+    1.5
+}
+
+test cast-function-float4-of-integer-as-text {
+    SELECT float4(1)::text;
+}
+expect {
+    1
+}

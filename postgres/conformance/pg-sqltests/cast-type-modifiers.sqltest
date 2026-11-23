@@ -1,0 +1,293 @@
+# A cast with a type modifier: numeric(p,s) rounds and varchar(n) cuts the text.
+# The answers come from PostgreSQL 18.
+
+@database :memory:
+
+test numeric-cast-rounds-to-the-scale {
+    SELECT 1.234::numeric(10,2), CAST(1.235 AS numeric(10,2)), 1::numeric(5,2), 1.5::numeric(10,0);
+}
+expect {
+    1.23|1.24|1.00|2
+}
+
+test numeric-cast-rounds-half-away-from-zero {
+    SELECT 2.5::numeric(10,0), (-2.5)::numeric(10,0), 0.5::numeric(10,0), (-0.5)::numeric(10,0), 1.005::numeric(5,2), (-1.005)::numeric(5,2);
+}
+expect {
+    3|-3|1|-1|1.01|-1.01
+}
+
+test numeric-cast-with-precision-only-has-scale-zero {
+    SELECT 1.9::numeric(5), 1234.5::numeric(4);
+}
+expect {
+    2|1235
+}
+
+test numeric-cast-of-a-typed-literal {
+    SELECT numeric(10,2) '1.235';
+}
+expect {
+    1.24
+}
+
+test numeric-cast-of-text {
+    SELECT '1.234'::numeric(10,2), '1.234'::text::numeric(10,2);
+}
+expect {
+    1.23|1.23
+}
+
+test numeric-cast-of-a-float {
+    SELECT 1.234::float8::numeric(10,2), 2.5::float4::numeric(10,0);
+}
+expect {
+    1.23|3
+}
+
+test numeric-cast-of-an-integer {
+    SELECT 12::int4::numeric(5,2), 12::int8::numeric(5,2), 12::int2::numeric(5,2);
+}
+expect {
+    12.00|12.00|12.00
+}
+
+test numeric-cast-has-the-numeric-type {
+    SELECT pg_typeof(1.234::numeric(10,2));
+}
+expect {
+    numeric
+}
+
+test numeric-cast-of-null {
+    SELECT NULL::numeric(5,2) IS NULL;
+}
+expect {
+    t
+}
+
+test numeric-cast-keeps-the-scale-in-arithmetic {
+    SELECT 1.5::numeric(5,2) + 1, 1.5::numeric(5,2) * 2;
+}
+expect {
+    2.50|3.00
+}
+
+test numeric-cast-overflow {
+    SELECT 12345.678::numeric(5,2);
+}
+@sqlstate 22003
+expect error {}
+
+test numeric-cast-overflow-after-rounding {
+    SELECT 99.999::numeric(4,2);
+}
+@sqlstate 22003
+expect error {}
+
+test numeric-cast-overflow-of-an-integer {
+    SELECT 123::numeric(2,0);
+}
+@sqlstate 22003
+expect error {}
+
+test numeric-cast-scale-larger-than-precision-overflows {
+    SELECT 1::numeric(5,6);
+}
+@sqlstate 22003
+expect error {}
+
+test numeric-cast-scale-larger-than-precision-fits-a-fraction {
+    SELECT 0.0012::numeric(2,4);
+}
+expect {
+    0.0012
+}
+
+test numeric-cast-of-invalid-text {
+    SELECT 'x'::numeric(10,2);
+}
+@sqlstate 22P02
+expect error {}
+
+test numeric-cast-of-a-decimal-synonym {
+    SELECT 1.5::decimal(10,2), 1.5::dec(10,2);
+}
+expect {
+    1.50|1.50
+}
+
+test numeric-cast-precision-too-large {
+    SELECT 1::numeric(1001,0);
+}
+@sqlstate 22023
+expect error {}
+
+test numeric-cast-precision-zero {
+    SELECT 1::numeric(0);
+}
+@sqlstate 22023
+expect error {}
+
+test numeric-cast-scale-too-large {
+    SELECT 1::numeric(5,1001);
+}
+@sqlstate 22023
+expect error {}
+
+test numeric-cast-in-a-column-default {
+    CREATE TABLE d (a numeric(10,3) DEFAULT 1.5::numeric(10,1)); INSERT INTO d DEFAULT VALUES; SELECT a FROM d;
+}
+expect {
+    1.500
+}
+
+test numeric-cast-stored-in-a-column {
+    CREATE TABLE s (a numeric(5,2)); INSERT INTO s VALUES (1.239::numeric(10,3)); SELECT a FROM s;
+}
+expect {
+    1.24
+}
+
+test numeric-cast-stored-in-an-integer-column {
+    CREATE TABLE i (a int); INSERT INTO i VALUES (1.5::numeric(10,0)); SELECT a FROM i;
+}
+expect {
+    2
+}
+
+test numeric-cast-in-a-where {
+    CREATE TABLE w (a numeric(5,3)); INSERT INTO w VALUES (1.239), (1.241); SELECT a FROM w WHERE a::numeric(5,2) = 1.24;
+}
+expect {
+    1.239
+    1.241
+}
+
+test numeric-cast-of-a-parameter-like-subquery {
+    SELECT (SELECT 1.239)::numeric(5,2);
+}
+expect {
+    1.24
+}
+
+test numeric-cast-inside-a-sum {
+    SELECT sum(x::numeric(5,1)) FROM (VALUES (1.04), (2.06)) v(x);
+}
+expect {
+    3.1
+}
+
+test numeric-cast-negative-scale {
+    SELECT 1234.5::numeric(3,-2);
+}
+expect {
+    1200
+}
+
+test varchar-cast-cuts-the-text {
+    SELECT 'abc'::varchar(2), CAST('abc' AS varchar(2)), CAST('abc' AS character varying(2));
+}
+expect {
+    ab|ab|ab
+}
+
+test varchar-cast-keeps-a-short-text {
+    SELECT 'ab'::varchar(5), 'abc'::varchar(3);
+}
+expect {
+    ab|abc
+}
+
+test varchar-cast-of-a-number {
+    SELECT 12345::varchar(3), 1.5::varchar(2), 1.5::numeric(10,2)::varchar(3);
+}
+expect {
+    123|1.|1.5
+}
+
+test varchar-cast-of-a-boolean {
+    SELECT true::varchar(2), (1 = 2)::varchar(10);
+}
+expect {
+    tr|false
+}
+
+test varchar-cast-has-the-varchar-type {
+    SELECT pg_typeof('abc'::varchar(2));
+}
+expect {
+    character varying
+}
+
+test varchar-cast-of-null {
+    SELECT NULL::varchar(2) IS NULL;
+}
+expect {
+    t
+}
+
+test varchar-cast-counts-characters {
+    SELECT 'añb'::varchar(2), length('añb'::varchar(2));
+}
+expect {
+    añ|2
+}
+
+test varchar-cast-of-a-column {
+    CREATE TABLE c (a text); INSERT INTO c VALUES ('abcdef'), ('xy'); SELECT a::varchar(3) FROM c ORDER BY a;
+}
+expect {
+    abc
+    xy
+}
+
+test varchar-cast-stored-in-a-column {
+    CREATE TABLE v (a varchar(3)); INSERT INTO v VALUES ('abcd'::varchar(3)); SELECT a FROM v;
+}
+expect {
+    abc
+}
+
+test varchar-assignment-does-not-cut {
+    CREATE TABLE v2 (a varchar(3)); INSERT INTO v2 VALUES ('abcd');
+}
+@sqlstate 22001
+expect error {}
+
+test varchar-cast-length-zero {
+    SELECT 'abc'::varchar(0);
+}
+@sqlstate 22023
+expect error {}
+
+@compat-gap "type:bpchar"
+test char-cast-with-a-length {
+    SELECT 'abc'::char(2);
+}
+expect {
+    ab
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:timestamp"
+test timestamp-cast-with-a-precision {
+    SELECT '2026-01-01 10:00:00.123456'::timestamp(0);
+}
+expect {
+    2026-01-01 10:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:_numeric"
+test array-cast-with-a-type-modifier {
+    SELECT ARRAY[1.234]::numeric(10,2)[];
+}
+expect {
+    {1.23}
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
