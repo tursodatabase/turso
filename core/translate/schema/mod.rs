@@ -323,6 +323,10 @@ fn resolve_check_expr_type(
                     "cannot determine type of CAST in CHECK constraint; use CAST with explicit type"
                 );
             };
+            // An array is stored as a blob, whatever its element type.
+            if type_name.array_dimensions > 0 {
+                return Ok(CheckExprType::Blob);
+            }
             let name = dequote(&type_name.name);
             let type_def = resolver.schema().get_type_def_unchecked(&name);
             if type_def.is_some_and(|type_def| !is_sqlite_cast_to(type_def, type_name)) {
@@ -559,6 +563,10 @@ fn resolve_column_type(
     resolver: &CatalogContext,
 ) -> Result<CheckExprType> {
     if let Some(ref col_type) = col.col_type {
+        // An array is stored as a blob, whatever its element type.
+        if col_type.array_dimensions > 0 {
+            return Ok(CheckExprType::Blob);
+        }
         resolve_type_name(&column_declared_type(&col_type.name), resolver)
     } else {
         // No type specified — in STRICT tables this would be caught elsewhere,
