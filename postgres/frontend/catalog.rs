@@ -424,6 +424,15 @@ impl Dialect for PostgresDialect {
     fn type_annotation(&self, ty: &ast::Type) -> Option<ast::TypeAnnotation> {
         turso_pg_parser::type_oid(&ty.name).map(ast::TypeAnnotation::new)
     }
+
+    fn literal_type_annotation(&self, literal: &ast::Literal) -> Option<ast::TypeAnnotation> {
+        match literal {
+            ast::Literal::True | ast::Literal::False => {
+                Some(ast::TypeAnnotation::new(turso_pg_parser::BOOL_OID))
+            }
+            _ => None,
+        }
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {

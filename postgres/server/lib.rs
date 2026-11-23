@@ -651,6 +651,7 @@ enum BinaryEncoding {
     Int2,
     Int4,
     Int8,
+    Float4,
     Float8,
     Bytea,
 }
@@ -659,11 +660,12 @@ impl BinaryEncoding {
     /// None for a type whose binary format tursopg neither reads nor writes.
     fn of(pg_type: &Type) -> Option<Self> {
         match *pg_type {
-            Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => Some(Self::Text),
+            Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::JSON => Some(Self::Text),
             Type::BOOL => Some(Self::Bool),
             Type::INT2 => Some(Self::Int2),
             Type::INT4 => Some(Self::Int4),
             Type::INT8 => Some(Self::Int8),
+            Type::FLOAT4 => Some(Self::Float4),
             Type::FLOAT8 => Some(Self::Float8),
             Type::BYTEA => Some(Self::Bytea),
             _ => None,
@@ -925,6 +927,7 @@ fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResul
             | BinaryEncoding::Int2
             | BinaryEncoding::Int4
             | BinaryEncoding::Int8
+            | BinaryEncoding::Float4
             | BinaryEncoding::Float8,
         )
         | None => Err(binary_not_supported(&format!("parameter ${n}"), pg_type)),
@@ -1066,7 +1069,7 @@ fn encode_binary(
     text_type: turso_pg::TextType,
 ) -> turso_core::Result<()> {
     use turso_core::Numeric::{Float, Integer};
-    use BinaryEncoding::{Bool, Bytea, Float8, Int2, Int4, Int8, Text};
+    use BinaryEncoding::{Bool, Bytea, Float4, Float8, Int2, Int4, Int8, Text};
     let encoding = BinaryEncoding::of(pg_type)
         .expect("build_field_info refuses binary format for a type without a binary encoding");
     let written = match (encoding, val) {
@@ -1082,13 +1085,15 @@ fn encode_binary(
             Err(_) => return Err(binary_value_not_supported(pg_type)),
         },
         (Int8, Value::Numeric(Integer(i))) => encoder.encode_field(i),
+        (Float4, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f32)),
+        (Float4, Value::Numeric(Float(f))) => encoder.encode_field(&(f64::from(*f) as f32)),
         (Float8, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f64)),
         (Float8, Value::Numeric(Float(f))) => encoder.encode_field(&f64::from(*f)),
         (Bytea, Value::Blob(b)) => encoder.encode_field(&b.as_slice()),
         (Bool | Int2 | Int4 | Int8, Value::Numeric(Float(_)))
         | (Bytea, Value::Numeric(_))
-        | (Bool | Int2 | Int4 | Int8 | Float8 | Bytea, Value::Text(_))
-        | (Bool | Int2 | Int4 | Int8 | Float8, Value::Blob(_)) => {
+        | (Bool | Int2 | Int4 | Int8 | Float4 | Float8 | Bytea, Value::Text(_))
+        | (Bool | Int2 | Int4 | Int8 | Float4 | Float8, Value::Blob(_)) => {
             return Err(binary_value_not_supported(pg_type))
         }
     };
@@ -1629,10 +1634,11 @@ mod tests {
         }
     }
 
-    /// A column is described as the PostgreSQL type that it is declared with,
-    /// and a value is sent in the encoding of that type.
+    /// A column and a cast are described as the PostgreSQL type that the
+    /// statement names, not as the type that stores their values, and a value
+    /// is sent in the encoding of that type.
     #[test]
-    fn columns_are_described_as_their_postgresql_type() {
+    fn columns_and_casts_are_described_as_their_postgresql_type() {
         let conn = memory_connection();
         conn.execute("CREATE TABLE t (s smallint, v varchar(10), a smallint[])")
             .unwrap();
@@ -1651,6 +1657,61 @@ mod tests {
                 Type::VARCHAR,
                 b"\0\0\0\x02ab",
                 b"\0\0\0\x02ab",
+            ),
+            (
+                "SELECT 7::smallint",
+                Type::INT2,
+                b"\0\0\0\x02\0\x07",
+                b"\0\0\0\x017",
+            ),
+            (
+                "SELECT 1.5::real",
+                Type::FLOAT4,
+                b"\0\0\0\x04\x3f\xc0\0\0",
+                b"\0\0\0\x031.5",
+            ),
+            (
+                "SELECT 'ab'::varchar",
+                Type::VARCHAR,
+                b"\0\0\0\x02ab",
+                b"\0\0\0\x02ab",
+            ),
+            (
+                "SELECT '{\"a\":1}'::json",
+                Type::JSON,
+                b"\0\0\0\x07{\"a\":1}",
+                b"\0\0\0\x07{\"a\":1}",
+            ),
+            (
+                "SELECT (5::boolean)",
+                Type::BOOL,
+                b"\0\0\0\x01\x01",
+                b"\0\0\0\x01t",
+            ),
+            // A function that returns one of its arguments has their type.
+            (
+                "SELECT coalesce(1::boolean, false)",
+                Type::BOOL,
+                b"\0\0\0\x01\x01",
+                b"\0\0\0\x01t",
+            ),
+            (
+                "SELECT coalesce(NULL, 7::smallint)",
+                Type::INT2,
+                b"\0\0\0\x02\0\x07",
+                b"\0\0\0\x017",
+            ),
+            (
+                "SELECT CASE WHEN s > 0 THEN s ELSE 0::smallint END FROM t",
+                Type::INT2,
+                b"\0\0\0\x02\0\x07",
+                b"\0\0\0\x017",
+            ),
+            (
+                "SELECT coalesce('{\"a\":1}'::json, '[]'::json)",
+                Type::JSON,
+                b"\0\0\0\x07{\"a\":1}",
+                b"\0\0\0\x07{\"a\":1}",
             ),
         ] {
             for (format, expected) in [(Format::UnifiedBinary, binary), (Format::UnifiedText, text)]
@@ -1674,6 +1735,24 @@ mod tests {
         let array = conn.prepare("SELECT a FROM t").unwrap();
         let fields = build_field_info(&array, &Format::UnifiedText).unwrap();
         assert_eq!(*fields[0].datatype(), Type::INT2_ARRAY);
+    }
+
+    /// tursopg sends numeric and jsonb values only as text. A cast to one of
+    /// them keeps the type it had, which a client can ask for in binary
+    /// format.
+    #[test]
+    fn a_cast_to_a_type_without_a_binary_encoding_keeps_its_stored_type() {
+        let conn = memory_connection();
+        for (sql, expected_type) in [
+            ("SELECT 1.5::numeric", Type::FLOAT8),
+            ("SELECT '{}'::jsonb", Type::TEXT),
+        ] {
+            let stmt = conn.prepare(sql).unwrap();
+            for format in [Format::UnifiedBinary, Format::UnifiedText] {
+                let fields = build_field_info(&stmt, &format).unwrap();
+                assert_eq!(*fields[0].datatype(), expected_type, "{sql}");
+            }
+        }
     }
 
     #[test]

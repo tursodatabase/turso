@@ -32,6 +32,14 @@ impl TextType {
         if matches!(info.kind, ColumnTypeKind::Struct | ColumnTypeKind::Union) {
             return TextType::Plain;
         }
+        // A cast to boolean is written as a cast to INTEGER, so only the
+        // annotation of its type tells that the value is a boolean.
+        let annotated_boolean = info
+            .ty_annotation
+            .is_some_and(|annotation| annotation.type_id == turso_pg_parser::BOOL_OID);
+        if annotated_boolean && info.array_dimensions == 0 {
+            return TextType::Boolean;
+        }
         std::iter::once(info.declared_name.as_str())
             .chain(info.base_type.as_deref())
             .find_map(
