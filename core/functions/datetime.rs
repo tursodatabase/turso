@@ -1070,7 +1070,8 @@ pub fn exec_date_diff(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Val
 }
 
 fn add_days(clock: &dyn Clock, date: &Value, days: i64) -> Result<Value> {
-    // Julian day number of 0001-01-01, the first date PostgreSQL accepts.
+    // Julian day number of 0001-01-01, the first date tursopg stores (check_year
+    // in functions/datetime_input.rs allows years 1 to 9999).
     const FIRST_JULIAN_DAY: f64 = 1721425.5;
     let shifted = julian_day(clock, date)? + days as f64;
     if shifted < FIRST_JULIAN_DAY {
