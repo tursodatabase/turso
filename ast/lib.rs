@@ -1039,6 +1039,38 @@ impl Operator {
         )
     }
 
+    /// Whether the operator compares an array's elements with other values or
+    /// puts values into one array, when one of its operands is an array.
+    /// `||` of an array and a value appends the value; `||` of two values
+    /// that are not arrays joins text.
+    pub const fn compares_or_combines_array_elements(&self) -> bool {
+        match self {
+            Self::ArrayContains | Self::ArrayOverlap | Self::Concat => true,
+            Self::Add
+            | Self::And
+            | Self::ArrowRight
+            | Self::ArrowRightShift
+            | Self::BitwiseAnd
+            | Self::BitwiseOr
+            | Self::BitwiseNot
+            | Self::Equals
+            | Self::Divide
+            | Self::Greater
+            | Self::GreaterEquals
+            | Self::Is
+            | Self::IsNot
+            | Self::LeftShift
+            | Self::Less
+            | Self::LessEquals
+            | Self::Modulus
+            | Self::Multiply
+            | Self::NotEquals
+            | Self::Or
+            | Self::RightShift
+            | Self::Subtract => false,
+        }
+    }
+
     /// Returns true if this operator is a comparison operator that may need affinity conversion
     pub const fn is_comparison(&self) -> bool {
         matches!(

@@ -1,6 +1,6 @@
 use std::{borrow::Borrow, cmp::Ordering, collections::HashMap, hash::Hasher, str::FromStr as _};
 
-use crate::ast::{Expr, Operator, UnaryOperator};
+use crate::ast::{Expr, UnaryOperator};
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
 use smallvec::SmallVec;
@@ -787,12 +787,7 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
     match expr {
         Expr::Collate(operand, _) => check_collate_operand(operand, context),
         Expr::Binary(lhs, op, rhs) if op.is_comparison() => check_comparison(lhs, rhs, context),
-        Expr::Binary(
-            lhs,
-            Operator::ArrayContains | Operator::ArrayOverlap | Operator::Concat,
-            rhs,
-        ) => {
-            // `||` of two values that are not arrays joins text and compares nothing.
+        Expr::Binary(lhs, op, rhs) if op.compares_or_combines_array_elements() => {
             let env = context.type_env();
             if type_of(lhs, &env).is_array() || type_of(rhs, &env).is_array() {
                 check_comparable_array_values([lhs.as_ref(), rhs.as_ref()].into_iter(), context)
