@@ -1635,6 +1635,7 @@ mod tests {
             name: "TEXT".to_string(),
             size: None,
             array_dimensions: 0,
+            ty_annotation: None,
         });
         let expr_cast = Expr::cast(
             Expr::Column {

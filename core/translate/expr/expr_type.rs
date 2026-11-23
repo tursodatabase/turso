@@ -556,6 +556,7 @@ impl ColumnCustomType {
             name: self.type_def.name.clone(),
             size,
             array_dimensions: 0,
+            ty_annotation: None,
         }
     }
 
@@ -2036,6 +2037,7 @@ mod tests {
             name: name.to_string(),
             size: None,
             array_dimensions: dimensions,
+            ty_annotation: None,
         }
     }
 
@@ -2048,6 +2050,7 @@ mod tests {
                 Box::new(int(scale)),
             )),
             array_dimensions: 0,
+            ty_annotation: None,
         }
     }
 

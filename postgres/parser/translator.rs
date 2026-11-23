@@ -882,6 +882,7 @@ impl PostgreSQLTranslator {
                 name: mapping.type_name.clone(),
                 size,
                 array_dimensions: mapping.array_dimensions,
+                ty_annotation: None,
             })
         };
 
@@ -1574,6 +1575,7 @@ impl PostgreSQLTranslator {
             name: mapping.type_name,
             size,
             array_dimensions: mapping.array_dimensions,
+            ty_annotation: None,
         });
 
         let mut constraints = Vec::new();
@@ -3080,6 +3082,7 @@ impl PostgreSQLTranslator {
                     name: "TEXT".to_string(),
                     size: None,
                     array_dimensions: 0,
+                    ty_annotation: None,
                 }),
             };
             let select = ast::Select {
@@ -3936,6 +3939,7 @@ impl PostgreSQLTranslator {
                             name: "timestamp".to_string(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                     }),
                     // Each role keyword is stored as a call to the function
@@ -4131,6 +4135,7 @@ impl PostgreSQLTranslator {
                         name: "boolean".to_string(),
                         size: None,
                         array_dimensions: 0,
+                        ty_annotation: None,
                     }),
                 }),
                 _ => Err(ParseError::sqlstate(
@@ -4972,6 +4977,7 @@ impl PostgreSQLTranslator {
                         name: type_name.to_string(),
                         size: None,
                         array_dimensions: 0,
+                        ty_annotation: None,
                     }),
                 });
             }
@@ -6308,6 +6314,7 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
                     name: type_name.to_string(),
                     size: None,
                     array_dimensions: 0,
+                    ty_annotation: None,
                 }),
             };
             vec![
@@ -6403,6 +6410,7 @@ fn bigint(expr: ast::Expr) -> ast::Expr {
             name: "BIGINT".to_string(),
             size: None,
             array_dimensions: 0,
+            ty_annotation: None,
         }),
     }
 }
@@ -8182,6 +8190,7 @@ fn pg_type_name_to_ast_type(
         name: name.to_string(),
         size: None,
         array_dimensions,
+        ty_annotation: None,
     })
 }
 
