@@ -197,6 +197,12 @@ jobs:
           LOCAL_SYNC_SERVER_DIR: "1"
         run: cargo nextest run -p turso --all-features --locked --no-fail-fast -E 'test(/^sync::/)' --no-tests=fail --failure-output=final
         timeout-minutes: 20
+      - name: Test encrypted sync through Rust SDK
+        if: runner.os == 'Linux' && matrix.suite == 'extra'
+        run: |
+          cargo build --locked -p turso --example sync_encryption_e2e --all-features
+          python3 testing/cli_tests/sync_encryption.py
+        timeout-minutes: 10
       - name: Test doctests
         if: matrix.suite == 'extra'
         env:

@@ -1,5 +1,6 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use prost::Message;
@@ -22,20 +23,52 @@ const FRAME_END_MAGIC: u32 = 0x4554564D;
 pub struct InProcessServer {
     remote: Arc<Remote>,
     bootstrap_base: Arc<Remote>,
+    replace_once: AtomicBool,
+    empty_base: bool,
+    pub metadata_write_failure: Arc<AtomicU8>,
+    pub host_files: Option<SharedHostFiles>,
+    pub bootstrap_failure: Arc<AtomicU8>,
+    pub force_page_updates: bool,
 }
+
+type SharedHostFiles = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
 impl InProcessServer {
     pub fn new(remote: Arc<Remote>) -> Self {
         Self {
             bootstrap_base: remote.clone(),
             remote,
+            replace_once: AtomicBool::new(false),
+            empty_base: false,
+            metadata_write_failure: Arc::new(AtomicU8::new(0)),
+            host_files: None,
+            bootstrap_failure: Arc::new(AtomicU8::new(0)),
+            force_page_updates: false,
         }
+    }
+
+    pub fn with_empty_base(remote: Arc<Remote>) -> Self {
+        let mut server = Self::new(remote);
+        server.empty_base = true;
+        server
+    }
+
+    pub fn with_replacement(remote: Arc<Remote>) -> Self {
+        let server = Self::new(remote);
+        server.replace_once.store(true, Ordering::SeqCst);
+        server
     }
 
     pub fn with_bootstrap_base(remote: Arc<Remote>, bootstrap_base: Arc<Remote>) -> Self {
         Self {
             remote,
             bootstrap_base,
+            replace_once: AtomicBool::new(false),
+            empty_base: false,
+            metadata_write_failure: Arc::new(AtomicU8::new(0)),
+            host_files: None,
+            bootstrap_failure: Arc::new(AtomicU8::new(0)),
+            force_page_updates: false,
         }
     }
 }
@@ -45,6 +78,17 @@ impl SyncEngineIo for InProcessServer {
     type DataCompletionTransform = NoTransform;
 
     fn full_read(&self, path: &str) -> Result<Response> {
+        if let Some(files) = &self.host_files {
+            let data = files.lock().unwrap().get(path).cloned();
+            let status = match &data {
+                None => 404,
+                Some(data) if data.is_empty() => 204,
+                _ => 200,
+            };
+            let mut response = Response::new(data.unwrap_or_default());
+            response.status = status;
+            return Ok(response);
+        }
         match std::fs::read(path) {
             Ok(content) => Ok(Response::new(content)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -54,8 +98,30 @@ impl SyncEngineIo for InProcessServer {
         }
     }
 
-    fn full_write(&self, path: &str, content: Vec<u8>) -> Result<Response> {
-        std::fs::write(path, content)?;
+    fn full_write(&self, path: &str, mut content: Vec<u8>) -> Result<Response> {
+        let failure = if path.ends_with("-info") {
+            self.metadata_write_failure.swap(0, Ordering::SeqCst)
+        } else {
+            0
+        };
+        if failure == 1 {
+            return Err(Error::DatabaseSyncEngineError(
+                "injected before metadata publication".into(),
+            ));
+        }
+        if failure == 3 {
+            content.truncate(content.len() / 2);
+        }
+        if let Some(files) = &self.host_files {
+            files.lock().unwrap().insert(path.into(), content);
+        } else {
+            std::fs::write(path, content)?;
+        }
+        if failure == 2 || failure == 3 {
+            return Err(Error::DatabaseSyncEngineError(
+                "injected after metadata publication".into(),
+            ));
+        }
         Ok(Response::new(Vec::new()))
     }
 
@@ -75,7 +141,18 @@ impl SyncEngineIo for InProcessServer {
     ) -> Result<Response> {
         match (method, path) {
             ("POST", "/pull-updates") => {
-                Ok(Response::new(self.pull_updates(&body.unwrap_or_default())?))
+                let mut bytes = self.pull_updates(&body.unwrap_or_default())?;
+                let failure = self.bootstrap_failure.swap(0, Ordering::SeqCst);
+                if failure == 1 {
+                    let mut rest = bytes.as_slice();
+                    PullUpdatesRespProtoBody::decode_length_delimited(&mut rest).unwrap();
+                    PageData::decode_length_delimited(&mut rest).unwrap();
+                    let length = bytes.len() - rest.len();
+                    bytes.truncate(length);
+                }
+                let mut response = Response::new(bytes);
+                response.fail_after_body = failure == 1;
+                Ok(response)
             }
             _ => Err(Error::DatabaseSyncEngineError(format!(
                 "the in-process server does not handle {method} {path}"
@@ -92,31 +169,53 @@ impl InProcessServer {
     fn pull_updates(&self, body: &[u8]) -> Result<Vec<u8>> {
         let request = PullUpdatesReqProtoBody::decode(body)
             .map_err(|error| Error::DatabaseSyncEngineError(error.to_string()))?;
-        if request.client_revision.is_empty() {
-            self.page_bootstrap()
+        if request.client_revision.is_empty() || self.force_page_updates {
+            self.page_bootstrap(false)
+        } else if self.replace_once.swap(false, Ordering::SeqCst) {
+            self.page_bootstrap(true)
         } else {
             self.logical_log_since(log_offset_of(&request.client_revision)?)
         }
     }
 
-    fn page_bootstrap(&self) -> Result<Vec<u8>> {
-        let database = self.bootstrap_base.checkpoint_and_read_database_file()?;
-        let log_end = self.bootstrap_base.read_logical_log()?.len();
+    fn page_bootstrap(&self, replace: bool) -> Result<Vec<u8>> {
+        let database = if self.empty_base {
+            Vec::new()
+        } else {
+            self.bootstrap_base.checkpoint_and_read_database_file()?
+        };
+        let log_end = if self.empty_base {
+            0
+        } else {
+            self.bootstrap_base.read_logical_log()?.len()
+        };
         let header = PullUpdatesRespProtoBody {
             server_revision: revision_at(log_end),
             db_size: (database.len() / PAGE_SIZE) as u64,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,
             stream_kind: PullUpdatesStreamKind::Pages as i32,
-            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            apply_mode: if replace {
+                PullUpdatesApplyMode::ReplaceBase
+            } else {
+                PullUpdatesApplyMode::Incremental
+            } as i32,
             mvcc_log: None,
-            protocol: PullUpdatesProtocol::MvccLogical as i32,
+            protocol: if self.force_page_updates {
+                PullUpdatesProtocol::Pages
+            } else {
+                PullUpdatesProtocol::MvccLogical
+            } as i32,
         };
         let mut response = header.encode_length_delimited_to_vec();
         for (page_id, page) in database.chunks_exact(PAGE_SIZE).enumerate() {
+            let mut page = page.to_vec();
+            if self.bootstrap_failure.load(Ordering::SeqCst) == 2 && page_id == 0 {
+                page[PAGE_SIZE - 1] = 1;
+            }
             let page = PageData {
                 page_id: page_id as u64,
-                encoded_page: Bytes::copy_from_slice(page),
+                encoded_page: Bytes::from(page),
             };
             response.extend(page.encode_length_delimited_to_vec());
         }
@@ -125,12 +224,55 @@ impl InProcessServer {
 
     fn logical_log_since(&self, offset: usize) -> Result<Vec<u8>> {
         let log = self.remote.read_logical_log()?;
-        let new_frames = log.get(offset..).ok_or_else(|| {
+        let mut normalized = Vec::new();
+        let mut wire_seed = None;
+        if let Some(crypto) = &self.remote.crypto {
+            if offset < log.len() {
+                use turso_core::mvcc::persistent_storage::logical_log::frame_codec::*;
+                let header = validate_log_header(&log[..56])?;
+                let mut source_crc = header.initial_crc();
+                let mut wire_crc = header.initial_crc();
+                if offset == 0 {
+                    normalized.extend_from_slice(header.bytes());
+                }
+                let mut pos = 56;
+                while pos < log.len() {
+                    let layout = inspect_frame_prefix(&log[pos..], Some(crypto))?.unwrap();
+                    let mut plaintext = Vec::new();
+                    let frame = validate_frame_into(
+                        &header,
+                        pos as u64,
+                        &log[pos..pos + layout.stored_size()],
+                        source_crc,
+                        Some(crypto),
+                        &mut plaintext,
+                    )?;
+                    let parts = plaintext_wire_parts(&frame, wire_crc);
+                    if pos >= offset {
+                        if wire_seed.is_none() && offset != 0 {
+                            wire_seed = Some(wire_crc);
+                        }
+                        normalized.extend_from_slice(parts.header);
+                        normalized.extend_from_slice(parts.body);
+                        normalized.extend_from_slice(&parts.trailer);
+                    }
+                    source_crc = frame.source_crc();
+                    wire_crc = parts.next_crc;
+                    pos = frame.source_end() as usize;
+                }
+            }
+        }
+        let raw_frames = log.get(offset..).ok_or_else(|| {
             Error::DatabaseSyncEngineError(format!(
                 "client revision offset {offset} is past the end of the {}-byte log",
                 log.len()
             ))
         })?;
+        let new_frames = if self.remote.crypto.is_some() {
+            normalized.as_slice()
+        } else {
+            raw_frames
+        };
         let mvcc_log = if new_frames.is_empty() {
             None
         } else {
@@ -142,8 +284,12 @@ impl InProcessServer {
                     start_offset: offset as u64,
                     end_offset: log.len() as u64,
                     starts_with_header: offset == 0,
-                    crc_seed: crc_of_frame_ending_at(&log, offset)?
-                        .map(|crc| crc.to_le_bytes().to_vec()),
+                    crc_seed: if self.remote.crypto.is_some() {
+                        wire_seed
+                    } else {
+                        crc_of_frame_ending_at(&log, offset)?
+                    }
+                    .map(|crc| crc.to_le_bytes().to_vec()),
                 }],
             })
         };
@@ -197,14 +343,18 @@ fn crc_of_frame_ending_at(log: &[u8], offset: usize) -> Result<Option<u32>> {
 
 pub struct Response {
     body: Vec<u8>,
+    status: u16,
     sent: AtomicBool,
+    fail_after_body: bool,
 }
 
 impl Response {
     fn new(body: Vec<u8>) -> Self {
         Self {
             body,
+            status: 200,
             sent: AtomicBool::new(false),
+            fail_after_body: false,
         }
     }
 }
@@ -213,16 +363,21 @@ impl DataCompletion<u8> for Response {
     type DataPollResult = Chunk;
 
     fn status(&self) -> Result<Option<u16>> {
-        Ok(Some(200))
+        Ok(Some(self.status))
     }
 
     fn poll_data(&self) -> Result<Option<Chunk>> {
         let already_sent = self.sent.swap(true, Ordering::AcqRel);
+        if already_sent && self.fail_after_body {
+            return Err(Error::IoError(
+                "injected interrupted bootstrap download".into(),
+            ));
+        }
         Ok((!already_sent && !self.body.is_empty()).then(|| Chunk(self.body.clone())))
     }
 
     fn is_done(&self) -> Result<bool> {
-        Ok(self.body.is_empty() || self.sent.load(Ordering::Acquire))
+        Ok(!self.fail_after_body && (self.body.is_empty() || self.sent.load(Ordering::Acquire)))
     }
 }
 
