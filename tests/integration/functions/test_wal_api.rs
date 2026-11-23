@@ -345,6 +345,26 @@ fn test_wal_insert_frame_without_session_does_not_overwrite_committed_frames() {
 }
 
 #[test]
+fn test_wal_insert_frame_rejects_page_number_zero() {
+    let source = TempDatabase::new_empty();
+    let writer = source.connect_limbo();
+    writer.execute("CREATE TABLE t(x)").unwrap();
+    let target = TempDatabase::new_empty();
+    let importer = target.connect_limbo();
+    let mut frame = [0u8; 24 + 4096];
+    writer.wal_get_frame(1, &mut frame).unwrap();
+    frame[..4].copy_from_slice(&0u32.to_be_bytes());
+    importer.wal_insert_begin().unwrap();
+    let insert = importer.wal_insert_frame(1, &frame);
+    assert!(
+        matches!(insert, Err(LimboError::InvalidArgument(_))),
+        "{insert:?}"
+    );
+    importer.wal_insert_end(false).unwrap();
+    assert_eq!(importer.wal_state().unwrap().max_frame, 0);
+}
+
+#[test]
 fn wal_get_frame_returns_uncommitted_frame() {
     let db = TempDatabase::new_empty();
     let writer = db.connect_limbo();

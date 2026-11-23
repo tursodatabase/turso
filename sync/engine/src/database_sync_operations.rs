@@ -2118,13 +2118,7 @@ pub(crate) async fn pull_updates_to_staging<IO: SyncEngineIo, Ctx>(
                 page_data_opt =
                     wait_proto_message(ctx.coro, &completion, &ctx.io.network_stats, &mut bytes)
                         .await?;
-                let mut frame_info = WalFrameInfo {
-                    db_size: 0,
-                    page_no: page_id as u32 + 1,
-                };
-                if page_data_opt.is_none() {
-                    frame_info.db_size = header.db_size as u32;
-                }
+                let frame_info = pulled_page_frame_info(page_id, page_data_opt.is_none(), &header)?;
                 tracing::debug!("page_data_opt: {}", page_data_opt.is_some());
                 frame_info.put_to_frame_header(buffer.as_mut_slice());
 
@@ -2267,13 +2261,7 @@ pub(crate) async fn wal_pull_to_staging_v1<IO: SyncEngineIo, Ctx>(
         buffer.as_mut_slice()[WAL_FRAME_HEADER..].copy_from_slice(&page);
         page_data_opt =
             wait_proto_message(ctx.coro, &completion, &ctx.io.network_stats, &mut bytes).await?;
-        let mut frame_info = WalFrameInfo {
-            db_size: 0,
-            page_no: page_id as u32 + 1,
-        };
-        if page_data_opt.is_none() {
-            frame_info.db_size = header.db_size as u32;
-        }
+        let frame_info = pulled_page_frame_info(page_id, page_data_opt.is_none(), &header)?;
         tracing::debug!("page_data_opt: {}", page_data_opt.is_some());
         frame_info.put_to_frame_header(buffer.as_mut_slice());
 
@@ -2285,6 +2273,32 @@ pub(crate) async fn wal_pull_to_staging_v1<IO: SyncEngineIo, Ctx>(
     Ok(DatabasePullRevision::V1 {
         revision: header.server_revision,
     })
+}
+
+/// Builds the WAL frame header for a pulled page with zero-based id `page_id`.
+/// The last page of the stream commits the database size from `header`.
+fn pulled_page_frame_info(
+    page_id: u64,
+    last: bool,
+    header: &PullUpdatesRespProtoBody,
+) -> Result<WalFrameInfo> {
+    let page_no = u32::try_from(page_id)
+        .ok()
+        .and_then(|page_id| page_id.checked_add(1))
+        .ok_or_else(|| {
+            Error::DatabaseSyncEngineError(format!("pulled page id is out of range: {page_id}"))
+        })?;
+    let db_size = if last {
+        u32::try_from(header.db_size).map_err(|_| {
+            Error::DatabaseSyncEngineError(format!(
+                "pulled database size is out of range: {}",
+                header.db_size
+            ))
+        })?
+    } else {
+        0
+    };
+    Ok(WalFrameInfo { db_size, page_no })
 }
 
 #[derive(Debug)]
