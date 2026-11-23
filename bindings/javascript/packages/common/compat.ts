@@ -1,4 +1,4 @@
-import { bindParams, splitBindParameters } from "./bind.js";
+import { bindCallParams, bindParams, splitBindParameters } from "./bind.js";
 import { convertError, ioLoopSync, prepareStatement, resetStatement, stepSync } from "./sqlite-error.js";
 import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE, STEP_SLEEP } from "./types.js";
 
@@ -269,7 +269,8 @@ class Database {
         const stmt = this.db.prepare(sql);
         try {
           if (args !== undefined) {
-            bindParams(stmt, [args]);
+            // The statement is new, so a value `args` leaves out is NULL, never an earlier one.
+            bindParams(stmt, [args], true);
           }
           const cols = stmt.columns();
           const columnNames = cols.map((c) => c.name);
@@ -352,6 +353,8 @@ class Database {
 class Statement {
   stmt: NativeStatement;
   db: NativeDatabase;
+  // Set by `bind()`, after which every call runs with the bound values.
+  private bound = false;
 
   constructor(stmt: NativeStatement, db: NativeDatabase) {
     this.stmt = stmt;
@@ -418,7 +421,7 @@ class Statement {
     const { params, queryOptions } = splitBindParameters(bindParameters);
     resetStatement(this.stmt);
     this.stmt.setQueryTimeout(queryOptions);
-    bindParams(this.stmt, params);
+    bindCallParams(this.stmt, params, this.bound);
     for (; ;) {
       const [stepResult] = stepSync(this.stmt);
       if (stepResult === STEP_IO || stepResult === STEP_SLEEP) {
@@ -449,7 +452,7 @@ class Statement {
     const { params, queryOptions } = splitBindParameters(bindParameters);
     resetStatement(this.stmt);
     this.stmt.setQueryTimeout(queryOptions);
-    bindParams(this.stmt, params);
+    bindCallParams(this.stmt, params, this.bound);
     let row = undefined;
     for (; ;) {
       const [stepResult] = stepSync(this.stmt);
@@ -476,7 +479,7 @@ class Statement {
     const { params, queryOptions } = splitBindParameters(bindParameters);
     resetStatement(this.stmt);
     this.stmt.setQueryTimeout(queryOptions);
-    bindParams(this.stmt, params);
+    bindCallParams(this.stmt, params, this.bound);
 
     while (true) {
       const [stepResult] = stepSync(this.stmt);
@@ -502,7 +505,7 @@ class Statement {
     const { params, queryOptions } = splitBindParameters(bindParameters);
     resetStatement(this.stmt);
     this.stmt.setQueryTimeout(queryOptions);
-    bindParams(this.stmt, params);
+    bindCallParams(this.stmt, params, this.bound);
     const rows: any[] = [];
     for (; ;) {
       const [stepResult] = stepSync(this.stmt);
@@ -535,8 +538,12 @@ class Statement {
    * @returns this - Statement with binded parameters
    */
   bind(...bindParameters) {
+    if (this.bound) {
+      throw new TypeError("The bind() method can only be invoked once per statement object");
+    }
     try {
       bindParams(this.stmt, bindParameters);
+      this.bound = true;
       return this;
     } catch (err) {
       throw convertError(err);

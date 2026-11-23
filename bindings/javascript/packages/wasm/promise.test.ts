@@ -406,10 +406,36 @@ test('a call binds each value it passes, and undefined as NULL', async () => {
     await db.close();
 })
 
+test('a call that leaves a parameter without a value throws', async () => {
+    const db = await connect(":memory:");
+    const tooFew = new RangeError("Too few parameter values were provided");
+    const missingA = new RangeError('Missing named parameter "a"');
+
+    await expect((await db.prepare("SELECT ?, ? AS y")).get(1)).rejects.toEqual(tooFew);
+    await expect((await db.prepare("SELECT :a AS x")).get({ A: 1 })).rejects.toEqual(missingA);
+
+    const positional = await db.prepare("SELECT ? AS x");
+    expect(await positional.get(1)).toEqual({ x: 1 });
+    await expect(positional.get()).rejects.toEqual(tooFew);
+
+    const named = await db.prepare("SELECT :a AS x");
+    expect(await named.get({ a: 1 })).toEqual({ x: 1 });
+    await expect(named.get({})).rejects.toEqual(missingA);
+
+    // batch() prepares each statement anew, so a value it leaves out is NULL.
+    const [result] = await db.batch([{ sql: "SELECT ? AS x, ? AS y", args: [1] }]);
+    expect(result.rows).toEqual([{ x: 1, y: null }]);
+    await db.close();
+})
+
 test('bind() binds the values that later calls run with', async () => {
     const db = await connect(":memory:");
     const stmt = await db.prepare("SELECT ? AS a, ? AS b");
+    expect(() => stmt.bind(1)).toThrow(new RangeError("Too few parameter values were provided"));
     expect(await stmt.bind(1, 2).get()).toEqual({ a: 1, b: 2 });
+    expect(await stmt.get(undefined, { queryTimeout: 1000 })).toEqual({ a: 1, b: 2 });
+    await expect(stmt.get(9)).rejects.toEqual(new TypeError("This statement already has bound parameters"));
+    expect(() => stmt.bind(3, 4)).toThrow(new TypeError("The bind() method can only be invoked once per statement object"));
     expect(await (await db.prepare("SELECT 1 AS a")).bind().get()).toEqual({ a: 1 });
     const unbindable = await db.prepare("SELECT ? AS a");
     expect(() => unbindable.bind(Symbol("s"))).toThrow(TypeError);

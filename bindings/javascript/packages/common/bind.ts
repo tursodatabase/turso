@@ -15,6 +15,18 @@ function isQueryOptions(value) {
     && Object.prototype.hasOwnProperty.call(value, "queryTimeout");
 }
 
+// Bind the values of one call to a statement. After `bind()`, every call runs
+// with the bound values, and a call that passes its own throws, as in
+// better-sqlite3. A call that passes only undefined, as
+// `get(undefined, { queryTimeout })` does, passes none.
+export function bindCallParams(stmt, params, bound) {
+  if (!bound) {
+    bindParams(stmt, params);
+  } else if (params.flat().some((value) => value !== undefined)) {
+    throw new TypeError('This statement already has bound parameters');
+  }
+}
+
 // Bind parameters to a statement.
 //
 // This function is used to bind parameters to a statement. It supports both
@@ -22,27 +34,21 @@ function isQueryOptions(value) {
 //
 // The `stmt` parameter is a statement object.
 // The `params` parameter is an array of parameters.
+// The `allowMissing` parameter lets `params` leave parameters without a value.
+// A statement keeps its values from one call to the next, so otherwise a
+// missing value throws better-sqlite3's RangeError rather than running with
+// the value of the previous call.
 //
 // The function returns void.
-export function bindParams(stmt, params) {
-  const len = params?.length;
-  if (len === 0) {
+export function bindParams(stmt, params, allowMissing = false) {
+  if (params.length === 1 && isPlainObject(params[0])) {
+    bindNamedParams(stmt, params[0], allowMissing);
     return;
   }
-  if (len === 1) {
-    const param = params[0];    
-    if (isPlainObject(param)) {  
-      bindNamedParams(stmt, param);
-      return;
-    }
-    if (Array.isArray(param)) {
-      bindPositionalParams(stmt, [param]);
-      return;
-    }
-    bindValue(stmt, 1, param);
-    return;
+  const count = bindPositionalParams(stmt, params);
+  if (!allowMissing && count < stmt.parameterCount()) {
+    throw new RangeError('Too few parameter values were provided');
   }
-  bindPositionalParams(stmt, params);
 }
 
 // Check if object is plain (no prototype chain)
@@ -53,7 +59,7 @@ function isPlainObject(obj) {
 }
 
 // Handle named parameters
-function bindNamedParams(stmt, paramObj) {
+function bindNamedParams(stmt, paramObj, allowMissing) {
   const paramCount = stmt.parameterCount();
   
   for (let i = 1; i <= paramCount; i++) {
@@ -62,12 +68,17 @@ function bindNamedParams(stmt, paramObj) {
       const key = paramName.substring(1); // Remove ':' or '$' prefix
       if (Object.prototype.hasOwnProperty.call(paramObj, key)) {
         bindValue(stmt, i, paramObj[key]);
+      } else if (!allowMissing) {
+        throw new RangeError(`Missing named parameter "${key}"`);
       }
+    } else if (!allowMissing) {
+      throw new RangeError('Too few parameter values were provided');
     }
   }
 }
 
-// Handle positional parameters (including nested arrays)
+// Handle positional parameters (including nested arrays), and return how many
+// values were bound
 function bindPositionalParams(stmt, params) {
   let bindIndex = 1;
   for (let i = 0; i < params.length; i++) {
@@ -80,6 +91,7 @@ function bindPositionalParams(stmt, params) {
       bindValue(stmt, bindIndex++, param);
     }
   }
+  return bindIndex - 1;
 }
 
 function bindValue(stmt, index, value) {

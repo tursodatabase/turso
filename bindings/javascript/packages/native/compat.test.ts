@@ -297,4 +297,6 @@ test('undefined before query options binds NULL', () => {
     const stmt = db.prepare('SELECT ? AS x');
     expect(stmt.get(1)).toEqual({ x: 1 });
     expect(stmt.get(undefined, { queryTimeout: 1000 })).toEqual({ x: null });
+    const bound = db.prepare('SELECT ? AS x').bind(1);
+    expect(bound.get(undefined, { queryTimeout: 1000 })).toEqual({ x: 1 });
 })

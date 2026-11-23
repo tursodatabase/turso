@@ -1,5 +1,5 @@
 import { AsyncLock } from "./async-lock.js";
-import { bindParams, splitBindParameters } from "./bind.js";
+import { bindCallParams, bindParams, splitBindParameters } from "./bind.js";
 import { convertError, prepareStatement, resetStatement, stepSync } from "./sqlite-error.js";
 import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE, STEP_SLEEP, DatabaseOpts } from "./types.js";
 
@@ -778,7 +778,8 @@ async function executeBatch(
     }
     try {
       if (args !== undefined) {
-        bindParams(nativeStmt, [args]);
+        // The statement is new, so a value `args` leaves out is NULL, never an earlier one.
+        bindParams(nativeStmt, [args], true);
       }
       const cols = nativeStmt.columns();
       const columnNames = cols.map((c) => c.name);
@@ -1122,6 +1123,8 @@ function maybeValue<T>(value: T): MaybeLazy<T> {
 class Statement {
   private stmt: MaybeLazy<NativeStatement>;
   private db: NativeDatabase;
+  // Set by `bind()`, after which every call runs with the bound values.
+  private bound = false;
   private execLock: ExecLock;
   private ioStep: () => Promise<void>;
 
@@ -1193,7 +1196,7 @@ class Statement {
     await this.execLock.acquire();
     try {
       stmt.setQueryTimeout(queryOptions);
-      bindParams(stmt, params);
+      bindCallParams(stmt, params, this.bound);
       const totalChangesBefore = this.db.totalChanges();
       while (true) {
         const [stepResult, sleepMs] = await stepSync(stmt);
@@ -1237,7 +1240,7 @@ class Statement {
     let row = undefined;
     try {
       stmt.setQueryTimeout(queryOptions);
-      bindParams(stmt, params);
+      bindCallParams(stmt, params, this.bound);
       while (true) {
         const [stepResult, sleepMs] = await stepSync(stmt);
         if (stepResult === STEP_IO) {
@@ -1275,7 +1278,7 @@ class Statement {
     await this.execLock.acquire();
     try {
       stmt.setQueryTimeout(queryOptions);
-      bindParams(stmt, params);
+      bindCallParams(stmt, params, this.bound);
       while (true) {
         const [stepResult, sleepMs] = await stepSync(stmt);
         if (stepResult === STEP_IO) {
@@ -1313,7 +1316,7 @@ class Statement {
     await this.execLock.acquire();
     try {
       stmt.setQueryTimeout(queryOptions);
-      bindParams(stmt, params);
+      bindCallParams(stmt, params, this.bound);
       while (true) {
         const [stepResult, sleepMs] = await stepSync(stmt);
         if (stepResult === STEP_IO) {
@@ -1358,8 +1361,12 @@ class Statement {
    * @returns this - Statement with binded parameters
    */
   bind(...bindParameters) {
+    if (this.bound) {
+      throw new TypeError("The bind() method can only be invoked once per statement object");
+    }
     try {
       bindParams(this.stmt.must(), bindParameters);
+      this.bound = true;
       return this;
     } catch (err) {
       throw convertError(err);
