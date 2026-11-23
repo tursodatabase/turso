@@ -3,7 +3,8 @@
 use crate::ast;
 use crate::dialect::{
     Catalog, CatalogCmd, CmdContext, CreateIndex, CreateMaterializedView, CreateSequence,
-    CreateTable, CreateView, DropIndex, DropSequence, DropTable, DropView, TableText,
+    CreateTable, CreateTrigger, CreateView, DropIndex, DropSequence, DropTable, DropTrigger,
+    DropView, TableText,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
@@ -57,6 +58,11 @@ impl Catalog for SqliteCatalog {
             CatalogCmd::AlterColumn(column) => emit_alter_column_rows(program, ctx, column),
             CatalogCmd::AddColumn(column) => emit_add_column_rows(program, ctx, column),
             CatalogCmd::DropColumn(column) => emit_drop_column_rows(program, ctx, column),
+            CatalogCmd::CreateTrigger(trigger) => emit_create_trigger_row(program, ctx, trigger),
+            CatalogCmd::DropTrigger(trigger) => {
+                emit_delete_trigger_row(program, ctx, trigger);
+                Ok(())
+            }
         }
     }
 }
@@ -832,6 +838,112 @@ fn create_view_sql(
         return format!("CREATE {view_kind} {view_name} ({columns_str}) AS {select_stmt}");
     }
     format!("CREATE {view_kind} {view_name} AS {select_stmt}")
+}
+
+/// Writes the row of a new trigger.
+fn emit_create_trigger_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    trigger: &CreateTrigger<'_>,
+) -> Result<()> {
+    let resolver = ctx.resolver;
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: trigger.namespace,
+    };
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    emit_schema_entry(
+        program,
+        resolver,
+        sqlite_schema_cursor_id,
+        // Changes of triggers are not captured.
+        None,
+        SchemaEntryType::Trigger,
+        &resolver.mangle_name(namespace, trigger.name),
+        &resolver.mangle_name(trigger.table_namespace, trigger.table),
+        // A trigger has no B-tree.
+        0,
+        Some(trigger.sql.to_string()),
+    )
+}
+
+/// Deletes the row of a trigger.
+fn emit_delete_trigger_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    trigger: &DropTrigger<'_>,
+) {
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: trigger.namespace,
+    };
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+
+    let search_loop_label = program.allocate_label();
+    let skip_non_trigger_label = program.allocate_label();
+    let done_label = program.allocate_label();
+    let rewind_done_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_empty: rewind_done_label,
+    });
+
+    program.preassign_label_to_next_insn(search_loop_label);
+
+    let type_reg = program.alloc_register();
+    let name_reg = program.alloc_register();
+    program.emit_insn(Insn::Column {
+        cursor_id: sqlite_schema_cursor_id,
+        column: 0,
+        dest: type_reg,
+        default: None,
+    });
+    program.emit_insn(Insn::Column {
+        cursor_id: sqlite_schema_cursor_id,
+        column: 1,
+        dest: name_reg,
+        default: None,
+    });
+
+    let type_str_reg = program.emit_string8_new_reg("trigger".to_string());
+    program.emit_insn(Insn::Ne {
+        lhs: type_reg,
+        rhs: type_str_reg,
+        target_pc: skip_non_trigger_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+
+    let trigger_name_str_reg =
+        program.emit_string8_new_reg(ctx.resolver.mangle_name(namespace, trigger.name));
+    program.emit_insn(Insn::Ne {
+        lhs: name_reg,
+        rhs: trigger_name_str_reg,
+        target_pc: skip_non_trigger_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+
+    program.emit_insn(Insn::Delete {
+        cursor_id: sqlite_schema_cursor_id,
+        table_name: SQLITE_TABLEID.to_string(),
+        is_part_of_update: false,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: done_label,
+    });
+
+    program.preassign_label_to_next_insn(skip_non_trigger_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_next: search_loop_label,
+        fullscan: false,
+        is_index: false,
+    });
+
+    program.preassign_label_to_next_insn(done_label);
+    program.preassign_label_to_next_insn(rewind_done_label);
 }
 
 /// Creates one of the engine's own tables in the main database the first

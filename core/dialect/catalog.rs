@@ -177,6 +177,8 @@ pub enum CatalogCmd<'a> {
     AlterColumn(AlterColumn<'a>),
     AddColumn(AddColumn<'a>),
     DropColumn(DropColumn<'a>),
+    CreateTrigger(CreateTrigger<'a>),
+    DropTrigger(DropTrigger<'a>),
 }
 
 /// A new table. The statement has already emitted the creation of its
@@ -411,6 +413,24 @@ pub struct DropColumn<'a> {
     pub name: &'a str,
     pub table: &'a BTreeTable,
     pub statement: &'a str,
+}
+
+/// A new trigger on `table`. A trigger of the temp database can be on a
+/// table of another database, so the table comes with its own database.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateTrigger<'a> {
+    pub namespace: NamespaceId,
+    pub name: &'a str,
+    pub table_namespace: NamespaceRef,
+    pub table: &'a str,
+    pub sql: &'a str,
+}
+
+/// A trigger that the statement drops.
+#[derive(Debug, Clone, Copy)]
+pub struct DropTrigger<'a> {
+    pub namespace: NamespaceId,
+    pub name: &'a str,
 }
 
 /// A statement about roles, ownership, privileges or row-level security.

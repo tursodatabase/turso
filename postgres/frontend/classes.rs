@@ -628,6 +628,8 @@ impl Catalog for PostgresCatalog {
                     emit_dropped_column_comments(program, ctx, column);
                 }
             }
+            // A trigger has no class row.
+            CatalogCmd::CreateTrigger(_) | CatalogCmd::DropTrigger(_) => {}
         }
         Ok(())
     }
