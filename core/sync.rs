@@ -4,6 +4,7 @@ pub(crate) use shuttle_adapter::*;
 #[cfg(not(shuttle))]
 pub use std_adapter::*;
 
+#[allow(dead_code)]
 #[cfg(shuttle)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EncryptionSchedulePoint(pub bool);

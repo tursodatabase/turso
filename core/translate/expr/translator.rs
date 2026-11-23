@@ -905,6 +905,13 @@ fn translate_cast_expr(
         }
     }
 
+    let _ = resolver.catalog.dialect.inject_cast_metadata(
+        program,
+        type_name,
+        target_register,
+        resolver.schema(),
+    );
+
     // SQLite allows CAST(x AS) without a type name, treating it as NUMERIC affinity
     let type_affinity = cast_type_name
         .map(|name| Affinity::of_written_type(&name))
@@ -952,10 +959,18 @@ fn emit_custom_type_cast(
     // does: CAST(5.5 AS smallint) is 5, as are CAST(5.5 AS bigint) and
     // CAST(5.5 AS d) for a domain d over integer.
     match resolver.schema().plain_input_type(&resolved)? {
-        StrictType::Stores(storage_class) => program.emit_insn(Insn::Cast {
-            reg,
-            affinity: storage_class.affinity(),
-        }),
+        StrictType::Stores(storage_class) => {
+            let _ = resolver.catalog.dialect.inject_cast_metadata(
+                program,
+                &Some(type_name.clone()),
+                reg,
+                resolver.schema(),
+            );
+            program.emit_insn(Insn::Cast {
+                reg,
+                affinity: storage_class.affinity(),
+            });
+        }
         StrictType::Any => {}
     }
     emit_store_value(

@@ -16886,19 +16886,23 @@ pub fn op_cast(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _connection: &Arc<Connection>,
+    connection: &Arc<Connection>,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Cast { reg, affinity }, insn);
 
     let value = state.registers[*reg].get_value().clone();
     let result = match affinity {
-        Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
-        Affinity::Text => value.exec_cast("TEXT"),
-        Affinity::Numeric => value.exec_cast("NUMERIC"),
-        Affinity::Integer => value.exec_cast("INTEGER"),
-        Affinity::Real => value.exec_cast("REAL"),
-    }?;
+        Affinity::Blob | Affinity::None => value.exec_cast("BLOB")?,
+        Affinity::Text => value.exec_cast("TEXT")?,
+        Affinity::Numeric => value.exec_cast("NUMERIC")?,
+        Affinity::Integer => {
+            connection
+                .dialect()
+                .cast_to_integer(&value, state, &connection.schema.read())?
+        }
+        Affinity::Real => value.exec_cast("REAL")?,
+    };
 
     state.registers[*reg].set_value(result);
     state.pc += 1;

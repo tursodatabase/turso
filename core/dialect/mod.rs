@@ -39,7 +39,7 @@ use crate::{
     namespace::NamespaceId,
     schema::{BTreeTable, Schema, SchemaBuilder},
     security::{policy::RowPolicy, roles::RoleId},
-    vdbe::Register,
+    vdbe::{builder::ProgramBuilder, ProgramState, Register},
     Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value,
     WallClockInstant, IO,
 };
@@ -645,6 +645,20 @@ pub trait Dialect: Send + Sync + 'static {
         out.push_str("\"X'");
         crate::vdbe::value::push_hex_upper(out, blob);
         out.push_str("'\"");
+    }
+
+    fn inject_cast_metadata(
+        &self,
+        _: &mut ProgramBuilder,
+        _: &Option<ast::Type>,
+        _: usize,
+        _: &Schema,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn cast_to_integer(&self, value: &Value, _: &ProgramState, _: &Schema) -> Result<Value> {
+        Ok(value.exec_cast("INTEGER")?)
     }
 }
 
