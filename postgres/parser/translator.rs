@@ -7694,7 +7694,9 @@ fn pg_type_name_to_ast_type(
         name: name.to_string(),
         size: None,
         array_dimensions,
-        ty_annotation: None,
+        // `name` is the type that stores the value, which is TEXT for a cast
+        // to json. The annotation keeps the type that the cast is to.
+        ty_annotation: crate::type_oid(&pg_type).map(ast::TypeAnnotation::new),
     })
 }
 
@@ -10505,6 +10507,51 @@ fn is_default_collation(collname: &[pg_query::protobuf::Node]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cast_is_annotated_with_the_oid_of_the_type_it_casts_to() {
+        let cast_type = |sql: &str| {
+            let parsed = crate::parse(sql).unwrap();
+            let stmt = PostgreSQLTranslator::new().translate(&parsed).unwrap();
+            let ast::Stmt::Select(select) = stmt else {
+                panic!("not a SELECT: {sql}");
+            };
+            let ast::OneSelect::Select { columns, .. } = select.body.select else {
+                panic!("not a SELECT: {sql}");
+            };
+            let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
+                panic!("not an expression: {sql}");
+            };
+            let ast::Expr::Cast {
+                type_name: Some(ty),
+                ..
+            } = expr.as_ref()
+            else {
+                panic!("not a cast: {sql}");
+            };
+            (
+                ty.name.clone(),
+                ty.ty_annotation.map(|annotation| annotation.type_id),
+            )
+        };
+        // The name is the type that stores the value. The annotation is the
+        // type that the statement names.
+        for (sql, name, oid) in [
+            ("SELECT x::json FROM t", "TEXT", Some(114)),
+            ("SELECT x::boolean FROM t", "INTEGER", Some(16)),
+            ("SELECT x::smallint FROM t", "INTEGER", Some(21)),
+            ("SELECT x::real FROM t", "REAL", Some(700)),
+            (
+                "SELECT CAST(x AS double precision) FROM t",
+                "REAL",
+                Some(701),
+            ),
+            // A type that tursopg has no oid for.
+            ("SELECT x::xml FROM t", "TEXT", None),
+        ] {
+            assert_eq!(cast_type(sql), (name.to_string(), oid), "{sql}");
+        }
+    }
 
     #[test]
     fn frontend_stmt_names_each_kind_the_frontend_runs() {

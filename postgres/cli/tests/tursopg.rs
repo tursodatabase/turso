@@ -1237,9 +1237,12 @@ fn extract_row_description_oids(data: &[u8]) -> Vec<u32> {
 // PostgreSQL versions, so test expectations stay valid. Only the OIDs the
 // current wire tests assert against are declared; add more here as new
 // tests need them.
+const OID_BOOL: u32 = 16;
 const OID_INT2: u32 = 21;
 const OID_INT4: u32 = 23;
 const OID_TEXT: u32 = 25;
+const OID_JSON: u32 = 114;
+const OID_FLOAT4: u32 = 700;
 const OID_FLOAT8: u32 = 701;
 const OID_VARCHAR: u32 = 1043;
 
@@ -1615,8 +1618,9 @@ fn wire_unary_and_parens_propagate() {
     });
 }
 
-/// `CAST(... AS type)` lands the inferred primitive in declared_name and
-/// the wire layer picks the matching PG OID.
+/// A cast reports the PostgreSQL type that it casts to, also when tursopg
+/// stores the value as another type: a json value is stored as text, and a
+/// boolean, a smallint and a real as an integer or a double precision.
 #[test]
 fn wire_cast_reports_target_type() {
     with_pg_client(|c| {
@@ -1630,7 +1634,21 @@ fn wire_cast_reports_target_type() {
         );
         assert_eq!(
             c.query_column_oids("SELECT CAST(1 AS REAL)"),
-            vec![OID_FLOAT8]
+            vec![OID_FLOAT4]
+        );
+        assert_eq!(
+            c.query_column_oids("SELECT '{\"a\":1}'::json, 5::boolean, 1::smallint, 'a'::varchar"),
+            vec![OID_JSON, OID_BOOL, OID_INT2, OID_VARCHAR]
+        );
+        assert_eq!(c.query_single_text("SELECT 5::boolean"), "t");
+        // A function that returns one of its arguments has their type.
+        assert_eq!(
+            c.query_column_oids("SELECT coalesce(1::boolean, false), coalesce(NULL, 1::smallint)"),
+            vec![OID_BOOL, OID_INT2]
+        );
+        assert_eq!(
+            c.query_single_text("SELECT coalesce(1::boolean, false)"),
+            "t"
         );
     });
 }

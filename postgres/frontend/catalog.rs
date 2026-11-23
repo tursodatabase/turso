@@ -422,8 +422,16 @@ impl Dialect for PostgresDialect {
     }
 
     fn type_annotation(&self, ty: &ast::Type) -> Option<ast::TypeAnnotation> {
-        let oid = pg_type_oid(&ty.name)?;
-        u32::try_from(oid).ok().map(ast::TypeAnnotation::new)
+        turso_pg_parser::type_oid(&ty.name).map(ast::TypeAnnotation::new)
+    }
+
+    fn literal_type_annotation(&self, literal: &ast::Literal) -> Option<ast::TypeAnnotation> {
+        match literal {
+            ast::Literal::True | ast::Literal::False => {
+                Some(ast::TypeAnnotation::new(turso_pg_parser::BOOL_OID))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -536,36 +544,7 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
 /// The oid of the PostgreSQL type of a column declared as `ty_str`, or None
 /// for a type name tursopg does not know.
 pub(crate) fn pg_type_oid(ty_str: &str) -> Option<i64> {
-    let base = match ty_str.find('(') {
-        Some(pos) => &ty_str[..pos],
-        None => ty_str,
-    };
-    let oid = match base.to_uppercase().as_str() {
-        "INTEGER" | "INT" | "INT4" => 23,
-        "SMALLINT" | "INT2" => 21,
-        "BIGINT" | "INT8" => 20,
-        "TINYINT" | "MEDIUMINT" => 23,
-        "TEXT" => 25,
-        "VARCHAR" | "CHAR" | "CLOB" | "NCHAR" | "NVARCHAR" | "CHARACTER VARYING" => 1043,
-        "REAL" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT" | "FLOAT8" => 701,
-        "FLOAT4" => 700,
-        "BLOB" | "BYTEA" => 17,
-        "NUMERIC" | "DECIMAL" => 1700,
-        "BOOLEAN" | "BOOL" => 16,
-        "UUID" => 2950,
-        "JSON" => 114,
-        "JSONB" => 3802,
-        "DATE" => 1082,
-        "TIME" => 1083,
-        "TIMESTAMP" => 1114,
-        "TIMESTAMPTZ" => 1184,
-        "INET" => 869,
-        "CIDR" => 650,
-        "MACADDR" => 829,
-        "OID" => 26,
-        _ => return None,
-    };
-    Some(oid)
+    turso_pg_parser::type_oid(ty_str).map(i64::from)
 }
 
 /// The oid of relation `name` of `namespace`, from its stored class row.
