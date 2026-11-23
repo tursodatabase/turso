@@ -1,3 +1,4 @@
+use crate::ast::{self, Expr, TriggerEvent, TriggerTime};
 use crate::error::SQLITE_ERROR;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{BTreeTable, Column, Trigger};
@@ -22,7 +23,6 @@ use crate::vdbe::{BranchOffset, MAX_TRIGGER_DEPTH, TRIGGER_DEPTH_ERROR};
 use crate::{bail_parse_error, QueryMode, Result};
 use std::cell::RefCell;
 use std::num::NonZero;
-use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
 
 /// Context for trigger execution
 #[derive(Debug)]

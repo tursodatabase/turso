@@ -19,8 +19,8 @@ use sql_generation::model::{
     table::{Column, ColumnType, Index, JoinTable, JoinType, SimValue, Table, TableContext},
 };
 use turso_core::Value;
+use turso_core::ast::{ColumnConstraint, Distinctness};
 use turso_core::turso_assert_eq;
-use turso_parser::ast::{ColumnConstraint, Distinctness};
 
 use crate::model::lateral::LateralSelect;
 use crate::runner::env::TransactionMode;

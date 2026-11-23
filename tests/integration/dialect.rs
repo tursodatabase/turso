@@ -1,4 +1,8 @@
 use std::sync::Arc;
+use turso_core::ast::Cmd;
+use turso_core::ast::CreateTableBody;
+use turso_core::ast::QualifiedName;
+use turso_core::ast::Stmt;
 use turso_core::dialect::*;
 use turso_core::function::ScalarFunc;
 use turso_core::io::PlatformIO;
@@ -33,10 +37,6 @@ use turso_ext::IndexInfo;
 use turso_ext::OrderByInfo;
 use turso_ext::ResultCode;
 use turso_ext::VTabKind;
-use turso_parser::ast::Cmd;
-use turso_parser::ast::CreateTableBody;
-use turso_parser::ast::QualifiedName;
-use turso_parser::ast::Stmt;
 use turso_sqlite::SqliteDialect;
 
 /// A dialect that counts schema-row parses and strips a `/* test */ `
@@ -57,14 +57,14 @@ impl Dialect for TestDialect {
     fn parse_internal(
         &self,
         sql: &str,
-    ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
         turso_sqlite::SqliteDialect.parse_internal(sql)
     }
 
     fn parse_internal_column_definition(
         &self,
         sql: &str,
-    ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+    ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
     }
 
@@ -164,14 +164,14 @@ impl Dialect for StrictTestDialect {
     fn parse_internal(
         &self,
         sql: &str,
-    ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
         turso_sqlite::SqliteDialect.parse_internal(sql)
     }
 
     fn parse_internal_column_definition(
         &self,
         sql: &str,
-    ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+    ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
     }
 
@@ -554,14 +554,14 @@ impl Dialect for NoFunctionsDialect {
     fn parse_internal(
         &self,
         sql: &str,
-    ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
         turso_sqlite::SqliteDialect.parse_internal(sql)
     }
 
     fn parse_internal_column_definition(
         &self,
         sql: &str,
-    ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+    ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
     }
 
@@ -623,14 +623,14 @@ impl Dialect for ShoutingUpperDialect {
     fn parse_internal(
         &self,
         sql: &str,
-    ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
         turso_sqlite::SqliteDialect.parse_internal(sql)
     }
 
     fn parse_internal_column_definition(
         &self,
         sql: &str,
-    ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+    ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
     }
 
@@ -1153,14 +1153,14 @@ impl Dialect for NamespacesAndOwnBuilderDialect {
     fn parse_internal(
         &self,
         sql: &str,
-    ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
         turso_sqlite::SqliteDialect.parse_internal(sql)
     }
 
     fn parse_internal_column_definition(
         &self,
         sql: &str,
-    ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+    ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
     }
 

@@ -1,10 +1,10 @@
+use crate::ast;
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::vtab::{column_definition, InternalVirtualTable, InternalVirtualTableCursor};
 use crate::MAIN_DB_ID;
 use crate::{Connection, Result, Value};
 use turso_ext::{ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode};
-use turso_parser::ast;
 
 #[derive(Debug)]
 pub struct TursoTypesTable;

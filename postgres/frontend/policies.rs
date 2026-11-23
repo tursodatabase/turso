@@ -28,9 +28,9 @@
 //! is never used twice in one database.
 
 use serde::{Deserialize, Serialize};
+use turso_core::ast;
 use turso_core::security::policy::RowPolicy;
 use turso_core::security::roles::RoleId;
-use turso_parser::ast;
 use turso_parser::parser::Parser;
 
 #[derive(Serialize, Deserialize)]

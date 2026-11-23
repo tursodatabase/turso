@@ -25,6 +25,7 @@ use super::{
     window::WindowMetadata,
 };
 use crate::alloc::{TryClone, TursoIteratorExt};
+use crate::ast::{self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime};
 use crate::instrument;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
@@ -55,9 +56,6 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use turso_parser::ast::{
-    self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
-};
 
 pub(crate) mod delete;
 pub(crate) mod gencol;
@@ -515,11 +513,11 @@ impl<'a> Resolver<'a> {
 
     /// Counts one more level of nested query until the returned guard is
     /// dropped. The planner and the code generator recurse one time for each
-    /// level, so the depth is bounded by [turso_parser::MAX_QUERY_DEPTH], as in
+    /// level, so the depth is bounded by [ast::MAX_QUERY_DEPTH], as in
     /// the parser.
     pub(crate) fn enter_nested_query(&self) -> Result<NestedQueryGuard<'_>> {
         let depth = self.query_nesting_depth.get();
-        if depth > turso_parser::MAX_QUERY_DEPTH {
+        if depth > ast::MAX_QUERY_DEPTH {
             return Err(query_nested_too_deeply_error());
         }
         self.query_nesting_depth.set(depth + 1);
@@ -892,7 +890,7 @@ impl Drop for NestedQueryGuard<'_> {
 #[cold]
 #[inline(never)]
 fn query_nested_too_deeply_error() -> LimboError {
-    LimboError::ParseError(turso_parser::query_nested_too_deeply_message())
+    LimboError::ParseError(ast::query_nested_too_deeply_message())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1058,6 +1056,11 @@ pub struct TranslateCtx<'a> {
     // we want to emit the non-aggregate columns (foo and bar) only once.
     // This register is a flag that tracks whether we have already done that.
     pub reg_nonagg_emit_once_flag: Option<usize>,
+    /// In an aggregate query without GROUP BY, the columns that are read after
+    /// the loop, each with the register that holds its value from the row
+    /// chosen by `BareColumnRowCheck`, or NULL when no row reached the
+    /// aggregates.
+    pub ungrouped_agg_bare_columns: Vec<(Expr, usize)>,
     // First register of the result columns of the query
     pub reg_result_cols_start: Option<usize>,
     pub limit_ctx: Option<LimitCtx>,
@@ -1130,6 +1133,7 @@ impl<'a> TranslateCtx<'a> {
             label_main_loop_end: None,
             reg_agg_start: None,
             reg_nonagg_emit_once_flag: None,
+            ungrouped_agg_bare_columns: Vec::new(),
             limit_ctx: None,
             reg_offset: None,
             reg_limit_offset_sum: None,

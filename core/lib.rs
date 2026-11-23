@@ -13,6 +13,7 @@
 #![recursion_limit = "256"]
 
 pub mod alloc;
+pub use turso_ast as ast;
 pub mod busy;
 pub mod cdc;
 #[cfg(feature = "cli_only")]
@@ -105,6 +106,7 @@ pub use functions::datetime_input::exec_temporal_encode;
 /// formatting implementation.
 pub use functions::printf::{exec_printf_values, printf_c_arg_plan, PrintfCArg};
 
+use crate::ast::Cmd;
 use crate::{
     busy::{BusyHandler, BusyHandlerCallback},
     index_method::IndexMethod,
@@ -119,8 +121,8 @@ use storage::sqlite3_ondisk::PageSize;
 use tracing::instrument;
 pub use translate::emitter::TransactionMode;
 use turso_macros::AtomicEnum;
-use turso_parser::{ast, ast::Cmd};
 
+pub use crate::ast::EqpFormat;
 pub use cdc::{
     CaptureDataChangesExt, CaptureDataChangesInfo, CaptureDataChangesMode, CdcVersion,
     CDC_VERSION_CURRENT,
@@ -202,7 +204,6 @@ pub use turso_macros::{
     turso_assert_sometimes_less_than, turso_assert_sometimes_less_than_or_equal,
     turso_assert_unreachable, turso_debug_assert, turso_soft_unreachable,
 };
-pub use turso_parser::ast::EqpFormat;
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
 pub use vdbe::array::{array_values_from_any, parse_text_array_of_texts, text_array_literal};

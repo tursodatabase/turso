@@ -3550,7 +3550,6 @@ dependencies = [
  "tracing-subscriber",
  "turso_core",
  "turso_macros",
- "turso_parser",
  "turso_sqlite",
 ]
 
@@ -6139,7 +6138,6 @@ dependencies = [
  "strum",
  "tracing",
  "turso_core",
- "turso_parser",
 ]
 
 [[package]]
@@ -6174,6 +6172,7 @@ dependencies = [
  "thiserror 2.0.16",
  "tokio",
  "turso",
+ "turso_ast",
  "turso_parser",
  "turso_pg",
  "turso_pg_client",
@@ -7133,6 +7132,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_ast"
+version = "0.9.0-pre.6"
+dependencies = [
+ "bitflags 2.9.4",
+ "miette",
+ "serde",
+ "strum",
+ "strum_macros",
+ "thiserror 2.0.16",
+ "turso_macros",
+]
+
+[[package]]
 name = "turso_benches"
 version = "0.9.0-pre.6"
 dependencies = [
@@ -7272,9 +7284,9 @@ dependencies = [
  "thiserror 2.0.16",
  "tracing",
  "tracing-subscriber",
+ "turso_ast",
  "turso_ext",
  "turso_macros",
- "turso_parser",
  "twox-hash",
  "uncased",
  "uuid",
@@ -7329,16 +7341,11 @@ dependencies = [
 name = "turso_parser"
 version = "0.9.0-pre.6"
 dependencies = [
- "bitflags 2.9.4",
  "codspeed-criterion-compat",
  "criterion",
  "fallible-iterator 0.3.0",
  "memchr",
- "miette",
- "serde",
- "strum",
- "strum_macros",
- "thiserror 2.0.16",
+ "turso_ast",
  "turso_macros",
 ]
 
@@ -7398,7 +7405,7 @@ dependencies = [
  "pg_query",
  "phf",
  "thiserror 2.0.16",
- "turso_parser",
+ "turso_ast",
 ]
 
 [[package]]
@@ -7453,7 +7460,6 @@ dependencies = [
  "turso_core",
  "turso_ext",
  "turso_macros",
- "turso_parser",
  "turso_pg",
  "turso_sdk_kit",
  "twox-hash",
@@ -7652,7 +7658,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "turso_core",
- "turso_parser",
  "turso_sqlite",
  "twox-hash",
  "windows-sys 0.61.2",

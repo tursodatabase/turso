@@ -19,13 +19,13 @@
 
 use std::sync::Arc;
 
-use turso_parser::ast;
+use crate::ast;
 
+use crate::ast::TableInternalId;
 use crate::schema::BTreeTable;
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::Aggregate;
 use crate::{error::LimboError, Result};
-use turso_parser::ast::TableInternalId;
 
 /// Index into [`MaintenanceDag::nodes`]. A node's inputs always have smaller
 /// indices, so iterating `0..nodes.len()` visits the DAG in topological order.

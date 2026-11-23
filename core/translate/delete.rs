@@ -1,3 +1,4 @@
+use crate::ast::{self, Expr, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
 use crate::namespace::NamespaceRef;
 use crate::schema::Table;
 use crate::security::policy::Command;
@@ -21,7 +22,6 @@ use crate::translate::{roles, row_security};
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
-use turso_parser::ast::{self, Expr, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
 
@@ -91,7 +91,7 @@ pub fn translate_delete(
     resolver: &Resolver,
     where_clause: Option<Box<Expr>>,
     returning: Vec<ResultColumn>,
-    indexed: Option<turso_parser::ast::Indexed>,
+    indexed: Option<crate::ast::Indexed>,
     with: Option<With>,
     truncate: bool,
     program: &mut ProgramBuilder,
@@ -283,7 +283,7 @@ pub fn prepare_delete_plan(
     table: Arc<Table>,
     where_clause: Option<Box<Expr>>,
     mut returning: Vec<ResultColumn>,
-    indexed: Option<turso_parser::ast::Indexed>,
+    indexed: Option<crate::ast::Indexed>,
     with: Option<With>,
     connection: &Arc<crate::Connection>,
     namespace: NamespaceRef,

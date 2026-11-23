@@ -6050,12 +6050,12 @@ mod tests {
             IndexInfo::new(
                 [
                     crate::types::KeyInfo {
-                        sort_order: turso_parser::ast::SortOrder::Asc,
+                        sort_order: crate::ast::SortOrder::Asc,
                         collation: crate::translate::collate::CollationSeq::BINARY,
                         nulls_order: None,
                     },
                     crate::types::KeyInfo {
-                        sort_order: turso_parser::ast::SortOrder::Asc,
+                        sort_order: crate::ast::SortOrder::Asc,
                         collation: crate::translate::collate::CollationSeq::BINARY,
                         nulls_order: None,
                     },

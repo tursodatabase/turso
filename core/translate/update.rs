@@ -1,6 +1,7 @@
 use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 
+use crate::ast::{self, Expr};
 use crate::namespace::NamespaceRef;
 use crate::schema::{EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::security::policy::Command;
@@ -17,7 +18,6 @@ use crate::{
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     CaptureDataChangesExt, Connection,
 };
-use turso_parser::ast::{self, Expr};
 
 use super::emitter::emit_program;
 use super::expr::process_returning_clause;
@@ -88,7 +88,10 @@ pub fn translate_update(
 /// After planning, the right-hand side (SELECT x, y FROM s) becomes a
 /// SubqueryResult with 2 columns, and this is split into 2 1-column SubqueryResult expressions
 /// i.e. one per each SET assignment.
-fn split_update_set_values(mut expr: Expr, target_count: usize) -> crate::Result<Vec<Expr>> {
+pub(crate) fn split_update_set_values(
+    mut expr: Expr,
+    target_count: usize,
+) -> crate::Result<Vec<Expr>> {
     while let Expr::Parenthesized(mut exprs) = expr {
         match exprs.len() {
             1 => expr = *exprs.pop().expect("single parenthesized expr"),
@@ -683,7 +686,7 @@ fn compose_update_set_clause(existing: &mut UpdateSetClause, expr: Box<Expr>) {
                 args: composed_args,
                 order_by: vec![],
                 within_group: vec![],
-                filter_over: turso_parser::ast::FunctionTail {
+                filter_over: crate::ast::FunctionTail {
                     filter_clause: None,
                     over_clause: None,
                 },

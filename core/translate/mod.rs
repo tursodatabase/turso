@@ -53,6 +53,7 @@ mod values;
 pub(crate) mod view;
 mod window;
 
+use crate::ast;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
@@ -72,7 +73,6 @@ use schema::{translate_create_table, translate_create_virtual_table, translate_d
 use select::translate_select;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
-use turso_parser::ast;
 use update::translate_update;
 
 #[instrument(skip_all, level = Level::DEBUG)]

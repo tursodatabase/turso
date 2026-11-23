@@ -1,3 +1,4 @@
+use crate::ast::Name;
 use crate::{
     vdbe::{
         builder::ProgramBuilder,
@@ -5,7 +6,6 @@ use crate::{
     },
     Result,
 };
-use turso_parser::ast::Name;
 
 /// Emits bytecode for `SAVEPOINT <name>`.
 pub fn translate_savepoint(program: &mut ProgramBuilder, name: Name) -> Result<()> {

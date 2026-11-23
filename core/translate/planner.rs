@@ -14,6 +14,10 @@ use super::{
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
 };
+use crate::ast::{
+    self, As, Expr, FromClause, JoinType, Materialized, Over, QualifiedName, Select,
+    TableInternalId, With,
+};
 use crate::security::permission::Object;
 use crate::translate::plan::BitSet;
 use crate::translate::{
@@ -47,10 +51,6 @@ use crate::{
     vdbe::builder::ProgramBuilder,
 };
 use smallvec::SmallVec;
-use turso_parser::ast::{
-    self, As, Expr, FromClause, JoinType, Materialized, Over, QualifiedName, Select,
-    TableInternalId, With,
-};
 
 /// Data needed to plan each reference to a CTE separately.
 ///
@@ -935,8 +935,8 @@ fn resolve_effective_frame(
     func: &AccumulatorFunc,
     user_frame: Option<crate::translate::plan::Frame>,
 ) -> Result<crate::translate::plan::Frame> {
+    use crate::ast::{FrameBound, FrameMode};
     use crate::translate::plan::Frame;
-    use turso_parser::ast::{FrameBound, FrameMode};
 
     // Built-ins with a coerced frame ignore the user clause entirely
     // (`Some(_)` from `coerced_frame()`). The rest honor it.
@@ -1448,6 +1448,7 @@ fn prepare_recursive_cte_plan(
         outer_query_refs,
         QueryDestination::placeholder_for_subquery(),
         connection,
+        false,
     )?;
 
     let explicit_columns = (!cte_definition.explicit_columns.is_empty())
@@ -1509,6 +1510,7 @@ fn prepare_recursive_cte_plan(
         &recursive_query_outer_refs,
         QueryDestination::placeholder_for_subquery(),
         connection,
+        false,
     )?;
 
     if initial_query.select_result_columns().len() != recursive_query.select_result_columns().len()

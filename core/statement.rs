@@ -7,8 +7,8 @@ use std::{
     time::Duration,
 };
 
+use crate::ast::{fmt::WriteSql, Cmd};
 use tracing::{instrument, Level};
-use turso_parser::ast::{fmt::ToTokens, Cmd};
 
 use crate::alloc::TursoIteratorExt;
 use crate::{
@@ -1230,7 +1230,7 @@ impl Statement {
 
                 // 2. For column references, apply full/short column name logic.
                 match &column.expr {
-                    turso_parser::ast::Expr::Column {
+                    crate::ast::Expr::Column {
                         table,
                         column: col_idx,
                         ..
@@ -1343,13 +1343,13 @@ impl Statement {
 
     fn column_origin(
         &self,
-        expr: &turso_parser::ast::Expr,
+        expr: &crate::ast::Expr,
         tables: &TableReferences,
     ) -> Option<ColumnOrigin> {
         let (table_id, column_idx) = match expr {
-            turso_parser::ast::Expr::Column { table, column, .. } => (*table, Some(*column)),
-            turso_parser::ast::Expr::RowId { table, .. } => (*table, None),
-            turso_parser::ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            crate::ast::Expr::Column { table, column, .. } => (*table, Some(*column)),
+            crate::ast::Expr::RowId { table, .. } => (*table, None),
+            crate::ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
                 return self.column_origin(&exprs[0], tables);
             }
             _ => return None,
@@ -1463,7 +1463,7 @@ impl Statement {
         }
         let column = &self.program.result_columns.get(idx).expect("No column");
         match &column.expr {
-            turso_parser::ast::Expr::Column {
+            crate::ast::Expr::Column {
                 table,
                 column: column_idx,
                 ..

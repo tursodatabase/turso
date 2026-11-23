@@ -716,25 +716,33 @@ test('batch validates every bigint before executing the first statement', async 
     expect(await stmt.all([])).toEqual([{ n: 0 }]);
 })
 
-test('batch coerces bind values once during validation', async () => {
+test('batch refuses a value with no SQLite type before executing the first statement', async () => {
     const db = await connect(":memory:");
-    await db.exec("CREATE TABLE t_batch_coercion (x TEXT)");
-    let coercions = 0;
-    const value = {
-        toString() {
-            coercions++;
-            if (coercions > 1) throw new Error("value was coerced twice");
-            return "coerced";
-        },
-    };
+    await db.exec("CREATE TABLE t_batch_unbindable (x)");
 
-    await db.batch([
-        { sql: "INSERT INTO t_batch_coercion VALUES (?)", args: [value] },
+    let error: any;
+    try {
+        await db.batch([
+            { sql: "INSERT INTO t_batch_unbindable VALUES (?)", args: [1] },
+            { sql: "INSERT INTO t_batch_unbindable VALUES (?)", args: [new Date(0)] },
+        ]);
+    } catch (caught) {
+        error = caught;
+    }
+
+    expect(error).toBeInstanceOf(TypeError);
+    expect(error.message).toContain("SQLite3 can only bind numbers, strings, bigints, buffers, and null");
+    expect(error.batchIndex).toBe(1);
+    const stmt = await db.prepare("SELECT COUNT(*) AS n FROM t_batch_unbindable");
+    expect(await stmt.all([])).toEqual([{ n: 0 }]);
+})
+
+test('batch binds a DataView as its bytes', async () => {
+    const db = await connect(":memory:");
+    const [result] = await db.batch([
+        { sql: "SELECT hex(?) AS x", args: [new DataView(new Uint8Array([9, 1, 2, 3]).buffer, 1, 2)] },
     ]);
-
-    expect(coercions).toBe(1);
-    const stmt = await db.prepare("SELECT x FROM t_batch_coercion");
-    expect(await stmt.all([])).toEqual([{ x: "coerced" }]);
+    expect(result.rows).toEqual([{ x: "0102" }]);
 })
 
 test('atomic batch rejects transaction control before BEGIN', async () => {
@@ -799,4 +807,16 @@ test('a whole number binds as INTEGER only inside the int64 range', async () => 
     expect(await stmt.get(2 ** 64)).toEqual({ type: "real", above_max: 1 });
     expect(await stmt.get(2 ** 63 - 1024)).toEqual({ type: "integer", above_max: 0 });
     expect(await stmt.get(-(2 ** 63))).toEqual({ type: "integer", above_max: 0 });
+})
+
+test('undefined binds as NULL and a value with no SQLite type is refused', async () => {
+    const db = await connect(":memory:");
+    const stmt = await db.prepare("SELECT typeof(?) AS a, typeof(?) AS b");
+    expect(await stmt.get(1, undefined)).toEqual({ a: "integer", b: "null" });
+    expect(await stmt.get([undefined, 1])).toEqual({ a: "null", b: "integer" });
+    for (const value of [new Date(0), { a: 1 }, new Map(), new ArrayBuffer(2), () => 1, Symbol("s")]) {
+        const error = await stmt.get(1, value).catch((e) => e);
+        expect(error).toBeInstanceOf(TypeError);
+        expect(error.message).toBe("SQLite3 can only bind numbers, strings, bigints, buffers, and null");
+    }
 })

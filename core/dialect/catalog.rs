@@ -2,6 +2,7 @@
 //! translation writes through, and what the dialect's bytecode tells the
 //! in-memory schema once the command is stored.
 
+use crate::ast::{self, Grantee, Privilege, RoleSpec};
 use crate::{
     namespace::{NamespaceId, NamespaceRef},
     schema::{BTreeTable, Index, Schema},
@@ -17,7 +18,6 @@ use crate::{
     Connection, LimboError, Result, Value,
 };
 use std::{cell::Cell, sync::Arc};
-use turso_parser::ast::{self, Grantee, Privilege, RoleSpec};
 
 /// Where a dialect stores the objects of a database. DDL translation
 /// creates and fills the B-trees; the catalog stores what describes them.

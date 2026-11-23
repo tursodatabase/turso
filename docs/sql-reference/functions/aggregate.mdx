@@ -201,6 +201,13 @@ GROUP BY region;
 | North | 250.0 | 100.0 |
 | South | 175.0 | 150.0 |
 
+In a query with `max(X)` or `min(X)`, a column outside the aggregate functions takes its value from the last row that set a new maximum or minimum of its group, as in SQLite. When the query has more than one `max()` or `min()`, the last one in the query decides.
+
+```sql
+SELECT region, max(amount), customer FROM sales GROUP BY region;
+-- customer is the customer of the largest sale in each region
+```
+
 <Info>
 When `max(X)` or `min(X)` is called with a single argument in an aggregate context, it acts as an aggregate function. When called with two or more arguments (e.g., `max(a, b, c)`), it acts as a [scalar function](/docs/sql-reference/functions/scalar) and returns the largest argument.
 </Info>

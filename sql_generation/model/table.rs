@@ -2,8 +2,8 @@ use std::{fmt::Display, hash::Hash, ops::Deref};
 
 use serde::{Deserialize, Serialize};
 use turso_core::alloc::{TursoIteratorExt, TursoSliceExt, ALLOC_ERR_MSG};
+use turso_core::ast::{self, ColumnConstraint, SortOrder};
 use turso_core::{numeric::Numeric, types, LimboError};
-use turso_parser::ast::{self, ColumnConstraint, SortOrder};
 
 use crate::model::query::predicate::Predicate;
 

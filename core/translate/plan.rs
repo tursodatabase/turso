@@ -1,3 +1,6 @@
+use crate::ast::{
+    self, Expr, FrameBound, FrameClause, FrameMode, ResolveType, SortOrder, SubqueryType,
+};
 use crate::namespace::NamespaceRef;
 use crate::{
     alloc::{self, TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt},
@@ -33,11 +36,8 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
-use turso_parser::ast::{
-    self, Expr, FrameBound, FrameClause, FrameMode, ResolveType, SortOrder, SubqueryType,
-};
 
-use turso_parser::ast::TableInternalId;
+use crate::ast::TableInternalId;
 
 use super::emitter::OperationMode;
 use super::expr::expr_type::{compound_column_type, type_of, type_ordering, ExprType};
@@ -1275,7 +1275,7 @@ impl UpdatePlan {
     /// Combine the UPDATE target (always first) and the `FROM`-clause tables
     /// into one `TableReferences` — the read-side scope used for planning
     /// outer-`WHERE` subqueries, `EXPLAIN QUERY PLAN`, and rendering the plan
-    /// back to SQL text via `ToTokens`.
+    /// back to SQL text via `WriteSql`.
     /// The plan stores the two separately because the write-side emitter
     /// treats the target table specially; this helper rejoins them for readers.
     pub fn build_read_scope_tables(&self) -> TableReferences {
@@ -4646,6 +4646,7 @@ impl SubqueryPosition {
             SubqueryPosition::ResultColumn
                 | SubqueryPosition::Where
                 | SubqueryPosition::GroupBy
+                | SubqueryPosition::Having
                 | SubqueryPosition::OrderBy
         )
     }

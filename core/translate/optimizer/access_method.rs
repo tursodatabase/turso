@@ -3,8 +3,8 @@ use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::iter;
 
+use crate::ast::{self, SortOrder, TableInternalId};
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
-use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::schema::Schema;
@@ -52,8 +52,7 @@ use super::{
         MultiIndexTableWork,
     },
     order::{
-        btree_access_order_consumed, subquery_intrinsic_order_consumed, ColumnTarget,
-        EqualityPrefixScope, OrderTarget,
+        btree_access_order_consumed, subquery_intrinsic_order_consumed, ColumnTarget, OrderTarget,
     },
     AvailableIndexes,
 };
@@ -298,11 +297,9 @@ pub(super) fn choose_best_btree_candidate(
         let (iter_dir, is_index_ordered, order_satisfiability_bonus) =
             if let Some(order_target) = maybe_order_target {
                 // Reuse the same index-vs-order matching logic as final plan
-                // validation, but allow any equality-constrained seek prefix to
-                // be skipped here. Candidate scoring only needs to know whether
+                // validation. Candidate scoring only needs to know whether
                 // this specific access path can emit rows ordered after its seek
-                // key; final global ORDER BY validation is stricter and only
-                // skips globally constant prefixes.
+                // key.
                 let all_same_direction = btree_access_order_consumed(
                     rhs_table,
                     IterationDirection::Forwards,
@@ -311,7 +308,6 @@ pub(super) fn choose_best_btree_candidate(
                     order_target,
                     0,
                     schema,
-                    EqualityPrefixScope::AnyEquality,
                 )
                 .consumed
                     == order_target.columns.len();
@@ -323,7 +319,6 @@ pub(super) fn choose_best_btree_candidate(
                     order_target,
                     0,
                     schema,
-                    EqualityPrefixScope::AnyEquality,
                 )
                 .consumed
                     == order_target.columns.len();
@@ -2265,7 +2260,6 @@ fn materialized_subquery_order_properties(
         order_target,
         0,
         schema,
-        EqualityPrefixScope::AnyEquality,
     )
     .consumed
         == order_target.columns.len();
@@ -2277,7 +2271,6 @@ fn materialized_subquery_order_properties(
         order_target,
         0,
         schema,
-        EqualityPrefixScope::AnyEquality,
     )
     .consumed
         == order_target.columns.len();

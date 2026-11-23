@@ -1,10 +1,25 @@
 pub mod check;
+pub mod error;
 pub mod fmt;
+pub mod keyword;
 
 use std::{num::NonZeroU32, sync::Arc};
 
-use crate::lexer::is_quotable_keyword;
+use crate::keyword::is_quotable_keyword;
 use strum_macros::{EnumIter, EnumString};
+
+/// Maximum nesting depth of queries: subqueries in a FROM clause or in an
+/// expression, CTE bodies, and parenthesized FROM terms. SQLite has no such
+/// limit. The parser, the planner and the code generator recurse one time for
+/// each level, so this limit bounds their stack use.
+pub const MAX_QUERY_DEPTH: usize = 500;
+
+/// The message of the error for a query nested deeper than [`MAX_QUERY_DEPTH`].
+/// The parser gives it for nesting in the SQL text, and the planner for
+/// nesting that the SQL text does not show.
+pub fn query_nested_too_deeply_message() -> String {
+    format!("Query is nested too deeply (maximum depth {MAX_QUERY_DEPTH})")
+}
 
 /// `?` or `$` Prepared statement arg placeholder(s)
 #[derive(Default)]

@@ -1,7 +1,7 @@
-use turso_parser::ast::{Expr, SortOrder, SubqueryType, TableInternalId};
+use crate::ast::{Expr, SortOrder, SubqueryType, TableInternalId};
 
 use super::{
-    aggregation::{emit_aggregate_step, AggArgumentSource},
+    aggregation::{emit_aggregate_step, AggArgumentSource, BareColumnRowCheck},
     emitter::{
         InSeekMetadata, MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, Resolver,
         TranslateCtx, UpdateRowSource,

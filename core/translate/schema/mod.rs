@@ -30,7 +30,7 @@ use crate::translate::catalog::CatalogContext;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{prepare_cdc_if_necessary, Resolver};
 use crate::translate::expr::expr_type::{
-    base_value_type, decode_type, iif_values, value_type, ExprType,
+    base_value_type, decode_type, first_and_third_arguments, iif_values, value_type, ExprType,
 };
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
@@ -50,9 +50,9 @@ use crate::vdbe::insn::{
 use crate::{bail_parse_error, turso_assert, turso_assert_eq, Result};
 use crate::{Connection, Value, MAIN_DB_ID};
 
+use crate::ast;
+use crate::ast::ColumnDefinition;
 use turso_ext::VTabKind;
-use turso_parser::ast;
-use turso_parser::ast::ColumnDefinition;
 
 /// Validate a CHECK constraint expression at CREATE TABLE / ALTER TABLE ADD COLUMN time.
 /// Rejects non-existent columns, non-existent functions, aggregates, window functions,
@@ -461,6 +461,9 @@ fn resolve_func_return_type(
         ResultType::OneOfTheArguments => common_check_type(args.iter().map(|arg| type_of(arg))),
         ResultType::OneOfTheIifValues => {
             common_check_type(iif_values(args).map(|arg| type_of(arg)))
+        }
+        ResultType::OneOfTheFirstAndThirdArguments => {
+            common_check_type(first_and_third_arguments(args).map(|arg| type_of(arg)))
         }
         // ceil, floor and trunc give an integer for an integer and a real for
         // a real. A text or blob argument is first converted to a number,

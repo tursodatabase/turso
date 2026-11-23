@@ -1,4 +1,5 @@
 use super::{emit_columns_and_dependencies, Resolver, Result, TranslateCtx};
+use crate::ast::TriggerEvent;
 use crate::namespace::NamespaceRef;
 use crate::{
     emit_explain,
@@ -36,7 +37,6 @@ use crate::{
     CaptureDataChangesExt, Connection,
 };
 use tracing::{instrument, Level};
-use turso_parser::ast::TriggerEvent;
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_delete(
