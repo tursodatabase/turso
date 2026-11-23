@@ -806,7 +806,7 @@ expect {
 expect @tursopg error {}
 
 # B-77: now() text format has offset and micros
-@compat-gap "cast:timestamptz -> text"
+@compat-gap "type:bool"
 test now-text-format-has-offset-and-micros {
     SELECT now()::text LIKE '____-__-__ __:__:__.%+00';
 }
@@ -814,7 +814,7 @@ expect {
     t
 }
 expect @tursopg {
-    0
+    1
 }
 
 # B-78: gen_random_uuid() format
@@ -1502,4 +1502,20 @@ expect error {
 }
 expect @tursopg raw {
  12
+}
+
+# SQLite's date functions are not PostgreSQL functions. tursopg runs them on
+# the stored text of a timestamptz.
+@compat-gap "function:datetime"
+test sqlite-date-functions-on-timestamptz {
+    CREATE TABLE datetime_values (tz timestamptz);
+    INSERT INTO datetime_values VALUES ('2024-01-05 10:00:00+00');
+    SELECT datetime(tz), strftime('%Y', tz), julianday(tz) FROM datetime_values;
+}
+@sqlstate 42883
+expect error {
+    function datetime\(timestamp with time zone\) does not exist
+}
+expect @tursopg {
+    2024-01-05 10:00:00|2024|2460314.9166666665
 }

@@ -15,8 +15,7 @@
 
 @database :memory:
 
-# A stored timestamptz cast to text loses its +00 offset.
-@compat-gap "cast:timestamptz -> text"
+# A stored timestamptz cast to text ends in the offset +00.
 test stored-timestamptz-text-cast {
     CREATE TABLE t (id int, created_at timestamptz);
     INSERT INTO t VALUES (1, '2026-01-01 10:00:00.25+02');
@@ -25,11 +24,8 @@ test stored-timestamptz-text-cast {
 expect {
     2026-01-01 08:00:00.25+00
 }
-expect @tursopg {
-    2026-01-01 08:00:00.25
-}
 
-# Concatenation converts the value with the same cast.
+# Concatenation reads the value without the +00 that the cast adds.
 @compat-gap "cast:timestamptz -> text"
 test stored-timestamptz-concat {
     CREATE TABLE t (id int, created_at timestamptz);
@@ -43,8 +39,7 @@ expect @tursopg {
     at 2026-01-01 08:00:00.25
 }
 
-# Without the offset, the text comparison on tursopg returns no rows.
-@compat-gap "cast:timestamptz -> text"
+# The text of a timestamptz, with its offset, compares as text.
 test where-timestamptz-text-compare {
     CREATE TABLE t (id int, ts timestamptz);
     INSERT INTO t VALUES (1, '2026-01-01 00:00Z'), (2, '2026-01-01 01:00+01'), (3, '2025-12-31 21:00-03');
@@ -54,8 +49,6 @@ expect {
     1
     2
     3
-}
-expect @tursopg {
 }
 
 @compat-gap "type:_timestamptz"
@@ -782,3 +775,18 @@ expect {
 }
 @sqlstate 22023
 expect @tursopg error {}
+
+# A UNION with a literal that has an offset does not read the literal as a
+# timestamptz, so the same time counts twice.
+@compat-gap "operator:timestamptz UNION unknown"
+test union-timestamptz-with-literal-offset {
+    CREATE TABLE t (tz timestamptz);
+    INSERT INTO t VALUES ('2024-01-05 10:00:00+02');
+    SELECT count(*) FROM (SELECT tz FROM t UNION SELECT '2024-01-05 08:00:00+00') u;
+}
+expect {
+    1
+}
+expect @tursopg {
+    2
+}
