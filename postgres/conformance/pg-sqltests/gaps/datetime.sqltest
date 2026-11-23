@@ -777,14 +777,24 @@ expect {
 @sqlstate 22023
 expect @tursopg error {}
 
+# tursopg stores dates from 0001-01-01 to 9999-12-31 and refuses date
+# arithmetic outside that range; PostgreSQL's date range is wider.
+@compat-gap "type:date"
 test date-minus-days-before-year-one {
     SELECT '0001-01-01'::date - 1;
 }
+expect {
+    0001-12-31 BC
+}
 @sqlstate 22008
-expect error {}
+expect @tursopg error {}
 
+@compat-gap "type:date"
 test date-plus-days-after-year-9999 {
     SELECT '9999-12-31'::date + 1;
 }
+expect {
+    10000-01-01
+}
 @sqlstate 22008
-expect error {}
+expect @tursopg error {}
