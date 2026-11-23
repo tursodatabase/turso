@@ -643,7 +643,7 @@ fn emit_percentile_fraction_check(
     resolver: &Resolver,
     agg: &mut crate::translate::plan::Aggregate,
 ) -> Result<()> {
-    use turso_parser::ast::Expr;
+    use crate::ast::Expr;
     // The fraction must be constant w.r.t. the aggregated rows. Outer
     // (correlated) columns are constant for the inner aggregate and allowed;
     // a subquery may hide an input-column reference, so reject conservatively.

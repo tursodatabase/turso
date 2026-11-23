@@ -46,6 +46,11 @@ fn seeded_encryption_state_machine() {
     campaign(seed, cases);
 }
 
+#[test]
+fn encrypted_reload_with_retained_completions_regression() {
+    campaign(11283090107835449216, 6);
+}
+
 fn campaign(seed: u64, cases: u64) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     for index in 0..cases {
@@ -1542,7 +1547,6 @@ fn reload_wal_after_restore(world: &World, actor: usize) -> String {
 
     match connection.reload_wal_after_external_restore() {
         Ok(()) => {
-            assert!(world.spec.plaintext, "encrypted WAL reload succeeded");
             for peer in world
                 .actors
                 .iter()
@@ -1555,14 +1559,10 @@ fn reload_wal_after_restore(world: &World, actor: usize) -> String {
         }
         Err(error) => {
             assert!(
-                if world.spec.plaintext {
-                    matches!(
-                        classify(&error),
-                        Category::Contention | Category::InjectedIo
-                    )
-                } else {
-                    classify(&error) == Category::SettingsRejected
-                },
+                matches!(
+                    classify(&error),
+                    Category::Contention | Category::InjectedIo
+                ),
                 "unexpected reload failure: {error}"
             );
             check_owner_after_restore(world, "reload_wal_after_external_restore");

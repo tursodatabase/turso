@@ -1,12 +1,12 @@
 use super::stream::{open_ephemeral_delta, EphemeralDelta};
 use crate::alloc::TursoIteratorExt;
+use crate::ast::SortOrder;
 use crate::schema::PseudoCursorType;
 use crate::translate::collate::CollationSeq;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, SorterOpenData};
 use crate::Result;
-use turso_parser::ast::SortOrder;
 
 /// A delta in which every distinct row appears once, with the sum of its
 /// weights, and no row has weight zero.

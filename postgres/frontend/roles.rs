@@ -21,6 +21,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use turso_core::ast::{self, RoleOptions};
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::{RelationKind, Schema};
 use turso_core::security::roles::RoleId;
@@ -28,7 +29,6 @@ use turso_core::{
     to_u32, CatalogApply, Connection, CursorType, InsertFlags, Insn, LimboError, Numeric,
     ProgramBuilder, RegisterOrLiteral, Value, MAIN_DB_ID, SQLITE_ERROR,
 };
-use turso_parser::ast::{self, RoleOptions};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST, SQLSTATE_DUPLICATE_OBJECT,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_OBJECT_IN_USE, SQLSTATE_UNDEFINED_OBJECT,

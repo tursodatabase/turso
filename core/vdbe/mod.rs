@@ -65,6 +65,7 @@ use crate::{
 };
 use smallvec::SmallVec;
 
+use crate::ast::{EqpFormat, ResolveType};
 #[cfg(feature = "json")]
 use crate::json::JsonCacheCell;
 use crate::sync::RwLock;
@@ -83,7 +84,6 @@ use execute::{
     InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState,
     OpOpenEphemeralState,
 };
-use turso_parser::ast::{EqpFormat, ResolveType};
 
 use crate::io::TempFile;
 use crate::storage::sqlite3_ondisk::split_varint;

@@ -1,11 +1,11 @@
 use std::sync::{Arc, Weak};
 
+use crate::ast;
 use crate::namespace::NamespaceId;
 use crate::types::IOResultOr;
 use rustc_hash::FxHashMap as HashMap;
 #[cfg(any(test, injected_yields))]
 use strum::EnumCount;
-use turso_parser::ast;
 
 use crate::{
     mvcc::cursor::MvccCursorType,

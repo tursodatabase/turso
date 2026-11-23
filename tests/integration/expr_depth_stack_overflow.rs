@@ -1,10 +1,9 @@
 use std::sync::Arc;
 use turso_sqlite::SqliteDialect;
 
+use turso_core::ast::MAX_QUERY_DEPTH;
 use turso_core::{ConnectOpts, Database, MemoryIO, SessionRole, IO};
-use turso_parser::{
-    MAX_COMPOUND_SELECT, MAX_EXPR_DEPTH, MAX_QUERY_DEPTH, TOO_MANY_COMPOUND_TERMS_MESSAGE,
-};
+use turso_parser::{MAX_COMPOUND_SELECT, MAX_EXPR_DEPTH, TOO_MANY_COMPOUND_TERMS_MESSAGE};
 
 struct GenExpr {
     name: &'static str,

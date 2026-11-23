@@ -25,7 +25,7 @@ fn builtin_types(
     dialect: &(impl crate::dialect::Dialect + ?Sized),
     mut builder: SchemaBuilder,
 ) -> crate::Result<SchemaBuilder> {
-    use turso_parser::ast::{Cmd, Stmt};
+    use crate::ast::{Cmd, Stmt};
 
     // Whether values of the type take a COLLATE. In PostgreSQL only text
     // types do, so of the types below only varchar does.

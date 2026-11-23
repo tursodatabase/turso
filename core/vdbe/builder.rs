@@ -1,9 +1,9 @@
 use crate::{alloc, turso_assert, turso_assert_eq, types::AsValueRef, Result, Value, ValueRef};
 
+use crate::ast::{self, ResolveType, SortOrder, TableInternalId};
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Range;
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
 use crate::{
     index_method::IndexMethodAttachment,
@@ -294,7 +294,15 @@ pub struct ProgramBuilder {
     /// before* the label's logical "next-insn" anchor. The label resolves to
     /// `anchor_offset + 1` so it tracks whichever instruction ends up at that
     /// position, even after `emit_constant_insns` reorders the program.
+    /// Only `set_label_anchor` writes an anchor, so that `max_label_anchor`
+    /// stays correct.
     label_to_resolved_offset: Vec<Option<InsnReference>>,
+    /// The largest anchor in `label_to_resolved_offset`. While instructions
+    /// are emitted, a label is only anchored to the last instruction or to the
+    /// anchor of another label, so no anchor is past the last instruction, and
+    /// a label targets the next instruction exactly when this anchor is the
+    /// last instruction.
+    max_label_anchor: Option<InsnReference>,
     explain: ExplainInfo,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
@@ -762,6 +770,9 @@ macro_rules! emit_explain {
 impl ProgramBuilder {
     /// Register an `ast::Variable` in the parameter list. Returns the
     /// `NonZeroUsize` index for use in `Insn::Variable`.
+    // Translation registers each variable of a statement two times, and a
+    // multirow INSERT can have thousands of variables.
+    #[inline]
     pub fn register_variable(&mut self, variable: &ast::Variable) -> NonZeroUsize {
         let index = usize::try_from(variable.index.get())
             .expect("u32 variable index must fit into usize")
@@ -880,6 +891,7 @@ impl ProgramBuilder {
             cursor_ref: Vec::with_capacity(opts.num_cursors),
             constant_spans: Vec::new(),
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
+            max_label_anchor: None,
             explain: ExplainInfo::default(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
@@ -1166,7 +1178,11 @@ impl ProgramBuilder {
     }
 
     pub fn extend(&mut self, opts: &ProgramBuilderOpts) {
-        self.insns.reserve(opts.approx_num_insns);
+        let needed = self.insns.len() + opts.approx_num_insns;
+        if needed > self.insns.capacity() {
+            // At least double the capacity, as `Vec::reserve` does.
+            self.move_insns_to_capacity(needed.max(2 * self.insns.capacity()));
+        }
         self.cursor_ref.reserve(opts.num_cursors);
         self.label_to_resolved_offset
             .reserve(opts.approx_num_labels);
@@ -1178,9 +1194,19 @@ impl ProgramBuilder {
     pub fn reserve_insns(&mut self, additional: usize) {
         let needed = self.insns.len() + additional;
         if needed > self.insns.capacity() {
-            self.insns
-                .reserve_exact(needed.next_power_of_two() - self.insns.len());
+            self.move_insns_to_capacity(needed.next_power_of_two());
         }
+    }
+
+    /// Move the instructions to a new allocation for `capacity` instructions.
+    /// `Vec::reserve` calls `realloc`, which copies all of the old allocation,
+    /// because it does not know which part of it holds instructions. When a
+    /// statement reserves its estimate, only a few of the 32 instructions that
+    /// the builder starts with are in use.
+    fn move_insns_to_capacity(&mut self, capacity: usize) {
+        let mut insns = Vec::with_capacity(capacity);
+        insns.append(&mut self.insns);
+        self.insns = insns;
     }
 
     /// Start a new constant span. The next instruction to be emitted will be the first
@@ -1557,7 +1583,12 @@ impl ProgramBuilder {
             return false;
         };
         let last = last as u32;
-        self.label_to_resolved_offset.contains(&Some(last))
+        let targets = self.max_label_anchor == Some(last);
+        crate::turso_debug_assert!(
+            targets == self.label_to_resolved_offset.contains(&Some(last)),
+            "the largest label anchor gives another answer than the labels"
+        );
+        targets
     }
 
     /// Emit an instruction that should not start or extend a constant span on its own.
@@ -1728,36 +1759,39 @@ impl ProgramBuilder {
         // where they are executed once after Init jumps to it.
 
         // Stable partition: non-constant instructions first, then constant.
+        // `extract_if` takes the constant instructions out and moves the other
+        // instructions back in the same buffer, so the instructions before the
+        // first constant one stay where they are, and no second buffer for
+        // the whole program is necessary.
         // Since spans are sorted and non-overlapping, we track our position
         // in the span list and never look back - O(n + m) total, where
         // n = number of instructions, m = number of constant spans.
-        // One more slot for the `Goto` that `epilogue` emits after the constant
-        // instructions. Without it, that push copies the whole program to a
-        // larger buffer.
-        let mut non_constant = Vec::with_capacity(self.insns.len() + 1);
-        let mut constant = Vec::new();
+        let len = self.insns.len();
+        // The spans are inclusive, so their lengths add up to the number of
+        // constant instructions. A `Vec` that starts empty copies all of its
+        // instructions each time it doubles.
+        let num_constant = self
+            .constant_spans
+            .iter()
+            .map(|&(start, end)| end.saturating_add(1).min(len).saturating_sub(start))
+            .sum::<usize>()
+            .min(len);
+        let mut constant = Vec::with_capacity(num_constant);
+        let spans = &self.constant_spans;
         let mut span_idx = 0;
-
-        for item in self.insns.drain(..) {
-            let idx = item.1;
-
+        constant.extend(self.insns.extract_if(.., |&mut (_, idx)| {
             // Advance past spans we've completely passed
-            while span_idx < self.constant_spans.len() && self.constant_spans[span_idx].1 < idx {
+            while span_idx < spans.len() && spans[span_idx].1 < idx {
                 span_idx += 1;
             }
 
             // Check if current span contains this index
-            let is_constant =
-                span_idx < self.constant_spans.len() && self.constant_spans[span_idx].0 <= idx;
+            span_idx < spans.len() && spans[span_idx].0 <= idx
+        }));
 
-            if is_constant {
-                constant.push(item);
-            } else {
-                non_constant.push(item);
-            }
-        }
-
-        self.insns = non_constant;
+        // One more slot for the `Goto` that `epilogue` emits after the constant
+        // instructions. Without it, a full buffer doubles for that push.
+        self.insns.reserve_exact(constant.len() + 1);
         self.insns.extend(constant);
 
         // Build old index -> new position mapping
@@ -1766,9 +1800,13 @@ impl ProgramBuilder {
             old_to_new[*old_idx] = new_pos;
         }
 
-        for resolved_offset in self.label_to_resolved_offset.iter_mut() {
-            if let Some(old_offset) = resolved_offset {
-                *resolved_offset = Some(old_to_new[*old_offset as usize] as u32);
+        // A remapped anchor can be smaller than before, so the largest anchor
+        // is found again.
+        self.max_label_anchor = None;
+        for label_index in 0..self.label_to_resolved_offset.len() {
+            if let Some(old_offset) = self.label_to_resolved_offset[label_index] {
+                let new_offset = old_to_new[old_offset as usize] as InsnReference;
+                self.set_label_anchor(label_index, new_offset);
             }
         }
 
@@ -1822,7 +1860,7 @@ impl ProgramBuilder {
             unreachable!("preassign_label_to_next_insn requires a Label, got {label:?}");
         };
         let anchor = self.offset().as_offset_int().saturating_sub(1);
-        self.label_to_resolved_offset[label_number as usize] = Some(anchor);
+        self.set_label_anchor(label_number as usize, anchor);
     }
 
     /// Resolve `dest` so that it ends up pointing at the same final offset as
@@ -1846,7 +1884,15 @@ impl ProgramBuilder {
         };
         let resolution = self.label_to_resolved_offset[anchor_n as usize]
             .expect("anchor label must already be preassigned/resolved");
-        self.label_to_resolved_offset[dest_n as usize] = Some(resolution);
+        self.set_label_anchor(dest_n as usize, resolution);
+    }
+
+    /// Anchor the label with index `label_index` at the instruction offset
+    /// `anchor`, and keep `max_label_anchor` the largest anchor.
+    #[inline]
+    fn set_label_anchor(&mut self, label_index: usize, anchor: InsnReference) {
+        self.label_to_resolved_offset[label_index] = Some(anchor);
+        self.max_label_anchor = self.max_label_anchor.max(Some(anchor));
     }
 
     /// Resolve unresolved labels to a specific offset in the instruction list.
@@ -2094,6 +2140,7 @@ impl ProgramBuilder {
             }
         }
         self.label_to_resolved_offset.clear();
+        self.max_label_anchor = None;
         Ok(())
     }
 

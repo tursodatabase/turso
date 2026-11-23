@@ -32,6 +32,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         "Partial Sync Prefetch",
         "Remote Encryption Cipher",
         "Remote Encryption Key",
+        "Local Encryption Key",
         "Push Operations Threshold",
         "Pull Bytes Threshold",
         "Force Logical MVCC Pull",
@@ -89,6 +90,8 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         ["RemoteEncryptionCipher"] = "Remote Encryption Cipher",
         ["Remote Encryption Key"] = "Remote Encryption Key",
         ["RemoteEncryptionKey"] = "Remote Encryption Key",
+        ["Local Encryption Key"] = "Local Encryption Key",
+        ["LocalEncryptionKey"] = "Local Encryption Key",
         ["Push Operations Threshold"] = "Push Operations Threshold",
         ["PushOperationsThreshold"] = "Push Operations Threshold",
         ["Pull Bytes Threshold"] = "Pull Bytes Threshold",
@@ -205,6 +208,12 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
     {
         get => GetString("Remote Encryption Key");
         set => SetString("Remote Encryption Key", value);
+    }
+
+    public string LocalEncryptionKey
+    {
+        get => GetString("Local Encryption Key");
+        set => SetString("Local Encryption Key", value);
     }
 
     public long PushOperationsThreshold
@@ -380,9 +389,10 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         set
         {
             var normalizedKeyword = NormalizeKeyword(keyword);
+            TursoSyncDatabaseOptions.ValidateConnectionStringKey(normalizedKeyword, value);
             if (value is null)
             {
-                Remove(normalizedKeyword);
+                base.Remove(normalizedKeyword);
                 return;
             }
 
@@ -449,6 +459,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         "Partial Sync Prefetch",
         "Remote Encryption Cipher",
         "Remote Encryption Key",
+        "Local Encryption Key",
         "Push Operations Threshold",
         "Pull Bytes Threshold",
         "Force Logical MVCC Pull",
@@ -588,6 +599,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Partial Sync Prefetch" => false,
             "Remote Encryption Cipher" => string.Empty,
             "Remote Encryption Key" => string.Empty,
+            "Local Encryption Key" => string.Empty,
             "Push Operations Threshold" => 0L,
             "Pull Bytes Threshold" => 0L,
             "Force Logical MVCC Pull" => false,

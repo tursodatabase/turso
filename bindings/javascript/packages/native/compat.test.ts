@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { unlinkSync, writeFileSync } from "node:fs";
 import { expect, test } from 'vitest'
 import { Database, SqliteError } from './compat.js'
@@ -35,7 +36,7 @@ test('errors carry the SQLite message and result code name', () => {
     db.exec('CREATE TABLE s(a INTEGER) STRICT');
     db.exec('CREATE TABLE tr(a)');
     db.exec("CREATE TRIGGER trg BEFORE INSERT ON tr BEGIN SELECT RAISE(ABORT, 'nope'); END");
-    const notADatabase = `test-${(Math.random() * 10000) | 0}.db`;
+    const notADatabase = `test-${randomUUID()}.db`;
     writeFileSync(notADatabase, Buffer.alloc(8192, 7));
     const cases: [() => unknown, string, string][] = [
         [() => db.prepare('INSERT INTO t(a) VALUES (1)').run(), 'SQLITE_CONSTRAINT_UNIQUE', 'UNIQUE constraint failed: t.a'],
@@ -109,7 +110,7 @@ test('expanded rows collapse duplicate column names like better-sqlite3', () => 
 })
 
 test('readonly-db', () => {
-    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    const path = `test-${randomUUID()}.db`;
     try {
         {
             const rw = new Database(path);
@@ -130,7 +131,7 @@ test('readonly-db', () => {
 })
 
 test('file-must-exist', () => {
-    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    const path = `test-${randomUUID()}.db`;
     let error: any;
     try { new Database(path, { fileMustExist: true }); } catch (e) { error = e; }
     expect(error).toBeInstanceOf(SqliteError);
@@ -139,7 +140,7 @@ test('file-must-exist', () => {
 })
 
 test('on-disk db', () => {
-    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    const path = `test-${randomUUID()}.db`;
     try {
         const db1 = new Database(path);
         db1.exec("CREATE TABLE t(x)");
@@ -163,8 +164,8 @@ test('on-disk db', () => {
 })
 
 test('attach', () => {
-    const path1 = `test-${(Math.random() * 10000) | 0}.db`;
-    const path2 = `test-${(Math.random() * 10000) | 0}.db`;
+    const path1 = `test-${randomUUID()}.db`;
+    const path2 = `test-${randomUUID()}.db`;
     try {
         const db1 = new Database(path1, { experimental: ["attach"] });
         db1.exec("CREATE TABLE t(x)");
@@ -194,7 +195,7 @@ test('blobs', () => {
 })
 
 test('encryption', () => {
-    const path = `test-encryption-${(Math.random() * 10000) | 0}.db`;
+    const path = `test-encryption-${randomUUID()}.db`;
     const hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';
     const wrongKey = 'aaaaaaa4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';
     try {

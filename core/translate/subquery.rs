@@ -3,14 +3,15 @@ use std::sync::Arc;
 use crate::alloc::TursoSliceExt;
 use crate::translate::expr_context::ExprContext;
 
+use crate::ast::{self, SortOrder, SubqueryType, TableInternalId};
 use rustc_hash::FxHashMap as HashMap;
-use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
 
 use super::{
     emitter::{OperationMode, Resolver, RowValueSubquery, RowValueSubqueryColumn, TranslateCtx},
     main_loop::LoopLabels,
     plan::{Aggregate, Operation, QueryDestination, Search, SelectPlan},
     planner::{resolve_window_and_aggregate_functions, TableMask},
+    select::first_aggregate_without_over_clause,
 };
 use crate::translate::expr::comparison_affinity;
 use crate::translate::expr::expr_type::{type_of, TypeEnv};
@@ -331,7 +332,7 @@ pub fn plan_subqueries_from_select_plan(
                 connection,
                 SubqueryPosition::Having,
                 SubqueryOrigin::SelectHaving,
-                !group_by.exprs.is_empty(),
+                SubqueryPosition::Having.allow_correlated(),
                 &mut cse_map,
                 &mut same_query_map,
                 &[],
@@ -582,6 +583,42 @@ pub fn plan_subqueries_from_returning(
         SubqueryPosition::ResultColumn,
         SubqueryOrigin::DmlReturning,
         SubqueryPosition::ResultColumn.allow_correlated(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &[],
+    )?;
+
+    update_column_used_masks(table_references, non_from_clause_subqueries)?;
+    Ok(())
+}
+
+/// Compute query plans for subqueries in an UPSERT's DO UPDATE SET values or
+/// WHERE clause, which can reference the row of the target table that
+/// conflicted and the row that failed to insert.
+pub fn plan_subqueries_from_upsert_do_update<'a>(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    exprs: impl Iterator<Item = &'a mut ast::Expr>,
+    origin: SubqueryOrigin,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let position = match origin {
+        SubqueryOrigin::DmlSet => SubqueryPosition::ResultColumn,
+        SubqueryOrigin::DmlWhere => SubqueryPosition::Where,
+        _ => unreachable!("DO UPDATE has only SET values and a WHERE clause"),
+    };
+    plan_subqueries_with_outer_query_access(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        resolver,
+        exprs,
+        connection,
+        position,
+        origin,
+        position.allow_correlated(),
         &mut Vec::new(),
         &mut Vec::new(),
         &[],
@@ -1564,6 +1601,7 @@ fn choose_from_clause_subquery_execution_mode(
     operation: &Operation,
     from_clause_subquery: &crate::schema::FromClauseSubquery,
     from_clause_has_right_or_full_join: bool,
+    coroutine_would_rerun: bool,
 ) -> FromClauseSubqueryExecutionMode {
     if from_clause_has_right_or_full_join {
         // SQLite does not use a coroutine in a FROM list with RIGHT or FULL JOIN.
@@ -1596,7 +1634,7 @@ fn choose_from_clause_subquery_execution_mode(
             })
         }
         _ if needs_materialized_seek => FromClauseSubqueryExecutionMode::MaterializedTable,
-        _ if from_clause_subquery.requires_table_materialization() => {
+        _ if from_clause_subquery.requires_table_materialization() || coroutine_would_rerun => {
             FromClauseSubqueryExecutionMode::MaterializedTable
         }
         _ => FromClauseSubqueryExecutionMode::Coroutine,
@@ -1651,6 +1689,8 @@ pub fn emit_from_clause_subqueries(
 
     for table_index in visit_order {
         allocate_cursors_read_by_lateral_subquery(program, t_ctx, tables, join_order, table_index)?;
+        let coroutine_would_rerun =
+            coroutine_would_rerun_for_outer_rows(tables, join_order, table_index);
         let table_reference = &mut tables.joined_tables_mut()[table_index];
         let execution_mode = match &table_reference.table {
             Table::FromClauseSubquery(from_clause_subquery) => {
@@ -1658,6 +1698,7 @@ pub fn emit_from_clause_subqueries(
                     &table_reference.op,
                     from_clause_subquery.as_ref(),
                     from_clause_has_right_or_full_join,
+                    coroutine_would_rerun,
                 ))
             }
             _ => None,
@@ -1836,6 +1877,106 @@ pub fn emit_from_clause_subqueries(
     Ok(())
 }
 
+/// Whether a coroutine for the FROM-clause subquery at `table_index` may sit
+/// in an inner loop of the join and so run the whole subquery again for each
+/// row of the outer loops. SQLite stores the subquery in a table instead when
+/// an earlier FROM term is a subquery, or when this term or an earlier one is
+/// joined by an outer join or CROSS JOIN, which keeps it after the earlier
+/// terms (rules 1c-i and 1c-ii of `fromClauseTermCanBeCoroutine` in select.c).
+/// A semi join or anti join that Turso makes from EXISTS or NOT EXISTS also
+/// keeps its table after the earlier terms, so it is treated the same way.
+/// SQLite applies these rules only to subqueries that it does not flatten into
+/// the outer query, so a subquery that SQLite may flatten keeps its coroutine.
+fn coroutine_would_rerun_for_outer_rows(
+    tables: &TableReferences,
+    join_order: &[JoinOrderMember],
+    table_index: usize,
+) -> bool {
+    let joined_tables = tables.joined_tables();
+    let Table::FromClauseSubquery(from_clause_subquery) = &joined_tables[table_index].table else {
+        return false;
+    };
+    // SQLite may merge any other subquery into the outer query, which
+    // evaluates its expressions, for example random() or a read of a table
+    // that an UPDATE changes, again for each outer row. A table filled once
+    // would not.
+    if !sqlite_never_flattens_from_clause_subquery(&joined_tables[table_index]) {
+        return false;
+    }
+    // A subquery that reads a row of an outer query has to run again for
+    // each such row, so a table filled once cannot replace it.
+    if plan_has_outer_scope_dependency(&from_clause_subquery.plan) {
+        return false;
+    }
+    // The first table of the join order is read once.
+    if join_order
+        .first()
+        .is_some_and(|member| member.original_idx == table_index)
+    {
+        return false;
+    }
+    joined_tables[..table_index].iter().any(|table| {
+        matches!(table.table, Table::FromClauseSubquery(_))
+            && sqlite_never_flattens_from_clause_subquery(table)
+    }) || joined_tables[..=table_index].iter().any(|table| {
+        table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::is_ordering_constrained)
+    })
+}
+
+/// Whether SQLite's `flattenSubquery` (select.c) refuses to merge the
+/// FROM-clause subquery of `table` into an outer query that has more than one
+/// FROM term, whatever that outer query is. Only restrictions that depend on
+/// the subquery alone are checked, because SQLite may turn an outer join into
+/// an inner join before it flattens, which changes the restrictions that
+/// depend on the outer query.
+fn sqlite_never_flattens_from_clause_subquery(table: &JoinedTable) -> bool {
+    let Table::FromClauseSubquery(from_clause_subquery) = &table.table else {
+        return false;
+    };
+    if from_clause_subquery.materialize_hint() {
+        return true;
+    }
+    match from_clause_subquery.plan.as_ref() {
+        Plan::Select(plan) => !select_core_can_be_flattened(plan),
+        Plan::CompoundSelect {
+            left,
+            right_most,
+            limit,
+            order_by,
+            ..
+        } => {
+            // Restrictions (8), (17a), (17b), (17c), (17e) and (20).
+            limit.is_some()
+                || order_by.is_some()
+                || left.iter().any(|(plan, operator)| {
+                    !matches!(operator, ast::CompoundOperator::UnionAll)
+                        || !select_core_can_be_flattened(plan)
+                })
+                || !select_core_can_be_flattened(right_most)
+        }
+        // Restriction (22): a recursive CTE is not flattened.
+        _ => true,
+    }
+}
+
+/// Whether one SELECT of a FROM-clause subquery passes the restrictions of
+/// SQLite's `flattenSubquery` that depend only on that SELECT: it has no
+/// aggregate (checked by its caller in select.c), DISTINCT (4), window
+/// function (25), LIMIT (8, as the outer query has more than one FROM term),
+/// and it has a FROM clause (7).
+fn select_core_can_be_flattened(plan: &SelectPlan) -> bool {
+    plan.aggregates.is_empty()
+        && plan.group_by.is_none()
+        && !plan.distinctness.is_distinct()
+        && plan.window.is_none()
+        && plan.limit.is_none()
+        && plan.offset.is_none()
+        && !plan.joined_tables().is_empty()
+}
+
 fn allocate_cursors_read_by_lateral_subquery(
     program: &mut ProgramBuilder,
     t_ctx: &TranslateCtx,
@@ -1947,6 +2088,7 @@ pub fn emit_from_clause_subquery(
                     meta_sort: None,
                     reg_agg_start: None,
                     reg_nonagg_emit_once_flag: None,
+                    ungrouped_agg_bare_columns: Vec::new(),
                     reg_result_cols_start: None,
                     limit_ctx: None,
                     reg_offset: None,
@@ -2047,6 +2189,7 @@ fn emit_indexed_materialized_subquery(
                 meta_sort: None,
                 reg_agg_start: None,
                 reg_nonagg_emit_once_flag: None,
+                ungrouped_agg_bare_columns: Vec::new(),
                 reg_result_cols_start: None,
                 limit_ctx: None,
                 reg_offset: None,
@@ -2177,6 +2320,7 @@ fn emit_materialized_subquery_table(
                 meta_sort: None,
                 reg_agg_start: None,
                 reg_nonagg_emit_once_flag: None,
+                ungrouped_agg_bare_columns: Vec::new(),
                 reg_result_cols_start: None,
                 limit_ctx: None,
                 reg_offset: None,
@@ -2453,6 +2597,8 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver
         .is_some_and(|group_by| !group_by.exprs.is_empty());
     let has_direct_row_output =
         !has_grouped_output && plan.aggregates.is_empty() && plan.window.is_none();
+    let has_ungrouped_aggregate_output =
+        !has_grouped_output && !plan.aggregates.is_empty() && plan.window.is_none();
     let has_unmatched_right_rows = plan.table_references.has_right_or_full_join();
 
     // Subqueries inside an aggregate's arguments or FILTER clause are evaluated
@@ -2473,8 +2619,15 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver
         }
     }
 
-    let mut outer_aggregate_subquery_ids: Vec<ast::TableInternalId> = Vec::new();
+    let mut output_phase_subquery_ids: Vec<ast::TableInternalId> = Vec::new();
     for subquery in plan.non_from_clause_subqueries.iter_mut() {
+        // Code generation finds an aggregate by its register, and a subquery
+        // that runs after this query's aggregation loop would find this
+        // query's register for an aggregate in its WHERE clause. SQLite never
+        // allows an aggregate in a WHERE clause, so reject it here.
+        if let Some(func) = aggregate_in_subquery_where(subquery, resolver) {
+            crate::bail_parse_error!("misuse of aggregate function {}()", func);
+        }
         // A subquery that reads an aggregate the outer query computes must run
         // in the outer query's aggregate-output phase, after that aggregate has
         // been finalized into a register; run earlier, the aggregate expression
@@ -2490,7 +2643,7 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver
             } else {
                 SubqueryEvalPhase::UngroupedAggregateOutput
             };
-            outer_aggregate_subquery_ids.push(subquery.internal_id);
+            output_phase_subquery_ids.push(subquery.internal_id);
             continue;
         }
         // These subqueries run once per input row: in output columns and
@@ -2516,24 +2669,45 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver
             {
                 SubqueryEvalPhase::GroupedOutput
             }
+            // HAVING without GROUP BY filters the one aggregate row, so a
+            // correlated subquery in it reads the row values saved for it.
+            SubqueryOrigin::SelectHaving
+                if subquery.correlated
+                    && !aggregate_subquery_ids.contains(&subquery.internal_id) =>
+            {
+                SubqueryEvalPhase::UngroupedAggregateOutput
+            }
+            // A correlated subquery in the result columns of an aggregate query
+            // without GROUP BY reads the same saved row as the bare columns.
+            // Run in the loop, it would read the last row when its result
+            // column is computed after the loop.
+            SubqueryOrigin::SelectList
+                if subquery.correlated
+                    && has_ungrouped_aggregate_output
+                    && !aggregate_subquery_ids.contains(&subquery.internal_id) =>
+            {
+                output_phase_subquery_ids.push(subquery.internal_id);
+                SubqueryEvalPhase::UngroupedAggregateOutput
+            }
             _ => subquery.origin.phase_floor(),
         };
     }
 
-    // A result column that reads one of these subqueries depends on an
-    // aggregate computed in the output phase, so it must be evaluated there
+    // A result column that reads one of these subqueries depends on a value
+    // computed in the output phase, so it must be evaluated there
     // rather than once per input row — the same treatment SQLite gives any
     // result-column expression that references an aggregate result (select.c
     // evaluates those after the aggregation loop, in the output step). Mark it
     // so the emitter defers it, instead of taking an arbitrary row's NULL
     // during the scan.
     for rc in plan.result_columns.iter_mut() {
-        if !rc.contains_aggregates && expr_reads_subquery(&rc.expr, &outer_aggregate_subquery_ids) {
+        if !rc.contains_aggregates && expr_reads_subquery(&rc.expr, &output_phase_subquery_ids) {
             rc.contains_aggregates = true;
         }
     }
 
-    let columns_read_by_group_subqueries = columns_read_by_group_subqueries(plan);
+    let columns_read_by_group_subqueries =
+        columns_read_by_subqueries(plan, SubqueryEvalPhase::GroupedOutput);
     if let Some(group_by) = plan.group_by.as_mut() {
         group_by.columns_read_by_group_subqueries = columns_read_by_group_subqueries;
     }
@@ -2541,8 +2715,11 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver
 }
 
 /// The columns of `plan`'s own tables that are read by its subqueries that run
-/// once per group.
-fn columns_read_by_group_subqueries(plan: &SelectPlan) -> Vec<ast::Expr> {
+/// in `phase`.
+pub(crate) fn columns_read_by_subqueries(
+    plan: &SelectPlan,
+    phase: SubqueryEvalPhase,
+) -> Vec<ast::Expr> {
     let mut columns = Vec::new();
     for subquery in &plan.non_from_clause_subqueries {
         let SubqueryState::Unevaluated {
@@ -2551,7 +2728,7 @@ fn columns_read_by_group_subqueries(plan: &SelectPlan) -> Vec<ast::Expr> {
         else {
             continue;
         };
-        if subquery.eval_phase != SubqueryEvalPhase::GroupedOutput {
+        if subquery.eval_phase != phase {
             continue;
         }
         for outer_ref in subquery_plan.used_outer_query_refs() {
@@ -2595,6 +2772,26 @@ fn expr_reads_subquery(expr: &ast::Expr, subquery_ids: &[ast::TableInternalId]) 
         Ok(WalkControl::Continue)
     });
     found
+}
+
+/// The name of an aggregate function, called without an `OVER` clause, in the
+/// WHERE clause of `subquery`. Subqueries nested in that WHERE clause are not
+/// searched: they own their aggregates.
+fn aggregate_in_subquery_where(
+    subquery: &NonFromClauseSubquery,
+    resolver: &Resolver,
+) -> Option<String> {
+    let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
+        return None;
+    };
+    let Plan::Select(select) = plan.as_ref() else {
+        return None;
+    };
+    select.where_clause.iter().find_map(|term| {
+        first_aggregate_without_over_clause(&term.expr, resolver)
+            .expect("walking an expression with an infallible visitor cannot fail")
+            .map(str::to_string)
+    })
 }
 
 /// The name of an aggregate in a result column of the subquery whose value the

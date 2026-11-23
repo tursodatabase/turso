@@ -23,6 +23,7 @@
   ],
   "exclude": [
     "*.test.ts",
-    "turso-server.ts"
+    "turso-server.ts",
+    "encrypted-server.ts"
   ]
 }

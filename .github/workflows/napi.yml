@@ -123,7 +123,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Setup node
         uses: actions/setup-node@v5
-        if: ${{ !matrix.settings.docker }}
         with:
           node-version: 24
       - name: Install
@@ -490,6 +489,10 @@ jobs:
         env:
           LOCAL_SYNC_SERVER: ${{ github.workspace }}/target/debug/tursodb
         run: yarn workspace @tursodatabase/sync-wasm test
+
+      - name: Test binary browser metadata and encrypted OPFS reopen
+        working-directory: bindings/javascript
+        run: yarn workspace @tursodatabase/sync-wasm test:encryption
   publish:
     name: Publish
     runs-on: ubuntu-latest

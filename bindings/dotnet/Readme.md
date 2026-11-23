@@ -122,7 +122,11 @@ await replica.SyncAsync();
 
 `Sync Interval` is the automatic pull period in seconds. `AutomaticSyncStatus` and `AutomaticSyncStatusChanged` expose waiting, running, retrying, faulted, and stopped states along with attempt times, the last pull result, the next attempt, and terminal failures. Automatic sync retries transient transport, I/O, and timeout failures twice; other failures are terminal and are also surfaced by `Close`.
 
-Connection-string replicas also map `Sync Client Name`, `Sync Long Poll Timeout`, `Bootstrap If Empty`, `Partial Bootstrap Prefix`/`Query`, `Partial Sync Segment Size`/`Prefetch`, `Remote Encryption Cipher`/`Key`, `Push Operations Threshold`, `Pull Bytes Threshold`, `Force Logical MVCC Pull`, and `Sync Experimental Features` to `TursoSyncDatabaseOptions`. Local `Encryption Cipher` and `Encryption Key` do not configure remote replica encryption.
+Connection-string replicas also map `Sync Client Name`, `Sync Long Poll Timeout`, `Bootstrap If Empty`, `Partial Bootstrap Prefix`/`Query`, `Partial Sync Segment Size`/`Prefetch`, `Remote Encryption Cipher`/`Key`, `Local Encryption Key`, `Push Operations Threshold`, `Pull Bytes Threshold`, `Force Logical MVCC Pull`, and `Sync Experimental Features` to `TursoSyncDatabaseOptions`.
+
+Local replica encryption requires `Sync Experimental Features=sync_encryption`. For encrypted replicas, use `Remote Encryption Cipher` as the shared cipher, `Local Encryption Key` for the hex local key, and `Remote Encryption Key` for the base64 cloud key. The SQLite-compatible provider accepts the same options. A pooled replica requires matching local and cloud credentials. An omitted local key selects plaintext storage; a quoted empty or whitespace-only key value is rejected. The cloud key may be omitted when reopening an initialized encrypted replica offline. Standalone `Encryption Cipher` and `Encryption Key` options do not configure synced replicas.
+
+Connection-string builders follow ADO.NET removal semantics: `Local Encryption Key=` omits the option, and `Remove("LocalEncryptionKey")` or assigning `null` clears it. Explicit empty or whitespace-only local and remote key values, including `Remote Encryption Key=""`, are rejected when a connection string is parsed or a builder property is assigned, for all connection types.
 
 Direct remote and opened embedded replica connections support ADO.NET `DbBatch`:
 

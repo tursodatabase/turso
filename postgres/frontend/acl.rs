@@ -6,9 +6,9 @@
 
 use std::fmt;
 
+use turso_core::ast;
 use turso_core::schema::RelationKind;
 use turso_core::{parse_text_array_of_texts, text_array_literal, Value};
-use turso_parser::ast;
 
 /// The oid that stands for `PUBLIC`, every role, which the text form writes
 /// as an empty name. PostgreSQL's `ACL_ID_PUBLIC`.

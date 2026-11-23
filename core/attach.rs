@@ -1,6 +1,7 @@
 //! ATTACH and DETACH: open a database on the connection and give it a
 //! namespace, or remove both.
 
+use crate::ast::{Expr, Literal};
 use crate::function::{Func, ScalarFunc};
 #[cfg(feature = "fs")]
 use crate::io::{MemoryIO, IO};
@@ -23,7 +24,6 @@ use crate::{is_memory_like, DatabaseOpts, EncryptionKey, IOResult};
 use crate::{
     turso_assert, Connection, Database, LimboError, Pager, Result, MAIN_DB_ID, TEMP_DB_ID,
 };
-use turso_parser::ast::{Expr, Literal};
 
 /// Translate ATTACH statement
 pub fn translate_attach(

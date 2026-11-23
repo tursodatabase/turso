@@ -158,6 +158,7 @@ pub enum EncryptionCipher {
     Aegis128l,
     Aegis128x2,
     Aegis128x4,
+    Aegis256x4,
 }
 
 impl EncryptionCipher {
@@ -167,6 +168,7 @@ impl EncryptionCipher {
             EncryptionCipher::Aes256Gcm => "aes256gcm",
             EncryptionCipher::Aegis256 => "aegis256",
             EncryptionCipher::Aegis256x2 => "aegis256x2",
+            EncryptionCipher::Aegis256x4 => "aegis256x4",
             EncryptionCipher::Aegis128l => "aegis128l",
             EncryptionCipher::Aegis128x2 => "aegis128x2",
             EncryptionCipher::Aegis128x4 => "aegis128x4",
@@ -355,7 +357,7 @@ pub fn apply_experimental_features(
             // always enabled, kept for backwards compatibility
             "strict" | "generated_columns" => opts,
             "custom_types" => opts.with_custom_types(true),
-            "encryption" => opts.with_encryption(true),
+            "encryption" | "sync_encryption" => opts.with_encryption(true),
             "index_method" => opts.with_index_method(true),
             "autovacuum" => opts.with_autovacuum(true),
             "vacuum" => opts.with_vacuum(true),
@@ -715,7 +717,8 @@ impl Database {
     /// Classify SQL statement. Returns "read", "write", "begin", "commit", or "rollback".
     #[napi(js_name = "classifySql")]
     pub fn classify_sql(&self, sql: String) -> napi::Result<String> {
-        use turso_parser::{ast::Stmt, parser::Parser};
+        use turso_core::ast::Stmt;
+        use turso_parser::parser::Parser;
         let mut parser = Parser::new(sql.as_bytes());
         match parser.next_cmd() {
             Ok(Some(cmd)) => {
@@ -878,7 +881,7 @@ impl Statement {
         })?;
         let value_type = value.get_type()?;
         let turso_value = match value_type {
-            ValueType::Null => turso_core::Value::Null,
+            ValueType::Null | ValueType::Undefined => turso_core::Value::Null,
             ValueType::Number => {
                 let n: f64 = unsafe { value.cast()? };
                 // `i64::MAX as f64` is 2^63, one past the largest i64, so the upper bound is exclusive.
@@ -909,14 +912,10 @@ impl Statement {
                 if obj.is_buffer()? || obj.is_typedarray()? || obj.is_dataview()? {
                     turso_core::Value::Blob(array_buffer_view_bytes(env, value)?)
                 } else {
-                    let s = value.coerce_to_string()?.into_utf8()?;
-                    turso_core::Value::Text(s.as_str()?.to_owned().into())
+                    return throw_unbindable_value(env);
                 }
             }
-            _ => {
-                let s = value.coerce_to_string()?.into_utf8()?;
-                turso_core::Value::Text(s.as_str()?.to_owned().into())
-            }
+            _ => return throw_unbindable_value(env),
         };
 
         self.statement_handle()?
@@ -1050,6 +1049,14 @@ impl Statement {
         *self.stmt.borrow_mut() = None;
         Ok(())
     }
+}
+
+fn throw_unbindable_value(env: &Env) -> Result<()> {
+    env.throw_type_error(
+        "SQLite3 can only bind numbers, strings, bigints, buffers, and null",
+        None,
+    )?;
+    Err(Error::from_status(Status::PendingException))
 }
 
 /// Copies the bytes a typed array, Buffer or DataView covers.

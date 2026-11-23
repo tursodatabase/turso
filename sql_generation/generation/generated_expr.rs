@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use rand::Rng;
-use turso_parser::ast::{self, Expr, Name, Operator, UnaryOperator};
+use turso_core::ast::{self, Expr, Name, Operator, UnaryOperator};
 
 use crate::model::table::{Column, ColumnType};
 

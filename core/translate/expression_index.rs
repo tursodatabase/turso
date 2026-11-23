@@ -1,3 +1,5 @@
+use crate::ast;
+use crate::ast::TableInternalId;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
@@ -5,8 +7,6 @@ use crate::translate::expr::{
 use crate::translate::plan::{ColumnUsedMask, JoinedTable, TableReferences};
 use crate::translate::planner::ROWID_STRS;
 use crate::{schema::Index, sync::Arc, Result};
-use turso_parser::ast;
-use turso_parser::ast::TableInternalId;
 
 /// Find the selected index key that stores this complete expression.
 ///

@@ -16,6 +16,14 @@ const MAX_SCALE_MAGNITUDE: i64 = 1_000_000;
 const MAX_INTEGER_DIGITS: i64 = 131_072;
 pub(crate) const MAX_FRACTION_DIGITS: i64 = 16_383;
 
+/// The text that PostgreSQL's numeric type writes for the number `text`, such
+/// as `0.002` for `2e-3` and `100` for `1e2`. It reads `text` as
+/// [`numeric_from_value`] does, so it fails for text that is not a number and
+/// for a value with more digits than numeric allows.
+pub fn format_numeric_text(text: &str) -> crate::Result<String> {
+    numeric_from_value(&Value::build_text(text.to_string())).map(|value| format_numeric(&value))
+}
+
 /// The numeric value of `val`: an integer, a real, or text such as `1.5` or
 /// `1e5`. Every numeric function reads its arguments with this, so they all
 /// accept the same values within the same limits. A blob is not a number, even

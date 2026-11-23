@@ -28,6 +28,8 @@ RUN pip install --break-system-packages maturin
 ADD https://antithesis.com/assets/instrumentation/libvoidstar.so /opt/antithesis/libvoidstar.so
 
 COPY --from=planner /tmp/recipe.json recipe.json
+# The recipe has .cargo/config.toml, and its linker is this script.
+COPY scripts/link-with-rust-lld.sh scripts/link-with-rust-lld.sh
 RUN cargo chef cook --bin turso_stress --release --recipe-path recipe.json
 COPY . .
 

@@ -2443,7 +2443,9 @@ impl Connection {
 
     #[cfg(feature = "conn_raw_api")]
     pub fn reload_wal_after_external_restore(&self) -> Result<()> {
-        self.db.reload_wal_after_external_restore()
+        let encryption_key = self.encryption_key.clone();
+        self.db
+            .reload_wal_after_external_restore_with_encryption_key(encryption_key)
     }
 
     /// Enable or disable writing portable logical-change metadata into MVCC
@@ -3351,8 +3353,8 @@ impl Connection {
     /// objects of the namespace under its id, so `name` can be anything
     /// that no namespace is called yet.
     pub fn create_namespace(self: &Arc<Self>, name: &str) -> Result<Qualifier> {
-        let statement = turso_parser::ast::Stmt::CreateSchema {
-            name: turso_parser::ast::Name::exact(name.to_string()),
+        let statement = crate::ast::Stmt::CreateSchema {
+            name: crate::ast::Name::exact(name.to_string()),
         };
         self.prepare_ast_stmt(statement)?.run_ignore_rows()?;
         let namespace = self
@@ -3375,8 +3377,8 @@ impl Connection {
                 "no such namespace: {name}"
             )));
         }
-        let statement = turso_parser::ast::Stmt::DropSchema {
-            name: turso_parser::ast::Name::exact(name.to_string()),
+        let statement = crate::ast::Stmt::DropSchema {
+            name: crate::ast::Name::exact(name.to_string()),
         };
         self.prepare_ast_stmt(statement)?.run_ignore_rows()
     }
@@ -3385,12 +3387,9 @@ impl Connection {
     /// SCHEMA, DROP SCHEMA or GRANT. No dialect parses their text, so
     /// preparing the statement again, after another connection changes the
     /// schema, translates the AST itself.
-    pub fn prepare_ast_stmt(
-        self: &Arc<Self>,
-        statement: turso_parser::ast::Stmt,
-    ) -> Result<Statement> {
+    pub fn prepare_ast_stmt(self: &Arc<Self>, statement: crate::ast::Stmt) -> Result<Statement> {
         let sql = statement.to_string();
-        let cmd = turso_parser::ast::Cmd::Stmt(statement);
+        let cmd = crate::ast::Cmd::Stmt(statement);
         let mut stmt = self.prepare_translated_cmd(cmd.clone(), &sql)?;
         stmt.reprepare_from(cmd);
         Ok(stmt)

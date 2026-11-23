@@ -1493,7 +1493,16 @@ pub fn write_varint(buf: &mut [u8], value: u64) -> usize {
     n
 }
 
+/// Appends the varint of `value` to `payload`.
+#[inline(always)]
 pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
+    // The varint of a value of less than 128 is one byte that is the value
+    // itself. A copy of `varint[0..n]` has a length that is not known at
+    // compile time, and costs a call of memcpy.
+    if value < 0x80 {
+        payload.push(value as u8);
+        return;
+    }
     let mut varint = [0u8; 9];
     let n = write_varint(&mut varint, value);
     payload.extend_from_slice(&varint[0..n]);
@@ -2732,5 +2741,20 @@ mod tests {
             seen_lengths,
             (1..=9).collect::<std::collections::HashSet<_>>()
         );
+    }
+
+    #[test]
+    fn write_varint_to_vec_appends_the_bytes_of_write_varint() {
+        let values = (0..64)
+            .flat_map(|bits| [(1u64 << bits) - 1, 1u64 << bits])
+            .chain([u64::MAX]);
+        for value in values {
+            let mut expected = [0u8; 9];
+            let len = write_varint(&mut expected, value);
+            let mut appended = std::vec![0xab_u8];
+            write_varint_to_vec(value, &mut appended);
+            assert_eq!(appended[0], 0xab, "value {value}");
+            assert_eq!(&appended[1..], &expected[..len], "value {value}");
+        }
     }
 }

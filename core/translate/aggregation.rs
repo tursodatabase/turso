@@ -1,12 +1,13 @@
 use crate::alloc::TursoVecExt;
+use crate::ast;
 use crate::translate::expr_context::ExprContext;
-use turso_parser::ast;
 
 use crate::{
     function::{AccumulatorFunc, AggFunc},
     schema::Table,
     sync::Arc,
     translate::collate::CollationSeq,
+    util::exprs_are_equivalent,
     vdbe::{
         builder::ProgramBuilder,
         insn::{AggStepData, Insn},
@@ -18,14 +19,15 @@ use super::{
     emitter::{OperationMode, Resolver, TranslateCtx},
     expr::{
         resolve_expr, translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
-        ConditionMetadata, NoConstantOptReason,
+        walk_expr, ConditionMetadata, NoConstantOptReason, WalkControl,
     },
+    expression_index::selected_expression_index,
     plan::{
         Aggregate, Distinctness, EvalAt, NonFromClauseSubquery, SelectPlan, SubqueryEvalPhase,
         SubqueryOrigin, SubqueryState, TableReferences,
     },
     result_row::emit_select_result,
-    subquery::emit_non_from_clause_subqueries_for_phase,
+    subquery::{columns_read_by_subqueries, emit_non_from_clause_subqueries_for_phase},
 };
 
 /// Emits the bytecode for processing an aggregate without a GROUP BY clause.
@@ -218,6 +220,125 @@ pub fn emit_ungrouped_aggregation<'a>(
     Ok(())
 }
 
+/// The columns of `plan`'s own tables that an aggregate query without GROUP BY
+/// reads after its loop: in result columns that contain an aggregate, in
+/// HAVING, and in the subqueries that run after the loop. They take their
+/// values from the row that `BareColumnRowCheck` chooses.
+/// Columns of an outer query are left out: the outer row does not change while
+/// this loop runs, so they are read directly, also when no row reaches the
+/// aggregates.
+pub fn columns_read_after_ungrouped_aggregation(plan: &SelectPlan) -> Result<Vec<ast::Expr>> {
+    let mut columns: Vec<ast::Expr> = Vec::new();
+    let mut add_column = |column: &ast::Expr| {
+        if !columns.iter().any(|c| exprs_are_equivalent(c, column)) {
+            columns.push(column.clone());
+        }
+    };
+    for column in columns_read_by_subqueries(plan, SubqueryEvalPhase::UngroupedAggregateOutput) {
+        add_column(&column);
+    }
+    let having = plan
+        .group_by
+        .iter()
+        .flat_map(|group_by| group_by.having.iter().flatten());
+    for expr in plan
+        .result_columns
+        .iter()
+        .filter(|rc| rc.contains_aggregates)
+        .map(|rc| &rc.expr)
+        .chain(having)
+    {
+        walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+            match expr {
+                _ if plan.aggregates.iter().any(|a| a.original_expr == *expr) => {
+                    Ok(WalkControl::SkipChildren)
+                }
+                // After the loop the expression is read from the saved
+                // register, not from the index cursor, which no longer points
+                // at the row. Its columns may not be readable at all when the
+                // index covers the query and the table cursor is not open.
+                _ if selected_expression_index(expr, &plan.table_references).is_some() => {
+                    add_column(expr);
+                    Ok(WalkControl::SkipChildren)
+                }
+                ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
+                    if plan
+                        .table_references
+                        .find_joined_table_by_internal_id(*table)
+                        .is_some()
+                    {
+                        add_column(expr);
+                    }
+                    Ok(WalkControl::SkipChildren)
+                }
+                _ => Ok(WalkControl::Continue),
+            }
+        })?;
+    }
+    Ok(columns)
+}
+
+/// The register that an aggregate loop tests to decide whether it reads the
+/// bare columns, the columns used outside aggregate functions, from the
+/// current row. As in SQLite's updateAccumulator() (select.c), a query with a
+/// min() or max() reads them from each row that sets a new minimum or
+/// maximum, and other queries read them from the first row of the group.
+pub struct BareColumnRowCheck {
+    /// The flag that is 0 on the first row of the group and 1 afterwards.
+    first_row_done_flag: usize,
+    /// The register that the min() and max() steps write
+    /// (`AggStepData::minmax_keeps_best_reg`), or None without a min() or max().
+    minmax_keeps_best_reg: Option<usize>,
+    /// Whether each min() and max() with a FILTER starts with the register
+    /// set to `first_row_done_flag`, so that the first row is read also when
+    /// the filters skip every step. As in SQLite, a query with GROUP BY always
+    /// does this, and a query without GROUP BY only when every min() and max()
+    /// has a FILTER: otherwise an unfiltered one steps on the first row.
+    copy_first_row_flag: bool,
+}
+
+impl BareColumnRowCheck {
+    pub fn new(
+        program: &mut ProgramBuilder,
+        aggregates: &[Aggregate],
+        first_row_done_flag: usize,
+        grouped: bool,
+    ) -> Self {
+        let mut minmax = aggregates
+            .iter()
+            .filter(|agg| matches!(agg.func, AggFunc::Min | AggFunc::Max))
+            .peekable();
+        let minmax_keeps_best_reg = minmax.peek().is_some().then(|| program.alloc_register());
+        Self {
+            first_row_done_flag,
+            minmax_keeps_best_reg,
+            copy_first_row_flag: grouped || minmax.all(|agg| agg.filter_expr.is_some()),
+        }
+    }
+
+    /// Emits what comes before the FILTER of `agg` and returns the register to
+    /// pass to its step.
+    pub fn emit_before_step(&self, program: &mut ProgramBuilder, agg: &Aggregate) -> Option<usize> {
+        let reg = self
+            .minmax_keeps_best_reg
+            .filter(|_| matches!(agg.func, AggFunc::Min | AggFunc::Max))?;
+        if self.copy_first_row_flag && agg.filter_expr.is_some() {
+            program.emit_insn(Insn::Copy {
+                src_reg: self.first_row_done_flag,
+                dst_reg: reg,
+                extra_amount: 0,
+            });
+        }
+        Some(reg)
+    }
+
+    /// The register that is not 0 when the current row is not read.
+    pub fn skip_reg(&self) -> usize {
+        self.minmax_keeps_best_reg
+            .unwrap_or(self.first_row_done_flag)
+    }
+}
+
 /// Emits the bytecode for handling duplicates in a distinct aggregate.
 /// This is used in both GROUP BY and non-GROUP BY aggregations to jump over
 /// the AggStep that would otherwise accumulate the same value multiple times.
@@ -329,6 +450,7 @@ pub fn emit_aggregate_step(
     source: AggArgumentSource,
     target_register: usize,
     resolver: &Resolver,
+    minmax_keeps_best_reg: Option<usize>,
 ) -> Result<usize> {
     let Some(cursor_id) = aggregate.order_cursor else {
         return translate_aggregation_step(
@@ -338,6 +460,7 @@ pub fn emit_aggregate_step(
             target_register,
             resolver,
             aggregate.fraction_reg,
+            minmax_keeps_best_reg,
         );
     };
     let span_idx = program.constant_spans_next_idx();
@@ -444,6 +567,7 @@ pub fn emit_aggregate_final(
             target_register,
             resolver,
             aggregate.fraction_reg,
+            None,
         )?;
         if let Some(label) = duplicate {
             program.preassign_label_to_next_insn(label);
@@ -518,6 +642,8 @@ pub fn translate_aggregation_step(
     // For `percentile_cont` / `percentile_disc`: register pre-evaluated by
     // `InitLoop::emit`. `None` for any other aggregate.
     fraction_reg: Option<usize>,
+    // For min() and max(): `AggStepData::minmax_keeps_best_reg`.
+    minmax_keeps_best_reg: Option<usize>,
 ) -> Result<usize> {
     let num_args = agg_arg_source.num_args();
     let func = agg_arg_source.agg_func();
@@ -535,6 +661,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Avg),
                     collation: CollationSeq::BINARY,
+                    minmax_keeps_best_reg: None,
                 }),
             });
             target_register
@@ -550,6 +677,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Count0),
                     collation: CollationSeq::BINARY,
+                    minmax_keeps_best_reg: None,
                 }),
             });
             target_register
@@ -567,6 +695,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Count),
                     collation: CollationSeq::BINARY,
+                    minmax_keeps_best_reg: None,
                 }),
             });
             target_register
@@ -594,6 +723,7 @@ pub fn translate_aggregation_step(
                     delimiter: delimiter_reg,
                     func: AccumulatorFunc::Agg(AggFunc::GroupConcat),
                     collation: CollationSeq::BINARY,
+                    minmax_keeps_best_reg: None,
                 }),
             });
 
@@ -615,6 +745,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Max),
                     collation: arg_collation,
+                    minmax_keeps_best_reg,
                 }),
             });
             target_register
@@ -635,6 +766,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Min),
                     collation: arg_collation,
+                    minmax_keeps_best_reg,
                 }),
             });
             target_register
@@ -655,6 +787,7 @@ pub fn translate_aggregation_step(
                     delimiter: value_reg,
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupObject),
                     collation: CollationSeq::BINARY,
+                    minmax_keeps_best_reg: None,
                 }),
             });
             target_register
@@ -673,6 +806,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupArray),
                     collation: CollationSeq::BINARY,
+                    minmax_keeps_best_reg: None,
                 }),
             });
             target_register
@@ -693,6 +827,7 @@ pub fn translate_aggregation_step(
                     delimiter: delimiter_reg,
                     func: AccumulatorFunc::Agg(AggFunc::StringAgg),
                     collation: CollationSeq::BINARY,
+                    minmax_keeps_best_reg: None,
                 }),
             });
 
@@ -711,6 +846,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Sum),
                     collation: CollationSeq::BINARY,
+                    minmax_keeps_best_reg: None,
                 }),
             });
             target_register
@@ -728,6 +864,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Total),
                     collation: CollationSeq::BINARY,
+                    minmax_keeps_best_reg: None,
                 }),
             });
             target_register
@@ -746,6 +883,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::ArrayAgg),
                     collation: CollationSeq::BINARY,
+                    minmax_keeps_best_reg: None,
                 }),
             });
             target_register
@@ -770,6 +908,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Mode),
                     collation: arg_collation,
+                    minmax_keeps_best_reg: None,
                 }),
             });
             target_register
@@ -798,6 +937,7 @@ pub fn translate_aggregation_step(
                     delimiter: fraction_reg,
                     func: AccumulatorFunc::Agg(func.clone()),
                     collation: arg_collation,
+                    minmax_keeps_best_reg: None,
                 }),
             });
             target_register
@@ -839,6 +979,7 @@ pub fn translate_aggregation_step(
                         func.clone()
                     })),
                     collation: CollationSeq::BINARY,
+                    minmax_keeps_best_reg: None,
                 }),
             });
             target_register

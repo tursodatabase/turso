@@ -2,7 +2,7 @@
 //! TODO: for now just generating [ast::Literal], but want to also generate Columns and any
 //! arbitrary [ast::Expr]
 
-use turso_parser::ast::{self, Expr};
+use turso_core::ast::{self, Expr};
 
 use crate::{
     generation::{

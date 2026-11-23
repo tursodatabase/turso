@@ -13,6 +13,7 @@ use turso_core::SessionRole;
 pub struct Remote {
     pub(super) mvcc: bool,
     conn: Arc<Connection>,
+    pub(super) crypto: Option<turso_core::EncryptionContext>,
     db_path: PathBuf,
     _db: Arc<Database>,
     _dir: TempDir,
@@ -20,28 +21,49 @@ pub struct Remote {
 
 impl Remote {
     pub fn new(setup: &[&str]) -> Result<Arc<Self>> {
-        Self::open(setup, true, true)
+        Self::create(setup, true, false, true)
+    }
+
+    pub fn new_encrypted(setup: &[&str]) -> Result<Arc<Self>> {
+        Self::create(setup, true, true, true)
     }
 
     /// A remote whose commits write plain frames with no portable changes.
     pub fn without_portable_changes(setup: &[&str]) -> Result<Arc<Self>> {
-        Self::open(setup, true, false)
+        Self::create(setup, true, false, false)
     }
 
     /// A remote in plain WAL mode, without MVCC.
     pub fn new_wal(setup: &[&str]) -> Result<Arc<Self>> {
-        Self::open(setup, false, false)
+        Self::create(setup, false, false, false)
     }
 
-    fn open(setup: &[&str], mvcc: bool, portable_changes: bool) -> Result<Arc<Self>> {
+    fn create(
+        setup: &[&str],
+        mvcc: bool,
+        encrypted: bool,
+        portable_changes: bool,
+    ) -> Result<Arc<Self>> {
+        let key = encrypted.then(|| turso_core::EncryptionKey::new_256([11; 32]));
+        let crypto = key
+            .as_ref()
+            .map(|key| {
+                turso_core::EncryptionContext::new(turso_core::CipherMode::Aes256Gcm, key, 4096)
+            })
+            .transpose()?;
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("remote.db");
         let db = Database::open(
             Arc::new(PlatformIO::new()?),
             &db_path.to_string_lossy(),
-            OpenOptions::new(Arc::new(SqliteDialect)).db_opts(database_opts()),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(database_opts().with_encryption(encrypted))
+                .encryption(encrypted.then(|| turso_core::EncryptionOpts {
+                    cipher: "aes256gcm".into(),
+                    hexkey: "0b".repeat(32),
+                })),
         )?;
-        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(key))?;
         if mvcc {
             conn.execute("PRAGMA journal_mode = 'mvcc'")?;
             conn.set_portable_logical_changes_enabled(portable_changes);
@@ -52,6 +74,7 @@ impl Remote {
         Ok(Arc::new(Self {
             mvcc,
             conn,
+            crypto,
             db_path,
             _db: db,
             _dir: dir,
@@ -77,7 +100,16 @@ impl Remote {
 
     pub(super) fn checkpoint_and_read_database_file(&self) -> Result<Vec<u8>> {
         self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
-        Ok(std::fs::read(&self.db_path)?)
+        let stored = std::fs::read(&self.db_path)?;
+        if let Some(crypto) = &self.crypto {
+            let mut plaintext = Vec::new();
+            for (index, page) in stored.chunks_exact(4096).enumerate() {
+                plaintext.extend_from_slice(&crypto.decrypt_page(page, index + 1)?);
+            }
+            Ok(plaintext)
+        } else {
+            Ok(stored)
+        }
     }
 
     pub(super) fn read_logical_log(&self) -> Result<Vec<u8>> {

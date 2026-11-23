@@ -5,8 +5,8 @@
 //! SQLite parser.
 
 use std::{ops::Range, sync::Arc};
-use turso_core::{Dialect, Result};
-use turso_parser::{ast, lexer::Lexer, parser::Parser, token::TokenType};
+use turso_core::{ast, Dialect, Result};
+use turso_parser::{lexer::Lexer, parser::Parser, token::TokenType};
 
 pub use turso_core::dialect::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
 

@@ -436,7 +436,7 @@ impl turso_core::InternalVirtualTable for PageReader {
         }
     }
 
-    fn columns(&self) -> Vec<turso_parser::ast::ColumnDefinition> {
+    fn columns(&self) -> Vec<turso_core::ast::ColumnDefinition> {
         vec![turso_core::vtab::column_definition("data", "BLOB")]
     }
 

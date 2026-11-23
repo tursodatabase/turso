@@ -55,6 +55,20 @@ pub enum RemoteEncryptionCipher {
 }
 
 impl RemoteEncryptionCipher {
+    fn cipher_name(self) -> &'static str {
+        match self {
+            Self::Aes256Gcm => "aes256gcm",
+            Self::Aes128Gcm => "aes128gcm",
+            Self::ChaCha20Poly1305 => "chacha20poly1305",
+            Self::Aegis128L => "aegis128l",
+            Self::Aegis128X2 => "aegis128x2",
+            Self::Aegis128X4 => "aegis128x4",
+            Self::Aegis256 => "aegis256",
+            Self::Aegis256X2 => "aegis256x2",
+            Self::Aegis256X4 => "aegis256x4",
+        }
+    }
+
     /// Returns the total reserved bytes as required by the server
     pub fn reserved_bytes(&self) -> usize {
         match self {
@@ -106,6 +120,7 @@ pub struct Builder {
     partial_sync_config_experimental: Option<PartialSyncOpts>,
     // Encryption key (base64-encoded) for the Turso Cloud database
     remote_encryption_key: Option<String>,
+    local_encryption_key: Option<String>,
     // Encryption cipher for the Turso Cloud database
     remote_encryption_cipher: Option<RemoteEncryptionCipher>,
     // Sync-protocol override: None (default) auto-detects the remote protocol
@@ -118,10 +133,8 @@ pub struct Builder {
     pull_parallel_requests: Option<usize>,
     // Experimental engine features to enable on the local synced database.
     // These mirror the local [`crate::Builder`] flags so synced databases
-    // expose the same SQL surface as their local-only counterparts. Local
-    // at-rest `encryption` is intentionally omitted because the sync engine
-    // does not support local encryption (cloud encryption is configured
-    // separately via `with_remote_encryption`).
+    // expose the same SQL surface as their local-only counterparts.
+    // The sync encryption opt-in also enables core encryption.
     enable_attach: bool,
     enable_custom_types: bool,
     enable_index_method: bool,
@@ -130,6 +143,7 @@ pub struct Builder {
     enable_autovacuum: bool,
     enable_multiprocess_wal: bool,
     enable_without_rowid: bool,
+    enable_sync_encryption: bool,
 }
 
 impl Builder {
@@ -144,6 +158,7 @@ impl Builder {
             bootstrap_if_empty: true,
             partial_sync_config_experimental: None,
             remote_encryption_key: None,
+            local_encryption_key: None,
             remote_encryption_cipher: None,
             logical_mvcc_pull: None,
             pull_bytes_threshold: None,
@@ -156,6 +171,7 @@ impl Builder {
             enable_autovacuum: false,
             enable_multiprocess_wal: false,
             enable_without_rowid: false,
+            enable_sync_encryption: false,
         }
     }
 
@@ -226,6 +242,13 @@ impl Builder {
         self
     }
 
+    /// Opt in to experimental local encryption for synced replicas.
+    /// Required when a local encryption key is configured, including offline reopen.
+    pub fn experimental_sync_encryption(mut self, enable: bool) -> Self {
+        self.enable_sync_encryption = enable;
+        self
+    }
+
     // Set remote_url for HTTP requests.
     // If remote_url omitted in configuration - tursodb will try to load it from the metadata file
     pub fn with_remote_url(mut self, remote_url: impl Into<String>) -> Self {
@@ -285,7 +308,7 @@ impl Builder {
     }
 
     /// Set encryption key (base64-encoded) and cipher for the Turso Cloud database.
-    /// The cipher is used to calculate the correct reserved_bytes for the database.
+    /// Both credentials are sent on encrypted sync requests.
     pub fn with_remote_encryption(
         mut self,
         base64_key: impl Into<String>,
@@ -296,10 +319,31 @@ impl Builder {
         self
     }
 
+    /// Configure a single cipher and independent local (hex) and cloud (base64) keys.
+    /// The cloud key may be omitted when reopening an initialized replica offline.
+    pub fn with_encryption(
+        mut self,
+        cipher: RemoteEncryptionCipher,
+        local_key: Option<String>,
+        cloud_key: Option<String>,
+    ) -> Self {
+        self.remote_encryption_cipher = Some(cipher);
+        self.local_encryption_key = local_key;
+        self.remote_encryption_key = cloud_key;
+        self
+    }
+
+    /// Encrypt local database and sync files with this hex-encoded key.
+    /// Uses the same cipher selected by `with_remote_encryption`.
+    /// Requires `experimental_sync_encryption(true)`.
+    pub fn with_local_encryption_key(mut self, hex_key: impl Into<String>) -> Self {
+        self.local_encryption_key = Some(hex_key.into());
+        self
+    }
+
     /// Set encryption key (base64-encoded) for the Turso Cloud database.
-    /// The key will be sent as x-turso-encryption-key header with sync HTTP requests.
-    /// Note: For deferred sync (no initial bootstrap), use with_remote_encryption() instead
-    /// to also specify the cipher for correct reserved_bytes calculation.
+    /// A cipher must also be configured before `build`; use `with_remote_encryption`
+    /// to set both. Key-only encrypted sync configurations are rejected.
     pub fn with_remote_encryption_key(mut self, base64_key: impl Into<String>) -> Self {
         self.remote_encryption_key = Some(base64_key.into());
         self
@@ -339,6 +383,9 @@ impl Builder {
     /// feature tokens must match the names parsed by the core.
     fn experimental_features_string(&self) -> Option<String> {
         let mut features: Vec<&str> = Vec::new();
+        if self.enable_sync_encryption {
+            features.push("sync_encryption");
+        }
         if self.enable_attach {
             features.push("attach");
         }
@@ -381,14 +428,26 @@ impl Builder {
         // Compose the experimental_features string from the boolean flags
         // exposed on this Builder.
         let experimental_features = self.experimental_features_string();
-
+        let local_encryption = self
+            .local_encryption_key
+            .as_ref()
+            .map(|key| {
+                let cipher = self.remote_encryption_cipher.ok_or_else(|| {
+                    Error::Error("local sync encryption requires a shared cipher".into())
+                })?;
+                Ok::<_, Error>(turso_core::EncryptionOpts {
+                    cipher: cipher.cipher_name().into(),
+                    hexkey: key.clone(),
+                })
+            })
+            .transpose()?;
         // Build core database config for the embedded engine.
         let db_config = turso_sdk_kit::rsapi::TursoDatabaseConfig {
             path: self.path.clone(),
             experimental_features,
             // IMPORTANT: async IO must be turned on to delegate IO to this layer.
             async_io: true,
-            encryption: None,
+            encryption: local_encryption,
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
@@ -409,6 +468,9 @@ impl Builder {
 
         // Build sync engine config.
         let sync_config = turso_sync_sdk_kit::rsapi::TursoDatabaseSyncConfig {
+            cipher: self
+                .remote_encryption_cipher
+                .map(|cipher| cipher.cipher_name().to_string()),
             path: self.path.clone(),
             remote_url: url.clone(),
             client_name: self
@@ -1143,6 +1205,21 @@ mod tests {
     const ADMIN_URL: &str = "http://localhost:8081";
     const USER_URL: &str = "http://localhost:8080";
 
+    #[tokio::test]
+    async fn local_encryption_requires_a_shared_cipher_before_io() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("missing-cipher.db");
+        let result = super::Builder::new_remote(path.to_str().unwrap())
+            .experimental_sync_encryption(true)
+            .with_local_encryption_key("16".repeat(32))
+            .build()
+            .await;
+        assert!(
+            matches!(result, Err(crate::Error::Error(message)) if message.contains("requires a shared cipher"))
+        );
+        assert!(!path.exists());
+    }
+
     #[test]
     fn missing_native_roots_returns_build_error() {
         const CHILD: &str = "TURSO_TEST_MISSING_NATIVE_ROOTS";
@@ -1396,6 +1473,19 @@ mod tests {
     #[test]
     fn experimental_features_string_composition() {
         use crate::sync::Builder;
+
+        assert_eq!(
+            Builder::new_remote(":memory:")
+                .experimental_sync_encryption(true)
+                .experimental_features_string()
+                .as_deref(),
+            Some("sync_encryption")
+        );
+        assert!(Builder::new_remote(":memory:")
+            .experimental_sync_encryption(true)
+            .experimental_sync_encryption(false)
+            .experimental_features_string()
+            .is_none());
 
         // No features enabled -> no experimental_features string at all.
         assert_eq!(

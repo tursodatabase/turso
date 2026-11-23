@@ -204,6 +204,7 @@ fn open(
             open_flags: OpenFlags::default(),
         },
         TursoDatabaseSyncConfig {
+            cipher: None,
             remote_url: Some("http://in-process".to_string()),
             path: path.to_string(),
             client_name: "test".to_string(),
@@ -472,15 +473,16 @@ fn query_integer(conn: &TursoConnection, io: &MemoryYieldIO, sql: &str) -> i64 {
     }
 }
 
-/// A pull with `logical_mvcc_pull: Some(true)` on a replica whose local database is in WAL mode
-/// returns a logical stream without converting the database to MVCC. The apply still needs the
+/// A replica bootstrapped in WAL mode and reopened with `logical_mvcc_pull: Some(true)` pulls
+/// logical streams without converting its database to MVCC. The apply still needs the
 /// SDK's SyncBusyGate: it reads the local changes and then commits, and an app commit in between
 /// would count as synced and never be pushed. So the app's write during the apply must fail with
 /// "database is locked".
 #[test]
 fn logical_pull_on_a_wal_database_rejects_app_writes() {
     // The remote is in MVCC mode, but the bootstrap base is an empty WAL database, so the
-    // replica starts in WAL mode and catches up with logical pulls.
+    // replica starts in WAL mode. A fresh bootstrap with logical pulls would convert it to
+    // MVCC, so it is bootstrapped without them and reopened with them.
     let remote =
         Remote::new(&["CREATE TABLE t(x TEXT)", "INSERT INTO t VALUES ('first')"]).unwrap();
     let bootstrap_base = Remote::new_wal(&[]).unwrap();
@@ -488,6 +490,9 @@ fn logical_pull_on_a_wal_database_rejects_app_writes() {
     let io = Arc::new(MemoryYieldIO::new());
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("local.db").to_str().unwrap().to_string();
+    let sync = open(&path, io.clone(), None);
+    run(&sync, &server, &io, &sync.create());
+    drop(sync);
     let sync = open(&path, io.clone(), Some(true));
     run(&sync, &server, &io, &sync.create());
     let conn = connect(&sync, &server, &io);

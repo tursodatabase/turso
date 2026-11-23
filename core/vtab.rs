@@ -1,4 +1,5 @@
 use crate::alloc::{TryClone, TursoAllocExt, TursoTryWithCapacityExt, TursoVecExt};
+use crate::ast;
 use crate::pragma::{PragmaVirtualTable, PragmaVirtualTableCursor};
 use crate::schema::{Column, FromDefinitionFlags};
 use crate::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
@@ -9,7 +10,6 @@ use crate::{Connection, IOResult, LimboError, SymbolTable, Value};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
-use turso_parser::ast;
 
 #[derive(Debug, Clone)]
 pub(crate) enum VirtualTableType {

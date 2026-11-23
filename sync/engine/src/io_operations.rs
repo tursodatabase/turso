@@ -4,8 +4,9 @@ use turso_sqlite::SqliteDialect;
 use turso_core::{Completion, LimboError, OpenFlags};
 
 use crate::{
+    database_sync_operations::wait_file_completion,
     database_tape::{DatabaseTape, DatabaseTapeOpts},
-    types::{Coro, SyncEngineIoResult},
+    types::Coro,
     Result,
 };
 
@@ -64,9 +65,7 @@ impl IoOperations for Arc<dyn turso_core::IO> {
             tracing::debug!("file truncated: rc={}", rc);
         });
         let c = file.truncate(len as u64, c)?;
-        while !c.succeeded() {
-            coro.yield_(SyncEngineIoResult::IO).await?;
-        }
+        wait_file_completion(coro, &c).await?;
         Ok(())
     }
 }

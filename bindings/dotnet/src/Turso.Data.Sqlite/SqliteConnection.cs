@@ -163,6 +163,8 @@ public partial class SqliteConnection : DbConnection
 
         if (_database is not null)
             throw new InvalidOperationException("The connection is already open.");
+        if (_connectionOptions.ShouldSerialize("Local Encryption Key"))
+            throw new InvalidOperationException("Local Encryption Key requires a remote Data Source and Replica Path.");
         if (!string.IsNullOrEmpty(_connectionOptions.Password))
             throw new InvalidOperationException(Properties.Resources.EncryptionNotSupported("e_sqlite3"));
 

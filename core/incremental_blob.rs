@@ -26,11 +26,11 @@
 //! writes made before it remain part of the handle's transaction and commit at
 //! close, exactly as `sqlite3_blob_write` documents.
 
+use crate::ast::Privilege;
 use crate::namespace::NamespaceId;
 use crate::translate::collate::CollationSeq;
 use std::num::NonZero;
 use std::sync::Arc;
-use turso_parser::ast::Privilege;
 
 use crate::alloc::TursoSliceExt;
 use crate::schema::{BTreeTable, Column, Schema};

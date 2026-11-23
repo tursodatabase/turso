@@ -201,6 +201,11 @@ where
 {
     type Error = T::Error;
 
+    // Without this attribute, the compiler can call this function out of
+    // line for each clone of a `BitSet` in the join order search. The
+    // `Option` there is almost always `None`, and the call costs more than
+    // the copy.
+    #[inline]
     fn try_clone(&self) -> Result<Self, Self::Error> {
         match self {
             Some(value) => Ok(Some(value.try_clone()?)),

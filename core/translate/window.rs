@@ -1,4 +1,6 @@
 use crate::alloc::TursoSliceExt;
+use crate::ast::Name;
+use crate::ast::{Expr, FrameBound, Literal, Over, SortOrder, TableInternalId};
 use crate::function::{AccumulatorFunc, AggFunc, WindowFunc};
 use crate::namespace::NamespaceRef;
 use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Table};
@@ -35,15 +37,13 @@ use crate::Connection;
 use crate::Result;
 use crate::{turso_assert, turso_assert_eq};
 use std::mem;
-use turso_parser::ast::Name;
-use turso_parser::ast::{Expr, FrameBound, Literal, Over, SortOrder, TableInternalId};
 
 const SUBQUERY_DATABASE_ID: usize = 0;
 const SUBQUERY_NAMESPACE: NamespaceRef = NamespaceRef::root_of(SUBQUERY_DATABASE_ID);
 
 struct WindowSubqueryContext<'a> {
     resolver: &'a Resolver<'a>,
-    subquery_order_by: &'a mut Vec<(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)>,
+    subquery_order_by: &'a mut Vec<(Box<Expr>, SortOrder, Option<crate::ast::NullsOrder>)>,
     subquery_result_columns: &'a mut Vec<ResultSetColumn>,
     subquery_id: &'a TableInternalId,
 }
@@ -206,6 +206,14 @@ fn prepare_window_subquery(
         )?;
     }
 
+    // An outer layer pushes each call of this window into its subquery as a
+    // whole expression and reuses one column for equivalent calls, as SQLite's
+    // `selectWindowRewriteExprCb` does. `link_with_window` keeps one entry per
+    // occurrence for calls with nondeterministic functions such as `random()`
+    // or `date()`, so the entries of the calls that were merged into an earlier
+    // equivalent call match no expression in this layer and compute nothing.
+    current_window.functions.retain(|f| f.rewritten.is_some());
+
     // When there is no ORDER BY or PARTITION BY clause, the window function takes zero arguments,
     // and no other columns are selected (e.g., "SELECT count() OVER () FROM products"),
     // `subquery_result_columns` may be empty. Add a constant expression to keep the query valid.
@@ -279,7 +287,7 @@ fn prepare_window_subquery(
         {"SUBQUERY_DATABASE_ID": SUBQUERY_DATABASE_ID}
     );
 
-    outer_plan.window = Some(current_window);
+    outer_plan.window = Some(Box::new(current_window));
     outer_plan.table_references.add_joined_table(subquery);
 
     Ok(())
@@ -289,7 +297,7 @@ fn append_order_by(
     plan: &mut SelectPlan,
     expr: &mut Expr,
     sort_order: &SortOrder,
-    nulls_order: Option<turso_parser::ast::NullsOrder>,
+    nulls_order: Option<crate::ast::NullsOrder>,
     ctx: &mut WindowSubqueryContext,
 ) -> crate::Result<()> {
     // Deduplicate: if an equivalent expression already exists in the subquery ORDER BY,
@@ -966,7 +974,7 @@ fn emit_frame_offset(
     resolver: &Resolver,
     expr: &Expr,
     reg: usize,
-    mode: turso_parser::ast::FrameMode,
+    mode: crate::ast::FrameMode,
     pos: FrameBoundPosition,
 ) -> Result<()> {
     let is_constant = is_constant_frame_offset(expr, resolver)?;
@@ -986,7 +994,7 @@ fn emit_frame_offset(
         });
     }
     let integer_only = match mode {
-        turso_parser::ast::FrameMode::Range => {
+        crate::ast::FrameMode::Range => {
             let window = plan.window.as_ref().expect("missing window");
             let [(order_expr, ..)] = window.order_by.as_slice() else {
                 unreachable!("RANGE offsets require exactly one ORDER BY expression");
@@ -994,7 +1002,7 @@ fn emit_frame_offset(
             let context = ExprContext::new(Some(&plan.table_references), resolver);
             check_range_offset_type(order_expr, is_constant.then_some(expr), &context.type_env())?
         }
-        turso_parser::ast::FrameMode::Rows | turso_parser::ast::FrameMode::Groups => true,
+        crate::ast::FrameMode::Rows | crate::ast::FrameMode::Groups => true,
     };
     emit_window_check_offset(program, reg, integer_only, pos);
     Ok(())
@@ -1111,7 +1119,7 @@ impl EmitWindow {
         window: &'a Window,
         plan: &SelectPlan,
         result_columns: &'a [ResultSetColumn],
-        order_by: &'a [(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)],
+        order_by: &'a [(Box<Expr>, SortOrder, Option<crate::ast::NullsOrder>)],
     ) -> crate::Result<()> {
         let joined_tables = &plan.joined_tables();
         turso_assert_eq!(joined_tables.len(), 1, "expected only one joined table");
@@ -1280,7 +1288,7 @@ impl EmitWindow {
             );
         }
 
-        t_ctx.meta_window = Some(WindowMetadata {
+        t_ctx.meta_window = Some(Box::new(WindowMetadata {
             labels: WindowLabels {
                 flush_buffer: program.allocate_label(),
                 row_output: program.allocate_label(),
@@ -1304,13 +1312,13 @@ impl EmitWindow {
                 // see if they are peers, so all of these stay `None`.
                 // Mirrors SQLite's `regPeer` allocation gate at
                 // window.c:2892-2896.
-                source_peer_values: if window.frame.mode != turso_parser::ast::FrameMode::Rows {
+                source_peer_values: if window.frame.mode != crate::ast::FrameMode::Rows {
                     alloc_optional_registers(program, order_by_len)
                 } else {
                     None
                 },
                 cursor_peer_values: {
-                    let is_peer_tracked = window.frame.mode != turso_parser::ast::FrameMode::Rows;
+                    let is_peer_tracked = window.frame.mode != crate::ast::FrameMode::Rows;
                     // Order matters: this allocates registers, so keep it
                     // Start / Current / End to match `FrameCursor`.
                     CursorPeerValues([
@@ -1355,7 +1363,7 @@ impl EmitWindow {
             expressions_referencing_subquery,
             buffer_table_name: buffer_table.name.clone(),
             minmax,
-        });
+        }));
 
         Ok(())
     }
@@ -1554,7 +1562,7 @@ impl EmitWindow {
         // branch — SQLite gets that re-entry for free because its
         // first-row test is `rowid == 1` and ResetSorter restarts the
         // rowids.
-        let same_kind_bounded = window.frame.mode != turso_parser::ast::FrameMode::Range
+        let same_kind_bounded = window.frame.mode != crate::ast::FrameMode::Range
             && matches!(
                 (&window.frame.start, &window.frame.end),
                 (FrameBound::Preceding(_), FrameBound::Preceding(_))
@@ -1620,7 +1628,7 @@ impl EmitWindow {
         // start count is set to the difference of the two offsets
         // (window.c:2962-2965).
         if matches!(window.frame.start, FrameBound::Following(_))
-            && window.frame.mode != turso_parser::ast::FrameMode::Range
+            && window.frame.mode != crate::ast::FrameMode::Range
         {
             if let (Some(start_offset_reg), Some(end_offset_reg)) =
                 (registers.start_offset_reg, registers.end_offset_reg)
@@ -1677,7 +1685,7 @@ impl EmitWindow {
         // waits and the end-of-partition flush does the work. Mirrors
         // SQLite's `windowIfNewPeer` call at window.c:2984-2986 (an
         // unconditional jump when there's no ORDER BY, window.c:2076).
-        if window.frame.mode != turso_parser::ast::FrameMode::Rows {
+        if window.frame.mode != crate::ast::FrameMode::Rows {
             program.add_comment(
                 program.offset(),
                 "peer of previous row: buffer only, handle at group end",
@@ -1696,7 +1704,7 @@ impl EmitWindow {
         // Pick the order to run the three operations in, based on the
         // frame's bounds — one of SQLite's three `sqlite3WindowCodeStep`
         // cases (window.c:2987-3037).
-        let is_range = window.frame.mode == turso_parser::ast::FrameMode::Range;
+        let is_range = window.frame.mode == crate::ast::FrameMode::Range;
         let end_is_unbounded = matches!(window.frame.end, FrameBound::UnboundedFollowing);
         if matches!(window.frame.start, FrameBound::Following(_)) {
             // Pattern A — the frame starts after the current row (`<expr>
@@ -1943,7 +1951,7 @@ fn alloc_optional_registers(program: &mut ProgramBuilder, count: usize) -> Optio
 
 fn collect_expressions_referencing_subquery<'a>(
     result_columns: &'a [ResultSetColumn],
-    order_by: &'a [(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)],
+    order_by: &'a [(Box<Expr>, SortOrder, Option<crate::ast::NullsOrder>)],
     subquery_id: &TableInternalId,
 ) -> crate::Result<Vec<(&'a Expr, usize)>> {
     let mut expressions_referencing_subquery: Vec<(&'a Expr, usize)> = Vec::new();
@@ -2154,7 +2162,7 @@ enum WindowOp {
 ///   first_value / nth_value: only rows that have already left the frame
 ///   are deleted, and those functions only ever look up rows still in it.
 fn window_delete_op(window: &Window) -> Option<WindowOp> {
-    let is_range = window.frame.mode == turso_parser::ast::FrameMode::Range;
+    let is_range = window.frame.mode == crate::ast::FrameMode::Range;
     match &window.frame.start {
         FrameBound::Following(expr) => {
             (!is_range && window_expr_gt_zero(expr)).then_some(WindowOp::ReturnRow)
@@ -2204,7 +2212,7 @@ fn window_cache_frame(window: &Window) -> bool {
 /// changes results. Mirrors SQLite's `windowExprGtZero`
 /// (window.c:2439-2449).
 fn window_expr_gt_zero(expr: &Expr) -> bool {
-    if let Expr::Literal(turso_parser::ast::Literal::Numeric(s)) = expr {
+    if let Expr::Literal(crate::ast::Literal::Numeric(s)) = expr {
         if let Ok(n) = s.parse::<i64>() {
             return n > 0;
         }
@@ -2333,7 +2341,7 @@ fn emit_window_full_scan(
 
     let compare_peers = matches!(
         exclude,
-        turso_parser::ast::FrameExclude::Group | turso_parser::ast::FrameExclude::Ties
+        crate::ast::FrameExclude::Group | crate::ast::FrameExclude::Ties
     );
     let order_by_len = window.order_by.len();
     let current_peer =
@@ -2386,8 +2394,8 @@ fn emit_window_full_scan(
     });
 
     match exclude {
-        turso_parser::ast::FrameExclude::NoOthers => {}
-        turso_parser::ast::FrameExclude::CurrentRow => {
+        crate::ast::FrameExclude::NoOthers => {}
+        crate::ast::FrameExclude::CurrentRow => {
             program.emit_insn(Insn::Eq {
                 lhs: current_rowid,
                 rhs: scan_rowid,
@@ -2396,8 +2404,8 @@ fn emit_window_full_scan(
                 collation: CollationSeq::for_internal_values(),
             });
         }
-        turso_parser::ast::FrameExclude::Group | turso_parser::ast::FrameExclude::Ties => {
-            if matches!(exclude, turso_parser::ast::FrameExclude::Ties) {
+        crate::ast::FrameExclude::Group | crate::ast::FrameExclude::Ties => {
+            if matches!(exclude, crate::ast::FrameExclude::Ties) {
                 program.emit_insn(Insn::Eq {
                     lhs: current_rowid,
                     rhs: scan_rowid,
@@ -2578,9 +2586,9 @@ fn emit_window_range_test(
     // the value's type as in any other arithmetic: numeric adds exactly.
     // None means SQLite's operator runs.
     let operator = if subtract {
-        turso_parser::ast::Operator::Subtract
+        crate::ast::Operator::Subtract
     } else {
-        turso_parser::ast::Operator::Add
+        crate::ast::Operator::Add
     };
     let arithmetic = Expr::Binary(
         Box::new(order_expr.clone()),
@@ -2591,8 +2599,8 @@ fn emit_window_range_test(
     let collation = context.expr_collation(order_expr)?;
     let big_null = matches!(
         (sort_order, nulls_order),
-        (SortOrder::Asc, Some(turso_parser::ast::NullsOrder::Last))
-            | (SortOrder::Desc, Some(turso_parser::ast::NullsOrder::First))
+        (SortOrder::Asc, Some(crate::ast::NullsOrder::Last))
+            | (SortOrder::Desc, Some(crate::ast::NullsOrder::First))
     );
     let label_done = program.allocate_label();
 
@@ -2880,7 +2888,7 @@ fn emit_window_op(
     // equal ORDER BY values (a peer group); with no ORDER BY every row
     // counts as equal, so it runs to the end of the partition. Mirrors
     // SQLite's `WindowCodeArg.eFrmType != TK_ROWS` test (window.c:2247).
-    let b_peer = frame_mode != turso_parser::ast::FrameMode::Rows;
+    let b_peer = frame_mode != crate::ast::FrameMode::Rows;
 
     // AGGINVERSE does nothing when the frame starts at UNBOUNDED
     // PRECEDING: no row ever leaves the frame. Mirrors SQLite's early
@@ -2921,7 +2929,7 @@ fn emit_window_op(
     // ORDER BY values and loop back after each peer group until the cursor
     // reaches the value boundary.
     let range_loop_start = if let Some(reg) = countdown_reg {
-        if frame_mode == turso_parser::ast::FrameMode::Range {
+        if frame_mode == crate::ast::FrameMode::Range {
             let label = program.allocate_label();
             program.preassign_label_to_next_insn(label);
             match op {
@@ -2993,7 +3001,7 @@ fn emit_window_op(
     // the frame-end cursor. While the source is still producing rows, also
     // keep csr_end at or before the newest buffered row. During flush SQLite
     // clears its source-rowid register, disabling the latter guard.
-    let same_kind_range_offsets = frame_mode == turso_parser::ast::FrameMode::Range
+    let same_kind_range_offsets = frame_mode == crate::ast::FrameMode::Range
         && countdown_reg.is_some()
         && matches!(
             (&window.frame.start, &window.frame.end),
@@ -3420,6 +3428,7 @@ fn emit_function_step(
                         acc_reg,
                         &t_ctx.resolver,
                         None,
+                        None,
                     )?;
 
                     if let Some(label) = filter_skip_label {
@@ -3437,6 +3446,7 @@ fn emit_function_step(
                         delimiter: 0,
                         func: AccumulatorFunc::Window(win_func.clone()),
                         collation: CollationSeq::BINARY,
+                        minmax_keeps_best_reg: None,
                     }),
                 });
             }
@@ -4063,7 +4073,7 @@ pub fn emit_window_flush(
             None,
             true,
         )?;
-        let inverse_before_return = window.frame.mode == turso_parser::ast::FrameMode::Range
+        let inverse_before_return = window.frame.mode == crate::ast::FrameMode::Range
             && matches!(window.frame.start, FrameBound::Preceding(_));
         if inverse_before_return {
             emit_window_op(
@@ -4104,7 +4114,7 @@ pub fn emit_window_flush(
         // rows that remain, with the totals now final.
         emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None, true)?;
         let (return_row_countdown, agg_inverse_countdown) =
-            if window.frame.mode == turso_parser::ast::FrameMode::Range {
+            if window.frame.mode == crate::ast::FrameMode::Range {
                 (None, registers.start_offset_reg)
             } else if matches!(window.frame.end, FrameBound::UnboundedFollowing) {
                 (registers.start_offset_reg, None)
@@ -4114,7 +4124,7 @@ pub fn emit_window_flush(
         let label_after_inverse_eof = program.allocate_label();
         let label_loop_1 = program.allocate_label();
         program.preassign_label_to_next_insn(label_loop_1);
-        if window.frame.mode == turso_parser::ast::FrameMode::Range {
+        if window.frame.mode == crate::ast::FrameMode::Range {
             emit_window_op(
                 program,
                 t_ctx,

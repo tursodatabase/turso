@@ -30,6 +30,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use turso_core::ast;
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::{
     is_user_relation_name, BTreeTable, RelationKind, Schema, SQLITE_SEQUENCE_TABLE_NAME,
@@ -42,7 +43,6 @@ use turso_core::{
     Connection, CursorType, DropColumn, InsertFlags, Insn, LimboError, NewOwner, Numeric,
     OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationName, SqliteCatalog, Value,
 };
-use turso_parser::ast;
 
 use turso_core::MAIN_DB_ID;
 use turso_pg_parser::sqlstate::{

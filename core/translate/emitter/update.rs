@@ -4,6 +4,7 @@ use super::gencol::{
 };
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
+use crate::ast::{RefAct, ResolveType, TriggerEvent, TriggerTime};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::collate::CollationSeq;
@@ -37,8 +38,7 @@ use crate::{
         fkeys::{
             affected_parent_fks_for_update, emit_fk_child_update_counters,
             emit_fk_parent_deferred_new_key_probes, emit_fk_update_parent_actions,
-            fire_fk_update_actions, stabilize_new_row_for_fk, ForeignKeyActions,
-            ParentKeyNewProbeMode,
+            fire_fk_update_actions, ForeignKeyActions, ParentKeyNewProbeMode,
         },
         insert::format_unique_violation_desc,
         main_loop::{CloseLoop, InitLoop, OpenLoop},
@@ -69,7 +69,6 @@ use crate::{
 use std::num::NonZeroUsize;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert, turso_assert_eq};
-use turso_parser::ast::{RefAct, ResolveType, TriggerEvent, TriggerTime};
 
 /// Info about position of rowid alias in the table if present + whether the current UPDATE statement will update the rowid.
 struct RowidUpdateInfo {
@@ -1595,24 +1594,6 @@ fn emit_update_insns<'a>(
             t_ctx,
             |column| !column.is_generated(),
         )?;
-    }
-
-    // Build a complete NEW row image for FK code now, while the old cursor is
-    // still positioned. This is only data preparation. FK counters must not be
-    // touched yet because later CHECK/PK/UNIQUE conflict handling may still
-    // decide that `ON CONFLICT IGNORE` makes this row a no-op.
-    if connection.foreign_keys_enabled() {
-        let rowid_new_reg = effective_rowid_reg;
-        if let Some(table_btree) = target_table.table.btree() {
-            stabilize_new_row_for_fk(
-                program,
-                &table_btree,
-                &updated_column_indices,
-                target_table_cursor_id,
-                start,
-                rowid_new_reg,
-            )?;
-        }
     }
 
     // Populate register-to-affinity map for expression index evaluation.
