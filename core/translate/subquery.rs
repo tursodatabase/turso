@@ -675,7 +675,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
 ) -> Result<()> {
     // Only custom types and arrays fail the checks below, and without custom
     // types enabled there are neither.
-    let custom_types_enabled = !resolver.schema().type_registry.is_empty();
+    let custom_types_enabled = !resolver.schema().types().is_empty();
     let mut with_subqueries = Vec::new();
     {
         let mut subquery_parser = get_subquery_parser(

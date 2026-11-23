@@ -646,7 +646,7 @@ pub(crate) fn check_custom_types(
     // Only custom types and arrays refuse an operator, a COLLATE or a
     // comparison. Without custom types enabled there are neither: the type
     // registry is empty and arrays are refused.
-    if resolver.schema().type_registry.is_empty() {
+    if resolver.schema().types().is_empty() {
         return Ok(());
     }
     let context = ExprContext::new(tables, resolver);

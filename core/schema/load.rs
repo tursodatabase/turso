@@ -86,8 +86,6 @@ pub(crate) struct SchemaLoad {
     /// Indexes and materialized views of the schema rows. They are built
     /// after the types are loaded, and None after that.
     unbuilt: Option<UnbuiltViewsAndIndexes>,
-    /// The CREATE TYPE statements of the custom types table.
-    type_sqls: Vec<String>,
 }
 
 struct UnbuiltViewsAndIndexes {
@@ -103,7 +101,6 @@ impl SchemaLoad {
         Self {
             schema,
             unbuilt: Some(UnbuiltViewsAndIndexes::new()),
-            type_sqls: Vec::new(),
         }
     }
 
@@ -584,10 +581,13 @@ impl LoadStep for Sequences {
     }
 }
 
-/// Reads the CREATE TYPE statements from the custom types table.
+/// Reads the CREATE TYPE and CREATE DOMAIN statements of the custom types
+/// table into the type registry of the schema.
 pub(crate) struct CustomTypes {
     conn: Arc<Connection>,
     queried: bool,
+    /// Whether the custom types table had a row.
+    added_a_type: bool,
 }
 
 impl CustomTypes {
@@ -595,6 +595,7 @@ impl CustomTypes {
         Self {
             conn,
             queried: false,
+            added_a_type: false,
         }
     }
 }
@@ -618,14 +619,24 @@ impl LoadStep for CustomTypes {
     }
 
     fn row(&mut self, load: &mut SchemaLoad, row: &Row) -> Result<()> {
-        load.type_sqls.push(row.get::<&str>(1)?.to_string());
+        let sql = row.get::<&str>(1)?;
+        load.schema_mut()?
+            .add_stored_type(self.conn.db.dialect().as_ref(), sql)?;
+        self.added_a_type = true;
+        Ok(())
+    }
+
+    fn end_of_rows(&mut self, load: &mut SchemaLoad) -> Result<()> {
+        if self.added_a_type {
+            load.schema_mut()?
+                .finish_stored_types(&self.conn.syms.read())?;
+        }
         Ok(())
     }
 }
 
-/// Loads the custom types that [`CustomTypes`] read, then builds the
-/// materialized views and indexes that [`SchemaRows`] read. It has no
-/// statement of its own.
+/// Builds the materialized views and indexes that [`SchemaRows`] read, after
+/// [`CustomTypes`] loaded the types. It has no statement of its own.
 pub(crate) struct ViewsAndIndexes {
     conn: Arc<Connection>,
 }
@@ -642,10 +653,9 @@ impl LoadStep for ViewsAndIndexes {
             .unbuilt
             .take()
             .expect("views and indexes are built once");
-        Schema::try_make_mut(&mut load.schema)?.populate_types_views_then_indices(
+        Schema::try_make_mut(&mut load.schema)?.populate_views_then_indices(
             self.conn.db.dialect().as_ref(),
             &self.conn.syms.read(),
-            &load.type_sqls,
             unbuilt.materialized_view_info,
             unbuilt.dbsp_state_roots,
             unbuilt.dbsp_state_index_roots,

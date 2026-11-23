@@ -121,7 +121,7 @@ fn decided_operator<'a>(
     expr: &'a ast::Expr,
     env: &TypeEnv,
 ) -> Option<(&'static str, Vec<&'a ast::Expr>)> {
-    if env.schema().type_registry.is_empty() {
+    if env.schema().types().is_empty() {
         return None;
     }
     let (op, operands, known) = match expr {

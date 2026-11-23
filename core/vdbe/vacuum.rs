@@ -461,7 +461,7 @@ pub(crate) fn capture_custom_types(
 ) -> Vec<(String, Arc<TypeDef>)> {
     source.with_schema(db_id, |schema| {
         schema
-            .type_registry
+            .types()
             .iter()
             .filter(|(_, td)| !td.is_builtin)
             .map(|(name, td)| (name.clone(), td.clone()))
@@ -639,8 +639,9 @@ pub(crate) fn vacuum_target_build_step(
                 if !config.source_custom_types.is_empty() {
                     state.target_conn.with_schema_mut(|target_schema| {
                         for (name, td) in &config.source_custom_types {
-                            target_schema.type_registry.insert(name.clone(), td.clone());
+                            target_schema.types_mut().insert(name, td.clone());
                         }
+                        target_schema.types_mut().rebuild_chains();
                     })?;
                 }
 

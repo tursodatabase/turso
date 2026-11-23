@@ -2118,7 +2118,7 @@ impl SnapshotRows for PgTypeTable {
         }
 
         let schema = conn.current_schema();
-        for (name, td) in &schema.type_registry {
+        for (name, td) in schema.types().iter() {
             if td.is_builtin {
                 continue;
             }

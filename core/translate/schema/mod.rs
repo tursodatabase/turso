@@ -3091,7 +3091,8 @@ pub fn translate_create_domain(
     if !is_primitive {
         resolver
             .schema()
-            .resolve_base_type_chain(&base_normalized)?;
+            .types()
+            .base_type_chain(&base_normalized)?;
     }
 
     // Validate CHECK and DEFAULT expressions (reject subqueries, aggregates, etc.)
@@ -3349,7 +3350,7 @@ fn find_cast_to_type(
 /// The name of the first other type or domain whose definition names the
 /// type (see type_def_uses_type).
 fn find_type_using(schema: &Schema, registry_key: &str) -> Result<Option<String>> {
-    for (name, type_def) in schema.type_registry.iter() {
+    for (name, type_def) in schema.types().iter() {
         if type_registry_key(name) != registry_key && type_def_uses_type(type_def, registry_key)? {
             return Ok(Some(name.clone()));
         }

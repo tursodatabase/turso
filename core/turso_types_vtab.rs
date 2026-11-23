@@ -85,15 +85,7 @@ impl TursoTypesCursor {
     fn snapshot_types(&mut self) {
         self.entries.clear();
         self.conn.with_schema(MAIN_DB_ID, |schema| {
-            let mut names: Vec<_> = schema
-                .type_registry
-                .iter()
-                .filter(|(key, td)| *key == &td.name.to_lowercase())
-                .map(|(key, _)| key.clone())
-                .collect();
-            names.sort();
-            for name in names {
-                let td = &schema.type_registry[&name];
+            for td in schema.types().types_by_name() {
                 let display_name = if td.params().is_empty() {
                     td.name.clone()
                 } else {

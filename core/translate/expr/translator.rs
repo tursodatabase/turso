@@ -794,7 +794,7 @@ fn translate_case_expr(
             program,
             referenced_tables,
             then_expr,
-            values_type.as_ref(),
+            values_type.as_deref(),
             target_register,
             resolver,
         )?;
@@ -812,7 +812,7 @@ fn translate_case_expr(
                 program,
                 referenced_tables,
                 expr,
-                values_type.as_ref(),
+                values_type.as_deref(),
                 target_register,
                 resolver,
             )?;
@@ -876,7 +876,7 @@ fn translate_cast_expr(
             // for an upper_text(n) over text is `{Ab}`.
             let element_type_name =
                 match resolver.schema().resolve_type_unchecked(cast_type_name)? {
-                    Some(resolved) => resolved.primitive,
+                    Some(resolved) => resolved.primitive.clone(),
                     None => cast_type_name.clone(),
                 };
             let mut column = Column::new(
@@ -985,11 +985,11 @@ fn custom_type_cast_chain(
     if type_name.array_dimensions > 0 {
         return Ok(None);
     }
-    let Some(mut resolved) =
-        schema.resolve_type_unchecked(&crate::util::dequote(&type_name.name))?
+    let Some(resolved) = schema.resolve_type_unchecked(&crate::util::dequote(&type_name.name))?
     else {
         return Ok(None);
     };
+    let mut resolved = (*resolved).clone();
     if resolved.is_domain() {
         return Ok(Some(resolved));
     }
@@ -1462,7 +1462,7 @@ fn translate_function_call_expr(
                             program,
                             referenced_tables,
                             arg,
-                            values_type.as_ref(),
+                            values_type.as_deref(),
                             target_register,
                             resolver,
                         )?;
@@ -1558,7 +1558,7 @@ fn translate_function_call_expr(
                         program,
                         referenced_tables,
                         &args[0],
-                        values_type.as_ref(),
+                        values_type.as_deref(),
                         temp_reg,
                         resolver,
                     )?;
@@ -1572,7 +1572,7 @@ fn translate_function_call_expr(
                         program,
                         referenced_tables,
                         &args[1],
-                        values_type.as_ref(),
+                        values_type.as_deref(),
                         temp_reg,
                         resolver,
                     )?;
@@ -1620,7 +1620,7 @@ fn translate_function_call_expr(
                             program,
                             referenced_tables,
                             value_expr,
-                            values_type.as_ref(),
+                            values_type.as_deref(),
                             target_register,
                             resolver,
                         )?;
@@ -1636,7 +1636,7 @@ fn translate_function_call_expr(
                             program,
                             referenced_tables,
                             args.last().unwrap(),
-                            values_type.as_ref(),
+                            values_type.as_deref(),
                             target_register,
                             resolver,
                         )?;

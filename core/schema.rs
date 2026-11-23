@@ -140,6 +140,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 use tracing::trace;
+pub use type_registry::TypeRegistry;
 
 pub const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 pub const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
@@ -194,6 +195,7 @@ use crate::util::quote_identifier as quote_ident;
 pub mod alter_table;
 pub mod builtin;
 pub(crate) mod load;
+pub mod type_registry;
 pub mod view;
 
 /// Recursively rewrite `Expr::Id("value")` (case-insensitive) to `Expr::Id(col_name)`.
@@ -1313,8 +1315,8 @@ pub struct Schema {
     /// integrity_check needs to know about these pages to avoid false positives about "page never used".
     pub dropped_root_pages: HashSet<i64>,
 
-    /// Custom type registry, loaded from sqlite_turso_types
-    pub type_registry: HashMap<String, Arc<TypeDef>>,
+    /// The built-in types and the types of the custom types table.
+    types: TypeRegistry,
 
     /// Whether the database was opened with custom types enabled. Without
     /// them, a schema that uses custom types is refused when it is loaded.
@@ -1451,7 +1453,7 @@ impl SchemaBuilder {
                 schema_version: 0,
                 analyze_stats: AnalyzeStats::default(),
                 dropped_root_pages: HashSet::default(),
-                type_registry: HashMap::default(),
+                types: TypeRegistry::default(),
                 custom_types_enabled: false,
                 supports_namespaces: false,
                 default_namespaces: &[],
@@ -1483,9 +1485,7 @@ impl SchemaBuilder {
 
     /// Adds the type `type_def` under `name`. A type can have several names.
     pub fn type_def(mut self, name: &str, type_def: Arc<TypeDef>) -> Self {
-        self.schema
-            .type_registry
-            .insert(name.to_lowercase(), type_def);
+        self.schema.types.insert(name, type_def);
         self
     }
 
@@ -1504,7 +1504,8 @@ impl SchemaBuilder {
         Ok(self)
     }
 
-    pub fn build(self) -> Schema {
+    pub fn build(mut self) -> Schema {
+        self.schema.types.rebuild_chains();
         self.schema
     }
 }
@@ -2163,6 +2164,16 @@ impl Schema {
         Ok(name)
     }
 
+    /// The built-in types and the types made by CREATE TYPE and CREATE DOMAIN.
+    pub fn types(&self) -> &TypeRegistry {
+        &self.types
+    }
+
+    /// The registry, for copying the types of another schema into this one.
+    pub(crate) fn types_mut(&mut self) -> &mut TypeRegistry {
+        &mut self.types
+    }
+
     /// Look up a custom type definition by name.
     /// Custom types are only valid on STRICT tables; pass `is_strict` from the
     /// owning table so that non-STRICT tables never resolve a custom type.
@@ -2170,7 +2181,7 @@ impl Schema {
         if !is_strict {
             return None;
         }
-        self.type_registry.get(&type_registry_key(type_name))
+        self.types.get(type_name)
     }
 
     /// The order values of `type_def` compare in. A domain has the order of
@@ -2247,7 +2258,7 @@ impl Schema {
         // A type that cannot be resolved counts as lossy and has no primitive,
         // so the hint falls back to the type's name.
         let primitive = match self.resolve_type_unchecked(&column.ty_str) {
-            Ok(Some(resolved)) => resolved.primitive,
+            Ok(Some(resolved)) => resolved.primitive.clone(),
             _ => column.ty_str.clone(),
         };
         crate::bail_parse_error!(
@@ -2277,7 +2288,7 @@ impl Schema {
     /// Only use this for operations that aren't column-scoped (e.g. DROP TYPE,
     /// CREATE TABLE validation, CAST).
     pub fn get_type_def_unchecked(&self, type_name: &str) -> Option<&Arc<TypeDef>> {
-        self.type_registry.get(&type_registry_key(type_name))
+        self.types.get(type_name)
     }
 
     /// Resolve a custom type fully: look it up (with strictness gate) and chase
@@ -2287,7 +2298,7 @@ impl Schema {
         &self,
         type_name: &str,
         is_strict: bool,
-    ) -> crate::Result<Option<ResolvedType>> {
+    ) -> crate::Result<Option<Arc<ResolvedType>>> {
         if !is_strict {
             return Ok(None);
         }
@@ -2296,13 +2307,11 @@ impl Schema {
 
     /// Resolve a custom type fully without a strictness check.
     /// Returns `Ok(None)` if the type is not in the registry.
-    pub fn resolve_type_unchecked(&self, type_name: &str) -> crate::Result<Option<ResolvedType>> {
-        let key = type_registry_key(type_name);
-        if !self.type_registry.contains_key(&key) {
-            return Ok(None);
-        }
-        let (primitive, chain) = self.resolve_base_type_chain(type_name)?;
-        Ok(Some(ResolvedType { primitive, chain }))
+    pub fn resolve_type_unchecked(
+        &self,
+        type_name: &str,
+    ) -> crate::Result<Option<Arc<ResolvedType>>> {
+        self.types.resolve(type_name)
     }
 
     /// The plain SQL type the type takes as input: its input type, followed
@@ -2393,38 +2402,7 @@ impl Schema {
     }
 
     pub fn remove_type(&mut self, type_name: &str) {
-        self.type_registry.remove(&type_registry_key(type_name));
-    }
-
-    /// Chase the base type chain: domain_a → domain_b → integer
-    /// Returns (ultimate_primitive, ordered_chain_of_TypeDefs)
-    /// The chain is ordered from child to ancestor.
-    /// Errors on cycles or missing intermediate types.
-    pub fn resolve_base_type_chain(
-        &self,
-        type_name: &str,
-    ) -> crate::Result<(String, Vec<Arc<TypeDef>>)> {
-        let mut chain = vec![];
-        let mut visited = std::collections::HashSet::new();
-        let mut current = type_registry_key(type_name);
-
-        loop {
-            if !visited.insert(current.clone()) {
-                return Err(crate::LimboError::ParseError(format!(
-                    "circular type dependency detected: {current}"
-                )));
-            }
-            match self.type_registry.get(&current) {
-                Some(td) => {
-                    chain.try_push(Arc::clone(td))?;
-                    current = type_registry_key(td.base());
-                }
-                None => {
-                    // current is not in the registry — it's a primitive
-                    return Ok((current, chain));
-                }
-            }
-        }
+        self.types.remove(type_name);
     }
 
     /// Parse a CREATE TYPE SQL string and add the type to the in-memory
@@ -2435,7 +2413,7 @@ impl Schema {
         sql: &str,
         syms: &SymbolTable,
     ) -> crate::Result<()> {
-        self.insert_type_from_sql(dialect, sql)?;
+        self.types.add_from_sql(dialect, sql)?;
         self.update_value_types(syms)
     }
 
@@ -2443,79 +2421,30 @@ impl Schema {
     /// DECODE may call.
     #[cfg(test)]
     pub(crate) fn add_type(&mut self, type_def: TypeDef, syms: &SymbolTable) -> crate::Result<()> {
-        self.type_registry
-            .insert(type_registry_key(&type_def.name), Arc::new(type_def));
+        let name = type_def.name.clone();
+        self.types.insert(&name, Arc::new(type_def));
         self.update_value_types(syms)
-    }
-
-    /// Parse a CREATE TYPE or CREATE DOMAIN SQL string and add the type to the
-    /// in-memory registry without working out the kind its DECODE gives.
-    fn insert_type_from_sql(
-        &mut self,
-        dialect: &dyn crate::dialect::Dialect,
-        sql: &str,
-    ) -> crate::Result<()> {
-        use crate::ast::{Cmd, Stmt};
-
-        let cmd = crate::dialect::parse_statement(dialect, sql);
-        match cmd {
-            Ok(Some(Cmd::Stmt(Stmt::CreateType {
-                type_name, body, ..
-            }))) => {
-                let type_def = TypeDef::from_create_type(
-                    &type_name,
-                    &body,
-                    TypeOrigin::User,
-                    sql.to_string(),
-                )?;
-                self.type_registry
-                    .insert(type_registry_key(&type_name), Arc::new(type_def));
-            }
-            Ok(Some(Cmd::Stmt(Stmt::CreateDomain {
-                domain_name,
-                base_type,
-                default,
-                not_null,
-                constraints,
-                ..
-            }))) => {
-                let type_def = TypeDef::from_domain(
-                    &domain_name,
-                    &base_type,
-                    not_null,
-                    &constraints,
-                    default,
-                    sql.to_string(),
-                );
-                self.type_registry
-                    .insert(type_registry_key(&domain_name), Arc::new(type_def));
-            }
-            _ => {
-                return Err(crate::LimboError::ParseError(format!(
-                    "invalid type sql: {sql}"
-                )));
-            }
-        }
-        Ok(())
     }
 
     /// Works out the kinds of value each newly added type reads as and
     /// stores. A type's kinds can depend on the kinds of the types its
     /// definition names (see type_def_uses_type), so a type is worked out only
     /// after all of those are, whatever order the types were added in. Built-in
-    /// types name their kinds when they are created.
+    /// types name their kinds when they are created. It stays here and not in
+    /// the registry because the kind of a DECODE is the type of an expression,
+    /// which is worked out against the schema.
     fn update_value_types(&mut self, syms: &SymbolTable) -> Result<()> {
-        let mut pending: std::vec::Vec<String> = self
-            .type_registry
-            .iter()
-            .filter(|(_, type_def)| type_def.kinds_pending())
-            .map(|(key, _)| key.clone())
-            .collect();
-        pending.sort();
+        let result = self.work_out_pending_kinds(syms);
+        self.types.rebuild_chains();
+        result
+    }
+
+    fn work_out_pending_kinds(&mut self, syms: &SymbolTable) -> Result<()> {
+        let pending = self.types.keys_with_pending_kinds();
         // For each pending type, the other pending types its definition names.
         let mut waits_for: std::vec::Vec<(String, std::vec::Vec<String>)> = std::vec::Vec::new();
         for key in &pending {
-            let type_def = &self.type_registry[key];
+            let type_def = self.types.under_key(key);
             let mut names = std::vec::Vec::new();
             for other in &pending {
                 if type_def_uses_type(type_def, other)? {
@@ -2529,12 +2458,12 @@ impl Schema {
                 waits_for.into_iter().partition(|(_, names)| {
                     names
                         .iter()
-                        .all(|name| !self.type_registry[name].kinds_pending())
+                        .all(|name| !self.types.under_key(name).kinds_pending())
                 });
             if ready.is_empty() {
                 let names: std::vec::Vec<&str> = waiting
                     .iter()
-                    .map(|(key, _)| self.type_registry[key].name.as_str())
+                    .map(|(key, _)| self.types.under_key(key).name.as_str())
                     .collect();
                 return Err(LimboError::ParseError(match names.as_slice() {
                     [name] => format!("cannot tell the kinds of type {name}: it names itself"),
@@ -2545,7 +2474,7 @@ impl Schema {
                 }));
             }
             for (key, _) in ready {
-                let type_def = &self.type_registry[&key];
+                let type_def = self.types.under_key(&key);
                 let Some(stored) = stored_value_type(type_def, self) else {
                     return Err(LimboError::ParseError(format!(
                         "cannot tell what kind of value type {} stores",
@@ -2558,28 +2487,42 @@ impl Schema {
                         type_def.name
                     )));
                 };
-                let mut updated = (**type_def).clone();
-                updated.set_kinds(ValueKinds { read, stored });
-                self.type_registry.insert(key, Arc::new(updated));
+                self.types.set_kinds(&key, ValueKinds { read, stored });
             }
             waits_for = waiting;
         }
         Ok(())
     }
 
-    /// Load type definitions from CREATE TYPE SQL strings and resolve custom
-    /// type affinities on all STRICT tables.
-    fn load_type_definitions(
+    /// Loads the types of the CREATE TYPE and CREATE DOMAIN statements of the
+    /// custom types table.
+    fn load_stored_types(
         &mut self,
         dialect: &dyn crate::dialect::Dialect,
         type_sqls: &[String],
         syms: &SymbolTable,
     ) -> crate::Result<()> {
         for sql in type_sqls {
-            self.insert_type_from_sql(dialect, sql).map_err(|e| {
-                crate::LimboError::Corrupt(format!("malformed database schema - {e}"))
-            })?;
+            self.add_stored_type(dialect, sql)?;
         }
+        self.finish_stored_types(syms)
+    }
+
+    /// Adds the type of one statement of the custom types table. Call
+    /// [`Self::finish_stored_types`] after the last one.
+    pub(crate) fn add_stored_type(
+        &mut self,
+        dialect: &dyn crate::dialect::Dialect,
+        sql: &str,
+    ) -> crate::Result<()> {
+        self.types
+            .add_from_sql(dialect, sql)
+            .map_err(|e| crate::LimboError::Corrupt(format!("malformed database schema - {e}")))
+    }
+
+    /// Works out the kinds of the types that [`Self::add_stored_type`] added,
+    /// and resolves custom type affinities on all STRICT tables.
+    pub(crate) fn finish_stored_types(&mut self, syms: &SymbolTable) -> crate::Result<()> {
         self.update_value_types(syms)
             .map_err(|e| crate::LimboError::Corrupt(format!("malformed database schema - {e}")))?;
         self.resolve_all_custom_type_affinities()?;
@@ -4180,8 +4123,61 @@ impl Schema {
             self.refuse_custom_types()?;
         }
         if !type_sqls.is_empty() {
-            self.load_type_definitions(dialect, type_sqls, syms)?;
+            self.load_stored_types(dialect, type_sqls, syms)?;
         }
+        self.build_views_then_indices(
+            dialect,
+            syms,
+            materialized_view_info,
+            dbsp_state_roots,
+            dbsp_state_index_roots,
+            from_sql_indexes,
+            automatic_indices,
+            mvcc_enabled,
+        )
+    }
+
+    /// [`Self::populate_types_views_then_indices`] for a schema that holds
+    /// every stored type already.
+    #[allow(clippy::too_many_arguments)]
+    pub fn populate_views_then_indices(
+        &mut self,
+        dialect: &dyn crate::dialect::Dialect,
+        syms: &SymbolTable,
+        materialized_view_info: HashMap<String, StoredMaterializedView>,
+        dbsp_state_roots: HashMap<String, i64>,
+        dbsp_state_index_roots: HashMap<String, i64>,
+        from_sql_indexes: Vec<UnparsedFromSqlIndex>,
+        automatic_indices: HashMap<String, Vec<(String, i64)>>,
+        mvcc_enabled: bool,
+    ) -> Result<()> {
+        if !self.custom_types_enabled {
+            self.refuse_custom_types()?;
+        }
+        self.build_views_then_indices(
+            dialect,
+            syms,
+            materialized_view_info,
+            dbsp_state_roots,
+            dbsp_state_index_roots,
+            from_sql_indexes,
+            automatic_indices,
+            mvcc_enabled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_views_then_indices(
+        &mut self,
+        dialect: &dyn crate::dialect::Dialect,
+        syms: &SymbolTable,
+        materialized_view_info: HashMap<String, StoredMaterializedView>,
+        dbsp_state_roots: HashMap<String, i64>,
+        dbsp_state_index_roots: HashMap<String, i64>,
+        from_sql_indexes: Vec<UnparsedFromSqlIndex>,
+        automatic_indices: HashMap<String, Vec<(String, i64)>>,
+        mvcc_enabled: bool,
+    ) -> Result<()> {
         if !self.namespace_names_loaded && !materialized_view_info.is_empty() {
             // A view body names tables by their namespace, so the views wait
             // for the names of the namespaces. No index is on a view: CREATE
@@ -5219,7 +5215,7 @@ impl TryClone for Schema {
             pending_materialized_views: self.pending_materialized_views.clone(),
             dialect_schema: self.dialect_schema.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
-            type_registry: self.type_registry.try_clone()?,
+            types: self.types.try_clone()?,
             custom_types_enabled: self.custom_types_enabled,
         })
     }

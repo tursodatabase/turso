@@ -144,7 +144,7 @@ pub(crate) fn translate_in_lhs_for_element(
     element: &ast::Expr,
     resolver: &Resolver,
 ) -> Result<usize> {
-    if resolver.schema().type_registry.is_empty() {
+    if resolver.schema().types().is_empty() {
         return Ok(lhs_reg);
     }
     let mut converted = Vec::new();
@@ -218,7 +218,7 @@ pub(crate) fn translate_compared_args(
             program,
             referenced_tables,
             arg,
-            values_type.as_ref(),
+            values_type.as_deref(),
             reg,
             resolver,
         )? {
@@ -240,9 +240,9 @@ pub(crate) fn untyped_values_type<'e>(
     values: impl Iterator<Item = &'e ast::Expr> + Clone,
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
-) -> Result<Option<ResolvedType>> {
+) -> Result<Option<Arc<ResolvedType>>> {
     let schema = resolver.schema();
-    if schema.type_registry.is_empty() {
+    if schema.types().is_empty() {
         return Ok(None);
     }
     let mut has_untyped_value = false;
@@ -394,7 +394,7 @@ pub(crate) fn untyped_operand_type(
     other: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
-) -> Result<Option<ResolvedType>> {
+) -> Result<Option<Arc<ResolvedType>>> {
     read_untyped_operand_as(operand, resolver.schema(), || {
         Ok(type_of(other, &TypeEnv::new(referenced_tables, resolver)))
     })
@@ -407,8 +407,8 @@ pub(crate) fn read_untyped_operand_as(
     operand: &ast::Expr,
     schema: &crate::schema::Schema,
     other_type: impl FnOnce() -> Result<ExprType>,
-) -> Result<Option<ResolvedType>> {
-    if schema.type_registry.is_empty() || !is_untyped_operand(operand)? {
+) -> Result<Option<Arc<ResolvedType>>> {
+    if schema.types().is_empty() || !is_untyped_operand(operand)? {
         return Ok(None);
     }
     untyped_operands_read_as(schema, other_type()?)
@@ -419,7 +419,7 @@ pub(crate) fn read_untyped_operand_as(
 fn untyped_operands_read_as(
     schema: &crate::schema::Schema,
     other_type: ExprType,
-) -> Result<Option<ResolvedType>> {
+) -> Result<Option<Arc<ResolvedType>>> {
     let type_def = match other_type {
         ExprType::Custom { type_def, .. } => type_def,
         // An array compares in its own order, which converts the other operand.

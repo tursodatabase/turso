@@ -15367,10 +15367,9 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                         schema.schema_version = cookie;
                     }
                     // The schema already holds every stored type.
-                    schema.populate_types_views_then_indices(
+                    schema.populate_views_then_indices(
                         dialect.as_ref(),
                         &syms,
-                        &[],
                         materialized_view_info,
                         dbsp_state_roots,
                         dbsp_state_index_roots,

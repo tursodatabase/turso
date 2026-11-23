@@ -1879,16 +1879,7 @@ fn query_pragma(
             // Custom types from the type registry are only shown when strict mode is enabled
             // Custom types are always shown since strict mode is always enabled
             {
-                // Skip aliases where key != canonical name
-                let mut type_names: Vec<_> = schema
-                    .type_registry
-                    .iter()
-                    .filter(|(key, td)| *key == &td.name.to_lowercase())
-                    .map(|(key, _)| key)
-                    .collect();
-                type_names.sort();
-                for type_name in type_names {
-                    let type_def = &schema.type_registry[type_name];
+                for type_def in schema.types().types_by_name() {
                     let display_name = if type_def.params().is_empty() {
                         type_def.name.clone()
                     } else {

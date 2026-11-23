@@ -2819,10 +2819,9 @@ impl Connection {
             }
 
             // The schema already holds every stored type.
-            match schema.populate_types_views_then_indices(
+            match schema.populate_views_then_indices(
                 self.dialect().as_ref(),
                 &syms,
-                &[],
                 materialized_view_info,
                 dbsp_state_roots,
                 dbsp_state_index_roots,
@@ -3458,7 +3457,7 @@ impl Connection {
         let syms = self.syms.read();
         self.with_schema(MAIN_DB_ID, |schema| {
             schema
-                .type_registry
+                .types()
                 .iter()
                 .map(|(name, type_def)| {
                     let decoded =
