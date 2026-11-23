@@ -2241,8 +2241,10 @@ impl Schema {
     }
 
     /// Whether `resolved` is a type that reads text and has an ENCODE, such as
-    /// date or json, in a dialect that refuses values of any other kind for
-    /// such a type (see `Dialect::text_input_types_refuse_other_kinds`). The
+    /// date or json, in a dialect that refuses a CAST from such a type to a
+    /// type that does not read text (see
+    /// `Dialect::text_input_types_refuse_other_kinds`). A number stored into
+    /// or cast to such a type is not refused; it is read as its text. The
     /// check looks at what the type declares, not at its name.
     pub fn refuses_non_text_input(
         &self,
