@@ -1002,3 +1002,38 @@ expect {
 expect @tursopg error {
     cannot compare type timestamp with type timestamptz
 }
+
+# PostgreSQL has no casts between date or time types and numbers, so a number
+# is not read as the text '20200101', and the text of a date is not read as a
+# number: the first would give a date, the second 2020.
+test cast-integer-to-date-errors {
+    SELECT 20200101::date;
+}
+@sqlstate 42846
+expect error {
+    cannot cast
+}
+
+test cast-date-to-integer-errors {
+    SELECT date '2020-01-01'::int;
+}
+@sqlstate 42846
+expect error {
+    cannot cast
+}
+
+test cast-timestamptz-to-float8-errors {
+    SELECT timestamptz '2020-01-01 00:00:00+00'::float8;
+}
+@sqlstate 42846
+expect error {
+    cannot cast
+}
+
+# PostgreSQL gives 42804 here and tursopg 42846, so no SQLSTATE is checked.
+test insert-integer-into-timestamp-column-errors {
+    CREATE TABLE t (ts timestamp);
+    INSERT INTO t VALUES (20200101);
+}
+expect error {
+}

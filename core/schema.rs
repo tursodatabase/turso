@@ -2313,6 +2313,29 @@ impl Schema {
         self.plain_value_type(&resolved.leaf().name, resolved.input_type())
     }
 
+    /// Whether `resolved` is a type that reads text and has an ENCODE, such as
+    /// date or json, in a dialect that refuses values of any other kind for
+    /// such a type (see `Dialect::text_input_types_refuse_other_kinds`). The
+    /// check looks at what the type declares, not at its name.
+    pub fn refuses_non_text_input(
+        &self,
+        resolved: &ResolvedType,
+        dialect: &dyn crate::dialect::Dialect,
+    ) -> Result<bool> {
+        if !dialect.text_input_types_refuse_other_kinds() {
+            return Ok(false);
+        }
+        let has_encode = resolved
+            .chain
+            .iter()
+            .any(|type_def| type_def.encode().is_some());
+        Ok(has_encode
+            && matches!(
+                self.plain_input_type(resolved)?,
+                StrictType::Stores(crate::types::StorageClass::Text)
+            ))
+    }
+
     /// The plain SQL type that `value_type`, the value type of type
     /// `type_name`, leads to through custom types. `type_name` need not be in
     /// the schema yet, so CREATE TYPE can check its own value type.
@@ -5885,12 +5908,14 @@ impl BTreeTable {
 
     /// Create a table ref for pre-encode TypeCheck that validates user input
     /// against the type's declared `value` input type (or base if not declared).
+    /// A type that refuses values that are not text keeps its input as it is.
     /// For UPDATE, `only_columns` limits which columns are checked — non-SET
     /// columns hold encoded values and must be skipped (set to ANY).
     pub fn input_type_check_table_ref(
         table: &Arc<BTreeTable>,
         schema: &Schema,
         only_columns: Option<&ColumnMask>,
+        dialect: &dyn crate::dialect::Dialect,
     ) -> Result<Arc<BTreeTable>> {
         let has_custom = table
             .columns
@@ -5914,6 +5939,14 @@ impl BTreeTable {
                 col.ty_str = "ANY".to_string();
                 col.override_affinity(Affinity::Blob);
             } else if let Some(resolved) = schema.resolve_type(&col.ty_str, table.is_strict)? {
+                if schema.refuses_non_text_input(&resolved, dialect)? {
+                    // A STRICT TEXT column would turn 20200101 into the text
+                    // 20200101, which the type reads as a date. The check of
+                    // the type's ENCODE refuses a value that is not text.
+                    col.ty_str = "ANY".to_string();
+                    col.override_affinity(Affinity::Blob);
+                    continue;
+                }
                 col.ty_str = schema.plain_input_type(&resolved)?.name().to_string();
             }
         }

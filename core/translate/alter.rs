@@ -2614,6 +2614,7 @@ fn emit_strict_column_conversion(
             &rewritten_table,
             resolver.schema(),
             Some(&column_mask),
+            &*resolver.catalog.dialect,
         )?,
     });
     crate::translate::expr::emit_custom_type_encode_columns(

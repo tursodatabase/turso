@@ -1078,6 +1078,7 @@ fn emit_input_type_check(
             btree,
             resolver.schema(),
             Some(updated_column_indices),
+            &*resolver.catalog.dialect,
         )?,
     });
     Ok(())

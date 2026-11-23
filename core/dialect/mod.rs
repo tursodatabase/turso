@@ -618,6 +618,18 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a custom type that reads text and has an ENCODE (such as date,
+    /// timestamp, json or inet) is refused a value of any other kind, and a
+    /// CAST from such a type is refused when its target does not read text.
+    ///
+    /// PostgreSQL has no cast between these types and numbers, booleans or
+    /// bytea: `20200101::date` and `date '2020-01-01'::int` fail. SQLite
+    /// converts the value to text, or reads the text as a number, so the
+    /// first gives 2020-01-01 and the second 2020, which are wrong answers.
+    fn text_input_types_refuse_other_kinds(&self) -> bool {
+        false
+    }
+
     /// Whether constraint errors report the values that broke the constraint.
     ///
     /// PostgreSQL shows them in the error DETAIL, so custom type and array

@@ -55,6 +55,7 @@ pub const SQLSTATE_INVALID_RECURSION: &str = "42P19";
 pub const SQLSTATE_GROUPING_ERROR: &str = "42803";
 pub const SQLSTATE_WINDOWING_ERROR: &str = "42P20";
 pub const SQLSTATE_DATATYPE_MISMATCH: &str = "42804";
+pub const SQLSTATE_CANNOT_COERCE: &str = "42846";
 pub const SQLSTATE_WRONG_OBJECT_TYPE: &str = "42809";
 pub const SQLSTATE_RESERVED_NAME: &str = "42939";
 pub const SQLSTATE_DISK_FULL: &str = "53100";

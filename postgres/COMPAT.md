@@ -118,6 +118,10 @@ column defaults in `pg_attrdef.adbin`, as PostgreSQL does for the forms the
 manual lists under `CREATE POLICY`, and return TursoPG's stored SQL for
 other forms; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
+Casting a value that is not text to date, time, timestamp or timestamptz, or
+from one of them to a type that does not read text, fails with 42846, and so
+does assigning such a value to a column of these types (PostgreSQL gives
+42804 for the assignment); `date::json` and `date::inet` are still accepted.
 `pg_input_is_valid`, `to_char` (numeric; other argument types fail with
 0A000), `now`/`clock_timestamp`/
 `transaction_timestamp`/`statement_timestamp`. `to_timestamp` fails with 0A000.

@@ -380,6 +380,8 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_COLUMN
     } else if msg.contains("no such function") || msg.contains("no such window") {
         SQLSTATE_UNDEFINED_FUNCTION
+    } else if msg.starts_with("cannot cast type ") {
+        SQLSTATE_CANNOT_COERCE
     } else if msg.starts_with("cannot compare type ") {
         // tursopg refuses comparisons that PostgreSQL may run, and it does not know
         // which ones. PostgreSQL itself reports 42883 for some of these, so this
@@ -501,6 +503,8 @@ fn sql_error_sqlstate(msg: &str) -> &'static str {
 fn raise_sqlstate(msg: &str) -> &'static str {
     if msg.starts_with("invalid input value for enum ") {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
+    } else if msg.starts_with("cannot cast a value that is not text to type ") {
+        SQLSTATE_CANNOT_COERCE
     } else if msg == "integer out of range for smallint" {
         SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
     } else if msg == "value too long for varchar" {

@@ -839,6 +839,7 @@ pub fn emit_upsert(
                     &bt,
                     resolver.schema(),
                     None,
+                    &*resolver.catalog.dialect,
                 )?,
             });
         } else {

@@ -858,6 +858,7 @@ pub fn translate_insert(
                     ctx.table,
                     resolver.schema(),
                     None,
+                    &*resolver.catalog.dialect,
                 )?,
             });
 

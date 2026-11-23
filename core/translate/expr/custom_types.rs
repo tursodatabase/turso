@@ -1,5 +1,6 @@
 use super::*;
 use crate::schema::ResolvedType;
+use crate::types::{StorageClass, StrictType};
 
 /// Get the effective type name of a literal expression.
 pub(super) fn literal_type_name(expr: &ast::Expr) -> Option<&'static str> {
@@ -674,7 +675,8 @@ pub(crate) enum Coerce<'a> {
 /// 5, and one whose ENCODE gives 'abc' is an error. COERCE sees the converted
 /// value too. A CAST runs the same. NULL is left as it is, without running
 /// ENCODE; a domain's NOT NULL is checked afterwards, by the column's NOT NULL
-/// constraint or by the CAST.
+/// constraint or by the CAST. A type that refuses values that are not text
+/// (see [refuses_non_text_input]) fails on any other kind first.
 pub(crate) fn emit_store_value(
     program: &mut ProgramBuilder,
     resolved: &ResolvedType,
@@ -696,6 +698,7 @@ pub(crate) fn emit_store_value(
         reg,
         target_pc: skip_label,
     });
+    emit_refuse_non_text_input(program, resolved, reg, resolver)?;
     for type_def in &resolved.chain {
         if let Some(encode) = type_def.encode() {
             emit_type_expr(program, encode, reg, reg, resolver)?;
@@ -712,6 +715,86 @@ pub(crate) fn emit_store_value(
     program.emit_insn(convert);
     program.preassign_label_to_next_insn(skip_label);
     Ok(())
+}
+
+/// Emits the check that the value in `reg`, when it is not NULL, is text if
+/// `resolved` refuses other kinds (see [refuses_non_text_input]). Every store
+/// of a value into such a type runs it first, before any conversion to text
+/// turns 20200101 into '20200101', which date would read as a date.
+fn emit_refuse_non_text_input(
+    program: &mut ProgramBuilder,
+    resolved: &ResolvedType,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    if !refuses_non_text_input(resolved, resolver)? {
+        return Ok(());
+    }
+    let is_text = program.allocate_label();
+    program.emit_insn(Insn::IsType {
+        reg,
+        target_pc: is_text,
+        value_type: crate::types::ValueType::Text,
+    });
+    program.emit_insn(Insn::Halt {
+        constraint_info: None,
+        err_code: SQLITE_ERROR,
+        description: format!(
+            "cannot cast a value that is not text to type {}",
+            resolved.leaf().name
+        ),
+        on_error: Some(ResolveType::Abort),
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(is_text);
+    Ok(())
+}
+
+/// Fails when a CAST of a value of the custom type `source` to `target`, which
+/// `custom_type_cast_chain` resolves for a custom type and is None for a plain
+/// type written as `target_name`, would read the text of `source` as another
+/// kind: `date '2020-01-01'::int` is 2020 in SQLite. Only a target that reads
+/// text takes the text of such a source.
+pub(crate) fn check_cast_from_text_input_type(
+    source: &ExprType,
+    target: Option<&ResolvedType>,
+    target_name: &ast::Type,
+    resolver: &Resolver,
+) -> Result<()> {
+    let ExprType::Custom { type_def, .. } = source else {
+        return Ok(());
+    };
+    let Some(source_resolved) = resolver.schema().resolve_type_unchecked(&type_def.name)? else {
+        return Ok(());
+    };
+    if !refuses_non_text_input(&source_resolved, resolver)? {
+        return Ok(());
+    }
+    let target_reads_text = match target {
+        Some(resolved) => matches!(
+            resolver.schema().plain_input_type(resolved)?,
+            StrictType::Stores(StorageClass::Text)
+        ),
+        None => {
+            target_name.array_dimensions == 0
+                && Affinity::of_written_type(&crate::util::dequote(&target_name.name))
+                    == Affinity::Text
+        }
+    };
+    if target_reads_text {
+        return Ok(());
+    }
+    Err(LimboError::ParseError(format!(
+        "cannot cast type {source} to type {}",
+        crate::util::dequote(&target_name.name)
+    )))
+}
+
+/// [Schema::refuses_non_text_input] for the dialect of the statement.
+pub(crate) fn refuses_non_text_input(resolved: &ResolvedType, resolver: &Resolver) -> Result<bool> {
+    resolver
+        .schema()
+        .refuses_non_text_input(resolved, &*resolver.catalog.dialect)
 }
 
 /// Emits what comparing the value in `reg` with stored values of `chain`'s

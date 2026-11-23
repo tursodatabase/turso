@@ -91,7 +91,7 @@ expect @tursopg {
     at 2026-01-31 10:00:00
 }
 
-# tursopg stores the integer 20260101 as 2026-01-01 00:00:00+00; PostgreSQL rejects it.
+# tursopg rejects the integer too, with 42846 where PostgreSQL gives 42804.
 @compat-gap "cast:int4 -> timestamptz"
 test insert-integer-into-timestamptz {
     CREATE TABLE t (created_at timestamptz);
@@ -100,9 +100,8 @@ test insert-integer-into-timestamptz {
 }
 @sqlstate 42804
 expect error {}
-expect @tursopg {
-    2026-01-01 00:00:00+00
-}
+@sqlstate 42846
+expect @tursopg error {}
 
 @compat-gap "cast:int4 -> timestamptz"
 test insert-select-integer-into-timestamptz {
@@ -111,9 +110,8 @@ test insert-select-integer-into-timestamptz {
 }
 @sqlstate 42804
 expect error {}
-expect @tursopg {
-    2026-01-01 00:00:00+00
-}
+@sqlstate 42846
+expect @tursopg error {}
 
 @compat-gap "operator:timestamptz > int4"
 test compare-timestamptz-with-integer {
@@ -133,7 +131,7 @@ test update-timestamptz-to-integer {
 }
 @sqlstate 42804
 expect error {}
-@sqlstate 22007
+@sqlstate 42846
 expect @tursopg error {}
 
 # PostgreSQL has no assignment cast from text to timestamptz.
@@ -159,15 +157,11 @@ expect @tursopg {
     0
 }
 
-@compat-gap "cast:timestamptz -> int8"
 test timestamptz-cast-to-bigint {
     SELECT timestamptz '2026-01-31Z'::bigint;
 }
 @sqlstate 42846
 expect error {}
-expect @tursopg {
-    2026
-}
 
 @compat-gap "type:timestamptz"
 test timestamptz-offset-out-of-range {
