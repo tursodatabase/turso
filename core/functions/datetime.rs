@@ -1579,9 +1579,13 @@ fn arg_as_text(value: ValueRef<'_>) -> ValueRef<'_> {
 /// Append `value` as `write!(res, "{value:0width$}")` does: zero padded to
 /// `width` characters, with the sign counted in the width.
 fn push_zero_padded(res: &mut String, value: i64, width: usize) {
-    // Most date and time fields are two or four digits with no sign.
+    // Most date and time fields are two, three or four digits with no sign.
     match (width, u16::try_from(value)) {
         (2, Ok(value @ 0..=99)) => push_two_digits(res, value),
+        (3, Ok(value @ 0..=999)) => {
+            res.push(char::from(b'0' + (value / 100) as u8));
+            push_two_digits(res, value % 100);
+        }
         (4, Ok(value @ 0..=9999)) => {
             push_two_digits(res, value / 100);
             push_two_digits(res, value % 100);
@@ -1590,15 +1594,31 @@ fn push_zero_padded(res: &mut String, value: i64, width: usize) {
     }
 }
 
+/// The numbers from 0 to 99, each as two digits.
+const TWO_DIGITS: &str = concat!(
+    "0001020304050607080910111213141516171819",
+    "2021222324252627282930313233343536373839",
+    "4041424344454647484950515253545556575859",
+    "6061626364656667686970717273747576777879",
+    "8081828384858687888990919293949596979899",
+);
+
 /// Append `value`, which is less than 100, as two digits.
+#[inline(always)]
 fn push_two_digits(res: &mut String, value: u16) {
-    let digit = |digit: u16| {
-        char::from_digit(u32::from(digit), 10).expect("a number less than 100 has two digits")
-    };
-    res.push(digit(value / 10));
-    res.push(digit(value % 10));
+    // One `push_str` copies both digits, where a `push` for each digit
+    // checks the capacity two times.
+    let start = usize::from(value) * 2;
+    res.push_str(&TWO_DIGITS[start..start + 2]);
 }
 
+/// Append `value` as `push_zero_padded` does, for the widths and values that
+/// `push_zero_padded` does not format itself.
+///
+/// Not inlined: `push_zero_padded` is inlined at each date and time field, and
+/// a copy of this function at each field makes the code larger for values
+/// that are rare.
+#[inline(never)]
 fn push_zero_padded_any_width(res: &mut String, value: i64, width: usize) {
     let mut buf = [0u8; 20];
     let digits = crate::numeric::write_decimal_digits(&mut buf, value.unsigned_abs());
