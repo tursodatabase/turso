@@ -5068,6 +5068,156 @@ fn test_nonunique_index_join_reuses_btree_position() {
 }
 
 #[test]
+fn test_integrity_check_after_text_primary_key_replacements_has_bounded_work() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let n = 512;
+    conn.execute("PRAGMA mvcc_checkpoint_threshold=-1").unwrap();
+    conn.execute("CREATE TABLE items(k TEXT PRIMARY KEY, v TEXT)")
+        .unwrap();
+    for i in 1..=n {
+        conn.execute(format!("INSERT INTO items VALUES ('key-{i}','payload')"))
+            .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    for i in 1..=n {
+        conn.execute(format!(
+            "DELETE FROM items WHERE k='key-{i}'; \
+             INSERT INTO items VALUES ('key-{i}','payload')"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    let steps = Arc::new(SeekBtreeSteps::default());
+    conn.set_yield_injector(Some(steps.clone()));
+    let result = get_rows(&conn, "PRAGMA integrity_check");
+    conn.set_yield_injector(None);
+    assert_eq!(result, vec![vec![Value::from_text("ok")]]);
+    let work = steps.total.load(Ordering::Relaxed);
+    assert!(
+        work <= 16 * n,
+        "integrity checking {n} replaced text keys took {work} B-tree progress events"
+    );
+}
+
+#[test]
+fn test_nonunique_index_join_after_replacements_has_bounded_work() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let n = 128;
+    conn.execute("PRAGMA mvcc_checkpoint_threshold=-1").unwrap();
+    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, k TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX ik ON items(k)").unwrap();
+    for i in 1..=n {
+        conn.execute(format!("INSERT INTO items VALUES ({i},'{i:08}')"))
+            .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    for i in 1..=n {
+        conn.execute(format!(
+            "DELETE FROM items WHERE k='{i:08}'; \
+             INSERT INTO items VALUES ({i},'{i:08}')"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    let sql = "SELECT count(*) FROM items a JOIN items b INDEXED BY ik ON b.k=a.k";
+    let plan = get_rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+    assert!(
+        plan.iter()
+            .flatten()
+            .any(|value| value.to_string() == "SEARCH b USING COVERING INDEX ik (k=?)"),
+        "{plan:?}"
+    );
+    let steps = Arc::new(SeekBtreeSteps::default());
+    conn.set_yield_injector(Some(steps.clone()));
+    let result = get_rows(&conn, sql);
+    conn.set_yield_injector(None);
+    assert_eq!(result, vec![vec![Value::from_i64(n as i64)]]);
+    let work = steps.total.load(Ordering::Relaxed);
+    assert!(
+        work <= 16 * n,
+        "joining {n} replaced text keys took {work} B-tree progress events"
+    );
+}
+
+#[test]
+fn test_index_join_with_new_memory_keys_before_hidden_entries_has_bounded_work() {
+    assert_index_join_after_rewrite_work(false);
+}
+
+#[test]
+fn test_index_join_after_same_key_replacements_has_bounded_work() {
+    assert_index_join_after_rewrite_work(true);
+}
+
+fn assert_index_join_after_rewrite_work(same_keys: bool) {
+    let mut work_by_size = Vec::new();
+    for unique in [false, true] {
+        for n in [64, 128] {
+            let db = MvccTestDbNoConn::new_with_random_db();
+            let conn = db.connect();
+            conn.execute(
+                "PRAGMA mvcc_checkpoint_threshold=-1; \
+                 CREATE TABLE a(id INTEGER PRIMARY KEY, v INTEGER); \
+                 CREATE TABLE b(id INTEGER PRIMARY KEY, v INTEGER)",
+            )
+            .unwrap();
+            let unique_sql = if unique { "UNIQUE" } else { "" };
+            conn.execute(format!("CREATE {unique_sql} INDEX b_v ON b(v)"))
+                .unwrap();
+            let populate_b = format!(
+                "WITH RECURSIVE s(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM s WHERE x<{n}) \
+                 INSERT INTO b SELECT x,x FROM s"
+            );
+            conn.execute(&populate_b).unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            let probe = if same_keys {
+                conn.execute("DELETE FROM b").unwrap();
+                conn.execute(&populate_b).unwrap();
+                format!("{n}+1-x")
+            } else {
+                conn.execute("UPDATE b SET v=-v").unwrap();
+                "-x".to_owned()
+            };
+            conn.execute(format!(
+                "WITH RECURSIVE s(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM s WHERE x<{n}) \
+                 INSERT INTO a SELECT x,{probe} FROM s"
+            ))
+            .unwrap();
+            let sql = "SELECT count(*),sum(b.id) FROM a CROSS JOIN b INDEXED BY b_v WHERE b.v=a.v";
+            let plan = get_rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+            assert!(
+                plan.iter()
+                    .flatten()
+                    .any(|value| value.to_string() == "SEARCH b USING COVERING INDEX b_v (v=?)"),
+                "{plan:?}"
+            );
+            let steps = Arc::new(SeekBtreeSteps::default());
+            conn.set_yield_injector(Some(steps.clone()));
+            let result = get_rows(&conn, sql);
+            conn.set_yield_injector(None);
+            assert_eq!(
+                result,
+                vec![vec![Value::from_i64(n), Value::from_i64(n * (n + 1) / 2)]]
+            );
+            work_by_size.push((unique, n, steps.total.load(Ordering::Relaxed)));
+        }
+    }
+    for &(unique, n, work) in &work_by_size {
+        assert!(
+            work <= 16 * n as u64,
+            "index join over {n} rewritten keys (unique={unique}) took {work} B-tree progress events, all (unique, size, work): {work_by_size:?}"
+        );
+    }
+}
+
+#[test]
 fn test_unique_index_probes_bound_seek_work_lookup() {
     for memory in [false, true] {
         assert_unique_index_probe_seek_work(
@@ -5144,6 +5294,13 @@ fn assert_unique_index_probe_seek_work(query: &str, probes: u64, result_kind: u8
         seek_progress <= limit,
         "repeated UNIQUE lookup seek work: {seek_progress} > {limit}"
     );
+    if !memory && result_kind == 1 {
+        let seek_starts = steps.seek_starts.load(Ordering::Relaxed);
+        assert!(
+            seek_starts <= probes,
+            "{probes} physical UNIQUE join probes started {seek_starts} cursor seeks"
+        );
+    }
 }
 
 /// What this test checks: An exact rowid seek over checkpointed rows that newer versions shadow

@@ -5382,6 +5382,214 @@ fn owned_cursor_record(record: crate::types::ImmutableRecordRef<'_>) -> Vec<Valu
     record.get_values_owned().unwrap()
 }
 
+#[rstest::rstest]
+#[case::memory_before_physical(&[30, 50], 20, None, &[20, 30, 50])]
+#[case::memory_replaces_physical(&[30, 50], 30, None, &[30, 50])]
+#[case::physical_before_memory(&[10, 30, 50], 20, None, &[10, 20, 30, 50])]
+#[case::hidden_physical_before_memory(&[10, 30, 50], 20, Some(10), &[20, 30, 50])]
+fn test_fresh_index_next_merges_all_rows(
+    #[case] physical_rowids: &[i64],
+    #[case] memory_rowid: i64,
+    #[case] hidden_rowid: Option<i64>,
+    #[case] expected: &[i64],
+    #[values(false, true)] unique: bool,
+    #[values(false, true)] yields: bool,
+) {
+    let fixture = CursorTestFixture::integer_rows(
+        Some(unique),
+        physical_rowids.iter().map(|&rowid| (rowid, rowid)),
+    );
+    fixture.insert_integer_rows([(memory_rowid, memory_rowid)]);
+    if let Some(rowid) = hidden_rowid {
+        fixture.delete_integer_index_row(rowid, rowid);
+    }
+    let conn = &fixture.db.conn;
+    let mut cursor = fixture.cursor();
+    let actual = with_cursor_yields(conn, yields, || {
+        conn.db.io.block(|| cursor.next()).unwrap();
+        rowids_from_current_row(conn, &mut cursor, false)
+    });
+    assert_eq!(actual, expected);
+    drop(cursor);
+
+    let mut cursor = fixture.cursor();
+    let actual = with_cursor_yields(conn, yields, || {
+        conn.db.io.block(|| cursor.prev()).unwrap();
+        assert_eq!(conn.db.io.block(|| cursor.rowid()).unwrap(), None);
+        conn.db.io.block(|| cursor.last()).unwrap();
+        rowids_from_current_row(conn, &mut cursor, true)
+    });
+    let expected: Vec<_> = expected.iter().rev().copied().collect();
+    assert_eq!(actual, expected);
+    drop(cursor);
+    fixture.rollback();
+}
+
+#[rstest::rstest]
+fn test_index_range_scan_reuses_deferred_physical_position(#[values(false, true)] backwards: bool) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let n = 64;
+    let fixture = CursorTestFixture::integer_rows(Some(false), (1..=n).map(|id| (id, 2 * id)));
+    fixture.insert_integer_rows((1..=n).map(|id| (n + id, 2 * id - 1)));
+    for id in 1..=n {
+        fixture.delete_integer_index_row(id, 2 * id);
+    }
+    let conn = &fixture.db.conn;
+    let target = if backwards { 2 * n - 1 } else { 1 };
+    let record = CursorTestFixture::integer_record(true, n + (target + 1) / 2, target);
+    let op = if backwards {
+        SeekOp::LE { eq_only: false }
+    } else {
+        SeekOp::GE { eq_only: false }
+    };
+    let mut cursor = fixture.cursor();
+    let steps = Arc::new(SeekBtreeSteps::default());
+    conn.set_yield_injector(Some(steps.clone()));
+    let result = conn
+        .db
+        .io
+        .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+        .unwrap();
+    assert!(matches!(result, SeekResult::Found));
+    let mut actual = Vec::new();
+    for _ in 0..=n {
+        let Some(rowid) = conn.db.io.block(|| cursor.rowid()).unwrap() else {
+            break;
+        };
+        actual.push(rowid);
+        if backwards {
+            conn.db.io.block(|| cursor.prev()).unwrap();
+        } else {
+            conn.db.io.block(|| cursor.next()).unwrap();
+        }
+    }
+    conn.set_yield_injector(None);
+    let mut expected: Vec<_> = (n + 1..=2 * n).collect();
+    if backwards {
+        expected.reverse();
+    }
+    assert_eq!(actual, expected);
+    let seeks = steps.seek_progress.load(Ordering::Relaxed);
+    assert!(
+        seeks <= 4,
+        "scanning {n} memory rows should not repeat the initial B-tree seek, got {seeks} progress events"
+    );
+    drop(cursor);
+    fixture.rollback();
+}
+
+#[rstest::rstest]
+fn test_deferred_physical_copy_of_current_row_is_not_repeated(
+    #[values(false, true)] backwards: bool,
+    #[values(false, true)] yields: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let fixture = CursorTestFixture::mixed_rows(true);
+    let conn = &fixture.db.conn;
+    let store = &fixture.db.mvcc_store;
+    store.begin_named_savepoint(fixture.tx_id, "s".to_owned(), false, 0);
+    fixture.insert_integer_rows([(30, 30)]);
+    let record = CursorTestFixture::integer_record(true, 30, 30);
+    let op = if backwards {
+        SeekOp::LE { eq_only: false }
+    } else {
+        SeekOp::GE { eq_only: false }
+    };
+    let mut cursor = fixture.cursor();
+    let actual = with_cursor_yields(conn, yields, || {
+        let result = conn
+            .db
+            .io
+            .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+            .unwrap();
+        assert!(matches!(result, SeekResult::Found));
+        assert_eq!(
+            store
+                .rollback_to_named_savepoint(fixture.tx_id, "s")
+                .unwrap(),
+            Some(0)
+        );
+        rowids_from_current_row(conn, &mut cursor, backwards)
+    });
+    assert_eq!(
+        actual,
+        if backwards {
+            vec![30, 20, 10]
+        } else {
+            vec![30, 40, 50]
+        }
+    );
+    drop(cursor);
+    fixture.rollback();
+}
+
+#[rstest::rstest]
+fn test_index_scan_limited_by_mvcc_reseeks_after_rollback(
+    #[values(false, true)] backwards: bool,
+    #[values(false, true)] reverse: bool,
+    #[values(false, true)] yields: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let fixture = CursorTestFixture::integer_rows(
+        Some(false),
+        [(10, 10), (30, 30), (50, 50), (70, 70), (90, 90)],
+    );
+    fixture.insert_integer_rows([(20, 20), (40, 40), (60, 60), (80, 80)]);
+    let store = &fixture.db.mvcc_store;
+    store.begin_named_savepoint(fixture.tx_id, "s".to_owned(), false, 0);
+    for id in [30, 50, 70] {
+        fixture.delete_integer_index_row(id, id);
+    }
+
+    let conn = &fixture.db.conn;
+    let target = if backwards { 80 } else { 20 };
+    let record = CursorTestFixture::integer_record(true, target, target);
+    let op = if backwards {
+        SeekOp::LE { eq_only: false }
+    } else {
+        SeekOp::GE { eq_only: false }
+    };
+    let mut cursor = fixture.cursor();
+    let actual = with_cursor_yields(conn, yields, || {
+        let result = conn
+            .db
+            .io
+            .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+            .unwrap();
+        assert!(matches!(result, SeekResult::Found));
+        if backwards {
+            conn.db.io.block(|| cursor.prev()).unwrap();
+        } else {
+            conn.db.io.block(|| cursor.next()).unwrap();
+        }
+        assert_eq!(
+            conn.db.io.block(|| cursor.rowid()).unwrap(),
+            Some(if backwards { 60 } else { 40 })
+        );
+        assert_eq!(
+            store
+                .rollback_to_named_savepoint(fixture.tx_id, "s")
+                .unwrap(),
+            Some(0)
+        );
+        rowids_from_current_row(conn, &mut cursor, backwards ^ reverse)
+    });
+    assert_eq!(
+        actual,
+        match (backwards, reverse) {
+            (false, false) => vec![40, 50, 60, 70, 80, 90],
+            (false, true) => vec![40, 30, 20, 10],
+            (true, false) => vec![60, 50, 40, 30, 20, 10],
+            (true, true) => vec![60, 70, 80, 90],
+        }
+    );
+    drop(cursor);
+    fixture.rollback();
+}
+
 #[derive(Default)]
 struct CursorReadProbe {
     calls: AtomicU64,
