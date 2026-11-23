@@ -11018,7 +11018,7 @@ mod tests {
             let inner = page.get();
             let buf = Arc::new(Buffer::new_temporary(PAGE_SIZE));
             // Poison the buffer so any stale bytes are detectable.
-            buf.as_ptr().fill(0xAB);
+            buf.as_mut_slice().fill(0xAB);
             inner.set_buffer(buf);
         }
         page.set_loaded();
