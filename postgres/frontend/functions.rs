@@ -128,11 +128,7 @@ fn exec_timestamp_plus_interval(args: &[Register]) -> Result<Value> {
             "adding an interval to the {time_type} value \"{text}\" is not supported"
         ))
     };
-    let utc_text = match time_type.as_str() {
-        "timestamptz" => text.strip_suffix("+00").ok_or_else(unreadable)?,
-        _ => text,
-    };
-    let time = NaiveDateTime::parse_from_str(utc_text, "%Y-%m-%d %H:%M:%S%.f")
+    let time = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
         .map_err(|_| unreadable())?;
     let sum = add_interval(time, months, days, micros)
         .filter(|sum| (1..=9999).contains(&sum.year()))
@@ -143,11 +139,7 @@ fn exec_timestamp_plus_interval(args: &[Register]) -> Result<Value> {
                 None,
             )
         })?;
-    let sum = timestamp_text(sum);
-    Ok(Value::build_text(match time_type.as_str() {
-        "timestamptz" => format!("{sum}+00"),
-        _ => sum,
-    }))
+    Ok(Value::build_text(timestamp_text(sum)))
 }
 
 /// `time` plus `months`, then `days`, then `micros`, as PostgreSQL's
