@@ -781,9 +781,10 @@ fn resolve_pg_type_for_column(stmt: &turso_pg::Statement, idx: usize) -> Type {
     // STRUCT and UNION columns live as BLOBs on disk, but exposing them as
     // BYTEA would force clients to deal with raw bytes. Map them to JSONB so
     // libpq/psql/JDBC see structured data they can introspect.
-    let mut base = match info.kind {
-        ColumnTypeKind::Struct | ColumnTypeKind::Union => Type::JSONB,
-        _ => {
+    let mut base = match (info.kind, annotated_pg_type(&info)) {
+        (ColumnTypeKind::Struct | ColumnTypeKind::Union, _) => Type::JSONB,
+        (_, Some(annotated)) => annotated,
+        (_, None) => {
             // Prefer the declared name (the user-visible type), then fall
             // back to the resolved base for custom/domain types whose
             // declared name isn't in the lookup table.
@@ -802,6 +803,17 @@ fn resolve_pg_type_for_column(stmt: &turso_pg::Statement, idx: usize) -> Type {
         base = scalar_pg_type_to_array_type(&base);
     }
     base
+}
+
+/// The type that the frontend annotated the type of the column with, when
+/// tursopg can send values of it in both formats.
+///
+/// For a type it can send only as text, such as numeric, the column keeps the
+/// type that its name maps to, which is one that a client that asks for binary
+/// results can read. Reporting the annotated type would refuse those clients.
+fn annotated_pg_type(info: &turso_core::ColumnTypeInfo) -> Option<Type> {
+    let annotated = Type::from_oid(info.ty_annotation?.type_id)?;
+    BinaryEncoding::of(&annotated).map(|_| annotated)
 }
 
 /// FIXME(pg-catalog): This hand-codes typarray of pg_type, and sends an array of any type it does not list as text[]. A lookup of typarray in a pg_type table replaces this.
@@ -1717,6 +1729,53 @@ mod tests {
             };
             assert_eq!(sqlstate(error), SQLSTATE_FEATURE_NOT_SUPPORTED, "{sql}");
         }
+    }
+
+    /// A column is described as the PostgreSQL type that it is declared with,
+    /// and a value is sent in the encoding of that type.
+    #[test]
+    fn columns_are_described_as_their_postgresql_type() {
+        let conn = memory_connection();
+        conn.execute("CREATE TABLE t (s smallint, v varchar(10), a smallint[])")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (7, 'ab', '{1,2}')")
+            .unwrap();
+        // Each field is a 4-byte length followed by the value.
+        for (sql, expected_type, binary, text) in [
+            (
+                "SELECT s FROM t",
+                Type::INT2,
+                &b"\0\0\0\x02\0\x07"[..],
+                &b"\0\0\0\x017"[..],
+            ),
+            (
+                "SELECT v FROM t",
+                Type::VARCHAR,
+                b"\0\0\0\x02ab",
+                b"\0\0\0\x02ab",
+            ),
+        ] {
+            for (format, expected) in [(Format::UnifiedBinary, binary), (Format::UnifiedText, text)]
+            {
+                let mut stmt = conn.prepare(sql).unwrap();
+                let fields = Arc::new(build_field_info(&stmt, &format).unwrap());
+                assert_eq!(*fields[0].datatype(), expected_type, "{sql}");
+                let rows = stmt.run_collect_rows().unwrap();
+                let mut encoder = DataRowEncoder::new(fields.clone());
+                encode_value(
+                    &mut encoder,
+                    &rows[0][0],
+                    fields[0].datatype(),
+                    fields[0].format(),
+                    turso_pg::TextType::of_column(&stmt, 0),
+                )
+                .unwrap();
+                assert_eq!(&encoder.finish().unwrap().data[..], expected, "{sql}");
+            }
+        }
+        let array = conn.prepare("SELECT a FROM t").unwrap();
+        let fields = build_field_info(&array, &Format::UnifiedText).unwrap();
+        assert_eq!(*fields[0].datatype(), Type::INT2_ARRAY);
     }
 
     #[test]

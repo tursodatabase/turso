@@ -521,6 +521,11 @@ impl Dialect for PostgresDialect {
     fn json_contains_function(&self) -> Option<&'static str> {
         Some("jsonb_contains")
     }
+
+    fn type_annotation(&self, ty: &ast::Type) -> Option<ast::TypeAnnotation> {
+        let oid = pg_type_oid(&ty.name)?;
+        u32::try_from(oid).ok().map(ast::TypeAnnotation::new)
+    }
 }
 
 /// `concat_ws(separator, ...)` with PostgreSQL's rule: every argument that is
