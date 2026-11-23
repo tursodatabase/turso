@@ -18,7 +18,9 @@
 #[cfg(test)]
 mod tests {
     use crate::common::{ExecRows, TempDatabase};
-    use turso_core::{ColumnOrigin, ColumnTypeInfo, ColumnTypeKind, Statement};
+    use std::sync::Arc;
+    use turso_core::{ast, ColumnOrigin, ColumnTypeInfo, ColumnTypeKind, Dialect, Statement};
+    use turso_sqlite::SqliteDialect;
 
     /// Helper: open a fresh DB with custom types + STRICT support enabled.
     /// Array, struct, union and domain columns require STRICT mode and the
@@ -65,6 +67,214 @@ mod tests {
         assert_eq!(label_info.array_dimensions, 0);
         assert_eq!(label_info.base_type, None);
         assert_eq!(label_info.kind, ColumnTypeKind::Builtin);
+    }
+
+    /// A dialect with identifiers for its types: 1 for INTEGER, 2 for TEXT and
+    /// 9 for the literals `true` and `false`. It parses as SQLite does.
+    struct AnnotatingDialect;
+
+    const INTEGER_ID: u32 = 1;
+    const TEXT_ID: u32 = 2;
+    const BOOLEAN_ID: u32 = 9;
+
+    impl Dialect for AnnotatingDialect {
+        fn name(&self) -> &'static str {
+            SqliteDialect.name()
+        }
+        fn parse(&self, sql: &str) -> turso_core::Result<(Option<ast::Cmd>, usize)> {
+            SqliteDialect.parse(sql)
+        }
+        fn parse_internal(&self, sql: &str) -> turso_core::Result<(Option<ast::Cmd>, usize)> {
+            SqliteDialect.parse_internal(sql)
+        }
+        fn parse_internal_column_definition(
+            &self,
+            sql: &str,
+        ) -> turso_core::Result<ast::ColumnDefinition> {
+            SqliteDialect.parse_internal_column_definition(sql)
+        }
+        fn parameter_marker_ranges(
+            &self,
+            sql: &str,
+        ) -> turso_core::Result<Vec<std::ops::Range<usize>>> {
+            SqliteDialect.parameter_marker_ranges(sql)
+        }
+        fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+            Arc::new(SqliteDialect)
+        }
+        fn type_annotation(&self, ty: &ast::Type) -> Option<ast::TypeAnnotation> {
+            match ty.name.to_ascii_uppercase().as_str() {
+                "INTEGER" => Some(ast::TypeAnnotation::new(INTEGER_ID)),
+                "TEXT" => Some(ast::TypeAnnotation::new(TEXT_ID)),
+                _ => None,
+            }
+        }
+        fn literal_type_annotation(&self, literal: &ast::Literal) -> Option<ast::TypeAnnotation> {
+            match literal {
+                ast::Literal::True | ast::Literal::False => {
+                    Some(ast::TypeAnnotation::new(BOOLEAN_ID))
+                }
+                _ => None,
+            }
+        }
+    }
+
+    fn annotating_db(name: &str) -> TempDatabase {
+        let db = TempDatabase::builder()
+            .with_db_name(name)
+            .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+            .with_dialect(Arc::new(AnnotatingDialect))
+            .build();
+        db.connect_limbo()
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT) STRICT")
+            .unwrap();
+        db
+    }
+
+    /// The identifier that the dialect has for the type of each result column.
+    fn type_ids(stmt: &Statement) -> Vec<Option<u32>> {
+        (0..stmt.num_columns())
+            .map(|idx| {
+                stmt.get_column_type_info(idx)
+                    .unwrap()
+                    .and_then(|info| info.ty_annotation)
+                    .map(|annotation| annotation.type_id)
+            })
+            .collect()
+    }
+
+    /// The SELECT statement `sql`, with `annotate` applied to its first result
+    /// column.
+    fn select_with_first_column(
+        sql: &str,
+        annotate: impl FnOnce(ast::Expr) -> ast::Expr,
+    ) -> ast::Stmt {
+        let Some(ast::Cmd::Stmt(ast::Stmt::Select(mut select))) =
+            turso_core::dialect::parse_statement(&SqliteDialect, sql).unwrap()
+        else {
+            panic!("not a SELECT: {sql}");
+        };
+        let ast::OneSelect::Select { columns, .. } = &mut select.body.select else {
+            panic!("not a SELECT: {sql}");
+        };
+        let ast::ResultColumn::Expr(expr, _) = &mut columns[0] else {
+            panic!("not an expression: {sql}");
+        };
+        **expr = annotate(std::mem::take(expr.as_mut()));
+        ast::Stmt::Select(select)
+    }
+
+    /// `expr` with `type_id` stored on the type of its casts: of `expr` when
+    /// it is a cast, and of the arguments that are casts when it is a call to
+    /// a function.
+    fn with_annotated_casts(expr: ast::Expr, type_id: u32) -> ast::Expr {
+        match expr {
+            ast::Expr::Cast {
+                expr,
+                type_name: Some(mut ty),
+            } => {
+                ty.ty_annotation = Some(ast::TypeAnnotation::new(type_id));
+                ast::Expr::Cast {
+                    expr,
+                    type_name: Some(ty),
+                }
+            }
+            ast::Expr::FunctionCall {
+                name,
+                distinctness,
+                args,
+                order_by,
+                within_group,
+                filter_over,
+            } => ast::Expr::FunctionCall {
+                name,
+                distinctness,
+                args: args
+                    .into_iter()
+                    .map(|arg| Box::new(with_annotated_casts(*arg, type_id)))
+                    .collect(),
+                order_by,
+                within_group,
+                filter_over,
+            },
+            expr => expr,
+        }
+    }
+
+    /// SQLite has no identifiers for its types, so neither a column nor a
+    /// cast reports an annotation.
+    #[test]
+    fn type_info_has_no_annotation_in_sqlite() {
+        let db = fresh_db_with_custom_types("type_info_annotation.db");
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT) STRICT")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT id, CAST(label AS INTEGER), coalesce(id, 1), true FROM t")
+            .unwrap();
+
+        assert_eq!(type_ids(&stmt), [None, None, None, None]);
+    }
+
+    /// Where the frontend stored no annotation, an expression has the one
+    /// derived from it: the one the dialect gives for the declared type
+    /// of a column, for the type of a cast and for a literal, and the one that
+    /// the values of `coalesce`, `nullif`, `iif` and CASE all have.
+    #[test]
+    fn type_annotation_is_derived_for_an_expression_without_one() {
+        let db = annotating_db("type_annotation_derived.db");
+        let conn = db.connect_limbo();
+        for (expr, expected) in [
+            ("id", Some(INTEGER_ID)),
+            ("label", Some(TEXT_ID)),
+            ("(id)", Some(INTEGER_ID)),
+            ("CAST(label AS INTEGER)", Some(INTEGER_ID)),
+            ("true", Some(BOOLEAN_ID)),
+            ("coalesce(id, id)", Some(INTEGER_ID)),
+            ("coalesce(true, false)", Some(BOOLEAN_ID)),
+            ("coalesce(CAST(label AS INTEGER), id)", Some(INTEGER_ID)),
+            ("nullif(id, 0)", Some(INTEGER_ID)),
+            ("iif(id > 0, label, label)", Some(TEXT_ID)),
+            ("CASE WHEN id > 0 THEN id ELSE id END", Some(INTEGER_ID)),
+            // NULL and a string literal take the type of the other values.
+            ("coalesce(id, NULL)", Some(INTEGER_ID)),
+            ("CASE WHEN id > 0 THEN label ELSE 'none' END", Some(TEXT_ID)),
+            // Values of different types have no common annotation.
+            ("coalesce(id, label)", None),
+            // Nothing tells the type of an operator's result.
+            ("id + 1", None),
+            ("1", None),
+        ] {
+            let stmt = conn.prepare(format!("SELECT {expr} FROM t")).unwrap();
+            assert_eq!(type_ids(&stmt), [expected], "{expr}");
+        }
+    }
+
+    /// The annotation that the frontend stored on the type of a cast is the
+    /// answer: nothing is derived for it. The annotation does not change
+    /// the value.
+    #[test]
+    fn type_annotation_of_the_frontend_is_used_before_a_derived_one() {
+        const FRONTEND_ID: u32 = 42;
+        let db = annotating_db("type_annotation_frontend.db");
+        let conn = db.connect_limbo();
+        conn.execute("INSERT INTO t VALUES (7, '7')").unwrap();
+
+        // A cast to an annotated type, alone and as the value of a function.
+        // Without the annotation the dialect gives INTEGER_ID for the cast.
+        for sql in [
+            "SELECT CAST(label AS INTEGER) FROM t",
+            "SELECT coalesce(CAST(label AS INTEGER), NULL) FROM t",
+        ] {
+            let stmt =
+                select_with_first_column(sql, |expr| with_annotated_casts(expr, FRONTEND_ID));
+            let mut stmt = conn.prepare_ast_stmt(stmt).unwrap();
+            assert_eq!(type_ids(&stmt), [Some(FRONTEND_ID)], "{sql}");
+            assert_eq!(expect_info(&stmt, 0).declared_name, "INTEGER", "{sql}");
+            let rows = stmt.run_collect_rows().unwrap();
+            assert_eq!(rows, [[turso_core::Value::from_i64(7)]], "{sql}");
+        }
     }
 
     /// Array columns report `array_dimensions` matching the bracket depth in
