@@ -1469,12 +1469,12 @@ fn steps_of_the_catalog_run_after_the_engine_steps_at_open_and_at_reload() {
 }
 
 /// A catalog that stores what SQLite's stores and notes the commands about
-/// triggers that it gets.
-struct NotesTriggerCommands {
+/// triggers and virtual tables that it gets.
+struct NotesCommands {
     commands: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
-impl turso_core::Catalog for NotesTriggerCommands {
+impl turso_core::Catalog for NotesCommands {
     fn emit(
         &self,
         program: &mut turso_core::ProgramBuilder,
@@ -1494,6 +1494,12 @@ impl turso_core::Catalog for NotesTriggerCommands {
                     .unwrap()
                     .push(format!("drop {}", trigger.name));
             }
+            turso_core::CatalogCmd::CreateVirtualTable(table) => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(format!("create virtual table {}", table.name));
+            }
             _ => {}
         }
         turso_core::SqliteCatalog.emit(program, ctx, cmd)
@@ -1504,7 +1510,7 @@ impl turso_core::Catalog for NotesTriggerCommands {
 fn the_catalog_gets_a_new_trigger_and_a_dropped_trigger() {
     let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
     let dialect = Arc::new(DialectWithCatalog {
-        catalog: NotesTriggerCommands {
+        catalog: NotesCommands {
             commands: commands.clone(),
         },
     });
@@ -1525,4 +1531,28 @@ fn the_catalog_gets_a_new_trigger_and_a_dropped_trigger() {
             "drop tr"
         ]
     );
+}
+
+#[test]
+fn the_catalog_gets_a_new_virtual_table() {
+    let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialect = Arc::new(DialectWithCatalog {
+        catalog: NotesCommands {
+            commands: commands.clone(),
+        },
+    });
+    let options = OpenOptions::new(dialect).native_module(
+        "one_row",
+        turso_ext::VTabKind::VirtualTable,
+        TestCatalogTable,
+    );
+    let db = Database::open(Arc::new(MemoryIO::new()), ":memory:", options).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.execute("CREATE VIRTUAL TABLE v USING one_row")
+        .unwrap();
+
+    assert_eq!(*commands.lock().unwrap(), ["create virtual table v"]);
 }
