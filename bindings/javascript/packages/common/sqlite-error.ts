@@ -66,6 +66,12 @@ const convertibleErrorTypes = { TypeError };
 const CONVERTIBLE_ERROR_PREFIX = "[TURSO_CONVERT_TYPE]";
 
 export function convertError(err) {
+  // Every error the native side creates has a code. One without was thrown
+  // in JavaScript, as `bind_at` throws a TypeError for a value it cannot
+  // bind, and stays as it is.
+  if (err.code === undefined) {
+    return err;
+  }
   if ((err.code ?? "").startsWith(CONVERTIBLE_ERROR_PREFIX)) {
     return createErrorByName(
       err.code.substring(CONVERTIBLE_ERROR_PREFIX.length),

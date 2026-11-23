@@ -309,6 +309,15 @@ test.serial("Statement.run() [named]", async (t) => {
   t.is(info.lastInsertRowid, 3);
 });
 
+test.serial("Statement.bind() [unbindable value]", async (t) => {
+  const db = t.context.db;
+  const unbindable = { instanceOf: TypeError, message: "SQLite3 can only bind numbers, strings, bigints, buffers, and null" };
+
+  const stmt = db.prepare("SELECT ? AS x, ? AS y");
+  t.throws(() => stmt.get(Symbol("s")), unbindable);
+  t.throws(() => stmt.bind(Symbol("s")), unbindable);
+});
+
 test.serial("Statement.run() with array bind parameter", async (t) => {
   const db = t.context.db;
 
