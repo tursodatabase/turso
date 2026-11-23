@@ -149,8 +149,8 @@ pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 pub use dialect::{
     AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
     CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,
-    CreateTrigger, CreateView, Dependent, DependentObject, Dialect, DropColumn, DropIndex,
-    DropSequence, DropTable, DropTrigger, DropView, NewOwner, OwnerColumn, RelationName,
+    CreateTrigger, CreateView, CreateVirtualTable, Dependent, DependentObject, Dialect, DropColumn,
+    DropIndex, DropSequence, DropTable, DropTrigger, DropView, NewOwner, OwnerColumn, RelationName,
     RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, SqliteCatalog, StatementTimes,
     TableText, TempTriggerOfRenamedTable,
 };

@@ -179,6 +179,7 @@ pub enum CatalogCmd<'a> {
     DropColumn(DropColumn<'a>),
     CreateTrigger(CreateTrigger<'a>),
     DropTrigger(DropTrigger<'a>),
+    CreateVirtualTable(CreateVirtualTable<'a>),
 }
 
 /// A new table. The statement has already emitted the creation of its
@@ -431,6 +432,14 @@ pub struct CreateTrigger<'a> {
 pub struct DropTrigger<'a> {
     pub namespace: NamespaceId,
     pub name: &'a str,
+}
+
+/// A new virtual table of the main database. It has no B-tree: its module
+/// stores it.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateVirtualTable<'a> {
+    pub name: &'a str,
+    pub sql: &'a str,
 }
 
 /// A statement about roles, ownership, privileges or row-level security.

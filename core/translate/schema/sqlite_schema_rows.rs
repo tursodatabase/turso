@@ -3,8 +3,8 @@
 use crate::ast;
 use crate::dialect::{
     Catalog, CatalogCmd, CmdContext, CreateIndex, CreateMaterializedView, CreateSequence,
-    CreateTable, CreateTrigger, CreateView, DropIndex, DropSequence, DropTable, DropTrigger,
-    DropView, TableText,
+    CreateTable, CreateTrigger, CreateView, CreateVirtualTable, DropIndex, DropSequence, DropTable,
+    DropTrigger, DropView, TableText,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
@@ -62,6 +62,9 @@ impl Catalog for SqliteCatalog {
             CatalogCmd::DropTrigger(trigger) => {
                 emit_delete_trigger_row(program, ctx, trigger);
                 Ok(())
+            }
+            CatalogCmd::CreateVirtualTable(table) => {
+                emit_create_virtual_table_row(program, ctx, table)
             }
         }
     }
@@ -944,6 +947,34 @@ fn emit_delete_trigger_row(
 
     program.preassign_label_to_next_insn(done_label);
     program.preassign_label_to_next_insn(rewind_done_label);
+}
+
+/// Writes the row of a new virtual table.
+fn emit_create_virtual_table_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    table: &CreateVirtualTable<'_>,
+) -> Result<()> {
+    let resolver = ctx.resolver;
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        ctx.database_id,
+        Some(SQLITE_TABLEID),
+    )?;
+    emit_schema_entry(
+        program,
+        resolver,
+        sqlite_schema_cursor_id,
+        cdc_table.map(|x| x.0),
+        SchemaEntryType::Table,
+        table.name,
+        table.name,
+        // A virtual table has no B-tree.
+        0,
+        Some(table.sql.to_string()),
+    )
 }
 
 /// Creates one of the engine's own tables in the main database the first
