@@ -624,7 +624,9 @@ pub fn first_collation<'a, 'c, 's: 'c>(
 }
 
 /// The collation that column `column` of a compound SELECT compares with,
-/// where `arms` are its SELECTs, by the rule of [first_collation]: a SELECT
+/// where `arms` are its SELECTs, after checking that the column's values in
+/// every SELECT and every row of a VALUES list compare. The collation follows
+/// the rule of [first_collation] over the result columns: a SELECT
 /// whose column has an order decides, so `SELECT n FROM t UNION SELECT 10`
 /// compares in numeric order and keeps one of `10.00` and `10`. Otherwise the
 /// text collation of the leftmost SELECT whose column has one, as in SQLite's
@@ -634,7 +636,11 @@ pub fn compound_column_collation(
     column: usize,
     resolver: &Resolver,
 ) -> Result<CollationSeq> {
-    first_collation(compound_column_exprs(arms, column, resolver))
+    check_comparable_types(
+        compound_column_exprs(arms, column, resolver)
+            .map(|(expr, context)| (type_of(expr, &context.type_env()), context.schema())),
+    )?;
+    first_collation(compound_result_column_exprs(arms, column, resolver))
 }
 
 /// The collation of a compound SELECT's ORDER BY term `column COLLATE name`,
@@ -661,6 +667,23 @@ fn compound_column_exprs<'a, 's>(
     arms.iter().flat_map(move |select| {
         let context = ExprContext::new(Some(&select.table_references), resolver);
         select.column_exprs(column).map(move |expr| (expr, context))
+    })
+}
+
+/// The result column `column` of every SELECT in `arms`, each with the context
+/// its columns refer to. The result columns of a VALUES list hold placeholders
+/// that have no collation, so a COLLATE in a row of a VALUES list does not
+/// decide the collation of a compound SELECT.
+fn compound_result_column_exprs<'a, 's>(
+    arms: &'a [&'a SelectPlan],
+    column: usize,
+    resolver: &'a Resolver<'s>,
+) -> impl Iterator<Item = (&'a Expr, ExprContext<'a, 's>)> + Clone + 'a {
+    arms.iter().map(move |select| {
+        (
+            &select.result_columns[column].expr,
+            ExprContext::new(Some(&select.table_references), resolver),
+        )
     })
 }
 
