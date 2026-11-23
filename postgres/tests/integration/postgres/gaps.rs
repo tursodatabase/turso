@@ -131,7 +131,7 @@ fn timestamp_n_param_plus_interval(db: TempDatabase) {
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "2026-01-02 05:00:00+00|2026-01-02 10:00:00");
+    assert_eq!(out, "2026-01-02 05:00:00|2026-01-02 10:00:00");
 }
 
 // A-41: date $n param

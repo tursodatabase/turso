@@ -128,8 +128,8 @@ fn exec_timestamp_plus_interval(args: &[Register]) -> Result<Value> {
             "adding an interval to the {time_type} value \"{text}\" is not supported"
         ))
     };
-    let time = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
-        .map_err(|_| unreadable())?;
+    let time =
+        NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").map_err(|_| unreadable())?;
     let sum = add_interval(time, months, days, micros)
         .filter(|sum| (1..=9999).contains(&sum.year()))
         .ok_or_else(|| {
