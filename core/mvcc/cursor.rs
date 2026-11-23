@@ -101,7 +101,7 @@ enum SeekBtreeState {
     SeekBtree,
     /// Advance to next key in btree (if we got [SeekResult::TryAdvance], or the current row is shadowed by MVCC)
     AdvanceBTree,
-    /// Check if current row is visible (not shadowed by MVCC)
+    /// Check whether the physical candidate can be returned or must be skipped.
     CheckRow,
 }
 
@@ -224,7 +224,8 @@ fn cursor_yield_key(tx_id: u64, table_id: MVTableId) -> u64 {
 struct DualCursorPeek<A: ConcurrentAllocator = TursoAllocator> {
     /// Next row available from MVCC
     mvcc_peek: CursorPeek<A>,
-    /// Next row available from btree
+    /// Next physical candidate. For indexes it may still be shadowed when the
+    /// visible MVCC candidate precedes it; validate before it can win the merge.
     btree_peek: CursorPeek<A>,
 }
 
@@ -953,17 +954,27 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         }
     }
 
-    /// Whether the B-tree peek is now shadowed by an MVCC version, for example
-    /// a delete by this cursor's own transaction after the peek was read. The
-    /// peek is checked again on each step that does not advance the B-tree.
-    fn btree_peek_is_shadowed(&self) -> Result<bool> {
-        match self.dual_peek.btree_peek.get_row_key() {
-            Some(key) => Ok(!self.query_btree_version_is_valid(key)?),
-            None => Ok(false),
+    /// Whether an unconsumed physical candidate must be skipped. An index
+    /// candidate behind the next visible MVCC key can wait until it could win.
+    fn btree_peek_needs_advance(&mut self, dir: IterationDirection) -> Result<bool> {
+        let Some(key) = self.dual_peek.btree_peek.get_row_key() else {
+            return Ok(false);
+        };
+        if self.mvcc_index_precedes(key, dir) {
+            return Ok(false);
         }
+        let key = key.clone();
+        // A deferred peek is part of the same monotonic physical scan. Use its
+        // visibility iterator too, rather than a map lookup for every row.
+        let valid = match dir {
+            IterationDirection::Forwards => self.btree_row_is_valid_forward(&key)?,
+            IterationDirection::Backwards => self.query_btree_version_is_valid(&key)?,
+        };
+        Ok(!valid)
     }
 
-    /// Advance btree cursor forward and set btree peek to the first valid row key (skipping rows shadowed by MVCC)
+    /// Prepare the next physical candidate, skipping shadowed keys only until
+    /// the current MVCC candidate wins the merge.
     fn advance_btree_forward(&mut self) -> IOResultOr<()> {
         self._advance_btree_forward(true)
     }
@@ -995,7 +1006,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 Some(AdvanceBtreeState::RewindCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
                     match key {
-                        Some(k) if self.btree_row_is_valid_forward(&k)? => {
+                        Some(k)
+                            if self.mvcc_index_precedes(&k, IterationDirection::Forwards)
+                                || self.btree_row_is_valid_forward(&k)? =>
+                        {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
@@ -1029,7 +1043,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
                     if let Some(key) = key {
-                        if self.btree_row_is_valid_forward(&key)? {
+                        if self.mvcc_index_precedes(&key, IterationDirection::Forwards)
+                            || self.btree_row_is_valid_forward(&key)?
+                        {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key,
                                 versions: None,
@@ -1050,7 +1066,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         }
     }
 
-    /// Advance btree cursor backward and set btree peek to the first valid row key (skipping rows shadowed by MVCC)
+    /// Prepare the previous physical candidate without passing the MVCC candidate.
     fn advance_btree_backward(&mut self) -> IOResultOr<()> {
         self._advance_btree_backward(true)
     }
@@ -1083,7 +1099,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 Some(AdvanceBtreeState::RewindCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
                     match key {
-                        Some(k) if self.query_btree_version_is_valid(&k)? => {
+                        Some(k)
+                            if self.mvcc_index_precedes(&k, IterationDirection::Backwards)
+                                || self.query_btree_version_is_valid(&k)? =>
+                        {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
@@ -1117,7 +1136,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
                     match key {
-                        Some(k) if self.query_btree_version_is_valid(&k)? => {
+                        Some(k)
+                            if self.mvcc_index_precedes(&k, IterationDirection::Backwards)
+                                || self.query_btree_version_is_valid(&k)? =>
+                        {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
@@ -1287,10 +1309,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
                 SeekBtreeState::AdvanceBTree => {
                     if at_most_one_match {
-                        // Such a seek lands here only for an index key stored in an interior
-                        // page, one row past where the B-tree seek stopped. That row is the only
-                        // possible match: step to it and let CheckRow decide, instead of walking
-                        // past every shadowed row.
+                        // A singleton probe must not scan beyond its one match.
                         return_if_io!(match direction {
                             IterationDirection::Forwards => self.btree_cursor.next(),
                             IterationDirection::Backwards => self.btree_cursor.prev(),
@@ -1313,14 +1332,19 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
                 SeekBtreeState::CheckRow => {
                     let key = self.get_btree_current_key()?;
-                    // A seek that can match at most one row has at most one B-tree match: once
-                    // that row is shadowed, or the row reached is not it, the B-tree holds no
-                    // visible match, and advancing would walk every shadowed row after it.
+                    // Keep visible physical candidates for later traversal, but
+                    // stop scanning when MVCC already supplies the next row.
                     match key {
                         Some(k)
-                            if (!at_most_one_match
-                                || row_matches_seek_key(&k, &seek_key, &self.mv_cursor_type)?)
-                                && self.query_btree_version_is_valid(&k)? =>
+                            if at_most_one_match
+                                && !row_matches_seek_key(&k, &seek_key, &self.mv_cursor_type)? =>
+                        {
+                            self.dual_peek.btree_peek = CursorPeek::Exhausted;
+                            return Ok(IOResult::Done(()));
+                        }
+                        Some(k)
+                            if (!at_most_one_match && self.mvcc_index_precedes(&k, direction))
+                                || self.query_btree_version_is_valid(&k)? =>
                         {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
@@ -1348,6 +1372,22 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
             }
         }
+    }
+
+    /// A physical index key need not be validated until it can win the merge.
+    /// Keep that first possible key so a later rollback can restore it. Table
+    /// candidates can fall through to their checkpointed copy and cannot bound
+    /// this search.
+    fn mvcc_index_precedes(&self, key: &RowKey, dir: IterationDirection) -> bool {
+        matches!(self.mv_cursor_type, MvccCursorType::Index(_))
+            && self
+                .dual_peek
+                .mvcc_peek
+                .get_row_key()
+                .is_some_and(|mvcc| match dir {
+                    IterationDirection::Forwards => mvcc <= key,
+                    IterationDirection::Backwards => mvcc >= key,
+                })
     }
 
     /// Whether a step in `dir` must start or resume a seek past the current row.
@@ -1426,6 +1466,41 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             let _ = self.table_iterator.take();
             let _ = self.index_iterator.take();
             self.reset_dual_peek();
+            // Initialize MVCC iterator to last position
+            match &self.mv_cursor_type {
+                MvccCursorType::Table => match self.db.get_last_table_rowid(
+                    self.table_id,
+                    &mut self.table_iterator,
+                    self.tx_id,
+                ) {
+                    Some(k) => {
+                        tracing::trace!("last: mvcc_key: {:?}", k);
+                        self.dual_peek.mvcc_peek = CursorPeek::Row {
+                            key: k,
+                            versions: None,
+                        };
+                    }
+                    None => {
+                        self.dual_peek.mvcc_peek = CursorPeek::Exhausted;
+                    }
+                },
+                MvccCursorType::Index(_) => match self.db.get_last_index_rowid(
+                    self.table_id,
+                    self.tx_id,
+                    &mut self.index_iterator,
+                )? {
+                    Some(k) => {
+                        self.dual_peek.mvcc_peek = CursorPeek::Row {
+                            key: k,
+                            versions: None,
+                        };
+                    }
+                    None => {
+                        self.dual_peek.mvcc_peek = CursorPeek::Exhausted;
+                    }
+                },
+            };
+
             self.state
                 .replace(MvccLazyCursorState::Rewind(RewindState::Advance));
         }
@@ -1446,41 +1521,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
         self.invalidate_record();
         self.current_pos = CursorPosition::End;
-
-        // Initialize MVCC iterator to last position
-        match &self.mv_cursor_type {
-            MvccCursorType::Table => match self.db.get_last_table_rowid(
-                self.table_id,
-                &mut self.table_iterator,
-                self.tx_id,
-            ) {
-                Some(k) => {
-                    tracing::trace!("last: mvcc_key: {:?}", k);
-                    self.dual_peek.mvcc_peek = CursorPeek::Row {
-                        key: k,
-                        versions: None,
-                    };
-                }
-                None => {
-                    self.dual_peek.mvcc_peek = CursorPeek::Exhausted;
-                }
-            },
-            MvccCursorType::Index(_) => match self.db.get_last_index_rowid(
-                self.table_id,
-                self.tx_id,
-                &mut self.index_iterator,
-            )? {
-                Some(k) => {
-                    self.dual_peek.mvcc_peek = CursorPeek::Row {
-                        key: k,
-                        versions: None,
-                    };
-                }
-                None => {
-                    self.dual_peek.mvcc_peek = CursorPeek::Exhausted;
-                }
-            },
-        };
 
         self.refresh_current_position(IterationDirection::Backwards);
         self.invalidate_record();
@@ -1568,7 +1608,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             if need_advance_mvcc && !reseeked && !self.dual_peek.mvcc_exhausted() {
                 self.advance_mvcc_iterator();
             }
-            let need_advance_btree = need_advance_btree || self.btree_peek_is_shadowed()?;
+            let need_advance_btree = need_advance_btree
+                || self.btree_peek_needs_advance(IterationDirection::Forwards)?;
             if need_advance_btree && !self.dual_peek.btree_exhausted() {
                 self.state
                     .replace(MvccLazyCursorState::Next(NextState::Advance));
@@ -1663,7 +1704,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             if need_advance_mvcc && !reseeked && !self.dual_peek.mvcc_exhausted() {
                 self.advance_mvcc_iterator();
             }
-            let need_advance_btree = need_advance_btree || self.btree_peek_is_shadowed()?;
+            let need_advance_btree = need_advance_btree
+                || self.btree_peek_needs_advance(IterationDirection::Backwards)?;
             if need_advance_btree && !self.dual_peek.btree_exhausted() {
                 self.state
                     .replace(MvccLazyCursorState::Prev(PrevState::Advance));
@@ -2331,6 +2373,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             let _ = self.table_iterator.take();
             let _ = self.index_iterator.take();
             self.reset_dual_peek();
+            self.init_mvcc_iterator_forward()?;
+            self.advance_mvcc_iterator();
             self.state
                 .replace(MvccLazyCursorState::Rewind(RewindState::Advance));
         }
@@ -2345,44 +2389,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             "invalid rewind state",
             { "state": format!("{:?}", self.state) }
         );
-        // First run btree_cursor rewind so that we don't need a explicit state machine.
+        // MVCC already provides the bound; keep its candidate across I/O yields.
         return_if_io!(self.advance_btree_forward());
 
         self.invalidate_record();
         self.current_pos = CursorPosition::BeforeFirst;
-
-        // Initialize MVCC iterators for rewind operation; in practice there is only one of these
-        // depending on the cursor type, so we should at some point refactor the iterator thing to be
-        // generic over the type instead of having two on the struct.
-        match &self.mv_cursor_type {
-            MvccCursorType::Table => {
-                // For table cursors, initialize iterator from the correct table id + i64::MIN;
-                // this is because table rows from all tables are stored in the same map
-                let start_rowid = RowID {
-                    table_id: self.table_id,
-                    row_id: RowKey::Int(i64::MIN),
-                };
-                let range = (
-                    std::ops::Bound::Included(start_rowid),
-                    std::ops::Bound::Unbounded,
-                );
-                let iter_box = Box::new(self.db.rows.range(range));
-                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
-            }
-            MvccCursorType::Index(_) => {
-                // For index cursors, initialize the iterator to the beginning
-                let index_rows = self.db.get_or_create_index_rows(self.table_id)?;
-                let index_rows = index_rows.value();
-                let iter_box: Box<
-                    dyn Iterator<Item = MvccEntry<'_, Arc<SortableIndexKey>, A>> + Send + Sync,
-                > = Box::new(index_rows.iter());
-                self.index_iterator =
-                    Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A));
-            }
-        }
-
-        // Rewind mvcc iterator
-        self.advance_mvcc_iterator();
 
         self.refresh_current_position(IterationDirection::Forwards);
 
