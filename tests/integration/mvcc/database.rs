@@ -11015,6 +11015,9 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
         )> {
             self.inner.truncate(checkpointed_through_ts)
         }
+        fn finish_logical_log_truncate(&self) {
+            self.inner.finish_logical_log_truncate();
+        }
         fn reset_to_fresh_header(&self) -> Result<Completion> {
             self.inner.reset_to_fresh_header()
         }
@@ -11248,6 +11251,9 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
         )> {
             self.inner.truncate(checkpointed_through_ts)
         }
+        fn finish_logical_log_truncate(&self) {
+            self.inner.finish_logical_log_truncate();
+        }
         fn reset_to_fresh_header(&self) -> Result<Completion> {
             self.inner.reset_to_fresh_header()
         }
@@ -11425,6 +11431,618 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
         get_rows(&conn, "SELECT id FROM t ORDER BY id"),
         vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
     );
+}
+
+#[test]
+fn passive_checkpoint_finishes_with_an_open_exclusive_writer() {
+    use turso_core::mvcc::database::checkpoint::CheckpointStateMachine;
+    use turso_core::CheckpointMode;
+
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
+    writer.execute("BEGIN IMMEDIATE").unwrap();
+    writer.execute("UPDATE t SET v = 'b' WHERE id = 1").unwrap();
+    let checkpointer = db.connect();
+    let mv = db.get_mvcc_store();
+    let mut checkpoint = CheckpointStateMachine::new(
+        checkpointer.get_pager(),
+        mv,
+        checkpointer.clone(),
+        true,
+        checkpointer.get_sync_mode(),
+        turso_core::MAIN_DB_ID,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    let mut finished = false;
+    for _ in 0..10_000 {
+        match checkpoint.step(&()).unwrap() {
+            TransitionResult::Io(c) => c.wait(checkpointer.db.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                finished = true;
+                break;
+            }
+        }
+    }
+    if !finished {
+        checkpoint
+            .cleanup_after_external_io_error(LimboError::Interrupt)
+            .unwrap();
+    }
+    assert!(finished, "passive checkpoint waited for the open writer");
+    assert_eq!(
+        get_rows(&checkpointer, "SELECT id, v FROM t"),
+        vec![vec![Value::from_i64(1), Value::build_text("a")]]
+    );
+    writer.execute("COMMIT").unwrap();
+    checkpointer
+        .execute("PRAGMA wal_checkpoint(PASSIVE)")
+        .unwrap();
+    assert_eq!(
+        get_rows(&checkpointer, "SELECT id, v FROM t"),
+        vec![vec![Value::from_i64(1), Value::build_text("b")]]
+    );
+}
+
+#[test]
+fn checkpoint_retains_log_for_prepared_append() {
+    use turso_core::io::FileSyncType;
+    use turso_core::mvcc::database::checkpoint::{CheckpointState, CheckpointStateMachine};
+    use turso_core::mvcc::database::{LogRecord, RowVersion};
+    use turso_core::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
+    use turso_core::mvcc::persistent_storage::{
+        DurableStorage, LogicalLogTruncateOutcome, Storage,
+    };
+    use turso_core::storage::sqlite3_ondisk::DatabaseHeader;
+    use turso_core::{CheckpointMode, CheckpointResult, EncryptionContext, File, Result};
+
+    #[derive(Debug)]
+    struct PauseBeforeLogTxStorage {
+        inner: Arc<dyn DurableStorage>,
+        armed: AtomicBool,
+        pending: Mutex<Option<Completion>>,
+    }
+
+    impl PauseBeforeLogTxStorage {
+        fn new(inner: Arc<dyn DurableStorage>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                armed: AtomicBool::new(false),
+                pending: Mutex::new(None),
+            })
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, Ordering::Release);
+        }
+
+        fn take_pending(&self) -> Option<Completion> {
+            self.pending.lock().take()
+        }
+    }
+
+    impl DurableStorage for PauseBeforeLogTxStorage {
+        fn serialize_row_version(
+            &self,
+            log_record: &mut LogRecord,
+            row_id: &RowID,
+            row_version: &RowVersion,
+            portable_extension: Option<&[u8]>,
+        ) -> Result<()> {
+            self.inner
+                .serialize_row_version(log_record, row_id, row_version, portable_extension)
+        }
+        fn serialize_database_header(
+            &self,
+            log_record: &mut LogRecord,
+            header: &DatabaseHeader,
+        ) -> Result<()> {
+            self.inner.serialize_database_header(log_record, header)
+        }
+        fn log_tx(
+            &self,
+            m: LogRecord,
+            c: OnSerializationComplete<'_>,
+        ) -> Result<(Completion, u64)> {
+            self.inner.log_tx(m, c)
+        }
+        fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
+            if self.armed.swap(false, Ordering::AcqRel) {
+                let c = Completion::new_write(|_| {});
+                *self.pending.lock() = Some(c.clone());
+                return Ok(Some(c));
+            }
+            self.inner.upgrade_header_for_log_tx(m)
+        }
+        fn sync(&self, t: FileSyncType) -> Result<Completion> {
+            self.inner.sync(t)
+        }
+        fn update_header(&self) -> Result<Completion> {
+            self.inner.update_header()
+        }
+        fn truncate(
+            &self,
+            checkpointed_through_ts: u64,
+        ) -> Result<(Completion, LogicalLogTruncateOutcome)> {
+            self.inner.truncate(checkpointed_through_ts)
+        }
+        fn finish_logical_log_truncate(&self) {
+            self.inner.finish_logical_log_truncate();
+        }
+        fn reset_to_fresh_header(&self) -> Result<Completion> {
+            self.inner.reset_to_fresh_header()
+        }
+        fn get_logical_log_file(&self) -> Arc<dyn File> {
+            self.inner.get_logical_log_file()
+        }
+        fn logical_log_offset(&self) -> u64 {
+            self.inner.logical_log_offset()
+        }
+        fn should_checkpoint(&self) -> bool {
+            self.inner.should_checkpoint()
+        }
+        fn set_checkpoint_threshold(&self, t: i64) {
+            self.inner.set_checkpoint_threshold(t)
+        }
+        fn checkpoint_threshold(&self) -> i64 {
+            self.inner.checkpoint_threshold()
+        }
+        fn advance_logical_log_offset_after_success(&self, b: u64) -> Result<()> {
+            self.inner.advance_logical_log_offset_after_success(b)
+        }
+        fn discard_pending_log_write(&self) -> Result<()> {
+            self.inner.discard_pending_log_write()
+        }
+        fn restore_logical_log_state_after_recovery(&self, o: u64, c: u32) {
+            self.inner.restore_logical_log_state_after_recovery(o, c)
+        }
+        fn set_header(&self, h: LogHeader) {
+            self.inner.set_header(h)
+        }
+        fn on_checkpoint_start(&self) -> Result<()> {
+            self.inner.on_checkpoint_start()
+        }
+        fn on_checkpoint_end(&self, r: Result<&CheckpointResult>) -> Result<()> {
+            self.inner.on_checkpoint_end(r)
+        }
+        fn encryption_ctx(&self) -> Option<EncryptionContext> {
+            self.inner.encryption_ctx()
+        }
+    }
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let path = temp.path().join("append-race.db");
+    let path_str = path.to_str().unwrap();
+    let opts = DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true);
+    {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path_str,
+            OpenFlags::default(),
+            opts,
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+    }
+    {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let file = Arc::new(DelayedLogicalLogTruncateFile {
+            inner: io
+                .open_file(
+                    path.with_extension("db-log").to_str().unwrap(),
+                    OpenFlags::default(),
+                    false,
+                )
+                .unwrap(),
+            io: io.clone(),
+            pending: Mutex::new(None),
+        });
+        let storage =
+            PauseBeforeLogTxStorage::new(Arc::new(Storage::new(file.clone(), io.clone(), None)));
+        let db = Database::open(
+            io.clone(),
+            path_str,
+            turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(opts)
+                .durable_storage(storage.clone() as Arc<dyn DurableStorage>),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
+        let mv = db.get_mv_store().clone().unwrap();
+        let cp_conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let mut checkpoint = CheckpointStateMachine::new(
+            cp_conn.get_pager(),
+            mv.clone(),
+            cp_conn.clone(),
+            true,
+            cp_conn.get_sync_mode(),
+            turso_core::MAIN_DB_ID,
+            CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            },
+        );
+        for _ in 0..200_000 {
+            if checkpoint.state() == CheckpointState::TruncateLogicalLog {
+                break;
+            }
+            match checkpoint.step(&()).unwrap() {
+                TransitionResult::Io(c) => c.wait(io.as_ref()).unwrap(),
+                TransitionResult::Continue => {}
+                TransitionResult::Done(_) => panic!("checkpoint finished too early"),
+            }
+        }
+        assert_eq!(checkpoint.state(), CheckpointState::TruncateLogicalLog);
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("INSERT INTO t VALUES(2, 'b')").unwrap();
+        storage.arm();
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        let wait_before_log_tx = loop {
+            match commit.step().unwrap() {
+                StepResult::Done => panic!("commit finished before pausing at log append"),
+                StepResult::IO | StepResult::Yield => {
+                    if let Some(c) = storage.take_pending() {
+                        break c;
+                    }
+                    io.step().unwrap();
+                }
+                other => panic!("unexpected commit step: {other:?}"),
+            }
+        };
+        assert!(matches!(
+            checkpoint.step(&()).unwrap(),
+            TransitionResult::Continue
+        ));
+        assert!(file.pending.lock().is_none());
+        assert_eq!(checkpoint.state(), CheckpointState::TruncateWal);
+        loop {
+            match checkpoint.step(&()).unwrap() {
+                TransitionResult::Io(c) => c.wait(io.as_ref()).unwrap(),
+                TransitionResult::Continue => {}
+                TransitionResult::Done(_) => break,
+            }
+        }
+        wait_before_log_tx.complete(0);
+        loop {
+            match commit.step().unwrap() {
+                StepResult::Done => break,
+                StepResult::IO | StepResult::Yield => io.step().unwrap(),
+                other => panic!("unexpected commit step after resume: {other:?}"),
+            }
+        }
+        assert!(file.pending.lock().is_none());
+        assert_eq!(
+            get_rows(&cp_conn, "SELECT id, v FROM t ORDER BY id"),
+            vec![
+                vec![Value::from_i64(1), Value::build_text("a")],
+                vec![Value::from_i64(2), Value::build_text("b")],
+            ]
+        );
+    }
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        path_str,
+        OpenFlags::default(),
+        opts,
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT id, v FROM t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), Value::build_text("a")],
+            vec![Value::from_i64(2), Value::build_text("b")],
+        ]
+    );
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    assert_eq!(db.get_mv_store().as_ref().unwrap().logical_log_offset(), 0);
+}
+
+#[test]
+fn checkpoint_observes_truncate_completed_before_offset_check_full() {
+    checkpoint_observes_truncate_completion_with_io(Arc::new(PlatformIO::new().unwrap()), "FULL");
+}
+
+#[test]
+fn checkpoint_observes_truncate_completed_before_offset_check_off() {
+    checkpoint_observes_truncate_completion_with_io(Arc::new(PlatformIO::new().unwrap()), "OFF");
+}
+
+#[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs", not(miri)))]
+#[test]
+fn uring_checkpoint_observes_truncate_completed_before_offset_check_full() {
+    checkpoint_observes_truncate_completion_with_io(
+        Arc::new(turso_core::io::UringIO::new().unwrap()),
+        "FULL",
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs", not(miri)))]
+#[test]
+fn uring_checkpoint_observes_truncate_completed_before_offset_check_off() {
+    checkpoint_observes_truncate_completion_with_io(
+        Arc::new(turso_core::io::UringIO::new().unwrap()),
+        "OFF",
+    );
+}
+
+fn checkpoint_observes_truncate_completion_with_io(
+    test_io: Arc<dyn turso_core::IO>,
+    sync_mode: &str,
+) {
+    use turso_core::io::FileSyncType;
+    use turso_core::mvcc;
+    use turso_core::mvcc::database::{LogRecord, RowVersion};
+    use turso_core::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
+    use turso_core::mvcc::persistent_storage::DurableStorage;
+    use turso_core::storage::sqlite3_ondisk::DatabaseHeader;
+    use turso_core::{CheckpointMode, CheckpointResult, EncryptionContext, File, Result, IO};
+
+    #[derive(Debug)]
+    struct CompleteTruncateBeforeReturnStorage {
+        inner: Arc<dyn DurableStorage>,
+        file: Arc<DelayedLogicalLogTruncateFile>,
+        end_called: AtomicBool,
+    }
+
+    impl CompleteTruncateBeforeReturnStorage {
+        fn new(
+            inner: Arc<dyn DurableStorage>,
+            file: Arc<DelayedLogicalLogTruncateFile>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                file,
+                end_called: AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl DurableStorage for CompleteTruncateBeforeReturnStorage {
+        fn serialize_row_version(
+            &self,
+            log_record: &mut LogRecord,
+            row_id: &RowID,
+            row_version: &RowVersion,
+            portable_extension: Option<&[u8]>,
+        ) -> Result<()> {
+            self.inner
+                .serialize_row_version(log_record, row_id, row_version, portable_extension)
+        }
+        fn serialize_database_header(
+            &self,
+            log_record: &mut LogRecord,
+            header: &DatabaseHeader,
+        ) -> Result<()> {
+            self.inner.serialize_database_header(log_record, header)
+        }
+        fn log_tx(
+            &self,
+            m: LogRecord,
+            c: OnSerializationComplete<'_>,
+        ) -> Result<(Completion, u64)> {
+            self.inner.log_tx(m, c)
+        }
+        fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
+            self.inner.upgrade_header_for_log_tx(m)
+        }
+        fn sync(&self, t: FileSyncType) -> Result<Completion> {
+            self.inner.sync(t)
+        }
+        fn update_header(&self) -> Result<Completion> {
+            self.inner.update_header()
+        }
+        fn truncate(
+            &self,
+            checkpointed_through_ts: u64,
+        ) -> Result<(
+            Completion,
+            turso_core::mvcc::persistent_storage::LogicalLogTruncateOutcome,
+        )> {
+            let result = self.inner.truncate(checkpointed_through_ts)?;
+            if let Some((len, c)) = self.file.pending.lock().take() {
+                self.file
+                    .io
+                    .wait_for_completion(self.file.inner.truncate(len, c)?)?;
+            }
+            assert!(result.0.succeeded());
+            Ok(result)
+        }
+        fn finish_logical_log_truncate(&self) {
+            self.inner.finish_logical_log_truncate();
+        }
+        fn reset_to_fresh_header(&self) -> Result<Completion> {
+            self.inner.reset_to_fresh_header()
+        }
+        fn get_logical_log_file(&self) -> Arc<dyn File> {
+            self.inner.get_logical_log_file()
+        }
+        fn logical_log_offset(&self) -> u64 {
+            self.inner.logical_log_offset()
+        }
+        fn should_checkpoint(&self) -> bool {
+            self.inner.should_checkpoint()
+        }
+        fn set_checkpoint_threshold(&self, t: i64) {
+            self.inner.set_checkpoint_threshold(t)
+        }
+        fn checkpoint_threshold(&self) -> i64 {
+            self.inner.checkpoint_threshold()
+        }
+        fn advance_logical_log_offset_after_success(&self, b: u64) -> Result<()> {
+            self.inner.advance_logical_log_offset_after_success(b)
+        }
+        fn discard_pending_log_write(&self) -> Result<()> {
+            self.inner.discard_pending_log_write()
+        }
+        fn restore_logical_log_state_after_recovery(&self, o: u64, c: u32) {
+            self.inner.restore_logical_log_state_after_recovery(o, c)
+        }
+        fn set_header(&self, h: LogHeader) {
+            self.inner.set_header(h)
+        }
+        fn on_checkpoint_start(&self) -> Result<()> {
+            self.inner.on_checkpoint_start()
+        }
+        fn on_checkpoint_end(&self, r: Result<&CheckpointResult>) -> Result<()> {
+            self.end_called.store(true, Ordering::Release);
+            self.inner.on_checkpoint_end(r)
+        }
+        fn encryption_ctx(&self) -> Option<EncryptionContext> {
+            self.inner.encryption_ctx()
+        }
+    }
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join(format!("test_{}.db", rand::random::<u64>()));
+    let path_str = path.to_str().unwrap().to_string();
+    {
+        let io: Arc<dyn IO> = test_io.clone();
+        let db = Database::open_file_with_flags(
+            io,
+            &path_str,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+    }
+
+    let log_path = path.with_extension("db-log");
+    let io: Arc<dyn IO> = test_io.clone();
+    let log_file = io
+        .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)
+        .unwrap();
+    let log_file = Arc::new(DelayedLogicalLogTruncateFile {
+        inner: log_file,
+        io: io.clone(),
+        pending: Mutex::new(None),
+    });
+    let inner_storage: Arc<dyn DurableStorage> = Arc::new(mvcc::persistent_storage::Storage::new(
+        log_file.clone(),
+        io.clone(),
+        None,
+    ));
+    let observe = CompleteTruncateBeforeReturnStorage::new(inner_storage, log_file);
+    let db = Database::open(
+        io,
+        &path_str,
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .durable_storage(observe.clone() as Arc<dyn DurableStorage>),
+    )
+    .unwrap();
+
+    let mv_store = db.get_mv_store().clone().unwrap();
+
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute(format!("PRAGMA synchronous = {sync_mode}"))
+        .unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.checkpoint(CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    })
+    .unwrap();
+
+    assert_eq!(mv_store.logical_log_offset(), 0);
+    assert_eq!(
+        get_rows(&conn, "SELECT id, v FROM t"),
+        vec![vec![Value::from_i64(1), Value::build_text("a")]]
+    );
+    assert_eq!(
+        get_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+    assert!(
+        observe.end_called.load(Ordering::Acquire),
+        "on_checkpoint_end must run for a successful truncate checkpoint"
+    );
+}
+
+struct DelayedLogicalLogTruncateFile {
+    inner: Arc<dyn turso_core::File>,
+    io: Arc<dyn turso_core::IO>,
+    pending: Mutex<Option<(u64, Completion)>>,
+}
+impl std::fmt::Debug for DelayedLogicalLogTruncateFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DelayedLogicalLogTruncateFile")
+    }
+}
+impl turso_core::File for DelayedLogicalLogTruncateFile {
+    fn lock_file(&self, exclusive: bool) -> turso_core::Result<()> {
+        self.inner.lock_file(exclusive)
+    }
+    fn unlock_file(&self) -> turso_core::Result<()> {
+        self.inner.unlock_file()
+    }
+    fn pread(&self, pos: u64, c: Completion) -> turso_core::Result<Completion> {
+        self.inner.pread(pos, c)
+    }
+    fn pwrite(
+        &self,
+        pos: u64,
+        buffer: Arc<Buffer>,
+        c: Completion,
+    ) -> turso_core::Result<Completion> {
+        self.inner.pwrite(pos, buffer, c)
+    }
+    fn sync(
+        &self,
+        c: Completion,
+        mode: turso_core::io::FileSyncType,
+    ) -> turso_core::Result<Completion> {
+        self.inner.sync(c, mode)
+    }
+    fn size(&self) -> turso_core::Result<u64> {
+        self.inner.size()
+    }
+    fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
+        assert!(self.pending.lock().replace((len, c.clone())).is_none());
+        Ok(c)
+    }
 }
 
 #[test]
