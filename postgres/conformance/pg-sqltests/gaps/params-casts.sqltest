@@ -34,15 +34,11 @@ test int2-overflow-literal-cast {
 expect error {}
 
 # A-09: int8 overflow arithmetic
-@compat-gap "operator:int8 + int4"
 test int8-overflow-arithmetic {
     SELECT 9223372036854775807::bigint + 1;
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-    9.223372036854776e18
-}
 
 # A-10: int4 overflow arithmetic
 @compat-gap "operator:int4 + int4"

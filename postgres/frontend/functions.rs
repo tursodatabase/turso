@@ -265,6 +265,60 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "json_strip_nulls"(FunctionArity::Exact(1), true) => {
             exec_json_strip_nulls(args[0].get_value())?
         },
+        "int2pl"(FunctionArity::Exact(2), true) => {
+            crate::pg_type::int2::int2pl(args)?
+        },
+        "int2mi"(FunctionArity::Exact(2), true) => {
+            crate::pg_type::int2::int2mi(args)?
+        },
+        "int2mul"(FunctionArity::Exact(2), true) => {
+            crate::pg_type::int2::int2mul(args)?
+        },
+        "int2div"(FunctionArity::Exact(2), true) => {
+            crate::pg_type::int2::int2div(args)?
+        },
+        "int2mod"(FunctionArity::Exact(2), true) => {
+            crate::pg_type::int2::int2mod(args)?
+        },
+        "int2and"(FunctionArity::Exact(2), true) => {
+            crate::pg_type::int2::int2and(args)?
+        },
+        "int2or"(FunctionArity::Exact(2), true) => {
+            crate::pg_type::int2::int2or(args)?
+        },
+        "int2not"(FunctionArity::Exact(1), true) => {
+            crate::pg_type::int2::int2not(args)?
+        },
+        "int2um"(FunctionArity::Exact(1), true) => {
+            crate::pg_type::int2::int2um(args)?
+        },
+        "int8pl"(FunctionArity::Exact(2), true) => {
+            crate::pg_type::int8::int8pl(args)?
+        },
+        "int8mi"(FunctionArity::Exact(2), true) => {
+            crate::pg_type::int8::int8mi(args)?
+        },
+        "int8mul"(FunctionArity::Exact(2), true) => {
+            crate::pg_type::int8::int8mul(args)?
+        },
+        "int8div"(FunctionArity::Exact(2), true) => {
+            crate::pg_type::int8::int8div(args)?
+        },
+        "int8mod"(FunctionArity::Exact(2), true) => {
+            crate::pg_type::int8::int8mod(args)?
+        },
+        "int8and"(FunctionArity::Exact(2), true) => {
+            crate::pg_type::int8::int8and(args)?
+        },
+        "int8or"(FunctionArity::Exact(2), true) => {
+            crate::pg_type::int8::int8or(args)?
+        },
+        "int8not"(FunctionArity::Exact(1), true) => {
+            crate::pg_type::int8::int8not(args)?
+        },
+        "int8um"(FunctionArity::Exact(1), true) => {
+            crate::pg_type::int8::int8um(args)?
+        },
         "jsonb_field"(FunctionArity::Exact(2), true) => {
             exec_jsonb_field(args[0].get_value(), args[1].get_value())?
         },
