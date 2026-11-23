@@ -207,7 +207,8 @@ the code differs from PostgreSQL's 42883 where PostgreSQL also refuses. It cover
 Not refused yet, and compared as stored: a join with a VALUES list in FROM or
 in a CTE, such as `WITH v(x) AS (VALUES (ts)) SELECT * FROM t, v WHERE d = x`.
 The same two types in
-one result column fail the same way: in UNION, UNION ALL, INTERSECT, EXCEPT, a
+one result column fail the same way: in UNION, UNION ALL, INTERSECT and EXCEPT,
+also with a VALUES part such as `SELECT d FROM t UNION ALL VALUES (CAST('2024-01-05' AS timestamp))`, a
 multi-row VALUES that is not the row source of an INSERT, a recursive CTE with
 UNION or UNION ALL, the results of CASE, `coalesce`, `ifnull` and `iif`, and `lag` and `lead`
 with a default of another type. A string literal compared with a custom type is read as that type.

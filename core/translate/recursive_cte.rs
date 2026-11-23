@@ -281,16 +281,12 @@ fn recursive_cte_result_column_collation(
             }
         };
         for select in selects {
-            let expr = select
-                .values
-                .first()
-                .and_then(|row| row.get(result_column_index))
-                .map(Box::as_ref)
-                .unwrap_or(&select.result_columns[result_column_index].expr);
-            columns.push((
-                expr,
-                ExprContext::new(Some(&select.table_references), resolver),
-            ));
+            let context = ExprContext::new(Some(&select.table_references), resolver);
+            columns.extend(
+                select
+                    .column_exprs(result_column_index)
+                    .map(|expr| (expr, context)),
+            );
         }
     }
     first_collation(columns)

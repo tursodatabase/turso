@@ -1111,10 +1111,21 @@ impl SelectPlan {
     /// row gives the affinity, as in SQLite, which plans the rows as a
     /// compound SELECT whose last part is the last row.
     pub fn result_column_affinity_expr(&self, column: usize) -> &ast::Expr {
-        match self.values.last() {
-            Some(row) => &row[column],
-            None => &self.result_columns[column].expr,
-        }
+        self.column_exprs(column)
+            .last()
+            .expect("a SELECT has at least one row expression per column")
+    }
+
+    /// The expressions that give result column `column` its values: that of
+    /// every row of a VALUES list, whose result columns hold only
+    /// placeholders, or else the result column's expression.
+    pub fn column_exprs(&self, column: usize) -> impl Iterator<Item = &ast::Expr> + Clone {
+        let values = self.values.iter().map(move |row| row[column].as_ref());
+        let result_column = self
+            .values
+            .is_empty()
+            .then(|| &self.result_columns[column].expr);
+        values.chain(result_column)
     }
 
     pub fn joined_tables(&self) -> &[JoinedTable] {

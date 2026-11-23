@@ -651,18 +651,18 @@ pub fn compound_order_by_collation(
     Ok(CollationSeq::Text(explicit_collation))
 }
 
-/// Column `column` of every SELECT in `arms`, each with the context its
-/// columns refer to.
+/// Column `column` of every SELECT in `arms`, every row of a VALUES list
+/// included, each with the context its columns refer to.
 fn compound_column_exprs<'a, 's>(
     arms: &'a [&'a SelectPlan],
     column: usize,
     resolver: &'a Resolver<'s>,
 ) -> impl Iterator<Item = (&'a Expr, ExprContext<'a, 's>)> + Clone + 'a {
-    arms.iter().map(move |select| {
-        (
-            &select.result_columns[column].expr,
-            ExprContext::new(Some(&select.table_references), resolver),
-        )
+    arms.iter().flat_map(move |select| {
+        let context = ExprContext::new(Some(&select.table_references), resolver);
+        select
+            .column_exprs(column)
+            .map(move |expr| (expr, context))
     })
 }
 

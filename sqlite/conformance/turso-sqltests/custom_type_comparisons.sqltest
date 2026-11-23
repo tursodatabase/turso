@@ -2102,6 +2102,28 @@ expect error {
     cannot compare type timestamp with type timestamptz
 }
 
+@requires strict "uses STRICT tables"
+test cmp-union-all-of-date-and-values-of-timestamp-is-an-error {
+    CREATE TABLE t(d date, ts timestamp) STRICT;
+    SELECT d FROM t UNION ALL VALUES (CAST('2024-01-05' AS timestamp));
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-recursive-cte-values-second-row-of-timestamp-and-timestamptz-is-an-error {
+    CREATE TABLE t(tz timestamptz) STRICT;
+    WITH RECURSIVE r(x, n) AS (
+        VALUES (NULL, 0), (CAST('2024-01-05' AS timestamp), 0)
+        UNION ALL SELECT tz, n + 1 FROM t, r WHERE n < 1
+    )
+    SELECT x FROM r;
+}
+expect error {
+    cannot compare type timestamp with type timestamptz
+}
+
 # A function or operator with an array argument fails when the array's
 # elements and its other values, or another array's elements, do not compare.
 
