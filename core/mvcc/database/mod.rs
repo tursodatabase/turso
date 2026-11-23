@@ -1926,7 +1926,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                                 self.db_id,
                             );
                         }
-                    } else {
+                    } else if self.mvcc_store.txs.get(&batch.writing.tx_id).is_some() {
+                        // The owner is still alive and will take the retry.
+                        // A ticket for a transaction that already rolled back
+                        // is never taken, and that hole parks every later commit.
                         self.commit_coordinator.request_retry(batch.writing.ticket);
                     }
                 }

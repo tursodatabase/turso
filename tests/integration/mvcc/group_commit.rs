@@ -640,6 +640,256 @@ fn step_until_done(stmt: &mut Statement) {
     panic!("statement never finished")
 }
 
+/// The leader's `log_tx` for another transaction fails after that transaction
+/// has already rolled back. The failed ticket must not stay in the retry set,
+/// or every later commit parks.
+#[test]
+fn failed_log_tx_for_dropped_waiter_does_not_stall_later_commits() {
+    use std::sync::Mutex;
+    use turso_core::io::FileSyncType;
+    use turso_core::mvcc::database::{LogRecord, RowVersion};
+    use turso_core::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
+    use turso_core::mvcc::persistent_storage::DurableStorage;
+    use turso_core::storage::sqlite3_ondisk::DatabaseHeader;
+    use turso_core::EncryptionContext;
+    use turso_core::{CheckpointResult, DatabaseOpts, File, OpenFlags, OpenOptions, Result, IO};
+
+    struct BusyAfterHook {
+        inner: Arc<dyn DurableStorage>,
+        on_busy: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl std::fmt::Debug for BusyAfterHook {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("BusyAfterHook").finish_non_exhaustive()
+        }
+    }
+
+    impl BusyAfterHook {
+        fn new(inner: Arc<dyn DurableStorage>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                on_busy: Mutex::new(None),
+            })
+        }
+
+        fn arm(&self, hook: impl FnOnce() + Send + 'static) {
+            *self.on_busy.lock().unwrap() = Some(Box::new(hook));
+        }
+    }
+
+    impl DurableStorage for BusyAfterHook {
+        fn serialize_row_version(
+            &self,
+            log_record: &mut LogRecord,
+            row_id: &turso_core::mvcc::database::RowID,
+            row_version: &RowVersion,
+            portable_extension: Option<&[u8]>,
+        ) -> Result<()> {
+            self.inner
+                .serialize_row_version(log_record, row_id, row_version, portable_extension)
+        }
+        fn serialize_database_header(
+            &self,
+            log_record: &mut LogRecord,
+            header: &DatabaseHeader,
+        ) -> Result<()> {
+            self.inner.serialize_database_header(log_record, header)
+        }
+        fn log_tx(
+            &self,
+            record: LogRecord,
+            on_serialization_complete: OnSerializationComplete<'_>,
+        ) -> Result<(Completion, u64)> {
+            if let Some(hook) = self.on_busy.lock().unwrap().take() {
+                hook();
+                return Err(LimboError::Busy);
+            }
+            self.inner.log_tx(record, on_serialization_complete)
+        }
+        fn upgrade_header_for_log_tx(&self, record: &LogRecord) -> Result<Option<Completion>> {
+            self.inner.upgrade_header_for_log_tx(record)
+        }
+        fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
+            self.inner.sync(sync_type)
+        }
+        fn update_header(&self) -> Result<Completion> {
+            self.inner.update_header()
+        }
+        fn truncate(
+            &self,
+            checkpointed_through_ts: u64,
+        ) -> Result<(
+            Completion,
+            turso_core::mvcc::persistent_storage::LogicalLogTruncateOutcome,
+        )> {
+            self.inner.truncate(checkpointed_through_ts)
+        }
+        fn finish_truncate(&self) {
+            self.inner.finish_truncate()
+        }
+        fn reset_to_fresh_header(&self) -> Result<Completion> {
+            self.inner.reset_to_fresh_header()
+        }
+        fn get_logical_log_file(&self) -> Arc<dyn File> {
+            self.inner.get_logical_log_file()
+        }
+        fn logical_log_offset(&self) -> u64 {
+            self.inner.logical_log_offset()
+        }
+        fn should_checkpoint(&self) -> bool {
+            self.inner.should_checkpoint()
+        }
+        fn set_checkpoint_threshold(&self, threshold: i64) {
+            self.inner.set_checkpoint_threshold(threshold)
+        }
+        fn checkpoint_threshold(&self) -> i64 {
+            self.inner.checkpoint_threshold()
+        }
+        fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()> {
+            self.inner.advance_logical_log_offset_after_success(bytes)
+        }
+        fn discard_pending_log_write(&self) -> Result<()> {
+            self.inner.discard_pending_log_write()
+        }
+        fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32) {
+            self.inner
+                .restore_logical_log_state_after_recovery(offset, running_crc)
+        }
+        fn set_header(&self, header: LogHeader) {
+            self.inner.set_header(header)
+        }
+        fn on_checkpoint_start(&self) -> Result<()> {
+            self.inner.on_checkpoint_start()
+        }
+        fn on_checkpoint_end(&self, result: Result<&CheckpointResult>) -> Result<()> {
+            self.inner.on_checkpoint_end(result)
+        }
+        fn encryption_ctx(&self) -> Option<EncryptionContext> {
+            self.inner.encryption_ctx()
+        }
+    }
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join(format!("test_{}.db", rand::random::<u64>()));
+    let path_str = path.to_str().unwrap().to_string();
+    {
+        let io: Arc<dyn IO> = Arc::new(turso_core::io::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            &path_str,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+    }
+
+    let log_path = path.with_extension("db-log");
+    let io: Arc<dyn IO> = Arc::new(turso_core::io::PlatformIO::new().unwrap());
+    let log_file = io
+        .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)
+        .unwrap();
+    let inner: Arc<dyn DurableStorage> = Arc::new(
+        turso_core::mvcc::persistent_storage::Storage::new(log_file, io.clone(), None),
+    );
+    let storage = BusyAfterHook::new(inner);
+    let db = Database::open(
+        io,
+        &path_str,
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .durable_storage(storage.clone() as Arc<dyn DurableStorage>),
+    )
+    .unwrap();
+
+    let setup = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup.execute("PRAGMA mvcc_group_commit = yes").unwrap();
+    setup
+        .execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let waiter = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let leader = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    waiter.execute("BEGIN CONCURRENT").unwrap();
+    leader.execute("BEGIN CONCURRENT").unwrap();
+    waiter.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    leader.execute("INSERT INTO t VALUES (2, 1)").unwrap();
+
+    let store = db.get_mv_store().clone().unwrap();
+    assert!(store.lock_commits_for_testing());
+
+    let mut commit_waiter = waiter.prepare("COMMIT").unwrap();
+    let mut commit_leader = leader.prepare("COMMIT").unwrap();
+    assert!(matches!(commit_waiter.step().unwrap(), StepResult::IO));
+    assert!(matches!(commit_leader.step().unwrap(), StepResult::IO));
+    assert_eq!(store.waiting_commit_count_for_testing(), 2);
+
+    let waiter_commit = Arc::new(Mutex::new(Some(commit_waiter)));
+    let drop_waiter = Arc::clone(&waiter_commit);
+    storage.arm(move || {
+        drop(drop_waiter.lock().unwrap().take());
+    });
+
+    store.unlock_commits_for_testing();
+    let mut saw_busy = false;
+    for _ in 0..20 {
+        match commit_leader.step() {
+            Ok(StepResult::Busy) => {
+                saw_busy = true;
+                break;
+            }
+            Ok(StepResult::IO | StepResult::Yield) => {}
+            other => panic!("leader COMMIT ended with {other:?}"),
+        }
+    }
+    assert!(saw_busy, "leader log_tx should return Busy");
+    drop(commit_leader);
+
+    let later = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    later.execute("BEGIN CONCURRENT").unwrap();
+    later.execute("INSERT INTO t VALUES (3, 1)").unwrap();
+    let mut commit_later = later.prepare("COMMIT").unwrap();
+    let mut finished = false;
+    for _ in 0..50 {
+        match commit_later.step() {
+            Ok(StepResult::Done) => {
+                finished = true;
+                break;
+            }
+            Ok(StepResult::IO | StepResult::Yield) => {}
+            other => panic!("later COMMIT ended with {other:?}"),
+        }
+    }
+    assert!(
+        finished,
+        "a later commit stayed parked after the failed group write"
+    );
+    assert_eq!(
+        get_rows(&later, "SELECT pk FROM t ORDER BY pk"),
+        vec![vec![Value::from_i64(3)]]
+    );
+}
+
 #[test]
 fn full_waiter_is_synced_when_group_leader_uses_sync_off() {
     let (_db, io, [mut leader, mut waiter]) =
