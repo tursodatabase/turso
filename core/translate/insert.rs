@@ -54,10 +54,7 @@ use crate::{
         trigger_exec::{
             fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
         },
-        upsert::{
-            collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target,
-            ResolvedUpsertTarget,
-        },
+        upsert::{emit_upsert, resolve_upsert_target, ResolvedUpsertTarget},
     },
     util::normalize_ident,
     vdbe::{
@@ -399,16 +396,24 @@ pub fn translate_insert(
         vec![],
     );
 
-    // Plan CTEs and add them as outer query references for RETURNING subquery resolution
-    let mut returning_table_refs = Vec::new();
+    // Plan CTEs and add them as outer query references for the subqueries of
+    // RETURNING and of DO UPDATE
+    let mut subquery_table_refs = Vec::new();
     for column in &returning {
         if let ResultColumn::Expr(expr, _) = column {
-            collect_subquery_table_refs_in_expr(expr, &mut returning_table_refs);
+            collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
+        }
+    }
+    for (_, _, upsert) in &upsert_actions {
+        if let UpsertDo::Set { sets, where_clause } = &upsert.do_clause {
+            for expr in sets.iter().map(|set| &set.expr).chain(where_clause) {
+                collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
+            }
         }
     }
     plan_ctes_as_outer_refs(
         with_for_returning,
-        &returning_table_refs,
+        &subquery_table_refs,
         resolver,
         program,
         &mut table_references,
@@ -1799,8 +1804,6 @@ fn resolve_upserts(
             ref mut where_clause,
         } = upsert.do_clause
         {
-            // Normalize SET pairs once
-            let mut rewritten_sets = collect_set_clauses_for_upsert(table, sets, resolver)?;
             let set_column_names: Vec<_> = sets
                 .iter()
                 .flat_map(|set| set.col_names.iter().cloned())
@@ -1811,7 +1814,7 @@ fn resolve_upserts(
                 table,
                 ctx,
                 insertion,
-                &mut rewritten_sets,
+                sets,
                 &set_column_names,
                 where_clause,
                 resolver,

@@ -88,7 +88,10 @@ pub fn translate_update(
 /// After planning, the right-hand side (SELECT x, y FROM s) becomes a
 /// SubqueryResult with 2 columns, and this is split into 2 1-column SubqueryResult expressions
 /// i.e. one per each SET assignment.
-fn split_update_set_values(mut expr: Expr, target_count: usize) -> crate::Result<Vec<Expr>> {
+pub(crate) fn split_update_set_values(
+    mut expr: Expr,
+    target_count: usize,
+) -> crate::Result<Vec<Expr>> {
     while let Expr::Parenthesized(mut exprs) = expr {
         match exprs.len() {
             1 => expr = *exprs.pop().expect("single parenthesized expr"),
