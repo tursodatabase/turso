@@ -1504,3 +1504,76 @@ expect {
     2|2|2|2
     NULL
 }
+
+# An INTEGER PRIMARY KEY is stored only as the rowid, with NULL in its record
+# slot. The last bytes of the page are the only cell: payload size, rowid,
+# header size, serial type 0 (NULL) for id, then the serial type of v
+# (8 = constant 0, 9 = constant 1).
+@backend cli
+@skip-if sqlite "the sqlite3 build used by the tests has no sqlite_dbpage"
+@skip-if mvcc "MVCC keeps the updated row out of the B-tree until a checkpoint"
+test upsert-do-update-stores-rowid-alias-as-null {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES(7, 0);
+    INSERT INTO t VALUES(7, 0) ON CONFLICT(id) DO UPDATE SET v = v + 1;
+    SELECT hex(substr(data, -6)) FROM sqlite_dbpage WHERE pgno = 2;
+}
+expect {
+    000307030009
+}
+
+@backend cli
+@skip-if sqlite "the sqlite3 build used by the tests has no sqlite_dbpage"
+@skip-if mvcc "MVCC keeps the updated row out of the B-tree until a checkpoint"
+test upsert-do-update-on-other-index-stores-rowid-alias-as-null {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER UNIQUE);
+    INSERT INTO t VALUES(7, 0);
+    INSERT INTO t VALUES(8, 0) ON CONFLICT(v) DO UPDATE SET v = v + 1;
+    SELECT hex(substr(data, -6)) FROM sqlite_dbpage WHERE pgno = 2;
+}
+expect {
+    000307030009
+}
+
+@backend cli
+@skip-if sqlite "the sqlite3 build used by the tests has no sqlite_dbpage"
+@skip-if mvcc "MVCC keeps the updated row out of the B-tree until a checkpoint"
+test upsert-do-update-set-rowid-alias-stores-null {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE c(x INTEGER REFERENCES t(id) ON UPDATE CASCADE);
+    INSERT INTO t VALUES(7, 0);
+    INSERT INTO c VALUES(7);
+    INSERT INTO t VALUES(7, 0) ON CONFLICT(id) DO UPDATE SET id = 9;
+    SELECT hex(substr(data, -6)) FROM sqlite_dbpage WHERE pgno = 2;
+    SELECT x FROM c;
+}
+expect {
+    000309030008
+    9
+}
+
+# With the rowid alias slot of the new row NULL in the record, triggers,
+# RETURNING, generated columns and indexes still read the new rowid.
+@cross-check-integrity
+test upsert-do-update-rowid-alias-seen-by-triggers-and-returning {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, g AS (id * 2));
+    CREATE INDEX t_v_id ON t(v, id);
+    CREATE TABLE log(o, n, r, g);
+    CREATE TRIGGER tb BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES(old.id, new.id, new.rowid, new.g); END;
+    CREATE TRIGGER ta AFTER UPDATE ON t BEGIN INSERT INTO log VALUES(old.id, new.id, new.rowid, new.g); END;
+    INSERT INTO t(id, v) VALUES(7, 0);
+    INSERT INTO t(id, v) VALUES(7, 0) ON CONFLICT(id) DO UPDATE SET v = v + 1 RETURNING id, rowid, g, v;
+    INSERT INTO t(id, v) VALUES(7, 0) ON CONFLICT(id) DO UPDATE SET id = 30 RETURNING id, rowid, g, v;
+    SELECT * FROM log;
+    SELECT id, v FROM t INDEXED BY t_v_id WHERE v >= 0;
+}
+expect {
+    7|7|14|1
+    30|30|60|1
+    7|7|7|14
+    7|7|7|14
+    7|30|30|60
+    7|30|30|60
+    30|1
+}
