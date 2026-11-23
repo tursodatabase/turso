@@ -1,3 +1,4 @@
+mod busy_log_storage;
 mod checkpoint;
 mod concurrent_inserts;
 mod database;

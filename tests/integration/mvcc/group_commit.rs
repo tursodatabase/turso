@@ -646,129 +646,10 @@ fn step_until_done(stmt: &mut Statement) {
 #[test]
 fn failed_log_tx_for_dropped_waiter_does_not_stall_later_commits() {
     use std::sync::Mutex;
-    use turso_core::io::FileSyncType;
-    use turso_core::mvcc::database::{LogRecord, RowVersion};
-    use turso_core::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
     use turso_core::mvcc::persistent_storage::DurableStorage;
-    use turso_core::storage::sqlite3_ondisk::DatabaseHeader;
-    use turso_core::EncryptionContext;
-    use turso_core::{CheckpointResult, DatabaseOpts, File, OpenFlags, OpenOptions, Result, IO};
+    use turso_core::{DatabaseOpts, OpenFlags, OpenOptions, IO};
 
-    struct BusyAfterHook {
-        inner: Arc<dyn DurableStorage>,
-        on_busy: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    }
-
-    impl std::fmt::Debug for BusyAfterHook {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("BusyAfterHook").finish_non_exhaustive()
-        }
-    }
-
-    impl BusyAfterHook {
-        fn new(inner: Arc<dyn DurableStorage>) -> Arc<Self> {
-            Arc::new(Self {
-                inner,
-                on_busy: Mutex::new(None),
-            })
-        }
-
-        fn arm(&self, hook: impl FnOnce() + Send + 'static) {
-            *self.on_busy.lock().unwrap() = Some(Box::new(hook));
-        }
-    }
-
-    impl DurableStorage for BusyAfterHook {
-        fn serialize_row_version(
-            &self,
-            log_record: &mut LogRecord,
-            row_id: &turso_core::mvcc::database::RowID,
-            row_version: &RowVersion,
-            portable_extension: Option<&[u8]>,
-        ) -> Result<()> {
-            self.inner
-                .serialize_row_version(log_record, row_id, row_version, portable_extension)
-        }
-        fn serialize_database_header(
-            &self,
-            log_record: &mut LogRecord,
-            header: &DatabaseHeader,
-        ) -> Result<()> {
-            self.inner.serialize_database_header(log_record, header)
-        }
-        fn log_tx(
-            &self,
-            record: LogRecord,
-            on_serialization_complete: OnSerializationComplete<'_>,
-        ) -> Result<(Completion, u64)> {
-            if let Some(hook) = self.on_busy.lock().unwrap().take() {
-                hook();
-                return Err(LimboError::Busy);
-            }
-            self.inner.log_tx(record, on_serialization_complete)
-        }
-        fn upgrade_header_for_log_tx(&self, record: &LogRecord) -> Result<Option<Completion>> {
-            self.inner.upgrade_header_for_log_tx(record)
-        }
-        fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
-            self.inner.sync(sync_type)
-        }
-        fn update_header(&self) -> Result<Completion> {
-            self.inner.update_header()
-        }
-        fn truncate(
-            &self,
-            checkpointed_through_ts: u64,
-        ) -> Result<(
-            Completion,
-            turso_core::mvcc::persistent_storage::LogicalLogTruncateOutcome,
-        )> {
-            self.inner.truncate(checkpointed_through_ts)
-        }
-        fn finish_truncate(&self) {
-            self.inner.finish_truncate()
-        }
-        fn reset_to_fresh_header(&self) -> Result<Completion> {
-            self.inner.reset_to_fresh_header()
-        }
-        fn get_logical_log_file(&self) -> Arc<dyn File> {
-            self.inner.get_logical_log_file()
-        }
-        fn logical_log_offset(&self) -> u64 {
-            self.inner.logical_log_offset()
-        }
-        fn should_checkpoint(&self) -> bool {
-            self.inner.should_checkpoint()
-        }
-        fn set_checkpoint_threshold(&self, threshold: i64) {
-            self.inner.set_checkpoint_threshold(threshold)
-        }
-        fn checkpoint_threshold(&self) -> i64 {
-            self.inner.checkpoint_threshold()
-        }
-        fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()> {
-            self.inner.advance_logical_log_offset_after_success(bytes)
-        }
-        fn discard_pending_log_write(&self) -> Result<()> {
-            self.inner.discard_pending_log_write()
-        }
-        fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32) {
-            self.inner
-                .restore_logical_log_state_after_recovery(offset, running_crc)
-        }
-        fn set_header(&self, header: LogHeader) {
-            self.inner.set_header(header)
-        }
-        fn on_checkpoint_start(&self) -> Result<()> {
-            self.inner.on_checkpoint_start()
-        }
-        fn on_checkpoint_end(&self, result: Result<&CheckpointResult>) -> Result<()> {
-            self.inner.on_checkpoint_end(result)
-        }
-        fn encryption_ctx(&self) -> Option<EncryptionContext> {
-            self.inner.encryption_ctx()
-        }
-    }
+    use super::busy_log_storage::BusyOnLogTxStorage;
 
     let temp_dir = tempfile::TempDir::new().unwrap();
     let path = temp_dir
@@ -801,7 +682,7 @@ fn failed_log_tx_for_dropped_waiter_does_not_stall_later_commits() {
     let inner: Arc<dyn DurableStorage> = Arc::new(
         turso_core::mvcc::persistent_storage::Storage::new(log_file, io.clone(), None),
     );
-    let storage = BusyAfterHook::new(inner);
+    let storage = BusyOnLogTxStorage::new(inner);
     let db = Database::open(
         io,
         &path_str,
@@ -844,7 +725,7 @@ fn failed_log_tx_for_dropped_waiter_does_not_stall_later_commits() {
 
     let waiter_commit = Arc::new(Mutex::new(Some(commit_waiter)));
     let drop_waiter = Arc::clone(&waiter_commit);
-    storage.arm(move || {
+    storage.arm_before_busy(move || {
         drop(drop_waiter.lock().unwrap().take());
     });
 
