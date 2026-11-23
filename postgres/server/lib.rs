@@ -1660,6 +1660,43 @@ mod tests {
         }
     }
 
+    /// A parameter sent without a type has type unknown, which PostgreSQL
+    /// reads as text input, whatever the text looks like.
+    #[test]
+    fn untyped_parameters_are_text_input_for_time_and_json_types() {
+        let conn = memory_connection();
+        conn.execute("CREATE TABLE w (j json, ts timestamp)")
+            .unwrap();
+        let bind = |sql: &str, text: &str| {
+            let mut portal = Portal::<String>::default();
+            portal.statement = Arc::new(StoredStatement::new(
+                String::new(),
+                String::new(),
+                vec![None],
+            ));
+            portal.parameters = vec![Some(text.as_bytes().to_vec().into())];
+            let mut stmt = conn.prepare(sql).unwrap();
+            bind_portal_parameters(&mut stmt, &portal).unwrap();
+            stmt.run_collect_rows().unwrap()
+        };
+        bind("INSERT INTO w (j) VALUES ($1)", "123");
+        bind("INSERT INTO w (ts) VALUES ($1)", "20200101");
+        let rows = bind("SELECT $1::timestamp::text", "20200103");
+        assert_eq!(rows, [[Value::from_text("2020-01-03 00:00:00")]]);
+        let rows = bind(
+            "SELECT (SELECT j::text FROM w WHERE j IS NOT NULL), (SELECT ts::text FROM w WHERE ts IS NOT NULL), $1::text",
+            "x",
+        );
+        assert_eq!(
+            rows,
+            [[
+                Value::from_text("123"),
+                Value::from_text("2020-01-01 00:00:00"),
+                Value::from_text("x")
+            ]]
+        );
+    }
+
     #[test]
     fn a_refused_binary_format_aborts_the_transaction_block() {
         let (mut client, _conn) = copy_test_client();

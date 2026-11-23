@@ -762,6 +762,17 @@ pub fn emit_upsert(
         &layout,
     )?;
     let set_pairs = &collect_set_clauses_for_upsert(table, sets, resolver)?;
+    for (col_idx, expr) in set_pairs {
+        if let Some(column) = table.columns().get(*col_idx) {
+            crate::translate::expr::check_store_source_for_column(
+                expr,
+                Some(table_references),
+                column,
+                table.is_strict(),
+                resolver,
+            )?;
+        }
+    }
     let mut new_rowid_reg: Option<usize> = None;
     for (col_idx, expr) in set_pairs {
         if *col_idx == ROWID_SENTINEL {
@@ -839,7 +850,6 @@ pub fn emit_upsert(
                     &bt,
                     resolver.schema(),
                     None,
-                    &*resolver.catalog.dialect,
                 )?,
             });
         } else {

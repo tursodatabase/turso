@@ -675,8 +675,7 @@ pub(crate) enum Coerce<'a> {
 /// 5, and one whose ENCODE gives 'abc' is an error. COERCE sees the converted
 /// value too. A CAST runs the same. NULL is left as it is, without running
 /// ENCODE; a domain's NOT NULL is checked afterwards, by the column's NOT NULL
-/// constraint or by the CAST. A type that refuses values that are not text
-/// (see [Schema::refuses_non_text_input]) fails on any other kind first.
+/// constraint or by the CAST.
 pub(crate) fn emit_store_value(
     program: &mut ProgramBuilder,
     resolved: &ResolvedType,
@@ -698,7 +697,6 @@ pub(crate) fn emit_store_value(
         reg,
         target_pc: skip_label,
     });
-    emit_refuse_non_text_input(program, resolved, reg, resolver)?;
     for type_def in &resolved.chain {
         if let Some(encode) = type_def.encode() {
             emit_type_expr(program, encode, reg, reg, resolver)?;
@@ -717,40 +715,93 @@ pub(crate) fn emit_store_value(
     Ok(())
 }
 
-/// Emits the check that the value in `reg`, when it is not NULL, is text if
-/// `resolved` refuses other kinds (see [Schema::refuses_non_text_input]). Every store
-/// of a value into such a type runs it first, before any conversion to text
-/// turns 20200101 into '20200101', which date would read as a date.
-fn emit_refuse_non_text_input(
-    program: &mut ProgramBuilder,
-    resolved: &ResolvedType,
-    reg: usize,
+/// Fails when a CAST of a value of the custom type `source` to `target`, which
+/// `custom_type_cast_chain` resolves for a custom type and is None for a plain
+/// Fails when a value of static type `source` is stored in, or cast to, the
+/// type `target`, which reads text and refuses other kinds (see
+/// [Schema::refuses_non_text_input]), and `source` is known not to be text: an
+/// integer, a real, a decimal, a number or a blob. PostgreSQL has no
+/// assignment or explicit cast from these types, and SQLite would convert
+/// 20200101 to the text '20200101', which a date reads as a date. A value of
+/// a type that is not known here, such as a parameter or a subquery, is
+/// accepted: PostgreSQL gives a parameter sent without a type the type of
+/// its text.
+pub(crate) fn check_store_source_type(
+    source: &ExprType,
+    target: &ResolvedType,
     resolver: &Resolver,
 ) -> Result<()> {
-    if !resolver
+    use BuiltinType::{Blob, Decimal, Integer, Numeric, Real};
+    if !matches!(
+        source,
+        ExprType::Builtin(Integer | Real | Decimal | Numeric | Blob)
+    ) || !resolver
         .schema()
-        .refuses_non_text_input(resolved, &*resolver.catalog.dialect)?
+        .refuses_non_text_input(target, &*resolver.catalog.dialect)?
     {
         return Ok(());
     }
-    let is_text = program.allocate_label();
-    program.emit_insn(Insn::IsType {
-        reg,
-        target_pc: is_text,
-        value_type: crate::types::ValueType::Text,
-    });
-    program.emit_insn(Insn::Halt {
-        constraint_info: None,
-        err_code: SQLITE_ERROR,
-        description: format!(
-            "cannot cast a value that is not text to type {}",
-            resolved.leaf().name
-        ),
-        on_error: Some(ResolveType::Abort),
-        description_reg: None,
-    });
-    program.preassign_label_to_next_insn(is_text);
-    Ok(())
+    Err(LimboError::ParseError(format!(
+        "cannot cast type {source} to type {}",
+        target.leaf().name
+    )))
+}
+
+/// The static type of `source` when it is known well enough to refuse a store
+/// or a CAST: a number or blob literal, optionally signed, or a column of a
+/// table. The type of other expressions, such as the columns of a derived
+/// table or a function's result, is not always exact, so they count as not
+/// known.
+pub(crate) fn known_source_type(
+    source: &ast::Expr,
+    tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Option<ExprType> {
+    let mut expr = source;
+    while let ast::Expr::Parenthesized(exprs) = expr {
+        let [inner] = exprs.as_slice() else {
+            return None;
+        };
+        expr = inner;
+    }
+    let known = match expr {
+        ast::Expr::Literal(
+            ast::Literal::Numeric(_)
+            | ast::Literal::True
+            | ast::Literal::False
+            | ast::Literal::Blob(_),
+        ) => true,
+        ast::Expr::Unary(ast::UnaryOperator::Negative | ast::UnaryOperator::Positive, inner) => {
+            return known_source_type(inner, tables, resolver);
+        }
+        ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => tables
+            .and_then(|tables| tables.find_table_by_internal_id(*table))
+            .is_some_and(|(_, table)| matches!(table, Table::BTree(_))),
+        _ => false,
+    };
+    known.then(|| type_of(expr, &TypeEnv::new(tables, resolver)))
+}
+
+/// [check_store_source_type] for `source`, a value stored in the column
+/// `column` of a table, when its type is known (see [known_source_type]).
+/// `tables` are the tables `source` reads.
+pub(crate) fn check_store_source_for_column(
+    source: &ast::Expr,
+    tables: Option<&TableReferences>,
+    column: &Column,
+    is_strict: bool,
+    resolver: &Resolver,
+) -> Result<()> {
+    if column.is_array() {
+        return Ok(());
+    }
+    let Some(source) = known_source_type(source, tables, resolver) else {
+        return Ok(());
+    };
+    match resolver.schema().resolve_type(&column.ty_str, is_strict)? {
+        Some(resolved) => check_store_source_type(&source, &resolved, resolver),
+        None => Ok(()),
+    }
 }
 
 /// Fails when a CAST of a value of the custom type `source` to `target`, which

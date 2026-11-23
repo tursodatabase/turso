@@ -850,6 +850,11 @@ fn translate_cast_expr(
         let source = type_of(expr, &TypeEnv::new(referenced_tables, resolver));
         let target = custom_type_cast_chain(tn, resolver.schema())?;
         check_cast_from_text_input_type(&source, target.as_ref(), tn, resolver)?;
+        if let (Some(target), 0) = (&target, tn.array_dimensions) {
+            if let Some(source) = known_source_type(expr, referenced_tables, resolver) {
+                check_store_source_type(&source, target, resolver)?;
+            }
+        }
     }
 
     let cast_type_name = type_name.as_ref().map(|tn| crate::util::dequote(&tn.name));
@@ -957,13 +962,7 @@ fn emit_custom_type_cast(
     // CAST to that type would, then stores it as a column of the type
     // does: CAST(5.5 AS smallint) is 5, as are CAST(5.5 AS bigint) and
     // CAST(5.5 AS d) for a domain d over integer.
-    // A type that refuses values that are not text sees the value as it is, so
-    // that CAST(20200101 AS date) is not read as the text 20200101.
     match resolver.schema().plain_input_type(&resolved)? {
-        StrictType::Stores(_)
-            if resolver
-                .schema()
-                .refuses_non_text_input(&resolved, &*resolver.catalog.dialect)? => {}
         StrictType::Stores(storage_class) => program.emit_insn(Insn::Cast {
             reg,
             affinity: storage_class.affinity(),

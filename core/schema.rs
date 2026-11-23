@@ -5935,14 +5935,12 @@ impl BTreeTable {
 
     /// Create a table ref for pre-encode TypeCheck that validates user input
     /// against the type's declared `value` input type (or base if not declared).
-    /// A type that refuses values that are not text keeps its input as it is.
     /// For UPDATE, `only_columns` limits which columns are checked — non-SET
     /// columns hold encoded values and must be skipped (set to ANY).
     pub fn input_type_check_table_ref(
         table: &Arc<BTreeTable>,
         schema: &Schema,
         only_columns: Option<&ColumnMask>,
-        dialect: &dyn crate::dialect::Dialect,
     ) -> Result<Arc<BTreeTable>> {
         let has_custom = table
             .columns
@@ -5966,14 +5964,6 @@ impl BTreeTable {
                 col.ty_str = "ANY".to_string();
                 col.override_affinity(Affinity::Blob);
             } else if let Some(resolved) = schema.resolve_type(&col.ty_str, table.is_strict)? {
-                if schema.refuses_non_text_input(&resolved, dialect)? {
-                    // A STRICT TEXT column would turn 20200101 into the text
-                    // 20200101, which the type reads as a date. The check of
-                    // the type's ENCODE refuses a value that is not text.
-                    col.ty_str = "ANY".to_string();
-                    col.override_affinity(Affinity::Blob);
-                    continue;
-                }
                 col.ty_str = schema.plain_input_type(&resolved)?.name().to_string();
             }
         }

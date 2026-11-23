@@ -113,6 +113,19 @@ expect error {}
 @sqlstate 42846
 expect @tursopg error {}
 
+# The refusal of a value that is not text looks at the type of the value when
+# the statement is compiled, so it does not see the integer of a subquery.
+@compat-gap "cast:int4 -> timestamptz"
+test insert-subquery-integer-into-timestamptz {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ((SELECT 20260101)); SELECT ts FROM t;
+}
+@sqlstate 42804
+expect error {}
+expect @tursopg {
+    2026-01-01 00:00:00+00
+}
+
 @compat-gap "operator:timestamptz > int4"
 test compare-timestamptz-with-integer {
     CREATE TABLE t (ts timestamptz);

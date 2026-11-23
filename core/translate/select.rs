@@ -41,6 +41,9 @@ use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
 use std::borrow::Cow;
 
+/// Checks the plan of the SELECT that gives the rows of an INSERT.
+type InsertSourceCheck<'a> = dyn Fn(&Plan) -> Result<()> + 'a;
+
 #[turso_macros::trace_stack]
 pub fn translate_select(
     select: ast::Select,
@@ -55,7 +58,7 @@ pub fn translate_select(
         program,
         query_destination,
         connection,
-        false,
+        None,
     )
 }
 
@@ -68,6 +71,7 @@ pub fn translate_insert_source_select(
     program: &mut ProgramBuilder,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    check_plan: &InsertSourceCheck,
 ) -> Result<usize> {
     translate_select_with_source(
         select,
@@ -75,7 +79,7 @@ pub fn translate_insert_source_select(
         program,
         query_destination,
         connection,
-        true,
+        Some(check_plan),
     )
 }
 
@@ -86,7 +90,7 @@ fn translate_select_with_source(
     program: &mut ProgramBuilder,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
-    is_insert_source: bool,
+    insert_source_check: Option<&InsertSourceCheck>,
 ) -> Result<usize> {
     let plan = prepare_select_plan_from_arms(
         select.body.select,
@@ -99,8 +103,11 @@ fn translate_select_with_source(
         &[],
         query_destination,
         connection,
-        is_insert_source,
+        insert_source_check.is_some(),
     )?;
+    if let Some(check) = insert_source_check {
+        check(&plan)?;
+    }
     if program.trigger.is_some() {
         if let Some(virtual_table) = plan_first_virtual_table_name(&plan) {
             crate::bail_parse_error!("unsafe use of virtual table \"{}\"", virtual_table);
