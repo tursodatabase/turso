@@ -460,7 +460,12 @@ impl<T: AnyText> Extendable<T> for Text {
                         s.as_mut_vec().set_len(needed);
                     }
                 } else {
-                    other_str.clone_into(s);
+                    // Growing the old buffer copies its bytes, which this
+                    // write replaces, so copy into a new buffer instead.
+                    // The capacity is the one that growing gives.
+                    let mut text = String::with_capacity(needed.max(s.capacity() * 2));
+                    text.push_str(other_str);
+                    *s = text;
                 }
             }
             Cow::Borrowed(_) => {
@@ -489,10 +494,14 @@ impl<T: AnyBlob> Extendable<T> for ValueBlob {
                 self.set_len(needed);
             }
         } else {
-            // Reserve before mutation so an allocation failure leaves the old value intact.
-            self.try_reserve(needed - self.len())?;
-            self.clear();
-            self.extend_from_slice(other_slice);
+            // Growing the old buffer copies its bytes, which this write
+            // replaces, so copy into a new buffer instead. The capacity is
+            // the one that growing gives. An allocation failure leaves the
+            // old value intact.
+            let mut blob = <ValueBlob as TursoAllocExt>::new();
+            blob.try_reserve(needed.max(self.capacity() * 2))?;
+            blob.extend_from_slice(other_slice);
+            *self = blob;
         }
         Ok(())
     }

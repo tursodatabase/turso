@@ -8019,15 +8019,26 @@ impl BTreeCursor {
         self.ensure_payload_layout()?;
         let mut kept = std::mem::take(self.blob_cache.kept_read_mut(which));
         if !(kept.valid && kept.offset == offset && kept.len == len) {
-            kept.bytes.clear();
+            // Growing the buffer copies its old bytes, which this read
+            // replaces. So a buffer that is too small is replaced by a new
+            // one with the capacity that growing gives.
+            let capacity = if kept.bytes.capacity() < len {
+                let capacity = len.max(kept.bytes.capacity() * 2);
+                kept.bytes = crate::alloc::vec![];
+                capacity
+            } else {
+                kept.bytes.clear();
+                len
+            };
             match which {
                 KeptRead::Header => crate::with_btree_allocation_site!(
                     BlobRecordHeader,
-                    kept.bytes.try_reserve(len)
+                    kept.bytes.try_reserve(capacity)
                 )?,
-                KeptRead::Values => {
-                    crate::with_btree_allocation_site!(OverflowRead, kept.bytes.try_reserve(len))?
-                }
+                KeptRead::Values => crate::with_btree_allocation_site!(
+                    OverflowRead,
+                    kept.bytes.try_reserve(capacity)
+                )?,
             }
             kept.valid = true;
             kept.offset = offset;
