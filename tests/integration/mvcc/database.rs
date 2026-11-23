@@ -14184,3 +14184,108 @@ fn assert_unique_point_delete_does_not_seek_next(
         })]]
     );
 }
+
+/// Integrity checking must not rescan the shadowed physical index tail for
+/// every replacement row when it checks the entry after an exact lookup.
+#[test]
+fn test_mvcc_replacement_read_integrity_has_bounded_cursor_work() {
+    const ROWS: i64 = 1024;
+    for descending in [false, true] {
+        let (_db, conn) = replacement_read_fixture(ROWS, true, descending);
+        let work = Arc::new(SeekBtreeSteps::default());
+        conn.set_yield_injector(Some(work.clone()));
+        let rows = get_rows(&conn, "PRAGMA integrity_check");
+        conn.set_yield_injector(None);
+        assert_eq!(rows, vec![vec![Value::from_text("ok")]]);
+        let steps = work.total.load(Ordering::Relaxed);
+        assert!(
+            steps <= 64 * ROWS as u64,
+            "integrity checking rescanned shadowed index entries: {steps} cursor work events for {ROWS} rows, descending={descending}"
+        );
+        assert_eq!(
+            get_rows(&conn, "SELECT count(*),sum(v) FROM items"),
+            vec![vec![
+                Value::from_i64(ROWS),
+                Value::from_i64(ROWS * 1000 + ROWS * (ROWS + 1) / 2),
+            ]]
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+/// A non-unique equality join must keep all duplicate matches without walking
+/// the shadowed physical suffix again for every probe and continuation.
+#[test]
+fn test_mvcc_replacement_read_nonunique_join_has_bounded_cursor_work() {
+    const ROWS: i64 = 1024;
+    for descending in [false, true] {
+        let (_db, conn) = replacement_read_fixture(ROWS, false, descending);
+        let work = Arc::new(SeekBtreeSteps::default());
+        conn.set_yield_injector(Some(work.clone()));
+        let rows = get_rows(
+            &conn,
+            "SELECT count(*),sum(b.v) FROM items a JOIN items b INDEXED BY ik ON b.k=a.k",
+        );
+        conn.set_yield_injector(None);
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::from_i64(2 * ROWS),
+                Value::from_i64(2 * ROWS * 1000 + ROWS * (ROWS + 1)),
+            ]]
+        );
+        let steps = work.total.load(Ordering::Relaxed);
+        assert!(
+            steps <= 64 * ROWS as u64,
+            "equality join rescanned shadowed index entries: {steps} cursor work events for {ROWS} rows, descending={descending}"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+fn replacement_read_fixture(
+    rows: i64,
+    unique: bool,
+    descending: bool,
+) -> (MvccTestDbNoConn, Arc<Connection>) {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold=-1").unwrap();
+    let order = if descending { "DESC" } else { "ASC" };
+    if unique {
+        conn.execute(format!(
+            "CREATE TABLE items(k TEXT,v INTEGER,PRIMARY KEY(k {order})); \
+             BEGIN IMMEDIATE; \
+             WITH RECURSIVE seq(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM seq WHERE i<{rows}) \
+             INSERT INTO items SELECT 'r'||i,i FROM seq;"
+        ))
+        .unwrap();
+    } else {
+        conn.execute(format!(
+            "CREATE TABLE items(id INTEGER PRIMARY KEY,k TEXT,v INTEGER); \
+             CREATE INDEX ik ON items(k {order}); \
+             BEGIN IMMEDIATE; \
+             WITH RECURSIVE seq(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM seq WHERE i<{rows}) \
+             INSERT INTO items SELECT i,'r'||((i+1)/2),i FROM seq;"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT; PRAGMA wal_checkpoint(TRUNCATE); BEGIN IMMEDIATE;")
+        .unwrap();
+    for i in 1..=rows {
+        let sql = if unique {
+            format!(
+                "DELETE FROM items WHERE k='r{i}'; INSERT INTO items VALUES('r{i}',{});",
+                i + 1000
+            )
+        } else {
+            format!(
+                "DELETE FROM items WHERE id={i}; INSERT INTO items VALUES({i},'r{}',{});",
+                (i + 1) / 2,
+                i + 1000
+            )
+        };
+        conn.execute(sql).unwrap();
+    }
+    (db, conn)
+}
