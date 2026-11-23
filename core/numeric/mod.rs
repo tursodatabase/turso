@@ -1057,16 +1057,31 @@ impl IntegerText {
 #[inline(never)]
 pub(crate) fn write_decimal_digits(buf: &mut [u8; 20], mut n: u64) -> &[u8] {
     let mut start = buf.len();
-    loop {
+    // Two digits for each division, from a table of the pairs.
+    while n >= 100 {
+        let pair = usize::from((n % 100) as u8) * 2;
+        n /= 100;
+        start -= 2;
+        buf[start..start + 2].copy_from_slice(&DIGIT_PAIRS[pair..pair + 2]);
+    }
+    if n >= 10 {
+        let pair = usize::from(n as u8) * 2;
+        start -= 2;
+        buf[start..start + 2].copy_from_slice(&DIGIT_PAIRS[pair..pair + 2]);
+    } else {
         start -= 1;
-        buf[start] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
+        buf[start] = b'0' + n as u8;
     }
     &buf[start..]
 }
+
+/// The numbers from 0 to 99, each as two ASCII digits.
+const DIGIT_PAIRS: &[u8; 200] = b"\
+    0001020304050607080910111213141516171819\
+    2021222324252627282930313233343536373839\
+    4041424344454647484950515253545556575859\
+    6061626364656667686970717273747576777879\
+    8081828384858687888990919293949596979899";
 
 pub fn format_float_for_quote(v: f64) -> String {
     if v.is_nan() {
