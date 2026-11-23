@@ -1045,7 +1045,7 @@ pub enum SimpleAggregate {
     Count,
     /// `SELECT min(expr) FROM …` or `SELECT max(expr) FROM …` — the optimizer
     /// will pick an index that delivers rows in the right order so the emitter
-    /// only needs to read the first (non-NULL for MIN) row.
+    /// only needs to read the first non-NULL row.
     MinMax(Box<MinMaxDef>),
 }
 
