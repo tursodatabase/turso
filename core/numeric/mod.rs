@@ -1029,6 +1029,9 @@ pub(crate) struct IntegerText {
 }
 
 impl IntegerText {
+    // Not inlined, so that its callers, such as the operands of `||`, stay
+    // small enough for the compiler to inline them.
+    #[inline(never)]
     pub(crate) fn new(value: i64) -> Self {
         let mut buf = [0u8; 20];
         let digits = write_decimal_digits(&mut buf, value.unsigned_abs()).len();
@@ -1047,9 +1050,11 @@ impl IntegerText {
 }
 
 /// Write the decimal digits of `n` at the end of `buf`, and return them.
-// Without inline(always), the date and time functions in another module
-// call this function, and the call costs more than the loop.
-#[inline(always)]
+// Not inlined: in a caller that owns `buf`, the compiler unrolls the loop for
+// all 20 digits and keeps each byte of `buf` in a register. That makes the
+// caller several kilobytes larger, and each byte of the result is moved one at
+// a time.
+#[inline(never)]
 pub(crate) fn write_decimal_digits(buf: &mut [u8; 20], mut n: u64) -> &[u8] {
     let mut start = buf.len();
     loop {
