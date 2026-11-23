@@ -964,7 +964,7 @@ fn get_subquery_parser<'a>(
                     .enumerate()
                     .map(|(i, _)| RowValueSubqueryColumn {
                         affinity: get_expr_affinity(
-                            plan.result_column_affinity_expr(i),
+                            &plan.result_columns[i].expr,
                             &ExprContext::new(Some(&plan.table_references), resolver),
                         ),
                         expr_type: select_column_type(&plan, i, resolver),
@@ -1175,7 +1175,7 @@ fn get_subquery_parser<'a>(
                     );
                     affinity_chars.push(
                         comparison_affinity(
-                            plan.select_result_column_affinity_expr(i),
+                            &result_columns[i].expr,
                             lhs_affinity,
                             &ExprContext::new(Some(table_references), resolver),
                         )

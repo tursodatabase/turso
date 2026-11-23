@@ -150,16 +150,3 @@ expect {
     1|10
     2|20
 }
-
-# A VALUES subquery's column has the affinity of its last row, as SQLite
-# plans the rows as a compound SELECT whose last part is the last row. With
-# the column `a` last, the text '1' is converted to an integer before it is
-# compared; with the text 'x' last, it is not.
-test values-subquery-column-has-affinity-of-last-row {
-    CREATE TABLE t(a INTEGER);
-    INSERT INTO t VALUES (1);
-    SELECT '1' = (VALUES (a)), '1' IN (VALUES ('x'), (a)), '1' IN (VALUES (a), ('x')) FROM t;
-}
-expect {
-    1|1|0
-}

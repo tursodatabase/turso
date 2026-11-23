@@ -567,23 +567,6 @@ impl Plan {
         }
     }
 
-    /// The expression that gives result column `column` its affinity, from
-    /// the same component as [Self::select_result_columns].
-    pub fn select_result_column_affinity_expr(&self, column: usize) -> &ast::Expr {
-        match self {
-            Plan::Select(select_plan) => select_plan.result_column_affinity_expr(column),
-            Plan::CompoundSelect { right_most, .. } => {
-                right_most.result_column_affinity_expr(column)
-            }
-            Plan::RecursiveCte(plan) => plan
-                .initial_query
-                .select_result_column_affinity_expr(column),
-            Plan::Delete(_) | Plan::Update(_) => {
-                panic!("select_result_column_affinity_expr called on a non-SELECT plan")
-            }
-        }
-    }
-
     /// Returns the table references of a SELECT or compound SELECT plan. For
     /// a compound SELECT the references of the right-most component are
     /// returned.
@@ -1106,16 +1089,6 @@ pub struct SelectPlan {
 }
 
 impl SelectPlan {
-    /// The expression that gives result column `column` its affinity. The
-    /// result columns of a VALUES list hold only placeholders, so its last
-    /// row gives the affinity, as in SQLite, which plans the rows as a
-    /// compound SELECT whose last part is the last row.
-    pub fn result_column_affinity_expr(&self, column: usize) -> &ast::Expr {
-        self.column_exprs(column)
-            .last()
-            .expect("a SELECT has at least one row expression per column")
-    }
-
     /// The expressions that give result column `column` its values: that of
     /// every row of a VALUES list, whose result columns hold only
     /// placeholders, or else the result column's expression.
