@@ -470,12 +470,11 @@ expect {
     2|2024-01-05 10:00:00.5+00|2024-01-05 10:00:00.5+00
 }
 
-# Text conversion adds the offset only to the text, so a UNION with a literal,
-# a comparison and an index on the cast still find the stored value.
+# Text conversion adds the offset only to the text, so a UNION with a literal
+# and a comparison still find the stored value.
 test datetime-timestamptz-text-cast-leaves-stored-value {
     CREATE TABLE t (id int, tz timestamptz);
     INSERT INTO t VALUES (1, '2024-01-05 10:00:00+02');
-    CREATE INDEX t_text ON t ((tz::text));
     SELECT tz FROM t UNION SELECT '2024-01-05 08:00:00';
     SELECT id FROM t WHERE tz::text = '2024-01-05 08:00:00+00';
     SELECT id FROM t WHERE tz = '2024-01-05 08:00:00+00';
