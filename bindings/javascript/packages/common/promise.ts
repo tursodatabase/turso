@@ -1,5 +1,5 @@
 import { AsyncLock } from "./async-lock.js";
-import { bindParams } from "./bind.js";
+import { bindParams, splitBindParameters, toBindArgs } from "./bind.js";
 import { convertError, prepareStatement, resetStatement, stepSync } from "./sqlite-error.js";
 import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE, STEP_SLEEP, DatabaseOpts } from "./types.js";
 
@@ -10,33 +10,6 @@ import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_
 // notifier would hang (WASM) or spin (native).
 function sleepBeforeRetry(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function isQueryOptions(value) {
-  return value != null
-    && typeof value === "object"
-    && !Array.isArray(value)
-    && Object.prototype.hasOwnProperty.call(value, "queryTimeout");
-}
-
-function splitBindParameters(bindParameters) {
-  if (bindParameters.length === 0) {
-    return { params: undefined, queryOptions: undefined };
-  }
-  if (bindParameters.length > 1 && isQueryOptions(bindParameters[bindParameters.length - 1])) {
-    return {
-      params: bindParameters.length === 2 ? bindParameters[0] : bindParameters.slice(0, -1),
-      queryOptions: bindParameters[bindParameters.length - 1],
-    };
-  }
-  return { params: bindParameters.length === 1 ? bindParameters[0] : bindParameters, queryOptions: undefined };
-}
-
-function toBindArgs(params) {
-  if (params === undefined) {
-    return [];
-  }
-  return [params];
 }
 
 /**

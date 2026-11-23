@@ -1,3 +1,30 @@
+export function splitBindParameters(bindParameters) {
+  if (bindParameters.length === 0) {
+    return { params: undefined, queryOptions: undefined };
+  }
+  if (bindParameters.length > 1 && isQueryOptions(bindParameters[bindParameters.length - 1])) {
+    return {
+      params: bindParameters.length === 2 ? bindParameters[0] : bindParameters.slice(0, -1),
+      queryOptions: bindParameters[bindParameters.length - 1],
+    };
+  }
+  return { params: bindParameters.length === 1 ? bindParameters[0] : bindParameters, queryOptions: undefined };
+}
+
+function isQueryOptions(value) {
+  return value != null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.prototype.hasOwnProperty.call(value, "queryTimeout");
+}
+
+export function toBindArgs(params) {
+  if (params === undefined) {
+    return [];
+  }
+  return [params];
+}
+
 // Bind parameters to a statement.
 //
 // This function is used to bind parameters to a statement. It supports both
