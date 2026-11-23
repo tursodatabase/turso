@@ -907,7 +907,7 @@ fn translate_cast_expr(
                     expr,
                     target_register,
                     resolver,
-                );
+                )?;
             }
             emit_custom_type_cast(program, resolved, tn, target_register, resolver)?;
             return Ok(target_register);
@@ -919,7 +919,7 @@ fn translate_cast_expr(
         .map(|name| Affinity::of_written_type(&name))
         .unwrap_or(Affinity::Numeric);
     if type_affinity == Affinity::Text {
-        emit_builtin_type_text_suffix(program, referenced_tables, expr, target_register, resolver);
+        emit_builtin_type_text_suffix(program, referenced_tables, expr, target_register, resolver)?;
     }
     program.emit_insn(Insn::Cast {
         reg: target_register,
@@ -938,23 +938,22 @@ fn emit_builtin_type_text_suffix(
     operand: &ast::Expr,
     reg: usize,
     resolver: &Resolver,
-) {
+) -> Result<()> {
     let env = super::expr_type::TypeEnv::new(referenced_tables, resolver);
     let super::expr_type::ExprType::Custom { type_def, .. } =
         super::expr_type::type_of(operand, &env)
     else {
-        return;
+        return Ok(());
     };
     // A domain over a built-in type takes the built-in type's text.
-    let type_def = match resolver.schema().resolve_type_unchecked(&type_def.name) {
-        Ok(Some(resolved)) => Arc::clone(resolved.chain.last().unwrap_or(&type_def)),
-        _ => type_def,
+    let Some(type_def) = resolver.schema().without_domains(&type_def)? else {
+        return Ok(());
     };
     if !type_def.is_builtin {
-        return;
+        return Ok(());
     }
     let Some(suffix) = resolver.catalog.dialect.text_cast_suffix(&type_def.name) else {
-        return;
+        return Ok(());
     };
     let suffix_reg = program.emit_string8_new_reg(suffix.to_string());
     program.emit_insn(Insn::Concat {
@@ -962,6 +961,7 @@ fn emit_builtin_type_text_suffix(
         rhs: suffix_reg,
         dest: reg,
     });
+    Ok(())
 }
 
 /// Whether a CAST to the resolved type gives text that is stored as it is

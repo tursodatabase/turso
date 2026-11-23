@@ -34,14 +34,31 @@ impl TextType {
         }
         std::iter::once(info.declared_name.as_str())
             .chain(info.base_type.as_deref())
-            .find_map(
-                |name| match (name.to_ascii_uppercase().as_str(), info.array_dimensions) {
-                    ("BOOL" | "BOOLEAN", 0) => Some(TextType::Boolean),
-                    ("TIMESTAMPTZ", 0) => Some(TextType::TimestampTz),
-                    _ => None,
-                },
-            )
+            .find_map(|name| {
+                if info.array_dimensions == 0 {
+                    Self::of_scalar_name(name)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(TextType::Plain)
+    }
+
+    /// The text type of the scalar type `name`, or `None` when its values print
+    /// as stored.
+    pub fn of_scalar_name(name: &str) -> Option<Self> {
+        match name.to_ascii_uppercase().as_str() {
+            "BOOL" | "BOOLEAN" => Some(TextType::Boolean),
+            "TIMESTAMPTZ" => Some(TextType::TimestampTz),
+            _ => None,
+        }
+    }
+
+    /// The suffix that makes the stored text of a value of this type the
+    /// PostgreSQL text: a timestamptz stored without an offset is in UTC, and
+    /// the `+00` makes clients read it as UTC, not as local time.
+    pub fn utc_suffix(self) -> Option<&'static str> {
+        (self == TextType::TimestampTz).then_some("+00")
     }
 }
 
@@ -57,14 +74,11 @@ pub fn value_text(value: &Value, text_type: TextType) -> Option<Cow<'_, str>> {
         Value::Numeric(Numeric::Float(f)) => Cow::Owned(pgwire_text::format_f64(f64::from(*f))),
         Value::Text(text) => {
             let text = text.as_str();
-            // A timestamptz stored without an offset is in UTC. The `+00`
-            // makes clients read it as UTC, not as local time.
-            if text_type == TextType::TimestampTz
-                && !text.contains('+')
-                && !text.contains('Z')
-                && !text.ends_with("-00")
+            if let Some(suffix) = text_type
+                .utc_suffix()
+                .filter(|_| !text.contains('+') && !text.contains('Z') && !text.ends_with("-00"))
             {
-                Cow::Owned(format!("{text}+00"))
+                Cow::Owned(format!("{text}{suffix}"))
             } else {
                 Cow::Borrowed(text)
             }

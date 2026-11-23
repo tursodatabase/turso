@@ -422,7 +422,7 @@ impl Dialect for PostgresDialect {
     }
 
     fn text_cast_suffix(&self, type_name: &str) -> Option<&'static str> {
-        (type_name == "timestamptz").then_some("+00")
+        crate::text::TextType::of_scalar_name(type_name)?.utc_suffix()
     }
 }
 
