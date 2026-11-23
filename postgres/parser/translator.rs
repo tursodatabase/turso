@@ -3740,11 +3740,16 @@ impl PostgreSQLTranslator {
                 // CURRENT_TIME and LOCALTIME are refused if tursopg does not
                 // support the type each returns in PostgreSQL.
                 match SqlValueFunctionOp::try_from(svf.op) {
-                    // SQLite's CURRENT_DATE reads the clock at each statement,
-                    // not at the start of the transaction as PostgreSQL does.
-                    Ok(SqlValueFunctionOp::SvfopCurrentDate) => {
-                        Err(ParseError::not_supported("CURRENT_DATE"))
-                    }
+                    // CURRENT_DATE is the date of now(), the time the
+                    // transaction started, in the session time zone (UTC).
+                    Ok(SqlValueFunctionOp::SvfopCurrentDate) => Ok(ast::Expr::Cast {
+                        expr: Box::new(function_call("now", vec![])),
+                        type_name: Some(ast::Type {
+                            name: "date".to_string(),
+                            size: None,
+                            array_dimensions: 0,
+                        }),
+                    }),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTime
                         | SqlValueFunctionOp::SvfopCurrentTimeN,

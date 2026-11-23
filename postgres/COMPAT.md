@@ -182,12 +182,13 @@ INTEGER. Unknown type names pass through as custom types.
 time, timetz and interval, and arrays of every date and time type
 (`date[]`, `timestamp[]` and `timestamptz[]` included), are rejected as not
 supported (0A000) in column types, casts, typed literals and domains. So are
-`CURRENT_DATE`, `CURRENT_TIME`, `LOCALTIME` and the built-in functions that
+`CURRENT_TIME`, `LOCALTIME` and the built-in functions that
 return date, time, timetz or interval, such as `age`, `make_date`, `to_date`
 and `date()`.
 
 `now()`, `transaction_timestamp()` and `CURRENT_TIMESTAMP` are the time the
-transaction started, and `LOCALTIMESTAMP` is that time as a timestamp in UTC;
+transaction started, `LOCALTIMESTAMP` is that time as a timestamp in UTC, and
+`CURRENT_DATE` is its date;
 `statement_timestamp()` is the time the client's query arrived, shared by all
 statements of one query string;
 `clock_timestamp()` reads the clock at each call. All of them have microsecond

@@ -862,7 +862,14 @@ test exists-subquery-with-empty-select-list-rejects-group-by-position {
 expect error {
 }
 
-@compat-gap "function:current_date"
+test select-current-date {
+    SELECT CASE WHEN CURRENT_DATE = now()::date THEN 'same' ELSE 'differ' END;
+}
+expect {
+    same
+}
+
+@compat-gap "type:timetz"
 test select-current-data-and-time {
     SELECT 'ok'
     WHERE CURRENT_DATE IS NOT NULL
@@ -874,7 +881,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    CURRENT_DATE is not supported
+    type "timetz" is not supported
 }
 
 setup comma_and_join {
