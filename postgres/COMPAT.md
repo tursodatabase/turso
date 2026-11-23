@@ -118,10 +118,15 @@ column defaults in `pg_attrdef.adbin`, as PostgreSQL does for the forms the
 manual lists under `CREATE POLICY`, and return TursoPG's stored SQL for
 other forms; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
-Casting a value that is not text to date, time, timestamp or timestamptz, or
-from one of them to a type that does not read text, fails with 42846, and so
-does assigning such a value to a column of these types (PostgreSQL gives
-42804 for the assignment); `date::json` and `date::inet` are still accepted.
+Casting a value that is not text to date, time, timestamp, timestamptz or an
+enum, and casting a value of date, time, timestamp, timestamptz, json, inet,
+cidr, macaddr, macaddr8 or an enum to a type that does not read text, fails
+with 42846. Assigning a value that is not text to a column of one of these
+types or of jsonb fails too (PostgreSQL gives 42804 for the assignment).
+`date::json` and `date::inet` are still accepted, as are `1::json`, `1::jsonb`,
+`1::inet`, `1::cidr` and `1::macaddr`, which PostgreSQL refuses. A jsonb value
+may be cast to a number: `'1'::jsonb::int`, `::bigint`, `::numeric`, `::float8`.
+`'true'::jsonb::boolean` gives 0 where PostgreSQL gives true, as does `'true'::text::boolean`.
 `pg_input_is_valid`, `to_char` (numeric; other argument types fail with
 0A000), `now`/`clock_timestamp`/
 `transaction_timestamp`/`statement_timestamp`. `to_timestamp` fails with 0A000.

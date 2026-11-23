@@ -1030,6 +1030,16 @@ expect error {
     cannot cast
 }
 
+# PostgreSQL casts jsonb to numbers, unlike the types above.
+test cast-jsonb-to-numbers {
+    CREATE TABLE j (i jsonb, f jsonb);
+    INSERT INTO j VALUES ('1', '1.5');
+    SELECT i::int, i::bigint, f::numeric, f::float8 FROM j;
+}
+expect {
+    1|1|1.5|1.5
+}
+
 # PostgreSQL gives 42804 here and tursopg 42846, so no SQLSTATE is checked.
 test insert-integer-into-timestamp-column-errors {
     CREATE TABLE t (ts timestamp);

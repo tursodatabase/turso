@@ -676,7 +676,7 @@ pub(crate) enum Coerce<'a> {
 /// value too. A CAST runs the same. NULL is left as it is, without running
 /// ENCODE; a domain's NOT NULL is checked afterwards, by the column's NOT NULL
 /// constraint or by the CAST. A type that refuses values that are not text
-/// (see [refuses_non_text_input]) fails on any other kind first.
+/// (see [Schema::refuses_non_text_input]) fails on any other kind first.
 pub(crate) fn emit_store_value(
     program: &mut ProgramBuilder,
     resolved: &ResolvedType,
@@ -718,7 +718,7 @@ pub(crate) fn emit_store_value(
 }
 
 /// Emits the check that the value in `reg`, when it is not NULL, is text if
-/// `resolved` refuses other kinds (see [refuses_non_text_input]). Every store
+/// `resolved` refuses other kinds (see [Schema::refuses_non_text_input]). Every store
 /// of a value into such a type runs it first, before any conversion to text
 /// turns 20200101 into '20200101', which date would read as a date.
 fn emit_refuse_non_text_input(
@@ -727,7 +727,10 @@ fn emit_refuse_non_text_input(
     reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    if !refuses_non_text_input(resolved, resolver)? {
+    if !resolver
+        .schema()
+        .refuses_non_text_input(resolved, &*resolver.catalog.dialect)?
+    {
         return Ok(());
     }
     let is_text = program.allocate_label();
@@ -767,7 +770,10 @@ pub(crate) fn check_cast_from_text_input_type(
     let Some(source_resolved) = resolver.schema().resolve_type_unchecked(&type_def.name)? else {
         return Ok(());
     };
-    if !refuses_non_text_input(&source_resolved, resolver)? {
+    let schema = resolver.schema();
+    if !schema.refuses_non_text_input(&source_resolved, &*resolver.catalog.dialect)?
+        || schema.casts_to_numbers_and_booleans(&source_resolved)
+    {
         return Ok(());
     }
     let target_reads_text = match target {
@@ -788,13 +794,6 @@ pub(crate) fn check_cast_from_text_input_type(
         "cannot cast type {source} to type {}",
         crate::util::dequote(&target_name.name)
     )))
-}
-
-/// [Schema::refuses_non_text_input] for the dialect of the statement.
-pub(crate) fn refuses_non_text_input(resolved: &ResolvedType, resolver: &Resolver) -> Result<bool> {
-    resolver
-        .schema()
-        .refuses_non_text_input(resolved, &*resolver.catalog.dialect)
 }
 
 /// Emits what comparing the value in `reg` with stored values of `chain`'s

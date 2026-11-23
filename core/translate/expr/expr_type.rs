@@ -1851,6 +1851,7 @@ mod tests {
             accepts_collate: false,
             range_offsets: RangeOffsets::Numeric,
             stored_form_sorts_in_value_order: false,
+            casts_to_numbers_and_booleans: false,
         };
         TypeDef::from_create_type("numeric", &body, origin, sql.to_string()).unwrap()
     }
@@ -1891,6 +1892,7 @@ mod tests {
             accepts_collate: false,
             range_offsets: RangeOffsets::Integer,
             stored_form_sorts_in_value_order: false,
+            casts_to_numbers_and_booleans: false,
         };
         TypeDef::from_create_type("smallint", &body, origin, sql.to_string()).unwrap()
     }

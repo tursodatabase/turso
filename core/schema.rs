@@ -563,6 +563,12 @@ pub struct TypeDef {
     /// built-in date and time types, which store one text form with a 4-digit
     /// year. False for a domain, whose index then serves only `=`.
     pub stored_form_sorts_in_value_order: bool,
+    /// Whether values of the type may be cast to number and boolean types, as
+    /// PostgreSQL casts jsonb to integer, numeric, float8 and boolean. A CAST
+    /// from a type that reads text is refused otherwise (see
+    /// `Schema::refuses_non_text_input`). False for a domain, user type and
+    /// STRUCT or UNION; a domain takes the answer of the types under it.
+    pub casts_to_numbers_and_booleans: bool,
     /// Original SQL for round-trip persistence. Stored verbatim from creation.
     pub sql: String,
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
@@ -861,6 +867,13 @@ impl TypeDef {
                         // A user type's ENCODE may store any form.
                         TypeOrigin::User => false,
                     },
+                    casts_to_numbers_and_booleans: match origin {
+                        TypeOrigin::Builtin {
+                            casts_to_numbers_and_booleans,
+                            ..
+                        } => casts_to_numbers_and_booleans,
+                        TypeOrigin::User => false,
+                    },
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Custom {
@@ -897,6 +910,7 @@ impl TypeDef {
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
                     stored_form_sorts_in_value_order: false,
+                    casts_to_numbers_and_booleans: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Struct(StructDef {
@@ -932,6 +946,7 @@ impl TypeDef {
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
                     stored_form_sorts_in_value_order: false,
+                    casts_to_numbers_and_booleans: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
@@ -963,6 +978,7 @@ impl TypeDef {
             range_offsets: None,
             accepts_collate: None,
             stored_form_sorts_in_value_order: false,
+            casts_to_numbers_and_booleans: false,
             sql,
             domain_checks: constraints.to_vec(),
             kind: TypeDefKind::Custom {
@@ -1544,13 +1560,15 @@ impl RangeOffsets {
 #[derive(Debug, Clone, Copy)]
 pub enum TypeOrigin {
     /// `accepts_collate` says whether values of the type take a COLLATE,
-    /// `range_offsets` what kind of number they are in a RANGE frame, and
+    /// `range_offsets` what kind of number they are in a RANGE frame,
     /// `stored_form_sorts_in_value_order` whether the stored form sorts in
-    /// the same order as the values.
+    /// the same order as the values, and `casts_to_numbers_and_booleans`
+    /// whether values may be cast to number and boolean types.
     Builtin {
         accepts_collate: bool,
         range_offsets: RangeOffsets,
         stored_form_sorts_in_value_order: bool,
+        casts_to_numbers_and_booleans: bool,
     },
     User,
 }
@@ -2334,6 +2352,15 @@ impl Schema {
                 self.plain_input_type(resolved)?,
                 StrictType::Stores(crate::types::StorageClass::Text)
             ))
+    }
+
+    /// Whether a CAST from `resolved` to a number or boolean type is allowed
+    /// although the type reads text (see `TypeDef::casts_to_numbers_and_booleans`).
+    pub fn casts_to_numbers_and_booleans(&self, resolved: &ResolvedType) -> bool {
+        resolved
+            .chain
+            .iter()
+            .any(|type_def| type_def.casts_to_numbers_and_booleans)
     }
 
     /// The plain SQL type that `value_type`, the value type of type

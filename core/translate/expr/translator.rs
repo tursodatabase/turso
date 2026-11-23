@@ -960,7 +960,10 @@ fn emit_custom_type_cast(
     // A type that refuses values that are not text sees the value as it is, so
     // that CAST(20200101 AS date) is not read as the text 20200101.
     match resolver.schema().plain_input_type(&resolved)? {
-        StrictType::Stores(_) if refuses_non_text_input(&resolved, resolver)? => {}
+        StrictType::Stores(_)
+            if resolver
+                .schema()
+                .refuses_non_text_input(&resolved, &*resolver.catalog.dialect)? => {}
         StrictType::Stores(storage_class) => program.emit_insn(Insn::Cast {
             reg,
             affinity: storage_class.affinity(),
