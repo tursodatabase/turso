@@ -2124,6 +2124,16 @@ expect error {
     cannot compare type timestamp with type timestamptz
 }
 
+@requires strict "uses STRICT tables"
+test cmp-text-in-compound-subquery-is-read-as-timestamptz {
+    CREATE TABLE t(tz timestamptz) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 00:00:00+00');
+    SELECT '2024-01-05 02:00:00+02' IN (SELECT tz FROM t UNION ALL SELECT 'x') FROM t;
+}
+expect {
+    1
+}
+
 # A function or operator with an array argument fails when the array's
 # elements and its other values, or another array's elements, do not compare.
 
