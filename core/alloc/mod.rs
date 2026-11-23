@@ -27,7 +27,7 @@ pub(crate) use collections::impl_try_clone_via_clone;
 #[cfg(nightly)]
 pub use collections::TursoFromIteratorIn;
 pub use collections::{
-    DynBoxedSlice, DynVec, TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt,
+    DynBox, DynBoxedSlice, DynVec, TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt,
     TursoFromIterator, TursoHashMapExt, TursoHashSetExt, TursoIteratorExt, TursoNewExt,
     TursoSliceExt, TursoTryNewExt, TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt,
     TursoVecInExt,
