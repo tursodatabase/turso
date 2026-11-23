@@ -77,7 +77,7 @@ fn gap_a_15_int_param_text_int_arithmetic(db: TempDatabase) {
 }
 
 // A-18 (S1): invalid uuid param cast
-// tursopg: an invalid uuid param is accepted.
+// tursopg: an invalid uuid param fails with SQLSTATE P0001.
 // PostgreSQL: ERROR 22P02
 #[turso_macros::test(views)]
 fn gap_a_18_tursopg_returns_wrong_result_invalid_uuid_param_cast(db: TempDatabase) {
@@ -87,7 +87,7 @@ fn gap_a_18_tursopg_returns_wrong_result_invalid_uuid_param_cast(db: TempDatabas
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "nope");
+    assert_eq!(out, "ERROR P0001");
 }
 
 // A-29 (S2): numeric $n param

@@ -1237,9 +1237,11 @@ fn extract_row_description_oids(data: &[u8]) -> Vec<u32> {
 // PostgreSQL versions, so test expectations stay valid. Only the OIDs the
 // current wire tests assert against are declared; add more here as new
 // tests need them.
+const OID_BOOL: u32 = 16;
 const OID_INT4: u32 = 23;
 const OID_TEXT: u32 = 25;
 const OID_FLOAT8: u32 = 701;
+const OID_UUID: u32 = 2950;
 
 /// Walk raw PG wire bytes, find the first ErrorResponse ('E') message, and
 /// return its fields as a map from the one-byte field type to the value string.
@@ -1629,6 +1631,17 @@ fn wire_cast_reports_target_type() {
         assert_eq!(
             c.query_column_oids("SELECT CAST(1 AS REAL)"),
             vec![OID_FLOAT8]
+        );
+        // A cast to a type that core registers reports that type.
+        assert_eq!(
+            c.query_column_oids("SELECT 5::boolean, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid"),
+            vec![OID_BOOL, OID_UUID]
+        );
+        assert_eq!(c.query_single_text("SELECT 5::boolean"), "t");
+        // A function that returns one of its arguments has their type.
+        assert_eq!(
+            c.query_column_oids("SELECT coalesce(1::boolean, false)"),
+            vec![OID_BOOL]
         );
     });
 }

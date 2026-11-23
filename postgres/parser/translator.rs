@@ -4663,11 +4663,13 @@ impl PostgreSQLTranslator {
             _ => func_name,
         };
 
-        // FIXME(pg-catalog): This hand-codes the pg_proc functions named after a type (float8, float4, int4, int2, int8, bool, text) as casts, and casts int2 and float4 to the wider INTEGER and REAL, so int2(70000) does not raise "smallint out of range" as it does in PostgreSQL. Function resolution in pg_proc, which finds the cast functions of pg_cast, replaces this.
+        // FIXME(pg-catalog): This hand-codes the pg_proc functions named after a type (float8, float4, int4, int2, int8, bool, text) as casts, and casts float4 to the wider REAL, so float4(16777217) is 16777217 and not 1.6777216e+07 as it is in PostgreSQL. Function resolution in pg_proc, which finds the cast functions of pg_cast, replaces this.
         // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
+        // As in a cast, a type that core registers keeps its name.
         let cast_type = match func_name.to_uppercase().as_str() {
             "FLOAT8" | "FLOAT4" => Some("REAL"),
-            "INT4" | "INT2" => Some("INTEGER"),
+            "INT4" => Some("INTEGER"),
+            "INT2" => Some("smallint"),
             "INT8" => Some("BIGINT"),
             "BOOL" => Some("BOOLEAN"),
             "TEXT" => Some("TEXT"),
@@ -7811,35 +7813,51 @@ fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
     Some(format!("{sign}{digits}"))
 }
 
-/// FIXME(pg-catalog): This lowers PostgreSQL types to SQLite types in the parser (smallint and oid to INTEGER; numeric and money to REAL; json, inet and uuid to TEXT), so the PostgreSQL type is gone before the cast is checked. A pg_type lookup and a typed expression tree that keeps the type replace this.
+/// FIXME(pg-catalog): This lowers PostgreSQL types to SQLite types in the parser (oid to INTEGER; numeric and money to REAL; json and xml to TEXT), so the PostgreSQL type is gone before the cast is checked. A pg_type lookup and a typed expression tree that keeps the type replace this.
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
-/// Maps PG types to their base SQLite storage types. A type that the frontend
-/// registers, such as boolean, keeps its name, and so do other names, so that
-/// enums and domains resolve to their custom type.
+///
+/// A PostgreSQL type that core or the frontend registers keeps its name. The
+/// cast then converts the value as a column of the type does, and its result
+/// has that type: `'t'::boolean` is true, and `40000::smallint` is out of
+/// range. Another PostgreSQL type is written as the SQLite type that stores
+/// its values, and the cast converts as SQLite does. Other names are kept as
+/// written so that enums and domains resolve to their custom type.
 fn pg_type_name_to_ast_type(
     type_name: &pg_query::protobuf::TypeName,
 ) -> Result<ast::Type, ParseError> {
     let pg_type = supported_type_name(type_name)?;
 
     let name = match pg_type.to_uppercase().as_str() {
-        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" | "OID"
-        | "REGCLASS" | "REGTYPE" => "INTEGER",
+        "INTEGER" | "INT" | "INT4" | "SERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE" => {
+            "INTEGER"
+        }
         // Casts like INTEGER; the name types the result as int8.
         "BIGINT" | "INT8" | "BIGSERIAL" => "BIGINT",
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
             "REAL"
         }
-        // The frontend registers these types, so the cast names the type
-        // and converts the value as a column of the type does.
+        // Core or the frontend registers these types, so the cast names the
+        // type and converts the value as a column of the type does.
+        "SMALLINT" | "INT2" => "smallint",
         "BOOLEAN" | "BOOL" => "boolean",
         "DATE" => "date",
         "TIME" => "time",
         "TIMESTAMP" => "timestamp",
         "TIMESTAMPTZ" => "timestamptz",
+        "UUID" => "uuid",
+        "INET" => "inet",
+        "CIDR" => "cidr",
+        "MACADDR" => "macaddr",
+        "BYTEA" => "bytea",
         // For CAST expressions, map all text-like PG types to TEXT.
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INET" | "JSON" | "JSONB"
-        | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
-        "BYTEA" | "BLOB" => "BLOB",
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "XML" | "BIT" | "VARBIT" | "TSVECTOR"
+        | "TSQUERY" => "TEXT",
+        "BLOB" => "BLOB",
+        // Core registers json and jsonb, but its conversion writes the text
+        // again without the whitespace, and it refuses text that is nested
+        // deeper than it reads. PostgreSQL keeps the text of a json as
+        // written, so a cast to one of them stays a cast to TEXT.
+        "JSON" | "JSONB" => "TEXT",
         _ => &pg_type,
     };
 

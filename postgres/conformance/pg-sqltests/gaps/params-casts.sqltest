@@ -31,15 +31,11 @@ expect @tursopg {
 }
 
 # A-08: int2 overflow literal cast
-@compat-gap "type:int2"
 test int2-overflow-literal-cast {
     SELECT '40000'::smallint;
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-    40000
-}
 
 # A-09: int8 overflow arithmetic
 @compat-gap "operator:int8 + int4"
@@ -112,36 +108,36 @@ test invalid-uuid-literal-cast {
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    nope
+@sqlstate P0001
+expect @tursopg error {}
+
+@compat-gap "type:inet"
+test invalid-inet-literal-cast {
+    SELECT 'nope'::inet;
 }
+@sqlstate 22P02
+expect error {}
+@sqlstate 23000
+expect @tursopg error {}
 
 # A-19: uuid uppercase input normalised
-@compat-gap "type:uuid"
 test uuid-uppercase-input-normalised {
     SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid;
 }
 expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
-expect @tursopg {
-    A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11
-}
 
 # A-20: uuid braces / no-hyphen input
-@compat-gap "type:uuid"
 test uuid-braces-no-hyphen-input {
     SELECT '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid, 'a0eebc999c0b4ef8bb6d6bb9bd380a11'::uuid;
 }
 expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
-expect @tursopg {
-    {a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}|a0eebc999c0b4ef8bb6d6bb9bd380a11
-}
 
 # A-21: uuid equality across case
-@compat-gap "operator:uuid = uuid"
+@compat-gap "type:bool"
 test uuid-equality-across-case {
     SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid;
 }
@@ -149,7 +145,7 @@ expect {
     t
 }
 expect @tursopg {
-    0
+    1
 }
 
 # A-22: numeric(10,2) rounding half away from zero
