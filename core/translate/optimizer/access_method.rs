@@ -951,7 +951,16 @@ fn find_best_access_method_for_btree<'a>(
             iter_dir: best.iter_dir,
             index: best.index,
             build_index: false,
-            constraint_refs: best.constraint_refs.into_vec(),
+            // For refs that the `SmallVec` keeps inline, `into_vec` moves the
+            // `SmallVec` into an iterator and collects the refs one at a time
+            // into a `Vec` with space for four. A copy of the slice allocates
+            // only space for the refs. Spilled refs already have a heap
+            // buffer, which `into_vec` keeps.
+            constraint_refs: if best.constraint_refs.spilled() {
+                best.constraint_refs.into_vec()
+            } else {
+                best.constraint_refs.to_vec()
+            },
         },
     };
     let mut best_cost_with_filters =
