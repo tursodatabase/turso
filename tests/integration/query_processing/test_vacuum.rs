@@ -211,7 +211,10 @@ fn employee_rows(conn: &Arc<Connection>) -> Vec<(i64, String, i64, f64, String)>
 
 fn custom_type_sql_snapshot(conn: &Arc<Connection>) -> Vec<(String, String)> {
     let rows: Vec<(String, String)> =
-        conn.exec_rows("SELECT name, sql FROM sqlite_turso_types ORDER BY name");
+        // A built-in type has no SQL.
+        conn.exec_rows(
+            "SELECT name, sql FROM sqlite_turso_types WHERE sql IS NOT NULL ORDER BY name",
+        );
     rows.into_iter()
         .map(|(name, sql)| (name, normalize_sql_whitespace(&sql)))
         .collect()

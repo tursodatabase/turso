@@ -21,6 +21,7 @@ use crate::translate::schema::type_def_uses_type;
 use crate::type_ordering::TypeOrdering;
 use crate::types::IOResultOr;
 use crate::types::StrictType;
+use crate::types::{Conversion, StorageClass, UserType};
 use crate::types::{IOResult, ImmutableRecord, ImmutableRecordRef};
 use crate::util::{exprs_are_equivalent, is_builtin_strict_type, normalize_ident};
 use crate::vdbe::affinity::Affinity;
@@ -248,9 +249,9 @@ pub enum TypeDefKind {
     Custom {
         params: std::vec::Vec<ast::TypeParam>,
         base: String,
-        encode: Option<Box<ast::Expr>>,
-        coerce: Option<Box<ast::Expr>>,
-        decode: Option<Box<ast::Expr>>,
+        encode: Option<Conversion>,
+        coerce: Option<Conversion>,
+        decode: Option<Conversion>,
         /// How values of the type compare, for built-in types that have their
         /// own order, such as numeric. `None` compares the stored values as
         /// SQLite does.
@@ -319,116 +320,8 @@ pub enum OperatorArg {
 pub const BINARY_OPERATORS: [&str; 9] = ["+", "-", "*", "/", "%", "&", "|", "<<", ">>"];
 pub const PREFIX_OPERATORS: [&str; 2] = ["-", "~"];
 
-/// The order of a built-in type whose stored values do not sort in the type's
-/// order: numeric is stored as a blob. Every other type, and every user type,
-/// sorts and compares by its stored value as SQLite does.
-fn builtin_ordering(type_name: &str) -> Option<TypeOrdering> {
-    match type_name {
-        "numeric" => Some(TypeOrdering::Numeric),
-        _ => None,
-    }
-}
-
-/// The kind of value a built-in type reads as. uuid, jsonb and numeric store
-/// blobs and DECODE them to text. The built-in types are registered before any
-/// connection's functions, so the kind of `uuid_str(value)` can't be worked
-/// out from the DECODE then; a test checks these against the DECODE of each
-/// type.
-fn builtin_value_type(type_name: &str) -> crate::Result<BuiltinType> {
-    Ok(match type_name {
-        "boolean" | "smallint" | "bigint" => BuiltinType::Integer,
-        "uuid" | "json" | "jsonb" | "numeric" | "varchar" | "date" | "time" | "timestamp"
-        | "timestamptz" | "inet" | "cidr" | "macaddr" | "macaddr8" => BuiltinType::Text,
-        "bytea" => BuiltinType::Blob,
-        _ => {
-            return Err(LimboError::InternalError(format!(
-                "built-in type {type_name} has no kind of value"
-            )))
-        }
-    })
-}
-
-/// Operators on built-in types. User types have none: `x + 1` on a user type is
-/// an error. The functions read plain values as they are, so nothing is encoded first:
-/// - `numeric op x` and `x op numeric` for `+ - * / %`, and `-numeric`, compute
-///   exactly, and the result is a numeric. Encoding a literal to the column's type would round it
-///   to the column's scale first (`n * 0.005` would be `n * 0.01`). With a REAL
-///   value `+ - * /` are SQLite's operators and give a REAL, as PostgreSQL gives
-///   double precision; `%` with a REAL value does not exist, as in PostgreSQL.
-/// - `date + integer`, `integer + date` and `date - integer` add or subtract
-///   days and give a date. `date - date` gives the number of days between them;
-///   a text literal on either side is encoded to a date first. Each signature
-///   has its own function, so its result type is known before the statement
-///   runs.
-/// - `smallint` and `bigint` store plain integers, so SQLite's operators run,
-///   including `-`, `~`, `&`, `|`, `<<` and `>>`.
-///
-/// Other built-in types have no operators, and these types have no others:
-/// `-date` and `numeric & 1` are errors, as in PostgreSQL.
-fn builtin_signatures(type_name: &str) -> std::vec::Vec<OperatorSignature> {
-    use OperatorArg::{EncodableLiteral, Exact, Integer, Real, Value};
-    let call = |op, args: &[OperatorArg], func: &str, result| OperatorSignature {
-        op,
-        args: args.to_vec(),
-        func: Some(func.to_string()),
-        result,
-    };
-    match type_name {
-        "numeric" => {
-            let mut signatures = std::vec::Vec::new();
-            for (op, func) in [
-                ("+", "numeric_add"),
-                ("-", "numeric_sub"),
-                ("*", "numeric_mul"),
-                ("/", "numeric_div"),
-                ("%", "numeric_mod"),
-            ] {
-                for args in [[Value, Value], [Value, Exact], [Exact, Value]] {
-                    signatures.push(call(op, &args, func, Some("numeric")));
-                }
-                if op != "%" {
-                    signatures.extend(sqlite_operator(op, Real));
-                }
-            }
-            signatures.push(call("-", &[Value], "numeric_neg", Some("numeric")));
-            signatures
-        }
-        "date" => std::vec![
-            call("+", &[Value, Integer], "date_plus", Some("date")),
-            call("+", &[Integer, Value], "date_plus", Some("date")),
-            call("-", &[Value, Value], "date_diff", Some("integer")),
-            call(
-                "-",
-                &[Value, EncodableLiteral],
-                "date_diff",
-                Some("integer")
-            ),
-            call(
-                "-",
-                &[EncodableLiteral, Value],
-                "date_diff",
-                Some("integer")
-            ),
-            call("-", &[Value, Integer], "date_minus", Some("date")),
-        ],
-        "smallint" | "bigint" => {
-            let binary = BINARY_OPERATORS
-                .into_iter()
-                .flat_map(|op| sqlite_operator(op, OperatorArg::PlainValue));
-            let prefix = PREFIX_OPERATORS.into_iter().map(|op| OperatorSignature {
-                op,
-                args: std::vec![Value],
-                func: None,
-                result: None,
-            });
-            binary.chain(prefix).collect()
-        }
-        _ => std::vec::Vec::new(),
-    }
-}
-
 /// SQLite's binary operator `op` on a value of the type and an operand `other`.
-fn sqlite_operator(op: &'static str, other: OperatorArg) -> [OperatorSignature; 2] {
+pub(crate) fn sqlite_operator(op: &'static str, other: OperatorArg) -> [OperatorSignature; 2] {
     use OperatorArg::Value;
     [[Value, other], [other, Value]].map(|args| OperatorSignature {
         op,
@@ -598,18 +491,18 @@ impl TypeDef {
         }
     }
 
-    /// Returns the encode expression (Custom types only).
-    pub fn encode(&self) -> Option<&ast::Expr> {
+    /// The ENCODE of the type (Custom types only).
+    pub fn encode(&self) -> Option<&Conversion> {
         match &self.kind {
-            TypeDefKind::Custom { encode, .. } => encode.as_deref(),
+            TypeDefKind::Custom { encode, .. } => encode.as_ref(),
             _ => None,
         }
     }
 
-    /// Returns the coerce expression (Custom types only).
-    pub fn coerce(&self) -> Option<&ast::Expr> {
+    /// The COERCE of the type (Custom types only).
+    pub fn coerce(&self) -> Option<&Conversion> {
         match &self.kind {
-            TypeDefKind::Custom { coerce, .. } => coerce.as_deref(),
+            TypeDefKind::Custom { coerce, .. } => coerce.as_ref(),
             _ => None,
         }
     }
@@ -619,10 +512,10 @@ impl TypeDef {
         self.encode().is_some() || self.coerce().is_some()
     }
 
-    /// Returns the decode expression (Custom types only).
-    pub fn decode(&self) -> Option<&ast::Expr> {
+    /// The DECODE of the type (Custom types only).
+    pub fn decode(&self) -> Option<&Conversion> {
         match &self.kind {
-            TypeDefKind::Custom { decode, .. } => decode.as_deref(),
+            TypeDefKind::Custom { decode, .. } => decode.as_ref(),
             _ => None,
         }
     }
@@ -640,9 +533,7 @@ impl TypeDef {
 
     /// True when stored values are read back unchanged (no DECODE, or `DECODE value`).
     pub fn decode_returns_value_unchanged(&self) -> bool {
-        self.decode().is_none_or(
-            |decode| matches!(decode, ast::Expr::Id(name) if name.as_str().eq_ignore_ascii_case("value")),
-        )
+        self.decode().is_none_or(Conversion::keeps_value)
     }
 
     /// Returns the base type name.
@@ -796,14 +687,45 @@ impl TypeDef {
         })
     }
 
+    /// The definition of the built-in type `ty`: a type that is written in
+    /// Rust and that every database of the dialect has.
+    pub fn builtin(ty: &dyn crate::types::Type) -> crate::Result<Self> {
+        let Some(stored) = primitive_value_type(ty.base()) else {
+            return Err(crate::LimboError::InternalError(format!(
+                "built-in type {} has BASE {}",
+                ty.name(),
+                ty.base()
+            )));
+        };
+        let read = match (ty.reads_as(), ty.decode()) {
+            (Some(StorageClass::Integer), _) => BuiltinType::Integer,
+            (Some(StorageClass::Real), _) => BuiltinType::Real,
+            (Some(StorageClass::Text), _) => BuiltinType::Text,
+            (Some(StorageClass::Blob), _) => BuiltinType::Blob,
+            // Nothing else tells what a Rust function gives, and a wrong
+            // kind would give expressions on the type a wrong type.
+            (None, Some(Conversion::Function(_))) => {
+                return Err(crate::LimboError::InternalError(format!(
+                    "built-in type {} has a DECODE written in Rust and does not say what it reads as",
+                    ty.name()
+                )));
+            }
+            (None, _) => stored,
+        };
+        Ok(Self::from_type(
+            ty,
+            true,
+            Some(ValueKinds { read, stored }),
+            String::new(),
+        ))
+    }
+
     /// Construct a TypeDef from a parsed CREATE TYPE statement.
     pub fn from_create_type(
         type_name: &str,
         body: &ast::CreateTypeBody,
-        origin: TypeOrigin,
         sql: String,
     ) -> crate::Result<Self> {
-        let is_builtin = matches!(origin, TypeOrigin::Builtin { .. });
         Ok(match body {
             ast::CreateTypeBody::CustomType {
                 params,
@@ -817,65 +739,17 @@ impl TypeDef {
                 // CREATE TYPE checks where type parameters are used. A type
                 // already stored by an earlier version is loaded unchecked, so
                 // the database still opens and DROP TYPE can remove it.
-                // A built-in type's BASE is a SQLite type. A user type's kinds
-                // are worked out once it is registered.
-                let (ordering, kinds, operator_signatures) = if is_builtin {
-                    let Some(stored) = primitive_value_type(base) else {
-                        return Err(crate::LimboError::InternalError(format!(
-                            "built-in type {type_name} has BASE {base}"
-                        )));
-                    };
-                    let kinds = ValueKinds {
-                        read: builtin_value_type(type_name)?,
-                        stored,
-                    };
-                    (
-                        builtin_ordering(type_name),
-                        Some(kinds),
-                        builtin_signatures(type_name),
-                    )
-                } else {
-                    (None, None, std::vec::Vec::new())
-                };
-                Self {
+                let user_type = UserType {
                     name: type_name.to_string(),
-                    is_builtin,
-                    not_null: false,
-                    is_domain: false,
-                    range_offsets: Some(match origin {
-                        TypeOrigin::Builtin { range_offsets, .. } => range_offsets,
-                        TypeOrigin::User => RangeOffsets::None,
-                    }),
-                    accepts_collate: Some(match origin {
-                        TypeOrigin::Builtin {
-                            accepts_collate, ..
-                        } => accepts_collate,
-                        // A user type takes a COLLATE when its values are text.
-                        TypeOrigin::User => base.eq_ignore_ascii_case("text"),
-                    }),
-                    stored_form_sorts_in_value_order: match origin {
-                        TypeOrigin::Builtin {
-                            stored_form_sorts_in_value_order,
-                            ..
-                        } => stored_form_sorts_in_value_order,
-                        // A user type's ENCODE may store any form.
-                        TypeOrigin::User => false,
-                    },
-                    sql,
-                    domain_checks: std::vec::Vec::new(),
-                    kind: TypeDefKind::Custom {
-                        params: params.clone(),
-                        base: base.clone(),
-                        encode: encode.clone(),
-                        coerce: coerce.clone(),
-                        decode: decode.clone(),
-                        ordering,
-                        kinds,
-                        operators: operators.clone(),
-                        operator_signatures,
-                        default: default.clone(),
-                    },
-                }
+                    params: params.clone(),
+                    base: base.clone(),
+                    encode: encode.clone(),
+                    coerce: coerce.clone(),
+                    decode: decode.clone(),
+                    operators: operators.clone(),
+                    default: default.clone(),
+                };
+                Self::from_type(&user_type, false, None, sql)
             }
             ast::CreateTypeBody::Struct(fields) => {
                 let struct_fields: Vec<StructFieldDef> = fields
@@ -891,7 +765,7 @@ impl TypeDef {
                     .try_collect()?;
                 Self {
                     name: type_name.to_string(),
-                    is_builtin,
+                    is_builtin: false,
                     not_null: false,
                     is_domain: false,
                     range_offsets: Some(RangeOffsets::None),
@@ -926,7 +800,7 @@ impl TypeDef {
                     .try_collect()?;
                 Self {
                     name: type_name.to_string(),
-                    is_builtin,
+                    is_builtin: false,
                     not_null: false,
                     is_domain: false,
                     range_offsets: Some(RangeOffsets::None),
@@ -943,6 +817,39 @@ impl TypeDef {
                 }
             }
         })
+    }
+
+    /// The definition of the type `ty`. `kinds` is None for a user type,
+    /// whose kinds are worked out once it is registered.
+    fn from_type(
+        ty: &dyn crate::types::Type,
+        is_builtin: bool,
+        kinds: Option<ValueKinds>,
+        sql: String,
+    ) -> Self {
+        Self {
+            name: ty.name().to_string(),
+            is_builtin,
+            not_null: false,
+            is_domain: false,
+            range_offsets: Some(ty.range_offsets()),
+            accepts_collate: Some(ty.accepts_collate()),
+            stored_form_sorts_in_value_order: ty.stored_form_sorts_in_value_order(),
+            sql,
+            domain_checks: std::vec::Vec::new(),
+            kind: TypeDefKind::Custom {
+                params: ty.params(),
+                base: ty.base().to_string(),
+                encode: ty.encode(),
+                coerce: ty.coerce(),
+                decode: ty.decode(),
+                ordering: ty.ordering(),
+                kinds,
+                operators: ty.operators(),
+                operator_signatures: ty.operator_signatures(),
+                default: ty.default(),
+            },
+        }
     }
 
     /// Construct a TypeDef from a parsed CREATE DOMAIN statement.
@@ -1481,6 +1388,31 @@ impl SchemaBuilder {
         self
     }
 
+    /// Adds the built-in type `ty` under its name and its aliases. It
+    /// replaces a type that already has one of these names, so a dialect can
+    /// define a built-in type differently from core. Every other name of a
+    /// replaced type then names `ty` too: a dialect that defines `boolean`
+    /// also defines `bool`, which core registered as an alias of its own
+    /// `boolean`.
+    pub fn builtin_type(mut self, ty: &dyn crate::types::Type) -> crate::Result<Self> {
+        let type_def = Arc::new(TypeDef::builtin(ty)?);
+        for name in std::iter::once(ty.name()).chain(ty.aliases().iter().copied()) {
+            let Some(replaced) = self.schema.type_registry.get(&name.to_lowercase()) else {
+                continue;
+            };
+            let replaced = Arc::clone(replaced);
+            for registered in self.schema.type_registry.values_mut() {
+                if Arc::ptr_eq(registered, &replaced) {
+                    *registered = Arc::clone(&type_def);
+                }
+            }
+        }
+        for alias in ty.aliases() {
+            self = self.type_def(alias, Arc::clone(&type_def));
+        }
+        Ok(self.type_def(ty.name(), type_def))
+    }
+
     /// Adds the type `type_def` under `name`. A type can have several names.
     pub fn type_def(mut self, name: &str, type_def: Arc<TypeDef>) -> Self {
         self.schema
@@ -1538,21 +1470,6 @@ impl RangeOffsets {
                 )
         )
     }
-}
-
-/// Whether a type is built into Turso or made by a user's CREATE TYPE.
-#[derive(Debug, Clone, Copy)]
-pub enum TypeOrigin {
-    /// `accepts_collate` says whether values of the type take a COLLATE,
-    /// `range_offsets` what kind of number they are in a RANGE frame, and
-    /// `stored_form_sorts_in_value_order` whether the stored form sorts in
-    /// the same order as the values.
-    Builtin {
-        accepts_collate: bool,
-        range_offsets: RangeOffsets,
-        stored_form_sorts_in_value_order: bool,
-    },
-    User,
 }
 
 impl Schema {
@@ -2462,12 +2379,7 @@ impl Schema {
             Ok(Some(Cmd::Stmt(Stmt::CreateType {
                 type_name, body, ..
             }))) => {
-                let type_def = TypeDef::from_create_type(
-                    &type_name,
-                    &body,
-                    TypeOrigin::User,
-                    sql.to_string(),
-                )?;
+                let type_def = TypeDef::from_create_type(&type_name, &body, sql.to_string())?;
                 self.type_registry
                     .insert(type_registry_key(&type_name), Arc::new(type_def));
             }
@@ -9393,8 +9305,7 @@ mod tests {
             operators: std::vec![],
             default: None,
         };
-        let price =
-            TypeDef::from_create_type("price", &body, TypeOrigin::User, String::new()).unwrap();
+        let price = TypeDef::from_create_type("price", &body, String::new()).unwrap();
         price.value_type();
     }
 

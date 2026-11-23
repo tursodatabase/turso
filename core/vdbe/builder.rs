@@ -355,7 +355,8 @@ pub struct ProgramBuilder {
     /// The mode in which the query is being executed.
     mode: BuilderQueryMode,
     pub flags: ProgramBuilderFlags,
-    /// True once any `Insn::Function` has been emitted. See [`Self::may_abort`].
+    /// True once any `Insn::Function` or `Insn::TypeConversion` has been
+    /// emitted. See [`Self::may_abort`].
     emitted_function_call: bool,
     next_free_register: usize,
     free_register_ranges: Vec<Range<usize>>,
@@ -1474,8 +1475,9 @@ impl ProgramBuilder {
         tracing::trace!("");
         self.flags
             .set_readonly(self.flags.readonly() & insn.is_readonly());
-        // Any function can raise at runtime; see Self::may_abort.
-        if matches!(insn, Insn::Function { .. }) {
+        // Any function can raise at runtime, and so can the conversion of a
+        // type; see Self::may_abort.
+        if matches!(insn, Insn::Function { .. } | Insn::TypeConversion { .. }) {
             self.emitted_function_call = true;
         }
         if let Insn::Column {

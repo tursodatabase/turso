@@ -1905,14 +1905,14 @@ fn query_pragma(
                     program.emit_string8(display_name, base_reg);
                     program.emit_string8(type_def.base().to_string(), base_reg + 1);
                     let clauses = [
-                        type_def.encode(),
-                        type_def.coerce(),
-                        type_def.decode(),
-                        type_def.default_expr(),
+                        type_def.encode().map(ToString::to_string),
+                        type_def.coerce().map(ToString::to_string),
+                        type_def.decode().map(ToString::to_string),
+                        type_def.default_expr().map(ToString::to_string),
                     ];
                     for (i, clause) in clauses.into_iter().enumerate() {
                         match clause {
-                            Some(expr) => program.emit_string8(expr.to_string(), base_reg + 2 + i),
+                            Some(text) => program.emit_string8(text, base_reg + 2 + i),
                             None => program.emit_null(base_reg + 2 + i, None),
                         }
                     }

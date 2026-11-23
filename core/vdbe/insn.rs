@@ -1017,6 +1017,18 @@ pub enum Insn {
         description: String,
     },
 
+    /// Replaces the value in `reg` with what `function` gives for it and for
+    /// the `param_count` values that start at `params_reg`. NULL is left as it
+    /// is. `function` is the ENCODE, COERCE or DECODE of a type that is written
+    /// in Rust, and `description` names the type and the conversion.
+    TypeConversion {
+        function: crate::types::ConversionFn,
+        reg: usize,
+        params_reg: usize,
+        param_count: usize,
+        description: String,
+    },
+
     /// Parse a JSON text array into a native record-format BLOB, validating
     /// and coercing each element against the declared type using STRICT
     /// type-checking logic (apply_affinity_char + value_type check).
@@ -2497,6 +2509,7 @@ impl InsnVariants {
             InsnVariants::IsType => execute::op_is_type,
             InsnVariants::TypeCheck => execute::op_type_check,
             InsnVariants::ConvertToType => execute::op_convert_to_type,
+            InsnVariants::TypeConversion => execute::op_type_conversion,
             InsnVariants::ArrayEncode => execute::op_array_encode,
             InsnVariants::ArrayDecode => execute::op_array_decode,
             InsnVariants::ArrayElement => execute::op_array_element,

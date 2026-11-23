@@ -14,7 +14,9 @@ use turso_core::security::roles::SessionRole;
 use turso_core::storage::database::DatabaseFile;
 use turso_core::sync::atomic::AtomicUsize;
 use turso_core::sync::atomic::Ordering;
+use turso_core::types::Conversion;
 use turso_core::types::IOResultOr;
+use turso_core::types::Type;
 use turso_core::vdbe::Register;
 use turso_core::ConnectOpts;
 use turso_core::Connection;
@@ -1187,6 +1189,170 @@ impl Dialect for NamespacesAndOwnBuilderDialect {
         &self,
         enable_custom_types: bool,
     ) -> Result<turso_core::schema::SchemaBuilder> {
-        turso_core::schema::builtin::schema_builder(self, enable_custom_types)
+        turso_core::schema::builtin::schema_builder(enable_custom_types)
+    }
+}
+
+#[test]
+fn dialect_registers_a_type_written_in_rust() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_db(&io, "dialect-rust-type.db", Arc::new(RustTypesDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    // `bool` is another name of the boolean type of core.
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s loud, b boolean, b2 bool) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'Hello', 'si', 'no'), (2, NULL, NULL, NULL)")
+        .unwrap();
+    let rows = conn
+        .prepare("SELECT s, b, b2 FROM t ORDER BY id")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            // ENCODE stored HELLO, and DECODE added the question mark.
+            vec![
+                Value::build_text("HELLO?"),
+                Value::from_i64(1),
+                Value::from_i64(0)
+            ],
+            // Neither runs on NULL.
+            vec![Value::Null, Value::Null, Value::Null],
+        ]
+    );
+
+    // The boolean type of the dialect replaced the type of core, which
+    // reads `yes` as true, under both of its names.
+    for values in ["(3, 'x', 'yes', 'no')", "(3, 'x', 'si', 'yes')"] {
+        let error = conn
+            .execute(format!("INSERT INTO t VALUES {values}"))
+            .unwrap_err();
+        assert!(error.to_string().contains("not si or no"), "{error}");
+    }
+    conn.close().unwrap();
+}
+
+/// A dialect that registers two types written in Rust: `loud`, and a
+/// `boolean` that replaces the type of core.
+struct RustTypesDialect;
+
+impl Dialect for RustTypesDialect {
+    fn name(&self) -> &'static str {
+        "rust-types"
+    }
+
+    fn parse_internal(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
+        turso_sqlite::SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
+        turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn parameter_marker_ranges(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<Vec<std::ops::Range<usize>>> {
+        turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
+    }
+
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
+    }
+
+    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        SqliteDialect.parse_internal(sql)
+    }
+
+    fn requires_custom_types(&self) -> bool {
+        true
+    }
+
+    fn schema_builder(
+        &self,
+        enable_custom_types: bool,
+    ) -> Result<turso_core::schema::SchemaBuilder> {
+        turso_core::schema::builtin::schema_builder(enable_custom_types)?
+            .builtin_type(&Loud)?
+            .builtin_type(&SiNoBoolean)
+    }
+}
+
+/// Text that is stored in upper case and read with a question mark after it.
+#[derive(Debug)]
+struct Loud;
+
+impl Type for Loud {
+    fn name(&self) -> &str {
+        "loud"
+    }
+
+    fn params(&self) -> Vec<turso_core::ast::TypeParam> {
+        vec![value_param("text")]
+    }
+
+    fn base(&self) -> &str {
+        "text"
+    }
+
+    fn encode(&self) -> Option<Conversion> {
+        Some(Conversion::Function(|value, _params| {
+            Ok(Value::build_text(value.to_string().to_uppercase()))
+        }))
+    }
+
+    fn decode(&self) -> Option<Conversion> {
+        Some(Conversion::Function(|value, _params| {
+            Ok(Value::build_text(format!("{value}?")))
+        }))
+    }
+
+    fn reads_as(&self) -> Option<turso_core::types::StorageClass> {
+        Some(turso_core::types::StorageClass::Text)
+    }
+}
+
+/// A boolean that reads `si` as true and `no` as false.
+#[derive(Debug)]
+struct SiNoBoolean;
+
+impl Type for SiNoBoolean {
+    fn name(&self) -> &str {
+        "boolean"
+    }
+
+    fn params(&self) -> Vec<turso_core::ast::TypeParam> {
+        vec![value_param("any")]
+    }
+
+    fn base(&self) -> &str {
+        "integer"
+    }
+
+    fn encode(&self) -> Option<Conversion> {
+        Some(Conversion::Function(|value, _params| {
+            match value.to_string().as_str() {
+                "si" => Ok(Value::from_i64(1)),
+                "no" => Ok(Value::from_i64(0)),
+                other => Err(LimboError::Constraint(format!("{other} is not si or no"))),
+            }
+        }))
+    }
+}
+
+fn value_param(ty: &str) -> turso_core::ast::TypeParam {
+    turso_core::ast::TypeParam {
+        name: "value".to_string(),
+        ty: Some(ty.to_string()),
     }
 }
