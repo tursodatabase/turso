@@ -1592,22 +1592,13 @@ fn push_zero_padded(res: &mut String, value: i64, width: usize) {
     }
 }
 
-/// The numbers from 0 to 99, each as two digits.
-const TWO_DIGITS: &str = concat!(
-    "0001020304050607080910111213141516171819",
-    "2021222324252627282930313233343536373839",
-    "4041424344454647484950515253545556575859",
-    "6061626364656667686970717273747576777879",
-    "8081828384858687888990919293949596979899",
-);
-
 /// Append `value`, which is less than 100, as two digits.
 #[inline(always)]
 fn push_two_digits(res: &mut String, value: u16) {
     // One `push_str` copies both digits, where a `push` for each digit
     // checks the capacity two times.
     let start = usize::from(value) * 2;
-    res.push_str(&TWO_DIGITS[start..start + 2]);
+    res.push_str(&crate::numeric::DIGIT_PAIRS[start..start + 2]);
 }
 
 /// Append `value` as `push_zero_padded` does, for the widths and values that

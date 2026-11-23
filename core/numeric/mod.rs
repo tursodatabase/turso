@@ -1062,12 +1062,12 @@ pub(crate) fn write_decimal_digits(buf: &mut [u8; 20], mut n: u64) -> &[u8] {
         let pair = usize::from((n % 100) as u8) * 2;
         n /= 100;
         start -= 2;
-        buf[start..start + 2].copy_from_slice(&DIGIT_PAIRS[pair..pair + 2]);
+        buf[start..start + 2].copy_from_slice(&DIGIT_PAIRS.as_bytes()[pair..pair + 2]);
     }
     if n >= 10 {
         let pair = usize::from(n as u8) * 2;
         start -= 2;
-        buf[start..start + 2].copy_from_slice(&DIGIT_PAIRS[pair..pair + 2]);
+        buf[start..start + 2].copy_from_slice(&DIGIT_PAIRS.as_bytes()[pair..pair + 2]);
     } else {
         start -= 1;
         buf[start] = b'0' + n as u8;
@@ -1076,7 +1076,7 @@ pub(crate) fn write_decimal_digits(buf: &mut [u8; 20], mut n: u64) -> &[u8] {
 }
 
 /// The numbers from 0 to 99, each as two ASCII digits.
-const DIGIT_PAIRS: &[u8; 200] = b"\
+pub(crate) const DIGIT_PAIRS: &str = "\
     0001020304050607080910111213141516171819\
     2021222324252627282930313233343536373839\
     4041424344454647484950515253545556575859\
