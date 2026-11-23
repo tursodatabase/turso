@@ -2612,8 +2612,7 @@ impl Schema {
         {
             let bt = table.btree().expect("checked btree table");
             let mut modified = (*bt).clone();
-            modified.resolve_custom_types(self)?;
-            modified.propagate_domain_constraints(self)?;
+            modified.resolve_types_and_domains(self)?;
             tables.push((
                 namespace,
                 name.clone(),
@@ -4443,8 +4442,7 @@ impl Schema {
                         }
                     }
 
-                    table.resolve_custom_types(self)?;
-                    table.propagate_domain_constraints(self)?;
+                    table.resolve_types_and_domains(self)?;
                     let has_autoinc = table.has_autoincrement;
                     let tbl_name = name.to_string();
                     self.add_btree_table(namespace, Arc::new(table))?;
@@ -6006,6 +6004,14 @@ impl BTreeTable {
                 }
             }
         }
+    }
+
+    /// What the schema does to a table when it loads it: fills in its custom
+    /// types and applies the constraints of its domains. `schema` is the
+    /// schema of the table's own database.
+    pub fn resolve_types_and_domains(&mut self, schema: &Schema) -> Result<()> {
+        self.resolve_custom_types(schema)?;
+        self.propagate_domain_constraints(schema)
     }
 
     /// Fill in what custom type columns get from their type:

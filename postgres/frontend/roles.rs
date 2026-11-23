@@ -38,6 +38,7 @@ use crate::auth_members::{emit_memberships_delete, Membership, Memberships};
 use crate::catalog::{pg_role_by_name, relation_name, PgRole};
 use crate::classes::class_catalog;
 use crate::error::sqlstate_error;
+use crate::schema_init::TableInit;
 use crate::schema_state::{change_schema_state, emit_catalog_apply};
 use crate::unique_index::emit_unique_index_insert;
 
@@ -48,7 +49,7 @@ pub(crate) const AUTHID_TABLE_NAME: &str = "__turso_internal_authid";
 const AUTHID_NAME_INDEX_NAME: &str = "__turso_internal_authid_rolname";
 
 /// Creates [`AUTHID_TABLE_NAME`]. The rowid of a row is the id of its role.
-pub(crate) const CREATE_AUTHID_TABLE_SQL: &str = "CREATE TABLE __turso_internal_authid (\
+const CREATE_AUTHID_TABLE_SQL: &str = "CREATE TABLE __turso_internal_authid (\
     id INTEGER PRIMARY KEY, \
     rolname TEXT NOT NULL, \
     rolsuper INTEGER NOT NULL, \
@@ -56,11 +57,16 @@ pub(crate) const CREATE_AUTHID_TABLE_SQL: &str = "CREATE TABLE __turso_internal_
     rolbypassrls INTEGER NOT NULL)";
 
 /// Keeps role names unique in the stored table, whatever writes it.
-pub(crate) const CREATE_AUTHID_NAME_INDEX_SQL: &str =
+const CREATE_AUTHID_NAME_INDEX_SQL: &str =
     "CREATE UNIQUE INDEX __turso_internal_authid_rolname ON __turso_internal_authid (rolname)";
 
 /// The number of columns of [`AUTHID_TABLE_NAME`].
 const AUTHID_COLUMN_COUNT: usize = 5;
+
+pub(crate) const TABLE_INIT: TableInit = TableInit {
+    table: AUTHID_TABLE_NAME,
+    statements: &[CREATE_AUTHID_TABLE_SQL, CREATE_AUTHID_NAME_INDEX_SQL],
+};
 
 /// The query that reads the roles for the frontend's schema state, or None
 /// when the database has no roles table, as in a read-only open of an empty

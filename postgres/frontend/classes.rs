@@ -51,17 +51,12 @@ use turso_pg_parser::sqlstate::{
 };
 
 use crate::acl::{Acl, Privileges, PUBLIC_OID};
-use crate::auth_members::{
-    AUTH_MEMBERS_TABLE_NAME, CREATE_AUTH_MEMBERS_ROLE_MEMBER_INDEX_SQL,
-    CREATE_AUTH_MEMBERS_TABLE_SQL,
-};
 use crate::catalog::{engine_role_by_name, role_oid, role_oid_by_name};
-use crate::descriptions::{emit_delete_comments, is_stored_catalog_table, Dropped};
+use crate::descriptions::{emit_delete_comments, Dropped};
 use crate::error::sqlstate_error;
 use crate::policies::{self, TablePolicies};
-use crate::roles::{
-    schema_roles, AUTHID_TABLE_NAME, CREATE_AUTHID_NAME_INDEX_SQL, CREATE_AUTHID_TABLE_SQL,
-};
+use crate::roles::schema_roles;
+use crate::schema_init::{is_stored_catalog_table, TableInit};
 use crate::schema_state::{change_schema_state, emit_catalog_apply, schema_state};
 use crate::unique_index::emit_unique_index_insert;
 use turso_core::security::policy::RowPolicy;
@@ -100,6 +95,44 @@ const CLASS_COLUMN_COUNT: usize = 10;
 
 const CREATE_CLASSES_NAME_INDEX_SQL: &str = "CREATE UNIQUE INDEX __turso_internal_classes_name \
      ON __turso_internal_classes (relnamespace, relname)";
+
+/// Fails for a database that has relations and no class table, as an
+/// earlier version of tursopg made it.
+pub(crate) fn refuse_relations_without_class_table(schema: &Schema) -> turso_core::Result<()> {
+    if schema
+        .get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME)
+        .is_none()
+        && !schema.user_relations().is_empty()
+    {
+        return Err(LimboError::ParseError(
+            "the database has relations but no relation catalog, as an earlier version of tursopg \
+             made it; this version does not open it"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// A database that the SQLite frontend made can have this table already.
+const CREATE_SEQUENCE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS sqlite_sequence(name,seq)";
+
+/// Stores the highest oid ever used. No oid is used yet, so it is the one
+/// before [`FIRST_NORMAL_OBJECT_ID`].
+const INSERT_HIGHEST_OID_SQL: &str =
+    "INSERT INTO sqlite_sequence (name, seq) VALUES ('__turso_internal_classes', 16383)";
+
+// The statement above spells the oid so that it can be a constant.
+const _: () = assert!(FIRST_NORMAL_OBJECT_ID - 1 == 16383);
+
+pub(crate) const TABLE_INIT: TableInit = TableInit {
+    table: CLASSES_TABLE_NAME,
+    statements: &[
+        CREATE_CLASSES_TABLE_SQL,
+        CREATE_CLASSES_NAME_INDEX_SQL,
+        CREATE_SEQUENCE_TABLE_SQL,
+        INSERT_HIGHEST_OID_SQL,
+    ],
+};
 
 /// PostgreSQL's `pg_class.relkind` letter for `kind`.
 pub(crate) fn relkind_letter(kind: RelationKind) -> &'static str {
@@ -2310,54 +2343,6 @@ fn emit_read_oid_watermark(program: &mut ProgramBuilder, seq_cursor_id: usize) -
     let rowid_reg = program.alloc_register();
     emit_sqlite_sequence_row_read(program, seq_cursor_id, name_reg, watermark_reg, rowid_reg);
     watermark_reg
-}
-
-pub(crate) fn initialize_schema(
-    schema: &Schema,
-    read_only: bool,
-) -> turso_core::Result<Vec<String>> {
-    let table = schema.get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME);
-    if table.is_none() && !schema.user_relations().is_empty() {
-        return Err(LimboError::ParseError(
-            "the database has relations but no relation catalog, as an earlier version of tursopg \
-             made it; this version does not open it"
-                .to_string(),
-        ));
-    }
-    if read_only {
-        return Ok(Vec::new());
-    }
-    let mut statements = Vec::new();
-    if table.is_none() {
-        statements.push(CREATE_CLASSES_TABLE_SQL.to_string());
-        statements.push(CREATE_CLASSES_NAME_INDEX_SQL.to_string());
-        if schema
-            .get_btree_table(NamespaceId::ROOT, "sqlite_sequence")
-            .is_none()
-        {
-            statements.push("CREATE TABLE sqlite_sequence(name,seq)".to_string());
-        }
-        statements.push(format!(
-            "INSERT INTO sqlite_sequence (name, seq) VALUES ('{CLASSES_TABLE_NAME}', {})",
-            FIRST_NORMAL_OBJECT_ID - 1
-        ));
-    }
-    if schema
-        .get_btree_table(NamespaceId::ROOT, AUTHID_TABLE_NAME)
-        .is_none()
-    {
-        statements.push(CREATE_AUTHID_TABLE_SQL.to_string());
-        statements.push(CREATE_AUTHID_NAME_INDEX_SQL.to_string());
-    }
-    if schema
-        .get_btree_table(NamespaceId::ROOT, AUTH_MEMBERS_TABLE_NAME)
-        .is_none()
-    {
-        statements.push(CREATE_AUTH_MEMBERS_TABLE_SQL.to_string());
-        statements.push(CREATE_AUTH_MEMBERS_ROLE_MEMBER_INDEX_SQL.to_string());
-    }
-    statements.extend(crate::descriptions::initialize_statements(schema));
-    Ok(statements)
 }
 
 #[cfg(test)]

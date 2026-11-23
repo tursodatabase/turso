@@ -1409,7 +1409,13 @@ pub fn translate_create_table(
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L2856-L2871
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
 
-    let index_regs = collect_autoindexes(&body, program, &mangled_tbl_name, resolver)?;
+    let mut table = create_table(
+        &mangled_tbl_name,
+        &body,
+        0,
+        resolver.catalog.dialect.supports_namespaces(),
+    )?;
+    let index_regs = collect_autoindexes(&table, program)?;
 
     // SQLite compiles `SELECT * FROM t` at the end of CREATE TABLE, after all other
     // checks, and that fails on a RAISE outside a trigger. The SELECT reads STORED
@@ -1461,6 +1467,11 @@ pub fn translate_create_table(
     } else {
         TableText::Statement(input)
     };
+    // The schema of the table's database does the same when it loads the
+    // table, so the catalog sees the table as a later statement will.
+    resolver.with_schema(database_id, |schema| {
+        table.resolve_types_and_domains(schema)
+    })?;
     let cmd_context = CmdContext::new(connection, resolver, database_id);
     resolver.catalog.dialect.catalog().emit(
         program,
@@ -1472,6 +1483,7 @@ pub fn translate_create_table(
             temporary,
             if_not_exists,
             body: &body,
+            table: &table,
             text,
             root_reg: table_root_reg,
             automatic_indexes: &automatic_indexes,
@@ -1775,18 +1787,9 @@ pub const SQLITE_TABLEID: &str = "sqlite_schema";
 ///
 /// Otherwise, an automatic PRIMARY KEY index is required.
 fn collect_autoindexes(
-    body: &ast::CreateTableBody,
+    table: &BTreeTable,
     program: &mut ProgramBuilder,
-    tbl_name: &str,
-    resolver: &Resolver,
 ) -> Result<Option<Vec<usize>>> {
-    let table = create_table(
-        tbl_name,
-        body,
-        0,
-        resolver.catalog.dialect.supports_namespaces(),
-    )?;
-
     let mut regs: Vec<usize> = Vec::new();
 
     // include UNIQUE singles, include PK single only if not rowid alias
