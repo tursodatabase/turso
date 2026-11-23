@@ -1940,7 +1940,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     // Now pick the winner based on direction
                     let winner_pos = self.position_from_peeks(direction);
                     self.state = None;
-                    // Exact lookups default to seeking both sources again on movement.
+                    // Exact lookups need recovery unless the index candidates
+                    // below are ready to continue in the same direction.
                     self.peeks_valid_for = if op.eq_only() { None } else { Some(direction) };
                     if let CursorPosition::Loaded {
                         row_id,
@@ -1960,14 +1961,19 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                             let found =
                                 row_matches_seek_key(&winner_key, &seek_key, &self.mv_cursor_type)?;
                             if found {
-                                // A peek ahead of the winner can skip a row restored by rollback.
+                                // A non-singleton search retains the first physical
+                                // key that could follow its MVCC winner. Reopen the
+                                // bounded MVCC iterator on movement, but keep that
+                                // physical position. A failed physical equality
+                                // probe does not provide a continuation candidate.
                                 if let (
-                                    true,
                                     SeekKey::IndexKey(index_key),
                                     MvccCursorType::Index(index_info),
-                                ) = (in_btree, &seek_key, &self.mv_cursor_type)
+                                ) = (&seek_key, &self.mv_cursor_type)
                                 {
-                                    if !index_key_matches_at_most_one_row(index_key, index_info)? {
+                                    if !index_key_matches_at_most_one_row(index_key, index_info)?
+                                        && self.dual_peek.btree_peek.get_row_key().is_some()
+                                    {
                                         self.peeks_valid_for = Some(direction);
                                         self.mvcc_peek_needs_reseek = true;
                                     }
