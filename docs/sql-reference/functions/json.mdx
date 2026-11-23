@@ -275,6 +275,8 @@ SELECT '{"count":42}' ->> '$.count';
 -- 42
 ```
 
+Through the PostgreSQL frontend, `->` and `->>` work as in PostgreSQL. The right operand is the name of a field or the index of an array element, not a JSON path: `'{"$.a":1}'::jsonb ->> '$.a'` is `1`. A negative index counts from the end of the array. If an object has two fields with the same name, the last one counts. `->>` returns text: `'{"n":2}'::jsonb ->> 'n'` is the text `2`, a number is written as jsonb writes it (`'{"n":1e2}'::jsonb ->> 'n'` is `100`), and a JSON boolean is `true` or `false`. A JSON null is NULL. A `CREATE INDEX` or a stored generated column that uses `->` or `->>` fails with SQLSTATE 0A000.
+
 ### json_type
 
 Returns the type of a JSON value as a string: `"null"`, `"true"`, `"false"`, `"integer"`, `"real"`, `"text"`, `"array"`, or `"object"`.
