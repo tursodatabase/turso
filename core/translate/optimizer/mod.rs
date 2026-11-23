@@ -2599,10 +2599,7 @@ fn keep_index_hint_candidates(
             .is_some_and(|index| Arc::ptr_eq(index, &forced_index))
     });
     if candidates.is_empty() {
-        candidates.push(ConstraintUseCandidate {
-            index: Some(forced_index),
-            refs: Vec::new(),
-        });
+        candidates.push(ConstraintUseCandidate::new(Some(forced_index)));
     }
 }
 

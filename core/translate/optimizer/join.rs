@@ -479,6 +479,10 @@ struct WhereTermsInfo {
     /// The positions of the unconsumed terms that do more work than one simple
     /// condition.
     terms_with_extra_work: Vec<usize>,
+    /// The tables after which a term of `terms_with_extra_work` can be ready:
+    /// the outer table of an ON term of an outer join, and the tables of the
+    /// other terms.
+    tables_with_extra_work: TableMask,
 }
 
 impl JoinN {
@@ -948,6 +952,7 @@ fn join_lhs_and_rhs<'a, 'w>(
                         let materialization_reads_an_outer_query = needs_materialization
                             && materialized_build_input_reads_an_outer_query(
                                 where_clause,
+                                where_terms,
                                 table_references,
                                 subqueries,
                                 &lhs_mask,
@@ -1151,13 +1156,16 @@ fn join_lhs_and_rhs<'a, 'w>(
 
 fn materialized_build_input_reads_an_outer_query(
     where_clause: &[WhereTerm],
+    where_terms: &WhereTermsInfo,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     build_input_mask: &TableMask,
 ) -> Result<bool> {
-    for term in where_clause.iter() {
-        let term_mask = table_mask_from_expr(&term.expr, table_references, subqueries)?;
-        if build_input_mask.contains_all_set_bits_of(&term_mask)
+    // The join search calls this for many join orders. The table mask of each
+    // term does not change during the search, so it comes from `where_terms`.
+    turso_assert_eq!(where_clause.len(), where_terms.terms.len());
+    for (term, info) in where_clause.iter().zip(&where_terms.terms) {
+        if build_input_mask.contains_all_set_bits_of(&info.table_mask)
             && expr_reads_an_outer_query(&term.expr, table_references, subqueries)?
         {
             return Ok(true);
@@ -1616,6 +1624,19 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     });
                     turso_assert_eq!(join_order.len(), subset_size);
 
+                    // Without an order target, the code below drops a plan
+                    // that costs more than the plan kept for this subset and
+                    // this last table. With that cost as the bound,
+                    // join_lhs_and_rhs returns None for such a plan before
+                    // it builds the plan.
+                    let rel_cost_upper_bound = match (
+                        planning_context.maybe_order_target,
+                        best_for_mask_by_last.get(&rhs_idx),
+                    ) {
+                        (None, Some(existing)) if existing.cost < cost_upper_bound => existing.cost,
+                        _ => cost_upper_bound,
+                    };
+
                     // Calculate the best way to join LHS with RHS.
                     let arena_len = access_methods_arena.len();
                     let rel = join_lhs_and_rhs(
@@ -1628,7 +1649,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         &join_order,
                         planning_context,
                         access_methods_arena,
-                        cost_upper_bound,
+                        rel_cost_upper_bound,
                         joined_tables,
                         where_clause,
                         &multi_index_work,
@@ -2369,17 +2390,37 @@ impl WhereTermsInfo {
     ) -> Result<Self> {
         let terms = build_where_term_info(where_clause, table_references, subqueries, resolver)?;
         let table_connections = table_connections(num_tables, &terms)?;
-        let terms_with_extra_work = where_clause
+        let terms_with_extra_work: Vec<usize> = where_clause
             .iter()
             .zip(&terms)
             .enumerate()
             .filter(|(_, (term, info))| !term.consumed && info.extra_steps > 0)
             .map(|(term_idx, _)| term_idx)
             .collect();
+        let mut tables_with_extra_work = TableMask::default();
+        for &term_idx in &terms_with_extra_work {
+            match where_clause[term_idx]
+                .origin
+                .join_origin()
+                .and_then(JoinOrigin::outer_table)
+            {
+                Some(table_id) => {
+                    if let Some(table_idx) = table_references
+                        .joined_tables()
+                        .iter()
+                        .position(|table| table.internal_id == table_id)
+                    {
+                        tables_with_extra_work.set(table_idx)?;
+                    }
+                }
+                None => tables_with_extra_work.union_with(&terms[term_idx].table_mask)?,
+            }
+        }
         Ok(Self {
             terms,
             table_connections,
             terms_with_extra_work,
+            tables_with_extra_work,
         })
     }
 }
@@ -2424,6 +2465,11 @@ fn ready_where_work(
     rhs_table_number: usize,
     rhs_table_id: TableInternalId,
 ) -> SmallVec<[(usize, usize); 4]> {
+    // The join search calls this for each join order that it tries. After a
+    // table that is in no term with extra work, no such term can be ready.
+    if !where_terms.tables_with_extra_work.get(rhs_table_number) {
+        return SmallVec::new();
+    }
     where_terms
         .terms_with_extra_work
         .iter()

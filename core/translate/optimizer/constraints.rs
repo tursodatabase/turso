@@ -1,4 +1,9 @@
-use super::{cost_params::CostModelParams, AvailableIndexes};
+use super::{
+    access_method::LhsMaskMemo,
+    cost::{BtreeDepthMemo, IndexInfo},
+    cost_params::CostModelParams,
+    AvailableIndexes,
+};
 use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
 use crate::translate::expr_context::{ExprContext, ExprProperties, TableMetadata};
@@ -28,7 +33,11 @@ use crate::{
 };
 use crate::{turso_assert, turso_debug_assert};
 use smallvec::SmallVec;
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    cell::{OnceCell, RefCell},
+    collections::VecDeque,
+    sync::Arc,
+};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
@@ -299,6 +308,28 @@ pub struct ConstraintUseCandidate {
     /// References to the constraints that may be used as an access path for the index.
     /// Refs are sorted by [ConstraintRef::index_col_pos]
     pub refs: Vec<ConstraintRef>,
+    /// The [IndexInfo] of `index` for the table of these constraints, made
+    /// the first time that the join search needs it. The search reads it for
+    /// each join order that it tries, and it does not change during the search.
+    pub(super) index_info: OnceCell<IndexInfo>,
+    /// The B-tree depth that the join search used for the last cost of a
+    /// lookup with this candidate.
+    pub(super) tree_depth: BtreeDepthMemo,
+    /// The usable constraint refs and the residual selectivity of this
+    /// candidate for the left-side tables in [TableConstraints::lhs_mask_key].
+    pub(super) lhs_mask_memo: RefCell<LhsMaskMemo>,
+}
+
+impl ConstraintUseCandidate {
+    pub fn new(index: Option<Arc<Index>>) -> Self {
+        Self {
+            index,
+            refs: Vec::new(),
+            index_info: OnceCell::new(),
+            tree_depth: BtreeDepthMemo::default(),
+            lhs_mask_memo: RefCell::default(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -312,6 +343,28 @@ pub struct TableConstraints {
     pub candidates: Vec<ConstraintUseCandidate>,
     /// Conditions that a temporary index may use for a lookup.
     pub temporary_index_terms: SmallVec<[ConstraintRef; 4]>,
+    /// The table and the left-side tables for which the [LhsMaskMemo] of
+    /// each candidate is valid, or `None` if no memo is valid. The join search
+    /// tries the same left-side tables one time for each table that can be
+    /// the last of them, so the candidates keep their values for the last
+    /// left-side tables that the search tried.
+    pub(super) lhs_mask_key: RefCell<Option<(usize, TableMask)>>,
+    /// Whether a constraint is an `IN` that can drive an IN seek, computed the
+    /// first time that the join search needs it. The search asks for each
+    /// join order that it tries, and the operators of the constraints do not
+    /// change.
+    in_seek_constraint_exists: OnceCell<bool>,
+}
+
+impl TableConstraints {
+    /// Whether a constraint of the table is an `IN` that can drive an IN seek.
+    pub(super) fn has_in_seek_constraint(&self) -> bool {
+        *self.in_seek_constraint_exists.get_or_init(|| {
+            self.constraints
+                .iter()
+                .any(|c| matches!(c.operator, ConstraintOperator::In { not: false, .. }))
+        })
+    }
 }
 
 /// Build the search terms for an automatic index.
@@ -785,6 +838,8 @@ pub fn table_constraints_from_where_clause(
         table_id: table_reference.internal_id,
         constraints: Vec::new(),
         temporary_index_terms: SmallVec::new(),
+        lhs_mask_key: RefCell::new(None),
+        in_seek_constraint_exists: OnceCell::new(),
         candidates: available_indexes
             .indexes_for_table(table_reference.internal_id)
             .map_or(Vec::new(), |indexes| {
@@ -800,18 +855,12 @@ pub fn table_constraints_from_where_clause(
                             || !table_references
                                 .is_left_of_right_or_full_join(table_reference.internal_id)
                     })
-                    .map(|index| ConstraintUseCandidate {
-                        index: Some(index.clone()),
-                        refs: Vec::new(),
-                    })
+                    .map(|index| ConstraintUseCandidate::new(Some(index.clone())))
                     .collect()
             }),
     };
     // Add a candidate for the rowid index, which is always available when the table has a rowid alias.
-    cs.candidates.push(ConstraintUseCandidate {
-        index: None,
-        refs: Vec::new(),
-    });
+    cs.candidates.push(ConstraintUseCandidate::new(None));
 
     let index_for_column = |column_pos| {
         selectivity_index_for_column(schema, table_reference, available_indexes, column_pos)
@@ -1578,9 +1627,23 @@ pub fn usable_constraints_for_lhs_mask(
     lhs_mask: &TableMask,
     table_idx: usize,
 ) -> SmallVec<[RangeConstraintRef; 2]> {
+    let mut usable = SmallVec::new();
+    fill_usable_constraints_for_lhs_mask(constraints, refs, lhs_mask, table_idx, &mut usable);
+    usable
+}
+
+/// Write the result of [usable_constraints_for_lhs_mask] into `usable`, and
+/// remove the earlier contents of `usable`.
+pub(super) fn fill_usable_constraints_for_lhs_mask(
+    constraints: &[Constraint],
+    refs: &[ConstraintRef],
+    lhs_mask: &TableMask,
+    table_idx: usize,
+    usable: &mut SmallVec<[RangeConstraintRef; 2]>,
+) {
     turso_debug_assert!(refs.is_sorted_by_key(|x| x.index_col_pos));
 
-    let mut usable: SmallVec<[RangeConstraintRef; 2]> = SmallVec::new();
+    usable.clear();
     let mut current_required_column_pos = 0;
     for cref in refs.iter() {
         let constraint = &constraints[cref.constraint_vec_pos];
@@ -1690,7 +1753,6 @@ pub fn usable_constraints_for_lhs_mask(
         usable.push(constraint_group);
         current_required_column_pos += 1;
     }
-    usable
 }
 
 pub fn usable_constraints_for_join_order<'a>(

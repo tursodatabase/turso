@@ -4,10 +4,12 @@ use crate::sync::Arc;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::RangeConstraintRef;
 use crate::translate::plan::JoinedTable;
+use crate::turso_debug_assert;
 use turso_parser::ast;
 
 use super::constraints::Constraint;
 use super::cost_params::CostModelParams;
+use std::cell::Cell;
 
 /// A simple newtype wrapper over a f64 that represents the cost of an operation.
 ///
@@ -152,6 +154,84 @@ pub(super) fn estimate_ephemeral_index_build_cost(
 
 pub(super) fn estimate_sort_cpu_cost(row_count: f64, params: &CostModelParams) -> Cost {
     Cost(row_count * row_count.max(1.0).log2() * params.sort_cpu_per_row)
+}
+
+/// The result of [estimate_btree_depth] for the arguments of its last call.
+///
+/// The join search costs each index candidate for each join order that it
+/// tries, with the same row count each time. The two logarithms of the depth
+/// cost more instructions than the rest of the cost estimate.
+#[derive(Debug, Default)]
+pub(crate) struct BtreeDepthMemo(Cell<Option<(u64, u64, f64)>>);
+
+impl BtreeDepthMemo {
+    /// Same result as [estimate_btree_depth].
+    fn estimate_btree_depth(&self, row_count: f64, rows_per_page: f64) -> f64 {
+        let (row_count_bits, rows_per_page_bits) = (row_count.to_bits(), rows_per_page.to_bits());
+        if let Some((cached_row_count, cached_rows_per_page, depth)) = self.0.get() {
+            if cached_row_count == row_count_bits && cached_rows_per_page == rows_per_page_bits {
+                return depth;
+            }
+        }
+        let depth = estimate_btree_depth(row_count, rows_per_page);
+        self.0
+            .set(Some((row_count_bits, rows_per_page_bits, depth)));
+        depth
+    }
+}
+
+/// The result of [estimate_rows_per_seek] for one index candidate and its
+/// usable constraint refs, and the row count of the last call.
+///
+/// The join search tries the same left-side tables, and thus the same refs,
+/// one time for each table that can be the last of them. The owner of the
+/// memo clears it when the refs change.
+#[derive(Debug, Default)]
+pub(crate) struct RowsPerSeekMemo(Cell<Option<(u64, f64)>>);
+
+impl RowsPerSeekMemo {
+    /// Same result as [estimate_rows_per_seek]. The other arguments must be
+    /// the same as in the calls since the last [RowsPerSeekMemo::clear].
+    pub(super) fn estimate_rows_per_seek(
+        &self,
+        index_info: IndexInfo,
+        constraints: &[Constraint],
+        usable_constraint_refs: &[RangeConstraintRef],
+        base_row_count: RowCountEstimate,
+        analyze_ctx: Option<&AnalyzeCtx>,
+    ) -> f64 {
+        let row_count_bits = (*base_row_count).to_bits();
+        if let Some((cached_row_count, rows)) = self.0.get() {
+            if cached_row_count == row_count_bits {
+                turso_debug_assert!(
+                    rows.to_bits()
+                        == estimate_rows_per_seek(
+                            index_info,
+                            constraints,
+                            usable_constraint_refs,
+                            base_row_count,
+                            analyze_ctx,
+                        )
+                        .to_bits(),
+                    "the memo has the rows per seek of other arguments"
+                );
+                return rows;
+            }
+        }
+        let rows = estimate_rows_per_seek(
+            index_info,
+            constraints,
+            usable_constraint_refs,
+            base_row_count,
+            analyze_ctx,
+        );
+        self.0.set(Some((row_count_bits, rows)));
+        rows
+    }
+
+    pub(super) fn clear(&self) {
+        self.0.set(None);
+    }
 }
 
 /// Estimate how many B-tree levels an index search reads.
@@ -470,6 +550,36 @@ pub fn estimate_cost_for_scan_or_seek(
     params: &CostModelParams,
     analyze_ctx: Option<&AnalyzeCtx>,
 ) -> Cost {
+    estimate_cost_for_scan_or_seek_with_memos(
+        index_info,
+        constraints,
+        usable_constraint_refs,
+        input_cardinality,
+        base_row_count,
+        is_index_ordered,
+        params,
+        analyze_ctx,
+        None,
+        None,
+    )
+}
+
+/// Same result as [estimate_cost_for_scan_or_seek]. When `depth_memo` is
+/// given, it supplies the B-tree depth. When `rows_per_seek_memo` is given,
+/// it supplies the rows per seek.
+#[expect(clippy::too_many_arguments)]
+pub(super) fn estimate_cost_for_scan_or_seek_with_memos(
+    index_info: Option<IndexInfo>,
+    constraints: &[Constraint],
+    usable_constraint_refs: &[RangeConstraintRef],
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    is_index_ordered: bool,
+    params: &CostModelParams,
+    analyze_ctx: Option<&AnalyzeCtx>,
+    depth_memo: Option<&BtreeDepthMemo>,
+    rows_per_seek_memo: Option<&RowsPerSeekMemo>,
+) -> Cost {
     let base_row_count = *base_row_count;
 
     let Some(index_info) = index_info else {
@@ -477,7 +587,10 @@ pub fn estimate_cost_for_scan_or_seek(
         return estimate_scan_cost(base_row_count, input_cardinality, params);
     };
 
-    let tree_depth = estimate_btree_depth(base_row_count, params.rows_per_table_page);
+    let tree_depth = match depth_memo {
+        Some(memo) => memo.estimate_btree_depth(base_row_count, params.rows_per_table_page),
+        None => estimate_btree_depth(base_row_count, params.rows_per_table_page),
+    };
 
     if is_unique_point_lookup(index_info, usable_constraint_refs) {
         // Unique point lookup: 1 seek per input row, 1 row returned per seek
@@ -491,13 +604,22 @@ pub fn estimate_cost_for_scan_or_seek(
         );
     }
 
-    let rows_per_seek = estimate_rows_per_seek(
-        index_info,
-        constraints,
-        usable_constraint_refs,
-        RowCountEstimate::AnalyzeStats(base_row_count),
-        analyze_ctx,
-    );
+    let rows_per_seek = match rows_per_seek_memo {
+        Some(memo) => memo.estimate_rows_per_seek(
+            index_info,
+            constraints,
+            usable_constraint_refs,
+            RowCountEstimate::AnalyzeStats(base_row_count),
+            analyze_ctx,
+        ),
+        None => estimate_rows_per_seek(
+            index_info,
+            constraints,
+            usable_constraint_refs,
+            RowCountEstimate::AnalyzeStats(base_row_count),
+            analyze_ctx,
+        ),
+    };
 
     let base_cost = estimate_index_cost(
         base_row_count,

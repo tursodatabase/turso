@@ -1,7 +1,7 @@
 use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
-use std::iter;
+use std::{cell::Ref, iter};
 
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
@@ -39,12 +39,14 @@ use crate::{
 
 use super::{
     constraints::{
-        usable_constraints_for_join_order, usable_constraints_for_lhs_mask, TableConstraints,
+        fill_usable_constraints_for_lhs_mask, usable_constraints_for_join_order,
+        usable_constraints_for_lhs_mask, TableConstraints,
     },
     cost::{
-        estimate_btree_depth, estimate_cost_for_scan_or_seek, estimate_ephemeral_index_build_cost,
+        estimate_btree_depth, estimate_cost_for_scan_or_seek,
+        estimate_cost_for_scan_or_seek_with_memos, estimate_ephemeral_index_build_cost,
         estimate_index_cost, estimate_rows_per_seek, estimate_scan_cost, estimate_sort_cpu_cost,
-        AnalyzeCtx, Cost, IndexInfo,
+        AnalyzeCtx, Cost, IndexInfo, RowsPerSeekMemo,
     },
     join::JoinPlanningContext,
     multi_index::{
@@ -164,13 +166,21 @@ pub enum AccessMethodParams {
 }
 
 /// Result of generic btree candidate selection before it is wrapped into a full
-/// [`AccessMethod`].
-pub(super) struct ChosenBtreeCandidate {
+/// [`AccessMethod`]. [ChosenBtreeCandidate::memo] has the constraint refs of
+/// the candidate.
+pub(super) struct ChosenBtreeCandidate<'a> {
     pub(super) iter_dir: IterationDirection,
     pub(super) index: Option<Arc<Index>>,
-    pub(super) constraint_refs: SmallVec<[RangeConstraintRef; 2]>,
     pub(super) base_row_count: RowCountEstimate,
     pub(super) cost: Cost,
+    /// The [IndexInfo] that the cost of the candidate used. It is `None` only
+    /// for a scan of the table, which has no constraint refs.
+    pub(super) index_info: Option<IndexInfo>,
+    /// The [LhsMaskMemo] of the candidate, or `None` for the table scan that
+    /// the search starts with. The next call of [choose_best_btree_candidate]
+    /// for the table can write other constraint refs into the memo. This
+    /// borrow makes that call panic while the result exists.
+    pub(super) memo: Option<Ref<'a, LhsMaskMemo>>,
 }
 
 #[derive(Debug, Clone)]
@@ -201,9 +211,14 @@ pub(super) enum BranchReadMode {
 /// current join-order prefix.
 ///
 /// This returns `None` if every forced candidate is unsafe for unmatched-right-row output.
-pub(super) fn choose_best_btree_candidate(
+///
+/// The returned candidate borrows the [LhsMaskMemo] that has its constraint
+/// refs. The refs are not copied into [ChosenBtreeCandidate], because the join
+/// search calls this function for each join order that it tries, and each
+/// move of the candidate then copied the 168 bytes of the refs.
+pub(super) fn choose_best_btree_candidate<'a>(
     rhs_table: &JoinedTable,
-    rhs_constraints: &TableConstraints,
+    rhs_constraints: &'a TableConstraints,
     lhs_mask: &TableMask,
     rhs_table_idx: usize,
     maybe_order_target: Option<&OrderTarget>,
@@ -213,7 +228,7 @@ pub(super) fn choose_best_btree_candidate(
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
-) -> Result<Option<ChosenBtreeCandidate>> {
+) -> Result<Option<ChosenBtreeCandidate<'a>>> {
     let keeps_right_rows = rhs_table
         .join_info
         .as_ref()
@@ -240,10 +255,16 @@ pub(super) fn choose_best_btree_candidate(
     let mut best_choice = ChosenBtreeCandidate {
         iter_dir: IterationDirection::Forwards,
         index: None,
-        constraint_refs: SmallVec::new(),
         base_row_count,
         cost: best_cost,
+        index_info: None,
+        memo: None,
     };
+    // The position of the best candidate in `rhs_constraints.candidates`. The
+    // loop changes the memo of each candidate, so the borrow of the memo of
+    // the best candidate starts after the loop. The index of the best
+    // candidate is cloned after the loop too, one time for each call.
+    let mut best_candidate_idx = None;
     let mut best_adjusted_output = f64::MAX;
     let mut best_is_ordered = false;
 
@@ -251,15 +272,43 @@ pub(super) fn choose_best_btree_candidate(
     let mut rhs_table_mask = TableMask::default();
     rhs_table_mask.set(rhs_table_idx)?;
 
+    // The sort that an ordered candidate saves does not depend on the
+    // candidate. The cost is computed here and not in the loop, because the
+    // compiler moved the logarithm out of the loop and computed it also for
+    // a search without an order target.
+    let order_target_and_sort_cost = maybe_order_target.map(|order_target| {
+        (
+            order_target,
+            estimate_sort_cpu_cost(*base_row_count, params),
+        )
+    });
+
     // Estimate cost for each candidate index (including the rowid index) and
     // keep the best candidate.
-    for candidate in rhs_constraints.candidates.iter() {
-        let usable_constraint_refs = usable_constraints_for_lhs_mask(
-            &rhs_constraints.constraints,
-            &candidate.refs,
-            lhs_mask,
-            rhs_table_idx,
-        );
+    let mut lhs_mask_key = rhs_constraints.lhs_mask_key.borrow_mut();
+    let memos_are_valid = lhs_mask_key
+        .as_ref()
+        .is_some_and(|(table_idx, mask)| *table_idx == rhs_table_idx && mask == lhs_mask);
+    if !memos_are_valid {
+        // The loop fills the memo of each candidate. If an error stops the
+        // loop, the next call fills the memos again.
+        *lhs_mask_key = None;
+    }
+    for (candidate_idx, candidate) in rhs_constraints.candidates.iter().enumerate() {
+        let mut memo = candidate.lhs_mask_memo.borrow_mut();
+        let memo = &mut *memo;
+        if !memos_are_valid {
+            fill_usable_constraints_for_lhs_mask(
+                &rhs_constraints.constraints,
+                &candidate.refs,
+                lhs_mask,
+                rhs_table_idx,
+                &mut memo.usable_constraint_refs,
+            );
+            memo.residual_selectivity = None;
+            memo.rows_per_seek.clear();
+        }
+        let usable_constraint_refs = &memo.usable_constraint_refs;
         // The unmatched-row pass reads expressions from the table cursor after
         // a full index scan ends. An expression-index cursor cannot supply
         // values to that pass. A constrained seek remains safe because the
@@ -276,7 +325,7 @@ pub(super) fn choose_best_btree_candidate(
         has_valid_candidate = true;
 
         let index_info = match candidate.index.as_ref() {
-            Some(index) => Some(IndexInfo {
+            Some(index) => Some(*candidate.index_info.get_or_init(|| IndexInfo {
                 unique: index.unique,
                 covering: rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
@@ -285,7 +334,7 @@ pub(super) fn choose_best_btree_candidate(
                     rhs_table,
                     params.rows_per_table_page,
                 ),
-            }),
+            })),
             None if usable_constraint_refs.is_empty() => None,
             None => Some(IndexInfo {
                 unique: true,
@@ -296,7 +345,7 @@ pub(super) fn choose_best_btree_candidate(
         };
 
         let (iter_dir, is_index_ordered, order_satisfiability_bonus) =
-            if let Some(order_target) = maybe_order_target {
+            if let Some((order_target, sort_cost_saved)) = order_target_and_sort_cost {
                 // Reuse the same index-vs-order matching logic as final plan
                 // validation, but allow any equality-constrained seek prefix to
                 // be skipped here. Candidate scoring only needs to know whether
@@ -307,7 +356,7 @@ pub(super) fn choose_best_btree_candidate(
                     rhs_table,
                     IterationDirection::Forwards,
                     candidate.index.as_deref(),
-                    &usable_constraint_refs,
+                    usable_constraint_refs,
                     order_target,
                     0,
                     schema,
@@ -319,7 +368,7 @@ pub(super) fn choose_best_btree_candidate(
                     rhs_table,
                     IterationDirection::Backwards,
                     candidate.index.as_deref(),
-                    &usable_constraint_refs,
+                    usable_constraint_refs,
                     order_target,
                     0,
                     schema,
@@ -330,7 +379,6 @@ pub(super) fn choose_best_btree_candidate(
 
                 let satisfies_order = all_same_direction || all_opposite_direction;
                 if satisfies_order {
-                    let sort_cost_saved = estimate_sort_cpu_cost(*base_row_count, params);
                     (
                         if all_same_direction {
                             IterationDirection::Forwards
@@ -378,87 +426,32 @@ pub(super) fn choose_best_btree_candidate(
             }
             None => base_row_count,
         };
-        let cost = estimate_cost_for_scan_or_seek(
+        let cost = estimate_cost_for_scan_or_seek_with_memos(
             index_info,
             &rhs_constraints.constraints,
-            &usable_constraint_refs,
+            usable_constraint_refs,
             input_cardinality,
             candidate_base_row_count,
             is_index_ordered,
             params,
             Some(&analyze_ctx),
+            Some(&candidate.tree_depth),
+            Some(&memo.rows_per_seek),
         );
 
-        // Residual filter output adjustment (mirrors SQLite's whereLoopOutputAdjust).
-        //
-        // When two indexes have the same seek cost, the one whose seek
-        // prerequisites already cover more residual WHERE constraints will
-        // produce fewer output rows (because those residual filters can be
-        // accounted for). This breaks ties correctly: a join-driven seek
-        // like fromId=e1.toId (prereqs={e1}) can claim credit for the
-        // constant residual label='requires', but a constant seek like
-        // label='requires' (prereqs={}) cannot claim credit for the
-        // join-dependent residual fromId=e1.toId.
-        let loop_prereq_mask = {
-            let mut mask = TableMask::default();
-            for ucref in usable_constraint_refs.iter() {
-                for idx in [
-                    ucref.eq.as_ref().map(|e| e.constraint_pos),
-                    ucref.lower_bound,
-                    ucref.upper_bound,
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    mask.union_with(&rhs_constraints.constraints[idx].lhs_mask)?;
-                }
-            }
-            mask
-        };
-        // Tables whose constraints this loop can account for: the loop's own
-        // prerequisite tables plus the current table itself.
-        let mut allowed_mask = loop_prereq_mask;
-        allowed_mask.union_with(&rhs_table_mask)?;
-
-        // Collect which constraint positions are consumed by the index seek.
-        let consumed: SmallVec<[usize; 8]> = usable_constraint_refs
-            .iter()
-            .flat_map(|ucref| {
-                [
-                    ucref.eq.as_ref().map(|e| e.constraint_pos),
-                    ucref.lower_bound,
-                    ucref.upper_bound,
-                ]
-                .into_iter()
-                .flatten()
-            })
-            .collect();
-
-        // Multiply selectivities of residual constraints whose prerequisites
-        // are within the allowed mask (i.e. already satisfied by this loop).
-        let residual_selectivity: f64 = rhs_constraints
-            .constraints
-            .iter()
-            .enumerate()
-            .filter(|(i, c)| {
-                !consumed.contains(i)
-                    && c.usable
-                    && c.outer_join_compatible
-                    && allowed_mask.contains_all_set_bits_of(&c.lhs_mask)
-                    && matches!(
-                        c.operator,
-                        ConstraintOperator::AstNativeOperator(ast::Operator::Equals)
-                            | ConstraintOperator::AstNativeOperator(ast::Operator::Greater)
-                            | ConstraintOperator::AstNativeOperator(ast::Operator::GreaterEquals)
-                            | ConstraintOperator::AstNativeOperator(ast::Operator::Less)
-                            | ConstraintOperator::AstNativeOperator(ast::Operator::LessEquals)
-                    )
-            })
-            .map(|(_, c)| c.selectivity)
-            .product();
-
         // Adjusted output: lower means the loop delivers fewer rows downstream.
-        let adjusted_output = residual_selectivity;
+        let adjusted_output = match memo.residual_selectivity {
+            Some(selectivity) => selectivity,
+            None => {
+                let selectivity = residual_selectivity(
+                    &rhs_constraints.constraints,
+                    usable_constraint_refs,
+                    &rhs_table_mask,
+                )?;
+                memo.residual_selectivity = Some(selectivity);
+                selectivity
+            }
+        };
 
         // Only apply the order bonus when this candidate satisfies order but
         // the current best does not. When both satisfy order, switching saves
@@ -474,19 +467,127 @@ pub(super) fn choose_best_btree_candidate(
             best_cost = cost;
             best_adjusted_output = adjusted_output;
             best_is_ordered = is_index_ordered;
-            best_choice = ChosenBtreeCandidate {
-                iter_dir,
-                index: candidate.index.clone(),
-                constraint_refs: usable_constraint_refs,
-                base_row_count: candidate_base_row_count,
-                cost,
-            };
+            best_choice.iter_dir = iter_dir;
+            best_choice.base_row_count = candidate_base_row_count;
+            best_choice.cost = cost;
+            best_choice.index_info = index_info;
+            best_candidate_idx = Some(candidate_idx);
         }
+    }
+    if !memos_are_valid {
+        *lhs_mask_key = Some((rhs_table_idx, lhs_mask.clone()));
     }
 
     // `best_choice` starts as a table scan even when INDEXED BY removed that choice.
     // Do not return that placeholder if all forced candidates were rejected.
-    Ok(has_valid_candidate.then_some(best_choice))
+    if !has_valid_candidate {
+        return Ok(None);
+    }
+    if let Some(candidate_idx) = best_candidate_idx {
+        let candidate = &rhs_constraints.candidates[candidate_idx];
+        best_choice.index.clone_from(&candidate.index);
+        best_choice.memo = Some(candidate.lhs_mask_memo.borrow());
+    }
+    Ok(Some(best_choice))
+}
+
+/// Return the product of the selectivities of the constraints that a lookup
+/// with `usable_constraint_refs` does not use, but that the loop of the lookup
+/// can check: the other tables of each such constraint are tables that the
+/// lookup needs.
+///
+/// Residual filter output adjustment (mirrors SQLite's whereLoopOutputAdjust).
+///
+/// When two indexes have the same seek cost, the one whose seek
+/// prerequisites already cover more residual WHERE constraints will
+/// produce fewer output rows (because those residual filters can be
+/// accounted for). This breaks ties correctly: a join-driven seek
+/// like fromId=e1.toId (prereqs={e1}) can claim credit for the
+/// constant residual label='requires', but a constant seek like
+/// label='requires' (prereqs={}) cannot claim credit for the
+/// join-dependent residual fromId=e1.toId.
+fn residual_selectivity(
+    constraints: &[Constraint],
+    usable_constraint_refs: &[RangeConstraintRef],
+    rhs_table_mask: &TableMask,
+) -> Result<f64> {
+    let loop_prereq_mask = {
+        let mut mask = TableMask::default();
+        for ucref in usable_constraint_refs.iter() {
+            for idx in [
+                ucref.eq.as_ref().map(|e| e.constraint_pos),
+                ucref.lower_bound,
+                ucref.upper_bound,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                mask.union_with(&constraints[idx].lhs_mask)?;
+            }
+        }
+        mask
+    };
+    // Tables whose constraints this loop can account for: the loop's own
+    // prerequisite tables plus the current table itself.
+    let mut allowed_mask = loop_prereq_mask;
+    allowed_mask.union_with(rhs_table_mask)?;
+
+    // Collect which constraint positions are consumed by the index seek.
+    let consumed: SmallVec<[usize; 8]> = usable_constraint_refs
+        .iter()
+        .flat_map(|ucref| {
+            [
+                ucref.eq.as_ref().map(|e| e.constraint_pos),
+                ucref.lower_bound,
+                ucref.upper_bound,
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .collect();
+
+    // Multiply selectivities of residual constraints whose prerequisites
+    // are within the allowed mask (i.e. already satisfied by this loop).
+    Ok(constraints
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| {
+            !consumed.contains(i)
+                && c.usable
+                && c.outer_join_compatible
+                && allowed_mask.contains_all_set_bits_of(&c.lhs_mask)
+                && matches!(
+                    c.operator,
+                    ConstraintOperator::AstNativeOperator(ast::Operator::Equals)
+                        | ConstraintOperator::AstNativeOperator(ast::Operator::Greater)
+                        | ConstraintOperator::AstNativeOperator(ast::Operator::GreaterEquals)
+                        | ConstraintOperator::AstNativeOperator(ast::Operator::Less)
+                        | ConstraintOperator::AstNativeOperator(ast::Operator::LessEquals)
+                )
+        })
+        .map(|(_, c)| c.selectivity)
+        .product())
+}
+
+/// The values of an index candidate that depend on the tables on the left
+/// side of the join order, but not on the order of these tables. They are
+/// valid for the table and the left-side tables in
+/// [TableConstraints::lhs_mask_key].
+#[derive(Debug, Default)]
+pub(super) struct LhsMaskMemo {
+    /// The result of [usable_constraints_for_lhs_mask] for these tables.
+    usable_constraint_refs: SmallVec<[RangeConstraintRef; 2]>,
+    /// The result of [residual_selectivity] for `usable_constraint_refs`, or
+    /// `None` before the first comparison of the candidate needs it.
+    residual_selectivity: Option<f64>,
+    /// The rows per seek of a lookup with `usable_constraint_refs`.
+    rows_per_seek: RowsPerSeekMemo,
+}
+
+impl LhsMaskMemo {
+    pub(super) fn usable_constraint_refs(&self) -> &[RangeConstraintRef] {
+        &self.usable_constraint_refs
+    }
 }
 
 fn consumed_where_terms_from_constraint_refs(
@@ -552,7 +653,7 @@ pub(super) fn choose_best_in_seek_candidate(
             "consider_in_seek_access_method called on non-BTree table".into(),
         ));
     };
-    if !has_in_seek_constraint(rhs_constraints) {
+    if !rhs_constraints.has_in_seek_constraint() {
         return Ok(None);
     }
 
@@ -677,14 +778,6 @@ pub(super) fn choose_best_in_seek_candidate(
     }
 
     Ok(best_in_seek)
-}
-
-/// Whether a constraint of the table is an `IN` that can drive an IN seek.
-pub(super) fn has_in_seek_constraint(constraints: &TableConstraints) -> bool {
-    constraints
-        .constraints
-        .iter()
-        .any(|c| matches!(c.operator, ConstraintOperator::In { not: false, .. }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -895,45 +988,33 @@ fn find_best_access_method_for_btree<'a>(
         return Ok(None);
     };
 
+    let memo = best.memo;
+    let constraint_refs = memo
+        .as_deref()
+        .map_or(&[][..], LhsMaskMemo::usable_constraint_refs);
     let access_base_row_count = best.base_row_count;
-    let estimated_rows_per_outer_row = if best.constraint_refs.is_empty() {
-        *access_base_row_count
-    } else {
-        let index_info = match best.index.as_ref() {
-            Some(index) => IndexInfo {
-                unique: index.unique,
-                covering: rhs_table.index_is_covering(index),
-                column_count: index.columns.len(),
-                rows_per_leaf_page: rows_per_leaf_page_for_index(
-                    index.columns.len(),
-                    rhs_table,
-                    params.rows_per_table_page,
-                ),
-            },
-            None => IndexInfo {
-                unique: true,
-                covering: true,
-                column_count: 1,
-                rows_per_leaf_page: params.rows_per_table_page,
-            },
-        };
-        let analyze_ctx = AnalyzeCtx {
-            rhs_table,
-            index: best.index.as_ref(),
-            stats: analyze_stats,
-        };
-        estimate_rows_per_seek(
-            index_info,
-            &rhs_constraints.constraints,
-            &best.constraint_refs,
-            access_base_row_count,
-            Some(&analyze_ctx),
-        )
+    let estimated_rows_per_outer_row = match memo.as_deref() {
+        Some(memo) if !constraint_refs.is_empty() => {
+            let index_info = best
+                .index_info
+                .expect("a candidate with constraint refs has an IndexInfo");
+            let analyze_ctx = AnalyzeCtx {
+                rhs_table,
+                index: best.index.as_ref(),
+                stats: analyze_stats,
+            };
+            memo.rows_per_seek.estimate_rows_per_seek(
+                index_info,
+                &rhs_constraints.constraints,
+                constraint_refs,
+                access_base_row_count,
+                Some(&analyze_ctx),
+            )
+        }
+        _ => *access_base_row_count,
     };
-    let mut consumed_where_terms = consumed_where_terms_from_constraint_refs(
-        &rhs_constraints.constraints,
-        &best.constraint_refs,
-    )?;
+    let mut consumed_where_terms =
+        consumed_where_terms_from_constraint_refs(&rhs_constraints.constraints, constraint_refs)?;
     if let Some(index) = partial_index(best.index.as_ref()) {
         consume_partial_index_predicate_terms(
             &mut consumed_where_terms,
@@ -950,9 +1031,10 @@ fn find_best_access_method_for_btree<'a>(
             iter_dir: best.iter_dir,
             index: best.index,
             build_index: false,
-            constraint_refs: best.constraint_refs.into_vec(),
+            constraint_refs: constraint_refs.to_vec(),
         },
     };
+    drop(memo);
     let mut best_cost_with_filters =
         cost_with_where_work(&best_access_method, ready_where, input_cardinality, params);
 
@@ -1051,17 +1133,27 @@ fn find_best_access_method_for_btree<'a>(
     // Skip alternative access methods (in-seek, multi-index) when INDEXED BY or NOT INDEXED
     // is specified — the user explicitly requested a specific index or no index.
     if rhs_table.indexed.is_none() && rhs_table.btree().is_some_and(|b| b.has_rowid) {
-        if let Some(in_seek_method) = consider_in_seek_access_method(
-            rhs_table,
-            rhs_constraints,
-            lhs_mask,
-            where_clause,
-            table_references,
-            input_cardinality,
-            base_row_count,
-            params,
-            best_cost_with_filters,
-        )? {
+        // Without an IN constraint, consider_in_seek_access_method returns
+        // None, because choose_best_in_seek_candidate does the same check for
+        // all of its callers. The check is also here because the join search
+        // gets here for each join order that it tries, and a call of the
+        // function for each join order costs more than the check.
+        let in_seek_method = if rhs_constraints.has_in_seek_constraint() {
+            consider_in_seek_access_method(
+                rhs_table,
+                rhs_constraints,
+                lhs_mask,
+                where_clause,
+                table_references,
+                input_cardinality,
+                base_row_count,
+                params,
+                best_cost_with_filters,
+            )?
+        } else {
+            None
+        };
+        if let Some(in_seek_method) = in_seek_method {
             let mut in_seek_method = in_seek_method;
             if let AccessMethodParams::InSeek { index, .. } = &in_seek_method.params {
                 if let Some(index) = partial_index(index.as_ref()) {
@@ -1091,22 +1183,34 @@ fn find_best_access_method_for_btree<'a>(
             return Ok(Some(best_access_method));
         }
 
-        if let Some(multi_idx_method) = consider_multi_index_union(
-            rhs_table,
-            where_clause,
-            available_indexes,
-            table_references,
-            subqueries,
-            schema,
-            input_cardinality,
-            base_row_count,
-            params,
-            best_cost_with_filters,
-            lhs_mask,
-            analyze_stats,
-            resolver,
-            multi_index_work,
-        )? {
+        // The join search gets here for each join order that it tries. After
+        // the first call for the table, the work of the table knows if an OR
+        // term can still give a union scan. consider_multi_index_union also
+        // skips each OR term that cannot give one, but a call of the function
+        // for each join order costs more than this check.
+        let union_scan_is_possible =
+            multi_index_work.is_none_or(MultiIndexTableWork::may_give_union_scan);
+        let multi_idx_method = if union_scan_is_possible {
+            consider_multi_index_union(
+                rhs_table,
+                where_clause,
+                available_indexes,
+                table_references,
+                subqueries,
+                schema,
+                input_cardinality,
+                base_row_count,
+                params,
+                best_cost_with_filters,
+                lhs_mask,
+                analyze_stats,
+                resolver,
+                multi_index_work,
+            )?
+        } else {
+            None
+        };
+        if let Some(multi_idx_method) = multi_idx_method {
             replace_if_cheaper(
                 &mut best_access_method,
                 &mut best_cost_with_filters,
@@ -1117,7 +1221,14 @@ fn find_best_access_method_for_btree<'a>(
             );
         }
 
-        if !has_two_local_constraint_terms(rhs_constraints, where_clause) {
+        // The join search gets here for each join order that it tries.
+        let two_local_terms = match multi_index_work {
+            Some(work) => work.has_two_local_constraint_terms(|| {
+                has_two_local_constraint_terms(rhs_constraints, where_clause)
+            }),
+            None => has_two_local_constraint_terms(rhs_constraints, where_clause),
+        };
+        if !two_local_terms {
             return Ok(Some(best_access_method));
         }
         if let Some(multi_idx_and_method) = consider_multi_index_intersection(
