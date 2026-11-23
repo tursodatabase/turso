@@ -148,3 +148,14 @@ test ctas-builtin-columns {
 expect {
     1|a|2|1
 }
+
+# The name check comes before the column check, as in PostgreSQL.
+test ctas-if-not-exists-existing-table-skips-column-check {
+    CREATE TABLE t (ts timestamptz);
+    CREATE TABLE c (x int);
+    CREATE TABLE IF NOT EXISTS c AS SELECT ts FROM t;
+    SELECT 'ok';
+}
+expect {
+    ok
+}

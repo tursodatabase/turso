@@ -916,6 +916,7 @@ pub(crate) fn validate_generated_function_calls(
 struct CtasInfo {
     plan: Plan,
     schema_sql: String,
+    column_names: Vec<String>,
 }
 
 /// Pre-plan the SELECT to derive the schema for a CTAS table.
@@ -974,10 +975,57 @@ fn derive_ctas_schema(
         *count += 1;
     }
 
-    // The new table types its columns with SQLite declared types, so the
-    // dialect decides what happens to a column of a custom type before the
-    // table is created. Every arm of a compound select is checked.
-    let arms: Vec<(&[ResultSetColumn], &TableReferences)> = match &plan {
+    let mut sql_parts = Vec::with_capacity(result_columns.len());
+    let mut col_defs = Vec::with_capacity(result_columns.len());
+
+    for (column_index, (col, name)) in result_columns.iter().zip(&names).enumerate() {
+        // Names come from the leftmost arm, but compound affinity can weaken its type.
+        let ty = compound_arms
+            .as_ref()
+            .map(|arms| compound_column_affinity(arms, column_index).short_type_name())
+            .unwrap_or_else(|| col.declared_type(table_refs));
+
+        let quoted = quote_identifier(name);
+        if ty.is_empty() {
+            sql_parts.push(quoted);
+        } else {
+            sql_parts.push(format!("{quoted} {ty}"));
+        }
+
+        let col_type = if ty.is_empty() {
+            None
+        } else {
+            Some(ast::Type {
+                name: ty.to_string(),
+                size: None,
+                array_dimensions: 0,
+            })
+        };
+        col_defs.push(ColumnDefinition {
+            col_name: ast::Name::exact(name.clone()),
+            col_type,
+            constraints: vec![],
+        });
+    }
+
+    let info = CtasInfo {
+        plan,
+        column_names: names,
+        schema_sql: format!("CREATE TABLE {table_name_in_sql}({})", sql_parts.join(",")),
+    };
+    Ok((info, col_defs))
+}
+
+/// The new CTAS table types its columns with SQLite declared types, so the
+/// dialect decides what happens to a column of a custom type before the table
+/// is created. Every arm of a compound select is checked.
+fn check_ctas_column_types(
+    plan: &Plan,
+    names: &[String],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let arms: Vec<(&[ResultSetColumn], &TableReferences)> = match plan {
         Plan::Select(sp) => vec![(&sp.result_columns[..], &sp.table_references)],
         Plan::CompoundSelect {
             left, right_most, ..
@@ -987,12 +1035,12 @@ fn derive_ctas_schema(
             .chain(std::iter::once(&**right_most))
             .map(|select| (&select.result_columns[..], &select.table_references))
             .collect(),
-        _ => unreachable!("checked above"),
+        _ => unreachable!("derive_ctas_schema accepts only SELECT plans"),
     };
     let dialect = connection.dialect();
     for (arm_columns, arm_tables) in arms {
         let env = TypeEnv::new(Some(arm_tables), resolver);
-        for (column, name) in arm_columns.iter().zip(&names) {
+        for (column, name) in arm_columns.iter().zip(names) {
             let ty = type_of(&column.expr, &env);
             let element = match &ty {
                 ExprType::Array { element, .. } => element.as_ref(),
@@ -1011,45 +1059,7 @@ fn derive_ctas_schema(
             }
         }
     }
-
-    let mut sql_parts = Vec::with_capacity(result_columns.len());
-    let mut col_defs = Vec::with_capacity(result_columns.len());
-
-    for (column_index, (col, name)) in result_columns.iter().zip(names).enumerate() {
-        // Names come from the leftmost arm, but compound affinity can weaken its type.
-        let ty = compound_arms
-            .as_ref()
-            .map(|arms| compound_column_affinity(arms, column_index).short_type_name())
-            .unwrap_or_else(|| col.declared_type(table_refs));
-
-        let quoted = quote_identifier(&name);
-        if ty.is_empty() {
-            sql_parts.push(quoted);
-        } else {
-            sql_parts.push(format!("{quoted} {ty}"));
-        }
-
-        let col_type = if ty.is_empty() {
-            None
-        } else {
-            Some(ast::Type {
-                name: ty.to_string(),
-                size: None,
-                array_dimensions: 0,
-            })
-        };
-        col_defs.push(ColumnDefinition {
-            col_name: ast::Name::exact(name),
-            col_type,
-            constraints: vec![],
-        });
-    }
-
-    let info = CtasInfo {
-        plan,
-        schema_sql: format!("CREATE TABLE {table_name_in_sql}({})", sql_parts.join(",")),
-    };
-    Ok((info, col_defs))
+    Ok(())
 }
 
 /// Emit bytecode to populate a newly-created CTAS table from the SELECT.
@@ -1303,6 +1313,12 @@ pub fn translate_create_table(
                 }
             }
         }
+    }
+
+    // The column types are checked after the name is known to be free, so IF NOT
+    // EXISTS on an existing table succeeds whatever the SELECT returns.
+    if let Some(info) = &ctas_info {
+        check_ctas_column_types(&info.plan, &info.column_names, resolver, connection)?;
     }
 
     // Like SQLite, the body is only checked when the table is really created,
