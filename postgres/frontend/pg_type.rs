@@ -1,10 +1,21 @@
-//! Lookup of the types that are not built in: the custom types of a schema
-//! and the row types of its relations.
+//! The types of the PostgreSQL frontend: the built-in types that it registers
+//! in place of the types of core, and the lookup of the types that are not
+//! built in, which are the custom types of a schema and the row types of its
+//! relations.
+
+mod boolean;
 
 use crate::session::relation_lookup_namespaces;
 use std::sync::Arc;
-use turso_core::schema::RelationKind;
-use turso_core::Connection;
+use turso_core::schema::{RelationKind, SchemaBuilder};
+use turso_core::{Connection, Result};
+
+/// Adds the built-in types that PostgreSQL defines differently from core to
+/// `builder`. Each one replaces the type that core registered under the same
+/// name.
+pub(crate) fn register_builtin_types(builder: SchemaBuilder) -> Result<SchemaBuilder> {
+    builder.builtin_type(&boolean::Boolean)
+}
 
 // FIXME(pg-catalog): three places that do not know about each other say what
 // a type name is, in place of a pg_type catalog:

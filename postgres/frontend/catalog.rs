@@ -226,6 +226,17 @@ impl Dialect for PostgresDialect {
         Ok(format!("{identity_marker}{sql}"))
     }
 
+    fn schema_builder(
+        &self,
+        enable_custom_types: bool,
+    ) -> Result<turso_core::schema::SchemaBuilder> {
+        let builder = turso_core::schema::builtin::schema_builder(enable_custom_types)?;
+        if !enable_custom_types {
+            return Ok(builder);
+        }
+        crate::pg_type::register_builtin_types(builder)
+    }
+
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
         let options = crate::functions::register_functions(options);
         let options = crate::auth_functions::register_functions(options);
