@@ -1425,22 +1425,22 @@ where
                 y_iso.i_jd += (3 - days_after_mon(&p)) * 86400000;
                 y_iso.valid_ymd = false;
                 y_iso.compute_ymd();
-                write!(res, "{:02}", y_iso.y % 100).unwrap();
+                push_zero_padded(&mut res, i64::from(y_iso.y % 100), 2);
             }
             Some('G') => {
                 let mut y_iso = p;
                 y_iso.i_jd += (3 - days_after_mon(&p)) * 86400000;
                 y_iso.valid_ymd = false;
                 y_iso.compute_ymd();
-                write!(res, "{:04}", y_iso.y).unwrap();
+                push_zero_padded(&mut res, i64::from(y_iso.y), 4);
             }
             Some('H') => push_zero_padded(&mut res, i64::from(p.h), 2),
             Some('I') => {
                 let h = if p.h % 12 == 0 { 12 } else { p.h % 12 };
-                write!(res, "{h:02}").unwrap();
+                push_zero_padded(&mut res, i64::from(h), 2);
             }
             Some('j') => {
-                write!(res, "{:03}", days_after_jan1(&p) + 1).unwrap();
+                push_zero_padded(&mut res, days_after_jan1(&p) + 1, 3);
             }
             Some('J') => {
                 let julian_day = Value::from_f64(p.i_jd as f64 / 86400000.0);
@@ -1453,8 +1453,8 @@ where
             }
             Some('m') => push_zero_padded(&mut res, i64::from(p.m), 2),
             Some('M') => push_zero_padded(&mut res, i64::from(p.min), 2),
-            Some('p') => write!(res, "{}", if p.h >= 12 { "PM" } else { "AM" }).unwrap(),
-            Some('P') => write!(res, "{}", if p.h >= 12 { "pm" } else { "am" }).unwrap(),
+            Some('p') => res.push_str(if p.h >= 12 { "PM" } else { "AM" }),
+            Some('P') => res.push_str(if p.h >= 12 { "pm" } else { "am" }),
             Some('R') => {
                 push_zero_padded(&mut res, i64::from(p.h), 2);
                 res.push(':');
@@ -1481,11 +1481,11 @@ where
                 if w == 0 {
                     w = 7;
                 }
-                write!(res, "{w}").unwrap();
+                push_zero_padded(&mut res, w, 1);
             }
             Some('U') => {
                 let w = (days_after_jan1(&p) - days_after_sun(&p) + 7) / 7;
-                write!(res, "{w:02}").unwrap();
+                push_zero_padded(&mut res, w, 2);
             }
             Some('V') => {
                 let mut temp = p;
@@ -1493,14 +1493,12 @@ where
                 temp.valid_ymd = false;
                 temp.compute_ymd();
                 let w = days_after_jan1(&temp) / 7 + 1;
-                write!(res, "{w:02}").unwrap();
+                push_zero_padded(&mut res, w, 2);
             }
-            Some('w') => {
-                write!(res, "{}", days_after_sun(&p)).unwrap();
-            }
+            Some('w') => push_zero_padded(&mut res, days_after_sun(&p), 1),
             Some('W') => {
                 let w = (days_after_jan1(&p) - days_after_mon(&p) + 7) / 7;
-                write!(res, "{w:02}").unwrap();
+                push_zero_padded(&mut res, w, 2);
             }
             Some('Y') => push_zero_padded(&mut res, i64::from(p.y), 4),
             Some('%') => res.push('%'),
