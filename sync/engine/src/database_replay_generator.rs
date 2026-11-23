@@ -363,7 +363,15 @@ impl DatabaseReplayGenerator {
                             before.get(1)
                         );
                     };
-                    let query = format!("DROP {} {}", entity_type.as_str(), entity_name.as_str());
+                    let entity_type = match entity_type.as_str() {
+                        entity_type @ ("table" | "index" | "view" | "trigger") => entity_type,
+                        other => {
+                            return Err(Error::DatabaseTapeError(format!(
+                                "unexpected 'type' column of sqlite_schema table: {other:?}"
+                            )));
+                        }
+                    };
+                    let query = format!("DROP {entity_type} {}", quote_ident(entity_name.as_str()));
                     let delete = ReplayInfo {
                         change_type: DatabaseChangeType::Delete,
                         query,
@@ -1020,6 +1028,7 @@ mod tests {
         Delete { use_rowid: bool },
         Update(Vec<bool>),
         Upsert(usize),
+        Change(DatabaseTapeRowChange),
     }
 
     fn replay_info_for(
@@ -1053,6 +1062,7 @@ mod tests {
                 }
                 QueryKind::Update(columns) => generator.update_query(&coro, &table, &columns).await,
                 QueryKind::Upsert(columns) => generator.upsert_query(&coro, &table, columns).await,
+                QueryKind::Change(change) => generator.replay_info(&coro, &change).await,
             }
         });
         loop {
@@ -1061,6 +1071,45 @@ mod tests {
                 genawaiter::GeneratorState::Complete(result) => break result,
             }
         }
+    }
+
+    fn sqlite_schema_delete(entity_type: &str, name: &str) -> QueryKind {
+        let text =
+            |value: &str| turso_core::Value::Text(turso_core::types::Text::new(value.to_string()));
+        QueryKind::Change(DatabaseTapeRowChange {
+            change_id: 1,
+            change_time: 0,
+            change: DatabaseTapeRowChangeType::Delete {
+                before: vec![
+                    text(entity_type),
+                    text(name),
+                    text(name),
+                    turso_core::Value::from_i64(2),
+                    text(""),
+                ],
+                key: None,
+            },
+            table_name: SQLITE_SCHEMA_TABLE.to_string(),
+            id: 1,
+        })
+    }
+
+    #[test]
+    fn test_sqlite_schema_delete_replays_quoted_drop() {
+        for entity_type in ["table", "index", "view", "trigger"] {
+            let kind = sqlite_schema_delete(entity_type, r#"my "odd" name"#);
+            let drop = replay_info_for(&[], SQLITE_SCHEMA_TABLE, kind, false).unwrap();
+            assert_eq!(
+                drop.query,
+                format!(r#"DROP {entity_type} "my ""odd"" name""#)
+            );
+        }
+        let kind = sqlite_schema_delete("table; DROP TABLE x", "t");
+        let error = replay_info_for(&[], SQLITE_SCHEMA_TABLE, kind, false).unwrap_err();
+        assert!(
+            matches!(&error, Error::DatabaseTapeError(message) if message.contains("'type' column")),
+            "{error:?}"
+        );
     }
 
     #[test]
