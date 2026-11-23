@@ -389,3 +389,19 @@ test('undefined binds as NULL and a value with no SQLite type is refused', async
     }
     await db.close();
 })
+
+test('a call binds each value it passes, and undefined as NULL', async () => {
+    const db = await connect(":memory:");
+    const positional = await db.prepare("SELECT ? AS x");
+    expect(await positional.get(1)).toEqual({ x: 1 });
+    expect(await positional.get(undefined)).toEqual({ x: null });
+    expect(await positional.get(1)).toEqual({ x: 1 });
+    expect(await positional.get(undefined, { queryTimeout: 1000 })).toEqual({ x: null });
+    const named = await db.prepare("SELECT :a AS x");
+    expect(await named.get({ a: 1 })).toEqual({ x: 1 });
+    expect(await named.get({ a: undefined })).toEqual({ x: null });
+    const pair = await db.prepare("SELECT ? AS x, ? AS y");
+    expect(await pair.get([1], 2)).toEqual({ x: 1, y: 2 });
+    expect(await pair.get(1, [2])).toEqual({ x: 1, y: 2 });
+    await db.close();
+})

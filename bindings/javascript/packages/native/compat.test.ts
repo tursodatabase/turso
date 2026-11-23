@@ -291,3 +291,10 @@ test('an error that leaves every nested transaction function rolls back the whol
     db.transaction(() => insert.run(3))();
     expect(db.prepare('SELECT x FROM t').all()).toEqual([{ x: 3 }]);
 })
+
+test('undefined before query options binds NULL', () => {
+    const db = new Database(':memory:');
+    const stmt = db.prepare('SELECT ? AS x');
+    expect(stmt.get(1)).toEqual({ x: 1 });
+    expect(stmt.get(undefined, { queryTimeout: 1000 })).toEqual({ x: null });
+})

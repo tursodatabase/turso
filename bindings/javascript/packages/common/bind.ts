@@ -1,14 +1,11 @@
 export function splitBindParameters(bindParameters) {
-  if (bindParameters.length === 0) {
-    return { params: undefined, queryOptions: undefined };
-  }
   if (bindParameters.length > 1 && isQueryOptions(bindParameters[bindParameters.length - 1])) {
     return {
-      params: bindParameters.length === 2 ? bindParameters[0] : bindParameters.slice(0, -1),
+      params: bindParameters.slice(0, -1),
       queryOptions: bindParameters[bindParameters.length - 1],
     };
   }
-  return { params: bindParameters.length === 1 ? bindParameters[0] : bindParameters, queryOptions: undefined };
+  return { params: bindParameters, queryOptions: undefined };
 }
 
 function isQueryOptions(value) {
@@ -16,13 +13,6 @@ function isQueryOptions(value) {
     && typeof value === "object"
     && !Array.isArray(value)
     && Object.prototype.hasOwnProperty.call(value, "queryTimeout");
-}
-
-export function toBindArgs(params) {
-  if (params === undefined) {
-    return [];
-  }
-  return [params];
 }
 
 // Bind parameters to a statement.
@@ -70,10 +60,8 @@ function bindNamedParams(stmt, paramObj) {
     const paramName = stmt.parameterName(i);
     if (paramName) {
       const key = paramName.substring(1); // Remove ':' or '$' prefix
-      const value = paramObj[key];
-      
-      if (value !== undefined) {
-        bindValue(stmt, i, value);
+      if (Object.prototype.hasOwnProperty.call(paramObj, key)) {
+        bindValue(stmt, i, paramObj[key]);
       }
     }
   }

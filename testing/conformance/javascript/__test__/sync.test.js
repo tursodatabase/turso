@@ -469,6 +469,26 @@ test.serial("Statement.get() [named]", async (t) => {
   t.is(stmt.get({ id: 2 }).name, "Bob");
 });
 
+test.serial("Statement.get() [undefined]", async (t) => {
+  const db = t.context.db;
+
+  const positional = db.prepare("SELECT ? AS x");
+  t.deepEqual(positional.get(1), { x: 1 });
+  t.deepEqual(positional.get(undefined), { x: null });
+
+  const named = db.prepare("SELECT :a AS x");
+  t.deepEqual(named.get({ a: 1 }), { x: 1 });
+  t.deepEqual(named.get({ a: undefined }), { x: null });
+});
+
+test.serial("Statement.get() [arrays among values]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT ? AS x, ? AS y");
+  t.deepEqual(stmt.get([1], 2), { x: 1, y: 2 });
+  t.deepEqual(stmt.get(1, [2]), { x: 1, y: 2 });
+});
+
 test.serial("Statement.get() [raw]", async (t) => {
   const db = t.context.db;
 

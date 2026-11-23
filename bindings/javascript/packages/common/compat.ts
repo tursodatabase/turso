@@ -1,4 +1,4 @@
-import { bindParams, splitBindParameters, toBindArgs } from "./bind.js";
+import { bindParams, splitBindParameters } from "./bind.js";
 import { convertError, ioLoopSync, prepareStatement, resetStatement, stepSync } from "./sqlite-error.js";
 import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE, STEP_SLEEP } from "./types.js";
 
@@ -418,7 +418,7 @@ class Statement {
     const { params, queryOptions } = splitBindParameters(bindParameters);
     resetStatement(this.stmt);
     this.stmt.setQueryTimeout(queryOptions);
-    bindParams(this.stmt, toBindArgs(params));
+    bindParams(this.stmt, params);
     for (; ;) {
       const [stepResult] = stepSync(this.stmt);
       if (stepResult === STEP_IO || stepResult === STEP_SLEEP) {
@@ -449,7 +449,7 @@ class Statement {
     const { params, queryOptions } = splitBindParameters(bindParameters);
     resetStatement(this.stmt);
     this.stmt.setQueryTimeout(queryOptions);
-    bindParams(this.stmt, toBindArgs(params));
+    bindParams(this.stmt, params);
     let row = undefined;
     for (; ;) {
       const [stepResult] = stepSync(this.stmt);
@@ -476,7 +476,7 @@ class Statement {
     const { params, queryOptions } = splitBindParameters(bindParameters);
     resetStatement(this.stmt);
     this.stmt.setQueryTimeout(queryOptions);
-    bindParams(this.stmt, toBindArgs(params));
+    bindParams(this.stmt, params);
 
     while (true) {
       const [stepResult] = stepSync(this.stmt);
@@ -502,7 +502,7 @@ class Statement {
     const { params, queryOptions } = splitBindParameters(bindParameters);
     resetStatement(this.stmt);
     this.stmt.setQueryTimeout(queryOptions);
-    bindParams(this.stmt, toBindArgs(params));
+    bindParams(this.stmt, params);
     const rows: any[] = [];
     for (; ;) {
       const [stepResult] = stepSync(this.stmt);

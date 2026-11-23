@@ -1,5 +1,5 @@
 import { AsyncLock } from "./async-lock.js";
-import { bindParams, splitBindParameters, toBindArgs } from "./bind.js";
+import { bindParams, splitBindParameters } from "./bind.js";
 import { convertError, prepareStatement, resetStatement, stepSync } from "./sqlite-error.js";
 import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE, STEP_SLEEP, DatabaseOpts } from "./types.js";
 
@@ -1193,7 +1193,7 @@ class Statement {
     await this.execLock.acquire();
     try {
       stmt.setQueryTimeout(queryOptions);
-      bindParams(stmt, toBindArgs(params));
+      bindParams(stmt, params);
       const totalChangesBefore = this.db.totalChanges();
       while (true) {
         const [stepResult, sleepMs] = await stepSync(stmt);
@@ -1237,7 +1237,7 @@ class Statement {
     let row = undefined;
     try {
       stmt.setQueryTimeout(queryOptions);
-      bindParams(stmt, toBindArgs(params));
+      bindParams(stmt, params);
       while (true) {
         const [stepResult, sleepMs] = await stepSync(stmt);
         if (stepResult === STEP_IO) {
@@ -1275,7 +1275,7 @@ class Statement {
     await this.execLock.acquire();
     try {
       stmt.setQueryTimeout(queryOptions);
-      bindParams(stmt, toBindArgs(params));
+      bindParams(stmt, params);
       while (true) {
         const [stepResult, sleepMs] = await stepSync(stmt);
         if (stepResult === STEP_IO) {
@@ -1313,7 +1313,7 @@ class Statement {
     await this.execLock.acquire();
     try {
       stmt.setQueryTimeout(queryOptions);
-      bindParams(stmt, toBindArgs(params));
+      bindParams(stmt, params);
       while (true) {
         const [stepResult, sleepMs] = await stepSync(stmt);
         if (stepResult === STEP_IO) {
