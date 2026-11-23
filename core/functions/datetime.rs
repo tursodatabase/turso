@@ -1070,11 +1070,16 @@ pub fn exec_date_diff(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Val
 }
 
 fn add_days(clock: &dyn Clock, date: &Value, days: i64) -> Result<Value> {
-    match exec_date(
-        clock,
-        [Value::from_f64(julian_day(clock, date)? + days as f64)],
-    ) {
-        Value::Null => Err(crate::LimboError::Constraint(
+    // Julian day number of 0001-01-01, the first date PostgreSQL accepts.
+    const FIRST_JULIAN_DAY: f64 = 1721425.5;
+    let shifted = julian_day(clock, date)? + days as f64;
+    if shifted < FIRST_JULIAN_DAY {
+        return Err(crate::LimboError::DatetimeFieldOverflow(
+            "date out of range".to_string(),
+        ));
+    }
+    match exec_date(clock, [Value::from_f64(shifted)]) {
+        Value::Null => Err(crate::LimboError::DatetimeFieldOverflow(
             "date out of range".to_string(),
         )),
         shifted => Ok(shifted),

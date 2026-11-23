@@ -776,3 +776,21 @@ expect {
 }
 @sqlstate 22023
 expect @tursopg error {}
+
+test date-minus-days-before-year-one {
+    SELECT '0001-01-01'::date - 1;
+}
+@sqlstate 22008
+expect error {}
+
+test date-plus-days-after-year-9999 {
+    SELECT '9999-12-31'::date + 1;
+}
+@sqlstate 22008
+expect error {}
+
+test date-minus-days-into-negative-years {
+    SELECT '0001-01-01'::date - 400;
+}
+@sqlstate 22008
+expect error {}
