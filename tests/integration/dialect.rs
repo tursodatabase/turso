@@ -1357,14 +1357,14 @@ fn value_param(ty: &str) -> turso_core::ast::TypeParam {
     }
 }
 
-/// A dialect whose catalog has one load step of its own.
-struct DialectWithACatalogStep {
-    catalog: CatalogWithAStep,
+/// A dialect that is SQLite's with catalog `C`.
+struct DialectWithCatalog<C> {
+    catalog: C,
 }
 
-impl Dialect for DialectWithACatalogStep {
+impl<C: turso_core::Catalog + 'static> Dialect for DialectWithCatalog<C> {
     fn name(&self) -> &'static str {
-        "catalog-step-test"
+        "catalog-test"
     }
 
     fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
@@ -1451,7 +1451,7 @@ impl turso_core::LoadStep for LooksForTheTable {
 #[test]
 fn steps_of_the_catalog_run_after_the_engine_steps_at_open_and_at_reload() {
     let table_seen_by_each_load = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let dialect = Arc::new(DialectWithACatalogStep {
+    let dialect = Arc::new(DialectWithCatalog {
         catalog: CatalogWithAStep {
             table_seen_by_each_load: table_seen_by_each_load.clone(),
         },
@@ -1466,4 +1466,93 @@ fn steps_of_the_catalog_run_after_the_engine_steps_at_open_and_at_reload() {
     conn.force_reparse_schema_without_publish().unwrap();
 
     assert_eq!(*table_seen_by_each_load.lock().unwrap(), [false, true]);
+}
+
+/// A catalog that stores what SQLite's stores and notes the commands about
+/// triggers and virtual tables that it gets.
+struct NotesCommands {
+    commands: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl turso_core::Catalog for NotesCommands {
+    fn emit(
+        &self,
+        program: &mut turso_core::ProgramBuilder,
+        ctx: &turso_core::CmdContext<'_>,
+        cmd: &turso_core::CatalogCmd<'_>,
+    ) -> Result<()> {
+        match cmd {
+            turso_core::CatalogCmd::CreateTrigger(trigger) => {
+                self.commands.lock().unwrap().push(format!(
+                    "create {} on {}: {}",
+                    trigger.name, trigger.table, trigger.sql
+                ));
+            }
+            turso_core::CatalogCmd::DropTrigger(trigger) => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(format!("drop {}", trigger.name));
+            }
+            turso_core::CatalogCmd::CreateVirtualTable(table) => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(format!("create virtual table {}", table.name));
+            }
+            _ => {}
+        }
+        turso_core::SqliteCatalog.emit(program, ctx, cmd)
+    }
+}
+
+#[test]
+fn the_catalog_gets_a_new_trigger_and_a_dropped_trigger() {
+    let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialect = Arc::new(DialectWithCatalog {
+        catalog: NotesCommands {
+            commands: commands.clone(),
+        },
+    });
+    let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", dialect).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t (x)").unwrap();
+
+    conn.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END")
+        .unwrap();
+    conn.execute("DROP TRIGGER tr").unwrap();
+
+    assert_eq!(
+        *commands.lock().unwrap(),
+        [
+            "create tr on t: CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+            "drop tr"
+        ]
+    );
+}
+
+#[test]
+fn the_catalog_gets_a_new_virtual_table() {
+    let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialect = Arc::new(DialectWithCatalog {
+        catalog: NotesCommands {
+            commands: commands.clone(),
+        },
+    });
+    let options = OpenOptions::new(dialect).native_module(
+        "one_row",
+        turso_ext::VTabKind::VirtualTable,
+        TestCatalogTable,
+    );
+    let db = Database::open(Arc::new(MemoryIO::new()), ":memory:", options).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.execute("CREATE VIRTUAL TABLE v USING one_row")
+        .unwrap();
+
+    assert_eq!(*commands.lock().unwrap(), ["create virtual table v"]);
 }

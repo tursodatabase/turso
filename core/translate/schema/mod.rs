@@ -8,7 +8,9 @@ pub(crate) use sqlite_schema_rows::{
     SchemaEntryType,
 };
 
-use crate::dialect::{AutomaticIndex, CatalogCmd, CmdContext, CreateTable, DropTable, TableText};
+use crate::dialect::{
+    AutomaticIndex, CatalogCmd, CmdContext, CreateTable, CreateVirtualTable, DropTable, TableText,
+};
 use crate::sync::Arc;
 use crate::HashMap;
 use crate::LimboError;
@@ -1945,26 +1947,15 @@ pub fn translate_create_virtual_table(
         table_name: table_name_reg,
         args_reg,
     });
-    let sqlite_schema_cursor_id =
-        open_sqlite_schema_for_write(program, resolver, crate::MAIN_DB_ID);
-
-    let cdc_table = prepare_cdc_if_necessary(
-        program,
-        resolver.schema(),
-        crate::MAIN_DB_ID,
-        Some(SQLITE_TABLEID),
-    )?;
     let sql = create_vtable_body_to_str(&vtab, vtab_module.clone());
-    emit_schema_entry(
+    let cmd_context = CmdContext::new(connection, resolver, crate::MAIN_DB_ID);
+    resolver.catalog.dialect.catalog().emit(
         program,
-        resolver,
-        sqlite_schema_cursor_id,
-        cdc_table.map(|x| x.0),
-        SchemaEntryType::Table,
-        tbl_name.name.as_str(),
-        tbl_name.name.as_str(),
-        0, // virtual tables dont have a root page
-        Some(sql),
+        &cmd_context,
+        &CatalogCmd::CreateVirtualTable(CreateVirtualTable {
+            name: tbl_name.name.as_str(),
+            sql: &sql,
+        }),
     )?;
 
     program.emit_insn(Insn::SetCookie {
