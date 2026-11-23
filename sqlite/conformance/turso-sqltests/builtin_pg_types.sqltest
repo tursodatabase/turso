@@ -45,6 +45,24 @@ expect {
     2|0
 }
 
+# Only the PostgreSQL frontend reads the first letters of a word as a boolean.
+@requires strict "uses STRICT tables"
+test boolean-invalid-first-letters-of-a-word {
+    CREATE TABLE t1(val boolean) STRICT;
+    INSERT INTO t1 VALUES ('y');
+}
+expect error {
+}
+
+# Only the PostgreSQL frontend reads a boolean with whitespace around it.
+@requires strict "uses STRICT tables"
+test boolean-invalid-whitespace-around-a-word {
+    CREATE TABLE t1(val boolean) STRICT;
+    INSERT INTO t1 VALUES (' true ');
+}
+expect error {
+}
+
 @requires strict "uses STRICT tables"
 test boolean-invalid {
     CREATE TABLE t1(val boolean) STRICT;

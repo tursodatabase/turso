@@ -21,6 +21,56 @@ expect {
     3|carol|35
 }
 
+test table-boolean-column-reads-text-as-a-boolean {
+    CREATE TABLE t (id int, b boolean);
+    INSERT INTO t VALUES (1, 'y'), (2, 'n'), (3, 'tr'), (4, 'of'), (5, ' true '), (6, 'ON');
+    SELECT b FROM t ORDER BY id;
+}
+expect {
+    t
+    f
+    t
+    f
+    t
+    t
+}
+
+# boolin is the function that reads text for a boolean column.
+test table-boolin-reads-text-as-a-boolean {
+    SELECT boolin('y'), boolin(' OF '), boolin('1');
+}
+expect {
+    t|f|t
+}
+
+# `o` is the start of both `on` and `off`.
+test table-boolean-column-refuses-o {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('o');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type boolean: "o"
+}
+
+test table-boolean-column-refuses-text-longer-than-the-word {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('truex');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type boolean: "truex"
+}
+
+test table-boolean-column-refuses-empty-text {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type boolean: ""
+}
+
 @setup users
 test table-where-boolean-column {
     SELECT name FROM users WHERE active ORDER BY name;

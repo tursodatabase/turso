@@ -305,6 +305,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
+        "boolin"(FunctionArity::Exact(1), true) => exec_boolin(args[0].get_value())?,
         "booleq"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() == args[1].get_value()),
         "boolne"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() != args[1].get_value()),
         "set_config"(FunctionArity::Exact(3), false) => exec_set_config(connection, args)?,
@@ -1967,6 +1968,31 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
         _ => Some((
             format!("type \"{type_name}\" does not exist"),
             "42704".to_string(),
+        )),
+    }
+}
+
+/// PostgreSQL's input function of the boolean type: the boolean that the text
+/// `input` is (see `parse_pg_bool`). The ENCODE of the boolean type calls it
+/// for text (see `PostgresDialect::schema_builder`).
+fn exec_boolin(input: &Value) -> Result<Option<Boolean>> {
+    match input {
+        Value::Null => Ok(None),
+        Value::Text(text) => match parse_pg_bool(text.as_str()) {
+            Some(truth) => Ok(Some(Boolean(truth))),
+            None => Err(sqlstate_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!(
+                    "invalid input syntax for type boolean: \"{}\"",
+                    text.as_str()
+                ),
+                None,
+            )),
+        },
+        other => Err(sqlstate_error(
+            SQLSTATE_UNDEFINED_FUNCTION,
+            "function boolin does not exist for an argument that is not text",
+            Some(format!("Got the argument {other}")),
         )),
     }
 }

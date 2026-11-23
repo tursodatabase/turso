@@ -14,8 +14,8 @@ use turso_core::{
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{
-        generated_expr_with_names, BTreeTable, GeneratedType, Schema, Sequence, Table, UniqueSet,
-        AUTOINCREMENT_SEQ_PREFIX,
+        builtin::builtin_type, generated_expr_with_names, BTreeTable, GeneratedType, RangeOffsets,
+        Schema, SchemaBuilder, Sequence, Table, TypeOrigin, UniqueSet, AUTOINCREMENT_SEQ_PREFIX,
     },
     security::policy::RowPolicy,
     security::roles::RoleId,
@@ -224,6 +224,26 @@ impl Dialect for PostgresDialect {
                 .filter_map(|(position, column)| Some((position, column.identity_kind()?))),
         );
         Ok(format!("{identity_marker}{sql}"))
+    }
+
+    fn schema_builder(&self, enable_custom_types: bool) -> Result<SchemaBuilder> {
+        let builder = turso_core::schema::builtin::schema_builder(self, enable_custom_types)?;
+        if !enable_custom_types {
+            return Ok(builder);
+        }
+        // Replaces the boolean type of core, whose ENCODE reads only whole
+        // words from text. PostgreSQL also reads the first letters of a word
+        // and ignores whitespace around it, which `boolin` does.
+        builtin_type(
+            self,
+            builder,
+            TypeOrigin::Builtin {
+                accepts_collate: false,
+                range_offsets: RangeOffsets::None,
+                stored_form_sorts_in_value_order: false,
+            },
+            "CREATE TYPE boolean(value any) BASE integer ENCODE CASE WHEN typeof(value) = 'text' THEN boolin(value) ELSE boolean_to_int(value) END DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'",
+        )
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
