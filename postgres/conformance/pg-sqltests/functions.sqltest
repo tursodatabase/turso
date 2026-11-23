@@ -351,6 +351,35 @@ expect {
     invalid
 }
 
+test pg-input-is-valid-reads-date-and-time-as-the-types-do {
+    SELECT CASE WHEN pg_input_is_valid('Jan 5 2024', 'date') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('2024-02-30', 'date') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('9:30', 'time') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('2024-01-05T10:00+02', 'timestamptz') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('zzz', 'timestamp') THEN 'valid' ELSE 'invalid' END;
+}
+expect {
+    valid
+    invalid
+    valid
+    valid
+    invalid
+}
+
+test pg-input-error-info-date-out-of-range {
+    SELECT message, sql_error_code FROM pg_input_error_info('2024-02-30', 'date');
+}
+expect {
+    date/time field value out of range: "2024-02-30"|22008
+}
+
+test pg-input-error-info-date-bad-syntax {
+    SELECT message, sql_error_code FROM pg_input_error_info('zzz', 'date');
+}
+expect {
+    invalid input syntax for type date: "zzz"|22007
+}
+
 test current-setting-numeric-parameter-name-errors {
     SELECT current_setting(5.5);
 }
@@ -708,6 +737,83 @@ expect {
     7
 }
 
+test pg-get-expr-text-default {
+    CREATE TABLE demo (a text DEFAULT 'x', b varchar(10) DEFAULT 'it''s', c text DEFAULT '');
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
+}
+expect {
+    'x'::text
+    'it''s'::character varying
+    ''::text
+}
+
+test pg-get-expr-number-default {
+    CREATE TABLE demo (
+        a int DEFAULT 7, b bigint DEFAULT 7, c int DEFAULT -1, d numeric(10, 2) DEFAULT 1.5,
+        e bigint DEFAULT 3000000000, f numeric(10, 2) DEFAULT -1.5, g int DEFAULT 1 + 2
+    );
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
+}
+expect {
+    7
+    7
+    '-1'::integer
+    1.5
+    '3000000000'::bigint
+    '-1.5'::numeric
+    (1 + 2)
+}
+
+test pg-get-expr-lowest-number-default {
+    CREATE TABLE demo (
+        a int DEFAULT -2147483648, b bigint DEFAULT -2147483649,
+        c bigint DEFAULT -9223372036854775808, d int DEFAULT -0
+    );
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
+}
+expect {
+    '-2147483648'::integer
+    '-2147483649'::bigint
+    '-9223372036854775808'::bigint
+    0
+}
+
+test pg-get-expr-negative-zero-decimal-default {
+    CREATE TABLE demo (
+        a numeric(10, 2) DEFAULT -0.0, b numeric(10, 2) DEFAULT -0.00, c numeric(10, 2) DEFAULT -0.10
+    );
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
+}
+expect {
+    0.0
+    0.00
+    '-0.10'::numeric
+}
+
+test pg-get-expr-boolean-default {
+    CREATE TABLE demo (a boolean DEFAULT true, b boolean DEFAULT false, c boolean DEFAULT (1 > 0));
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
+}
+expect {
+    true
+    false
+    (1 > 0)
+}
+
+# tursopg does not print the cast of a function's argument and shows the
+# default as the engine stores it.
+@compat-gap "function:pg_get_expr"
+test pg-get-expr-default-with-function-of-literal {
+    CREATE TABLE demo (a text DEFAULT lower('X'));
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef;
+}
+expect {
+    lower('X'::text)
+}
+expect @tursopg {
+    lower ('X')
+}
+
 test pg-get-expr-null-oid-is-null {
     CREATE TABLE demo (id int DEFAULT 7, label text);
     SELECT pg_get_expr(adbin, NULL, true) FROM pg_attrdef;
@@ -728,13 +834,111 @@ test pg-get-expr-null-oid-does-not-hide-invalid-expression {
 @sqlstate 42883
 expect error {}
 
-@skip-if postgres "PostgreSQL prints (val > 0), and also lists the CHECK constraints of the information_schema domains"
 test pg-get-expr-check-constraint {
     CREATE TABLE checked (val int CHECK (val > 0));
-    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c';
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0;
 }
 expect {
-    val > 0
+    (val > 0)
+}
+
+test pg-get-expr-check-constraint-with-like {
+    CREATE TABLE checked (owner text CHECK (owner LIKE 'a%'), code varchar(10) CHECK (code NOT LIKE 'x_'));
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    ((code)::text !~~ 'x_'::text)
+    (owner ~~ 'a%'::text)
+}
+
+test pg-get-expr-check-constraint-with-text-literal {
+    CREATE TABLE checked (owner text CHECK (owner <> 'it''s'), code varchar(10) CHECK (code = 'x'));
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    ((code)::text = 'x'::text)
+    (owner <> 'it''s'::text)
+}
+
+test pg-get-expr-check-constraint-with-in-list {
+    CREATE TABLE checked (id int CHECK (id IN (1, 2)), owner text CHECK (owner NOT IN ('a', 'b')));
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    (id = ANY (ARRAY[1, 2]))
+    (owner <> ALL (ARRAY['a'::text, 'b'::text]))
+}
+
+test pg-get-expr-check-constraint-on-numeric-column {
+    CREATE TABLE checked (price numeric(10, 2) CHECK (price > 0), rate numeric(4, 2) CHECK (rate <= 1.5));
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    (price > (0)::numeric)
+    (rate <= 1.5)
+}
+
+test pg-get-expr-check-constraint-with-lowest-number {
+    CREATE TABLE checked (
+        id int, big bigint,
+        CONSTRAINT a_integer CHECK (id > -2147483648),
+        CONSTRAINT b_bigint CHECK (big > -2147483649),
+        CONSTRAINT c_lowest_bigint CHECK (big > -9223372036854775808),
+        CONSTRAINT d_zero CHECK (id > -0)
+    );
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    (id > '-2147483648'::integer)
+    (big > '-2147483649'::bigint)
+    (big > '-9223372036854775808'::bigint)
+    (id > 0)
+}
+
+test pg-get-expr-check-constraint-with-negative-zero-decimal {
+    CREATE TABLE checked (
+        price numeric(10, 2),
+        CONSTRAINT a_zero CHECK (price > -0.0),
+        CONSTRAINT b_two_places CHECK (price > -0.00),
+        CONSTRAINT c_not_zero CHECK (price > -0.10)
+    );
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    (price > 0.0)
+    (price > 0.00)
+    (price > '-0.10'::numeric)
+}
+
+test pg-get-expr-check-constraint-on-several-columns {
+    CREATE TABLE checked (
+        low int, high int, done boolean, note text,
+        CONSTRAINT a_range CHECK (low >= 0 AND low < high),
+        CONSTRAINT b_between CHECK (high BETWEEN 1 AND 100),
+        CONSTRAINT c_flag CHECK (done),
+        CONSTRAINT d_note CHECK (note IS NOT NULL OR NOT done)
+    );
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    ((low >= 0) AND (low < high))
+    ((high >= 1) AND (high <= 100))
+    done
+    ((note IS NOT NULL) OR (NOT done))
+}
+
+# tursopg does not print the casts of the || operator and shows the condition
+# as the engine stores it.
+@compat-gap "function:pg_get_expr"
+test pg-get-expr-check-constraint-with-concatenation {
+    CREATE TABLE checked (owner text CHECK (owner || 'x' <> 'ax'));
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0;
+}
+expect {
+    ((owner || 'x'::text) <> 'ax'::text)
+}
+expect @tursopg {
+    (owner || 'x') != 'ax'
 }
 
 test percentile-cont-within-group {
@@ -1051,6 +1255,18 @@ expect {
     0
 }
 
+test unnest-argument-is-a-table-column-with-the-name-of-a-column-of-unnest {
+    CREATE TABLE unnest_names (input int[], unnest int[]);
+    INSERT INTO unnest_names VALUES ('{1,2}', '{7}');
+    SELECT u FROM unnest_names, unnest(input) AS u;
+    SELECT u FROM unnest_names, unnest(unnest) AS u;
+}
+expect {
+    1
+    2
+    7
+}
+
 test unnest-pgdump-correlated {
     CREATE TABLE unnest_tags (id int, tags text[]);
     INSERT INTO unnest_tags VALUES (1, ARRAY['a', 'b']), (2, ARRAY['c']), (3, NULL);
@@ -1083,6 +1299,226 @@ expect {
     1|2
     1|3
     2|-1
+}
+
+test unnest-several-arrays-pads-the-shorter-ones-with-null {
+    SELECT * FROM unnest(ARRAY[1, 2, 3], ARRAY['a', 'b']) AS t(a, b);
+    SELECT * FROM unnest(ARRAY['a', 'b'], ARRAY[1, 2, 3]) AS t(a, b);
+    SELECT * FROM unnest(ARRAY[1.5, 2], ARRAY['x', 'y', 'z'], ARRAY[10, 20, 30, 40]) AS t(a, b, c);
+}
+expect {
+    1|a
+    2|b
+    3|
+    a|1
+    b|2
+    |3
+    1.5|x|10
+    2|y|20
+    |z|30
+    ||40
+}
+
+test unnest-several-arrays-keeps-null-elements {
+    SELECT * FROM unnest(ARRAY[1, NULL, 3], ARRAY[NULL, 'x']) AS t(a, b);
+}
+expect {
+    1|
+    |x
+    3|
+}
+
+test unnest-several-arrays-reads-arrays-of-more-dimensions-element-by-element {
+    SELECT * FROM unnest(ARRAY[[1, 2], [3, 4]], ARRAY['a', 'b', 'c', 'd', 'e']) AS t(a, b);
+    SELECT * FROM unnest(ARRAY[[[1], [2]], [[3], [4]]], ARRAY[[10, 20], [30, 40]], ARRAY[100]) AS t(a, b, c);
+    SELECT * FROM unnest(ARRAY[ARRAY[1, 2]], ARRAY[10]) AS t(a, b);
+}
+expect {
+    1|a
+    2|b
+    3|c
+    4|d
+    |e
+    1|10|100
+    2|20|
+    3|30|
+    4|40|
+    1|10
+    2|
+}
+
+test unnest-several-arrays-null-and-empty-arrays-have-no-elements {
+    SELECT * FROM unnest(ARRAY[1, 2], NULL::int[], '{}'::text[]) AS t(a, b, c);
+    SELECT count(*) FROM unnest(NULL::int[], NULL::int[]) AS t(a, b);
+    SELECT count(*) FROM unnest('{}'::int[], '{}'::int[]) AS t(a, b);
+    SELECT v.k, u.* FROM (VALUES (1)) v(k) LEFT JOIN unnest(NULL::int[], NULL::int[]) AS u(x, y) ON true;
+}
+expect {
+    1||
+    2||
+    0
+    0
+    1||
+}
+
+test unnest-several-arrays-with-ordinality {
+    SELECT * FROM unnest(ARRAY[1, 2, 3], ARRAY['a', 'b']) WITH ORDINALITY AS t(a, b, n);
+    SELECT * FROM unnest(ARRAY[1, 2], ARRAY['a']) WITH ORDINALITY AS t(a, b);
+}
+expect {
+    1|a|1
+    2|b|2
+    3||3
+    1|a|1
+    2||2
+}
+
+test unnest-several-arrays-column-names {
+    SELECT x, unnest FROM unnest(ARRAY[1, 2], ARRAY['a']) AS t(x);
+    SELECT t.b, t.a FROM unnest(ARRAY[1, 2], ARRAY['a']) AS t(a, b) WHERE b IS NULL;
+    SELECT * FROM unnest(ARRAY['x'], ARRAY['y']) AS unnest(a);
+    SELECT * FROM ROWS FROM (unnest(ARRAY[1, 2], ARRAY[3])) AS t(a, b);
+}
+expect {
+    1|a
+    2|
+    |2
+    x|y
+    1|3
+    2|
+}
+
+test unnest-several-arrays-of-table-columns {
+    CREATE TABLE unnest_several (id int, a int[], b text[], c int[][]);
+    INSERT INTO unnest_several VALUES
+        (1, ARRAY[1, 2, 3], ARRAY['x', 'y'], ARRAY[[1, 2], [3, 4]]),
+        (2, NULL, ARRAY['only'], NULL),
+        (3, '{}', '{}', ARRAY[[9]]),
+        (4, ARRAY[7], NULL, ARRAY[[5, 6]]);
+    SELECT id, u.* FROM unnest_several, unnest(a, b) AS u(x, y) ORDER BY id, x, y;
+    SELECT id, u.* FROM unnest_several LEFT JOIN LATERAL unnest(a, b, c) AS u(x, y, z) ON true ORDER BY id, x, y, z;
+    SELECT id, count(u.x), count(u.y) FROM unnest_several LEFT JOIN unnest(a, b) AS u(x, y) ON true GROUP BY id ORDER BY id;
+}
+expect {
+    1|1|x
+    1|2|y
+    1|3|
+    2||only
+    4|7|
+    1|1|x|1
+    1|2|y|2
+    1|3||3
+    1|||4
+    2||only|
+    3|||9
+    4|7||5
+    4|||6
+    1|3|2
+    2|0|1
+    3|0|0
+    4|1|0
+}
+
+test unnest-several-arrays-in-a-view {
+    CREATE TABLE unnest_view_source (id int, a int[], b text[]);
+    INSERT INTO unnest_view_source VALUES (1, ARRAY[1, 2], ARRAY['x']), (2, ARRAY[3], ARRAY['y', 'z']);
+    CREATE VIEW unnest_view AS SELECT id, x, y FROM unnest_view_source, unnest(a, b) AS u(x, y);
+    SELECT * FROM unnest_view ORDER BY id, x, y;
+}
+expect {
+    1|1|x
+    1|2|
+    2|3|y
+    2||z
+}
+
+test unnest-several-arrays-joined-to-each-other {
+    SELECT * FROM unnest(ARRAY[1, 2], ARRAY[3, 4]) AS x(a, b) JOIN unnest(ARRAY[2, 1], ARRAY['two', 'one']) AS y(a, n) USING (a) ORDER BY a;
+    SELECT a, b FROM unnest(ARRAY[3, 1, 2], ARRAY['c', 'a', 'b']) AS t(a, b) ORDER BY b DESC LIMIT 2;
+}
+expect {
+    1|3|one
+    2|4|two
+    3|c
+    2|b
+}
+
+test unnest-column-alias-list-longer-than-the-arrays-errors {
+    SELECT * FROM unnest(ARRAY[1], ARRAY[2]) AS t(a, b, c);
+}
+@sqlstate 42P10
+expect error {
+    table "t" has 2 columns available but 3 columns specified
+}
+
+test unnest-column-definition-list-errors {
+    SELECT * FROM unnest(ARRAY[1,2]) AS t(x int);
+}
+@sqlstate 42601
+expect error {
+    a column definition list is only allowed for functions returning "record"
+}
+
+test unnest-several-arrays-column-definition-list-errors {
+    SELECT * FROM unnest(ARRAY[1], ARRAY[2]) AS t(x int, y int);
+}
+@sqlstate 42601
+expect error {
+    UNNEST\(\) with multiple arguments cannot have a column definition list
+}
+
+test generate-series-column-definition-list-errors {
+    SELECT * FROM generate_series(1, 3) AS t(x int);
+}
+@sqlstate 42601
+expect error {
+    a column definition list is only allowed for functions returning "record"
+}
+
+test generate-series-with-one-argument-and-a-column-definition-list-reports-the-function {
+    SELECT * FROM generate_series(1) AS t(x int);
+}
+@sqlstate 42883
+expect error {
+}
+
+test generate-series-with-four-arguments-and-a-column-definition-list-reports-the-function {
+    SELECT * FROM generate_series(1, 2, 3, 4) AS t(x int);
+}
+@sqlstate 42883
+expect error {
+}
+
+test unnest-without-an-array-and-a-column-definition-list-reports-the-function {
+    SELECT * FROM unnest() AS t(x int);
+}
+@sqlstate 42883
+expect error {
+}
+
+test schema-qualified-unnest-with-several-arrays-and-a-column-definition-list-reports-the-function {
+    SELECT * FROM pg_catalog.unnest(ARRAY[1], ARRAY[2]) AS t(x int, y int);
+}
+@sqlstate 42883
+expect error {
+}
+
+test unnest-without-an-array-errors {
+    SELECT * FROM unnest();
+}
+@sqlstate 42883
+expect error {
+    function unnest\(\) does not exist
+}
+
+# PostgreSQL returns two columns named unnest.
+@skip-if postgres "tursopg cannot return two columns of a function with the same name"
+test unnest-several-arrays-without-distinct-column-names-is-not-supported {
+    SELECT * FROM unnest(ARRAY[1], ARRAY[2]);
+}
+@sqlstate 0A000
+expect error {
+    two columns with the same name in a function in FROM is not supported
 }
 
 test json-to-recordset-column-list {
@@ -1133,12 +1569,147 @@ expect {
     2|c
 }
 
+test json-to-recordset-column-list-inside-rows-from {
+    SELECT * FROM ROWS FROM (json_to_recordset('[{"a":1,"b":"x"},{"a":2,"b":"y"}]') AS (a int, b text));
+    SELECT * FROM ROWS FROM (jsonb_to_record('{"a":3}') AS (a int));
+}
+expect {
+    1|x
+    2|y
+    3
+}
+
+test column-alias-list-renames-columns-defined-inside-rows-from {
+    SELECT t.p, t.b FROM ROWS FROM (json_to_recordset('[{"a":1,"b":"x"}]') AS (a int, b text)) AS t(p);
+    SELECT t.p, t.q FROM ROWS FROM (json_to_recordset('[{"a":2,"b":"y"}]') AS (a int, b text)) AS t(p, q);
+}
+expect {
+    1|x
+    2|y
+}
+
+test column-alias-list-longer-than-columns-defined-inside-rows-from-errors {
+    SELECT * FROM ROWS FROM (json_to_recordset('[{"a":1}]') AS (a int, b text)) AS t(p, q, r);
+}
+@sqlstate 42P10
+expect error {
+    table "t" has 2 columns available but 3 columns specified
+}
+
+test column-definition-list-on-a-function-that-does-not-return-record-errors {
+    SELECT * FROM unnest(ARRAY[1]) AS u(a int);
+}
+expect error {
+}
+
 test json-to-record-requires-column-list {
     SELECT * FROM json_to_record('{"id":1}') AS _;
 }
 @sqlstate 42601
 expect error {
     a column definition list is required for functions returning "record"
+}
+
+test schema-qualified-unnest-with-several-arrays-errors {
+    SELECT * FROM pg_catalog.unnest(ARRAY[1, 2], ARRAY[3]) AS u(a, b);
+}
+@sqlstate 42883
+expect error {
+}
+
+test schema-qualified-unnest-with-one-array {
+    SELECT * FROM pg_catalog.unnest(ARRAY[1, 2]) WITH ORDINALITY AS u(a, n);
+}
+expect {
+    1|1
+    2|2
+}
+
+test generate-series-with-one-argument-errors {
+    SELECT * FROM generate_series(1);
+}
+@sqlstate 42883
+expect error {
+}
+
+test generate-series-with-four-arguments-errors {
+    SELECT * FROM generate_series(1, 2, 1, 1);
+}
+@sqlstate 42883
+expect error {
+}
+
+test generate-series-argument-cannot-name-the-column-of-the-function {
+    SELECT * FROM generate_series(1, generate_series);
+}
+@sqlstate 42703
+expect error {
+    generate_series
+}
+
+test unnest-argument-cannot-name-the-column-of-the-function {
+    SELECT * FROM unnest(unnest);
+}
+@sqlstate 42703
+expect error {
+    unnest
+}
+
+test generate-series-argument-cannot-name-the-function-itself {
+    SELECT * FROM generate_series(1, generate_series.generate_series);
+}
+@sqlstate 42P01
+expect error {
+}
+
+test generate-series-argument-cannot-name-a-column-the-function-does-not-have {
+    SELECT * FROM generate_series(1, generate_series.value);
+}
+@sqlstate 42P01
+expect error {
+}
+
+test unnest-argument-cannot-name-the-function-itself {
+    SELECT * FROM unnest(unnest.unnest);
+}
+@sqlstate 42P01
+expect error {
+}
+
+test generate-series-argument-cannot-name-a-table-listed-after-it {
+    CREATE TABLE series_later (n int);
+    SELECT * FROM generate_series(1, series_later.n), series_later;
+}
+@sqlstate 42P01
+expect error {
+}
+
+test generate-series-argument-cannot-name-a-column-of-a-table-listed-after-it {
+    CREATE TABLE series_later_column (n int);
+    SELECT * FROM generate_series(1, n), series_later_column;
+}
+@sqlstate 42703
+expect error {
+    n
+}
+
+test unnest-argument-cannot-name-a-table-listed-after-it {
+    CREATE TABLE unnest_later (a int[]);
+    SELECT * FROM unnest(unnest_later.a), unnest_later;
+}
+@sqlstate 42P01
+expect error {
+}
+
+test generate-series-argument-named-like-a-column-of-the-function {
+    CREATE TABLE series_args (start int, stop int, step int, value text);
+    INSERT INTO series_args VALUES (1, 7, 3, 'a');
+    SELECT series_args.value, generate_series.generate_series FROM series_args, generate_series(start, stop, step);
+}
+expect {
+    a|1
+    a|4
+    a|7
 }
 
 test json-to-record-argument-named-like-json-each-column {
@@ -1241,9 +1812,11 @@ expect {
 test function-whose-name-starts-with-a-bracket-does-not-exist {
     SELECT "[x"();
 }
+@sqlstate 42883
 expect error {
     function \[x\(\) does not exist
 }
+@sqlstate 42883
 expect @tursopg error {
     no such function: \[x
 }
@@ -1407,20 +1980,31 @@ expect error {
     value "4294967296" is out of range for type oid
 }
 
+@compat-gap "function:age"
 test age-of-two-timestamps {
     SELECT age('2026-10-08'::timestamp, '2025-01-01'::timestamp);
 }
 expect {
     1 year 9 mons 7 days
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
+@compat-gap "function:age"
 test age-of-an-earlier-timestamp-is-negative {
     SELECT age('2025-01-01'::timestamp, '2026-10-08 03:04:05.5'::timestamp);
 }
 expect {
     -1 years -9 mons -7 days -03:04:05.5
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
+@compat-gap "function:age"
 test age-borrows-the-length-of-the-earlier-month {
     SELECT age('2024-03-01'::timestamp, '2024-01-31'::timestamp),
            age('2024-01-31'::timestamp, '2024-03-01'::timestamp);
@@ -1428,7 +2012,12 @@ test age-borrows-the-length-of-the-earlier-month {
 expect {
     1 mon 1 day|-1 mons -1 days
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
+@compat-gap "function:age"
 test age-borrows-a-day-for-the-time-part {
     SELECT age('2026-10-08 01:00:00.25'::timestamp, '2026-10-07 23:30:00.5'::timestamp),
            age('2023-03-01'::timestamp, '2022-01-31 01:00'::timestamp);
@@ -1436,14 +2025,24 @@ test age-borrows-a-day-for-the-time-part {
 expect {
     01:29:59.75|1 year 1 mon 23:00:00
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
+@compat-gap "function:age"
 test age-of-equal-timestamps-is-zero {
     SELECT age('2026-10-08'::timestamp, '2026-10-08'::timestamp);
 }
 expect {
     00:00:00
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
+@compat-gap "function:age"
 test age-of-timestamp-columns {
     CREATE TABLE events (started timestamp, ended timestamp);
     INSERT INTO events VALUES ('2025-01-01', '2026-10-08 03:04:05.5');
@@ -1452,21 +2051,36 @@ test age-of-timestamp-columns {
 expect {
     1 year 9 mons 7 days 03:04:05.5|-1 years -9 mons -7 days -03:04:05.5
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
+@compat-gap "function:age"
 test age-of-one-timestamp-counts-from-midnight-today {
     SELECT age(current_date::timestamp);
 }
 expect {
     00:00:00
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
+@compat-gap "function:age"
 test age-of-one-date-counts-from-midnight-today {
     SELECT age(current_date);
 }
 expect {
     00:00:00
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
+@compat-gap "function:age"
 test age-of-date-columns {
     CREATE TABLE trips (started date, ended date);
     INSERT INTO trips VALUES ('2025-01-01', '2026-10-08');
@@ -1475,7 +2089,12 @@ test age-of-date-columns {
 expect {
     1 year 9 mons 7 days|1 year 9 mons 7 days 03:04:05
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
 
+@compat-gap "function:age"
 test age-reads-untyped-text-as-a-timestamp {
     SELECT age('2026-10-08', '2025-01-01 01:02'),
            age('2026-10-08', '2025-01-01T01:02:03'),
@@ -1484,14 +2103,24 @@ test age-reads-untyped-text-as-a-timestamp {
 expect {
     1 year 9 mons 6 days 22:58:00|1 year 9 mons 6 days 22:57:57|1 year 9 mons 6 days 22:57:56.75
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
+@compat-gap "function:age"
 test age-reads-midnight-at-the-end-of-the-day {
     SELECT age('2025-01-01 24:00:00', '2025-01-01'), age('2025-01-01 24:00', '2025-01-01');
 }
 expect {
     1 day|1 day
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
+@compat-gap "function:age"
 test age-converts-a-zone-in-untyped-text-to-utc {
     SELECT age('2026-10-08', '2025-01-01 01:02:03+00:00'),
            age('2026-10-08', '2025-01-01 01:02:03+02:00'),
@@ -1501,60 +2130,92 @@ test age-converts-a-zone-in-untyped-text-to-utc {
 expect {
     1 year 9 mons 6 days 22:57:57|1 year 9 mons 7 days 00:57:57|1 year 9 mons 6 days 21:28:00|1 year 9 mons 6 days 22:57:57
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
+@compat-gap "function:age"
 test age-of-a-two-digit-year-errors {
     SELECT age('26-10-08', '2025-01-01');
 }
+@sqlstate 22008
 expect error {
     date/time field value out of range: "26-10-08"
 }
+@sqlstate 0A000
 expect @tursopg error {
-    invalid timestamp value
+    type "interval" is not supported
 }
 
+@compat-gap "function:age"
 test age-of-a-zone-hour-out-of-range-errors {
     SELECT age('2026-10-08 12:34:56+99:00', '2025-01-01');
 }
+@sqlstate 22009
 expect error {
     time zone displacement out of range: "2026-10-08 12:34:56\+99:00"
 }
+@sqlstate 0A000
 expect @tursopg error {
-    invalid timestamp value
+    type "interval" is not supported
 }
 
+@compat-gap "function:age"
 test age-of-a-zone-minute-out-of-range-errors {
     SELECT age('2026-10-08 12:34:56+05:61', '2025-01-01');
 }
+@sqlstate 22009
 expect error {
     time zone displacement out of range: "2026-10-08 12:34:56\+05:61"
 }
+@sqlstate 0A000
 expect @tursopg error {
-    invalid timestamp value
+    type "interval" is not supported
 }
 
+@compat-gap "function:age"
 test age-of-integers-errors {
     SELECT age(20261008, 20250101);
 }
+@sqlstate 42883
 expect error {
     function age\(integer, integer\) does not exist
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
+@compat-gap "function:age"
 test age-of-a-fraction-errors {
     SELECT age(1.5, 2);
 }
+@sqlstate 42883
 expect error {
     function age\(numeric, integer\) does not exist
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
+@compat-gap "function:age"
 test age-of-an-integer-column-errors {
     CREATE TABLE counters (n int);
     INSERT INTO counters VALUES (8);
     SELECT age(n) FROM counters;
 }
+@sqlstate 42883
 expect error {
     function age\(integer\) does not exist
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
+@compat-gap "function:age"
 test age-with-null-is-null {
     SELECT coalesce(age(NULL, '2025-01-01'::timestamp)::text, '<null>'),
            coalesce(age(NULL::timestamp)::text, '<null>');
@@ -1562,15 +2223,22 @@ test age-with-null-is-null {
 expect {
     <null>|<null>
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
+@compat-gap "function:age"
 test age-of-invalid-text-errors {
     SELECT age('hello', '2025-01-01'::timestamp);
 }
+@sqlstate 22007
 expect error {
     invalid input syntax for type timestamp: "hello"
 }
+@sqlstate 0A000
 expect @tursopg error {
-    invalid timestamp value
+    type "interval" is not supported
 }
 
 test check-constraint-calls-a-text-function {
@@ -1600,6 +2268,7 @@ expect {
     1
 }
 
+@compat-gap "operator:timestamptz + int4"
 test now-plus-an-integer-errors {
     SELECT now() + 1;
 }
@@ -1607,6 +2276,7 @@ test now-plus-an-integer-errors {
 expect error {
     operator does not exist: timestamp with time zone \+ integer
 }
+@sqlstate 42601
 expect @tursopg error {
     operator does not exist: timestamptz \+ integer
 }
@@ -1735,6 +2405,7 @@ expect {
     ["\\\\x616263",null]
 }
 
+@compat-gap "function:array_to_json"
 test array-to-json-writes-dates-and-timestamps-in-iso-format {
     SELECT array_to_json(ARRAY['2024-01-02'::date]),
            array_to_json(ARRAY['2024-01-02 03:04:05.5'::timestamp]),
@@ -1742,6 +2413,10 @@ test array-to-json-writes-dates-and-timestamps-in-iso-format {
 }
 expect {
     ["2024-01-02"]|["2024-01-02T03:04:05.5"]|["2024-01-02T03:04:05+00:00"]
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
 }
 
 test array-to-json-embeds-json-and-jsonb-values {
@@ -1761,4 +2436,729 @@ test array-to-json-result-is-json {
 }
 expect {
     [[1,2]]|2
+}
+
+test table-function-argument-cannot-name-a-table-listed-after-it {
+    CREATE TABLE json_each_later (j json);
+    SELECT * FROM json_each(json_each_later.j), json_each_later;
+}
+@sqlstate 42P01
+expect error {
+}
+
+test table-function-argument-cannot-name-a-column-of-a-table-listed-after-it {
+    CREATE TABLE json_each_later_column (j json);
+    SELECT * FROM json_each(j), json_each_later_column;
+}
+@sqlstate 42703
+expect error {
+    j
+}
+
+test table-function-argument-named-like-a-column-of-the-function {
+    CREATE TABLE json_each_value (value json);
+    INSERT INTO json_each_value VALUES ('{"a": 1, "b": 2}');
+    SELECT count(*) FROM json_each_value, json_each(value) AS e;
+}
+expect {
+    2
+}
+
+test table-function-argument-names-the-column-of-the-function-before-it {
+    CREATE TABLE json_each_nested (j json);
+    INSERT INTO json_each_nested VALUES ('{"a": {"x": 1, "y": 2}, "b": {"z": 3}}');
+    SELECT count(*) FROM json_each_nested, json_each(j) AS outer_each, json_each(value) AS inner_each;
+}
+expect {
+    3
+}
+
+test json-each-returns-the-key-and-the-value-of-each-member {
+    SELECT * FROM json_each('{"a":1,"b":"x","c":[1,2],"d":null,"e":true,"f":false,"g":{"h":1},"i":2.5}');
+}
+expect {
+    a|1
+    b|"x"
+    c|[1,2]
+    d|null
+    e|true
+    f|false
+    g|{"h":1}
+    i|2.5
+}
+
+test json-each-has-only-the-columns-key-and-value {
+    SELECT * FROM json_each('{"a":1}') AS j WHERE j.key = 'a' AND j.value::text = '1';
+}
+expect {
+    a|1
+}
+
+test json-each-key-is-text-and-value-is-json {
+    SELECT key || '!', value -> 'h' FROM json_each('{"a":{"h":5}}');
+}
+expect {
+    a!|5
+}
+
+test json-each-keeps-the-order-and-the-repeated-keys {
+    SELECT * FROM json_each('{"b":1,"a":2,"b":3}');
+}
+expect {
+    b|1
+    a|2
+    b|3
+}
+
+test json-each-of-an-empty-object-has-no-rows {
+    SELECT count(*) FROM json_each('{}');
+}
+expect {
+    0
+}
+
+test json-each-of-null-has-no-rows {
+    SELECT count(*) FROM json_each(NULL::json);
+}
+expect {
+    0
+}
+
+test json-each-of-an-array-errors {
+    SELECT * FROM json_each('[1]');
+}
+@sqlstate 22023
+expect error {
+    cannot deconstruct an array as an object
+}
+
+test json-each-of-an-empty-array-errors {
+    SELECT * FROM json_each('[]');
+}
+@sqlstate 22023
+expect error {
+    cannot deconstruct an array as an object
+}
+
+test json-each-of-a-scalar-errors {
+    SELECT * FROM json_each('1');
+}
+@sqlstate 22023
+expect error {
+    cannot deconstruct a scalar
+}
+
+test json-each-of-json-null-errors {
+    SELECT * FROM json_each('null');
+}
+@sqlstate 22023
+expect error {
+    cannot deconstruct a scalar
+}
+
+test json-each-with-ordinality {
+    SELECT * FROM json_each('{"a":10,"b":20}') WITH ORDINALITY;
+}
+expect {
+    a|10|1
+    b|20|2
+}
+
+test json-each-with-column-aliases {
+    SELECT k, v FROM json_each('{"a":1}') AS j(k, v);
+}
+expect {
+    a|1
+}
+
+test json-each-with-ordinality-and-column-aliases {
+    SELECT k, v, n FROM json_each('{"a":1,"b":2}') WITH ORDINALITY AS j(k, v, n);
+}
+expect {
+    a|1|1
+    b|2|2
+}
+
+test json-each-reads-a-column-of-an-earlier-table {
+    CREATE TABLE json_each_docs (id int, doc json);
+    INSERT INTO json_each_docs VALUES (1, '{"a":1,"b":2}'), (2, '{"c":3}');
+    SELECT id, key, value FROM json_each_docs, json_each(doc) ORDER BY id, key;
+}
+expect {
+    1|a|1
+    1|b|2
+    2|c|3
+}
+
+test json-each-restarts-the-ordinality-for-each-row {
+    CREATE TABLE json_each_ordinality_docs (id int, doc json);
+    INSERT INTO json_each_ordinality_docs VALUES (1, '{"a":1,"b":2}'), (2, '{"c":3}');
+    SELECT id, key, ordinality FROM json_each_ordinality_docs, json_each(doc) WITH ORDINALITY ORDER BY id, ordinality;
+}
+expect {
+    1|a|1
+    1|b|2
+    2|c|1
+}
+
+test json-each-with-the-schema-name {
+    SELECT * FROM pg_catalog.json_each('{"a":1}');
+}
+expect {
+    a|1
+}
+
+test json-each-without-an-argument-errors {
+    SELECT * FROM json_each();
+}
+@sqlstate 42883
+expect error {
+}
+
+test json-each-with-two-arguments-errors {
+    SELECT * FROM json_each('{"a":1}', '{"b":2}');
+}
+@sqlstate 42883
+expect error {
+}
+
+test json-each-with-a-column-definition-list-errors {
+    SELECT * FROM json_each('{"a":1}') AS j(k text, v json);
+}
+@sqlstate 42601
+expect error {
+}
+
+test json-each-returns-the-text-of-each-number {
+    SELECT * FROM json_each('{"a":12345678901234567890,"b":1e2,"c":1.50,"d":-0,"e":0.10,"f":1E2,"g":1e+2,"h":-1.5e-3}');
+}
+expect {
+    a|12345678901234567890
+    b|1e2
+    c|1.50
+    d|-0
+    e|0.10
+    f|1E2
+    g|1e+2
+    h|-1.5e-3
+}
+
+test json-each-keeps-the-whitespace-inside-a-value {
+    SELECT * FROM json_each(E'\n {\t"a" :\r\n  [ 1 , {"b" : 2 } ]  ,"b":{ "x" : 1 }, "c":[], "d" : "  " }  ');
+}
+expect {
+    a|[ 1 , {"b" : 2 } ]
+    b|{ "x" : 1 }
+    c|[]
+    d|"  "
+}
+
+test json-each-unescapes-the-key-and-keeps-the-escapes-of-the-value {
+    SELECT * FROM json_each('{"aA":"xA","b\"c":"😀","":"\/"}');
+}
+expect {
+    aA|"xA"
+    b"c|"😀"
+    |"\/"
+}
+
+test json-each-of-invalid-json-errors {
+    SELECT * FROM json_each('{"a":01}');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type json
+}
+
+test json-each-of-json-with-text-after-it-errors {
+    SELECT * FROM json_each('{"a":1} x');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type json
+}
+
+test json-each-of-a-lone-surrogate-in-a-nested-value-errors {
+    SELECT * FROM json_each('{"a":{"b":["\udc00"]}}');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type json
+}
+
+test json-each-of-a-null-character-in-a-nested-value-errors {
+    SELECT * FROM json_each('{"a":1,"b":{"c":"x\u0000y"}}');
+}
+@sqlstate 22P05
+expect error {
+    unsupported Unicode escape sequence
+}
+
+test json-each-of-an-array-with-a-null-character-errors-on-the-array {
+    SELECT * FROM json_each('["\u0000"]');
+}
+@sqlstate 22023
+expect error {
+    cannot deconstruct an array as an object
+}
+
+test json-each-of-an-integer-errors {
+    SELECT * FROM json_each(1);
+}
+@sqlstate 42883
+expect error {
+    function json_each\(integer\) does not exist
+}
+
+@compat-gap "function:json_tree"
+test json-tree-is-not-a-function-of-postgresql {
+    SELECT * FROM json_tree('{"a":1}');
+}
+@sqlstate 42883
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+    json_tree as a function in FROM is not supported
+}
+
+# now() is the time the transaction started, so every row a transaction
+# inserts gets the same DEFAULT now(). The generate_series between the
+# INSERTs lets the clock move.
+test default-now-is-the-same-for-every-insert-of-a-transaction {
+    CREATE TABLE created (id int, created_at timestamptz NOT NULL DEFAULT now());
+    BEGIN;
+    INSERT INTO created (id) VALUES (1);
+    SELECT count(*) FROM generate_series(1, 100000);
+    INSERT INTO created (id) VALUES (2);
+    SELECT count(DISTINCT created_at) FROM created;
+    COMMIT;
+}
+expect {
+    100000
+    1
+}
+
+# Outside a transaction, now() and statement_timestamp() are the time the
+# statement started: one value for all rows. clock_timestamp() changes.
+test now-and-statement-timestamp-are-the-same-for-every-row {
+    SELECT count(DISTINCT now()), count(DISTINCT transaction_timestamp()),
+           count(DISTINCT statement_timestamp())
+    FROM generate_series(1, 100000);
+    SELECT count(*) FROM generate_series(1, 100000) WHERE now() <> statement_timestamp();
+    SELECT count(*) FROM (
+        SELECT count(DISTINCT clock_timestamp()) AS n FROM generate_series(1, 100000)
+    ) AS clock WHERE n > 1;
+}
+expect {
+    1|1|1
+    0
+    1
+}
+
+# LOCALTIMESTAMP is the time the transaction started, as a timestamp in the
+# session's time zone (UTC), so it equals now() to the microsecond.
+test localtimestamp-is-the-start-of-the-transaction {
+    BEGIN;
+    SELECT count(*) FROM generate_series(1, 100000);
+    SELECT count(*) WHERE LOCALTIMESTAMP = now()::timestamp;
+    SELECT count(*) WHERE LOCALTIMESTAMP = CURRENT_TIMESTAMP::timestamp;
+    COMMIT;
+}
+expect {
+    100000
+    1
+    1
+}
+
+# In a transaction, statement_timestamp() is the time the statement started,
+# which is later than now() in the second statement.
+test statement-timestamp-is-later-than-now-in-a-later-statement {
+    BEGIN;
+    SELECT count(*) FROM generate_series(1, 100000);
+    SELECT count(*)
+    WHERE statement_timestamp() > now() AND statement_timestamp() > transaction_timestamp();
+    COMMIT;
+}
+expect {
+    100000
+    1
+}
+
+# ALTER TABLE fills the existing rows with one value of DEFAULT now().
+test add-column-default-now-gives-every-existing-row-one-value {
+    CREATE TABLE filled (x int);
+    INSERT INTO filled SELECT g FROM generate_series(1, 20000) AS g;
+    ALTER TABLE filled ADD COLUMN d timestamptz DEFAULT now();
+    SELECT count(d), count(DISTINCT d) FROM filled;
+}
+expect {
+    20000|1
+}
+
+# The statement starts before any clock_timestamp() call in it.
+test clock-timestamp-is-never-earlier-than-statement-timestamp {
+    SELECT count(*) FROM generate_series(1, 100000) WHERE clock_timestamp() < statement_timestamp();
+}
+expect {
+    0
+}
+
+# PostgreSQL rounds to the given precision. tursopg cannot yet, so it refuses
+# every explicit precision, including 0.
+@compat-gap "syntax:current-timestamp-precision"
+test current-timestamp-with-precision-0-has-no-fraction {
+    SELECT current_timestamp(0) = date_trunc('second', current_timestamp(0));
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP is not supported
+}
+
+@compat-gap "syntax:current-timestamp-precision"
+test localtimestamp-with-precision-0-has-no-fraction {
+    SELECT localtimestamp(0) = date_trunc('second', localtimestamp(0));
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP is not supported
+}
+
+@compat-gap "syntax:current-timestamp-precision"
+test default-current-timestamp-with-precision-0-has-no-fraction {
+    CREATE TABLE ts_precision (id int, t timestamptz DEFAULT current_timestamp(0));
+    INSERT INTO ts_precision (id) VALUES (1);
+    SELECT t = date_trunc('second', t) FROM ts_precision;
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP is not supported
+}
+
+# to_char formats numbers. Other argument types are covered in
+# gaps/operators-functions.sqltest.
+test to-char-number {
+    SELECT to_char(-1234.5, '9999.9'), to_char(NULL::int, '999');
+}
+expect {
+    -1234.5|
+}
+
+# to_char is strict: a NULL argument gives NULL whatever the other types are.
+test to-char-null-format {
+    SELECT coalesce(to_char(timestamp '2024-01-01', NULL::text), 'null'), coalesce(to_char(1, NULL), 'null');
+}
+expect {
+    null|null
+}
+
+test now-with-an-argument-errors {
+    SELECT now(1);
+}
+@sqlstate 42883
+expect error {}
+
+test statement-timestamp-with-a-text-argument-errors {
+    SELECT statement_timestamp('x');
+}
+@sqlstate 42883
+expect error {}
+
+test now-with-a-star-argument-errors {
+    SELECT now(*) IS NOT NULL;
+}
+@sqlstate 42809
+expect error {
+    now\(\*\) specified, but now is not an aggregate function
+}
+
+test random-with-a-star-argument-errors {
+    SELECT random(*) IS NOT NULL;
+}
+@sqlstate 42809
+expect error {
+    random\(\*\) specified, but random is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-in-where-errors {
+    SELECT 1 WHERE clock_timestamp(*) IS NOT NULL;
+}
+@sqlstate 42809
+expect error {
+    clock_timestamp\(\*\) specified, but clock_timestamp is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-in-check-errors {
+    CREATE TABLE star_check (a int CHECK (random(*) > 0));
+}
+@sqlstate 42809
+expect error {
+    random\(\*\) specified, but random is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-in-default-errors {
+    CREATE TABLE star_default (a float DEFAULT pi(*));
+}
+@sqlstate 42809
+expect error {
+    pi\(\*\) specified, but pi is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-in-view-errors {
+    CREATE VIEW star_view AS SELECT pg_catalog.now(*) AS t;
+}
+@sqlstate 42809
+expect error {
+    pg_catalog\.now\(\*\) specified, but pg_catalog\.now is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-with-filter-errors {
+    SELECT now(*) FILTER (WHERE true);
+}
+@sqlstate 42809
+expect error {
+    now\(\*\) specified, but now is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-with-over-errors {
+    SELECT random(*) OVER ();
+}
+@sqlstate 42809
+expect error {
+    random\(\*\) specified, but random is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-with-over-in-check-errors {
+    CREATE TABLE star_over_check (a int CHECK (random(*) OVER () > 0));
+}
+@sqlstate 42809
+expect error {
+    random\(\*\) specified, but random is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-in-generated-column-errors {
+    CREATE TABLE star_generated (a int, b float GENERATED ALWAYS AS (random(*)) STORED);
+}
+@sqlstate 42809
+expect error {
+    random\(\*\) specified, but random is not an aggregate function
+}
+
+test star-argument-of-a-non-aggregate-with-over-in-generated-column-errors {
+    CREATE TABLE star_over_generated (a int, b float GENERATED ALWAYS AS (random(*) OVER ()) STORED);
+}
+@sqlstate 42809
+expect error {
+    random\(\*\) specified, but random is not an aggregate function
+}
+
+test star-argument-of-aggregate-and-window-functions {
+    SELECT count(*), (SELECT row_number(*) OVER ());
+}
+expect {
+    1|1
+}
+
+# The clock functions keep microseconds. Of 200 clock readings at least one
+# has more than three fraction digits (PostgreSQL leaves out trailing zeros).
+test clock-timestamp-has-microseconds {
+    SELECT min(1) FROM (SELECT clock_timestamp()::text AS c FROM generate_series(1, 200)) s
+    WHERE c LIKE '%.____%';
+}
+expect {
+    1
+}
+
+# date_trunc truncates a timestamptz to each unit. Weeks start on Monday, and
+# centuries and millennia start at years ending in 01. Each row whose
+# truncated value equals the expected value is listed.
+test date-trunc-timestamptz-units {
+    CREATE TABLE trunc_units (unit text, expected timestamptz);
+    INSERT INTO trunc_units VALUES
+        ('microseconds', '2026-10-08 12:34:56.789123+00'),
+        ('milliseconds', '2026-10-08 12:34:56.789+00'),
+        ('second', '2026-10-08 12:34:56+00'),
+        ('minute', '2026-10-08 12:34:00+00'),
+        ('hour', '2026-10-08 12:00:00+00'),
+        ('day', '2026-10-08 00:00:00+00'),
+        ('week', '2026-10-05 00:00:00+00'),
+        ('month', '2026-10-01 00:00:00+00'),
+        ('quarter', '2026-10-01 00:00:00+00'),
+        ('year', '2026-01-01 00:00:00+00'),
+        ('decade', '2020-01-01 00:00:00+00'),
+        ('century', '2001-01-01 00:00:00+00'),
+        ('millennium', '2001-01-01 00:00:00+00');
+    SELECT unit FROM trunc_units
+    WHERE date_trunc(unit, '2026-10-08 12:34:56.789123+00'::timestamptz) = expected
+    ORDER BY unit;
+}
+expect {
+    century
+    day
+    decade
+    hour
+    microseconds
+    millennium
+    milliseconds
+    minute
+    month
+    quarter
+    second
+    week
+    year
+}
+
+# date_trunc of a timestamptz column, a typical "events per day" query.
+test date-trunc-group-by-day {
+    CREATE TABLE trunc_events (at timestamptz);
+    INSERT INTO trunc_events VALUES ('2026-10-08 01:00:00+00'), ('2026-10-08 23:59:59.999999+00'),
+        ('2026-10-09 00:00:00+00'), (NULL);
+    SELECT count(*) FROM trunc_events GROUP BY date_trunc('day', at) ORDER BY date_trunc('day', at) NULLS LAST;
+}
+expect {
+    2
+    1
+    1
+}
+
+# date_trunc accepts the unit spellings of PostgreSQL's interval unit table,
+# in any letter case. A name longer than 10 characters matches on its first 10.
+test date-trunc-unit-aliases {
+    SELECT count(*) FROM (VALUES
+        ('hours', '2026-10-08 12:00:00+00'), ('HRS', '2026-10-08 12:00:00+00'), ('h', '2026-10-08 12:00:00+00'),
+        ('Mins', '2026-10-08 12:34:00+00'), ('m', '2026-10-08 12:34:00+00'),
+        ('secs', '2026-10-08 12:34:56+00'), ('s', '2026-10-08 12:34:56+00'),
+        ('ms', '2026-10-08 12:34:56.789+00'), ('millisecond', '2026-10-08 12:34:56.789+00'),
+        ('milliseconds', '2026-10-08 12:34:56.789+00'), ('msecs', '2026-10-08 12:34:56.789+00'),
+        ('us', '2026-10-08 12:34:56.789123+00'), ('microsecond', '2026-10-08 12:34:56.789123+00'),
+        ('microseconds', '2026-10-08 12:34:56.789123+00'), ('usecs', '2026-10-08 12:34:56.789123+00'),
+        ('days', '2026-10-08 00:00:00+00'), ('d', '2026-10-08 00:00:00+00'),
+        ('weeks', '2026-10-05 00:00:00+00'), ('w', '2026-10-05 00:00:00+00'),
+        ('mon', '2026-10-01 00:00:00+00'), ('mons', '2026-10-01 00:00:00+00'), ('months', '2026-10-01 00:00:00+00'),
+        ('qtr', '2026-10-01 00:00:00+00'),
+        ('y', '2026-01-01 00:00:00+00'), ('yr', '2026-01-01 00:00:00+00'), ('YEARS', '2026-01-01 00:00:00+00'),
+        ('dec', '2020-01-01 00:00:00+00'), ('decades', '2020-01-01 00:00:00+00'),
+        ('c', '2001-01-01 00:00:00+00'), ('cent', '2001-01-01 00:00:00+00'), ('centuries', '2001-01-01 00:00:00+00'),
+        ('mil', '2001-01-01 00:00:00+00'), ('mils', '2001-01-01 00:00:00+00'), ('millennia', '2001-01-01 00:00:00+00'),
+        ('usecond', '2026-10-08 12:34:56.789123+00'), ('msecond', '2026-10-08 12:34:56.789+00'),
+        ('microsecondsXY', '2026-10-08 12:34:56.789123+00'), ('DAY', '2026-10-08 00:00:00+00')
+    ) AS t(unit, expected)
+    WHERE date_trunc(unit, '2026-10-08 12:34:56.789123+00'::timestamptz) = expected::timestamptz;
+}
+expect {
+    38
+}
+
+# An unrecognized unit is an invalid parameter value, not a missing feature.
+test date-trunc-unit-not-recognized {
+    SELECT date_trunc('foo', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 22023
+expect error {
+    unit "foo" not recognized for type timestamp with time zone
+}
+
+# PostgreSQL prints the lowercased unit.
+test date-trunc-unit-not-recognized-uppercase {
+    SELECT date_trunc('FOO', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 22023
+expect error {
+    unit "foo" not recognized for type timestamp with time zone
+}
+
+# The time zone fields of the interval unit table are not truncation units.
+test date-trunc-unit-timezone {
+    SELECT date_trunc('TIMEZONE', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 0A000
+expect error {
+    unit "timezone" not supported for type timestamp with time zone
+}
+
+test date-trunc-unit-timezone-h {
+    SELECT date_trunc('timezone_h', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 0A000
+expect error {
+    unit "timezone_h" not supported for type timestamp with time zone
+}
+
+test date-trunc-unit-timezone-m {
+    SELECT date_trunc('timezone_m', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 0A000
+expect error {
+    unit "timezone_m" not supported for type timestamp with time zone
+}
+
+test date-trunc-unit-leading-space {
+    SELECT date_trunc(' day', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 22023
+expect error {}
+
+test date-trunc-unit-empty {
+    SELECT date_trunc('', '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 22023
+expect error {}
+
+# A unit that is not text matches no date_trunc signature. A SQL NULL unit
+# gives NULL.
+test date-trunc-integer-unit {
+    SELECT date_trunc(5, '2026-10-08 12:34:56+00'::timestamptz);
+}
+@sqlstate 42883
+expect error {}
+
+test date-trunc-null-unit {
+    SELECT (date_trunc(NULL, '2026-10-08 12:34:56+00'::timestamptz) IS NULL)::int;
+}
+expect {
+    1
+}
+
+# A typed NULL unit needs function signature typing in tursopg, which
+# returns NULL.
+@compat-gap "function:date_trunc"
+test date-trunc-typed-null-unit {
+    SELECT (date_trunc(NULL::int, '2026-10-08 12:34:56+00'::timestamptz) IS NULL)::int;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    1
+}
+
+# PostgreSQL has no year 0. A decade that starts before year 1 is BC in
+# PostgreSQL, which tursopg cannot store, so it refuses.
+@compat-gap "function:date_trunc"
+test date-trunc-decade-before-year-1 {
+    SELECT date_trunc('decade', '0001-05-03 00:00:00+00'::timestamptz);
+}
+expect {
+    0001-01-01 00:00:00+00 BC
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# Centuries and millennia of years 1 to 99 and 1 to 999 start at year 1.
+test date-trunc-century-millennium-low-years {
+    SELECT date_trunc('century', '0001-05-03 00:00:00+00'::timestamptz),
+        date_trunc('century', '0099-05-03 00:00:00+00'::timestamptz),
+        date_trunc('millennium', '0999-05-03 00:00:00+00'::timestamptz),
+        date_trunc('decade', '0010-05-03 00:00:00+00'::timestamptz);
+}
+expect {
+    0001-01-01 00:00:00+00|0001-01-01 00:00:00+00|0001-01-01 00:00:00+00|0010-01-01 00:00:00+00
 }

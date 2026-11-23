@@ -24,6 +24,7 @@ pub struct BackingBTreeIndexMethodAttachment {
 impl IndexMethod for BackingBtreeIndexMethod {
     fn attach(
         &self,
+        _dialect: &dyn crate::dialect::Dialect,
         configuration: &IndexMethodConfiguration,
     ) -> Result<Arc<dyn IndexMethodAttachment>> {
         Ok(Arc::new(BackingBTreeIndexMethodAttachment {

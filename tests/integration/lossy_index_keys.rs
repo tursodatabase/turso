@@ -44,7 +44,7 @@
 //!
 //! ```text
 //! - core/translate/index.rs                CREATE INDEX (index_* forms)
-//! - core/translate/schema.rs               UNIQUE and PRIMARY KEY in CREATE TABLE
+//! - core/translate/schema/mod.rs           UNIQUE and PRIMARY KEY in CREATE TABLE
 //!                                          (col_*, tbl_* forms)
 //! - core/schema.rs                         automatic_from_primary_key/unique, and
 //!                                          loading an index from the schema table

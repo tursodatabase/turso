@@ -98,10 +98,10 @@ pub(crate) use arrays::{
 };
 pub(crate) use binary::{row_value_component_expr, row_value_len};
 pub(crate) use binding::check_custom_types;
-pub use binding::{bind_and_rewrite_expr, BindingBehavior};
+pub use binding::{bind_and_rewrite_expr, bind_and_rewrite_expr_except, BindingBehavior};
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub(crate) use columns::emit_encoded_default;
-pub use columns::{emit_stored_column, emit_table_column, emit_table_column_for_dml};
+pub use columns::{emit_stored_column, emit_table_column};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_type_operators::{
     check_custom_operator, custom_operator_call, emit_operator_call_on_registers,

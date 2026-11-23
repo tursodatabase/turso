@@ -1,0 +1,49 @@
+@database :memory:
+
+# A string literal is copied into a register that can already hold a text
+# value of an earlier row. The text of the earlier row is longer, shorter or
+# empty.
+@cross-check-integrity
+test string_literal_into_text_register {
+    CREATE TABLE f(x);
+    INSERT INTO f VALUES (1), (0), (1), (0), (2), (1);
+    SELECT x, CASE x WHEN 1 THEN 'a much longer text value' WHEN 0 THEN 'b' ELSE '' END FROM f;
+}
+expect {
+    1|a much longer text value
+    0|b
+    1|a much longer text value
+    0|b
+    2|
+    1|a much longer text value
+}
+
+# A string literal that replaces a JSON value in a register is plain text.
+@cross-check-integrity
+test string_literal_replaces_json_value {
+    CREATE TABLE g(x);
+    INSERT INTO g VALUES (1), (0), (1), (0), (2);
+    SELECT x, json_quote(CASE x WHEN 1 THEN json('[1]') WHEN 0 THEN '[1]' ELSE 'some text' END) FROM g;
+}
+expect {
+    1|[1]
+    0|"[1]"
+    1|[1]
+    0|"[1]"
+    2|"some text"
+}
+
+@cross-check-integrity
+test string_literals_of_multi_row_insert {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 'first value'), (2, 'b'), (3, NULL), (4, 'a longer value than the others'), (5, 7), (6, '');
+    SELECT a, b, typeof(b) FROM t;
+}
+expect {
+    1|first value|text
+    2|b|text
+    3||null
+    4|a longer value than the others|text
+    5|7|integer
+    6||text
+}

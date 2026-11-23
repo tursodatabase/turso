@@ -1,0 +1,390 @@
+# DROP ROLE through the PostgreSQL frontend.
+# PostgreSQL roles belong to the whole server, not to one database, so every
+# test uses its own role names.
+
+@database :memory:
+
+test drop-role-removes-the-role {
+    CREATE ROLE dr_removed;
+    DROP ROLE dr_removed;
+    SELECT count(*) FROM pg_roles WHERE rolname = 'dr_removed';
+}
+expect {
+    0
+}
+
+test drop-role-removes-several-roles {
+    CREATE ROLE dr_several_1;
+    CREATE ROLE dr_several_2;
+    DROP ROLE dr_several_1, dr_several_2;
+    SELECT count(*) FROM pg_roles WHERE rolname LIKE 'dr_several_%';
+}
+expect {
+    0
+}
+
+test drop-role-naming-a-role-twice-drops-it-once {
+    CREATE ROLE dr_twice;
+    DROP ROLE dr_twice, dr_twice;
+    SELECT count(*) FROM pg_roles WHERE rolname = 'dr_twice';
+}
+expect {
+    0
+}
+
+test drop-user-and-drop-group-drop-roles {
+    CREATE ROLE dr_user;
+    CREATE ROLE dr_group;
+    DROP USER dr_user;
+    DROP GROUP dr_group;
+    SELECT count(*) FROM pg_roles WHERE rolname IN ('dr_user', 'dr_group');
+}
+expect {
+    0
+}
+
+test dropped-role-name-can-be-created-again {
+    CREATE ROLE dr_again;
+    DROP ROLE dr_again;
+    CREATE ROLE dr_again NOINHERIT;
+    SELECT count(*) FROM pg_roles WHERE rolname = 'dr_again' AND NOT rolinherit;
+}
+expect {
+    1
+}
+
+test drop-role-in-a-rolled-back-transaction-keeps-the-role {
+    CREATE ROLE dr_rolled_back;
+    BEGIN;
+    DROP ROLE dr_rolled_back;
+    ROLLBACK;
+    SELECT count(*) FROM pg_roles WHERE rolname = 'dr_rolled_back';
+}
+expect {
+    1
+}
+
+test drop-role-of-a-missing-role-fails {
+    DROP ROLE dr_missing;
+}
+@sqlstate 42704
+expect error {
+    role "dr_missing" does not exist
+}
+
+test drop-role-names-are-case-sensitive {
+    CREATE ROLE dr_case;
+    DROP ROLE "DR_CASE";
+}
+@sqlstate 42704
+expect error {
+    role "DR_CASE" does not exist
+}
+
+test drop-role-if-exists-skips-a-missing-role {
+    CREATE ROLE dr_if_exists;
+    DROP ROLE IF EXISTS dr_if_exists_missing, dr_if_exists;
+    SELECT count(*) FROM pg_roles WHERE rolname LIKE 'dr_if_exists%';
+}
+expect {
+    0
+}
+
+test drop-role-that-fails-drops-none-of-its-roles {
+    CREATE ROLE dr_none_dropped;
+    DROP ROLE dr_none_dropped, dr_none_dropped_missing;
+}
+@sqlstate 42704
+expect error {
+    role "dr_none_dropped_missing" does not exist
+}
+
+test drop-role-of-current-user-fails {
+    DROP ROLE postgres;
+}
+@sqlstate 55006
+expect error {
+    current user cannot be dropped
+}
+
+test role-set-with-set-role-cannot-drop-itself {
+    CREATE ROLE dr_current;
+    SET ROLE dr_current;
+    DROP ROLE dr_current;
+}
+@sqlstate 42501
+expect error {
+    permission denied to drop role
+}
+
+test drop-role-of-pg-database-owner-fails {
+    DROP ROLE pg_database_owner;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop role pg_database_owner because it is required by the database system
+}
+
+test drop-role-of-a-predefined-role-fails {
+    DROP ROLE pg_monitor;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop role pg_monitor because it is required by the database system
+}
+
+test drop-role-if-exists-of-a-predefined-role-fails {
+    DROP ROLE IF EXISTS pg_read_all_data;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop role pg_read_all_data because it is required by the database system
+}
+
+test drop-role-of-current-user-specifier-fails {
+    DROP ROLE CURRENT_USER;
+}
+@sqlstate 22023
+expect error {
+    cannot use special role specifier in DROP ROLE
+}
+
+test drop-role-of-session-user-specifier-fails {
+    DROP ROLE SESSION_USER;
+}
+@sqlstate 22023
+expect error {
+    cannot use special role specifier in DROP ROLE
+}
+
+test drop-role-of-public-fails {
+    DROP ROLE public;
+}
+@sqlstate 22023
+expect error {
+    cannot use special role specifier in DROP ROLE
+}
+
+test drop-role-if-exists-of-a-special-role-specifier-fails {
+    DROP ROLE IF EXISTS CURRENT_ROLE;
+}
+@sqlstate 22023
+expect error {
+    cannot use special role specifier in DROP ROLE
+}
+
+test role-without-privileges-cannot-drop-a-role {
+    CREATE ROLE dr_victim;
+    CREATE ROLE dr_dropper;
+    SET ROLE dr_dropper;
+    DROP ROLE dr_victim;
+}
+@sqlstate 42501
+expect error {
+    permission denied to drop role
+}
+
+test role-without-privileges-cannot-drop-a-missing-role {
+    CREATE ROLE dr_missing_dropper;
+    SET ROLE dr_missing_dropper;
+    DROP ROLE IF EXISTS dr_never_created;
+}
+@sqlstate 42501
+expect error {
+    permission denied to drop role
+}
+
+# PostgreSQL checks every role for the errors above before it checks any
+# role for what depends on it or for being required by the system.
+
+test drop-role-reports-the-current-user-before-a-later-role-s-dependents {
+    CREATE ROLE dr_first_owner;
+    CREATE TABLE dr_first_owned (x int);
+    ALTER TABLE dr_first_owned OWNER TO dr_first_owner;
+    DROP ROLE dr_first_owner, postgres;
+}
+@sqlstate 55006
+expect error {
+    current user cannot be dropped
+}
+
+test drop-role-reports-a-missing-role-before-pg-database-owner {
+    DROP ROLE pg_database_owner, dr_missing_after_owner;
+}
+@sqlstate 42704
+expect error {
+    role "dr_missing_after_owner" does not exist
+}
+
+# What depends on a role keeps it from being dropped.
+
+test drop-role-of-a-table-owner-fails {
+    CREATE ROLE dr_table_owner;
+    CREATE TABLE dr_owned (x int);
+    ALTER TABLE dr_owned OWNER TO dr_table_owner;
+    DROP ROLE dr_table_owner;
+}
+@sqlstate 2BP01
+expect error {
+    role "dr_table_owner" cannot be dropped because some objects depend on it
+}
+
+test drop-role-of-a-view-owner-fails {
+    CREATE ROLE dr_view_owner;
+    CREATE VIEW dr_owned_view AS SELECT 1;
+    ALTER VIEW dr_owned_view OWNER TO dr_view_owner;
+    DROP ROLE dr_view_owner;
+}
+@sqlstate 2BP01
+expect error {
+    role "dr_view_owner" cannot be dropped because some objects depend on it
+}
+
+test drop-role-of-a-sequence-owner-fails {
+    CREATE ROLE dr_sequence_owner;
+    CREATE SEQUENCE dr_owned_sequence;
+    ALTER SEQUENCE dr_owned_sequence OWNER TO dr_sequence_owner;
+    DROP ROLE dr_sequence_owner;
+}
+@sqlstate 2BP01
+expect error {
+    role "dr_sequence_owner" cannot be dropped because some objects depend on it
+}
+
+test drop-role-with-privileges-on-a-table-fails {
+    CREATE ROLE dr_reader;
+    CREATE TABLE dr_read (x int);
+    GRANT SELECT ON dr_read TO dr_reader;
+    DROP ROLE dr_reader;
+}
+@sqlstate 2BP01
+expect error {
+    role "dr_reader" cannot be dropped because some objects depend on it
+}
+
+test drop-role-with-privileges-on-a-sequence-fails {
+    CREATE ROLE dr_sequence_user;
+    CREATE SEQUENCE dr_used_sequence;
+    GRANT USAGE ON SEQUENCE dr_used_sequence TO dr_sequence_user;
+    DROP ROLE dr_sequence_user;
+}
+@sqlstate 2BP01
+expect error {
+    role "dr_sequence_user" cannot be dropped because some objects depend on it
+}
+
+test drop-role-of-a-policy-role-fails {
+    CREATE ROLE dr_policy_role;
+    CREATE TABLE dr_policy_table (x int);
+    CREATE POLICY dr_policy ON dr_policy_table TO dr_policy_role USING (true);
+    DROP ROLE dr_policy_role;
+}
+@sqlstate 2BP01
+expect error {
+    role "dr_policy_role" cannot be dropped because some objects depend on it
+}
+
+# PostgreSQL keeps only PUBLIC when a policy names PUBLIC and other roles,
+# so those roles are not its targets.
+test drop-role-named-with-public-in-a-policy {
+    CREATE ROLE dr_with_public;
+    CREATE TABLE dr_with_public_table (x int);
+    CREATE POLICY dr_with_public_policy ON dr_with_public_table
+        TO dr_with_public, public USING (true);
+    DROP ROLE dr_with_public;
+    SELECT count(*) FROM pg_roles WHERE rolname = 'dr_with_public';
+}
+expect {
+    0
+}
+
+test drop-role-after-its-privileges-are-revoked {
+    CREATE ROLE dr_revoked;
+    CREATE TABLE dr_revoked_table (x int);
+    GRANT SELECT ON dr_revoked_table TO dr_revoked;
+    REVOKE SELECT ON dr_revoked_table FROM dr_revoked;
+    DROP ROLE dr_revoked;
+    SELECT count(*) FROM pg_roles WHERE rolname = 'dr_revoked';
+}
+expect {
+    0
+}
+
+test drop-role-after-its-table-is-dropped {
+    CREATE ROLE dr_former_owner;
+    CREATE TABLE dr_dropped_table (x int);
+    ALTER TABLE dr_dropped_table OWNER TO dr_former_owner;
+    DROP TABLE dr_dropped_table;
+    DROP ROLE dr_former_owner;
+    SELECT count(*) FROM pg_roles WHERE rolname = 'dr_former_owner';
+}
+expect {
+    0
+}
+
+test drop-role-after-its-table-changes-owner {
+    CREATE ROLE dr_given_away;
+    CREATE TABLE dr_given_table (x int);
+    ALTER TABLE dr_given_table OWNER TO dr_given_away;
+    ALTER TABLE dr_given_table OWNER TO postgres;
+    DROP ROLE dr_given_away;
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'dr_given_table';
+}
+expect {
+    postgres
+}
+
+test drop-role-after-its-policy-is-dropped {
+    CREATE ROLE dr_former_policy_role;
+    CREATE TABLE dr_former_policy_table (x int);
+    CREATE POLICY dr_former_policy ON dr_former_policy_table
+        TO dr_former_policy_role USING (true);
+    DROP POLICY dr_former_policy ON dr_former_policy_table;
+    DROP ROLE dr_former_policy_role;
+    SELECT count(*) FROM pg_roles WHERE rolname = 'dr_former_policy_role';
+}
+expect {
+    0
+}
+
+# Memberships go with the role.
+
+test drop-role-removes-its-memberships {
+    CREATE ROLE dr_member_group;
+    CREATE ROLE dr_member;
+    CREATE ROLE dr_member_other;
+    GRANT dr_member_group TO dr_member, dr_member_other;
+    DROP ROLE dr_member;
+    SELECT m.rolname
+    FROM pg_auth_members a
+    JOIN pg_roles r ON r.oid = a.roleid
+    JOIN pg_roles m ON m.oid = a.member
+    WHERE r.rolname = 'dr_member_group';
+}
+expect {
+    dr_member_other
+}
+
+test drop-role-removes-the-memberships-in-it {
+    CREATE ROLE dr_group;
+    CREATE ROLE dr_group_member;
+    GRANT dr_group TO dr_group_member;
+    DROP ROLE dr_group;
+    SELECT count(*)
+    FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
+    WHERE m.rolname = 'dr_group_member';
+}
+expect {
+    0
+}
+
+test drop-role-of-a-group-and-its-member {
+    CREATE ROLE dr_both_group;
+    CREATE ROLE dr_both_member;
+    GRANT dr_both_group TO dr_both_member;
+    DROP ROLE dr_both_group, dr_both_member;
+    SELECT count(*) FROM pg_roles WHERE rolname LIKE 'dr_both_%';
+}
+expect {
+    0
+}

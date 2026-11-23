@@ -66,6 +66,22 @@ impl ConstraintViolation {
 pub struct DialectError {
     pub code: &'static str,
     pub message: String,
+    /// More about the error, which a dialect may report apart from the
+    /// message, such as the objects that keep it from dropping something.
+    pub detail: Option<String>,
+    /// What the user can do about the error, which a dialect may report
+    /// apart from the message.
+    pub hint: Option<String>,
+}
+
+/// A DROP that was refused because other objects depend on what it drops.
+#[derive(Debug, Clone)]
+pub struct DependentObjects {
+    /// What the statement drops, such as `table t` or `column c of table t`.
+    pub dropped: String,
+    /// One description of each dependent object, such as
+    /// `view v depends on table t`.
+    pub dependents: Vec<String>,
 }
 
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
@@ -117,6 +133,9 @@ pub enum LimboError {
     ParseFloatError(#[from] std::num::ParseFloatError),
     #[error("Parse error: {0}")]
     InvalidDate(String),
+    /// A date or time field is out of range, such as `2024-02-30`.
+    #[error("Parse error: {0}")]
+    DatetimeFieldOverflow(String),
     #[error("Parse error: {0}")]
     InvalidTime(String),
     #[error("Modifier parsing error: {0}")]
@@ -214,6 +233,17 @@ pub enum LimboError {
     /// functions. Boxed, so that it does not make every `LimboError` larger.
     #[error("{}", .0.message)]
     Dialect(Box<DialectError>),
+    #[error("cannot drop {} because other objects depend on it: {}", .0.dropped, .0.dependents.join(", "))]
+    DependentObjects(Box<DependentObjects>),
+}
+
+impl LimboError {
+    pub fn dependent_objects(dropped: String, dependents: Vec<String>) -> Self {
+        Self::DependentObjects(Box::new(DependentObjects {
+            dropped,
+            dependents,
+        }))
+    }
 }
 
 /// `?` in functions returning boxed errors (see `InsnResult`) composes

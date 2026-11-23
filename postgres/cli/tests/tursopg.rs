@@ -476,7 +476,7 @@ fn role_without_privileges_can_use_table_valued_functions() {
         b"CREATE ROLE alice;\n\
           SET ROLE alice;\n\
           SELECT count(*) FROM generate_series(1, 3);\n\
-          SELECT count(*) FROM json_each('[1, 2]');\n",
+          SELECT count(*) FROM json_each('{\"a\": 1, \"b\": 2}');\n",
     );
     let output = stdout(&output);
     assert!(!output.contains("Error"), "{output}");
@@ -1846,6 +1846,60 @@ fn debug_wire_pk_violation_response() {
             response.contains(&b'E'),
             "response should contain ErrorResponse ('E') tag byte, got: {:?}",
             &response[..response.len().min(20)]
+        );
+    });
+}
+
+#[test]
+fn wire_error_drop_table_that_views_read() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE dep_t (a INT)");
+        c.query_command_tags("CREATE VIEW dep_v AS SELECT a FROM dep_t");
+        c.query_command_tags("CREATE VIEW dep_w AS SELECT a FROM dep_v");
+        let fields = c.query_error_fields("DROP TABLE dep_t");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("2BP01"),
+            "{fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'M').map(String::as_str),
+            Some("cannot drop table dep_t because other objects depend on it"),
+            "{fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'D').map(String::as_str),
+            Some("view dep_v depends on table dep_t\nview dep_w depends on view dep_v"),
+            "{fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'H').map(String::as_str),
+            Some("Use DROP ... CASCADE to drop the dependent objects too."),
+            "{fields:?}"
+        );
+    });
+}
+
+#[test]
+fn wire_error_drop_column_that_a_view_reads() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE depcol_t (a INT, b INT)");
+        c.query_command_tags("CREATE VIEW depcol_v AS SELECT b FROM depcol_t");
+        let fields = c.query_error_fields("ALTER TABLE depcol_t DROP COLUMN b");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("2BP01"),
+            "{fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'M').map(String::as_str),
+            Some("cannot drop column b of table depcol_t because other objects depend on it"),
+            "{fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'D').map(String::as_str),
+            Some("view depcol_v depends on column b of table depcol_t"),
+            "{fields:?}"
         );
     });
 }

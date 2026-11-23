@@ -5,6 +5,7 @@ use super::plan::{
     NamedWindowDef, Operation, OuterQueryReference, QueryDestination, Search, TableReferences,
     Window,
 };
+use crate::dialect::SortTermMatching;
 use crate::schema::Table;
 use crate::security::policy::Command;
 use crate::stack::trace_stack;
@@ -12,7 +13,8 @@ use crate::sync::Arc;
 use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
-    bind_and_rewrite_expr, expr_vector_size, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+    bind_and_rewrite_expr, expr_contains_function_that_changes_within_statement, expr_vector_size,
+    walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
@@ -30,7 +32,7 @@ use crate::translate::subquery::{
     plan_limit_offset_subqueries, plan_subqueries_from_select_plan, plan_subqueries_from_values,
 };
 use crate::translate::window::plan_windows;
-use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::util::{exprs_are_equivalent, exprs_are_equivalent_as_written, normalize_ident};
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
@@ -47,13 +49,57 @@ pub fn translate_select(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    let plan = prepare_select_plan(
+    translate_select_with_source(
         select,
+        resolver,
+        program,
+        query_destination,
+        connection,
+        false,
+    )
+}
+
+/// [translate_select] for the rows of `INSERT INTO t VALUES (...), (...)`. An
+/// INSERT converts each row to its target column, so a bare VALUES source does
+/// not need one type for the rows of a column, whatever WITH clause it carries.
+pub fn translate_insert_source_select(
+    select: ast::Select,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    query_destination: QueryDestination,
+    connection: &Arc<crate::Connection>,
+) -> Result<usize> {
+    translate_select_with_source(
+        select,
+        resolver,
+        program,
+        query_destination,
+        connection,
+        true,
+    )
+}
+
+#[turso_macros::trace_stack]
+fn translate_select_with_source(
+    select: ast::Select,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    query_destination: QueryDestination,
+    connection: &Arc<crate::Connection>,
+    is_insert_source: bool,
+) -> Result<usize> {
+    let plan = prepare_select_plan_from_arms(
+        select.body.select,
+        select.body.compounds,
+        select.with,
+        select.order_by,
+        select.limit,
         resolver,
         program,
         &[],
         query_destination,
         connection,
+        is_insert_source,
     )?;
     if program.trigger.is_some() {
         if let Some(virtual_table) = plan_first_virtual_table_name(&plan) {
@@ -118,7 +164,7 @@ pub fn emit_select_plan(
     };
 
     program.extend(&opts);
-    emit_program(connection, resolver, program, plan, |_| {})?;
+    emit_program(connection, resolver, program, plan)?;
     Ok(num_result_cols)
 }
 
@@ -184,6 +230,7 @@ pub fn prepare_select_plan(
         outer_query_refs,
         query_destination,
         connection,
+        false,
     )
 }
 
@@ -204,7 +251,9 @@ pub(crate) fn prepare_select_plan_from_arms(
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    is_insert_source: bool,
 ) -> Result<Plan> {
+    let _nested_query = resolver.enter_nested_query()?;
     let mut compound_arms = compound_arms.into_iter().peekable();
     if compound_arms.peek().is_none() {
         return Ok(Plan::Select(Box::new(prepare_one_select_plan(
@@ -217,6 +266,7 @@ pub(crate) fn prepare_select_plan_from_arms(
             outer_query_refs,
             query_destination,
             connection,
+            is_insert_source,
         )?)));
     }
 
@@ -232,6 +282,7 @@ pub(crate) fn prepare_select_plan_from_arms(
         outer_query_refs,
         query_destination.clone(),
         connection,
+        false,
     )?;
 
     let mut left = Vec::with_capacity(compound_arms.size_hint().0);
@@ -251,6 +302,7 @@ pub(crate) fn prepare_select_plan_from_arms(
             outer_query_refs,
             query_destination.clone(),
             connection,
+            false,
         )?;
     }
 
@@ -308,6 +360,7 @@ fn prepare_one_select_plan(
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    is_insert_source: bool,
 ) -> Result<SelectPlan> {
     match select {
         ast::OneSelect::Select {
@@ -414,7 +467,14 @@ fn prepare_one_select_plan(
                 offset: None,
                 contains_constant_false_condition: false,
                 query_destination,
-                distinctness: Distinctness::from_ast(distinctness.as_ref()),
+                distinctness: match &distinctness {
+                    Some(ast::SelectDistinctness::Distinct) => Distinctness::Distinct {
+                        ctx: None,
+                        ordered: false,
+                    },
+                    Some(ast::SelectDistinctness::All | ast::SelectDistinctness::DistinctOn(_))
+                    | None => Distinctness::NonDistinct,
+                },
                 values: vec![],
                 window: None,
                 non_from_clause_subqueries: vec![],
@@ -710,14 +770,19 @@ fn prepare_one_select_plan(
                     "ORDER BY",
                 )?;
 
+                check_sort_name_is_one_output_column(&o.expr, "ORDER BY", &plan, resolver)?;
+                let binding = sort_expr_binding(&o.expr, resolver);
                 bind_and_rewrite_expr(
                     &mut o.expr,
                     Some(&mut plan.table_references),
                     Some(&plan.result_columns),
                     resolver,
-                    BindingBehavior::TryResultColumnsFirst,
+                    binding,
                 )?;
                 key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
+            }
+            if matches!(distinctness, Some(ast::SelectDistinctness::Distinct)) {
+                check_order_by_of_distinct_is_in_select_list(&key, &plan, resolver)?;
             }
             // Remove duplicate ORDER BY expressions, keeping the first occurrence.
             // Duplicates are semantically redundant.
@@ -732,6 +797,13 @@ fn prepare_one_select_plan(
                     i += 1;
                 }
             }
+
+            let distinct_on_expr_count = match distinctness {
+                Some(ast::SelectDistinctness::DistinctOn(distinct_on)) => {
+                    sort_by_distinct_on_exprs(distinct_on, &mut key, &mut plan, resolver)?
+                }
+                _ => 0,
+            };
 
             // SQLite optimizes away ORDER BY clauses after a rowid/INTEGER PRIMARY KEY column
             // when it's FIRST in the ORDER BY, since the table is stored in rowid order.
@@ -763,6 +835,15 @@ fn prepare_one_select_plan(
                 let is_aggregate_query = has_group_by
                     || agg_count_before_order_by > 0
                     || result_columns_contain_aggregate(&plan.result_columns, resolver)?;
+                if !is_aggregate_query {
+                    for (expr, _, _) in key.iter().take(distinct_on_expr_count) {
+                        if first_aggregate_without_over_clause(expr, resolver)?.is_some() {
+                            crate::bail_parse_error!(
+                                "an aggregate in a SELECT DISTINCT ON expression of a query with no other aggregate is not supported"
+                            );
+                        }
+                    }
+                }
                 for (expr, _, _) in key.iter() {
                     let had_agg = resolve_window_and_aggregate_functions(
                         expr,
@@ -813,7 +894,24 @@ fn prepare_one_select_plan(
                 && plan.group_by.as_ref().is_none_or(|gb| gb.exprs.is_empty())
                 && windows.is_empty();
             if is_single_row_aggregate {
+                let keys_are_aggregate_calls = plan
+                    .order_by
+                    .iter()
+                    .take(distinct_on_expr_count)
+                    .all(|(expr, _, _)| aggregate_call_name(expr, resolver).is_some());
+                if !keys_are_aggregate_calls {
+                    crate::bail_parse_error!(
+                        "a SELECT DISTINCT ON expression that computes on an aggregate in a query without GROUP BY is not supported"
+                    );
+                }
                 plan.order_by.clear();
+            }
+            let distinct_on_key_count = distinct_on_expr_count.min(plan.order_by.len());
+            if distinct_on_key_count > 0 {
+                check_distinct_on_can_run_after_the_sort(&plan, distinct_on_key_count, resolver)?;
+                plan.distinctness = Distinctness::DistinctOn {
+                    key_count: distinct_on_key_count,
+                };
             }
 
             if let Some(group_by) = &mut plan.group_by {
@@ -924,6 +1022,24 @@ fn prepare_one_select_plan(
                 connection,
             )?;
 
+            // The values of a column are one result, so they have one type.
+            // An INSERT converts each row to its target column, so its rows may differ in type.
+            if !is_insert_source {
+                let context = crate::translate::expr_context::ExprContext::new(
+                    Some(&table_references),
+                    resolver,
+                );
+                for column in 0..len {
+                    crate::translate::collate::check_comparable_results(
+                        values
+                            .iter()
+                            .filter_map(|row| row.get(column))
+                            .map(|v| v.as_ref()),
+                        &context,
+                    )?;
+                }
+            }
+
             let plan = SelectPlan {
                 join_order: vec![],
                 table_references,
@@ -937,10 +1053,7 @@ fn prepare_one_select_plan(
                 contains_constant_false_condition: false,
                 query_destination,
                 distinctness: Distinctness::NonDistinct,
-                values: values
-                    .into_iter()
-                    .map(|values| values.into_iter().map(|value| *value).collect())
-                    .collect(),
+                values,
                 window: None,
                 non_from_clause_subqueries,
                 input_cardinality_hint: None,
@@ -976,34 +1089,34 @@ fn first_aggregate_without_over_clause<'a>(
 ) -> Result<Option<&'a str>> {
     let mut found = None;
     walk_expr(expr, &mut |e: &'a ast::Expr| -> Result<WalkControl> {
-        let (name, args_count, filter_over) = match e {
-            ast::Expr::FunctionCall {
-                name,
-                args,
-                filter_over,
-                ..
-            } => (name, args.len(), filter_over),
-            ast::Expr::FunctionCallStar { name, filter_over } => (name, 0, filter_over),
-            _ => return Ok(WalkControl::Continue),
-        };
-        if found.is_some() || filter_over.over_clause.is_some() {
-            return Ok(WalkControl::Continue);
-        }
-        let is_aggregate = match crate::function::Func::resolve_function(name.as_str(), args_count)
-        {
-            Ok(Some(crate::function::Func::Agg(_))) => true,
-            _ => resolver
-                .catalog
-                .symbol_table
-                .resolve_function(name.as_str(), args_count)
-                .is_some_and(|f| f.func.is_aggregate()),
-        };
-        if is_aggregate {
-            found = Some(name.as_str());
+        if found.is_none() {
+            found = aggregate_call_name(e, resolver);
         }
         Ok(WalkControl::Continue)
     })?;
     Ok(found)
+}
+
+/// The function name when `expr` itself is an aggregate call without an OVER clause.
+fn aggregate_call_name<'a>(expr: &'a ast::Expr, resolver: &Resolver) -> Option<&'a str> {
+    let (name, args_count, filter_over) = match expr {
+        ast::Expr::FunctionCall {
+            name,
+            args,
+            filter_over,
+            ..
+        } => (name, args.len(), filter_over),
+        ast::Expr::FunctionCallStar { name, filter_over } => (name, 0, filter_over),
+        _ => return None,
+    };
+    if filter_over.over_clause.is_some() {
+        return None;
+    }
+    matches!(
+        resolver.resolve_function(name.as_str(), args_count),
+        Ok(Some(func)) if func.is_aggregate()
+    )
+    .then_some(name.as_str())
 }
 
 /// Validate that all expressions in the plan return the correct number of values;
@@ -1244,6 +1357,192 @@ fn add_vtab_predicates_to_where_clause(
         &mut plan.where_clause,
         resolver,
     )
+}
+
+/// Makes the DISTINCT ON expressions the first ORDER BY terms and returns how many there are.
+///
+/// ORDER BY terms the query wrote keep their place, so they must start with DISTINCT ON
+/// expressions.
+#[allow(clippy::vec_box)]
+fn sort_by_distinct_on_exprs(
+    distinct_on: Vec<Box<ast::Expr>>,
+    order_by: &mut Vec<(Box<ast::Expr>, ast::SortOrder, Option<ast::NullsOrder>)>,
+    plan: &mut SelectPlan,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let mut distinct_exprs: Vec<Box<ast::Expr>> = Vec::with_capacity(distinct_on.len());
+    for mut expr in distinct_on {
+        replace_column_number_with_copy_of_column_expr(
+            &mut expr,
+            &plan.result_columns,
+            "DISTINCT ON",
+        )?;
+        check_sort_name_is_one_output_column(&expr, "DISTINCT ON", plan, resolver)?;
+        let binding = sort_expr_binding(&expr, resolver);
+        bind_and_rewrite_expr(
+            &mut expr,
+            Some(&mut plan.table_references),
+            Some(&plan.result_columns),
+            resolver,
+            binding,
+        )?;
+        if !distinct_exprs
+            .iter()
+            .any(|seen| exprs_are_equivalent_as_written(seen, &expr))
+        {
+            distinct_exprs.push(expr);
+        }
+    }
+
+    let is_distinct_expr = |expr: &ast::Expr| {
+        distinct_exprs
+            .iter()
+            .any(|distinct_expr| exprs_are_equivalent_as_written(distinct_expr, expr))
+    };
+    if !order_by
+        .iter()
+        .take(distinct_exprs.len())
+        .all(|(expr, _, _)| is_distinct_expr(expr))
+    {
+        crate::bail_parse_error!(
+            "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+        );
+    }
+
+    let distinct_expr_count = distinct_exprs.len();
+    for distinct_expr in distinct_exprs {
+        if !order_by
+            .iter()
+            .any(|(expr, _, _)| exprs_are_equivalent_as_written(expr, &distinct_expr))
+        {
+            order_by.push((distinct_expr, ast::SortOrder::Asc, None));
+        }
+    }
+    Ok(distinct_expr_count)
+}
+
+/// DISTINCT ON drops rows after every result column was computed, and in a grouped query its
+/// expressions are computed from the group's row.
+fn check_distinct_on_can_run_after_the_sort(
+    plan: &SelectPlan,
+    key_count: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    for result_column in plan.result_columns.iter() {
+        if expr_contains_function_that_changes_within_statement(&result_column.expr, resolver)? {
+            crate::bail_parse_error!(
+                "SELECT DISTINCT ON with a volatile function in the select list is not supported"
+            );
+        }
+    }
+    let group_exprs: &[ast::Expr] = match &plan.group_by {
+        Some(group_by) => &group_by.exprs,
+        None if plan.aggregates.is_empty() => return Ok(()),
+        None => &[],
+    };
+    for (expr, _, _) in plan.order_by.iter().take(key_count) {
+        if !expr_reads_only_grouped_values(expr, group_exprs, resolver)? {
+            crate::bail_parse_error!(
+                "a DISTINCT ON expression that is neither a GROUP BY expression nor an aggregate is not supported"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn expr_reads_only_grouped_values(
+    expr: &ast::Expr,
+    group_exprs: &[ast::Expr],
+    resolver: &Resolver,
+) -> Result<bool> {
+    let mut only_grouped = true;
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if group_exprs
+            .iter()
+            .any(|group_expr| exprs_are_equivalent(group_expr, e))
+            || aggregate_call_name(e, resolver).is_some()
+        {
+            return Ok(WalkControl::SkipChildren);
+        }
+        if matches!(
+            e,
+            ast::Expr::Column { .. }
+                | ast::Expr::RowId { .. }
+                | ast::Expr::Subquery(_)
+                | ast::Expr::SubqueryResult { .. }
+                | ast::Expr::Exists(_)
+                | ast::Expr::InSelect { .. }
+        ) {
+            only_grouped = false;
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(only_grouped)
+}
+
+#[allow(clippy::vec_box)]
+fn check_order_by_of_distinct_is_in_select_list(
+    order_by: &[(Box<ast::Expr>, ast::SortOrder, Option<ast::NullsOrder>)],
+    plan: &SelectPlan,
+    resolver: &Resolver,
+) -> Result<()> {
+    if resolver.catalog.dialect.sort_term_matching() == SortTermMatching::Sqlite {
+        return Ok(());
+    }
+    let is_in_select_list = |expr: &ast::Expr| {
+        plan.result_columns
+            .iter()
+            .any(|column| exprs_are_equivalent_as_written(&column.expr, expr))
+    };
+    if !order_by.iter().all(|(expr, _, _)| is_in_select_list(expr)) {
+        crate::bail_parse_error!(
+            "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+        );
+    }
+    Ok(())
+}
+
+fn check_sort_name_is_one_output_column(
+    expr: &ast::Expr,
+    clause: &str,
+    plan: &SelectPlan,
+    resolver: &Resolver,
+) -> Result<()> {
+    if resolver.catalog.dialect.sort_term_matching() == SortTermMatching::Sqlite {
+        return Ok(());
+    }
+    let Some(name) = bare_name(expr) else {
+        return Ok(());
+    };
+    let name = normalize_ident(name.as_str());
+    let mut columns_with_name = plan
+        .result_columns
+        .iter()
+        .filter(|column| column.name(&plan.table_references) == Some(name.as_str()));
+    if let Some(first) = columns_with_name.next() {
+        if columns_with_name.any(|other| !exprs_are_equivalent(&first.expr, &other.expr)) {
+            crate::bail_parse_error!("{clause} \"{name}\" is ambiguous");
+        }
+    }
+    Ok(())
+}
+
+fn sort_expr_binding(expr: &ast::Expr, resolver: &Resolver) -> BindingBehavior {
+    if bare_name(expr).is_some()
+        || resolver.catalog.dialect.sort_term_matching() == SortTermMatching::Sqlite
+    {
+        BindingBehavior::TryResultColumnsFirst
+    } else {
+        BindingBehavior::ResultColumnsNotAllowed
+    }
+}
+
+fn bare_name(expr: &ast::Expr) -> Option<&ast::Name> {
+    match expr {
+        ast::Expr::Id(name) => Some(name),
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => bare_name(&exprs[0]),
+        _ => None,
+    }
 }
 
 /// Replaces a column number in an ORDER BY or GROUP BY expression with a copy of the column expression.

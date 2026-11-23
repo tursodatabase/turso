@@ -20,10 +20,9 @@ use crate::security::roles::RoleId;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::plan::{NonFromClauseSubquery, SubqueryState};
-use crate::translate::row_security::translate_change;
-use crate::translate::schema::emit_schema_cookie;
+use crate::translate::row_security::translate_access_statement;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::{bail_parse_error, CatalogChange, LimboError, Result, MAIN_DB_ID};
+use crate::{bail_parse_error, AccessStatement, LimboError, RelationName, Result, MAIN_DB_ID};
 
 const MAIN_SCHEMA_NAME: &str = "main";
 
@@ -229,6 +228,15 @@ pub fn check_statement_privileges(
         }
         ast::Stmt::CreateRole { role_name, .. } => {
             PermissionDenied::privilege(Action::Create, Object::Role(role_name.clone()))
+        }
+        // As in PostgreSQL, a role that may not drop roles is told so before
+        // the roles are looked up.
+        ast::Stmt::DropRole { roles, .. } => {
+            let name = match roles.first() {
+                Some(ast::Grantee::Role(role)) => role_spec_name(role),
+                Some(ast::Grantee::Public) | None => "public".to_string(),
+            };
+            PermissionDenied::privilege(Action::Drop, Object::Role(name))
         }
         ast::Stmt::Pragma {
             name,
@@ -587,15 +595,15 @@ pub fn translate_grant(
             relations,
         } => (privileges, on_sequences, relations),
         ast::GrantObjects::Roles(roles) => {
-            let change = CatalogChange::GrantRole {
+            let statement = AccessStatement::GrantRole {
                 revoke: grant.revoke,
-                roles: roles.clone(),
-                grantees: grant.grantees.clone(),
+                roles,
+                grantees: &grant.grantees,
             };
-            return translate_change(change, resolver, program, connection);
+            return translate_access_statement(&statement, resolver, program, connection);
         }
     };
-    let mut changes = Vec::with_capacity(relations.len());
+    let mut main_database_relations = Vec::with_capacity(relations.len());
     for qualified_name in relations {
         let normalized_name = crate::util::normalize_ident(qualified_name.name.as_str());
         // A schema that does not exist is reported as such, not as a
@@ -622,24 +630,18 @@ pub fn translate_grant(
         if namespace.database_id != MAIN_DB_ID {
             continue;
         }
-        changes.push(crate::CatalogChange::Grant {
-            revoke: grant.revoke,
+        main_database_relations.push(RelationName {
             namespace: namespace.id,
             name: normalized_name,
-            privileges: privileges.clone(),
-            grantees: grant.grantees.clone(),
         });
     }
-    let schema_cookie = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
-    program.begin_write_on_database(MAIN_DB_ID, schema_cookie)?;
-    resolver.catalog.dialect.translate_catalog_changes(
-        program,
-        resolver.schema(),
-        connection,
-        &changes,
-    )?;
-    emit_schema_cookie(resolver, program);
-    Ok(())
+    let statement = AccessStatement::Grant {
+        revoke: grant.revoke,
+        relations: &main_database_relations,
+        privileges,
+        grantees: &grant.grantees,
+    };
+    translate_access_statement(&statement, resolver, program, connection)
 }
 
 /// `CREATE ROLE`: the dialect stores the role, through the same hook as its
@@ -651,9 +653,25 @@ pub fn translate_create_role(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let change = CatalogChange::CreateRole {
-        name: role_name,
-        options,
+    let statement = AccessStatement::CreateRole {
+        name: &role_name,
+        options: &options,
     };
-    translate_change(change, resolver, program, connection)
+    translate_access_statement(&statement, resolver, program, connection)
+}
+
+/// `DROP ROLE`: the dialect deletes the roles, through the same hook as its
+/// other catalog changes.
+pub fn translate_drop_role(
+    if_exists: bool,
+    roles: Vec<ast::Grantee>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let statement = AccessStatement::DropRole {
+        if_exists,
+        roles: &roles,
+    };
+    translate_access_statement(&statement, resolver, program, connection)
 }

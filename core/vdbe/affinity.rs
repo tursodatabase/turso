@@ -184,25 +184,45 @@ impl Affinity {
     /// Note that the order of the rules for determining column affinity is important. A column whose declared type is "CHARINT" will match both rules 1 and 2 but the first rule takes precedence and so the column affinity will be INTEGER.
     #[expect(clippy::self_named_constructors)]
     pub fn affinity(datatype: &str) -> Self {
-        let datatype = datatype.to_ascii_uppercase();
+        const INT: u32 = u32::from_be_bytes([0, b'I', b'N', b'T']);
+        const CHAR: u32 = u32::from_be_bytes(*b"CHAR");
+        const CLOB: u32 = u32::from_be_bytes(*b"CLOB");
+        const TEXT: u32 = u32::from_be_bytes(*b"TEXT");
+        const BLOB: u32 = u32::from_be_bytes(*b"BLOB");
+        const REAL: u32 = u32::from_be_bytes(*b"REAL");
+        const FLOA: u32 = u32::from_be_bytes(*b"FLOA");
+        const DOUB: u32 = u32::from_be_bytes(*b"DOUB");
 
-        // Rule 1: INT -> INTEGER affinity
-        if datatype.contains("INT") {
-            return Affinity::Integer;
+        // One pass finds all the keywords of the rules, as SQLite does: `window`
+        // holds the last four bytes in upper case.
+        let mut window: u32 = 0;
+        let (mut has_text_keyword, mut has_blob, mut has_real_keyword) = (false, false, false);
+        for &byte in datatype.as_bytes() {
+            window = (window << 8) | u32::from(byte.to_ascii_uppercase());
+            // Rule 1: INT -> INTEGER affinity
+            if window & 0x00FF_FFFF == INT {
+                return Affinity::Integer;
+            }
+            match window {
+                CHAR | CLOB | TEXT => has_text_keyword = true,
+                BLOB => has_blob = true,
+                REAL | FLOA | DOUB => has_real_keyword = true,
+                _ => {}
+            }
         }
 
         // Rule 2: CHAR/CLOB/TEXT -> TEXT affinity
-        if datatype.contains("CHAR") || datatype.contains("CLOB") || datatype.contains("TEXT") {
+        if has_text_keyword {
             return Affinity::Text;
         }
 
         // Rule 3: BLOB or empty -> BLOB affinity (historically called NONE)
-        if datatype.contains("BLOB") || datatype.is_empty() {
+        if has_blob || datatype.is_empty() {
             return Affinity::Blob;
         }
 
         // Rule 4: REAL/FLOA/DOUB -> REAL affinity
-        if datatype.contains("REAL") || datatype.contains("FLOA") || datatype.contains("DOUB") {
+        if has_real_keyword {
             return Affinity::Real;
         }
 
@@ -724,6 +744,88 @@ fn stringify_register(val: ValueRef) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affinity_matches_upper_case_search() {
+        fn old_affinity(datatype: &str) -> Affinity {
+            let datatype = datatype.to_ascii_uppercase();
+            if datatype.contains("INT") {
+                Affinity::Integer
+            } else if datatype.contains("CHAR")
+                || datatype.contains("CLOB")
+                || datatype.contains("TEXT")
+            {
+                Affinity::Text
+            } else if datatype.contains("BLOB") || datatype.is_empty() {
+                Affinity::Blob
+            } else if datatype.contains("REAL")
+                || datatype.contains("FLOA")
+                || datatype.contains("DOUB")
+            {
+                Affinity::Real
+            } else {
+                Affinity::Numeric
+            }
+        }
+        for datatype in [
+            "",
+            "INT",
+            "int",
+            "Integer",
+            "BIGINT",
+            "VARCHAR(10)",
+            "nvarchar",
+            "clob",
+            "Text",
+            "blob",
+            "BLOB",
+            "real",
+            "Float",
+            "double precision",
+            "DOUB",
+            "numeric",
+            "DECIMAL(10,5)",
+            "boolean",
+            "date",
+            "in",
+            "i",
+            "chr",
+            "\u{130}nt",
+            "\u{131}NT",
+            "\u{e9}text",
+            "x\u{1f600}int",
+            "POINT",
+            "TINYBLOB",
+            "CHARINT",
+            "flo",
+            "FLOA",
+            "ReAlLy",
+            "  int  ",
+        ] {
+            assert_eq!(
+                Affinity::affinity(datatype),
+                old_affinity(datatype),
+                "{datatype:?}"
+            );
+        }
+        // Short names made of the letters of the keywords, in all their combinations.
+        let letters: Vec<char> = "INTCHARLOBEXFDU iz\u{e9}".chars().collect();
+        let mut state: u64 = 1;
+        for _ in 0..100_000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let len = (state >> 60) as usize % 9;
+            let datatype: String = (0..len)
+                .map(|i| letters[(state >> (i * 6)) as usize % letters.len()])
+                .collect();
+            assert_eq!(
+                Affinity::affinity(&datatype),
+                old_affinity(&datatype),
+                "{datatype:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_apply_numeric_affinity_partial_numbers() {

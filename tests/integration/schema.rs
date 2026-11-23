@@ -1,6 +1,7 @@
 use rustc_hash::FxHashMap as HashMap;
 use turso_core::alloc::vec;
 use turso_core::alloc::*;
+use turso_core::dialect::Dialect;
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::*;
 use turso_core::sync::Arc;
@@ -16,7 +17,7 @@ use turso_sqlite::SqliteDialect;
 
 #[test]
 fn a_new_schema_has_only_the_root_namespace_with_the_schema_table() {
-    let schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     let ids: std::vec::Vec<NamespaceId> = schema.namespace_ids().collect();
     assert_eq!(ids, vec![NamespaceId::ROOT]);
     assert!(schema
@@ -48,7 +49,7 @@ fn test_column_definition_matches_create_table() -> Result<()> {
         "CREATE TABLE t(a TEXT, b aNy AS (a)) STRICT",
     ] {
         let Some(Cmd::Stmt(Stmt::CreateTable { body, .. })) =
-            turso_core::dialect::engine::parse_statement(sql)?
+            turso_core::dialect::parse_statement(&SqliteDialect, sql)?
         else {
             panic!("expected CREATE TABLE: {sql}");
         };
@@ -108,7 +109,7 @@ fn test_column_definition_matches_create_table() -> Result<()> {
 
 #[test]
 fn test_schema_loading_accepts_generated_columns() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
 
     schema
         .handle_schema_row(
@@ -134,7 +135,7 @@ fn test_schema_loading_accepts_generated_columns() {
 
 #[test]
 fn test_schema_row_vtab_with_nonzero_root_page_is_corrupt() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
 
     let result = schema.handle_schema_row(
         "table",
@@ -159,7 +160,7 @@ fn test_schema_row_vtab_with_nonzero_root_page_is_corrupt() {
 
 #[test]
 fn test_schema_row_with_zero_root_page_takes_virtual_table_path() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
 
     // Root page 0 must route to virtual-table handling; with no such
     // module registered, that path fails module resolution instead of
@@ -185,7 +186,7 @@ fn test_schema_row_with_zero_root_page_takes_virtual_table_path() {
 
 #[test]
 fn test_schema_row_with_zero_root_page_rejects_malformed_sql() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
 
     let result = schema.handle_schema_row(
         "table",
@@ -208,7 +209,7 @@ fn test_schema_row_with_zero_root_page_rejects_malformed_sql() {
 
 #[test]
 fn test_schema_row_table_with_virtual_table_substring_is_btree() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
 
     // A regular table whose SQL merely contains virtual-table syntax
     // (e.g. in a DEFAULT literal) must classify as a B-tree table.
@@ -235,7 +236,7 @@ fn test_schema_row_table_with_virtual_table_substring_is_btree() {
 
 #[test]
 fn test_named_unique_constraint_propagates_through_schema() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     let table_sql =
         r#"CREATE TABLE t_u (id INT PRIMARY KEY, code TEXT CONSTRAINT t_u_code_uq UNIQUE)"#;
 
@@ -267,7 +268,13 @@ fn test_named_unique_constraint_propagates_through_schema() {
     );
 
     schema
-        .populate_indices(&SymbolTable::default(), vec![], automatic_indices, false)
+        .populate_indices(
+            &SqliteDialect,
+            &SymbolTable::default(),
+            vec![],
+            automatic_indices,
+            false,
+        )
         .unwrap();
 
     let indexes: std::vec::Vec<_> = schema.get_indices(NamespaceId::ROOT, "t_u").collect();
@@ -283,12 +290,15 @@ fn test_named_unique_constraint_propagates_through_schema() {
 }
 
 fn table(sql: &str, root_page: i64) -> Arc<BTreeTable> {
-    Arc::new(turso_core::schema::BTreeTable::from_sql(sql, root_page).unwrap())
+    Arc::new(
+        turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, root_page, false)
+            .unwrap(),
+    )
 }
 
 #[test]
 fn a_namespace_holds_only_its_own_objects() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     let other = NamespaceId::new(1);
     schema.add_namespace(other, "other");
     schema
@@ -315,7 +325,7 @@ fn a_namespace_holds_only_its_own_objects() {
 
 #[test]
 fn removing_a_namespace_removes_its_objects() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     let other = NamespaceId::new(7);
     schema.add_namespace(other, "other");
     schema
@@ -331,7 +341,7 @@ fn removing_a_namespace_removes_its_objects() {
 
 #[test]
 fn a_cloned_schema_keeps_every_namespace() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     let other = NamespaceId::new(2);
     schema.add_namespace(other, "other");
     schema
@@ -343,7 +353,7 @@ fn a_cloned_schema_keeps_every_namespace() {
 
 #[test]
 fn a_foreign_key_finds_its_parent_in_the_parent_namespace() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     let other = NamespaceId::new(1);
     schema.add_namespace(other, "other");
     schema
@@ -380,7 +390,7 @@ fn a_foreign_key_finds_its_parent_in_the_parent_namespace() {
 
 #[test]
 fn schema_wide_scans_see_every_namespace() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     let other = NamespaceId::new(1);
     schema.add_namespace(other, "other");
     schema
@@ -392,6 +402,7 @@ fn schema_wide_scans_see_every_namespace() {
             other,
             Arc::new(
                 Index::from_sql(
+                    &SqliteDialect,
                     &SymbolTable::new(),
                     "CREATE INDEX i ON t (x)",
                     4,
@@ -416,7 +427,7 @@ fn schema_wide_scans_see_every_namespace() {
 
 #[test]
 fn tables_of_the_same_name_in_two_namespaces_keep_their_own_statistics() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     let other = NamespaceId::new(1);
     schema.add_namespace(other, "other");
     schema
@@ -448,7 +459,7 @@ fn tables_of_the_same_name_in_two_namespaces_keep_their_own_statistics() {
 #[test]
 pub fn test_has_rowid_true() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     assert!(table.has_rowid, "has_rowid should be set to true");
     Ok(())
 }
@@ -456,7 +467,7 @@ pub fn test_has_rowid_true() -> Result<()> {
 #[test]
 pub fn test_has_rowid_false() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     assert!(!table.has_rowid, "has_rowid should be set to false");
     Ok(())
 }
@@ -464,7 +475,7 @@ pub fn test_has_rowid_false() -> Result<()> {
 #[test]
 pub fn test_column_default_collation_is_effective_binary() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a TEXT);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let column = table.get_column("a").unwrap().1;
     assert_eq!(column.collation(), CollationSeq::BINARY);
     assert_eq!(column.text_collation(), None);
@@ -474,7 +485,7 @@ pub fn test_column_default_collation_is_effective_binary() -> Result<()> {
 #[test]
 pub fn test_column_is_rowid_alias_single_text() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a TEXT PRIMARY KEY, b TEXT);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let column = table.get_column("a").unwrap().1;
     assert!(
         !column.is_rowid_alias(),
@@ -486,7 +497,7 @@ pub fn test_column_is_rowid_alias_single_text() -> Result<()> {
 #[test]
 pub fn test_column_is_rowid_alias_single_integer() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let column = table.get_column("a").unwrap().1;
     assert!(
         column.is_rowid_alias(),
@@ -498,7 +509,7 @@ pub fn test_column_is_rowid_alias_single_integer() -> Result<()> {
 #[test]
 pub fn test_column_is_rowid_alias_single_integer_separate_primary_key_definition() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a));"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let column = table.get_column("a").unwrap().1;
     assert!(
         column.is_rowid_alias(),
@@ -511,7 +522,7 @@ pub fn test_column_is_rowid_alias_single_integer_separate_primary_key_definition
 pub fn test_column_is_rowid_alias_single_integer_separate_primary_key_definition_without_rowid(
 ) -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a)) WITHOUT ROWID;"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let column = table.get_column("a").unwrap().1;
     assert!(
         !column.is_rowid_alias(),
@@ -523,7 +534,7 @@ pub fn test_column_is_rowid_alias_single_integer_separate_primary_key_definition
 #[test]
 pub fn test_column_is_rowid_alias_single_integer_without_rowid() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let column = table.get_column("a").unwrap().1;
     assert!(
         !column.is_rowid_alias(),
@@ -535,7 +546,7 @@ pub fn test_column_is_rowid_alias_single_integer_without_rowid() -> Result<()> {
 #[test]
 pub fn test_multiple_pk_forbidden() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT PRIMARY KEY);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0);
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false);
     let error = table.unwrap_err();
     assert!(
         matches!(error, LimboError::ParseError(e) if e.contains("table \"t1\" has more than one primary key"))
@@ -546,7 +557,7 @@ pub fn test_multiple_pk_forbidden() -> Result<()> {
 #[test]
 pub fn test_column_is_rowid_alias_separate_composite_primary_key_definition() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a, b));"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let column = table.get_column("a").unwrap().1;
     assert!(
         !column.is_rowid_alias(),
@@ -558,7 +569,7 @@ pub fn test_column_is_rowid_alias_separate_composite_primary_key_definition() ->
 #[test]
 pub fn test_primary_key_inline_single() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT, c REAL);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let column = table.get_column("a").unwrap().1;
     assert!(column.primary_key(), "column 'a' should be a primary key");
     let column = table.get_column("b").unwrap().1;
@@ -582,7 +593,7 @@ pub fn test_primary_key_inline_single() -> Result<()> {
 #[test]
 pub fn test_primary_key_inline_multiple_forbidden() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT PRIMARY KEY, c REAL);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0);
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false);
     let error = table.unwrap_err();
     assert!(
         matches!(error, LimboError::ParseError(e) if e.contains("table \"t1\" has more than one primary key"))
@@ -593,7 +604,7 @@ pub fn test_primary_key_inline_multiple_forbidden() -> Result<()> {
 #[test]
 pub fn test_conflicting_on_conflict_unique_rejected() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a) ON CONFLICT IGNORE);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0);
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false);
     let error = table.unwrap_err();
     assert!(
         matches!(error, LimboError::ParseError(e) if e.contains("conflicting ON CONFLICT clauses"))
@@ -604,7 +615,7 @@ pub fn test_conflicting_on_conflict_unique_rejected() -> Result<()> {
 #[test]
 pub fn test_conflicting_on_conflict_composite_unique_rejected() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a, b, UNIQUE(a, b) ON CONFLICT FAIL, UNIQUE(a, b) ON CONFLICT IGNORE);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0);
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false);
     let error = table.unwrap_err();
     assert!(
         matches!(error, LimboError::ParseError(e) if e.contains("conflicting ON CONFLICT clauses"))
@@ -615,21 +626,21 @@ pub fn test_conflicting_on_conflict_composite_unique_rejected() -> Result<()> {
 #[test]
 pub fn test_same_on_conflict_unique_allowed() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a) ON CONFLICT FAIL);"#;
-    assert!(turso_core::schema::BTreeTable::from_sql(sql, 0).is_ok());
+    assert!(turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false).is_ok());
     Ok(())
 }
 
 #[test]
 pub fn test_one_on_conflict_unique_allowed() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a UNIQUE ON CONFLICT FAIL, b, UNIQUE(a));"#;
-    assert!(turso_core::schema::BTreeTable::from_sql(sql, 0).is_ok());
+    assert!(turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false).is_ok());
     Ok(())
 }
 
 #[test]
 pub fn test_primary_key_separate_single() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY(a desc));"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let column = table.get_column("a").unwrap().1;
     assert!(column.primary_key(), "column 'a' should be a primary key");
     let column = table.get_column("b").unwrap().1;
@@ -653,7 +664,7 @@ pub fn test_primary_key_separate_single() -> Result<()> {
 #[test]
 pub fn test_primary_key_separate_multiple() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY(a, b desc));"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let column = table.get_column("a").unwrap().1;
     assert!(column.primary_key(), "column 'a' should be a primary key");
     let column = table.get_column("b").unwrap().1;
@@ -677,7 +688,7 @@ pub fn test_primary_key_separate_multiple() -> Result<()> {
 #[test]
 pub fn test_primary_key_separate_single_quoted() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY('a'));"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let column = table.get_column("a").unwrap().1;
     assert!(column.primary_key(), "column 'a' should be a primary key");
     let column = table.get_column("b").unwrap().1;
@@ -701,7 +712,7 @@ pub fn test_primary_key_separate_single_quoted() -> Result<()> {
 #[test]
 pub fn test_primary_key_separate_single_doubly_quoted() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY("a"));"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let column = table.get_column("a").unwrap().1;
     assert!(column.primary_key(), "column 'a' should be a primary key");
     let column = table.get_column("b").unwrap().1;
@@ -725,7 +736,7 @@ pub fn test_primary_key_separate_single_doubly_quoted() -> Result<()> {
 #[test]
 pub fn test_default_value() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER DEFAULT 23);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let column = table.get_column("a").unwrap().1;
     let default = column.default.clone().unwrap();
     assert_eq!(default.to_string(), "23");
@@ -735,7 +746,7 @@ pub fn test_default_value() -> Result<()> {
 #[test]
 pub fn test_col_notnull() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER NOT NULL);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let column = table.get_column("a").unwrap().1;
     assert!(column.notnull());
     Ok(())
@@ -747,21 +758,26 @@ fn rowid_alias_is_not_nullable() {
         "CREATE TABLE t(id INTEGER PRIMARY KEY)",
         "CREATE TABLE t(id INTEGER, PRIMARY KEY(id))",
     ] {
-        let table = turso_core::schema::BTreeTable::from_sql(sql, 2).unwrap();
+        let table =
+            turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 2, false).unwrap();
         let column = table.get_column("id").unwrap().1;
         assert!(column.notnull(), "{sql}");
         assert!(!column.explicit_notnull(), "{sql}");
     }
-    let table =
-        turso_core::schema::BTreeTable::from_sql("CREATE TABLE t(id INTEGER PRIMARY KEY DESC)", 2)
-            .unwrap();
+    let table = turso_core::schema::BTreeTable::from_stored_sql(
+        &SqliteDialect,
+        "CREATE TABLE t(id INTEGER PRIMARY KEY DESC)",
+        2,
+        false,
+    )
+    .unwrap();
     assert!(!table.get_column("id").unwrap().1.notnull());
 }
 
 #[test]
 pub fn test_col_notnull_negative() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let column = table.get_column("a").unwrap().1;
     assert!(!column.notnull());
     Ok(())
@@ -770,7 +786,7 @@ pub fn test_col_notnull_negative() -> Result<()> {
 #[test]
 pub fn test_col_type_string_integer() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a InTeGeR);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let column = table.get_column("a").unwrap().1;
     assert_eq!(column.ty_str, "InTeGeR");
     Ok(())
@@ -788,13 +804,15 @@ fn check_constraint_comments_survive_table_reconstruction() -> Result<()> {
             "-- line comment",
         ),
     ] {
-        let reconstructed = turso_core::schema::BTreeTable::from_sql(sql, 0)?.to_sql();
+        let reconstructed =
+            turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?
+                .to_sql();
 
         assert!(
             reconstructed.contains(comment),
             "reconstructed SQL: {reconstructed}"
         );
-        turso_core::schema::BTreeTable::from_sql(&reconstructed, 0)?;
+        turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, &reconstructed, 0, false)?;
     }
 
     Ok(())
@@ -812,7 +830,9 @@ pub fn test_special_column_names() -> Result<()> {
 
     for (input_column_name, expected_sql) in tests {
         let sql = format!(r#"CREATE TABLE t ("{input_column_name}" TEXT)"#);
-        let actual = turso_core::schema::BTreeTable::from_sql(&sql, 0)?.to_sql();
+        let actual =
+            turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, &sql, 0, false)?
+                .to_sql();
         assert_eq!(expected_sql, actual);
     }
 
@@ -837,7 +857,9 @@ fn test_special_table_names_are_quoted_in_to_sql() -> Result<()> {
     ];
 
     for (input_sql, expected_sql) in tests {
-        let actual = turso_core::schema::BTreeTable::from_sql(input_sql, 0)?.to_sql();
+        let actual =
+            turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, input_sql, 0, false)?
+                .to_sql();
         assert_eq!(actual, expected_sql);
     }
 
@@ -849,7 +871,8 @@ fn test_special_table_names_are_quoted_in_to_sql() -> Result<()> {
 fn test_automatic_index_single_column() {
     // Without composite primary keys, we should not have an automatic index on a primary key that is a rowid alias
     let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0).unwrap();
+    let table =
+        turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false).unwrap();
     let _index = Index::automatic_from_primary_key(
         &table,
         ("sqlite_autoindex_t1_1".to_string(), 2),
@@ -864,7 +887,7 @@ fn test_automatic_index_single_column() {
 #[test]
 fn test_automatic_index_composite_key() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a, b));"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let index = Index::automatic_from_primary_key(
         &table,
         ("sqlite_autoindex_t1_1".to_string(), 2),
@@ -890,7 +913,8 @@ fn test_automatic_index_composite_key() -> Result<()> {
 #[should_panic]
 fn test_automatic_index_no_primary_key() {
     let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0).unwrap();
+    let table =
+        turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false).unwrap();
     Index::automatic_from_primary_key(
         &table,
         ("sqlite_autoindex_t1_1".to_string(), 2),
@@ -905,7 +929,7 @@ fn test_automatic_index_no_primary_key() {
 #[test]
 fn test_automatic_index_unique_column() -> Result<()> {
     let sql = r#"CREATE table t1 (x INTEGER, y INTEGER UNIQUE);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let index = Index::automatic_from_unique(
         &table,
         ("sqlite_autoindex_t1_1".to_string(), 2),
@@ -928,7 +952,7 @@ fn test_automatic_index_unique_column() -> Result<()> {
 #[test]
 fn test_automatic_index_pkey_unique_column() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (x PRIMARY KEY, y UNIQUE);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let indices = [
         Index::automatic_from_primary_key(
             &table,
@@ -970,7 +994,7 @@ fn test_automatic_index_pkey_unique_column() -> Result<()> {
 #[test]
 fn test_automatic_index_pkey_many_unique_columns() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a PRIMARY KEY, b UNIQUE, c, d, UNIQUE(c, d));"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let auto_indices = [
         ("sqlite_autoindex_t1_1".to_string(), 2),
         ("sqlite_autoindex_t1_2".to_string(), 3),
@@ -1033,7 +1057,7 @@ fn test_automatic_index_pkey_many_unique_columns() -> Result<()> {
 #[test]
 fn test_automatic_index_unique_set_dedup() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a, b, UNIQUE(a, b), UNIQUE(a, b));"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let index = Index::automatic_from_unique(
         &table,
         ("sqlite_autoindex_t1_1".to_string(), 2),
@@ -1059,7 +1083,7 @@ fn test_automatic_index_unique_set_dedup() -> Result<()> {
 #[test]
 fn test_automatic_index_primary_key_is_unique() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a primary key unique);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let index = Index::automatic_from_primary_key(
         &table,
         ("sqlite_autoindex_t1_1".to_string(), 2),
@@ -1083,7 +1107,7 @@ fn test_automatic_index_primary_key_is_unique() -> Result<()> {
 #[test]
 fn test_automatic_index_primary_key_is_unique_and_composite() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a, b, PRIMARY KEY(a, b), UNIQUE(a, b));"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let index = Index::automatic_from_primary_key(
         &table,
         ("sqlite_autoindex_t1_1".to_string(), 2),
@@ -1108,7 +1132,7 @@ fn test_automatic_index_primary_key_is_unique_and_composite() -> Result<()> {
 #[test]
 fn test_strict_table_to_sql() -> Result<()> {
     let sql = r#"CREATE TABLE test_strict (id INTEGER, name TEXT) STRICT"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
 
     // Verify the table is marked as strict
     assert!(table.is_strict);
@@ -1130,7 +1154,7 @@ fn test_strict_table_to_sql() -> Result<()> {
 #[test]
 fn test_non_strict_table_to_sql() -> Result<()> {
     let sql = r#"CREATE TABLE test_normal (id INTEGER, name TEXT)"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
 
     // Verify the table is NOT marked as strict
     assert!(!table.is_strict);
@@ -1152,7 +1176,7 @@ fn test_non_strict_table_to_sql() -> Result<()> {
 #[test]
 fn test_autoincrement_preserved_in_to_sql() -> Result<()> {
     let sql = r#"CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, doomed INT, v TEXT)"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
 
     assert!(table.has_autoincrement);
     assert_eq!(
@@ -1166,7 +1190,7 @@ fn test_autoincrement_preserved_in_to_sql() -> Result<()> {
 #[test]
 fn test_without_rowid_preserved_in_sql() -> Result<()> {
     let sql = r#"CREATE TABLE t(code TEXT PRIMARY KEY, val TEXT) WITHOUT ROWID"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     assert!(table.get_column("code").unwrap().1.notnull());
     assert_eq!(
         table.to_sql(),
@@ -1178,7 +1202,7 @@ fn test_without_rowid_preserved_in_sql() -> Result<()> {
 #[test]
 fn test_strict_without_rowid_preserved_in_sql() -> Result<()> {
     let sql = r#"CREATE TABLE t(code TEXT PRIMARY KEY, val TEXT) STRICT, WITHOUT ROWID"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     assert!(table.get_column("code").unwrap().1.notnull());
     assert_eq!(
         table.to_sql(),
@@ -1190,7 +1214,7 @@ fn test_strict_without_rowid_preserved_in_sql() -> Result<()> {
 #[test]
 fn test_automatic_index_unique_and_a_pk() -> Result<()> {
     let sql = r#"CREATE TABLE t1 (a NUMERIC UNIQUE UNIQUE,  b TEXT PRIMARY KEY)"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0)?;
+    let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false)?;
     let mut indexes = vec![
         Index::automatic_from_unique(
             &table,
@@ -1235,9 +1259,11 @@ fn test_automatic_index_unique_and_a_pk() -> Result<()> {
 #[test]
 fn gencol_graph_cycle_rejected() {
     // Two-cycle: a := b, b := a. Must be rejected at CREATE TABLE time by Kahn's.
-    let err = turso_core::schema::BTreeTable::from_sql(
+    let err = turso_core::schema::BTreeTable::from_stored_sql(
+        &SqliteDialect,
         "CREATE TABLE t(stored, a AS (b) VIRTUAL, b AS (a) VIRTUAL)",
         0,
+        false,
     )
     .expect_err("cycle must be rejected");
     assert!(
@@ -1250,9 +1276,11 @@ fn gencol_graph_cycle_rejected() {
 #[test]
 fn gencol_graph_three_cycle_rejected() {
     // Three-cycle: a := b, b := c, c := a.
-    let err = turso_core::schema::BTreeTable::from_sql(
+    let err = turso_core::schema::BTreeTable::from_stored_sql(
+        &SqliteDialect,
         "CREATE TABLE t(stored, a AS (b) VIRTUAL, b AS (c) VIRTUAL, c AS (a) VIRTUAL)",
         0,
+        false,
     )
     .expect_err("cycle must be rejected");
     assert!(err.to_string().contains("circular dependency"));
@@ -1260,15 +1288,21 @@ fn gencol_graph_three_cycle_rejected() {
 
 #[test]
 fn gencol_graph_self_reference_rejected() {
-    let err = turso_core::schema::BTreeTable::from_sql("CREATE TABLE t(a, b AS (b) VIRTUAL)", 0)
-        .expect_err("self-reference must be rejected");
+    let err = turso_core::schema::BTreeTable::from_stored_sql(
+        &SqliteDialect,
+        "CREATE TABLE t(a, b AS (b) VIRTUAL)",
+        0,
+        false,
+    )
+    .expect_err("self-reference must be rejected");
     assert!(err.to_string().contains("cannot reference itself"));
 }
 
 #[test]
 fn test_named_unique_constraint_stores_constraint_name() {
     let sql = r#"CREATE TABLE t_u (id INT, code TEXT CONSTRAINT "T_U Code UQ" UNIQUE);"#;
-    let table = turso_core::schema::BTreeTable::from_sql(sql, 0).unwrap();
+    let table =
+        turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, 0, false).unwrap();
     let unique_set = table
         .unique_sets
         .iter()
@@ -1302,9 +1336,9 @@ fn named_primary_and_foreign_keys_survive_sql_reconstruction() {
         "CREATE TABLE child (id INTEGER CONSTRAINT \"Custom PK\" PRIMARY KEY, pid INTEGER CONSTRAINT \"Custom FK\" REFERENCES parent(id))",
         "CREATE TABLE child (id TEXT, pid INTEGER, CONSTRAINT \"Custom PK\" PRIMARY KEY (id, pid), CONSTRAINT \"Custom FK\" FOREIGN KEY (pid) REFERENCES parent(id))",
     ] {
-        let table = turso_core::schema::BTreeTable::from_sql(original_sql, 1).unwrap();
+        let table = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, original_sql, 1, false).unwrap();
         let sql = table.to_sql();
-        let restored = turso_core::schema::BTreeTable::from_sql(&sql, 1).unwrap();
+        let restored = turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, &sql, 1, false).unwrap();
         assert_eq!(restored.primary_key_constraint_name.as_deref(), Some("Custom PK"), "{sql}");
         assert_eq!(restored.foreign_keys[0].constraint_name.as_deref(), Some("Custom FK"), "{sql}");
     }
@@ -1330,10 +1364,14 @@ fn table_level_pk_and_unique_order_survives_to_sql() {
             "CREATE TABLE w (a TEXT UNIQUE, b TEXT, PRIMARY KEY (b))",
         ),
     ] {
-        let table = turso_core::schema::BTreeTable::from_sql(original_sql, 2).unwrap();
+        let table =
+            turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, original_sql, 2, false)
+                .unwrap();
         let sql = table.to_sql();
         assert_eq!(sql, expected_sql);
-        let restored = turso_core::schema::BTreeTable::from_sql(&sql, 2).unwrap();
+        let restored =
+            turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, &sql, 2, false)
+                .unwrap();
         assert_eq!(restored.unique_sets, table.unique_sets, "{sql}");
     }
 }

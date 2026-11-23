@@ -1008,26 +1008,29 @@ fn test_prepare_rejects_empty_statements(tmp_db: TempDatabase) {
 }
 
 #[turso_macros::test]
-/// Test that we can only join up to 63 tables, and trying to join more should fail with an error instead of panicing.
+/// Test that we can join up to 64 tables, and trying to join more should fail with an error instead of panicing.
 fn test_max_joined_tables_limit(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
 
-    // Create 64 tables
-    for i in 0..64 {
+    // Create 65 tables
+    for i in 0..65 {
         conn.execute(format!("CREATE TABLE t{i} (id INTEGER)"))
             .unwrap();
     }
 
-    // Try to join 64 tables - should fail
+    // Join 64 tables - should succeed
     let mut sql = String::from("SELECT * FROM t0");
     for i in 1..64 {
         sql.push_str(&format!(" JOIN t{i} ON t{i}.id = t0.id"));
     }
+    conn.prepare(&sql).unwrap();
 
+    // Try to join 65 tables - should fail
+    sql.push_str(" JOIN t64 ON t64.id = t0.id");
     let Err(LimboError::ParseError(result)) = conn.prepare(&sql) else {
         panic!("Expected an error but got no error");
     };
-    assert_that!(result).contains("Only up to 63 tables can be joined");
+    assert_that!(result).contains("at most 64 tables in a join");
 }
 
 #[turso_macros::test]

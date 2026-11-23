@@ -21,11 +21,45 @@ enum TestOrSnapshot {
     Setup(String, Setup),
 }
 
-/// Parse a `.sqltest` file from source
+/// A check that a caller of [`parse_with_lint`] runs on each test of a parsed
+/// file. It returns the message of a broken rule.
+pub type TestLint<'a> = &'a (dyn Fn(&TestFile, &TestCase) -> Result<(), String> + Sync);
+
+/// Parse a `.sqltest` file from source. A test with `@compat-gap` is an error:
+/// gap tests need the gap lints, which [`parse_with_lint`] runs.
 pub fn parse(input: &str) -> Result<TestFile, ParseError> {
+    parse_with_lint(input, &reject_compat_gap)
+}
+
+/// Parse a `.sqltest` file from source and run `lint` on each test. A lint
+/// error points at the name of the test.
+pub fn parse_with_lint(input: &str, lint: TestLint<'_>) -> Result<TestFile, ParseError> {
     let tokens = tokenize(input)?;
     let mut parser = Parser::new(tokens);
-    parser.parse()
+    let file = parser.parse()?;
+    for test in &file.tests {
+        if let Err(message) = lint(&file, test) {
+            return Err(ParseError::ValidationError {
+                message: format!("test '{}': {message}", test.name),
+                span: Some(SourceSpan::new(
+                    test.name_span.start.into(),
+                    test.name_span.len(),
+                )),
+                help: None,
+            });
+        }
+    }
+    Ok(file)
+}
+
+/// The lint of [`parse`]: a `@compat-gap` test is an error.
+pub fn reject_compat_gap(_file: &TestFile, test: &TestCase) -> Result<(), String> {
+    match test.gap {
+        Some(_) => Err(
+            "a @compat-gap test needs the gap lints: run sqltest with --compat-gaps".to_string(),
+        ),
+        None => Ok(()),
+    }
 }
 
 fn eval_block_macro_count(expr: &str) -> Result<usize, String> {
@@ -152,6 +186,7 @@ impl Parser {
                     | Token::AtBackend
                     | Token::AtCrossCheckIntegrity
                     | Token::AtSqliteReference
+                    | Token::AtGap
                     | Token::AtVar
                     | Token::Test
                     | Token::Snapshot
@@ -306,6 +341,7 @@ impl Parser {
         let mut cross_check_integrity = false;
         let mut sqlite_reference = false;
         let mut matrix_vars: Vec<MatrixVar> = Vec::new();
+        let mut gap: Option<String> = None;
 
         // Parse decorators
         loop {
@@ -378,10 +414,21 @@ impl Parser {
                     sqlite_reference = true;
                     self.skip_newlines_and_comments();
                 }
+                Some(Token::AtGap) => {
+                    self.advance();
+                    if gap.is_some() {
+                        return Err(self.error("a test takes one @compat-gap label".to_string()));
+                    }
+                    gap = Some(self.expect_string()?);
+                    self.skip_newlines_and_comments();
+                }
                 _ => break,
             }
         }
 
+        if gap.is_some() && !matches!(self.peek(), Some(Token::Test)) {
+            return Err(self.error("@compat-gap is only valid before a test".to_string()));
+        }
         // Now check if it's a test, snapshot or matrix
         if !matrix_vars.is_empty() && !matches!(self.peek(), Some(Token::Matrix)) {
             return Err(self.error("@var decorators are only valid before a matrix".to_string()));
@@ -525,6 +572,7 @@ impl Parser {
                     name_span,
                     sql,
                     expectations: Expectations { default, overrides },
+                    gap,
                     modifiers: CaseModifiers {
                         setups: test_setups,
                         skip,
@@ -1390,9 +1438,6 @@ test postgres {
 expect {
     1
 }
-expect @tursopg {
-    2
-}
 "#;
 
         let file = parse(input).unwrap();
@@ -1402,10 +1447,6 @@ expect @tursopg {
             file.tests[0].modifiers.backend,
             Some(ast::Backend::Postgres)
         );
-        assert!(matches!(
-            file.tests[0].expectations.for_backend(ast::Backend::Tursopg),
-            Expectation::Exact(rows) if rows == &vec!["2".to_string()]
-        ));
         assert!(matches!(
             file.tests[0].expectations.for_backend(ast::Backend::Postgres),
             Expectation::Exact(rows) if rows == &vec!["1".to_string()]
@@ -1738,11 +1779,12 @@ test missing-table {
 expect error {
     relation "missing" does not exist
 }
+@sqlstate 42P01
 expect @tursopg error {
     no such table
 }
-@sqlstate XX000
-expect @postgres error {
+expect @rust error {
+    no such table
 }
 "#;
 
@@ -1758,15 +1800,15 @@ expect @postgres error {
         assert_eq!(
             expectations.for_backend(ast::Backend::Tursopg),
             &Expectation::Error {
-                sqlstate: None,
+                sqlstate: Some("42P01".to_string()),
                 pattern: Some("no such table".to_string()),
             }
         );
         assert_eq!(
-            expectations.for_backend(ast::Backend::Postgres),
+            expectations.for_backend(ast::Backend::Rust),
             &Expectation::Error {
-                sqlstate: Some("XX000".to_string()),
-                pattern: None,
+                sqlstate: None,
+                pattern: Some("no such table".to_string()),
             }
         );
     }
@@ -1872,16 +1914,13 @@ test select-1 {
 expect {
     1
 }
-expect @tursopg {
-    2
-}
 "#;
 
         let file = parse(input).unwrap();
         assert_eq!(file.tests[0].modifiers.backend, Some(ast::Backend::Tursopg));
         assert!(matches!(
             file.tests[0].expectations.for_backend(ast::Backend::Tursopg),
-            Expectation::Exact(rows) if rows == &vec!["2".to_string()]
+            Expectation::Exact(rows) if rows == &vec!["1".to_string()]
         ));
     }
 

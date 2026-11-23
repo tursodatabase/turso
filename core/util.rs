@@ -2,9 +2,8 @@ use crate::dialect::Dialect;
 use crate::namespace::NamespaceId;
 use crate::numeric::StrToF64;
 use crate::schema::CheckConstraint;
-use crate::schema::FromDefinitionFlags;
 use crate::security::policy::RowPolicy;
-use crate::translate::emitter::{Resolver, TransactionMode};
+use crate::translate::emitter::Resolver;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{BitSet, JoinedTable};
 use crate::translate::planner::parse_row_id;
@@ -14,14 +13,13 @@ use crate::IO;
 use crate::{
     schema::{Column, Index, Schema, Table, Trigger, Type},
     types::{Value, ValueType},
-    LimboError, OpenFlags, Result, Statement, SymbolTable,
+    LimboError, OpenFlags, Result,
 };
 use either::Either;
 use rustc_hash::FxHashMap as HashMap;
 use std::future::Future;
-use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{self, CreateTableBody, Expr, Literal, UnaryOperator};
+use turso_parser::ast::{self, Expr, Literal, UnaryOperator};
 
 #[macro_export]
 macro_rules! io_yield_one {
@@ -218,16 +216,7 @@ pub fn table_name_for_error(name: &turso_parser::ast::QualifiedName) -> String {
 /// Quote a SQL identifier with double quotes when necessary.
 /// Always safe to call — returns the bare name when no quoting is needed.
 pub fn quote_identifier(name: &str) -> String {
-    let needs_quoting = name.is_empty()
-        || name.as_bytes()[0].is_ascii_digit()
-        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        || turso_parser::lexer::is_quotable_keyword(name.as_bytes());
-    if needs_quoting {
-        let escaped = name.replace('"', "\"\"");
-        format!("\"{escaped}\"")
-    } else {
-        name.to_string()
-    }
+    ast::Name::exact(name.to_string()).as_ident()
 }
 
 pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
@@ -256,124 +245,6 @@ pub struct UnparsedFromSqlIndex {
     pub table_name: String,
     pub root_page: i64,
     pub sql: String,
-}
-
-/// Carries the in-progress state of [`parse_schema_rows`] across IO yields:
-/// the schema-scan statement plus the accumulators that `handle_schema_row`
-/// fills row-by-row. Without this, a yield mid-scan would lose the partially
-/// accumulated indexes/materialized-view info and re-run the statement from
-/// scratch.
-#[derive(Default)]
-pub struct ParseSchemaRowsState {
-    inner: Option<ParseSchemaRowsInner>,
-}
-
-struct ParseSchemaRowsInner {
-    rows: Statement,
-    from_sql_indexes: crate::alloc::Vec<UnparsedFromSqlIndex>,
-    automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>>,
-    dbsp_state_roots: HashMap<String, i64>,
-    dbsp_state_index_roots: HashMap<String, i64>,
-    materialized_view_info: HashMap<String, crate::schema::StoredMaterializedView>,
-}
-
-impl ParseSchemaRowsState {
-    /// Initialize the scan state from a prepared `SELECT * FROM sqlite_schema`
-    /// statement (or equivalent) and the MVCC transaction it should read under.
-    pub fn new(mut rows: Statement, mv_tx: Option<(u64, TransactionMode)>) -> Self {
-        rows.set_mv_tx(mv_tx);
-        Self {
-            inner: Some(ParseSchemaRowsInner {
-                rows,
-                from_sql_indexes: <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(10).expect(crate::alloc::ALLOC_ERR_MSG),
-                automatic_indices: HashMap::with_capacity_and_hasher(10, Default::default()),
-                dbsp_state_roots: HashMap::default(),
-                dbsp_state_index_roots: HashMap::default(),
-                materialized_view_info: HashMap::default(),
-            }),
-        }
-    }
-}
-
-/// Non-blocking schema-row parser: steps the schema-scan statement held in
-/// `state`, feeding each row to `handle_schema_row`, and yields IO instead of
-/// pumping it. Re-invoke after each yielded completion; accumulators persist in
-/// `state`. Indexes and materialized views are built afterwards by
-/// [`populate_types_views_then_indices`], once the types are loaded.
-#[instrument(skip_all, level = Level::DEBUG)]
-pub fn parse_schema_rows(
-    state: &mut ParseSchemaRowsState,
-    schema: &mut Schema,
-    syms: &SymbolTable,
-    resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
-    dialect: &dyn crate::dialect::Dialect,
-) -> IOResultOr<()> {
-    {
-        let inner = state
-            .inner
-            .as_mut()
-            .expect("ParseSchemaRowsState not initialized");
-        // Destructure so the statement (receiver) and the accumulators (captured
-        // by the closure) are borrowed as disjoint fields.
-        let ParseSchemaRowsInner {
-            rows,
-            from_sql_indexes,
-            automatic_indices,
-            dbsp_state_roots,
-            dbsp_state_index_roots,
-            materialized_view_info,
-        } = inner;
-        crate::return_if_io!(rows.run_with_row_callback_nonblock(|row| {
-            let ty = row.get::<&str>(0)?;
-            let name = row.get::<&str>(1)?;
-            let table_name = row.get::<&str>(2)?;
-            let root_page = row.get::<i64>(3)?;
-            let sql = row.get::<&str>(4).ok();
-            schema.handle_schema_row(
-                ty,
-                name,
-                table_name,
-                root_page,
-                sql,
-                syms,
-                from_sql_indexes,
-                automatic_indices,
-                dbsp_state_roots,
-                dbsp_state_index_roots,
-                materialized_view_info,
-                resolve_attached_db,
-                dialect,
-            )
-        }));
-    }
-
-    Ok(IOResult::Done(()))
-}
-
-/// After [`parse_schema_rows`] has scanned every row: load the CREATE TYPE
-/// statements `type_sqls`, then build the materialized views and indexes
-/// collected during the scan.
-pub fn populate_types_views_then_indices(
-    state: &mut ParseSchemaRowsState,
-    schema: &mut Schema,
-    syms: &SymbolTable,
-    type_sqls: &[String],
-) -> Result<()> {
-    let inner = state
-        .inner
-        .take()
-        .expect("ParseSchemaRowsState not initialized");
-    let has_mv_store = inner.rows.mv_store().is_some();
-    schema.populate_types_views_then_indices(
-        syms,
-        type_sqls,
-        inner.materialized_view_info,
-        inner.dbsp_state_roots,
-        inner.dbsp_state_index_roots,
-        inner.from_sql_indexes,
-        inner.automatic_indices,
-        has_mv_store,
-    )
 }
 
 fn cmp_numeric_strings(num_str: &str, other: &str) -> bool {
@@ -741,6 +612,15 @@ pub fn try_capture_parameters_column_agnostic(
 /// equivalent in the context of queries, even if their representations
 /// differ. e.g.: `SUM(x)` and `sum(x)`, `x + y` and `y + x`
 pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
+    exprs_match(expr1, expr2, true)
+}
+
+/// Like [exprs_are_equivalent], but `x + y` and `y + x` are different expressions.
+pub fn exprs_are_equivalent_as_written(expr1: &Expr, expr2: &Expr) -> bool {
+    exprs_match(expr1, expr2, false)
+}
+
+fn exprs_match(expr1: &Expr, expr2: &Expr, operands_can_swap: bool) -> bool {
     match (expr1, expr2) {
         (
             Expr::Between {
@@ -757,16 +637,18 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
             },
         ) => {
             not1 == not2
-                && exprs_are_equivalent(lhs1, lhs2)
-                && exprs_are_equivalent(start1, start2)
-                && exprs_are_equivalent(end1, end2)
+                && exprs_match(lhs1, lhs2, operands_can_swap)
+                && exprs_match(start1, start2, operands_can_swap)
+                && exprs_match(end1, end2, operands_can_swap)
         }
         (Expr::Binary(lhs1, op1, rhs1), Expr::Binary(lhs2, op2, rhs2)) => {
             op1 == op2
-                && ((exprs_are_equivalent(lhs1, lhs2) && exprs_are_equivalent(rhs1, rhs2))
-                    || (op1.is_commutative()
-                        && exprs_are_equivalent(lhs1, rhs2)
-                        && exprs_are_equivalent(rhs1, lhs2)))
+                && ((exprs_match(lhs1, lhs2, operands_can_swap)
+                    && exprs_match(rhs1, rhs2, operands_can_swap))
+                    || (operands_can_swap
+                        && op1.is_commutative()
+                        && exprs_match(lhs1, rhs2, operands_can_swap)
+                        && exprs_match(rhs1, lhs2, operands_can_swap)))
         }
         (
             Expr::Case {
@@ -783,7 +665,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
             base1 == base2
                 && pairs1.len() == pairs2.len()
                 && pairs1.iter().zip(pairs2).all(|((w1, t1), (w2, t2))| {
-                    exprs_are_equivalent(w1, w2) && exprs_are_equivalent(t1, t2)
+                    exprs_match(w1, w2, operands_can_swap) && exprs_match(t1, t2, operands_can_swap)
                 })
                 && else1 == else2
         }
@@ -797,7 +679,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                 type_name: type2,
             },
         ) => {
-            exprs_are_equivalent(expr1, expr2)
+            exprs_match(expr1, expr2, operands_can_swap)
                 && match (type1, type2) {
                     (Some(t1), Some(t2)) => t1.name.eq_ignore_ascii_case(&t2.name),
                     _ => false,
@@ -805,7 +687,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
         }
         (Expr::Collate(expr1, collation1), Expr::Collate(expr2, collation2)) => {
             // TODO: check correctness of comparing colation as strings
-            exprs_are_equivalent(expr1, expr2)
+            exprs_match(expr1, expr2, operands_can_swap)
                 && collation1
                     .as_str()
                     .eq_ignore_ascii_case(collation2.as_str())
@@ -847,18 +729,20 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
         ) => {
             name1.as_str().eq_ignore_ascii_case(name2.as_str())
                 && match (&filter1.filter_clause, &filter2.filter_clause) {
-                    (Some(expr1), Some(expr2)) => exprs_are_equivalent(expr1, expr2),
+                    (Some(expr1), Some(expr2)) => exprs_match(expr1, expr2, operands_can_swap),
                     (None, None) => true,
                     _ => false,
                 }
                 && filter1.over_clause == filter2.over_clause
         }
-        (Expr::NotNull(expr1), Expr::NotNull(expr2)) => exprs_are_equivalent(expr1, expr2),
-        (Expr::IsNull(expr1), Expr::IsNull(expr2)) => exprs_are_equivalent(expr1, expr2),
+        (Expr::NotNull(expr1), Expr::NotNull(expr2)) => {
+            exprs_match(expr1, expr2, operands_can_swap)
+        }
+        (Expr::IsNull(expr1), Expr::IsNull(expr2)) => exprs_match(expr1, expr2, operands_can_swap),
         (Expr::Literal(lit1), Expr::Literal(lit2)) => check_literal_equivalency(lit1, lit2),
         (Expr::Id(id1), Expr::Id(id2)) => check_ident_equivalency(id1.as_str(), id2.as_str()),
         (Expr::Unary(op1, expr1), Expr::Unary(op2, expr2)) => {
-            op1 == op2 && exprs_are_equivalent(expr1, expr2)
+            op1 == op2 && exprs_match(expr1, expr2, operands_can_swap)
         }
         (Expr::Variable(val), Expr::Variable(val2)) => val == val2,
         (Expr::Parenthesized(exprs1), Expr::Parenthesized(exprs2)) => {
@@ -866,10 +750,10 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                 && exprs1
                     .iter()
                     .zip(exprs2)
-                    .all(|(e1, e2)| exprs_are_equivalent(e1, e2))
+                    .all(|(e1, e2)| exprs_match(e1, e2, operands_can_swap))
         }
         (Expr::Parenthesized(exprs1), exprs2) | (exprs2, Expr::Parenthesized(exprs1)) => {
-            exprs1.len() == 1 && exprs_are_equivalent(&exprs1[0], exprs2)
+            exprs1.len() == 1 && exprs_match(&exprs1[0], exprs2, operands_can_swap)
         }
         (Expr::Qualified(tn1, cn1), Expr::Qualified(tn2, cn2)) => {
             check_ident_equivalency(tn1.as_str(), tn2.as_str())
@@ -893,12 +777,12 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
             },
         ) => {
             *not1 == *not2
-                && exprs_are_equivalent(lhs1, lhs2)
+                && exprs_match(lhs1, lhs2, operands_can_swap)
                 && rhs1.len() == rhs2.len()
                 && rhs1
                     .iter()
                     .zip(rhs2.iter())
-                    .all(|(a, b)| exprs_are_equivalent(a, b))
+                    .all(|(a, b)| exprs_match(a, b, operands_can_swap))
         }
         (
             Expr::Column {
@@ -977,21 +861,6 @@ pub(crate) fn is_rowid_alias_type(written_type: &ast::Type) -> bool {
     !written_type.is_array()
         && (written_type.name.eq_ignore_ascii_case("INTEGER")
             || written_type.name.eq_ignore_ascii_case("[INTEGER]"))
-}
-
-pub fn columns_from_create_table_body(
-    body: &turso_parser::ast::CreateTableBody,
-) -> crate::Result<Vec<Column>> {
-    let CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
-        return Err(crate::LimboError::ParseError(
-            "CREATE TABLE body must contain columns and constraints".to_string(),
-        ));
-    };
-
-    columns
-        .iter()
-        .map(|column| Column::from_definition(column, FromDefinitionFlags::empty()))
-        .collect::<crate::Result<Vec<Column>>>()
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -1423,6 +1292,9 @@ pub fn cast_real_to_integer(float: f64) -> std::result::Result<i64, ()> {
 
 // we don't need to verify the numeric literal here, as it is already verified by the parser
 pub fn parse_numeric_literal(text: &str) -> Result<Value> {
+    if let Some(value) = parse_short_decimal_integer(text) {
+        return Ok(Value::from_i64(value));
+    }
     // a single extra underscore ("_") character can exist between any two digits
     let text = if text.contains('_') {
         std::borrow::Cow::Owned(text.replace('_', ""))
@@ -1455,6 +1327,24 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
         unreachable!();
     };
     Ok(Value::Numeric(crate::numeric::Numeric::Float(float)))
+}
+
+/// The value of `text` if it has only ASCII digits, at most 18 of them. Such
+/// a number always fits in an `i64`.
+fn parse_short_decimal_integer(text: &str) -> Option<i64> {
+    let digits = text.as_bytes();
+    if digits.is_empty() || digits.len() > 18 {
+        return None;
+    }
+    let mut value: i64 = 0;
+    for &byte in digits {
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        value = value * 10 + i64::from(digit);
+    }
+    Some(value)
 }
 
 pub fn parse_signed_number(expr: &Expr) -> Result<Value> {
@@ -1537,6 +1427,12 @@ pub trait AstVisitor {
     fn table_function(&mut self, _name: &ast::QualifiedName) -> Result<()> {
         Ok(())
     }
+
+    /// Before the CTEs and the body of a SELECT that has a WITH clause.
+    fn enter_with(&mut self, _with: &ast::With) {}
+
+    /// After the SELECT whose WITH clause `enter_with` reported.
+    fn leave_with(&mut self) {}
 
     /// Visit in SQLite's name resolution order: each query level's FROM
     /// clause before its SELECT list, and the left operand of `IN (SELECT ...)`
@@ -1816,6 +1712,7 @@ pub fn visit_stmt<V: AstVisitor>(stmt: &ast::Stmt, visitor: &mut V) -> Result<()
         | ast::Stmt::AlterSequenceOwnedBy { .. }
         | ast::Stmt::CreateSchema { .. }
         | ast::Stmt::CreateRole { .. }
+        | ast::Stmt::DropRole { .. }
         | ast::Stmt::Grant(_)
         | ast::Stmt::CreatePolicy(_)
         | ast::Stmt::DropPolicy { .. }
@@ -1954,6 +1851,9 @@ where
 /// Walk a SELECT: the tables it reads and all of its expressions, including
 /// subqueries.
 pub fn visit_select<V: AstVisitor>(select: &ast::Select, visitor: &mut V) -> Result<()> {
+    if let Some(with) = &select.with {
+        visitor.enter_with(with);
+    }
     visit_with(select.with.as_ref(), visitor)?;
 
     visit_one_select(&select.body.select, visitor)?;
@@ -1972,6 +1872,10 @@ pub fn visit_select<V: AstVisitor>(select: &ast::Select, visitor: &mut V) -> Res
         }
     }
 
+    if select.with.is_some() {
+        visitor.leave_with();
+    }
+
     Ok(())
 }
 
@@ -1983,7 +1887,7 @@ fn visit_one_select<V: AstVisitor>(one_select: &ast::OneSelect, visitor: &mut V)
             where_clause,
             group_by,
             window_clause,
-            ..
+            distinctness,
         } => {
             // Source order is SELECT list then FROM; name resolution is the
             // reverse, which a visitor can ask for.
@@ -2014,6 +1918,13 @@ fn visit_one_select<V: AstVisitor>(one_select: &ast::OneSelect, visitor: &mut V)
 
             for window_def in window_clause {
                 visit_window(&window_def.window, visitor)?;
+            }
+
+            for expr in distinctness
+                .iter()
+                .flat_map(|distinctness| distinctness.exprs())
+            {
+                visit_expr_with_subqueries(expr, visitor)?;
             }
         }
         ast::OneSelect::Values(values) => {
@@ -3358,6 +3269,20 @@ pub mod tests {
     #[test]
     fn test_parse_numeric_literal_integer() {
         assert_eq!(parse_numeric_literal("123").unwrap(), Value::from_i64(123));
+        assert_eq!(parse_numeric_literal("0").unwrap(), Value::from_i64(0));
+        assert_eq!(parse_numeric_literal("007").unwrap(), Value::from_i64(7));
+        assert_eq!(
+            parse_numeric_literal("999999999999999999").unwrap(),
+            Value::from_i64(999_999_999_999_999_999)
+        );
+        assert_eq!(
+            parse_numeric_literal("9223372036854775807").unwrap(),
+            Value::from_i64(i64::MAX)
+        );
+        assert_eq!(
+            parse_numeric_literal("-9223372036854775808").unwrap(),
+            Value::from_i64(i64::MIN)
+        );
         assert_eq!(
             parse_numeric_literal("9_223_372_036_854_775_807").unwrap(),
             Value::from_i64(9223372036854775807)

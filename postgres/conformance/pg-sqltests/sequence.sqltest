@@ -16,6 +16,7 @@ expect {
     1|2
 }
 
+@compat-gap "syntax:create-sequence"
 test create-sequence-with-cache-10 {
     CREATE SEQUENCE cache_ten CACHE 10;
     SELECT nextval('cache_ten');
@@ -30,6 +31,7 @@ expect @tursopg error {
     CACHE 10 \(Turso sequences do not cache values, so CACHE must be 1\) is not supported
 }
 
+@compat-gap "syntax:create-sequence"
 test create-sequence-with-cache-too-large-for-int4 {
     CREATE SEQUENCE cache_large CACHE 9999999999;
     SELECT cache_size FROM pg_sequences WHERE sequencename = 'cache_large';
@@ -58,6 +60,7 @@ expect error {
     CACHE \(-1\) must be greater than zero
 }
 
+@compat-gap "syntax:create-sequence"
 test create-sequence-with-fractional-cache {
     CREATE SEQUENCE cache_fraction CACHE 1.5;
 }
@@ -70,6 +73,7 @@ expect @tursopg error {
     this CACHE value in CREATE SEQUENCE is not supported
 }
 
+@compat-gap "syntax:create-sequence"
 test create-sequence-with-cache-too-large-for-bigint {
     CREATE SEQUENCE cache_huge CACHE 99999999999999999999;
 }

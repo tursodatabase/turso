@@ -37,6 +37,7 @@ pub mod database;
 pub mod persistent_storage;
 #[cfg(feature = "conn_raw_api")]
 pub mod portable_logical;
+mod sqlite_schema_row;
 #[cfg(any(test, injected_yields))]
 pub mod yield_hooks;
 pub mod yield_points;

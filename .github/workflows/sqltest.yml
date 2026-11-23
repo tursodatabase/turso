@@ -103,14 +103,9 @@ jobs:
         uses: useblacksmith/setup-node@v5
         with:
           node-version: 24
-      - name: Install JS dependencies
-        run: yarn install
-      - name: Build common package
-        run: yarn workspace @tursodatabase/database-common build
-      - name: Build native bindings
-        run: yarn workspace @tursodatabase/database napi-build --target x86_64-unknown-linux-gnu
-      - name: Build TypeScript
-        run: yarn workspace @tursodatabase/database tsc-build
+      # `make run-js` installs the JS dependencies and builds the common
+      # package, the native binding (with the test_helper feature the tests
+      # need) and the TypeScript, so this job has no separate build steps.
       - name: Build test runner
         working-directory: sqlite/conformance
         run: make build-runner
@@ -129,6 +124,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The gap-removal check compares the checkout with its first parent,
+          # which for a pull request is the target branch (the checkout is the
+          # merge commit).
+          fetch-depth: 2
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
@@ -139,6 +139,16 @@ jobs:
         run: make -C postgres/conformance build-runner
       - name: Run tests
         run: make -C postgres/conformance run
+      - name: Run tests (turso_pg embedded, without the pgwire server)
+        run: make -C postgres/conformance run-embedded
+      - name: Write gap-test counts to the job summary
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        run: make -s --no-print-directory -C postgres/conformance gaps >> "$GITHUB_STEP_SUMMARY"
+      - name: Check that no gap test was removed
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/gap-base" HEAD^1
+          make -C postgres/conformance check-gap-removals BASE="$RUNNER_TEMP/gap-base"
 
   sqltest-postgres:
     name: Run SQL tests (PostgreSQL)

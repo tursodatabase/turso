@@ -1,0 +1,38 @@
+@database :memory:
+
+# MIN and MAX over values of every type: NULL is skipped, and values of
+# different types compare as NULL < numbers < texts < blobs.
+@cross-check-integrity
+test min_max_values_of_each_type {
+    CREATE TABLE t(g, x);
+    INSERT INTO t VALUES (1, 'b'), (1, 'a'), (1, 'c'), (1, NULL), (2, 2.5), (2, 'z'), (2, 10), (2, x'00'), (3, x'ff'), (3, x'0102'), (3, NULL), (4, NULL), (5, 'é'), (5, 'e'), (5, 'f');
+    SELECT typeof(min(x)), min(x), typeof(max(x)), hex(max(x)) FROM t;
+}
+expect {
+    real|2.5|blob|FF
+}
+
+@cross-check-integrity
+test min_max_values_of_each_type_per_group {
+    CREATE TABLE t2(g, x);
+    INSERT INTO t2 VALUES (1, 'b'), (1, 'a'), (1, 'c'), (1, NULL), (2, 2.5), (2, 'z'), (2, 10), (2, x'00'), (3, x'ff'), (3, x'0102'), (3, NULL), (4, NULL), (5, 'é'), (5, 'e'), (5, 'f');
+    SELECT g, hex(min(x)), hex(max(x)), typeof(min(x)), typeof(max(x)) FROM t2 GROUP BY g;
+}
+expect {
+    1|61|63|text|text
+    2|322E35|00|real|blob
+    3|0102|FF|blob|blob
+    4|||null|null
+    5|65|C3A9|text|text
+}
+
+# Under NOCASE, a value equal to the current one does not replace it.
+@cross-check-integrity
+test min_max_nocase_keeps_first_equal_value {
+    CREATE TABLE u(x TEXT COLLATE NOCASE);
+    INSERT INTO u VALUES ('b'), ('A'), ('a'), ('C'), ('c'), ('B');
+    SELECT min(x), max(x), max(x COLLATE BINARY), min(x COLLATE BINARY) FROM u;
+}
+expect {
+    A|C|c|A
+}

@@ -12,12 +12,13 @@ default = ["simd"]
 simd = ["turso_core/simd"]
 
 [dependencies]
-turso_sqlite = { path = "../../sqlite/frontend", version = "0.9.0-pre.5" }
-turso_core = { path = "../../core", version = "0.9.0-pre.5", default-features = false, features = [
+turso_sqlite = { path = "../../sqlite/frontend", version = "0.9.0-pre.6" }
+turso_core = { path = "../../core", version = "0.9.0-pre.6", default-features = false, features = [
     "baseline",
     "conn_raw_api",
 ] }
 turso_parser = { workspace = true }
+aristo = { workspace = true }
 thiserror = "2.0.12"
 tracing = "0.1.41"
 serde_json.workspace = true

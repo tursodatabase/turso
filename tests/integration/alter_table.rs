@@ -11,8 +11,13 @@ fn schema_with_tables(create_table_sqls: &[&str]) -> Schema {
     let mut schema = Schema::new();
     for (index, create_table_sql) in create_table_sqls.iter().enumerate() {
         let root_page = i64::try_from(index).expect("test table index should fit in i64") + 2;
-        let table = BTreeTable::from_sql(create_table_sql, root_page)
-            .expect("test CREATE TABLE should parse");
+        let table = BTreeTable::from_stored_sql(
+            &turso_sqlite::SqliteDialect,
+            create_table_sql,
+            root_page,
+            false,
+        )
+        .expect("test CREATE TABLE should parse");
         schema
             .add_btree_table(NamespaceId::ROOT, std::sync::Arc::new(table))
             .expect("test table should be added to schema");
@@ -31,8 +36,13 @@ pub(crate) fn schema_with_a_table_t_in_two_namespaces() -> (Schema, NamespaceId)
     let mut schema = schema_with_table("CREATE TABLE t (a)");
     let other = NamespaceId::new(1);
     schema.add_namespace(other, "other");
-    let table =
-        BTreeTable::from_sql("CREATE TABLE t (b, c)", 3).expect("test CREATE TABLE should parse");
+    let table = BTreeTable::from_stored_sql(
+        &turso_sqlite::SqliteDialect,
+        "CREATE TABLE t (b, c)",
+        3,
+        false,
+    )
+    .expect("test CREATE TABLE should parse");
     schema
         .add_btree_table(other, std::sync::Arc::new(table))
         .expect("test table should be added to schema");
@@ -41,7 +51,7 @@ pub(crate) fn schema_with_a_table_t_in_two_namespaces() -> (Schema, NamespaceId)
 
 pub(crate) fn select(sql: &str) -> ast::Select {
     let Some(ast::Cmd::Stmt(ast::Stmt::Select(select))) =
-        turso_core::dialect::engine::parse_statement(sql).unwrap()
+        turso_core::dialect::parse_statement(&turso_sqlite::SqliteDialect, sql).unwrap()
     else {
         panic!("expected SELECT: {sql}");
     };
@@ -61,10 +71,18 @@ pub(crate) fn column_names(columns: &ViewColumnSchema) -> Vec<String> {
 fn rename_column_rewrites_a_view_against_the_table_of_its_namespace() {
     let (schema, other) = schema_with_a_table_t_in_two_namespaces();
     let view_sql = "CREATE VIEW v AS SELECT b FROM t";
-    let rewritten =
-        rewrite_view_sql_for_column_rename(view_sql, &schema, other, "t", "main", "b", "x")
-            .unwrap()
-            .expect("view should be rewritten");
+    let rewritten = rewrite_view_sql_for_column_rename(
+        &turso_sqlite::SqliteDialect,
+        view_sql,
+        &schema,
+        other,
+        "t",
+        "main",
+        "b",
+        "x",
+    )
+    .unwrap()
+    .expect("view should be rewritten");
     assert!(
         rewritten.sql.contains("SELECT x FROM t"),
         "{}",
@@ -78,6 +96,7 @@ fn test_rewrite_view_sql_select_table_branch() {
     let view_sql = "CREATE VIEW v AS SELECT s.x FROM (SELECT b AS x FROM t) AS s";
 
     let rewritten = rewrite_view_sql_for_column_rename(
+        &turso_sqlite::SqliteDialect,
         view_sql,
         &schema,
         NamespaceId::ROOT,
@@ -98,6 +117,7 @@ fn test_rewrite_view_sql_sub_branch() {
     let view_sql = "CREATE VIEW v AS SELECT s.b FROM (t) AS s";
 
     let rewritten = rewrite_view_sql_for_column_rename(
+        &turso_sqlite::SqliteDialect,
         view_sql,
         &schema,
         NamespaceId::ROOT,
@@ -118,6 +138,7 @@ fn test_rewrite_view_sql_table_call_branch() {
     let view_sql = "CREATE VIEW v AS SELECT j.value FROM t JOIN json_each(json_array(t.b)) AS j";
 
     let rewritten = rewrite_view_sql_for_column_rename(
+        &turso_sqlite::SqliteDialect,
         view_sql,
         &schema,
         NamespaceId::ROOT,
@@ -138,6 +159,7 @@ fn test_rewrite_view_sql_compound_branch() {
     let view_sql = "CREATE VIEW v AS SELECT b FROM t UNION ALL SELECT b FROM t ORDER BY b";
 
     let rewritten = rewrite_view_sql_for_column_rename(
+        &turso_sqlite::SqliteDialect,
         view_sql,
         &schema,
         NamespaceId::ROOT,
@@ -160,6 +182,7 @@ fn test_rewrite_view_sql_cte_branch() {
     let view_sql = "CREATE VIEW v AS WITH cte AS (SELECT b FROM t) SELECT b FROM cte";
 
     let rewritten = rewrite_view_sql_for_column_rename(
+        &turso_sqlite::SqliteDialect,
         view_sql,
         &schema,
         NamespaceId::ROOT,
@@ -189,6 +212,7 @@ fn test_rewrite_view_sql_cte_branch_with_explicit_columns() {
     let view_sql = "CREATE VIEW v AS WITH cte(x) AS (SELECT b FROM t) SELECT x FROM cte";
 
     let rewritten = rewrite_view_sql_for_column_rename(
+        &turso_sqlite::SqliteDialect,
         view_sql,
         &schema,
         NamespaceId::ROOT,
@@ -220,7 +244,7 @@ fn test_rewrite_view_sql_cte_branch_with_explicit_columns() {
 #[test]
 fn test_rewrite_trigger_cmd_table_refs_cte_branch() {
     let sql = "CREATE TEMP TRIGGER trg AFTER INSERT ON temp.old BEGIN WITH cte AS (SELECT * FROM temp.old) SELECT * FROM cte; END";
-    let cmd = turso_core::dialect::engine::parse_statement(sql)
+    let cmd = turso_core::dialect::parse_statement(&turso_sqlite::SqliteDialect, sql)
         .expect("trigger SQL should parse")
         .expect("trigger SQL should produce a statement");
     let ast::Cmd::Stmt(ast::Stmt::CreateTrigger { commands, .. }) = cmd else {
@@ -256,7 +280,7 @@ fn test_rewrite_trigger_cmd_table_refs_cte_branch() {
 #[test]
 fn test_rewrite_trigger_cmd_table_refs_expr_subquery_branch() {
     let sql = "CREATE TEMP TRIGGER trg AFTER INSERT ON temp.old BEGIN SELECT EXISTS(SELECT 1 FROM temp.old); END";
-    let cmd = turso_core::dialect::engine::parse_statement(sql)
+    let cmd = turso_core::dialect::parse_statement(&turso_sqlite::SqliteDialect, sql)
         .expect("trigger SQL should parse")
         .expect("trigger SQL should produce a statement");
     let ast::Cmd::Stmt(ast::Stmt::CreateTrigger { commands, .. }) = cmd else {
@@ -301,6 +325,7 @@ fn test_rewrite_view_sql_join_on_branch() {
     let view_sql = "CREATE VIEW v AS SELECT t.a FROM t JOIN u ON t.b = u.b";
 
     let rewritten = rewrite_view_sql_for_column_rename(
+        &turso_sqlite::SqliteDialect,
         view_sql,
         &schema,
         NamespaceId::ROOT,
@@ -326,6 +351,7 @@ fn test_rewrite_view_sql_join_using_branch() {
     // rewrite must error rather than emit a view that can never be
     // queried again.
     let err = rewrite_view_sql_for_column_rename(
+        &turso_sqlite::SqliteDialect,
         view_sql,
         &schema,
         NamespaceId::ROOT,
@@ -347,6 +373,7 @@ fn test_rewrite_view_sql_group_by_having_branch() {
     let view_sql = "CREATE VIEW v AS SELECT b FROM t GROUP BY b HAVING b > 0";
 
     let rewritten = rewrite_view_sql_for_column_rename(
+        &turso_sqlite::SqliteDialect,
         view_sql,
         &schema,
         NamespaceId::ROOT,
@@ -373,6 +400,7 @@ fn test_rewrite_view_sql_window_clause_branch() {
     let view_sql = "CREATE VIEW v AS SELECT sum(a) OVER (PARTITION BY b ORDER BY b) FROM t";
 
     let rewritten = rewrite_view_sql_for_column_rename(
+        &turso_sqlite::SqliteDialect,
         view_sql,
         &schema,
         NamespaceId::ROOT,
@@ -404,6 +432,7 @@ fn test_rewrite_view_sql_limit_offset_branch() {
     let view_sql = "CREATE VIEW v AS SELECT a FROM t LIMIT b OFFSET b";
 
     let rewritten = rewrite_view_sql_for_column_rename(
+        &turso_sqlite::SqliteDialect,
         view_sql,
         &schema,
         NamespaceId::ROOT,
@@ -427,6 +456,7 @@ fn test_rewrite_view_sql_values_branch() {
     let view_sql = "CREATE VIEW v AS VALUES ((SELECT b FROM t LIMIT 1))";
 
     let rewritten = rewrite_view_sql_for_column_rename(
+        &turso_sqlite::SqliteDialect,
         view_sql,
         &schema,
         NamespaceId::ROOT,

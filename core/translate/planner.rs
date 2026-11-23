@@ -40,7 +40,7 @@ use crate::{
 };
 use crate::{
     function::{AccumulatorFunc, AggFunc, WindowFunc},
-    translate::expr::bind_and_rewrite_expr,
+    translate::expr::{bind_and_rewrite_expr, bind_and_rewrite_expr_except},
 };
 use crate::{
     translate::plan::{Window, WindowFunction},
@@ -225,7 +225,7 @@ impl RecursiveRefCounter<'_> {
                 where_clause,
                 group_by,
                 window_clause,
-                ..
+                distinctness,
             } => {
                 let mut count = 0;
                 if let Some(from) = from {
@@ -255,6 +255,12 @@ impl RecursiveRefCounter<'_> {
                 }
                 for window_def in window_clause {
                     count += self.count_window(&window_def.window, scope);
+                }
+                for expr in distinctness
+                    .iter()
+                    .flat_map(|distinctness| distinctness.exprs())
+                {
+                    count += self.count_expr(expr, scope);
                 }
                 count
             }
@@ -450,6 +456,7 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
             where_clause,
             group_by,
             window_clause,
+            distinctness,
             ..
         } => {
             for column in columns {
@@ -469,6 +476,12 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
                 }
             }
             collect_subquery_table_refs_in_window_clause(window_clause, out);
+            for expr in distinctness
+                .iter()
+                .flat_map(|distinctness| distinctness.exprs())
+            {
+                collect_subquery_table_refs_in_expr(expr, out);
+            }
             if let ast::OneSelect::Select {
                 from: Some(from), ..
             } = one
@@ -1242,6 +1255,9 @@ fn plan_cte(
             {
                 continue;
             }
+            // The plan of this CTE holds the plan of the CTE that it reads, so a
+            // chain of CTEs in one WITH clause nests its plans one in another.
+            let nested_query = resolver.enter_nested_query()?;
             let referenced_cte_table = plan_cte(
                 referenced_cte_index,
                 cte_definitions,
@@ -1251,6 +1267,7 @@ fn plan_cte(
                 connection,
                 false,
             )?;
+            drop(nested_query);
             outer_query_refs.push(OuterQueryReference {
                 identifier: referenced_cte_table.identifier.clone(),
                 has_alias: referenced_cte_table.has_alias,
@@ -1431,6 +1448,7 @@ fn prepare_recursive_cte_plan(
         outer_query_refs,
         QueryDestination::placeholder_for_subquery(),
         connection,
+        false,
     )?;
 
     let explicit_columns = (!cte_definition.explicit_columns.is_empty())
@@ -1492,6 +1510,7 @@ fn prepare_recursive_cte_plan(
         &recursive_query_outer_refs,
         QueryDestination::placeholder_for_subquery(),
         connection,
+        false,
     )?;
 
     if initial_query.select_result_columns().len() != recursive_query.select_result_columns().len()
@@ -1645,9 +1664,6 @@ fn parse_from_clause_table(
                 if already_visible {
                     continue;
                 }
-                let name_used_by_table_on_the_left = outer_query_refs_for_subquery
-                    .iter()
-                    .any(|reference| reference.identifier == cte_definition.name);
                 // This plan only makes the name visible. A later FROM lookup performs
                 // the real CTE use and validates its explicit column list.
                 let cte_table = plan_cte(
@@ -1671,7 +1687,7 @@ fn parse_from_clause_table(
                         .then(|| cte_definition.select.clone()),
                     cte_explicit_columns: cte_definition.explicit_columns.clone(),
                     cte_id: Some(cte_definition.cte_id),
-                    cte_definition_only: name_used_by_table_on_the_left,
+                    cte_definition_only: true,
                     rowid_referenced: false,
                     outer_join_may_null_extend: false,
                     scope_depth: 0,
@@ -2838,11 +2854,17 @@ pub fn determine_where_to_eval_term(
                 || referenced_tables
                     .iter()
                     .any(|table_index| table_index < right_table_index);
-            if reads_left_table {
-                let loop_index = join_order
-                    .iter()
-                    .position(|table| table.table_id == right_table.internal_id)
-                    .expect("right join table must be in the join order");
+            if !reads_left_table {
+                continue;
+            }
+            // A materialized hash input removes its join prefix from this plan.
+            // When that prefix holds the RIGHT JOIN, the input's own plan already
+            // added the unmatched right rows, and every row reaches this plan
+            // through the probe loop. The term then runs where its tables are ready.
+            if let Some(loop_index) = join_order
+                .iter()
+                .position(|table| table.table_id == right_table.internal_id)
+            {
                 eval_at = eval_at.max(EvalAt::Loop(loop_index));
             }
         }
@@ -3328,19 +3350,29 @@ pub(crate) fn append_vtab_predicates_to_where_clause(
     out_where_clause: &mut Vec<WhereTerm>,
     resolver: &Resolver,
 ) -> Result<()> {
+    let reads_only_earlier_tables = resolver
+        .catalog
+        .dialect
+        .table_function_arguments_read_only_earlier_tables();
     for mut expr in vtab_predicates.drain(..) {
-        bind_and_rewrite_expr(
+        let table_function = vtab_predicate_table_id(&expr)
+            .expect("a table-function argument must constrain its hidden column");
+        let hidden_tables = if reads_only_earlier_tables {
+            tables_from(table_references, table_function)
+        } else {
+            Vec::new()
+        };
+        bind_and_rewrite_expr_except(
             &mut expr,
             Some(table_references),
-            Some(result_columns),
+            (!reads_only_earlier_tables).then_some(result_columns),
             resolver,
             BindingBehavior::TryCanonicalColumnsFirst,
+            &hidden_tables,
         )?;
 
         // SQLite treats a table-function argument as an ON term for that table.
         // This keeps the term with the table when a later RIGHT JOIN adds NULL rows.
-        let table_function = vtab_predicate_table_id(&expr)
-            .expect("a table-function argument must constrain its hidden column");
         let table_reference = table_references
             .find_joined_table_by_internal_id(table_function)
             .expect("a table-function argument must have a table reference");
@@ -3358,6 +3390,16 @@ pub(crate) fn append_vtab_predicates_to_where_clause(
         });
     }
     Ok(())
+}
+
+/// The table `first` and every table listed after it.
+fn tables_from(table_references: &TableReferences, first: TableInternalId) -> Vec<TableInternalId> {
+    table_references
+        .joined_tables()
+        .iter()
+        .skip_while(|table| table.internal_id != first)
+        .map(|table| table.internal_id)
+        .collect()
 }
 
 /// Get the source table from `hidden_column = +(argument)`.

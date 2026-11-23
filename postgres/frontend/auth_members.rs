@@ -22,7 +22,7 @@ use turso_core::namespace::NamespaceId;
 use turso_core::schema::Schema;
 use turso_core::security::roles::RoleId;
 use turso_core::{
-    to_u32, CatalogChange, Connection, CursorType, InsertFlags, Insn, LimboError, Numeric,
+    to_u32, CatalogApply, Connection, CursorType, InsertFlags, Insn, LimboError, Numeric,
     ProgramBuilder, RegisterOrLiteral, Value, MAIN_DB_ID, SQLITE_ERROR,
 };
 use turso_parser::ast;
@@ -35,6 +35,7 @@ use crate::catalog::{pg_role_by_name, PgRole, PG_DATABASE_OWNER_NAME};
 use crate::error::sqlstate_error;
 use crate::functions::role_name_in;
 use crate::roles::{schema_roles, RoleCatalog};
+use crate::schema_state::{change_schema_state, emit_catalog_apply};
 use crate::unique_index::emit_unique_index_insert;
 
 /// The table that stores the memberships that `GRANT role TO role` makes.
@@ -99,6 +100,14 @@ pub(crate) struct Membership {
     pub(crate) set_option: bool,
 }
 
+impl Membership {
+    /// Whether the membership names role `role` as the role, the member or
+    /// the grantor.
+    pub(crate) fn names(&self, role: RoleId) -> bool {
+        self.role == role || self.member == role || self.grantor == role
+    }
+}
+
 /// The memberships of a database, in memory.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Memberships {
@@ -161,34 +170,6 @@ impl Memberships {
         reached
     }
 
-    /// Adds the membership that GRANT stored, with the values the statement
-    /// read back: the columns of [`schema_state_query`].
-    pub(crate) fn apply_grant(&mut self, values: &[Value]) -> turso_core::Result<()> {
-        let membership = membership_from_row(values).map_err(|_| {
-            LimboError::InternalError(format!(
-                "GRANT read back {values:?} where a membership was written"
-            ))
-        })?;
-        self.add(membership);
-        Ok(())
-    }
-
-    /// Removes the membership that REVOKE deleted, whose id is the one value
-    /// the statement read back.
-    pub(crate) fn apply_revoke(&mut self, values: &[Value]) -> turso_core::Result<()> {
-        let [Value::Numeric(Numeric::Integer(id))] = values else {
-            return Err(LimboError::InternalError(format!(
-                "REVOKE read back {values:?} where a membership id was written"
-            )));
-        };
-        let removed = self.by_id.remove(id);
-        assert!(
-            removed.is_some(),
-            "REVOKE removed membership {id}, which is not loaded"
-        );
-        Ok(())
-    }
-
     /// Adds `membership`. Panics if its id is already in use.
     fn add(&mut self, membership: Membership) {
         let previous = self.by_id.insert(membership.id, membership);
@@ -248,55 +229,18 @@ pub(crate) fn translate_grant_role(
     program: &mut ProgramBuilder,
     schema: &Schema,
     connection: &Arc<Connection>,
-    change: &CatalogChange,
+    revoke: bool,
+    role_names: &[String],
+    grantees: &[ast::Grantee],
 ) -> turso_core::Result<()> {
-    let CatalogChange::GrantRole {
-        revoke,
-        roles: role_names,
-        grantees,
-    } = change
-    else {
-        return Err(LimboError::InternalError(format!(
-            "{change:?} reached the role membership table"
-        )));
-    };
     let roles = schema_roles(schema);
-    let Some(table) = schema.get_btree_table(NamespaceId::ROOT, AUTH_MEMBERS_TABLE_NAME) else {
-        return Err(LimboError::ParseError(
-            "the database has no role membership table".to_string(),
-        ));
-    };
-    let statement = if *revoke { "revoke" } else { "grant" };
+    let statement = if revoke { "revoke" } else { "grant" };
     let grantees = grantees
         .iter()
         .map(|grantee| resolve_grantee(roles, connection, grantee))
         .collect::<turso_core::Result<Vec<_>>>()?;
 
-    let role_member_index = schema
-        .get_indices(NamespaceId::ROOT, AUTH_MEMBERS_TABLE_NAME)
-        .find(|index| index.name == AUTH_MEMBERS_ROLE_MEMBER_INDEX_NAME)
-        .cloned()
-        .ok_or_else(|| {
-            LimboError::Corrupt(format!(
-                "{AUTH_MEMBERS_TABLE_NAME} has no role and member index"
-            ))
-        })?;
-    let table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: table_cursor_id,
-        root_page: RegisterOrLiteral::Literal(table.root_page),
-        db: MAIN_DB_ID,
-    });
-    let index_cursor_id = program.alloc_cursor_index(None, &role_member_index)?;
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: index_cursor_id,
-        root_page: RegisterOrLiteral::Literal(role_member_index.root_page),
-        db: MAIN_DB_ID,
-    });
-    let cursors = Cursors {
-        table: table_cursor_id,
-        role_member_index: index_cursor_id,
-    };
+    let cursors = open_cursors(program, schema)?;
     // The memberships as the statement leaves them so far, so that a later
     // pair of the same statement sees what an earlier pair granted.
     let mut memberships = roles.memberships().clone();
@@ -306,16 +250,18 @@ pub(crate) fn translate_grant_role(
     let mut granted_ids = (1..).map(|n: i64| -n);
     for role_name in role_names {
         let role = resolve_role_name(roles, role_name)?;
-        if role.id.is_none() && !*revoke {
+        if role.id.is_none() && !revoke {
             return Err(sqlstate_error(
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
                 format!("role \"{PG_DATABASE_OWNER_NAME}\" cannot have explicit members"),
+                None,
             ));
         }
         if !roles.is_superuser(connection.current_role()) {
             return Err(sqlstate_error(
                 SQLSTATE_INSUFFICIENT_PRIVILEGE,
                 format!("permission denied to {statement} role \"{}\"", role.name),
+                None,
             ));
         }
         // pg_database_owner has no stored members to revoke.
@@ -323,7 +269,7 @@ pub(crate) fn translate_grant_role(
             continue;
         };
         for grantee in &grantees {
-            if *revoke {
+            if revoke {
                 let Some(member_id) = grantee.id else {
                     continue;
                 };
@@ -331,7 +277,7 @@ pub(crate) fn translate_grant_role(
                     continue;
                 };
                 let membership = membership.clone();
-                emit_membership_delete(program, &cursors, &membership, change);
+                emit_membership_delete(program, &cursors, &membership);
                 memberships.by_id.remove(&membership.id);
                 continue;
             }
@@ -339,6 +285,7 @@ pub(crate) fn translate_grant_role(
                 return Err(sqlstate_error(
                     SQLSTATE_FEATURE_NOT_SUPPORTED,
                     format!("role \"{PG_DATABASE_OWNER_NAME}\" cannot be a member of any role"),
+                    None,
                 ));
             };
             // A role that `role` already reaches cannot become its member:
@@ -353,6 +300,7 @@ pub(crate) fn translate_grant_role(
                         "role \"{}\" is a member of role \"{}\"",
                         role.name, grantee.name
                     ),
+                    None,
                 ));
             }
             if memberships.get(role_id, member_id).is_some() {
@@ -368,7 +316,7 @@ pub(crate) fn translate_grant_role(
                 inherit_option: roles.get(member_id).is_none_or(|role| role.inherit),
                 set_option: true,
             };
-            emit_membership_insert(program, &cursors, &membership, change);
+            emit_membership_insert(program, &cursors, &membership);
             memberships.add(membership);
         }
     }
@@ -410,13 +358,66 @@ fn role_does_not_exist(name: &str) -> LimboError {
     sqlstate_error(
         SQLSTATE_UNDEFINED_OBJECT,
         format!("role \"{name}\" does not exist"),
+        None,
     )
 }
 
-/// The cursors that GRANT and REVOKE write the membership table through.
+/// Deletes `memberships` from the membership table and from the in-memory
+/// catalog, as DROP ROLE does for the memberships of the roles it drops.
+pub(crate) fn emit_memberships_delete(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+    memberships: &[Membership],
+) -> turso_core::Result<()> {
+    if memberships.is_empty() {
+        return Ok(());
+    }
+    let cursors = open_cursors(program, schema)?;
+    for membership in memberships {
+        emit_membership_delete(program, &cursors, membership);
+    }
+    Ok(())
+}
+
+/// The cursors that GRANT, REVOKE and DROP ROLE write the membership table
+/// through.
 struct Cursors {
     table: usize,
     role_member_index: usize,
+}
+
+/// Opens [`Cursors`] for writing the membership table of `schema`.
+fn open_cursors(program: &mut ProgramBuilder, schema: &Schema) -> turso_core::Result<Cursors> {
+    let Some(table) = schema.get_btree_table(NamespaceId::ROOT, AUTH_MEMBERS_TABLE_NAME) else {
+        return Err(LimboError::ParseError(
+            "the database has no role membership table".to_string(),
+        ));
+    };
+    let role_member_index = schema
+        .get_indices(NamespaceId::ROOT, AUTH_MEMBERS_TABLE_NAME)
+        .find(|index| index.name == AUTH_MEMBERS_ROLE_MEMBER_INDEX_NAME)
+        .cloned()
+        .ok_or_else(|| {
+            LimboError::Corrupt(format!(
+                "{AUTH_MEMBERS_TABLE_NAME} has no role and member index"
+            ))
+        })?;
+    let table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: table_cursor_id,
+        root_page: RegisterOrLiteral::Literal(table.root_page),
+        db: MAIN_DB_ID,
+    });
+    let index_cursor_id = program.alloc_cursor_index(None, &role_member_index)?;
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: index_cursor_id,
+        root_page: RegisterOrLiteral::Literal(role_member_index.root_page),
+        db: MAIN_DB_ID,
+    });
+    Ok(Cursors {
+        table: table_cursor_id,
+        role_member_index: index_cursor_id,
+    })
 }
 
 /// Inserts `membership` under a new rowid and tells the engine to add it to
@@ -425,7 +426,6 @@ fn emit_membership_insert(
     program: &mut ProgramBuilder,
     cursors: &Cursors,
     membership: &Membership,
-    change: &CatalogChange,
 ) {
     let id_reg = program.alloc_register();
     program.emit_insn(Insn::NewRowid {
@@ -469,14 +469,7 @@ fn emit_membership_insert(
         table_name: AUTH_MEMBERS_TABLE_NAME.to_string(),
     });
     emit_role_member_index_insert(program, cursors, membership, id_reg);
-    let value_regs = std::iter::once(id_reg)
-        .chain((1..AUTH_MEMBERS_COLUMN_COUNT).map(|offset| first_column_reg + offset))
-        .collect();
-    program.emit_insn(Insn::CatalogChange {
-        db: MAIN_DB_ID,
-        change: Box::new(change.clone()),
-        value_regs,
-    });
+    MembershipGranted.emit(program, id_reg, first_column_reg);
 }
 
 /// Adds `membership`, stored under the rowid in `id_reg`, to the role and
@@ -507,7 +500,6 @@ fn emit_membership_delete(
     program: &mut ProgramBuilder,
     cursors: &Cursors,
     membership: &Membership,
-    change: &CatalogChange,
 ) {
     let id = membership.id;
     let id_reg = program.alloc_register();
@@ -544,12 +536,75 @@ fn emit_membership_delete(
         table_name: AUTH_MEMBERS_TABLE_NAME.to_string(),
         is_part_of_update: true,
     });
-    program.emit_insn(Insn::CatalogChange {
-        db: MAIN_DB_ID,
-        change: Box::new(change.clone()),
-        value_regs: vec![id_reg],
-    });
+    MembershipRevoked.emit(program, id_reg);
 }
+
+/// A membership that `GRANT` inserted.
+#[derive(Debug)]
+struct MembershipGranted;
+
+impl MembershipGranted {
+    /// `id_reg` holds the id the membership was stored under, and the
+    /// registers from `first_column_reg` hold the columns of its record.
+    /// The values are the columns of [`schema_state_query`].
+    fn emit(self, program: &mut ProgramBuilder, id_reg: usize, first_column_reg: usize) {
+        let value_regs = std::iter::once(id_reg)
+            .chain((1..AUTH_MEMBERS_COLUMN_COUNT).map(|offset| first_column_reg + offset))
+            .collect();
+        emit_catalog_apply(program, self, value_regs);
+    }
+
+    fn apply_to(&self, memberships: &mut Memberships, values: &[Value]) -> turso_core::Result<()> {
+        let membership = membership_from_row(values).map_err(|_| {
+            LimboError::InternalError(format!(
+                "GRANT read back {values:?} where a membership was written"
+            ))
+        })?;
+        memberships.add(membership);
+        Ok(())
+    }
+}
+
+/// A membership that `REVOKE` deleted.
+#[derive(Debug)]
+struct MembershipRevoked;
+
+impl MembershipRevoked {
+    /// `id_reg` holds the id of the deleted membership.
+    fn emit(self, program: &mut ProgramBuilder, id_reg: usize) {
+        emit_catalog_apply(program, self, vec![id_reg]);
+    }
+
+    fn apply_to(&self, memberships: &mut Memberships, values: &[Value]) -> turso_core::Result<()> {
+        let [Value::Numeric(Numeric::Integer(id))] = values else {
+            return Err(LimboError::InternalError(format!(
+                "REVOKE read back {values:?} where a membership id was written"
+            )));
+        };
+        let removed = memberships.by_id.remove(id);
+        assert!(
+            removed.is_some(),
+            "REVOKE removed membership {id}, which is not loaded"
+        );
+        Ok(())
+    }
+}
+
+macro_rules! apply_to_memberships {
+    ($($change:ty),*) => {
+        $(
+            impl CatalogApply for $change {
+                fn apply(&self, schema: &mut Schema, values: &[Value]) -> turso_core::Result<()> {
+                    change_schema_state(schema, |state| {
+                        self.apply_to(Arc::make_mut(&mut state.roles).memberships_mut(), values)
+                    })
+                }
+            }
+        )*
+    };
+}
+
+apply_to_memberships!(MembershipGranted, MembershipRevoked);
 
 /// Fills four new registers with the role and member index key of
 /// `membership`, stored under the rowid in `id_reg`, and returns the first.
@@ -619,8 +674,12 @@ mod tests {
     fn apply_grant_and_revoke_change_the_memberships() {
         let mut memberships = memberships(&[(1, 2, 3, true)]);
 
-        memberships.apply_grant(&row(7, 4, 3, false)).unwrap();
-        memberships.apply_revoke(&[Value::from_i64(1)]).unwrap();
+        MembershipGranted
+            .apply_to(&mut memberships, &row(7, 4, 3, false))
+            .unwrap();
+        MembershipRevoked
+            .apply_to(&mut memberships, &[Value::from_i64(1)])
+            .unwrap();
 
         let ids: Vec<_> = memberships.iter().map(|membership| membership.id).collect();
         assert_eq!(ids, vec![7]);

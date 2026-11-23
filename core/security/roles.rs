@@ -10,7 +10,7 @@
 //! and core asks it about them through [`crate::Dialect::role_by_name`],
 //! [`crate::Dialect::role_is_superuser`] and
 //! [`crate::Dialect::can_set_role`]. `CREATE ROLE` reaches the dialect as a
-//! [`crate::CatalogChange::CreateRole`]. A dialect that keeps no roles, such
+//! [`crate::AccessStatement::CreateRole`]. A dialect that keeps no roles, such
 //! as SQLite's, has only the built-in ids and refuses `CREATE ROLE`.
 
 /// The role a new connection runs as. The program that opens the connection

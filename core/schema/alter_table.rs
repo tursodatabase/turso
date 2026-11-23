@@ -64,7 +64,9 @@ mod rename_column_view {
     }
 
     /// `namespace` is the namespace of the view, where its names resolve.
+    #[allow(clippy::too_many_arguments)]
     pub fn rewrite_view_sql_for_column_rename(
+        dialect: &dyn crate::dialect::Dialect,
         view_sql: &str,
         schema: &Schema,
         namespace: NamespaceId,
@@ -75,6 +77,7 @@ mod rename_column_view {
     ) -> Result<Option<RewrittenView>> {
         let mut visiting_views = HashSet::default();
         rewrite_view_sql_for_column_rename_inner(
+            dialect,
             view_sql,
             schema,
             namespace,
@@ -88,6 +91,7 @@ mod rename_column_view {
 
     #[allow(clippy::too_many_arguments)]
     fn rewrite_view_sql_for_column_rename_inner(
+        dialect: &dyn crate::dialect::Dialect,
         view_sql: &str,
         schema: &Schema,
         namespace: NamespaceId,
@@ -97,7 +101,7 @@ mod rename_column_view {
         new_column: &str,
         visiting_views: &mut HashSet<String>,
     ) -> Result<Option<RewrittenView>> {
-        let cmd = crate::dialect::engine::parse_statement(view_sql)
+        let cmd = crate::dialect::parse_statement(dialect, view_sql)
             .map_err(|e| LimboError::ParseError(format!("failed to parse view SQL: {e}")))?;
         let Some(ast::Cmd::Stmt(ast::Stmt::CreateView {
             temporary,
@@ -123,6 +127,7 @@ mod rename_column_view {
                 view_columns_from_select(&original_select, schema, namespace, &view_columns)?;
 
             let ctx = ViewRewriteCtx::new(
+                dialect,
                 schema,
                 namespace,
                 target_table,
@@ -257,6 +262,7 @@ mod rename_column_view {
     }
 
     struct ViewRewriteCtx<'a> {
+        dialect: &'a dyn crate::dialect::Dialect,
         schema: &'a Schema,
         /// The namespace of the view being rewritten.
         namespace: NamespaceId,
@@ -274,6 +280,7 @@ mod rename_column_view {
 
     impl<'a> ViewRewriteCtx<'a> {
         fn new(
+            dialect: &'a dyn crate::dialect::Dialect,
             schema: &'a Schema,
             namespace: NamespaceId,
             target_table: &'a str,
@@ -282,6 +289,7 @@ mod rename_column_view {
             new_column: &'a str,
         ) -> Self {
             Self {
+                dialect,
                 schema,
                 namespace,
                 target_table,
@@ -407,7 +415,7 @@ mod rename_column_view {
                 where_clause,
                 group_by,
                 window_clause,
-                ..
+                distinctness,
             } => {
                 let sources = if let Some(ref mut from_clause) = from {
                     rewrite_from_clause_for_column_rename(
@@ -438,6 +446,20 @@ mod rename_column_view {
                 if let Some(ref mut where_expr) = where_clause {
                     rewrite_expr_in_scope(
                         where_expr,
+                        &sources,
+                        outer_scopes,
+                        ctx,
+                        changed,
+                        visiting_views,
+                    )?;
+                }
+
+                for expr in distinctness
+                    .iter_mut()
+                    .flat_map(|distinctness| distinctness.exprs_mut())
+                {
+                    rewrite_expr_in_scope(
+                        expr,
                         &sources,
                         outer_scopes,
                         ctx,
@@ -622,6 +644,7 @@ mod rename_column_view {
 
                         let mut rename_map = HashMap::default();
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename_inner(
+                            ctx.dialect,
                             &view.sql,
                             ctx.schema,
                             ctx.namespace,
@@ -1385,6 +1408,20 @@ pub fn rewrite_select_namespace_table_refs(
     );
 }
 
+/// Writes the qualifier `qualifier` in front of each reference to table
+/// `tbl` in `select` that has no qualifier. A reference to a CTE named `tbl`
+/// is left as written.
+pub fn qualify_select_table_refs(select: &mut ast::Select, tbl: &str, qualifier: &str) {
+    rewrite_select_in_scope(
+        select,
+        TableRenameScope {
+            table_qualifiers: Some(&[]),
+            new_qualifier: Some(qualifier),
+            ..TableRenameScope::new(tbl, tbl)
+        },
+    );
+}
+
 #[derive(Clone, Copy)]
 struct TableRenameScope<'a> {
     old_tbl: &'a str,
@@ -1395,6 +1432,9 @@ struct TableRenameScope<'a> {
     unqualified_names_table: bool,
     /// The qualifiers that name the table's namespace; None takes any.
     table_qualifiers: Option<&'a [String]>,
+    /// When set, a reference to the table keeps its name and gets this
+    /// qualifier, and column qualifiers and table functions are left alone.
+    new_qualifier: Option<&'a str>,
 }
 
 impl<'a> TableRenameScope<'a> {
@@ -1406,6 +1446,7 @@ impl<'a> TableRenameScope<'a> {
             qualifier_is_table: true,
             unqualified_names_table: true,
             table_qualifiers: None,
+            new_qualifier: None,
         }
     }
 
@@ -1481,7 +1522,18 @@ impl<'a> TableRenameScope<'a> {
     }
 
     fn renames_qualifier(&self, name: &ast::Name) -> bool {
-        self.qualifier_is_table && self.is_old_name(name)
+        self.new_qualifier.is_none() && self.qualifier_is_table && self.is_old_name(name)
+    }
+
+    fn renames_table_function(&self, name: &ast::QualifiedName) -> bool {
+        self.new_qualifier.is_none() && self.renames_table(name)
+    }
+
+    fn rewrite_table(&self, name: &mut ast::QualifiedName) {
+        match self.new_qualifier {
+            Some(qualifier) => name.namespace = Some(ast::Name::exact(qualifier.to_owned())),
+            None => name.name = self.new_name(),
+        }
     }
 
     fn is_old_name(&self, name: &ast::Name) -> bool {
@@ -1532,7 +1584,7 @@ fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, scope: TableRenameSco
             columns,
             group_by,
             window_clause,
-            ..
+            distinctness,
         } => {
             if let Some(ref mut from) = from {
                 rewrite_from_clause_table_refs(from, scope);
@@ -1560,6 +1612,12 @@ fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, scope: TableRenameSco
                     }
                     ast::ResultColumn::Star => {}
                 }
+            }
+            for expr in distinctness
+                .iter_mut()
+                .flat_map(|distinctness| distinctness.exprs_mut())
+            {
+                rewrite_expr_table_refs(expr, inner_scope);
             }
             if let Some(ref mut gb) = group_by {
                 for expr in &mut gb.exprs {
@@ -1599,11 +1657,11 @@ fn rewrite_select_table_entry_table_refs(
     match st {
         ast::SelectTable::Table(ref mut name, _, _) => {
             if scope.renames_table(name) {
-                name.name = scope.new_name();
+                scope.rewrite_table(name);
             }
         }
         ast::SelectTable::TableCall(ref mut name, ref mut args, _) => {
-            if scope.renames_table(name) {
+            if scope.renames_table_function(name) {
                 name.name = scope.new_name();
             }
             for arg in args {
@@ -1642,7 +1700,7 @@ fn rewrite_expr_table_refs(expr: &mut ast::Expr, scope: TableRenameScope) {
                 }
                 ast::Expr::InTable { rhs, .. } => {
                     if scope.renames_table(rhs) {
-                        rhs.name = scope.new_name();
+                        scope.rewrite_table(rhs);
                     }
                 }
                 _ => {}

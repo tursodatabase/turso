@@ -1455,7 +1455,7 @@ test cmp-time-with-invalid-text-is-an-error {
     SELECT count(*) FROM t WHERE tm < 'garbage';
 }
 expect error {
-    invalid time value
+    invalid input syntax for type time
 }
 
 @requires strict "uses STRICT tables"
@@ -1680,7 +1680,7 @@ test cmp-time-row-value-with-invalid-text-is-an-error {
     SELECT count(*) FROM t WHERE (tm, id) = ('garbage', 1);
 }
 expect error {
-    invalid time value
+    invalid input syntax for type time
 }
 
 @requires strict "uses STRICT tables"
@@ -1733,13 +1733,14 @@ expect {
 
 @requires strict "uses STRICT tables"
 test cmp-min-with-text-and-two-custom-types-is-an-error {
-    -- A text compared with a time and a date has no single type to be read as.
+    -- A time and a date do not compare, so there is no type for the text to be
+    -- read as.
     CREATE TABLE t(tm time, d date) STRICT;
     INSERT INTO t VALUES ('10:00:00', '2024-01-02');
     SELECT min(tm, d, '10:00') FROM t;
 }
 expect error {
-    cannot tell which type to read a string literal or parameter as
+    cannot compare type time with type date
 }
 
 @requires strict "uses STRICT tables"
@@ -1794,5 +1795,275 @@ test cmp-coalesce-with-text-and-two-custom-types-is-an-error {
     SELECT coalesce(tm, d, '10:00') FROM t;
 }
 expect error {
-    cannot tell which type to read a string literal or parameter as
+    cannot compare type time with type date
+}
+
+# Two different custom types do not compare when either of them changes the
+# values it stores (a domain over another type is compared as that type; a
+# STRUCT or UNION, a type with ENCODE or a DECODE changes values), unless they
+# already have one order in common, as numeric and bigint do. The error is
+# the same wherever the comparison appears and however the query runs it: as
+# written, as an index seek, as a hash join key, or as the key of the
+# ephemeral index of IN (SELECT ...).
+
+@requires strict "uses STRICT tables"
+test cmp-date-eq-timestamp-is-an-error {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
+    SELECT 1 FROM t WHERE d = ts;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-in-list-with-timestamp-is-an-error {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
+    SELECT 1 FROM t WHERE d IN (d, ts);
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-case-date-when-timestamp-is-an-error {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
+    SELECT CASE d WHEN ts THEN 1 ELSE 0 END FROM t;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-min-date-timestamp-is-an-error {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
+    SELECT min(d, ts) FROM t;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-comparison-in-dead-branch-is-an-error {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
+    SELECT 1 FROM t WHERE 0 AND d = ts;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-in-subquery-of-other-type-is-an-error {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
+    SELECT 1 FROM t WHERE ts IN (SELECT d FROM t);
+}
+expect error {
+    cannot compare type timestamp with type date
+}
+
+@requires strict "uses STRICT tables"
+test cmp-join-using-columns-of-other-types-is-an-error {
+    CREATE TABLE a(c date) STRICT;
+    CREATE TABLE b(c timestamp) STRICT;
+    SELECT 1 FROM a JOIN b USING (c);
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-same-custom-type-and-untyped-literal-still-compare {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-05', '2024-01-05 00:00:00', '2024-01-05 00:00:00'),
+        (2, '2024-01-06', '2024-01-06 00:00:00', '2024-01-06 00:00:00');
+    SELECT 'same', a.id, b.id FROM t a, t b WHERE a.d = b.d AND a.ts = b.ts AND a.tz = b.tz ORDER BY 2, 3;
+    SELECT 'literal', id FROM t WHERE d = '2024-01-05' AND ts = '2024-01-05 00:00:00' AND tz = '2024-01-05 00:00:00';
+    SELECT 'in', id FROM t WHERE ts IN (SELECT ts FROM t WHERE id = 2);
+    CREATE INDEX t_ts ON t(ts);
+    SELECT 'in-idx', id FROM t WHERE ts IN (SELECT ts FROM t WHERE id = 2);
+    SELECT 'cast', id FROM t WHERE ts = CAST(d AS timestamp) ORDER BY id;
+}
+expect {
+    same|1|1
+    same|2|2
+    literal|1
+    in|2
+    in-idx|2
+    cast|1
+    cast|2
+}
+
+@requires strict "uses STRICT tables"
+test cmp-coerce-only-types-of-the-same-family-still-compare {
+    -- varchar(n) and smallint only check a value, so they read as text and
+    -- integer and compare with each other and with their base.
+    CREATE TABLE t(v varchar(10), w varchar(20), s smallint, b bigint, x text, i integer) STRICT;
+    INSERT INTO t VALUES ('a', 'a', 1, 1, 'a', 1);
+    CREATE INDEX t_v ON t(v);
+    SELECT 'v-w', count(*) FROM t WHERE v = w;
+    SELECT 'v-x', count(*) FROM t WHERE v = x;
+    SELECT 's-b', count(*) FROM t WHERE s = b;
+    SELECT 's-i', count(*) FROM t WHERE s = i;
+    SELECT 'in', count(*) FROM t WHERE v IN (SELECT w FROM t);
+    SELECT 'between', count(*) FROM t WHERE s BETWEEN b AND b;
+}
+expect {
+    v-w|1
+    v-x|1
+    s-b|1
+    s-i|1
+    in|1
+    between|1
+}
+
+# Two different custom types do not meet in one result column either, for the
+# same reason as in a comparison: no rule says which type the column has, and
+# a compound SELECT removes duplicates by comparing the values. This covers a
+# compound SELECT, a multi-row VALUES, a recursive CTE, and the arms of CASE
+# and of the functions whose result is one of their arguments.
+
+@requires strict "uses STRICT tables"
+test cmp-union-of-date-and-timestamp-is-an-error {
+    CREATE TABLE t(d date, ts timestamp) STRICT;
+    SELECT d FROM t UNION SELECT ts FROM t;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-values-of-date-and-timestamp-is-an-error {
+    VALUES (CAST('2024-01-05' AS date)), (CAST('2024-01-05 00:00:00' AS timestamp));
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-insert-values-of-date-and-timestamp-converts-each-row {
+    -- INSERT converts each row to the target column, so rows of different
+    -- types are not compared with each other.
+    CREATE TABLE c(z timestamp) STRICT;
+    INSERT INTO c(z) VALUES (CAST('2024-01-05' AS date)), (CAST('2024-01-05 00:00:00' AS timestamp));
+    SELECT count(*) FROM c;
+}
+expect {
+    2
+}
+
+@requires strict "uses STRICT tables"
+test cmp-insert-values-with-a-cte-converts-each-row {
+    -- A WITH clause does not make the rows of an INSERT one result column.
+    CREATE TABLE c(z timestamp) STRICT;
+    WITH x AS (SELECT 1) INSERT INTO c(z) VALUES (CAST('2024-01-05' AS date)), (CAST('2024-01-05 00:00:00' AS timestamp));
+    SELECT count(*) FROM c;
+}
+expect {
+    2
+}
+
+@requires strict "uses STRICT tables"
+test cmp-coalesce-of-date-and-timestamp-is-an-error {
+    CREATE TABLE t(d date, ts timestamp) STRICT;
+    SELECT coalesce(d, ts) FROM t;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-case-result-of-date-and-timestamp-is-an-error {
+    CREATE TABLE t(d date, ts timestamp) STRICT;
+    SELECT CASE WHEN 1 THEN d ELSE ts END FROM t;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-iif-of-date-and-timestamp-is-an-error {
+    CREATE TABLE t(d date, ts timestamp) STRICT;
+    SELECT iif(1, d, ts) FROM t;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-result-column-of-coerce-only-and-compatible-types-still-works {
+    CREATE DOMAIN d1 AS date;
+    CREATE TABLE t(v varchar(10), w varchar(20), s smallint, b bigint, d date, e d1) STRICT;
+    INSERT INTO t VALUES ('a', 'a', 1, 1, '2024-01-05', '2024-01-05');
+    SELECT 'union', v FROM t UNION SELECT 'union', w FROM t;
+    SELECT 'int', s FROM t UNION SELECT 'int', b FROM t;
+    SELECT 'coalesce', coalesce(v, w), CASE WHEN 1 THEN v ELSE w END, coalesce(s, b) FROM t;
+    SELECT 'literal', coalesce(d, '2024-01-06') FROM t UNION ALL SELECT 'x', '2024-01-05' FROM t;
+    SELECT 'domain-base', d FROM t UNION SELECT 'domain-base', e FROM t;
+    VALUES (CAST('2024-01-05' AS date)), (CAST('2024-01-06' AS date));
+}
+expect {
+    union|a
+    int|1
+    coalesce|a|a|1
+    literal|2024-01-05
+    x|2024-01-05
+    domain-base|2024-01-05
+    2024-01-05
+    2024-01-06
+}
+
+@requires strict "uses STRICT tables"
+test cmp-timestamptz-with-varchar-is-an-error {
+    -- No operator compares a timestamptz with a varchar in PostgreSQL. The
+    -- stored forms of the two differ, so comparing them gave a wrong answer.
+    CREATE TABLE t(tz timestamptz, v varchar(40)) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 02:00:00+02', '2024-01-05 02:00:00+02');
+    SELECT tz = v FROM t;
+}
+expect error {
+    cannot compare type timestamptz with type varchar
+}
+
+@requires strict "uses STRICT tables"
+test cmp-domain-over-timestamptz-with-its-base-and-another-domain-compare {
+    CREATE DOMAIN dtz1 AS timestamptz;
+    CREATE DOMAIN dtz2 AS dtz1;
+    CREATE TABLE t(a dtz1, b dtz2, c timestamptz) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 02:00:00+02', '2024-01-05 00:00:00+00', '2024-01-05 00:00:00+00');
+    SELECT a = b, a = c, b = c FROM t;
+}
+expect {
+    1|1|1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-array-of-date-with-array-of-timestamp-is-an-error {
+    -- Arrays compare element by element, so the elements must compare.
+    CREATE TABLE t(ad date[], ats timestamp[]) STRICT;
+    INSERT INTO t VALUES (ARRAY[CAST('2024-01-05' AS date)], ARRAY[CAST('2024-01-05 00:00:00' AS timestamp)]);
+    SELECT ad = ats FROM t;
+}
+expect error {
+    cannot compare type date\[\] with type timestamp\[\]
+}
+
+@requires strict "uses STRICT tables"
+test cmp-array-of-date-union-array-of-timestamp-is-an-error {
+    CREATE TABLE t(ad date[], ats timestamp[]) STRICT;
+    INSERT INTO t VALUES (ARRAY[CAST('2024-01-05' AS date)], ARRAY[CAST('2024-01-05 00:00:00' AS timestamp)]);
+    SELECT ad FROM t UNION SELECT ats FROM t;
+}
+expect error {
+    cannot compare type date\[\] with type timestamp\[\]
+}
+
+@requires strict "uses STRICT tables"
+test cmp-arrays-of-the-same-type-compare {
+    CREATE TABLE t(a date[], b date[]) STRICT;
+    INSERT INTO t VALUES (ARRAY[CAST('2024-01-05' AS date)], ARRAY[CAST('2024-01-05' AS date)]);
+    SELECT a = b FROM t;
+    SELECT a FROM t UNION SELECT b FROM t;
+}
+expect {
+    1
+    {2024-01-05}
 }

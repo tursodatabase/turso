@@ -250,6 +250,8 @@ fn prepare_window_subquery(
         simple_aggregate: None,
     };
 
+    // Each window adds one level of subquery, so it counts as a nested query.
+    let nested_query = resolver.enter_nested_query()?;
     prepare_window_subquery(
         program,
         &mut inner_plan,
@@ -258,6 +260,7 @@ fn prepare_window_subquery(
         windows,
         processed_window_count + 1,
     )?;
+    drop(nested_query);
 
     let subquery = JoinedTable::new_subquery(
         format!("window_subquery_{processed_window_count}"),
@@ -3964,7 +3967,7 @@ fn emit_row_output_subroutine(
 
     program.preassign_label_to_next_insn(label_skip_returning_row);
 
-    if let Distinctness::Distinct { ctx } = &plan.distinctness {
+    if let Distinctness::Distinct { ctx, .. } = &plan.distinctness {
         let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
         program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
     }

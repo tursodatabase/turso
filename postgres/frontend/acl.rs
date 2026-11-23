@@ -284,6 +284,13 @@ impl Acl {
         })
     }
 
+    /// Whether role `oid` is a grantee or a grantor of an entry.
+    pub(crate) fn names_role(&self, oid: i64) -> bool {
+        self.items
+            .iter()
+            .any(|item| item.grantee == oid || item.grantor == oid)
+    }
+
     /// Makes `new_owner` stand wherever `old_owner` stood, as grantee and as
     /// grantor, as PostgreSQL's `aclnewowner` does. Two entries that become
     /// the same pair merge into the earlier one.

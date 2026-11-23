@@ -1,6 +1,8 @@
+use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use turso_core::alloc::TryClone;
+use turso_core::dialect::{Dialect, ScalarFuncContext};
 use turso_core::function::ExternalFunc;
 use turso_core::namespace::NamespaceId;
 use turso_core::native_ext::*;
@@ -8,8 +10,8 @@ use turso_core::security::roles::SessionRole;
 use turso_core::sync::{Arc, Mutex};
 use turso_core::types::{AggContext, ExternalAggState, IOCompletions, IOResultOr};
 use turso_core::{
-    Completion, ConnectOpts, Connection, Database, IOResult, LimboError, MemoryIO, Numeric,
-    OpenOptions, Register, Result, Statement, StepResult, Value,
+    CollationSeq, Completion, ConnectOpts, Connection, Database, IOResult, LimboError, MemoryIO,
+    Numeric, OpenOptions, Register, Result, Statement, StepResult, Value,
 };
 use turso_ext::{ConstraintOp, ResultCode, VTabCursor, VTabModule, VTable};
 use turso_sqlite::SqliteDialect;
@@ -120,14 +122,79 @@ fn native_scalar_borrows_the_same_registers_across_io() {
     )
     .unwrap();
     let mut state = turso_core::native_ext::ExtensionState::None;
+    let io = MemoryIO::new();
+    let statement_times = Cell::new(None);
+    let context = ScalarFuncContext {
+        connection: &conn,
+        io: &io,
+        clock: &io,
+        statement_times: &statement_times,
+        collation: CollationSeq::BINARY,
+    };
     let value = finish(&queue, || {
-        function.func.call_scalar(&mut state, &conn, &args)
+        function.func.call_scalar(&mut state, &context, &args)
     });
     assert_eq!(value, Value::from_i64(73));
     assert!(matches!(
         state,
         turso_core::native_ext::ExtensionState::None
     ));
+}
+
+#[test]
+fn trigger_sees_the_start_time_of_the_statement_that_fires_it() {
+    let conn = statement_micros_connection();
+    conn.execute("CREATE TABLE src(x INTEGER)").unwrap();
+    conn.execute("CREATE TABLE log(t INTEGER)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER src_insert AFTER INSERT ON src BEGIN \
+         INSERT INTO log VALUES (statement_micros()); END",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO src SELECT statement_micros() FROM generate_series(1, 1000)")
+        .unwrap();
+    assert_eq!(
+        conn.prepare(
+            "SELECT count(DISTINCT t) FROM (SELECT x AS t FROM src UNION ALL SELECT t FROM log)"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![Value::from_i64(1)]]
+    );
+}
+
+#[test]
+fn transaction_started_without_begin_has_a_start_time() {
+    let starts: [fn(&Arc<Connection>); 2] = [
+        |conn| conn.execute("SAVEPOINT s").unwrap(),
+        |conn| conn.wal_insert_begin().unwrap(),
+    ];
+    for start in starts {
+        let conn = statement_micros_connection();
+        start(&conn);
+        assert_eq!(
+            conn.prepare("SELECT statement_micros() > 0")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::from_i64(1)]]
+        );
+    }
+}
+
+fn statement_micros_connection() -> Arc<Connection> {
+    connection(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+            ExternalFunc::new_native_scalar(
+                "statement_micros".into(),
+                FunctionArity::Exact(0),
+                false,
+                StatementMicros,
+            )
+            .unwrap(),
+        ),
+    )
 }
 
 #[test]
@@ -249,18 +316,21 @@ struct ConnectionContextCall {
 impl ScalarCall for ConnectionContextCall {
     type Output = Value;
 
-    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
+    fn step(&mut self, context: &ScalarFuncContext<'_>, args: &[Register]) -> IOResultOr<Value> {
         if integer(args[0].get_value()) == 0 {
-            let context = connection.context::<AtomicI64>().ok_or_else(|| {
+            let counter = context.connection.context::<AtomicI64>().ok_or_else(|| {
                 LimboError::ExtensionError("connection context is required".into())
             })?;
             return Ok(IOResult::Done(Value::from_i64(
-                context.load(Ordering::SeqCst),
+                counter.load(Ordering::SeqCst),
             )));
         }
         if self.statement.is_none() {
-            self.statement =
-                Some(connection.prepare_internal("SELECT connection_context_read(0) + 3")?);
+            self.statement = Some(
+                context
+                    .connection
+                    .prepare_internal("SELECT connection_context_read(0) + 3")?,
+            );
         }
         if let Some(io) = self.gate.wait() {
             return Ok(IOResult::IO(io));
@@ -560,7 +630,7 @@ struct GatedSevenCall {
 impl ScalarCall for GatedSevenCall {
     type Output = Value;
 
-    fn step(&mut self, _connection: &Arc<Connection>, _args: &[Register]) -> IOResultOr<Value> {
+    fn step(&mut self, _context: &ScalarFuncContext<'_>, _args: &[Register]) -> IOResultOr<Value> {
         if let Some(io) = self.gate.wait() {
             return Ok(IOResult::IO(io));
         }
@@ -593,7 +663,7 @@ struct RegisterProbeCall {
 impl ScalarCall for RegisterProbeCall {
     type Output = Value;
 
-    fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
+    fn step(&mut self, _context: &ScalarFuncContext<'_>, args: &[Register]) -> IOResultOr<Value> {
         assert_eq!(args.as_ptr() as usize, self.args_address);
         if let Some(io) = self.gate.wait() {
             return Ok(IOResult::IO(io));
@@ -618,10 +688,33 @@ impl ScalarFunction for ConnectionChanges {
 impl ScalarCall for ConnectionChanges {
     type Output = Value;
 
-    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
+    fn step(&mut self, context: &ScalarFuncContext<'_>, args: &[Register]) -> IOResultOr<Value> {
         Ok(IOResult::Done(Value::from_i64(
-            connection.changes() * 10 + integer(args[0].get_value()),
+            context.connection.changes() * 10 + integer(args[0].get_value()),
         )))
+    }
+}
+
+/// When the calling statement started, in microseconds since 1970.
+#[derive(Debug, Clone, Copy)]
+struct StatementMicros;
+
+impl ScalarFunction for StatementMicros {
+    type Call = Self;
+
+    fn create_call(&self) -> Result<Self::Call> {
+        Ok(*self)
+    }
+}
+
+impl ScalarCall for StatementMicros {
+    type Output = i64;
+
+    fn step(&mut self, context: &ScalarFuncContext<'_>, _args: &[Register]) -> IOResultOr<i64> {
+        let start = context.statement_times().statement;
+        Ok(IOResult::Done(
+            start.secs * 1_000_000 + i64::from(start.micros),
+        ))
     }
 }
 
@@ -639,7 +732,7 @@ impl ScalarFunction for Nine {
 impl ScalarCall for Nine {
     type Output = i64;
 
-    fn step(&mut self, _connection: &Arc<Connection>, _args: &[Register]) -> IOResultOr<i64> {
+    fn step(&mut self, _context: &ScalarFuncContext<'_>, _args: &[Register]) -> IOResultOr<i64> {
         Ok(IOResult::Done(9))
     }
 }
@@ -660,7 +753,7 @@ struct NullToNineCall;
 impl ScalarCall for NullToNineCall {
     type Output = Value;
 
-    fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
+    fn step(&mut self, _context: &ScalarFuncContext<'_>, args: &[Register]) -> IOResultOr<Value> {
         Ok(IOResult::Done(match args[0].get_value() {
             Value::Null => Value::from_i64(9),
             value => value.clone(),
@@ -1219,6 +1312,7 @@ fn native_module_creation_borrows_original_argument_buffers() {
             assert_eq!(calls.load(Ordering::SeqCst), 1);
         } else {
             let table = turso_core::vtab::VirtualTable::table(
+                &SqliteDialect,
                 Some("arguments"),
                 "argument_module",
                 args,
@@ -1258,7 +1352,7 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
     ))
     .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 3);
-    let mut schema = turso_core::schema::Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     schema
         .handle_schema_row(
             "table",
@@ -1314,6 +1408,7 @@ fn c_module_creation_converts_core_arguments_at_the_callback() {
                 }
             } else {
                 let result = turso_core::vtab::VirtualTable::table(
+                    &SqliteDialect,
                     Some("arguments"),
                     "c_arguments_module",
                     args,
@@ -1323,9 +1418,7 @@ fn c_module_creation_converts_core_arguments_at_the_callback() {
                     let table = result.unwrap();
                     let mut cursor = table.open(conn.clone()).unwrap();
                     assert!(matches!(
-                        cursor
-                            .filter(0, None, 0, turso_core::alloc::vec![])
-                            .unwrap(),
+                        cursor.filter(0, None, &mut []).unwrap(),
                         IOResult::Done(true)
                     ));
                     let IOResult::Done(value) = cursor.column(0).unwrap() else {
@@ -1372,6 +1465,37 @@ fn virtual_table_filter_next_and_column_resume_without_skipping_rows() {
         .prepare("SELECT value FROM (SELECT 1 AS n) LEFT JOIN native_rows(18) ON 1")
         .unwrap();
     assert_eq!(collect(&mut outer, &queue), vec![vec![Value::Null]]);
+}
+
+#[test]
+fn table_function_argument_reads_a_table_listed_after_the_function() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+        "native_rows",
+        VTabKind::TableValuedFunction,
+        RowsModule {
+            queue: queue.clone(),
+            rows: Arc::new(Mutex::new(vec![(1, 4), (2, 9), (3, 17)])),
+            events: Arc::new(Mutex::new(Vec::new())),
+            writable: false,
+        },
+    ));
+    conn.execute("CREATE TABLE bounds(lower)").unwrap();
+    conn.execute("INSERT INTO bounds VALUES (8), (16)").unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT bounds.lower, r.value FROM native_rows(bounds.lower) AS r, bounds \
+             ORDER BY bounds.lower, r.value",
+        )
+        .unwrap();
+    assert_eq!(
+        collect(&mut stmt, &queue),
+        vec![
+            vec![Value::from_i64(8), Value::from_i64(9)],
+            vec![Value::from_i64(8), Value::from_i64(17)],
+            vec![Value::from_i64(16), Value::from_i64(17)],
+        ]
+    );
 }
 
 #[test]
@@ -2139,7 +2263,7 @@ struct DelayedCall {
 impl ScalarCall for DelayedCall {
     type Output = Value;
 
-    fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
+    fn step(&mut self, _context: &ScalarFuncContext<'_>, args: &[Register]) -> IOResultOr<Value> {
         if let Some(io) = self.gate.wait() {
             return Ok(IOResult::IO(io));
         }
@@ -2185,9 +2309,13 @@ struct NestedSumCall {
 impl ScalarCall for NestedSumCall {
     type Output = Value;
 
-    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
+    fn step(&mut self, context: &ScalarFuncContext<'_>, args: &[Register]) -> IOResultOr<Value> {
         if self.statement.is_none() {
-            self.statement = Some(connection.prepare_internal("SELECT x FROM input_values")?);
+            self.statement = Some(
+                context
+                    .connection
+                    .prepare_internal("SELECT x FROM input_values")?,
+            );
         }
         if let Some(io) = self.gate.wait() {
             return Ok(IOResult::IO(io));

@@ -721,39 +721,55 @@ expect {
     5|6
 }
 
-@skip-if postgres "tursopg pg_get_expr returns pg-dialect syntax; real postgres returns a different internal representation"
+# tursopg does not print GREATEST as PostgreSQL does and shows the
+# expression as the engine stores it.
+@compat-gap "function:pg_get_expr"
 test stored-generated-column-pg-get-expr-returns-pg-syntax {
     CREATE TABLE t (a int, b int GENERATED ALWAYS AS (greatest(a, 2)) STORED);
     SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef pa JOIN pg_class pc ON pa.adrelid = pc.oid WHERE pc.relname = 't';
 }
 expect {
+    GREATEST(a, 2)
+}
+expect @tursopg {
     greatest (a, 2)
 }
 
-@skip-if postgres "real postgres prints adbin differently"
 test stored-generated-column-pg-get-expr-keeps-grouping {
     CREATE TABLE t (a int, b int, g int GENERATED ALWAYS AS (a - (1 - b)) STORED);
     SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef pa JOIN pg_class pc ON pa.adrelid = pc.oid WHERE pc.relname = 't';
 }
 expect {
-    a - (1 - b)
+    (a - (1 - b))
 }
 
-@skip-if postgres "real postgres prints adbin differently"
 test stored-generated-column-pg-get-expr-quotes-names {
     CREATE TABLE t ("select" int, "Mixed Case" int, g int GENERATED ALWAYS AS ("select" + "Mixed Case") STORED);
     SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef pa JOIN pg_class pc ON pa.adrelid = pc.oid WHERE pc.relname = 't';
 }
 expect {
-    "select" + "Mixed Case"
+    ("select" + "Mixed Case")
 }
 
-@skip-if postgres "real postgres prints adbin differently"
 test stored-generated-column-pg-get-expr-after-rename {
     CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
     ALTER TABLE t RENAME COLUMN a TO z;
     SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef pa JOIN pg_class pc ON pa.adrelid = pc.oid WHERE pc.relname = 't';
 }
 expect {
-    z * 2
+    (z * 2)
+}
+
+@compat-gap "syntax:generated-column"
+test virtual-generated-column {
+    CREATE TABLE virt (a int, b int GENERATED ALWAYS AS (a * 2));
+    INSERT INTO virt VALUES (3);
+    SELECT b FROM virt;
+}
+expect {
+    6
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a virtual generated column is not supported
 }

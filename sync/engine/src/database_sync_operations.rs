@@ -1740,9 +1740,15 @@ pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
                 running_crc = Some(stored_crc);
             }
 
+            // A frame without an extension block carries no portable changes,
+            // so its row changes cannot be replayed here. A log that needs
+            // portable changes never contains such a frame, so the log is corrupt.
             if extension_size == 0 {
-                pos = frame_end;
-                continue;
+                return Err(turso_core::LimboError::Corrupt(format!(
+                    "MVCC logical-log frame at range offset {frame_start} has no portable changes; \
+                     the remote database must be upgraded with PRAGMA journal_mode = 'mvcc'"
+                ))
+                .into());
             }
             let extension_block = &range_body[extension_start..recovery_start];
             let recovery_payload = &range_body[recovery_start..trailer_start];
@@ -1834,7 +1840,11 @@ pub async fn wal_apply_from_file<Ctx>(
     session: &mut DatabaseWalSession,
 ) -> Result<u32> {
     let size = frames_file.size()?;
-    assert!(size % WAL_FRAME_SIZE as u64 == 0);
+    if size % WAL_FRAME_SIZE as u64 != 0 {
+        return Err(Error::DatabaseSyncEngineError(
+            "changes file size is not a whole number of WAL frames".to_string(),
+        ));
+    }
     #[allow(clippy::arc_with_non_send_sync)]
     let buffer = Arc::new(Buffer::new_temporary(WAL_FRAME_SIZE));
     tracing::info!("wal_apply_from_file: size={}", size);
@@ -1857,7 +1867,11 @@ pub async fn wal_apply_from_file<Ctx>(
         db_size = info.db_size;
         session.append_page(info.page_no, &buffer.as_slice()[WAL_FRAME_HEADER..])?;
     }
-    assert!(db_size > 0);
+    if db_size == 0 {
+        return Err(Error::DatabaseSyncEngineError(
+            "changes file does not end with a commit frame".to_string(),
+        ));
+    }
     Ok(db_size)
 }
 

@@ -2098,18 +2098,18 @@ pub fn insn_to_row(
                 0,
                 "ADD TYPE".to_string(),
             ),
-            Insn::CatalogChange {
+            Insn::CatalogApply {
                 db,
-                change,
+                apply,
                 value_regs,
             } => (
-                "CatalogChange",
+                "CatalogApply",
                 *db as i64,
                 value_regs.first().map_or(0, |reg| *reg as i64),
                 0,
-                Value::build_text(format!("{change:?}")),
+                Value::build_text(format!("{apply:?}")),
                 0,
-                "tell the dialect its catalog changed".to_string(),
+                "apply the change to the dialect's state in the schema".to_string(),
             ),
             Insn::DropView {
                 db,
