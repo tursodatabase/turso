@@ -618,14 +618,17 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// Whether a custom type that reads text and has an ENCODE (such as date,
-    /// timestamp, json or inet) is refused a value of any other kind, and a
-    /// CAST from such a type is refused when its target does not read text.
+    /// Whether a CAST from a custom type that reads text and has an ENCODE
+    /// (such as date, timestamp, json or inet) is refused when its target does
+    /// not read text.
     ///
-    /// PostgreSQL has no cast between these types and numbers, booleans or
-    /// bytea: `20200101::date` and `date '2020-01-01'::int` fail. SQLite
-    /// converts the value to text, or reads the text as a number, so the
-    /// first gives 2020-01-01 and the second 2020, which are wrong answers.
+    /// PostgreSQL has no cast from these types to numbers, booleans or bytea:
+    /// `date '2020-01-01'::int` fails. SQLite reads the text as a number, so
+    /// it gives 2020, which is a wrong answer. A number stored into or cast
+    /// to one of these types is read as its text, so `20200101::date` gives
+    /// 2020-01-01 where PostgreSQL refuses it: tursopg binds a parameter sent
+    /// without a type as a number when its text is one, and refusing numbers
+    /// would refuse such parameters too.
     fn text_input_types_refuse_other_kinds(&self) -> bool {
         false
     }
