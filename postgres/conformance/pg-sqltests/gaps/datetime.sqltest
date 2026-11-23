@@ -790,3 +790,16 @@ expect {
 expect @tursopg {
     2
 }
+
+# tursopg refuses a type modifier in a cast.
+@compat-gap "cast:timestamptz -> varchar(n)"
+test timestamptz-cast-to-varchar-with-length {
+    CREATE TABLE t (tz timestamptz);
+    INSERT INTO t VALUES ('2024-01-05 10:00:00+02');
+    SELECT CAST(tz AS varchar(40)) FROM t;
+}
+expect {
+    2024-01-05 08:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {}

@@ -486,6 +486,17 @@ expect {
     1
 }
 
+# A cast to varchar, and a cast of a domain over timestamptz, give the same text.
+test datetime-timestamptz-text-cast-varchar-and-domain {
+    CREATE DOMAIN stamp AS timestamptz;
+    CREATE TABLE t (id int, tz timestamptz, d stamp);
+    INSERT INTO t VALUES (1, '2024-01-05 10:00:00+02', '2024-01-05 10:00:00+02');
+    SELECT tz::varchar, d::text, d::varchar FROM t;
+}
+expect {
+    2024-01-05 08:00:00+00|2024-01-05 08:00:00+00|2024-01-05 08:00:00+00
+}
+
 # The order of the fields matters: `T` needs a date before it and a time after it,
 # it and a time after it, a date cannot follow a time, and the order of a
 # date's numbers and month name is limited.

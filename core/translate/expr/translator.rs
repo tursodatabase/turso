@@ -900,6 +900,15 @@ fn translate_cast_expr(
             return Ok(target_register);
         }
         if let Some(resolved) = custom_type_cast_chain(tn, resolver.schema())? {
+            if casts_to_varchar(&resolved) {
+                emit_builtin_type_text_suffix(
+                    program,
+                    referenced_tables,
+                    expr,
+                    target_register,
+                    resolver,
+                );
+            }
             emit_custom_type_cast(program, resolved, tn, target_register, resolver)?;
             return Ok(target_register);
         }
@@ -936,6 +945,11 @@ fn emit_builtin_type_text_suffix(
     else {
         return;
     };
+    // A domain over a built-in type takes the built-in type's text.
+    let type_def = match resolver.schema().resolve_type_unchecked(&type_def.name) {
+        Ok(Some(resolved)) => Arc::clone(resolved.chain.last().unwrap_or(&type_def)),
+        _ => type_def,
+    };
     if !type_def.is_builtin {
         return;
     }
@@ -948,6 +962,15 @@ fn emit_builtin_type_text_suffix(
         rhs: suffix_reg,
         dest: reg,
     });
+}
+
+/// Whether a CAST to the resolved type gives a varchar, which is text with a
+/// length limit.
+fn casts_to_varchar(resolved: &crate::schema::ResolvedType) -> bool {
+    resolved
+        .chain
+        .last()
+        .is_some_and(|type_def| type_def.is_builtin && type_def.name == "varchar")
 }
 
 /// Emits a CAST of the value in `reg` to the custom type `type_name`, whose
