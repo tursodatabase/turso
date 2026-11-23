@@ -164,3 +164,35 @@ expect {
     6|12
     29|29
 }
+
+# A BLOB that ends in the overflow pages moves from the buffer of the cursor
+# into the register. A second read of the same BLOB in the same row reads the
+# overflow pages again. Rows 31 to 33 put NULL, an integer and a small BLOB in
+# the registers before the large BLOB of row 34.
+@cross-check-integrity
+test overflow-blob-read-more-than-once-in-a-row {
+    PRAGMA page_size = 512;
+    CREATE TABLE ob(i INTEGER, big BLOB, tail TEXT);
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30)
+    INSERT INTO ob SELECT i, CAST(replace(hex(zeroblob(300 + i * 37)), '0', char(65 + i % 26)) AS BLOB), 't' || i FROM n;
+    INSERT INTO ob VALUES (31, NULL, 'null'), (32, 7, 'int'), (33, x'0102', 'small');
+    INSERT INTO ob SELECT 34, CAST(replace(hex(zeroblob(2000)), '0', 'z') AS BLOB), 't34';
+    SELECT i, length(big), hex(substr(big, 1, 2)), hex(substr(big, -2)), length(big) + length(big), typeof(big), tail FROM ob WHERE i IN (1, 2, 29, 30, 31, 32, 33, 34);
+    SELECT count(*), sum(length(big)), sum(length(big) * 2 = length(big) + length(big)), group_concat(hex(substr(big, 1, 1)), '') FROM ob;
+    SELECT a.i, a.big = b.big, length(a.big || b.big) FROM ob a JOIN ob b ON b.i = a.i + 1 WHERE a.i IN (1, 29, 30, 33);
+}
+expect {
+    1|674|4242|4242|1348|blob|t1
+    2|748|4343|4343|1496|blob|t2
+    29|2746|4444|4444|5492|blob|t29
+    30|2820|4545|4545|5640|blob|t30
+    31|||||null|null
+    32|1|37|37|2|integer|int
+    33|2|0102|0102|4|blob|small
+    34|4000|7A7A|7A7A|8000|blob|t34
+    34|56413|33|42434445464748494A4B4C4D4E4F505152535455565758595A414243444537017A
+    1|0|1422
+    29|0|5566
+    30||
+    33|0|4002
+}

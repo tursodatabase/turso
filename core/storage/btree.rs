@@ -8053,6 +8053,19 @@ impl BTreeCursor {
         Ok(IOResult::Done(&self.blob_cache.kept_read_mut(which).bytes))
     }
 
+    /// Takes the bytes that the last `read_payload(KeptRead::Values, ..)` read
+    /// and keeps `buffer`, emptied, in their place. The cursor forgets that
+    /// read, so the next read of these values reads them from the pages again.
+    pub(crate) fn take_kept_values(
+        &mut self,
+        mut buffer: crate::alloc::Vec<u8>,
+    ) -> crate::alloc::Vec<u8> {
+        buffer.clear();
+        let kept = &mut self.blob_cache.kept_values;
+        kept.valid = false;
+        std::mem::replace(&mut kept.bytes, buffer)
+    }
+
     /// `payload_fetch` with the page bytes typed as `'static`. `record_payload`
     /// needs that: it either returns these bytes or goes on to call
     /// `self.record()`, and with the bytes borrowing `self` the borrow checker

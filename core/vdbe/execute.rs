@@ -2417,6 +2417,21 @@ fn op_column_fetch_overflowing(
         state,
         cursor.read_payload(KeptRead::Values, values_start, values_end - values_start)
     );
+    if let [(i, _, serial_type)] = values_in_overflow[..] {
+        // The run is one BLOB, so the bytes that the cursor read are the
+        // value. Move them into the register instead of copying them, and give
+        // the cursor the old buffer of the register to read into next time.
+        let is_blob = serial_type >= 12 && serial_type & 1 == 0;
+        if is_blob && bytes.len() as u64 == (serial_type - 12) / 2 {
+            let reg = &mut state.registers[dest + i];
+            let old_blob = match reg {
+                Register::Value(Value::Blob(blob)) => std::mem::replace(blob, crate::alloc::vec![]),
+                _ => crate::alloc::vec![],
+            };
+            reg.set_blob(cursor.take_kept_values(old_blob))?;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
     for (i, offset, serial_type) in values_in_overflow {
         decode_serial_type_into_register(
             serial_type,
