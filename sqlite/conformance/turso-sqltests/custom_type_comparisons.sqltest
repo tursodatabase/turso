@@ -2131,3 +2131,22 @@ test cmp-array-of-timestamp-concat-date-is-an-error {
 expect error {
     cannot compare type timestamp with type date
 }
+
+@requires strict "uses STRICT tables"
+test cmp-array-of-timestamp-and-date-is-an-error {
+    CREATE TABLE t(d date, ts timestamp) STRICT;
+    SELECT ARRAY[ts, d] FROM t;
+}
+expect error {
+    cannot compare type timestamp with type date
+}
+
+@requires strict "uses STRICT tables"
+test cmp-concat-of-array-of-timestamp-and-date-compares-nothing {
+    CREATE TABLE t(d date, ats timestamp[]) STRICT;
+    INSERT INTO t VALUES ('2024-01-05', ARRAY['2024-01-05 00:00:00']);
+    SELECT typeof(concat(ats, d)) FROM t;
+}
+expect {
+    text
+}

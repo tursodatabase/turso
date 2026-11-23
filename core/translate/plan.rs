@@ -1107,10 +1107,11 @@ pub struct SelectPlan {
 
 impl SelectPlan {
     /// The expression that gives result column `column` its affinity. The
-    /// result columns of a VALUES list hold only placeholders, so its first
-    /// row gives the affinity, as in SQLite.
+    /// result columns of a VALUES list hold only placeholders, so its last
+    /// row gives the affinity, as in SQLite, which plans the rows as a
+    /// compound SELECT whose last part is the last row.
     pub fn result_column_affinity_expr(&self, column: usize) -> &ast::Expr {
-        match self.values.first() {
+        match self.values.last() {
             Some(row) => &row[column],
             None => &self.result_columns[column].expr,
         }

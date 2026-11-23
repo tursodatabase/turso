@@ -212,11 +212,12 @@ multi-row VALUES that is not the row source of an INSERT, a recursive CTE with
 UNION or UNION ALL, the results of CASE, `coalesce`, `ifnull` and `iif`, and `lag` and `lead`
 with a default of another type. A string literal compared with a custom type is read as that type.
 Two arrays compare when their element types compare, so `date[]` with
-`timestamp[]` fails. So does every function or operator with an array
-argument whose other values, or another array's elements, do not compare with
-the array's elements, such as `array_position(ats, d)`, `array_append(ats, d)`,
-`array_set_element(ats, 1, d)`, `ats || d`, `ARRAY[d, ts]`, `@>`, `<@` and `&&`
-for a `timestamp[]` and a `date`. PostgreSQL converts or refuses these. Two types that only check a value, such as `varchar(n)` and
+`timestamp[]` fails. So do the array functions and operators that compare
+an array's elements with other values or put values into one array, such as
+`array_position(ats, d)`, `array_append(ats, d)`, `array_set_element(ats, 1, d)`,
+`ats || d`, `ARRAY[d, ts]`, `@>`, `<@` and `&&` for a `timestamp[]` and a
+`date`. A function that turns its arguments into text, such as `concat(ats, d)`,
+compares nothing and is accepted. PostgreSQL converts or refuses these. Two types that only check a value, such as `varchar(n)` and
 `smallint`, compare as they did before this check, as stored. PostgreSQL refuses
 that pair, so Turso accepts a comparison that PostgreSQL rejects.
 

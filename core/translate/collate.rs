@@ -791,7 +791,15 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
             lhs,
             Operator::ArrayContains | Operator::ArrayOverlap | Operator::Concat,
             rhs,
-        ) => check_comparable_array_values([lhs.as_ref(), rhs.as_ref()].into_iter(), context),
+        ) => {
+            // `||` of two values that are not arrays joins text and compares nothing.
+            let env = context.type_env();
+            if type_of(lhs, &env).is_array() || type_of(rhs, &env).is_array() {
+                check_comparable_array_values([lhs.as_ref(), rhs.as_ref()].into_iter(), context)
+            } else {
+                Ok(())
+            }
+        }
         // Compiled as `lhs >= start AND lhs <= end`.
         Expr::Between {
             lhs, start, end, ..
@@ -833,7 +841,12 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
                 check_comparable_results(args.iter().map(|arg| arg.as_ref()), context)?;
                 common_type_ordering(args.iter().map(|arg| (arg.as_ref(), context)))?;
             }
-            check_comparable_array_values(args.iter().map(|arg| arg.as_ref()), context)?;
+            if func
+                .as_ref()
+                .is_some_and(|func| func.compares_or_combines_array_elements())
+            {
+                check_comparable_array_values(args.iter().map(|arg| arg.as_ref()), context)?;
+            }
             // The result is one of these arguments, so they have one type. A function
             // that needs a collation, such as min and max, was checked above.
             match func.as_ref().map(|func| func.result_type()) {
@@ -1021,24 +1034,18 @@ pub(crate) fn check_comparable_results<'a>(
     check_comparable_types(exprs.map(|expr| (type_of(expr, &env), context.schema())))
 }
 
-/// [check_comparable] for every pair of the values of `args`, the arguments of
-/// a function or operator, when one of them is an array: the value of an array
-/// argument is its element. A function or operator with an array argument
-/// compares its values with the elements, as `array_position(a, x)` and
-/// `a && b` do, or makes them elements of one array, as `array_append(a, x)`
-/// and `a || x` do. Arguments that are not values, such as the index of
-/// `array_length(a, 1)`, have built-in types, which compare with any type.
+/// [check_comparable] for every pair of the values of `args`, the arguments
+/// of a function or operator that compares or combines array elements: the
+/// value of an array argument is its element. Arguments that are not values,
+/// such as the index of `array_set_element(a, 1, x)`, have built-in types,
+/// which compare with any type.
 fn check_comparable_array_values<'a>(
     args: impl Iterator<Item = &'a Expr>,
     context: &ExprContext<'_, '_>,
 ) -> Result<()> {
     let env = context.type_env();
-    let types: SmallVec<[ExprType; 4]> = args.map(|arg| type_of(arg, &env)).collect();
-    if !types.iter().any(ExprType::is_array) {
-        return Ok(());
-    }
-    check_comparable_types(types.into_iter().map(|ty| {
-        let value_type = match ty {
+    check_comparable_types(args.map(|arg| {
+        let value_type = match type_of(arg, &env) {
             ExprType::Array { element, .. } => *element,
             ty => ty,
         };
