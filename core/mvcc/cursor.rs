@@ -1244,6 +1244,19 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     /// Skips rows that are shadowed by MVCC.
     /// Returns IOResult indicating if we need to yield for IO or are done.
     fn seek_btree_and_set_peek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> IOResultOr<()> {
+        if op.eq_only()
+            && self.dual_peek.mvcc_peek.get_row_key().is_some()
+            && matches!(
+                (&seek_key, &self.mv_cursor_type),
+                (SeekKey::IndexKey(target), MvccCursorType::Index(info))
+                    if index_key_matches_at_most_one_row(target, info)?
+            )
+        {
+            // This visible memory match settles the bounded equality probe.
+            // Movement still reopens both ranges from the complete current key.
+            self.dual_peek.btree_peek = CursorPeek::Exhausted;
+            return Ok(IOResult::Done(()));
+        }
         // Fast path: btree not allocated
         if !self.is_btree_allocated() {
             self.dual_peek.btree_peek = CursorPeek::Exhausted;
@@ -1392,7 +1405,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 Ok(IOResult::Done(()))
             }
             Err(e) => {
-                self.seek_past_current = None;
+                if !matches!(*e, LimboError::Busy) {
+                    self.seek_past_current = None;
+                }
                 Err(e)
             }
         }
@@ -1966,16 +1981,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                             };
                             if found {
                                 // A peek ahead of the winner can skip a row restored by rollback.
-                                if let (
-                                    true,
-                                    SeekKey::IndexKey(index_key),
-                                    MvccCursorType::Index(index_info),
-                                ) = (in_btree, &seek_key, &self.mv_cursor_type)
+                                if in_btree
+                                    && matches!(self.mv_cursor_type, MvccCursorType::Index(_))
                                 {
-                                    if !index_key_matches_at_most_one_row(index_key, index_info)? {
-                                        self.peeks_valid_for = Some(direction);
-                                        self.mvcc_peek_needs_reseek = true;
-                                    }
+                                    self.peeks_valid_for = Some(direction);
+                                    self.mvcc_peek_needs_reseek = true;
                                 }
                                 return Ok(IOResult::Done(SeekResult::Found));
                             } else {
