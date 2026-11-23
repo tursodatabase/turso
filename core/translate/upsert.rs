@@ -1477,7 +1477,12 @@ pub fn emit_upsert(
         }
     }
 
-    // Build NEW table payload
+    // Build NEW table payload. An INTEGER PRIMARY KEY is stored only as the
+    // rowid, with NULL in its record slot, as UPDATE writes it. From here on
+    // the new rowid is read from `new_rowid`, not from this register.
+    if let Some(alias_idx) = rowid_alias_idx {
+        program.emit_null(layout.to_register(new_start, alias_idx), None);
+    }
     let record_reg = program.alloc_register();
     emit_make_record(program, table.columns().iter(), new_start, record_reg);
 
