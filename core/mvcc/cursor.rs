@@ -1271,6 +1271,15 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
                 _ => false,
             };
+        // A visible singleton index entry answers this probe completely. Leave
+        // physical positioning for movement, which recovers both sources past
+        // the current complete key. Table entries can fall through to B-tree.
+        if at_most_one_match
+            && matches!(self.mv_cursor_type, MvccCursorType::Index(_))
+            && self.dual_peek.mvcc_peek.get_row_key().is_some()
+        {
+            return Ok(IOResult::Done(()));
+        }
 
         loop {
             let Some(MvccLazyCursorState::Seek(SeekState::SeekBtree(btree_seek_state), direction)) =
