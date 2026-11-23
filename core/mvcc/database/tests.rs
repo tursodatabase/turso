@@ -7,7 +7,8 @@ use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
 use crate::alloc::{TursoAllocator, TursoIteratorExt, TursoTryWithCapacityExt};
-use crate::io::IO;
+use crate::io::clock::Clock;
+use crate::io::{Buffer, File, FileSyncType, IO};
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::database::CommitYieldPoint;
@@ -19,6 +20,7 @@ use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::Mutex;
 use crate::sync::RwLock;
+use crate::types::{SeekKey, SeekOp};
 use crate::{Completion, ConnectOpts, DatabaseOpts, LimboError, OpenFlags};
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
@@ -5045,6 +5047,457 @@ fn test_exact_index_cursor_returns_rows_restored_by_savepoint_rollback(
     fixture.rollback();
 }
 
+#[rstest::rstest]
+fn test_cursor_movement_retries_busy_seek(
+    #[values(false, true)] index: bool,
+    #[values(false, true)] backwards: bool,
+    #[values(0, 1, 3)] busy_count: u64,
+) {
+    let (fixture, reads) = cursor_fixture_with_read_probe(index.then_some(false));
+    fixture.insert_integer_rows([(20, 20), (40, 40)]);
+    let conn = &fixture.db.conn;
+    let io = &conn.db.io;
+    // Clearing before cursor construction keeps every live cursor page valid.
+    conn.pager.load().clear_page_cache(false);
+    let mut cursor = fixture.cursor();
+    let target = if backwards { 40 } else { 20 };
+    let record = CursorTestFixture::integer_record(index, target, target);
+    io.block(|| cursor.insert(&CursorTestFixture::btree_key(index, target, &record)))
+        .unwrap();
+    let key = if index {
+        SeekKey::IndexKey(record.as_record_ref())
+    } else {
+        SeekKey::TableRowId(target)
+    };
+    assert!(matches!(
+        io.block(|| cursor.seek(
+            key.clone(),
+            if backwards {
+                SeekOp::LE { eq_only: true }
+            } else {
+                SeekOp::GE { eq_only: true }
+            }
+        ))
+        .unwrap(),
+        SeekResult::Found
+    ));
+    let initial_reads = reads.calls.load(Ordering::SeqCst);
+    reads.busy_remaining.store(busy_count, Ordering::SeqCst);
+    let mut observed_busy = 0;
+    loop {
+        let result = if backwards {
+            io.block(|| cursor.prev())
+        } else {
+            io.block(|| cursor.next())
+        };
+        match result {
+            Err(LimboError::Busy) => {
+                observed_busy += 1;
+                assert!(observed_busy <= busy_count);
+            }
+            result => {
+                result.unwrap();
+                break;
+            }
+        }
+    }
+    let actual = cursor_rows_with_records(conn, &mut cursor, backwards);
+    let ids = if backwards {
+        [30, 20, 10]
+    } else {
+        [30, 40, 50]
+    };
+    let expected = ids
+        .into_iter()
+        .map(|id| {
+            let record = CursorTestFixture::integer_record(index, id, id);
+            (id, owned_cursor_record(record.as_record_ref()))
+        })
+        .collect::<Vec<_>>();
+    reads.busy_remaining.store(0, Ordering::SeqCst);
+    drop(cursor);
+    fixture.rollback();
+    assert_eq!(actual, expected);
+    assert_eq!(observed_busy, busy_count);
+    assert!(reads.calls.load(Ordering::SeqCst) > initial_reads + busy_count);
+}
+
+#[rstest::rstest]
+fn test_exact_physical_index_hit_reuses_btree_position(
+    #[values(false, true)] unique: bool,
+    #[values(false, true)] backwards: bool,
+) {
+    let fixture = CursorTestFixture::integer_rows(Some(unique), [(91, 10), (7, 30), (43, 50)]);
+    fixture.insert_integer_rows([(2, 20), (88, 40)]);
+    let conn = &fixture.db.conn;
+    let io = &conn.db.io;
+    let mut cursor = fixture.cursor();
+    let key = ImmutableRecord::from_values(&[Value::from_i64(30)], 1).unwrap();
+    let steps = Arc::new(SeekBtreeSteps::default());
+    conn.set_yield_injector(Some(steps.clone()));
+    io.block(|| {
+        cursor.seek(
+            SeekKey::IndexKey(key.as_record_ref()),
+            if backwards {
+                SeekOp::LE { eq_only: true }
+            } else {
+                SeekOp::GE { eq_only: true }
+            },
+        )
+    })
+    .unwrap();
+    assert_eq!(io.block(|| cursor.rowid()).unwrap(), Some(7));
+    let before = steps.seek_progress.load(Ordering::Relaxed);
+    if backwards {
+        io.block(|| cursor.prev()).unwrap();
+    } else {
+        io.block(|| cursor.next()).unwrap();
+    }
+    let after = steps.seek_progress.load(Ordering::Relaxed);
+    conn.set_yield_injector(None);
+    let actual = cursor_rows_with_records(conn, &mut cursor, backwards);
+    let expected = if backwards {
+        vec![
+            (2, vec![Value::from_i64(20), Value::from_i64(2)]),
+            (91, vec![Value::from_i64(10), Value::from_i64(91)]),
+        ]
+    } else {
+        vec![
+            (88, vec![Value::from_i64(40), Value::from_i64(88)]),
+            (43, vec![Value::from_i64(50), Value::from_i64(43)]),
+        ]
+    };
+    drop(cursor);
+    fixture.rollback();
+    assert_eq!(actual, expected);
+    assert_eq!(after, before, "continuation repeated the physical seek");
+}
+
+#[rstest::rstest]
+#[case::unique_prefix(true, false)]
+#[case::unique_full_key(true, true)]
+#[case::nonunique_full_key(false, true)]
+fn test_exact_index_memory_hit_avoids_physical_read(
+    #[case] unique: bool,
+    #[case] full_key: bool,
+    #[values(false, true)] backwards: bool,
+    #[values(false, true)] yields: bool,
+) {
+    let (fixture, reads) = cursor_fixture_with_read_probe(Some(unique));
+    fixture.insert_integer_rows([(20, 20), (40, 40)]);
+    let conn = &fixture.db.conn;
+    let io = &conn.db.io;
+    conn.pager.load().clear_page_cache(false);
+    let mut cursor = fixture.cursor();
+    let target = if backwards { 40 } else { 20 };
+    let key = if full_key {
+        CursorTestFixture::integer_record(true, target, target)
+    } else {
+        ImmutableRecord::from_values(&[Value::from_i64(target)], 1).unwrap()
+    };
+    let before = reads.calls.load(Ordering::SeqCst);
+    let (found, initial_reads, actual) = with_cursor_yields(conn, yields, || {
+        let found = io
+            .block(|| {
+                cursor.seek(
+                    SeekKey::IndexKey(key.as_record_ref()),
+                    if backwards {
+                        SeekOp::LE { eq_only: true }
+                    } else {
+                        SeekOp::GE { eq_only: true }
+                    },
+                )
+            })
+            .unwrap();
+        let initial_reads = reads.calls.load(Ordering::SeqCst) - before;
+        (
+            found,
+            initial_reads,
+            cursor_rows_with_records(conn, &mut cursor, backwards),
+        )
+    });
+    let ids = if backwards {
+        vec![40, 30, 20, 10]
+    } else {
+        vec![20, 30, 40, 50]
+    };
+    let expected = ids
+        .into_iter()
+        .map(|id| (id, vec![Value::from_i64(id), Value::from_i64(id)]))
+        .collect::<Vec<_>>();
+    drop(cursor);
+    fixture.rollback();
+    assert!(matches!(found, SeekResult::Found));
+    assert_eq!(actual, expected);
+    assert_eq!(
+        initial_reads, 0,
+        "memory hit searched a cold physical index"
+    );
+}
+
+#[rstest::rstest]
+fn test_exact_multirow_index_prefix_keeps_physical_winner(
+    #[values(false, true)] unique: bool,
+    #[values(false, true)] backwards: bool,
+    #[values(false, true)] yields: bool,
+) {
+    let value = if unique {
+        Value::Null
+    } else {
+        Value::from_i64(1)
+    };
+    let record =
+        |id| ImmutableRecord::from_values(&[value.clone(), Value::from_i64(id)], 2).unwrap();
+    let fixture = CursorTestFixture::new(
+        Some(cursor_test_index(
+            unique,
+            [IndexColumn::new("v", 1, CollationSeq::BINARY)],
+        )),
+        [10, 30, 50].map(|id| (id, record(id))),
+    );
+    let conn = &fixture.db.conn;
+    let io = &conn.db.io;
+    let mut writer = fixture.cursor();
+    for id in [20, 40] {
+        io.block(|| writer.insert(&BTreeKey::IndexKey(record(id).as_record_ref())))
+            .unwrap();
+    }
+    drop(writer);
+    let mut cursor = fixture.cursor();
+    let key = ImmutableRecord::from_values(&[value.clone()], 1).unwrap();
+    let actual = with_cursor_yields(conn, yields, || {
+        io.block(|| {
+            cursor.seek(
+                SeekKey::IndexKey(key.as_record_ref()),
+                if backwards {
+                    SeekOp::LE { eq_only: true }
+                } else {
+                    SeekOp::GE { eq_only: true }
+                },
+            )
+        })
+        .unwrap();
+        cursor_rows_with_records(conn, &mut cursor, backwards)
+    });
+    let ids = if backwards {
+        vec![50, 40, 30, 20, 10]
+    } else {
+        vec![10, 20, 30, 40, 50]
+    };
+    let expected = ids
+        .into_iter()
+        .map(|id| (id, vec![value.clone(), Value::from_i64(id)]))
+        .collect::<Vec<_>>();
+    drop(cursor);
+    fixture.rollback();
+    assert_eq!(actual, expected);
+}
+
+#[rstest::rstest]
+fn test_exact_no_rowid_index_hit_keeps_memory_neighbor(#[values(false, true)] backwards: bool) {
+    let mut index = cursor_test_index(true, [IndexColumn::new("k", 0, CollationSeq::BINARY)]);
+    index.has_rowid = false;
+    let record = |value| ImmutableRecord::from_values(&[Value::from_i64(value)], 1).unwrap();
+    let fixture = CursorTestFixture::new(Some(index), [10, 30, 50].map(|id| (id, record(id))));
+    let conn = &fixture.db.conn;
+    let io = &conn.db.io;
+    let mut writer = fixture.cursor();
+    for value in [20, 40] {
+        io.block(|| writer.insert(&BTreeKey::IndexKey(record(value).as_record_ref())))
+            .unwrap();
+    }
+    drop(writer);
+    let mut cursor = fixture.cursor();
+    let key = record(30);
+    let steps = Arc::new(SeekBtreeSteps::default());
+    conn.set_yield_injector(Some(steps.clone()));
+    io.block(|| {
+        cursor.seek(
+            SeekKey::IndexKey(key.as_record_ref()),
+            if backwards {
+                SeekOp::LE { eq_only: true }
+            } else {
+                SeekOp::GE { eq_only: true }
+            },
+        )
+    })
+    .unwrap();
+    let before = steps.seek_progress.load(Ordering::Relaxed);
+    if backwards {
+        io.block(|| cursor.prev()).unwrap();
+    } else {
+        io.block(|| cursor.next()).unwrap();
+    }
+    let after = steps.seek_progress.load(Ordering::Relaxed);
+    conn.set_yield_injector(None);
+    let mut actual = Vec::new();
+    while cursor.has_record() {
+        let values = cursor_owned_record(conn, &mut cursor);
+        actual.push(values);
+        assert!(actual.len() <= 2);
+        if backwards {
+            io.block(|| cursor.prev()).unwrap();
+        } else {
+            io.block(|| cursor.next()).unwrap();
+        }
+    }
+    drop(cursor);
+    fixture.rollback();
+    let values = if backwards { [20, 10] } else { [40, 50] };
+    assert_eq!(actual, values.map(|value| vec![Value::from_i64(value)]));
+    assert_eq!(after, before);
+}
+
+fn cursor_rows_with_records(
+    conn: &Arc<Connection>,
+    cursor: &mut crate::MvCursor,
+    backwards: bool,
+) -> Vec<(i64, Vec<Value>)> {
+    let mut rows = Vec::new();
+    while let Some(id) = conn.db.io.block(|| cursor.rowid()).unwrap() {
+        let values = cursor_owned_record(conn, cursor);
+        rows.push((id, values));
+        assert!(rows.len() <= 10, "cursor repeated rows: {rows:?}");
+        if backwards {
+            conn.db.io.block(|| cursor.prev()).unwrap();
+        } else {
+            conn.db.io.block(|| cursor.next()).unwrap();
+        }
+    }
+    rows
+}
+
+fn cursor_owned_record(conn: &Arc<Connection>, cursor: &mut crate::MvCursor) -> Vec<Value> {
+    conn.db
+        .io
+        .block(|| {
+            cursor.record().map(|result| {
+                result.map(|record| owned_cursor_record(record.unwrap().as_record_ref()))
+            })
+        })
+        .unwrap()
+}
+
+fn owned_cursor_record(record: crate::types::ImmutableRecordRef<'_>) -> Vec<Value> {
+    record.get_values_owned().unwrap()
+}
+
+#[derive(Default)]
+struct CursorReadProbe {
+    calls: AtomicU64,
+    busy_remaining: AtomicU64,
+}
+
+struct CursorReadIo {
+    inner: MemoryIO,
+    probe: Arc<CursorReadProbe>,
+}
+
+struct CursorReadFile {
+    inner: Arc<dyn File>,
+    probe: Arc<CursorReadProbe>,
+}
+
+impl Clock for CursorReadIo {
+    fn current_time_monotonic(&self) -> crate::io::clock::MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+    fn current_time_wall_clock(&self) -> crate::io::clock::WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for CursorReadIo {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> crate::Result<Arc<dyn File>> {
+        Ok(Arc::new(CursorReadFile {
+            inner: self.inner.open_file(path, flags, direct)?,
+            probe: self.probe.clone(),
+        }))
+    }
+    fn remove_file(&self, path: &str) -> crate::Result<()> {
+        self.inner.remove_file(path)
+    }
+}
+
+impl File for CursorReadFile {
+    fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
+        self.inner.lock_file(exclusive)
+    }
+    fn unlock_file(&self) -> crate::Result<()> {
+        self.inner.unlock_file()
+    }
+    fn pread(&self, pos: u64, completion: Completion) -> crate::Result<Completion> {
+        self.probe.calls.fetch_add(1, Ordering::SeqCst);
+        if self
+            .probe
+            .busy_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(LimboError::Busy);
+        }
+        self.inner.pread(pos, completion)
+    }
+    fn pwrite(
+        &self,
+        pos: u64,
+        buffer: Arc<Buffer>,
+        completion: Completion,
+    ) -> crate::Result<Completion> {
+        self.inner.pwrite(pos, buffer, completion)
+    }
+    fn sync(&self, completion: Completion, sync_type: FileSyncType) -> crate::Result<Completion> {
+        self.inner.sync(completion, sync_type)
+    }
+    fn size(&self) -> crate::Result<u64> {
+        self.inner.size()
+    }
+    fn truncate(&self, len: u64, completion: Completion) -> crate::Result<Completion> {
+        self.inner.truncate(len, completion)
+    }
+}
+
+fn cursor_fixture_with_read_probe(
+    unique: Option<bool>,
+) -> (CursorTestFixture, Arc<CursorReadProbe>) {
+    let probe = Arc::new(CursorReadProbe::default());
+    let io = Arc::new(CursorReadIo {
+        inner: MemoryIO::new(),
+        probe: probe.clone(),
+    });
+    let db = Database::open(
+        io,
+        ":memory:",
+        crate::OpenOptions::new(Arc::new(DialectThatCannotParse))
+            .db_opts(DatabaseOpts::new().with_mvcc(true)),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let db = MvccTestDb {
+        mvcc_store: db.get_mv_store().clone().unwrap(),
+        db,
+        conn,
+    };
+    let index = unique
+        .map(|unique| cursor_test_index(unique, [IndexColumn::new("v", 1, CollationSeq::BINARY)]));
+    let records = [10, 30, 50].map(|id| {
+        (
+            id,
+            CursorTestFixture::integer_record(unique.is_some(), id, id),
+        )
+    });
+    (CursorTestFixture::new_with_db(db, index, records), probe)
+}
+
 struct CursorTestFixture {
     db: MvccTestDb,
     table_id: MVTableId,
@@ -5058,10 +5511,17 @@ impl CursorTestFixture {
         index: Option<crate::schema::Index>,
         records: impl IntoIterator<Item = (i64, ImmutableRecord)>,
     ) -> Self {
+        Self::new_with_db(MvccTestDb::new(), index, records)
+    }
+
+    fn new_with_db(
+        db: MvccTestDb,
+        index: Option<crate::schema::Index>,
+        records: impl IntoIterator<Item = (i64, ImmutableRecord)>,
+    ) -> Self {
         use crate::storage::{pager::CreateBTreeFlags, wal::WalAutoActions};
         use crate::types::{SeekKey, SeekOp};
 
-        let db = MvccTestDb::new();
         let pager = db.conn.pager.load().clone();
         let io = &pager.io;
         pager.begin_read_tx().unwrap();

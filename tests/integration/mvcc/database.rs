@@ -5067,6 +5067,85 @@ fn test_nonunique_index_join_reuses_btree_position() {
     );
 }
 
+#[test]
+fn test_unique_index_probes_bound_seek_work_lookup() {
+    for memory in [false, true] {
+        assert_unique_index_probe_seek_work(
+            "SELECT id,v FROM b INDEXED BY b_v WHERE v=20",
+            1,
+            0,
+            memory,
+        );
+    }
+}
+
+#[test]
+fn test_unique_index_probes_bound_seek_work_join() {
+    for memory in [false, true] {
+        assert_unique_index_probe_seek_work(
+            "SELECT count(*),sum(b.id) FROM a CROSS JOIN b INDEXED BY b_v WHERE b.v=a.v",
+            12,
+            1,
+            memory,
+        );
+    }
+}
+
+#[test]
+fn test_unique_index_probes_bound_seek_work_in_list() {
+    for memory in [false, true] {
+        assert_unique_index_probe_seek_work(
+            "SELECT id,v FROM b INDEXED BY b_v WHERE v IN (10,30) ORDER BY v",
+            2,
+            2,
+            memory,
+        );
+    }
+}
+
+fn assert_unique_index_probe_seek_work(query: &str, probes: u64, result_kind: u8, memory: bool) {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute(
+        "PRAGMA mvcc_checkpoint_threshold=-1; \
+         CREATE TABLE b(id INTEGER PRIMARY KEY,v INTEGER NOT NULL); \
+         CREATE UNIQUE INDEX b_v ON b(v); \
+         INSERT INTO b VALUES(1,10),(2,20),(3,30),(4,40); \
+         CREATE TABLE a(id INTEGER PRIMARY KEY,v INTEGER); \
+         INSERT INTO a VALUES(1,10),(2,30),(3,10),(4,30),(5,10),(6,30), \
+                             (7,10),(8,30),(9,10),(10,30),(11,10),(12,30)",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    if memory {
+        conn.execute("DELETE FROM b; INSERT INTO b VALUES(101,10),(102,20),(103,30),(104,40)")
+            .unwrap();
+    }
+    let offset = if memory { 100 } else { 0 };
+    let expected = match result_kind {
+        0 => vec![vec![Value::from_i64(2 + offset), Value::from_i64(20)]],
+        1 => vec![vec![Value::from_i64(12), Value::from_i64(24 + 12 * offset)]],
+        2 => vec![
+            vec![Value::from_i64(1 + offset), Value::from_i64(10)],
+            vec![Value::from_i64(3 + offset), Value::from_i64(30)],
+        ],
+        _ => unreachable!(),
+    };
+    conn.execute("BEGIN").unwrap();
+    let steps = Arc::new(SeekBtreeSteps::default());
+    conn.set_yield_injector(Some(steps.clone()));
+    let actual = get_rows(&conn, query);
+    conn.set_yield_injector(None);
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(actual, expected);
+    let seek_progress = steps.seek_progress.load(Ordering::Relaxed);
+    let limit = probes * if memory { 5 } else { 2 };
+    assert!(
+        seek_progress <= limit,
+        "repeated UNIQUE lookup seek work: {seek_progress} > {limit}"
+    );
+}
+
 /// What this test checks: An exact rowid seek over checkpointed rows that newer versions shadow
 /// returns each row's newest version, or nothing for a deleted or missing row, in a few B-tree
 /// steps however many shadowed rows follow its target.
