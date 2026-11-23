@@ -1470,15 +1470,6 @@ impl ShmWalCoordination {
             .covers(snapshot, max_frame)
     }
 
-    fn clear_overflow_fallback_coverage(&self) {
-        self.shared
-            .read()
-            .runtime
-            .overflow_fallback_coverage
-            .lock()
-            .clear();
-    }
-
     fn local_authority_snapshot_from_shared(
         shared: &WalFileShared,
         authority_snapshot: SharedWalCoordinationHeader,
@@ -1916,7 +1907,16 @@ impl ShmWalCoordination {
         if authority_snapshot.checkpoint_seq != required_snapshot.checkpoint_seq {
             return Err(LimboError::Busy);
         }
-        if self.overflow_fallback_covers(authority_snapshot, required_snapshot.max_frame) {
+        // Frames above the committed max_frame belong to the write
+        // transaction that holds the write lock. It runs in this process and
+        // appended them through `cache_frame`, so the local cache holds them
+        // without recorded coverage.
+        let committed_max_frame = required_snapshot
+            .max_frame
+            .min(authority_snapshot.max_frame);
+        if committed_max_frame == 0
+            || self.overflow_fallback_covers(authority_snapshot, committed_max_frame)
+        {
             return Ok(());
         }
 
@@ -2474,7 +2474,11 @@ impl WalCoordination for ShmWalCoordination {
     fn rollback_cache(&self, max_frame: u64) {
         self.fallback.rollback_cache(max_frame);
         self.authority.rollback_frames(max_frame);
-        self.clear_overflow_fallback_coverage();
+        // The overflow fallback coverage stays: it only covers committed
+        // frames, and max_frame is never below the committed max_frame, so
+        // the rollback drops no covered frame. Clearing it would leave
+        // overflowed readers failing with Busy until reopen, because only a
+        // commit on top of complete coverage records it again.
     }
 
     fn should_checkpoint_on_close(&self) -> bool {
@@ -8740,6 +8744,110 @@ pub mod test {
             .ensure_local_frame_cache_covers(&io, snapshot)
             .expect("same-process commits must keep the overflow fallback complete");
         assert_eq!(coordination.find_frame(11, 0, 3, None), Some(3));
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn live_overflow_writer_finds_its_spilled_frames() {
+        let page_size = 512;
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-spill-live-overflow.db-wal");
+        let shm_path = dir.path().join("test-spill-live-overflow.db-tshm");
+        let io = shared_wal_test_io();
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool
+            .finalize_with_page_size(page_size as usize)
+            .unwrap();
+        let wal = WalFile::new_with_shared_coordination(
+            io.clone(),
+            shared,
+            authority.clone(),
+            ((0, 0), 0),
+            buffer_pool.clone(),
+        );
+        if let Some(c) = wal
+            .prepare_wal_start(PageSize::new(page_size).unwrap())
+            .unwrap()
+        {
+            io.wait_for_completion(c).unwrap();
+        }
+        let c = wal.prepare_wal_finish(FileSyncType::Fsync).unwrap();
+        io.wait_for_completion(c).unwrap();
+        wal.begin_read_tx().unwrap();
+        wal.begin_write_tx(WalAutoActions::empty()).unwrap();
+
+        append_test_pages(
+            &io,
+            &wal,
+            page_size,
+            &[page_with_pattern(2, 0x20, &buffer_pool)],
+        );
+        authority.mark_frame_index_overflowed_for_tests();
+
+        // A write transaction that spills a dirty page reads it back from
+        // its own uncommitted frame.
+        let c = wal
+            .append_frames_vectored(
+                vec![page_with_pattern(3, 0x30, &buffer_pool)],
+                PageSize::new(page_size).unwrap(),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        assert_eq!(wal.get_max_frame_in_wal(), 1);
+        assert_eq!(wal.find_frame(3, None).unwrap(), Some(2));
+        assert_eq!(wal.find_frame(2, None).unwrap(), Some(1));
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn live_overflow_rollback_keeps_committed_frame_cache_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-rollback-live-overflow.db-wal");
+        let shm_path = dir.path().join("test-rollback-live-overflow.db-tshm");
+        let io = shared_wal_test_io();
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let (authority, coordination) = make_test_shm_coordination(&shared, &shm_path);
+
+        coordination.cache_frame(7, 1);
+        coordination.publish_commit(WalCommitState {
+            max_frame: 1,
+            last_checksum: (31, 37),
+            transaction_count: 1,
+        });
+        authority.mark_frame_index_overflowed_for_tests();
+
+        // Frames 2 and 3 belong to a write transaction that rolls back.
+        coordination.cache_frame(7, 2);
+        coordination.cache_frame(9, 3);
+        coordination.rollback_cache(1);
+
+        let snapshot = coordination.load_snapshot();
+        coordination
+            .ensure_local_frame_cache_covers(&io, snapshot)
+            .expect("a rollback must keep the overflow fallback complete for committed frames");
+        assert_eq!(coordination.find_frame(7, 0, 1, None), Some(1));
+        assert_eq!(coordination.find_frame(9, 0, 1, None), None);
+
+        coordination.cache_frame(11, 2);
+        coordination.publish_commit(WalCommitState {
+            max_frame: 2,
+            last_checksum: (41, 43),
+            transaction_count: 2,
+        });
+        let snapshot = coordination.load_snapshot();
+        coordination
+            .ensure_local_frame_cache_covers(&io, snapshot)
+            .expect("a commit after the rollback must extend the overflow fallback coverage");
+        assert_eq!(coordination.find_frame(11, 0, 2, None), Some(2));
     }
 
     #[cfg(host_shared_wal)]
