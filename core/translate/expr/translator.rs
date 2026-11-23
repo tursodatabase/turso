@@ -900,7 +900,7 @@ fn translate_cast_expr(
             return Ok(target_register);
         }
         if let Some(resolved) = custom_type_cast_chain(tn, resolver.schema())? {
-            if casts_to_varchar(&resolved) {
+            if casts_to_unchanged_text(&resolved) {
                 emit_builtin_type_text_suffix(
                     program,
                     referenced_tables,
@@ -964,13 +964,15 @@ fn emit_builtin_type_text_suffix(
     });
 }
 
-/// Whether a CAST to the resolved type gives a varchar, which is text with a
-/// length limit.
-fn casts_to_varchar(resolved: &crate::schema::ResolvedType) -> bool {
-    resolved
-        .chain
-        .last()
-        .is_some_and(|type_def| type_def.is_builtin && type_def.name == "varchar")
+/// Whether a CAST to the resolved type gives text that is stored as it is
+/// written, such as varchar(n) or a domain over text. A type that converts the
+/// value, such as timestamptz, is not.
+fn casts_to_unchanged_text(resolved: &crate::schema::ResolvedType) -> bool {
+    Affinity::of_written_type(&resolved.primitive) == Affinity::Text
+        && !resolved
+            .chain
+            .iter()
+            .any(|type_def| type_def.changes_stored_value())
 }
 
 /// Emits a CAST of the value in `reg` to the custom type `type_name`, whose
