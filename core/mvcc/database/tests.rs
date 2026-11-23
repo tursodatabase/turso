@@ -4963,6 +4963,217 @@ fn test_exact_index_cursor_returns_rows_restored_by_savepoint_rollback(
     fixture.rollback();
 }
 
+/// A range lookup may stop physical visibility work behind its MVCC winner.
+/// Later movement must recover that source if rollback restores physical rows.
+#[rstest::rstest]
+#[case::forward(false, [30, 40, 50, 60, 70])]
+#[case::backward(true, [50, 40, 30, 20, 10])]
+fn test_index_range_recovers_physical_rows_after_rollback(
+    #[case] backwards: bool,
+    #[case] expected: [i64; 5],
+    #[values(false, true)] yields: bool,
+    #[values(false, true)] from_start: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let fixture = CursorTestFixture::integer_rows(Some(false), [(20, 1), (40, 1), (60, 1)]);
+    fixture.insert_integer_rows([(10, 1), (30, 1), (50, 1), (70, 1)]);
+    let store = &fixture.db.mvcc_store;
+    store.begin_named_savepoint(fixture.tx_id, "s".to_owned(), false, 0);
+    for rowid in [20, 40, 60] {
+        fixture.delete_integer_index_row(rowid, 1);
+    }
+    let conn = &fixture.db.conn;
+    let mut cursor = fixture.cursor();
+    let key = ImmutableRecord::from_values(&[Value::from_i64(1)], 1).unwrap();
+    let op = if backwards {
+        SeekOp::LE { eq_only: false }
+    } else {
+        SeekOp::GE { eq_only: false }
+    };
+    let actual = with_cursor_yields(conn, yields, || {
+        if from_start {
+            if backwards {
+                conn.db.io.block(|| cursor.last()).unwrap();
+            } else {
+                conn.db.io.block(|| cursor.rewind()).unwrap();
+            }
+        } else {
+            let result = conn
+                .db
+                .io
+                .block(|| cursor.seek(SeekKey::IndexKey(key.as_record_ref()), op))
+                .unwrap();
+            assert!(matches!(result, SeekResult::Found));
+        }
+        if backwards {
+            conn.db.io.block(|| cursor.prev()).unwrap();
+        } else {
+            conn.db.io.block(|| cursor.next()).unwrap();
+        }
+        assert_eq!(
+            conn.db.io.block(|| cursor.rowid()).unwrap(),
+            Some(expected[0])
+        );
+        assert_eq!(
+            store
+                .rollback_to_named_savepoint(fixture.tx_id, "s")
+                .unwrap(),
+            Some(0)
+        );
+        rowids_from_current_row(conn, &mut cursor, backwards)
+    });
+    drop(cursor);
+    fixture.rollback();
+    assert_eq!(actual, expected);
+}
+
+/// If the only physical match is deleted, a failed prefix probe can stand on
+/// the following visible key. Later movement must continue from that key.
+#[rstest::rstest]
+#[case::forward(false, [20, 30, 40])]
+#[case::backward(true, [30, 20, 10])]
+fn test_missing_eq_index_probe_keeps_position_after_shadowed_match(
+    #[case] backwards: bool,
+    #[case] expected: [i64; 3],
+    #[values(false, true)] yields: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let fixture =
+        CursorTestFixture::integer_rows(Some(false), [(10, 1), (20, 2), (30, 3), (40, 4)]);
+    let target = if backwards { 4 } else { 1 };
+    fixture.delete_integer_index_row(10 * target, target);
+    let key = ImmutableRecord::from_values(&[Value::from_i64(target)], 1).unwrap();
+    let op = if backwards {
+        SeekOp::LE { eq_only: true }
+    } else {
+        SeekOp::GE { eq_only: true }
+    };
+    let conn = &fixture.db.conn;
+    let mut cursor = fixture.cursor();
+    let actual = with_cursor_yields(conn, yields, || {
+        let result = conn
+            .db
+            .io
+            .block(|| cursor.seek(SeekKey::IndexKey(key.as_record_ref()), op))
+            .unwrap();
+        assert!(matches!(result, SeekResult::NotFound));
+        rowids_from_current_row(conn, &mut cursor, backwards)
+    });
+    drop(cursor);
+    fixture.rollback();
+    assert_eq!(actual, expected);
+}
+
+/// Once positioned, a range over replacements must stream instead of seeking
+/// both sources again for each MVCC row.
+#[rstest::rstest]
+fn test_index_replacement_range_streams_without_reseeking(
+    #[values(false, true)] backwards: bool,
+    #[values(false, true)] eq_only: bool,
+    #[values(false, true)] changed_rowids: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    const ROWS: i64 = 8;
+    let value = |id| if changed_rowids { id } else { 1 };
+    let offset = if changed_rowids { ROWS } else { 0 };
+    let fixture =
+        CursorTestFixture::integer_rows(Some(false), (1..=ROWS).map(|id| (id, value(id))));
+    for id in 1..=ROWS {
+        fixture.delete_integer_index_row(id, value(id));
+    }
+    fixture.insert_integer_rows((1..=ROWS).map(|id| (id + offset, value(id))));
+    let conn = &fixture.db.conn;
+    let mut cursor = fixture.cursor();
+    let target = if backwards && changed_rowids { ROWS } else { 1 };
+    let key = ImmutableRecord::from_values(&[Value::from_i64(target)], 1).unwrap();
+    let op = if backwards {
+        SeekOp::LE { eq_only }
+    } else {
+        SeekOp::GE { eq_only }
+    };
+    let work = Arc::new(SeekBtreeSteps::default());
+    conn.set_yield_injector(Some(work.clone()));
+    let result = conn
+        .db
+        .io
+        .block(|| cursor.seek(SeekKey::IndexKey(key.as_record_ref()), op))
+        .unwrap();
+    assert!(matches!(result, SeekResult::Found));
+    let actual = rowids_from_current_row(conn, &mut cursor, backwards);
+    conn.set_yield_injector(None);
+    let expected: Vec<_> = if backwards {
+        (1..=ROWS).rev().map(|id| id + offset).collect()
+    } else {
+        (1..=ROWS).map(|id| id + offset).collect()
+    };
+    assert_eq!(actual, expected);
+    assert!(
+        work.seek_starts.load(Ordering::Relaxed) <= 2,
+        "range scan re-seeked for each replacement: {work:?}"
+    );
+    drop(cursor);
+    fixture.rollback();
+}
+
+/// A visible MVCC singleton answers an equality probe by itself. Physical
+/// positioning can wait until movement, which still must find the next key.
+#[rstest::rstest]
+fn test_mvcc_singleton_index_probe_defers_physical_search(
+    #[values(false, true)] unique_prefix: bool,
+    #[values(false, true)] backwards: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let fixture =
+        CursorTestFixture::integer_rows(Some(unique_prefix), [(10, 10), (20, 20), (30, 30)]);
+    fixture.delete_integer_index_row(20, 20);
+    fixture.insert_integer_rows([(20, 20)]);
+    let values = if unique_prefix {
+        vec![Value::from_i64(20)]
+    } else {
+        vec![Value::from_i64(20), Value::from_i64(20)]
+    };
+    let key = ImmutableRecord::from_values(&values, values.len()).unwrap();
+    let op = if backwards {
+        SeekOp::LE { eq_only: true }
+    } else {
+        SeekOp::GE { eq_only: true }
+    };
+    let conn = &fixture.db.conn;
+    let mut cursor = fixture.cursor();
+    let work = Arc::new(SeekBtreeSteps::default());
+    conn.set_yield_injector(Some(work.clone()));
+    let result = conn
+        .db
+        .io
+        .block(|| cursor.seek(SeekKey::IndexKey(key.as_record_ref()), op))
+        .unwrap();
+    conn.set_yield_injector(None);
+    assert!(matches!(result, SeekResult::Found));
+    // PickWinner emits one progress event. Entering physical positioning adds
+    // another even though the MVCC singleton already proves the answer.
+    assert!(
+        work.seek_progress.load(Ordering::Relaxed) <= 1,
+        "singleton MVCC hit searched the physical tree: {work:?}"
+    );
+    let expected = if backwards {
+        vec![20, 10]
+    } else {
+        vec![20, 30]
+    };
+    assert_eq!(
+        with_cursor_yields(conn, true, || {
+            rowids_from_current_row(conn, &mut cursor, backwards)
+        }),
+        expected
+    );
+    drop(cursor);
+    fixture.rollback();
+}
+
 struct CursorTestFixture {
     db: MvccTestDb,
     table_id: MVTableId,
