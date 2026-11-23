@@ -752,6 +752,7 @@ pub fn column_definition(name: &str, declared_type: &str) -> ast::ColumnDefiniti
             name: declared_type.to_string(),
             size: None,
             array_dimensions: 0,
+            ty_annotation: None,
         }),
         constraints: Vec::new(),
     }

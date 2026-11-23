@@ -330,6 +330,7 @@ fn call_for(
         name: result.to_string(),
         size: None,
         array_dimensions: 0,
+        ty_annotation: None,
     };
     Ok(Some(OperatorCall {
         func: function,
