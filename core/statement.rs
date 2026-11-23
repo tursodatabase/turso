@@ -164,6 +164,12 @@ pub struct ColumnTypeInfo {
     /// than raw bytes. The `kind` field carries that distinction directly
     /// without forcing the caller to re-query the schema.
     pub kind: ColumnTypeKind,
+    /// What the frontend knows about the type beyond its name, such as the
+    /// oid of a PostgreSQL type. For an array type it describes the element
+    /// type. It comes from the annotation of the type of a cast, or from
+    /// [`Dialect::type_annotation`](crate::Dialect::type_annotation) for the
+    /// declared type of a column. `None` when the frontend gives none.
+    pub ty_annotation: Option<crate::ast::TypeAnnotation>,
 }
 
 /// Classification of a result column's declared type.

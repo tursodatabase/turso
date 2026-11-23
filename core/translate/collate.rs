@@ -1063,6 +1063,7 @@ fn dialect_casts_to_compare(dialect: &dyn Dialect, x: &TypeDef, y: &TypeDef) -> 
             name: ty.name.clone(),
             size: None,
             array_dimensions: 0,
+            ty_annotation: None,
         })
     };
     let choice = dialect.choose_operator("=", &|| vec![operand(x), operand(y)]);

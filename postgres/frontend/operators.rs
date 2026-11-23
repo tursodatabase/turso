@@ -126,6 +126,7 @@ fn implicit_cast_choice(op: &str, types: &[Option<Checked>]) -> Option<OperatorC
             .to_string(),
         size: None,
         array_dimensions: 0,
+        ty_annotation: None,
     };
     Some(OperatorChoice::Chosen(ChosenOperator {
         id: row.oid,
@@ -182,6 +183,7 @@ fn integer_operator_function(op: &str, types: &[&Checked]) -> Option<OperatorFun
             name: operator.result().name().to_string(),
             size: None,
             array_dimensions: 0,
+            ty_annotation: None,
         },
     })
 }
@@ -491,6 +493,7 @@ fn checked_engine_type(ty: EngineType, array_dimensions: u32) -> Option<Checked>
             name: cast_to.to_string(),
             size: None,
             array_dimensions: 0,
+            ty_annotation: None,
         },
         engine: Some(ty),
     })
@@ -907,6 +910,7 @@ mod tests {
         OperandType::Engine {
             ty,
             array_dimensions: 0,
+            ty_annotation: None,
         }
     }
 

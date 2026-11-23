@@ -5,7 +5,7 @@
 use crate::ast;
 
 use super::emitter::Resolver;
-use super::expr::expr_type::{type_of, BuiltinType, ExprType, TypeEnv};
+use super::expr::expr_type::{ty_annotation_of, type_of, BuiltinType, ExprType, TypeEnv};
 use super::plan::{ResultSetColumn, TableReferences};
 use crate::schema::{Schema, Table};
 use crate::statement::{ColumnTypeInfo, ColumnTypeKind};
@@ -16,20 +16,27 @@ pub(crate) fn result_column_types(
     resolver: &Resolver,
 ) -> Vec<Option<ColumnTypeInfo>> {
     let env = TypeEnv::new(Some(table_references), resolver);
+    let schema = resolver.schema();
     result_columns
         .iter()
         .map(|result_column| {
-            if let Some(ty) = &result_column.values_condition_type {
-                return expression_type(ty, resolver.schema());
-            }
-            match &result_column.expr {
-                ast::Expr::Column { table, column, .. }
-                    if !reads_subquery(*table, table_references) =>
-                {
-                    table_column_type(*table, *column, table_references, resolver.schema())
+            let info = if let Some(ty) = &result_column.values_condition_type {
+                expression_type(ty, schema)
+            } else {
+                match &result_column.expr {
+                    ast::Expr::Column { table, column, .. }
+                        if !reads_subquery(*table, table_references) =>
+                    {
+                        table_column_type(*table, *column, table_references, schema)
+                    }
+                    expr => expression_type(&type_of(expr, &env), schema),
                 }
-                expr => expression_type(&type_of(expr, &env), resolver.schema()),
-            }
+            };
+            with_ty_annotation(
+                info,
+                &result_column.expr,
+                ty_annotation_of(&result_column.expr, &env),
+            )
         })
         .collect()
 }
@@ -61,6 +68,7 @@ fn table_column_type(
         array_dimensions: column.array_dimensions(),
         base_type,
         kind,
+        ty_annotation: None,
     })
 }
 
@@ -92,6 +100,7 @@ fn expression_type(ty: &ExprType, schema: &Schema) -> Option<ColumnTypeInfo> {
             array_dimensions,
             base_type,
             kind,
+            ty_annotation: None,
         });
     }
     let declared_name = match element {
@@ -109,7 +118,47 @@ fn expression_type(ty: &ExprType, schema: &Schema) -> Option<ColumnTypeInfo> {
         array_dimensions,
         base_type: None,
         kind: ColumnTypeKind::Builtin,
+        ty_annotation: None,
     })
+}
+
+/// Adds the type annotation of result column `expr` to its type information.
+///
+/// A cast to a type whose values may be of any kind, such as BLOB, reports no
+/// type by itself. With an annotation it reports the type that it casts to:
+/// the frontend may have written the cast with the name of the type that
+/// stores the value, so the annotation is what tells which type it is.
+fn with_ty_annotation(
+    info: Option<ColumnTypeInfo>,
+    expr: &ast::Expr,
+    ty_annotation: Option<ast::TypeAnnotation>,
+) -> Option<ColumnTypeInfo> {
+    if ty_annotation.is_none() {
+        return info;
+    }
+    let mut info = info.or_else(|| {
+        cast_type(expr).map(|ty| ColumnTypeInfo {
+            declared_name: ty.name.clone(),
+            array_dimensions: ty.array_dimensions,
+            base_type: None,
+            kind: ColumnTypeKind::Builtin,
+            ty_annotation: None,
+        })
+    })?;
+    info.ty_annotation = ty_annotation;
+    Some(info)
+}
+
+/// The type that a result column is cast to, when the column is a cast.
+fn cast_type(expr: &ast::Expr) -> Option<&ast::Type> {
+    match expr {
+        ast::Expr::Cast { type_name, .. } => type_name.as_ref(),
+        ast::Expr::Parenthesized(exprs) => match exprs.as_slice() {
+            [expr] => cast_type(expr),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The stored primitive and kind of a type name. STRUCT and UNION are tagged on

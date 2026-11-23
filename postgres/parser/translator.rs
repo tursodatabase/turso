@@ -3354,6 +3354,7 @@ impl PostgreSQLTranslator {
                             name: "text".to_string(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                     }
                 };
@@ -3908,6 +3909,7 @@ impl PostgreSQLTranslator {
                             name: "date".to_string(),
                             size: None,
                             array_dimensions: 0,
+                            ty_annotation: None,
                         }),
                     }),
                     Ok(
@@ -10602,6 +10604,7 @@ fn text_cast(expr: ast::Expr) -> ast::Expr {
             name: "TEXT".to_string(),
             size: None,
             array_dimensions: 0,
+            ty_annotation: None,
         }),
     }
 }
