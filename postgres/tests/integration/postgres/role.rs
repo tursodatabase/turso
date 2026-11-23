@@ -844,6 +844,85 @@ fn database_without_the_membership_table_gets_it_when_opened() {
     assert_eq!(memberships(&conn), vec![membership("readers", "alice")]);
 }
 
+#[test]
+fn database_without_the_membership_table_has_no_memberships_after_its_schema_is_read_again() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE readers").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.close().unwrap();
+    drop(conn);
+    drop_membership_table(&db);
+    let conn = PgConnection::connect(&reopen_read_only(db)).unwrap();
+
+    conn.inner().force_reparse_schema_without_publish().unwrap();
+
+    assert_eq!(memberships(&conn), vec![]);
+    assert_eq!(
+        role_names(&conn),
+        vec!["postgres", "pg_database_owner", "readers", "alice"]
+    );
+}
+
+/// A database can have a classes table and no roles table. Then it has no
+/// roles to load, and its tables still load.
+#[test]
+fn database_without_the_roles_table_opens_read_only_without_roles() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE TABLE t (x INT)").unwrap();
+    conn.close().unwrap();
+    drop(conn);
+    drop_membership_table(&db);
+    drop_roles_table(&db);
+    let conn = PgConnection::connect(&reopen_read_only(db)).unwrap();
+
+    for read in ["after open", "after the schema is read again"] {
+        assert_eq!(
+            role_names(&conn),
+            vec!["postgres", "pg_database_owner"],
+            "{read}"
+        );
+        assert_eq!(memberships(&conn), vec![], "{read}");
+        let mut stmt = conn
+            .query("SELECT relname FROM pg_class WHERE relname = 't'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![turso_core::Value::build_text("t")]],
+            "{read}"
+        );
+        conn.inner().force_reparse_schema_without_publish().unwrap();
+    }
+}
+
+/// Drops the roles table, to get a database with classes and no roles.
+fn drop_roles_table(db: &TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.inner()
+        .prepare_engine_schema_statement("DROP TABLE __turso_internal_authid")
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+    conn.close().unwrap();
+}
+
+/// Closes `db` and opens the same file read-only. A read-only open does
+/// not create the tables that are missing.
+fn reopen_read_only(db: TempDatabase) -> std::sync::Arc<turso_core::Database> {
+    let TempDatabase { path, io, db } = db;
+    drop(db);
+    turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
+        turso_core::DatabaseOpts::new().with_encryption(true),
+    )
+    .unwrap()
+}
+
 /// The in-memory catalog skips a membership it knows, but only the stored
 /// table can keep a membership unique against every writer of the file. A
 /// duplicate would leave the database unable to open.

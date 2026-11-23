@@ -40,7 +40,7 @@ use turso_core::security::roles::RoleId;
 use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, AccessStatement,
     Catalog, CatalogApply, CatalogCmd, CmdContext, CmdOrigin, CmpInsFlags, CollationSeq,
-    Connection, CursorType, DropColumn, InsertFlags, Insn, LimboError, NewOwner, Numeric,
+    Connection, CursorType, DropColumn, InsertFlags, Insn, LimboError, LoadStep, NewOwner, Numeric,
     OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationName, SqliteCatalog, Value,
 };
 
@@ -371,8 +371,8 @@ pub(crate) fn class_catalog(schema: &Schema) -> Option<&ClassCatalog> {
     schema_state(schema).map(|state| state.classes.as_ref())
 }
 
-/// The query of the relation catalog for
-/// [`turso_core::Dialect::schema_state_queries`].
+/// The query that reads the relation catalog for the frontend's schema
+/// state, or None when the database has no classes table.
 pub(crate) fn schema_state_query(schema: &Schema) -> Option<String> {
     schema.get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME)?;
     Some(format!(
@@ -668,6 +668,10 @@ impl Catalog for PostgresCatalog {
             } if !writes_class_rows(ctx)? => Ok(()),
             _ => translate_access_statement(program, ctx.schema, ctx.connection, statement),
         }
+    }
+
+    fn load_steps(&self) -> Vec<Box<dyn LoadStep>> {
+        crate::schema_state::load_steps()
     }
 }
 

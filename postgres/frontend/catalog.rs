@@ -289,18 +289,6 @@ impl Dialect for PostgresDialect {
         false
     }
 
-    fn schema_state_queries(&self, schema: &Schema) -> Vec<String> {
-        crate::schema_state::schema_state_queries(schema)
-    }
-
-    fn build_schema_state(
-        &self,
-        schema: &Schema,
-        results: &[Vec<Vec<Value>>],
-    ) -> turso_core::Result<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
-        crate::schema_state::build_schema_state(schema, results)
-    }
-
     fn catalog(&self) -> &dyn turso_core::Catalog {
         &crate::classes::PostgresCatalog
     }

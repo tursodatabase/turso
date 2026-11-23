@@ -5,7 +5,7 @@
 use crate::ast::{self, Grantee, Privilege, RoleSpec};
 use crate::{
     namespace::{NamespaceId, NamespaceRef},
-    schema::{BTreeTable, Index, Schema},
+    schema::{load::LoadStep, BTreeTable, Index, Schema},
     translate::{
         emitter::Resolver,
         schema::{
@@ -45,6 +45,12 @@ pub trait Catalog: Send + Sync {
     ) -> Result<()> {
         let _ = (program, ctx);
         Err(statement.not_supported())
+    }
+
+    /// Steps that read this catalog's own tables while a schema is loaded.
+    /// The loader runs them after its own steps, at open and at reload.
+    fn load_steps(&self) -> Vec<Box<dyn LoadStep>> {
+        Vec::new()
     }
 }
 
