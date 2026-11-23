@@ -40,7 +40,7 @@ const MANY_ROWS: usize = COLLECT_PREEMPTION_THRESHOLD + 10;
 #[test]
 fn collection_yields_while_walking_many_table_rows() {
     for walk in [Walk::EveryRow, Walk::ChangedRows] {
-        let db = TempDatabase::new_with_mvcc("collect_many_table_rows");
+        let db = database_for_walk("collect_many_table_rows", walk);
         let conn = connect_without_auto_checkpoint(&db);
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
             .unwrap();
@@ -111,7 +111,7 @@ fn collection_yields_while_walking_many_schema_rows() {
 #[test]
 fn collection_yields_while_walking_many_index_rows() {
     for walk in [Walk::EveryRow, Walk::ChangedRows] {
-        let db = TempDatabase::new_with_mvcc("collect_many_index_rows");
+        let db = database_for_walk("collect_many_index_rows", walk);
         let conn = connect_without_auto_checkpoint(&db);
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
             .unwrap();
@@ -171,7 +171,7 @@ fn rows_of_a_table_dropped_before_its_first_checkpoint_are_not_collected() {
 
 #[test]
 fn only_table_rows_changed_since_the_last_checkpoint_are_collected() {
-    let db = TempDatabase::new_with_mvcc("collect_changed_table_rows");
+    let db = passive_checkpoint_database("collect_changed_table_rows");
     let conn = connect_without_auto_checkpoint(&db);
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
@@ -194,7 +194,7 @@ fn only_table_rows_changed_since_the_last_checkpoint_are_collected() {
 
 #[test]
 fn only_index_rows_changed_since_the_last_checkpoint_are_collected() {
-    let db = TempDatabase::new_with_mvcc("collect_changed_index_rows");
+    let db = passive_checkpoint_database("collect_changed_index_rows");
     let conn = connect_without_auto_checkpoint(&db);
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
@@ -213,7 +213,7 @@ fn only_index_rows_changed_since_the_last_checkpoint_are_collected() {
 
 #[test]
 fn first_checkpoint_after_reopen_collects_rows_that_no_commit_marked() {
-    let db = TempDatabase::new_with_mvcc("collect_after_reopen");
+    let db = passive_checkpoint_database("collect_after_reopen");
     {
         let conn = connect_without_auto_checkpoint(&db);
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -223,7 +223,10 @@ fn first_checkpoint_after_reopen_collects_rows_that_no_commit_marked() {
     }
     let path = db.path.clone();
     drop(db);
-    let db = TempDatabase::new_with_existent(&path);
+    let db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true),
+    );
     let conn = connect_without_auto_checkpoint(&db);
     let table = btree_id(&conn, "t");
     assert!(
@@ -398,7 +401,7 @@ fn row_changed_after_collection_stays_marked_for_the_next_checkpoint() {
 
 #[test]
 fn clearing_the_marks_yields_on_many_rows() {
-    let db = TempDatabase::new_with_mvcc("prune_many_rows");
+    let db = passive_checkpoint_database("prune_many_rows");
     let conn = connect_without_auto_checkpoint(&db);
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
@@ -416,6 +419,152 @@ fn clearing_the_marks_yields_on_many_rows() {
     checkpoint.finish();
 
     assert!(store.checkpoint_dirty_table_keys.is_empty());
+}
+
+/// With the passive checkpoint off, commits mark no row as changed, and a blocking checkpoint
+/// still writes every row and index entry committed since the last checkpoint.
+#[test]
+fn blocking_checkpoint_writes_rows_that_no_commit_marked() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+        insert_rows(&conn, "t", 1, 5);
+        let store = db.get_mvcc_store();
+        assert!(store.checkpoint_dirty_table_keys.is_empty());
+        assert!(store.checkpoint_dirty_index_keys.is_empty());
+
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("UPDATE t SET v = 'changed' WHERE id = 2")
+            .unwrap();
+        conn.execute("DELETE FROM t WHERE id = 3").unwrap();
+        conn.execute("INSERT INTO t VALUES (6, 'new')").unwrap();
+        assert!(
+            store.checkpoint_dirty_table_keys.is_empty(),
+            "a commit must not mark table rows when the passive checkpoint is off"
+        );
+        assert!(
+            store.checkpoint_dirty_index_keys.is_empty(),
+            "a commit must not mark index rows when the passive checkpoint is off"
+        );
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        get_rows(&conn, "SELECT id, v FROM t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), Value::build_text("v00000001")],
+            vec![Value::from_i64(2), Value::build_text("changed")],
+            vec![Value::from_i64(4), Value::build_text("v00000004")],
+            vec![Value::from_i64(5), Value::build_text("v00000005")],
+            vec![Value::from_i64(6), Value::build_text("new")],
+        ]
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM t INDEXED BY t_v ORDER BY v"),
+        [2, 6, 1, 4, 5].map(|id| vec![Value::from_i64(id)]).to_vec(),
+        "the index entries follow the rows"
+    );
+    assert_eq!(
+        get_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+}
+
+/// A blocking checkpoint cannot start while a commit is paused just before the step where a
+/// commit with the passive checkpoint on marks its rows. The next checkpoint writes the row.
+#[test]
+fn blocking_checkpoint_waits_for_a_commit_paused_before_marking_rows() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        let writer = db.connect();
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer
+            .execute("INSERT INTO t VALUES (1, 'paused')")
+            .unwrap();
+        writer.set_yield_injector(Some(FixedYieldInjector::new([
+            CommitYieldPoint::LogRecordPrepared.point(),
+        ])));
+        let mut commit = writer.prepare("COMMIT").unwrap();
+        assert!(
+            matches!(commit.step().unwrap(), StepResult::Yield),
+            "the commit must pause after it takes its commit timestamp"
+        );
+        assert!(
+            matches!(
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)"),
+                Err(LimboError::Busy)
+            ),
+            "a blocking checkpoint must not run while a commit is in progress"
+        );
+        commit.run_ignore_rows().unwrap();
+        drop(commit);
+        assert!(db.get_mvcc_store().checkpoint_dirty_table_keys.is_empty());
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        get_rows(&conn, "SELECT id, v FROM t"),
+        vec![vec![Value::from_i64(1), Value::build_text("paused")]]
+    );
+}
+
+/// A commit that is abandoned after it takes its commit timestamp rolls back. With the passive
+/// checkpoint off it leaves no marked row, and the next blocking checkpoint writes only the
+/// rows of the transactions that committed.
+#[test]
+fn blocking_checkpoint_after_an_abandoned_commit_writes_only_committed_rows() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'committed')")
+            .unwrap();
+
+        let writer = db.connect();
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer
+            .execute("INSERT INTO t VALUES (2, 'abandoned')")
+            .unwrap();
+        writer.set_yield_injector(Some(FixedYieldInjector::new([
+            CommitYieldPoint::LogRecordPrepared.point(),
+        ])));
+        {
+            let mut commit = writer.prepare("COMMIT").unwrap();
+            assert!(matches!(commit.step().unwrap(), StepResult::Yield));
+        }
+        writer.set_yield_injector(None);
+        let store = db.get_mvcc_store();
+        assert!(store.checkpoint_dirty_table_keys.is_empty());
+
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        assert!(store.checkpoint_dirty_table_keys.is_empty());
+    }
+
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        get_rows(&conn, "SELECT id, v FROM t"),
+        vec![vec![Value::from_i64(1), Value::build_text("committed")]]
+    );
 }
 
 #[test]
@@ -5058,10 +5207,19 @@ const PASSIVE: CheckpointMode = CheckpointMode::Passive {
 /// Which rows the checkpoint under test walks to find what to write.
 #[derive(Debug, Clone, Copy)]
 enum Walk {
-    /// Every row in the store. The first checkpoint after an open does this.
+    /// Every row in the store. A blocking checkpoint, and the first passive checkpoint after
+    /// an open, do this.
     EveryRow,
-    /// Only the rows that commits marked as changed. Later checkpoints do this.
+    /// Only the rows that commits marked as changed. Later passive checkpoints do this.
     ChangedRows,
+}
+
+/// A database whose checkpoints can do `walk`: only a passive checkpoint walks changed rows.
+fn database_for_walk(name: &str, walk: Walk) -> TempDatabase {
+    match walk {
+        Walk::EveryRow => TempDatabase::new_with_mvcc(name),
+        Walk::ChangedRows => passive_checkpoint_database(name),
+    }
 }
 
 /// Completes one checkpoint first when the test wants the next one to walk changed rows only.

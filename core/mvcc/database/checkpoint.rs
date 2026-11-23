@@ -366,6 +366,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     collect_index_key_end: Option<Arc<SortableIndexKey>>,
     collect_dirty_index_cursor: TableWalkCursor,
     collect_index_phase: CollectIndexPhase,
+    /// The MvStore's full-scan request that a passive checkpoint serves, if any. A blocking
+    /// checkpoint leaves it `None`.
     full_scan_generation: Option<NonZeroU64>,
     prune_candidates: Vec<(RowID, u64)>,
     prune_cursor: usize,
@@ -1190,7 +1192,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn collect_table_rows(&mut self) -> Result<Option<IOCompletions>> {
         let mut processed = 0;
         loop {
-            let full_scan = self.full_scan_generation.is_some();
+            let full_scan = self.collects_every_key();
             let must_yield = match (full_scan, self.collect_table_phase) {
                 (true, CollectTablePhase::DirtyStamps) => {
                     self.record_dirty_stamps(DirtyMap::Table, &mut processed)?
@@ -1203,7 +1205,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
             let next_phase = match self.collect_table_phase {
                 CollectTablePhase::Schema => Some(CollectTablePhase::User),
-                CollectTablePhase::User if full_scan => Some(CollectTablePhase::DirtyStamps),
+                CollectTablePhase::User if self.full_scan_generation.is_some() => {
+                    Some(CollectTablePhase::DirtyStamps)
+                }
                 CollectTablePhase::User | CollectTablePhase::DirtyStamps => None,
             };
             match next_phase {
@@ -1215,7 +1219,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
         }
         #[cfg(debug_assertions)]
-        if self.full_scan_generation.is_none() {
+        if !self.collects_every_key() {
             self.debug_assert_checkpointable_table_keys_are_dirty()?;
         }
         self.write_set.sort_by_key(|(row_id, _, _)| {
@@ -1486,7 +1490,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     ///    * The row is a delete AND it exists in the database file already.
     fn collect_index_rows(&mut self) -> Result<Option<IOCompletions>> {
         loop {
-            let full_scan = self.full_scan_generation.is_some();
+            let full_scan = self.collects_every_key();
             let must_yield = match (full_scan, self.collect_index_phase) {
                 (true, CollectIndexPhase::Rows) => self.collect_index_rows_from_store()?,
                 (true, CollectIndexPhase::DirtyStamps) => {
@@ -1498,17 +1502,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             if must_yield {
                 return Ok(Some(IOCompletions(Completion::new_yield())));
             }
-            if full_scan && self.collect_index_phase == CollectIndexPhase::Rows {
+            if self.full_scan_generation.is_some()
+                && self.collect_index_phase == CollectIndexPhase::Rows
+            {
                 self.collect_index_phase = CollectIndexPhase::DirtyStamps;
                 continue;
             }
             break;
         }
         #[cfg(debug_assertions)]
-        if self.full_scan_generation.is_none() {
+        if !self.collects_every_key() {
             self.debug_assert_checkpointable_index_keys_are_dirty()?;
         }
         Ok(None)
+    }
+
+    /// True when the collection reads every key of the MvStore instead of only the dirty
+    /// keys. Commits record dirty keys only when the passive checkpoint is on.
+    fn collects_every_key(&self) -> bool {
+        !self.mvstore.uses_passive_checkpoint() || self.full_scan_generation.is_some()
     }
 
     fn collect_index_rows_from_store(&mut self) -> Result<bool> {
@@ -2445,7 +2457,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 // Sample the snapshot only after the stop-the-world lock: no concurrent
                 // commits can land between snapshot_ts and collection on this path.
                 self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
-                self.full_scan_generation = self.mvstore.checkpoint_full_scan_generation();
                 // Checkpoint state machines can be created before they are run.
                 // Resample after serializing with other checkpoints so already-durable
                 // index deletes are not replayed, and keep schema-derived index metadata
@@ -3423,7 +3434,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 if let Some(io) = self.gc_checkpointed_index_versions() {
                     return Ok(TransitionResult::Io(io));
                 }
-                self.state = CheckpointState::PruneDirtyKeys;
+                self.state = if self.mvstore.uses_passive_checkpoint() {
+                    CheckpointState::PruneDirtyKeys
+                } else {
+                    CheckpointState::Finalize
+                };
                 Ok(TransitionResult::Continue)
             }
 
@@ -4200,9 +4215,11 @@ mod tests {
         (row.id, version)
     }
 
+    /// A checkpoint on a store with the passive checkpoint on, because only that store walks
+    /// the dirty keys.
     fn checkpoint_for_collect_tests(
     ) -> CheckpointStateMachine<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator> {
-        let db = MvccTestDbNoConn::new();
+        let db = MvccTestDbNoConn::new_passive();
         let conn = db.connect();
         let mvstore = db.get_mvcc_store();
         let pager = conn.pager.load().clone();

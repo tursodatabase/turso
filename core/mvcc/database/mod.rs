@@ -2852,15 +2852,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         else {
             unreachable!("step_mark_dirty_keys requires MarkDirtyKeys state")
         };
-        let (next, total) = mvcc_store.mark_tx_write_set_dirty(
-            tx.value(),
-            *end_ts,
-            *cursor,
-            MVCC_COMMIT_BATCH_SIZE,
-        )?;
-        if next < total {
-            *cursor = next;
-            return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
+        // Only the passive checkpoint reads the dirty keys. A blocking checkpoint reads
+        // every key of the MvStore, so recording them would only cost time.
+        if mvcc_store.uses_passive_checkpoint() {
+            let (next, total) = mvcc_store.mark_tx_write_set_dirty(
+                tx.value(),
+                *end_ts,
+                *cursor,
+                MVCC_COMMIT_BATCH_SIZE,
+            )?;
+            if next < total {
+                *cursor = next;
+                return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
+            }
         }
         let end_ts = *end_ts;
         let log_record = log_record
@@ -7244,7 +7248,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         let dirty_stamp = match tx.state.load() {
             TransactionState::Active => None,
-            TransactionState::Preparing(end_ts) => Some(end_ts),
+            // Commits record dirty keys only for the passive checkpoint.
+            TransactionState::Preparing(end_ts) => {
+                self.experimental_mvcc_passive_checkpoint.then_some(end_ts)
+            }
             other => {
                 unreachable!("rollback_tx requires Active or Preparing, got {other:?}")
             }
