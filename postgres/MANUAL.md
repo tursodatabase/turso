@@ -113,10 +113,11 @@ command:
   NULL fails. `INSERT ... ON CONFLICT` checks every row it proposes, also
   the ones that conflict.
 - `INSERT ... ON CONFLICT DO UPDATE` checks the row that conflicts against
-  the `USING` expressions of the `UPDATE` and `SELECT` policies, after the
-  `WHERE` of `DO UPDATE`, and fails with `new row violates row-level
-  security policy (USING expression)` instead of skipping it. The row the
-  update writes is checked as for `UPDATE`.
+  the `USING` expressions of the `UPDATE` and `SELECT` policies before the
+  `WHERE` of `DO UPDATE`, so a false `WHERE` does not skip a row the role
+  may not update, and fails with `new row violates row-level security
+  policy (USING expression)`. The row the update writes is checked as for
+  `UPDATE`.
 
 The policies are checked on each row before the other conditions of a query,
 so a condition of the query, or a function it calls, never sees a row the

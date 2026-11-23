@@ -674,6 +674,24 @@ pub fn emit_upsert(
     let decoded_column_types: Option<Vec<Option<Box<ast::Type>>>> = decoded_current_start
         .map(|_| column_custom_type_names(table.columns(), is_strict, resolver.schema()));
 
+    // The conflicting row must be one the role may update, or the statement
+    // fails. As in PostgreSQL, this runs before the WHERE below, so that the
+    // user's WHERE cannot tell anything about a row the role may not update.
+    emit_row_checks(
+        program,
+        resolver,
+        &row_checks.conflicting_row,
+        table_references,
+        ctx.conflict_rowid_reg,
+        table.columns().iter().enumerate().map(|(idx, col)| {
+            if col.is_rowid_alias() {
+                (col, ctx.conflict_rowid_reg)
+            } else {
+                (col, layout.to_register(current_start, idx))
+            }
+        }),
+    )?;
+
     // WHERE on target row
     if let Some(pred) = where_clause.as_mut() {
         rewrite_expr_to_registers(
@@ -711,23 +729,6 @@ pub fn emit_upsert(
             jump_if_null: true,
         });
     }
-
-    // The conflicting row must be one the role may update, or the statement
-    // fails, after the WHERE above, as in PostgreSQL.
-    emit_row_checks(
-        program,
-        resolver,
-        &row_checks.conflicting_row,
-        table_references,
-        ctx.conflict_rowid_reg,
-        table.columns().iter().enumerate().map(|(idx, col)| {
-            if col.is_rowid_alias() {
-                (col, ctx.conflict_rowid_reg)
-            } else {
-                (col, layout.to_register(current_start, idx))
-            }
-        }),
-    )?;
 
     // Apply SET; capture rowid change if any. As in UPDATE, the subqueries are
     // planned before the SET clauses are split, so that `SET (a, b) = (SELECT ...)`
