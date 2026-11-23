@@ -94,9 +94,9 @@ addr  opcode          p1   p2   p3  p4            p5  comment
   68    Move          31   24    1                 0  r[24..24]=r[31..31]
   69    IfPos         23   93    0                 0  r[23]>0 -> r[23]-=0, goto 93; check abort flag
   70    Gosub         30   90    0                 0  ; goto clear accumulator subroutine
-  71    Column         5    1   32                 0  r[32]=pseudo.column 1
-  72    AggStep        0   32   26  max(Binary)    0  accum=r[26] step(r[32])
-  73    If            22   75    0                 0  if r[22] goto 75; don't emit group columns if continuing existing group
+  71    Column         5    1   33                 0  r[33]=pseudo.column 1
+  72    AggStep        0   33   26  max(Binary)    0  accum=r[26] step(r[33]); r[32]=1 if accum kept its value
+  73    If            32   75    0                 0  if r[32] goto 75; don't emit group columns if continuing existing group
   74    Column         5    0   25                 0  r[25]=pseudo.column 0
   75    Integer        1   22    0                 0  r[22]=1; indicate data in accumulator
   76  SorterNext       4   63    0                 0
@@ -109,31 +109,31 @@ addr  opcode          p1   p2   p3  p4            p5  comment
   83  AggFinal         0   26    0  max            0  accum=r[26]
   84  Copy            25   19    0                 0  r[19]=r[25]
   85  Copy            26   20    0                 0  r[20]=r[26]
-  86  MakeRecord      19    2   33                 0  r[33]=mkrec(r[19..20]); for
-  87  NewRowid         3   34    0                 0  r[34]=rowid
-  88  Insert           3   33   34                 4  intkey=r[34] data=r[33]
+  86  MakeRecord      19    2   34                 0  r[34]=mkrec(r[19..20]); for
+  87  NewRowid         3   35    0                 0  r[35]=rowid
+  88  Insert           3   34   35                 4  intkey=r[35] data=r[34]
   89  Return          21    0    0                 0
   90  Null             0   25   26                 0  r[25..26]=NULL; clear accumulator subroutine start
   91  Integer          0   22    0                 0  r[22]=0
   92  Return          30    0    0                 0
   93  Return          18    0    0                 0
-  94  Null             0   36    0                 0  r[36]=NULL
+  94  Null             0   37    0                 0  r[37]=NULL
   95  InitCoroutine    1    0    2                 0
   96    Yield          1  106    0                 0
   97    Rewind         3  105    0                 0  Rewind  ephemeral()
   98      Column       3    1   17                 0  r[17]=ephemeral().maxp
-  99      Copy         3   40    0                 0  r[40]=r[3]
- 100      Copy        17   41    0                 0  r[41]=r[17]
- 101      Add         40   41   38                 0  r[38]=r[40]+r[41]
- 102      Le          38   39  104  Binary         0  if r[38]<=r[39] goto 104
- 103      AggStep      0   42   36  count          0  accum=r[36] step(r[42])
+  99      Copy         3   41    0                 0  r[41]=r[3]
+ 100      Copy        17   42    0                 0  r[42]=r[17]
+ 101      Add         41   42   39                 0  r[39]=r[41]+r[42]
+ 102      Le          39   40  104  Binary         0  if r[39]<=r[40] goto 104
+ 103      AggStep      0   43   37  count          0  accum=r[37] step(r[43])
  104    Next           3   98    0                 0
  105  Goto             0   96    0                 0
- 106  AggFinal         0   36    0  count          0  accum=r[36]
- 107  Copy            36   35    0                 0  r[35]=r[36]
- 108  ResultRow       35    1    0                 0  output=r[35]
+ 106  AggFinal         0   37    0  count          0  accum=r[37]
+ 107  Copy            37   36    0                 0  r[36]=r[37]
+ 108  ResultRow       36    1    0                 0  output=r[36]
  109  Halt             0    0    0                 0
  110  Transaction      0    1    2                 0  iDb=0 tx_mode=Read
- 111  Integer          3   39    0                 0  r[39]=3
- 112  Integer          1   42    0                 0  r[42]=1
+ 111  Integer          3   40    0                 0  r[40]=3
+ 112  Integer          1   43    0                 0  r[43]=1
  113  Goto             0    1    0                 0
