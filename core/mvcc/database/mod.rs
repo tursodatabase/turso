@@ -1928,8 +1928,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                         }
                     } else if self.mvcc_store.txs.get(&batch.writing.tx_id).is_some() {
                         // The owner is still alive and will take the retry.
-                        // A ticket for a transaction that already rolled back
-                        // is never taken, and that hole parks every later commit.
+                        // This read is outside the group mutex. If the owner
+                        // drops first, drop_pending records the ticket and
+                        // request_retry does not leave a hole.
                         self.commit_coordinator.request_retry(batch.writing.ticket);
                     }
                 }

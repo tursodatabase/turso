@@ -50,6 +50,9 @@ struct GroupState {
     /// Waiters that dropped after `log_tx`. The leader finishes or rolls them
     /// back. They must not roll back themselves.
     abandoned: HashSet<TxID>,
+    /// Tickets the leader already took, whose owner then dropped. A retry
+    /// hole for one of these is never taken, and it parks every later commit.
+    dropped_claimed: HashSet<u64>,
     /// Waiters asleep until the leader makes their ticket durable, asks
     /// them to retry, or releases the commit lock.
     parked: BTreeMap<u64, Completion>,
@@ -89,6 +92,7 @@ impl CommitCoordinator {
                 retry: HashSet::default(),
                 issued: None,
                 abandoned: HashSet::default(),
+                dropped_claimed: HashSet::default(),
                 parked: BTreeMap::new(),
             }),
             #[cfg(any(test, feature = "test_helper"))]
@@ -197,6 +201,10 @@ impl CommitCoordinator {
             let ticket = dense_prefix_cap(ticket, group.written_through, &group.retry);
             group.durable_through = group.durable_through.max(ticket);
             let durable_through = group.durable_through;
+            // request_retry runs before a later commit is marked durable.
+            group
+                .dropped_claimed
+                .retain(|&dropped| dropped > durable_through);
             take_parked_through(&mut group, durable_through)
         };
         wake(woken);
@@ -208,6 +216,7 @@ impl CommitCoordinator {
 
     pub(crate) fn note_written(&self, ticket: u64) {
         let mut group = self.group.lock();
+        group.dropped_claimed.remove(&ticket);
         if group.retry.iter().any(|&hole| hole <= ticket) {
             return;
         }
@@ -241,6 +250,9 @@ impl CommitCoordinator {
             group.pending.remove(index);
             true
         } else {
+            // The leader already popped this ticket. The owner is gone, so
+            // a later request_retry must not leave a hole.
+            group.dropped_claimed.insert(ticket);
             false
         }
     }
@@ -248,14 +260,18 @@ impl CommitCoordinator {
     pub(crate) fn request_retry(&self, ticket: u64) {
         let woken = {
             let mut group = self.group.lock();
-            group.retry.insert(ticket);
-            if group.written_through >= ticket {
-                group.written_through = ticket.saturating_sub(1);
+            if group.dropped_claimed.remove(&ticket) {
+                None
+            } else {
+                group.retry.insert(ticket);
+                if group.written_through >= ticket {
+                    group.written_through = ticket.saturating_sub(1);
+                }
+                if group.durable_through >= ticket {
+                    group.durable_through = ticket.saturating_sub(1);
+                }
+                group.parked.remove(&ticket)
             }
-            if group.durable_through >= ticket {
-                group.durable_through = ticket.saturating_sub(1);
-            }
-            group.parked.remove(&ticket)
         };
         wake(woken);
     }
