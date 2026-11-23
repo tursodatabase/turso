@@ -279,6 +279,54 @@ fn oids_are_never_reused_even_across_a_reopen() {
     assert_eq!(d_oid, 16387, "oids survive a reopen");
 }
 
+/// Without the counter the next oid would be 16384 again, which table `a`
+/// already has.
+#[test]
+fn creating_a_relation_fails_when_the_oid_counter_row_is_missing() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+
+    pg.execute("CREATE TABLE a (x INTEGER)").unwrap();
+    conn.execute("DELETE FROM sqlite_sequence WHERE name = '__turso_internal_classes'")
+        .unwrap();
+
+    let error = pg
+        .execute("CREATE TABLE b (x INTEGER)")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("has no row for the oid counter"),
+        "unexpected error: {error}"
+    );
+    assert!(class_row(&conn, "b").is_none());
+    let (a_oid, ..) = class_row(&conn, "a").unwrap();
+    assert_eq!(a_oid, 16384);
+}
+
+#[test]
+fn creating_a_relation_fails_when_the_oid_counter_is_behind_the_classes_table() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+
+    pg.execute("CREATE TABLE a (x INTEGER)").unwrap();
+    conn.execute("UPDATE sqlite_sequence SET seq = 16383 WHERE name = '__turso_internal_classes'")
+        .unwrap();
+
+    let error = pg
+        .execute("CREATE TABLE b (x INTEGER)")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("gave out an oid that a row of __turso_internal_classes already has"),
+        "unexpected error: {error}"
+    );
+    assert!(class_row(&conn, "b").is_none());
+    let (_, relname, ..) = class_row(&conn, "a").unwrap();
+    assert_eq!(relname, "a");
+}
+
 #[test]
 fn a_rename_keeps_the_oid_and_owner() {
     let db = TempDatabase::builder().build();

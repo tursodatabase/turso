@@ -23,8 +23,7 @@
 //!
 //! Oids start at 16384, PostgreSQL's `FirstNormalObjectId`, and are never
 //! reused inside one database, even after the relation is dropped: the
-//! highest oid ever used is kept in `sqlite_sequence` under the catalog's
-//! own name, like an AUTOINCREMENT table's watermark. Row-level security
+//! database's oid counter gives them out, see [`crate::oid`]. Row-level security
 //! policies take their oids from the same counter.
 
 use std::collections::{BTreeMap, HashMap};
@@ -32,16 +31,14 @@ use std::sync::Arc;
 
 use turso_core::ast;
 use turso_core::namespace::NamespaceId;
-use turso_core::schema::{
-    is_user_relation_name, BTreeTable, RelationKind, Schema, SQLITE_SEQUENCE_TABLE_NAME,
-};
+use turso_core::schema::{is_user_relation_name, RelationKind, Schema};
 use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::security::roles::RoleId;
 use turso_core::{
-    emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, AccessStatement,
-    Catalog, CatalogApply, CatalogCmd, CmdContext, CmdOrigin, CmpInsFlags, CollationSeq,
-    Connection, CursorType, DropColumn, InsertFlags, Insn, LimboError, LoadStep, NewOwner, Numeric,
-    OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationName, SqliteCatalog, Value,
+    to_u32, AccessStatement, Catalog, CatalogApply, CatalogCmd, CmdContext, CmdOrigin, CmpInsFlags,
+    CollationSeq, Connection, CursorType, DropColumn, InsertFlags, Insn, LimboError, LoadStep,
+    NewOwner, Numeric, OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationName, SqliteCatalog,
+    Value,
 };
 
 use turso_core::MAIN_DB_ID;
@@ -54,6 +51,7 @@ use crate::acl::{Acl, Privileges, PUBLIC_OID};
 use crate::catalog::{engine_role_by_name, role_oid, role_oid_by_name};
 use crate::descriptions::{emit_delete_comments, Dropped};
 use crate::error::sqlstate_error;
+use crate::oid::{OidAllocator, COUNTER_INIT_STATEMENTS, FIRST_NORMAL_OBJECT_ID};
 use crate::policies::{self, TablePolicies};
 use crate::roles::schema_roles;
 use crate::schema_init::{is_stored_catalog_table, TableInit};
@@ -64,10 +62,6 @@ use turso_core::security::policy::RowPolicy;
 pub(crate) const CLASSES_TABLE_NAME: &str = "__turso_internal_classes";
 
 pub(crate) const CLASSES_NAME_INDEX_NAME: &str = "__turso_internal_classes_name";
-
-/// PostgreSQL's `FirstNormalObjectId`: the first oid given to a user
-/// relation. Smaller oids belong to built-in catalog objects.
-pub(crate) const FIRST_NORMAL_OBJECT_ID: i64 = 16384;
 
 /// The columns the rest of this module reads and writes. `relownedby` is
 /// the oid of the table whose serial column owns the relation, 0 when no
@@ -113,24 +107,13 @@ pub(crate) fn refuse_relations_without_class_table(schema: &Schema) -> turso_cor
     Ok(())
 }
 
-/// A database that the SQLite frontend made can have this table already.
-const CREATE_SEQUENCE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS sqlite_sequence(name,seq)";
-
-/// Stores the highest oid ever used. No oid is used yet, so it is the one
-/// before [`FIRST_NORMAL_OBJECT_ID`].
-const INSERT_HIGHEST_OID_SQL: &str =
-    "INSERT INTO sqlite_sequence (name, seq) VALUES ('__turso_internal_classes', 16383)";
-
-// The statement above spells the oid so that it can be a constant.
-const _: () = assert!(FIRST_NORMAL_OBJECT_ID - 1 == 16383);
-
 pub(crate) const TABLE_INIT: TableInit = TableInit {
     table: CLASSES_TABLE_NAME,
     statements: &[
         CREATE_CLASSES_TABLE_SQL,
         CREATE_CLASSES_NAME_INDEX_SQL,
-        CREATE_SEQUENCE_TABLE_SQL,
-        INSERT_HIGHEST_OID_SQL,
+        COUNTER_INIT_STATEMENTS[0],
+        COUNTER_INIT_STATEMENTS[1],
     ],
 };
 
@@ -1288,23 +1271,21 @@ fn resolve_role(
     })
 }
 
-/// The cursors of one statement's class row writes: the classes table, its
-/// name index, and `sqlite_sequence`, which keeps the highest oid ever used
-/// under the classes table's own name.
+/// The cursors of one statement's class row writes: the classes table and
+/// its name index, and the oid counter.
 struct ClassTableCursors {
     table_cursor_id: usize,
     index_cursor_id: usize,
     index_name: String,
-    /// Only opened when the statement inserts a row, which allocates an oid.
-    seq_cursor_id: Option<usize>,
-    seq_table: Option<Arc<BTreeTable>>,
+    /// Only opened when the statement adds a relation or a policy, which
+    /// takes an oid.
+    oids: Option<OidAllocator>,
 }
 
 /// Opens the classes table of the main database for writing, or returns None
 /// when the database has no catalog, which only happens outside the
 /// frontend's own open path, such as a core-level open for tests.
-/// `allocates_oids` also opens `sqlite_sequence`, which inserting a class
-/// row updates.
+/// `allocates_oids` also opens the oid counter.
 fn open_class_table_for_writing(
     program: &mut ProgramBuilder,
     schema: &Schema,
@@ -1331,29 +1312,16 @@ fn open_class_table_for_writing(
         root_page: RegisterOrLiteral::Literal(name_index.root_page),
         db: MAIN_DB_ID,
     });
-    let (seq_cursor_id, seq_table) = if allocates_oids {
-        let Some(seq_table) = schema.get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
-        else {
-            return Err(LimboError::Corrupt(format!(
-                "a database with {CLASSES_TABLE_NAME} has no {SQLITE_SEQUENCE_TABLE_NAME}"
-            )));
-        };
-        let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
-        program.emit_insn(Insn::OpenRead {
-            cursor_id: seq_cursor_id,
-            root_page: seq_table.root_page,
-            db: MAIN_DB_ID,
-        });
-        (Some(seq_cursor_id), Some(seq_table))
+    let oids = if allocates_oids {
+        Some(OidAllocator::open(program, schema)?)
     } else {
-        (None, None)
+        None
     };
     Ok(Some(ClassTableCursors {
         table_cursor_id,
         index_cursor_id,
         index_name: name_index.name.clone(),
-        seq_cursor_id,
-        seq_table,
+        oids,
     }))
 }
 
@@ -1370,7 +1338,11 @@ fn emit_class_row_insert(
     if !is_user_relation_name(kind, name) {
         return;
     }
-    let oid_reg = emit_allocate_oid(program, cursors);
+    let oid_reg = oid_allocator(cursors).emit_allocate_rowid(
+        program,
+        cursors.table_cursor_id,
+        CLASSES_TABLE_NAME,
+    );
 
     emit_class_name_index_insert(program, cursors, namespace, name, oid_reg);
 
@@ -1440,52 +1412,12 @@ fn emit_class_row_insert(
     .emit(program, oid_reg, first_column_reg + 4);
 }
 
-/// Puts the next oid in the returned register and records it as the
-/// highest oid ever used.
-fn emit_allocate_oid(program: &mut ProgramBuilder, cursors: &ClassTableCursors) -> usize {
-    let seq_cursor_id = cursors
-        .seq_cursor_id
-        .expect("the caller opened the cursors with allocates_oids");
-
-    // oid = max(largest oid in the table + 1, highest oid ever used + 1,
-    // FIRST_NORMAL_OBJECT_ID), so an oid is never reused even after the
-    // relation or policy with the largest oid is dropped.
-    let watermark_reg = emit_read_oid_watermark(program, seq_cursor_id);
-    let oid_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: cursors.table_cursor_id,
-        rowid_reg: oid_reg,
-        prev_largest_reg: 0,
-    });
-    let floor_reg = program.alloc_register();
-    program.emit_insn(Insn::Integer {
-        value: FIRST_NORMAL_OBJECT_ID - 1,
-        dest: floor_reg,
-    });
-    program.emit_insn(Insn::MemMax {
-        dest_reg: watermark_reg,
-        src_reg: floor_reg,
-    });
-    program.emit_insn(Insn::AddImm {
-        register: watermark_reg,
-        value: 1,
-    });
-    program.emit_insn(Insn::MemMax {
-        dest_reg: oid_reg,
-        src_reg: watermark_reg,
-    });
-
-    emit_sqlite_sequence_row_write(
-        program,
-        cursors
-            .seq_table
-            .clone()
-            .expect("the caller opened the cursors with allocates_oids"),
-        MAIN_DB_ID,
-        CLASSES_TABLE_NAME,
-        oid_reg,
-    );
-    oid_reg
+/// The oid counter of a statement that adds a relation or a policy.
+fn oid_allocator(cursors: &ClassTableCursors) -> &OidAllocator {
+    cursors
+        .oids
+        .as_ref()
+        .expect("the caller opened the cursors with allocates_oids")
 }
 
 /// Makes column `column` of the table with oid `table_oid` the owner of
@@ -1719,7 +1651,7 @@ fn emit_class_row_set_policies(
             before_oid,
             after_oid,
         } => {
-            let oid_reg = emit_allocate_oid(program, cursors);
+            let oid_reg = oid_allocator(cursors).emit_allocate(program);
             program.emit_insn(Insn::String8 {
                 value: before_oid,
                 dest: policies_reg,
@@ -2336,17 +2268,6 @@ fn emit_class_name_index_delete(
         cursor_id: cursors.index_cursor_id,
         raise_error_if_no_matching_entry: true,
     });
-}
-
-/// Reads the highest oid ever used from the `sqlite_sequence` row named
-/// after the classes table into the returned register: an integer, zero
-/// when the row does not exist.
-fn emit_read_oid_watermark(program: &mut ProgramBuilder, seq_cursor_id: usize) -> usize {
-    let name_reg = program.emit_string8_new_reg(CLASSES_TABLE_NAME.to_string());
-    let watermark_reg = program.alloc_register();
-    let rowid_reg = program.alloc_register();
-    emit_sqlite_sequence_row_read(program, seq_cursor_id, name_reg, watermark_reg, rowid_reg);
-    watermark_reg
 }
 
 #[cfg(test)]
