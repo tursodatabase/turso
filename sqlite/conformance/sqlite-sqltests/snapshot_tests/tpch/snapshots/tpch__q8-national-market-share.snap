@@ -49,12 +49,12 @@ info:
 ---
 QUERY PLAN
 |--SCAN all_nations
-|  |--SCAN orders
-|  |--SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
-|  |--SEARCH part USING INTEGER PRIMARY KEY (rowid=?)
+|  |--HASH JOIN lineitem
+|  |--SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)
 |  |--SEARCH customer USING INTEGER PRIMARY KEY (rowid=?)
 |  |--SEARCH n1 USING INTEGER PRIMARY KEY (rowid=?)
 |  |--SEARCH region USING INTEGER PRIMARY KEY (rowid=?)
 |  |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
-|  `--SEARCH n2 USING INTEGER PRIMARY KEY (rowid=?)
+|  |--SEARCH n2 USING INTEGER PRIMARY KEY (rowid=?)
+|  `--SCAN part
 `--USE SORTER FOR GROUP BY
