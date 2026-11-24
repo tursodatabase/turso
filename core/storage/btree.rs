@@ -9417,16 +9417,20 @@ pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usabl
     contents.write_fragmented_bytes_count(0);
     contents.write_rightmost_ptr(0);
 
-    let header_size = contents.header_size();
-    let buf = contents.as_ptr();
-    let buffer_len = buf.len();
-    turso_assert!(
-        usable_space <= buffer_len,
-        "usable_space must be <= buffer_len"
-    );
-    // Zero out all unallocated space and reserved area to prevent leaking stale memory
-    // and to ensure deterministic on-disk representation.
-    buf[offset + header_size..].fill(0);
+    #[cfg(debug_assertions)]
+    {
+        // we might get already used page from the pool. generally this is not a problem because
+        // b tree access is very controlled. However, for encrypted pages (and also checksums) we want
+        // to ensure that there are no reserved bytes that contain old data.
+        let buf = contents.as_ptr();
+        let buffer_len = buf.len();
+        turso_assert!(
+            usable_space <= buffer_len,
+            "usable_space must be <= buffer_len"
+        );
+        // this is no op if usable_space == buffer_len
+        buf[usable_space..buffer_len].fill(0);
+    }
 }
 
 fn to_static_buf(buf: &mut [u8]) -> &'static mut [u8] {
@@ -10950,31 +10954,6 @@ mod tests {
 
         btree_init_page(&page, PageType::TableLeaf, 0, 4096);
         page
-    }
-
-    #[test]
-    fn btree_init_page_zeros_unallocated_space() {
-        const PAGE_SIZE: usize = 4096;
-        let page = Arc::new(Page::new(2));
-        {
-            let inner = page.get();
-            let buf = Arc::new(Buffer::new_temporary(PAGE_SIZE));
-            // Poison the buffer so any stale bytes are detectable.
-            buf.as_mut_slice().fill(0xAB);
-            inner.set_buffer(buf);
-        }
-        page.set_loaded();
-
-        btree_init_page(&page, PageType::TableLeaf, 0, PAGE_SIZE);
-
-        let inner = page.get();
-        let buf = inner.as_ptr();
-        let header_size = inner.header_size();
-        // Every byte after the page header must be zero.
-        assert!(
-            buf[header_size..].iter().all(|&b| b == 0),
-            "unallocated space after page header contains non-zero bytes (stale data leak)"
-        );
     }
 
     /// Nightly-only because on stable `crate::alloc::Vec` degrades to the global

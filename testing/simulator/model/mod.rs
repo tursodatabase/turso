@@ -575,7 +575,7 @@ impl Shadow for Query {
             Query::LateralSelect(select) => select.shadow(env),
             Query::Update(update) => update.shadow(env),
             Query::Drop(drop) => drop.shadow(env),
-            Query::CreateIndex(create_index) => create_index.shadow(env),
+            Query::CreateIndex(create_index) => Ok(create_index.shadow(env)),
             Query::AlterTable(alter_table) => alter_table.shadow(env),
             Query::DropIndex(drop_index) => drop_index.shadow(env),
             Query::CreateSequence(cs) => cs.shadow(env),
@@ -700,21 +700,16 @@ impl Shadow for Create {
 }
 
 impl Shadow for CreateIndex {
-    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
-    fn shadow(&self, env: &mut ShadowTablesMut) -> Self::Result {
+    type Result = Vec<Vec<SimValue>>;
+    fn shadow(&self, env: &mut ShadowTablesMut) -> Vec<Vec<SimValue>> {
         // Record the operation BEFORE applying it to current_tables
         env.record_create_index(self.table_name.clone(), self.index.clone());
-        let table = env
-            .iter_mut()
+        env.iter_mut()
             .find(|t| t.name == self.table_name)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Table {} does not exist. CREATE INDEX statement ignored.",
-                    self.table_name
-                )
-            })?;
-        table.indexes.push(self.index.clone());
-        Ok(vec![])
+            .unwrap()
+            .indexes
+            .push(self.index.clone());
+        vec![]
     }
 }
 
