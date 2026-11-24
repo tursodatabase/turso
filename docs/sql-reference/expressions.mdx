@@ -66,6 +66,7 @@ The PostgreSQL frontend supports `TRUE` and `FALSE` literals. Boolean literals a
 | `-` | Subtraction | `10 - 3` | `7` |
 | `*` | Multiplication | `3 * 4` | `12` |
 | `/` | Division | `10 / 3` | `3` (integer division) |
+| `%` | Remainder | `7 % 3` | `1` |
 | `-` (unary) | Negation | `-5` | `-5` |
 | `+` (unary) | No-op | `+5` | `5` |
 
@@ -76,6 +77,12 @@ SELECT 10 / 3;           -- 3 (integer division)
 SELECT 10 / 3.0;         -- 3.333... (real division)
 SELECT CAST(10 AS REAL) / 3;  -- 3.333...
 ```
+
+`%` casts both operands to integers first, so `7.5 % 2` is `1.0`. Through the PostgreSQL frontend, `%` and `mod()` with a non-integer operand compute the exact decimal remainder, as PostgreSQL does for `numeric`: `7.5 % 2` is `1.5`, `-7.5 % 2` is `-1.5`, `0.1 % 0.03` is `0.01`, and `9007199254740993 % 2.5` is `0.5`. The result is a double precision value. PostgreSQL rejects `%` on `double precision` and `real` values, but the PostgreSQL frontend computes it, because it stores these values and plain `numeric` values in the same way.
+
+A REAL operand is read as the shortest decimal that reads back as the same double. For a literal with a large negative exponent this decimal can differ from the literal, so `1 % 1e-300` gives `1e-304`, where PostgreSQL gives `0`.
+
+Older versions of the PostgreSQL frontend computed `%` and `mod()` with a non-integer operand as an integer remainder. An expression index or a partial index that uses `%` or `mod()` on non-integer values, created by an older version, keeps the old results. Drop the index and create it again after the upgrade. Until then, `DELETE` and `UPDATE` on such a row fail with a corrupt database error.
 
 ### Comparison Operators
 

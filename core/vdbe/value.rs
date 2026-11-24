@@ -1,13 +1,17 @@
 use crate::types::TextSubtype;
 use crate::{
     function::MathFunc,
-    numeric::{format_float, format_float_for_quote, IntegerText, NullableInteger, Numeric},
+    numeric::{
+        decimal::{format_numeric, numeric_from_value},
+        format_float, format_float_for_quote, IntegerText, NullableInteger, Numeric,
+    },
     translate::collate::CollationSeq,
     turso_assert,
     types::{AsValueRef, SeekOp, Text},
     vdbe::affinity::{real_to_i64, Affinity},
     LimboError, Result, Value,
 };
+use bigdecimal::Zero;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -1293,6 +1297,32 @@ impl Value {
                     Value::from_i64(v)
                 }
             }
+        }
+    }
+
+    /// The remainder of `self / rhs` with the sign of `self`, as the numeric
+    /// type of PostgreSQL computes it. When an operand is a REAL, each
+    /// operand is read as the shortest decimal that reads back as the same
+    /// f64, the remainder of the decimals is exact, and the result is a
+    /// REAL: `7.5 % 2` is 1.5, and
+    /// `9007199254740993 % 2.5` is 0.5, which the f64 nearest to the dividend
+    /// does not give. Two integers give the result of [Self::exec_remainder].
+    pub fn exec_exact_remainder(&self, rhs: &Value) -> Value {
+        match (Numeric::from_value(self), Numeric::from_value(rhs)) {
+            (Some(lhs @ Numeric::Float(_)), Some(rhs))
+            | (Some(lhs), Some(rhs @ Numeric::Float(_))) => {
+                let decimal = |n: Numeric| numeric_from_value(&Value::Numeric(n)).ok();
+                match (decimal(lhs), decimal(rhs)) {
+                    (Some(dividend), Some(divisor)) if !divisor.is_zero() => {
+                        let remainder = format_numeric(&(dividend % divisor));
+                        Value::from_f64(remainder.parse().expect("a decimal is an f64"))
+                    }
+                    // An infinity has no decimal form, and a zero divisor
+                    // gives NULL, as fmod() gives NaN.
+                    _ => Value::from_f64(libm::fmod(lhs.to_f64(), rhs.to_f64())),
+                }
+            }
+            _ => self.exec_remainder(rhs),
         }
     }
 

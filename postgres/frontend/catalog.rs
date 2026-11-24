@@ -416,7 +416,7 @@ impl Dialect for PostgresDialect {
         ))
     }
 
-    fn mod_of_integers_is_integer(&self) -> bool {
+    fn exact_remainder(&self) -> bool {
         true
     }
 

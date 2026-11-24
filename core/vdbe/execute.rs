@@ -459,7 +459,12 @@ pub fn op_remainder(
         return Ok(InsnFunctionStepResult::Step);
     }
     check_divisor(connection, state, *lhs, *rhs)?;
-    op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_remainder)
+    let exec = if connection.dialect().exact_remainder() {
+        Value::exec_exact_remainder
+    } else {
+        Value::exec_remainder
+    };
+    op_arithmetic_slow(state, *lhs, *rhs, *dest, exec)
 }
 
 fn check_divisor(
@@ -11050,10 +11055,8 @@ pub fn op_function(
                     Numeric::from_value_strict(lhs),
                     Numeric::from_value_strict(rhs),
                 ) {
-                    (MathFunc::Mod, Some(Numeric::Integer(lhs)), Some(Numeric::Integer(rhs)))
-                        if rhs != 0 && dialect.mod_of_integers_is_integer() =>
-                    {
-                        Value::from_i64(lhs.wrapping_rem(rhs))
+                    (MathFunc::Mod, Some(_), Some(_)) if dialect.exact_remainder() => {
+                        lhs.exec_exact_remainder(rhs)
                     }
                     _ => result,
                 };
