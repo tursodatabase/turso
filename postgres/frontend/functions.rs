@@ -309,7 +309,12 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
             oid_arg(args, 0)?.map(|oid| exec_pg_get_user_by_id(connection, oid))
         },
-        "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible"(
+        "pg_table_is_visible"
+        | "pg_function_is_visible"
+        | "pg_type_is_visible"
+        | "pg_operator_is_visible"
+        | "pg_opclass_is_visible"
+        | "pg_opfamily_is_visible"(
             FunctionArity::Exact(1), true
         ) => oid_arg(args, 0)?.map(exec_pg_is_visible),
         "pg_encoding_to_char"(FunctionArity::Exact(1), true) => {
@@ -927,6 +932,21 @@ fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> String {
     role_name_by_oid(&connection_roles(conn), oid).unwrap_or_else(|| format!("unknown (OID={oid})"))
 }
 
+/// FIXME(pg-search-path): This says that every object is visible, which
+/// hand-codes PostgreSQL's rule of visibility in the search path: an object
+/// is visible when its schema is in search_path and no object of an earlier
+/// schema of search_path has the same name (and, for an operator, the same
+/// argument types). The answer is right for the built-in rows of
+/// pg_operator, pg_opclass and pg_opfamily, which are all in pg_catalog, and
+/// no user statement creates rows in these catalogs. But PostgreSQL returns
+/// NULL for an oid that no row of the catalog has, and false for a hidden
+/// object. A lookup of the object in its catalog, and of its name in the
+/// schemas of search_path, replaces this. psql calls pg_operator_is_visible
+/// in `\do`, pg_opclass_is_visible in `\dAc`, and pg_opfamily_is_visible in
+/// `\dAf`, `\dAo` and `\dAp`.
+/// Whether the object with oid `_oid` is visible in the schemas of
+/// search_path, for `pg_table_is_visible` and the other `pg_*_is_visible`
+/// functions.
 fn exec_pg_is_visible(_oid: i64) -> Boolean {
     Boolean(true)
 }

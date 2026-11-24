@@ -109,7 +109,12 @@ row can have the oid of another built-in function of PostgreSQL. Thus psql's
 catalogs with wrong or empty function names, and with `unknown` for each type
 that `format_type` does not know. No statement
 changes the rows: a role that is not a superuser gets `42501`, and a superuser,
-whom PostgreSQL lets change them, gets `0A000`.
+whom PostgreSQL lets change them, gets `0A000`. `pg_operator_is_visible`,
+`pg_opclass_is_visible` and `pg_opfamily_is_visible`, which psql's `\do`,
+`\dAc`, `\dAf`, `\dAo` and `\dAp` call, return true for every oid, as
+`pg_table_is_visible`, `pg_type_is_visible` and `pg_function_is_visible` do;
+PostgreSQL returns NULL for an oid that no row has, and false for an object
+that an object of an earlier schema of `search_path` hides.
 `pg_description` is a stored table. It has the comments that `COMMENT ON`
 stored, and the default `standard public schema` comment for `public`, so
 pg_dump does not emit a command to clear that comment on restore. Dropping a
