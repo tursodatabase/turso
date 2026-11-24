@@ -7909,9 +7909,13 @@ fn pg_type_name_to_ast_type(
         "TIME" => "time",
         "TIMESTAMP" => "timestamp",
         "TIMESTAMPTZ" => "timestamptz",
+        // A cast to jsonb converts the value as a jsonb column does, so that
+        // core runs the operators of jsonb on it: `'{"a":1}'::jsonb || '{}'`
+        // joins two objects, not two texts.
+        "JSONB" => "jsonb",
         // For CAST expressions, map all text-like PG types to TEXT.
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INET" | "JSON" | "JSONB"
-        | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INET" | "JSON" | "XML"
+        | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
         "BYTEA" | "BLOB" => "BLOB",
         _ => &pg_type,
     };
