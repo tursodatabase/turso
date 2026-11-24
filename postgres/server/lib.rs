@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::{ConnectOpts, Database, StatementTimes, Value, WallClockInstant};
 use turso_pg::{
-    parse_pg_bool, split_statements, sql_parse_error, sqlstate_error, PgConnection,
+    parse_pg_bool, parse_pg_bytea, split_statements, sql_parse_error, sqlstate_error, PgConnection,
     StatementResultKind, TransactionState,
 };
 use turso_pg_parser::cmdtag::CommandTag;
@@ -952,20 +952,10 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 format!("invalid input syntax for type boolean: \"{text}\""),
             )),
         },
-        Type::BYTEA => {
-            // PostgreSQL text format for bytea uses \x hex encoding
-            if let Some(hex_str) = text.strip_prefix("\\x") {
-                let data = decode_hex(hex_str).map_err(|e| {
-                    PgWireError::UserError(Box::new(error_info(&format!(
-                        "invalid bytea hex parameter: {e}"
-                    ))))
-                })?;
-                Ok(Value::from_blob(data))
-            } else {
-                // Raw bytes as-is
-                Ok(Value::from_blob(bytes.to_vec()))
-            }
-        }
+        Type::BYTEA => match parse_pg_bytea(text) {
+            Ok(data) => Ok(Value::from_blob(data)),
+            Err(error) => Err(wire_error(error.sqlstate, error.message)),
+        },
         // FIXME(pg-catalog): PostgreSQL resolves an unknown-type parameter from its context, as an operand of an operator or a function or as a target column. A typed expression tree replaces this guess.
         // UNKNOWN: try to infer type from text content (numeric-looking values
         // should be bound as numbers so comparisons with COUNT/SUM etc. work)
@@ -984,32 +974,6 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
         }
         // TEXT, VARCHAR, and all other types → text
         _ => Ok(Value::from_text(text.to_owned())),
-    }
-}
-
-/// Decode a hex string into bytes.
-fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
-    if hex.len() % 2 != 0 {
-        return Err("odd-length hex string".to_owned());
-    }
-    hex.as_bytes()
-        .chunks_exact(2)
-        .enumerate()
-        .map(|(pair_index, pair)| {
-            let position = 2 * pair_index;
-            let high = decode_hex_digit(pair[0], position)?;
-            let low = decode_hex_digit(pair[1], position + 1)?;
-            Ok((high << 4) | low)
-        })
-        .collect()
-}
-
-fn decode_hex_digit(byte: u8, position: usize) -> Result<u8, String> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(format!("invalid hex at position {position}")),
     }
 }
 
@@ -1704,6 +1668,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bytea_parameter_is_bytea_input_with_or_without_a_declared_type() {
+        let conn = memory_connection();
+        conn.execute("CREATE TABLE w (b bytea)").unwrap();
+        conn.execute("CREATE TABLE u (i int, b bytea)").unwrap();
+        for declared in [Some(Type::BYTEA), None] {
+            let bind = |sql: &str, text: &str| {
+                let mut portal = Portal::<String>::default();
+                portal.statement = Arc::new(StoredStatement::new(
+                    String::new(),
+                    String::new(),
+                    vec![declared.clone()],
+                ));
+                portal.parameters = vec![Some(text.as_bytes().to_vec().into())];
+                let mut stmt = conn.prepare(sql).unwrap();
+                bind_portal_parameters(&mut stmt, &portal).unwrap();
+                stmt.run_collect_rows().unwrap()
+            };
+            for (text, expected) in [
+                ("12", b"12".as_slice()),
+                ("1.5", b"1.5"),
+                ("-7", b"-7"),
+                ("\\x0102", &[1, 2]),
+            ] {
+                let expected = [[Value::from_blob(expected.to_vec())]];
+                assert_eq!(bind("SELECT $1::bytea", text), expected, "{text}");
+                for insert in [
+                    "INSERT INTO w VALUES ($1)",
+                    "INSERT INTO w VALUES ($1), ($1)",
+                    "INSERT INTO w SELECT $1",
+                ] {
+                    bind("DELETE FROM w", "");
+                    bind(insert, text);
+                    let rows = bind("SELECT DISTINCT b FROM w", "");
+                    assert_eq!(rows, expected, "{insert} {text}");
+                }
+            }
+        }
+    }
+
     /// Known gap: PostgreSQL stores the text 'true' of an untyped parameter in
     /// a jsonb column as the JSON value true. tursopg binds it as a boolean,
     /// which the column stores as the number 1.
@@ -2214,13 +2218,46 @@ mod tests {
     }
 
     #[test]
-    fn test_pg_bytes_to_value_bytea_rejects_multi_byte_character() {
-        let result = pg_bytes_to_value("\\x\u{20ac}a".as_bytes(), &Type::BYTEA);
-        assert!(matches!(
-            result,
-            Err(PgWireError::UserError(info))
-                if info.message == "invalid bytea hex parameter: invalid hex at position 0"
-        ));
+    fn test_pg_bytes_to_value_bytea_reads_text_as_postgres_does() {
+        let cases: [(&[u8], &[u8]); 5] = [
+            (b"\\x01 02 0a", &[1, 2, 10]),
+            (b"\\x", &[]),
+            (b"abc\\000d", b"abc\0d"),
+            (b"a\\\\b", b"a\\b"),
+            (b"plain", b"plain"),
+        ];
+        for (text, expected) in cases {
+            let val = pg_bytes_to_value(text, &Type::BYTEA).unwrap();
+            assert_eq!(val, Value::from_blob(expected.to_vec()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_bytea_invalid() {
+        let cases: [(&str, &str, &str); 4] = [
+            (
+                "\\x0",
+                "22023",
+                "invalid hexadecimal data: odd number of digits",
+            ),
+            (
+                "\\x\u{20ac}a",
+                "22023",
+                "invalid hexadecimal digit: \"\u{20ac}\"",
+            ),
+            ("a\\zb", "22P02", "invalid input syntax for type bytea"),
+            ("a\\400", "22P02", "invalid input syntax for type bytea"),
+        ];
+        for (text, state, message) in cases {
+            let Err(error) = pg_bytes_to_value(text.as_bytes(), &Type::BYTEA) else {
+                panic!("{text:?}: no error");
+            };
+            let PgWireError::ApiError(error) = error else {
+                panic!("{text:?}: not an SQL error");
+            };
+            let error = error.downcast::<turso_pg::Error>().unwrap();
+            assert_eq!((error.sqlstate, error.message.as_str()), (state, message));
+        }
     }
 
     #[test]
@@ -2254,37 +2291,6 @@ mod tests {
                 "{text:?}"
             );
         }
-    }
-
-    #[test]
-    fn test_decode_hex() {
-        assert_eq!(
-            decode_hex("DEADBEEF").unwrap(),
-            vec![0xDE, 0xAD, 0xBE, 0xEF]
-        );
-        assert_eq!(decode_hex("00ff").unwrap(), vec![0x00, 0xFF]);
-        assert_eq!(decode_hex("0aff").unwrap(), vec![0x0A, 0xFF]);
-        assert_eq!(
-            decode_hex("0123456789abcdefABCDEF").unwrap(),
-            vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xAB, 0xCD, 0xEF]
-        );
-        assert_eq!(decode_hex("").unwrap(), Vec::<u8>::new());
-        assert!(decode_hex("0").is_err()); // odd length
-        assert!(decode_hex("GG").is_err()); // invalid hex
-        assert!(decode_hex("zz").is_err());
-        assert!(decode_hex("+f").is_err());
-    }
-
-    #[test]
-    fn test_decode_hex_rejects_multi_byte_character() {
-        assert_eq!(
-            decode_hex("\u{20ac}a"),
-            Err("invalid hex at position 0".to_owned())
-        );
-        assert_eq!(
-            decode_hex("a\u{20ac}"),
-            Err("invalid hex at position 1".to_owned())
-        );
     }
 
     #[test]
