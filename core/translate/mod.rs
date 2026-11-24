@@ -264,8 +264,14 @@ pub fn translate_inner(
     result
 }
 
+/// Translates one statement for [translate_inner], its only caller. The
+/// compilation of nested triggers and foreign key actions recurses through
+/// [translate_inner] one time for each level. This function is always
+/// inlined: in some builds, LLVM did not inline it, and the two frames
+/// together were more than twice as large as the one frame.
+#[inline(always)]
 fn translate_statement(
-    stmt: ast::Stmt,
+    mut stmt: ast::Stmt,
     resolver: &mut Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
@@ -337,7 +343,6 @@ fn translate_statement(
         None
     };
 
-    let mut stmt = stmt;
     let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
         && sequence::bind_sequence_names_in_stored_expressions(&mut stmt, resolver)?;
     if resolver.catalog.dialect.binds_names_at_create() {
