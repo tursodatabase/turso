@@ -31,7 +31,6 @@ use serde::{Deserialize, Serialize};
 use turso_core::ast;
 use turso_core::security::policy::RowPolicy;
 use turso_core::security::roles::RoleId;
-use turso_parser::parser::Parser;
 
 #[derive(Serialize, Deserialize)]
 struct StoredPolicy {
@@ -223,7 +222,7 @@ fn parse_optional_condition(sql: Option<&str>) -> Option<Option<ast::Expr>> {
 /// Reads back a condition that [`stored_text`] wrote.
 pub(crate) fn parse_condition(sql: &str) -> Option<ast::Expr> {
     let select_sql = format!("SELECT {sql}");
-    let mut parser = Parser::new(select_sql.as_bytes());
+    let mut parser = crate::dialect_types::stored_sql_parser(select_sql.as_bytes());
     let Ok(Some(ast::Cmd::Stmt(ast::Stmt::Select(select)))) = parser.next_cmd() else {
         return None;
     };

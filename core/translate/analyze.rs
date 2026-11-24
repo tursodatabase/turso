@@ -424,7 +424,9 @@ pub fn translate_analyze(
             });
             program.emit_insn(Insn::Cast {
                 reg: stat_text_reg,
-                affinity: Affinity::Text,
+                to: crate::dialect::types::core_type(Affinity::Text),
+                from: None,
+                context: crate::dialect::types::CastContext::Implicit,
             });
             program.emit_insn(Insn::MakeRecord {
                 start_reg: to_u32(tablename_reg),

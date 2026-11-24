@@ -15,8 +15,9 @@ use turso_ast::{
     Operator, Over, PragmaBody, PragmaValue, QualifiedName, RefAct, RefArg, ResolveType,
     ResultColumn, Select, SelectBody, SelectDistinctness, SelectTable, Set, SortOrder,
     SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent,
-    TriggerTime, Type, TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert,
-    UpsertDo, UpsertIndex, Variable, Window, WindowDef, With, MAX_ARRAY_DIMENSIONS,
+    TriggerTime, Type, TypeField, TypeOperator, TypeParam, TypePlace, TypeResolver, TypeSize,
+    UnaryOperator, Update, Upsert, UpsertDo, UpsertIndex, Variable, Window, WindowDef, With,
+    MAX_ARRAY_DIMENSIONS,
 };
 use turso_ast::{query_nested_too_deeply_message, MAX_QUERY_DEPTH};
 use turso_macros::match_ignore_ascii_case;
@@ -208,6 +209,7 @@ pub struct Parser<'a> {
     named_variables: HashMap<&'a [u8], NonZeroU32>,
     /// Tracks STRUCT/UNION nesting depth to prevent stack overflow from deeply nested types
     type_nesting_depth: u32,
+    types: Option<&'a dyn TypeResolver>,
     /// Current expression recursion depth of the parser, bounded by [`MAX_EXPR_DEPTH`]
     expr_nesting_depth: u32,
     /// Number of queries and parenthesized FROM terms that enclose the current
@@ -256,10 +258,19 @@ impl<'a> Parser<'a> {
             last_variable_id: 0,
             named_variables: HashMap::new(),
             type_nesting_depth: 0,
+            types: None,
             expr_nesting_depth: 0,
             query_nesting_depth: 0,
             last_expr_height: 0,
             domain_default_ends_at_not_null: false,
+        }
+    }
+
+    /// A parser that asks `types` for the handle of each type it reads.
+    pub fn with_types(input: &'a [u8], types: &'a dyn TypeResolver) -> Self {
+        Self {
+            types: Some(types),
+            ..Self::new(input)
         }
     }
 
@@ -1295,7 +1306,7 @@ impl<'a> Parser<'a> {
 
     /// Like SQLite, the type name keeps the source text from its first word to
     /// its last one, comments and quotes included: both affect the affinity.
-    fn parse_type(&mut self) -> Result<Option<Type>> {
+    fn parse_type(&mut self, place: TypePlace) -> Result<Option<Type>> {
         let Some(token_type) = self.peek()?.map(|tok| tok.token_type) else {
             return Ok(None);
         };
@@ -1378,10 +1389,12 @@ impl<'a> Parser<'a> {
             )));
         }
 
+        let resolved = self.types.map(|types| types.resolve(&type_name, place));
         Ok(Some(Type {
             name: type_name,
             size,
             array_dimensions,
+            resolved,
         }))
     }
 
@@ -1407,7 +1420,7 @@ impl<'a> Parser<'a> {
             // Parse field name (use parse_nm to handle keywords-as-identifiers)
             let name = self.parse_nm()?;
             // Parse field type (recursive — allows nested STRUCT/UNION)
-            let field_type = self.parse_type()?.ok_or_else(|| {
+            let field_type = self.parse_type(TypePlace::Column)?.ok_or_else(|| {
                 Error::ParseError("expected type after field name in STRUCT/UNION".to_owned())
             })?;
             fields.push(TypeField { name, field_type });
@@ -1891,7 +1904,7 @@ impl<'a> Parser<'a> {
         eat_expect!(self, TK_LP);
         let expr = self.parse_expr(0)?;
         eat_expect!(self, TK_AS);
-        let typ = self.parse_type()?;
+        let typ = self.parse_type(TypePlace::Cast)?;
         eat_expect!(self, TK_RP);
         self.last_expr_height += 1;
         Ok(Box::new(Expr::Cast {
@@ -4450,7 +4463,7 @@ impl<'a> Parser<'a> {
 
     pub fn parse_column_definition(&mut self, in_alter: bool) -> Result<ColumnDefinition> {
         let col_name = self.parse_nm()?;
-        let col_type = self.parse_type()?;
+        let col_type = self.parse_type(TypePlace::Column)?;
         let constraints = self.parse_named_column_constraints(in_alter, &col_name)?;
         Ok(ColumnDefinition {
             col_name,
@@ -6390,6 +6403,7 @@ mod tests {
                                         name: "INTEGER".to_owned(),
                                         size: None,
                                         array_dimensions: 0,
+                                        resolved: None,
                                     }),
                                 }),
                                 None,
@@ -6421,6 +6435,7 @@ mod tests {
                                             Literal::Numeric("255".to_owned()),
                                         )))),
                                         array_dimensions: 0,
+                                        resolved: None,
                                     }),
                                 }),
                                 None,
@@ -6457,6 +6472,7 @@ mod tests {
                                             ))),
                                         )),
                                         array_dimensions: 0,
+                                        resolved: None,
                                     }),
                                 }),
                                 None,
@@ -11170,6 +11186,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![],
                     }),
@@ -11185,6 +11202,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11207,6 +11225,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11231,6 +11250,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11256,6 +11276,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11281,6 +11302,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11303,6 +11325,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11326,6 +11349,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11349,6 +11373,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11372,6 +11397,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11395,6 +11421,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11418,6 +11445,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11441,6 +11469,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11464,6 +11493,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11491,6 +11521,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11532,6 +11563,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11573,6 +11605,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11614,6 +11647,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11655,6 +11689,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11696,6 +11731,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11737,6 +11773,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11778,6 +11815,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11808,6 +11846,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11838,6 +11877,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11868,6 +11908,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11898,6 +11939,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11920,6 +11962,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11944,6 +11987,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11968,6 +12012,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            resolved: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -11994,6 +12039,7 @@ mod tests {
                                 name: "INTEGER".to_owned(),
                                 size: None,
                                 array_dimensions: 0,
+                                resolved: None,
                             }),
                             constraints: vec![],
                         },
@@ -12160,6 +12206,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    resolved: None,
                                 }),
                                 constraints: vec![],
                             },
@@ -12202,6 +12249,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    resolved: None,
                                 }),
                                 constraints: vec![
                                     NamedColumnConstraint {
@@ -12220,6 +12268,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    resolved: None,
                                 }),
                                 constraints: vec![],
                             },
@@ -12266,6 +12315,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    resolved: None,
                                 }),
                                 constraints: vec![],
                             },
@@ -12306,6 +12356,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    resolved: None,
                                 }),
                                 constraints: vec![],
                             },
@@ -13448,6 +13499,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    resolved: None,
                                 }),
                                 constraints: vec![
                                     NamedColumnConstraint {
@@ -13889,5 +13941,61 @@ mod tests {
 
     fn boxed_over(over: Over) -> Option<Box<Over>> {
         Some(Box::new(over))
+    }
+}
+
+#[cfg(test)]
+mod type_resolver_tests {
+    use super::Parser;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use turso_ast::{TypeHandle, TypePlace, TypeResolver};
+
+    #[derive(Default)]
+    struct RecordingResolver {
+        asked: Mutex<Vec<(String, TypePlace)>>,
+    }
+
+    impl TypeResolver for RecordingResolver {
+        fn resolve(&self, type_name: &str, place: TypePlace) -> TypeHandle {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((type_name.to_string(), place));
+            TypeHandle(Arc::new(()))
+        }
+    }
+
+    fn types_asked_for(sql: &str) -> Vec<(String, TypePlace)> {
+        let resolver = RecordingResolver::default();
+        Parser::with_types(sql.as_bytes(), &resolver)
+            .next_cmd()
+            .unwrap();
+        resolver.asked.into_inner().unwrap()
+    }
+
+    #[test]
+    fn the_parser_asks_for_the_type_of_a_column() {
+        assert_eq!(
+            types_asked_for("CREATE TABLE t (a VARCHAR(10), b)"),
+            [("VARCHAR".to_string(), TypePlace::Column)]
+        );
+    }
+
+    #[test]
+    fn the_parser_asks_for_the_target_of_a_cast() {
+        assert_eq!(
+            types_asked_for("SELECT CAST(x AS \"my type\") FROM t"),
+            [("\"my type\"".to_string(), TypePlace::Cast)]
+        );
+    }
+
+    #[test]
+    fn a_parser_without_a_resolver_leaves_types_unresolved() {
+        let cmd = Parser::new(b"SELECT CAST(1 AS INTEGER)")
+            .next_cmd()
+            .unwrap()
+            .unwrap();
+        assert!(!format!("{cmd:?}").contains("TypeHandle"));
     }
 }

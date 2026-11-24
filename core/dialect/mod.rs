@@ -20,6 +20,7 @@
 #[cfg(test)]
 pub(crate) mod cannot_parse;
 pub mod catalog;
+pub mod types;
 
 pub use crate::functions::builtin::{
     call_builtin_scalar, resolve_builtin_function, SQLITE_VERSION, SQLITE_VERSION_NUMBER,
@@ -630,6 +631,20 @@ pub trait Dialect: Send + Sync + 'static {
     /// DEFAULT, and rejects a NULL key.
     fn generates_integer_primary_keys(&self) -> bool {
         true
+    }
+
+    /// The type of `expr`, when the dialect works it out. The default knows
+    /// the type of no expression.
+    ///
+    /// The type is worked out from the expression each time it is asked
+    /// for. A dialect could instead walk the statement once and store the
+    /// type of every expression.
+    fn type_of(
+        &self,
+        _expr: &ast::Expr,
+        _env: &dyn types::TypeEnv,
+    ) -> Option<std::sync::Arc<dyn types::DialectType>> {
+        None
     }
 
     /// Appends a blob element of an array to the array's text, as in

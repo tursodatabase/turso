@@ -1487,6 +1487,9 @@ mod tests {
             name: "TEXT".to_string(),
             size: None,
             array_dimensions: 0,
+            resolved: Some(crate::dialect::types::type_of_affinity(
+                crate::vdbe::affinity::Affinity::Text,
+            )),
         });
         let expr_cast = Expr::cast(
             Expr::Column {

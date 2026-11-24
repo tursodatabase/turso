@@ -326,10 +326,17 @@ fn call_for(
             signature.op, ty.type_def.name
         )));
     };
+    let resolved = match crate::types::StrictType::named(result) {
+        Some(crate::types::StrictType::Stores(storage_class)) => Some(
+            crate::dialect::types::type_of_affinity(storage_class.affinity()),
+        ),
+        Some(crate::types::StrictType::Any) | None => None,
+    };
     let result = ast::Type {
         name: result.to_string(),
         size: None,
         array_dimensions: 0,
+        resolved,
     };
     Ok(Some(OperatorCall {
         func: function,

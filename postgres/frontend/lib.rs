@@ -6,6 +6,7 @@ mod classes;
 mod copy;
 mod deparse;
 mod descriptions;
+mod dialect_types;
 mod error;
 mod functions;
 mod open;

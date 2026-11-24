@@ -211,6 +211,7 @@ pub use turso_macros::{
 };
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
+pub use vdbe::affinity::Affinity;
 pub use vdbe::array::{
     array_contains_all, array_values_from_any, parse_text_array_of_texts, text_array_literal,
 };

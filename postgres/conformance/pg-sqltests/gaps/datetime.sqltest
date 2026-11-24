@@ -926,7 +926,7 @@ expect error {
     operator does not exist: date ~~ unknown
 }
 expect @tursopg {
-    1
+    t
 }
 
 # PostgreSQL accepts the special date value infinity. tursopg refuses it as

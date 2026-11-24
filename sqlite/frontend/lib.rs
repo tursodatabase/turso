@@ -4,11 +4,19 @@
 //! SQL and `sqlite_schema` rows are canonical SQLite text, parsed with the
 //! SQLite parser.
 
+mod types;
+
 use std::{ops::Range, sync::Arc};
 use turso_core::{ast, Dialect, Result};
 use turso_parser::{lexer::Lexer, parser::Parser, token::TokenType};
 
 pub use turso_core::dialect::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
+pub use types::SqliteTypes;
+
+/// A parser of SQLite text that gives each type it reads its SQLite type.
+pub fn parser(sql: &[u8]) -> Parser<'_> {
+    Parser::with_types(sql, &SqliteTypes)
+}
 
 /// The SQLite dialect.
 pub struct SqliteDialect;
@@ -23,13 +31,13 @@ impl Dialect for SqliteDialect {
     }
 
     fn parse_internal(&self, sql: &str) -> Result<(Option<ast::Cmd>, usize)> {
-        let mut parser = Parser::new(sql.as_bytes());
+        let mut parser = parser(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         Ok((cmd, parser.offset()))
     }
 
     fn parse_internal_column_definition(&self, sql: &str) -> Result<ast::ColumnDefinition> {
-        Ok(Parser::new(sql.as_bytes()).parse_column_definition(true)?)
+        Ok(parser(sql.as_bytes()).parse_column_definition(true)?)
     }
 
     fn parameter_marker_ranges(&self, sql: &str) -> Result<Vec<Range<usize>>> {

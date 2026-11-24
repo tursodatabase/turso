@@ -2567,14 +2567,19 @@ pub fn insn_to_row(
                 0,
                 format!("r[{}] = data", *dest),
             ),
-            Insn::Cast { reg, affinity } => (
+            Insn::Cast {
+                reg,
+                to,
+                from: _,
+                context: _,
+            } => (
                 "Cast",
                 *reg as i64,
                 0,
                 0,
                 Value::build_text(""),
                 0,
-                format!("affinity(r[{}]={:?})", *reg, affinity),
+                format!("r[{reg}]=CAST(r[{reg}] AS {to})"),
             ),
             Insn::RenameTable {
                 db: _,

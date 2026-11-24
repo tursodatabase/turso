@@ -773,7 +773,7 @@ pub(crate) fn check_cast_from_text_input_type(
         ),
         None => {
             target_name.array_dimensions == 0
-                && Affinity::of_written_type(&crate::util::dequote(&target_name.name))
+                && crate::dialect::types::dialect_type(target_name).comparison_affinity()
                     == Affinity::Text
         }
     };

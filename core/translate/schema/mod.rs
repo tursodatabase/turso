@@ -982,26 +982,18 @@ fn derive_ctas_schema(
             .unwrap_or_else(|| col.declared_type(table_refs));
 
         let quoted = quote_identifier(&name);
-        if ty.is_empty() {
-            sql_parts.push(quoted);
+        let definition = if ty.is_empty() {
+            quoted
         } else {
-            sql_parts.push(format!("{quoted} {ty}"));
-        }
-
-        let col_type = if ty.is_empty() {
-            None
-        } else {
-            Some(ast::Type {
-                name: ty.to_string(),
-                size: None,
-                array_dimensions: 0,
-            })
+            format!("{quoted} {ty}")
         };
-        col_defs.push(ColumnDefinition {
-            col_name: ast::Name::exact(name),
-            col_type,
-            constraints: vec![],
-        });
+        col_defs.push(
+            resolver
+                .catalog
+                .dialect
+                .parse_internal_column_definition(&definition)?,
+        );
+        sql_parts.push(definition);
     }
 
     let info = CtasInfo {

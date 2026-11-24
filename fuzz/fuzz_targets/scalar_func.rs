@@ -413,14 +413,15 @@ fn execute_scalar_func(call: ScalarFuncCall) {
         }
         ScalarFuncCall::Cast(val, cast_type) => {
             let v: CoreValue = val.into();
-            let type_str = match cast_type {
-                CastType::Text => "TEXT",
-                CastType::Real => "REAL",
-                CastType::Integer => "INTEGER",
-                CastType::Numeric => "NUMERIC",
-                CastType::Blob => "BLOB",
+            use turso_core::Affinity;
+            let affinity = match cast_type {
+                CastType::Text => Affinity::Text,
+                CastType::Real => Affinity::Real,
+                CastType::Integer => Affinity::Integer,
+                CastType::Numeric => Affinity::Numeric,
+                CastType::Blob => Affinity::Blob,
             };
-            let _ = v.exec_cast(type_str);
+            let _ = v.exec_cast(affinity);
         }
         ScalarFuncCall::Nullif(v1, v2) => {
             let v1: CoreValue = v1.into();

@@ -2485,6 +2485,7 @@ pub mod tests {
                 name: "INTEGER".to_string(),
                 size: None,
                 array_dimensions: 0,
+                resolved: None,
             }),
         };
 
@@ -2494,6 +2495,7 @@ pub mod tests {
                 name: "integer".to_string(),
                 size: None,
                 array_dimensions: 0,
+                resolved: None,
             }),
         };
         assert!(exprs_are_equivalent(&cast1, &cast2));

@@ -2565,6 +2565,50 @@ pub struct Type {
     pub size: Option<TypeSize>,
     /// Number of array dimensions: 0 = scalar, 1 = `type[]`, 2 = `type[][]`, etc.
     pub array_dimensions: u32,
+    /// The type as the dialect that parsed the name knows it. None when the
+    /// parser was given no [`TypeResolver`], as a tool that only prints SQL
+    /// gives none.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub resolved: Option<TypeHandle>,
+}
+
+/// A type as a dialect knows it. The AST carries it from the parser to the
+/// code that asks the dialect about the type, and does not look inside.
+#[derive(Clone)]
+pub struct TypeHandle(pub std::sync::Arc<dyn std::any::Any + Send + Sync>);
+
+impl std::fmt::Debug for TypeHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TypeHandle")
+    }
+}
+
+/// The handle of a type is worked out from how the type is written, so two
+/// types that are written the same are the same type.
+impl PartialEq for TypeHandle {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for TypeHandle {}
+
+impl std::panic::UnwindSafe for TypeHandle {}
+impl std::panic::RefUnwindSafe for TypeHandle {}
+
+/// Where a type name is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypePlace {
+    /// The type of a column, or of a field of a STRUCT or UNION.
+    Column,
+    /// The target of a CAST.
+    Cast,
+}
+
+/// Gives the parser the handle of each type it reads. A dialect implements
+/// it with its own rules for what a type name means.
+pub trait TypeResolver: Send + Sync {
+    fn resolve(&self, type_name: &str, place: TypePlace) -> TypeHandle;
 }
 
 impl Type {

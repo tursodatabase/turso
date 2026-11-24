@@ -401,37 +401,37 @@ fn typeof_null(bencher: Bencher) {
 #[turso_macros::divan_bench]
 fn cast_integer_to_text(bencher: Bencher) {
     let value = Value::from_i64(12345);
-    bencher.bench_local(|| black_box(black_box(&value).exec_cast("TEXT")));
+    bencher.bench_local(|| black_box(black_box(&value).exec_cast(turso_core::Affinity::Text)));
 }
 
 #[turso_macros::divan_bench]
 fn cast_float_to_integer(bencher: Bencher) {
     let value = Value::from_f64(123.456);
-    bencher.bench_local(|| black_box(black_box(&value).exec_cast("INT")));
+    bencher.bench_local(|| black_box(black_box(&value).exec_cast(turso_core::Affinity::Integer)));
 }
 
 #[turso_macros::divan_bench]
 fn cast_text_to_integer(bencher: Bencher) {
     let value = Value::build_text("12345");
-    bencher.bench_local(|| black_box(black_box(&value).exec_cast("INT")));
+    bencher.bench_local(|| black_box(black_box(&value).exec_cast(turso_core::Affinity::Integer)));
 }
 
 #[turso_macros::divan_bench]
 fn cast_text_to_real(bencher: Bencher) {
     let value = Value::build_text("123.456");
-    bencher.bench_local(|| black_box(black_box(&value).exec_cast("REAL")));
+    bencher.bench_local(|| black_box(black_box(&value).exec_cast(turso_core::Affinity::Real)));
 }
 
 #[turso_macros::divan_bench]
 fn cast_text_to_blob(bencher: Bencher) {
     let value = Value::build_text("hello world");
-    bencher.bench_local(|| black_box(black_box(&value).exec_cast("BLOB")));
+    bencher.bench_local(|| black_box(black_box(&value).exec_cast(turso_core::Affinity::Blob)));
 }
 
 #[turso_macros::divan_bench]
 fn cast_text_to_numeric(bencher: Bencher) {
     let value = Value::build_text("123.456");
-    bencher.bench_local(|| black_box(black_box(&value).exec_cast("NUMERIC")));
+    bencher.bench_local(|| black_box(black_box(&value).exec_cast(turso_core::Affinity::Numeric)));
 }
 
 // =============================================================================

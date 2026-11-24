@@ -50,7 +50,7 @@ addr  opcode       p1  p2  p3  p4                                     p5  commen
   19    Multiply   15  16  11                                          0  r[11]=r[15]*r[16]
   20    Goto        0  22   0                                          0
   21    Integer     0  11   0                                          0  r[11]=0
-  22    Cast       11   0   0                                          0  affinity(r[11]=Numeric)
+  22    Cast       11   0   0                                          0  r[11]=CAST(r[11] AS Numeric)
   23    AggStep     0  11   2  sum                                     0  accum=r[2] step(r[11])
   24    Column      0   5  20                                          0  r[20]=lineitem.L_EXTENDEDPRICE
   25    Column      0   6  23                                          0  r[23]=lineitem.L_DISCOUNT

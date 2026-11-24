@@ -582,7 +582,7 @@ impl Value {
         fn cast_to_int(value: &Value) -> std::result::Result<Value, crate::alloc::TryReserveError> {
             match value {
                 Value::Numeric(Numeric::Integer(i)) => Ok(Value::from_i64(*i)),
-                value => value.exec_cast("INT"),
+                value => value.exec_cast(Affinity::Integer),
             }
         }
 
@@ -774,7 +774,7 @@ impl Value {
     /// offset falls outside `0..length-1`, matching PostgreSQL exactly. A `NULL`
     /// input or offset yields `NULL`.
     pub fn exec_get_byte(&self, offset: &Value) -> Result<Value> {
-        let Value::Numeric(Numeric::Integer(offset)) = offset.exec_cast("INT")? else {
+        let Value::Numeric(Numeric::Integer(offset)) = offset.exec_cast(Affinity::Integer)? else {
             return Ok(Value::Null);
         };
         let Some(bytes) = self.byte_view() else {
@@ -795,10 +795,11 @@ impl Value {
     /// Raises an error when the offset falls outside `0..length-1`, matching
     /// PostgreSQL exactly. A `NULL` input, offset, or value yields `NULL`.
     pub fn exec_set_byte(&self, offset: &Value, new_value: &Value) -> Result<Value> {
-        let Value::Numeric(Numeric::Integer(offset)) = offset.exec_cast("INT")? else {
+        let Value::Numeric(Numeric::Integer(offset)) = offset.exec_cast(Affinity::Integer)? else {
             return Ok(Value::Null);
         };
-        let Value::Numeric(Numeric::Integer(new_value)) = new_value.exec_cast("INT")? else {
+        let Value::Numeric(Numeric::Integer(new_value)) = new_value.exec_cast(Affinity::Integer)?
+        else {
             return Ok(Value::Null);
         };
         let Some(bytes) = self.byte_view() else {
@@ -1008,12 +1009,12 @@ impl Value {
 
     pub fn exec_cast(
         &self,
-        datatype: &str,
+        affinity: Affinity,
     ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
         if matches!(self, Value::Null) {
             return Ok(Value::Null);
         }
-        Ok(match Affinity::affinity(datatype) {
+        Ok(match affinity {
             // NONE	Casting a value to a type-name with no affinity causes the value to be converted into a BLOB. Casting to a BLOB consists of first casting the value to TEXT in the encoding of the database connection, then interpreting the resulting byte sequence as a BLOB instead of as TEXT.
             Affinity::Blob | Affinity::None => {
                 if let Value::Blob(blob) = self {
@@ -3283,7 +3284,10 @@ mod tests {
         let input_blob = blob(&[0xd2, 0x64, 0xc0, 0x07, 0xf6, 0x44, 0xe4, 0x59]);
         let expected = input_blob.clone();
 
-        assert_eq!(allocated(input_blob.exec_cast("BLOB")), expected);
+        assert_eq!(
+            allocated(input_blob.exec_cast(crate::vdbe::affinity::Affinity::Blob)),
+            expected
+        );
     }
 
     #[test]

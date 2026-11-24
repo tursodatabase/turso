@@ -678,7 +678,9 @@ fn view_expression_affinity(expr: &ast::Expr, sources: &[ViewSource]) -> Affinit
         }
         ast::Expr::Collate(inner, _) => view_expression_affinity(inner, sources),
         ast::Expr::Cast { type_name, .. } => {
-            Affinity::affinity(type_name.as_ref().map_or("", |type_name| &type_name.name))
+            type_name.as_ref().map_or(Affinity::Blob, |type_name| {
+                crate::dialect::types::dialect_type(type_name).comparison_affinity()
+            })
         }
         _ => view_referenced_column(expr, sources).map_or(Affinity::None, |column| {
             Affinity::affinity(&column.column.ty_str)

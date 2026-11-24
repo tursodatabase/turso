@@ -476,13 +476,9 @@ pub fn call_builtin_scalar(
         ScalarFunc::LoadExtension => Err(LimboError::InternalError(format!(
             "{func} is executed by the VDBE, not the dialect"
         ))),
-        ScalarFunc::Cast => {
-            assert_eq!(args.len(), 2);
-            let Value::Text(cast_type) = args[1].get_value() else {
-                unreachable!("Cast with non-text type");
-            };
-            Ok(args[0].get_value().exec_cast(cast_type.as_str())?)
-        }
+        ScalarFunc::Cast => Err(LimboError::InternalError(format!(
+            "{func} is translated as a CAST expression, not a function call"
+        ))),
         ScalarFunc::Changes => Ok(Value::from_i64(connection.changes.load(Ordering::SeqCst))),
         ScalarFunc::Char => Ok(Value::exec_char(args.iter().map(|reg| reg.get_value()))),
         ScalarFunc::Concat => Ok(Value::exec_concat_strings(
@@ -1363,7 +1359,7 @@ pub(crate) fn exec_numeric_decode(value: &Value) -> crate::Result<Value> {
 fn text_or_cast_to_text(value: &Value) -> crate::Result<Cow<'_, str>> {
     match value {
         Value::Text(s) => Ok(Cow::Borrowed(s.as_str())),
-        v => match v.exec_cast("TEXT")? {
+        v => match v.exec_cast(crate::vdbe::affinity::Affinity::Text)? {
             Value::Text(s) => Ok(Cow::Owned(s.to_string())),
             _ => unreachable!("Cast to TEXT should yield Text"),
         },

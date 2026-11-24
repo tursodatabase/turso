@@ -8139,6 +8139,9 @@ pub struct Column {
     /// the same as `ty_str`, which has its quotes removed and may not be
     /// valid SQL, e.g. `[x] INT` has the declared type `x] IN`.
     pub written_ty_str: Option<String>,
+    /// The declared type as the dialect that read the column's definition
+    /// knows it. None for a column that was not read from a definition.
+    dialect_type: Option<ast::TypeHandle>,
     pub ty_params: std::vec::Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
     generated_type: GeneratedType,
@@ -8304,6 +8307,7 @@ impl Column {
             name,
             ty_str,
             written_ty_str: None,
+            dialect_type: None,
             ty_params: std::vec::Vec::new(),
             default,
             generated_type,
@@ -8439,6 +8443,7 @@ impl Column {
         if written.name != self.ty_str {
             self.written_ty_str = Some(written.name.clone());
         }
+        self.dialect_type.clone_from(&written.resolved);
         if self.ty_str.is_empty() {
             self.override_affinity(Affinity::Numeric);
         }
@@ -8544,6 +8549,14 @@ impl Column {
         {
             *original_sql = new_sql;
         }
+    }
+
+    /// The declared type as the dialect that read the column's definition
+    /// knows it.
+    pub fn dialect_type(&self) -> Option<std::sync::Arc<dyn crate::dialect::types::DialectType>> {
+        self.dialect_type
+            .as_ref()
+            .map(|handle| std::sync::Arc::clone(crate::dialect::types::handle_type(handle)))
     }
 
     #[inline]
@@ -9374,6 +9387,7 @@ mod tests {
                     name: "real".to_string(),
                     size: None,
                     array_dimensions: 0,
+                    resolved: Some(crate::dialect::types::type_of_affinity(Affinity::Real)),
                 }),
             })),
             operators: std::vec![],

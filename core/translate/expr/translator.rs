@@ -1,4 +1,5 @@
 use super::*;
+use crate::dialect::types::{core_type, dialect_type, CastContext, DialectType};
 use crate::types::StrictType;
 
 /// Reason why [translate_expr_no_constant_opt()] was called.
@@ -929,15 +930,60 @@ fn translate_cast_expr(
         }
     }
 
-    // SQLite allows CAST(x AS) without a type name, treating it as NUMERIC affinity
-    let type_affinity = cast_type_name
-        .map(|name| Affinity::of_written_type(&name))
-        .unwrap_or(Affinity::Numeric);
+    let Some(type_name) = type_name else {
+        // SQLite allows CAST(x AS) without a type name, treating it as NUMERIC affinity
+        program.emit_insn(Insn::Cast {
+            reg: target_register,
+            to: core_type(Affinity::Numeric),
+            from: None,
+            context: CastContext::Explicit,
+        });
+        return Ok(target_register);
+    };
+    let env = StatementTypes {
+        tables: referenced_tables,
+        resolver,
+    };
     program.emit_insn(Insn::Cast {
         reg: target_register,
-        affinity: type_affinity,
+        to: std::sync::Arc::clone(dialect_type(type_name)),
+        from: resolver.catalog.dialect.type_of(expr, &env),
+        context: CastContext::Explicit,
     });
     Ok(target_register)
+}
+
+/// What a dialect may ask about the statement that an expression is in.
+struct StatementTypes<'a> {
+    tables: Option<&'a TableReferences>,
+    resolver: &'a Resolver<'a>,
+}
+
+impl crate::dialect::types::TypeEnv for StatementTypes<'_> {
+    fn column_type(
+        &self,
+        table: ast::TableInternalId,
+        column: usize,
+    ) -> Option<std::sync::Arc<dyn DialectType>> {
+        if table.is_self_table() {
+            if let Some(self_table) = self.resolver.self_table() {
+                return scalar_dialect_type(self_table.columns().get(column)?);
+            }
+        }
+        let (_, table) = self.tables?.find_table_by_internal_id(table)?;
+        scalar_dialect_type(table.get_column_at(column)?)
+    }
+
+    fn schema(&self) -> &crate::schema::Schema {
+        self.resolver.schema()
+    }
+}
+
+fn scalar_dialect_type(column: &crate::schema::Column) -> Option<std::sync::Arc<dyn DialectType>> {
+    if column.array_dimensions() > 0 {
+        return None;
+    }
+    column.dialect_type()
 }
 
 /// Emits a CAST of the value in `reg` to the custom type `type_name`, whose
@@ -977,7 +1023,9 @@ fn emit_custom_type_cast(
     match resolver.schema().plain_input_type(&resolved)? {
         StrictType::Stores(storage_class) => program.emit_insn(Insn::Cast {
             reg,
-            affinity: storage_class.affinity(),
+            to: core_type(storage_class.affinity()),
+            from: None,
+            context: CastContext::Explicit,
         }),
         StrictType::Any => {}
     }
