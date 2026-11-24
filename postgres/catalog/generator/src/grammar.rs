@@ -4,7 +4,7 @@
 
 use chumsky::prelude::*;
 
-use crate::bki::{Column, Nullness, Token};
+use crate::bki::{Column, Index, Nullness, Token};
 
 /// One command of the file.
 pub(crate) enum Statement<'src> {
@@ -15,12 +15,12 @@ pub(crate) enum Statement<'src> {
     Open(&'src str),
     Close,
     Insert(Vec<Token>),
-    UniqueIndex {
+    Index {
         catalog: &'src str,
-        columns: Vec<&'src str>,
+        index: Index,
     },
     /// A command that the generator does not use: a comment, or the
-    /// declaration of an index that is not unique or of a TOAST table.
+    /// declaration of a TOAST table.
     Other,
 }
 
@@ -36,23 +36,18 @@ pub(crate) fn file_parser<'src>(
     let open = just("open ").ignore_then(word()).map(Statement::Open);
     let close = just("close ").then(word()).map(|_| Statement::Close);
     let insert = insert_parser().map(Statement::Insert);
-    let other = choice((just("declare "), just("build "), just("#")))
+    // A malformed index declaration fails the parse, as it does not start
+    // with `declare toast`.
+    let other = choice((just("declare toast "), just("build "), just("#")))
         .then(rest_of_line)
         .map(|_| Statement::Other);
 
-    choice((
-        create_parser(),
-        open,
-        close,
-        insert,
-        unique_index_parser(),
-        other,
-    ))
-    .map_with(|statement, extra| (statement, extra.span()))
-    .separated_by(just('\n'))
-    .allow_trailing()
-    .collect()
-    .then_ignore(end())
+    choice((create_parser(), open, close, insert, index_parser(), other))
+        .map_with(|statement, extra| (statement, extra.span()))
+        .separated_by(just('\n'))
+        .allow_trailing()
+        .collect()
+        .then_ignore(end())
 }
 
 /// A `create` command and the column list on the lines after it:
@@ -100,33 +95,44 @@ fn column_parser<'src>() -> impl Parser<'src, &'src str, Column, ParseError<'src
         })
 }
 
-/// The declaration of a unique index, which says what identifies a row:
+/// The declaration of an index, unique or not:
 ///
 /// ```text
 /// declare unique index pg_am_oid_index 2652 on pg_am using btree(oid oid_ops)
+/// declare index pg_index_indrelid_index 2678 on pg_index using btree(indrelid oid_ops)
 /// ```
 ///
-/// Each column is followed by its operator class.
-fn unique_index_parser<'src>() -> impl Parser<'src, &'src str, Statement<'src>, ParseError<'src>> {
+/// The number after the index name is the oid of the index. Each column is
+/// followed by its operator class.
+fn index_parser<'src>() -> impl Parser<'src, &'src str, Statement<'src>, ParseError<'src>> {
     let name = none_of(" \n,()").repeated().at_least(1).to_slice();
     let column = name.then_ignore(just(' ')).then_ignore(name);
 
-    just("declare unique index ")
-        .ignore_then(word())
-        .ignore_then(just(' '))
-        .ignore_then(word())
-        .ignore_then(just(" on "))
-        .ignore_then(word())
+    just("declare ")
+        .ignore_then(just("unique ").or_not().map(|unique| unique.is_some()))
+        .then_ignore(just("index "))
+        .then(word())
+        .then_ignore(just(' '))
+        .then_ignore(word())
+        .then_ignore(just(" on "))
+        .then(word())
         .then_ignore(just(" using "))
         .then_ignore(name)
         .then(
             column
                 .separated_by(just(", "))
                 .at_least(1)
-                .collect()
+                .collect::<Vec<&str>>()
                 .delimited_by(just('('), just(')')),
         )
-        .map(|(catalog, columns)| Statement::UniqueIndex { catalog, columns })
+        .map(|(((unique, name), catalog), columns)| Statement::Index {
+            catalog,
+            index: Index {
+                name: name.to_string(),
+                unique,
+                columns: columns.into_iter().map(str::to_string).collect(),
+            },
+        })
 }
 
 /// An `insert` command and its values: `insert ( 16 bool ',' _null_ )`.
