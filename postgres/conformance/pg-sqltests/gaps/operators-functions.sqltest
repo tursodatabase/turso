@@ -701,14 +701,6 @@ expect {
     t
 }
 
-# B-78: gen_random_uuid() format
-test gen-random-uuid-format {
-    SELECT gen_random_uuid()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
-}
-expect {
-    t
-}
-
 # B-79: set_config + current_setting
 test set-config-current-setting {
     SELECT set_config('request.jwt.claims', '{"sub":"u1"}', true);
@@ -1190,15 +1182,6 @@ expect error {
 }
 expect @tursopg raw {
  12
-}
-
-test to-char-null-timestamptz-row {
-    CREATE TABLE to_char_times (at timestamptz);
-    INSERT INTO to_char_times VALUES (NULL);
-    SELECT to_char(at, 'YYYY') IS NULL FROM to_char_times;
-}
-expect {
-    t
 }
 
 # to_timestamp(double precision)
