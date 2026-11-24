@@ -2169,6 +2169,10 @@ fn rewrite_expr_to_registers(
                             if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&c)) {
                                 *expr = Expr::register(ins.key_register());
                             } else if let Some(cm) = ins.get_col_mapping_by_name(&c) {
+                                if cm.column.is_rowid_alias() {
+                                    *expr = Expr::register(ins.key_register());
+                                    return Ok(WalkControl::Continue);
+                                }
                                 // Use decoded excluded registers when available
                                 // to prevent double-encoding of custom type values
                                 if let Some(decoded_start) = excluded_decoded_start {
