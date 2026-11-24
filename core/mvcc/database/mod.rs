@@ -9458,6 +9458,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             checkpoint_result,
                         };
                     } else {
+                        if let Err(err) = wal.restart_log_after_checkpoint(&checkpoint_result) {
+                            self.storage.on_checkpoint_end(Err(err.clone()))?;
+                            return Err(err.into());
+                        }
                         *st = CompleteCheckpointState::RetryHeader {
                             checkpoint_result,
                             retried_crc: false,
@@ -9475,6 +9479,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     }
                     let checkpoint_result =
                         std::mem::replace(checkpoint_result, CheckpointResult::new(0, 0, 0));
+                    // The WAL frames stay until the DB file is synced: they are the only
+                    // durable copy of the backfilled pages until then.
+                    if let Err(err) = wal.restart_log_after_checkpoint(&checkpoint_result) {
+                        self.storage.on_checkpoint_end(Err(err.clone()))?;
+                        return Err(err.into());
+                    }
                     *st = CompleteCheckpointState::RetryHeader {
                         checkpoint_result,
                         retried_crc: false,

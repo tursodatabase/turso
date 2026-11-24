@@ -1906,6 +1906,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         wal.publish_backfill(max_frame);
     }
 
+    /// Restart the WAL of a Truncate/Restart checkpoint. Call it only after the DB file
+    /// sync succeeded: until then the WAL frames are the only durable copy of the
+    /// backfilled pages, and a retried checkpoint must find them to backfill them again.
+    fn restart_wal_if_needed(&self) -> Result<()> {
+        if !self.mode.should_restart_log() {
+            return Ok(());
+        }
+        let result = self
+            .checkpoint_result
+            .as_ref()
+            .expect("checkpoint_result should be set");
+        let Some(wal) = &self.pager.wal else {
+            panic!("No WAL to restart");
+        };
+        wal.restart_log_after_checkpoint(result)
+    }
+
     fn has_unpublished_schema_changes(&self) -> bool {
         let schema = self.database.schema.lock();
         if !schema.dropped_root_pages.is_empty() {
@@ -3333,6 +3350,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 if self.sync_mode == SyncMode::Off {
                     tracing::debug!("Skipping fsync of database file (synchronous=off)");
                     self.publish_wal_backfill_if_needed();
+                    self.restart_wal_if_needed()?;
                     self.state = CheckpointState::TruncateLogicalLog;
                     return Ok(TransitionResult::Continue);
                 }
@@ -3344,6 +3362,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
                 // Only sync if we actually backfilled any frames
                 if checkpoint_result.wal_checkpoint_backfilled == 0 {
+                    self.restart_wal_if_needed()?;
                     self.state = CheckpointState::TruncateLogicalLog;
                     return Ok(TransitionResult::Continue);
                 }
@@ -3351,6 +3370,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 // Check if we already sent the sync
                 if checkpoint_result.db_sync_sent {
                     self.publish_wal_backfill_if_needed();
+                    self.restart_wal_if_needed()?;
                     self.state = CheckpointState::TruncateLogicalLog;
                     return Ok(TransitionResult::Continue);
                 }

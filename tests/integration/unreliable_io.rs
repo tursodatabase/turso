@@ -27,15 +27,22 @@
 //! file's bytes to disk and open with the regular platform IO.
 //! [`UnreliableIo::crash_now_and_recover`] does this for the strictest outcome.
 //!
-//! Other kinds of storage misbehavior tests need — injected write or fsync
-//! errors, reordered writeback — belong in this module too.
+//! A test can also make one fsync fail with [`UnreliableIo::fail_next_sync`].
+//! The failed fsync drops the file's unsynced writes, as Linux does after a
+//! writeback error: the kernel marks the dirty pages clean, so the file reads
+//! back its last durable content and a later fsync succeeds without writing
+//! them.
+//!
+//! Other kinds of storage misbehavior tests need — injected write errors,
+//! reordered writeback — belong in this module too.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use turso_core::{
-    io::FileSyncType, Buffer, Clock, Completion, ConnectOpts, Connection, Database, File,
-    MonotonicInstant, OpenFlags, PlatformIO, SessionRole, WallClockInstant, IO,
+    io::FileSyncType, Buffer, Clock, Completion, CompletionError, ConnectOpts, Connection,
+    Database, File, LimboError, MonotonicInstant, OpenFlags, PlatformIO, SessionRole,
+    WallClockInstant, IO,
 };
 use turso_sqlite::SqliteDialect;
 
@@ -94,6 +101,8 @@ struct UnreliableIoState {
     /// simulated power-loss point.
     armed_path: Mutex<Option<String>>,
     snapshot: Mutex<Option<CrashSnapshot>>,
+    /// When set, the next fsync of this file fails and drops its unsynced writes.
+    failing_sync_path: Mutex<Option<String>>,
 }
 
 impl UnreliableIoState {
@@ -151,8 +160,16 @@ impl UnreliableIo {
                 files: Mutex::new(HashMap::new()),
                 armed_path: Mutex::new(None),
                 snapshot: Mutex::new(None),
+                failing_sync_path: Mutex::new(None),
             }),
         }
+    }
+
+    /// Arms an fsync failure: the next fsync of `path` returns an I/O error
+    /// and drops the file's unsynced writes, so the file reads back its last
+    /// durable content.
+    pub fn fail_next_sync(&self, path: &str) {
+        *self.state.failing_sync_path.lock().unwrap() = Some(path.to_string());
     }
 
     /// Settle: pretend everything written so far reached stable storage
@@ -349,6 +366,24 @@ impl File for UnreliableFile {
     }
 
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
+        let fail_here = {
+            let mut failing = self.state.failing_sync_path.lock().unwrap();
+            if failing.as_deref() == Some(self.path.as_str()) {
+                failing.take();
+                true
+            } else {
+                false
+            }
+        };
+        if fail_here {
+            self.drop_unsynced_writes()?;
+            // The unix backend returns a failed fsync(2) as an error of the
+            // call, before the completion runs.
+            return Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::Other,
+                "sync",
+            )));
+        }
         // Simulated power loss: crash while the armed file's fsync is in
         // flight, i.e. after its writes were submitted but before any of them
         // were made durable.
@@ -378,5 +413,32 @@ impl File for UnreliableFile {
 
     fn size(&self) -> turso_core::Result<u64> {
         self.inner.size()
+    }
+}
+
+impl UnreliableFile {
+    /// Forgets the writes since the last successful fsync and puts the file
+    /// back to its durable content, as the kernel does when it drops the dirty
+    /// pages of a file whose writeback failed.
+    fn drop_unsynced_writes(&self) -> turso_core::Result<()> {
+        let durable = {
+            let mut shadow = self.shadow.lock().unwrap();
+            shadow.unsynced.clear();
+            shadow.durable.clone()
+        };
+        // The inner MemoryIO completes both operations before returning.
+        let c = self
+            .inner
+            .truncate(durable.len() as u64, Completion::new_trunc(|_| {}))?;
+        assert!(c.succeeded(), "restoring the durable file length failed");
+        if !durable.is_empty() {
+            let c = self.inner.pwrite(
+                0,
+                Arc::new(Buffer::new(durable)),
+                Completion::new_write(|_| {}),
+            )?;
+            assert!(c.succeeded(), "restoring the durable file content failed");
+        }
+        Ok(())
     }
 }
