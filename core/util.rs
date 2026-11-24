@@ -1151,6 +1151,14 @@ pub fn checked_cast_text_to_numeric(text: &str, lossless: bool) -> std::result::
         return Err(());
     }
 
+    // `str_to_f64` rounds the same way as sqlite3AtoF. `str::parse::<f64>` rounds
+    // correctly, which gives a different double for some inputs.
+    let parse_real = || {
+        f64::from(
+            crate::numeric::str_to_f64(text)
+                .expect("parse_numeric_str returns text with at least one digit"),
+        )
+    };
     match kind {
         ValueType::Integer => match text.parse::<i64>() {
             Ok(i) => Ok(Value::from_i64(i)),
@@ -1160,19 +1168,13 @@ pub fn checked_cast_text_to_numeric(text: &str, lossless: bool) -> std::result::
                     std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow
                 ) {
                     // if overflow, we return the representation as a real.
-                    // we have to match sqlite exactly here, so we match sqlite3AtoF
-                    let value = text.parse::<f64>().unwrap_or_default();
-                    let factor = 10f64.powi(15 - value.abs().log10().ceil() as i32);
-                    Ok(Value::from_f64((value * factor).round() / factor))
+                    Ok(Value::from_f64(parse_real()))
                 } else {
                     Err(())
                 }
             }
         },
-        ValueType::Float => {
-            let value = text.parse::<f64>().unwrap_or(0.0);
-            Ok(real_to_numeric_value(value))
-        }
+        ValueType::Float => Ok(real_to_numeric_value(parse_real())),
         _ => unreachable!(),
     }
 }
@@ -2837,7 +2839,7 @@ pub mod tests {
         // Overflow becomes Float (different from cast_text_to_integer which returned 0)
         assert_eq!(
             checked_cast_text_to_numeric("9223372036854775808", false).unwrap(),
-            Value::from_f64(9.22337203685478e18)
+            Value::from_f64(9223372036854775808.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-9223372036854775808", false).unwrap(),
@@ -2846,7 +2848,7 @@ pub mod tests {
         // Overflow becomes Float (different from cast_text_to_integer which returned 0)
         assert_eq!(
             checked_cast_text_to_numeric("-9223372036854775809", false).unwrap(),
-            Value::from_f64(-9.22337203685478e18)
+            Value::from_f64(-9223372036854775808.0)
         );
         assert!(checked_cast_text_to_numeric("-", false).is_err());
     }
@@ -3006,7 +3008,7 @@ pub mod tests {
         );
         assert_eq!(
             checked_cast_text_to_numeric("9223372036854775808", false).unwrap(),
-            Value::from_f64(9.22337203685478e18)
+            Value::from_f64(9223372036854775808.0)
         ); // Exceeds i64, becomes float
         assert_eq!(
             checked_cast_text_to_numeric("-9223372036854775808", false).unwrap(),
@@ -3014,7 +3016,7 @@ pub mod tests {
         );
         assert_eq!(
             checked_cast_text_to_numeric("-9223372036854775809", false).unwrap(),
-            Value::from_f64(-9.22337203685478e18)
+            Value::from_f64(-9223372036854775808.0)
         ); // Exceeds i64, becomes float
 
         assert_eq!(
