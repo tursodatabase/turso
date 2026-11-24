@@ -549,7 +549,10 @@ fn searcher_key(segments: &[LoadedSegment]) -> SearcherKey {
             )
         })
         .collect();
-    key.sort_by_key(|(id, _, _)| id.uuid_string());
+    // `SegmentId` compares the bytes of the UUID. They sort in the same
+    // order as `uuid_string()`, which is lowercase hex, and the sort then
+    // makes no string for each comparison.
+    key.sort_by_key(|(id, _, _)| *id);
     key
 }
 
