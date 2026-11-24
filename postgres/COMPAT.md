@@ -127,7 +127,6 @@ without a type as a number when its text is one, so refusing numbers would
 refuse such parameters too. `date::json` and `date::inet` are still accepted, as are `1::json`, `1::jsonb`,
 `1::inet`, `1::cidr` and `1::macaddr`, which PostgreSQL refuses. A jsonb value
 may be cast to a number: `'1'::jsonb::int`, `::bigint`, `::numeric`, `::float8`.
-`'true'::jsonb::boolean` gives 0 where PostgreSQL gives true, as does `'true'::text::boolean`.
 `pg_input_is_valid`, `to_char` (numeric; other argument types fail with
 0A000), `now`/`clock_timestamp`/
 `transaction_timestamp`/`statement_timestamp`. `to_timestamp` fails with 0A000.

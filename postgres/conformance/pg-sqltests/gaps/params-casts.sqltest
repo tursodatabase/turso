@@ -20,50 +20,34 @@ setup t_b {
 }
 
 # A-01: bool literal casts, true forms
-@compat-gap "type:bool"
 test bool-literal-casts-true-forms {
     SELECT 't'::boolean, 'true'::boolean, 'yes'::boolean, 'on'::boolean, '1'::boolean, 'TRUE'::boolean, 'y'::boolean;
 }
 expect {
     t|t|t|t|t|t|t
 }
-expect @tursopg {
-    0|0|0|0|1|0|0
-}
 
 # A-02: bool literal casts, false forms
-@compat-gap "type:bool"
 test bool-literal-casts-false-forms {
     SELECT 'f'::boolean, 'false'::boolean, 'no'::boolean, 'off'::boolean, '0'::boolean;
 }
 expect {
     f|f|f|f|f
 }
-expect @tursopg {
-    0|0|0|0|0
-}
 
 # A-04: bool invalid literal
-@compat-gap "type:bool"
 test bool-invalid-literal {
     SELECT 'maybe'::boolean;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    0
-}
 
 # A-06: CAST(... AS boolean) form
-@compat-gap "type:bool"
 test cast-as-boolean-form {
     SELECT CAST('true' AS boolean), CAST(1 AS boolean), CAST(0 AS boolean);
 }
 expect {
     t|t|f
-}
-expect @tursopg {
-    0|1|0
 }
 
 # A-07: int4 overflow literal cast
@@ -588,8 +572,6 @@ expect {
     1.50
 }
 
-# The frontend reads ::boolean as a cast to integer, so a jsonb true becomes 0.
-@compat-gap "cast:jsonb -> bool"
 test jsonb-column-cast-to-boolean {
     CREATE TABLE j (b jsonb);
     INSERT INTO j VALUES ('true');
@@ -597,9 +579,6 @@ test jsonb-column-cast-to-boolean {
 }
 expect {
     t
-}
-expect @tursopg {
-    0
 }
 
 # PostgreSQL has a cast to boolean only from int4, not from int2 or int8.
@@ -610,7 +589,7 @@ test int2-to-bool-cast-does-not-exist {
 @sqlstate 42846
 expect error {}
 expect @tursopg {
-    5
+    t
 }
 
 @compat-gap "cast:int8 -> bool"
@@ -620,7 +599,7 @@ test int8-to-bool-cast-does-not-exist {
 @sqlstate 42846
 expect error {}
 expect @tursopg {
-    5
+    t
 }
 
 @compat-gap "cast:jsonb -> bytea"
