@@ -62,6 +62,21 @@ expect @tursopg error {
     cannot compare type timestamp with type timestamptz
 }
 
+@compat-gap "operator:domain over timestamptz - interval"
+test domain-over-timestamptz-minus-interval {
+    CREATE DOMAIN dz AS timestamptz;
+    CREATE TABLE t10 (z dz);
+    INSERT INTO t10 VALUES ('2024-01-01 00:00:00+00');
+    SELECT z - interval '1 day' FROM t10;
+}
+expect {
+    2023-12-31 00:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    adding an interval is supported only for timestamp and timestamptz, not dz
+}
+
 # The function the translator calls can also be called by name.
 @skip-if postgres "pg_timestamp_plus_interval is a tursopg function"
 test timestamp-plus-interval-function-with-fractional-part {

@@ -55,8 +55,9 @@ impl ExternalFunc {
     }
 
     /// Sets a function that is called at compile time with the type name of
-    /// each argument, as `receiving_argument_types` passes them; an error
-    /// refuses the statement. Needs `receiving_argument_types`.
+    /// each argument, with domain names kept (`receiving_argument_types`
+    /// passes the domain's base type); an error refuses the statement. Needs
+    /// `receiving_argument_types`.
     pub fn checking_argument_types(mut self, check: crate::function::ArgumentTypeCheck) -> Self {
         let ExtFunc::NativeScalar {
             receives_argument_types,

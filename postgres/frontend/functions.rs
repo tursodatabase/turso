@@ -79,18 +79,18 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             )
             .receiving_argument_types()
             .checking_argument_types(check_timestamp_plus_interval_types)
-            // FIXME(pg-catalog): pg_operator declares the result type per left
-            // type (timestamp_pl_interval gives timestamp, timestamptz_pl_interval
-            // gives timestamptz), so a domain over timestamptz gives timestamptz.
-            // Taking the first argument's type gives the domain. A pg_operator
-            // lookup replaces this.
+            // FIXME(pg-catalog): The check refuses a domain on the left because
+            // the result would get the domain's type, where pg_operator gives
+            // the base type (timestamp or timestamptz). A pg_operator lookup
+            // replaces this.
             .returning_first_argument_type(),
         )
 }
 
 /// Refuses the left side of `+ interval` when it is not timestamp or
-/// timestamptz. `types` are the argument type names; the first is the left
-/// side. Every other type gets 0A000, including the ones that have no operator
+/// timestamptz. `types` are the argument type names, with domain names kept;
+/// the first is the left side, so a domain over timestamp or timestamptz is
+/// refused. Every other type gets 0A000, including the ones that have no operator
 /// in PostgreSQL (which gives 42883), because the type name does not say
 /// whether PostgreSQL has one. The translator turns `-` into `+` of the
 /// negated interval, so the message always says `+`.
