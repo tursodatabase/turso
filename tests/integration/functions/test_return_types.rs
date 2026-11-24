@@ -81,7 +81,8 @@ fn results_have_the_declared_return_type(tmp_db: TempDatabase) {
 /// functions whose type is not a plain stored type.
 fn expected_typeof(declared: Option<ReturnType>) -> Option<&'static str> {
     match declared? {
-        ReturnType::Integer => Some("integer"),
+        // A function that answers a condition returns the integer 1 or 0.
+        ReturnType::Integer | ReturnType::Boolean => Some("integer"),
         ReturnType::Real => Some("real"),
         ReturnType::Text => Some("text"),
         ReturnType::Blob => Some("blob"),

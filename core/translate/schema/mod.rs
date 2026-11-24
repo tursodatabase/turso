@@ -453,7 +453,9 @@ fn resolve_func_return_type(
     // after DECODE. Its type is not declared, so the result's type is unknown.
     let first_argument = || args.first().map(|arg| type_of(arg)).transpose();
     match func.result_type() {
-        ResultType::Declared(ReturnType::Integer) => Ok(CheckExprType::Integer),
+        ResultType::Declared(ReturnType::Integer | ReturnType::Boolean) => {
+            Ok(CheckExprType::Integer)
+        }
         ResultType::Declared(ReturnType::Real) => Ok(CheckExprType::Real),
         ResultType::Declared(ReturnType::Text) => Ok(CheckExprType::Text),
         ResultType::Declared(ReturnType::Blob) => Ok(CheckExprType::Blob),
