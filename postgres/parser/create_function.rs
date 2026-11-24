@@ -603,6 +603,7 @@ const PSEUDO_TYPES: &[&str] = &[
     "unknown",
 ];
 
+/// FIXME(pg-catalog): This list of built-in type names was copied by hand from pg_type. A lookup in a pg_type table replaces this.
 /// The built-in base, range and multirange types, by the names pg_query
 /// gives them: `int` is `int4` and `double precision` is `float8`, for
 /// example.
