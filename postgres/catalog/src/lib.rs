@@ -21,7 +21,11 @@
 //!
 //! Each struct also has `CREATE_SQL` and `INDEX_SQL`: the `CREATE TABLE`
 //! and `CREATE INDEX` statements that store the catalog in a SQLite table.
-//! The documentation of `turso_pg_catalog_gen` gives the column types.
+//! Each catalog is a [`BuiltinCatalog`] with these statements and its built-in
+//! rows, such as `PG_CAST_CATALOG` for `pg_cast`, and `BUILTIN_CATALOGS`
+//! has all of them. The PostgreSQL frontend serves the rows of a built-in
+//! table from memory before anything is stored. The documentation of `turso_pg_catalog_gen` gives the column
+//! types and the value of each type.
 //!
 //! The tables are generated from `upstream/postgres.bki`, which
 //! PostgreSQL's own build script produced, so the rows and their oids are
@@ -41,7 +45,11 @@ pub type Oid = u32;
 // The generated file has one row per line, which rustfmt would split.
 #[rustfmt::skip]
 mod generated;
+mod builtin_catalog;
+mod builtin_rows;
+mod text_out;
 
+pub use builtin_catalog::{BuiltinCatalog, BuiltinRows};
 pub use generated::*;
 
 #[cfg(test)]
@@ -125,6 +133,172 @@ mod tests {
                 "CREATE UNIQUE INDEX pg_proc_proname_args_nsp_index ON pg_proc(proname, proargtypes, pronamespace)"
             ]
         );
+    }
+
+    /// The value of `value` in the form of the generator.
+    fn sql_value(value: &turso_core::Value) -> turso_pg_catalog_gen::SqlValue {
+        use turso_core::{Numeric, Value};
+        use turso_pg_catalog_gen::SqlValue;
+        match value {
+            Value::Null => SqlValue::Null,
+            Value::Numeric(Numeric::Integer(integer)) => SqlValue::Integer(*integer),
+            Value::Numeric(Numeric::Float(real)) => SqlValue::Real(f64::from(*real)),
+            Value::Text(text) => SqlValue::Text(text.as_str().to_string()),
+            Value::Blob(_) => panic!("a built-in row writes no blob"),
+        }
+    }
+
+    /// The built-in rows of `table`, as they write themselves.
+    fn catalog_rows(table: &BuiltinCatalog) -> Vec<Vec<turso_core::Value>> {
+        (0..table.rows.len())
+            .map(|index| {
+                let mut row = Vec::new();
+                table.rows.row(index, &mut row);
+                row
+            })
+            .collect()
+    }
+
+    /// The column names of a `CREATE_SQL`, which the generator writes as
+    /// `CREATE TABLE name(column TYPE ..., column TYPE ...)`.
+    fn column_names(create_sql: &str) -> Vec<&str> {
+        let (_, columns) = create_sql.split_once('(').unwrap();
+        let columns = columns.strip_suffix(')').unwrap();
+        columns
+            .split(", ")
+            .map(|column| column.split(' ').next().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn each_catalog_is_a_builtin_catalog_with_its_sql() {
+        assert_eq!(BUILTIN_CATALOGS.len(), 64);
+        let proc = BUILTIN_CATALOGS
+            .iter()
+            .find(|table| table.name == "pg_proc")
+            .unwrap();
+        assert_eq!(proc.create_sql, PgProc::CREATE_SQL);
+        assert_eq!(proc.index_sql, PgProc::INDEX_SQL);
+        assert_eq!(proc.rows.len(), PG_PROC.len());
+        for table in &BUILTIN_CATALOGS {
+            assert!(
+                table
+                    .create_sql
+                    .starts_with(&format!("CREATE TABLE {}(", table.name)),
+                "{}",
+                table.name
+            );
+        }
+    }
+
+    /// The built-in rows write the values that the generator computes the versions
+    /// from, for every row of every catalog.
+    #[test]
+    fn each_catalog_writes_the_values_of_the_generator() {
+        let expected =
+            turso_pg_catalog_gen::builtin_values(include_str!("../upstream/postgres.bki")).unwrap();
+        assert_eq!(expected.len(), BUILTIN_CATALOGS.len());
+        for ((name, expected_rows), table) in expected.iter().zip(&BUILTIN_CATALOGS) {
+            assert_eq!(name, table.name);
+            let rows: Vec<Vec<_>> = catalog_rows(table)
+                .iter()
+                .map(|row| row.iter().map(sql_value).collect())
+                .collect();
+            assert_eq!(&rows, expected_rows, "{name}");
+        }
+    }
+
+    /// A built-in row has one value for each column of `CREATE_SQL`, and the
+    /// rowid of a row finds it.
+    #[test]
+    fn each_builtin_row_fits_the_table_and_find_returns_it() {
+        let mut oid_catalogs = 0;
+        for table in &BUILTIN_CATALOGS {
+            let columns = column_names(table.create_sql);
+            let oid_is_rowid = table.create_sql.contains("(oid INTEGER PRIMARY KEY,");
+            if oid_is_rowid {
+                oid_catalogs += 1;
+                assert_eq!(columns[0], "oid");
+            }
+            let mut previous_oid = None;
+            for (index, row) in catalog_rows(table).iter().enumerate() {
+                assert_eq!(row.len(), columns.len(), "{} row {index}", table.name);
+                let rowid = if oid_is_rowid {
+                    let oid = row[0].as_int().unwrap();
+                    assert!(previous_oid < Some(oid), "{} is in oid order", table.name);
+                    previous_oid = Some(oid);
+                    oid
+                } else {
+                    index as i64 + 1
+                };
+                assert_eq!(table.rows.find(rowid), Some(index), "{}", table.name);
+            }
+            assert_eq!(table.rows.find(0), None, "{}", table.name);
+            assert_eq!(table.rows.find(-1), None, "{}", table.name);
+            if !oid_is_rowid {
+                let after_last = table.rows.len() as i64 + 1;
+                assert_eq!(table.rows.find(after_last), None, "{}", table.name);
+            }
+        }
+        assert_eq!(oid_catalogs, 42);
+    }
+
+    #[test]
+    fn known_builtin_rows_have_their_values() {
+        use turso_core::Value;
+        let table = |name: &str| BUILTIN_CATALOGS.iter().find(|t| t.name == name).unwrap();
+        let row = |name: &str, rowid: i64| {
+            let table = table(name);
+            let mut row = Vec::new();
+            table.rows.row(table.rows.find(rowid).unwrap(), &mut row);
+            row
+        };
+        let text = |text: &str| Value::from_text(text.to_string());
+        let int = Value::from_i64;
+
+        let bool_type = row("pg_type", 16);
+        assert_eq!(bool_type[1], text("bool"));
+        // typbyval is a bool, typcategory a "char" and typinput a regproc.
+        let column = |name: &str, column: &str| {
+            column_names(table(name).create_sql)
+                .iter()
+                .position(|c| *c == column)
+                .unwrap()
+        };
+        assert_eq!(bool_type[column("pg_type", "typbyval")], int(1));
+        assert_eq!(bool_type[column("pg_type", "typcategory")], text("B"));
+        assert_eq!(bool_type[column("pg_type", "typinput")], int(1242));
+        assert_eq!(bool_type[column("pg_type", "typacl")], Value::Null);
+
+        assert_eq!(
+            row("pg_cast", 10000),
+            [int(10000), int(20), int(21), int(714), text("a"), text("f")]
+        );
+
+        // regexp_replace(text, text, text): an oidvector and an array.
+        let regexp_replace = row("pg_proc", 2284);
+        assert_eq!(
+            regexp_replace[column("pg_proc", "proargtypes")],
+            text("25 25 25")
+        );
+        assert_eq!(
+            regexp_replace[column("pg_proc", "proargnames")],
+            text("{string,pattern,replacement}")
+        );
+        assert_eq!(
+            regexp_replace[column("pg_proc", "procost")],
+            Value::from_f64(1.0)
+        );
+        // A function without arguments has an empty oidvector.
+        let now = row("pg_proc", 1299);
+        assert_eq!(now[column("pg_proc", "proname")], text("now"));
+        assert_eq!(now[column("pg_proc", "proargtypes")], text(""));
+
+        // int4 = int4.
+        let int4_eq = row("pg_operator", 96);
+        assert_eq!(int4_eq[column("pg_operator", "oprname")], text("="));
+        assert_eq!(int4_eq[column("pg_operator", "oprleft")], int(23));
+        assert_eq!(int4_eq[column("pg_operator", "oprcode")], int(65));
     }
 
     #[test]

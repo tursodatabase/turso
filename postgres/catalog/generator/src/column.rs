@@ -1,10 +1,14 @@
 //! The columns of a catalog as Rust: the type of a column, and the Rust
 //! expression for a value of the file in that column.
 
+use std::fmt::Display;
+
 use proc_macro2::{Ident, Literal, Span, TokenStream};
 use quote::quote;
 
 use crate::bki::{Catalog, Nullness, Token};
+use crate::text_out::{float4_as_f64, is_array_space, push_array, push_vector, Float4};
+use crate::SqlValue;
 
 pub(crate) struct Field<'a> {
     pub(crate) name: &'a str,
@@ -65,19 +69,62 @@ impl<'a> Field<'a> {
 
     /// The Rust expression for `token` in this column.
     pub(crate) fn literal(&self, token: &Token) -> Result<TokenStream, String> {
+        Ok(match self.read(token)? {
+            None => quote! { None },
+            Some(value) if self.nullable => {
+                let value = value.literal();
+                quote! { Some(#value) }
+            }
+            Some(value) => value.literal(),
+        })
+    }
+
+    /// The SQL value of `token` in this column, as the built-in rows of the
+    /// catalog write it.
+    pub(crate) fn sql_value(&self, token: &Token) -> Result<SqlValue, String> {
+        Ok(match self.read(token)? {
+            None => SqlValue::Null,
+            Some(value) => value.sql_value(self.is_vector()),
+        })
+    }
+
+    /// Whether the column is an `oidvector` or an `int2vector`, whose text
+    /// separates the elements with spaces, and not an array.
+    fn is_vector(&self) -> bool {
+        matches!(self.bki_type, "oidvector" | "int2vector")
+    }
+
+    /// The value of `token` in this column, or None for NULL.
+    fn read(&self, token: &Token) -> Result<Option<ColumnValue>, String> {
         if token.is_null() {
             return if self.nullable {
-                Ok(quote! { None })
+                Ok(None)
             } else {
                 Err("the column is NOT NULL and the row has NULL in it".to_string())
             };
         }
-        let value = self.kind.literal(token)?;
-        Ok(if self.nullable {
-            quote! { Some(#value) }
-        } else {
-            value
-        })
+        self.kind.read(token).map(Some)
+    }
+
+    /// The Rust expression that gives the value of this column as a
+    /// `turso_core::Value`, for a row in `self`. It calls `value` of the
+    /// module `builtin_rows` of `turso_pg_catalog`.
+    pub(crate) fn value_expression(&self) -> String {
+        let name = self.name;
+        let wrapper = match self.kind {
+            _ if self.is_vector() => Some("Vector"),
+            ColumnKind::Oids
+            | ColumnKind::Int2s
+            | ColumnKind::Floats
+            | ColumnKind::Chars
+            | ColumnKind::Texts => Some("Array"),
+            _ => None,
+        };
+        match (wrapper, self.nullable) {
+            (None, _) => format!("value(self.{name})"),
+            (Some(wrapper), false) => format!("value({wrapper}(self.{name}))"),
+            (Some(wrapper), true) => format!("value(self.{name}.map({wrapper}))"),
+        }
     }
 }
 
@@ -95,10 +142,13 @@ pub(crate) enum ColumnKind {
     Bool,
     /// PostgreSQL's one-byte `"char"`.
     Char,
-    /// `name` and `text`, and each type that has no Rust form here and is
-    /// kept as the text of the file, such as the expression trees of
-    /// `pg_node_tree`.
+    /// `name` and `text`, and the expression trees of `pg_node_tree`, which
+    /// are kept as the text of the file.
     Text,
+    /// A type whose values the generator does not read, such as
+    /// `timestamptz` or `bytea`. No built-in row has a value of these
+    /// types, and a value stops the generation.
+    Unread,
     /// `oidvector`, and `_oid`, the array of oids.
     Oids,
     /// `int2vector`, and `_int2`.
@@ -123,9 +173,8 @@ impl ColumnKind {
             "bool" => Self::Bool,
             "char" => Self::Char,
             "name" | "text" | "pg_node_tree" => Self::Text,
-            // No built-in row has a value of these types.
             "timestamptz" | "pg_lsn" | "bytea" | "anyarray" | "_pg_statistic" | "pg_ndistinct"
-            | "pg_dependencies" | "pg_mcv_list" => Self::Text,
+            | "pg_dependencies" | "pg_mcv_list" => Self::Unread,
             "oidvector" | "_oid" => Self::Oids,
             "int2vector" | "_int2" => Self::Int2s,
             "_float4" => Self::Floats,
@@ -145,7 +194,7 @@ impl ColumnKind {
             Self::Float4 => quote! { f32 },
             Self::Bool => quote! { bool },
             Self::Char => quote! { char },
-            Self::Text => quote! { &'static str },
+            Self::Text | Self::Unread => quote! { &'static str },
             Self::Oids => quote! { &'static [Oid] },
             Self::Int2s => quote! { &'static [i16] },
             Self::Floats => quote! { &'static [f32] },
@@ -155,99 +204,163 @@ impl ColumnKind {
     }
 
     /// The Rust expression for `token`, which is not NULL.
+    #[cfg(test)]
     fn literal(self, token: &Token) -> Result<TokenStream, String> {
+        Ok(self.read(token)?.literal())
+    }
+
+    /// The value of `token`, which is not NULL, in a column of this kind.
+    fn read(self, token: &Token) -> Result<ColumnValue, String> {
         let text = substitute_symbol(token);
         Ok(match self {
-            Self::Oid => {
-                let oid = Literal::u32_unsuffixed(oid_value(token)?);
-                quote! { #oid }
-            }
-            Self::Int2 => {
-                let value = text
-                    .parse()
-                    .map(Literal::i16_unsuffixed)
-                    .map_err(|_| format!("\"{text}\" is not an int2"))?;
-                quote! { #value }
-            }
-            Self::Int4 => {
-                let value = text
-                    .parse()
-                    .map(Literal::i32_unsuffixed)
-                    .map_err(|_| format!("\"{text}\" is not an int4"))?;
-                quote! { #value }
-            }
-            Self::Int8 => {
-                let value = text
-                    .parse()
-                    .map(Literal::i64_unsuffixed)
-                    .map_err(|_| format!("\"{text}\" is not an int8"))?;
-                quote! { #value }
-            }
-            Self::Xid => {
-                let value = text
-                    .parse()
-                    .map(Literal::u32_unsuffixed)
-                    .map_err(|_| format!("\"{text}\" is not an xid"))?;
-                quote! { #value }
-            }
-            Self::Float4 => {
-                let value = float_literal(text)?;
-                quote! { #value }
-            }
+            Self::Oid => ColumnValue::Oid(oid_value(token)?),
+            Self::Xid => ColumnValue::Xid(parse(text, "an xid")?),
+            Self::Int2 => ColumnValue::Int2(parse(text, "an int2")?),
+            Self::Int4 => ColumnValue::Int4(parse(text, "an int4")?),
+            Self::Int8 => ColumnValue::Int8(parse(text, "an int8")?),
+            Self::Float4 => ColumnValue::Float4(finite_float(text)?),
             Self::Bool => match text {
-                "t" => quote! { true },
-                "f" => quote! { false },
+                "t" => ColumnValue::Bool(true),
+                "f" => ColumnValue::Bool(false),
                 _ => return Err(format!("\"{text}\" is not a bool")),
             },
-            Self::Char => {
-                let value = one_char(text)?;
-                quote! { #value }
+            Self::Char => ColumnValue::Char(one_char(text)?),
+            Self::Text => ColumnValue::Text(text.to_string()),
+            Self::Unread => {
+                return Err(format!(
+                    "the generator does not read values of this type, such as \"{text}\""
+                ))
             }
-            Self::Text => quote! { #text },
-            Self::Oids => {
-                let oids = elements(token)?
+            Self::Oids => ColumnValue::Oids(
+                elements(token)?
                     .iter()
-                    .map(|element| {
-                        element
-                            .parse()
-                            .map(Literal::u32_unsuffixed)
-                            .map_err(|_| format!("\"{element}\" is not an oid"))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                quote! { &[#(#oids),*] }
-            }
-            Self::Int2s => {
-                let values = elements(token)?
+                    .map(|element| parse(element, "an oid"))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Self::Int2s => ColumnValue::Int2s(
+                elements(token)?
                     .iter()
-                    .map(|element| {
-                        element
-                            .parse()
-                            .map(Literal::i16_unsuffixed)
-                            .map_err(|_| format!("\"{element}\" is not an int2"))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                quote! { &[#(#values),*] }
-            }
-            Self::Floats => {
-                let values = elements(token)?
+                    .map(|element| parse(element, "an int2"))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Self::Floats => ColumnValue::Floats(
+                elements(token)?
                     .iter()
-                    .map(|element| float_literal(element))
-                    .collect::<Result<Vec<_>, _>>()?;
-                quote! { &[#(#values),*] }
-            }
-            Self::Chars => {
-                let chars = elements(token)?
+                    .map(|element| finite_float(element))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Self::Chars => ColumnValue::Chars(
+                elements(token)?
                     .iter()
                     .map(|element| one_char(element))
-                    .collect::<Result<Vec<_>, _>>()?;
-                quote! { &[#(#chars),*] }
-            }
-            Self::Texts => {
-                let texts = elements(token)?;
-                quote! { &[#(#texts),*] }
-            }
+                    .collect::<Result<_, _>>()?,
+            ),
+            Self::Texts => ColumnValue::Texts(elements(token)?),
         })
     }
+}
+
+/// A value of the file that is not NULL, read for the kind of its column.
+#[derive(Debug, PartialEq)]
+enum ColumnValue {
+    Oid(u32),
+    Xid(u32),
+    Int2(i16),
+    Int4(i32),
+    Int8(i64),
+    Float4(f32),
+    Bool(bool),
+    Char(char),
+    Text(String),
+    Oids(Vec<u32>),
+    Int2s(Vec<i16>),
+    Floats(Vec<f32>),
+    Chars(Vec<char>),
+    Texts(Vec<String>),
+}
+
+impl ColumnValue {
+    /// The Rust expression of the value.
+    fn literal(&self) -> TokenStream {
+        match self {
+            Self::Oid(value) | Self::Xid(value) => {
+                let value = Literal::u32_unsuffixed(*value);
+                quote! { #value }
+            }
+            Self::Int2(value) => {
+                let value = Literal::i16_unsuffixed(*value);
+                quote! { #value }
+            }
+            Self::Int4(value) => {
+                let value = Literal::i32_unsuffixed(*value);
+                quote! { #value }
+            }
+            Self::Int8(value) => {
+                let value = Literal::i64_unsuffixed(*value);
+                quote! { #value }
+            }
+            Self::Float4(value) => {
+                let value = Literal::f32_unsuffixed(*value);
+                quote! { #value }
+            }
+            Self::Bool(value) => quote! { #value },
+            Self::Char(value) => quote! { #value },
+            Self::Text(value) => quote! { #value },
+            Self::Oids(values) => {
+                let values = values.iter().map(|value| Literal::u32_unsuffixed(*value));
+                quote! { &[#(#values),*] }
+            }
+            Self::Int2s(values) => {
+                let values = values.iter().map(|value| Literal::i16_unsuffixed(*value));
+                quote! { &[#(#values),*] }
+            }
+            Self::Floats(values) => {
+                let values = values.iter().map(|value| Literal::f32_unsuffixed(*value));
+                quote! { &[#(#values),*] }
+            }
+            Self::Chars(values) => quote! { &[#(#values),*] },
+            Self::Texts(values) => quote! { &[#(#values),*] },
+        }
+    }
+
+    /// The SQL value of the value, as the built-in rows of the catalog write it:
+    /// see the crate documentation. `vector` tells an `oidvector` or
+    /// `int2vector` from an array.
+    fn sql_value(&self, vector: bool) -> SqlValue {
+        fn list<T: Display>(values: &[T], vector: bool) -> SqlValue {
+            let mut text = String::new();
+            if vector {
+                push_vector(values, &mut text);
+            } else {
+                push_array(values, &mut text);
+            }
+            SqlValue::Text(text)
+        }
+        match self {
+            Self::Oid(value) | Self::Xid(value) => SqlValue::Integer(i64::from(*value)),
+            Self::Int2(value) => SqlValue::Integer(i64::from(*value)),
+            Self::Int4(value) => SqlValue::Integer(i64::from(*value)),
+            Self::Int8(value) => SqlValue::Integer(*value),
+            Self::Float4(value) => SqlValue::Real(float4_as_f64(*value)),
+            Self::Bool(value) => SqlValue::Integer(i64::from(*value)),
+            Self::Char(value) => SqlValue::Text(value.to_string()),
+            Self::Text(value) => SqlValue::Text(value.clone()),
+            Self::Oids(values) => list(values, vector),
+            Self::Int2s(values) => list(values, vector),
+            Self::Floats(values) => {
+                let values: Vec<Float4> = values.iter().map(|value| Float4(*value)).collect();
+                list(&values, vector)
+            }
+            Self::Chars(values) => list(values, vector),
+            Self::Texts(values) => list(values, vector),
+        }
+    }
+}
+
+/// The number in `text`, of the type that `what` names.
+fn parse<T: std::str::FromStr>(text: &str, what: &str) -> Result<T, String> {
+    text.parse()
+        .map_err(|_| format!("\"{text}\" is not {what}"))
 }
 
 /// Whether each value of the type takes the same number of bytes in a
@@ -271,13 +384,11 @@ fn has_fixed_width(bki_type: &str) -> bool {
     )
 }
 
-/// The Rust literal for a `float4`. Rust has no literal for infinity and
-/// NaN.
-fn float_literal(text: &str) -> Result<Literal, String> {
+/// The `float4` in `text`. Rust has no literal for infinity and NaN.
+fn finite_float(text: &str) -> Result<f32, String> {
     text.parse::<f32>()
         .ok()
         .filter(|value| value.is_finite())
-        .map(Literal::f32_unsuffixed)
         .ok_or_else(|| format!("\"{text}\" is not a finite float4"))
 }
 
@@ -311,11 +422,13 @@ fn substitute_symbol(token: &Token) -> &str {
     }
 }
 
+/// The character of a `"char"` value. PostgreSQL's `"char"` is one byte,
+/// so the character is ASCII.
 fn one_char(text: &str) -> Result<char, String> {
     let mut chars = text.chars();
     match (chars.next(), chars.next()) {
-        (Some(only), None) => Ok(only),
-        _ => Err(format!("\"{text}\" is not one character")),
+        (Some(only), None) if only.is_ascii() && only != '\0' => Ok(only),
+        _ => Err(format!("\"{text}\" is not one ASCII character")),
     }
 }
 
@@ -396,11 +509,6 @@ fn elements(token: &Token) -> Result<Vec<String>, String> {
     }
 }
 
-/// Whether `array_in` of PostgreSQL skips `c` as white space.
-fn is_array_space(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0B' | '\x0C')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +583,119 @@ mod tests {
             literal("{string, pattern}").unwrap(),
             "& [\"string\" , \"pattern\"]"
         );
+    }
+
+    /// The SQL value of `text` in a column of type `bki_type`, which can be
+    /// NULL.
+    fn sql_value(bki_type: &str, token: Token) -> Result<SqlValue, String> {
+        let field = Field {
+            name: "c",
+            bki_type,
+            kind: ColumnKind::of(bki_type).unwrap(),
+            nullable: true,
+        };
+        field.sql_value(&token)
+    }
+
+    #[test]
+    fn each_type_has_the_sql_value_of_its_text_output() {
+        let bare = |text: &str| Token::Bare(text.to_string());
+        let quoted = |text: &str| Token::Quoted(text.to_string());
+        let text = |text: &str| SqlValue::Text(text.to_string());
+        let cases = [
+            ("oid", bare("16"), SqlValue::Integer(16)),
+            ("oid", bare("4294967295"), SqlValue::Integer(4_294_967_295)),
+            ("regproc", bare("1242"), SqlValue::Integer(1242)),
+            ("regproc", bare("-"), SqlValue::Integer(0)),
+            ("xid", bare("3"), SqlValue::Integer(3)),
+            ("int2", bare("-1"), SqlValue::Integer(-1)),
+            ("int2", bare("NAMEDATALEN"), SqlValue::Integer(64)),
+            (
+                "int4",
+                bare("-2147483648"),
+                SqlValue::Integer(-2_147_483_648),
+            ),
+            (
+                "int8",
+                bare("9223372036854775807"),
+                SqlValue::Integer(i64::MAX),
+            ),
+            ("bool", bare("t"), SqlValue::Integer(1)),
+            ("bool", bare("f"), SqlValue::Integer(0)),
+            ("bool", bare("FLOAT8PASSBYVAL"), SqlValue::Integer(1)),
+            ("float4", bare("0.01"), SqlValue::Real(0.01)),
+            ("float4", bare("1"), SqlValue::Real(1.0)),
+            ("char", bare("b"), text("b")),
+            ("char", quoted(","), text(",")),
+            ("char", bare("ALIGNOF_POINTER"), text("d")),
+            ("name", bare("bool"), text("bool")),
+            ("name", bare("POSTGRES"), text("postgres")),
+            (
+                "text",
+                quoted("database's default"),
+                text("database's default"),
+            ),
+            ("text", quoted(""), text("")),
+            ("text", quoted("_null_"), text("_null_")),
+            (
+                "pg_node_tree",
+                quoted("({CONST :consttype 16})"),
+                text("({CONST :consttype 16})"),
+            ),
+            ("oidvector", quoted("23 25"), text("23 25")),
+            ("oidvector", quoted(""), text("")),
+            ("int2vector", quoted("1 -2"), text("1 -2")),
+            ("_oid", quoted("{25,20,1184}"), text("{25,20,1184}")),
+            ("_int2", quoted("{1, 2}"), text("{1,2}")),
+            ("_float4", quoted("{0.5,1e10}"), text("{0.5,1e+10}")),
+            ("_char", quoted("{i,o,o}"), text("{i,o,o}")),
+            (
+                "_text",
+                quoted("{string, pattern}"),
+                text("{string,pattern}"),
+            ),
+            (
+                "_text",
+                quoted("{\"a b\",\"NULL\",\"\",x}"),
+                text("{\"a b\",\"NULL\",\"\",x}"),
+            ),
+            ("_text", quoted("{\"a\\\"b\"}"), text("{\"a\\\"b\"}")),
+            ("_aclitem", quoted("{=Tc/postgres}"), text("{=Tc/postgres}")),
+            ("oid", bare("_null_"), SqlValue::Null),
+            ("_text", bare("_null_"), SqlValue::Null),
+            ("timestamptz", bare("_null_"), SqlValue::Null),
+        ];
+        for (bki_type, token, expected) in cases {
+            let description = format!("{bki_type} {:?}", token.text());
+            assert_eq!(
+                sql_value(bki_type, token).unwrap(),
+                expected,
+                "{description}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_that_a_row_cannot_write_stops_the_generation() {
+        let bare = |text: &str| Token::Bare(text.to_string());
+        for bki_type in [
+            "timestamptz",
+            "pg_lsn",
+            "bytea",
+            "anyarray",
+            "_pg_statistic",
+            "pg_ndistinct",
+            "pg_dependencies",
+            "pg_mcv_list",
+        ] {
+            assert!(sql_value(bki_type, bare("0")).is_err(), "{bki_type}");
+        }
+        // PostgreSQL's "char" is one byte.
+        assert!(sql_value("char", bare("é")).is_err());
+        assert!(sql_value("char", bare("ab")).is_err());
+        assert!(sql_value("_char", Token::Quoted("{a,é}".to_string())).is_err());
+        assert!(sql_value("bool", bare("yes")).is_err());
+        assert!(sql_value("int2", bare("40000")).is_err());
     }
 
     /// `postgres.bki` has the `pg_attribute` rows of four catalogs, which
