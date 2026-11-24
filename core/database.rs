@@ -214,8 +214,9 @@ pub struct DatabaseAllocators<
     ///
     /// - The state of each statement.
     /// - The program builders of statements, blob handles, nested trigger
-    ///   programs and the maintenance of materialized views. The builders of
-    ///   foreign key action programs do not come from this allocator.
+    ///   programs and the maintenance of materialized views, and the builder
+    ///   that plans the query of a materialized view. The builders of foreign
+    ///   key action programs do not come from this allocator.
     /// - The statement that executes a nested trigger or foreign key action
     ///   program.
     ///
