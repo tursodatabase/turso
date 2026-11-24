@@ -1,0 +1,19 @@
+# A timestamptz column of a subquery in FROM, or of a CTE, keeps its type in
+# the outer query, so it prints with its offset. The session time zone is UTC
+# on both servers.
+
+@database :memory:
+
+setup events {
+    CREATE TABLE events (id int PRIMARY KEY, created_at timestamptz NOT NULL);
+    INSERT INTO events VALUES (1, '2025-12-31 23:00:00+00');
+}
+
+@setup events
+test timestamptz-from-subquery-column {
+    SELECT c FROM (SELECT created_at AS c FROM events) s;
+}
+expect {
+    2025-12-31 23:00:00+00
+}
+

@@ -23,15 +23,10 @@ pub(crate) fn result_column_types(
                 return expression_type(ty, resolver.schema());
             }
             match &result_column.expr {
-                ast::Expr::Column { table, column, .. } => {
-                    match type_of(&result_column.expr, &env) {
-                        ty if ty.is_condition() && reads_subquery(*table, table_references) => {
-                            expression_type(&ty, resolver.schema())
-                        }
-                        _ => {
-                            table_column_type(*table, *column, table_references, resolver.schema())
-                        }
-                    }
+                ast::Expr::Column { table, column, .. }
+                    if !reads_subquery(*table, table_references) =>
+                {
+                    table_column_type(*table, *column, table_references, resolver.schema())
                 }
                 expr => expression_type(&type_of(expr, &env), resolver.schema()),
             }
