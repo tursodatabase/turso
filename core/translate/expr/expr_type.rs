@@ -1198,6 +1198,7 @@ fn declared_return_type(
 ) -> ExprType {
     match return_type {
         ReturnType::Integer => ExprType::Builtin(BuiltinType::Integer),
+        ReturnType::Boolean => ExprType::Builtin(BuiltinType::Boolean),
         ReturnType::Real => ExprType::Builtin(BuiltinType::Real),
         ReturnType::Text => ExprType::Builtin(BuiltinType::Text),
         ReturnType::Blob => ExprType::Builtin(BuiltinType::Blob),
@@ -1520,6 +1521,10 @@ mod tests {
             ),
             (
                 Expr::IsNull(Box::new(int(1))),
+                builtin(BuiltinType::Boolean),
+            ),
+            (
+                call("like", vec![text("a"), text("a")]),
                 builtin(BuiltinType::Boolean),
             ),
             (

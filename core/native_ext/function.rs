@@ -50,7 +50,7 @@ impl ScalarReturn for i64 {
 
 /// Stored as 0 or 1, like SQLite booleans.
 impl ScalarReturn for bool {
-    const TYPE: Option<ReturnType> = Some(ReturnType::Integer);
+    const TYPE: Option<ReturnType> = Some(ReturnType::Boolean);
 
     fn into_value(self) -> Value {
         Value::from_i64(self as i64)
