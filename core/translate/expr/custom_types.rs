@@ -715,6 +715,7 @@ pub(crate) fn emit_store_value(
     Ok(())
 }
 
+/// FIXME(pg-catalog): This decides by type properties whether a pg_cast entry from `source` to `target` exists, and the text-reading target test stands in for the target side of that lookup. A lookup in a pg_cast table replaces this.
 /// Fails when a CAST of a value of the custom type `source` to `target`, which
 /// `custom_type_cast_chain` resolves for a custom type and is None for a plain
 /// type written as `target_name`, would read the text of `source` as another

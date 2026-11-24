@@ -595,6 +595,7 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// FIXME(pg-catalog): This hand-codes the absence of pg_cast entries from date, timestamp, json and inet to numbers, booleans and bytea. A lookup in a pg_cast table replaces this.
     /// Whether a CAST from a custom type that reads text and has an ENCODE
     /// (such as date, timestamp, json or inet) is refused when its target does
     /// not read text.

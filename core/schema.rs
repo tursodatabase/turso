@@ -456,6 +456,7 @@ pub struct TypeDef {
     /// built-in date and time types, which store one text form with a 4-digit
     /// year. False for a domain, whose index then serves only `=`.
     pub stored_form_sorts_in_value_order: bool,
+    /// FIXME(pg-catalog): This field hand-codes which pg_cast entries leave a type that reads text. A lookup in a pg_cast table replaces this.
     /// Whether values of the type may be cast to number and boolean types, as
     /// PostgreSQL casts jsonb to integer, numeric, float8 and boolean. A CAST
     /// from a type that reads text is refused otherwise (see
@@ -2241,6 +2242,7 @@ impl Schema {
         self.plain_value_type(&resolved.leaf().name, resolved.input_type())
     }
 
+    /// FIXME(pg-catalog): This proxies a missing pg_cast entry by checking for an ENCODE and a text input. A lookup in a pg_cast table replaces this.
     /// Whether `resolved` is a type that reads text and has an ENCODE, such as
     /// date or json, in a dialect that refuses a CAST from such a type to a
     /// type that does not read text (see
