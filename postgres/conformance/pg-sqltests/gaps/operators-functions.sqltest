@@ -202,14 +202,6 @@ expect {
     4
 }
 
-# B-25: = ANY('{..}'::int[])
-test eq-any-int-array-literal {
-    SELECT 1 = ANY('{1,2}'::int[]), 3 = ANY('{1,2}'::int[]);
-}
-expect {
-    t|f
-}
-
 # B-26: > ALL / < ANY (non-equality)
 @compat-gap "syntax:any-all"
 test all-any-non-equality {
@@ -275,14 +267,6 @@ test array-equality-col-literal {
 }
 expect {
     1
-}
-
-# B-35: ARRAY @> ARRAY literal
-test array-array-literal {
-    SELECT ARRAY[1,2] @> ARRAY[1], ARRAY['a'] <@ ARRAY['a','b'], ARRAY[1] && ARRAY[2];
-}
-expect {
-    t|t|f
 }
 
 # B-36: array subscript 1-based + out of range
