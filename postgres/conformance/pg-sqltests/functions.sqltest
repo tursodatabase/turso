@@ -3180,3 +3180,19 @@ test date-trunc-century-millennium-low-years {
 expect {
     0001-01-01 00:00:00+00|0001-01-01 00:00:00+00|0001-01-01 00:00:00+00|0010-01-01 00:00:00+00
 }
+
+test gen-random-uuid-format {
+    SELECT gen_random_uuid()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
+}
+expect {
+    t
+}
+
+test to-char-null-timestamptz-row {
+    CREATE TABLE to_char_times (at timestamptz);
+    INSERT INTO to_char_times VALUES (NULL);
+    SELECT to_char(at, 'YYYY') IS NULL FROM to_char_times;
+}
+expect {
+    t
+}
