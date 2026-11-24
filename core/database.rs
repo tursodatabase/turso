@@ -3132,6 +3132,8 @@ impl Database {
             has_index_method_tx_cursors: crate::sync::atomic::AtomicBool::new(false),
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),
+            main_schema_changes: AtomicU64::new(0),
+            main_schema_reload_pending: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
             session_role: role,
             current_role: RwLock::new(role),

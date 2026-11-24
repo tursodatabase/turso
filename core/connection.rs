@@ -597,6 +597,15 @@ pub struct Connection {
     /// Internal helper statements used during reload must not recursively
     /// trigger another schema reparse on the same connection.
     pub(crate) schema_reparse_in_progress: AtomicBool,
+    /// The number of changes made to the main schema through
+    /// [`Self::with_schema_mut`]. A statement compares it at its start and at
+    /// its rollback to learn whether it changed the schema.
+    pub(crate) main_schema_changes: AtomicU64,
+    /// Set when a statement savepoint rolled back a statement that changed
+    /// the main schema. The pages are as the savepoint left them, but the
+    /// in-memory schema still has the statement's changes, so the next
+    /// statement that compiles reads the schema again from the file.
+    pub(crate) main_schema_reload_pending: AtomicBool,
     /// Generation counter bumped whenever any setting that affects PrepareContext
     /// changes. Allows prepared statements to cheaply detect when they need to be
     /// reprepared (single u64 comparison instead of rebuilding the full context).
@@ -1047,6 +1056,17 @@ impl Connection {
         input: &str,
         origin: StatementOrigin,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
+        // A full ROLLBACK does not need the schema of the transaction, and
+        // must work when the schema can not be read.
+        if !matches!(
+            &cmd,
+            Cmd::Stmt(ast::Stmt::Rollback {
+                savepoint_name: None,
+                ..
+            })
+        ) {
+            self.reload_main_schema_if_pending()?;
+        }
         self.maybe_update_schema();
 
         let syms = self.syms.read();
@@ -3038,7 +3058,53 @@ impl Connection {
     pub fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> T) -> Result<T> {
         let mut schema_ref = self.schema.write();
         let schema = Schema::try_make_mut(&mut schema_ref)?;
+        self.main_schema_changes.fetch_add(1, Ordering::AcqRel);
         Ok(f(schema))
+    }
+
+    /// Makes the next statement that compiles read the main schema again
+    /// from the file. A statement savepoint rolled back the pages of a
+    /// statement that changed the schema, and the in-memory schema still has
+    /// the changes. Statements prepared before are prepared again.
+    pub(crate) fn request_main_schema_reload(&self, pager: &Pager) {
+        self.main_schema_reload_pending
+            .store(true, Ordering::Release);
+        pager.set_schema_cookie(None);
+        self.bump_prepare_context_generation();
+    }
+
+    /// Reads the main schema again from the file, in the current
+    /// transaction, if [`Self::request_main_schema_reload`] asked for it. The
+    /// statements of the reload see the flag clear, so they do not reload
+    /// again. When the reload fails, the next statement tries again.
+    pub(crate) fn reload_main_schema_if_pending(self: &Arc<Connection>) -> Result<()> {
+        if !self.main_schema_reload_pending.load(Ordering::Acquire)
+            || self.schema_reparse_in_progress()
+        {
+            return Ok(());
+        }
+        self.main_schema_reload_pending
+            .store(false, Ordering::Release);
+        if let Err(err) = self.reparse_schema() {
+            self.main_schema_reload_pending
+                .store(true, Ordering::Release);
+            return Err(err);
+        }
+        self.bump_prepare_context_generation();
+        Ok(())
+    }
+
+    /// Forgets a pending reload of the main schema when the transaction rolls
+    /// back: the connection gets the committed schema, which matches the
+    /// file after the rollback.
+    fn cancel_main_schema_reload(&self) {
+        if self
+            .main_schema_reload_pending
+            .swap(false, Ordering::AcqRel)
+        {
+            *self.schema.write() = self.db.clone_schema();
+            self.bump_prepare_context_generation();
+        }
     }
 
     /// Mutate the schema for a specific database (main or attached).
@@ -4960,6 +5026,7 @@ impl Connection {
         self.set_tx_state(TransactionState::None);
         self.set_tx_read_only(false);
         self.clear_tx_poison();
+        self.cancel_main_schema_reload();
         // The entire transaction is being rolled back, so every materialized
         // view delta captured within it is void. Leaving them behind would
         // apply phantom changes to the views at the next successful commit.
