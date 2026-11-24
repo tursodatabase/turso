@@ -197,6 +197,12 @@ pub static PG_AGGREGATE: [PgAggregate; 161] = [
 ];
 
 impl PgAggregate {
+    /// The `CREATE TABLE` statement of `pg_aggregate` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_aggregate(aggfnoid INTEGER NOT NULL, aggkind TEXT NOT NULL, aggnumdirectargs INTEGER NOT NULL, aggtransfn INTEGER NOT NULL, aggfinalfn INTEGER NOT NULL, aggcombinefn INTEGER NOT NULL, aggserialfn INTEGER NOT NULL, aggdeserialfn INTEGER NOT NULL, aggmtransfn INTEGER NOT NULL, aggminvtransfn INTEGER NOT NULL, aggmfinalfn INTEGER NOT NULL, aggfinalextra BOOLEAN NOT NULL, aggmfinalextra BOOLEAN NOT NULL, aggfinalmodify TEXT NOT NULL, aggmfinalmodify TEXT NOT NULL, aggsortop INTEGER NOT NULL, aggtranstype INTEGER NOT NULL, aggtransspace INTEGER NOT NULL, aggmtranstype INTEGER NOT NULL, aggmtransspace INTEGER NOT NULL, agginitval TEXT, aggminitval TEXT)";
+    /// The `CREATE INDEX` statements of `pg_aggregate` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_aggregate_fnoid_index ON pg_aggregate(aggfnoid)",
+    ];
     /// The built-in row whose `aggfnoid` is `aggfnoid`.
     pub fn by_aggfnoid(aggfnoid: Oid) -> Option<&'static PgAggregate> {
         let position = PG_AGGREGATE
@@ -227,6 +233,12 @@ pub static PG_AM: [PgAm; 7] = [
 ];
 
 impl PgAm {
+    /// The `CREATE TABLE` statement of `pg_am` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_am(oid INTEGER PRIMARY KEY, amname TEXT NOT NULL, amhandler INTEGER NOT NULL, amtype TEXT NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_am` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_am_name_index ON pg_am(amname)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgAm> {
         let position = PG_AM.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -1198,6 +1210,13 @@ pub static PG_AMOP: [PgAmop; 945] = [
 ];
 
 impl PgAmop {
+    /// The `CREATE TABLE` statement of `pg_amop` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_amop(oid INTEGER PRIMARY KEY, amopfamily INTEGER NOT NULL, amoplefttype INTEGER NOT NULL, amoprighttype INTEGER NOT NULL, amopstrategy INTEGER NOT NULL, amoppurpose TEXT NOT NULL, amopopr INTEGER NOT NULL, amopmethod INTEGER NOT NULL, amopsortfamily INTEGER NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_amop` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_amop_fam_strat_index ON pg_amop(amopfamily, amoplefttype, amoprighttype, amopstrategy)",
+        "CREATE UNIQUE INDEX pg_amop_opr_fam_index ON pg_amop(amopopr, amoppurpose, amopfamily)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgAmop> {
         let position = PG_AMOP.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -1935,6 +1954,12 @@ pub static PG_AMPROC: [PgAmproc; 714] = [
 ];
 
 impl PgAmproc {
+    /// The `CREATE TABLE` statement of `pg_amproc` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_amproc(oid INTEGER PRIMARY KEY, amprocfamily INTEGER NOT NULL, amproclefttype INTEGER NOT NULL, amprocrighttype INTEGER NOT NULL, amprocnum INTEGER NOT NULL, amproc INTEGER NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_amproc` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_amproc_fam_proc_index ON pg_amproc(amprocfamily, amproclefttype, amprocrighttype, amprocnum)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgAmproc> {
         let position = PG_AMPROC.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -1956,6 +1981,12 @@ pub static PG_ATTRDEF: [PgAttrdef; 0] = [
 ];
 
 impl PgAttrdef {
+    /// The `CREATE TABLE` statement of `pg_attrdef` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_attrdef(oid INTEGER PRIMARY KEY, adrelid INTEGER NOT NULL, adnum INTEGER NOT NULL, adbin TEXT NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_attrdef` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_attrdef_adrelid_adnum_index ON pg_attrdef(adrelid, adnum)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgAttrdef> {
         let position = PG_ATTRDEF.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -1997,6 +2028,16 @@ pub struct PgAttribute {
 pub static PG_ATTRIBUTE: [PgAttribute; 0] = [
 ];
 
+impl PgAttribute {
+    /// The `CREATE TABLE` statement of `pg_attribute` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_attribute(attrelid INTEGER NOT NULL, attname TEXT NOT NULL, atttypid INTEGER NOT NULL, attlen INTEGER NOT NULL, attnum INTEGER NOT NULL, atttypmod INTEGER NOT NULL, attndims INTEGER NOT NULL, attbyval BOOLEAN NOT NULL, attalign TEXT NOT NULL, attstorage TEXT NOT NULL, attcompression TEXT NOT NULL, attnotnull BOOLEAN NOT NULL, atthasdef BOOLEAN NOT NULL, atthasmissing BOOLEAN NOT NULL, attidentity TEXT NOT NULL, attgenerated TEXT NOT NULL, attisdropped BOOLEAN NOT NULL, attislocal BOOLEAN NOT NULL, attinhcount INTEGER NOT NULL, attcollation INTEGER NOT NULL, attstattarget INTEGER, attacl TEXT, attoptions TEXT, attfdwoptions TEXT, attmissingval TEXT)";
+    /// The `CREATE INDEX` statements of `pg_attribute` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_attribute_relid_attnam_index ON pg_attribute(attrelid, attname)",
+        "CREATE UNIQUE INDEX pg_attribute_relid_attnum_index ON pg_attribute(attrelid, attnum)",
+    ];
+}
+
 /// A row of `pg_auth_members`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgAuthMembers {
@@ -2014,6 +2055,14 @@ pub static PG_AUTH_MEMBERS: [PgAuthMembers; 0] = [
 ];
 
 impl PgAuthMembers {
+    /// The `CREATE TABLE` statement of `pg_auth_members` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_auth_members(oid INTEGER PRIMARY KEY, roleid INTEGER NOT NULL, member INTEGER NOT NULL, grantor INTEGER NOT NULL, admin_option BOOLEAN NOT NULL, inherit_option BOOLEAN NOT NULL, set_option BOOLEAN NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_auth_members` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_auth_members_role_member_index ON pg_auth_members(roleid, member, grantor)",
+        "CREATE UNIQUE INDEX pg_auth_members_member_role_index ON pg_auth_members(member, roleid, grantor)",
+        "CREATE INDEX pg_auth_members_grantor_index ON pg_auth_members(grantor)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgAuthMembers> {
         let position = PG_AUTH_MEMBERS.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -2060,6 +2109,12 @@ pub static PG_AUTHID: [PgAuthid; 17] = [
 ];
 
 impl PgAuthid {
+    /// The `CREATE TABLE` statement of `pg_authid` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_authid(oid INTEGER PRIMARY KEY, rolname TEXT NOT NULL, rolsuper BOOLEAN NOT NULL, rolinherit BOOLEAN NOT NULL, rolcreaterole BOOLEAN NOT NULL, rolcreatedb BOOLEAN NOT NULL, rolcanlogin BOOLEAN NOT NULL, rolreplication BOOLEAN NOT NULL, rolbypassrls BOOLEAN NOT NULL, rolconnlimit INTEGER NOT NULL, rolpassword TEXT, rolvaliduntil TEXT)";
+    /// The `CREATE INDEX` statements of `pg_authid` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_authid_rolname_index ON pg_authid(rolname)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgAuthid> {
         let position = PG_AUTHID.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -2318,6 +2373,12 @@ pub static PG_CAST: [PgCast; 235] = [
 ];
 
 impl PgCast {
+    /// The `CREATE TABLE` statement of `pg_cast` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_cast(oid INTEGER PRIMARY KEY, castsource INTEGER NOT NULL, casttarget INTEGER NOT NULL, castfunc INTEGER NOT NULL, castcontext TEXT NOT NULL, castmethod TEXT NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_cast` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_cast_source_target_index ON pg_cast(castsource, casttarget)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgCast> {
         let position = PG_CAST.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -2369,6 +2430,13 @@ pub static PG_CLASS: [PgClass; 0] = [
 ];
 
 impl PgClass {
+    /// The `CREATE TABLE` statement of `pg_class` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_class(oid INTEGER PRIMARY KEY, relname TEXT NOT NULL, relnamespace INTEGER NOT NULL, reltype INTEGER NOT NULL, reloftype INTEGER NOT NULL, relowner INTEGER NOT NULL, relam INTEGER NOT NULL, relfilenode INTEGER NOT NULL, reltablespace INTEGER NOT NULL, relpages INTEGER NOT NULL, reltuples REAL NOT NULL, relallvisible INTEGER NOT NULL, relallfrozen INTEGER NOT NULL, reltoastrelid INTEGER NOT NULL, relhasindex BOOLEAN NOT NULL, relisshared BOOLEAN NOT NULL, relpersistence TEXT NOT NULL, relkind TEXT NOT NULL, relnatts INTEGER NOT NULL, relchecks INTEGER NOT NULL, relhasrules BOOLEAN NOT NULL, relhastriggers BOOLEAN NOT NULL, relhassubclass BOOLEAN NOT NULL, relrowsecurity BOOLEAN NOT NULL, relforcerowsecurity BOOLEAN NOT NULL, relispopulated BOOLEAN NOT NULL, relreplident TEXT NOT NULL, relispartition BOOLEAN NOT NULL, relrewrite INTEGER NOT NULL, relfrozenxid INTEGER NOT NULL, relminmxid INTEGER NOT NULL, relacl TEXT, reloptions TEXT, relpartbound TEXT)";
+    /// The `CREATE INDEX` statements of `pg_class` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_class_relname_nsp_index ON pg_class(relname, relnamespace)",
+        "CREATE INDEX pg_class_tblspc_relfilenode_index ON pg_class(reltablespace, relfilenode)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgClass> {
         let position = PG_CLASS.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -2405,6 +2473,12 @@ pub static PG_COLLATION: [PgCollation; 7] = [
 ];
 
 impl PgCollation {
+    /// The `CREATE TABLE` statement of `pg_collation` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_collation(oid INTEGER PRIMARY KEY, collname TEXT NOT NULL, collnamespace INTEGER NOT NULL, collowner INTEGER NOT NULL, collprovider TEXT NOT NULL, collisdeterministic BOOLEAN NOT NULL, collencoding INTEGER NOT NULL, collcollate TEXT, collctype TEXT, colllocale TEXT, collicurules TEXT, collversion TEXT)";
+    /// The `CREATE INDEX` statements of `pg_collation` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_collation_name_enc_nsp_index ON pg_collation(collname, collencoding, collnamespace)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgCollation> {
         let position = PG_COLLATION.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -2450,6 +2524,15 @@ pub static PG_CONSTRAINT: [PgConstraint; 0] = [
 ];
 
 impl PgConstraint {
+    /// The `CREATE TABLE` statement of `pg_constraint` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_constraint(oid INTEGER PRIMARY KEY, conname TEXT NOT NULL, connamespace INTEGER NOT NULL, contype TEXT NOT NULL, condeferrable BOOLEAN NOT NULL, condeferred BOOLEAN NOT NULL, conenforced BOOLEAN NOT NULL, convalidated BOOLEAN NOT NULL, conrelid INTEGER NOT NULL, contypid INTEGER NOT NULL, conindid INTEGER NOT NULL, conparentid INTEGER NOT NULL, confrelid INTEGER NOT NULL, confupdtype TEXT NOT NULL, confdeltype TEXT NOT NULL, confmatchtype TEXT NOT NULL, conislocal BOOLEAN NOT NULL, coninhcount INTEGER NOT NULL, connoinherit BOOLEAN NOT NULL, conperiod BOOLEAN NOT NULL, conkey TEXT, confkey TEXT, conpfeqop TEXT, conppeqop TEXT, conffeqop TEXT, confdelsetcols TEXT, conexclop TEXT, conbin TEXT)";
+    /// The `CREATE INDEX` statements of `pg_constraint` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE INDEX pg_constraint_conname_nsp_index ON pg_constraint(conname, connamespace)",
+        "CREATE UNIQUE INDEX pg_constraint_conrelid_contypid_conname_index ON pg_constraint(conrelid, contypid, conname)",
+        "CREATE INDEX pg_constraint_contypid_index ON pg_constraint(contypid)",
+        "CREATE INDEX pg_constraint_conparentid_index ON pg_constraint(conparentid)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgConstraint> {
         let position = PG_CONSTRAINT.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -2603,6 +2686,13 @@ pub static PG_CONVERSION: [PgConversion; 128] = [
 ];
 
 impl PgConversion {
+    /// The `CREATE TABLE` statement of `pg_conversion` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_conversion(oid INTEGER PRIMARY KEY, conname TEXT NOT NULL, connamespace INTEGER NOT NULL, conowner INTEGER NOT NULL, conforencoding INTEGER NOT NULL, contoencoding INTEGER NOT NULL, conproc INTEGER NOT NULL, condefault BOOLEAN NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_conversion` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_conversion_default_index ON pg_conversion(connamespace, conforencoding, contoencoding, oid)",
+        "CREATE UNIQUE INDEX pg_conversion_name_nsp_index ON pg_conversion(conname, connamespace)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgConversion> {
         let position = PG_CONVERSION.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -2638,6 +2728,12 @@ pub static PG_DATABASE: [PgDatabase; 0] = [
 ];
 
 impl PgDatabase {
+    /// The `CREATE TABLE` statement of `pg_database` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_database(oid INTEGER PRIMARY KEY, datname TEXT NOT NULL, datdba INTEGER NOT NULL, encoding INTEGER NOT NULL, datlocprovider TEXT NOT NULL, datistemplate BOOLEAN NOT NULL, datallowconn BOOLEAN NOT NULL, dathasloginevt BOOLEAN NOT NULL, datconnlimit INTEGER NOT NULL, datfrozenxid INTEGER NOT NULL, datminmxid INTEGER NOT NULL, dattablespace INTEGER NOT NULL, datcollate TEXT NOT NULL, datctype TEXT NOT NULL, datlocale TEXT, daticurules TEXT, datcollversion TEXT, datacl TEXT)";
+    /// The `CREATE INDEX` statements of `pg_database` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_database_datname_index ON pg_database(datname)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgDatabase> {
         let position = PG_DATABASE.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -2657,6 +2753,15 @@ pub struct PgDbRoleSetting {
 pub static PG_DB_ROLE_SETTING: [PgDbRoleSetting; 0] = [
 ];
 
+impl PgDbRoleSetting {
+    /// The `CREATE TABLE` statement of `pg_db_role_setting` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_db_role_setting(setdatabase INTEGER NOT NULL, setrole INTEGER NOT NULL, setconfig TEXT)";
+    /// The `CREATE INDEX` statements of `pg_db_role_setting` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_db_role_setting_databaseid_rol_index ON pg_db_role_setting(setdatabase, setrole)",
+    ];
+}
+
 /// A row of `pg_default_acl`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgDefaultAcl {
@@ -2672,6 +2777,12 @@ pub static PG_DEFAULT_ACL: [PgDefaultAcl; 0] = [
 ];
 
 impl PgDefaultAcl {
+    /// The `CREATE TABLE` statement of `pg_default_acl` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_default_acl(oid INTEGER PRIMARY KEY, defaclrole INTEGER NOT NULL, defaclnamespace INTEGER NOT NULL, defaclobjtype TEXT NOT NULL, defaclacl TEXT NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_default_acl` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_default_acl_role_nsp_obj_index ON pg_default_acl(defaclrole, defaclnamespace, defaclobjtype)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgDefaultAcl> {
         let position = PG_DEFAULT_ACL.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -2694,6 +2805,16 @@ pub struct PgDepend {
 /// The built-in rows of `pg_depend`, in the order of `postgres.bki`.
 pub static PG_DEPEND: [PgDepend; 0] = [
 ];
+
+impl PgDepend {
+    /// The `CREATE TABLE` statement of `pg_depend` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_depend(classid INTEGER NOT NULL, objid INTEGER NOT NULL, objsubid INTEGER NOT NULL, refclassid INTEGER NOT NULL, refobjid INTEGER NOT NULL, refobjsubid INTEGER NOT NULL, deptype TEXT NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_depend` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE INDEX pg_depend_depender_index ON pg_depend(classid, objid, objsubid)",
+        "CREATE INDEX pg_depend_reference_index ON pg_depend(refclassid, refobjid, refobjsubid)",
+    ];
+}
 
 /// A row of `pg_description`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6383,6 +6504,15 @@ pub static PG_DESCRIPTION: [PgDescription; 3675] = [
     PgDescription { objoid: 4601, classoid: 1247, objsubid: 0, description: "pseudo-type representing BRIN minmax-multi summary" },
 ];
 
+impl PgDescription {
+    /// The `CREATE TABLE` statement of `pg_description` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_description(objoid INTEGER NOT NULL, classoid INTEGER NOT NULL, objsubid INTEGER NOT NULL, description TEXT NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_description` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_description_o_c_o_index ON pg_description(objoid, classoid, objsubid)",
+    ];
+}
+
 /// A row of `pg_enum`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgEnum {
@@ -6397,6 +6527,13 @@ pub static PG_ENUM: [PgEnum; 0] = [
 ];
 
 impl PgEnum {
+    /// The `CREATE TABLE` statement of `pg_enum` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_enum(oid INTEGER PRIMARY KEY, enumtypid INTEGER NOT NULL, enumsortorder REAL NOT NULL, enumlabel TEXT NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_enum` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_enum_typid_label_index ON pg_enum(enumtypid, enumlabel)",
+        "CREATE UNIQUE INDEX pg_enum_typid_sortorder_index ON pg_enum(enumtypid, enumsortorder)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgEnum> {
         let position = PG_ENUM.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -6421,6 +6558,12 @@ pub static PG_EVENT_TRIGGER: [PgEventTrigger; 0] = [
 ];
 
 impl PgEventTrigger {
+    /// The `CREATE TABLE` statement of `pg_event_trigger` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_event_trigger(oid INTEGER PRIMARY KEY, evtname TEXT NOT NULL, evtevent TEXT NOT NULL, evtowner INTEGER NOT NULL, evtfoid INTEGER NOT NULL, evtenabled TEXT NOT NULL, evttags TEXT)";
+    /// The `CREATE INDEX` statements of `pg_event_trigger` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_event_trigger_evtname_index ON pg_event_trigger(evtname)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgEventTrigger> {
         let position = PG_EVENT_TRIGGER.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -6446,6 +6589,12 @@ pub static PG_EXTENSION: [PgExtension; 0] = [
 ];
 
 impl PgExtension {
+    /// The `CREATE TABLE` statement of `pg_extension` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_extension(oid INTEGER PRIMARY KEY, extname TEXT NOT NULL, extowner INTEGER NOT NULL, extnamespace INTEGER NOT NULL, extrelocatable BOOLEAN NOT NULL, extversion TEXT NOT NULL, extconfig TEXT, extcondition TEXT)";
+    /// The `CREATE INDEX` statements of `pg_extension` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_extension_name_index ON pg_extension(extname)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgExtension> {
         let position = PG_EXTENSION.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -6470,6 +6619,12 @@ pub static PG_FOREIGN_DATA_WRAPPER: [PgForeignDataWrapper; 0] = [
 ];
 
 impl PgForeignDataWrapper {
+    /// The `CREATE TABLE` statement of `pg_foreign_data_wrapper` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_foreign_data_wrapper(oid INTEGER PRIMARY KEY, fdwname TEXT NOT NULL, fdwowner INTEGER NOT NULL, fdwhandler INTEGER NOT NULL, fdwvalidator INTEGER NOT NULL, fdwacl TEXT, fdwoptions TEXT)";
+    /// The `CREATE INDEX` statements of `pg_foreign_data_wrapper` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_foreign_data_wrapper_name_index ON pg_foreign_data_wrapper(fdwname)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgForeignDataWrapper> {
         let position = PG_FOREIGN_DATA_WRAPPER
@@ -6497,6 +6652,12 @@ pub static PG_FOREIGN_SERVER: [PgForeignServer; 0] = [
 ];
 
 impl PgForeignServer {
+    /// The `CREATE TABLE` statement of `pg_foreign_server` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_foreign_server(oid INTEGER PRIMARY KEY, srvname TEXT NOT NULL, srvowner INTEGER NOT NULL, srvfdw INTEGER NOT NULL, srvtype TEXT, srvversion TEXT, srvacl TEXT, srvoptions TEXT)";
+    /// The `CREATE INDEX` statements of `pg_foreign_server` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_foreign_server_name_index ON pg_foreign_server(srvname)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgForeignServer> {
         let position = PG_FOREIGN_SERVER.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -6517,6 +6678,12 @@ pub static PG_FOREIGN_TABLE: [PgForeignTable; 0] = [
 ];
 
 impl PgForeignTable {
+    /// The `CREATE TABLE` statement of `pg_foreign_table` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_foreign_table(ftrelid INTEGER NOT NULL, ftserver INTEGER NOT NULL, ftoptions TEXT)";
+    /// The `CREATE INDEX` statements of `pg_foreign_table` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_foreign_table_relid_index ON pg_foreign_table(ftrelid)",
+    ];
     /// The built-in row whose `ftrelid` is `ftrelid`.
     pub fn by_ftrelid(ftrelid: Oid) -> Option<&'static PgForeignTable> {
         let position = PG_FOREIGN_TABLE
@@ -6557,6 +6724,13 @@ pub static PG_INDEX: [PgIndex; 0] = [
 ];
 
 impl PgIndex {
+    /// The `CREATE TABLE` statement of `pg_index` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_index(indexrelid INTEGER NOT NULL, indrelid INTEGER NOT NULL, indnatts INTEGER NOT NULL, indnkeyatts INTEGER NOT NULL, indisunique BOOLEAN NOT NULL, indnullsnotdistinct BOOLEAN NOT NULL, indisprimary BOOLEAN NOT NULL, indisexclusion BOOLEAN NOT NULL, indimmediate BOOLEAN NOT NULL, indisclustered BOOLEAN NOT NULL, indisvalid BOOLEAN NOT NULL, indcheckxmin BOOLEAN NOT NULL, indisready BOOLEAN NOT NULL, indislive BOOLEAN NOT NULL, indisreplident BOOLEAN NOT NULL, indkey TEXT NOT NULL, indcollation TEXT NOT NULL, indclass TEXT NOT NULL, indoption TEXT NOT NULL, indexprs TEXT, indpred TEXT)";
+    /// The `CREATE INDEX` statements of `pg_index` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE INDEX pg_index_indrelid_index ON pg_index(indrelid)",
+        "CREATE UNIQUE INDEX pg_index_indexrelid_index ON pg_index(indexrelid)",
+    ];
     /// The built-in row whose `indexrelid` is `indexrelid`.
     pub fn by_indexrelid(indexrelid: Oid) -> Option<&'static PgIndex> {
         let position = PG_INDEX
@@ -6579,6 +6753,16 @@ pub struct PgInherits {
 pub static PG_INHERITS: [PgInherits; 0] = [
 ];
 
+impl PgInherits {
+    /// The `CREATE TABLE` statement of `pg_inherits` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_inherits(inhrelid INTEGER NOT NULL, inhparent INTEGER NOT NULL, inhseqno INTEGER NOT NULL, inhdetachpending BOOLEAN NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_inherits` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_inherits_relid_seqno_index ON pg_inherits(inhrelid, inhseqno)",
+        "CREATE INDEX pg_inherits_parent_index ON pg_inherits(inhparent)",
+    ];
+}
+
 /// A row of `pg_init_privs`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgInitPrivs {
@@ -6592,6 +6776,15 @@ pub struct PgInitPrivs {
 /// The built-in rows of `pg_init_privs`, in the order of `postgres.bki`.
 pub static PG_INIT_PRIVS: [PgInitPrivs; 0] = [
 ];
+
+impl PgInitPrivs {
+    /// The `CREATE TABLE` statement of `pg_init_privs` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_init_privs(objoid INTEGER NOT NULL, classoid INTEGER NOT NULL, objsubid INTEGER NOT NULL, privtype TEXT NOT NULL, initprivs TEXT NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_init_privs` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_init_privs_o_c_o_index ON pg_init_privs(objoid, classoid, objsubid)",
+    ];
+}
 
 /// A row of `pg_language`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6615,6 +6808,12 @@ pub static PG_LANGUAGE: [PgLanguage; 3] = [
 ];
 
 impl PgLanguage {
+    /// The `CREATE TABLE` statement of `pg_language` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_language(oid INTEGER PRIMARY KEY, lanname TEXT NOT NULL, lanowner INTEGER NOT NULL, lanispl BOOLEAN NOT NULL, lanpltrusted BOOLEAN NOT NULL, lanplcallfoid INTEGER NOT NULL, laninline INTEGER NOT NULL, lanvalidator INTEGER NOT NULL, lanacl TEXT)";
+    /// The `CREATE INDEX` statements of `pg_language` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_language_name_index ON pg_language(lanname)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgLanguage> {
         let position = PG_LANGUAGE.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -6634,6 +6833,15 @@ pub struct PgLargeobject {
 pub static PG_LARGEOBJECT: [PgLargeobject; 0] = [
 ];
 
+impl PgLargeobject {
+    /// The `CREATE TABLE` statement of `pg_largeobject` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_largeobject(loid INTEGER NOT NULL, pageno INTEGER NOT NULL, data BLOB NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_largeobject` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_largeobject_loid_pn_index ON pg_largeobject(loid, pageno)",
+    ];
+}
+
 /// A row of `pg_largeobject_metadata`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgLargeobjectMetadata {
@@ -6647,6 +6855,10 @@ pub static PG_LARGEOBJECT_METADATA: [PgLargeobjectMetadata; 0] = [
 ];
 
 impl PgLargeobjectMetadata {
+    /// The `CREATE TABLE` statement of `pg_largeobject_metadata` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_largeobject_metadata(oid INTEGER PRIMARY KEY, lomowner INTEGER NOT NULL, lomacl TEXT)";
+    /// The `CREATE INDEX` statements of `pg_largeobject_metadata` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgLargeobjectMetadata> {
         let position = PG_LARGEOBJECT_METADATA
@@ -6673,6 +6885,12 @@ pub static PG_NAMESPACE: [PgNamespace; 3] = [
 ];
 
 impl PgNamespace {
+    /// The `CREATE TABLE` statement of `pg_namespace` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_namespace(oid INTEGER PRIMARY KEY, nspname TEXT NOT NULL, nspowner INTEGER NOT NULL, nspacl TEXT)";
+    /// The `CREATE INDEX` statements of `pg_namespace` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_namespace_nspname_index ON pg_namespace(nspname)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgNamespace> {
         let position = PG_NAMESPACE.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -6876,6 +7094,12 @@ pub static PG_OPCLASS: [PgOpclass; 177] = [
 ];
 
 impl PgOpclass {
+    /// The `CREATE TABLE` statement of `pg_opclass` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_opclass(oid INTEGER PRIMARY KEY, opcmethod INTEGER NOT NULL, opcname TEXT NOT NULL, opcnamespace INTEGER NOT NULL, opcowner INTEGER NOT NULL, opcfamily INTEGER NOT NULL, opcintype INTEGER NOT NULL, opcdefault BOOLEAN NOT NULL, opckeytype INTEGER NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_opclass` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_opclass_am_name_nsp_index ON pg_opclass(opcmethod, opcname, opcnamespace)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgOpclass> {
         let position = PG_OPCLASS.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -7707,6 +7931,12 @@ pub static PG_OPERATOR: [PgOperator; 799] = [
 ];
 
 impl PgOperator {
+    /// The `CREATE TABLE` statement of `pg_operator` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_operator(oid INTEGER PRIMARY KEY, oprname TEXT NOT NULL, oprnamespace INTEGER NOT NULL, oprowner INTEGER NOT NULL, oprkind TEXT NOT NULL, oprcanmerge BOOLEAN NOT NULL, oprcanhash BOOLEAN NOT NULL, oprleft INTEGER NOT NULL, oprright INTEGER NOT NULL, oprresult INTEGER NOT NULL, oprcom INTEGER NOT NULL, oprnegate INTEGER NOT NULL, oprcode INTEGER NOT NULL, oprrest INTEGER NOT NULL, oprjoin INTEGER NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_operator` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_operator_oprname_l_r_n_index ON pg_operator(oprname, oprleft, oprright, oprnamespace)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgOperator> {
         let position = PG_OPERATOR.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -7875,6 +8105,12 @@ pub static PG_OPFAMILY: [PgOpfamily; 146] = [
 ];
 
 impl PgOpfamily {
+    /// The `CREATE TABLE` statement of `pg_opfamily` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_opfamily(oid INTEGER PRIMARY KEY, opfmethod INTEGER NOT NULL, opfname TEXT NOT NULL, opfnamespace INTEGER NOT NULL, opfowner INTEGER NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_opfamily` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_opfamily_am_name_nsp_index ON pg_opfamily(opfmethod, opfname, opfnamespace)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgOpfamily> {
         let position = PG_OPFAMILY.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -7895,6 +8131,12 @@ pub static PG_PARAMETER_ACL: [PgParameterAcl; 0] = [
 ];
 
 impl PgParameterAcl {
+    /// The `CREATE TABLE` statement of `pg_parameter_acl` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_parameter_acl(oid INTEGER PRIMARY KEY, parname TEXT NOT NULL, paracl TEXT)";
+    /// The `CREATE INDEX` statements of `pg_parameter_acl` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_parameter_acl_parname_index ON pg_parameter_acl(parname)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgParameterAcl> {
         let position = PG_PARAMETER_ACL.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -7920,6 +8162,12 @@ pub static PG_PARTITIONED_TABLE: [PgPartitionedTable; 0] = [
 ];
 
 impl PgPartitionedTable {
+    /// The `CREATE TABLE` statement of `pg_partitioned_table` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_partitioned_table(partrelid INTEGER NOT NULL, partstrat TEXT NOT NULL, partnatts INTEGER NOT NULL, partdefid INTEGER NOT NULL, partattrs TEXT NOT NULL, partclass TEXT NOT NULL, partcollation TEXT NOT NULL, partexprs TEXT)";
+    /// The `CREATE INDEX` statements of `pg_partitioned_table` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_partitioned_table_partrelid_index ON pg_partitioned_table(partrelid)",
+    ];
     /// The built-in row whose `partrelid` is `partrelid`.
     pub fn by_partrelid(partrelid: Oid) -> Option<&'static PgPartitionedTable> {
         let position = PG_PARTITIONED_TABLE
@@ -7947,6 +8195,12 @@ pub static PG_POLICY: [PgPolicy; 0] = [
 ];
 
 impl PgPolicy {
+    /// The `CREATE TABLE` statement of `pg_policy` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_policy(oid INTEGER PRIMARY KEY, polname TEXT NOT NULL, polrelid INTEGER NOT NULL, polcmd TEXT NOT NULL, polpermissive BOOLEAN NOT NULL, polroles TEXT NOT NULL, polqual TEXT, polwithcheck TEXT)";
+    /// The `CREATE INDEX` statements of `pg_policy` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_policy_polrelid_polname_index ON pg_policy(polrelid, polname)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgPolicy> {
         let position = PG_POLICY.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -11391,6 +11645,12 @@ pub static PG_PROC: [PgProc; 3397] = [
 ];
 
 impl PgProc {
+    /// The `CREATE TABLE` statement of `pg_proc` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_proc(oid INTEGER PRIMARY KEY, proname TEXT NOT NULL, pronamespace INTEGER NOT NULL, proowner INTEGER NOT NULL, prolang INTEGER NOT NULL, procost REAL NOT NULL, prorows REAL NOT NULL, provariadic INTEGER NOT NULL, prosupport INTEGER NOT NULL, prokind TEXT NOT NULL, prosecdef BOOLEAN NOT NULL, proleakproof BOOLEAN NOT NULL, proisstrict BOOLEAN NOT NULL, proretset BOOLEAN NOT NULL, provolatile TEXT NOT NULL, proparallel TEXT NOT NULL, pronargs INTEGER NOT NULL, pronargdefaults INTEGER NOT NULL, prorettype INTEGER NOT NULL, proargtypes TEXT NOT NULL, proallargtypes TEXT, proargmodes TEXT, proargnames TEXT, proargdefaults TEXT, protrftypes TEXT, prosrc TEXT NOT NULL, probin TEXT, prosqlbody TEXT, proconfig TEXT, proacl TEXT)";
+    /// The `CREATE INDEX` statements of `pg_proc` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_proc_proname_args_nsp_index ON pg_proc(proname, proargtypes, pronamespace)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgProc> {
         let position = PG_PROC.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -11418,6 +11678,12 @@ pub static PG_PUBLICATION: [PgPublication; 0] = [
 ];
 
 impl PgPublication {
+    /// The `CREATE TABLE` statement of `pg_publication` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_publication(oid INTEGER PRIMARY KEY, pubname TEXT NOT NULL, pubowner INTEGER NOT NULL, puballtables BOOLEAN NOT NULL, pubinsert BOOLEAN NOT NULL, pubupdate BOOLEAN NOT NULL, pubdelete BOOLEAN NOT NULL, pubtruncate BOOLEAN NOT NULL, pubviaroot BOOLEAN NOT NULL, pubgencols TEXT NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_publication` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_publication_pubname_index ON pg_publication(pubname)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgPublication> {
         let position = PG_PUBLICATION.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -11438,6 +11704,12 @@ pub static PG_PUBLICATION_NAMESPACE: [PgPublicationNamespace; 0] = [
 ];
 
 impl PgPublicationNamespace {
+    /// The `CREATE TABLE` statement of `pg_publication_namespace` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_publication_namespace(oid INTEGER PRIMARY KEY, pnpubid INTEGER NOT NULL, pnnspid INTEGER NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_publication_namespace` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_publication_namespace_pnnspid_pnpubid_index ON pg_publication_namespace(pnnspid, pnpubid)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgPublicationNamespace> {
         let position = PG_PUBLICATION_NAMESPACE
@@ -11462,6 +11734,13 @@ pub static PG_PUBLICATION_REL: [PgPublicationRel; 0] = [
 ];
 
 impl PgPublicationRel {
+    /// The `CREATE TABLE` statement of `pg_publication_rel` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_publication_rel(oid INTEGER PRIMARY KEY, prpubid INTEGER NOT NULL, prrelid INTEGER NOT NULL, prqual TEXT, prattrs TEXT)";
+    /// The `CREATE INDEX` statements of `pg_publication_rel` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_publication_rel_prrelid_prpubid_index ON pg_publication_rel(prrelid, prpubid)",
+        "CREATE INDEX pg_publication_rel_prpubid_index ON pg_publication_rel(prpubid)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgPublicationRel> {
         let position = PG_PUBLICATION_REL
@@ -11494,6 +11773,13 @@ pub static PG_RANGE: [PgRange; 6] = [
 ];
 
 impl PgRange {
+    /// The `CREATE TABLE` statement of `pg_range` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_range(rngtypid INTEGER NOT NULL, rngsubtype INTEGER NOT NULL, rngmultitypid INTEGER NOT NULL, rngcollation INTEGER NOT NULL, rngsubopc INTEGER NOT NULL, rngcanonical INTEGER NOT NULL, rngsubdiff INTEGER NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_range` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_range_rngtypid_index ON pg_range(rngtypid)",
+        "CREATE UNIQUE INDEX pg_range_rngmultitypid_index ON pg_range(rngmultitypid)",
+    ];
     /// The built-in row whose `rngtypid` is `rngtypid`.
     pub fn by_rngtypid(rngtypid: Oid) -> Option<&'static PgRange> {
         let position = PG_RANGE
@@ -11515,6 +11801,13 @@ pub static PG_REPLICATION_ORIGIN: [PgReplicationOrigin; 0] = [
 ];
 
 impl PgReplicationOrigin {
+    /// The `CREATE TABLE` statement of `pg_replication_origin` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_replication_origin(roident INTEGER NOT NULL, roname TEXT NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_replication_origin` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_replication_origin_roiident_index ON pg_replication_origin(roident)",
+        "CREATE UNIQUE INDEX pg_replication_origin_roname_index ON pg_replication_origin(roname)",
+    ];
     /// The built-in row whose `roident` is `roident`.
     pub fn by_roident(roident: Oid) -> Option<&'static PgReplicationOrigin> {
         let position = PG_REPLICATION_ORIGIN
@@ -11542,6 +11835,12 @@ pub static PG_REWRITE: [PgRewrite; 0] = [
 ];
 
 impl PgRewrite {
+    /// The `CREATE TABLE` statement of `pg_rewrite` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_rewrite(oid INTEGER PRIMARY KEY, rulename TEXT NOT NULL, ev_class INTEGER NOT NULL, ev_type TEXT NOT NULL, ev_enabled TEXT NOT NULL, is_instead BOOLEAN NOT NULL, ev_qual TEXT NOT NULL, ev_action TEXT NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_rewrite` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_rewrite_rel_rulename_index ON pg_rewrite(ev_class, rulename)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgRewrite> {
         let position = PG_REWRITE.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -11563,6 +11862,15 @@ pub struct PgSeclabel {
 pub static PG_SECLABEL: [PgSeclabel; 0] = [
 ];
 
+impl PgSeclabel {
+    /// The `CREATE TABLE` statement of `pg_seclabel` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_seclabel(objoid INTEGER NOT NULL, classoid INTEGER NOT NULL, objsubid INTEGER NOT NULL, provider TEXT NOT NULL, label TEXT NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_seclabel` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_seclabel_object_index ON pg_seclabel(objoid, classoid, objsubid, provider)",
+    ];
+}
+
 /// A row of `pg_sequence`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgSequence {
@@ -11581,6 +11889,12 @@ pub static PG_SEQUENCE: [PgSequence; 0] = [
 ];
 
 impl PgSequence {
+    /// The `CREATE TABLE` statement of `pg_sequence` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_sequence(seqrelid INTEGER NOT NULL, seqtypid INTEGER NOT NULL, seqstart INTEGER NOT NULL, seqincrement INTEGER NOT NULL, seqmax INTEGER NOT NULL, seqmin INTEGER NOT NULL, seqcache INTEGER NOT NULL, seqcycle BOOLEAN NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_sequence` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_sequence_seqrelid_index ON pg_sequence(seqrelid)",
+    ];
     /// The built-in row whose `seqrelid` is `seqrelid`.
     pub fn by_seqrelid(seqrelid: Oid) -> Option<&'static PgSequence> {
         let position = PG_SEQUENCE
@@ -11606,6 +11920,16 @@ pub struct PgShdepend {
 pub static PG_SHDEPEND: [PgShdepend; 0] = [
 ];
 
+impl PgShdepend {
+    /// The `CREATE TABLE` statement of `pg_shdepend` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_shdepend(dbid INTEGER NOT NULL, classid INTEGER NOT NULL, objid INTEGER NOT NULL, objsubid INTEGER NOT NULL, refclassid INTEGER NOT NULL, refobjid INTEGER NOT NULL, deptype TEXT NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_shdepend` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE INDEX pg_shdepend_depender_index ON pg_shdepend(dbid, classid, objid, objsubid)",
+        "CREATE INDEX pg_shdepend_reference_index ON pg_shdepend(refclassid, refobjid)",
+    ];
+}
+
 /// A row of `pg_shdescription`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgShdescription {
@@ -11619,6 +11943,15 @@ pub static PG_SHDESCRIPTION: [PgShdescription; 1] = [
     PgShdescription { objoid: 1, classoid: 1262, description: "default template for new databases" },
 ];
 
+impl PgShdescription {
+    /// The `CREATE TABLE` statement of `pg_shdescription` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_shdescription(objoid INTEGER NOT NULL, classoid INTEGER NOT NULL, description TEXT NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_shdescription` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_shdescription_o_c_index ON pg_shdescription(objoid, classoid)",
+    ];
+}
+
 /// A row of `pg_shseclabel`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgShseclabel {
@@ -11631,6 +11964,15 @@ pub struct PgShseclabel {
 /// The built-in rows of `pg_shseclabel`, in the order of `postgres.bki`.
 pub static PG_SHSECLABEL: [PgShseclabel; 0] = [
 ];
+
+impl PgShseclabel {
+    /// The `CREATE TABLE` statement of `pg_shseclabel` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_shseclabel(objoid INTEGER NOT NULL, classoid INTEGER NOT NULL, provider TEXT NOT NULL, label TEXT NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_shseclabel` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_shseclabel_object_index ON pg_shseclabel(objoid, classoid, provider)",
+    ];
+}
 
 /// A row of `pg_statistic`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -11672,6 +12014,15 @@ pub struct PgStatistic {
 pub static PG_STATISTIC: [PgStatistic; 0] = [
 ];
 
+impl PgStatistic {
+    /// The `CREATE TABLE` statement of `pg_statistic` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_statistic(starelid INTEGER NOT NULL, staattnum INTEGER NOT NULL, stainherit BOOLEAN NOT NULL, stanullfrac REAL NOT NULL, stawidth INTEGER NOT NULL, stadistinct REAL NOT NULL, stakind1 INTEGER NOT NULL, stakind2 INTEGER NOT NULL, stakind3 INTEGER NOT NULL, stakind4 INTEGER NOT NULL, stakind5 INTEGER NOT NULL, staop1 INTEGER NOT NULL, staop2 INTEGER NOT NULL, staop3 INTEGER NOT NULL, staop4 INTEGER NOT NULL, staop5 INTEGER NOT NULL, stacoll1 INTEGER NOT NULL, stacoll2 INTEGER NOT NULL, stacoll3 INTEGER NOT NULL, stacoll4 INTEGER NOT NULL, stacoll5 INTEGER NOT NULL, stanumbers1 TEXT, stanumbers2 TEXT, stanumbers3 TEXT, stanumbers4 TEXT, stanumbers5 TEXT, stavalues1 TEXT, stavalues2 TEXT, stavalues3 TEXT, stavalues4 TEXT, stavalues5 TEXT)";
+    /// The `CREATE INDEX` statements of `pg_statistic` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_statistic_relid_att_inh_index ON pg_statistic(starelid, staattnum, stainherit)",
+    ];
+}
+
 /// A row of `pg_statistic_ext`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgStatisticExt {
@@ -11691,6 +12042,13 @@ pub static PG_STATISTIC_EXT: [PgStatisticExt; 0] = [
 ];
 
 impl PgStatisticExt {
+    /// The `CREATE TABLE` statement of `pg_statistic_ext` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_statistic_ext(oid INTEGER PRIMARY KEY, stxrelid INTEGER NOT NULL, stxname TEXT NOT NULL, stxnamespace INTEGER NOT NULL, stxowner INTEGER NOT NULL, stxkeys TEXT NOT NULL, stxstattarget INTEGER, stxkind TEXT NOT NULL, stxexprs TEXT)";
+    /// The `CREATE INDEX` statements of `pg_statistic_ext` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_statistic_ext_name_index ON pg_statistic_ext(stxname, stxnamespace)",
+        "CREATE INDEX pg_statistic_ext_relid_index ON pg_statistic_ext(stxrelid)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgStatisticExt> {
         let position = PG_STATISTIC_EXT.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -11712,6 +12070,15 @@ pub struct PgStatisticExtData {
 /// The built-in rows of `pg_statistic_ext_data`, in the order of `postgres.bki`.
 pub static PG_STATISTIC_EXT_DATA: [PgStatisticExtData; 0] = [
 ];
+
+impl PgStatisticExtData {
+    /// The `CREATE TABLE` statement of `pg_statistic_ext_data` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_statistic_ext_data(stxoid INTEGER NOT NULL, stxdinherit BOOLEAN NOT NULL, stxdndistinct TEXT, stxddependencies TEXT, stxdmcv TEXT, stxdexpr TEXT)";
+    /// The `CREATE INDEX` statements of `pg_statistic_ext_data` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_statistic_ext_data_stxoid_inh_index ON pg_statistic_ext_data(stxoid, stxdinherit)",
+    ];
+}
 
 /// A row of `pg_subscription`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -11741,6 +12108,12 @@ pub static PG_SUBSCRIPTION: [PgSubscription; 0] = [
 ];
 
 impl PgSubscription {
+    /// The `CREATE TABLE` statement of `pg_subscription` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_subscription(oid INTEGER PRIMARY KEY, subdbid INTEGER NOT NULL, subskiplsn TEXT NOT NULL, subname TEXT NOT NULL, subowner INTEGER NOT NULL, subenabled BOOLEAN NOT NULL, subbinary BOOLEAN NOT NULL, substream TEXT NOT NULL, subtwophasestate TEXT NOT NULL, subdisableonerr BOOLEAN NOT NULL, subpasswordrequired BOOLEAN NOT NULL, subrunasowner BOOLEAN NOT NULL, subfailover BOOLEAN NOT NULL, subconninfo TEXT NOT NULL, subslotname TEXT, subsynccommit TEXT NOT NULL, subpublications TEXT NOT NULL, suborigin TEXT)";
+    /// The `CREATE INDEX` statements of `pg_subscription` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_subscription_subname_index ON pg_subscription(subdbid, subname)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgSubscription> {
         let position = PG_SUBSCRIPTION.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -11761,6 +12134,15 @@ pub struct PgSubscriptionRel {
 pub static PG_SUBSCRIPTION_REL: [PgSubscriptionRel; 0] = [
 ];
 
+impl PgSubscriptionRel {
+    /// The `CREATE TABLE` statement of `pg_subscription_rel` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_subscription_rel(srsubid INTEGER NOT NULL, srrelid INTEGER NOT NULL, srsubstate TEXT NOT NULL, srsublsn TEXT)";
+    /// The `CREATE INDEX` statements of `pg_subscription_rel` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_subscription_rel_srrelid_srsubid_index ON pg_subscription_rel(srrelid, srsubid)",
+    ];
+}
+
 /// A row of `pg_tablespace`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgTablespace {
@@ -11778,6 +12160,12 @@ pub static PG_TABLESPACE: [PgTablespace; 2] = [
 ];
 
 impl PgTablespace {
+    /// The `CREATE TABLE` statement of `pg_tablespace` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_tablespace(oid INTEGER PRIMARY KEY, spcname TEXT NOT NULL, spcowner INTEGER NOT NULL, spcacl TEXT, spcoptions TEXT)";
+    /// The `CREATE INDEX` statements of `pg_tablespace` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_tablespace_spcname_index ON pg_tablespace(spcname)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgTablespace> {
         let position = PG_TABLESPACE.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -11800,6 +12188,12 @@ pub static PG_TRANSFORM: [PgTransform; 0] = [
 ];
 
 impl PgTransform {
+    /// The `CREATE TABLE` statement of `pg_transform` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_transform(oid INTEGER PRIMARY KEY, trftype INTEGER NOT NULL, trflang INTEGER NOT NULL, trffromsql INTEGER NOT NULL, trftosql INTEGER NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_transform` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_transform_type_lang_index ON pg_transform(trftype, trflang)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgTransform> {
         let position = PG_TRANSFORM.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -11836,6 +12230,13 @@ pub static PG_TRIGGER: [PgTrigger; 0] = [
 ];
 
 impl PgTrigger {
+    /// The `CREATE TABLE` statement of `pg_trigger` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_trigger(oid INTEGER PRIMARY KEY, tgrelid INTEGER NOT NULL, tgparentid INTEGER NOT NULL, tgname TEXT NOT NULL, tgfoid INTEGER NOT NULL, tgtype INTEGER NOT NULL, tgenabled TEXT NOT NULL, tgisinternal BOOLEAN NOT NULL, tgconstrrelid INTEGER NOT NULL, tgconstrindid INTEGER NOT NULL, tgconstraint INTEGER NOT NULL, tgdeferrable BOOLEAN NOT NULL, tginitdeferred BOOLEAN NOT NULL, tgnargs INTEGER NOT NULL, tgattr TEXT NOT NULL, tgargs BLOB NOT NULL, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT)";
+    /// The `CREATE INDEX` statements of `pg_trigger` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE INDEX pg_trigger_tgconstraint_index ON pg_trigger(tgconstraint)",
+        "CREATE UNIQUE INDEX pg_trigger_tgrelid_tgname_index ON pg_trigger(tgrelid, tgname)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgTrigger> {
         let position = PG_TRIGGER.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -11859,6 +12260,12 @@ pub static PG_TS_CONFIG: [PgTsConfig; 1] = [
 ];
 
 impl PgTsConfig {
+    /// The `CREATE TABLE` statement of `pg_ts_config` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_ts_config(oid INTEGER PRIMARY KEY, cfgname TEXT NOT NULL, cfgnamespace INTEGER NOT NULL, cfgowner INTEGER NOT NULL, cfgparser INTEGER NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_ts_config` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_ts_config_cfgname_index ON pg_ts_config(cfgname, cfgnamespace)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgTsConfig> {
         let position = PG_TS_CONFIG.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -11898,6 +12305,15 @@ pub static PG_TS_CONFIG_MAP: [PgTsConfigMap; 19] = [
     PgTsConfigMap { mapcfg: 3748, maptokentype: 22, mapseqno: 1, mapdict: 3765 },
 ];
 
+impl PgTsConfigMap {
+    /// The `CREATE TABLE` statement of `pg_ts_config_map` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_ts_config_map(mapcfg INTEGER NOT NULL, maptokentype INTEGER NOT NULL, mapseqno INTEGER NOT NULL, mapdict INTEGER NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_ts_config_map` in SQLite syntax: one for each index of `postgres.bki`.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_ts_config_map_index ON pg_ts_config_map(mapcfg, maptokentype, mapseqno)",
+    ];
+}
+
 /// A row of `pg_ts_dict`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgTsDict {
@@ -11915,6 +12331,12 @@ pub static PG_TS_DICT: [PgTsDict; 1] = [
 ];
 
 impl PgTsDict {
+    /// The `CREATE TABLE` statement of `pg_ts_dict` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_ts_dict(oid INTEGER PRIMARY KEY, dictname TEXT NOT NULL, dictnamespace INTEGER NOT NULL, dictowner INTEGER NOT NULL, dicttemplate INTEGER NOT NULL, dictinitoption TEXT)";
+    /// The `CREATE INDEX` statements of `pg_ts_dict` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_ts_dict_dictname_index ON pg_ts_dict(dictname, dictnamespace)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgTsDict> {
         let position = PG_TS_DICT.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -11941,6 +12363,12 @@ pub static PG_TS_PARSER: [PgTsParser; 1] = [
 ];
 
 impl PgTsParser {
+    /// The `CREATE TABLE` statement of `pg_ts_parser` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_ts_parser(oid INTEGER PRIMARY KEY, prsname TEXT NOT NULL, prsnamespace INTEGER NOT NULL, prsstart INTEGER NOT NULL, prstoken INTEGER NOT NULL, prsend INTEGER NOT NULL, prsheadline INTEGER NOT NULL, prslextype INTEGER NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_ts_parser` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_ts_parser_prsname_index ON pg_ts_parser(prsname, prsnamespace)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgTsParser> {
         let position = PG_TS_PARSER.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -11967,6 +12395,12 @@ pub static PG_TS_TEMPLATE: [PgTsTemplate; 4] = [
 ];
 
 impl PgTsTemplate {
+    /// The `CREATE TABLE` statement of `pg_ts_template` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_ts_template(oid INTEGER PRIMARY KEY, tmplname TEXT NOT NULL, tmplnamespace INTEGER NOT NULL, tmplinit INTEGER NOT NULL, tmpllexize INTEGER NOT NULL)";
+    /// The `CREATE INDEX` statements of `pg_ts_template` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_ts_template_tmplname_index ON pg_ts_template(tmplname, tmplnamespace)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgTsTemplate> {
         let position = PG_TS_TEMPLATE.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -12209,6 +12643,12 @@ pub static PG_TYPE: [PgType; 193] = [
 ];
 
 impl PgType {
+    /// The `CREATE TABLE` statement of `pg_type` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_type(oid INTEGER PRIMARY KEY, typname TEXT NOT NULL, typnamespace INTEGER NOT NULL, typowner INTEGER NOT NULL, typlen INTEGER NOT NULL, typbyval BOOLEAN NOT NULL, typtype TEXT NOT NULL, typcategory TEXT NOT NULL, typispreferred BOOLEAN NOT NULL, typisdefined BOOLEAN NOT NULL, typdelim TEXT NOT NULL, typrelid INTEGER NOT NULL, typsubscript INTEGER NOT NULL, typelem INTEGER NOT NULL, typarray INTEGER NOT NULL, typinput INTEGER NOT NULL, typoutput INTEGER NOT NULL, typreceive INTEGER NOT NULL, typsend INTEGER NOT NULL, typmodin INTEGER NOT NULL, typmodout INTEGER NOT NULL, typanalyze INTEGER NOT NULL, typalign TEXT NOT NULL, typstorage TEXT NOT NULL, typnotnull BOOLEAN NOT NULL, typbasetype INTEGER NOT NULL, typtypmod INTEGER NOT NULL, typndims INTEGER NOT NULL, typcollation INTEGER NOT NULL, typdefaultbin TEXT, typdefault TEXT, typacl TEXT)";
+    /// The `CREATE INDEX` statements of `pg_type` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_type_typname_nsp_index ON pg_type(typname, typnamespace)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgType> {
         let position = PG_TYPE.binary_search_by_key(&oid, |row| row.oid).ok()?;
@@ -12230,6 +12670,12 @@ pub static PG_USER_MAPPING: [PgUserMapping; 0] = [
 ];
 
 impl PgUserMapping {
+    /// The `CREATE TABLE` statement of `pg_user_mapping` in SQLite syntax, with the columns in the order of `postgres.bki`.
+    pub const CREATE_SQL: &'static str = "CREATE TABLE pg_user_mapping(oid INTEGER PRIMARY KEY, umuser INTEGER NOT NULL, umserver INTEGER NOT NULL, umoptions TEXT)";
+    /// The `CREATE INDEX` statements of `pg_user_mapping` in SQLite syntax: one for each index of `postgres.bki`, except the unique index on `oid`, which the `INTEGER PRIMARY KEY` replaces.
+    pub const INDEX_SQL: &'static [&'static str] = &[
+        "CREATE UNIQUE INDEX pg_user_mapping_user_server_index ON pg_user_mapping(umuser, umserver)",
+    ];
     /// The built-in row whose `oid` is `oid`.
     pub fn by_oid(oid: Oid) -> Option<&'static PgUserMapping> {
         let position = PG_USER_MAPPING.binary_search_by_key(&oid, |row| row.oid).ok()?;

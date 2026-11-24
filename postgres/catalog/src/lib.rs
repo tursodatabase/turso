@@ -19,6 +19,10 @@
 //! A column that refers to a row of another catalog holds that row's oid,
 //! as in PostgreSQL. 0 means that it refers to nothing.
 //!
+//! Each struct also has `CREATE_SQL` and `INDEX_SQL`: the `CREATE TABLE`
+//! and `CREATE INDEX` statements that store the catalog in a SQLite table.
+//! The documentation of `turso_pg_catalog_gen` gives the column types.
+//!
 //! The tables are generated from `upstream/postgres.bki`, which
 //! PostgreSQL's own build script produced, so the rows and their oids are
 //! PostgreSQL's. `upstream/README.md` says where the file comes from and
@@ -89,6 +93,38 @@ mod tests {
         let function = PgProc::by_oid(int8_to_int2.castfunc).unwrap();
         assert_eq!(function.proname, "int2");
         assert_eq!(function.proargtypes, [20]);
+    }
+
+    #[test]
+    fn a_catalog_has_the_sql_of_a_sqlite_table() {
+        assert_eq!(
+            PgCast::CREATE_SQL,
+            "CREATE TABLE pg_cast(oid INTEGER PRIMARY KEY, castsource INTEGER NOT NULL, \
+             casttarget INTEGER NOT NULL, castfunc INTEGER NOT NULL, \
+             castcontext TEXT NOT NULL, castmethod TEXT NOT NULL)"
+        );
+        assert_eq!(
+            PgCast::INDEX_SQL,
+            ["CREATE UNIQUE INDEX pg_cast_source_target_index ON pg_cast(castsource, casttarget)"]
+        );
+        // pg_depend has no oid and two indexes that are not unique.
+        assert_eq!(
+            PgDepend::INDEX_SQL,
+            [
+                "CREATE INDEX pg_depend_depender_index ON pg_depend(classid, objid, objsubid)",
+                "CREATE INDEX pg_depend_reference_index ON pg_depend(refclassid, refobjid, refobjsubid)",
+            ]
+        );
+        assert!(
+            PgDepend::CREATE_SQL.starts_with("CREATE TABLE pg_depend(classid INTEGER NOT NULL,")
+        );
+        // pg_proc keeps the unique index on its name and argument types.
+        assert_eq!(
+            PgProc::INDEX_SQL,
+            [
+                "CREATE UNIQUE INDEX pg_proc_proname_args_nsp_index ON pg_proc(proname, proargtypes, pronamespace)"
+            ]
+        );
     }
 
     #[test]

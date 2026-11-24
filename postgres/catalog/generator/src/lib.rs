@@ -24,21 +24,57 @@
 //! `_null_` is NULL. A value with a space or punctuation is in single
 //! quotes, and a quote inside it is written twice.
 //!
-//! The generator has four parts, one in each module:
+//! The generator has five parts, one in each module:
 //!
 //! - `grammar` reads the commands of the file with chumsky parsers.
 //! - `bki` puts the rows of each catalog together.
 //! - `column` gives a column its Rust type and a value its Rust expression.
+//! - `sql` writes the `CREATE TABLE` and `CREATE INDEX` statements of a
+//!   catalog.
 //! - `emit` writes the struct, the table and the lookup of a catalog.
 //!
 //! Each catalog of the file gets a struct and a table. A catalog without
 //! built-in rows gets an empty table. A catalog gets a lookup by oid when
 //! a unique index of the file is on its first column alone.
+//!
+//! # The catalog as a SQLite table
+//!
+//! Each catalog also gets the SQL that stores it in a SQLite table:
+//! `CREATE_SQL`, a `CREATE TABLE` statement with the columns of the file
+//! in their order, and `INDEX_SQL`, a `CREATE INDEX` statement for each
+//! `declare index` and `declare unique index` line of the catalog, with
+//! the name of the index in PostgreSQL. The statements have no collations
+//! and no operator classes.
+//!
+//! A column is `NOT NULL` when PostgreSQL makes it NOT NULL: the column
+//! list forces it with `FORCE NOT NULL`, or the column and each column
+//! before it have a type of fixed width, as `genbki.pl` decides. When a
+//! unique index is on the column `oid` alone, `oid` is the
+//! `INTEGER PRIMARY KEY`, and `INDEX_SQL` leaves out that index.
+//!
+//! The column types are those that the PostgreSQL frontend gives its
+//! catalog tables:
+//!
+//! | bki type                                          | SQLite type |
+//! |---------------------------------------------------|-------------|
+//! | `oid`, `regproc`, `xid`, `int2`, `int4`, `int8`   | `INTEGER`   |
+//! | `bool`                                            | `BOOLEAN`   |
+//! | `float4`                                          | `REAL`      |
+//! | `char`, `name`, `text`, `pg_node_tree`            | `TEXT`      |
+//! | `oidvector`, `int2vector` and each array type     | `TEXT`      |
+//! | `timestamptz`, `pg_lsn`, `anyarray`, `_pg_statistic`, `pg_ndistinct`, `pg_dependencies`, `pg_mcv_list` | `TEXT` |
+//! | `bytea`                                           | `BLOB`      |
+//!
+//! An array is `TEXT` and not an array type such as `TEXT[]`, because core
+//! decodes arrays only in STRICT tables, and a seeded table cannot be
+//! STRICT. A `regproc` holds the oid of a function, as PostgreSQL stores
+//! it.
 
 mod bki;
 mod column;
 mod emit;
 mod grammar;
+mod sql;
 
 /// The Rust source of a struct and a table for each catalog of the file,
 /// from the text of `postgres.bki`. Fails when the file has something this
