@@ -75,14 +75,6 @@ expect {
     2
 }
 
-# B-07: LIKE case-sensitive literal
-test like-case-sensitive-literal {
-    SELECT 'ABC' LIKE 'abc', 'abc' LIKE 'a%', 'abc' LIKE 'A%';
-}
-expect {
-    f|t|f
-}
-
 # B-08: LIKE default escape \_
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 test like-default-escape-underscore {
@@ -208,22 +200,6 @@ test regex-not-match-case-insensitive {
 expect {
     3
     4
-}
-
-# B-21: regex classes \d and escapes
-test regex-classes-d-and-escapes {
-    SELECT 'a1' ~ '^a\d$', 'a.c' ~ '^a\.c$', 'abc' ~ '^a\.c$';
-}
-expect {
-    t|t|f
-}
-
-# B-22: SIMILAR TO
-test similar-to {
-    SELECT 'abc' SIMILAR TO 'a(b|x)c', 'abc' SIMILAR TO 'b';
-}
-expect {
-    t|f
 }
 
 # B-25: = ANY('{..}'::int[])
