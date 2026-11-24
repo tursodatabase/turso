@@ -456,9 +456,10 @@ pub struct TypeDef {
     /// built-in date and time types, which store one text form with a 4-digit
     /// year. False for a domain, whose index then serves only `=`.
     pub stored_form_sorts_in_value_order: bool,
-    /// FIXME(pg-catalog): This field hand-codes which pg_cast entries leave a type that reads text. A lookup in a pg_cast table replaces this.
+    /// FIXME(pg-catalog): This field hand-codes that pg_cast has entries from jsonb to boolean, smallint, integer, bigint, real, double precision and numeric, and none from the other types that read text. A lookup in a pg_cast table replaces this.
     /// Whether values of the type may be cast to number and boolean types, as
-    /// PostgreSQL casts jsonb to integer, numeric, float8 and boolean. A CAST
+    /// PostgreSQL casts jsonb to the integer types, real, double precision,
+    /// numeric and boolean. A CAST
     /// from a type that reads text is refused otherwise (see
     /// `Schema::refuses_non_text_input`). False for a domain, user type and
     /// STRUCT or UNION; a domain takes the answer of the types under it.

@@ -134,9 +134,10 @@ pub trait Type: Debug + Send + Sync {
         false
     }
 
-    /// FIXME(pg-catalog): This hand-codes the pg_cast entries from jsonb to numbers and booleans. A lookup in a pg_cast table replaces this.
+    /// FIXME(pg-catalog): This hand-codes the pg_cast entries from jsonb to boolean, smallint, integer, bigint, real, double precision and numeric. A lookup in a pg_cast table replaces this.
     /// Whether values of the type may be cast to number and boolean types, as
-    /// PostgreSQL casts jsonb to integer, numeric, float8 and boolean.
+    /// PostgreSQL casts jsonb to the integer types, real, double precision,
+    /// numeric and boolean.
     fn casts_to_numbers_and_booleans(&self) -> bool {
         false
     }
