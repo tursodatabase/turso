@@ -3,11 +3,11 @@
 use crate::ast;
 use crate::dialect::{
     Catalog, CatalogCmd, CmdContext, CreateIndex, CreateMaterializedView, CreateSequence,
-    CreateTable, CreateTrigger, CreateView, CreateVirtualTable, DropIndex, DropSequence, DropTable,
-    DropTrigger, DropView, TableText,
+    CreateTable, CreateTrigger, CreateType, CreateView, CreateVirtualTable, DropIndex,
+    DropSequence, DropTable, DropTrigger, DropType, DropView, TableText,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
-use crate::schema::BTreeTable;
+use crate::schema::{BTreeTable, TURSO_TYPES_TABLE_NAME};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
@@ -66,6 +66,8 @@ impl Catalog for SqliteCatalog {
             CatalogCmd::CreateVirtualTable(table) => {
                 emit_create_virtual_table_row(program, ctx, table)
             }
+            CatalogCmd::CreateType(ty) => emit_create_type_row(program, ctx, ty),
+            CatalogCmd::DropType(ty) => emit_delete_type_row(program, ctx, ty),
         }
     }
 }
@@ -975,6 +977,130 @@ fn emit_create_virtual_table_row(
         0,
         Some(table.sql.to_string()),
     )
+}
+
+/// Writes the row of a new type or domain into the types table. It creates
+/// the table first when the database has none.
+fn emit_create_type_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    ty: &CreateType<'_>,
+) -> Result<()> {
+    let resolver = ctx.resolver;
+    let types_table: Arc<BTreeTable>;
+    let types_root_page: RegisterOrLiteral<i64>;
+    if let Some(existing) = resolver
+        .schema()
+        .get_btree_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME)
+    {
+        types_root_page = RegisterOrLiteral::Literal(existing.root_page);
+        types_table = existing;
+    } else {
+        let created = emit_create_internal_table(
+            program,
+            resolver,
+            TURSO_TYPES_TABLE_NAME,
+            &format!("CREATE TABLE {TURSO_TYPES_TABLE_NAME}(name TEXT PRIMARY KEY, sql TEXT)"),
+        )?;
+        (types_table, types_root_page) = (created.table, created.root_page);
+    }
+
+    let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: types_cursor_id,
+        root_page: types_root_page,
+        db: MAIN_DB_ID,
+    });
+
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: types_cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+    let name_reg = program.emit_string8_new_reg(ty.name.to_string());
+    program.emit_string8_new_reg(ty.sql.to_string());
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(name_reg),
+        count: to_u32(2),
+        dest_reg: to_u32(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: types_cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: TURSO_TYPES_TABLE_NAME.to_string(),
+    });
+    Ok(())
+}
+
+/// Deletes the row of a type or domain from the types table.
+fn emit_delete_type_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    ty: &DropType<'_>,
+) -> Result<()> {
+    let types_table = ctx
+        .resolver
+        .schema()
+        .get_btree_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME)
+        .ok_or_else(|| crate::LimboError::ParseError(format!("no such type: {}", ty.name)))?;
+    let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: types_cursor_id,
+        root_page: types_table.root_page.into(),
+        db: MAIN_DB_ID,
+    });
+
+    let name_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        dest: name_reg,
+        value: ty.name.to_string(),
+    });
+
+    let end_loop_label = program.allocate_label();
+    let loop_start_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: types_cursor_id,
+        pc_if_empty: end_loop_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
+
+    let col0_reg = program.alloc_register();
+    program.emit_column_or_rowid(types_cursor_id, 0, col0_reg);
+
+    let skip_delete_label = program.allocate_label();
+
+    program.emit_insn(Insn::Ne {
+        lhs: col0_reg,
+        rhs: name_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+
+    program.emit_insn(Insn::Delete {
+        cursor_id: types_cursor_id,
+        table_name: TURSO_TYPES_TABLE_NAME.to_string(),
+        is_part_of_update: false,
+    });
+
+    program.preassign_label_to_next_insn(skip_delete_label);
+
+    program.emit_insn(Insn::Next {
+        cursor_id: types_cursor_id,
+        pc_if_next: loop_start_label,
+        fullscan: false,
+        is_index: false,
+    });
+
+    program.preassign_label_to_next_insn(end_loop_label);
+    Ok(())
 }
 
 /// Creates one of the engine's own tables in the main database the first
