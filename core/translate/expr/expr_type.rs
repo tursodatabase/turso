@@ -153,7 +153,7 @@ impl ExprType {
 impl std::fmt::Display for ExprType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Custom { type_def, .. } => f.write_str(&type_def.name),
+            Self::Custom { type_def, .. } => f.write_str(&type_def.display_name),
             Self::Array { element, .. } if element.is_unknown_element() => f.write_str("anyarray"),
             Self::Array {
                 element,

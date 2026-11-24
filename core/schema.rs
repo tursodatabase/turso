@@ -450,6 +450,8 @@ impl ResolvedType {
 #[derive(Debug, Clone)]
 pub struct TypeDef {
     pub name: String,
+    /// The name of the type in error messages.
+    pub display_name: String,
     pub is_builtin: bool,
     pub not_null: bool,
     /// Whether this is a domain (CREATE DOMAIN) vs a custom type (CREATE TYPE).
@@ -791,6 +793,7 @@ impl TypeDef {
                     .try_collect()?;
                 Self {
                     name: type_name.to_string(),
+                    display_name: type_name.to_string(),
                     is_builtin: false,
                     not_null: false,
                     is_domain: false,
@@ -827,6 +830,7 @@ impl TypeDef {
                     .try_collect()?;
                 Self {
                     name: type_name.to_string(),
+                    display_name: type_name.to_string(),
                     is_builtin: false,
                     not_null: false,
                     is_domain: false,
@@ -857,6 +861,7 @@ impl TypeDef {
     ) -> Self {
         Self {
             name: ty.name().to_string(),
+            display_name: ty.display_name().to_string(),
             is_builtin,
             not_null: false,
             is_domain: false,
@@ -893,6 +898,7 @@ impl TypeDef {
     ) -> Self {
         Self {
             name: domain_name.to_string(),
+            display_name: domain_name.to_string(),
             is_builtin: false,
             not_null,
             is_domain: true,

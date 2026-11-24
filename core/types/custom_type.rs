@@ -79,6 +79,11 @@ pub trait Type: Debug + Send + Sync {
     /// The name of the type, in lowercase.
     fn name(&self) -> &str;
 
+    /// The name of the type in error messages. It is the name by default.
+    fn display_name(&self) -> &str {
+        self.name()
+    }
+
     /// Other names of the type, such as `bool` for `boolean`.
     fn aliases(&self) -> &[&str] {
         &[]

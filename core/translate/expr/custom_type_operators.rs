@@ -504,7 +504,7 @@ impl<'a> Operand<'a> {
     /// The operand's type for an error message: `date`, `integer`, ...
     fn type_name(&self) -> String {
         match (&self.value_type, self.expr_type) {
-            (Some(ty), _) => ty.type_def.name.clone(),
+            (Some(ty), _) => ty.type_def.display_name.clone(),
             // A value whose type is only known when the statement runs, such as
             // the result of json_extract().
             (
