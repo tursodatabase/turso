@@ -179,7 +179,11 @@ pub use io::{
     SyscallIO, WriteCompletion, IO,
 };
 pub use namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
-pub use numeric::{decimal::format_numeric_text, nonnan::NonNan, Numeric};
+pub use numeric::{
+    decimal::{format_numeric_text, Decimal},
+    nonnan::NonNan,
+    Numeric,
+};
 pub use schema::load::{LoadQuery, LoadStep, QueryFailure, SchemaLoad};
 pub use security::roles::SessionRole;
 pub use statement::{
@@ -207,7 +211,9 @@ pub use turso_macros::{
 };
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
-pub use vdbe::array::{array_values_from_any, parse_text_array_of_texts, text_array_literal};
+pub use vdbe::array::{
+    array_contains_all, array_values_from_any, parse_text_array_of_texts, text_array_literal,
+};
 pub use vdbe::builder::{CursorType, ProgramBuilder};
 pub use vdbe::insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
 pub use vdbe::{

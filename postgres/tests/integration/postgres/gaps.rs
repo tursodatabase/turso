@@ -457,11 +457,9 @@ fn gap_b_32_int_1_int(db: TempDatabase) {
     assert_eq!(out, "1");
 }
 
-// B-44 (S1): jsonb @> $1::jsonb param
-// tursopg: jsonb @> with a param returns no rows.
-// PostgreSQL: 2
+// B-44: jsonb @> $1::jsonb param
 #[turso_macros::test(views)]
-fn gap_b_44_tursopg_returns_wrong_result_jsonb_1_jsonb_param(db: TempDatabase) {
+fn gap_b_44_jsonb_1_jsonb_param(db: TempDatabase) {
     let out = GapCase {
         setup: &[
             "CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean)",
@@ -472,7 +470,7 @@ fn gap_b_44_tursopg_returns_wrong_result_jsonb_1_jsonb_param(db: TempDatabase) {
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "");
+    assert_eq!(out, "2");
 }
 
 // B-54: jsonb ->  param key

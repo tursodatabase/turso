@@ -412,6 +412,10 @@ impl Dialect for PostgresDialect {
     fn text_input_types_refuse_other_kinds(&self) -> bool {
         true
     }
+
+    fn json_contains_function(&self) -> Option<&'static str> {
+        Some("jsonb_contains")
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {

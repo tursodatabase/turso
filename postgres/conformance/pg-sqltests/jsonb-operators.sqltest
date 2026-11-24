@@ -1,11 +1,11 @@
-# The jsonb operators -> and ->>. The Data API turns a filter on a jsonb
-# field into `data ->> 'field' = 'value'`.
+# The jsonb operators ->, ->>, @> and <@. The Data API turns a filter on a
+# jsonb field into `data ->> 'field' = 'value'`.
 #
 # -> returns the field as JSON text, and ->> returns it as text: a string has
 # no quotes, a number is written as jsonb writes it (`1e2` as `100`), a
 # boolean is `true` or `false`, and a JSON null is NULL. A text key is the
 # name of a field, not a JSON path, and of two fields with the same name the
-# last one counts.
+# last one counts. @> and <@ compare jsonb values by containment.
 
 @database :memory:
 
@@ -286,3 +286,315 @@ test jsonb-arrow-in-added-generated-column-errors {
 }
 @sqlstate 0A000
 expect error {}
+
+# @>
+
+@setup items_with_jsonb_rows
+test jsonb-contains-field {
+    SELECT id FROM items WHERE data @> '{"qty":2}';
+}
+expect {
+    2
+}
+
+@setup items_with_jsonb_rows
+test jsonb-contains-several-fields {
+    SELECT id FROM items WHERE data @> '{"name":"apple","active":true}';
+}
+expect {
+    1
+}
+
+@setup items_with_jsonb_rows
+test jsonb-contains-part-of-nested-object {
+    SELECT id FROM items WHERE data @> '{"dims":{"w":3}}';
+}
+expect {
+    1
+}
+
+@setup items_with_jsonb_rows
+test jsonb-contains-array-elements-in-any-order {
+    SELECT id FROM items WHERE data @> '{"tags":["red","fruit"]}';
+}
+expect {
+    1
+}
+
+@setup items_with_jsonb_rows
+test jsonb-contains-compares-numbers-by-value {
+    SELECT id FROM items WHERE data @> '{"price":1.5}';
+}
+expect {
+    1
+}
+
+@setup items_with_jsonb_rows
+test jsonb-contains-empty-object-matches-objects-only {
+    SELECT id FROM items WHERE data @> '{}' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup items_with_jsonb_rows
+test jsonb-contains-elements-of-top-level-array {
+    SELECT id FROM items WHERE data @> '[3,1]';
+}
+expect {
+    3
+}
+
+@setup items_with_jsonb_rows
+test jsonb-contains-scalar-in-top-level-array {
+    SELECT id FROM items WHERE data @> '2';
+}
+expect {
+    3
+}
+
+# The string "2" does not match the number 2.
+@setup items_with_jsonb_rows
+test jsonb-contains-does-not-match-string-to-number {
+    SELECT id FROM items WHERE NOT (data @> '{"qty":"2"}') ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+# Containment does not look for the field at a deeper level.
+@setup items_with_jsonb_rows
+test jsonb-contains-does-not-match-nested-field-at-top-level {
+    SELECT id FROM items WHERE NOT (data @> '{"w":3}') ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup items_with_jsonb_rows
+test jsonb-contains-of-null-is-null {
+    SELECT id FROM items WHERE (data @> '{}') IS NULL;
+}
+expect {
+    4
+}
+
+# <@
+
+@setup items_with_jsonb_rows
+test jsonb-contained-by-object {
+    SELECT id FROM items WHERE data <@ '{"name":"bread","price":2,"qty":2,"active":false,"tags":["bakery","extra"],"dims":{"w":20,"h":10,"d":5},"note":null,"x":1}';
+}
+expect {
+    2
+}
+
+@setup items_with_jsonb_rows
+test jsonb-contained-by-array {
+    SELECT id FROM items WHERE data <@ '[3,2,1,0]';
+}
+expect {
+    3
+}
+
+@setup items_with_jsonb_rows
+test jsonb-contained-by-does-not-match-object-with-more-fields {
+    SELECT id FROM items WHERE NOT (data <@ '{"name":"apple"}') ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+# More rules of @> and <@
+
+# The tests that follow cast each comparison to int, so that the result does
+# not depend on B-04, where a boolean prints as 0 or 1 instead of f or t.
+
+# A scalar document is an array with one element in jsonb, so a scalar
+# contains an equal scalar, and an array contains each of its elements.
+test jsonb-contains-scalar-documents {
+    SELECT ('1'::jsonb @> '1')::int, ('"a"'::jsonb <@ '["a","b"]')::int, ('null'::jsonb @> 'null')::int, ('true'::jsonb @> 'false')::int;
+}
+expect {
+    1|1|1|0
+}
+
+test jsonb-contains-takes-the-last-of-two-equal-keys {
+    SELECT ('{"a":1,"a":2}'::jsonb @> '{"a":2}')::int, ('{"a":1,"a":2}'::jsonb @> '{"a":1}')::int, ('{"a":2}'::jsonb @> '{"a":1,"a":2}')::int;
+}
+expect {
+    1|0|1
+}
+
+test jsonb-contains-empty-object-or-array {
+    SELECT ('{"a":1}'::jsonb @> '{}')::int, ('[1]'::jsonb @> '[]')::int, ('{}'::jsonb @> '[]')::int, ('[]'::jsonb @> '{}')::int, ('1'::jsonb @> '[]')::int;
+}
+expect {
+    1|1|0|0|0
+}
+
+# Only at the top level does an array contain a scalar.
+test jsonb-contains-nested-arrays {
+    SELECT ('[[1,2]]'::jsonb @> '[[2]]')::int, ('[[1,2]]'::jsonb @> '[2]')::int, ('[{"a":1,"b":2}]'::jsonb @> '[{"a":1}]')::int, ('[[1]]'::jsonb @> '[{}]')::int;
+}
+expect {
+    1|0|1|0
+}
+
+test jsonb-contains-deeply-nested-values {
+    SELECT ('{"a":{"b":[1,{"c":2}]}}'::jsonb @> '{"a":{"b":[{"c":2}]}}')::int, ('{"a":[1,2,3]}'::jsonb @> '{"a":[3,3]}')::int;
+}
+expect {
+    1|1
+}
+
+test jsonb-contains-compares-numbers-as-exact-decimals {
+    SELECT ('[1e2]'::jsonb @> '[100]')::int, ('{"n":-0}'::jsonb @> '{"n":0}')::int, ('[12345678901234567890]'::jsonb @> '[12345678901234567891]')::int, ('[0.1]'::jsonb @> '[1e-1]')::int;
+}
+expect {
+    1|1|0|1
+}
+
+test jsonb-contains-compares-strings-after-escapes {
+    SELECT ('{"a":"é"}'::jsonb @> '{"a":"é"}')::int;
+}
+expect {
+    1
+}
+
+test jsonb-contains-null-value-is-not-a-missing-field {
+    SELECT ('{"a":null}'::jsonb @> '{"a":null}')::int, ('{}'::jsonb @> '{"a":null}')::int, ('{"a":1}'::jsonb @> '{"a":null}')::int;
+}
+expect {
+    1|0|0
+}
+
+test jsonb-contains-input-nested-1000-levels {
+    SELECT ((repeat('[', 1000) || repeat(']', 1000))::jsonb @> (repeat('[', 999) || repeat(']', 999))::jsonb)::int;
+}
+expect {
+    1
+}
+
+test jsonb-contains-objects-nested-1000-levels {
+    SELECT ((repeat('{"a":', 1000) || '1' || repeat('}', 1000))::jsonb @> (repeat('{"a":', 1000) || '1' || repeat('}', 1000))::jsonb)::int;
+}
+expect {
+    1
+}
+
+test jsonb-contains-of-deeply-nested-input-errors {
+    SELECT '[1]'::jsonb @> (repeat('[', 50000) || repeat(']', 50000))::jsonb;
+}
+@sqlstate 54001
+expect error {}
+
+test jsonb-contains-invalid-json-errors {
+    SELECT '{"a":1}'::jsonb @> 'not json';
+}
+@sqlstate 22P02
+expect error {}
+
+# jsonb stores a number as numeric, which has at most 131072 digits before the
+# decimal point.
+test jsonb-contains-of-number-beyond-numeric-limits-errors {
+    SELECT ('[1e131071]'::jsonb @> '[1e131071]')::int;
+    SELECT '[1]'::jsonb @> '[1e131072]';
+}
+@sqlstate 22003
+expect error {}
+
+test bytea-contains-errors {
+    SELECT '\x01'::bytea @> '{}';
+}
+@sqlstate 42883
+expect error {}
+
+# Core does not know that a column of a VALUES list or of a table that CREATE
+# TABLE AS made is an array, so it runs the jsonb function for @> and <@ on
+# such a column. That function compares two arrays as arrays.
+test array-contains-of-values-list-column {
+    SELECT count(*) FROM (VALUES (ARRAY['a','b'])) v(x) WHERE x @> '{a}';
+    SELECT count(*) FROM (VALUES (ARRAY['a','b'])) v(x) WHERE x <@ '{a}';
+}
+expect {
+    1
+    0
+}
+
+test array-contains-of-cte-and-view-of-values-list {
+    CREATE VIEW jc_tag_view AS SELECT * FROM (VALUES (ARRAY['a','b'])) v(x);
+    WITH tags(x) AS (VALUES (ARRAY['a','b'])) SELECT count(*) FROM tags WHERE '{b}' <@ x;
+    SELECT count(*) FROM jc_tag_view WHERE x @> '{a,b}';
+}
+expect {
+    1
+    1
+}
+
+test array-contains-of-create-table-as-column {
+    CREATE TABLE jc_tag_copy AS SELECT ARRAY['a','b'] AS tags, ARRAY[1,2] AS ids;
+    SELECT count(*) FROM jc_tag_copy WHERE tags @> '{a}' AND ids @> '{2}' AND NOT (tags @> '{c}');
+}
+expect {
+    1
+}
+
+test jsonb-contains-in-check-constraint {
+    CREATE TABLE jc_stock (data jsonb CHECK (data @> '{"kind":"fruit"}'));
+    INSERT INTO jc_stock VALUES ('{"kind":"fruit","n":1}');
+    INSERT INTO jc_stock VALUES ('{"kind":"bread"}');
+}
+@sqlstate 23514
+expect error {}
+
+# PostgreSQL roles belong to the whole server, so the test uses its own role
+# and table names.
+test jsonb-contains-in-row-security-policy {
+    CREATE ROLE jc_reader_1;
+    CREATE TABLE jc_docs_1 (id int PRIMARY KEY, data jsonb);
+    INSERT INTO jc_docs_1 VALUES (1, '{"readers":["jc_reader_1","x"]}'), (2, '{"readers":["x"]}'), (3, '{"readers":[]}');
+    GRANT SELECT ON jc_docs_1 TO jc_reader_1;
+    ALTER TABLE jc_docs_1 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY jc_readers_1 ON jc_docs_1 FOR SELECT USING (data @> '{"readers":["jc_reader_1"]}');
+    SET ROLE jc_reader_1;
+    SELECT id FROM jc_docs_1;
+    RESET ROLE;
+}
+expect {
+    1
+}
+
+# An index expression can use only core functions, so an index on @> keeps
+# the array function. A query must not read such an index.
+@setup items_with_jsonb_rows
+test jsonb-contains-with-an-index-on-the-same-expression {
+    CREATE INDEX items_fruit ON items ((data @> '{"tags":["fruit"]}'));
+    SELECT id FROM items WHERE data @> '{"tags":["fruit"]}';
+}
+expect {
+    1
+}
+
+# A generation expression can use only core functions too, so a generated
+# column keeps the array function, which gives NULL for jsonb values.
+# TODO let generated columns use frontend functions
+@compat-gap "operator:jsonb @> jsonb"
+test jsonb-contains-in-generated-column-uses-the-array-function {
+    CREATE TABLE gen_tags (data text, fruit int GENERATED ALWAYS AS ((data::jsonb @> '{"tags":["fruit"]}')::int) STORED);
+    INSERT INTO gen_tags (data) VALUES ('{"tags":["fruit","red"]}');
+    SELECT coalesce(fruit, -1) FROM gen_tags;
+}
+expect {
+    1
+}
+expect @tursopg {
+    -1
+}

@@ -594,19 +594,23 @@ pub(crate) fn exec_array_overlap(a: &Value, b: &Value) -> Value {
 /// Returns 1 if every element in `b` appears in `a`, 0 otherwise.
 /// NULL if either input is not a valid array.
 pub(crate) fn exec_array_contains_all(a: &Value, b: &Value) -> Value {
-    if matches!(a, Value::Null) || matches!(b, Value::Null) {
-        return Value::Null;
+    match array_contains_all(a, b) {
+        Some(all_found) => Value::from_i64(all_found as i64),
+        None => Value::Null,
     }
-    let Some(elems_a) = array_values_from_any(a) else {
-        return Value::Null;
-    };
-    let Some(elems_b) = array_values_from_any(b) else {
-        return Value::Null;
-    };
+}
+
+/// Whether array `a` contains every element of array `b`, as `a @> b` compares
+/// two arrays. None when either value is NULL or not an array.
+pub fn array_contains_all(a: &Value, b: &Value) -> Option<bool> {
+    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        return None;
+    }
+    let elems_a = array_values_from_any(a)?;
+    let elems_b = array_values_from_any(b)?;
     // O(n log n + m log n) via BTreeSet instead of O(n*m)
     let set: BTreeSet<&Value> = elems_a.iter().collect();
-    let all_found = elems_b.iter().all(|eb| set.contains(eb));
-    Value::from_i64(all_found as i64)
+    Some(elems_b.iter().all(|eb| set.contains(eb)))
 }
 
 /// Collect values from contiguous registers into a record-format array blob.
