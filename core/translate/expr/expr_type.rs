@@ -624,14 +624,19 @@ pub(crate) fn compound_column_type<'p>(
     )
 }
 
-fn select_column_type(select: &SelectPlan, column: usize, resolver: &Resolver) -> ExprType {
-    match select.result_columns.get(column) {
-        Some(result_column) => type_of(
-            &result_column.expr,
-            &TypeEnv::new(Some(&select.table_references), resolver),
-        ),
-        None => ExprType::Unknown,
+/// The type of column `column` of one SELECT or VALUES list. The result
+/// columns of a VALUES list only hold its column names, so its type is the
+/// common type of the column in every row.
+pub(crate) fn select_column_type(
+    select: &SelectPlan,
+    column: usize,
+    resolver: &Resolver,
+) -> ExprType {
+    let env = TypeEnv::new(Some(&select.table_references), resolver);
+    if column >= select.result_columns.len() {
+        return ExprType::Unknown;
     }
+    common_type(select.column_exprs(column), &env)
 }
 
 /// The type of a column of a table or of the table being written. Derived

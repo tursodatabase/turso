@@ -2429,3 +2429,14 @@ test scalar-min-max-result-collation {
 expect {
     1|0
 }
+
+# The rows of a VALUES list are compared with BINARY here, so a COLLATE in
+# its second row does not make 'b' and 'B' duplicates.
+test compound-select-ignores-collate-in-later-values-row {
+    VALUES ('b'), ('B' COLLATE nocase) UNION SELECT 'a';
+}
+expect {
+    B
+    a
+    b
+}
