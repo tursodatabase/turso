@@ -1468,3 +1468,92 @@ test update-strict-generated-column-null-primary-key-still-fails {
 expect error {
     NOT NULL constraint failed: t.id
 }
+
+# An UPDATE trigger makes the UPDATE collect rowids first and then write each
+# row. A row whose rowid stays the same is overwritten in place, also when the
+# new record grows past the page size.
+@cross-check-integrity
+test update-after-trigger-overwrites-rows {
+    CREATE TABLE a(k INTEGER, v INTEGER, pad TEXT);
+    CREATE INDEX a_v ON a(v);
+    WITH r(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM r WHERE i<2000) INSERT INTO a SELECT i, 0, 'x' FROM r;
+    CREATE TABLE log(k, oldv, newv);
+    CREATE TRIGGER t1 AFTER UPDATE ON a BEGIN INSERT INTO log VALUES (new.k, old.v, new.v); END;
+    UPDATE a SET v = v + k, pad = CASE WHEN k % 3 = 0 THEN zeroblob(600) ELSE 'y' END WHERE k > 0;
+    SELECT count(*), sum(v), sum(length(pad)) FROM a;
+    SELECT count(*), sum(newv - oldv) FROM log;
+    SELECT k, v FROM a WHERE v BETWEEN 10 AND 13 ORDER BY k;
+}
+expect {
+    2000|2001000|400934
+    2000|2001000
+    10|10
+    11|11
+    12|12
+    13|13
+}
+
+# The BEFORE trigger inserts and deletes rows of the table under update, so the
+# UPDATE must find its row again before it overwrites it.
+@cross-check-integrity
+test update-before-trigger-writing-same-table-overwrites-rows {
+    CREATE TABLE n(i INTEGER);
+    WITH r(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM r WHERE i<40) INSERT INTO n SELECT i FROM r;
+    CREATE TABLE a(k INTEGER, v INTEGER, pad TEXT);
+    WITH r(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM r WHERE i<300) INSERT INTO a SELECT i, 0, 'x' FROM r;
+    CREATE TRIGGER b1 BEFORE UPDATE ON a WHEN old.k % 50 = 0 BEGIN
+      INSERT INTO a SELECT -old.k * 1000 - i, 0, zeroblob(200) FROM n;
+      DELETE FROM a WHERE k = old.k + 1;
+    END;
+    UPDATE a SET v = v + 1, pad = 'yy' WHERE k > 0;
+    SELECT count(*), sum(v), sum(k > 0), sum(length(pad)) FROM a;
+    SELECT k, v, pad FROM a WHERE k BETWEEN 48 AND 53 ORDER BY k;
+}
+expect {
+    535|295|295|48590
+    48|1|yy
+    49|1|yy
+    50|1|yy
+    52|1|yy
+    53|1|yy
+}
+
+# REPLACE deletes the conflicting row through the table cursor, so the UPDATE
+# must find its row again before it overwrites it.
+@cross-check-integrity
+test update-or-replace-with-trigger-overwrites-rows {
+    CREATE TABLE a(k INTEGER, u INTEGER UNIQUE, v INTEGER);
+    WITH r(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM r WHERE i<500) INSERT INTO a SELECT i, i, 0 FROM r;
+    CREATE TRIGGER t1 AFTER UPDATE ON a BEGIN SELECT 1; END;
+    UPDATE OR REPLACE a SET u = u + 1, v = v + 1 WHERE k % 2 = 1;
+    SELECT count(*), sum(u), sum(v) FROM a;
+    SELECT k, u, v FROM a ORDER BY rowid LIMIT 6;
+}
+expect {
+    250|62750|250
+    1|2|1
+    3|4|1
+    5|6|1
+    7|8|1
+    9|10|1
+    11|12|1
+}
+
+# The subquery makes the UPDATE collect rowids first and then write each row,
+# and RETURNING then reads the written row back from the table cursor. The new
+# record is smaller than the old one, so the overwritten cell moves on the page.
+@cross-check-integrity
+test update-two-pass-returning-reads-moved-cell {
+    CREATE TABLE u(x);
+    CREATE TABLE t(a BLOB, b TEXT);
+    WITH r(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM r WHERE i<40) INSERT INTO t SELECT zeroblob(40), 'row' || i FROM r;
+    UPDATE t SET a = X'5859' WHERE rowid % 10 = 0 AND rowid NOT IN (SELECT x FROM u) RETURNING hex(a), b;
+    SELECT count(*), sum(length(a)) FROM t;
+}
+expect {
+    5859|row10
+    5859|row20
+    5859|row30
+    5859|row40
+    40|1448
+}

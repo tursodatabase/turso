@@ -1,0 +1,49 @@
+---
+source: modifications.sqltest
+expression: UPDATE a SET v = v + 1 WHERE k > 0;
+info:
+  statement_type: UPDATE
+  tables:
+  - a
+  setup_blocks:
+  - after_update_trigger
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN a
+
+BYTECODE
+addr  opcode         p1  p2  p3  p4                  p5  comment
+   0  Init            0  25   0                       0  Start at 25
+   1  OpenEphemeral   0   1   0                       0  cursor=0 is_table=true
+   2  OpenRead        1   2   0  k(3,B,B)             0  table=a, root=2, iDb=0
+   3  Rewind          1  10   0                       0  Rewind table a
+   4    Column        1   0   3                       0  r[3]=a.k
+   5    Le            3   4   9  Binary               0  if r[3]<=r[4] goto 9
+   6    RowId         1   1   0                       0  r[1]=a.rowid
+   7    MakeRecord    1   1   5                       0  r[5]=mkrec(r[1..1]); for ephemeral_scratch
+   8    Insert        0   5   1  ephemeral_scratch    6  intkey=r[1] data=r[5]
+   9  Next            1   4   0                       1
+  10  OpenWrite       1   2   0                       0  root=2; iDb=0
+  11  Rewind          0  24   0                       0  Rewind table ephemeral(ephemeral_scratch)
+  12    RowId         0   6   0                       0  r[6]=ephemeral(ephemeral_scratch).rowid
+  13    NotExists     1  23   6                       0
+  14    Column        1   0   7                       0  r[7]=a.k
+  15    Column        1   1   9                       0  r[9]=a.v
+  16    Add           9  10   8                       0  r[8]=r[9]+r[10]
+  17    Affinity      7   2   0                       0  r[7..9] = D, D
+  18    ColumnRange   1   0  11  2                    0  r[11..12]=a.k..v
+  19    MakeRecord    7   2  13                       0  r[13]=mkrec(r[7..8])
+  20    Insert        1  13   6  a                    8  intkey=r[6] data=r[13]
+  21    ResetOnce    23   0   0                       0  clear once flags before 23
+  22    Program       0  23   0  trigger subprogram   0  subprogram=trigger subprogram
+  23  Next            0  12   0                       1
+  24  Halt            0   0   0                       0
+  25  Transaction     0   2   2                       0  iDb=0 tx_mode=Write
+  26  Integer         0   4   0                       0  r[4]=0
+  27  Integer         1  10   0                       0  r[10]=1
+  28  Goto            0   1   0                       0
+   0  Init            0   1   0                       0  Start at 1
+   1  Integer         1   1   0                       0  r[1]=1
+   2  ResultRow       1   1   0                       0  output=r[1]
+   3  Halt            0   0   0  trigger              0
