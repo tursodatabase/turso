@@ -32,7 +32,8 @@ use crate::translate::catalog::CatalogContext;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{prepare_cdc_if_necessary, Resolver};
 use crate::translate::expr::expr_type::{
-    base_value_type, decode_type, first_and_third_arguments, iif_values, value_type, ExprType,
+    base_value_type, decode_type, first_and_third_arguments, iif_values, query_column_type,
+    value_type, ExprType,
 };
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
@@ -913,6 +914,7 @@ pub(crate) fn validate_generated_function_calls(
 struct CtasInfo {
     plan: Plan,
     schema_sql: String,
+    column_names: Vec<String>,
 }
 
 /// Pre-plan the SELECT to derive the schema for a CTAS table.
@@ -974,14 +976,14 @@ fn derive_ctas_schema(
     let mut sql_parts = Vec::with_capacity(result_columns.len());
     let mut col_defs = Vec::with_capacity(result_columns.len());
 
-    for (column_index, (col, name)) in result_columns.iter().zip(names).enumerate() {
+    for (column_index, (col, name)) in result_columns.iter().zip(&names).enumerate() {
         // Names come from the leftmost arm, but compound affinity can weaken its type.
         let ty = compound_arms
             .as_ref()
             .map(|arms| compound_column_affinity(arms, column_index).short_type_name())
             .unwrap_or_else(|| col.declared_type(table_refs));
 
-        let quoted = quote_identifier(&name);
+        let quoted = quote_identifier(name);
         if ty.is_empty() {
             sql_parts.push(quoted);
         } else {
@@ -998,7 +1000,7 @@ fn derive_ctas_schema(
             })
         };
         col_defs.push(ColumnDefinition {
-            col_name: ast::Name::exact(name),
+            col_name: ast::Name::exact(name.clone()),
             col_type,
             constraints: vec![],
         });
@@ -1006,9 +1008,41 @@ fn derive_ctas_schema(
 
     let info = CtasInfo {
         plan,
+        column_names: names,
         schema_sql: format!("CREATE TABLE {table_name_in_sql}({})", sql_parts.join(",")),
     };
     Ok((info, col_defs))
+}
+
+/// The new CTAS table types its columns with SQLite declared types, so the
+/// dialect decides what happens to a column of a custom type before the table
+/// is created. Every arm of a compound select is checked.
+fn check_ctas_column_types(
+    plan: &Plan,
+    names: &[String],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let dialect = connection.dialect();
+    for (column_index, name) in names.iter().enumerate() {
+        let ty = query_column_type(plan, column_index, resolver);
+        let element = match &ty {
+            ExprType::Array { element, .. } => element.as_ref(),
+            scalar => scalar,
+        };
+        match element {
+            ExprType::Custom { type_def, .. }
+                if type_def.is_domain || type_def.changes_stored_value() =>
+            {
+                dialect.check_ctas_column_type(name, Some(&type_def.name))?
+            }
+            // An expression that cannot be typed here, such as DEFAULT, could
+            // be a custom type.
+            ExprType::NotKnownYet => dialect.check_ctas_column_type(name, None)?,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Emit bytecode to populate a newly-created CTAS table from the SELECT.
@@ -1262,6 +1296,12 @@ pub fn translate_create_table(
                 }
             }
         }
+    }
+
+    // The column types are checked after the name is known to be free, so IF NOT
+    // EXISTS on an existing table succeeds whatever the SELECT returns.
+    if let Some(info) = &ctas_info {
+        check_ctas_column_types(&info.plan, &info.column_names, resolver, connection)?;
     }
 
     // Like SQLite, the body is only checked when the table is really created,

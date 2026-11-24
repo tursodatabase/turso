@@ -400,6 +400,22 @@ impl Dialect for PostgresDialect {
         false
     }
 
+    fn check_ctas_column_type(&self, column: &str, type_name: Option<&str>) -> Result<()> {
+        let message = match type_name {
+            Some(type_name) => format!(
+                "CREATE TABLE AS with a column of type {type_name} is not supported (column \"{column}\")"
+            ),
+            None => format!(
+                "CREATE TABLE AS with a column whose type cannot be determined is not supported (column \"{column}\")"
+            ),
+        };
+        Err(crate::error::sqlstate_error(
+            turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+            message,
+            None,
+        ))
+    }
+
     fn mod_of_integers_is_integer(&self) -> bool {
         true
     }
