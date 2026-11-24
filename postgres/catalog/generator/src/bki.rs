@@ -11,8 +11,26 @@ pub(crate) struct Catalog {
     pub(crate) name: String,
     pub(crate) columns: Vec<Column>,
     pub(crate) rows: Vec<Vec<Token>>,
-    /// The columns of each unique index of the catalog.
-    pub(crate) unique_indexes: Vec<Vec<String>>,
+    /// The indexes of the catalog, in the order of the file.
+    pub(crate) indexes: Vec<Index>,
+}
+
+impl Catalog {
+    /// Whether a unique index of the catalog is on `column` alone.
+    pub(crate) fn has_unique_index_on(&self, column: &str) -> bool {
+        self.indexes
+            .iter()
+            .any(|index| index.unique && index.columns == [column])
+    }
+}
+
+/// An index that a `declare index` or `declare unique index` line declares.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Index {
+    pub(crate) name: String,
+    pub(crate) unique: bool,
+    /// The names of the key columns, without their operator classes.
+    pub(crate) columns: Vec<String>,
 }
 
 pub(crate) struct Column {
@@ -72,7 +90,7 @@ pub(crate) fn parse(bki: &str) -> Result<Vec<Catalog>, String> {
                     name: name.to_string(),
                     columns,
                     rows: Vec::new(),
-                    unique_indexes: Vec::new(),
+                    indexes: Vec::new(),
                 });
                 // A bootstrap catalog has no `open` line.
                 open = Some(catalogs.len() - 1);
@@ -98,13 +116,13 @@ pub(crate) fn parse(bki: &str) -> Result<Vec<Catalog>, String> {
                 }
                 catalog.rows.push(row);
             }
-            Statement::UniqueIndex { catalog, columns } => {
+            Statement::Index { catalog, index } => {
                 catalogs
                     .iter_mut()
                     .find(|candidate| candidate.name == catalog)
                     .ok_or_else(|| at(format!("index on {catalog}, which no create declared")))?
-                    .unique_indexes
-                    .push(columns.into_iter().map(str::to_string).collect());
+                    .indexes
+                    .push(index);
             }
             Statement::Other => {}
         }
@@ -175,16 +193,61 @@ mod tests {
     }
 
     #[test]
-    fn a_unique_index_is_kept_with_its_catalog_and_other_indexes_are_not() {
+    fn each_index_is_kept_with_its_catalog() {
         let bki = "create pg_amop 2602\n (\n oid = oid\n )\nopen pg_amop\nclose pg_amop\n\
                    declare unique index pg_amop_fam_strat_index 2653 on pg_amop using btree(amopfamily oid_ops, amopstrategy int2_ops)\n\
                    declare unique index pg_amop_oid_index 2756 on pg_amop using btree(oid oid_ops)\n\
                    declare index pg_amop_other_index 2757 on pg_amop using btree(amopmethod oid_ops)\n\
                    declare toast 2836 2837 on pg_amop\n";
         let catalogs = parse(bki).unwrap();
+        let index = |name: &str, unique: bool, columns: &[&str]| Index {
+            name: name.to_string(),
+            unique,
+            columns: columns.iter().map(|column| column.to_string()).collect(),
+        };
         assert_eq!(
-            catalogs[0].unique_indexes,
-            [vec!["amopfamily", "amopstrategy"], vec!["oid"]]
+            catalogs[0].indexes,
+            [
+                index(
+                    "pg_amop_fam_strat_index",
+                    true,
+                    &["amopfamily", "amopstrategy"]
+                ),
+                index("pg_amop_oid_index", true, &["oid"]),
+                index("pg_amop_other_index", false, &["amopmethod"]),
+            ]
+        );
+        assert!(catalogs[0].has_unique_index_on("oid"));
+        assert!(!catalogs[0].has_unique_index_on("amopmethod"));
+        assert!(!catalogs[0].has_unique_index_on("amopfamily"));
+    }
+
+    #[test]
+    fn a_malformed_index_declaration_stops_the_parse() {
+        let bki = "create pg_am 2601\n (\n oid = oid\n )\n\
+                   declare index pg_am_oid_index 2652 on pg_am using btree(oid)\n";
+        let error = parse(bki).err().unwrap();
+        assert!(error.starts_with("line 5: "), "{error}");
+    }
+
+    #[test]
+    fn the_file_of_postgresql_has_both_kinds_of_index() {
+        let catalogs = parse(include_str!("../../upstream/postgres.bki")).unwrap();
+        let indexes = catalogs.iter().flat_map(|catalog| &catalog.indexes);
+        let (unique, other): (Vec<&Index>, Vec<&Index>) = indexes.partition(|index| index.unique);
+        assert_eq!((unique.len(), other.len()), (110, 14));
+        let pg_depend = catalogs.iter().find(|c| c.name == "pg_depend").unwrap();
+        assert_eq!(
+            pg_depend.indexes[0],
+            Index {
+                name: "pg_depend_depender_index".to_string(),
+                unique: false,
+                columns: vec![
+                    "classid".to_string(),
+                    "objid".to_string(),
+                    "objsubid".to_string()
+                ],
+            }
         );
     }
 }
