@@ -58,6 +58,10 @@ impl ExternalFunc {
     /// each argument, with domain names kept (`receiving_argument_types`
     /// passes the domain's base type); an error refuses the statement. Needs
     /// `receiving_argument_types`.
+    // FIXME(pg-catalog): only pg_timestamp_plus_interval sets this. It stands in
+    // for PostgreSQL resolving an operator or function by its argument types
+    // from pg_operator or pg_proc when it plans the statement. A pg_proc and
+    // pg_operator lookup replaces this; remove it if that lookup does not use it.
     pub fn checking_argument_types(mut self, check: crate::function::ArgumentTypeCheck) -> Self {
         let ExtFunc::NativeScalar {
             receives_argument_types,
@@ -79,6 +83,10 @@ impl ExternalFunc {
     /// `nullif` has, for a function whose result type depends on the type of
     /// its first argument. The function returns `Value`, which declares no
     /// type of its own.
+    // FIXME(pg-catalog): only pg_timestamp_plus_interval sets this. PostgreSQL
+    // takes a result type from the prorettype of pg_proc or the oprresult of
+    // pg_operator, not from an argument. A pg_proc and pg_operator lookup
+    // replaces this; remove it if that lookup does not use it.
     pub fn returning_first_argument_type(mut self) -> Self {
         let ExtFunc::NativeScalar {
             return_type,

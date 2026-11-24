@@ -7955,6 +7955,10 @@ fn check_type_is_supported(name: &str, array_dimensions: usize) -> Result<(), Pa
     let quoted = format!("type \"{name}{}\"", "[]".repeat(array_dimensions));
     if element == "interval" {
         // Tells the user what does work, as a workaround for the refusal.
+        // FIXME(pg-interval): tursopg has no interval type. An interval literal
+        // works only on the right of `timestamp + ` or `timestamp - `, which the
+        // translator rewrites into pg_timestamp_plus_interval. An interval type
+        // with its input function and pg_operator rows replaces this refusal.
         return Err(ParseError::Sqlstate {
             sqlstate: crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
             message: format!(
@@ -8037,6 +8041,9 @@ fn interval_literal(node: &pg_query::protobuf::Node) -> Result<Option<IntervalPa
 /// unit may appear only once, and a value out of the range of its part is an
 /// error. PostgreSQL reads many more forms, such as `1:30` or `1 day ago`,
 /// which are not supported.
+// FIXME(pg-interval): this reads a subset of PostgreSQL's interval input
+// (DecodeInterval in src/backend/utils/adt/datetime.c) by hand. The input
+// function of an interval type replaces it.
 fn interval_parts(text: &str) -> Option<IntervalParts> {
     let mut words = text.split_ascii_whitespace();
     let mut parts = IntervalParts {

@@ -71,6 +71,11 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             )
             .receiving_argument_types(),
         )
+        // FIXME(pg-interval): PostgreSQL has no function of this name. It exists
+        // because tursopg has no interval type: the translator rewrites
+        // `timestamp ± interval literal` into a call of it, and users can also
+        // call it by name. An interval type with the pg_operator rows
+        // timestamp_pl_interval and timestamptz_pl_interval replaces it.
         .extension_function(
             pg_scalar_function(
                 turso_pg_parser::TIMESTAMP_PLUS_INTERVAL_FUNCTION,
