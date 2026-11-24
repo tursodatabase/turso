@@ -7952,10 +7952,17 @@ fn check_type_is_supported(name: &str, array_dimensions: usize) -> Result<(), Pa
     if is_supported {
         return Ok(());
     }
-    Err(ParseError::not_supported(format!(
-        "type \"{name}{}\"",
-        "[]".repeat(array_dimensions)
-    )))
+    let quoted = format!("type \"{name}{}\"", "[]".repeat(array_dimensions));
+    if element == "interval" {
+        // Tells the user what does work, as a workaround for the refusal.
+        return Err(ParseError::Sqlstate {
+            sqlstate: crate::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+            message: format!(
+                "{quoted} is not supported, except in a timestamp plus or minus an interval literal, such as now() - interval '7 days'"
+            ),
+        });
+    }
+    Err(ParseError::not_supported(quoted))
 }
 
 /// The months, days and microseconds of an interval literal, the three fields
