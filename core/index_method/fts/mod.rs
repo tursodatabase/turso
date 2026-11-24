@@ -2600,12 +2600,19 @@ impl FtsCursor {
             let inverted = segment_reader
                 .inverted_index(self.rowid_field)
                 .map_err(|e| LimboError::InternalError(format!("FTS rowid lookup: {e}")))?;
-            let Some(mut postings) = inverted
-                .read_postings(&term, IndexRecordOption::Basic)
+            // This is what `read_postings` does. But `read_postings` returns
+            // `Option<SegmentPostings>`, which is about 2 KB and is moved
+            // also when the segment does not have the rowid. Usually only one
+            // segment has it.
+            let Some(term_info) = inverted
+                .get_term_info(&term)
                 .map_err(|e| LimboError::InternalError(format!("FTS rowid postings: {e}")))?
             else {
                 continue;
             };
+            let mut postings = inverted
+                .read_postings_from_terminfo(&term_info, IndexRecordOption::Basic)
+                .map_err(|e| LimboError::InternalError(format!("FTS rowid postings: {e}")))?;
             loop {
                 let doc_id = postings.doc();
                 if doc_id == TERMINATED {
