@@ -332,15 +332,11 @@ expect {
 }
 
 # A-44: now() - interval comparison
-@compat-gap "type:bool"
 test now-interval-comparison {
     SELECT now() - interval '1 day' < now();
 }
 expect {
     t
-}
-expect @tursopg {
-    1
 }
 
 # A-45: jsonb literal key order/whitespace

@@ -1589,6 +1589,43 @@ fn wire_comparison_and_logical_report_bool() {
     });
 }
 
+/// Every kind of condition reports BOOL and prints t or f, in a plain query
+/// and in a described prepared statement.
+#[test]
+fn wire_conditions_of_every_kind_report_bool() {
+    with_pg_client(|c| {
+        for sql in [
+            "SELECT 'abc' ~ 'b'",
+            "SELECT 'abc' ~* 'B'",
+            "SELECT 'abc' !~ 'b'",
+            "SELECT 'abc' !~* 'B'",
+            "SELECT 'abc' SIMILAR TO '%b%'",
+            "SELECT ARRAY[1, 2] && ARRAY[2]",
+            "SELECT ARRAY[1, 2] @> ARRAY[2]",
+            "SELECT 1 = ANY(ARRAY[1, 2])",
+            "SELECT 'abc' LIKE 'a%'",
+            "SELECT 1 BETWEEN 0 AND 2",
+            "SELECT 1 IN (1, 2)",
+            "SELECT 1 IS NULL",
+            "SELECT EXISTS (SELECT 1)",
+            "SELECT count(*) > 0 FROM (SELECT 1) AS s",
+            "SELECT CASE WHEN 1 < 2 THEN 1 < 3 ELSE false END",
+            "SELECT coalesce(NULL, 1 < 2)",
+        ] {
+            assert_eq!(c.query_column_oids(sql), vec![OID_BOOL], "{sql}");
+            let text = c.query_single_text(sql);
+            assert!(text == "t" || text == "f", "{sql} printed {text}");
+            c.send_extended(sql, true);
+            let response = c.read_until_ready();
+            assert_eq!(
+                extract_row_description_oids(&response),
+                vec![OID_BOOL],
+                "{sql}"
+            );
+        }
+    });
+}
+
 /// Concat (`||`) always reports TEXT.
 #[test]
 fn wire_concat_reports_text() {
