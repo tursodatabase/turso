@@ -1559,9 +1559,11 @@ fn value_param(ty: &str) -> turso_core::ast::TypeParam {
     }
 }
 
-/// A dialect that is SQLite's with catalog `C`.
+/// A dialect that is SQLite's with catalog `C`, and with namespaces when
+/// `namespaces` is set.
 struct DialectWithCatalog<C> {
     catalog: C,
+    namespaces: bool,
 }
 
 impl<C: turso_core::Catalog + 'static> Dialect for DialectWithCatalog<C> {
@@ -1594,6 +1596,10 @@ impl<C: turso_core::Catalog + 'static> Dialect for DialectWithCatalog<C> {
 
     fn catalog(&self) -> &dyn turso_core::Catalog {
         &self.catalog
+    }
+
+    fn supports_namespaces(&self) -> bool {
+        self.namespaces
     }
 }
 
@@ -1657,6 +1663,7 @@ fn steps_of_the_catalog_run_after_the_engine_steps_at_open_and_at_reload() {
         catalog: CatalogWithAStep {
             table_seen_by_each_load: table_seen_by_each_load.clone(),
         },
+        namespaces: false,
     });
     let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", dialect).unwrap();
     let conn = db
@@ -1671,7 +1678,7 @@ fn steps_of_the_catalog_run_after_the_engine_steps_at_open_and_at_reload() {
 }
 
 /// A catalog that stores what SQLite's stores and notes the commands about
-/// triggers, virtual tables and types that it gets.
+/// triggers, virtual tables, types and schemas that it gets.
 struct NotesCommands {
     commands: Arc<std::sync::Mutex<Vec<String>>>,
 }
@@ -1714,6 +1721,18 @@ impl turso_core::Catalog for NotesCommands {
                     .unwrap()
                     .push(format!("drop type {}", ty.name));
             }
+            turso_core::CatalogCmd::CreateSchema(schema) => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(format!("create schema {}", schema.name));
+            }
+            turso_core::CatalogCmd::DropSchema(schema) => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(format!("drop schema {}", schema.name));
+            }
             _ => {}
         }
         turso_core::SqliteCatalog.emit(program, ctx, cmd)
@@ -1727,6 +1746,7 @@ fn the_catalog_gets_a_new_trigger_and_a_dropped_trigger() {
         catalog: NotesCommands {
             commands: commands.clone(),
         },
+        namespaces: false,
     });
     let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", dialect).unwrap();
     let conn = db
@@ -1754,6 +1774,7 @@ fn the_catalog_gets_a_new_virtual_table() {
         catalog: NotesCommands {
             commands: commands.clone(),
         },
+        namespaces: false,
     });
     let options = OpenOptions::new(dialect).native_module(
         "one_row",
@@ -1778,6 +1799,7 @@ fn the_catalog_gets_new_and_dropped_types_and_domains() {
         catalog: NotesCommands {
             commands: commands.clone(),
         },
+        namespaces: false,
     });
     let options = OpenOptions::new(dialect).db_opts(DatabaseOpts::new().with_custom_types(true));
     let db = Database::open(Arc::new(MemoryIO::new()), ":memory:", options).unwrap();
@@ -1811,5 +1833,28 @@ fn the_catalog_gets_new_and_dropped_types_and_domains() {
         commands[1].contains("CREATE DOMAIN positive"),
         "{}",
         commands[1]
+    );
+}
+
+#[test]
+fn the_catalog_gets_a_new_schema_and_a_dropped_schema() {
+    let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialect = Arc::new(DialectWithCatalog {
+        catalog: NotesCommands {
+            commands: commands.clone(),
+        },
+        namespaces: true,
+    });
+    let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", dialect).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.create_namespace("app").unwrap();
+    conn.drop_namespace("app").unwrap();
+
+    assert_eq!(
+        *commands.lock().unwrap(),
+        ["create schema app", "drop schema app"]
     );
 }

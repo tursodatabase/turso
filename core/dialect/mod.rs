@@ -27,11 +27,11 @@ pub use crate::functions::builtin::{
 pub use crate::translate::schema::SqliteCatalog;
 pub use catalog::{
     AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
-    CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,
-    CreateTrigger, CreateType, CreateView, CreateVirtualTable, Dependent, DependentObject,
-    DropColumn, DropIndex, DropSequence, DropTable, DropTrigger, DropType, DropView, NewOwner,
-    OwnerColumn, RelationName, RenameColumn, RenameTable, RewrittenTrigger, RewrittenView,
-    TableText, TempTriggerOfRenamedTable,
+    CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSchema, CreateSequence,
+    CreateTable, CreateTrigger, CreateType, CreateView, CreateVirtualTable, Dependent,
+    DependentObject, DropColumn, DropIndex, DropSchema, DropSequence, DropTable, DropTrigger,
+    DropType, DropView, NewOwner, OwnerColumn, RelationName, RenameColumn, RenameTable,
+    RewrittenTrigger, RewrittenView, TableText, TempTriggerOfRenamedTable,
 };
 
 use crate::ast::{self, Cmd, CreateTableBody, IdentityKind, Privilege, QualifiedName, Stmt};

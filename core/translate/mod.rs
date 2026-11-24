@@ -664,10 +664,10 @@ fn translate_statement(
             )?;
         }
         ast::Stmt::CreateSchema { name } => {
-            schema::translate_create_schema(&name, resolver, program)?;
+            schema::translate_create_schema(&name, resolver, connection, program)?;
         }
         ast::Stmt::DropSchema { name } => {
-            schema::translate_drop_schema(&name, resolver, program)?;
+            schema::translate_drop_schema(&name, resolver, connection, program)?;
         }
         ast::Stmt::CreatePolicy(policy) => {
             row_security::translate_create_policy(&policy, resolver, program, connection)?;

@@ -182,6 +182,8 @@ pub enum CatalogCmd<'a> {
     CreateVirtualTable(CreateVirtualTable<'a>),
     CreateType(CreateType<'a>),
     DropType(DropType<'a>),
+    CreateSchema(CreateSchema<'a>),
+    DropSchema(DropSchema<'a>),
 }
 
 /// A new table. The statement has already emitted the creation of its
@@ -455,6 +457,21 @@ pub struct CreateType<'a> {
 /// A custom type or domain that the statement drops.
 #[derive(Debug, Clone, Copy)]
 pub struct DropType<'a> {
+    pub name: &'a str,
+}
+
+/// A new namespace of the main database, with the id that it gets.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateSchema<'a> {
+    pub id: NamespaceId,
+    pub name: &'a str,
+}
+
+/// A namespace that the statement drops. The statement has dropped its
+/// objects already.
+#[derive(Debug, Clone, Copy)]
+pub struct DropSchema<'a> {
+    pub id: NamespaceId,
     pub name: &'a str,
 }
 
