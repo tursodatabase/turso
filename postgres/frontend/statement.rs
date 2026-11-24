@@ -609,6 +609,7 @@ enum BooleanResultType {
     Other,
 }
 
+// FIXME(pg-catalog): This guesses whether a result column is boolean from the shape of its expression, because Turso has no typed expression tree. The type of the resolved expression replaces it.
 // TODO: With better binding and resolved expression support, read the result type
 // from the resolved expression instead. Inferring it from expression shapes here
 // is fragile: new expressions and rewrites can lose the boolean type.
