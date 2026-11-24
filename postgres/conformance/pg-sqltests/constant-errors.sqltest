@@ -1,0 +1,47 @@
+# PostgreSQL evaluates constant expressions when it plans a query, so a
+# constant that raises an error fails the query even when the scan reads no
+# rows. SQLite evaluates such a constant only when the query reaches it.
+
+@database :memory:
+
+test constant-error-in-result-column-of-empty-scan {
+    CREATE TABLE t (a int);
+    SELECT abs(1/0) FROM t;
+}
+@sqlstate 22012
+expect error {}
+
+test constant-error-in-json-operator-of-empty-scan {
+    CREATE TABLE t (a int);
+    SELECT 'abc'::json -> 'a' FROM t;
+}
+@sqlstate 22P02
+expect error {}
+
+test constant-error-in-where-of-empty-scan {
+    CREATE TABLE t (a int);
+    SELECT a FROM t WHERE a = abs(1/0);
+}
+@sqlstate 22012
+expect error {}
+
+test constant-error-with-constant-false-where {
+    CREATE TABLE t (a int);
+    SELECT abs(1/0) FROM t WHERE false;
+}
+@sqlstate 22012
+expect error {}
+
+test constant-error-in-like-escape-of-empty-scan {
+    CREATE TABLE t (a int);
+    SELECT 1 FROM t WHERE 'x' LIKE 'a' ESCAPE 'ab';
+}
+@sqlstate 22025
+expect error {}
+
+test constant-error-in-abs-overflow-of-empty-scan {
+    CREATE TABLE t (a int);
+    SELECT abs(-9223372036854775807 - 1) FROM t;
+}
+@sqlstate 22003
+expect error {}

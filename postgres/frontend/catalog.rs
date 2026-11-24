@@ -373,6 +373,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn evaluates_failing_constants_when_reached(&self) -> bool {
+        false
+    }
+
     fn write_array_blob_element(&self, out: &mut String, blob: &[u8]) {
         out.push_str(&crate::text::encode_bytea(blob, true));
     }

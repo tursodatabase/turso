@@ -550,6 +550,16 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a constant expression that can raise an error, such as
+    /// `abs(-9223372036854775808)`, is evaluated only when the statement reaches it.
+    ///
+    /// SQLite evaluates it the first time it is reached, so
+    /// `SELECT abs(-9223372036854775808) FROM t` returns no rows when t is empty.
+    /// PostgreSQL evaluates constants when it plans the statement and raises the error.
+    fn evaluates_failing_constants_when_reached(&self) -> bool {
+        true
+    }
+
     /// FIXME(pg-catalog): This hand-codes prorettype of the pg_proc entries mod(smallint, smallint), mod(integer, integer) and mod(bigint, bigint), which return their argument type. A lookup in a pg_proc table replaces this.
     /// Whether `mod` of two integers returns an integer.
     ///
