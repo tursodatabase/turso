@@ -1186,7 +1186,7 @@ pub fn translate_alter_table(
             column = btree.columns().last().unwrap().clone();
 
             if is_stored {
-                btree.check_stored_columns_have_no_custom_types(resolver.schema())?;
+                btree.check_stored_columns_have_no_composite_types(resolver.schema())?;
                 emit_halt_if_table_has_rows(
                     program,
                     &original_btree,

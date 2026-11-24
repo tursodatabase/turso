@@ -2657,7 +2657,7 @@ pub fn op_type_check(
     assert!(table_reference.is_strict);
     table_reference.columns().iter().enumerate().try_for_each(
         |(column_idx, col)| -> Result<(), LimboError> {
-            if col.is_virtual_generated() && !check_generated {
+            if col.is_generated() && !check_generated {
                 return Ok(());
             }
             let offset = table_reference.logical_to_physical_column(column_idx);

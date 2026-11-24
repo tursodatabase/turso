@@ -2157,6 +2157,21 @@ impl Schema {
         column.is_array() || self.get_type_def(&column.ty_str, is_strict).is_some()
     }
 
+    /// Whether the column has an array, STRUCT, or UNION type.
+    pub fn column_has_composite_type(&self, column: &Column, is_strict: bool) -> bool {
+        column.is_array()
+            || self
+                .resolve_type(&column.ty_str, is_strict)
+                .ok()
+                .flatten()
+                .is_some_and(|resolved| {
+                    resolved
+                        .chain
+                        .iter()
+                        .any(|type_def| type_def.is_struct() || type_def.is_union())
+                })
+    }
+
     /// Whether reading the column runs a DECODE, so a read gives a value other
     /// than the stored one.
     pub fn column_has_decode(&self, column: &Column, is_strict: bool) -> bool {
@@ -5905,9 +5920,12 @@ impl BTreeTable {
         Ok(())
     }
 
-    /// Fails when a STORED generated column has a custom type or reads a column that has one.
-    // FIXME: allow custom types in STORED generated columns once custom types stabilize.
-    pub(crate) fn check_stored_columns_have_no_custom_types(&self, schema: &Schema) -> Result<()> {
+    /// Fails when a STORED generated column has an array, STRUCT, or UNION type or reads a
+    /// column that has one.
+    pub(crate) fn check_stored_columns_have_no_composite_types(
+        &self,
+        schema: &Schema,
+    ) -> Result<()> {
         let graph = self.column_graph()?;
         for (idx, column) in self.columns.iter().enumerate() {
             if !column.is_stored_generated() {
@@ -5915,9 +5933,11 @@ impl BTreeTable {
             }
             let uses_custom_type = std::iter::once(idx)
                 .chain(graph.dependencies[idx].iter())
-                .any(|i| schema.column_has_custom_type(&self.columns[i], self.is_strict));
+                .any(|i| schema.column_has_composite_type(&self.columns[i], self.is_strict));
             if uses_custom_type {
-                bail_parse_error!("stored generated columns cannot use custom types");
+                bail_parse_error!(
+                    "stored generated columns cannot use array, STRUCT, or UNION types"
+                );
             }
         }
         Ok(())
