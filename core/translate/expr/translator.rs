@@ -970,6 +970,14 @@ fn emit_custom_type_cast(
     {
         emit_integer_to_boolean_cast(program, reg);
     }
+    // A type may take more values in a CAST than in a column. Its conversion
+    // runs before the type stores the value. A CAST to a domain runs the
+    // conversion of the type the domain is based on.
+    for type_def in chain {
+        if let Some(cast) = type_def.cast() {
+            emit_conversion(program, type_def, "CAST", cast, reg, resolver)?;
+        }
+    }
     // The CAST first converts the value to the type's input type as a
     // CAST to that type would, then stores it as a column of the type
     // does: CAST(5.5 AS smallint) is 5, as are CAST(5.5 AS bigint) and

@@ -810,9 +810,10 @@ pub(crate) fn emit_encode_for_comparison(
     Ok(())
 }
 
-/// Emits `conversion`, which is the ENCODE or DECODE of `type_def` as `clause`
-/// says, on the value in `reg`. A SQL expression is compiled with `value`
-/// referencing `reg`. A Rust function is called, unless the value is NULL.
+/// Emits `conversion`, which is the ENCODE, DECODE or CAST conversion of
+/// `type_def` as `clause` says, on the value in `reg`. A SQL expression is
+/// compiled with `value` referencing `reg`. A Rust function is called, unless
+/// the value is NULL.
 pub(crate) fn emit_conversion(
     program: &mut ProgramBuilder,
     type_def: &TypeDef,
