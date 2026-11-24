@@ -116,7 +116,8 @@ The PostgreSQL dump fuzzer uses comfy-table, distributed by its authors:
 * Homepage: https://github.com/nukesor/comfy-table
 
 postgres/catalog/upstream/postgres.bki is the file that PostgreSQL's genbki.pl
-generates from the catalog data files of the PostgreSQL source tree:
+generates from the catalog data files of the PostgreSQL source tree, and
+postgres/catalog/src/generated.rs is generated from that file:
 
 * License: licenses/postgres-license.md (PostgreSQL License)
 * Homepage: https://www.postgresql.org/
