@@ -82,6 +82,7 @@ fn bool_encode(value: &Value, _params: &[Value]) -> Result<Value> {
     }
 }
 
+/// FIXME(pg-catalog): This hand-codes the pg_cast entry from integer to boolean (function bool(integer)). pg_cast has no entry from smallint or bigint to boolean, but this cast applies to every integer value. A lookup in a pg_cast table replaces this.
 /// PostgreSQL casts an integer to boolean, but does not store one in a boolean
 /// column: every nonzero integer is true in a cast. Other values are left
 /// as they are, and `bool_encode` reads them as it does for a column.
