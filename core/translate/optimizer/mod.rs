@@ -4352,9 +4352,12 @@ impl Optimizable for ast::Expr {
                 }
                 ast::Literal::String(s) => {
                     // Use Numeric::from to match SQLite's string-to-numeric conversion,
-                    // which extracts leading numeric prefixes (e.g., '9S' -> 9, 'abc' -> 0)
-                    let without_quotes = s.trim_matches('\'');
-                    let numeric = Numeric::from(without_quotes);
+                    // which extracts leading numeric prefixes (e.g., '9S' -> 9, 'abc' -> 0).
+                    // `s` is the quoted source text, so convert the value of the literal:
+                    // in '''1' the value is `'1`, which has no numeric prefix. Trimming
+                    // every quote from both ends would read it as 1.
+                    let value = crate::translate::expr::sanitize_string(s);
+                    let numeric = Numeric::from(value.as_str());
                     match numeric.to_bool() {
                         true => Ok(Some(AlwaysTrueOrFalse::AlwaysTrue)),
                         false => Ok(Some(AlwaysTrueOrFalse::AlwaysFalse)),

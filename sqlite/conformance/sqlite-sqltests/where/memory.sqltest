@@ -30,3 +30,61 @@ expect {
     1|101
 }
 
+
+# A string literal used as a WHERE term is true when its value has a non-zero
+# numeric prefix. In '''1' the value is the text `'1`, which has no numeric
+# prefix, so the term is false, even though the source text without quotes
+# reads as 1.
+@cross-check-integrity
+test where_constant_string_starting_with_escaped_quote {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1),(2),(3);
+    SELECT count(*) FROM t WHERE '''1';
+    SELECT count(*) FROM t WHERE '''1' AND a=1;
+    SELECT count(*) FROM t WHERE a=1 OR '''1';
+    SELECT count(*) FROM t WHERE a=2 AND NOT '''1';
+    SELECT count(*) FROM t WHERE ''' 5abc';
+    SELECT count(*) FROM t WHERE '''''7';
+    SELECT count(*) FROM t WHERE 'x''1';
+}
+expect {
+    0
+    0
+    1
+    1
+    0
+    0
+    0
+}
+
+# A literal whose value ends with a quote keeps its numeric prefix.
+@cross-check-integrity
+test where_constant_string_ending_with_escaped_quote {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1),(2),(3);
+    SELECT count(*) FROM t WHERE '1''';
+    SELECT count(*) FROM t WHERE ' 2.5e1''x';
+    SELECT count(*) FROM t WHERE '0''';
+    SELECT count(*) FROM t WHERE '''';
+}
+expect {
+    3
+    3
+    0
+    0
+}
+
+# UPDATE and DELETE use the same constant-condition folding as SELECT.
+@cross-check-integrity
+test dml_constant_string_starting_with_escaped_quote {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1),(2),(3);
+    UPDATE t SET a = a + 10 WHERE '''1';
+    DELETE FROM t WHERE '''1';
+    DELETE FROM t WHERE a=1 OR '''5';
+    SELECT a FROM t ORDER BY a;
+}
+expect {
+    2
+    3
+}
