@@ -4,22 +4,24 @@
 
 use turso_core::dialect::{HiddenColumn, SeededTable};
 use turso_pg_catalog::{
-    PG_AMOP_SEEDED_TABLE, PG_AMPROC_SEEDED_TABLE, PG_CAST_SEEDED_TABLE, PG_COLLATION_SEEDED_TABLE,
-    PG_OPCLASS_SEEDED_TABLE, PG_OPERATOR_SEEDED_TABLE, PG_OPFAMILY_SEEDED_TABLE,
-    PG_RANGE_SEEDED_TABLE,
+    PG_AMOP_SEEDED_TABLE, PG_COLLATION_SEEDED_TABLE, PG_OPCLASS_SEEDED_TABLE,
+    PG_OPFAMILY_SEEDED_TABLE,
 };
 
+/// FIXME(pg-catalog): This list leaves out pg_cast, pg_operator, pg_amproc
+/// and pg_range, which stay empty native modules (see
+/// `register_catalog_modules`). Their rows refer to functions by the oid of
+/// PostgreSQL (castfunc; oprcode, oprrest and oprjoin; amproc; rngcanonical
+/// and rngsubdiff), but the emulated pg_proc gives its rows other oids, so a
+/// join with pg_proc finds another function. A pg_proc with the oids of
+/// PostgreSQL replaces this: then these four catalogs join this list.
 /// The seeded catalogs of [`crate::classes::PostgresCatalog`]. Each has the
 /// columns of PostgreSQL 18, in the order of `postgres.bki`, and the hidden
 /// system column `tableoid`.
-pub(crate) static SEEDED_CATALOGS: [SeededTable; 8] = [
-    with_table_oid(PG_OPERATOR_SEEDED_TABLE, &[table_oid(2617)]),
-    with_table_oid(PG_CAST_SEEDED_TABLE, &[table_oid(2605)]),
+pub(crate) static SEEDED_CATALOGS: [SeededTable; 4] = [
     with_table_oid(PG_OPCLASS_SEEDED_TABLE, &[table_oid(2616)]),
     with_table_oid(PG_OPFAMILY_SEEDED_TABLE, &[table_oid(2753)]),
     with_table_oid(PG_AMOP_SEEDED_TABLE, &[table_oid(2602)]),
-    with_table_oid(PG_AMPROC_SEEDED_TABLE, &[table_oid(2603)]),
-    with_table_oid(PG_RANGE_SEEDED_TABLE, &[table_oid(3541)]),
     with_table_oid(PG_COLLATION_SEEDED_TABLE, &[table_oid(3456)]),
 ];
 
@@ -45,7 +47,7 @@ mod tests {
     use super::*;
 
     /// The `tableoid` of each catalog is the oid of its `create` line in
-    /// `postgres.bki`, such as `create pg_cast 2605`.
+    /// `postgres.bki`, such as `create pg_amop 2602`.
     #[test]
     fn table_oids_are_those_of_postgres_bki() {
         let bki = include_str!("../catalog/upstream/postgres.bki");

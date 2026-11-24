@@ -92,23 +92,23 @@ as the text `pg_get_expr` prints), `pg_policies`, plus `pg_input_error_info`. Pr
 always empty: `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
 `pg_foreign_table`, `pg_partitioned_table`,
 `pg_publication*`, `pg_seclabels` (security labels are not supported).
-`pg_operator`, `pg_cast`, `pg_opclass`, `pg_opfamily`, `pg_amop`, `pg_amproc`,
-`pg_range` and `pg_collation` have the built-in rows of PostgreSQL 18, with the
-columns of PostgreSQL 18 in its order, and the hidden system column `tableoid`.
-The database file has no rows for them: TursoPG serves the rows from memory. A
-lookup by `oid` reads one row. `pg_collation` has `colllocale`, which
-PostgreSQL 16 calls `colliculocale`, so the `\dO` command of psql fails: psql
-asks for `colliculocale` because TursoPG reports server version 16. It does not
-have the collations that `initdb` imports from the operating system. A
-`regproc` column (`oprcode`, `oprrest`, `oprjoin`, `amproc`, `rngcanonical`,
-`rngsubdiff`) shows the oid of the function, where PostgreSQL shows its name. A
-join with `pg_proc`, `pg_type` or `pg_am` finds only the rows that these
-catalogs have, which are not the built-in rows of PostgreSQL, and a `pg_proc`
-row can have the oid of another built-in function of PostgreSQL. Thus psql's
-`\dC`, `\do`, `\dAc`, `\dAf`, `\dAo` and `\dAp` show the rows of these
-catalogs with wrong or empty function names. No statement
-changes the rows: a role that is not a superuser gets `42501`, and a superuser,
-whom PostgreSQL lets change them, gets `0A000`. `pg_operator_is_visible`,
+`pg_operator`, `pg_cast`, `pg_amproc` and `pg_range` are also empty: their
+rows refer to functions by the oids of PostgreSQL, but `pg_proc` gives its rows
+other oids, so a join with `pg_proc` would find another function.
+`pg_opclass`, `pg_opfamily`, `pg_amop` and `pg_collation` have the built-in rows
+of PostgreSQL 18, with the columns of PostgreSQL 18 in its order, and the
+hidden system column `tableoid`. The database file has no rows for them:
+TursoPG serves the rows from memory. A lookup by `oid` reads one row.
+`pg_collation` has `colllocale`, which PostgreSQL 16 calls `colliculocale`, so
+the `\dO` command of psql fails: psql asks for `colliculocale` because TursoPG
+reports server version 16. It does not have the collations that `initdb`
+imports from the operating system. A join with `pg_am` finds only `heap` and
+`btree`, and a join of `pg_amop` with `pg_operator` finds no operator. psql's
+`\dAc`, `\dAf` and `\dAo` show empty names of operator classes and families,
+because `format('%I', ...)` returns an empty text, and `\dAo` shows the oid of
+each operator, because `::regoperator` gives the oid. No statement changes the
+rows: a role that is not a superuser gets `42501`, and a superuser, whom
+PostgreSQL lets change them, gets `0A000`. `pg_operator_is_visible`,
 `pg_opclass_is_visible` and `pg_opfamily_is_visible`, which psql's `\do`,
 `\dAc`, `\dAf`, `\dAo` and `\dAp` call, return true for every oid, as
 `pg_table_is_visible`, `pg_type_is_visible` and `pg_function_is_visible` do;

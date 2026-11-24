@@ -1252,20 +1252,3 @@ expect {
 }
 @sqlstate 42P01
 expect @tursopg error {}
-
-# A regproc column of a catalog with built-in rows holds the oid of the
-# function, and tursopg prints the oid. PostgreSQL prints the name of the
-# function, and `-` for 0.
-@compat-gap "type:regproc"
-test regproc-columns-print-function-names {
-    SELECT oprcode, oprrest, oprjoin FROM pg_operator WHERE oid = 96;
-    SELECT rngcanonical, rngsubdiff FROM pg_range WHERE rngtypid = 3906;
-}
-expect {
-    int4eq|eqsel|eqjoinsel
-    -|numrange_subdiff
-}
-expect @tursopg {
-    65|101|105
-    0|3924
-}
