@@ -75,6 +75,13 @@ expect {
     f
 }
 
+test invalid-bool-into-bool-column {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('maybe');
+}
+@sqlstate 22P02
+expect error {}
+
 # Text that goes on after the word is not a boolean.
 test bool-refuses-text-longer-than-the-word {
     CREATE TABLE t (b boolean);

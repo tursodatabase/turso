@@ -282,14 +282,6 @@ test invalid-json-into-jsonb-column {
 @sqlstate 22P02
 expect error {}
 
-# D-26: invalid bool into bool column
-test invalid-bool-into-bool-column {
-    CREATE TABLE t (b boolean);
-    INSERT INTO t VALUES ('maybe');
-}
-@sqlstate 22P02
-expect error {}
-
 # D-27: integer division by zero
 test integer-division-by-zero {
     SELECT 1 / 0;
