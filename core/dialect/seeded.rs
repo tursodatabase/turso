@@ -37,6 +37,7 @@ static CORE_SEEDED_TABLES: [SeededTable; 1] = [SeededTable {
     create_sql: TURSO_TYPES_TABLE_SQL,
     index_sql: &[],
     seed: &EmptySeed,
+    hidden_columns: &[],
 }];
 
 /// The `CREATE TABLE` statement of the table of the types made by
@@ -336,7 +337,7 @@ impl StoredForm {
 }
 
 /// The read-only table of `seeded_table`. Its columns are the columns that
-/// `create_sql` declares.
+/// `create_sql` declares, then the hidden columns.
 fn read_only_table(
     dialect: &dyn Dialect,
     seeded_table: &'static SeededTable,
@@ -352,7 +353,7 @@ fn read_only_table(
             seeded_table.name
         )));
     };
-    let definitions = columns.clone();
+    let mut definitions = columns.clone();
     let btree = crate::schema::create_table(seeded_table.name, &body, 0, false)?;
     turso_assert!(btree.has_rowid, "a seeded table must have a rowid", {
         "name": seeded_table.name
@@ -362,13 +363,31 @@ fn read_only_table(
         "a seeded table must not have generated columns",
         { "name": seeded_table.name }
     );
-    let columns: Vec<Column> = btree.columns().to_vec();
+    let mut columns: Vec<Column> = btree.columns().to_vec();
+    let column_count = columns.len();
+    let hidden_definitions = seeded_table
+        .hidden_columns
+        .iter()
+        .map(|column| crate::vtab::column_definition(column.name, "INTEGER HIDDEN"))
+        .collect::<Vec<_>>();
+    columns.extend(VirtualTable::columns_from_definitions(&hidden_definitions)?);
+    definitions.extend(hidden_definitions);
+    for (position, column) in columns.iter().enumerate() {
+        let name = column.name.as_deref().map(crate::util::normalize_ident);
+        turso_assert!(
+            !columns[..position]
+                .iter()
+                .any(|other| other.name.as_deref().map(crate::util::normalize_ident) == name),
+            "two columns of a seeded table have the same name",
+            { "table": seeded_table.name, "column": name }
+        );
+    }
     let rowid_column = btree.get_rowid_alias_column().map(|(position, _)| position);
     let table = SeededVirtualTable {
         table: seeded_table,
         definitions,
         rowid_column,
-        column_count: columns.len(),
+        column_count,
     };
     Ok(VirtualTable::new_seeded(
         seeded_table.name.to_string(),
@@ -383,6 +402,8 @@ struct SeededVirtualTable {
     definitions: Vec<ast::ColumnDefinition>,
     /// The position of the `INTEGER PRIMARY KEY` column, if there is one.
     rowid_column: Option<usize>,
+    /// The number of columns of `create_sql`. The hidden columns follow
+    /// them.
     column_count: usize,
 }
 
@@ -478,6 +499,8 @@ enum Position {
 struct SeededCursor {
     table: &'static SeededTable,
     rowid_column: Option<usize>,
+    /// The number of columns of `create_sql`. The hidden columns follow
+    /// them.
     column_count: usize,
     position: Position,
     /// The values of the current row.
@@ -588,6 +611,9 @@ impl InternalVirtualTableCursor for SeededCursor {
     fn column(&self, column: usize) -> Result<Value> {
         if self.position == Position::Done {
             return Ok(Value::Null);
+        }
+        if let Some(hidden) = column.checked_sub(self.column_count) {
+            return Ok(Value::from_i64(self.table.hidden_columns[hidden].value));
         }
         Ok(self.row[column].clone())
     }

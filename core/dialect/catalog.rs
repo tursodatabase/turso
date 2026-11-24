@@ -81,6 +81,21 @@ pub struct SeededTable {
     pub index_sql: &'static [&'static str],
     /// The rows of the table before it is stored.
     pub seed: &'static dyn Seed,
+    /// The hidden columns of the read-only table, after the columns of
+    /// `create_sql`. `SELECT *` does not show them. The stored table does not
+    /// have them, so core refuses to store a seeded table that has hidden
+    /// columns.
+    pub hidden_columns: &'static [HiddenColumn],
+}
+
+/// A hidden `INTEGER` column of the read-only table of a [`SeededTable`],
+/// with the same value in each row. An example is the `tableoid` system
+/// column of a PostgreSQL catalog.
+pub struct HiddenColumn {
+    /// The name of the column.
+    pub name: &'static str,
+    /// The value of the column in each row.
+    pub value: i64,
 }
 
 /// The rows of a [`SeededTable`] before the table is stored. A row has an

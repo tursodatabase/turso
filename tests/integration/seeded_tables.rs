@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use turso_core::dialect::{
-    Catalog, CatalogCmd, CmdContext, CmdOrigin, Dialect, Seed, SeededTable, SqliteCatalog,
+    Catalog, CatalogCmd, CmdContext, CmdOrigin, Dialect, HiddenColumn, Seed, SeededTable,
+    SqliteCatalog,
 };
 use turso_core::{Connection, Insn, LimboError, ProgramBuilder, Result, Value};
 use turso_sqlite::SqliteDialect;
@@ -210,6 +211,28 @@ impl SeedDialect {
 
     /// A dialect whose `seed_items` has the rows `items`.
     fn with_items(items: Vec<Vec<Value>>) -> Arc<Self> {
+        Self::with_tables(items, &[])
+    }
+
+    /// A dialect whose `seed_words` has the hidden column `tableoid`, with
+    /// the value 1234 in each row.
+    fn with_hidden_column() -> Arc<Self> {
+        let dialect = Self::new();
+        Self::with_tables(
+            dialect.items().rows.clone(),
+            &[HiddenColumn {
+                name: "tableoid",
+                value: 1234,
+            }],
+        )
+    }
+
+    /// A dialect whose `seed_items` has the rows `items`, and whose
+    /// `seed_words` has the hidden columns `words_hidden_columns`.
+    fn with_tables(
+        items: Vec<Vec<Value>>,
+        words_hidden_columns: &'static [HiddenColumn],
+    ) -> Arc<Self> {
         let items: &'static CountingSeed = Box::leak(Box::new(CountingSeed::new(items, Some(0))));
         let words: &'static CountingSeed = Box::leak(Box::new(CountingSeed::new(
             vec![
@@ -224,12 +247,14 @@ impl SeedDialect {
                 create_sql: ITEMS_SQL,
                 index_sql: &["CREATE INDEX seed_items_name ON seed_items (name)"],
                 seed: items,
+                hidden_columns: &[],
             },
             SeededTable {
                 name: "seed_words",
                 create_sql: WORDS_SQL,
                 index_sql: &[],
                 seed: words,
+                hidden_columns: words_hidden_columns,
             },
         ]));
         Arc::new(Self {
@@ -540,6 +565,57 @@ fn writes_fail_and_change_nothing_wal() {
 #[test]
 fn writes_fail_and_change_nothing_mvcc() {
     writes_fail_and_change_nothing(true);
+}
+
+/// A hidden column of a read-only table has its value in each row. `SELECT *`
+/// does not show it, and a query reads it by name. The stored table would
+/// not have it, so the first write fails and changes nothing.
+fn hidden_column_is_served_and_blocks_the_first_write(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&new_path(&dir), SeedDialect::with_hidden_column(), mvcc);
+    let conn = db.connect_limbo();
+    let words = vec![vec![text("one"), int(3)], vec![text("three"), int(5)]];
+    assert_eq!(rows(&conn, "SELECT * FROM seed_words"), words);
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT tableoid, word, w.tableoid FROM seed_words AS w ORDER BY length DESC"
+        ),
+        vec![
+            vec![int(1234), text("three"), int(1234)],
+            vec![int(1234), text("one"), int(1234)],
+        ]
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT word FROM seed_words WHERE tableoid = 1234 AND rowid = 2"
+        ),
+        vec![vec![text("three")]]
+    );
+    let error = error_of(&conn, "CREATE TABLE words_x (a)");
+    assert!(
+        error.contains("cannot store seeded table seed_words"),
+        "{error}"
+    );
+    assert_eq!(rows(&conn, "SELECT * FROM seed_words"), words);
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT count(*) FROM sqlite_schema WHERE name LIKE 'seed%' OR name = 'words_x'"
+        ),
+        vec![vec![int(0)]]
+    );
+}
+
+#[test]
+fn hidden_column_is_served_and_blocks_the_first_write_wal() {
+    hidden_column_is_served_and_blocks_the_first_write(false);
+}
+
+#[test]
+fn hidden_column_is_served_and_blocks_the_first_write_mvcc() {
+    hidden_column_is_served_and_blocks_the_first_write(true);
 }
 
 fn visible_after_schema_change_and_reopen(mvcc: bool) {

@@ -30,9 +30,9 @@ pub use catalog::{
     AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
     CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,
     CreateTrigger, CreateView, CreateVirtualTable, Dependent, DependentObject, DropColumn,
-    DropIndex, DropSequence, DropTable, DropTrigger, DropView, NewOwner, OwnerColumn, RelationName,
-    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, Seed, SeededTable, TableText,
-    TempTriggerOfRenamedTable,
+    DropIndex, DropSequence, DropTable, DropTrigger, DropView, HiddenColumn, NewOwner, OwnerColumn,
+    RelationName, RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, Seed, SeededTable,
+    TableText, TempTriggerOfRenamedTable,
 };
 
 use crate::ast::{self, Cmd, CreateTableBody, IdentityKind, Privilege, QualifiedName, Stmt};

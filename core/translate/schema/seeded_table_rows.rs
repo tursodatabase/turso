@@ -161,6 +161,14 @@ fn store_seeded_table(
     program: &mut ProgramBuilder,
     form: &StoredForm,
 ) -> Result<SeededTableWriter> {
+    // The stored table would lose the hidden columns, and queries that
+    // read them would fail after the first write.
+    if !form.seeded_table.hidden_columns.is_empty() {
+        return Err(LimboError::InternalError(format!(
+            "cannot store seeded table {}: the stored table cannot have its hidden columns",
+            form.name
+        )));
+    }
     let resolver = ctx.resolver;
     let table_root_reg = program.alloc_register();
     program.emit_insn(Insn::CreateBtree {

@@ -170,6 +170,7 @@ pub const {table_name}_SEEDED_TABLE: SeededTable = SeededTable {{
     create_sql: {struct_name}::CREATE_SQL,
     index_sql: {struct_name}::INDEX_SQL,
     seed: &CatalogSeed::new(&{table_name}, {oid}, {version:#010x}),
+    hidden_columns: &[],
 }};
 ",
         values = values.join(", "),
