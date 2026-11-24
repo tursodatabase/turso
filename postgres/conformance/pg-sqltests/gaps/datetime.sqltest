@@ -91,7 +91,7 @@ expect @tursopg {
     at 2026-01-31 10:00:00
 }
 
-# tursopg stores the integer 20260101 as 2026-01-01 00:00:00+00; PostgreSQL rejects it.
+# tursopg reads the integer as its text, as it reads an untyped parameter.
 @compat-gap "cast:int4 -> timestamptz"
 test insert-integer-into-timestamptz {
     CREATE TABLE t (created_at timestamptz);
@@ -108,6 +108,18 @@ expect @tursopg {
 test insert-select-integer-into-timestamptz {
     CREATE TABLE t (ts timestamptz);
     CREATE TABLE s (v int); INSERT INTO s VALUES (20260101); INSERT INTO t SELECT v FROM s; SELECT ts FROM t;
+}
+@sqlstate 42804
+expect error {}
+expect @tursopg {
+    2026-01-01 00:00:00+00
+}
+
+# tursopg reads the integer of a subquery as its text.
+@compat-gap "cast:int4 -> timestamptz"
+test insert-subquery-integer-into-timestamptz {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ((SELECT 20260101)); SELECT ts FROM t;
 }
 @sqlstate 42804
 expect error {}
@@ -159,15 +171,11 @@ expect @tursopg {
     0
 }
 
-@compat-gap "cast:timestamptz -> int8"
 test timestamptz-cast-to-bigint {
     SELECT timestamptz '2026-01-31Z'::bigint;
 }
 @sqlstate 42846
 expect error {}
-expect @tursopg {
-    2026
-}
 
 @compat-gap "type:timestamptz"
 test timestamptz-offset-out-of-range {
@@ -686,24 +694,18 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-@compat-gap "cast:timestamptz -> date"
 test timestamptz-cast-to-date {
     SELECT timestamptz '2026-01-31 23:30-05'::date;
 }
 expect {
     2026-02-01
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
-@compat-gap "type:date"
 test date-input-invalid {
     SELECT '2026-02-30'::date;
 }
 @sqlstate 22008
 expect error {}
-@sqlstate 0A000
-expect @tursopg error {}
 
 @compat-gap "type:timestamp"
 test timestamp-precision-modifier {
@@ -782,6 +784,51 @@ expect {
 }
 @sqlstate 22023
 expect @tursopg error {}
+
+# tursopg stores dates from 0001-01-01 to 9999-12-31 and refuses date
+# arithmetic outside that range; PostgreSQL's date range is wider.
+@compat-gap "type:date"
+test date-minus-days-before-year-one {
+    SELECT '0001-01-01'::date - 1;
+}
+expect {
+    0001-12-31 BC
+}
+@sqlstate 22008
+expect @tursopg error {}
+
+@compat-gap "type:date"
+test date-plus-days-after-year-9999 {
+    SELECT '9999-12-31'::date + 1;
+}
+expect {
+    10000-01-01
+}
+@sqlstate 22008
+expect @tursopg error {}
+
+@compat-gap "cast:int4 -> timestamp"
+test insert-integer-into-timestamp-column {
+    CREATE TABLE t (ts timestamp);
+    INSERT INTO t VALUES (20200101);
+    SELECT ts FROM t;
+}
+@sqlstate 42804
+expect error {}
+expect @tursopg {
+    2020-01-01 00:00:00
+}
+
+# PostgreSQL has no casts between date or time types and numbers.
+@compat-gap "cast:int4 -> date"
+test cast-integer-to-date {
+    SELECT 20200101::date;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    2020-01-01
+}
 
 # PostgreSQL finds no common type for an integer and a timestamp in one VALUES
 # column; tursopg accepts them.

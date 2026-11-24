@@ -2114,7 +2114,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    type "date" is not supported
+    type "interval" is not supported
 }
 
 @compat-gap "function:age"
@@ -2428,7 +2428,6 @@ expect {
     ["\\\\x616263",null]
 }
 
-@compat-gap "function:array_to_json"
 test array-to-json-writes-dates-and-timestamps-in-iso-format {
     SELECT array_to_json(ARRAY['2024-01-02'::date]),
            array_to_json(ARRAY['2024-01-02 03:04:05.5'::timestamp]),
@@ -2436,10 +2435,6 @@ test array-to-json-writes-dates-and-timestamps-in-iso-format {
 }
 expect {
     ["2024-01-02"]|["2024-01-02T03:04:05.5"]|["2024-01-02T03:04:05+00:00"]
-}
-@sqlstate 0A000
-expect @tursopg error {
-    type "date" is not supported
 }
 
 test array-to-json-embeds-json-and-jsonb-values {

@@ -846,6 +846,12 @@ fn translate_cast_expr(
     // runs numeric's `-` on 1.50.
     translate_expr(program, referenced_tables, expr, target_register, resolver)?;
 
+    if let Some(tn) = type_name {
+        let source = type_of(expr, &TypeEnv::new(referenced_tables, resolver));
+        let target = custom_type_cast_chain(tn, resolver.schema())?;
+        check_cast_from_text_input_type(&source, target.as_ref(), tn, resolver)?;
+    }
+
     let cast_type_name = type_name.as_ref().map(|tn| crate::util::dequote(&tn.name));
 
     if let (Some(tn), Some(cast_type_name)) = (type_name, &cast_type_name) {

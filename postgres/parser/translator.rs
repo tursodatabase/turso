@@ -3740,14 +3740,19 @@ impl PostgreSQLTranslator {
                         "a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP",
                     ));
                 }
-                // CURRENT_DATE, CURRENT_TIME and LOCALTIME are refused if
-                // tursopg does not support the type each returns in
-                // PostgreSQL.
+                // CURRENT_TIME and LOCALTIME are refused if tursopg does not
+                // support the type each returns in PostgreSQL.
                 match SqlValueFunctionOp::try_from(svf.op) {
-                    Ok(SqlValueFunctionOp::SvfopCurrentDate) => {
-                        check_type_is_supported("date", 0)?;
-                        Ok(ast::Expr::Literal(ast::Literal::CurrentDate))
-                    }
+                    // CURRENT_DATE is the date of now(), the time the
+                    // transaction started, in the session time zone (UTC).
+                    Ok(SqlValueFunctionOp::SvfopCurrentDate) => Ok(ast::Expr::Cast {
+                        expr: Box::new(function_call("now", vec![])),
+                        type_name: Some(ast::Type {
+                            name: "date".to_string(),
+                            size: None,
+                            array_dimensions: 0,
+                        }),
+                    }),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTime
                         | SqlValueFunctionOp::SvfopCurrentTimeN,
@@ -4547,6 +4552,11 @@ impl PostgreSQLTranslator {
             return Err(star_argument_error(&func_call.funcname));
         }
         if let Some(result_type) = datetime_result_type(&func_name) {
+            // tursopg implements none of the functions that return a date,
+            // and SQLite's date() would run in their place.
+            if result_type == "date" {
+                return Err(ParseError::not_supported(format!("{func_name}()")));
+            }
             check_type_is_supported(result_type, 0)?;
         }
         if func_name.eq_ignore_ascii_case("substring")
@@ -7854,7 +7864,7 @@ fn check_type_is_supported(name: &str, array_dimensions: usize) -> Result<(), Pa
         "interval",
     ];
     // The date and time types tursopg supports, as scalars only.
-    const SUPPORTED_DATETIME_TYPES: &[&str] = &["timestamp", "timestamptz"];
+    const SUPPORTED_DATETIME_TYPES: &[&str] = &["date", "timestamp", "timestamptz"];
     let (element, is_array) = match name.strip_prefix('_') {
         Some(element) => (element, true),
         None => (name, array_dimensions > 0),

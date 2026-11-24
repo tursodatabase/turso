@@ -111,7 +111,6 @@ expect {
 @sqlstate 22007
 expect @tursopg error {}
 
-@compat-gap "type:date"
 test todos-overdue-by-due-date {
     CREATE TABLE todos (id serial PRIMARY KEY, title text NOT NULL, completed boolean NOT NULL DEFAULT false, due_date date, created_at timestamptz NOT NULL DEFAULT now());
     INSERT INTO todos (title, completed, due_date, created_at) VALUES ('Buy milk', false, '2000-01-01', '2026-01-01 10:00Z'), ('Write report', true, '2099-01-01', '2026-01-02 08:00Z'), ('Call mom', false, NULL, '2026-01-03 09:15Z');
@@ -120,5 +119,3 @@ test todos-overdue-by-due-date {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {}

@@ -595,6 +595,22 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// FIXME(pg-catalog): This hand-codes the absence of pg_cast entries from date, timestamp, json and inet to numbers, booleans and bytea. A lookup in a pg_cast table replaces this.
+    /// Whether a CAST from a custom type that reads text and has an ENCODE
+    /// (such as date, timestamp, json or inet) is refused when its target does
+    /// not read text.
+    ///
+    /// PostgreSQL has no cast from these types to numbers, booleans or bytea:
+    /// `date '2020-01-01'::int` fails. SQLite reads the text as a number, so
+    /// it gives 2020, which is a wrong answer. A number stored into or cast
+    /// to one of these types is read as its text, so `20200101::date` gives
+    /// 2020-01-01 where PostgreSQL refuses it: tursopg binds a parameter sent
+    /// without a type as a number when its text is one, and refusing numbers
+    /// would refuse such parameters too.
+    fn text_input_types_refuse_other_kinds(&self) -> bool {
+        false
+    }
+
     /// Whether constraint errors report the values that broke the constraint.
     ///
     /// PostgreSQL shows them in the error DETAIL, so custom type and array

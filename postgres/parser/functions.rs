@@ -306,8 +306,10 @@ static PG_FUNCS: phf::Map<&'static str, PgFunc> = phf_map! {
 /// functions that return the same one for every argument type. Names are
 /// matched ignoring case. The list was copied by hand from PostgreSQL 18's
 /// pg_proc; functions returning timestamp or timestamptz are left out because
-/// tursopg supports both. age() is listed although age(xid) returns an
-/// integer, because tursopg has no xid type.
+/// tursopg supports both. Functions returning date stay listed: tursopg
+/// supports the date type, but it has not implemented these functions. age()
+/// is listed although age(xid) returns an integer, because tursopg has no xid
+/// type.
 #[rustfmt::skip]
 pub fn datetime_result_type(name: &str) -> Option<&'static str> {
     Some(match name.to_ascii_lowercase().as_str() {
