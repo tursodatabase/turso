@@ -32,14 +32,12 @@ use crate::translate::catalog::CatalogContext;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{prepare_cdc_if_necessary, Resolver};
 use crate::translate::expr::expr_type::{
-    base_value_type, decode_type, first_and_third_arguments, iif_values, type_of, value_type,
-    ExprType, TypeEnv,
+    base_value_type, decode_type, first_and_third_arguments, iif_values, query_column_type,
+    value_type, ExprType,
 };
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
-use crate::translate::plan::{
-    compound_column_affinity, Plan, QueryDestination, ResultSetColumn, TableReferences,
-};
+use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
@@ -1025,38 +1023,23 @@ fn check_ctas_column_types(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let arms: Vec<(&[ResultSetColumn], &TableReferences)> = match plan {
-        Plan::Select(sp) => vec![(&sp.result_columns[..], &sp.table_references)],
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => left
-            .iter()
-            .map(|(select, _)| select)
-            .chain(std::iter::once(&**right_most))
-            .map(|select| (&select.result_columns[..], &select.table_references))
-            .collect(),
-        _ => unreachable!("derive_ctas_schema accepts only SELECT plans"),
-    };
     let dialect = connection.dialect();
-    for (arm_columns, arm_tables) in arms {
-        let env = TypeEnv::new(Some(arm_tables), resolver);
-        for (column, name) in arm_columns.iter().zip(names) {
-            let ty = type_of(&column.expr, &env);
-            let element = match &ty {
-                ExprType::Array { element, .. } => element.as_ref(),
-                scalar => scalar,
-            };
-            match element {
-                ExprType::Custom { type_def, .. }
-                    if type_def.is_domain || type_def.changes_stored_value() =>
-                {
-                    dialect.check_ctas_column_type(name, Some(&type_def.name))?
-                }
-                // An expression that type_of cannot type here, such as DEFAULT,
-                // could be a custom type.
-                ExprType::NotKnownYet => dialect.check_ctas_column_type(name, None)?,
-                _ => {}
+    for (column_index, name) in names.iter().enumerate() {
+        let ty = query_column_type(plan, column_index, resolver);
+        let element = match &ty {
+            ExprType::Array { element, .. } => element.as_ref(),
+            scalar => scalar,
+        };
+        match element {
+            ExprType::Custom { type_def, .. }
+                if type_def.is_domain || type_def.changes_stored_value() =>
+            {
+                dialect.check_ctas_column_type(name, Some(&type_def.name))?
             }
+            // An expression that cannot be typed here, such as DEFAULT, could
+            // be a custom type.
+            ExprType::NotKnownYet => dialect.check_ctas_column_type(name, None)?,
+            _ => {}
         }
     }
     Ok(())

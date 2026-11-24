@@ -66,19 +66,6 @@ expect {
 expect @tursopg error {}
 
 @compat-gap "syntax:create table as with custom type"
-test ctas-date-column {
-    CREATE TABLE t (d date);
-    INSERT INTO t VALUES ('2024-03-05');
-    CREATE TABLE c AS SELECT d FROM t;
-    SELECT count(*) FROM c WHERE d = '2024-03-05';
-}
-expect {
-    1
-}
-@sqlstate 0A000
-expect @tursopg error {}
-
-@compat-gap "syntax:create table as with custom type"
 test ctas-now {
     CREATE TABLE c AS SELECT now() AS n;
     SELECT count(*) FROM c WHERE n <= now();
@@ -159,3 +146,14 @@ test ctas-if-not-exists-existing-table-skips-column-check {
 expect {
     ok
 }
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-values-timestamptz {
+    CREATE TABLE c AS VALUES (CAST('2024-01-05 10:00:00+02' AS timestamptz));
+    SELECT count(*) FROM c WHERE column1 = '2024-01-05 08:00:00+00';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
