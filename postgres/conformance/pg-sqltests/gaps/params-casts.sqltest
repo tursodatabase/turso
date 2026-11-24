@@ -356,7 +356,7 @@ expect {
     {"a": 1, "b": 2, "aa": [1, 2]}
 }
 expect @tursopg {
-    {"b": 2,  "a":1, "aa": [1,  2]}
+    {"b":2,"a":1,"aa":[1,2]}
 }
 
 # A-46: jsonb duplicate keys keep last
@@ -380,14 +380,67 @@ expect {
 }
 
 # A-48: invalid jsonb literal
-@compat-gap "type:jsonb"
 test invalid-jsonb-literal {
     SELECT 'not json'::jsonb;
 }
 @sqlstate 22P02
 expect error {}
+
+# A cast to jsonb converts the value as a jsonb column does, and the jsonb
+# input of tursopg accepts JSON5, such as a field name without quotes.
+@compat-gap "type:jsonb"
+test jsonb-literal-in-json5 {
+    SELECT '{a:1}'::jsonb;
+}
+@sqlstate 22P02
+expect error {}
 expect @tursopg {
-    not json
+    {"a":1}
+}
+
+# PostgreSQL has no cast from a number or a boolean to jsonb. tursopg converts
+# the stored value, so true gives the JSON number 1.
+@compat-gap "cast:int4 -> jsonb"
+test cast-of-integer-to-jsonb {
+    SELECT 1::jsonb;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    1
+}
+
+@compat-gap "cast:bool -> jsonb"
+test cast-of-boolean-to-jsonb {
+    SELECT true::jsonb;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    1
+}
+
+# A cast to jsonb in a generation expression converts the value as a jsonb
+# column does, so text that is not JSON fails.
+test jsonb-cast-in-generated-column-of-invalid-json-errors {
+    CREATE TABLE gen_jsonb_invalid (data text, normal text GENERATED ALWAYS AS (data::jsonb::text) STORED);
+    INSERT INTO gen_jsonb_invalid (data) VALUES ('not json');
+}
+@sqlstate 22P02
+expect error {}
+
+# The value is converted, but the output differs because of A-45.
+@compat-gap "type:jsonb"
+test jsonb-cast-in-generated-column {
+    CREATE TABLE gen_jsonb_texts (data text, normal text GENERATED ALWAYS AS (data::jsonb::text) STORED);
+    INSERT INTO gen_jsonb_texts (data) VALUES ('[1,  2]');
+    SELECT normal FROM gen_jsonb_texts;
+}
+expect {
+    [1, 2]
+}
+expect @tursopg {
+    [1,2]
 }
 
 # A-50: jsonb number precision
