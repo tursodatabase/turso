@@ -126,20 +126,22 @@ fn resolve_binary(op: &str, left: &OperandType, right: &OperandType) -> Operator
             _ => return OperatorResolution::Keep,
         },
     };
-    if exists(op, left_type, right_type, true) {
-        OperatorResolution::Keep
-    } else {
-        OperatorResolution::Reject
+    if !exists(op, left_type, right_type, true) {
+        return OperatorResolution::Reject;
     }
+    OperatorResolution::Keep
 }
 
 /// A string literal next to an operand of type `ty`: the literal is read as
-/// `ty`, which needs an operator for two operands of that type.
+/// `ty`, except for text, which needs no cast.
 fn resolve_literal(op: &str, ty: CastType) -> OperatorResolution {
-    if exists(op, ty, ty, false) {
+    if !exists(op, ty, ty, false) {
+        return OperatorResolution::Reject;
+    }
+    if ty == Text {
         OperatorResolution::Keep
     } else {
-        OperatorResolution::Reject
+        OperatorResolution::CastUntyped(ty.name().to_string())
     }
 }
 

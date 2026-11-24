@@ -629,6 +629,7 @@ pub fn bind_and_rewrite_expr_except<'a>(
             Ok(WalkControl::Continue)
         },
     )?;
+    cast_untyped_operands(top_level_expr, referenced_tables.as_deref(), resolver)?;
     check_custom_types(top_level_expr, referenced_tables.as_deref(), resolver)
 }
 

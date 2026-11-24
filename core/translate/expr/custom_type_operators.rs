@@ -76,6 +76,188 @@ pub(crate) fn check_comparison(expr: &ast::Expr, env: &TypeEnv) -> Result<()> {
     Ok(())
 }
 
+/// Casts the string literals that meet an operand of another type to that
+/// type when the dialect says so, as PostgreSQL reads `int_column = '5'` as
+/// `int_column = '5'::int4`. A literal that is not a value of the type then
+/// fails as the cast does. This runs on every expression a statement binds,
+/// once its columns are bound and before the optimizer sees the operators.
+pub(crate) fn cast_untyped_operands(
+    expr: &mut ast::Expr,
+    tables: Option<&TableReferences>,
+    resolver: &Resolver<'_>,
+) -> Result<()> {
+    if resolver.schema().type_registry.is_empty() {
+        return Ok(());
+    }
+    let context = ExprContext::new(tables, resolver);
+    walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
+        let casts = literal_casts(expr, &context.type_env())?;
+        for (slot, type_name) in casts {
+            let operand = operand_slots(expr).swap_remove(slot);
+            if let ast::Expr::Literal(ast::Literal::String(text)) = without_wrappers(operand) {
+                resolver
+                    .catalog
+                    .dialect
+                    .check_literal_cast(&sanitize_string(text), &type_name)?;
+            }
+            let literal = std::mem::replace(operand, ast::Expr::Literal(ast::Literal::Null));
+            *operand = ast::Expr::Cast {
+                expr: Box::new(literal),
+                type_name: Some(ast::Type {
+                    name: type_name,
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            };
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+/// The operands of an operator, a BETWEEN, an IN list or a CASE, by
+/// slot. A CASE with an operand has it first, then the WHEN values; without
+/// one, only the WHEN conditions.
+fn operand_slots(expr: &mut ast::Expr) -> Vec<&mut ast::Expr> {
+    match expr {
+        ast::Expr::Binary(lhs, _, rhs) => vec![lhs.as_mut(), rhs.as_mut()],
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => vec![lhs.as_mut(), start.as_mut(), end.as_mut()],
+        ast::Expr::InList { lhs, rhs, .. } => std::iter::once(lhs.as_mut())
+            .chain(rhs.iter_mut().map(|value| value.as_mut()))
+            .collect(),
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            ..
+        } => base
+            .iter_mut()
+            .map(|base| base.as_mut())
+            .chain(when_then_pairs.iter_mut().map(|(when, _)| when.as_mut()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The operators that `expr` applies to its operand slots, as pairs of slots
+/// with the operator's name.
+struct OperatorUses<'a> {
+    slots: Vec<&'a ast::Expr>,
+    pairs: Vec<(usize, &'static str, usize)>,
+}
+
+fn operator_uses<'a>(expr: &'a ast::Expr) -> Option<OperatorUses<'a>> {
+    let mut uses = OperatorUses {
+        slots: Vec::new(),
+        pairs: Vec::new(),
+    };
+    match expr {
+        ast::Expr::Binary(lhs, op, rhs) => {
+            uses.slots = vec![lhs.as_ref(), rhs.as_ref()];
+            match op {
+                ast::Operator::Is | ast::Operator::IsNot => {
+                    let is_boolean_test = matches!(
+                        rhs.as_ref(),
+                        ast::Expr::Literal(ast::Literal::Numeric(value))
+                            if value == "0" || value == "1"
+                    );
+                    if !is_boolean_test {
+                        uses.pairs = vec![(0, "=", 1)];
+                    }
+                }
+                ast::Operator::And | ast::Operator::Or => return None,
+                _ => {
+                    let symbol = comparison_symbol(op).or_else(|| binary_symbol(op))?;
+                    uses.pairs = vec![(0, symbol, 1)];
+                }
+            }
+        }
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => {
+            uses.slots = vec![lhs.as_ref(), start.as_ref(), end.as_ref()];
+            uses.pairs = vec![(0, ">=", 1), (0, "<=", 2)];
+        }
+        ast::Expr::InList { lhs, rhs, .. } => {
+            uses.slots = std::iter::once(lhs.as_ref())
+                .chain(rhs.iter().map(|value| value.as_ref()))
+                .collect();
+            uses.pairs = (1..=rhs.len()).map(|index| (0, "=", index)).collect();
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            ..
+        } => {
+            let whens = when_then_pairs.iter().map(|(when, _)| when.as_ref());
+            match base {
+                Some(base) => {
+                    uses.slots = std::iter::once(base.as_ref()).chain(whens).collect();
+                    uses.pairs = (1..=when_then_pairs.len())
+                        .map(|index| (0, "=", index))
+                        .collect();
+                }
+                None => return None,
+            }
+        }
+        _ => return None,
+    }
+    Some(uses)
+}
+
+/// The slots of `expr` whose string literal the dialect casts, with the type
+/// to cast to. Fails when the dialect has no operator for the operands.
+fn literal_casts(expr: &ast::Expr, env: &TypeEnv) -> Result<Vec<(usize, String)>> {
+    let (Some(resolver), Some(uses)) = (env.resolver(), operator_uses(expr)) else {
+        return Ok(Vec::new());
+    };
+    let OperatorUses { slots, pairs } = uses;
+    if slots.iter().any(|slot| is_hidden_column(slot, env)) {
+        return Ok(Vec::new());
+    }
+    let types: Vec<ExprType> = slots.iter().map(|slot| type_of(slot, env)).collect();
+    let mut casts: Vec<(usize, String)> = Vec::new();
+    let mut add_cast = |slot: usize, type_name: &str| {
+        let is_literal = matches!(
+            without_wrappers(slots[slot]),
+            ast::Expr::Literal(ast::Literal::String(_))
+        );
+        if is_literal && !casts.iter().any(|(done, _)| *done == slot) {
+            casts.push((slot, type_name.to_string()));
+        }
+    };
+    for (left, symbol, right) in pairs {
+        if matches!(types[left], ExprType::NotKnownYet)
+            || matches!(types[right], ExprType::NotKnownYet)
+        {
+            continue;
+        }
+        let operand_types = || {
+            vec![
+                dialect_operand_type(&types[left]),
+                dialect_operand_type(&types[right]),
+            ]
+        };
+        match resolver
+            .catalog
+            .dialect
+            .resolve_operator(symbol, &operand_types)
+        {
+            OperatorResolution::Keep => {}
+            OperatorResolution::Reject => {
+                let (lhs, rhs) = (&types[left], &types[right]);
+                crate::bail_parse_error!("operator does not exist: {lhs} {symbol} {rhs}");
+            }
+            OperatorResolution::CastUntyped(type_name) => {
+                add_cast(left, &type_name);
+                add_cast(right, &type_name);
+            }
+        }
+    }
+    Ok(casts)
+}
+
 /// The comparisons that `expr` makes: left operand, operator, right operand.
 fn comparisons_of(expr: &ast::Expr) -> Vec<(&ast::Expr, &'static str, &ast::Expr)> {
     match expr {
