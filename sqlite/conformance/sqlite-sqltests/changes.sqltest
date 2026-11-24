@@ -508,3 +508,26 @@ test changes-unchanged-by-create-unique-index {
 expect {
     3
 }
+
+# A window function buffers the rows of its frame in an ephemeral table.
+# Adding rows to that buffer and removing them is not a change to the database
+# and does not set last_insert_rowid().
+@cross-check-integrity
+test changes-ignores-window-frame-buffer {
+    create table t (x integer);
+    insert into t values (1), (2), (3), (4);
+    create table u (x integer);
+    insert into u values (100);
+    select sum(x) over (rows between 1 preceding and current row) from t;
+    select last_insert_rowid(), changes(), total_changes();
+    insert into u select sum(x) over (rows between 1 preceding and current row) from t;
+    select last_insert_rowid(), changes(), total_changes();
+}
+expect {
+    1
+    3
+    5
+    7
+    1|1|5
+    5|4|9
+}

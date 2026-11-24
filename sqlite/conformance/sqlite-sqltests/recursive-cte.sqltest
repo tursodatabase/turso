@@ -2063,3 +2063,32 @@ test recursive-cte-self-ref-with-call-arguments-rejected {
 expect error {
     too many arguments on cte1\(\) - max 0
 }
+
+# Without ORDER BY the queue is first in, first out. SQLite keeps it in an
+# ephemeral rowid table: NewRowid and Insert to add a row, Delete to take one.
+snapshot recursive-cte-union-all-queue-is-rowid-table {
+    WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 1000)
+    SELECT count(*) FROM s;
+}
+
+snapshot recursive-cte-union-queue-is-rowid-table {
+    WITH RECURSIVE s(i) AS (SELECT 1 UNION SELECT i + 1 FROM s WHERE i < 1000)
+    SELECT count(*) FROM s;
+}
+
+# Rows taken from the queue are not changes to the database.
+test recursive-cte-queue-rows-not-counted-as-changes {
+    CREATE TABLE t(x);
+    INSERT INTO t
+        WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 5)
+        SELECT i FROM s;
+    SELECT changes(), total_changes();
+    INSERT INTO t
+        WITH RECURSIVE s(i) AS (SELECT 1 UNION SELECT i % 3 + 1 FROM s)
+        SELECT i FROM s;
+    SELECT changes(), total_changes();
+}
+expect {
+    5|5
+    3|8
+}
