@@ -33,7 +33,7 @@ use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{prepare_cdc_if_necessary, Resolver};
 use crate::translate::expr::expr_type::{
     base_value_type, decode_type, first_and_third_arguments, iif_values, query_column_type,
-    value_type, ExprType,
+    value_type, BuiltinType, ExprType,
 };
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
@@ -1037,6 +1037,13 @@ fn check_ctas_column_types(
                 if type_def.is_domain || type_def.changes_stored_value() =>
             {
                 dialect.check_ctas_column_type(name, Some(&type_def.name))?
+            }
+            ExprType::Builtin(BuiltinType::Boolean) => {
+                if let Some(type_def) = resolver.schema().type_of_conditions() {
+                    if type_def.changes_stored_value() {
+                        dialect.check_ctas_column_type(name, Some(&type_def.name))?
+                    }
+                }
             }
             // An expression that cannot be typed here, such as DEFAULT, could
             // be a custom type.

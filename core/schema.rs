@@ -1429,7 +1429,7 @@ impl SchemaBuilder {
     /// define a built-in type differently from core. Every other name of a
     /// replaced type then names `ty` too: a dialect that defines `boolean`
     /// also defines `bool`, which core registered as an alias of its own
-    /// `boolean`.
+    /// `boolean`. A schema has at most one type of conditions.
     pub fn builtin_type(mut self, ty: &dyn crate::types::Type) -> crate::Result<Self> {
         let type_def = Arc::new(TypeDef::builtin(ty)?);
         for name in std::iter::once(ty.name()).chain(ty.aliases().iter().copied()) {
@@ -1441,6 +1441,17 @@ impl SchemaBuilder {
                 if Arc::ptr_eq(registered, &replaced) {
                     *registered = Arc::clone(&type_def);
                 }
+            }
+        }
+        if type_def.is_type_of_conditions {
+            let other = self.schema.type_registry.values().find(|registered| {
+                registered.is_type_of_conditions && !Arc::ptr_eq(registered, &type_def)
+            });
+            if let Some(other) = other {
+                return Err(crate::LimboError::InternalError(format!(
+                    "built-in types {} and {} are both the type of conditions",
+                    other.name, type_def.name
+                )));
             }
         }
         for alias in ty.aliases() {

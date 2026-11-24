@@ -1323,11 +1323,35 @@ fn conditions_are_reported_as_the_type_a_dialect_registers_for_them() {
         ),
         vec!["truth"; 2]
     );
-    // SQLite computes with a condition as an integer.
+    // A condition keeps its type in a VALUES list.
+    assert_eq!(declared_names("VALUES (1 < 2), (NOT 1)"), vec!["truth"]);
     assert_eq!(
-        declared_names("SELECT (a < 2) + 1, CASE WHEN a THEN a < 2 ELSE 5 END FROM t"),
-        vec!["INTEGER"; 2]
+        declared_names("SELECT column1 FROM (VALUES (1 < 2))"),
+        vec!["truth"]
     );
+    assert_eq!(
+        declared_names("WITH c AS (VALUES (1 < 2)) SELECT * FROM c"),
+        vec!["truth"]
+    );
+    assert_eq!(
+        declared_names("VALUES (1 < 2) UNION ALL VALUES (NOT 1)"),
+        vec!["truth"]
+    );
+    // A condition and an integer in a CASE give an integer.
+    assert_eq!(
+        declared_names("SELECT CASE WHEN a THEN a < 2 ELSE 5 END FROM t"),
+        vec!["INTEGER"]
+    );
+    // A condition has the operators of the type, and truth declares none.
+    for sql in ["SELECT (a < 2) + 1 FROM t", "SELECT f + 1 FROM t"] {
+        let error = conn.prepare(sql).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("operator does not exist: truth + integer"),
+            "{error}"
+        );
+    }
 
     // The value is still the integer 1 or 0.
     conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
@@ -1338,6 +1362,25 @@ fn conditions_are_reported_as_the_type_a_dialect_registers_for_them() {
         .unwrap();
     assert_eq!(rows, vec![vec![Value::from_i64(1), Value::from_i64(0)]]);
     conn.close().unwrap();
+}
+
+#[test]
+fn schema_has_at_most_one_type_of_conditions() {
+    let builder = || {
+        turso_core::schema::builtin::schema_builder(true)
+            .unwrap()
+            .builtin_type(&Truth)
+    };
+    assert!(builder().unwrap().builtin_type(&Truth).is_ok());
+    let Err(error) = builder().unwrap().builtin_type(&Verdict) else {
+        panic!("a second type of conditions was accepted");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("truth and verdict are both the type of conditions"),
+        "{error}"
+    );
 }
 
 /// A dialect that registers three types written in Rust: `loud`, a
@@ -1472,6 +1515,28 @@ struct Truth;
 impl Type for Truth {
     fn name(&self) -> &str {
         "truth"
+    }
+
+    fn params(&self) -> Vec<turso_core::ast::TypeParam> {
+        vec![value_param("integer")]
+    }
+
+    fn base(&self) -> &str {
+        "integer"
+    }
+
+    fn is_type_of_conditions(&self) -> bool {
+        true
+    }
+}
+
+/// A second type of conditions, which a schema refuses.
+#[derive(Debug)]
+struct Verdict;
+
+impl Type for Verdict {
+    fn name(&self) -> &str {
+        "verdict"
     }
 
     fn params(&self) -> Vec<turso_core::ast::TypeParam> {

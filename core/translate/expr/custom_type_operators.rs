@@ -200,6 +200,14 @@ impl<'a> Operand<'a> {
                         params: params.clone(),
                     })
             }
+            ExprType::Builtin(BuiltinType::Boolean) => {
+                env.schema()
+                    .type_of_conditions()
+                    .map(|type_def| ColumnCustomType {
+                        type_def: Arc::clone(type_def),
+                        params: Vec::new(),
+                    })
+            }
             _ => None,
         };
         let sqlite_type = sqlite_operand_type(expr_type.clone());

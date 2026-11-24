@@ -7,7 +7,7 @@ use crate::ast;
 use super::emitter::Resolver;
 use super::expr::expr_type::{type_of, BuiltinType, ExprType, TypeEnv};
 use super::plan::{ResultSetColumn, TableReferences};
-use crate::schema::Schema;
+use crate::schema::{Schema, Table};
 use crate::statement::{ColumnTypeInfo, ColumnTypeKind};
 
 pub(crate) fn result_column_types(
@@ -18,20 +18,37 @@ pub(crate) fn result_column_types(
     let env = TypeEnv::new(Some(table_references), resolver);
     result_columns
         .iter()
-        .map(|result_column| match &result_column.expr {
-            ast::Expr::Column { table, column, .. } => {
-                // A column of a subquery in FROM may be a condition of that
-                // subquery: `SELECT x FROM (SELECT a < b AS x FROM t)`.
-                match type_of(&result_column.expr, &env) {
-                    ty @ ExprType::Builtin(BuiltinType::Boolean) => {
-                        expression_type(&ty, resolver.schema())
-                    }
-                    _ => table_column_type(*table, *column, table_references, resolver.schema()),
-                }
+        .map(|result_column| {
+            if let Some(ty) = &result_column.values_condition_type {
+                return expression_type(ty, resolver.schema());
             }
-            expr => expression_type(&type_of(expr, &env), resolver.schema()),
+            match &result_column.expr {
+                ast::Expr::Column { table, column, .. } => {
+                    match type_of(&result_column.expr, &env) {
+                        ty if ty.is_condition() && reads_subquery(*table, table_references) => {
+                            expression_type(&ty, resolver.schema())
+                        }
+                        _ => {
+                            table_column_type(*table, *column, table_references, resolver.schema())
+                        }
+                    }
+                }
+                expr => expression_type(&type_of(expr, &env), resolver.schema()),
+            }
         })
         .collect()
+}
+
+/// Whether `table` is a subquery in FROM or a recursive CTE, whose columns are
+/// typed by the query that gives them.
+fn reads_subquery(table: ast::TableInternalId, table_references: &TableReferences) -> bool {
+    matches!(
+        table_references.find_table_by_internal_id(table),
+        Some((
+            _,
+            Table::FromClauseSubquery(_) | Table::RecursiveCteInput(_)
+        ))
+    )
 }
 
 /// A table column reports the type name it was declared with.

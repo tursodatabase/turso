@@ -1610,6 +1610,10 @@ fn wire_conditions_of_every_kind_report_bool() {
             "SELECT EXISTS (SELECT 1)",
             "SELECT pg_is_in_recovery()",
             "SELECT count(*) > 0 FROM (SELECT 1) AS s",
+            "SELECT * FROM (VALUES (1 < 2), (false)) AS v(x)",
+            "SELECT x FROM (SELECT 1 < 2 AS x UNION ALL SELECT false) AS s",
+            "VALUES (1 < 2)",
+            "WITH c AS (VALUES (1 < 2)) SELECT * FROM c",
             "SELECT CASE WHEN 1 < 2 THEN 1 < 3 ELSE false END",
             "SELECT coalesce(NULL, 1 < 2)",
         ] {

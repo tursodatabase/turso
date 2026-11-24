@@ -15,6 +15,7 @@ use crate::stack::trace_stack;
 use crate::sync::Arc;
 use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
 use crate::translate::emitter::{OperationMode, Resolver};
+use crate::translate::expr::expr_type::select_column_type;
 use crate::translate::expr::{
     bind_and_rewrite_expr, expr_contains_function_that_changes_within_statement, expr_vector_size,
     walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
@@ -632,6 +633,7 @@ fn prepare_one_select_plan(
                                 implicit_column_name,
                                 expr: *expr,
                                 contains_aggregates,
+                                values_condition_type: None,
                             });
                         }
                     }
@@ -978,6 +980,7 @@ fn prepare_one_select_plan(
                     alias: Some(format!("column{}", i + 1)),
                     implicit_column_name: None,
                     contains_aggregates: false,
+                    values_condition_type: None,
                 });
             }
 
@@ -1040,7 +1043,7 @@ fn prepare_one_select_plan(
                 }
             }
 
-            let plan = SelectPlan {
+            let mut plan = SelectPlan {
                 join_order: vec![],
                 table_references,
                 result_columns,
@@ -1063,9 +1066,22 @@ fn prepare_one_select_plan(
             };
 
             validate_expr_correct_column_counts(&plan)?;
+            if !is_insert_source {
+                set_values_condition_types(&mut plan, resolver);
+            }
 
             Ok(plan)
         }
+    }
+}
+
+fn set_values_condition_types(plan: &mut SelectPlan, resolver: &Resolver) {
+    if resolver.schema().type_of_conditions().is_none() {
+        return;
+    }
+    for column in 0..plan.result_columns.len() {
+        let ty = select_column_type(plan, column, resolver);
+        plan.result_columns[column].values_condition_type = ty.is_condition().then_some(ty);
     }
 }
 

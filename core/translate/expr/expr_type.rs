@@ -152,6 +152,18 @@ impl ExprType {
     }
 }
 
+impl ExprType {
+    /// Whether the value is a condition: a comparison, or a value of the
+    /// schema's type for conditions.
+    pub(crate) fn is_condition(&self) -> bool {
+        match self {
+            Self::Builtin(BuiltinType::Boolean) => true,
+            Self::Custom { type_def, .. } => type_def.is_type_of_conditions,
+            _ => false,
+        }
+    }
+}
+
 /// The type's name for an error message, as a column declares it: `date`,
 /// `integer[]`. An array whose element type nothing declares is `anyarray`,
 /// as in PostgreSQL.

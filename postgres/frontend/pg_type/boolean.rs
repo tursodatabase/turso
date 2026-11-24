@@ -57,6 +57,7 @@ impl Type for Boolean {
         Some(StorageClass::Integer)
     }
 
+    /// FIXME(pg-catalog): This hand-codes that the comparison operators and the other conditions return boolean, which is `oprresult` of each operator in pg_operator. A lookup of the operator in a pg_operator table replaces this.
     /// A comparison is a boolean in PostgreSQL.
     fn is_type_of_conditions(&self) -> bool {
         true

@@ -56,7 +56,7 @@ Basics not enumerated by the official feature matrix.
 | UPDATE (incl. FROM clause) | ✅ Supported | Multi-column `SET (a,b) = (...)` not supported; duplicate assignments and array-element/field targets rejected |
 | DELETE | 🟡 Partial | `USING` clause rejected |
 | CREATE TABLE | ✅ Supported | PK, NOT NULL, UNIQUE, DEFAULT, CHECK, FK (with ON DELETE/UPDATE actions); IF NOT EXISTS; tables are created STRICT |
-| CREATE TABLE AS / SELECT INTO | 🟡 Partial | Schema derived from the SELECT; a result column whose type converts values (timestamptz, timestamp, date, time, uuid, json, numeric, boolean, inet, domains, now()), is rejected with 0A000 because the copy would be a plain column; a copy of a varchar(n) or smallint column keeps the values but not the length or range check; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP, WITH (...), TABLESPACE, USING and ON COMMIT rejected; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
+| CREATE TABLE AS / SELECT INTO | 🟡 Partial | Schema derived from the SELECT; a result column whose type converts values (timestamptz, timestamp, date, time, uuid, json, numeric, boolean, a comparison or other condition, inet, domains, now()), is rejected with 0A000 because the copy would be a plain column; a copy of a varchar(n) or smallint column keeps the values but not the length or range check; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP, WITH (...), TABLESPACE, USING and ON COMMIT rejected; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
 | ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN, OWNER TO, ENABLE/DISABLE ROW LEVEL SECURITY work (RENAME TABLE, like CREATE INDEX, needs CREATE on the schema, which only a superuser has until GRANT exists); one subcommand per statement; ALTER COLUMN TYPE, IF [NOT] EXISTS (except for OWNER TO) and CASCADE rejected; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
 | ALTER TABLE/VIEW/MATERIALIZED VIEW/SEQUENCE/INDEX ... OWNER TO | 🟡 Partial | Changes the stored owner, which may then alter and drop the relation; a table's indexes and serial sequences move with it, ALTER INDEX changes nothing, and a serial column's sequence refuses its own OWNER TO (0A000); superuser-only for now, so an owner cannot transfer ownership |
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS. An index expression or a WHERE clause that uses `->` or `->>` fails with `0A000` |
@@ -187,6 +187,19 @@ numeric(p,s) keep their type modifiers; type modifiers on any other type,
 including char(n), timestamp(p) and bit(n), are rejected. xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
+
+A comparison, `AND`, `OR`, `NOT`, `IS` tests, `IN`, `BETWEEN`, `LIKE`, `EXISTS`,
+the regular expression operators, `= ANY(array)`, `@>`, `<@`, `&&` and the
+functions that answer a condition are boolean: they print as `t` or `f` and are
+described with OID 16. The type is kept through a subquery in FROM, a CTE, a
+view, a VALUES list, a UNION, a CASE and a coalesce. Still different from
+PostgreSQL: a boolean cast to text is `1` or `0`, a boolean in an array prints
+as `1` or `0`, arithmetic on a boolean fails with 42601 and not 42883, CREATE
+TABLE AS of a condition fails with 0A000, and `pg_is_in_recovery()` is true
+where a primary gives false. A subquery in FROM and a VALUES list in FROM keep only this type
+and the types of table columns: any other column, such as `1` or `now()`, is
+described with a wrong type, such as bytea, and a date or time value from it
+prints as it is stored.
 
 time, timetz and interval, and arrays of every date and time type
 (`date[]`, `timestamp[]` and `timestamptz[]` included), are rejected as not

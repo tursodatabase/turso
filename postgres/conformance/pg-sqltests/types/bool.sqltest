@@ -155,11 +155,42 @@ expect {
     t|t|t|t
 }
 
+test condition-keeps-boolean-in-values {
+    SELECT * FROM (VALUES (1 < 2), (false)) AS v(x);
+}
+expect {
+    t
+    f
+}
+
+test condition-keeps-boolean-in-top-level-values {
+    VALUES (1 < 2), (true);
+}
+expect {
+    t
+    t
+}
+
+test condition-keeps-boolean-in-cte-over-values {
+    WITH c AS (VALUES (1 < 2)) SELECT * FROM c;
+}
+expect {
+    t
+}
+
 test condition-keeps-boolean-in-subquery {
     SELECT x, y FROM (SELECT 1 < 2 AS x, 'a' ~ 'a' AS y) AS s;
 }
 expect {
     t|t
+}
+
+test condition-keeps-boolean-in-union {
+    SELECT x FROM (SELECT 'a' ~ 'a' AS x UNION ALL SELECT false) AS s;
+}
+expect {
+    t
+    f
 }
 
 test condition-keeps-boolean-in-case-and-coalesce {
@@ -200,4 +231,42 @@ test view-over-condition-gives-boolean {
 expect {
     1|f|t
     3|t|t
+}
+
+# A condition has no arithmetic operators, as a boolean column has none.
+test condition-plus-an-integer-errors {
+    SELECT (1 < 2) + 1;
+}
+expect error {
+    operator does not exist: boolean \+ integer
+}
+
+test negated-condition-errors {
+    SELECT -(1 < 2);
+}
+expect error {
+    operator does not exist: - boolean
+}
+
+test condition-from-a-subquery-plus-an-integer-errors {
+    SELECT x + 1 FROM (SELECT 'a' ~ 'a' AS x) AS s;
+}
+expect error {
+    operator does not exist: boolean \+ integer
+}
+
+test date-plus-a-condition-errors {
+    CREATE TABLE t (d date);
+    INSERT INTO t VALUES ('2024-01-05');
+    SELECT d + (1 < 2) FROM t;
+}
+expect error {
+    operator does not exist: date \+ boolean
+}
+
+test condition-cast-to-integer-has-arithmetic {
+    SELECT (1 < 2)::int + 1, -(2 < 1)::int;
+}
+expect {
+    2|0
 }

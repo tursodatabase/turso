@@ -223,6 +223,7 @@ fn prepare_window_subquery(
             alias: None,
             implicit_column_name: None,
             contains_aggregates: false,
+            values_condition_type: None,
         });
     }
 
@@ -585,6 +586,7 @@ fn push_new_subquery_column(
         alias: None,
         implicit_column_name: None,
         contains_aggregates,
+        values_condition_type: None,
     });
 }
 
