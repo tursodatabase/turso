@@ -975,6 +975,7 @@ fn check_type_accepts_collate(ty: &ExprType, schema: &Schema) -> Result<()> {
     )))
 }
 
+/// FIXME(pg-catalog): This refuses comparisons by the stored forms of two types because Turso cannot look up which pg_operator entry PostgreSQL would run, so it may refuse a comparison PostgreSQL accepts. A lookup in pg_operator, with pg_cast for implicit coercion, replaces this.
 /// The one decision that two values of different custom types do not compare.
 /// A domain compares as the type it is declared on, so two domains over one
 /// type, or a domain and its base, compare as that type does. After that,
