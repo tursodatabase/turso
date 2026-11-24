@@ -1725,6 +1725,29 @@ mod tests {
         assert_eq!(rows, [[Value::from_text("1")]]);
     }
 
+    /// Known gap: PostgreSQL reads the text '20240101' of an untyped
+    /// parameter compared with a date column as the date 2024-01-01.
+    /// tursopg binds the number-like text as a number, and the comparison
+    /// refuses it with 22007 "only text can be converted to date".
+    #[test]
+    fn untyped_number_like_parameter_compared_with_date_is_a_known_gap() {
+        let conn = memory_connection();
+        conn.execute("CREATE TABLE w (d date)").unwrap();
+        conn.execute("INSERT INTO w VALUES ('2024-01-01')").unwrap();
+        let mut portal = Portal::<String>::default();
+        portal.statement = Arc::new(StoredStatement::new(
+            String::new(),
+            String::new(),
+            vec![None],
+        ));
+        portal.parameters = vec![Some(b"20240101".to_vec().into())];
+        let mut stmt = conn.prepare("SELECT count(*) FROM w WHERE d = $1").unwrap();
+        bind_portal_parameters(&mut stmt, &portal).unwrap();
+        // PostgreSQL 18 returns one row with count 1.
+        let error = stmt.run_collect_rows().unwrap_err();
+        assert_eq!(error.sqlstate, "22007");
+    }
+
     #[test]
     fn a_refused_binary_format_aborts_the_transaction_block() {
         let (mut client, _conn) = copy_test_client();
