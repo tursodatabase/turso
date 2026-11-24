@@ -829,3 +829,17 @@ expect error {}
 expect @tursopg {
     2020-01-01
 }
+
+# PostgreSQL finds no common type for an integer and a timestamp in one VALUES
+# column; tursopg accepts them.
+@compat-gap "syntax:values"
+test in-values-mixing-integer-and-timestamp {
+    CREATE TABLE t (id int, ts timestamp, tz timestamptz);
+    INSERT INTO t VALUES (1, '2024-01-05 00:00:00', '2024-01-05 00:00:00+00');
+    SELECT tz IN (VALUES (1), (ts)) FROM t;
+}
+@sqlstate 42804
+expect error {}
+expect @tursopg {
+    1
+}

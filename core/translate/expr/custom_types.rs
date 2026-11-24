@@ -715,6 +715,7 @@ pub(crate) fn emit_store_value(
     Ok(())
 }
 
+/// FIXME(pg-catalog): This decides by type properties whether a pg_cast entry from `source` to `target` exists, and the text-reading target test stands in for the target side of that lookup. A source that casts to numbers and booleans skips the check for every target, so jsonb::bytea is not refused, although pg_cast has no entry from jsonb to bytea. A lookup in a pg_cast table replaces this.
 /// Fails when a CAST of a value of the custom type `source` to `target`, which
 /// `custom_type_cast_chain` resolves for a custom type and is None for a plain
 /// type written as `target_name`, would read the text of `source` as another
