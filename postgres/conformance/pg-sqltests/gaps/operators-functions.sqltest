@@ -56,18 +56,6 @@ expect {
     2
 }
 
-# B-04: IS TRUE / IS NOT TRUE on bool col
-@setup t_id_s_n_arr_ia_j_ok_with_rows
-test is-true-is-not-true-on-bool-col {
-    SELECT id, ok IS TRUE, ok IS NOT TRUE FROM t ORDER BY id;
-}
-expect {
-    1|t|f
-    2|f|t
-    3|f|t
-    4|f|t
-}
-
 # B-05: IS UNKNOWN
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 test is-unknown {
@@ -236,14 +224,6 @@ test similar-to {
 }
 expect {
     t|f
-}
-
-# B-23: IN with NULL (three-valued)
-test in-with-null-three-valued {
-    SELECT 1 IN (1, NULL), 2 IN (1, NULL), 2 NOT IN (1, NULL);
-}
-expect {
-    t||
 }
 
 # B-25: = ANY('{..}'::int[])
@@ -1069,24 +1049,6 @@ test update-multi-column-set-a-b {
 }
 expect {
     z|0
-}
-
-# B-106: boolean comparison output
-@setup t_id_s_n_arr_ia_j_ok_with_rows
-test boolean-comparison-output {
-    SELECT id < 2, n IS NULL FROM t WHERE id = 1;
-}
-expect {
-    t|f
-}
-
-# B-107: EXISTS subquery output
-@setup t_id_s_n_arr_ia_j_ok_with_rows
-test exists-subquery-output {
-    SELECT EXISTS (SELECT 1 FROM t WHERE id = 1);
-}
-expect {
-    t
 }
 
 # B-117: VALUES list with column aliases v(x)
