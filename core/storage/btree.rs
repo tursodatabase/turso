@@ -4168,7 +4168,7 @@ impl BTreeCursor {
                     #[cfg(debug_assertions)]
                     validate_cells_after_insertion(&cell_array, is_table_leaf);
 
-                    /* 3. Initiliaze current size of every page including overflow cells and divider cells that might be included. */
+                    /* 3. Initiliaze current size of every page including overflow cells. Divider cells are not counted because they are stored in the parent page, not in the sibling. */
                     let mut new_page_sizes: [i64; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE] =
                         [0; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE];
                     let header_size = if is_leaf {
@@ -4190,13 +4190,6 @@ impl BTreeCursor {
                         for overflow in &page_contents.overflow_cells {
                             // 2 to account of pointer
                             new_page_sizes[i] += 2 + overflow.payload.len() as i64;
-                        }
-                        let is_last_sibling = i == balance_info.sibling_count - 1;
-                        if !is_leaf && !is_last_sibling {
-                            // Account for divider cell which is included in this page.
-                            new_page_sizes[i] += cell_array.cell_payloads
-                                [cell_array.cell_count_up_to_page(i)]
-                            .len() as i64;
                         }
                     }
 
