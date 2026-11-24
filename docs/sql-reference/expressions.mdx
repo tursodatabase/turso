@@ -77,7 +77,7 @@ SELECT 10 / 3.0;         -- 3.333... (real division)
 SELECT CAST(10 AS REAL) / 3;  -- 3.333...
 ```
 
-Through the PostgreSQL frontend, `-` fails with SQLSTATE 42883, as in PostgreSQL, when its right operand is a boolean expression such as `a = b`. It also fails with 42883 when its right operand is a cast to json, uuid, xml, macaddr, bit, varbit, tsvector, tsquery, oid, regclass or regtype. A cast to inet or cidr on the right of `-` fails with SQLSTATE 0A000, because the frontend cannot run `inet - inet`.
+Through the PostgreSQL frontend, `-` fails with SQLSTATE 42883, as in PostgreSQL, when its right operand is a boolean expression such as `a = b`. It also fails with 42883 when its right operand is a cast to json, uuid, xml, macaddr, bit, varbit, tsvector, tsquery, oid, regclass or regtype. A cast to inet or cidr on the right of `-` fails with SQLSTATE 0A000, because the frontend cannot run `inet - inet`. The frontend reads the syntax of the right operand, also in a scalar subquery, CASE, COALESCE, GREATEST, LEAST and NULLIF. It does not see such a value when a function or a column of a subquery gives it. Thus `'{}'::jsonb - gen_random_uuid()` gives `{}`, where PostgreSQL fails with 42883.
 
 ### Comparison Operators
 

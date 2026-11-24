@@ -142,6 +142,52 @@ test jsonb-delete-of-exists-errors {
 @sqlstate 42883
 expect error {}
 
+# The check also reads the result of a scalar subquery, CASE, COALESCE,
+# GREATEST and NULLIF.
+test jsonb-delete-of-boolean-subquery-errors {
+    SELECT '[1,2]'::jsonb - (SELECT 1 < 2);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-boolean-case-errors {
+    SELECT '[1,2]'::jsonb - CASE WHEN true THEN 1 = 1 END;
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-boolean-coalesce-errors {
+    SELECT '[1,2]'::jsonb - coalesce(1 = 2, false);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-boolean-greatest-errors {
+    SELECT '[1,2]'::jsonb - greatest(1 = 1, false);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-boolean-nullif-errors {
+    SELECT '[1,2]'::jsonb - nullif(1 = 1, false);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-uuid-subquery-errors {
+    SELECT '{}'::jsonb - (SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid);
+}
+@sqlstate 42883
+expect error {}
+
+# A subquery or a CASE that gives an integer deletes an element.
+test jsonb-delete-of-integer-subquery-and-case {
+    SELECT '[1,2]'::jsonb - (SELECT 1), '[1,2]'::jsonb - CASE WHEN true THEN 0 END;
+}
+expect {
+    [1]|[2]
+}
+
 test jsonb-delete-of-json-errors {
     SELECT '{"a":1}'::jsonb - '"a"'::json;
 }
@@ -241,6 +287,30 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {}
+
+# The check of the right operand of - reads its syntax. It does not see a
+# boolean that a column of a subquery gives, so - reads the boolean as the
+# integer 1 and deletes the element at index 1.
+@compat-gap "operator:jsonb - boolean"
+test jsonb-delete-of-boolean-column-of-subquery {
+    SELECT j - b FROM (SELECT '[1,2]'::jsonb AS j, 1 < 2 AS b) s;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    [1]
+}
+
+# gen_random_uuid() gives its uuid as text, so - reads it as a key.
+@compat-gap "operator:jsonb - uuid"
+test jsonb-delete-of-uuid-function {
+    SELECT '{}'::jsonb - gen_random_uuid();
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    {}
+}
 
 # The check of the types of a CHECK constraint does not know the operators
 # of custom types.
