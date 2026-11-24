@@ -348,7 +348,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-@compat-gap "type:interval"
+@compat-gap "function:pg_typeof"
 test now-minus-interval-days {
     SELECT pg_typeof(now() - interval '7 days');
     SELECT count(*) FROM (SELECT 1) AS one WHERE (now() - interval '7 days') < now() + interval '1000 years';
@@ -842,4 +842,16 @@ test in-values-mixing-integer-and-timestamp {
 expect error {}
 expect @tursopg {
     1
+}
+
+# tursopg checks the left side of `+ interval` when it computes a row, not
+# when it plans the statement, so with no rows to compute there is no error.
+@compat-gap "operator:integer + interval"
+test integer-plus-interval-over-no-rows {
+    CREATE TABLE t (i int);
+    SELECT i + interval '1 day' FROM t;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
 }
