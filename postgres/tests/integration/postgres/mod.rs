@@ -9,6 +9,7 @@ mod namespace;
 mod parse_edge_cases;
 mod role;
 mod row_security;
+mod seeded_catalogs;
 mod sequence;
 mod table;
 mod type_aliases;

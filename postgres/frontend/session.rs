@@ -596,7 +596,7 @@ fn translate_statement<'a>(
         .translate_with_prereqs(&parse_result)
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
     let sql = write_out_renamed_serial_columns(&pg_conn.conn, sql, &translated.serial_sequences)?;
-    reject_catalog_dml(translated.cmd.stmt())?;
+    reject_catalog_dml(&pg_conn.conn, translated.cmd.stmt())?;
     reject_catalog_ddl(translated.cmd.stmt())?;
     match translated.cmd.stmt() {
         ast::Stmt::DropView { view_name, .. } => {
@@ -1821,17 +1821,20 @@ pub(crate) fn current_schemas(conn: &Connection, include_implicit: bool) -> Vec<
     schemas
 }
 
-fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
-    let table_name = match stmt {
-        ast::Stmt::Insert { tbl_name, .. } => Some(tbl_name.name.as_str()),
-        ast::Stmt::Delete { tbl_name, .. } => Some(tbl_name.name.as_str()),
-        ast::Stmt::Update(update) => Some(update.tbl_name.name.as_str()),
+/// Refuses a statement that inserts, updates or deletes rows of a catalog.
+/// PostgreSQL refuses it for a role that is not a superuser.
+fn reject_catalog_dml(conn: &Connection, stmt: &ast::Stmt) -> Result<()> {
+    let qualified_name = match stmt {
+        ast::Stmt::Insert { tbl_name, .. } => Some(tbl_name),
+        ast::Stmt::Delete { tbl_name, .. } => Some(tbl_name),
+        ast::Stmt::Update(update) => Some(&update.tbl_name),
         _ => None,
     };
 
-    let Some(table_name) = table_name else {
+    let Some(qualified_name) = qualified_name else {
         return Ok(());
     };
+    let table_name = qualified_name.name.as_str();
 
     if !catalog::is_catalog_table_name(table_name) {
         return Ok(());
@@ -1847,6 +1850,26 @@ fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
         return Err(sqlstate_error(
             SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE,
             format!("cannot {verb} view \"{table_name}\""),
+            None,
+        ));
+    }
+    // PostgreSQL lets a superuser change the built-in rows of a catalog,
+    // but not truncate it. These rows describe what the engine does, and the
+    // engine does not read them, so a change would not change what it does.
+    // A table of the same name in a schema of the user's is not a catalog.
+    let truncate = matches!(stmt, ast::Stmt::Delete { truncate: true, .. });
+    let in_catalog_schema = qualified_name
+        .namespace
+        .as_ref()
+        .is_none_or(|schema| schema.as_str() == "main");
+    if !truncate
+        && in_catalog_schema
+        && crate::schema_init::is_seeded_catalog(table_name)
+        && conn.current_role_is_superuser()
+    {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("changing the rows of pg_catalog table \"{table_name}\" is not supported"),
             None,
         ));
     }

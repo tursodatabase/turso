@@ -5,8 +5,9 @@
 
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::Schema;
-use turso_core::Result;
+use turso_core::{Catalog, Result};
 
+use crate::classes::PostgresCatalog;
 use crate::descriptions::DESCRIPTION_TABLE_NAME;
 use crate::{auth_members, classes, descriptions, roles};
 
@@ -44,11 +45,21 @@ pub(crate) fn initialize_statements(
 }
 
 /// Whether `name` in the root namespace is a catalog table that this
-/// frontend stores. Every role reads such a table and no user statement
+/// frontend stores, or a seeded catalog, which core serves until a
+/// statement stores it. Every role reads such a table and no user statement
 /// writes it.
 pub(crate) fn is_stored_catalog_table(namespace: NamespaceId, name: &str) -> bool {
     namespace.is_root()
-        && STORED_CATALOG_TABLES
+        && (STORED_CATALOG_TABLES
             .iter()
             .any(|table| name.eq_ignore_ascii_case(table))
+            || is_seeded_catalog(name))
+}
+
+/// Whether `name` is a seeded catalog of the frontend.
+pub(crate) fn is_seeded_catalog(name: &str) -> bool {
+    PostgresCatalog
+        .seeded_tables()
+        .iter()
+        .any(|table| name.eq_ignore_ascii_case(table.name))
 }

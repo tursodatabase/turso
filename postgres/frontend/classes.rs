@@ -31,6 +31,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use turso_core::ast;
+use turso_core::dialect::SeededTable;
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::{
     is_user_relation_name, BTreeTable, RelationKind, Schema, SQLITE_SEQUENCE_TABLE_NAME,
@@ -676,6 +677,10 @@ impl Catalog for PostgresCatalog {
 
     fn load_steps(&self) -> Vec<Box<dyn LoadStep>> {
         crate::schema_state::load_steps()
+    }
+
+    fn seeded_tables(&self) -> &'static [SeededTable] {
+        &crate::seeded::SEEDED_CATALOGS
     }
 }
 

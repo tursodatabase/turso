@@ -3037,19 +3037,6 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_partitioned_table (partrelid INTEGER, partstrat TEXT, partnatts INTEGER, partdefid INTEGER, partattrs TEXT, partclass TEXT, partcollation TEXT, partexprs TEXT)".to_string() },
     );
     options = options.native_module(
-        "pg_collation",
-        VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable {
-            create_sql: "CREATE TABLE pg_collation (
-                oid INTEGER, collname TEXT, collnamespace INTEGER, collowner INTEGER,
-                collprovider TEXT, collisdeterministic INTEGER, collencoding INTEGER,
-                collcollate TEXT, collctype TEXT, colliculocale TEXT, collicurules TEXT,
-                collversion TEXT, tableoid INTEGER HIDDEN
-            )"
-            .to_string(),
-        },
-    );
-    options = options.native_module(
         "pg_seclabels",
         VTabKind::TableValuedFunction,
         EmptyPgCatalogTable {
@@ -3103,17 +3090,6 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         },
     );
     options = options.native_module(
-        "pg_cast",
-        VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable {
-            create_sql: "CREATE TABLE pg_cast (
-                oid INTEGER, castsource INTEGER, casttarget INTEGER, castfunc INTEGER,
-                castcontext TEXT, castmethod TEXT, tableoid INTEGER HIDDEN
-            )"
-            .to_string(),
-        },
-    );
-    options = options.native_module(
         "pg_transform",
         VTabKind::TableValuedFunction,
         EmptyPgCatalogTable {
@@ -3130,30 +3106,6 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         SnapshotCatalog::<PgLanguageTable>(PhantomData),
     );
     for (name, create_sql) in [
-        (
-            "pg_operator",
-            "CREATE TABLE pg_operator (
-            oid INTEGER, oprname TEXT, oprnamespace INTEGER, oprowner INTEGER,
-            oprkind TEXT, oprcanmerge BOOLEAN, oprcanhash BOOLEAN, oprleft INTEGER,
-            oprright INTEGER, oprresult INTEGER, oprcom INTEGER, oprnegate INTEGER,
-            oprcode INTEGER, oprrest INTEGER, oprjoin INTEGER, tableoid INTEGER HIDDEN
-        )",
-        ),
-        (
-            "pg_opclass",
-            "CREATE TABLE pg_opclass (
-            oid INTEGER, opcmethod INTEGER, opcname TEXT, opcnamespace INTEGER,
-            opcowner INTEGER, opcfamily INTEGER, opcintype INTEGER, opcdefault BOOLEAN,
-            opckeytype INTEGER, tableoid INTEGER HIDDEN
-        )",
-        ),
-        (
-            "pg_opfamily",
-            "CREATE TABLE pg_opfamily (
-            oid INTEGER, opfmethod INTEGER, opfname TEXT, opfnamespace INTEGER,
-            opfowner INTEGER, tableoid INTEGER HIDDEN
-        )",
-        ),
         (
             "pg_ts_parser",
             "CREATE TABLE pg_ts_parser (
@@ -3213,14 +3165,6 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         )",
         ),
         (
-            "pg_range",
-            "CREATE TABLE pg_range (
-            rngtypid INTEGER, rngsubtype INTEGER, rngmultitypid INTEGER,
-            rngcollation INTEGER, rngsubopc INTEGER, rngcanonical INTEGER,
-            rngsubdiff INTEGER, tableoid INTEGER HIDDEN
-        )",
-        ),
-        (
             "pg_event_trigger",
             "CREATE TABLE pg_event_trigger (
             oid INTEGER, evtname TEXT, evtevent TEXT, evtowner INTEGER, evtfoid INTEGER,
@@ -3241,21 +3185,6 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             "pg_largeobject_metadata",
             "CREATE TABLE pg_largeobject_metadata (
             oid INTEGER, lomowner INTEGER, lomacl TEXT[], tableoid INTEGER HIDDEN
-        )",
-        ),
-        (
-            "pg_amop",
-            "CREATE TABLE pg_amop (
-            oid INTEGER, amopfamily INTEGER, amoplefttype INTEGER, amoprighttype INTEGER,
-            amopstrategy INTEGER, amoppurpose TEXT, amopopr INTEGER, amopmethod INTEGER,
-            amopsortfamily INTEGER, tableoid INTEGER HIDDEN
-        )",
-        ),
-        (
-            "pg_amproc",
-            "CREATE TABLE pg_amproc (
-            oid INTEGER, amprocfamily INTEGER, amproclefttype INTEGER, amprocrighttype INTEGER,
-            amprocnum INTEGER, amproc INTEGER, tableoid INTEGER HIDDEN
         )",
         ),
     ] {

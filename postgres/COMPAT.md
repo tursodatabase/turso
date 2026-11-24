@@ -90,8 +90,26 @@ The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 `pg_policy` (row-level security policies, with `polqual` and `polwithcheck`
 as the text `pg_get_expr` prints), `pg_policies`, plus `pg_input_error_info`. Present but
 always empty: `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
-`pg_foreign_table`, `pg_partitioned_table`, `pg_collation`,
+`pg_foreign_table`, `pg_partitioned_table`,
 `pg_publication*`, `pg_seclabels` (security labels are not supported).
+`pg_operator`, `pg_cast`, `pg_opclass`, `pg_opfamily`, `pg_amop`, `pg_amproc`,
+`pg_range` and `pg_collation` have the built-in rows of PostgreSQL 18, with the
+columns of PostgreSQL 18 in its order, and the hidden system column `tableoid`.
+The database file has no rows for them: TursoPG serves the rows from memory. A
+lookup by `oid` reads one row. `pg_collation` has `colllocale`, which
+PostgreSQL 16 calls `colliculocale`, so the `\dO` command of psql fails: psql
+asks for `colliculocale` because TursoPG reports server version 16. It does not
+have the collations that `initdb` imports from the operating system. A
+`regproc` column (`oprcode`, `oprrest`, `oprjoin`, `amproc`, `rngcanonical`,
+`rngsubdiff`) shows the oid of the function, where PostgreSQL shows its name. A
+join with `pg_proc`, `pg_type` or `pg_am` finds only the rows that these
+catalogs have, which are not the built-in rows of PostgreSQL, and a `pg_proc`
+row can have the oid of another built-in function of PostgreSQL. Thus psql's
+`\dC`, `\do`, `\dAc`, `\dAf`, `\dAo` and `\dAp` show the rows of these
+catalogs with wrong or empty function names, and with `unknown` for each type
+that `format_type` does not know. No statement
+changes the rows: a role that is not a superuser gets `42501`, and a superuser,
+whom PostgreSQL lets change them, gets `0A000`.
 `pg_description` is a stored table. It has the comments that `COMMENT ON`
 stored, and the default `standard public schema` comment for `public`, so
 pg_dump does not emit a command to clear that comment on restore. Dropping a

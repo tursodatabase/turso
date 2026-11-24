@@ -247,17 +247,13 @@ expect {
     1|updated
 }
 
-@skip-if postgres "PostgreSQL fills pg_init_privs and pg_cast"
+@skip-if postgres "PostgreSQL fills pg_init_privs"
 test pg-function-support-catalogs-are-empty {
     SET search_path TO '';
     SELECT * FROM pg_init_privs;
     SELECT * FROM pg_catalog.pg_init_privs;
     SELECT objoid, classoid, objsubid, privtype, initprivs, tableoid FROM pg_init_privs;
     SELECT objoid, classoid, objsubid, privtype, initprivs, tableoid FROM pg_catalog.pg_init_privs;
-    SELECT * FROM pg_cast;
-    SELECT * FROM pg_catalog.pg_cast;
-    SELECT oid, castsource, casttarget, castfunc, castcontext, castmethod, tableoid FROM pg_cast;
-    SELECT oid, castsource, casttarget, castfunc, castcontext, castmethod, tableoid FROM pg_catalog.pg_cast;
     SELECT * FROM pg_transform;
     SELECT * FROM pg_catalog.pg_transform;
     SELECT oid, trftype, trflang, trffromsql, trftosql, tableoid FROM pg_transform;
@@ -351,12 +347,6 @@ expect {}
 @skip-if postgres "PostgreSQL fills these catalogs, and only a superuser can read pg_subscription"
 test pg-object-unsupported-catalogs-are-empty {
     SET search_path TO '';
-    SELECT tableoid FROM pg_operator;
-    SELECT tableoid FROM pg_catalog.pg_operator;
-    SELECT tableoid FROM pg_opclass;
-    SELECT tableoid FROM pg_catalog.pg_opclass;
-    SELECT tableoid FROM pg_opfamily;
-    SELECT tableoid FROM pg_catalog.pg_opfamily;
     SELECT tableoid FROM pg_ts_parser;
     SELECT tableoid FROM pg_catalog.pg_ts_parser;
     SELECT tableoid FROM pg_ts_template;
@@ -373,23 +363,13 @@ test pg-object-unsupported-catalogs-are-empty {
     SELECT tableoid FROM pg_catalog.pg_default_acl;
     SELECT tableoid FROM pg_conversion;
     SELECT tableoid FROM pg_catalog.pg_conversion;
-    SELECT tableoid FROM pg_range;
-    SELECT tableoid FROM pg_catalog.pg_range;
     SELECT tableoid FROM pg_event_trigger;
     SELECT tableoid FROM pg_catalog.pg_event_trigger;
     SELECT tableoid FROM pg_subscription;
     SELECT tableoid FROM pg_catalog.pg_subscription;
     SELECT tableoid FROM pg_largeobject_metadata;
     SELECT tableoid FROM pg_catalog.pg_largeobject_metadata;
-    SELECT tableoid FROM pg_amop;
-    SELECT tableoid FROM pg_catalog.pg_amop;
-    SELECT tableoid FROM pg_amproc;
-    SELECT tableoid FROM pg_catalog.pg_amproc;
 
-    SELECT tableoid, oid, oprname, oprnamespace, oprowner, oprkind, oprleft,
-           oprright, oprcode::oid AS oprcode FROM pg_operator;
-    SELECT tableoid, oid, opcmethod, opcname, opcnamespace, opcowner FROM pg_opclass;
-    SELECT tableoid, oid, opfmethod, opfname, opfnamespace, opfowner FROM pg_opfamily;
     SELECT tableoid, oid, prsname, prsnamespace, prsstart::oid, prstoken::oid,
            prsend::oid, prsheadline::oid, prslextype::oid FROM pg_ts_parser;
     SELECT tableoid, oid, tmplname, tmplnamespace, tmplinit::oid, tmpllexize::oid
@@ -402,9 +382,6 @@ test pg-object-unsupported-catalogs-are-empty {
              CASE WHEN defaclobjtype = 'S' THEN 's'::"char" ELSE defaclobjtype END,
              defaclrole) ELSE '{}' END AS acldefault FROM pg_default_acl;
     SELECT tableoid, oid, conname, connamespace, conowner FROM pg_conversion;
-    SELECT tableoid, oid, castsource, casttarget, castfunc, castcontext, castmethod
-    FROM pg_cast c WHERE NOT EXISTS (SELECT 1 FROM pg_range r
-      WHERE c.castsource = r.rngtypid AND c.casttarget = r.rngmultitypid) ORDER BY 3,4;
     SELECT s.tableoid, s.oid, s.subname, s.subowner, s.subconninfo, s.subslotname,
            s.subsynccommit, s.subpublications, s.subbinary, s.substream,
            s.subtwophasestate, s.subdisableonerr, s.subpasswordrequired,
@@ -415,6 +392,154 @@ test pg-object-unsupported-catalogs-are-empty {
     FROM pg_largeobject_metadata;
 }
 expect {}
+
+# pg_operator, pg_cast, pg_opclass, pg_opfamily, pg_amop, pg_amproc, pg_range
+# and pg_collation have the built-in rows of PostgreSQL 18. PostgreSQL adds
+# no rows to them when it creates a database, except the collations of the
+# operating system in pg_collation.
+test pg-builtin-catalogs-have-the-builtin-rows {
+    SET search_path TO '';
+    SELECT 'pg_operator', count(*) FROM pg_operator
+    UNION ALL SELECT 'pg_cast', count(*) FROM pg_cast
+    UNION ALL SELECT 'pg_opclass', count(*) FROM pg_catalog.pg_opclass
+    UNION ALL SELECT 'pg_opfamily', count(*) FROM pg_opfamily
+    UNION ALL SELECT 'pg_amop', count(*) FROM pg_catalog.pg_amop
+    UNION ALL SELECT 'pg_amproc', count(*) FROM pg_amproc
+    UNION ALL SELECT 'pg_range', count(*) FROM pg_catalog.pg_range;
+}
+expect {
+    pg_operator|799
+    pg_cast|235
+    pg_opclass|177
+    pg_opfamily|146
+    pg_amop|945
+    pg_amproc|714
+    pg_range|6
+}
+
+test pg-builtin-catalogs-tableoid {
+    SET search_path TO '';
+    SELECT DISTINCT 'pg_operator', tableoid FROM pg_operator
+    UNION ALL SELECT DISTINCT 'pg_cast', tableoid FROM pg_catalog.pg_cast
+    UNION ALL SELECT DISTINCT 'pg_opclass', tableoid FROM pg_opclass
+    UNION ALL SELECT DISTINCT 'pg_opfamily', tableoid FROM pg_catalog.pg_opfamily
+    UNION ALL SELECT DISTINCT 'pg_amop', tableoid FROM pg_amop
+    UNION ALL SELECT DISTINCT 'pg_amproc', tableoid FROM pg_catalog.pg_amproc
+    UNION ALL SELECT DISTINCT 'pg_range', tableoid FROM pg_range
+    UNION ALL SELECT DISTINCT 'pg_collation', tableoid FROM pg_catalog.pg_collation;
+}
+expect {
+    pg_operator|2617
+    pg_cast|2605
+    pg_opclass|2616
+    pg_opfamily|2753
+    pg_amop|2602
+    pg_amproc|2603
+    pg_range|3541
+    pg_collation|3456
+}
+
+test pg-cast-builtin-row {
+    SELECT * FROM pg_cast WHERE oid = 10000;
+    SELECT oid FROM pg_cast WHERE castsource = 20 AND casttarget = 21;
+}
+expect {
+    10000|20|21|714|a|f
+    10000
+}
+
+test pg-operator-builtin-row {
+    SELECT oid, oprname, oprnamespace, oprowner, oprkind, oprcanmerge, oprcanhash,
+           oprleft, oprright, oprresult, oprcom, oprnegate
+    FROM pg_operator WHERE oid = 96;
+}
+expect {
+    96|=|11|10|b|t|t|23|23|16|96|518
+}
+
+test pg-opclass-and-opfamily-builtin-rows {
+    SELECT * FROM pg_opclass WHERE oid = 1978;
+    SELECT * FROM pg_opfamily WHERE oid = 1976;
+    SELECT oid, opcname FROM pg_opclass WHERE opcfamily = 1976 AND opcdefault ORDER BY oid;
+}
+expect {
+    1978|403|int4_ops|11|10|1976|23|t|0
+    1976|403|integer_ops|11|10
+    1978|int4_ops
+    1979|int2_ops
+    3124|int8_ops
+}
+
+test pg-amop-and-amproc-builtin-rows {
+    SELECT amopfamily, amoplefttype, amoprighttype, amopstrategy, amoppurpose, amopopr,
+           amopmethod, amopsortfamily
+    FROM pg_amop WHERE amopopr = 96 ORDER BY amopmethod, amopfamily;
+    SELECT amprocfamily, amproclefttype, amprocrighttype, amprocnum, amproc::oid
+    FROM pg_amproc WHERE amprocfamily = 1976 AND amproclefttype = 23
+      AND amprocrighttype = 23 ORDER BY amprocnum;
+}
+expect {
+    1976|23|23|3|s|96|403|0
+    1977|23|23|1|s|96|405|0
+    4054|23|23|3|s|96|3580|0
+    4572|23|23|1|s|96|3580|0
+    4602|23|23|3|s|96|3580|0
+    1976|23|23|1|351
+    1976|23|23|2|3130
+    1976|23|23|3|4128
+    1976|23|23|4|5051
+    1976|23|23|6|6403
+}
+
+test pg-range-builtin-rows {
+    SELECT rngtypid, rngsubtype, rngmultitypid, rngcollation, rngsubopc,
+           rngcanonical::oid, rngsubdiff::oid
+    FROM pg_range ORDER BY rngtypid;
+}
+expect {
+    3904|23|4451|0|1978|3914|3922
+    3906|1700|4532|0|3125|0|3924
+    3908|1114|4533|0|3128|0|3929
+    3910|1184|4534|0|3127|0|3930
+    3912|1082|4535|0|3122|3915|3925
+    3926|20|4536|0|3124|3928|3923
+}
+
+test pg-collation-builtin-rows {
+    SELECT oid, collname, collnamespace, collowner, collprovider, collisdeterministic,
+           collencoding, collcollate, collctype
+    FROM pg_collation WHERE oid IN (100, 950, 951) ORDER BY oid;
+}
+expect {
+    100|default|11|10|d|t|-1||
+    950|C|11|10|c|t|-1|C|C
+    951|POSIX|11|10|c|t|-1|POSIX|POSIX
+}
+
+# The queries of pg_dump find the built-in rows, with the tableoid of each
+# catalog.
+test pg-dump-discovers-builtin-operators-casts-and-classes {
+    SELECT tableoid, oid, oprname, oprnamespace, oprowner, oprkind, oprleft,
+           oprright, oprcode::oid AS oprcode FROM pg_operator WHERE oid = 96;
+    SELECT tableoid, oid, opcmethod, opcname, opcnamespace, opcowner
+    FROM pg_opclass WHERE oid = 1978;
+    SELECT tableoid, oid, opfmethod, opfname, opfnamespace, opfowner
+    FROM pg_opfamily WHERE oid = 1976;
+    SELECT tableoid, oid, collname, collnamespace, collowner, collencoding
+    FROM pg_catalog.pg_collation WHERE oid = 950;
+    SELECT count(*), min(tableoid), max(tableoid) FROM (
+      SELECT tableoid, oid, castsource, casttarget, castfunc, castcontext, castmethod
+      FROM pg_cast c WHERE NOT EXISTS (SELECT 1 FROM pg_range r
+        WHERE c.castsource = r.rngtypid AND c.casttarget = r.rngmultitypid)
+      ORDER BY 3,4) AS casts;
+}
+expect {
+    2617|96|=|11|10|b|23|23|65
+    2616|1978|403|int4_ops|11|10
+    2753|1976|403|integer_ops|11|10
+    3456|950|C|11|10|-1
+    229|2605|2605
+}
 
 test pg-object-operator-is-read-only {
     CREATE ROLE reader_of_object_operator_is_read_only_role;

@@ -76,6 +76,13 @@ impl TableSql {
 /// PostgreSQL frontend gives its catalog tables. An array is TEXT, because
 /// SQLite has no array type and core decodes arrays only in STRICT tables,
 /// which a seeded table cannot be.
+///
+/// FIXME(pg-catalog): A `regproc` column is INTEGER, so the PostgreSQL
+/// frontend prints the oid of the function. PostgreSQL prints the name of
+/// the function with `regprocout`: `-` for 0, and the name with its schema
+/// when the name alone does not find the function. Result columns that
+/// carry PostgreSQL types, printed with the output function that pg_type
+/// gives, replace this.
 pub(crate) fn column_type(bki_type: &str) -> Option<&'static str> {
     Some(match bki_type {
         "oid" | "regproc" | "xid" | "int2" | "int4" | "int8" => "INTEGER",

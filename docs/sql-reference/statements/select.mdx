@@ -669,6 +669,18 @@ it is not included in `SELECT *`.
 `pg_catalog.pg_publication_namespace` expose the hidden system column `tableoid`
 for publication discovery. These catalogs currently return no rows. Select `tableoid` explicitly; it is not included in `SELECT *`.
 
+Through the PostgreSQL frontend, `pg_catalog.pg_operator`, `pg_catalog.pg_cast`,
+`pg_catalog.pg_opclass`, `pg_catalog.pg_opfamily`, `pg_catalog.pg_amop`,
+`pg_catalog.pg_amproc`, `pg_catalog.pg_range` and `pg_catalog.pg_collation`
+return the built-in rows of PostgreSQL 18, with the columns of PostgreSQL 18 in
+the same order. They also expose the hidden system column `tableoid`, the oid
+of the catalog in `pg_class`, such as 2605 for `pg_cast`. Select `tableoid`
+explicitly; it is not included in `SELECT *`. A `boolean` column shows `t` or
+`f`. A `regproc` column, such as `pg_operator.oprcode`, shows the oid of the
+function, where PostgreSQL shows its name. `INSERT`, `UPDATE` and `DELETE` on
+these catalogs fail: with SQLSTATE 42501 for a role that is not a superuser,
+and with SQLSTATE 0A000 for a superuser.
+
 `pg_catalog.pg_seclabels` exposes the security-label columns `objoid`, `classoid`,
 `objsubid`, `objtype`, `objnamespace`, `objname`, `provider`, and `label`. It
 currently returns no rows because security labels are not supported.
