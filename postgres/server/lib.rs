@@ -433,6 +433,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         }
         let stmt = conn.prepare(&target.statement).map_err(pg_error)?;
 
+        // FIXME(pg-catalog): This describes a parameter with no declared type as text, where PostgreSQL gives the type its context requires. A typed expression tree replaces this.
         let param_types: Vec<Type> = target
             .parameter_types
             .iter()
@@ -895,6 +896,7 @@ fn bind_portal_parameters(
     Ok(())
 }
 
+/// FIXME(pg-catalog): This refuses a binary parameter of unknown type because Turso cannot work out its type from the query. A typed expression tree replaces this refusal.
 /// Reads parameter `$n` sent in binary format as `pg_type`, the type Parse
 /// declared for it. A type whose binary format is its text is read as in text
 /// format. A parameter whose type Parse left out or left unspecified (OID 0)
@@ -914,6 +916,7 @@ fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResul
     }
 }
 
+/// FIXME(pg-catalog): This reads a parameter by the type that Parse declared, and the UNKNOWN arm guesses one for the others. A typed expression tree that gives each parameter the type of its context replaces this.
 /// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
 /// Assumes text format encoding (UTF-8 string representations).
 fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
@@ -961,6 +964,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 Ok(Value::from_blob(bytes.to_vec()))
             }
         }
+        // FIXME(pg-catalog): PostgreSQL resolves an unknown-type parameter from its context, as an operand of an operator or a function or as a target column. A typed expression tree replaces this guess.
         // UNKNOWN: try to infer type from text content (numeric-looking values
         // should be bound as numbers so comparisons with COUNT/SUM etc. work)
         Type::UNKNOWN => {
