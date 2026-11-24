@@ -19,3 +19,30 @@ setup schema {
 snapshot constant-parameter-hoisted-out-of-scan {
     SELECT COUNT(*) FROM t WHERE LENGTH(zeroblob(?)) = ?;
 }
+
+setup integer_table {
+    CREATE TABLE s (x INTEGER);
+}
+
+# A statement loads each distinct constant into one register in the init
+# section, and each use of the constant reads that register, as in SQLite.
+# Each snapshot below has one `Integer 100`.
+@setup integer_table
+snapshot equal-constants-share-register-in-where-and-result {
+    SELECT x + 100 FROM s WHERE x < 100;
+}
+
+@setup integer_table
+snapshot equal-constants-share-register-in-where {
+    SELECT x FROM s WHERE x < 100 AND x + 100 > 0;
+}
+
+@setup integer_table
+snapshot equal-constants-share-register-in-union-all {
+    SELECT x FROM s WHERE x < 100 UNION ALL SELECT x FROM s WHERE x < 100;
+}
+
+@setup integer_table
+snapshot equal-constants-share-register-in-recursive-cte {
+    WITH RECURSIVE t(a) AS (SELECT 1 UNION ALL SELECT a * 2 FROM t WHERE a < 100 UNION ALL SELECT a * 3 FROM t WHERE a < 100) SELECT a FROM t;
+}

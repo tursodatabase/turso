@@ -122,10 +122,10 @@ addr  opcode          p1   p2   p3  p4            p5  comment
   96    Yield          1  106    0                 0
   97    Rewind         3  105    0                 0  Rewind  ephemeral()
   98      Column       3    1   17                 0  r[17]=ephemeral().maxp
-  99      Copy         3   41    0                 0  r[41]=r[3]
- 100      Copy        17   42    0                 0  r[42]=r[17]
- 101      Add         41   42   39                 0  r[39]=r[41]+r[42]
- 102      Le          39   40  104  Binary         0  if r[39]<=r[40] goto 104
+  99      Copy         3   40    0                 0  r[40]=r[3]
+ 100      Copy        17   41    0                 0  r[41]=r[17]
+ 101      Add         40   41   39                 0  r[39]=r[40]+r[41]
+ 102      Le          39   42  104  Binary         0  if r[39]<=r[42] goto 104
  103      AggStep      0   43   37  count          0  accum=r[37] step(r[43])
  104    Next           3   98    0                 0
  105  Goto             0   96    0                 0
@@ -134,6 +134,6 @@ addr  opcode          p1   p2   p3  p4            p5  comment
  108  ResultRow       36    1    0                 0  output=r[36]
  109  Halt             0    0    0                 0
  110  Transaction      0    1    2                 0  iDb=0 tx_mode=Read
- 111  Integer          3   40    0                 0  r[40]=3
+ 111  Integer          3   42    0                 0  r[42]=3
  112  Integer          1   43    0                 0  r[43]=1
  113  Goto             0    1    0                 0

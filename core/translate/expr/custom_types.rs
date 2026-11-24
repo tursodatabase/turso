@@ -115,6 +115,32 @@ fn translate_compared_value(
     }
 }
 
+/// Like [translate_compared_value], but returns the register that holds
+/// `operand`. [resolve_expr()] chooses it, unless `operand` is read as a value
+/// of a custom type.
+pub(crate) fn resolve_compared_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    other: &ast::Expr,
+    resolver: &Resolver,
+) -> Result<usize> {
+    match untyped_operand_type(operand, other, referenced_tables, resolver)? {
+        Some(resolved) => {
+            let reg = program.alloc_register();
+            translate_untyped_operand_as(
+                program,
+                referenced_tables,
+                operand,
+                &resolved,
+                reg,
+                resolver,
+            )
+        }
+        None => resolve_expr(program, referenced_tables, operand, resolver),
+    }
+}
+
 /// Translates the two operands of a comparison into `lhs_reg` and `rhs_reg`.
 /// See [translate_compared_operand].
 pub(crate) fn translate_compared_pair(

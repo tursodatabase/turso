@@ -1126,7 +1126,10 @@ fn op_comparison_slow(
         (_, _) => {}
     }
 
-    // If all else failed, do an affinity-aware comparison
+    // If all else failed, do an affinity-aware comparison. As in SQLite, the
+    // converted values are only compared, and the registers keep their values:
+    // other instructions read them too, such as the other uses of a constant,
+    // or the record of a row that a CHECK constraint compares a column of.
     let (new_lhs, new_rhs) = (
         affinity.convert_for_compare(lhs_value),
         affinity.convert_for_compare(rhs_value),
@@ -1139,24 +1142,6 @@ fn op_comparison_slow(
         .as_ref()
         .map_or(Either::Left(rhs_value), Either::Right);
     let should_jump = op.compare(lhs_for_compare, rhs_for_compare, collation)?;
-
-    match (new_lhs, new_rhs) {
-        (Some(new_lhs), None) => {
-            state.registers[lhs].set_value(new_lhs.as_value_ref().to_owned()?);
-        }
-        (None, Some(new_rhs)) => {
-            state.registers[rhs].set_value(new_rhs.as_value_ref().to_owned()?);
-        }
-        (Some(new_lhs), Some(new_rhs)) => {
-            let (new_lhs, new_rhs) = (
-                new_lhs.as_value_ref().to_owned()?,
-                new_rhs.as_value_ref().to_owned()?,
-            );
-            state.registers[lhs].set_value(new_lhs);
-            state.registers[rhs].set_value(new_rhs);
-        }
-        (None, None) => {}
-    }
 
     take_jump_if!(should_jump);
 }

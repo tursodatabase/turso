@@ -284,6 +284,16 @@ pub struct ProgramBuilder {
     /// that are deemed to be compile-time constant and can be hoisted out of loops
     /// so that they get evaluated only once at the start of the program.
     pub constant_spans: Vec<(usize, usize)>,
+    /// Constant expressions that `resolve_expr` moved to the init section, with
+    /// the register that holds the value of each. An equal constant reads that
+    /// register instead of loading the value again, as SQLite's
+    /// `sqlite3ExprCodeRunJustOnce()` does.
+    reusable_constants: Vec<(ast::Expr, usize)>,
+    /// The number of [Self::constants_in_place_start] calls that
+    /// [Self::constant_spans_invalidate_after] has not ended. While it is not
+    /// zero, a constant stays where it is emitted, so its register cannot be
+    /// reused.
+    constants_in_place_depth: usize,
     /// Cursors that are referenced by the program. Indexed by [CursorKey].
     /// Certain types of cursors do not need a [CursorKey] (e.g. temp tables, sorter),
     /// because they never need to use [ProgramBuilder::resolve_cursor_id] to find it
@@ -891,6 +901,8 @@ impl ProgramBuilder {
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
             constant_spans: Vec::new(),
+            reusable_constants: Vec::new(),
+            constants_in_place_depth: 0,
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
             max_label_anchor: None,
             explain: ExplainInfo::default(),
@@ -1254,7 +1266,12 @@ impl ProgramBuilder {
         );
         let first_span_of_emit = self.constant_spans.len();
         let first_insn = self.insns.len();
-        let result = emit(self)?;
+        // The code that `emit` emits can branch, so a constant inside it is
+        // not always loaded, and its register cannot be reused.
+        self.constants_in_place_depth += 1;
+        let result = emit(self);
+        self.constants_in_place_depth -= 1;
+        let result = result?;
         // One span over everything `emit` emitted replaces the spans of the
         // constant expressions inside it.
         self.constant_spans.truncate(first_span_of_emit);
@@ -1272,9 +1289,15 @@ impl ProgramBuilder {
     }
 
     /// Get the index of the next constant span.
-    /// Used in `crate::translate::expr::translate_expr_no_constant_opt()` to invalidate
-    /// all constant spans after the given index.
     pub const fn constant_spans_next_idx(&self) -> usize {
+        self.constant_spans.len()
+    }
+
+    /// Starts code whose constant expressions stay where they are emitted,
+    /// and returns the index of the next constant span. The code ends with
+    /// [Self::constant_spans_invalidate_after] called with that index.
+    pub fn constants_in_place_start(&mut self) -> usize {
+        self.constants_in_place_depth += 1;
         self.constant_spans.len()
     }
 
@@ -1282,7 +1305,44 @@ impl ProgramBuilder {
     /// be sure that constant optimization is never used for translating a given expression.
     /// See `crate::translate::expr::translate_expr_no_constant_opt()` for more details.
     pub fn constant_spans_invalidate_after(&mut self, idx: usize) {
+        self.constants_in_place_depth -= 1;
         self.constant_spans.truncate(idx);
+    }
+
+    /// Whether the register of a constant can be given to an equal constant.
+    /// A subprogram does not move its constants to an init section (see
+    /// [Self::epilogue]), and [Self::constants_in_place_start] keeps them
+    /// where they are emitted, so in both a constant is not loaded before
+    /// every instruction that would read its register.
+    fn constants_are_reusable(&self) -> bool {
+        !self.flags.is_subprogram() && self.constants_in_place_depth == 0
+    }
+
+    /// The register of a constant equal to `expr` that
+    /// [Self::add_reusable_constant] recorded.
+    pub fn reusable_constant_register(&self, expr: &ast::Expr) -> Option<usize> {
+        if !self.constants_are_reusable() {
+            return None;
+        }
+        self.reusable_constants
+            .iter()
+            .find(|(constant, _)| constant == expr)
+            .map(|(_, reg)| *reg)
+    }
+
+    /// Records that `reg` holds the value of the constant `expr`, which the
+    /// instructions from the start of the constant span `span_idx` to the last
+    /// instruction load. It records nothing unless all of those instructions
+    /// are in that span: only then do they move to the init section, which
+    /// runs before any instruction that can read `reg`.
+    pub fn add_reusable_constant(&mut self, expr: &ast::Expr, reg: usize, span_idx: usize) {
+        if !self.constants_are_reusable() || self.constant_spans.len() != span_idx + 1 {
+            return;
+        }
+        let (start, end) = self.constant_spans[span_idx];
+        if start <= end && end + 1 == self.insns.len() {
+            self.reusable_constants.push((expr.clone(), reg));
+        }
     }
 
     pub fn alloc_register(&mut self) -> usize {

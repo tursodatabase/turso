@@ -930,6 +930,12 @@ fn managed_aggregate_variadic_callbacks_receive_callsite_arg_count(
         conn.exec_rows("SELECT managed_variadic_sum(first) FROM variadic_items WHERE 0");
     assert_eq!(empty, vec![(0,)]);
 
+    // The WHERE clause loads 100 and 200 before the aggregate arguments do.
+    let shared_constants: Vec<(i64,)> = conn.exec_rows(
+        "SELECT managed_variadic_sum(100, 200) FROM variadic_items WHERE first < 200 AND second < 100",
+    );
+    assert_eq!(shared_constants, vec![(604,)]);
+
     unregister_extension_function(&conn, "managed_variadic_sum")?;
     assert_eq!(counters.context_drops.load(AtomicOrdering::SeqCst), 1);
     assert_eq!(
