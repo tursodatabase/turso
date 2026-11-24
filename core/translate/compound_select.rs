@@ -11,12 +11,13 @@ use crate::translate::eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod};
 use crate::translate::expr::translate_expr;
 use crate::translate::order_by::sorter_insert;
 use crate::translate::plan::{
-    CompoundOrderByKey, EvalAt, Plan, QueryDestination, SelectPlan, SubqueryOrigin,
+    CompoundOrderByKey, EvalAt, Plan, QueryDestination, ResultSetColumn, SelectPlan, SubqueryOrigin,
 };
 use crate::translate::result_row::emit_columns_to_destination;
 use crate::translate::subquery::emit_non_from_clause_subqueries_for_eval_at;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{Insn, SorterOpenData};
+use crate::vdbe::CursorID;
 use crate::{emit_explain, LimboError};
 use tracing::instrument;
 
@@ -25,12 +26,71 @@ use tracing::Level;
 /// Emits bytecode for a compound SELECT statement (UNION, INTERSECT, EXCEPT, UNION ALL).
 /// Returns the result column start register when in coroutine mode (for CTE subqueries),
 /// or None for top-level queries.
+///
+/// This function is on the stack one time for each level of nested compound
+/// subqueries. The work before and after the emission of the SELECTs is in
+/// functions that are not inlined, so that their values are not in this frame
+/// while the SELECTs are emitted.
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_compound_select(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     plan: &mut Plan,
 ) -> crate::Result<Option<usize>> {
+    let emission = prepare_compound_select(program, resolver, plan)?;
+    let Plan::CompoundSelect {
+        left, right_most, ..
+    } = plan
+    else {
+        unreachable!()
+    };
+
+    program.with_scoped_result_cols_start(|program| {
+        emit_compound_select(
+            program,
+            left,
+            right_most,
+            &emission.limit,
+            &emission.offset,
+            &emission.right_most_ctx.resolver,
+            &emission.collations,
+            emission.limit_ctx,
+            emission.offset_reg,
+            emission.reg_result_cols_start,
+        )
+    })?;
+    finish_compound_select(program, plan, emission)
+}
+
+/// The values that [emit_program_for_compound_select] makes before it emits
+/// the SELECTs of a compound query, and reads after them.
+struct CompoundSelectEmission<'a> {
+    order_by: Option<Vec<CompoundOrderByKey>>,
+    limit: Option<Box<Expr>>,
+    offset: Option<Box<Expr>>,
+    right_most_ctx: Box<TranslateCtx<'a>>,
+    limit_ctx: Option<LimitCtx>,
+    offset_reg: Option<usize>,
+    /// The destination of the compound query. With ORDER BY, the SELECTs
+    /// write to a collection index, and the sorted rows go to this
+    /// destination.
+    real_query_destination: QueryDestination,
+    num_result_cols: usize,
+    collations: Vec<CollationSeq>,
+    collection_cursor: Option<CursorID>,
+    collection_index: Option<Arc<Index>>,
+    reg_result_cols_start: Option<usize>,
+    leftmost_result_columns: Vec<ResultSetColumn>,
+}
+
+/// Prepares the emission of the SELECTs of a compound query: the LIMIT and
+/// OFFSET counters, the destination of the SELECTs, and the result registers.
+#[inline(never)]
+fn prepare_compound_select<'a>(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver<'a>,
+    plan: &mut Plan,
+) -> crate::Result<Box<CompoundSelectEmission<'a>>> {
     let Plan::CompoundSelect {
         left,
         right_most,
@@ -45,12 +105,12 @@ pub fn emit_program_for_compound_select(
     let order_by_owned = order_by.clone();
     let limit_owned = limit.clone();
     let offset_owned = offset.clone();
-    let right_most_ctx = Box::new(TranslateCtx::new(
+    let right_most_ctx = TranslateCtx::new_boxed(
         program,
         resolver.fork_with_expr_cache(),
         right_most.table_references.joined_tables().len(),
         false,
-    ));
+    );
 
     emit_non_from_clause_subqueries_for_eval_at(
         program,
@@ -208,27 +268,44 @@ pub fn emit_program_for_compound_select(
     if has_order_by {
         set_select_plan_destination(plan, &query_destination);
     }
-    let Plan::CompoundSelect {
-        left, right_most, ..
-    } = plan
-    else {
-        unreachable!()
-    };
+    Ok(Box::new(CompoundSelectEmission {
+        order_by: order_by_owned,
+        limit: limit_owned,
+        offset: offset_owned,
+        right_most_ctx,
+        limit_ctx,
+        offset_reg,
+        real_query_destination,
+        num_result_cols,
+        collations,
+        collection_cursor,
+        collection_index,
+        reg_result_cols_start,
+        leftmost_result_columns,
+    }))
+}
 
-    program.with_scoped_result_cols_start(|program| {
-        emit_compound_select(
-            program,
-            left,
-            right_most,
-            &limit_owned,
-            &offset_owned,
-            &right_most_ctx.resolver,
-            &collations,
-            limit_ctx,
-            offset_reg,
-            reg_result_cols_start,
-        )
-    })?;
+/// Sorts the rows of a compound query that has ORDER BY, and sets the result
+/// columns of the program, after the SELECTs of the query are emitted.
+#[inline(never)]
+fn finish_compound_select(
+    program: &mut ProgramBuilder,
+    plan: &mut Plan,
+    emission: Box<CompoundSelectEmission>,
+) -> crate::Result<Option<usize>> {
+    let CompoundSelectEmission {
+        order_by: order_by_owned,
+        limit: limit_owned,
+        offset: offset_owned,
+        right_most_ctx,
+        real_query_destination,
+        num_result_cols,
+        collection_cursor,
+        collection_index,
+        reg_result_cols_start,
+        leftmost_result_columns,
+        ..
+    } = *emission;
     program.pop_current_parent_explain();
 
     // Install the compound query's result columns. Emission of nested subqueries above may
@@ -293,12 +370,12 @@ fn emit_compound_select(
             jump_if_null: false,
         });
     }
-    let mut right_most_ctx = Box::new(TranslateCtx::new(
+    let mut right_most_ctx = TranslateCtx::new_boxed(
         program,
         resolver.fork_with_expr_cache(),
         right_most.table_references.joined_tables().len(),
         false,
-    ));
+    );
     right_most_ctx.reg_result_cols_start = reg_result_cols_start;
     match left.split_last_mut() {
         Some(((plan, operator), left)) => match operator {
