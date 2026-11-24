@@ -59,12 +59,7 @@ pub(crate) fn emit_catalog(code: &mut String, catalog: &Catalog) -> Result<(), S
     // The oid that identifies a row, for a catalog that has one: the
     // first column, when a unique index is on that column alone.
     let key = fields.first().filter(|first| {
-        first.kind == ColumnKind::Oid
-            && !first.nullable
-            && catalog
-                .unique_indexes
-                .iter()
-                .any(|index| index.len() == 1 && index[0] == first.name)
+        first.kind == ColumnKind::Oid && !first.nullable && catalog.has_unique_index_on(first.name)
     });
 
     let left_out = ROWS_LEFT_OUT
