@@ -117,6 +117,15 @@ pub trait Type: Debug + Send + Sync {
         None
     }
 
+    /// Whether a comparison and the other conditions (`NOT`, `AND`, `OR`,
+    /// `IN`, `BETWEEN`, `IS NULL`, `LIKE`, `EXISTS`) give a value of this
+    /// type. Their value is the integer 1 or 0 or NULL, so the type must
+    /// store and read these as they are. Without such a type in the schema a
+    /// condition is an integer, as in SQLite. A schema has at most one.
+    fn is_type_of_conditions(&self) -> bool {
+        false
+    }
+
     /// The value of a column of the type that has no DEFAULT of its own.
     fn default(&self) -> Option<Box<ast::Expr>> {
         None
