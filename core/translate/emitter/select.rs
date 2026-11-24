@@ -184,6 +184,7 @@ pub fn emit_query<'a>(
             &plan.table_references,
             has_group_by_exprs,
             plan.distinctness != Distinctness::NonDistinct,
+            plan.limit.is_some(),
             &plan.aggregates,
         )?;
     }

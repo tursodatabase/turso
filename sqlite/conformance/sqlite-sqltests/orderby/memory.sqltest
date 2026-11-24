@@ -436,3 +436,72 @@ expect {
     1|0|0|SEARCH u USING INTEGER PRIMARY KEY (rowid=?)
     2|0|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
 }
+
+# ORDER BY with LIMIT keeps the top rows in an ephemeral index. A negative
+# LIMIT means no limit, so every row is kept.
+@cross-check-integrity
+test orderby_limit_negative {
+    CREATE TABLE t(x, y);
+    INSERT INTO t VALUES (5,'a'),(3,'b'),(9,'c'),(1,'d'),(3,'e'),(NULL,'f'),(7,'g');
+    SELECT x, y FROM t ORDER BY x LIMIT -1;
+}
+expect {
+    |f
+    1|d
+    3|b
+    3|e
+    5|a
+    7|g
+    9|c
+}
+
+@cross-check-integrity
+test orderby_limit_negative_offset {
+    CREATE TABLE t(x, y);
+    INSERT INTO t VALUES (5,'a'),(3,'b'),(9,'c'),(1,'d'),(3,'e'),(NULL,'f'),(7,'g');
+    SELECT x, y FROM t ORDER BY x DESC LIMIT -1 OFFSET 2;
+}
+expect {
+    5|a
+    3|b
+    3|e
+    1|d
+    |f
+}
+
+@cross-check-integrity
+test orderby_limit_offset_replaces_rows {
+    CREATE TABLE t(x, y);
+    INSERT INTO t VALUES (5,'a'),(3,'b'),(9,'c'),(1,'d'),(3,'e'),(NULL,'f'),(7,'g');
+    SELECT x, y FROM t ORDER BY x LIMIT 2 OFFSET 1;
+}
+expect {
+    1|d
+    3|b
+}
+
+# Rows that tie on the sort key keep their scan order, also when the LIMIT
+# cuts through the tied rows.
+@cross-check-integrity
+test orderby_limit_ties_keep_scan_order {
+    CREATE TABLE t(x, y);
+    INSERT INTO t VALUES (1,'z'),(1,'y'),(0,'x'),(1,'w'),(1,'a');
+    SELECT x, y FROM t ORDER BY x LIMIT 3;
+}
+expect {
+    0|x
+    1|z
+    1|y
+}
+
+@cross-check-integrity
+test orderby_limit_from_subquery_negative {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (2),(1),(3);
+    SELECT x FROM t ORDER BY x LIMIT (SELECT -5);
+}
+expect {
+    1
+    2
+    3
+}

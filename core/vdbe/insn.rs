@@ -834,6 +834,12 @@ pub enum Insn {
         target_pc: BranchOffset,
         decrement_by: usize,
     },
+    /// If the given register is not zero, decrement it if it is positive and jump to the given PC.
+    /// If the register is zero, leave it unchanged and fall through.
+    IfNotZero {
+        reg: usize,
+        target_pc: BranchOffset,
+    },
     /// If the given register is not NULL, jump to the given PC.
     NotNull {
         reg: usize,
@@ -2483,6 +2489,7 @@ impl InsnVariants {
             InsnVariants::Jump => execute::op_jump,
             InsnVariants::Move => execute::op_move,
             InsnVariants::IfPos => execute::op_if_pos,
+            InsnVariants::IfNotZero => execute::op_if_not_zero,
             InsnVariants::NotNull => execute::op_not_null,
             InsnVariants::Eq => execute::op_eq,
             InsnVariants::Ne => execute::op_ne,
