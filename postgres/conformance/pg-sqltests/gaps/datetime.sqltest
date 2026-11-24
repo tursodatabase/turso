@@ -859,3 +859,45 @@ expect {
 expect @tursopg {
     0
 }
+
+# sum, avg and abs have no date version in PostgreSQL. tursopg applies them
+# to the number the date is stored as.
+@compat-gap "function:sum"
+test sum-of-date-column {
+    CREATE TABLE date_sums (d date);
+    INSERT INTO date_sums VALUES ('2020-01-01');
+    SELECT sum(d) FROM date_sums;
+}
+@sqlstate 42883
+expect error {
+    function sum\(date\) does not exist
+}
+expect @tursopg {
+    2020.0
+}
+
+@compat-gap "function:avg"
+test avg-of-date-column {
+    CREATE TABLE date_avgs (d date);
+    INSERT INTO date_avgs VALUES ('2020-01-01');
+    SELECT avg(d) FROM date_avgs;
+}
+@sqlstate 42883
+expect error {
+    function avg\(date\) does not exist
+}
+expect @tursopg {
+    2020.0
+}
+
+@compat-gap "function:abs"
+test abs-of-date {
+    SELECT abs(DATE '2020-01-01');
+}
+@sqlstate 42883
+expect error {
+    function abs\(date\) does not exist
+}
+expect @tursopg {
+    2020.0
+}
