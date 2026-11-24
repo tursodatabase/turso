@@ -12404,7 +12404,15 @@ pub fn op_insert(
                 // instead of page 1.
                 let is_schema_root = root_page == 1
                     || root_page == i64::from(crate::mvcc::database::SQLITE_SCHEMA_MVCC_TABLE_ID);
-                if !is_schema_root && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT) {
+                // A cursor opened with OpenEphemeral, OpenAutoindex or OpenDup writes to an
+                // ephemeral B-tree, so the emitter does not have to set the flag for it.
+                let is_ephemeral = flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
+                    || program
+                        .prepared()
+                        .explain
+                        .ephemeral_cursors
+                        .contains(cursor_id);
+                if !is_schema_root && !is_ephemeral {
                     state.active_op_state.insert().sub_state = OpInsertSubState::UpdateLastRowid;
                 } else {
                     // Schema table and ephemeral writes must not produce
@@ -12774,9 +12782,17 @@ pub fn op_delete(
     }
 
     state.active_op_state.clear();
-    if !is_part_of_update {
-        // DELETEs do not count towards the total changes if they are part of an UPDATE statement,
-        // i.e. the DELETE and subsequent INSERT of a row are the same "change".
+    // DELETEs do not count towards the total changes if they are part of an UPDATE statement,
+    // i.e. the DELETE and subsequent INSERT of a row are the same "change". Rows removed
+    // from an ephemeral table, such as a recursive CTE queue or a window frame buffer,
+    // are not changes to the database either.
+    if !is_part_of_update
+        && !program
+            .prepared()
+            .explain
+            .ephemeral_cursors
+            .contains(cursor_id)
+    {
         state.record_statement_change();
     }
     state.pc += 1;
