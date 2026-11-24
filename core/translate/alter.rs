@@ -4648,6 +4648,22 @@ impl crate::util::AstVisitor for RenameTableRefCheck<'_> {
     fn report_target_tables(&self) -> bool {
         true
     }
+
+    fn trigger_table(&mut self, trigger: &crate::schema::Trigger) -> Result<()> {
+        // A TEMP trigger `ON aux.s` keeps the database its qualifier resolved
+        // to, so name its table with that database rather than looking `s` up
+        // in temp and main. A database that is no longer attached has no name,
+        // and the bare name reports the table as missing, as before.
+        let table_name = ast::Name::exact(trigger.table_name.clone());
+        let name = match trigger
+            .target_database_id
+            .and_then(|database_id| self.resolver.namespace_name(database_id))
+        {
+            Some(db_name) => ast::QualifiedName::fullname(ast::Name::exact(db_name), table_name),
+            None => ast::QualifiedName::single(table_name),
+        };
+        self.table(&name)
+    }
 }
 
 fn table_reference_exists_after_rename(

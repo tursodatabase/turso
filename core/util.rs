@@ -1452,6 +1452,16 @@ pub trait AstVisitor {
     fn report_target_tables(&self) -> bool {
         false
     }
+
+    /// A trigger's own table, when `report_target_tables` is on. By default it
+    /// goes to `table()` by its bare name. `trigger.target_database_id` holds
+    /// the database an `ON db.t` qualifier resolved to, for a visitor that
+    /// needs to look the table up there.
+    fn trigger_table(&mut self, trigger: &Trigger) -> Result<()> {
+        self.table(&ast::QualifiedName::single(ast::Name::exact(
+            trigger.table_name.clone(),
+        )))
+    }
 }
 
 impl<F> AstVisitor for F
@@ -1725,9 +1735,7 @@ pub fn visit_stmt<V: AstVisitor>(stmt: &ast::Stmt, visitor: &mut V) -> Result<()
 /// when the visitor asks for target tables.
 pub fn visit_trigger<V: AstVisitor>(trigger: &Trigger, visitor: &mut V) -> Result<()> {
     if visitor.report_target_tables() {
-        visitor.table(&ast::QualifiedName::single(ast::Name::exact(
-            trigger.table_name.clone(),
-        )))?;
+        visitor.trigger_table(trigger)?;
     }
     if let Some(when_clause) = &trigger.when_clause {
         visit_expr_with_subqueries(when_clause, visitor)?;

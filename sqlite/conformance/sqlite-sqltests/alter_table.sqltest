@@ -2532,6 +2532,68 @@ expect {
     CREATE TABLE tt_m6 (y)
 }
 
+# A TEMP trigger on an attached table (ON aux.s) names its table with the
+# database. ALTER TABLE on any table must look the trigger's table up in aux,
+# not in temp or main.
+test alter-table-rename-column-with-temp-trigger-on-attached-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.tt_s7 (a);
+    CREATE TABLE tt_o7 (b);
+    CREATE TEMP TRIGGER tt_tr7 AFTER INSERT ON aux.tt_s7 BEGIN SELECT 1; END;
+    ALTER TABLE tt_o7 RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE name = 'tt_o7';
+}
+expect {
+    CREATE TABLE tt_o7 (c)
+}
+
+test alter-table-rename-column-of-attached-table-with-temp-trigger {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.tt_s8 (a);
+    CREATE TABLE aux.tt_t8 (b);
+    CREATE TEMP TRIGGER tt_tr8 AFTER UPDATE OF a ON aux.tt_s8 BEGIN
+        SELECT new.a, old.a;
+    END;
+    ALTER TABLE aux.tt_t8 RENAME COLUMN b TO c;
+    ALTER TABLE aux.tt_s8 RENAME COLUMN a TO z;
+    INSERT INTO aux.tt_s8 VALUES (1);
+    UPDATE aux.tt_s8 SET z = 2;
+    SELECT * FROM aux.tt_s8;
+    SELECT sql FROM aux.sqlite_schema WHERE name IN ('tt_s8', 'tt_t8') ORDER BY name;
+    SELECT instr(sql, 'UPDATE OF z') > 0, instr(sql, 'new.z') > 0, instr(sql, 'old.z') > 0
+    FROM sqlite_temp_schema WHERE name = 'tt_tr8';
+}
+expect {
+    2
+    CREATE TABLE tt_s8 (z)
+    CREATE TABLE tt_t8 (c)
+    1|1|1
+}
+
+# RENAME TO, ADD COLUMN and DROP COLUMN on another table, then RENAME COLUMN
+# and RENAME TO on the trigger's own table. The trigger keeps its `aux.`
+# qualifier throughout.
+test alter-table-other-alters-with-temp-trigger-on-attached-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.tt_s9 (a);
+    CREATE TABLE tt_o9 (b);
+    CREATE TEMP TRIGGER tt_tr9 AFTER INSERT ON aux.tt_s9 BEGIN SELECT new.a; END;
+    ALTER TABLE tt_o9 RENAME TO tt_o9b;
+    ALTER TABLE tt_o9b ADD COLUMN d;
+    ALTER TABLE tt_o9b DROP COLUMN d;
+    ALTER TABLE tt_o9b RENAME COLUMN b TO c;
+    ALTER TABLE aux.tt_s9 RENAME TO tt_s9b;
+    INSERT INTO aux.tt_s9b VALUES (1);
+    SELECT name, sql LIKE '%(c)' FROM sqlite_schema WHERE name = 'tt_o9b';
+    SELECT name FROM aux.sqlite_schema WHERE type = 'table';
+    SELECT instr(sql, 'ON aux.') > 0 FROM sqlite_temp_schema WHERE name = 'tt_tr9';
+}
+expect {
+    tt_o9b|1
+    tt_s9b
+    1
+}
+
 test temp-trigger-attached-read-cross-table {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.src_temp_aux_read (a INTEGER PRIMARY KEY, b);
