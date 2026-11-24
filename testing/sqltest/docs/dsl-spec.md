@@ -372,13 +372,13 @@ A pretty-format run prints the gap counts after the summary: by kind, by class a
 
 #### Removed Gap Tests
 
-When tursopg gets a gap right, the test stays: the change removes only `@compat-gap` and the `expect @tursopg` block, and the test keeps checking the PostgreSQL answer. `sqltest gap-removals --base <dir> --head <dir>` compares the test files of two trees and fails for each gap test of the base tree that the head tree does not keep. The head tree keeps a gap test when a test with the same file and name either is still a gap test, or is the same test without `@compat-gap` and the `expect @tursopg` block:
+When tursopg gets a gap right, the test stays: the change removes only `@compat-gap` and the `expect @tursopg` block, and the test keeps checking the PostgreSQL answer. `sqltest gap-removals --base <dir> --head <dir>` compares the test files of two trees and fails for each gap test of the base tree that the head tree does not keep. The head tree keeps a gap test when a test with the same name, in any file, either is still a gap test, or is the same test without `@compat-gap` and the `expect @tursopg` block:
 
 - its SQL and setups equal the base test's after trimming whitespace, and its default `expect` block equals the base test's as parsed: the parser removes the indentation of each row, except in an `expect raw` block;
 - its `@skip`, `@skip-if`, `@backend` and `@requires` modifiers, and the file-level skip and requires directives of its file, equal the base test's;
 - it has no `expect @tursopg` block, or an `expect @tursopg` error block with the default block's SQLSTATE that only changes the message.
 
-A deleted test, a renamed test and a test moved to another file count as removed. The command fails when `--base` or `--head` is not a directory, or when the base directory has no `.sqltest` files.
+A test may move to another file when it keeps its name. A deleted test and a renamed test count as removed. The command fails when `--base` or `--head` is not a directory, or when the base directory has no `.sqltest` files.
 
 CI runs `make -C postgres/conformance check-gap-removals` on pull requests, with the target branch as the base tree. A change that must delete a gap test fails this check, and a reviewer decides whether it merges.
 

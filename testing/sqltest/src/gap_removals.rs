@@ -3,57 +3,66 @@
 //! A gap test records a known difference from PostgreSQL. When a change
 //! fixes the gap, the test stays and becomes a plain test: the change removes
 //! only `@compat-gap` and the `expect @tursopg` block, or keeps that block when it
-//! only changes the error message. A change that deletes a
-//! gap test, renames it, or edits its SQL, setups or PostgreSQL answer while
-//! it removes the gap loses the record that the gap was fixed. This check
-//! compares the gap tests of a base tree with a head tree and reports each
-//! one that the head tree does not keep.
+//! only changes the error message. The test may move to another file. A change
+//! that deletes a gap test, renames it, or edits its SQL, setups or PostgreSQL
+//! answer while it removes the gap loses the record that the gap was fixed.
+//! This check compares the gap tests of a base tree with a head tree and
+//! reports each one that the head tree does not keep.
 
 use crate::parser::ast::{Backend, TestCase, TestFile};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// The test files of one tree, with paths relative to the root of the tree.
 pub type Tree<'a> = &'a [(PathBuf, TestFile)];
 
 /// Returns one message per gap test of `base` that `head` does not keep.
-/// A test is kept when `head` has a test with the same file and name that
-/// is still a gap test, or that is a plain test with the same SQL, setups
-/// and default `expect` block as the gap test in `base`.
+/// A test is kept when some file of `head` has a test with the same name
+/// that is still a gap test, or that is a plain test with the same SQL,
+/// setups and default `expect` block as the gap test in `base`. The file may
+/// differ, so a change can move a test to another file when it fixes the gap.
 pub fn removed_gaps(base: Tree<'_>, head: Tree<'_>) -> Vec<String> {
-    let head_files: HashMap<&Path, &TestFile> = head
-        .iter()
-        .map(|(path, file)| (path.as_path(), file))
-        .collect();
     let mut errors = Vec::new();
     for (path, base_file) in base {
         for base_test in &base_file.tests {
             let Some(label) = &base_test.gap else {
                 continue;
             };
-            let head_test = head_files.get(path.as_path()).and_then(|head_file| {
-                head_file
-                    .tests
-                    .iter()
-                    .find(|t| t.name == base_test.name)
-                    .map(|t| (*head_file, t))
-            });
-            let problem = match head_test {
-                None => None,
-                Some((head_file, head_test)) => {
-                    match conversion_problem(base_file, base_test, head_file, head_test) {
-                        Ok(()) => continue,
-                        Err(problem) => Some(problem),
-                    }
-                }
-            };
+            // The test in the same file comes first, so its problem is the
+            // one reported when no test of `head` keeps the gap test.
+            let mut candidates: Vec<(&Path, &TestFile, &TestCase)> = head
+                .iter()
+                .flat_map(|(head_path, head_file)| {
+                    head_file
+                        .tests
+                        .iter()
+                        .filter(|t| t.name == base_test.name)
+                        .map(move |t| (head_path.as_path(), head_file, t))
+                })
+                .collect();
+            candidates.sort_by_key(|(head_path, _, _)| *head_path != path.as_path());
+            let results: Vec<_> = candidates
+                .iter()
+                .map(|(head_path, head_file, head_test)| {
+                    conversion_problem(base_file, base_test, head_file, head_test).map_err(|p| {
+                        if *head_path == path.as_path() {
+                            p.to_string()
+                        } else {
+                            format!("moved to {}, but {p}", head_path.display())
+                        }
+                    })
+                })
+                .collect();
+            if results.iter().any(Result::is_ok) {
+                continue;
+            }
+            let problems: Vec<&String> = results.iter().filter_map(|r| r.as_ref().err()).collect();
             let mut message = format!(
                 "{}: gap test {} ({label}) removed: if the gap is fixed, keep the test and \
                  remove only the @compat-gap and the expect @tursopg override",
                 path.display(),
                 base_test.name
             );
-            if let Some(problem) = problem {
+            if let Some(problem) = problems.first() {
                 message.push_str(&format!(" ({problem})"));
             }
             errors.push(message);
@@ -254,12 +263,28 @@ expect @tursopg {
     }
 
     #[test]
-    fn a_gap_test_moved_to_another_file_fails() {
+    fn a_gap_test_moved_to_another_file_passes() {
+        // a.sqltest has no test g; b.sqltest has it without the gap.
+        let head = vec![
+            (
+                PathBuf::from("a.sqltest"),
+                tree("@database :memory:\n").remove(0).1,
+            ),
+            (PathBuf::from("b.sqltest"), tree(&converted()).remove(0).1),
+        ];
+        assert!(removed_gaps(&tree(BASE), &head).is_empty());
+        // b.sqltest has test g with other SQL.
         let head = vec![(
             PathBuf::from("b.sqltest"),
-            crate::gap::parse_with_gap_lints(BASE).unwrap(),
+            tree(&converted().replace("SELECT true;", "SELECT 't'::bool;"))
+                .remove(0)
+                .1,
         )];
-        assert_eq!(removed_gaps(&tree(BASE), &head).len(), 1);
+        let errors = removed_gaps(&tree(BASE), &head);
+        assert!(
+            errors[0].ends_with("(moved to b.sqltest, but its SQL changed)"),
+            "{errors:?}"
+        );
     }
 
     #[test]
