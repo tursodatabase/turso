@@ -56,6 +56,11 @@ impl Type for Boolean {
     fn reads_as(&self) -> Option<StorageClass> {
         Some(StorageClass::Integer)
     }
+
+    /// A comparison is a boolean in PostgreSQL.
+    fn is_type_of_conditions(&self) -> bool {
+        true
+    }
 }
 
 /// Text is read as PostgreSQL's boolean input does (see `parse_pg_bool`). A
