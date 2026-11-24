@@ -33,7 +33,7 @@ use crate::translate::{build_program, new_program_builder};
 use std::num::NonZero;
 use std::sync::Arc;
 
-use crate::alloc::TursoSliceExt;
+use crate::alloc::{StatementAllocationSite, TursoSliceExt};
 use crate::schema::{BTreeTable, Column, Schema};
 use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::storage::pager::Pager;
@@ -438,7 +438,7 @@ fn build_blob_program(
     rowid: i64,
     read_write: bool,
 ) -> Result<crate::vdbe::Program> {
-    let mut b = new_program_builder(conn, || {
+    let mut b = new_program_builder(conn, StatementAllocationSite::ProgramBuilder, || {
         ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 64, 16))
     })?;
     b.prologue();

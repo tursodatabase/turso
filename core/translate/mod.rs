@@ -53,7 +53,7 @@ mod values;
 pub(crate) mod view;
 mod window;
 
-use crate::alloc::{DynBox, TursoBoxExt};
+use crate::alloc::{DynBox, StatementAllocationSite, TursoBoxExt};
 use crate::ast;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
@@ -101,14 +101,15 @@ pub fn translate(
     } else {
         connection.get_capture_data_changes_info().clone()
     };
-    let mut program = new_program_builder(&connection, || {
-        ProgramBuilder::new(
-            query_mode,
-            capture_data_changes_info,
-            // These options will be extended whithin each translate program
-            ProgramBuilderOpts::new(1, 32, 2),
-        )
-    })?;
+    let mut program =
+        new_program_builder(&connection, StatementAllocationSite::ProgramBuilder, || {
+            ProgramBuilder::new(
+                query_mode,
+                capture_data_changes_info,
+                // These options will be extended whithin each translate program
+                ProgramBuilderOpts::new(1, 32, 2),
+            )
+        })?;
     program.set_mvcc_enabled(connection.mvcc_enabled());
     program.flags.set_reads_stored_values(matches!(
         origin,
@@ -204,19 +205,23 @@ pub fn translate(
 }
 
 /// Makes a program builder with `new`, in memory from the statement allocator
-/// of the database. Rust makes the builder on the stack and then copies it into
-/// the box. This function is not inlined, so that the builder is in the stack
-/// frame of this function, and not in the frame of its caller.
+/// of the database. The allocation is at `site`. Rust makes the builder on the
+/// stack and then copies it into the box. This function is not inlined, so
+/// that the builder is in the stack frame of this function, and not in the
+/// frame of its caller.
 #[inline(never)]
 pub(crate) fn new_program_builder(
     connection: &Connection,
+    site: StatementAllocationSite,
     new: impl FnOnce() -> ProgramBuilder,
 ) -> Result<DynBox<ProgramBuilder>> {
     let builder = new();
     let alloc = connection.db.allocators.statement.clone();
-    let builder =
-        crate::with_statement_allocation_site!(ProgramBuilder, DynBox::try_new_in(builder, alloc))?;
-    Ok(builder)
+    #[cfg(feature = "allocation_metric")]
+    let _site_guard = crate::alloc::enter_allocation_site(site);
+    #[cfg(not(feature = "allocation_metric"))]
+    let _ = site;
+    Ok(DynBox::try_new_in(builder, alloc)?)
 }
 
 /// Builds the program of a builder in memory from the statement allocator.

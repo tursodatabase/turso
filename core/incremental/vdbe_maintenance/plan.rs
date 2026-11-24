@@ -3,6 +3,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::output::NodeOutputContract;
 use super::stream::{binding_rowid_metadata_width, DeltaIdentity};
+use crate::alloc::StatementAllocationSite;
 use crate::function::{AggFunc, Func};
 use crate::incremental::dag;
 use crate::schema::BTreeTable;
@@ -985,15 +986,16 @@ pub(crate) fn plan_view(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<MaintenancePlan> {
-    let mut planner_program = new_program_builder(connection, || {
-        ProgramBuilder::new_for_subprogram(
-            QueryMode::Normal,
-            None,
-            ProgramBuilderOpts::new(8, 32, 8),
-            connection.mvcc_enabled(),
-            0,
-        )
-    })?;
+    let mut planner_program =
+        new_program_builder(connection, StatementAllocationSite::ProgramBuilder, || {
+            ProgramBuilder::new_for_subprogram(
+                QueryMode::Normal,
+                None,
+                ProgramBuilderOpts::new(8, 32, 8),
+                connection.mvcc_enabled(),
+                0,
+            )
+        })?;
     let mut relational_plan = prepare_select_plan(
         select.clone(),
         resolver,

@@ -24,6 +24,7 @@
 //! completion (or before an in-statement view read), or inside the CREATE
 //! MATERIALIZED VIEW statement for initial population.
 
+use crate::alloc::StatementAllocationSite;
 use crate::ast;
 use crate::namespace::NamespaceRef;
 use rustc_hash::FxHashMap;
@@ -173,19 +174,20 @@ fn compile_maintenance_plan(
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<Program> {
-    let mut program = new_program_builder(connection, || {
-        ProgramBuilder::new_for_subprogram(
-            QueryMode::Normal,
-            None,
-            ProgramBuilderOpts {
-                num_cursors: 13,
-                approx_num_insns: 128 + 64 * num_view_columns,
-                approx_num_labels: 48,
-            },
-            connection.mvcc_enabled(),
-            0,
-        )
-    })?;
+    let mut program =
+        new_program_builder(connection, StatementAllocationSite::ProgramBuilder, || {
+            ProgramBuilder::new_for_subprogram(
+                QueryMode::Normal,
+                None,
+                ProgramBuilderOpts {
+                    num_cursors: 13,
+                    approx_num_insns: 128 + 64 * num_view_columns,
+                    approx_num_labels: 48,
+                },
+                connection.mvcc_enabled(),
+                0,
+            )
+        })?;
     program.prologue();
     emit_plan_to_sink(
         &mut program,
