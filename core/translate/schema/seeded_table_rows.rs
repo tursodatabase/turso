@@ -2,21 +2,22 @@
 //! the rows of a seeded table.
 
 use crate::dialect::seeded::{
-    unwritable_index_reason, unwritable_table_reason, StoredForm, SEED_SCAN,
+    unwritable_index_reason, unwritable_table_reason, SeedRowColumn, StoredForm, SEED_SCAN,
 };
 use crate::dialect::CmdContext;
-use crate::error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY};
+use crate::error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_ERROR};
 use crate::namespace::NamespaceId;
 use crate::schema::{BTreeTable, Index, Table};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
+use crate::translate::collate::CollationSeq;
 use crate::translate::insert::format_unique_violation_desc;
 use crate::translate::schema::{emit_schema_cookie, emit_schema_entry, SchemaEntryType};
 use crate::translate::ProgramBuilder;
 use crate::util::escape_sql_string_literal;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
-    to_u32, ConstraintInfo, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral,
+    to_u32, CmpInsFlags, ConstraintInfo, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral,
 };
 use crate::{bail_parse_error, LimboError, Result, MAIN_DB_ID};
 
@@ -30,6 +31,20 @@ pub struct SeededTableWriter {
     /// Each index with its cursor, in the order in which an insert writes
     /// them.
     indexes: Vec<(Arc<Index>, usize)>,
+    /// The column and the range of the seed rows. None for a seeded table
+    /// of core.
+    seed_rows: Option<SeedRowColumn>,
+}
+
+/// Which rule a row that the writer inserts follows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowOwner {
+    /// A seed row, which the fill copies. It must be inside the seed row
+    /// range.
+    Seed,
+    /// A row that the catalog writes. It must be outside the seed row
+    /// range, so that a refill never deletes it.
+    Catalog,
 }
 
 /// Opens the seeded table `name` of the main database for writing. When the
@@ -147,6 +162,7 @@ fn open_stored_table(
         table,
         cursor_id,
         indexes: index_cursors,
+        seed_rows: form.seed_rows.clone(),
     })
 }
 
@@ -247,6 +263,7 @@ fn store_seeded_table(
         table: form.table.clone(),
         cursor_id,
         indexes: index_cursors,
+        seed_rows: form.seed_rows.clone(),
     };
     if !form.seeded_table.seed.is_empty() {
         emit_fill(program, form, &writer);
@@ -291,7 +308,7 @@ fn emit_fill(program: &mut ProgramBuilder, form: &StoredForm, writer: &SeededTab
         cursor_id,
         dest: rowid_reg,
     });
-    writer.emit_insert_row(program, values_reg, Some(rowid_reg));
+    writer.emit_insert_row(program, values_reg, Some(rowid_reg), RowOwner::Seed);
     program.emit_insn(Insn::VNext {
         cursor_id,
         pc_if_next: next_row,
@@ -313,11 +330,14 @@ impl SeededTableWriter {
     /// Emits the insert of one row. `values_start_reg` is the first of one
     /// register for each column, in column order. The value of the
     /// `INTEGER PRIMARY KEY` column is the rowid; NULL gives a new rowid. A
-    /// row that breaks a NOT NULL or UNIQUE constraint fails the statement.
-    /// The insert does not count as a change and does not set
-    /// `last_insert_rowid()`.
+    /// row that breaks a NOT NULL or UNIQUE constraint fails the statement,
+    /// and so does a row inside the [`SeedRowRange`] of the table, which only
+    /// seed rows may have. The insert does not count as a change and does
+    /// not set `last_insert_rowid()`.
+    ///
+    /// [`SeedRowRange`]: crate::dialect::SeedRowRange
     pub fn emit_insert(&self, program: &mut ProgramBuilder, values_start_reg: usize) {
-        self.emit_insert_row(program, values_start_reg, None);
+        self.emit_insert_row(program, values_start_reg, None, RowOwner::Catalog);
     }
 
     /// Emits the delete of the row at the table cursor, and of its index
@@ -376,12 +396,14 @@ impl SeededTableWriter {
     }
 
     /// Emits the insert of one row, as [`Self::emit_insert`] does. When
-    /// `given_rowid_reg` is given, it has the rowid of the row.
+    /// `given_rowid_reg` is given, it has the rowid of the row. `owner` says
+    /// on which side of the seed row range the row must be.
     fn emit_insert_row(
         &self,
         program: &mut ProgramBuilder,
         values_start_reg: usize,
         given_rowid_reg: Option<usize>,
+        owner: RowOwner,
     ) {
         let table = &self.table;
         let columns = table.columns();
@@ -497,6 +519,7 @@ impl SeededTableWriter {
             });
             program.preassign_label_to_next_insn(free);
         }
+        self.emit_seed_row_range_check(program, record_reg, rowid_reg, owner);
 
         for (index, index_cursor_id) in self.indexes.iter().filter(|(index, _)| index.unique) {
             let key_reg = self.emit_index_key(program, index, record_reg, rowid_reg);
@@ -559,6 +582,94 @@ impl SeededTableWriter {
                 .skip_all_change_counts(),
             table_name: table.name.clone(),
         });
+    }
+
+    /// Emits the check that the row in `record_reg`, whose rowid is in
+    /// `rowid_reg`, is on the side of the seed row range that `owner` says.
+    /// A row on the other side halts the statement with an error. A NULL
+    /// value is outside the range.
+    fn emit_seed_row_range_check(
+        &self,
+        program: &mut ProgramBuilder,
+        record_reg: usize,
+        rowid_reg: usize,
+        owner: RowOwner,
+    ) {
+        let Some(seed_rows) = &self.seed_rows else {
+            return;
+        };
+        let table = &self.table.name;
+        let column = self.table.columns()[seed_rows.position]
+            .name
+            .clone()
+            .unwrap_or_default();
+        // The record has NULL for the INTEGER PRIMARY KEY column, whose value
+        // is the rowid.
+        let value_reg = if Some(seed_rows.position) == self.rowid_column() {
+            rowid_reg
+        } else {
+            record_reg + seed_rows.position
+        };
+        let bounds_reg = program.alloc_registers(2);
+        program.emit_insn(Insn::Integer {
+            value: seed_rows.range.start,
+            dest: bounds_reg,
+        });
+        program.emit_insn(Insn::Integer {
+            value: seed_rows.range.end,
+            dest: bounds_reg + 1,
+        });
+        let outside = program.allocate_label();
+        program.emit_insn(Insn::IsNull {
+            reg: value_reg,
+            target_pc: outside,
+        });
+        program.emit_insn(Insn::Lt {
+            lhs: value_reg,
+            rhs: bounds_reg,
+            target_pc: outside,
+            flags: CmpInsFlags::default(),
+            collation: CollationSeq::for_internal_values(),
+        });
+        program.emit_insn(Insn::Ge {
+            lhs: value_reg,
+            rhs: bounds_reg + 1,
+            target_pc: outside,
+            flags: CmpInsFlags::default(),
+            collation: CollationSeq::for_internal_values(),
+        });
+        let (start, end) = (seed_rows.range.start, seed_rows.range.end);
+        match owner {
+            RowOwner::Catalog => {
+                program.emit_insn(Insn::Halt {
+                    constraint_info: None,
+                    err_code: SQLITE_ERROR,
+                    description: format!(
+                        "cannot write a row of seeded table {table}: a row whose {column} \
+                         is at least {start} and less than {end} is a seed row"
+                    ),
+                    on_error: None,
+                    description_reg: None,
+                });
+                program.preassign_label_to_next_insn(outside);
+            }
+            RowOwner::Seed => {
+                let inside = program.allocate_label();
+                program.emit_insn(Insn::Goto { target_pc: inside });
+                program.preassign_label_to_next_insn(outside);
+                program.emit_insn(Insn::Halt {
+                    constraint_info: None,
+                    err_code: SQLITE_ERROR,
+                    description: format!(
+                        "a seed row of seeded table {table} is outside its seed row range: \
+                         {column} must be at least {start} and less than {end}"
+                    ),
+                    on_error: None,
+                    description_reg: None,
+                });
+                program.preassign_label_to_next_insn(inside);
+            }
+        }
     }
 
     /// Copies the key of `index` for the row in `record_reg` to new

@@ -29,6 +29,55 @@ const ROWS_LEFT_OUT: [(&str, &str); 3] = [
     ),
 ];
 
+/// The first oid that PostgreSQL gives to an object that a user makes,
+/// `FirstNormalObjectId` of `access/transam.h`. Each built-in object has a
+/// lower oid, so the rows with a lower oid are the built-in rows.
+const FIRST_NORMAL_OBJECT_ID: i64 = 16384;
+
+/// For each catalog whose rows have no `oid`, the column with the oid of the
+/// object that a row is about. A built-in row has a built-in object.
+const OBJECT_COLUMNS: [(&str, &str); 20] = [
+    ("pg_aggregate", "aggfnoid"),
+    ("pg_attribute", "attrelid"),
+    ("pg_depend", "objid"),
+    ("pg_description", "objoid"),
+    ("pg_foreign_table", "ftrelid"),
+    ("pg_index", "indexrelid"),
+    ("pg_inherits", "inhrelid"),
+    ("pg_init_privs", "objoid"),
+    ("pg_largeobject", "loid"),
+    ("pg_partitioned_table", "partrelid"),
+    ("pg_range", "rngtypid"),
+    ("pg_seclabel", "objoid"),
+    ("pg_sequence", "seqrelid"),
+    ("pg_shdepend", "objid"),
+    ("pg_shdescription", "objoid"),
+    ("pg_shseclabel", "objoid"),
+    ("pg_statistic", "starelid"),
+    ("pg_statistic_ext_data", "stxoid"),
+    ("pg_subscription_rel", "srsubid"),
+    ("pg_ts_config_map", "mapcfg"),
+];
+
+/// The catalogs whose rows have no column that tells a built-in row from a
+/// row that a user makes, with a column of the empty seed row range that
+/// they get. Their seeds must stay empty.
+/// - `pg_db_role_setting`: `ALTER ROLE ALL SET` makes a row whose `setrole`
+///   is 0.
+/// - `pg_replication_origin`: `roident` is not an oid. The first origin
+///   that a user makes gets 1.
+const WITHOUT_SEED_ROWS: [(&str, &str); 2] = [
+    ("pg_db_role_setting", "setrole"),
+    ("pg_replication_origin", "roident"),
+];
+
+/// The stored rows that belong to the seed of a catalog: the rows whose
+/// `column` is in `range`.
+pub(crate) struct SeedRows {
+    pub(crate) column: &'static str,
+    pub(crate) range: std::ops::Range<i64>,
+}
+
 pub(crate) struct Table<'a> {
     pub(crate) catalog: &'a Catalog,
     /// The columns of the catalog, in the order of the file. The struct,
@@ -107,6 +156,41 @@ impl<'a> Table<'a> {
     /// The field that identifies a row, if there is one.
     pub(crate) fn key(&self) -> Option<&Field<'a>> {
         self.has_key.then(|| &self.fields[0])
+    }
+
+    /// The stored rows that belong to the seed of the catalog: the built-in
+    /// rows. A catalog whose `oid` is the rowid has them by `oid`, and
+    /// another catalog by the column of [`OBJECT_COLUMNS`]. A catalog of
+    /// [`WITHOUT_SEED_ROWS`] has none, and must have no rows.
+    pub(crate) fn seed_rows(&self) -> Result<SeedRows, String> {
+        let name = self.catalog.name.as_str();
+        let built_in = 0..FIRST_NORMAL_OBJECT_ID;
+        if self.oid_is_rowid {
+            return Ok(SeedRows {
+                column: "oid",
+                range: built_in,
+            });
+        }
+        if let Some((_, column)) = OBJECT_COLUMNS.iter().find(|(other, _)| *other == name) {
+            return Ok(SeedRows {
+                column,
+                range: built_in,
+            });
+        }
+        if let Some((_, column)) = WITHOUT_SEED_ROWS.iter().find(|(other, _)| *other == name) {
+            if !self.rows.is_empty() {
+                return Err(format!(
+                    "{name}: the catalog has rows, but no column tells a built-in row"
+                ));
+            }
+            return Ok(SeedRows {
+                column,
+                range: 0..0,
+            });
+        }
+        Err(format!(
+            "{name}: the generator does not know which column tells a built-in row"
+        ))
     }
 
     /// The SQL values of the rows, in the order of the table, as the seed of

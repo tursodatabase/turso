@@ -65,6 +65,35 @@ mod tests {
         );
     }
 
+    /// Each row of each seed is inside the seed row range of its catalog,
+    /// so that core can store the seed and fill the table again later.
+    #[test]
+    fn each_seed_row_is_inside_its_seed_row_range() {
+        let mut checked = 0;
+        for table in &SEEDED_TABLES {
+            let range = table.seed_rows.as_ref().unwrap();
+            let position = column_names(table.create_sql)
+                .iter()
+                .position(|column| *column == range.column)
+                .unwrap_or_else(|| panic!("{} has no column {}", table.name, range.column));
+            for (index, values) in seed_rows(table).iter().enumerate() {
+                let turso_core::Value::Numeric(turso_core::Numeric::Integer(value)) =
+                    values[position]
+                else {
+                    panic!("{} row {index}: {:?}", table.name, values[position]);
+                };
+                assert!(
+                    range.range.contains(&value),
+                    "{} row {index}: {} is {value}",
+                    table.name,
+                    range.column
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 10_000, "{checked} rows");
+    }
+
     #[test]
     fn known_rows_have_the_oids_of_postgresql() {
         let bool_type = PgType::by_oid(16).unwrap();

@@ -14,6 +14,7 @@ use crate::numeric::Numeric;
 use crate::schema::{BTreeTable, Column, Index, Schema, Table, TURSO_TYPES_TABLE_NAME};
 use crate::sync::{Arc, OnceLock, RwLock};
 use crate::util::{UnparsedFromSqlIndex, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX};
+use crate::vdbe::affinity::Affinity;
 use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor, VirtualTable};
 use crate::SymbolTable;
 use crate::{ast, turso_assert, Connection, LimboError, Result, Value};
@@ -38,6 +39,7 @@ static CORE_SEEDED_TABLES: [SeededTable; 1] = [SeededTable {
     index_sql: &[],
     seed: &EmptySeed,
     hidden_columns: &[],
+    seed_rows: None,
 }];
 
 /// The `CREATE TABLE` statement of the table of the types made by
@@ -219,6 +221,19 @@ pub(crate) struct StoredForm {
     /// The indexes in the order that the schema lists them, which is the
     /// order in which an insert writes them.
     pub(crate) indexes: Vec<Arc<Index>>,
+    /// The column and the range of the seed rows. None for a seeded table
+    /// of core.
+    pub(crate) seed_rows: Option<SeedRowColumn>,
+}
+
+/// The [`SeedRowRange`] of a seeded table, with the position of its column
+/// in the table.
+///
+/// [`SeedRowRange`]: crate::dialect::SeedRowRange
+#[derive(Debug, Clone)]
+pub(crate) struct SeedRowColumn {
+    pub(crate) position: usize,
+    pub(crate) range: std::ops::Range<i64>,
 }
 
 /// The `sqlite_schema` row of an index of a seeded table.
@@ -255,6 +270,32 @@ impl StoredForm {
         if let Some(reason) = unwritable_table_reason(&table) {
             return refuse(reason);
         }
+        turso_assert!(
+            read_only.is_some() || seeded_table.seed_rows.is_none(),
+            "a seeded table of core has no seed row range",
+            { "name": name }
+        );
+        let seed_rows = match &seeded_table.seed_rows {
+            Some(seed_rows) => {
+                let Some(position) = table.columns().iter().position(|column| {
+                    column
+                        .name
+                        .as_deref()
+                        .is_some_and(|other| other.eq_ignore_ascii_case(seed_rows.column))
+                }) else {
+                    return refuse("the column of its seed row range does not exist");
+                };
+                if table.columns()[position].affinity() != Affinity::Integer {
+                    return refuse("the column of its seed row range is not an INTEGER column");
+                }
+                Some(SeedRowColumn {
+                    position,
+                    range: seed_rows.range.clone(),
+                })
+            }
+            None if read_only.is_some() => return refuse("it has no seed row range"),
+            None => None,
+        };
         let table = Arc::new(table);
 
         // Fake root pages tell the indexes apart until they have names.
@@ -332,6 +373,7 @@ impl StoredForm {
             table,
             index_rows,
             indexes,
+            seed_rows,
         })
     }
 }

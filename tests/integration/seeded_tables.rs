@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use turso_core::dialect::{
-    Catalog, CatalogCmd, CmdContext, CmdOrigin, Dialect, HiddenColumn, Seed, SeededTable,
-    SqliteCatalog,
+    Catalog, CatalogCmd, CmdContext, CmdOrigin, Dialect, HiddenColumn, Seed, SeedRowRange,
+    SeededTable, SqliteCatalog,
 };
 use turso_core::{Connection, Insn, LimboError, ProgramBuilder, Result, Value};
 use turso_sqlite::SqliteDialect;
@@ -94,6 +94,7 @@ impl Catalog for SeedCatalog {
     /// what else the catalog does:
     /// - `plain...`: no row.
     /// - `dup...`: the row has oid 10, which a seed row has.
+    /// - `inside...`: the row has oid 15, which is in the seed row range.
     /// - `twice...`: the catalog opens `seed_items` twice and writes two rows.
     /// - `words...`: `seed_words` also gets a row `(name, length of name)`.
     fn emit(
@@ -115,6 +116,8 @@ impl Catalog for SeedCatalog {
         }
         let oid = if table.name.starts_with("dup") {
             Some(10)
+        } else if table.name.starts_with("inside") {
+            Some(15)
         } else {
             None
         };
@@ -228,9 +231,37 @@ impl SeedDialect {
     }
 
     /// A dialect whose `seed_items` has the rows `items`, and whose
-    /// `seed_words` has the hidden columns `words_hidden_columns`.
+    /// `seed_words` has the hidden columns `words_hidden_columns`. The seed
+    /// rows of `seed_items` are those with an oid up to the last oid of
+    /// `items`.
     fn with_tables(
         items: Vec<Vec<Value>>,
+        words_hidden_columns: &'static [HiddenColumn],
+    ) -> Arc<Self> {
+        let last_oid = items
+            .iter()
+            .map(|row| match row[0] {
+                Value::Numeric(turso_core::numeric::Numeric::Integer(oid)) => oid,
+                ref other => panic!("the oid of a seed row is {other:?}"),
+            })
+            .max()
+            .unwrap_or(0);
+        Self::with_item_rows(
+            items,
+            SeedRowRange {
+                column: "oid",
+                range: 0..last_oid + 1,
+            },
+            words_hidden_columns,
+        )
+    }
+
+    /// A dialect whose `seed_items` has the rows `items` and the seed row
+    /// range `item_rows`. The seed rows of `seed_words` are those with a
+    /// length below 6, and the catalog writes longer words.
+    fn with_item_rows(
+        items: Vec<Vec<Value>>,
+        item_rows: SeedRowRange,
         words_hidden_columns: &'static [HiddenColumn],
     ) -> Arc<Self> {
         let items: &'static CountingSeed = Box::leak(Box::new(CountingSeed::new(items, Some(0))));
@@ -248,6 +279,7 @@ impl SeedDialect {
                 index_sql: &["CREATE INDEX seed_items_name ON seed_items (name)"],
                 seed: items,
                 hidden_columns: &[],
+                seed_rows: Some(item_rows),
             },
             SeededTable {
                 name: "seed_words",
@@ -255,6 +287,10 @@ impl SeedDialect {
                 index_sql: &[],
                 seed: words,
                 hidden_columns: words_hidden_columns,
+                seed_rows: Some(SeedRowRange {
+                    column: "length",
+                    range: 0..6,
+                }),
             },
         ]));
         Arc::new(Self {
@@ -1754,4 +1790,132 @@ fn type_statements_keep_change_counters_wal() {
 #[test]
 fn type_statements_keep_change_counters_mvcc() {
     type_statements_keep_change_counters(true);
+}
+
+/// A row that the catalog writes inside the seed row range fails the
+/// statement, whether the statement stores the table or the table was
+/// stored before, so that a refill never deletes a row that the catalog
+/// wrote. The statement changes nothing.
+fn catalog_row_inside_the_seed_row_range_fails(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let dialect = SeedDialect::new();
+    let db = open(&new_path(&dir), dialect.clone(), mvcc);
+    let conn = db.connect_limbo();
+    let items_error = "cannot write a row of seeded table seed_items: \
+                       a row whose oid is at least 0 and less than 31 is a seed row";
+
+    let err = error_of(&conn, "CREATE TABLE inside1 (a)");
+    assert!(err.contains(items_error), "{err}");
+    assert_read_only_items(&conn, &dialect);
+    let err = error_of(&conn, "SELECT * FROM inside1");
+    assert!(err.contains("no such table"), "{err}");
+
+    conn.execute("CREATE TABLE t1 (a)").unwrap();
+    let err = error_of(&conn, "CREATE TABLE inside2 (a)");
+    assert!(err.contains(items_error), "{err}");
+    assert_eq!(all_items(&conn), items_with_user_tables(&["t1"]));
+
+    // The column of the range of seed_words is not the rowid.
+    let err = error_of(&conn, "CREATE TABLE words (a)");
+    assert!(
+        err.contains(
+            "cannot write a row of seeded table seed_words: \
+             a row whose length is at least 0 and less than 6 is a seed row"
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        rows(&conn, "SELECT count(*) FROM seed_words"),
+        vec![vec![int(2)]]
+    );
+    let err = error_of(&conn, "SELECT * FROM words");
+    assert!(err.contains("no such table"), "{err}");
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn catalog_row_inside_the_seed_row_range_fails_wal() {
+    catalog_row_inside_the_seed_row_range_fails(false);
+}
+
+#[test]
+fn catalog_row_inside_the_seed_row_range_fails_mvcc() {
+    catalog_row_inside_the_seed_row_range_fails(true);
+}
+
+/// A seed row outside the seed row range fails the first write, which then
+/// stores nothing.
+fn seed_row_outside_the_seed_row_range_fails(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let rows_of_seed = SeedDialect::new().items().rows.clone();
+    let dialect = SeedDialect::with_item_rows(
+        rows_of_seed,
+        SeedRowRange {
+            column: "oid",
+            range: 0..25,
+        },
+        &[],
+    );
+    let db = open(&new_path(&dir), dialect.clone(), mvcc);
+    let conn = db.connect_limbo();
+    let err = error_of(&conn, "CREATE TABLE t1 (a)");
+    assert!(
+        err.contains(
+            "a seed row of seeded table seed_items is outside its seed row range: \
+             oid must be at least 0 and less than 25"
+        ),
+        "{err}"
+    );
+    assert_read_only_items(&conn, &dialect);
+}
+
+#[test]
+fn seed_row_outside_the_seed_row_range_fails_wal() {
+    seed_row_outside_the_seed_row_range_fails(false);
+}
+
+#[test]
+fn seed_row_outside_the_seed_row_range_fails_mvcc() {
+    seed_row_outside_the_seed_row_range_fails(true);
+}
+
+/// The column of a seed row range must be an INTEGER column of the table.
+/// A database whose dialect has another column does not open.
+#[test]
+fn seed_row_range_column_is_checked_at_open() {
+    let rows_of_seed = SeedDialect::new().items().rows.clone();
+    for (column, reason) in [
+        ("missing", "the column of its seed row range does not exist"),
+        (
+            "name",
+            "the column of its seed row range is not an INTEGER column",
+        ),
+        (
+            "weight",
+            "the column of its seed row range is not an INTEGER column",
+        ),
+    ] {
+        let dialect = SeedDialect::with_item_rows(
+            rows_of_seed.clone(),
+            SeedRowRange {
+                column,
+                range: 0..31,
+            },
+            &[],
+        );
+        let err = turso_core::Database::open(
+            Arc::new(turso_core::MemoryIO::new()),
+            ":memory:",
+            turso_core::OpenOptions::new(dialect),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("the open with column {column} did not fail"))
+        .to_string();
+        assert!(
+            err.contains(&format!(
+                "seeded table seed_items cannot be stored: {reason}"
+            )),
+            "{column}: {err}"
+        );
+    }
 }

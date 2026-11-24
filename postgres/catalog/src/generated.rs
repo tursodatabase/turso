@@ -2,7 +2,7 @@
 // Do not edit. To change this file, run postgres/catalog/update.sh or
 // `cargo run -p turso_pg_catalog_gen`.
 
-use turso_core::dialect::SeededTable;
+use turso_core::dialect::{SeedRowRange, SeededTable};
 use turso_core::Value;
 
 use crate::seed::{value, Array, CatalogRow, CatalogSeed, Vector};
@@ -229,6 +229,10 @@ pub const PG_AGGREGATE_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgAggregate::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_AGGREGATE, None, 0x34fb32c2),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "aggfnoid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_am`.
@@ -278,6 +282,10 @@ pub const PG_AM_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgAm::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_AM, Some(|row| row.oid), 0xc29f9c3b),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_amop`.
@@ -1271,6 +1279,10 @@ pub const PG_AMOP_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgAmop::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_AMOP, Some(|row| row.oid), 0xbc70c4ad),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_amproc`.
@@ -2029,6 +2041,10 @@ pub const PG_AMPROC_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgAmproc::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_AMPROC, Some(|row| row.oid), 0xf628c125),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_attrdef`.
@@ -2071,6 +2087,10 @@ pub const PG_ATTRDEF_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgAttrdef::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_ATTRDEF, Some(|row| row.oid), 0xa105d3c2),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_attribute`.
@@ -2130,6 +2150,10 @@ pub const PG_ATTRIBUTE_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgAttribute::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_ATTRIBUTE, None, 0x35da79f9),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "attrelid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_auth_members`.
@@ -2177,6 +2201,10 @@ pub const PG_AUTH_MEMBERS_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgAuthMembers::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_AUTH_MEMBERS, Some(|row| row.oid), 0x3c3bd911),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_authid`.
@@ -2244,6 +2272,10 @@ pub const PG_AUTHID_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgAuthid::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_AUTHID, Some(|row| row.oid), 0x6ae4e522),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_cast`.
@@ -2523,6 +2555,10 @@ pub const PG_CAST_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgCast::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_CAST, Some(|row| row.oid), 0x1b33f10c),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_class`.
@@ -2596,6 +2632,10 @@ pub const PG_CLASS_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgClass::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_CLASS, Some(|row| row.oid), 0x048eed69),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_collation`.
@@ -2653,6 +2693,10 @@ pub const PG_COLLATION_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgCollation::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_COLLATION, Some(|row| row.oid), 0x2f8dadd8),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_constraint`.
@@ -2722,6 +2766,10 @@ pub const PG_CONSTRAINT_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgConstraint::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_CONSTRAINT, Some(|row| row.oid), 0xea2835ed),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_conversion`.
@@ -2897,6 +2945,10 @@ pub const PG_CONVERSION_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgConversion::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_CONVERSION, Some(|row| row.oid), 0xe2dc1681),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_database`.
@@ -2953,6 +3005,10 @@ pub const PG_DATABASE_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgDatabase::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_DATABASE, Some(|row| row.oid), 0x43bea119),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_db_role_setting`.
@@ -2989,6 +3045,10 @@ pub const PG_DB_ROLE_SETTING_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgDbRoleSetting::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_DB_ROLE_SETTING, None, 0x85f1b7f2),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "setrole",
+        range: 0..0,
+    }),
 };
 
 /// A row of `pg_default_acl`.
@@ -3032,6 +3092,10 @@ pub const PG_DEFAULT_ACL_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgDefaultAcl::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_DEFAULT_ACL, Some(|row| row.oid), 0x4119d77d),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_depend`.
@@ -3073,6 +3137,10 @@ pub const PG_DEPEND_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgDepend::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_DEPEND, None, 0x0301618e),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "objid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_description`.
@@ -6785,6 +6853,10 @@ pub const PG_DESCRIPTION_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgDescription::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_DESCRIPTION, None, 0x969430ad),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "objoid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_enum`.
@@ -6828,6 +6900,10 @@ pub const PG_ENUM_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgEnum::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_ENUM, Some(|row| row.oid), 0x874f3bfe),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_event_trigger`.
@@ -6873,6 +6949,10 @@ pub const PG_EVENT_TRIGGER_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgEventTrigger::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_EVENT_TRIGGER, Some(|row| row.oid), 0xbcc20d47),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_extension`.
@@ -6919,6 +6999,10 @@ pub const PG_EXTENSION_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgExtension::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_EXTENSION, Some(|row| row.oid), 0x78337abd),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_foreign_data_wrapper`.
@@ -6966,6 +7050,10 @@ pub const PG_FOREIGN_DATA_WRAPPER_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgForeignDataWrapper::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_FOREIGN_DATA_WRAPPER, Some(|row| row.oid), 0x2f63b1db),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_foreign_server`.
@@ -7012,6 +7100,10 @@ pub const PG_FOREIGN_SERVER_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgForeignServer::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_FOREIGN_SERVER, Some(|row| row.oid), 0x22825d0a),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_foreign_table`.
@@ -7055,6 +7147,10 @@ pub const PG_FOREIGN_TABLE_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgForeignTable::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_FOREIGN_TABLE, None, 0x209e63da),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "ftrelid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_index`.
@@ -7117,6 +7213,10 @@ pub const PG_INDEX_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgIndex::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_INDEX, None, 0x60dd3f80),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "indexrelid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_inherits`.
@@ -7155,6 +7255,10 @@ pub const PG_INHERITS_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgInherits::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_INHERITS, None, 0xf2c1ba77),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "inhrelid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_init_privs`.
@@ -7193,6 +7297,10 @@ pub const PG_INIT_PRIVS_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgInitPrivs::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_INIT_PRIVS, None, 0x8f9d6394),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "objoid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_language`.
@@ -7243,6 +7351,10 @@ pub const PG_LANGUAGE_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgLanguage::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_LANGUAGE, Some(|row| row.oid), 0xca150d37),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_largeobject`.
@@ -7279,6 +7391,10 @@ pub const PG_LARGEOBJECT_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgLargeobject::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_LARGEOBJECT, None, 0xf8a2859d),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "loid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_largeobject_metadata`.
@@ -7320,6 +7436,10 @@ pub const PG_LARGEOBJECT_METADATA_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgLargeobjectMetadata::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_LARGEOBJECT_METADATA, Some(|row| row.oid), 0x16af5813),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_namespace`.
@@ -7365,6 +7485,10 @@ pub const PG_NAMESPACE_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgNamespace::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_NAMESPACE, Some(|row| row.oid), 0x4163f0f7),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_opclass`.
@@ -7589,6 +7713,10 @@ pub const PG_OPCLASS_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgOpclass::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_OPCLASS, Some(|row| row.oid), 0xa2b590bf),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_operator`.
@@ -8441,6 +8569,10 @@ pub const PG_OPERATOR_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgOperator::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_OPERATOR, Some(|row| row.oid), 0x50244ec3),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_opfamily`.
@@ -8630,6 +8762,10 @@ pub const PG_OPFAMILY_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgOpfamily::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_OPFAMILY, Some(|row| row.oid), 0xd5041022),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_parameter_acl`.
@@ -8671,6 +8807,10 @@ pub const PG_PARAMETER_ACL_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgParameterAcl::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_PARAMETER_ACL, Some(|row| row.oid), 0x2b293729),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_partitioned_table`.
@@ -8719,6 +8859,10 @@ pub const PG_PARTITIONED_TABLE_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgPartitionedTable::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_PARTITIONED_TABLE, None, 0xffebc6b1),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "partrelid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_policy`.
@@ -8765,6 +8909,10 @@ pub const PG_POLICY_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgPolicy::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_POLICY, Some(|row| row.oid), 0xc1a4aa75),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_proc`.
@@ -12230,6 +12378,10 @@ pub const PG_PROC_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgProc::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_PROC, Some(|row| row.oid), 0x133e6212),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_publication`.
@@ -12278,6 +12430,10 @@ pub const PG_PUBLICATION_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgPublication::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_PUBLICATION, Some(|row| row.oid), 0x922071bf),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_publication_namespace`.
@@ -12321,6 +12477,10 @@ pub const PG_PUBLICATION_NAMESPACE_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgPublicationNamespace::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_PUBLICATION_NAMESPACE, Some(|row| row.oid), 0xb31bc6cf),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_publication_rel`.
@@ -12367,6 +12527,10 @@ pub const PG_PUBLICATION_REL_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgPublicationRel::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_PUBLICATION_REL, Some(|row| row.oid), 0x0271c476),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_range`.
@@ -12421,6 +12585,10 @@ pub const PG_RANGE_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgRange::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_RANGE, None, 0x074138da),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "rngtypid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_replication_origin`.
@@ -12464,6 +12632,10 @@ pub const PG_REPLICATION_ORIGIN_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgReplicationOrigin::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_REPLICATION_ORIGIN, None, 0x9b3a0812),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "roident",
+        range: 0..0,
+    }),
 };
 
 /// A row of `pg_rewrite`.
@@ -12510,6 +12682,10 @@ pub const PG_REWRITE_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgRewrite::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_REWRITE, Some(|row| row.oid), 0x6a9349c7),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_seclabel`.
@@ -12548,6 +12724,10 @@ pub const PG_SECLABEL_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgSeclabel::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_SECLABEL, None, 0x8e3dfa13),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "objoid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_sequence`.
@@ -12596,6 +12776,10 @@ pub const PG_SEQUENCE_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgSequence::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_SEQUENCE, None, 0x6a2a4d2f),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "seqrelid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_shdepend`.
@@ -12637,6 +12821,10 @@ pub const PG_SHDEPEND_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgShdepend::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_SHDEPEND, None, 0xd5d04f0d),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "objid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_shdescription`.
@@ -12674,6 +12862,10 @@ pub const PG_SHDESCRIPTION_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgShdescription::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_SHDESCRIPTION, None, 0xaf161a3d),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "objoid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_shseclabel`.
@@ -12711,6 +12903,10 @@ pub const PG_SHSECLABEL_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgShseclabel::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_SHSECLABEL, None, 0xb0f43fb6),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "objoid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_statistic`.
@@ -12775,6 +12971,10 @@ pub const PG_STATISTIC_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgStatistic::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_STATISTIC, None, 0xbcc8d066),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "starelid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_statistic_ext`.
@@ -12823,6 +13023,10 @@ pub const PG_STATISTIC_EXT_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgStatisticExt::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_STATISTIC_EXT, Some(|row| row.oid), 0xfde2823c),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_statistic_ext_data`.
@@ -12862,6 +13066,10 @@ pub const PG_STATISTIC_EXT_DATA_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgStatisticExtData::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_STATISTIC_EXT_DATA, None, 0x63029ee1),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "stxoid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_subscription`.
@@ -12918,6 +13126,10 @@ pub const PG_SUBSCRIPTION_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgSubscription::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_SUBSCRIPTION, Some(|row| row.oid), 0xa99dc474),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_subscription_rel`.
@@ -12955,6 +13167,10 @@ pub const PG_SUBSCRIPTION_REL_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgSubscriptionRel::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_SUBSCRIPTION_REL, None, 0x853ed20e),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "srsubid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_tablespace`.
@@ -13000,6 +13216,10 @@ pub const PG_TABLESPACE_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgTablespace::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_TABLESPACE, Some(|row| row.oid), 0x7b0fcca8),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_transform`.
@@ -13043,6 +13263,10 @@ pub const PG_TRANSFORM_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgTransform::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_TRANSFORM, Some(|row| row.oid), 0x019256fe),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_trigger`.
@@ -13101,6 +13325,10 @@ pub const PG_TRIGGER_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgTrigger::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_TRIGGER, Some(|row| row.oid), 0xe6f15829),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_ts_config`.
@@ -13145,6 +13373,10 @@ pub const PG_TS_CONFIG_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgTsConfig::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_TS_CONFIG, Some(|row| row.oid), 0x54670829),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_ts_config_map`.
@@ -13201,6 +13433,10 @@ pub const PG_TS_CONFIG_MAP_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgTsConfigMap::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_TS_CONFIG_MAP, None, 0x07d6d456),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "mapcfg",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_ts_dict`.
@@ -13246,6 +13482,10 @@ pub const PG_TS_DICT_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgTsDict::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_TS_DICT, Some(|row| row.oid), 0x2d2a484c),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_ts_parser`.
@@ -13293,6 +13533,10 @@ pub const PG_TS_PARSER_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgTsParser::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_TS_PARSER, Some(|row| row.oid), 0xb20b248d),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_ts_template`.
@@ -13340,6 +13584,10 @@ pub const PG_TS_TEMPLATE_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgTsTemplate::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_TS_TEMPLATE, Some(|row| row.oid), 0x6d4a9c4e),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_type`.
@@ -13603,6 +13851,10 @@ pub const PG_TYPE_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgType::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_TYPE, Some(|row| row.oid), 0x842b21b8),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// A row of `pg_user_mapping`.
@@ -13645,6 +13897,10 @@ pub const PG_USER_MAPPING_SEEDED_TABLE: SeededTable = SeededTable {
     index_sql: PgUserMapping::INDEX_SQL,
     seed: &CatalogSeed::new(&PG_USER_MAPPING, Some(|row| row.oid), 0xd2708538),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {
+        column: "oid",
+        range: 0..16384,
+    }),
 };
 
 /// Each catalog as a seeded table, in the order of `postgres.bki`.

@@ -13,7 +13,7 @@ pub(crate) const HEADER: &str = "\
 // Do not edit. To change this file, run postgres/catalog/update.sh or
 // `cargo run -p turso_pg_catalog_gen`.
 
-use turso_core::dialect::SeededTable;
+use turso_core::dialect::{SeedRowRange, SeededTable};
 use turso_core::Value;
 
 use crate::seed::{value, Array, CatalogRow, CatalogSeed, Vector};
@@ -151,6 +151,7 @@ fn emit_seeded_table(
         &table.sql.index_sql,
         &table.sql_rows()?,
     );
+    let seed_rows = table.seed_rows()?;
     let oid = if table.oid_is_rowid {
         "Some(|row| row.oid)"
     } else {
@@ -171,9 +172,16 @@ pub const {table_name}_SEEDED_TABLE: SeededTable = SeededTable {{
     index_sql: {struct_name}::INDEX_SQL,
     seed: &CatalogSeed::new(&{table_name}, {oid}, {version:#010x}),
     hidden_columns: &[],
+    seed_rows: Some(SeedRowRange {{
+        column: \"{seed_column}\",
+        range: {start}..{end},
+    }}),
 }};
 ",
         values = values.join(", "),
+        seed_column = seed_rows.column,
+        start = seed_rows.range.start,
+        end = seed_rows.range.end,
     ));
     Ok(())
 }
@@ -344,6 +352,48 @@ declare unique index pg_namespace_oid_index 2685 on pg_namespace using btree(oid
              nspname TEXT NOT NULL, nspacl TEXT)\";"
         ));
         assert!(code.contains("pub const INDEX_SQL: &'static [&'static str] = &[];"));
+    }
+
+    #[test]
+    fn the_seed_rows_of_a_catalog_are_its_built_in_rows() {
+        let catalogs = parse(SMALL).unwrap();
+        let mut code = String::new();
+        emit_catalog(&mut code, &catalogs[0]).unwrap();
+        assert!(code.contains(
+            "    seed_rows: Some(SeedRowRange {\n        column: \"oid\",\n        range: 0..16384,\n    }),\n"
+        ));
+        // A catalog without oid has the built-in rows by the oid of the
+        // object that a row is about.
+        let bki = "create pg_depend 2608\n (\n classid = oid ,\n objid = oid\n )\n";
+        let catalogs = parse(bki).unwrap();
+        let mut code = String::new();
+        emit_catalog(&mut code, &catalogs[0]).unwrap();
+        assert!(code.contains("column: \"objid\",\n        range: 0..16384,"));
+        // No column of pg_db_role_setting tells a built-in row.
+        let bki = "create pg_db_role_setting 2964\n (\n setdatabase = oid ,\n setrole = oid\n )\n";
+        let catalogs = parse(bki).unwrap();
+        let mut code = String::new();
+        emit_catalog(&mut code, &catalogs[0]).unwrap();
+        assert!(code.contains("column: \"setrole\",\n        range: 0..0,"));
+    }
+
+    #[test]
+    fn a_catalog_whose_built_in_rows_are_unknown_stops_the_generation() {
+        let bki = "create pg_mystery 9999\n (\n a = oid\n )\n";
+        let catalogs = parse(bki).unwrap();
+        let error = emit_catalog(&mut String::new(), &catalogs[0]).unwrap_err();
+        assert_eq!(
+            error,
+            "pg_mystery: the generator does not know which column tells a built-in row"
+        );
+        let bki = "create pg_db_role_setting 2964\n (\n setdatabase = oid ,\n setrole = oid\n )\n\
+                   open pg_db_role_setting\ninsert ( 1 10 )\nclose pg_db_role_setting\n";
+        let catalogs = parse(bki).unwrap();
+        let error = emit_catalog(&mut String::new(), &catalogs[0]).unwrap_err();
+        assert_eq!(
+            error,
+            "pg_db_role_setting: the catalog has rows, but no column tells a built-in row"
+        );
     }
 
     #[test]

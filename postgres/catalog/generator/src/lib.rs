@@ -102,6 +102,15 @@
 //! `INTEGER PRIMARY KEY`, and otherwise its position in the table plus 1.
 //! The version of a seed is computed when the file is generated: the
 //! module `seed` describes it.
+//!
+//! The seed row range of a catalog holds its built-in rows: the rows whose
+//! oid is below 16384, PostgreSQL's `FirstNormalObjectId`, the first oid
+//! that a user's object gets. The oid is the column `oid`, or for a
+//! catalog without one, the column with the oid of the object that the row
+//! is about, such as `attrelid` of `pg_attribute`. `pg_db_role_setting` and
+//! `pg_replication_origin` have no such column, and their range is empty:
+//! their seeds must stay empty. A catalog that the generator does not know
+//! stops the generation.
 
 mod bki;
 mod column;

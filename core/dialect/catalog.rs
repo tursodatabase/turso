@@ -86,6 +86,30 @@ pub struct SeededTable {
     /// have them, so core refuses to store a seeded table that has hidden
     /// columns.
     pub hidden_columns: &'static [HiddenColumn],
+    /// The stored rows that belong to the seed. Each seeded table of a
+    /// catalog must have a range, also when its seed is empty, so that a
+    /// later seed with rows does not take rows that the catalog wrote. Only
+    /// the seeded tables of core, whose seeds stay empty, have none.
+    pub seed_rows: Option<SeedRowRange>,
+}
+
+/// The stored rows of a [`SeededTable`] that belong to its seed: the rows
+/// whose `column` has an integer value in `range`.
+///
+/// The seed owns the rows inside the range. When the seed in the binary has
+/// another [`Seed::version`] than the seed that filled the stored table,
+/// core deletes the rows inside the range and copies the seed rows in
+/// again. Core never deletes or changes a row outside the range. Thus each
+/// seed row must be inside the range, and each row that the catalog writes
+/// must be outside it. A statement that writes a row that breaks one of
+/// these rules fails.
+#[derive(Debug, Clone)]
+pub struct SeedRowRange {
+    /// The name of an `INTEGER` column of `create_sql`, which can be the
+    /// `INTEGER PRIMARY KEY` column. A NULL value is outside the range.
+    pub column: &'static str,
+    /// The values of `column` that the seed owns.
+    pub range: std::ops::Range<i64>,
 }
 
 /// A hidden `INTEGER` column of the read-only table of a [`SeededTable`],
