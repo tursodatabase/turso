@@ -853,6 +853,12 @@ fn translate_cast_expr(
         // An array is a record blob in a register. A CAST of it to a type that
         // is not an array converts its text form, the text the client sees:
         // CAST(ARRAY[1,2] AS TEXT) is '{1,2}'.
+        // FIXME(pg-catalog): PostgreSQL casts an array only to another array or,
+        // by its output function, to a string type (text, varchar, bpchar,
+        // name); a cast to any other type, such as int, fails with 42846. This
+        // converts the text for every target, so CAST(ARRAY[1,2] AS int) is 0.
+        // A lookup in pg_cast, with its I/O conversion casts to string types,
+        // replaces this.
         if source.is_array() && tn.array_dimensions == 0 {
             program.emit_insn(Insn::ArrayDecode {
                 reg: target_register,

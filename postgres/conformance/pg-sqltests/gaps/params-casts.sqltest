@@ -670,3 +670,17 @@ expect {
 }
 @sqlstate 23000
 expect @tursopg error {}
+
+# PostgreSQL casts an array to a string type through its output function, and
+# has no cast from an array to a number. tursopg casts the array's text.
+@compat-gap "cast:_int4 -> int4"
+test array-to-int-cast {
+    SELECT CAST(ARRAY[1,2] AS int);
+}
+@sqlstate 42846
+expect error {
+    cannot cast type integer\[\] to integer
+}
+expect @tursopg {
+    0
+}
