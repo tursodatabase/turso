@@ -109,6 +109,14 @@ pub trait Type: Debug + Send + Sync {
         None
     }
 
+    /// Turns a value that a CAST to the type takes into a value that a
+    /// column of the type takes. The CAST then stores the result as a column
+    /// does, with ENCODE and COERCE. Without one, a CAST takes the values
+    /// that a column takes.
+    fn cast(&self) -> Option<Conversion> {
+        None
+    }
+
     /// The value of a column of the type that has no DEFAULT of its own.
     fn default(&self) -> Option<Box<ast::Expr>> {
         None

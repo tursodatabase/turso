@@ -960,15 +960,15 @@ fn emit_custom_type_cast(
         None => Vec::new(),
     };
 
-    // A cast to boolean, or to a domain over boolean, gives true for every
-    // nonzero integer in dialects whose integer-to-boolean cast does, before
-    // boolean's ENCODE sees the value.
+    // A type may take more values in a CAST than in a column: the boolean
+    // of the PostgreSQL frontend gives true for every nonzero integer in a
+    // CAST. Its conversion runs before the type stores the value. A CAST to
+    // a domain runs the conversion of the type the domain is based on.
     let is_domain = chain[0].is_domain;
-    if chain
-        .iter()
-        .any(|type_def| casts_nonzero_integer_to_true(type_def, resolver))
-    {
-        emit_integer_to_boolean_cast(program, reg);
+    for type_def in chain {
+        if let Some(cast) = type_def.cast() {
+            emit_conversion(program, type_def, "CAST", cast, reg, resolver)?;
+        }
     }
     // The CAST first converts the value to the type's input type as a
     // CAST to that type would, then stores it as a column of the type
@@ -1035,39 +1035,6 @@ pub(crate) fn is_sqlite_cast_to(type_def: &TypeDef, type_name: &ast::Type) -> bo
     };
     let user_param_count = type_def.user_params().count();
     !type_def.is_domain && user_param_count != 0 && type_arg_count != user_param_count
-}
-
-/// True when a cast to `type_def` turns every nonzero integer into true.
-fn casts_nonzero_integer_to_true(type_def: &TypeDef, resolver: &Resolver) -> bool {
-    type_def.is_builtin
-        && type_def.name == "boolean"
-        && resolver.catalog.dialect.casts_nonzero_integer_to_true()
-}
-
-/// Replaces an integer in `reg` with 1 when it is nonzero and 0 when it is
-/// zero. Other values are left for the boolean type's ENCODE.
-fn emit_integer_to_boolean_cast(program: &mut ProgramBuilder, reg: usize) {
-    let to_boolean = program.allocate_label();
-    let done = program.allocate_label();
-    // IsType also jumps for NULL, which must stay NULL.
-    program.emit_insn(Insn::IsNull {
-        reg,
-        target_pc: done,
-    });
-    program.emit_insn(Insn::IsType {
-        reg,
-        target_pc: to_boolean,
-        value_type: crate::types::ValueType::Integer,
-    });
-    program.emit_insn(Insn::Goto { target_pc: done });
-    program.preassign_label_to_next_insn(to_boolean);
-    program.emit_insn(Insn::IsTrue {
-        reg,
-        dest: reg,
-        null_value: false,
-        invert: false,
-    });
-    program.preassign_label_to_next_insn(done);
 }
 
 #[inline(never)]

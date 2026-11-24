@@ -432,10 +432,6 @@ impl Dialect for PostgresDialect {
         true
     }
 
-    fn casts_nonzero_integer_to_true(&self) -> bool {
-        true
-    }
-
     fn text_input_types_refuse_other_kinds(&self) -> bool {
         true
     }

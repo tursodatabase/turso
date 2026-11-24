@@ -252,6 +252,9 @@ pub enum TypeDefKind {
         encode: Option<Conversion>,
         coerce: Option<Conversion>,
         decode: Option<Conversion>,
+        /// What a CAST to the type does to its value before the type stores
+        /// it (see `Type::cast`).
+        cast: Option<Conversion>,
         /// How values of the type compare, for built-in types that have their
         /// own order, such as numeric. `None` compares the stored values as
         /// SQLite does.
@@ -524,6 +527,15 @@ impl TypeDef {
     pub fn decode(&self) -> Option<&Conversion> {
         match &self.kind {
             TypeDefKind::Custom { decode, .. } => decode.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// What a CAST to the type does to its value before the type stores it
+    /// (Custom types only).
+    pub fn cast(&self) -> Option<&Conversion> {
+        match &self.kind {
+            TypeDefKind::Custom { cast, .. } => cast.as_ref(),
             _ => None,
         }
     }
@@ -854,6 +866,7 @@ impl TypeDef {
                 encode: ty.encode(),
                 coerce: ty.coerce(),
                 decode: ty.decode(),
+                cast: ty.cast(),
                 ordering: ty.ordering(),
                 kinds,
                 operators: ty.operators(),
@@ -890,6 +903,8 @@ impl TypeDef {
                 encode: None,
                 coerce: None,
                 decode: None,
+                // A CAST to a domain converts as the type it is based on.
+                cast: None,
                 // A domain has the order and arithmetic of the type it is based on.
                 ordering: None,
                 kinds: None,

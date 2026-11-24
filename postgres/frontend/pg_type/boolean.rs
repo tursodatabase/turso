@@ -41,6 +41,10 @@ impl Type for Boolean {
         Some(Conversion::Function(bool_decode))
     }
 
+    fn cast(&self) -> Option<Conversion> {
+        Some(Conversion::Function(bool_cast))
+    }
+
     /// `OPERATOR '<'`: false sorts before true, as 0 sorts before 1.
     fn operators(&self) -> Vec<ast::TypeOperator> {
         vec![ast::TypeOperator {
@@ -75,6 +79,17 @@ fn bool_encode(value: &Value, _params: &[Value]) -> Result<Value> {
             format!("the value {other} is not of type boolean"),
             None,
         )),
+    }
+}
+
+/// FIXME(pg-catalog): This hand-codes the pg_cast entry from integer to boolean (function bool(integer)). pg_cast has no entry from smallint or bigint to boolean, but this cast applies to every integer value. A lookup in a pg_cast table replaces this.
+/// PostgreSQL casts an integer to boolean, but does not store one in a boolean
+/// column: every nonzero integer is true in a cast. Other values are left
+/// as they are, and `bool_encode` reads them as it does for a column.
+fn bool_cast(value: &Value, _params: &[Value]) -> Result<Value> {
+    match value {
+        Value::Numeric(Numeric::Integer(integer)) => Ok(Value::from_i64(i64::from(*integer != 0))),
+        other => Ok(other.clone()),
     }
 }
 

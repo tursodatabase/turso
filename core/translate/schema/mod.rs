@@ -3414,6 +3414,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
             encode,
             coerce,
             decode,
+            cast,
             default,
             // These name functions and comparison rules, never a type.
             ordering: _,
@@ -3428,7 +3429,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
                 .chain(params.iter().filter_map(|param| param.ty.as_deref()))
                 .collect(),
             // A conversion written in Rust names no type.
-            [encode, coerce, decode]
+            [encode, coerce, decode, cast]
                 .into_iter()
                 .flatten()
                 .filter_map(Conversion::expr)

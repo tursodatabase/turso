@@ -1236,6 +1236,54 @@ fn dialect_registers_a_type_written_in_rust() {
     conn.close().unwrap();
 }
 
+/// A type with a cast conversion takes values in a CAST that a column of the
+/// type refuses.
+#[test]
+fn cast_conversion_of_a_type_runs_in_a_cast_and_not_in_a_column() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_db(&io, "dialect-type-cast.db", Arc::new(RustTypesDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    // The conversion turns 5 into `si`, which ENCODE reads. It leaves text
+    // to ENCODE, and it does not run on NULL.
+    conn.execute("CREATE DOMAIN flag AS boolean").unwrap();
+    let rows = conn
+        .prepare(
+            "SELECT CAST(5 AS boolean), CAST(0 AS boolean), CAST('si' AS boolean), \
+             CAST(NULL AS boolean), CAST(5 AS flag)",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::from_i64(1),
+            Value::from_i64(0),
+            Value::from_i64(1),
+            Value::Null,
+            // A domain converts as the type it is based on.
+            Value::from_i64(1),
+        ]]
+    );
+
+    // Text that ENCODE refuses fails in a CAST too.
+    let error = conn
+        .prepare("SELECT CAST('yes' AS boolean)")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap_err();
+    assert!(error.to_string().contains("yes is not si or no"), "{error}");
+
+    // A column of the type does not run the conversion.
+    conn.execute("CREATE TABLE t (b boolean) STRICT").unwrap();
+    let error = conn.execute("INSERT INTO t VALUES (5)").unwrap_err();
+    assert!(error.to_string().contains("5 is not si or no"), "{error}");
+    conn.close().unwrap();
+}
+
 /// A dialect that registers two types written in Rust: `loud`, and a
 /// `boolean` that replaces the type of core.
 struct RustTypesDialect;
@@ -1322,7 +1370,8 @@ impl Type for Loud {
     }
 }
 
-/// A boolean that reads `si` as true and `no` as false.
+/// A boolean that reads `si` as true and `no` as false. A CAST to it also
+/// takes an integer.
 #[derive(Debug)]
 struct SiNoBoolean;
 
@@ -1346,6 +1395,14 @@ impl Type for SiNoBoolean {
                 "no" => Ok(Value::from_i64(0)),
                 other => Err(LimboError::Constraint(format!("{other} is not si or no"))),
             }
+        }))
+    }
+
+    fn cast(&self) -> Option<Conversion> {
+        Some(Conversion::Function(|value, _params| match value {
+            Value::Numeric(Numeric::Integer(0)) => Ok(Value::build_text("no")),
+            Value::Numeric(Numeric::Integer(_)) => Ok(Value::build_text("si")),
+            other => Ok(other.clone()),
         }))
     }
 }
