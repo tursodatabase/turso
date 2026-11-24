@@ -78,10 +78,11 @@ use turso_macros::turso_assert;
 fn validate(
     table_name: &str,
     resolver: &Resolver,
-    _table: &Table,
+    table: &Table,
     namespace: NamespaceRef,
     conn: &Arc<Connection>,
 ) -> Result<()> {
+    conn.db.seeded_tables.refuse_write(table, table_name)?;
     // Check if this is a system table that should be protected from direct writes
     if !conn.is_nested_stmt()
         && !conn.is_mvcc_bootstrap_connection()

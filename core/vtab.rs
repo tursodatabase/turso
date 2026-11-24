@@ -83,6 +83,25 @@ impl VirtualTable {
         })
     }
 
+    /// The read-only table of a seeded table, with the columns of its
+    /// `CREATE TABLE`. It is not a table-valued function, so the paths that
+    /// copy table-valued functions into a new schema do not copy it.
+    pub(crate) fn new_seeded(
+        name: String,
+        columns: Vec<Column>,
+        table: Arc<RwLock<dyn InternalVirtualTable>>,
+    ) -> Self {
+        VirtualTable {
+            name,
+            columns,
+            kind: VTabKind::VirtualTable,
+            vtab_type: VirtualTableType::Internal(table),
+            vtab_id: 0,
+            is_droppable: false,
+            innocuous: true,
+        }
+    }
+
     pub(crate) fn function(
         dialect: &dyn crate::dialect::Dialect,
         name: &str,

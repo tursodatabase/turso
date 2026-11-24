@@ -14374,6 +14374,11 @@ pub fn op_drop_table(
             schema.remove_indices_for_table(*namespace, table_name);
             schema.remove_triggers_for_table(*namespace, table_name);
             schema.remove_table(*namespace, table_name);
+            if *db == crate::MAIN_DB_ID {
+                // A reload gives a freed seeded name its read-only table
+                // again, so the schema gives it now.
+                conn.db.seeded_tables.add_missing_to(schema);
+            }
         })?;
         // SQLite also removes temp triggers that target the dropped table.
         // Only needed when dropping from a non-temp database. We must
@@ -17284,6 +17289,12 @@ pub fn op_rename_table(
             );
             view.sql = new_sql;
             view.select_stmt = new_select;
+        }
+
+        if *db == crate::MAIN_DB_ID {
+            // A reload gives a freed seeded name its read-only table again,
+            // so the schema gives it now.
+            conn.db.seeded_tables.add_missing_to(schema);
         }
 
         Ok(())

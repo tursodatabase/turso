@@ -279,6 +279,9 @@ pub(crate) fn load_steps(conn: &Arc<Connection>, steps_for: StepsFor) -> Vec<Box
     if reads_schema_rows {
         steps.push(Box::new(SchemaRows::new(conn.clone())));
     }
+    if !conn.db.seeded_tables.is_empty() {
+        steps.push(Box::new(SeededTables::new(conn.clone())));
+    }
     steps.push(Box::new(NamespaceNames::new(conn.clone())));
     if reads_schema_rows {
         steps.push(Box::new(Sequences::new(conn.clone(), preserved_sequences)));
@@ -346,6 +349,35 @@ impl LoadStep for SchemaRows {
             &attached_database_id,
             self.conn.db.dialect().as_ref(),
         )
+    }
+}
+
+/// Adds the read-only tables of the seeded tables whose names the schema
+/// rows did not give to a stored object. It runs before the steps that can
+/// read them.
+pub(crate) struct SeededTables {
+    conn: Arc<Connection>,
+}
+
+impl SeededTables {
+    pub(crate) fn new(conn: Arc<Connection>) -> Self {
+        Self { conn }
+    }
+}
+
+impl LoadStep for SeededTables {
+    fn next_query(&mut self, load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
+        let seeded_tables = &self.conn.db.seeded_tables;
+        // Changes the schema only when a table is missing, so that a schema
+        // that has all of them is not copied.
+        if seeded_tables.any_missing_from(load.schema()) {
+            seeded_tables.add_missing_to(load.schema_mut()?);
+        }
+        Ok(None)
+    }
+
+    fn row(&mut self, _load: &mut SchemaLoad, _row: &Row) -> Result<()> {
+        unreachable!("the step has no statement")
     }
 }
 

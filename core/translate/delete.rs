@@ -50,6 +50,7 @@ fn validate_delete(
             crate::util::table_name_for_error(qualified_name)
         ),
     };
+    connection.db.seeded_tables.refuse_write(&table, tbl_name)?;
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);
     }

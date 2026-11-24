@@ -310,6 +310,13 @@ fn validate_update(
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
+    if !conn.db.seeded_tables.is_empty() {
+        if let Some(table) = resolver.with_schema(namespace.database_id, |s| {
+            s.get_table(namespace.id, table_name)
+        }) {
+            conn.db.seeded_tables.refuse_write(&table, table_name)?;
+        }
+    }
     // Check if this is a materialized view. Must look up the schema of the
     // table's own database: a table in an attached database can share a name
     // with a materialized view in a different database.

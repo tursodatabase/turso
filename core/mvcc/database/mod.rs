@@ -10565,6 +10565,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 connection.dialect().as_ref(),
             )?;
         }
+        // As the loader does after the schema rows: a stored table keeps its
+        // name, and each other seeded table gets its read-only table.
+        connection.db.seeded_tables.add_missing_to(&mut fresh);
         fresh.populate_types_views_then_indices(
             connection.dialect().as_ref(),
             &syms,

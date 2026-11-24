@@ -723,6 +723,7 @@ impl Connection {
             .with_index_method(self.db.experimental_index_method_enabled())
             .with_vacuum(self.db.experimental_vacuum_enabled())
             .with_without_rowid(self.db.experimental_without_rowid_enabled())
+            .without_seeded_tables()
     }
 
     fn effective_temp_store(&self) -> crate::TempStore {

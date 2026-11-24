@@ -91,6 +91,10 @@ pub struct DatabaseOpts {
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
+    /// The schema has no read-only tables of seeded tables. Set for the
+    /// temp database, which only has the objects that the connection
+    /// creates in it.
+    pub(crate) without_seeded_tables: bool,
 }
 
 impl DatabaseOpts {
@@ -101,6 +105,12 @@ impl DatabaseOpts {
     #[cfg(feature = "cli_only")]
     pub fn turso_cli(mut self) -> Self {
         self.enable_load_extension = true;
+        self
+    }
+
+    /// Gives the schema no read-only tables of seeded tables.
+    pub(crate) fn without_seeded_tables(mut self) -> Self {
+        self.without_seeded_tables = true;
         self
     }
 
@@ -818,6 +828,10 @@ pub struct Database<
     /// and shared by all connections because the parsed [`Schema`] is
     /// shared per database.
     dialect: Arc<dyn Dialect>,
+    /// The read-only tables of the seeded tables of the dialect's catalog,
+    /// which the schema has under the names that no stored object has. The
+    /// temp database has none.
+    pub(crate) seeded_tables: crate::dialect::seeded::SeededTables,
     pub(crate) opts: DatabaseOpts,
     pub(crate) n_connections: AtomicUsize,
     /// Process-unique id minted at construction. Unlike the `Arc`'s heap
@@ -975,6 +989,10 @@ impl Database {
             shared_wal_coordination: OnceLock::new(),
             db_file,
             builtin_syms: parking_lot::RwLock::new(syms),
+            seeded_tables: crate::dialect::seeded::SeededTables::new(
+                dialect.as_ref(),
+                !opts.without_seeded_tables,
+            )?,
             dialect,
             io: io.clone(),
             open_flags: flags,
