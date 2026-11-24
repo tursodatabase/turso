@@ -1,5 +1,5 @@
 use crate::alloc::{
-    DynAllocator, TryClone, TursoAllocExt, TursoIteratorExt, TursoSliceExt,
+    DynAllocator, DynBox, TryClone, TursoAllocExt, TursoIteratorExt, TursoSliceExt,
     TursoTryWithCapacityExt, TursoVecExt,
 };
 use crate::cdc::TURSO_CDC_VERSION_TABLE_NAME;
@@ -6011,7 +6011,7 @@ pub enum OpProgramState {
     /// Step state tracks whether we're executing a trigger subprogram (vs FK action subprogram)
     Step {
         is_trigger: bool,
-        statement: Box<Statement>,
+        statement: DynBox<Statement>,
         /// Saved last_insert_rowid to restore after trigger subprogram completes.
         /// Per SQLite docs, trigger-body INSERTs must not overwrite the top-level rowid.
         saved_last_insert_rowid: Option<i64>,
@@ -6136,15 +6136,7 @@ pub fn op_program(
                         cached.reset_for_subprogram_reuse();
                         cached
                     } else {
-                        Box::new(Statement::new_with_origin(
-                            Program::from_prepared(subprogram.clone()),
-                            connection.clone(),
-                            pager.clone(),
-                            QueryMode::Normal,
-                            0,
-                            crate::statement::StatementOrigin::Subprogram,
-                            false,
-                        ))
+                        new_subprogram_statement(&subprogram, connection, pager)?
                     };
                 statement.set_subprogram_depth(state.subprogram_depth + 1);
 
@@ -6307,6 +6299,34 @@ pub fn op_program(
             }
         }
     }
+}
+
+/// Makes the statement of a nested trigger or foreign key action program in
+/// memory from the statement allocator of the database. The execution of
+/// nested programs recurses one time for each level through [op_program], so
+/// the large statement must not be in its stack frame. Thus this function
+/// makes the statement in its own frame, and it must not be inlined.
+#[inline(never)]
+fn new_subprogram_statement(
+    subprogram: &Arc<super::PreparedProgram>,
+    connection: &Arc<Connection>,
+    pager: &Arc<Pager>,
+) -> Result<DynBox<Statement>> {
+    let statement = Statement::new_with_origin(
+        Program::from_prepared(subprogram.clone()),
+        connection.clone(),
+        pager.clone(),
+        QueryMode::Normal,
+        0,
+        crate::statement::StatementOrigin::Subprogram,
+        false,
+    );
+    let alloc = connection.db.allocators.statement.clone();
+    let statement = crate::with_statement_allocation_site!(
+        SubprogramStatement,
+        DynBox::try_new_in(statement, alloc)
+    )?;
+    Ok(statement)
 }
 
 pub(super) fn abort_active_subprogram(

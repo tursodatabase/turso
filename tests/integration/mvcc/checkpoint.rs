@@ -6094,6 +6094,7 @@ fn update_survives_restart_when_prune_cannot_mark_its_key_again() {
                         fault.clone(),
                     )),
                     fts: turso_core::alloc::DynAllocator::default(),
+                    statement: turso_core::alloc::DynAllocator::default(),
                 }),
         )
         .unwrap();

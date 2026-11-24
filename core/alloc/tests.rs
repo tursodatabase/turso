@@ -82,6 +82,7 @@ fn database_allocators_preserve_distinct_concrete_types() {
             allocations: allocations.clone(),
             deallocations: deallocations.clone(),
         },
+        statement: DynAllocator::default(),
     };
     let cloned = allocators.clone();
     let layout = Layout::new::<u64>();
@@ -110,6 +111,40 @@ fn dyn_allocator_delegates_skiplist_allocations() {
     map.try_insert(1, 2).unwrap();
 
     assert!(allocations.load(Ordering::Relaxed) > 0);
+}
+
+#[test]
+fn dyn_box_allocates_from_its_allocator() {
+    let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
+    let alloc = DynAllocator::new(CountingAlloc {
+        allocations: allocations.clone(),
+        deallocations: deallocations.clone(),
+    });
+
+    let boxed = DynBox::try_new_in([7u64; 4], alloc).unwrap();
+    assert_eq!(allocations.load(Ordering::Relaxed), 1);
+    assert_eq!(TursoBoxExt::into_inner(boxed), [7u64; 4]);
+    assert_eq!(deallocations.load(Ordering::Relaxed), 1);
+}
+
+struct FailingAlloc;
+
+unsafe impl ApiAllocator for FailingAlloc {
+    fn allocate(&self, _layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        Err(AllocError)
+    }
+
+    unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {
+        unreachable!("FailingAlloc gives no memory, so nothing can return memory to it");
+    }
+}
+
+#[test]
+fn dyn_box_returns_an_error_when_its_allocator_fails() {
+    let alloc = DynAllocator::new(FailingAlloc);
+
+    assert!(DynBox::try_new_in(7u64, alloc).is_err());
 }
 
 #[cfg(nightly)]

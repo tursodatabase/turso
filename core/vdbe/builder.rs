@@ -1171,6 +1171,24 @@ impl ProgramBuilder {
         self.subprogram_depth
     }
 
+    /// Nesting level of a trigger or foreign key action program that this
+    /// program starts, or `None` when that level is past
+    /// [MAX_TRIGGER_DEPTH](crate::vdbe::MAX_TRIGGER_DEPTH). For `None`, the
+    /// method emits a `Halt` with the error of SQLite instead of the program.
+    /// Thus, as in SQLite, the error occurs only if the statement gets to that
+    /// level.
+    pub fn nested_subprogram_depth(&mut self) -> Option<usize> {
+        let depth = self.subprogram_depth + 1;
+        if depth > crate::vdbe::MAX_TRIGGER_DEPTH {
+            self.emit_halt_err(
+                crate::error::SQLITE_ERROR,
+                crate::vdbe::TRIGGER_DEPTH_ERROR.to_string(),
+            );
+            return None;
+        }
+        Some(depth)
+    }
+
     /// Whether the main database uses MVCC journal mode. See `Self::mvcc_enabled`.
     pub const fn is_mvcc_enabled(&self) -> bool {
         self.mvcc_enabled
