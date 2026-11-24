@@ -3,14 +3,14 @@ mod sqlite_schema_rows;
 
 pub use sqlite_schema_rows::SqliteCatalog;
 pub(crate) use sqlite_schema_rows::{
-    alloc_sqlite_schema_cursor, emit_create_internal_table, emit_delete_sequence_backing_table_row,
+    alloc_sqlite_schema_cursor, emit_delete_sequence_backing_table_row,
     emit_open_sqlite_schema_cursor, emit_schema_entry, open_sqlite_schema_for_write,
     SchemaEntryType,
 };
 
 use crate::dialect::{
-    AutomaticIndex, CatalogCmd, CmdContext, CreateTable, CreateType, CreateVirtualTable, DropTable,
-    DropType, TableText,
+    AutomaticIndex, CatalogCmd, CmdContext, CreateSchema, CreateTable, CreateType,
+    CreateVirtualTable, DropSchema, DropTable, DropType, TableText,
 };
 use crate::sync::Arc;
 use crate::HashMap;
@@ -24,8 +24,7 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
     BTreeTable, ColDef, Column, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
-    TypeDefKind, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME,
-    TURSO_TYPES_TABLE_NAME,
+    TypeDefKind, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -1624,6 +1623,7 @@ pub fn translate_create_table(
 pub fn translate_create_schema(
     name: &ast::Name,
     resolver: &Resolver,
+    connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     if !resolver.catalog.dialect.supports_namespaces() {
@@ -1641,8 +1641,15 @@ pub fn translate_create_schema(
     let schema_version = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
     program.begin_write_on_database(MAIN_DB_ID, schema_version)?;
 
-    let cursor_id = open_namespaces_table_for_writing(program, resolver)?;
-    emit_namespace_row(program, cursor_id, id, &normalized_name);
+    let cmd_context = CmdContext::new(connection, resolver, MAIN_DB_ID);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::CreateSchema(CreateSchema {
+            id,
+            name: &normalized_name,
+        }),
+    )?;
     program.emit_insn(Insn::AddNamespace {
         db: MAIN_DB_ID,
         namespace: id,
@@ -1663,6 +1670,7 @@ pub fn translate_create_schema(
 pub fn translate_drop_schema(
     name: &ast::Name,
     resolver: &Resolver,
+    connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     if !resolver.catalog.dialect.supports_namespaces() {
@@ -1675,38 +1683,15 @@ pub fn translate_drop_schema(
     let schema_version = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
     program.begin_write_on_database(MAIN_DB_ID, schema_version)?;
 
-    let cursor_id = open_namespaces_table_for_writing(program, resolver)?;
-    let id_reg = program.alloc_register();
-    program.emit_insn(Insn::Integer {
-        dest: id_reg,
-        value: i64::from(id.as_u32()),
-    });
-    let missing_row_label = program.allocate_label();
-    let delete_done_label = program.allocate_label();
-    program.emit_insn(Insn::NotExists {
-        cursor: cursor_id,
-        rowid_reg: id_reg,
-        target_pc: missing_row_label,
-    });
-    program.emit_insn(Insn::Delete {
-        cursor_id,
-        table_name: TURSO_NAMESPACES_TABLE_NAME.to_string(),
-        is_part_of_update: false,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: delete_done_label,
-    });
-    program.preassign_label_to_next_insn(missing_row_label);
-    program.emit_insn(Insn::Halt {
-        constraint_info: None,
-        err_code: crate::error::SQLITE_ERROR,
-        description: format!(
-            "{TURSO_NAMESPACES_TABLE_NAME} has no row for namespace {normalized_name}"
-        ),
-        on_error: None,
-        description_reg: None,
-    });
-    program.preassign_label_to_next_insn(delete_done_label);
+    let cmd_context = CmdContext::new(connection, resolver, MAIN_DB_ID);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::DropSchema(DropSchema {
+            id,
+            name: &normalized_name,
+        }),
+    )?;
 
     program.emit_insn(Insn::DropNamespace {
         db: MAIN_DB_ID,
@@ -1719,104 +1704,6 @@ pub fn translate_drop_schema(
         p5: 0,
     });
     Ok(())
-}
-
-/// Opens the namespaces table of the main database for writing. A database
-/// that has never created or dropped a namespace has no namespaces table
-/// yet, so it is created first with a row for each namespace the database
-/// has, which are its default namespaces.
-fn open_namespaces_table_for_writing(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-) -> Result<usize> {
-    let existing = resolver.with_schema(MAIN_DB_ID, |s| {
-        s.get_btree_table(NamespaceId::ROOT, TURSO_NAMESPACES_TABLE_NAME)
-    });
-    let created = existing.is_none();
-    let (table, root_page) = match existing {
-        Some(table) => {
-            let root_page = RegisterOrLiteral::Literal(table.root_page);
-            (table, root_page)
-        }
-        None => {
-            let created = emit_create_internal_table(
-                program,
-                resolver,
-                TURSO_NAMESPACES_TABLE_NAME,
-                &format!(
-                    "CREATE TABLE {TURSO_NAMESPACES_TABLE_NAME}(id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
-                ),
-            )?;
-            (created.table, created.root_page)
-        }
-    };
-    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id,
-        root_page,
-        db: MAIN_DB_ID,
-    });
-    if created {
-        let namespaces = resolver.with_schema(MAIN_DB_ID, |s| {
-            s.namespaces()
-                .map(|(id, name)| (id, name.to_string()))
-                .collect::<Vec<_>>()
-        });
-        for (id, name) in namespaces {
-            emit_namespace_row(program, cursor_id, id, &name);
-        }
-    }
-    Ok(cursor_id)
-}
-
-/// Inserts the row of namespace `id` called `name` into the namespaces
-/// table open at `cursor_id`, failing if the table has a row with that id.
-fn emit_namespace_row(program: &mut ProgramBuilder, cursor_id: usize, id: NamespaceId, name: &str) {
-    let id_reg = program.alloc_register();
-    program.emit_insn(Insn::Integer {
-        dest: id_reg,
-        value: i64::from(id.as_u32()),
-    });
-    let insert_label = program.allocate_label();
-    program.emit_insn(Insn::NotExists {
-        cursor: cursor_id,
-        rowid_reg: id_reg,
-        target_pc: insert_label,
-    });
-    program.emit_insn(Insn::Halt {
-        constraint_info: None,
-        err_code: crate::error::SQLITE_CONSTRAINT_PRIMARYKEY,
-        description: format!("UNIQUE constraint failed: {TURSO_NAMESPACES_TABLE_NAME}.id"),
-        on_error: None,
-        description_reg: None,
-    });
-    program.preassign_label_to_next_insn(insert_label);
-    // The id is the rowid, so the record keeps NULL for it, as SQLite does
-    // for an INTEGER PRIMARY KEY column.
-    let record_start_reg = program.alloc_registers(2);
-    program.emit_insn(Insn::Null {
-        dest: record_start_reg,
-        dest_end: None,
-    });
-    program.emit_insn(Insn::String8 {
-        value: name.to_string(),
-        dest: record_start_reg + 1,
-    });
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(record_start_reg),
-        count: to_u32(2),
-        dest_reg: to_u32(record_reg),
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: cursor_id,
-        key_reg: id_reg,
-        record_reg,
-        flag: InsertFlags::new(),
-        table_name: TURSO_NAMESPACES_TABLE_NAME.to_string(),
-    });
 }
 
 pub const SQLITE_TABLEID: &str = "sqlite_schema";

@@ -148,11 +148,12 @@ pub(crate) use database::{DatabaseCatalog, InitState};
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 pub use dialect::{
     AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
-    CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,
-    CreateTrigger, CreateType, CreateView, CreateVirtualTable, Dependent, DependentObject, Dialect,
-    DropColumn, DropIndex, DropSequence, DropTable, DropTrigger, DropType, DropView, NewOwner,
-    OwnerColumn, RelationName, RenameColumn, RenameTable, RewrittenTrigger, RewrittenView,
-    SqliteCatalog, StatementTimes, TableText, TempTriggerOfRenamedTable,
+    CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSchema, CreateSequence,
+    CreateTable, CreateTrigger, CreateType, CreateView, CreateVirtualTable, Dependent,
+    DependentObject, Dialect, DropColumn, DropIndex, DropSchema, DropSequence, DropTable,
+    DropTrigger, DropType, DropView, NewOwner, OwnerColumn, RelationName, RenameColumn,
+    RenameTable, RewrittenTrigger, RewrittenView, SqliteCatalog, StatementTimes, TableText,
+    TempTriggerOfRenamedTable,
 };
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
