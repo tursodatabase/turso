@@ -3402,6 +3402,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
         accepts_collate: _,
         range_offsets: _,
         stored_form_sorts_in_value_order: _,
+        casts_to_numbers_and_booleans: _,
         sql: _,
         domain_checks,
         kind,

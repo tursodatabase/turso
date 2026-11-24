@@ -1,7 +1,8 @@
 use super::*;
 use crate::schema::ResolvedType;
-use crate::types::Conversion;
+use crate::types::{Conversion, StorageClass, StrictType};
 
+/// FIXME(pg-catalog): This types literals by the rules of SQLite: TRUE and FALSE are integer and 1.5 is real, where PostgreSQL types them boolean and numeric. The type decides whether an operator of a custom type encodes the literal to that type. A typed expression tree that gives literals the types of the dialect replaces this.
 /// Get the effective type name of a literal expression.
 pub(super) fn literal_type_name(expr: &ast::Expr) -> Option<&'static str> {
     match expr {
@@ -111,6 +112,32 @@ fn translate_compared_value(
             resolver,
         ),
         None => translate_expr(program, referenced_tables, operand, reg, resolver),
+    }
+}
+
+/// Like [translate_compared_value], but returns the register that holds
+/// `operand`. [resolve_expr()] chooses it, unless `operand` is read as a value
+/// of a custom type.
+pub(crate) fn resolve_compared_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    other: &ast::Expr,
+    resolver: &Resolver,
+) -> Result<usize> {
+    match untyped_operand_type(operand, other, referenced_tables, resolver)? {
+        Some(resolved) => {
+            let reg = program.alloc_register();
+            translate_untyped_operand_as(
+                program,
+                referenced_tables,
+                operand,
+                &resolved,
+                reg,
+                resolver,
+            )
+        }
+        None => resolve_expr(program, referenced_tables, operand, resolver),
     }
 }
 
@@ -713,6 +740,50 @@ pub(crate) fn emit_store_value(
     program.emit_insn(convert);
     program.preassign_label_to_next_insn(skip_label);
     Ok(())
+}
+
+/// FIXME(pg-catalog): This decides by type properties whether a pg_cast entry from `source` to `target` exists, and the text-reading target test stands in for the target side of that lookup. A source that casts to numbers and booleans skips the check for every target, so jsonb::bytea is not refused, although pg_cast has no entry from jsonb to bytea. A lookup in a pg_cast table replaces this.
+/// Fails when a CAST of a value of the custom type `source` to `target`, which
+/// `custom_type_cast_chain` resolves for a custom type and is None for a plain
+/// type written as `target_name`, would read the text of `source` as another
+/// kind: `date '2020-01-01'::int` is 2020 in SQLite. Only a target that reads
+/// text takes the text of such a source.
+pub(crate) fn check_cast_from_text_input_type(
+    source: &ExprType,
+    target: Option<&ResolvedType>,
+    target_name: &ast::Type,
+    resolver: &Resolver,
+) -> Result<()> {
+    let ExprType::Custom { type_def, .. } = source else {
+        return Ok(());
+    };
+    let Some(source_resolved) = resolver.schema().resolve_type_unchecked(&type_def.name)? else {
+        return Ok(());
+    };
+    let schema = resolver.schema();
+    if !schema.refuses_non_text_input(&source_resolved, &*resolver.catalog.dialect)?
+        || schema.casts_to_numbers_and_booleans(&source_resolved)
+    {
+        return Ok(());
+    }
+    let target_reads_text = match target {
+        Some(resolved) => matches!(
+            resolver.schema().plain_input_type(resolved)?,
+            StrictType::Stores(StorageClass::Text)
+        ),
+        None => {
+            target_name.array_dimensions == 0
+                && Affinity::of_written_type(&crate::util::dequote(&target_name.name))
+                    == Affinity::Text
+        }
+    };
+    if target_reads_text {
+        return Ok(());
+    }
+    Err(LimboError::ParseError(format!(
+        "cannot cast type {source} to type {}",
+        crate::util::dequote(&target_name.name)
+    )))
 }
 
 /// Emits what comparing the value in `reg` with stored values of `chain`'s

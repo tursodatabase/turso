@@ -206,9 +206,16 @@ impl EncryptionOpts {
 pub struct DatabaseAllocators<
     M: alloc::ConcurrentAllocator = alloc::DynAllocator,
     F: alloc::ConcurrentAllocator = alloc::DynAllocator,
+    S: alloc::ConcurrentAllocator = alloc::DynAllocator,
 > {
     pub mv_store: M,
     pub fts: F,
+    /// Allocator for the values that the code of nested trigger and foreign
+    /// key action programs keeps in the heap and not on the stack, because
+    /// this code recurses one time for each level of nesting. The other
+    /// memory of statements, for example their registers and cursors, does not
+    /// come from this allocator.
+    pub statement: S,
 }
 
 /// Options for opening a [`Database`].

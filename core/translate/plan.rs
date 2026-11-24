@@ -699,9 +699,7 @@ pub enum QueryDestination {
     /// Insert rows produced by a recursive CTE into its work queue.
     RecursiveCteQueue {
         cursor_id: CursorID,
-        index: Arc<Index>,
-        /// Result columns that determine which queued row is read next.
-        sort_keys: alloc::Vec<RecursiveCteQueueKey>,
+        queue: RecursiveCteQueue,
         /// Index of rows already produced by a recursive `UNION`.
         seen_rows: Option<(CursorID, Arc<Index>)>,
     },
@@ -728,6 +726,21 @@ pub enum QueryDestination {
     },
     /// Decision made at some point after query plan construction.
     Unset,
+}
+
+/// The B-tree that holds the work queue of a recursive CTE.
+#[derive(Debug, Clone)]
+pub enum RecursiveCteQueue {
+    /// Without ORDER BY, rows are read in the order they were added, so the
+    /// queue is an ephemeral rowid table, as in SQLite.
+    Fifo { table: Arc<BTreeTable> },
+    /// With ORDER BY, the queue is an ephemeral index keyed on the ORDER BY
+    /// terms, then a sequence number, then the result columns.
+    Ordered {
+        index: Arc<Index>,
+        /// Result columns that determine which queued row is read next.
+        sort_keys: alloc::Vec<RecursiveCteQueueKey>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]

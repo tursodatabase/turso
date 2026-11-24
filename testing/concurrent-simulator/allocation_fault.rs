@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use turso_core::alloc::{
     AllocError, AllocationSite, ApiAllocator, BTreeAllocationSite, FtsAllocationSite, Global,
     Layout, MvStoreAllocationSite, MvccCheckpointAllocationSite, SchemaAllocationSite,
-    SetAllocatorError, TursoAllocBackend, ValueBlobAllocationSite, VectorAllocationSite,
+    SetAllocatorError, StatementAllocationSite, TursoAllocBackend, ValueBlobAllocationSite,
+    VectorAllocationSite,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -250,6 +251,10 @@ fn allocation_site_id(site: AllocationSite) -> u64 {
             ValueBlobAllocationSite::RecordBuild => 30,
             ValueBlobAllocationSite::RecordCopy => 31,
             ValueBlobAllocationSite::AggAccumulate => 32,
+        },
+        AllocationSite::Statement(site) => match site {
+            StatementAllocationSite::TriggerProgramBuilder => 43,
+            StatementAllocationSite::SubprogramStatement => 44,
         },
         AllocationSite::Vector(site) => match site {
             VectorAllocationSite::Parse => 15,

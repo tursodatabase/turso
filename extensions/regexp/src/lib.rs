@@ -7,6 +7,9 @@ register_extension! {
 
 #[scalar(name = "regexp")]
 fn regexp(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return wrong_arity("regexp");
+    }
     regex(&args[0], &args[1])
 }
 
@@ -31,11 +34,17 @@ fn regex(pattern: &Value, haystack: &Value) -> Value {
 
 #[scalar(name = "regexp_like")]
 fn regexp_like(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return wrong_arity("regexp_like");
+    }
     regex(&args[1], &args[0])
 }
 
 #[scalar(name = "regexp_substr")]
 fn regexp_substr(&self, args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return wrong_arity("regexp_substr");
+    }
     match (args[0].value_type(), args[1].value_type()) {
         (ValueType::Text, ValueType::Text) => {
             let Some(haystack) = &args[0].to_text() else {
@@ -55,6 +64,12 @@ fn regexp_substr(&self, args: &[Value]) -> Value {
         }
         _ => Value::null(),
     }
+}
+
+/// Registered with `argc = -1`, so the engine does not check the argument
+/// count. Indexing `args` from the `extern "C"` shim aborts the process.
+fn wrong_arity(name: &str) -> Value {
+    Value::error_with_message(format!("wrong number of arguments to function {name}()"))
 }
 
 #[scalar(name = "regexp_replace")]
@@ -111,4 +126,79 @@ fn regexp_capture(args: &[Value]) -> Value {
     }
 
     Value::null()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Call the C shim `SELECT regexp(...)` uses.
+    fn call(
+        func: unsafe extern "C" fn(
+            usize,
+            i32,
+            *const Value,
+            Option<turso_ext::ContextDestructor>,
+            Option<turso_ext::ValueDestructor>,
+        ) -> Value,
+        args: &[Value],
+    ) -> Value {
+        unsafe { func(0, args.len() as i32, args.as_ptr(), None, None) }
+    }
+
+    fn text(s: &str) -> Value {
+        Value::from_text(s.to_string())
+    }
+
+    fn assert_wrong_arity(
+        name: &str,
+        func: unsafe extern "C" fn(
+            usize,
+            i32,
+            *const Value,
+            Option<turso_ext::ContextDestructor>,
+            Option<turso_ext::ValueDestructor>,
+        ) -> Value,
+    ) {
+        for argc in [0usize, 1, 3] {
+            let args: Vec<Value> = (0..argc).map(|_| text("a")).collect();
+            let result = call(func, &args);
+            let details = result
+                .to_error_details()
+                .unwrap_or_else(|| panic!("{name}/{argc} should error, got {result:?}"));
+            let expected = format!("wrong number of arguments to function {name}()");
+            assert_eq!(
+                details.1.as_deref(),
+                Some(expected.as_str()),
+                "unexpected error for {name}/{argc}"
+            );
+        }
+    }
+
+    #[test]
+    fn regexp_rejects_wrong_arity() {
+        assert_wrong_arity("regexp", regexp);
+    }
+
+    #[test]
+    fn regexp_like_rejects_wrong_arity() {
+        assert_wrong_arity("regexp_like", regexp_like);
+    }
+
+    #[test]
+    fn regexp_substr_rejects_wrong_arity() {
+        assert_wrong_arity("regexp_substr", regexp_substr);
+    }
+
+    #[test]
+    fn regexp_matches_with_two_arguments() {
+        assert_eq!(
+            call(regexp, &[text("^a.c$"), text("abc")]).to_integer(),
+            Some(1)
+        );
+        assert_eq!(
+            call(regexp, &[text("^a.c$"), text("abd")]).to_integer(),
+            Some(0)
+        );
+    }
 }

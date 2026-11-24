@@ -550,6 +550,7 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// FIXME(pg-catalog): This hand-codes prorettype of the pg_proc entries mod(smallint, smallint), mod(integer, integer) and mod(bigint, bigint), which return their argument type. A lookup in a pg_proc table replaces this.
     /// Whether `mod` of two integers returns an integer.
     ///
     /// PostgreSQL returns an integer. SQLite always returns a REAL.
@@ -586,12 +587,29 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// FIXME(pg-catalog): This hand-codes the pg_cast entry from integer to boolean (function bool(integer)). pg_cast has no entry from smallint or bigint to boolean, but this cast applies to every integer value. A lookup in a pg_cast table replaces this.
     /// Whether a cast of an integer to the built-in `boolean` type gives
     /// true for every nonzero integer.
     ///
     /// PostgreSQL's integer-to-boolean cast does. Otherwise the cast uses the
     /// type's ENCODE, which accepts only 0 and 1.
     fn casts_nonzero_integer_to_true(&self) -> bool {
+        false
+    }
+
+    /// FIXME(pg-catalog): This hand-codes the absence of pg_cast entries from date, timestamp, json and inet to numbers, booleans and bytea. A lookup in a pg_cast table replaces this.
+    /// Whether a CAST from a custom type that reads text and has an ENCODE
+    /// (such as date, timestamp, json or inet) is refused when its target does
+    /// not read text.
+    ///
+    /// PostgreSQL has no cast from these types to numbers, booleans or bytea:
+    /// `date '2020-01-01'::int` fails. SQLite reads the text as a number, so
+    /// it gives 2020, which is a wrong answer. A number stored into or cast
+    /// to one of these types is read as its text, so `20200101::date` gives
+    /// 2020-01-01 where PostgreSQL refuses it: tursopg binds a parameter sent
+    /// without a type as a number when its text is one, and refusing numbers
+    /// would refuse such parameters too.
+    fn text_input_types_refuse_other_kinds(&self) -> bool {
         false
     }
 

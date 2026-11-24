@@ -217,6 +217,10 @@ impl Type for Jsonb {
     fn reads_as(&self) -> Option<StorageClass> {
         Some(StorageClass::Text)
     }
+
+    fn casts_to_numbers_and_booleans(&self) -> bool {
+        true
+    }
 }
 
 /// The JSON text of `value`, as the SQL function `json()` gives it.

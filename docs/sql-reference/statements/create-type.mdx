@@ -331,7 +331,7 @@ Turso provides the following built-in custom types in STRICT tables:
 | `smallint` | integer | -- | Integer constrained to -32768 through 32767. Aliases: `int2`. |
 | `bigint` | integer | -- | Integer (no range constraint). Aliases: `int8`. |
 | `varchar(N)` | text | `maxlen` | Text with a maximum length of N characters. |
-| `date` | text | -- | Date, stored as `YYYY-MM-DD`. `date + n`, `n + date` and `date - n` add or subtract whole days and give a date; `date - date` gives the number of days between them. In `date - x`, a value `x` of unknown type, such as a parameter, is taken as a number of days, and anything other than an integer fails when the statement runs. `x - date` fails with `operator does not exist`; cast `x` to `date` first. |
+| `date` | text | -- | Date, stored as `YYYY-MM-DD`. `date + n`, `n + date` and `date - n` add or subtract whole days and give a date; `date - date` gives the number of days between them. In `date - x`, a value `x` of unknown type, such as a parameter, is taken as a number of days, and anything other than an integer fails when the statement runs. `x - date` fails with `operator does not exist`; cast `x` to `date` first. A result before 0001-01-01 or after 9999-12-31 fails with `date out of range`. |
 | `time` | text | -- | Time of day, stored as `HH:MM:SS[.ffffff]`. An offset in the input is dropped. |
 | `timestamp` | text | -- | Date and time, stored as `YYYY-MM-DD HH:MM:SS[.ffffff]`. An offset in the input is dropped. |
 | `timestamptz` | text | -- | Date and time converted to UTC, stored as `YYYY-MM-DD HH:MM:SS[.ffffff]` with no offset. |

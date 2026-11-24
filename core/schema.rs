@@ -456,6 +456,14 @@ pub struct TypeDef {
     /// built-in date and time types, which store one text form with a 4-digit
     /// year. False for a domain, whose index then serves only `=`.
     pub stored_form_sorts_in_value_order: bool,
+    /// FIXME(pg-catalog): This field hand-codes that pg_cast has entries from jsonb to boolean, smallint, integer, bigint, real, double precision and numeric, and none from the other types that read text. A lookup in a pg_cast table replaces this.
+    /// Whether values of the type may be cast to number and boolean types, as
+    /// PostgreSQL casts jsonb to the integer types, real, double precision,
+    /// numeric and boolean. A CAST
+    /// from a type that reads text is refused otherwise (see
+    /// `Schema::refuses_non_text_input`). False for a domain, user type and
+    /// STRUCT or UNION; a domain takes the answer of the types under it.
+    pub casts_to_numbers_and_booleans: bool,
     /// Original SQL for round-trip persistence. Stored verbatim from creation.
     pub sql: String,
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
@@ -771,6 +779,7 @@ impl TypeDef {
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
                     stored_form_sorts_in_value_order: false,
+                    casts_to_numbers_and_booleans: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Struct(StructDef {
@@ -806,6 +815,7 @@ impl TypeDef {
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
                     stored_form_sorts_in_value_order: false,
+                    casts_to_numbers_and_booleans: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
@@ -835,6 +845,7 @@ impl TypeDef {
             range_offsets: Some(ty.range_offsets()),
             accepts_collate: Some(ty.accepts_collate()),
             stored_form_sorts_in_value_order: ty.stored_form_sorts_in_value_order(),
+            casts_to_numbers_and_booleans: ty.casts_to_numbers_and_booleans(),
             sql,
             domain_checks: std::vec::Vec::new(),
             kind: TypeDefKind::Custom {
@@ -870,6 +881,7 @@ impl TypeDef {
             range_offsets: None,
             accepts_collate: None,
             stored_form_sorts_in_value_order: false,
+            casts_to_numbers_and_booleans: false,
             sql,
             domain_checks: constraints.to_vec(),
             kind: TypeDefKind::Custom {
@@ -2229,6 +2241,41 @@ impl Schema {
     /// can't be declared with, such as `(value float)`.
     pub fn plain_input_type(&self, resolved: &ResolvedType) -> Result<StrictType> {
         self.plain_value_type(&resolved.leaf().name, resolved.input_type())
+    }
+
+    /// FIXME(pg-catalog): This proxies a missing pg_cast entry by checking for an ENCODE and a text input. A lookup in a pg_cast table replaces this.
+    /// Whether `resolved` is a type that reads text and has an ENCODE, such as
+    /// date or json, in a dialect that refuses a CAST from such a type to a
+    /// type that does not read text (see
+    /// `Dialect::text_input_types_refuse_other_kinds`). A number stored into
+    /// or cast to such a type is not refused; it is read as its text. The
+    /// check looks at what the type declares, not at its name.
+    pub fn refuses_non_text_input(
+        &self,
+        resolved: &ResolvedType,
+        dialect: &dyn crate::dialect::Dialect,
+    ) -> Result<bool> {
+        if !dialect.text_input_types_refuse_other_kinds() {
+            return Ok(false);
+        }
+        let has_encode = resolved
+            .chain
+            .iter()
+            .any(|type_def| type_def.encode().is_some());
+        Ok(has_encode
+            && matches!(
+                self.plain_input_type(resolved)?,
+                StrictType::Stores(crate::types::StorageClass::Text)
+            ))
+    }
+
+    /// Whether a CAST from `resolved` to a number or boolean type is allowed
+    /// although the type reads text (see `TypeDef::casts_to_numbers_and_booleans`).
+    pub fn casts_to_numbers_and_booleans(&self, resolved: &ResolvedType) -> bool {
+        resolved
+            .chain
+            .iter()
+            .any(|type_def| type_def.casts_to_numbers_and_booleans)
     }
 
     /// The plain SQL type that `value_type`, the value type of type

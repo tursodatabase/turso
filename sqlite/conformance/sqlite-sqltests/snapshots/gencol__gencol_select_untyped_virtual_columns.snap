@@ -22,10 +22,10 @@ addr  opcode         p1  p2  p3  p4            p5  comment
    5    Add           3   4   1                 0  r[1]=r[3]+r[4]
    6    IfNullRow     0  12   2                 0  if 0.nullRow then r[2]=NULL, goto 12
    7    IfNullRow     0  10   5                 0  if 0.nullRow then r[5]=NULL, goto 10
-   8    ColumnRange   0   0   7  2              0  r[7..8]=t.a..b
-   9    Add           7   8   5                 0  r[5]=r[7]+r[8]
-  10    Integer       2   6   0                 0  r[6]=2
-  11    Multiply      5   6   2                 0  r[2]=r[5]*r[6]
+   8    ColumnRange   0   0   6  2              0  r[6..7]=t.a..b
+   9    Add           6   7   5                 0  r[5]=r[6]+r[7]
+  10    Integer       2   8   0                 0  r[8]=2
+  11    Multiply      5   8   2                 0  r[2]=r[5]*r[8]
   12    ResultRow     1   2   0                 0  output=r[1..2]
   13  Next            0   3   0                 1
   14  Halt            0   0   0                 0

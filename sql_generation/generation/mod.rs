@@ -8,6 +8,7 @@ pub mod generated_expr;
 pub mod opts;
 pub mod predicate;
 pub mod query;
+pub mod swarm;
 pub mod table;
 pub mod value;
 

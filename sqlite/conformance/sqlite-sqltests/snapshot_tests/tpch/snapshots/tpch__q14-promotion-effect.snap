@@ -28,7 +28,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode       p1  p2  p3  p4                                     p5  comment
-   0  Init          0  38   0                                          0  Start at 38
+   0  Init          0  36   0                                          0  Start at 36
    1  Null          0   2   3                                          0  r[2..3]=NULL
    2  OpenRead      0  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
    3  OpenRead      1   4   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=part, root=4, iDb=0
@@ -60,15 +60,13 @@ addr  opcode       p1  p2  p3  p4                                     p5  commen
   29  Next          0   5   0                                          1
   30  AggFinal      0   2   0  sum                                     0  accum=r[2]
   31  AggFinal      0   3   0  sum                                     0  accum=r[3]
-  32  Copy          2  27   0                                          0  r[27]=r[2]
-  33  Multiply     26  27  24                                          0  r[24]=r[26]*r[27]
-  34  Copy          3  25   0                                          0  r[25]=r[3]
-  35  Divide       24  25   1                                          0  r[1]=r[24]/r[25]
-  36  ResultRow     1   1   0                                          0  output=r[1]
-  37  Halt          0   0   0                                          0
-  38  Transaction   0   1   8                                          0  iDb=0 tx_mode=Read
-  39  String8       0   6   0  1994-03-01                              0  r[6]='1994-03-01'
-  40  String8       0   9   0  1994-04-01                              0  r[9]='1994-04-01'
-  41  Integer       1  22   0                                          0  r[22]=1
-  42  Real          0  26   0  100.0                                   0  r[26]=100
-  43  Goto          0   1   0                                          0
+  32  Multiply     25   2  24                                          0  r[24]=r[25]*r[2]
+  33  Divide       24   3   1                                          0  r[1]=r[24]/r[3]
+  34  ResultRow     1   1   0                                          0  output=r[1]
+  35  Halt          0   0   0                                          0
+  36  Transaction   0   1   8                                          0  iDb=0 tx_mode=Read
+  37  String8       0   6   0  1994-03-01                              0  r[6]='1994-03-01'
+  38  String8       0   9   0  1994-04-01                              0  r[9]='1994-04-01'
+  39  Integer       1  22   0                                          0  r[22]=1
+  40  Real          0  25   0  100.0                                   0  r[25]=100
+  41  Goto          0   1   0                                          0
