@@ -362,6 +362,10 @@ What this means is that the behavior of a test run is deterministic based on the
 If the simulator catches a bug, you can always reproduce the exact same sequence of events by passing the same seed.
 The simulator also performs fault injection to discover interesting bugs.
 
+To give each run a different mix of statements, properties, faults, and connections, add `--swarm`.
+The seed also picks these settings, so `--seed 1234` repeats a swarm run.
+See [the simulator README](testing/simulator/README.md#swarm-testing).
+
 ### Whopper
 
 Whopper is a DST that, unlike `simulator`, performs concurrent query execution.
