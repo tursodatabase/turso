@@ -1922,7 +1922,7 @@ fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {
     }
 }
 
-/// FIXME(pg-catalog): This table of oids and names was copied by hand from pg_type. It prints unknown for an oid it does not list, where PostgreSQL prints the name of that pg_type row, and character for bpchar with typemod -1, where PostgreSQL prints bpchar. A lookup in a pg_type table replaces this.
+/// FIXME(pg-catalog): The arms of this match hand-code the names that PostgreSQL's format_type gives to some types, and their type modifiers. The other built-in types get their name from the built-in rows of pg_type in turso_pg_catalog, without a type modifier. This prints unknown for a type that the user created, such as an enum or a domain, where PostgreSQL prints its name. It prints character for bpchar with typemod -1, where PostgreSQL prints bpchar, because a NULL typemod and -1 both arrive here as -1. A lookup in a pg_type table that has every type, with the typmodout function of each type, replaces this.
 /// The name of a type as `format_type` prints it.
 fn format_type(type_oid: i64, typemod: i64) -> String {
     match type_oid {
@@ -1975,8 +1975,32 @@ fn format_type(type_oid: i64, typemod: i64) -> String {
         2278 => "void".to_string(),
         2950 => "uuid".to_string(),
         3802 => "jsonb".to_string(),
-        _ => "unknown".to_string(),
+        0 => "-".to_string(),
+        1266 => "time with time zone".to_string(),
+        1560 => "bit".to_string(),
+        1562 => "bit varying".to_string(),
+        _ => format_builtin_type(type_oid, typemod).unwrap_or_else(|| "unknown".to_string()),
     }
+}
+
+/// The name of the built-in type with oid `type_oid`, as format_type prints
+/// it, or None when no built-in type has the oid. An array type is the name
+/// of its element type, with `typemod`, and `[]`. Another type is its name,
+/// quoted when it must be.
+fn format_builtin_type(type_oid: i64, typemod: i64) -> Option<String> {
+    /// The oid of `array_subscript_handler`, the subscript function of the
+    /// array types.
+    const ARRAY_SUBSCRIPT_HANDLER: u32 = 6179;
+    let row = turso_pg_catalog::PgType::by_oid(u32::try_from(type_oid).ok()?)?;
+    // PostgreSQL does not print oidvector and int2vector as arrays, because
+    // their storage is plain.
+    if row.typelem != 0 && row.typsubscript == ARRAY_SUBSCRIPT_HANDLER && row.typstorage != 'p' {
+        return Some(format!(
+            "{}[]",
+            format_type(i64::from(row.typelem), typemod)
+        ));
+    }
+    Some(turso_pg_parser::quote_identifier(row.typname))
 }
 
 /// Simplified to_char: formats a number with the given format pattern.

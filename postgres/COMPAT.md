@@ -106,8 +106,7 @@ join with `pg_proc`, `pg_type` or `pg_am` finds only the rows that these
 catalogs have, which are not the built-in rows of PostgreSQL, and a `pg_proc`
 row can have the oid of another built-in function of PostgreSQL. Thus psql's
 `\dC`, `\do`, `\dAc`, `\dAf`, `\dAo` and `\dAp` show the rows of these
-catalogs with wrong or empty function names, and with `unknown` for each type
-that `format_type` does not know. No statement
+catalogs with wrong or empty function names. No statement
 changes the rows: a role that is not a superuser gets `42501`, and a superuser,
 whom PostgreSQL lets change them, gets `0A000`. `pg_operator_is_visible`,
 `pg_opclass_is_visible` and `pg_opfamily_is_visible`, which psql's `\do`,
@@ -134,7 +133,10 @@ exposes it for policy discovery. `pg_publication`, `pg_publication_rel`, and
 `pg_publication_namespace` expose hidden `tableoid` for publication discovery.
 `pg_get_triggerdef(oid)` and `pg_get_triggerdef(oid, pretty)` return NULL:
 PostgreSQL triggers are not supported and `pg_trigger` is empty.
-Catalog introspection functions: `format_type`,
+Catalog introspection functions: `format_type` (it names each built-in type
+of PostgreSQL 18; it prints `unknown` for a type that the user created, does
+not print the type modifier of `time`, `timestamp` and `interval`, and prints
+`character` for `bpchar` with type modifier -1),
 `pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_expr` (`pg_get_expr` and
 `pg_get_constraintdef` print `CHECK` constraints, and `pg_get_expr` prints
 column defaults in `pg_attrdef.adbin`, as PostgreSQL does for the forms the

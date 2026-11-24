@@ -1140,6 +1140,41 @@ expect {
     character varying(50)
 }
 
+# A built-in type that format_type does not name by hand gets the name of
+# its pg_type row, an array type the name of its element type and [].
+test format-type-names-every-builtin-type {
+    SELECT format_type(0, NULL);
+    SELECT format_type(18, NULL);
+    SELECT format_type(1002, NULL);
+    SELECT format_type(22, NULL);
+    SELECT format_type(30, NULL);
+    SELECT format_type(24, NULL);
+    SELECT format_type(3904, NULL);
+    SELECT format_type(3905, NULL);
+    SELECT format_type(1015, 14);
+    SELECT format_type(1266, NULL);
+    SELECT format_type(1560, NULL);
+    SELECT format_type(1562, NULL);
+    SELECT format_type(2283, NULL);
+    SELECT format_type(600, NULL);
+}
+expect {
+    -
+    "char"
+    "char"[]
+    int2vector
+    oidvector
+    regproc
+    int4range
+    int4range[]
+    character varying(10)[]
+    time with time zone
+    bit
+    bit varying
+    anyelement
+    point
+}
+
 test pg-type-is-visible {
     SELECT CASE WHEN pg_type_is_visible(23) THEN 1 ELSE 0 END;
 }
