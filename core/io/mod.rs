@@ -2145,4 +2145,81 @@ mod shuttle_tests {
         concurrent_overlapping_writes,
         test_concurrent_overlapping_writes_impl
     );
+
+    /// Runs threads that wait as the async bindings do. Each thread queues a
+    /// write, calls `step()` one time, and then sleeps until the waker of the
+    /// write is called. If a `step()` returns while such a write stays in the
+    /// backend, the thread of that write sleeps for ever, and shuttle reports
+    /// a deadlock.
+    fn test_step_once_then_sleep_impl<F: IOFactory>(factory: F) {
+        let io = factory.create();
+        let path = factory.temp_dir().join("test.db");
+        let file = io
+            .open_file(path.to_str().unwrap(), OpenFlags::Create, false)
+            .unwrap();
+
+        let mut handles = vec![];
+        const NUM_THREADS: usize = 3;
+        const WRITES_PER_THREAD: usize = 2;
+
+        for i in 0..NUM_THREADS {
+            let file = file.clone();
+            let io = io.clone();
+            handles.push(thread::spawn(move || {
+                for j in 0..WRITES_PER_THREAD {
+                    let buf = Arc::new(Buffer::new(vec![i as u8; 100]));
+                    let pos = ((i * WRITES_PER_THREAD + j) * 100) as u64;
+                    let c = file
+                        .pwrite(pos, buf, Completion::new_write(|_| {}))
+                        .unwrap();
+                    step_once_then_sleep(io.as_ref(), &c);
+                    assert!(c.succeeded(), "write failed: {:?}", c.get_error());
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    shuttle_io_test!(step_once_then_sleep, test_step_once_then_sleep_impl);
+
+    /// Calls `step()` one time, then sleeps until the waker of `c` is called.
+    /// The async bindings wait in the same way: after one `step()` they return
+    /// `Poll::Pending`, and only the waker makes them poll again.
+    fn step_once_then_sleep(io: &dyn IO, c: &Completion) {
+        io.step().unwrap();
+        // Under shuttle, `Context::set_waker` yields. A yield between the
+        // write and `step()` makes the schedules that lose a wakeup rare, so
+        // this function sets the waker after `step()`.
+        let parker = std::sync::Arc::new(Parker {
+            woken: shuttle::sync::Mutex::new(false),
+            cv: shuttle::sync::Condvar::new(),
+        });
+        c.set_waker(&std::task::Waker::from(parker.clone()));
+        let mut woken = parker.woken.lock().unwrap();
+        while !*woken {
+            woken = parker.cv.wait(woken).unwrap();
+        }
+    }
+
+    /// A waker that a shuttle thread sleeps on. Shuttle sees the thread as
+    /// blocked while it sleeps, so a waker that nobody calls gives a deadlock
+    /// report. `shuttle::future::block_on` gives no such report: the yield in
+    /// `Context::set_waker` wakes its task, so it polls until the step limit.
+    struct Parker {
+        woken: shuttle::sync::Mutex<bool>,
+        cv: shuttle::sync::Condvar,
+    }
+
+    impl std::task::Wake for Parker {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            *self.woken.lock().unwrap() = true;
+            self.cv.notify_all();
+        }
+    }
 }
