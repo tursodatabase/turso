@@ -287,7 +287,7 @@ pub struct ValueKinds {
 /// or SQLite's operator when `func` is `None`.
 #[derive(Debug, Clone)]
 pub struct OperatorSignature {
-    /// One of [BINARY_OPERATORS] or [PREFIX_OPERATORS].
+    /// One of [BINARY_OPERATORS], [PREFIX_OPERATORS] or [CONCAT_OPERATOR].
     pub op: &'static str,
     /// One operand for a prefix operator, two for a binary one.
     pub args: std::vec::Vec<OperatorArg>,
@@ -316,12 +316,22 @@ pub enum OperatorArg {
     /// the `0.5` of `(SELECT 0.5)`, is not one: as in PostgreSQL, it is an
     /// exact number.
     Real,
+    /// A string literal or a parameter, which takes this type as an operand of
+    /// unknown type does in PostgreSQL. It is read as a value of this type
+    /// before the call: stored as a column of the type stores it, and read
+    /// back.
+    Untyped,
 }
 
 /// The operators whose function an operand's custom type decides. Comparisons
 /// are decided separately, and unary `+` gives its operand unchanged.
 pub const BINARY_OPERATORS: [&str; 9] = ["+", "-", "*", "/", "%", "&", "|", "<<", ">>"];
 pub const PREFIX_OPERATORS: [&str; 2] = ["-", "~"];
+
+/// `||`, which an operand's custom type decides only when the type has a
+/// signature for it. With an operand of another type, `||` stays SQLite's
+/// `||`, which joins text, or the `||` of arrays.
+pub const CONCAT_OPERATOR: &str = "||";
 
 /// SQLite's binary operator `op` on a value of the type and an operand `other`.
 pub(crate) fn sqlite_operator(op: &'static str, other: OperatorArg) -> [OperatorSignature; 2] {

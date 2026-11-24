@@ -474,7 +474,7 @@ fn untyped_operands_read_as(
 /// foreign key's parent key, carries the column's type or collation and holds
 /// the column's value. Parentheses don't change this: `('10:00')` is a string
 /// literal too.
-fn is_untyped_operand(expr: &ast::Expr) -> Result<bool> {
+pub(super) fn is_untyped_operand(expr: &ast::Expr) -> Result<bool> {
     Ok(match unwrap_parens(expr)? {
         ast::Expr::Literal(ast::Literal::String(_)) => true,
         ast::Expr::Variable(variable) => {

@@ -7,7 +7,9 @@
 
 use super::*;
 use crate::function::Deterministic;
-use crate::schema::{OperatorArg, OperatorSignature, BINARY_OPERATORS, PREFIX_OPERATORS};
+use crate::schema::{
+    OperatorArg, OperatorSignature, BINARY_OPERATORS, CONCAT_OPERATOR, PREFIX_OPERATORS,
+};
 use crate::translate::expr::expr_type::{
     same_type_def, sqlite_operand_type, type_of, without_wrappers, BuiltinType, ColumnCustomType,
     ExprType, TypeEnv,
@@ -55,7 +57,8 @@ fn operand_types(expr: &ast::Expr, env: &TypeEnv) -> Option<Vec<ExprType>> {
 /// The function that runs the operator expression `expr` when an operand is a
 /// custom-type value. `None` means SQLite's operator runs: `expr` is not an
 /// operator a custom type decides, no operand has a custom type, an operand is
-/// NULL, or the signature says so (`smallint`, `bigint`). When no signature
+/// NULL, or the signature says so (`smallint`, `bigint`). For `||`, only an
+/// operand whose type has a signature for `||` counts. When no signature
 /// fits, as in `date + date`, `date * 2` or `-date`, it is an error: running
 /// SQLite's operator on the value would give an answer nobody asked for.
 ///
@@ -82,6 +85,16 @@ pub(super) fn find_operator_call(
     let custom_types: Vec<&ColumnCustomType> = operands
         .iter()
         .filter_map(|operand| operand.value_type.as_ref())
+        // A type without a signature for `||` keeps SQLite's `||`, which joins
+        // text, and the `||` of arrays.
+        .filter(|ty| {
+            op != CONCAT_OPERATOR
+                || ty
+                    .type_def
+                    .operator_signatures(op, operands.len())
+                    .next()
+                    .is_some()
+        })
         .collect();
     if custom_types.is_empty() {
         return Ok(None);
@@ -111,9 +124,9 @@ pub(super) fn find_operator_call(
 }
 
 /// The symbol and operands of `expr` when it is an operator that custom types
-/// decide: `-x` is `-` with one operand, `a & b` is `&` with two. Comparisons
-/// use the order of the operands' type (see `comparison_collation`), and unary
-/// `+` gives its operand unchanged.
+/// decide: `-x` is `-` with one operand, `a & b` is `&` with two, and `a || b`
+/// is `||` with two. Comparisons use the order of the operands' type (see
+/// `comparison_collation`), and unary `+` gives its operand unchanged.
 ///
 /// Without custom types no operand can have one, so plain SQLite does no more
 /// work per operator than before custom types existed.
@@ -137,7 +150,10 @@ fn decided_operator<'a>(
         ),
         _ => return None,
     };
-    assert!(known.contains(&op), "custom types do not decide {op}");
+    assert!(
+        known.contains(&op) || (op == CONCAT_OPERATOR && operands.len() == 2),
+        "custom types do not decide {op}"
+    );
     Some((op, operands))
 }
 
@@ -153,6 +169,7 @@ fn binary_symbol(op: &ast::Operator) -> Option<&'static str> {
         Operator::BitwiseOr => "|",
         Operator::LeftShift => "<<",
         Operator::RightShift => ">>",
+        Operator::Concat => CONCAT_OPERATOR,
         _ => return None,
     })
 }
@@ -181,12 +198,16 @@ struct Operand<'a> {
     is_real: bool,
     /// Whether the operand is a blob, which is not a number.
     is_blob: bool,
+    /// Whether the operand is a string literal or a parameter, whose type
+    /// comes from the other operand.
+    is_untyped: bool,
     /// The operand's type, as `type_of` gives it.
     expr_type: &'a ExprType,
 }
 
 impl<'a> Operand<'a> {
     fn new(expr: &'a ast::Expr, expr_type: &'a ExprType, env: &TypeEnv) -> Result<Self> {
+        let is_untyped = super::custom_types::is_untyped_operand(expr)?;
         let expr = without_wrappers(expr);
         // A domain has the operators of the type it is based on. A domain over a
         // plain SQLite type, such as `CREATE DOMAIN pos AS integer`, has SQLite's
@@ -216,6 +237,7 @@ impl<'a> Operand<'a> {
             may_be_integer,
             is_real,
             is_blob,
+            is_untyped,
             expr_type,
         })
     }
@@ -266,6 +288,7 @@ fn accepts_operand(
             is_plain_value(signature, operand) && !operand.is_real && !operand.is_blob
         }
         OperatorArg::Real => is_plain_value(signature, operand) && operand.is_real,
+        OperatorArg::Untyped => operand.value_type.is_none() && operand.is_untyped,
     }
 }
 
@@ -301,14 +324,15 @@ fn call_for(
             signature.op, ty.type_def.name
         )));
     };
-    let encode = signature
+    let conversions = signature
         .args
         .iter()
         .map(|arg| match arg {
             OperatorArg::EncodableLiteral if ty.type_def.encode().is_some() => {
-                Some(Arc::clone(&ty.type_def))
+                OperandConversion::Encode(Arc::clone(&ty.type_def))
             }
-            _ => None,
+            OperatorArg::Untyped => OperandConversion::ReadAs(Arc::clone(&ty.type_def)),
+            _ => OperandConversion::AsIs,
         })
         .collect();
     // Checks such as "is this expression constant" treat `a + b` as SQLite's
@@ -333,17 +357,27 @@ fn call_for(
     };
     Ok(Some(OperatorCall {
         func: function,
-        encode,
+        conversions,
         result,
     }))
 }
 
 pub(crate) struct OperatorCall {
     func: Func,
-    /// For each operand, the type to encode it to before the call.
-    encode: Vec<Option<Arc<TypeDef>>>,
+    /// For each operand, what happens to it before the call.
+    conversions: Vec<OperandConversion>,
     /// The type the function returns.
     pub(super) result: ast::Type,
+}
+
+/// What happens to an operand before the call of the function of an operator.
+enum OperandConversion {
+    /// The function gets the operand as it is.
+    AsIs,
+    /// The operand is encoded to the type (see `OperatorArg::EncodableLiteral`).
+    Encode(Arc<TypeDef>),
+    /// The operand is read as a value of the type (see `OperatorArg::Untyped`).
+    ReadAs(Arc<TypeDef>),
 }
 
 /// Emits `call` on the operands of `expr` and returns the register holding its
@@ -362,22 +396,36 @@ pub(super) fn emit_operator_call(
     };
     assert_eq!(
         operands.len(),
-        call.encode.len(),
+        call.conversions.len(),
         "one argument per operand"
     );
-    // An operand is translated into its own register and encoded into the
-    // argument register: a literal may be translated into a register that is
-    // set once and read on every row, so it must not be encoded in place.
     let start_reg = program.alloc_registers(operands.len());
-    for (i, (operand, encode)) in operands.into_iter().zip(&call.encode).enumerate() {
-        match encode {
-            Some(to) => {
+    for (i, (operand, conversion)) in operands.into_iter().zip(&call.conversions).enumerate() {
+        let arg_reg = start_reg + i;
+        match conversion {
+            OperandConversion::AsIs => {
+                translate_expr(program, referenced_tables, operand, arg_reg, resolver)?;
+            }
+            // The operand is translated into its own register and encoded into
+            // the argument register: a literal may be translated into a
+            // register that is set once and read on every row, so it must not
+            // be encoded in place.
+            OperandConversion::Encode(to) => {
                 let value_reg = program.alloc_register();
                 translate_expr(program, referenced_tables, operand, value_reg, resolver)?;
-                emit_encode(program, to, value_reg, start_reg + i, resolver)?;
+                emit_encode(program, to, value_reg, arg_reg, resolver)?;
             }
-            None => {
-                translate_expr(program, referenced_tables, operand, start_reg + i, resolver)?;
+            // The conversion of a string literal or a parameter is computed
+            // once, with the operand.
+            OperandConversion::ReadAs(to) => {
+                super::custom_types::translate_untyped_operand_as(
+                    program,
+                    referenced_tables,
+                    operand,
+                    &resolved_type(to, resolver)?,
+                    arg_reg,
+                    resolver,
+                )?;
             }
         }
     }
@@ -397,20 +445,31 @@ pub(crate) fn emit_operator_call_on_registers(
 ) -> Result<()> {
     assert_eq!(
         operand_regs.len(),
-        call.encode.len(),
+        call.conversions.len(),
         "one argument per operand"
     );
     let start_reg = program.alloc_registers(operand_regs.len());
-    for (i, (&operand_reg, encode)) in operand_regs.iter().zip(&call.encode).enumerate() {
-        match encode {
-            Some(to) => {
-                emit_encode(program, to, operand_reg, start_reg + i, resolver)?;
-            }
-            None => program.emit_insn(Insn::Copy {
+    for (i, (&operand_reg, conversion)) in operand_regs.iter().zip(&call.conversions).enumerate() {
+        let arg_reg = start_reg + i;
+        match conversion {
+            OperandConversion::AsIs => program.emit_insn(Insn::Copy {
                 src_reg: operand_reg,
-                dst_reg: start_reg + i,
+                dst_reg: arg_reg,
                 extra_amount: 0,
             }),
+            OperandConversion::Encode(to) => {
+                emit_encode(program, to, operand_reg, arg_reg, resolver)?;
+            }
+            OperandConversion::ReadAs(to) => {
+                let resolved = resolved_type(to, resolver)?;
+                program.emit_insn(Insn::Copy {
+                    src_reg: operand_reg,
+                    dst_reg: arg_reg,
+                    extra_amount: 0,
+                });
+                emit_untyped_operand_store(program, &resolved, arg_reg, resolver)?;
+                emit_decode(program, &resolved, arg_reg, resolver)?;
+            }
         }
     }
     emit_function(program, call, start_reg, dest);
@@ -424,7 +483,7 @@ fn emit_function(program: &mut ProgramBuilder, call: &OperatorCall, start_reg: u
         dest,
         func: FuncCtx {
             func: call.func.clone(),
-            arg_count: call.encode.len(),
+            arg_count: call.conversions.len(),
             collation: CollationSeq::BINARY,
         },
     });
@@ -446,10 +505,7 @@ fn emit_encode(
             to.name
         )));
     }
-    let resolved = resolver
-        .schema()
-        .resolve_type_unchecked(&to.name)?
-        .ok_or_else(|| LimboError::InternalError(format!("type {} does not resolve", to.name)))?;
+    let resolved = resolved_type(to, resolver)?;
     program.emit_insn(Insn::Copy {
         src_reg: value_reg,
         dst_reg: dest_reg,
@@ -462,4 +518,12 @@ fn emit_encode(
         dest_reg,
         resolver,
     )
+}
+
+/// The types that a value of the type `ty` is stored through.
+fn resolved_type(ty: &TypeDef, resolver: &Resolver) -> Result<crate::schema::ResolvedType> {
+    resolver
+        .schema()
+        .resolve_type_unchecked(&ty.name)?
+        .ok_or_else(|| LimboError::InternalError(format!("type {} does not resolve", ty.name)))
 }
