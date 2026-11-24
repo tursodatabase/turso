@@ -246,25 +246,19 @@ expect error {}
 
 # D-22: invalid int into int column
 @setup t_n
-@compat-gap "type:int4"
 test invalid-int-into-int-column {
     INSERT INTO t VALUES ('abc');
 }
 @sqlstate 22P02
 expect error {}
-@sqlstate 23000
-expect @tursopg error {}
 
 # D-23: invalid uuid into uuid column
-@compat-gap "type:uuid"
 test invalid-uuid-into-uuid-column {
     CREATE TABLE t (u uuid);
     INSERT INTO t VALUES ('nope');
 }
 @sqlstate 22P02
 expect error {}
-@sqlstate P0001
-expect @tursopg error {}
 
 # D-24: invalid timestamptz into column
 test invalid-timestamptz-into-column {

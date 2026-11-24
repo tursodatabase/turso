@@ -1,6 +1,7 @@
 mod acl;
 mod auth_functions;
 mod auth_members;
+mod casts;
 mod catalog;
 mod classes;
 mod copy;
@@ -9,6 +10,7 @@ mod descriptions;
 mod error;
 mod functions;
 mod open;
+mod operators;
 mod options;
 mod pg_type;
 mod policies;

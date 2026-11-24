@@ -303,14 +303,24 @@ pub enum OperatorArg {
     EncodableLiteral,
     /// Any value of this type.
     Value,
-    /// A value SQLite can compute with: anything without a custom type, or a
-    /// value of a type whose only way to run the operator is SQLite's.
+    /// A value SQLite can compute with: anything without a custom type, a
+    /// value of a type whose only way to run the operator is SQLite's, or a
+    /// value of a type that stores plain integers.
     PlainValue,
     /// A `PlainValue` that is an integer, or whose type is not known before the
     /// statement runs, such as a parameter. The function rejects anything else.
     Integer,
     /// A `PlainValue` that is neither a `Real` nor a blob.
     Exact,
+    /// Any value without a custom type. Unlike `PlainValue`, a value of a type
+    /// that stores plain integers is not one.
+    Untyped,
+    /// An `Untyped` value that is an integer, or whose type is not known before
+    /// the statement runs.
+    UntypedInteger,
+    /// A value of the named type, which is not the type that declares the
+    /// signature.
+    Type(&'static str),
     /// A REAL value: a REAL column, a CAST to REAL, arithmetic on two plain
     /// values. A decimal written in the statement, such as `0.5`, `-0.5` or
     /// the `0.5` of `(SELECT 0.5)`, is not one: as in PostgreSQL, it is an
@@ -443,6 +453,8 @@ impl ResolvedType {
 #[derive(Debug, Clone)]
 pub struct TypeDef {
     pub name: String,
+    /// The name of the type in error messages.
+    pub display_name: String,
     pub is_builtin: bool,
     pub not_null: bool,
     /// Whether this is a domain (CREATE DOMAIN) vs a custom type (CREATE TYPE).
@@ -554,6 +566,14 @@ impl TypeDef {
     /// True when stored values are read back unchanged (no DECODE, or `DECODE value`).
     pub fn decode_returns_value_unchanged(&self) -> bool {
         self.decode().is_none_or(Conversion::keeps_value)
+    }
+
+    /// Whether the type keeps its values as plain integers: its BASE is
+    /// integer and it has no ENCODE and no DECODE.
+    pub fn stores_plain_integers(&self) -> bool {
+        self.base().eq_ignore_ascii_case("integer")
+            && self.encode().is_none()
+            && self.decode().is_none()
     }
 
     /// Returns the base type name.
@@ -785,6 +805,7 @@ impl TypeDef {
                     .try_collect()?;
                 Self {
                     name: type_name.to_string(),
+                    display_name: type_name.to_string(),
                     is_builtin: false,
                     not_null: false,
                     is_domain: false,
@@ -821,6 +842,7 @@ impl TypeDef {
                     .try_collect()?;
                 Self {
                     name: type_name.to_string(),
+                    display_name: type_name.to_string(),
                     is_builtin: false,
                     not_null: false,
                     is_domain: false,
@@ -851,6 +873,7 @@ impl TypeDef {
     ) -> Self {
         Self {
             name: ty.name().to_string(),
+            display_name: ty.display_name().to_string(),
             is_builtin,
             not_null: false,
             is_domain: false,
@@ -888,6 +911,7 @@ impl TypeDef {
     ) -> Self {
         Self {
             name: domain_name.to_string(),
+            display_name: domain_name.to_string(),
             is_builtin: false,
             not_null,
             is_domain: true,

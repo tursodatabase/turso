@@ -657,6 +657,92 @@ pub trait Dialect: Send + Sync + 'static {
     fn json_contains_function(&self) -> Option<&'static str> {
         None
     }
+
+    /// How the dialect resolves the operator `op` for operands of the given
+    /// types. `op` is an arithmetic, bit or comparison operator, or `||`. The
+    /// default has every operator, as SQLite does: it adds a comparison to a
+    /// number.
+    fn resolve_operator(
+        &self,
+        _op: &str,
+        _operands: &dyn Fn() -> std::vec::Vec<OperandType>,
+    ) -> OperatorResolution {
+        OperatorResolution::Keep
+    }
+
+    /// Fails when the string literal `text` is not a value of the type that
+    /// `CastUntyped` names. PostgreSQL reads the literal when it plans the
+    /// statement, so a bad one fails even where the statement never uses it.
+    fn check_literal_cast(&self, _text: &str, _type_name: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Plans a CAST of a value of type `source()` to the type `target`, as
+    /// written. None leaves the CAST to the engine, which converts the value
+    /// as SQLite's CAST or the target custom type does. `source` works out
+    /// the type of the operand, so a dialect that plans no casts never pays
+    /// for it.
+    fn plan_cast(
+        &self,
+        _source: &dyn Fn() -> OperandType,
+        _target: &ast::Type,
+        _context: CastContext,
+    ) -> Result<Option<CastPlan>> {
+        Ok(None)
+    }
+}
+
+/// Where a cast is written, from the narrowest to the widest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CastContext {
+    Implicit,
+    Assignment,
+    Explicit,
+}
+
+/// The dialect's choice of an operator for the operands of a call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorResolution {
+    /// The engine's operator runs on the operands as they are.
+    Keep,
+    /// The dialect has no such operator: the statement fails with "operator
+    /// does not exist".
+    Reject,
+    /// The operator exists once the string literal operands are cast to this
+    /// type, as in `int_column = '5'`.
+    CastUntyped(String),
+}
+
+/// The type of an operand, as far as a dialect needs to know it.
+#[derive(Debug, Clone)]
+pub enum OperandType {
+    /// A string literal or a parameter. Its type comes from where it is used.
+    Untyped,
+    Null,
+    Integer,
+    Real,
+    /// A number written in the statement with a decimal point or exponent.
+    Decimal,
+    Text,
+    Blob,
+    Custom(Arc<crate::schema::TypeDef>),
+    Array,
+    Unknown,
+}
+
+/// What the engine does for a cast: the conversion of the operand, then the
+/// store of the converted value as the target type does.
+#[derive(Debug, Clone)]
+pub struct CastPlan {
+    pub convert: Option<CastConversion>,
+}
+
+/// The call of a function on the operand, which gives the value in the form
+/// the target type takes as input. `extra_args` follow the operand.
+#[derive(Debug, Clone)]
+pub struct CastConversion {
+    pub function: String,
+    pub extra_args: Vec<ast::Expr>,
 }
 
 /// How an ORDER BY or DISTINCT ON term is matched to the output columns.

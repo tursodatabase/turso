@@ -20,37 +20,25 @@ setup t_b {
 }
 
 # A-07: int4 overflow literal cast
-@compat-gap "type:int4"
 test int4-overflow-literal-cast {
     SELECT '2147483648'::int4;
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-    2147483648
-}
 
 # A-08: int2 overflow literal cast
-@compat-gap "type:int2"
 test int2-overflow-literal-cast {
     SELECT '40000'::smallint;
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-    40000
-}
 
 # A-09: int8 overflow arithmetic
-@compat-gap "operator:int8 + int4"
 test int8-overflow-arithmetic {
     SELECT 9223372036854775807::bigint + 1;
 }
 @sqlstate 22003
 expect error {}
-expect @tursopg {
-    9.223372036854776e18
-}
 
 # A-10: int4 overflow arithmetic
 @compat-gap "operator:int4 + int4"
@@ -64,37 +52,25 @@ expect @tursopg {
 }
 
 # A-11: invalid int literal cast
-@compat-gap "type:int4"
 test invalid-int-literal-cast {
     SELECT 'abc'::integer;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    0
-}
 
 # A-13: '1.5'::int (text) is invalid
-@compat-gap "type:int4"
 test decimal-text-cast-to-int4-is-invalid {
     SELECT '1.5'::integer;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    1
-}
 
 # A-14: numeric->int rounds half away from zero
-@compat-gap "cast:numeric -> int4"
 test numeric-int-rounds-half-away-from-zero {
     SELECT 1.5::integer, 2.5::integer, (-2.5)::integer;
 }
 expect {
     2|3|-3
-}
-expect @tursopg {
-    1|2|-2
 }
 
 # A-16: int with surrounding spaces
@@ -106,38 +82,26 @@ expect {
 }
 
 # A-17: invalid uuid literal cast
-@compat-gap "type:uuid"
 test invalid-uuid-literal-cast {
     SELECT 'nope'::uuid;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    nope
-}
 
 # A-19: uuid uppercase input normalised
-@compat-gap "type:uuid"
 test uuid-uppercase-input-normalised {
     SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid;
 }
 expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
-expect @tursopg {
-    A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11
-}
 
 # A-20: uuid braces / no-hyphen input
-@compat-gap "type:uuid"
 test uuid-braces-no-hyphen-input {
     SELECT '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid, 'a0eebc999c0b4ef8bb6d6bb9bd380a11'::uuid;
 }
 expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
-}
-expect @tursopg {
-    {a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}|a0eebc999c0b4ef8bb6d6bb9bd380a11
 }
 
 # A-21: uuid equality across case
@@ -149,7 +113,7 @@ expect {
     t
 }
 expect @tursopg {
-    0
+    1
 }
 
 # A-22: numeric(10,2) rounding half away from zero
@@ -445,7 +409,6 @@ expect {
 }
 
 # A-61: text column = int literal (PG: no operator)
-@compat-gap "operator:text = int4"
 test text-column-int-literal-pg-no-operator {
     CREATE TABLE t (s text);
     INSERT INTO t VALUES ('1');
@@ -453,9 +416,6 @@ test text-column-int-literal-pg-no-operator {
 }
 @sqlstate 42883
 expect error {}
-expect @tursopg {
-    1
-}
 
 # A-62: insert '42' text literal into int column
 @setup t_id
@@ -468,26 +428,20 @@ expect {
 
 # A-63: insert 'abc' into int column
 @setup t_id
-@compat-gap "type:int4"
 test insert-abc-into-int-column {
     INSERT INTO t VALUES ('abc') RETURNING id;
 }
 @sqlstate 22P02
 expect error {}
-@sqlstate 23000
-expect @tursopg error {}
 
 # A-64: insert 1.7 numeric into int column
 @setup t_id
-@compat-gap "cast:numeric -> int4"
 test insert-1-7-numeric-into-int-column {
     INSERT INTO t VALUES (1.7) RETURNING id;
 }
 expect {
     2
 }
-@sqlstate 23000
-expect @tursopg error {}
 
 # A-65: insert 'true' into bool column
 @setup t_b
@@ -500,15 +454,11 @@ expect {
 
 # A-66: insert integer 1 into bool column
 @setup t_b
-@compat-gap "cast:int4 -> bool"
 test insert-integer-1-into-bool-column {
     INSERT INTO t VALUES (1) RETURNING b;
 }
 @sqlstate 42804
 expect error {}
-expect @tursopg {
-    t
-}
 
 # A-79: insert literal with short +00 offset into timestamptz column
 test insert-literal-with-short-00-offset-into-timestamptz {
@@ -542,25 +492,17 @@ expect {
 }
 
 # PostgreSQL has a cast to boolean only from int4, not from int2 or int8.
-@compat-gap "cast:int2 -> bool"
 test int2-to-bool-cast-does-not-exist {
     SELECT 5::int2::boolean;
 }
 @sqlstate 42846
 expect error {}
-expect @tursopg {
-    t
-}
 
-@compat-gap "cast:int8 -> bool"
 test int8-to-bool-cast-does-not-exist {
     SELECT 5::int8::boolean;
 }
 @sqlstate 42846
 expect error {}
-expect @tursopg {
-    t
-}
 
 @compat-gap "cast:jsonb -> bytea"
 test jsonb-to-bytea-cast-does-not-exist {

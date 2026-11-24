@@ -9,6 +9,7 @@ use crate::ast;
 
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
+use crate::dialect::OperandType;
 use crate::function::{AggFunc, Func, ResultType, ReturnType, ScalarFunc, WindowFunc};
 use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
@@ -152,7 +153,7 @@ impl ExprType {
 impl std::fmt::Display for ExprType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Custom { type_def, .. } => f.write_str(&type_def.name),
+            Self::Custom { type_def, .. } => f.write_str(&type_def.display_name),
             Self::Array { element, .. } if element.is_unknown_element() => f.write_str("anyarray"),
             Self::Array {
                 element,
@@ -244,14 +245,14 @@ impl<'a> TypeEnv<'a> {
         }
     }
 
-    fn tables(&self) -> Option<&TableReferences> {
+    pub(super) fn tables(&self) -> Option<&TableReferences> {
         match self {
             Self::Statement { tables, .. } => *tables,
             Self::Table { .. } | Self::TypeBody { .. } => None,
         }
     }
 
-    fn resolver(&self) -> Option<&Resolver<'a>> {
+    pub(super) fn resolver(&self) -> Option<&Resolver<'a>> {
         match self {
             Self::Statement { resolver, .. } => Some(resolver),
             Self::Table { .. } | Self::TypeBody { .. } => None,
@@ -1230,6 +1231,22 @@ pub(crate) fn common_type<'e>(
     env: &TypeEnv,
 ) -> ExprType {
     common_of_types(exprs.map(|expr| type_of(expr, env)), env.schema())
+}
+
+/// The type of an operand as a dialect sees it.
+pub(crate) fn dialect_operand_type(ty: &ExprType) -> OperandType {
+    match ty {
+        ExprType::Untyped | ExprType::Builtin(BuiltinType::Any) => OperandType::Untyped,
+        ExprType::Null => OperandType::Null,
+        ExprType::Builtin(BuiltinType::Integer) => OperandType::Integer,
+        ExprType::Builtin(BuiltinType::Real) => OperandType::Real,
+        ExprType::Builtin(BuiltinType::Decimal | BuiltinType::Numeric) => OperandType::Decimal,
+        ExprType::Builtin(BuiltinType::Text) => OperandType::Text,
+        ExprType::Builtin(BuiltinType::Blob) => OperandType::Blob,
+        ExprType::Custom { type_def, .. } => OperandType::Custom(Arc::clone(type_def)),
+        ExprType::Array { .. } => OperandType::Array,
+        _ => OperandType::Unknown,
+    }
 }
 
 fn common_of_types(types: impl Iterator<Item = ExprType>, schema: &Schema) -> ExprType {

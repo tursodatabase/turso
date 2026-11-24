@@ -51,17 +51,15 @@ fn gap_a_05_bool_invalid_param(db: TempDatabase) {
 }
 
 // A-12 (S1): invalid int param cast
-// tursopg: an invalid bigint param casts to 0 instead of failing.
-// PostgreSQL: ERROR 22P02
 #[turso_macros::test(views)]
-fn gap_a_12_tursopg_returns_wrong_result_invalid_int_param_cast(db: TempDatabase) {
+fn gap_a_12_invalid_int_param_cast(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::bigint",
         params: &[P::Text("abc")],
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "0");
+    assert_eq!(out, "ERROR 22P02");
 }
 
 // A-15: int param text -> int arithmetic
@@ -77,17 +75,15 @@ fn gap_a_15_int_param_text_int_arithmetic(db: TempDatabase) {
 }
 
 // A-18 (S1): invalid uuid param cast
-// tursopg: an invalid uuid param is accepted.
-// PostgreSQL: ERROR 22P02
 #[turso_macros::test(views)]
-fn gap_a_18_tursopg_returns_wrong_result_invalid_uuid_param_cast(db: TempDatabase) {
+fn gap_a_18_invalid_uuid_param_cast(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::uuid",
         params: &[P::Text("nope")],
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "nope");
+    assert_eq!(out, "ERROR 22P02");
 }
 
 // A-29 (S2): numeric $n param

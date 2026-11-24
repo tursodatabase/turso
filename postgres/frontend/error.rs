@@ -293,6 +293,9 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
             }
         },
         LimboError::ForeignKeyConstraint(_) => SQLSTATE_FK_VIOLATION,
+        LimboError::Constraint(msg) if msg.starts_with("invalid input for type boolean") => {
+            SQLSTATE_INVALID_TEXT_REPRESENTATION
+        }
         LimboError::Constraint(_) => SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION,
         LimboError::LexerError(_) => SQLSTATE_SYNTAX_ERROR,
         LimboError::ParseError(msg) => parse_error_sqlstate(msg),
@@ -378,7 +381,10 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_TABLE
     } else if msg.contains("no such column") || msg.contains("column not found") {
         SQLSTATE_UNDEFINED_COLUMN
-    } else if msg.contains("no such function") || msg.contains("no such window") {
+    } else if msg.contains("no such function")
+        || msg.contains("no such window")
+        || msg.starts_with("operator does not exist: ")
+    {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.starts_with("cannot cast type ") {
         SQLSTATE_CANNOT_COERCE
@@ -501,7 +507,7 @@ fn sql_error_sqlstate(msg: &str) -> &'static str {
 /// The SQLSTATE of a RAISE. The translator and the types of the engine check
 /// values with RAISE, and PostgreSQL gives these checks their own SQLSTATE.
 fn raise_sqlstate(msg: &str) -> &'static str {
-    if msg.starts_with("invalid input value for enum ") {
+    if msg.starts_with("invalid input value for enum ") || msg == "invalid UUID value" {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
     } else if msg == "integer out of range for smallint" {
         SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE

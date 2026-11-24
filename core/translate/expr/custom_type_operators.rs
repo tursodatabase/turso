@@ -6,11 +6,12 @@
 //! Nothing is written into the expression tree.
 
 use super::*;
+use crate::dialect::OperatorResolution;
 use crate::function::Deterministic;
 use crate::schema::{OperatorArg, OperatorSignature, BINARY_OPERATORS, PREFIX_OPERATORS};
 use crate::translate::expr::expr_type::{
-    same_type_def, sqlite_operand_type, type_of, without_wrappers, BuiltinType, ColumnCustomType,
-    ExprType, TypeEnv,
+    dialect_operand_type, same_type_def, sqlite_operand_type, type_of, without_wrappers,
+    BuiltinType, ColumnCustomType, ExprType, TypeEnv,
 };
 
 /// The function that runs the operator expression `expr`, such as `a + b` or
@@ -38,6 +39,269 @@ pub(crate) fn check_custom_operator(expr: &ast::Expr, env: &TypeEnv) -> Result<(
         return Ok(());
     }
     find_operator_call(expr, &types, env).map(|_| ())
+}
+
+/// Fails when the dialect has no comparison for the operands of `expr`, as
+/// PostgreSQL has none for `text = integer`. The comparisons of `expr` are
+/// its own operator, the two of a BETWEEN, and the `=` of each value of an
+/// IN list. An operand whose type is not known yet leaves the decision to a
+/// check once it is known.
+pub(crate) fn check_comparison(expr: &ast::Expr, env: &TypeEnv) -> Result<()> {
+    let Some(resolver) = env.resolver() else {
+        return Ok(());
+    };
+    for (lhs, symbol, rhs) in comparisons_of(expr) {
+        if is_hidden_column(lhs, env) || is_hidden_column(rhs, env) {
+            continue;
+        }
+        let (lhs_type, rhs_type) = (type_of(lhs, env), type_of(rhs, env));
+        if matches!(lhs_type, ExprType::NotKnownYet) || matches!(rhs_type, ExprType::NotKnownYet) {
+            continue;
+        }
+        let operand_types = || {
+            vec![
+                dialect_operand_type(&lhs_type),
+                dialect_operand_type(&rhs_type),
+            ]
+        };
+        if resolver
+            .catalog
+            .dialect
+            .resolve_operator(symbol, &operand_types)
+            == OperatorResolution::Reject
+        {
+            crate::bail_parse_error!("operator does not exist: {lhs_type} {symbol} {rhs_type}");
+        }
+    }
+    Ok(())
+}
+
+/// Casts the string literals that meet an operand of another type to that
+/// type when the dialect says so, as PostgreSQL reads `int_column = '5'` as
+/// `int_column = '5'::int4`. A literal that is not a value of the type then
+/// fails as the cast does. This runs on every expression a statement binds,
+/// once its columns are bound and before the optimizer sees the operators.
+pub(crate) fn cast_untyped_operands(
+    expr: &mut ast::Expr,
+    tables: Option<&TableReferences>,
+    resolver: &Resolver<'_>,
+) -> Result<()> {
+    if resolver.schema().type_registry.is_empty() {
+        return Ok(());
+    }
+    let context = ExprContext::new(tables, resolver);
+    walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
+        let casts = literal_casts(expr, &context.type_env())?;
+        for (slot, type_name) in casts {
+            let operand = operand_slots(expr).swap_remove(slot);
+            if let ast::Expr::Literal(ast::Literal::String(text)) = without_wrappers(operand) {
+                resolver
+                    .catalog
+                    .dialect
+                    .check_literal_cast(&sanitize_string(text), &type_name)?;
+            }
+            let literal = std::mem::replace(operand, ast::Expr::Literal(ast::Literal::Null));
+            *operand = ast::Expr::Cast {
+                expr: Box::new(literal),
+                type_name: Some(ast::Type {
+                    name: type_name,
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            };
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+/// The operands of an operator, a BETWEEN, an IN list or a CASE, by
+/// slot. A CASE with an operand has it first, then the WHEN values; without
+/// one, only the WHEN conditions.
+fn operand_slots(expr: &mut ast::Expr) -> Vec<&mut ast::Expr> {
+    match expr {
+        ast::Expr::Binary(lhs, _, rhs) => vec![lhs.as_mut(), rhs.as_mut()],
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => vec![lhs.as_mut(), start.as_mut(), end.as_mut()],
+        ast::Expr::InList { lhs, rhs, .. } => std::iter::once(lhs.as_mut())
+            .chain(rhs.iter_mut().map(|value| value.as_mut()))
+            .collect(),
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            ..
+        } => base
+            .iter_mut()
+            .map(|base| base.as_mut())
+            .chain(when_then_pairs.iter_mut().map(|(when, _)| when.as_mut()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The operators that `expr` applies to its operand slots, as pairs of slots
+/// with the operator's name.
+struct OperatorUses<'a> {
+    slots: Vec<&'a ast::Expr>,
+    pairs: Vec<(usize, &'static str, usize)>,
+}
+
+fn operator_uses<'a>(expr: &'a ast::Expr) -> Option<OperatorUses<'a>> {
+    let mut uses = OperatorUses {
+        slots: Vec::new(),
+        pairs: Vec::new(),
+    };
+    match expr {
+        ast::Expr::Binary(lhs, op, rhs) => {
+            uses.slots = vec![lhs.as_ref(), rhs.as_ref()];
+            match op {
+                ast::Operator::Is | ast::Operator::IsNot => {
+                    let is_boolean_test = matches!(
+                        rhs.as_ref(),
+                        ast::Expr::Literal(ast::Literal::Numeric(value))
+                            if value == "0" || value == "1"
+                    );
+                    if !is_boolean_test {
+                        uses.pairs = vec![(0, "=", 1)];
+                    }
+                }
+                ast::Operator::And | ast::Operator::Or => return None,
+                _ => {
+                    let symbol = comparison_symbol(op).or_else(|| binary_symbol(op))?;
+                    uses.pairs = vec![(0, symbol, 1)];
+                }
+            }
+        }
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => {
+            uses.slots = vec![lhs.as_ref(), start.as_ref(), end.as_ref()];
+            uses.pairs = vec![(0, ">=", 1), (0, "<=", 2)];
+        }
+        ast::Expr::InList { lhs, rhs, .. } => {
+            uses.slots = std::iter::once(lhs.as_ref())
+                .chain(rhs.iter().map(|value| value.as_ref()))
+                .collect();
+            uses.pairs = (1..=rhs.len()).map(|index| (0, "=", index)).collect();
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            ..
+        } => {
+            let whens = when_then_pairs.iter().map(|(when, _)| when.as_ref());
+            match base {
+                Some(base) => {
+                    uses.slots = std::iter::once(base.as_ref()).chain(whens).collect();
+                    uses.pairs = (1..=when_then_pairs.len())
+                        .map(|index| (0, "=", index))
+                        .collect();
+                }
+                None => return None,
+            }
+        }
+        _ => return None,
+    }
+    Some(uses)
+}
+
+/// The slots of `expr` whose string literal the dialect casts, with the type
+/// to cast to. Fails when the dialect has no operator for the operands.
+fn literal_casts(expr: &ast::Expr, env: &TypeEnv) -> Result<Vec<(usize, String)>> {
+    let (Some(resolver), Some(uses)) = (env.resolver(), operator_uses(expr)) else {
+        return Ok(Vec::new());
+    };
+    let OperatorUses { slots, pairs } = uses;
+    if slots.iter().any(|slot| is_hidden_column(slot, env)) {
+        return Ok(Vec::new());
+    }
+    let types: Vec<ExprType> = slots.iter().map(|slot| type_of(slot, env)).collect();
+    let mut casts: Vec<(usize, String)> = Vec::new();
+    let mut add_cast = |slot: usize, type_name: &str| {
+        let is_literal = matches!(
+            without_wrappers(slots[slot]),
+            ast::Expr::Literal(ast::Literal::String(_))
+        );
+        if is_literal && !casts.iter().any(|(done, _)| *done == slot) {
+            casts.push((slot, type_name.to_string()));
+        }
+    };
+    for (left, symbol, right) in pairs {
+        if matches!(types[left], ExprType::NotKnownYet)
+            || matches!(types[right], ExprType::NotKnownYet)
+        {
+            continue;
+        }
+        let operand_types = || {
+            vec![
+                dialect_operand_type(&types[left]),
+                dialect_operand_type(&types[right]),
+            ]
+        };
+        match resolver
+            .catalog
+            .dialect
+            .resolve_operator(symbol, &operand_types)
+        {
+            OperatorResolution::Keep => {}
+            OperatorResolution::Reject => {
+                let (lhs, rhs) = (&types[left], &types[right]);
+                crate::bail_parse_error!("operator does not exist: {lhs} {symbol} {rhs}");
+            }
+            OperatorResolution::CastUntyped(type_name) => {
+                add_cast(left, &type_name);
+                add_cast(right, &type_name);
+            }
+        }
+    }
+    Ok(casts)
+}
+
+/// The comparisons that `expr` makes: left operand, operator, right operand.
+fn comparisons_of(expr: &ast::Expr) -> Vec<(&ast::Expr, &'static str, &ast::Expr)> {
+    match expr {
+        ast::Expr::Binary(lhs, op, rhs) => comparison_symbol(op)
+            .map(|symbol| (lhs.as_ref(), symbol, rhs.as_ref()))
+            .into_iter()
+            .collect(),
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => vec![
+            (lhs.as_ref(), ">=", start.as_ref()),
+            (lhs.as_ref(), "<=", end.as_ref()),
+        ],
+        ast::Expr::InList { lhs, rhs, .. } => rhs
+            .iter()
+            .map(|value| (lhs.as_ref(), "=", value.as_ref()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether `expr` is a hidden column, such as the argument of a table
+/// function, which the engine compares with the argument itself.
+fn is_hidden_column(expr: &ast::Expr, env: &TypeEnv) -> bool {
+    let ast::Expr::Column { table, column, .. } = without_wrappers(expr) else {
+        return false;
+    };
+    env.tables()
+        .and_then(|tables| tables.find_table_by_internal_id(*table))
+        .and_then(|(_, table)| table.get_column_at(*column))
+        .is_some_and(|column| column.hidden())
+}
+
+fn comparison_symbol(op: &ast::Operator) -> Option<&'static str> {
+    use ast::Operator;
+    Some(match op {
+        Operator::Equals => "=",
+        Operator::NotEquals => "<>",
+        Operator::Less => "<",
+        Operator::LessEquals => "<=",
+        Operator::Greater => ">",
+        Operator::GreaterEquals => ">=",
+        _ => return None,
+    })
 }
 
 /// The types of the operands of `expr`, in order, when it is an operator that
@@ -73,6 +337,23 @@ pub(super) fn find_operator_call(
     // An operator on NULL gives NULL whichever function runs it.
     if types.iter().any(|ty| matches!(ty, ExprType::Null)) {
         return Ok(None);
+    }
+    if let Some(resolver) = env.resolver() {
+        let operand_types = || types.iter().map(dialect_operand_type).collect();
+        if resolver
+            .catalog
+            .dialect
+            .resolve_operator(op, &operand_types)
+            == OperatorResolution::Reject
+        {
+            match types {
+                [operand] => crate::bail_parse_error!("operator does not exist: {op} {operand}"),
+                [lhs, rhs] => {
+                    crate::bail_parse_error!("operator does not exist: {lhs} {op} {rhs}")
+                }
+                _ => unreachable!("an operator has one or two operands"),
+            }
+        }
     }
     let operands = operands
         .iter()
@@ -223,7 +504,7 @@ impl<'a> Operand<'a> {
     /// The operand's type for an error message: `date`, `integer`, ...
     fn type_name(&self) -> String {
         match (&self.value_type, self.expr_type) {
-            (Some(ty), _) => ty.type_def.name.clone(),
+            (Some(ty), _) => ty.type_def.display_name.clone(),
             // A value whose type is only known when the statement runs, such as
             // the result of json_extract().
             (
@@ -265,15 +546,21 @@ fn accepts_operand(
         OperatorArg::Exact => {
             is_plain_value(signature, operand) && !operand.is_real && !operand.is_blob
         }
+        OperatorArg::Untyped => operand.value_type.is_none(),
+        OperatorArg::UntypedInteger => operand.value_type.is_none() && operand.may_be_integer,
+        OperatorArg::Type(name) => operand
+            .value_type
+            .as_ref()
+            .is_some_and(|t| t.type_def.name.eq_ignore_ascii_case(name)),
         OperatorArg::Real => is_plain_value(signature, operand) && operand.is_real,
     }
 }
 
 fn is_plain_value(signature: &OperatorSignature, operand: &Operand) -> bool {
-    operand
-        .value_type
-        .as_ref()
-        .is_none_or(|t| has_sqlite_operator(&t.type_def, signature))
+    operand.value_type.as_ref().is_none_or(|t| {
+        (t.type_def.is_builtin && t.type_def.stores_plain_integers())
+            || has_sqlite_operator(&t.type_def, signature)
+    })
 }
 
 /// A type whose only way to run the operator of `signature` is SQLite's, such

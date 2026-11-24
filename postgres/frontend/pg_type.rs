@@ -4,6 +4,9 @@
 //! relations.
 
 mod boolean;
+pub(crate) mod int2;
+pub(crate) mod int8;
+mod integer;
 
 use crate::session::relation_lookup_namespaces;
 use std::sync::Arc;
@@ -14,7 +17,10 @@ use turso_core::{Connection, Result};
 /// `builder`. Each one replaces the type that core registered under the same
 /// name.
 pub(crate) fn register_builtin_types(builder: SchemaBuilder) -> Result<SchemaBuilder> {
-    builder.builtin_type(&boolean::Boolean)
+    builder
+        .builtin_type(&boolean::Boolean)?
+        .builtin_type(&int2::Int2)?
+        .builtin_type(&int8::Int8)
 }
 
 // FIXME(pg-catalog): three places that do not know about each other say what

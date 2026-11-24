@@ -3396,6 +3396,7 @@ fn find_type_using(schema: &Schema, registry_key: &str) -> Result<Option<String>
 pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Result<bool> {
     let TypeDef {
         name: _,
+        display_name: _,
         is_builtin: _,
         not_null: _,
         is_domain: _,
