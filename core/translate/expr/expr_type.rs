@@ -65,6 +65,11 @@ pub enum BuiltinType {
     Decimal,
     /// A number that may be an integer or a real.
     Numeric,
+    /// The result of a comparison, `NOT`, `IN`, `LIKE`, `EXISTS` and the
+    /// like: 1, 0 or NULL. SQLite has no boolean type, so this is an integer
+    /// wherever SQLite computes with it, and a result column of this type
+    /// is reported as INTEGER.
+    Boolean,
     Text,
     Blob,
     /// Any value: a column without a declared type, or a SQLite function that may
@@ -75,7 +80,7 @@ pub enum BuiltinType {
 impl BuiltinType {
     pub(crate) fn affinity(self) -> Affinity {
         match self {
-            Self::Integer => Affinity::Integer,
+            Self::Integer | Self::Boolean => Affinity::Integer,
             Self::Real | Self::Decimal => Affinity::Real,
             Self::Numeric => Affinity::Numeric,
             Self::Text => Affinity::Text,
@@ -88,7 +93,7 @@ impl BuiltinType {
     /// written in the statement is a REAL to SQLite.
     pub(crate) fn sqlite_name(self) -> &'static str {
         match self {
-            Self::Integer => "INTEGER",
+            Self::Integer | Self::Boolean => "INTEGER",
             Self::Real | Self::Decimal => "REAL",
             Self::Numeric => "NUMERIC",
             Self::Text => "TEXT",
@@ -159,7 +164,9 @@ impl std::fmt::Display for ExprType {
                 dimensions,
             } => write!(f, "{element}{}", "[]".repeat(*dimensions as usize)),
             Self::Builtin(builtin) => f.write_str(match builtin {
-                BuiltinType::Integer => "integer",
+                // SQLite has no boolean type, so a message names it as SQLite
+                // computes with it.
+                BuiltinType::Integer | BuiltinType::Boolean => "integer",
                 BuiltinType::Real => "real",
                 BuiltinType::Decimal | BuiltinType::Numeric => "numeric",
                 BuiltinType::Text => "text",
@@ -314,7 +321,7 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             ..
         } => cast_type(type_name, env.schema()),
         ast::Expr::Unary(op, inner) => match op {
-            ast::UnaryOperator::Not => ExprType::Builtin(BuiltinType::Integer),
+            ast::UnaryOperator::Not => ExprType::Builtin(BuiltinType::Boolean),
             ast::UnaryOperator::BitwiseNot => {
                 custom_operator_type(expr, &[type_of(inner, env)], env)
                     .unwrap_or(ExprType::Builtin(BuiltinType::Integer))
@@ -385,7 +392,7 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
         | ast::Expr::SubqueryResult {
             query_type: ast::SubqueryType::Exists { .. } | ast::SubqueryType::In { .. },
             ..
-        } => ExprType::Builtin(BuiltinType::Integer),
+        } => ExprType::Builtin(BuiltinType::Boolean),
         // `x REGEXP p` calls regexp(p, x), which an extension may define.
         ast::Expr::Like {
             op: ast::LikeOperator::Regexp,
@@ -557,6 +564,7 @@ fn literal_type(literal: &ast::Literal) -> ExprType {
         ast::Literal::Null => ExprType::Null,
         ast::Literal::String(_) => ExprType::Untyped,
         ast::Literal::Blob(_) => ExprType::Builtin(BuiltinType::Blob),
+        ast::Literal::True | ast::Literal::False => ExprType::Builtin(BuiltinType::Boolean),
         _ => {
             match crate::translate::alter::literal_default_value(literal).map(|v| v.value_type()) {
                 Ok(crate::types::ValueType::Integer) => ExprType::Builtin(BuiltinType::Integer),
@@ -826,8 +834,8 @@ fn binary_type(
             custom_operator_type(expr, &[type_of(lhs, env), type_of(rhs, env)], env)
                 .unwrap_or(ExprType::Builtin(BuiltinType::Integer))
         }
-        Operator::BitwiseNot
-        | Operator::Equals
+        Operator::BitwiseNot => ExprType::Builtin(BuiltinType::Integer),
+        Operator::Equals
         | Operator::NotEquals
         | Operator::Less
         | Operator::LessEquals
@@ -838,7 +846,7 @@ fn binary_type(
         | Operator::And
         | Operator::Or
         | Operator::ArrayContains
-        | Operator::ArrayOverlap => ExprType::Builtin(BuiltinType::Integer),
+        | Operator::ArrayOverlap => ExprType::Builtin(BuiltinType::Boolean),
         // `||` joins arrays when either side is an array.
         Operator::Concat => {
             let lhs = type_of(lhs, env);
@@ -891,6 +899,7 @@ fn operand_type(ty: ExprType, custom_type: impl FnOnce(&TypeDef) -> ExprType) ->
     match &ty {
         ExprType::Custom { type_def, .. } => custom_type(type_def),
         ExprType::Builtin(BuiltinType::Decimal) => ExprType::Builtin(BuiltinType::Real),
+        ExprType::Builtin(BuiltinType::Boolean) => ExprType::Builtin(BuiltinType::Integer),
         ExprType::Builtin(_)
         | ExprType::Array { .. }
         | ExprType::Untyped
@@ -1017,6 +1026,7 @@ pub(crate) fn value_kind(ty: &ExprType, schema: &Schema) -> Option<BuiltinType> 
         | ExprType::NotKnownYet
         | ExprType::RowValue => None,
         ExprType::Builtin(BuiltinType::Decimal) => Some(BuiltinType::Real),
+        ExprType::Builtin(BuiltinType::Boolean) => Some(BuiltinType::Integer),
         ExprType::Builtin(
             builtin @ (BuiltinType::Integer
             | BuiltinType::Real
@@ -1138,6 +1148,7 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
             Some(
                 ExprType::Builtin(
                     BuiltinType::Integer
+                    | BuiltinType::Boolean
                     | BuiltinType::Real
                     | BuiltinType::Numeric
                     | BuiltinType::Decimal
@@ -1279,6 +1290,12 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
             ExprType::Untyped | ExprType::Builtin(Text),
         ) => ExprType::Builtin(Text),
         (ExprType::Builtin(a), ExprType::Builtin(b)) if a == b => ExprType::Builtin(a),
+        // The result of a comparison mixed with another type is an integer,
+        // as it is to SQLite: `CASE WHEN c THEN a < b ELSE 5 END`.
+        (ExprType::Builtin(BuiltinType::Boolean), other)
+        | (other, ExprType::Builtin(BuiltinType::Boolean)) => {
+            common_scalar_type(ExprType::Builtin(Integer), other, schema)
+        }
         (ExprType::Builtin(Decimal), ExprType::Builtin(Integer))
         | (ExprType::Builtin(Integer), ExprType::Builtin(Decimal)) => ExprType::Builtin(Decimal),
         (
@@ -1484,6 +1501,44 @@ mod tests {
             (
                 cast(int(1), array_of("cents", 1)),
                 ExprType::array(custom("cents", &[]), 1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn conditions() {
+        let less = || binary(int(1), Operator::Less, int(2));
+        check(&[
+            (less(), builtin(BuiltinType::Boolean)),
+            (
+                binary(less(), Operator::And, less()),
+                builtin(BuiltinType::Boolean),
+            ),
+            (
+                Expr::Unary(UnaryOperator::Not, Box::new(int(1))),
+                builtin(BuiltinType::Boolean),
+            ),
+            (
+                Expr::IsNull(Box::new(int(1))),
+                builtin(BuiltinType::Boolean),
+            ),
+            (
+                case_when(int(1), less(), Some(less())),
+                builtin(BuiltinType::Boolean),
+            ),
+            // SQLite computes with a condition as an integer.
+            (
+                binary(less(), Operator::Add, int(1)),
+                builtin(BuiltinType::Integer),
+            ),
+            (neg(less()), builtin(BuiltinType::Integer)),
+            (
+                case_when(int(1), less(), Some(int(5))),
+                builtin(BuiltinType::Integer),
+            ),
+            (
+                case_when(int(1), less(), Some(num("2.5"))),
+                builtin(BuiltinType::Decimal),
             ),
         ]);
     }

@@ -110,6 +110,7 @@ fn custom_type_info(
 fn builtin_primitive(ty: BuiltinType) -> Option<&'static str> {
     match ty {
         BuiltinType::Integer
+        | BuiltinType::Boolean
         | BuiltinType::Real
         | BuiltinType::Decimal
         | BuiltinType::Numeric
