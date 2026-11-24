@@ -12,16 +12,10 @@ pub(super) fn operator_signatures() -> Vec<OperatorSignature> {
     // is jsonb_delete, and it resolves the type of the right operand by its
     // value. A lookup in pg_operator by the types of the operands, in an
     // expression tree that carries PostgreSQL types, replaces this.
-    vec![jsonb_function("-", &[Value, PlainValue], "jsonb_delete")]
-}
-
-/// The signature of an operator that runs the function `func`, which returns
-/// a jsonb value.
-fn jsonb_function(op: &'static str, args: &[OperatorArg], func: &str) -> OperatorSignature {
-    OperatorSignature {
-        op,
-        args: args.to_vec(),
-        func: Some(func.to_string()),
-        result: Some("jsonb"),
-    }
+    vec![OperatorSignature::call(
+        "-",
+        &[Value, PlainValue],
+        "jsonb_delete",
+        "jsonb",
+    )]
 }

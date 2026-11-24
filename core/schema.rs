@@ -295,6 +295,20 @@ pub struct OperatorSignature {
     /// The type `func` returns. `None` when SQLite's operator runs.
     pub result: Option<&'static str>,
 }
+
+impl OperatorSignature {
+    /// The signature of an operator that runs the SQL function `func`, which
+    /// returns a value of the type `result`.
+    pub fn call(op: &'static str, args: &[OperatorArg], func: &str, result: &'static str) -> Self {
+        Self {
+            op,
+            args: args.to_vec(),
+            func: Some(func.to_string()),
+            result: Some(result),
+        }
+    }
+}
+
 /// An operand that a signature accepts. "This type" is the type that declares
 /// the signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
