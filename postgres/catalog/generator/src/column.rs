@@ -8,6 +8,8 @@ use crate::bki::{Catalog, Nullness, Token};
 
 pub(crate) struct Field<'a> {
     pub(crate) name: &'a str,
+    /// The type name as the file spells it.
+    pub(crate) bki_type: &'a str,
     pub(crate) kind: ColumnKind,
     /// Whether a row can have NULL in the column.
     pub(crate) nullable: bool,
@@ -40,6 +42,7 @@ impl<'a> Field<'a> {
             only_fixed_not_null_so_far &= fixed_width && !nullable;
             fields.push(Field {
                 name: &column.name,
+                bki_type: &column.bki_type,
                 kind,
                 nullable,
             });
