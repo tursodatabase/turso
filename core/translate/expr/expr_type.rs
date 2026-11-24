@@ -839,13 +839,17 @@ fn binary_type(
         | Operator::Or
         | Operator::ArrayContains
         | Operator::ArrayOverlap => ExprType::Builtin(BuiltinType::Integer),
-        // `||` joins arrays when either side is an array.
+        // `||` runs the function of an operand's custom type that has a
+        // signature for it, and joins arrays when either side is an array.
         Operator::Concat => {
-            let lhs = type_of(lhs, env);
+            let types = [type_of(lhs, env), type_of(rhs, env)];
+            if let Some(ty) = custom_operator_type(expr, &types, env) {
+                return ty;
+            }
+            let [lhs, rhs] = types;
             if lhs.is_array() {
                 return lhs;
             }
-            let rhs = type_of(rhs, env);
             if rhs.is_array() {
                 return rhs;
             }
