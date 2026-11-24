@@ -101,7 +101,14 @@ pub fn translate(
     } else {
         connection.get_capture_data_changes_info().clone()
     };
-    let mut program = new_program_builder(&connection, query_mode, capture_data_changes_info)?;
+    let mut program = new_program_builder(&connection, || {
+        ProgramBuilder::new(
+            query_mode,
+            capture_data_changes_info,
+            // These options will be extended whithin each translate program
+            ProgramBuilderOpts::new(1, 32, 2),
+        )
+    })?;
     program.set_mvcc_enabled(connection.mvcc_enabled());
     program.flags.set_reads_stored_values(matches!(
         origin,
@@ -196,36 +203,30 @@ pub fn translate(
     build_program(program, &connection, change_cnt_on, input)
 }
 
-/// Makes the builder of the program of a statement in memory from the statement
-/// allocator of the database. Rust makes the builder on the stack and then
-/// copies it into the box. This function is not inlined, so that the builder is
-/// in the stack frame of this function, and not in the frame of [translate].
+/// Makes a program builder with `new`, in memory from the statement allocator
+/// of the database. Rust makes the builder on the stack and then copies it into
+/// the box. This function is not inlined, so that the builder is in the stack
+/// frame of this function, and not in the frame of its caller.
 #[inline(never)]
-fn new_program_builder(
+pub(crate) fn new_program_builder(
     connection: &Connection,
-    query_mode: QueryMode,
-    capture_data_changes_info: Option<crate::CaptureDataChangesInfo>,
+    new: impl FnOnce() -> ProgramBuilder,
 ) -> Result<DynBox<ProgramBuilder>> {
-    let builder = ProgramBuilder::new(
-        query_mode,
-        capture_data_changes_info,
-        // These options will be extended whithin each translate program
-        ProgramBuilderOpts::new(1, 32, 2),
-    );
+    let builder = new();
     let alloc = connection.db.allocators.statement.clone();
     let builder =
         crate::with_statement_allocation_site!(ProgramBuilder, DynBox::try_new_in(builder, alloc))?;
     Ok(builder)
 }
 
-/// Builds the program of a statement or of a nested trigger.
+/// Builds the program of a builder in memory from the statement allocator.
 /// [ProgramBuilder::build] takes the builder as a value, so the builder leaves
 /// its box here. This function is not inlined, so that the builder is in the
 /// stack frame of this function, and not in the frame of its caller. The
 /// compilation of nested triggers recurses one time for each level, so the
 /// builder must not be in the frame of the code that recurses.
 #[inline(never)]
-fn build_program(
+pub(crate) fn build_program(
     builder: DynBox<ProgramBuilder>,
     connection: &Arc<Connection>,
     change_cnt_on: bool,

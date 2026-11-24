@@ -29,6 +29,7 @@
 use crate::ast::Privilege;
 use crate::namespace::NamespaceId;
 use crate::translate::collate::CollationSeq;
+use crate::translate::{build_program, new_program_builder};
 use std::num::NonZero;
 use std::sync::Arc;
 
@@ -437,7 +438,9 @@ fn build_blob_program(
     rowid: i64,
     read_write: bool,
 ) -> Result<crate::vdbe::Program> {
-    let mut b = ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 64, 16));
+    let mut b = new_program_builder(conn, || {
+        ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 64, 16))
+    })?;
     b.prologue();
     if read_write {
         b.begin_write_operation()
@@ -564,6 +567,6 @@ fn build_blob_program(
     b.preassign_label_to_next_insn(l_end);
 
     conn.with_schema_mut(|schema| b.epilogue(schema))?;
-    b.build(conn, false, "incremental blob io")
+    build_program(b, conn, false, "incremental blob io")
         .map_err(|e| LimboError::InternalError(format!("blob program build failed: {e}")))
 }

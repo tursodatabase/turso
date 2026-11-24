@@ -8,7 +8,10 @@ use turso_core::{
     },
     SessionRole,
 };
-use turso_core::{ConnectOpts, Connection, Database, LimboError, MemoryIO, StepResult, IO};
+use turso_core::{
+    ConnectOpts, Connection, Database, DatabaseOpts, LimboError, MemoryIO, OpenFlags, StepResult,
+    IO,
+};
 use turso_sqlite::SqliteDialect;
 
 /// The statement allocator of a database uses `TursoAllocator` by default, so
@@ -20,7 +23,15 @@ fn statement_allocation_sites_fail_only_the_statement() {
     unsafe { set_allocator(&BACKEND).unwrap() };
     #[allow(clippy::arc_with_non_send_sync)]
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, "statement-site-fault.db", Arc::new(SqliteDialect)).unwrap();
+    let db = Database::open_file_with_flags(
+        io,
+        "statement-site-fault.db",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_views(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
@@ -33,6 +44,10 @@ fn statement_allocation_sites_fail_only_the_statement() {
         "CREATE TABLE child(pid REFERENCES parent(id) ON DELETE CASCADE)",
         "INSERT INTO parent VALUES (1)",
         "INSERT INTO child VALUES (1)",
+        "CREATE TABLE b(data BLOB)",
+        "INSERT INTO b VALUES (zeroblob(4))",
+        "CREATE TABLE w(z)",
+        "CREATE MATERIALIZED VIEW mv AS SELECT z FROM w",
     ] {
         conn.execute(sql).unwrap();
     }
@@ -44,6 +59,24 @@ fn statement_allocation_sites_fail_only_the_statement() {
     };
     assert!(matches!(err, LimboError::OutOfMemory), "{err}");
     disarm_fault();
+
+    // The opening of a blob handle fails when it makes the builder of its
+    // program.
+    arm_fault(StatementAllocationSite::ProgramBuilder);
+    let Err(err) = conn.blob_open("b", "data", 1, false) else {
+        panic!("the opening of the blob handle must fail");
+    };
+    assert!(matches!(err, LimboError::OutOfMemory), "{err}");
+    disarm_fault();
+
+    // The maintenance of a materialized view fails when it makes a builder, so
+    // the statement that changes the table of the view fails.
+    let mut stmt = conn.prepare("INSERT INTO w VALUES (1)").unwrap();
+    arm_fault(StatementAllocationSite::ProgramBuilder);
+    let err = stmt.run_ignore_rows().unwrap_err();
+    assert!(matches!(err, LimboError::OutOfMemory), "{err}");
+    disarm_fault();
+    drop(stmt);
 
     // The preparation of a statement fails when it makes the state of the
     // statement.
@@ -75,14 +108,18 @@ fn statement_allocation_sites_fail_only_the_statement() {
     // The failed statements changed nothing, and the connection continues to
     // work.
     conn.execute("INSERT INTO t VALUES (3)").unwrap();
+    conn.execute("INSERT INTO w VALUES (2)").unwrap();
     for (sql, expected) in [
         ("SELECT count(*) FROM t", 1),
         ("SELECT count(*) FROM u", 1),
         ("SELECT count(*) FROM parent", 1),
         ("SELECT count(*) FROM child", 1),
+        ("SELECT count(*) FROM w", 1),
+        ("SELECT count(*) FROM mv", 1),
     ] {
         assert_eq!(query_single_i64(&conn, sql), expected, "{sql}");
     }
+    drop(conn.blob_open("b", "data", 1, false).unwrap());
 }
 
 fn arm_fault(site: StatementAllocationSite) {

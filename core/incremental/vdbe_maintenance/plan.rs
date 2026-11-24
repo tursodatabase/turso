@@ -11,6 +11,7 @@ use crate::translate::collate::{first_collation, CollationSeq};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{expr_contains_nondeterministic_scalar_function, WalkControl};
 use crate::translate::expr_context::ExprContext;
+use crate::translate::new_program_builder;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::optimizer::unnest::rewrite_correlated_subqueries;
 use crate::translate::plan::{
@@ -984,13 +985,15 @@ pub(crate) fn plan_view(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<MaintenancePlan> {
-    let mut planner_program = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        None,
-        ProgramBuilderOpts::new(8, 32, 8),
-        connection.mvcc_enabled(),
-        0,
-    );
+    let mut planner_program = new_program_builder(connection, || {
+        ProgramBuilder::new_for_subprogram(
+            QueryMode::Normal,
+            None,
+            ProgramBuilderOpts::new(8, 32, 8),
+            connection.mvcc_enabled(),
+            0,
+        )
+    })?;
     let mut relational_plan = prepare_select_plan(
         select.clone(),
         resolver,

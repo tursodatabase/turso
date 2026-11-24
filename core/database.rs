@@ -210,12 +210,19 @@ pub struct DatabaseAllocators<
 > {
     pub mv_store: M,
     pub fts: F,
-    /// Allocator for the program builder and the state of each statement, and
-    /// for the values that the code of nested trigger and foreign key action
-    /// programs keeps in the heap and not on the stack, because this code
-    /// recurses one time for each level of nesting. The memory in the vectors
-    /// of the builders and the states, for example the registers and the
-    /// cursors, does not come from this allocator.
+    /// Allocator for these values of statements:
+    ///
+    /// - The state of each statement.
+    /// - The program builders of statements, blob handles, nested trigger
+    ///   programs and the maintenance of materialized views. The builders of
+    ///   foreign key action programs do not come from this allocator.
+    /// - The statement that executes a nested trigger or foreign key action
+    ///   program.
+    ///
+    /// The code of nested programs recurses one time for each level of
+    /// nesting, so it keeps its values in the heap and not on the stack. The
+    /// memory in the vectors of the builders and the states, for example the
+    /// registers and the cursors, does not come from this allocator.
     pub statement: S,
 }
 
