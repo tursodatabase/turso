@@ -844,6 +844,9 @@ expect @tursopg {
     1
 }
 
+# tursopg refuses at compile time with 0A000 because it cannot tell which types
+# have the operator.
+@compat-gap "operator:integer + interval"
 test integer-plus-interval-over-no-rows {
     CREATE TABLE t (i int);
     SELECT i + interval '1 day' FROM t;
@@ -851,6 +854,10 @@ test integer-plus-interval-over-no-rows {
 @sqlstate 42883
 expect error {
     operator does not exist: integer \+ interval
+}
+@sqlstate 0A000
+expect @tursopg error {
+    adding an interval is supported only for timestamp and timestamptz, not integer
 }
 
 # PostgreSQL compares a date with a timestamp as the timestamp at midnight of

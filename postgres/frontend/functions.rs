@@ -90,26 +90,23 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
 
 /// Refuses the left side of `+ interval` when it is not timestamp or
 /// timestamptz. `types` are the argument type names; the first is the left
-/// side. PostgreSQL has the operator for date, time, timetz and interval, which
-/// tursopg does not support (0A000), and none for other types (42883). The
-/// translator turns `-` into `+` of the negated interval, so the message
-/// always says `+`.
-// FIXME(pg-catalog): the check runs at compile time now, but the list of
-// types is still written by hand. A pg_operator lookup replaces it.
+/// side. Every other type gets 0A000, including the ones that have no operator
+/// in PostgreSQL (which gives 42883), because the type name does not say
+/// whether PostgreSQL has one. The translator turns `-` into `+` of the
+/// negated interval, so the message always says `+`.
+// FIXME(pg-catalog): tursopg refuses every other left type with 0A000 because
+// it cannot tell which have a PostgreSQL operator. Some do, such as date, and
+// an untyped literal or NULL is resolved by PostgreSQL to a type that does. A
+// pg_operator lookup replaces this.
 fn check_timestamp_plus_interval_types(types: &[String]) -> Result<()> {
     let time_type = types[0].as_str();
     match time_type {
         "timestamp" | "timestamptz" => Ok(()),
-        "date" | "time" | "timetz" | "interval" => Err(sqlstate_error(
+        _ => Err(sqlstate_error(
             SQLSTATE_FEATURE_NOT_SUPPORTED,
             format!(
                 "adding an interval is supported only for timestamp and timestamptz, not {time_type}"
             ),
-            None,
-        )),
-        _ => Err(sqlstate_error(
-            SQLSTATE_UNDEFINED_FUNCTION,
-            format!("operator does not exist: {time_type} + interval"),
             None,
         )),
     }

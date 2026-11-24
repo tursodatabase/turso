@@ -170,7 +170,7 @@ test untyped-literal-minus-interval {
 expect error {
     invalid input syntax for type interval: "2026-01-01"
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
 }
 
@@ -303,8 +303,9 @@ expect @tursopg error {
     an interval in an index expression is not supported
 }
 
-# The translator turns `-` into `+` of the negated interval, so tursopg names
-# the wrong operator in its message.
+# tursopg refuses at compile time with 0A000 because it cannot tell which types
+# have the operator.
+@compat-gap "operator:text - interval"
 test text-column-minus-interval {
     CREATE TABLE t (a text);
     INSERT INTO t VALUES ('2026-01-01');
@@ -314,9 +315,22 @@ test text-column-minus-interval {
 expect error {
     operator does not exist: text - interval
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {
-    operator does not exist: text \+ interval
+    adding an interval is supported only for timestamp and timestamptz, not text
+}
+
+# PostgreSQL resolves NULL as an interval-compatible type and returns NULL.
+@compat-gap "operator:unknown + interval"
+test null-plus-interval {
+    SELECT (NULL + interval '1 day') IS NULL;
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    adding an interval is supported only for timestamp and timestamptz, not null
 }
 
 @compat-gap "function:coalesce"
