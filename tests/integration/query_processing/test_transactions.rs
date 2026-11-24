@@ -193,6 +193,218 @@ fn test_txn_error_doesnt_rollback_txn(tmp_db: TempDatabase) -> Result<()> {
     Ok(())
 }
 
+/// A CREATE TABLE AS SELECT that stores the table and changes the schema,
+/// then fails on the overflow of abs().
+const FAILING_DDL: &str = "CREATE TABLE gone AS SELECT abs(-9223372036854775807 - 1) AS v";
+
+/// Runs [`FAILING_DDL`] and checks its error.
+fn run_failing_ddl(conn: &Arc<Connection>) {
+    let err = conn.execute(FAILING_DDL).unwrap_err();
+    assert!(err.to_string().contains("integer overflow"), "{err}");
+}
+
+/// The names of the tables that `conn` has, by name.
+fn table_names(conn: &Arc<Connection>) -> Vec<String> {
+    let rows: Vec<(String,)> = conn.exec_rows(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' \
+         AND name NOT LIKE '\\_\\_turso\\_internal\\_%' ESCAPE '\\' ORDER BY name",
+    );
+    rows.into_iter().map(|(name,)| name).collect()
+}
+
+/// Asserts that `conn` has exactly the tables `expected`, that each one
+/// can be read, and that the failed table can not.
+fn assert_tables(conn: &Arc<Connection>, expected: &[&str]) {
+    assert_eq!(table_names(conn), expected);
+    for name in expected {
+        conn.execute(format!("SELECT * FROM {name}")).unwrap();
+    }
+    let err = conn.execute("SELECT * FROM gone").unwrap_err();
+    assert!(err.to_string().contains("no such table"), "{err}");
+}
+
+/// A DDL statement that fails after it changed the schema, in autocommit
+/// mode, leaves no table. A connection made before the statement shares the
+/// schema and sees the same.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE kept (x);")]
+fn test_failed_ddl_statement_in_autocommit_leaves_schema(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    let other = tmp_db.connect_limbo();
+    assert_tables(&other, &["kept"]);
+    run_failing_ddl(&conn);
+    assert_tables(&conn, &["kept"]);
+    assert_tables(&other, &["kept"]);
+    conn.execute("CREATE TABLE made (y)").unwrap();
+    assert_tables(&other, &["kept", "made"]);
+    assert_eq!(
+        query_scalar_text(&other, "PRAGMA integrity_check").unwrap(),
+        "ok"
+    );
+}
+
+/// A DDL statement that fails after it changed the schema, inside a
+/// transaction, is rolled back alone: the connection loses the new table,
+/// and the transaction goes on and commits.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE kept (x);")]
+fn test_failed_ddl_statement_in_transaction_restores_schema(tmp_db: TempDatabase) -> Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let other = tmp_db.connect_limbo();
+    assert_tables(&other, &["kept"]);
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO kept VALUES (1)")?;
+    conn.execute("CREATE TABLE early (y)")?;
+    run_failing_ddl(&conn);
+    assert_tables(&conn, &["early", "kept"]);
+    conn.execute("INSERT INTO kept VALUES (2)")?;
+    conn.execute("CREATE TABLE made (y)")?;
+    assert_tables(&other, &["kept"]);
+    conn.execute("COMMIT")?;
+
+    assert_tables(&other, &["early", "kept", "made"]);
+    assert_eq!(query_scalar_i64(&other, "SELECT sum(x) FROM kept")?, 3);
+    assert_eq!(query_scalar_text(&other, "PRAGMA integrity_check")?, "ok");
+    Ok(())
+}
+
+/// The same, with a ROLLBACK at the end: the transaction's other DDL goes
+/// too.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE kept (x);")]
+fn test_failed_ddl_statement_in_transaction_then_rollback(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    let other = tmp_db.connect_limbo();
+    assert_tables(&other, &["kept"]);
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE early (y)").unwrap();
+    run_failing_ddl(&conn);
+    assert_tables(&conn, &["early", "kept"]);
+    conn.execute("ROLLBACK").unwrap();
+    assert_tables(&conn, &["kept"]);
+    assert_tables(&other, &["kept"]);
+    conn.execute("CREATE TABLE made (y)").unwrap();
+    assert_tables(&other, &["kept", "made"]);
+    assert_eq!(
+        query_scalar_text(&other, "PRAGMA integrity_check").unwrap(),
+        "ok"
+    );
+}
+
+/// A DDL statement that fails inside a SAVEPOINT is rolled back alone. The
+/// savepoint keeps the DDL before it until RELEASE, and ROLLBACK TO undoes
+/// that DDL, also inside a nested savepoint.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE kept (x);")]
+fn test_failed_ddl_statement_in_savepoint(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    let other = tmp_db.connect_limbo();
+    assert_tables(&other, &["kept"]);
+
+    conn.execute("SAVEPOINT outer_sp").unwrap();
+    conn.execute("CREATE TABLE early (y)").unwrap();
+    conn.execute("SAVEPOINT inner_sp").unwrap();
+    conn.execute("CREATE TABLE inner_t (y)").unwrap();
+    run_failing_ddl(&conn);
+    assert_tables(&conn, &["early", "inner_t", "kept"]);
+    conn.execute("ROLLBACK TO inner_sp").unwrap();
+    assert_tables(&conn, &["early", "kept"]);
+    run_failing_ddl(&conn);
+    assert_tables(&conn, &["early", "kept"]);
+    conn.execute("RELEASE inner_sp").unwrap();
+    assert_tables(&other, &["kept"]);
+    conn.execute("RELEASE outer_sp").unwrap();
+    assert_tables(&conn, &["early", "kept"]);
+    assert_tables(&other, &["early", "kept"]);
+
+    conn.execute("SAVEPOINT sp").unwrap();
+    conn.execute("CREATE TABLE undone (y)").unwrap();
+    run_failing_ddl(&conn);
+    assert_tables(&conn, &["early", "kept", "undone"]);
+    conn.execute("ROLLBACK TO sp").unwrap();
+    assert_tables(&conn, &["early", "kept"]);
+    conn.execute("RELEASE sp").unwrap();
+    assert_tables(&conn, &["early", "kept"]);
+    assert_tables(&other, &["early", "kept"]);
+    assert_eq!(
+        query_scalar_text(&other, "PRAGMA integrity_check").unwrap(),
+        "ok"
+    );
+}
+
+/// A DDL statement that fails while another statement of the connection
+/// reads, inside a transaction: the reader goes on, and the schema loses
+/// only the failed table.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE kept (x);")]
+fn test_failed_ddl_statement_while_another_statement_reads(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    let other = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO kept VALUES (1), (2), (3)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let mut reader = conn
+        .query("SELECT x FROM kept ORDER BY x")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(reader.step().unwrap(), StepResult::Row));
+    run_failing_ddl(&conn);
+    let mut values = vec![reader.row().unwrap().get::<i64>(0).unwrap()];
+    loop {
+        match reader.step().unwrap() {
+            StepResult::Row => values.push(reader.row().unwrap().get::<i64>(0).unwrap()),
+            StepResult::Done => break,
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            other => panic!("unexpected step result {other:?}"),
+        }
+    }
+    drop(reader);
+    assert_eq!(values, vec![1, 2, 3]);
+    assert_tables(&conn, &["kept"]);
+    conn.execute("CREATE TABLE made (y)").unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert_tables(&other, &["kept", "made"]);
+    assert_eq!(
+        query_scalar_text(&other, "PRAGMA integrity_check").unwrap(),
+        "ok"
+    );
+}
+
+/// Statements prepared before a DDL statement fails inside a transaction
+/// run after it against the schema without the failed table: a DDL
+/// statement and a COMMIT that run first after the failure.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE kept (x);")]
+fn test_failed_ddl_statement_then_statements_prepared_before(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    let other = tmp_db.connect_limbo();
+    assert_tables(&other, &["kept"]);
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE early (y)").unwrap();
+    let mut create = conn.prepare("CREATE TABLE made (y)").unwrap();
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    run_failing_ddl(&conn);
+    create.run_ignore_rows().unwrap();
+    commit.run_ignore_rows().unwrap();
+    assert_tables(&conn, &["early", "kept", "made"]);
+    assert_tables(&other, &["early", "kept", "made"]);
+    assert_eq!(
+        query_scalar_text(&other, "PRAGMA integrity_check").unwrap(),
+        "ok"
+    );
+}
+
+/// A COMMIT right after a DDL statement failed inside a transaction keeps
+/// the transaction's other DDL and not the failed table.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE kept (x);")]
+fn test_failed_ddl_statement_then_commit(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    let other = tmp_db.connect_limbo();
+    assert_tables(&other, &["kept"]);
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE early (y)").unwrap();
+    run_failing_ddl(&conn);
+    conn.execute("COMMIT").unwrap();
+    assert_tables(&other, &["early", "kept"]);
+    assert_tables(&conn, &["early", "kept"]);
+    let third = tmp_db.connect_limbo();
+    assert_tables(&third, &["early", "kept"]);
+}
+
 fn query_scalar_i64(conn: &Arc<Connection>, sql: &str) -> Result<i64> {
     let mut stmt = conn.query(sql)?.unwrap();
     match stmt.step()? {
