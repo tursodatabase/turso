@@ -287,7 +287,7 @@ pub struct ValueKinds {
 /// or SQLite's operator when `func` is `None`.
 #[derive(Debug, Clone)]
 pub struct OperatorSignature {
-    /// One of [BINARY_OPERATORS] or [PREFIX_OPERATORS].
+    /// One of [BINARY_OPERATORS], [PREFIX_OPERATORS] or [CONCAT_OPERATOR].
     pub op: &'static str,
     /// One operand for a prefix operator, two for a binary one.
     pub args: std::vec::Vec<OperatorArg>,
@@ -316,12 +316,22 @@ pub enum OperatorArg {
     /// the `0.5` of `(SELECT 0.5)`, is not one: as in PostgreSQL, it is an
     /// exact number.
     Real,
+    /// A string literal or a parameter, which takes this type as an operand of
+    /// unknown type does in PostgreSQL. It is read as a value of this type
+    /// before the call: stored as a column of the type stores it, and read
+    /// back.
+    Untyped,
 }
 
 /// The operators whose function an operand's custom type decides. Comparisons
 /// are decided separately, and unary `+` gives its operand unchanged.
 pub const BINARY_OPERATORS: [&str; 9] = ["+", "-", "*", "/", "%", "&", "|", "<<", ">>"];
 pub const PREFIX_OPERATORS: [&str; 2] = ["-", "~"];
+
+/// `||`, which an operand's custom type decides only when the type has a
+/// signature for it. With an operand of another type, `||` stays SQLite's
+/// `||`, which joins text, or the `||` of arrays.
+pub const CONCAT_OPERATOR: &str = "||";
 
 /// SQLite's binary operator `op` on a value of the type and an operand `other`.
 pub(crate) fn sqlite_operator(op: &'static str, other: OperatorArg) -> [OperatorSignature; 2] {
@@ -1439,6 +1449,47 @@ impl SchemaBuilder {
             self = self.type_def(alias, Arc::clone(&type_def));
         }
         Ok(self.type_def(ty.name(), type_def))
+    }
+
+    /// Gives the built-in type `name` the operator signatures `signatures`,
+    /// which are tried before the signatures that the type has. Thus a dialect
+    /// gives a type of core operators that run functions of the dialect. Every
+    /// name of the type then names the type with the new signatures.
+    pub fn builtin_type_operator_signatures(
+        mut self,
+        name: &str,
+        signatures: std::vec::Vec<OperatorSignature>,
+    ) -> crate::Result<Self> {
+        let Some(registered) = self.schema.type_registry.get(&name.to_lowercase()) else {
+            return Err(crate::LimboError::InternalError(format!(
+                "no built-in type is named {name}"
+            )));
+        };
+        let registered = Arc::clone(registered);
+        let mut type_def = TypeDef::clone(&registered);
+        let TypeDefKind::Custom {
+            operator_signatures,
+            ..
+        } = &mut type_def.kind
+        else {
+            return Err(crate::LimboError::InternalError(format!(
+                "the type {name} has no operators"
+            )));
+        };
+        if !type_def.is_builtin {
+            return Err(crate::LimboError::InternalError(format!(
+                "the type {name} is not built in"
+            )));
+        }
+        let own_signatures = std::mem::take(operator_signatures);
+        *operator_signatures = signatures.into_iter().chain(own_signatures).collect();
+        let type_def = Arc::new(type_def);
+        for registered_type in self.schema.type_registry.values_mut() {
+            if Arc::ptr_eq(registered_type, &registered) {
+                *registered_type = Arc::clone(&type_def);
+            }
+        }
+        Ok(self)
     }
 
     /// Adds the type `type_def` under `name`. A type can have several names.

@@ -1063,3 +1063,100 @@ fn test_pg_key_and_path_operators_with_parameters(db: TempDatabase) {
         );
     }
 }
+
+#[turso_macros::test(mvcc)]
+fn test_pg_jsonb_concat_and_delete_with_parameters(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE items (id int PRIMARY KEY, data jsonb)")
+        .unwrap();
+    conn.execute(r#"INSERT INTO items VALUES (1, '{"a":1,"b":2}'), (2, '["x","y"]')"#)
+        .unwrap();
+    let param = |index| std::num::NonZero::new(index).unwrap();
+
+    for (sql, value, expected) in [
+        // A parameter without a type on a side of || is read as jsonb.
+        (
+            "SELECT data || $1 FROM items WHERE id = 1",
+            Value::build_text(r#"{"c": 3}"#),
+            r#"{"a":1,"b":2,"c":3}"#,
+        ),
+        (
+            "SELECT $1 || data FROM items WHERE id = 2",
+            Value::build_text("[0]"),
+            r#"[0,"x","y"]"#,
+        ),
+        (
+            "SELECT data || $1 FROM items WHERE id = 2",
+            Value::from_i64(5),
+            r#"["x","y",5]"#,
+        ),
+        // The kind of the value of the right operand of - chooses what it
+        // deletes.
+        (
+            "SELECT data - $1 FROM items WHERE id = 1",
+            Value::build_text("a"),
+            r#"{"b":2}"#,
+        ),
+        (
+            "SELECT data - $1 FROM items WHERE id = 2",
+            Value::from_i64(-1),
+            r#"["x"]"#,
+        ),
+        (
+            "SELECT data - $1::text[] FROM items WHERE id = 1",
+            Value::build_text("{a,b}"),
+            "{}",
+        ),
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.bind_at(param(1), value.clone()).unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::build_text(expected)]],
+            "{sql} with $1 = {value}"
+        );
+    }
+}
+
+/// The schema is read again when the database opens, and the PostgreSQL
+/// frontend gives jsonb its operators again then. An index on the result of
+/// an operator stays valid through writes and the reopen.
+#[turso_macros::test]
+fn test_pg_jsonb_operators_in_index_expressions(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE items (id int PRIMARY KEY, data jsonb)")
+        .unwrap();
+    conn.execute("CREATE INDEX items_rest ON items ((data - 'a'))")
+        .unwrap();
+    conn.execute(r#"CREATE INDEX items_more ON items ((data || '{"z":0}'))"#)
+        .unwrap();
+    conn.execute(r#"INSERT INTO items VALUES (1, '{"a":1,"b":2}'), (2, '{"a":3,"c":4}')"#)
+        .unwrap();
+    conn.execute(r#"UPDATE items SET data = data || '{"d":5}' WHERE id = 2"#)
+        .unwrap();
+    conn.execute("DELETE FROM items WHERE id = 1").unwrap();
+    let integrity_check = |conn: &turso_pg::Connection| {
+        let mut rows = conn.inner().prepare("PRAGMA integrity_check").unwrap();
+        let StepResult::Row = rows.step().unwrap() else {
+            panic!("expected a row");
+        };
+        rows.row().unwrap().get_value(0).to_string()
+    };
+    assert_eq!(integrity_check(&conn), "ok");
+    drop(conn);
+
+    let db = db.reopen();
+    let conn = db.connect_postgres();
+    assert_eq!(
+        query_integer(
+            &conn,
+            r#"SELECT id FROM items WHERE data - 'a' = '{"c":4,"d":5}'"#
+        ),
+        vec![2]
+    );
+    assert_eq!(
+        query_text(&conn, r#"SELECT data || '{"z":0}' FROM items"#),
+        vec![r#"{"a":3,"c":4,"d":5,"z":0}"#.to_string()]
+    );
+    assert_eq!(integrity_check(&conn), "ok");
+}

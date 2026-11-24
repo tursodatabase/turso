@@ -4,6 +4,7 @@
 //! relations.
 
 mod boolean;
+mod jsonb;
 
 use crate::session::relation_lookup_namespaces;
 use std::sync::Arc;
@@ -12,9 +13,11 @@ use turso_core::{Connection, Result};
 
 /// Adds the built-in types that PostgreSQL defines differently from core to
 /// `builder`. Each one replaces the type that core registered under the same
-/// name.
+/// name. jsonb keeps the type of core, with the operators of PostgreSQL.
 pub(crate) fn register_builtin_types(builder: SchemaBuilder) -> Result<SchemaBuilder> {
-    builder.builtin_type(&boolean::Boolean)
+    builder
+        .builtin_type(&boolean::Boolean)?
+        .builtin_type_operator_signatures("jsonb", jsonb::operator_signatures())
 }
 
 // FIXME(pg-catalog): three places that do not know about each other say what

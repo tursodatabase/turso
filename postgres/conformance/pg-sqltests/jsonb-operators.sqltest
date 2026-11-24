@@ -943,3 +943,277 @@ test jsonb-has-key-in-row-security-policy {
 expect {
     1
 }
+
+# || and -
+
+# The tests that follow compare a result with a jsonb value or read one of its
+# fields, so that they do not depend on A-45, where tursopg writes jsonb
+# without the spaces of PostgreSQL. A comparison is cast to int, because of
+# B-04.
+
+@setup items_with_jsonb_rows
+test jsonb-concat-adds-fields {
+    SELECT (data || '{"qty":99,"new":true}') ->> 'qty', (data || '{"qty":99,"new":true}') ->> 'new', (data || '{"qty":99}') ->> 'name' FROM items WHERE id = 1;
+}
+expect {
+    99|true|apple
+}
+
+# Of two fields with the same name, the field of the right object counts.
+test jsonb-concat-of-objects {
+    SELECT ('{"a":1,"b":2}'::jsonb || '{"a":3,"c":4}' = '{"a":3,"b":2,"c":4}')::int, ('{"a":1}'::jsonb || '{"a":2}' = '{"a":2}')::int, '{}'::jsonb || '{}';
+}
+expect {
+    1|1|{}
+}
+
+test jsonb-concat-of-arrays {
+    SELECT ('[1,2]'::jsonb || '[2,3]' = '[1,2,2,3]')::int, ('[1]'::jsonb || '[[2]]' = '[1,[2]]')::int, '[]'::jsonb || '[]';
+}
+expect {
+    1|1|[]
+}
+
+# A value that is not an array counts as an array with one element.
+test jsonb-concat-of-other-values {
+    SELECT ('[1]'::jsonb || '2' = '[1,2]')::int, ('{"a":1}'::jsonb || '[2]' = '[{"a":1},2]')::int, ('[2]'::jsonb || '{"a":1}' = '[2,{"a":1}]')::int, ('1'::jsonb || '"x"' = '[1,"x"]')::int, '{}'::jsonb || '[]', '[]'::jsonb || '1';
+}
+expect {
+    1|1|1|1|[{}]|[1]
+}
+
+# Only the top level is joined.
+test jsonb-concat-joins-only-the-top-level {
+    SELECT ('{"a":{"b":1}}'::jsonb || '{"a":{"c":2}}') -> 'a' ->> 'c', coalesce(('{"a":{"b":1}}'::jsonb || '{"a":{"c":2}}') -> 'a' ->> 'b', 'none');
+}
+expect {
+    2|none
+}
+
+# A string literal on the other side is read as jsonb, also on the left.
+test jsonb-concat-reads-a-string-literal-as-jsonb {
+    SELECT ('[1]' || '[2]'::jsonb = '[1,2]')::int, ('{"a":1}'::jsonb || '{"b": 2}' = '{"a":1,"b":2}')::int;
+}
+expect {
+    1|1
+}
+
+test jsonb-concat-of-invalid-json-literal-errors {
+    SELECT '[1]'::jsonb || 'not json';
+}
+@sqlstate 22P02
+expect error {}
+
+# A value of type text on the other side is joined as text.
+test jsonb-concat-of-text-joins-text {
+    SELECT '[1]'::jsonb || 'x'::text, 'x'::text || '[1]'::jsonb;
+}
+expect {
+    [1]x|x[1]
+}
+
+test jsonb-concat-of-null-is-null {
+    SELECT coalesce(('[1]'::jsonb || NULL)::text, 'none'), coalesce((NULL || '[1]'::jsonb)::text, 'none');
+}
+expect {
+    none|none
+}
+
+# The result is jsonb, so the operators of jsonb run on it.
+test jsonb-concat-result-is-jsonb {
+    SELECT ('[1]'::jsonb || '[2]' || '[3]' = '[1,2,3]')::int, (('{"a":1}'::jsonb || '{"b":2}') - 'a') ->> 'b', ('{"a":1}'::jsonb || '{"b":2}') ? 'b';
+}
+expect {
+    1|2|t
+}
+
+@setup items_with_jsonb_rows
+test jsonb-concat-in-update {
+    UPDATE items SET data = data || '{"qty":3}' WHERE id = 2;
+    SELECT data ->> 'qty', data ->> 'name' FROM items WHERE id = 2;
+}
+expect {
+    3|bread
+}
+
+test jsonb-concat-function {
+    SELECT (jsonb_concat('{"a":1}', '{"b":2}') = '{"a":1,"b":2}')::int;
+}
+expect {
+    1
+}
+
+@setup items_with_jsonb_rows
+test jsonb-delete-key {
+    SELECT coalesce((data - 'name') ->> 'name', 'none'), (data - 'name') ->> 'qty' FROM items WHERE id = 1;
+}
+expect {
+    none|10
+}
+
+# A text deletes the string elements of an array that are equal to it, and
+# only at the top level.
+test jsonb-delete-string-elements {
+    SELECT ('["a","b","a",1]'::jsonb - 'a' = '["b",1]')::int, '["1",1]'::jsonb - '1', '["a",["a"]]'::jsonb - 'a', ('{"a":1,"b":{"a":2}}'::jsonb - 'a' = '{"b":{"a":2}}')::int;
+}
+expect {
+    1|[1]|[["a"]]|1
+}
+
+# A negative index counts from the end. An index past either end deletes
+# nothing.
+test jsonb-delete-element {
+    SELECT '[1,2]'::jsonb - 0, '[1,2]'::jsonb - -1, ('[1,2]'::jsonb - 2 = '[1,2]')::int, ('[1,2]'::jsonb - -3 = '[1,2]')::int, ('[1,2,3]'::jsonb - (-2147483648) = '[1,2,3]')::int;
+}
+expect {
+    [2]|[1]|1|1|1
+}
+
+# A text array deletes each of its elements, and a NULL element deletes
+# nothing. A string literal is a text, not a text array.
+test jsonb-delete-keys {
+    SELECT '{"a":1,"b":2}'::jsonb - '{a,b}'::text[], '{"a":1,"b":2}'::jsonb - ARRAY['a','b'], ('{"a":1,"b":2}'::jsonb - ARRAY['a',NULL]) ->> 'b', ('{"a":1,"b":2}'::jsonb - '{a,b}' = '{"a":1,"b":2}')::int, '["a","b"]'::jsonb - ARRAY['a','b'];
+}
+expect {
+    {}|{}|2|1|[]
+}
+
+test jsonb-delete-from-empty-value {
+    SELECT '[]'::jsonb - 0, '[]'::jsonb - 'a', '{}'::jsonb - 'a', '{}'::jsonb - '{a}'::text[];
+}
+expect {
+    []|[]|{}|{}
+}
+
+test jsonb-delete-of-null-is-null {
+    SELECT coalesce(('{"a":1}'::jsonb - NULL::text)::text, 'none'), coalesce(('[1]'::jsonb - NULL::int)::text, 'none'), coalesce((NULL::jsonb - 'a')::text, 'none');
+}
+expect {
+    none|none|none
+}
+
+test jsonb-delete-from-scalar-errors {
+    SELECT '"a"'::jsonb - 'a';
+}
+@sqlstate 22023
+expect error {}
+
+test jsonb-delete-index-from-object-errors {
+    SELECT '{}'::jsonb - 0;
+}
+@sqlstate 22023
+expect error {}
+
+test jsonb-delete-of-two-dimensional-array-errors {
+    SELECT '{"a":1}'::jsonb - ARRAY[ARRAY['a']];
+}
+@sqlstate 2202E
+expect error {}
+
+# PostgreSQL has `jsonb - integer`, and no `jsonb - numeric` or
+# `jsonb - bigint`.
+test jsonb-delete-of-decimal-errors {
+    SELECT '[1]'::jsonb - 1.5;
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-bigint-errors {
+    SELECT '[1]'::jsonb - 3000000000;
+}
+@sqlstate 42883
+expect error {}
+
+@setup items_with_jsonb_rows
+test jsonb-delete-in-update {
+    UPDATE items SET data = data - 'dims' - 'tags' WHERE id = 1;
+    SELECT coalesce(data ->> 'dims', 'none'), coalesce(data ->> 'tags', 'none'), data ->> 'qty' FROM items WHERE id = 1;
+}
+expect {
+    none|none|10
+}
+
+test jsonb-delete-function {
+    SELECT jsonb_delete('{"a":1,"b":2,"c":3}', 'a', 'b') ->> 'c', jsonb_delete('[1,2]', 0);
+}
+expect {
+    3|[2]
+}
+
+# Core runs || and - on jsonb values, so an index expression can use them.
+@setup items_with_jsonb_rows
+test jsonb-concat-and-delete-in-index-expressions {
+    CREATE INDEX items_without_name ON items ((data - 'name'));
+    CREATE INDEX items_with_flag ON items ((data || '{"flag":1}'));
+    UPDATE items SET data = data || '{"qty":5}' WHERE id = 2;
+    SELECT id FROM items WHERE data - 'name' = '{"price":2,"qty":5,"active":false,"tags":["bakery"],"dims":{"w":20,"h":10},"note":null}' OR (data || '{"flag":1}') ->> 'qty' = '10' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# Known differences of || and -
+
+# tursopg joins text for a value that is not jsonb, such as an integer, where
+# PostgreSQL has no `jsonb || integer`.
+@compat-gap "operator:jsonb || int4"
+test jsonb-concat-of-integer {
+    SELECT '[1]'::jsonb || 5;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    [1]5
+}
+
+# A cast to json is a cast to text in tursopg, so || joins text.
+@compat-gap "operator:jsonb || json"
+test jsonb-concat-of-json {
+    SELECT '[1]'::jsonb || '[2]'::json;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    [1][2]
+}
+
+# The error of an operator that a type does not have reports 42601 in
+# tursopg.
+@compat-gap "operator:jsonb - jsonb"
+test jsonb-delete-of-jsonb-errors {
+    SELECT '{"a":1}'::jsonb - '{"a":1}'::jsonb;
+}
+@sqlstate 42883
+expect error {}
+@sqlstate 42601
+expect @tursopg error {}
+
+# The check of the types of a CHECK constraint does not know the operators
+# of custom types.
+@compat-gap "operator:jsonb - text"
+test jsonb-delete-in-check-constraint {
+    CREATE TABLE checked_rest (data jsonb CHECK (data - 'a' <> '{}'));
+    INSERT INTO checked_rest VALUES ('{"a":1,"b":2}');
+    SELECT count(*) FROM checked_rest;
+}
+expect {
+    1
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# A cast to jsonb in a generation expression is a cast to text (see
+# jsonb-cast-in-generated-column-is-a-cast-to-text), so - subtracts numbers.
+@compat-gap "type:jsonb"
+test jsonb-delete-in-generated-column-subtracts-numbers {
+    CREATE TABLE gen_rest (data text, rest text GENERATED ALWAYS AS (data::jsonb - 'a') STORED);
+    INSERT INTO gen_rest (data) VALUES ('[1]');
+    SELECT rest FROM gen_rest;
+}
+expect {
+    [1]
+}
+expect @tursopg {
+    0
+}
