@@ -2933,6 +2933,10 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parses the joins that follow the first table of a FROM clause. This
+    /// function is not inlined, so that its values are not in the frame of
+    /// [Self::parse_from_clause] while the first table is parsed.
+    #[inline(never)]
     fn parse_joined_tables(&mut self) -> Result<Vec<JoinedSelectTable>> {
         let mut result = vec![];
         while let Some(tok) = self.peek()? {
@@ -2983,107 +2987,34 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
 
-            let tok = peek_expect!(
-                self,
-                TK_ID,
-                TK_STRING,
-                TK_INDEXED,
-                TK_JOIN_KW,
-                TK_LP,
-                TK_LBRACKET,
-                TK_LATERAL
-            );
-
-            match tok.token_type.fallback_id_if_ok() {
-                TK_LATERAL => {
-                    let select = self.parse_lateral_subquery()?;
-                    let alias = self.parse_as()?;
-                    let on_using = self.parse_on_using()?;
-                    result.push(JoinedSelectTable {
-                        operator: op,
-                        table: Box::new(SelectTable::Select {
-                            select,
-                            alias,
-                            lateral: true,
-                        }),
-                        constraint: on_using,
-                    });
-                }
-                TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => {
-                    let name = self.parse_fullname(false)?;
-                    match self.peek()? {
-                        None => {
-                            result.push(JoinedSelectTable {
-                                operator: op,
-                                table: Box::new(SelectTable::Table(name, None, None)),
-                                constraint: None,
-                            });
-                        }
-                        Some(tok) => match tok.token_type {
-                            TK_LP => {
-                                eat_assert!(self, TK_LP);
-                                let exprs = self.parse_expr_list()?;
-                                eat_expect!(self, TK_RP);
-                                let alias = self.parse_as()?;
-                                let on_using = self.parse_on_using()?;
-                                result.push(JoinedSelectTable {
-                                    operator: op,
-                                    table: Box::new(SelectTable::TableCall(name, exprs, alias)),
-                                    constraint: on_using,
-                                });
-                            }
-                            _ => {
-                                let alias = self.parse_as()?;
-                                let indexed = self.parse_indexed()?;
-                                let on_using = self.parse_on_using()?;
-                                result.push(JoinedSelectTable {
-                                    operator: op,
-                                    table: Box::new(SelectTable::Table(name, alias, indexed)),
-                                    constraint: on_using,
-                                });
-                            }
-                        },
-                    }
-                }
-                TK_LP => {
-                    eat_assert!(self, TK_LP);
-                    match self.peek_no_eof()?.token_type {
-                        TK_SELECT | TK_WITH | TK_VALUES => {
-                            let select = self.parse_nested(Self::parse_select)?;
-                            eat_expect!(self, TK_RP);
-                            let alias = self.parse_as()?;
-                            let on_using = self.parse_on_using()?;
-                            result.push(JoinedSelectTable {
-                                operator: op,
-                                table: Box::new(SelectTable::Select {
-                                    select,
-                                    alias,
-                                    lateral: false,
-                                }),
-                                constraint: on_using,
-                            });
-                        }
-                        _ => {
-                            let fr = self.parse_nested(Self::parse_from_clause)?;
-                            eat_expect!(self, TK_RP);
-                            let alias = self.parse_as()?;
-                            let on_using = self.parse_on_using()?;
-                            result.push(JoinedSelectTable {
-                                operator: op,
-                                table: Box::new(SelectTable::Sub(fr, alias)),
-                                constraint: on_using,
-                            });
-                        }
-                    }
-                }
-                _ => unreachable!(),
-            }
+            let table = self.parse_select_table()?;
+            let constraint = self.parse_on_using()?;
+            result.push(JoinedSelectTable {
+                operator: op,
+                table,
+                constraint,
+            });
         }
 
         Ok(result)
     }
 
+    /// Parses a FROM clause: the first table or subquery, and the joins that
+    /// follow it.
     fn parse_from_clause(&mut self) -> Result<FromClause> {
+        let select = self.parse_select_table()?;
+        let joins = self.parse_joined_tables()?;
+        Ok(FromClause { select, joins })
+    }
+
+    /// Parses one table or subquery of a FROM clause, without the join
+    /// constraint that follows it.
+    ///
+    /// This function is on the stack one time for each level of nested queries
+    /// in FROM clauses. The tables are made in functions that are not inlined,
+    /// so that the large [SelectTable] values are not in this frame while a
+    /// nested query is parsed.
+    fn parse_select_table(&mut self) -> Result<Box<SelectTable>> {
         let tok = peek_expect!(
             self,
             TK_ID,
@@ -3095,72 +3026,21 @@ impl<'a> Parser<'a> {
             TK_LATERAL
         );
 
+        // The results of the nested parsers go to the functions that make the
+        // tables before they are unwrapped, so that this frame holds one copy.
         match tok.token_type.fallback_id_if_ok() {
-            TK_LATERAL => {
-                let select = self.parse_lateral_subquery()?;
-                let alias = self.parse_as()?;
-                Ok(FromClause {
-                    select: Box::new(SelectTable::Select {
-                        select,
-                        alias,
-                        lateral: true,
-                    }),
-                    joins: self.parse_joined_tables()?,
-                })
-            }
-            TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => {
-                let name = self.parse_fullname(false)?;
-                match self.peek()? {
-                    None => Ok(FromClause {
-                        select: Box::new(SelectTable::Table(name, None, None)),
-                        joins: vec![],
-                    }),
-                    Some(tok) => match tok.token_type {
-                        TK_LP => {
-                            eat_assert!(self, TK_LP);
-                            let exprs = self.parse_expr_list()?;
-                            eat_expect!(self, TK_RP);
-                            let alias = self.parse_as()?;
-                            Ok(FromClause {
-                                select: Box::new(SelectTable::TableCall(name, exprs, alias)),
-                                joins: self.parse_joined_tables()?,
-                            })
-                        }
-                        _ => {
-                            let alias = self.parse_as()?;
-                            let indexed = self.parse_indexed()?;
-                            Ok(FromClause {
-                                select: Box::new(SelectTable::Table(name, alias, indexed)),
-                                joins: self.parse_joined_tables()?,
-                            })
-                        }
-                    },
-                }
-            }
+            TK_LATERAL => self.parse_lateral_subquery_table(),
+            TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => self.parse_named_table(),
             TK_LP => {
                 eat_assert!(self, TK_LP);
                 match self.peek_no_eof()?.token_type {
                     TK_SELECT | TK_WITH | TK_VALUES => {
-                        let select = self.parse_nested(Self::parse_select)?;
-                        eat_expect!(self, TK_RP);
-                        let alias = self.parse_as()?;
-                        Ok(FromClause {
-                            select: Box::new(SelectTable::Select {
-                                select,
-                                alias,
-                                lateral: false,
-                            }),
-                            joins: self.parse_joined_tables()?,
-                        })
+                        let select = self.parse_nested(Self::parse_select);
+                        self.finish_subquery_table(select, 1, false)
                     }
                     _ => {
-                        let fr = self.parse_nested(Self::parse_from_clause)?;
-                        eat_expect!(self, TK_RP);
-                        let alias = self.parse_as()?;
-                        Ok(FromClause {
-                            select: Box::new(SelectTable::Sub(fr, alias)),
-                            joins: self.parse_joined_tables()?,
-                        })
+                        let from_clause = self.parse_nested(Self::parse_from_clause);
+                        self.finish_join_group_table(from_clause)
                     }
                 }
             }
@@ -3168,7 +3048,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_lateral_subquery(&mut self) -> Result<Select> {
+    /// Parses a LATERAL subquery of a FROM clause, with its alias.
+    #[inline(never)]
+    fn parse_lateral_subquery_table(&mut self) -> Result<Box<SelectTable>> {
         eat_assert!(self, TK_LATERAL);
         eat_assert!(self, TK_LP);
         let mut open_parentheses = 1;
@@ -3176,11 +3058,71 @@ impl<'a> Parser<'a> {
             eat_assert!(self, TK_LP);
             open_parentheses += 1;
         }
-        let select = self.parse_nested(Self::parse_select)?;
-        for _ in 0..open_parentheses {
+        let select = self.parse_nested(Self::parse_select);
+        self.finish_subquery_table(select, open_parentheses, true)
+    }
+
+    /// Parses a table or a table-valued function of a FROM clause, by name.
+    #[inline(never)]
+    fn parse_named_table(&mut self) -> Result<Box<SelectTable>> {
+        let name = self.parse_fullname(false)?;
+        match self.peek()? {
+            None => Ok(Box::new(SelectTable::Table(name, None, None))),
+            Some(tok) => match tok.token_type {
+                TK_LP => {
+                    eat_assert!(self, TK_LP);
+                    let exprs = self.parse_expr_list()?;
+                    eat_expect!(self, TK_RP);
+                    let alias = self.parse_as()?;
+                    Ok(Box::new(SelectTable::TableCall(name, exprs, alias)))
+                }
+                _ => {
+                    let alias = self.parse_as()?;
+                    let indexed = self.parse_indexed()?;
+                    Ok(Box::new(SelectTable::Table(name, alias, indexed)))
+                }
+            },
+        }
+    }
+
+    /// Makes the table of a subquery in a FROM clause from the result of the
+    /// parsing of its query. Then parses the `closing_parentheses` closing
+    /// parentheses and the alias that follow the query. This function is not
+    /// inlined, so that its values are not in the frame of
+    /// [Self::parse_select_table] while a nested query is parsed.
+    #[inline(never)]
+    fn finish_subquery_table(
+        &mut self,
+        select: Result<Select>,
+        closing_parentheses: usize,
+        lateral: bool,
+    ) -> Result<Box<SelectTable>> {
+        let select = select?;
+        for _ in 0..closing_parentheses {
             eat_expect!(self, TK_RP);
         }
-        Ok(select)
+        let alias = self.parse_as()?;
+        Ok(Box::new(SelectTable::Select {
+            select,
+            alias,
+            lateral,
+        }))
+    }
+
+    /// Makes the table of a parenthesized join group in a FROM clause from the
+    /// result of the parsing of the group. Then parses the closing parenthesis
+    /// and the alias that follow the group. This function is not inlined, so
+    /// that its values are not in the frame of [Self::parse_select_table]
+    /// while a nested query is parsed.
+    #[inline(never)]
+    fn finish_join_group_table(
+        &mut self,
+        from_clause: Result<FromClause>,
+    ) -> Result<Box<SelectTable>> {
+        let from_clause = from_clause?;
+        eat_expect!(self, TK_RP);
+        let alias = self.parse_as()?;
+        Ok(Box::new(SelectTable::Sub(from_clause, alias)))
     }
 
     /// Parses a query or a parenthesized FROM term that is nested in another
@@ -3291,6 +3233,12 @@ impl<'a> Parser<'a> {
         Ok(result)
     }
 
+    /// Parses one SELECT or VALUES term of a query.
+    ///
+    /// This function is on the stack one time for each level of nested queries
+    /// in FROM clauses. The work after the FROM clause, and the parsing of
+    /// VALUES, are in functions that are not inlined, so that their values are
+    /// not in this frame while a nested query is parsed.
     fn parse_one_select(&mut self) -> Result<OneSelect> {
         let tok = eat_expect!(self, TK_SELECT, TK_VALUES);
         match tok.token_type {
@@ -3298,45 +3246,61 @@ impl<'a> Parser<'a> {
                 let distinct = self.parse_select_distinct()?;
                 let collist = self.parse_select_columns()?;
                 let from = self.parse_from_clause_opt()?;
-                let where_clause = self.parse_where()?;
-                let group_by = self.parse_group_by()?;
-                let window_clause = self.parse_window_clause()?;
-                Ok(OneSelect::Select {
-                    distinctness: distinct,
-                    columns: collist,
-                    from,
-                    where_clause,
-                    group_by,
-                    window_clause,
-                })
+                self.finish_one_select(distinct, collist, from)
             }
-            TK_VALUES => {
-                eat_expect!(self, TK_LP);
-                let mut values = vec![self.parse_nexpr_list()?];
-                eat_expect!(self, TK_RP);
-
-                while let Some(tok) = self.peek()? {
-                    if tok.token_type == TK_COMMA {
-                        eat_assert!(self, TK_COMMA);
-                    } else {
-                        break;
-                    }
-
-                    eat_expect!(self, TK_LP);
-                    values.push(self.parse_nexpr_list()?);
-                    if values.last().unwrap().len() != values[0].len() {
-                        return Err(Error::Custom(
-                            "all VALUES must have the same number of terms".to_owned(),
-                        ));
-                    }
-
-                    eat_expect!(self, TK_RP);
-                }
-
-                Ok(OneSelect::Values(values))
-            }
+            TK_VALUES => self.parse_values(),
             _ => unreachable!(),
         }
+    }
+
+    /// Parses the clauses of a SELECT term that follow its FROM clause, and
+    /// makes the term.
+    #[inline(never)]
+    fn finish_one_select(
+        &mut self,
+        distinctness: Option<SelectDistinctness>,
+        columns: Vec<ResultColumn>,
+        from: Option<FromClause>,
+    ) -> Result<OneSelect> {
+        let where_clause = self.parse_where()?;
+        let group_by = self.parse_group_by()?;
+        let window_clause = self.parse_window_clause()?;
+        Ok(OneSelect::Select {
+            distinctness,
+            columns,
+            from,
+            where_clause,
+            group_by,
+            window_clause,
+        })
+    }
+
+    /// Parses the rows of a VALUES term, after the VALUES keyword.
+    #[inline(never)]
+    fn parse_values(&mut self) -> Result<OneSelect> {
+        eat_expect!(self, TK_LP);
+        let mut values = vec![self.parse_nexpr_list()?];
+        eat_expect!(self, TK_RP);
+
+        while let Some(tok) = self.peek()? {
+            if tok.token_type == TK_COMMA {
+                eat_assert!(self, TK_COMMA);
+            } else {
+                break;
+            }
+
+            eat_expect!(self, TK_LP);
+            values.push(self.parse_nexpr_list()?);
+            if values.last().unwrap().len() != values[0].len() {
+                return Err(Error::Custom(
+                    "all VALUES must have the same number of terms".to_owned(),
+                ));
+            }
+
+            eat_expect!(self, TK_RP);
+        }
+
+        Ok(OneSelect::Values(values))
     }
 
     fn parse_select_distinct(&mut self) -> Result<Option<SelectDistinctness>> {
@@ -3358,6 +3322,15 @@ impl<'a> Parser<'a> {
 
     fn parse_select_body(&mut self) -> Result<SelectBody> {
         let select = self.parse_one_select()?;
+        let compounds = self.parse_compound_selects()?;
+        Ok(SelectBody { select, compounds })
+    }
+
+    /// Parses the compound terms that follow the first term of a query. This
+    /// function is not inlined, so that its values are not in the frame of
+    /// [Self::parse_select_without_cte] while the first term is parsed.
+    #[inline(never)]
+    fn parse_compound_selects(&mut self) -> Result<Vec<CompoundSelect>> {
         let mut compounds = vec![];
         while let Some(tok) = self.peek()? {
             let op = match tok.token_type {
@@ -3393,7 +3366,7 @@ impl<'a> Parser<'a> {
             });
         }
 
-        Ok(SelectBody { select, compounds })
+        Ok(compounds)
     }
 
     fn parse_sorted_column(&mut self) -> Result<SortedColumn> {
@@ -3495,8 +3468,24 @@ impl<'a> Parser<'a> {
         }))
     }
 
+    /// Parses a query after its WITH clause.
+    ///
+    /// This function is on the stack one time for each level of nested
+    /// queries. The work after the body of the query is in
+    /// [Self::finish_select], which is not inlined, so that its values are not
+    /// in this frame while a nested query is parsed.
     fn parse_select_without_cte(&mut self, with: Option<With>) -> Result<Select> {
-        let body = self.parse_select_body()?;
+        // The body goes to finish_select before it is unwrapped, so that this
+        // frame holds one copy of it.
+        let body = self.parse_select_body();
+        self.finish_select(with, body)
+    }
+
+    /// Makes a query from the result of the parsing of its body. Then parses
+    /// the ORDER BY and LIMIT clauses that follow the body.
+    #[inline(never)]
+    fn finish_select(&mut self, with: Option<With>, body: Result<SelectBody>) -> Result<Select> {
+        let body = body?;
         let order_by = self.parse_order_by()?;
         let limit = self.parse_limit()?;
         if !order_by.is_empty() || limit.is_some() {
