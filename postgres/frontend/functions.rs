@@ -2201,22 +2201,9 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 ))
             }
         }
-        "bytea" => {
-            // Accept \x hex format
-            if let Some(hex) = trimmed.strip_prefix("\\x") {
-                if hex.len() % 2 == 0 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                    None
-                } else {
-                    Some((
-                        format!("invalid input syntax for type bytea: \"{input}\""),
-                        "22P02".to_string(),
-                    ))
-                }
-            } else {
-                // Plain text is valid bytea input (escape format)
-                None
-            }
-        }
+        "bytea" => crate::pg_type::parse_pg_bytea(input)
+            .err()
+            .map(|error| (error.message, error.sqlstate.to_string())),
         "inet" | "cidr" => {
             // Accept IP address with optional /prefix
             let addr_part = trimmed.split('/').next().unwrap_or(trimmed);
