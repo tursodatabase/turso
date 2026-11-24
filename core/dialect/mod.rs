@@ -587,16 +587,6 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// FIXME(pg-catalog): This hand-codes the pg_cast entry from integer to boolean (function bool(integer)). pg_cast has no entry from smallint or bigint to boolean, but this cast applies to every integer value. A lookup in a pg_cast table replaces this.
-    /// Whether a cast of an integer to the built-in `boolean` type gives
-    /// true for every nonzero integer.
-    ///
-    /// PostgreSQL's integer-to-boolean cast does. Otherwise the cast uses the
-    /// type's ENCODE, which accepts only 0 and 1.
-    fn casts_nonzero_integer_to_true(&self) -> bool {
-        false
-    }
-
     /// FIXME(pg-catalog): This hand-codes the absence of pg_cast entries from date, timestamp, json and inet to numbers, booleans and bytea. A lookup in a pg_cast table replaces this.
     /// Whether a CAST from a custom type that reads text and has an ENCODE
     /// (such as date, timestamp, json or inet) is refused when its target does
