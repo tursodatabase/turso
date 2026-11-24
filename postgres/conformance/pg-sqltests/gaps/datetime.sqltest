@@ -348,7 +348,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-@compat-gap "type:interval"
+@compat-gap "function:pg_typeof"
 test now-minus-interval-days {
     SELECT pg_typeof(now() - interval '7 days');
     SELECT count(*) FROM (SELECT 1) AS one WHERE (now() - interval '7 days') < now() + interval '1000 years';
@@ -357,7 +357,7 @@ expect {
     timestamp with time zone
     1
 }
-@sqlstate 0A000
+@sqlstate 42883
 expect @tursopg error {}
 
 @compat-gap "type:interval"
@@ -842,6 +842,22 @@ test in-values-mixing-integer-and-timestamp {
 expect error {}
 expect @tursopg {
     1
+}
+
+# tursopg refuses at compile time with 0A000 because it cannot tell which types
+# have the operator.
+@compat-gap "operator:integer + interval"
+test integer-plus-interval-over-no-rows {
+    CREATE TABLE t (i int);
+    SELECT i + interval '1 day' FROM t;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: integer \+ interval
+}
+@sqlstate 0A000
+expect @tursopg error {
+    adding an interval is supported only for timestamp and timestamptz, not integer
 }
 
 # PostgreSQL compares a date with a timestamp as the timestamp at midnight of

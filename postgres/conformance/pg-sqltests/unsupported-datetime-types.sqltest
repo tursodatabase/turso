@@ -26,7 +26,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    type "interval" is not supported
+    type "interval" is not supported, except in a timestamp plus or minus an interval literal, such as now\(\) - interval '7 days'
 }
 
 @compat-gap "type:timetz"

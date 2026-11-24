@@ -14,6 +14,7 @@ use turso_core::{
     exec_temporal_encode, Connection, Decimal, ExternalFunc, IOResult, LimboError, Numeric,
     OpenOptions, Register, Result, Value, WallClockInstant,
 };
+use turso_pg_parser::datetime_unit::DatetimeUnit;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR,
     SQLSTATE_INVALID_DATETIME_FORMAT, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
@@ -70,6 +71,118 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             )
             .receiving_argument_types(),
         )
+        // FIXME(pg-interval): PostgreSQL has no function of this name. It exists
+        // because tursopg has no interval type: the translator rewrites
+        // `timestamp ± interval literal` into a call of it, and users can also
+        // call it by name. An interval type with the pg_operator rows
+        // timestamp_pl_interval and timestamptz_pl_interval replaces it.
+        .extension_function(
+            pg_scalar_function(
+                turso_pg_parser::TIMESTAMP_PLUS_INTERVAL_FUNCTION,
+                FunctionArity::Exact(4),
+                true,
+                |_, args| exec_timestamp_plus_interval(args),
+            )
+            .receiving_argument_types()
+            .checking_argument_types(check_timestamp_plus_interval_types)
+            // FIXME(pg-catalog): The check refuses a domain on the left because
+            // the result would get the domain's type, where pg_operator gives
+            // the base type (timestamp or timestamptz). A pg_operator lookup
+            // replaces this.
+            .returning_first_argument_type(),
+        )
+}
+
+/// Refuses the left side of `+ interval` when it is not timestamp or
+/// timestamptz. `types` are the argument type names, with domain names kept;
+/// the first is the left side, so a domain over timestamp or timestamptz is
+/// refused. Every other type gets 0A000, including the ones that have no operator
+/// in PostgreSQL (which gives 42883), because the type name does not say
+/// whether PostgreSQL has one. The translator turns `-` into `+` of the
+/// negated interval, so the message always says `+`.
+// FIXME(pg-catalog): tursopg refuses every other left type with 0A000 because
+// it cannot tell which have a PostgreSQL operator. Some do, such as date, and
+// an untyped literal or NULL is resolved by PostgreSQL to a type that does. A
+// pg_operator lookup replaces this.
+fn check_timestamp_plus_interval_types(types: &[String]) -> Result<()> {
+    let time_type = types[0].as_str();
+    match time_type {
+        "timestamp" | "timestamptz" => Ok(()),
+        _ => Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "adding an interval is supported only for timestamp and timestamptz, not {time_type}"
+            ),
+            None,
+        )),
+    }
+}
+
+/// `timestamp + interval` and `timestamptz + interval` for an interval
+/// literal, which the translator passes as its months, days and microseconds:
+/// `(time, months, days, microseconds)`. The result has the type of `time`.
+/// The parts are added as PostgreSQL's timestamp_pl_interval adds them: the
+/// months first, moving a day past the end of the month back to its last day,
+/// then the days, then the microseconds. Only UTC is supported, so timestamptz
+/// is computed like timestamp. The type of `time` is checked when the
+/// statement is compiled.
+fn exec_timestamp_plus_interval(args: &[Register]) -> Result<Value> {
+    use chrono::Datelike;
+    let (args, types) = args.split_at(args.len() / 2);
+    let time_type = types[0].get_value().to_string();
+    // The function can be called by name with any arguments, and a value
+    // typed timestamp can reach it in a form the ENCODE of timestamp would
+    // not write, so unexpected arguments are errors, not assertions.
+    let not_supported = |what: String| sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, what, None);
+    let text = match args[0].get_value() {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(text) => text.as_str(),
+        other => {
+            return Err(not_supported(format!(
+                "adding an interval to the {time_type} value {other} is not supported"
+            )))
+        }
+    };
+    let integer = |register: &Register| match register.get_value() {
+        Value::Numeric(Numeric::Integer(value)) => Ok(*value),
+        other => Err(not_supported(format!(
+            "an interval part that is not an integer, {other}, is not supported"
+        ))),
+    };
+    let (months, days, micros) = (integer(&args[1])?, integer(&args[2])?, integer(&args[3])?);
+    let unreadable = || {
+        not_supported(format!(
+            "adding an interval to the {time_type} value \"{text}\" is not supported"
+        ))
+    };
+    let time =
+        NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").map_err(|_| unreadable())?;
+    let sum = add_interval(time, months, days, micros)
+        .filter(|sum| (1..=9999).contains(&sum.year()))
+        .ok_or_else(|| {
+            sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "a result outside the years 1 to 9999 is not supported",
+                None,
+            )
+        })?;
+    Ok(Value::build_text(timestamp_text(sum)))
+}
+
+/// `time` plus `months`, then `days`, then `micros`, as PostgreSQL's
+/// timestamp_pl_interval adds them, or None if a step leaves chrono's range.
+/// Adding months clamps the day to the last day of the target month, as
+/// PostgreSQL does.
+fn add_interval(time: NaiveDateTime, months: i64, days: i64, micros: i64) -> Option<NaiveDateTime> {
+    use chrono::{Duration, Months};
+    let month_count = Months::new(u32::try_from(months.unsigned_abs()).ok()?);
+    let time = if months >= 0 {
+        time.checked_add_months(month_count)?
+    } else {
+        time.checked_sub_months(month_count)?
+    };
+    time.checked_add_signed(Duration::try_days(days)?)?
+        .checked_add_signed(Duration::microseconds(micros))
 }
 
 /// date_trunc(field, timestamptz). The declared return type is timestamptz,
@@ -122,12 +235,13 @@ fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
             ))
         })?;
     let lowered_field = field.as_str().to_ascii_lowercase();
-    if is_time_zone_unit(&lowered_field) {
+    let parsed = DatetimeUnit::parse(field.as_str());
+    if parsed == Some(DatetimeUnit::TimeZone) {
         return Err(not_supported(format!(
             "unit \"{lowered_field}\" not supported for type timestamp with time zone"
         )));
     }
-    let Some(unit) = TruncUnit::parse(field.as_str()) else {
+    let Some(unit) = parsed else {
         return Err(sqlstate_error(
             SQLSTATE_INVALID_PARAMETER_VALUE,
             format!("unit \"{lowered_field}\" not recognized for type timestamp with time zone"),
@@ -144,90 +258,40 @@ fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
     Ok(Some(Timestamptz(timestamp_text(truncated))))
 }
 
-/// The units of PostgreSQL's interval unit table that are time zone fields,
-/// not truncation units. date_trunc refuses them with 0A000 rather than 22023.
-/// `lowered` is matched on its first 10 bytes, as in `TruncUnit::parse`.
-fn is_time_zone_unit(lowered: &str) -> bool {
-    let key = &lowered.as_bytes()[..lowered.len().min(10)];
-    matches!(key, b"timezone" | b"timezone_h" | b"timezone_m")
-}
-
-#[derive(Clone, Copy)]
-enum TruncUnit {
-    Microseconds,
-    Milliseconds,
-    Second,
-    Minute,
-    Hour,
-    Day,
-    Week,
-    Month,
-    Quarter,
-    Year,
-    Decade,
-    Century,
-    Millennium,
-}
-
-impl TruncUnit {
-    /// The unit named by `name`, spelled as in PostgreSQL's interval unit
-    /// table (deltatktbl in src/backend/utils/adt/datetime.c). PostgreSQL
-    /// matches the lowercased name on its first 10 bytes only, so
-    /// "microsecondsXY" is the unit "microsecon". None for a name that is
-    /// not a unit of date_trunc.
-    fn parse(name: &str) -> Option<Self> {
-        let lowered = name.to_ascii_lowercase();
-        let key = &lowered.as_bytes()[..lowered.len().min(10)];
-        Some(match key {
-            b"microsecon" | b"us" | b"usec" | b"usecond" | b"useconds" | b"usecs" => {
-                Self::Microseconds
-            }
-            b"millisecon" | b"ms" | b"msec" | b"msecond" | b"mseconds" | b"msecs" => {
-                Self::Milliseconds
-            }
-            b"second" | b"seconds" | b"s" | b"sec" | b"secs" => Self::Second,
-            b"minute" | b"minutes" | b"m" | b"min" | b"mins" => Self::Minute,
-            b"hour" | b"hours" | b"h" | b"hr" | b"hrs" => Self::Hour,
-            b"day" | b"days" | b"d" => Self::Day,
-            b"week" | b"weeks" | b"w" => Self::Week,
-            b"month" | b"months" | b"mon" | b"mons" => Self::Month,
-            b"quarter" | b"qtr" => Self::Quarter,
-            b"year" | b"years" | b"y" | b"yr" | b"yrs" => Self::Year,
-            b"decade" | b"decades" | b"dec" | b"decs" => Self::Decade,
-            b"century" | b"centuries" | b"c" | b"cent" => Self::Century,
-            b"millennium" | b"millennia" | b"mil" | b"mils" => Self::Millennium,
-            _ => return None,
-        })
-    }
-}
-
 /// `time` truncated to `unit`, as PostgreSQL's date_trunc does it, or None
 /// when the result is before year 1: PostgreSQL prints it as BC, which the
 /// timestamptz encoding cannot store. Weeks start on Monday; century and
 /// millennium start at years ending in 01, as in PostgreSQL.
-fn truncate_timestamp(time: NaiveDateTime, unit: TruncUnit) -> Option<NaiveDateTime> {
+fn truncate_timestamp(time: NaiveDateTime, unit: DatetimeUnit) -> Option<NaiveDateTime> {
     use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Timelike};
     let date = time.date();
     let first_day_of_year = |year: i32| NaiveDate::from_ymd_opt(year, 1, 1);
     let day = match unit {
-        TruncUnit::Microseconds => return Some(time),
-        TruncUnit::Milliseconds => {
+        DatetimeUnit::Microsecond => return Some(time),
+        DatetimeUnit::Millisecond => {
             let nanos = time.nanosecond() / 1_000_000 * 1_000_000;
             return time.with_nanosecond(nanos);
         }
-        TruncUnit::Second => return time.with_nanosecond(0),
-        TruncUnit::Minute => return time.with_nanosecond(0)?.with_second(0),
-        TruncUnit::Hour => return time.with_nanosecond(0)?.with_second(0)?.with_minute(0),
-        TruncUnit::Day => date,
-        TruncUnit::Week => date - Duration::days(i64::from(date.weekday().num_days_from_monday())),
-        TruncUnit::Month => date.with_day(1)?,
-        TruncUnit::Quarter => {
+        DatetimeUnit::Second => return time.with_nanosecond(0),
+        DatetimeUnit::Minute => return time.with_nanosecond(0)?.with_second(0),
+        DatetimeUnit::Hour => return time.with_nanosecond(0)?.with_second(0)?.with_minute(0),
+        DatetimeUnit::Day => date,
+        DatetimeUnit::Week => {
+            date - Duration::days(i64::from(date.weekday().num_days_from_monday()))
+        }
+        DatetimeUnit::Month => date.with_day(1)?,
+        DatetimeUnit::Quarter => {
             NaiveDate::from_ymd_opt(date.year(), (date.month() - 1) / 3 * 3 + 1, 1)?
         }
-        TruncUnit::Year => first_day_of_year(date.year())?,
-        TruncUnit::Decade => first_day_of_year(date.year().div_euclid(10) * 10)?,
-        TruncUnit::Century => first_day_of_year((date.year() - 1).div_euclid(100) * 100 + 1)?,
-        TruncUnit::Millennium => first_day_of_year((date.year() - 1).div_euclid(1000) * 1000 + 1)?,
+        DatetimeUnit::Year => first_day_of_year(date.year())?,
+        DatetimeUnit::Decade => first_day_of_year(date.year().div_euclid(10) * 10)?,
+        DatetimeUnit::Century => first_day_of_year((date.year() - 1).div_euclid(100) * 100 + 1)?,
+        DatetimeUnit::Millennium => {
+            first_day_of_year((date.year() - 1).div_euclid(1000) * 1000 + 1)?
+        }
+        DatetimeUnit::TimeZone => {
+            unreachable!("date_trunc refuses the time zone units before truncating")
+        }
     };
     // A year before 1 is BC in PostgreSQL. Only the decade of years 1 to 9
     // gets here, because the other units stay in the year of `time` or start
