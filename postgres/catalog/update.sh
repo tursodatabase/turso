@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Replaces upstream/postgres.bki with the one of a PostgreSQL release.
+# Replaces upstream/postgres.bki with the one of a PostgreSQL release and
+# generates src/generated.rs from it again.
 #
 #   ./update.sh REL_18_4
 #
 # The argument is a tag of https://github.com/postgres/postgres. The script
 # downloads the catalog files of that tag and runs PostgreSQL's own
 # src/backend/catalog/genbki.pl on them, the script that writes postgres.bki
-# when PostgreSQL is built. It needs git and perl.
+# when PostgreSQL is built. It needs git, perl and cargo.
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
@@ -56,4 +57,5 @@ tag: $tag
 commit: $commit
 VERSION
 
-echo "upstream/postgres.bki is now the one of $tag ($commit)"
+cargo run --quiet --manifest-path "$catalog_dir/generator/Cargo.toml"
+echo "upstream/postgres.bki and src/generated.rs are now those of $tag ($commit)"

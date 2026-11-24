@@ -3,7 +3,7 @@
 `postgres.bki` holds every built-in row of every PostgreSQL system catalog:
 the types, functions, operators, casts and operator classes that exist in a
 new database. `turso_pg_catalog_gen`, in `../generator`, reads it and writes
-Rust tables with the same rows.
+`../src/generated.rs`, which has Rust tables with the same rows.
 
 ## Provenance
 
@@ -30,6 +30,13 @@ verbatim. Do not edit it.
 postgres/catalog/update.sh REL_18_4
 ```
 
-This replaces `postgres.bki` and `VERSION`. A test of the generator reads
-the file, and fails when the new file has a column type or a quoting form
-that the generator does not know.
+This replaces `postgres.bki` and `VERSION`, and generates
+`src/generated.rs` again. The generator stops with an error when the new
+file has a column type or a quoting form that it does not know.
+
+To generate `src/generated.rs` again without a new `postgres.bki`, after a
+change to the generator:
+
+```bash
+cargo run -p turso_pg_catalog_gen
+```
