@@ -2440,3 +2440,182 @@ expect {
     a
     b
 }
+
+# `x = y` compares with the collation of x and `y = x` with the collation of y
+# when both are columns without a COLLATE operator, so the two comparisons are
+# different expressions when the columns have different collations.
+@cross-check-integrity
+test swapped-comparison-or-common-term {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x TEXT, y TEXT COLLATE NOCASE, z INTEGER);
+    INSERT INTO a VALUES (1,'a','A',1),(2,'b','b',2),(3,'c','C',3),(4,'d','x',4);
+    SELECT group_concat(id) FROM a WHERE (x = y AND z = 99) OR (y = x AND z = 1);
+    SELECT group_concat(id) FROM a WHERE (y = x AND z = 1) OR (x = y AND z = 99);
+    SELECT group_concat(id) FROM a WHERE (x != y AND z = 1) OR (y != x AND z = 4);
+    SELECT group_concat(id) FROM a WHERE (x = y COLLATE NOCASE AND z = 99) OR (y = x AND z = 1);
+}
+expect {
+    1
+    1
+    1,4
+    1
+}
+
+@cross-check-integrity
+test swapped-comparison-or-common-term-join {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x TEXT, y TEXT COLLATE NOCASE);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, w TEXT);
+    INSERT INTO a VALUES (1,'a','A'),(2,'b','b');
+    INSERT INTO b VALUES (10,'a'),(20,'b');
+    SELECT a.id, b.id FROM a JOIN b ON b.w = a.x
+    WHERE (a.x = a.y AND b.id = 99) OR (a.y = a.x AND b.id = 10)
+    ORDER BY a.id, b.id;
+}
+expect {
+    1|10
+}
+
+@cross-check-integrity
+test swapped-comparison-expression-index {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x TEXT, y TEXT COLLATE NOCASE, z INTEGER);
+    INSERT INTO a VALUES (1,'a','A',1),(2,'b','b',2),(3,'c','C',3),(4,'d','x',4);
+    CREATE INDEX ie ON a((x = y));
+    SELECT group_concat(id) FROM a WHERE (y = x) = 1;
+    SELECT group_concat(id) FROM a WHERE (x = y) = 1;
+    SELECT group_concat(id) FROM a NOT INDEXED WHERE (y = x) = 1;
+}
+expect {
+    1,2,3
+    2
+    1,2,3
+}
+
+# A GROUP BY key `y = x` does not give the value of `x = y` in the result.
+@cross-check-integrity
+test swapped-comparison-group-by {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x TEXT, y TEXT COLLATE NOCASE);
+    INSERT INTO a VALUES (1,'a','A'),(2,'c','d');
+    SELECT y = x, x = y, count(*) FROM a GROUP BY y = x ORDER BY 1;
+}
+expect {
+    0|0|1
+    1|0|1
+}
+
+# A partial index on `x = y` does not hold the rows for which only `y = x` is
+# true, and the query term `x = y` must still filter the rows of an index on
+# `y = x`.
+@cross-check-integrity
+test swapped-comparison-partial-index {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x TEXT, y TEXT COLLATE NOCASE, z INTEGER);
+    INSERT INTO a VALUES (1,'a','A',1),(2,'b','b',1),(3,'c','C',1),(4,'d','x',1);
+    CREATE INDEX pi ON a(z) WHERE x = y;
+    SELECT group_concat(id) FROM a WHERE y = x AND z = 1;
+    SELECT group_concat(id) FROM a WHERE x = y AND z = 1;
+    CREATE TABLE b(id INTEGER PRIMARY KEY, x TEXT, y TEXT COLLATE NOCASE, z INTEGER);
+    INSERT INTO b VALUES (1,'a','A',1),(2,'b','b',1),(3,'c','C',1),(4,'d','x',1);
+    CREATE INDEX pj ON b(z) WHERE y = x;
+    SELECT group_concat(id) FROM b WHERE x = y AND z = 1;
+    SELECT group_concat(id) FROM b WHERE y = x AND z = 1;
+}
+expect {
+    1,2,3
+    2
+    2
+    1,2,3
+}
+
+# With the same collation on both columns, `y = x` proves the partial index
+# predicate `x = y`.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test swapped-comparison-same-collation-uses-partial-index {
+    CREATE TABLE s(id INTEGER PRIMARY KEY, x TEXT, y TEXT, z INTEGER);
+    CREATE INDEX si ON s(z) WHERE x = y;
+    EXPLAIN QUERY PLAN SELECT id FROM s WHERE y = x AND z = 1;
+}
+expect {
+    1|0|0|SEARCH s USING COVERING INDEX si (z=?)
+}
+
+# A row value comparison compares its elements pair by pair, each pair with its
+# own collation. So `(a, b) = (c, d)` and `(c, d) = (a, b)` differ when b and d
+# have different collations, even when a and c have the same one.
+@cross-check-integrity
+test swapped-row-value-comparison-or-common-term {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT, d TEXT COLLATE NOCASE, z INTEGER);
+    INSERT INTO t VALUES (1,'p','q','p','Q',1),(2,'p','q','p','q',2);
+    SELECT group_concat(id) FROM t WHERE ((a,b) = (c,d) AND z = 99) OR ((c,d) = (a,b) AND z = 1);
+    SELECT group_concat(id) FROM t WHERE ((id,b) = (id,d) AND z = 99) OR ((id,d) = (id,b) AND z = 1);
+}
+expect {
+    1
+    1
+}
+
+@cross-check-integrity
+test swapped-row-value-comparison-partial-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT, d TEXT COLLATE NOCASE, z INTEGER);
+    INSERT INTO t VALUES (1,'p','q','p','Q',1),(2,'p','q','p','q',1);
+    CREATE INDEX pi ON t(z) WHERE (a,b) = (c,d);
+    SELECT group_concat(id) FROM t WHERE (c,d) = (a,b) AND z = 1;
+    SELECT group_concat(id) FROM t WHERE (a,b) = (c,d) AND z = 1;
+}
+expect {
+    1,2
+    2
+}
+
+@cross-check-integrity
+test swapped-row-value-comparison-expression-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT, d TEXT COLLATE NOCASE, z INTEGER);
+    INSERT INTO t VALUES (1,'p','q','p','Q',1),(2,'p','q','p','q',2);
+    CREATE INDEX ie ON t(((a,b) = (c,d)));
+    SELECT id FROM t WHERE ((c,d) = (a,b)) = 1 ORDER BY id;
+    SELECT id FROM t NOT INDEXED WHERE ((c,d) = (a,b)) = 1 ORDER BY id;
+}
+expect {
+    1
+    2
+    1
+    2
+}
+
+@cross-check-integrity
+test swapped-row-value-comparison-group-by {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b TEXT, d TEXT COLLATE NOCASE, z INTEGER);
+    INSERT INTO t VALUES (1,'q','Q',1),(2,'q','q',2);
+    SELECT (1,d) = (1,b), count(*) FROM t GROUP BY (1,b) = (1,d) ORDER BY 1;
+}
+expect {
+    1|1
+    1|1
+}
+
+# The leftmost COLLATE operator gives the collation of `a + b`, so swapping the
+# operands of + changes the collation when both of them have a COLLATE operator.
+@cross-check-integrity
+test swapped-arithmetic-operands-keep-leftmost-collate {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER, y INTEGER, z TEXT, k INTEGER);
+    INSERT INTO t VALUES (1,1,2,'3 ',1),(2,1,2,'3',2);
+    SELECT id FROM t WHERE (z = (y COLLATE binary + x COLLATE rtrim) AND k = 99)
+        OR ((x COLLATE rtrim + y COLLATE binary) = z AND k IN (1,2)) ORDER BY id;
+    SELECT (x COLLATE rtrim + y COLLATE binary) = z, count(*) FROM t
+        GROUP BY z = (y COLLATE binary + x COLLATE rtrim) ORDER BY 1;
+}
+expect {
+    1
+    2
+    1|1
+    1|1
+}
+
+# With the same collation on every pair, `(c, d) = (a, b)` proves the partial
+# index predicate `(a, b) = (c, d)`.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test swapped-row-value-same-collation-uses-partial-index {
+    CREATE TABLE s(id INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT, d TEXT, z INTEGER);
+    CREATE INDEX si ON s(z) WHERE (a,b) = (c,d);
+    EXPLAIN QUERY PLAN SELECT id FROM s WHERE (c,d) = (a,b) AND z = 1;
+}
+expect {
+    1|0|0|SEARCH s USING COVERING INDEX si (z=?)
+}

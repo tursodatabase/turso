@@ -6,7 +6,7 @@ use crate::translate::expr_context::{ExprContext, ExprProperties, TableMetadata}
 use crate::{
     schema::{Column, Index, IndexColumn, Schema, Table},
     translate::{
-        collate::{comparison_collation, in_list_collation, CollationSeq},
+        collate::{comparison_collation, in_list_collation, CollationSeq, ColumnLookup},
         expr::{
             as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr_mut,
             WalkControl,
@@ -23,7 +23,7 @@ use crate::{
         },
         Resolver,
     },
-    util::exprs_are_equivalent,
+    util::exprs_are_equivalent_with_columns,
     vdbe::affinity::Affinity,
     Result,
 };
@@ -1354,7 +1354,9 @@ pub fn table_constraints_from_where_clause(
                 None => constraint.expr.as_ref().and_then(|e| {
                     let normalized =
                         normalize_expr_for_index_matching(e, table_reference, table_references);
-                    index.expression_to_index_pos(&normalized)
+                    index.expression_to_index_pos(&normalized, &|expr| {
+                        table_reference.column_named_by(expr)
+                    })
                 }),
             } {
                 // An index seek compares keys with the index column's
@@ -1747,13 +1749,18 @@ pub fn ordered_ephemeral_key_columns(constraints: &[&Constraint]) -> SmallVec<[u
     ordered
 }
 
-fn query_term_implies_predicate(query: &ast::Expr, predicate: &ast::Expr) -> bool {
-    if exprs_are_equivalent(query, predicate) {
+fn query_term_implies_predicate(
+    query: &ast::Expr,
+    predicate: &ast::Expr,
+    column: &ColumnLookup<'_>,
+) -> bool {
+    if exprs_are_equivalent_with_columns(query, predicate, column) {
         return true;
     }
     match unwrap_parens(predicate).unwrap_or(predicate) {
         ast::Expr::Binary(left, ast::Operator::Or, right) => {
-            query_term_implies_predicate(query, left) || query_term_implies_predicate(query, right)
+            query_term_implies_predicate(query, left, column)
+                || query_term_implies_predicate(query, right, column)
         }
         _ => false,
     }
@@ -1808,15 +1815,22 @@ pub(super) fn partial_index_predicate_terms(
     rewrite_between_exprs(&mut bound, None).ok()?;
     let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
     break_predicate_at_and_boundaries(bound, &mut index_conjuncts);
+    // The index WHERE and the query terms refer to columns of this table only.
+    // Knowing their collations lets `x = y` prove `y = x` when x and y have
+    // the same collation; with different collations the two differ.
+    let column = |expr: &ast::Expr| table_reference.column_named_by(expr);
     let mut matched_terms = SmallVec::<[usize; 4]>::new();
     for index_conjunct in index_conjuncts.iter() {
         let (term_idx, term) = query_where_clause.iter().enumerate().find(|(_, term)| {
-            can_use_query_term(term) && query_term_implies_predicate(&term.expr, index_conjunct)
+            can_use_query_term(term)
+                && query_term_implies_predicate(&term.expr, index_conjunct, &column)
         })?;
         // A query term that proves one branch of an OR makes the partial index
         // usable, but does not make that term true for every row in the index.
         // Keep it as a residual filter unless the whole conjunct matched.
-        if exprs_are_equivalent(index_conjunct, &term.expr) && !matched_terms.contains(&term_idx) {
+        if exprs_are_equivalent_with_columns(index_conjunct, &term.expr, &column)
+            && !matched_terms.contains(&term_idx)
+        {
             matched_terms.push(term_idx);
         }
     }

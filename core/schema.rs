@@ -23,7 +23,7 @@ use crate::types::IOResultOr;
 use crate::types::StrictType;
 use crate::types::{Conversion, StorageClass, UserType};
 use crate::types::{IOResult, ImmutableRecord, ImmutableRecordRef};
-use crate::util::{exprs_are_equivalent, is_builtin_strict_type, normalize_ident};
+use crate::util::{exprs_are_equivalent_with_columns, is_builtin_strict_type, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
 use crate::{turso_assert, turso_debug_assert};
@@ -124,7 +124,7 @@ use crate::dialect::identity_table_sql_marker;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
-use crate::translate::collate::{key_collation, CollationSeq, TextCollation};
+use crate::translate::collate::{key_collation, CollationSeq, ColumnLookup, TextCollation};
 use crate::translate::expr::expr_type::{
     column_type, primitive_value_type, stored_value_type, value_type, BuiltinType, ExprType,
 };
@@ -9225,11 +9225,16 @@ impl Index {
     /// Given an expression, return the position in the index if it matches an expression index column.
     /// Expression index matching is textual (after binding), so the caller should normalize the query
     /// expression to resemble the stored index expression (e.g. unqualified column names).
-    pub fn expression_to_index_pos(&self, expr: &Expr) -> Option<usize> {
+    /// `column` finds the columns of the indexed table that the names refer to.
+    pub(crate) fn expression_to_index_pos(
+        &self,
+        expr: &Expr,
+        column: &ColumnLookup<'_>,
+    ) -> Option<usize> {
         self.columns.iter().position(|c| {
             c.expr
                 .as_ref()
-                .is_some_and(|e| exprs_are_equivalent(e, expr))
+                .is_some_and(|e| exprs_are_equivalent_with_columns(e, expr, column))
         })
     }
 

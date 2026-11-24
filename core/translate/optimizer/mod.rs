@@ -1238,7 +1238,11 @@ fn find_select_plan_form(
     optimize_subqueries(plan, resolver, cache, save_subquery_plans)?;
     let available_indexes =
         AvailableIndexes::for_table_references(resolver, &plan.table_references);
-    rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
+    rewrite_or_terms(
+        &mut plan.where_clause,
+        &plan.table_references,
+        &available_indexes,
+    )?;
     if let ConstantConditionEliminationResult::ImpossibleCondition = eliminate_constant_conditions(
         &mut plan.where_clause,
         plan.table_references.has_right_or_full_join(),
@@ -1501,7 +1505,11 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &plan.table_references)?;
 
-    rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
+    rewrite_or_terms(
+        &mut plan.where_clause,
+        &plan.table_references,
+        &available_indexes,
+    )?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause, false)?
     {
@@ -1549,7 +1557,7 @@ fn optimize_update_plan(
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
     let available_indexes = AvailableIndexes::for_table_references(resolver, &target_tables);
-    rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
+    rewrite_or_terms(&mut plan.where_clause, &target_tables, &available_indexes)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition = eliminate_constant_conditions(
         &mut plan.where_clause,
         plan.from_tables.has_right_or_full_join(),

@@ -4,6 +4,9 @@ use crate::namespace::NamespaceId;
 use crate::numeric::StrToF64;
 use crate::schema::CheckConstraint;
 use crate::security::policy::RowPolicy;
+use crate::translate::collate::{
+    has_collate_operator, swapped_comparison_keeps_collation, ColumnLookup,
+};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{BitSet, JoinedTable};
@@ -611,16 +614,35 @@ pub fn try_capture_parameters_column_agnostic(
 /// This function is used to determine whether two expressions are logically
 /// equivalent in the context of queries, even if their representations
 /// differ. e.g.: `SUM(x)` and `sum(x)`, `x + y` and `y + x`
+///
+/// `x = y` and `y = x` are equivalent only when swapping the operands keeps
+/// the collation of the comparison. This function knows the collation of no
+/// column, so it does not swap two column operands;
+/// [exprs_are_equivalent_with_columns] does when they have the same collation.
 pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
-    exprs_match(expr1, expr2, true)
+    exprs_match(expr1, expr2, Some(&|_| None))
+}
+
+/// Like [exprs_are_equivalent], and `column` finds the table columns that the
+/// expressions refer to, so that `x = y` and `y = x` are equivalent for
+/// columns x and y with the same collation.
+pub(crate) fn exprs_are_equivalent_with_columns(
+    expr1: &Expr,
+    expr2: &Expr,
+    column: &ColumnLookup<'_>,
+) -> bool {
+    exprs_match(expr1, expr2, Some(column))
 }
 
 /// Like [exprs_are_equivalent], but `x + y` and `y + x` are different expressions.
 pub fn exprs_are_equivalent_as_written(expr1: &Expr, expr2: &Expr) -> bool {
-    exprs_match(expr1, expr2, false)
+    exprs_match(expr1, expr2, None)
 }
 
-fn exprs_match(expr1: &Expr, expr2: &Expr, operands_can_swap: bool) -> bool {
+/// `operands_can_swap` is None when operands must match as written. Otherwise
+/// the operands of a commutative operator may match swapped, and it finds the
+/// columns whose collations decide whether the operands of a comparison may.
+fn exprs_match(expr1: &Expr, expr2: &Expr, operands_can_swap: Option<&ColumnLookup<'_>>) -> bool {
     match (expr1, expr2) {
         (
             Expr::Between {
@@ -645,10 +667,22 @@ fn exprs_match(expr1: &Expr, expr2: &Expr, operands_can_swap: bool) -> bool {
             op1 == op2
                 && ((exprs_match(lhs1, lhs2, operands_can_swap)
                     && exprs_match(rhs1, rhs2, operands_can_swap))
-                    || (operands_can_swap
-                        && op1.is_commutative()
-                        && exprs_match(lhs1, rhs2, operands_can_swap)
-                        && exprs_match(rhs1, lhs2, operands_can_swap)))
+                    || operands_can_swap.is_some_and(|column| {
+                        op1.is_commutative()
+                            // The left operand's collation can decide a
+                            // comparison, so `x = y` and `y = x` differ when
+                            // x and y have different collations.
+                            && (if op1.is_comparison() {
+                                swapped_comparison_keeps_collation(lhs1, rhs1, column)
+                            } else {
+                                // The leftmost COLLATE operator gives the
+                                // collation of `a + b`, so the swap changes
+                                // it when both operands have one.
+                                !(has_collate_operator(lhs1) && has_collate_operator(rhs1))
+                            })
+                            && exprs_match(lhs1, rhs2, operands_can_swap)
+                            && exprs_match(rhs1, lhs2, operands_can_swap)
+                    }))
         }
         (
             Expr::Case {
@@ -2184,6 +2218,7 @@ pub mod tests {
 
     use crate::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type, Variable};
     use crate::schema::Type as SchemaValueType;
+    use crate::translate::collate::TextCollation;
 
     #[test]
     fn test_normalize_ident() {
@@ -2497,6 +2532,84 @@ pub mod tests {
             }),
         };
         assert!(exprs_are_equivalent(&cast1, &cast2));
+    }
+
+    fn column_ref(column: usize) -> Expr {
+        Expr::Column {
+            database: None,
+            table: ast::TableInternalId::from(1),
+            column,
+            is_rowid_alias: false,
+        }
+    }
+
+    fn equals(lhs: Expr, rhs: Expr) -> Expr {
+        Expr::Binary(Box::new(lhs), Equals, Box::new(rhs))
+    }
+
+    fn text_column(collation: Option<TextCollation>) -> Column {
+        Column::new(
+            Some("c".to_string()),
+            "TEXT".to_string(),
+            None,
+            None,
+            SchemaValueType::Text,
+            collation,
+            Default::default(),
+        )
+    }
+
+    #[test]
+    fn test_swapped_comparison_with_one_column_is_equivalent() {
+        let literal = || Expr::Literal(Literal::String("'a'".to_string()));
+        assert!(exprs_are_equivalent(
+            &equals(column_ref(0), literal()),
+            &equals(literal(), column_ref(0)),
+        ));
+    }
+
+    #[test]
+    fn test_swapped_comparison_of_columns_needs_their_collations() {
+        let x_eq_y = equals(column_ref(0), column_ref(1));
+        let y_eq_x = equals(column_ref(1), column_ref(0));
+        // Without the columns, their collations are not known.
+        assert!(!exprs_are_equivalent(&x_eq_y, &y_eq_x));
+
+        let binary = [text_column(None), text_column(None)];
+        let same = |expr: &Expr| match expr {
+            Expr::Column { column, .. } => binary.get(*column),
+            _ => None,
+        };
+        assert!(exprs_are_equivalent_with_columns(&x_eq_y, &y_eq_x, &same));
+
+        let mixed = [text_column(None), text_column(Some(TextCollation::NoCase))];
+        let different = |expr: &Expr| match expr {
+            Expr::Column { column, .. } => mixed.get(*column),
+            _ => None,
+        };
+        assert!(!exprs_are_equivalent_with_columns(
+            &x_eq_y, &y_eq_x, &different
+        ));
+        // As written, the comparison matches whatever the collations are.
+        assert!(exprs_are_equivalent_with_columns(
+            &x_eq_y, &x_eq_y, &different
+        ));
+    }
+
+    #[test]
+    fn test_swapped_comparison_with_one_collate_operator_is_equivalent() {
+        let nocase = |expr: Expr| Expr::Collate(Box::new(expr), Name::exact("nocase".to_string()));
+        let binary = |expr: Expr| Expr::Collate(Box::new(expr), Name::exact("binary".to_string()));
+        // The operand with the COLLATE operator decides in both orders.
+        assert!(exprs_are_equivalent(
+            &equals(nocase(column_ref(0)), column_ref(1)),
+            &equals(column_ref(1), nocase(column_ref(0))),
+        ));
+        // With a COLLATE operator on both sides, the left one decides.
+        assert!(!exprs_are_equivalent(
+            &equals(nocase(column_ref(0)), binary(column_ref(1))),
+            &equals(binary(column_ref(1)), nocase(column_ref(0))),
+        ));
     }
 
     #[test]
