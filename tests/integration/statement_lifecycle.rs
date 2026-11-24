@@ -412,14 +412,12 @@ fn fts_backing_store_ddl_yields_its_io_instead_of_pumping_it() {
 /// time a `(cursor, point)` pair asks it yields, the re-ask on re-entry
 /// proceeds, the next visit yields again. Exercises re-entry at every
 /// resumable boundary a statement crosses.
-#[cfg(feature = "fts")]
 #[derive(Debug, Default)]
-struct YieldAtEveryVisit {
+pub(crate) struct YieldAtEveryVisit {
     armed: Mutex<HashMap<(u64, YieldPoint), bool>>,
-    fired: std::sync::atomic::AtomicUsize,
+    pub(crate) fired: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(feature = "fts")]
 impl YieldInjector for YieldAtEveryVisit {
     fn should_yield(&self, instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
         let mut armed = self.armed.lock();
