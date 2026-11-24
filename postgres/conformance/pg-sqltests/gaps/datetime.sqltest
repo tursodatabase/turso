@@ -841,7 +841,7 @@ test in-values-mixing-integer-and-timestamp {
 @sqlstate 42804
 expect error {}
 expect @tursopg {
-    1
+    t
 }
 
 # tursopg refuses at compile time with 0A000 because it cannot tell which types
@@ -940,7 +940,7 @@ expect error {
     operator does not exist: date ~~ unknown
 }
 expect @tursopg {
-    1
+    t
 }
 
 # PostgreSQL accepts the special date value infinity. tursopg refuses it as

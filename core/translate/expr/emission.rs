@@ -166,6 +166,7 @@ pub fn process_returning_clause(
                     alias,
                     implicit_column_name,
                     contains_aggregates: false,
+                    values_condition_type: None,
                 });
             }
             ast::ResultColumn::Star => {
@@ -190,6 +191,7 @@ pub fn process_returning_clause(
                         alias: column.name.clone(),
                         implicit_column_name: None,
                         contains_aggregates: false,
+                        values_condition_type: None,
                     });
                 }
             }

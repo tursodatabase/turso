@@ -149,7 +149,7 @@ expect {
     t
 }
 expect @tursopg {
-    0
+    f
 }
 
 # A-22: numeric(10,2) rounding half away from zero
@@ -271,15 +271,11 @@ test invalid-timestamptz {
 expect error {}
 
 # A-36: timestamptz equality across offsets
-@compat-gap "operator:timestamptz = timestamptz"
 test timestamptz-equality-across-offsets {
     SELECT '2026-10-08 14:00:00+02'::timestamptz = '2026-10-08 12:00:00Z'::timestamptz;
 }
 expect {
     t
-}
-expect @tursopg {
-    1
 }
 
 # A-37: timestamp drops offset
@@ -336,15 +332,11 @@ expect {
 }
 
 # A-44: now() - interval comparison
-@compat-gap "type:bool"
 test now-interval-comparison {
     SELECT now() - interval '1 day' < now();
 }
 expect {
     t
-}
-expect @tursopg {
-    1
 }
 
 # A-45: jsonb literal key order/whitespace

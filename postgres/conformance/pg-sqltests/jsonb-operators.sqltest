@@ -414,8 +414,8 @@ expect {
 
 # More rules of @> and <@
 
-# The tests that follow cast each comparison to int, so that the result does
-# not depend on B-04, where a boolean prints as 0 or 1 instead of f or t.
+# The tests that follow cast each comparison to int. They were written when
+# tursopg printed a boolean as 0 or 1 instead of f or t.
 
 # A scalar document is an array with one element in jsonb, so a scalar
 # contains an equal scalar, and an array contains each of its elements.

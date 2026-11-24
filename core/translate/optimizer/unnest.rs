@@ -601,6 +601,7 @@ fn try_rewrite_single_value_aggregate(
             alias: Some(format!("correlation_key_{index}")),
             implicit_column_name: None,
             contains_aggregates: false,
+            values_condition_type: None,
         });
     }
     let column_count = group_columns.len();

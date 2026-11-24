@@ -2920,7 +2920,8 @@ fn declared_return_type_of_extension_functions_matches_what_they_return() {
             })
             .1;
         let expected = match return_type {
-            ReturnType::Integer => "integer",
+            // A function that answers a condition returns the integer 1 or 0.
+            ReturnType::Integer | ReturnType::Boolean => "integer",
             ReturnType::Real => "real",
             ReturnType::Text => "text",
             ReturnType::Blob => "blob",

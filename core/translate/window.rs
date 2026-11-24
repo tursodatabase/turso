@@ -223,6 +223,7 @@ fn prepare_window_subquery(
             alias: None,
             implicit_column_name: None,
             contains_aggregates: false,
+            values_condition_type: None,
         });
     }
 
@@ -585,6 +586,7 @@ fn push_new_subquery_column(
         alias: None,
         implicit_column_name: None,
         contains_aggregates,
+        values_condition_type: None,
     });
 }
 
@@ -2816,7 +2818,9 @@ enum RangeType {
 fn range_type(ty: &ExprType) -> RangeType {
     match ty {
         ExprType::Null | ExprType::Untyped => RangeType::ReadWhenRun,
-        ExprType::Builtin(BuiltinType::Integer) => RangeType::Sqlite(RangeOffsets::Integer),
+        ExprType::Builtin(BuiltinType::Integer | BuiltinType::Boolean) => {
+            RangeType::Sqlite(RangeOffsets::Integer)
+        }
         ExprType::Builtin(BuiltinType::Decimal) => RangeType::Sqlite(RangeOffsets::Numeric),
         ExprType::Builtin(
             BuiltinType::Real

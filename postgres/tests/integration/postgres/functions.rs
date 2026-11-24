@@ -429,7 +429,7 @@ fn test_pg_setting_change_stays_when_its_statement_is_reset_after_a_row(db: Temp
 }
 
 #[turso_macros::test(mvcc)]
-fn test_pg_is_in_recovery_returns_temporary_true_text(db: TempDatabase) {
+fn test_pg_is_in_recovery_returns_temporary_true(db: TempDatabase) {
     let conn = db.connect_postgres();
     assert_eq!(
         query_text(
@@ -442,7 +442,7 @@ fn test_pg_is_in_recovery_returns_temporary_true_text(db: TempDatabase) {
         "SELECT pg_catalog.pg_is_in_recovery()",
         "SELECT pg_is_in_recovery() AS recovery",
     ] {
-        assert_eq!(query_text(&conn, sql), ["t"]);
+        assert_eq!(query_integer(&conn, sql), [1]);
     }
     assert!(conn.prepare("SELECT pg_is_in_recovery(1)").is_err());
 
@@ -452,7 +452,7 @@ fn test_pg_is_in_recovery_returns_temporary_true_text(db: TempDatabase) {
             .unwrap()
             .run_collect_rows()
             .unwrap(),
-        vec![vec![Value::build_text("t")]]
+        vec![vec![Value::from_i64(1)]]
     );
 }
 

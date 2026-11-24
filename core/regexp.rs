@@ -8,7 +8,7 @@ pub fn register_extension(ext_api: &mut ExtensionApi) {
             ext_api.ctx,
             c"regexp".as_ptr(),
             regexp,
-            Some(ReturnType::Integer),
+            Some(ReturnType::Boolean),
         );
     }
 }

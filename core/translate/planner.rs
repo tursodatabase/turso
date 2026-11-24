@@ -1985,6 +1985,7 @@ fn parenthesized_join_result_column(expr: Expr, column_name: &str) -> ResultSetC
         alias: Some(column_name.to_string()),
         implicit_column_name: None,
         contains_aggregates: false,
+        values_condition_type: None,
     }
 }
 

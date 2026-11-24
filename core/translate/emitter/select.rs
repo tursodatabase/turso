@@ -1066,6 +1066,7 @@ fn build_materialized_build_input_plan(
             alias: None,
             implicit_column_name: None,
             contains_aggregates: false,
+            values_condition_type: None,
         }],
         MaterializedBuildInputMode::KeyPayload { num_keys, .. } => {
             turso_assert!(
@@ -1079,6 +1080,7 @@ fn build_materialized_build_input_plan(
                     alias: None,
                     implicit_column_name: None,
                     contains_aggregates: false,
+                    values_condition_type: None,
                 });
             }
             for payload in payload_columns.iter() {
@@ -1103,6 +1105,7 @@ fn build_materialized_build_input_plan(
                     alias: None,
                     implicit_column_name: None,
                     contains_aggregates: false,
+                    values_condition_type: None,
                 });
             }
             result_columns

@@ -193,3 +193,14 @@ test ctas-varchar-length-limit {
 expect error {}
 expect @tursopg {
 }
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-condition-column {
+    CREATE TABLE c AS SELECT 1 < 2 AS x;
+    SELECT x FROM c;
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {}

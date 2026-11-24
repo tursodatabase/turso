@@ -510,5 +510,5 @@ expect {
     b"}|t
 }
 expect @tursopg {
-    {"a\nb"}|1
+    {"a\nb"}|t
 }

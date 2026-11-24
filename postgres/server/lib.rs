@@ -1965,7 +1965,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pg_is_in_recovery_returns_true_text_on_wire() {
+    fn test_pg_is_in_recovery_returns_true_bool_on_wire() {
         let (_io, db) = turso_pg::open_database(
             ":memory:",
             None,
@@ -1982,7 +1982,7 @@ mod tests {
             for format in [Format::UnifiedText, Format::UnifiedBinary] {
                 let mut stmt = conn.prepare(sql).unwrap();
                 let fields = Arc::new(build_field_info(&stmt, &format).unwrap());
-                assert_eq!(*fields[0].datatype(), Type::TEXT, "{sql}");
+                assert_eq!(*fields[0].datatype(), Type::BOOL, "{sql}");
                 let rows = stmt.run_collect_rows().unwrap();
                 assert_eq!(rows.len(), 1);
                 let mut encoder = DataRowEncoder::new(fields.clone());
@@ -1996,7 +1996,12 @@ mod tests {
                 .unwrap();
                 let row = encoder.finish().unwrap();
                 assert_eq!(row.field_count, 1);
-                assert_eq!(&row.data[..], b"\0\0\0\x01t");
+                let expected: &[u8] = if matches!(format, Format::UnifiedText) {
+                    b"\0\0\0\x01t"
+                } else {
+                    b"\0\0\0\x01\x01"
+                };
+                assert_eq!(&row.data[..], expected);
             }
         }
         let stmt = conn.prepare("SELECT 7 AS pg_is_in_recovery").unwrap();

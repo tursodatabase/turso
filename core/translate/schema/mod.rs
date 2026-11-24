@@ -34,7 +34,7 @@ use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{prepare_cdc_if_necessary, Resolver};
 use crate::translate::expr::expr_type::{
     base_value_type, decode_type, first_and_third_arguments, iif_values, query_column_type,
-    value_type, ExprType,
+    value_type, BuiltinType, ExprType,
 };
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
@@ -454,7 +454,9 @@ fn resolve_func_return_type(
     // after DECODE. Its type is not declared, so the result's type is unknown.
     let first_argument = || args.first().map(|arg| type_of(arg)).transpose();
     match func.result_type() {
-        ResultType::Declared(ReturnType::Integer) => Ok(CheckExprType::Integer),
+        ResultType::Declared(ReturnType::Integer | ReturnType::Boolean) => {
+            Ok(CheckExprType::Integer)
+        }
         ResultType::Declared(ReturnType::Real) => Ok(CheckExprType::Real),
         ResultType::Declared(ReturnType::Text) => Ok(CheckExprType::Text),
         ResultType::Declared(ReturnType::Blob) => Ok(CheckExprType::Blob),
@@ -1036,6 +1038,13 @@ fn check_ctas_column_types(
                 if type_def.is_domain || type_def.changes_stored_value() =>
             {
                 dialect.check_ctas_column_type(name, Some(&type_def.name))?
+            }
+            ExprType::Builtin(BuiltinType::Boolean) => {
+                if let Some(type_def) = resolver.schema().type_of_conditions() {
+                    if type_def.changes_stored_value() {
+                        dialect.check_ctas_column_type(name, Some(&type_def.name))?
+                    }
+                }
             }
             // An expression that cannot be typed here, such as DEFAULT, could
             // be a custom type.
@@ -3318,6 +3327,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
         accepts_collate: _,
         range_offsets: _,
         stored_form_sorts_in_value_order: _,
+        is_type_of_conditions: _,
         casts_to_numbers_and_booleans: _,
         sql: _,
         domain_checks,

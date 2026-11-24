@@ -119,6 +119,9 @@ pub struct ResultSetColumn {
     pub implicit_column_name: Option<String>,
     // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
     pub contains_aggregates: bool,
+    /// The type of this column of a VALUES list, when it is the schema's type
+    /// for conditions. `expr` is only a placeholder in a VALUES list.
+    pub(crate) values_condition_type: Option<ExprType>,
 }
 
 impl ResultSetColumn {
@@ -1634,6 +1637,7 @@ fn star_result_column(
         implicit_column_name: None,
         expr,
         contains_aggregates: false,
+        values_condition_type: None,
     }
 }
 
