@@ -8,10 +8,13 @@
 //! that copy table-valued functions into a new schema, or into the temp
 //! schema, do not copy it.
 
-use crate::dialect::{Dialect, Seed, SeededTable};
+use crate::dialect::{CatalogApply, Dialect, Seed, SeededTable};
 use crate::namespace::NamespaceId;
 use crate::numeric::Numeric;
-use crate::schema::{BTreeTable, Column, Index, Schema, Table, TURSO_TYPES_TABLE_NAME};
+use crate::schema::{
+    BTreeTable, Column, Index, Schema, StoredSeed, Table, TURSO_SEED_VERSIONS_TABLE_NAME,
+    TURSO_TYPES_TABLE_NAME,
+};
 use crate::sync::{Arc, OnceLock, RwLock};
 use crate::util::{UnparsedFromSqlIndex, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX};
 use crate::vdbe::affinity::Affinity;
@@ -33,19 +36,42 @@ const FIND: i32 = 1;
 /// stores the seeded tables of a catalog, but core gives them no read-only
 /// table: their seeds are empty, and a database without the stored table
 /// has no table of that name.
-static CORE_SEEDED_TABLES: [SeededTable; 1] = [SeededTable {
-    name: TURSO_TYPES_TABLE_NAME,
-    create_sql: TURSO_TYPES_TABLE_SQL,
-    index_sql: &[],
-    seed: &EmptySeed,
-    hidden_columns: &[],
-    seed_rows: None,
-}];
+static CORE_SEEDED_TABLES: [SeededTable; 2] = [
+    SeededTable {
+        name: TURSO_TYPES_TABLE_NAME,
+        create_sql: TURSO_TYPES_TABLE_SQL,
+        index_sql: &[],
+        seed: &EmptySeed,
+        hidden_columns: &[],
+        seed_rows: None,
+    },
+    SeededTable {
+        name: TURSO_SEED_VERSIONS_TABLE_NAME,
+        create_sql: TURSO_SEED_VERSIONS_TABLE_SQL,
+        index_sql: &[],
+        seed: &EmptySeed,
+        hidden_columns: &[],
+        seed_rows: None,
+    },
+];
 
 /// The `CREATE TABLE` statement of the table of the types made by
 /// `CREATE TYPE` and `CREATE DOMAIN`.
 const TURSO_TYPES_TABLE_SQL: &str =
     "CREATE TABLE __turso_internal_types(name TEXT PRIMARY KEY, sql TEXT)";
+
+/// The `CREATE TABLE` statement of the table of seed versions. It has one
+/// row for each seeded table of the catalog that core stored: the
+/// normalized name of the table, and the [`Seed::version`] and the
+/// [`SeedRowRange`] of the seed that filled it. The first write of a seeded
+/// table of the catalog stores this table, in the same transaction. A stored
+/// seeded table without a row was not filled by this code: core never fills
+/// it again.
+///
+/// [`SeedRowRange`]: crate::dialect::SeedRowRange
+const TURSO_SEED_VERSIONS_TABLE_SQL: &str = "CREATE TABLE __turso_internal_seed_versions(\
+     name TEXT PRIMARY KEY, version INTEGER NOT NULL, seed_column TEXT NOT NULL, \
+     seed_start INTEGER NOT NULL, seed_end INTEGER NOT NULL)";
 
 /// A seed without rows.
 struct EmptySeed;
@@ -374,6 +400,17 @@ impl StoredForm {
             index_rows,
             indexes,
             seed_rows,
+        })
+    }
+
+    /// The seed in the binary, as the table of seed versions records it, or
+    /// None for a seeded table of core, which gets no row there.
+    pub(crate) fn seed_of_binary(&self) -> Option<StoredSeed> {
+        let seed_rows = self.seeded_table.seed_rows.as_ref()?;
+        Some(StoredSeed {
+            version: self.seeded_table.seed.version(),
+            column: seed_rows.column.to_string(),
+            range: seed_rows.range.clone(),
         })
     }
 }
@@ -729,5 +766,23 @@ pub(crate) fn unwritable_index_reason(index: &Index) -> Option<&'static str> {
         Some("an index uses an index method")
     } else {
         None
+    }
+}
+
+/// Records in the schema that `seed` filled the stored seeded table `name`.
+/// The statement that writes the row of the table of seed versions applies
+/// it, so that the next statement of the connection does not fill the
+/// table again.
+#[derive(Debug)]
+pub(crate) struct RecordSeedVersion {
+    /// The normalized name of the seeded table.
+    pub(crate) name: String,
+    pub(crate) seed: StoredSeed,
+}
+
+impl CatalogApply for RecordSeedVersion {
+    fn apply(&self, schema: &mut Schema, _values: &[Value]) -> Result<()> {
+        schema.set_seed_version(&self.name, self.seed.clone());
+        Ok(())
     }
 }

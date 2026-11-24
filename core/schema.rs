@@ -148,6 +148,9 @@ pub const TEMP_SCHEMA_TABLE_NAME: &str = "sqlite_temp_schema";
 pub const TEMP_SCHEMA_TABLE_NAME_ALT: &str = "sqlite_temp_master";
 pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
+/// The table of the main database that keeps, for each seeded table of the
+/// catalog that core stored, the version of the seed that filled it.
+pub const TURSO_SEED_VERSIONS_TABLE_NAME: &str = "__turso_internal_seed_versions";
 /// The table of the main database that keeps the id and name of each
 /// namespace.
 pub const TURSO_NAMESPACES_TABLE_NAME: &str = "__turso_internal_namespaces";
@@ -1276,6 +1279,25 @@ pub struct Schema {
     /// inside. None when the dialect loads nothing. Copies of the schema
     /// share it.
     pub dialect_schema: Option<Arc<dyn std::any::Any + Send + Sync>>,
+
+    /// The seed that filled each stored seeded table, under the normalized
+    /// name of the table, as the table of seed versions has it. A load step
+    /// reads it, so that translation does not read the table.
+    seed_versions: HashMap<String, StoredSeed>,
+}
+
+/// The seed that filled a stored seeded table, as a row of the table of
+/// seed versions has it: the [`Seed::version`] and the [`SeedRowRange`] of
+/// the seed.
+///
+/// [`Seed::version`]: crate::dialect::Seed::version
+/// [`SeedRowRange`]: crate::dialect::SeedRowRange
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredSeed {
+    pub(crate) version: u32,
+    /// The column of the seed row range.
+    pub(crate) column: String,
+    pub(crate) range: std::ops::Range<i64>,
 }
 
 /// What kind of relation a schema object is, for the relations that
@@ -1393,6 +1415,7 @@ impl SchemaBuilder {
                 namespace_names_loaded: true,
                 pending_materialized_views: None,
                 dialect_schema: None,
+                seed_versions: HashMap::default(),
             },
         })
     }
@@ -1651,6 +1674,23 @@ impl Schema {
     /// Whether the names of the namespaces are loaded.
     pub fn namespace_names_loaded(&self) -> bool {
         self.namespace_names_loaded
+    }
+
+    /// Records that `seed` filled the stored seeded table `name`. `name` is
+    /// normalized.
+    pub(crate) fn set_seed_version(&mut self, name: &str, seed: StoredSeed) {
+        self.seed_versions.insert(name.to_string(), seed);
+    }
+
+    /// Whether the seed versions are `versions`.
+    pub(crate) fn has_seed_versions(&self, versions: &HashMap<String, StoredSeed>) -> bool {
+        self.seed_versions == *versions
+    }
+
+    /// Replaces the seed versions with the rows of the table of seed
+    /// versions.
+    pub(crate) fn set_seed_versions(&mut self, versions: HashMap<String, StoredSeed>) {
+        self.seed_versions = versions;
     }
 
     /// Records that the namespace `id` is called `name`.
@@ -5206,6 +5246,7 @@ impl TryClone for Schema {
             namespace_names_loaded: self.namespace_names_loaded,
             pending_materialized_views: self.pending_materialized_views.clone(),
             dialect_schema: self.dialect_schema.clone(),
+            seed_versions: self.seed_versions.try_clone()?,
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
             custom_types_enabled: self.custom_types_enabled,

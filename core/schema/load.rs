@@ -4,8 +4,8 @@
 use crate::connection::Connection;
 use crate::namespace::NamespaceId;
 use crate::schema::{
-    Schema, Sequence, SequencesByNamespace, StoredMaterializedView, TURSO_NAMESPACES_TABLE_NAME,
-    TURSO_TYPES_TABLE_NAME,
+    Schema, Sequence, SequencesByNamespace, StoredMaterializedView, StoredSeed,
+    TURSO_NAMESPACES_TABLE_NAME, TURSO_SEED_VERSIONS_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::statement::StatementOrigin;
 use crate::sync::Arc;
@@ -288,6 +288,9 @@ pub(crate) fn load_steps(conn: &Arc<Connection>, steps_for: StepsFor) -> Vec<Box
         steps.push(Box::new(CustomTypes::new(conn.clone())));
         steps.push(Box::new(ViewsAndIndexes::new(conn.clone())));
     }
+    if !conn.db.seeded_tables.is_empty() {
+        steps.push(Box::new(SeedVersions::new()));
+    }
     steps.extend(conn.db.dialect().catalog().load_steps());
     steps
 }
@@ -378,6 +381,72 @@ impl LoadStep for SeededTables {
 
     fn row(&mut self, _load: &mut SchemaLoad, _row: &Row) -> Result<()> {
         unreachable!("the step has no statement")
+    }
+}
+
+/// Reads the seed that filled each stored seeded table, its version and
+/// its seed row range, from the table of seed versions. Translation
+/// compares it with the seed in the binary, without a read of the table.
+pub(crate) struct SeedVersions {
+    queried: bool,
+    versions: HashMap<String, StoredSeed>,
+}
+
+impl SeedVersions {
+    pub(crate) fn new() -> Self {
+        Self {
+            queried: false,
+            versions: HashMap::default(),
+        }
+    }
+}
+
+impl LoadStep for SeedVersions {
+    fn next_query(&mut self, load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
+        if self.queried {
+            return Ok(None);
+        }
+        self.queried = true;
+        if load
+            .schema()
+            .has_table(NamespaceId::ROOT, TURSO_SEED_VERSIONS_TABLE_NAME)
+        {
+            return Ok(Some(LoadQuery::internal_helper(format!(
+                "SELECT name, version, seed_column, seed_start, seed_end \
+                 FROM {TURSO_SEED_VERSIONS_TABLE_NAME}"
+            ))));
+        }
+        self.end_of_rows(load)?;
+        Ok(None)
+    }
+
+    fn row(&mut self, _load: &mut SchemaLoad, row: &Row) -> Result<()> {
+        let name = row.get::<&str>(0)?;
+        let version = row.get::<i64>(1)?;
+        // Only core writes the table, and users cannot write it.
+        let version = u32::try_from(version).map_err(|_| {
+            LimboError::Corrupt(format!(
+                "{TURSO_SEED_VERSIONS_TABLE_NAME} has the version {version} for {name}"
+            ))
+        })?;
+        let seed = StoredSeed {
+            version,
+            column: row.get::<&str>(2)?.to_string(),
+            range: row.get::<i64>(3)?..row.get::<i64>(4)?,
+        };
+        self.versions
+            .insert(crate::util::normalize_ident(name), seed);
+        Ok(())
+    }
+
+    fn end_of_rows(&mut self, load: &mut SchemaLoad) -> Result<()> {
+        // Changes the schema only when the versions differ, so that most
+        // schemas are not copied.
+        if !load.schema().has_seed_versions(&self.versions) {
+            load.schema_mut()?
+                .set_seed_versions(std::mem::take(&mut self.versions));
+        }
+        Ok(())
     }
 }
 

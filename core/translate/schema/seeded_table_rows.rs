@@ -2,12 +2,13 @@
 //! the rows of a seeded table.
 
 use crate::dialect::seeded::{
-    unwritable_index_reason, unwritable_table_reason, SeedRowColumn, StoredForm, SEED_SCAN,
+    unwritable_index_reason, unwritable_table_reason, RecordSeedVersion, SeedRowColumn, StoredForm,
+    SEED_SCAN,
 };
 use crate::dialect::CmdContext;
 use crate::error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_ERROR};
 use crate::namespace::NamespaceId;
-use crate::schema::{BTreeTable, Index, Table};
+use crate::schema::{BTreeTable, Index, Table, TURSO_SEED_VERSIONS_TABLE_NAME};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
@@ -268,6 +269,11 @@ fn store_seeded_table(
     if !form.seeded_table.seed.is_empty() {
         emit_fill(program, form, &writer);
     }
+    // A seeded table of core has no read-only table and no version: its
+    // seed is empty and stays empty.
+    if form.read_only.is_some() {
+        emit_record_seed_version(ctx, program, form)?;
+    }
     Ok(writer)
 }
 
@@ -314,6 +320,82 @@ fn emit_fill(program: &mut ProgramBuilder, form: &StoredForm, writer: &SeededTab
         pc_if_next: next_row,
     });
     program.preassign_label_to_next_insn(done);
+}
+
+/// Writes the row of `form` in the table of seed versions, with the version
+/// and the seed row range of the seed in the binary, and records them in
+/// the schema. The row replaces the row that the table had, if it had one.
+fn emit_record_seed_version(
+    ctx: &CmdContext<'_>,
+    program: &mut ProgramBuilder,
+    form: &StoredForm,
+) -> Result<()> {
+    let Some(seed) = form.seed_of_binary() else {
+        unreachable!("only a seeded table of a catalog gets a seed version");
+    };
+    let versions = ctx.open_seeded_table_for_write(program, TURSO_SEED_VERSIONS_TABLE_NAME)?;
+    let cursor_id = versions.cursor_id();
+    let row_reg = program.alloc_registers(5);
+    program.emit_insn(Insn::String8 {
+        value: form.name.clone(),
+        dest: row_reg,
+    });
+    program.emit_insn(Insn::Integer {
+        value: i64::from(seed.version),
+        dest: row_reg + 1,
+    });
+    program.emit_insn(Insn::String8 {
+        value: seed.column.clone(),
+        dest: row_reg + 2,
+    });
+    program.emit_insn(Insn::Integer {
+        value: seed.range.start,
+        dest: row_reg + 3,
+    });
+    program.emit_insn(Insn::Integer {
+        value: seed.range.end,
+        dest: row_reg + 4,
+    });
+
+    // The table has a row for the name when the seeded table was stored
+    // before, and then dropped.
+    let done = program.allocate_label();
+    let next_row = program.allocate_label();
+    let skip = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id,
+        pc_if_empty: done,
+    });
+    program.preassign_label_to_next_insn(next_row);
+    let name_reg = program.alloc_register();
+    program.emit_column_or_rowid(cursor_id, 0, name_reg);
+    program.emit_insn(Insn::Ne {
+        lhs: name_reg,
+        rhs: row_reg,
+        target_pc: skip,
+        flags: CmpInsFlags::default().jump_if_null(),
+        collation: CollationSeq::for_internal_values(),
+    });
+    versions.emit_delete(program);
+    program.preassign_label_to_next_insn(skip);
+    program.emit_insn(Insn::Next {
+        cursor_id,
+        pc_if_next: next_row,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(done);
+
+    versions.emit_insert(program, row_reg);
+    program.emit_insn(Insn::CatalogApply {
+        db: MAIN_DB_ID,
+        apply: Arc::new(RecordSeedVersion {
+            name: form.name.clone(),
+            seed,
+        }),
+        value_regs: Vec::new(),
+    });
+    Ok(())
 }
 
 impl SeededTableWriter {

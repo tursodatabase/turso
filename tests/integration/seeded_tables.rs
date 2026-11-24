@@ -1361,10 +1361,12 @@ fn same_table_twice_in_one_statement(mvcc: bool) {
     let db = open(&new_path(&dir), dialect.clone(), mvcc);
     let conn = db.connect_limbo();
     let program = opcodes(&conn, "CREATE TABLE twice1 (a)");
-    // twice1, seed_items and its index seed_items_name.
-    assert_eq!(count_opcode(&program, "CreateBtree"), 3, "{program:?}");
+    // twice1, seed_items and its index seed_items_name, and the table of
+    // seed versions and its automatic index.
+    assert_eq!(count_opcode(&program, "CreateBtree"), 5, "{program:?}");
     assert_eq!(count_opcode(&program, "VOpen"), 1, "{program:?}");
-    assert_eq!(count_opcode(&program, "ParseSchema"), 2, "{program:?}");
+    assert_eq!(count_opcode(&program, "ParseSchema"), 3, "{program:?}");
+    assert_eq!(count_opcode(&program, "CatalogApply"), 1, "{program:?}");
     conn.execute("CREATE TABLE twice1 (a)").unwrap();
     assert_eq!(
         all_items(&conn),
@@ -1792,6 +1794,139 @@ fn type_statements_keep_change_counters_mvcc() {
     type_statements_keep_change_counters(true);
 }
 
+/// The rows of the table of seed versions, by name.
+fn seed_versions(conn: &Arc<Connection>) -> Vec<Vec<SqlValue>> {
+    rows(
+        conn,
+        "SELECT name, version FROM __turso_internal_seed_versions ORDER BY name",
+    )
+}
+
+/// The `type` and `name` of the `sqlite_schema` rows of the table of seed
+/// versions.
+fn seed_versions_schema_rows(conn: &Arc<Connection>) -> Vec<Vec<SqlValue>> {
+    rows(
+        conn,
+        "SELECT type, name FROM sqlite_schema \
+         WHERE tbl_name = '__turso_internal_seed_versions' ORDER BY rowid",
+    )
+}
+
+/// The first write of a seeded table stores the table of seed versions in
+/// its transaction, with a row that has the version and the seed row range
+/// of the seed. A rollback leaves neither the table nor the row. Each
+/// seeded table that a statement stores gets its own row.
+fn first_write_records_the_seed_version(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    let dialect = SeedDialect::new();
+    {
+        let db = open(&path, dialect.clone(), mvcc);
+        let conn = db.connect_limbo();
+        let err = error_of(&conn, "SELECT * FROM __turso_internal_seed_versions");
+        assert!(err.contains("no such table"), "{err}");
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("CREATE TABLE t1 (a)").unwrap();
+        assert_eq!(seed_versions(&conn), vec![vec![text("seed_items"), int(1)]]);
+        conn.execute("ROLLBACK").unwrap();
+        let err = error_of(&conn, "SELECT * FROM __turso_internal_seed_versions");
+        assert!(err.contains("no such table"), "{err}");
+
+        conn.execute("CREATE TABLE words1 (a)").unwrap();
+        assert_eq!(
+            seed_versions(&conn),
+            vec![
+                vec![text("seed_items"), int(1)],
+                vec![text("seed_words"), int(1)],
+            ]
+        );
+        assert_eq!(
+            seed_versions_schema_rows(&conn),
+            vec![
+                vec![text("table"), text("__turso_internal_seed_versions")],
+                vec![
+                    text("index"),
+                    text("sqlite_autoindex___turso_internal_seed_versions_1")
+                ],
+            ]
+        );
+        // The row also has the seed row range of the seed.
+        assert_eq!(
+            rows(
+                &conn,
+                "SELECT * FROM __turso_internal_seed_versions ORDER BY name"
+            ),
+            vec![
+                vec![text("seed_items"), int(1), text("oid"), int(0), int(31)],
+                vec![text("seed_words"), int(1), text("length"), int(0), int(6)],
+            ]
+        );
+        // A write to a stored table writes no new row.
+        conn.execute("CREATE TABLE t2 (a)").unwrap();
+        assert_eq!(seed_versions(&conn).len(), 2);
+        let other = db.connect_limbo();
+        assert_eq!(seed_versions(&other).len(), 2);
+        assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+        let err = error_of(&conn, "DELETE FROM __turso_internal_seed_versions");
+        assert!(err.contains("may not be modified"), "{err}");
+        if !mvcc {
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        conn.close().unwrap();
+        other.close().unwrap();
+    }
+    if !mvcc {
+        assert_eq!(sqlite_integrity_check(&path), "ok");
+    }
+    let db = open(&path, dialect, mvcc);
+    let conn = db.connect_limbo();
+    assert_eq!(
+        seed_versions(&conn),
+        vec![
+            vec![text("seed_items"), int(1)],
+            vec![text("seed_words"), int(1)],
+        ]
+    );
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn first_write_records_the_seed_version_wal() {
+    first_write_records_the_seed_version(false);
+}
+
+#[test]
+fn first_write_records_the_seed_version_mvcc() {
+    first_write_records_the_seed_version(true);
+}
+
+/// A stored seeded table that is dropped and stored again replaces its row
+/// in the table of seed versions.
+fn stored_again_replaces_the_seed_version_row(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&new_path(&dir), SeedDialect::new(), mvcc);
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t1 (a)").unwrap();
+    conn.execute("DROP TABLE seed_items").unwrap();
+    assert_eq!(rows(&conn, "SELECT * FROM seed_items"), seed_item_rows());
+    assert_eq!(seed_versions(&conn), vec![vec![text("seed_items"), int(1)]]);
+    conn.execute("CREATE TABLE t2 (a)").unwrap();
+    assert_eq!(seed_versions(&conn), vec![vec![text("seed_items"), int(1)]]);
+    assert_eq!(all_items(&conn), items_with_user_tables(&["t2"]));
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn stored_again_replaces_the_seed_version_row_wal() {
+    stored_again_replaces_the_seed_version_row(false);
+}
+
+#[test]
+fn stored_again_replaces_the_seed_version_row_mvcc() {
+    stored_again_replaces_the_seed_version_row(true);
+}
+
 /// A row that the catalog writes inside the seed row range fails the
 /// statement, whether the statement stores the table or the table was
 /// stored before, so that a refill never deletes a row that the catalog
@@ -1867,6 +2002,8 @@ fn seed_row_outside_the_seed_row_range_fails(mvcc: bool) {
         "{err}"
     );
     assert_read_only_items(&conn, &dialect);
+    let err = error_of(&conn, "SELECT * FROM __turso_internal_seed_versions");
+    assert!(err.contains("no such table"), "{err}");
 }
 
 #[test]
