@@ -367,6 +367,7 @@ pub enum OpenDbAsyncPhase {
     /// has no table roots and has not replayed its logical log, and recovery
     /// rebuilds the schema from the schema rows.
     RunningLoadSteps,
+    RefreshingMvccStats,
     Done,
 }
 
@@ -597,11 +598,26 @@ pub struct ConnectAsyncState {
     opts: Option<ConnectOpts>,
     init: InitState,
     database: Option<Arc<Database>>,
+    use_shared_stats: bool,
 }
 
 impl ConnectAsyncState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Use the shared schema's ANALYZE stats on MVCC connections. This avoids
+    /// opening a read transaction during connection startup to rescan sqlite_stat1.
+    pub fn with_shared_stats() -> Self {
+        let mut state = Self::new();
+        state.use_shared_stats = true;
+        state
+    }
+
+    fn reset(&mut self) {
+        let use_shared_stats = self.use_shared_stats;
+        *self = Self::new();
+        self.use_shared_stats = use_shared_stats;
     }
 }
 
@@ -639,6 +655,7 @@ pub struct OpenDbAsyncState {
     mvcc_convert_stmt: Option<crate::Statement>,
     /// The loader of `RunningLoadSteps`, held across yields.
     schema_loader: Option<SchemaLoader>,
+    mvcc_stats_refresh: Option<Box<RefreshAnalyzeStatsState>>,
     conn: Option<Arc<Connection>>,
 }
 
@@ -666,6 +683,7 @@ impl OpenDbAsyncState {
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
             mvcc_convert_stmt: None,
             schema_loader: None,
+            mvcc_stats_refresh: None,
         }
     }
 }
@@ -689,6 +707,7 @@ impl OpenDbAsyncState {
         self.mvcc_convert_stmt = None;
         self.mvcc_bootstrap_state = mvcc::database::BootstrapState::default();
         self.schema_loader = None;
+        self.mvcc_stats_refresh = None;
         self.mvcc_bootstrap_conn = None;
         self.conn = None;
         self.pager = None;
@@ -1950,7 +1969,27 @@ impl Database {
                     });
                     return_if_io!(loader.run(conn));
                     let loader = state.schema_loader.take().expect("set above");
-                    db.replace_schema(loader.into_schema());
+                    let schema = loader.into_schema();
+                    db.replace_schema(schema.clone());
+                    *conn.schema.write() = schema;
+                    state.phase = OpenDbAsyncPhase::RefreshingMvccStats;
+                }
+
+                OpenDbAsyncPhase::RefreshingMvccStats => {
+                    let db = state.db.as_ref().expect("database is open");
+                    let conn = state.conn.as_ref().expect("open connection is available");
+                    // Load the shared stats before the database can be used by a checkpoint.
+                    if db.mvcc_enabled() {
+                        let refresh = state.mvcc_stats_refresh.get_or_insert_with(Box::default);
+                        match refresh_analyze_stats_nonblock(conn, refresh) {
+                            Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                            Ok(IOResult::Done(())) => {}
+                            Err(err) => {
+                                tracing::warn!("Failed to refresh analyze stats on open: {err}")
+                            }
+                        }
+                    }
+                    state.mvcc_stats_refresh = None;
 
                     state.phase = OpenDbAsyncPhase::Done;
                     return Ok(IOResult::Done(
@@ -2872,18 +2911,18 @@ impl Database {
                     conn
                 }
             };
-            match refresh_analyze_stats_nonblock(&conn, &mut state.refresh) {
-                Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
-                Ok(IOResult::Done(())) => {}
-                Err(err) => {
-                    tracing::warn!("Failed to refresh analyze stats on connect: {err}");
+            if !state.use_shared_stats || !self.mvcc_enabled() {
+                match refresh_analyze_stats_nonblock(&conn, &mut state.refresh) {
+                    Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                    Ok(IOResult::Done(())) => {}
+                    Err(err) => tracing::warn!("Failed to refresh analyze stats on connect: {err}"),
                 }
             }
-            *state = ConnectAsyncState::default();
+            state.reset();
             Ok(IOResult::Done(conn))
         })();
         if result.is_err() {
-            *state = ConnectAsyncState::default();
+            state.reset();
         }
         result
     }
