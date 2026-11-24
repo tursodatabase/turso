@@ -67,8 +67,9 @@ pub enum BuiltinType {
     Numeric,
     /// The result of a comparison, `NOT`, `IN`, `LIKE`, `EXISTS` and the
     /// like: 1, 0 or NULL. SQLite has no boolean type, so this is an integer
-    /// wherever SQLite computes with it, and a result column of this type
-    /// is reported as INTEGER.
+    /// wherever SQLite computes with it. A result column of this type is
+    /// reported as the type that the schema has for conditions, if it has
+    /// one (see `Type::is_type_of_conditions`), and as INTEGER otherwise.
     Boolean,
     Text,
     Blob,
@@ -1291,8 +1292,16 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
             ExprType::Untyped | ExprType::Builtin(Text),
         ) => ExprType::Builtin(Text),
         (ExprType::Builtin(a), ExprType::Builtin(b)) if a == b => ExprType::Builtin(a),
-        // The result of a comparison mixed with another type is an integer,
-        // as it is to SQLite: `CASE WHEN c THEN a < b ELSE 5 END`.
+        // The result of a comparison mixed with a value of the schema's type
+        // for conditions is a value of that type: `coalesce(a < b, flag)`.
+        (ExprType::Builtin(BuiltinType::Boolean), conditions @ ExprType::Custom { .. })
+        | (conditions @ ExprType::Custom { .. }, ExprType::Builtin(BuiltinType::Boolean))
+            if matches!(&conditions, ExprType::Custom { type_def, .. } if type_def.is_type_of_conditions) =>
+        {
+            conditions
+        }
+        // Mixed with another type it is an integer, as it is to SQLite:
+        // `CASE WHEN c THEN a < b ELSE 5 END`.
         (ExprType::Builtin(BuiltinType::Boolean), other)
         | (other, ExprType::Builtin(BuiltinType::Boolean)) => {
             common_scalar_type(ExprType::Builtin(Integer), other, schema)

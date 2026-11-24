@@ -459,6 +459,10 @@ pub struct TypeDef {
     /// built-in date and time types, which store one text form with a 4-digit
     /// year. False for a domain, whose index then serves only `=`.
     pub stored_form_sorts_in_value_order: bool,
+    /// Whether a comparison and the other conditions give a value of this
+    /// type (see `Type::is_type_of_conditions`). False for a domain, a user
+    /// type and a STRUCT or UNION.
+    pub is_type_of_conditions: bool,
     /// FIXME(pg-catalog): This field hand-codes that pg_cast has entries from jsonb to boolean, smallint, integer, bigint, real, double precision and numeric, and none from the other types that read text. A lookup in a pg_cast table replaces this.
     /// Whether values of the type may be cast to number and boolean types, as
     /// PostgreSQL casts jsonb to the integer types, real, double precision,
@@ -791,6 +795,7 @@ impl TypeDef {
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
                     stored_form_sorts_in_value_order: false,
+                    is_type_of_conditions: false,
                     casts_to_numbers_and_booleans: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
@@ -827,6 +832,7 @@ impl TypeDef {
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
                     stored_form_sorts_in_value_order: false,
+                    is_type_of_conditions: false,
                     casts_to_numbers_and_booleans: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
@@ -857,6 +863,7 @@ impl TypeDef {
             range_offsets: Some(ty.range_offsets()),
             accepts_collate: Some(ty.accepts_collate()),
             stored_form_sorts_in_value_order: ty.stored_form_sorts_in_value_order(),
+            is_type_of_conditions: ty.is_type_of_conditions(),
             casts_to_numbers_and_booleans: ty.casts_to_numbers_and_booleans(),
             sql,
             domain_checks: std::vec::Vec::new(),
@@ -894,6 +901,7 @@ impl TypeDef {
             range_offsets: None,
             accepts_collate: None,
             stored_form_sorts_in_value_order: false,
+            is_type_of_conditions: false,
             casts_to_numbers_and_booleans: false,
             sql,
             domain_checks: constraints.to_vec(),
@@ -2238,6 +2246,14 @@ impl Schema {
     /// CREATE TABLE validation, CAST).
     pub fn get_type_def_unchecked(&self, type_name: &str) -> Option<&Arc<TypeDef>> {
         self.type_registry.get(&type_registry_key(type_name))
+    }
+
+    /// The type that a comparison and the other conditions give a value of,
+    /// when the schema has one (see `Type::is_type_of_conditions`).
+    pub fn type_of_conditions(&self) -> Option<&Arc<TypeDef>> {
+        self.type_registry
+            .values()
+            .find(|type_def| type_def.is_type_of_conditions)
     }
 
     /// Resolve a custom type fully: look it up (with strictness gate) and chase

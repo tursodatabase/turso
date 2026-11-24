@@ -18,9 +18,16 @@ pub(crate) fn result_column_types(
     let env = TypeEnv::new(Some(table_references), resolver);
     result_columns
         .iter()
-        .map(|column| match &column.expr {
+        .map(|result_column| match &result_column.expr {
             ast::Expr::Column { table, column, .. } => {
-                table_column_type(*table, *column, table_references, resolver.schema())
+                // A column of a subquery in FROM may be a condition of that
+                // subquery: `SELECT x FROM (SELECT a < b AS x FROM t)`.
+                match type_of(&result_column.expr, &env) {
+                    ty @ ExprType::Builtin(BuiltinType::Boolean) => {
+                        expression_type(&ty, resolver.schema())
+                    }
+                    _ => table_column_type(*table, *column, table_references, resolver.schema()),
+                }
             }
             expr => expression_type(&type_of(expr, &env), resolver.schema()),
         })
@@ -48,6 +55,8 @@ fn table_column_type(
 /// Any other expression reports the SQLite primitive behind its type: INTEGER,
 /// REAL, NUMERIC or TEXT, or nothing when the value may be anything. An
 /// expression of a custom type reports it the way a column of that type does.
+/// A condition, such as a comparison, reports the type the schema has for
+/// conditions, and INTEGER when the schema has none.
 fn expression_type(ty: &ExprType, schema: &Schema) -> Option<ColumnTypeInfo> {
     let (element, array_dimensions) = match ty {
         ExprType::Array {
@@ -56,18 +65,27 @@ fn expression_type(ty: &ExprType, schema: &Schema) -> Option<ColumnTypeInfo> {
         } => (element.as_ref(), *dimensions),
         scalar => (scalar, 0),
     };
+    let custom_type = match element {
+        ExprType::Custom { type_def, .. } => Some(type_def),
+        // An array of conditions is an array of integers.
+        ExprType::Builtin(BuiltinType::Boolean) if array_dimensions == 0 => {
+            schema.type_of_conditions()
+        }
+        _ => None,
+    };
+    if let Some(type_def) = custom_type {
+        let (base_type, kind) = custom_type_info(&type_def.name, true, schema);
+        return Some(ColumnTypeInfo {
+            declared_name: type_def.name.clone(),
+            array_dimensions,
+            base_type,
+            kind,
+        });
+    }
     let declared_name = match element {
         ExprType::Builtin(builtin) => builtin_primitive(*builtin)?.to_string(),
         ExprType::Untyped => "TEXT".to_string(),
-        ExprType::Custom { type_def, .. } => {
-            let (base_type, kind) = custom_type_info(&type_def.name, true, schema);
-            return Some(ColumnTypeInfo {
-                declared_name: type_def.name.clone(),
-                array_dimensions,
-                base_type,
-                kind,
-            });
-        }
+        ExprType::Custom { .. } => unreachable!("a custom type was reported above"),
         ExprType::Null
         | ExprType::Unknown
         | ExprType::NotKnownYet
