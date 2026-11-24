@@ -850,6 +850,14 @@ fn translate_cast_expr(
         let source = type_of(expr, &TypeEnv::new(referenced_tables, resolver));
         let target = custom_type_cast_chain(tn, resolver.schema())?;
         check_cast_from_text_input_type(&source, target.as_ref(), tn, resolver)?;
+        // An array is a record blob in a register. A CAST of it to a type that
+        // is not an array converts its text form, the text the client sees:
+        // CAST(ARRAY[1,2] AS TEXT) is '{1,2}'.
+        if source.is_array() && tn.array_dimensions == 0 {
+            program.emit_insn(Insn::ArrayDecode {
+                reg: target_register,
+            });
+        }
     }
 
     let cast_type_name = type_name.as_ref().map(|tn| crate::util::dequote(&tn.name));

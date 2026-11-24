@@ -1093,6 +1093,16 @@ expect {
     7
 }
 
+# CAST of an array to a type that is not an array converts its display text.
+test array-cast-to-text {
+    CREATE TABLE array_text_source (a int[]);
+    INSERT INTO array_text_source VALUES (ARRAY[5,6]);
+    SELECT a::text FROM array_text_source;
+}
+expect {
+    {5,6}
+}
+
 test union-of-null-and-array-is-array {
     SELECT 0, NULL UNION ALL SELECT 1, ARRAY[1,2];
 }
