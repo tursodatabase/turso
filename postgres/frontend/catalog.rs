@@ -416,6 +416,14 @@ impl Dialect for PostgresDialect {
     fn json_contains_function(&self) -> Option<&'static str> {
         Some("jsonb_contains")
     }
+
+    fn jsonb_concat_function(&self) -> Option<&'static str> {
+        Some("jsonb_concat")
+    }
+
+    fn jsonb_delete_function(&self) -> Option<&'static str> {
+        Some("jsonb_delete")
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {

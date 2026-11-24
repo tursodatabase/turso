@@ -289,6 +289,12 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "jsonb_exists_all"(FunctionArity::Exact(2), true) => {
             exec_jsonb_exists_keys(args[0].get_value(), args[1].get_value(), KeysWanted::All)?
         },
+        "jsonb_concat"(FunctionArity::Exact(2), true) => {
+            exec_jsonb_concat(args[0].get_value(), args[1].get_value())?
+        },
+        "jsonb_delete"(FunctionArity::Exact(2), true) => {
+            exec_jsonb_delete(args[0].get_value(), args[1].get_value())?
+        },
         "format_type"(FunctionArity::OneOf(&[1, 2]), true) => oid_arg(args, 0)?
             .map(|type_oid| format_type(type_oid, int_arg(args, 1, -1))),
         "pg_get_constraintdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
@@ -458,6 +464,19 @@ struct Json(String);
 
 impl ScalarReturn for Json {
     const TYPE: Option<ReturnType> = Some(ReturnType::Custom("json"));
+
+    fn into_value(self) -> Value {
+        Value::build_text(self.0)
+    }
+}
+
+/// A `jsonb` value in its text form, which is the form that the type's DECODE
+/// gives. Returning one gives the function the type `jsonb`, as in
+/// PostgreSQL, instead of text.
+struct Jsonb(String);
+
+impl ScalarReturn for Jsonb {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Custom("jsonb"));
 
     fn into_value(self) -> Value {
         Value::build_text(self.0)
@@ -1079,6 +1098,154 @@ fn json_top_level_strings(json: &str) -> Result<Vec<String>> {
     Ok(strings)
 }
 
+/// PostgreSQL's `jsonb || jsonb`, which is also its function jsonb_concat().
+/// Two objects give an object with the fields of both, and a field that both
+/// have takes the value of the right one. Any other two documents give an
+/// array with the elements of both, where an object or a scalar counts as an
+/// array of one element. Core runs this function for `||` when an operand is
+/// a jsonb value (see Dialect::jsonb_concat_function).
+fn exec_jsonb_concat(left: &Value, right: &Value) -> Result<Option<Jsonb>> {
+    if matches!(left, Value::Numeric(_) | Value::Blob(_))
+        || matches!(right, Value::Numeric(_) | Value::Blob(_))
+    {
+        let type_name = |value: &Value| match value {
+            Value::Text(_) => "jsonb",
+            other => pg_type_name(other),
+        };
+        return Err(undefined_operator(type_name(left), "||", type_name(right)));
+    }
+    // Both operands are validated before a NULL gives NULL, because
+    // PostgreSQL reads a string literal as a jsonb value before the operator
+    // runs: `NULL || 'x'` fails.
+    let left = json_operand(left, "||", right)?;
+    let right = json_operand(right, "||", &Value::Null)?;
+    let (Some(left), Some(right)) = (left, right) else {
+        return Ok(None);
+    };
+    let mut out = String::new();
+    match (json_parts(left)?, json_parts(right)?) {
+        (JsonParts::Object(mut fields), JsonParts::Object(right_fields)) => {
+            fields.extend(right_fields);
+            push_json_object(&fields, &mut out);
+        }
+        (left, right) => {
+            out.push('[');
+            let mut count = 0;
+            push_as_array_elements(&left, &mut count, &mut out);
+            push_as_array_elements(&right, &mut count, &mut out);
+            out.push(']');
+        }
+    }
+    Ok(Some(Jsonb(out)))
+}
+
+/// Writes `parts` as elements of the array that `out` ends with, after
+/// `count` elements. An array gives its elements, and an object or a scalar
+/// is one element, as `jsonb || jsonb` reads an operand.
+fn push_as_array_elements(parts: &JsonParts, count: &mut usize, out: &mut String) {
+    let mut separate = |out: &mut String| {
+        if *count > 0 {
+            out.push(',');
+        }
+        *count += 1;
+    };
+    match parts {
+        JsonParts::Array(elements) => {
+            for element in elements {
+                separate(out);
+                push_minified_json(element, out);
+            }
+        }
+        JsonParts::Object(fields) => {
+            separate(out);
+            push_json_object(fields, out);
+        }
+        JsonParts::Scalar(scalar) => {
+            separate(out);
+            push_minified_json(scalar, out);
+        }
+    }
+}
+
+/// PostgreSQL's `jsonb - text`, `jsonb - text[]` and `jsonb - integer`,
+/// which are also its function jsonb_delete(). A text removes the field with
+/// that name from an object, or each string element equal to it from an
+/// array. Each text of a text[] does the same, and a NULL element is skipped.
+/// An integer removes the array element at that index, and a negative index
+/// counts from the end. Core runs this function for `-` when the left operand
+/// is a jsonb value (see Dialect::jsonb_delete_function).
+///
+/// FIXME(pg-catalog): This chooses between the pg_operator entries `jsonb - text`, `jsonb - text[]` and `jsonb - integer` from the value of `key`, because the operands have no PostgreSQL types. An untyped string literal is text, as PostgreSQL resolves it, and an array literal must be cast to text[]. A lookup in pg_operator by the types of the operands replaces this.
+fn exec_jsonb_delete(json: &Value, key: &Value) -> Result<Option<Jsonb>> {
+    let Some(json) = json_operand(json, "-", key)? else {
+        return Ok(None);
+    };
+    /// What `-` removes.
+    enum Removed {
+        /// The fields with these names, or the string elements equal to them.
+        Keys(Vec<String>),
+        /// The array element at this index.
+        Index(i32),
+    }
+    let removed = match key {
+        Value::Null => return Ok(None),
+        Value::Text(name) => Removed::Keys(vec![name.as_str().to_string()]),
+        Value::Blob(_) => match text_array_operand(key, "-")? {
+            Some(names) => Removed::Keys(names.into_iter().flatten().collect()),
+            None => return Ok(None),
+        },
+        Value::Numeric(Numeric::Integer(index)) => match i32::try_from(*index) {
+            Ok(index) => Removed::Index(index),
+            // PostgreSQL has `-` for jsonb and int4 only.
+            Err(_) => return Err(undefined_operator("jsonb", "-", "bigint")),
+        },
+        other => return Err(undefined_operator("jsonb", "-", pg_type_name(other))),
+    };
+    let mut out = String::new();
+    match (json_parts(json)?, removed) {
+        (JsonParts::Scalar(_), _) => {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "cannot delete from scalar",
+                None,
+            ))
+        }
+        (JsonParts::Object(_), Removed::Index(_)) => {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "cannot delete from object using integer index",
+                None,
+            ))
+        }
+        (JsonParts::Object(mut fields), Removed::Keys(names)) => {
+            fields.retain(|(name, _)| !names.contains(name));
+            push_json_object(&fields, &mut out);
+        }
+        (JsonParts::Array(elements), Removed::Keys(names)) => {
+            let mut kept = Vec::with_capacity(elements.len());
+            for element in elements {
+                if element.starts_with('"') && names.contains(&decode_json_string(element, &mut 0)?)
+                {
+                    continue;
+                }
+                kept.push(element);
+            }
+            push_json_array(&kept, &mut out);
+        }
+        (JsonParts::Array(mut elements), Removed::Index(index)) => {
+            let len = elements.len() as i64;
+            let index = i64::from(index);
+            let index = if index < 0 { index + len } else { index };
+            // An index outside the array removes nothing.
+            if (0..len).contains(&index) {
+                elements.remove(index as usize);
+            }
+            push_json_array(&elements, &mut out);
+        }
+    }
+    Ok(Some(Jsonb(out)))
+}
+
 /// A JSON document split into its members, each with its JSON text as the
 /// document has it.
 enum JsonParts<'a> {
@@ -1119,6 +1286,70 @@ fn json_parts(json: &str) -> Result<JsonParts<'_>> {
 
 fn is_json_whitespace(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r')
+}
+
+/// Writes an object with `fields` as JSON text, without white space between
+/// tokens. Of two fields with the same name, the value of the last one is
+/// written at the place of the first one, because jsonb keeps one field for
+/// each name and the last one counts.
+fn push_json_object(fields: &[(String, &str)], out: &mut String) {
+    let mut unique: Vec<(&str, &str)> = Vec::with_capacity(fields.len());
+    let mut place_of_name: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(fields.len());
+    for (name, value) in fields {
+        match place_of_name.get(name.as_str()) {
+            Some(&place) => unique[place].1 = value,
+            None => {
+                place_of_name.insert(name, unique.len());
+                unique.push((name, value));
+            }
+        }
+    }
+    out.push('{');
+    for (i, (name, value)) in unique.into_iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        push_json_string(name, out);
+        out.push(':');
+        push_minified_json(value, out);
+    }
+    out.push('}');
+}
+
+/// Writes an array with `elements` as JSON text, without white space between
+/// tokens.
+fn push_json_array(elements: &[&str], out: &mut String) {
+    out.push('[');
+    for (i, element) in elements.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        push_minified_json(element, out);
+    }
+    out.push(']');
+}
+
+/// Writes the valid JSON text `json` without the white space between its
+/// tokens. Strings and numbers stay as they are written.
+fn push_minified_json(json: &str, out: &mut String) {
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in json.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            out.push(c);
+        } else if !is_json_whitespace(c) {
+            in_string = c == '"';
+            out.push(c);
+        }
+    }
 }
 
 /// The value of the JSON text `value` as `->>` and `#>>` give it: a string

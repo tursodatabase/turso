@@ -4164,6 +4164,31 @@ impl PostgreSQLTranslator {
             ));
         };
 
+        // PostgreSQL has `||` and `-` for jsonb, and only core knows the
+        // types of the operands, so core chooses (see
+        // Dialect::jsonb_concat_function). A `::jsonb` cast is lowered to a
+        // cast to text (see pg_type_name_to_ast_type), so such an operand of
+        // `||` or `-` is cast to jsonb instead, for core to see its type.
+        //
+        // A generation expression and an index expression can use only core
+        // functions, so their casts stay casts to text. Thus the values that
+        // such a column or index stored before also stay the same.
+        let (left, right) = if matches!(op_name, "||" | "-")
+            && self.generation_expression_table.borrow().is_none()
+            && !self.translating_index.get()
+        {
+            let rexpr = a_expr
+                .rexpr
+                .as_deref()
+                .expect("the right operand was translated");
+            (
+                Box::new(keep_jsonb_cast(a_expr.lexpr.as_deref().unwrap(), *left)?),
+                Box::new(keep_jsonb_cast(rexpr, *right)?),
+            )
+        } else {
+            (left, right)
+        };
+
         let right = if matches!(op_name, "~*" | "!~*") {
             Box::new(ast::Expr::Binary(
                 Box::new(ast::Expr::Literal(ast::Literal::String(
@@ -10079,6 +10104,40 @@ fn deparse_default_expr(node: &pg_query::protobuf::Node) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// `translated`, the translation of the operand `node`, with its cast to
+/// text changed to a cast to jsonb when `node` is a cast to jsonb.
+///
+/// FIXME(pg-catalog): This keeps the type jsonb only for the operands of `||` and `-`, because pg_type_name_to_ast_type lowers jsonb to text in every other cast. A typed expression tree that keeps the type of each cast replaces this.
+fn keep_jsonb_cast(
+    node: &pg_query::protobuf::Node,
+    translated: ast::Expr,
+) -> Result<ast::Expr, ParseError> {
+    let Some(pg_query::protobuf::node::Node::TypeCast(type_cast)) = &node.node else {
+        return Ok(translated);
+    };
+    let Some(type_name) = &type_cast.type_name else {
+        return Ok(translated);
+    };
+    if !type_name.array_bounds.is_empty()
+        || !extract_type_name_from_typename(type_name)?.eq_ignore_ascii_case("jsonb")
+    {
+        return Ok(translated);
+    }
+    Ok(match translated {
+        ast::Expr::Cast {
+            expr,
+            type_name: Some(mut cast_type),
+        } if cast_type.name == "TEXT" => {
+            cast_type.name = "jsonb".to_string();
+            ast::Expr::Cast {
+                expr,
+                type_name: Some(cast_type),
+            }
+        }
+        other => other,
+    })
 }
 
 fn function_call(name: &str, args: Vec<ast::Expr>) -> ast::Expr {

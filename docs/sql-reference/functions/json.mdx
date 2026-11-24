@@ -283,7 +283,9 @@ Through the PostgreSQL frontend, `?`, `?|` and `?&` find keys in a jsonb value, 
 
 Through the PostgreSQL frontend, `#>` and `#>>` find the value at a path, as a chain of `->` and `->>` does: `'{"a":{"b":[1,2]}}'::jsonb #>> '{a,b,1}'` is `2`. Each element of the text array is the name of a field, or the index of an element when the value is an array. A negative index counts from the end of the array. An empty path gives the document itself. A path into a scalar, or a path with a NULL element, gives NULL. `#>` returns the JSON text of the value, as `->` does, and `#>>` returns text, as `->>` does.
 
-A `CREATE INDEX` or a stored generated column that uses `?`, `?|`, `?&`, `#>` or `#>>` fails with SQLSTATE 0A000.
+Through the PostgreSQL frontend, `||` and `-` change jsonb values, as in PostgreSQL. `||` of two objects gives an object with the fields of both, and a field that both objects have gets the value of the right object. `||` of two other jsonb values gives an array with the elements of both, where an object or a scalar is one element. A string literal or a parameter is read as jsonb, but `||` with a text value joins text. `-` with a text removes the field with that name from an object, or each string element equal to the text from an array. `-` with a text array removes each of its texts, and `-` with an integer removes the array element at that index. The result has no white space between its tokens: `'{"a":1}'::jsonb || '{"b":2}'` is `{"a":1,"b":2}`, where PostgreSQL writes `{"a": 1, "b": 2}`.
+
+A `CREATE INDEX` that uses `?`, `?|`, `?&`, `#>` or `#>>`, or `||` or `-` on jsonb values, fails with SQLSTATE 0A000. A stored generated column that uses `?`, `?|`, `?&`, `#>` or `#>>` fails with SQLSTATE 0A000 too.
 
 ### json_type
 

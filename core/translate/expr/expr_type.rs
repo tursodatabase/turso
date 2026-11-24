@@ -258,6 +258,14 @@ impl<'a> TypeEnv<'a> {
         }
     }
 
+    /// The dialect of the statement, which decides how some operators run on
+    /// jsonb values. An expression over the columns of one table or in a
+    /// CREATE TYPE body has none, and gets the operators of SQLite.
+    pub(crate) fn dialect(&self) -> Option<&dyn crate::dialect::Dialect> {
+        self.resolver()
+            .map(|resolver| resolver.catalog.dialect.as_ref())
+    }
+
     /// The type of a name in a CREATE TYPE body: `value` or a parameter.
     /// Anywhere else a name is not bound yet.
     fn name_type(&self, name: &str) -> ExprType {
@@ -839,7 +847,8 @@ fn binary_type(
         | Operator::Or
         | Operator::ArrayContains
         | Operator::ArrayOverlap => ExprType::Builtin(BuiltinType::Integer),
-        // `||` joins arrays when either side is an array.
+        // `||` joins arrays when either side is an array. The dialect's
+        // function may run it on jsonb values.
         Operator::Concat => {
             let lhs = type_of(lhs, env);
             if lhs.is_array() {
@@ -849,7 +858,8 @@ fn binary_type(
             if rhs.is_array() {
                 return rhs;
             }
-            ExprType::Builtin(BuiltinType::Text)
+            custom_operator_type(expr, &[lhs, rhs], env)
+                .unwrap_or(ExprType::Builtin(BuiltinType::Text))
         }
         // `->` gives the JSON text of what it extracts, or NULL (SQLite's
         // json.c registers it with JSON_JSON, "Result is always JSON").

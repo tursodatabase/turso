@@ -1007,3 +1007,73 @@ fn test_pg_containment_with_parameters(db: TempDatabase) {
         );
     }
 }
+
+#[turso_macros::test(mvcc)]
+fn test_pg_jsonb_key_path_concat_and_minus_with_parameters(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE items (id int PRIMARY KEY, data jsonb)")
+        .unwrap();
+    conn.execute(
+        r#"INSERT INTO items VALUES (1, '{"qty":10,"tags":["fruit","red"]}'), (2, '{"qty":2,"dims":{"w":20}}'), (3, '[5,6]')"#,
+    )
+    .unwrap();
+    let param = |index| std::num::NonZero::new(index).unwrap();
+
+    for (sql, value, expected) in [
+        (
+            "SELECT id FROM items WHERE data ? $1",
+            Value::build_text("tags"),
+            Value::from_i64(1),
+        ),
+        (
+            "SELECT id FROM items WHERE data ?| $1::text[]",
+            Value::build_text("{zzz,dims}"),
+            Value::from_i64(2),
+        ),
+        (
+            "SELECT id FROM items WHERE data ?& $1::text[]",
+            Value::build_text("{qty,tags}"),
+            Value::from_i64(1),
+        ),
+        (
+            "SELECT data #>> $1::text[] FROM items WHERE id = 1",
+            Value::build_text("{tags,-1}"),
+            Value::build_text("red"),
+        ),
+        (
+            "SELECT data #> $1::text[] FROM items WHERE id = 2",
+            Value::build_text("{dims,w}"),
+            Value::build_text("20"),
+        ),
+        // PostgreSQL types an untyped parameter of || as jsonb, and one of -
+        // as text.
+        (
+            "SELECT (data || $1) ->> 'x' FROM items WHERE id = 2",
+            Value::build_text(r#"{"x":5}"#),
+            Value::build_text("5"),
+        ),
+        (
+            "SELECT (data || $1::jsonb) ->> 'qty' FROM items WHERE id = 2",
+            Value::build_text(r#"{"qty":3}"#),
+            Value::build_text("3"),
+        ),
+        (
+            "SELECT id FROM items WHERE data ? 'dims' AND NOT (data - $1) ? 'qty'",
+            Value::build_text("qty"),
+            Value::from_i64(2),
+        ),
+        (
+            "SELECT (data - $1::int) ->> 0 FROM items WHERE id = 3",
+            Value::from_i64(0),
+            Value::build_text("6"),
+        ),
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.bind_at(param(1), value.clone()).unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![expected]],
+            "{sql} with $1 = {value}"
+        );
+    }
+}

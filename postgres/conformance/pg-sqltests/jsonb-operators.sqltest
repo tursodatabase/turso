@@ -1,5 +1,5 @@
-# The jsonb operators ->, ->>, @>, <@, ?, ?|, ?&, #> and #>>. The Data API
-# turns a filter on a jsonb field into `data ->> 'field' = 'value'`.
+# The jsonb operators ->, ->>, @>, <@, ?, ?|, ?&, #>, #>>, || and -. The Data
+# API turns a filter on a jsonb field into `data ->> 'field' = 'value'`.
 #
 # -> returns the field as JSON text, and ->> returns it as text: a string has
 # no quotes, a number is written as jsonb writes it (`1e2` as `100`), a
@@ -9,6 +9,10 @@
 #
 # ? finds a key at the top level, and ?| and ?& find any or each key of an
 # array. #> and #>> find the value at a path, as a chain of -> and ->> does.
+# || joins two jsonb values, and - removes fields or array elements.
+#
+# tursopg writes a jsonb object or array without the spaces of PostgreSQL's
+# output (A-45), so the tests read the fields of such a result instead.
 
 @database :memory:
 
@@ -784,8 +788,133 @@ test jsonb-path-that-is-not-an-array-errors {
 @sqlstate 22P02
 expect error {}
 
-# An index expression can use only core functions, and ?, ?|, ?&, #> and #>>
-# run functions of the PostgreSQL frontend.
+# ||
+
+test jsonb-concatenates-objects {
+    SELECT x ->> 'a', x ->> 'b', x ->> 'c' FROM (SELECT '{"a":1,"b":2}'::jsonb || '{"b":3,"c":4}'::jsonb AS x) AS s;
+}
+expect {
+    1|3|4
+}
+
+@setup items_with_jsonb_rows
+test jsonb-concatenates-column-and-literal {
+    SELECT (data || '{"qty":3}') ->> 'qty', (data || '{"qty":3}') ->> 'name' FROM items WHERE id = 1;
+}
+expect {
+    3|apple
+}
+
+# Two arrays give one array. Any other two values give an array, where an
+# object or a scalar is one element.
+test jsonb-concatenates-arrays-and-scalars {
+    SELECT ('[1,2]'::jsonb || '[3]'::jsonb) ->> 2, ('[1]'::jsonb || '2') ->> 1, ('1'::jsonb || '2'::jsonb) ->> 0, ('{"a":1}'::jsonb || '[2]') -> 0 ->> 'a', ('[2]'::jsonb || '{"a":1}') -> 1 ->> 'a';
+}
+expect {
+    3|2|1|1|1
+}
+
+# jsonb || text is text || text in PostgreSQL.
+test jsonb-concatenated-with-text-is-text {
+    SELECT '[1]'::jsonb || 'x'::text;
+}
+expect {
+    [1]x
+}
+
+@setup items_with_jsonb_rows
+test jsonb-concatenates-in-update {
+    UPDATE items SET data = data || '{"qty":11,"new":true}' WHERE id = 1;
+    SELECT data ->> 'qty', data ->> 'new', data ->> 'name' FROM items WHERE id = 1;
+}
+expect {
+    11|true|apple
+}
+
+@setup items_with_jsonb_rows
+test jsonb-concatenation-with-null-is-null {
+    SELECT count(*) FROM items WHERE id = 4 AND data || '{}' IS NULL;
+}
+expect {
+    1
+}
+
+@setup items_with_jsonb_rows
+test jsonb-concatenation-with-invalid-json-errors {
+    SELECT data || 'x' FROM items WHERE id = 1;
+}
+@sqlstate 22P02
+expect error {}
+
+# -
+
+@setup items_with_jsonb_rows
+test jsonb-minus-removes-a-field {
+    SELECT ((data - 'qty') ? 'qty')::int, (data - 'qty') ->> 'name' FROM items WHERE id = 1;
+}
+expect {
+    0|apple
+}
+
+# - binds before ?, so this removes two fields, then looks for a third.
+@setup items_with_jsonb_rows
+test jsonb-minus-twice {
+    SELECT id FROM items WHERE data - 'qty' - 'name' ? 'price' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test jsonb-minus-removes-string-elements {
+    SELECT ('["a","b","a"]'::jsonb - 'a') ->> 0, ('["a","b","a"]'::jsonb - 'a') ->> 1;
+}
+expect {
+    b|
+}
+
+test jsonb-minus-integer-removes-an-element {
+    SELECT ('[1,2,3]'::jsonb - 1) ->> 1, ('[1,2,3]'::jsonb - -1) ->> 1, ('[1,2,3]'::jsonb - 5) ->> 2, ('[1,2,3]'::jsonb - -5) ->> 0;
+}
+expect {
+    3|2|3|1
+}
+
+test jsonb-minus-text-array-removes-each-field {
+    SELECT (('{"a":1,"b":2,"c":3}'::jsonb - '{a,b}'::text[]) ?| array['a','b'])::int, ('{"a":1,"b":2,"c":3}'::jsonb - ARRAY['a',NULL]) ->> 'b';
+}
+expect {
+    0|2
+}
+
+# - binds before ||.
+test jsonb-minus-binds-before-concatenation {
+    SELECT (('{"a":1}'::jsonb || '{"b":2}'::jsonb - 'b') ? 'b')::int;
+}
+expect {
+    0
+}
+
+test jsonb-minus-from-scalar-errors {
+    SELECT '"a"'::jsonb - 'a';
+}
+@sqlstate 22023
+expect error {}
+
+test jsonb-minus-integer-from-object-errors {
+    SELECT '{"a":1}'::jsonb - 0;
+}
+@sqlstate 22023
+expect error {}
+
+test jsonb-minus-numeric-errors {
+    SELECT '{"a":1}'::jsonb - 1.5;
+}
+@sqlstate 42883
+expect error {}
+
+# An index expression can use only core functions, and ?, #>, || and - on
+# jsonb values run functions of the PostgreSQL frontend.
 
 # TODO let expression indexes use frontend functions
 @setup items_with_jsonb_rows
@@ -804,3 +933,32 @@ test jsonb-path-in-index-expression-errors {
 }
 @sqlstate 0A000
 expect error {}
+
+# TODO let expression indexes use frontend functions
+@setup items_with_jsonb_rows
+@skip-if postgres "Expression indexes can't use functions from frontends yet"
+test jsonb-concatenation-in-index-expression-errors {
+    CREATE INDEX items_merged ON items ((data || '{"x":1}'));
+}
+@sqlstate 0A000
+expect error {}
+
+# TODO let expression indexes use frontend functions
+@setup items_with_jsonb_rows
+@skip-if postgres "Expression indexes can't use functions from frontends yet"
+test jsonb-minus-in-partial-index-errors {
+    CREATE INDEX items_without_qty ON items (id) WHERE (data - 'qty') IS NOT NULL;
+}
+@sqlstate 0A000
+expect error {}
+
+# A text column has no jsonb operators, so an index on || of text is allowed.
+test text-concatenation-in-index-expression {
+    CREATE TABLE names (id int PRIMARY KEY, first text, last text);
+    INSERT INTO names VALUES (1, 'a', 'b');
+    CREATE INDEX names_full ON names ((first || ' ' || last));
+    SELECT id FROM names WHERE first || ' ' || last = 'a b';
+}
+expect {
+    1
+}

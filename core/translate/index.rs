@@ -16,8 +16,9 @@ use crate::translate::{
     emitter::Resolver,
     expr::expr_type::{column_type, type_of, type_ordering, ExprType, TypeEnv},
     expr::{
-        bind_and_rewrite_expr, emit_stored_column, emit_table_column, translate_condition_expr,
-        translate_expr, unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
+        bind_and_rewrite_expr, check_index_expression_jsonb_operators, emit_stored_column,
+        emit_table_column, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
+        BindingBehavior, ConditionMetadata, WalkControl,
     },
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
@@ -292,6 +293,26 @@ pub fn translate_create_index(
         on_conflict: None,
         constraint_name: None,
     });
+
+    // Not checked when a nested statement such as VACUUM replays the stored
+    // schema, so databases that already have such an index keep working.
+    if !connection.is_nested_stmt() {
+        resolver.with_schema(database_id, |schema| {
+            idx.columns
+                .iter()
+                .filter_map(|column| column.expr.as_deref())
+                .chain(idx.where_clause.as_deref())
+                .try_for_each(|expr| {
+                    check_index_expression_jsonb_operators(
+                        expr,
+                        &tbl,
+                        schema,
+                        resolver.catalog.symbol_table,
+                        resolver.catalog.dialect.as_ref(),
+                    )
+                })
+        })?;
+    }
 
     if !idx.validate_where_expr(&table, resolver) {
         crate::bail_parse_error!(

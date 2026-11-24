@@ -653,6 +653,30 @@ pub trait Dialect: Send + Sync + 'static {
     fn json_contains_function(&self) -> Option<&'static str> {
         None
     }
+
+    /// The name of the function that runs `a || b` when an operand is a
+    /// jsonb value and the other operand is a jsonb value or has no type, such
+    /// as a string literal. None when SQLite's `||` joins the values as text.
+    ///
+    /// PostgreSQL's `||` concatenates two jsonb values: the frontend gives a
+    /// function that it registers. SQLite has no jsonb operators.
+    ///
+    /// FIXME(pg-catalog): This hand-codes the pg_operator entry `jsonb || jsonb`, whose function is jsonb_concat, and the rule that a string literal takes the type of the other operand. A lookup in pg_operator by the types of the operands replaces this.
+    fn jsonb_concat_function(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// The name of the function that runs `a - b` when `a` is a jsonb value,
+    /// or None when the type of `a` decides, as for any other value.
+    ///
+    /// PostgreSQL's `-` removes a field or an array element from a jsonb
+    /// value: the frontend gives a function that it registers. SQLite has no
+    /// jsonb operators.
+    ///
+    /// FIXME(pg-catalog): This hand-codes the pg_operator entries `jsonb - text`, `jsonb - text[]` and `jsonb - integer`, whose function is jsonb_delete. A lookup in pg_operator by the types of the operands replaces this.
+    fn jsonb_delete_function(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// How an ORDER BY or DISTINCT ON term is matched to the output columns.

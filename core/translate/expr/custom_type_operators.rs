@@ -41,9 +41,13 @@ pub(crate) fn check_custom_operator(expr: &ast::Expr, env: &TypeEnv) -> Result<(
 }
 
 /// The types of the operands of `expr`, in order, when it is an operator that
-/// custom types decide (see [decided_operator]).
+/// custom types decide (see [decided_operator]), or `||` when the dialect has
+/// a function for it on jsonb values (see [jsonb_operator_call]).
 fn operand_types(expr: &ast::Expr, env: &TypeEnv) -> Option<Vec<ExprType>> {
-    let (_, operands) = decided_operator(expr, env)?;
+    let operands = match decided_operator(expr, env) {
+        Some((_, operands)) => operands,
+        None => jsonb_concat_operands(expr, env)?,
+    };
     Some(
         operands
             .iter()
@@ -66,14 +70,17 @@ pub(super) fn find_operator_call(
     types: &[ExprType],
     env: &TypeEnv,
 ) -> Result<Option<OperatorCall>> {
-    let Some((op, operands)) = decided_operator(expr, env) else {
-        return Ok(None);
-    };
-    assert_eq!(operands.len(), types.len(), "one type per operand");
     // An operator on NULL gives NULL whichever function runs it.
     if types.iter().any(|ty| matches!(ty, ExprType::Null)) {
         return Ok(None);
     }
+    if let Some(call) = jsonb_operator_call(expr, types, env)? {
+        return Ok(Some(call));
+    }
+    let Some((op, operands)) = decided_operator(expr, env) else {
+        return Ok(None);
+    };
+    assert_eq!(operands.len(), types.len(), "one type per operand");
     let operands = operands
         .iter()
         .zip(types)
@@ -108,6 +115,141 @@ pub(super) fn find_operator_call(
         }
     };
     call_for(signature, ty, env)
+}
+
+/// The operands of `expr` when it is `a || b` and the dialect has a function
+/// that runs `||` on jsonb values.
+fn jsonb_concat_operands<'a>(expr: &'a ast::Expr, env: &TypeEnv) -> Option<Vec<&'a ast::Expr>> {
+    match expr {
+        ast::Expr::Binary(lhs, ast::Operator::Concat, rhs)
+            if !env.schema().type_registry.is_empty()
+                && env
+                    .dialect()
+                    .is_some_and(|dialect| dialect.jsonb_concat_function().is_some()) =>
+        {
+            Some(vec![lhs.as_ref(), rhs.as_ref()])
+        }
+        _ => None,
+    }
+}
+
+/// The call of the dialect's function that runs `expr` when it is `a || b`
+/// or `a - b` on jsonb values (see [jsonb_operator_function]). `types` are
+/// the types of the operands, in order.
+///
+/// A type environment without a dialect, such as the one of an index
+/// expression read from the schema (see TypeEnv::over_table), gets the
+/// operators of SQLite.
+fn jsonb_operator_call(
+    expr: &ast::Expr,
+    types: &[ExprType],
+    env: &TypeEnv,
+) -> Result<Option<OperatorCall>> {
+    let (ast::Expr::Binary(_, op, _), [lhs, rhs]) = (expr, types) else {
+        return Ok(None);
+    };
+    let Some(dialect) = env.dialect() else {
+        return Ok(None);
+    };
+    let Some(name) = jsonb_operator_function(op, lhs, rhs, dialect, env)? else {
+        return Ok(None);
+    };
+    let func = env.resolve_function(name, 2)?.unwrap_or_else(|| {
+        panic!("the dialect gives {name}() for {op}, but no function has that name")
+    });
+    Ok(Some(OperatorCall {
+        func,
+        encode: vec![None, None],
+        result: ast::Type {
+            name: "jsonb".to_string(),
+            size: None,
+            array_dimensions: 0,
+        },
+    }))
+}
+
+/// The name of the function of `dialect` that runs `a op b` on jsonb values,
+/// where `lhs` and `rhs` are the types of `a` and `b`, as PostgreSQL runs
+/// these operators. `||` concatenates two jsonb values, and an operand
+/// without a type, such as a string literal or a parameter, is read as jsonb,
+/// because PostgreSQL gives such an operand the type of the other one. `||`
+/// with a text operand joins text, as in PostgreSQL. `jsonb - x` removes
+/// fields or array elements, and the function decides from the value of `x`
+/// which ones.
+fn jsonb_operator_function(
+    op: &ast::Operator,
+    lhs: &ExprType,
+    rhs: &ExprType,
+    dialect: &dyn crate::dialect::Dialect,
+    env: &TypeEnv,
+) -> Result<Option<&'static str>> {
+    let (name, runs) = match op {
+        ast::Operator::Concat => {
+            let Some(name) = dialect.jsonb_concat_function() else {
+                return Ok(None);
+            };
+            let takes_jsonb = |ty: &ExprType| -> Result<bool> {
+                Ok(is_jsonb(ty, env)?
+                    || matches!(
+                        ty,
+                        ExprType::Untyped | ExprType::Builtin(BuiltinType::Any) | ExprType::Unknown
+                    ))
+            };
+            let runs = (is_jsonb(lhs, env)? && takes_jsonb(rhs)?)
+                || (is_jsonb(rhs, env)? && takes_jsonb(lhs)?);
+            (name, runs)
+        }
+        ast::Operator::Subtract => {
+            let Some(name) = dialect.jsonb_delete_function() else {
+                return Ok(None);
+            };
+            (name, is_jsonb(lhs, env)?)
+        }
+        _ => return Ok(None),
+    };
+    Ok(runs.then_some(name))
+}
+
+/// Fails when an operator in `expr` would run a function of `dialect` on
+/// jsonb values (see [jsonb_operator_function]). `expr` is an index
+/// expression or the WHERE clause of a partial index, over the columns of
+/// `table`.
+///
+/// An index expression can use only core functions, as for `->` and `@>`.
+/// Core also types an index expression without the dialect (see
+/// [jsonb_operator_call]), so the type of the index column would not be the
+/// type of its values.
+pub(crate) fn check_index_expression_jsonb_operators(
+    expr: &ast::Expr,
+    table: &BTreeTable,
+    schema: &crate::Schema,
+    syms: &crate::SymbolTable,
+    dialect: &dyn crate::dialect::Dialect,
+) -> Result<()> {
+    let mut expr = expr.clone();
+    crate::schema::resolve_gencol_expr_columns(&mut expr, table.columns())?;
+    let env = TypeEnv::over_table(table, schema, syms);
+    walk_expr(&expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::Binary(lhs, op, rhs) = expr {
+            let (lhs, rhs) = (type_of(lhs, &env), type_of(rhs, &env));
+            if jsonb_operator_function(op, &lhs, &rhs, dialect, &env)?.is_some() {
+                crate::bail_parse_error!("CREATE INDEX does not support the jsonb operator {op}");
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+/// Whether `ty` is the built-in type jsonb, or a domain over it.
+fn is_jsonb(ty: &ExprType, env: &TypeEnv) -> Result<bool> {
+    let ExprType::Custom { type_def, .. } = ty else {
+        return Ok(false);
+    };
+    Ok(env
+        .schema()
+        .without_domains(type_def)?
+        .is_some_and(|type_def| type_def.is_builtin && type_def.name.eq_ignore_ascii_case("jsonb")))
 }
 
 /// The symbol and operands of `expr` when it is an operator that custom types
