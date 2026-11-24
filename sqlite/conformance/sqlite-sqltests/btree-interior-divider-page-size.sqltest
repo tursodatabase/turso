@@ -1,0 +1,44 @@
+@database :memory:
+
+# When balance_non_root redistributes cells between interior sibling pages, it
+# must not count the parent's divider cell as part of the sibling that sits to
+# its left: the divider is stored in the parent. Counting it made the sibling
+# look fuller than it was, so balancing allocated extra pages and an INSERT
+# that fits in SQLite's page count failed with "database or disk is full".
+
+# 96 rows with 80-byte keys fit in 43 pages of 512 bytes, as in SQLite. The
+# extra pages came from the interior pages of the index.
+@skip-if mvcc "max_page_count and page_count not implemented for mvcc"
+@cross-check-integrity
+test index-interior-balance-fits-max-page-count {
+    PRAGMA page_size=512;
+    PRAGMA max_page_count=43;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE INDEX idx ON t(k);
+    WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c WHERE x<96)
+        INSERT INTO t SELECT x, printf('%080d',x) FROM c;
+    SELECT count(*) FROM t;
+    PRAGMA page_count;
+}
+expect {
+    43
+    96
+    43
+}
+
+# Rowids inserted out of order split table interior pages, which have the same
+# divider cells between siblings.
+@skip-if mvcc "page_count not implemented for mvcc"
+@cross-check-integrity
+test table-interior-balance-page-count {
+    PRAGMA page_size=512;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c WHERE x<1000)
+        INSERT INTO t SELECT (x*7919)%100003, printf('%080d',x) FROM c;
+    SELECT count(*) FROM t;
+    PRAGMA page_count;
+}
+expect {
+    1000
+    225
+}
