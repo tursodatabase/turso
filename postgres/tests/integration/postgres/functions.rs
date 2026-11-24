@@ -1007,3 +1007,59 @@ fn test_pg_containment_with_parameters(db: TempDatabase) {
         );
     }
 }
+
+#[turso_macros::test(mvcc)]
+fn test_pg_key_and_path_operators_with_parameters(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE items (id int PRIMARY KEY, data jsonb)")
+        .unwrap();
+    conn.execute(
+        r#"INSERT INTO items VALUES (1, '{"dims":{"w":20},"tags":["red"]}'), (2, '{"qty":2,"1":"x"}')"#,
+    )
+    .unwrap();
+    let param = |index| std::num::NonZero::new(index).unwrap();
+
+    for (sql, value, expected_id) in [
+        (
+            "SELECT id FROM items WHERE data ? $1",
+            Value::build_text("qty"),
+            2,
+        ),
+        // The server binds a parameter without a type, such as 1, as a
+        // number. It is the text of a key, as PostgreSQL reads such a
+        // parameter of ? as text.
+        (
+            "SELECT id FROM items WHERE data ? $1",
+            Value::from_i64(1),
+            2,
+        ),
+        (
+            "SELECT id FROM items WHERE data ?| $1",
+            Value::build_text("{zzz,tags}"),
+            1,
+        ),
+        (
+            "SELECT id FROM items WHERE data ?& $1",
+            Value::build_text("{qty,1}"),
+            2,
+        ),
+        (
+            "SELECT id FROM items WHERE data #>> $1 = '20'",
+            Value::build_text("{dims,w}"),
+            1,
+        ),
+        (
+            "SELECT id FROM items WHERE data #> $1 IS NOT NULL",
+            Value::build_text("{tags,0}"),
+            1,
+        ),
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.bind_at(param(1), value.clone()).unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(expected_id)]],
+            "{sql} with $1 = {value}"
+        );
+    }
+}

@@ -1,11 +1,13 @@
-# The jsonb operators ->, ->>, @> and <@. The Data API turns a filter on a
-# jsonb field into `data ->> 'field' = 'value'`.
+# The jsonb operators ->, ->>, #>, #>>, ?, ?|, ?&, @> and <@. The Data API
+# turns a filter on a jsonb field into `data ->> 'field' = 'value'`.
 #
 # -> returns the field as JSON text, and ->> returns it as text: a string has
 # no quotes, a number is written as jsonb writes it (`1e2` as `100`), a
 # boolean is `true` or `false`, and a JSON null is NULL. A text key is the
 # name of a field, not a JSON path, and of two fields with the same name the
-# last one counts. @> and <@ compare jsonb values by containment.
+# last one counts. #> and #>> find the value at a path of field names and
+# array indexes, and return it as -> and ->> do. ?, ?| and ?& test the
+# top-level keys, and @> and <@ compare jsonb values by containment.
 
 @database :memory:
 
@@ -597,4 +599,273 @@ expect {
 }
 expect @tursopg {
     -1
+}
+
+# ?, ?| and ?&
+
+# A field whose value is null is a key too.
+@setup items_with_jsonb_rows
+test jsonb-has-key {
+    SELECT id FROM items WHERE data ? 'note';
+}
+expect {
+    2
+}
+
+# Only the fields of the top-level object are keys.
+@setup items_with_jsonb_rows
+test jsonb-has-key-only-at-top-level {
+    SELECT count(*) FROM items WHERE data ? 'w';
+}
+expect {
+    0
+}
+
+# The keys of an array are its string elements, and a scalar string document
+# is an array with one element in jsonb. A number element is not a key.
+test jsonb-has-key-of-array-or-scalar {
+    SELECT ('["a",1]'::jsonb ? 'a')::int, ('["a",1]'::jsonb ? '1')::int, ('"a"'::jsonb ? 'a')::int, ('1'::jsonb ? '1')::int, ('[["a"]]'::jsonb ? 'a')::int;
+}
+expect {
+    1|0|1|0|0
+}
+
+test jsonb-has-key-compares-keys-after-escapes {
+    SELECT ('{"é":1}'::jsonb ? 'é')::int, ('["a\"b"]'::jsonb ? 'a"b')::int, ('{"a":1,"a":2}'::jsonb ? 'a')::int;
+}
+expect {
+    1|1|1
+}
+
+@setup items_with_jsonb_rows
+test jsonb-has-key-of-null-is-null {
+    SELECT id FROM items WHERE (data ? 'name') IS NULL OR ('{"a":1}'::jsonb ? NULL) IS NOT NULL;
+}
+expect {
+    4
+}
+
+# A string literal on the left is read as jsonb, because PostgreSQL has ? only
+# for jsonb.
+test jsonb-has-key-of-string-literal {
+    SELECT ('{"a":1}' ? 'a')::int;
+}
+expect {
+    1
+}
+
+test jsonb-has-key-of-invalid-json-errors {
+    SELECT 'not json' ? 'a';
+}
+@sqlstate 22P02
+expect error {}
+
+test bytea-has-key-errors {
+    SELECT '\x01'::bytea ? 'a';
+}
+@sqlstate 42883
+expect error {}
+
+@setup items_with_jsonb_rows
+test jsonb-has-any-key {
+    SELECT id FROM items WHERE data ?| array['note','zzz'];
+}
+expect {
+    2
+}
+
+# A string literal on the right is read as a text array.
+@setup items_with_jsonb_rows
+test jsonb-has-any-key-of-array-literal {
+    SELECT id FROM items WHERE data ?| '{dims,zzz}' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup items_with_jsonb_rows
+test jsonb-has-all-keys {
+    SELECT id FROM items WHERE data ?& array['name','note'];
+}
+expect {
+    2
+}
+
+@setup items_with_jsonb_rows
+test jsonb-has-all-keys-of-array-literal {
+    SELECT id FROM items WHERE data ?& '{name,tags}' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# A NULL element does not count, so ?| finds no key and ?& finds every key in
+# an array that has no other element.
+test jsonb-has-any-or-all-keys-skips-null-elements {
+    SELECT ('{"a":1}'::jsonb ?| array[NULL,'a'])::int, ('{"a":1}'::jsonb ?| array[NULL]::text[])::int, ('{"a":1}'::jsonb ?| array[]::text[])::int, ('{"a":1}'::jsonb ?& array[NULL,'b'])::int, ('{"a":1}'::jsonb ?& array[NULL]::text[])::int, ('{"a":1}'::jsonb ?& array[]::text[])::int;
+}
+expect {
+    1|0|0|0|1|1
+}
+
+test jsonb-has-any-or-all-keys-of-null-array-is-null {
+    SELECT coalesce(('{"a":1}'::jsonb ?| NULL)::int, -1), coalesce(('{"a":1}'::jsonb ?& NULL)::int, -1);
+}
+expect {
+    -1|-1
+}
+
+test jsonb-has-key-functions {
+    SELECT jsonb_exists('{"a":1}', 'a')::int, jsonb_exists_any('{"a":1}', '{a,b}')::int, jsonb_exists_all('{"a":1}', '{a,b}')::int;
+}
+expect {
+    1|1|0
+}
+
+# #> and #>>
+
+@setup items_with_jsonb_rows
+test jsonb-path-of-nested-field {
+    SELECT data #> '{tags,0}', data #>> '{tags,0}', data #>> '{dims,w}' FROM items WHERE id = 1;
+}
+expect {
+    "fruit"|fruit|3
+}
+
+@setup items_with_jsonb_rows
+test jsonb-path-in-filter {
+    SELECT id FROM items WHERE data #>> '{dims,h}' = '10';
+}
+expect {
+    2
+}
+
+# A negative index counts from the end of the array.
+@setup items_with_jsonb_rows
+test jsonb-path-with-array-index {
+    SELECT data #>> '{tags,-1}', data #>> '{tags,1}' FROM items WHERE id = 1;
+    SELECT data #> '{1}', data #>> '{-3}' FROM items WHERE id = 3;
+}
+expect {
+    red|red
+    2|1
+}
+
+# An index is read as C's strtol() reads it: after white space and an
+# optional sign, decimal digits only, and nothing after them. An index that
+# does not fit in 32 bits leads nowhere.
+test jsonb-path-index-is-read-as-a-c-integer {
+    SELECT '[1,2]'::jsonb #>> '{" 1"}', '[1,2]'::jsonb #>> '{+1}', '[1,2]'::jsonb #>> '{01}', '[1,2]'::jsonb #>> '{-0}', coalesce('[1,2]'::jsonb #>> '{"1 "}', 'none'), coalesce('[1,2]'::jsonb #>> '{0x1}', 'none'), coalesce('[1,2]'::jsonb #>> '{1.0}', 'none'), coalesce('[1,2]'::jsonb #>> '{2147483648}', 'none'), coalesce('[1,2]'::jsonb #>> '{-2147483648}', 'none');
+}
+expect {
+    2|2|2|1|none|none|none|none|none
+}
+
+# A path element of an object is the name of a field, also when it looks like
+# an index.
+test jsonb-path-of-field-named-like-an-index {
+    SELECT '{"1":"x"}'::jsonb #>> '{1}', '{"a":[1,{"b":2}]}'::jsonb #>> '{a,-1,b}', '[[1,2],[3]]'::jsonb #>> '{0,1}';
+}
+expect {
+    x|2|2
+}
+
+test jsonb-path-takes-the-last-of-two-equal-keys {
+    SELECT '{"a":1,"a":2}'::jsonb #>> '{a}';
+}
+expect {
+    2
+}
+
+test jsonb-empty-path-gives-the-whole-document {
+    SELECT '"s"'::jsonb #> '{}', '"s"'::jsonb #>> '{}', '[1]'::jsonb #>> '{}', 'null'::jsonb #> '{}', coalesce('null'::jsonb #>> '{}', 'sql null');
+}
+expect {
+    "s"|s|[1]|null|sql null
+}
+
+# A scalar has no value at a path that is not empty, and neither has a path
+# with a NULL element.
+test jsonb-path-to-no-value-is-null {
+    SELECT coalesce('"s"'::jsonb #>> '{0}', 'none'), coalesce('[1,2]'::jsonb #>> '{a}', 'none'), coalesce('{"a":1}'::jsonb #>> '{a,b}', 'none'), coalesce('{"a":1}'::jsonb #>> '{b}', 'none'), coalesce('{"a":1}'::jsonb #>> array['a',NULL], 'none'), coalesce('{"a":1}'::jsonb #>> NULL, 'none');
+}
+expect {
+    none|none|none|none|none|none
+}
+
+test jsonb-path-to-json-null {
+    SELECT '{"a":null}'::jsonb #> '{a}', coalesce('{"a":null}'::jsonb #>> '{a}', 'sql null');
+}
+expect {
+    null|sql null
+}
+
+test json-path {
+    SELECT '{"a":{"b":1}}'::json #> '{a,b}', '{"a":{"b":"x"}}'::json #>> '{a,b}';
+}
+expect {
+    1|x
+}
+
+# The functions take the path as more arguments. A text argument is one
+# element, not a text array.
+test jsonb-path-functions {
+    SELECT jsonb_extract_path('{"a":{"b":1}}', 'a', 'b'), jsonb_extract_path_text('{"a":{"b":"x"}}', 'a', 'b'), jsonb_extract_path_text('{"{a}":"y"}', '{a}'), coalesce(jsonb_extract_path_text('{"a":1}', 'a', NULL), 'none');
+}
+expect {
+    1|x|y|none
+}
+
+test jsonb-path-of-nul-escape-errors {
+    SELECT '{"b":"\u0000","a":1}'::json #> '{a}';
+}
+@sqlstate 22P05
+expect error {}
+
+# The operators run functions of the PostgreSQL frontend, so an index
+# expression and a generation expression cannot use them.
+
+# TODO let expression indexes use frontend functions
+@setup items_with_jsonb_rows
+@skip-if postgres "Expression indexes can't use functions from frontends yet"
+test jsonb-has-key-in-index-expression-errors {
+    CREATE INDEX items_noted ON items ((data ? 'note'));
+}
+@sqlstate 0A000
+expect error {}
+
+# TODO let expression indexes use frontend functions
+@setup items_with_jsonb_rows
+@skip-if postgres "Expression indexes can't use functions from frontends yet"
+test jsonb-path-in-partial-index-errors {
+    CREATE INDEX items_wide ON items (id) WHERE data #>> '{dims,w}' = '20';
+}
+@sqlstate 0A000
+expect error {}
+
+# TODO let generated columns use frontend functions
+@skip-if postgres "Generated columns can't use functions from frontends yet"
+test jsonb-path-in-generated-column-errors {
+    CREATE TABLE gen_items_3 (data text, w text GENERATED ALWAYS AS (data::jsonb #>> '{dims,w}') STORED);
+}
+@sqlstate 0A000
+expect error {}
+
+# PostgreSQL roles belong to the whole server, so the test uses its own role
+# and table names.
+test jsonb-has-key-in-row-security-policy {
+    CREATE ROLE jk_reader_1;
+    CREATE TABLE jk_docs_1 (id int PRIMARY KEY, data jsonb);
+    INSERT INTO jk_docs_1 VALUES (1, '{"public":true}'), (2, '{"owner":"x"}');
+    GRANT SELECT ON jk_docs_1 TO jk_reader_1;
+    ALTER TABLE jk_docs_1 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY jk_public_1 ON jk_docs_1 FOR SELECT USING (data ? 'public');
+    SET ROLE jk_reader_1;
+    SELECT id FROM jk_docs_1;
+    RESET ROLE;
+}
+expect {
+    1
 }

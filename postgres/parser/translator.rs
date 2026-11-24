@@ -4231,11 +4231,12 @@ impl PostgreSQLTranslator {
             "/" => ast::Operator::Divide,
             "%" => ast::Operator::Modulus,
             "||" => ast::Operator::Concat,
-            // PostgreSQL has -> and ->> only for json and jsonb, so they run the
-            // frontend's functions. SQLite's operators read a text key such as
-            // '$.a' as a JSON path, take the first of two equal keys, and give
-            // numbers and booleans as SQL values instead of text.
-            "->" | "->>" => {
+            // PostgreSQL has these operators only for json and jsonb, so they
+            // run the frontend's functions. SQLite's -> and ->> read a text key
+            // such as '$.a' as a JSON path, take the first of two equal keys,
+            // and give numbers and booleans as SQL values instead of text.
+            // SQLite has no #>, #>>, ?, ?| or ?&.
+            "->" | "->>" | "#>" | "#>>" | "?" | "?|" | "?&" => {
                 // An index expression and a generation expression can use only
                 // core functions.
                 if self.translating_index.get() {
@@ -4252,12 +4253,18 @@ impl PostgreSQLTranslator {
                         ),
                     });
                 }
-                let func_name = if op_name == "->" {
-                    "jsonb_field"
-                } else {
-                    "jsonb_field_text"
+                // FIXME(pg-catalog): This hand-codes the right operand types of the pg_operator entries `jsonb ? text`, `jsonb ?| text[]`, `jsonb ?& text[]`, `jsonb #> text[]` and `jsonb #>> text[]` (and `json #> text[]` and `json #>> text[]`), with a cast that reads a string literal or a parameter as PostgreSQL reads an operand of that type: `'{a,b}'` is the path of the fields a and b. A lookup in pg_operator by the types of the operands, in an expression tree that carries PostgreSQL types, replaces this.
+                let (func_name, key) = match op_name {
+                    "->" => ("jsonb_field", *right),
+                    "->>" => ("jsonb_field_text", *right),
+                    "#>" => ("jsonb_extract_path", text_cast(*right, 1)),
+                    "#>>" => ("jsonb_extract_path_text", text_cast(*right, 1)),
+                    "?" => ("jsonb_exists", text_cast(*right, 0)),
+                    "?|" => ("jsonb_exists_any", text_cast(*right, 1)),
+                    "?&" => ("jsonb_exists_all", text_cast(*right, 1)),
+                    _ => unreachable!("the arm matches only the JSON operators"),
                 };
-                return Ok(function_call(func_name, vec![*left, *right]));
+                return Ok(function_call(func_name, vec![*left, key]));
             }
             "&" => ast::Operator::BitwiseAnd,
             "|" => ast::Operator::BitwiseOr,
@@ -10087,6 +10094,19 @@ fn function_call(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
             filter_clause: None,
             over_clause: None,
         },
+    }
+}
+
+/// `CAST(expr AS TEXT)`, or a cast to a text array of `array_dimensions`
+/// dimensions.
+fn text_cast(expr: ast::Expr, array_dimensions: u32) -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(expr),
+        type_name: Some(ast::Type {
+            name: "TEXT".to_string(),
+            size: None,
+            array_dimensions,
+        }),
     }
 }
 

@@ -3,6 +3,7 @@ use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{DateTime, NaiveDateTime};
+use std::collections::HashSet;
 use std::fmt;
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::security::roles::RoleId;
@@ -273,6 +274,21 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         },
         "jsonb_contains"(FunctionArity::Exact(2), true) => {
             exec_jsonb_contains(args[0].get_value(), args[1].get_value())?
+        },
+        "jsonb_extract_path"(FunctionArity::Variadic, true) => {
+            exec_jsonb_extract_path(args)?
+        },
+        "jsonb_extract_path_text"(FunctionArity::Variadic, true) => {
+            exec_jsonb_extract_path_text(args)?
+        },
+        "jsonb_exists"(FunctionArity::Exact(2), true) => {
+            exec_jsonb_exists(args[0].get_value(), args[1].get_value())?
+        },
+        "jsonb_exists_any"(FunctionArity::Exact(2), true) => {
+            exec_jsonb_exists_keys(args[0].get_value(), args[1].get_value(), false)?
+        },
+        "jsonb_exists_all"(FunctionArity::Exact(2), true) => {
+            exec_jsonb_exists_keys(args[0].get_value(), args[1].get_value(), true)?
         },
         "format_type"(FunctionArity::OneOf(&[1, 2]), true) => oid_arg(args, 0)?
             .map(|type_oid| format_type(type_oid, int_arg(args, 1, -1))),
@@ -972,16 +988,92 @@ fn exec_jsonb_field(json: &Value, key: &Value) -> Result<Option<String>> {
 /// as text. A string has no quotes and no escapes, a number is written as
 /// jsonb writes it, and a JSON null is NULL.
 fn exec_jsonb_field_text(json: &Value, key: &Value) -> Result<Option<String>> {
-    let Some(field) = find_json_field(json, key, "->>")? else {
+    match find_json_field(json, key, "->>")? {
+        Some(field) => json_value_text(&field),
+        None => Ok(None),
+    }
+}
+
+/// PostgreSQL's `json #> path` and `jsonb #> path`, which are also its
+/// functions json_extract_path() and jsonb_extract_path(): the JSON text of
+/// the value at `path` in a JSON document. The translator turns the operator
+/// into a call with the path as a text array. A call written in SQL gives the
+/// path as more arguments, as PostgreSQL's VARIADIC parameter does.
+fn exec_jsonb_extract_path(args: &[Register]) -> Result<Option<String>> {
+    Ok(find_json_path("jsonb_extract_path", "#>", args)?.map(str::to_string))
+}
+
+/// PostgreSQL's `json #>> path` and `jsonb #>> path`, which are also its
+/// functions json_extract_path_text() and jsonb_extract_path_text(): the value
+/// that `#>` finds, as text, as `->>` gives it.
+fn exec_jsonb_extract_path_text(args: &[Register]) -> Result<Option<String>> {
+    match find_json_path("jsonb_extract_path_text", "#>>", args)? {
+        Some(value) => json_value_text(value),
+        None => Ok(None),
+    }
+}
+
+/// PostgreSQL's `jsonb ? key`, which is also its function jsonb_exists():
+/// whether the text `key` is the name of a field of the object `json`, or a
+/// string element of the array `json`. Only the top level counts. jsonb
+/// stores a scalar document as an array with one element, so `'"a"' ? 'a'`
+/// is true.
+fn exec_jsonb_exists(json: &Value, key: &Value) -> Result<Option<Boolean>> {
+    let Some(document) = json_document(json, "?", "text")? else {
         return Ok(None);
     };
-    if field.starts_with('"') {
-        return decode_json_string(&field, &mut 0).map(Some);
+    let key = match key {
+        Value::Null => return Ok(None),
+        Value::Text(key) => key.as_str(),
+        other => {
+            return Err(undefined_function(
+                "jsonb_exists",
+                &["jsonb", pg_type_name(other)],
+            ))
+        }
+    };
+    let keys = json_top_level_keys(document)?;
+    Ok(Some(Boolean(keys.contains(key))))
+}
+
+/// PostgreSQL's `jsonb ?| keys` and `jsonb ?& keys`, which are also its
+/// functions jsonb_exists_any() and jsonb_exists_all(): whether any element,
+/// or every element, of the text array `keys` is a key of `json` as `?` finds
+/// it: every element when `every_key` is true. A NULL element does not count,
+/// so `?|` is false and `?&` is true when `keys` has no other element.
+fn exec_jsonb_exists_keys(json: &Value, keys: &Value, every_key: bool) -> Result<Option<Boolean>> {
+    let (func, op) = if every_key {
+        ("jsonb_exists_all", "?&")
+    } else {
+        ("jsonb_exists_any", "?|")
+    };
+    let Some(document) = json_document(json, op, "text[]")? else {
+        return Ok(None);
+    };
+    let Some(wanted) = text_array_elements(func, keys)? else {
+        return Ok(None);
+    };
+    let keys = json_top_level_keys(document)?;
+    let mut wanted = wanted.iter().flatten();
+    Ok(Some(Boolean(if every_key {
+        wanted.all(|key| keys.contains(key.as_str()))
+    } else {
+        wanted.any(|key| keys.contains(key.as_str()))
+    })))
+}
+
+/// The text that `->>` gives for the JSON value `value`, which must be valid
+/// JSON: a string without quotes and escapes, a number as jsonb writes it, and
+/// NULL for a JSON null. A boolean, an object and an array are their JSON
+/// text.
+fn json_value_text(value: &str) -> Result<Option<String>> {
+    if value.starts_with('"') {
+        return decode_json_string(value, &mut 0).map(Some);
     }
-    if field.starts_with(|c: char| c == '-' || c.is_ascii_digit()) {
+    if value.starts_with(|c: char| c == '-' || c.is_ascii_digit()) {
         // A valid JSON number fails only when it has more digits than numeric
         // allows. PostgreSQL then fails when it makes the jsonb value.
-        return turso_core::format_numeric_text(&field)
+        return turso_core::format_numeric_text(value)
             .map(Some)
             .map_err(|_| {
                 sqlstate_error(
@@ -991,10 +1083,144 @@ fn exec_jsonb_field_text(json: &Value, key: &Value) -> Result<Option<String>> {
                 )
             });
     }
-    Ok((field != "null").then_some(field))
+    Ok((value != "null").then(|| value.to_string()))
 }
 
-/// The field or array element that `->` and `->>` look up.
+/// The JSON text of the value at a path in a JSON document, for `#>` and
+/// `#>>`. `args` are the document and the path: a text array, or one text
+/// argument for each element (see `exec_jsonb_extract_path`). Each element is
+/// the name of a field of an object, or the index of an element of an array
+/// (see `json_path_index`). None when the document has no value at the path,
+/// or when an element is NULL. A scalar has no value at a path that is not
+/// empty, and the empty path gives the whole document. `func` and `op` name
+/// the function and the operator, for errors.
+fn find_json_path<'a>(func: &str, op: &str, args: &'a [Register]) -> Result<Option<&'a str>> {
+    let Some((json, path_args)) = args.split_first().filter(|(_, path)| !path.is_empty()) else {
+        let arg_types = vec!["jsonb"; args.len()];
+        return Err(undefined_function(func, &arg_types));
+    };
+    let Some(document) = json_document(json.get_value(), op, "text[]")? else {
+        return Ok(None);
+    };
+    let path = match path_args {
+        [path] if matches!(path.get_value(), Value::Blob(_)) => {
+            text_array_elements(func, path.get_value())?
+        }
+        _ => path_args
+            .iter()
+            .map(|arg| match arg.get_value() {
+                Value::Null => Ok(None),
+                Value::Text(element) => Ok(Some(element.as_str().to_string())),
+                other => Err(undefined_function(func, &["jsonb", pg_type_name(other)])),
+            })
+            .collect::<Result<_>>()
+            .map(Some)?,
+    };
+    // A NULL path, or a NULL element, gives NULL, as a NULL key of `->` does.
+    let Some(path) = path.and_then(|path| path.into_iter().collect::<Option<Vec<_>>>()) else {
+        return Ok(None);
+    };
+    let mut value = document.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r'));
+    if path.is_empty() {
+        // The walk reads the whole document, so that a bad escape or deep
+        // nesting anywhere in it errors as it does for a path that is not
+        // empty.
+        walk_json_members(value, |_, _| {})?;
+    }
+    for element in &path {
+        let key = match value.as_bytes()[0] {
+            b'{' => JsonKey::Field(element),
+            b'[' => match json_path_index(element) {
+                Some(index) => JsonKey::Index(index),
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        match json_field_span(value, &key)? {
+            Some(found) => value = found,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(value))
+}
+
+/// The index of an array element that the path element `text` of `#>` gives,
+/// as PostgreSQL reads it with strtoint(): a decimal integer that fits in 32
+/// bits, after white space and an optional sign. None when `text` is not one,
+/// and then the path leads to no value.
+fn json_path_index(text: &str) -> Option<i64> {
+    let number = text.trim_start_matches([' ', '\t', '\n', '\u{b}', '\u{c}', '\r']);
+    let digits = number.strip_prefix(['+', '-']).unwrap_or(number);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    number.parse::<i32>().ok().map(i64::from)
+}
+
+/// The names of the fields of the object `json`, or the string elements of
+/// the array `json`: the keys that `?` finds. A scalar string is an array
+/// with one element in jsonb, and another scalar has no keys. `json` must be
+/// valid JSON.
+fn json_top_level_keys(json: &str) -> Result<HashSet<String>> {
+    let bytes = json.as_bytes();
+    let mut pos = 0;
+    skip_json_whitespace(bytes, &mut pos);
+    if bytes[pos] == b'"' {
+        return Ok(HashSet::from([decode_json_string(json, &mut pos)?]));
+    }
+    let mut keys = HashSet::new();
+    let mut strings = Vec::new();
+    walk_json_members(json, |name, value| match name {
+        Some(name) => {
+            keys.insert(name);
+        }
+        None if value.starts_with('"') => strings.push(value),
+        None => {}
+    })?;
+    for string in strings {
+        keys.insert(decode_json_string(string, &mut 0)?);
+    }
+    Ok(keys)
+}
+
+/// The elements of the text array `value`, an argument of `func`, with None
+/// for a NULL element, or None when `value` is NULL. The translator casts the
+/// right operand of `?|`, `?&`, `#>` and `#>>` to a text array. A text
+/// argument of a call written in SQL is read as an array literal, such as
+/// `{a,b}`, as PostgreSQL reads a string literal for a text array.
+fn text_array_elements(func: &str, value: &Value) -> Result<Option<Vec<Option<String>>>> {
+    let elements = match value {
+        Value::Null => return Ok(None),
+        Value::Text(text) => {
+            turso_core::parse_text_array_of_texts(text.as_str()).ok_or_else(|| {
+                sqlstate_error(
+                    SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                    format!("malformed array literal: \"{}\"", text.as_str()),
+                    None,
+                )
+            })?
+        }
+        Value::Blob(_) => turso_core::array_values_from_any(value)
+            .ok_or_else(|| undefined_function(func, &["jsonb", "bytea"]))?,
+        Value::Numeric(_) => return Err(undefined_function(func, &["jsonb", pg_type_name(value)])),
+    };
+    elements
+        .into_iter()
+        .map(|element| match element {
+            Value::Null => Ok(None),
+            Value::Text(text) => Ok(Some(text.as_str().to_string())),
+            // An array of numbers or of arrays: PostgreSQL has these
+            // functions only for text arrays.
+            other => Err(undefined_function(
+                func,
+                &["jsonb", &format!("{}[]", pg_type_name(&other))],
+            )),
+        })
+        .collect::<Result<_>>()
+        .map(Some)
+}
+
+/// The field or array element that `->`, `->>`, `#>` and `#>>` look up.
 enum JsonKey<'a> {
     /// The field with this name of an object.
     Field(&'a str),
@@ -1006,21 +1232,9 @@ enum JsonKey<'a> {
 /// The JSON text of the value at `key` in the JSON document `json`, or None
 /// when the document has no such value. `op` is the operator, for errors.
 fn find_json_field(json: &Value, key: &Value, op: &str) -> Result<Option<String>> {
-    // A json or jsonb column reads as text. A blob is a bytea, which has no
-    // -> in PostgreSQL.
-    let json = match json {
-        Value::Null => return Ok(None),
-        Value::Text(text) => text.as_str(),
-        Value::Numeric(_) | Value::Blob(_) => {
-            return Err(undefined_operator(
-                pg_type_name(json),
-                op,
-                pg_type_name(key),
-            ))
-        }
+    let Some(json) = json_document(json, op, pg_type_name(key))? else {
+        return Ok(None);
     };
-    // Validate first, so the walk below can assume well-formed input.
-    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
     let key = match key {
         Value::Null => return Ok(None),
         Value::Text(name) => JsonKey::Field(name.as_str()),
@@ -1028,6 +1242,24 @@ fn find_json_field(json: &Value, key: &Value, op: &str) -> Result<Option<String>
         other => return Err(undefined_operator("jsonb", op, pg_type_name(other))),
     };
     Ok(json_field_span(json, &key)?.map(str::to_string))
+}
+
+/// The JSON document that `value`, the left operand of the JSON operator
+/// `op`, holds, or None when `value` is NULL. The document is checked, so
+/// that the code that reads it can assume valid JSON. A json or jsonb value
+/// reads as text. A number, or a blob, which is a bytea, has no JSON
+/// operators in PostgreSQL. `right_type` is the type of the right operand,
+/// for that error.
+fn json_document<'a>(value: &'a Value, op: &str, right_type: &str) -> Result<Option<&'a str>> {
+    let json = match value {
+        Value::Null => return Ok(None),
+        Value::Text(text) => text.as_str(),
+        Value::Numeric(_) | Value::Blob(_) => {
+            return Err(undefined_operator(pg_type_name(value), op, right_type))
+        }
+    };
+    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
+    Ok(Some(json))
 }
 
 /// The JSON text of the value at `key` in `json`, which must be valid JSON.
