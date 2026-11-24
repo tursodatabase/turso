@@ -590,7 +590,7 @@ fn has_array_type(name: &str) -> bool {
 
 /// The type name as PostgreSQL writes it in an error about a type that does
 /// not exist, such as `public.nosuch[]`.
-fn type_name_text(type_name: &TypeName) -> Result<String, ParseError> {
+pub(crate) fn type_name_text(type_name: &TypeName) -> Result<String, ParseError> {
     let mut text = extract_key_columns(&type_name.names)?.join(".");
     for _ in &type_name.array_bounds {
         text.push_str("[]");

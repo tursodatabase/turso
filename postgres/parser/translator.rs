@@ -1718,11 +1718,9 @@ impl PostgreSQLTranslator {
                     if !drop.missing_ok
                         && crate::create_function::builtin_type_name(&element)?.is_some()
                     {
-                        let names = extract_key_columns(&tn.names)?.join(".");
-                        return Err(type_does_not_exist(&format!(
-                            "{names}{}",
-                            "[]".repeat(tn.array_bounds.len())
-                        )));
+                        return Err(type_does_not_exist(
+                            &crate::create_function::type_name_text(tn)?,
+                        ));
                     }
                     return Err(ParseError::not_supported(format!(
                         "DROP {} of an array type",
