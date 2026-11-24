@@ -1137,3 +1137,10 @@ test cast-jsonb-to-numbers {
 expect {
     1|1|1.5|1.5
 }
+
+test timestamptz-equality-across-offsets {
+    SELECT '2026-10-08 14:00:00+02'::timestamptz = '2026-10-08 12:00:00Z'::timestamptz;
+}
+expect {
+    t
+}
