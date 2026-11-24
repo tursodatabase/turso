@@ -292,7 +292,7 @@ expect {
 expect @tursopg error {}
 
 # C-22: bytea '\xdeadbeef': raw value, inside json_build_object
-@compat-gap "type:bytea"
+@compat-gap "function:json_build_object"
 test bytea-raw-and-in-json-build-object {
     CREATE TABLE t (v bytea);
     INSERT INTO t VALUES ('\xdeadbeef');
@@ -301,7 +301,7 @@ test bytea-raw-and-in-json-build-object {
 expect {
     \\xdeadbeef|{"v" : "\\\\xdeadbeef"}
 }
-@sqlstate 23000
+@sqlstate 42883
 expect @tursopg error {}
 
 # C-23: text[] '{a,"b c",NULL}': raw value, inside json_build_object
