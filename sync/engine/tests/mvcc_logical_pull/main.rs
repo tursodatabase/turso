@@ -6,3 +6,4 @@ mod pull_without_busy_gate;
 mod schema_changes;
 
 mod encryption;
+mod pulled_page_validation;

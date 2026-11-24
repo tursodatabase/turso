@@ -1068,35 +1068,7 @@ pub fn call_builtin_scalar(
         }
         ScalarFunc::BooleanToInt => {
             check_arg_count(args, 1)?;
-            Ok(match args[0].get_value() {
-                Value::Null => Value::Null,
-                Value::Numeric(Numeric::Integer(i)) => match *i {
-                    0 => Value::from_i64(0),
-                    1 => Value::from_i64(1),
-                    _ => {
-                        return Err(LimboError::Constraint(format!(
-                            "invalid input for type boolean: \"{i}\""
-                        )));
-                    }
-                },
-                Value::Text(t) => {
-                    let v = &t.value;
-                    match v.to_ascii_lowercase().as_str() {
-                        "true" | "t" | "yes" | "on" | "1" => Value::from_i64(1),
-                        "false" | "f" | "no" | "off" | "0" => Value::from_i64(0),
-                        _ => {
-                            return Err(LimboError::Constraint(format!(
-                                "invalid input for type boolean: \"{v}\""
-                            )));
-                        }
-                    }
-                }
-                other => {
-                    return Err(LimboError::Constraint(format!(
-                        "invalid input for type boolean: \"{other}\""
-                    )));
-                }
-            })
+            exec_boolean_to_int(args[0].get_value())
         }
         ScalarFunc::IntToBoolean => {
             check_arg_count(args, 1)?;
@@ -1108,31 +1080,11 @@ pub fn call_builtin_scalar(
         }
         ScalarFunc::ValidateIpAddr => {
             check_arg_count(args, 1)?;
-            Ok(match args[0].get_value() {
-                Value::Null => Value::Null,
-                Value::Text(t) => {
-                    let v = &t.value;
-                    v.parse::<std::net::IpAddr>().map_err(|_| {
-                        LimboError::Constraint(format!("invalid input for type inet: \"{v}\""))
-                    })?;
-                    args[0].get_value().clone()
-                }
-                other => {
-                    return Err(LimboError::Constraint(format!(
-                        "invalid input for type inet: \"{other}\""
-                    )));
-                }
-            })
+            exec_validate_ipaddr(args[0].get_value())
         }
         ScalarFunc::NumericEncode => {
             check_arg_count(args, 1)?;
-            Ok(match args[0].get_value() {
-                Value::Null => Value::Null,
-                other => {
-                    let bd = numeric_from_value(other)?;
-                    Value::from_blob(bigdecimal_to_blob(&bd))
-                }
-            })
+            exec_numeric_encode(args[0].get_value())
         }
         ScalarFunc::TemporalEncode => {
             check_arg_count(args, 2)?;
@@ -1140,41 +1092,15 @@ pub fn call_builtin_scalar(
         }
         ScalarFunc::NumericFit => {
             check_arg_count(args, 3)?;
-            Ok(match args[0].get_value() {
-                Value::Null => Value::Null,
-                Value::Blob(stored) => {
-                    let bd = blob_to_bigdecimal(stored)?;
-                    let (
-                        Value::Numeric(Numeric::Integer(precision)),
-                        Value::Numeric(Numeric::Integer(scale)),
-                    ) = (args[1].get_value(), args[2].get_value())
-                    else {
-                        return Err(LimboError::Constraint(
-                            "numeric_fit: precision and scale must be integers".to_string(),
-                        ));
-                    };
-                    let fitted = validate_precision_scale(&bd, *precision, *scale)?;
-                    Value::from_blob(bigdecimal_to_blob(&fitted))
-                }
-                other => {
-                    return Err(LimboError::InternalError(format!(
-                        "numeric_fit expects a stored numeric, got {}",
-                        other.value_type()
-                    )));
-                }
-            })
+            exec_numeric_fit(
+                args[0].get_value(),
+                args[1].get_value(),
+                args[2].get_value(),
+            )
         }
         ScalarFunc::NumericDecode => {
             check_arg_count(args, 1)?;
-            Ok(match args[0].get_value() {
-                Value::Null => Value::Null,
-                Value::Blob(b) => Value::build_text(format_numeric(&blob_to_bigdecimal(b)?)),
-                other => {
-                    return Err(LimboError::Constraint(format!(
-                        "numeric_decode: expected blob, got \"{other}\""
-                    )));
-                }
-            })
+            exec_numeric_decode(args[0].get_value())
         }
         ScalarFunc::NumericAdd
         | ScalarFunc::NumericSub
@@ -1323,6 +1249,115 @@ pub fn call_builtin_scalar(
             "{func} should be desugared to a dedicated instruction, not Function"
         ))),
     }
+}
+
+/// The stored form of a boolean: 1 or 0 for an integer or a text that is a
+/// boolean, and an error for another value.
+pub(crate) fn exec_boolean_to_int(value: &Value) -> crate::Result<Value> {
+    Ok(match value {
+        Value::Null => Value::Null,
+        Value::Numeric(Numeric::Integer(i)) => match *i {
+            0 => Value::from_i64(0),
+            1 => Value::from_i64(1),
+            _ => {
+                return Err(LimboError::Constraint(format!(
+                    "invalid input for type boolean: \"{i}\""
+                )));
+            }
+        },
+        Value::Text(t) => {
+            let v = &t.value;
+            match v.to_ascii_lowercase().as_str() {
+                "true" | "t" | "yes" | "on" | "1" => Value::from_i64(1),
+                "false" | "f" | "no" | "off" | "0" => Value::from_i64(0),
+                _ => {
+                    return Err(LimboError::Constraint(format!(
+                        "invalid input for type boolean: \"{v}\""
+                    )));
+                }
+            }
+        }
+        other => {
+            return Err(LimboError::Constraint(format!(
+                "invalid input for type boolean: \"{other}\""
+            )));
+        }
+    })
+}
+
+/// `value` when it is the text of an IP address, and an error otherwise.
+pub(crate) fn exec_validate_ipaddr(value: &Value) -> crate::Result<Value> {
+    Ok(match value {
+        Value::Null => Value::Null,
+        Value::Text(t) => {
+            let v = &t.value;
+            v.parse::<std::net::IpAddr>().map_err(|_| {
+                LimboError::Constraint(format!("invalid input for type inet: \"{v}\""))
+            })?;
+            value.clone()
+        }
+        other => {
+            return Err(LimboError::Constraint(format!(
+                "invalid input for type inet: \"{other}\""
+            )));
+        }
+    })
+}
+
+/// The stored form of the number `value` as a numeric.
+pub(crate) fn exec_numeric_encode(value: &Value) -> crate::Result<Value> {
+    Ok(match value {
+        Value::Null => Value::Null,
+        other => {
+            let bd = numeric_from_value(other)?;
+            Value::from_blob(bigdecimal_to_blob(&bd))
+        }
+    })
+}
+
+/// The stored numeric `value` rounded to `scale`, or an error when it has
+/// more digits than `precision` allows.
+pub(crate) fn exec_numeric_fit(
+    value: &Value,
+    precision: &Value,
+    scale: &Value,
+) -> crate::Result<Value> {
+    Ok(match value {
+        Value::Null => Value::Null,
+        Value::Blob(stored) => {
+            let bd = blob_to_bigdecimal(stored)?;
+            let (
+                Value::Numeric(Numeric::Integer(precision)),
+                Value::Numeric(Numeric::Integer(scale)),
+            ) = (precision, scale)
+            else {
+                return Err(LimboError::Constraint(
+                    "numeric_fit: precision and scale must be integers".to_string(),
+                ));
+            };
+            let fitted = validate_precision_scale(&bd, *precision, *scale)?;
+            Value::from_blob(bigdecimal_to_blob(&fitted))
+        }
+        other => {
+            return Err(LimboError::InternalError(format!(
+                "numeric_fit expects a stored numeric, got {}",
+                other.value_type()
+            )));
+        }
+    })
+}
+
+/// The text of the stored numeric `value`.
+pub(crate) fn exec_numeric_decode(value: &Value) -> crate::Result<Value> {
+    Ok(match value {
+        Value::Null => Value::Null,
+        Value::Blob(b) => Value::build_text(format_numeric(&blob_to_bigdecimal(b)?)),
+        other => {
+            return Err(LimboError::Constraint(format!(
+                "numeric_decode: expected blob, got \"{other}\""
+            )));
+        }
+    })
 }
 
 fn text_or_cast_to_text(value: &Value) -> crate::Result<Cow<'_, str>> {

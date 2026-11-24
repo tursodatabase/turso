@@ -35,7 +35,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode          p1   p2  p3  p4                     p5  comment
-   0  Init             0  155   0                          0  Start at 155
+   0  Init             0  153   0                          0  Start at 153
    1  InitCoroutine    1  103   2                          0
    2  InitCoroutine    2   82   3                          0
    3  InitCoroutine    3   15   4                          0
@@ -177,18 +177,16 @@ addr  opcode          p1   p2  p3  p4                     p5  comment
  139  Goto             0  133   0                          0
  140  ResetSorter      7    0   0                          0  cursor=7
  141  Return          57    0   1                          0
- 142  Goto             0  154   0                          0
+ 142  Goto             0  152   0                          0
  143  Copy            51   42   0                          0  r[42]=r[51]
  144  Copy            52   43   0                          0  r[43]=r[52]
  145  Copy            53   44   0                          0  r[44]=r[53]
  146  Copy            54   45   0                          0  r[45]=r[54]
  147  Copy            55   46   0                          0  r[46]=r[55]
- 148  Copy            54   62   0                          0  r[62]=r[54]
- 149  Copy            55   63   0                          0  r[63]=r[55]
- 150  Subtract        62   63  47                          0  r[47]=r[62]-r[63]
- 151  Copy            50   48   0                          0  r[48]=r[50]
- 152  ResultRow       42    7   0                          0  output=r[42..48]
- 153  Return          59    0   0                          0
- 154  Halt             0    0   0                          0
- 155  Transaction      0    1   7                          0  iDb=0 tx_mode=Read
- 156  Goto             0    1   0                          0
+ 148  Subtract        54   55  47                          0  r[47]=r[54]-r[55]
+ 149  Copy            50   48   0                          0  r[48]=r[50]
+ 150  ResultRow       42    7   0                          0  output=r[42..48]
+ 151  Return          59    0   0                          0
+ 152  Halt             0    0   0                          0
+ 153  Transaction      0    1   7                          0  iDb=0 tx_mode=Read
+ 154  Goto             0    1   0                          0

@@ -106,6 +106,55 @@ mod tests {
         }
     }
 
+    /// The range and format errors of the built-in types are the errors that
+    /// RAISE(ABORT) raises: a plain error, and a trigger constraint error
+    /// when the statement runs inside a trigger.
+    #[test]
+    fn test_builtin_type_errors_keep_their_result_codes() {
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(v varchar(3), s smallint, u uuid) STRICT")
+            .unwrap();
+        conn.execute("CREATE TABLE src(x)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr AFTER INSERT ON src BEGIN INSERT INTO t(v) VALUES (new.x); END",
+        )
+        .unwrap();
+
+        const SQLITE_ERROR: i32 = 1;
+        const SQLITE_CONSTRAINT: i32 = 19;
+        const SQLITE_CONSTRAINT_TRIGGER: i32 = 1811;
+        for (sql, message, extended_code) in [
+            (
+                "INSERT INTO t(v) VALUES ('abcd')",
+                "value too long for varchar",
+                SQLITE_ERROR,
+            ),
+            (
+                "INSERT INTO t(s) VALUES (40000)",
+                "integer out of range for smallint",
+                SQLITE_ERROR,
+            ),
+            (
+                "INSERT INTO t(u) VALUES ('nope')",
+                "invalid UUID value",
+                SQLITE_ERROR,
+            ),
+            (
+                "INSERT INTO src VALUES ('abcd')",
+                "value too long for varchar",
+                SQLITE_CONSTRAINT_TRIGGER,
+            ),
+        ] {
+            let error = conn.execute(sql).unwrap_err();
+            assert!(error.to_string().contains(message), "{sql}: {error}");
+            assert_eq!(error.sqlite_result_code(), SQLITE_CONSTRAINT, "{sql}");
+            assert_eq!(error.sqlite_extended_result_code(), extended_code, "{sql}");
+        }
+        conn.close().unwrap();
+    }
+
     /// Custom types must be loaded from __turso_internal_types when reopening
     /// a database. Without this, SELECT returns raw encoded values and PRAGMA
     /// list_types omits user-defined types.

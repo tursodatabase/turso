@@ -54,39 +54,37 @@ addr  opcode         p1  p2  p3  p4  p5  comment
   36  Copy           21  25   0       0  r[25]=r[21]
   37  Add            24  25  22       0  r[22]=r[24]+r[25]
   38  Copy           22  26   0       0  r[26]=r[22]
-  39  Multiply       26  27  23       0  r[23]=r[26]*r[27]
-  40  Copy           20  28   3       0  r[28]=r[20]
-  41  Copy            4  32   0       0  r[32]=r[4]
-  42  Integer         1  33   0       0  r[33]=1
-  43  Add            32  33  29       0  r[29]=r[32]+r[33]
-  44  Affinity       28   2   0       0  r[28..30] = D, D
-  45  Copy            1  34   0       0  r[34]=r[1]
-  46  Copy           29  35   0       0  r[35]=r[29]
-  47  Add            34  35  30       0  r[30]=r[34]+r[35]
-  48  Copy           30  36   0       0  r[36]=r[30]
-  49  Multiply       36  37  31       0  r[31]=r[36]*r[37]
-  50  Null            0  28   0       0  r[28]=NULL
-  51  MakeRecord     28   2  38       0  r[38]=mkrec(r[28..29])
-  52  Insert          1  38   1  t    8  intkey=r[1] data=r[38]
-  53  Copy            1  39   0       0  r[39]=r[1]
-  54  Copy           29  40   0       0  r[40]=r[29]
-  55  Copy           30  41   0       0  r[41]=r[30]
-  56  Copy           31  42   0       0  r[42]=r[31]
-  57  Copy           41  43   0       0  r[43]=r[41]
-  58  Copy           42  44   0       0  r[44]=r[42]
-  59  MakeRecord     43   2  45       0  r[45]=mkrec(r[43..44])
-  60  NewRowid        0  46   0       0  r[46]=rowid
-  61  Insert          0  45  46       4  intkey=r[46] data=r[45]
+  39  Multiply       26  11  23       0  r[23]=r[26]*r[11]
+  40  Copy           20  27   3       0  r[27]=r[20]
+  41  Copy            4  31   0       0  r[31]=r[4]
+  42  Integer         1  32   0       0  r[32]=1
+  43  Add            31  32  28       0  r[28]=r[31]+r[32]
+  44  Affinity       27   2   0       0  r[27..29] = D, D
+  45  Copy            1  33   0       0  r[33]=r[1]
+  46  Copy           28  34   0       0  r[34]=r[28]
+  47  Add            33  34  29       0  r[29]=r[33]+r[34]
+  48  Copy           29  35   0       0  r[35]=r[29]
+  49  Multiply       35  11  30       0  r[30]=r[35]*r[11]
+  50  Null            0  27   0       0  r[27]=NULL
+  51  MakeRecord     27   2  36       0  r[36]=mkrec(r[27..28])
+  52  Insert          1  36   1  t    8  intkey=r[1] data=r[36]
+  53  Copy            1  37   0       0  r[37]=r[1]
+  54  Copy           28  38   0       0  r[38]=r[28]
+  55  Copy           29  39   0       0  r[39]=r[29]
+  56  Copy           30  40   0       0  r[40]=r[30]
+  57  Copy           39  41   0       0  r[41]=r[39]
+  58  Copy           40  42   0       0  r[42]=r[40]
+  59  MakeRecord     41   2  43       0  r[43]=mkrec(r[41..42])
+  60  NewRowid        0  44   0       0  r[44]=rowid
+  61  Insert          0  43  44       4  intkey=r[44] data=r[43]
   62  Goto            0  63   0       0
   63  Goto            0  64   0       0
   64  FkCheck         0   0   0       0
   65  Rewind          0  69   0       0  Rewind  ephemeral(t)
-  66    ColumnRange   0   0  47  2    0  r[47..48]=ephemeral(t).id..b
-  67    ResultRow    47   2   0       0  output=r[47..48]
+  66    ColumnRange   0   0  45  2    0  r[45..46]=ephemeral(t).id..b
+  67    ResultRow    45   2   0       0  output=r[45..46]
   68  Next            0  66   0       0
   69  Halt            0   0   0       0
   70  Transaction     0   2   1       0  iDb=0 tx_mode=Write
   71  Integer         2  11   0       0  r[11]=2
-  72  Integer         2  27   0       0  r[27]=2
-  73  Integer         2  37   0       0  r[37]=2
-  74  Goto            0   1   0       0
+  72  Goto            0   1   0       0

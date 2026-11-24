@@ -1174,6 +1174,7 @@ enum JsonElement {
 }
 
 impl JsonElement {
+    // FIXME(pg-catalog): PostgreSQL also picks how to_json writes a value by type oid (json_categorize_type), so the named arms stay. The last arm stands in for the cast to json in pg_cast of a type that has one, and for the typoutput function in pg_type of the others. A pg_cast and pg_type lookup replaces that arm.
     fn of_type(name: &str) -> Self {
         match name {
             "boolean" => Self::Boolean,
@@ -1606,6 +1607,7 @@ fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {
     }
 }
 
+/// FIXME(pg-catalog): This table of oids and names was copied by hand from pg_type. It prints unknown for an oid it does not list, where PostgreSQL prints the name of that pg_type row, and character for bpchar with typemod -1, where PostgreSQL prints bpchar. A lookup in a pg_type table replaces this.
 /// The name of a type as `format_type` prints it.
 fn format_type(type_oid: i64, typemod: i64) -> String {
     match type_oid {
@@ -1738,6 +1740,7 @@ fn undefined_operator(left_type: &str, op: &str, right_type: &str) -> LimboError
     )
 }
 
+/// FIXME(pg-catalog): This guesses the PostgreSQL type of an argument from the storage class of its value, because the arguments have no types. The typed expression tree replaces it.
 /// The PostgreSQL type that a value of the engine has, for error messages.
 fn pg_type_name(value: &Value) -> &'static str {
     match value {
@@ -1749,6 +1752,7 @@ fn pg_type_name(value: &Value) -> &'static str {
     }
 }
 
+/// FIXME(pg-catalog): This hand-codes the input function (typinput) of each type by type name. A call to the typinput function of the pg_type entry replaces this.
 /// Validate input for a PostgreSQL type, returning error info if invalid.
 ///
 /// Returns `None` for valid input, or `Some((message, sql_error_code))` for invalid input.

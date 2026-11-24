@@ -8,7 +8,9 @@ pub(crate) use sqlite_schema_rows::{
     SchemaEntryType,
 };
 
-use crate::dialect::{AutomaticIndex, CatalogCmd, CmdContext, CreateTable, DropTable, TableText};
+use crate::dialect::{
+    AutomaticIndex, CatalogCmd, CmdContext, CreateTable, CreateVirtualTable, DropTable, TableText,
+};
 use crate::sync::Arc;
 use crate::HashMap;
 use crate::LimboError;
@@ -21,7 +23,7 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
     BTreeTable, ColDef, Column, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
-    TypeDefKind, TypeOrigin, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME,
+    TypeDefKind, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME,
     TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
@@ -38,6 +40,7 @@ use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
+use crate::types::Conversion;
 use crate::util::{
     check_expr_references_column, column_declared_type, dequote, escape_sql_string_literal,
     is_builtin_strict_type, normalize_ident, quote_identifier, walk_expr_with_subqueries,
@@ -1409,7 +1412,13 @@ pub fn translate_create_table(
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L2856-L2871
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
 
-    let index_regs = collect_autoindexes(&body, program, &mangled_tbl_name, resolver)?;
+    let mut table = create_table(
+        &mangled_tbl_name,
+        &body,
+        0,
+        resolver.catalog.dialect.supports_namespaces(),
+    )?;
+    let index_regs = collect_autoindexes(&table, program)?;
 
     // SQLite compiles `SELECT * FROM t` at the end of CREATE TABLE, after all other
     // checks, and that fails on a RAISE outside a trigger. The SELECT reads STORED
@@ -1461,6 +1470,11 @@ pub fn translate_create_table(
     } else {
         TableText::Statement(input)
     };
+    // The schema of the table's database does the same when it loads the
+    // table, so the catalog sees the table as a later statement will.
+    resolver.with_schema(database_id, |schema| {
+        table.resolve_types_and_domains(schema)
+    })?;
     let cmd_context = CmdContext::new(connection, resolver, database_id);
     resolver.catalog.dialect.catalog().emit(
         program,
@@ -1472,6 +1486,7 @@ pub fn translate_create_table(
             temporary,
             if_not_exists,
             body: &body,
+            table: &table,
             text,
             root_reg: table_root_reg,
             automatic_indexes: &automatic_indexes,
@@ -1775,18 +1790,9 @@ pub const SQLITE_TABLEID: &str = "sqlite_schema";
 ///
 /// Otherwise, an automatic PRIMARY KEY index is required.
 fn collect_autoindexes(
-    body: &ast::CreateTableBody,
+    table: &BTreeTable,
     program: &mut ProgramBuilder,
-    tbl_name: &str,
-    resolver: &Resolver,
 ) -> Result<Option<Vec<usize>>> {
-    let table = create_table(
-        tbl_name,
-        body,
-        0,
-        resolver.catalog.dialect.supports_namespaces(),
-    )?;
-
     let mut regs: Vec<usize> = Vec::new();
 
     // include UNIQUE singles, include PK single only if not rowid alias
@@ -1941,26 +1947,15 @@ pub fn translate_create_virtual_table(
         table_name: table_name_reg,
         args_reg,
     });
-    let sqlite_schema_cursor_id =
-        open_sqlite_schema_for_write(program, resolver, crate::MAIN_DB_ID);
-
-    let cdc_table = prepare_cdc_if_necessary(
-        program,
-        resolver.schema(),
-        crate::MAIN_DB_ID,
-        Some(SQLITE_TABLEID),
-    )?;
     let sql = create_vtable_body_to_str(&vtab, vtab_module.clone());
-    emit_schema_entry(
+    let cmd_context = CmdContext::new(connection, resolver, crate::MAIN_DB_ID);
+    resolver.catalog.dialect.catalog().emit(
         program,
-        resolver,
-        sqlite_schema_cursor_id,
-        cdc_table.map(|x| x.0),
-        SchemaEntryType::Table,
-        tbl_name.name.as_str(),
-        tbl_name.name.as_str(),
-        0, // virtual tables dont have a root page
-        Some(sql),
+        &cmd_context,
+        &CatalogCmd::CreateVirtualTable(CreateVirtualTable {
+            name: tbl_name.name.as_str(),
+            sql: &sql,
+        }),
     )?;
 
     program.emit_insn(Insn::SetCookie {
@@ -2891,8 +2886,7 @@ pub fn translate_create_type(
             validate_type_expr(decode, "DECODE", &resolver.catalog)?;
         }
         crate::schema::check_type_param_use(params, encode, decode)?;
-        let type_def =
-            TypeDef::from_create_type(&normalized_name, body, TypeOrigin::User, String::new())?;
+        let type_def = TypeDef::from_create_type(&normalized_name, body, String::new())?;
         resolver
             .schema()
             .plain_value_type(&normalized_name, type_def.value_input_type())?;
@@ -3368,6 +3362,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
         accepts_collate: _,
         range_offsets: _,
         stored_form_sorts_in_value_order: _,
+        casts_to_numbers_and_booleans: _,
         sql: _,
         domain_checks,
         kind,
@@ -3392,10 +3387,12 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
                 // with inner_t.
                 .chain(params.iter().filter_map(|param| param.ty.as_deref()))
                 .collect(),
-            [encode, coerce, decode, default]
+            // A conversion written in Rust names no type.
+            [encode, coerce, decode]
                 .into_iter()
                 .flatten()
-                .map(|expr| expr.as_ref())
+                .filter_map(Conversion::expr)
+                .chain(default.as_deref())
                 .collect(),
         ),
         TypeDefKind::Struct(StructDef { fields }) => (

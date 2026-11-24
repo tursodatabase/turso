@@ -5,7 +5,7 @@
 use crate::ast::{self, Grantee, Privilege, RoleSpec};
 use crate::{
     namespace::{NamespaceId, NamespaceRef},
-    schema::{BTreeTable, Index, Schema},
+    schema::{load::LoadStep, BTreeTable, Index, Schema},
     translate::{
         emitter::Resolver,
         schema::{
@@ -45,6 +45,12 @@ pub trait Catalog: Send + Sync {
     ) -> Result<()> {
         let _ = (program, ctx);
         Err(statement.not_supported())
+    }
+
+    /// Steps that read this catalog's own tables while a schema is loaded.
+    /// The loader runs them after its own steps, at open and at reload.
+    fn load_steps(&self) -> Vec<Box<dyn LoadStep>> {
+        Vec::new()
     }
 }
 
@@ -171,10 +177,16 @@ pub enum CatalogCmd<'a> {
     AlterColumn(AlterColumn<'a>),
     AddColumn(AddColumn<'a>),
     DropColumn(DropColumn<'a>),
+    CreateTrigger(CreateTrigger<'a>),
+    DropTrigger(DropTrigger<'a>),
+    CreateVirtualTable(CreateVirtualTable<'a>),
 }
 
 /// A new table. The statement has already emitted the creation of its
-/// B-tree and of the B-trees of its automatic indexes.
+/// B-tree and of the B-trees of its automatic indexes. `table` is the table
+/// that the statement creates, as the schema will hold it after loading it,
+/// with two differences: it has no root page yet, and its name still has the
+/// prefix of its namespace. Use `name` for the table's name.
 #[derive(Debug, Clone, Copy)]
 pub struct CreateTable<'a> {
     pub namespace: NamespaceId,
@@ -183,6 +195,7 @@ pub struct CreateTable<'a> {
     pub temporary: bool,
     pub if_not_exists: bool,
     pub body: &'a ast::CreateTableBody,
+    pub table: &'a BTreeTable,
     pub text: TableText<'a>,
     pub root_reg: usize,
     pub automatic_indexes: &'a [AutomaticIndex],
@@ -401,6 +414,32 @@ pub struct DropColumn<'a> {
     pub name: &'a str,
     pub table: &'a BTreeTable,
     pub statement: &'a str,
+}
+
+/// A new trigger on `table`. A trigger of the temp database can be on a
+/// table of another database, so the table comes with its own database.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateTrigger<'a> {
+    pub namespace: NamespaceId,
+    pub name: &'a str,
+    pub table_namespace: NamespaceRef,
+    pub table: &'a str,
+    pub sql: &'a str,
+}
+
+/// A trigger that the statement drops.
+#[derive(Debug, Clone, Copy)]
+pub struct DropTrigger<'a> {
+    pub namespace: NamespaceId,
+    pub name: &'a str,
+}
+
+/// A new virtual table of the main database. It has no B-tree: its module
+/// stores it.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateVirtualTable<'a> {
+    pub name: &'a str,
+    pub sql: &'a str,
 }
 
 /// A statement about roles, ownership, privileges or row-level security.

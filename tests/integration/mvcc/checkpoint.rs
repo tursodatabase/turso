@@ -2443,6 +2443,190 @@ fn recovered_rows_are_written_by_the_first_checkpoint_after_restart() {
     );
 }
 
+/// A passive checkpoint runs while a COMMIT rewrites its row versions from its
+/// transaction id to its timestamp, and stamps those versions as written. The
+/// rewrite must keep the stamps: the checkpoint removed the keys from the dirty
+/// set, so no later checkpoint stamps them again, and GC would never drop the
+/// versions.
+///
+/// The checkpoint includes the rows of the COMMIT only if its snapshot reaches
+/// a later commit B, so B must finish while the COMMIT is still in the rewrite.
+/// Without group commit, the COMMIT waits in BuildLogRecord with its end
+/// timestamp while B commits. With group commit, a leader writes the record of
+/// the COMMIT and finishes first.
+#[test]
+fn checkpoint_during_commit_rewrite_keeps_written_versions_collectable() {
+    rewrite_window_checkpoint_test(false, CommitEnd::Finish);
+}
+
+/// Same as above, with the COMMIT written by a group commit leader.
+#[test]
+fn checkpoint_during_group_commit_rewrite_keeps_written_versions_collectable() {
+    rewrite_window_checkpoint_test(true, CommitEnd::Finish);
+}
+
+/// Same as above, but the COMMIT statement is dropped in the rewrite window,
+/// so the rest of the rewrite runs when the dropped statement is cleaned up.
+#[test]
+fn checkpoint_during_dropped_commit_rewrite_keeps_written_versions_collectable() {
+    rewrite_window_checkpoint_test(false, CommitEnd::Drop);
+}
+
+/// How [`rewrite_window_checkpoint_test`] ends the COMMIT it paused.
+#[derive(Clone, Copy)]
+enum CommitEnd {
+    Finish,
+    Drop,
+}
+
+fn rewrite_window_checkpoint_test(group_commit: bool, commit_end: CommitEnd) {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let setup = db.connect();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup
+        .execute(if group_commit {
+            "PRAGMA mvcc_group_commit = yes"
+        } else {
+            "PRAGMA mvcc_group_commit = no"
+        })
+        .unwrap();
+    setup
+        .execute("CREATE TABLE t(pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    let store = store(&setup);
+    let table = btree_id(&setup, "t");
+
+    // An open reader keeps GC from dropping the last version of a row, so the
+    // versions stamped during the rewrite are still in memory after it.
+    let reader = db.connect();
+    reader.execute("BEGIN").unwrap();
+    assert_eq!(
+        get_rows(&reader, "SELECT count(*) FROM t")[0][0],
+        Value::from_i64(0)
+    );
+
+    // More rows than one step of BuildLogRecord or of the rewrite handles, so
+    // both yield before they are done.
+    let conn_a = db.connect();
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    for pk in 1..=1100 {
+        conn_a
+            .execute(format!("INSERT INTO t VALUES ({pk}, {pk})"))
+            .unwrap();
+    }
+    let tx_a = conn_a.get_mv_tx().unwrap().0;
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+
+    let conn_leader = db.connect();
+    let conn_b = db.connect();
+    if group_commit {
+        // The leader waits for the commit lock first and A second, so the
+        // leader writes the records of both.
+        assert!(store.lock_commits_for_testing());
+        conn_leader.execute("BEGIN CONCURRENT").unwrap();
+        conn_leader
+            .execute("INSERT INTO t VALUES (9000, 1)")
+            .unwrap();
+        let mut commit_leader = conn_leader.prepare("COMMIT").unwrap();
+        step_commit_until_waiting(&mut commit_leader, &store, 1);
+        step_commit_until_waiting(&mut commit_a, &store, 2);
+        store.unlock_commits_for_testing();
+        step_commit_until_done(&mut commit_leader);
+    } else {
+        step_commit_until_state(&mut commit_a, &store, tx_a, |state| {
+            matches!(state, TransactionState::Preparing(_))
+        });
+        // B takes a larger end timestamp than A and commits to the end.
+        conn_b.execute("BEGIN CONCURRENT").unwrap();
+        conn_b.execute("INSERT INTO t VALUES (5000, 1)").unwrap();
+        conn_b.execute("COMMIT").unwrap();
+    }
+
+    step_commit_until_state(&mut commit_a, &store, tx_a, |state| {
+        matches!(state, TransactionState::Committed(_))
+    });
+    if group_commit {
+        // A holds no commit lock in the rewrite, so B leads alone and finishes.
+        conn_b.execute("BEGIN CONCURRENT").unwrap();
+        conn_b.execute("INSERT INTO t VALUES (5000, 1)").unwrap();
+        conn_b.execute("COMMIT").unwrap();
+    }
+
+    let checkpointer = db.connect();
+    checkpointer
+        .execute("PRAGMA wal_checkpoint(PASSIVE)")
+        .unwrap();
+
+    match commit_end {
+        CommitEnd::Finish => step_commit_until_done(&mut commit_a),
+        CommitEnd::Drop => drop(commit_a),
+    }
+    assert!(store.tx_snapshot(tx_a).is_none(), "COMMIT of A did not end");
+    reader.execute("COMMIT").unwrap();
+    for _ in 0..3 {
+        checkpointer
+            .execute("PRAGMA wal_checkpoint(PASSIVE)")
+            .unwrap();
+    }
+
+    let check = db.connect();
+    let expected_rows = if group_commit { 1102 } else { 1101 };
+    assert_eq!(
+        get_rows(&check, "SELECT count(*) FROM t")[0][0],
+        Value::from_i64(expected_rows)
+    );
+    assert_eq!(
+        table_version_count(&store, table),
+        0,
+        "versions stamped by the checkpoint during the rewrite stayed in memory"
+    );
+}
+
+/// Steps a COMMIT until `waiting` commits wait for the commit lock.
+fn step_commit_until_waiting(commit: &mut turso_core::Statement, store: &Store, waiting: usize) {
+    for _ in 0..1000 {
+        if store.waiting_commit_count_for_testing() == waiting {
+            return;
+        }
+        commit.step().unwrap();
+    }
+    panic!("COMMIT never waited for the commit lock");
+}
+
+fn step_commit_until_done(commit: &mut turso_core::Statement) {
+    for _ in 0..100_000 {
+        match commit.step().unwrap() {
+            StepResult::Done => return,
+            StepResult::IO | StepResult::Yield => {}
+            other => panic!("COMMIT returned {other:?}"),
+        }
+    }
+    panic!("COMMIT did not finish");
+}
+
+/// Steps a COMMIT until a step returns IO or Yield while the transaction is in
+/// a state that `reached` accepts.
+fn step_commit_until_state(
+    commit: &mut turso_core::Statement,
+    store: &Store,
+    tx_id: u64,
+    reached: impl Fn(TransactionState) -> bool,
+) {
+    for _ in 0..100_000 {
+        match commit.step().unwrap() {
+            StepResult::IO | StepResult::Yield => {
+                if reached(store.tx_snapshot(tx_id).unwrap().state) {
+                    return;
+                }
+            }
+            other => panic!("COMMIT returned {other:?} before the expected state"),
+        }
+    }
+    panic!("COMMIT never yielded in the expected state");
+}
+
 /// What this test checks: Checkpoint transitions preserve DB/WAL/log ordering and watermark updates for the tested edge case.
 /// Why this matters: Incorrect ordering breaks crash safety, replay boundaries, or durability guarantees.
 #[test]

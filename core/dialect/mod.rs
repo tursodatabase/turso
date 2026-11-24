@@ -28,9 +28,10 @@ pub use crate::translate::schema::SqliteCatalog;
 pub use catalog::{
     AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
     CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,
-    CreateView, Dependent, DependentObject, DropColumn, DropIndex, DropSequence, DropTable,
-    DropView, NewOwner, OwnerColumn, RelationName, RenameColumn, RenameTable, RewrittenTrigger,
-    RewrittenView, TableText, TempTriggerOfRenamedTable,
+    CreateTrigger, CreateView, CreateVirtualTable, Dependent, DependentObject, DropColumn,
+    DropIndex, DropSequence, DropTable, DropTrigger, DropView, NewOwner, OwnerColumn, RelationName,
+    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, TableText,
+    TempTriggerOfRenamedTable,
 };
 
 use crate::ast::{self, Cmd, CreateTableBody, IdentityKind, Privilege, QualifiedName, Stmt};
@@ -43,7 +44,7 @@ use crate::{
     Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value,
     WallClockInstant, IO,
 };
-use std::{any::Any, cell::Cell, ops::Range, sync::Arc};
+use std::{cell::Cell, ops::Range, sync::Arc};
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
@@ -260,7 +261,7 @@ pub trait Dialect: Send + Sync + 'static {
     ///
     /// [`Dialect::new_schema`] finishes the schema.
     fn schema_builder(&self, enable_custom_types: bool) -> Result<SchemaBuilder> {
-        crate::schema::builtin::schema_builder(self, enable_custom_types)
+        crate::schema::builtin::schema_builder(enable_custom_types)
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
@@ -392,30 +393,6 @@ pub trait Dialect: Send + Sync + 'static {
     /// for tables, views and indexes.
     fn relation_names_unique_across_kinds(&self) -> bool {
         false
-    }
-
-    /// SQL statements that read the dialect's own schema state, such as the
-    /// PostgreSQL frontend's relation catalog table, or none when this
-    /// database keeps none. The statements run with engine semantics after
-    /// the schema rows load, and their rows go to
-    /// [`Dialect::build_schema_state`].
-    fn schema_state_queries(&self, schema: &Schema) -> Vec<String> {
-        let _ = schema;
-        Vec::new()
-    }
-
-    /// Builds [`Schema::dialect_schema`] from the rows of each statement of
-    /// [`Dialect::schema_state_queries`], in the same order. `schema` is the
-    /// schema the state is built for, already holding every other object.
-    fn build_schema_state(
-        &self,
-        schema: &Schema,
-        results: &[Vec<Vec<Value>>],
-    ) -> Result<Arc<dyn Any + Send + Sync>> {
-        let _ = (schema, results);
-        Err(LimboError::InternalError(
-            "the dialect queried schema state it cannot build".to_string(),
-        ))
     }
 
     /// Where the dialect stores the objects of a database. The default
@@ -573,6 +550,7 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// FIXME(pg-catalog): This hand-codes prorettype of the pg_proc entries mod(smallint, smallint), mod(integer, integer) and mod(bigint, bigint), which return their argument type. A lookup in a pg_proc table replaces this.
     /// Whether `mod` of two integers returns an integer.
     ///
     /// PostgreSQL returns an integer. SQLite always returns a REAL.
@@ -609,12 +587,29 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// FIXME(pg-catalog): This hand-codes the pg_cast entry from integer to boolean (function bool(integer)). pg_cast has no entry from smallint or bigint to boolean, but this cast applies to every integer value. A lookup in a pg_cast table replaces this.
     /// Whether a cast of an integer to the built-in `boolean` type gives
     /// true for every nonzero integer.
     ///
     /// PostgreSQL's integer-to-boolean cast does. Otherwise the cast uses the
     /// type's ENCODE, which accepts only 0 and 1.
     fn casts_nonzero_integer_to_true(&self) -> bool {
+        false
+    }
+
+    /// FIXME(pg-catalog): This hand-codes the absence of pg_cast entries from date, timestamp, json and inet to numbers, booleans and bytea. A lookup in a pg_cast table replaces this.
+    /// Whether a CAST from a custom type that reads text and has an ENCODE
+    /// (such as date, timestamp, json or inet) is refused when its target does
+    /// not read text.
+    ///
+    /// PostgreSQL has no cast from these types to numbers, booleans or bytea:
+    /// `date '2020-01-01'::int` fails. SQLite reads the text as a number, so
+    /// it gives 2020, which is a wrong answer. A number stored into or cast
+    /// to one of these types is read as its text, so `20200101::date` gives
+    /// 2020-01-01 where PostgreSQL refuses it: tursopg binds a parameter sent
+    /// without a type as a number when its text is one, and refusing numbers
+    /// would refuse such parameters too.
+    fn text_input_types_refuse_other_kinds(&self) -> bool {
         false
     }
 

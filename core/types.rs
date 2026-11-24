@@ -33,6 +33,12 @@ use std::iter::{FusedIterator, Peekable};
 use std::ops::Deref;
 use std::task::{Poll, Waker};
 
+mod builtin;
+mod custom_type;
+
+pub(crate) use builtin::builtin_types;
+pub use custom_type::{Conversion, ConversionFn, Type, UserType};
+
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
 /// But the hard limit of number of columns is 32,767 columns i16::MAX

@@ -289,18 +289,6 @@ impl Dialect for PostgresDialect {
         false
     }
 
-    fn schema_state_queries(&self, schema: &Schema) -> Vec<String> {
-        crate::schema_state::schema_state_queries(schema)
-    }
-
-    fn build_schema_state(
-        &self,
-        schema: &Schema,
-        results: &[Vec<Vec<Value>>],
-    ) -> turso_core::Result<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
-        crate::schema_state::build_schema_state(schema, results)
-    }
-
     fn catalog(&self) -> &dyn turso_core::Catalog {
         &crate::classes::PostgresCatalog
     }
@@ -420,6 +408,10 @@ impl Dialect for PostgresDialect {
     fn casts_nonzero_integer_to_true(&self) -> bool {
         true
     }
+
+    fn text_input_types_refuse_other_kinds(&self) -> bool {
+        true
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
@@ -528,6 +520,7 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
     pg_type_oid(ty_str).unwrap_or(25) // default to text
 }
 
+/// FIXME(pg-catalog): This maps type names to pg_type oids by hand, and a type it does not list reads as text elsewhere. It maps CHAR to varchar (1043), where PostgreSQL's char is bpchar (1042). A lookup in a pg_type table replaces this.
 /// The oid of the PostgreSQL type of a column declared as `ty_str`, or None
 /// for a type name tursopg does not know.
 pub(crate) fn pg_type_oid(ty_str: &str) -> Option<i64> {

@@ -40,9 +40,10 @@ pub fn open_database_async(
                     IOResult::IO(completions) => return Ok(IOResult::IO(completions)),
                 };
                 crate::session::refuse_tables_in_no_schema(&conn)?;
-                if crate::classes::initialize_schema(&conn.current_schema(), db.is_readonly())?
-                    .is_empty()
-                {
+                let schema = conn.current_schema();
+                let mut statements =
+                    crate::schema_init::initialize_statements(&schema, db.is_readonly())?;
+                if statements.next().is_none() {
                     state.phase = OpenPhase::Done;
                     return Ok(IOResult::Done(state.db.take().unwrap()));
                 }
@@ -61,12 +62,10 @@ pub fn open_database_async(
                     IOResult::IO(completions) => return Ok(IOResult::IO(completions)),
                 };
                 state.statement = None;
-                let conn = state.conn.as_ref().unwrap();
-                state.queries = crate::classes::initialize_schema(
-                    &conn.current_schema(),
-                    state.db.as_ref().unwrap().is_readonly(),
-                )?
-                .into();
+                let schema = state.conn.as_ref().unwrap().current_schema();
+                let read_only = state.db.as_ref().unwrap().is_readonly();
+                state.queries =
+                    crate::schema_init::initialize_statements(&schema, read_only)?.collect();
                 state.phase = OpenPhase::Initializing;
             }
             OpenPhase::Initializing => {
@@ -76,7 +75,7 @@ pub fn open_database_async(
                         state.phase = OpenPhase::Reloading;
                         continue;
                     };
-                    state.statement = Some(conn.prepare_engine_schema_statement(&sql)?);
+                    state.statement = Some(conn.prepare_engine_schema_statement(sql)?);
                 }
                 match state
                     .statement
@@ -126,7 +125,7 @@ pub struct OpenDatabaseState {
     db: Option<Arc<Database>>,
     conn: Option<Arc<Connection>>,
     statement: Option<Statement>,
-    queries: VecDeque<String>,
+    queries: VecDeque<&'static str>,
     reparse: ReparseSchemaState,
 }
 
