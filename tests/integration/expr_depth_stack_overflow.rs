@@ -148,6 +148,19 @@ fn over_limit_is_a_graceful_depth_error() {
 /// Rust gives spawned threads a 2 MiB stack unless told otherwise.
 const DEFAULT_THREAD_STACK: usize = 2 << 20;
 
+/// The stack for statements at the query nesting limit. A release build for
+/// x86_64 runs them on the stack that Rust gives to a spawned thread, as
+/// `scripts/stack/check-deep-queries.sh` does for more kinds of nesting in CI.
+/// Debug frames are much larger. On aarch64, frames are larger too, and a
+/// compound subquery at the limit needs more than 2 MiB. Thus the other builds
+/// use [WORKER_STACK].
+const QUERY_NESTING_LIMIT_STACK: usize = if cfg!(all(target_arch = "x86_64", not(debug_assertions)))
+{
+    DEFAULT_THREAD_STACK
+} else {
+    WORKER_STACK
+};
+
 #[test]
 fn longest_allowed_operator_chains_run_on_a_default_thread_stack() {
     for gen_expr in GEN_EXPRS
@@ -224,6 +237,36 @@ const NESTED_QUERIES: &[NestedQuery] = &[
         name: "from-parentheses",
         build: |depth| format!("SELECT * FROM {}t{}", "(".repeat(depth), ")".repeat(depth)),
     },
+    NestedQuery {
+        name: "join-subquery",
+        build: |depth| {
+            format!(
+                "{}SELECT x FROM t{}",
+                "SELECT t.x FROM t JOIN (".repeat(depth),
+                ") ON 1".repeat(depth)
+            )
+        },
+    },
+    NestedQuery {
+        name: "lateral-subquery",
+        build: |depth| {
+            format!(
+                "{}SELECT t.x{}",
+                "SELECT t.x FROM t, LATERAL (".repeat(depth),
+                ")".repeat(depth)
+            )
+        },
+    },
+    NestedQuery {
+        name: "compound-subquery",
+        build: |depth| {
+            format!(
+                "{}SELECT x FROM t{}",
+                "SELECT * FROM (SELECT x FROM t UNION ALL ".repeat(depth),
+                ")".repeat(depth)
+            )
+        },
+    },
     // https://github.com/tursodatabase/turso/issues/8105
     NestedQuery {
         name: "cte",
@@ -268,7 +311,7 @@ fn query_nesting_over_the_limit_is_an_error() {
 fn query_nesting_at_the_limit_completes() {
     for nested in NESTED_QUERIES {
         run_with_stack(
-            WORKER_STACK,
+            QUERY_NESTING_LIMIT_STACK,
             vec![CREATE_T.to_string(), (nested.build)(MAX_QUERY_DEPTH)],
         )
         .unwrap_or_else(|err| panic!("{}: {err:?}", nested.name));
@@ -359,7 +402,7 @@ fn planned_nesting_over_the_limit_is_an_error() {
 #[test]
 fn planned_nesting_at_the_limit_completes() {
     for nesting in PLANNED_NESTINGS.iter().filter(|n| n.name != "windows") {
-        run_with_stack(WORKER_STACK, (nesting.build)(MAX_QUERY_DEPTH))
+        run_with_stack(QUERY_NESTING_LIMIT_STACK, (nesting.build)(MAX_QUERY_DEPTH))
             .unwrap_or_else(|err| panic!("{}: {err:?}", nesting.name));
     }
 }
@@ -372,7 +415,7 @@ fn windows_at_the_query_nesting_limit_complete() {
         .iter()
         .find(|n| n.name == "windows")
         .unwrap();
-    run_with_stack(WORKER_STACK, (windows.build)(MAX_QUERY_DEPTH)).unwrap();
+    run_with_stack(QUERY_NESTING_LIMIT_STACK, (windows.build)(MAX_QUERY_DEPTH)).unwrap();
 }
 
 /// SQLite's `SQLITE_MAX_TRIGGER_DEPTH`, which Turso also uses.
