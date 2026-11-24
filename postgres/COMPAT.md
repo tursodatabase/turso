@@ -428,8 +428,9 @@ that pair, so Turso accepts a comparison that PostgreSQL rejects.
 | JSONB operators `#>` and `#>>` | ❌ Not supported | They fail to translate |
 | JSONB operators `?`, `?\|` and `?&` | ❌ Not supported | They fail to translate |
 | JSONB operator `@@` | ❌ Not supported | It fails to translate |
+| JSONB operator `\|\|` | 🟡 Partial | `\|\|` joins jsonb values. Its result has no white space between tokens and keeps the order of the fields. `jsonb \|\| x` joins text when `x` has another type than jsonb, also for a number, where PostgreSQL fails with `42883`, and for a json value from a cast, which is text in tursopg. But `jsonb \|\| x` fails with `42601` when `x` is a varchar with a length, where PostgreSQL joins text. `->` returns text, so `\|\|` joins text on its result, where PostgreSQL joins jsonb values |
 | JSONB operator `-` | 🟡 Partial | `-` deletes from jsonb values. Its result has no white space between tokens and keeps the order of the fields. `jsonb - x` deletes an element by index when `x` is a bigint, where PostgreSQL fails with `42883`. A parameter without a type whose text is a number is bound as a number, so `j - $1` deletes an element by index, where PostgreSQL deletes a key. An operator that jsonb does not have, such as `jsonb - jsonb`, fails with `42601`, where PostgreSQL fails with `42883`. A CHECK constraint that uses `-` on a jsonb value fails at CREATE TABLE with `42601`, as `date - 1` does |
-| JSONB-modifying operators and functions | ❌ Not supported | `\|\|` joins the texts of two jsonb values. `#-`, `jsonb_set`, `jsonb_insert` and the other functions that modify jsonb are not supported |
+| JSONB-modifying operators and functions | ❌ Not supported | `#-`, `jsonb_set`, `jsonb_insert` and the other functions that modify jsonb are not supported |
 | JSONB subscripting | ❌ Not supported | |
 | JSON data type | 🟡 Partial | Same as jsonb (see above) |
 | array_to_json | ✅ Supported | |

@@ -1390,8 +1390,9 @@ expect @tursopg {
 }
 
 # B-128: jsonb || concatenates two objects
-# B-122 also uses ||. After a fix, the output still differs because of A-45.
-@compat-gap "operator:jsonb || jsonb"
+# B-122 also uses ||. The objects are joined, but the output differs because
+# of A-45.
+@compat-gap "type:jsonb"
 test jsonb-concatenates-two-objects {
     SELECT '{"a":1}'::jsonb || '{"b":2}'::jsonb;
 }
@@ -1399,7 +1400,7 @@ expect {
     {"a": 1, "b": 2}
 }
 expect @tursopg {
-    {"a":1}{"b":2}
+    {"a":1,"b":2}
 }
 
 # B-129: jsonb - removes a key
