@@ -2067,3 +2067,118 @@ expect {
     1
     {2024-01-05}
 }
+
+# A VALUES subquery's column has the type of its rows, so comparing it with
+# another custom type fails like comparing the rows' values would, through an
+# IN subquery and a scalar subquery.
+
+@requires strict "uses STRICT tables"
+test cmp-date-in-values-of-timestamp-is-an-error {
+    CREATE TABLE t(d date, ts timestamp) STRICT;
+    SELECT d IN (VALUES (ts)) FROM t;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-eq-scalar-values-of-timestamp-is-an-error {
+    CREATE TABLE t(d date, ts timestamp) STRICT;
+    SELECT d = (VALUES (ts)) FROM t;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-recursive-cte-union-all-of-timestamp-and-timestamptz-is-an-error {
+    CREATE TABLE t(ts timestamp, tz timestamptz) STRICT;
+    WITH RECURSIVE r(x, n) AS (
+        SELECT ts, 0 FROM t UNION ALL SELECT tz, n + 1 FROM t, r WHERE n < 1
+    )
+    SELECT x FROM r;
+}
+expect error {
+    cannot compare type timestamp with type timestamptz
+}
+
+@requires strict "uses STRICT tables"
+test cmp-union-all-of-date-and-values-of-timestamp-is-an-error {
+    CREATE TABLE t(d date, ts timestamp) STRICT;
+    SELECT d FROM t UNION ALL VALUES (CAST('2024-01-05' AS timestamp));
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-recursive-cte-values-second-row-of-timestamp-and-timestamptz-is-an-error {
+    CREATE TABLE t(tz timestamptz) STRICT;
+    WITH RECURSIVE r(x, n) AS (
+        VALUES (NULL, 0), (CAST('2024-01-05' AS timestamp), 0)
+        UNION ALL SELECT tz, n + 1 FROM t, r WHERE n < 1
+    )
+    SELECT x FROM r;
+}
+expect error {
+    cannot compare type timestamp with type timestamptz
+}
+
+@requires strict "uses STRICT tables"
+test cmp-text-in-compound-subquery-is-read-as-timestamptz {
+    CREATE TABLE t(tz timestamptz) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 00:00:00+00');
+    SELECT '2024-01-05 02:00:00+02' IN (SELECT tz FROM t UNION ALL SELECT 'x') FROM t;
+}
+expect {
+    1
+}
+
+# A function or operator with an array argument fails when the array's
+# elements and its other values, or another array's elements, do not compare.
+
+@requires strict "uses STRICT tables"
+test cmp-array-position-of-date-in-array-of-timestamp-is-an-error {
+    CREATE TABLE t(d date, ats timestamp[]) STRICT;
+    SELECT array_position(ats, d) FROM t;
+}
+expect error {
+    cannot compare type timestamp with type date
+}
+
+@requires strict "uses STRICT tables"
+test cmp-array-of-timestamp-overlaps-array-of-date-is-an-error {
+    CREATE TABLE t(ad date[], ats timestamp[]) STRICT;
+    SELECT ats && ad FROM t;
+}
+expect error {
+    cannot compare type timestamp with type date
+}
+
+@requires strict "uses STRICT tables"
+test cmp-array-of-timestamp-concat-date-is-an-error {
+    CREATE TABLE t(d date, ats timestamp[]) STRICT;
+    SELECT ats || d FROM t;
+}
+expect error {
+    cannot compare type timestamp with type date
+}
+
+@requires strict "uses STRICT tables"
+test cmp-array-of-timestamp-and-date-is-an-error {
+    CREATE TABLE t(d date, ts timestamp) STRICT;
+    SELECT ARRAY[ts, d] FROM t;
+}
+expect error {
+    cannot compare type timestamp with type date
+}
+
+@requires strict "uses STRICT tables"
+test cmp-concat-of-array-of-timestamp-and-date-compares-nothing {
+    CREATE TABLE t(d date, ats timestamp[]) STRICT;
+    INSERT INTO t VALUES ('2024-01-05', ARRAY['2024-01-05 00:00:00']);
+    SELECT typeof(concat(ats, d)) FROM t;
+}
+expect {
+    text
+}

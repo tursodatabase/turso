@@ -1,12 +1,9 @@
 use crate::ast::{self, QualifiedName};
+use crate::dialect::{CatalogCmd, CmdContext, CreateTrigger, DropTrigger};
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::NamespaceRef;
 use crate::sync::Arc;
-use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
-use crate::translate::schema::{
-    emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType, SQLITE_TABLEID,
-};
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
 use crate::util::{escape_sql_string_literal, normalize_ident};
@@ -154,7 +151,6 @@ pub fn translate_create_trigger(
         commands,
     );
     let mangled_trigger_name = resolver.mangle_name(namespace, &normalized_trigger_name);
-    let mangled_table_name = resolver.mangle_name(target_table_namespace, &normalized_table_name);
     // Temp triggers are allowed to reference tables in other databases.
     if target_table_database_id != database_id && database_id != crate::TEMP_DB_ID {
         let table_db_name = tbl_name
@@ -255,19 +251,17 @@ pub fn translate_create_trigger(
     let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
 
-    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
-
-    // Add the trigger entry to sqlite_schema
-    emit_schema_entry(
+    let cmd_context = CmdContext::new(connection, resolver, database_id);
+    resolver.catalog.dialect.catalog().emit(
         program,
-        resolver,
-        sqlite_schema_cursor_id,
-        None, // cdc_table_cursor_id, no cdc for triggers
-        SchemaEntryType::Trigger,
-        &mangled_trigger_name,
-        &mangled_table_name,
-        0, // triggers don't have a root page
-        Some(sql),
+        &cmd_context,
+        &CatalogCmd::CreateTrigger(CreateTrigger {
+            namespace: namespace.id,
+            name: &normalized_trigger_name,
+            table_namespace: target_table_namespace,
+            table: &normalized_table_name,
+            sql: &sql,
+        }),
     )?;
 
     // Update schema version
@@ -554,6 +548,7 @@ pub fn translate_drop_trigger(
     resolver: &Resolver,
     trigger_name: &ast::QualifiedName,
     if_exists: bool,
+    connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let namespace = resolver.resolve_existing_trigger(trigger_name)?;
@@ -577,83 +572,15 @@ pub fn translate_drop_trigger(
     let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
 
-    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
-
-    let search_loop_label = program.allocate_label();
-    let skip_non_trigger_label = program.allocate_label();
-    let done_label = program.allocate_label();
-    let rewind_done_label = program.allocate_label();
-
-    // Find and delete the trigger from sqlite_schema
-    program.emit_insn(Insn::Rewind {
-        cursor_id: sqlite_schema_cursor_id,
-        pc_if_empty: rewind_done_label,
-    });
-
-    program.preassign_label_to_next_insn(search_loop_label);
-
-    // Check if this is the trigger we're looking for
-    // sqlite_schema columns: type, name, tbl_name, rootpage, sql
-    // Column 0: type (should be "trigger")
-    // Column 1: name (should match trigger_name)
-    let type_reg = program.alloc_register();
-    let name_reg = program.alloc_register();
-    program.emit_insn(Insn::Column {
-        cursor_id: sqlite_schema_cursor_id,
-        column: 0,
-        dest: type_reg,
-        default: None,
-    });
-    program.emit_insn(Insn::Column {
-        cursor_id: sqlite_schema_cursor_id,
-        column: 1,
-        dest: name_reg,
-        default: None,
-    });
-
-    // Check if type == "trigger"
-    let type_str_reg = program.emit_string8_new_reg("trigger".to_string());
-    program.emit_insn(Insn::Ne {
-        lhs: type_reg,
-        rhs: type_str_reg,
-        target_pc: skip_non_trigger_label,
-        flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
-    });
-
-    // Check if name matches
-    let trigger_name_str_reg =
-        program.emit_string8_new_reg(resolver.mangle_name(namespace, &normalized_trigger_name));
-    program.emit_insn(Insn::Ne {
-        lhs: name_reg,
-        rhs: trigger_name_str_reg,
-        target_pc: skip_non_trigger_label,
-        flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
-    });
-
-    // Found it! Delete the row
-    program.emit_insn(Insn::Delete {
-        cursor_id: sqlite_schema_cursor_id,
-        table_name: SQLITE_TABLEID.to_string(),
-        is_part_of_update: false,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: done_label,
-    });
-
-    program.preassign_label_to_next_insn(skip_non_trigger_label);
-    // Continue to next row
-    program.emit_insn(Insn::Next {
-        cursor_id: sqlite_schema_cursor_id,
-        pc_if_next: search_loop_label,
-        fullscan: false,
-        is_index: false,
-    });
-
-    program.preassign_label_to_next_insn(done_label);
-
-    program.preassign_label_to_next_insn(rewind_done_label);
+    let cmd_context = CmdContext::new(connection, resolver, database_id);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::DropTrigger(DropTrigger {
+            namespace: namespace.id,
+            name: &normalized_trigger_name,
+        }),
+    )?;
 
     // Update schema version
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);

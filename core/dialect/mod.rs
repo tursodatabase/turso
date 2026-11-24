@@ -28,9 +28,10 @@ pub use crate::translate::schema::SqliteCatalog;
 pub use catalog::{
     AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
     CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,
-    CreateView, Dependent, DependentObject, DropColumn, DropIndex, DropSequence, DropTable,
-    DropView, NewOwner, OwnerColumn, RelationName, RenameColumn, RenameTable, RewrittenTrigger,
-    RewrittenView, TableText, TempTriggerOfRenamedTable,
+    CreateTrigger, CreateView, CreateVirtualTable, Dependent, DependentObject, DropColumn,
+    DropIndex, DropSequence, DropTable, DropTrigger, DropView, NewOwner, OwnerColumn, RelationName,
+    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, TableText,
+    TempTriggerOfRenamedTable,
 };
 
 use crate::ast::{self, Cmd, CreateTableBody, IdentityKind, Privilege, QualifiedName, Stmt};
@@ -43,7 +44,7 @@ use crate::{
     Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value,
     WallClockInstant, IO,
 };
-use std::{any::Any, cell::Cell, ops::Range, sync::Arc};
+use std::{cell::Cell, ops::Range, sync::Arc};
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
@@ -392,30 +393,6 @@ pub trait Dialect: Send + Sync + 'static {
     /// for tables, views and indexes.
     fn relation_names_unique_across_kinds(&self) -> bool {
         false
-    }
-
-    /// SQL statements that read the dialect's own schema state, such as the
-    /// PostgreSQL frontend's relation catalog table, or none when this
-    /// database keeps none. The statements run with engine semantics after
-    /// the schema rows load, and their rows go to
-    /// [`Dialect::build_schema_state`].
-    fn schema_state_queries(&self, schema: &Schema) -> Vec<String> {
-        let _ = schema;
-        Vec::new()
-    }
-
-    /// Builds [`Schema::dialect_schema`] from the rows of each statement of
-    /// [`Dialect::schema_state_queries`], in the same order. `schema` is the
-    /// schema the state is built for, already holding every other object.
-    fn build_schema_state(
-        &self,
-        schema: &Schema,
-        results: &[Vec<Vec<Value>>],
-    ) -> Result<Arc<dyn Any + Send + Sync>> {
-        let _ = (schema, results);
-        Err(LimboError::InternalError(
-            "the dialect queried schema state it cannot build".to_string(),
-        ))
     }
 
     /// Where the dialect stores the objects of a database. The default
