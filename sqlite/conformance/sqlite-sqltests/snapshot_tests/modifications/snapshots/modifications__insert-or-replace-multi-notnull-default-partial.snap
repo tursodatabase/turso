@@ -17,20 +17,20 @@ addr  opcode         p1  p2  p3  p4               p5  comment
    2  Integer         1   2   0                    0  r[2]=1
    3  SoftNull        3   0   0                    0
    4  Integer       100   4   0                    0  r[4]=100
-   5  Affinity        3   3   0                    0  r[3..6] = D, D, B
-   6  NotNull         2   8   0                    0  r[2]!=NULL -> goto 8
-   7  Goto            0  10   0                    0
-   8  MustBeInt       2   0   0                    0
-   9  Goto            0  11   0                    0
-  10  NewRowid        0   2   0                    0  r[2]=rowid
-  11  NotNull         4  14   0                    0  r[4]!=NULL -> goto 14
-  12  Integer        42   4   0                    0  r[4]=42
-  13  Affinity        4   1   0                    0  r[4..5] = D
-  14  HaltIfNull   1299   0   4  t_defaults.val    0
-  15  NotNull         5  18   0                    0  r[5]!=NULL -> goto 18
-  16  String8         0   5   0  unnamed           0  r[5]='unnamed'
-  17  Affinity        5   1   0                    0  r[5..6] = B
-  18  HaltIfNull   1299   0   5  t_defaults.name   0
+   5  NotNull         2   7   0                    0  r[2]!=NULL -> goto 7
+   6  Goto            0   9   0                    0
+   7  MustBeInt       2   0   0                    0
+   8  Goto            0  10   0                    0
+   9  NewRowid        0   2   0                    0  r[2]=rowid
+  10  NotNull         4  13   0                    0  r[4]!=NULL -> goto 13
+  11  Integer        42   4   0                    0  r[4]=42
+  12  Affinity        4   1   0                    0  r[4..5] = D
+  13  HaltIfNull   1299   0   4  t_defaults.val    0
+  14  NotNull         5  17   0                    0  r[5]!=NULL -> goto 17
+  15  String8         0   5   0  unnamed           0  r[5]='unnamed'
+  16  Affinity        5   1   0                    0  r[5..6] = B
+  17  HaltIfNull   1299   0   5  t_defaults.name   0
+  18  Affinity        3   3   0                    0  r[3..6] = D, D, B
   19  NotExists       0  24   2                    0
   20  Copy            2   1   0                    0  r[1]=r[2]
   21  SeekRowid       0   1  28                    0  if (r[1]!=cursor 0 for table t_defaults.rowid) goto 28

@@ -63,3 +63,19 @@ test before-update-trigger-direct-update-still-works {
 expect {
     old=10 new=20
 }
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test before-insert-trigger-sees-value-converted-to-input-type {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(a cents) STRICT;
+    CREATE TABLE lg(v);
+    CREATE TRIGGER tr BEFORE INSERT ON t BEGIN INSERT INTO lg VALUES (typeof(new.a) || new.a); END;
+    INSERT INTO t VALUES ('42');
+    INSERT INTO t SELECT '43';
+    SELECT v FROM lg ORDER BY rowid;
+}
+expect {
+    integer42
+    integer43
+}

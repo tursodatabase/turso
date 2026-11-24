@@ -18,8 +18,8 @@ addr  opcode       p1  p2  p3  p4                  p5  comment
    1  OpenWrite     0   2   0                       0  root=2; iDb=0
    2  Integer       1   3   0                       0  r[3]=1
    3  Integer       2   4   0                       0  r[4]=2
-   4  Affinity      3   2   0                       0  r[3..5] = D, D
-   5  NewRowid      0   2   0                       0  r[2]=rowid
+   4  NewRowid      0   2   0                       0  r[2]=rowid
+   5  Affinity      3   2   0                       0  r[3..5] = D, D
    6  Copy          3   8   0                       0  r[8]=r[3]
    7  Copy          4   9   0                       0  r[9]=r[4]
    8  Add           8   9   5                       0  r[5]=r[8]+r[9]
