@@ -373,6 +373,7 @@ fn run_to_completion(db: &Arc<Database>, stmt: &mut Statement) {
     }
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn run_huge_multi_write(c: &mut Criterion, group_name: &str, placement: GhostPlacement) {
     let idx1 = NonZeroUsize::new(1).unwrap();
     let sql = build_huge_multi_write(HUGE_WRITE_ROWS_PER_BATCH);
