@@ -92,6 +92,17 @@ mod tests {
     }
 
     #[test]
+    fn an_array_element_has_no_spaces_around_it() {
+        // The file writes the names as '{string, pattern, replacement}'.
+        let regexp_replace = PgProc::by_oid(2284).unwrap();
+        assert_eq!(regexp_replace.proname, "regexp_replace");
+        assert_eq!(
+            regexp_replace.proargnames,
+            Some(&["string", "pattern", "replacement"][..])
+        );
+    }
+
+    #[test]
     fn a_symbol_of_the_file_has_the_value_of_a_64_bit_build() {
         // The file says NAMEDATALEN for the length of `name`.
         assert_eq!(PgType::by_oid(19).unwrap().typlen, 64);
