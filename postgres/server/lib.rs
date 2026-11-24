@@ -2280,4 +2280,24 @@ mod tests {
         let val = pg_bytes_to_value(b"hello", &Type::UNKNOWN).unwrap();
         assert!(matches!(val, Value::Text(_)));
     }
+
+    /// Known gap: PostgreSQL 18 describes `5::int2` as int2 (oid 21) and
+    /// `1.5::numeric` as numeric (oid 1700). tursopg describes them as int4
+    /// and float8, so a client decodes the values with the wrong type.
+    #[test]
+    fn smallint_and_numeric_result_column_oids_are_a_known_gap() {
+        let (mut client, _conn) = copy_test_client();
+        let events = client.simple_query("SELECT 5::int2, 1.5::numeric").unwrap();
+        let oids: Vec<u32> = events
+            .iter()
+            .find_map(|event| match event {
+                BackendEvent::RowDescription(columns) => {
+                    Some(columns.iter().map(|c| c.type_oid).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{events:?}"));
+        // PostgreSQL 18 sends [21, 1700].
+        assert_eq!(oids, [Type::INT4.oid(), Type::FLOAT8.oid()]);
+    }
 }

@@ -1501,3 +1501,33 @@ expect error {
 expect @tursopg raw {
  12
 }
+
+# Unquoted C folds to c, and PostgreSQL has no collation named "c".
+@compat-gap "syntax:collate"
+test unquoted-collate-c-does-not-exist {
+    SELECT 'a' COLLATE C;
+}
+@sqlstate 42704
+expect error {}
+expect @tursopg {
+    a
+}
+
+# The default collation of the database is en_US.utf8 in PostgreSQL 18;
+# tursopg compares text bytewise, so uppercase sorts before lowercase.
+@compat-gap "operator:text < text"
+test text-order-by-uses-database-collation {
+    SELECT x FROM (VALUES ('b'), ('B'), ('a'), ('A')) v(x) ORDER BY x;
+}
+expect {
+    a
+    A
+    b
+    B
+}
+expect @tursopg {
+    A
+    B
+    a
+    b
+}
