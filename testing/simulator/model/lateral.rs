@@ -7,9 +7,9 @@ use sql_generation::model::{
     query::{predicate::Predicate, select::table_qualified_name},
     table::SimValue,
 };
-use turso_parser::ast::{
+use turso_core::ast::{
     self,
-    fmt::{BlankContext, ToTokens},
+    fmt::{BlankContext, WriteSql},
 };
 
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
@@ -376,7 +376,7 @@ fn select_ast(
         with: None,
         body: ast::SelectBody {
             select: ast::OneSelect::Select {
-                distinctness: distinct.then_some(ast::Distinctness::Distinct),
+                distinctness: distinct.then_some(ast::SelectDistinctness::Distinct),
                 columns,
                 from: Some(from),
                 where_clause: where_clause.map(Box::new),

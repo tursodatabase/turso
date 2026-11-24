@@ -45,6 +45,14 @@ A release build takes several times longer than a debug build and doubles the si
 - Put PostgreSQL code in `postgres/`.
 - If the PostgreSQL frontend cannot execute a statement exactly as PostgreSQL does,
   return an error with SQLSTATE 0A000 (feature_not_supported).
+- When code hand-codes a PostgreSQL rule because Turso lacks the PostgreSQL facility
+  that holds it, put a `FIXME(pg-<facility>):` comment at the place that decides.
+  The comment says which rule the code hand-codes and what would replace it.
+  `FIXME(pg-catalog)` marks code that a lookup in pg_type, pg_cast, pg_proc or
+  pg_operator, or an expression tree that carries PostgreSQL types, would replace.
+  For a different missing facility, reuse a tag from `rg 'FIXME\(pg-'` or start a
+  new one, such as `FIXME(pg-search-path)`. Check each PostgreSQL fact in the
+  comment against PostgreSQL itself, for example with a catalog query.
 - For an impossible state, use an assertion.
 - Index inserts, deletes and conflict resolution happen in the same order as in SQLite.
   Compare the `EXPLAIN` output of both.
@@ -56,8 +64,7 @@ A release build takes several times longer than a debug build and doubles the si
 
 ## Writing code and text
 
-- Use literal words instead of metaphors. Write "a statement that needs a table", not
-  "a bootstrap-safe statement".
+- In comments, documentation, and PRs, use simple English (ASD-STE100 without the dictionary).
 - In a file, place each function below the functions that call it.
 - A comment explains why the code does something. A comment on a function or field
   describes that function or field.
@@ -69,13 +76,18 @@ imperative mood, with no period at the end. Example:
 `core/mvcc: preserve B-tree cleanup markers in commit logs`.
 In the commit body, explain why the change is needed.
 
-Split a pull request into several commits, one commit per logical step.
-
-A pull request description leaves out the test plan, the names of added tests and test
-counts. CI shows them.
+Split a pull request into several commits, one commit per logical step. If the PR hasn't been reviewed by a human
+yet, amend or rebase your commits to keep a clear history.
 
 In GitHub Actions (`.github/workflows/claude.yml`) a run has a turn limit. Push work in
 progress so that another run can continue it.
 
 Topic guides are in `.claude/skills/<name>/SKILL.md`: testing, debugging, async-io-model,
 transaction-correctness, mvcc, yield-injections, cdc, differential-fuzzer, memory-benchmark.
+
+In PR descriptions, explain what the bug was in the past tense, and the solution in the present tense.
+If you identified the bug while working on a project other than Turso, please name it. When addressing
+PR comments, indicate clearly in a footer that you're an agent.
+
+Address comments from Autofixer, our review bot, and iterate with it. Often, maintainers will only
+consider a PR once Autofixer is happy with it.

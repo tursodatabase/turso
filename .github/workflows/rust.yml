@@ -197,9 +197,11 @@ jobs:
           LOCAL_SYNC_SERVER_DIR: "1"
         run: cargo nextest run -p turso --all-features --locked --no-fail-fast -E 'test(/^sync::/)' --no-tests=fail --failure-output=final
         timeout-minutes: 20
-      - name: Memory leak check (repeated database open/workload/drop)
-        if: matrix.suite == 'extra'
-        run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'binary(leak_tests)' --failure-output=final
+      - name: Test encrypted sync through Rust SDK
+        if: runner.os == 'Linux' && matrix.suite == 'extra'
+        run: |
+          cargo build --locked -p turso --example sync_encryption_e2e --all-features
+          python3 testing/cli_tests/sync_encryption.py
         timeout-minutes: 10
       - name: Test doctests
         if: matrix.suite == 'extra'
@@ -394,6 +396,9 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 35
     strategy:
+      # Each profile tests different code, so a failure in one profile must not
+      # cancel the others.
+      fail-fast: false
       matrix:
         profile:
           - name: default
@@ -408,6 +413,11 @@ jobs:
           - name: Faultless
             iterations: 10
             args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --io-backend=memory"
+          # The default backend, not memory: it rejects an operation with a
+          # fault when it is issued, as `UnixFile::truncate` does.
+          - name: MvccSingleConnection
+            iterations: 10
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile mvcc_single_connection --io-backend=default"
           - name: SavepointStress
             iterations: 5
             args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile savepoint_stress --io-backend=memory"
@@ -423,6 +433,19 @@ jobs:
           - name: Differential
             iterations: 10
             args: "--maximum-tests 1000 --differential --io-backend=memory"
+          # Swarm testing: each iteration picks its statement mix, properties,
+          # faults, connection count, I/O backend, I/O latency and clock ticks
+          # from its seed, so the job gives none of these flags. The log shows
+          # the picked settings, and the same seed repeats the run. Pull requests
+          # use the seeds 1 to `iterations`, which pass on main, so a failure
+          # on a pull request comes from its change. All other runs (pushes
+          # to main and manual runs) use random seeds to try new settings.
+          # There, a failure is a bug to investigate, and it does not block
+          # an unrelated pull request.
+          - name: Swarm
+            iterations: 100
+            args: "--maximum-tests 1000 --swarm"
+            swarm: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -433,22 +456,34 @@ jobs:
           prefix-key: "v1-rust"
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The simulator profile (Cargo.toml) optimizes the code but keeps
+      # debug assertions; simulations run about ten times faster than with
+      # the dev profile.
       - name: Build simulator
-        run: cargo build -p limbo_sim --bin limbo_sim --locked
+        run: cargo build -p limbo_sim --bin limbo_sim --locked --profile simulator
       - name: Simulator ${{ matrix.profile.name }}
         env:
           SIM_ARGS: ${{ matrix.profile.args }}
+          FIXED_SEEDS: ${{ github.event_name == 'pull_request' && matrix.profile.swarm || false }}
         run: |
           set -euo pipefail
+          # The step picks the seed, so that a failed iteration can print it
+          # even if the simulator stops before it prints the seed.
           seq 1 ${{ matrix.profile.iterations }} | xargs -P 4 -n 1 bash -c '
             i="$1"
             log="sim-run-$i.log"
             read -r -a args <<< "$SIM_ARGS"
-            if ./target/debug/limbo_sim "${args[@]}" >"$log" 2>&1; then
-              echo "iteration $i ok: $(grep -m1 "^seed: " "$log")"
+            if [ "$FIXED_SEEDS" = true ]; then
+              seed="$i"
             else
-              echo "iteration $i FAILED:"
+              seed=$(od -An -N8 -tu8 /dev/urandom | tr -d " ")
+            fi
+            if ./target/simulator/limbo_sim "${args[@]}" --seed "$seed" >"$log" 2>&1; then
+              echo "iteration $i ok: seed: $seed"
+            else
+              echo "iteration $i FAILED (seed: $seed):"
               cat "$log"
+              echo "Reproduce with: cargo run -p limbo_sim --profile simulator -- $SIM_ARGS --seed $seed"
               exit 255
             fi
           ' _

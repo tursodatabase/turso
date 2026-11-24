@@ -1,0 +1,40 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/8104
+#
+# The code generator recurses one time for each term of a compound SELECT, so
+# a compound with many terms overflowed the stack. SQLite stops at 500 terms
+# (SQLITE_MAX_COMPOUND_SELECT) with "too many terms in compound SELECT", and
+# Turso uses the same limit and the same message.
+
+# CLI backend only: the rust backend executes queries on tokio worker threads,
+# and 500 terms do not fit in their stacks in a debug build.
+@backend cli
+test compound-select-with-500-terms {
+    SELECT count(*) FROM (SELECT 1{{repeat:499: UNION ALL SELECT 1}});
+}
+expect {
+    500
+}
+
+test compound-select-with-501-terms-is-an-error {
+    SELECT 1{{repeat:500: UNION ALL SELECT 1}};
+}
+expect error {
+    too many terms in compound SELECT
+}
+
+test compound-select-with-501-terms-in-a-subquery-is-an-error {
+    SELECT count(*) FROM (SELECT 1{{repeat:500: UNION SELECT 1}});
+}
+expect error {
+    too many terms in compound SELECT
+}
+
+# A VALUES list is one term, not a compound, so the limit does not apply to it.
+test values-with-600-rows-is-not-a-compound {
+    SELECT count(*) FROM (VALUES (1){{repeat:599:, (1)}});
+}
+expect {
+    600
+}

@@ -12,6 +12,8 @@ Most functions come in pairs: a `json_*` variant that returns TEXT and a `jsonb_
 
 SQL REAL arguments are converted to JSON numbers with up to 15 significant decimal digits, matching SQLite. Numbers already stored in JSON text retain their original precision.
 
+A BLOB argument is read as JSONB when its first header gives the size of the whole BLOB. Other BLOB arguments are read as JSON text. Like SQLite, `->`, `->>`, `json_extract`, `jsonb_extract`, `json_type` and `json_array_length` with a path, and `json_each` and `json_tree` with a root path, read only the part of a JSONB argument that the path selects. Thus a malformed value outside the path does not cause an error.
+
 ## JSON Path Syntax
 
 Many JSON functions accept a **path** argument that identifies a specific element within a JSON document.
@@ -26,6 +28,15 @@ Many JSON functions accept a **path** argument that identifies a specific elemen
 | `$[0].key` | Object member inside the first array element |
 
 Path arguments must begin with `$`. If a path does not match any element, functions generally return `NULL`.
+
+As in SQLite, each step of a path is read only when it is applied to an element, so a malformed step is an error only if the steps before it find an element. A `[` step finds nothing in an element that is not an array.
+
+```sql
+SELECT json_extract('{"a": 1}', '$[-1]');
+-- NULL: the root is not an array
+SELECT json_extract('[1, 2, 3]', '$[-1]');
+-- error: bad JSON path: '$[-1]'
+```
 
 ```sql
 SELECT json_extract('{"a": {"b": [10, 20, 30]}}', '$.a.b[1]');
@@ -272,6 +283,10 @@ SELECT '{"name":"Alice"}' ->> '$.name';
 SELECT '{"count":42}' ->> '$.count';
 -- 42
 ```
+
+Through the PostgreSQL frontend, `->` and `->>` work as in PostgreSQL. The right operand is the name of a field or the index of an array element, not a JSON path: `'{"$.a":1}'::jsonb ->> '$.a'` is `1`. A negative index counts from the end of the array. If an object has two fields with the same name, the last one counts. `->>` returns text: `'{"n":2}'::jsonb ->> 'n'` is the text `2`, a number is written as jsonb writes it (`'{"n":1e2}'::jsonb ->> 'n'` is `100`), and a JSON boolean is `true` or `false`. A JSON null is NULL. A `CREATE INDEX` or a stored generated column that uses `->` or `->>` fails with SQLSTATE 0A000.
+
+Through the PostgreSQL frontend, `@>` and `<@` compare jsonb values as in PostgreSQL: `'{"a":1,"b":2}'::jsonb @> '{"a":1}'` is true, and `a <@ b` is `b @> a`. An object contains an object when it has each field of that object, with a value that contains the value of the field. An array contains an array when each element of that array is contained by one of its elements, in any order. Only at the top level does an array also contain a scalar that is one of its elements. Numbers compare by value, so `1.5` equals `1.50`. If an object has two fields with the same name, the last one counts. An index expression and a stored generated column use the array function for `@>` and `<@`, which returns NULL for jsonb values. [Array Functions](/docs/sql-reference/functions/array) describes `@>` and `<@` for arrays.
 
 ### json_type
 
@@ -533,7 +548,7 @@ jsonb_group_object(label, value)
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `label` | TEXT | The key for each entry |
+| `label` | TEXT | The key for each entry. A number or BLOB is converted to text. The key ends at the first NUL character, unlike a `json_object()` label. A row with a NULL label is skipped. |
 | `value` | any | The value for each entry |
 
 **Returns:** TEXT (json_group_object) or BLOB (jsonb_group_object) -- a JSON object.

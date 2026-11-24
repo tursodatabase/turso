@@ -1,0 +1,198 @@
+# Known tursopg gaps against PostgreSQL: CREATE TABLE AS with a column of a
+# custom type
+#
+# PostgreSQL keeps the type of each result column in the new table. tursopg
+# types the new columns with SQLite declared types, so a timestamptz would
+# become text: it would compare wrongly and accept invalid input. tursopg
+# refuses the statement with 0A000 until the type is kept.
+#
+# Each test with a `@compat-gap "<kind>:<object>"` label records a known
+# difference: its default `expect` block is PostgreSQL 18's answer and its
+# `expect @tursopg` block is tursopg's current answer. When tursopg gives the
+# PostgreSQL answer, the tursopg run fails with "gap fixed": then delete only
+# `@compat-gap` and the `expect @tursopg` block, and keep the test.
+
+@database :memory:
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-timestamptz-column {
+    CREATE TABLE t (id int, ts timestamptz);
+    INSERT INTO t VALUES (1, '2024-03-05 12:34:56.789+02');
+    CREATE TABLE c AS SELECT ts FROM t;
+    SELECT count(*) FROM c WHERE ts = '2024-03-05 12:34:56.789+02' AND NOT ts < '2024-03-05 11:00:00+01';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-timestamptz-column-rejects-invalid-input {
+    CREATE TABLE t (ts timestamptz);
+    CREATE TABLE c AS SELECT ts FROM t;
+    INSERT INTO c VALUES ('not a time');
+}
+@sqlstate 22007
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-domain-over-timestamptz-column {
+    CREATE DOMAIN ts_dom AS timestamptz;
+    CREATE TABLE t (ts ts_dom);
+    INSERT INTO t VALUES ('2024-03-05 12:34:56+02');
+    CREATE TABLE c AS SELECT ts FROM t;
+    SELECT count(*) FROM c WHERE ts = '2024-03-05 10:34:56+00';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-timestamp-column {
+    CREATE TABLE t (ts timestamp);
+    INSERT INTO t VALUES ('2024-03-05 12:34:56');
+    CREATE TABLE c AS SELECT ts FROM t;
+    SELECT count(*) FROM c WHERE ts = '2024-03-05 12:34:56.000';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-now {
+    CREATE TABLE c AS SELECT now() AS n;
+    SELECT count(*) FROM c WHERE n <= now();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-cast-to-timestamptz {
+    CREATE TABLE c AS SELECT '2024-03-05 12:34:56.789+02'::timestamptz AS ts;
+    SELECT count(*) FROM c WHERE ts = '2024-03-05 10:34:56.789+00';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create table as with custom type"
+test select-into-timestamptz-column {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2024-03-05 12:34:56+02');
+    SELECT ts INTO c FROM t;
+    SELECT count(*) FROM c WHERE ts = '2024-03-05 10:34:56+00';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-with-no-data-timestamptz-column {
+    CREATE TABLE t (ts timestamptz);
+    CREATE TABLE c AS SELECT ts FROM t WITH NO DATA;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-coalesce-timestamptz-column {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES (NULL);
+    CREATE TABLE c AS SELECT coalesce(ts, now()) AS ts FROM t;
+    SELECT count(*) FROM c;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# A result column of a built-in type still works.
+test ctas-builtin-columns {
+    CREATE TABLE t (id int, name text);
+    INSERT INTO t VALUES (1, 'a');
+    CREATE TABLE c AS SELECT id, name, id + 1 AS next_id, length(name) AS len FROM t;
+    SELECT id, name, next_id, len FROM c;
+}
+expect {
+    1|a|2|1
+}
+
+# The name check comes before the column check, as in PostgreSQL.
+test ctas-if-not-exists-existing-table-skips-column-check {
+    CREATE TABLE t (ts timestamptz);
+    CREATE TABLE c (x int);
+    CREATE TABLE IF NOT EXISTS c AS SELECT ts FROM t;
+    SELECT 'ok';
+}
+expect {
+    ok
+}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-values-timestamptz {
+    CREATE TABLE c AS VALUES (CAST('2024-01-05 10:00:00+02' AS timestamptz));
+    SELECT count(*) FROM c WHERE column1 = '2024-01-05 08:00:00+00';
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# A VALUES list hides the type of its cast from CREATE TABLE AS, so the copy
+# stores the timestamps as text instead of being refused.
+@compat-gap "syntax:create table as with custom type"
+test ctas-values-subquery-timestamptz {
+    CREATE TABLE c AS SELECT * FROM (VALUES ('2024-03-05 12:34:56+02'::timestamptz)) v(x);
+    SELECT count(*) FROM c WHERE x = '2024-03-05 10:34:56+00';
+}
+expect {
+    1
+}
+expect @tursopg {
+    0
+}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-cte-over-values-timestamptz {
+    CREATE TABLE c AS WITH v(x) AS (VALUES ('2024-03-05 12:34:56+02'::timestamptz)) SELECT x FROM v;
+    SELECT count(*) FROM c WHERE x = '2024-03-05 10:34:56+00';
+}
+expect {
+    1
+}
+expect @tursopg {
+    0
+}
+
+# PostgreSQL keeps varchar(3) in the copy and refuses a longer value; tursopg
+# copies the column without its length limit.
+@compat-gap "type:varchar"
+test ctas-varchar-length-limit {
+    CREATE TABLE t (s varchar(3));
+    CREATE TABLE c AS SELECT s FROM t;
+    INSERT INTO c VALUES ('abcd');
+}
+@sqlstate 22001
+expect error {}
+expect @tursopg {
+}

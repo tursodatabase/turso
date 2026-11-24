@@ -69,6 +69,7 @@ pub fn pg_func(name: &str) -> Option<&'static PgFunc> {
 }
 
 #[rustfmt::skip]
+// FIXME(pg-catalog): This registry hand-codes provolatile, proretset and prokind of pg_proc, and picks the volatility of overloads by argument count or by whether an argument is timestamptz. It also lists SQL expressions that pg_proc does not have (coalesce, nullif, greatest, least, trim, current_date and the other SQL value functions) and uuid_generate_v1 and uuid_generate_v4 of the uuid-ossp extension. A lookup in a pg_proc table after function resolution replaces this.
 static PG_FUNCS: phf::Map<&'static str, PgFunc> = phf_map! {
     "abs" => PgFunc { immutability: Immutability::Always, set_returning: false, aggregate: false },
     "age" => PgFunc { immutability: Immutability::ArgCount(2), set_returning: false, aggregate: false },
@@ -302,12 +303,15 @@ static PG_FUNCS: phf::Map<&'static str, PgFunc> = phf_map! {
     "xmlagg" => PgFunc { immutability: Immutability::Always, set_returning: false, aggregate: true },
 };
 
+/// FIXME(pg-catalog): This hand-codes prorettype of pg_proc for functions that return a date or time type. A lookup in a pg_proc table replaces this.
 /// The date or time type that the built-in function `name` returns, for
 /// functions that return the same one for every argument type. Names are
 /// matched ignoring case. The list was copied by hand from PostgreSQL 18's
 /// pg_proc; functions returning timestamp or timestamptz are left out because
-/// tursopg supports both. age() is listed although age(xid) returns an
-/// integer, because tursopg has no xid type.
+/// tursopg supports both. Functions returning date stay listed: tursopg
+/// supports the date type, but it has not implemented these functions. age()
+/// is listed although age(xid) returns an integer, because tursopg has no xid
+/// type.
 #[rustfmt::skip]
 pub fn datetime_result_type(name: &str) -> Option<&'static str> {
     Some(match name.to_ascii_lowercase().as_str() {

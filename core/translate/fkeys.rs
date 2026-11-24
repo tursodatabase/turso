@@ -1,4 +1,4 @@
-use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
+use crate::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::namespace::NamespaceRef;
@@ -662,41 +662,6 @@ pub fn emit_fk_restrict_halt(
     Ok(())
 }
 
-/// Stabilize the NEW row image for FK checks (UPDATE):
-/// fill in unmodified PK columns from the current row so the NEW PK vector is complete.
-pub fn stabilize_new_row_for_fk(
-    program: &mut ProgramBuilder,
-    table_btree: &BTreeTable,
-    set_cols: &ColumnMask,
-    cursor_id: usize,
-    start: usize,
-    rowid_new_reg: usize,
-) -> Result<()> {
-    if table_btree.primary_key_columns.is_empty() {
-        return Ok(());
-    }
-
-    let layout = table_btree.column_layout()?;
-    for (pk_name, _) in &table_btree.primary_key_columns {
-        let (pos, col) = table_btree
-            .get_column(pk_name)
-            .ok_or_else(|| LimboError::InternalError(format!("pk col {pk_name} missing")))?;
-        if !set_cols.get(pos) {
-            let dst_reg = layout.to_register(start, pos);
-            if col.is_rowid_alias() {
-                program.emit_insn(Insn::Copy {
-                    src_reg: rowid_new_reg,
-                    dst_reg,
-                    extra_amount: 0,
-                });
-            } else {
-                program.emit_column_or_rowid(cursor_id, pos, dst_reg);
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Handles rowid and `INTEGER PRIMARY KEY` parent-key updates.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_rowid_pk_change_check(
@@ -1039,7 +1004,9 @@ fn emit_fk_parent_key_probe(
 
 /// An index on exactly the child key columns that can find the child rows of
 /// a parent key: its key columns must compare with the parent key's
-/// collations, otherwise a seek would miss or wrongly find child rows.
+/// collations, otherwise a seek would miss or wrongly find child rows. A
+/// partial index cannot find them all, because it has no entries for the
+/// child rows that fail its WHERE clause.
 pub(super) fn child_index_for_fk(
     resolver: &Resolver,
     database_id: usize,
@@ -1049,7 +1016,8 @@ pub(super) fn child_index_for_fk(
     resolver.with_schema(database_id, |s| {
         s.get_indices(fk_ref.child_namespace, &fk_ref.child_table.name)
             .find(|ix| {
-                ix.columns.len() == child_cols.len()
+                ix.where_clause.is_none()
+                    && ix.columns.len() == child_cols.len()
                     && ix
                         .columns
                         .iter()
@@ -1894,11 +1862,15 @@ fn emit_fk_action_subprogram(
         );
         Subprogram::Pending(slot)
     } else {
+        let Some(depth) = program.nested_subprogram_depth() else {
+            return Ok(());
+        };
         let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
             QueryMode::Normal,
             program.capture_data_changes_info().clone(),
             FK_SUBPROGRAM_OPTS,
             program.is_mvcc_enabled(),
+            depth,
         );
         subprogram_builder
             .flags

@@ -11,18 +11,25 @@ use turso_ext::{
 };
 use turso_pg_parser::sqlstate::SQLSTATE_NULL_VALUE_NOT_ALLOWED;
 
-#[derive(Debug)]
-pub(crate) struct PgOptionsToTable;
+/// A table function with two columns and a hidden third column that holds its
+/// one argument, such as pg_options_to_table and PostgreSQL's json_each.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TwoColumnFunction {
+    /// The CREATE TABLE statement that names the function and its columns.
+    pub(crate) schema: &'static str,
+    /// Appends the rows of the function for its argument.
+    pub(crate) append_rows: fn(&Value, &mut Vec<[Value; 2]>) -> Result<()>,
+}
 
-impl VirtualTableModule for PgOptionsToTable {
+impl VirtualTableModule for TwoColumnFunction {
     type Table = Self;
 
     fn schema(&self, _args: &[Value]) -> Result<String> {
-        Ok("CREATE TABLE pg_options_to_table (option_name TEXT, option_value TEXT, options_array TEXT HIDDEN)".into())
+        Ok(self.schema.into())
     }
 
     fn create(&self, _args: &[Value]) -> Result<Self> {
-        Ok(Self)
+        Ok(*self)
     }
 
     fn innocuous(&self) -> bool {
@@ -30,11 +37,12 @@ impl VirtualTableModule for PgOptionsToTable {
     }
 }
 
-impl VirtualTable for PgOptionsToTable {
-    type Cursor = PgOptionsCursor;
+impl VirtualTable for TwoColumnFunction {
+    type Cursor = TwoColumnCursor;
 
     fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
-        Ok(PgOptionsCursor {
+        Ok(TwoColumnCursor {
+            append_rows: self.append_rows,
             rows: Vec::new(),
             position: 0,
             input: Value::Null,
@@ -66,13 +74,14 @@ impl VirtualTable for PgOptionsToTable {
     }
 }
 
-pub(crate) struct PgOptionsCursor {
+pub(crate) struct TwoColumnCursor {
+    append_rows: fn(&Value, &mut Vec<[Value; 2]>) -> Result<()>,
     rows: Vec<[Value; 2]>,
     position: usize,
     input: Value,
 }
 
-impl VirtualTableCursor for PgOptionsCursor {
+impl VirtualTableCursor for TwoColumnCursor {
     fn next(&mut self) -> IOResultOr<bool> {
         self.position += 1;
         Ok(IOResult::Done(self.position < self.rows.len()))
@@ -86,7 +95,7 @@ impl VirtualTableCursor for PgOptionsCursor {
         let value = match column {
             0 | 1 => self.rows[self.position][column].clone(),
             2 => self.input.clone(),
-            _ => unreachable!("invalid pg_options_to_table column"),
+            _ => unreachable!("invalid table function column"),
         };
         Ok(IOResult::Done(value))
     }
@@ -101,17 +110,17 @@ impl VirtualTableCursor for PgOptionsCursor {
         self.position = 0;
         let [input] = args else {
             return Err(LimboError::InvalidArgument(
-                "pg_options_to_table requires one argument".into(),
+                "a table function requires one argument".into(),
             )
             .into());
         };
         self.input = input.clone();
-        append_options(input, &mut self.rows)?;
+        (self.append_rows)(input, &mut self.rows)?;
         Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
 
-fn append_options(input: &Value, rows: &mut Vec<[Value; 2]>) -> Result<()> {
+pub(crate) fn append_options(input: &Value, rows: &mut Vec<[Value; 2]>) -> Result<()> {
     let values = array_values_from_any(input).ok_or_else(|| {
         LimboError::InvalidArgument("pg_options_to_table requires a text array".into())
     })?;
@@ -124,6 +133,7 @@ fn append_options(input: &Value, rows: &mut Vec<[Value; 2]>) -> Result<()> {
             return Err(sqlstate_error(
                 SQLSTATE_NULL_VALUE_NOT_ALLOWED,
                 "null array element not allowed in this context",
+                None,
             ));
         }
         let option = value.to_string();

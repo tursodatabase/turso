@@ -82,6 +82,7 @@ fn database_allocators_preserve_distinct_concrete_types() {
             allocations: allocations.clone(),
             deallocations: deallocations.clone(),
         },
+        statement: DynAllocator::default(),
     };
     let cloned = allocators.clone();
     let layout = Layout::new::<u64>();
@@ -112,62 +113,38 @@ fn dyn_allocator_delegates_skiplist_allocations() {
     assert!(allocations.load(Ordering::Relaxed) > 0);
 }
 
-#[cfg(all(nightly, feature = "fts"))]
 #[test]
-fn database_fts_build_and_merge_use_only_the_fts_allocator() {
+fn dyn_box_allocates_from_its_allocator() {
     let allocations = StdArc::new(AtomicUsize::new(0));
     let deallocations = StdArc::new(AtomicUsize::new(0));
-    let mv_allocations = StdArc::new(AtomicUsize::new(0));
-    let db = crate::Database::open(
-        StdArc::new(crate::MemoryIO::new()),
-        ":memory:",
-        crate::OpenOptions::new(StdArc::new(crate::SqliteDialect))
-            .db_opts(crate::DatabaseOpts::default().with_index_method(true))
-            .allocators(DatabaseAllocators {
-                mv_store: DynAllocator::new(CountingAlloc {
-                    allocations: mv_allocations.clone(),
-                    deallocations: StdArc::new(AtomicUsize::new(0)),
-                }),
-                fts: DynAllocator::new(CountingAlloc {
-                    allocations: allocations.clone(),
-                    deallocations: deallocations.clone(),
-                }),
-            }),
-    )
-    .unwrap();
-    let conn = db.connect().unwrap();
-    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
-        .unwrap();
-    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
-        .unwrap();
-    for sql in [
-        "INSERT INTO docs VALUES (7, 'hello turso')",
-        "INSERT INTO docs VALUES (19, 'hello world')",
-        "OPTIMIZE INDEX docs_fts",
-    ] {
-        allocations.store(0, Ordering::Relaxed);
-        deallocations.store(0, Ordering::Relaxed);
-        conn.execute(sql).unwrap();
-        assert!(allocations.load(Ordering::Relaxed) > 0, "{sql}");
-        assert_eq!(
-            allocations.load(Ordering::Relaxed),
-            deallocations.load(Ordering::Relaxed),
-            "{sql}"
-        );
-        assert_eq!(mv_allocations.load(Ordering::Relaxed), 0, "{sql}");
+    let alloc = DynAllocator::new(CountingAlloc {
+        allocations: allocations.clone(),
+        deallocations: deallocations.clone(),
+    });
+
+    let boxed = DynBox::try_new_in([7u64; 4], alloc).unwrap();
+    assert_eq!(allocations.load(Ordering::Relaxed), 1);
+    assert_eq!(TursoBoxExt::into_inner(boxed), [7u64; 4]);
+    assert_eq!(deallocations.load(Ordering::Relaxed), 1);
+}
+
+struct FailingAlloc;
+
+unsafe impl ApiAllocator for FailingAlloc {
+    fn allocate(&self, _layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        Err(AllocError)
     }
-    let rows = conn
-        .prepare("SELECT id FROM docs WHERE fts_match(body, 'hello') ORDER BY id")
-        .unwrap()
-        .run_collect_rows()
-        .unwrap();
-    assert_eq!(
-        rows,
-        std::vec![
-            std::vec![crate::Value::from_i64(7)],
-            std::vec![crate::Value::from_i64(19)]
-        ]
-    );
+
+    unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {
+        unreachable!("FailingAlloc gives no memory, so nothing can return memory to it");
+    }
+}
+
+#[test]
+fn dyn_box_returns_an_error_when_its_allocator_fails() {
+    let alloc = DynAllocator::new(FailingAlloc);
+
+    assert!(DynBox::try_new_in(7u64, alloc).is_err());
 }
 
 #[cfg(nightly)]

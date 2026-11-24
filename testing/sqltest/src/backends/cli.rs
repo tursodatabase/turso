@@ -1,5 +1,6 @@
 use super::{
-    BackendError, DatabaseFileHandle, DatabaseInstance, QueryResult, SqlBackend, parse_list_output,
+    BackendError, DatabaseFileHandle, DatabaseInstance, QueryResult, SqlBackend,
+    check_process_crash, parse_list_output,
 };
 use crate::backends::DefaultDatabaseResolver;
 use crate::parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation};
@@ -321,6 +322,7 @@ impl CliDatabaseInstance {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let exit_success = output.status.success();
+        check_process_crash(output.status, &stderr)?;
 
         // Detect errors from output text
         let has_stderr_error =

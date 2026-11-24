@@ -15,7 +15,7 @@ use crate::mvcc::sqlite_schema_row::{
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::namespace::{mangle_name, NamespaceId};
-use crate::schema::{Index, Schema};
+use crate::schema::{Index, Schema, Table};
 use crate::skiplist::base::RefEntry;
 use crate::skiplist::comparator::{BasicComparator, Comparator};
 use crate::skiplist::{SkipMap, SkiplistAllocator};
@@ -214,6 +214,10 @@ pub enum CheckpointState {
     /// truncation, the old frames come back, but their `commit_ts` is at or below
     /// `persistent_tx_ts_max`, so recovery skips them.
     TruncateLogicalLog,
+    /// Apply the finished truncate of the logical log to the in-memory log
+    /// state. A truncate that completes after `DurableStorage::truncate`
+    /// returned leaves the old log offset in place until this step.
+    FinishTruncateLogicalLog,
     /// Truncate the WAL file after the DB file is durable.
     TruncateWal,
     GcTableRows {
@@ -1994,28 +1998,33 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         for (_, name, table) in schema.all_tables_mut() {
             #[cfg(not(feature = "conn_raw_api"))]
             let _ = name;
-            let table = Arc::get_mut(table).expect("this should be the only reference");
-            let Some(btree_table) = table.btree_mut() else {
+            let Table::BTree(btree_table) = table.as_ref() else {
                 continue;
             };
-            let btree_table = Arc::make_mut(btree_table);
-            if btree_table.root_page < 0 {
-                #[cfg(feature = "conn_raw_api")]
-                let old_root_page = btree_table.root_page;
-                let table_id = MVTableId::from(btree_table.root_page);
-                // Only tables this pass materialized; ones created after our snapshot stay
-                // negative for a later pass.
-                if let Some(root_page) = self
-                    .mvstore
-                    .table_id_to_rootpage
-                    .get(&table_id)
-                    .and_then(|entry| entry.value().root_page)
-                {
-                    btree_table.root_page = root_page as i64;
-                    #[cfg(feature = "conn_raw_api")]
-                    moved_root_pages.push((old_root_page, btree_table.root_page, name.to_string()));
-                }
+            if btree_table.root_page >= 0 {
+                continue;
             }
+            let old_root_page = btree_table.root_page;
+            let table_id = MVTableId::from(old_root_page);
+            // Only tables this pass materialized; ones created after our snapshot stay
+            // negative for a later pass.
+            let Some(root_page) = self
+                .mvstore
+                .table_id_to_rootpage
+                .get(&table_id)
+                .and_then(|entry| entry.value().root_page)
+            else {
+                continue;
+            };
+            // Copy only the tables that change, because other schemas share them.
+            let btree_table = Arc::make_mut(
+                Arc::make_mut(table)
+                    .btree_mut()
+                    .expect("the table was a B-tree table above"),
+            );
+            btree_table.root_page = root_page as i64;
+            #[cfg(feature = "conn_raw_api")]
+            moved_root_pages.push((old_root_page, btree_table.root_page, name.to_string()));
         }
         #[cfg(feature = "conn_raw_api")]
         for (old_root_page, new_root_page, name) in moved_root_pages {
@@ -3257,27 +3266,33 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             CheckpointState::TruncateLogicalLog => {
                 tracing::debug!("Truncating logical log file");
                 let c = self.truncate_logical_log()?;
-                self.state = CheckpointState::TruncateWal;
+                self.state = CheckpointState::FinishTruncateLogicalLog;
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
-                    if self.clears_whole_logical_log() {
-                        turso_assert!(
-                            self.mvstore.storage.logical_log_offset() == 0,
-                            "TRUNCATE checkpoint must reset logical log offset to 0"
-                        );
-                        turso_assert!(
-                            self.mvstore
-                                .get_logical_log_file()
-                                .size()
-                                .expect("logical log file size should be readable after truncate")
-                                == 0,
-                            "TRUNCATE checkpoint must zero the logical log file"
-                        );
-                    }
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions(c)))
                 }
+            }
+
+            CheckpointState::FinishTruncateLogicalLog => {
+                self.mvstore.storage.finish_truncate();
+                if self.clears_whole_logical_log() {
+                    turso_assert!(
+                        self.mvstore.storage.logical_log_offset() == 0,
+                        "TRUNCATE checkpoint must reset logical log offset to 0"
+                    );
+                    turso_assert!(
+                        self.mvstore
+                            .get_logical_log_file()
+                            .size()
+                            .expect("logical log file size should be readable after truncate")
+                            == 0,
+                        "TRUNCATE checkpoint must zero the logical log file"
+                    );
+                }
+                self.state = CheckpointState::TruncateWal;
+                Ok(TransitionResult::Continue)
             }
 
             CheckpointState::CheckpointWal => {
@@ -3418,7 +3433,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 if let Some(io) = self.gc_checkpointed_index_versions() {
                     return Ok(TransitionResult::Io(io));
                 }
-                self.state = CheckpointState::PruneDirtyKeys;
+                // With the passive checkpoint off, commits record no dirty keys, and the
+                // full-scan request is never cleared, so every checkpoint reads every key.
+                self.state = if self.mvstore.uses_passive_checkpoint() {
+                    CheckpointState::PruneDirtyKeys
+                } else {
+                    CheckpointState::Finalize
+                };
                 Ok(TransitionResult::Continue)
             }
 
@@ -3967,11 +3988,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
 mod tests {
     use super::*;
     use crate::alloc::vec;
+    use crate::ast::SortOrder;
     use crate::mvcc::database::tests::MvccTestDbNoConn;
     use crate::mvcc::database::{Row, SortableIndexKey};
     use crate::translate::collate::CollationSeq;
     use crate::types::{IndexInfo, KeyInfo};
-    use turso_parser::ast::SortOrder;
 
     fn sqlite_schema_row_version(
         rowid: i64,
@@ -4195,9 +4216,11 @@ mod tests {
         (row.id, version)
     }
 
+    /// A checkpoint on a store with the passive checkpoint on, because only that store walks
+    /// the dirty keys.
     fn checkpoint_for_collect_tests(
     ) -> CheckpointStateMachine<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator> {
-        let db = MvccTestDbNoConn::new();
+        let db = MvccTestDbNoConn::new_passive();
         let conn = db.connect();
         let mvstore = db.get_mvcc_store();
         let pager = conn.pager.load().clone();

@@ -235,7 +235,7 @@ CREATE TABLE order_lines (
 );
 ```
 
-`INSERT` and `UPDATE` cannot write a generated column. A generated column can read other generated columns, virtual or stored, as long as no column depends on itself. You can create an index on a generated column. A generated column cannot be part of the `PRIMARY KEY`. A stored generated column cannot have a [custom type](/docs/sql-reference/statements/create-type) or an [array type](/docs/sql-reference/data-types#array-types), and its expression cannot read a column that has one. `PRAGMA table_info` does not show generated columns, but `PRAGMA table_xinfo` does, with `hidden` set to 2 for a virtual column and 3 for a stored column.
+`INSERT` and `UPDATE` cannot write a generated column. A generated column can read other generated columns, virtual or stored, as long as no column depends on itself. You can create an index on a generated column. A generated column cannot be part of the `PRIMARY KEY`. A stored generated column cannot have an [array type](/docs/sql-reference/data-types#array-types) or a STRUCT or UNION [custom type](/docs/sql-reference/statements/create-type), and its expression cannot read a column that has one. Any other type works, such as `numeric(10,2)`, `varchar(20)`, or `smallint`: the stored value goes through the type's `COERCE` and `ENCODE` like the value of a plain column. `PRAGMA table_info` does not show generated columns, but `PRAGMA table_xinfo` does, with `hidden` set to 2 for a virtual column and 3 for a stored column.
 
 ## Table Constraints
 

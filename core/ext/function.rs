@@ -5,7 +5,7 @@ use crate::native_ext::{
 };
 use crate::sync::Arc;
 use crate::types::{AggContext, ExternalAggState, IOResultOr};
-use crate::{Connection, IOResult, OpenOptions, Register, Result, Value};
+use crate::{dialect::ScalarFuncContext, IOResult, OpenOptions, Register, Result, Value};
 use turso_ext::ValueDestructor;
 
 impl OpenOptions {
@@ -31,6 +31,8 @@ impl ExternalFunc {
                 deterministic,
                 return_type: <<F::Call as ScalarCall>::Output as ScalarReturn>::TYPE,
                 receives_argument_types: false,
+                check_argument_types: None,
+                returns_first_argument_type: false,
                 function: Arc::new(function),
             },
         })
@@ -49,6 +51,56 @@ impl ExternalFunc {
             panic!("only a native scalar function can receive its argument types");
         };
         *receives_argument_types = true;
+        self
+    }
+
+    /// Sets a function that is called at compile time with the type name of
+    /// each argument, with domain names kept (`receiving_argument_types`
+    /// passes the domain's base type); an error refuses the statement. Needs
+    /// `receiving_argument_types`.
+    // FIXME(pg-catalog): only pg_timestamp_plus_interval sets this. It stands in
+    // for PostgreSQL resolving an operator or function by its argument types
+    // from pg_operator or pg_proc when it plans the statement. A pg_proc and
+    // pg_operator lookup replaces this; remove it if that lookup does not use it.
+    pub fn checking_argument_types(mut self, check: crate::function::ArgumentTypeCheck) -> Self {
+        let ExtFunc::NativeScalar {
+            receives_argument_types,
+            check_argument_types,
+            ..
+        } = &mut self.func
+        else {
+            panic!("only a native scalar function can check its argument types");
+        };
+        assert!(
+            *receives_argument_types,
+            "checking argument types needs receiving_argument_types"
+        );
+        *check_argument_types = Some(check);
+        self
+    }
+
+    /// Gives the function's result the type of its first argument, as
+    /// `nullif` has, for a function whose result type depends on the type of
+    /// its first argument. The function returns `Value`, which declares no
+    /// type of its own.
+    // FIXME(pg-catalog): only pg_timestamp_plus_interval sets this. PostgreSQL
+    // takes a result type from the prorettype of pg_proc or the oprresult of
+    // pg_operator, not from an argument. A pg_proc and pg_operator lookup
+    // replaces this; remove it if that lookup does not use it.
+    pub fn returning_first_argument_type(mut self) -> Self {
+        let ExtFunc::NativeScalar {
+            return_type,
+            returns_first_argument_type,
+            ..
+        } = &mut self.func
+        else {
+            panic!("only a native scalar function can return its first argument's type");
+        };
+        assert!(
+            return_type.is_none(),
+            "a function that returns its first argument's type declares no return type"
+        );
+        *returns_first_argument_type = true;
         self
     }
 
@@ -72,12 +124,12 @@ impl ExtFunc {
     pub fn call_scalar(
         &self,
         state: &mut ExtensionState,
-        connection: &Arc<Connection>,
+        context: &ScalarFuncContext<'_>,
         args: &[Register],
     ) -> IOResultOr<Value> {
         match self {
             Self::NativeScalar { function, .. } => {
-                crate::native_ext::step_scalar(state, function.as_ref(), connection, args)
+                crate::native_ext::step_scalar(state, function.as_ref(), context, args)
             }
             Self::Scalar {
                 context,

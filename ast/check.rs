@@ -1,6 +1,6 @@
 //! Check for additional syntax error
 
-use crate::ast::*;
+use crate::*;
 
 impl Cmd {
     /// Statement accessor

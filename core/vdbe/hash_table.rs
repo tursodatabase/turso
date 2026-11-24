@@ -6,13 +6,13 @@ use crate::{
     error::LimboError,
     io::{Buffer, Completion, TempFile, IO},
     io_yield_one, return_if_io,
-    storage::sqlite3_ondisk::{read_varint, read_varint_partial, varint_len, write_varint},
+    storage::sqlite3_ondisk::{read_varint, read_varint_partial, varint_len, write_varint_to_vec},
     sync::{
         atomic::{self, AtomicUsize},
         Arc, RwLock,
     },
     translate::collate::CollationSeq,
-    types::{IOCompletions, IOResult, Value, ValueRef},
+    types::{AsValueRef, IOCompletions, IOResult, Value, ValueRef},
     vdbe::metrics::HashJoinMetrics,
     CompletionError, Numeric, Result,
 };
@@ -44,11 +44,13 @@ const BLOB_HASH: u8 = 4;
 
 /// Hash function for join keys using rapidhash
 /// Takes collation into account when hashing text values
-fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
+/// The keys can be `Value`s or `ValueRef`s, so that a caller with `Value`s
+/// does not make a `Vec<ValueRef>` for each row.
+fn hash_join_key<V: AsValueRef>(key_values: &[V], collations: &[CollationSeq]) -> u64 {
     turso_assert_eq!(key_values.len(), collations.len());
     let mut hasher = RapidHasher::new(DEFAULT_SEED);
     for (value, collation) in key_values.iter().zip(collations) {
-        collation.hash_value(*value, &mut hasher);
+        collation.hash_value(value.as_value_ref(), &mut hasher);
     }
     hasher.finish()
 }
@@ -75,13 +77,14 @@ fn has_null_key_ref(key_values: &[ValueRef]) -> bool {
 }
 
 /// Check if two key value arrays are equal, taking collation into account.
-fn keys_equal(key1: &[Value], key2: &[ValueRef], collations: &[CollationSeq]) -> bool {
+/// The second keys can be `Value`s or `ValueRef`s, as in [hash_join_key].
+fn keys_equal<V: AsValueRef>(key1: &[Value], key2: &[V], collations: &[CollationSeq]) -> bool {
     if key1.len() != key2.len() {
         return false;
     }
     turso_assert_eq!(key1.len(), collations.len());
     for ((v1, v2), collation) in key1.iter().zip(key2.iter()).zip(collations) {
-        if !values_equal(v1.as_ref(), *v2, *collation) {
+        if !values_equal(v1.as_ref(), v2.as_value_ref(), *collation) {
             return false;
         }
     }
@@ -232,99 +235,39 @@ impl HashEntry {
             + self.payload_values.iter().map(Self::value_serialized_size).sum::<usize>()
     }
 
-    /// Serialize this entry directly to a slice, returns bytes written.
-    /// The caller must ensure the slice is large enough (use serialized_size()).
-    fn serialize_to_slice(&self, buf: &mut [u8]) -> usize {
-        let mut offset = 0;
-
-        // Write hash and rowid
-        buf[offset..offset + 8].copy_from_slice(&self.hash.to_le_bytes());
-        offset += 8;
-        buf[offset..offset + 8].copy_from_slice(&self.rowid.to_le_bytes());
-        offset += 8;
-
-        // Write number of keys and key values
-        offset += write_varint(&mut buf[offset..], self.key_values.len() as u64);
-        for value in &self.key_values {
-            offset += Self::serialize_value_to_slice(value, &mut buf[offset..]);
-        }
-
-        // Write number of payload values and payload values
-        offset += write_varint(&mut buf[offset..], self.payload_values.len() as u64);
-        for value in &self.payload_values {
-            offset += Self::serialize_value_to_slice(value, &mut buf[offset..]);
-        }
-
-        offset
-    }
-
-    /// Helper to serialize a single Value directly to a slice. Returns bytes written.
-    #[inline]
-    fn serialize_value_to_slice(value: &Value, buf: &mut [u8]) -> usize {
-        let mut offset = 0;
-        match value {
-            Value::Null => {
-                buf[offset] = NULL_HASH;
-                offset += 1;
-            }
-            Value::Numeric(Numeric::Integer(i)) => {
-                buf[offset] = INT_HASH;
-                offset += 1;
-                buf[offset..offset + 8].copy_from_slice(&i.to_le_bytes());
-                offset += 8;
-            }
-            Value::Numeric(Numeric::Float(f)) => {
-                buf[offset] = FLOAT_HASH;
-                offset += 1;
-                buf[offset..offset + 8].copy_from_slice(&f64::from(*f).to_le_bytes());
-                offset += 8;
-            }
-            Value::Text(t) => {
-                buf[offset] = TEXT_HASH;
-                offset += 1;
-                let bytes = t.as_str().as_bytes();
-                offset += write_varint(&mut buf[offset..], bytes.len() as u64);
-                buf[offset..offset + bytes.len()].copy_from_slice(bytes);
-                offset += bytes.len();
-            }
-            Value::Blob(b) => {
-                buf[offset] = BLOB_HASH;
-                offset += 1;
-                offset += write_varint(&mut buf[offset..], b.len() as u64);
-                buf[offset..offset + b.len()].copy_from_slice(b);
-                offset += b.len();
-            }
-        }
-        offset
-    }
-
     /// Serialize this entry to bytes for disk storage.
     /// Format: [hash:8][rowid:8][num_keys:varint][keys...][num_payload:varint][payload...]
     /// Each value is: [type:1][len:varint (for text/blob)][data]
-    fn serialize(&self, buf: &mut Vec<u8>) -> Result<()> {
+    fn serialize(&self, buf: &mut std::vec::Vec<u8>) -> Result<()> {
         buf.try_reserve(self.serialized_size())?;
+        self.append_to(buf);
+        Ok(())
+    }
+
+    /// Appends the bytes of [Self::serialize] to `buf`. The caller reserves
+    /// [Self::serialized_size] bytes of `buf` first, so that the append does
+    /// not allocate. `buf` is a `std::vec::Vec` because the spilled bytes go
+    /// into a [Buffer], and on `--cfg nightly` builds the `Vec` of
+    /// `crate::alloc` has another allocator.
+    fn append_to(&self, buf: &mut std::vec::Vec<u8>) {
         buf.extend_from_slice(&self.hash.to_le_bytes());
         buf.extend_from_slice(&self.rowid.to_le_bytes());
 
         // Write number of keys and key values
-        let varint_buf = &mut [0u8; 9];
-        let len = write_varint(varint_buf, self.key_values.len() as u64);
-        buf.extend_from_slice(&varint_buf[..len]);
+        write_varint_to_vec(self.key_values.len() as u64, buf);
         for value in &self.key_values {
-            Self::serialize_value(value, buf, varint_buf);
+            Self::serialize_value(value, buf);
         }
 
         // Write number of payload values and payload values
-        let len = write_varint(varint_buf, self.payload_values.len() as u64);
-        buf.extend_from_slice(&varint_buf[..len]);
+        write_varint_to_vec(self.payload_values.len() as u64, buf);
         for value in &self.payload_values {
-            Self::serialize_value(value, buf, varint_buf);
+            Self::serialize_value(value, buf);
         }
-        Ok(())
     }
 
     /// Helper to serialize a single Value to bytes.
-    fn serialize_value(value: &Value, buf: &mut Vec<u8>, varint_buf: &mut [u8; 9]) {
+    fn serialize_value(value: &Value, buf: &mut std::vec::Vec<u8>) {
         match value {
             Value::Null => {
                 buf.push(NULL_HASH);
@@ -340,14 +283,12 @@ impl HashEntry {
             Value::Text(t) => {
                 buf.push(TEXT_HASH);
                 let bytes = t.as_str().as_bytes();
-                let len = write_varint(varint_buf, bytes.len() as u64);
-                buf.extend_from_slice(&varint_buf[..len]);
+                write_varint_to_vec(bytes.len() as u64, buf);
                 buf.extend_from_slice(bytes);
             }
             Value::Blob(b) => {
                 buf.push(BLOB_HASH);
-                let len = write_varint(varint_buf, b.len() as u64);
-                buf.extend_from_slice(&varint_buf[..len]);
+                write_varint_to_vec(b.len() as u64, buf);
                 buf.extend_from_slice(b);
             }
         }
@@ -1178,12 +1119,7 @@ impl HashTable {
         }
 
         // Compute hash of the join keys using collations
-        let key_refs: Vec<ValueRef> = pending
-            .key_values
-            .iter()
-            .map(|value| value.as_ref())
-            .try_collect()?;
-        let hash = hash_join_key(&key_refs, &self.collations);
+        let hash = hash_join_key(&pending.key_values, &self.collations);
         let entry_size = HashEntry::size_from_values(&pending.key_values, &pending.payload_values);
 
         // Check if we would exceed memory budget
@@ -1593,24 +1529,26 @@ impl HashTable {
             total_size += varint_len(entry_size as u64) + entry_size;
         }
 
-        // Allocate I/O buffer and serialize using cached sizes
-        let buffer = Buffer::new_temporary(total_size);
-        let buf = buffer.as_mut_slice();
-        let mut offset = 0;
+        // Serialize using cached sizes. The entries are appended to a Vec that
+        // has room for all of them, so the I/O buffer is not filled with zeros
+        // that the entries then overwrite.
+        let mut data = Vec::new();
+        data.try_reserve_exact(total_size)?;
 
         let file_offset = spill_state.next_spill_offset;
         for (entry, &entry_size) in partition.entries.iter().zip(entry_sizes.iter()) {
-            offset += write_varint(&mut buf[offset..], entry_size as u64);
+            write_varint_to_vec(entry_size as u64, &mut data);
             record_distinct_key_on_disk(
                 &mut spill_state.distinct_key_places[partition_idx],
                 entry.hash,
-                file_offset + offset as u64,
+                file_offset + data.len() as u64,
                 entry_size,
             );
-            offset += entry.serialize_to_slice(&mut buf[offset..]);
+            entry.append_to(&mut data);
         }
 
-        turso_assert!(offset == total_size, "serialized size mismatch");
+        turso_assert!(data.len() == total_size, "serialized size mismatch");
+        let buffer = Buffer::new(data);
 
         let data_size = total_size;
         let num_entries = spill_state.partition_buffers[partition_idx].entries.len();
@@ -1741,10 +1679,11 @@ impl HashTable {
             return Ok(None);
         }
 
-        // Allocate single I/O buffer and serialize all partitions
-        let buffer = Buffer::new_temporary(total_size);
-        let buf = buffer.as_mut_slice();
-        let mut offset = 0;
+        // Serialize all partitions into a single I/O buffer. The entries are
+        // appended to a Vec that has room for all of them, so the buffer is not
+        // filled with zeros that the entries then overwrite.
+        let mut data = Vec::new();
+        data.try_reserve_exact(total_size)?;
         let base_file_offset = spill_state.next_spill_offset;
 
         // Track where each partition's data starts in the buffer
@@ -1752,23 +1691,24 @@ impl HashTable {
 
         for meta in &metas {
             partition_offsets
-                .push_within_capacity(offset)
+                .push_within_capacity(data.len())
                 .expect("partition offsets vector was preallocated");
             let partition = &spill_state.partition_buffers[meta.idx];
 
             for (entry, &entry_size) in partition.entries.iter().zip(meta.entry_sizes.iter()) {
-                offset += write_varint(&mut buf[offset..], entry_size as u64);
+                write_varint_to_vec(entry_size as u64, &mut data);
                 record_distinct_key_on_disk(
                     &mut spill_state.distinct_key_places[meta.idx],
                     entry.hash,
-                    base_file_offset + offset as u64,
+                    base_file_offset + data.len() as u64,
                     entry_size,
                 );
-                offset += entry.serialize_to_slice(&mut buf[offset..]);
+                entry.append_to(&mut data);
             }
         }
 
-        turso_assert!(offset == total_size, "serialized size mismatch");
+        turso_assert!(data.len() == total_size, "serialized size mismatch");
+        let buffer = Buffer::new(data);
 
         // Update partition metadata and clear buffers
         let mut total_mem_freed = 0usize;
@@ -2018,13 +1958,7 @@ impl HashTable {
         }
 
         // Compute hash of probe keys using collations
-        let hash = {
-            let key_refs: Vec<ValueRef> = probe_keys
-                .iter()
-                .map(|value| value.as_ref())
-                .try_collect()?;
-            hash_join_key(&key_refs, &self.collations)
-        };
+        let hash = hash_join_key(&probe_keys, &self.collations);
         self.current_probe_keys = Some(probe_keys);
         self.current_probe_hash = Some(hash);
 
@@ -2057,13 +1991,10 @@ impl HashTable {
             self.current_spill_partition_idx = target_partition;
 
             let match_idx = {
-                let key_refs: Vec<ValueRef> = self
+                let probe_keys = self
                     .current_probe_keys
                     .as_ref()
-                    .expect("probe keys were set")
-                    .iter()
-                    .map(|v| v.as_ref())
-                    .try_collect()?;
+                    .expect("probe keys were set");
                 let spill_state = self.spill_state.as_ref().expect("spill state must exist");
                 let Some(partition) = spill_state.find_partition(target_partition) else {
                     return Ok(None);
@@ -2072,7 +2003,7 @@ impl HashTable {
                 let mut found = None;
                 for (idx, entry) in bucket.entries.iter().enumerate() {
                     if entry.hash == hash
-                        && keys_equal(&entry.key_values, &key_refs, &self.collations)
+                        && keys_equal(&entry.key_values, probe_keys, &self.collations)
                     {
                         found = Some(idx);
                         break;
@@ -2097,18 +2028,15 @@ impl HashTable {
             let bucket_idx = (hash as usize) % self.buckets.len();
             self.probe_bucket_idx = bucket_idx;
             let match_idx = {
-                let key_refs: Vec<ValueRef> = self
+                let probe_keys = self
                     .current_probe_keys
                     .as_ref()
-                    .expect("probe keys were set")
-                    .iter()
-                    .map(|v| v.as_ref())
-                    .try_collect()?;
+                    .expect("probe keys were set");
                 let bucket = &self.buckets[bucket_idx];
                 let mut found = None;
                 for (idx, entry) in bucket.entries.iter().enumerate() {
                     if entry.hash == hash
-                        && keys_equal(&entry.key_values, &key_refs, &self.collations)
+                        && keys_equal(&entry.key_values, probe_keys, &self.collations)
                     {
                         found = Some(idx);
                         break;
@@ -2137,11 +2065,10 @@ impl HashTable {
         let Some(probe_keys) = self.current_probe_keys.as_ref() else {
             return Ok(None);
         };
-        let key_refs: Vec<ValueRef> = probe_keys.iter().map(|v| v.as_ref()).try_collect()?;
         let hash = match self.current_probe_hash {
             Some(h) => h,
             None => {
-                let h = hash_join_key(&key_refs, &self.collations);
+                let h = hash_join_key(probe_keys, &self.collations);
                 self.current_probe_hash = Some(h);
                 h
             }
@@ -2162,7 +2089,7 @@ impl HashTable {
             // Continue from where we left off
             for idx in self.probe_entry_idx..bucket.entries.len() {
                 let entry = &bucket.entries[idx];
-                if entry.hash == hash && keys_equal(&entry.key_values, &key_refs, &self.collations)
+                if entry.hash == hash && keys_equal(&entry.key_values, probe_keys, &self.collations)
                 {
                     self.probe_entry_idx = idx + 1;
                     return Ok(Some(entry));
@@ -2174,7 +2101,7 @@ impl HashTable {
             let bucket = &self.buckets[self.probe_bucket_idx];
             for idx in self.probe_entry_idx..bucket.entries.len() {
                 let entry = &bucket.entries[idx];
-                if entry.hash == hash && keys_equal(&entry.key_values, &key_refs, &self.collations)
+                if entry.hash == hash && keys_equal(&entry.key_values, probe_keys, &self.collations)
                 {
                     // update probe entry index for next call
                     self.probe_entry_idx = idx + 1;
@@ -2718,8 +2645,7 @@ impl HashTable {
             return Ok(None);
         }
 
-        let key_refs: Vec<ValueRef> = probe_keys.iter().map(|v| v.as_ref()).try_collect()?;
-        let hash = hash_join_key(&key_refs, &self.collations);
+        let hash = hash_join_key(probe_keys, &self.collations);
 
         // Store probe keys for subsequent next_match calls
         self.current_probe_keys = Some(probe_keys.iter().cloned().try_collect()?);
@@ -2745,7 +2671,7 @@ impl HashTable {
         self.current_spill_partition_idx = partition_idx;
 
         for (idx, entry) in bucket.entries.iter().enumerate() {
-            if entry.hash == hash && keys_equal(&entry.key_values, &key_refs, &self.collations) {
+            if entry.hash == hash && keys_equal(&entry.key_values, probe_keys, &self.collations) {
                 self.probe_entry_idx = idx + 1;
                 return Ok(Some(entry));
             }
@@ -2759,8 +2685,7 @@ impl HashTable {
             self.spill_state.is_some(),
             "partition_for_keys requires spill state"
         );
-        let key_refs: Vec<ValueRef> = probe_keys.iter().map(|v| v.as_ref()).try_collect()?;
-        let hash = hash_join_key(&key_refs, &self.collations);
+        let hash = hash_join_key(probe_keys, &self.collations);
         Ok(self.partition_index(hash))
     }
 
@@ -2867,8 +2792,7 @@ impl HashTable {
             )?);
         }
 
-        let key_refs: Vec<ValueRef> = key_values.iter().map(|v| v.as_ref()).try_collect()?;
-        let hash = hash_join_key(&key_refs, &self.collations);
+        let hash = hash_join_key(&key_values, &self.collations);
         let partition_idx = partitioning.index(hash);
 
         let entry = HashEntry::new(hash, key_values, probe_rowid);
@@ -2944,15 +2868,17 @@ impl HashTable {
             total_size += varint_len(s as u64) + s;
         }
 
-        // Serialize into I/O buffer
-        let buffer = Buffer::new_temporary(total_size);
-        let buf = buffer.as_mut_slice();
-        let mut offset = 0;
+        // Serialize into the I/O buffer. The entries are appended to a Vec that
+        // has room for all of them, so the buffer is not filled with zeros that
+        // the entries then overwrite.
+        let mut data = Vec::new();
+        data.try_reserve_exact(total_size)?;
         for (entry, &entry_size) in partition.entries.iter().zip(entry_sizes.iter()) {
-            offset += write_varint(&mut buf[offset..], entry_size as u64);
-            offset += entry.serialize_to_slice(&mut buf[offset..]);
+            write_varint_to_vec(entry_size as u64, &mut data);
+            entry.append_to(&mut data);
         }
-        turso_assert!(offset == total_size, "serialized size mismatch");
+        turso_assert!(data.len() == total_size, "serialized size mismatch");
+        let buffer = Buffer::new(data);
 
         let file_offset = probe_state.next_spill_offset;
         let num_entries = partition.entries.len();
@@ -3545,6 +3471,36 @@ mod hashtests {
         assert!(!keys_equal(&key1, &key3, &collations));
     }
 
+    /// The keys of `hash_join_key` and the second keys of `keys_equal` can be
+    /// `Value`s or `ValueRef`s, with the same results.
+    #[test]
+    fn test_hash_and_keys_equal_same_for_values_and_value_refs() {
+        let values = vec![
+            Value::from_i64(10),
+            Value::from_f64(-0.0),
+            Value::Text("Hello ".to_string().into()),
+            Value::from_blob(vec![1, 2, 3]),
+        ];
+        let refs: Vec<ValueRef> = values
+            .iter()
+            .map(|value| value.as_ref())
+            .try_collect()
+            .unwrap();
+        for collation in [
+            CollationSeq::BINARY,
+            CollationSeq::NOCASE,
+            CollationSeq::RTRIM,
+        ] {
+            let collations = vec![collation; values.len()];
+            assert_eq!(
+                hash_join_key(&values, &collations),
+                hash_join_key(&refs, &collations)
+            );
+            assert!(keys_equal(&values, &values, &collations));
+            assert!(keys_equal(&values, &refs, &collations));
+        }
+    }
+
     #[test]
     fn test_hash_table_basic() {
         let io = Arc::new(MemoryIO::new());
@@ -3678,7 +3634,7 @@ mod hashtests {
             100,
         );
 
-        let mut buf = vec![];
+        let mut buf = std::vec::Vec::new();
         entry.serialize(&mut buf).unwrap();
 
         let (deserialized, consumed) = HashEntry::deserialize(&buf).unwrap();
@@ -3703,8 +3659,8 @@ mod hashtests {
     }
 
     #[test]
-    fn test_serialize_to_slice_matches_serialize() {
-        // Test that serialize_to_slice produces identical output to serialize
+    fn test_append_to_matches_serialize() {
+        // The spill paths append entries with append_to after other bytes
         let entry = HashEntry::new_with_payload(
             12345,
             vec![
@@ -3720,30 +3676,28 @@ mod hashtests {
             ],
         );
 
-        // Serialize using the Vec-based method
-        let mut vec_buf = vec![];
-        entry.serialize(&mut vec_buf).unwrap();
-
-        // Serialize using the slice-based method
+        let mut serialized = std::vec::Vec::new();
+        entry.serialize(&mut serialized).unwrap();
         let size = entry.serialized_size();
         assert_eq!(
             size,
-            vec_buf.len(),
+            serialized.len(),
             "serialized_size must match actual size"
         );
 
-        let mut slice_buf = vec![0u8; size];
-        let written = entry.serialize_to_slice(&mut slice_buf);
-        assert_eq!(written, size, "bytes written must match serialized_size");
-
-        // Both methods must produce identical output
+        let prefix = [0xAB, 0xCD, 0xEF];
+        let mut appended = prefix.to_vec();
+        appended.reserve_exact(size);
+        entry.append_to(&mut appended);
+        assert_eq!(&appended[..prefix.len()], &prefix);
         assert_eq!(
-            vec_buf, slice_buf,
-            "serialize and serialize_to_slice must produce identical output"
+            &appended[prefix.len()..],
+            &serialized[..],
+            "append_to must append the bytes of serialize"
         );
 
         // Verify the output is valid by deserializing
-        let (deserialized, consumed) = HashEntry::deserialize(&slice_buf).unwrap();
+        let (deserialized, consumed) = HashEntry::deserialize(&appended[prefix.len()..]).unwrap();
         assert_eq!(consumed, size);
         assert_eq!(deserialized.hash, entry.hash);
         assert_eq!(deserialized.rowid, entry.rowid);
@@ -3954,7 +3908,7 @@ mod hashtests {
         let mut ht = HashTable::new(config, io.clone()).unwrap();
 
         let entry = HashEntry::new(1, vec![Value::from_i64(1)], 7);
-        let mut buf = vec![];
+        let mut buf = std::vec::Vec::new();
         entry.serialize(&mut buf).unwrap();
         let truncated = &buf[..buf.len() - 1];
 
@@ -4107,7 +4061,7 @@ mod hashtests {
     fn test_hash_entry_deserialization_truncated() {
         let entry = HashEntry::new(123, vec![Value::from_i64(1), Value::Text("abc".into())], 42);
 
-        let mut buf = vec![];
+        let mut buf = std::vec::Vec::new();
         entry.serialize(&mut buf).unwrap();
 
         // Cut off the buffer mid-entry
@@ -4123,7 +4077,7 @@ mod hashtests {
     #[test]
     fn test_hash_entry_deserialization_garbage_type_tag() {
         let entry = HashEntry::new(1, vec![Value::from_i64(10)], 7);
-        let mut buf = vec![];
+        let mut buf = std::vec::Vec::new();
         entry.serialize(&mut buf).unwrap();
 
         // Compute the exact offset of the *first* type tag.
@@ -4769,7 +4723,7 @@ mod hashtests {
             ],
         );
 
-        let mut buf = vec![];
+        let mut buf = std::vec::Vec::new();
         entry.serialize(&mut buf).unwrap();
 
         let (deserialized, bytes_consumed) = HashEntry::deserialize(&buf).unwrap();
@@ -4809,7 +4763,7 @@ mod hashtests {
         assert!(entry.payload_values.is_empty());
 
         // Serialization should still work
-        let mut buf = vec![];
+        let mut buf = std::vec::Vec::new();
         entry.serialize(&mut buf).unwrap();
 
         let (deserialized, _) = HashEntry::deserialize(&buf).unwrap();

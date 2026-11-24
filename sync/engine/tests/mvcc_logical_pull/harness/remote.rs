@@ -12,6 +12,7 @@ use turso_core::SessionRole;
 
 pub struct Remote {
     conn: Arc<Connection>,
+    pub(super) crypto: Option<turso_core::EncryptionContext>,
     db_path: PathBuf,
     _db: Arc<Database>,
     _dir: TempDir,
@@ -19,23 +20,39 @@ pub struct Remote {
 
 impl Remote {
     pub fn new(setup: &[&str]) -> Result<Arc<Self>> {
-        Self::with_portable_changes(setup, true)
+        Self::create(setup, false, true)
+    }
+
+    pub fn new_encrypted(setup: &[&str]) -> Result<Arc<Self>> {
+        Self::create(setup, true, true)
     }
 
     /// A remote whose commits write plain frames with no portable changes.
     pub fn without_portable_changes(setup: &[&str]) -> Result<Arc<Self>> {
-        Self::with_portable_changes(setup, false)
+        Self::create(setup, false, false)
     }
 
-    fn with_portable_changes(setup: &[&str], enabled: bool) -> Result<Arc<Self>> {
+    fn create(setup: &[&str], encrypted: bool, enabled: bool) -> Result<Arc<Self>> {
+        let key = encrypted.then(|| turso_core::EncryptionKey::new_256([11; 32]));
+        let crypto = key
+            .as_ref()
+            .map(|key| {
+                turso_core::EncryptionContext::new(turso_core::CipherMode::Aes256Gcm, key, 4096)
+            })
+            .transpose()?;
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("remote.db");
         let db = Database::open(
             Arc::new(PlatformIO::new()?),
             &db_path.to_string_lossy(),
-            OpenOptions::new(Arc::new(SqliteDialect)).db_opts(database_opts()),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(database_opts().with_encryption(encrypted))
+                .encryption(encrypted.then(|| turso_core::EncryptionOpts {
+                    cipher: "aes256gcm".into(),
+                    hexkey: "0b".repeat(32),
+                })),
         )?;
-        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(key))?;
         conn.execute("PRAGMA journal_mode = 'mvcc'")?;
         conn.set_portable_logical_changes_enabled(enabled);
         for sql in setup {
@@ -43,6 +60,7 @@ impl Remote {
         }
         Ok(Arc::new(Self {
             conn,
+            crypto,
             db_path,
             _db: db,
             _dir: dir,
@@ -68,7 +86,16 @@ impl Remote {
 
     pub(super) fn checkpoint_and_read_database_file(&self) -> Result<Vec<u8>> {
         self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
-        Ok(std::fs::read(&self.db_path)?)
+        let stored = std::fs::read(&self.db_path)?;
+        if let Some(crypto) = &self.crypto {
+            let mut plaintext = Vec::new();
+            for (index, page) in stored.chunks_exact(4096).enumerate() {
+                plaintext.extend_from_slice(&crypto.decrypt_page(page, index + 1)?);
+            }
+            Ok(plaintext)
+        } else {
+            Ok(stored)
+        }
     }
 
     pub(super) fn read_logical_log(&self) -> Result<Vec<u8>> {

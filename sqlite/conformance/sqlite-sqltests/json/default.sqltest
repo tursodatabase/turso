@@ -986,9 +986,9 @@ expect {
     2
 }
 
-# Issue #6099: bracket-notation with quoted key — parsed without error but
-# always returns NULL (matches SQLite behavior: bracket notation on non-array
-# nodes produces NOTFOUND, not a parse error).
+# Issue #6099: like SQLite, a quoted key in brackets is a malformed `[` step.
+# SQLite reads a `[` step only on an array, so on an object the step finds
+# nothing and the result is NULL.
 test json_extract_bracket_quoted_key_double_quote {
     SELECT json_extract('{"key with spaces":1}', '$["key with spaces"]')
 }
@@ -1023,6 +1023,206 @@ test json_extract_bracket_quoted_key_with_array_index {
     SELECT json_extract('{"items":[{"k":1},{"k":2},{"k":3}]}', '$["items"][1].k')
 }
 expect {
+}
+
+test json_extract_bracket_quoted_key_on_array {
+    SELECT json_extract('[1]', '$["a"]');
+}
+expect error {
+    ^bad JSON path: '\$\["a"\]'$
+}
+
+# Issue #12174: SQLite reads each step of a path only when it applies the step,
+# so a malformed step after a step that finds nothing is not an error. A `[`
+# step finds nothing in an element that is not an array, before SQLite reads
+# its index. A `[#-N` step finds nothing in an array of fewer than N elements.
+test json_malformed_step_after_step_that_finds_nothing {
+    SELECT quote(json_extract('{"a":[1,2,3]}', '$[-1]')),
+           quote('{"a":[1,2,3]}' -> '$[-1]'),
+           quote('{"a":[1,2,3]}' ->> '$[-1]'),
+           quote(json_extract('{"a":1}', '$[#+1]')),
+           quote(json_extract('{"a":1}', '$.b[')),
+           quote(json_extract('{"a":1}', '$.a[')),
+           quote(json_extract('{"a":1}', '$.b.')),
+           quote(json_extract('{"a":1}', '$."b"x')),
+           quote(json_extract('[]', '$[0]x')),
+           quote(json_extract('[1,2]', '$[#-5x')),
+           quote(json_type('{"a":1}', '$[-1]')),
+           quote(json_array_length('{"a":1}', '$.a[-1]')),
+           json_extract('{"a":1}', '$.a', '$[-1]');
+}
+expect {
+    NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|[1,null]
+}
+
+test json_edit_with_malformed_step_after_step_that_finds_nothing {
+    SELECT json_set('{"a":1}', '$[-1]', 5),
+           json_remove('{"a":1}', '$[-1]'),
+           json_replace('{"a":1}', '$.c.[', 5),
+           json_insert('[1]', '$[5][-1]', 5),
+           json_remove('[1]', '$[5][-1]'),
+           json_set('{"a":1}', '$.b[#-1x', 5),
+           json(jsonb_set('{"a":1}', '$[-1]', 5));
+}
+expect {
+    {"a":1}|{"a":1}|{"a":1}|[1]|[1]|{"a":1}|{"a":1}
+}
+
+test json_each_malformed_step_after_step_that_finds_nothing {
+    SELECT (SELECT count(*) FROM json_each('{"a":1}', '$[-1]')),
+           (SELECT count(*) FROM json_tree('{"a":1}', '$.b['));
+}
+expect {
+    0|0
+}
+
+test json_extract_malformed_step_on_array {
+    SELECT json_extract('[1,2,3]', '$[-1]');
+}
+expect error {
+    ^bad JSON path: '\$\[-1\]'$
+}
+
+test json_arrow_malformed_step_on_array {
+    SELECT '[1,2,3]' -> '$[-1]';
+}
+expect error {
+    ^bad JSON path: '\$\[-1\]'$
+}
+
+test json_extract_second_path_malformed_step_on_array {
+    SELECT json_extract('[1]', '$.a', '$[-1]');
+}
+expect error {
+    ^bad JSON path: '\$\[-1\]'$
+}
+
+test json_type_malformed_step_on_array {
+    SELECT json_type('{"a":[1]}', '$.a[-1]');
+}
+expect error {
+    ^bad JSON path: '\$\.a\[-1\]'$
+}
+
+test json_array_length_malformed_step_on_array {
+    SELECT json_array_length('{"a":[1]}', '$.a[-1]');
+}
+expect error {
+    ^bad JSON path: '\$\.a\[-1\]'$
+}
+
+test json_each_malformed_step_on_array {
+    SELECT count(*) FROM json_each('[1]', '$[-1]');
+}
+expect error {
+    ^bad JSON path: '\$\[-1\]'$
+}
+
+# A JSONB blob is searched where it is, so these cover that search too.
+test jsonb_malformed_step_after_step_that_finds_nothing {
+    SELECT quote(json_extract(jsonb('{"a":[1,2,3]}'), '$[-1]')),
+           quote(jsonb('{"a":[1,2,3]}') -> '$[-1]'),
+           quote(jsonb('{"a":1}') ->> '$.b['),
+           quote(json_type(jsonb('{"a":1}'), '$[-1]')),
+           quote(json_array_length(jsonb('{"a":1}'), '$.a[-1]')),
+           json_extract(jsonb('{"a":1}'), '$.a', '$[-1]'),
+           (SELECT count(*) FROM json_each(jsonb('{"a":1}'), '$[-1]'));
+}
+expect {
+    NULL|NULL|NULL|NULL|NULL|[1,null]|0
+}
+
+test jsonb_extract_malformed_step_on_array {
+    SELECT json_extract(jsonb('[1]'), '$[0]', '$[x]');
+}
+expect error {
+    ^bad JSON path: '\$\[x\]'$
+}
+
+test jsonb_type_malformed_step_on_array {
+    SELECT json_type(jsonb('[1]'), '$[-1]');
+}
+expect error {
+    ^bad JSON path: '\$\[-1\]'$
+}
+
+test jsonb_each_malformed_step_on_array {
+    SELECT count(*) FROM json_each(jsonb('[1]'), '$[-1]');
+}
+expect error {
+    ^bad JSON path: '\$\[-1\]'$
+}
+
+test json_extract_malformed_from_end_step_in_long_array {
+    SELECT json_extract('[1,2]', '$[#-1x');
+}
+expect error {
+    ^bad JSON path: '\$\[#-1x'$
+}
+
+test json_extract_empty_key_after_found_member {
+    SELECT json_extract('{"a":1}', '$.a.');
+}
+expect error {
+    ^bad JSON path: '\$\.a\.'$
+}
+
+test json_extract_text_after_found_quoted_member {
+    SELECT json_extract('{"a":1}', '$."a"x');
+}
+expect error {
+    ^bad JSON path: '\$\."a"x'$
+}
+
+test json_insert_malformed_step_on_found_array {
+    SELECT json_insert('{"a":[1]}', '$.a[-1]', 5);
+}
+expect error {
+    ^bad JSON path: '\$\.a\[-1\]'$
+}
+
+test json_remove_malformed_step_on_found_array {
+    SELECT json_remove('{"a":[1]}', '$.a[-1]');
+}
+expect error {
+    ^bad JSON path: '\$\.a\[-1\]'$
+}
+
+test json_set_malformed_step_in_created_object {
+    SELECT json_set('{"a":1}', '$.b.', 5);
+}
+expect error {
+    ^bad JSON path: '\$\.b\.'$
+}
+
+test json_set_malformed_step_in_created_array {
+    SELECT json_set('{"a":1}', '$.b[-1]', 5);
+}
+expect error {
+    ^bad JSON path: '\$\.b\[-1\]'$
+}
+
+test json_set_text_after_created_element {
+    SELECT json_set('[]', '$[0]x', 1);
+}
+expect error {
+    ^bad JSON path: '\$\[0\]x'$
+}
+
+# Like SQLite, only a key that starts with a quote is quoted, and an escaped
+# quote does not close a quoted key.
+test json_extract_quote_inside_unquoted_key {
+    SELECT json_extract('{"a\"b\"":8,"b":1}', '$.a"b"');
+}
+expect {
+    8
+}
+
+test json_extract_quoted_key_with_escaped_closing_quote {
+    SELECT json_extract('{"a":1}', '$."a\"');
+}
+expect error {
+    ^bad JSON path: '\$\."a\\\\"'$
 }
 
 test json_array_length {

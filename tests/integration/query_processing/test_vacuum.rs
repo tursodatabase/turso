@@ -2,7 +2,7 @@ use crate::assertions::{AssertQueryPlan, NULL};
 use crate::common::{
     compute_dbhash, compute_dbhash_with_database_opts, compute_dbhash_with_options,
     compute_dbhash_with_options_and_database_opts, do_flush, limbo_exec_rows, ExecRows,
-    TempDatabase,
+    SyncCountingIo, TempDatabase,
 };
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use asserting::prelude::*;
@@ -11,15 +11,16 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering as StdOrdering;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
-use turso_core::io::{FileId, FileSyncType};
-use turso_core::{
-    Buffer, Clock, Completion, File, MemoryIO, MonotonicInstant, OpenFlags, WallClockInstant, IO,
-};
+use turso_core::ast::Cmd;
+use turso_core::mvcc::yield_hooks::YieldPointMarker;
+use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};
+use turso_core::vdbe::execute::TransactionYieldPoint;
 use turso_core::{
     ConnectOpts, Connection, Database, DatabaseOpts, EncryptionOpts, LimboError, SessionRole,
     StepResult, Value,
 };
-use turso_parser::{ast::Cmd, parser::Parser};
+use turso_core::{MemoryIO, OpenFlags, IO};
+use turso_parser::parser::Parser;
 use turso_sqlite::SqliteDialect;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,7 +211,10 @@ fn employee_rows(conn: &Arc<Connection>) -> Vec<(i64, String, i64, f64, String)>
 
 fn custom_type_sql_snapshot(conn: &Arc<Connection>) -> Vec<(String, String)> {
     let rows: Vec<(String, String)> =
-        conn.exec_rows("SELECT name, sql FROM sqlite_turso_types ORDER BY name");
+        // A built-in type has no SQL.
+        conn.exec_rows(
+            "SELECT name, sql FROM sqlite_turso_types WHERE sql IS NOT NULL ORDER BY name",
+        );
     rows.into_iter()
         .map(|(name, sql)| (name, normalize_sql_whitespace(&sql)))
         .collect()
@@ -4965,6 +4969,97 @@ fn test_plain_vacuum_preserves_sqlite_stat1(tmp_db: TempDatabase) -> anyhow::Res
     Ok(())
 }
 
+/// Plain VACUUM must keep ANALYZE statistics loaded in the schema so the query
+/// planner continues using them without running ANALYZE again.
+#[turso_macros::test(mvcc)]
+fn test_plain_vacuum_preserves_analyze_stats_for_planner(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(a, b)")?;
+    conn.execute("CREATE INDEX ia ON t(a)")?;
+    conn.execute("CREATE INDEX ib ON t(b)")?;
+    conn.execute(
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 2000) \
+         INSERT INTO t SELECT 1, x FROM c",
+    )?;
+    conn.execute("ANALYZE")?;
+
+    let plan_before: Vec<(i64, i64, i64, String)> =
+        conn.exec_rows("EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5");
+    assert!(
+        plan_before
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("USING INDEX ib")),
+        "expected planner to use ib before VACUUM, got: {plan_before:?}"
+    );
+
+    run_plain_vacuum_and_assert_round_trip(&tmp_db, &conn)?;
+
+    assert!(
+        conn.current_schema()
+            .analyze_stats
+            .table_stats(turso_core::namespace::NamespaceId::ROOT, "t")
+            .is_some(),
+        "expected connection schema to keep analyze_stats after VACUUM"
+    );
+
+    let plan_after: Vec<(i64, i64, i64, String)> =
+        conn.exec_rows("EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5");
+    assert!(
+        plan_after
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("USING INDEX ib")),
+        "expected planner to keep using ib after VACUUM, got: {plan_after:?}"
+    );
+
+    let plan_conn2: Vec<(i64, i64, i64, String)> =
+        conn2.exec_rows("EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5");
+    assert!(
+        plan_conn2
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("USING INDEX ib")),
+        "expected another connection to keep using ib after VACUUM, got: {plan_conn2:?}"
+    );
+
+    Ok(())
+}
+
+/// Plain VACUUM must stay best-effort when loading `sqlite_stat1`: a malformed
+/// `sqlite_stat1` schema (for example created via `writable_schema`) must not
+/// cause VACUUM to fail, matching SQLite.
+#[turso_macros::test]
+fn test_plain_vacuum_succeeds_with_malformed_sqlite_stat1(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("malformed_stat1.db");
+    {
+        let sqlite = rusqlite::Connection::open(&db_path)?;
+        sqlite.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE t(a);
+             INSERT INTO t VALUES (1);
+             ANALYZE;
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema
+                SET sql = 'CREATE TABLE sqlite_stat1(only_one_col)'
+              WHERE name = 'sqlite_stat1';
+             PRAGMA writable_schema = OFF;",
+        )?;
+    }
+
+    let db = TempDatabase::new_with_existent_with_opts(&db_path, tmp_db.db_opts);
+    let conn = db.connect_limbo();
+    conn.execute("VACUUM")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM t");
+    assert_eq!(rows, vec![(1,)]);
+
+    Ok(())
+}
+
 /// Plain VACUUM must preserve custom index-method indexes on the source
 /// connection after schema reload.
 #[turso_macros::test]
@@ -5864,11 +5959,10 @@ fn test_plain_vacuum_complex_batched_storage_shapes() -> anyhow::Result<()> {
 fn test_plain_vacuum_encrypted() -> anyhow::Result<()> {
     const HEXKEY: &str = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
 
-    let tmp_db = TempDatabase::new_empty();
+    let tmp_db = crate::common::TempDatabaseBuilder::new()
+        .with_encryption("aegis256", HEXKEY)
+        .build();
     let conn = tmp_db.connect_limbo();
-
-    conn.execute(format!("PRAGMA hexkey = '{HEXKEY}'"))?;
-    conn.execute("PRAGMA cipher = 'aegis256'")?;
 
     let fill = |conn: &Arc<Connection>| -> anyhow::Result<()> {
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
@@ -5924,11 +6018,11 @@ fn test_plain_vacuum_encrypted() -> anyhow::Result<()> {
 fn test_plain_vacuum_encrypted_existing() -> anyhow::Result<()> {
     const HEXKEY: &str = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
 
-    let tmp_db = TempDatabase::new_empty();
+    let tmp_db = crate::common::TempDatabaseBuilder::new()
+        .with_encryption("aegis256", HEXKEY)
+        .build();
     {
         let conn = tmp_db.connect_limbo();
-        conn.execute(format!("PRAGMA hexkey = '{HEXKEY}'"))?;
-        conn.execute("PRAGMA cipher = 'aegis256'")?;
 
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
         for i in 0..150 {
@@ -5938,10 +6032,23 @@ fn test_plain_vacuum_encrypted_existing() -> anyhow::Result<()> {
         do_flush(&conn, &tmp_db)?;
     }
 
-    let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, tmp_db.db_opts);
-    let reopened_conn = reopened.connect_limbo();
-    reopened_conn.execute(format!("PRAGMA hexkey = '{HEXKEY}'"))?;
-    reopened_conn.execute("PRAGMA cipher = 'aegis256'")?;
+    let reopen = || -> anyhow::Result<Arc<Connection>> {
+        let db = Database::open(
+            tmp_db.io.clone(),
+            tmp_db.path.to_str().unwrap(),
+            turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(tmp_db.db_opts)
+                .encryption(EncryptionOpts {
+                    cipher: "aegis256".to_string(),
+                    hexkey: HEXKEY.to_string(),
+                }),
+        )?;
+        Ok(db.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(turso_core::EncryptionKey::from_hex_string(HEXKEY)?)),
+        )?)
+    };
+    let reopened_conn = reopen()?;
 
     reopened_conn.execute("VACUUM")?;
     assert_eq!(run_integrity_check(&reopened_conn), "ok");
@@ -5955,10 +6062,7 @@ fn test_plain_vacuum_encrypted_existing() -> anyhow::Result<()> {
     assert_eq!(last.len(), 1);
     assert_eq!(last[0], (29, "z".repeat(80)));
 
-    let post_vacuum = TempDatabase::new_with_existent_with_opts(&tmp_db.path, tmp_db.db_opts);
-    let post_vacuum_conn = post_vacuum.connect_limbo();
-    post_vacuum_conn.execute(format!("PRAGMA hexkey = '{HEXKEY}'"))?;
-    post_vacuum_conn.execute("PRAGMA cipher = 'aegis256'")?;
+    let post_vacuum_conn = reopen()?;
     assert_eq!(run_integrity_check(&post_vacuum_conn), "ok");
     assert_eq!(scalar_i64(&post_vacuum_conn, "SELECT COUNT(*) FROM t"), 30);
 
@@ -7097,136 +7201,6 @@ fn test_in_place_vacuum_busy_before_copyback_restores_source_txn() {
     assert!(!pager.holds_write_lock());
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct SyncCounts {
-    db: usize,
-    wal: usize,
-}
-
-struct SyncCountingIo {
-    inner: Arc<MemoryIO>,
-    tracked_db_path: String,
-    tracked_wal_path: String,
-    db_syncs: Arc<AtomicUsize>,
-    wal_syncs: Arc<AtomicUsize>,
-}
-
-impl SyncCountingIo {
-    fn new(tracked_db_path: &str) -> Self {
-        Self {
-            inner: Arc::new(MemoryIO::new()),
-            tracked_db_path: tracked_db_path.to_string(),
-            tracked_wal_path: format!("{tracked_db_path}-wal"),
-            db_syncs: Arc::new(AtomicUsize::new(0)),
-            wal_syncs: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    fn counts(&self) -> SyncCounts {
-        SyncCounts {
-            db: self.db_syncs.load(StdOrdering::SeqCst),
-            wal: self.wal_syncs.load(StdOrdering::SeqCst),
-        }
-    }
-}
-
-impl Clock for SyncCountingIo {
-    fn current_time_monotonic(&self) -> MonotonicInstant {
-        self.inner.current_time_monotonic()
-    }
-
-    fn current_time_wall_clock(&self) -> WallClockInstant {
-        self.inner.current_time_wall_clock()
-    }
-}
-
-impl IO for SyncCountingIo {
-    fn open_file(
-        &self,
-        path: &str,
-        flags: OpenFlags,
-        direct: bool,
-    ) -> turso_core::Result<Arc<dyn File>> {
-        let inner = self.inner.open_file(path, flags, direct)?;
-        Ok(Arc::new(SyncCountingFile {
-            inner,
-            count_as_db_sync: path == self.tracked_db_path,
-            count_as_wal_sync: path == self.tracked_wal_path,
-            db_syncs: self.db_syncs.clone(),
-            wal_syncs: self.wal_syncs.clone(),
-        }))
-    }
-
-    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
-        self.inner.remove_file(path)
-    }
-
-    fn step(&self) -> turso_core::Result<()> {
-        self.inner.step()
-    }
-
-    fn drain_completions(&self, completions: &[Completion]) -> turso_core::Result<()> {
-        self.inner.drain_completions(completions)
-    }
-
-    fn cancel(&self, completions: &[Completion]) -> turso_core::Result<()> {
-        self.inner.cancel(completions)
-    }
-
-    fn file_id(&self, path: &str) -> turso_core::Result<FileId> {
-        self.inner.file_id(path)
-    }
-}
-
-struct SyncCountingFile {
-    inner: Arc<dyn File>,
-    count_as_db_sync: bool,
-    count_as_wal_sync: bool,
-    db_syncs: Arc<AtomicUsize>,
-    wal_syncs: Arc<AtomicUsize>,
-}
-
-impl File for SyncCountingFile {
-    fn lock_file(&self, exclusive: bool) -> turso_core::Result<()> {
-        self.inner.lock_file(exclusive)
-    }
-
-    fn unlock_file(&self) -> turso_core::Result<()> {
-        self.inner.unlock_file()
-    }
-
-    fn pread(&self, pos: u64, c: Completion) -> turso_core::Result<Completion> {
-        self.inner.pread(pos, c)
-    }
-
-    fn pwrite(
-        &self,
-        pos: u64,
-        buffer: Arc<Buffer>,
-        c: Completion,
-    ) -> turso_core::Result<Completion> {
-        self.inner.pwrite(pos, buffer, c)
-    }
-
-    fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
-        if self.count_as_db_sync {
-            self.db_syncs.fetch_add(1, StdOrdering::SeqCst);
-        }
-        if self.count_as_wal_sync {
-            self.wal_syncs.fetch_add(1, StdOrdering::SeqCst);
-        }
-        self.inner.sync(c, sync_type)
-    }
-
-    fn size(&self) -> turso_core::Result<u64> {
-        self.inner.size()
-    }
-
-    fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
-        self.inner.truncate(len, c)
-    }
-}
-
 #[test]
 fn in_place_vacuum_with_sync_off_syncs_source_db_once_and_wal_twice() -> turso_core::Result<()> {
     let io = Arc::new(SyncCountingIo::new("vacuum-source.db"));
@@ -7311,4 +7285,148 @@ fn in_place_vacuum_with_sync_full_adds_pre_publish_wal_sync() -> turso_core::Res
     );
 
     Ok(())
+}
+
+/// The statements that VACUUM INTO runs on the source connection, such as
+/// the one that reads its schema, can yield before their transaction starts.
+/// VACUUM INTO must pass such a yield on to its caller.
+#[test]
+fn vacuum_into_passes_on_yields_of_its_nested_statements() -> turso_core::Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        "vacuum-yield-source.db",
+        OpenFlags::Create,
+        DatabaseOpts::new().with_vacuum(true),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    conn.execute("CREATE INDEX idx_t_payload ON t(payload)")?;
+    for id in 1..=8 {
+        conn.execute(format!("INSERT INTO t VALUES({id}, 'payload-{id}')"))?;
+    }
+
+    let injector = YieldOnEveryOtherTransactionStart::new();
+    conn.set_yield_injector(Some(injector.clone()));
+    let dest_dir = TempDir::new().unwrap();
+    let dest_path = dest_dir.path().join("vacuum-yield-target.db");
+    let mut stmt = conn.prepare(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+    loop {
+        match stmt.step()? {
+            StepResult::Done => break,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                stmt.get_pager().io.step()?
+            }
+            other => panic!("unexpected step result from VACUUM INTO: {other:?}"),
+        }
+    }
+    drop(stmt);
+    conn.set_yield_injector(None);
+    assert!(
+        injector.yields() > 1,
+        "the statements nested in VACUUM INTO must yield too"
+    );
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    assert_eq!(scalar_i64(&dest_conn, "SELECT COUNT(*) FROM t"), 8);
+    Ok(())
+}
+
+/// When a VACUUM target build fails, its cleanup ends the open transaction
+/// and drops the statement it holds, so the target connection holds no locks
+/// and can run statements again.
+#[test]
+fn vacuum_target_build_cleanup_clears_target_connection_state() -> turso_core::Result<()> {
+    let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new()?);
+    let target_dir = TempDir::new().unwrap();
+    let target_path = target_dir.path().join("target.db");
+    let target_db = Database::open_file_with_flags(
+        io,
+        target_path.to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let target_conn = target_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    target_conn.execute("CREATE TABLE seed(x)")?;
+
+    let helper_stmt = target_conn.prepare_internal("SELECT 1")?;
+    target_conn.execute("BEGIN IMMEDIATE")?;
+    target_conn.execute("INSERT INTO seed VALUES (1)")?;
+    let pager = target_conn.get_pager();
+
+    assert!(!target_conn.get_auto_commit());
+    assert!(target_conn.is_nested_stmt());
+
+    turso_core::vdbe::vacuum::clean_up_target_build_after_error(target_conn.clone(), helper_stmt)?;
+
+    assert!(target_conn.get_auto_commit());
+    assert_eq!(
+        target_conn.get_tx_state(),
+        turso_core::connection::TransactionState::None
+    );
+    assert!(!target_conn.is_nested_stmt());
+    assert!(!pager.holds_read_lock());
+    assert!(!pager.holds_write_lock());
+    let rows: Vec<(i64,)> = target_conn.exec_rows("SELECT COUNT(*) FROM seed");
+    assert_eq!(
+        rows.len(),
+        1,
+        "target cleanup should leave the connection queryable"
+    );
+
+    Ok(())
+}
+
+/// In-place VACUUM installs the schema it reads back from the rebuilt
+/// database. That schema must keep the tables, the indexes, and the
+/// built-in table-valued functions.
+#[turso_macros::test]
+fn test_plain_vacuum_keeps_tables_indexes_and_table_valued_functions(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("CREATE INDEX idx_t_v ON t(v)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y')")?;
+
+    conn.execute("VACUUM")?;
+
+    assert_eq!(
+        scalar_i64(&conn, "SELECT id FROM t INDEXED BY idx_t_v WHERE v = 'y'"),
+        2
+    );
+    assert_eq!(
+        scalar_i64(&conn, "SELECT COUNT(*) FROM generate_series(1, 3)"),
+        3
+    );
+    Ok(())
+}
+
+/// Yields at the start of every other transaction that the connection's
+/// statements begin, so that each statement yields once and then goes on.
+#[derive(Debug, Default)]
+struct YieldOnEveryOtherTransactionStart {
+    visits: AtomicUsize,
+}
+
+impl YieldOnEveryOtherTransactionStart {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn yields(&self) -> usize {
+        self.visits.load(StdOrdering::SeqCst).div_ceil(2)
+    }
+}
+
+impl YieldInjector for YieldOnEveryOtherTransactionStart {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        point == TransactionYieldPoint::BeforeStart.point()
+            && self.visits.fetch_add(1, StdOrdering::SeqCst) % 2 == 0
+    }
 }

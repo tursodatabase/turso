@@ -1,10 +1,25 @@
 pub mod check;
+pub mod error;
 pub mod fmt;
+pub mod keyword;
 
 use std::{num::NonZeroU32, sync::Arc};
 
-use crate::lexer::is_quotable_keyword;
+use crate::keyword::is_quotable_keyword;
 use strum_macros::{EnumIter, EnumString};
+
+/// Maximum nesting depth of queries: subqueries in a FROM clause or in an
+/// expression, CTE bodies, and parenthesized FROM terms. SQLite has no such
+/// limit. The parser, the planner and the code generator recurse one time for
+/// each level, so this limit bounds their stack use.
+pub const MAX_QUERY_DEPTH: usize = 500;
+
+/// The message of the error for a query nested deeper than [`MAX_QUERY_DEPTH`].
+/// The parser gives it for nesting in the SQL text, and the planner for
+/// nesting that the SQL text does not show.
+pub fn query_nested_too_deeply_message() -> String {
+    format!("Query is nested too deeply (maximum depth {MAX_QUERY_DEPTH})")
+}
 
 /// `?` or `$` Prepared statement arg placeholder(s)
 #[derive(Default)]
@@ -208,6 +223,14 @@ pub enum Stmt {
         role_name: String,
         /// role options
         options: RoleOptions,
+    },
+    /// `DROP ROLE`. Not SQLite syntax; a frontend with roles translates its
+    /// own DROP ROLE into this.
+    DropRole {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// The roles to drop, as the statement names them.
+        roles: Vec<Grantee>,
     },
     /// `GRANT`: privileges on relations for roles. Not SQLite syntax; a
     /// frontend with roles translates its own GRANT into this.
@@ -1016,6 +1039,38 @@ impl Operator {
         )
     }
 
+    /// Whether the operator compares an array's elements with other values or
+    /// puts values into one array, when one of its operands is an array.
+    /// `||` of an array and a value appends the value; `||` of two values
+    /// that are not arrays joins text.
+    pub const fn compares_or_combines_array_elements(&self) -> bool {
+        match self {
+            Self::ArrayContains | Self::ArrayOverlap | Self::Concat => true,
+            Self::Add
+            | Self::And
+            | Self::ArrowRight
+            | Self::ArrowRightShift
+            | Self::BitwiseAnd
+            | Self::BitwiseOr
+            | Self::BitwiseNot
+            | Self::Equals
+            | Self::Divide
+            | Self::Greater
+            | Self::GreaterEquals
+            | Self::Is
+            | Self::IsNot
+            | Self::LeftShift
+            | Self::Less
+            | Self::LessEquals
+            | Self::Modulus
+            | Self::Multiply
+            | Self::NotEquals
+            | Self::Or
+            | Self::RightShift
+            | Self::Subtract => false,
+        }
+    }
+
     /// Returns true if this operator is a comparison operator that may need affinity conversion
     pub const fn is_comparison(&self) -> bool {
         matches!(
@@ -1105,7 +1160,7 @@ pub enum OneSelect {
     /// `SELECT`
     Select {
         /// `DISTINCT`
-        distinctness: Option<Distinctness>,
+        distinctness: Option<SelectDistinctness>,
         /// columns
         columns: Vec<ResultColumn>,
         /// `FROM` clause
@@ -1132,7 +1187,7 @@ pub struct FromClause {
     pub joins: Vec<JoinedSelectTable>,
 }
 
-/// `SELECT` distinctness
+/// Distinctness of the arguments of a function call
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Distinctness {
@@ -1140,6 +1195,36 @@ pub enum Distinctness {
     Distinct,
     /// `ALL`
     All,
+}
+
+/// `SELECT` distinctness
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SelectDistinctness {
+    /// `DISTINCT`
+    Distinct,
+    /// `ALL`
+    All,
+    /// `DISTINCT ON (exprs)`: the first row of each group of rows where the expressions are equal
+    DistinctOn(Vec<Box<Expr>>),
+}
+
+impl SelectDistinctness {
+    /// The expressions of `DISTINCT ON`; none for `DISTINCT` and `ALL`.
+    pub fn exprs(&self) -> &[Box<Expr>] {
+        match self {
+            Self::DistinctOn(exprs) => exprs,
+            Self::Distinct | Self::All => &[],
+        }
+    }
+
+    /// The expressions of `DISTINCT ON`; none for `DISTINCT` and `ALL`.
+    pub fn exprs_mut(&mut self) -> &mut [Box<Expr>] {
+        match self {
+            Self::DistinctOn(exprs) => exprs,
+            Self::Distinct | Self::All => &mut [],
+        }
+    }
 }
 
 /// `SELECT` or `RETURNING` result column
@@ -1542,6 +1627,30 @@ pub enum RelationKind {
     MaterializedView,
     Sequence,
     Index,
+}
+
+impl RelationKind {
+    /// The kind in words, such as `table` or `materialized view`.
+    pub fn name(self) -> &'static str {
+        match self {
+            RelationKind::Table => "table",
+            RelationKind::View => "view",
+            RelationKind::MaterializedView => "materialized view",
+            RelationKind::Sequence => "sequence",
+            RelationKind::Index => "index",
+        }
+    }
+
+    /// The kind as an error message names it, such as `a table` or `an index`.
+    pub fn with_article(self) -> &'static str {
+        match self {
+            RelationKind::Table => "a table",
+            RelationKind::View => "a view",
+            RelationKind::MaterializedView => "a materialized view",
+            RelationKind::Sequence => "a sequence",
+            RelationKind::Index => "an index",
+        }
+    }
 }
 
 /// A role named in DDL, like PostgreSQL's RoleSpec.

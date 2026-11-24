@@ -23,8 +23,8 @@ use sql_generation::{
     },
 };
 use strum::IntoEnumIterator;
+use turso_core::ast::{self, Distinctness};
 use turso_core::{LimboError, Numeric, types};
-use turso_parser::ast::{self, Distinctness};
 
 use crate::{
     common::print_diff,

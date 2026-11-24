@@ -1,5 +1,11 @@
 //! Bytecode that writes rows of `sqlite_schema`.
 
+use crate::ast;
+use crate::dialect::{
+    Catalog, CatalogCmd, CmdContext, CreateIndex, CreateMaterializedView, CreateSequence,
+    CreateTable, CreateTrigger, CreateView, CreateVirtualTable, DropIndex, DropSequence, DropTable,
+    DropTrigger, DropView, TableText,
+};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
 use crate::storage::pager::CreateBTreeFlags;
@@ -9,27 +15,313 @@ use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
 };
+use crate::translate::index::canonical_create_index_sql;
+use crate::translate::schema::sqlite_schema_alter_rows::{
+    emit_add_column_rows, emit_alter_column_rows, emit_drop_column_rows, emit_rename_column_rows,
+    emit_rename_table_rows,
+};
 use crate::translate::schema::{emit_schema_cookie, SQLITE_TABLEID};
+use crate::translate::sequence::{sequence_backing_table_name, sequence_backing_table_sql};
 use crate::translate::ProgramBuilder;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
 use crate::{CaptureDataChangesExt, Result, MAIN_DB_ID};
 
-/// Deletes the row of an index.
-pub(crate) fn emit_delete_index_row(
+/// The catalog of a SQLite database: a row of `sqlite_schema` per object,
+/// with the SQL text that creates it.
+#[derive(Debug)]
+pub struct SqliteCatalog;
+
+impl Catalog for SqliteCatalog {
+    fn emit(
+        &self,
+        program: &mut ProgramBuilder,
+        ctx: &CmdContext<'_>,
+        cmd: &CatalogCmd<'_>,
+    ) -> Result<()> {
+        match cmd {
+            CatalogCmd::CreateTable(table) => emit_create_table_rows(program, ctx, table),
+            CatalogCmd::CreateIndex(index) => emit_create_index_row(program, ctx, index),
+            CatalogCmd::DropIndex(index) => emit_delete_index_row(program, ctx, index),
+            CatalogCmd::CreateSequence(sequence) => {
+                emit_create_sequence_row(program, ctx, sequence)
+            }
+            CatalogCmd::DropSequence(sequence) => emit_delete_sequence_row(program, ctx, sequence),
+            CatalogCmd::DropTable(table) => emit_drop_table_rows(program, ctx, table),
+            CatalogCmd::CreateView(view) => emit_create_view_row(program, ctx, view),
+            CatalogCmd::CreateMaterializedView(view) => {
+                emit_create_materialized_view_row(program, ctx, view)
+            }
+            CatalogCmd::DropView(view) => emit_drop_view_row(program, ctx, view),
+            CatalogCmd::RenameTable(table) => emit_rename_table_rows(program, ctx, table),
+            CatalogCmd::RenameColumn(column) => emit_rename_column_rows(program, ctx, column),
+            CatalogCmd::AlterColumn(column) => emit_alter_column_rows(program, ctx, column),
+            CatalogCmd::AddColumn(column) => emit_add_column_rows(program, ctx, column),
+            CatalogCmd::DropColumn(column) => emit_drop_column_rows(program, ctx, column),
+            CatalogCmd::CreateTrigger(trigger) => emit_create_trigger_row(program, ctx, trigger),
+            CatalogCmd::DropTrigger(trigger) => {
+                emit_delete_trigger_row(program, ctx, trigger);
+                Ok(())
+            }
+            CatalogCmd::CreateVirtualTable(table) => {
+                emit_create_virtual_table_row(program, ctx, table)
+            }
+        }
+    }
+}
+
+/// Writes the row of a new table and a row for each of its automatic
+/// indexes.
+fn emit_create_table_rows(
     program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    table: &CreateTable<'_>,
+) -> Result<()> {
+    let resolver = ctx.resolver;
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: table.namespace,
+    };
+    let stored_name = resolver.mangle_name(namespace, table.name);
+    let sql = table_sql(resolver, namespace, table)?;
+
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        ctx.database_id,
+        Some(SQLITE_TABLEID),
+    )?;
+    emit_schema_entry(
+        program,
+        resolver,
+        sqlite_schema_cursor_id,
+        cdc_table.as_ref().map(|x| x.0),
+        SchemaEntryType::Table,
+        &stored_name,
+        &stored_name,
+        table.root_reg,
+        Some(sql),
+    )?;
+    for index in table.automatic_indexes {
+        emit_schema_entry(
+            program,
+            resolver,
+            sqlite_schema_cursor_id,
+            None,
+            SchemaEntryType::Index,
+            &index.name,
+            &stored_name,
+            index.root_reg,
+            None,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// The SQL text to store for a new table. The resolver's dialect is the
+/// one the statement was parsed with: the engine's own for an engine schema
+/// statement, which stores plain SQLite text, the connection's otherwise.
+/// The SQLite dialect renders canonical text from the AST; a frontend
+/// dialect keeps its own input text.
+fn table_sql(
     resolver: &Resolver,
     namespace: NamespaceRef,
-    index_name: &str,
-    cdc_table: Option<(usize, Arc<BTreeTable>)>,
+    table: &CreateTable<'_>,
+) -> Result<String> {
+    let dialect = &resolver.catalog.dialect;
+    let name_in_sql = ast::QualifiedName {
+        namespace: None,
+        name: resolver.name_in_sql(namespace, table.written_name),
+        alias: None,
+    };
+    match table.text {
+        TableText::FromSelect(sql) => Ok(sql.to_string()),
+        TableText::Rewritten => dialect.format_rewritten_table_sql(&ast::Stmt::CreateTable {
+            temporary: table.temporary,
+            if_not_exists: table.if_not_exists,
+            tbl_name: name_in_sql,
+            body: table.body.clone(),
+        }),
+        TableText::Statement(input) => dialect.format_table_sql(input, &name_in_sql, table.body),
+    }
+}
+
+/// Writes the row of a new index.
+fn emit_create_index_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    index: &CreateIndex<'_>,
 ) -> Result<()> {
+    let resolver = ctx.resolver;
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: index.namespace,
+    };
+    let stored_name = resolver.mangle_name(namespace, index.name);
+    let sql = canonical_create_index_sql(
+        index.statement,
+        resolver.name_in_sql(namespace, index.written_name),
+        resolver.name_in_sql(namespace, index.written_table),
+    );
+
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        ctx.database_id,
+        Some(SQLITE_TABLEID),
+    )?;
+    emit_schema_entry(
+        program,
+        resolver,
+        sqlite_schema_cursor_id,
+        cdc_table.map(|x| x.0),
+        SchemaEntryType::Index,
+        &stored_name,
+        &resolver.mangle_name(namespace, index.table),
+        index.root_reg,
+        Some(sql),
+    )?;
+
+    Ok(())
+}
+
+/// Writes the row of a new sequence. The schema reads a sequence from the
+/// row of its backing table, so that row is the one written.
+fn emit_create_sequence_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    sequence: &CreateSequence<'_>,
+) -> Result<()> {
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: sequence.namespace,
+    };
+    let stored_name = ctx.resolver.mangle_name(namespace, sequence.name);
+    let backing_table_name = sequence_backing_table_name(&stored_name);
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    emit_schema_entry(
+        program,
+        ctx.resolver,
+        sqlite_schema_cursor_id,
+        None,
+        SchemaEntryType::Table,
+        &backing_table_name,
+        &backing_table_name,
+        sequence.root_reg,
+        Some(sequence_backing_table_sql(&stored_name)),
+    )
+}
+
+/// Deletes the row of a sequence that is dropped, which is the row of its
+/// backing table.
+fn emit_delete_sequence_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    sequence: &DropSequence<'_>,
+) -> Result<()> {
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: sequence.namespace,
+    };
+    let stored_name = ctx.resolver.mangle_name(namespace, sequence.name);
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    emit_delete_sequence_backing_table_row(
+        program,
+        sqlite_schema_cursor_id,
+        sequence_backing_table_name(&stored_name),
+    );
+    Ok(())
+}
+
+/// Deletes the `sqlite_schema` row of the table `backing_table_name` of a
+/// sequence, with a scan of the open cursor `sqlite_schema_cursor_id`.
+pub(crate) fn emit_delete_sequence_backing_table_row(
+    program: &mut ProgramBuilder,
+    sqlite_schema_cursor_id: usize,
+    backing_table_name: String,
+) {
+    let seq_name_reg = program.alloc_register();
+    let type_str_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        dest: seq_name_reg,
+        value: backing_table_name,
+    });
+    program.emit_insn(Insn::String8 {
+        dest: type_str_reg,
+        value: "table".to_string(),
+    });
+
+    // Scan sqlite_schema for (type='table' AND name=backing_table_name) and delete the row.
+    let end_loop_label = program.allocate_label();
+    let loop_start_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_empty: end_loop_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
+    let col0_reg = program.alloc_register();
+    let col1_reg = program.alloc_register();
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, col0_reg);
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, col1_reg);
+    let skip_delete_label = program.allocate_label();
+    program.emit_insn(Insn::Ne {
+        lhs: col0_reg,
+        rhs: type_str_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: col1_reg,
+        rhs: seq_name_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+    program.emit_insn(Insn::Delete {
+        cursor_id: sqlite_schema_cursor_id,
+        table_name: "sqlite_schema".to_string(),
+        is_part_of_update: false,
+    });
+    program.preassign_label_to_next_insn(skip_delete_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_next: loop_start_label,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(end_loop_label);
+}
+
+/// Deletes the row of an index.
+fn emit_delete_index_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    index: &DropIndex<'_>,
+) -> Result<()> {
+    let resolver = ctx.resolver;
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: index.namespace,
+    };
+
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        ctx.database_id,
+        Some(SQLITE_TABLEID),
+    )?;
+
     // According to sqlite should emit Null instruction
     // but why?
     let null_reg = program.alloc_register();
     program.emit_null(null_reg, None);
 
     // String8; r[3] = 'some idx name'
-    let index_name_reg = program.emit_string8_new_reg(resolver.mangle_name(namespace, index_name));
+    let index_name_reg = program.emit_string8_new_reg(resolver.mangle_name(namespace, index.name));
     // String8; r[4] = 'index'
     let index_str_reg = program.emit_string8_new_reg("index".to_string());
 
@@ -41,8 +333,7 @@ pub(crate) fn emit_delete_index_row(
         .schema()
         .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
         .unwrap();
-    let sqlite_schema_cursor_id =
-        open_sqlite_schema_for_write(program, resolver, namespace.database_id);
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
 
     let loop_start_label = program.allocate_label();
     let loop_end_label = program.allocate_label();
@@ -137,15 +428,33 @@ pub(crate) fn emit_delete_index_row(
     Ok(())
 }
 
+/// Deletes the rows of a dropped table and of its indexes and triggers.
+fn emit_drop_table_rows(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    table: &DropTable<'_>,
+) -> Result<()> {
+    emit_delete_rows_of_table(program, ctx, table)?;
+    emit_delete_temp_triggers_on_table(program, ctx, table)?;
+    Ok(())
+}
+
 /// Deletes every row whose `tbl_name` is the table: its own row and the
 /// rows of its indexes and triggers.
-pub(crate) fn emit_delete_rows_of_table(
+fn emit_delete_rows_of_table(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    database_id: usize,
-    stored_name: String,
-    scratch_regs: [usize; 2],
+    ctx: &CmdContext<'_>,
+    table: &DropTable<'_>,
 ) -> Result<()> {
+    let resolver = ctx.resolver;
+    let database_id = ctx.database_id;
+    let stored_name = resolver.mangle_name(
+        NamespaceRef {
+            database_id,
+            id: table.namespace,
+        },
+        table.name,
+    );
     let cdc_table = prepare_cdc_if_necessary(
         program,
         resolver.schema(),
@@ -153,7 +462,7 @@ pub(crate) fn emit_delete_rows_of_table(
         Some(SQLITE_TABLEID),
     )?;
 
-    let [null_reg, tbl_name_reg] = scratch_regs;
+    let [null_reg, tbl_name_reg] = table.scratch_regs;
     program.emit_null(null_reg, None);
     let table_reg = program.emit_string8_new_reg(stored_name);
     program.mark_last_insn_constant();
@@ -165,7 +474,7 @@ pub(crate) fn emit_delete_rows_of_table(
         .schema()
         .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
         .unwrap();
-    let sqlite_schema_cursor_id_0 = open_sqlite_schema_for_write(program, resolver, database_id);
+    let sqlite_schema_cursor_id_0 = ctx.sqlite_schema_cursor(program);
 
     //  1. Remove all entries from the schema table related to the table we are dropping (including triggers)
     //  loop to beginning of schema table
@@ -253,11 +562,10 @@ pub(crate) fn emit_delete_rows_of_table(
 
 /// Deletes the rows of the triggers in the temp database that are on the
 /// table, when the table is in another database.
-pub(crate) fn emit_delete_temp_triggers_on_table(
+fn emit_delete_temp_triggers_on_table(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    database_id: usize,
-    table_name: &str,
+    ctx: &CmdContext<'_>,
+    table: &DropTable<'_>,
 ) -> Result<()> {
     // SQLite removes temp triggers targeting the dropped table.
     // Enumerate the temp schema triggers at translate time (which is
@@ -268,6 +576,8 @@ pub(crate) fn emit_delete_temp_triggers_on_table(
     // unqualified table name can live in the temp schema but point to
     // different databases (e.g. one on `main.t`, one on `temp.t` when a
     // shadow table exists). We must key on trigger name.
+    let resolver = ctx.resolver;
+    let database_id = ctx.database_id;
     if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
         // A temp schema trigger targets the dropped db iff:
         //   - it explicitly qualifies with the dropped db, or
@@ -275,10 +585,10 @@ pub(crate) fn emit_delete_temp_triggers_on_table(
         //     shadow table of the same name (in which case the
         //     unqualified reference resolves to main).
         let temp_has_shadow = resolver.with_schema(crate::TEMP_DB_ID, |s| {
-            s.get_table(NamespaceId::ROOT, table_name).is_some()
+            s.get_table(NamespaceId::ROOT, table.name).is_some()
         });
         let trigger_names_to_drop: Vec<String> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
-            s.get_triggers_for_table(NamespaceId::ROOT, table_name)
+            s.get_triggers_for_table(NamespaceId::ROOT, table.name)
                 .filter(|trigger| match trigger.target_database_id {
                     Some(db_id) => db_id == database_id,
                     None => !temp_has_shadow && database_id == crate::MAIN_DB_ID,
@@ -361,22 +671,98 @@ pub(crate) fn emit_delete_temp_triggers_on_table(
     Ok(())
 }
 
-/// Deletes the row of a view or materialized view. Returns the register
-/// with the rowid of the deleted row.
-pub(crate) fn emit_drop_view_row(
+/// Writes the row of a new view.
+fn emit_create_view_row(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    namespace: NamespaceRef,
-    view_name: &str,
-    sqlite_schema_cursor_id: usize,
-) -> Result<usize> {
+    ctx: &CmdContext<'_>,
+    view: &CreateView<'_>,
+) -> Result<()> {
+    let resolver = ctx.resolver;
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: view.namespace,
+    };
+    let stored_name = resolver.mangle_name(namespace, view.name);
+    let sql = create_view_sql(
+        "VIEW",
+        &resolver
+            .name_in_sql(namespace, view.written_name)
+            .as_ident(),
+        view.columns,
+        view.select,
+    );
+
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    emit_schema_entry(
+        program,
+        resolver,
+        sqlite_schema_cursor_id,
+        None,
+        SchemaEntryType::View,
+        &stored_name,
+        &stored_name,
+        // A view has no B-tree.
+        0,
+        Some(sql),
+    )?;
+
+    Ok(())
+}
+
+/// Writes the row of a new materialized view.
+fn emit_create_materialized_view_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    view: &CreateMaterializedView<'_>,
+) -> Result<()> {
+    let resolver = ctx.resolver;
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: view.namespace,
+    };
+    let stored_name = resolver.mangle_name(namespace, view.name);
+    let sql = create_view_sql(
+        "MATERIALIZED VIEW",
+        &view.written_name.as_ident(),
+        view.columns,
+        view.select,
+    );
+
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    emit_schema_entry(
+        program,
+        resolver,
+        sqlite_schema_cursor_id,
+        None,
+        SchemaEntryType::View,
+        &stored_name,
+        &stored_name,
+        view.root_reg,
+        Some(sql),
+    )?;
+
+    Ok(())
+}
+
+/// Deletes the row of a view or materialized view.
+fn emit_drop_view_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    view: &DropView<'_>,
+) -> Result<()> {
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: view.namespace,
+    };
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+
     let view_name_reg = program.alloc_register();
     let type_reg = program.alloc_register();
-    let rowid_reg = program.alloc_register();
+    let rowid_reg = ctx.sqlite_schema_rowid_reg(program);
 
     program.emit_insn(Insn::String8 {
         dest: view_name_reg,
-        value: resolver.mangle_name(namespace, view_name),
+        value: ctx.resolver.mangle_name(namespace, view.name),
     });
     program.emit_insn(Insn::String8 {
         dest: type_reg,
@@ -436,7 +822,159 @@ pub(crate) fn emit_drop_view_row(
 
     program.preassign_label_to_next_insn(end_loop_label);
 
-    Ok(rowid_reg)
+    Ok(())
+}
+
+/// The SQL text to store for a new view or materialized view.
+fn create_view_sql(
+    view_kind: &str,
+    view_name: &str,
+    columns: &[ast::IndexedColumn],
+    select_stmt: &ast::Select,
+) -> String {
+    let columns_str = columns
+        .iter()
+        .map(|col| col.col_name.as_ident())
+        .collect::<Vec<String>>()
+        .join(", ");
+    if !columns_str.is_empty() {
+        return format!("CREATE {view_kind} {view_name} ({columns_str}) AS {select_stmt}");
+    }
+    format!("CREATE {view_kind} {view_name} AS {select_stmt}")
+}
+
+/// Writes the row of a new trigger.
+fn emit_create_trigger_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    trigger: &CreateTrigger<'_>,
+) -> Result<()> {
+    let resolver = ctx.resolver;
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: trigger.namespace,
+    };
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    emit_schema_entry(
+        program,
+        resolver,
+        sqlite_schema_cursor_id,
+        // Changes of triggers are not captured.
+        None,
+        SchemaEntryType::Trigger,
+        &resolver.mangle_name(namespace, trigger.name),
+        &resolver.mangle_name(trigger.table_namespace, trigger.table),
+        // A trigger has no B-tree.
+        0,
+        Some(trigger.sql.to_string()),
+    )
+}
+
+/// Deletes the row of a trigger.
+fn emit_delete_trigger_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    trigger: &DropTrigger<'_>,
+) {
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: trigger.namespace,
+    };
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+
+    let search_loop_label = program.allocate_label();
+    let skip_non_trigger_label = program.allocate_label();
+    let done_label = program.allocate_label();
+    let rewind_done_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_empty: rewind_done_label,
+    });
+
+    program.preassign_label_to_next_insn(search_loop_label);
+
+    let type_reg = program.alloc_register();
+    let name_reg = program.alloc_register();
+    program.emit_insn(Insn::Column {
+        cursor_id: sqlite_schema_cursor_id,
+        column: 0,
+        dest: type_reg,
+        default: None,
+    });
+    program.emit_insn(Insn::Column {
+        cursor_id: sqlite_schema_cursor_id,
+        column: 1,
+        dest: name_reg,
+        default: None,
+    });
+
+    let type_str_reg = program.emit_string8_new_reg("trigger".to_string());
+    program.emit_insn(Insn::Ne {
+        lhs: type_reg,
+        rhs: type_str_reg,
+        target_pc: skip_non_trigger_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+
+    let trigger_name_str_reg =
+        program.emit_string8_new_reg(ctx.resolver.mangle_name(namespace, trigger.name));
+    program.emit_insn(Insn::Ne {
+        lhs: name_reg,
+        rhs: trigger_name_str_reg,
+        target_pc: skip_non_trigger_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+
+    program.emit_insn(Insn::Delete {
+        cursor_id: sqlite_schema_cursor_id,
+        table_name: SQLITE_TABLEID.to_string(),
+        is_part_of_update: false,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: done_label,
+    });
+
+    program.preassign_label_to_next_insn(skip_non_trigger_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_next: search_loop_label,
+        fullscan: false,
+        is_index: false,
+    });
+
+    program.preassign_label_to_next_insn(done_label);
+    program.preassign_label_to_next_insn(rewind_done_label);
+}
+
+/// Writes the row of a new virtual table.
+fn emit_create_virtual_table_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    table: &CreateVirtualTable<'_>,
+) -> Result<()> {
+    let resolver = ctx.resolver;
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        ctx.database_id,
+        Some(SQLITE_TABLEID),
+    )?;
+    emit_schema_entry(
+        program,
+        resolver,
+        sqlite_schema_cursor_id,
+        cdc_table.map(|x| x.0),
+        SchemaEntryType::Table,
+        table.name,
+        table.name,
+        // A virtual table has no B-tree.
+        0,
+        Some(table.sql.to_string()),
+    )
 }
 
 /// Creates one of the engine's own tables in the main database the first
@@ -504,17 +1042,36 @@ pub(crate) fn open_sqlite_schema_for_write(
     resolver: &Resolver,
     database_id: usize,
 ) -> usize {
+    let cursor_id = alloc_sqlite_schema_cursor(program, resolver, database_id);
+    emit_open_sqlite_schema_cursor(program, cursor_id, database_id);
+    cursor_id
+}
+
+/// Gives a cursor for writing `sqlite_schema` of the given database its
+/// number, without opening it.
+pub(crate) fn alloc_sqlite_schema_cursor(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+) -> usize {
     let sqlite_schema = resolver.with_schema(database_id, |s| {
         s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
             .expect("every database has sqlite_schema")
     });
-    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema));
+    program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema))
+}
+
+/// Opens a cursor that [`alloc_sqlite_schema_cursor`] gave a number.
+pub(crate) fn emit_open_sqlite_schema_cursor(
+    program: &mut ProgramBuilder,
+    cursor_id: usize,
+    database_id: usize,
+) {
     program.emit_insn(Insn::OpenWrite {
         cursor_id,
         root_page: RegisterOrLiteral::Literal(SQLITE_SCHEMA_ROOT_PAGE),
         db: database_id,
     });
-    cursor_id
 }
 
 /// `sqlite_schema` is at the first page of every database.

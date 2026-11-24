@@ -1,0 +1,20 @@
+@database :memory:
+
+# ALTER TABLE ... RENAME COLUMN stores the new text of every view that names
+# the column, with an UPDATE of sqlite_schema that finds the view's row by
+# name. The name went into that UPDATE's text without escaping, so a view
+# whose name contains a single quote made the statement fail with a parse
+# error.
+
+test rename-column-used-by-view-with-quote-in-name {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 2);
+    CREATE VIEW "v'q" AS SELECT b FROM t;
+    ALTER TABLE t RENAME b TO bb;
+    SELECT * FROM "v'q";
+    SELECT bb FROM t;
+}
+expect {
+    2
+    2
+}

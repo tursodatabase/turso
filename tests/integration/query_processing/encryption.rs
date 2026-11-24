@@ -6,30 +6,442 @@ use asserting::prelude::*;
 use rand::{rng, RngCore};
 use std::sync::Arc;
 use turso_core::{
-    CipherMode, ConnectOpts, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags,
-    PlatformIO, Row, SessionRole, IO,
+    CompletionError, ConnectOpts, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, IOResult,
+    LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SessionRole, IO,
 };
 use turso_sqlite::SqliteDialect;
 
 const ENABLE_ENCRYPTION: bool = true;
 
+#[test]
+fn attach_encryption_matrix() -> anyhow::Result<()> {
+    let (mut rng, seed) = crate::common::rng_from_time_or_env();
+    eprintln!("encryption ATTACH SEED={seed}");
+    for main_encrypted in [false, true] {
+        for attached_cipher in [None, Some(CIPHER_A), Some(CIPHER_B)] {
+            let mut cases = Vec::new();
+            for populate_main in [false, true] {
+                if populate_main && !main_encrypted {
+                    continue;
+                }
+                for main_memory in [false, true] {
+                    for mvcc in [false, true] {
+                        for (existing, cached) in [(false, false), (true, false), (true, true)] {
+                            cases.push((populate_main, main_memory, mvcc, existing, cached));
+                        }
+                    }
+                }
+            }
+            for (populate_main, main_memory, mvcc, existing, cached) in
+                crate::common::sample_encryption_cases(cases, 1, &mut rng)
+            {
+                let directory = tempfile::tempdir()?;
+                let main_path = directory.path().join("main.db");
+                let attached_path = directory.path().join("attached.db");
+                let disk: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+                let main_io: Arc<dyn IO> = if main_memory {
+                    Arc::new(turso_core::MemoryIO::new())
+                } else {
+                    disk.clone()
+                };
+                let main = Database::open(
+                    main_io,
+                    if main_memory {
+                        ":memory:"
+                    } else {
+                        main_path.to_str().unwrap()
+                    },
+                    attach_matrix_options(main_encrypted.then_some(CIPHER_A), mvcc, KEY_A),
+                )?;
+                let connection = main.connect(
+                    ConnectOpts::new(SessionRole::Superuser).with_encryption_key(
+                        main_encrypted.then(|| EncryptionKey::from_hex_string(KEY_A).unwrap()),
+                    ),
+                )?;
+                if populate_main {
+                    connection.execute("CREATE TABLE main_data(value TEXT)")?;
+                    connection.execute("INSERT INTO main_data VALUES ('main value')")?;
+                }
+                let retained = if existing {
+                    let attached = Database::open(
+                        disk.clone(),
+                        attached_path.to_str().unwrap(),
+                        attach_matrix_options(attached_cipher, mvcc, KEY_B),
+                    )?;
+                    let owner = attached.connect(
+                        ConnectOpts::new(SessionRole::Superuser).with_encryption_key(
+                            attached_cipher.map(|_| EncryptionKey::from_hex_string(KEY_B).unwrap()),
+                        ),
+                    )?;
+                    owner.execute("CREATE TABLE data(value TEXT)")?;
+                    owner.execute("INSERT INTO data VALUES ('existing')")?;
+                    if cached {
+                        Some((attached, owner))
+                    } else {
+                        owner.close()?;
+                        let weak = Arc::downgrade(&attached);
+                        drop((owner, attached));
+                        assert_eq!(weak.strong_count(), 0);
+                        None
+                    }
+                } else {
+                    None
+                };
+                if existing && attached_cipher.is_some() {
+                    for uri in [
+                        attached_path.display().to_string(),
+                        format!(
+                            "file:{}?cipher={}&hexkey={}",
+                            attached_path.display(),
+                            attached_cipher.unwrap(),
+                            KEY_A
+                        ),
+                    ] {
+                        assert!(connection
+                            .execute(format!("ATTACH '{uri}' AS aux"))
+                            .is_err());
+                        assert!(connection
+                            .attached_database_names()
+                            .iter()
+                            .all(|name| name != "aux"));
+                        if populate_main {
+                            let rows: Vec<(String,)> =
+                                connection.exec_rows("SELECT value FROM main_data");
+                            assert_eq!(rows, [("main value".into(),)]);
+                        }
+                    }
+                }
+                let uri = match attached_cipher {
+                    Some(cipher) => format!(
+                        "file:{}?cipher={cipher}&hexkey={KEY_B}",
+                        attached_path.display()
+                    ),
+                    None => attached_path.to_str().unwrap().to_string(),
+                };
+                connection.execute(format!("ATTACH '{uri}' AS aux"))?;
+                connection.execute("CREATE TABLE IF NOT EXISTS aux.data(value TEXT)")?;
+                connection.execute("INSERT INTO aux.data VALUES ('attached')")?;
+                let rows: Vec<(String,)> =
+                    connection.exec_rows("SELECT value FROM aux.data ORDER BY value");
+                let expected = if existing {
+                    vec![("attached".into(),), ("existing".into(),)]
+                } else {
+                    vec![("attached".into(),)]
+                };
+                assert_eq!(rows, expected, "main_encrypted={main_encrypted}, populate_main={populate_main}, main_memory={main_memory}, mvcc={mvcc}, attached_cipher={attached_cipher:?}, existing={existing}, cached={cached}");
+                assert_eq!(
+                    connection.get_pager().is_encryption_ctx_set(),
+                    main_encrypted
+                );
+                connection.execute("DETACH aux")?;
+                if attached_cipher.is_some() {
+                    assert!(connection
+                        .execute(format!("ATTACH '{}' AS aux", attached_path.display()))
+                        .is_err());
+                    assert!(connection
+                        .attached_database_names()
+                        .iter()
+                        .all(|name| name != "aux"));
+                }
+                if populate_main {
+                    let rows: Vec<(String,)> = connection.exec_rows("SELECT value FROM main_data");
+                    assert_eq!(rows, [("main value".into(),)]);
+                }
+                let bytes = std::fs::read(&attached_path)?;
+                assert_eq!(
+                    bytes.starts_with(b"SQLite format 3\0"),
+                    attached_cipher.is_none()
+                );
+                drop(retained);
+                let reopened = Database::open(
+                    disk.clone(),
+                    attached_path.to_str().unwrap(),
+                    attach_matrix_options(attached_cipher, mvcc, KEY_B),
+                )?;
+                let reader = reopened.connect(
+                    ConnectOpts::new(SessionRole::Superuser).with_encryption_key(
+                        attached_cipher.map(|_| EncryptionKey::from_hex_string(KEY_B).unwrap()),
+                    ),
+                )?;
+                let recovered: Vec<(String,)> =
+                    reader.exec_rows("SELECT value FROM data ORDER BY value");
+                assert_eq!(recovered, expected);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn attach_key_rejects_non_null_values_before_creating_a_file() -> anyhow::Result<()> {
+    for main_encrypted in [false, true] {
+        let directory = tempfile::tempdir()?;
+        let main_path = directory.path().join("main.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+        let db = Database::open(
+            io,
+            main_path.to_str().unwrap(),
+            attach_matrix_options(main_encrypted.then_some(CIPHER_A), false, KEY_A),
+        )?;
+        let connection = db.connect(
+            ConnectOpts::new(SessionRole::Superuser).with_encryption_key(
+                main_encrypted.then(|| EncryptionKey::from_hex_string(KEY_A).unwrap()),
+            ),
+        )?;
+        for (index, expression) in ["'secret'", "42", "x'AB'", "lower('SECRET')"]
+            .into_iter()
+            .enumerate()
+        {
+            let path = directory.path().join(format!("refused-{index}.db"));
+            let error = connection
+                .execute(format!(
+                    "ATTACH '{}' AS aux KEY {expression}",
+                    path.display()
+                ))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("ATTACH KEY is not supported"),
+                "{error}"
+            );
+            assert!(!path.exists());
+            connection.execute(format!("ATTACH '{}' AS aux KEY NULL", path.display()))?;
+            connection.execute("CREATE TABLE aux.data(value)")?;
+            connection.execute("DETACH aux")?;
+            assert!(std::fs::read(&path)?.starts_with(b"SQLite format 3\0"));
+        }
+    }
+    Ok(())
+}
+
+fn attach_matrix_options(cipher: Option<&str>, mvcc: bool, key: &str) -> OpenOptions {
+    OpenOptions::new(Arc::new(SqliteDialect))
+        .db_opts(
+            DatabaseOpts::new()
+                .with_attach(true)
+                .with_mvcc(mvcc)
+                .with_encryption(cipher.is_some()),
+        )
+        .encryption(cipher.map(|cipher| EncryptionOpts {
+            cipher: cipher.into(),
+            hexkey: key.into(),
+        }))
+}
+
+#[test]
+fn authenticated_wal_import_preserves_target_encryption() -> anyhow::Result<()> {
+    for cipher in [CIPHER_A, CIPHER_B] {
+        let source = TempDatabaseBuilder::new()
+            .with_encryption(cipher, KEY_A)
+            .build();
+        let writer = source.connect_limbo();
+        writer.execute("CREATE TABLE secrets(value TEXT)")?;
+        writer.execute("INSERT INTO secrets VALUES ('imported secret')")?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("imported.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+        let target = Database::open(
+            io.clone(),
+            path.to_str().unwrap(),
+            attach_matrix_options(Some(cipher), false, KEY_B),
+        )?;
+        let importer = target.connect(
+            ConnectOpts::new(SessionRole::Superuser)
+                .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_B)?)),
+        )?;
+        importer.execute("CREATE TABLE old(value)")?;
+        importer.checkpoint(turso_core::CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })?;
+        importer.wal_insert_begin()?;
+        let mut frame = vec![0; 24 + writer.get_page_size().get() as usize];
+        for index in 1..=writer.wal_state()?.max_frame {
+            writer.wal_get_frame(index, &mut frame)?;
+            if u32::from_be_bytes(frame[..4].try_into().unwrap()) == 1 {
+                let before = std::fs::read(format!("{}-wal", path.display()))?;
+                // The SQLite magic, the page size, the reserved-space size, and
+                // the reserved tail, where encryption writes its nonce and tag.
+                for offset in [24, 24 + 16, 24 + 20, frame.len() - 1] {
+                    frame[offset] ^= 1;
+                    assert!(importer.wal_insert_frame(index, &frame).is_err());
+                    assert_eq!(std::fs::read(format!("{}-wal", path.display()))?, before);
+                    frame[offset] ^= 1;
+                }
+            }
+            importer.wal_insert_frame(index, &frame)?;
+        }
+        importer.wal_insert_end(false)?;
+        importer.force_reparse_schema()?;
+        let rows: Vec<(String,)> = importer.exec_rows("SELECT value FROM secrets");
+        assert_eq!(rows, [("imported secret".into(),)]);
+        importer.close()?;
+        drop((importer, target));
+        let bytes = std::fs::read(&path)?;
+        assert!(!bytes
+            .windows(b"imported secret".len())
+            .any(|value| value == b"imported secret"));
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+        assert!(Database::open(
+            io.clone(),
+            path.to_str().unwrap(),
+            attach_matrix_options(Some(cipher), false, KEY_A)
+        )
+        .is_err());
+        let reopened = Database::open(
+            io,
+            path.to_str().unwrap(),
+            attach_matrix_options(Some(cipher), false, KEY_B),
+        )?;
+        let connection = reopened.connect(
+            ConnectOpts::new(SessionRole::Superuser)
+                .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_B)?)),
+        )?;
+        let rows: Vec<(String,)> = connection.exec_rows("SELECT value FROM secrets");
+        assert_eq!(rows, [("imported secret".into(),)]);
+    }
+    Ok(())
+}
+
+#[test]
+fn synchronous_connect_keeps_statistics_read_failures_best_effort() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("statistics.db");
+    let queued = Arc::new(crate::queued_io::QueuedIo::new_with_io(Arc::new(
+        PlatformIO::new()?,
+    )));
+    let io = Arc::new(ConnectFaultIo {
+        inner: queued,
+        fail_read_offset: std::sync::atomic::AtomicU64::new(u64::MAX),
+    });
+    let db = Database::open(
+        io.clone(),
+        path.to_str().unwrap(),
+        OpenOptions::new(Arc::new(SqliteDialect)),
+    )?;
+    let owner = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    owner.execute("CREATE TABLE data(value)")?;
+    owner.execute("CREATE INDEX data_value ON data(value)")?;
+    owner.execute("INSERT INTO data VALUES (1), (2), (3)")?;
+    owner.execute("ANALYZE")?;
+    let roots: Vec<(i64,)> =
+        owner.exec_rows("SELECT rootpage FROM sqlite_schema WHERE name = 'sqlite_stat1'");
+    owner.checkpoint(turso_core::CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    })?;
+    let offset = (roots[0].0 as u64 - 1) * owner.get_page_size().get() as u64;
+    io.fail_read_offset
+        .store(offset, std::sync::atomic::Ordering::SeqCst);
+    let connection = db.connect(ConnectOpts::new(SessionRole::Superuser));
+    assert_eq!(
+        io.fail_read_offset
+            .load(std::sync::atomic::Ordering::SeqCst),
+        u64::MAX,
+        "statistics fault did not trigger"
+    );
+    let rows: Vec<(i64,)> = connection?.exec_rows("SELECT count(*) FROM data");
+    assert_eq!(rows, [(3,)]);
+    Ok(())
+}
+
+struct ConnectFaultIo {
+    inner: Arc<crate::queued_io::QueuedIo>,
+    fail_read_offset: std::sync::atomic::AtomicU64,
+}
+impl turso_core::Clock for ConnectFaultIo {
+    fn current_time_monotonic(&self) -> turso_core::MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+    fn current_time_wall_clock(&self) -> turso_core::WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+impl IO for ConnectFaultIo {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn turso_core::File>> {
+        self.inner.open_file(path, flags, direct)
+    }
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
+        self.inner.file_id(path)
+    }
+    fn step(&self) -> turso_core::Result<()> {
+        let offset = self
+            .fail_read_offset
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let events = self.inner.pending_events();
+        if let Some(index) = events.iter().position(|event| {
+            event.kind == crate::queued_io::QueuedIoOpKind::Pread
+                && event.offset == offset
+                && !event.path.ends_with("-wal")
+        }) {
+            self.fail_read_offset
+                .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+            self.inner.step_at(index, true)?;
+            Ok(())
+        } else {
+            self.inner.step()
+        }
+    }
+}
+
+#[test]
+fn cached_open_authenticates_bootstrap_page_before_returning_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encrypted.db");
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let options = |key: &str| {
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(DatabaseOpts::new().with_encryption(true))
+            .encryption(EncryptionOpts {
+                cipher: "aegis256".into(),
+                hexkey: key.into(),
+            })
+    };
+    let db = Database::open(
+        io.clone(),
+        path.to_str().unwrap(),
+        options(&"01".repeat(32)),
+    )
+    .unwrap();
+    let refused = Database::open(
+        io.clone(),
+        path.to_str().unwrap(),
+        options(&"02".repeat(32)),
+    );
+    assert!(
+        refused.is_err(),
+        "cached open returned a Database with a wrong key"
+    );
+    let correct = Database::open(io, path.to_str().unwrap(), options(&"01".repeat(32))).unwrap();
+    assert!(Arc::ptr_eq(&db, &correct));
+}
+
+fn encrypted_fixture(source: &TempDatabase, size: u32) -> TempDatabase {
+    TempDatabaseBuilder::new()
+        .with_opts(source.db_opts)
+        .with_mvcc(source.enable_mvcc)
+        .with_encryption(CIPHER_A, KEY_A)
+        .with_page_size(size)
+        .build()
+}
+
 fn run_non_4k_page_size_encryption_test(
     tmp_db: &TempDatabase,
     enable_mvcc: bool,
 ) -> anyhow::Result<()> {
+    // Set page size to 8k (8192 bytes) and test encryption. Default page size is 4k.
+    let encrypted = encrypted_fixture(tmp_db, 8192);
+    let tmp_db = &encrypted;
     let _ = env_logger::try_init();
     let db_path = tmp_db.path.clone();
 
     {
         let conn = tmp_db.connect_limbo();
-        // Set page size to 8k (8192 bytes) and test encryption. Default page size is 4k.
-        run_query(tmp_db, &conn, "PRAGMA page_size = 8192;")?;
-        run_query(
-            tmp_db,
-            &conn,
-            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
-        )?;
-        run_query(tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
         if enable_mvcc {
             run_query(tmp_db, &conn, "PRAGMA journal_mode = 'mvcc';")?;
         }
@@ -78,17 +490,13 @@ fn run_corruption_associated_data_bytes_test(
     tmp_db: &TempDatabase,
     enable_mvcc: bool,
 ) -> anyhow::Result<()> {
+    let encrypted = encrypted_fixture(tmp_db, 4096);
+    let tmp_db = &encrypted;
     let _ = env_logger::try_init();
     let db_path = tmp_db.path.clone();
 
     {
         let conn = tmp_db.connect_limbo();
-        run_query(
-            tmp_db,
-            &conn,
-            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
-        )?;
-        run_query(tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
         if enable_mvcc {
             run_query(tmp_db, &conn, "PRAGMA journal_mode = 'mvcc';")?;
         }
@@ -140,18 +548,15 @@ fn run_corruption_associated_data_bytes_test(
             test_db_path.to_str().unwrap()
         );
 
-        let (_io, conn) = turso_core::Connection::from_uri(
-            &uri,
-            DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
-            Arc::new(SqliteDialect),
-        )
-        .expect("opening the corrupted DB should not fail at the URI level");
-
-        let result = run_query_on_row(tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
-
-        assert_that!(result)
-            .described_as(format!("accessing an encrypted database with corrupted associated data at position {corrupt_pos}"))
-            .is_err();
+        assert!(
+            turso_core::Connection::from_uri(
+                &uri,
+                DatabaseOpts::new().with_encryption(true),
+                Arc::new(SqliteDialect)
+            )
+            .is_err(),
+            "corrupted associated data at {corrupt_pos}"
+        );
     }
 
     Ok(())
@@ -160,18 +565,13 @@ fn run_corruption_associated_data_bytes_test(
 // TODO: mvcc does not error here
 #[turso_macros::test]
 fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let tmp_db = encrypted_fixture(&tmp_db, 4096);
     let _ = env_logger::try_init();
     let db_path = tmp_db.path.clone();
     let opts = tmp_db.db_opts;
 
     {
         let conn = tmp_db.connect_limbo();
-        run_query(
-            &tmp_db,
-            &conn,
-            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
-        )?;
-        run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
         run_query(
             &tmp_db,
             &conn,
@@ -249,11 +649,12 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76377",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect))?;
-        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
-        assert_that!(result)
-            .described_as("accessing an encrypted database with the wrong key")
-            .is_err();
+        assert!(matches!(
+            turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect)),
+            Err(LimboError::CompletionError(
+                CompletionError::DecryptionError { .. }
+            ))
+        ));
     }
     {
         // test connecting to encrypted db using insufficient encryption parameters in URI.
@@ -277,11 +678,10 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
     }
     {
         // test connecting to encrypted db without using URI.
-        let conn = tmp_db.connect_limbo();
-        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
-        assert_that!(result)
-            .described_as("accessing an encrypted database without using the URI")
-            .is_err();
+        assert!(tmp_db
+            .db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .is_err());
     }
 
     Ok(())
@@ -302,6 +702,18 @@ fn test_mvcc_rejects_late_encryption_pragmas(tmp_db: TempDatabase) -> anyhow::Re
     let conn = tmp_db.connect_limbo();
     run_query(&tmp_db, &conn, "PRAGMA journal_mode = 'mvcc';")?;
 
+    assert!(Database::open(
+        tmp_db.io.clone(),
+        tmp_db.path.to_str().unwrap(),
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(tmp_db.db_opts)
+            .encryption(EncryptionOpts {
+                cipher: CIPHER_A.to_string(),
+                hexkey: KEY_A.to_string(),
+            }),
+    )
+    .is_err());
+
     // Insert data before the (rejected) late encryption pragmas.
     run_query(
         &tmp_db,
@@ -321,12 +733,12 @@ fn test_mvcc_rejects_late_encryption_pragmas(tmp_db: TempDatabase) -> anyhow::Re
     ))
     .err()
     .display_string()
-    .contains("configure encryption before PRAGMA journal_mode='mvcc'");
+    .contains("encryption must be configured when opening the database");
 
     assert_that!(run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';"))
         .err()
         .display_string()
-        .contains("configure encryption before PRAGMA journal_mode='mvcc'");
+        .contains("encryption must be configured when opening the database");
 
     // Data inserted before the rejected pragmas must still be readable.
     let mut pre_count = 0;
@@ -362,6 +774,7 @@ fn test_mvcc_rejects_late_encryption_pragmas(tmp_db: TempDatabase) -> anyhow::Re
 // TODO: mvcc for some reason does not error on corruption here
 #[turso_macros::test]
 fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let tmp_db = encrypted_fixture(&tmp_db, 4096);
     let _ = env_logger::try_init();
     let db_path = tmp_db.path.clone();
 
@@ -369,12 +782,6 @@ fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()>
 
     {
         let conn = tmp_db.connect_limbo();
-        run_query(
-            &tmp_db,
-            &conn,
-            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
-        )?;
-        run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
         run_query(
             &tmp_db,
             &conn,
@@ -407,14 +814,12 @@ fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()>
             db_path.to_str().unwrap()
         );
 
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect))?;
-        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
-
-        assert_that!(result)
-            .described_as("accessing an encrypted database with corrupted Turso magic bytes")
-            .err()
-            .display_string()
-            .contains("Decryption failed");
+        assert!(matches!(
+            turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect)),
+            Err(LimboError::CompletionError(
+                CompletionError::DecryptionError { .. }
+            ))
+        ));
     }
 
     Ok(())
@@ -521,13 +926,12 @@ fn test_turso_header_structure(db: TempDatabase) -> anyhow::Result<()> {
         let tmp_db = TempDatabase::builder()
             .with_opts(opts)
             .with_flags(flags)
+            .with_encryption(cipher_name, hexkey)
             .build();
         let db_path = tmp_db.path.clone();
 
         {
             let conn = tmp_db.connect_limbo();
-            run_query(&tmp_db, &conn, &format!("PRAGMA hexkey = '{hexkey}';"))?;
-            run_query(&tmp_db, &conn, &format!("PRAGMA cipher = '{cipher_name}';"))?;
             run_query(
                 &tmp_db,
                 &conn,
@@ -585,9 +989,10 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
         let correct_encryption_key =
             turso_core::EncryptionKey::from_hex_string(correct_key).unwrap();
 
-        let conn = main_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
-        conn.set_encryption_key(correct_encryption_key)?;
+        let conn = main_db.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(correct_encryption_key)),
+        )?;
 
         conn.execute("CREATE TABLE secret_data (id INTEGER PRIMARY KEY, value TEXT)")?;
         conn.execute("INSERT INTO secret_data (value) VALUES ('top secret')")?;
@@ -611,9 +1016,10 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             Arc::new(SqliteDialect),
         )?;
 
-        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
-        conn.set_encryption_key(correct_encryption_key)?;
+        let conn = db.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(correct_encryption_key)),
+        )?;
 
         let rows = conn.query("SELECT * FROM secret_data")?;
         let mut row_count = 0;
@@ -637,11 +1043,9 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
         assert_eq!(row_count, 1, "Should read data with correct key");
     }
 
-    // Step 3: Opening with wrong key succeeds, but reading data fails with decryption error
+    // Step 3: Opening a cached database must still validate the key.
     {
-        let wrong_encryption_key = turso_core::EncryptionKey::from_hex_string(wrong_key).unwrap();
-
-        let db = Database::open_file_with_flags(
+        let result = Database::open_file_with_flags(
             io.clone(),
             db_path_str,
             OpenFlags::default(),
@@ -651,34 +1055,14 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
                 hexkey: wrong_key.to_string(),
             }),
             Arc::new(SqliteDialect),
-        )?;
-
-        // opening succeeds - the key is not validated at open time
-        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
-        conn.set_encryption_key(wrong_encryption_key)?;
-
-        // Reading data should fail with a decryption error
-        let read_failed = match conn.query("SELECT * FROM secret_data") {
-            Err(_) => true,
-            Ok(Some(mut rows)) => loop {
-                match rows.step() {
-                    Err(_) => break true,                            // Error - read failed
-                    Ok(turso_core::StepResult::Done) => break false, // Completed without error
-                    Ok(turso_core::StepResult::Interrupt) => break false,
-                    Ok(turso_core::StepResult::Row) => break false, // Got data - unexpected!!
-                    Ok(turso_core::StepResult::Busy)
-                    | Ok(turso_core::StepResult::IO)
-                    | Ok(turso_core::StepResult::Yield)
-                    | Ok(turso_core::StepResult::Sleep { .. }) => continue,
-                }
-            },
-            Ok(None) => false,
-        };
-        assert!(
-            read_failed,
-            "Reading data with wrong key should fail with decryption error"
         );
+
+        assert!(matches!(
+            result,
+            Err(LimboError::CompletionError(
+                CompletionError::DecryptionError { .. }
+            ))
+        ));
     }
 
     // Step 4: Opening without encryption options should fail immediately
@@ -696,7 +1080,7 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             .described_as("opening an encrypted database with no encryption options")
             .err()
             .display_string()
-            .contains("Database is encrypted but no encryption options provided");
+            .contains("encrypted database requires an encryption key");
     }
 
     // Step 5: verify correct key still works after wrong key attempt
@@ -713,9 +1097,10 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             Arc::new(SqliteDialect),
         )?;
 
-        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
-        conn.set_encryption_key(correct_encryption_key)?;
+        let conn = db.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(correct_encryption_key)),
+        )?;
 
         let rows = conn.query("SELECT * FROM secret_data")?;
         let mut row_count = 0;
@@ -782,11 +1167,10 @@ fn create_encrypted_db(
         Arc::new(SqliteDialect),
     )?;
 
-    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-    let cipher_mode = CipherMode::try_from(cipher)?;
     let key = EncryptionKey::from_hex_string(hexkey)?;
-    conn.set_encryption_cipher(cipher_mode)?;
-    conn.set_encryption_key(key)?;
+    let conn = db.connect(
+        ConnectOpts::new(turso_core::SessionRole::Superuser).with_encryption_key(Some(key)),
+    )?;
 
     conn.execute(format!(
         "CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, value TEXT)"
@@ -871,20 +1255,9 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
             CIPHER_A,
             KEY_B // wrong key!
         );
-        // Attaching may succeed (key is not validated at open time), but reading must fail
-        let attach_result = run_query(&main_db, &conn, &attach_wrong);
-        if attach_result.is_ok() {
-            let read_result = run_query_on_row(
-                &main_db,
-                &conn,
-                "SELECT value FROM aux_a.secret_a",
-                |_: &Row| {},
-            );
-            assert_that!(read_result)
-                .described_as("reading an attached database with the wrong key")
-                .is_err();
-        }
-        // If attach itself failed, that's also acceptable
+        assert_that!(run_query(&main_db, &conn, &attach_wrong))
+            .described_as("ATTACH with the wrong key")
+            .is_err();
     }
 
     // --- Test 3: Swapped keys — db_a gets key_b, db_b gets key_a ---
@@ -903,26 +1276,12 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
             KEY_A
         );
 
-        // Attach may succeed at open time; reading should fail for both
-        let _ = run_query(&main_db, &conn, &attach_a_wrong);
-        let _ = run_query(&main_db, &conn, &attach_b_wrong);
-
-        let read_a = run_query_on_row(
-            &main_db,
-            &conn,
-            "SELECT value FROM aux_a.secret_a",
-            |_: &Row| {},
-        );
-        let read_b = run_query_on_row(
-            &main_db,
-            &conn,
-            "SELECT value FROM aux_b.secret_b",
-            |_: &Row| {},
-        );
-        assert!(
-            read_a.is_err() || read_b.is_err(),
-            "At least one read with swapped keys must fail"
-        );
+        assert_that!(run_query(&main_db, &conn, &attach_a_wrong))
+            .described_as("ATTACH of the first database with swapped keys")
+            .is_err();
+        assert_that!(run_query(&main_db, &conn, &attach_b_wrong))
+            .described_as("ATTACH of the second database with swapped keys")
+            .is_err();
     }
 
     // --- Test 4: Missing hexkey in URI ---
@@ -975,9 +1334,9 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
             CIPHER_A,
             KEY_B
         );
-        let _ = run_query(&main_db, &conn, &attach_wrong);
-        // Detach (ignore error if attach failed)
-        let _ = run_query(&main_db, &conn, "DETACH aux_a");
+        assert_that!(run_query(&main_db, &conn, &attach_wrong))
+            .described_as("ATTACH with the wrong key before retrying")
+            .is_err();
 
         // Now attach with correct key
         let attach_correct = format!(
@@ -1084,17 +1443,15 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
 /// database that can be read without any encryption keys.
 #[turso_macros::test]
 fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let tmp_db = encrypted_fixture(&tmp_db, 4096);
     use tempfile::TempDir;
 
     let _ = env_logger::try_init();
     let hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
-    let cipher = "aegis256";
 
     // 1. Create an encrypted source database and insert data
     {
         let conn = tmp_db.connect_limbo();
-        conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
-        conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
 
         conn.execute("CREATE TABLE secret_data (id INTEGER PRIMARY KEY, content TEXT)")?;
         conn.execute("INSERT INTO secret_data (content) VALUES ('this was encrypted')")?;
@@ -1107,33 +1464,23 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     // 2. Demonstrate that the encrypted source CANNOT be read or vacuumed without keys
     {
-        let unauthorized_db = TempDatabase::new_with_existent(&tmp_db.path);
-        let unauthorized_conn = unauthorized_db.connect_limbo();
-
-        // Reading should fail
-        let result = unauthorized_conn.execute("SELECT * FROM secret_data");
+        let result = Database::open(
+            tmp_db.io.clone(),
+            tmp_db.path.to_str().unwrap(),
+            OpenOptions::new(Arc::new(SqliteDialect)).db_opts(tmp_db.db_opts),
+        );
         assert_that!(result)
-            .described_as("reading an encrypted database as plaintext")
             .err()
             .display_string()
-            .contains("Corrupt database");
-
-        // VACUUM INTO should also fail because it cannot read the source schema/data
-        let fail_path = dest_dir.path().join("should_fail.db");
-        let fail_path_str = fail_path.to_str().unwrap();
-        let result = unauthorized_conn.execute(format!("VACUUM INTO '{fail_path_str}'"));
-        assert_that!(result)
-            .described_as("VACUUM INTO from an encrypted database with no keys")
-            .err()
-            .display_string()
-            .contains("Corrupt database");
+            .contains("encrypted database requires an encryption key");
     }
 
     // 3. Execute VACUUM INTO using an authorized connection
     {
-        let conn = tmp_db.connect_limbo();
-        conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
-        conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
+        let conn = tmp_db.db.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(EncryptionKey::from_hex_string(hexkey)?)),
+        )?;
         conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
     }
 
@@ -1148,15 +1495,14 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
     }
 
     // 5. Prove the destination has the same content as the encrypted source.
-    // Close the source first: it was encrypted with PRAGMAs, so its open `Database`
-    // has no cipher set and cannot take a key from a new connection.
+    // Close the source first.
     let source_path = tmp_db.path.clone();
     drop(tmp_db);
     let source_hash = turso_dbhash::hash_database(
         source_path.to_str().unwrap(),
         &turso_dbhash::DbHashOptions {
             encryption: Some(EncryptionOpts {
-                cipher: cipher.to_string(),
+                cipher: CIPHER_A.to_string(),
                 hexkey: hexkey.to_string(),
             }),
             ..Default::default()
@@ -1377,13 +1723,11 @@ fn test_encrypted_db_with_data_then_enable_mvcc() -> anyhow::Result<()> {
 fn test_non_4k_page_size_encryption_enable_mvcc_after_encryption(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
+    let tmp_db = encrypted_fixture(&tmp_db, 8192);
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
 
     [
-        "PRAGMA page_size = 8192;",
-        "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
-        "PRAGMA cipher = 'aegis256';",
         "PRAGMA journal_mode = 'mvcc';",
         "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT);",
         "INSERT INTO test (value) VALUES ('Hello, World!')",
@@ -1395,19 +1739,18 @@ fn test_non_4k_page_size_encryption_enable_mvcc_after_encryption(
 
 // Regression coverage for https://github.com/tursodatabase/turso/issues/7375.
 
-fn assert_encrypted_page_size_after_key_and_cipher(
+fn assert_encrypted_page_size_selected_at_open(
     page_size: i64,
     cipher: &str,
     hexkey: &str,
 ) -> anyhow::Result<()> {
     let tmp_db = TempDatabaseBuilder::new()
         .with_opts(DatabaseOpts::new().with_encryption(true))
+        .with_encryption(cipher, hexkey)
+        .with_page_size(page_size as u32)
         .build();
 
     let conn = tmp_db.connect_limbo();
-    conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
-    conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
-    conn.execute(format!("PRAGMA page_size = {page_size}"))?;
     conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)")?;
     conn.execute("INSERT INTO t VALUES(1, randomblob(300))")?;
 
@@ -1437,22 +1780,23 @@ fn assert_encrypted_page_size_after_key_and_cipher(
 }
 
 #[turso_macros::test]
-fn test_encrypted_page_size_after_key_and_cipher(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+fn test_encrypted_page_size_selected_at_open(_tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     for page_size in [512, 4096, 65536] {
-        assert_encrypted_page_size_after_key_and_cipher(page_size, CIPHER_A, KEY_A)?;
+        assert_encrypted_page_size_selected_at_open(page_size, CIPHER_A, KEY_A)?;
     }
     // Exercise a cipher that uses a 16-byte key and different metadata size.
     let aes128_key = &KEY_A[..32];
-    assert_encrypted_page_size_after_key_and_cipher(512, "aes128gcm", aes128_key)?;
+    assert_encrypted_page_size_selected_at_open(512, "aes128gcm", aes128_key)?;
     Ok(())
 }
 
 #[turso_macros::test]
-fn test_uri_encryption_then_page_size(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+fn test_uri_encryption_rejects_page_size_changes(_tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let tmp_db = TempDatabaseBuilder::new()
         .with_opts(DatabaseOpts::new().with_encryption(true))
+        .with_encryption(CIPHER_A, KEY_A)
         .build();
 
     let uri = format!(
@@ -1466,14 +1810,14 @@ fn test_uri_encryption_then_page_size(_tmp_db: TempDatabase) -> anyhow::Result<(
             DatabaseOpts::new().with_encryption(true),
             Arc::new(SqliteDialect),
         )?;
-        conn.execute("PRAGMA page_size = 512")?;
+        assert!(conn.execute("PRAGMA page_size = 512").is_err());
         conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)")?;
         conn.execute("INSERT INTO t VALUES(1, randomblob(300))")?;
 
         let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
         assert_eq!(rows[0].0, 1);
         let ps: Vec<(i64,)> = conn.exec_rows("PRAGMA page_size");
-        assert_eq!(ps[0].0, 512);
+        assert_eq!(ps[0].0, 4096);
 
         for c in conn.cacheflush()? {
             io.wait_for_completion(c)?;
@@ -1488,7 +1832,7 @@ fn test_uri_encryption_then_page_size(_tmp_db: TempDatabase) -> anyhow::Result<(
     let rows: Vec<(i64,)> = reopened.exec_rows("SELECT count(*) FROM t");
     assert_eq!(rows[0].0, 1);
     let ps: Vec<(i64,)> = reopened.exec_rows("PRAGMA page_size");
-    assert_eq!(ps[0].0, 512);
+    assert_eq!(ps[0].0, 4096);
 
     Ok(())
 }
@@ -1542,15 +1886,11 @@ fn test_inplace_vacuum_non_4k_encryption(_tmp_db: TempDatabase) -> anyhow::Resul
     let _ = env_logger::try_init();
     let tmp_db = TempDatabaseBuilder::new()
         .with_opts(DatabaseOpts::new().with_encryption(true))
+        .with_encryption(CIPHER_A, KEY_A)
+        .with_page_size(512)
         .build();
 
     let conn = tmp_db.connect_limbo();
-    // This test covers VACUUM, so create the source DB without using the issue
-    // #7375 PRAGMA order.
-    conn.execute("PRAGMA page_size = 512")?;
-    conn.execute(format!("PRAGMA cipher = '{CIPHER_A}'"))?;
-    conn.execute(format!("PRAGMA hexkey = '{KEY_A}'"))?;
-
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)")?;
     for i in 0..100i64 {
         conn.execute(format!("INSERT INTO t VALUES({i}, randomblob(300))"))?;
@@ -1578,5 +1918,1380 @@ fn test_inplace_vacuum_non_4k_encryption(_tmp_db: TempDatabase) -> anyhow::Resul
     let rows: Vec<(i64,)> = reopened.exec_rows("SELECT count(*) FROM t");
     assert_eq!(rows[0].0, 66);
 
+    Ok(())
+}
+
+#[test]
+fn test_attach_encrypted_database_without_key_is_refused() -> anyhow::Result<()> {
+    for mvcc in [false, true] {
+        for cached in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("encrypted-attach.db");
+            let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+            let encrypted = Database::open(
+                io,
+                path.to_str().unwrap(),
+                OpenOptions::new(Arc::new(SqliteDialect))
+                    .db_opts(DatabaseOpts::new().with_encryption(true))
+                    .encryption(EncryptionOpts {
+                        cipher: CIPHER_A.to_string(),
+                        hexkey: KEY_A.to_string(),
+                    }),
+            )?;
+            let writer = encrypted.connect(
+                ConnectOpts::new(turso_core::SessionRole::Superuser)
+                    .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?)),
+            )?;
+            if mvcc {
+                writer.execute("PRAGMA journal_mode = 'mvcc'")?;
+            }
+            writer.execute("CREATE TABLE secrets(value TEXT)")?;
+            writer.execute("INSERT INTO secrets VALUES ('protected value')")?;
+            let keep_open = cached.then_some((encrypted, writer));
+            let main = TempDatabase::builder()
+                .with_opts(DatabaseOpts::new().with_encryption(true).with_attach(true))
+                .with_mvcc(mvcc)
+                .build();
+            let conn = main.connect_limbo();
+            assert!(conn
+                .execute(format!("ATTACH '{}' AS secret", path.display()))
+                .is_err());
+            let databases: Vec<(i64, String, String)> = conn.exec_rows("PRAGMA database_list");
+            assert!(databases.iter().all(|(_, name, _)| name != "secret"));
+            drop(keep_open);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_cached_encrypted_database_validates_each_connection() -> anyhow::Result<()> {
+    for mvcc in [false, true] {
+        let tmp = TempDatabaseBuilder::new()
+            .with_encryption(CIPHER_A, KEY_A)
+            .build();
+        let writer = tmp.connect_limbo();
+        if mvcc {
+            writer.execute("PRAGMA journal_mode = 'mvcc'")?;
+        }
+        writer.execute("CREATE TABLE secrets(value TEXT)")?;
+        writer.execute("INSERT INTO secrets VALUES ('protected value')")?;
+
+        let open = |encryption| {
+            Database::open(
+                tmp.io.clone(),
+                tmp.path.to_str().unwrap(),
+                OpenOptions::new(Arc::new(SqliteDialect))
+                    .db_opts(tmp.db_opts)
+                    .encryption(encryption),
+            )
+        };
+        assert!(open(None).is_err());
+        assert!(open(Some(EncryptionOpts {
+            cipher: CIPHER_B.to_string(),
+            hexkey: KEY_A.to_string(),
+        }))
+        .is_err());
+
+        let cached = open(Some(EncryptionOpts {
+            cipher: CIPHER_A.to_string(),
+            hexkey: KEY_A.to_string(),
+        }))?;
+        assert!(Arc::ptr_eq(&cached, &tmp.db));
+        assert!(cached
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .is_err());
+        let wrong = cached.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_B)?)),
+        );
+        assert!(matches!(
+            wrong,
+            Err(LimboError::CompletionError(
+                CompletionError::DecryptionError { .. }
+            ))
+        ));
+        let reader = cached.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?)),
+        )?;
+        let rows: Vec<(String,)> = reader.exec_rows("SELECT value FROM secrets");
+        assert_eq!(rows, [("protected value".to_string(),)]);
+        assert!(Arc::ptr_eq(
+            &reader.current_schema(),
+            &writer.current_schema()
+        ));
+        let connect_async = |key: Option<EncryptionKey>| -> turso_core::Result<_> {
+            let mut state = turso_core::ConnectAsyncState::new();
+            let options =
+                ConnectOpts::new(turso_core::SessionRole::Superuser).with_encryption_key(key);
+            loop {
+                match cached
+                    .connect_async(options.clone(), &mut state)
+                    .map_err(|err| *err)?
+                {
+                    IOResult::Done(conn) => break Ok(conn),
+                    IOResult::IO(pending) => pending.wait(&*tmp.io)?,
+                }
+            }
+        };
+        assert!(connect_async(None).is_err());
+        assert!(connect_async(Some(EncryptionKey::from_hex_string(KEY_B)?)).is_err());
+        let async_reader = connect_async(Some(EncryptionKey::from_hex_string(KEY_A)?))?;
+        let rows: Vec<(String,)> = async_reader.exec_rows("SELECT value FROM secrets");
+        assert_eq!(rows, [("protected value".to_string(),)]);
+        let wrong_uri = format!(
+            "file:{}?cipher={CIPHER_A}&hexkey={KEY_B}",
+            tmp.path.display()
+        );
+        assert!(
+            turso_core::Connection::from_uri(&wrong_uri, tmp.db_opts, Arc::new(SqliteDialect),)
+                .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_encrypted_database_open_in_progress_rejects_invalid_credentials() -> anyhow::Result<()> {
+    use crate::queued_io::QueuedIo;
+
+    for creator_finishes in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("opening-encrypted.db");
+        let path_str = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(QueuedIo::new_with_io(Arc::new(PlatformIO::new()?)));
+        let file = io.open_file(path_str, OpenFlags::Create, true)?;
+        let storage = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
+        let base = OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(storage)
+            .db_opts(DatabaseOpts::new().with_encryption(true));
+        let encrypted = base.clone().encryption(EncryptionOpts {
+            cipher: CIPHER_A.to_string(),
+            hexkey: KEY_A.to_string(),
+        });
+        let creator_options = encrypted
+            .clone()
+            .db_opts(DatabaseOpts::new().with_encryption(true).with_mvcc(true));
+        let wrong = base.clone().encryption(EncryptionOpts {
+            cipher: CIPHER_A.to_string(),
+            hexkey: KEY_B.to_string(),
+        });
+        let mut creator = turso_core::OpenDbAsyncState::new();
+        loop {
+            match Database::open_async(&mut creator, io.clone(), path_str, &creator_options)? {
+                IOResult::Done(_) => panic!("creator must yield before publishing the database"),
+                IOResult::IO(pending) => pending.wait(io.as_ref())?,
+            }
+            if std::fs::metadata(&path)?.len() > 0 {
+                break;
+            }
+        }
+        assert_eq!(&std::fs::read(&path)?[..5], b"Turso");
+
+        for options in [&base, &wrong] {
+            let mut reader = turso_core::OpenDbAsyncState::new();
+            let IOResult::IO(pending) =
+                Database::open_async(&mut reader, io.clone(), path_str, options)?
+            else {
+                panic!("reader must wait while the creator is opening the database");
+            };
+            assert!(pending.is_explicit_yield());
+        }
+        let drive = |state: &mut turso_core::OpenDbAsyncState,
+                     options: &OpenOptions|
+         -> turso_core::Result<Arc<Database>> {
+            loop {
+                match Database::open_async(state, io.clone(), path_str, options)
+                    .map_err(|err| *err)?
+                {
+                    IOResult::Done(db) => break Ok(db),
+                    IOResult::IO(pending) => pending.wait(io.as_ref())?,
+                }
+            }
+        };
+        let owner = if creator_finishes {
+            Some(drive(&mut creator, &creator_options)?)
+        } else {
+            None
+        };
+        drop(creator);
+        assert!(drive(&mut turso_core::OpenDbAsyncState::new(), &base).is_err());
+        if let Ok(db) = drive(&mut turso_core::OpenDbAsyncState::new(), &wrong) {
+            assert!(db
+                .connect(
+                    ConnectOpts::new(turso_core::SessionRole::Superuser)
+                        .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_B)?)),
+                )
+                .is_err());
+        }
+        let db = drive(&mut turso_core::OpenDbAsyncState::new(), &encrypted)?;
+        if let Some(owner) = owner {
+            assert!(Arc::ptr_eq(&db, &owner));
+        }
+        let conn = db.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?)),
+        )?;
+        conn.execute("CREATE TABLE correct_key(value TEXT)")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_new_encrypted_database_checks_keys_after_first_write() -> anyhow::Result<()> {
+    let tmp = TempDatabaseBuilder::new()
+        .with_encryption(CIPHER_A, KEY_A)
+        .with_page_size(8192)
+        .build();
+    let writer = tmp.connect_limbo();
+    assert!(tmp
+        .db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .is_err());
+    assert_wrong_key_refusal(
+        tmp.db.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_B)?)),
+        ),
+    );
+    let reader = tmp.connect_limbo();
+    assert_eq!(std::fs::metadata(&tmp.path)?.len(), 0);
+    reader.execute("PRAGMA journal_mode = 'mvcc'")?;
+    writer.execute("CREATE TABLE secrets(value TEXT)")?;
+    writer.execute("INSERT INTO secrets VALUES ('protected value')")?;
+    let bytes = std::fs::read(&tmp.path)?;
+    assert_eq!(&bytes[..5], b"Turso");
+    assert_eq!(u16::from_be_bytes([bytes[16], bytes[17]]), 8192);
+    assert!(tmp
+        .db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .is_err());
+    assert_wrong_key_refusal(
+        tmp.db.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_B)?)),
+        ),
+    );
+    let rows: Vec<(String,)> = reader.exec_rows("SELECT value FROM secrets");
+    assert_eq!(rows, [("protected value".to_string(),)]);
+    assert!(Arc::ptr_eq(
+        &reader.current_schema(),
+        &writer.current_schema()
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_first_encrypted_page_write_is_not_replaced_by_another_connection() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("encrypted.db");
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+    let db = Database::open(
+        io.clone(),
+        path.to_str().unwrap(),
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(DatabaseOpts::new().with_encryption(true))
+            .encryption(EncryptionOpts {
+                cipher: CIPHER_A.into(),
+                hexkey: KEY_A.into(),
+            }),
+    )?;
+    let first = db.connect(
+        ConnectOpts::new(turso_core::SessionRole::Superuser)
+            .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?)),
+    )?;
+    let IOResult::IO(pending) = first.get_pager().maybe_allocate_page1()? else {
+        panic!("first page allocation must write page 1");
+    };
+    pending.wait(&*io)?;
+    assert_wrong_key_refusal(
+        db.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_B)?)),
+        ),
+    );
+    first.execute("CREATE TABLE secrets(value TEXT)")?;
+    first.execute("INSERT INTO secrets VALUES ('protected value')")?;
+    let rows: Vec<(String,)> = first.exec_rows("SELECT value FROM secrets");
+    assert_eq!(rows, [("protected value".to_string(),)]);
+    Ok(())
+}
+
+#[test]
+fn test_failed_encryption_setup_preserves_plaintext_database() -> anyhow::Result<()> {
+    let tmp = TempDatabase::new_empty();
+    let conn = tmp.connect_limbo();
+    conn.execute("CREATE TABLE data(value TEXT)")?;
+    conn.execute("INSERT INTO data VALUES ('original value')")?;
+    assert!(conn.pragma_update("cipher", "'aegis256'").is_err());
+    assert!(conn.pragma_update("hexkey", format!("'{KEY_A}'")).is_err());
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT value FROM data");
+    assert_eq!(rows, [("original value".to_string(),)]);
+    Ok(())
+}
+
+#[test]
+fn test_failed_initial_write_keeps_encryption_identity() -> anyhow::Result<()> {
+    use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+
+    for failure in [QueuedIoOpKind::Pwrite, QueuedIoOpKind::Sync] {
+        let io = Arc::new(QueuedIo::new());
+        let path = ":memory:encrypted-initialization-error";
+        let db = Database::open(
+            io.clone(),
+            path,
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .flags(OpenFlags::Create)
+                .db_opts(DatabaseOpts::new().with_encryption(true))
+                .encryption(EncryptionOpts {
+                    cipher: CIPHER_A.to_string(),
+                    hexkey: KEY_A.to_string(),
+                }),
+        )?;
+        let conn = db.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?)),
+        )?;
+        io.fault_after(path, failure, 0);
+        assert!(conn.execute("CREATE TABLE secrets(value TEXT)").is_err());
+        io.clear_fault();
+        let page_size = conn.get_page_size().get();
+        assert!(conn.execute("PRAGMA page_size = 8192").is_err());
+        assert_eq!(conn.get_page_size().get(), page_size);
+        assert!(db
+            .connect(
+                ConnectOpts::new(turso_core::SessionRole::Superuser)
+                    .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_B)?)),
+            )
+            .is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn test_encryption_validation_recovers_from_read_error() -> anyhow::Result<()> {
+    use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+    for asynchronous in [false, true] {
+        let io = Arc::new(QueuedIo::new());
+        let db = Database::open(
+            io.clone(),
+            ":memory:encryption-validation-error",
+            ReadLockDatabase::options_for(KEY_A),
+        )?;
+        let opts = ConnectOpts::new(turso_core::SessionRole::Superuser)
+            .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?));
+        let writer = db.connect(opts.clone())?;
+        writer.execute("CREATE TABLE secrets(value TEXT)")?;
+        writer.execute("INSERT INTO secrets VALUES ('protected value')")?;
+        io.fault_after("", QueuedIoOpKind::Pread, 0);
+        if asynchronous {
+            let mut state = turso_core::ConnectAsyncState::new();
+            let result: turso_core::Result<()> = loop {
+                match db.connect_async(opts.clone(), &mut state) {
+                    Ok(IOResult::Done(_)) => break Ok(()),
+                    Ok(IOResult::IO(pending)) => {
+                        if let Err(error) = pending.wait(io.as_ref()) {
+                            break Err(error);
+                        }
+                    }
+                    Err(error) => break Err(*error),
+                }
+            };
+            assert!(result.is_err());
+        } else {
+            assert!(db.connect(opts.clone()).is_err());
+        }
+        io.clear_fault();
+        let reader = db.connect(opts)?;
+        let rows: Vec<(String,)> = reader.exec_rows("SELECT value FROM secrets");
+        assert_eq!(rows, [("protected value".to_string(),)]);
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_wrong_key_is_rejected_after_dropping_initial_writer() -> anyhow::Result<()> {
+    use crate::queued_io::QueuedIo;
+
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open(
+        io.clone(),
+        ":memory:encrypted-initialization-drop",
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .flags(OpenFlags::Create)
+            .db_opts(DatabaseOpts::new().with_encryption(true))
+            .encryption(EncryptionOpts {
+                cipher: CIPHER_A.to_string(),
+                hexkey: KEY_A.to_string(),
+            }),
+    )?;
+    let first = db.connect(
+        ConnectOpts::new(turso_core::SessionRole::Superuser)
+            .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?)),
+    )?;
+    let IOResult::IO(pending) = first.get_pager().maybe_allocate_page1()? else {
+        panic!("first page allocation must write page 1");
+    };
+    drop(first);
+    pending.wait(&*io)?;
+    assert!(db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .is_err());
+    assert_wrong_key_refusal(
+        db.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_B)?)),
+        ),
+    );
+    Ok(())
+}
+
+// Refusing a wrong key must release the WAL read lock so a valid connection
+// can truncate the WAL. Found by the encryption fuzzer; the refusal leaked
+// this lock on main (4b3befbd6) as well.
+
+#[test]
+fn test_wrong_key_connection_releases_its_read_lock() -> anyhow::Result<()> {
+    let database = ReadLockDatabase::new("wrong-key-connection")?;
+    let refused = database.db.connect(
+        ConnectOpts::new(turso_core::SessionRole::Superuser)
+            .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_B)?)),
+    );
+    assert_wrong_key_refusal(refused);
+    database.assert_truncate_checkpoint_succeeds("after a wrong-key connection was refused");
+    Ok(())
+}
+
+#[test]
+fn test_wrong_key_connection_releases_its_read_lock_when_page_one_is_in_the_main_file(
+) -> anyhow::Result<()> {
+    let database = ReadLockDatabase::new("wrong-key-connection-main-file")?;
+    database.assert_truncate_checkpoint_succeeds("before any refusal");
+    let refused = database.db.connect(
+        ConnectOpts::new(turso_core::SessionRole::Superuser)
+            .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_B)?)),
+    );
+    assert_wrong_key_refusal(refused);
+    database
+        .owner
+        .execute("INSERT INTO secrets VALUES ('more')")?;
+    database.assert_truncate_checkpoint_succeeds("after a wrong-key connection was refused");
+    Ok(())
+}
+
+#[test]
+fn test_wrong_key_open_of_a_cached_database_releases_its_read_lock() -> anyhow::Result<()> {
+    let database = ReadLockDatabase::new("wrong-key-cached-open")?;
+    let refused = Database::open(database.io.clone(), &database.path, database.options(KEY_B));
+    assert_wrong_key_refusal(refused);
+    database.assert_truncate_checkpoint_succeeds("after a wrong-key open was refused");
+    Ok(())
+}
+
+#[test]
+fn test_wrong_key_attach_releases_its_read_lock() -> anyhow::Result<()> {
+    let database = ReadLockDatabase::new("wrong-key-attach")?;
+    let main = Database::open(
+        database.io.clone(),
+        &format!("{}-main", database.path),
+        OpenOptions::new(Arc::new(SqliteDialect)).db_opts(
+            DatabaseOpts::new()
+                .with_encryption(ENABLE_ENCRYPTION)
+                .with_attach(true),
+        ),
+    )?;
+    let main = main.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
+    let refused = main.execute(format!(
+        "ATTACH 'file:{}?cipher=aegis256&hexkey={KEY_B}' AS aux",
+        database.path
+    ));
+    assert!(
+        matches!(
+            refused,
+            Err(LimboError::CompletionError(
+                CompletionError::DecryptionError { .. }
+            ))
+        ),
+        "ATTACH with a wrong key must fail to decrypt page 1: {refused:?}"
+    );
+    database.assert_truncate_checkpoint_succeeds("after a wrong-key ATTACH was refused");
+    Ok(())
+}
+
+#[test]
+fn test_missing_key_refusals_leave_no_read_lock() -> anyhow::Result<()> {
+    let database = ReadLockDatabase::new("missing-key")?;
+    let refused = database
+        .db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser));
+    assert!(
+        matches!(&refused, Err(LimboError::InvalidArgument(message)) if message.contains("requires an encryption key")),
+        "a keyless connection must be refused: {:?}",
+        refused.err()
+    );
+    let main = Database::open(
+        database.io.clone(),
+        &format!("{}-main", database.path),
+        OpenOptions::new(Arc::new(SqliteDialect)).db_opts(
+            DatabaseOpts::new()
+                .with_encryption(ENABLE_ENCRYPTION)
+                .with_attach(true),
+        ),
+    )?;
+    let main = main.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
+    assert!(main
+        .execute(format!("ATTACH '{}' AS aux", database.path))
+        .is_err());
+    database.assert_truncate_checkpoint_succeeds("after missing-key refusals");
+    Ok(())
+}
+
+/// An encrypted WAL database (AEGIS-256, KEY_A) with one row, kept open
+/// through a valid connection.
+struct ReadLockDatabase {
+    inner: Arc<turso_core::MemoryIO>,
+    io: Arc<crate::queued_io::QueuedIo>,
+    path: String,
+    db: Arc<Database>,
+    owner: Arc<turso_core::Connection>,
+}
+
+impl ReadLockDatabase {
+    fn new(name: &str) -> anyhow::Result<Self> {
+        let inner = Arc::new(turso_core::MemoryIO::new());
+        let io = Arc::new(crate::queued_io::QueuedIo::new_with_io(inner.clone()));
+        // Not a `:memory:` name: ATTACH of such a name opens a new empty database.
+        let path = format!(":read-lock-{name}:");
+        let db = Database::open(io.clone(), &path, Self::options_for(KEY_A))?;
+        let owner = db.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?)),
+        )?;
+        owner.execute("CREATE TABLE secrets(value TEXT)")?;
+        owner.execute("INSERT INTO secrets VALUES ('protected value')")?;
+        Ok(Self {
+            inner,
+            io,
+            path,
+            db,
+            owner,
+        })
+    }
+
+    fn options(&self, hexkey: &str) -> OpenOptions {
+        Self::options_for(hexkey)
+    }
+
+    fn options_for(hexkey: &str) -> OpenOptions {
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(
+                DatabaseOpts::new()
+                    .with_encryption(ENABLE_ENCRYPTION)
+                    .with_attach(true),
+            )
+            .encryption(EncryptionOpts {
+                cipher: "aegis256".to_string(),
+                hexkey: hexkey.to_string(),
+            })
+    }
+
+    /// No other connection may hold a read lock: the checkpoint must not be
+    /// busy and must leave an empty WAL.
+    fn assert_truncate_checkpoint_succeeds(&self, when: &str) {
+        let rows = self
+            .owner
+            .prepare("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        let busy = rows[0][0].to_string();
+        assert_eq!(busy, "0", "TRUNCATE checkpoint was busy {when}: {rows:?}");
+        let wal = self
+            .inner
+            .open_file(&format!("{}-wal", self.path), OpenFlags::Create, false)
+            .unwrap();
+        assert_eq!(wal.size().unwrap(), 0, "the WAL was not truncated {when}");
+    }
+}
+
+#[test]
+fn test_cached_database_open_async_rejects_wrong_encryption_key() -> anyhow::Result<()> {
+    let tmp = TempDatabaseBuilder::new()
+        .with_encryption(CIPHER_A, KEY_A)
+        .with_mvcc(true)
+        .build();
+    let owner = tmp.connect_limbo();
+    owner.execute("CREATE TABLE secrets(value TEXT)")?;
+    owner.execute("INSERT INTO secrets VALUES ('protected value')")?;
+    let path = tmp.path.to_str().unwrap();
+    let file = tmp.io.open_file(path, OpenFlags::default(), false)?;
+    let options = OpenOptions::new(Arc::new(SqliteDialect))
+        .storage(Arc::new(turso_core::storage::database::DatabaseFile::new(
+            file,
+        )))
+        .db_opts(tmp.db_opts)
+        .encryption(EncryptionOpts {
+            cipher: CIPHER_A.to_string(),
+            hexkey: KEY_B.to_string(),
+        });
+    let mut state = turso_core::OpenDbAsyncState::new();
+    let opened: turso_core::Result<Arc<Database>> = loop {
+        match Database::open_async(&mut state, tmp.io.clone(), path, &options)
+            .map_err(|error| *error)
+        {
+            Ok(IOResult::Done(database)) => break Ok(database),
+            Ok(IOResult::IO(pending)) => pending.wait(tmp.io.as_ref())?,
+            Err(error) => break Err(error),
+        }
+    };
+
+    assert_wrong_key_refusal(opened);
+    Ok(())
+}
+
+fn assert_wrong_key_refusal<T>(refused: turso_core::Result<T>) {
+    assert!(
+        matches!(
+            refused,
+            Err(LimboError::CompletionError(
+                CompletionError::DecryptionError { .. }
+            ))
+        ),
+        "a wrong key must fail to decrypt page 1"
+    );
+}
+
+#[test]
+fn cached_open_with_different_io_uses_only_the_verifier() -> anyhow::Result<()> {
+    use crate::queued_io::QueuedIo;
+    let tmp = TempDatabaseBuilder::new()
+        .with_encryption(CIPHER_A, KEY_A)
+        .with_page_size(8192)
+        .build();
+    let owner = tmp.connect_limbo();
+    owner.execute("PRAGMA journal_mode = 'mvcc'")?;
+    owner.execute("CREATE TABLE secrets(value TEXT)")?;
+    owner.execute("INSERT INTO secrets VALUES ('protected value')")?;
+    owner.execute("PRAGMA user_version = 42")?;
+    let other_io = Arc::new(QueuedIo::new_with_io(Arc::new(PlatformIO::new()?)));
+    let options = |key: &str| {
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(tmp.db_opts)
+            .encryption(EncryptionOpts {
+                cipher: CIPHER_A.into(),
+                hexkey: key.into(),
+            })
+    };
+    assert_wrong_key_refusal(Database::open(
+        other_io.clone(),
+        tmp.path.to_str().unwrap(),
+        options(KEY_B),
+    ));
+    let cached = Database::open(other_io.clone(), tmp.path.to_str().unwrap(), options(KEY_A))?;
+    assert!(Arc::ptr_eq(&cached, &tmp.db));
+    let mut state = turso_core::OpenDbAsyncState::new();
+    let options = options(KEY_A).storage(tmp.db.db_file.clone());
+    let IOResult::Done(cached) = Database::open_async(
+        &mut state,
+        other_io.clone(),
+        tmp.path.to_str().unwrap(),
+        &options,
+    )?
+    else {
+        panic!("cached authentication must not yield");
+    };
+    assert!(Arc::ptr_eq(&cached, &tmp.db));
+    assert!(other_io.records().is_empty());
+    assert!(other_io.pending_events().is_empty());
+    assert_eq!(owner.get_page_size().get(), 8192);
+    let version: Vec<(i64,)> = owner.exec_rows("PRAGMA user_version");
+    assert_eq!(version, [(42,)]);
+    Ok(())
+}
+
+#[test]
+fn connect_async_yields_and_cancellation_releases_read_transactions() -> anyhow::Result<()> {
+    for wrong in [false, true] {
+        let database = ReadLockDatabase::new(if wrong {
+            "cancel-wrong"
+        } else {
+            "cancel-correct"
+        })?;
+        let opts = ConnectOpts::new(turso_core::SessionRole::Superuser).with_encryption_key(Some(
+            EncryptionKey::from_hex_string(if wrong { KEY_B } else { KEY_A })?,
+        ));
+        let mut cancelled = 0;
+        for stop_after in 0..16 {
+            let mut state = turso_core::ConnectAsyncState::new();
+            let mut finished = false;
+            for step in 0..=stop_after {
+                match database.db.connect_async(opts.clone(), &mut state) {
+                    Ok(IOResult::IO(pending)) if step < stop_after => {
+                        let _ = pending.wait(database.io.as_ref());
+                    }
+                    Ok(IOResult::IO(pending)) => {
+                        assert!(
+                            !pending.finished(),
+                            "async connect must return before page I/O completes"
+                        );
+                        cancelled += 1;
+                    }
+                    Ok(IOResult::Done(_)) => {
+                        assert!(!wrong);
+                        finished = true;
+                        break;
+                    }
+                    Err(error) => {
+                        assert!(wrong);
+                        assert!(matches!(
+                            *error,
+                            LimboError::CompletionError(CompletionError::DecryptionError { .. })
+                        ));
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            drop(state);
+            database.io.drain_all()?;
+            database.assert_truncate_checkpoint_succeeds("after connect state cancellation");
+            let rows: Vec<(String,)> = database.owner.exec_rows("SELECT value FROM secrets");
+            assert_eq!(rows, [("protected value".into(),)]);
+            if finished {
+                break;
+            }
+        }
+        if wrong {
+            assert_eq!(cancelled, 0, "a cached wrong key must fail before page I/O");
+        } else {
+            assert!(cancelled > 0, "reading page 1 must yield");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn encrypted_reload_accepts_an_unwritten_database() -> anyhow::Result<()> {
+    for cipher in [CIPHER_A, CIPHER_B] {
+        let tmp = TempDatabaseBuilder::new()
+            .with_encryption(cipher, KEY_A)
+            .build();
+        let owner = tmp.connect_limbo();
+        assert_eq!(std::fs::metadata(&tmp.path)?.len(), 0);
+        assert!(tmp.db.reload_wal_after_external_restore().is_err());
+        assert!(tmp
+            .db
+            .reload_wal_after_external_restore_with_encryption_key(Some(
+                EncryptionKey::from_hex_string(KEY_B)?,
+            ))
+            .is_err());
+        std::fs::write(&tmp.path, [0; 16])?;
+        assert!(owner.reload_wal_after_external_restore().is_err());
+        assert_eq!(std::fs::read(&tmp.path)?, [0; 16]);
+        std::fs::write(&tmp.path, [])?;
+        let foreign = TempDatabaseBuilder::new()
+            .with_encryption(cipher, KEY_B)
+            .build();
+        let foreign_owner = foreign.connect_limbo();
+        foreign_owner.execute("CREATE TABLE secrets(value TEXT)")?;
+        foreign_owner.execute("INSERT INTO secrets VALUES ('foreign')")?;
+        let wal_path = format!("{}-wal", tmp.path.display());
+        let original_wal = std::fs::read(&wal_path)?;
+        let foreign_wal = std::fs::read(format!("{}-wal", foreign.path.display()))?;
+        assert!(!foreign_wal.is_empty());
+        std::fs::write(&wal_path, &foreign_wal)?;
+        let error = owner.reload_wal_after_external_restore().unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("decrypt"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&wal_path)?, foreign_wal);
+        std::fs::write(&wal_path, original_wal)?;
+        owner.reload_wal_after_external_restore()?;
+        assert_eq!(std::fs::metadata(&tmp.path)?.len(), 0);
+        owner.execute("CREATE TABLE secrets(value TEXT)")?;
+        owner.execute("INSERT INTO secrets VALUES ('after reload')")?;
+        owner.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
+        assert_eq!(rows, [("after reload".into(),)]);
+    }
+    Ok(())
+}
+
+#[test]
+fn encrypted_reload_with_retained_completions() -> anyhow::Result<()> {
+    for cipher in [CIPHER_A, CIPHER_B] {
+        for mvcc in [false, true] {
+            let database = Database::open(
+                Arc::new(crate::queued_io::QueuedIo::new()),
+                "retained-completions.db",
+                attach_matrix_options(Some(cipher), mvcc, KEY_A),
+            )?;
+            let owner = database.connect(
+                ConnectOpts::new(SessionRole::Superuser)
+                    .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?)),
+            )?;
+            owner.execute("CREATE TABLE secrets(value TEXT)")?;
+            owner.execute("INSERT INTO secrets VALUES ('before reload')")?;
+            owner.reload_wal_after_external_restore()?;
+            owner.publish_schema_after_external_restore()?;
+            let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
+            assert_eq!(rows, [("before reload".into(),)]);
+            owner.execute("INSERT INTO secrets VALUES ('after reload')")?;
+            owner.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            let rows: Vec<(i64,)> = owner.exec_rows("SELECT count(*) FROM secrets");
+            assert_eq!(rows, [(2,)]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn encrypted_restore_recovers_torn_sidecar_tail() -> anyhow::Result<()> {
+    for cipher in [CIPHER_A, CIPHER_B] {
+        for mvcc in [false, true] {
+            let target = TempDatabaseBuilder::new()
+                .with_encryption(cipher, KEY_A)
+                .with_mvcc(mvcc)
+                .build();
+            let owner = target.connect_limbo();
+            owner.execute("CREATE TABLE secrets(value TEXT)")?;
+            owner.execute("INSERT INTO secrets VALUES ('checkpointed')")?;
+            owner.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            let committed = "committed".repeat(16_384);
+            owner.execute(format!("INSERT INTO secrets VALUES ('{committed}')"))?;
+            owner.reload_wal_after_external_restore()?;
+            owner.publish_schema_after_external_restore()?;
+            owner.execute(format!("INSERT INTO secrets VALUES ('{committed}')"))?;
+            let suffix = if mvcc { "-log" } else { "-wal" };
+            let path = format!("{}{suffix}", target.path.display());
+            let mut bytes = std::fs::read(&path)?;
+            let damaged_byte = bytes.len() - 16;
+            bytes[damaged_byte] ^= 1;
+            std::fs::write(path, bytes)?;
+            let fresh_dir = tempfile::tempdir()?;
+            let fresh_path = fresh_dir.path().join("fresh.db");
+            copy_encrypted_test_files(&target, &fresh_path)?;
+            assert_eq!(fresh_encrypted_rows(&fresh_path, cipher)?.len(), 2);
+            owner.reload_wal_after_external_restore()?;
+            owner.publish_schema_after_external_restore()?;
+            let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
+            assert_eq!(rows, [("checkpointed".into(),), (committed,)]);
+            owner.execute("INSERT INTO secrets VALUES ('after recovery')")?;
+            owner.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
+            assert_eq!(rows.len(), 3);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn encrypted_recovery_rejects_files_encrypted_with_another_key() -> anyhow::Result<()> {
+    for cipher in [CIPHER_A, CIPHER_B] {
+        for mvcc in [false, true] {
+            let target = TempDatabaseBuilder::new()
+                .with_encryption(cipher, KEY_A)
+                .with_mvcc(mvcc)
+                .build();
+            let source = TempDatabaseBuilder::new()
+                .with_encryption(cipher, KEY_B)
+                .with_mvcc(mvcc)
+                .build();
+            let owner = target.connect_limbo();
+            let foreign = source.connect_limbo();
+            for conn in [&owner, &foreign] {
+                conn.execute("CREATE TABLE secrets(value TEXT)")?;
+                conn.execute("INSERT INTO secrets VALUES ('protected value')")?;
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+                conn.execute("INSERT INTO secrets VALUES ('in sidecar'), ('in sidecar2')")?;
+            }
+            let sidecar_suffix = if mvcc { "-log" } else { "-wal" };
+            let sidecar_path = format!("{}{sidecar_suffix}", target.path.display());
+            let mut incomplete_tail = std::fs::read(&sidecar_path)?;
+            incomplete_tail.extend_from_slice(&[0; 7]);
+            std::fs::write(&sidecar_path, incomplete_tail)?;
+            owner.reload_wal_after_external_restore()?;
+            owner.publish_schema_after_external_restore()?;
+            let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
+            assert_eq!(rows.len(), 3, "incomplete tail lost committed rows");
+            for suffix in ["", sidecar_suffix] {
+                let target_path = format!("{}{suffix}", target.path.display());
+                let source_path = format!("{}{suffix}", source.path.display());
+                let original = std::fs::read(&target_path)?;
+                let restored = std::fs::read(source_path)?;
+                std::fs::write(&target_path, &restored)?;
+                let result = owner.reload_wal_after_external_restore();
+                let after_reload = std::fs::read(&target_path)?;
+                let fresh_dir = tempfile::tempdir()?;
+                let fresh_path = fresh_dir.path().join("fresh.db");
+                copy_encrypted_test_files(&target, &fresh_path)?;
+                std::fs::write(&target_path, original)?;
+                let error = result.expect_err(&format!("accepted {cipher} mvcc={mvcc} {suffix}"));
+                assert!(
+                    error.to_string().to_ascii_lowercase().contains("decrypt"),
+                    "{error}"
+                );
+                assert_eq!(after_reload, restored, "rejected restore changed the file");
+                let error = fresh_encrypted_rows(&fresh_path, cipher)
+                    .expect_err("fresh recovery accepted files encrypted under another key");
+                assert!(error.to_string().to_ascii_lowercase().contains("decrypt"));
+                assert_eq!(
+                    std::fs::read(format!("{}{suffix}", fresh_path.display()))?,
+                    restored,
+                    "rejected fresh recovery changed the file"
+                );
+                let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
+                assert_eq!(rows.len(), 3, "rejected restore changed the live database");
+                owner.reload_wal_after_external_restore()?;
+                owner.publish_schema_after_external_restore()?;
+                let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
+                assert_eq!(
+                    rows,
+                    [
+                        ("protected value".into(),),
+                        ("in sidecar".into(),),
+                        ("in sidecar2".into(),)
+                    ]
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_encrypted_test_files(source: &TempDatabase, path: &std::path::Path) -> anyhow::Result<()> {
+    for suffix in ["", "-wal", "-log"] {
+        let source_path = format!("{}{suffix}", source.path.display());
+        if std::path::Path::new(&source_path).exists() {
+            std::fs::copy(source_path, format!("{}{suffix}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn fresh_encrypted_rows(
+    path: &std::path::Path,
+    cipher: &str,
+) -> anyhow::Result<Vec<Vec<turso_core::Value>>> {
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::None,
+        DatabaseOpts::new().with_encryption(true),
+        Some(EncryptionOpts {
+            cipher: cipher.into(),
+            hexkey: KEY_A.into(),
+        }),
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect(
+        ConnectOpts::new(SessionRole::Superuser)
+            .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?)),
+    )?;
+    Ok(conn
+        .prepare("SELECT value FROM secrets")?
+        .run_collect_rows()?)
+}
+
+#[test]
+fn encrypted_restore_requires_the_current_key_and_preserves_page_layout() -> anyhow::Result<()> {
+    for cipher in [CIPHER_A, CIPHER_B] {
+        for mvcc in [false, true] {
+            let tmp = TempDatabaseBuilder::new()
+                .with_encryption(cipher, KEY_A)
+                .with_mvcc(mvcc)
+                .build();
+            let owner = tmp.connect_limbo();
+            owner.execute("CREATE TABLE secrets(value TEXT)")?;
+            owner.execute("INSERT INTO secrets VALUES ('protected value')")?;
+            owner.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            let before: Vec<_> = [
+                tmp.path.clone(),
+                std::path::PathBuf::from(format!("{}-wal", tmp.path.display())),
+                std::path::PathBuf::from(format!("{}-log", tmp.path.display())),
+            ]
+            .into_iter()
+            .map(|path| (path.clone(), std::fs::read(path).ok()))
+            .collect();
+            assert!(tmp.db.reload_wal_after_external_restore().is_err());
+            assert!(tmp
+                .db
+                .reload_wal_after_external_restore_with_encryption_key(Some(
+                    EncryptionKey::from_hex_string(KEY_B)?,
+                ))
+                .is_err());
+            let original = std::fs::read(&tmp.path)?;
+            for change_page_size in [false, true] {
+                let mut replaced = original.clone();
+                if change_page_size {
+                    replaced[16..18].copy_from_slice(&8192u16.to_be_bytes());
+                } else {
+                    replaced[20] ^= 1;
+                }
+                std::fs::write(&tmp.path, replaced)?;
+                let error = owner.reload_wal_after_external_restore().unwrap_err();
+                assert!(error.to_string().contains("page layout"), "{error}");
+                std::fs::write(&tmp.path, &original)?;
+            }
+            owner.reload_wal_after_external_restore()?;
+            owner.publish_schema_after_external_restore()?;
+            for (path, bytes) in before {
+                assert_eq!(std::fs::read(path).ok(), bytes);
+            }
+            let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
+            assert_eq!(rows, [("protected value".into(),)]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn memory_uri_credentials_and_attach_feature_gate_are_checked() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_encryption(true);
+    for uri in ["file::memory:?cipher=aegis256", "file::memory:?hexkey=01"] {
+        assert!(turso_core::Connection::from_uri(uri, opts, Arc::new(SqliteDialect)).is_err());
+    }
+    let uri = format!("file::memory:?cipher={CIPHER_A}&hexkey={KEY_A}");
+    let (_, connection) = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect))?;
+    assert_eq!(
+        connection.get_encryption_cipher_mode().unwrap().to_string(),
+        CIPHER_A
+    );
+    let tmp = TempDatabaseBuilder::new()
+        .with_opts(DatabaseOpts::new().with_attach(true))
+        .build();
+    let conn = tmp.connect_limbo();
+    let path = tmp.path.with_file_name("disabled-attachment.db");
+    conn.execute(format!(
+        "ATTACH 'file:{}?cipher={CIPHER_A}&hexkey={KEY_A}' AS aux",
+        path.display()
+    ))?;
+    conn.execute("CREATE TABLE aux.data(value)")?;
+    conn.execute("DETACH aux")?;
+    assert!(!std::fs::read(&path)?.starts_with(b"SQLite format 3\0"));
+    Ok(())
+}
+
+#[test]
+fn vacuum_rejects_encrypted_attachments_and_preserves_plaintext_attachments() -> anyhow::Result<()>
+{
+    let tmp = TempDatabaseBuilder::new()
+        .with_opts(DatabaseOpts::new().with_encryption(true).with_attach(true))
+        .with_encryption(CIPHER_A, KEY_A)
+        .build();
+    let owner = tmp.connect_limbo();
+    let encrypted = tmp.path.with_file_name("encrypted-aux.db");
+    owner.execute(format!(
+        "ATTACH 'file:{}?cipher={CIPHER_B}&hexkey={KEY_B}' AS encrypted_aux",
+        encrypted.display()
+    ))?;
+    owner.execute("CREATE TABLE encrypted_aux.t(x)")?;
+    let before = std::fs::read(&encrypted)?;
+    assert!(owner.execute("VACUUM encrypted_aux").is_err());
+    assert_eq!(std::fs::read(&encrypted)?, before);
+    let plain = tmp.path.with_file_name("plain-aux.db");
+    owner.execute(format!("ATTACH '{}' AS plain_aux", plain.display()))?;
+    owner.execute("CREATE TABLE plain_aux.t(x)")?;
+    owner.execute("INSERT INTO plain_aux.t VALUES (42)")?;
+    assert!(owner.execute("VACUUM plain_aux").is_err());
+    let rows: Vec<(i64,)> = owner.exec_rows("SELECT x FROM plain_aux.t");
+    assert_eq!(rows, [(42,)]);
+    assert_eq!(&std::fs::read(&plain)?[..16], b"SQLite format 3\0");
+    Ok(())
+}
+
+#[test]
+fn cold_encrypted_attach_authenticates_before_catalog_publication() -> anyhow::Result<()> {
+    use crate::queued_io::QueuedIo;
+    let mut yielded = false;
+    let mut completed = false;
+    for stop_after in 0..32 {
+        let io = Arc::new(QueuedIo::new());
+        let path = format!(":cold-attach-{stop_after}:");
+        let target = Database::open(io.clone(), &path, ReadLockDatabase::options_for(KEY_A))?;
+        let owner = target.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?)),
+        )?;
+        owner.execute("CREATE TABLE secrets(value TEXT)")?;
+        owner.execute("INSERT INTO secrets VALUES ('protected value')")?;
+        owner.close()?;
+        drop((owner, target));
+        let main = Database::open(
+            io.clone(),
+            &format!("{path}-main"),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(DatabaseOpts::new().with_encryption(true).with_attach(true)),
+        )?;
+        let conn = main.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
+        let mut statement = conn.prepare(format!(
+            "ATTACH 'file:{path}?cipher={CIPHER_A}&hexkey={KEY_A}' AS aux"
+        ))?;
+        let mut done = false;
+        for step in 0..=stop_after {
+            match statement.step()? {
+                turso_core::StepResult::Done => {
+                    done = true;
+                    break;
+                }
+                turso_core::StepResult::IO => {
+                    yielded = true;
+                    assert!(!conn.attached_database_names().contains(&"aux".to_string()));
+                    if step < stop_after {
+                        io.step_one()?;
+                    }
+                }
+                other => panic!("unexpected ATTACH result: {other:?}"),
+            }
+        }
+        drop(statement);
+        io.drain_all()?;
+        if done {
+            completed = true;
+            let rows: Vec<(String,)> = conn.exec_rows("SELECT value FROM aux.secrets");
+            assert_eq!(rows, [("protected value".into(),)]);
+            break;
+        }
+        assert!(!conn.attached_database_names().contains(&"aux".to_string()));
+    }
+    assert!(
+        yielded && completed,
+        "ATTACH pager authentication must yield and eventually complete"
+    );
+    Ok(())
+}
+
+#[test]
+fn regression_async_connect_state_cannot_change_database() -> anyhow::Result<()> {
+    use crate::queued_io::QueuedIo;
+    let io = Arc::new(QueuedIo::new());
+    let a = Database::open(
+        io.clone(),
+        ":async-state-origin:",
+        ReadLockDatabase::options_for(KEY_A),
+    )?;
+    let owner_a = a.connect(
+        ConnectOpts::new(turso_core::SessionRole::Superuser)
+            .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?)),
+    )?;
+    owner_a.execute("CREATE TABLE a_data(value TEXT)")?;
+    let b = Database::open(
+        io.clone(),
+        ":async-state-other:",
+        ReadLockDatabase::options_for(KEY_B),
+    )?;
+    let owner_b = b.connect(
+        ConnectOpts::new(turso_core::SessionRole::Superuser)
+            .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_B)?)),
+    )?;
+    owner_b.execute("PRAGMA journal_mode = 'mvcc'")?;
+    owner_b.execute("CREATE TABLE secrets(value TEXT)")?;
+    owner_b.execute("INSERT INTO secrets VALUES ('protected value')")?;
+    let opts = ConnectOpts::new(turso_core::SessionRole::Superuser)
+        .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?));
+    let mut state = turso_core::ConnectAsyncState::new();
+    let IOResult::IO(pending) = a.connect_async(opts.clone(), &mut state)? else {
+        panic!("page-1 read must yield");
+    };
+    pending.wait(io.as_ref())?;
+    assert!(
+        b.connect_async(
+            ConnectOpts::new(turso_core::SessionRole::Superuser),
+            &mut state
+        )
+        .is_err(),
+        "a pending connect state must reject another database"
+    );
+    let connected = loop {
+        match a.connect_async(opts.clone(), &mut state)? {
+            IOResult::Done(conn) => break conn,
+            IOResult::IO(pending) => pending.wait(io.as_ref())?,
+        }
+    };
+    assert!(Arc::ptr_eq(&connected.get_pager().db_file, &a.db_file));
+    assert!(!connected
+        .current_schema()
+        .has_table(turso_core::NamespaceId::ROOT, "secrets"));
+    let rows: Vec<(String,)> = owner_b.exec_rows("SELECT value FROM secrets");
+    assert_eq!(rows, [("protected value".into(),)]);
+    Ok(())
+}
+
+#[test]
+fn regression_public_header_mutation_preserves_encrypted_layout() -> anyhow::Result<()> {
+    use turso_core::storage::sqlite3_ondisk::PageSize;
+    use turso_core::IOExt;
+    let tmp = TempDatabaseBuilder::new()
+        .with_encryption(CIPHER_A, KEY_A)
+        .build();
+    let owner = tmp.connect_limbo();
+    owner.execute("CREATE TABLE secrets(value TEXT)")?;
+    owner.execute("BEGIN IMMEDIATE")?;
+    owner.execute("INSERT INTO secrets VALUES ('protected value')")?;
+    let pager = owner.get_pager();
+    for change_size in [false, true] {
+        let result = tmp.io.block(|| {
+            pager.with_header_mut(|header| {
+                header.user_version = 42.into();
+                if change_size {
+                    header.page_size = PageSize::new(8192).unwrap();
+                } else {
+                    header.reserved_space = 0;
+                }
+            })
+        });
+        assert!(
+            result.is_err(),
+            "a public header mutation must reject encrypted layout changes"
+        );
+        let header = tmp.io.block(|| {
+            pager.with_header(|header| {
+                (
+                    header.page_size.get(),
+                    header.reserved_space,
+                    header.user_version.get(),
+                )
+            })
+        })?;
+        assert_eq!(header, (4096, 48, 0));
+    }
+    tmp.io
+        .block(|| pager.with_header_mut(|header| header.user_version = 7.into()))?;
+    owner.execute("COMMIT")?;
+    let peer = tmp.connect_limbo();
+    let rows: Vec<(String,)> = peer.exec_rows("SELECT value FROM secrets");
+    assert_eq!(rows, [("protected value".into(),)]);
+    assert_eq!(
+        tmp.io.block(|| peer
+            .get_pager()
+            .with_header(|header| header.user_version.get()))?,
+        7
+    );
+    Ok(())
+}
+
+#[test]
+fn async_connect_authenticates_before_resolving_the_original_role() -> anyhow::Result<()> {
+    use crate::queued_io::QueuedIo;
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open(
+        io.clone(),
+        ":async-encrypted-session-role:",
+        ReadLockDatabase::options_for(KEY_A),
+    )?;
+    let owner = db.connect(
+        ConnectOpts::new(SessionRole::Superuser)
+            .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?)),
+    )?;
+    owner.execute("CREATE TABLE secrets(value TEXT)")?;
+    let named = |key: &str| -> anyhow::Result<ConnectOpts> {
+        Ok(ConnectOpts::new(SessionRole::Named("missing_role".into()))
+            .with_encryption_key(Some(EncryptionKey::from_hex_string(key)?)))
+    };
+    let wrong = db.connect(named(KEY_B)?).err().unwrap();
+    assert!(matches!(
+        wrong,
+        LimboError::CompletionError(CompletionError::DecryptionError { .. })
+    ));
+    let correct = db.connect(named(KEY_A)?).err().unwrap();
+    assert!(correct.to_string().contains("missing_role"));
+    let mut state = turso_core::ConnectAsyncState::new();
+    let IOResult::IO(pending) = db.connect_async(named(KEY_A)?, &mut state)? else {
+        panic!("page-1 authentication must yield");
+    };
+    pending.wait(io.as_ref())?;
+    loop {
+        match db.connect_async(ConnectOpts::new(SessionRole::Superuser), &mut state) {
+            Ok(IOResult::IO(pending)) => pending.wait(io.as_ref())?,
+            Ok(IOResult::Done(_)) => panic!("resumption must retain the original named role"),
+            Err(error) => {
+                assert!(error.to_string().contains("missing_role"));
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "fs", feature = "encryption", feature = "conn_raw_api"))]
+#[test]
+fn encrypted_mvcc_reload_preserves_key_and_log_encryption() -> anyhow::Result<()> {
+    let dir = tempfile::TempDir::new().expect("temporary directory");
+    let path = dir.path().join("reload.db");
+    let path = path.to_str().expect("UTF-8 path");
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+    let encryption = EncryptionOpts {
+        cipher: "aes256gcm".into(),
+        hexkey: "17".repeat(32),
+    };
+    let key = EncryptionKey::from_hex_string(&encryption.hexkey)?;
+    let options = DatabaseOpts::new().with_encryption(true);
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path,
+            OpenFlags::Create,
+            options,
+            Some(encryption.clone()),
+            Arc::new(SqliteDialect),
+        )?;
+        let conn = db.connect(
+            ConnectOpts::new(SessionRole::Superuser).with_encryption_key(Some(key.clone())),
+        )?;
+        conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+        conn.execute("CREATE TABLE t(value TEXT)")?;
+        conn.execute("INSERT INTO t VALUES ('before reload')")?;
+        conn.reload_wal_after_external_restore()?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let store = conn.mv_store();
+        let store = store.as_ref().expect("MVCC store");
+        io.wait_for_completion(store.reset_logical_log_after_external_restore()?)?;
+        if let Some(completion) = store.sync_logical_log(&conn)? {
+            io.wait_for_completion(completion)?;
+        }
+        drop(conn);
+        db.reload_wal_after_external_restore_with_encryption_key(Some(key.clone()))?;
+        let conn = db.connect(
+            ConnectOpts::new(SessionRole::Superuser).with_encryption_key(Some(key.clone())),
+        )?;
+        conn.execute("INSERT INTO t VALUES ('after reload')")?;
+    }
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path,
+            OpenFlags::None,
+            options,
+            Some(encryption.clone()),
+            Arc::new(SqliteDialect),
+        )?;
+        let conn = db.connect(
+            ConnectOpts::new(SessionRole::Superuser).with_encryption_key(Some(key.clone())),
+        )?;
+        let mut stmt = conn.prepare("SELECT value FROM t ORDER BY rowid")?;
+        for expected in ["before reload", "after reload"] {
+            assert!(matches!(stmt.step()?, turso_core::StepResult::Row));
+            assert_eq!(stmt.row().expect("row").get::<String>(0)?, expected);
+        }
+        assert!(matches!(stmt.step()?, turso_core::StepResult::Done));
+        drop(stmt);
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    }
+    let db = Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::None,
+        options,
+        Some(encryption),
+        Arc::new(SqliteDialect),
+    )?;
+    let conn =
+        db.connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(Some(key)))?;
+    let rows = conn.prepare("SELECT count(*) FROM t")?.run_collect_rows()?;
+    assert_eq!(rows, vec![vec![turso_core::Value::from_i64(2)]]);
     Ok(())
 }

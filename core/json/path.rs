@@ -1,4 +1,3 @@
-use crate::bail_parse_error;
 use std::borrow::Cow;
 
 /// Formats a path for the bad-path message the way SQLite's %Q does:
@@ -9,22 +8,8 @@ fn quote_path(path: &str) -> String {
     path.replace('\'', "''")
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum PPState {
-    Start,
-    AfterRoot,
-    InKey,
-    InArrayIndex,
-    ExpectDotOrBracket,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum ArrayIndexState {
-    Start,
-    AfterHash,
-    CollectingNumbers,
-    /// Collecting digits after "#-".
-    CollectingNegativeNumbers,
+pub fn bad_path_error(path: &str) -> crate::LimboError {
+    crate::LimboError::ParseError(format!("bad JSON path: '{}'", quote_path(path)))
 }
 
 /// Describes a JSON path, which is a sequence of keys and/or array locators.
@@ -42,9 +27,10 @@ impl JsonPath<'_> {
                 PathElement::Root() => PathElement::Root(),
                 PathElement::Key(key, raw) => PathElement::Key(Cow::Owned(key.into_owned()), raw),
                 PathElement::ArrayLocator(index) => PathElement::ArrayLocator(index),
-                PathElement::BracketQuotedKey(key) => {
-                    PathElement::BracketQuotedKey(Cow::Owned(key.into_owned()))
-                }
+                PathElement::Malformed(step) => PathElement::Malformed(MalformedStep {
+                    path: Cow::Owned(step.path.into_owned()),
+                    kind: step.kind,
+                }),
             })
             .collect();
         JsonPath { elements }
@@ -62,10 +48,31 @@ pub enum PathElement<'a> {
     Key(Cow<'a, str>, RawString),
     /// Array locator, eg. [2], [#-5]
     ArrayLocator(Option<i32>),
-    /// Bracket-quoted key (e.g. `$["key"]`). Parsed without error for SQLite
-    /// compatibility but never matches during extraction — SQLite returns NULL
-    /// for bracket-notation on non-array nodes.
-    BracketQuotedKey(Cow<'a, str>),
+    /// A step that is not valid path syntax. It is the last element of the
+    /// path.
+    Malformed(MalformedStep<'a>),
+}
+
+/// A step that is not valid path syntax. SQLite reads each step of a path
+/// only when a lookup applies the step to an element, so the step is an
+/// error only when the steps before it find an element, and only when that
+/// element is one that SQLite reads the step on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MalformedStep<'a> {
+    /// The whole path, which the error message quotes.
+    pub path: Cow<'a, str>,
+    pub kind: MalformedStepKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MalformedStepKind {
+    /// A step that starts with `[`. SQLite reads it only on an array, so it
+    /// finds nothing in any other element. `from_end` is N when the step
+    /// starts with `[#-N`: SQLite finds nothing in an array of fewer than N
+    /// elements before it reads the rest of the step.
+    Array { from_end: Option<u32> },
+    /// Any other step, which SQLite reads on any element.
+    Other,
 }
 
 impl PathElement<'_> {
@@ -92,355 +99,108 @@ fn estimate_path_capacity(input: &str) -> usize {
     1 + (input.len() - 1) / 2
 }
 
-/// Parses path into a Vec of Strings, where each string is a key or an array locator.
+/// Parses a path that starts with `$` into its elements. Like SQLite, the
+/// path is read one step at a time, and a step that is not valid path
+/// syntax becomes a [PathElement::Malformed] element that ends the path.
 pub fn json_path(path: &str) -> crate::Result<JsonPath<'_>> {
-    if path.is_empty() {
-        bail_parse_error!("bad JSON path: '{}'", quote_path(path))
-    }
-    let mut parser_state = PPState::Start;
-    let mut index_state = ArrayIndexState::Start;
-    let mut key_start = 0;
-    let mut index_buffer: u32 = 0;
-    let mut path_components = Vec::with_capacity(estimate_path_capacity(path));
-    let mut path_iter = path.char_indices();
-
-    while let Some(ch) = path_iter.next() {
-        match parser_state {
-            PPState::Start => {
-                handle_start(ch, &mut parser_state, &mut path_components, path)?;
-            }
-            PPState::AfterRoot => {
-                handle_after_root(
-                    ch,
-                    &mut parser_state,
-                    &mut index_state,
-                    &mut key_start,
-                    &mut index_buffer,
-                    path,
-                )?;
-            }
-            PPState::InKey => {
-                handle_in_key(
-                    ch,
-                    &mut parser_state,
-                    &mut index_state,
-                    &mut key_start,
-                    &mut index_buffer,
-                    &mut path_components,
-                    &mut path_iter,
-                    path,
-                )?;
-            }
-            PPState::InArrayIndex => {
-                handle_array_index(
-                    ch,
-                    &mut parser_state,
-                    &mut index_state,
-                    &mut index_buffer,
-                    &mut path_components,
-                    &mut path_iter,
-                    path,
-                )?;
-            }
-            PPState::ExpectDotOrBracket => {
-                handle_expect_dot_or_bracket(
-                    ch,
-                    &mut parser_state,
-                    &mut index_state,
-                    &mut key_start,
-                    &mut index_buffer,
-                    path,
-                )?;
-            }
-        }
-    }
-
-    finalize_path(parser_state, key_start, path, &mut path_components)?;
-    Ok(JsonPath {
-        elements: path_components,
-    })
-}
-
-fn handle_start(
-    ch: (usize, char),
-    parser_state: &mut PPState,
-    path_components: &mut Vec<PathElement>,
-    path: &str,
-) -> crate::Result<()> {
-    match ch {
-        (_, '$') => {
-            path_components.push(PathElement::Root());
-            *parser_state = PPState::AfterRoot;
-            Ok(())
-        }
-        (_, _) => bail_parse_error!("bad JSON path: '{}'", quote_path(path)),
-    }
-}
-
-fn handle_after_root(
-    ch: (usize, char),
-    parser_state: &mut PPState,
-    index_state: &mut ArrayIndexState,
-    key_start: &mut usize,
-    index_buffer: &mut u32,
-    path: &str,
-) -> crate::Result<()> {
-    match ch {
-        (idx, '.') => {
-            *parser_state = PPState::InKey;
-            *key_start = idx + ch.1.len_utf8();
-            Ok(())
-        }
-        (_, '[') => {
-            *index_state = ArrayIndexState::Start;
-            *parser_state = PPState::InArrayIndex;
-            *index_buffer = 0;
-            Ok(())
-        }
-        (_, _) => bail_parse_error!("bad JSON path: '{}'", quote_path(path)),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn handle_in_key<'a>(
-    ch: (usize, char),
-    parser_state: &mut PPState,
-    index_state: &mut ArrayIndexState,
-    key_start: &mut usize,
-    index_buffer: &mut u32,
-    path_components: &mut Vec<PathElement<'a>>,
-    path_iter: &mut std::str::CharIndices,
-    path: &'a str,
-) -> crate::Result<()> {
-    match ch {
-        (idx, '.' | '[') => {
-            let key_end = idx;
-            if key_end > *key_start {
-                let key = &path[*key_start..key_end];
-                if ch.1 == '[' {
-                    *index_state = ArrayIndexState::Start;
-                    *parser_state = PPState::InArrayIndex;
-                    *index_buffer = 0;
-                } else {
-                    *key_start = idx + ch.1.len_utf8();
-                }
-                path_components.push(PathElement::Key(Cow::Borrowed(key), false));
-            } else {
-                bail_parse_error!("bad JSON path: '{}'", quote_path(path))
-            }
-        }
-        (idx, '"') => {
-            handle_quoted_key(parser_state, idx, path_components, path_iter, path)?;
-        }
-        (_, _) => (),
-    }
-    Ok(())
-}
-
-fn handle_quoted_key<'a>(
-    parser_state: &mut PPState,
-    quote_start: usize,
-    path_components: &mut Vec<PathElement<'a>>,
-    path_iter: &mut std::str::CharIndices,
-    path: &'a str,
-) -> crate::Result<()> {
-    // quote_start is the byte index of the opening '"'
-    // The key content starts after the opening quote (1 byte for '"')
-    let key_content_start = quote_start + 1;
-    while let Some((idx, ch)) = path_iter.next() {
-        match ch {
-            '\\' => {
-                path_iter.next();
-            }
-            '"' => {
-                if key_content_start <= idx {
-                    let key = &path[key_content_start..idx];
-                    path_components.push(PathElement::Key(Cow::Borrowed(key), true));
-                    *parser_state = PPState::ExpectDotOrBracket;
-                    return Ok(());
-                }
-            }
-            _ => continue,
-        }
-    }
-    Ok(())
-}
-
-fn handle_array_index<'a>(
-    ch: (usize, char),
-    parser_state: &mut PPState,
-    index_state: &mut ArrayIndexState,
-    index_buffer: &mut u32,
-    path_components: &mut Vec<PathElement<'a>>,
-    path_iter: &mut std::str::CharIndices,
-    path: &'a str,
-) -> crate::Result<()> {
-    match (&index_state, ch.1) {
-        (ArrayIndexState::Start, '#') => {
-            *index_state = ArrayIndexState::AfterHash;
-        }
-        (ArrayIndexState::Start, '0'..='9') => {
-            *index_buffer = ch.1.to_digit(10).ok_or_else(|| {
-                crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
-            })?;
-            *index_state = ArrayIndexState::CollectingNumbers;
-        }
-        // Bracket-notation quoted key, e.g. $["key with spaces"] or $['key'].
-        // Issue #6099: previously this fell through to the catch-all and produced
-        // a "Bad json path" parse error. Dispatch to a dedicated helper that
-        // consumes the quoted string and the closing `]`.
-        (ArrayIndexState::Start, q @ ('"' | '\'')) => {
-            handle_bracket_quoted_key(q, ch.0, parser_state, path_components, path_iter, path)?;
-        }
-        (ArrayIndexState::AfterHash, '-') => {
-            handle_negative_index(index_state, index_buffer, path_iter, path)?;
-        }
-        (ArrayIndexState::AfterHash, ']') => {
-            *parser_state = PPState::ExpectDotOrBracket;
-            path_components.push(PathElement::ArrayLocator(None));
-        }
-        (
-            ArrayIndexState::CollectingNumbers | ArrayIndexState::CollectingNegativeNumbers,
-            '0'..='9',
-        ) => {
-            let digit = ch.1.to_digit(10).ok_or_else(|| {
-                crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
-            })?;
-            // Like SQLite, accumulate in a u32 so that long indexes wrap modulo 2^32.
-            *index_buffer = index_buffer.wrapping_mul(10).wrapping_add(digit);
-        }
-        (ArrayIndexState::CollectingNumbers, ']') => {
-            *parser_state = PPState::ExpectDotOrBracket;
-            path_components.push(PathElement::array_locator(*index_buffer, false));
-        }
-        (ArrayIndexState::CollectingNegativeNumbers, ']') => {
-            *parser_state = PPState::ExpectDotOrBracket;
-            path_components.push(PathElement::array_locator(*index_buffer, true));
-        }
-        (_, _) => bail_parse_error!("bad JSON path: '{}'", quote_path(path)),
-    }
-    Ok(())
-}
-
-/// Handle bracket-notation with a quoted key, e.g. `$["key with spaces"]` or `$['key']`.
-/// The opening bracket and the opening quote have already been consumed by
-/// `handle_array_index`; `quote_start` is the byte index of the opening quote.
-/// After the closing quote we require a `]`.
-///
-/// Escape handling mirrors `handle_quoted_key` (raw bytes preserved, no decoding)
-/// so the dot-quoted form `$."key"` and the bracket-quoted form behave the same.
-fn handle_bracket_quoted_key<'a>(
-    quote_char: char,
-    quote_start: usize,
-    parser_state: &mut PPState,
-    path_components: &mut Vec<PathElement<'a>>,
-    path_iter: &mut std::str::CharIndices,
-    path: &'a str,
-) -> crate::Result<()> {
-    // The quote character is always 1 byte (ASCII '"' or '\''), so the key
-    // content begins at quote_start + 1.
-    let key_content_start = quote_start + 1;
-    let mut key_end: Option<usize> = None;
-
-    while let Some((idx, ch)) = path_iter.next() {
-        match ch {
-            '\\' => {
-                // Skip the escaped character (matches handle_quoted_key's behavior).
-                path_iter.next();
-            }
-            c if c == quote_char => {
-                key_end = Some(idx);
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    let Some(key_end) = key_end else {
-        bail_parse_error!("bad JSON path: '{}'", quote_path(path))
+    let Some(mut rest) = path.strip_prefix('$') else {
+        return Err(bad_path_error(path));
     };
-
-    // Expect the closing bracket immediately after the closing quote.
-    match path_iter.next() {
-        Some((_, ']')) => {
-            let key = &path[key_content_start..key_end];
-            path_components.push(PathElement::BracketQuotedKey(Cow::Borrowed(key)));
-            *parser_state = PPState::ExpectDotOrBracket;
-            Ok(())
-        }
-        _ => bail_parse_error!("bad JSON path: '{}'", quote_path(path)),
+    let mut elements = Vec::with_capacity(estimate_path_capacity(path));
+    elements.push(PathElement::Root());
+    while !rest.is_empty() {
+        let step = match rest.as_bytes()[0] {
+            b'.' => key_step(rest),
+            b'[' => array_step(rest),
+            _ => None,
+        };
+        let Some((element, step_len)) = step else {
+            let kind = if rest.starts_with('[') {
+                MalformedStepKind::Array {
+                    from_end: from_end_number(rest).map(|(index, _)| index),
+                }
+            } else {
+                MalformedStepKind::Other
+            };
+            elements.push(PathElement::Malformed(MalformedStep {
+                path: Cow::Borrowed(path),
+                kind,
+            }));
+            break;
+        };
+        elements.push(element);
+        rest = &rest[step_len..];
     }
+    Ok(JsonPath { elements })
 }
 
-fn handle_negative_index(
-    index_state: &mut ArrayIndexState,
-    index_buffer: &mut u32,
-    path_iter: &mut std::str::CharIndices,
-    path: &str,
-) -> crate::Result<()> {
-    if let Some((_, next_c)) = path_iter.next() {
-        if next_c.is_ascii_digit() {
-            *index_buffer = next_c.to_digit(10).ok_or_else(|| {
-                crate::LimboError::ParseError(format!("failed to parse digit: {next_c}"))
-            })?;
-            *index_state = ArrayIndexState::CollectingNegativeNumbers;
-            Ok(())
-        } else {
-            bail_parse_error!("bad JSON path: '{}'", quote_path(path))
+/// Parses the `.` step at the start of `step` the way SQLite's
+/// jsonLookupStep does. Returns the key and the length of the step, or None
+/// when the key is empty or its closing quote is missing.
+fn key_step(step: &str) -> Option<(PathElement<'_>, usize)> {
+    let key = &step[1..];
+    if let Some(quoted) = key.strip_prefix('"') {
+        let bytes = quoted.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && bytes[i] != b'"' {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 1;
+            }
+            i += 1;
+        }
+        if i == bytes.len() {
+            return None;
+        }
+        // The step is the dot, the key and its two quotes.
+        return Some((PathElement::Key(Cow::Borrowed(&quoted[..i]), true), i + 3));
+    }
+    let key_len = key.find(['.', '[']).unwrap_or(key.len());
+    if key_len == 0 {
+        return None;
+    }
+    Some((
+        PathElement::Key(Cow::Borrowed(&key[..key_len]), false),
+        key_len + 1,
+    ))
+}
+
+/// Parses the `[N]`, `[#]` or `[#-N]` step at the start of `step` the way
+/// SQLite's jsonLookupStep does. Returns the array locator and the length of
+/// the step, or None when the step is not one of these.
+fn array_step(step: &str) -> Option<(PathElement<'static>, usize)> {
+    let (index, digits) = leading_number(&step[1..]);
+    let (locator, len) = if digits > 0 {
+        (PathElement::array_locator(index, false), 1 + digits)
+    } else if step[1..].starts_with('#') {
+        match from_end_number(step) {
+            Some((index, digits)) => (PathElement::array_locator(index, true), 3 + digits),
+            None => (PathElement::ArrayLocator(None), 2),
         }
     } else {
-        bail_parse_error!("bad JSON path: '{}'", quote_path(path))
-    }
+        return None;
+    };
+    (step.as_bytes().get(len) == Some(&b']')).then_some((locator, len + 1))
 }
 
-fn handle_expect_dot_or_bracket(
-    ch: (usize, char),
-    parser_state: &mut PPState,
-    index_state: &mut ArrayIndexState,
-    key_start: &mut usize,
-    index_buffer: &mut u32,
-    path: &str,
-) -> crate::Result<()> {
-    match ch {
-        (idx, '.') => {
-            *key_start = idx + ch.1.len_utf8();
-            *parser_state = PPState::InKey;
-            Ok(())
-        }
-        (_, '[') => {
-            *index_state = ArrayIndexState::Start;
-            *parser_state = PPState::InArrayIndex;
-            *index_buffer = 0;
-            Ok(())
-        }
-        (_, _) => bail_parse_error!("bad JSON path: '{}'", quote_path(path)),
-    }
+/// Returns N and the number of its digits when `step` starts with `[#-N`.
+fn from_end_number(step: &str) -> Option<(u32, usize)> {
+    let (index, digits) = leading_number(step.strip_prefix("[#-")?);
+    (digits > 0).then_some((index, digits))
 }
 
-fn finalize_path<'a>(
-    parser_state: PPState,
-    key_start: usize,
-    path: &'a str,
-    path_components: &mut Vec<PathElement<'a>>,
-) -> crate::Result<()> {
-    match parser_state {
-        PPState::InArrayIndex => bail_parse_error!("bad JSON path: '{}'", quote_path(path)),
-        PPState::InKey => {
-            if key_start < path.len() {
-                let key = &path[key_start..];
-                if key.starts_with('"') && !key.ends_with('"') && key.len() > 1
-                    || (key.starts_with('"') && key.ends_with('"') && key.len() == 1)
-                {
-                    bail_parse_error!("bad JSON path: '{}'", quote_path(path))
-                }
-                path_components.push(PathElement::Key(Cow::Borrowed(key), false));
-            } else {
-                bail_parse_error!("bad JSON path: '{}'", quote_path(path))
-            }
-        }
-        _ => (),
-    }
-    Ok(())
+/// Returns the number that the ASCII digits at the start of `text` spell and
+/// the number of those digits. Like SQLite, the number is accumulated in a
+/// u32, so a long number wraps modulo 2^32.
+fn leading_number(text: &str) -> (u32, usize) {
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    let number = text.as_bytes()[..digits]
+        .iter()
+        .fold(0u32, |number, &digit| {
+            number
+                .wrapping_mul(10)
+                .wrapping_add(u32::from(digit - b'0'))
+        });
+    (number, digits)
 }
 
 #[cfg(test)]
@@ -483,20 +243,74 @@ mod tests {
 
     #[test]
     fn test_json_path_invalid() {
-        let invalid_values = vec![
-            "", "$$$", "$.", "$ ", "$[", "$]", "$[-1]", "x", "[]", "$[0", "$[0x]", "$\"",
-        ];
-
-        for value in invalid_values {
+        for value in ["", "x", "[]", " $"] {
             let path = json_path(value);
-
             match path {
-                Err(crate::error::LimboError::ParseError(_)) => {
-                    // happy path
-                }
+                Err(crate::error::LimboError::ParseError(_)) => {}
                 _ => panic!("Expected error for: {value:?}, got: {path:?}"),
             }
         }
+    }
+
+    /// Returns the elements of `path` before its malformed step, and the
+    /// kind of that step.
+    fn split_malformed(path: &str) -> (Vec<PathElement<'_>>, MalformedStepKind) {
+        let mut elements = json_path(path).unwrap().elements;
+        match elements.pop() {
+            Some(PathElement::Malformed(step)) => (elements, step.kind),
+            last => panic!("Expected a malformed step at the end of {path:?}, got {last:?}"),
+        }
+    }
+
+    #[test]
+    fn test_malformed_step_ends_path() {
+        let other = MalformedStepKind::Other;
+        let array = MalformedStepKind::Array { from_end: None };
+        for (path, valid_steps, kind) in [
+            ("$$$", 1, other),
+            ("$ ", 1, other),
+            ("$.", 1, other),
+            ("$..key", 1, other),
+            ("$.a.", 2, other),
+            ("$.a.[0]", 2, other),
+            (r#"$."a"x"#, 2, other),
+            (r#"$."a"#, 1, other),
+            (r#"$."a\""#, 1, other),
+            ("$]", 1, other),
+            ("$[", 1, array),
+            ("$[0", 1, array),
+            ("$[0x]", 1, array),
+            ("$[-1]", 1, array),
+            ("$[ 0]", 1, array),
+            ("$[]", 1, array),
+            ("$[#x]", 1, array),
+            ("$[#-]", 1, array),
+            ("$[0]]", 2, other),
+            ("$.a[-1].b", 2, array),
+            ("$.b[", 2, array),
+            (
+                "$[#-12x",
+                1,
+                MalformedStepKind::Array { from_end: Some(12) },
+            ),
+            ("$[#-0", 1, MalformedStepKind::Array { from_end: Some(0) }),
+        ] {
+            let (elements, step_kind) = split_malformed(path);
+            assert_eq!(elements.len(), valid_steps, "{path}");
+            assert_eq!(step_kind, kind, "{path}");
+        }
+    }
+
+    #[test]
+    fn test_malformed_step_error_quotes_whole_path() {
+        let path = json_path("$.a'[-1]").unwrap();
+        let Some(PathElement::Malformed(step)) = path.elements.last() else {
+            panic!("Expected a malformed step, got {:?}", path.elements);
+        };
+        assert_eq!(
+            bad_path_error(&step.path).to_string(),
+            "bad JSON path: '$.a''[-1]'"
+        );
     }
 
     #[test]
@@ -544,19 +358,14 @@ mod tests {
     }
 
     #[test]
-    fn test_edge_cases() {
-        // Empty key
-        assert!(json_path("$.").is_err());
-
-        // Multiple dots
-        assert!(json_path("$..key").is_err());
-
-        // Unclosed brackets
-        assert!(json_path("$[0").is_err());
-        assert!(json_path("$[").is_err());
-
-        // Invalid negative index format
-        assert!(json_path("$[-1]").is_err()); // should be $[#-1]
+    fn test_unquoted_key_keeps_quotes() {
+        // Like SQLite, only a key that starts with a quote is quoted.
+        let path = json_path(r#"$.a"b"[0]"#).unwrap();
+        assert_eq!(
+            path.elements[1],
+            PathElement::Key(Cow::Borrowed(r#"a"b""#), false)
+        );
+        assert_eq!(path.elements[2], PathElement::ArrayLocator(Some(0)));
     }
 
     #[test]
@@ -620,76 +429,25 @@ mod tests {
 
     #[test]
     fn test_bracket_quoted_key() {
-        // Issue #6099: bracket notation with double-quoted key.
-        // Parsed successfully but produces BracketQuotedKey (never matches
-        // during extraction — SQLite compat, always returns NULL).
-        let path = json_path(r#"$["key"]"#).unwrap();
-        assert_eq!(path.elements.len(), 2);
-        assert_eq!(path.elements[0], PathElement::Root());
+        // SQLite reads a quoted key in brackets as a malformed `[` step.
+        for path in [
+            r#"$["key"]"#,
+            r#"$['key']"#,
+            r#"$[""]"#,
+            r#"$["key"#,
+            r#"$["key"x]"#,
+        ] {
+            let (elements, kind) = split_malformed(path);
+            assert_eq!(elements, vec![PathElement::Root()], "{path}");
+            assert_eq!(kind, MalformedStepKind::Array { from_end: None }, "{path}");
+        }
+        let (elements, _) = split_malformed(r#"$.outer["inner key"][2]"#);
         assert_eq!(
-            path.elements[1],
-            PathElement::BracketQuotedKey(Cow::Borrowed("key"))
+            elements,
+            vec![
+                PathElement::Root(),
+                PathElement::Key(Cow::Borrowed("outer"), false)
+            ]
         );
-
-        // Key containing spaces (the original issue example).
-        let path = json_path(r#"$["key with spaces"]"#).unwrap();
-        assert_eq!(
-            path.elements[1],
-            PathElement::BracketQuotedKey(Cow::Borrowed("key with spaces"))
-        );
-
-        // Key containing dots.
-        let path = json_path(r#"$["key.with.dots"]"#).unwrap();
-        assert_eq!(
-            path.elements[1],
-            PathElement::BracketQuotedKey(Cow::Borrowed("key.with.dots"))
-        );
-
-        // Key containing brackets.
-        let path = json_path(r#"$["key[0]"]"#).unwrap();
-        assert_eq!(
-            path.elements[1],
-            PathElement::BracketQuotedKey(Cow::Borrowed("key[0]"))
-        );
-
-        // Single-quoted variant.
-        let path = json_path(r#"$['key']"#).unwrap();
-        assert_eq!(
-            path.elements[1],
-            PathElement::BracketQuotedKey(Cow::Borrowed("key"))
-        );
-
-        // Empty quoted key.
-        let path = json_path(r#"$[""]"#).unwrap();
-        assert_eq!(
-            path.elements[1],
-            PathElement::BracketQuotedKey(Cow::Borrowed(""))
-        );
-
-        // Mixed with dot notation and array indices.
-        let path = json_path(r#"$.outer["inner key"][2]"#).unwrap();
-        assert_eq!(path.elements.len(), 4);
-        assert_eq!(
-            path.elements[1],
-            PathElement::Key(Cow::Borrowed("outer"), false)
-        );
-        assert_eq!(
-            path.elements[2],
-            PathElement::BracketQuotedKey(Cow::Borrowed("inner key"))
-        );
-        assert_eq!(path.elements[3], PathElement::ArrayLocator(Some(2)));
-    }
-
-    #[test]
-    fn test_bracket_quoted_key_invalid() {
-        // Unclosed quote.
-        assert!(json_path(r#"$["key"#).is_err());
-        // Closing quote but no closing bracket.
-        assert!(json_path(r#"$["key""#).is_err());
-        // Mismatched quote characters (single quote inside double-quoted key
-        // is fine; this case has the wrong closing quote).
-        assert!(json_path(r#"$["key']"#).is_err());
-        // Trailing junk between closing quote and bracket.
-        assert!(json_path(r#"$["key"x]"#).is_err());
     }
 }

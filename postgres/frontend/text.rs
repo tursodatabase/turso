@@ -3,6 +3,7 @@
 
 mod pgwire_text;
 
+pub(crate) use pgwire_text::encode_bytea;
 use std::borrow::Cow;
 use turso_core::{ColumnTypeKind, Numeric, Value};
 
@@ -17,8 +18,6 @@ pub enum TextType {
     Boolean,
     /// Text without an offset gets `+00`.
     TimestampTz,
-    /// A blob prints quoted, as an element of a bytea array.
-    ByteaArray,
 }
 
 impl TextType {
@@ -39,7 +38,6 @@ impl TextType {
                 |name| match (name.to_ascii_uppercase().as_str(), info.array_dimensions) {
                     ("BOOL" | "BOOLEAN", 0) => Some(TextType::Boolean),
                     ("TIMESTAMPTZ", 0) => Some(TextType::TimestampTz),
-                    ("BLOB" | "BYTEA", 1..) => Some(TextType::ByteaArray),
                     _ => None,
                 },
             )
@@ -71,10 +69,7 @@ pub fn value_text(value: &Value, text_type: TextType) -> Option<Cow<'_, str>> {
                 Cow::Borrowed(text)
             }
         }
-        Value::Blob(bytes) => Cow::Owned(pgwire_text::encode_bytea(
-            bytes,
-            text_type == TextType::ByteaArray,
-        )),
+        Value::Blob(bytes) => Cow::Owned(pgwire_text::encode_bytea(bytes, false)),
     };
     Some(text)
 }

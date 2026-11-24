@@ -37,6 +37,14 @@ rustflags = [
   "link-args=-Wl,-z,nodelete",
 ]
 
+# Link with the LLD that ships with the Rust toolchain, which is much faster
+# than GNU ld (see the script). The path is relative to the workspace root.
+# A build that has this file but not the script fails. Because the recipe of
+# `cargo chef` has this file, the Dockerfiles copy the script before
+# `cargo chef cook`.
+[target.x86_64-unknown-linux-gnu]
+linker = "scripts/link-with-rust-lld.sh"
+
 # To be able to run unit tests on Windows, support compilation to MSVC targets.
 [target.'cfg(target_env = "msvc")']
 rustflags = [

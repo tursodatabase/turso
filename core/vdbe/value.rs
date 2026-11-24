@@ -4,7 +4,7 @@ use crate::{
     numeric::{format_float, format_float_for_quote, IntegerText, NullableInteger, Numeric},
     translate::collate::CollationSeq,
     turso_assert,
-    types::{AsValueRef, SeekOp},
+    types::{AsValueRef, SeekOp, Text},
     vdbe::affinity::{real_to_i64, Affinity},
     LimboError, Result, Value,
 };
@@ -1330,21 +1330,55 @@ impl Value {
             return Ok(Value::Blob(blob));
         }
 
+        // Two TEXT operands, the usual case, need no conversion.
         if let (Value::Text(lhs), Value::Text(rhs)) = (self, rhs) {
             return join_text(lhs.as_str(), rhs.as_str());
         }
 
         let mut lhs_integer = None;
-        let Some(lhs) = text_of_operand(self, &mut lhs_integer) else {
-            return Ok(Value::Null);
-        };
-
         let mut rhs_integer = None;
-        let Some(rhs) = text_of_operand(rhs, &mut rhs_integer) else {
+        let Some((lhs, rhs)) = self.concat_text_operands(rhs, &mut lhs_integer, &mut rhs_integer)
+        else {
             return Ok(Value::Null);
         };
-
         join_text(&lhs, &rhs)
+    }
+
+    /// The TEXT result of `self || rhs`, written into `dest`, which keeps its
+    /// buffer when the buffer is large enough. Returns false, and leaves
+    /// `dest` as it was, when the result is not TEXT: two BLOBs give a BLOB,
+    /// and a NULL operand gives NULL.
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::Concat)]
+    pub fn exec_concat_into(&self, rhs: &Value, dest: &mut Text) -> Result<bool> {
+        let mut lhs_integer = None;
+        let mut rhs_integer = None;
+        let Some((lhs, rhs)) = self.concat_text_operands(rhs, &mut lhs_integer, &mut rhs_integer)
+        else {
+            return Ok(false);
+        };
+        check_concat_length(&lhs, &rhs)?;
+        dest.replace_with_concat(&lhs, &rhs)?;
+        Ok(true)
+    }
+
+    /// The operands of `self || rhs` as text, or `None` when the result is
+    /// not TEXT: two BLOBs give a BLOB, and a NULL operand gives NULL. The
+    /// text of an integer operand goes into `lhs_integer` or `rhs_integer`.
+    /// [Self::exec_concat] and [Self::exec_concat_into] get their operands
+    /// from this function, so the rules for the operands of `||` are here.
+    #[inline(always)]
+    fn concat_text_operands<'a>(
+        &'a self,
+        rhs: &'a Value,
+        lhs_integer: &'a mut Option<IntegerText>,
+        rhs_integer: &'a mut Option<IntegerText>,
+    ) -> Option<(Cow<'a, str>, Cow<'a, str>)> {
+        if let (Value::Blob(_), Value::Blob(_)) = (self, rhs) {
+            return None;
+        }
+        let lhs = text_of_operand(self, lhs_integer)?;
+        let rhs = text_of_operand(rhs, rhs_integer)?;
+        Some((lhs, rhs))
     }
 
     pub fn exec_and(&self, rhs: &Value) -> Value {
@@ -1644,7 +1678,7 @@ fn hex_upper(bytes: &[u8]) -> String {
     hex
 }
 
-fn push_hex_upper(out: &mut String, bytes: &[u8]) {
+pub(crate) fn push_hex_upper(out: &mut String, bytes: &[u8]) {
     const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
     for &byte in bytes {
         out.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
@@ -1754,13 +1788,21 @@ const SHORT_TEXT_BYTES: usize = 64;
 /// `lhs` followed by `rhs`, as a TEXT value.
 #[inline]
 fn join_text(lhs: &str, rhs: &str) -> Result<Value> {
-    if lhs.len() + rhs.len() > Value::MAX_BLOB_LENGTH as usize {
-        return Err(LimboError::TooBig);
-    }
+    check_concat_length(lhs, rhs)?;
     let mut joined = String::with_capacity(lhs.len() + rhs.len());
     joined.push_str(lhs);
     joined.push_str(rhs);
     Ok(Value::build_text(joined))
+}
+
+/// `LimboError::TooBig` when the result of `lhs || rhs` is longer than the
+/// length limit of a value.
+#[inline(always)]
+fn check_concat_length(lhs: &str, rhs: &str) -> Result<()> {
+    if lhs.len() + rhs.len() > Value::MAX_BLOB_LENGTH as usize {
+        return Err(LimboError::TooBig);
+    }
+    Ok(())
 }
 
 /// The text of `value` as `cast_text_ref` gives it, but the text of an

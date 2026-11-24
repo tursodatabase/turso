@@ -17,7 +17,7 @@ addr  opcode       p1  p2  p3  p4        p5  comment
    0  Init          0  11   0             0  Start at 11
    1  Null          0   2   0             0  r[2]=NULL
    2  OpenRead      0   2   0  k(2,B)     0  table=t, root=2, iDb=0
-   3  Ne            4   5   7  Binary     0  if r[4]!=r[5] goto 7
+   3  Ne            4   7   7  Binary     0  if r[4]!=r[7] goto 7
    4  Rewind        0   7   0             0  Rewind table t
    5    AggStep     0   8   2  count      0  accum=r[2] step(r[8])
    6  Next          0   5   0             1
@@ -26,9 +26,9 @@ addr  opcode       p1  p2  p3  p4        p5  comment
    9  ResultRow     1   1   0             0  output=r[1]
   10  Halt          0   0   0             0
   11  Transaction   0   1   1             0  iDb=0 tx_mode=Read
-  12  Variable      1   7   0             0  r[7]=parameter(1)
-  13  Function      0   7   6  zeroblob   0  r[6]=func(r[7])
-  14  Function      0   6   4  length     0  r[4]=func(r[6])
-  15  Variable      2   5   0             0  r[5]=parameter(2)
+  12  Variable      1   6   0             0  r[6]=parameter(1)
+  13  Function      0   6   5  zeroblob   0  r[5]=func(r[6])
+  14  Function      0   5   4  length     0  r[4]=func(r[5])
+  15  Variable      2   7   0             0  r[7]=parameter(2)
   16  Integer       1   8   0             0  r[8]=1
   17  Goto          0   1   0             0

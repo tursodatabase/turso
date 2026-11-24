@@ -174,6 +174,9 @@ impl PageCodec for EncryptionPageCodec {
         input: &[u8],
         output: &mut [u8],
     ) -> Result<()> {
+        if context.page_no == 1 {
+            self.validate_page_one_layout(input)?;
+        }
         // todo(v): once we have in place encryption, we can avoid allocations here
         let encrypted = self.context.encrypt_page(input, context.page_no as usize)?;
         output.copy_from_slice(&encrypted);
@@ -188,7 +191,32 @@ impl PageCodec for EncryptionPageCodec {
     ) -> Result<()> {
         // todo(v): once we have in place encryption, we can avoid allocations here
         let decrypted = self.context.decrypt_page(input, context.page_no as usize)?;
+        if context.page_no == 1 {
+            self.validate_page_one_layout(input)?;
+        }
         output.copy_from_slice(&decrypted);
+        Ok(())
+    }
+}
+
+impl EncryptionPageCodec {
+    fn validate_page_one_layout(&self, page: &[u8]) -> Result<()> {
+        if page.len() < super::sqlite3_ondisk::DatabaseHeader::SIZE {
+            return Err(LimboError::InvalidArgument(
+                "encrypted page 1 is shorter than its header".into(),
+            ));
+        }
+        let size = super::sqlite3_ondisk::PageSize::new_from_header_u16(u16::from_be_bytes([
+            page[16], page[17],
+        ]))?;
+        if size.get() as usize != self.context.page_size()
+            || page.len() != self.context.page_size()
+            || page[20] != self.required_reserved_bytes()
+        {
+            return Err(LimboError::InvalidArgument(
+                "encrypted page layout does not match the cipher".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -219,6 +247,37 @@ impl std::fmt::Debug for PageTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encryption_encoder_rejects_changed_page_one_layout_before_writing_output() {
+        use crate::storage::encryption::{CipherMode, EncryptionKey};
+        let key = EncryptionKey::new_256([7; 32]);
+        let ctx = EncryptionContext::new(CipherMode::Aegis256, &key, 4096).unwrap();
+        let codec = EncryptionPageCodec { context: ctx };
+        let mut page = vec![0; 4096];
+        page[..16].copy_from_slice(b"SQLite format 3\0");
+        page[16..18].copy_from_slice(&4096u16.to_be_bytes());
+        page[20] = codec.required_reserved_bytes();
+        for location in [PageLocation::Database, PageLocation::Wal] {
+            let context = PageCodecContext::new(1, location);
+            let mut encoded = vec![0; 4096];
+            codec.encode_page(context, &page, &mut encoded).unwrap();
+            let mut decoded = vec![0; 4096];
+            codec.decode_page(context, &encoded, &mut decoded).unwrap();
+            assert_eq!(&decoded[..4096 - 48], &page[..4096 - 48]);
+            for changed_size in [false, true] {
+                let mut invalid = page.clone();
+                if changed_size {
+                    invalid[16..18].copy_from_slice(&8192u16.to_be_bytes());
+                } else {
+                    invalid[20] = 0;
+                }
+                let mut output = vec![0xab; 4096];
+                assert!(codec.encode_page(context, &invalid, &mut output).is_err());
+                assert!(output.iter().all(|byte| *byte == 0xab));
+            }
+        }
+    }
 
     #[test]
     fn visible_sqlite_header_requires_layout_fields() {

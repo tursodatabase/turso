@@ -14,6 +14,16 @@ permissions:
   contents: read
   id-token: write # required for OIDC authentication with CodSpeed
 
+# A called workflow does not get the env block of the workflow that calls
+# it, so codspeed.yml's settings are repeated here.
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  # Thin LTO made up a large part of the bench build. CodSpeed compares each
+  # PR against main built the same way, so the comparison does not need it.
+  CARGO_PROFILE_BENCH_LTO: "false"
+
 jobs:
   build:
     runs-on: blacksmith-4vcpu-ubuntu-2404

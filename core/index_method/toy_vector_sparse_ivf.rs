@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashSet, VecDeque};
 
+use crate::ast::{self, SortOrder};
 use crate::types::IOResultOr;
-use turso_parser::ast::{self, SortOrder};
 
 use crate::numeric::Numeric;
 use crate::{

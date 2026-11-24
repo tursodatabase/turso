@@ -1,10 +1,10 @@
+use crate::ast;
 use crate::{
     translate::{alter::literal_default_value, expr_context::ExprProperties},
     types::ValueType,
     vdbe::affinity::Affinity,
 };
 use bitflags::bitflags;
-use turso_parser::ast;
 
 bitflags! {
     /// Storage class flags that represent the possible storage classes an expression can yield.

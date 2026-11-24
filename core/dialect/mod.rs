@@ -17,38 +17,97 @@
 //! `sqlite_schema`, is SQLite syntax in every database. Core parses it with
 //! [`Dialect::parse_internal`] of the database's dialect.
 
+#[cfg(test)]
+pub(crate) mod cannot_parse;
 pub mod catalog;
 
 pub use crate::functions::builtin::{
     call_builtin_scalar, resolve_builtin_function, SQLITE_VERSION, SQLITE_VERSION_NUMBER,
 };
+pub use crate::translate::schema::SqliteCatalog;
 pub use catalog::{
-    AccessStatement, CatalogApply, NewOwner, OwnerColumn, RelationChange, RelationName,
+    AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
+    CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,
+    CreateTrigger, CreateView, CreateVirtualTable, Dependent, DependentObject, DropColumn,
+    DropIndex, DropSequence, DropTable, DropTrigger, DropView, NewOwner, OwnerColumn, RelationName,
+    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, TableText,
+    TempTriggerOfRenamedTable,
 };
 
+use crate::ast::{self, Cmd, CreateTableBody, IdentityKind, Privilege, QualifiedName, Stmt};
 use crate::{
     function::ScalarFunc,
     namespace::NamespaceId,
     schema::{BTreeTable, Schema, SchemaBuilder},
     security::{policy::RowPolicy, roles::RoleId},
-    vdbe::{builder::ProgramBuilder, Register},
-    Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
+    vdbe::Register,
+    Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value,
+    WallClockInstant, IO,
 };
-use std::{any::Any, sync::Arc};
-use turso_parser::ast::{self, Cmd, CreateTableBody, IdentityKind, Privilege, QualifiedName, Stmt};
+use std::{cell::Cell, ops::Range, sync::Arc};
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
 pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
 
-/// What a built-in scalar function may read besides its arguments.
+/// What a scalar function may read besides its arguments.
 pub struct ScalarFuncContext<'a> {
-    pub connection: &'a Connection,
+    pub connection: &'a Arc<Connection>,
     pub io: &'a dyn IO,
     /// The statement's clock: every function of one step sees the same time.
     pub clock: &'a dyn Clock,
+    /// Set by the first call of `statement_times` in the statement.
+    pub statement_times: &'a Cell<Option<StatementTimes>>,
     /// The collation of the call site, for functions that compare arguments.
     pub collation: CollationSeq,
+}
+
+impl ScalarFuncContext<'_> {
+    /// The same times for every call until the statement ends, triggers
+    /// included.
+    pub fn statement_times(&self) -> StatementTimes {
+        if let Some(times) = self.statement_times.get() {
+            return times;
+        }
+        let times = StatementTimes::new(self.io.current_time_wall_clock(), self.connection);
+        self.statement_times.set(Some(times));
+        times
+    }
+
+    /// The wall clock now. The statement start is read first, so no time
+    /// read during a statement is earlier than its `statement_times`.
+    pub fn current_time(&self) -> WallClockInstant {
+        self.statement_times();
+        self.io.current_time_wall_clock()
+    }
+}
+
+/// When a statement and its transaction started, as PostgreSQL's
+/// `statement_timestamp()` and `now()` report them. A client command with
+/// several statements, or an extended-protocol batch that ends at Sync, is
+/// one transaction in autocommit mode, so its statements share these times.
+#[derive(Debug, Clone, Copy)]
+pub struct StatementTimes {
+    pub statement: WallClockInstant,
+    pub transaction: WallClockInstant,
+}
+
+impl StatementTimes {
+    /// Times for a statement that starts at `now`. In autocommit mode the
+    /// statement is its own transaction, unless a command set the times.
+    pub(crate) fn new(now: WallClockInstant, connection: &Connection) -> Self {
+        let command = connection.command_times();
+        let statement = command.map_or(now, |times| times.statement);
+        let transaction = if connection.get_auto_commit() {
+            command.map_or(now, |times| times.transaction)
+        } else {
+            connection.explicit_transaction_start()
+        };
+        Self {
+            statement,
+            transaction,
+        }
+    }
 }
 
 /// Start of the comment in stored table SQL that lists the positions and kinds
@@ -112,6 +171,11 @@ pub trait Dialect: Send + Sync + 'static {
     /// Parse the column definition that core keeps for `ALTER TABLE`, such
     /// as `b INTEGER DEFAULT 0`. The text is SQLite syntax in every dialect.
     fn parse_internal_column_definition(&self, sql: &str) -> Result<ast::ColumnDefinition>;
+
+    /// The byte ranges of the parameter markers in a statement that
+    /// [`Dialect::parse`] accepted, in the order they appear. Markers inside
+    /// string literals, quoted identifiers and comments are not parameters.
+    fn parameter_marker_ranges(&self, sql: &str) -> Result<Vec<Range<usize>>>;
 
     /// The dialect for the statements that core and the frontend run for
     /// themselves. Those statements are SQLite syntax and expect SQLite
@@ -197,7 +261,7 @@ pub trait Dialect: Send + Sync + 'static {
     ///
     /// [`Dialect::new_schema`] finishes the schema.
     fn schema_builder(&self, enable_custom_types: bool) -> Result<SchemaBuilder> {
-        crate::schema::builtin::schema_builder(self, enable_custom_types)
+        crate::schema::builtin::schema_builder(enable_custom_types)
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
@@ -283,6 +347,35 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// The name that a message gives the relation `name` of `namespace`.
+    fn relation_name_in_messages(
+        &self,
+        connection: &Connection,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> String {
+        let _ = (connection, schema, namespace);
+        name.to_string()
+    }
+
+    /// The objects that depend on the table or view `name` of `namespace`,
+    /// directly or through other objects, which DROP without CASCADE refuses
+    /// to leave without it. Each object comes before the objects that it
+    /// depends on, so they can be dropped in this order.
+    ///
+    /// SQLite records no dependencies: it drops the relation, and a view
+    /// that reads it fails when it is read.
+    fn relation_dependents(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Vec<Dependent> {
+        let _ = (schema, namespace, name);
+        Vec::new()
+    }
+
     /// Whether a database of this dialect supports namespaces: the objects of
     /// a namespace are kept in the schema rows of the main database
     /// under names that encode the namespace's id, which the loader decodes
@@ -302,69 +395,10 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// SQL statements that read the dialect's own schema state, such as the
-    /// PostgreSQL frontend's relation catalog table, or none when this
-    /// database keeps none. The statements run with engine semantics after
-    /// the schema rows load, and their rows go to
-    /// [`Dialect::build_schema_state`].
-    fn schema_state_queries(&self, schema: &Schema) -> Vec<String> {
-        let _ = schema;
-        Vec::new()
-    }
-
-    /// Builds [`Schema::dialect_schema`] from the rows of each statement of
-    /// [`Dialect::schema_state_queries`], in the same order. `schema` is the
-    /// schema the state is built for, already holding every other object.
-    fn build_schema_state(
-        &self,
-        schema: &Schema,
-        results: &[Vec<Vec<Value>>],
-    ) -> Result<Arc<dyn Any + Send + Sync>> {
-        let _ = (schema, results);
-        Err(LimboError::InternalError(
-            "the dialect queried schema state it cannot build".to_string(),
-        ))
-    }
-
-    /// Translates `changes`, which the statement being compiled makes to
-    /// relations, into the bytecode that records them in the dialect's own
-    /// schema state, in the same transaction as the statement's
-    /// `sqlite_schema` rows. A table comes with its automatic indexes in one
-    /// call. Does nothing for a dialect without schema state of its own.
-    fn translate_relation_changes(
-        &self,
-        program: &mut ProgramBuilder,
-        schema: &Schema,
-        connection: &Arc<Connection>,
-        changes: &[RelationChange<'_>],
-    ) -> Result<()> {
-        let _ = (program, schema, connection, changes);
-        Ok(())
-    }
-
-    /// Translates `statement` into the bytecode that changes the roles,
-    /// owners, privileges or policies the dialect stores. A dialect that
-    /// stores none refuses `CREATE ROLE`, `GRANT role TO role`,
-    /// `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`, `GRANT`,
-    /// `REVOKE`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`,
-    /// `CREATE POLICY` and `DROP POLICY`.
-    fn translate_access_statement(
-        &self,
-        program: &mut ProgramBuilder,
-        schema: &Schema,
-        connection: &Arc<Connection>,
-        statement: &AccessStatement<'_>,
-    ) -> Result<()> {
-        let _ = (program, schema, connection);
-        Err(statement.not_supported())
-    }
-
-    /// Whether relations can be created, renamed or dropped in an attached
-    /// database. The PostgreSQL frontend refuses it: its relation catalog
-    /// covers only the main database, so a database file with relations
-    /// made while it was attached could not be opened later.
-    fn supports_relation_ddl_in_attached_databases(&self) -> bool {
-        true
+    /// Where the dialect stores the objects of a database. The default
+    /// stores them as rows of `sqlite_schema`.
+    fn catalog(&self) -> &dyn Catalog {
+        &SqliteCatalog
     }
 
     /// The id of the role named `name`, case-sensitively, when the dialect
@@ -504,6 +538,11 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// How an ORDER BY or DISTINCT ON term is matched to the output columns.
+    fn sort_term_matching(&self) -> SortTermMatching {
+        SortTermMatching::Sqlite
+    }
+
     /// Whether integer division by zero raises an error.
     ///
     /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.
@@ -511,6 +550,7 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// FIXME(pg-catalog): This hand-codes prorettype of the pg_proc entries mod(smallint, smallint), mod(integer, integer) and mod(bigint, bigint), which return their argument type. A lookup in a pg_proc table replaces this.
     /// Whether `mod` of two integers returns an integer.
     ///
     /// PostgreSQL returns an integer. SQLite always returns a REAL.
@@ -547,12 +587,19 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// Whether a cast of an integer to the built-in `boolean` type gives
-    /// true for every nonzero integer.
+    /// FIXME(pg-catalog): This hand-codes the absence of pg_cast entries from date, timestamp, json and inet to numbers, booleans and bytea. A lookup in a pg_cast table replaces this.
+    /// Whether a CAST from a custom type that reads text and has an ENCODE
+    /// (such as date, timestamp, json or inet) is refused when its target does
+    /// not read text.
     ///
-    /// PostgreSQL's integer-to-boolean cast does. Otherwise the cast uses the
-    /// type's ENCODE, which accepts only 0 and 1.
-    fn casts_nonzero_integer_to_true(&self) -> bool {
+    /// PostgreSQL has no cast from these types to numbers, booleans or bytea:
+    /// `date '2020-01-01'::int` fails. SQLite reads the text as a number, so
+    /// it gives 2020, which is a wrong answer. A number stored into or cast
+    /// to one of these types is read as its text, so `20200101::date` gives
+    /// 2020-01-01 where PostgreSQL refuses it: tursopg binds a parameter sent
+    /// without a type as a number when its text is one, and refusing numbers
+    /// would refuse such parameters too.
+    fn text_input_types_refuse_other_kinds(&self) -> bool {
         false
     }
 
@@ -574,6 +621,54 @@ pub trait Dialect: Send + Sync + 'static {
     fn generates_integer_primary_keys(&self) -> bool {
         true
     }
+
+    /// Checks the type of a result column of CREATE TABLE AS or SELECT INTO
+    /// before the table is created. `type_name` is the custom type of the
+    /// column, or `None` when its type is not known at that point.
+    ///
+    /// The new table types its columns with SQLite declared types, so a column
+    /// of a custom type would become a plain column that compares and accepts
+    /// values differently. SQLite has no custom types and accepts every
+    /// column. PostgreSQL refuses the statement, which PostgreSQL itself
+    /// executes with the type kept.
+    fn check_ctas_column_type(&self, column: &str, type_name: Option<&str>) -> Result<()> {
+        let _ = (column, type_name);
+        Ok(())
+    }
+
+    /// Appends a blob element of an array to the array's text, as in
+    /// `{"X'6162'"}`.
+    ///
+    /// PostgreSQL writes a bytea element as quoted hex: `{"\\x6162"}`.
+    fn write_array_blob_element(&self, out: &mut String, blob: &[u8]) {
+        out.push_str("\"X'");
+        crate::vdbe::value::push_hex_upper(out, blob);
+        out.push_str("'\"");
+    }
+
+    /// The name of the function that runs `a @> b` when neither operand is
+    /// an array, or None when the array function runs it too.
+    ///
+    /// PostgreSQL's `@>` also compares jsonb values: the frontend gives a
+    /// function that it registers. SQLite has no `@>`, and Turso's `@>`
+    /// compares arrays.
+    ///
+    /// FIXME(pg-catalog): This hand-codes the pg_operator entry `jsonb @> jsonb`, whose function is jsonb_contains, beside the entry `anyarray @> anyarray`, whose function is arraycontains. A lookup in pg_operator by the types of the operands replaces this.
+    fn json_contains_function(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+/// How an ORDER BY or DISTINCT ON term is matched to the output columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortTermMatching {
+    /// A name anywhere in the term can be an output column name, and the first output
+    /// column with that name is used.
+    Sqlite,
+    /// Only a term that is a bare name can be an output column name, and it is an error
+    /// when output columns with different expressions share that name. Every ORDER BY
+    /// term of a SELECT DISTINCT must be an output column.
+    Sql92,
 }
 
 /// Refuses table SQL stored by the PostgreSQL frontend. The SQL comment that

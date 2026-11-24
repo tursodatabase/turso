@@ -151,6 +151,25 @@ pub fn refresh_analyze_stats_nonblock(
     conn: &Arc<Connection>,
     st: &mut RefreshAnalyzeStatsState,
 ) -> IOResultOr<()> {
+    refresh_analyze_stats_nonblock_inner(conn, st, true)
+}
+
+/// Like [`refresh_analyze_stats_nonblock`], but updates only `conn.schema` and
+/// leaves `conn.db.schema` untouched. Used by schema reparse so callers that
+/// keep the reparsed schema private (such as `force_reparse_schema_without_publish`
+/// or a read-snapshot reparse) do not mutate or clone the shared schema.
+pub(crate) fn refresh_analyze_stats_connection_only_nonblock(
+    conn: &Arc<Connection>,
+    st: &mut RefreshAnalyzeStatsState,
+) -> IOResultOr<()> {
+    refresh_analyze_stats_nonblock_inner(conn, st, false)
+}
+
+fn refresh_analyze_stats_nonblock_inner(
+    conn: &Arc<Connection>,
+    st: &mut RefreshAnalyzeStatsState,
+    publish_to_shared: bool,
+) -> IOResultOr<()> {
     loop {
         match st {
             RefreshAnalyzeStatsState::Start => {
@@ -168,8 +187,15 @@ pub fn refresh_analyze_stats_nonblock(
                     return Ok(IOResult::Done(()));
                 }
                 let mv_tx = conn.get_mv_tx();
-                let mut stmt =
-                    conn.prepare_with_origin(STATS_QUERY, StatementOrigin::EngineMetadataRead)?;
+                let mut stmt = match conn
+                    .prepare_with_origin(STATS_QUERY, StatementOrigin::EngineMetadataRead)
+                {
+                    Ok(stmt) => stmt,
+                    Err(e) => {
+                        tracing::warn!("Failed to prepare analyze stats query: {e}");
+                        return Ok(IOResult::Done(()));
+                    }
+                };
                 stmt.set_mv_tx(mv_tx);
                 *st = RefreshAnalyzeStatsState::Running {
                     stmt: Box::new(stmt),
@@ -187,10 +213,21 @@ pub fn refresh_analyze_stats_nonblock(
                     Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                     Ok(IOResult::Done(())) => {
                         let stats = std::mem::take(stats);
-                        if let Err(e) = install_analyze_stats(conn, stats) {
+                        // Drop the statement and `schema_snapshot` before
+                        // installing so a solely-owned connection schema (for
+                        // example during `reparse_schema`) can be updated in
+                        // place without cloning.
+                        *st = RefreshAnalyzeStatsState::Start;
+                        let install = if publish_to_shared {
+                            install_analyze_stats(conn, stats)
+                        } else {
+                            conn.with_schema_mut(|schema| {
+                                schema.analyze_stats = stats;
+                            })
+                        };
+                        if let Err(e) = install {
                             tracing::warn!("Failed to refresh analyze stats: {e}");
                         }
-                        *st = RefreshAnalyzeStatsState::Start;
                         return Ok(IOResult::Done(()));
                     }
                     Err(e) => {
@@ -237,11 +274,6 @@ pub fn refresh_analyze_stats_nonblock(
 /// No prepare-generation bump is needed here: the schema the connection ends
 /// up with differs from its old one only in stats, which the old
 /// per-connection install also left unbumped.
-///
-/// In the reparse path this refresh runs before finalize replaces the
-/// connection schema with the freshly built one, which carries no stats yet;
-/// that end state (connection without stats, shared with stats) is
-/// pre-existing and unchanged by this fix.
 fn install_analyze_stats(conn: &Arc<Connection>, stats: AnalyzeStats) -> Result<()> {
     let connection_schema = conn.schema.read().clone();
     let mut shared = conn.db.schema.lock();
@@ -268,7 +300,7 @@ fn install_analyze_stats(conn: &Arc<Connection>, stats: AnalyzeStats) -> Result<
         schema.schema_version
     })?;
     let mut shared = conn.db.schema.lock();
-    if shared.schema_version == schema_version {
+    if shared.schema_version == schema_version && shared.analyze_stats != stats {
         Schema::try_make_mut(&mut shared)?.analyze_stats = stats;
     }
     Ok(())

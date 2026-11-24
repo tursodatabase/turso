@@ -646,6 +646,51 @@ expect {
     12
 }
 
+# Integer text that overflows i64 and decimal text both become the double that
+# sqlite3AtoF returns, with no rounding to 15 significant digits.
+@cross-check-integrity
+test cast-text-to-numeric-exact-double {
+    SELECT printf('%!.20e', CAST('9223372036854775808' AS NUMERIC));
+    SELECT CAST('9223372036854775808' AS NUMERIC) = 9223372036854775808.0;
+    SELECT printf('%!.20e', CAST('9223372036854775808.0' AS NUMERIC));
+    SELECT CAST('9223372036854775807' AS NUMERIC);
+    SELECT printf('%!.20e', CAST('-9223372036854775809' AS NUMERIC));
+    SELECT printf('%!.20e', CAST('123456789012345678901234567890' AS NUMERIC));
+    SELECT printf('%!.20e', CAST('99999999999999999999999999999999999999999999' AS NUMERIC));
+    SELECT printf('%!.20e', CAST('2.2250738585072011e-308' AS NUMERIC));
+    SELECT printf('%!.20e', CAST('9007199254740993.0000000001' AS NUMERIC));
+}
+expect {
+    9.22337203685477581e+18
+    1
+    9.22337203685477581e+18
+    9223372036854775807
+    -9.22337203685477581e+18
+    1.234567890123456778e+29
+    1.000000000000000089e+44
+    2.225073858507201383e-308
+    9.007199254740992e+15
+}
+
+# An exponent with no digits is not part of the number, so integer text that
+# ends in "e", "e+" or "e-" stays an INTEGER instead of being rounded to a double.
+test cast-text-to-numeric-bare-exponent {
+    SELECT typeof(CAST('9007199254740993e' AS NUMERIC)), CAST('9007199254740993e' AS NUMERIC);
+    SELECT typeof(CAST('9007199254740993e+' AS NUMERIC)), CAST('9007199254740993e+' AS NUMERIC);
+    SELECT typeof(CAST('-9007199254740993E-' AS NUMERIC)), CAST('-9007199254740993E-' AS NUMERIC);
+    SELECT typeof(CAST(' 12e ' AS NUMERIC)), CAST(' 12e ' AS NUMERIC);
+    SELECT typeof(CAST('9007199254740993.e' AS NUMERIC)), printf('%!.20e', CAST('9007199254740993.e' AS NUMERIC));
+    SELECT typeof(CAST('9223372036854775808e' AS NUMERIC)), printf('%!.20e', CAST('9223372036854775808e' AS NUMERIC));
+}
+expect {
+    integer|9007199254740993
+    integer|9007199254740993
+    integer|-9007199254740993
+    integer|12
+    real|9.007199254740992e+15
+    real|9.22337203685477581e+18
+}
+
 # Regression tests for https://github.com/tursodatabase/turso/issues/4927
 # A compound (UNION/UNION ALL) subquery column's affinity must be combined
 # across all arms, not taken from the leftmost arm alone. Scanning left to
@@ -840,6 +885,22 @@ expect {
     x] IN
     text|integer|text|integer|integer
     blob|integer|integer
+}
+
+@cross-check-integrity
+test affinity-type-name-case {
+    CREATE TABLE t (a integer, b "int", c [blob], d 'text' int, e Real(3), f varchar(4), g Numeric, h any);
+    SELECT type FROM pragma_table_info('t');
+}
+expect {
+    INTEGER
+    INT
+    BLOB
+    text
+    Real(3)
+    varchar(4)
+    Numeric
+    ANY
 }
 
 @cross-check-integrity

@@ -2,6 +2,7 @@ use crate::alloc::{
     ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator, TursoVecInExt,
     ALLOC_ERR_MSG,
 };
+use crate::ast::SortOrder;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 use crate::mvcc::sqlite_schema_row::{types_table_root_page, SqliteSchemaRow};
@@ -21,13 +22,15 @@ use crate::storage::btree::BTreeKey;
 use crate::storage::btree::CursorTrait;
 use crate::storage::btree::CursorValidState;
 use crate::storage::pager::SavepointResult;
-use crate::storage::sqlite3_ondisk::DatabaseHeader;
+use crate::storage::sqlite3_ondisk::{try_read_integer, DatabaseHeader};
 use crate::storage::wal::{CheckpointMode, CheckpointResult, TursoRwLock};
 use crate::sync::atomic::{fence, AtomicBool, AtomicI64};
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
+use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
+use crate::types::cmp_in_column;
 use crate::types::compare_immutable;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
@@ -214,7 +217,63 @@ impl SortableIndexKey {
         })
     }
 
+    /// Always inlined, so that the skip list loops compare two keys whose
+    /// first columns are different integers without a call.
+    #[inline(always)]
     fn compare(&self, other: &Self) -> Result<std::cmp::Ordering> {
+        if let Some(ordering) = self.compare_first_integers(other) {
+            return Ok(ordering);
+        }
+        self.compare_columns(other)
+    }
+
+    /// The order of the two keys when their first columns are integers that
+    /// differ, under a text collation. This is the result of
+    /// [Self::compare_columns] for such keys. Else None.
+    #[inline(always)]
+    fn compare_first_integers(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        // The values come before the metadata: for a key whose first value
+        // is not an integer, as in an index on a TEXT column, this returns
+        // after a few instructions.
+        let lhs = Self::first_integer(self.key.get_payload())?;
+        let rhs = Self::first_integer(other.key.get_payload())?;
+        let key_info = self.metadata.key_info.first()?;
+        if self.metadata.num_cols.min(other.metadata.num_cols) == 0
+            || !matches!(key_info.collation, CollationSeq::Text(_))
+        {
+            return None;
+        }
+        match lhs.cmp(&rhs) {
+            std::cmp::Ordering::Equal => None,
+            ordering => Some(match key_info.sort_order {
+                SortOrder::Asc => ordering,
+                SortOrder::Desc => ordering.reverse(),
+            }),
+        }
+    }
+
+    /// The first value of a record if it is an integer, and the header size
+    /// and the first serial type take one byte each, as in most index keys.
+    /// Else None, also for a record that is not valid: the general
+    /// comparison then gives the order or the error. This function makes no
+    /// error value, because an error value adds code to each inlined copy
+    /// of [Self::compare].
+    #[inline(always)]
+    fn first_integer(payload: &[u8]) -> Option<i64> {
+        let &[header_size, serial_type, ..] = payload else {
+            return None;
+        };
+        // A header size of 0x80 or more takes more than one byte, and a
+        // header of fewer than two bytes has no serial type.
+        if !(2..0x80).contains(&header_size) {
+            return None;
+        }
+        let data = payload.get(usize::from(header_size)..)?;
+        try_read_integer(data, serial_type).map(|(value, _)| value)
+    }
+
+    #[inline(never)]
+    fn compare_columns(&self, other: &Self) -> Result<std::cmp::Ordering> {
         // We sometimes need to compare a shorter key to a longer one,
         // for example when seeking with an index key that is a prefix of the full key.
         let num_cols = self.metadata.num_cols.min(other.metadata.num_cols);
@@ -223,14 +282,52 @@ impl SortableIndexKey {
         let mut rhs = other.key.iter()?;
 
         for i in 0..num_cols {
+            // Two integers compare by value under every text collation, and
+            // two texts compare byte by byte under BINARY, so they need no
+            // ValueRef. The skip list compares keys many times for each
+            // insert and seek. Other values, and a corrupt record, take the
+            // general path below.
+            if let Some(key_info) = self.metadata.key_info.get(i) {
+                if matches!(key_info.collation, CollationSeq::Text(_)) {
+                    if let (Some((lhs_int, lhs_size)), Some((rhs_int, rhs_size))) =
+                        (lhs.peek_integer(), rhs.peek_integer())
+                    {
+                        lhs.skip_value(1, lhs_size);
+                        rhs.skip_value(1, rhs_size);
+                        let cmp = match key_info.sort_order {
+                            SortOrder::Asc => lhs_int.cmp(&rhs_int),
+                            SortOrder::Desc => lhs_int.cmp(&rhs_int).reverse(),
+                        };
+                        if cmp != std::cmp::Ordering::Equal {
+                            return Ok(cmp);
+                        }
+                        continue;
+                    }
+                }
+                if key_info.collation == CollationSeq::BINARY {
+                    if let (
+                        Some((lhs_text, lhs_header_len, lhs_size)),
+                        Some((rhs_text, rhs_header_len, rhs_size)),
+                    ) = (lhs.peek_text(), rhs.peek_text())
+                    {
+                        lhs.skip_value(lhs_header_len, lhs_size);
+                        rhs.skip_value(rhs_header_len, rhs_size);
+                        let cmp = match key_info.sort_order {
+                            SortOrder::Asc => lhs_text.cmp(rhs_text),
+                            SortOrder::Desc => lhs_text.cmp(rhs_text).reverse(),
+                        };
+                        if cmp != std::cmp::Ordering::Equal {
+                            return Ok(cmp);
+                        }
+                        continue;
+                    }
+                }
+            }
+
             let lhs_value = lhs.next().expect("we already checked length")?;
             let rhs_value = rhs.next().expect("we already checked length")?;
 
-            let cmp = compare_immutable(
-                std::iter::once(&lhs_value),
-                std::iter::once(&rhs_value),
-                &self.metadata.key_info[i..i + 1],
-            );
+            let cmp = cmp_in_column(&lhs_value, &rhs_value, &self.metadata.key_info[i]);
 
             if cmp != std::cmp::Ordering::Equal {
                 return Ok(cmp);
@@ -1520,6 +1617,11 @@ pub struct BuildLogRecordCtx {
     /// op after both row-version passes complete (preserves on-disk
     /// order: ops first, header last).
     pub pending_header: Option<DatabaseHeader>,
+    /// Indexes of the sqlite_schema entries in the write set, found by the
+    /// first step of BuildLogRecord. The write set does not change after the
+    /// transaction leaves the Active state, so the later steps read these
+    /// entries instead of all the entries of the write set.
+    pub schema_entries: Option<Vec<usize>>,
 }
 
 /// Iteration state for the chunked `RewriteLiveVersions` step.
@@ -1997,6 +2099,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             cursor: 0,
             schema_process: true,
             pending_header,
+            schema_entries: None,
         });
         Ok(())
     }
@@ -2164,77 +2267,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
     ) -> Result<()> {
         // Check for conflicts - iterate in reverse for faster early termination
         for version in row_versions.iter().rev() {
-            // A row that we are trying to commit was deleted/updated by another
-            // committed transaction after our begin timestamp. Even if that
-            // version is now "ended", this is still a write-write conflict.
-            if let Some(TxTimestampOrID::Timestamp(end_ts)) = version.end() {
-                turso_assert!(
-                    end_ts != tx.begin_ts,
-                    "committed end_ts and begin_ts cannot be equal: txn timestamps are strictly monotonic"
-                );
-                if end_ts > tx.begin_ts {
-                    return Err(LimboError::WriteWriteConflict);
-                }
-            }
-
-            // B-tree tombstones (begin: None, end: TxID) act as write locks.
-            // When another transaction has created a tombstone to delete a
-            // B-tree-resident row, that tombstone is effectively a write lock
-            // on the row — same as Hekaton's End field. We must detect this
-            // as a write-write conflict using the same state-based logic used
-            // for begin: TxID checks below.
-            if version.begin().is_none() {
-                // Committed tombstones (end: Timestamp) are already handled by
-                // the check above at lines 1070-1074. Here we only need to check
-                // in-flight tombstones (end: TxID) from other transactions.
-                if let Some(TxTimestampOrID::TxID(other_tx_id)) = version.end() {
-                    if other_tx_id != self.tx_id {
-                        // The other transaction may already have moved from
-                        // `txs` to `finalized_tx_states`; consult both
-                        // instead of panicking on the race.
-                        let other_state = lookup_tx_state(
-                            &mvcc_store.txs,
-                            &mvcc_store.finalized_tx_states,
-                            other_tx_id,
-                        );
-                        match other_state {
-                            Some(TransactionState::Committed(_)) => {
-                                return Err(LimboError::WriteWriteConflict);
-                            }
-                            Some(TransactionState::Preparing(other_end_ts)) => {
-                                if other_end_ts < end_ts {
-                                    return Err(LimboError::WriteWriteConflict);
-                                }
-                            }
-                            Some(TransactionState::Active) => {}
-                            Some(TransactionState::Aborted | TransactionState::Terminated)
-                            | None => {}
-                        }
-                    }
-                }
-                // Tombstones have no meaningful begin field — skip begin checks
-                continue;
-            }
-
             match version.end() {
-                Some(TxTimestampOrID::Timestamp(end_ts)) => {
-                    // Committed deletion. If end_ts > our begin_ts, the conflict
-                    // would have been already caught earlier when we iterate through
-                    // the row versions in reverse. If end_ts < our
-                    // begin_ts, the deletion predates our snapshot — no conflict.
+                Some(TxTimestampOrID::Timestamp(version_end_ts)) => {
+                    // A row that we are trying to commit was deleted/updated by another
+                    // committed transaction after our begin timestamp. Even if that
+                    // version is now "ended", this is still a write-write conflict.
+                    // If the deletion predates our snapshot, the version is not live.
                     turso_assert!(
-                        end_ts < tx.begin_ts,
-                        "row version's end_ts cannot be greater than txns begin_ts"
+                        version_end_ts != tx.begin_ts,
+                        "committed end_ts and begin_ts cannot be equal: txn timestamps are strictly monotonic"
                     );
+                    if version_end_ts > tx.begin_ts {
+                        return Err(LimboError::WriteWriteConflict);
+                    }
                     continue;
                 }
                 Some(TxTimestampOrID::TxID(end_tx_id)) => {
-                    // Deletion not yet finalized; the deleting transaction may still be in Preparing.
                     if end_tx_id == self.tx_id {
                         // We deleted this version ourselves, so it cannot conflict with our commit.
                         continue;
                     }
-
+                    // The deleting transaction may not have replaced its TxID with
+                    // its end timestamp yet. Resolve it the same way as `is_end_visible`.
                     match lookup_tx_state(
                         &mvcc_store.txs,
                         &mvcc_store.finalized_tx_states,
@@ -2250,8 +2304,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                             }
                             continue;
                         }
+                        // Hekaton speculative ignore: the deletion is in our snapshot
+                        // if the deleting transaction commits, so we commit only if it does.
+                        Some(TransactionState::Preparing(other_end_ts))
+                            if other_end_ts < tx.begin_ts =>
+                        {
+                            register_commit_dependency(&mvcc_store.txs, tx, end_tx_id);
+                            continue;
+                        }
+                        Some(TransactionState::Preparing(other_end_ts)) => {
+                            // The deletion is not in our snapshot. A B-tree tombstone
+                            // (begin: None) acts as a write lock on a B-tree-resident row,
+                            // same as Hekaton's End field: lower end_ts wins. Other
+                            // versions fall through to check begin for conflicts.
+                            if version.begin().is_none() && other_end_ts < end_ts {
+                                return Err(LimboError::WriteWriteConflict);
+                            }
+                        }
                         _ => {
-                            // Deleting tx is Active, Preparing, Aborted, or gone.
+                            // Deleting tx is Active, Aborted, or gone.
                             // The deletion may not stick, so this version may still be live.
                             // Fall through to check begin for conflicts.
                         }
@@ -2314,7 +2385,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     return Err(LimboError::WriteWriteConflict);
                 }
                 None => {
-                    // Invalid version
+                    // B-tree tombstone: no begin to check.
                 }
             }
         }
@@ -2383,29 +2454,32 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         let mut btree_ids_removed_from_schema_by_tx: HashSet<MVTableId> = HashSet::default();
         {
             let write_set = tx.write_set.lock();
-            let frame_writes_schema = write_set
-                .entries
-                .iter()
-                .any(|(id, _)| id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID);
+            // Each step of BuildLogRecord processes MVCC_COMMIT_BATCH_SIZE
+            // entries, and each step needs the sqlite_schema entries. A scan
+            // of the whole write set in each step made a large commit
+            // quadratic, so only the first step scans it.
+            let schema_entries = ctx.schema_entries.get_or_insert_with(|| {
+                write_set
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (id, _))| id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID)
+                    .map(|(index, _)| index)
+                    .collect()
+            });
 
             // Decoding sqlite_schema records is only needed for DDL frames.
             // Normal DML frames do not touch sqlite_schema, so avoid parsing
             // schema records while committing the common path.
-            if frame_writes_schema {
+            if !schema_entries.is_empty() {
                 let mut schema_roots_created_and_deleted_in_tx: HashSet<i64> = HashSet::default();
                 let mut schema_roots_deleted_by_tx: HashSet<i64> = HashSet::default();
                 let mut schema_roots_present_before_tx: HashSet<i64> = HashSet::default();
                 let mut schema_roots_present_after_tx: HashSet<i64> = HashSet::default();
 
-                for (id, row_versions) in &write_set.entries {
-                    // Only sqlite_schema entries can yield a btree identity. The
-                    // common path (CREATE INDEX on a populated table, bulk DML)
-                    // has tens of thousands of write_set entries that are NOT
-                    // sqlite_schema; locking each and parsing every version was
-                    // the dominant cost of MVCC commit on this branch.
-                    if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-                        continue;
-                    }
+                for &index in schema_entries.iter() {
+                    // Only sqlite_schema entries can yield a btree identity.
+                    let (id, row_versions) = &write_set.entries[index];
                     for row_version in row_versions.read().iter() {
                         let Some(identity) =
                             sqlite_schema_btree_identity(id.table_id, row_version)?
@@ -2746,15 +2820,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         else {
             unreachable!("step_mark_dirty_keys requires MarkDirtyKeys state")
         };
-        let (next, total) = mvcc_store.mark_tx_write_set_dirty(
-            tx.value(),
-            *end_ts,
-            *cursor,
-            MVCC_COMMIT_BATCH_SIZE,
-        )?;
-        if next < total {
-            *cursor = next;
-            return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
+        // Only the passive checkpoint reads the dirty keys. A blocking checkpoint reads
+        // every key of the MvStore, so recording them would only cost time.
+        if mvcc_store.uses_passive_checkpoint() {
+            let (next, total) = mvcc_store.mark_tx_write_set_dirty(
+                tx.value(),
+                *end_ts,
+                *cursor,
+                MVCC_COMMIT_BATCH_SIZE,
+            )?;
+            if next < total {
+                *cursor = next;
+                return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
+            }
         }
         let end_ts = *end_ts;
         let log_record = log_record
@@ -3392,6 +3470,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     cursor: 0,
                     schema_process: true,
                     pending_header,
+                    schema_entries: None,
                 });
                 return Ok(TransitionResult::Continue);
             }
@@ -4929,6 +5008,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.blocking_checkpoint_lock.unlock();
     }
 
+    /// Runs [`Self::reset_after_vacuum`] while holding the vacuum gate, as
+    /// VACUUM does.
+    #[cfg(feature = "test_helper")]
+    pub fn reset_after_vacuum_for_testing(&self, header: DatabaseHeader, schema: &Schema) {
+        self.try_begin_vacuum_gate()
+            .expect("no transaction should be active");
+        self.reset_after_vacuum(header, schema);
+        self.release_vacuum_gate();
+    }
+
     /// VACUUM copies the physical DB image, so any transaction frames in the
     /// MVCC logical log must be checkpointed first.
     ///
@@ -5455,26 +5544,52 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         maybe_index_id: Option<MVTableId>,
     ) -> Result<()> {
         tracing::trace!("insert(tx_id={}, row.id={:?})", tx_id, row.id);
+        self.insert_row_version(tx_id, row, maybe_index_id, false)
+    }
+
+    /// Inserts a row that was read from the B-tree (not in MvStore).
+    /// This is used when updating a row that exists in B-tree but hasn't been
+    /// modified in MVCC yet. The btree_resident flag helps the checkpoint logic
+    /// determine if subsequent deletes should be checkpointed to the B-tree file.
+    pub fn insert_btree_resident_to_table_or_index(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+    ) -> Result<()> {
+        tracing::trace!(
+            "insert_btree_resident(tx_id={}, row.id={:?})",
+            tx_id,
+            row.id
+        );
+        self.insert_row_version(tx_id, row, maybe_index_id, true)
+    }
+
+    fn insert_row_version(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+        btree_resident: bool,
+    ) -> Result<()> {
         let tx = self
             .txs
             .get(&tx_id)
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         turso_assert_eq!(tx.state, TransactionState::Active);
+
         let id = row.id.clone();
+        let version_id = self.get_version_id();
+        let row_version = RowVersion::new(
+            version_id,
+            Some(TxTimestampOrID::TxID(tx.tx_id)),
+            None,
+            row.data,
+            btree_resident,
+        );
         match maybe_index_id {
             Some(index_id) => {
-                let version_id = self.get_version_id();
-                let row_version = RowVersion {
-                    id: version_id,
-                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(
-                        tx.tx_id,
-                    ))),
-                    end: crate::mvcc::database::PackedTs::pack(None),
-                    data: row.data.clone(),
-                    btree_resident: false,
-                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-                };
                 let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
                 };
@@ -5496,93 +5611,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // Conflicts are detected at commit time using end_ts comparison.
                 // This allows multiple transactions to insert the same rowid,
                 // with first-committer-wins semantics.
-
-                let version_id = self.get_version_id();
-                let row_version = RowVersion {
-                    id: version_id,
-                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(
-                        tx.tx_id,
-                    ))),
-                    end: crate::mvcc::database::PackedTs::pack(None),
-                    data: row.data,
-                    btree_resident: false,
-                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-                };
                 let (row_versions, chain_in_write_set) =
                     self.insert_version(id.clone(), row_version)?;
-                let allocator = self.get_rowid_allocator(&id.table_id);
-                allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
-                tx.record_created_table_version(id.clone(), version_id);
-                if !chain_in_write_set {
-                    tx.add_to_write_set(id, row_versions);
+                if !btree_resident {
+                    let allocator = self.get_rowid_allocator(&id.table_id);
+                    allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
                 }
-            }
-        }
-        Ok(())
-    }
-
-    /// Inserts a row that was read from the B-tree (not in MvStore).
-    /// This is used when updating a row that exists in B-tree but hasn't been
-    /// modified in MVCC yet. The btree_resident flag helps the checkpoint logic
-    /// determine if subsequent deletes should be checkpointed to the B-tree file.
-    pub fn insert_btree_resident_to_table_or_index(
-        &self,
-        tx_id: TxID,
-        row: Row,
-        maybe_index_id: Option<MVTableId>,
-    ) -> Result<()> {
-        tracing::trace!(
-            "insert_btree_resident(tx_id={}, row.id={:?})",
-            tx_id,
-            row.id
-        );
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-        let tx = tx.value();
-        turso_assert_eq!(tx.state, TransactionState::Active);
-        let id = row.id.clone();
-        match maybe_index_id {
-            Some(index_id) => {
-                let version_id = self.get_version_id();
-                let row_version = RowVersion {
-                    id: version_id,
-                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(
-                        tx.tx_id,
-                    ))),
-                    end: crate::mvcc::database::PackedTs::pack(None),
-                    data: row.data.clone(),
-                    btree_resident: true,
-                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-                };
-                let RowKey::Record(sortable_key) = row.id.row_id else {
-                    panic!("Index writes must be to a record");
-                };
-                let (canonical_key, row_versions, chain_in_write_set) =
-                    self.insert_index_version(index_id, sortable_key, row_version)?;
-                if !chain_in_write_set {
-                    tx.add_to_write_set(
-                        RowID::new(id.table_id, RowKey::Record(canonical_key.clone())),
-                        row_versions,
-                    );
-                }
-                tx.record_created_index_version((index_id, canonical_key), version_id);
-            }
-            None => {
-                let version_id = self.get_version_id();
-                let row_version = RowVersion {
-                    id: version_id,
-                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(
-                        tx.tx_id,
-                    ))),
-                    end: crate::mvcc::database::PackedTs::pack(None),
-                    data: row.data,
-                    btree_resident: true,
-                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-                };
-                let (row_versions, chain_in_write_set) =
-                    self.insert_version(id.clone(), row_version)?;
                 tx.record_created_table_version(id.clone(), version_id);
                 if !chain_in_write_set {
                     tx.add_to_write_set(id, row_versions);
@@ -5711,22 +5745,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     }
                     let chain_in_write_set =
                         chain_has_version_written_by(&locked_row_versions, tx_id);
-                    for rv in locked_row_versions.iter_mut().rev() {
-                        // A transaction cannot delete a version that it cannot see.
-                        // B-tree deletion markers are not visible versions, but their
-                        // end fields can still indicate a write-write conflict.
-                        let visible = rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states);
-                        if (visible || rv.begin().is_none())
-                            && is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
-                        {
-                            return Err(LimboError::WriteWriteConflict);
-                        }
-                        if !visible {
-                            continue;
-                        }
-
-                        let version_id = rv.id;
-                        rv.set_end(Some(TxTimestampOrID::TxID(tx_id)));
+                    if let Some(version_id) =
+                        self.end_visible_version(tx, &mut locked_row_versions)?
+                    {
                         drop(locked_row_versions);
                         self.bump_index_rows_epoch();
                         if !chain_in_write_set {
@@ -5763,22 +5784,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     continue;
                 }
                 let chain_in_write_set = chain_has_version_written_by(&locked_row_versions, tx_id);
-                for rv in locked_row_versions.iter_mut().rev() {
-                    // A transaction cannot delete a version that it cannot see.
-                    // B-tree deletion markers are not visible versions, but their
-                    // end fields can still indicate a write-write conflict.
-                    let visible = rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states);
-                    if (visible || rv.begin().is_none())
-                        && is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
-                    {
-                        return Err(LimboError::WriteWriteConflict);
-                    }
-                    if !visible {
-                        continue;
-                    }
-
-                    let version_id = rv.id;
-                    rv.set_end(Some(TxTimestampOrID::TxID(tx_id)));
+                if let Some(version_id) = self.end_visible_version(tx, &mut locked_row_versions)? {
                     drop(locked_row_versions);
                     self.bump_table_rows_epoch();
                     if !chain_in_write_set {
@@ -5810,6 +5816,29 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 return Ok(true);
             },
         }
+    }
+
+    fn end_visible_version(
+        &self,
+        tx: &Transaction<A>,
+        versions: &mut [RowVersion],
+    ) -> Result<Option<u64>> {
+        for rv in versions.iter_mut().rev() {
+            // A transaction cannot delete a version that it cannot see.
+            // B-tree deletion markers are not visible versions, but their
+            // end fields can still indicate a write-write conflict.
+            let visible = rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states);
+            if (visible || rv.begin().is_none())
+                && is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
+            {
+                return Err(LimboError::WriteWriteConflict);
+            }
+            if visible {
+                rv.set_end(Some(TxTimestampOrID::TxID(tx.tx_id)));
+                return Ok(Some(rv.id));
+            }
+        }
+        Ok(None)
     }
 
     /// Only two readers use the deleted row in a table tombstone: the checkpoint,
@@ -7054,7 +7083,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// invisible to MVCC header lookups even though the pager itself honors `N` for on-disk
     /// page allocation. Only valid before any data has been written; matches the same
     /// precondition `Connection::reset_page_size` enforces via `db.initialized()`.
-    pub fn set_global_page_size(&self, size: PageSize) {
+    pub(crate) fn set_global_page_size(&self, size: PageSize) {
         let mut header = self.global_header.write();
         if let Some(header) = header.as_mut() {
             header.page_size = size;
@@ -7083,7 +7112,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    pub fn with_header_mut<T, F>(&self, f: F, tx_id: Option<&TxID>) -> Result<T>
+    #[cfg(feature = "test_helper")]
+    pub fn with_global_header_mut_for_testing<T>(
+        &self,
+        f: impl Fn(&mut DatabaseHeader) -> T,
+    ) -> Result<T> {
+        self.with_header_mut(f, None)
+    }
+
+    pub(crate) fn with_header_mut<T, F>(&self, f: F, tx_id: Option<&TxID>) -> Result<T>
     where
         F: Fn(&mut DatabaseHeader) -> T,
     {
@@ -7179,7 +7216,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         let dirty_stamp = match tx.state.load() {
             TransactionState::Active => None,
-            TransactionState::Preparing(end_ts) => Some(end_ts),
+            // Commits record dirty keys only for the passive checkpoint.
+            TransactionState::Preparing(end_ts) => {
+                self.experimental_mvcc_passive_checkpoint.then_some(end_ts)
+            }
             other => {
                 unreachable!("rollback_tx requires Active or Preparing, got {other:?}")
             }
@@ -8162,9 +8202,71 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.commit_coordinator.group_commit_enabled()
     }
 
-    #[cfg(test)]
+    /// Number of commit records that the last group commit wrote together.
+    #[cfg(any(test, feature = "test_helper"))]
     pub fn last_group_commit_size(&self) -> usize {
         self.commit_coordinator.last_group_size()
+    }
+
+    /// Takes the lock that a commit holds while it writes the logical log, so
+    /// that commits started meanwhile wait for it. Returns false if it is
+    /// already held.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn lock_commits_for_testing(&self) -> bool {
+        self.commit_coordinator.pager_commit_lock.write()
+    }
+
+    /// Releases the lock taken by [`Self::lock_commits_for_testing`] and wakes
+    /// the commits that wait for it.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn unlock_commits_for_testing(&self) {
+        self.commit_coordinator.unlock_pager_commit_lock();
+    }
+
+    /// Number of commits that wait for the commit lock.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn waiting_commit_count_for_testing(&self) -> usize {
+        self.commit_coordinator.parked_tickets().len()
+    }
+
+    /// Number of times commits ran the step that waits for the commit lock.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn commit_wait_count_for_testing(&self) -> usize {
+        self.commit_coordinator.park_calls()
+    }
+
+    /// Makes GC treat every transaction up to `tx_id` as written to the WAL by
+    /// a checkpoint, whether a checkpoint wrote it or not.
+    #[cfg(feature = "test_helper")]
+    pub fn set_durable_txid_max_for_testing(&self, tx_id: u64) {
+        self.durable_txid_max.store(tx_id, Ordering::SeqCst);
+    }
+
+    /// Moves `tx_id` to Preparing with a new commit timestamp, as if its
+    /// commit had started and not finished.
+    #[cfg(feature = "test_helper")]
+    pub fn start_commit_for_testing(&self, tx_id: TxID) {
+        self.get_commit_timestamp(|ts| {
+            self.txs
+                .get(&tx_id)
+                .expect("the transaction is active")
+                .value()
+                .state
+                .store(TransactionState::Preparing(ts));
+        });
+    }
+
+    /// The number of entries in the write set of transaction `tx_id`, and the
+    /// number of distinct version chains that they point to.
+    #[cfg(feature = "test_helper")]
+    pub fn write_set_counts_for_testing(&self, tx_id: TxID) -> (usize, usize) {
+        let tx = self.txs.get(&tx_id).expect("transaction should exist");
+        let write_set = tx.value().write_set.lock();
+        let distinct_chains: HashSet<usize> = write_set
+            .iter()
+            .map(|(_, row_versions)| Arc::as_ptr(row_versions) as usize)
+            .collect();
+        (write_set.len(), distinct_chains.len())
     }
 
     /// Whether an incremental GC pass should run now: inline GC is enabled
@@ -10799,6 +10901,12 @@ impl RowVersion {
         self.materialized_at
     }
 
+    /// [`Self::materialized_at`] for integration tests.
+    #[cfg(feature = "test_helper")]
+    pub fn materialized_at_for_testing(&self) -> WalPos {
+        self.materialized_at
+    }
+
     #[inline]
     pub(crate) fn set_materialized_at(&mut self, pos: WalPos) {
         self.materialized_at = pos;
@@ -10836,16 +10944,25 @@ impl RowVersion {
     /// timestamp `end_ts`. Shared by the chunked commit step
     /// (`step_rewrite_live_versions`) and the dropped-statement cleanup path
     /// (`rewrite_live_versions_for_committed_tx`) so the two cannot drift.
+    ///
+    /// Keeps `materialized_at`. `tx_id` is already `Committed(end_ts)`, and
+    /// `stamp_chain_materialized` resolves a `TxID` through that state, so the
+    /// rewrite does not change the state a checkpoint wrote to the B-tree. A
+    /// checkpoint pass that ran before the rewrite already removed the key from
+    /// the dirty set, so a reset stamp is never set again and GC never drops
+    /// the version.
     #[inline]
     fn rewrite_txid_to_timestamp(&mut self, tx_id: TxID, end_ts: u64) {
         if let Some(TxTimestampOrID::TxID(rv_id)) = self.begin() {
             if rv_id == tx_id {
-                self.set_begin(Some(TxTimestampOrID::Timestamp(end_ts)));
+                self.begin =
+                    crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(end_ts)));
             }
         }
         if let Some(TxTimestampOrID::TxID(rv_id)) = self.end() {
             if rv_id == tx_id {
-                self.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
+                self.end =
+                    crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(end_ts)));
             }
         }
     }

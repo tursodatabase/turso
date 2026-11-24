@@ -66,6 +66,22 @@ impl ConstraintViolation {
 pub struct DialectError {
     pub code: &'static str,
     pub message: String,
+    /// More about the error, which a dialect may report apart from the
+    /// message, such as the objects that keep it from dropping something.
+    pub detail: Option<String>,
+    /// What the user can do about the error, which a dialect may report
+    /// apart from the message.
+    pub hint: Option<String>,
+}
+
+/// A DROP that was refused because other objects depend on what it drops.
+#[derive(Debug, Clone)]
+pub struct DependentObjects {
+    /// What the statement drops, such as `table t` or `column c of table t`.
+    pub dropped: String,
+    /// One description of each dependent object, such as
+    /// `view v depends on table t`.
+    pub dependents: Vec<String>,
 }
 
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
@@ -96,7 +112,7 @@ pub enum LimboError {
     /// `LimboError`'s size, which rides in every hot-path `Result`.
     #[error(transparent)]
     #[diagnostic(transparent)]
-    LexerError(#[from] Box<turso_parser::error::Error>),
+    LexerError(#[from] Box<crate::ast::error::Error>),
     #[error("Conversion error: {0}")]
     ConversionError(String),
     #[error("Env variable error: {0}")]
@@ -142,7 +158,7 @@ pub enum LimboError {
     /// An error that halts the statement with its own resolve type (RAISE, a
     /// constraint-level ON CONFLICT clause, or a trigger step's OR clause).
     #[error("{1}")]
-    Raise(turso_parser::ast::ResolveType, Box<LimboError>),
+    Raise(crate::ast::ResolveType, Box<LimboError>),
     #[error("RaiseIgnore")]
     RaiseIgnore,
     #[error("Extension error: {0}")]
@@ -217,6 +233,17 @@ pub enum LimboError {
     /// functions. Boxed, so that it does not make every `LimboError` larger.
     #[error("{}", .0.message)]
     Dialect(Box<DialectError>),
+    #[error("cannot drop {} because other objects depend on it: {}", .0.dropped, .0.dependents.join(", "))]
+    DependentObjects(Box<DependentObjects>),
+}
+
+impl LimboError {
+    pub fn dependent_objects(dropped: String, dependents: Vec<String>) -> Self {
+        Self::DependentObjects(Box::new(DependentObjects {
+            dropped,
+            dependents,
+        }))
+    }
 }
 
 /// `?` in functions returning boxed errors (see `InsnResult`) composes
@@ -234,7 +261,7 @@ macro_rules! boxed_from {
 }
 boxed_from!(crate::alloc::TryReserveError);
 boxed_from!(std::collections::TryReserveError);
-boxed_from!(turso_parser::error::Error);
+boxed_from!(crate::ast::error::Error);
 boxed_from!(CompletionError);
 boxed_from!(CacheError);
 boxed_from!(bumpalo::AllocErr);
@@ -246,8 +273,8 @@ impl From<Box<LimboError>> for LimboError {
     }
 }
 
-impl From<turso_parser::error::Error> for LimboError {
-    fn from(err: turso_parser::error::Error) -> Self {
+impl From<crate::ast::error::Error> for LimboError {
+    fn from(err: crate::ast::error::Error) -> Self {
         LimboError::LexerError(Box::new(err))
     }
 }

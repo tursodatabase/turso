@@ -1283,67 +1283,54 @@ pub fn read_text(payload: &[u8]) -> Result<&str> {
 
 #[inline(always)]
 pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
-    match serial_type {
-        1 => {
-            if buf.is_empty() {
-                mark_unlikely();
-                crate::bail_corrupt_error!("Invalid 1-byte int");
-            }
-            Ok(buf[0] as i8 as i64)
-        }
-        2 => {
-            if buf.len() < 2 {
-                mark_unlikely();
-                crate::bail_corrupt_error!("Invalid 2-byte int");
-            }
-            Ok(i16::from_be_bytes([buf[0], buf[1]]) as i64)
-        }
+    match try_read_integer(buf, serial_type) {
+        Some((value, _)) => Ok(value),
+        None => invalid_integer(serial_type),
+    }
+}
+
+/// The integer of an integer `serial_type` at the start of `buf`, and its
+/// number of data bytes. None for a serial type that is not an integer, and
+/// for a `buf` that is too short: [read_integer] gives an error in these
+/// cases. This function makes no error value, so that a caller in a hot
+/// loop, as the comparison of two MVCC index keys, gets no error code where
+/// it is inlined.
+#[inline(always)]
+pub fn try_read_integer(buf: &[u8], serial_type: u8) -> Option<(i64, usize)> {
+    // The arithmetic shifts give the sign of the 3-byte and the 6-byte
+    // integers.
+    Some(match serial_type {
+        1 => (i64::from(i8::from_be_bytes(*buf.first_chunk()?)), 1),
+        2 => (i64::from(i16::from_be_bytes(*buf.first_chunk()?)), 2),
         3 => {
-            if buf.len() < 3 {
-                mark_unlikely();
-                crate::bail_corrupt_error!("Invalid 3-byte int");
-            }
-            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
-            Ok(i32::from_be_bytes([sign_extension, buf[0], buf[1], buf[2]]) as i64)
+            let &[b0, b1, b2] = buf.first_chunk()?;
+            (i64::from(i32::from_be_bytes([b0, b1, b2, 0]) >> 8), 3)
         }
-        4 => {
-            if buf.len() < 4 {
-                mark_unlikely();
-                crate::bail_corrupt_error!("Invalid 4-byte int");
-            }
-            Ok(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64)
-        }
+        4 => (i64::from(i32::from_be_bytes(*buf.first_chunk()?)), 4),
         5 => {
-            if buf.len() < 6 {
-                mark_unlikely();
-                crate::bail_corrupt_error!("Invalid 6-byte int");
-            }
-            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
-            Ok(i64::from_be_bytes([
-                sign_extension,
-                sign_extension,
-                buf[0],
-                buf[1],
-                buf[2],
-                buf[3],
-                buf[4],
-                buf[5],
-            ]))
+            let &[b0, b1, b2, b3, b4, b5] = buf.first_chunk()?;
+            (i64::from_be_bytes([b0, b1, b2, b3, b4, b5, 0, 0]) >> 16, 6)
         }
-        6 => {
-            if buf.len() < 8 {
-                crate::bail_corrupt_error!("Invalid 8-byte int");
-            }
-            Ok(i64::from_be_bytes([
-                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-            ]))
-        }
-        8 => Ok(0),
-        9 => Ok(1),
-        _ => {
-            mark_unlikely();
-            crate::bail_corrupt_error!("Invalid serial type for integer")
-        }
+        6 => (i64::from_be_bytes(*buf.first_chunk()?), 8),
+        8 => (0, 0),
+        9 => (1, 0),
+        _ => return None,
+    })
+}
+
+/// The error of [read_integer] when `serial_type` is not an integer type or
+/// the buffer is too short for it.
+#[cold]
+#[inline(never)]
+fn invalid_integer(serial_type: u8) -> Result<i64> {
+    match serial_type {
+        1 => crate::bail_corrupt_error!("Invalid 1-byte int"),
+        2 => crate::bail_corrupt_error!("Invalid 2-byte int"),
+        3 => crate::bail_corrupt_error!("Invalid 3-byte int"),
+        4 => crate::bail_corrupt_error!("Invalid 4-byte int"),
+        5 => crate::bail_corrupt_error!("Invalid 6-byte int"),
+        6 => crate::bail_corrupt_error!("Invalid 8-byte int"),
+        _ => crate::bail_corrupt_error!("Invalid serial type for integer"),
     }
 }
 
@@ -1506,7 +1493,16 @@ pub fn write_varint(buf: &mut [u8], value: u64) -> usize {
     n
 }
 
+/// Appends the varint of `value` to `payload`.
+#[inline(always)]
 pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
+    // The varint of a value of less than 128 is one byte that is the value
+    // itself. A copy of `varint[0..n]` has a length that is not known at
+    // compile time, and costs a call of memcpy.
+    if value < 0x80 {
+        payload.push(value as u8);
+        return;
+    }
     let mut varint = [0u8; 9];
     let n = write_varint(&mut varint, value);
     payload.extend_from_slice(&varint[0..n]);
@@ -2745,5 +2741,20 @@ mod tests {
             seen_lengths,
             (1..=9).collect::<std::collections::HashSet<_>>()
         );
+    }
+
+    #[test]
+    fn write_varint_to_vec_appends_the_bytes_of_write_varint() {
+        let values = (0..64)
+            .flat_map(|bits| [(1u64 << bits) - 1, 1u64 << bits])
+            .chain([u64::MAX]);
+        for value in values {
+            let mut expected = [0u8; 9];
+            let len = write_varint(&mut expected, value);
+            let mut appended = std::vec![0xab_u8];
+            write_varint_to_vec(value, &mut appended);
+            assert_eq!(appended[0], 0xab, "value {value}");
+            assert_eq!(&appended[1..], &expected[..len], "value {value}");
+        }
     }
 }

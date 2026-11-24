@@ -3,6 +3,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "ast",
     "bindings/java",
     "bindings/javascript",
     "bindings/javascript/sync",
@@ -62,6 +63,7 @@ members = [
 ]
 
 default-members = [
+    "ast",
     "bindings/java",
     "bindings/javascript",
     "bindings/javascript/sync",
@@ -107,7 +109,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.9.0-pre.5"
+version = "0.9.0-pre.6"
 authors = ["the Turso authors"]
 edition = "2021"
 license = "MIT"
@@ -115,23 +117,24 @@ repository = "https://github.com/tursodatabase/turso"
 
 [workspace.dependencies]
 chumsky = { version = "0.13", default-features = false, features = ["std"] }
-turso = { path = "bindings/rust", version = "0.9.0-pre.5" }
-turso_node = { path = "bindings/javascript", version = "0.9.0-pre.5" }
-turso_sdk_kit = { path = "sdk-kit", version = "0.9.0-pre.5" }
-turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.9.0-pre.5" }
-turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.9.0-pre.5" }
-limbo_completion = { path = "extensions/completion", version = "0.9.0-pre.5" }
-limbo_csv = { path = "extensions/csv", version = "0.9.0-pre.5" }
-turso_core = { path = "core", version = "0.9.0-pre.5" }
-turso_sync_engine = { path = "sync/engine", version = "0.9.0-pre.5" }
-turso_ext = { path = "extensions/core", version = "0.9.0-pre.5" }
-turso_macros = { path = "macros", version = "0.9.0-pre.5" }
-turso_parser = { path = "sqlite/parser", version = "0.9.0-pre.5" }
-turso_sqlite = { path = "sqlite/frontend", version = "0.9.0-pre.5" }
-turso_pg = { path = "postgres/frontend", version = "0.9.0-pre.5" }
-turso_pg_client = { path = "postgres/client", version = "0.9.0-pre.5" }
-turso_pg_parser = { path = "postgres/parser", version = "0.9.0-pre.5" }
-turso_pg_server = { path = "postgres/server", version = "0.9.0-pre.5" }
+turso = { path = "bindings/rust", version = "0.9.0-pre.6" }
+turso_node = { path = "bindings/javascript", version = "0.9.0-pre.6" }
+turso_sdk_kit = { path = "sdk-kit", version = "0.9.0-pre.6" }
+turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.9.0-pre.6" }
+turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.9.0-pre.6" }
+limbo_completion = { path = "extensions/completion", version = "0.9.0-pre.6" }
+limbo_csv = { path = "extensions/csv", version = "0.9.0-pre.6" }
+turso_ast = { path = "ast", version = "0.9.0-pre.6" }
+turso_core = { path = "core", version = "0.9.0-pre.6" }
+turso_sync_engine = { path = "sync/engine", version = "0.9.0-pre.6" }
+turso_ext = { path = "extensions/core", version = "0.9.0-pre.6" }
+turso_macros = { path = "macros", version = "0.9.0-pre.6" }
+turso_parser = { path = "sqlite/parser", version = "0.9.0-pre.6" }
+turso_sqlite = { path = "sqlite/frontend", version = "0.9.0-pre.6" }
+turso_pg = { path = "postgres/frontend", version = "0.9.0-pre.6" }
+turso_pg_client = { path = "postgres/client", version = "0.9.0-pre.6" }
+turso_pg_parser = { path = "postgres/parser", version = "0.9.0-pre.6" }
+turso_pg_server = { path = "postgres/server", version = "0.9.0-pre.6" }
 sql_generation = { path = "sql_generation" }
 turso-dbhash = { path = "tools/dbhash" }
 strum = { version = "0.26", features = ["derive"] }
@@ -154,6 +157,10 @@ futures = "0.3"
 clap = "4.5.47"
 thiserror = "2.0.16"
 tempfile = "3.20.0"
+# aristo SDK from crates.io. It also has the aristo::instrument surface behind
+# the `aristo_instrument` feature. The conformance harness resolves aristo and
+# aristo-macros from crates.io, so no vendored copy or path rewrite is needed.
+aristo = "0.4"
 indexmap = "2.11.1"
 indicatif = "0.17"
 miette = "7.6.0"
@@ -189,8 +196,33 @@ windows-sys = "0.61.2"
 loom = { version = "0.7" }
 shuttle = { version = "0.8.1" }
 
+# Proc macros run inside rustc each time that a crate that uses them compiles.
+# For example, #[turso_macros::test] runs on more than 800 functions in each
+# rebuild of tests/integration. Proc macros spend most of their time in syn,
+# proc-macro2 and quote, so these crates and turso_macros are optimized.
+[profile.dev.package.turso_macros]
+opt-level = 3
+
+[profile.dev.package.syn]
+opt-level = 3
+
+[profile.dev.package.proc-macro2]
+opt-level = 3
+
+[profile.dev.package.quote]
+opt-level = 3
+
 [profile.dev.package.similar]
 opt-level = 3
+
+# CI runs the simulator built with this profile. A simulation runs about ten
+# times faster than with the dev profile, and a rebuild after a change to
+# turso_core takes about twice as long. opt-level 2 runs no faster than 1.
+# Debug assertions and overflow checks stay on, as in dev.
+[profile.simulator]
+inherits = "dev"
+opt-level = 1
+debug = "line-tables-only"
 
 [profile.release]
 debug = "line-tables-only"

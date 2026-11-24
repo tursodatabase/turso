@@ -1,10 +1,10 @@
+use crate::ast::SortOrder;
 use crate::translate::collate::CollationSeq;
 use crate::vdbe::{
     builder::CursorType,
     insn::{ClearBtreeCount, IntegrityCkData, RegisterOrLiteral, SorterOpenData},
 };
 use crate::HashSet;
-use turso_parser::ast::SortOrder;
 
 use super::{Insn, InsnReference, PreparedProgram, Value};
 use crate::function::{Func, ScalarFunc};
@@ -767,6 +767,21 @@ pub fn insn_to_row(
                 0,
                 description.clone(),
             ),
+            Insn::TypeConversion {
+                function: _,
+                reg,
+                params_reg,
+                param_count,
+                description,
+            } => (
+                "TypeConversion",
+                *reg as i64,
+                *params_reg as i64,
+                *param_count as i64,
+                Value::build_text(""),
+                0,
+                description.clone(),
+            ),
             Insn::ArrayEncode { data } => (
                 "ArrayEncode",
                 data.reg as i64,
@@ -1386,7 +1401,13 @@ pub fn insn_to_row(
                     data.func.as_str().to_string()
                 }),
                 0,
-                format!("accum=r[{}] step(r[{}])", data.acc_reg, data.col),
+                match data.minmax_keeps_best_reg {
+                    Some(reg) => format!(
+                        "accum=r[{}] step(r[{}]); r[{}]=1 if accum kept its value",
+                        data.acc_reg, data.col, reg
+                    ),
+                    None => format!("accum=r[{}] step(r[{}])", data.acc_reg, data.col),
+                },
             ),
             Insn::AggInverse {
                 func,
@@ -1489,8 +1510,8 @@ pub fn insn_to_row(
                             coll => format!("{sign}{coll}"),
                         };
                         match nulls {
-                            Some(turso_parser::ast::NullsOrder::First) => format!("{coll_str} NF"),
-                            Some(turso_parser::ast::NullsOrder::Last) => format!("{coll_str} NL"),
+                            Some(crate::ast::NullsOrder::First) => format!("{coll_str} NF"),
+                            Some(crate::ast::NullsOrder::Last) => format!("{coll_str} NL"),
                             None => coll_str,
                         }
                     })

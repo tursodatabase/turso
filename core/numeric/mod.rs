@@ -1029,6 +1029,9 @@ pub(crate) struct IntegerText {
 }
 
 impl IntegerText {
+    // Not inlined, so that its callers, such as the operands of `||`, stay
+    // small enough for the compiler to inline them.
+    #[inline(never)]
     pub(crate) fn new(value: i64) -> Self {
         let mut buf = [0u8; 20];
         let digits = write_decimal_digits(&mut buf, value.unsigned_abs()).len();
@@ -1047,21 +1050,38 @@ impl IntegerText {
 }
 
 /// Write the decimal digits of `n` at the end of `buf`, and return them.
-// Without inline(always), the date and time functions in another module
-// call this function, and the call costs more than the loop.
-#[inline(always)]
+// Not inlined: in a caller that owns `buf`, the compiler unrolls the loop for
+// all 20 digits and keeps each byte of `buf` in a register. That makes the
+// caller several kilobytes larger, and each byte of the result is moved one at
+// a time.
+#[inline(never)]
 pub(crate) fn write_decimal_digits(buf: &mut [u8; 20], mut n: u64) -> &[u8] {
     let mut start = buf.len();
-    loop {
+    // Two digits for each division, from a table of the pairs.
+    while n >= 100 {
+        let pair = usize::from((n % 100) as u8) * 2;
+        n /= 100;
+        start -= 2;
+        buf[start..start + 2].copy_from_slice(&DIGIT_PAIRS.as_bytes()[pair..pair + 2]);
+    }
+    if n >= 10 {
+        let pair = usize::from(n as u8) * 2;
+        start -= 2;
+        buf[start..start + 2].copy_from_slice(&DIGIT_PAIRS.as_bytes()[pair..pair + 2]);
+    } else {
         start -= 1;
-        buf[start] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
+        buf[start] = b'0' + n as u8;
     }
     &buf[start..]
 }
+
+/// The numbers from 0 to 99, each as two ASCII digits.
+pub(crate) const DIGIT_PAIRS: &str = "\
+    0001020304050607080910111213141516171819\
+    2021222324252627282930313233343536373839\
+    4041424344454647484950515253545556575859\
+    6061626364656667686970717273747576777879\
+    8081828384858687888990919293949596979899";
 
 pub fn format_float_for_quote(v: f64) -> String {
     if v.is_nan() {

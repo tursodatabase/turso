@@ -1,6 +1,7 @@
 mod datetime;
 mod likeop;
 mod numeric;
+mod printf;
 mod value;
 
 use divan::AllocProfiler;

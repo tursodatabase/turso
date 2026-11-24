@@ -1,10 +1,10 @@
+use crate::ast;
 use crate::schema::Index;
 use crate::stats::AnalyzeStats;
 use crate::sync::Arc;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::RangeConstraintRef;
 use crate::translate::plan::JoinedTable;
-use turso_parser::ast;
 
 use super::constraints::Constraint;
 use super::cost_params::CostModelParams;
@@ -366,6 +366,15 @@ pub(crate) fn estimate_rows_per_seek(
         }
     }
 
+    if let Some(rows) = default_rows_for_first_column_of_unique_key(
+        index_info,
+        constraints,
+        usable_constraint_refs,
+        base_row_count,
+    ) {
+        return rows * join_probe_constant_selectivity;
+    }
+
     let selectivity_multiplier: f64 = usable_constraint_refs
         .iter()
         .map(|cref| {
@@ -384,6 +393,58 @@ pub(crate) fn estimate_rows_per_seek(
         .product();
 
     (selectivity_multiplier * *base_row_count).max(1.0) * join_probe_constant_selectivity
+}
+
+/// Default number of rows that match `=` on the first column of an index
+/// without ANALYZE stats. This is the value SQLite's sqlite3DefaultRowEst()
+/// uses for a one-column prefix.
+const DEFAULT_ROWS_PER_FIRST_COLUMN_OF_INDEX: f64 = 10.0;
+
+/// Rows per seek with `=` on only the first column of a unique index with
+/// several columns, such as a composite primary key, when ANALYZE has no
+/// stats. Returns `None` for any other seek.
+///
+/// The per-column estimate for that column is a fixed fraction of the table,
+/// so `l_orderkey = ?` on TPC-H's PRIMARY KEY (l_orderkey, l_linenumber)
+/// estimates thousands of rows of a 6M-row lineitem table, where the first
+/// key column usually matches a few rows. Like SQLite, the estimate is 10
+/// rows, times the selectivity of any range constraint on the next column.
+/// Longer prefixes keep the product of the per-column estimates, which
+/// includes the factor of every column that leads no index.
+fn default_rows_for_first_column_of_unique_key(
+    index_info: IndexInfo,
+    constraints: &[Constraint],
+    usable_constraint_refs: &[RangeConstraintRef],
+    base_row_count: RowCountEstimate,
+) -> Option<f64> {
+    if !index_info.unique || index_info.column_count < 2 {
+        return None;
+    }
+    let eq_prefix_len = usable_constraint_refs
+        .iter()
+        .take_while(|cref| cref.eq.is_some())
+        .count();
+    if eq_prefix_len != 1 {
+        return None;
+    }
+    let range_selectivity: f64 = usable_constraint_refs[1..]
+        .iter()
+        .map(|cref| {
+            let mut selectivity = 1.0;
+            if let Some(lower_bound) = cref.lower_bound {
+                selectivity *= constraints[lower_bound].selectivity;
+            }
+            if let Some(upper_bound) = cref.upper_bound {
+                selectivity *= constraints[upper_bound].selectivity;
+            }
+            selectivity
+        })
+        .product();
+    Some(
+        (DEFAULT_ROWS_PER_FIRST_COLUMN_OF_INDEX * range_selectivity)
+            .min(*base_row_count)
+            .max(1.0),
+    )
 }
 
 fn join_probe_constant_selectivity(

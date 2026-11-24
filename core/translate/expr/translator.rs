@@ -63,7 +63,7 @@ pub fn translate_expr_no_constant_opt(
         expr,
         deopt_reason
     );
-    let next_span_idx = program.constant_spans_next_idx();
+    let next_span_idx = program.constants_in_place_start();
     let translated = translate_expr(program, referenced_tables, expr, target_register, resolver)?;
     program.constant_spans_invalidate_after(next_span_idx);
     Ok(translated)
@@ -73,10 +73,13 @@ pub fn translate_expr_no_constant_opt(
 ///
 /// Unlike `translate_expr`, this does not require a pre-allocated target register.
 /// If the expression is found in the `expr_to_reg_cache`, the cached register is
-/// returned directly without emitting a Copy instruction. Otherwise, a new register
-/// is allocated and the expression is translated into it.
+/// returned directly without emitting a Copy instruction. If an equal constant
+/// was already moved to the init section by this function, its register is
+/// returned. Otherwise, a new register is allocated and the expression is
+/// translated into it.
 ///
-/// Callers MUST use the returned register — they cannot assume a specific destination.
+/// Callers MUST use the returned register, and MUST NOT write to it — they
+/// cannot assume a specific destination.
 #[must_use = "the returned register must be used, because that is where the expression value is stored"]
 pub fn resolve_expr(
     program: &mut ProgramBuilder,
@@ -89,8 +92,23 @@ pub fn resolve_expr(
             return Ok(reg);
         }
     }
+    // As in SQLite, a constant that calls a function is not reused: the
+    // translation of some functions depends on where they are called, such as
+    // `union_value()` on the column it writes.
+    let reusable =
+        expr.is_constant(resolver) && !walk::expr_contains_function(expr, resolver, |_| true)?;
+    if reusable {
+        if let Some(reg) = program.reusable_constant_register(expr) {
+            return Ok(reg);
+        }
+    }
     let dest_reg = program.alloc_register();
-    translate_expr(program, referenced_tables, expr, dest_reg, resolver)
+    let span_idx = program.constant_spans_next_idx();
+    translate_expr(program, referenced_tables, expr, dest_reg, resolver)?;
+    if reusable {
+        program.add_reusable_constant(expr, dest_reg, span_idx);
+    }
+    Ok(dest_reg)
 }
 
 /// Translate an expression into bytecode.
@@ -846,6 +864,12 @@ fn translate_cast_expr(
     // runs numeric's `-` on 1.50.
     translate_expr(program, referenced_tables, expr, target_register, resolver)?;
 
+    if let Some(tn) = type_name {
+        let source = type_of(expr, &TypeEnv::new(referenced_tables, resolver));
+        let target = custom_type_cast_chain(tn, resolver.schema())?;
+        check_cast_from_text_input_type(&source, target.as_ref(), tn, resolver)?;
+    }
+
     let cast_type_name = type_name.as_ref().map(|tn| crate::util::dequote(&tn.name));
 
     if let (Some(tn), Some(cast_type_name)) = (type_name, &cast_type_name) {
@@ -936,16 +960,15 @@ fn emit_custom_type_cast(
         None => Vec::new(),
     };
 
-    // A cast to a domain over boolean gives true for every nonzero
-    // integer in dialects whose integer-to-boolean cast does, before
-    // boolean's ENCODE sees the value.
+    // A type may take more values in a CAST than in a column: the boolean
+    // of the PostgreSQL frontend gives true for every nonzero integer in a
+    // CAST. Its conversion runs before the type stores the value. A CAST to
+    // a domain runs the conversion of the type the domain is based on.
     let is_domain = chain[0].is_domain;
-    if is_domain
-        && chain
-            .iter()
-            .any(|type_def| casts_nonzero_integer_to_true(type_def, resolver))
-    {
-        emit_integer_to_boolean_cast(program, reg);
+    for type_def in chain {
+        if let Some(cast) = type_def.cast() {
+            emit_conversion(program, type_def, "CAST", cast, reg, resolver)?;
+        }
     }
     // The CAST first converts the value to the type's input type as a
     // CAST to that type would, then stores it as a column of the type
@@ -1014,39 +1037,6 @@ pub(crate) fn is_sqlite_cast_to(type_def: &TypeDef, type_name: &ast::Type) -> bo
     !type_def.is_domain && user_param_count != 0 && type_arg_count != user_param_count
 }
 
-/// True when a cast to `type_def` turns every nonzero integer into true.
-fn casts_nonzero_integer_to_true(type_def: &TypeDef, resolver: &Resolver) -> bool {
-    type_def.is_builtin
-        && type_def.name == "boolean"
-        && resolver.catalog.dialect.casts_nonzero_integer_to_true()
-}
-
-/// Replaces an integer in `reg` with 1 when it is nonzero and 0 when it is
-/// zero. Other values are left for the boolean type's ENCODE.
-fn emit_integer_to_boolean_cast(program: &mut ProgramBuilder, reg: usize) {
-    let to_boolean = program.allocate_label();
-    let done = program.allocate_label();
-    // IsType also jumps for NULL, which must stay NULL.
-    program.emit_insn(Insn::IsNull {
-        reg,
-        target_pc: done,
-    });
-    program.emit_insn(Insn::IsType {
-        reg,
-        target_pc: to_boolean,
-        value_type: crate::types::ValueType::Integer,
-    });
-    program.emit_insn(Insn::Goto { target_pc: done });
-    program.preassign_label_to_next_insn(to_boolean);
-    program.emit_insn(Insn::IsTrue {
-        reg,
-        dest: reg,
-        null_value: false,
-        invert: false,
-    });
-    program.preassign_label_to_next_insn(done);
-}
-
 #[inline(never)]
 fn translate_collate_expr(
     program: &mut ProgramBuilder,
@@ -1111,7 +1101,7 @@ fn translate_function_call_expr(
     };
 
     match &func_ctx.func {
-        Func::Agg(_) => {
+        func if func.is_aggregate() => {
             crate::bail_parse_error!(
                 "misuse of {} function {}()",
                 if filter_over.over_clause.is_some() {
@@ -1122,6 +1112,7 @@ fn translate_function_call_expr(
                 name.as_str()
             )
         }
+        Func::Agg(_) => unreachable!("is_aggregate() is true for every built-in aggregate"),
         Func::Window(_) => {
             crate::bail_parse_error!("misuse of window function {}()", name.as_str())
         }
@@ -1129,8 +1120,16 @@ fn translate_function_call_expr(
             let argument_types: Vec<String> = match &func_ctx.func {
                 Func::External(external) if external.func.receives_argument_types() => {
                     let env = TypeEnv::new(referenced_tables, resolver);
-                    args.iter()
-                        .map(|arg| name_without_domains(type_of(arg, &env), resolver.schema()))
+                    let written_types: Vec<ExprType> =
+                        args.iter().map(|arg| type_of(arg, &env)).collect();
+                    if let Some(check) = external.func.check_argument_types() {
+                        let names: Vec<String> =
+                            written_types.iter().map(|ty| ty.to_string()).collect();
+                        check(&names)?;
+                    }
+                    written_types
+                        .into_iter()
+                        .map(|ty| name_without_domains(ty, resolver.schema()))
                         .collect()
                 }
                 _ => Vec::new(),

@@ -1,7 +1,7 @@
 use super::stream::EphemeralDelta;
+use crate::ast::{self, TableInternalId};
 use crate::namespace::NamespaceRef;
 use rustc_hash::FxHashMap;
-use turso_parser::ast::{self, TableInternalId};
 
 use crate::incremental::dag;
 use crate::schema::BTreeTable;

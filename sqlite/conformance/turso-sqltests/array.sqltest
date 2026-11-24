@@ -490,6 +490,15 @@ expect {
     1|{NULL}
 }
 
+test array-blob-elements-print-as-blob-literals {
+    CREATE TABLE t_blob_elems (id INTEGER PRIMARY KEY, data BLOB[]) STRICT;
+    INSERT INTO t_blob_elems VALUES (1, ARRAY[X'6162', NULL, X'']);
+    SELECT id, data FROM t_blob_elems;
+}
+expect {
+    1|{"X'6162'",NULL,"X''"}
+}
+
 test array-concat-append {
     CREATE TABLE t_concat (id INTEGER PRIMARY KEY, tags text[]) STRICT;
     INSERT INTO t_concat VALUES (1, ARRAY['a','b']);

@@ -1,9 +1,7 @@
 use super::{Connection, SchemaReparseGuard};
 use crate::alloc::TryClone;
 use crate::namespace::NamespaceId;
-use crate::schema::load::{
-    CustomTypes, DialectState, NamespaceNames, SchemaLoader, SchemaRows, Sequences, ViewsAndIndexes,
-};
+use crate::schema::load::{load_steps, SchemaInstall, SchemaLoader, StepsFor};
 use crate::schema::SequencesByNamespace;
 use crate::sync::Arc;
 use crate::util::IOExt;
@@ -25,16 +23,13 @@ pub struct ReparseSchemaInner {
     /// Held for the whole reparse so a concurrent reparse on this connection
     /// trips the recursion assert. Dropped when the schema is finalized.
     _guard: SchemaReparseGuard,
-    /// Runs the steps that read the schema, and holds the schema that is
-    /// being read.
-    loader: SchemaLoader,
     phase: ReparsePhase,
 }
 
 enum ReparsePhase {
     /// Running the steps of the schema loader.
-    RunLoadSteps,
-    /// Best-effort ANALYZE-stats refresh before finalizing.
+    RunLoadSteps { loader: SchemaLoader },
+    /// Best-effort ANALYZE-stats refresh after installing the rebuilt schema.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
     },
@@ -129,15 +124,14 @@ impl Connection {
         // the loader swaps our schema with a new clean schema that has the same header cookie
         // before it prepares its first statement.
         let mut loader = SchemaLoader::new(
-            fresh,
-            vec![
-                Box::new(SchemaRows::new(self.clone())),
-                Box::new(NamespaceNames::new(self.clone())),
-                Box::new(Sequences::new(self.clone(), preserved_sequences)),
-                Box::new(CustomTypes::new(self.clone())),
-                Box::new(ViewsAndIndexes::new(self.clone())),
-                Box::new(DialectState::new(self.clone())),
-            ],
+            Arc::new(fresh),
+            load_steps(
+                self,
+                StepsFor::Reload {
+                    preserved_sequences,
+                },
+            ),
+            SchemaInstall::ConnectionCopy,
         );
         loader.prepare_next_statement(self)?;
 
@@ -147,13 +141,13 @@ impl Connection {
         }
         Ok(ReparseSchemaInner {
             _guard: guard,
-            loader,
-            phase: ReparsePhase::RunLoadSteps,
+            phase: ReparsePhase::RunLoadSteps { loader },
         })
     }
 
     /// Drive the schema-rebuild phases held in `state` (must be `Building`).
-    /// Yields IO; on completion installs the finished schema and resets `state`.
+    /// Yields IO; on completion installs the finished schema (including any
+    /// ANALYZE statistics loaded from `sqlite_stat1`) and resets `state`.
     fn drive_reparse_building(
         self: &Arc<Connection>,
         state: &mut ReparseSchemaState,
@@ -164,30 +158,38 @@ impl Connection {
                 unreachable!("drive_reparse_building requires Building state");
             };
             match &mut inner.phase {
-                ReparsePhase::RunLoadSteps => {
-                    crate::return_if_io!(inner.loader.run(self));
-                    inner.phase = ReparsePhase::RefreshStats {
-                        stats: Default::default(),
+                ReparsePhase::RunLoadSteps { loader } => {
+                    crate::return_if_io!(loader.run(self));
+                    // Install the rebuilt schema before refreshing stats so the
+                    // `sqlite_stat1` scan sees the freshly loaded tables and
+                    // the refresh updates this schema instead of being
+                    // overwritten afterward. `_guard` stays held until
+                    // `RefreshStats` finishes.
+                    let ReparsePhase::RunLoadSteps { loader } = std::mem::replace(
+                        &mut inner.phase,
+                        ReparsePhase::RefreshStats {
+                            stats: Default::default(),
+                        },
+                    ) else {
+                        unreachable!("phase is RunLoadSteps");
                     };
-                }
-                ReparsePhase::RefreshStats { stats } => {
-                    // Best-effort load stats if sqlite_stat1 is present.
-                    crate::return_if_io!(crate::stats::refresh_analyze_stats_nonblock(self, stats));
-
-                    // Finalize: install the rebuilt schema. Take ownership so the
-                    // guard drops and `state` is reusable.
-                    let ReparseSchemaState::Building(inner) = std::mem::take(state) else {
-                        unreachable!("state is Building");
-                    };
-                    let fresh = inner.loader.into_schema();
+                    let fresh = loader.into_schema();
                     tracing::debug!(
                         "reparse_schema: schema_version={}, tables={:?}",
                         fresh.schema_version,
                         fresh.table_names(NamespaceId::ROOT).collect::<Vec<_>>()
                     );
-                    self.with_schema_mut(|schema| {
-                        *schema = fresh;
-                    })?;
+                    *self.schema.write() = fresh;
+                }
+                ReparsePhase::RefreshStats { stats } => {
+                    // Best-effort load stats if sqlite_stat1 is present.
+                    crate::return_if_io!(
+                        crate::stats::refresh_analyze_stats_connection_only_nonblock(self, stats)
+                    );
+
+                    // Finalize: drop the reparse guard and reset `state` so it
+                    // is reusable.
+                    let _ = std::mem::take(state);
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -214,9 +216,23 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
     use crate::security::roles::SessionRole;
-    use crate::SqliteDialect;
     use crate::{ConnectOpts, Database};
+
+    #[test]
+    fn reparsing_an_empty_schema_parses_no_sql() {
+        let db = Database::open_file(
+            Arc::new(crate::MemoryIO::new()),
+            ":memory:",
+            Arc::new(DialectThatCannotParse),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.reparse_schema().unwrap();
+    }
 
     /// The reparse of the schema installs a fresh schema before the
     /// dialect's schema state is read, and a statement compiled meanwhile
@@ -226,7 +242,7 @@ mod tests {
         let db = Database::open_file(
             Arc::new(crate::MemoryIO::new()),
             ":memory:",
-            Arc::new(SqliteDialect),
+            Arc::new(DialectThatCannotParse),
         )
         .unwrap();
         let conn = db
@@ -236,7 +252,7 @@ mod tests {
             schema.dialect_schema = Some(Arc::new(()));
         })
         .unwrap();
-        let fresh = crate::schema::builtin::schema_builder(&SqliteDialect, false)
+        let fresh = crate::schema::builtin::schema_builder(false)
             .unwrap()
             .build();
         assert!(fresh.dialect_schema.is_none());

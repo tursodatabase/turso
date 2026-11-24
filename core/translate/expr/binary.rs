@@ -98,10 +98,11 @@ fn emit_row_valued_binary_expr(
 }
 
 /// Function instructions read contiguous registers start_reg..start_reg+arg_count.
-/// When both operands are equivalent the compiler reuses a single shared register,
-/// so copy it into a contiguous pair.
+/// The operands are in registers that [resolve_expr()] chose, which can be one
+/// shared register or two registers that are not next to each other, so copy
+/// them into a contiguous pair then.
 fn contiguous_operands(program: &mut ProgramBuilder, lhs: usize, rhs: usize) -> usize {
-    if lhs != rhs {
+    if rhs == lhs + 1 {
         return lhs;
     }
     let regs = program.alloc_registers(2);
@@ -111,7 +112,7 @@ fn contiguous_operands(program: &mut ProgramBuilder, lhs: usize, rhs: usize) -> 
         extra_amount: 0,
     });
     program.emit_insn(Insn::Copy {
-        src_reg: lhs,
+        src_reg: rhs,
         dst_reg: regs + 1,
         extra_amount: 0,
     });
@@ -133,8 +134,7 @@ pub(super) fn emit_binary_expr_scalar(
     if exprs_are_equivalent(e1, e2)
         && !expr_contains_nondeterministic_scalar_function(e1, resolver)?
     {
-        let shared_reg = program.alloc_register();
-        translate_expr(program, referenced_tables, e1, shared_reg, resolver)?;
+        let shared_reg = resolve_expr(program, referenced_tables, e1, resolver)?;
 
         match emit_mode {
             BinaryEmitMode::Value => emit_binary_insn(
@@ -163,15 +163,17 @@ pub(super) fn emit_binary_expr_scalar(
         }
         Ok(target_register)
     } else {
-        let e1_reg = program.alloc_registers(2);
-        let e2_reg = e1_reg + 1;
-
-        if op.is_comparison() {
-            translate_compared_pair(program, referenced_tables, e1, e2, e1_reg, e2_reg, resolver)?;
+        let (e1_reg, e2_reg) = if op.is_comparison() {
+            (
+                resolve_compared_value(program, referenced_tables, e1, e2, resolver)?,
+                resolve_compared_value(program, referenced_tables, e2, e1, resolver)?,
+            )
         } else {
-            translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
-            translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
-        }
+            (
+                resolve_expr(program, referenced_tables, e1, resolver)?,
+                resolve_expr(program, referenced_tables, e2, resolver)?,
+            )
+        };
 
         match emit_mode {
             BinaryEmitMode::Value => emit_binary_insn(
@@ -797,19 +799,14 @@ pub(super) fn emit_binary_insn(
             }
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
-            resolver.require_custom_types("Array features")?;
+            let func = containment_func(op, lhs_expr, rhs_expr, referenced_tables, resolver)?;
             let start = contiguous_operands(program, lhs, rhs);
-            let func = match op {
-                ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
-                ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
-                _ => unreachable!(),
-            };
             program.emit_insn(Insn::Function {
                 constant_mask: 0,
                 start_reg: start,
                 dest: target_register,
                 func: FuncCtx {
-                    func: Func::Scalar(func),
+                    func,
                     arg_count: 2,
                     collation: CollationSeq::BINARY,
                 },
@@ -1104,19 +1101,14 @@ pub(super) fn emit_binary_condition_insn(
             eval_result(program, target_register);
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
-            resolver.require_custom_types("Array features")?;
+            let func = containment_func(op, lhs_expr, rhs_expr, referenced_tables, resolver)?;
             let start = contiguous_operands(program, lhs, rhs);
-            let func = match op {
-                ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
-                ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
-                _ => unreachable!(),
-            };
             program.emit_insn(Insn::Function {
                 constant_mask: 0,
                 start_reg: start,
                 dest: target_register,
                 func: FuncCtx {
-                    func: Func::Scalar(func),
+                    func,
                     arg_count: 2,
                     collation: CollationSeq::BINARY,
                 },
@@ -1127,6 +1119,38 @@ pub(super) fn emit_binary_condition_insn(
     }
 
     Ok(())
+}
+
+/// The function that runs `lhs @> rhs` or `lhs && rhs`. When neither operand
+/// of `@>` is an array, the function of the dialect runs it, if the dialect
+/// has one: PostgreSQL's `@>` also compares jsonb values. The types of the
+/// operands are known only here, not when the statement is parsed.
+///
+/// FIXME(pg-catalog): This chooses between the pg_operator entries `anyarray @> anyarray` and `jsonb @> jsonb` from whether an operand is an array, because the AST does not carry PostgreSQL types. A lookup in pg_operator by the types of both operands, in an expression tree that carries PostgreSQL types, replaces this.
+fn containment_func(
+    op: &ast::Operator,
+    lhs_expr: &Expr,
+    rhs_expr: &Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<Func> {
+    if matches!(op, ast::Operator::ArrayContains)
+        && !is_array(lhs_expr, referenced_tables, resolver)
+        && !is_array(rhs_expr, referenced_tables, resolver)
+    {
+        if let Some(name) = resolver.catalog.dialect.json_contains_function() {
+            let func = resolver.resolve_function(name, 2)?;
+            return Ok(func.unwrap_or_else(|| {
+                panic!("the dialect gives {name}() for @>, but no function has that name")
+            }));
+        }
+    }
+    resolver.require_custom_types("Array features")?;
+    Ok(Func::Scalar(match op {
+        ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
+        ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
+        _ => unreachable!("only @> and && run an array function"),
+    }))
 }
 
 fn is_array(expr: &Expr, referenced_tables: Option<&TableReferences>, resolver: &Resolver) -> bool {

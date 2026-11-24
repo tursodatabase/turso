@@ -16,26 +16,75 @@ const MAX_SCALE_MAGNITUDE: i64 = 1_000_000;
 const MAX_INTEGER_DIGITS: i64 = 131_072;
 pub(crate) const MAX_FRACTION_DIGITS: i64 = 16_383;
 
+/// The text that PostgreSQL's numeric type writes for the number `text`, such
+/// as `0.002` for `2e-3` and `100` for `1e2`. It reads `text` as
+/// [`numeric_from_value`] does, so it fails for text that is not a number and
+/// for a value with more digits than numeric allows.
+pub fn format_numeric_text(text: &str) -> crate::Result<String> {
+    numeric_from_value(&Value::build_text(text.to_string())).map(|value| format_numeric(&value))
+}
+
 /// The numeric value of `val`: an integer, a real, or text such as `1.5` or
 /// `1e5`. Every numeric function reads its arguments with this, so they all
 /// accept the same values within the same limits. A blob is not a number, even
 /// one that holds a stored numeric: `n + x` with a blob in `x` is an error.
 pub fn numeric_from_value(val: &Value) -> crate::Result<BigDecimal> {
-    let value = match val {
-        Value::Numeric(Numeric::Integer(i)) => return Ok(BigDecimal::from(*i)),
-        Value::Numeric(Numeric::Float(f)) => parse_numeric(&f.to_string())?,
-        Value::Text(t) => parse_numeric(t.as_str())?,
-        Value::Blob(_) => {
-            return Err(LimboError::Constraint(
-                "invalid input syntax for type numeric: a blob is not a number".to_string(),
-            ))
-        }
-        _ => {
-            return Err(LimboError::Constraint(format!(
-                "invalid input syntax for type numeric: \"{val}\""
-            )))
-        }
-    };
+    match val {
+        Value::Numeric(Numeric::Integer(i)) => Ok(BigDecimal::from(*i)),
+        Value::Numeric(Numeric::Float(f)) => numeric_from_text(&f.to_string()),
+        Value::Text(t) => numeric_from_text(t.as_str()),
+        Value::Blob(_) => Err(LimboError::Constraint(
+            "invalid input syntax for type numeric: a blob is not a number".to_string(),
+        )),
+        _ => Err(LimboError::Constraint(format!(
+            "invalid input syntax for type numeric: \"{val}\""
+        ))),
+    }
+}
+
+/// An exact decimal number, read as a `numeric` column reads its value, and
+/// within the same limits. Two decimals are equal when they have the same
+/// value: `1.5` equals `1.50`, and `1e2` equals `100`.
+///
+/// A frontend uses it to compare numbers that are not in a numeric column,
+/// such as the numbers in a JSON document, by the rules of the numeric type.
+#[derive(Debug, Clone)]
+pub struct Decimal(BigDecimal);
+
+impl std::str::FromStr for Decimal {
+    type Err = LimboError;
+
+    /// Reads decimal text such as `-1.50` or `1e2`. Text that is not a
+    /// number, or that has more digits than PostgreSQL allows, is an error.
+    fn from_str(text: &str) -> crate::Result<Self> {
+        numeric_from_text(text).map(Self)
+    }
+}
+
+impl PartialEq for Decimal {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Decimal {}
+
+impl PartialOrd for Decimal {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Decimal {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_numbers(&self.0, &other.0)
+    }
+}
+
+/// The numeric value of decimal text, such as `1.5` or `1e5`, within the
+/// limits of PostgreSQL.
+fn numeric_from_text(text: &str) -> crate::Result<BigDecimal> {
+    let value = parse_numeric(text)?;
     check_numeric_limits(&value)?;
     // `0e5` parses as zero with scale -5. Zero has no digits, so its exponent
     // is dropped, as PostgreSQL does.
@@ -448,6 +497,33 @@ mod tests {
     use super::*;
     use crate::types::AsValueRef;
     use std::str::FromStr;
+
+    #[test]
+    fn decimals_compare_by_value() {
+        let decimal = |text: &str| Decimal::from_str(text).unwrap();
+        assert_eq!(decimal("1.5"), decimal("1.50"));
+        assert_eq!(decimal("1e2"), decimal("100"));
+        assert_eq!(decimal("-0"), decimal("0"));
+        assert_eq!(decimal("0.1"), decimal("1e-1"));
+        // An f64 has about 16 significant digits, so it gives these pairs
+        // the same value. A decimal does not.
+        assert_ne!(
+            decimal("12345678901234567890"),
+            decimal("12345678901234567891")
+        );
+        assert_ne!(decimal("0.1"), decimal("0.10000000000000001"));
+        assert!(decimal("-2") < decimal("1e-5"));
+        assert!(decimal("1e131071") > decimal("1e-16383"));
+    }
+
+    #[test]
+    fn decimal_text_has_the_limits_of_numeric() {
+        assert!(Decimal::from_str("1e131071").is_ok());
+        assert!(Decimal::from_str("1e131072").is_err());
+        assert!(Decimal::from_str(&format!("0.{}1", "0".repeat(16_382))).is_ok());
+        assert!(Decimal::from_str(&format!("0.{}1", "0".repeat(16_383))).is_err());
+        assert!(Decimal::from_str("abc").is_err());
+    }
 
     #[test]
     fn test_roundtrip_positive() {

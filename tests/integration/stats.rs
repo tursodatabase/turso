@@ -116,11 +116,24 @@ fn private_same_version_schema_survives_analyze() {
     let a = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
+    let other = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let shared_before = db.clone_schema();
     a.force_reparse_schema_without_publish().unwrap();
     assert!(
         !Arc::ptr_eq(&a.current_schema(), &db.clone_schema()),
         "test setup must leave a private schema on the connection"
     );
+    assert!(
+        Arc::ptr_eq(&shared_before, &db.clone_schema()),
+        "force_reparse_schema_without_publish must not mutate or clone the shared schema"
+    );
+    assert!(
+        Arc::ptr_eq(&other.current_schema(), &db.clone_schema()),
+        "other connections must keep sharing the database schema"
+    );
+    assert_table_t_stats(&a.current_schema());
     a.execute("ANALYZE").unwrap();
     assert!(
         !Arc::ptr_eq(&a.current_schema(), &db.clone_schema()),

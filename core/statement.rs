@@ -7,16 +7,21 @@ use std::{
     time::Duration,
 };
 
+use crate::ast::{fmt::WriteSql, Cmd};
 use tracing::{instrument, Level};
-use turso_parser::ast::{fmt::ToTokens, Cmd};
 
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{DynBox, TursoIteratorExt};
 use crate::{
     busy::BusyHandlerState,
     parameters,
-    schema::Trigger,
+    schema::{Table, Trigger},
     stats::{refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
-    translate::{self, display::PlanContext, emitter::TransactionMode, plan::BitSet},
+    translate::{
+        self,
+        display::PlanContext,
+        emitter::TransactionMode,
+        plan::{BitSet, Plan, TableReferences},
+    },
     turso_assert, turso_soft_unreachable,
     vdbe::{
         self,
@@ -134,7 +139,7 @@ impl StatementOrigin {
 pub struct ColumnTypeInfo {
     /// The declared type name as written in CREATE TABLE — e.g. `"INTEGER"`,
     /// `"VARCHAR"`, or the name of a `CREATE TYPE` / `CREATE DOMAIN` such as
-    /// `"cents"`. This is the same string `get_column_decltype` returns.
+    /// `"cents"`. `get_column_decltype` returns it with the type's parameters.
     pub declared_name: String,
     /// Array dimensionality: `0` for scalar columns, `1` for `INTEGER[]`,
     /// `2` for `TEXT[][]`, etc.
@@ -192,9 +197,23 @@ pub enum ColumnTypeKind {
     Union,
 }
 
+/// The table column that a result column reads.
+///
+/// Returned by [`Statement::get_column_origin`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnOrigin {
+    /// `main`, `temp`, or the name an attached database was given.
+    pub database: String,
+    pub table: String,
+    pub column: String,
+    /// The declared type with its parameters, e.g. `VARCHAR(40)`. `None` for
+    /// a column declared without a type.
+    pub declared_type: Option<String>,
+}
+
 pub struct Statement {
     pub(crate) program: vdbe::Program,
-    state: Box<vdbe::ProgramState>,
+    state: DynBox<vdbe::ProgramState>,
     connection: Arc<Connection>,
     pager: Arc<Pager>,
     /// indicates if the statement is a NORMAL/EXPLAIN/EXPLAIN QUERY PLAN
@@ -213,6 +232,10 @@ pub struct Statement {
     /// Byte offset in the original SQL string where this statement ends.
     /// Used by sqlite3_prepare_v2 to set the *pzTail output parameter.
     tail_offset: usize,
+    /// True once the statement has been stepped. Only a step changes the
+    /// connection or starts a transaction, so the drop of a statement that
+    /// was never stepped has nothing to reset.
+    stepped: bool,
     origin: StatementOrigin,
     /// True once this root statement has started executing and incremented
     /// `Connection::n_active_root_statements`.
@@ -230,7 +253,9 @@ pub struct Statement {
     nested_guard_active: bool,
     /// The command the statement was prepared from, when its SQL text cannot
     /// be parsed again, so that preparing it again translates the command.
-    reprepare_cmd: Option<Cmd>,
+    /// Boxed because a `Cmd` is about 440 bytes, and most statements have no
+    /// command here: each move of a statement copies all of its bytes.
+    reprepare_cmd: Option<Box<Cmd>>,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -267,7 +292,7 @@ impl Statement {
         pager: Arc<Pager>,
         query_mode: QueryMode,
         tail_offset: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new_with_origin(
             program,
             connection,
@@ -288,7 +313,7 @@ impl Statement {
         tail_offset: usize,
         origin: StatementOrigin,
         nested_guard_active: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         let (max_registers, cursor_count) = match query_mode {
             QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
@@ -300,9 +325,12 @@ impl Statement {
             } => (EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len(), 0),
         };
         let state = vdbe::ProgramState::new(max_registers, cursor_count);
-        Self {
+        let alloc = connection.db.allocators.statement.clone();
+        let state =
+            crate::with_statement_allocation_site!(ProgramState, DynBox::try_new_in(state, alloc))?;
+        Ok(Self {
             program,
-            state: Box::new(state),
+            state,
             connection,
             pager,
             query_mode,
@@ -311,13 +339,14 @@ impl Statement {
             query_timeout_override: None,
             has_returned_row: false,
             tail_offset,
+            stepped: false,
             origin,
             counted_as_active_root: false,
             is_blob_handle: false,
             nested_guard_active,
             analyze_refresh: None,
             reprepare_cmd: None,
-        }
+        })
     }
 
     /// Mark this statement as the parked backing statement of an incremental
@@ -345,6 +374,60 @@ impl Statement {
 
     pub fn get_program(&self) -> &vdbe::Program {
         &self.program
+    }
+
+    /// Sets the memory budget of every hash table the statement builds and
+    /// returns the number of hash tables it builds.
+    #[cfg(feature = "test_helper")]
+    pub fn set_hash_build_mem_budget(&mut self, bytes: usize) -> usize {
+        let mut hash_builds = 0;
+        for (insn, _) in &mut Arc::make_mut(&mut self.program.prepared).insns {
+            if let vdbe::insn::Insn::HashBuild { data } = insn {
+                data.mem_budget = bytes;
+                hash_builds += 1;
+            }
+        }
+        hash_builds
+    }
+
+    /// Each place in the program that compares values, with the collation it
+    /// compares them with: the instructions, and the keys of the ephemeral
+    /// indexes. Functions and aggregates that never compare values carry an
+    /// unused collation, so they are left out.
+    #[cfg(feature = "test_helper")]
+    pub fn comparison_collations(&self) -> Vec<(String, crate::CollationSeq)> {
+        use vdbe::{builder::CursorType, insn::Insn};
+
+        let program = &self.program.prepared;
+        let instructions = program
+            .insns
+            .iter()
+            .filter(|(insn, _)| match insn {
+                Insn::Function { func, .. } => func.func.needs_collation(),
+                Insn::AggStep { data } => data.func.compares_values(),
+                _ => true,
+            })
+            .flat_map(|(insn, _)| {
+                insn.collations()
+                    .into_iter()
+                    .map(move |collation| (format!("{insn:?}"), collation))
+            });
+        let index_keys = program
+            .cursor_ref
+            .iter()
+            .filter_map(|(_, cursor_type)| match cursor_type {
+                CursorType::BTreeIndex(index) if index.ephemeral => Some(index),
+                _ => None,
+            })
+            .flat_map(|index| {
+                index.columns.iter().map(move |column| {
+                    (
+                        format!("key {} of index {}", column.name, index.name),
+                        column.collation,
+                    )
+                })
+            });
+        instructions.chain(index_keys).collect()
     }
 
     pub fn get_connection(&self) -> &Arc<Connection> {
@@ -491,6 +574,7 @@ impl Statement {
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        self.stepped = true;
         // ANALYZE already ran to Done; only its stats refresh is outstanding.
         // Checked first: the root-statement count was released at Done, so
         // `prepare_step` must not re-register this statement as a root.
@@ -815,6 +899,7 @@ impl Statement {
     /// The parent statement handles all of those concerns.
     #[inline]
     pub fn step_subprogram(&mut self) -> Result<StepResult> {
+        self.stepped = true;
         self.program
             .step(
                 &mut self.state,
@@ -834,6 +919,12 @@ impl Statement {
     /// the statement that runs it, as SQLite does.
     pub(crate) fn set_current_time(&mut self, now: crate::WallClockInstant) {
         self.state.current_time = Some(now);
+    }
+
+    /// Makes a trigger or foreign key action see the statement and
+    /// transaction times of the statement that runs it.
+    pub(crate) fn set_statement_times(&mut self, times: crate::dialect::StatementTimes) {
+        self.state.statement_times = Some(times);
     }
 
     /// Makes a trigger or foreign key action stop at the deadline of the
@@ -1046,7 +1137,7 @@ impl Statement {
     /// Makes preparing the statement again translate `cmd`, the command it
     /// was prepared from, instead of parsing its SQL text.
     pub(crate) fn reprepare_from(&mut self, cmd: Cmd) {
-        self.reprepare_cmd = Some(cmd);
+        self.reprepare_cmd = Some(Box::new(cmd));
     }
 
     fn reprepare(&mut self) -> Result<()> {
@@ -1062,7 +1153,7 @@ impl Statement {
         conn.refresh_schema_for_reprepare()?;
         let new_program = {
             let cmd = match &self.reprepare_cmd {
-                Some(cmd) => cmd.clone(),
+                Some(cmd) => Cmd::clone(cmd),
                 None => {
                     let (cmd, _) = conn.parse_sql(&self.program.sql)?;
                     cmd.expect("Same SQL string should be able to be parsed")
@@ -1151,7 +1242,7 @@ impl Statement {
 
                 // 2. For column references, apply full/short column name logic.
                 match &column.expr {
-                    turso_parser::ast::Expr::Column {
+                    crate::ast::Expr::Column {
                         table,
                         column: col_idx,
                         ..
@@ -1213,30 +1304,15 @@ impl Statement {
     }
 
     pub fn get_column_table_name(&self, idx: usize) -> Option<Cow<'_, str>> {
-        if matches!(
-            self.query_mode,
-            QueryMode::Explain | QueryMode::ExplainQueryPlan { .. }
-        ) {
-            return None;
-        }
-        let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
-            turso_parser::ast::Expr::Column { table, .. } => self
-                .program
-                .table_references
-                .find_table_by_internal_id(*table)
-                .map(|(_, table_ref)| Cow::Borrowed(table_ref.get_name())),
-            _ => None,
-        }
+        self.get_column_origin(idx)
+            .map(|origin| Cow::Owned(origin.table))
     }
 
     /// Returns the declared type of a result column.
     ///
-    /// This behaves similarly to SQLite's `sqlite3_column_decltype()`:
-    /// If the Nth column of the returned result set of a SELECT is a table column
-    /// (not an expression or subquery) then the declared type of the table column
-    /// is returned. If the Nth column of the result set is an expression or subquery,
-    /// then None is returned. The returned string is always UTF-8 encoded.
+    /// This behaves like SQLite's `sqlite3_column_decltype()`: the declared type,
+    /// with its parameters, of the table column that the result column reads (see
+    /// [Self::get_column_origin]), or None for an expression.
     ///
     /// See: <https://sqlite.org/c3ref/column_decltype.html>
     pub fn get_column_decltype(&self, idx: usize) -> Option<String> {
@@ -1255,27 +1331,85 @@ impl Statement {
             };
             return Some(column_types.get(idx).expect("No column").to_string());
         }
-        let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
-            turso_parser::ast::Expr::Column {
-                table,
-                column: column_idx,
-                ..
-            } => {
-                let (_, table_ref) = self
-                    .program
-                    .table_references
-                    .find_table_by_internal_id(*table)?;
-                let table_column = table_ref.get_column_at(*column_idx)?;
-                let ty_str = &table_column.ty_str;
-                if ty_str.is_empty() {
-                    None
-                } else {
-                    Some(ty_str.clone())
-                }
-            }
-            _ => None,
+        self.get_column_origin(idx)?.declared_type
+    }
+
+    /// Returns the table column that a result column reads.
+    ///
+    /// This behaves like SQLite's `sqlite3_column_database_name()`,
+    /// `sqlite3_column_table_name()`, `sqlite3_column_origin_name()` and
+    /// `sqlite3_column_decltype()` together: a column of a FROM-clause
+    /// subquery, view or CTE is followed to the table column it reads, and an
+    /// expression has no origin. A compound subquery is followed through its
+    /// last SELECT, as in SQLite. Unlike SQLite, a scalar subquery such as
+    /// `(SELECT name FROM users)` has no origin.
+    ///
+    /// See: <https://sqlite.org/c3ref/column_database_name.html>
+    pub fn get_column_origin(&self, idx: usize) -> Option<ColumnOrigin> {
+        if self.query_mode != QueryMode::Normal {
+            return None;
         }
+        let column = self.program.result_columns.get(idx).expect("No column");
+        self.column_origin(&column.expr, &self.program.table_references)
+    }
+
+    fn column_origin(
+        &self,
+        expr: &crate::ast::Expr,
+        tables: &TableReferences,
+    ) -> Option<ColumnOrigin> {
+        let (table_id, column_idx) = match expr {
+            crate::ast::Expr::Column { table, column, .. } => (*table, Some(*column)),
+            crate::ast::Expr::RowId { table, .. } => (*table, None),
+            crate::ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+                return self.column_origin(&exprs[0], tables);
+            }
+            _ => return None,
+        };
+        let (namespace, table) = tables
+            .find_joined_table_by_internal_id(table_id)
+            .map(|joined| (joined.namespace, &joined.table))
+            .or_else(|| {
+                tables
+                    .find_outer_query_ref_by_internal_id(table_id)
+                    .map(|outer| (outer.namespace, &outer.table))
+            })?;
+        let table_column = match (table, column_idx) {
+            (Table::FromClauseSubquery(subquery), Some(column_idx)) => {
+                let select = match subquery.plan.as_ref() {
+                    Plan::Select(select) => select,
+                    Plan::CompoundSelect { right_most, .. } => right_most,
+                    _ => return None,
+                };
+                let result_column = select.result_columns.get(column_idx)?;
+                return self.column_origin(&result_column.expr, &select.table_references);
+            }
+            (Table::BTree(_) | Table::Virtual(_), Some(column_idx)) => {
+                Some(table.get_column_at(column_idx)?)
+            }
+            (Table::BTree(btree), None) => btree.get_rowid_alias_column().map(|(_, c)| c),
+            _ => return None,
+        };
+        let (column, declared_type) = match table_column {
+            Some(table_column) => (
+                table_column.name.clone()?,
+                Some(table_column.declared_type()).filter(|ty| !ty.is_empty()),
+            ),
+            None => ("rowid".to_string(), Some("INTEGER".to_string())),
+        };
+        let database_id = match table {
+            // SQLite keeps table-valued functions such as json_each() in main.
+            Table::Virtual(vtab) if vtab.kind == turso_ext::VTabKind::TableValuedFunction => {
+                crate::MAIN_DB_ID
+            }
+            _ => namespace.database_id,
+        };
+        Some(ColumnOrigin {
+            database: self.connection.namespace_name(database_id)?,
+            table: table.get_name().to_string(),
+            column,
+            declared_type,
+        })
     }
 
     /// Returns rich type information for a result column.
@@ -1341,7 +1475,7 @@ impl Statement {
         }
         let column = &self.program.result_columns.get(idx).expect("No column");
         match &column.expr {
-            turso_parser::ast::Expr::Column {
+            crate::ast::Expr::Column {
                 table,
                 column: column_idx,
                 ..
@@ -1399,46 +1533,44 @@ impl Statement {
 
     /// Returns the SQL text with every parameter marker replaced by the
     /// literal of its currently bound value (NULL when unbound), following
-    /// SQLite's sqlite3_expanded_sql rendering. The text is re-tokenized
-    /// with the lexer — whose token stream partitions the input, emitting
-    /// whitespace and comments as TK_NONE tokens carrying their bytes — so
-    /// string literals, quoted identifiers and comments are never mistaken
-    /// for markers. Each TK_VARIABLE token resolves to its bind index from
-    /// its own text: `?N` carries the number, named markers are looked up
-    /// in the parameter table (the same marker can occur several times),
+    /// SQLite's sqlite3_expanded_sql rendering. The dialect finds the
+    /// markers, so string literals, quoted identifiers and comments are
+    /// never mistaken for markers. Each marker resolves to its bind index
+    /// from its own text: `?N` carries the number, named markers are looked
+    /// up in the parameter table (the same marker can occur several times),
     /// and a bare `?` takes one more than the largest number assigned so
     /// far, which is SQLite's numbering rule.
     pub fn expanded_sql(&self) -> String {
         let sql = self.get_sql();
+        let Ok(markers) = self.connection.dialect().parameter_marker_ranges(sql) else {
+            // The statement already parsed once, so finding its markers
+            // cannot fail; return the unexpanded SQL if it somehow does.
+            return sql.to_string();
+        };
         let params = &self.program.parameters;
         let mut out = String::with_capacity(sql.len());
         let mut max_index = 0usize;
-        for token in turso_parser::lexer::Lexer::new(sql.as_bytes()) {
-            let Ok(token) = token else {
-                // The statement already parsed once, so re-lexing its text
-                // cannot fail; return the unexpanded SQL if it somehow does.
-                return sql.to_string();
-            };
-            if token.token_type == turso_parser::token::TokenType::TK_VARIABLE {
-                let text = String::from_utf8_lossy(token.value);
-                let index = if let Some(digits) = text.strip_prefix('?') {
-                    if digits.is_empty() {
-                        max_index + 1
-                    } else {
-                        digits.parse().unwrap_or(0)
-                    }
+        let mut copied_up_to = 0;
+        for marker in markers {
+            out.push_str(&sql[copied_up_to..marker.start]);
+            copied_up_to = marker.end;
+            let text = &sql[marker];
+            let index = if let Some(digits) = text.strip_prefix('?') {
+                if digits.is_empty() {
+                    max_index + 1
                 } else {
-                    params.index(text.as_ref()).map_or(0, |i| i.get())
-                };
-                max_index = max_index.max(index);
-                let value = NonZero::new(index)
-                    .map(|i| self.state.get_parameter(i))
-                    .unwrap_or(Value::Null);
-                append_expanded_literal(&mut out, &value);
+                    digits.parse().unwrap_or(0)
+                }
             } else {
-                out.push_str(&String::from_utf8_lossy(token.value));
-            }
+                params.index(text).map_or(0, |i| i.get())
+            };
+            max_index = max_index.max(index);
+            let value = NonZero::new(index)
+                .map(|i| self.state.get_parameter(i))
+                .unwrap_or(Value::Null);
+            append_expanded_literal(&mut out, &value);
         }
+        out.push_str(&sql[copied_up_to..]);
         out
     }
 
@@ -1513,6 +1645,12 @@ impl Statement {
                 tracing::error!("Statement reset panicked during best-effort cleanup");
             }
         }
+    }
+
+    /// Sets the number of trigger and foreign key action programs that execute
+    /// this statement, one inside the other.
+    pub(crate) fn set_subprogram_depth(&mut self, depth: usize) {
+        self.state.subprogram_depth = depth;
     }
 
     /// Lightweight reset for reusing a cached subprogram statement.
@@ -1780,7 +1918,9 @@ impl Drop for Statement {
         // That cleanup consults `is_nested_stmt()` to decide whether top-level
         // transaction/savepoint finalization belongs to this statement or to its
         // parent, so we release the nested guard only after reset completes.
-        self.reset_best_effort();
+        if self.stepped {
+            self.reset_best_effort();
+        }
         if self.nested_guard_active {
             self.connection.end_nested();
             self.nested_guard_active = false;
@@ -1806,339 +1946,14 @@ fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::roles::SessionRole;
-    use crate::SqliteDialect;
-    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
 
     /// Callers move a `Statement` by value while they build it and wrap it,
     /// and every copy is a stack slot in the caller's frame. Those frames stay
     /// on the stack while statements are prepared, so a large `Statement`
-    /// overflows small coroutine stacks.
+    /// overflows small coroutine stacks. Each move also copies all the bytes
+    /// of the statement.
     #[test]
     fn statement_stays_small() {
-        assert!(std::mem::size_of::<Statement>() <= 1024);
-    }
-
-    #[test]
-    fn cloned_halt_retains_constraint_context() {
-        assert_cloned_constraint_context(
-            "INSERT INTO parent VALUES (1, 'b', 1)",
-            crate::ConstraintKind::PrimaryKey,
-            "parent",
-            "id",
-        );
-    }
-
-    #[test]
-    fn cloned_halt_if_null_retains_constraint_context() {
-        assert_cloned_constraint_context(
-            "INSERT INTO parent VALUES (2, NULL, 1)",
-            crate::ConstraintKind::NotNull,
-            "parent",
-            "code",
-        );
-    }
-
-    #[test]
-    fn cloned_fk_counter_retains_constraint_context() {
-        assert_cloned_constraint_context(
-            "UPDATE child SET pid = 99",
-            crate::ConstraintKind::ForeignKey,
-            "child",
-            "pid",
-        );
-    }
-
-    fn assert_cloned_constraint_context(
-        sql: &str,
-        kind: crate::ConstraintKind,
-        table: &str,
-        column: &str,
-    ) {
-        use crate::vdbe::{execute, insn::Insn};
-
-        let conn = constraint_test_connection();
-        let mut stmt = conn.prepare(sql).unwrap();
-        let insn = stmt
-            .program
-            .insns
-            .iter()
-            .find_map(|(insn, _)| {
-                let matches = match kind {
-                    crate::ConstraintKind::PrimaryKey => matches!(
-                        insn,
-                        Insn::Halt {
-                            err_code: crate::error::SQLITE_CONSTRAINT_PRIMARYKEY,
-                            ..
-                        }
-                    ),
-                    crate::ConstraintKind::NotNull => matches!(insn, Insn::HaltIfNull { .. }),
-                    crate::ConstraintKind::ForeignKey => matches!(
-                        insn,
-                        Insn::FkCounter {
-                            increment_value: 1,
-                            deferred: false,
-                            ..
-                        }
-                    ),
-                    _ => unreachable!(),
-                };
-                matches.then(|| insn.clone())
-            })
-            .expect("constraint instruction");
-        for index in 0..stmt.state.column_count() {
-            stmt.state
-                .set_register(index, vdbe::Register::Value(Value::from_i64(99)));
-        }
-        let error = match &insn {
-            Insn::Halt { .. } => execute::op_halt(
-                &stmt.program,
-                &mut stmt.state,
-                &insn,
-                &stmt.connection,
-                &stmt.pager,
-            )
-            .err()
-            .expect("constraint error"),
-            Insn::HaltIfNull { target_reg, .. } => {
-                stmt.state
-                    .set_register(*target_reg, vdbe::Register::Value(Value::Null));
-                execute::op_halt_if_null(
-                    &stmt.program,
-                    &mut stmt.state,
-                    &insn,
-                    &stmt.connection,
-                    &stmt.pager,
-                )
-                .err()
-                .expect("constraint error")
-            }
-            Insn::FkCounter { .. } => {
-                execute::op_fk_counter(
-                    &stmt.program,
-                    &mut stmt.state,
-                    &insn,
-                    &stmt.connection,
-                    &stmt.pager,
-                )
-                .unwrap();
-                Box::new(stmt.state.immediate_foreign_key_error())
-            }
-            _ => unreachable!(),
-        };
-        let LimboError::ConstraintViolation(violation) = *error else {
-            panic!("expected structured constraint: {error:?}");
-        };
-        assert_eq!(violation.kind, kind);
-        assert_eq!(violation.table_name.as_deref(), Some(table));
-        assert_eq!(violation.column_names, vec![column]);
-        assert!(!violation.values.is_empty());
-    }
-
-    #[test]
-    fn internal_constraint_errors_are_structured() {
-        for (sql, kind, message, foreign_key, extended_code) in constraint_error_cases() {
-            let conn = constraint_test_connection();
-            let mut stmt = conn.prepare(sql).unwrap();
-            let error = loop {
-                match stmt.step_with_structured_errors() {
-                    Err(error) => break error,
-                    Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
-                        stmt.pager.io.step().unwrap();
-                    }
-                    Ok(result) => panic!("expected constraint error, got {result:?}: {sql}"),
-                }
-            };
-            let LimboError::ConstraintViolation(violation) = &error else {
-                panic!("{sql}: {error:?}");
-            };
-            assert_eq!(violation.kind, kind, "{sql}");
-            assert_eq!(error.to_string(), message, "{sql}");
-            assert_eq!(error.is_foreign_key_constraint(), foreign_key, "{sql}");
-            assert_eq!(error.sqlite_result_code(), 19, "{sql}");
-            assert_eq!(error.sqlite_extended_result_code(), extended_code, "{sql}");
-        }
-    }
-
-    fn constraint_error_cases(
-    ) -> [(&'static str, crate::ConstraintKind, &'static str, bool, i32); 13] {
-        [
-            (
-                "INSERT INTO parent VALUES (1, 'b', 1)",
-                crate::ConstraintKind::PrimaryKey,
-                "UNIQUE constraint failed: parent.id",
-                false,
-                1555,
-            ),
-            (
-                "INSERT INTO parent VALUES (2, 'a', 1)",
-                crate::ConstraintKind::Unique,
-                "UNIQUE constraint failed: parent.code",
-                false,
-                2067,
-            ),
-            (
-                "INSERT INTO parent VALUES (2, NULL, 1)",
-                crate::ConstraintKind::NotNull,
-                "NOT NULL constraint failed: parent.code",
-                false,
-                1299,
-            ),
-            (
-                "INSERT INTO parent VALUES (2, 'b', -1)",
-                crate::ConstraintKind::Check,
-                "CHECK constraint failed: positive",
-                false,
-                275,
-            ),
-            (
-                "INSERT INTO child VALUES (99)",
-                crate::ConstraintKind::ForeignKey,
-                "FOREIGN KEY constraint failed",
-                true,
-                787,
-            ),
-            (
-                "DELETE FROM parent",
-                crate::ConstraintKind::ForeignKey,
-                "FOREIGN KEY constraint failed",
-                true,
-                787,
-            ),
-            (
-                "INSERT INTO deferred_child VALUES (99)",
-                crate::ConstraintKind::ForeignKey,
-                "FOREIGN KEY constraint failed",
-                true,
-                787,
-            ),
-            (
-                "INSERT INTO trigger_source VALUES (1)",
-                crate::ConstraintKind::PrimaryKey,
-                "UNIQUE constraint failed: parent.id",
-                false,
-                1555,
-            ),
-            (
-                "INSERT INTO text_key VALUES ('k')",
-                crate::ConstraintKind::PrimaryKey,
-                "UNIQUE constraint failed: text_key.k",
-                false,
-                1555,
-            ),
-            (
-                "INSERT INTO pair_key VALUES (1, 1)",
-                crate::ConstraintKind::PrimaryKey,
-                "UNIQUE constraint failed: pair_key.a, pair_key.b",
-                false,
-                1555,
-            ),
-            (
-                "UPDATE pair_key SET b = 1 WHERE b = 2",
-                crate::ConstraintKind::PrimaryKey,
-                "UNIQUE constraint failed: pair_key.a, pair_key.b",
-                false,
-                1555,
-            ),
-            (
-                "INSERT INTO pair_key VALUES (1, 2) ON CONFLICT DO UPDATE SET b = 1",
-                crate::ConstraintKind::PrimaryKey,
-                "UNIQUE constraint failed: pair_key.a, pair_key.b",
-                false,
-                1555,
-            ),
-            (
-                "INSERT INTO strict_int VALUES ('x')",
-                crate::ConstraintKind::Datatype,
-                "cannot store TEXT value in INTEGER column strict_int.a",
-                false,
-                3091,
-            ),
-        ]
-    }
-
-    fn constraint_test_connection() -> Arc<crate::Connection> {
-        let conn = open_test_connection().unwrap();
-        conn.set_foreign_keys_enabled(true);
-        for sql in [
-            "CREATE TABLE parent (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, score INTEGER CONSTRAINT positive CHECK (score > 0))",
-            "CREATE TABLE child (pid INTEGER REFERENCES parent(id))",
-            "CREATE TABLE deferred_child (pid INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
-            "CREATE TABLE trigger_source (id INTEGER)",
-            "CREATE TRIGGER duplicate_parent AFTER INSERT ON trigger_source BEGIN INSERT INTO parent VALUES (NEW.id, 'b', 1); END",
-            "INSERT INTO parent VALUES (1, 'a', 1)",
-            "INSERT INTO child VALUES (1)",
-            "CREATE TABLE text_key (k TEXT PRIMARY KEY)",
-            "INSERT INTO text_key VALUES ('k')",
-            "CREATE TABLE pair_key (a, b, PRIMARY KEY (a, b))",
-            "INSERT INTO pair_key VALUES (1, 1), (1, 2)",
-            "CREATE TABLE strict_int (a INTEGER) STRICT",
-            "CREATE TABLE raise_abort (a)",
-            "CREATE TRIGGER raise_abort_trigger BEFORE INSERT ON raise_abort BEGIN SELECT RAISE(ABORT, 'nope'); END",
-            "CREATE TABLE unique_rollback (a UNIQUE ON CONFLICT ROLLBACK)",
-            "INSERT INTO unique_rollback VALUES (1)",
-        ] {
-            conn.execute(sql).unwrap();
-        }
-        conn
-    }
-
-    fn open_test_connection() -> crate::Result<Arc<crate::Connection>> {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            ":memory:",
-            OpenFlags::Create,
-            DatabaseOpts::new(),
-            None,
-            Arc::new(SqliteDialect),
-        )?;
-        db.connect(ConnectOpts::new(SessionRole::Superuser))
-    }
-
-    /// A hash join inside a correlated subquery is built once and probed once per
-    /// outer row. The budget is forced down so the build spills in every build
-    /// profile; the second and third passes then go through the grace phase and
-    /// must count the same rows as the first (#9774).
-    #[test]
-    fn test_spilled_hash_join_counts_the_same_on_every_probe_pass() {
-        let conn = open_test_connection().unwrap();
-        for sql in [
-            "CREATE TABLE a(x INTEGER PRIMARY KEY, y INT)",
-            "CREATE TABLE c(k INT, v INT)",
-            "CREATE TABLE d(k INT, w INT)",
-            "INSERT INTO a VALUES (1, 0), (2, 1000000), (3, 1000000)",
-            "INSERT INTO c SELECT value % 50, value FROM generate_series(1, 1000)",
-            "INSERT INTO d SELECT value % 70, value FROM generate_series(1, 1000)",
-        ] {
-            conn.execute(sql).unwrap();
-        }
-        let mut stmt = conn
-            .prepare(
-                "SELECT a.x, (SELECT count(*) FROM c JOIN d ON c.k = d.k AND d.w < a.y) FROM a",
-            )
-            .unwrap();
-        let mut hash_builds = 0;
-        for (insn, _) in &mut Arc::make_mut(&mut stmt.program.prepared).insns {
-            if let vdbe::insn::Insn::HashBuild { data } = insn {
-                data.mem_budget = 32 * 1024;
-                hash_builds += 1;
-            }
-        }
-        assert_eq!(hash_builds, 1, "the join must be built once and reused");
-
-        let rows = stmt.run_collect_rows().unwrap();
-        let expected: Vec<Vec<Value>> = [[1, 0], [2, 14400], [3, 14400]]
-            .iter()
-            .map(|row| row.iter().copied().map(Value::from_i64).collect())
-            .collect();
-        assert_eq!(rows, expected);
-
-        let metrics = stmt.metrics().hash_join;
-        assert!(metrics.spill_chunks > 0, "build did not spill: {metrics:?}");
-        assert!(
-            metrics.grace_partitions_processed > 0,
-            "no pass went through grace: {metrics:?}"
-        );
+        assert!(std::mem::size_of::<Statement>() <= 256);
     }
 }

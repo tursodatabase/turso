@@ -30,12 +30,12 @@ use crate::{
     translate,
     translate::collate::TextCollation,
     util::IOExt,
-    vdbe, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler, BusyHandlerCallback,
+    vdbe, AtomicSyncMode, AtomicTempStore, BusyHandler, BusyHandlerCallback,
     CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion,
     ConnectOpts, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
     EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
     Program, QueryMode, Result, Schema, Statement, SyncMode, TransactionMode, Trigger, Value,
-    VirtualTable, WalAutoActions,
+    VirtualTable, WalAutoActions, WallClockInstant,
 };
 use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
@@ -383,6 +383,12 @@ pub struct Connection {
     pub(super) database_schemas: RwLock<HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
+    /// When the explicit transaction started. Valid only while autocommit is
+    /// off; see `start_explicit_transaction`.
+    pub(super) explicit_transaction_start: RwLock<Option<WallClockInstant>>,
+    /// The times of the client command being executed, set by a server that
+    /// receives commands. See `Connection::set_command_times`.
+    pub(super) command_times: RwLock<Option<crate::dialect::StatementTimes>>,
     pub(super) transaction_state: AtomicTransactionState,
     /// True when an unfinished write statement inside an explicit transaction
     /// was reset or dropped and there was no statement savepoint to undo only
@@ -509,8 +515,7 @@ pub struct Connection {
     /// Stack of currently executing triggers to prevent recursive trigger execution
     /// Only prevents the same trigger from firing again, allowing different triggers on the same table to fire
     pub executing_triggers: RwLock<Vec<Arc<Trigger>>>,
-    pub(crate) encryption_key: RwLock<Option<EncryptionKey>>,
-    pub(super) encryption_cipher_mode: AtomicCipherMode,
+    pub(crate) encryption_key: Option<EncryptionKey>,
     pub(super) sync_mode: AtomicSyncMode,
     pub(super) temp_store: AtomicTempStore,
     pub(super) data_sync_retry: AtomicBool,
@@ -1159,7 +1164,7 @@ impl Connection {
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
 
-            Ok(Statement::new_with_origin(
+            Statement::new_with_origin(
                 program,
                 self.clone(),
                 pager,
@@ -1167,7 +1172,7 @@ impl Connection {
                 byte_offset_end,
                 origin,
                 needs_nested_guard,
-            ))
+            )
         })();
         if result.is_err() && needs_nested_guard {
             self.end_nested();
@@ -1216,7 +1221,7 @@ impl Connection {
         }
         let result = (|| {
             let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
-            Ok(Statement::new_with_origin(
+            Statement::new_with_origin(
                 program,
                 self.clone(),
                 pager,
@@ -1224,7 +1229,7 @@ impl Connection {
                 0,
                 origin,
                 needs_nested_guard,
-            ))
+            )
         })();
         if result.is_err() && needs_nested_guard {
             self.end_nested();
@@ -1427,6 +1432,22 @@ impl Connection {
         self.prepare_with_origin(sql, StatementOrigin::EngineMetadataRead)
     }
 
+    /// Prepares `SELECT * FROM sqlite_schema` as an engine metadata read
+    /// (see [`Self::prepare_engine_metadata_read`]). It is built as a
+    /// statement so that reading the schema parses no SQL.
+    pub(crate) fn prepare_schema_table_read(self: &Arc<Connection>) -> Result<Statement> {
+        let stmt = select_all_from(crate::schema::SCHEMA_TABLE_NAME);
+        let sql = stmt.to_string();
+        let cmd = ast::Cmd::Stmt(stmt);
+        let mut statement = self.prepare_cmd_with_input_and_origin(
+            cmd.clone(),
+            &sql,
+            StatementOrigin::EngineMetadataRead,
+        )?;
+        statement.reprepare_from(cmd);
+        Ok(statement)
+    }
+
     /// Prepares a schema statement of the engine's own: SQLite text whatever
     /// the database's dialect, allowed to name the engine's reserved objects,
     /// and run as an ordinary top-level statement with its own transaction
@@ -1488,7 +1509,7 @@ impl Connection {
                 .unwrap()
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-            Statement::new(program, self.clone(), pager, mode, 0).run_ignore_rows()?;
+            Statement::new(program, self.clone(), pager, mode, 0)?.run_ignore_rows()?;
             remaining = &remaining[byte_offset_end..];
         }
         Ok(())
@@ -1510,7 +1531,7 @@ impl Connection {
             return Ok(None);
         };
         let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-        Ok(Some(Statement::new(program, self.clone(), pager, mode, 0)))
+        Ok(Some(Statement::new(program, self.clone(), pager, mode, 0)?))
     }
 
     /// Execute will run a query from start to finish taking ownership of I/O because it will run pending I/Os if it didn't finish.
@@ -1530,7 +1551,7 @@ impl Connection {
             let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
             {
                 crate::stack::trace_stack!("run");
-                Statement::new(program, self.clone(), pager.clone(), mode, 0).run_ignore_rows()?;
+                Statement::new(program, self.clone(), pager.clone(), mode, 0)?.run_ignore_rows()?;
             }
             remaining = &remaining[byte_offset_end..];
         }
@@ -1553,7 +1574,7 @@ impl Connection {
             .unwrap()
             .trim();
         let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-        let stmt = Statement::new(program, self.clone(), pager, mode, 0);
+        let stmt = Statement::new(program, self.clone(), pager, mode, 0)?;
         Ok(Some((stmt, byte_offset_end)))
     }
 
@@ -1570,19 +1591,6 @@ impl Connection {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
         let flags = opts.get_flags()?;
-        if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
-            let io = Arc::new(MemoryIO::new());
-            let db = Database::open_file_with_flags(
-                io.clone(),
-                MEMORY_PATH,
-                flags,
-                db_opts,
-                None,
-                dialect,
-            )?;
-            let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-            return Ok((io, conn));
-        }
         let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
             (Some(cipher), Some(hexkey)) => Some(EncryptionOpts { cipher, hexkey }),
             (Some(_), None) => {
@@ -1597,6 +1605,26 @@ impl Connection {
             }
             (None, None) => None,
         };
+        if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                MEMORY_PATH,
+                flags,
+                db_opts,
+                encryption_opts.clone(),
+                dialect,
+            )?;
+            let conn = db.connect(
+                ConnectOpts::new(SessionRole::Superuser).with_encryption_key(
+                    encryption_opts
+                        .as_ref()
+                        .map(|opts| EncryptionKey::from_hex_string(&opts.hexkey))
+                        .transpose()?,
+                ),
+            )?;
+            return Ok((io, conn));
+        }
         let (io, db) = Database::open_new(
             &opts.path,
             opts.vfs.as_ref(),
@@ -1610,13 +1638,12 @@ impl Connection {
             std::fs::set_permissions(&opts.path, perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
-        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-        if let Some(cipher) = opts.cipher {
-            let _ = conn.pragma_update("cipher", format!("'{cipher}'"));
-        }
-        if let Some(hexkey) = opts.hexkey {
-            let _ = conn.pragma_update("hexkey", format!("'{hexkey}'"));
-        }
+        let key = opts
+            .hexkey
+            .as_deref()
+            .map(EncryptionKey::from_hex_string)
+            .transpose()?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(key))?;
         Ok((io, conn))
     }
 
@@ -1627,7 +1654,8 @@ impl Connection {
         main_db_flags: OpenFlags,
         io: Arc<dyn IO>,
         dialect: Arc<dyn crate::Dialect>,
-    ) -> Result<(Arc<Database>, Option<EncryptionOpts>)> {
+        page_size: PageSize,
+    ) -> Result<(Arc<Database>, Option<EncryptionKey>)> {
         let opts = OpenOptions::parse(uri)?;
         let mut flags = opts.get_flags()?;
         if main_db_flags.contains(OpenFlags::ReadOnly) {
@@ -1647,24 +1675,27 @@ impl Connection {
             }
             (None, None) => None,
         };
-        if encryption_opts.is_some() {
-            db_opts = db_opts.with_encryption(true);
-        }
+        let encryption_key = encryption_opts
+            .as_ref()
+            .map(|opts| EncryptionKey::from_hex_string(&opts.hexkey))
+            .transpose()?;
+        db_opts = db_opts.with_encryption(encryption_opts.is_some());
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
-        let db = Database::open_file_with_flags(
+        let db = Database::open(
             io.clone(),
             &opts.path,
-            flags,
-            db_opts,
-            encryption_opts.clone(),
-            dialect,
+            crate::OpenOptions::new(dialect)
+                .flags(flags)
+                .db_opts(db_opts)
+                .encryption(encryption_opts)
+                .page_size(page_size),
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
             std::fs::set_permissions(&opts.path, perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
-        Ok((db, encryption_opts))
+        Ok((db, encryption_key))
     }
 
     pub fn set_foreign_keys_enabled(&self, enable: bool) {
@@ -1739,33 +1770,6 @@ impl Connection {
 
     pub(crate) fn increment_deferred_foreign_key_violations(&self, v: isize) {
         self.fk_deferred_violations.fetch_add(v, Ordering::AcqRel);
-    }
-
-    /// Query the `(id, name)` rows of the namespaces table. The connection's
-    /// schema must already contain the table definitions so that `prepare`
-    /// can resolve the table name. Returns an empty Vec if the database has
-    /// no namespaces table.
-    pub(crate) fn query_stored_namespaces(self: &Arc<Connection>) -> Result<Vec<(i64, String)>> {
-        let has_namespaces_table = {
-            let s = self.schema.read();
-            s.has_table(
-                NamespaceId::ROOT,
-                crate::schema::TURSO_NAMESPACES_TABLE_NAME,
-            )
-        };
-        if !has_namespaces_table {
-            return Ok(Vec::new());
-        }
-        let mut stmt = self.prepare_internal(format!(
-            "SELECT id, name FROM {}",
-            crate::schema::TURSO_NAMESPACES_TABLE_NAME
-        ))?;
-        let mut rows = Vec::new();
-        stmt.run_with_row_callback(|row| {
-            rows.push((row.get::<i64>(0)?, row.get::<&str>(1)?.to_string()));
-            Ok(())
-        })?;
-        Ok(rows)
     }
 
     pub fn maybe_update_schema(&self) {
@@ -2100,7 +2104,7 @@ impl Connection {
         self.set_tx_state(TransactionState::Write {
             schema_did_change: false,
         });
-        self.auto_commit.store(false, Ordering::SeqCst);
+        self.start_explicit_transaction(pager.io.current_time_wall_clock());
 
         Ok(())
     }
@@ -2275,10 +2279,12 @@ impl Connection {
         self.clear_mvcc_log_meta();
 
         let is_memory_db = is_memory_like(&self.db.path);
-        let should_checkpoint_on_close = pager
-            .wal
-            .as_ref()
-            .is_none_or(|wal| wal.should_checkpoint_on_close());
+        // For MVCC the shutdown checkpoint only fsyncs the WAL, which is needed only while
+        // the WAL holds frames that are not yet copied into the database file.
+        let should_checkpoint_on_close = pager.wal.as_ref().is_none_or(|wal| {
+            wal.should_checkpoint_on_close()
+                && (!self.mvcc_enabled() || wal.get_max_frame_in_wal() > wal.backfill_frame())
+        });
         if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
             && !self.db.is_readonly()
             && !is_memory_db
@@ -2401,7 +2407,9 @@ impl Connection {
 
     #[cfg(feature = "conn_raw_api")]
     pub fn reload_wal_after_external_restore(&self) -> Result<()> {
-        self.db.reload_wal_after_external_restore()
+        let encryption_key = self.encryption_key.clone();
+        self.db
+            .reload_wal_after_external_restore_with_encryption_key(encryption_key)
     }
 
     /// Enable or disable writing portable logical-change metadata into MVCC
@@ -2611,6 +2619,15 @@ impl Connection {
     /// or at the next VACUUM command that is run on the same database connection while not in WAL mode.
     /// `VACUUM INTO` uses it for the output database even in WAL mode.
     pub fn reset_page_size(&self, database_id: usize, size: u32) -> Result<()> {
+        if self
+            .get_pager_from_database_index(&database_id)?
+            .encryption_cipher()
+            != CipherMode::None
+        {
+            return Err(LimboError::InvalidArgument(
+                "encrypted database page size is fixed when opening the database".into(),
+            ));
+        }
         self.next_page_size.store(size, Ordering::SeqCst);
         if self.get_source_database(database_id).initialized() {
             return Ok(());
@@ -2671,6 +2688,47 @@ impl Connection {
         self.auto_commit.load(Ordering::SeqCst)
     }
 
+    /// Sets the times of the client command that is about to run, or clears
+    /// them with `None`. While set, every statement of the command reports
+    /// `times.statement` as its start, and a statement in autocommit mode
+    /// reports `times.transaction` as the start of its transaction, instead
+    /// of the time at which the statement starts. A server calls this when
+    /// it receives a command message that holds several statements.
+    pub fn set_command_times(&self, times: Option<crate::dialect::StatementTimes>) {
+        *self.command_times.write() = times;
+    }
+
+    /// The times set by `set_command_times`.
+    pub(crate) fn command_times(&self) -> Option<crate::dialect::StatementTimes> {
+        *self.command_times.read()
+    }
+
+    /// The wall clock now.
+    pub fn current_time_wall_clock(&self) -> WallClockInstant {
+        self.pager.load().io.current_time_wall_clock()
+    }
+
+    /// Turns autocommit off because the user starts a transaction at `now`,
+    /// which PostgreSQL's `now()` then returns until the transaction ends. A
+    /// command that starts several transactions gives them all the start of
+    /// the command.
+    pub(crate) fn start_explicit_transaction(&self, now: WallClockInstant) {
+        let start = self.command_times().map_or(now, |times| times.transaction);
+        *self.explicit_transaction_start.write() = Some(start);
+        self.auto_commit.store(false, Ordering::SeqCst);
+    }
+
+    /// When the open explicit transaction started.
+    pub(crate) fn explicit_transaction_start(&self) -> WallClockInstant {
+        turso_assert!(
+            !self.get_auto_commit(),
+            "only an explicit transaction has a start time"
+        );
+        self.explicit_transaction_start
+            .read()
+            .expect("every explicit transaction starts in start_explicit_transaction")
+    }
+
     /// Mark the active explicit transaction poisoned so COMMIT rolls it back.
     ///
     /// This is used when a write statement under BEGIN is abandoned before it
@@ -2707,7 +2765,7 @@ impl Connection {
         // would deadlock against the schema write lock.
         let mut rows_data: Vec<(String, String, String, i64, Option<String>)> = Vec::new();
         {
-            let mut rows = self.prepare_engine_metadata_read("SELECT * FROM sqlite_schema")?;
+            let mut rows = self.prepare_schema_table_read()?;
             rows.run_with_row_callback(|row| {
                 let ty = row.get::<&str>(0)?.to_string();
                 let name = row.get::<&str>(1)?.to_string();
@@ -3187,6 +3245,41 @@ impl Connection {
         &self.attached_databases
     }
 
+    /// The database and the pager of the database attached as `alias`.
+    #[cfg(feature = "test_helper")]
+    pub fn attached_database(&self, alias: &str) -> Option<(Arc<Database>, Arc<Pager>)> {
+        let index = self.qualifiers.database_id(alias)?;
+        let catalog = self.attached_databases.read();
+        let entry = catalog.index_to_data.get(&index)?;
+        Some((entry.db.clone(), entry.pager.clone()))
+    }
+
+    /// The address of the schema the connection uses for `database`: "main",
+    /// "temp" or the alias of an attached database. It changes when the
+    /// schema is copied.
+    #[cfg(feature = "test_helper")]
+    pub fn schema_address(&self, database: &str) -> usize {
+        let database_id = self
+            .qualifier(database)
+            .expect("the database is attached")
+            .database_id();
+        match database_id {
+            crate::MAIN_DB_ID => Arc::as_ptr(&self.schema.read()) as usize,
+            crate::TEMP_DB_ID => Arc::as_ptr(
+                &self
+                    .temp
+                    .database
+                    .read()
+                    .as_ref()
+                    .expect("the temp database is open")
+                    .db
+                    .schema
+                    .lock(),
+            ) as usize,
+            _ => Arc::as_ptr(&self.database_schemas.read()[&database_id]) as usize,
+        }
+    }
+
     /// The qualifiers the connection accepts, as of the schema it has: its
     /// databases and the namespaces of its main database.
     pub(crate) fn current_qualifiers(&self) -> Qualifiers {
@@ -3224,8 +3317,8 @@ impl Connection {
     /// objects of the namespace under its id, so `name` can be anything
     /// that no namespace is called yet.
     pub fn create_namespace(self: &Arc<Self>, name: &str) -> Result<Qualifier> {
-        let statement = turso_parser::ast::Stmt::CreateSchema {
-            name: turso_parser::ast::Name::exact(name.to_string()),
+        let statement = crate::ast::Stmt::CreateSchema {
+            name: crate::ast::Name::exact(name.to_string()),
         };
         self.prepare_ast_stmt(statement)?.run_ignore_rows()?;
         let namespace = self
@@ -3248,8 +3341,8 @@ impl Connection {
                 "no such namespace: {name}"
             )));
         }
-        let statement = turso_parser::ast::Stmt::DropSchema {
-            name: turso_parser::ast::Name::exact(name.to_string()),
+        let statement = crate::ast::Stmt::DropSchema {
+            name: crate::ast::Name::exact(name.to_string()),
         };
         self.prepare_ast_stmt(statement)?.run_ignore_rows()
     }
@@ -3258,12 +3351,9 @@ impl Connection {
     /// SCHEMA, DROP SCHEMA or GRANT. No dialect parses their text, so
     /// preparing the statement again, after another connection changes the
     /// schema, translates the AST itself.
-    pub fn prepare_ast_stmt(
-        self: &Arc<Self>,
-        statement: turso_parser::ast::Stmt,
-    ) -> Result<Statement> {
+    pub fn prepare_ast_stmt(self: &Arc<Self>, statement: crate::ast::Stmt) -> Result<Statement> {
         let sql = statement.to_string();
-        let cmd = turso_parser::ast::Cmd::Stmt(statement);
+        let cmd = crate::ast::Cmd::Stmt(statement);
         let mut stmt = self.prepare_translated_cmd(cmd.clone(), &sql)?;
         stmt.reprepare_from(cmd);
         Ok(stmt)
@@ -3358,6 +3448,30 @@ impl Connection {
                 f(&schema)
             }
         }
+    }
+
+    /// Each type of the main database as `(name, is built-in, kind of value
+    /// it is declared to read as, kind of value its DECODE gives)`, with the
+    /// kinds in their debug form.
+    #[cfg(feature = "test_helper")]
+    pub fn type_read_kinds(&self) -> std::vec::Vec<(String, bool, String, String)> {
+        let syms = self.syms.read();
+        self.with_schema(MAIN_DB_ID, |schema| {
+            schema
+                .type_registry
+                .iter()
+                .map(|(name, type_def)| {
+                    let decoded =
+                        crate::translate::expr::expr_type::value_type(type_def, schema, &syms);
+                    (
+                        name.clone(),
+                        type_def.is_builtin,
+                        format!("{:?}", Some(type_def.value_type())),
+                        format!("{decoded:?}"),
+                    )
+                })
+                .collect()
+        })
     }
 
     /// Clone the shared schema for `database_id`, bypassing the connection-local cache.
@@ -3962,13 +4076,17 @@ impl Connection {
 
     /// The error for a statement on a sequence backing table that failed
     /// with `err`. The backing table is the engine's own, so the failure
-    /// means the file is corrupt.
+    /// means the file is corrupt, except when no memory was available: then
+    /// the error stays `OutOfMemory`, and the statement can run again later.
     pub(crate) fn sequence_backing_table_corrupt(
         backing_table_name: &str,
         seq_name: &str,
         problem: &str,
         err: &LimboError,
     ) -> LimboError {
+        if matches!(err, LimboError::OutOfMemory) {
+            return LimboError::OutOfMemory;
+        }
         LimboError::Corrupt(format!(
             "internal sequence backing table \"{backing_table_name}\" for sequence \
              \"{seq_name}\": {problem}: {err}"
@@ -4309,24 +4427,28 @@ impl Connection {
         Arc::as_ptr(&self.db) as usize
     }
 
-    pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {
-        tracing::trace!("setting encryption key for connection");
-        self.ensure_can_change_encryption_settings()?;
-        *self.encryption_key.write() = Some(key);
-        self.bump_prepare_context_generation();
-        self.set_encryption_context()
+    pub fn set_encryption_key(&self, _key: EncryptionKey) -> Result<()> {
+        Err(LimboError::InvalidArgument(
+            "encryption must be configured when opening the database".into(),
+        ))
     }
 
-    pub fn set_encryption_cipher(&self, cipher_mode: CipherMode) -> Result<()> {
-        tracing::trace!("setting encryption cipher for connection");
-        self.ensure_can_change_encryption_settings()?;
-        self.encryption_cipher_mode.set(cipher_mode);
-        self.bump_prepare_context_generation();
-        self.set_encryption_context()
+    pub fn set_encryption_cipher(&self, _cipher_mode: CipherMode) -> Result<()> {
+        Err(LimboError::InvalidArgument(
+            "encryption must be configured when opening the database".into(),
+        ))
     }
 
     pub fn set_reserved_bytes(&self, reserved_bytes: u8) -> Result<()> {
         let pager = self.pager.load();
+        if pager.encryption_cipher() != CipherMode::None {
+            if reserved_bytes as usize == pager.encryption_cipher().metadata_size() {
+                return Ok(());
+            }
+            return Err(LimboError::InvalidArgument(
+                "encrypted database reserved bytes are fixed when opening the database".into(),
+            ));
+        }
         if let Some(codec) = pager.page_codec_external() {
             let required_reserved_bytes = codec.required_reserved_bytes();
             if reserved_bytes != required_reserved_bytes {
@@ -4350,47 +4472,10 @@ impl Connection {
     }
 
     pub fn get_encryption_cipher_mode(&self) -> Option<CipherMode> {
-        match self.encryption_cipher_mode.get() {
+        match self.pager.load().encryption_cipher() {
             CipherMode::None => None,
             mode => Some(mode),
         }
-    }
-
-    fn ensure_can_change_encryption_settings(&self) -> Result<()> {
-        let pager = self.pager.load();
-        if pager.is_encryption_ctx_set() {
-            return Err(LimboError::InvalidArgument(
-                "cannot reset encryption attributes if already set in the session".to_string(),
-            ));
-        }
-        if pager.has_external_page_codec() {
-            return Err(LimboError::InvalidArgument(
-                "cannot configure built-in encryption while an external page codec is installed"
-                    .to_string(),
-            ));
-        }
-        if self.db.get_mv_store().is_some() {
-            return Err(LimboError::InvalidArgument(
-                "cannot enable encryption after MVCC is active; configure encryption before PRAGMA journal_mode='mvcc'"
-                    .to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    // if both key and cipher are set, set encryption context on pager
-    fn set_encryption_context(&self) -> Result<()> {
-        let key_guard = self.encryption_key.read();
-        let Some(key) = key_guard.as_ref() else {
-            return Ok(());
-        };
-        let cipher_mode = self.get_encryption_cipher_mode();
-        let Some(cipher_mode) = cipher_mode else {
-            return Ok(());
-        };
-        tracing::trace!("setting encryption ctx for connection");
-        let pager = self.pager.load();
-        pager.set_encryption_context(cipher_mode, key)
     }
 
     /// Sets a custom busy handler callback.
@@ -5121,14 +5206,41 @@ impl SymbolTable {
     }
 }
 
+/// `SELECT * FROM <table>`.
+fn select_all_from(table: &str) -> ast::Stmt {
+    ast::Stmt::Select(ast::Select {
+        with: None,
+        body: ast::SelectBody {
+            select: ast::OneSelect::Select {
+                distinctness: None,
+                columns: vec![ast::ResultColumn::Star],
+                from: Some(ast::FromClause {
+                    select: Box::new(ast::SelectTable::Table(
+                        ast::QualifiedName::single(ast::Name::exact(table.to_string())),
+                        None,
+                        None,
+                    )),
+                    joins: vec![],
+                }),
+                where_clause: None,
+                group_by: None,
+                window_clause: vec![],
+            },
+            compounds: vec![],
+        },
+        order_by: vec![],
+        limit: None,
+    })
+}
+
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
     use crate::attach::AttachDatabaseState;
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
     use crate::security::roles::SessionRole;
     use crate::ConnectOpts;
     use crate::IOResult;
-    use crate::SqliteDialect;
     use tempfile::TempDir;
 
     fn open_connection_with_opts(path: &std::path::Path, opts: DatabaseOpts) -> Arc<Connection> {
@@ -5139,7 +5251,7 @@ mod tests {
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(DialectThatCannotParse),
         )
         .unwrap();
         db.connect(ConnectOpts::new(SessionRole::Superuser))
@@ -5148,16 +5260,6 @@ mod tests {
 
     fn open_connection(path: &std::path::Path) -> Arc<Connection> {
         open_connection_with_opts(path, DatabaseOpts::new())
-    }
-
-    fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) -> Result<()> {
-        let mut state = AttachDatabaseState::default();
-        loop {
-            match conn.attach_database(path, alias, &mut state)? {
-                IOResult::Done(()) => return Ok(()),
-                IOResult::IO(io) => io.wait(conn.db.io.as_ref())?,
-            }
-        }
     }
 
     fn drive_attach_with_config(
@@ -5181,6 +5283,43 @@ mod tests {
         let catalog = conn.attached_databases.read();
         let entry = catalog.index_to_data.get(&index).unwrap();
         (entry.db.clone(), entry.pager.clone())
+    }
+
+    /// A statement on a sequence backing table can fail because the statement
+    /// allocator gives no memory. That is not corruption, so the error must
+    /// stay `OutOfMemory`: the concurrent simulator stops at a `Corrupt` error.
+    #[test]
+    fn sequence_backing_table_error_keeps_out_of_memory() {
+        let err = Connection::sequence_backing_table_corrupt(
+            "__turso_internal_seq_s",
+            "s",
+            "cannot prepare descriptor SELECT",
+            &LimboError::OutOfMemory,
+        );
+        assert!(matches!(err, LimboError::OutOfMemory), "{err}");
+
+        let err = Connection::sequence_backing_table_corrupt(
+            "__turso_internal_seq_s",
+            "s",
+            "descriptor row read failed",
+            &LimboError::InternalError("no row".to_string()),
+        );
+        assert!(matches!(err, LimboError::Corrupt(_)), "{err}");
+    }
+
+    #[test]
+    fn close_marks_connection_closed_and_decrements_count_once() {
+        let directory = TempDir::new().unwrap();
+        let connection = open_connection(&directory.path().join("close.db"));
+        let database = connection.db.clone();
+        assert_eq!(database.n_connections.load(Ordering::SeqCst), 1);
+        connection.close().unwrap();
+        assert!(connection.is_closed());
+        assert_eq!(database.n_connections.load(Ordering::SeqCst), 0);
+        connection.close().unwrap();
+        assert_eq!(database.n_connections.load(Ordering::SeqCst), 0);
+        drop(connection);
+        assert_eq!(database.n_connections.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -5214,108 +5353,182 @@ mod tests {
             "cannot attach database 'aux': reserved space 0 is smaller than attached database minimum 8"
         );
     }
+}
+
+#[cfg(all(test, shuttle))]
+mod shuttle_encryption_tests {
+    use super::*;
+    use crate::thread;
 
     #[test]
-    fn test_fresh_mvcc_attach_installs_wal_before_bootstrap() {
-        // this is a test to check that mvcc db on attach with a fresh db, makes the
-        // attached db also mvcc
-        let temp_dir = TempDir::new().unwrap();
-        let main_path = temp_dir.path().join("main.db");
-        let aux_path = temp_dir.path().join("aux.db");
-        let conn = open_connection(&main_path);
-
-        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        drive_attach(&conn, aux_path.to_str().unwrap(), "aux").unwrap();
-
-        let (attached_db, pager) = attached_entry(&conn, "aux");
-        assert!(attached_db.get_mv_store().as_ref().is_some());
-        assert!(pager.has_wal());
-
-        conn.execute("CREATE TABLE aux.t(x INTEGER)").unwrap();
-        conn.execute("INSERT INTO aux.t VALUES(1)").unwrap();
-        conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
+    fn seeded_connections_authenticate_independent_keys() {
+        seeded("connections authenticate independent keys", || {
+            let (db, _, _) = connections();
+            let first_db = db.clone();
+            let second_db = db.clone();
+            assert_eq!(
+                race(
+                    move || first_db
+                        .connect(
+                            ConnectOpts::new(crate::SessionRole::Superuser)
+                                .with_encryption_key(Some(key(1)))
+                        )
+                        .is_ok(),
+                    move || second_db
+                        .connect(
+                            ConnectOpts::new(crate::SessionRole::Superuser)
+                                .with_encryption_key(Some(key(2)))
+                        )
+                        .is_ok()
+                ),
+                [true, false]
+            );
+            assert_single_binding(&db, CipherMode::Aegis256, 1);
+        });
     }
 
     #[test]
-    fn test_fresh_mvcc_attach_reuses_database_shared_wal() {
-        let temp_dir = TempDir::new().unwrap();
-        let main_path = temp_dir.path().join("main.db");
-        let aux_path = temp_dir.path().join("aux.db");
-        let conn = open_connection(&main_path);
-
-        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        drive_attach(&conn, aux_path.to_str().unwrap(), "aux").unwrap();
-        conn.execute("CREATE TABLE aux.t(x INTEGER)").unwrap();
-        conn.execute("INSERT INTO aux.t VALUES(1)").unwrap();
-
-        let (attached_db, pager) = attached_entry(&conn, "aux");
-        let pager_shared_ptr = pager
-            .wal_shared_ptr()
-            .expect("fresh MVCC attach must expose WAL shared state in tests");
-        let db_shared_ptr = Arc::as_ptr(&attached_db.shared_wal) as usize;
-
-        assert_eq!(pager_shared_ptr, db_shared_ptr);
+    fn seeded_encrypted_schema_publication() {
+        seeded("schema publication", || {
+            let (db, writer, _) = connections();
+            let observer = db.clone();
+            assert_eq!(
+                race(
+                    move || {
+                        let pager = writer.get_pager();
+                        writer.db.io.block(|| pager.maybe_allocate_page1()).unwrap();
+                        writer
+                            .with_schema_mut(|schema| schema.schema_version += 1)
+                            .unwrap();
+                        writer.publish_schema_if_newer();
+                        true
+                    },
+                    move || observer
+                        .connect(
+                            ConnectOpts::new(crate::SessionRole::Superuser)
+                                .with_encryption_key(Some(key(2)))
+                        )
+                        .is_ok()
+                ),
+                [true, false]
+            );
+            assert_eq!(db.clone_schema().schema_version, 1);
+            assert_single_binding(&db, CipherMode::Aegis256, 1);
+        });
     }
 
-    #[test]
-    fn test_ddl_in_one_transaction_changes_the_schema_in_place() {
-        fn schema_ptr(conn: &Connection, db: usize) -> *const Schema {
-            match db {
-                crate::MAIN_DB_ID => Arc::as_ptr(&conn.schema.read()),
-                crate::TEMP_DB_ID => {
-                    Arc::as_ptr(&conn.temp.database.read().as_ref().unwrap().db.schema.lock())
-                }
-                _ => Arc::as_ptr(&conn.database_schemas.read()[&db]),
-            }
+    fn connections() -> (Arc<Database>, Arc<Connection>, Arc<Connection>) {
+        let db = Database::open(
+            Arc::new(crate::MemoryIO::new()),
+            ":memory:",
+            crate::OpenOptions::new(Arc::new(
+                crate::dialect::cannot_parse::DialectThatCannotParse,
+            ))
+            .db_opts(DatabaseOpts::new().with_encryption(true))
+            .encryption(crate::EncryptionOpts {
+                cipher: "aegis256".into(),
+                hexkey: "01".repeat(32),
+            }),
+        )
+        .unwrap();
+        let first = db
+            .connect(
+                ConnectOpts::new(crate::SessionRole::Superuser).with_encryption_key(Some(key(1))),
+            )
+            .unwrap();
+        let second = db
+            .connect(
+                ConnectOpts::new(crate::SessionRole::Superuser).with_encryption_key(Some(key(1))),
+            )
+            .unwrap();
+        (db, first, second)
+    }
+
+    fn key(byte: u8) -> EncryptionKey {
+        EncryptionKey::new_256([byte; 32])
+    }
+
+    fn race(
+        first: impl FnOnce() -> bool + Send + 'static,
+        second: impl FnOnce() -> bool + Send + 'static,
+    ) -> [bool; 2] {
+        let first = thread::spawn(first);
+        let second = thread::spawn(second);
+        [first.join().unwrap(), second.join().unwrap()]
+    }
+
+    fn assert_single_binding(db: &Arc<Database>, cipher: CipherMode, winner: u8) {
+        let valid = db
+            .connect(
+                ConnectOpts::new(crate::SessionRole::Superuser)
+                    .with_encryption_key(Some(key(winner))),
+            )
+            .unwrap();
+        assert_eq!(valid.get_encryption_cipher_mode(), Some(cipher));
+        assert!(db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .is_err());
+        assert!(db
+            .connect(
+                ConnectOpts::new(crate::SessionRole::Superuser)
+                    .with_encryption_key(Some(key(3 - winner)))
+            )
+            .is_err());
+    }
+
+    fn seeded(name: &'static str, body: impl Fn() + Send + Sync + 'static) {
+        let iterations = if std::env::var("ENCRYPTION_TEST_FULL").as_deref() == Ok("1") {
+            256
+        } else {
+            8
+        };
+        let mut config = shuttle::Config::default();
+        config.stack_size = 1024 * 1024;
+        config.max_steps = shuttle::MaxSteps::FailAfter(10_000);
+        let scheduler = EncryptionScheduler {
+            inner: shuttle::scheduler::RandomScheduler::new(iterations),
+        };
+        let executions = shuttle::Runner::new(scheduler, config).run(body);
+        assert_eq!(executions, iterations);
+        eprintln!("encryption {name}: {executions} complete executions");
+    }
+
+    /// Runs the test's root thread alone and lets other threads interleave
+    /// at labelled shared-state accesses.
+    struct EncryptionScheduler<S> {
+        inner: S,
+    }
+
+    impl<S: shuttle::scheduler::Scheduler> shuttle::scheduler::Scheduler for EncryptionScheduler<S> {
+        fn new_execution(&mut self) -> Option<shuttle::scheduler::Schedule> {
+            self.inner.new_execution()
         }
 
-        let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(&temp_dir.path().join("main.db"));
-        let aux_path = temp_dir.path().join("aux.db");
-        drive_attach(&conn, aux_path.to_str().unwrap(), "aux").unwrap();
-        let aux_id = conn.qualifier("aux").unwrap().database_id();
-
-        for (db, name) in [
-            (crate::MAIN_DB_ID, "main"),
-            (crate::TEMP_DB_ID, "temp"),
-            (aux_id, "aux"),
-        ] {
-            conn.execute("BEGIN").unwrap();
-            // The first DDL copies the schema, which the committed schema still shares.
-            conn.execute(format!("CREATE TABLE {name}.a(x)")).unwrap();
-            let private_schema = schema_ptr(&conn, db);
-            conn.execute(format!("CREATE TABLE {name}.b(x UNIQUE)"))
-                .unwrap();
-            conn.execute(format!("CREATE INDEX {name}.b_x ON b(x)"))
-                .unwrap();
-            conn.execute(format!(
-                "CREATE TRIGGER {name}.b_insert AFTER INSERT ON b BEGIN SELECT 1; END"
-            ))
-            .unwrap();
-            assert_eq!(
-                schema_ptr(&conn, db),
-                private_schema,
-                "DDL on {name} copied a schema that only this transaction uses"
-            );
-            conn.execute(format!("INSERT INTO {name}.b VALUES (1)"))
-                .unwrap();
-
-            conn.execute("SAVEPOINT sp").unwrap();
-            conn.execute(format!("CREATE TABLE {name}.c(x)")).unwrap();
-            conn.execute(format!("CREATE TABLE {name}.d(x)")).unwrap();
-            conn.execute("ROLLBACK TO sp").unwrap();
-            assert!(conn.execute(format!("SELECT * FROM {name}.c")).is_err());
-            assert!(conn.execute(format!("SELECT * FROM {name}.d")).is_err());
-            conn.execute(format!("SELECT * FROM {name}.b")).unwrap();
-
-            conn.execute("ROLLBACK").unwrap();
-            for object in ["a", "b"] {
-                assert!(
-                    conn.execute(format!("SELECT * FROM {name}.{object}"))
-                        .is_err(),
-                    "{name}.{object} survived ROLLBACK"
-                );
+        fn next_task(
+            &mut self,
+            runnable: &[&shuttle::scheduler::Task],
+            current: Option<shuttle::scheduler::TaskId>,
+            yielding: bool,
+        ) -> Option<shuttle::scheduler::TaskId> {
+            if let Some(root) = runnable.iter().find(|task| usize::from(task.id()) == 0) {
+                return self.inner.next_task(&[root], current, yielding);
             }
+            if let Some(current) = current {
+                let shared = shuttle::current::get_label_for_task::<
+                    crate::sync::EncryptionSchedulePoint,
+                >(current)
+                .is_some_and(|point| point.0);
+                if !shared {
+                    if let Some(task) = runnable.iter().find(|task| task.id() == current) {
+                        return self.inner.next_task(&[task], Some(current), yielding);
+                    }
+                }
+            }
+            self.inner.next_task(runnable, current, yielding)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.inner.next_u64()
         }
     }
 }

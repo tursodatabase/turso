@@ -12,7 +12,7 @@ Retrieves rows from one or more tables. SELECT is the primary way to read data i
 
 ```sql
 [WITH cte_name AS (select_statement) [, ...]]
-SELECT [DISTINCT] result_column [, ...]
+SELECT [DISTINCT [ON (expression [, ...])]] result_column [, ...]
   [FROM table_or_subquery [join_clause ...]]
   [WHERE expression]
   [GROUP BY expression [, ...]]
@@ -287,6 +287,13 @@ GROUP BY department
 HAVING COUNT(*) >= 5;
 ```
 
+Without GROUP BY, all rows form one group, and HAVING decides whether its single row is returned. A column outside an aggregate, in the select list, in HAVING, or in a subquery that references it, takes its value from the first row that reached the aggregates, or NULL when no row did. With a `MIN()` or `MAX()`, it takes its value from the row that set the minimum or maximum instead (see [aggregate functions](/docs/sql-reference/functions/aggregate)).
+
+```sql
+SELECT COUNT(*) FROM employees
+HAVING (SELECT COUNT(*) FROM departments WHERE departments.id = employees.department_id) > 0;
+```
+
 ### GROUP BY with Expressions
 
 ```sql
@@ -312,6 +319,38 @@ DISTINCT applies to the entire result row, not to a single column. Two rows are 
 </Info>
 
 Text values are compared with the collation of their result column. A column with a custom collation registered by the application is not supported in `SELECT DISTINCT` or in an aggregate such as `count(DISTINCT x)`, and is an error.
+
+### DISTINCT ON
+
+`DISTINCT ON (expression [, ...])` returns one row for each distinct value of the listed expressions: the first row of each group in ORDER BY order. It is a Turso extension that follows PostgreSQL.
+
+```sql
+-- The highest-paid employee of each department
+SELECT DISTINCT ON (department) department, name, salary
+FROM employees
+ORDER BY department, salary DESC;
+```
+
+The ORDER BY must begin with the DISTINCT ON expressions, written the same way and in any order, and the terms after them decide which row of each group comes first. Without those terms, the row returned for a group is unspecified. An ORDER BY that begins with anything else is an error:
+
+```sql
+SELECT DISTINCT ON (department) department, name FROM employees ORDER BY name;
+-- Error: SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+```
+
+A DISTINCT ON expression follows the rules of an ORDER BY term: an integer is a position in the select list, and a name refers to an output column before a table column. The expressions do not have to appear in the select list. NULL values form one group.
+
+DISTINCT ON is applied after WHERE, GROUP BY, HAVING and window functions, and before LIMIT and OFFSET. When an index already provides the ORDER BY order, the rows are not sorted again.
+
+These forms are not supported:
+
+- DISTINCT ON in a materialized view.
+- A function whose value changes from call to call, such as `random()`, in the select list.
+- In a query with GROUP BY or aggregates, a DISTINCT ON expression that reads a column outside the GROUP BY expressions and outside an aggregate.
+- An aggregate in a DISTINCT ON expression when the query has no GROUP BY and no other aggregate.
+- A DISTINCT ON expression computed on an aggregate, such as `1 / sum(x)`, when the query has no GROUP BY.
+
+`EXPLAIN QUERY PLAN` shows the step as `KEEP FIRST ROW PER DISTINCT ON KEY`.
 
 ## ORDER BY
 

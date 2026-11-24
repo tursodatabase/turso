@@ -258,8 +258,6 @@ fn parse_spilled_delta(
             Value::Numeric(crate::numeric::Numeric::Integer(root_page)) => {
                 TableChangeId::RootPage(root_page)
             }
-            #[cfg(test)]
-            Value::Text(name) => TableChangeId::Name(name.as_str().to_string()),
             _ => {
                 return Err(LimboError::Corrupt(
                     "materialized-view delta table identity has an invalid type".to_string(),

@@ -1,5 +1,6 @@
 use super::{
-    BackendError, DatabaseFileHandle, DatabaseInstance, QueryResult, SqlBackend, parse_list_output,
+    BackendError, DatabaseFileHandle, DatabaseInstance, QueryResult, SqlBackend,
+    check_process_crash, parse_list_output,
 };
 use crate::backends::DefaultDatabaseResolver;
 use crate::parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation};
@@ -180,6 +181,7 @@ impl JsDatabaseInstance {
         // Parse stdout
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        check_process_crash(output.status, &stderr)?;
 
         // Check for errors in stderr
         if !stderr.is_empty() && (stderr.contains("Error") || stderr.contains("error")) {

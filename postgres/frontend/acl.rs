@@ -6,9 +6,9 @@
 
 use std::fmt;
 
+use turso_core::ast;
 use turso_core::schema::RelationKind;
 use turso_core::{parse_text_array_of_texts, text_array_literal, Value};
-use turso_parser::ast;
 
 /// The oid that stands for `PUBLIC`, every role, which the text form writes
 /// as an empty name. PostgreSQL's `ACL_ID_PUBLIC`.
@@ -282,6 +282,13 @@ impl Acl {
             (roles.contains(&item.grantee) || item.grantee == PUBLIC_OID)
                 && !item.privileges.is_empty()
         })
+    }
+
+    /// Whether role `oid` is a grantee or a grantor of an entry.
+    pub(crate) fn names_role(&self, oid: i64) -> bool {
+        self.items
+            .iter()
+            .any(|item| item.grantee == oid || item.grantor == oid)
     }
 
     /// Makes `new_owner` stand wherever `old_owner` stood, as grantee and as

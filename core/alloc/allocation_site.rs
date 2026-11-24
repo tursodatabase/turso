@@ -10,6 +10,7 @@ pub enum AllocationSite {
     Vector(VectorAllocationSite),
     NoFaultInjection,
     Fts(FtsAllocationSite),
+    Statement(StatementAllocationSite),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -24,6 +25,30 @@ pub enum FtsAllocationSite {
 impl From<FtsAllocationSite> for AllocationSite {
     fn from(site: FtsAllocationSite) -> Self {
         Self::Fts(site)
+    }
+}
+
+/// An allocation from the statement allocator of
+/// [DatabaseAllocators](crate::DatabaseAllocators).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum StatementAllocationSite {
+    /// The program builder of a nested trigger program.
+    TriggerProgramBuilder,
+    /// The statement that executes a nested trigger or foreign key action
+    /// program.
+    SubprogramStatement,
+    /// The builder of the program of a statement, of a blob handle or of the
+    /// maintenance of a materialized view, or the builder that plans the
+    /// query of a materialized view.
+    ProgramBuilder,
+    /// The state of a statement, which keeps its registers and cursors while
+    /// the statement executes.
+    ProgramState,
+}
+
+impl From<StatementAllocationSite> for AllocationSite {
+    fn from(site: StatementAllocationSite) -> Self {
+        Self::Statement(site)
     }
 }
 
@@ -197,6 +222,16 @@ macro_rules! with_value_blob_allocation_site {
         #[cfg(feature = "allocation_metric")]
         let _turso_allocation_site_guard =
             $crate::alloc::enter_allocation_site($crate::alloc::ValueBlobAllocationSite::$site);
+        $expr
+    }};
+}
+
+#[macro_export]
+macro_rules! with_statement_allocation_site {
+    ($site:ident, $expr:expr) => {{
+        #[cfg(feature = "allocation_metric")]
+        let _turso_allocation_site_guard =
+            $crate::alloc::enter_allocation_site($crate::alloc::StatementAllocationSite::$site);
         $expr
     }};
 }

@@ -401,6 +401,11 @@ impl YieldPointMarker for BTreeWriteYieldPoint {
     }
 }
 
+/// The largest buffer that an overflow read reserves before it reads the
+/// overflow pages. A larger payload grows the buffer while the read copies the
+/// pages.
+const OVERFLOW_READ_MAX_RESERVE: usize = 16 * 1024 * 1024;
+
 struct ReadPayloadOverflow {
     payload: crate::alloc::Vec<u8>,
     next_page: u32,
@@ -1638,8 +1643,19 @@ impl BTreeCursor {
                 // page that doesn't exist yet, and re-entry would skip the
                 // `is_none()` branch entirely.
                 let (page, c) = return_if_io!(self.read_page(start_next_page as i64));
-                let payload =
-                    crate::with_btree_allocation_site!(OverflowRead, payload.try_to_vec())?;
+                // Reserve the whole payload, so that the copies of the overflow
+                // pages do not grow the buffer, which copies all the bytes read
+                // before. The size comes from the cell, which can be corrupt,
+                // so the reservation has a limit.
+                let capacity = (payload_size.min(OVERFLOW_READ_MAX_RESERVE as u64) as usize)
+                    .max(payload.len());
+                let mut payload_buf = crate::alloc::vec![];
+                crate::with_btree_allocation_site!(
+                    OverflowRead,
+                    payload_buf.try_reserve_exact(capacity)
+                )?;
+                payload_buf.extend_from_slice(payload);
+                let payload = payload_buf;
                 self.read_overflow_state.replace(ReadPayloadOverflow {
                     payload,
                     next_page: start_next_page,
@@ -1685,10 +1701,10 @@ impl BTreeCursor {
                 page,
             } = self.read_overflow_state.as_mut().unwrap();
             let buf = page.get_contents().as_ptr();
-            crate::with_btree_allocation_site!(
-                OverflowRead,
-                payload.try_extend(buf[4..4 + to_read].iter().copied())
-            )?;
+            // The buffer usually has the capacity already. `extend_from_slice`
+            // copies with `memcpy`, where the iterator could copy byte by byte.
+            crate::with_btree_allocation_site!(OverflowRead, payload.try_reserve(to_read))?;
+            payload.extend_from_slice(&buf[4..4 + to_read]);
             *remaining_to_read -= to_read;
 
             if let Some((new_page, c)) = new_page_and_c {
@@ -1731,16 +1747,9 @@ impl BTreeCursor {
                 .expect("read_overflow_state was checked above")
                 .payload;
 
+            // The record takes the buffer, so the payload is not copied again.
             let mut reuse_immutable = self.get_immutable_record_or_create()?;
-            reuse_immutable.as_mut().unwrap().invalidate();
-
-            crate::with_btree_allocation_site!(
-                RecordPayload,
-                reuse_immutable
-                    .as_mut()
-                    .unwrap()
-                    .start_serialization(&payload_swap)
-            )?;
+            reuse_immutable.as_mut().unwrap().set_payload(payload_swap);
 
             break Ok(IOResult::Done(()));
         }
@@ -2232,7 +2241,7 @@ impl BTreeCursor {
         index_key: &ImmutableRecordRef<'_>,
         cmp: SeekOp,
     ) -> IOResultOr<()> {
-        let key_values = index_key.get_values()?;
+        let key_values = index_key.get_values_inline()?;
         let record_comparer = {
             let index_info = self
                 .index_info
@@ -2809,7 +2818,7 @@ impl BTreeCursor {
         key: &ImmutableRecordRef<'_>,
         seek_op: SeekOp,
     ) -> IOResultOr<SeekResult> {
-        let key_values = key.get_values()?;
+        let key_values = key.get_values_inline()?;
         let record_comparer = {
             let index_info = self
                 .index_info
@@ -4159,7 +4168,7 @@ impl BTreeCursor {
                     #[cfg(debug_assertions)]
                     validate_cells_after_insertion(&cell_array, is_table_leaf);
 
-                    /* 3. Initiliaze current size of every page including overflow cells and divider cells that might be included. */
+                    /* 3. Initiliaze current size of every page including overflow cells. Divider cells are not counted because they are stored in the parent page, not in the sibling. */
                     let mut new_page_sizes: [i64; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE] =
                         [0; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE];
                     let header_size = if is_leaf {
@@ -4181,13 +4190,6 @@ impl BTreeCursor {
                         for overflow in &page_contents.overflow_cells {
                             // 2 to account of pointer
                             new_page_sizes[i] += 2 + overflow.payload.len() as i64;
-                        }
-                        let is_last_sibling = i == balance_info.sibling_count - 1;
-                        if !is_leaf && !is_last_sibling {
-                            // Account for divider cell which is included in this page.
-                            new_page_sizes[i] += cell_array.cell_payloads
-                                [cell_array.cell_count_up_to_page(i)]
-                            .len() as i64;
                         }
                     }
 
@@ -8019,15 +8021,26 @@ impl BTreeCursor {
         self.ensure_payload_layout()?;
         let mut kept = std::mem::take(self.blob_cache.kept_read_mut(which));
         if !(kept.valid && kept.offset == offset && kept.len == len) {
-            kept.bytes.clear();
+            // Growing the buffer copies its old bytes, which this read
+            // replaces. So a buffer that is too small is replaced by a new
+            // one with the capacity that growing gives.
+            let capacity = if kept.bytes.capacity() < len {
+                let capacity = len.max(kept.bytes.capacity() * 2);
+                kept.bytes = crate::alloc::vec![];
+                capacity
+            } else {
+                kept.bytes.clear();
+                len
+            };
             match which {
                 KeptRead::Header => crate::with_btree_allocation_site!(
                     BlobRecordHeader,
-                    kept.bytes.try_reserve(len)
+                    kept.bytes.try_reserve(capacity)
                 )?,
-                KeptRead::Values => {
-                    crate::with_btree_allocation_site!(OverflowRead, kept.bytes.try_reserve(len))?
-                }
+                KeptRead::Values => crate::with_btree_allocation_site!(
+                    OverflowRead,
+                    kept.bytes.try_reserve(capacity)
+                )?,
             }
             kept.valid = true;
             kept.offset = offset;
@@ -8040,6 +8053,19 @@ impl BTreeCursor {
         *self.blob_cache.kept_read_mut(which) = kept;
         return_if_io!(copied);
         Ok(IOResult::Done(&self.blob_cache.kept_read_mut(which).bytes))
+    }
+
+    /// Takes the bytes that the last `read_payload(KeptRead::Values, ..)` read
+    /// and keeps `buffer`, emptied, in their place. The cursor forgets that
+    /// read, so the next read of these values reads them from the pages again.
+    pub(crate) fn take_kept_values(
+        &mut self,
+        mut buffer: crate::alloc::Vec<u8>,
+    ) -> crate::alloc::Vec<u8> {
+        buffer.clear();
+        let kept = &mut self.blob_cache.kept_values;
+        kept.valid = false;
+        std::mem::replace(&mut kept.bytes, buffer)
     }
 
     /// `payload_fetch` with the page bytes typed as `'static`. `record_payload`
@@ -8890,11 +8916,13 @@ impl PartialOrd for IntegrityCheckCellRange {
 /// MINIMUM_CELL_SIZE bytes, the least space any cell takes on a page (a freed cell must be
 /// able to hold a 4-byte freeblock header).
 ///
-/// Only index cells can be smaller: a one-column record of 0, 1, '' or X'' is 2 bytes, so
-/// its cell is 3. A leaf page stores such a cell padded and cell_get_raw_region reports the
-/// padded size, while a divider in the parent stores the cell's real size after its child
-/// pointer. Padding the cell whenever it is headed for a leaf keeps balancing working with
-/// one size; the record's own length prefix keeps readers from ever looking at the padding.
+/// Only leaf cells can be smaller. An index cell holding a one-column record of NULL, 0, 1, ''
+/// or X'' is 3 bytes (the record is 2), and so is a table cell with a rowid from 0 to 127 and an
+/// empty record (the temporary table of rowids an upsert wrote). A leaf page stores such a cell in
+/// a MINIMUM_CELL_SIZE slot and cell_get_raw_region reports the padded size, while an index
+/// divider in the parent stores the cell's real size after its child pointer. Padding the cell
+/// whenever it is headed for a leaf keeps balancing working with one size; the cell's own length
+/// prefix keeps readers from ever looking at the padding.
 fn ensure_min_cell_size(buf: &mut crate::alloc::Vec<u8>, cell_start: usize) {
     const ZEROS: [u8; MINIMUM_CELL_SIZE] = [0; MINIMUM_CELL_SIZE];
     let padding = (cell_start + MINIMUM_CELL_SIZE).saturating_sub(buf.len());
@@ -10355,7 +10383,7 @@ fn _insert_into_cell(
             }
         }
         let mut payload = crate::with_btree_allocation_site!(OverflowCell, payload.try_to_vec())?;
-        if page.page_type()? == PageType::IndexLeaf {
+        if matches!(page.page_type()?, PageType::IndexLeaf | PageType::TableLeaf) {
             // Balancing must see one size for every leaf cell, whether it sits on the page
             // (where cell_get_raw_region reports at least the minimum size) or overflowed.
             ensure_min_cell_size(&mut payload, 0);
@@ -10705,9 +10733,14 @@ fn fill_cell_payload(
                             );
                             turso_assert!(*dst_data_offset == overflow_page_pointer_size, "data must be copied to overflow page pointer offset on overflow pages", { "dst_data_offset": dst_data_offset, "overflow_page_pointer_size": overflow_page_pointer_size });
                             let contents = cur_page.get_contents();
-                            let buf = &mut contents.as_ptr()
-                                [*dst_data_offset..*dst_data_offset + amount_to_copy];
-                            buf.copy_from_slice(record_offset_slice_to_copy);
+                            let page_buf = contents.as_ptr();
+                            let payload_end = *dst_data_offset + amount_to_copy;
+                            page_buf[*dst_data_offset..payload_end]
+                                .copy_from_slice(record_offset_slice_to_copy);
+                            // `allocate_overflow_page` does not clear the page. The
+                            // bytes after the payload are zero: the end of the payload
+                            // on the last page, and the reserved bytes on each page.
+                            page_buf[payload_end..].fill(0);
                         } else {
                             // Copy data into the cell payload on the btree page.
                             let buf = &mut cell_payload
@@ -10737,6 +10770,10 @@ fn fill_cell_payload(
                             "new overflow page is not loaded"
                         );
                         let new_overflow_page_id = new_overflow_page.get().id() as u32;
+                        // The pointer to the next overflow page is zero until the next
+                        // page is allocated, and stays zero on the last page.
+                        new_overflow_page.get_contents().as_ptr()[..overflow_page_pointer_size]
+                            .fill(0);
 
                         if let Some(prev_page) = current_overflow_page {
                             // Update the previous overflow page's "next overflow page" pointer to point to the new overflow page.
@@ -13785,6 +13822,51 @@ mod tests {
         );
     }
 
+    /// A table leaf cell can be 3 bytes too: a rowid from 0 to 127 and an empty record, as in the
+    /// temporary table of rowids an upsert wrote. When such a cell overflows a full leaf it must
+    /// be padded to MINIMUM_CELL_SIZE, as it would be on the page, or balancing counts and checks
+    /// a cell shorter than any cell on a page.
+    #[test]
+    pub fn test_tiny_cell_overflowing_a_leaf_is_padded() {
+        for page_type in [PageType::TableLeaf, PageType::IndexLeaf] {
+            let page = get_page(2);
+            btree_init_page(&page, page_type, 0, 4096);
+            let contents = page.get_contents();
+            let usable_space = 4096;
+
+            // 681 six-byte slots (a four-byte cell and its pointer) fill 4086 of the 4088 free
+            // bytes. insert_into_cell doesn't read the cells, so one cell repeated will do.
+            let four_byte_cell = [0x02, 0x05, 0x01, 0x00];
+            for i in 0..681 {
+                insert_into_cell(contents, &four_byte_cell, i, usable_space).unwrap();
+            }
+            assert_eq!(compute_free_space(contents, usable_space).unwrap(), 2);
+            let three_byte_cell = [0x01, 0x01, 0x01];
+            insert_into_cell(contents, &three_byte_cell, 681, usable_space).unwrap();
+
+            assert_eq!(
+                contents.overflow_cells.len(),
+                1,
+                "{page_type:?}: the cell overflows"
+            );
+            let overflowed = &contents.overflow_cells[0].payload;
+            assert_eq!(
+                overflowed.len(),
+                MINIMUM_CELL_SIZE,
+                "{page_type:?}: the overflowed cell is padded"
+            );
+            assert_eq!(
+                &overflowed[..3],
+                &three_byte_cell,
+                "{page_type:?}: the cell's bytes are kept"
+            );
+            assert_eq!(
+                overflowed[3], 0,
+                "{page_type:?}: the padding is a zero byte"
+            );
+        }
+    }
+
     #[test]
     pub fn test_defragment_1() {
         let pager = pager_of_new_database();
@@ -14464,6 +14546,45 @@ mod tests {
                 .unwrap();
             assert_eq!(rowid, i as i64, "got!=expected");
         }
+    }
+
+    /// `allocate_overflow_page` does not clear the page, and a buffer of the
+    /// buffer pool can hold the bytes of an earlier page. The overflow pages of
+    /// a cell get the payload and zeros, and no byte of the earlier page.
+    #[test]
+    pub fn test_overflow_pages_hold_no_bytes_of_an_earlier_page() {
+        let (pager, root_page) = empty_btree();
+        // Put bytes that are not zero into the free page buffers of the pool, as
+        // a page that used a buffer before does.
+        let buffers: Vec<Buffer> = (0..512).map(|_| pager.buffer_pool.get_page()).collect();
+        for buffer in &buffers {
+            buffer.as_mut_slice().fill(0xAB);
+        }
+        drop(buffers);
+
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+        // The payload fills two overflow pages and a part of a third one.
+        let blob = Value::Blob(crate::alloc::vec![0x11; 3 * pager.usable_space()]);
+        insert_record(&mut cursor, &pager, 1, blob).unwrap();
+
+        let (leaf, _c) = cursor.read_page_blocking(root_page).unwrap();
+        let cell = leaf
+            .get_contents()
+            .cell_get(0, pager.usable_space())
+            .unwrap();
+        let mut next_page = cell.first_overflow_page().expect("the cell overflows");
+        let mut overflow_pages = 0;
+        while next_page != 0 {
+            let (page, _c) = cursor.read_page_blocking(next_page as i64).unwrap();
+            let bytes = page.get_contents().as_ptr();
+            assert!(
+                !bytes.contains(&0xAB),
+                "overflow page {next_page} holds bytes of an earlier page"
+            );
+            next_page = u32::from_be_bytes(bytes[..4].try_into().unwrap());
+            overflow_pages += 1;
+        }
+        assert_eq!(overflow_pages, 3);
     }
 
     fn run_until_done<T>(action: impl FnMut() -> IOResultOr<T>, pager: &Pager) -> Result<T> {

@@ -192,14 +192,20 @@ pub struct SimulatorCLI {
     pub disable_integrity_check: bool,
     #[clap(
         long = "io-backend",
-        help = "Select the IO backend for the simulator",
-        value_enum,
-        default_value_t = IoBackend::Default
+        help = "Select the IO backend for the simulator [default: default, or picked by --swarm]",
+        value_enum
     )]
-    pub io_backend: IoBackend,
+    pub io_backend: Option<IoBackend>,
     #[clap(long, default_value_t = ProfileType::Default)]
     /// Profile selector for Simulation run
     pub profile: ProfileType,
+    /// Pick the statement mix, the properties, the faults, the connection count, the I/O
+    /// backend and the clock ticks from the seed (swarm testing). The flags that you give
+    /// keep their values.
+    #[clap(long)]
+    // A bug base entry from an older simulator has no `swarm` field.
+    #[serde(default)]
+    pub swarm: bool,
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]

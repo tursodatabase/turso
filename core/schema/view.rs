@@ -1,18 +1,21 @@
 use crate::alloc::TursoIteratorExt;
+use crate::ast;
 use crate::namespace::NamespaceId;
 use crate::schema::ColDef;
+use crate::translate::expr::WalkControl;
 use crate::translate::plan::{
     left_using_column_sources, star_column_uses_merged_value, unqualified_column_sources,
     ColumnLookup, JoinInfo, JoinType,
 };
-use crate::util::{extract_column_name_from_expr, normalize_ident, type_from_name};
+use crate::util::{
+    extract_column_name_from_expr, normalize_ident, type_from_name, visit_select, AstVisitor,
+};
 use crate::vdbe::affinity::Affinity;
 use crate::{
     schema::{Column, Schema, Table},
     LimboError, Result,
 };
-use rustc_hash::FxHashMap as HashMap;
-use turso_parser::ast;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 /// Information about a table referenced in a view
 #[derive(Debug, Clone)]
@@ -709,4 +712,52 @@ pub fn extract_view_columns(
     schema: &Schema,
 ) -> Result<ViewColumnSchema> {
     extract_view_columns_inner(namespace, select_stmt, schema, &HashMap::default())
+}
+
+/// The tables `select` reads, each with the namespace it is written
+/// with, if any. A name that is a CTE of the select is not a table.
+pub fn referenced_tables(select: &ast::Select) -> std::vec::Vec<(Option<String>, String)> {
+    #[derive(Default)]
+    struct TablesRead {
+        /// The names of the CTEs of each enclosing WITH clause.
+        ctes_in_scope: Vec<Vec<String>>,
+        tables: HashSet<(Option<String>, String)>,
+    }
+
+    impl AstVisitor for TablesRead {
+        fn expr(&mut self, _expr: &ast::Expr) -> Result<WalkControl> {
+            Ok(WalkControl::Continue)
+        }
+
+        fn table(&mut self, name: &ast::QualifiedName) -> Result<()> {
+            let table = normalize_ident(name.name.as_str());
+            let qualifier = name
+                .namespace
+                .as_ref()
+                .map(|qualifier| normalize_ident(qualifier.as_str()));
+            let is_cte =
+                qualifier.is_none() && self.ctes_in_scope.iter().flatten().any(|cte| *cte == table);
+            if !is_cte {
+                self.tables.insert((qualifier, table));
+            }
+            Ok(())
+        }
+
+        fn enter_with(&mut self, with: &ast::With) {
+            self.ctes_in_scope.push(
+                with.ctes
+                    .iter()
+                    .map(|cte| normalize_ident(cte.tbl_name.as_str()))
+                    .collect(),
+            );
+        }
+
+        fn leave_with(&mut self) {
+            self.ctes_in_scope.pop();
+        }
+    }
+
+    let mut tables_read = TablesRead::default();
+    visit_select(select, &mut tables_read).expect("collecting the tables of a query cannot fail");
+    tables_read.tables.into_iter().collect()
 }

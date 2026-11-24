@@ -9,6 +9,9 @@
 //! the PostgreSQL result and remove `tursopg_returns_wrong_result` from the
 //! name. See postgres/CONTRIBUTING.md.
 //!
+//! The gap counts of `make -C postgres/conformance gaps` come from the `@compat-gap`
+//! tests in the .sqltest files and do not include these tests.
+//!
 //! Results are rows joined by ` ; ` and cells joined by `|`, or
 //! `ERROR <sqlstate>`. PostgreSQL results are the PostgreSQL 18 results in
 //! the form the embedded API returns them: booleans as `1` and `0`, and
@@ -18,11 +21,9 @@ use crate::common::TempDatabase;
 use std::num::NonZero;
 use turso_core::{Numeric, Value};
 
-// A-03 (S1): bool $n param cast (text param)
-// tursopg: boolean text params all cast to false.
-// PostgreSQL: 1|1|0|1
+// A-03: bool $n param cast (text param)
 #[turso_macros::test(views)]
-fn gap_a_03_tursopg_returns_wrong_result_bool_n_param_cast_text_param(db: TempDatabase) {
+fn gap_a_03_bool_n_param_cast_text_param(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::boolean, $2::boolean, $3::boolean, $4::boolean",
         params: &[
@@ -34,21 +35,19 @@ fn gap_a_03_tursopg_returns_wrong_result_bool_n_param_cast_text_param(db: TempDa
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "0|0|0|0");
+    assert_eq!(out, "1|1|0|1");
 }
 
-// A-05 (S1): bool invalid param
-// tursopg: an invalid boolean param casts to false instead of failing.
-// PostgreSQL: ERROR 22P02
+// A-05: bool invalid param
 #[turso_macros::test(views)]
-fn gap_a_05_tursopg_returns_wrong_result_bool_invalid_param(db: TempDatabase) {
+fn gap_a_05_bool_invalid_param(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::boolean",
         params: &[P::Text("maybe")],
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "0");
+    assert_eq!(out, "ERROR 22P02");
 }
 
 // A-12 (S1): invalid int param cast
@@ -117,18 +116,30 @@ fn gap_a_33_timestamptz_n_param_with_offset(db: TempDatabase) {
     assert_eq!(out, "2026-10-08 12:00:00");
 }
 
-// A-41 (S2): date $n param
-// tursopg: a date cast of a param is not supported.
-// PostgreSQL: 2026-10-08
+// A timestamptz or timestamp $n param plus an interval literal. The
+// timestamptz param has an offset, and the timestamp param has a T separator,
+// so the stored values differ from the param text.
 #[turso_macros::test(views)]
-fn gap_a_41_tursopg_returns_wrong_result_date_n_param(db: TempDatabase) {
+fn timestamp_n_param_plus_interval(db: TempDatabase) {
+    let out = GapCase {
+        sql: "SELECT $1::timestamptz + interval '1 day', $2::timestamp + interval '1 day'",
+        params: &[P::Text("2026-01-01 10:00+05"), P::Text("2026-01-01T10:00")],
+        ..GapCase::default()
+    }
+    .run(db);
+    assert_eq!(out, "2026-01-02 05:00:00|2026-01-02 10:00:00");
+}
+
+// A-41: date $n param
+#[turso_macros::test(views)]
+fn gap_a_41_date_n_param(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::date",
         params: &[P::Text("2026-10-08")],
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "ERROR 0A000");
+    assert_eq!(out, "2026-10-08");
 }
 
 // A-49 (S1): invalid jsonb param
@@ -456,11 +467,9 @@ fn gap_b_32_int_1_int(db: TempDatabase) {
     assert_eq!(out, "1");
 }
 
-// B-44 (S1): jsonb @> $1::jsonb param
-// tursopg: jsonb @> with a param returns no rows.
-// PostgreSQL: 2
+// B-44: jsonb @> $1::jsonb param
 #[turso_macros::test(views)]
-fn gap_b_44_tursopg_returns_wrong_result_jsonb_1_jsonb_param(db: TempDatabase) {
+fn gap_b_44_jsonb_1_jsonb_param(db: TempDatabase) {
     let out = GapCase {
         setup: &[
             "CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean)",
@@ -471,7 +480,7 @@ fn gap_b_44_tursopg_returns_wrong_result_jsonb_1_jsonb_param(db: TempDatabase) {
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "");
+    assert_eq!(out, "2");
 }
 
 // B-54: jsonb ->  param key

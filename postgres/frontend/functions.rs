@@ -2,20 +2,23 @@ use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
-use chrono::Utc;
-use std::{fmt, sync::Arc};
+use chrono::{DateTime, NaiveDateTime};
+use std::fmt;
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::security::roles::RoleId;
 
 use crate::roles::{connection_roles, RoleCatalog};
+use turso_core::dialect::ScalarFuncContext;
 use turso_core::types::IOResultOr;
 use turso_core::{
-    exec_temporal_encode, Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions,
-    Register, Result, Value,
+    exec_temporal_encode, Connection, Decimal, ExternalFunc, IOResult, LimboError, Numeric,
+    OpenOptions, Register, Result, Value, WallClockInstant,
 };
+use turso_pg_parser::datetime_unit::DatetimeUnit;
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_DATETIME_FORMAT,
-    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
+    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR,
+    SQLSTATE_INVALID_DATETIME_FORMAT, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
     SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
     SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
     SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
@@ -26,13 +29,14 @@ use turso_pg_parser::sqlstate::{
 /// Rust type of the body (see `ScalarReturn`), so it cannot drift from what
 /// the body returns.
 macro_rules! scalar_functions {
-    ($options:expr, |$connection:ident, $args:ident| {
+    ($options:expr, |$context:ident, $connection:ident, $args:ident| {
         $($($name:literal)|+ ($arity:expr, $deterministic:expr) => $body:expr,)*
     }) => {{
         let mut options = $options;
         $($(
             #[allow(unused_variables)]
-            let step = |$connection: &Arc<Connection>, $args: &[Register]| -> Result<_> {
+            let step = |$context: &ScalarFuncContext<'_>, $args: &[Register]| -> Result<_> {
+                let $connection = $context.connection;
                 Ok($body)
             };
             options = options.extension_function(pg_scalar_function(
@@ -48,19 +52,259 @@ macro_rules! scalar_functions {
 
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     let options = register_scalar_functions(options);
-    options.extension_function(
-        pg_scalar_function(
-            "array_to_json",
-            FunctionArity::OneOf(&[1, 2]),
-            true,
-            |_, args| exec_array_to_json(args),
+    options
+        .extension_function(
+            pg_scalar_function(
+                "array_to_json",
+                FunctionArity::OneOf(&[1, 2]),
+                true,
+                |_, args| exec_array_to_json(args),
+            )
+            .receiving_argument_types(),
         )
-        .receiving_argument_types(),
-    )
+        .extension_function(
+            pg_scalar_function(
+                "date_trunc",
+                FunctionArity::OneOf(&[2, 3]),
+                true,
+                |_, args| exec_date_trunc(args),
+            )
+            .receiving_argument_types(),
+        )
+        // FIXME(pg-interval): PostgreSQL has no function of this name. It exists
+        // because tursopg has no interval type: the translator rewrites
+        // `timestamp ± interval literal` into a call of it, and users can also
+        // call it by name. An interval type with the pg_operator rows
+        // timestamp_pl_interval and timestamptz_pl_interval replaces it.
+        .extension_function(
+            pg_scalar_function(
+                turso_pg_parser::TIMESTAMP_PLUS_INTERVAL_FUNCTION,
+                FunctionArity::Exact(4),
+                true,
+                |_, args| exec_timestamp_plus_interval(args),
+            )
+            .receiving_argument_types()
+            .checking_argument_types(check_timestamp_plus_interval_types)
+            // FIXME(pg-catalog): The check refuses a domain on the left because
+            // the result would get the domain's type, where pg_operator gives
+            // the base type (timestamp or timestamptz). A pg_operator lookup
+            // replaces this.
+            .returning_first_argument_type(),
+        )
+}
+
+/// Refuses the left side of `+ interval` when it is not timestamp or
+/// timestamptz. `types` are the argument type names, with domain names kept;
+/// the first is the left side, so a domain over timestamp or timestamptz is
+/// refused. Every other type gets 0A000, including the ones that have no operator
+/// in PostgreSQL (which gives 42883), because the type name does not say
+/// whether PostgreSQL has one. The translator turns `-` into `+` of the
+/// negated interval, so the message always says `+`.
+// FIXME(pg-catalog): tursopg refuses every other left type with 0A000 because
+// it cannot tell which have a PostgreSQL operator. Some do, such as date, and
+// an untyped literal or NULL is resolved by PostgreSQL to a type that does. A
+// pg_operator lookup replaces this.
+fn check_timestamp_plus_interval_types(types: &[String]) -> Result<()> {
+    let time_type = types[0].as_str();
+    match time_type {
+        "timestamp" | "timestamptz" => Ok(()),
+        _ => Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "adding an interval is supported only for timestamp and timestamptz, not {time_type}"
+            ),
+            None,
+        )),
+    }
+}
+
+/// `timestamp + interval` and `timestamptz + interval` for an interval
+/// literal, which the translator passes as its months, days and microseconds:
+/// `(time, months, days, microseconds)`. The result has the type of `time`.
+/// The parts are added as PostgreSQL's timestamp_pl_interval adds them: the
+/// months first, moving a day past the end of the month back to its last day,
+/// then the days, then the microseconds. Only UTC is supported, so timestamptz
+/// is computed like timestamp. The type of `time` is checked when the
+/// statement is compiled.
+fn exec_timestamp_plus_interval(args: &[Register]) -> Result<Value> {
+    use chrono::Datelike;
+    let (args, types) = args.split_at(args.len() / 2);
+    let time_type = types[0].get_value().to_string();
+    // The function can be called by name with any arguments, and a value
+    // typed timestamp can reach it in a form the ENCODE of timestamp would
+    // not write, so unexpected arguments are errors, not assertions.
+    let not_supported = |what: String| sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, what, None);
+    let text = match args[0].get_value() {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(text) => text.as_str(),
+        other => {
+            return Err(not_supported(format!(
+                "adding an interval to the {time_type} value {other} is not supported"
+            )))
+        }
+    };
+    let integer = |register: &Register| match register.get_value() {
+        Value::Numeric(Numeric::Integer(value)) => Ok(*value),
+        other => Err(not_supported(format!(
+            "an interval part that is not an integer, {other}, is not supported"
+        ))),
+    };
+    let (months, days, micros) = (integer(&args[1])?, integer(&args[2])?, integer(&args[3])?);
+    let unreadable = || {
+        not_supported(format!(
+            "adding an interval to the {time_type} value \"{text}\" is not supported"
+        ))
+    };
+    let time =
+        NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").map_err(|_| unreadable())?;
+    let sum = add_interval(time, months, days, micros)
+        .filter(|sum| (1..=9999).contains(&sum.year()))
+        .ok_or_else(|| {
+            sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "a result outside the years 1 to 9999 is not supported",
+                None,
+            )
+        })?;
+    Ok(Value::build_text(timestamp_text(sum)))
+}
+
+/// `time` plus `months`, then `days`, then `micros`, as PostgreSQL's
+/// timestamp_pl_interval adds them, or None if a step leaves chrono's range.
+/// Adding months clamps the day to the last day of the target month, as
+/// PostgreSQL does.
+fn add_interval(time: NaiveDateTime, months: i64, days: i64, micros: i64) -> Option<NaiveDateTime> {
+    use chrono::{Duration, Months};
+    let month_count = Months::new(u32::try_from(months.unsigned_abs()).ok()?);
+    let time = if months >= 0 {
+        time.checked_add_months(month_count)?
+    } else {
+        time.checked_sub_months(month_count)?
+    };
+    time.checked_add_signed(Duration::try_days(days)?)?
+        .checked_add_signed(Duration::microseconds(micros))
+}
+
+/// date_trunc(field, timestamptz). The declared return type is timestamptz,
+/// so any other argument type fails with 0A000 instead of returning a
+/// timestamptz for a timestamp or date argument.
+fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
+    // Registered with arity 2 or 3; each argument is followed by its type.
+    if args.len() == 6 {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "date_trunc with a time zone argument is not supported".to_string(),
+            None,
+        ));
+    }
+    let (args, types) = args.split_at(args.len() / 2);
+    let argument_type = types[1].get_value().to_string();
+    if argument_type != "timestamptz" {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("date_trunc is supported only for timestamptz, not {argument_type}"),
+            None,
+        ));
+    }
+    let not_supported = |what: String| sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, what, None);
+    let field = match args[0].get_value() {
+        Value::Text(field) => field,
+        // A SQL NULL unit gives NULL. A typed NULL such as NULL::int is
+        // indistinguishable from it here, because the argument types are
+        // not available for a NULL value.
+        Value::Null => return Ok(None),
+        other => {
+            return Err(sqlstate_error(
+                SQLSTATE_UNDEFINED_FUNCTION,
+                format!(
+                    "function date_trunc({}, timestamp with time zone) does not exist",
+                    types[0].get_value()
+                ),
+                Some(format!("Got a unit argument that is not text: {other}")),
+            ))
+        }
+    };
+    let Value::Text(value) = args[1].get_value() else {
+        return Ok(None);
+    };
+    let time =
+        NaiveDateTime::parse_from_str(value.as_str(), "%Y-%m-%d %H:%M:%S%.f").map_err(|_| {
+            not_supported(format!(
+                "date_trunc is not supported for the timestamptz value \"{}\"",
+                value.as_str()
+            ))
+        })?;
+    let lowered_field = field.as_str().to_ascii_lowercase();
+    let parsed = DatetimeUnit::parse(field.as_str());
+    if parsed == Some(DatetimeUnit::TimeZone) {
+        return Err(not_supported(format!(
+            "unit \"{lowered_field}\" not supported for type timestamp with time zone"
+        )));
+    }
+    let Some(unit) = parsed else {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            format!("unit \"{lowered_field}\" not recognized for type timestamp with time zone"),
+            None,
+        ));
+    };
+    let truncated = truncate_timestamp(time, unit).ok_or_else(|| {
+        not_supported(format!(
+            "date_trunc is not supported for the unit \"{}\" with the value \"{}\"",
+            field.as_str(),
+            value.as_str()
+        ))
+    })?;
+    Ok(Some(Timestamptz(timestamp_text(truncated))))
+}
+
+/// `time` truncated to `unit`, as PostgreSQL's date_trunc does it, or None
+/// when the result is before year 1: PostgreSQL prints it as BC, which the
+/// timestamptz encoding cannot store. Weeks start on Monday; century and
+/// millennium start at years ending in 01, as in PostgreSQL.
+fn truncate_timestamp(time: NaiveDateTime, unit: DatetimeUnit) -> Option<NaiveDateTime> {
+    use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Timelike};
+    let date = time.date();
+    let first_day_of_year = |year: i32| NaiveDate::from_ymd_opt(year, 1, 1);
+    let day = match unit {
+        DatetimeUnit::Microsecond => return Some(time),
+        DatetimeUnit::Millisecond => {
+            let nanos = time.nanosecond() / 1_000_000 * 1_000_000;
+            return time.with_nanosecond(nanos);
+        }
+        DatetimeUnit::Second => return time.with_nanosecond(0),
+        DatetimeUnit::Minute => return time.with_nanosecond(0)?.with_second(0),
+        DatetimeUnit::Hour => return time.with_nanosecond(0)?.with_second(0)?.with_minute(0),
+        DatetimeUnit::Day => date,
+        DatetimeUnit::Week => {
+            date - Duration::days(i64::from(date.weekday().num_days_from_monday()))
+        }
+        DatetimeUnit::Month => date.with_day(1)?,
+        DatetimeUnit::Quarter => {
+            NaiveDate::from_ymd_opt(date.year(), (date.month() - 1) / 3 * 3 + 1, 1)?
+        }
+        DatetimeUnit::Year => first_day_of_year(date.year())?,
+        DatetimeUnit::Decade => first_day_of_year(date.year().div_euclid(10) * 10)?,
+        DatetimeUnit::Century => first_day_of_year((date.year() - 1).div_euclid(100) * 100 + 1)?,
+        DatetimeUnit::Millennium => {
+            first_day_of_year((date.year() - 1).div_euclid(1000) * 1000 + 1)?
+        }
+        DatetimeUnit::TimeZone => {
+            unreachable!("date_trunc refuses the time zone units before truncating")
+        }
+    };
+    // A year before 1 is BC in PostgreSQL. Only the decade of years 1 to 9
+    // gets here, because the other units stay in the year of `time` or start
+    // at year 1.
+    assert!(day.year() >= 0, "date_trunc result before year 0");
+    if day.year() < 1 {
+        return None;
+    }
+    Some(day.and_time(NaiveTime::MIN))
 }
 
 fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
-    scalar_functions!(options, |connection, args| {
+    scalar_functions!(options, |context, connection, args| {
         "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(connection, args)?,
         "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
             oid_arg(args, 0)?.map(|oid| exec_pg_get_user_by_id(connection, oid))
@@ -85,6 +329,15 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "json_strip_nulls"(FunctionArity::Exact(1), true) => {
             exec_json_strip_nulls(args[0].get_value())?
         },
+        "jsonb_field"(FunctionArity::Exact(2), true) => {
+            exec_jsonb_field(args[0].get_value(), args[1].get_value())?
+        },
+        "jsonb_field_text"(FunctionArity::Exact(2), true) => {
+            exec_jsonb_field_text(args[0].get_value(), args[1].get_value())?
+        },
+        "jsonb_contains"(FunctionArity::Exact(2), true) => {
+            exec_jsonb_contains(args[0].get_value(), args[1].get_value())?
+        },
         "format_type"(FunctionArity::OneOf(&[1, 2]), true) => oid_arg(args, 0)?
             .map(|type_oid| format_type(type_oid, int_arg(args, 1, -1))),
         "pg_get_constraintdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
@@ -92,24 +345,35 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "pg_get_indexdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
             .and_then(|oid| crate::catalog::pg_get_indexdef(connection, oid)),
         "pg_get_triggerdef"(FunctionArity::OneOf(&[1, 2]), false) => None::<String>,
-        "obj_description"(FunctionArity::OneOf(&[1, 2]), true) => None::<String>,
         "pg_get_expr"(FunctionArity::OneOf(&[2, 3]), true) => exec_pg_get_expr(args)?,
         "to_char"(FunctionArity::Exact(2), true) => {
-            exec_to_char(args[0].get_value(), &text_arg(args, 1))
+            // to_char is strict: a NULL argument gives NULL for every argument type.
+            if args.iter().any(|arg| matches!(arg.get_value(), Value::Null)) {
+                None
+            } else {
+                exec_to_char(args[0].get_value(), &text_arg(args, 1))?
+            }
         },
+        // Registered so that the core time extension's to_timestamp, which
+        // returns a blob, never answers a PostgreSQL query.
+        "to_timestamp"(FunctionArity::OneOf(&[1, 2]), true) => Err::<Timestamptz, _>(
+            sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "to_timestamp is not supported", None,
+            )
+        )?,
         "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
             exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))
         },
         "int8_out_of_range"(FunctionArity::Exact(0), false) => Err::<i64, _>(sqlstate_error(
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-            "bigint out of range",
+            "bigint out of range", None,
         ))?,
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
         "booleq"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() == args[1].get_value()),
         "boolne"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() != args[1].get_value()),
-        "col_description"(FunctionArity::Exact(2), true) => None::<String>,
         "set_config"(FunctionArity::Exact(3), false) => exec_set_config(connection, args)?,
         "current_setting"(FunctionArity::OneOf(&[1, 2]), false) => {
             exec_current_setting(connection, args)?
@@ -146,17 +410,43 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
         },
-        "now" | "clock_timestamp" | "transaction_timestamp" | "statement_timestamp"(
-            FunctionArity::Variadic, false
-        ) => Timestamptz(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
+        // The time the transaction started, or the statement outside a
+        // transaction.
+        "now" | "transaction_timestamp"(FunctionArity::Exact(0), false) => {
+            timestamptz_at(context.statement_times().transaction)
+        },
+        "statement_timestamp"(FunctionArity::Exact(0), false) => {
+            timestamptz_at(context.statement_times().statement)
+        },
+        // The clock at each call.
+        "clock_timestamp"(FunctionArity::Exact(0), false) => {
+            timestamptz_at(context.current_time())
+        },
     })
+}
+
+/// The timestamptz of `instant`, a reading of the system clock, with
+/// microseconds as PostgreSQL keeps them.
+fn timestamptz_at(instant: WallClockInstant) -> Timestamptz {
+    let time: NaiveDateTime = DateTime::from_timestamp(instant.secs, instant.micros * 1_000)
+        .expect("a system clock reading is a valid date and time")
+        .naive_utc();
+    Timestamptz(timestamp_text(time))
+}
+
+/// The text of `time` with microseconds, without trailing zeros of the
+/// fraction and without a dot that has no digits after it, as PostgreSQL
+/// prints it.
+fn timestamp_text(time: NaiveDateTime) -> String {
+    let text = time.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
     name: &'static str,
     arity: FunctionArity,
     deterministic: bool,
-    step: fn(&Arc<Connection>, &[Register]) -> Result<O>,
+    step: fn(&ScalarFuncContext<'_>, &[Register]) -> Result<O>,
 ) -> ExternalFunc {
     ExternalFunc::new_native_scalar(
         name.to_string(),
@@ -170,7 +460,7 @@ pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
 /// A PostgreSQL function that computes its result without I/O.
 struct PgScalarFunction<O> {
     name: &'static str,
-    step: fn(&Arc<Connection>, &[Register]) -> Result<O>,
+    step: fn(&ScalarFuncContext<'_>, &[Register]) -> Result<O>,
 }
 
 impl<O> fmt::Debug for PgScalarFunction<O> {
@@ -193,8 +483,8 @@ impl<O: ScalarReturn + 'static> ScalarFunction for PgScalarFunction<O> {
 impl<O: ScalarReturn + 'static> ScalarCall for PgScalarFunction<O> {
     type Output = O;
 
-    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<O> {
-        Ok(IOResult::Done((self.step)(connection, args)?))
+    fn step(&mut self, context: &ScalarFuncContext<'_>, args: &[Register]) -> IOResultOr<O> {
+        Ok(IOResult::Done((self.step)(context, args)?))
     }
 }
 
@@ -259,6 +549,7 @@ fn exec_current_schemas(conn: &Connection, argument: &Value) -> Result<Option<St
                     "invalid input syntax for type boolean: \"{}\"",
                     text.as_str()
                 ),
+                None,
             )
         })?,
         value => match value.as_int() {
@@ -326,6 +617,7 @@ fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Option<Strin
             sqlstate_error(
                 SQLSTATE_INTERNAL_ERROR,
                 format!("unrecognized object type abbreviation: {kind_code}"),
+                None,
             )
         })?;
     let (public_privileges, owner_privileges) = kind.default_privileges();
@@ -529,6 +821,7 @@ fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Option<S
                     "invalid input syntax for type boolean: \"{}\"",
                     text.as_str()
                 ),
+                None,
             )
         })?,
         Some(value) => match value.as_int() {
@@ -557,6 +850,7 @@ fn unrecognized_parameter(name: &str) -> LimboError {
     sqlstate_error(
         SQLSTATE_UNDEFINED_OBJECT,
         format!("unrecognized configuration parameter \"{name}\""),
+        None,
     )
 }
 
@@ -579,6 +873,7 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
                 return Err(sqlstate_error(
                     SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
                     "bigint out of range",
+                    None,
                 ));
             }
             rounded as i64
@@ -590,6 +885,7 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
                     "invalid input syntax for type bigint: \"{}\"",
                     text.as_str()
                 ),
+                None,
             )
         })?,
         Value::Blob(_) => return Err(LimboError::InvalidArgument("datatype mismatch".to_string())),
@@ -604,6 +900,7 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
         return Err(sqlstate_error(
             sqlstate,
             format!("{clause} must not be negative"),
+            None,
         ));
     }
     Ok(Some(value))
@@ -621,6 +918,7 @@ pub(crate) fn role_name_in(roles: &RoleCatalog, role: RoleId) -> Result<String> 
         None => Err(sqlstate_error(
             SQLSTATE_UNDEFINED_OBJECT,
             format!("invalid role OID: {}", crate::catalog::role_oid(role)),
+            None,
         )),
     }
 }
@@ -689,6 +987,415 @@ fn exec_json_strip_nulls(value: &Value) -> Result<Option<String>> {
     Ok(Some(stripped))
 }
 
+/// Appends the rows of PostgreSQL's json_each(json): the key of each member
+/// unescaped and the text of its value as the input writes it, in the order of
+/// the input and with repeated keys kept. The engine's json_each() is SQLite's,
+/// which turns a number member into a SQL value and writes it again.
+pub(crate) fn exec_json_each(value: &Value, rows: &mut Vec<[Value; 2]>) -> Result<()> {
+    let json = match value {
+        Value::Null => return Ok(()),
+        Value::Text(text) => text.as_str(),
+        other => return Err(undefined_function("json_each", &[pg_type_name(other)])),
+    };
+    // Validate first, so the walk below can assume well-formed input.
+    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
+    let bytes = json.as_bytes();
+    let mut pos = 0;
+    skip_json_whitespace(bytes, &mut pos);
+    match bytes[pos] {
+        b'{' => {}
+        b'[' => {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "cannot deconstruct an array as an object",
+                None,
+            ))
+        }
+        _ => {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "cannot deconstruct a scalar",
+                None,
+            ))
+        }
+    }
+    walk_json_members(json, |key, value| {
+        let key = key.expect("every member of an object has a key");
+        rows.push([Value::build_text(key), Value::build_text(value.to_string())]);
+    })
+}
+
+/// PostgreSQL's `json -> key` and `jsonb -> key`: the JSON text of the field
+/// `key` of an object, or of the element at index `key` of an array. The
+/// translator turns the operator into this function.
+fn exec_jsonb_field(json: &Value, key: &Value) -> Result<Option<String>> {
+    find_json_field(json, key, "->")
+}
+
+/// PostgreSQL's `json ->> key` and `jsonb ->> key`: the value that `->` finds,
+/// as text. A string has no quotes and no escapes, a number is written as
+/// jsonb writes it, and a JSON null is NULL.
+fn exec_jsonb_field_text(json: &Value, key: &Value) -> Result<Option<String>> {
+    let Some(field) = find_json_field(json, key, "->>")? else {
+        return Ok(None);
+    };
+    if field.starts_with('"') {
+        return decode_json_string(&field, &mut 0).map(Some);
+    }
+    if field.starts_with(|c: char| c == '-' || c.is_ascii_digit()) {
+        // A valid JSON number fails only when it has more digits than numeric
+        // allows. PostgreSQL then fails when it makes the jsonb value.
+        return turso_core::format_numeric_text(&field)
+            .map(Some)
+            .map_err(|_| {
+                sqlstate_error(
+                    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                    "value overflows numeric format",
+                    None,
+                )
+            });
+    }
+    Ok((field != "null").then_some(field))
+}
+
+/// The field or array element that `->` and `->>` look up.
+enum JsonKey<'a> {
+    /// The field with this name of an object.
+    Field(&'a str),
+    /// The element at this index of an array. A negative index counts from
+    /// the end.
+    Index(i64),
+}
+
+/// The JSON text of the value at `key` in the JSON document `json`, or None
+/// when the document has no such value. `op` is the operator, for errors.
+fn find_json_field(json: &Value, key: &Value, op: &str) -> Result<Option<String>> {
+    // A json or jsonb column reads as text. A blob is a bytea, which has no
+    // -> in PostgreSQL.
+    let json = match json {
+        Value::Null => return Ok(None),
+        Value::Text(text) => text.as_str(),
+        Value::Numeric(_) | Value::Blob(_) => {
+            return Err(undefined_operator(
+                pg_type_name(json),
+                op,
+                pg_type_name(key),
+            ))
+        }
+    };
+    // Validate first, so the walk below can assume well-formed input.
+    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
+    let key = match key {
+        Value::Null => return Ok(None),
+        Value::Text(name) => JsonKey::Field(name.as_str()),
+        Value::Numeric(Numeric::Integer(index)) => JsonKey::Index(*index),
+        other => return Err(undefined_operator("jsonb", op, pg_type_name(other))),
+    };
+    Ok(json_field_span(json, &key)?.map(str::to_string))
+}
+
+/// The JSON text of the value at `key` in `json`, which must be valid JSON.
+/// When an object has two fields with the name, the last one counts, as in
+/// PostgreSQL.
+fn json_field_span<'a>(json: &'a str, key: &JsonKey) -> Result<Option<&'a str>> {
+    // The walk covers the whole document, also when the key cannot match, so
+    // that a bad escape or deep nesting anywhere in it errors as in PostgreSQL.
+    let mut found = None;
+    let mut elements = Vec::new();
+    walk_json_members(json, |member_key, value| match (member_key, key) {
+        (Some(name), JsonKey::Field(field)) if name == *field => found = Some(value),
+        (None, JsonKey::Index(_)) => elements.push(value),
+        // A name on an array or an index on an object.
+        _ => {}
+    })?;
+    let JsonKey::Index(index) = key else {
+        return Ok(found);
+    };
+    let index = if *index < 0 {
+        *index + elements.len() as i64
+    } else {
+        *index
+    };
+    Ok(usize::try_from(index)
+        .ok()
+        .and_then(|index| elements.get(index).copied()))
+}
+
+/// Calls `visit` with the key and the text of the value of each member of the
+/// JSON object `json`, or with None and the text of each element of the JSON
+/// array `json`. A scalar has no members. `json` must be valid JSON.
+fn walk_json_members<'a>(
+    json: &'a str,
+    mut visit: impl FnMut(Option<String>, &'a str),
+) -> Result<()> {
+    let bytes = json.as_bytes();
+    let mut pos = 0;
+    skip_json_whitespace(bytes, &mut pos);
+    // copy_without_null_fields decodes every string of a value and counts its
+    // nesting, so a \u0000, a lone surrogate or nesting deeper than
+    // MAX_JSON_DEPTH errors as in PostgreSQL. Its copy of the value is not used.
+    let mut walked_value = String::new();
+    let is_object = match bytes[pos] {
+        b'{' => true,
+        b'[' => false,
+        _ => return copy_without_null_fields(json, &mut pos, 0, &mut walked_value),
+    };
+    pos += 1;
+    loop {
+        skip_json_whitespace(bytes, &mut pos);
+        match bytes[pos] {
+            b'}' | b']' => break,
+            b',' => {
+                pos += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let key = if is_object {
+            let key = decode_json_string(json, &mut pos)?;
+            skip_json_whitespace(bytes, &mut pos);
+            pos += 1; // ':'
+            skip_json_whitespace(bytes, &mut pos);
+            Some(key)
+        } else {
+            None
+        };
+        let start = pos;
+        walked_value.clear();
+        copy_without_null_fields(json, &mut pos, 1, &mut walked_value)?;
+        visit(key, &json[start..pos]);
+    }
+    Ok(())
+}
+
+/// PostgreSQL's `jsonb @> jsonb`, which is also its function jsonb_contains():
+/// whether `json` contains `template`. Core runs this function for `a @> b`
+/// when neither operand has an array type, and the translator turns `a <@ b`
+/// into `b @> a`.
+///
+/// Core does not know the type of each array: a column of a VALUES list has
+/// no array type, and CREATE TABLE AS stores an array as text. Thus two
+/// arrays that are not JSON documents are compared with the array function of
+/// core, as `@>` compared them before it compared jsonb values.
+///
+/// FIXME(pg-catalog): This chooses between arraycontains and jsonb_contains from the values, because the type of a VALUES column or of a column that CREATE TABLE AS made does not say that it is an array. PostgreSQL chooses from the types, so it fails with 22P02 for `'{}'::jsonb @> '{a}'`, where this gives false. An expression tree that carries PostgreSQL types replaces this.
+fn exec_jsonb_contains(json: &Value, template: &Value) -> Result<Option<bool>> {
+    match (json, template) {
+        (Value::Null, _) | (_, Value::Null) => Ok(None),
+        // A json or jsonb column reads as text.
+        (Value::Text(json_text), Value::Text(template_text)) => {
+            let documents = read_json_document(json_text.as_str())
+                .and_then(|json| Ok((json, read_json_document(template_text.as_str())?)));
+            match documents {
+                Ok((json, template)) => Ok(Some(json_document_contains(&json, &template))),
+                // `{a}` is an array, not JSON. A JSON object such as `{"a":1}`
+                // is not an array, so a jsonb value keeps the JSON error.
+                Err(error) => turso_core::array_contains_all(json, template)
+                    .map(Some)
+                    .ok_or(error),
+            }
+        }
+        _ if holds_array(json) || holds_array(template) => {
+            Ok(turso_core::array_contains_all(json, template))
+        }
+        // A number or a bytea has no @> for jsonb in PostgreSQL.
+        _ => Err(undefined_operator(
+            pg_type_name(json),
+            "@>",
+            pg_type_name(template),
+        )),
+    }
+}
+
+/// Whether `value` is a blob that holds an array. An array is stored as a
+/// blob, and a bytea is a blob too.
+fn holds_array(value: &Value) -> bool {
+    matches!(value, Value::Blob(_)) && turso_core::array_values_from_any(value).is_some()
+}
+
+/// A JSON value as jsonb compares it. A number is its exact decimal value, so
+/// `1.5` and `1.50` are equal. An object has one field for each name, sorted
+/// by name.
+enum JsonNode {
+    Null,
+    Bool(bool),
+    Number(Decimal),
+    String(String),
+    Array(Vec<JsonNode>),
+    Object(Vec<(String, JsonNode)>),
+}
+
+/// Reads the JSON document `json` into a tree, with the errors of PostgreSQL's
+/// jsonb input.
+///
+/// A loop with its own list of open objects and arrays reads the document,
+/// not a function that calls itself for each level: the server runs
+/// statements on threads with small stacks, and 1000 levels of such calls
+/// do not fit in them.
+fn read_json_document(json: &str) -> Result<JsonNode> {
+    // Validate first, so the reading below can assume well-formed input.
+    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
+    let bytes = json.as_bytes();
+    let mut pos = 0;
+    // The objects and arrays that are open, innermost last, each with the
+    // name of the field that it is the value of, if it is in an object.
+    let mut open: Vec<(Option<String>, OpenJsonContainer)> = Vec::new();
+    // The name of the field whose value comes next.
+    let mut name: Option<String> = None;
+    loop {
+        skip_json_whitespace(bytes, &mut pos);
+        let value = match bytes[pos] {
+            b',' => {
+                pos += 1;
+                continue;
+            }
+            b'{' | b'[' => {
+                if open.len() == MAX_JSON_DEPTH {
+                    return Err(sqlstate_error(
+                        SQLSTATE_STATEMENT_TOO_COMPLEX,
+                        "stack depth limit exceeded",
+                        None,
+                    ));
+                }
+                let container = if bytes[pos] == b'{' {
+                    OpenJsonContainer::Object(Vec::new())
+                } else {
+                    OpenJsonContainer::Array(Vec::new())
+                };
+                pos += 1;
+                open.push((name.take(), container));
+                continue;
+            }
+            b'}' | b']' => {
+                pos += 1;
+                let (field_name, container) =
+                    open.pop().expect("a closing bracket has its opening one");
+                name = field_name;
+                container.into_node()
+            }
+            b'"' if name.is_none()
+                && matches!(open.last(), Some((_, OpenJsonContainer::Object(_)))) =>
+            {
+                name = Some(decode_json_string(json, &mut pos)?);
+                skip_json_whitespace(bytes, &mut pos);
+                pos += 1; // ':'
+                continue;
+            }
+            b'"' => JsonNode::String(decode_json_string(json, &mut pos)?),
+            b't' => {
+                pos += 4;
+                JsonNode::Bool(true)
+            }
+            b'f' => {
+                pos += 5;
+                JsonNode::Bool(false)
+            }
+            b'n' => {
+                pos += 4;
+                JsonNode::Null
+            }
+            // The arms above match every other value, so this is a number.
+            _ => {
+                let start = pos;
+                while matches!(
+                    bytes.get(pos),
+                    Some(b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+                ) {
+                    pos += 1;
+                }
+                // A JSON number is also valid numeric text, so the only error
+                // is a number with more digits than numeric allows. jsonb
+                // stores its numbers as numeric, so PostgreSQL fails then too.
+                let number = json[start..pos].parse::<Decimal>().map_err(|_| {
+                    sqlstate_error(
+                        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                        "value overflows numeric format",
+                        None,
+                    )
+                })?;
+                JsonNode::Number(number)
+            }
+        };
+        match open.last_mut() {
+            None => return Ok(value),
+            Some((_, OpenJsonContainer::Array(elements))) => elements.push(value),
+            Some((_, OpenJsonContainer::Object(fields))) => {
+                fields.push((name.take().expect("a field value has a name"), value))
+            }
+        }
+    }
+}
+
+/// An object or array that read_json_document has not read to its end yet.
+enum OpenJsonContainer {
+    Array(Vec<JsonNode>),
+    Object(Vec<(String, JsonNode)>),
+}
+
+impl OpenJsonContainer {
+    fn into_node(self) -> JsonNode {
+        match self {
+            Self::Array(elements) => JsonNode::Array(elements),
+            Self::Object(mut fields) => {
+                // Of two fields with the same name, the last one counts, as in
+                // jsonb. The sort is stable, so such fields keep their order.
+                fields.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut unique: Vec<(String, JsonNode)> = Vec::with_capacity(fields.len());
+                for field in fields {
+                    match unique.last_mut() {
+                        Some(last) if last.0 == field.0 => *last = field,
+                        _ => unique.push(field),
+                    }
+                }
+                JsonNode::Object(unique)
+            }
+        }
+    }
+}
+
+/// Whether the document `json` contains the document `template`. Only at this
+/// level does an array also contain a scalar that is one of its elements:
+/// jsonb stores a scalar document as an array with one element.
+fn json_document_contains(json: &JsonNode, template: &JsonNode) -> bool {
+    match (json, template) {
+        (
+            JsonNode::Array(elements),
+            JsonNode::Null | JsonNode::Bool(_) | JsonNode::Number(_) | JsonNode::String(_),
+        ) => elements
+            .iter()
+            .any(|element| json_contains(element, template)),
+        _ => json_contains(json, template),
+    }
+}
+
+/// Whether `json` contains `template`: each field of an object in `template`
+/// is in `json` with a value that contains it, and each element of an array
+/// in `template` is contained by an element of the array in `json`, in any
+/// order. Scalars must be equal.
+fn json_contains(json: &JsonNode, template: &JsonNode) -> bool {
+    match (json, template) {
+        (JsonNode::Object(fields), JsonNode::Object(wanted)) => {
+            wanted.iter().all(|(name, wanted_value)| {
+                fields
+                    .binary_search_by(|(field_name, _)| field_name.cmp(name))
+                    .is_ok_and(|index| json_contains(&fields[index].1, wanted_value))
+            })
+        }
+        (JsonNode::Array(elements), JsonNode::Array(wanted)) => {
+            wanted.iter().all(|wanted_element| {
+                elements
+                    .iter()
+                    .any(|element| json_contains(element, wanted_element))
+            })
+        }
+        (JsonNode::Null, JsonNode::Null) => true,
+        (JsonNode::Bool(a), JsonNode::Bool(b)) => a == b,
+        (JsonNode::Number(a), JsonNode::Number(b)) => a == b,
+        (JsonNode::String(a), JsonNode::String(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// `array_to_json(array [, pretty])`: the array as a JSON array, with line
 /// feeds between its elements when `pretty` is true. After the arguments come
 /// their type names, such as `boolean[]`, because an element's stored value
@@ -707,6 +1414,7 @@ fn exec_array_to_json(args: &[Register]) -> Result<Option<Json>> {
                     "invalid input syntax for type boolean: \"{}\"",
                     text.as_str()
                 ),
+                None,
             )
         })?,
         Some(pretty) => !matches!(pretty, Value::Numeric(Numeric::Integer(0))),
@@ -761,6 +1469,7 @@ enum JsonElement {
 }
 
 impl JsonElement {
+    // FIXME(pg-catalog): PostgreSQL also picks how to_json writes a value by type oid (json_categorize_type), so the named arms stay. The last arm stands in for the cast to json in pg_cast of a type that has one, and for the typoutput function in pg_type of the others. A pg_cast and pg_type lookup replaces that arm.
     fn of_type(name: &str) -> Self {
         match name {
             "boolean" => Self::Boolean,
@@ -872,6 +1581,7 @@ pub(crate) fn invalid_json() -> LimboError {
     sqlstate_error(
         SQLSTATE_INVALID_TEXT_REPRESENTATION,
         "invalid input syntax for type json",
+        None,
     )
 }
 
@@ -879,6 +1589,7 @@ pub(crate) fn unsupported_unicode_escape() -> LimboError {
     sqlstate_error(
         SQLSTATE_UNTRANSLATABLE_CHARACTER,
         "unsupported Unicode escape sequence",
+        None,
     )
 }
 
@@ -896,6 +1607,7 @@ fn copy_without_null_fields(
         return Err(sqlstate_error(
             SQLSTATE_STATEMENT_TOO_COMPLEX,
             "stack depth limit exceeded",
+            None,
         ));
     }
     match bytes[*pos] {
@@ -1045,6 +1757,7 @@ fn like_matches(text: &str, pattern: &str) -> Result<bool> {
         sqlstate_error(
             SQLSTATE_INVALID_ESCAPE_SEQUENCE,
             "LIKE pattern must not end with escape character",
+            None,
         )
     };
     let (text_bytes, pattern_bytes) = (text.as_bytes(), pattern.as_bytes());
@@ -1152,6 +1865,7 @@ fn exec_like_escape(args: &[Register]) -> Result<Option<String>> {
             return Err(sqlstate_error(
                 SQLSTATE_INVALID_ESCAPE_SEQUENCE,
                 "invalid escape string: Escape string must be empty or one character.",
+                None,
             ));
         }
     };
@@ -1174,7 +1888,7 @@ fn exec_similar_to_escape(args: &[Register]) -> Result<Option<String>> {
     match turso_pg_parser::translator::similar_to_regex(&pattern, &escape) {
         Ok(regex) => Ok(Some(regex)),
         Err(turso_pg_parser::ParseError::Sqlstate { sqlstate, message }) => {
-            Err(sqlstate_error(sqlstate, message))
+            Err(sqlstate_error(sqlstate, message, None))
         }
         Err(error) => Err(LimboError::ParseError(error.to_string())),
     }
@@ -1188,6 +1902,7 @@ fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {
     }
 }
 
+/// FIXME(pg-catalog): This table of oids and names was copied by hand from pg_type. It prints unknown for an oid it does not list, where PostgreSQL prints the name of that pg_type row, and character for bpchar with typemod -1, where PostgreSQL prints bpchar. A lookup in a pg_type table replaces this.
 /// The name of a type as `format_type` prints it.
 fn format_type(type_oid: i64, typemod: i64) -> String {
     match type_oid {
@@ -1246,14 +1961,27 @@ fn format_type(type_oid: i64, typemod: i64) -> String {
 
 /// Simplified to_char: formats a number with the given format pattern.
 /// Supports basic PG numeric format patterns (9, 0, S, MI, FM, D, G, PR, TH, L).
-fn exec_to_char(value: &Value, format: &str) -> Option<String> {
+/// Any other argument, such as a timestamp, fails with 0A000 instead of
+/// returning NULL.
+fn exec_to_char(value: &Value, format: &str) -> Result<Option<String>> {
     let num = match value {
-        Value::Null => return None,
+        Value::Null => return Ok(None),
         Value::Numeric(_) => value.as_float(),
-        Value::Text(t) => t.as_str().parse::<f64>().ok()?,
-        _ => return None,
+        Value::Text(t) => match t.as_str().parse::<f64>() {
+            Ok(num) => num,
+            Err(_) => return Err(to_char_not_supported()),
+        },
+        _ => return Err(to_char_not_supported()),
     };
-    Some(pg_to_char_numeric(num, format))
+    Ok(Some(pg_to_char_numeric(num, format)))
+}
+
+fn to_char_not_supported() -> LimboError {
+    sqlstate_error(
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        "to_char is supported only for numbers",
+        None,
+    )
 }
 
 /// pg_input_is_valid(text, type) → boolean
@@ -1295,9 +2023,19 @@ fn undefined_function(name: &str, arg_types: &[&str]) -> LimboError {
     sqlstate_error(
         SQLSTATE_UNDEFINED_FUNCTION,
         format!("function {name}({}) does not exist", arg_types.join(", ")),
+        None,
     )
 }
 
+fn undefined_operator(left_type: &str, op: &str, right_type: &str) -> LimboError {
+    sqlstate_error(
+        SQLSTATE_UNDEFINED_FUNCTION,
+        format!("operator does not exist: {left_type} {op} {right_type}"),
+        None,
+    )
+}
+
+/// FIXME(pg-catalog): This guesses the PostgreSQL type of an argument from the storage class of its value, because the arguments have no types. The typed expression tree replaces it.
 /// The PostgreSQL type that a value of the engine has, for error messages.
 fn pg_type_name(value: &Value) -> &'static str {
     match value {
@@ -1309,6 +2047,7 @@ fn pg_type_name(value: &Value) -> &'static str {
     }
 }
 
+/// FIXME(pg-catalog): This hand-codes the input function (typinput) of each type by type name. A call to the typinput function of the pg_type entry replaces this.
 /// Validate input for a PostgreSQL type, returning error info if invalid.
 ///
 /// Returns `None` for valid input, or `Some((message, sql_error_code))` for invalid input.
@@ -1536,7 +2275,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
 /// and the case of the letters do not matter, and the start of true, false,
 /// yes or no is enough. For on and off, the first two letters are necessary.
 /// None when the text is not a boolean literal.
-pub(crate) fn parse_pg_bool(text: &str) -> Option<bool> {
+pub fn parse_pg_bool(text: &str) -> Option<bool> {
     let word = text
         .trim_matches(|c: char| c.is_ascii_whitespace() || c == '\u{b}')
         .to_ascii_lowercase();

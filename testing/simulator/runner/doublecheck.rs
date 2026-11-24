@@ -53,6 +53,15 @@ pub fn run_simulation(
         doublecheck_env.clear_poison();
         let doublecheck_env = doublecheck_env.lock().unwrap();
 
+        // Memory I/O keeps the database files in memory, but the comparison
+        // reads them from disk.
+        env.io
+            .persist_files()
+            .expect("persist the default database files");
+        doublecheck_env
+            .io
+            .persist_files()
+            .expect("persist the doublecheck database files");
         // Check if the database files are the same
         let db = fs::read(env.get_db_path()).expect("should be able to read default database file");
         let doublecheck_db = fs::read(doublecheck_env.get_db_path())

@@ -21,18 +21,24 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use turso_core::ast::{self, RoleOptions};
 use turso_core::namespace::NamespaceId;
-use turso_core::schema::Schema;
+use turso_core::schema::{RelationKind, Schema};
 use turso_core::security::roles::RoleId;
 use turso_core::{
     to_u32, CatalogApply, Connection, CursorType, InsertFlags, Insn, LimboError, Numeric,
-    ProgramBuilder, RegisterOrLiteral, Value, MAIN_DB_ID,
+    ProgramBuilder, RegisterOrLiteral, Value, MAIN_DB_ID, SQLITE_ERROR,
 };
-use turso_parser::ast::RoleOptions;
-use turso_pg_parser::sqlstate::SQLSTATE_DUPLICATE_OBJECT;
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST, SQLSTATE_DUPLICATE_OBJECT,
+    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_OBJECT_IN_USE, SQLSTATE_UNDEFINED_OBJECT,
+};
 
-use crate::auth_members::Memberships;
+use crate::auth_members::{emit_memberships_delete, Membership, Memberships};
+use crate::catalog::{pg_role_by_name, relation_name, PgRole};
+use crate::classes::class_catalog;
 use crate::error::sqlstate_error;
+use crate::schema_init::TableInit;
 use crate::schema_state::{change_schema_state, emit_catalog_apply};
 use crate::unique_index::emit_unique_index_insert;
 
@@ -43,7 +49,7 @@ pub(crate) const AUTHID_TABLE_NAME: &str = "__turso_internal_authid";
 const AUTHID_NAME_INDEX_NAME: &str = "__turso_internal_authid_rolname";
 
 /// Creates [`AUTHID_TABLE_NAME`]. The rowid of a row is the id of its role.
-pub(crate) const CREATE_AUTHID_TABLE_SQL: &str = "CREATE TABLE __turso_internal_authid (\
+const CREATE_AUTHID_TABLE_SQL: &str = "CREATE TABLE __turso_internal_authid (\
     id INTEGER PRIMARY KEY, \
     rolname TEXT NOT NULL, \
     rolsuper INTEGER NOT NULL, \
@@ -51,11 +57,16 @@ pub(crate) const CREATE_AUTHID_TABLE_SQL: &str = "CREATE TABLE __turso_internal_
     rolbypassrls INTEGER NOT NULL)";
 
 /// Keeps role names unique in the stored table, whatever writes it.
-pub(crate) const CREATE_AUTHID_NAME_INDEX_SQL: &str =
+const CREATE_AUTHID_NAME_INDEX_SQL: &str =
     "CREATE UNIQUE INDEX __turso_internal_authid_rolname ON __turso_internal_authid (rolname)";
 
 /// The number of columns of [`AUTHID_TABLE_NAME`].
 const AUTHID_COLUMN_COUNT: usize = 5;
+
+pub(crate) const TABLE_INIT: TableInit = TableInit {
+    table: AUTHID_TABLE_NAME,
+    statements: &[CREATE_AUTHID_TABLE_SQL, CREATE_AUTHID_NAME_INDEX_SQL],
+};
 
 /// The query that reads the roles for the frontend's schema state, or None
 /// when the database has no roles table, as in a read-only open of an empty
@@ -129,16 +140,27 @@ impl RoleCatalog {
             }
             catalog.add(role);
         }
-        catalog.memberships = Memberships::new(membership_rows)?;
-        let exists = |id| id == RoleId::SUPERUSER || catalog.roles.contains_key(&id);
-        if let Some(membership) = catalog.memberships.iter().find(|membership| {
+        catalog.set_memberships(membership_rows)?;
+        Ok(catalog)
+    }
+
+    /// Replaces the memberships with the rows read from the membership
+    /// table, after checking that each names roles of this catalog.
+    pub(crate) fn set_memberships(
+        &mut self,
+        membership_rows: &[Vec<Value>],
+    ) -> turso_core::Result<()> {
+        let memberships = Memberships::new(membership_rows)?;
+        let exists = |id| id == RoleId::SUPERUSER || self.roles.contains_key(&id);
+        if let Some(membership) = memberships.iter().find(|membership| {
             !exists(membership.role) || !exists(membership.member) || !exists(membership.grantor)
         }) {
             return Err(LimboError::Corrupt(format!(
                 "a role membership names a role that does not exist: {membership:?}"
             )));
         }
-        Ok(catalog)
+        self.memberships = memberships;
+        Ok(())
     }
 
     /// The stored role with id `id`. None for a built-in id.
@@ -215,6 +237,15 @@ impl RoleCatalog {
         &mut self.memberships
     }
 
+    /// Removes role `id` from the catalog. Panics if it is not there.
+    fn remove(&mut self, id: RoleId) {
+        let role = self
+            .roles
+            .remove(&id)
+            .unwrap_or_else(|| panic!("DROP ROLE removed role {id:?}, which is not loaded"));
+        self.ids_by_name.remove(&role.name);
+    }
+
     /// Adds `role` to the catalog. Panics if its id or name is already in
     /// use.
     fn add(&mut self, role: Role) {
@@ -268,31 +299,10 @@ pub(crate) fn translate_create_role(
         return Err(sqlstate_error(
             SQLSTATE_DUPLICATE_OBJECT,
             format!("role \"{name}\" already exists"),
+            None,
         ));
     }
-    let Some(table) = schema.get_btree_table(NamespaceId::ROOT, AUTHID_TABLE_NAME) else {
-        return Err(LimboError::ParseError(
-            "the database has no roles table".to_string(),
-        ));
-    };
-    let name_index = schema
-        .get_indices(NamespaceId::ROOT, AUTHID_TABLE_NAME)
-        .find(|index| index.name == AUTHID_NAME_INDEX_NAME)
-        .cloned()
-        .ok_or_else(|| LimboError::Corrupt(format!("{AUTHID_TABLE_NAME} has no name index")))?;
-
-    let table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: table_cursor_id,
-        root_page: RegisterOrLiteral::Literal(table.root_page),
-        db: MAIN_DB_ID,
-    });
-    let index_cursor_id = program.alloc_cursor_index(None, &name_index)?;
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: index_cursor_id,
-        root_page: RegisterOrLiteral::Literal(name_index.root_page),
-        db: MAIN_DB_ID,
-    });
+    let (table_cursor_id, index_cursor_id) = open_authid_cursors(program, schema)?;
 
     let id_reg = program.alloc_register();
     program.emit_insn(Insn::NewRowid {
@@ -385,6 +395,314 @@ impl CatalogApply for RoleCreated {
     }
 }
 
+/// The most objects that the DETAIL of a role that other objects depend on
+/// lists, as in PostgreSQL.
+const MAX_REPORTED_DEPENDENTS: usize = 100;
+
+/// `DROP ROLE roles`. The roles are checked as PostgreSQL checks them, in
+/// two passes. First each role must be named, not given as `CURRENT_USER`
+/// or the like, exist unless `IF EXISTS` skips it, and not be the current or
+/// the session role. Then each must not be needed by the database system,
+/// own no relation, have no privileges on one and be no policy's role. A
+/// role the statement names twice is dropped once. The roles' memberships
+/// go with them. Only a superuser reaches this; core refuses the statement
+/// for any other role.
+pub(crate) fn translate_drop_role(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+    if_exists: bool,
+    role_names: &[ast::Grantee],
+) -> turso_core::Result<()> {
+    let roles = schema_roles(schema);
+    // The roles that pass the checks PostgreSQL makes first, with the name
+    // the statement gives each. None stands for a role that the database
+    // system needs, which the second checks refuse.
+    let mut named: Vec<(&str, Option<&Role>)> = Vec::new();
+    for role_name in role_names {
+        let ast::Grantee::Role(ast::RoleSpec::Name(name)) = role_name else {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "cannot use special role specifier in DROP ROLE",
+                None,
+            ));
+        };
+        let role = match pg_role_by_name(roles, name) {
+            Some(PgRole::Engine(id)) => {
+                if id == connection.current_role() {
+                    return Err(sqlstate_error(
+                        SQLSTATE_OBJECT_IN_USE,
+                        "current user cannot be dropped",
+                        None,
+                    ));
+                }
+                if id == connection.session_role() {
+                    return Err(sqlstate_error(
+                        SQLSTATE_OBJECT_IN_USE,
+                        "session user cannot be dropped",
+                        None,
+                    ));
+                }
+                // The built-in superuser is not stored, so it is not found.
+                roles.get(id)
+            }
+            Some(PgRole::DatabaseOwner) => None,
+            // tursopg does not have PostgreSQL's other predefined roles, but
+            // PostgreSQL would find them and refuse to drop them.
+            None if is_predefined_role(name) => None,
+            None if if_exists => continue,
+            None => {
+                return Err(sqlstate_error(
+                    SQLSTATE_UNDEFINED_OBJECT,
+                    format!("role \"{name}\" does not exist"),
+                    None,
+                ))
+            }
+        };
+        if !named.iter().any(|(other, _)| *other == name.as_str()) {
+            named.push((name, role));
+        }
+    }
+    let mut dropped: Vec<&Role> = Vec::new();
+    for (name, role) in named {
+        let Some(role) = role else {
+            return Err(sqlstate_error(
+                SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+                format!("cannot drop role {name} because it is required by the database system"),
+                None,
+            ));
+        };
+        let dependents = role_dependents(schema, connection, role.id);
+        if !dependents.is_empty() {
+            return Err(sqlstate_error(
+                SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+                format!("role \"{name}\" cannot be dropped because some objects depend on it"),
+                Some(dependents_detail(dependents)),
+            ));
+        }
+        dropped.push(role);
+    }
+    if dropped.is_empty() {
+        return Ok(());
+    }
+
+    let memberships: Vec<Membership> = roles
+        .memberships()
+        .iter()
+        .filter(|membership| dropped.iter().any(|role| membership.names(role.id)))
+        .cloned()
+        .collect();
+    emit_memberships_delete(program, schema, &memberships)?;
+
+    let (table_cursor_id, index_cursor_id) = open_authid_cursors(program, schema)?;
+    for role in dropped {
+        emit_role_delete(program, table_cursor_id, index_cursor_id, role);
+    }
+    Ok(())
+}
+
+/// Whether `name` is one of PostgreSQL 18's predefined roles.
+fn is_predefined_role(name: &str) -> bool {
+    matches!(
+        name,
+        "pg_database_owner"
+            | "pg_read_all_data"
+            | "pg_write_all_data"
+            | "pg_monitor"
+            | "pg_read_all_settings"
+            | "pg_read_all_stats"
+            | "pg_stat_scan_tables"
+            | "pg_read_server_files"
+            | "pg_write_server_files"
+            | "pg_execute_server_program"
+            | "pg_signal_backend"
+            | "pg_checkpoint"
+            | "pg_maintain"
+            | "pg_use_reserved_connections"
+            | "pg_create_subscription"
+            | "pg_signal_autovacuum_worker"
+    )
+}
+
+/// What keeps role `role` from being dropped, one line per object, as
+/// PostgreSQL describes them: the relations it owns, those whose access
+/// control list names it, and the policies that apply to it. Indexes are
+/// left out, as their tables stand for them.
+fn role_dependents(schema: &Schema, connection: &Connection, role: RoleId) -> Vec<String> {
+    let Some(catalog) = class_catalog(schema) else {
+        return Vec::new();
+    };
+    let role_oid = crate::catalog::role_oid(role);
+    // PostgreSQL lists the objects by oid, which is the order they were
+    // created in. Relations and policies take their oids from one counter.
+    let mut dependents: Vec<(i64, String)> = Vec::new();
+    for class in catalog.classes() {
+        if class.relkind == RelationKind::Index {
+            continue;
+        }
+        let name = relation_name(connection, schema, class.relnamespace, &class.relname);
+        let kind = class.relkind.name();
+        if class.relowner == role {
+            dependents.push((class.oid, format!("owner of {kind} {name}")));
+        } else if class
+            .relacl
+            .as_ref()
+            .is_some_and(|acl| acl.names_role(role_oid))
+        {
+            dependents.push((class.oid, format!("privileges for {kind} {name}")));
+        }
+        for (details, policy) in class.relpolicies.iter() {
+            // A policy that names PUBLIC applies to PUBLIC alone, as
+            // PostgreSQL keeps no other role for it.
+            if policy.roles.contains(&role) && !policy.roles.contains(&RoleId::PUBLIC) {
+                dependents.push((
+                    details.oid,
+                    format!("target of policy {} on {kind} {name}", policy.name),
+                ));
+            }
+        }
+    }
+    dependents.sort_by_key(|(oid, _)| *oid);
+    dependents.into_iter().map(|(_, line)| line).collect()
+}
+
+/// The DETAIL that lists `dependents`, at most [`MAX_REPORTED_DEPENDENTS`]
+/// of them.
+fn dependents_detail(dependents: Vec<String>) -> String {
+    if dependents.len() <= MAX_REPORTED_DEPENDENTS {
+        return dependents.join("\n");
+    }
+    // PostgreSQL writes the whole list to the server log.
+    tracing::info!(
+        "objects that depend on the role:\n{}",
+        dependents.join("\n")
+    );
+    let others = dependents.len() - MAX_REPORTED_DEPENDENTS;
+    let mut lines = dependents;
+    lines.truncate(MAX_REPORTED_DEPENDENTS);
+    let objects = if others == 1 { "object" } else { "objects" };
+    lines.push(format!(
+        "and {others} other {objects} (see server log for list)"
+    ));
+    lines.join("\n")
+}
+
+/// Opens [`AUTHID_TABLE_NAME`] and its name index for writing, and returns
+/// the cursor of each.
+fn open_authid_cursors(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+) -> turso_core::Result<(usize, usize)> {
+    let Some(table) = schema.get_btree_table(NamespaceId::ROOT, AUTHID_TABLE_NAME) else {
+        return Err(LimboError::ParseError(
+            "the database has no roles table".to_string(),
+        ));
+    };
+    let name_index = schema
+        .get_indices(NamespaceId::ROOT, AUTHID_TABLE_NAME)
+        .find(|index| index.name == AUTHID_NAME_INDEX_NAME)
+        .cloned()
+        .ok_or_else(|| LimboError::Corrupt(format!("{AUTHID_TABLE_NAME} has no name index")))?;
+    let table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: table_cursor_id,
+        root_page: RegisterOrLiteral::Literal(table.root_page),
+        db: MAIN_DB_ID,
+    });
+    let index_cursor_id = program.alloc_cursor_index(None, &name_index)?;
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: index_cursor_id,
+        root_page: RegisterOrLiteral::Literal(name_index.root_page),
+        db: MAIN_DB_ID,
+    });
+    Ok((table_cursor_id, index_cursor_id))
+}
+
+/// Deletes the row of `role` and its name index entry, and tells the engine
+/// to remove the role from the in-memory catalog. The catalog was loaded
+/// from the table, so the row must be there.
+fn emit_role_delete(
+    program: &mut ProgramBuilder,
+    table_cursor_id: usize,
+    index_cursor_id: usize,
+    role: &Role,
+) {
+    let id = role.id.get();
+    let id_reg = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        value: id,
+        dest: id_reg,
+    });
+    let found = program.allocate_label();
+    let missing = program.allocate_label();
+    program.emit_insn(Insn::NotExists {
+        cursor: table_cursor_id,
+        rowid_reg: id_reg,
+        target_pc: missing,
+    });
+    program.emit_insn(Insn::Goto { target_pc: found });
+    program.preassign_label_to_next_insn(missing);
+    program.emit_insn(Insn::Halt {
+        constraint_info: None,
+        err_code: SQLITE_ERROR,
+        description: format!("{AUTHID_TABLE_NAME} has no role with id {id}"),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(found);
+    let key_reg = program.alloc_registers(2);
+    program.emit_insn(Insn::String8 {
+        value: role.name.clone(),
+        dest: key_reg,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: id_reg,
+        dst_reg: key_reg + 1,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::IdxDelete {
+        start_reg: key_reg,
+        num_regs: 2,
+        cursor_id: index_cursor_id,
+        raise_error_if_no_matching_entry: true,
+    });
+    program.emit_insn(Insn::Delete {
+        cursor_id: table_cursor_id,
+        table_name: AUTHID_TABLE_NAME.to_string(),
+        is_part_of_update: true,
+    });
+    RoleDropped.emit(program, id_reg);
+}
+
+/// A role that `DROP ROLE` deleted. Its memberships were deleted before it.
+#[derive(Debug)]
+struct RoleDropped;
+
+impl RoleDropped {
+    /// `id_reg` holds the id of the deleted role.
+    fn emit(self, program: &mut ProgramBuilder, id_reg: usize) {
+        emit_catalog_apply(program, self, vec![id_reg]);
+    }
+
+    fn apply_to(&self, roles: &mut RoleCatalog, values: &[Value]) -> turso_core::Result<()> {
+        let [Value::Numeric(Numeric::Integer(id))] = values else {
+            return Err(LimboError::InternalError(format!(
+                "DROP ROLE read back {values:?} where the role's id was written"
+            )));
+        };
+        roles.remove(RoleId::from_stored(*id));
+        Ok(())
+    }
+}
+
+impl CatalogApply for RoleDropped {
+    fn apply(&self, schema: &mut Schema, values: &[Value]) -> turso_core::Result<()> {
+        change_schema_state(schema, |state| {
+            self.apply_to(Arc::make_mut(&mut state.roles), values)
+        })
+    }
+}
+
 /// Adds the role's name to the name index, failing if another role has the
 /// name. The in-memory catalog has already rejected a name it knows, so this
 /// only fails if the stored table has a role the catalog does not.
@@ -417,6 +735,26 @@ fn emit_name_index_insert(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dependents_detail_counts_the_objects_it_leaves_out() {
+        let dependents = |count: usize| {
+            (1..=count)
+                .map(|i| format!("privileges for table t{i}"))
+                .collect::<Vec<_>>()
+        };
+
+        let one_more = dependents_detail(dependents(MAX_REPORTED_DEPENDENTS + 1));
+        assert_eq!(
+            one_more.lines().last(),
+            Some("and 1 other object (see server log for list)")
+        );
+        let two_more = dependents_detail(dependents(MAX_REPORTED_DEPENDENTS + 2));
+        assert_eq!(
+            two_more.lines().last(),
+            Some("and 2 other objects (see server log for list)")
+        );
+    }
 
     #[test]
     fn superuser_is_a_superuser_without_being_in_the_catalog() {

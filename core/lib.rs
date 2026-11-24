@@ -13,6 +13,7 @@
 #![recursion_limit = "256"]
 
 pub mod alloc;
+pub use turso_ast as ast;
 pub mod busy;
 pub mod cdc;
 #[cfg(feature = "cli_only")]
@@ -94,20 +95,6 @@ mod uuid;
 mod vdbe;
 pub mod vtab;
 
-// `turso_sqlite` depends on this crate, so the unit tests of this crate
-// cannot link it: its `SqliteDialect` implements the `Dialect` trait of the
-// copy of this crate built without tests. The unit tests compile the source
-// of `turso_sqlite` as a module instead, and open databases with the same
-// dialect that users do.
-#[cfg(test)]
-extern crate self as turso_core;
-#[cfg(test)]
-#[allow(unused_imports)]
-#[path = "../sqlite/frontend/lib.rs"]
-mod turso_sqlite;
-#[cfg(test)]
-pub(crate) use turso_sqlite::SqliteDialect;
-
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
 pub use function::{ExternalFunc, Func, ScalarFunc};
@@ -119,11 +106,11 @@ pub use functions::datetime_input::exec_temporal_encode;
 /// formatting implementation.
 pub use functions::printf::{exec_printf_values, printf_c_arg_plan, PrintfCArg};
 
+use crate::ast::Cmd;
 use crate::{
     busy::{BusyHandler, BusyHandlerCallback},
     index_method::IndexMethod,
     schema::Trigger,
-    storage::encryption::AtomicCipherMode,
     sync::{atomic::AtomicBool, Arc, RwLock},
     vdbe::metrics::ConnectionMetrics,
 };
@@ -134,8 +121,8 @@ use storage::sqlite3_ondisk::PageSize;
 use tracing::instrument;
 pub use translate::emitter::TransactionMode;
 use turso_macros::AtomicEnum;
-use turso_parser::{ast, ast::Cmd};
 
+pub use crate::ast::EqpFormat;
 pub use cdc::{
     CaptureDataChangesExt, CaptureDataChangesInfo, CaptureDataChangesMode, CdcVersion,
     CDC_VERSION_CURRENT,
@@ -160,7 +147,12 @@ pub(crate) use database::{DatabaseCatalog, InitState};
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 pub use dialect::{
-    AccessStatement, CatalogApply, Dialect, NewOwner, OwnerColumn, RelationChange, RelationName,
+    AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
+    CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,
+    CreateTrigger, CreateView, CreateVirtualTable, Dependent, DependentObject, Dialect, DropColumn,
+    DropIndex, DropSequence, DropTable, DropTrigger, DropView, NewOwner, OwnerColumn, RelationName,
+    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, SqliteCatalog, StatementTimes,
+    TableText, TempTriggerOfRenamedTable,
 };
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
@@ -187,9 +179,16 @@ pub use io::{
     SyscallIO, WriteCompletion, IO,
 };
 pub use namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
-pub use numeric::{nonnan::NonNan, Numeric};
+pub use numeric::{
+    decimal::{format_numeric_text, Decimal},
+    nonnan::NonNan,
+    Numeric,
+};
+pub use schema::load::{LoadQuery, LoadStep, QueryFailure, SchemaLoad};
 pub use security::roles::SessionRole;
-pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
+pub use statement::{
+    ColumnOrigin, ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter,
+};
 pub use storage::{
     buffer_pool::BufferPool,
     database::{DatabaseStorage, IOContext},
@@ -210,10 +209,11 @@ pub use turso_macros::{
     turso_assert_sometimes_less_than, turso_assert_sometimes_less_than_or_equal,
     turso_assert_unreachable, turso_debug_assert, turso_soft_unreachable,
 };
-pub use turso_parser::ast::EqpFormat;
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
-pub use vdbe::array::{array_values_from_any, parse_text_array_of_texts, text_array_literal};
+pub use vdbe::array::{
+    array_contains_all, array_values_from_any, parse_text_array_of_texts, text_array_literal,
+};
 pub use vdbe::builder::{CursorType, ProgramBuilder};
 pub use vdbe::insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
 pub use vdbe::{

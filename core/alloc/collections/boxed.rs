@@ -6,6 +6,30 @@ pub type DynBoxedSlice<T> = std::boxed::Box<[T]>;
 #[cfg(nightly)]
 pub type DynBoxedSlice<T> = std::boxed::Box<[T], crate::alloc::DynAllocator>;
 
+/// A box whose memory comes from a [`DynAllocator`](crate::alloc::DynAllocator).
+///
+/// Unlike the other `Dyn` collections, it uses its allocator also in stable
+/// builds, where it is the `Box` of `allocator_api2`. Its `try_new_in`
+/// returns [`AllocError`] when the allocator cannot give the memory.
+#[cfg(not(nightly))]
+pub type DynBox<T> = allocator_api2::boxed::Box<T, crate::alloc::DynAllocator>;
+#[cfg(nightly)]
+pub type DynBox<T> = std::boxed::Box<T, crate::alloc::DynAllocator>;
+
+#[cfg(not(nightly))]
+impl<T> TursoBoxExt<T> for DynBox<T> {
+    fn into_inner(self) -> T {
+        allocator_api2::boxed::Box::into_inner(self)
+    }
+}
+
+#[cfg(nightly)]
+impl<T> TursoBoxExt<T> for DynBox<T> {
+    fn into_inner(self) -> T {
+        *self
+    }
+}
+
 fn boxed<T>(value: T) -> Box<T> {
     Box::new(value)
 }

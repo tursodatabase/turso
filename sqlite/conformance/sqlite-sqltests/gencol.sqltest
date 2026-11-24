@@ -3525,13 +3525,13 @@ expect error {
 
 @skip-if sqlite "SQLite doesn't support custom types"
 @requires custom_types "uses custom types"
-test gencol_alter_add_stored_with_custom_type_rejected {
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+test gencol_alter_add_stored_with_struct_type_rejected {
+    CREATE TYPE pt AS STRUCT(x INT, y INT);
     CREATE TABLE t1(a INTEGER) STRICT;
-    ALTER TABLE t1 ADD COLUMN s cents AS (a) STORED;
+    ALTER TABLE t1 ADD COLUMN s pt AS (NULL) STORED;
 }
 expect error {
-    stored generated columns cannot use custom types
+    stored generated columns cannot use array, STRUCT, or UNION types
 }
 
 @skip-if sqlite "SQLite doesn't support array types"
@@ -3541,7 +3541,7 @@ test gencol_alter_add_stored_reading_array_column_rejected {
     ALTER TABLE t1 ADD COLUMN s TEXT AS (a) STORED;
 }
 expect error {
-    stored generated columns cannot use custom types
+    stored generated columns cannot use array, STRUCT, or UNION types
 }
 
 # --- RENAME COLUMN with generated columns ---
@@ -4104,6 +4104,146 @@ expect error {
     subqueries prohibited in generated columns
 }
 
+# --- RAISE prohibited outside triggers ---
+
+test gencol_error_raise_ignore {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)));
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+test gencol_error_raise_abort {
+    CREATE TABLE t1(a, b AS (RAISE(ABORT, 'x')));
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+test gencol_error_raise_nested {
+    CREATE TABLE t1(a, b AS (coalesce(a, RAISE(FAIL, 'x'))) VIRTUAL);
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+# SQLite's check compiles `SELECT * FROM t`, which reads STORED columns from
+# the row, so a RAISE in a STORED column is reported only when a row is written.
+test gencol_raise_stored_is_accepted {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)) STORED);
+    CREATE TABLE t2(a, b AS (coalesce(a, RAISE(ABORT, 'x'))) STORED, c AS (b + 1));
+    SELECT name FROM sqlite_schema ORDER BY name;
+}
+expect {
+    t1
+    t2
+}
+
+test gencol_raise_stored_fails_on_insert {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)) STORED);
+    INSERT INTO t1(a) VALUES (1);
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+# The parser replaces `x IN ()` with 0 and `x NOT IN ()` with 1, so the RAISE
+# in them is never compiled.
+test gencol_raise_in_empty_in_list {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE) IN ()), c AS (RAISE(FAIL, 'x') NOT IN ()));
+    INSERT INTO t1(a) VALUES (1);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    1|0|1
+}
+
+# SQLite's parser replaces `0 AND RAISE(...)` with 0 and accepts the table.
+# Turso compiles both sides of AND, so it rejects the table instead of
+# creating one that every INSERT and SELECT fails on.
+@skip-if sqlite "SQLite's parser folds 0 AND X to 0"
+test gencol_error_raise_in_and_with_zero {
+    CREATE TABLE t1(a, b AS (0 AND RAISE(IGNORE)));
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+test gencol_error_raise_in_or_with_one {
+    CREATE TABLE t1(a, b AS (1 OR RAISE(IGNORE)));
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+# CREATE TABLE IF NOT EXISTS on an existing name does nothing, so the
+# RAISE is never compiled.
+test gencol_raise_if_not_exists_table {
+    CREATE TABLE t1(a);
+    CREATE TABLE IF NOT EXISTS t1(a, b AS (RAISE(IGNORE)));
+    SELECT name FROM sqlite_schema;
+}
+expect {
+    t1
+}
+
+test gencol_raise_if_not_exists_view {
+    CREATE VIEW v1 AS SELECT 1;
+    CREATE TABLE IF NOT EXISTS v1(a, b AS (RAISE(IGNORE)));
+    SELECT name FROM sqlite_schema;
+}
+expect {
+    v1
+}
+
+# SQLite finds the RAISE after every other column check, so those errors
+# are reported first.
+test gencol_raise_after_unknown_column {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)), c AS (zzz));
+}
+expect error {
+    no such column: zzz
+}
+
+test gencol_raise_after_aggregate {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)), c AS (max(a, 1) + count(*)));
+}
+expect error {
+    (aggregate functions prohibited|misuse of aggregate function)
+}
+
+test gencol_raise_after_generated_column_loop {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE) + c), c AS (b));
+}
+expect error {
+    (circular dependency|generated column loop)
+}
+
+test gencol_raise_after_generated_primary_key {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)), PRIMARY KEY(b));
+}
+expect error {
+    generated column.*cannot be part of the PRIMARY KEY
+}
+
+test gencol_raise_after_unknown_primary_key_column {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)), PRIMARY KEY(zz));
+}
+expect error {
+    (no such column: zz|Column zz not found)
+}
+
+# SQLite checks RAISE only at CREATE TABLE: ADD COLUMN stores the column and
+# the error is reported when a statement reads it.
+test gencol_alter_add_raise_fails_on_read {
+    CREATE TABLE t1(a);
+    ALTER TABLE t1 ADD COLUMN b AS (RAISE(IGNORE));
+    SELECT a, b FROM t1;
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
 # --- Aggregates prohibited ---
 
 test gencol_error_aggregate {
@@ -4532,12 +4672,126 @@ expect error {
 
 @skip-if sqlite "SQLite doesn't support custom types"
 @requires custom_types "uses custom types"
-test gencol_stored_with_custom_type_rejected {
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    CREATE TABLE t1(a INTEGER, s cents AS (a) STORED) STRICT;
+test gencol_stored_with_struct_type_rejected {
+    CREATE TYPE pt AS STRUCT(x INT, y INT);
+    CREATE TABLE t1(a INTEGER, s pt AS (NULL) STORED) STRICT;
 }
 expect error {
-    stored generated columns cannot use custom types
+    stored generated columns cannot use array, STRUCT, or UNION types
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_with_union_type_rejected {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE t1(a INTEGER, s number AS (NULL) STORED) STRICT;
+}
+expect error {
+    stored generated columns cannot use array, STRUCT, or UNION types
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_with_encoding_type_reads_back_the_value {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INTEGER, s cents AS (a) STORED) STRICT;
+    INSERT INTO t1(id, a) VALUES (1, 5), (2, 6);
+    UPDATE t1 SET a = 7 WHERE id = 1;
+    INSERT INTO t1(id, a) VALUES (2, 0) ON CONFLICT(id) DO UPDATE SET a = 8;
+    SELECT id, a, s FROM t1 ORDER BY id;
+}
+expect {
+    1|7|7
+    2|8|8
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_numeric_column_in_a_multi_row_insert {
+    CREATE TABLE t1(a numeric(10,2), g numeric(10,2) AS (a * 2) STORED) STRICT;
+    INSERT INTO t1(a) VALUES (1.234), (4.5), (7);
+    SELECT a, g FROM t1 ORDER BY a;
+}
+expect {
+    1.23|2.46
+    4.50|9.00
+    7.00|14.00
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_numeric_column_reads_the_coerced_set_value {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a numeric(10,2), g numeric(10,2) AS (a * 2) STORED) STRICT;
+    INSERT INTO t1(id, a) VALUES (1, 1.5), (2, 2.5);
+    UPDATE t1 SET a = 3.456 WHERE id = 1;
+    INSERT INTO t1(id, a) VALUES (2, 0) ON CONFLICT(id) DO UPDATE SET a = 3.333;
+    SELECT id, a, g FROM t1 ORDER BY id;
+}
+expect {
+    1|3.46|6.92
+    2|3.33|6.66
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_encoding_type_in_a_before_insert_trigger {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(a INTEGER, s cents AS (a) STORED) STRICT;
+    CREATE TABLE log(x ANY) STRICT;
+    CREATE TRIGGER bi BEFORE INSERT ON t1 BEGIN INSERT INTO log VALUES (NEW.s); END;
+    INSERT INTO t1(a) VALUES (5), (6);
+    SELECT x FROM log;
+    SELECT s FROM t1;
+}
+expect {
+    5
+    6
+    5
+    6
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_numeric_column_in_a_before_insert_trigger {
+    CREATE TABLE t1(a INTEGER, s numeric(10,2) AS (a / 3.0) STORED) STRICT;
+    CREATE TABLE log(x ANY) STRICT;
+    CREATE TRIGGER bi BEFORE INSERT ON t1 BEGIN INSERT INTO log VALUES (NEW.a); END;
+    INSERT INTO t1(a) VALUES (5), (6);
+    SELECT s FROM t1 ORDER BY a;
+}
+expect {
+    1.67
+    2.00
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_with_coerce_only_type_coerces_once {
+    CREATE TYPE bump BASE integer COERCE value + 1;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INTEGER, g bump AS (a) STORED) STRICT;
+    INSERT INTO t1(id, a) VALUES (1, 10);
+    SELECT g FROM t1;
+    UPDATE t1 SET a = 20;
+    SELECT g FROM t1;
+    INSERT INTO t1(id, a) VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET a = 30;
+    SELECT g FROM t1;
+}
+expect {
+    11
+    21
+    31
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_varchar_checks_its_length {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT, b varchar(3) AS (a || 'x') STORED) STRICT;
+    INSERT INTO t1(id, a) VALUES (1, 'ab');
+    SELECT b FROM t1;
+    INSERT INTO t1(id, a) VALUES (2, 'abc');
+}
+expect error {
+    value too long for varchar
 }
 
 @skip-if sqlite "SQLite doesn't support array types"
@@ -4546,17 +4800,21 @@ test gencol_stored_with_array_type_rejected {
     CREATE TABLE t1(a INTEGER, s INTEGER[] AS (a) STORED) STRICT;
 }
 expect error {
-    stored generated columns cannot use custom types
+    stored generated columns cannot use array, STRUCT, or UNION types
 }
 
 @skip-if sqlite "SQLite doesn't support custom types"
 @requires custom_types "uses custom types"
-test gencol_stored_reading_custom_type_column_rejected {
+test gencol_stored_reading_encoding_type_column_gets_the_user_value {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t1(a cents, s INTEGER AS (a) STORED) STRICT;
+    INSERT INTO t1(a) VALUES (5), (6);
+    UPDATE t1 SET a = 7 WHERE a = 5;
+    SELECT a, s FROM t1;
 }
-expect error {
-    stored generated columns cannot use custom types
+expect {
+    7|7
+    6|6
 }
 
 @skip-if sqlite "SQLite doesn't support array types"
@@ -4565,17 +4823,19 @@ test gencol_stored_reading_array_column_rejected {
     CREATE TABLE t1(a INTEGER[], s TEXT AS (a) STORED) STRICT;
 }
 expect error {
-    stored generated columns cannot use custom types
+    stored generated columns cannot use array, STRUCT, or UNION types
 }
 
 @skip-if sqlite "SQLite doesn't support custom types"
 @requires custom_types "uses custom types"
-test gencol_stored_reading_custom_type_column_through_virtual_column_rejected {
+test gencol_stored_reading_encoding_type_column_through_virtual_column {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t1(a cents, v INTEGER AS (a) VIRTUAL, s INTEGER AS (v) STORED) STRICT;
+    INSERT INTO t1(a) VALUES (5);
+    SELECT a, v, s FROM t1;
 }
-expect error {
-    stored generated columns cannot use custom types
+expect {
+    5|5|5
 }
 
 @skip-if sqlite "SQLite doesn't support custom types"

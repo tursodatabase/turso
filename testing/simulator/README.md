@@ -118,6 +118,53 @@ For development purposes, you can run `make sim-schema` to generate a JsonSchema
 }
 ```
 
+## Swarm testing
+
+A run with all statements and fixed weights cannot get to some states.
+For example, DELETE keeps tables small, savepoint rollbacks discard writes, and frequent checkpoints keep the WAL short.
+With `--swarm`, the seed of each run also picks these settings:
+
+- The statements. Each kind of statement is off in about half of the runs. The weight of each other kind is 1/4, 1/2, 1, 2, or 4 times its weight in the profile.
+- The properties that write, for example `Savepoint-Rollback` and `Delete-Select`. Each one is off in about half of the runs.
+- The faults: database reopen and power loss, faulty queries, and `FsyncNoWait`. Each one is off in about half of the runs.
+- The connections: 1 to the connection count of the profile. The default profile has 10 connections.
+- The I/O backend: `memory` or `default`. Only `memory` can simulate a power loss, so runs on `default` have no power loss faults and no `FsyncNoWait`. The swarm does not pick `io_uring`, because `io_uring` exists only on Linux and some hosts block it.
+- The I/O latency probability: 0, 1, or 10 percent.
+- The clock ticks: 1 to 10, 10 to 50, or 50 to 500 microseconds. Each read of the simulated clock moves it forward by one tick. A delayed I/O completes 5 to 20 ms later, so small ticks let more work run before it completes.
+
+Three rules apply:
+
+- SELECT and INSERT always stay on. The read-only properties take their weight from the SELECT weight. Without INSERT, the tables stay empty.
+- The read-only properties always stay on, for example `Select-Limit`. They do not change the database, so a run without them finds fewer bugs.
+- If DROP TABLE stays on, CREATE TABLE also stays on. Otherwise, a run can drop all of its tables.
+
+The swarm changes the profile that you select with `--profile`.
+It does not turn on a statement, a property, or a fault that the profile or a flag turns off.
+For example, `--swarm --disable-reopen-database` never reopens the database, and `--swarm --profile faultless` injects no I/O faults.
+If you give `--io-backend` or `--latency-prob`, it keeps its value.
+If you give `--min-tick` or `--max-tick`, the swarm does not change the ticks.
+
+The output shows the settings of the run:
+
+```text
+swarm: connections 9
+swarm: --io-backend default --latency-prob 10 --min-tick 1 --max-tick 10 --disable-delete-select --disable-drop-select --disable-savepoint-rollback --disable-fsync-no-wait --disable-reopen-database
+swarm: queries select:240 create_table:60 create_index:2 insert:120 update:20 delete:40 drop_table:8 alter_table:1 drop_index:4 setval:2
+swarm: queries off pragma create_sequence drop_sequence nextval
+```
+
+The names of the statements are the weight fields of the profile, without the `_weight` suffix.
+To repeat a run, use the same seed and the same flags:
+
+```bash
+cargo run -p limbo_sim -- --swarm --seed 1
+```
+
+CI runs a swarm profile.
+On pull requests, iteration N uses seed N, so each pull request tests the same settings.
+On pushes to main, each iteration uses a new random seed.
+If an iteration fails, the log ends with the command that repeats the run.
+
 ## Run simulator using the Miri interpreter
 
 Miri is a deterministic Rust interpreter designed to identify undefined behavior. To run the simulator under Miri, use

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { unlinkSync, writeFileSync } from "node:fs";
 import { expect, test } from 'vitest'
 import { Database, SqliteError } from './compat.js'
@@ -35,7 +36,7 @@ test('errors carry the SQLite message and result code name', () => {
     db.exec('CREATE TABLE s(a INTEGER) STRICT');
     db.exec('CREATE TABLE tr(a)');
     db.exec("CREATE TRIGGER trg BEFORE INSERT ON tr BEGIN SELECT RAISE(ABORT, 'nope'); END");
-    const notADatabase = `test-${(Math.random() * 10000) | 0}.db`;
+    const notADatabase = `test-${randomUUID()}.db`;
     writeFileSync(notADatabase, Buffer.alloc(8192, 7));
     const cases: [() => unknown, string, string][] = [
         [() => db.prepare('INSERT INTO t(a) VALUES (1)').run(), 'SQLITE_CONSTRAINT_UNIQUE', 'UNIQUE constraint failed: t.a'],
@@ -109,7 +110,7 @@ test('expanded rows collapse duplicate column names like better-sqlite3', () => 
 })
 
 test('readonly-db', () => {
-    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    const path = `test-${randomUUID()}.db`;
     try {
         {
             const rw = new Database(path);
@@ -130,7 +131,7 @@ test('readonly-db', () => {
 })
 
 test('file-must-exist', () => {
-    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    const path = `test-${randomUUID()}.db`;
     let error: any;
     try { new Database(path, { fileMustExist: true }); } catch (e) { error = e; }
     expect(error).toBeInstanceOf(SqliteError);
@@ -139,20 +140,20 @@ test('file-must-exist', () => {
 })
 
 test('on-disk db', () => {
-    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    const path = `test-${randomUUID()}.db`;
     try {
         const db1 = new Database(path);
         db1.exec("CREATE TABLE t(x)");
         db1.exec("INSERT INTO t VALUES (1), (2), (3)");
         const stmt1 = db1.prepare("SELECT * FROM t WHERE x % 2 = ?");
-        expect(stmt1.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
+        expect(stmt1.columns()).toEqual([{ name: "x", column: "x", database: "main", table: "t", type: null }]);
         const rows1 = stmt1.all([1]);
         expect(rows1).toEqual([{ x: 1 }, { x: 3 }]);
         db1.close();
 
         const db2 = new Database(path);
         const stmt2 = db2.prepare("SELECT * FROM t WHERE x % 2 = ?");
-        expect(stmt2.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
+        expect(stmt2.columns()).toEqual([{ name: "x", column: "x", database: "main", table: "t", type: null }]);
         const rows2 = stmt2.all([1]);
         expect(rows2).toEqual([{ x: 1 }, { x: 3 }]);
         db2.close();
@@ -163,8 +164,8 @@ test('on-disk db', () => {
 })
 
 test('attach', () => {
-    const path1 = `test-${(Math.random() * 10000) | 0}.db`;
-    const path2 = `test-${(Math.random() * 10000) | 0}.db`;
+    const path1 = `test-${randomUUID()}.db`;
+    const path2 = `test-${randomUUID()}.db`;
     try {
         const db1 = new Database(path1, { experimental: ["attach"] });
         db1.exec("CREATE TABLE t(x)");
@@ -176,7 +177,7 @@ test('attach', () => {
         db1.exec(`ATTACH '${path2}' as secondary`);
 
         const stmt = db1.prepare("SELECT * FROM t UNION ALL SELECT * FROM secondary.q");
-        expect(stmt.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
+        expect(stmt.columns()).toEqual([{ name: "x", column: "x", database: "main", table: "t", type: null }]);
         const rows = stmt.all([1]);
         expect(rows).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }, { x: 5 }, { x: 6 }]);
     } finally {
@@ -194,7 +195,7 @@ test('blobs', () => {
 })
 
 test('encryption', () => {
-    const path = `test-encryption-${(Math.random() * 10000) | 0}.db`;
+    const path = `test-encryption-${randomUUID()}.db`;
     const hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';
     const wrongKey = 'aaaaaaa4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';
     try {
@@ -230,4 +231,63 @@ test('encryption', () => {
     } finally {
         unlinkSync(path);
     }
+})
+
+test('a transaction function called inside another runs as a savepoint, as in better-sqlite3', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE t (x INTEGER)');
+    const insert = db.prepare('INSERT INTO t VALUES (?)');
+    const inner = db.transaction((x) => {
+        insert.run(x);
+        if (x === 2) throw new Error('inner failed');
+    });
+    const outer = db.transaction(() => {
+        inner(1);
+        expect(() => inner(2)).toThrow('inner failed');
+        insert.run(3);
+    });
+    outer();
+    expect(db.prepare('SELECT x FROM t ORDER BY x').all()).toEqual([{ x: 1 }, { x: 3 }]);
+})
+
+test('transaction functions nest three deep, each level rolling back only itself', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE t (x INTEGER)');
+    const insert = db.prepare('INSERT INTO t VALUES (?)');
+    const inner = db.transaction((x) => {
+        insert.run(x);
+        throw new Error('inner failed');
+    });
+    const middle = db.transaction(() => {
+        insert.run(2);
+        expect(() => inner(3)).toThrow('inner failed');
+        insert.run(4);
+    });
+    const outer = db.transaction(() => {
+        insert.run(1);
+        middle();
+        insert.run(5);
+    });
+    outer();
+    expect(db.inTransaction).toBe(false);
+    expect(db.prepare('SELECT x FROM t ORDER BY x').all()).toEqual([{ x: 1 }, { x: 2 }, { x: 4 }, { x: 5 }]);
+})
+
+test('an error that leaves every nested transaction function rolls back the whole transaction', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE t (x INTEGER)');
+    const insert = db.prepare('INSERT INTO t VALUES (?)');
+    const inner = db.transaction((x) => {
+        insert.run(x);
+        throw new Error('inner failed');
+    });
+    const outer = db.transaction(() => {
+        insert.run(1);
+        inner(2);
+    });
+    expect(() => outer()).toThrow('inner failed');
+    expect(db.inTransaction).toBe(false);
+    expect(db.prepare('SELECT x FROM t').all()).toEqual([]);
+    db.transaction(() => insert.run(3))();
+    expect(db.prepare('SELECT x FROM t').all()).toEqual([{ x: 3 }]);
 })

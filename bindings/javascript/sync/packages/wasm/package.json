@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/sync-wasm",
-  "version": "0.9.0-pre.5",
+  "version": "0.9.0-pre.6",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/turso"
@@ -42,7 +42,8 @@
     "tsc-build": "npm exec tsc && cp sync.wasm32-wasi.wasm ./dist/sync.wasm32-wasi.wasm && WASM_FILE=sync.wasm32-wasi.wasm JS_FILE=./dist/wasm-inline.js node ../../../scripts/inline-wasm-base64.js && npm run bundle",
     "bundle": "vite build",
     "build": "npm run napi-build && npm run tsc-build",
-    "test": "LOCAL_SYNC_SERVER=../../../../../target/debug/tursodb CI=1 vitest --testTimeout 30000 --browser=chromium --run"
+    "test": "LOCAL_SYNC_SERVER=../../../../../target/debug/tursodb CI=1 vitest --testTimeout 30000 --browser=chromium --run",
+    "test:encryption": "node --test browser-io.check.mjs && vitest run --config vitest.encryption.config.ts"
   },
   "napi": {
     "binaryName": "sync",
@@ -54,8 +55,8 @@
     "#index": "./index.js"
   },
   "dependencies": {
-    "@tursodatabase/database-common": "^0.9.0-pre.5",
-    "@tursodatabase/database-wasm-common": "^0.9.0-pre.5",
-    "@tursodatabase/sync-common": "^0.9.0-pre.5"
+    "@tursodatabase/database-common": "^0.9.0-pre.6",
+    "@tursodatabase/database-wasm-common": "^0.9.0-pre.6",
+    "@tursodatabase/sync-common": "^0.9.0-pre.6"
   }
 }

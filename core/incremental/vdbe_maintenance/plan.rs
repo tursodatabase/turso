@@ -1,8 +1,9 @@
+use crate::ast::{self, TableInternalId};
 use rustc_hash::{FxHashMap, FxHashSet};
-use turso_parser::ast::{self, TableInternalId};
 
 use super::output::NodeOutputContract;
 use super::stream::{binding_rowid_metadata_width, DeltaIdentity};
+use crate::alloc::StatementAllocationSite;
 use crate::function::{AggFunc, Func};
 use crate::incremental::dag;
 use crate::schema::BTreeTable;
@@ -11,6 +12,7 @@ use crate::translate::collate::{first_collation, CollationSeq};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{expr_contains_nondeterministic_scalar_function, WalkControl};
 use crate::translate::expr_context::ExprContext;
+use crate::translate::new_program_builder;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::optimizer::unnest::rewrite_correlated_subqueries;
 use crate::translate::plan::{
@@ -237,6 +239,9 @@ fn build_select_plan_dag(
     plan: &SelectPlan,
     resolver: &Resolver,
 ) -> Result<dag::NodeId> {
+    if plan.distinctness.is_distinct_on() {
+        return unsupported("DISTINCT ON");
+    }
     if !plan.order_by.is_empty() {
         return unsupported("ORDER BY");
     }
@@ -981,12 +986,16 @@ pub(crate) fn plan_view(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<MaintenancePlan> {
-    let mut planner_program = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        None,
-        ProgramBuilderOpts::new(8, 32, 8),
-        connection.mvcc_enabled(),
-    );
+    let mut planner_program =
+        new_program_builder(connection, StatementAllocationSite::ProgramBuilder, || {
+            ProgramBuilder::new_for_subprogram(
+                QueryMode::Normal,
+                None,
+                ProgramBuilderOpts::new(8, 32, 8),
+                connection.mvcc_enabled(),
+                0,
+            )
+        })?;
     let mut relational_plan = prepare_select_plan(
         select.clone(),
         resolver,

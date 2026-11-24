@@ -1,4 +1,4 @@
-use turso_parser::ast::{Expr, TableInternalId};
+use crate::ast::{Expr, TableInternalId};
 
 use crate::{schema::Schema, vdbe::affinity::Affinity, LimboError, Result};
 
