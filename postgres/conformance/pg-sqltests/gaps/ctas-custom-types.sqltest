@@ -157,3 +157,42 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {}
+
+# A VALUES list hides the type of its cast from CREATE TABLE AS, so the copy
+# stores the timestamps as text instead of being refused.
+@compat-gap "syntax:create table as with custom type"
+test ctas-values-subquery-timestamptz {
+    CREATE TABLE c AS SELECT * FROM (VALUES ('2024-03-05 12:34:56+02'::timestamptz)) v(x);
+    SELECT count(*) FROM c WHERE x = '2024-03-05 10:34:56+00';
+}
+expect {
+    1
+}
+expect @tursopg {
+    0
+}
+
+@compat-gap "syntax:create table as with custom type"
+test ctas-cte-over-values-timestamptz {
+    CREATE TABLE c AS WITH v(x) AS (VALUES ('2024-03-05 12:34:56+02'::timestamptz)) SELECT x FROM v;
+    SELECT count(*) FROM c WHERE x = '2024-03-05 10:34:56+00';
+}
+expect {
+    1
+}
+expect @tursopg {
+    0
+}
+
+# PostgreSQL keeps varchar(3) in the copy and refuses a longer value; tursopg
+# copies the column without its length limit.
+@compat-gap "type:varchar"
+test ctas-varchar-length-limit {
+    CREATE TABLE t (s varchar(3));
+    CREATE TABLE c AS SELECT s FROM t;
+    INSERT INTO c VALUES ('abcd');
+}
+@sqlstate 22001
+expect error {}
+expect @tursopg {
+}
