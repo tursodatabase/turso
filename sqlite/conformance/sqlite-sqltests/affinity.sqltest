@@ -672,6 +672,25 @@ expect {
     9.007199254740992e+15
 }
 
+# An exponent with no digits is not part of the number, so integer text that
+# ends in "e", "e+" or "e-" stays an INTEGER instead of being rounded to a double.
+test cast-text-to-numeric-bare-exponent {
+    SELECT typeof(CAST('9007199254740993e' AS NUMERIC)), CAST('9007199254740993e' AS NUMERIC);
+    SELECT typeof(CAST('9007199254740993e+' AS NUMERIC)), CAST('9007199254740993e+' AS NUMERIC);
+    SELECT typeof(CAST('-9007199254740993E-' AS NUMERIC)), CAST('-9007199254740993E-' AS NUMERIC);
+    SELECT typeof(CAST(' 12e ' AS NUMERIC)), CAST(' 12e ' AS NUMERIC);
+    SELECT typeof(CAST('9007199254740993.e' AS NUMERIC)), printf('%!.20e', CAST('9007199254740993.e' AS NUMERIC));
+    SELECT typeof(CAST('9223372036854775808e' AS NUMERIC)), printf('%!.20e', CAST('9223372036854775808e' AS NUMERIC));
+}
+expect {
+    integer|9007199254740993
+    integer|9007199254740993
+    integer|-9007199254740993
+    integer|12
+    real|9.007199254740992e+15
+    real|9.22337203685477581e+18
+}
+
 # Regression tests for https://github.com/tursodatabase/turso/issues/4927
 # A compound (UNION/UNION ALL) subquery column's affinity must be combined
 # across all arms, not taken from the leftmost arm alone. Scanning left to

@@ -1243,13 +1243,15 @@ fn parse_numeric_str(text: &str) -> Result<(ValueType, &str), ()> {
     if !has_mantissa_digit {
         return Err(());
     }
-    // edge case: if it ends with exponent, strip and cast valid digits as float
+    // like sqlite3AtoF, an exponent with no digits ("12e", "12e+") is not part of
+    // the number, so it does not make the text a real either
     let last = bytes[end - 1];
     if last.eq_ignore_ascii_case(&b'e') {
-        return Ok((ValueType::Float, &text[0..end - 1]));
-    // edge case: ends with extponent / sign
+        end -= 1;
+        has_exponent = false;
     } else if has_exponent && (last == b'-' || last == b'+') {
-        return Ok((ValueType::Float, &text[0..end - 2]));
+        end -= 2;
+        has_exponent = false;
     }
     Ok((
         if !has_decimal && !has_exponent {
@@ -3167,11 +3169,12 @@ pub mod tests {
 
     #[test]
     fn test_parse_numeric_str_edge_cases() {
-        assert_eq!(parse_numeric_str("1e"), Ok((ValueType::Float, "1")));
-        assert_eq!(parse_numeric_str("1e-"), Ok((ValueType::Float, "1")));
-        assert_eq!(parse_numeric_str("1e+"), Ok((ValueType::Float, "1")));
-        assert_eq!(parse_numeric_str("-1e"), Ok((ValueType::Float, "-1")));
-        assert_eq!(parse_numeric_str("-1e-"), Ok((ValueType::Float, "-1")));
+        assert_eq!(parse_numeric_str("1e"), Ok((ValueType::Integer, "1")));
+        assert_eq!(parse_numeric_str("1e-"), Ok((ValueType::Integer, "1")));
+        assert_eq!(parse_numeric_str("1e+"), Ok((ValueType::Integer, "1")));
+        assert_eq!(parse_numeric_str("-1e"), Ok((ValueType::Integer, "-1")));
+        assert_eq!(parse_numeric_str("-1e-"), Ok((ValueType::Integer, "-1")));
+        assert_eq!(parse_numeric_str("1.e"), Ok((ValueType::Float, "1.")));
     }
 
     #[test]
