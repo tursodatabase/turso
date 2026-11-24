@@ -36,7 +36,7 @@ use turso_pg_parser::translator::{
     set_transaction_access_mode, unnamed_index_name, unqualified_create_table_name_location,
     FrontendStmt, PgCopyFromStmt, PgCreateSchemaStmt, PgDropRelationsStmt, PgDropSchemaStmt,
     PgGrantStmt, PgGrantTables, PgGrantee, PgSetStmt, PgSetTo, PgSetValue, PgShowStmt,
-    PostgreSQLTranslator, SerialSequence, TranslateResult,
+    SerialSequence, TranslateResult,
 };
 use turso_pg_parser::ParseError;
 
@@ -586,7 +586,7 @@ fn translate_statement<'a>(
     }
     let conn_for_names = Arc::clone(&pg_conn.conn);
     let conn_for_functions = Arc::clone(&pg_conn.conn);
-    let translator = PostgreSQLTranslator::new()
+    let translator = crate::dialect_types::translator()
         .with_relation_name_check(move |schema, name| {
             schema_has_relation(&conn_for_names, schema, name)
         })
@@ -2877,7 +2877,7 @@ fn prepare_copy_rows(
 }
 
 fn prepare_copy_insert(conn: &Arc<Connection>, sql: &str) -> Result<Statement> {
-    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+    let mut parser = crate::dialect_types::stored_sql_parser(sql.as_bytes());
     let cmd = parser
         .next_cmd()
         .map_err(|e| LimboError::ParseError(e.to_string()))?;

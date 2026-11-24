@@ -81,7 +81,7 @@ impl Dialect for PostgresDialect {
             Some(next) => next.stmt_location as usize,
             None => sql.len(),
         };
-        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
+        let translator = crate::dialect_types::translator();
         match translator.translate_with_prereqs(&parse_result) {
             Ok(translated) => Ok((Some(translated.cmd), consumed)),
             Err(_) => self.parse_internal(sql),
@@ -89,7 +89,7 @@ impl Dialect for PostgresDialect {
     }
 
     fn parse_internal(&self, sql: &str) -> Result<(Option<turso_core::ast::Cmd>, usize)> {
-        let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+        let mut parser = crate::dialect_types::stored_sql_parser(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         Ok((cmd, parser.offset()))
     }
@@ -98,7 +98,10 @@ impl Dialect for PostgresDialect {
         &self,
         sql: &str,
     ) -> Result<turso_core::ast::ColumnDefinition> {
-        Ok(turso_parser::parser::Parser::new(sql.as_bytes()).parse_column_definition(true)?)
+        Ok(
+            crate::dialect_types::stored_sql_parser(sql.as_bytes())
+                .parse_column_definition(true)?,
+        )
     }
 
     fn parameter_marker_ranges(&self, sql: &str) -> Result<Vec<std::ops::Range<usize>>> {
@@ -130,7 +133,7 @@ impl Dialect for PostgresDialect {
 
         let parse_result =
             turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
+        let translator = crate::dialect_types::translator();
         let stmt = translator
             .translate(&parse_result)
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
@@ -153,7 +156,7 @@ impl Dialect for PostgresDialect {
 
         let parse_result =
             turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
+        let translator = crate::dialect_types::translator();
         let stmt = translator
             .translate(&parse_result)
             .map_err(|e| LimboError::ParseError(e.to_string()))?;

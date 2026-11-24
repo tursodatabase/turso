@@ -16999,18 +16999,32 @@ pub fn op_integrity_check(
     Ok(InsnFunctionStepResult::Step)
 }
 pub fn op_cast(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _connection: &Arc<Connection>,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(Cast { reg, affinity }, insn);
-
-    let value = state.registers[*reg].get_value().clone();
-    let result = value.exec_cast(*affinity)?;
-
-    state.registers[*reg].set_value(result);
+    load_insn!(
+        Cast {
+            reg,
+            to,
+            from,
+            context
+        },
+        insn
+    );
+    let value = state.registers[*reg].get_value();
+    if !matches!(value, Value::Null) {
+        let converted = to.cast(value, from.as_deref(), *context).map_err(|error| {
+            if program.trigger.is_some() {
+                raised_in_trigger(error)
+            } else {
+                error
+            }
+        })?;
+        state.registers[*reg].set_value(converted);
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

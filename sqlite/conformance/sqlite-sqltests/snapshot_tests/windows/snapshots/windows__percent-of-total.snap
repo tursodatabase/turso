@@ -159,11 +159,11 @@ addr  opcode          p1   p2  p3  p4                     p5  comment
  132  Copy            36   28   0                          0  r[28]=r[36]
  133  Copy            37   29   0                          0  r[29]=r[37]
  134  Copy            37   47   0                          0  r[47]=r[37]
- 135  Cast            47    0   0                          0  affinity(r[47]=Real)
+ 135  Cast            47    0   0                          0  r[47]=CAST(r[47] AS Real)
  136  Multiply        47   48  46                          0  r[46]=r[47]*r[48]
  137  Divide          46   33  30                          0  r[30]=r[46]/r[33]
  138  Copy            37   50   0                          0  r[50]=r[37]
- 139  Cast            50    0   0                          0  affinity(r[50]=Real)
+ 139  Cast            50    0   0                          0  r[50]=CAST(r[50] AS Real)
  140  Multiply        50   48  49                          0  r[49]=r[50]*r[48]
  141  Divide          49   38  31                          0  r[31]=r[49]/r[38]
  142  ResultRow       26    6   0                          0  output=r[26..31]

@@ -1037,7 +1037,9 @@ fn get_subquery_parser<'a>(
                                         name: "NUMERIC".to_string(),
                                         size: None,
                                         array_dimensions: 0,
-                                        resolved: None,
+                                        resolved: Some(crate::dialect::types::type_of_affinity(
+                                            crate::vdbe::affinity::Affinity::Numeric,
+                                        )),
                                     }),
                                 )),
                             )),

@@ -754,7 +754,7 @@ fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
     let name = crate::util::dequote(&type_name.name);
     let scalar = match custom_cast_target(&name, type_name, schema) {
         Some(custom) => custom,
-        None => match Affinity::of_written_type(&name) {
+        None => match crate::dialect::types::dialect_type(type_name).comparison_affinity() {
             // A CAST to BLOB always gives a blob.
             Affinity::Blob => ExprType::Builtin(BuiltinType::Blob),
             affinity @ (Affinity::Integer
@@ -1794,11 +1794,19 @@ mod tests {
     }
 
     fn array_of(name: &str, dimensions: u32) -> ast::Type {
+        let affinity = match name {
+            "INTEGER" => Some(Affinity::Integer),
+            "REAL" => Some(Affinity::Real),
+            "TEXT" => Some(Affinity::Text),
+            "BLOB" => Some(Affinity::Blob),
+            "numeric" => Some(Affinity::Numeric),
+            _ => None,
+        };
         ast::Type {
             name: name.to_string(),
             size: None,
             array_dimensions: dimensions,
-            resolved: None,
+            resolved: affinity.map(crate::dialect::types::type_of_affinity),
         }
     }
 

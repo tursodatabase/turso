@@ -1565,10 +1565,14 @@ pub enum Insn {
         func: FuncCtx,      // P4
     },
 
-    /// Cast register P1 to affinity P2 and store in register P1
+    /// Replaces the value in `reg` with what a cast of it to the type `to`
+    /// gives. `from` is the type of the value, when the dialect knows it.
+    /// NULL is left as it is.
     Cast {
         reg: usize,
-        affinity: Affinity,
+        to: Arc<dyn crate::dialect::types::DialectType>,
+        from: Option<Arc<dyn crate::dialect::types::DialectType>>,
+        context: crate::dialect::types::CastContext,
     },
 
     InitCoroutine {
