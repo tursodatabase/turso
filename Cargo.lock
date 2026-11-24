@@ -7378,6 +7378,7 @@ dependencies = [
 name = "turso_pg_catalog"
 version = "0.9.0-pre.6"
 dependencies = [
+ "turso_core",
  "turso_pg_catalog_gen",
 ]
 
