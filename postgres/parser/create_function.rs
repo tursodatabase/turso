@@ -580,6 +580,10 @@ fn classify_type(type_name: &TypeName) -> Result<TypeClass, ParseError> {
 /// Whether PostgreSQL has an array type of the built-in type `name`: of the
 /// base types in [`BASE_TYPES`], and of the pseudo-types only `record` and
 /// `cstring`.
+// FIXME(pg-catalog): which built-in types have an array type, and that the
+// array type of `x` is named `_x` (the rule `classify_type` uses for `_int4`),
+// were copied by hand from the typarray and typname columns of PostgreSQL 18's
+// pg_type. A lookup of pg_type.typarray replaces this.
 fn has_array_type(name: &str) -> bool {
     BASE_TYPES.contains(&name) || matches!(name, "record" | "cstring")
 }
