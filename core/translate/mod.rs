@@ -218,10 +218,12 @@ fn new_program_builder(
     Ok(builder)
 }
 
-/// Builds the program of a statement. [ProgramBuilder::build] takes the builder
-/// as a value, so the builder leaves its box here. This function is not
-/// inlined, so that the builder is in the stack frame of this function, and not
-/// in the frame of [translate].
+/// Builds the program of a statement or of a nested trigger.
+/// [ProgramBuilder::build] takes the builder as a value, so the builder leaves
+/// its box here. This function is not inlined, so that the builder is in the
+/// stack frame of this function, and not in the frame of its caller. The
+/// compilation of nested triggers recurses one time for each level, so the
+/// builder must not be in the frame of the code that recurses.
 #[inline(never)]
 fn build_program(
     builder: DynBox<ProgramBuilder>,

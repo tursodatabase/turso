@@ -1,4 +1,4 @@
-use crate::alloc::{DynBox, TursoBoxExt};
+use crate::alloc::DynBox;
 use crate::ast::{self, Expr, TriggerEvent, TriggerTime};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{BTreeTable, Column, Trigger};
@@ -10,6 +10,7 @@ use crate::translate::subquery::{
     emit_non_from_clause_subquery, plan_subqueries_in_expr_without_from_clause,
 };
 use crate::translate::{
+    build_program,
     emitter::Resolver,
     expr::{self, expr_type::column_custom_type_names, translate_expr, walk_expr_mut},
     planner::ROWID_STRS,
@@ -606,7 +607,8 @@ fn execute_trigger_commands(
         Ok(())
     })?;
     subprogram_builder.epilogue(resolver.schema());
-    let built_subprogram = build_trigger_program(subprogram_builder, connection)?;
+    let built_subprogram =
+        build_program(subprogram_builder, connection, true, "trigger subprogram")?;
     let subprogram_prepared = built_subprogram.prepared();
 
     // Trigger subprograms do not emit Transaction opcodes, so the parent statement
@@ -695,16 +697,6 @@ fn new_trigger_program_builder(
         DynBox::try_new_in(builder, alloc)
     )?;
     Ok(builder)
-}
-
-/// Builds the program of a nested trigger. The builder leaves its box here, so
-/// that it is not in the stack frame of [execute_trigger_commands].
-#[inline(never)]
-fn build_trigger_program(
-    builder: DynBox<ProgramBuilder>,
-    connection: &Arc<crate::Connection>,
-) -> Result<crate::vdbe::Program> {
-    TursoBoxExt::into_inner(builder).build(connection, true, "trigger subprogram")
 }
 
 /// Check if there are any triggers for a given event (regardless of time).
