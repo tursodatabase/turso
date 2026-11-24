@@ -39,7 +39,7 @@ pub(super) fn format_f64(value: f64) -> String {
     buffer.format(value).to_string()
 }
 
-pub(super) fn encode_bytea(value: &[u8], array: bool) -> String {
+pub(crate) fn encode_bytea(value: &[u8], array: bool) -> String {
     let mut out = String::new();
     // for a bytea_array, the bytes are enclosed in quotes,
     // and \x is escaped

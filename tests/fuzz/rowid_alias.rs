@@ -9,7 +9,7 @@ use sql_generation::{
         table::{Column, ColumnType, Table},
     },
 };
-use turso_parser::ast::ColumnConstraint;
+use turso_core::ast::ColumnConstraint;
 
 fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
     let seed = if let Ok(seed_str) = std::env::var("FUZZ_SEED") {

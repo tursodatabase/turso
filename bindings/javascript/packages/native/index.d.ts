@@ -184,7 +184,8 @@ export declare const enum EncryptionCipher {
   Aegis256x2 = 3,
   Aegis128l = 4,
   Aegis128x2 = 5,
-  Aegis128x4 = 6
+  Aegis128x4 = 6,
+  Aegis256x4 = 7
 }
 
 /** Encryption configuration for local database encryption. */
@@ -202,7 +203,7 @@ export interface QueryOptions {
 export interface TableColumn {
   name: string
   type?: string | null
-  column?: undefined
-  table?: undefined
-  database?: undefined
+  column?: string | null
+  table?: string | null
+  database?: string | null
 }

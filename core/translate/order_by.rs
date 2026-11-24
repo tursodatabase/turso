@@ -2,12 +2,13 @@ use crate::translate::expr_context::ExprContext;
 use crate::{alloc::TursoVecExt, sync::Arc};
 
 use crate::alloc::*;
-use turso_parser::ast::{self, SortOrder};
+use crate::ast::{self, SortOrder};
 
 use crate::{
     emit_explain,
     schema::{Index, IndexColumn, PseudoCursorType, Schema},
     translate::{collate::CollationSeq, group_by::is_orderby_agg_or_const, plan::Aggregate},
+    turso_assert,
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -19,7 +20,7 @@ use crate::{
 use super::{
     emitter::{Resolver, TranslateCtx},
     expr::translate_expr,
-    plan::{Distinctness, ResultSetColumn, SelectPlan, TableReferences},
+    plan::{DistinctOnRegisters, Distinctness, ResultSetColumn, SelectPlan, TableReferences},
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
@@ -91,11 +92,7 @@ impl EmitOrderBy {
         program: &mut ProgramBuilder,
         t_ctx: &mut TranslateCtx,
         result_columns: &[ResultSetColumn],
-        order_by: &[(
-            Box<ast::Expr>,
-            SortOrder,
-            Option<turso_parser::ast::NullsOrder>,
-        )],
+        order_by: &[(Box<ast::Expr>, SortOrder, Option<crate::ast::NullsOrder>)],
         referenced_tables: &TableReferences,
         has_group_by: bool,
         has_distinct: bool,
@@ -304,9 +301,16 @@ impl EmitOrderBy {
             sort_cursor
         };
 
-        program.preassign_label_to_next_insn(sort_loop_start_label);
+        let distinct_on = match plan.distinctness {
+            Distinctness::DistinctOn { key_count } => {
+                turso_assert!(!use_heap_sort, "DISTINCT ON reads its rows from a sorter");
+                emit_explain!(program, false, EqpDetail::DistinctOn);
+                Some(DistinctOnRegisters::alloc(program, key_count))
+            }
+            _ => None,
+        };
 
-        emit_offset(program, sort_loop_next_label, t_ctx.reg_offset);
+        program.preassign_label_to_next_insn(sort_loop_start_label);
 
         if !use_heap_sort {
             program.emit_insn(Insn::SorterData {
@@ -315,6 +319,28 @@ impl EmitOrderBy {
                 pseudo_cursor: cursor_id,
             });
         }
+
+        if let (Some(distinct_on), Distinctness::DistinctOn { key_count }) =
+            (&distinct_on, &plan.distinctness)
+        {
+            for i in 0..*key_count {
+                program.emit_column_or_rowid(cursor_id, i, distinct_on.reg_key_start + i);
+            }
+            let mut key_collations = std::vec::Vec::with_capacity(*key_count);
+            for (expr, _, _) in &plan.order_by[..*key_count] {
+                key_collations.push(
+                    ExprContext::new(Some(&plan.table_references), &t_ctx.resolver)
+                        .expr_collation(expr)?,
+                );
+            }
+            distinct_on.emit_skip_unless_first_row_of_group(
+                program,
+                key_collations,
+                sort_loop_next_label,
+            );
+        }
+
+        emit_offset(program, sort_loop_next_label, t_ctx.reg_offset);
 
         // We emit the columns in SELECT order, not sorter order (sorter always has the sort keys first).
         // This is tracked in sort_metadata.remappings.
@@ -337,16 +363,17 @@ impl EmitOrderBy {
                     &plan.table_references,
                     t_ctx.resolver.schema(),
                 ) {
-                    if let Some(decode_expr) = type_def.decode() {
+                    if let Some(decode) = type_def.decode() {
                         let skip_label = program.allocate_label();
                         program.emit_insn(Insn::IsNull {
                             reg,
                             target_pc: skip_label,
                         });
-                        super::expr::emit_type_expr(
+                        super::expr::emit_conversion(
                             program,
-                            decode_expr,
-                            reg,
+                            &type_def,
+                            "DECODE",
+                            decode,
                             reg,
                             &t_ctx.resolver,
                         )?;
@@ -681,11 +708,7 @@ pub struct OrderByRemapping {
 /// If we skip a result column, we need to keep track what index in the ORDER BY sorter the result columns have,
 /// because the result columns should be emitted in the SELECT clause order, not the ORDER BY clause order.
 pub fn order_by_deduplicate_result_columns(
-    order_by: &[(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )],
+    order_by: &[(Box<ast::Expr>, SortOrder, Option<crate::ast::NullsOrder>)],
     result_columns: &[ResultSetColumn],
     has_sequence: bool,
 ) -> Result<Vec<OrderByRemapping>> {

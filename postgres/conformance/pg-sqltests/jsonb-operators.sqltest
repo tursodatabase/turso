@@ -1,0 +1,288 @@
+# The jsonb operators -> and ->>. The Data API turns a filter on a jsonb
+# field into `data ->> 'field' = 'value'`.
+#
+# -> returns the field as JSON text, and ->> returns it as text: a string has
+# no quotes, a number is written as jsonb writes it (`1e2` as `100`), a
+# boolean is `true` or `false`, and a JSON null is NULL. A text key is the
+# name of a field, not a JSON path, and of two fields with the same name the
+# last one counts.
+
+@database :memory:
+
+setup items_with_jsonb_rows {
+    CREATE TABLE items (id int PRIMARY KEY, data jsonb);
+    INSERT INTO items VALUES
+        (1, '{"name":"apple","price":1.50,"qty":10,"active":true,"tags":["fruit","red"],"dims":{"w":3,"h":4}}'),
+        (2, '{"name":"bread","price":2,"qty":2,"active":false,"tags":["bakery"],"dims":{"w":20,"h":10},"note":null}'),
+        (3, '[1,2,3]'),
+        (4, NULL);
+}
+
+# ->>
+
+@setup items_with_jsonb_rows
+test jsonb-text-arrow-returns-scalars-as-text {
+    SELECT id, data ->> 'qty', data ->> 'price', data ->> 'active' FROM items WHERE id <= 2 ORDER BY id;
+}
+expect {
+    1|10|1.50|true
+    2|2|2|false
+}
+
+@setup items_with_jsonb_rows
+test jsonb-text-arrow-of-integer-equals-text {
+    SELECT id FROM items WHERE data ->> 'qty' = '2';
+}
+expect {
+    2
+}
+
+@setup items_with_jsonb_rows
+test jsonb-text-arrow-of-decimal-keeps-its-digits {
+    SELECT id FROM items WHERE data ->> 'price' = '1.50';
+}
+expect {
+    1
+}
+
+@setup items_with_jsonb_rows
+test jsonb-text-arrow-of-boolean-equals-true {
+    SELECT id FROM items WHERE data ->> 'active' = 'true';
+}
+expect {
+    1
+}
+
+# A text comparison: '2' > '19' because '2' > '1'. A numeric comparison
+# would return no rows.
+@setup items_with_jsonb_rows
+test jsonb-text-arrow-compares-as-text {
+    SELECT id FROM items WHERE data ->> 'qty' > '19';
+}
+expect {
+    2
+}
+
+@setup items_with_jsonb_rows
+test jsonb-text-arrow-in-text-list {
+    SELECT id FROM items WHERE data ->> 'qty' IN ('2', '3') ORDER BY id;
+}
+expect {
+    2
+}
+
+@setup items_with_jsonb_rows
+test jsonb-text-arrow-of-nested-field {
+    SELECT id FROM items WHERE data -> 'dims' ->> 'w' = '20';
+}
+expect {
+    2
+}
+
+@setup items_with_jsonb_rows
+test jsonb-text-arrow-of-array-element {
+    SELECT id FROM items WHERE data ->> 1 = '2';
+}
+expect {
+    3
+}
+
+# ->> writes a number as jsonb stores it, with the scale that numeric reads.
+test jsonb-text-arrow-writes-numbers-as-numeric-does {
+    SELECT '{"a":-0}'::jsonb ->> 'a', '{"a":0e0}'::jsonb ->> 'a', '{"a":2e-3}'::jsonb ->> 'a', '[-0]'::jsonb ->> 0, '{"a":1E+2}'::jsonb ->> 'a', '{"a":12.50e1}'::jsonb ->> 'a', '{"a":-0.0}'::jsonb ->> 'a', '{"a":0e-3}'::jsonb ->> 'a', '{"a":-1.5e-1}'::jsonb ->> 'a', '{"a":100e-2}'::jsonb ->> 'a';
+}
+expect {
+    0|0|0.002|0|100|125.0|0.0|0.000|-0.15|1.00
+}
+
+test jsonb-text-arrow-of-number-past-the-limits-of-numeric-errors {
+    SELECT '{"a":1e-20000}'::jsonb ->> 'a';
+}
+@sqlstate 22003
+expect error {}
+
+test jsonb-text-arrow-key-is-a-field-name-not-a-path {
+    SELECT '{"$.a":1,"a":2}'::jsonb ->> '$.a', '{"a.b":3,"a":{"b":4}}'::jsonb ->> 'a.b';
+}
+expect {
+    1|3
+}
+
+test jsonb-arrows-take-the-last-of-two-equal-keys {
+    SELECT '{"a":1,"a":2}'::jsonb ->> 'a', '{"a":1,"a":2}'::jsonb -> 'a';
+}
+expect {
+    2|2
+}
+
+test jsonb-text-arrow-in-check-constraint {
+    CREATE TABLE stock (data jsonb CHECK (data ->> 'qty' <> '0'));
+    INSERT INTO stock VALUES ('{"qty":2}');
+    INSERT INTO stock VALUES ('{"qty":0}');
+}
+@sqlstate 23514
+expect error {}
+
+test jsonb-text-arrow-of-invalid-json-errors {
+    SELECT 'not json'::jsonb ->> 'a';
+}
+@sqlstate 22P02
+expect error {}
+
+test arrow-on-integer-errors {
+    SELECT 5 -> 'a';
+}
+@sqlstate 42883
+expect error {}
+
+@setup items_with_jsonb_rows
+test jsonb-arrow-returns-json-text {
+    SELECT data -> 'name', data -> 'tags', data -> 'qty', data -> 'note' FROM items WHERE id = 2;
+}
+expect {
+    "bread"|["bakery"]|2|null
+}
+
+test jsonb-text-arrow-of-string-has-no-quotes-or-escapes {
+    SELECT '{"a":"x\"yé"}'::jsonb ->> 'a';
+}
+expect {
+    x"yé
+}
+
+@setup items_with_jsonb_rows
+test jsonb-text-arrow-of-json-null-is-null {
+    SELECT coalesce(data ->> 'note', 'sql null') FROM items WHERE id = 2;
+}
+expect {
+    sql null
+}
+
+@setup items_with_jsonb_rows
+test jsonb-arrows-with-negative-index-count-from-the-end {
+    SELECT data ->> -1, data -> -3, data ->> 3, data ->> -4 FROM items WHERE id = 3;
+}
+expect {
+    3|1||
+}
+
+# A name on an array and an index on an object find nothing.
+@setup items_with_jsonb_rows
+test jsonb-arrows-with-key-of-the-wrong-kind-are-null {
+    SELECT (SELECT count(*) FROM items WHERE data -> 0 IS NULL), (SELECT count(*) FROM items WHERE data ->> 'name' IS NULL);
+}
+expect {
+    3|2
+}
+
+@setup items_with_jsonb_rows
+test jsonb-arrows-with-null-key-are-null {
+    SELECT count(*) FROM items WHERE data -> NULL::text IS NULL AND data ->> NULL::int IS NULL;
+}
+expect {
+    4
+}
+
+test jsonb-arrow-of-input-nested-1000-levels {
+    SELECT length(((repeat('[', 1000) || repeat(']', 1000))::jsonb -> 0)::text);
+}
+expect {
+    1998
+}
+
+test jsonb-arrow-of-deeply-nested-input-errors {
+    SELECT (repeat('[', 50000) || repeat(']', 50000))::jsonb -> 0;
+}
+@sqlstate 54001
+expect error {}
+
+test jsonb-text-arrow-of-nul-escape-errors {
+    SELECT '{"a":"\u0000"}'::jsonb ->> 'a';
+}
+@sqlstate 22P05
+expect error {}
+
+# The lookup decodes every string of the document, not only the field that it
+# returns, as PostgreSQL does.
+test jsonb-arrow-of-nul-escape-in-another-field-errors {
+    SELECT '{"b":"\u0000","a":1}'::json -> 'a';
+}
+@sqlstate 22P05
+expect error {}
+
+test jsonb-arrow-of-lone-surrogate-in-another-element-errors {
+    SELECT '["\ud83d",1]'::json -> 1;
+}
+@sqlstate 22P02
+expect error {}
+
+test jsonb-arrow-with-numeric-key-errors {
+    SELECT '[1]'::jsonb -> 1.5;
+}
+@sqlstate 42883
+expect error {}
+
+test bytea-arrow-errors {
+    SELECT '\x01'::bytea -> 'a';
+}
+@sqlstate 42883
+expect error {}
+
+# PostgreSQL roles belong to the whole server, so the test uses its own role
+# and table names.
+test jsonb-text-arrow-in-row-security-policy {
+    CREATE ROLE jo_reader_1;
+    CREATE TABLE jo_docs_1 (id int PRIMARY KEY, data jsonb);
+    INSERT INTO jo_docs_1 VALUES (1, '{"owner":"jo_reader_1","level":1}'), (2, '{"owner":"jo_reader_1","level":2}'), (3, '{"owner":"other","level":1}');
+    GRANT SELECT ON jo_docs_1 TO jo_reader_1;
+    ALTER TABLE jo_docs_1 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY jo_own_1 ON jo_docs_1 FOR SELECT USING (data ->> 'owner' = current_user AND data ->> 'level' = '1');
+    SET ROLE jo_reader_1;
+    SELECT id FROM jo_docs_1;
+    RESET ROLE;
+}
+expect {
+    1
+}
+
+# An index expression can use only core functions, and -> and ->> run
+# functions of the PostgreSQL frontend.
+
+# TODO let expression indexes use frontend functions
+@setup items_with_jsonb_rows
+@skip-if postgres "Expression indexes can't use functions from frontends yet"
+test jsonb-text-arrow-in-index-expression-errors {
+    CREATE INDEX items_qty ON items ((data ->> 'qty'));
+}
+@sqlstate 0A000
+expect error {}
+
+# TODO let expression indexes use frontend functions
+@setup items_with_jsonb_rows
+@skip-if postgres "Expression indexes can't use functions from frontends yet"
+test jsonb-arrow-in-partial-index-errors {
+    CREATE INDEX items_dims ON items (id) WHERE data -> 'dims' IS NOT NULL;
+}
+@sqlstate 0A000
+expect error {}
+
+# A generation expression can use only core functions too. The column reads a
+# text column, because a generated column cannot read a column of a custom
+# type such as jsonb.
+
+# TODO let generated columns use frontend functions
+@skip-if postgres "Generated columns can't use functions from frontends yet"
+test jsonb-text-arrow-in-generated-column-errors {
+    CREATE TABLE gen_items (data text, name text GENERATED ALWAYS AS (data::jsonb ->> 'name') STORED);
+}
+@sqlstate 0A000
+expect error {}
+
+# TODO let generated columns use frontend functions
+@skip-if postgres "Generated columns can't use functions from frontends yet"
+test jsonb-arrow-in-added-generated-column-errors {
+    CREATE TABLE gen_items_2 (data text);
+    ALTER TABLE gen_items_2 ADD COLUMN dims text GENERATED ALWAYS AS (data::jsonb -> 'dims') STORED;
+}
+@sqlstate 0A000
+expect error {}

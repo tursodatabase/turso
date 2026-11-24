@@ -1,4 +1,5 @@
 use crate::common::TempDatabase;
+use std::sync::Arc;
 use turso_core::Value;
 
 #[turso_macros::test(mvcc)]
@@ -304,6 +305,59 @@ fn catalogs_report_the_same_objects_after_open_and_after_the_schema_is_read_agai
     assert_eq!(after_open, after_reading_again);
 }
 
+/// Every user table needs a row in the classes table. A file where one is
+/// missing is corrupt: open must fail, and so must a reload.
+#[test]
+fn a_table_without_a_class_row_fails_the_load_at_open_and_when_the_schema_is_read_again() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE docs (id int)").unwrap();
+    conn.inner()
+        .prepare_engine_schema_statement(
+            "DELETE FROM __turso_internal_classes WHERE relname = 'docs'",
+        )
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+    let expected = format!(
+        "relation \"docs\" of namespace {} has no row in __turso_internal_classes",
+        public_namespace(&conn)
+    );
+
+    let error = conn
+        .inner()
+        .force_reparse_schema_without_publish()
+        .unwrap_err();
+    assert!(
+        matches!(&error, turso_core::LimboError::Corrupt(message) if *message == expected),
+        "{error:?}"
+    );
+
+    conn.close().unwrap();
+    drop(conn);
+    let TempDatabase { path, io, db } = db;
+    drop(db);
+    let Err(error) = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new().with_encryption(true),
+    ) else {
+        panic!("a database with a table that has no class row opened");
+    };
+    assert!(error.to_string().contains(&expected), "{error}");
+}
+
+/// The id of the namespace of the schema `public`.
+fn public_namespace(conn: &turso_pg::Connection) -> u32 {
+    conn.inner().with_schema(turso_core::MAIN_DB_ID, |schema| {
+        schema
+            .namespace_named("public")
+            .expect("a PostgreSQL database has the schema public")
+            .as_u32()
+    })
+}
+
 /// What the catalogs report about schemas, relations, sequences, types and
 /// roles.
 fn catalog_rows(conn: &turso_pg::Connection) -> Vec<Vec<Value>> {
@@ -321,4 +375,106 @@ fn catalog_rows(conn: &turso_pg::Connection) -> Vec<Vec<Value>> {
         rows.extend(stmt.run_collect_rows().unwrap());
     }
     rows
+}
+
+/// How the database of
+/// [`a_schema_a_role_and_a_table_are_present_after_open`] is stored when it
+/// is opened again.
+#[derive(Debug, Clone, Copy)]
+enum StoredAs {
+    /// Without MVCC.
+    Wal,
+    /// With MVCC, and the rows are only in the logical log. Opening replays
+    /// them, and the tables that the open reads have no pages yet.
+    MvccLogicalLog,
+    /// With MVCC, and a checkpoint wrote the rows to the database file.
+    MvccCheckpointed,
+}
+
+/// Opening reads the names of the schemas and then the dialect's own tables
+/// with statements. The second read must see the schemas of the first.
+#[test]
+fn a_schema_a_role_and_a_table_are_present_after_open() {
+    for stored_as in [
+        StoredAs::Wal,
+        StoredAs::MvccLogicalLog,
+        StoredAs::MvccCheckpointed,
+    ] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("main.db");
+        let open = || {
+            let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+            let file = io
+                .open_file(
+                    path.to_str().unwrap(),
+                    turso_core::OpenFlags::default(),
+                    true,
+                )
+                .unwrap();
+            let options = turso_core::OpenOptions::new(Arc::new(turso_pg::PostgresDialect))
+                .storage(Arc::new(turso_core::storage::database::DatabaseFile::new(
+                    file,
+                )))
+                .db_opts(
+                    turso_core::DatabaseOpts::new().with_mvcc(!matches!(stored_as, StoredAs::Wal)),
+                );
+            let mut state = turso_pg::OpenDatabaseState::default();
+            let db = loop {
+                match turso_pg::open_database_async(
+                    &mut state,
+                    io.clone(),
+                    path.to_str().unwrap(),
+                    &options,
+                    turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser),
+                )
+                .unwrap()
+                {
+                    turso_core::IOResult::Done(db) => break db,
+                    turso_core::IOResult::IO(completions) => {
+                        completions.wait(io.as_ref()).unwrap();
+                    }
+                }
+            };
+            turso_pg::Connection::connect(&db).unwrap()
+        };
+        {
+            let conn = open();
+            conn.execute("CREATE SCHEMA app").unwrap();
+            conn.execute("CREATE ROLE alice").unwrap();
+            conn.execute("CREATE TABLE app.docs (id int PRIMARY KEY)")
+                .unwrap();
+            conn.execute("ALTER TABLE app.docs OWNER TO alice").unwrap();
+            if matches!(stored_as, StoredAs::MvccCheckpointed) {
+                conn.inner()
+                    .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .unwrap();
+            }
+        }
+        let log_size = std::fs::metadata(path.with_extension("db-log")).map(|log| log.len());
+        match stored_as {
+            StoredAs::Wal => assert!(log_size.is_err(), "{stored_as:?}"),
+            StoredAs::MvccLogicalLog => assert!(log_size.unwrap() > 0, "{stored_as:?}"),
+            StoredAs::MvccCheckpointed => assert_eq!(log_size.unwrap(), 0, "{stored_as:?}"),
+        }
+
+        let conn = open();
+
+        let mut stmt = conn
+            .query(
+                "SELECT schemaname, tablename, tableowner FROM pg_tables WHERE schemaname = 'app'",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![
+                Value::build_text("app"),
+                Value::build_text("docs"),
+                Value::build_text("alice"),
+            ]],
+            "{stored_as:?}"
+        );
+        conn.execute("SET ROLE alice").unwrap();
+        conn.execute("INSERT INTO app.docs VALUES (1)").unwrap();
+    }
 }

@@ -9,7 +9,9 @@ use super::{
         WhereTerm, WhereTermOrigin,
     },
 };
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TursoIteratorExt, TursoVecExt};
+use crate::ast::RefAct;
+use crate::ast::{self, Expr, SortOrder, SubqueryType, TableInternalId, TriggerEvent};
 use crate::schema::GeneratedType;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::{table_mask_from_expr, TableMask};
@@ -37,7 +39,7 @@ use crate::{
             },
             cost::RowCountEstimate,
             multi_index::{MultiIndexBranchAccessParams, MultiIndexBranchParams},
-            order::{ColumnTarget, OrderTarget},
+            order::OrderTarget,
         },
         plan::{
             DmlSafetyReason, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
@@ -80,8 +82,6 @@ use std::{
     sync::Arc,
 };
 use turso_ext::{ConstraintInfo, ConstraintUsage};
-use turso_parser::ast::RefAct;
-use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TableInternalId, TriggerEvent};
 
 pub(crate) mod access_method;
 pub(crate) mod constraints;
@@ -300,11 +300,7 @@ fn try_match_index_method_pattern(
     pattern: &ast::Select,
     table: &JoinedTable,
     query_where_terms: &[WhereTerm],
-    order_by: &[(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )],
+    order_by: &[(Box<ast::Expr>, SortOrder, Option<crate::ast::NullsOrder>)],
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
     pattern_idx: usize,
@@ -528,11 +524,7 @@ fn collect_index_method_candidates(
     table_references: &TableReferences,
     available_indexes: &AvailableIndexes,
     where_clause: &[WhereTerm],
-    order_by: &[(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )],
+    order_by: &[(Box<ast::Expr>, SortOrder, Option<crate::ast::NullsOrder>)],
     group_by: &Option<GroupBy>,
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
@@ -1022,6 +1014,12 @@ fn optimize_select_plan_with_cache(
     if !unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)? {
         return optimize_select_plan_form(plan, resolver, cache);
     }
+    // The join limit counts only the tables of the FROM clause, as in SQLite.
+    // When the rewrite moves subquery tables into the join past that limit,
+    // run the subqueries in their correlated form instead.
+    if rewritten.table_references.joined_tables().len() > TableReferences::MAX_JOINED_TABLES {
+        return optimize_select_plan_form(plan, resolver, cache);
+    }
 
     #[cfg(feature = "simulator")]
     if resolver.subquery_unnesting_mode() == crate::SubqueryUnnestingMode::Forced {
@@ -1081,7 +1079,11 @@ fn optimize_select_plan_form(
 /// SQLite removes DISTINCT in the same cases.
 fn distinct_is_redundant(plan: &SelectPlan, resolver: &Resolver) -> Result<bool> {
     let exprs: Vec<&ast::Expr> = match plan.aggregates.as_slice() {
-        [] if plan.distinctness.is_distinct() && plan.group_by.is_none() => {
+        [] if matches!(
+            plan.distinctness,
+            super::plan::Distinctness::Distinct { .. }
+        ) && plan.group_by.is_none() =>
+        {
             plan.result_columns.iter().map(|col| &col.expr).collect()
         }
         [agg] if agg.is_distinct() => plan
@@ -1197,6 +1199,7 @@ fn find_select_plan_form(
     }
 
     plan.simple_aggregate = detect_simple_aggregate(plan, resolver)?;
+    let distinct_on_order_by = order_by_of_distinct_on(plan);
     let mut table_plan = find_table_access_plan(
         schema,
         resolver,
@@ -1216,6 +1219,7 @@ fn find_select_plan_form(
         // comes between.
         !plan.distinctness.is_distinct() && plan.aggregates.is_empty(),
     )?;
+    keep_distinct_on_if_order_by_was_removed(plan, distinct_on_order_by);
 
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
         && !table_plan
@@ -1358,6 +1362,7 @@ fn apply_select_table_plan(
         return Ok(());
     };
     mark_distinct_ordered(plan, &table_plan, resolver)?;
+    let distinct_on_order_by = order_by_of_distinct_on(plan);
     plan.join_order = apply_table_access_plan(
         resolver,
         &mut plan.table_references,
@@ -1366,6 +1371,7 @@ fn apply_select_table_plan(
         &mut plan.group_by,
         table_plan,
     )?;
+    keep_distinct_on_if_order_by_was_removed(plan, distinct_on_order_by);
     Ok(())
 }
 
@@ -1399,6 +1405,42 @@ fn mark_distinct_ordered(
     distinctness.set_ordered(ordered);
     Ok(())
 }
+
+fn order_by_of_distinct_on(plan: &SelectPlan) -> Option<OrderBy> {
+    matches!(
+        plan.distinctness,
+        super::plan::Distinctness::DistinctOn { .. }
+    )
+    .then(|| plan.order_by.clone())
+}
+
+/// The optimizer removes ORDER BY when the rows already arrive in that order. DISTINCT ON then
+/// compares neighboring rows as they are read. Rows that leave a window function no longer
+/// have the values of a key outside the select list, so such a query keeps its sort.
+fn keep_distinct_on_if_order_by_was_removed(plan: &mut SelectPlan, order_by: Option<OrderBy>) {
+    let (Some(order_by), super::plan::Distinctness::DistinctOn { key_count }) =
+        (order_by, &plan.distinctness)
+    else {
+        return;
+    };
+    if !plan.order_by.is_empty() {
+        return;
+    }
+    if plan.window.is_some() {
+        plan.order_by = order_by;
+        return;
+    }
+    plan.distinctness = super::plan::Distinctness::DistinctOnRowsInOrder {
+        keys: order_by
+            .into_iter()
+            .take(*key_count)
+            .map(|(expr, _, _)| *expr)
+            .collect(),
+        registers: None,
+    };
+}
+
+type OrderBy = Vec<(Box<ast::Expr>, SortOrder, Option<crate::ast::NullsOrder>)>;
 
 fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()> {
     let schema = resolver.schema();
@@ -1612,10 +1654,7 @@ fn update_write_set_reason(
 
         // REPLACE mode requires ephemeral table because REPLACE deletes conflicting rows,
         // which can corrupt the iteration order when iterating via an index.
-        if matches!(
-            plan.or_conflict,
-            Some(turso_parser::ast::ResolveType::Replace)
-        ) {
+        if matches!(plan.or_conflict, Some(crate::ast::ResolveType::Replace)) {
             break 'requires Some(DmlSafetyReason::ReplaceMode);
         }
 
@@ -1650,11 +1689,11 @@ fn update_write_set_reason(
 
 fn collect_subquery_ids_from_exprs<'a>(
     exprs: impl IntoIterator<Item = &'a ast::Expr>,
-) -> Result<BitSet<turso_parser::ast::TableInternalId>> {
+) -> Result<BitSet<crate::ast::TableInternalId>> {
     use crate::translate::expr::walk_expr;
     use crate::translate::expr::WalkControl;
 
-    let mut ids = BitSet::<turso_parser::ast::TableInternalId>::default();
+    let mut ids = BitSet::<crate::ast::TableInternalId>::default();
     let mut collector = |e: &ast::Expr| -> Result<WalkControl> {
         if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
             ids.set(*subquery_id)?;
@@ -1672,7 +1711,7 @@ fn collect_subquery_ids_from_exprs<'a>(
 /// not be moved to the ephemeral plan (which only collects rowids).
 fn collect_update_phase_subquery_ids(
     plan: &UpdatePlan,
-) -> Result<BitSet<turso_parser::ast::TableInternalId>> {
+) -> Result<BitSet<crate::ast::TableInternalId>> {
     let mut ids = collect_subquery_ids_from_exprs(
         plan.set_clauses
             .iter()
@@ -2018,11 +2057,7 @@ fn optimize_table_access_with_custom_modules(
     available_indexes: &AvailableIndexes,
     subqueries: &[NonFromClauseSubquery],
     where_query: &mut [WhereTerm],
-    order_by: &mut Vec<(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )>,
+    order_by: &mut Vec<(Box<ast::Expr>, SortOrder, Option<crate::ast::NullsOrder>)>,
     group_by: &mut Option<GroupBy>,
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
@@ -2159,11 +2194,7 @@ fn optimize_table_access_with_custom_modules(
 fn register_index_expression_usages_for_plan(
     table_references: &mut TableReferences,
     result_columns: &[ResultSetColumn],
-    order_by: &[(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )],
+    order_by: &[(Box<ast::Expr>, SortOrder, Option<crate::ast::NullsOrder>)],
     group_by: Option<&GroupBy>,
     where_clause: &mut [WhereTerm],
 ) -> Result<()> {
@@ -2561,11 +2592,7 @@ fn optimize_table_access(
     table_references: &mut TableReferences,
     available_indexes: &AvailableIndexes,
     where_clause: &mut Vec<WhereTerm>,
-    order_by: &mut Vec<(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )>,
+    order_by: &mut Vec<(Box<ast::Expr>, SortOrder, Option<crate::ast::NullsOrder>)>,
     group_by: &mut Option<GroupBy>,
     simple_aggregate: Option<&SimpleAggregate>,
     subqueries: &[NonFromClauseSubquery],
@@ -2613,11 +2640,7 @@ fn find_table_access_plan(
     table_references: &mut TableReferences,
     available_indexes: &AvailableIndexes,
     where_clause: &mut Vec<WhereTerm>,
-    order_by: &mut Vec<(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )>,
+    order_by: &mut Vec<(Box<ast::Expr>, SortOrder, Option<crate::ast::NullsOrder>)>,
     group_by: &mut Option<GroupBy>,
     simple_aggregate: Option<&SimpleAggregate>,
     subqueries: &[NonFromClauseSubquery],
@@ -2639,7 +2662,7 @@ fn find_table_access_plan(
     }
     if table_references.joined_tables().len() > TableReferences::MAX_JOINED_TABLES {
         crate::bail_parse_error!(
-            "Only up to {} tables can be joined",
+            "at most {} tables in a join",
             TableReferences::MAX_JOINED_TABLES
         );
     }
@@ -3185,18 +3208,13 @@ fn operation_for_unmatched_right_rows(
                 resolver,
             )
         }
-        AccessMethodParams::VirtualTable {
-            idx_num,
-            idx_str,
-            constraints,
-            constraint_usages,
-        } => build_vtab_scan_op(
+        AccessMethodParams::VirtualTable(access) => build_vtab_scan_op(
             where_clause_for_unmatched_rows,
             table_constraints,
-            &idx_num,
-            &idx_str,
-            &constraints,
-            &constraint_usages,
+            &access.idx_num,
+            &access.idx_str,
+            &access.constraints,
+            &access.constraint_usages,
             Some(table_references),
             false,
         ),
@@ -3229,11 +3247,7 @@ fn apply_table_access_plan(
     resolver: &Resolver,
     table_references: &mut TableReferences,
     where_clause: &mut [WhereTerm],
-    order_by: &mut Vec<(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )>,
+    order_by: &mut Vec<(Box<ast::Expr>, SortOrder, Option<crate::ast::NullsOrder>)>,
     group_by: &mut Option<GroupBy>,
     plan: TableAccessPlan,
 ) -> Result<Vec<JoinOrderMember>> {
@@ -3437,12 +3451,6 @@ fn apply_table_access_plan(
                     )?));
                     *build_index = false;
                 }
-                maybe_remove_index_candidate(
-                    index,
-                    &table_references.joined_tables()[table_idx],
-                    maybe_order_target.as_ref(),
-                    sort_eliminated,
-                );
                 if constraint_refs.is_empty() {
                     if let Some(index) = partial_index(index.as_ref()) {
                         let is_outer_join = table_references.joined_tables()[table_idx]
@@ -3494,20 +3502,15 @@ fn apply_table_access_plan(
                     )?;
                 }
             }
-            AccessMethodParams::VirtualTable {
-                idx_num,
-                idx_str,
-                constraints,
-                constraint_usages,
-            } => {
+            AccessMethodParams::VirtualTable(access) => {
                 let table_id = table_references.joined_tables()[table_idx].internal_id;
                 table_references.joined_tables_mut()[table_idx].op = build_vtab_scan_op(
                     where_clause,
                     &constraints_per_table[table_idx],
-                    idx_num,
-                    idx_str,
-                    constraints,
-                    constraint_usages,
+                    &access.idx_num,
+                    &access.idx_str,
+                    &access.constraints,
+                    &access.constraint_usages,
                     Some(table_references),
                     table_references.outer_join_may_null_extend(table_id),
                 )?;
@@ -3591,7 +3594,7 @@ fn apply_table_access_plan(
                 }
                 // Set up the index method query operation
                 table_references.joined_tables_mut()[table_idx].op =
-                    Operation::IndexMethodQuery(query.clone());
+                    Operation::IndexMethodQuery(IndexMethodQuery::clone(query));
             }
             AccessMethodParams::MultiIndexScan {
                 branches,
@@ -3653,7 +3656,7 @@ fn apply_table_access_plan(
         .iter_mut()
         .zip(unmatched_right_rows_plans)
     {
-        table.unmatched_right_rows_plan = plan;
+        table.unmatched_right_rows_plan = plan.map(Box::new);
     }
 
     let mut probe_pos_by_table: Vec<Option<usize>> =
@@ -4031,47 +4034,6 @@ fn eliminate_constant_conditions(
     Ok(ConstantConditionEliminationResult::Continue)
 }
 
-/// Check if the order target collation matches index column collations.
-/// Only remove the index when sort elimination selected this plan.
-fn maybe_remove_index_candidate(
-    index: &mut Option<Arc<Index>>,
-    table_reference: &JoinedTable,
-    order_target: Option<&OrderTarget>,
-    sort_eliminated: bool,
-) {
-    if !sort_eliminated {
-        return;
-    }
-    if let Some((idx, order_target)) = index.as_mut().zip(order_target) {
-        for col_order in &order_target.columns {
-            // Only check columns from this table
-            if col_order.table_id != table_reference.internal_id {
-                continue;
-            }
-
-            // Find matching index column
-            let matching_idx_col = match &col_order.target {
-                ColumnTarget::Column(col_no) => {
-                    idx.columns.iter().find(|ic| ic.pos_in_table == *col_no)
-                }
-                ColumnTarget::RowId => {
-                    continue;
-                }
-                ColumnTarget::Expr(_expr) => {
-                    continue;
-                }
-            };
-
-            if let Some(idx_col) = matching_idx_col {
-                if col_order.collation != idx_col.collation {
-                    *index = None;
-                    return;
-                }
-            }
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlwaysTrueOrFalse {
     AlwaysTrue,
@@ -4421,28 +4383,29 @@ fn ephemeral_index_build(
     where_clause: &[WhereTerm],
     resolver: &Resolver<'_>,
 ) -> Result<Index> {
+    let make_index_column = |i: usize, c: &Column| {
+        let expr = match c.generated_type() {
+            GeneratedType::Virtual { .. } => c.generated_expr().cloned(),
+            GeneratedType::Stored { .. } | GeneratedType::NotGenerated => None,
+        };
+        IndexColumn {
+            name: c.name.clone().unwrap(),
+            order: SortOrder::Asc,
+            nulls_order: None,
+            pos_in_table: i,
+            collation: c.collation(),
+            explicit_collation: None,
+            default: c.default.clone(),
+            expr: expr.map(Box::new),
+        }
+    };
     let mut ephemeral_columns: crate::alloc::Vec<IndexColumn> = table_reference
         .columns()
         .iter()
         .enumerate()
         // Only copy columns that the query reads.
         .filter(|(index, _)| table_reference.column_is_used(*index))
-        .map(|(i, c)| {
-            let expr = match c.generated_type() {
-                GeneratedType::Virtual { .. } => c.generated_expr().cloned(),
-                GeneratedType::Stored { .. } | GeneratedType::NotGenerated => None,
-            };
-            IndexColumn {
-                name: c.name.clone().unwrap(),
-                order: SortOrder::Asc,
-                nulls_order: None,
-                pos_in_table: i,
-                collation: c.collation(),
-                explicit_collation: None,
-                default: c.default.clone(),
-                expr: expr.map(Box::new),
-            }
-        })
+        .map(|(i, c)| make_index_column(i, c))
         .try_collect()?;
     // sort so that constraints first, then rest in whatever order they were in in the table
     ephemeral_columns.sort_by(|a, b| {
@@ -4461,6 +4424,22 @@ fn ephemeral_index_build(
             (None, None) => Ordering::Equal,
         }
     });
+    // A WITHOUT ROWID table has no rowid to keep index entries distinct, so rows
+    // that agree on every column the query reads would collapse into one entry.
+    // Append the missing PRIMARY KEY columns so each row keeps a unique key.
+    if let Some(btree) = table_reference.table.btree().filter(|b| !b.has_rowid) {
+        for (pk_name, _) in btree.primary_key_columns.iter() {
+            let (pos, column) = btree.get_column(pk_name).ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "PRIMARY KEY column {pk_name} not found in table {}",
+                    btree.name
+                ))
+            })?;
+            if ephemeral_columns.iter().all(|c| c.pos_in_table != pos) {
+                ephemeral_columns.try_push(make_index_column(pos, column))?;
+            }
+        }
+    }
     let ephemeral_index = Index {
         name: format!(
             "ephemeral_{}_{}",
@@ -5014,10 +4993,10 @@ fn build_seek_def(
 #[cfg(test)]
 mod tests {
     use super::{where_term_rejects_null_row, Optimizable};
+    use crate::ast::{self, Expr, FunctionTail, Name, TableInternalId};
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
     use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
-    use turso_parser::ast::{self, Expr, FunctionTail, Name, TableInternalId};
 
     fn empty_resolver<'a>(
         schema: &'a Schema,
@@ -5036,7 +5015,7 @@ mod tests {
             syms,
             true,
             DoubleQuotedDml::Enabled,
-            crate::sync::Arc::new(crate::SqliteDialect),
+            crate::sync::Arc::new(crate::dialect::cannot_parse::DialectThatCannotParse),
             None,
             crate::security::roles::RoleId::SUPERUSER,
         )

@@ -937,3 +937,107 @@ snapshot-eqp cte-materialized-order-outer-beyond-cte {
     )
     SELECT * FROM ordered ORDER BY a ASC, b ASC;
 }
+
+# =============================================================================
+# FROM-CLAUSE SUBQUERY IN AN INNER LOOP
+# =============================================================================
+
+# A FROM-clause subquery that an outer join, a CROSS JOIN or an earlier
+# subquery keeps in an inner loop is stored in a table once, as SQLite does,
+# instead of running as a coroutine again for each outer row.
+
+setup watchlist_schema {
+    CREATE TABLE watchlist (type_id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE history_txt (type_id VARCHAR, price REAL);
+}
+
+# The INTEGER = TEXT comparison cannot seek an index on the subquery.
+@setup watchlist_schema
+snapshot left-join-subquery-without-seek-index-materialized {
+    SELECT count(*), sum(h.avgp)
+    FROM watchlist w
+    LEFT JOIN (
+        SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id
+    ) h ON w.type_id = h.type_id;
+}
+
+@setup watchlist_schema
+snapshot left-join-subquery-non-equality-materialized {
+    SELECT count(*)
+    FROM watchlist w
+    LEFT JOIN (
+        SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id
+    ) h ON w.name > h.avgp;
+}
+
+@setup watchlist_schema
+snapshot cross-join-subquery-materialized {
+    SELECT count(*)
+    FROM watchlist w
+    CROSS JOIN (
+        SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id
+    ) h
+    WHERE w.name > h.avgp;
+}
+
+# An earlier LEFT JOIN keeps the subquery after watchlist.
+@setup watchlist_schema
+snapshot subquery-after-left-join-materialized {
+    SELECT count(*)
+    FROM watchlist w
+    LEFT JOIN history_txt t ON t.price = w.type_id
+    JOIN (
+        SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id
+    ) h ON w.name > h.avgp;
+}
+
+# The second subquery comes after another subquery, so it is stored in a table.
+# The first one is the outer loop and stays a coroutine.
+@setup watchlist_schema
+snapshot subquery-after-subquery-materialized {
+    SELECT count(*)
+    FROM (SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id) a,
+         (SELECT type_id, max(price) AS maxp FROM history_txt GROUP BY type_id) b
+    WHERE a.avgp + b.maxp > 3;
+}
+
+@setup watchlist_schema
+snapshot left-join-cte-materialized {
+    WITH h AS (
+        SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id
+    )
+    SELECT count(*) FROM watchlist w LEFT JOIN h ON w.name > h.avgp;
+}
+
+# EXISTS becomes a semi join, which keeps the subquery after watchlist.
+@setup watchlist_schema
+snapshot exists-subquery-materialized {
+    SELECT count(*)
+    FROM watchlist w
+    WHERE EXISTS (
+        SELECT 1
+        FROM (SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id) h
+        WHERE w.name > h.avgp
+    );
+}
+
+# NOT EXISTS becomes an anti join, which keeps the subquery after watchlist.
+@setup watchlist_schema
+snapshot not-exists-subquery-materialized {
+    SELECT count(*)
+    FROM watchlist w
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM (SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id) h
+        WHERE w.name > h.avgp
+    );
+}
+
+# SQLite flattens a subquery without aggregates into the outer query, so it
+# runs once per outer row, and Turso keeps the coroutine.
+@setup watchlist_schema
+snapshot left-join-flattenable-subquery-coroutine {
+    SELECT w.type_id, h.price
+    FROM watchlist w
+    LEFT JOIN (SELECT type_id, price FROM history_txt WHERE price > 10) h ON w.type_id + h.price > 20;
+}

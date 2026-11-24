@@ -45,11 +45,11 @@ experimental_win_iocp = []
 time = []
 fuzz = []
 autovacuum = []
-simulator = ["fuzz", "serde", "io_memory_yield", "allocation_metric"]
+simulator = ["fuzz", "serde", "io_memory_yield", "allocation_metric", "turso_ast/simulator"]
 allocation_metric = []
 # Test only: exposed to testing/stress and the simulator, never to regular library users.
 io_memory_yield = []
-serde = ["dep:serde"]
+serde = ["dep:serde", "turso_ast/serde"]
 series = []
 encryption = []
 pure-rust-crypto = ["aegis/pure-rust"]
@@ -92,12 +92,7 @@ tantivy-common = { version = "0.11.0", optional = true }
 crc32fast = { version = "1", optional = true }
 
 [dependencies]
-# aristo SDK from crates.io (0.4.x — latest; also carries the aristo::instrument
-# surface behind the `aristo_instrument` feature, for future state-exposure
-# accessors). Was a local sibling path (../../aristo) pre-OSS; the conformance
-# harness resolves aristo + aristo-macros from crates.io, so no vendored mount
-# / path-rewrite is needed.
-aristo = "0.4"
+aristo = { workspace = true }
 turso_ext = { workspace = true, features = ["core_only"] }
 cfg_block = "0.1.1"
 fallible-iterator = { workspace = true }
@@ -114,6 +109,7 @@ chrono = { workspace = true, default-features = false, features = ["clock"] }
 rand = { workspace = true }
 libm = "0.2"
 turso_macros = { workspace = true }
+turso_ast = { workspace = true }
 miette = { workspace = true }
 strum = { workspace = true }
 parking_lot = { workspace = true, features = ["arc_lock"] }
@@ -133,7 +129,6 @@ pack1 = { version = "1.0.0", features = ["bytemuck"] }
 bytemuck = "1.23.1"
 aes-gcm = { version = "0.10.3" }
 aes = { version = "0.8.4" }
-turso_parser = { workspace = true }
 twox-hash = "2.1.1"
 intrusive-collections = "0.9.7"
 roaring = "0.11.2"

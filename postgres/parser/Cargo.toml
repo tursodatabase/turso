@@ -19,7 +19,7 @@ pg_query = { workspace = true }
 phf = { workspace = true }
 miette = { workspace = true }
 thiserror = { workspace = true }
-turso_parser = { workspace = true }
+turso_ast = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

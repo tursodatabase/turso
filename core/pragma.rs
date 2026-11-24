@@ -1,3 +1,4 @@
+use crate::ast::{self, PragmaName};
 use crate::sync::Arc;
 use crate::util::{escape_sql_string_literal, normalize_ident, quote_identifier};
 use crate::vtab::column_definition;
@@ -5,7 +6,6 @@ use crate::{Connection, LimboError, Statement, StepResult, Value};
 use bitflags::bitflags;
 use strum::IntoEnumIterator;
 use turso_ext::{ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, ResultCode};
-use turso_parser::ast::{self, PragmaName};
 
 bitflags! {
     // Flag names match those used in SQLite:

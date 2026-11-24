@@ -501,6 +501,26 @@ expect error {
     window functions are not allowed in policy expressions
 }
 
+@skip-if postgres "PostgreSQL has no median()"
+test policy-with-extension-aggregate-is-rejected {
+    CREATE TABLE rp_docs_46 (id INT PRIMARY KEY);
+    CREATE POLICY p ON rp_docs_46 USING (median(id) > 0);
+}
+@sqlstate 42803
+expect error {
+    aggregate functions are not allowed in policy expressions
+}
+
+test policy-with-scalar-function-is-accepted {
+    CREATE TABLE rp_docs_47 (id INT PRIMARY KEY);
+    INSERT INTO rp_docs_47 VALUES (-1), (2);
+    CREATE POLICY p ON rp_docs_47 USING (abs(id) > 1);
+    SELECT polname FROM pg_policy WHERE polrelid = (SELECT oid FROM pg_class WHERE relname = 'rp_docs_47');
+}
+expect {
+    p
+}
+
 @skip-if postgres "PostgreSQL supports subqueries with FROM in policies"
 test policy-with-subquery-that-reads-a-table-is-rejected {
     CREATE TABLE rp_docs_45 (id INT PRIMARY KEY);

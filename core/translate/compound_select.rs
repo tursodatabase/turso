@@ -1,4 +1,5 @@
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
+use crate::ast::{CompoundOperator, Expr, Literal, SortOrder};
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
 use crate::translate::collate::{compound_column_collation, CollationSeq};
@@ -18,7 +19,6 @@ use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{Insn, SorterOpenData};
 use crate::{emit_explain, LimboError};
 use tracing::instrument;
-use turso_parser::ast::{CompoundOperator, Expr, Literal, SortOrder};
 
 use tracing::Level;
 
@@ -870,7 +870,7 @@ fn emit_compound_order_by(
     let order_collations_nulls: crate::alloc::Vec<(
         SortOrder,
         CollationSeq,
-        Option<turso_parser::ast::NullsOrder>,
+        Option<crate::ast::NullsOrder>,
     )> = order_by
         .iter()
         .map(|(col_idx, order, nulls, explicit_collation)| {

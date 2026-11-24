@@ -1,4 +1,4 @@
-use turso_parser::ast::{
+use turso_core::ast::{
     self, Expr, LikeOperator, Name, Operator, QualifiedName, Type, UnaryOperator,
 };
 

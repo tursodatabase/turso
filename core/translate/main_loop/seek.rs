@@ -1,10 +1,10 @@
 use super::*;
+use crate::ast::{self, NullsOrder};
 use crate::schema::Column;
 use crate::translate::expr::expr_type::{column_type, ExprType, TypeEnv};
 use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
-use turso_parser::ast::{self, NullsOrder};
 
 fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
     // Apply the constraint's resolved comparison affinity to the seek key,

@@ -21,6 +21,7 @@ use crate::translate::schema::type_def_uses_type;
 use crate::type_ordering::TypeOrdering;
 use crate::types::IOResultOr;
 use crate::types::StrictType;
+use crate::types::{Conversion, StorageClass, UserType};
 use crate::types::{IOResult, ImmutableRecord, ImmutableRecordRef};
 use crate::util::{exprs_are_equivalent, is_builtin_strict_type, normalize_ident};
 use crate::vdbe::affinity::Affinity;
@@ -65,11 +66,11 @@ pub struct Trigger {
     pub name: String,
     pub sql: String,
     pub table_name: String,
-    pub time: turso_parser::ast::TriggerTime,
-    pub event: turso_parser::ast::TriggerEvent,
+    pub time: crate::ast::TriggerTime,
+    pub event: crate::ast::TriggerEvent,
     pub for_each_row: bool,
-    pub when_clause: Option<turso_parser::ast::Expr>,
-    pub commands: std::vec::Vec<turso_parser::ast::TriggerCmd>,
+    pub when_clause: Option<crate::ast::Expr>,
+    pub commands: std::vec::Vec<crate::ast::TriggerCmd>,
     pub temporary: bool,
     /// For temp triggers that target a table in a specific database.
     /// - `None` — the trigger was created without a db qualifier and
@@ -91,11 +92,11 @@ impl Trigger {
         name: String,
         sql: String,
         table_name: String,
-        time: Option<turso_parser::ast::TriggerTime>,
-        event: turso_parser::ast::TriggerEvent,
+        time: Option<crate::ast::TriggerTime>,
+        event: crate::ast::TriggerEvent,
         for_each_row: bool,
-        when_clause: Option<turso_parser::ast::Expr>,
-        commands: std::vec::Vec<turso_parser::ast::TriggerCmd>,
+        when_clause: Option<crate::ast::Expr>,
+        commands: std::vec::Vec<crate::ast::TriggerCmd>,
         temporary: bool,
         target_database_id: Option<usize>,
     ) -> Self {
@@ -103,7 +104,7 @@ impl Trigger {
             name,
             sql,
             table_name,
-            time: time.unwrap_or(turso_parser::ast::TriggerTime::Before),
+            time: time.unwrap_or(crate::ast::TriggerTime::Before),
             event,
             for_each_row,
             when_clause,
@@ -114,6 +115,11 @@ impl Trigger {
     }
 }
 
+use crate::ast::{
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, NullsOrder, RefAct, ResolveType,
+    SortOrder, TableInternalId, TypeOperator,
+};
+use crate::ast::{Cmd, CreateTableBody, ResultColumn, Stmt};
 use crate::dialect::identity_table_sql_marker;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
@@ -135,11 +141,6 @@ use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 use tracing::trace;
-use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, NullsOrder, RefAct, ResolveType,
-    SortOrder, TableInternalId, TypeOperator,
-};
-use turso_parser::ast::{Cmd, CreateTableBody, ResultColumn, Stmt};
 
 pub const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 pub const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
@@ -248,9 +249,9 @@ pub enum TypeDefKind {
     Custom {
         params: std::vec::Vec<ast::TypeParam>,
         base: String,
-        encode: Option<Box<ast::Expr>>,
-        coerce: Option<Box<ast::Expr>>,
-        decode: Option<Box<ast::Expr>>,
+        encode: Option<Conversion>,
+        coerce: Option<Conversion>,
+        decode: Option<Conversion>,
         /// How values of the type compare, for built-in types that have their
         /// own order, such as numeric. `None` compares the stored values as
         /// SQLite does.
@@ -319,116 +320,8 @@ pub enum OperatorArg {
 pub const BINARY_OPERATORS: [&str; 9] = ["+", "-", "*", "/", "%", "&", "|", "<<", ">>"];
 pub const PREFIX_OPERATORS: [&str; 2] = ["-", "~"];
 
-/// The order of a built-in type whose stored values do not sort in the type's
-/// order: numeric is stored as a blob. Every other type, and every user type,
-/// sorts and compares by its stored value as SQLite does.
-fn builtin_ordering(type_name: &str) -> Option<TypeOrdering> {
-    match type_name {
-        "numeric" => Some(TypeOrdering::Numeric),
-        _ => None,
-    }
-}
-
-/// The kind of value a built-in type reads as. uuid, jsonb and numeric store
-/// blobs and DECODE them to text. The built-in types are registered before any
-/// connection's functions, so the kind of `uuid_str(value)` can't be worked
-/// out from the DECODE then; a test checks these against the DECODE of each
-/// type.
-fn builtin_value_type(type_name: &str) -> crate::Result<BuiltinType> {
-    Ok(match type_name {
-        "boolean" | "smallint" | "bigint" => BuiltinType::Integer,
-        "uuid" | "json" | "jsonb" | "numeric" | "varchar" | "date" | "time" | "timestamp"
-        | "timestamptz" | "inet" | "cidr" | "macaddr" | "macaddr8" => BuiltinType::Text,
-        "bytea" => BuiltinType::Blob,
-        _ => {
-            return Err(LimboError::InternalError(format!(
-                "built-in type {type_name} has no kind of value"
-            )))
-        }
-    })
-}
-
-/// Operators on built-in types. User types have none: `x + 1` on a user type is
-/// an error. The functions read plain values as they are, so nothing is encoded first:
-/// - `numeric op x` and `x op numeric` for `+ - * / %`, and `-numeric`, compute
-///   exactly, and the result is a numeric. Encoding a literal to the column's type would round it
-///   to the column's scale first (`n * 0.005` would be `n * 0.01`). With a REAL
-///   value `+ - * /` are SQLite's operators and give a REAL, as PostgreSQL gives
-///   double precision; `%` with a REAL value does not exist, as in PostgreSQL.
-/// - `date + integer`, `integer + date` and `date - integer` add or subtract
-///   days and give a date. `date - date` gives the number of days between them;
-///   a text literal on either side is encoded to a date first. Each signature
-///   has its own function, so its result type is known before the statement
-///   runs.
-/// - `smallint` and `bigint` store plain integers, so SQLite's operators run,
-///   including `-`, `~`, `&`, `|`, `<<` and `>>`.
-///
-/// Other built-in types have no operators, and these types have no others:
-/// `-date` and `numeric & 1` are errors, as in PostgreSQL.
-fn builtin_signatures(type_name: &str) -> std::vec::Vec<OperatorSignature> {
-    use OperatorArg::{EncodableLiteral, Exact, Integer, Real, Value};
-    let call = |op, args: &[OperatorArg], func: &str, result| OperatorSignature {
-        op,
-        args: args.to_vec(),
-        func: Some(func.to_string()),
-        result,
-    };
-    match type_name {
-        "numeric" => {
-            let mut signatures = std::vec::Vec::new();
-            for (op, func) in [
-                ("+", "numeric_add"),
-                ("-", "numeric_sub"),
-                ("*", "numeric_mul"),
-                ("/", "numeric_div"),
-                ("%", "numeric_mod"),
-            ] {
-                for args in [[Value, Value], [Value, Exact], [Exact, Value]] {
-                    signatures.push(call(op, &args, func, Some("numeric")));
-                }
-                if op != "%" {
-                    signatures.extend(sqlite_operator(op, Real));
-                }
-            }
-            signatures.push(call("-", &[Value], "numeric_neg", Some("numeric")));
-            signatures
-        }
-        "date" => std::vec![
-            call("+", &[Value, Integer], "date_plus", Some("date")),
-            call("+", &[Integer, Value], "date_plus", Some("date")),
-            call("-", &[Value, Value], "date_diff", Some("integer")),
-            call(
-                "-",
-                &[Value, EncodableLiteral],
-                "date_diff",
-                Some("integer")
-            ),
-            call(
-                "-",
-                &[EncodableLiteral, Value],
-                "date_diff",
-                Some("integer")
-            ),
-            call("-", &[Value, Integer], "date_minus", Some("date")),
-        ],
-        "smallint" | "bigint" => {
-            let binary = BINARY_OPERATORS
-                .into_iter()
-                .flat_map(|op| sqlite_operator(op, OperatorArg::PlainValue));
-            let prefix = PREFIX_OPERATORS.into_iter().map(|op| OperatorSignature {
-                op,
-                args: std::vec![Value],
-                func: None,
-                result: None,
-            });
-            binary.chain(prefix).collect()
-        }
-        _ => std::vec::Vec::new(),
-    }
-}
-
 /// SQLite's binary operator `op` on a value of the type and an operand `other`.
-fn sqlite_operator(op: &'static str, other: OperatorArg) -> [OperatorSignature; 2] {
+pub(crate) fn sqlite_operator(op: &'static str, other: OperatorArg) -> [OperatorSignature; 2] {
     use OperatorArg::Value;
     [[Value, other], [other, Value]].map(|args| OperatorSignature {
         op,
@@ -598,18 +491,18 @@ impl TypeDef {
         }
     }
 
-    /// Returns the encode expression (Custom types only).
-    pub fn encode(&self) -> Option<&ast::Expr> {
+    /// The ENCODE of the type (Custom types only).
+    pub fn encode(&self) -> Option<&Conversion> {
         match &self.kind {
-            TypeDefKind::Custom { encode, .. } => encode.as_deref(),
+            TypeDefKind::Custom { encode, .. } => encode.as_ref(),
             _ => None,
         }
     }
 
-    /// Returns the coerce expression (Custom types only).
-    pub fn coerce(&self) -> Option<&ast::Expr> {
+    /// The COERCE of the type (Custom types only).
+    pub fn coerce(&self) -> Option<&Conversion> {
         match &self.kind {
-            TypeDefKind::Custom { coerce, .. } => coerce.as_deref(),
+            TypeDefKind::Custom { coerce, .. } => coerce.as_ref(),
             _ => None,
         }
     }
@@ -619,19 +512,28 @@ impl TypeDef {
         self.encode().is_some() || self.coerce().is_some()
     }
 
-    /// Returns the decode expression (Custom types only).
-    pub fn decode(&self) -> Option<&ast::Expr> {
+    /// The DECODE of the type (Custom types only).
+    pub fn decode(&self) -> Option<&Conversion> {
         match &self.kind {
-            TypeDefKind::Custom { decode, .. } => decode.as_deref(),
+            TypeDefKind::Custom { decode, .. } => decode.as_ref(),
             _ => None,
         }
     }
 
+    /// Whether a column of this type is not the same as a column of its base type: a
+    /// STRUCT or UNION, or a type that converts values when it stores or reads them.
+    /// A type with at most a COERCE check, such as varchar(n), is not, because its
+    /// values stay what they were stored as.
+    pub fn changes_stored_value(&self) -> bool {
+        self.is_struct()
+            || self.is_union()
+            || self.encode().is_some()
+            || !self.decode_returns_value_unchanged()
+    }
+
     /// True when stored values are read back unchanged (no DECODE, or `DECODE value`).
     pub fn decode_returns_value_unchanged(&self) -> bool {
-        self.decode().is_none_or(
-            |decode| matches!(decode, ast::Expr::Id(name) if name.as_str().eq_ignore_ascii_case("value")),
-        )
+        self.decode().is_none_or(Conversion::keeps_value)
     }
 
     /// Returns the base type name.
@@ -785,14 +687,45 @@ impl TypeDef {
         })
     }
 
+    /// The definition of the built-in type `ty`: a type that is written in
+    /// Rust and that every database of the dialect has.
+    pub fn builtin(ty: &dyn crate::types::Type) -> crate::Result<Self> {
+        let Some(stored) = primitive_value_type(ty.base()) else {
+            return Err(crate::LimboError::InternalError(format!(
+                "built-in type {} has BASE {}",
+                ty.name(),
+                ty.base()
+            )));
+        };
+        let read = match (ty.reads_as(), ty.decode()) {
+            (Some(StorageClass::Integer), _) => BuiltinType::Integer,
+            (Some(StorageClass::Real), _) => BuiltinType::Real,
+            (Some(StorageClass::Text), _) => BuiltinType::Text,
+            (Some(StorageClass::Blob), _) => BuiltinType::Blob,
+            // Nothing else tells what a Rust function gives, and a wrong
+            // kind would give expressions on the type a wrong type.
+            (None, Some(Conversion::Function(_))) => {
+                return Err(crate::LimboError::InternalError(format!(
+                    "built-in type {} has a DECODE written in Rust and does not say what it reads as",
+                    ty.name()
+                )));
+            }
+            (None, _) => stored,
+        };
+        Ok(Self::from_type(
+            ty,
+            true,
+            Some(ValueKinds { read, stored }),
+            String::new(),
+        ))
+    }
+
     /// Construct a TypeDef from a parsed CREATE TYPE statement.
     pub fn from_create_type(
         type_name: &str,
         body: &ast::CreateTypeBody,
-        origin: TypeOrigin,
         sql: String,
     ) -> crate::Result<Self> {
-        let is_builtin = matches!(origin, TypeOrigin::Builtin { .. });
         Ok(match body {
             ast::CreateTypeBody::CustomType {
                 params,
@@ -806,65 +739,17 @@ impl TypeDef {
                 // CREATE TYPE checks where type parameters are used. A type
                 // already stored by an earlier version is loaded unchecked, so
                 // the database still opens and DROP TYPE can remove it.
-                // A built-in type's BASE is a SQLite type. A user type's kinds
-                // are worked out once it is registered.
-                let (ordering, kinds, operator_signatures) = if is_builtin {
-                    let Some(stored) = primitive_value_type(base) else {
-                        return Err(crate::LimboError::InternalError(format!(
-                            "built-in type {type_name} has BASE {base}"
-                        )));
-                    };
-                    let kinds = ValueKinds {
-                        read: builtin_value_type(type_name)?,
-                        stored,
-                    };
-                    (
-                        builtin_ordering(type_name),
-                        Some(kinds),
-                        builtin_signatures(type_name),
-                    )
-                } else {
-                    (None, None, std::vec::Vec::new())
-                };
-                Self {
+                let user_type = UserType {
                     name: type_name.to_string(),
-                    is_builtin,
-                    not_null: false,
-                    is_domain: false,
-                    range_offsets: Some(match origin {
-                        TypeOrigin::Builtin { range_offsets, .. } => range_offsets,
-                        TypeOrigin::User => RangeOffsets::None,
-                    }),
-                    accepts_collate: Some(match origin {
-                        TypeOrigin::Builtin {
-                            accepts_collate, ..
-                        } => accepts_collate,
-                        // A user type takes a COLLATE when its values are text.
-                        TypeOrigin::User => base.eq_ignore_ascii_case("text"),
-                    }),
-                    stored_form_sorts_in_value_order: match origin {
-                        TypeOrigin::Builtin {
-                            stored_form_sorts_in_value_order,
-                            ..
-                        } => stored_form_sorts_in_value_order,
-                        // A user type's ENCODE may store any form.
-                        TypeOrigin::User => false,
-                    },
-                    sql,
-                    domain_checks: std::vec::Vec::new(),
-                    kind: TypeDefKind::Custom {
-                        params: params.clone(),
-                        base: base.clone(),
-                        encode: encode.clone(),
-                        coerce: coerce.clone(),
-                        decode: decode.clone(),
-                        ordering,
-                        kinds,
-                        operators: operators.clone(),
-                        operator_signatures,
-                        default: default.clone(),
-                    },
-                }
+                    params: params.clone(),
+                    base: base.clone(),
+                    encode: encode.clone(),
+                    coerce: coerce.clone(),
+                    decode: decode.clone(),
+                    operators: operators.clone(),
+                    default: default.clone(),
+                };
+                Self::from_type(&user_type, false, None, sql)
             }
             ast::CreateTypeBody::Struct(fields) => {
                 let struct_fields: Vec<StructFieldDef> = fields
@@ -880,7 +765,7 @@ impl TypeDef {
                     .try_collect()?;
                 Self {
                     name: type_name.to_string(),
-                    is_builtin,
+                    is_builtin: false,
                     not_null: false,
                     is_domain: false,
                     range_offsets: Some(RangeOffsets::None),
@@ -915,7 +800,7 @@ impl TypeDef {
                     .try_collect()?;
                 Self {
                     name: type_name.to_string(),
-                    is_builtin,
+                    is_builtin: false,
                     not_null: false,
                     is_domain: false,
                     range_offsets: Some(RangeOffsets::None),
@@ -932,6 +817,39 @@ impl TypeDef {
                 }
             }
         })
+    }
+
+    /// The definition of the type `ty`. `kinds` is None for a user type,
+    /// whose kinds are worked out once it is registered.
+    fn from_type(
+        ty: &dyn crate::types::Type,
+        is_builtin: bool,
+        kinds: Option<ValueKinds>,
+        sql: String,
+    ) -> Self {
+        Self {
+            name: ty.name().to_string(),
+            is_builtin,
+            not_null: false,
+            is_domain: false,
+            range_offsets: Some(ty.range_offsets()),
+            accepts_collate: Some(ty.accepts_collate()),
+            stored_form_sorts_in_value_order: ty.stored_form_sorts_in_value_order(),
+            sql,
+            domain_checks: std::vec::Vec::new(),
+            kind: TypeDefKind::Custom {
+                params: ty.params(),
+                base: ty.base().to_string(),
+                encode: ty.encode(),
+                coerce: ty.coerce(),
+                decode: ty.decode(),
+                ordering: ty.ordering(),
+                kinds,
+                operators: ty.operators(),
+                operator_signatures: ty.operator_signatures(),
+                default: ty.default(),
+            },
+        }
     }
 
     /// Construct a TypeDef from a parsed CREATE DOMAIN statement.
@@ -983,7 +901,7 @@ impl TypeDef {
     }
 
     /// The non-value params (user-provided at column declaration time).
-    pub fn user_params(&self) -> impl Iterator<Item = &turso_parser::ast::TypeParam> {
+    pub fn user_params(&self) -> impl Iterator<Item = &crate::ast::TypeParam> {
         self.params()
             .iter()
             .filter(|p| !p.name.eq_ignore_ascii_case("value"))
@@ -1325,17 +1243,18 @@ pub struct Schema {
     /// loaded, built once they are.
     pending_materialized_views: Option<PendingMaterializedViews>,
 
-    /// Schema state of the database's dialect, opaque to core: what the
-    /// dialect's [`crate::Dialect::build_schema_state`] built from its own
-    /// schema table, such as the PostgreSQL frontend's relation catalog.
-    /// None when the dialect keeps none. Copies of the schema share it.
+    /// What the dialect loaded from its own tables, such as the classes and
+    /// roles of the PostgreSQL frontend. The steps of
+    /// [`crate::Catalog::load_steps`] put it here, and core never looks
+    /// inside. None when the dialect loads nothing. Copies of the schema
+    /// share it.
     pub dialect_schema: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 /// What kind of relation a schema object is, for the relations that
 /// [`Schema::user_relations`] lists. The parser defines it, because
 /// `ALTER ... OWNER TO` names a kind.
-pub use turso_parser::ast::RelationKind;
+pub use crate::ast::RelationKind;
 
 /// Materialized views the loader read before the names of the namespaces,
 /// with the roots of their state tables. A view body names tables by their
@@ -1470,6 +1389,31 @@ impl SchemaBuilder {
         self
     }
 
+    /// Adds the built-in type `ty` under its name and its aliases. It
+    /// replaces a type that already has one of these names, so a dialect can
+    /// define a built-in type differently from core. Every other name of a
+    /// replaced type then names `ty` too: a dialect that defines `boolean`
+    /// also defines `bool`, which core registered as an alias of its own
+    /// `boolean`.
+    pub fn builtin_type(mut self, ty: &dyn crate::types::Type) -> crate::Result<Self> {
+        let type_def = Arc::new(TypeDef::builtin(ty)?);
+        for name in std::iter::once(ty.name()).chain(ty.aliases().iter().copied()) {
+            let Some(replaced) = self.schema.type_registry.get(&name.to_lowercase()) else {
+                continue;
+            };
+            let replaced = Arc::clone(replaced);
+            for registered in self.schema.type_registry.values_mut() {
+                if Arc::ptr_eq(registered, &replaced) {
+                    *registered = Arc::clone(&type_def);
+                }
+            }
+        }
+        for alias in ty.aliases() {
+            self = self.type_def(alias, Arc::clone(&type_def));
+        }
+        Ok(self.type_def(ty.name(), type_def))
+    }
+
     /// Adds the type `type_def` under `name`. A type can have several names.
     pub fn type_def(mut self, name: &str, type_def: Arc<TypeDef>) -> Self {
         self.schema
@@ -1527,21 +1471,6 @@ impl RangeOffsets {
                 )
         )
     }
-}
-
-/// Whether a type is built into Turso or made by a user's CREATE TYPE.
-#[derive(Debug, Clone, Copy)]
-pub enum TypeOrigin {
-    /// `accepts_collate` says whether values of the type take a COLLATE,
-    /// `range_offsets` what kind of number they are in a RANGE frame, and
-    /// `stored_form_sorts_in_value_order` whether the stored form sorts in
-    /// the same order as the values.
-    Builtin {
-        accepts_collate: bool,
-        range_offsets: RangeOffsets,
-        stored_form_sorts_in_value_order: bool,
-    },
-    User,
 }
 
 impl Schema {
@@ -2428,6 +2357,15 @@ impl Schema {
         self.update_value_types(syms)
     }
 
+    /// Adds a type to the in-memory registry. `syms` has the functions its
+    /// DECODE may call.
+    #[cfg(test)]
+    pub(crate) fn add_type(&mut self, type_def: TypeDef, syms: &SymbolTable) -> crate::Result<()> {
+        self.type_registry
+            .insert(type_registry_key(&type_def.name), Arc::new(type_def));
+        self.update_value_types(syms)
+    }
+
     /// Parse a CREATE TYPE or CREATE DOMAIN SQL string and add the type to the
     /// in-memory registry without working out the kind its DECODE gives.
     fn insert_type_from_sql(
@@ -2435,19 +2373,14 @@ impl Schema {
         dialect: &dyn crate::dialect::Dialect,
         sql: &str,
     ) -> crate::Result<()> {
-        use turso_parser::ast::{Cmd, Stmt};
+        use crate::ast::{Cmd, Stmt};
 
         let cmd = crate::dialect::parse_statement(dialect, sql);
         match cmd {
             Ok(Some(Cmd::Stmt(Stmt::CreateType {
                 type_name, body, ..
             }))) => {
-                let type_def = TypeDef::from_create_type(
-                    &type_name,
-                    &body,
-                    TypeOrigin::User,
-                    sql.to_string(),
-                )?;
+                let type_def = TypeDef::from_create_type(&type_name, &body, sql.to_string())?;
                 self.type_registry
                     .insert(type_registry_key(&type_name), Arc::new(type_def));
             }
@@ -2592,8 +2525,7 @@ impl Schema {
         {
             let bt = table.btree().expect("checked btree table");
             let mut modified = (*bt).clone();
-            modified.resolve_custom_types(self)?;
-            modified.propagate_domain_constraints(self)?;
+            modified.resolve_types_and_domains(self)?;
             tables.push((
                 namespace,
                 name.clone(),
@@ -4057,7 +3989,7 @@ impl Schema {
 
     /// Every name a materialized view's dependency must be registered under:
     /// the tables its query reads (including tables read only inside
-    /// subqueries, see [IncrementalView::referenced_table_names]), with each
+    /// subqueries, see [view::referenced_tables]), with each
     /// plain `VIEW` among them expanded recursively, since a view can itself
     /// select from another view, down to the real tables it reads. A write
     /// only ever lands on a real table, so if a dependency were left naming
@@ -4110,13 +4042,13 @@ impl Schema {
     /// The tables `select` reads, with the namespace each resolves to when
     /// the select is the body of a view of `namespace`. A table of a
     /// namespace the schema does not know is left out.
-    fn referenced_tables_of(
+    pub fn referenced_tables_of(
         &self,
         namespace: NamespaceId,
         select: &ast::Select,
     ) -> Vec<(NamespaceId, String)> {
         let mut tables = vec![];
-        for (qualifier, name) in IncrementalView::referenced_tables(select) {
+        for (qualifier, name) in view::referenced_tables(select) {
             let table_namespace = match qualifier.as_deref() {
                 None => namespace,
                 Some("main") => NamespaceId::ROOT,
@@ -4423,8 +4355,7 @@ impl Schema {
                         }
                     }
 
-                    table.resolve_custom_types(self)?;
-                    table.propagate_domain_constraints(self)?;
+                    table.resolve_types_and_domains(self)?;
                     let has_autoinc = table.has_autoincrement;
                     let tbl_name = name.to_string();
                     self.add_btree_table(namespace, Arc::new(table))?;
@@ -4500,8 +4431,8 @@ impl Schema {
                 }
             }
             "view" => {
+                use crate::ast::{Cmd, Stmt};
                 use crate::schema::View;
-                use turso_parser::ast::{Cmd, Stmt};
 
                 let sql = maybe_sql.expect("sql should be present for view");
                 let (namespace, view_name) = self.demangle_name(name);
@@ -4558,7 +4489,7 @@ impl Schema {
                 }
             }
             "trigger" => {
-                use turso_parser::ast::{Cmd, Stmt};
+                use crate::ast::{Cmd, Stmt};
 
                 let sql = maybe_sql.expect("sql should be present for trigger");
                 let (namespace, trigger_name) = self.demangle_name(name);
@@ -5032,7 +4963,7 @@ impl TryClone for UniqueSet {
 
 // Copy enums stored as `Vec` elements: their clone cannot allocate.
 crate::alloc::impl_try_clone_via_clone!(
-    turso_parser::ast::SortOrder,
+    crate::ast::SortOrder,
     crate::translate::collate::CollationSeq,
 );
 
@@ -5175,10 +5106,10 @@ impl TryClone for Index {
 }
 
 impl TryClone for Schema {
-    /// Copying a `Schema` requires deep cloning of all internal tables and indexes, even though they are wrapped in `Arc`.
-    /// Simply copying the `Arc` pointers would result in multiple `Schema` instances sharing the same underlying tables and indexes,
-    /// which could lead to panics or data races if any instance attempts to modify them.
-    /// To ensure each `Schema` is independent and safe to modify, we clone the underlying data for all tables and indexes.
+    /// The copy shares the tables, indexes, views and triggers with `self`,
+    /// because they are behind an `Arc`. Code that changes one of them in a
+    /// schema must copy it first with `Arc::make_mut`, so the change does not
+    /// reach the other schemas.
     type Error = TryReserveError;
 
     fn try_clone(&self) -> Result<Self, Self::Error> {
@@ -5212,18 +5143,16 @@ impl TryClone for NamespaceSchema {
         let tables = self
             .tables
             .iter()
-            .map(|(name, table)| {
-                Ok::<_, TryReserveError>((name.clone(), Arc::new(table.as_ref().try_clone()?)))
-            })
-            .try_collect::<Result<_, TryReserveError>>()??;
+            .map(|(name, table)| (name.clone(), Arc::clone(table)))
+            .try_collect()?;
         let indexes = self
             .indexes
             .iter()
             .map(|(name, indexes)| {
                 let indexes = indexes
                     .iter()
-                    .map(|index| index.as_ref().try_clone().map(Arc::new))
-                    .try_collect::<Result<VecDeque<_>, TryReserveError>>()??;
+                    .map(Arc::clone)
+                    .try_collect::<VecDeque<_>>()?;
                 Ok::<_, TryReserveError>((name.clone(), indexes))
             })
             .try_collect::<Result<_, TryReserveError>>()??;
@@ -5237,20 +5166,15 @@ impl TryClone for NamespaceSchema {
         let views = self
             .views
             .iter()
-            .map(|(name, view)| {
-                Ok::<_, TryReserveError>((name.clone(), Arc::new(view.as_ref().try_clone()?)))
-            })
-            .try_collect::<Result<_, TryReserveError>>()??;
+            .map(|(name, view)| (name.clone(), Arc::clone(view)))
+            .try_collect()?;
         let triggers = self
             .triggers
             .iter()
             .map(|(table_name, triggers)| {
                 Ok::<_, TryReserveError>((
                     table_name.clone(),
-                    triggers
-                        .iter()
-                        .map(|t| Arc::new((**t).clone()))
-                        .try_collect()?,
+                    triggers.iter().map(Arc::clone).try_collect()?,
                 ))
             })
             .try_collect::<Result<_, TryReserveError>>()??;
@@ -5993,6 +5917,14 @@ impl BTreeTable {
                 }
             }
         }
+    }
+
+    /// What the schema does to a table when it loads it: fills in its custom
+    /// types and applies the constraints of its domains. `schema` is the
+    /// schema of the table's own database.
+    pub fn resolve_types_and_domains(&mut self, schema: &Schema) -> Result<()> {
+        self.resolve_custom_types(schema)?;
+        self.propagate_domain_constraints(schema)
     }
 
     /// Fill in what custom type columns get from their type:
@@ -8387,7 +8319,7 @@ impl Column {
             None => (Type::Null, false),
         };
 
-        let ty_params: std::vec::Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
+        let ty_params: std::vec::Vec<Box<crate::ast::Expr>> = match &value.col_type {
             Some(ast::Type {
                 size: Some(ast::TypeSize::MaxSize(ref expr)),
                 ..
@@ -8554,6 +8486,42 @@ impl Column {
     #[inline]
     pub fn ty(&self) -> Type {
         self.info.ty()
+    }
+    /// The declared type with its parameters, as `PRAGMA table_info` shows it,
+    /// e.g. `VARCHAR(40)`. Empty for a column declared without a type.
+    pub fn declared_type(&self) -> String {
+        let written_type = self.written_ty_str.as_deref().unwrap_or(&self.ty_str);
+        // SQLite keeps the type names that STRICT tables accept in upper case.
+        if self.ty_params.is_empty() && is_builtin_strict_type(written_type) {
+            return self.ty_str.to_ascii_uppercase();
+        }
+        let mut declared_type = self.ty_str.clone();
+        if !self.ty_params.is_empty()
+            && !matches!(
+                written_type.as_bytes().first(),
+                Some(b'"' | b'\'' | b'`' | b'[')
+            )
+        {
+            declared_type.push('(');
+            for (i, param) in self.ty_params.iter().enumerate() {
+                if i > 0 {
+                    declared_type.push(',');
+                }
+                match param.as_ref() {
+                    Expr::Unary(ast::UnaryOperator::Negative, inner) => {
+                        declared_type.push('-');
+                        declared_type.push_str(&inner.to_string());
+                    }
+                    Expr::Unary(ast::UnaryOperator::Positive, inner) => {
+                        declared_type.push('+');
+                        declared_type.push_str(&inner.to_string());
+                    }
+                    _ => declared_type.push_str(&param.to_string()),
+                }
+            }
+            declared_type.push(')');
+        }
+        declared_type
     }
     #[inline]
     pub fn set_ty(&mut self, ty: Type) {
@@ -8852,7 +8820,7 @@ macro_rules! impl_effective_nulls_order {
             pub fn effective_nulls_order_when_iterated(
                 &self,
                 iter_dir: $crate::translate::plan::IterationDirection,
-            ) -> turso_parser::ast::NullsOrder {
+            ) -> crate::ast::NullsOrder {
                 match iter_dir {
                     $crate::translate::plan::IterationDirection::Forwards => {
                         self.effective_nulls_order()
@@ -8863,9 +8831,9 @@ macro_rules! impl_effective_nulls_order {
                 }
             }
 
-            pub fn effective_nulls_order(&self) -> turso_parser::ast::NullsOrder {
+            pub fn effective_nulls_order(&self) -> crate::ast::NullsOrder {
                 self.nulls_order
-                    .unwrap_or_else(|| turso_parser::ast::NullsOrder::default_for(self.order))
+                    .unwrap_or_else(|| crate::ast::NullsOrder::default_for(self.order))
             }
         }
     };
@@ -9318,84 +9286,46 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::roles::SessionRole;
-    use crate::SqliteDialect;
-
-    #[test]
-    fn builtin_types_read_as_the_kind_their_decode_gives() {
-        use crate::{
-            translate::expr::expr_type::value_type, ConnectOpts, Database, DatabaseOpts, MemoryIO,
-            OpenFlags, IO, MAIN_DB_ID,
-        };
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            ":memory:",
-            OpenFlags::Create,
-            DatabaseOpts::new().with_custom_types(true),
-            None,
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        let syms = conn.syms.read();
-        conn.with_schema(MAIN_DB_ID, |schema| {
-            assert!(schema.type_registry.values().all(|t| t.is_builtin));
-            for (name, type_def) in &schema.type_registry {
-                assert_eq!(
-                    Some(type_def.value_type()),
-                    value_type(type_def, schema, &syms),
-                    "built-in type {name}"
-                );
-            }
-        });
-    }
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
 
     #[test]
     #[should_panic(expected = "kinds of type price were read before they were worked out")]
     fn reading_the_kind_of_a_type_not_yet_worked_out_panics() {
-        let mut schema = Schema::new();
-        schema
-            .insert_type_from_sql(
-                &SqliteDialect,
-                "CREATE TYPE price(value any) BASE text ENCODE value DECODE CAST(value AS real)",
-            )
-            .unwrap();
-        schema.get_type_def_unchecked("price").unwrap().value_type();
+        // CREATE TYPE price(value any) BASE text ENCODE value DECODE CAST(value AS real)
+        let value = || Box::new(Expr::Id(Name::exact("value".to_string())));
+        let body = ast::CreateTypeBody::CustomType {
+            params: std::vec![ast::TypeParam {
+                name: "value".to_string(),
+                ty: Some("any".to_string()),
+            }],
+            base: "text".to_string(),
+            encode: Some(value()),
+            coerce: None,
+            decode: Some(Box::new(Expr::Cast {
+                expr: value(),
+                type_name: Some(ast::Type {
+                    name: "real".to_string(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            })),
+            operators: std::vec![],
+            default: None,
+        };
+        let price = TypeDef::from_create_type("price", &body, String::new()).unwrap();
+        price.value_type();
     }
 
     #[test]
     fn persisted_materialized_views_are_loaded_in_dependency_order() {
-        let mut views = HashMap::default();
-        views.insert(
-            "third".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW third AS SELECT * FROM second".to_string(),
-                5,
-            ),
-        );
-        views.insert(
-            "first".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW first AS SELECT * FROM base".to_string(),
-                3,
-            ),
-        );
-        views.insert(
-            "second".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW second AS SELECT * FROM first".to_string(),
-                4,
-            ),
-        );
+        let (views, dialect) = stored_views_selecting_from(&[
+            ("third", "second", 5),
+            ("first", "base", 3),
+            ("second", "first", 4),
+        ]);
 
         let ordered = Schema::new()
-            .order_persisted_materialized_views(&SqliteDialect, views)
+            .order_persisted_materialized_views(&dialect, views)
             .unwrap();
         assert_eq!(
             ordered
@@ -9408,28 +9338,103 @@ mod tests {
 
     #[test]
     fn persisted_materialized_view_cycle_is_corrupt() {
-        let mut views = HashMap::default();
-        views.insert(
-            "left_view".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW left_view AS SELECT * FROM right_view".to_string(),
-                3,
-            ),
-        );
-        views.insert(
-            "right_view".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW right_view AS SELECT * FROM left_view".to_string(),
-                4,
-            ),
-        );
+        let (views, dialect) = stored_views_selecting_from(&[
+            ("left_view", "right_view", 3),
+            ("right_view", "left_view", 4),
+        ]);
 
         let error = Schema::new()
-            .order_persisted_materialized_views(&SqliteDialect, views)
+            .order_persisted_materialized_views(&dialect, views)
             .unwrap_err();
         assert!(matches!(error, LimboError::Corrupt(_)));
+    }
+
+    /// Materialized views as stored in `sqlite_schema`, given as
+    /// `(view, table it selects every row of, root page)`, and a dialect
+    /// that reads their SQL.
+    fn stored_views_selecting_from(
+        views: &[(&str, &str, i64)],
+    ) -> (HashMap<String, StoredMaterializedView>, StoredViewsDialect) {
+        let mut stored = HashMap::default();
+        let mut dialect = StoredViewsDialect { views: vec![] };
+        for &(view, table, root_page) in views {
+            let sql = format!("CREATE MATERIALIZED VIEW {view} AS SELECT * FROM {table}");
+            stored.insert(
+                view.to_string(),
+                (NamespaceId::ROOT, sql.clone(), root_page),
+            );
+            dialect
+                .views
+                .push((sql, create_materialized_view_selecting_from(view, table)));
+        }
+        (stored, dialect)
+    }
+
+    /// `CREATE MATERIALIZED VIEW <view> AS SELECT * FROM <table>`
+    fn create_materialized_view_selecting_from(view: &str, table: &str) -> Stmt {
+        let name = |name: &str| ast::QualifiedName::single(Name::exact(name.to_string()));
+        Stmt::CreateMaterializedView {
+            if_not_exists: false,
+            view_name: name(view),
+            columns: std::vec![],
+            select: ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns: std::vec![ResultColumn::Star],
+                        from: Some(ast::FromClause {
+                            select: Box::new(ast::SelectTable::Table(name(table), None, None)),
+                            joins: std::vec![],
+                        }),
+                        where_clause: None,
+                        group_by: None,
+                        window_clause: std::vec![],
+                    },
+                    compounds: std::vec![],
+                },
+                order_by: std::vec![],
+                limit: None,
+            },
+        }
+    }
+
+    /// A dialect that reads only the SQL of the views it holds, each given
+    /// with the statement it reads as.
+    struct StoredViewsDialect {
+        views: Vec<(String, Stmt)>,
+    }
+
+    impl crate::dialect::Dialect for StoredViewsDialect {
+        fn name(&self) -> &'static str {
+            "stored-views"
+        }
+
+        fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+            self.parse_internal(sql)
+        }
+
+        fn parse_internal(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+            match self.views.iter().find(|(view_sql, _)| view_sql == sql) {
+                Some((_, stmt)) => Ok((Some(Cmd::Stmt(stmt.clone())), sql.len())),
+                None => DialectThatCannotParse.parse_internal(sql),
+            }
+        }
+
+        fn parse_internal_column_definition(&self, sql: &str) -> Result<ColumnDefinition> {
+            DialectThatCannotParse.parse_internal_column_definition(sql)
+        }
+
+        fn parameter_marker_ranges(
+            &self,
+            sql: &str,
+        ) -> Result<std::vec::Vec<std::ops::Range<usize>>> {
+            DialectThatCannotParse.parameter_marker_ranges(sql)
+        }
+
+        fn get_internal_dialect(&self) -> Arc<dyn crate::dialect::Dialect> {
+            Arc::new(DialectThatCannotParse)
+        }
     }
 
     #[test]
@@ -9458,18 +9463,24 @@ mod tests {
     #[test]
     fn stateless_materialized_view_requires_current_version_marker() -> Result<()> {
         fn add_marker(schema: &mut Schema, name: &str, root_page: i64) -> Result<()> {
-            let sql = format!(
-                "CREATE TABLE {} (version INTEGER)",
-                crate::util::quote_identifier(name)
+            let version = Column::new_default_integer(
+                Some("version".to_string()),
+                "INTEGER".to_string(),
+                None,
             );
             schema.add_btree_table(
                 NamespaceId::ROOT,
-                Arc::new(BTreeTable::from_stored_sql(
-                    &SqliteDialect,
-                    &sql,
+                Arc::new(BTreeTable::new(
                     root_page,
-                    false,
-                )?),
+                    name.to_string(),
+                    vec![],
+                    vec![version],
+                    BTreeCharacteristics::HAS_ROWID,
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                )),
             )
         }
 
@@ -9666,7 +9677,7 @@ mod tests {
 
     #[test]
     fn gencol_graph_no_virtual_columns() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(&SqliteDialect, "CREATE TABLE t(a, b)", 0, false)?;
+        let t = table_t(vec![stored_column("a"), stored_column("b")])?;
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0]);
         assert_eq!(indices(&t.columns_affected_by_update([0, 1])?), vec![0, 1]);
         assert_eq!(stored(&t.dependencies_of_columns([0])?), vec![0]);
@@ -9676,12 +9687,11 @@ mod tests {
 
     #[test]
     fn gencol_graph_linear_chain() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (b) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            virtual_column("b", &["a"]),
+            virtual_column("c", &["b"]),
+        ])?;
         // affected-by({a}) = {a, b, c}
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 1, 2]);
         // affected-by({b}) = {b, c} (b is virtual, but updating it still propagates through dependents)
@@ -9697,12 +9707,12 @@ mod tests {
 
     #[test]
     fn gencol_graph_diamond() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (a) VIRTUAL, d AS (b + c) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            virtual_column("b", &["a"]),
+            virtual_column("c", &["a"]),
+            virtual_column("d", &["b", "c"]),
+        ])?;
         assert_eq!(
             indices(&t.columns_affected_by_update([0])?),
             vec![0, 1, 2, 3]
@@ -9720,12 +9730,11 @@ mod tests {
 
     #[test]
     fn gencol_graph_multiple_stored_roots() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b, c AS (a + b) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            stored_column("b"),
+            virtual_column("c", &["a", "b"]),
+        ])?;
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 2]);
         assert_eq!(indices(&t.columns_affected_by_update([1])?), vec![1, 2]);
         assert_eq!(
@@ -9738,12 +9747,7 @@ mod tests {
 
     #[test]
     fn gencol_graph_empty_input() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![stored_column("a"), virtual_column("b", &["a"])])?;
         assert!(t.columns_affected_by_update(std::iter::empty())?.is_empty());
         assert!(t.dependencies_of_columns(std::iter::empty())?.is_empty());
         Ok(())
@@ -9751,12 +9755,12 @@ mod tests {
 
     #[test]
     fn gencol_graph_disjoint_components() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c, d AS (c) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            virtual_column("b", &["a"]),
+            stored_column("c"),
+            virtual_column("d", &["c"]),
+        ])?;
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 1]);
         assert_eq!(indices(&t.columns_affected_by_update([2])?), vec![2, 3]);
         assert_eq!(stored(&t.dependencies_of_columns([1])?), vec![0]);
@@ -9767,12 +9771,7 @@ mod tests {
     #[test]
     fn gencol_graph_deep_chain() -> Result<()> {
         // Build 50-long chain: c0 (stored), c1 := c0, c2 := c1, ... c49 := c48.
-        let mut sql = String::from("CREATE TABLE t(c0");
-        for i in 1..50 {
-            sql.push_str(&format!(", c{i} AS (c{prev}) VIRTUAL", prev = i - 1));
-        }
-        sql.push(')');
-        let t = BTreeTable::from_stored_sql(&SqliteDialect, &sql, 0, false)?;
+        let t = table_t(chain(50))?;
         // affected-by({c0}) = {c0..c49}
         let affected = t.columns_affected_by_update([0])?;
         assert_eq!(affected.count(), 50);
@@ -9785,12 +9784,7 @@ mod tests {
     fn gencol_graph_very_deep_chain_no_stack_overflow() -> Result<()> {
         // Validates that the iterative Kahn's + DP don't blow the stack on
         // realistic worst-case generated-column depth.
-        let mut sql = String::from("CREATE TABLE t(c0");
-        for i in 1..500 {
-            sql.push_str(&format!(", c{i} AS (c{prev}) VIRTUAL", prev = i - 1));
-        }
-        sql.push(')');
-        let t = BTreeTable::from_stored_sql(&SqliteDialect, &sql, 0, false)?;
+        let t = table_t(chain(500))?;
         assert_eq!(t.columns_affected_by_update([0])?.count(), 500);
         assert_eq!(stored(&t.dependencies_of_columns([499])?), vec![0]);
         Ok(())
@@ -9798,12 +9792,7 @@ mod tests {
 
     #[test]
     fn gencol_graph_rowid_sentinel_passthrough() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![stored_column("a"), virtual_column("b", &["a"])])?;
         let affected = t.columns_affected_by_update([ROWID_SENTINEL])?;
         // ROWID_SENTINEL is preserved in the mask flag but does not propagate through the graph
         // (no generated column can depend on ROWID_SENTINEL directly).
@@ -9814,12 +9803,12 @@ mod tests {
 
     #[test]
     fn gencol_graph_transpose_duality() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (b) VIRTUAL, d AS (a + c) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            virtual_column("b", &["a"]),
+            virtual_column("c", &["b"]),
+            virtual_column("d", &["a", "c"]),
+        ])?;
         let graph = t.column_graph()?;
         // j ∈ dependencies[i] iff i ∈ dependents[j]
         for i in 0..graph.dependencies.len() {
@@ -9842,12 +9831,12 @@ mod tests {
     #[test]
     fn gencol_graph_idempotence() -> Result<()> {
         // affected_by(affected_by(xs)) == affected_by(xs).
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b, c AS (a) VIRTUAL, d AS (b + c) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            stored_column("b"),
+            virtual_column("c", &["a"]),
+            virtual_column("d", &["b", "c"]),
+        ])?;
         let once = t.columns_affected_by_update([0, 1])?;
         let twice = t.columns_affected_by_update(once.iter())?;
         assert_eq!(indices(&twice), indices(&once));
@@ -9857,12 +9846,13 @@ mod tests {
     #[test]
     fn gencol_graph_union_monotonicity() -> Result<()> {
         // affected_by(A ∪ B) == affected_by(A) ∪ affected_by(B).
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b, c AS (a) VIRTUAL, d AS (b) VIRTUAL, e AS (c + d) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            stored_column("b"),
+            virtual_column("c", &["a"]),
+            virtual_column("d", &["b"]),
+            virtual_column("e", &["c", "d"]),
+        ])?;
         let mut expected = t.columns_affected_by_update([0])?;
         let b_mask = t.columns_affected_by_update([1])?;
         expected.union_with(&b_mask).unwrap();
@@ -9877,12 +9867,7 @@ mod tests {
         // After cloning a BTreeTable, the cache is fresh. Mutating columns on
         // the clone via `columns_mut()` keeps it fresh; `prepare_generated_columns`
         // rebuilds correctly.
-        let original = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let original = table_t(vec![stored_column("a"), virtual_column("b", &["a"])])?;
         // Force the cache to be populated on the original.
         let _ = original.columns_affected_by_update([0])?;
         assert!(original.peek_column_dependencies().is_some());
@@ -9906,12 +9891,7 @@ mod tests {
 
     #[test]
     fn gencol_graph_columns_mut_invalidates_cache() -> Result<()> {
-        let mut t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let mut t = table_t(vec![stored_column("a"), virtual_column("b", &["a"])])?;
         // Force the cache to be populated.
         let _ = t.columns_affected_by_update([0])?;
         assert!(t.peek_column_dependencies().is_some());
@@ -9924,12 +9904,98 @@ mod tests {
 
     #[test]
     fn gencol_graph_of_table_without_generated_columns_is_built_on_first_use() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(&SqliteDialect, "CREATE TABLE t(a, b)", 0, false)?;
+        let t = table_t(vec![stored_column("a"), stored_column("b")])?;
         assert!(t.peek_column_dependencies().is_none());
 
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0]);
         assert!(t.peek_column_dependencies().is_some());
         Ok(())
+    }
+
+    #[test]
+    fn schema_copy_shares_a_table_until_the_copy_changes_it() -> Result<()> {
+        let mut schema = Schema::new();
+        let mut table = table_t(vec![stored_column("a"), stored_column("b")])?;
+        table.root_page = 2;
+        schema.add_btree_table(NamespaceId::ROOT, Arc::new(table))?;
+
+        let mut copy = schema.try_clone()?;
+        assert!(Arc::ptr_eq(
+            &schema.get_table(NamespaceId::ROOT, "t").unwrap(),
+            &copy.get_table(NamespaceId::ROOT, "t").unwrap()
+        ));
+
+        let table = Arc::make_mut(copy.table_mut(NamespaceId::ROOT, "t").unwrap());
+        Arc::make_mut(table.btree_mut().unwrap()).root_page = 3;
+        let root_page = |schema: &Schema| {
+            schema
+                .get_btree_table(NamespaceId::ROOT, "t")
+                .unwrap()
+                .root_page
+        };
+        assert_eq!(root_page(&schema), 2);
+        assert_eq!(root_page(&copy), 3);
+        Ok(())
+    }
+
+    /// A rowid table named `t` with the given columns, set up the way a
+    /// `CREATE TABLE` sets up its generated columns.
+    fn table_t(columns: Vec<Column>) -> Result<BTreeTable> {
+        let mut table = BTreeTable::new(
+            0,
+            "t".to_string(),
+            vec![],
+            columns,
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        table.prepare_generated_columns()?;
+        Ok(table)
+    }
+
+    /// A column without a declared type, like `a` in `CREATE TABLE t(a)`.
+    fn stored_column(name: &str) -> Column {
+        Column::new(
+            Some(name.to_string()),
+            String::new(),
+            None,
+            None,
+            Type::Null,
+            None,
+            ColDef::default(),
+        )
+    }
+
+    /// A virtual column that adds up the named columns, like
+    /// `c AS (a + b) VIRTUAL`.
+    fn virtual_column(name: &str, sources: &[&str]) -> Column {
+        let expr = sources
+            .iter()
+            .map(|source| Expr::Id(ast::Name::exact(source.to_string())))
+            .reduce(|sum, next| Expr::Binary(Box::new(sum), ast::Operator::Add, Box::new(next)))
+            .expect("a generated column needs at least one source column");
+        Column::new(
+            Some(name.to_string()),
+            String::new(),
+            None,
+            Some(GeneratedType::new(Box::new(expr), false)),
+            Type::Null,
+            None,
+            ColDef::default(),
+        )
+    }
+
+    /// Columns `c0` to `c{len - 1}` where `c0` is stored and each later
+    /// column is a virtual copy of the one before it.
+    fn chain(len: usize) -> Vec<Column> {
+        let mut columns = vec![stored_column("c0")];
+        for i in 1..len {
+            columns.push(virtual_column(&format!("c{i}"), &[&format!("c{}", i - 1)]));
+        }
+        columns
     }
 
     /// `install_sequence_descriptor` must surface an error when the
@@ -10159,9 +10225,9 @@ mod column_info {
         #[inline]
         pub fn set_array_dimensions(&mut self, dims: u32) {
             assert!(
-                dims <= turso_parser::ast::MAX_ARRAY_DIMENSIONS,
+                dims <= crate::ast::MAX_ARRAY_DIMENSIONS,
                 "array dimensions must be <= {}",
-                turso_parser::ast::MAX_ARRAY_DIMENSIONS
+                crate::ast::MAX_ARRAY_DIMENSIONS
             );
             self.0 = (self.0 & !ARRAY_DIM_MASK) | (dims << ARRAY_DIM_SHIFT);
         }

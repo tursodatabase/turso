@@ -64,7 +64,7 @@ impl Opfs {
             let mut completions = self.inner.completions.borrow_mut();
             completions.remove(&completion_no).unwrap()
         };
-        completion.complete(result);
+        complete_opfs_result(&completion, result);
     }
 
     fn register_completion(&self, c: Completion) -> u32 {
@@ -188,7 +188,7 @@ impl File for OpfsFile {
         let buffer = buffer.as_mut_slice();
         if web_worker {
             let result = unsafe { read(handle, buffer.as_mut_ptr(), buffer.len(), pos as i32) };
-            c.complete(result as i32);
+            complete_opfs_result(&c, result);
         } else {
             let completion_no = self.opfs.register_completion(c.clone());
             unsafe {
@@ -224,7 +224,7 @@ impl File for OpfsFile {
         let buffer = buffer.as_slice();
         if web_worker {
             let result = unsafe { write(handle, buffer.as_ptr(), buffer.len(), pos as i32) };
-            c.complete(result as i32);
+            complete_opfs_result(&c, result);
         } else {
             let completion_no = self.opfs.register_completion(c.clone());
             unsafe {
@@ -250,7 +250,7 @@ impl File for OpfsFile {
         let handle = self.handle;
         if web_worker {
             let result = unsafe { sync(handle) };
-            c.complete(result as i32);
+            complete_opfs_result(&c, result);
         } else {
             let completion_no = self.opfs.register_completion(c.clone());
             unsafe { sync_async(handle, completion_no) };
@@ -273,7 +273,7 @@ impl File for OpfsFile {
         let handle = self.handle;
         if web_worker {
             let result = unsafe { truncate(handle, len as usize) };
-            c.complete(result as i32);
+            complete_opfs_result(&c, result);
         } else {
             let completion_no = self.opfs.register_completion(c.clone());
             unsafe { truncate_async(handle, len as usize, completion_no) };
@@ -289,7 +289,55 @@ impl File for OpfsFile {
         }
         tracing::debug!("size({})", self.handle);
         let handle = self.handle;
-        let result = unsafe { size(handle) };
+        let result = opfs_result(unsafe { size(handle) })?;
         Ok(result as u64)
+    }
+}
+
+fn complete_opfs_result(completion: &Completion, result: i32) {
+    match opfs_result(result) {
+        Ok(result) => completion.complete(result),
+        Err(error) => completion.error(error),
+    }
+}
+
+fn opfs_result(result: i32) -> std::result::Result<i32, turso_core::CompletionError> {
+    if result < 0 {
+        Err(turso_core::CompletionError::IOError(
+            std::io::ErrorKind::Other,
+            "OPFS",
+        ))
+    } else {
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opfs_rejects_failed_io_completions() {
+        assert!(opfs_result(-1).is_err());
+        assert_eq!(opfs_result(0), Ok(0));
+        for completion in [
+            Completion::new_sync(|_| {}),
+            Completion::new_trunc(|_| {}),
+            Completion::new_write(|_| {}),
+            Completion::new_read(Arc::new(turso_core::Buffer::new_temporary(16)), |_| None),
+        ] {
+            let opfs = Opfs::default();
+            let id = opfs.register_completion(completion.clone());
+            opfs.complete(id, -1);
+            assert!(
+                completion.failed(),
+                "negative OPFS results must fail completion"
+            );
+        }
+        let completion = Completion::new_trunc(|_| {});
+        let opfs = Opfs::default();
+        let id = opfs.register_completion(completion.clone());
+        opfs.complete(id, 0);
+        assert!(completion.succeeded());
     }
 }

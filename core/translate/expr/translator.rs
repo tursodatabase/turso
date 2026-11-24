@@ -936,14 +936,13 @@ fn emit_custom_type_cast(
         None => Vec::new(),
     };
 
-    // A cast to a domain over boolean gives true for every nonzero
-    // integer in dialects whose integer-to-boolean cast does, before
+    // A cast to boolean, or to a domain over boolean, gives true for every
+    // nonzero integer in dialects whose integer-to-boolean cast does, before
     // boolean's ENCODE sees the value.
     let is_domain = chain[0].is_domain;
-    if is_domain
-        && chain
-            .iter()
-            .any(|type_def| casts_nonzero_integer_to_true(type_def, resolver))
+    if chain
+        .iter()
+        .any(|type_def| casts_nonzero_integer_to_true(type_def, resolver))
     {
         emit_integer_to_boolean_cast(program, reg);
     }
@@ -1111,7 +1110,7 @@ fn translate_function_call_expr(
     };
 
     match &func_ctx.func {
-        Func::Agg(_) => {
+        func if func.is_aggregate() => {
             crate::bail_parse_error!(
                 "misuse of {} function {}()",
                 if filter_over.over_clause.is_some() {
@@ -1122,6 +1121,7 @@ fn translate_function_call_expr(
                 name.as_str()
             )
         }
+        Func::Agg(_) => unreachable!("is_aggregate() is true for every built-in aggregate"),
         Func::Window(_) => {
             crate::bail_parse_error!("misuse of window function {}()", name.as_str())
         }

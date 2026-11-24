@@ -60,6 +60,8 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         ["RemoteEncryptionCipher"] = "Remote Encryption Cipher",
         ["Remote Encryption Key"] = "Remote Encryption Key",
         ["RemoteEncryptionKey"] = "Remote Encryption Key",
+        ["Local Encryption Key"] = "Local Encryption Key",
+        ["LocalEncryptionKey"] = "Local Encryption Key",
         ["Push Operations Threshold"] = "Push Operations Threshold",
         ["PushOperationsThreshold"] = "Push Operations Threshold",
         ["Pull Bytes Threshold"] = "Pull Bytes Threshold",
@@ -250,6 +252,12 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         set => SetString("Remote Encryption Cipher", value);
     }
 
+    public string LocalEncryptionKey
+    {
+        get => GetString("Local Encryption Key");
+        set => SetString("Local Encryption Key", value);
+    }
+
     public string RemoteEncryptionKey
     {
         get => GetString("Remote Encryption Key");
@@ -301,9 +309,10 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         set
         {
             var normalizedKeyword = NormalizeKeyword(keyword);
+            TursoSyncDatabaseOptions.ValidateConnectionStringKey(normalizedKeyword, value);
             if (value is null)
             {
-                Remove(normalizedKeyword);
+                base.Remove(normalizedKeyword);
                 return;
             }
 

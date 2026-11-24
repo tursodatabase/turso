@@ -1,5 +1,6 @@
 use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
+use crate::ast::{self, SortOrder, TableInternalId};
 use crate::translate::expr::comparison_affinity;
 use crate::translate::expr_context::{ExprContext, ExprProperties, TableMetadata};
 use crate::{
@@ -30,7 +31,6 @@ use crate::{turso_assert, turso_debug_assert};
 use smallvec::SmallVec;
 use std::{collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
-use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 /// Represents a single condition derived from a `WHERE` clause term
 /// that constrains a specific column of a table.
@@ -1457,10 +1457,6 @@ fn in_subquery_collation(subquery: &NonFromClauseSubquery) -> Result<CollationSe
 pub struct EqConstraintRef {
     /// Position of the constraint in the [Constraint] array.
     pub constraint_pos: usize,
-    /// Whether this equality constrains the column to a single value for the
-    /// entire query (true for `col = 5`, false for `t2.x = t1.b` where the
-    /// value changes per outer row in a nested-loop join).
-    pub is_const: bool,
     /// Whether this equality comes from `IS` instead of `=`. An `IS` equality
     /// matches NULL keys, and an index (even a UNIQUE one) can store many NULL
     /// keys, so an `IS` equality does not pin the column to at most one row.
@@ -1659,7 +1655,6 @@ pub fn usable_constraints_for_lhs_mask(
                 nulls_order: cref.nulls_order,
                 eq: Some(EqConstraintRef {
                     constraint_pos: cref.constraint_vec_pos,
-                    is_const: constraints[cref.constraint_vec_pos].lhs_mask.is_empty(),
                     null_matching: constraints[cref.constraint_vec_pos].null_matching,
                 }),
                 lower_bound: None,
@@ -1804,7 +1799,7 @@ pub(super) fn partial_index_predicate_terms(
     bind_partial_index_columns(&mut bound, table_reference);
     rewrite_between_exprs(&mut bound, None).ok()?;
     let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
-    break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
+    break_predicate_at_and_boundaries(bound, &mut index_conjuncts);
     let mut matched_terms = SmallVec::<[usize; 4]>::new();
     for index_conjunct in index_conjuncts.iter() {
         let (term_idx, term) = query_where_clause.iter().enumerate().find(|(_, term)| {
@@ -2467,7 +2462,6 @@ fn find_best_index_for_constraint(
             eq: if operator.as_ast_operator() == Some(ast::Operator::Equals) {
                 Some(EqConstraintRef {
                     constraint_pos: 0,
-                    is_const: false,
                     null_matching: false,
                 })
             } else {
@@ -2499,7 +2493,6 @@ fn find_best_index_for_constraint(
             eq: if operator.as_ast_operator() == Some(ast::Operator::Equals) {
                 Some(EqConstraintRef {
                     constraint_pos: 0,
-                    is_const: false,
                     null_matching: false,
                 })
             } else {
@@ -2546,7 +2539,6 @@ fn find_best_index_for_constraint(
                         eq: if operator.as_ast_operator() == Some(ast::Operator::Equals) {
                             Some(EqConstraintRef {
                                 constraint_pos: 0,
-                                is_const: false,
                                 null_matching: false,
                             })
                         } else {

@@ -9,6 +9,7 @@ mod attach;
 mod blob_io;
 mod checkpoint_crash_atomicity;
 mod checkpoint_stale_page_size;
+mod checkpoint_write_failure;
 mod common;
 mod conflict_resolution;
 mod connection;

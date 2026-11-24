@@ -234,6 +234,30 @@ pub fn parse_list_output(output: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Return an error when a child process crashed instead of exiting: a Rust
+/// panic exits with status 101, and a panic with `panic = "abort"` (the release
+/// profile) or a segfault kills the process with a signal.
+///
+/// The exit status decides this, not the stderr text: sqlite3 and tursodb write
+/// every SQL error to stderr, and an error message can quote any text, including
+/// text that looks like a panic message.
+pub fn check_process_crash(
+    status: std::process::ExitStatus,
+    stderr: &str,
+) -> Result<(), BackendError> {
+    #[cfg(unix)]
+    let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+    #[cfg(not(unix))]
+    let signal: Option<i32> = None;
+    if status.code() == Some(101) || signal.is_some() {
+        return Err(BackendError::Execute(format!(
+            "process crashed ({status}): {}",
+            stderr.trim()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +301,39 @@ mod tests {
         let output = "1|Alice\n2|Bob\n";
         let rows = parse_list_output(output);
         assert_eq!(rows.len(), 2);
+    }
+
+    #[cfg(unix)]
+    fn wait_status(raw: i32) -> std::process::ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(raw)
+    }
+
+    const PANIC_STDERR: &str = "thread 'main' panicked at core/translate/expr/expr_type.rs:760:21:\n\
+        internal error: entered unreachable code: type \"varchar\" requires 1 parameter(s), got 2";
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_process_crash_panic_exit_status() {
+        // A wait status holds the exit code in bits 8..16.
+        let err = check_process_crash(wait_status(101 << 8), PANIC_STDERR).unwrap_err();
+        assert!(err.to_string().contains("process crashed"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_process_crash_killed_by_signal() {
+        // SIGABRT, which `panic = "abort"` raises.
+        let err = check_process_crash(wait_status(6), PANIC_STDERR).unwrap_err();
+        assert!(err.to_string().contains("process crashed"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_process_crash_sql_error_quoting_panic_text() {
+        // sqlite3 exits with status 1 after an SQL error whose message can quote
+        // text that looks like a panic message.
+        let stderr = "Parse error near line 1: no such table: a\nthread 'x' panicked at b";
+        assert!(check_process_crash(wait_status(1 << 8), stderr).is_ok());
+        assert!(check_process_crash(wait_status(0), stderr).is_ok());
     }
 }

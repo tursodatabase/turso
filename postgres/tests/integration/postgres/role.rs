@@ -844,6 +844,85 @@ fn database_without_the_membership_table_gets_it_when_opened() {
     assert_eq!(memberships(&conn), vec![membership("readers", "alice")]);
 }
 
+#[test]
+fn database_without_the_membership_table_has_no_memberships_after_its_schema_is_read_again() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE readers").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.close().unwrap();
+    drop(conn);
+    drop_membership_table(&db);
+    let conn = PgConnection::connect(&reopen_read_only(db)).unwrap();
+
+    conn.inner().force_reparse_schema_without_publish().unwrap();
+
+    assert_eq!(memberships(&conn), vec![]);
+    assert_eq!(
+        role_names(&conn),
+        vec!["postgres", "pg_database_owner", "readers", "alice"]
+    );
+}
+
+/// A database can have a classes table and no roles table. Then it has no
+/// roles to load, and its tables still load.
+#[test]
+fn database_without_the_roles_table_opens_read_only_without_roles() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE TABLE t (x INT)").unwrap();
+    conn.close().unwrap();
+    drop(conn);
+    drop_membership_table(&db);
+    drop_roles_table(&db);
+    let conn = PgConnection::connect(&reopen_read_only(db)).unwrap();
+
+    for read in ["after open", "after the schema is read again"] {
+        assert_eq!(
+            role_names(&conn),
+            vec!["postgres", "pg_database_owner"],
+            "{read}"
+        );
+        assert_eq!(memberships(&conn), vec![], "{read}");
+        let mut stmt = conn
+            .query("SELECT relname FROM pg_class WHERE relname = 't'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![turso_core::Value::build_text("t")]],
+            "{read}"
+        );
+        conn.inner().force_reparse_schema_without_publish().unwrap();
+    }
+}
+
+/// Drops the roles table, to get a database with classes and no roles.
+fn drop_roles_table(db: &TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.inner()
+        .prepare_engine_schema_statement("DROP TABLE __turso_internal_authid")
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+    conn.close().unwrap();
+}
+
+/// Closes `db` and opens the same file read-only. A read-only open does
+/// not create the tables that are missing.
+fn reopen_read_only(db: TempDatabase) -> std::sync::Arc<turso_core::Database> {
+    let TempDatabase { path, io, db } = db;
+    drop(db);
+    turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
+        turso_core::DatabaseOpts::new().with_encryption(true),
+    )
+    .unwrap()
+}
+
 /// The in-memory catalog skips a membership it knows, but only the stored
 /// table can keep a membership unique against every writer of the file. A
 /// duplicate would leave the database unable to open.
@@ -993,4 +1072,275 @@ fn todo_ids(conn: &PgConnection) -> Vec<String> {
         .into_iter()
         .map(|row| row[0].to_string())
         .collect()
+}
+
+#[test]
+fn dropped_role_is_not_visible_to_another_connection() {
+    let db = TempDatabase::builder().build();
+    let conn1 = db.connect_postgres();
+    let conn2 = db.connect_postgres();
+    conn1.execute("CREATE ROLE alice").unwrap();
+    assert_eq!(
+        role_names(&conn2),
+        vec!["postgres", "pg_database_owner", "alice"]
+    );
+
+    conn1.execute("DROP ROLE alice").unwrap();
+
+    assert_eq!(role_names(&conn2), vec!["postgres", "pg_database_owner"]);
+}
+
+#[test]
+fn drop_role_that_fails_drops_none_of_its_roles() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+
+    let error = conn.execute("DROP ROLE alice, bob").unwrap_err();
+
+    assert_eq!(error.to_string(), "role \"bob\" does not exist");
+    assert_eq!(
+        role_names(&conn),
+        vec!["postgres", "pg_database_owner", "alice"]
+    );
+}
+
+#[test]
+fn dropped_roles_and_their_memberships_stay_dropped_after_reopening() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    for role in ["readers", "writers", "alice", "bob"] {
+        conn.execute(format!("CREATE ROLE {role}")).unwrap();
+    }
+    conn.execute("GRANT readers, writers TO alice, bob")
+        .unwrap();
+    conn.execute("DROP ROLE writers, alice").unwrap();
+    assert_eq!(memberships(&conn), vec![membership("readers", "bob")]);
+    conn.close().unwrap();
+    drop(conn);
+
+    let db = db.reopen();
+
+    let conn = db.connect_postgres();
+    assert_eq!(
+        role_names(&conn),
+        vec!["postgres", "pg_database_owner", "readers", "bob"]
+    );
+    assert_eq!(memberships(&conn), vec![membership("readers", "bob")]);
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("GRANT readers TO alice").unwrap();
+    assert_eq!(
+        memberships(&conn),
+        vec![membership("readers", "alice"), membership("readers", "bob")]
+    );
+}
+
+/// The DETAIL lists each object that depends on the role, as PostgreSQL
+/// describes it, and names a relation that the search path does not find
+/// by its bare name with its schema.
+#[test]
+fn drop_role_lists_the_objects_that_depend_on_it() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    for sql in [
+        "CREATE ROLE alice",
+        "CREATE SCHEMA app",
+        "CREATE TABLE owned (id SERIAL)",
+        "ALTER TABLE owned OWNER TO alice",
+        "CREATE INDEX owned_id ON owned (id)",
+        "CREATE TABLE app.owned (x INT)",
+        "ALTER TABLE app.owned OWNER TO alice",
+        "CREATE TABLE shared (x INT)",
+        "GRANT SELECT ON shared TO alice",
+        "CREATE POLICY readers ON shared TO alice USING (true)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+
+    let error = conn.execute("DROP ROLE alice").unwrap_err();
+
+    let report = ErrorReport::from(error.core_error());
+    assert_eq!(report.sqlstate, "2BP01");
+    assert_eq!(
+        report.message,
+        "role \"alice\" cannot be dropped because some objects depend on it"
+    );
+    assert_eq!(
+        report.detail.as_deref(),
+        Some(
+            "owner of sequence owned_id_seq\n\
+             owner of table owned\n\
+             owner of table app.owned\n\
+             privileges for table shared\n\
+             target of policy readers on table shared"
+        )
+    );
+}
+
+/// The DETAIL quotes names the way PostgreSQL does and lists the objects in
+/// the order they were created, policies among relations.
+#[test]
+fn drop_role_detail_names_objects_as_postgresql_does() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    for sql in [
+        "CREATE ROLE alice",
+        "CREATE SCHEMA \"my s\"",
+        "CREATE TABLE \"my t\" (x INT)",
+        "CREATE TABLE \"my s\".\"q\" (x INT)",
+        "CREATE TABLE later (x INT)",
+        "GRANT SELECT ON \"my t\" TO alice",
+        "GRANT SELECT ON \"my s\".\"q\" TO alice",
+        "GRANT SELECT ON later TO alice",
+        "CREATE POLICY p ON \"my t\" TO alice USING (true)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+
+    let error = conn.execute("DROP ROLE alice").unwrap_err();
+
+    let report = ErrorReport::from(error.core_error());
+    assert_eq!(
+        report.detail.as_deref(),
+        Some(
+            "privileges for table \"my t\"\n\
+             privileges for table \"my s\".q\n\
+             privileges for table later\n\
+             target of policy p on table \"my t\""
+        )
+    );
+}
+
+/// The DETAIL gives a table the name it was created with, not the
+/// lowercase name it is stored under.
+#[test]
+fn drop_role_detail_keeps_the_case_of_table_names() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    for sql in [
+        "CREATE ROLE alice",
+        "CREATE TABLE \"MixT\" (x INT)",
+        "ALTER TABLE \"MixT\" OWNER TO alice",
+        "CREATE SCHEMA app",
+        "CREATE TABLE app.\"Other\" (x INT)",
+        "ALTER TABLE app.\"Other\" OWNER TO alice",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+
+    let error = conn.execute("DROP ROLE alice").unwrap_err();
+
+    let report = ErrorReport::from(error.core_error());
+    assert_eq!(
+        report.detail.as_deref(),
+        Some(
+            "owner of table \"MixT\"\n\
+             owner of table app.\"Other\""
+        )
+    );
+}
+
+#[test]
+fn role_without_privileges_is_told_who_may_create_roles() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    let error = conn.execute("CREATE ROLE bob").unwrap_err();
+
+    let report = ErrorReport::from(error.core_error());
+    assert_eq!(report.sqlstate, "42501");
+    assert_eq!(report.message, "permission denied to create role");
+    assert_eq!(
+        report.detail.as_deref(),
+        Some("Only roles with the CREATEROLE attribute may create roles.")
+    );
+}
+
+#[test]
+fn role_without_privileges_is_told_who_may_drop_roles() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    let error = conn.execute("DROP ROLE alice").unwrap_err();
+
+    let report = ErrorReport::from(error.core_error());
+    assert_eq!(report.sqlstate, "42501");
+    assert_eq!(report.message, "permission denied to drop role");
+    assert_eq!(
+        report.detail.as_deref(),
+        Some(
+            "Only roles with the CREATEROLE attribute and the ADMIN option on the target \
+             roles may drop roles."
+        )
+    );
+}
+
+/// A session that logs in as a stored superuser may drop roles, but not
+/// its own role or the built-in superuser.
+#[test]
+fn superuser_session_cannot_drop_its_session_role_or_the_built_in_superuser() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE admin").unwrap();
+    conn.execute("CREATE ROLE other").unwrap();
+    conn.inner()
+        .prepare_engine_schema_statement(
+            "UPDATE __turso_internal_authid SET rolsuper = 1 WHERE rolname = 'admin'",
+        )
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+    conn.close().unwrap();
+    drop(conn);
+    let db = db.reopen();
+    let admin = connect_as(&db, "admin");
+
+    let error = admin.execute("DROP ROLE admin").unwrap_err();
+    assert_eq!(error.to_string(), "current user cannot be dropped");
+    admin.execute("SET ROLE other").unwrap();
+    admin.execute("RESET ROLE").unwrap();
+    let error = admin.execute("DROP ROLE postgres").unwrap_err();
+    let report = ErrorReport::from(error.core_error());
+    assert_eq!(report.sqlstate, "2BP01");
+    assert_eq!(
+        report.message,
+        "cannot drop role postgres because it is required by the database system"
+    );
+
+    // A superuser that switched to another superuser role still cannot drop
+    // the role it logged in as.
+    let conn = db.connect_postgres();
+    conn.execute("SET ROLE admin").unwrap();
+    let error = conn.execute("DROP ROLE postgres").unwrap_err();
+    assert_eq!(error.to_string(), "session user cannot be dropped");
+
+    admin.execute("DROP ROLE other").unwrap();
+    assert_eq!(
+        role_names(&admin),
+        vec!["postgres", "pg_database_owner", "admin"]
+    );
+}
+
+/// PostgreSQL lets a superuser drop the role another session runs as. That
+/// session keeps running, as a role without privileges.
+#[test]
+fn session_of_a_dropped_role_keeps_running_without_privileges() {
+    let db = TempDatabase::builder().build();
+    let superuser = db.connect_postgres();
+    superuser.execute("CREATE ROLE alice").unwrap();
+    superuser.execute("CREATE TABLE t (x INT)").unwrap();
+    let alice = connect_as(&db, "alice");
+
+    superuser.execute("DROP ROLE alice").unwrap();
+
+    let mut stmt = alice.query("SELECT 1").unwrap().unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap()[0][0].to_string(), "1");
+    let Err(error) = alice.query("SELECT x FROM t") else {
+        panic!("the session of a dropped role read table t");
+    };
+    assert_eq!(error.to_string(), "permission denied for table t");
 }

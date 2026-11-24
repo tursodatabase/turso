@@ -87,6 +87,7 @@ pub(super) fn emit_array_element_loop(
             delimiter: 0,
             func: array_agg.clone(),
             collation: CollationSeq::BINARY,
+            minmax_keeps_best_reg: None,
         }),
     });
 

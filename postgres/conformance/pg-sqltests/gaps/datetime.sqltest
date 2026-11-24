@@ -1,0 +1,798 @@
+# Known tursopg gaps against PostgreSQL: date and time
+#
+# Each test with a `@compat-gap "<kind>:<object>"` label records a known
+# difference: its default `expect` block is PostgreSQL 18's answer and its
+# `expect @tursopg` block is tursopg's current wrong answer. When tursopg
+# gives the PostgreSQL answer, the tursopg run fails with "gap fixed": then
+# delete only `@compat-gap` and the `expect @tursopg` block, and keep the
+# test.
+#
+# These tests come from running candidate SQL on PostgreSQL 18 and on
+# tursopg and keeping one test per cause of a difference. The first
+# tests cover storing timestamptz values, `DEFAULT now()`, comparisons with
+# literals, `now() - interval`, and `date_trunc` with GROUP BY; the rest
+# cover other date and time functions, types, casts and settings.
+
+@database :memory:
+
+# A stored timestamptz cast to text loses its +00 offset.
+@compat-gap "cast:timestamptz -> text"
+test stored-timestamptz-text-cast {
+    CREATE TABLE t (id int, created_at timestamptz);
+    INSERT INTO t VALUES (1, '2026-01-01 10:00:00.25+02');
+    SELECT created_at::text FROM t;
+}
+expect {
+    2026-01-01 08:00:00.25+00
+}
+expect @tursopg {
+    2026-01-01 08:00:00.25
+}
+
+# Concatenation converts the value with the same cast.
+@compat-gap "cast:timestamptz -> text"
+test stored-timestamptz-concat {
+    CREATE TABLE t (id int, created_at timestamptz);
+    INSERT INTO t VALUES (1, '2026-01-01 10:00:00.25+02');
+    SELECT 'at ' || created_at FROM t;
+}
+expect {
+    at 2026-01-01 08:00:00.25+00
+}
+expect @tursopg {
+    at 2026-01-01 08:00:00.25
+}
+
+# Without the offset, the text comparison on tursopg returns no rows.
+@compat-gap "cast:timestamptz -> text"
+test where-timestamptz-text-compare {
+    CREATE TABLE t (id int, ts timestamptz);
+    INSERT INTO t VALUES (1, '2026-01-01 00:00Z'), (2, '2026-01-01 01:00+01'), (3, '2025-12-31 21:00-03');
+    SELECT id FROM t WHERE ts::text >= '2026-01-01 00:00:00+00' ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+expect @tursopg {
+}
+
+@compat-gap "type:_timestamptz"
+test array-agg-timestamptz-output {
+    SELECT (SELECT array_agg(x) FROM (VALUES (timestamptz '2026-01-31 10:00Z')) v(x));
+}
+expect {
+    {"2026-01-31 10:00:00+00"}
+}
+expect @tursopg {
+    {"2026-01-31 10:00:00"}
+}
+
+@compat-gap "function:format"
+test format-timestamptz-output {
+    SELECT format('%s', timestamptz '2026-01-31 10:00Z');
+}
+expect {
+    2026-01-31 10:00:00+00
+}
+expect @tursopg {
+    2026-01-31 10:00:00
+}
+
+@compat-gap "function:concat"
+test concat-timestamptz-output {
+    SELECT concat('at ', timestamptz '2026-01-31 10:00Z');
+}
+expect {
+    at 2026-01-31 10:00:00+00
+}
+expect @tursopg {
+    at 2026-01-31 10:00:00
+}
+
+# tursopg stores the integer 20260101 as 2026-01-01 00:00:00+00; PostgreSQL rejects it.
+@compat-gap "cast:int4 -> timestamptz"
+test insert-integer-into-timestamptz {
+    CREATE TABLE t (created_at timestamptz);
+    INSERT INTO t VALUES (20260101);
+    SELECT created_at FROM t;
+}
+@sqlstate 42804
+expect error {}
+expect @tursopg {
+    2026-01-01 00:00:00+00
+}
+
+@compat-gap "cast:int4 -> timestamptz"
+test insert-select-integer-into-timestamptz {
+    CREATE TABLE t (ts timestamptz);
+    CREATE TABLE s (v int); INSERT INTO s VALUES (20260101); INSERT INTO t SELECT v FROM s; SELECT ts FROM t;
+}
+@sqlstate 42804
+expect error {}
+expect @tursopg {
+    2026-01-01 00:00:00+00
+}
+
+@compat-gap "operator:timestamptz > int4"
+test compare-timestamptz-with-integer {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-01-01Z'); SELECT count(*) FROM t WHERE ts > 5;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    0
+}
+
+@compat-gap "cast:int4 -> timestamptz"
+test update-timestamptz-to-integer {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-01-01Z'); UPDATE t SET ts = 5; SELECT ts FROM t;
+}
+@sqlstate 42804
+expect error {}
+@sqlstate 22007
+expect @tursopg error {}
+
+# PostgreSQL has no assignment cast from text to timestamptz.
+@compat-gap "cast:text -> timestamptz"
+test insert-select-text-into-timestamptz {
+    CREATE TABLE t (ts timestamptz);
+    CREATE TABLE s (v text); INSERT INTO s VALUES ('2026-01-01 10:00Z'); INSERT INTO t SELECT v FROM s; SELECT ts FROM t;
+}
+@sqlstate 42804
+expect error {}
+expect @tursopg {
+    2026-01-01 10:00:00+00
+}
+
+@compat-gap "operator:timestamptz = text"
+test compare-timestamptz-with-text-column {
+    CREATE TABLE t (ts timestamptz);
+    CREATE TABLE s (v text); INSERT INTO s VALUES ('2026-01-01 10:00Z'); SELECT count(*) FROM t, s WHERE t.ts = s.v;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    0
+}
+
+@compat-gap "cast:timestamptz -> int8"
+test timestamptz-cast-to-bigint {
+    SELECT timestamptz '2026-01-31Z'::bigint;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    2026
+}
+
+@compat-gap "type:timestamptz"
+test timestamptz-offset-out-of-range {
+    CREATE TABLE t (created_at timestamptz);
+    INSERT INTO t VALUES ('2026-01-01 10:00+25');
+    SELECT created_at FROM t;
+}
+@sqlstate 22009
+expect error {}
+@sqlstate 22008
+expect @tursopg error {}
+
+@compat-gap "type:timestamptz"
+test timestamptz-input-utc-word {
+    CREATE TABLE t (id int, created_at timestamptz);
+    INSERT INTO t VALUES (1, '2026-01-01 10:00:00 UTC');
+    SELECT created_at FROM t;
+}
+expect {
+    2026-01-01 10:00:00+00
+}
+@sqlstate 22007
+expect @tursopg error {}
+
+@compat-gap "type:timestamptz"
+test timestamptz-input-zone-name {
+    CREATE TABLE t (id int, created_at timestamptz);
+    INSERT INTO t VALUES (1, '2026-01-01 10:00:00 Europe/Helsinki');
+    SELECT created_at FROM t;
+}
+expect {
+    2026-01-01 08:00:00+00
+}
+@sqlstate 22007
+expect @tursopg error {}
+
+@compat-gap "type:timestamptz"
+test timestamptz-input-mdy-slashes {
+    CREATE TABLE t (id int, created_at timestamptz);
+    INSERT INTO t VALUES (1, '01/02/2026 10:00');
+    SELECT created_at FROM t;
+}
+expect {
+    2026-01-02 10:00:00+00
+}
+@sqlstate 22007
+expect @tursopg error {}
+
+@compat-gap "type:timestamptz"
+test timestamptz-input-bc {
+    CREATE TABLE t (id int, created_at timestamptz);
+    INSERT INTO t VALUES (1, '0044-03-15 12:00:00 BC');
+    SELECT created_at FROM t;
+}
+expect {
+    0044-03-15 12:00:00+00 BC
+}
+@sqlstate 22007
+expect @tursopg error {}
+
+@compat-gap "type:timestamptz"
+test timestamptz-input-year-10000 {
+    CREATE TABLE t (id int, created_at timestamptz);
+    INSERT INTO t VALUES (1, '10000-01-01 00:00:00+00');
+    SELECT created_at FROM t;
+}
+expect {
+    10000-01-01 00:00:00+00
+}
+@sqlstate 22007
+expect @tursopg error {}
+
+@compat-gap "type:timestamptz"
+test timestamptz-precision-modifier {
+    CREATE TABLE t (created_at timestamptz(3));
+    INSERT INTO t VALUES ('2026-01-01 10:00:00.123456+00');
+    SELECT created_at FROM t;
+}
+expect {
+    2026-01-01 10:00:00.123+00
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:prepare"
+test prepare-timestamptz-parameter {
+    CREATE TABLE t (id int, created_at timestamptz);
+    PREPARE ins(int, timestamptz) AS INSERT INTO t VALUES ($1, $2);
+    EXECUTE ins(1, '2026-01-01T10:00Z');
+    SELECT id, created_at FROM t;
+}
+expect {
+    1|2026-01-01 10:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:timestamptz"
+test default-now-string {
+    CREATE TABLE todos (id serial PRIMARY KEY, title text NOT NULL, created_at timestamptz NOT NULL DEFAULT 'now');
+    INSERT INTO todos (title) VALUES ('a');
+    SELECT id, title FROM todos WHERE created_at > '2020-01-01Z' AND created_at < '2100-01-01Z';
+}
+expect {
+    1|a
+}
+@sqlstate 22007
+expect @tursopg error {}
+
+@compat-gap "type:timestamptz"
+test where-greater-than-now-string {
+    CREATE TABLE t (id int, created_at timestamptz);
+    INSERT INTO t VALUES (1, '2025-12-31 23:00Z'), (2, '2026-01-01 00:00Z'), (3, '2026-01-01 10:00Z'), (4, '2026-06-01 00:00+05'), (5, NULL), (6, '2099-01-01Z');
+    SELECT id FROM t WHERE created_at > 'now' ORDER BY id;
+}
+expect {
+    6
+}
+@sqlstate 22007
+expect @tursopg error {}
+
+@compat-gap "type:timestamptz"
+test where-greater-than-today {
+    CREATE TABLE t (id int, created_at timestamptz);
+    INSERT INTO t VALUES (1, '2025-12-31 23:00Z'), (2, '2026-01-01 00:00Z'), (3, '2026-01-01 10:00Z'), (4, '2026-06-01 00:00+05'), (5, NULL), (6, '2099-01-01Z');
+    SELECT id FROM t WHERE created_at > 'today' ORDER BY id;
+}
+expect {
+    6
+}
+@sqlstate 22007
+expect @tursopg error {}
+
+@compat-gap "type:timestamptz"
+test where-greater-than-tomorrow {
+    CREATE TABLE t (id int, created_at timestamptz);
+    INSERT INTO t VALUES (1, '2025-12-31 23:00Z'), (2, '2026-01-01 00:00Z'), (3, '2026-01-01 10:00Z'), (4, '2026-06-01 00:00+05'), (5, NULL), (6, '2099-01-01Z');
+    SELECT id FROM t WHERE created_at > 'tomorrow' ORDER BY id;
+}
+expect {
+    6
+}
+@sqlstate 22007
+expect @tursopg error {}
+
+@compat-gap "type:timestamptz"
+test where-greater-than-yesterday {
+    CREATE TABLE t (id int, created_at timestamptz);
+    INSERT INTO t VALUES (1, '2025-12-31 23:00Z'), (2, '2026-01-01 00:00Z'), (3, '2026-01-01 10:00Z'), (4, '2026-06-01 00:00+05'), (5, NULL), (6, '2099-01-01Z');
+    SELECT id FROM t WHERE created_at > 'yesterday' ORDER BY id;
+}
+expect {
+    6
+}
+@sqlstate 22007
+expect @tursopg error {}
+
+# PostgreSQL fills the missing trailing columns with their defaults.
+@compat-gap "syntax:insert"
+test insert-fewer-values-than-columns {
+    CREATE TABLE t (id int, created_at timestamptz, done boolean DEFAULT false);
+    INSERT INTO t VALUES (1, '2025-12-31 23:00Z'), (2, '2026-01-01 10:00Z'), (3, '2099-01-01Z');
+    DELETE FROM t WHERE created_at < '2026-01-01';
+    SELECT id, CASE WHEN done THEN 'done' ELSE 'open' END FROM t ORDER BY id;
+}
+expect {
+    2|open
+    3|open
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+@compat-gap "type:interval"
+test now-minus-interval-days {
+    SELECT pg_typeof(now() - interval '7 days');
+    SELECT count(*) FROM (SELECT 1) AS one WHERE (now() - interval '7 days') < now() + interval '1000 years';
+}
+expect {
+    timestamp with time zone
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:interval"
+test now-minus-interval-field-qualifier {
+    SELECT pg_typeof(now() - interval '7' day);
+    SELECT count(*) FROM (SELECT 1) AS one WHERE (now() - interval '7' day) < now() + interval '1000 years';
+}
+expect {
+    timestamp with time zone
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# An untyped literal next to timestamptz + resolves to interval.
+@compat-gap "operator:timestamptz + interval"
+test timestamptz-plus-untyped-literal {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-01-31 10:00Z');
+    SELECT ts + '1 day' FROM t;
+}
+expect {
+    2026-02-01 10:00:00+00
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# PostgreSQL resolves the untyped literal of now() - '7 days' as timestamptz.
+@compat-gap "operator:timestamptz - timestamptz"
+test now-minus-untyped-literal {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-01-31 10:00Z');
+    SELECT CASE WHEN now() - '7 days' < now() THEN 'past' ELSE 'not' END FROM t;
+}
+@sqlstate 22007
+expect error {}
+@sqlstate 42601
+expect @tursopg error {}
+
+@compat-gap "operator:timestamptz - timestamptz"
+test timestamptz-minus-timestamptz {
+    CREATE TABLE t (a timestamptz, b timestamptz);
+    INSERT INTO t VALUES ('2026-01-01 10:00Z', '2026-01-03 12:30Z');
+    SELECT b - a FROM t;
+}
+expect {
+    2 days 02:30:00
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+@compat-gap "operator:timestamp - timestamp"
+test timestamp-minus-timestamp {
+    CREATE TABLE t (id int, ts timestamp);
+    INSERT INTO t VALUES (1, '2026-01-31 10:20:30.5');
+    SELECT ts - TIMESTAMP '2026-01-01' FROM t;
+}
+expect {
+    30 days 10:20:30.5
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# The common type of timestamptz and timestamp is timestamptz.
+@compat-gap "cast:timestamp -> timestamptz"
+test coalesce-timestamptz-timestamp {
+    CREATE TABLE t (id int, tstz timestamptz, ts timestamp);
+    INSERT INTO t VALUES (1, '2026-01-01 10:00+02', '2026-01-01 08:00'), (2, '2026-01-01 10:00Z', '2026-01-01 09:00');
+    SELECT coalesce(tstz, ts) FROM t ORDER BY id;
+}
+expect {
+    2026-01-01 08:00:00+00
+    2026-01-01 10:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type timestamptz with type timestamp
+}
+
+@compat-gap "cast:timestamp -> timestamptz"
+test case-timestamptz-timestamp {
+    CREATE TABLE t (id int, tstz timestamptz, ts timestamp);
+    INSERT INTO t VALUES (1, '2026-01-01 10:00+02', '2026-01-01 08:00'), (2, '2026-01-01 10:00Z', '2026-01-01 09:00');
+    SELECT CASE WHEN id = 1 THEN tstz ELSE ts END FROM t ORDER BY id;
+}
+expect {
+    2026-01-01 08:00:00+00
+    2026-01-01 09:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type timestamptz with type timestamp
+}
+
+@compat-gap "function:avg"
+test avg-timestamptz {
+    CREATE TABLE t (id int, ts timestamptz);
+    INSERT INTO t VALUES (1, '2026-01-01 10:00+02'), (2, '2026-01-01 09:00Z'), (3, NULL), (4, '2026-01-02Z');
+    SELECT avg(ts) FROM t;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    2026.0
+}
+
+@compat-gap "function:percentile_disc"
+test percentile-disc-timestamptz {
+    CREATE TABLE t (id int, ts timestamptz);
+    INSERT INTO t VALUES (1, '2026-01-01 10:00+02'), (2, '2026-01-01 09:00Z'), (3, NULL), (4, '2026-01-02Z');
+    SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY ts) FROM t;
+}
+expect {
+    2026-01-01 09:00:00+00
+}
+expect @tursopg {
+    2026-01-01 09:00:00
+}
+
+test date-trunc-day {
+    SELECT date_trunc('day', timestamptz '2026-08-19 13:45:56.789012+00');
+}
+expect {
+    2026-08-19 00:00:00+00
+}
+
+@compat-gap "function:date_trunc"
+test date-trunc-with-zone {
+    SELECT date_trunc('day', timestamptz '2026-08-19 01:00+00', 'Asia/Tokyo');
+}
+expect {
+    2026-08-18 15:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+test date-trunc-invalid-field {
+    SELECT date_trunc('fortnight', timestamptz '2026-08-19 13:45:56.789012+00');
+}
+@sqlstate 22023
+expect error {}
+
+# to_char on a timestamp is refused.
+@compat-gap "function:to_char"
+test group-by-to-char-day {
+    CREATE TABLE t (id int, created_at timestamptz, done boolean);
+    INSERT INTO t VALUES (1, '2026-01-01 10:00Z', true), (2, '2026-01-01 23:30Z', false), (3, '2026-01-02 00:10+02', true), (4, '2026-01-02 08:00Z', true), (5, '2026-02-15 12:00Z', false);
+    SELECT to_char(created_at, 'YYYY-MM-DD') AS day, count(*) FROM t GROUP BY 1 ORDER BY 1;
+}
+expect {
+    2026-01-01|3
+    2026-01-02|1
+    2026-02-15|1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "function:to_char"
+test to-char-timestamptz-iso {
+    SELECT coalesce('[' || to_char(timestamptz '2026-08-09 13:05:06.789+00', 'YYYY-MM-DD') || ']', 'null');
+}
+expect {
+    [2026-08-09]
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "function:to_char"
+test to-char-timestamptz-month {
+    SELECT coalesce('[' || to_char(timestamptz '2026-08-09 13:05:06.789+00', 'Month DD, YYYY') || ']', 'null');
+}
+expect {
+    [August    09, 2026]
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "function:to_char"
+test to-char-numeric-group-separator {
+    SELECT coalesce('[' || to_char(1234.5, 'FM9,999.00') || ']', 'null');
+}
+expect {
+    [1,234.50]
+}
+expect @tursopg {
+    [ 1234.50]
+}
+
+@compat-gap "function:to_char"
+test to-char-integer-zero-pad {
+    SELECT coalesce('[' || to_char(5, 'FM00') || ']', 'null');
+}
+expect {
+    [05]
+}
+expect @tursopg {
+    [ 5]
+}
+
+@compat-gap "function:to_timestamp"
+test to-timestamp-epoch-integer {
+    SELECT to_timestamp(1767261600);
+}
+expect {
+    2026-01-01 10:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "function:to_timestamp"
+test to-timestamp-epoch-fraction {
+    SELECT to_timestamp(1767261600.5);
+}
+expect {
+    2026-01-01 10:00:00.5+00
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "function:to_timestamp"
+test to-timestamp-with-format {
+    SELECT to_timestamp('2026-01-01 10:00', 'YYYY-MM-DD HH24:MI');
+}
+expect {
+    2026-01-01 10:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "function:extract"
+test extract-epoch {
+    SELECT extract(epoch FROM timestamptz '2026-08-19 13:45:56.789012+00');
+}
+expect {
+    1787147156.789012
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+@compat-gap "function:extract"
+test extract-dow {
+    SELECT extract(dow FROM timestamptz '2026-08-19 13:45:56.789012+00');
+}
+expect {
+    3
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+@compat-gap "function:extract"
+test extract-invalid-field {
+    SELECT extract(fortnight FROM timestamptz '2026-08-19 13:45:56.789012+00');
+}
+@sqlstate 22023
+expect error {}
+@sqlstate 42883
+expect @tursopg error {}
+
+@compat-gap "function:date_part"
+test date-part-year {
+    SELECT date_part('year', timestamptz '2026-08-19 13:45:56+00');
+}
+expect {
+    2026
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+@compat-gap "function:timezone"
+test at-time-zone-utc {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-01-31 10:20:30.5+00');
+    SELECT ts AT TIME ZONE 'UTC' FROM t;
+}
+expect {
+    2026-01-31 10:20:30.5
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+@compat-gap "function:timezone"
+test at-time-zone-name {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-01-31 10:20:30.5+00');
+    SELECT ts AT TIME ZONE 'Europe/Helsinki' FROM t;
+}
+expect {
+    2026-01-31 12:20:30.5
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+@compat-gap "function:isfinite"
+test isfinite-timestamptz {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-01-31 10:20:30.5+00');
+    SELECT CASE WHEN isfinite(ts) THEN 'finite' ELSE 'inf' END FROM t;
+}
+expect {
+    finite
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+@compat-gap "function:make_timestamptz"
+test make-timestamptz {
+    SELECT make_timestamptz(2026, 8, 19, 13, 45, 56.5);
+}
+expect {
+    2026-08-19 13:45:56.5+00
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+@compat-gap "function:make_timestamp"
+test make-timestamp-fractional-seconds {
+    SELECT make_timestamp(2026, 8, 19, 13, 45, 56.5);
+}
+expect {
+    2026-08-19 13:45:56.5
+}
+@sqlstate XX000
+expect @tursopg error {}
+
+@compat-gap "function:generate_series"
+test generate-series-timestamp {
+    SELECT generate_series(timestamp '2026-01-01', timestamp '2026-01-01 02:00', '1 hour');
+}
+expect {
+    2026-01-01 00:00:00
+    2026-01-01 01:00:00
+    2026-01-01 02:00:00
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+@compat-gap "cast:timestamptz -> date"
+test timestamptz-cast-to-date {
+    SELECT timestamptz '2026-01-31 23:30-05'::date;
+}
+expect {
+    2026-02-01
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:date"
+test date-input-invalid {
+    SELECT '2026-02-30'::date;
+}
+@sqlstate 22008
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:timestamp"
+test timestamp-precision-modifier {
+    SELECT '2026-01-31 10:20:30.123456'::timestamp(2);
+}
+expect {
+    2026-01-31 10:20:30.12
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "type:timestamp"
+test timestamp-input-infinity {
+    SELECT 'infinity'::timestamp;
+}
+expect {
+    infinity
+}
+@sqlstate 22007
+expect @tursopg error {}
+
+@compat-gap "syntax:set"
+test set-timezone {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-01-31 10:20:30+00');
+    SET TIME ZONE 'Europe/Helsinki';
+    SELECT ts FROM t;
+}
+expect {
+    2026-01-31 12:20:30+02
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "function:set_config"
+test set-config-timezone {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-01-31 10:20:30+00');
+    SELECT set_config('TimeZone', 'Asia/Tokyo', false);
+    SELECT ts FROM t;
+}
+expect {
+    Asia/Tokyo
+    2026-01-31 19:20:30+09
+}
+@sqlstate 42704
+expect @tursopg error {}
+
+@compat-gap "syntax:show"
+test show-timezone {
+    SHOW timezone;
+}
+expect {
+    Etc/UTC
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "function:current_setting"
+test current-setting-timezone {
+    SELECT current_setting('TimeZone');
+}
+expect {
+    Etc/UTC
+}
+@sqlstate 42704
+expect @tursopg error {}
+
+@compat-gap "syntax:set"
+test set-datestyle {
+    SET datestyle = 'SQL, MDY';
+    SELECT timestamptz '2026-01-31 10:20:30Z', '01/02/2026'::timestamptz;
+}
+expect {
+    01/31/2026 10:20:30 UTC|01/02/2026 00:00:00 UTC
+}
+@sqlstate 22023
+expect @tursopg error {}
+
+# PostgreSQL finds no common type for an integer and a timestamp in one VALUES
+# column; tursopg accepts them.
+@compat-gap "syntax:values"
+test in-values-mixing-integer-and-timestamp {
+    CREATE TABLE t (id int, ts timestamp, tz timestamptz);
+    INSERT INTO t VALUES (1, '2024-01-05 00:00:00', '2024-01-05 00:00:00+00');
+    SELECT tz IN (VALUES (1), (ts)) FROM t;
+}
+@sqlstate 42804
+expect error {}
+expect @tursopg {
+    1
+}

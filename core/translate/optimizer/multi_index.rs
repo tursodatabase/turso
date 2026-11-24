@@ -7,6 +7,7 @@
 //! top.
 
 use crate::alloc::{TryClone, TursoIteratorExt};
+use crate::ast;
 use crate::schema::{Index, Schema};
 use crate::stats::AnalyzeStats;
 use crate::translate::emitter::Resolver;
@@ -35,7 +36,6 @@ use crate::Result;
 use std::cell::OnceCell;
 use std::sync::Arc;
 use turso_macros::turso_assert_eq;
-use turso_parser::ast;
 
 #[derive(Debug, Clone)]
 /// Parameters for a single branch of a multi-index scan.
@@ -1360,6 +1360,7 @@ mod tests {
     };
     use crate::alloc::TursoIteratorExt;
     use crate::alloc::TursoSliceExt;
+    use crate::ast::{self, Expr, Operator, TableInternalId};
     use crate::namespace::NamespaceRef;
     use crate::translate::emitter::Resolver;
     use crate::{
@@ -1384,7 +1385,6 @@ mod tests {
         MAIN_DB_ID,
     };
     use std::{collections::VecDeque, sync::Arc};
-    use turso_parser::ast::{self, Expr, Operator, TableInternalId};
 
     struct TestColumn {
         name: String,

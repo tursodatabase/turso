@@ -13,11 +13,11 @@
 
 use std::sync::Arc;
 
-use turso_parser::ast;
+use crate::ast;
 
 use crate::{
     bail_parse_error,
-    dialect::AccessStatement,
+    dialect::{AccessStatement, CmdContext},
     function::Func,
     namespace::{NamespaceId, NamespaceRef},
     schema::{collect_column_dependencies_of_expr, BTreeTable, Column, Schema, Table},
@@ -99,7 +99,7 @@ pub(crate) fn filter_rows(
                 WhereTermOrigin::Where
             };
             let mut parts: Vec<ast::Expr> = Vec::new();
-            break_predicate_at_and_boundaries(&filter, &mut parts);
+            break_predicate_at_and_boundaries(filter.clone(), &mut parts);
             terms.extend(parts.into_iter().map(|expr| WhereTerm {
                 expr,
                 origin,
@@ -111,7 +111,7 @@ pub(crate) fn filter_rows(
         for column in used_columns {
             table.mark_column_used(column);
         }
-        table.row_filter = Some(filter);
+        table.row_filter = Some(Box::new(filter));
     }
     where_clause.splice(0..0, terms);
     Ok(())
@@ -760,8 +760,9 @@ fn row_security_table(
     }
 }
 
-/// Has the dialect translate `statement`, in a write transaction that bumps
-/// the schema cookie so that other connections load what it stored.
+/// Has the dialect's catalog store what `statement` changes, in a write
+/// transaction that bumps the schema cookie so that other connections load
+/// what it stored.
 pub(crate) fn translate_access_statement(
     statement: &AccessStatement<'_>,
     resolver: &Resolver,
@@ -770,10 +771,12 @@ pub(crate) fn translate_access_statement(
 ) -> Result<()> {
     let schema = resolver.schema();
     program.begin_write_on_database(MAIN_DB_ID, schema.schema_version)?;
+    let cmd_context = CmdContext::new(connection, resolver, MAIN_DB_ID);
     resolver
         .catalog
         .dialect
-        .translate_access_statement(program, schema, connection, statement)?;
+        .catalog()
+        .emit_access(program, &cmd_context, statement)?;
     emit_schema_cookie(resolver, program);
     Ok(())
 }
@@ -859,7 +862,7 @@ fn policy_column(name: &ast::Name, table: &BTreeTable) -> Result<ast::Expr> {
 fn check_policy_function(name: &str, arg_count: usize, resolver: &Resolver) -> Result<()> {
     match resolver.resolve_function(name, arg_count)? {
         None => bail_parse_error!("function {name} does not exist"),
-        Some(Func::Agg(_)) => {
+        Some(func) if func.is_aggregate() => {
             bail_parse_error!("aggregate functions are not allowed in policy expressions")
         }
         Some(Func::Window(_)) => {
@@ -928,25 +931,24 @@ fn single_value_of_mut(select: &mut ast::Select) -> Option<&mut ast::Expr> {
 mod tests {
     use std::sync::Arc;
 
+    use crate::ast;
     use rustc_hash::FxHashMap;
-    use turso_parser::ast;
 
     use super::{
         conditions_of, policy, using_condition, with_check_condition, Command, Condition, Policy,
     };
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
     use crate::dialect::Dialect;
-    use crate::function::Func;
     use crate::namespace::{NamespaceId, NamespaceRef};
-    use crate::schema::{BTreeTable, Schema};
+    use crate::schema::Schema;
     use crate::security::policy::RowPolicy;
     use crate::security::roles::RoleId;
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
-    use crate::SqliteDialect;
     use crate::{DatabaseCatalog, Qualifiers, RwLock, SymbolTable};
 
-    /// The SQLite dialect, except that every table of a schema with dialect
-    /// schema state has row-level security, and table `documents` has a
-    /// policy that lets every role access every row.
+    /// A dialect in which every table of a schema with dialect schema state
+    /// has row-level security, and table `documents` has a policy that lets
+    /// every role access every row. It cannot parse SQL.
     struct RowSecurityInSchemasWithState;
 
     static ACCESS_EVERY_ROW: std::sync::LazyLock<Vec<RowPolicy>> = std::sync::LazyLock::new(|| {
@@ -962,51 +964,30 @@ mod tests {
 
     impl Dialect for RowSecurityInSchemasWithState {
         fn name(&self) -> &'static str {
-            SqliteDialect.name()
+            "row-security-in-schemas-with-state"
         }
 
         fn parse(&self, sql: &str) -> crate::Result<(Option<ast::Cmd>, usize)> {
-            SqliteDialect.parse(sql)
+            DialectThatCannotParse.parse(sql)
         }
 
         fn parse_internal(&self, sql: &str) -> crate::Result<(Option<ast::Cmd>, usize)> {
-            SqliteDialect.parse_internal(sql)
+            DialectThatCannotParse.parse_internal(sql)
         }
 
         fn parse_internal_column_definition(
             &self,
             sql: &str,
         ) -> crate::Result<ast::ColumnDefinition> {
-            SqliteDialect.parse_internal_column_definition(sql)
+            DialectThatCannotParse.parse_internal_column_definition(sql)
+        }
+
+        fn parameter_marker_ranges(&self, sql: &str) -> crate::Result<Vec<std::ops::Range<usize>>> {
+            DialectThatCannotParse.parameter_marker_ranges(sql)
         }
 
         fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
-            Arc::new(SqliteDialect)
-        }
-
-        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
-            SqliteDialect.parse_table_sql(sql, root_page)
-        }
-
-        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<ast::Stmt> {
-            SqliteDialect.parse_table_sql_ast(sql)
-        }
-
-        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
-            SqliteDialect.table_sql_for_replay(sql)
-        }
-
-        fn format_table_sql(
-            &self,
-            input: &str,
-            tbl_name: &ast::QualifiedName,
-            body: &ast::CreateTableBody,
-        ) -> crate::Result<String> {
-            SqliteDialect.format_table_sql(input, tbl_name, body)
-        }
-
-        fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
-            SqliteDialect.resolve_function(name, arg_count)
+            Arc::new(DialectThatCannotParse)
         }
 
         fn table_rls_enabled(&self, schema: &Schema, _namespace: NamespaceId, _name: &str) -> bool {
@@ -1033,9 +1014,9 @@ mod tests {
     #[test]
     fn conditions_combine_permissive_policies_and_keep_restrictive_ones_apart() {
         let policies = [
-            row_policy("a", true, Some("a = 1"), None),
-            row_policy("b", true, Some("b = 1"), Some("b = 2")),
-            row_policy("r", false, Some("r = 1"), None),
+            row_policy("a", true, Some(equals("a", 1)), None),
+            row_policy("b", true, Some(equals("b", 1)), Some(equals("b", 2))),
+            row_policy("r", false, Some(equals("r", 1)), None),
         ];
 
         assert_eq!(
@@ -1059,8 +1040,8 @@ mod tests {
     #[test]
     fn conditions_without_a_permissive_policy_pass_no_row() {
         let policies = [
-            row_policy("insert_only", true, None, Some("a = 1")),
-            row_policy("r", false, Some("r = 1"), None),
+            row_policy("insert_only", true, None, Some(equals("a", 1))),
+            row_policy("r", false, Some(equals("r", 1)), None),
         ];
 
         assert_eq!(
@@ -1076,31 +1057,26 @@ mod tests {
     fn row_policy(
         name: &str,
         permissive: bool,
-        using_expr: Option<&str>,
-        check_expr: Option<&str>,
+        using_expr: Option<ast::Expr>,
+        check_expr: Option<ast::Expr>,
     ) -> RowPolicy {
-        let expr = |sql: &str| {
-            let Some(ast::Cmd::Stmt(ast::Stmt::Select(select))) =
-                SqliteDialect.parse(&format!("SELECT {sql}")).unwrap().0
-            else {
-                panic!("{sql} is not an expression");
-            };
-            let ast::OneSelect::Select { columns, .. } = select.body.select else {
-                panic!("{sql} is not an expression");
-            };
-            let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
-                panic!("{sql} is not an expression");
-            };
-            *expr.clone()
-        };
         RowPolicy {
             name: name.to_string(),
             permissive,
             command: ast::PolicyCommand::All,
             roles: vec![RoleId::PUBLIC],
-            using_expr: using_expr.map(expr),
-            check_expr: check_expr.map(expr),
+            using_expr,
+            check_expr,
         }
+    }
+
+    /// `<column> = <value>`
+    fn equals(column: &str, value: i64) -> ast::Expr {
+        ast::Expr::Binary(
+            Box::new(ast::Expr::Id(ast::Name::exact(column.to_string()))),
+            ast::Operator::Equals,
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric(value.to_string()))),
+        )
     }
 
     fn texts(conditions: &[Condition]) -> Vec<(Option<String>, String)> {

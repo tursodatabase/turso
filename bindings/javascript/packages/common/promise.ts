@@ -903,12 +903,12 @@ function normalizeBatchBindValue(value: any): any {
   if (
     typeof value === "boolean" ||
     typeof value === "string" ||
-    (ArrayBuffer.isView(value) && !(value instanceof DataView))
+    ArrayBuffer.isView(value)
   ) {
     return value;
   }
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  return String(value);
+  throw new TypeError("SQLite3 can only bind numbers, strings, bigints, buffers, and null");
 }
 
 /**

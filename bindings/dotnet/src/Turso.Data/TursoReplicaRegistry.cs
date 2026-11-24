@@ -18,6 +18,7 @@ internal static class TursoReplicaRegistry
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(options);
+        options.Validate();
         if (options.Path == ":memory:")
         {
             var database = await TursoSyncDatabase
@@ -230,6 +231,7 @@ internal static class TursoReplicaRegistry
         bool PartialPrefetch,
         TursoRemoteEncryptionCipher? EncryptionCipher,
         string? EncryptionKeyHash,
+        string? LocalEncryptionKeyHash,
         string? AuthTokenHash,
         long? PushOperationsThreshold,
         long? PullBytesThreshold,
@@ -255,6 +257,7 @@ internal static class TursoReplicaRegistry
                 options.PartialSync?.Prefetch ?? false,
                 options.RemoteEncryption?.Cipher,
                 HashSecret(options.RemoteEncryption?.Key),
+                HashSecret(options.LocalEncryptionKey),
                 HashSecret(options.AuthToken),
                 options.PushOperationsThreshold,
                 options.PullBytesThreshold,

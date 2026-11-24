@@ -11,6 +11,8 @@
 //! remote. The `Wal` struct is responsible for managing the write-ahead log
 //! for the database, also either local or remote.
 pub(crate) mod btree;
+#[cfg(feature = "test_helper")]
+pub use btree::CursorTrait;
 #[cfg(injected_yields)]
 pub use btree::{BTreeWriteYieldPoint, BTREE_WRITE_YIELD_FAMILY};
 pub(crate) mod buffer_pool;

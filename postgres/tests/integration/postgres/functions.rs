@@ -616,7 +616,6 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
             Value::build_text("x + 7"),
         ),
         ("SELECT pg_get_expr('x + 7', NULL, 1)", Value::Null),
-        ("SELECT length(now(1, 2, 3))", Value::from_i64(23)),
     ] {
         assert_eq!(
             conn.prepare(sql).unwrap().run_collect_rows().unwrap(),
@@ -626,6 +625,11 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
     }
     for sql in [
         "SELECT version(1)",
+        "SELECT now(1)",
+        "SELECT now(1, 2)",
+        "SELECT clock_timestamp(1)",
+        "SELECT transaction_timestamp(1)",
+        "SELECT statement_timestamp('x')",
         "SELECT quote_ident()",
         "SELECT format_type()",
         "SELECT format_type(23, -1, 0)",
@@ -647,7 +651,7 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
         [
             ("format_type", 1, 2048),
             ("format_type", 2, 2048),
-            ("now", -1, 0),
+            ("now", 0, 0),
             ("pg_get_constraintdef", 1, 0),
             ("pg_get_constraintdef", 2, 0),
             ("quote_ident", 1, 2048),
@@ -673,7 +677,7 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
         [
             ("format_type", 1, "i"),
             ("format_type", 2, "i"),
-            ("now", -1, "v"),
+            ("now", 0, "v"),
             ("pg_get_constraintdef", 1, "v"),
             ("pg_get_constraintdef", 2, "v"),
             ("quote_ident", 1, "i"),
@@ -700,7 +704,7 @@ fn test_pg_native_timestamps_are_registered_before_connection_wrapping(db: TempD
         assert!(conn.get_syms_functions().iter().any(
             |(registered, is_agg, argc, deterministic)| registered == name
                 && !is_agg
-                && *argc == -1
+                && *argc == 0
                 && !deterministic
         ));
         let rows = conn
@@ -711,18 +715,37 @@ fn test_pg_native_timestamps_are_registered_before_connection_wrapping(db: TempD
         let Value::Text(timestamp) = &rows[0][0] else {
             panic!("expected timestamp text for {name}")
         };
-        assert_eq!(timestamp.as_str().len(), 23);
-        for (index, separator) in [
-            (4, b'-'),
-            (7, b'-'),
-            (10, b' '),
-            (13, b':'),
-            (16, b':'),
-            (19, b'.'),
-        ] {
-            assert_eq!(timestamp.as_str().as_bytes()[index], separator, "{name}");
-        }
+        assert!(
+            is_timestamp_text(timestamp.as_str()),
+            "{name} returned {}",
+            timestamp.as_str()
+        );
     }
+}
+
+/// Whether `text` is `YYYY-MM-DD HH:MM:SS`, optionally followed by `.` and one
+/// to six digits, the form PostgreSQL prints a timestamp in.
+fn is_timestamp_text(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() < 19 {
+        return false;
+    }
+    let (seconds, fraction) = bytes.split_at(19);
+    let seconds_match = seconds
+        .iter()
+        .zip(b"0000-00-00 00:00:00")
+        .all(|(byte, pattern)| match pattern {
+            b'0' => byte.is_ascii_digit(),
+            _ => byte == pattern,
+        });
+    let fraction_match = match fraction {
+        [] => true,
+        [b'.', digits @ ..] => {
+            (1..=6).contains(&digits.len()) && digits.iter().all(u8::is_ascii_digit)
+        }
+        _ => false,
+    };
+    seconds_match && fraction_match
 }
 
 #[turso_macros::test(mvcc)]
@@ -760,13 +783,11 @@ fn test_pg_quote_literal(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
-fn test_pg_description_stubs_return_null(db: TempDatabase) {
+fn description_lookups_return_null_for_an_object_without_a_comment(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE t (id integer PRIMARY KEY)")
         .unwrap();
 
-    // Comments are not stored, so description lookups report none rather
-    // than erroring.
     for sql in [
         "SELECT obj_description(16384, 'pg_class')",
         "SELECT obj_description(16384)",
@@ -865,4 +886,88 @@ fn test_pg_application_name_isolation_and_rollback(db: TempDatabase) {
     assert!(conn
         .execute("SELECT current_setting('unknown_builtin')")
         .is_err());
+}
+
+/// Older versions stored `f(*)` on a function that is not an aggregate as a
+/// call with no arguments. The core connection translates without the check
+/// that rejects it, as those versions did, and the tables and views it
+/// creates stay usable after the schema loads again.
+#[turso_macros::test]
+fn test_pg_stored_star_argument_of_scalar_function_still_loads(db: TempDatabase) {
+    let raw = db.connect_limbo();
+    raw.execute(
+        "CREATE TABLE public.star_stored (a float CHECK (random(*) >= 0), b float DEFAULT pi(*), \
+         c timestamptz DEFAULT now(*))",
+    )
+    .unwrap();
+    raw.execute(
+        "CREATE VIEW public.star_stored_view AS SELECT now(*) IS NOT NULL AS x, pi(*) > 3 AS y",
+    )
+    .unwrap();
+    drop(raw);
+    let db = db.reopen();
+    let conn = db.connect_postgres();
+    conn.execute("INSERT INTO star_stored (a) VALUES (1)")
+        .unwrap();
+    assert_eq!(
+        query_integer(
+            &conn,
+            "SELECT count(*) FROM star_stored WHERE b > 3 AND c IS NOT NULL"
+        ),
+        [1]
+    );
+    assert_eq!(
+        query_integer(&conn, "SELECT count(*) FROM star_stored_view WHERE x AND y"),
+        [1]
+    );
+    assert!(conn.execute("SELECT pi(*)").is_err());
+}
+
+/// A Data API sends the values of a filter as parameters. `->>` compares them
+/// as text, reads a text parameter as the name of a field, and reads an
+/// integer parameter as the index of an array element.
+#[turso_macros::test(mvcc)]
+fn test_pg_jsonb_arrows_with_parameters(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE items (id int PRIMARY KEY, data jsonb)")
+        .unwrap();
+    conn.execute(
+        r#"INSERT INTO items VALUES (1, '{"qty":10,"$.a":"x"}'), (2, '{"qty":2,"dims":{"w":20}}'), (3, '[5,6]')"#,
+    )
+    .unwrap();
+    let param = |index| std::num::NonZero::new(index).unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT id FROM items WHERE data ->> $1 = $2")
+        .unwrap();
+    for (key, value, expected_id) in [("qty", "2", 2), ("qty", "10", 1), ("$.a", "x", 1)] {
+        stmt.bind_at(param(1), Value::build_text(key)).unwrap();
+        stmt.bind_at(param(2), Value::build_text(value)).unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(expected_id)]],
+            "data ->> '{key}' = '{value}'"
+        );
+        stmt.reset().unwrap();
+    }
+
+    let mut stmt = conn
+        .prepare("SELECT id FROM items WHERE data -> $1 ->> $2 = $3")
+        .unwrap();
+    stmt.bind_at(param(1), Value::build_text("dims")).unwrap();
+    stmt.bind_at(param(2), Value::build_text("w")).unwrap();
+    stmt.bind_at(param(3), Value::build_text("20")).unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![vec![Value::from_i64(2)]]
+    );
+
+    let mut stmt = conn
+        .prepare("SELECT data ->> $1 FROM items WHERE id = 3")
+        .unwrap();
+    stmt.bind_at(param(1), Value::from_i64(-1)).unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("6")]]
+    );
 }

@@ -5,7 +5,7 @@
 
 use std::fmt::{self, Display, Formatter, Write as _};
 
-use turso_parser::ast::SortOrder;
+use crate::ast::SortOrder;
 
 use crate::{
     schema::Index,
@@ -272,6 +272,8 @@ pub enum EqpDetail {
     },
     /// De-duplicate result rows with an in-memory hash table.
     Distinct,
+    /// Return only the first of the rows that follow each other with equal DISTINCT ON keys.
+    DistinctOn,
     /// De-duplicate one aggregate's input, e.g. count(DISTINCT x).
     DistinctAggregate {
         function: String,
@@ -374,6 +376,7 @@ impl Display for EqpDetail {
                 table.name_with_alias()
             ),
             Self::Distinct => write!(f, "USE HASH TABLE FOR DISTINCT"),
+            Self::DistinctOn => write!(f, "KEEP FIRST ROW PER DISTINCT ON KEY"),
             Self::DistinctAggregate { function } => {
                 write!(f, "USE HASH TABLE FOR {function}(DISTINCT)")
             }
@@ -833,6 +836,7 @@ impl EqpDetail {
                 Self::write_estimate(&mut obj, estimate.as_ref());
             }
             Self::Distinct => obj.str("type", "distinct"),
+            Self::DistinctOn => obj.str("type", "distinct_on"),
             Self::DistinctAggregate { function } => {
                 obj.str("type", "distinct_aggregate");
                 obj.str("function", function);

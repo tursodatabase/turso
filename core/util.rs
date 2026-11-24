@@ -1,3 +1,4 @@
+use crate::ast::{self, Expr, Literal, UnaryOperator};
 use crate::dialect::Dialect;
 use crate::namespace::NamespaceId;
 use crate::numeric::StrToF64;
@@ -19,7 +20,6 @@ use either::Either;
 use rustc_hash::FxHashMap as HashMap;
 use std::future::Future;
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{self, Expr, Literal, UnaryOperator};
 
 #[macro_export]
 macro_rules! io_yield_one {
@@ -134,7 +134,7 @@ pub fn escape_sql_string_literal(literal: &str) -> String {
 /// Format an identifier for error messages the way SQLite's `%T` does: the
 /// token exactly as the user wrote it, keeping the original quote characters.
 /// `CREATE TABLE "t"` reports an existing table as `table "t" already exists`.
-pub fn identifier_token_for_error(name: &turso_parser::ast::Name) -> String {
+pub fn identifier_token_for_error(name: &crate::ast::Name) -> String {
     if name.quoted() {
         name.as_ident()
     } else {
@@ -206,7 +206,7 @@ pub fn dequote(source: &str) -> String {
 /// Format a table reference for error messages the way SQLite does: the name
 /// as the user wrote it with quotes stripped, keeping any database prefix.
 /// `SELECT * FROM main."T1"` reports the missing table as `main.T1`.
-pub fn table_name_for_error(name: &turso_parser::ast::QualifiedName) -> String {
+pub fn table_name_for_error(name: &crate::ast::QualifiedName) -> String {
     match &name.namespace {
         Some(db) => format!("{}.{}", db.as_str(), name.name.as_str()),
         None => name.name.as_str().to_owned(),
@@ -216,16 +216,7 @@ pub fn table_name_for_error(name: &turso_parser::ast::QualifiedName) -> String {
 /// Quote a SQL identifier with double quotes when necessary.
 /// Always safe to call — returns the bare name when no quoting is needed.
 pub fn quote_identifier(name: &str) -> String {
-    let needs_quoting = name.is_empty()
-        || name.as_bytes()[0].is_ascii_digit()
-        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        || turso_parser::lexer::is_quotable_keyword(name.as_bytes());
-    if needs_quoting {
-        let escaped = name.replace('"', "\"\"");
-        format!("\"{escaped}\"")
-    } else {
-        name.to_string()
-    }
+    ast::Name::exact(name.to_string()).as_ident()
 }
 
 pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
@@ -621,6 +612,15 @@ pub fn try_capture_parameters_column_agnostic(
 /// equivalent in the context of queries, even if their representations
 /// differ. e.g.: `SUM(x)` and `sum(x)`, `x + y` and `y + x`
 pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
+    exprs_match(expr1, expr2, true)
+}
+
+/// Like [exprs_are_equivalent], but `x + y` and `y + x` are different expressions.
+pub fn exprs_are_equivalent_as_written(expr1: &Expr, expr2: &Expr) -> bool {
+    exprs_match(expr1, expr2, false)
+}
+
+fn exprs_match(expr1: &Expr, expr2: &Expr, operands_can_swap: bool) -> bool {
     match (expr1, expr2) {
         (
             Expr::Between {
@@ -637,16 +637,18 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
             },
         ) => {
             not1 == not2
-                && exprs_are_equivalent(lhs1, lhs2)
-                && exprs_are_equivalent(start1, start2)
-                && exprs_are_equivalent(end1, end2)
+                && exprs_match(lhs1, lhs2, operands_can_swap)
+                && exprs_match(start1, start2, operands_can_swap)
+                && exprs_match(end1, end2, operands_can_swap)
         }
         (Expr::Binary(lhs1, op1, rhs1), Expr::Binary(lhs2, op2, rhs2)) => {
             op1 == op2
-                && ((exprs_are_equivalent(lhs1, lhs2) && exprs_are_equivalent(rhs1, rhs2))
-                    || (op1.is_commutative()
-                        && exprs_are_equivalent(lhs1, rhs2)
-                        && exprs_are_equivalent(rhs1, lhs2)))
+                && ((exprs_match(lhs1, lhs2, operands_can_swap)
+                    && exprs_match(rhs1, rhs2, operands_can_swap))
+                    || (operands_can_swap
+                        && op1.is_commutative()
+                        && exprs_match(lhs1, rhs2, operands_can_swap)
+                        && exprs_match(rhs1, lhs2, operands_can_swap)))
         }
         (
             Expr::Case {
@@ -663,7 +665,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
             base1 == base2
                 && pairs1.len() == pairs2.len()
                 && pairs1.iter().zip(pairs2).all(|((w1, t1), (w2, t2))| {
-                    exprs_are_equivalent(w1, w2) && exprs_are_equivalent(t1, t2)
+                    exprs_match(w1, w2, operands_can_swap) && exprs_match(t1, t2, operands_can_swap)
                 })
                 && else1 == else2
         }
@@ -677,7 +679,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                 type_name: type2,
             },
         ) => {
-            exprs_are_equivalent(expr1, expr2)
+            exprs_match(expr1, expr2, operands_can_swap)
                 && match (type1, type2) {
                     (Some(t1), Some(t2)) => t1.name.eq_ignore_ascii_case(&t2.name),
                     _ => false,
@@ -685,7 +687,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
         }
         (Expr::Collate(expr1, collation1), Expr::Collate(expr2, collation2)) => {
             // TODO: check correctness of comparing colation as strings
-            exprs_are_equivalent(expr1, expr2)
+            exprs_match(expr1, expr2, operands_can_swap)
                 && collation1
                     .as_str()
                     .eq_ignore_ascii_case(collation2.as_str())
@@ -727,18 +729,20 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
         ) => {
             name1.as_str().eq_ignore_ascii_case(name2.as_str())
                 && match (&filter1.filter_clause, &filter2.filter_clause) {
-                    (Some(expr1), Some(expr2)) => exprs_are_equivalent(expr1, expr2),
+                    (Some(expr1), Some(expr2)) => exprs_match(expr1, expr2, operands_can_swap),
                     (None, None) => true,
                     _ => false,
                 }
                 && filter1.over_clause == filter2.over_clause
         }
-        (Expr::NotNull(expr1), Expr::NotNull(expr2)) => exprs_are_equivalent(expr1, expr2),
-        (Expr::IsNull(expr1), Expr::IsNull(expr2)) => exprs_are_equivalent(expr1, expr2),
+        (Expr::NotNull(expr1), Expr::NotNull(expr2)) => {
+            exprs_match(expr1, expr2, operands_can_swap)
+        }
+        (Expr::IsNull(expr1), Expr::IsNull(expr2)) => exprs_match(expr1, expr2, operands_can_swap),
         (Expr::Literal(lit1), Expr::Literal(lit2)) => check_literal_equivalency(lit1, lit2),
         (Expr::Id(id1), Expr::Id(id2)) => check_ident_equivalency(id1.as_str(), id2.as_str()),
         (Expr::Unary(op1, expr1), Expr::Unary(op2, expr2)) => {
-            op1 == op2 && exprs_are_equivalent(expr1, expr2)
+            op1 == op2 && exprs_match(expr1, expr2, operands_can_swap)
         }
         (Expr::Variable(val), Expr::Variable(val2)) => val == val2,
         (Expr::Parenthesized(exprs1), Expr::Parenthesized(exprs2)) => {
@@ -746,10 +750,10 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                 && exprs1
                     .iter()
                     .zip(exprs2)
-                    .all(|(e1, e2)| exprs_are_equivalent(e1, e2))
+                    .all(|(e1, e2)| exprs_match(e1, e2, operands_can_swap))
         }
         (Expr::Parenthesized(exprs1), exprs2) | (exprs2, Expr::Parenthesized(exprs1)) => {
-            exprs1.len() == 1 && exprs_are_equivalent(&exprs1[0], exprs2)
+            exprs1.len() == 1 && exprs_match(&exprs1[0], exprs2, operands_can_swap)
         }
         (Expr::Qualified(tn1, cn1), Expr::Qualified(tn2, cn2)) => {
             check_ident_equivalency(tn1.as_str(), tn2.as_str())
@@ -773,12 +777,12 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
             },
         ) => {
             *not1 == *not2
-                && exprs_are_equivalent(lhs1, lhs2)
+                && exprs_match(lhs1, lhs2, operands_can_swap)
                 && rhs1.len() == rhs2.len()
                 && rhs1
                     .iter()
                     .zip(rhs2.iter())
-                    .all(|(a, b)| exprs_are_equivalent(a, b))
+                    .all(|(a, b)| exprs_match(a, b, operands_can_swap))
         }
         (
             Expr::Column {
@@ -1424,6 +1428,12 @@ pub trait AstVisitor {
         Ok(())
     }
 
+    /// Before the CTEs and the body of a SELECT that has a WITH clause.
+    fn enter_with(&mut self, _with: &ast::With) {}
+
+    /// After the SELECT whose WITH clause `enter_with` reported.
+    fn leave_with(&mut self) {}
+
     /// Visit in SQLite's name resolution order: each query level's FROM
     /// clause before its SELECT list, and the left operand of `IN (SELECT ...)`
     /// before the subquery. Off by default: the walk visits in source order so
@@ -1702,6 +1712,7 @@ pub fn visit_stmt<V: AstVisitor>(stmt: &ast::Stmt, visitor: &mut V) -> Result<()
         | ast::Stmt::AlterSequenceOwnedBy { .. }
         | ast::Stmt::CreateSchema { .. }
         | ast::Stmt::CreateRole { .. }
+        | ast::Stmt::DropRole { .. }
         | ast::Stmt::Grant(_)
         | ast::Stmt::CreatePolicy(_)
         | ast::Stmt::DropPolicy { .. }
@@ -1840,6 +1851,9 @@ where
 /// Walk a SELECT: the tables it reads and all of its expressions, including
 /// subqueries.
 pub fn visit_select<V: AstVisitor>(select: &ast::Select, visitor: &mut V) -> Result<()> {
+    if let Some(with) = &select.with {
+        visitor.enter_with(with);
+    }
     visit_with(select.with.as_ref(), visitor)?;
 
     visit_one_select(&select.body.select, visitor)?;
@@ -1858,6 +1872,10 @@ pub fn visit_select<V: AstVisitor>(select: &ast::Select, visitor: &mut V) -> Res
         }
     }
 
+    if select.with.is_some() {
+        visitor.leave_with();
+    }
+
     Ok(())
 }
 
@@ -1869,7 +1887,7 @@ fn visit_one_select<V: AstVisitor>(one_select: &ast::OneSelect, visitor: &mut V)
             where_clause,
             group_by,
             window_clause,
-            ..
+            distinctness,
         } => {
             // Source order is SELECT list then FROM; name resolution is the
             // reverse, which a visitor can ask for.
@@ -1900,6 +1918,13 @@ fn visit_one_select<V: AstVisitor>(one_select: &ast::OneSelect, visitor: &mut V)
 
             for window_def in window_clause {
                 visit_window(&window_def.window, visitor)?;
+            }
+
+            for expr in distinctness
+                .iter()
+                .flat_map(|distinctness| distinctness.exprs())
+            {
+                visit_expr_with_subqueries(expr, visitor)?;
             }
         }
         ast::OneSelect::Values(values) => {
@@ -2153,8 +2178,8 @@ pub fn check_expr_references_column(expr: &ast::Expr, col_name_normalized: &str)
 pub mod tests {
     use super::*;
 
+    use crate::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type, Variable};
     use crate::schema::Type as SchemaValueType;
-    use turso_parser::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type, Variable};
 
     #[test]
     fn test_normalize_ident() {
@@ -3466,7 +3491,7 @@ pub mod tests {
 
     #[test]
     fn capture_parameters_treats_numbered_markers_as_placeholders() {
-        use turso_parser::ast::{Literal, Variable};
+        use crate::ast::{Literal, Variable};
         // Index-method patterns use ?N to share one captured argument
         // across several call sites (fts_score/fts_match); a numbered
         // marker carries its "?N" spelling as its name and must still

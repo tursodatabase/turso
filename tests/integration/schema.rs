@@ -1,6 +1,10 @@
 use rustc_hash::FxHashMap as HashMap;
 use turso_core::alloc::vec;
 use turso_core::alloc::*;
+use turso_core::ast::Cmd;
+use turso_core::ast::CreateTableBody;
+use turso_core::ast::SortOrder;
+use turso_core::ast::Stmt;
 use turso_core::dialect::Dialect;
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::*;
@@ -9,10 +13,6 @@ use turso_core::CollationSeq;
 use turso_core::LimboError;
 use turso_core::Result;
 use turso_core::SymbolTable;
-use turso_parser::ast::Cmd;
-use turso_parser::ast::CreateTableBody;
-use turso_parser::ast::SortOrder;
-use turso_parser::ast::Stmt;
 use turso_sqlite::SqliteDialect;
 
 #[test]

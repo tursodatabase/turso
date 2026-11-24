@@ -616,6 +616,10 @@ impl EncryptionContext {
         self.cipher_mode
     }
 
+    pub(crate) fn page_size(&self) -> usize {
+        self.page_size
+    }
+
     /// Set the database page size used when encrypting and decrypting pages.
     ///
     /// This does not change the selected cipher or key material.

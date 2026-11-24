@@ -53,6 +53,7 @@ mod values;
 pub(crate) mod view;
 mod window;
 
+use crate::ast;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
@@ -72,7 +73,6 @@ use schema::{translate_create_table, translate_create_virtual_table, translate_d
 use select::translate_select;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
-use turso_parser::ast;
 use update::translate_update;
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -245,6 +245,7 @@ fn translate_statement(
             | ast::Stmt::CreateType { .. }
             | ast::Stmt::CreateDomain { .. }
             | ast::Stmt::CreateRole { .. }
+            | ast::Stmt::DropRole { .. }
             | ast::Stmt::Grant(_)
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
@@ -300,6 +301,11 @@ fn translate_statement(
     let mut stmt = stmt;
     let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
         && sequence::bind_sequence_names_in_stored_expressions(&mut stmt, resolver)?;
+    if resolver.catalog.dialect.binds_names_at_create() {
+        if let ast::Stmt::CreateView { select, .. } = &mut stmt {
+            view::bind_table_names(select, resolver);
+        }
+    }
 
     match stmt {
         ast::Stmt::AlterTable(alter) => {
@@ -439,13 +445,22 @@ fn translate_statement(
         ast::Stmt::DropTrigger {
             if_exists,
             trigger_name,
-        } => trigger::translate_drop_trigger(resolver, &trigger_name, if_exists, program)?,
+        } => trigger::translate_drop_trigger(
+            resolver,
+            &trigger_name,
+            if_exists,
+            connection,
+            program,
+        )?,
         ast::Stmt::DropView {
             if_exists,
             view_name,
         } => view::translate_drop_view(resolver, &view_name, if_exists, connection, program)?,
         ast::Stmt::CreateRole { role_name, options } => {
             roles::translate_create_role(role_name, options, resolver, program, connection)?
+        }
+        ast::Stmt::DropRole { if_exists, roles } => {
+            roles::translate_drop_role(if_exists, roles, resolver, program, connection)?
         }
         ast::Stmt::Grant(grant) => roles::translate_grant(&grant, resolver, program, connection)?,
         ast::Stmt::CreateType {
@@ -682,6 +697,7 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::CreateType { .. } => "create_type",
         ast::Stmt::CreateDomain { .. } => "create_domain",
         ast::Stmt::CreateRole { .. } => "create_role",
+        ast::Stmt::DropRole { .. } => "drop_role",
         ast::Stmt::Grant(_) => "grant",
         ast::Stmt::Delete { .. } => "delete",
         ast::Stmt::Detach { .. } => "detach",
@@ -715,13 +731,16 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
 mod tests {
     use super::*;
     use crate::alloc::TryClone;
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
     use crate::io::MemoryIO;
     use crate::namespace::NamespaceId;
-    use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
+    use crate::schema::{
+        BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Table, Type,
+        SQLITE_SEQUENCE_TABLE_NAME,
+    };
     use crate::security::roles::SessionRole;
     use crate::ConnectOpts;
     use crate::Database;
-    use crate::SqliteDialect;
 
     #[test]
     fn view_expansion_restores_context_after_errors() {
@@ -768,25 +787,36 @@ mod tests {
     /// Verify that REGEXP produces the correct error when no regexp function is registered.
     #[test]
     fn test_regexp_no_function_registered() {
-        let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let (db, conn) = open_database();
         let schema = db.schema.lock().clone();
         let pager = conn.pager.load().clone();
 
         // Use an empty SymbolTable so regexp() is not available.
         let empty_syms = SymbolTable::new();
-        let cmd = crate::dialect::parse_statement(&crate::SqliteDialect, "SELECT 'x' REGEXP 'y'")
-            .transpose()
-            .unwrap()
-            .unwrap();
-        let stmt = match cmd {
-            ast::Cmd::Stmt(s) => s,
-            _ => panic!("expected statement"),
+        // SELECT 'x' REGEXP 'y'
+        let regexp = ast::Expr::Like {
+            lhs: Box::new(text("x")),
+            not: false,
+            op: ast::LikeOperator::Regexp,
+            rhs: Box::new(text("y")),
+            escape: None,
         };
-
+        let stmt = ast::Stmt::Select(ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ast::ResultColumn::Expr(Box::new(regexp), None)],
+                    from: None,
+                    where_clause: None,
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        });
         let result = translate(
             &schema,
             stmt,
@@ -804,156 +834,33 @@ mod tests {
         );
     }
 
-    /// The SQLite parser has no syntax for these statements, so the test
-    /// builds the statements a frontend with roles would build.
-    #[test]
-    fn dialect_without_roles_refuses_role_owner_privilege_and_row_security_statements() {
-        let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE t(a)").unwrap();
-        conn.execute("CREATE SEQUENCE s").unwrap();
-
-        let table = || ast::QualifiedName::single(ast::Name::exact("t".to_string()));
-        let role = || ast::RoleSpec::Name("r".to_string());
-        let alter_table = |body| {
-            ast::Stmt::AlterTable(ast::AlterTable {
-                name: table(),
-                body,
-            })
-        };
-        let grant = |revoke, objects| {
-            ast::Stmt::Grant(ast::Grant {
-                revoke,
-                objects,
-                grantees: vec![ast::Grantee::Role(role())],
-            })
-        };
-        let privileges_on_table = || ast::GrantObjects::Relations {
-            privileges: vec![ast::Privilege::Select],
-            on_sequences: false,
-            relations: vec![table()],
-        };
-        let member_roles = || ast::GrantObjects::Roles(vec!["admin".to_string()]);
-
-        let statements = [
-            (
-                grant(false, privileges_on_table()),
-                "GRANT is not supported",
-            ),
-            (
-                grant(true, privileges_on_table()),
-                "REVOKE is not supported",
-            ),
-            (
-                ast::Stmt::CreateRole {
-                    role_name: "r".to_string(),
-                    options: ast::RoleOptions::default(),
-                },
-                "CREATE ROLE is not supported",
-            ),
-            (
-                grant(false, member_roles()),
-                "GRANT of role membership is not supported",
-            ),
-            (
-                grant(true, member_roles()),
-                "REVOKE of role membership is not supported",
-            ),
-            (
-                alter_table(ast::AlterTableBody::OwnerTo {
-                    kind: ast::RelationKind::Table,
-                    role: role(),
-                    if_exists: false,
-                }),
-                "ALTER ... OWNER TO is not supported",
-            ),
-            (
-                ast::Stmt::AlterSequenceOwnedBy {
-                    seq_name: ast::QualifiedName::single(ast::Name::exact("s".to_string())),
-                    owner: Some((table(), ast::Name::exact("a".to_string()))),
-                },
-                "ALTER SEQUENCE ... OWNED BY is not supported",
-            ),
-            (
-                alter_table(ast::AlterTableBody::EnableRowSecurity),
-                "row-level security is not supported",
-            ),
-            (
-                alter_table(ast::AlterTableBody::DisableRowSecurity),
-                "row-level security is not supported",
-            ),
-            (
-                ast::Stmt::CreatePolicy(Box::new(ast::CreatePolicy {
-                    policy_name: ast::Name::exact("p".to_string()),
-                    tbl_name: table(),
-                    permissive: true,
-                    command: ast::PolicyCommand::All,
-                    roles: vec![ast::Grantee::Public],
-                    using_expr: None,
-                    check_expr: None,
-                    using_sql: None,
-                    check_sql: None,
-                })),
-                "row-level security is not supported",
-            ),
-            (
-                ast::Stmt::DropPolicy {
-                    if_exists: false,
-                    policy_name: ast::Name::exact("p".to_string()),
-                    tbl_name: table(),
-                },
-                "row-level security is not supported",
-            ),
-        ];
-
-        for (stmt, expected) in statements {
-            let description = format!("{stmt:?}");
-            let schema = db.schema.lock().clone();
-            let result = translate(
-                &schema,
-                stmt,
-                conn.pager.load().clone(),
-                conn.clone(),
-                &SymbolTable::new(),
-                QueryMode::Normal,
-                "",
-                crate::statement::StatementOrigin::Root,
-            );
-            match result {
-                Err(crate::LimboError::ParseError(message)) => {
-                    assert_eq!(message, expected, "{description}")
-                }
-                Err(other) => panic!("{description}: expected a parse error, got {other:?}"),
-                Ok(_) => panic!("{description}: expected an error"),
-            }
-        }
-    }
-
     #[test]
     fn test_insert_autoincrement_with_malformed_sqlite_sequence_is_corrupt() {
-        let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
-            .unwrap();
-
+        let (db, conn) = open_database();
         let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
-        let seq_root_page = schema
-            .get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
-            .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
-            .root_page;
-        let malformed_seq = BTreeTable::from_stored_sql(
-            &crate::SqliteDialect,
-            "CREATE TABLE sqlite_sequence(name)",
-            seq_root_page,
-            false,
-        )
-        .expect("malformed sqlite_sequence SQL should parse");
+        schema
+            .add_btree_table(NamespaceId::ROOT, Arc::new(autoincrement_table_t()))
+            .unwrap();
+        // CREATE TABLE sqlite_sequence(name)
+        let malformed_seq = BTreeTable::new(
+            3,
+            SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+            crate::alloc::vec![],
+            crate::alloc::vec![Column::new(
+                Some("name".to_string()),
+                String::new(),
+                None,
+                None,
+                Type::Null,
+                None,
+                ColDef::default(),
+            )],
+            BTreeCharacteristics::HAS_ROWID,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        );
         schema.insert_table(
             NamespaceId::ROOT,
             SQLITE_SEQUENCE_TABLE_NAME.to_string(),
@@ -963,19 +870,9 @@ mod tests {
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();
 
-        let cmd =
-            crate::dialect::parse_statement(&crate::SqliteDialect, "INSERT INTO t(v) VALUES('x')")
-                .transpose()
-                .unwrap()
-                .unwrap();
-        let stmt = match cmd {
-            ast::Cmd::Stmt(s) => s,
-            _ => panic!("expected statement"),
-        };
-
         let err = translate(
             &schema,
-            stmt,
+            insert_into_t(),
             pager,
             conn,
             &syms,
@@ -997,33 +894,21 @@ mod tests {
 
     #[test]
     fn test_insert_autoincrement_with_missing_sqlite_sequence_is_corrupt() {
-        let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
-            .unwrap();
-
+        let (db, conn) = open_database();
         let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
-        schema.take_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME);
+        schema
+            .add_btree_table(NamespaceId::ROOT, Arc::new(autoincrement_table_t()))
+            .unwrap();
+        assert!(schema
+            .get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
+            .is_none());
 
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();
 
-        let cmd =
-            crate::dialect::parse_statement(&crate::SqliteDialect, "INSERT INTO t(v) VALUES('x')")
-                .transpose()
-                .unwrap()
-                .unwrap();
-        let stmt = match cmd {
-            ast::Cmd::Stmt(s) => s,
-            _ => panic!("expected statement"),
-        };
-
         let err = translate(
             &schema,
-            stmt,
+            insert_into_t(),
             pager,
             conn,
             &syms,
@@ -1041,5 +926,70 @@ mod tests {
             }
             other => panic!("expected LimboError::Corrupt, got: {other}"),
         }
+    }
+
+    fn open_database() -> (Arc<Database>, Arc<crate::Connection>) {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(DialectThatCannotParse)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        (db, conn)
+    }
+
+    /// `CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)`
+    fn autoincrement_table_t() -> BTreeTable {
+        let id = Column::new(
+            Some("id".to_string()),
+            "INTEGER".to_string(),
+            None,
+            None,
+            Type::Integer,
+            None,
+            ColDef {
+                flags: ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias,
+                ..Default::default()
+            },
+        );
+        let v = Column::new_default_text(Some("v".to_string()), "TEXT".to_string(), None);
+        BTreeTable::new(
+            2,
+            "t".to_string(),
+            crate::alloc::vec![("id".to_string(), ast::SortOrder::Asc)],
+            crate::alloc::vec![id, v],
+            BTreeCharacteristics::HAS_ROWID | BTreeCharacteristics::HAS_AUTOINCREMENT,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        )
+    }
+
+    /// `INSERT INTO t(v) VALUES('x')`
+    fn insert_into_t() -> ast::Stmt {
+        ast::Stmt::Insert {
+            with: None,
+            or_conflict: None,
+            tbl_name: ast::QualifiedName::single(ast::Name::exact("t".to_string())),
+            columns: vec![ast::Name::exact("v".to_string())],
+            body: ast::InsertBody::Select(
+                ast::Select {
+                    with: None,
+                    body: ast::SelectBody {
+                        select: ast::OneSelect::Values(vec![vec![Box::new(text("x"))]]),
+                        compounds: vec![],
+                    },
+                    order_by: vec![],
+                    limit: None,
+                },
+                None,
+            ),
+            returning: vec![],
+            overriding_system_value: false,
+        }
+    }
+
+    fn text(value: &str) -> ast::Expr {
+        ast::Expr::Literal(ast::Literal::String(format!("'{value}'")))
     }
 }

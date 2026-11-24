@@ -823,6 +823,36 @@ test fk-deferred-self-unique-parent-affinity-with-child-index {
 expect error {
 }
 
+# The parent-side check of an INSERT runs after the new row is written. It
+# must not count the new row as a child of its own key, or a row that
+# references itself repairs a deferred violation of a different row.
+@cross-check-integrity
+test fk-deferred-self-reference-insert-does-not-repair-other-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b REFERENCES t1(a) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO t1 VALUES(1, 99);
+    INSERT INTO t1 VALUES(2, 2);
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-deferred-self-reference-insert-does-not-repair-other-row-indexed {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b REFERENCES t1(a) DEFERRABLE INITIALLY DEFERRED);
+    CREATE INDEX i1 ON t1(b);
+    BEGIN;
+    INSERT INTO t1 VALUES(1, 99);
+    INSERT INTO t1 VALUES(2, 2);
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
 @cross-check-integrity
 test fk-self-unique-same-row-stored-values-match {
     PRAGMA foreign_keys=ON;
@@ -4819,6 +4849,117 @@ test fk-deferred-null-parent-key-does-not-repay {
 expect error {
 }
 
+# A partial index on the child key has no entries for the child rows that fail
+# its WHERE clause. The parent-side checks must still find those child rows.
+@cross-check-integrity
+test fk-delete-parent-child-outside-partial-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY);
+    CREATE TABLE t2(b REFERENCES t1(a), c);
+    CREATE INDEX i2 ON t2(b) WHERE c IS NULL;
+    INSERT INTO t1 VALUES(1);
+    INSERT INTO t2 VALUES(1, 'x');
+    DELETE FROM t1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# The scan that replaces the partial index compares the values like SQLite:
+# with numeric affinity, so the TEXT value '1' matches the integer key 1.
+@cross-check-integrity
+test fk-delete-parent-text-child-outside-partial-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY);
+    CREATE TABLE t2(b TEXT REFERENCES t1(a), c);
+    CREATE INDEX i2 ON t2(b) WHERE c IS NULL;
+    INSERT INTO t1 VALUES(1);
+    INSERT INTO t2 VALUES(1, 'x');
+    DELETE FROM t1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-update-parent-key-child-outside-partial-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY);
+    CREATE TABLE t2(b REFERENCES t1(a), c);
+    CREATE INDEX i2 ON t2(b) WHERE c IS NULL;
+    INSERT INTO t1 VALUES(1);
+    INSERT INTO t2 VALUES(1, 'x');
+    UPDATE t1 SET a = 2;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-deferred-insert-parent-repairs-child-outside-partial-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY);
+    CREATE TABLE t2(b REFERENCES t1(a) DEFERRABLE INITIALLY DEFERRED, c);
+    CREATE INDEX i2 ON t2(b) WHERE c IS NULL;
+    BEGIN;
+    INSERT INTO t2 VALUES(1, 'x');
+    INSERT INTO t1 VALUES(1);
+    COMMIT;
+    SELECT a FROM t1;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test fk-deferred-update-parent-key-repairs-child-outside-partial-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY);
+    CREATE TABLE t2(b REFERENCES t1(a) DEFERRABLE INITIALLY DEFERRED, c);
+    CREATE INDEX i2 ON t2(b) WHERE c IS NULL;
+    INSERT INTO t1 VALUES(1);
+    BEGIN;
+    INSERT INTO t2 VALUES(2, 'x');
+    UPDATE t1 SET a = 2;
+    COMMIT;
+    SELECT a FROM t1;
+}
+expect {
+    2
+}
+
+# The scan uses the collation of the parent key, not the NOCASE collation of
+# the partial index, so the child value 'A' does not reference the key 'a'.
+@cross-check-integrity
+test fk-delete-parent-nocase-partial-index-uses-parent-collation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a TEXT PRIMARY KEY);
+    CREATE TABLE t2(b REFERENCES t1(a), c);
+    CREATE INDEX i2 ON t2(b COLLATE NOCASE) WHERE c IS NULL;
+    INSERT INTO t1 VALUES('a'), ('A');
+    INSERT INTO t2 VALUES('A', 'x');
+    DELETE FROM t1 WHERE a = 'a';
+    SELECT a FROM t1;
+}
+expect {
+    A
+}
+
+@cross-check-integrity
+test fk-deferred-insert-parent-nocase-partial-index-does-not-repair {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(a TEXT PRIMARY KEY);
+    CREATE TABLE t2(b REFERENCES t1(a) DEFERRABLE INITIALLY DEFERRED, c);
+    CREATE INDEX i2 ON t2(b COLLATE NOCASE) WHERE c IS NULL;
+    BEGIN;
+    INSERT INTO t2 VALUES('A', 'x');
+    INSERT INTO t1 VALUES('a');
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
 # UPDATE and UPSERT only emit parent-side foreign-key bytecode when the
 # statement can change the key that the children point at. These snapshots record
 # which statements get the OLD/NEW key probes and which get the CASCADE,
@@ -4951,6 +5092,308 @@ test fk-deferred-upsert-rowid-alias-child-change-creates-violation {
     BEGIN;
     INSERT INTO c(k, a) VALUES(3, 7) ON CONFLICT DO UPDATE SET k=9;
     COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# A REPLACE delete runs ON DELETE CASCADE, and a trigger on the child table
+# inserts the replaced key again. The uniqueness checks must run again after
+# the delete, so the REPLACE fails instead of adding a duplicate key.
+test fk-replace-cascade-trigger-reinserts-unique-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p1(a, b UNIQUE);
+    CREATE TABLE c1(c, d REFERENCES p1(b) ON DELETE CASCADE);
+    CREATE TRIGGER tr6 AFTER DELETE ON c1 BEGIN
+      INSERT INTO p1 VALUES(4, 1);
+    END;
+    INSERT INTO p1 VALUES(1, 1);
+    INSERT INTO c1 VALUES(2, 1);
+    REPLACE INTO p1 VALUES(3, 1);
+}
+expect error {
+    UNIQUE constraint failed: p1.b
+}
+
+test fk-replace-cascade-set-null-trigger-reinserts-unique-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p1(a, b UNIQUE);
+    CREATE TABLE c1(c, d REFERENCES p1(b) ON DELETE SET NULL);
+    CREATE TRIGGER tr6 AFTER UPDATE ON c1 BEGIN
+      INSERT INTO p1 VALUES(4, 1);
+    END;
+    INSERT INTO p1 VALUES(1, 1);
+    INSERT INTO c1 VALUES(2, 1);
+    INSERT OR REPLACE INTO p1 SELECT 3, 1;
+}
+expect error {
+    UNIQUE constraint failed: p1.b
+}
+
+# The trigger takes the rowid that was chosen for the new row.
+test fk-replace-cascade-trigger-takes-new-rowid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p1(a, b UNIQUE);
+    CREATE TABLE c1(c, d REFERENCES p1(b) ON DELETE CASCADE);
+    CREATE TRIGGER tr6 AFTER DELETE ON c1 BEGIN
+      INSERT INTO p1(rowid, a, b) VALUES(2, 4, 9);
+    END;
+    INSERT INTO p1 VALUES(1, 1);
+    INSERT INTO c1 VALUES(2, 1);
+    REPLACE INTO p1 VALUES(3, 1);
+}
+expect error {
+    UNIQUE constraint failed: p1.rowid
+}
+
+test fk-replace-cascade-trigger-reinserts-integer-primary-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p1(a INTEGER PRIMARY KEY, b);
+    CREATE TABLE c1(c, d REFERENCES p1(a) ON DELETE CASCADE);
+    CREATE TRIGGER tr6 AFTER DELETE ON c1 BEGIN
+      INSERT INTO p1 VALUES(5, 'trigger');
+    END;
+    INSERT INTO p1 VALUES(5, 'five');
+    INSERT INTO c1 VALUES(1, 5);
+    REPLACE INTO p1 VALUES(5, 'new');
+}
+expect error {
+    UNIQUE constraint failed: p1.a
+}
+
+# SQLite checks only the REPLACE constraints again, and leaves a duplicate
+# in the index of `a`.
+@skip-if sqlite "SQLite leaves a duplicate entry in the UNIQUE index of a"
+test fk-replace-cascade-trigger-reinserts-key-of-abort-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p1(a UNIQUE, b UNIQUE ON CONFLICT REPLACE);
+    CREATE TABLE c1(c, d REFERENCES p1(b) ON DELETE CASCADE);
+    CREATE TRIGGER tr6 AFTER DELETE ON c1 BEGIN
+      INSERT INTO p1 VALUES(7, 9);
+    END;
+    INSERT INTO p1 VALUES(1, 1);
+    INSERT INTO c1 VALUES(2, 1);
+    INSERT INTO p1 VALUES(7, 1);
+}
+expect error {
+    UNIQUE constraint failed: p1.a
+}
+
+# The rows the triggers insert do not conflict with the new rows, so the
+# REPLACE succeeds.
+test fk-replace-cascade-trigger-inserts-other-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p1(a, b UNIQUE);
+    CREATE TABLE c1(c, d REFERENCES p1(b) ON DELETE CASCADE);
+    CREATE INDEX p1a ON p1(a);
+    CREATE TRIGGER tr6 AFTER DELETE ON c1 BEGIN
+      INSERT INTO p1(rowid, a, b) VALUES(old.c * 100, old.c, old.c);
+    END;
+    INSERT INTO p1 VALUES(1, 1), (2, 2);
+    INSERT INTO c1 VALUES(7, 1), (8, 2);
+    REPLACE INTO p1 VALUES(3, 1), (4, 4), (5, 2);
+    SELECT rowid, a, b FROM p1 ORDER BY rowid;
+    SELECT count(*) FROM c1;
+    PRAGMA integrity_check;
+}
+expect {
+    3|3|1
+    700|7|7
+    701|4|4
+    702|5|2
+    800|8|8
+    0
+    ok
+}
+
+test fk-update-or-replace-cascade-trigger-reinserts-unique-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p1(a, b UNIQUE);
+    CREATE TABLE c1(c, d REFERENCES p1(b) ON DELETE CASCADE);
+    CREATE TRIGGER tr6 AFTER DELETE ON c1 BEGIN
+      INSERT INTO p1 VALUES(4, 1);
+    END;
+    INSERT INTO p1 VALUES(1, 1), (2, 2);
+    INSERT INTO c1 VALUES(2, 1);
+    UPDATE OR REPLACE p1 SET b=1 WHERE a=2;
+}
+expect error {
+    UNIQUE constraint failed: p1.b
+}
+
+test fk-update-or-replace-cascade-trigger-reinserts-integer-primary-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p1(a INTEGER PRIMARY KEY, b);
+    CREATE TABLE c1(c, d REFERENCES p1(a) ON DELETE CASCADE);
+    CREATE TRIGGER tr6 AFTER DELETE ON c1 BEGIN
+      INSERT INTO p1 VALUES(5, 'trigger');
+    END;
+    INSERT INTO p1 VALUES(2, 'two'), (5, 'five');
+    INSERT INTO c1 VALUES(1, 5);
+    UPDATE OR REPLACE p1 SET a=5 WHERE a=2;
+}
+expect error {
+    UNIQUE constraint failed: p1.a
+}
+
+test fk-update-or-replace-cascade-trigger-inserts-other-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p1(a, b UNIQUE);
+    CREATE TABLE c1(c, d REFERENCES p1(b) ON DELETE CASCADE);
+    CREATE TRIGGER tr6 AFTER DELETE ON c1 BEGIN
+      INSERT INTO p1 VALUES(old.c, old.c);
+    END;
+    INSERT INTO p1 VALUES(1, 1), (2, 2);
+    INSERT INTO c1 VALUES(7, 1);
+    UPDATE OR REPLACE p1 SET b=1 WHERE a=2;
+    SELECT rowid, a, b FROM p1 ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    2|2|1
+    3|7|7
+    ok
+}
+
+# The cascade run by the REPLACE delete of row 1 also deletes row 2, the row
+# being updated. The UPDATE skips that row instead of writing it.
+test fk-update-or-replace-cascade-deletes-updated-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p1(id INTEGER PRIMARY KEY, b UNIQUE, par REFERENCES p1(id) ON DELETE CASCADE);
+    INSERT INTO p1 VALUES(1, 1, NULL), (2, 2, 1), (3, 3, NULL);
+    UPDATE OR REPLACE p1 SET b=1;
+    SELECT * FROM p1;
+    PRAGMA integrity_check;
+}
+expect {
+    3|1|
+    ok
+}
+
+test fk-update-or-replace-cascade-trigger-deletes-updated-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p1(id INTEGER PRIMARY KEY, b UNIQUE);
+    CREATE TABLE c1(x REFERENCES p1(b) ON DELETE CASCADE);
+    CREATE TRIGGER tr AFTER DELETE ON c1 BEGIN
+      DELETE FROM p1 WHERE id=2;
+    END;
+    INSERT INTO p1 VALUES(1, 1), (2, 2);
+    INSERT INTO c1 VALUES(1);
+    UPDATE OR REPLACE p1 SET b=1 WHERE id=2;
+    SELECT count(*) FROM p1;
+    SELECT count(*) FROM c1;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    0
+    ok
+}
+
+# With OR REPLACE in the statement, the new rowid is checked before the UNIQUE
+# index. The cascade from the delete for b inserts a row at the new rowid,
+# so the second check fails instead of deleting that row.
+test fk-update-or-replace-rowid-checked-before-unique-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p1(a INTEGER PRIMARY KEY, b UNIQUE);
+    CREATE TABLE c1(c, d REFERENCES p1(b) ON DELETE CASCADE);
+    CREATE TRIGGER tr6 AFTER DELETE ON c1 BEGIN
+      INSERT INTO p1 VALUES(7, 8);
+    END;
+    INSERT INTO p1 VALUES(1, 1), (2, 2);
+    INSERT INTO c1 VALUES(2, 1);
+    UPDATE OR REPLACE p1 SET a = 7, b = 1 WHERE a = 2;
+}
+expect error {
+    UNIQUE constraint failed: p1.a
+}
+
+# With REPLACE declared on the INTEGER PRIMARY KEY, the rowid is checked
+# after the UNIQUE index, so the IGNORE of b skips the row first.
+test update-table-replace-rowid-checked-after-ignore-index {
+    CREATE TABLE p1(a INTEGER PRIMARY KEY ON CONFLICT REPLACE, b UNIQUE ON CONFLICT IGNORE);
+    INSERT INTO p1 VALUES(1, 1), (2, 2), (3, 3);
+    UPDATE p1 SET a = 3, b = 1 WHERE a = 2;
+    SELECT a, b FROM p1 ORDER BY a;
+}
+expect {
+    1|1
+    2|2
+    3|3
+}
+
+# An INTEGER PRIMARY KEY is stored only as the rowid, with NULL in its record
+# slot. The last bytes of the page are the only cell: payload size, rowid 119
+# (0x77), header size, serial type 0 (NULL) for id, serial type 9 for v = 1.
+@backend cli
+@skip-if sqlite "the sqlite3 build used by the tests has no sqlite_dbpage"
+@skip-if mvcc "MVCC keeps the updated row out of the B-tree until a checkpoint"
+test fk-update-stores-rowid-alias-as-null {
+    CREATE TABLE solo(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO solo VALUES(119, 0);
+    PRAGMA foreign_keys=ON;
+    UPDATE solo SET v = v + 1;
+    SELECT hex(substr(data, -6)) FROM sqlite_dbpage WHERE pgno = 2;
+}
+expect {
+    000377030009
+}
+
+@backend cli
+@skip-if sqlite "the sqlite3 build used by the tests has no sqlite_dbpage"
+@skip-if mvcc "MVCC keeps the updated row out of the B-tree until a checkpoint"
+test fk-update-parent-stores-rowid-alias-as-null {
+    CREATE TABLE p(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE c(x INTEGER REFERENCES p(id));
+    INSERT INTO p VALUES(119, 0);
+    INSERT INTO c VALUES(119);
+    PRAGMA foreign_keys=ON;
+    UPDATE p SET v = v + 1;
+    SELECT hex(substr(data, -6)) FROM sqlite_dbpage WHERE pgno = 2;
+}
+expect {
+    000377030009
+}
+
+@backend cli
+@skip-if sqlite "the sqlite3 build used by the tests has no sqlite_dbpage"
+@skip-if mvcc "MVCC keeps the updated row out of the B-tree until a checkpoint"
+test fk-update-child-stores-rowid-alias-as-null {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INTEGER REFERENCES p(id));
+    INSERT INTO p VALUES(1), (2);
+    INSERT INTO c VALUES(119, 1);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET x = 2;
+    SELECT hex(substr(data, -6)) FROM sqlite_dbpage WHERE pgno = 3;
+}
+expect {
+    047703000102
+}
+
+# The foreign key checks read the key of an INTEGER PRIMARY KEY table from the
+# rowid, also when the UPDATE does not set it.
+test fk-update-rowid-key-not-set-is-checked {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INTEGER REFERENCES p(id));
+    INSERT INTO p VALUES(1, 0);
+    INSERT INTO c VALUES(1, 1);
+    UPDATE p SET v = 5;
+    UPDATE c SET x = 1;
+    SELECT p.id, p.v, c.id, c.x FROM p, c;
+}
+expect {
+    1|5|1|1
+}
+
+test fk-update-child-without-parent-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INTEGER REFERENCES p(id));
+    INSERT INTO p VALUES(1, 0);
+    INSERT INTO c VALUES(1, 1);
+    UPDATE c SET x = 2;
 }
 expect error {
     FOREIGN KEY constraint failed

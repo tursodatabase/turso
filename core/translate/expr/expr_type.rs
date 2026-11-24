@@ -5,7 +5,7 @@
 //! wire protocol should report for it asks here instead of matching on expression
 //! shapes itself.
 
-use turso_parser::ast;
+use crate::ast;
 
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
@@ -16,7 +16,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::{Plan, SelectPlan, TableReferences};
 use crate::type_ordering::TypeOrdering;
-use crate::types::{StorageClass, StrictType};
+use crate::types::{Conversion, StorageClass, StrictType};
 use crate::vdbe::affinity::Affinity;
 use crate::{Result, SymbolTable};
 
@@ -624,14 +624,19 @@ pub(crate) fn compound_column_type<'p>(
     )
 }
 
-fn select_column_type(select: &SelectPlan, column: usize, resolver: &Resolver) -> ExprType {
-    match select.result_columns.get(column) {
-        Some(result_column) => type_of(
-            &result_column.expr,
-            &TypeEnv::new(Some(&select.table_references), resolver),
-        ),
-        None => ExprType::Unknown,
+/// The type of column `column` of one SELECT or VALUES list. The result
+/// columns of a VALUES list only hold its column names, so its type is the
+/// common type of the column in every row.
+pub(crate) fn select_column_type(
+    select: &SelectPlan,
+    column: usize,
+    resolver: &Resolver,
+) -> ExprType {
+    let env = TypeEnv::new(Some(&select.table_references), resolver);
+    if column >= select.result_columns.len() {
+        return ExprType::Unknown;
     }
+    common_type(select.column_exprs(column), &env)
 }
 
 /// The type of a column of a table or of the table being written. Derived
@@ -954,7 +959,13 @@ pub(crate) fn decode_type(
     if type_def.decode_returns_value_unchanged() {
         return None;
     }
-    let decode = type_def.decode()?;
+    let decode = match type_def.decode()? {
+        Conversion::Expr(decode) => decode,
+        // A type written in Rust says what its DECODE gives when it is
+        // registered.
+        Conversion::Function(_) => return Some(ExprType::Builtin(type_def.value_type())),
+        Conversion::Unchanged => return None,
+    };
     Some(type_of(
         decode,
         &TypeEnv::TypeBody {
@@ -1074,16 +1085,6 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
                 .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),
             1,
         ),
-        // A value of another row: its own argument's type, or for lag and
-        // lead the common type of the argument and the default (the third
-        // argument).
-        Func::Window(WindowFunc::Lag | WindowFunc::Lead) => common_type(
-            args.iter()
-                .enumerate()
-                .filter(|(i, _)| *i != 1)
-                .map(|(_, arg)| arg.as_ref()),
-            env,
-        ),
         Func::Window(WindowFunc::FirstValue | WindowFunc::LastValue | WindowFunc::NthValue) => args
             .first()
             .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),
@@ -1102,6 +1103,9 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
         ResultType::FirstArgument => first_argument().unwrap_or(any),
         ResultType::OneOfTheArguments => common_type(args.iter().map(|arg| arg.as_ref()), env),
         ResultType::OneOfTheIifValues => common_type(iif_values(args).map(|arg| arg.as_ref()), env),
+        ResultType::OneOfTheFirstAndThirdArguments => {
+            common_type(first_and_third_arguments(args).map(|arg| arg.as_ref()), env)
+        }
         ResultType::NumberOfTheFirstArgumentsType => match first_argument() {
             Some(ty) => negated_type(ty),
             None => any,
@@ -1161,6 +1165,17 @@ pub(crate) fn iif_values(args: &[Box<ast::Expr>]) -> impl Iterator<Item = &Box<a
     args.iter()
         .enumerate()
         .filter(move |(i, _)| i % 2 == 1 || (has_else && *i == args.len() - 1))
+        .map(|(_, arg)| arg)
+}
+
+/// The arguments of `lag(x, n, default)` that the result is one of: x and the
+/// default.
+pub(crate) fn first_and_third_arguments(
+    args: &[Box<ast::Expr>],
+) -> impl Iterator<Item = &Box<ast::Expr>> + Clone {
+    args.iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 1)
         .map(|(_, arg)| arg)
 }
 
@@ -1407,10 +1422,12 @@ fn builtin_type_of_affinity(affinity: Affinity) -> BuiltinType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{Expr, Literal, Name, Operator, UnaryOperator};
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
+    use crate::schema::SchemaBuilder;
     use crate::translate::emitter::DoubleQuotedDml;
     use crate::{DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
-    use turso_parser::ast::{Cmd, OneSelect, ResultColumn, Stmt};
 
     impl PartialEq for ExprType {
         fn eq(&self, other: &Self) -> bool {
@@ -1447,22 +1464,25 @@ mod tests {
     #[test]
     fn literals_and_casts() {
         check(&[
-            ("1", builtin(BuiltinType::Integer)),
-            ("1.5", builtin(BuiltinType::Decimal)),
-            ("-1.5", builtin(BuiltinType::Decimal)),
-            ("abs(-1.5)", builtin(BuiltinType::Decimal)),
-            ("'a'", ExprType::Untyped),
-            ("x'00'", builtin(BuiltinType::Blob)),
-            ("NULL", ExprType::Null),
-            ("CAST(1 AS TEXT)", builtin(BuiltinType::Text)),
-            ("CAST(1 AS BLOB)", builtin(BuiltinType::Blob)),
-            ("CAST(1 AS cents)", custom("cents", &[])),
-            ("CAST(1 AS numeric(10, 2))", custom("numeric", &["10", "2"])),
+            (int(1), builtin(BuiltinType::Integer)),
+            (num("1.5"), builtin(BuiltinType::Decimal)),
+            (neg(num("1.5")), builtin(BuiltinType::Decimal)),
+            (
+                call("abs", vec![neg(num("1.5"))]),
+                builtin(BuiltinType::Decimal),
+            ),
+            (text("a"), ExprType::Untyped),
+            (blob("00"), builtin(BuiltinType::Blob)),
+            (Expr::Literal(Literal::Null), ExprType::Null),
+            (cast(int(1), ty("TEXT")), builtin(BuiltinType::Text)),
+            (cast(int(1), ty("BLOB")), builtin(BuiltinType::Blob)),
+            (cast(int(1), ty("cents")), custom("cents", &[])),
+            (cast(int(1), numeric(10, 2)), custom("numeric", &[10, 2])),
             // numeric needs a precision and a scale, so without them this is
             // SQLite's NUMERIC.
-            ("CAST(1 AS numeric)", builtin(BuiltinType::Numeric)),
+            (cast(int(1), ty("numeric")), builtin(BuiltinType::Numeric)),
             (
-                "CAST(1 AS cents[])",
+                cast(int(1), array_of("cents", 1)),
                 ExprType::array(custom("cents", &[]), 1),
             ),
         ]);
@@ -1472,78 +1492,127 @@ mod tests {
     fn values_from_several_branches() {
         check(&[
             (
-                "CASE WHEN 1 THEN 1 ELSE 2.5 END",
+                case_when(int(1), int(1), Some(num("2.5"))),
                 builtin(BuiltinType::Decimal),
             ),
             (
-                "CASE WHEN 1 THEN CAST(1 AS REAL) ELSE 2.5 END",
+                case_when(int(1), cast(int(1), ty("REAL")), Some(num("2.5"))),
                 builtin(BuiltinType::Real),
             ),
-            ("CASE WHEN 1 THEN 'a' END", ExprType::Untyped),
+            (case_when(int(1), text("a"), None), ExprType::Untyped),
             (
-                "coalesce(NULL, 'a', CAST(1 AS TEXT))",
+                call(
+                    "coalesce",
+                    vec![
+                        Expr::Literal(Literal::Null),
+                        text("a"),
+                        cast(int(1), ty("TEXT")),
+                    ],
+                ),
                 builtin(BuiltinType::Text),
             ),
-            ("coalesce(1, 'a')", builtin(BuiltinType::Any)),
             (
-                "coalesce(CAST(1 AS cents), CAST(2 AS cents))",
+                call("coalesce", vec![int(1), text("a")]),
+                builtin(BuiltinType::Any),
+            ),
+            (
+                call("coalesce", vec![cents(1), cents(2)]),
                 custom("cents", &[]),
             ),
             (
-                "coalesce(CAST(1 AS numeric(10, 2)), CAST(2 AS numeric(10, 2)))",
-                custom("numeric", &["10", "2"]),
+                call(
+                    "coalesce",
+                    vec![cast(int(1), numeric(10, 2)), cast(int(2), numeric(10, 2))],
+                ),
+                custom("numeric", &[10, 2]),
             ),
             (
-                "coalesce(CAST(1 AS numeric(10, 2)), CAST(2 AS numeric(5, 1)))",
+                call(
+                    "coalesce",
+                    vec![cast(int(1), numeric(10, 2)), cast(int(2), numeric(5, 1))],
+                ),
                 custom("numeric", &[]),
             ),
             // A custom value and a plain one have the custom type's stored type.
             (
-                "coalesce(CAST(1 AS cents), 1)",
+                call("coalesce", vec![cents(1), int(1)]),
                 builtin(BuiltinType::Integer),
             ),
             // Except that a number mixed with numeric is a numeric, so the
             // values compare in numeric order.
             (
-                "coalesce(CAST(1 AS numeric(10, 2)), 0)",
+                call("coalesce", vec![cast(int(1), numeric(10, 2)), int(0)]),
                 custom("numeric", &[]),
             ),
             (
-                "coalesce(CAST(1 AS numeric(10, 2)), 0.5)",
+                call("coalesce", vec![cast(int(1), numeric(10, 2)), num("0.5")]),
                 custom("numeric", &[]),
             ),
             (
-                "coalesce(CAST(1 AS numeric(10, 2)), CAST(0.5 AS REAL))",
+                call(
+                    "coalesce",
+                    vec![cast(int(1), numeric(10, 2)), cast(num("0.5"), ty("REAL"))],
+                ),
                 custom("numeric", &[]),
             ),
             // Two different custom types have their common stored type.
             (
-                "coalesce(CAST(1 AS cents), CAST(2 AS smallint))",
+                call("coalesce", vec![cents(1), cast(int(2), ty("smallint"))]),
                 builtin(BuiltinType::Integer),
             ),
-            ("iif(1, NULL, 2)", builtin(BuiltinType::Integer)),
+            (
+                call("iif", vec![int(1), Expr::Literal(Literal::Null), int(2)]),
+                builtin(BuiltinType::Integer),
+            ),
         ]);
     }
 
     #[test]
     fn arithmetic() {
         check(&[
-            ("1 + 2", builtin(BuiltinType::Integer)),
-            ("1 + 2.5", builtin(BuiltinType::Real)),
-            ("0.5 + 2.5", builtin(BuiltinType::Real)),
-            ("1 + 'a'", builtin(BuiltinType::Numeric)),
-            ("-CAST(1 AS REAL)", builtin(BuiltinType::Real)),
+            (
+                binary(int(1), Operator::Add, int(2)),
+                builtin(BuiltinType::Integer),
+            ),
+            (
+                binary(int(1), Operator::Add, num("2.5")),
+                builtin(BuiltinType::Real),
+            ),
+            (
+                binary(num("0.5"), Operator::Add, num("2.5")),
+                builtin(BuiltinType::Real),
+            ),
+            (
+                binary(int(1), Operator::Add, text("a")),
+                builtin(BuiltinType::Numeric),
+            ),
+            (neg(cast(int(1), ty("REAL"))), builtin(BuiltinType::Real)),
             // cents declares no `+`, so the statement fails with "operator does not exist".
-            ("CAST(1 AS cents) + 1", ExprType::Unknown),
+            (binary(cents(1), Operator::Add, int(1)), ExprType::Unknown),
             // Nor any other operator.
-            ("-CAST(1 AS cents)", ExprType::Unknown),
-            ("~CAST(1 AS cents)", ExprType::Unknown),
-            ("CAST(1 AS cents) & 1", ExprType::Unknown),
-            ("-CAST(1 AS numeric(10, 2))", custom("numeric", &[])),
-            ("-CAST(1 AS smallint)", builtin(BuiltinType::Integer)),
-            ("CAST(1 AS smallint) << 1", builtin(BuiltinType::Integer)),
-            ("abs(CAST(1 AS cents))", builtin(BuiltinType::Integer)),
-            ("1 || 2", builtin(BuiltinType::Text)),
+            (neg(cents(1)), ExprType::Unknown),
+            (
+                Expr::Unary(UnaryOperator::BitwiseNot, Box::new(cents(1))),
+                ExprType::Unknown,
+            ),
+            (
+                binary(cents(1), Operator::BitwiseAnd, int(1)),
+                ExprType::Unknown,
+            ),
+            (neg(cast(int(1), numeric(10, 2))), custom("numeric", &[])),
+            (
+                neg(cast(int(1), ty("smallint"))),
+                builtin(BuiltinType::Integer),
+            ),
+            (
+                binary(cast(int(1), ty("smallint")), Operator::LeftShift, int(1)),
+                builtin(BuiltinType::Integer),
+            ),
+            (call("abs", vec![cents(1)]), builtin(BuiltinType::Integer)),
+            (
+                binary(int(1), Operator::Concat, int(2)),
+                builtin(BuiltinType::Text),
+            ),
         ]);
     }
 
@@ -1551,25 +1620,35 @@ mod tests {
     fn arrays_never_nest() {
         check(&[
             (
-                "array_agg(CAST(1 AS INTEGER[]))",
+                call("array_agg", vec![cast(int(1), array_of("INTEGER", 1))]),
                 ExprType::array(builtin(BuiltinType::Integer), 2),
             ),
             (
-                "array_element(CAST(1 AS INTEGER[][]), 1)",
+                call(
+                    "array_element",
+                    vec![cast(int(1), array_of("INTEGER", 2)), int(1)],
+                ),
                 ExprType::array(builtin(BuiltinType::Integer), 1),
             ),
             (
-                "array_element(CAST(1 AS INTEGER[]), 1)",
+                call(
+                    "array_element",
+                    vec![cast(int(1), array_of("INTEGER", 1)), int(1)],
+                ),
                 builtin(BuiltinType::Integer),
             ),
             (
-                "CAST(1 AS INTEGER[]) || 2",
+                binary(
+                    cast(int(1), array_of("INTEGER", 1)),
+                    Operator::Concat,
+                    int(2),
+                ),
                 ExprType::array(builtin(BuiltinType::Integer), 1),
             ),
         ]);
     }
 
-    fn check(cases: &[(&str, ExprType)]) {
+    fn check(cases: &[(Expr, ExprType)]) {
         let schema = test_schema();
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
@@ -1585,17 +1664,17 @@ mod tests {
             &syms,
             true,
             DoubleQuotedDml::Enabled,
-            Arc::new(crate::SqliteDialect),
+            Arc::new(DialectThatCannotParse),
             None,
             crate::security::roles::RoleId::SUPERUSER,
         );
         let env = TypeEnv::new(None, &resolver);
         let mismatches: Vec<String> = cases
             .iter()
-            .filter_map(|(sql, expected)| {
-                let actual = type_of(&parse_expr(sql), &env);
+            .filter_map(|(expr, expected)| {
+                let actual = type_of(expr, &env);
                 (actual != *expected)
-                    .then(|| format!("  {sql}: expected {expected:?}, got {actual:?}"))
+                    .then(|| format!("  {expr}: expected {expected:?}, got {actual:?}"))
             })
             .collect();
         assert!(
@@ -1626,54 +1705,143 @@ mod tests {
             ),
             (custom("cents", &[]), Some(BuiltinType::Integer)),
             // numeric compares in its own order, which no affinity gives.
-            (custom("numeric", &["10", "2"]), None),
+            (custom("numeric", &[10, 2]), None),
         ];
         for (ty, expected) in cases {
             assert_eq!(value_kind(&ty, &schema), expected, "{ty:?}");
         }
     }
 
-    fn parse_expr(sql: &str) -> ast::Expr {
-        let select_sql = format!("SELECT {sql}");
-        let Ok(Some(Cmd::Stmt(Stmt::Select(select)))) =
-            crate::dialect::parse_statement(&crate::SqliteDialect, &select_sql)
-        else {
-            panic!("not a SELECT: {sql}");
-        };
-        let OneSelect::Select { mut columns, .. } = select.body.select else {
-            panic!("not a plain SELECT: {sql}");
-        };
-        let ResultColumn::Expr(expr, _) = columns.remove(0) else {
-            panic!("not an expression: {sql}");
-        };
-        *expr
-    }
-
     fn builtin(ty: BuiltinType) -> ExprType {
         ExprType::Builtin(ty)
     }
 
-    /// A custom type from the test schema, with its parameters as written.
-    fn custom(name: &str, params: &[&str]) -> ExprType {
+    /// A custom type from the test schema, with its integer parameters.
+    fn custom(name: &str, params: &[i64]) -> ExprType {
         let schema = test_schema();
         ExprType::Custom {
             type_def: Arc::clone(schema.get_type_def_unchecked(name).unwrap()),
-            params: params.iter().map(|p| Box::new(parse_expr(p))).collect(),
+            params: params.iter().map(|&p| Box::new(int(p))).collect(),
         }
     }
 
-    /// The built-in types plus `cents`.
+    fn int(value: i64) -> Expr {
+        num(&value.to_string())
+    }
+
+    fn num(text: &str) -> Expr {
+        Expr::Literal(Literal::Numeric(text.to_string()))
+    }
+
+    fn text(value: &str) -> Expr {
+        Expr::Literal(Literal::String(format!("'{value}'")))
+    }
+
+    fn blob(hex: &str) -> Expr {
+        Expr::Literal(Literal::Blob(format!("x'{hex}'")))
+    }
+
+    fn id(name: &str) -> Expr {
+        Expr::Id(Name::exact(name.to_string()))
+    }
+
+    fn neg(expr: Expr) -> Expr {
+        Expr::Unary(UnaryOperator::Negative, Box::new(expr))
+    }
+
+    fn binary(lhs: Expr, op: Operator, rhs: Expr) -> Expr {
+        Expr::Binary(Box::new(lhs), op, Box::new(rhs))
+    }
+
+    fn call(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::FunctionCall {
+            name: Name::exact(name.to_string()),
+            distinctness: None,
+            args: args.into_iter().map(Box::new).collect(),
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        }
+    }
+
+    /// `CASE WHEN <when> THEN <then> [ELSE <otherwise>] END`
+    fn case_when(when: Expr, then: Expr, otherwise: Option<Expr>) -> Expr {
+        Expr::Case {
+            base: None,
+            when_then_pairs: vec![(Box::new(when), Box::new(then))],
+            else_expr: otherwise.map(Box::new),
+        }
+    }
+
+    fn cast(expr: Expr, type_name: ast::Type) -> Expr {
+        Expr::Cast {
+            expr: Box::new(expr),
+            type_name: Some(type_name),
+        }
+    }
+
+    /// `CAST(<value> AS cents)`
+    fn cents(value: i64) -> Expr {
+        cast(int(value), ty("cents"))
+    }
+
+    fn ty(name: &str) -> ast::Type {
+        array_of(name, 0)
+    }
+
+    fn array_of(name: &str, dimensions: u32) -> ast::Type {
+        ast::Type {
+            name: name.to_string(),
+            size: None,
+            array_dimensions: dimensions,
+        }
+    }
+
+    /// `numeric(<precision>, <scale>)`
+    fn numeric(precision: i64, scale: i64) -> ast::Type {
+        ast::Type {
+            name: "numeric".to_string(),
+            size: Some(ast::TypeSize::TypeSize(
+                Box::new(int(precision)),
+                Box::new(int(scale)),
+            )),
+            array_dimensions: 0,
+        }
+    }
+
+    /// The built-in types numeric and smallint, and the user type `cents`.
     fn test_schema() -> Schema {
-        let mut schema = crate::schema::builtin::schema_builder(&crate::SqliteDialect, true)
+        let mut schema = SchemaBuilder::new()
             .unwrap()
+            .custom_types(true)
+            .type_def("numeric", Arc::new(builtin_type("numeric")))
+            .type_def("smallint", Arc::new(builtin_type("smallint")))
             .build();
+        let sql = "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100";
+        let cents = ast::CreateTypeBody::CustomType {
+            params: vec![],
+            base: "integer".to_string(),
+            encode: Some(Box::new(binary(id("value"), Operator::Multiply, int(100)))),
+            coerce: None,
+            decode: Some(Box::new(binary(id("value"), Operator::Divide, int(100)))),
+            operators: vec![],
+            default: None,
+        };
+        let cents = TypeDef::from_create_type("cents", &cents, sql.to_string()).unwrap();
+        schema.add_type(cents, &SymbolTable::new()).unwrap();
         schema
-            .add_type_from_sql(
-                &crate::SqliteDialect,
-                "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
-                &SymbolTable::new(),
-            )
-            .unwrap();
-        schema
+    }
+
+    /// The built-in type `name`, as the database creates it when custom
+    /// types are on.
+    fn builtin_type(name: &str) -> TypeDef {
+        let ty = crate::types::builtin_types()
+            .into_iter()
+            .find(|ty| ty.name() == name)
+            .expect("no such built-in type");
+        TypeDef::builtin(ty.as_ref()).unwrap()
     }
 }

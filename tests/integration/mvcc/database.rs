@@ -1929,7 +1929,7 @@ fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
     header.schema_cookie = 77.into();
 
     db.mvcc_store
-        .with_header_mut(|header| *header = DatabaseHeader::default(), None)
+        .with_global_header_mut_for_testing(|header| *header = DatabaseHeader::default())
         .unwrap();
     db.mvcc_store
         .insert_table_id_to_rootpage(MVTableId::from(-999_i64), Some(999));
@@ -11015,6 +11015,9 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
         )> {
             self.inner.truncate(checkpointed_through_ts)
         }
+        fn finish_truncate(&self) {
+            self.inner.finish_truncate()
+        }
         fn reset_to_fresh_header(&self) -> Result<Completion> {
             self.inner.reset_to_fresh_header()
         }
@@ -11247,6 +11250,9 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
             turso_core::mvcc::persistent_storage::LogicalLogTruncateOutcome,
         )> {
             self.inner.truncate(checkpointed_through_ts)
+        }
+        fn finish_truncate(&self) {
+            self.inner.finish_truncate()
         }
         fn reset_to_fresh_header(&self) -> Result<Completion> {
             self.inner.reset_to_fresh_header()

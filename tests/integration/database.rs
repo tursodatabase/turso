@@ -557,21 +557,28 @@ fn test_errors_on_zero_divisor_dialect() {
         fn parse_internal(
             &self,
             sql: &str,
-        ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
             turso_sqlite::SqliteDialect.parse_internal(sql)
         }
 
         fn parse_internal_column_definition(
             &self,
             sql: &str,
-        ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+        ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
             turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+        }
+
+        fn parameter_marker_ranges(
+            &self,
+            sql: &str,
+        ) -> turso_core::Result<Vec<std::ops::Range<usize>>> {
+            turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
         }
 
         fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
             Arc::new(SqliteDialect)
         }
-        fn parse(&self, sql: &str) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        fn parse(&self, sql: &str) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
             SqliteDialect.parse(sql)
         }
         fn parse_table_sql(
@@ -581,7 +588,7 @@ fn test_errors_on_zero_divisor_dialect() {
         ) -> turso_core::Result<turso_core::schema::BTreeTable> {
             SqliteDialect.parse_table_sql(sql, root_page)
         }
-        fn parse_table_sql_ast(&self, sql: &str) -> turso_core::Result<turso_parser::ast::Stmt> {
+        fn parse_table_sql_ast(&self, sql: &str) -> turso_core::Result<turso_core::ast::Stmt> {
             SqliteDialect.parse_table_sql_ast(sql)
         }
         fn table_sql_for_replay(&self, sql: &str) -> turso_core::Result<String> {
@@ -590,8 +597,8 @@ fn test_errors_on_zero_divisor_dialect() {
         fn format_table_sql(
             &self,
             input: &str,
-            tbl_name: &turso_parser::ast::QualifiedName,
-            body: &turso_parser::ast::CreateTableBody,
+            tbl_name: &turso_core::ast::QualifiedName,
+            body: &turso_core::ast::CreateTableBody,
         ) -> turso_core::Result<String> {
             SqliteDialect.format_table_sql(input, tbl_name, body)
         }
@@ -754,7 +761,7 @@ impl InternalVirtualTable for StaticTable {
     fn name(&self) -> String {
         self.name.to_string()
     }
-    fn columns(&self) -> Vec<turso_parser::ast::ColumnDefinition> {
+    fn columns(&self) -> Vec<turso_core::ast::ColumnDefinition> {
         vec![
             turso_core::vtab::column_definition("key", "TEXT"),
             turso_core::vtab::column_definition("value", "INTEGER"),

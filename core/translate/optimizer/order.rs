@@ -1,3 +1,4 @@
+use crate::ast::{self, SortOrder, TableInternalId};
 use crate::schema::{impl_effective_nulls_order, Column, Table};
 use crate::translate::expr_context::ExprContext;
 use crate::turso_assert_greater_than_or_equal;
@@ -20,7 +21,6 @@ use crate::{
     },
     util::exprs_are_equivalent,
 };
-use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use super::{access_method::AccessMethod, cost::index_access_is_unique_point_lookup, join::JoinN};
 
@@ -73,17 +73,6 @@ pub enum OrderTargetPurpose {
 pub struct OrderTarget {
     pub columns: Vec<ColumnOrder>,
     pub purpose: OrderTargetPurpose,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EqualityPrefixScope {
-    /// Candidate scoring may skip any equality-constrained seek prefix because
-    /// it only reasons about the order within that specific seek.
-    AnyEquality,
-    /// Final ORDER BY / GROUP BY elimination may only skip globally constant
-    /// equality prefixes. Join-dependent equalities vary per outer row and do
-    /// not guarantee a globally ordered concatenation of inner scans.
-    ConstantEquality,
 }
 
 impl OrderTarget {
@@ -270,7 +259,6 @@ pub fn plan_groups_equal_keys(
         else {
             return Ok(false);
         };
-        // TODO: sqlite also does this for inner table columns when the outer table returns only one row, we don't yet
         if plan_satisfies_order_target(
             plan,
             access_methods_arena,
@@ -336,29 +324,18 @@ pub fn plan_satisfies_order_target(
 
     let mut target_col_idx = 0;
     let mut prior_tables = TableMask::default();
+    // Tables whose current row is the same for all output rows that share the
+    // ORDER BY values consumed so far, so their ORDER BY terms need no sorting.
+    // This is SQLite's `orderDistinctMask`.
+    let mut fixed_row_tables = TableMask::default();
     let num_cols_in_order_target = order_target.columns.len();
-    for (loop_pos, (table_index, access_method_index)) in plan.data.iter().enumerate() {
+    for (table_index, access_method_index) in plan.data.iter() {
         let access_method = &access_methods_arena[*access_method_index];
         let table_ref = &joined_tables[*table_index];
 
         // A hash build is consumed into an unordered hash table and omitted
         // from the execution loop order. Its scan order cannot order output.
         if hash_join_build_tables.get(*table_index) {
-            return false;
-        }
-
-        // Outer joins can emit an extra row with NULLs on the right-hand side
-        // when no match is found. Because that row is produced after the scan or
-        // seek, we cannot rely on the right-hand table's access order to satisfy
-        // ORDER BY / GROUP BY terms that reference that table.
-        if table_ref
-            .join_info
-            .as_ref()
-            .is_some_and(|join_info| join_info.is_outer())
-            && order_target.columns[target_col_idx..]
-                .iter()
-                .any(|target_col| target_col.table_id == table_ref.internal_id)
-        {
             return false;
         }
 
@@ -394,7 +371,6 @@ pub fn plan_satisfies_order_target(
                         order_target,
                         target_col_idx,
                         schema,
-                        EqualityPrefixScope::ConstantEquality,
                     )
                 }
             }
@@ -410,7 +386,6 @@ pub fn plan_satisfies_order_target(
                 order_target,
                 target_col_idx,
                 schema,
-                EqualityPrefixScope::ConstantEquality,
             ),
             AccessMethodParams::Subquery { iter_dir } => {
                 let Table::FromClauseSubquery(from_clause_subquery) = &table_ref.table else {
@@ -432,10 +407,24 @@ pub fn plan_satisfies_order_target(
             _ => return false,
         };
 
-        if consumed.consumed == 0 {
-            return false;
-        }
         target_col_idx += consumed.consumed;
+        if access_method_emits_unique_order_prefix(access_method, &consumed) {
+            fixed_row_tables
+                .set(*table_index)
+                .expect("a plan cannot contain more than the table limit");
+        }
+        while order_target
+            .columns
+            .get(target_col_idx)
+            .is_some_and(|target_col| {
+                joined_tables
+                    .iter()
+                    .position(|table| table.internal_id == target_col.table_id)
+                    .is_some_and(|table_idx| fixed_row_tables.get(table_idx))
+            })
+        {
+            target_col_idx += 1;
+        }
         if target_col_idx == num_cols_in_order_target {
             return true;
         }
@@ -444,20 +433,13 @@ pub fn plan_satisfies_order_target(
         // output by this loop are unique for the columns so far. If they're not unique,
         // the inner loop would repeat the same values for each duplicate, resulting in
         // an output like `A B C ... A B C ...` instead of the correct fully sorted order `A A B B ...`.
-        let next_term_comes_from_later_loop =
-            order_target
-                .columns
-                .get(target_col_idx)
-                .is_some_and(|target_col| {
-                    plan.data[loop_pos + 1..]
-                        .iter()
-                        .any(|(later_table_index, _)| {
-                            joined_tables[*later_table_index].internal_id == target_col.table_id
-                        })
-                });
-        if next_term_comes_from_later_loop
-            && !access_method_emits_unique_order_prefix(access_method, &consumed)
-        {
+        // A loop that consumes no ORDER BY column is unique only when it returns
+        // at most one row. Because every outer loop is unique, an inner loop's
+        // equality on an outer column fixes that index column like a constant does.
+        // It also keeps outer joins ordered: for one combination of outer rows,
+        // an outer join emits either its matching rows in access order or a
+        // single row with NULLs, which is never out of order on its own.
+        if !fixed_row_tables.get(*table_index) {
             return false;
         }
         prior_tables
@@ -495,7 +477,7 @@ fn access_method_emits_unique_order_prefix(
         AccessMethodParams::Subquery { .. }
         | AccessMethodParams::RecursiveCteInput
         | AccessMethodParams::HashJoin { .. }
-        | AccessMethodParams::VirtualTable { .. }
+        | AccessMethodParams::VirtualTable(_)
         | AccessMethodParams::IndexMethod { .. }
         | AccessMethodParams::MultiIndexScan { .. }
         | AccessMethodParams::InSeek { .. } => false,
@@ -730,7 +712,6 @@ fn finalized_scan_subquery_order_consumed(
                 },
                 0,
                 schema,
-                EqualityPrefixScope::ConstantEquality,
             )
             .consumed
         }
@@ -880,11 +861,8 @@ impl OrderConsumption {
 ///
 /// This is shared by both candidate scoring and final ORDER BY / GROUP BY
 /// elimination so they use the same column-matching, collation, custom-type,
-/// and hidden-rowid-suffix rules. The caller supplies
-/// [`EqualityPrefixScope`] because candidate scoring may skip any equality
-/// prefix in the chosen seek key, while final global ordering proof may only
-/// skip prefixes that are constant across all output rows.
-#[allow(clippy::too_many_arguments)]
+/// and hidden-rowid-suffix rules. Index columns that an equality in the seek
+/// key fixes are skipped.
 pub(super) fn btree_access_order_consumed(
     table_ref: &JoinedTable,
     iter_dir: IterationDirection,
@@ -893,7 +871,6 @@ pub(super) fn btree_access_order_consumed(
     order_target: &OrderTarget,
     start_col: usize,
     schema: &Schema,
-    equality_prefix_scope: EqualityPrefixScope,
 ) -> OrderConsumption {
     let target_columns = &order_target.columns[start_col..];
     let Some(first_target_col) = target_columns.first() else {
@@ -941,7 +918,6 @@ pub(super) fn btree_access_order_consumed(
             order_target,
             target_columns,
             schema,
-            equality_prefix_scope,
             index.columns.iter().map(|column| IndexOrderColumn {
                 pos_in_table: column.pos_in_table,
                 order: column.order,
@@ -1009,7 +985,6 @@ fn temporary_index_order_consumed(
         order_target,
         target_columns,
         schema,
-        EqualityPrefixScope::ConstantEquality,
         index_columns,
         column_count,
         table_ref.table.btree().is_some_and(|table| table.has_rowid),
@@ -1026,7 +1001,6 @@ fn index_columns_order_consumed<'a>(
     order_target: &OrderTarget,
     target_columns: &[ColumnOrder],
     schema: &Schema,
-    equality_prefix_scope: EqualityPrefixScope,
     index_columns: impl Iterator<Item = IndexOrderColumn<'a>>,
     column_count: usize,
     has_rowid: bool,
@@ -1049,12 +1023,9 @@ fn index_columns_order_consumed<'a>(
         if target_col.table_id != table_ref.internal_id {
             break;
         }
-        let eq_prefix_usable = constraint_refs.iter().any(|constraint| {
-            constraint.index_col_pos == idx_pos
-                && constraint.eq.as_ref().is_some_and(|eq| {
-                    equality_prefix_scope == EqualityPrefixScope::AnyEquality || eq.is_const
-                })
-        });
+        let eq_prefix_usable = constraint_refs
+            .iter()
+            .any(|constraint| constraint.index_col_pos == idx_pos && constraint.eq.is_some());
         if eq_prefix_usable {
             if target_matches_order_column(target_col, idx_col, table_ref) {
                 if target_col.collation != idx_col.collation {

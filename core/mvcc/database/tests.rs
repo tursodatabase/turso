@@ -1,10 +1,9 @@
-use crate::SqliteDialect;
+use crate::dialect::cannot_parse::DialectThatCannotParse;
 use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
 use crate::alloc::{TursoAllocator, TursoIteratorExt, TursoTryWithCapacityExt};
-use crate::database::remove_file_from_database_registry;
-use crate::io::{PlatformIO, IO};
+use crate::io::IO;
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::database::CommitYieldPoint;
@@ -25,8 +24,6 @@ use std::sync::Arc;
 
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
-    // Stored mainly to not drop the temp dir before the test is done.
-    _temp_dir: Option<tempfile::TempDir>,
 }
 pub(crate) struct MvccTestDb {
     pub(crate) mvcc_store: Arc<crate::MvStore>,
@@ -239,7 +236,7 @@ fn index_key_payload_allocation_uses_passed_allocator() {
     let index_info = Arc::new(
         IndexInfo::new(
             [crate::types::KeyInfo {
-                sort_order: turso_parser::ast::SortOrder::Asc,
+                sort_order: crate::ast::SortOrder::Asc,
                 collation: crate::translate::collate::CollationSeq::BINARY,
                 nulls_order: None,
             }],
@@ -257,6 +254,165 @@ fn index_key_payload_allocation_uses_passed_allocator() {
     alloc.fail_allocations(false);
     let key = SortableIndexKey::new_from_payload_in(record_ref, index_info, alloc).unwrap();
     assert_eq!(key.key.get_payload(), record.get_payload());
+}
+
+/// `SortableIndexKey` compares two integers, and two texts under BINARY,
+/// without decoding them into values. The order must be the order of
+/// `compare_immutable` on the decoded values, for integers of every serial
+/// type, for texts of one-byte and two-byte serial types, for values of
+/// different kinds, for both sort orders, for another collation and for
+/// keys of different lengths.
+#[test]
+fn index_key_order_matches_compare_immutable() {
+    use crate::ast::SortOrder;
+    use crate::translate::collate::CollationSeq;
+
+    let integers = [
+        0,
+        1,
+        -1,
+        2,
+        127,
+        -128,
+        128,
+        32_767,
+        -32_768,
+        32_768,
+        8_388_607,
+        -8_388_608,
+        8_388_608,
+        2_147_483_647,
+        -2_147_483_648,
+        2_147_483_648,
+        140_737_488_355_327,
+        -140_737_488_355_328,
+        140_737_488_355_328,
+        i64::MAX,
+        i64::MIN,
+    ];
+    let mut values: Vec<Value> = integers.iter().map(|&i| Value::from_i64(i)).collect();
+    values.extend([
+        Value::Null,
+        Value::from_f64(-0.5),
+        Value::from_f64(1.0),
+        Value::from_f64(1.5),
+        Value::from_f64(9.3e18),
+        Value::build_text("1"),
+        Value::build_text("a"),
+        Value::build_text("A"),
+        Value::build_text(""),
+        Value::build_text("ab"),
+        Value::build_text("b"),
+        Value::build_text("é"),
+        // Longer than 57 bytes, so the serial type takes two bytes.
+        Value::build_text("x".repeat(100)),
+        Value::build_text(format!("{}y", "x".repeat(99))),
+        Value::from_slice(b"1").unwrap(),
+    ]);
+
+    let index_info = |sort_orders: &[SortOrder], collation: CollationSeq, num_cols: usize| {
+        Arc::new(
+            IndexInfo::new(
+                sort_orders.iter().map(|&sort_order| crate::types::KeyInfo {
+                    sort_order,
+                    collation,
+                    nulls_order: None,
+                }),
+                true,
+                num_cols,
+                false,
+            )
+            .unwrap(),
+        )
+    };
+    let key = |values: &[Value], info: &Arc<IndexInfo>| {
+        let record = ImmutableRecord::from_values(values, values.len()).unwrap();
+        SortableIndexKey::new_from_payload_in(&record, info.clone(), TursoAllocator).unwrap()
+    };
+    let expected = |lhs: &SortableIndexKey, rhs: &SortableIndexKey| {
+        let num_cols = lhs.metadata.num_cols.min(rhs.metadata.num_cols);
+        let lhs_values = lhs.key.get_values().unwrap();
+        let rhs_values = rhs.key.get_values().unwrap();
+        compare_immutable(
+            &lhs_values[..num_cols],
+            &rhs_values[..num_cols],
+            &lhs.metadata.key_info[..num_cols],
+        )
+    };
+
+    for (first_order, second_order, collation) in [
+        (SortOrder::Asc, SortOrder::Asc, CollationSeq::BINARY),
+        (SortOrder::Asc, SortOrder::Desc, CollationSeq::BINARY),
+        (SortOrder::Desc, SortOrder::Asc, CollationSeq::BINARY),
+        (SortOrder::Desc, SortOrder::Desc, CollationSeq::BINARY),
+        (SortOrder::Asc, SortOrder::Asc, CollationSeq::NOCASE),
+        (SortOrder::Desc, SortOrder::Asc, CollationSeq::NOCASE),
+    ] {
+        let sort_orders = [first_order, second_order];
+        let full = index_info(&sort_orders, collation, 2);
+        let prefix = index_info(&sort_orders, collation, 1);
+        for a in &values {
+            for b in &values {
+                for (a_second, b_second) in [(1, 1), (1, 2), (3, 2)] {
+                    let lhs = key(&[a.clone(), Value::from_i64(a_second)], &full);
+                    let rhs = key(&[b.clone(), Value::from_i64(b_second)], &full);
+                    assert_eq!(lhs.cmp(&rhs), expected(&lhs, &rhs), "{a:?} {b:?}");
+                    assert_eq!(lhs == rhs, expected(&lhs, &rhs).is_eq());
+                }
+                let lhs = key(&[a.clone()], &prefix);
+                let rhs = key(&[b.clone(), Value::build_text("x")], &full);
+                assert_eq!(lhs.cmp(&rhs), expected(&lhs, &rhs), "{a:?} {b:?}");
+                assert_eq!(rhs.cmp(&lhs), expected(&rhs, &lhs), "{a:?} {b:?}");
+            }
+        }
+    }
+}
+
+/// A TEXT that is not valid UTF-8 and an integer with missing bytes do not
+/// take the fast paths of `SortableIndexKey::compare`: the comparison gives
+/// the error of the general path, from both sides.
+#[test]
+fn index_key_compare_reports_corrupt_values() {
+    use crate::ast::SortOrder;
+    use crate::translate::collate::CollationSeq;
+
+    let info = Arc::new(
+        IndexInfo::new(
+            [crate::types::KeyInfo {
+                sort_order: SortOrder::Asc,
+                collation: CollationSeq::BINARY,
+                nulls_order: None,
+            }],
+            false,
+            1,
+            false,
+        )
+        .unwrap(),
+    );
+    let key = |payload: &[u8]| {
+        SortableIndexKey::new_from_payload_in(payload, info.clone(), TursoAllocator).unwrap()
+    };
+    // Header size 2, then the serial type of a 2-byte TEXT, then 0xff 0xfe.
+    let invalid_text = key(&[2, 17, 0xff, 0xfe]);
+    // Header size 2, then the serial type of an 8-byte integer, then 3 bytes.
+    let truncated_integer = key(&[2, 6, 0, 0, 1]);
+    let text_record = ImmutableRecord::from_values(&[Value::build_text("ab")], 1).unwrap();
+    let text = key(text_record.get_payload());
+    let integer_record = ImmutableRecord::from_values(&[Value::from_i64(i64::MAX)], 1).unwrap();
+    let integer = key(integer_record.get_payload());
+
+    for (lhs, rhs) in [
+        (&invalid_text, &text),
+        (&text, &invalid_text),
+        (&truncated_integer, &integer),
+        (&integer, &truncated_integer),
+    ] {
+        assert!(
+            matches!(lhs.compare(rhs), Err(LimboError::Corrupt(_))),
+            "{:?}",
+            lhs.compare(rhs)
+        );
+    }
 }
 
 #[cfg(nightly)]
@@ -321,12 +477,16 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
 impl MvccTestDb {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open(
+            io,
+            ":memory:",
+            crate::OpenOptions::new(Arc::new(DialectThatCannotParse))
+                .db_opts(DatabaseOpts::new().with_mvcc(true)),
+        )
+        .unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
-        // Enable MVCC via PRAGMA
-        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         let mvcc_store = db.get_mv_store().clone().unwrap();
         Self {
             mvcc_store,
@@ -524,62 +684,29 @@ fn gc_keeps_sole_current_version_for_reader_that_began_after_lwm_sample() {
 
 impl MvccTestDbNoConn {
     pub fn new() -> Self {
+        Self::new_with_opts(DatabaseOpts::new().with_mvcc(true))
+    }
+
+    pub fn new_passive() -> Self {
+        Self::new_with_opts(
+            DatabaseOpts::new()
+                .with_mvcc(true)
+                .with_experimental_mvcc_passive_checkpoint(true),
+        )
+    }
+
+    fn new_with_opts(opts: DatabaseOpts) -> Self {
         let io = Arc::new(MemoryIO::new());
-        let opts = DatabaseOpts::new();
         let db = Database::open_file_with_flags(
             io,
             ":memory:",
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(DialectThatCannotParse),
         )
         .unwrap();
-        // Enable MVCC via PRAGMA
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        conn.close().unwrap();
-        Self {
-            db: Some(db),
-            _temp_dir: None,
-        }
-    }
-
-    /// Opens a database with a file
-    pub fn new_with_random_db() -> Self {
-        Self::new_with_random_db_with_opts(DatabaseOpts::new())
-    }
-
-    /// Opens a database with a file and the requested options.
-    pub fn new_with_random_db_with_opts(opts: DatabaseOpts) -> Self {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let path = temp_dir
-            .path()
-            .join(format!("test_{}", rand::random::<u64>()));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let io = Arc::new(PlatformIO::new().unwrap());
-        println!("path: {}", path.as_os_str().to_str().unwrap());
-        let db = Database::open_file_with_flags(
-            io,
-            path.as_os_str().to_str().unwrap(),
-            OpenFlags::default(),
-            opts,
-            None,
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
-        // Enable MVCC via PRAGMA
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        conn.close().unwrap();
-        Self {
-            db: Some(db),
-            _temp_dir: Some(temp_dir),
-        }
+        Self { db: Some(db) }
     }
 
     /// Asumes there is a database open
@@ -657,67 +784,13 @@ use crate::security::roles::SessionRole;
 use crate::types::Text;
 use crate::Database;
 use crate::MemoryIO;
-use crate::StepResult;
 use crate::Value;
 // Simple atomic clock implementation for testing
 
-fn setup_test_db() -> (MvccTestDb, u64, MVTableId, i64) {
-    let db = MvccTestDb::new();
-    db.conn
-        .execute("CREATE TABLE mvcc_lazy_gap_test(x INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    let root_page = get_rows(
-        &db.conn,
-        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'mvcc_lazy_gap_test'",
-    )[0][0]
-        .as_int()
-        .unwrap();
-    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
-    let btree_root_page = root_page.abs();
-
-    let tx_id = db
-        .mvcc_store
-        .begin_tx(db.conn.pager.load().clone())
-        .unwrap();
-
-    let test_rows = [
-        (5, "row5"),
-        (10, "row10"),
-        (15, "row15"),
-        (20, "row20"),
-        (30, "row30"),
-    ];
-
-    for (row_id, data) in test_rows.iter() {
-        let id = RowID::new(table_id, RowKey::Int(*row_id));
-        let record =
-            ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1).unwrap();
-        let row = Row::new_table_row(id, record.as_blob()).unwrap();
-        db.mvcc_store.insert(tx_id, row).unwrap();
-    }
-
-    commit_tx(db.mvcc_store.clone(), &db.conn, tx_id).unwrap();
-
-    let tx_id = db
-        .mvcc_store
-        .begin_tx(db.conn.pager.load().clone())
-        .unwrap();
-    (db, tx_id, table_id, btree_root_page)
-}
-
 fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
     let db = MvccTestDb::new();
-    db.conn
-        .execute("CREATE TABLE mvcc_lazy_basic_test(x INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    let root_page = get_rows(
-        &db.conn,
-        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'mvcc_lazy_basic_test'",
-    )[0][0]
-        .as_int()
-        .unwrap();
-    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
-    let btree_root_page = root_page.abs();
+    let table_id = new_uncheckpointed_table_id(&db);
+    let btree_root_page = -i64::from(table_id);
 
     let tx_id = db
         .mvcc_store
@@ -744,16 +817,7 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
 #[test]
 fn test_mvcc_cursor_next_yields_with_injected_yield() {
     let db = MvccTestDb::new();
-    db.conn
-        .execute("CREATE TABLE cursor_yield_test(x INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    let root_page = get_rows(
-        &db.conn,
-        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'cursor_yield_test'",
-    )[0][0]
-        .as_int()
-        .unwrap();
-    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
+    let table_id = new_uncheckpointed_table_id(&db);
     let tx_id = db
         .mvcc_store
         .begin_tx(db.conn.pager.load().clone())
@@ -770,7 +834,7 @@ fn test_mvcc_cursor_next_yields_with_injected_yield() {
         MvccCursorType::Table,
         Box::new(BTreeCursor::new(
             db.conn.pager.load().clone(),
-            root_page.abs(),
+            -i64::from(table_id),
             1,
         )),
     )
@@ -787,6 +851,13 @@ fn test_mvcc_cursor_next_yields_with_injected_yield() {
         saw_yield,
         "MVCC cursor should inject an explicit yield on the first next() transition",
     );
+}
+
+/// Allocates a table id the way CREATE TABLE does in MVCC mode: the table has
+/// no B-tree until a checkpoint gives it one, and its root page in
+/// sqlite_schema is the table id.
+fn new_uncheckpointed_table_id(db: &MvccTestDb) -> MVTableId {
+    MVTableId::from(db.mvcc_store.get_next_table_id())
 }
 
 pub(crate) fn commit_tx(
@@ -866,7 +937,7 @@ fn test_lazy_scan_cursor_basic() {
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
 #[test]
 fn test_lazy_scan_cursor_with_gaps() {
-    let (db, tx_id, table_id, btree_root_page) = setup_test_db();
+    let (db, tx_id, table_id, btree_root_page) = setup_lazy_db(&[5, 10, 15, 20, 30]);
 
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
@@ -1296,20 +1367,27 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
 
 #[test]
 fn test_gc_keeps_finalized_tx_state_of_tx_still_in_txs() {
-    let db = MvccTestDbNoConn::new_with_random_db();
+    let db = MvccTestDbNoConn::new();
     let conn = db.connect();
     let mvcc_store = db.get_mvcc_store();
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
-        .unwrap();
 
-    conn.execute("BEGIN CONCURRENT").unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
-    let tx_id = conn.get_mv_tx_id().unwrap();
+    let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
+    mvcc_store
+        .insert(tx_id, generate_simple_string_row((-2).into(), 1, "1"))
+        .unwrap();
     conn.set_yield_injector(Some(FixedYieldInjector::new([
         CommitYieldPoint::BeforeFinishCommittedTx.point(),
     ])));
-    let mut commit = conn.prepare("COMMIT").unwrap();
-    assert!(matches!(commit.step().unwrap(), StepResult::Yield));
+    let mut commit = mvcc_store
+        .commit_tx(tx_id, &conn, crate::MAIN_DB_ID)
+        .unwrap();
+    loop {
+        match commit.step(&mvcc_store).unwrap() {
+            IOResult::IO(io) if io.is_explicit_yield() => break,
+            IOResult::IO(io) => io.wait(conn.db.io.as_ref()).unwrap(),
+            IOResult::Done(_) => panic!("commit finished without the injected yield"),
+        }
+    }
 
     let commit_ts = match mvcc_store.txs.get(&tx_id).unwrap().value().state.load() {
         TransactionState::Committed(ts) => ts,
@@ -1492,7 +1570,7 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
     let info = std::sync::Arc::new(
         crate::types::IndexInfo::new(
             crate::alloc::vec![crate::types::KeyInfo {
-                sort_order: turso_parser::ast::SortOrder::Asc,
+                sort_order: crate::ast::SortOrder::Asc,
                 collation: crate::translate::collate::CollationSeq::BINARY,
                 nulls_order: None,
             }],
@@ -1606,48 +1684,23 @@ fn test_commit_dependency_multiple_reads_dedup() {
 /// Hekaton §2.7 cascade abort with real connections and threads.
 ///
 /// A Preparing writer is speculatively read by a reader on another thread.
-/// When the writer aborts, the reader's COMMIT must fail with
+/// When the writer aborts, the reader's commit must fail with
 /// CommitDependencyAborted (cascade abort via AbortNow).
 ///
 /// Sequence:
-///   1. Writer: BEGIN CONCURRENT → UPDATE (real SQL)
+///   1. Writer: begin → update row 1
 ///   2. Writer state manually set to Preparing(end_ts)
-///   3. Reader thread: BEGIN → SELECT (speculative read → dependency) → INSERT
+///   3. Reader thread: begin → read row 1 (speculative read → dependency) → insert
 ///   4. Main thread: rollback writer → cascade abort via AbortNow
-///   5. Reader COMMIT → CommitDependencyAborted
+///   5. Reader commit → CommitDependencyAborted
 #[test]
 fn test_commit_dep_threaded_abort_cascades() {
-    let db = MvccTestDbNoConn::new_with_random_db();
-    {
-        let conn = db.connect();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'initial')").unwrap();
-        conn.close().unwrap();
-    }
-
+    let db = MvccTestDbNoConn::new();
     let mvcc_store = db.get_mvcc_store();
+    commit_dep_insert_initial_row(&db);
 
-    // Writer: real SQL operations
     let writer_conn = db.connect();
-    writer_conn.execute("BEGIN CONCURRENT").unwrap();
-    writer_conn
-        .execute("UPDATE t SET value = 'modified' WHERE id = 1")
-        .unwrap();
-    let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
-
-    // Simulate mid-commit: transition writer to Preparing.
-    // end_ts comes from the global clock so the reader's begin_ts will be >=
-    // end_ts, satisfying the speculative read condition (Hekaton Table 1).
-    let _end_ts = mvcc_store.get_commit_timestamp(|ts| {
-        mvcc_store
-            .txs
-            .get(&writer_tx_id)
-            .unwrap()
-            .value()
-            .state
-            .store(TransactionState::Preparing(ts));
-    });
+    let writer_tx_id = commit_dep_begin_preparing_writer(&mvcc_store, &writer_conn, "modified");
 
     // Reader signals after speculative read so main thread can abort writer.
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
@@ -1657,28 +1710,33 @@ fn test_commit_dep_threaded_abort_cascades() {
         let reader_conn = db_arc
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
-        reader_conn.execute("BEGIN CONCURRENT").unwrap();
-
-        // SELECT triggers speculative read: reader.begin_ts >= writer.end_ts
-        // → Hekaton Table 1: visible, register commit dependency
-        let mut stmt = reader_conn
-            .prepare("SELECT value FROM t WHERE id = 1")
+        let mvcc_store = db_arc.get_mv_store().clone().unwrap();
+        let reader_tx_id = mvcc_store
+            .begin_tx(reader_conn.pager.load().clone())
             .unwrap();
-        let rows = stmt.run_collect_rows().unwrap();
 
-        // Write so COMMIT exercises the full commit state machine path.
-        reader_conn
-            .execute("INSERT INTO t VALUES (2, 'reader_data')")
+        // The read is speculative: reader.begin_ts >= writer.end_ts
+        // → Hekaton Table 1: visible, register commit dependency
+        let row = mvcc_store
+            .read(reader_tx_id, &commit_dep_row_id(1))
+            .unwrap();
+
+        // Write so the commit exercises the full commit state machine path.
+        mvcc_store
+            .insert(
+                reader_tx_id,
+                generate_simple_string_row(COMMIT_DEP_TABLE_ID.into(), 2, "reader_data"),
+            )
             .unwrap();
 
         // Signal: speculative read done, dependency registered
         signal_tx.send(()).unwrap();
 
-        // COMMIT blocks in WaitForDependencies until the writer resolves.
+        // The commit waits in WaitForDependencies until the writer resolves.
         // Writer will abort → AbortNow set → CommitDependencyAborted.
-        let commit_result = reader_conn.execute("COMMIT");
-        let _ = reader_conn.close(); // cleanup (rolls back if still active)
-        (rows, commit_result)
+        let commit_result = commit_tx(mvcc_store, &reader_conn, reader_tx_id);
+        let _ = reader_conn.close();
+        (row, commit_result)
     });
 
     // Wait for reader to complete speculative read
@@ -1692,74 +1750,40 @@ fn test_commit_dep_threaded_abort_cascades() {
         crate::MAIN_DB_ID,
     );
 
-    let (rows, commit_result) = reader_handle.join().unwrap();
+    let (row, commit_result) = reader_handle.join().unwrap();
 
     // Reader saw the writer's modified value via speculative read
-    assert_eq!(rows.len(), 1);
     assert_eq!(
-        rows[0][0].to_text().unwrap(),
-        "modified",
+        row,
+        Some(commit_dep_row(1, "modified")),
         "reader should have speculatively read the Preparing writer's value"
     );
 
-    // Reader's COMMIT must fail: depended-on writer aborted
+    // Reader's commit must fail: depended-on writer aborted
     assert!(
         matches!(commit_result, Err(LimboError::CommitDependencyAborted)),
         "expected CommitDependencyAborted, got: {commit_result:?}",
     );
 
-    // Verify database consistency
-    {
-        let conn = db.connect();
-
-        // Only the initial value should remain
-        let mut stmt = conn.prepare("SELECT value FROM t WHERE id = 1").unwrap();
-        let rows = stmt.run_collect_rows().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][0].to_text().unwrap(), "initial");
-
-        // Reader's INSERT must not be visible (cascade-aborted)
-        let mut stmt = conn.prepare("SELECT * FROM t WHERE id = 2").unwrap();
-        let rows = stmt.run_collect_rows().unwrap();
-        assert!(
-            rows.is_empty(),
-            "reader's write should not be visible after cascade abort"
-        );
-    }
+    // Verify database consistency: only the initial value remains, and the
+    // reader's insert is not visible (cascade-aborted).
+    assert_eq!(
+        commit_dep_read_committed(&db, &[1, 2]),
+        vec![Some(commit_dep_row(1, "initial")), None],
+        "reader's write should not be visible after cascade abort"
+    );
 }
 
 /// Hekaton §2.7: multiple readers depending on the same Preparing writer
 /// all cascade-abort when the writer aborts.
 #[test]
 fn test_commit_dep_threaded_multiple_dependents_abort() {
-    let db = MvccTestDbNoConn::new_with_random_db();
-    {
-        let conn = db.connect();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'initial')").unwrap();
-        conn.close().unwrap();
-    }
-
+    let db = MvccTestDbNoConn::new();
     let mvcc_store = db.get_mvcc_store();
+    commit_dep_insert_initial_row(&db);
 
-    // Writer
     let writer_conn = db.connect();
-    writer_conn.execute("BEGIN CONCURRENT").unwrap();
-    writer_conn
-        .execute("UPDATE t SET value = 'modified' WHERE id = 1")
-        .unwrap();
-    let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
-
-    let _end_ts = mvcc_store.get_commit_timestamp(|ts| {
-        mvcc_store
-            .txs
-            .get(&writer_tx_id)
-            .unwrap()
-            .value()
-            .state
-            .store(TransactionState::Preparing(ts));
-    });
+    let writer_tx_id = commit_dep_begin_preparing_writer(&mvcc_store, &writer_conn, "modified");
 
     let num_readers = 4;
     // Barrier: all readers + main thread synchronize after speculative reads
@@ -1773,22 +1797,30 @@ fn test_commit_dep_threaded_multiple_dependents_abort() {
             let conn = db_arc
                 .connect(ConnectOpts::new(SessionRole::Superuser))
                 .unwrap();
-            conn.execute("BEGIN CONCURRENT").unwrap();
+            let mvcc_store = db_arc.get_mv_store().clone().unwrap();
+            let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
 
             // Speculative read from Preparing writer
-            let mut stmt = conn.prepare("SELECT value FROM t WHERE id = 1").unwrap();
-            let rows = stmt.run_collect_rows().unwrap();
+            let row = mvcc_store.read(tx_id, &commit_dep_row_id(1)).unwrap();
 
             // Each reader writes to a unique row (no conflicts)
-            conn.execute(format!("INSERT INTO t VALUES ({}, 'reader_{i}')", i + 10,))
+            mvcc_store
+                .insert(
+                    tx_id,
+                    generate_simple_string_row(
+                        COMMIT_DEP_TABLE_ID.into(),
+                        i as i64 + 10,
+                        &format!("reader_{i}"),
+                    ),
+                )
                 .unwrap();
 
             // Signal: all readers done with speculative reads
             barrier_clone.wait();
 
-            let commit_result = conn.execute("COMMIT");
+            let commit_result = commit_tx(mvcc_store, &conn, tx_id);
             let _ = conn.close();
-            (rows, commit_result)
+            (row, commit_result)
         }));
     }
 
@@ -1804,9 +1836,8 @@ fn test_commit_dep_threaded_multiple_dependents_abort() {
     );
 
     for handle in handles {
-        let (rows, commit_result) = handle.join().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][0].to_text().unwrap(), "modified");
+        let (row, commit_result) = handle.join().unwrap();
+        assert_eq!(row, Some(commit_dep_row(1, "modified")));
         assert!(
             matches!(commit_result, Err(LimboError::CommitDependencyAborted)),
             "expected CommitDependencyAborted, got: {commit_result:?}",
@@ -1814,46 +1845,22 @@ fn test_commit_dep_threaded_multiple_dependents_abort() {
     }
 
     // All reader writes should be invisible — only the initial row remains
-    {
-        let conn = db.connect();
-        let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
-        let rows = stmt.run_collect_rows().unwrap();
-        assert_eq!(rows[0][0].as_int().unwrap(), 1);
-    }
+    assert_eq!(
+        commit_dep_read_committed(&db, &[1, 10, 11, 12, 13]),
+        vec![Some(commit_dep_row(1, "initial")), None, None, None, None]
+    );
 }
 
 /// Hekaton §2.7 happy path: when a Preparing writer commits, the dependent
 /// reader's CommitDepCounter is decremented and the reader can proceed.
 #[test]
 fn test_commit_dep_threaded_commit_resolves() {
-    let db = MvccTestDbNoConn::new_with_random_db();
-    {
-        let conn = db.connect();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'initial')").unwrap();
-        conn.close().unwrap();
-    }
-
+    let db = MvccTestDbNoConn::new();
     let mvcc_store = db.get_mvcc_store();
+    commit_dep_insert_initial_row(&db);
 
-    // Writer: UPDATE via real connection, then set to Preparing
     let writer_conn = db.connect();
-    writer_conn.execute("BEGIN CONCURRENT").unwrap();
-    writer_conn
-        .execute("UPDATE t SET value = 'committed' WHERE id = 1")
-        .unwrap();
-    let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
-
-    let end_ts = mvcc_store.get_commit_timestamp(|ts| {
-        mvcc_store
-            .txs
-            .get(&writer_tx_id)
-            .unwrap()
-            .value()
-            .state
-            .store(TransactionState::Preparing(ts));
-    });
+    let writer_tx_id = commit_dep_begin_preparing_writer(&mvcc_store, &writer_conn, "committed");
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
 
@@ -1862,82 +1869,58 @@ fn test_commit_dep_threaded_commit_resolves() {
         let reader_conn = db_arc
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
-        reader_conn.execute("BEGIN CONCURRENT").unwrap();
-
-        let mut stmt = reader_conn
-            .prepare("SELECT value FROM t WHERE id = 1")
+        let mvcc_store = db_arc.get_mv_store().clone().unwrap();
+        let reader_tx_id = mvcc_store
+            .begin_tx(reader_conn.pager.load().clone())
             .unwrap();
-        let rows = stmt.run_collect_rows().unwrap();
 
-        reader_conn
-            .execute("INSERT INTO t VALUES (2, 'reader_data')")
+        let row = mvcc_store
+            .read(reader_tx_id, &commit_dep_row_id(1))
+            .unwrap();
+
+        mvcc_store
+            .insert(
+                reader_tx_id,
+                generate_simple_string_row(COMMIT_DEP_TABLE_ID.into(), 2, "reader_data"),
+            )
             .unwrap();
 
         signal_tx.send(()).unwrap();
 
-        // COMMIT blocks in WaitForDependencies. Writer will commit →
+        // The commit waits in WaitForDependencies. Writer will commit →
         // counter decremented → reader proceeds.
-        let commit_result = reader_conn.execute("COMMIT");
+        let commit_result = commit_tx(mvcc_store, &reader_conn, reader_tx_id);
         let _ = reader_conn.close();
-        (rows, commit_result)
+        (row, commit_result)
     });
 
     signal_rx.recv().unwrap();
 
     // Complete the writer's commit manually (postprocessing):
-    // 1. Convert TxID → Timestamp in row versions
+    // 1. Convert TxID → Timestamp in row versions (Hekaton §3.3)
     // 2. Set state to Committed
     // 3. Drain CommitDepSet, decrement dependents' counters
-    {
-        let writer_tx = mvcc_store.txs.get(&writer_tx_id).unwrap();
-        let writer_tx = writer_tx.value();
+    commit_dep_finish_writer_commit(&mvcc_store, writer_tx_id);
 
-        // Convert TxID→Timestamp in row versions (Hekaton §3.3 postprocessing)
-        for entry in mvcc_store.rows.iter() {
-            let mut rvs = entry.value().write();
-            for rv in rvs.iter_mut() {
-                if rv.begin() == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.set_begin(Some(TxTimestampOrID::Timestamp(end_ts)));
-                }
-                if rv.end() == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
-                }
-            }
-        }
-
-        // Committed state + notify dependents
-        writer_tx.state.store(TransactionState::Committed(end_ts));
-        for dep_tx_id in writer_tx.commit_dep_set.lock().drain() {
-            if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
-                dep_tx_entry
-                    .value()
-                    .commit_dep_counter
-                    .fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-    }
-
-    let (rows, commit_result) = reader_handle.join().unwrap();
+    let (row, commit_result) = reader_handle.join().unwrap();
 
     // Reader speculatively read the writer's value
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0].to_text().unwrap(), "committed");
+    assert_eq!(row, Some(commit_dep_row(1, "committed")));
 
-    // Reader's COMMIT succeeds: dependency resolved by writer's commit
+    // Reader's commit succeeds: dependency resolved by writer's commit
     assert!(
         commit_result.is_ok(),
-        "expected reader COMMIT to succeed, got: {commit_result:?}",
+        "expected reader commit to succeed, got: {commit_result:?}",
     );
 
     // Both writes are visible
-    {
-        let conn = db.connect();
-        let mut stmt = conn.prepare("SELECT value FROM t ORDER BY id").unwrap();
-        let rows = stmt.run_collect_rows().unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0][0].to_text().unwrap(), "committed");
-        assert_eq!(rows[1][0].to_text().unwrap(), "reader_data");
-    }
+    assert_eq!(
+        commit_dep_read_committed(&db, &[1, 2]),
+        vec![
+            Some(commit_dep_row(1, "committed")),
+            Some(commit_dep_row(2, "reader_data"))
+        ]
+    );
 }
 
 /// Regression: the write_set.is_empty() fast path used to commit read-only
@@ -1945,34 +1928,12 @@ fn test_commit_dep_threaded_commit_resolves() {
 /// speculatively read from a Preparing writer must still honour AbortNow.
 #[test]
 fn test_commit_dep_threaded_readonly_abort_cascades() {
-    let db = MvccTestDbNoConn::new_with_random_db();
-    {
-        let conn = db.connect();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'initial')").unwrap();
-        conn.close().unwrap();
-    }
-
+    let db = MvccTestDbNoConn::new();
     let mvcc_store = db.get_mvcc_store();
+    commit_dep_insert_initial_row(&db);
 
-    // Writer
     let writer_conn = db.connect();
-    writer_conn.execute("BEGIN CONCURRENT").unwrap();
-    writer_conn
-        .execute("UPDATE t SET value = 'modified' WHERE id = 1")
-        .unwrap();
-    let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
-
-    let _end_ts = mvcc_store.get_commit_timestamp(|ts| {
-        mvcc_store
-            .txs
-            .get(&writer_tx_id)
-            .unwrap()
-            .value()
-            .state
-            .store(TransactionState::Preparing(ts));
-    });
+    let writer_tx_id = commit_dep_begin_preparing_writer(&mvcc_store, &writer_conn, "modified");
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
 
@@ -1981,21 +1942,23 @@ fn test_commit_dep_threaded_readonly_abort_cascades() {
         let reader_conn = db_arc
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
-        reader_conn.execute("BEGIN CONCURRENT").unwrap();
-
-        // Read-only: no writes, only SELECT → triggers speculative read
-        let mut stmt = reader_conn
-            .prepare("SELECT value FROM t WHERE id = 1")
+        let mvcc_store = db_arc.get_mv_store().clone().unwrap();
+        let reader_tx_id = mvcc_store
+            .begin_tx(reader_conn.pager.load().clone())
             .unwrap();
-        let rows = stmt.run_collect_rows().unwrap();
+
+        // Read-only: no writes, only a read → triggers speculative read
+        let row = mvcc_store
+            .read(reader_tx_id, &commit_dep_row_id(1))
+            .unwrap();
 
         signal_tx.send(()).unwrap();
 
-        // COMMIT on a read-only tx hits the write_set.is_empty() fast path.
+        // Committing a read-only tx hits the write_set.is_empty() fast path.
         // It must still check commit dependencies.
-        let commit_result = reader_conn.execute("COMMIT");
+        let commit_result = commit_tx(mvcc_store, &reader_conn, reader_tx_id);
         let _ = reader_conn.close();
-        (rows, commit_result)
+        (row, commit_result)
     });
 
     signal_rx.recv().unwrap();
@@ -2008,10 +1971,9 @@ fn test_commit_dep_threaded_readonly_abort_cascades() {
         crate::MAIN_DB_ID,
     );
 
-    let (rows, commit_result) = reader_handle.join().unwrap();
+    let (row, commit_result) = reader_handle.join().unwrap();
 
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0].to_text().unwrap(), "modified");
+    assert_eq!(row, Some(commit_dep_row(1, "modified")));
 
     // Read-only tx must still fail when its dependency aborts
     assert!(
@@ -2160,166 +2122,49 @@ fn test_update_fails_when_speculatively_read_writer_aborts() {
     }
 }
 
-/// A statement that fails with CommitDependencyAborted rolls back its whole
-/// transaction, like WriteWriteConflict: the transaction depends on an aborted
-/// one and can never commit. A single-row UPDATE has no statement savepoint, and
-/// under MVCC its Insert step can raise this error after its Delete step wrote.
-#[test]
-fn test_commit_dependency_aborted_statement_rolls_back_txn() {
-    let db = MvccTestDbNoConn::new_with_random_db();
-    {
-        let conn = db.connect();
-        conn.execute("CREATE TABLE hot (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)")
-            .unwrap();
-        conn.execute("INSERT INTO hot VALUES (1, 0)").unwrap();
-        conn.close().unwrap();
-    }
-    let mvcc_store = db.get_mvcc_store();
-
-    let writer_conn = db.connect();
-    writer_conn.execute("BEGIN CONCURRENT").unwrap();
-    writer_conn
-        .execute("UPDATE hot SET n = 100 WHERE id = 1")
-        .unwrap();
-    let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
-    mvcc_store.get_commit_timestamp(|ts| {
-        mvcc_store
-            .txs
-            .get(&writer_tx_id)
-            .unwrap()
-            .value()
-            .state
-            .store(TransactionState::Preparing(ts));
-    });
-
-    let updater_conn = db.connect();
-    updater_conn.execute("BEGIN CONCURRENT").unwrap();
-    updater_conn
-        .execute("INSERT INTO hot VALUES (2, 0)")
-        .unwrap();
-    let rows = updater_conn
-        .prepare("SELECT n FROM hot WHERE id = 1")
-        .unwrap()
-        .run_collect_rows()
-        .unwrap();
-    assert_eq!(
-        rows,
-        vec![vec![Value::from_i64(100)]],
-        "the updater should read the Preparing writer's version"
-    );
-
-    mvcc_store.rollback_tx(
-        writer_tx_id,
-        writer_conn.pager.load().clone(),
-        &writer_conn,
-        crate::MAIN_DB_ID,
-    );
-
-    let result = updater_conn.execute("UPDATE hot SET n = n + 1 WHERE id = 1");
-    assert!(
-        matches!(result, Err(LimboError::CommitDependencyAborted)),
-        "expected CommitDependencyAborted, got {result:?}"
-    );
-    assert!(
-        updater_conn.get_auto_commit(),
-        "the updater's transaction should be rolled back"
-    );
-
-    let rows = updater_conn
-        .prepare("SELECT id, n FROM hot ORDER BY id")
-        .unwrap()
-        .run_collect_rows()
-        .unwrap();
-    assert_eq!(rows, vec![vec![Value::from_i64(1), Value::from_i64(0)]]);
-}
-
 /// Test that read-only transactions with resolved dependencies do NOT advance
 /// last_committed_tx_ts. A read-only tx going through WaitForDependencies →
 /// CommitEnd would update last_committed_tx_ts, causing spurious Busy errors
 /// from acquire_exclusive_tx.
 #[test]
 fn test_commit_dep_readonly_does_not_advance_timestamp() {
-    let db = MvccTestDbNoConn::new_with_random_db();
-    {
-        let conn = db.connect();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'initial')").unwrap();
-        conn.close().unwrap();
-    }
-
+    let db = MvccTestDbNoConn::new();
     let mvcc_store = db.get_mvcc_store();
+    commit_dep_insert_initial_row(&db);
+
     let ts_before = mvcc_store.last_committed_tx_ts.load(Ordering::Acquire);
 
-    // Writer: UPDATE then set to Preparing
     let writer_conn = db.connect();
-    writer_conn.execute("BEGIN CONCURRENT").unwrap();
-    writer_conn
-        .execute("UPDATE t SET value = 'modified' WHERE id = 1")
-        .unwrap();
-    let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
-
-    let end_ts = mvcc_store.get_commit_timestamp(|ts| {
-        mvcc_store
-            .txs
-            .get(&writer_tx_id)
-            .unwrap()
-            .value()
-            .state
-            .store(TransactionState::Preparing(ts));
-    });
+    let writer_tx_id = commit_dep_begin_preparing_writer(&mvcc_store, &writer_conn, "modified");
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
 
     let db_arc = db.get_db();
-    let mvcc_clone = mvcc_store.clone();
     let reader_handle = std::thread::spawn(move || {
         let reader_conn = db_arc
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
-        reader_conn.execute("BEGIN CONCURRENT").unwrap();
-
-        // Read-only: SELECT only → speculative read registers dependency
-        let mut stmt = reader_conn
-            .prepare("SELECT value FROM t WHERE id = 1")
+        let mvcc_store = db_arc.get_mv_store().clone().unwrap();
+        let reader_tx_id = mvcc_store
+            .begin_tx(reader_conn.pager.load().clone())
             .unwrap();
-        let _rows = stmt.run_collect_rows().unwrap();
+
+        // Read-only: a read only → speculative read registers dependency
+        let _row = mvcc_store
+            .read(reader_tx_id, &commit_dep_row_id(1))
+            .unwrap();
 
         signal_tx.send(()).unwrap();
 
-        // COMMIT: read-only with dependency → WaitForDependencies
-        let commit_result = reader_conn.execute("COMMIT");
+        // Commit: read-only with dependency → WaitForDependencies
+        let commit_result = commit_tx(mvcc_store, &reader_conn, reader_tx_id);
         let _ = reader_conn.close();
         commit_result
     });
 
     signal_rx.recv().unwrap();
 
-    // Complete writer's commit manually (resolve dependency)
-    {
-        let writer_tx = mvcc_store.txs.get(&writer_tx_id).unwrap();
-        let writer_tx = writer_tx.value();
-        for entry in mvcc_store.rows.iter() {
-            let mut rvs = entry.value().write();
-            for rv in rvs.iter_mut() {
-                if rv.begin() == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.set_begin(Some(TxTimestampOrID::Timestamp(end_ts)));
-                }
-                if rv.end() == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
-                }
-            }
-        }
-        writer_tx.state.store(TransactionState::Committed(end_ts));
-        for dep_tx_id in writer_tx.commit_dep_set.lock().drain() {
-            if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
-                dep_tx_entry
-                    .value()
-                    .commit_dep_counter
-                    .fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-    }
+    commit_dep_finish_writer_commit(&mvcc_store, writer_tx_id);
 
     let commit_result = reader_handle.join().unwrap();
     assert!(
@@ -2327,7 +2172,7 @@ fn test_commit_dep_readonly_does_not_advance_timestamp() {
         "read-only tx with resolved dependency should commit: {commit_result:?}",
     );
 
-    let ts_after = mvcc_clone.last_committed_tx_ts.load(Ordering::Acquire);
+    let ts_after = mvcc_store.last_committed_tx_ts.load(Ordering::Acquire);
     assert_eq!(
         ts_before, ts_after,
         "read-only tx should NOT advance last_committed_tx_ts (was {ts_before}, now {ts_after})"
@@ -2340,42 +2185,19 @@ fn test_commit_dep_readonly_does_not_advance_timestamp() {
 /// return Busy for transactions that started before the read.
 #[test]
 fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
-    let db = MvccTestDbNoConn::new_with_random_db();
-    {
-        let conn = db.connect();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'initial')").unwrap();
-        conn.close().unwrap();
-    }
-
+    let db = MvccTestDbNoConn::new();
     let mvcc_store = db.get_mvcc_store();
+    commit_dep_insert_initial_row(&db);
 
-    // Writer: UPDATE then set to Preparing
     let writer_conn = db.connect();
-    writer_conn.execute("BEGIN CONCURRENT").unwrap();
-    writer_conn
-        .execute("UPDATE t SET value = 'modified' WHERE id = 1")
-        .unwrap();
-    let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
+    let writer_tx_id = commit_dep_begin_preparing_writer(&mvcc_store, &writer_conn, "modified");
 
-    let end_ts = mvcc_store.get_commit_timestamp(|ts| {
-        mvcc_store
-            .txs
-            .get(&writer_tx_id)
-            .unwrap()
-            .value()
-            .state
-            .store(TransactionState::Preparing(ts));
-    });
-
-    // Start a tx that will try to get the exclusive lock later. BEGIN
-    // CONCURRENT is deferred, so run a read to materialize it: its begin_ts
+    // Start a tx that will try to get the exclusive lock later. Its begin_ts
     // must be assigned now, before the read-only tx commits.
     let exclusive_conn = db.connect();
-    exclusive_conn.execute("BEGIN CONCURRENT").unwrap();
-    let _ = get_rows(&exclusive_conn, "SELECT count(*) FROM t");
-    let exclusive_tx_id = exclusive_conn.get_mv_tx_id().unwrap();
+    let exclusive_tx_id = mvcc_store
+        .begin_tx(exclusive_conn.pager.load().clone())
+        .unwrap();
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
 
@@ -2384,16 +2206,18 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
         let reader_conn = db_arc
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
-        reader_conn.execute("BEGIN CONCURRENT").unwrap();
-
-        let mut stmt = reader_conn
-            .prepare("SELECT value FROM t WHERE id = 1")
+        let mvcc_store = db_arc.get_mv_store().clone().unwrap();
+        let reader_tx_id = mvcc_store
+            .begin_tx(reader_conn.pager.load().clone())
             .unwrap();
-        let _rows = stmt.run_collect_rows().unwrap();
+
+        let _row = mvcc_store
+            .read(reader_tx_id, &commit_dep_row_id(1))
+            .unwrap();
 
         signal_tx.send(()).unwrap();
 
-        let commit_result = reader_conn.execute("COMMIT");
+        let commit_result = commit_tx(mvcc_store, &reader_conn, reader_tx_id);
         let _ = reader_conn.close();
         commit_result
     });
@@ -2401,30 +2225,7 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
     signal_rx.recv().unwrap();
 
     // Resolve the writer's commit (unblocks reader's WaitForDependencies)
-    {
-        let writer_tx = mvcc_store.txs.get(&writer_tx_id).unwrap();
-        let writer_tx = writer_tx.value();
-        for entry in mvcc_store.rows.iter() {
-            let mut rvs = entry.value().write();
-            for rv in rvs.iter_mut() {
-                if rv.begin() == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.set_begin(Some(TxTimestampOrID::Timestamp(end_ts)));
-                }
-                if rv.end() == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
-                }
-            }
-        }
-        writer_tx.state.store(TransactionState::Committed(end_ts));
-        for dep_tx_id in writer_tx.commit_dep_set.lock().drain() {
-            if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
-                dep_tx_entry
-                    .value()
-                    .commit_dep_counter
-                    .fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-    }
+    commit_dep_finish_writer_commit(&mvcc_store, writer_tx_id);
 
     let commit_result = reader_handle.join().unwrap();
     assert!(commit_result.is_ok());
@@ -2440,15 +2241,94 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
     mvcc_store.release_exclusive_tx(&exclusive_tx_id);
 }
 
-fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
-    let mut stmt = conn.prepare(query).unwrap();
-    let mut rows = Vec::new();
-    stmt.run_with_row_callback(|row| {
-        let values = row.get_values().cloned().collect::<Vec<_>>();
-        rows.push(values);
-        Ok(())
-    })
-    .unwrap();
+/// The table the commit dependency tests write to. It has no schema entry; the
+/// tests read and write its rows through `MvStore`.
+const COMMIT_DEP_TABLE_ID: i64 = -2;
+
+fn commit_dep_row_id(id: i64) -> RowID {
+    RowID::new(COMMIT_DEP_TABLE_ID.into(), RowKey::Int(id))
+}
+
+fn commit_dep_row(id: i64, value: &str) -> Row {
+    generate_simple_string_row(COMMIT_DEP_TABLE_ID.into(), id, value)
+}
+
+/// Commits row 1 with the value "initial".
+fn commit_dep_insert_initial_row(db: &MvccTestDbNoConn) {
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
+    mvcc_store
+        .insert(tx_id, commit_dep_row(1, "initial"))
+        .unwrap();
+    commit_tx(mvcc_store, &conn, tx_id).unwrap();
+    conn.close().unwrap();
+}
+
+/// Updates row 1 to `value` in a new transaction and moves that transaction to
+/// Preparing, as if it were in the middle of its commit. Its end_ts comes from
+/// the global clock, so a transaction that begins later has begin_ts >= end_ts,
+/// which is the speculative read condition (Hekaton Table 1).
+fn commit_dep_begin_preparing_writer(
+    mvcc_store: &Arc<crate::MvStore>,
+    conn: &Arc<Connection>,
+    value: &str,
+) -> TxID {
+    let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
+    assert!(mvcc_store.update(tx_id, commit_dep_row(1, value)).unwrap());
+    mvcc_store.get_commit_timestamp(|ts| {
+        mvcc_store
+            .txs
+            .get(&tx_id)
+            .unwrap()
+            .value()
+            .state
+            .store(TransactionState::Preparing(ts));
+    });
+    tx_id
+}
+
+/// Completes the commit of a Preparing writer by hand: its row versions get
+/// its end_ts, it becomes Committed, and its dependents' counters go down.
+fn commit_dep_finish_writer_commit(mvcc_store: &Arc<crate::MvStore>, writer_tx_id: TxID) {
+    let writer_tx = mvcc_store.txs.get(&writer_tx_id).unwrap();
+    let writer_tx = writer_tx.value();
+    let TransactionState::Preparing(end_ts) = writer_tx.state.load() else {
+        panic!("writer should be preparing");
+    };
+    for entry in mvcc_store.rows.iter() {
+        let mut rvs = entry.value().write();
+        for rv in rvs.iter_mut() {
+            if rv.begin() == Some(TxTimestampOrID::TxID(writer_tx_id)) {
+                rv.set_begin(Some(TxTimestampOrID::Timestamp(end_ts)));
+            }
+            if rv.end() == Some(TxTimestampOrID::TxID(writer_tx_id)) {
+                rv.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
+            }
+        }
+    }
+    writer_tx.state.store(TransactionState::Committed(end_ts));
+    for dep_tx_id in writer_tx.commit_dep_set.lock().drain() {
+        if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
+            dep_tx_entry
+                .value()
+                .commit_dep_counter
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Reads the given rows in a new transaction on a new connection.
+fn commit_dep_read_committed(db: &MvccTestDbNoConn, ids: &[i64]) -> Vec<Option<Row>> {
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
+    let rows = ids
+        .iter()
+        .map(|id| mvcc_store.read(tx_id, &commit_dep_row_id(*id)).unwrap())
+        .collect();
+    mvcc_store.rollback_tx(tx_id, conn.pager.load().clone(), &conn, crate::MAIN_DB_ID);
+    conn.close().unwrap();
     rows
 }
 
@@ -4092,6 +3972,9 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
         )> {
             self.inner.truncate(checkpointed_through_ts)
         }
+        fn finish_truncate(&self) {
+            self.inner.finish_truncate()
+        }
         fn reset_to_fresh_header(&self) -> Result<Completion> {
             self.inner.reset_to_fresh_header()
         }
@@ -4147,34 +4030,9 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
         }
     }
 
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let path = temp_dir
-        .path()
-        .join(format!("test_{}.db", rand::random::<u64>()));
-    let path_str = path.to_str().unwrap().to_string();
-    {
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(
-            io,
-            &path_str,
-            OpenFlags::default(),
-            DatabaseOpts::new(),
-            None,
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        conn.close().unwrap();
-        remove_file_from_database_registry(&path_str);
-    }
-
-    let log_path = path.with_extension("db-log");
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let log_file = io
-        .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)
+        .open_file("test.db-log", OpenFlags::default(), false)
         .unwrap();
     let inner_storage: Arc<dyn DurableStorage> = Arc::new(mvcc::persistent_storage::Storage::new(
         log_file,
@@ -4184,8 +4042,9 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
     let observe = ObserveCheckpointEndStorage::new(inner_storage);
     let db = Database::open(
         io,
-        &path_str,
-        crate::OpenOptions::new(Arc::new(SqliteDialect))
+        ":memory:",
+        crate::OpenOptions::new(Arc::new(DialectThatCannotParse))
+            .db_opts(DatabaseOpts::new().with_mvcc(true))
             .durable_storage(observe.clone() as Arc<dyn DurableStorage>),
     )
     .unwrap();
@@ -4196,9 +4055,13 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+    let tx_id = mv_store
+        .begin_exclusive_tx(conn.pager.load().clone(), None, &conn, None)
         .unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    mv_store
+        .with_header_mut(|header| header.user_version = 1.into(), Some(&tx_id))
+        .unwrap();
+    commit_tx(mv_store.clone(), &conn, tx_id).unwrap();
     conn.checkpoint(CheckpointMode::Truncate {
         upper_bound_inclusive: None,
     })

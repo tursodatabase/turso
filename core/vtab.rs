@@ -1,13 +1,15 @@
+use crate::alloc::{TryClone, TursoAllocExt, TursoTryWithCapacityExt, TursoVecExt};
+use crate::ast;
 use crate::pragma::{PragmaVirtualTable, PragmaVirtualTableCursor};
 use crate::schema::{Column, FromDefinitionFlags};
 use crate::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use crate::sync::{Arc, RwLock, Weak};
 use crate::types::IOResultOr;
+use crate::vdbe::Register;
 use crate::{Connection, IOResult, LimboError, SymbolTable, Value};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
-use turso_parser::ast;
 
 #[derive(Debug, Clone)]
 pub(crate) enum VirtualTableType {
@@ -275,6 +277,10 @@ enum VirtualTableCursorInner {
 pub struct VirtualTableCursor {
     inner: VirtualTableCursorInner,
     null_flag: bool,
+    /// The vector that [Self::filter] lends the argument values to an internal
+    /// cursor in. The cursor keeps it, so that a filter for each row of an
+    /// outer loop does not allocate.
+    filter_args: crate::alloc::Vec<Value>,
 }
 
 crate::assert::assert_send_sync!(VirtualTableCursor);
@@ -284,6 +290,7 @@ impl VirtualTableCursor {
         Self {
             inner: VirtualTableCursorInner::Pragma(Box::new(cursor)),
             null_flag: false,
+            filter_args: TursoAllocExt::new(),
         }
     }
 
@@ -291,6 +298,7 @@ impl VirtualTableCursor {
         Self {
             inner: VirtualTableCursorInner::External(cursor),
             null_flag: false,
+            filter_args: TursoAllocExt::new(),
         }
     }
 
@@ -298,6 +306,7 @@ impl VirtualTableCursor {
         Self {
             inner: VirtualTableCursorInner::Internal(cursor),
             null_flag: false,
+            filter_args: TursoAllocExt::new(),
         }
     }
 
@@ -307,6 +316,12 @@ impl VirtualTableCursor {
 
     pub(crate) fn get_null_flag(&self) -> bool {
         self.null_flag
+    }
+
+    /// Whether this is the cursor of an internal virtual table, whose filter
+    /// starts a new scan each time.
+    pub(crate) fn is_internal(&self) -> bool {
+        matches!(&self.inner, VirtualTableCursorInner::Internal(_))
     }
 
     pub(crate) fn needs_close_at_done(&self) -> bool {
@@ -334,6 +349,25 @@ impl VirtualTableCursor {
         })
     }
 
+    /// Writes the value of `column` into the register `dest`. An internal
+    /// cursor writes it into the value of the register, with
+    /// [InternalVirtualTableCursor::column_into].
+    pub(crate) fn column_into(&mut self, column: usize, dest: &mut Register) -> IOResultOr<()> {
+        if let (false, VirtualTableCursorInner::Internal(cursor), Register::Value(value)) =
+            (self.null_flag, &self.inner, &mut *dest)
+        {
+            cursor.read().column_into(column, value)?;
+            return Ok(IOResult::Done(()));
+        }
+        match self.column(column)? {
+            IOResult::Done(value) => {
+                dest.set_value(value);
+                Ok(IOResult::Done(()))
+            }
+            IOResult::IO(io) => Ok(IOResult::IO(io)),
+        }
+    }
+
     pub fn column(&mut self, column: usize) -> IOResultOr<Value> {
         if self.null_flag {
             return Ok(IOResult::Done(Value::Null));
@@ -346,21 +380,69 @@ impl VirtualTableCursor {
         result.map(IOResult::Done).map_err(Into::into)
     }
 
+    /// Starts a scan with the values of `arg_registers` as the arguments.
+    ///
+    /// An internal cursor reads its arguments only during the call, so the
+    /// values move out of their registers into a vector that this cursor
+    /// keeps, and they move back after the call, also after an error. The
+    /// registers must get their values back, because a constant argument,
+    /// such as the path of `json_each(doc, '$.a')`, is loaded once for each
+    /// statement. Pragma and extension cursors keep their arguments, so they
+    /// get copies.
     pub fn filter(
         &mut self,
         idx_num: i32,
         idx_str: Option<String>,
-        arg_count: usize,
-        args: crate::alloc::Vec<Value>,
+        arg_registers: &mut [Register],
+    ) -> IOResultOr<bool> {
+        self.filter_with_json_cache(
+            idx_num,
+            idx_str,
+            arg_registers,
+            #[cfg(feature = "json")]
+            &crate::json::JsonCacheCell::new(),
+        )
+    }
+
+    /// Like [Self::filter], and an internal cursor can read its document from
+    /// `json_cache`, the JSON cache of the statement, with
+    /// [InternalVirtualTableCursor::filter_with_json_cache].
+    pub(crate) fn filter_with_json_cache(
+        &mut self,
+        idx_num: i32,
+        idx_str: Option<String>,
+        arg_registers: &mut [Register],
+        #[cfg(feature = "json")] json_cache: &crate::json::JsonCacheCell,
     ) -> IOResultOr<bool> {
         self.null_flag = false;
         let result = match &mut self.inner {
-            VirtualTableCursorInner::Pragma(cursor) => cursor.filter(args),
+            VirtualTableCursorInner::Pragma(cursor) => cursor.filter(copy_values(arg_registers)?),
             VirtualTableCursorInner::External(cursor) => {
-                return cursor.filter(idx_num, idx_str, arg_count, args);
+                let arg_count = arg_registers.len();
+                return cursor.filter(idx_num, idx_str, arg_count, copy_values(arg_registers)?);
             }
             VirtualTableCursorInner::Internal(cursor) => {
-                cursor.write().filter(&args, idx_str, idx_num)
+                let args = &mut self.filter_args;
+                args.clear();
+                for register in arg_registers.iter_mut() {
+                    let value = match register {
+                        Register::Value(value) => std::mem::replace(value, Value::Null),
+                        register => register.get_value().try_clone()?,
+                    };
+                    args.try_push(value)?;
+                }
+                #[cfg(feature = "json")]
+                let result = cursor
+                    .write()
+                    .filter_with_json_cache(args, idx_str, idx_num, json_cache);
+                #[cfg(not(feature = "json"))]
+                let result = cursor.write().filter(args, idx_str, idx_num);
+                for (register, value) in arg_registers.iter_mut().zip(args.drain(..)) {
+                    if let Register::Value(slot) = register {
+                        *slot = value;
+                    }
+                }
+                result
             }
         };
         result.map(IOResult::Done).map_err(Into::into)
@@ -373,6 +455,15 @@ impl VirtualTableCursor {
             VirtualTableCursorInner::Internal(_) => None,
         }
     }
+}
+
+/// Copies of the values of `registers`.
+fn copy_values(registers: &[Register]) -> crate::Result<crate::alloc::Vec<Value>> {
+    let mut values = crate::alloc::Vec::try_with_capacity_ext(registers.len())?;
+    for register in registers {
+        values.try_push(register.get_value().try_clone()?)?;
+    }
+    Ok(values)
 }
 
 #[derive(Debug)]
@@ -671,10 +762,103 @@ pub trait InternalVirtualTableCursor: Send + Sync {
     fn next(&mut self) -> Result<bool, LimboError>;
     fn rowid(&self) -> i64;
     fn column(&self, column: usize) -> Result<Value, LimboError>;
+    /// Writes the value of `column` into `value`, the value that the register
+    /// of the column holds. A cursor can write a text value into the buffer of
+    /// `value`, so that each row does not allocate a new string. The default
+    /// replaces `value` with the value of [Self::column].
+    fn column_into(&self, column: usize, value: &mut Value) -> Result<(), LimboError> {
+        *value = self.column(column)?;
+        Ok(())
+    }
+    /// Starts a new scan with `args`, and returns `Ok(true)` when the scan has
+    /// a first row. VOpen keeps an open cursor when it runs again, as in a
+    /// correlated subquery, so a filter must reset all state of the cursor
+    /// from an earlier scan, as SQLite's xFilter does.
     fn filter(
         &mut self,
         args: &[Value],
         idx_str: Option<String>,
         idx_num: i32,
     ) -> Result<bool, LimboError>;
+    /// Like [Self::filter], for a cursor that can read its document from
+    /// `json_cache`, the JSON cache of the statement. The default ignores the
+    /// cache.
+    #[cfg(feature = "json")]
+    fn filter_with_json_cache(
+        &mut self,
+        args: &[Value],
+        idx_str: Option<String>,
+        idx_num: i32,
+        _json_cache: &crate::json::JsonCacheCell,
+    ) -> Result<bool, LimboError> {
+        self.filter(args, idx_str, idx_num)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cursor that records the arguments of each filter.
+    struct RecordingCursor {
+        seen_args: Vec<Vec<Value>>,
+    }
+
+    impl InternalVirtualTableCursor for RecordingCursor {
+        fn next(&mut self) -> Result<bool, LimboError> {
+            Ok(false)
+        }
+
+        fn rowid(&self) -> i64 {
+            0
+        }
+
+        fn column(&self, _column: usize) -> Result<Value, LimboError> {
+            Ok(Value::Null)
+        }
+
+        fn filter(
+            &mut self,
+            args: &[Value],
+            _idx_str: Option<String>,
+            _idx_num: i32,
+        ) -> Result<bool, LimboError> {
+            self.seen_args.push(args.to_vec());
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn filter_lends_argument_values_and_gives_them_back() {
+        let recording = Arc::new(RwLock::new(RecordingCursor {
+            seen_args: Vec::new(),
+        }));
+        let mut cursor = VirtualTableCursor::new_internal(recording.clone());
+        for round in 0..2 {
+            let mut registers = [
+                Register::Value(Value::build_text(format!("{{\"round\":{round}}}"))),
+                Register::Value(Value::build_text("$.round")),
+            ];
+            assert!(matches!(
+                cursor.filter(0, None, &mut registers).unwrap(),
+                IOResult::Done(false)
+            ));
+            assert_eq!(
+                registers[0].get_value(),
+                &Value::build_text(format!("{{\"round\":{round}}}"))
+            );
+            assert_eq!(registers[1].get_value(), &Value::build_text("$.round"));
+        }
+        let seen_args = &recording.read().seen_args;
+        assert_eq!(seen_args.len(), 2);
+        for (round, args) in seen_args.iter().enumerate() {
+            assert_eq!(
+                args,
+                &vec![
+                    Value::build_text(format!("{{\"round\":{round}}}")),
+                    Value::build_text("$.round"),
+                ]
+            );
+        }
+    }
 }

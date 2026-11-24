@@ -1,3 +1,6 @@
+use crate::ast::{
+    self, Expr, FrameBound, FrameClause, FrameMode, ResolveType, SortOrder, SubqueryType,
+};
 use crate::namespace::NamespaceRef;
 use crate::{
     alloc::{self, TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt},
@@ -19,6 +22,7 @@ use crate::{
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
     },
+    types::KeyInfo,
     types::SeekOp,
     util::exprs_are_equivalent,
     vdbe::{
@@ -32,11 +36,8 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
-use turso_parser::ast::{
-    self, Expr, FrameBound, FrameClause, FrameMode, ResolveType, SortOrder, SubqueryType,
-};
 
-use turso_parser::ast::TableInternalId;
+use crate::ast::TableInternalId;
 
 use super::emitter::OperationMode;
 use super::expr::expr_type::{compound_column_type, type_of, type_ordering, ExprType};
@@ -771,6 +772,15 @@ pub enum Distinctness {
         /// rows already come sorted by the distinct columns
         ordered: bool,
     },
+    /// `DISTINCT ON`: of the rows that follow each other with equal values in the first
+    /// `key_count` ORDER BY terms, only the first is returned.
+    DistinctOn { key_count: usize },
+    /// `DISTINCT ON` of a query whose rows arrive in ORDER BY order without a sort: of the
+    /// rows that follow each other with equal values in `keys`, only the first is returned.
+    DistinctOnRowsInOrder {
+        keys: Vec<ast::Expr>,
+        registers: Option<DistinctOnRegisters>,
+    },
 }
 
 impl Distinctness {
@@ -785,7 +795,13 @@ impl Distinctness {
         }
     }
     pub fn is_distinct(&self) -> bool {
-        matches!(self, Distinctness::Distinct { .. })
+        !matches!(self, Distinctness::NonDistinct)
+    }
+    pub fn is_distinct_on(&self) -> bool {
+        matches!(
+            self,
+            Distinctness::DistinctOn { .. } | Distinctness::DistinctOnRowsInOrder { .. }
+        )
     }
     pub fn is_ordered(&self) -> bool {
         matches!(self, Distinctness::Distinct { ordered: true, .. })
@@ -794,6 +810,79 @@ impl Distinctness {
         if let Distinctness::Distinct { ordered, .. } = self {
             *ordered = value;
         }
+    }
+}
+
+/// Registers that DISTINCT ON uses to tell whether a row starts a new group.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DistinctOnRegisters {
+    /// The key of the last row that was returned.
+    reg_previous_key_start: usize,
+    /// The key of the current row.
+    pub reg_key_start: usize,
+    /// 0 until a row has been returned.
+    reg_has_previous_key: usize,
+    key_count: usize,
+}
+
+impl DistinctOnRegisters {
+    pub fn alloc(program: &mut ProgramBuilder, key_count: usize) -> Self {
+        let registers = Self {
+            // `Insn::Compare` needs its first run of registers to come before its second.
+            reg_previous_key_start: program.alloc_registers(key_count),
+            reg_key_start: program.alloc_registers(key_count),
+            reg_has_previous_key: program.alloc_register(),
+            key_count,
+        };
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: registers.reg_has_previous_key,
+        });
+        registers
+    }
+
+    /// Jumps to `label_skip_row` when the key at `reg_key_start` equals the key of the last
+    /// row that was returned.
+    pub fn emit_skip_unless_first_row_of_group(
+        &self,
+        program: &mut ProgramBuilder,
+        key_collations: Vec<CollationSeq>,
+        label_skip_row: BranchOffset,
+    ) {
+        let label_new_group = program.allocate_label();
+        program.emit_insn(Insn::IfNot {
+            reg: self.reg_has_previous_key,
+            target_pc: label_new_group,
+            jump_if_null: true,
+        });
+        program.emit_insn(Insn::Compare {
+            start_reg_a: self.reg_previous_key_start,
+            start_reg_b: self.reg_key_start,
+            count: self.key_count,
+            key_info: key_collations
+                .into_iter()
+                .map(|collation| KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation,
+                    nulls_order: None,
+                })
+                .collect(),
+        });
+        program.emit_insn(Insn::Jump {
+            target_pc_lt: label_new_group,
+            target_pc_eq: label_skip_row,
+            target_pc_gt: label_new_group,
+        });
+        program.preassign_label_to_next_insn(label_new_group);
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: self.reg_has_previous_key,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: self.reg_key_start,
+            dst_reg: self.reg_previous_key_start,
+            extra_amount: self.key_count - 1,
+        });
     }
 }
 
@@ -979,7 +1068,9 @@ pub struct SelectPlan {
     pub values: Vec<Vec<Box<Expr>>>,
     /// The window definition and all window functions associated with it. There is at most one
     /// window per SELECT. If the original query contains more, they are pushed down into subqueries.
-    pub window: Option<Window>,
+    /// Boxed because only queries with window functions have a window, and each move of a
+    /// `SelectPlan` would copy its 152 bytes.
+    pub window: Option<Box<Window>>,
     /// Subqueries that appear in any part of the query apart from the FROM clause
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
     /// Estimated number of times this SELECT will be invoked by its parent scope.
@@ -1000,6 +1091,18 @@ pub struct SelectPlan {
 }
 
 impl SelectPlan {
+    /// The expressions that give result column `column` its values: that of
+    /// every row of a VALUES list, whose result columns hold only
+    /// placeholders, or else the result column's expression.
+    pub fn column_exprs(&self, column: usize) -> impl Iterator<Item = &ast::Expr> + Clone {
+        let values = self.values.iter().map(move |row| row[column].as_ref());
+        let result_column = self
+            .values
+            .is_empty()
+            .then(|| &self.result_columns[column].expr);
+        values.chain(result_column)
+    }
+
     pub fn joined_tables(&self) -> &[JoinedTable] {
         self.table_references.joined_tables()
     }
@@ -1186,7 +1289,7 @@ impl UpdatePlan {
     /// Combine the UPDATE target (always first) and the `FROM`-clause tables
     /// into one `TableReferences` — the read-side scope used for planning
     /// outer-`WHERE` subqueries, `EXPLAIN QUERY PLAN`, and rendering the plan
-    /// back to SQL text via `ToTokens`.
+    /// back to SQL text via `WriteSql`.
     /// The plan stores the two separately because the write-side emitter
     /// treats the target table specially; this helper rejoins them for readers.
     pub fn build_read_scope_tables(&self) -> TableReferences {
@@ -1856,25 +1959,39 @@ pub fn left_using_column_sources<'a, S>(
 pub fn merge_columns<'a>(
     sources: impl IntoIterator<Item = (TableInternalId, &'a Table, usize)>,
 ) -> ResolvedColumn {
-    let mut expressions = Vec::new();
-    let mut source_columns = SmallVec::new();
-    for (table_id, table, column_index) in sources {
-        expressions.push(Box::new(Expr::Column {
+    let column_expr =
+        |table_id: TableInternalId, table: &Table, column_index: usize| Expr::Column {
             database: None,
             table: table_id,
             column: column_index,
             is_rowid_alias: table.columns()[column_index].is_rowid_alias(),
-        }));
+        };
+    let mut sources = sources.into_iter();
+    let (table_id, table, column_index) = sources
+        .next()
+        .expect("a merged column has at least one source");
+    let mut source_columns = SmallVec::new();
+    source_columns.push((table_id, column_index));
+    let first = column_expr(table_id, table, column_index);
+    // Almost all columns have one source, and their value is the plain column.
+    // Return it without the Vec and the Box of a merged column.
+    let Some((table_id, table, column_index)) = sources.next() else {
+        return ResolvedColumn {
+            expr: first,
+            source_columns,
+        };
+    };
+    source_columns.push((table_id, column_index));
+    let mut expressions = vec![
+        Box::new(first),
+        Box::new(column_expr(table_id, table, column_index)),
+    ];
+    for (table_id, table, column_index) in sources {
+        expressions.push(Box::new(column_expr(table_id, table, column_index)));
         source_columns.push((table_id, column_index));
     }
-    assert!(!expressions.is_empty());
-    let expr = if expressions.len() == 1 {
-        *expressions.pop().unwrap()
-    } else {
-        Expr::MergedColumn(expressions)
-    };
     ResolvedColumn {
-        expr,
+        expr: Expr::MergedColumn(expressions),
         source_columns,
     }
 }
@@ -1907,7 +2024,9 @@ pub struct JoinedTable {
     pub op: Operation,
     /// How a RIGHT or FULL JOIN reads unmatched right rows after the main join loop.
     /// SQLite plans this read separately from the main loop. `None` means a default scan.
-    pub unmatched_right_rows_plan: Option<UnmatchedRightRowsPlan>,
+    /// Boxed because only RIGHT and FULL joins have this plan, and each move of a
+    /// `JoinedTable` would copy its 360 bytes.
+    pub unmatched_right_rows_plan: Option<Box<UnmatchedRightRowsPlan>>,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
@@ -1945,7 +2064,8 @@ pub struct JoinedTable {
     /// The condition that row-level security puts on the rows of the table.
     /// It is checked as soon as the loop reads a row, before any other
     /// condition, so no expression of the query sees a row it fails.
-    pub row_filter: Option<ast::Expr>,
+    /// Boxed because only tables with row-level security have this condition.
+    pub row_filter: Option<Box<ast::Expr>>,
 }
 
 /// Cost and row estimates for one table in a selected join plan.
@@ -1989,8 +2109,9 @@ pub struct OuterQueryReference {
     pub col_used_mask: ColumnUsedMask,
     /// Original CTE SELECT AST for re-planning. When a CTE is referenced
     /// multiple times, each reference needs a fresh plan with unique
-    /// internal_ids to avoid cursor key collisions.
-    pub cte_select: Option<ast::Select>,
+    /// internal_ids to avoid cursor key collisions. Shared, because the outer
+    /// query references are copied into the scope of each nested query.
+    pub cte_select: Option<Arc<ast::Select>>,
     /// Explicit column names from WITH t(a, b) AS (...) syntax.
     pub cte_explicit_columns: Vec<String>,
     /// CTE ID if this is a CTE reference. Used to track CTE reference counts
@@ -2070,10 +2191,8 @@ impl Default for TableReferences {
 
 impl TableReferences {
     /// The maximum number of tables that can be joined together in a query.
-    /// This limit is arbitrary, although we currently use a u128 to represent the [crate::translate::planner::TableMask],
-    /// which can represent up to 128 tables.
-    /// Even at 63 tables we currently cannot handle the optimization performantly, hence the arbitrary cap.
-    pub const MAX_JOINED_TABLES: usize = 63;
+    /// SQLite has the same limit (BMS, the number of bits in its table bitmask).
+    pub const MAX_JOINED_TABLES: usize = 64;
     pub const fn new(
         joined_tables: Vec<JoinedTable>,
         outer_query_refs: Vec<OuterQueryReference>,
@@ -4559,6 +4678,7 @@ impl SubqueryPosition {
             SubqueryPosition::ResultColumn
                 | SubqueryPosition::Where
                 | SubqueryPosition::GroupBy
+                | SubqueryPosition::Having
                 | SubqueryPosition::OrderBy
         )
     }
@@ -4913,6 +5033,14 @@ mod tests {
     };
 
     type TestResult = std::result::Result<(), alloc::TryReserveError>;
+
+    /// The planner moves and clones joined tables by value, and each move
+    /// copies all the bytes of a `JoinedTable`.
+    #[test]
+    fn joined_table_stays_small() {
+        let size = std::mem::size_of::<JoinedTable>();
+        assert!(size <= 640, "JoinedTable is {size} bytes");
+    }
 
     #[test]
     fn test_column_used_mask_empty() -> TestResult {

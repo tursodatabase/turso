@@ -10,10 +10,10 @@
 //! granted privileges on, which row-level security limits, and switches
 //! roles. It may not use a sequence or change the schema it does not own.
 
+use crate::ast;
 use crate::namespace::NamespaceRef;
 use crate::sync::Arc;
 use crate::Connection;
-use turso_parser::ast;
 
 use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::security::roles::RoleId;
@@ -228,6 +228,15 @@ pub fn check_statement_privileges(
         }
         ast::Stmt::CreateRole { role_name, .. } => {
             PermissionDenied::privilege(Action::Create, Object::Role(role_name.clone()))
+        }
+        // As in PostgreSQL, a role that may not drop roles is told so before
+        // the roles are looked up.
+        ast::Stmt::DropRole { roles, .. } => {
+            let name = match roles.first() {
+                Some(ast::Grantee::Role(role)) => role_spec_name(role),
+                Some(ast::Grantee::Public) | None => "public".to_string(),
+            };
+            PermissionDenied::privilege(Action::Drop, Object::Role(name))
         }
         ast::Stmt::Pragma {
             name,
@@ -647,6 +656,22 @@ pub fn translate_create_role(
     let statement = AccessStatement::CreateRole {
         name: &role_name,
         options: &options,
+    };
+    translate_access_statement(&statement, resolver, program, connection)
+}
+
+/// `DROP ROLE`: the dialect deletes the roles, through the same hook as its
+/// other catalog changes.
+pub fn translate_drop_role(
+    if_exists: bool,
+    roles: Vec<ast::Grantee>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let statement = AccessStatement::DropRole {
+        if_exists,
+        roles: &roles,
     };
     translate_access_statement(&statement, resolver, program, connection)
 }

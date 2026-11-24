@@ -1,0 +1,30 @@
+@database :memory:
+
+# AggFinal moves the result of MIN, MAX, group_concat and string_agg out of
+# the accumulator. The accumulator of each group starts again from an empty
+# payload. The index on g makes each group read its rows in rowid order.
+
+setup groups {
+    CREATE TABLE t(g INTEGER, x TEXT, b BLOB);
+    CREATE INDEX t_g ON t(g);
+    INSERT INTO t VALUES (1, 'b', x'02'), (1, 'a', x'01'), (2, 'c', x'03'), (2, NULL, NULL), (3, NULL, NULL), (4, 'dd', x'0404'), (4, 'd', x'04');
+}
+
+@setup groups
+test final-values-of-each-group {
+    SELECT g, group_concat(x), string_agg(x, '-'), min(x), max(x), hex(min(b)), hex(max(b)) FROM t GROUP BY g;
+}
+expect {
+    1|b,a|b-a|a|b|01|02
+    2|c|c|c|c|03|03
+    3||||||
+    4|dd,d|dd-d|d|dd|04|0404
+}
+
+@setup groups
+test final-values-in-expressions {
+    SELECT group_concat(x) || '!', max(x) || '?', min(x) || '.' FROM t;
+}
+expect {
+    b,a,c,dd,d!|dd?|a.
+}

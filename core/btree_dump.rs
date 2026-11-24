@@ -1,3 +1,4 @@
+use crate::ast;
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
 use crate::storage::btree::BTreeCursor;
@@ -11,7 +12,6 @@ use crate::{Connection, Result, Value};
 use turso_ext::{
     ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
 };
-use turso_parser::ast;
 
 #[derive(Debug)]
 pub struct BtreeDumpTable;

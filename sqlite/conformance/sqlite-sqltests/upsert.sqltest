@@ -178,6 +178,249 @@ expect {
 }
 
 @cross-check-integrity
+test upsert-returning-subqueries-update {
+    CREATE TABLE r4 (id INTEGER PRIMARY KEY, v);
+    CREATE TABLE r4x (x);
+    INSERT INTO r4x VALUES (1), (2), (3);
+    INSERT INTO r4 VALUES (1, 1);
+    INSERT INTO r4 VALUES (1, 2)
+      ON CONFLICT DO UPDATE SET v = excluded.v + 1
+      RETURNING v, (SELECT count(*) FROM r4x), EXISTS (SELECT 1 FROM r4x),
+        v IN (SELECT x FROM r4x), (SELECT x * 10 FROM r4x WHERE x = r4.v);
+}
+expect {
+    3|3|1|1|30
+}
+
+@cross-check-integrity
+test upsert-returning-subqueries-update-then-insert {
+    CREATE TABLE r5 (id INTEGER PRIMARY KEY, name);
+    CREATE TABLE r5x (x);
+    INSERT INTO r5x VALUES (1), (2);
+    INSERT INTO r5 VALUES (1, 'a');
+    INSERT INTO r5 VALUES (1, 'b'), (2, 'c')
+      ON CONFLICT DO UPDATE SET name = excluded.name
+      RETURNING id, (SELECT count(*) FROM r5x), (SELECT count(*) FROM r5);
+}
+expect {
+    1|2|1
+    2|2|2
+}
+
+@cross-check-integrity
+test upsert-returning-subqueries-before-after-triggers {
+    CREATE TABLE r6 (id INTEGER PRIMARY KEY, name);
+    CREATE TABLE r6log (x);
+    CREATE TRIGGER r6i AFTER INSERT ON r6 BEGIN INSERT INTO r6log VALUES ('i'); END;
+    CREATE TRIGGER r6u AFTER UPDATE ON r6 BEGIN INSERT INTO r6log VALUES ('u'); END;
+    INSERT INTO r6 VALUES (1, 'a');
+    DELETE FROM r6log;
+    INSERT INTO r6 VALUES (1, 'b'), (2, 'c')
+      ON CONFLICT DO UPDATE SET name = excluded.name
+      RETURNING id, (SELECT count(*) FROM r6log);
+}
+expect {
+    1|0
+    2|1
+}
+
+@cross-check-integrity
+test upsert-do-update-set-subqueries {
+    CREATE TABLE p (sku TEXT PRIMARY KEY, qty, price);
+    CREATE TABLE prices (sku, price);
+    INSERT INTO prices VALUES ('a', 9), ('b', 4);
+    INSERT INTO p VALUES ('a', 1, 0);
+    INSERT INTO p(sku, qty) VALUES ('a', 2)
+      ON CONFLICT(sku) DO UPDATE SET qty = qty + excluded.qty,
+        price = (SELECT price FROM prices WHERE prices.sku = excluded.sku);
+    SELECT * FROM p;
+    INSERT INTO p VALUES ('a', 0, 0)
+      ON CONFLICT(sku) DO UPDATE SET price = (SELECT max(price) FROM prices) + 1;
+    SELECT * FROM p;
+}
+expect {
+    a|3|9
+    a|3|10
+}
+
+# An uncorrelated subquery runs once, at the first conflict: after row 3 is
+# inserted and before row 4 is.
+@cross-check-integrity
+test upsert-do-update-set-subquery-runs-once {
+    CREATE TABLE s1 (id INTEGER PRIMARY KEY, c);
+    INSERT INTO s1 VALUES (1, 0), (2, 0);
+    INSERT INTO s1 VALUES (3, 0), (1, 0), (4, 0), (2, 0)
+      ON CONFLICT(id) DO UPDATE SET c = (SELECT count(*) FROM s1);
+    SELECT * FROM s1;
+}
+expect {
+    1|3
+    2|3
+    3|0
+    4|0
+}
+
+@cross-check-integrity
+test upsert-do-update-set-subqueries-read-each-row {
+    CREATE TABLE s2 (id INTEGER PRIMARY KEY, c, d);
+    CREATE TABLE s2x (x);
+    INSERT INTO s2x VALUES (1), (2), (5);
+    INSERT INTO s2 VALUES (1, 0, 0), (2, 0, 0);
+    INSERT INTO s2 VALUES (1, 5, 0), (2, 105, 0)
+      ON CONFLICT(id) DO UPDATE SET c = (SELECT (SELECT excluded.c) + 100),
+        d = (SELECT count(*) FROM s2x WHERE x > s2.id);
+    SELECT * FROM s2;
+}
+expect {
+    1|105|2
+    2|205|1
+}
+
+# The subquery that reads excluded runs for each conflict, and the count inside
+# it still runs once: row 2 gets the count from the first conflict.
+@cross-check-integrity
+test upsert-do-update-subquery-in-one-that-reads-excluded-runs-once {
+    CREATE TABLE s3 (id INTEGER PRIMARY KEY, c);
+    INSERT INTO s3 VALUES (1, 0), (2, 0);
+    INSERT INTO s3 VALUES (3, 0), (1, 100), (4, 0), (2, 200)
+      ON CONFLICT(id) DO UPDATE SET c = (SELECT excluded.c + (SELECT count(*) FROM s3));
+    SELECT * FROM s3;
+}
+expect {
+    1|103
+    2|203
+    3|0
+    4|0
+}
+
+@cross-check-integrity
+test upsert-do-update-subquery-names-target-by-alias {
+    CREATE TABLE ta (id INTEGER PRIMARY KEY, c);
+    INSERT INTO ta VALUES (1, 10);
+    INSERT INTO ta AS a VALUES (1, 5)
+      ON CONFLICT(id) DO UPDATE SET c = (SELECT a.c + a.rowid + excluded.rowid * 100);
+    SELECT * FROM ta;
+}
+expect {
+    1|111
+}
+
+@cross-check-integrity
+test upsert-do-update-subquery-table-aliased-excluded {
+    CREATE TABLE te (id INTEGER PRIMARY KEY, c);
+    CREATE TABLE o (c);
+    INSERT INTO o VALUES (77);
+    INSERT INTO te VALUES (1, 0);
+    INSERT INTO te VALUES (1, 5)
+      ON CONFLICT(id) DO UPDATE SET c = (SELECT excluded.c FROM o AS excluded) + excluded.c;
+    SELECT * FROM te;
+}
+expect {
+    1|82
+}
+
+@cross-check-integrity
+test upsert-do-update-subquery-reads-cte {
+    CREATE TABLE tc (id INTEGER PRIMARY KEY, c);
+    INSERT INTO tc VALUES (1, 0);
+    WITH k AS (SELECT 42 AS v)
+    INSERT INTO tc VALUES (1, 5) ON CONFLICT(id) DO UPDATE SET c = (SELECT v FROM k);
+    SELECT * FROM tc;
+}
+expect {
+    1|42
+}
+
+# A subquery reads the decoded values of the conflicting row and of excluded,
+# as the rest of the SET value does.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test upsert-do-update-subquery-reads-custom-type-values {
+    CREATE TYPE dbl BASE integer DECODE value * 2;
+    CREATE TABLE ct (id INTEGER PRIMARY KEY, v dbl, w INT, x INT) STRICT;
+    INSERT INTO ct VALUES (1, 5, 0, 0);
+    INSERT INTO ct VALUES (1, 7, 0, 0)
+      ON CONFLICT(id) DO UPDATE
+      SET w = (SELECT CAST(ct.v AS INTEGER) + CAST(excluded.v AS INTEGER)),
+        x = CAST(ct.v AS INTEGER) + CAST(excluded.v AS INTEGER);
+    SELECT w, x FROM ct;
+}
+expect {
+    24|24
+}
+
+@cross-check-integrity
+test upsert-do-update-set-row-value-subquery {
+    CREATE TABLE rv (id INTEGER PRIMARY KEY, c);
+    CREATE TABLE rvx (x);
+    INSERT INTO rvx VALUES (1), (2), (5);
+    INSERT INTO rv VALUES (1, 'a');
+    INSERT INTO rv VALUES (1, 'q')
+      ON CONFLICT(id) DO UPDATE SET (id, c) = (SELECT 10, max(x) FROM rvx);
+    SELECT * FROM rv;
+}
+expect {
+    10|5
+}
+
+@cross-check-integrity
+test upsert-do-update-where-subqueries {
+    CREATE TABLE w1 (id INTEGER PRIMARY KEY, c);
+    CREATE TABLE w1x (x);
+    INSERT INTO w1x VALUES (1), (2), (5);
+    INSERT INTO w1 VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+    INSERT INTO w1 VALUES (1, 'z') ON CONFLICT(id) DO UPDATE SET c = excluded.c
+      WHERE (SELECT max(x) FROM w1x) > 3;
+    INSERT INTO w1 VALUES (2, 5), (3, 6) ON CONFLICT(id) DO UPDATE SET c = 'e'
+      WHERE EXISTS (SELECT 1 FROM w1x WHERE x = excluded.c);
+    INSERT INTO w1 VALUES (4, 2) ON CONFLICT(id) DO UPDATE SET c = 'i'
+      WHERE excluded.c IN (SELECT x FROM w1x);
+    SELECT * FROM w1;
+}
+expect {
+    1|z
+    2|e
+    3|c
+    4|i
+}
+
+# The subquery runs once, so the update of row 1 does not stop the update of
+# row 2.
+@cross-check-integrity
+test upsert-do-update-where-subquery-runs-once {
+    CREATE TABLE w2 (id INTEGER PRIMARY KEY, c);
+    INSERT INTO w2 VALUES (1, 0), (2, 0);
+    INSERT INTO w2 VALUES (1, 0), (2, 0) ON CONFLICT(id) DO UPDATE SET c = c + 1
+      WHERE (SELECT count(*) FROM w2 WHERE c > 0) < 1;
+    SELECT * FROM w2;
+}
+expect {
+    1|1
+    2|1
+}
+
+@cross-check-integrity
+test upsert-do-update-subqueries-in-trigger {
+    CREATE TABLE tg (id INTEGER PRIMARY KEY, c);
+    CREATE TABLE tgx (x);
+    CREATE TABLE tglog (k);
+    INSERT INTO tgx VALUES (1), (2), (5);
+    INSERT INTO tg VALUES (1, 'a'), (2, 'b');
+    CREATE TRIGGER tglog_ai AFTER INSERT ON tglog BEGIN
+      INSERT INTO tg VALUES (new.k, 'q')
+        ON CONFLICT(id) DO UPDATE SET c = (SELECT max(x) FROM tgx WHERE x <= new.k)
+        WHERE EXISTS (SELECT 1 FROM tgx WHERE x = new.k);
+    END;
+    INSERT INTO tglog VALUES (7), (1), (2);
+    SELECT * FROM tg;
+}
+expect {
+    1|1
+    2|2
+    7|q
+}
+
+@cross-check-integrity
 test upsert-rowid-in-set {
     CREATE TABLE rid (id INTEGER PRIMARY KEY, name);
     INSERT INTO rid VALUES (5,'foo');
@@ -1092,4 +1335,245 @@ test upsert-do-update-compiled-when-table-has-unique-index-created-separately {
 }
 expect error {
     no such column: nosuch
+}
+
+# OR IGNORE does not replace the upsert: a conflict on the upsert target runs
+# DO UPDATE, and OR IGNORE applies to the other constraints.
+@cross-check-integrity
+test upsert-insert-or-ignore-runs-do-update {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, n INTEGER NOT NULL);
+    INSERT OR IGNORE INTO u VALUES(1,1) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    INSERT OR IGNORE INTO u VALUES(1,1) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    INSERT OR IGNORE INTO u VALUES(1,1) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    INSERT OR IGNORE INTO u VALUES(1,1) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    SELECT n FROM u;
+}
+expect {
+    4
+}
+
+@cross-check-integrity
+test upsert-insert-or-ignore-skips-conflict-on-other-index {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, b UNIQUE, c UNIQUE, n);
+    INSERT INTO u VALUES(1,1,1,1),(2,2,2,1);
+    INSERT OR IGNORE INTO u VALUES(3,1,3,5),(4,4,2,0),(5,5,5,5) ON CONFLICT(c) DO UPDATE SET n=n+100;
+    INSERT OR IGNORE INTO u VALUES(6,2,6,6) ON CONFLICT(id) DO UPDATE SET n=n+100;
+    INSERT OR IGNORE INTO u VALUES(2,7,7,7) ON CONFLICT(b) DO UPDATE SET n=n+100;
+    SELECT * FROM u ORDER BY id;
+}
+expect {
+    1|1|1|1
+    2|2|2|101
+    5|5|5|5
+}
+
+@cross-check-integrity
+test upsert-insert-or-ignore-not-null-and-check {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, n INTEGER NOT NULL CHECK(n < 100));
+    INSERT INTO u VALUES(1,1);
+    INSERT OR IGNORE INTO u VALUES(2,NULL) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    INSERT OR IGNORE INTO u VALUES(3,500) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    INSERT OR IGNORE INTO u VALUES(1,500) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    INSERT OR IGNORE INTO u VALUES(1,5) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    SELECT * FROM u;
+}
+expect {
+    1|2
+}
+
+@cross-check-integrity
+test upsert-column-on-conflict-ignore-skips-conflict-on-other-index {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, b UNIQUE ON CONFLICT IGNORE, n);
+    INSERT INTO u VALUES(1,1,1),(2,2,1);
+    INSERT INTO u VALUES(3,1,5) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    INSERT INTO u VALUES(2,5,5) ON CONFLICT(id) DO UPDATE SET n=n+1;
+    SELECT * FROM u ORDER BY id;
+}
+expect {
+    1|1|1
+    2|2|2
+}
+
+# OR REPLACE deletes the row that conflicts on a constraint other than the
+# upsert target; a conflict on the upsert target still runs DO UPDATE.
+@cross-check-integrity
+test upsert-insert-or-replace-replaces-conflict-on-other-index {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, a UNIQUE, b UNIQUE, n);
+    INSERT INTO u VALUES(1,1,1,0),(2,2,2,0),(3,3,3,0);
+    INSERT OR REPLACE INTO u VALUES(6,7,2,5) ON CONFLICT(a) DO UPDATE SET n=n+100;
+    INSERT OR REPLACE INTO u VALUES(3,8,8,5) ON CONFLICT(a) DO UPDATE SET n=n+100;
+    INSERT OR REPLACE INTO u VALUES(9,1,9,5) ON CONFLICT(a) DO UPDATE SET n=n+100;
+    SELECT * FROM u ORDER BY id;
+}
+expect {
+    1|1|1|100
+    3|8|8|5
+    6|7|2|5
+}
+
+@cross-check-integrity
+test upsert-column-on-conflict-replace-replaces-conflict-on-other-constraint {
+    CREATE TABLE u(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, a UNIQUE, b UNIQUE ON CONFLICT REPLACE, n);
+    INSERT INTO u VALUES(1,1,1,0),(2,2,2,0),(3,3,3,0);
+    INSERT INTO u VALUES(6,7,2,5) ON CONFLICT(a) DO UPDATE SET n=n+100;
+    INSERT INTO u VALUES(3,8,8,5) ON CONFLICT(a) DO UPDATE SET n=n+100;
+    INSERT INTO u VALUES(9,1,9,5) ON CONFLICT(a) DO UPDATE SET n=n+100;
+    SELECT * FROM u ORDER BY id;
+}
+expect {
+    1|1|1|100
+    3|8|8|5
+    6|7|2|5
+}
+
+# An upsert clause that targets a constraint declared ON CONFLICT REPLACE
+# handles that constraint's conflicts.
+@cross-check-integrity
+test upsert-targets-constraint-declared-on-conflict-replace {
+    CREATE TABLE u(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, a UNIQUE ON CONFLICT REPLACE, b UNIQUE, n);
+    INSERT INTO u VALUES(1,1,1,0),(2,2,2,0);
+    INSERT INTO u VALUES(1,5,5,5) ON CONFLICT(id) DO UPDATE SET n=n+100;
+    INSERT INTO u VALUES(7,2,7,5) ON CONFLICT(a) DO UPDATE SET n=n+10;
+    SELECT * FROM u ORDER BY id;
+}
+expect {
+    1|1|1|100
+    2|2|2|10
+}
+
+# The rows that ON DELETE CASCADE removes after a REPLACE delete stay removed.
+@cross-check-integrity
+test upsert-insert-or-replace-fires-foreign-key-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, a UNIQUE, b UNIQUE, n);
+    CREATE TABLE c(x REFERENCES p(b) ON DELETE CASCADE);
+    INSERT INTO p VALUES(1,1,1,0),(2,2,2,0);
+    INSERT INTO c VALUES(1),(2);
+    INSERT OR REPLACE INTO p VALUES(6,7,2,5) ON CONFLICT(a) DO UPDATE SET n=n+100;
+    SELECT * FROM p ORDER BY id;
+    SELECT x FROM c;
+}
+expect {
+    1|1|1|0
+    6|7|2|5
+    1
+}
+
+# With an upsert clause that does not target the rowid, the INTEGER PRIMARY
+# KEY ON CONFLICT REPLACE check runs right after the upsert target indexes,
+# before the other indexes: the old row is deleted before `a` is checked.
+@cross-check-integrity
+test upsert-rowid-replace-runs-before-other-index-ignore {
+    CREATE TABLE u(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, a UNIQUE ON CONFLICT IGNORE, b UNIQUE, n);
+    INSERT INTO u VALUES(0,0,0,0);
+    INSERT INTO u VALUES(0,0,4,0) ON CONFLICT(b) DO UPDATE SET n=n+1;
+    SELECT * FROM u;
+}
+expect {
+    0|0|4|0
+}
+
+@cross-check-integrity
+test upsert-rowid-replace-runs-before-other-index-abort {
+    CREATE TABLE u(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, a UNIQUE, b UNIQUE, n);
+    INSERT INTO u VALUES(0,0,0,0);
+    INSERT INTO u VALUES(0,0,4,0) ON CONFLICT(b) DO UPDATE SET n=n+1;
+    SELECT * FROM u;
+}
+expect {
+    0|0|4|0
+}
+
+# The rowid REPLACE delete has already run when `a` conflicts with another row
+# and IGNORE skips the new row. The foreign key makes SQLite delete the whole
+# old row; without one it removes only the old row's index entries, which
+# leaves its indexes out of step with the table.
+@cross-check-integrity
+test upsert-rowid-replace-then-other-index-ignore-on-other-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE u(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, a UNIQUE ON CONFLICT IGNORE, b UNIQUE, n);
+    CREATE TABLE c(x REFERENCES u(id) ON DELETE SET NULL);
+    INSERT INTO u VALUES(0,0,0,0),(1,1,1,1),(2,2,2,2);
+    INSERT INTO c VALUES(1);
+    INSERT INTO u VALUES(1,2,3,0) ON CONFLICT(b) DO UPDATE SET n=n+1;
+    SELECT * FROM u ORDER BY id;
+    SELECT quote(x) FROM c;
+}
+expect {
+    0|0|0|0
+    2|2|2|2
+    NULL
+}
+
+# An INTEGER PRIMARY KEY is stored only as the rowid, with NULL in its record
+# slot. The last bytes of the page are the only cell: payload size, rowid,
+# header size, serial type 0 (NULL) for id, then the serial type of v
+# (8 = constant 0, 9 = constant 1).
+@backend cli
+@skip-if sqlite "the sqlite3 build used by the tests has no sqlite_dbpage"
+@skip-if mvcc "MVCC keeps the updated row out of the B-tree until a checkpoint"
+test upsert-do-update-stores-rowid-alias-as-null {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES(7, 0);
+    INSERT INTO t VALUES(7, 0) ON CONFLICT(id) DO UPDATE SET v = v + 1;
+    SELECT hex(substr(data, -6)) FROM sqlite_dbpage WHERE pgno = 2;
+}
+expect {
+    000307030009
+}
+
+@backend cli
+@skip-if sqlite "the sqlite3 build used by the tests has no sqlite_dbpage"
+@skip-if mvcc "MVCC keeps the updated row out of the B-tree until a checkpoint"
+test upsert-do-update-on-other-index-stores-rowid-alias-as-null {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER UNIQUE);
+    INSERT INTO t VALUES(7, 0);
+    INSERT INTO t VALUES(8, 0) ON CONFLICT(v) DO UPDATE SET v = v + 1;
+    SELECT hex(substr(data, -6)) FROM sqlite_dbpage WHERE pgno = 2;
+}
+expect {
+    000307030009
+}
+
+@backend cli
+@skip-if sqlite "the sqlite3 build used by the tests has no sqlite_dbpage"
+@skip-if mvcc "MVCC keeps the updated row out of the B-tree until a checkpoint"
+test upsert-do-update-set-rowid-alias-stores-null {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE c(x INTEGER REFERENCES t(id) ON UPDATE CASCADE);
+    INSERT INTO t VALUES(7, 0);
+    INSERT INTO c VALUES(7);
+    INSERT INTO t VALUES(7, 0) ON CONFLICT(id) DO UPDATE SET id = 9;
+    SELECT hex(substr(data, -6)) FROM sqlite_dbpage WHERE pgno = 2;
+    SELECT x FROM c;
+}
+expect {
+    000309030008
+    9
+}
+
+# With the rowid alias slot of the new row NULL in the record, triggers,
+# RETURNING, generated columns and indexes still read the new rowid.
+@cross-check-integrity
+test upsert-do-update-rowid-alias-seen-by-triggers-and-returning {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, g AS (id * 2));
+    CREATE INDEX t_v_id ON t(v, id);
+    CREATE TABLE log(o, n, r, g);
+    CREATE TRIGGER tb BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES(old.id, new.id, new.rowid, new.g); END;
+    CREATE TRIGGER ta AFTER UPDATE ON t BEGIN INSERT INTO log VALUES(old.id, new.id, new.rowid, new.g); END;
+    INSERT INTO t(id, v) VALUES(7, 0);
+    INSERT INTO t(id, v) VALUES(7, 0) ON CONFLICT(id) DO UPDATE SET v = v + 1 RETURNING id, rowid, g, v;
+    INSERT INTO t(id, v) VALUES(7, 0) ON CONFLICT(id) DO UPDATE SET id = 30 RETURNING id, rowid, g, v;
+    SELECT * FROM log;
+    SELECT id, v FROM t INDEXED BY t_v_id WHERE v >= 0;
+}
+expect {
+    7|7|14|1
+    30|30|60|1
+    7|7|7|14
+    7|7|7|14
+    7|30|30|60
+    7|30|30|60
+    30|1
 }

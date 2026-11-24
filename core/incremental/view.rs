@@ -1,4 +1,6 @@
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
+use crate::ast;
+use crate::ast::{Cmd, Stmt};
 use crate::io::{Buffer, Completion, File, TempFile, IO};
 use crate::namespace::NamespaceId;
 use crate::schema::view::{extract_view_columns, ViewColumnSchema};
@@ -8,8 +10,6 @@ use crate::sync::{Arc, Mutex};
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, Value};
 use crate::{turso_assert, LimboError, Result, TempStore};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use turso_parser::ast;
-use turso_parser::ast::{Cmd, Stmt};
 
 /// Version of the materialized-view storage format embedded in every hidden
 /// table name. Version 1 is the interpreter layout released on `main`;
@@ -131,8 +131,6 @@ pub fn create_dbsp_state_index(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum TableChangeId {
     RootPage(i64),
-    #[cfg(test)]
-    Name(String),
 }
 
 #[derive(Debug, Clone)]
@@ -180,14 +178,6 @@ impl CapturedDelta {
             tail: Arc::new(Vec::new()),
             table_id: None,
         }
-    }
-
-    #[cfg(test)]
-    fn contains_table(&self, table_id: &TableChangeId) -> bool {
-        self.spilled
-            .iter()
-            .any(|segment| segment.rows > 0 && segment.table_ids.contains(table_id))
-            || self.tail.iter().any(|event| &event.table_id == table_id)
     }
 }
 
@@ -455,8 +445,6 @@ fn serialize_change_events(events: &[ChangeEvent]) -> Result<std::vec::Vec<u8>> 
 fn table_id_value(table_id: &TableChangeId) -> Value {
     match table_id {
         TableChangeId::RootPage(root_page) => Value::from_i64(*root_page),
-        #[cfg(test)]
-        TableChangeId::Name(name) => Value::Text(crate::types::Text::new(name.clone())),
     }
 }
 
@@ -475,50 +463,11 @@ impl ViewChangeSubscription {
         }
     }
 
-    #[cfg(test)]
-    pub fn insert(&self, table_name: &str, key: i64, values: crate::alloc::Vec<Value>) {
-        let table_id = TableChangeId::Name(table_name.to_string());
-        self.change_log
-            .subscribe_views(std::slice::from_ref(&self.view_name), &table_id);
-        let mut changes = self.change_log.changes.lock();
-        Arc::make_mut(&mut changes.tail).push(ChangeEvent {
-            table_id,
-            rowid: key,
-            values,
-            weight: 1,
-        });
-        self.change_log.event_appended();
-    }
-
-    #[cfg(test)]
-    pub fn delete(&self, table_name: &str, key: i64, values: crate::alloc::Vec<Value>) {
-        let table_id = TableChangeId::Name(table_name.to_string());
-        self.change_log
-            .subscribe_views(std::slice::from_ref(&self.view_name), &table_id);
-        let mut changes = self.change_log.changes.lock();
-        Arc::make_mut(&mut changes.tail).push(ChangeEvent {
-            table_id,
-            rowid: key,
-            values,
-            weight: -1,
-        });
-        self.change_log.event_appended();
-    }
-
     /// Clone only the requested table's stream, rather than every delta
     /// captured for the view.
     pub(crate) fn table_delta(&self, table: &BTreeTable) -> CapturedDelta {
-        let root_id = TableChangeId::RootPage(table.root_page);
-        let captured = self.change_log.snapshot(&root_id);
-        #[cfg(test)]
-        {
-            if !captured.contains_table(&root_id) {
-                return self
-                    .change_log
-                    .snapshot(&TableChangeId::Name(table.name.clone()));
-            }
-        }
-        captured
+        self.change_log
+            .snapshot(&TableChangeId::RootPage(table.root_page))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -681,6 +630,43 @@ impl Default for TransactionChanges {
     }
 }
 
+#[cfg(feature = "test_helper")]
+impl crate::Connection {
+    /// Record a change of `weight` to row `rowid` of main-database table
+    /// `table_name` in this connection's transaction change log, as a write
+    /// statement would, but deliver it only to materialized view `view_name`.
+    /// The table itself is not written.
+    pub fn record_view_change_for_testing(
+        &self,
+        view_name: &str,
+        table_name: &str,
+        rowid: i64,
+        values: std::vec::Vec<Value>,
+        weight: isize,
+    ) -> Result<()> {
+        let table = self
+            .schema
+            .read()
+            .get_btree_table(NamespaceId::ROOT, table_name)
+            .ok_or_else(|| LimboError::InternalError(format!("no table {table_name}")))?;
+        let spill_started = self.transaction_changes.change(
+            &table,
+            &[view_name.to_string()],
+            rowid,
+            values.into_iter().try_collect()?,
+            weight,
+            self.get_temp_store(),
+        )?;
+        if spill_started {
+            use crate::IOExt;
+            self.get_pager()
+                .io
+                .block(|| self.transaction_changes.finish_spill().map_err(Box::new))?;
+        }
+        Ok(())
+    }
+}
+
 /// A materialized view: its defining SELECT, output schema, and storage root.
 ///
 /// Maintenance is performed by compiled VDBE programs (see
@@ -744,146 +730,18 @@ impl IncrementalView {
     pub fn get_root_page(&self) -> i64 {
         self.root_page
     }
-
-    /// Syntactic relation dependencies, independent of schema load order.
-    ///
-    /// Schema reconstruction uses this to order persisted materialized views
-    /// before binding them. The executable DAG is still produced by the main
-    /// bound planner; this walker is identity metadata only.
-    /// The tables `select` reads, each with the namespace it is written
-    /// with, if any. A name that is a CTE of the select is not a table.
-    pub(crate) fn referenced_tables(
-        select: &ast::Select,
-    ) -> std::vec::Vec<(Option<String>, String)> {
-        fn collect_source(
-            source: &ast::SelectTable,
-            cte_names: &HashSet<String>,
-            tables: &mut HashSet<(Option<String>, String)>,
-        ) {
-            match source {
-                ast::SelectTable::Table(name, _, _) => {
-                    if cte_names
-                        .iter()
-                        .any(|cte| cte.eq_ignore_ascii_case(name.name.as_str()))
-                    {
-                        return;
-                    }
-                    tables.insert((
-                        name.namespace
-                            .as_ref()
-                            .map(|namespace| crate::util::normalize_ident(namespace.as_str())),
-                        crate::util::normalize_ident(name.name.as_str()),
-                    ));
-                }
-                ast::SelectTable::Select { select, .. } => {
-                    collect_select(select, cte_names, tables)
-                }
-                ast::SelectTable::Sub(from, _) => {
-                    collect_source(&from.select, cte_names, tables);
-                    for join in &from.joins {
-                        collect_source(&join.table, cte_names, tables);
-                    }
-                }
-                ast::SelectTable::TableCall(_, _, _) => {}
-            }
-        }
-
-        fn collect_one(
-            select: &ast::OneSelect,
-            cte_names: &HashSet<String>,
-            tables: &mut HashSet<(Option<String>, String)>,
-        ) {
-            let ast::OneSelect::Select {
-                columns,
-                from,
-                where_clause,
-                group_by,
-                ..
-            } = select
-            else {
-                return;
-            };
-            let mut exprs = Vec::new();
-            if let Some(from) = from {
-                for source in std::iter::once(from.select.as_ref())
-                    .chain(from.joins.iter().map(|join| join.table.as_ref()))
-                {
-                    collect_source(source, cte_names, tables);
-                }
-                for join in &from.joins {
-                    if let Some(ast::JoinConstraint::On(on)) = &join.constraint {
-                        exprs.push(on.as_ref());
-                    }
-                }
-            }
-            for column in columns {
-                if let ast::ResultColumn::Expr(expr, _) = column {
-                    exprs.push(expr.as_ref());
-                }
-            }
-            exprs.extend(where_clause.as_deref());
-            if let Some(group_by) = group_by {
-                exprs.extend(group_by.exprs.iter().map(|expr| expr.as_ref()));
-                exprs.extend(group_by.having.as_deref());
-            }
-            // Subqueries in expressions read tables too: the planner may turn
-            // `EXISTS (SELECT ... FROM t)` into a join with `t`.
-            for expr in exprs {
-                crate::translate::expr::walk_expr(expr, &mut |expr: &ast::Expr| {
-                    match expr {
-                        ast::Expr::Exists(select)
-                        | ast::Expr::Subquery(select)
-                        | ast::Expr::InSelect { rhs: select, .. } => {
-                            collect_select(select, cte_names, tables);
-                        }
-                        _ => {}
-                    }
-                    Ok(crate::translate::expr::WalkControl::Continue)
-                })
-                .expect("collecting subquery tables cannot fail");
-            }
-        }
-
-        fn collect_select(
-            select: &ast::Select,
-            inherited_ctes: &HashSet<String>,
-            tables: &mut HashSet<(Option<String>, String)>,
-        ) {
-            let mut cte_names = inherited_ctes.clone();
-            if let Some(with) = &select.with {
-                for cte in &with.ctes {
-                    cte_names.insert(crate::util::normalize_ident(cte.tbl_name.as_str()));
-                }
-                for cte in &with.ctes {
-                    collect_select(&cte.select, &cte_names, tables);
-                }
-            }
-            collect_one(&select.body.select, &cte_names, tables);
-            for compound in &select.body.compounds {
-                collect_one(&compound.select, &cte_names, tables);
-            }
-        }
-        let mut tables = HashSet::default();
-        collect_select(select, &HashSet::default(), &mut tables);
-        tables.into_iter().collect()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::alloc::vec;
-    use crate::incremental::yield_test_support::OneShotYieldInjector;
-    use crate::mvcc::yield_hooks::YieldPointMarker;
+    use crate::ast;
     use crate::namespace::NamespaceId;
     use crate::schema::{
         BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column as SchemaColumn, Schema, Type,
     };
-    use crate::security::roles::SessionRole;
-    use crate::storage::btree::{BTreeWriteYieldPoint, BTREE_WRITE_YIELD_FAMILY};
     use crate::sync::Arc;
-    use crate::{ConnectOpts, Database, DatabaseOpts, OpenFlags, SqliteDialect, StepResult};
-    use turso_parser::ast;
 
     #[test]
     fn hidden_state_ownership_parses_aggregate_suffixes() {
@@ -1178,73 +1036,6 @@ mod tests {
             )
             .unwrap();
         assert!(spill_started);
-    }
-
-    #[test]
-    fn maintenance_insert_resumes_after_overflow_cell_yield() {
-        #[allow(clippy::arc_with_non_send_sync)]
-        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            "ivm-maintenance-overflow-yield.db",
-            OpenFlags::default(),
-            DatabaseOpts::new().with_views(true),
-            None,
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE overflow_base(id INTEGER PRIMARY KEY, payload BLOB)")
-            .unwrap();
-        for id in 1..260 {
-            conn.execute(format!(
-                "INSERT INTO overflow_base VALUES ({id}, zeroblob(3600))"
-            ))
-            .unwrap();
-        }
-        conn.execute(
-            "CREATE MATERIALIZED VIEW overflow_view AS SELECT id, payload FROM overflow_base",
-        )
-        .unwrap();
-
-        let view_root_page = {
-            let view = conn
-                .schema
-                .read()
-                .get_materialized_view(NamespaceId::ROOT, "overflow_view")
-                .expect("materialized view must be present in the schema");
-            let root_page = view.lock().get_root_page();
-            root_page
-        };
-        let injector = OneShotYieldInjector::new(
-            BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance.point(),
-            BTREE_WRITE_YIELD_FAMILY ^ view_root_page as u64,
-        );
-        conn.set_yield_injector(Some(injector.clone()));
-
-        let mut stmt = conn
-            .prepare("INSERT INTO overflow_base VALUES (926, zeroblob(7200))")
-            .unwrap();
-        assert!(matches!(stmt.step().unwrap(), StepResult::Yield));
-        assert!(injector.fired(), "targeted view B-tree yield did not fire");
-        assert!(matches!(stmt.step().unwrap(), StepResult::Done));
-        drop(stmt);
-        conn.set_yield_injector(None);
-
-        let mut query = conn
-            .prepare("SELECT count(*), max(length(payload)) FROM overflow_view WHERE id = 926")
-            .unwrap();
-        assert!(matches!(query.step().unwrap(), StepResult::Row));
-        let row = query.row().unwrap();
-        assert_eq!(row.get::<i64>(0).unwrap(), 1);
-        assert_eq!(row.get::<i64>(1).unwrap(), 7200);
-        drop(query);
-
-        let mut integrity = conn.prepare("PRAGMA integrity_check").unwrap();
-        assert!(matches!(integrity.step().unwrap(), StepResult::Row));
-        assert_eq!(integrity.row().unwrap().get::<String>(0).unwrap(), "ok");
     }
 
     // Helper function to create a test schema with multiple tables

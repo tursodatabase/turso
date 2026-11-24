@@ -40,6 +40,7 @@ use turso_core::{
     QueryMode, SessionRole, Statement, Value,
 };
 use turso_sqlite::SqliteDialect;
+use turso_sync_engine::sync_encryption::SyncEncryption;
 
 #[derive(Parser, Debug)]
 #[command(name = "Turso")]
@@ -86,6 +87,10 @@ pub struct Opts {
         help = "Start sync server instead of interactive shell and listen at given address (e.g. 0.0.0.0:8080)"
     )]
     pub sync_server: Option<String>,
+    #[clap(long, requires_all = ["sync_server", "sync_encryption_key_file"], help = "Cipher for encrypted sync databases (e.g. aes256gcm)")]
+    pub sync_encryption_cipher: Option<String>,
+    #[clap(long, requires_all = ["sync_server", "sync_encryption_cipher"], help = "File containing the hex-encoded cloud database key")]
+    pub sync_encryption_key_file: Option<PathBuf>,
     #[clap(
         long,
         requires = "sync_server",
@@ -161,6 +166,7 @@ pub struct Limbo {
     input_buff: ManuallyDrop<String>,
     pub(crate) opts: Settings,
     pub(crate) db_opts: turso_core::DatabaseOpts,
+    pub(crate) sync_encryption: Option<SyncEncryption>,
     read_state: ReadState,
     pub rl: Option<Editor<LimboHelper, DefaultHistory>>,
     config: Option<Config>,
@@ -266,6 +272,22 @@ impl Limbo {
     pub fn new() -> anyhow::Result<(Self, WorkerGuard)> {
         let mut opts = Opts::parse();
         let guard = Self::init_tracing(&opts)?;
+        let sync_encryption = opts
+            .sync_encryption_cipher
+            .as_deref()
+            .map(|cipher| -> anyhow::Result<_> {
+                Ok(SyncEncryption::from_local_options(
+                    &turso_core::EncryptionOpts {
+                        cipher: cipher.to_string(),
+                        hexkey: std::fs::read_to_string(
+                            opts.sync_encryption_key_file
+                                .as_ref()
+                                .expect("clap requires key file"),
+                        )?,
+                    },
+                )?)
+            })
+            .transpose()?;
 
         let db_file = opts
             .database
@@ -275,7 +297,7 @@ impl Limbo {
         let db_opts = turso_core::DatabaseOpts::new()
             .with_views(opts.experimental_views)
             .with_custom_types(opts.experimental_custom_types)
-            .with_encryption(opts.experimental_encryption)
+            .with_encryption(opts.experimental_encryption || sync_encryption.is_some())
             .with_index_method(opts.experimental_index_method)
             .with_autovacuum(opts.experimental_autovacuum)
             .with_vacuum(opts.experimental_vacuum)
@@ -288,6 +310,10 @@ impl Limbo {
         let db_file = normalize_db_path(db_file);
 
         let (io, conn) = if db_file.starts_with("file:") {
+            anyhow::ensure!(
+                sync_encryption.is_none(),
+                "use a database path, not a file URI, with --sync-encryption-cipher"
+            );
             Connection::from_uri(&db_file, db_opts, Arc::new(SqliteDialect))?
         } else {
             let flags = open_flags(opts.readonly);
@@ -296,10 +322,15 @@ impl Limbo {
                 opts.vfs.as_ref(),
                 flags,
                 db_opts.turso_cli(),
-                None,
+                sync_encryption
+                    .as_ref()
+                    .and_then(SyncEncryption::local_options),
                 Arc::new(SqliteDialect),
             )?;
-            let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+            let conn = db.connect(sync_encryption.as_ref().map_or_else(
+                || ConnectOpts::new(SessionRole::Superuser),
+                SyncEncryption::connect_options,
+            ))?;
             (io, conn)
         };
         unsafe {
@@ -334,6 +365,7 @@ impl Limbo {
             read_state: ReadState::default(),
             opts: Settings::from(opts),
             db_opts,
+            sync_encryption,
             rl: None,
             config: Some(config),
             had_query_error: false,
@@ -477,6 +509,10 @@ impl Limbo {
 
     pub fn is_sync_server_mode(&self) -> bool {
         self.opts.sync_server_address.is_some()
+    }
+
+    pub fn get_io(&self) -> Arc<dyn turso_core::IO> {
+        self.io.clone()
     }
 
     pub fn get_interrupt_count(&self) -> Arc<AtomicUsize> {

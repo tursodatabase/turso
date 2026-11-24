@@ -18,7 +18,9 @@ const TURSO_ENCRYPTION_KEY = process.env.TURSO_ENCRYPTION_KEY as string | undefi
 const TURSO_ENCRYPTION_CIPHER = (process.env.TURSO_ENCRYPTION_CIPHER || 'aes256gcm') as
   | 'aes256gcm'
   | 'aes128gcm'
-  | 'chacha20poly1305';
+  | 'chacha20poly1305'
+  | 'aegis128l' | 'aegis128x2' | 'aegis128x4'
+  | 'aegis256' | 'aegis256x2' | 'aegis256x4';
 
 // Check if sync tests should run
 const SYNC_ENABLED = !!(TURSO_DATABASE_URL && TURSO_AUTH_TOKEN);
@@ -459,6 +461,42 @@ export default function App() {
     // ========================================
     if (ENCRYPTION_ENABLED) {
       testResults.push({ name: '--- Encryption Tests ---', passed: true });
+
+      if (TURSO_ENCRYPTION_CIPHER !== 'chacha20poly1305') {
+        let local: Database | null = null;
+        let peer: Database | null = null;
+        const path = `native-local-encryption-${Date.now()}.db`;
+        const keySize = TURSO_ENCRYPTION_CIPHER === 'aes128gcm' || TURSO_ENCRYPTION_CIPHER.startsWith('aegis128') ? 16 : 32;
+        const localEncryptionKey = '16'.repeat(keySize);
+        const table = `rn_local_encryption_${Date.now()}`;
+        try {
+          local = await connect({ path, url: TURSO_DATABASE_URL, authToken: TURSO_AUTH_TOKEN,
+            experimental: ['sync_encryption'], localEncryptionKey, remoteEncryption: { key: TURSO_ENCRYPTION_KEY!, cipher: TURSO_ENCRYPTION_CIPHER } });
+          await local.exec(`CREATE TABLE ${table}(value TEXT); INSERT INTO ${table} VALUES ('native local marker')`);
+          await local.push();
+          peer = await connect({ path: `${path}-peer`, url: TURSO_DATABASE_URL, authToken: TURSO_AUTH_TOKEN,
+            experimental: ['sync_encryption'], localEncryptionKey: '18'.repeat(keySize), remoteEncryption: { key: TURSO_ENCRYPTION_KEY!, cipher: TURSO_ENCRYPTION_CIPHER } });
+          await peer.exec(`INSERT INTO ${table} VALUES ('native remote marker')`);
+          await peer.push();
+          peer.close();
+          peer = null;
+          await local.pull();
+          await local.checkpoint();
+          local.close();
+          local = await connect({ path, experimental: ['sync_encryption'], localEncryptionKey, remoteEncryption: { cipher: TURSO_ENCRYPTION_CIPHER } });
+          const rows = await local.all(`SELECT value FROM ${table} ORDER BY value`);
+          if (rows.length !== 2 || rows[0]?.value !== 'native local marker' || rows[1]?.value !== 'native remote marker') throw new Error(JSON.stringify(rows));
+          local.close();
+          local = null;
+          let wrong: Database | null = null;
+          try { wrong = await connect({ path, experimental: ['sync_encryption'], localEncryptionKey: '17'.repeat(keySize), remoteEncryption: { cipher: TURSO_ENCRYPTION_CIPHER } }); }
+          catch { /* Expected authentication failure. */ }
+          if (wrong) { wrong.close(); throw new Error('wrong local key was accepted'); }
+          testResults.push({ name: 'Native local encryption: push/pull, checkpoint, offline reopen, wrong key', passed: true });
+        } catch (error) {
+          testResults.push({ name: 'Native local encryption bridge', passed: false, error: String(error) });
+        } finally { peer?.close(); local?.close(); }
+      }
 
       let encDb: Database | null = null;
 

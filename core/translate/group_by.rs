@@ -1,6 +1,6 @@
 use crate::alloc::TursoIteratorExt;
+use crate::ast::{self, SortOrder};
 use crate::translate::expr_context::ExprContext;
-use turso_parser::ast::{self, SortOrder};
 
 use super::{
     emitter::TranslateCtx,
@@ -9,7 +9,9 @@ use super::{
     result_row::emit_select_result,
 };
 use crate::translate::{
-    aggregation::{emit_aggregate_final, emit_aggregate_step, AggArgumentSource},
+    aggregation::{
+        emit_aggregate_final, emit_aggregate_step, AggArgumentSource, BareColumnRowCheck,
+    },
     expression_index::selected_expression_index,
     order_by::EmitOrderBy,
     plan::{Aggregate, NonFromClauseSubquery},
@@ -100,7 +102,7 @@ impl EmitGroupBy {
         order_by: &'a [(
             Box<ast::Expr>,
             ast::SortOrder,
-            Option<turso_parser::ast::NullsOrder>,
+            Option<crate::ast::NullsOrder>,
         )],
     ) -> Result<()> {
         collect_non_aggregate_expressions(
@@ -164,7 +166,7 @@ impl EmitGroupBy {
             let order_collations_nulls: crate::alloc::Vec<(
                 SortOrder,
                 CollationSeq,
-                Option<turso_parser::ast::NullsOrder>,
+                Option<crate::ast::NullsOrder>,
             )> = group_by
                 .exprs
                 .iter()
@@ -296,11 +298,7 @@ pub fn is_orderby_agg_or_const(resolver: &Resolver, e: &ast::Expr, aggs: &[Aggre
 /// appears in ORDER BY, and the remaining keys default to `ASC`.
 pub fn compute_group_by_sort_order(
     group_by_exprs: &[ast::Expr],
-    order_by: &[(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )],
+    order_by: &[(Box<ast::Expr>, SortOrder, Option<crate::ast::NullsOrder>)],
     aggs: &[Aggregate],
     resolver: &Resolver,
 ) -> (Vec<SortOrder>, Vec<Option<ast::NullsOrder>>) {
@@ -407,7 +405,7 @@ fn collect_non_aggregate_expressions<'a>(
     order_by: &'a [(
         Box<ast::Expr>,
         ast::SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
+        Option<crate::ast::NullsOrder>,
     )],
 ) -> Result<()> {
     let mut result_columns = Vec::new();
@@ -421,10 +419,17 @@ fn collect_non_aggregate_expressions<'a>(
     }
     result_columns.extend(&group_by.columns_read_by_group_subqueries);
 
+    let distinct_on_keys: &[ast::Expr] = match &plan.distinctness {
+        Distinctness::DistinctOnRowsInOrder { keys, .. } => keys,
+        _ => &[],
+    };
     for group_expr in &group_by.exprs {
         let expr_appears_in_result_columns = result_columns
             .iter()
             .any(|expr| exprs_are_equivalent(expr, group_expr))
+            || distinct_on_keys
+                .iter()
+                .any(|key| expr_contains(key, group_expr))
             || (!can_return_json_subtype(group_expr)
                 && root_result_columns
                     .iter()
@@ -443,6 +448,16 @@ fn collect_non_aggregate_expressions<'a>(
     Ok(())
 }
 
+fn expr_contains(expr: &ast::Expr, part: &ast::Expr) -> bool {
+    let mut found = false;
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        found |= exprs_are_equivalent(e, part);
+        Ok(WalkControl::Continue)
+    })
+    .expect("walking an expression cannot fail");
+    found
+}
+
 /// Collects columns from different parts of a SELECT that are needed for
 /// GROUP BY.
 fn collect_result_columns<'a>(
@@ -452,7 +467,7 @@ fn collect_result_columns<'a>(
 ) -> Result<()> {
     fn is_deferred_grouped_output_subquery(
         plan: &SelectPlan,
-        subquery_id: turso_parser::ast::TableInternalId,
+        subquery_id: crate::ast::TableInternalId,
     ) -> bool {
         plan.non_from_clause_subqueries
             .iter()
@@ -462,6 +477,15 @@ fn collect_result_columns<'a>(
 
     walk_expr(root_expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
         match expr {
+            // An expression that the selected index stores is saved whole, as
+            // in `collect_agg_leaf_columns`. Its columns may not be readable
+            // when the index covers the query and the table cursor is not open.
+            _ if !plan.aggregates.iter().any(|a| a.original_expr == *expr)
+                && selected_expression_index(expr, &plan.table_references).is_some() =>
+            {
+                result_columns.push(expr);
+                return Ok(WalkControl::SkipChildren);
+            }
             ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
                 if plan
                     .table_references
@@ -756,6 +780,12 @@ pub fn group_by_process_single_group(
 
     // Process each aggregate function for the current row
     program.preassign_label_to_next_insn(labels.label_grouping_agg_step);
+    let bare_column_row_check = BareColumnRowCheck::new(
+        program,
+        &plan.aggregates,
+        registers.reg_data_in_acc_flag,
+        true,
+    );
 
     match &row_source {
         GroupByRowSource::Sorter { pseudo_cursor, .. } => {
@@ -783,6 +813,7 @@ pub fn group_by_process_single_group(
                     .reg_agg_start
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
+                let minmax_keeps_best_reg = bare_column_row_check.emit_before_step(program, agg);
 
                 // FILTER: skip AggStep if filter condition is false
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
@@ -814,6 +845,7 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    minmax_keeps_best_reg,
                 )?;
                 if let Distinctness::Distinct { ctx, .. } = &agg.distinctness {
                     let ctx = ctx
@@ -837,6 +869,7 @@ pub fn group_by_process_single_group(
                     .reg_agg_start
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
+                let minmax_keeps_best_reg = bare_column_row_check.emit_before_step(program, agg);
 
                 // FILTER: skip AggStep if filter condition is false
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
@@ -872,6 +905,7 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    minmax_keeps_best_reg,
                 )?;
                 if let Distinctness::Distinct { ctx, .. } = &agg.distinctness {
                     let ctx = ctx
@@ -889,15 +923,15 @@ pub fn group_by_process_single_group(
         }
     }
 
-    // We only need to store non-aggregate columns once per group
-    // Skip if we've already stored them for this group
+    // Store the non-aggregate columns once per group, or on each row that sets
+    // a new minimum or maximum.
     program.add_comment(
         program.offset(),
         "don't emit group columns if continuing existing group",
     );
     program.emit_insn(Insn::If {
         target_pc: labels.label_acc_indicator_set_flag_true,
-        reg: registers.reg_data_in_acc_flag,
+        reg: bare_column_row_check.skip_reg(),
         jump_if_null: false,
     });
 

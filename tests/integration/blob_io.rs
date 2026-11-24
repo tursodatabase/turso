@@ -10,6 +10,7 @@ use turso_core::security::roles::RoleId;
 use turso_core::Dialect;
 use turso_sqlite::SqliteDialect;
 
+use turso_core::ast::Privilege;
 use turso_core::security::roles::SessionRole;
 use turso_core::vdbe::builder::{CursorType, ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use turso_core::vdbe::insn::{Insn, RegisterOrLiteral};
@@ -17,7 +18,6 @@ use turso_core::{
     ConnectOpts, Connection, Database, DatabaseOpts, LimboError, MemoryIO, OpenFlags, Statement,
     Value, IO,
 };
-use turso_parser::ast::Privilege;
 
 fn fresh_db() -> Arc<Connection> {
     fresh_db_with_dialect(Arc::new(SqliteDialect))
@@ -874,22 +874,29 @@ impl Dialect for SecretTableDialect {
         "secret-table-test"
     }
 
-    fn parse(&self, sql: &str) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    fn parse(&self, sql: &str) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
         turso_sqlite::SqliteDialect.parse(sql)
     }
 
     fn parse_internal(
         &self,
         sql: &str,
-    ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
         turso_sqlite::SqliteDialect.parse_internal(sql)
     }
 
     fn parse_internal_column_definition(
         &self,
         sql: &str,
-    ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+    ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn parameter_marker_ranges(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<Vec<std::ops::Range<usize>>> {
+        turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
     }
 
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {

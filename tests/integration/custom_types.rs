@@ -8,6 +8,20 @@ mod tests {
     use turso_sqlite::SqliteDialect;
 
     #[test]
+    fn builtin_types_read_as_the_kind_their_decode_gives() {
+        let db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+            .build();
+        let conn = db.connect_limbo();
+        let types = conn.type_read_kinds();
+        assert!(types.iter().any(|(name, ..)| name == "numeric"));
+        for (name, is_builtin, declared, decoded) in types {
+            assert!(is_builtin, "type {name} is not built-in");
+            assert_eq!(declared, decoded, "built-in type {name}");
+        }
+    }
+
+    #[test]
     fn test_uuid_invalid_update_and_upsert_preserve_rows() {
         for mvcc in [false, true] {
             let opts = turso_core::DatabaseOpts::new()
@@ -90,6 +104,55 @@ mod tests {
             assert_eq!(rows, expected, "mvcc={mvcc}, after COMMIT");
             conn.close().unwrap();
         }
+    }
+
+    /// The range and format errors of the built-in types are the errors that
+    /// RAISE(ABORT) raises: a plain error, and a trigger constraint error
+    /// when the statement runs inside a trigger.
+    #[test]
+    fn test_builtin_type_errors_keep_their_result_codes() {
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(v varchar(3), s smallint, u uuid) STRICT")
+            .unwrap();
+        conn.execute("CREATE TABLE src(x)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr AFTER INSERT ON src BEGIN INSERT INTO t(v) VALUES (new.x); END",
+        )
+        .unwrap();
+
+        const SQLITE_ERROR: i32 = 1;
+        const SQLITE_CONSTRAINT: i32 = 19;
+        const SQLITE_CONSTRAINT_TRIGGER: i32 = 1811;
+        for (sql, message, extended_code) in [
+            (
+                "INSERT INTO t(v) VALUES ('abcd')",
+                "value too long for varchar",
+                SQLITE_ERROR,
+            ),
+            (
+                "INSERT INTO t(s) VALUES (40000)",
+                "integer out of range for smallint",
+                SQLITE_ERROR,
+            ),
+            (
+                "INSERT INTO t(u) VALUES ('nope')",
+                "invalid UUID value",
+                SQLITE_ERROR,
+            ),
+            (
+                "INSERT INTO src VALUES ('abcd')",
+                "value too long for varchar",
+                SQLITE_CONSTRAINT_TRIGGER,
+            ),
+        ] {
+            let error = conn.execute(sql).unwrap_err();
+            assert!(error.to_string().contains(message), "{sql}: {error}");
+            assert_eq!(error.sqlite_result_code(), SQLITE_CONSTRAINT, "{sql}");
+            assert_eq!(error.sqlite_extended_result_code(), extended_code, "{sql}");
+        }
+        conn.close().unwrap();
     }
 
     /// Custom types must be loaded from __turso_internal_types when reopening
@@ -2937,5 +3000,134 @@ mod tests {
             run(&format!("ALTER TABLE b ALTER COLUMN x TO x2 {ty}[]"));
             all_true("SELECT x2 = ARRAY[y2] FROM b", 1);
         }
+    }
+
+    /// Every query here compares, sorts or hashes only values of a type with
+    /// its own order. No instruction of its program may use a text
+    /// collation: if one does, some code path took the collation from the
+    /// text rules instead of from the value's type, and would compare
+    /// '10.00' before '9.50'.
+    #[test]
+    fn no_text_collation_on_typed_values() {
+        let conn = connection_with_typed_tables();
+        let mut failures = Vec::new();
+        for &(sql, internal_comparisons) in TYPED_VALUE_QUERIES {
+            let stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let with_text_collation: Vec<String> = stmt
+                .comparison_collations()
+                .into_iter()
+                .filter(|(_, collation)| matches!(collation, turso_core::CollationSeq::Text(_)))
+                .map(|(place, _)| place)
+                .collect();
+            if with_text_collation.len() != internal_comparisons {
+                failures.push(format!("{sql}\n    {}", with_text_collation.join("\n    ")));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "comparisons of typed values that use a text collation:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Each query, with the number of its instructions that compare values the
+    /// engine made itself (row counters, sequence numbers) with BINARY.
+    const TYPED_VALUE_QUERIES: &[(&str, usize)] = &[
+        // comparisons
+        ("SELECT n FROM t WHERE n > 1.5", 0),
+        ("SELECT n FROM t WHERE n BETWEEN 1.5 AND 2", 0),
+        ("SELECT n FROM t WHERE a = '{1}'", 0),
+        ("SELECT n FROM t WHERE b < '{x}'", 0),
+        ("SELECT n FROM t WHERE n = (SELECT max(m) FROM u)", 0),
+        ("SELECT n > 1.5, nullif(n, 2), n IS 1.5 FROM t", 0),
+        // IN
+        ("SELECT n FROM t WHERE n IN (1.5, 2)", 0),
+        ("SELECT n FROM t WHERE n NOT IN (1.5, 2)", 0),
+        ("SELECT n FROM t WHERE n IN (SELECT m FROM u)", 0),
+        ("SELECT n FROM t WHERE n IN (SELECT m FROM u UNION SELECT n FROM t)", 0),
+        ("SELECT n FROM t WHERE a IN (SELECT a FROM t)", 0),
+        // CASE
+        ("SELECT CASE n WHEN 1.5 THEN 1 WHEN 2 THEN 2 END FROM t", 0),
+        ("SELECT n FROM t ORDER BY CASE WHEN a IS NULL THEN n ELSE n END", 0),
+        // ORDER BY
+        ("SELECT n FROM t ORDER BY n", 0),
+        ("SELECT n FROM t ORDER BY a DESC, b", 0),
+        ("SELECT n FROM t ORDER BY likely(n), coalesce(n, 1)", 0),
+        ("SELECT n + 1 AS x FROM t ORDER BY x", 0),
+        // GROUP BY
+        ("SELECT n FROM t GROUP BY n", 0),
+        ("SELECT a, b FROM t GROUP BY a, b", 0),
+        ("SELECT n FROM t GROUP BY n HAVING n > 1", 0),
+        // DISTINCT
+        ("SELECT DISTINCT n FROM t", 0),
+        ("SELECT DISTINCT a, b FROM t", 0),
+        ("SELECT count(DISTINCT n) FROM t", 0),
+        // compound
+        ("SELECT n FROM t UNION SELECT m FROM u", 0),
+        ("SELECT n FROM t INTERSECT SELECT m FROM u", 0),
+        ("SELECT n FROM t EXCEPT SELECT m FROM u", 0),
+        // The sorter's last key is the sequence number of the row.
+        ("SELECT n FROM t UNION ALL SELECT m FROM u ORDER BY 1", 1),
+        ("SELECT a FROM t UNION SELECT a FROM t", 0),
+        // window
+        ("SELECT min(n) OVER (PARTITION BY a ORDER BY b) FROM t", 0),
+        ("SELECT max(n) OVER (ORDER BY n RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t", 0),
+        ("SELECT n FROM t ORDER BY lag(n) OVER (ORDER BY a)", 0),
+        // Two comparisons of the frame's row numbers.
+        ("SELECT n FROM t ORDER BY first_value(b) OVER (ORDER BY n)", 2),
+        // min/max
+        ("SELECT min(n), max(a), min(b) FROM t", 0),
+        ("SELECT max(n, 2), min(n, 1.5) FROM t", 0),
+        // join
+        ("SELECT t.n FROM t JOIN u ON t.n = u.m", 0),
+        ("SELECT t.n FROM t LEFT JOIN u ON t.n = u.m", 0),
+        ("SELECT t.n FROM t, u WHERE t.n > u.m", 0),
+        ("SELECT t.n FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.m = t.n)", 0),
+        // A value without a type compared with typed values.
+        ("SELECT n FROM t WHERE 1.5 IN (n, 2)", 0),
+        ("SELECT n FROM t WHERE '{1}' IN (a)", 0),
+        // Registers that stand for columns.
+        (
+            "INSERT INTO w VALUES (1, '{1}', 1.5) ON CONFLICT(k) DO UPDATE \
+             SET a = excluded.a WHERE excluded.a > w.a AND excluded.n > w.n",
+            0,
+        ),
+        ("UPDATE w SET a = '{2}'", 0),
+        ("INSERT INTO w VALUES (2, '{1}', 1.5) RETURNING a > '{0}', n > 1.5", 0),
+        // Array function results.
+        ("SELECT n FROM t WHERE b = ARRAY['9'] OR array_append(a, 1) > a", 0),
+        ("SELECT n FROM t WHERE string_to_array('9', ',') = b", 0),
+        // A compound subquery in FROM.
+        ("SELECT x FROM (SELECT n AS x FROM t UNION ALL SELECT m FROM u) WHERE x > 1.5", 0),
+        ("SELECT DISTINCT x FROM (SELECT 1 AS x UNION ALL SELECT n FROM t)", 0),
+        // Automatic indexes.
+        ("SELECT t.n FROM t, u WHERE t.n = u.m AND u.m > 1", 0),
+    ];
+
+    fn connection_with_typed_tables() -> Arc<turso_core::Connection> {
+        let db = turso_core::Database::open_file_with_flags(
+            Arc::new(turso_core::MemoryIO::new()),
+            ":memory:",
+            turso_core::OpenFlags::Create,
+            turso_core::DatabaseOpts::new().with_custom_types(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("CREATE TABLE t(n numeric(10,2), a integer[], b text[]) STRICT")
+            .unwrap();
+        conn.execute("CREATE TABLE u(m numeric(10,2)) STRICT")
+            .unwrap();
+        conn.execute("CREATE TABLE w(k int PRIMARY KEY, a integer[], n numeric(10,2)) STRICT")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER w_grew AFTER UPDATE ON w WHEN NEW.a > OLD.a AND NEW.n > OLD.n \
+             BEGIN SELECT 1; END",
+        )
+        .unwrap();
+        conn
     }
 }

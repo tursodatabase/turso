@@ -1,4 +1,4 @@
-export type ExperimentalFeature = 'views' | 'strict' | 'encryption' | 'index_method' | 'custom_types' | 'autovacuum' | 'vacuum' | 'triggers' | 'attach' | 'generated_columns' | 'multiprocess_wal' | 'without_rowid';
+export type ExperimentalFeature = 'views' | 'strict' | 'encryption' | 'sync_encryption' | 'index_method' | 'custom_types' | 'autovacuum' | 'vacuum' | 'triggers' | 'attach' | 'generated_columns' | 'multiprocess_wal' | 'without_rowid';
 
 /** Supported encryption ciphers for local database encryption. */
 export type EncryptionCipher = 'aes128gcm' | 'aes256gcm' | 'aegis256' | 'aegis256x2' | 'aegis128l' | 'aegis128x2' | 'aegis128x4'
@@ -62,9 +62,9 @@ export const STEP_SLEEP = 4;
 export interface TableColumn {
     name: string,
     type: string | null,
-    column: null,
-    table: null,
-    database: null
+    column: string | null,
+    table: string | null,
+    database: string | null
 }
 
 /** [step constant, milliseconds to wait before stepping again (nonzero only for STEP_SLEEP)] */
