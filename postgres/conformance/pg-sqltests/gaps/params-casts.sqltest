@@ -388,6 +388,40 @@ test invalid-jsonb-literal {
 @sqlstate 22P02
 expect error {}
 
+# A cast to jsonb converts the value as a jsonb column does, and the jsonb
+# input of tursopg accepts JSON5, such as a field name without quotes.
+@compat-gap "type:jsonb"
+test jsonb-literal-in-json5 {
+    SELECT '{a:1}'::jsonb;
+}
+@sqlstate 22P02
+expect error {}
+expect @tursopg {
+    {"a":1}
+}
+
+# PostgreSQL has no cast from a number or a boolean to jsonb. tursopg converts
+# the stored value, so true gives the JSON number 1.
+@compat-gap "cast:int4 -> jsonb"
+test cast-of-integer-to-jsonb {
+    SELECT 1::jsonb;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    1
+}
+
+@compat-gap "cast:bool -> jsonb"
+test cast-of-boolean-to-jsonb {
+    SELECT true::jsonb;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    1
+}
+
 # A-50: jsonb number precision
 test jsonb-number-precision {
     SELECT '1.50'::jsonb, '12345678901234567890'::jsonb;
