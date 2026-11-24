@@ -99,6 +99,12 @@ The PostgreSQL frontend depends on Chumsky, distributed by the Chumsky authors:
 * License: licenses/chumsky-mit-license.md (MIT License)
 * Homepage: https://codeberg.org/zesterer/chumsky
 
+The generator of the PostgreSQL catalog tables uses prettyplease, distributed
+by David Tolnay:
+
+* License: licenses/prettyplease-mit-license.md (MIT License)
+* Homepage: https://github.com/dtolnay/prettyplease
+
 The PostgreSQL dump fuzzer uses Hegel, distributed by Antithesis, LLC:
 
 * License: licenses/testing/hegeltest-mit-license.md (MIT License)
