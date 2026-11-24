@@ -1,5 +1,7 @@
+use crate::common::TempDatabase;
 use std::sync::Arc;
 use std::task::Waker;
+use tempfile::TempDir;
 use turso_core::security::roles::SessionRole;
 use turso_core::vdbe::{ProgramExecutionState, StepResult};
 use turso_core::ConnectOpts;
@@ -615,6 +617,84 @@ fn stmt_status_run_counts_trigger_and_foreign_key_action_programs() {
     let mut delete = conn.prepare("DELETE FROM p").unwrap();
     delete.run_ignore_rows().unwrap();
     assert_eq!(delete.stmt_status(StatementStatusCounter::Run), 3);
+}
+
+/// The dispatch loop moves its step counts into the metrics of the
+/// statement at each periodic check, and the interval of the progress
+/// handler sets how often these checks run. So the step counts must not
+/// depend on this interval. The statements read pages from the file, so
+/// some instructions wait for IO. One statement fails, and one is
+/// interrupted after its first row.
+#[test]
+fn vm_step_counts_do_not_depend_on_the_progress_handler_interval() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("vm_step_counts.db");
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO t SELECT value, printf('%.500d', value) FROM generate_series(1, 1000)",
+        )
+        .unwrap();
+    }
+    let counts = |stmt: &turso_core::Statement| {
+        let metrics = stmt.metrics();
+        (
+            metrics.vm_steps,
+            metrics.insn_executed,
+            stmt.stmt_status(StatementStatusCounter::VmStep),
+        )
+    };
+    let mut expected = None;
+    for interval in [0, 1, 7, 255, 256, 1000] {
+        // A new database for each interval, so that each run reads the
+        // pages from the file and waits for the same IO.
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        if interval > 0 {
+            conn.set_progress_handler(interval, Some(Box::new(|| false)));
+        }
+
+        let mut scan = conn
+            .prepare("SELECT count(*), sum(length(y)) FROM t")
+            .unwrap();
+        scan.run_ignore_rows().unwrap();
+
+        let mut failing = conn
+            .prepare("SELECT abs(CASE WHEN x = 600 THEN -9223372036854775808 ELSE x END) FROM t")
+            .unwrap();
+        let error = failing.run_ignore_rows().unwrap_err();
+        assert!(matches!(error, LimboError::IntegerOverflow), "{error:?}");
+
+        let mut interrupted = conn.prepare("SELECT y FROM t").unwrap();
+        let mut rows = 0;
+        loop {
+            match interrupted.step().unwrap() {
+                StepResult::Row => {
+                    rows += 1;
+                    if rows == 1 {
+                        interrupted.interrupt();
+                    }
+                }
+                StepResult::Interrupt => break,
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    interrupted._io().step().unwrap();
+                }
+                result => panic!("expected a row or an interrupt, got {result:?}"),
+            }
+        }
+        assert_eq!(rows, 1);
+
+        let all = [counts(&scan), counts(&failing), counts(&interrupted)];
+        match &expected {
+            None => expected = Some(all),
+            Some(expected) => {
+                assert_eq!(&all, expected, "progress handler interval {interval}")
+            }
+        }
+    }
 }
 
 #[test]
