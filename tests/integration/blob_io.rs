@@ -102,7 +102,8 @@ fn run_blob_program(
         conn.get_pager(),
         QueryMode::Normal,
         0,
-    );
+    )
+    .unwrap();
     stmt.run_collect_rows().unwrap()
 }
 

@@ -89,15 +89,20 @@ fn statement_allocator_gives_the_memory_of_nested_programs() {
     conn.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO u VALUES (new.x); END")
         .unwrap();
 
-    // A statement that starts no trigger uses no memory of this allocator.
+    // Each statement makes the builder of its program and its state with this
+    // allocator.
+    let before = allocations.load(Relaxed);
     conn.execute("INSERT INTO u VALUES (1)").unwrap();
-    assert_eq!(allocations.load(Relaxed), 0);
+    let without_trigger = allocations.load(Relaxed) - before;
+    assert!(without_trigger > 0);
 
-    // The compilation of the trigger program and the statement that executes
-    // it use this allocator. They give back all the memory when the statement
-    // ends.
+    // A statement that starts a trigger also makes the builder of the trigger
+    // program and the statement that executes it with this allocator.
+    let before = allocations.load(Relaxed);
     conn.execute("INSERT INTO t VALUES (2)").unwrap();
-    assert!(allocations.load(Relaxed) > 0);
+    assert!(allocations.load(Relaxed) - before > without_trigger);
+
+    // The statements give back all the memory when they end.
     assert_eq!(deallocations.load(Relaxed), allocations.load(Relaxed));
 }
 
@@ -119,10 +124,10 @@ fn statement_allocator_failure_stops_only_the_statement() {
         conn.execute(sql).unwrap();
     }
 
-    // The compilation of the trigger program fails.
+    // The compilation of the statement fails.
     fail.store(true, Relaxed);
     let Err(err) = conn.prepare("INSERT INTO t VALUES (1)") else {
-        panic!("the compilation of the trigger program must fail");
+        panic!("the compilation of the statement must fail");
     };
     assert!(matches!(err, LimboError::OutOfMemory), "{err}");
 

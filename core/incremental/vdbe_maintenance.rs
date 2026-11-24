@@ -24,6 +24,7 @@
 //! completion (or before an in-statement view read), or inside the CREATE
 //! MATERIALIZED VIEW statement for initial population.
 
+use crate::alloc::StatementAllocationSite;
 use crate::ast;
 use crate::namespace::NamespaceRef;
 use rustc_hash::FxHashMap;
@@ -33,6 +34,7 @@ use crate::schema::Schema;
 use crate::security::roles::RoleId;
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
+use crate::translate::{build_program, new_program_builder};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::{PreparedProgram, Program};
 use crate::{Connection, LimboError, QueryMode, Result};
@@ -172,17 +174,20 @@ fn compile_maintenance_plan(
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<Program> {
-    let mut program = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        None,
-        ProgramBuilderOpts {
-            num_cursors: 13,
-            approx_num_insns: 128 + 64 * num_view_columns,
-            approx_num_labels: 48,
-        },
-        connection.mvcc_enabled(),
-        0,
-    );
+    let mut program =
+        new_program_builder(connection, StatementAllocationSite::ProgramBuilder, || {
+            ProgramBuilder::new_for_subprogram(
+                QueryMode::Normal,
+                None,
+                ProgramBuilderOpts {
+                    num_cursors: 13,
+                    approx_num_insns: 128 + 64 * num_view_columns,
+                    approx_num_labels: 48,
+                },
+                connection.mvcc_enabled(),
+                0,
+            )
+        })?;
     program.prologue();
     emit_plan_to_sink(
         &mut program,
@@ -197,7 +202,12 @@ fn compile_maintenance_plan(
         connection,
     )?;
     program.epilogue(schema);
-    program.build(connection, false, "materialized view DAG maintenance")
+    build_program(
+        program,
+        connection,
+        false,
+        "materialized view DAG maintenance",
+    )
 }
 
 #[cfg(feature = "test_helper")]

@@ -1164,7 +1164,7 @@ impl Connection {
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
 
-            Ok(Statement::new_with_origin(
+            Statement::new_with_origin(
                 program,
                 self.clone(),
                 pager,
@@ -1172,7 +1172,7 @@ impl Connection {
                 byte_offset_end,
                 origin,
                 needs_nested_guard,
-            ))
+            )
         })();
         if result.is_err() && needs_nested_guard {
             self.end_nested();
@@ -1221,7 +1221,7 @@ impl Connection {
         }
         let result = (|| {
             let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
-            Ok(Statement::new_with_origin(
+            Statement::new_with_origin(
                 program,
                 self.clone(),
                 pager,
@@ -1229,7 +1229,7 @@ impl Connection {
                 0,
                 origin,
                 needs_nested_guard,
-            ))
+            )
         })();
         if result.is_err() && needs_nested_guard {
             self.end_nested();
@@ -1509,7 +1509,7 @@ impl Connection {
                 .unwrap()
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-            Statement::new(program, self.clone(), pager, mode, 0).run_ignore_rows()?;
+            Statement::new(program, self.clone(), pager, mode, 0)?.run_ignore_rows()?;
             remaining = &remaining[byte_offset_end..];
         }
         Ok(())
@@ -1531,7 +1531,7 @@ impl Connection {
             return Ok(None);
         };
         let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-        Ok(Some(Statement::new(program, self.clone(), pager, mode, 0)))
+        Ok(Some(Statement::new(program, self.clone(), pager, mode, 0)?))
     }
 
     /// Execute will run a query from start to finish taking ownership of I/O because it will run pending I/Os if it didn't finish.
@@ -1551,7 +1551,7 @@ impl Connection {
             let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
             {
                 crate::stack::trace_stack!("run");
-                Statement::new(program, self.clone(), pager.clone(), mode, 0).run_ignore_rows()?;
+                Statement::new(program, self.clone(), pager.clone(), mode, 0)?.run_ignore_rows()?;
             }
             remaining = &remaining[byte_offset_end..];
         }
@@ -1574,7 +1574,7 @@ impl Connection {
             .unwrap()
             .trim();
         let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-        let stmt = Statement::new(program, self.clone(), pager, mode, 0);
+        let stmt = Statement::new(program, self.clone(), pager, mode, 0)?;
         Ok(Some((stmt, byte_offset_end)))
     }
 
@@ -4076,13 +4076,17 @@ impl Connection {
 
     /// The error for a statement on a sequence backing table that failed
     /// with `err`. The backing table is the engine's own, so the failure
-    /// means the file is corrupt.
+    /// means the file is corrupt, except when no memory was available: then
+    /// the error stays `OutOfMemory`, and the statement can run again later.
     pub(crate) fn sequence_backing_table_corrupt(
         backing_table_name: &str,
         seq_name: &str,
         problem: &str,
         err: &LimboError,
     ) -> LimboError {
+        if matches!(err, LimboError::OutOfMemory) {
+            return LimboError::OutOfMemory;
+        }
         LimboError::Corrupt(format!(
             "internal sequence backing table \"{backing_table_name}\" for sequence \
              \"{seq_name}\": {problem}: {err}"
@@ -5279,6 +5283,28 @@ mod tests {
         let catalog = conn.attached_databases.read();
         let entry = catalog.index_to_data.get(&index).unwrap();
         (entry.db.clone(), entry.pager.clone())
+    }
+
+    /// A statement on a sequence backing table can fail because the statement
+    /// allocator gives no memory. That is not corruption, so the error must
+    /// stay `OutOfMemory`: the concurrent simulator stops at a `Corrupt` error.
+    #[test]
+    fn sequence_backing_table_error_keeps_out_of_memory() {
+        let err = Connection::sequence_backing_table_corrupt(
+            "__turso_internal_seq_s",
+            "s",
+            "cannot prepare descriptor SELECT",
+            &LimboError::OutOfMemory,
+        );
+        assert!(matches!(err, LimboError::OutOfMemory), "{err}");
+
+        let err = Connection::sequence_backing_table_corrupt(
+            "__turso_internal_seq_s",
+            "s",
+            "descriptor row read failed",
+            &LimboError::InternalError("no row".to_string()),
+        );
+        assert!(matches!(err, LimboError::Corrupt(_)), "{err}");
     }
 
     #[test]

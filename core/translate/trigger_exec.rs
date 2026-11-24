@@ -1,4 +1,4 @@
-use crate::alloc::{DynBox, TursoBoxExt};
+use crate::alloc::StatementAllocationSite;
 use crate::ast::{self, Expr, TriggerEvent, TriggerTime};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{BTreeTable, Column, Trigger};
@@ -10,8 +10,10 @@ use crate::translate::subquery::{
     emit_non_from_clause_subquery, plan_subqueries_in_expr_without_from_clause,
 };
 use crate::translate::{
+    build_program,
     emitter::Resolver,
     expr::{self, expr_type::column_custom_type_names, translate_expr, walk_expr_mut},
+    new_program_builder,
     planner::ROWID_STRS,
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
@@ -566,7 +568,23 @@ fn execute_trigger_commands(
         override_conflict: ctx.override_conflict,
         db_name,
     };
-    let mut subprogram_builder = new_trigger_program_builder(connection, program, trigger, depth)?;
+    // The compilation of nested triggers recurses one time for each level, so
+    // new_program_builder makes the large builder in its own stack frame, and
+    // not in the frame of this function.
+    let mut subprogram_builder = new_program_builder(
+        connection,
+        StatementAllocationSite::TriggerProgramBuilder,
+        || {
+            ProgramBuilder::new_for_trigger(
+                QueryMode::Normal,
+                program.capture_data_changes_info().clone(),
+                ProgramBuilderOpts::new(1, 32, 2),
+                trigger.clone(),
+                program.is_mvcc_enabled(),
+                depth,
+            )
+        },
+    )?;
     // If we have an override_conflict (e.g. from UPSERT DO UPDATE context),
     // propagate it to the subprogram so that nested trigger firing will also use it.
     if let Some(override_conflict) = ctx.override_conflict {
@@ -606,7 +624,8 @@ fn execute_trigger_commands(
         Ok(())
     })?;
     subprogram_builder.epilogue(resolver.schema());
-    let built_subprogram = build_trigger_program(subprogram_builder, connection)?;
+    let built_subprogram =
+        build_program(subprogram_builder, connection, true, "trigger subprogram")?;
     let subprogram_prepared = built_subprogram.prepared();
 
     // Trigger subprograms do not emit Transaction opcodes, so the parent statement
@@ -667,44 +686,6 @@ fn execute_trigger_commands(
     });
 
     Ok(true)
-}
-
-/// Makes the builder of a nested trigger program in memory from the statement
-/// allocator of the database. The compilation of nested triggers recurses one
-/// time for each level, so the large builder must not be in the stack frame of
-/// [execute_trigger_commands]. Thus this function makes the builder in its own
-/// frame, and it must not be inlined.
-#[inline(never)]
-fn new_trigger_program_builder(
-    connection: &crate::Connection,
-    parent: &ProgramBuilder,
-    trigger: &Arc<Trigger>,
-    depth: usize,
-) -> Result<DynBox<ProgramBuilder>> {
-    let builder = ProgramBuilder::new_for_trigger(
-        QueryMode::Normal,
-        parent.capture_data_changes_info().clone(),
-        ProgramBuilderOpts::new(1, 32, 2),
-        trigger.clone(),
-        parent.is_mvcc_enabled(),
-        depth,
-    );
-    let alloc = connection.db.allocators.statement.clone();
-    let builder = crate::with_statement_allocation_site!(
-        TriggerProgramBuilder,
-        DynBox::try_new_in(builder, alloc)
-    )?;
-    Ok(builder)
-}
-
-/// Builds the program of a nested trigger. The builder leaves its box here, so
-/// that it is not in the stack frame of [execute_trigger_commands].
-#[inline(never)]
-fn build_trigger_program(
-    builder: DynBox<ProgramBuilder>,
-    connection: &Arc<crate::Connection>,
-) -> Result<crate::vdbe::Program> {
-    TursoBoxExt::into_inner(builder).build(connection, true, "trigger subprogram")
 }
 
 /// Check if there are any triggers for a given event (regardless of time).

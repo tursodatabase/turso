@@ -53,6 +53,7 @@ mod values;
 pub(crate) mod view;
 mod window;
 
+use crate::alloc::{DynBox, StatementAllocationSite, TursoBoxExt};
 use crate::ast;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
@@ -100,13 +101,15 @@ pub fn translate(
     } else {
         connection.get_capture_data_changes_info().clone()
     };
-    // Boxed so the ~800 B builder sits on the heap instead of the prepare frame.
-    let mut program = Box::new(ProgramBuilder::new(
-        query_mode,
-        capture_data_changes_info,
-        // These options will be extended whithin each translate program
-        ProgramBuilderOpts::new(1, 32, 2),
-    ));
+    let mut program =
+        new_program_builder(&connection, StatementAllocationSite::ProgramBuilder, || {
+            ProgramBuilder::new(
+                query_mode,
+                capture_data_changes_info,
+                // These options will be extended whithin each translate program
+                ProgramBuilderOpts::new(1, 32, 2),
+            )
+        })?;
     program.set_mvcc_enabled(connection.mvcc_enabled());
     program.flags.set_reads_stored_values(matches!(
         origin,
@@ -198,7 +201,43 @@ pub fn translate(
 
     program.epilogue(schema);
 
-    program.build(&connection, change_cnt_on, input)
+    build_program(program, &connection, change_cnt_on, input)
+}
+
+/// Makes a program builder with `new`, in memory from the statement allocator
+/// of the database. The allocation is at `site`. Rust makes the builder on the
+/// stack and then copies it into the box. This function is not inlined, so
+/// that the builder is in the stack frame of this function, and not in the
+/// frame of its caller.
+#[inline(never)]
+pub(crate) fn new_program_builder(
+    connection: &Connection,
+    site: StatementAllocationSite,
+    new: impl FnOnce() -> ProgramBuilder,
+) -> Result<DynBox<ProgramBuilder>> {
+    let builder = new();
+    let alloc = connection.db.allocators.statement.clone();
+    #[cfg(feature = "allocation_metric")]
+    let _site_guard = crate::alloc::enter_allocation_site(site);
+    #[cfg(not(feature = "allocation_metric"))]
+    let _ = site;
+    Ok(DynBox::try_new_in(builder, alloc)?)
+}
+
+/// Builds the program of a builder in memory from the statement allocator.
+/// [ProgramBuilder::build] takes the builder as a value, so the builder leaves
+/// its box here. This function is not inlined, so that the builder is in the
+/// stack frame of this function, and not in the frame of its caller. The
+/// compilation of nested triggers recurses one time for each level, so the
+/// builder must not be in the frame of the code that recurses.
+#[inline(never)]
+pub(crate) fn build_program(
+    builder: DynBox<ProgramBuilder>,
+    connection: &Arc<Connection>,
+    change_cnt_on: bool,
+    input: &str,
+) -> Result<Program> {
+    TursoBoxExt::into_inner(builder).build(connection, change_cnt_on, input)
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty

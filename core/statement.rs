@@ -10,7 +10,7 @@ use std::{
 use crate::ast::{fmt::WriteSql, Cmd};
 use tracing::{instrument, Level};
 
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{DynBox, TursoIteratorExt};
 use crate::{
     busy::BusyHandlerState,
     parameters,
@@ -213,7 +213,7 @@ pub struct ColumnOrigin {
 
 pub struct Statement {
     pub(crate) program: vdbe::Program,
-    state: Box<vdbe::ProgramState>,
+    state: DynBox<vdbe::ProgramState>,
     connection: Arc<Connection>,
     pager: Arc<Pager>,
     /// indicates if the statement is a NORMAL/EXPLAIN/EXPLAIN QUERY PLAN
@@ -292,7 +292,7 @@ impl Statement {
         pager: Arc<Pager>,
         query_mode: QueryMode,
         tail_offset: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new_with_origin(
             program,
             connection,
@@ -313,7 +313,7 @@ impl Statement {
         tail_offset: usize,
         origin: StatementOrigin,
         nested_guard_active: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         let (max_registers, cursor_count) = match query_mode {
             QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
@@ -325,9 +325,12 @@ impl Statement {
             } => (EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len(), 0),
         };
         let state = vdbe::ProgramState::new(max_registers, cursor_count);
-        Self {
+        let alloc = connection.db.allocators.statement.clone();
+        let state =
+            crate::with_statement_allocation_site!(ProgramState, DynBox::try_new_in(state, alloc))?;
+        Ok(Self {
             program,
-            state: Box::new(state),
+            state,
             connection,
             pager,
             query_mode,
@@ -343,7 +346,7 @@ impl Statement {
             nested_guard_active,
             analyze_refresh: None,
             reprepare_cmd: None,
-        }
+        })
     }
 
     /// Mark this statement as the parked backing statement of an incremental

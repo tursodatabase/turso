@@ -6363,7 +6363,7 @@ fn new_subprogram_statement(
         0,
         crate::statement::StatementOrigin::Subprogram,
         false,
-    );
+    )?;
     let alloc = connection.db.allocators.statement.clone();
     let statement = crate::with_statement_allocation_site!(
         SubprogramStatement,
@@ -15837,7 +15837,7 @@ pub fn op_populate_materialized_views(
                 0,
                 crate::statement::StatementOrigin::Subprogram,
                 false,
-            )));
+            )?));
         }
 
         let populate_state = state
