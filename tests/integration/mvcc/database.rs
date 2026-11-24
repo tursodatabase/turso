@@ -13809,3 +13809,288 @@ fn test_mvcc_portable_changes_resolve_user_table_after_cross_connection_checkpoi
         "DML-only portable frame should resolve user table after cross-connection checkpoint"
     );
 }
+
+/// Regression for #8447: `SAVEPOINT s; INSERT ...; COMMIT` where the COMMIT
+/// yields, then `ROLLBACK TO s` on the same connection. The rollback succeeded
+/// and undid the rows in memory after the commit had built its log record, so
+/// the table was empty until the database was reopened and recovery replayed
+/// the record. Other statements of the connection panicked on the committing
+/// transaction, or (BEGIN) made the paused COMMIT skip the commit. Now every
+/// other statement of the connection, including one started before the
+/// COMMIT, and `Connection::close`, fail with `StatementsInProgress` until the
+/// commit finishes, while other connections keep working.
+#[test]
+fn statements_of_a_connection_wait_for_its_yielded_commit() {
+    use CommitYieldPoint::*;
+    for point in [
+        CommitValidation,
+        WaitForDependencies,
+        BuildLogRecordStart,
+        LogRecordPrepared,
+        LogRecordMarkedWritten,
+        BeforeGlobalHeaderUpdate,
+        BeforeFinishCommittedTx,
+    ] {
+        let mut db = MvccTestDbNoConn::new_with_random_db();
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("SAVEPOINT s").unwrap();
+        for i in 0..5 {
+            conn.execute(format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+        let mut started_select = conn.prepare("SELECT x FROM t").unwrap();
+        assert!(matches!(started_select.step().unwrap(), StepResult::Row));
+
+        let injector = FixedYieldInjector::new([point.point()]);
+        conn.set_yield_injector(Some(injector.clone()));
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        while !injector.is_empty() {
+            assert!(
+                matches!(commit.step().unwrap(), StepResult::Yield | StepResult::IO),
+                "COMMIT finished without reaching {point:?}"
+            );
+        }
+        conn.set_yield_injector(None);
+
+        for sql in [
+            "ROLLBACK TO s",
+            "SAVEPOINT q",
+            "RELEASE s",
+            "INSERT INTO t VALUES (99)",
+            "SELECT count(*) FROM t",
+            "BEGIN",
+            "ROLLBACK",
+            "COMMIT",
+        ] {
+            let result = conn.execute(sql);
+            assert!(
+                matches!(result, Err(LimboError::StatementsInProgress(_))),
+                "{sql} during a COMMIT paused at {point:?} returned {result:?}"
+            );
+        }
+        let result = started_select.step();
+        assert!(
+            matches!(result, Err(LimboError::StatementsInProgress(_))),
+            "a SELECT started before a COMMIT paused at {point:?} returned {result:?}"
+        );
+        let result = conn.close();
+        assert!(
+            matches!(result, Err(LimboError::StatementsInProgress(_))),
+            "close() during a COMMIT paused at {point:?} returned {result:?}"
+        );
+        // Another connection still reads. It sees the rows of the committing
+        // transaction and takes a commit dependency on it, so it can finish
+        // only after the COMMIT.
+        let other = db.connect();
+        let mut other_select = other.prepare("SELECT count(*) FROM t").unwrap();
+        assert!(matches!(other_select.step().unwrap(), StepResult::Row));
+        assert_eq!(
+            *other_select.row().unwrap().get_value(0),
+            Value::from_i64(5)
+        );
+
+        commit.run_ignore_rows().unwrap();
+        drop(commit);
+        drop(started_select);
+        assert!(other_select.run_collect_rows().unwrap().is_empty());
+        drop(other_select);
+        drop(other);
+        assert_eq!(
+            get_rows(&conn, "SELECT count(*) FROM t"),
+            vec![vec![Value::from_i64(5)]]
+        );
+        conn.execute("INSERT INTO t VALUES (5)").unwrap();
+        drop(conn);
+        db.restart();
+        assert_eq!(
+            get_rows(&db.connect(), "SELECT count(*) FROM t"),
+            vec![vec![Value::from_i64(6)]],
+            "reopened database after a COMMIT paused at {point:?}"
+        );
+    }
+}
+
+/// The statements of a connection may run again as soon as its unfinished
+/// COMMIT is dropped or has failed, even if the failed COMMIT statement is
+/// not reset.
+#[test]
+fn statements_of_a_connection_run_after_its_commit_is_dropped_or_fails() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    let injector = FixedYieldInjector::new([CommitYieldPoint::LogRecordPrepared.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    while !injector.is_empty() {
+        assert!(matches!(
+            commit.step().unwrap(),
+            StepResult::Yield | StepResult::IO
+        ));
+    }
+    conn.set_yield_injector(None);
+    drop(commit);
+    assert_eq!(
+        get_rows(&conn, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(0)]],
+        "dropping the COMMIT rolls its transaction back"
+    );
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    conn.set_failure_injector(Some(FixedFailureInjector::new([(
+        CommitYieldPoint::AfterRemoveTx.point(),
+        LimboError::TxError("synthetic commit failure".to_string()),
+    )])));
+    let mut failed_commit = conn.prepare("COMMIT").unwrap();
+    assert!(failed_commit.run_ignore_rows().is_err());
+    conn.set_failure_injector(None);
+    conn.execute("INSERT INTO t VALUES (3)").unwrap();
+    drop(failed_commit);
+
+    drop(conn);
+    db.restart();
+    assert_eq!(
+        get_rows(&db.connect(), "SELECT count(*) FROM t WHERE x = 3"),
+        vec![vec![Value::from_i64(1)]]
+    );
+}
+
+/// `nextval()` commits its sequence row in a transaction of its own, which
+/// the connection holds instead of the user's transaction until that commit
+/// ends. While that commit yields, the other statements of the connection
+/// wait like they do for the connection's own COMMIT.
+#[test]
+fn statements_of_a_connection_wait_for_a_yielded_nextval_commit() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE SEQUENCE seq").unwrap();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let injector = FixedYieldInjector::new([CommitYieldPoint::LogRecordPrepared.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut nextval = conn.prepare("SELECT nextval('seq')").unwrap();
+    while !injector.is_empty() {
+        assert!(matches!(
+            nextval.step().unwrap(),
+            StepResult::Yield | StepResult::IO
+        ));
+    }
+    conn.set_yield_injector(None);
+    for sql in [
+        "SELECT count(*) FROM t",
+        "INSERT INTO t VALUES (2)",
+        "COMMIT",
+    ] {
+        let result = conn.execute(sql);
+        assert!(
+            matches!(result, Err(LimboError::StatementsInProgress(_))),
+            "{sql} during a paused nextval() commit returned {result:?}"
+        );
+    }
+    assert_eq!(
+        nextval.run_collect_rows().unwrap(),
+        vec![vec![Value::from_i64(1)]]
+    );
+    drop(nextval);
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    drop(conn);
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        get_rows(&conn, "SELECT x FROM t"),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT nextval('seq')"),
+        vec![vec![Value::from_i64(2)]]
+    );
+}
+
+/// A COMMIT that covers the main database and an attached MVCC database
+/// commits the attached transaction after the main database's
+/// auto-checkpoint. While that checkpoint yields, the other statements of the
+/// connection wait: a ROLLBACK run then removed the attached transaction, and
+/// the COMMIT still returned Ok without the attached rows.
+#[test]
+fn statements_of_a_connection_wait_for_the_attached_part_of_its_commit() {
+    for point in [
+        CheckpointYieldPoint::BeforeAcquireLock,
+        CheckpointYieldPoint::BeforePagerCommit,
+    ] {
+        let opts = DatabaseOpts::new().with_attach(true);
+        let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(opts);
+        let aux_dir = tempfile::TempDir::new().unwrap();
+        let aux_path = aux_dir.path().join("aux.db");
+        let attach = format!("ATTACH '{}' AS aux", aux_path.to_str().unwrap());
+        let conn = db.connect();
+        conn.execute(&attach).unwrap();
+        conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+            .unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE aux.u (x INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("INSERT INTO aux.u VALUES (0), (1), (2), (3), (4)")
+            .unwrap();
+
+        let injector = FixedYieldInjector::new([point.point()]);
+        conn.set_yield_injector(Some(injector.clone()));
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        while !injector.is_empty() {
+            assert!(
+                matches!(commit.step().unwrap(), StepResult::Yield | StepResult::IO),
+                "COMMIT finished without reaching {point:?}"
+            );
+        }
+        conn.set_yield_injector(None);
+
+        for sql in [
+            "BEGIN",
+            "ROLLBACK",
+            "INSERT INTO aux.u VALUES (99)",
+            "SELECT count(*) FROM aux.u",
+        ] {
+            let result = conn.execute(sql);
+            assert!(
+                matches!(result, Err(LimboError::StatementsInProgress(_))),
+                "{sql} during a COMMIT paused at {point:?} returned {result:?}"
+            );
+        }
+        commit.run_ignore_rows().unwrap();
+        drop(commit);
+        assert_eq!(
+            get_rows(&conn, "SELECT count(*) FROM aux.u"),
+            vec![vec![Value::from_i64(5)]]
+        );
+        drop(conn);
+
+        db.restart();
+        let conn = db.connect();
+        conn.execute(&attach).unwrap();
+        conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+            .unwrap();
+        assert_eq!(
+            get_rows(&conn, "SELECT count(*) FROM t"),
+            vec![vec![Value::from_i64(1)]]
+        );
+        assert_eq!(
+            get_rows(&conn, "SELECT count(*) FROM aux.u"),
+            vec![vec![Value::from_i64(5)]],
+            "reopened database after a COMMIT paused at {point:?}"
+        );
+    }
+}

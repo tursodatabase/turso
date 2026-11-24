@@ -1427,6 +1427,16 @@ impl ProgramState {
         self.parameters.get(i).cloned().unwrap_or(Value::Null)
     }
 
+    /// Whether this statement is stepping an MVCC commit state machine: its
+    /// own commit, or the commit of the transaction `nextval()` opens.
+    pub(crate) fn has_active_mvcc_commit(&self) -> bool {
+        self.sequence_inner_commit.is_some()
+            || matches!(
+                self.commit_state,
+                CommitState::CommittingMvcc { .. } | CommitState::CommittingAttachedMvcc { .. }
+            )
+    }
+
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         turso_assert!(
             !self.is_active_read && !self.is_active_destroy,
