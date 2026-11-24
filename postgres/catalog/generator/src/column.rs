@@ -318,25 +318,84 @@ fn one_char(text: &str) -> Result<char, String> {
 
 /// The elements of a list value. An `oidvector` separates them with
 /// spaces. An array is in braces and separates them with commas.
-fn elements(token: &Token) -> Result<Vec<&str>, String> {
+///
+/// An array is read as PostgreSQL's `array_in` reads it (PostgreSQL
+/// documentation, 8.15.2 "Array Value Input"): the white space before and
+/// after an element that is not in double quotes is not part of it, so
+/// `'{string, pattern}'` has the elements `string` and `pattern`. An element
+/// in double quotes keeps its white space, and a backslash in it makes the
+/// next character part of the element.
+fn elements(token: &Token) -> Result<Vec<String>, String> {
     let text = token.text();
-    let Some(inner) = text.strip_prefix('{') else {
-        return Ok(text.split_whitespace().collect());
+    let Some(mut rest) = text.strip_prefix('{') else {
+        return Ok(text.split_whitespace().map(str::to_string).collect());
     };
-    let inner = inner
-        .strip_suffix('}')
-        .ok_or_else(|| format!("the array \"{text}\" does not end with }}"))?;
-    // PostgreSQL quotes an array element that has a comma, a brace or a
-    // space in it. No built-in row has one.
-    if inner.contains(['"', '\\', '{']) {
-        return Err(format!(
-            "the array \"{text}\" has a quoted or nested element, which the generator does not read"
-        ));
+    let refuse = |what: &str| {
+        Err(format!(
+            "the array \"{text}\" has {what}, which the generator does not read"
+        ))
+    };
+    let mut elements = Vec::new();
+    rest = rest.trim_start_matches(is_array_space);
+    if let Some(after) = rest.strip_prefix('}') {
+        if !after.is_empty() {
+            return refuse("text after the closing brace");
+        }
+        return Ok(elements);
     }
-    if inner.is_empty() {
-        return Ok(Vec::new());
+    loop {
+        rest = rest.trim_start_matches(is_array_space);
+        let element = if let Some(quoted) = rest.strip_prefix('"') {
+            let mut element = String::new();
+            let mut chars = quoted.char_indices();
+            let end = loop {
+                match chars.next() {
+                    Some((position, '"')) => break position,
+                    Some((_, '\\')) => match chars.next() {
+                        Some((_, escaped)) => element.push(escaped),
+                        None => return refuse("a quoted element that does not end"),
+                    },
+                    Some((_, c)) => element.push(c),
+                    None => return refuse("a quoted element that does not end"),
+                }
+            };
+            rest = quoted[end + 1..].trim_start_matches(is_array_space);
+            element
+        } else {
+            let end = rest
+                .find([',', '}'])
+                .ok_or_else(|| format!("the array \"{text}\" does not end with }}"))?;
+            let element = rest[..end].trim_end_matches(is_array_space);
+            rest = &rest[end..];
+            // A brace is a nested array, and a backslash or a quote inside
+            // an element that is not quoted is an escape.
+            if element.contains(['{', '"', '\\']) {
+                return refuse("a nested array or an escape");
+            }
+            // An empty element is not valid, and the element NULL is a
+            // NULL, which the Rust types of the generated file cannot hold.
+            if element.is_empty() || element.eq_ignore_ascii_case("NULL") {
+                return refuse("an empty or NULL element");
+            }
+            element.to_string()
+        };
+        elements.push(element);
+        if let Some(after) = rest.strip_prefix(',') {
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix('}') {
+            if !after.is_empty() {
+                return refuse("text after the closing brace");
+            }
+            return Ok(elements);
+        } else {
+            return refuse("an element that a comma does not follow");
+        }
     }
-    Ok(inner.split(',').collect())
+}
+
+/// Whether `array_in` of PostgreSQL skips `c` as white space.
+fn is_array_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0B' | '\x0C')
 }
 
 #[cfg(test)]
@@ -372,6 +431,47 @@ mod tests {
             "\"Infinity\" is not a finite float4"
         );
         assert!(literal("NaN").is_err());
+    }
+
+    #[test]
+    fn the_spaces_around_an_array_element_are_not_part_of_it() {
+        let read = |text: &str| elements(&Token::Quoted(text.to_string()));
+        assert_eq!(read("{string, pattern}").unwrap(), ["string", "pattern"]);
+        assert_eq!(read("{ a ,b }").unwrap(), ["a", "b"]);
+        // A quoted element keeps its spaces; the spaces outside the quotes
+        // are not part of it.
+        assert_eq!(read("{a, b,\"c d\" ,e}").unwrap(), ["a", "b", "c d", "e"]);
+        assert_eq!(
+            read(r#"{" x ","a\"b","c\\d","NULL",""}"#).unwrap(),
+            [" x ", "a\"b", "c\\d", "NULL", ""]
+        );
+        assert_eq!(read("{ }").unwrap(), Vec::<String>::new());
+        assert_eq!(read("{}").unwrap(), Vec::<String>::new());
+        assert_eq!(read("23 25").unwrap(), ["23", "25"]);
+        for malformed in [
+            "{a,,b}",
+            "{a,NULL}",
+            "{a,null}",
+            "{{a}}",
+            "{a\\,b}",
+            "{\"a}",
+            "{\"a\" b}",
+            "{a",
+            "{a}x",
+            "{a,}",
+        ] {
+            assert!(read(malformed).is_err(), "{malformed}");
+        }
+
+        let literal = |text: &str| {
+            ColumnKind::Texts
+                .literal(&Token::Quoted(text.to_string()))
+                .map(|tokens| tokens.to_string())
+        };
+        assert_eq!(
+            literal("{string, pattern}").unwrap(),
+            "& [\"string\" , \"pattern\"]"
+        );
     }
 
     /// `postgres.bki` has the `pg_attribute` rows of four catalogs, which
