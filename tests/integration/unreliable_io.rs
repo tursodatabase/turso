@@ -83,6 +83,16 @@ impl FileShadow {
             op.apply(&mut self.durable);
         }
     }
+
+    /// The bytes the OS holds for the file: the durable bytes with every
+    /// unsynced write applied.
+    fn os_image(&self) -> Vec<u8> {
+        let mut image = self.durable.clone();
+        for op in &self.unsynced {
+            op.apply(&mut image);
+        }
+        image
+    }
 }
 
 /// The captured post-crash disk state.
@@ -198,28 +208,26 @@ impl UnreliableIo {
         &self,
         db_path_sim: &str,
     ) -> anyhow::Result<(tempfile::TempDir, Arc<Connection>)> {
-        let files = self.durable_files();
-        let dir = tempfile::TempDir::new()?;
-        let db_path = dir.path().join("recovered.db");
-        std::fs::write(
-            &db_path,
-            files
-                .get(db_path_sim)
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
-        )?;
-        for suffix in ["-wal", "-log"] {
-            if let Some(bytes) = files.get(&format!("{db_path_sim}{suffix}")) {
-                std::fs::write(dir.path().join(format!("recovered.db{suffix}")), bytes)?;
-            }
-        }
-        let recovered_db = Database::open_file(
-            Arc::new(PlatformIO::new()?),
-            db_path.to_str().unwrap(),
-            Arc::new(SqliteDialect),
-        )?;
-        let recovered = recovered_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-        Ok((dir, recovered))
+        recover_image(&self.durable_files(), db_path_sim)
+    }
+
+    /// Simulates a crash of the process at this exact moment: the OS survives,
+    /// so every write it accepted is kept, synced or not, and writes dropped by
+    /// a failed fsync stay lost. Recovers that image with a fresh database.
+    /// Returns the tempdir alongside the connection to keep the files alive.
+    pub fn crash_process_and_recover(
+        &self,
+        db_path_sim: &str,
+    ) -> anyhow::Result<(tempfile::TempDir, Arc<Connection>)> {
+        let files: HashMap<String, Vec<u8>> = self
+            .state
+            .files
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, shadow)| (path.clone(), shadow.lock().unwrap().os_image()))
+            .collect();
+        recover_image(&files, db_path_sim)
     }
 
     /// Simulate power loss right now: return, for each file, only the bytes
@@ -243,6 +251,35 @@ impl UnreliableIo {
             .get(path)
             .is_some_and(|shadow| !shadow.lock().unwrap().unsynced.is_empty())
     }
+}
+
+/// Writes the database file, its WAL and its MVCC logical log from `files` to a
+/// new tempdir and opens the database there with the platform IO.
+fn recover_image(
+    files: &HashMap<String, Vec<u8>>,
+    db_path_sim: &str,
+) -> anyhow::Result<(tempfile::TempDir, Arc<Connection>)> {
+    let dir = tempfile::TempDir::new()?;
+    let db_path = dir.path().join("recovered.db");
+    std::fs::write(
+        &db_path,
+        files
+            .get(db_path_sim)
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+    )?;
+    for suffix in ["-wal", "-log"] {
+        if let Some(bytes) = files.get(&format!("{db_path_sim}{suffix}")) {
+            std::fs::write(dir.path().join(format!("recovered.db{suffix}")), bytes)?;
+        }
+    }
+    let recovered_db = Database::open_file(
+        Arc::new(PlatformIO::new()?),
+        db_path.to_str().unwrap(),
+        Arc::new(SqliteDialect),
+    )?;
+    let recovered = recovered_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    Ok((dir, recovered))
 }
 
 impl Clock for UnreliableIo {
