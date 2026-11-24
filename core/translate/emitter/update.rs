@@ -1,9 +1,7 @@
-use super::gencol::{
-    compute_generated_columns, compute_virtual_columns, emit_row_from_cursor,
-    sets_custom_type_column,
-};
+use super::gencol::{compute_generated_columns, emit_row_from_cursor, sets_custom_type_column};
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
+use crate::ast::{RefAct, ResolveType, TriggerEvent, TriggerTime};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::collate::CollationSeq;
@@ -37,8 +35,7 @@ use crate::{
         fkeys::{
             affected_parent_fks_for_update, emit_fk_child_update_counters,
             emit_fk_parent_deferred_new_key_probes, emit_fk_update_parent_actions,
-            fire_fk_update_actions, stabilize_new_row_for_fk, ForeignKeyActions,
-            ParentKeyNewProbeMode,
+            fire_fk_update_actions, ForeignKeyActions, ParentKeyNewProbeMode,
         },
         insert::format_unique_violation_desc,
         main_loop::{CloseLoop, InitLoop, OpenLoop},
@@ -69,7 +66,6 @@ use crate::{
 use std::num::NonZeroUsize;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert, turso_assert_eq};
-use turso_parser::ast::{RefAct, ResolveType, TriggerEvent, TriggerTime};
 
 /// Info about position of rowid alias in the table if present + whether the current UPDATE statement will update the rowid.
 struct RowidUpdateInfo {
@@ -1597,24 +1593,6 @@ fn emit_update_insns<'a>(
         )?;
     }
 
-    // Build a complete NEW row image for FK code now, while the old cursor is
-    // still positioned. This is only data preparation. FK counters must not be
-    // touched yet because later CHECK/PK/UNIQUE conflict handling may still
-    // decide that `ON CONFLICT IGNORE` makes this row a no-op.
-    if connection.foreign_keys_enabled() {
-        let rowid_new_reg = effective_rowid_reg;
-        if let Some(table_btree) = target_table.table.btree() {
-            stabilize_new_row_for_fk(
-                program,
-                &table_btree,
-                &updated_column_indices,
-                target_table_cursor_id,
-                start,
-                rowid_new_reg,
-            )?;
-        }
-    }
-
     // Populate register-to-affinity map for expression index evaluation.
     // When column references are rewritten to Expr::Register during UPDATE, comparison
     // operators need the original column affinity. This is set once here and cleared at
@@ -1714,9 +1692,9 @@ fn emit_update_insns<'a>(
         }
     }
 
-    // When a SET column has a custom type, the virtual columns are computed again
+    // When a SET column has a custom type, the generated columns are computed again
     // after ENCODE, below, and their NOT NULL checks wait for these values.
-    let computes_virtual_columns_after_encode = target_table.table.btree().is_some_and(|btree| {
+    let computes_generated_columns_after_encode = target_table.table.btree().is_some_and(|btree| {
         btree.is_strict && sets_custom_type_column(&btree, &user_value_columns, &t_ctx.resolver)
     });
 
@@ -1729,10 +1707,7 @@ fn emit_update_insns<'a>(
         &column_ctx,
         skip_row_label,
         t_ctx,
-        |column| {
-            column.is_generated()
-                && !(computes_virtual_columns_after_encode && column.is_virtual_generated())
-        },
+        |column| column.is_generated() && !computes_generated_columns_after_encode,
     )?;
     emit_cdc_updates_of_generated_columns(program, &target_table, &column_ctx);
 
@@ -1813,10 +1788,10 @@ fn emit_update_insns<'a>(
                 &layout,
             )?;
 
-            // The virtual columns were computed from the SET values before ENCODE. When a
+            // The generated columns were computed from the SET values before ENCODE. When a
             // SET column has a custom type, a read of the row can give other values, so
             // compute them again from the encoded row, as a read of the row gives them.
-            if computes_virtual_columns_after_encode {
+            if computes_generated_columns_after_encode {
                 let dml_ctx = DmlColumnContext::layout(
                     btree_table.columns(),
                     start,
@@ -1824,7 +1799,7 @@ fn emit_update_insns<'a>(
                     layout.clone(),
                     DmlRowForm::Stored,
                 );
-                compute_virtual_columns(
+                compute_generated_columns(
                     program,
                     &btree_table.columns_topo_sort()?,
                     &dml_ctx,
@@ -1845,7 +1820,7 @@ fn emit_update_insns<'a>(
                 ),
             });
 
-            if computes_virtual_columns_after_encode {
+            if computes_generated_columns_after_encode {
                 emit_deferred_notnull_checks(
                     program,
                     table_references,
@@ -1853,7 +1828,7 @@ fn emit_update_insns<'a>(
                     &column_ctx,
                     skip_row_label,
                     t_ctx,
-                    Column::is_virtual_generated,
+                    Column::is_generated,
                 )?;
             }
         }

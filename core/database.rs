@@ -3,6 +3,7 @@
 //! keeps a single `Database` per file, and the per-connection catalog of
 //! attached databases.
 
+use crate::ast;
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
 use crate::namespace::NamespaceId;
 use crate::schema::load::{load_steps, SchemaInstall, SchemaLoader, StepsFor};
@@ -70,7 +71,6 @@ use storage::database::DatabaseFile;
 #[cfg(host_shared_wal)]
 use storage::shared_wal_coordination::MappedSharedWalCoordination;
 use tracing::{instrument, Level};
-use turso_parser::ast;
 
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -206,9 +206,25 @@ impl EncryptionOpts {
 pub struct DatabaseAllocators<
     M: alloc::ConcurrentAllocator = alloc::DynAllocator,
     F: alloc::ConcurrentAllocator = alloc::DynAllocator,
+    S: alloc::ConcurrentAllocator = alloc::DynAllocator,
 > {
     pub mv_store: M,
     pub fts: F,
+    /// Allocator for these values of statements:
+    ///
+    /// - The state of each statement.
+    /// - The program builders of statements, blob handles, nested trigger
+    ///   programs and the maintenance of materialized views, and the builder
+    ///   that plans the query of a materialized view. The builders of foreign
+    ///   key action programs do not come from this allocator.
+    /// - The statement that executes a nested trigger or foreign key action
+    ///   program.
+    ///
+    /// The code of nested programs recurses one time for each level of
+    /// nesting, so it keeps its values in the heap and not on the stack. The
+    /// memory in the vectors of the builders and the states, for example the
+    /// registers and the cursors, does not come from this allocator.
+    pub statement: S,
 }
 
 /// Options for opening a [`Database`].
@@ -2033,7 +2049,8 @@ impl Database {
                     let header = return_if_io!(self.read_authenticated_header(
                         header_st,
                         encryption_key,
-                        page_codec
+                        page_codec,
+                        true
                     ));
                     let pager = self.init_pager(header)?;
 
@@ -2564,26 +2581,25 @@ impl Database {
     }
 
     #[cfg(feature = "conn_raw_api")]
-    pub(crate) fn ensure_external_restore_supported(&self) -> Result<()> {
-        if self.encryption_cipher() != CipherMode::None {
-            return Err(LimboError::InvalidArgument(
-                "external restore is not supported with built-in encryption".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "conn_raw_api")]
     /// Rebuild the process-local shared WAL view after a caller restores the
     /// database and WAL files outside the pager.
     pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
-        self.ensure_external_restore_supported()?;
+        self.reload_wal_after_external_restore_with_encryption_key(None)
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn reload_wal_after_external_restore_with_encryption_key(
+        self: &Arc<Self>,
+        encryption_key: Option<EncryptionKey>,
+    ) -> Result<()> {
         if self.page_codec_id.is_some() {
             return Err(LimboError::InvalidArgument(
                 "reloading a WAL after external restore is not supported with an external page codec"
                     .to_string(),
             ));
         }
+        let encryption_context =
+            self.validate_external_restore_encryption(encryption_key.as_ref())?;
         let flags = self.open_flags;
         #[cfg(host_shared_wal)]
         let shared_authority = self.open_shared_wal_coordination_for_open()?;
@@ -2614,28 +2630,46 @@ impl Database {
                 WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
             }
         };
-        let new_shared_wal = Arc::try_unwrap(new_shared_wal).map_err(|_| {
-            LimboError::InternalError(
-                "new WAL state unexpectedly shared during external restore reload".to_string(),
-            )
-        })?;
-        self.shared_wal
-            .write()
-            .replace_after_external_restore(new_shared_wal.into_inner());
-        if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
+        if let Some(context) = encryption_context.as_ref() {
+            self.validate_external_restore_wal(&new_shared_wal.read(), context)?;
+        }
+        let new_mv_store = if self.mvcc_enabled()
+            || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
         {
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
                 &self.path,
                 self.open_flags,
                 self.durable_storage.clone(),
-                None,
+                encryption_context.clone(),
                 self.allocators.mv_store.clone(),
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
-            self.mv_store.store(Some(mv_store.clone()));
+            if encryption_context.is_some() {
+                // Authenticate before publication so rejection preserves the live state.
+                mvcc::persistent_storage::logical_log::StreamingLogicalLogReader::new(
+                    mv_store.get_logical_log_file(),
+                    encryption_context,
+                )
+                .validate_encryption_key(&self.io)?;
+            }
+            Some(mv_store)
+        } else {
+            None
+        };
+        // Completed recovery callbacks may retain the Arc; leave them an empty state.
+        let restored = std::mem::replace(
+            &mut *new_shared_wal.write(),
+            WalFileShared::new_noop_state(),
+        );
+        self.shared_wal
+            .write()
+            .replace_after_external_restore(restored);
+        drop(new_shared_wal);
+        self.mv_store.store(new_mv_store.clone());
+        if let Some(mv_store) = new_mv_store {
             let mvcc_bootstrap_conn = self._connect(
-                ConnectOpts::new(SessionRole::Superuser),
+                ConnectOpts::new(SessionRole::Superuser).with_encryption_key(encryption_key),
                 ConnectionContext::default(),
                 true,
                 None,
@@ -2649,10 +2683,95 @@ impl Database {
                 }
                 Err(error) => return Err(error),
             }
-        } else {
-            self.mv_store.store(None);
         }
         Ok(())
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    fn validate_external_restore_wal(
+        &self,
+        wal: &WalFileShared,
+        context: &EncryptionContext,
+    ) -> Result<()> {
+        use storage::sqlite3_ondisk::{
+            parse_wal_frame_header, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
+        };
+        let Some(file) = wal.runtime.file.as_ref() else {
+            return Ok(());
+        };
+        let max_frame = wal.metadata.max_frame.load(Ordering::Acquire);
+        if max_frame == 0 {
+            return Ok(());
+        }
+        if wal.page_size() as usize != context.page_size() {
+            return Err(LimboError::InvalidArgument(
+                "restored WAL page size does not match the database".into(),
+            ));
+        }
+        let context = Arc::new(context.clone());
+        let buffer = Arc::new(Buffer::new_temporary(
+            context.page_size() + WAL_FRAME_HEADER_SIZE,
+        ));
+        for frame in 1..=max_frame {
+            let offset = WAL_HEADER_SIZE as u64
+                + (frame - 1) * (WAL_FRAME_HEADER_SIZE as u64 + wal.page_size() as u64);
+            let context = context.clone();
+            let complete = Box::new(
+                move |result: std::result::Result<(Arc<Buffer>, i32), CompletionError>| {
+                    let Ok((buffer, actual)) = result else {
+                        return None;
+                    };
+                    if actual as usize != buffer.len() {
+                        return Some(CompletionError::ShortReadWalFrame {
+                            offset,
+                            expected: buffer.len(),
+                            actual: actual as usize,
+                        });
+                    }
+                    let (header, page) = parse_wal_frame_header(buffer.as_slice());
+                    context
+                        .decrypt_page(page, header.page_number as usize)
+                        .err()
+                        .map(|_| CompletionError::DecryptionError {
+                            page_idx: header.page_number as usize,
+                        })
+                },
+            );
+            let completion = file.pread(offset, Completion::new_read(buffer.clone(), complete))?;
+            self.io.wait_for_completion(completion)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    fn validate_external_restore_encryption(
+        &self,
+        key: Option<&EncryptionKey>,
+    ) -> Result<Option<EncryptionContext>> {
+        let cipher = self.encryption_cipher();
+        if cipher == CipherMode::None {
+            if key.is_some() {
+                return Err(LimboError::InvalidArgument(
+                    "database was opened without encryption".into(),
+                ));
+            }
+            return Ok(None);
+        }
+        let key = key.ok_or_else(|| {
+            LimboError::InvalidArgument("encrypted database requires an encryption key".into())
+        })?;
+        let mut context = self.pager_state.verify_encryption_key(key)?;
+        if self.db_file.size()? == 0 {
+            if let Some(page_size) = self.pager_state.page_size() {
+                context.set_page_size(page_size);
+            }
+            return Ok(Some(context));
+        }
+        let mut state = HeaderAuthenticationState::default();
+        let header = self
+            .io
+            .block(|| self.read_authenticated_header(&mut state, Some(key), None, false))?;
+        Ok(header.io_ctx.encryption_context().cloned())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -3568,6 +3687,7 @@ impl Database {
         st: &mut HeaderAuthenticationState,
         encryption_key: Option<&EncryptionKey>,
         page_codec: Option<&Arc<dyn PageCodec>>,
+        use_cached_header: bool,
     ) -> IOResultOr<AuthenticatedHeader> {
         if encryption_key.is_some() && page_codec.is_some() {
             return Err(LimboError::InvalidArgument(
@@ -3597,7 +3717,9 @@ impl Database {
             match st {
                 HeaderAuthenticationState::ReadHeader(hdr_st) => {
                     if let Some(key) = encryption_key {
-                        if let Some(page_size) = self.pager_state.page_size() {
+                        if let Some(page_size) =
+                            self.pager_state.page_size().filter(|_| use_cached_header)
+                        {
                             let mut context = self.pager_state.verify_encryption_key(key)?;
                             context.set_page_size(page_size);
                             let mut io_ctx = IOContext::default();
@@ -3615,6 +3737,19 @@ impl Database {
                         let header = return_if_io!(self.read_db_header_buf(hdr_st));
                         let (reserved_space, page_size) =
                             Self::plain_header_page_info(&header, true)?;
+                        if !use_cached_header
+                            && (reserved_space as usize != cipher.metadata_size()
+                                || self
+                                    .pager_state
+                                    .page_size()
+                                    .is_some_and(|current| current != page_size))
+                        {
+                            return Err(LimboError::InvalidArgument(
+                                "external restore cannot change the encrypted database page layout"
+                                    .into(),
+                            )
+                            .into());
+                        }
                         if reserved_space as usize != cipher.metadata_size() {
                             return Err(LimboError::InvalidArgument(
                                 "encryption cipher does not match the database reserved bytes"
@@ -4193,6 +4328,7 @@ mod database_tests {
                     &mut state,
                     Some(&EncryptionKey::new_256([1; 32])),
                     None,
+                    true,
                 )
             })
             .unwrap();

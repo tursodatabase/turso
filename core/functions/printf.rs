@@ -311,7 +311,9 @@ fn ensure_decimal_strip_zeros(s: &str) -> String {
 /// then `precision` more digits (sqlite3.c:32581-32602 in etEXP path).
 /// Returns (mantissa_string, flag_dp).
 fn build_exp_mantissa(digits: &[u8], precision: usize, flags: &FormatFlags) -> (String, bool) {
-    let mut mantissa = String::new();
+    // The first digit, the point, the digits after the point, and the
+    // exponent that the callers append: "e", a sign and at most 4 digits.
+    let mut mantissa = String::with_capacity(precision + 8);
     mantissa.push((b'0' + digits.first().copied().unwrap_or(0)) as char);
 
     let flag_dp = precision > 0 || flags.alternate || flags.alt_form_2;
@@ -334,16 +336,14 @@ fn build_exp_mantissa(digits: &[u8], precision: usize, flags: &FormatFlags) -> (
 /// point. If `keep_dot_zero` is true (alt_form_2 / `!` flag), a bare "." becomes
 /// ".0"; otherwise the dot is also removed. (sqlite3.c:32604-32613)
 fn strip_trailing_zeros(s: &mut String, keep_dot_zero: bool) {
-    let trimmed = s.trim_end_matches('0');
-    *s = if trimmed.ends_with('.') {
+    s.truncate(s.trim_end_matches('0').len());
+    if s.ends_with('.') {
         if keep_dot_zero {
-            format!("{trimmed}0")
+            s.push('0');
         } else {
-            trimmed.trim_end_matches('.').to_string()
+            s.truncate(s.trim_end_matches('.').len());
         }
-    } else {
-        trimmed.to_string()
-    };
+    }
 }
 
 /// Pad a digit string to at least `min_digits` characters with leading zeros.
@@ -439,14 +439,16 @@ fn fp_decode(r: f64, i_round: i32, max_round: usize) -> (Vec<u8>, i32) {
         (rr[0] as u64).wrapping_add(rr[1] as u64)
     };
 
-    // Extract decimal digits from u64
-    let mut buf = Vec::with_capacity(20);
-    let mut temp = v;
-    while temp > 0 {
-        buf.push((temp % 10) as u8);
-        temp /= 10;
-    }
-    buf.reverse();
+    // The decimal digits of `v` as the values 0 to 9, with no digits for 0.
+    let mut text = [0u8; 20];
+    let digits: &[u8] = if v == 0 {
+        &[]
+    } else {
+        crate::numeric::write_decimal_digits(&mut text, v)
+    };
+    // One more byte for a carry digit that the rounding below can insert.
+    let mut buf = Vec::with_capacity(digits.len() + 1);
+    buf.extend(digits.iter().map(|digit| digit - b'0'));
 
     let n = buf.len();
     let mut dp = n as i32 + exp;
@@ -517,7 +519,8 @@ fn format_fixed_from_digits(abs_f: f64, precision: usize, max_sig: usize) -> Str
     let (digits, dp) = fp_decode(abs_f, i_round, max_sig);
 
     // ── Integer part (sqlite3.c:32581-32588) ───────────────────────
-    let mut result = String::new();
+    // The integer digits, the point and the digits after the point.
+    let mut result = String::with_capacity(dp.max(1) as usize + 1 + precision);
     let mut j: usize = 0;
     if dp <= 0 {
         result.push('0');
@@ -916,9 +919,10 @@ fn format_exponential_inner(output: &mut String, f: f64, spec: &FormatSpec, uppe
         strip_trailing_zeros(&mut mantissa, true);
     }
 
-    let content = format!("{mantissa}{e_char}{exp:+03}");
+    mantissa.push(e_char);
+    write!(mantissa, "{exp:+03}").unwrap();
     let prefix = sign_prefix(negative, &spec.flags);
-    apply_width(output, prefix, &content, spec.width, &spec.flags, false);
+    apply_width(output, prefix, &mantissa, spec.width, &spec.flags, false);
 }
 
 fn format_general(output: &mut String, value: &Value, spec: &FormatSpec, uppercase: bool) {
@@ -976,7 +980,9 @@ fn format_general_inner(output: &mut String, f: f64, spec: &FormatSpec, uppercas
         if flag_rtz && flag_dp {
             strip_trailing_zeros(&mut mantissa, spec.flags.alt_form_2);
         }
-        format!("{mantissa}{e_char}{exp:+03}")
+        mantissa.push(e_char);
+        write!(mantissa, "{exp:+03}").unwrap();
+        mantissa
     } else {
         // ── Fixed-point notation ──────────────────────────────────
         // SQLite: precision = precision - exp (line 32553), giving digits after decimal
@@ -986,8 +992,9 @@ fn format_general_inner(output: &mut String, f: f64, spec: &FormatSpec, uppercas
             0
         };
 
-        // Build fixed-point string from decoded digits
-        let mut s = String::new();
+        // Build fixed-point string from decoded digits: the integer digits,
+        // the point and the digits after the point.
+        let mut s = String::with_capacity(dp.max(1) as usize + 1 + frac_precision);
         let mut j: usize = 0;
 
         // Integer part

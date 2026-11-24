@@ -11,6 +11,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering as StdOrdering;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
+use turso_core::ast::Cmd;
 use turso_core::mvcc::yield_hooks::YieldPointMarker;
 use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};
 use turso_core::vdbe::execute::TransactionYieldPoint;
@@ -19,7 +20,7 @@ use turso_core::{
     StepResult, Value,
 };
 use turso_core::{MemoryIO, OpenFlags, IO};
-use turso_parser::{ast::Cmd, parser::Parser};
+use turso_parser::parser::Parser;
 use turso_sqlite::SqliteDialect;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,7 +211,10 @@ fn employee_rows(conn: &Arc<Connection>) -> Vec<(i64, String, i64, f64, String)>
 
 fn custom_type_sql_snapshot(conn: &Arc<Connection>) -> Vec<(String, String)> {
     let rows: Vec<(String, String)> =
-        conn.exec_rows("SELECT name, sql FROM sqlite_turso_types ORDER BY name");
+        // A built-in type has no SQL.
+        conn.exec_rows(
+            "SELECT name, sql FROM sqlite_turso_types WHERE sql IS NOT NULL ORDER BY name",
+        );
     rows.into_iter()
         .map(|(name, sql)| (name, normalize_sql_whitespace(&sql)))
         .collect()

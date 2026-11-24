@@ -4,9 +4,9 @@ pub use ast::Distinctness;
 use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use turso_parser::ast::{
+use turso_core::ast::{
     self,
-    fmt::{BlankContext, ToTokens},
+    fmt::{BlankContext, WriteSql},
     SortOrder,
 };
 

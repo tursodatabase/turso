@@ -1,4 +1,5 @@
-use crate::error::SQLITE_ERROR;
+use crate::alloc::StatementAllocationSite;
+use crate::ast::{self, Expr, TriggerEvent, TriggerTime};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{BTreeTable, Column, Trigger};
 use crate::sync::Arc;
@@ -9,8 +10,10 @@ use crate::translate::subquery::{
     emit_non_from_clause_subquery, plan_subqueries_in_expr_without_from_clause,
 };
 use crate::translate::{
+    build_program,
     emitter::Resolver,
     expr::{self, expr_type::column_custom_type_names, translate_expr, walk_expr_mut},
+    new_program_builder,
     planner::ROWID_STRS,
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
@@ -18,11 +21,10 @@ use crate::turso_assert;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::DmlRowForm;
 use crate::vdbe::insn::{Insn, Subprogram};
-use crate::vdbe::{BranchOffset, MAX_TRIGGER_DEPTH, TRIGGER_DEPTH_ERROR};
+use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, QueryMode, Result};
 use std::cell::RefCell;
 use std::num::NonZero;
-use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
 
 /// Context for trigger execution
 #[derive(Debug)]
@@ -528,12 +530,9 @@ fn execute_trigger_commands(
         // Do not recursively compile the same trigger
         return Ok(false);
     }
-    let depth = program.subprogram_depth() + 1;
-    if depth > MAX_TRIGGER_DEPTH {
-        // As in SQLite, the error occurs only if the statement gets to this level.
-        program.emit_halt_err(SQLITE_ERROR, TRIGGER_DEPTH_ERROR.to_string());
+    let Some(depth) = program.nested_subprogram_depth() else {
         return Ok(true);
-    }
+    };
     connection.start_trigger_compilation(trigger.clone());
     let _trigger_compilation_guard = TriggerCompilationGuard {
         connection: connection.clone(),
@@ -569,14 +568,23 @@ fn execute_trigger_commands(
         override_conflict: ctx.override_conflict,
         db_name,
     };
-    let mut subprogram_builder = ProgramBuilder::new_for_trigger(
-        QueryMode::Normal,
-        program.capture_data_changes_info().clone(),
-        ProgramBuilderOpts::new(1, 32, 2),
-        trigger.clone(),
-        program.is_mvcc_enabled(),
-        depth,
-    );
+    // The compilation of nested triggers recurses one time for each level, so
+    // new_program_builder makes the large builder in its own stack frame, and
+    // not in the frame of this function.
+    let mut subprogram_builder = new_program_builder(
+        connection,
+        StatementAllocationSite::TriggerProgramBuilder,
+        || {
+            ProgramBuilder::new_for_trigger(
+                QueryMode::Normal,
+                program.capture_data_changes_info().clone(),
+                ProgramBuilderOpts::new(1, 32, 2),
+                trigger.clone(),
+                program.is_mvcc_enabled(),
+                depth,
+            )
+        },
+    )?;
     // If we have an override_conflict (e.g. from UPSERT DO UPDATE context),
     // propagate it to the subprogram so that nested trigger firing will also use it.
     if let Some(override_conflict) = ctx.override_conflict {
@@ -616,7 +624,8 @@ fn execute_trigger_commands(
         Ok(())
     })?;
     subprogram_builder.epilogue(resolver.schema());
-    let built_subprogram = subprogram_builder.build(connection, true, "trigger subprogram")?;
+    let built_subprogram =
+        build_program(subprogram_builder, connection, true, "trigger subprogram")?;
     let subprogram_prepared = built_subprogram.prepared();
 
     // Trigger subprograms do not emit Transaction opcodes, so the parent statement

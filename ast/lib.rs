@@ -1,10 +1,25 @@
 pub mod check;
+pub mod error;
 pub mod fmt;
+pub mod keyword;
 
 use std::{num::NonZeroU32, sync::Arc};
 
-use crate::lexer::is_quotable_keyword;
+use crate::keyword::is_quotable_keyword;
 use strum_macros::{EnumIter, EnumString};
+
+/// Maximum nesting depth of queries: subqueries in a FROM clause or in an
+/// expression, CTE bodies, and parenthesized FROM terms. SQLite has no such
+/// limit. The parser, the planner and the code generator recurse one time for
+/// each level, so this limit bounds their stack use.
+pub const MAX_QUERY_DEPTH: usize = 500;
+
+/// The message of the error for a query nested deeper than [`MAX_QUERY_DEPTH`].
+/// The parser gives it for nesting in the SQL text, and the planner for
+/// nesting that the SQL text does not show.
+pub fn query_nested_too_deeply_message() -> String {
+    format!("Query is nested too deeply (maximum depth {MAX_QUERY_DEPTH})")
+}
 
 /// `?` or `$` Prepared statement arg placeholder(s)
 #[derive(Default)]
@@ -1022,6 +1037,38 @@ impl Operator {
                 | Operator::Equals
                 | Operator::NotEquals
         )
+    }
+
+    /// Whether the operator compares an array's elements with other values or
+    /// puts values into one array, when one of its operands is an array.
+    /// `||` of an array and a value appends the value; `||` of two values
+    /// that are not arrays joins text.
+    pub const fn compares_or_combines_array_elements(&self) -> bool {
+        match self {
+            Self::ArrayContains | Self::ArrayOverlap | Self::Concat => true,
+            Self::Add
+            | Self::And
+            | Self::ArrowRight
+            | Self::ArrowRightShift
+            | Self::BitwiseAnd
+            | Self::BitwiseOr
+            | Self::BitwiseNot
+            | Self::Equals
+            | Self::Divide
+            | Self::Greater
+            | Self::GreaterEquals
+            | Self::Is
+            | Self::IsNot
+            | Self::LeftShift
+            | Self::Less
+            | Self::LessEquals
+            | Self::Modulus
+            | Self::Multiply
+            | Self::NotEquals
+            | Self::Or
+            | Self::RightShift
+            | Self::Subtract => false,
+        }
     }
 
     /// Returns true if this operator is a comparison operator that may need affinity conversion

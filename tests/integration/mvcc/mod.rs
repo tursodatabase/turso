@@ -115,6 +115,10 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         self.inner.truncate(checkpointed_through_ts)
     }
 
+    fn finish_truncate(&self) {
+        self.inner.finish_truncate()
+    }
+
     fn reset_to_fresh_header(&self) -> turso_core::Result<turso_core::Completion> {
         self.inner.reset_to_fresh_header()
     }

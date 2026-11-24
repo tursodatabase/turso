@@ -5321,3 +5321,80 @@ expect {
     2|2
     3|3
 }
+
+# An INTEGER PRIMARY KEY is stored only as the rowid, with NULL in its record
+# slot. The last bytes of the page are the only cell: payload size, rowid 119
+# (0x77), header size, serial type 0 (NULL) for id, serial type 9 for v = 1.
+@backend cli
+@skip-if sqlite "the sqlite3 build used by the tests has no sqlite_dbpage"
+@skip-if mvcc "MVCC keeps the updated row out of the B-tree until a checkpoint"
+test fk-update-stores-rowid-alias-as-null {
+    CREATE TABLE solo(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO solo VALUES(119, 0);
+    PRAGMA foreign_keys=ON;
+    UPDATE solo SET v = v + 1;
+    SELECT hex(substr(data, -6)) FROM sqlite_dbpage WHERE pgno = 2;
+}
+expect {
+    000377030009
+}
+
+@backend cli
+@skip-if sqlite "the sqlite3 build used by the tests has no sqlite_dbpage"
+@skip-if mvcc "MVCC keeps the updated row out of the B-tree until a checkpoint"
+test fk-update-parent-stores-rowid-alias-as-null {
+    CREATE TABLE p(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE c(x INTEGER REFERENCES p(id));
+    INSERT INTO p VALUES(119, 0);
+    INSERT INTO c VALUES(119);
+    PRAGMA foreign_keys=ON;
+    UPDATE p SET v = v + 1;
+    SELECT hex(substr(data, -6)) FROM sqlite_dbpage WHERE pgno = 2;
+}
+expect {
+    000377030009
+}
+
+@backend cli
+@skip-if sqlite "the sqlite3 build used by the tests has no sqlite_dbpage"
+@skip-if mvcc "MVCC keeps the updated row out of the B-tree until a checkpoint"
+test fk-update-child-stores-rowid-alias-as-null {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INTEGER REFERENCES p(id));
+    INSERT INTO p VALUES(1), (2);
+    INSERT INTO c VALUES(119, 1);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET x = 2;
+    SELECT hex(substr(data, -6)) FROM sqlite_dbpage WHERE pgno = 3;
+}
+expect {
+    047703000102
+}
+
+# The foreign key checks read the key of an INTEGER PRIMARY KEY table from the
+# rowid, also when the UPDATE does not set it.
+test fk-update-rowid-key-not-set-is-checked {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INTEGER REFERENCES p(id));
+    INSERT INTO p VALUES(1, 0);
+    INSERT INTO c VALUES(1, 1);
+    UPDATE p SET v = 5;
+    UPDATE c SET x = 1;
+    SELECT p.id, p.v, c.id, c.x FROM p, c;
+}
+expect {
+    1|5|1|1
+}
+
+test fk-update-child-without-parent-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INTEGER REFERENCES p(id));
+    INSERT INTO p VALUES(1, 0);
+    INSERT INTO c VALUES(1, 1);
+    UPDATE c SET x = 2;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}

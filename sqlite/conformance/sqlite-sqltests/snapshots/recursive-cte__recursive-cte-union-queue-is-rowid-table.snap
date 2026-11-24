@@ -1,0 +1,64 @@
+---
+source: recursive-cte.sqltest
+expression: |-
+  WITH RECURSIVE s(i) AS (SELECT 1 UNION SELECT i + 1 FROM s WHERE i < 1000)
+      SELECT count(*) FROM s;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - s
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN s
+   |--SETUP
+   |  `--SCAN CONSTANT ROW
+   `--RECURSIVE STEP
+      `--SCAN s
+
+BYTECODE
+addr  opcode           p1  p2  p3  p4                 p5  comment
+   0  Init              0  40   0                      0  Start at 40
+   1  InitCoroutine     1  31   2                      0
+   2  OpenPseudo        0   2   1                      0  1 columns in r[2]
+   3  OpenEphemeral     1   1   0                      0  cursor=1 is_table=true
+   4  OpenEphemeral     2   0   0                      0  cursor=2 is_table=false
+   5  Integer           1   3   0                      0  r[3]=1
+   6  MakeRecord        3   1   4                      0  r[4]=mkrec(r[3..3]); for recursive-distinct-s
+   7  Found             2  11   4                      0  if found goto 11
+   8  IdxInsert         2   4   3                     12  key=r[4]
+   9  NewRowid          1   5   0                      0  r[5]=rowid
+  10  Insert            1   4   5  recursive-queue-s   4  intkey=r[5] data=r[4]
+  11    Rewind          1  27   0                      0  Rewind  ephemeral(recursive-queue-s)
+  12    RowData         1   2   0                      0  r[2] = data
+  13    Delete          1   0   0  recursive-queue-s   0
+  14    Column          0   0   6                      0  r[6]=pseudo.column 0
+  15    Yield           1   0   0                      0
+  16    Column          0   0   9                      0  r[9]=pseudo.column 0
+  17    Ge              9  10  26  Binary              0  if r[9]>=r[10] goto 26
+  18    Column          0   0  11                      0  r[11]=pseudo.column 0
+  19    Integer         1  12   0                      0  r[12]=1
+  20    Add            11  12   7                      0  r[7]=r[11]+r[12]
+  21    MakeRecord      7   1  13                      0  r[13]=mkrec(r[7..7]); for recursive-distinct-s
+  22    Found           2  26  13                      0  if found goto 26
+  23    IdxInsert       2  13   7                     12  key=r[13]
+  24    NewRowid        1  14   0                      0  r[14]=rowid
+  25    Insert          1  13  14  recursive-queue-s   4  intkey=r[14] data=r[13]
+  26  Goto              0  11   0                      0
+  27  Close             1   0   0                      0
+  28  Close             2   0   0                      0
+  29  Close             0   0   0                      0
+  30  EndCoroutine      1   0   0                      0
+  31  Null              0  16   0                      0  r[16]=NULL
+  32  InitCoroutine     1   0   2                      0
+  33    Yield           1  36   0                      0
+  34    AggStep         0  17  16  count               0  accum=r[16] step(r[17])
+  35  Goto              0  33   0                      0
+  36  AggFinal          0  16   0  count               0  accum=r[16]
+  37  Copy             16  15   0                      0  r[15]=r[16]
+  38  ResultRow        15   1   0                      0  output=r[15]
+  39  Halt              0   0   0                      0
+  40  Transaction       0   1   0                      0  iDb=0 tx_mode=Read
+  41  Integer        1000  10   0                      0  r[10]=1000
+  42  Integer           1  17   0                      0  r[17]=1
+  43  Goto              0   1   0                      0

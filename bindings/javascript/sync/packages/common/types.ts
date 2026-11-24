@@ -60,13 +60,13 @@ export interface DatabaseRowMutation {
 export type Transform = (arg: DatabaseRowMutation) => DatabaseRowTransformResult;
 
 export interface EncryptionOpts {
-    // base64 encoded encryption key (must be either 16 or 32 bytes depending on the cipher)
-    key: string,
+    // Base64 cloud key; may be omitted when reopening an initialized replica offline.
+    key?: string,
     // encryption cipher algorithm
-    // - aes256gcm, aes128gcm, chacha20poly1305: 28 reserved bytes
+    // - aes256gcm, aes128gcm: 28 reserved bytes
     // - aegis128l, aegis128x2, aegis128x4: 32 reserved bytes
     // - aegis256, aegis256x2, aegis256x4: 48 reserved bytes
-    cipher: 'aes256gcm' | 'aes128gcm' | 'chacha20poly1305' | 'aegis128l' | 'aegis128x2' | 'aegis128x4' | 'aegis256' | 'aegis256x2' | 'aegis256x4'
+    cipher: 'aes256gcm' | 'aes128gcm' | 'aegis128l' | 'aegis128x2' | 'aegis128x4' | 'aegis256' | 'aegis256x2' | 'aegis256x4'
 }
 export interface DatabaseOpts {
     /**
@@ -98,6 +98,8 @@ export interface DatabaseOpts {
      * optional remote encryption parameters if cloud database were encrypted by default
      */
     remoteEncryption?: EncryptionOpts;
+    /** Hex-encoded local key. Requires experimental: ["sync_encryption"]. Uses remoteEncryption.cipher. */
+    localEncryptionKey?: string;
     /**
      * optional callback which will be called for every mutation before sending it to the remote
      * this callback can transform the update in order to support complex conflict resolution strategy

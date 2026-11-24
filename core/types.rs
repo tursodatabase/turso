@@ -1,8 +1,8 @@
+use crate::ast::SortOrder;
 use crate::turso_debug_assert;
 use branches::{mark_unlikely, unlikely};
 use either::Either;
 use turso_ext::{AggCtx, ContextDestructor, FinalizeFunction, StepFunction, ValueDestructor};
-use turso_parser::ast::SortOrder;
 
 use crate::alloc::*;
 use crate::error::LimboError;
@@ -32,6 +32,12 @@ use std::future::Future;
 use std::iter::{FusedIterator, Peekable};
 use std::ops::Deref;
 use std::task::{Poll, Waker};
+
+mod builtin;
+mod custom_type;
+
+pub(crate) use builtin::builtin_types;
+pub use custom_type::{Conversion, ConversionFn, Type, UserType};
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
@@ -460,7 +466,12 @@ impl<T: AnyText> Extendable<T> for Text {
                         s.as_mut_vec().set_len(needed);
                     }
                 } else {
-                    other_str.clone_into(s);
+                    // Growing the old buffer copies its bytes, which this
+                    // write replaces, so copy into a new buffer instead.
+                    // The capacity is the one that growing gives.
+                    let mut text = String::with_capacity(needed.max(s.capacity() * 2));
+                    text.push_str(other_str);
+                    *s = text;
                 }
             }
             Cow::Borrowed(_) => {
@@ -489,10 +500,14 @@ impl<T: AnyBlob> Extendable<T> for ValueBlob {
                 self.set_len(needed);
             }
         } else {
-            // Reserve before mutation so an allocation failure leaves the old value intact.
-            self.try_reserve(needed - self.len())?;
-            self.clear();
-            self.extend_from_slice(other_slice);
+            // Growing the old buffer copies its bytes, which this write
+            // replaces, so copy into a new buffer instead. The capacity is
+            // the one that growing gives. An allocation failure leaves the
+            // old value intact.
+            let mut blob = <ValueBlob as TursoAllocExt>::new();
+            blob.try_reserve(needed.max(self.capacity() * 2))?;
+            blob.extend_from_slice(other_slice);
+            *self = blob;
         }
         Ok(())
     }
@@ -2110,6 +2125,13 @@ mod immutable_record {
             self.as_blob_mut().clear();
         }
 
+        /// Makes `payload` the bytes of the record. The record takes the
+        /// buffer, so the bytes are not copied.
+        #[inline]
+        pub fn set_payload(&mut self, payload: ValueBlob) {
+            *self.as_blob_mut() = payload;
+        }
+
         #[inline]
         pub const fn is_invalidated(&self) -> bool {
             self.as_blob().is_empty()
@@ -2666,7 +2688,7 @@ impl<'a> Ord for ValueRef<'a> {
 pub struct KeyInfo {
     pub sort_order: SortOrder,
     pub collation: CollationSeq,
-    pub nulls_order: Option<turso_parser::ast::NullsOrder>,
+    pub nulls_order: Option<crate::ast::NullsOrder>,
 }
 
 #[cfg(not(nightly))]
@@ -2879,8 +2901,8 @@ pub fn cmp_with_sort(cmp: Ordering, a: &ValueRef, b: &ValueRef, key: &KeyInfo) -
                 // NULLS FIRST: keep that natural order regardless of ASC/DESC.
                 // NULLS LAST: reverse it regardless of ASC/DESC.
                 return match nulls_order {
-                    turso_parser::ast::NullsOrder::First => cmp,
-                    turso_parser::ast::NullsOrder::Last => cmp.reverse(),
+                    crate::ast::NullsOrder::First => cmp,
+                    crate::ast::NullsOrder::Last => cmp.reverse(),
                 };
             }
         }

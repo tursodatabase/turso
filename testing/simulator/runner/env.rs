@@ -19,7 +19,7 @@ use sql_generation::model::query::transaction::Rollback;
 use sql_generation::model::table::{SimValue, Table};
 use tracing::trace;
 use turso_core::Database;
-use turso_parser::ast::ColumnConstraint;
+use turso_core::ast::ColumnConstraint;
 
 use crate::generation::Shadow;
 use crate::model::Query;
@@ -28,6 +28,7 @@ use crate::runner::SimIO;
 use crate::runner::cli::IoBackend;
 use crate::runner::io::SimulatorIO;
 use crate::runner::memory::io::MemorySimIO;
+use crate::runner::swarm;
 const DEFAULT_CACHE_SIZE: usize = 2000;
 use super::cli::SimulatorCLI;
 use turso_core::SessionRole;
@@ -1183,7 +1184,7 @@ mod tests {
     /// and one row per (a, b) pair, with g materialized in the shadow rows.
     fn table_with_unique_generated_column(rows: &[(i64, i64)]) -> Table {
         use sql_generation::model::table::{Column, ColumnType};
-        use turso_parser::ast;
+        use turso_core::ast;
 
         let generated_expr = ast::Expr::Binary(
             Box::new(ast::Expr::Id(ast::Name::from_string("a"))),
@@ -2022,12 +2023,15 @@ impl SimulatorEnv {
             // SQLite does not have LATERAL joins, so we can't use this property.
             opts.disable_lateral_matches_json_each = true;
         }
+        let mut io_backend = cli_opts.io_backend.unwrap_or_default();
+        if cli_opts.swarm {
+            swarm::apply(seed, cli_opts, &mut profile, &mut opts, &mut io_backend);
+        }
 
         profile.validate().unwrap();
 
         let latency_prof = &profile.io.latency;
 
-        let io_backend = cli_opts.io_backend;
         let io: Arc<dyn SimIO> = match io_backend {
             IoBackend::Memory => Arc::new(MemorySimIO::new(
                 opts.seed,

@@ -4,6 +4,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::sync::Arc;
+use turso_core::ast::{self, RefAct, SortOrder};
 use turso_core::schema::RelationKind;
 use turso_core::{
     dialect::{
@@ -23,7 +24,6 @@ use turso_core::{
 };
 use turso_core::{Dependent, DependentObject};
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
-use turso_parser::ast::{self, RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
 
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
@@ -62,7 +62,7 @@ impl Dialect for PostgresDialect {
         error
     }
 
-    fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    fn parse(&self, sql: &str) -> Result<(Option<turso_core::ast::Cmd>, usize)> {
         // Engine-generated helper statements and pragmas are canonical SQLite
         // text that pg_query rejects, so anything the PostgreSQL parser cannot
         // handle falls back to SQLite parsing.
@@ -88,7 +88,7 @@ impl Dialect for PostgresDialect {
         }
     }
 
-    fn parse_internal(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    fn parse_internal(&self, sql: &str) -> Result<(Option<turso_core::ast::Cmd>, usize)> {
         let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         Ok((cmd, parser.offset()))
@@ -97,7 +97,7 @@ impl Dialect for PostgresDialect {
     fn parse_internal_column_definition(
         &self,
         sql: &str,
-    ) -> Result<turso_parser::ast::ColumnDefinition> {
+    ) -> Result<turso_core::ast::ColumnDefinition> {
         Ok(turso_parser::parser::Parser::new(sql.as_bytes()).parse_column_definition(true)?)
     }
 
@@ -113,7 +113,7 @@ impl Dialect for PostgresDialect {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } =
+            let turso_core::ast::Stmt::CreateTable { tbl_name, body, .. } =
                 canonical_table_sql_ast(self, sql)?
             else {
                 unreachable!("canonical_table_sql_ast returned a non-CREATE TABLE statement");
@@ -135,7 +135,7 @@ impl Dialect for PostgresDialect {
             .translate(&parse_result)
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
         match stmt {
-            turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } => {
+            turso_core::ast::Stmt::CreateTable { tbl_name, body, .. } => {
                 BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)
             }
             _ => Err(LimboError::ParseError(
@@ -144,7 +144,7 @@ impl Dialect for PostgresDialect {
         }
     }
 
-    fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_parser::ast::Stmt> {
+    fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_core::ast::Stmt> {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
@@ -158,7 +158,7 @@ impl Dialect for PostgresDialect {
             .translate(&parse_result)
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
         match stmt {
-            stmt @ turso_parser::ast::Stmt::CreateTable { .. } => Ok(stmt),
+            stmt @ turso_core::ast::Stmt::CreateTable { .. } => Ok(stmt),
             _ => Err(LimboError::ParseError(
                 "expected CREATE TABLE statement".to_string(),
             )),
@@ -171,7 +171,7 @@ impl Dialect for PostgresDialect {
         };
 
         let stmt = self.parse_table_sql_ast(sql)?;
-        let turso_parser::ast::Stmt::CreateTable {
+        let turso_core::ast::Stmt::CreateTable {
             mut tbl_name,
             temporary,
             if_not_exists,
@@ -190,7 +190,7 @@ impl Dialect for PostgresDialect {
             return Ok(raw_sql.to_string());
         }
 
-        Ok(turso_parser::ast::Stmt::CreateTable {
+        Ok(turso_core::ast::Stmt::CreateTable {
             tbl_name,
             temporary,
             if_not_exists,
@@ -202,16 +202,16 @@ impl Dialect for PostgresDialect {
     fn format_table_sql(
         &self,
         input: &str,
-        tbl_name: &turso_parser::ast::QualifiedName,
-        _body: &turso_parser::ast::CreateTableBody,
+        tbl_name: &turso_core::ast::QualifiedName,
+        _body: &turso_core::ast::CreateTableBody,
     ) -> Result<String> {
         let sql = turso_pg_parser::name_create_table(input, tbl_name.name.as_str())
             .unwrap_or_else(|_| input.to_string());
         Ok(encode_pg_schema_sql(&sql))
     }
 
-    fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> Result<String> {
-        let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } = stmt else {
+    fn format_rewritten_table_sql(&self, stmt: &turso_core::ast::Stmt) -> Result<String> {
+        let turso_core::ast::Stmt::CreateTable { tbl_name, body, .. } = stmt else {
             return Err(LimboError::InternalError(
                 "format_rewritten_table_sql requires CREATE TABLE".to_string(),
             ));
@@ -224,6 +224,17 @@ impl Dialect for PostgresDialect {
                 .filter_map(|(position, column)| Some((position, column.identity_kind()?))),
         );
         Ok(format!("{identity_marker}{sql}"))
+    }
+
+    fn schema_builder(
+        &self,
+        enable_custom_types: bool,
+    ) -> Result<turso_core::schema::SchemaBuilder> {
+        let builder = turso_core::schema::builtin::schema_builder(enable_custom_types)?;
+        if !enable_custom_types {
+            return Ok(builder);
+        }
+        crate::pg_type::register_builtin_types(builder)
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
@@ -287,18 +298,6 @@ impl Dialect for PostgresDialect {
 
     fn supports_capture_data_changes(&self) -> bool {
         false
-    }
-
-    fn schema_state_queries(&self, schema: &Schema) -> Vec<String> {
-        crate::schema_state::schema_state_queries(schema)
-    }
-
-    fn build_schema_state(
-        &self,
-        schema: &Schema,
-        results: &[Vec<Vec<Value>>],
-    ) -> turso_core::Result<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
-        crate::schema_state::build_schema_state(schema, results)
     }
 
     fn catalog(&self) -> &dyn turso_core::Catalog {
@@ -401,6 +400,22 @@ impl Dialect for PostgresDialect {
         false
     }
 
+    fn check_ctas_column_type(&self, column: &str, type_name: Option<&str>) -> Result<()> {
+        let message = match type_name {
+            Some(type_name) => format!(
+                "CREATE TABLE AS with a column of type {type_name} is not supported (column \"{column}\")"
+            ),
+            None => format!(
+                "CREATE TABLE AS with a column whose type cannot be determined is not supported (column \"{column}\")"
+            ),
+        };
+        Err(crate::error::sqlstate_error(
+            turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+            message,
+            None,
+        ))
+    }
+
     fn mod_of_integers_is_integer(&self) -> bool {
         true
     }
@@ -417,8 +432,12 @@ impl Dialect for PostgresDialect {
         true
     }
 
-    fn casts_nonzero_integer_to_true(&self) -> bool {
+    fn text_input_types_refuse_other_kinds(&self) -> bool {
         true
+    }
+
+    fn json_contains_function(&self) -> Option<&'static str> {
+        Some("jsonb_contains")
     }
 }
 
@@ -528,6 +547,7 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
     pg_type_oid(ty_str).unwrap_or(25) // default to text
 }
 
+/// FIXME(pg-catalog): This maps type names to pg_type oids by hand, and a type it does not list reads as text elsewhere. It maps CHAR to varchar (1043), where PostgreSQL's char is bpchar (1042). A lookup in a pg_type table replaces this.
 /// The oid of the PostgreSQL type of a column declared as `ty_str`, or None
 /// for a type name tursopg does not know.
 pub(crate) fn pg_type_oid(ty_str: &str) -> Option<i64> {
@@ -4868,7 +4888,7 @@ mod tests {
 
     #[test]
     fn dialect_parse_preserves_explain_command() {
-        use turso_parser::ast::{Cmd, EqpFormat};
+        use turso_core::ast::{Cmd, EqpFormat};
 
         for sql in ["EXPLAIN SELECT 7", "EXPLAIN SELECT 7::text"] {
             let (cmd, consumed) = PostgresDialect.parse(sql).unwrap();

@@ -1,5 +1,6 @@
 //! Translation of VACUUM statements to VDBE bytecode.
 
+use crate::ast::{Expr, Name, SubqueryType};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
     bind_and_rewrite_expr, expr_vector_size, translate_expr, BindingBehavior,
@@ -12,7 +13,6 @@ use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::Insn;
 use crate::{bail_parse_error, Connection, Result, TEMP_DB_ID};
 use crate::{sync::Arc, LimboError};
-use turso_parser::ast::{Expr, Name, SubqueryType};
 
 /// Translate a VACUUM statement into VDBE bytecode.
 ///

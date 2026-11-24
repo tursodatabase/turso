@@ -183,9 +183,32 @@ test('reopen file-backed replica after switching to MVCC sync', async () => {
     const url = process.env.VITE_TURSO_MVCC_DB_URL;
     {
         let remoteUrl: string | null = null;
-        const db = await connect({ path, url: () => remoteUrl, logicalMvccPull: true });
+        let replacedBase = false;
+        const db = await connect({ path, url: () => remoteUrl, logicalMvccPull: true,
+            fetch: async (input, options) => {
+                if (replacedBase || !String(input).endsWith('/pull-updates')) {
+                    return fetch(input, options);
+                }
+                replacedBase = true;
+                // Exercise a page-base fallback once without unlinking the live log
+                // needed by the following logical pull and subsequent pushes.
+                const response = await fetch(input, { ...options, body: new Uint8Array() });
+                expect(response.status).toBe(200);
+                const body = new Uint8Array(await response.arrayBuffer());
+                // This small fixture has a one-byte header length. Append field 6:
+                // apply_mode = ReplaceBase (1); keep all real snapshot pages intact.
+                expect(body[0]).toBeLessThan(126);
+                const end = 1 + body[0];
+                expect(end).toBeLessThan(body.length);
+                const headers = new Headers(response.headers);
+                headers.delete('content-length');
+                return new Response(Uint8Array.from([body[0] + 2,
+                    ...body.subarray(1, end), 0x30, 1, ...body.subarray(end)]), { headers });
+            },
+        });
         remoteUrl = url ?? null;
         await db.pull();
+        expect(replacedBase).toBe(true);
         await db.exec("CREATE TABLE IF NOT EXISTS mvcc_opfs_reopen(value TEXT)");
         await db.exec("DELETE FROM mvcc_opfs_reopen");
         await db.exec("INSERT INTO mvcc_opfs_reopen VALUES ('still here')");

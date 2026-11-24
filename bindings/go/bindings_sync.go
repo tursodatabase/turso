@@ -2,6 +2,7 @@ package turso // import "github.com/tursodatabase/turso/go"
 
 import (
 	"runtime"
+	"strings"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -397,12 +398,21 @@ func sliceRefToStringCopy(s turso_slice_ref_t) string {
 
 // turso_sync_database_new creates the database sync holder but does not open it.
 func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncDatabaseConfig) (TursoSyncDatabase, error) {
+	if strings.IndexByte(syncConfig.RemoteEncryptionCipher, 0) >= 0 {
+		return nil, statusToError(TURSO_MISUSE, "remote encryption cipher contains NUL")
+	}
 	// Build C database config
 	var cdb turso_database_config_t
-	var pathBytes, expBytes []byte
+	var pathBytes, expBytes, localCipherBytes, localKeyBytes []byte
 	pathBytes, cdb.path = makeCStringBytes(dbConfig.Path)
 	if dbConfig.ExperimentalFeatures != "" {
 		expBytes, cdb.experimental_features = makeCStringBytes(dbConfig.ExperimentalFeatures)
+	}
+	if dbConfig.Encryption.Cipher != "" {
+		localCipherBytes, cdb.encryption_cipher = makeCStringBytes(dbConfig.Encryption.Cipher)
+	}
+	if dbConfig.Encryption.Hexkey != "" {
+		localKeyBytes, cdb.encryption_hexkey = makeCStringBytes(dbConfig.Encryption.Hexkey)
 	}
 	cdb.async_io = 0
 	if dbConfig.AsyncIO {
@@ -443,6 +453,8 @@ func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncD
 	runtime.KeepAlive(pathBytes)
 	runtime.KeepAlive(remoteUrlBytes)
 	runtime.KeepAlive(expBytes)
+	runtime.KeepAlive(localCipherBytes)
+	runtime.KeepAlive(localKeyBytes)
 	runtime.KeepAlive(syncPathBytes)
 	runtime.KeepAlive(clientNameBytes)
 	runtime.KeepAlive(queryBytes)

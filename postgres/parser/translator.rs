@@ -14,17 +14,17 @@ use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_GROUPING_ERROR, SQLSTATE_INVALID_COLUMN_REFERENCE,
     SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME,
     SQLSTATE_INVALID_OBJECT_DEFINITION, SQLSTATE_INVALID_PARAMETER_VALUE,
-    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
-    SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_COLUMN,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNDEFINED_PARAMETER,
-    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION, SQLSTATE_WINDOWING_ERROR,
-    SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_INVALID_RECURSION, SQLSTATE_INVALID_SCHEMA_DEFINITION,
+    SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
+    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
+    SQLSTATE_WINDOWING_ERROR, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
-use turso_parser::ast;
-use turso_parser::ast::GroupBy;
+use turso_ast as ast;
+use turso_ast::GroupBy;
 
 /// Result of translating a PostgreSQL command, which may include
 /// prerequisite statements (e.g., implicit CREATE SEQUENCE for serial columns).
@@ -3242,16 +3242,22 @@ impl PostgreSQLTranslator {
                     "json" | "jsonb"
                 );
                 let cast_type = Some(pg_type_name_to_ast_type(type_name)?);
-                let path = Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                    "'$.\"{}\"'",
-                    col_def
-                        .colname
-                        .replace('\\', "\\\\")
-                        .replace('"', "\\\"")
-                        .replace('\'', "''")
-                ))));
-                let extract =
-                    |operator| ast::Expr::Binary(Box::new(source.clone()), operator, path.clone());
+                // jsonb_field() finds the field as -> does: of two fields with
+                // the same name, the last one counts, as in PostgreSQL. A JSON
+                // path of SQLite finds the first one. SQLite's operators then
+                // read the value of the field for the cast to the column type.
+                let field = Box::new(function_call(
+                    "jsonb_field",
+                    vec![
+                        source.clone(),
+                        ast::Expr::Literal(ast::Literal::String(format!(
+                            "'{}'",
+                            col_def.colname.replace('\'', "''")
+                        ))),
+                    ],
+                ));
+                let root = Box::new(ast::Expr::Literal(ast::Literal::String("'$'".into())));
+                let extract = |operator| ast::Expr::Binary(field.clone(), operator, root.clone());
                 let reads_json_text =
                     is_json || cast_type.as_ref().is_some_and(|t| t.name == "TEXT");
                 let value = if reads_json_text {
@@ -3266,10 +3272,7 @@ impl PostgreSQLTranslator {
                         ));
                     }
                     ast::Expr::Case {
-                        base: Some(Box::new(json_type(vec![
-                            Box::new(source.clone()),
-                            path.clone(),
-                        ]))),
+                        base: Some(Box::new(json_type(vec![field.clone()]))),
                         when_then_pairs,
                         else_expr: Some(Box::new(extract(ast::Operator::ArrowRight))),
                     }
@@ -3787,14 +3790,19 @@ impl PostgreSQLTranslator {
                         "a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP",
                     ));
                 }
-                // CURRENT_DATE, CURRENT_TIME and LOCALTIME are refused if
-                // tursopg does not support the type each returns in
-                // PostgreSQL.
+                // CURRENT_TIME and LOCALTIME are refused if tursopg does not
+                // support the type each returns in PostgreSQL.
                 match SqlValueFunctionOp::try_from(svf.op) {
-                    Ok(SqlValueFunctionOp::SvfopCurrentDate) => {
-                        check_type_is_supported("date", 0)?;
-                        Ok(ast::Expr::Literal(ast::Literal::CurrentDate))
-                    }
+                    // CURRENT_DATE is the date of now(), the time the
+                    // transaction started, in the session time zone (UTC).
+                    Ok(SqlValueFunctionOp::SvfopCurrentDate) => Ok(ast::Expr::Cast {
+                        expr: Box::new(function_call("now", vec![])),
+                        type_name: Some(ast::Type {
+                            name: "date".to_string(),
+                            size: None,
+                            array_dimensions: 0,
+                        }),
+                    }),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTime
                         | SqlValueFunctionOp::SvfopCurrentTimeN,
@@ -4273,15 +4281,58 @@ impl PostgreSQLTranslator {
             "/" => ast::Operator::Divide,
             "%" => ast::Operator::Modulus,
             "||" => ast::Operator::Concat,
-            "->" => ast::Operator::ArrowRight,
-            "->>" => ast::Operator::ArrowRightShift,
+            // PostgreSQL has -> and ->> only for json and jsonb, so they run the
+            // frontend's functions. SQLite's operators read a text key such as
+            // '$.a' as a JSON path, take the first of two equal keys, and give
+            // numbers and booleans as SQL values instead of text.
+            "->" | "->>" => {
+                // An index expression and a generation expression can use only
+                // core functions.
+                if self.translating_index.get() {
+                    return Err(ParseError::Sqlstate {
+                        sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+                        message: format!("CREATE INDEX does not support the {op_name} operator"),
+                    });
+                }
+                if self.generation_expression_table.borrow().is_some() {
+                    return Err(ParseError::Sqlstate {
+                        sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+                        message: format!(
+                            "a generated column does not support the {op_name} operator"
+                        ),
+                    });
+                }
+                let func_name = if op_name == "->" {
+                    "jsonb_field"
+                } else {
+                    "jsonb_field_text"
+                };
+                return Ok(function_call(func_name, vec![*left, *right]));
+            }
             "&" => ast::Operator::BitwiseAnd,
             "|" => ast::Operator::BitwiseOr,
             "<<" => ast::Operator::LeftShift,
             ">>" => ast::Operator::RightShift,
             "AND" => ast::Operator::And,
             "OR" => ast::Operator::Or,
-            // Array operators → translate to native array function calls
+            // PostgreSQL has @> and <@ for arrays and for jsonb, and only the
+            // type of an operand tells which one runs. Only core knows the
+            // types, so core chooses. `a <@ b` is `b @> a`.
+            //
+            // A generation expression and an index expression can use only
+            // core functions, so they keep the array function. Thus the values
+            // that such a column or index stored before also stay the same.
+            "@>" | "<@"
+                if self.generation_expression_table.borrow().is_none()
+                    && !self.translating_index.get() =>
+            {
+                let (lhs, rhs) = if op_name == "@>" {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                return Ok(ast::Expr::Binary(lhs, ast::Operator::ArrayContains, rhs));
+            }
             "@>" | "<@" | "&&" => {
                 let (func_name, args) = match op_name {
                     "@>" => ("array_contains_all", vec![left, right]),
@@ -4568,6 +4619,11 @@ impl PostgreSQLTranslator {
             return Err(star_argument_error(&func_call.funcname));
         }
         if let Some(result_type) = datetime_result_type(&func_name) {
+            // tursopg implements none of the functions that return a date,
+            // and SQLite's date() would run in their place.
+            if result_type == "date" {
+                return Err(ParseError::not_supported(format!("{func_name}()")));
+            }
             check_type_is_supported(result_type, 0)?;
         }
         if func_name.eq_ignore_ascii_case("substring")
@@ -4657,6 +4713,7 @@ impl PostgreSQLTranslator {
             _ => func_name,
         };
 
+        // FIXME(pg-catalog): This hand-codes the pg_proc functions named after a type (float8, float4, int4, int2, int8, bool, text) as casts, and casts int2 and float4 to the wider INTEGER and REAL, so int2(70000) does not raise "smallint out of range" as it does in PostgreSQL. Function resolution in pg_proc, which finds the cast functions of pg_cast, replaces this.
         // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
             "FLOAT8" | "FLOAT4" => Some("REAL"),
@@ -5172,6 +5229,15 @@ impl PostgreSQLTranslator {
             };
 
             let tbl_name = exact_name(&cte.ctename);
+
+            // PostgreSQL checks the form of a recursive query before it
+            // analyzes the query and its SEARCH and CYCLE clauses, also when
+            // no query reads the CTE.
+            if with_clause.recursive {
+                if let Some(error) = recursive_cte_error(cte) {
+                    return Err(error);
+                }
+            }
 
             // PostgreSQL evaluates SEARCH/CYCLE by adding computed columns to
             // the recursion; silently dropping them would change results (and
@@ -6948,6 +7014,97 @@ fn collect_lateral_items<'a>(
     }
 }
 
+/// The error of PostgreSQL's `checkWellFormedRecursion` for CTE `cte` of a
+/// WITH RECURSIVE, without the checks of the arms of the UNION. None when the
+/// query of the CTE is not a SELECT, does not refer to the CTE or has the form
+/// that PostgreSQL accepts. For a query that refers to the CTE, the engine
+/// would run ORDER BY as the order of the recursion queue and LIMIT and OFFSET
+/// as stops of the recursion, as SQLite does.
+fn recursive_cte_error(cte: &pg_query::protobuf::CommonTableExpr) -> Option<ParseError> {
+    let query = cte.ctequery.as_ref()?.node.as_ref()?;
+    let pg_query::NodeEnum::SelectStmt(select) = query else {
+        return None;
+    };
+    if !refers_to_cte(query, &cte.ctename) {
+        return None;
+    }
+    if select.op() != pg_query::protobuf::SetOperation::SetopUnion {
+        return Some(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_INVALID_RECURSION,
+            message: format!(
+                "recursive query \"{}\" does not have the form non-recursive-term UNION [ALL] recursive-term",
+                cte.ctename
+            ),
+        });
+    }
+    // LIMIT ALL, LIMIT NULL and OFFSET NULL count too: the parse tree has
+    // them as a NULL constant.
+    let clause = if !select.sort_clause.is_empty() {
+        "ORDER BY"
+    } else if select.limit_offset.is_some() {
+        "OFFSET"
+    } else if select.limit_count.is_some() {
+        "LIMIT"
+    } else if !select.locking_clause.is_empty() {
+        "FOR UPDATE/SHARE"
+    } else {
+        return None;
+    };
+    Some(ParseError::Sqlstate {
+        sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+        message: format!("{clause} in a recursive query is not implemented"),
+    })
+}
+
+/// Whether `query` names the CTE `cte_name` as an unqualified table, outside
+/// the part of `query` where a WITH inside it gives the name to a CTE of its
+/// own. A WITH RECURSIVE gives the name to all of its CTEs and its main query;
+/// a WITH gives it to the CTEs after that CTE and to its main query.
+fn refers_to_cte(query: &pg_query::NodeEnum, cte_name: &str) -> bool {
+    // A node is found again in a copy by its location in the query text.
+    let references = |node: &pg_query::NodeEnum| -> Vec<i32> {
+        node.nodes()
+            .into_iter()
+            .filter_map(|(node, ..)| match node {
+                NodeRef::RangeVar(table)
+                    if table.schemaname.is_empty() && table.relname == cte_name =>
+                {
+                    Some(table.location)
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let mut shadowed = std::collections::HashSet::new();
+    for (node, ..) in query.nodes() {
+        let NodeRef::SelectStmt(select) = node else {
+            continue;
+        };
+        let Some(with) = &select.with_clause else {
+            continue;
+        };
+        let Some(position) = with.ctes.iter().position(|cte| {
+            matches!(&cte.node, Some(pg_query::NodeEnum::CommonTableExpr(cte)) if cte.ctename == cte_name)
+        }) else {
+            continue;
+        };
+        let outer_ctes = if with.recursive { 0 } else { position + 1 };
+        let outer: Vec<i32> = with.ctes[..outer_ctes]
+            .iter()
+            .filter_map(|cte| cte.node.as_ref())
+            .flat_map(&references)
+            .collect();
+        shadowed.extend(
+            references(&pg_query::NodeEnum::SelectStmt(Box::new(select.clone())))
+                .into_iter()
+                .filter(|location| !outer.contains(location)),
+        );
+    }
+    references(query)
+        .iter()
+        .any(|location| !shadowed.contains(location))
+}
+
 /// The names that a FROM item, a join or a CTE gives to its rows. For a
 /// table, the name of the table too, also when the table has an alias.
 fn range_names<'a>(node: &pg_query::NodeRef<'a>) -> Vec<&'a str> {
@@ -7066,6 +7223,7 @@ fn is_serial_type(pg_type: &str) -> bool {
 /// built-in Turso type exists, otherwise returns the base SQLite type.
 /// For array types (e.g. `INTEGER[]`, `_int4`), returns the base scalar type
 /// with `array_dimensions > 0` so native Turso arrays are used.
+// FIXME(pg-catalog): This maps PostgreSQL type names to Turso or SQLite type names by hand, and lowers types Turso does not have to another type: money to REAL; point, bit and xml to TEXT; oid and the reg types to INTEGER. It also maps numeric without a precision to REAL and char without a length to TEXT, where pg_type keeps numeric and makes char a bpchar of length 1. A pg_type lookup replaces this.
 pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
     // Check for array types first
     if pg_type.ends_with("[]") || pg_type.starts_with('_') {
@@ -7560,6 +7718,7 @@ fn json_type_or_raise(
     }
 }
 
+/// FIXME(pg-catalog): This finds a cast to int8 by its type name and checks a numeric literal in the parser because there is no typed expression tree. The pg_cast entry from numeric to bigint (function int8(numeric)), applied to a literal typed numeric, replaces this.
 /// The operand of an int8 cast, made to raise "bigint out of range" when it is
 /// a numeric literal outside the bigint range, where `CAST(x AS INTEGER)` would
 /// clamp it. The literal is checked from its text, because a literal just past
@@ -7702,9 +7861,11 @@ fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
     Some(format!("{sign}{digits}"))
 }
 
+/// FIXME(pg-catalog): This lowers PostgreSQL types to SQLite types in the parser (smallint and oid to INTEGER; numeric and money to REAL; json, inet and uuid to TEXT), so the PostgreSQL type is gone before the cast is checked. A pg_type lookup and a typed expression tree that keeps the type replace this.
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
-/// Maps PG types to their base SQLite storage types. Other names are kept as
-/// written so that enums and domains resolve to their custom type.
+/// Maps PG types to their base SQLite storage types. A type that the frontend
+/// registers, such as boolean, keeps its name, and so do other names, so that
+/// enums and domains resolve to their custom type.
 fn pg_type_name_to_ast_type(
     type_name: &pg_query::protobuf::TypeName,
 ) -> Result<ast::Type, ParseError> {
@@ -7718,13 +7879,14 @@ fn pg_type_name_to_ast_type(
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
             "REAL"
         }
-        // For CAST expressions, map all text-like PG types to TEXT and
-        // boolean to INTEGER for SQLite VDBE compatibility
-        "BOOLEAN" | "BOOL" => "INTEGER",
+        // The frontend registers these types, so the cast names the type
+        // and converts the value as a column of the type does.
+        "BOOLEAN" | "BOOL" => "boolean",
         "DATE" => "date",
         "TIME" => "time",
         "TIMESTAMP" => "timestamp",
         "TIMESTAMPTZ" => "timestamptz",
+        // For CAST expressions, map all text-like PG types to TEXT.
         "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INET" | "JSON" | "JSONB"
         | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
         "BYTEA" | "BLOB" => "BLOB",
@@ -7775,7 +7937,7 @@ fn check_type_is_supported(name: &str, array_dimensions: usize) -> Result<(), Pa
         "interval",
     ];
     // The date and time types tursopg supports, as scalars only.
-    const SUPPORTED_DATETIME_TYPES: &[&str] = &["timestamp", "timestamptz"];
+    const SUPPORTED_DATETIME_TYPES: &[&str] = &["date", "timestamp", "timestamptz"];
     let (element, is_array) = match name.strip_prefix('_') {
         Some(element) => (element, true),
         None => (name, array_dimensions > 0),
@@ -8186,6 +8348,7 @@ fn validate_column_qualifiers(
     Ok(())
 }
 
+/// FIXME(pg-catalog): This hand-codes provolatile of the pg_proc functions behind pg_operator entries: timestamptz plus or minus interval is stable, and text || anynonarray is a stable SQL function that PostgreSQL inlines into a cast of the other operand to text, so it takes the volatility of that cast. It leaves out the comparisons of date and timestamp with timestamptz, which are stable. A lookup in pg_operator and pg_proc, with inlining of SQL functions, replaces this.
 /// Whether operator `name` on operands of types `left` and `right` is immutable.
 fn operator_is_immutable(name: &str, left: ExprType, right: ExprType) -> bool {
     use ExprType::*;
@@ -8200,6 +8363,7 @@ fn operator_is_immutable(name: &str, left: ExprType, right: ExprType) -> bool {
     }
 }
 
+/// FIXME(pg-catalog): This hand-codes the volatility of casts among date and time types, which is provolatile of the pg_cast function, and of casts between text and date and time types, which have no pg_cast entry and run the typinput or typoutput function of pg_type: all of them are stable except time_out and timetz_out. A lookup in pg_cast, pg_type and pg_proc replaces this.
 /// Whether a cast from `source` to `target` is immutable.
 fn cast_is_immutable(source: ExprType, target: ExprType) -> bool {
     use ExprType::*;
@@ -8213,6 +8377,7 @@ fn cast_is_immutable(source: ExprType, target: ExprType) -> bool {
     }
 }
 
+/// FIXME(pg-catalog): This is a small typed expression tree that knows only text and date and time types, built by hand for the volatility check. The typed expression tree of the binder replaces it.
 /// The type of a value in a generation expression, as far as the volatility checks need it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExprType {
@@ -8276,6 +8441,7 @@ impl ExprType {
         }
     }
 
+    /// FIXME(pg-catalog): This hand-codes the result types of the pg_operator entries for text and date and time operands. A lookup in a pg_operator table replaces this.
     /// The type an operator gives its result, for the operand types it has a rule for.
     fn operator_result(name: &str, left: Option<Self>, right: Option<Self>) -> Option<Self> {
         use ExprType::*;
@@ -9380,33 +9546,87 @@ fn description_lookup(func_name: &str, args: &[Box<ast::Expr>]) -> Option<ast::E
 
 /// `(SELECT description FROM pg_description WHERE column = value AND ... LIMIT 1)`
 /// for the `conditions`, which are pairs of a column and its value.
+///
+/// The subquery reads pg_description through an inner query that renames
+/// its columns, because a value is an expression of the outer query: `oid`
+/// in it must not be read as the rowid of pg_description.
 fn description_subquery(conditions: Vec<(&str, ast::Expr)>) -> ast::Expr {
-    let mut parser = turso_parser::parser::Parser::new(DESCRIPTION_SELECT.as_bytes());
-    let Ok(Some(ast::Cmd::Stmt(ast::Stmt::Select(mut select)))) = parser.next_cmd() else {
-        unreachable!("DESCRIPTION_SELECT is a SELECT statement");
-    };
-    let ast::OneSelect::Select { where_clause, .. } = &mut select.body.select else {
-        unreachable!("DESCRIPTION_SELECT has no VALUES");
-    };
-    *where_clause = conditions
+    let renamed = |column: &str| exact_name(format!("_turso_{column}"));
+    let where_clause = conditions
         .into_iter()
         .map(|(column, value)| {
-            let column = ast::Expr::Id(exact_name(format!("_turso_{column}")));
+            let column = ast::Expr::Id(renamed(column));
             ast::Expr::Binary(Box::new(column), ast::Operator::Equals, Box::new(value))
         })
         .reduce(|all, condition| {
             ast::Expr::Binary(Box::new(all), ast::Operator::And, Box::new(condition))
         })
         .map(Box::new);
-    ast::Expr::Subquery(Box::new(select))
+    let renamed_columns = ["objoid", "classoid", "objsubid", "description"]
+        .into_iter()
+        .map(|column| {
+            ast::ResultColumn::Expr(
+                Box::new(ast::Expr::Id(exact_name(column))),
+                Some(ast::As::As(renamed(column))),
+            )
+        })
+        .collect();
+    let pg_description = ast::Select {
+        with: None,
+        body: ast::SelectBody {
+            select: ast::OneSelect::Select {
+                distinctness: None,
+                columns: renamed_columns,
+                from: Some(ast::FromClause {
+                    select: Box::new(ast::SelectTable::Table(
+                        ast::QualifiedName::fullname(
+                            exact_name("main"),
+                            exact_name("pg_description"),
+                        ),
+                        None,
+                        None,
+                    )),
+                    joins: vec![],
+                }),
+                where_clause: None,
+                group_by: None,
+                window_clause: vec![],
+            },
+            compounds: vec![],
+        },
+        order_by: vec![],
+        limit: None,
+    };
+    ast::Expr::Subquery(Box::new(ast::Select {
+        with: None,
+        body: ast::SelectBody {
+            select: ast::OneSelect::Select {
+                distinctness: None,
+                columns: vec![ast::ResultColumn::Expr(
+                    Box::new(ast::Expr::Id(renamed("description"))),
+                    Some(ast::As::ImplicitColumnName(renamed("description"))),
+                )],
+                from: Some(ast::FromClause {
+                    select: Box::new(ast::SelectTable::Select {
+                        select: pg_description,
+                        alias: None,
+                        lateral: false,
+                    }),
+                    joins: vec![],
+                }),
+                where_clause,
+                group_by: None,
+                window_clause: vec![],
+            },
+            compounds: vec![],
+        },
+        order_by: vec![],
+        limit: Some(ast::Limit {
+            expr: Box::new(integer_literal(1)),
+            offset: None,
+        }),
+    }))
 }
-
-// The columns are renamed because a value is an expression of the outer
-// query: `oid` in it must not be read as the rowid of pg_description.
-const DESCRIPTION_SELECT: &str = "SELECT _turso_description FROM (\
-    SELECT objoid AS _turso_objoid, classoid AS _turso_classoid, \
-    objsubid AS _turso_objsubid, description AS _turso_description \
-    FROM main.pg_description) LIMIT 1";
 
 /// `CASE catalog WHEN 'pg_class' THEN 1259 WHEN 'pg_namespace' THEN 2615 END`:
 /// the oid of the catalog named `catalog`.
@@ -10392,6 +10612,7 @@ fn reject_column_aliases(
     Ok(())
 }
 
+// FIXME(pg-catalog): This guesses from the shape of the second argument whether substring() resolves to the pg_proc entry substring(text, text), which takes a regular expression, instead of substring(text, integer). Function resolution in pg_proc on a typed expression tree replaces this.
 fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
     use pg_query::protobuf::node::Node;
     match &node.node {
@@ -10469,6 +10690,7 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
 /// tursopg functions that PostgreSQL does not have, so user SQL cannot call them.
 const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &["int8_out_of_range"];
 
+// FIXME(pg-collation): This hand-codes the pg_collation entries that compare bytes (C, POSIX, ucs_basic) and counts default among them, where PostgreSQL's default collation is the one of the database (pg_database.datcollate, en_US.utf8 in the postgres:18 image). It matches the names without regard to case, so it accepts `COLLATE C`, which PostgreSQL folds to "c" and refuses. A lookup in a pg_collation table replaces this.
 fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
     let Ok(names) = extract_key_columns(collname) else {
         return false;
@@ -12517,47 +12739,29 @@ mod tests {
 
     #[test]
     fn test_array_contains_operator() {
-        let translator = PostgreSQLTranslator::new();
-        let sql = "SELECT id FROM posts WHERE tags @> '{\"ORM\"}'";
-        let parsed = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parsed).unwrap();
-        if let ast::Stmt::Select(select) = translated {
-            if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
-                let wc = where_clause.as_ref().expect("Expected WHERE clause");
-                if let ast::Expr::FunctionCall { name, args, .. } = &**wc {
-                    assert_eq!(name.as_str(), "array_contains_all");
-                    assert_eq!(args.len(), 2);
-                } else {
-                    panic!("Expected FunctionCall for @>, got: {wc:?}");
-                }
-            } else {
-                panic!("Expected Select variant");
-            }
-        } else {
-            panic!("Expected Select statement");
-        }
+        let wc = where_clause_of("SELECT id FROM posts WHERE tags @> '{\"ORM\"}'");
+        let ast::Expr::Binary(lhs, ast::Operator::ArrayContains, rhs) = wc else {
+            panic!("Expected ArrayContains for @>, got: {wc:?}");
+        };
+        assert!(
+            matches!(&*lhs, ast::Expr::Id(name) if name.as_str() == "tags"),
+            "{lhs:?}"
+        );
+        assert!(matches!(&*rhs, ast::Expr::Literal(_)), "{rhs:?}");
     }
 
+    /// `a <@ b` is `b @> a`.
     #[test]
     fn test_array_contained_operator() {
-        let translator = PostgreSQLTranslator::new();
-        let sql = "SELECT id FROM posts WHERE tags <@ '{\"ORM\"}'";
-        let parsed = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parsed).unwrap();
-        if let ast::Stmt::Select(select) = translated {
-            if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
-                let wc = where_clause.as_ref().expect("Expected WHERE clause");
-                if let ast::Expr::FunctionCall { name, .. } = &**wc {
-                    assert_eq!(name.as_str(), "array_contains_all");
-                } else {
-                    panic!("Expected FunctionCall for <@, got: {wc:?}");
-                }
-            } else {
-                panic!("Expected Select variant");
-            }
-        } else {
-            panic!("Expected Select statement");
-        }
+        let wc = where_clause_of("SELECT id FROM posts WHERE tags <@ '{\"ORM\"}'");
+        let ast::Expr::Binary(lhs, ast::Operator::ArrayContains, rhs) = wc else {
+            panic!("Expected ArrayContains for <@, got: {wc:?}");
+        };
+        assert!(matches!(&*lhs, ast::Expr::Literal(_)), "{lhs:?}");
+        assert!(
+            matches!(&*rhs, ast::Expr::Id(name) if name.as_str() == "tags"),
+            "{rhs:?}"
+        );
     }
 
     /// Extract the WHERE clause of a translated single SELECT.

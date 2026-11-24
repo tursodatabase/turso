@@ -1,19 +1,23 @@
 use std::{borrow::Borrow, cmp::Ordering, collections::HashMap, hash::Hasher, str::FromStr as _};
 
+use crate::ast::{Expr, UnaryOperator};
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
 use smallvec::SmallVec;
-use turso_parser::ast::{Expr, UnaryOperator};
 
 use crate::{
     function::ExternalCollation,
-    schema::Schema,
+    function::ResultType,
+    schema::{Schema, TypeDef},
     sync::{Arc, LazyLock, RwLock, Weak},
     translate::{
         catalog::CatalogContext,
         emitter::Resolver,
         expr::{
-            expr_type::{query_column_type, type_of, type_ordering, ExprType},
+            expr_type::{
+                first_and_third_arguments, iif_values, query_column_type, same_type_def, type_of,
+                type_ordering, ExprType,
+            },
             row_value_component_expr, row_value_len,
         },
         expr_context::{ExprContext, ExprProperties},
@@ -508,6 +512,7 @@ pub fn comparison_collation_across_queries(
     rhs: &Expr,
     rhs_context: &ExprContext<'_, '_>,
 ) -> Result<CollationSeq> {
+    check_comparable_exprs(lhs, lhs_context, rhs, rhs_context)?;
     if let Some(ordering) = common_type_ordering([(lhs, lhs_context), (rhs, rhs_context)])? {
         return Ok(CollationSeq::Type(ordering));
     }
@@ -546,6 +551,7 @@ pub fn in_subquery_collation(
         type_of(lhs, &lhs_context.type_env()),
         query_column_type(query, column, resolver),
     ];
+    check_comparable(&types[0], &types[1], resolver.schema())?;
     let has_collate = has_collate_operator(lhs) || has_collate_operator(rhs);
     if let Some(ordering) = common_ordering(&types, resolver.schema(), has_collate)? {
         return Ok(CollationSeq::Type(ordering));
@@ -562,6 +568,7 @@ pub fn in_list_collation(
     rhs: &[Box<Expr>],
     context: &ExprContext<'_, '_>,
 ) -> Result<CollationSeq> {
+    check_in_list_comparable(lhs, rhs, context)?;
     let operands = std::iter::once(lhs)
         .chain(rhs.iter().map(|item| item.as_ref()))
         .map(|expr| (expr, context));
@@ -604,6 +611,12 @@ pub(crate) fn expr_text_collation(
 pub fn first_collation<'a, 'c, 's: 'c>(
     exprs: impl IntoIterator<Item = (&'a Expr, ExprContext<'c, 's>)> + Clone,
 ) -> Result<CollationSeq> {
+    check_comparable_types(
+        exprs
+            .clone()
+            .into_iter()
+            .map(|(expr, context)| (type_of(expr, &context.type_env()), context.schema())),
+    )?;
     if let Some(ordering) = common_type_ordering(exprs.clone())? {
         return Ok(CollationSeq::Type(ordering));
     }
@@ -611,7 +624,9 @@ pub fn first_collation<'a, 'c, 's: 'c>(
 }
 
 /// The collation that column `column` of a compound SELECT compares with,
-/// where `arms` are its SELECTs, by the rule of [first_collation]: a SELECT
+/// where `arms` are its SELECTs, after checking that the column's values in
+/// every SELECT and every row of a VALUES list compare. The collation follows
+/// the rule of [first_collation] over the result columns: a SELECT
 /// whose column has an order decides, so `SELECT n FROM t UNION SELECT 10`
 /// compares in numeric order and keeps one of `10.00` and `10`. Otherwise the
 /// text collation of the leftmost SELECT whose column has one, as in SQLite's
@@ -621,7 +636,11 @@ pub fn compound_column_collation(
     column: usize,
     resolver: &Resolver,
 ) -> Result<CollationSeq> {
-    first_collation(compound_column_exprs(arms, column, resolver))
+    check_comparable_types(
+        compound_column_exprs(arms, column, resolver)
+            .map(|(expr, context)| (type_of(expr, &context.type_env()), context.schema())),
+    )?;
+    first_collation(compound_result_column_exprs(arms, column, resolver))
 }
 
 /// The collation of a compound SELECT's ORDER BY term `column COLLATE name`,
@@ -638,9 +657,24 @@ pub fn compound_order_by_collation(
     Ok(CollationSeq::Text(explicit_collation))
 }
 
-/// Column `column` of every SELECT in `arms`, each with the context its
-/// columns refer to.
+/// Column `column` of every SELECT in `arms`, every row of a VALUES list
+/// included, each with the context its columns refer to.
 fn compound_column_exprs<'a, 's>(
+    arms: &'a [&'a SelectPlan],
+    column: usize,
+    resolver: &'a Resolver<'s>,
+) -> impl Iterator<Item = (&'a Expr, ExprContext<'a, 's>)> + Clone + 'a {
+    arms.iter().flat_map(move |select| {
+        let context = ExprContext::new(Some(&select.table_references), resolver);
+        select.column_exprs(column).map(move |expr| (expr, context))
+    })
+}
+
+/// The result column `column` of every SELECT in `arms`, each with the context
+/// its columns refer to. The result columns of a VALUES list hold placeholders
+/// that have no collation, so a COLLATE in a row of a VALUES list does not
+/// decide the collation of a compound SELECT.
+fn compound_result_column_exprs<'a, 's>(
     arms: &'a [&'a SelectPlan],
     column: usize,
     resolver: &'a Resolver<'s>,
@@ -774,6 +808,14 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
     match expr {
         Expr::Collate(operand, _) => check_collate_operand(operand, context),
         Expr::Binary(lhs, op, rhs) if op.is_comparison() => check_comparison(lhs, rhs, context),
+        Expr::Binary(lhs, op, rhs) if op.compares_or_combines_array_elements() => {
+            let env = context.type_env();
+            if type_of(lhs, &env).is_array() || type_of(rhs, &env).is_array() {
+                check_comparable_array_values([lhs.as_ref(), rhs.as_ref()].into_iter(), context)
+            } else {
+                Ok(())
+            }
+        }
         // Compiled as `lhs >= start AND lhs <= end`.
         Expr::Between {
             lhs, start, end, ..
@@ -785,22 +827,69 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
             let operands =
                 std::iter::once(lhs.as_ref()).chain(rhs.iter().map(|item| item.as_ref()));
             common_type_ordering(operands.map(|expr| (expr, context)))?;
+            check_in_list_comparable(lhs, rhs, context)?;
             Ok(())
         }
-        // Compiled as `base = when` for each WHEN.
+        // Compiled as `base = when` for each WHEN, and the values of the THENs and
+        // the ELSE are the one result.
         Expr::Case {
-            base: Some(base),
+            base,
             when_then_pairs,
-            ..
-        } => when_then_pairs
-            .iter()
-            .try_for_each(|(when, _)| check_comparison(base, when, context)),
+            else_expr,
+        } => {
+            if let Some(base) = base {
+                when_then_pairs
+                    .iter()
+                    .try_for_each(|(when, _)| check_comparison(base, when, context))?;
+            }
+            let results = when_then_pairs
+                .iter()
+                .map(|(_, then)| then.as_ref())
+                .chain(else_expr.as_deref());
+            check_comparable_results(results, context)
+        }
         Expr::FunctionCall { name, args, .. } => {
             let func = context
                 .catalog()
                 .resolve_function(name.as_str(), args.len())?;
-            if func.is_some_and(|func| func.needs_collation()) {
+            let needs_collation = func.as_ref().is_some_and(|func| func.needs_collation());
+            if needs_collation {
+                check_comparable_results(args.iter().map(|arg| arg.as_ref()), context)?;
                 common_type_ordering(args.iter().map(|arg| (arg.as_ref(), context)))?;
+            }
+            if func
+                .as_ref()
+                .is_some_and(|func| func.compares_or_combines_array_elements())
+            {
+                check_comparable_array_values(args.iter().map(|arg| arg.as_ref()), context)?;
+            }
+            // The result is one of these arguments, so they have one type. A function
+            // that needs a collation, such as min and max, was checked above.
+            match func.as_ref().map(|func| func.result_type()) {
+                Some(ResultType::OneOfTheArguments) if !needs_collation => {
+                    check_comparable_results(args.iter().map(|arg| arg.as_ref()), context)?;
+                }
+                Some(ResultType::OneOfTheIifValues) => {
+                    check_comparable_results(iif_values(args).map(|arg| arg.as_ref()), context)?;
+                }
+                Some(ResultType::OneOfTheFirstAndThirdArguments) => {
+                    check_comparable_results(
+                        first_and_third_arguments(args).map(|arg| arg.as_ref()),
+                        context,
+                    )?;
+                }
+                Some(
+                    ResultType::OneOfTheArguments
+                    | ResultType::Declared(_)
+                    | ResultType::FirstArgument
+                    | ResultType::NumberOfTheFirstArgumentsType
+                    | ResultType::AbsOfTheFirstArgument
+                    | ResultType::RealForARealArgument
+                    | ResultType::TextOrBlobLikeTheFirstArgument
+                    | ResultType::ElementOfTheFirstArgument
+                    | ResultType::Unknown,
+                )
+                | None => {}
             }
             Ok(())
         }
@@ -810,7 +899,6 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
         Expr::InSelect { .. } | Expr::InTable { .. } | Expr::SubqueryResult { .. } => Ok(()),
         // These compare nothing with a collation.
         Expr::Binary(..)
-        | Expr::Case { base: None, .. }
         | Expr::Cast { .. }
         | Expr::Column { .. }
         | Expr::Default
@@ -853,6 +941,7 @@ fn check_comparison(lhs: &Expr, rhs: &Expr, context: &ExprContext<'_, '_>) -> Re
         }
         return Ok(());
     }
+    check_comparable_exprs(lhs, context, rhs, context)?;
     common_type_ordering([(lhs, context), (rhs, context)])?;
     Ok(())
 }
@@ -884,6 +973,138 @@ fn check_type_accepts_collate(ty: &ExprType, schema: &Schema) -> Result<()> {
     Err(LimboError::ParseError(format!(
         "collations are not supported by type {ty}"
     )))
+}
+
+/// FIXME(pg-catalog): This decides from the stored forms of two types whether they compare, in place of looking up a pg_operator entry for the pair, so it refuses comparisons that PostgreSQL runs: pg_operator has `=` and `<` for timestamp with timestamptz and for date with either. A lookup in pg_operator, with pg_cast for implicit coercion, replaces this.
+/// The one decision that two values of different custom types do not compare.
+/// A domain compares as the type it is declared on, so two domains over one
+/// type, or a domain and its base, compare as that type does. After that,
+/// two different types compare when neither changes the values it stores (a
+/// STRUCT or UNION, a type with ENCODE or a DECODE; varchar(n) and
+/// smallint do not), or when their types already have one order in common,
+/// as `numeric` and `bigint` do. Any other pair, such as `timestamp` with
+/// `timestamptz` or `timestamptz` with `varchar(n)`, is refused, because one
+/// stored form is not the other's and no rule converts one into the other, so
+/// comparing the stored forms would give wrong answers. Every place that picks
+/// the collation of a comparison calls this, so a comparison turned into an
+/// index seek, a hash join key or an ephemeral index key is refused like the
+/// one compiled as written. A custom type compared with a built-in type or an
+/// untyped literal is not checked here.
+fn check_comparable(a: &ExprType, b: &ExprType, schema: &Schema) -> Result<()> {
+    // Two arrays compare element by element, so their elements must compare.
+    if let (ExprType::Array { element: x, .. }, ExprType::Array { element: y, .. }) = (a, b) {
+        return check_comparable(x, y, schema).map_err(|_| cannot_compare(a, b));
+    }
+    let (ExprType::Custom { type_def: x, .. }, ExprType::Custom { type_def: y, .. }) = (a, b)
+    else {
+        return Ok(());
+    };
+    let (Some(x), Some(y)) = (schema.without_domains(x)?, schema.without_domains(y)?) else {
+        return Ok(());
+    };
+    if same_type_def(&x, &y) || !(x.changes_stored_value() || y.changes_stored_value()) {
+        return Ok(());
+    }
+    // The orders of the types themselves, not of their bases: a domain over
+    // numeric has the order of numeric, and common_ordering follows domains.
+    if common_ordering(&[a.clone(), b.clone()], schema, false)?.is_some() {
+        return Ok(());
+    }
+    Err(cannot_compare(a, b))
+}
+
+/// [check_comparable] for the types of `lhs` and `rhs`.
+fn check_comparable_exprs(
+    lhs: &Expr,
+    lhs_context: &ExprContext<'_, '_>,
+    rhs: &Expr,
+    rhs_context: &ExprContext<'_, '_>,
+) -> Result<()> {
+    check_comparable(
+        &type_of(lhs, &lhs_context.type_env()),
+        &type_of(rhs, &rhs_context.type_env()),
+        lhs_context.schema(),
+    )
+}
+
+/// [check_comparable] for `lhs` compared with each item of `x IN (items)`.
+fn check_in_list_comparable(
+    lhs: &Expr,
+    items: &[Box<Expr>],
+    context: &ExprContext<'_, '_>,
+) -> Result<()> {
+    let env = context.type_env();
+    let lhs_type = type_of(lhs, &env);
+    items
+        .iter()
+        .try_for_each(|item| check_comparable(&lhs_type, &type_of(item, &env), context.schema()))
+}
+
+/// [check_comparable] for every pair of `exprs`, which are compared with each
+/// other (`min`, `nullif`) or are the possible results of one expression
+/// (CASE, `coalesce`), so they have one type.
+pub(crate) fn check_comparable_results<'a>(
+    exprs: impl Iterator<Item = &'a Expr>,
+    context: &ExprContext<'_, '_>,
+) -> Result<()> {
+    let env = context.type_env();
+    check_comparable_types(exprs.map(|expr| (type_of(expr, &env), context.schema())))
+}
+
+/// [check_comparable] for every pair of the values of `args`, the arguments
+/// of a function or operator that compares or combines array elements: the
+/// value of an array argument is its element. Arguments that are not values,
+/// such as the index of `array_set_element(a, 1, x)`, have built-in types,
+/// which compare with any type.
+fn check_comparable_array_values<'a>(
+    args: impl Iterator<Item = &'a Expr>,
+    context: &ExprContext<'_, '_>,
+) -> Result<()> {
+    let env = context.type_env();
+    check_comparable_types(args.map(|arg| {
+        let value_type = match type_of(arg, &env) {
+            ExprType::Array { element, .. } => *element,
+            ty => ty,
+        };
+        (value_type, context.schema())
+    }))
+}
+
+/// [check_comparable] for every pair of `types`. This is the one place that
+/// checks the types a result is made of: [first_collation] calls it for the
+/// column of a compound SELECT or recursive CTE, and the check of an
+/// expression calls it for the arms of a CASE and the arguments of a function
+/// that returns one of them.
+fn check_comparable_types<'s>(types: impl Iterator<Item = (ExprType, &'s Schema)>) -> Result<()> {
+    // Different custom types are few, so keep one type of each name.
+    let mut seen: SmallVec<[ExprType; 2]> = SmallVec::new();
+    for (ty, schema) in types {
+        // An array is checked against arrays through its element type.
+        let Some(type_def) = custom_type_of(&ty) else {
+            continue;
+        };
+        let is_new = seen.iter().all(|other| {
+            std::mem::discriminant(other) != std::mem::discriminant(&ty)
+                || custom_type_of(other).is_none_or(|other| !same_type_def(other, type_def))
+        });
+        if !is_new {
+            continue;
+        }
+        for other in &seen {
+            check_comparable(other, &ty, schema)?;
+        }
+        seen.push(ty);
+    }
+    Ok(())
+}
+
+/// The custom type of `ty`, or of the elements of an array of it.
+fn custom_type_of(ty: &ExprType) -> Option<&Arc<TypeDef>> {
+    match ty {
+        ExprType::Custom { type_def, .. } => Some(type_def),
+        ExprType::Array { element, .. } => custom_type_of(element),
+        _ => None,
+    }
 }
 
 fn cannot_compare(a: &ExprType, b: &ExprType) -> LimboError {
@@ -1089,7 +1310,7 @@ mod tests {
     use crate::namespace::NamespaceRef;
     use crate::{sync::Arc, MAIN_DB_ID};
 
-    use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
+    use crate::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
 
     use crate::{
         schema::{BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Table, Type},
@@ -1262,7 +1483,7 @@ mod tests {
         assert_eq!(collseq_plus, Some(TextCollation::NoCase));
 
         // CAST(column AS TEXT)
-        let cast_ty = Some(turso_parser::ast::Type {
+        let cast_ty = Some(crate::ast::Type {
             name: "TEXT".to_string(),
             size: None,
             array_dimensions: 0,
@@ -1463,7 +1684,7 @@ mod tests {
             })],
             order_by: std::vec![],
             within_group: std::vec![],
-            filter_over: turso_parser::ast::FunctionTail {
+            filter_over: crate::ast::FunctionTail {
                 filter_clause: None,
                 over_clause: None,
             },
@@ -1710,7 +1931,7 @@ mod tests {
     fn get_table_references_single_table_rowid_alias_with_collation(
         collation: Option<TextCollation>,
     ) -> TableReferences {
-        use turso_parser::ast::SortOrder;
+        use crate::ast::SortOrder;
         let mut table_references = TableReferences::new_empty();
         let columns = vec![Column::new(
             Some("id".to_string()),

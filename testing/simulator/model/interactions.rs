@@ -12,6 +12,7 @@ use turso_sqlite::SqliteDialect;
 use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use sql_generation::model::query::pragma::Pragma;
 use sql_generation::model::table::SimValue;
 use turso_core::{ConnectOpts, Connection, Result, StepResult};
 
@@ -867,13 +868,47 @@ impl InteractionType {
                 })
                 .collect();
 
+            // An MVCC checkpoint does all its I/O in one step: it writes the
+            // WAL, then the database file, and then it truncates the logical
+            // log. A fault on all files stops it at its first WAL write. Thus a
+            // faulty MVCC checkpoint puts the fault on one random file of the
+            // main database, or on all of them, so that a fault can hit each of
+            // these operations. The fault is on at every step, because a fault
+            // at the first step has only the chance `current_prob`.
+            let main_db_name = env
+                .get_db_path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let main_wal_name = format!("{main_db_name}-wal");
+            let main_log_name = format!("{main_db_name}-log");
+            let checkpoint_fault_pairs: Option<Vec<(&str, bool)>> = (env.profile.mvcc
+                && matches!(query, Query::Pragma(Pragma::WalCheckpoint { .. })))
+            .then(|| {
+                // `inject_fault_selective` uses the first pair whose name is in
+                // the path of a file. The name of the database file is also in
+                // the paths of the WAL and the log, so their names come first.
+                let (db, wal, log) = (&*main_db_name, &*main_wal_name, &*main_log_name);
+                match env.rng.random_range(0..4) {
+                    0 => vec![(db, true)],
+                    1 => vec![(wal, false), (log, false), (db, true)],
+                    2 => vec![(wal, true), (db, false)],
+                    _ => vec![(log, true), (db, false)],
+                }
+            });
+
             loop {
                 let syncing = env.io.syncing();
 
                 // Decide faults independently per database
                 let main_fault = env.rng.random_bool(current_prob);
                 let aux_prob = (current_prob * 0.5).min(1.0);
-                let mut fault_pairs: Vec<(&str, bool)> = vec![(&main_db_stem, main_fault)];
+                let mut fault_pairs: Vec<(&str, bool)> = match &checkpoint_fault_pairs {
+                    Some(pairs) => pairs.clone(),
+                    None => vec![(&main_db_stem, main_fault)],
+                };
                 for (_, stem) in &aux_db_stems {
                     let aux_fault = env.rng.random_bool(aux_prob);
                     fault_pairs.push((stem, aux_fault));

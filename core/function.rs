@@ -694,8 +694,8 @@ impl WindowFunc {
     ///
     /// This is taken from SQLite's `sqlite3WindowUpdate` table at `window.c:699-708`.
     pub fn coerced_frame(&self) -> Option<crate::translate::plan::Frame> {
+        use crate::ast::{Expr, FrameBound, FrameMode, Literal};
         use crate::translate::plan::Frame;
-        use turso_parser::ast::{Expr, FrameBound, FrameMode, Literal};
         match self {
             // Lag shares row_number's streaming frame even though its lookup
             // can point forward (negative offset): SQLite emits a row as soon
@@ -1344,6 +1344,136 @@ impl ScalarFunc {
         }
     }
 
+    /// Whether the function compares the elements of its array arguments
+    /// with each other or with its other arguments, as `array_position(a, x)`
+    /// does, or makes its arguments and their elements the elements of one
+    /// array, as `ARRAY[x, y]` and `array_append(a, x)` do. Then those values
+    /// must compare. A function that turns its arguments into text, such as
+    /// `concat`, compares nothing.
+    pub fn compares_or_combines_array_elements(&self) -> bool {
+        match self {
+            Self::Array
+            | Self::ArraySetElement
+            | Self::ArrayAppend
+            | Self::ArrayPrepend
+            | Self::ArrayCat
+            | Self::ArrayRemove
+            | Self::ArrayContains
+            | Self::ArrayPosition
+            | Self::ArrayOverlap
+            | Self::ArrayContainsAll => true,
+            Self::Cast
+            | Self::Changes
+            | Self::Char
+            | Self::Coalesce
+            | Self::Concat
+            | Self::ConcatWs
+            | Self::Glob
+            | Self::IfNull
+            | Self::Iif
+            | Self::Instr
+            | Self::Like
+            | Self::Abs
+            | Self::Upper
+            | Self::Lower
+            | Self::Random
+            | Self::RandomBlob
+            | Self::Trim
+            | Self::LTrim
+            | Self::RTrim
+            | Self::Round
+            | Self::Length
+            | Self::OctetLength
+            | Self::Min
+            | Self::Max
+            | Self::Nullif
+            | Self::Sign
+            | Self::Substr
+            | Self::Substring
+            | Self::Soundex
+            | Self::Date
+            | Self::Time
+            | Self::TotalChanges
+            | Self::DateTime
+            | Self::Subtype
+            | Self::Typeof
+            | Self::Unicode
+            | Self::Unistr
+            | Self::UnistrQuote
+            | Self::Quote
+            | Self::SqliteVersion
+            | Self::TursoVersion
+            | Self::SqliteSourceId
+            | Self::UnixEpoch
+            | Self::JulianDay
+            | Self::Hex
+            | Self::Unhex
+            | Self::GetByte
+            | Self::SetByte
+            | Self::ZeroBlob
+            | Self::LastInsertRowid
+            | Self::Replace
+            | Self::StrfTime
+            | Self::Printf
+            | Self::Likely
+            | Self::TimeDiff
+            | Self::Likelihood
+            | Self::TableColumnsJsonArray
+            | Self::BinRecordJsonObject
+            | Self::Attach
+            | Self::Detach
+            | Self::Unlikely
+            | Self::StatInit
+            | Self::StatPush
+            | Self::StatGet
+            | Self::ConnTxnId
+            | Self::IsAutocommit
+            | Self::SequenceWatermark
+            | Self::TestUintEncode
+            | Self::TestUintDecode
+            | Self::StringReverse
+            | Self::Gcd
+            | Self::Lcm
+            | Self::Repeat
+            | Self::Lpad
+            | Self::Rpad
+            | Self::BooleanToInt
+            | Self::IntToBoolean
+            | Self::ValidateIpAddr
+            | Self::TemporalEncode
+            | Self::NumericEncode
+            | Self::NumericFit
+            | Self::NumericDecode
+            | Self::NumericAdd
+            | Self::NumericSub
+            | Self::NumericMul
+            | Self::NumericDiv
+            | Self::NumericMod
+            | Self::NumericNeg
+            | Self::DatePlus
+            | Self::DateMinus
+            | Self::DateDiff
+            | Self::ArrayElement
+            | Self::ArrayLength
+            | Self::ArraySlice
+            | Self::StringToArray
+            | Self::ArrayToString
+            | Self::StructPack
+            | Self::StructExtractFunc
+            | Self::UnionValueFunc
+            | Self::UnionTagFunc
+            | Self::UnionExtractFunc
+            | Self::NextVal
+            | Self::CurrVal
+            | Self::SetVal => false,
+            #[cfg(feature = "fs")]
+            #[cfg(not(target_family = "wasm"))]
+            Self::LoadExtension => false,
+            #[cfg(feature = "test_helper")]
+            Self::TestNondetCounter => false,
+        }
+    }
+
     pub fn is_date_time_function(&self) -> bool {
         matches!(
             self,
@@ -1916,6 +2046,10 @@ pub enum ResultType {
     /// argument from the second on, and the last one when there is an odd
     /// number of arguments. The conditions are never returned.
     OneOfTheIifValues,
+    /// One of the first and the third argument, unchanged: `lag(x, n, default)`
+    /// and `lead(x, n, default)` return the value of x in another row, or the
+    /// default. The second argument is an offset and is never returned.
+    OneOfTheFirstAndThirdArguments,
     /// A number that keeps the type of a numeric first argument: `ceil(5)` is
     /// an integer, `ceil(5.5)` a real. A text argument is first converted to a
     /// number, so `ceil('3')` is an integer.
@@ -1955,6 +2089,9 @@ impl Func {
             Self::Vector(func) => declared(func.return_type()),
             Self::External(func) => declared(func.func.return_type()),
             Self::Agg(AggFunc::Min | AggFunc::Max) => ResultType::OneOfTheArguments,
+            Self::Window(WindowFunc::Lag | WindowFunc::Lead) => {
+                ResultType::OneOfTheFirstAndThirdArguments
+            }
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
             Self::Fts(_) => ResultType::Unknown,
             Self::Agg(_) | Self::Window(_) | Self::AlterTable(_) | Self::Dialect(_) => {
@@ -1980,6 +2117,25 @@ impl Func {
             self,
             Self::Scalar(ScalarFunc::Min | ScalarFunc::Max | ScalarFunc::Nullif)
         )
+    }
+
+    /// [ScalarFunc::compares_or_combines_array_elements] for any function.
+    /// The other kinds of function take no array to compare or combine.
+    pub fn compares_or_combines_array_elements(&self) -> bool {
+        match self {
+            Self::Scalar(func) => func.compares_or_combines_array_elements(),
+            Self::Agg(_)
+            | Self::Window(_)
+            | Self::Math(_)
+            | Self::Vector(_)
+            | Self::AlterTable(_)
+            | Self::External(_)
+            | Self::Dialect(_) => false,
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            Self::Fts(_) => false,
+            #[cfg(feature = "json")]
+            Self::Json(_) => false,
+        }
     }
 
     /// Whether the function is an aggregate, built in or from an extension.

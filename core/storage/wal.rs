@@ -6004,6 +6004,10 @@ impl WalFileShared {
     }
 
     pub fn new_noop() -> Arc<RwLock<WalFileShared>> {
+        Arc::new(RwLock::new(Self::new_noop_state()))
+    }
+
+    pub(crate) fn new_noop_state() -> Self {
         let wal_header = WalHeader::new();
         let read_locks = array::from_fn(|_| TursoRwLock::new());
         for (i, lock) in read_locks.iter().enumerate() {
@@ -6011,7 +6015,7 @@ impl WalFileShared {
             lock.set_value_exclusive(if i < 2 { 0 } else { READMARK_NOT_USED });
             lock.unlock();
         }
-        let shared = WalFileShared {
+        Self {
             metadata: WalSharedMetadata {
                 enabled: AtomicBool::new(false),
                 wal_header: Arc::new(SpinLock::new(wal_header)),
@@ -6039,8 +6043,7 @@ impl WalFileShared {
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
-        };
-        Arc::new(RwLock::new(shared))
+        }
     }
 
     #[cfg(test)]
@@ -6148,6 +6151,13 @@ impl WalFileShared {
         self.metadata = restored.metadata;
         self.runtime.frame_cache = restored.runtime.frame_cache;
         self.runtime.file = restored.runtime.file;
+        self.runtime.frame_cache_high_water.store(
+            restored
+                .runtime
+                .frame_cache_high_water
+                .load(Ordering::Acquire),
+            Ordering::Release,
+        );
         self.runtime.epoch.store(
             restored.runtime.epoch.load(Ordering::Acquire),
             Ordering::Release,
@@ -6307,6 +6317,7 @@ pub mod test {
     fn replace_after_external_restore_preserves_lock_identity() {
         let shared = WalFileShared::new_noop();
         let restored = WalFileShared::new_noop();
+        let old_cache = Arc::downgrade(&shared.read().runtime.frame_cache);
 
         let read_lock_ptrs = {
             let shared = shared.read();
@@ -6326,19 +6337,29 @@ pub mod test {
         {
             let restored = restored.read();
             restored.metadata.max_frame.store(42, Ordering::Release);
+            restored
+                .runtime
+                .frame_cache_high_water
+                .store(42, Ordering::Release);
             assert!(restored.runtime.read_locks[1].write());
             restored.runtime.read_locks[1].set_value_exclusive(99);
             restored.runtime.read_locks[1].unlock();
         }
 
-        let restored = match Arc::try_unwrap(restored) {
-            Ok(restored) => restored.into_inner(),
-            Err(_) => panic!("restored WAL test state should not be shared"),
-        };
-        shared.write().replace_after_external_restore(restored);
+        let restored_state =
+            std::mem::replace(&mut *restored.write(), WalFileShared::new_noop_state());
+        shared
+            .write()
+            .replace_after_external_restore(restored_state);
+        assert!(old_cache.upgrade().is_none());
 
         let shared = shared.read();
         assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 42);
+        let high_water = shared
+            .runtime
+            .frame_cache_high_water
+            .load(Ordering::Acquire);
+        assert_eq!(high_water, 42);
         assert_eq!(shared.runtime.read_locks[1].get_value(), 7);
         for (idx, lock) in shared.runtime.read_locks.iter().enumerate() {
             assert_eq!(std::ptr::from_ref(lock), read_lock_ptrs[idx]);

@@ -7,7 +7,7 @@ This document is a quick helper to get you going.
 <!--toc:start-->
 - [Contributing to Turso](#contributing-to-turso)
   - [Getting Started](#getting-started)
-    - [Configuring `mold` Linker](#configuring-mold-linker)
+    - [Linker](#linker)
     - [Running Tests On Linux](#running-tests-on-linux)
   - [Developing with AI coding agents](#developing-with-ai-coding-agents)
   - [Debugging bugs](#debugging-bugs)
@@ -92,11 +92,14 @@ cargo build -p turso_sqlite3 --features capi
 cargo test
 ```
 
-### Configuring `mold` Linker
+### Linker
 
-The `mold` linker (Linux only) can reduce your build time from a minute to just few seconds.
+On x86_64 Linux, `.cargo/config.toml` sets `scripts/link-with-rust-lld.sh` as the linker.
+The script links with the LLD linker that comes with the Rust toolchain, so you do not need
+to install a linker. On a machine with 4 cores, LLD links a debug build of `tursodb` in 1.4
+seconds. GNU ld needs 10 seconds.
 
-First, install `mold`:
+To use the `mold` linker, install it:
 
 ```console
 # Fedora/RHEL
@@ -106,15 +109,13 @@ sudo dnf install mold
 sudo apt install mold
 ```
 
-Then configure Cargo to use mold by creating `.cargo/config.toml`:
+Then add this line to your shell profile:
 
-**For Linux:**
-
-```toml
-[target.x86_64-unknown-linux-gnu]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```console
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 ```
+
+To use the default linker of your C compiler, set `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc`.
 
 ### Running Tests On Linux
 
@@ -254,8 +255,6 @@ Do not add a trailing period. Conventional Commit prefixes such as
 
 <non-obvious implementation details or tradeoffs, if needed>
 
-Tests: <relevant validation, if useful>
-
 Fixes #1234
 ```
 
@@ -269,14 +268,12 @@ replacement row, leaving stale physical B-tree state after checkpoint.
 
 Keep B-tree-resident delete markers when collapsing adjacent versions.
 
-Tests: added an update/reopen/delete/checkpoint regression test
-
 Fixes #1234
 ```
 
 The body should explain the intent and why the change is needed, rather than
 narrating the diff. Include non-obvious implementation details and tradeoffs
-that will matter to reviewers or future maintainers. The body, test summary,
+that will matter to reviewers or future maintainers. The body,
 and issue reference are optional when they do not add useful information.
 
 To produce pull requests like this, you should learn how to use Git's interactive rebase (`git rebase -i`).
@@ -360,6 +357,10 @@ The `simulator` directory contains a deterministic simulator for testing.
 What this means is that the behavior of a test run is deterministic based on the seed value.
 If the simulator catches a bug, you can always reproduce the exact same sequence of events by passing the same seed.
 The simulator also performs fault injection to discover interesting bugs.
+
+To give each run a different mix of statements, properties, faults, and connections, add `--swarm`.
+The seed also picks these settings, so `--seed 1234` repeats a swarm run.
+See [the simulator README](testing/simulator/README.md#swarm-testing).
 
 ### Whopper
 

@@ -1,6 +1,7 @@
 use super::binding::{remap_bound_expr, seed_ephemeral_stream_cache, stream_table_references};
 use super::output::{EmittedNodeOutput, NodeOutputContract};
 use super::stream::{emit_ephemeral_delta_row, open_ephemeral_delta, EphemeralDelta};
+use crate::ast;
 use crate::incremental::dag;
 use crate::schema::Schema;
 use crate::security::roles::RoleId;
@@ -14,7 +15,6 @@ use crate::turso_assert;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::{to_u32, InsertFlags, Insn};
 use crate::{Connection, LimboError, Result};
-use turso_parser::ast;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_filter(

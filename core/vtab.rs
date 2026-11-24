@@ -1,4 +1,5 @@
 use crate::alloc::{TryClone, TursoAllocExt, TursoTryWithCapacityExt, TursoVecExt};
+use crate::ast;
 use crate::pragma::{PragmaVirtualTable, PragmaVirtualTableCursor};
 use crate::schema::{Column, FromDefinitionFlags};
 use crate::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
@@ -9,7 +10,6 @@ use crate::{Connection, IOResult, LimboError, SymbolTable, Value};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
-use turso_parser::ast;
 
 #[derive(Debug, Clone)]
 pub(crate) enum VirtualTableType {
@@ -331,7 +331,7 @@ impl VirtualTableCursor {
     pub(crate) fn next(&mut self) -> IOResultOr<bool> {
         self.null_flag = false;
         let result = match &mut self.inner {
-            VirtualTableCursorInner::Pragma(cursor) => cursor.next(),
+            VirtualTableCursorInner::Pragma(cursor) => return cursor.next().map_err(Into::into),
             VirtualTableCursorInner::External(cursor) => return cursor.next(),
             VirtualTableCursorInner::Internal(cursor) => cursor.write().next(),
         };
@@ -416,7 +416,11 @@ impl VirtualTableCursor {
     ) -> IOResultOr<bool> {
         self.null_flag = false;
         let result = match &mut self.inner {
-            VirtualTableCursorInner::Pragma(cursor) => cursor.filter(copy_values(arg_registers)?),
+            VirtualTableCursorInner::Pragma(cursor) => {
+                return cursor
+                    .filter(copy_values(arg_registers)?)
+                    .map_err(Into::into);
+            }
             VirtualTableCursorInner::External(cursor) => {
                 let arg_count = arg_registers.len();
                 return cursor.filter(idx_num, idx_str, arg_count, copy_values(arg_registers)?);

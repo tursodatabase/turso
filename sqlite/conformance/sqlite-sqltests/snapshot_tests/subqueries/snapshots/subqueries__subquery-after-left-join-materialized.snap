@@ -1,0 +1,148 @@
+---
+source: subqueries.sqltest
+expression: |-
+  SELECT count(*)
+      FROM watchlist w
+      LEFT JOIN history_txt t ON t.price = w.type_id
+      JOIN (
+          SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id
+      ) h ON w.name > h.avgp;
+info:
+  statement_type: SELECT
+  tables:
+  - history_txt
+  - t.price
+  - w.name
+  - watchlist
+  setup_blocks:
+  - watchlist_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--HASH JOIN history_txt AS t
+|--SCAN h
+|  |--SCAN history_txt
+|  `--USE SORTER FOR GROUP BY
+`--SCAN watchlist AS w
+
+BYTECODE
+addr  opcode              p1   p2   p3  p4                                          p5  comment
+   0  Init                 0  116    0                                               0  Start at 116
+   1  Gosub                3    3    0                                               0
+   2  Goto                 0   50    0                                               0
+   3  Once                49    0    0                                               0  goto 49
+   4  OpenEphemeral        0    1    0                                               0  cursor=0 is_table=true
+   5  Null                 0   11    0                                               0  r[11]=NULL
+   6  SorterOpen           1    2    0  k(1,B)                                       0  cursor=1
+   7  Integer              0    8    0                                               0  r[8]=0; clear group by abort flag
+   8  Null                 0    9    0                                               0  r[9]=NULL; initialize group by comparison registers to NULL
+   9  Gosub               15   46    0                                               0  ; go to clear accumulator subroutine
+  10  OpenRead             3    3    0  k(3,B,B)                                     0  table=history_txt, root=3, iDb=0
+  11  Rewind               3   17    0                                               0  Rewind table history_txt
+  12    ColumnRange        3    0   13  2                                            0  r[13..14]=history_txt.type_id..price
+  13    RealAffinity      14    0    0                                               0
+  14    MakeRecord        13    2   12                                               0  r[12]=mkrec(r[13..14])
+  15    SorterInsert       1   12    0  0                                            0  key=r[12]
+  16  Next                 3   12    0                                               1
+  17  OpenPseudo           2   12    2                                               0  2 columns in r[12]
+  18  SorterSort           1   33    0                                               0
+  19    SorterData         1   12    2                                               0  r[12]=data
+  20    Column             2    0   16                                               0  r[16]=pseudo.column 0
+  21    Compare            9   16    1  k(1, Binary)                                 0  r[9..9]==r[16..16]
+  22    Jump              23   27   23                                               0  ; start new group if comparison is not equal
+  23    Gosub              6   37    0                                               0  ; check if ended group had data, and output if so
+  24    Move              16    9    1                                               0  r[9..9]=r[16..16]
+  25    IfPos              8   49    0                                               0  r[8]>0 -> r[8]-=0, goto 49; check abort flag
+  26    Gosub             15   46    0                                               0  ; goto clear accumulator subroutine
+  27    Column             2    1   17                                               0  r[17]=pseudo.column 1
+  28    AggStep            0   17   11  avg                                          0  accum=r[11] step(r[17])
+  29    If                 7   31    0                                               0  if r[7] goto 31; don't emit group columns if continuing existing group
+  30    Column             2    0   10                                               0  r[10]=pseudo.column 0
+  31    Integer            1    7    0                                               0  r[7]=1; indicate data in accumulator
+  32  SorterNext           1   19    0                                               0
+  33  Gosub                6   37    0                                               0  ; emit row for final group
+  34  Goto                 0   49    0                                               0  ; group by finished
+  35  Integer              1    8    0                                               0  r[8]=1
+  36  Return               6    0    0                                               0
+  37  IfPos                7   39    0                                               0  r[7]>0 -> r[7]-=0, goto 39; output group by row subroutine start
+  38  Return               6    0    0                                               0
+  39  AggFinal             0   11    0  avg                                          0  accum=r[11]
+  40  Copy                10    4    0                                               0  r[4]=r[10]
+  41  Copy                11    5    0                                               0  r[5]=r[11]
+  42  MakeRecord           4    2   18                                               0  r[18]=mkrec(r[4..5]); for
+  43  NewRowid             0   19    0                                               0  r[19]=rowid
+  44  Insert               0   18   19                                               4  intkey=r[19] data=r[18]
+  45  Return               6    0    0                                               0
+  46  Null                 0   10   11                                               0  r[10..11]=NULL; clear accumulator subroutine start
+  47  Integer              0    7    0                                               0  r[7]=0
+  48  Return              15    0    0                                               0
+  49  Return               3    0    0                                               0
+  50  Null                 0   21    0                                               0  r[21]=NULL
+  51  OpenRead             4    2    0  k(2,B,B)                                     0  table=watchlist, root=2, iDb=0
+  52  OpenRead             5    3    0  k(3,B,B)                                     0  table=history_txt, root=3, iDb=0
+  53  Integer              0   22    0                                               0  r[22]=0
+  54  Once                64    0    0                                               0  goto 64
+  55  OpenRead             6    2    0  k(2,B,B)                                     0  table=watchlist, root=2, iDb=0
+  56  Rewind               6   63    0                                               0  Rewind table watchlist
+  57    RowId              6   23    0                                               0  r[23]=watchlist.rowid
+  58    Affinity          23    1    0                                               0  r[23..24] = C
+  59    RowId              6   24    0                                               0  r[24]=watchlist.rowid
+  60    Column             6    1   25                                               0  r[25]=watchlist.name
+  61    HashBuild          6   23    1  r=[1] budget=67108864 payload=r[24]..r[25]   0
+  62  Next                 6   57    0                                               0
+  63  HashBuildFinalize    1    0    0                                               0
+  64  HashProbeInit        1    0    0                                               0
+  65  Rewind               5   87    0                                               0  Rewind table history_txt
+  66    Column             5    1   26                                               0  r[26]=history_txt.price
+  67    RealAffinity      26    0    0                                               0
+  68    Affinity          26    1    0                                               0  r[26..27] = C
+  69    RowId              5   29    0                                               0  r[29]=history_txt.rowid
+  70    Integer            0   30    0                                               0  r[30]=0
+  71    HashProbe          1   26    1  r[31]=86 payload=r[27]..r[28]                0
+  72    HashMarkMatched    1    0    0                                               0
+  73    Gosub             32   75    0                                               0
+  74    Goto               0   83    0                                               0
+  75    Rewind             0   82    0                                               0  Rewind  ephemeral()
+  76      Column           0    1    2                                               0  r[2]=ephemeral().avgp
+  77      Copy            28   34    0                                               0  r[34]=r[28]
+  78      Copy             2   35    0                                               0  r[35]=r[2]
+  79      Le              34   35   81  Binary                                       0  if r[34]<=r[35] goto 81
+  80      AggStep          0   36   21  count                                        0  accum=r[21] step(r[36])
+  81    Next               0   76    0                                               0
+  82    Return            32    0    0                                               0
+  83    IfPos             30  100    0                                               0  r[30]>0 -> r[30]-=0, goto 100
+  84    HashNext           1   31   86   payload=r[27]..r[28]                        0
+  85    Goto               0   72    0                                               0
+  86  Next                 5   66    0                                               0
+  87  NullRow              5    0    0                                               0  Set cursor 5 to a (pseudo) NULL row
+  88  HashScanUnmatched    1   31   93                                               0  hash_table_id=1 payload=r[27]..r[28]
+  89  SeekRowid            4   31   93                                               0  if (r[31]!=cursor 4 for table watchlist.rowid) goto 93
+  90  Gosub               32   75    0                                               0
+  91  HashNextUnmatched    1   31   93                                               0  hash_table_id=1 payload=r[27]..r[28]
+  92  Goto                 0   89    0                                               0
+  93  HashGraceInit        1    0  111                                               0  hash_table_id=1
+  94  Integer              1   30    0                                               0  r[30]=1
+  95  HashGraceLoadPart    1    0  110                                               0  hash_table_id=1
+  96  HashGraceNextProbe   1   26  102                                               0  hash_table_id=1 keys=r[26]..r[26] probe_rowid_dest=r[29]
+  97  SeekRowid            5   29   96                                               0  if (r[29]!=cursor 5 for table history_txt.rowid) goto 96
+  98  HashProbe            1   26    1  r[31]=96 payload=r[27]..r[28]                0
+  99  Goto                 0   72    0                                               0
+ 100  HashNext             1   31   96   payload=r[27]..r[28]                        0
+ 101  Goto                 0   72    0                                               0
+ 102  NullRow              5    0    0                                               0  Set cursor 5 to a (pseudo) NULL row
+ 103  HashScanUnmatched    1   31  108                                               0  hash_table_id=1 payload=r[27]..r[28]
+ 104  SeekRowid            4   31  108                                               0  if (r[31]!=cursor 4 for table watchlist.rowid) goto 108
+ 105  Gosub               32   75    0                                               0
+ 106  HashNextUnmatched    1   31  108                                               0  hash_table_id=1 payload=r[27]..r[28]
+ 107  Goto                 0  104    0                                               0
+ 108  HashGraceAdvPart     1    0  110                                               0  hash_table_id=1
+ 109  Goto                 0   95    0                                               0
+ 110  Integer              0   30    0                                               0  r[30]=0
+ 111  HashClose            1    0    0                                               0
+ 112  AggFinal             0   21    0  count                                        0  accum=r[21]
+ 113  Copy                21   20    0                                               0  r[20]=r[21]
+ 114  ResultRow           20    1    0                                               0  output=r[20]
+ 115  Halt                 0    0    0                                               0
+ 116  Transaction          0    1    2                                               0  iDb=0 tx_mode=Read
+ 117  Integer              1   36    0                                               0  r[36]=1
+ 118  Goto                 0    1    0                                               0

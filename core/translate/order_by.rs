@@ -2,7 +2,7 @@ use crate::translate::expr_context::ExprContext;
 use crate::{alloc::TursoVecExt, sync::Arc};
 
 use crate::alloc::*;
-use turso_parser::ast::{self, SortOrder};
+use crate::ast::{self, SortOrder};
 
 use crate::{
     emit_explain,
@@ -92,11 +92,7 @@ impl EmitOrderBy {
         program: &mut ProgramBuilder,
         t_ctx: &mut TranslateCtx,
         result_columns: &[ResultSetColumn],
-        order_by: &[(
-            Box<ast::Expr>,
-            SortOrder,
-            Option<turso_parser::ast::NullsOrder>,
-        )],
+        order_by: &[(Box<ast::Expr>, SortOrder, Option<crate::ast::NullsOrder>)],
         referenced_tables: &TableReferences,
         has_group_by: bool,
         has_distinct: bool,
@@ -367,16 +363,17 @@ impl EmitOrderBy {
                     &plan.table_references,
                     t_ctx.resolver.schema(),
                 ) {
-                    if let Some(decode_expr) = type_def.decode() {
+                    if let Some(decode) = type_def.decode() {
                         let skip_label = program.allocate_label();
                         program.emit_insn(Insn::IsNull {
                             reg,
                             target_pc: skip_label,
                         });
-                        super::expr::emit_type_expr(
+                        super::expr::emit_conversion(
                             program,
-                            decode_expr,
-                            reg,
+                            &type_def,
+                            "DECODE",
+                            decode,
                             reg,
                             &t_ctx.resolver,
                         )?;
@@ -711,11 +708,7 @@ pub struct OrderByRemapping {
 /// If we skip a result column, we need to keep track what index in the ORDER BY sorter the result columns have,
 /// because the result columns should be emitted in the SELECT clause order, not the ORDER BY clause order.
 pub fn order_by_deduplicate_result_columns(
-    order_by: &[(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )],
+    order_by: &[(Box<ast::Expr>, SortOrder, Option<crate::ast::NullsOrder>)],
     result_columns: &[ResultSetColumn],
     has_sequence: bool,
 ) -> Result<Vec<OrderByRemapping>> {

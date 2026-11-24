@@ -1,0 +1,58 @@
+---
+source: subqueries.sqltest
+expression: |-
+  SELECT w.type_id, h.price
+      FROM watchlist w
+      LEFT JOIN (SELECT type_id, price FROM history_txt WHERE price > 10) h ON w.type_id + h.price > 20;
+info:
+  statement_type: SELECT
+  tables:
+  - history_txt
+  - w.type_id
+  - watchlist
+  setup_blocks:
+  - watchlist_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN watchlist AS w
+`--SCAN h LEFT-JOIN
+   `--SCAN history_txt
+
+BYTECODE
+addr  opcode           p1  p2  p3  p4        p5  comment
+   0  Init              0  31   0             0  Start at 31
+   1  InitCoroutine     1  12   2             0
+   2  OpenRead          0   3   0  k(3,B,B)   0  table=history_txt, root=3, iDb=0
+   3  Rewind            0  11   0             0  Rewind table history_txt
+   4    Column          0   1   5             0  r[5]=history_txt.price
+   5    RealAffinity    5   0   0             0
+   6    Le              5   6  10  Binary     0  if r[5]<=r[6] goto 10
+   7    ColumnRange     0   0   2  2          0  r[2..3]=history_txt.type_id..price
+   8    RealAffinity    3   0   0             0
+   9    Yield           1   0   0             0
+  10  Next              0   4   0             1
+  11  EndCoroutine      1   0   0             0
+  12  OpenRead          1   2   0  k(2,B,B)   0  table=watchlist, root=2, iDb=0
+  13  Rewind            1  30   0             0  Rewind table watchlist
+  14    Integer         0   9   0             0  r[9]=0
+  15    InitCoroutine   1   0   2             0
+  16      Yield         1  26   0             0
+  17      RowId         1  12   0             0  r[12]=watchlist.rowid
+  18      Copy          3  13   0             0  r[13]=r[3]
+  19      Add          12  13  11             0  r[11]=r[12]+r[13]
+  20      Le           11  14  25  Binary     0  if r[11]<=r[14] goto 25
+  21      Integer       1   9   0             0  r[9]=1
+  22      RowId         1   7   0             0  r[7]=watchlist.rowid
+  23      Copy          3   8   0             0  r[8]=r[3]
+  24      ResultRow     7   2   0             0  output=r[7..8]
+  25    Goto            0  16   0             0
+  26    IfPos           9  29   0             0  r[9]>0 -> r[9]-=0, goto 29
+  27    Null            0   2   3             0  r[2..3]=NULL
+  28    Goto            0  21   0             0
+  29  Next              1  14   0             1
+  30  Halt              0   0   0             0
+  31  Transaction       0   1   2             0  iDb=0 tx_mode=Read
+  32  Integer          10   6   0             0  r[6]=10
+  33  Integer          20  14   0             0  r[14]=20
+  34  Goto              0   1   0             0

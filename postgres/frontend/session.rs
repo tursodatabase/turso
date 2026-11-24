@@ -15,6 +15,7 @@ use crate::settings::{
     SettingScope,
 };
 use crate::statement::{PgTxState, PostRunFn, StatementResultKind, TxRole};
+use turso_core::ast::{self};
 use turso_core::dialect::Dialect;
 use turso_core::function::Func;
 use turso_core::schema::{Schema, Table};
@@ -23,7 +24,6 @@ use turso_core::{
     Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
 };
 use turso_core::{DependentObject, NamespaceId};
-use turso_parser::ast::{self};
 use turso_pg_parser::foreign_key_tables;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_ACTIVE_SQL_TRANSACTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,

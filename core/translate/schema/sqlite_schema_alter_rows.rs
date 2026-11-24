@@ -1,6 +1,7 @@
 //! Bytecode that rewrites stored rows for `ALTER TABLE`: the rows of
 //! `sqlite_schema`, and the rows of engine tables that name a user table.
 
+use crate::ast;
 use crate::dialect::{AddColumn, AlterColumn, CmdContext, DropColumn, RenameColumn, RenameTable};
 use crate::function::{AlterTableFunc, Func, FuncCtx};
 use crate::namespace::{NamespaceId, NamespaceRef};
@@ -16,7 +17,6 @@ use crate::util::escape_sql_string_literal;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
 use crate::{LimboError, Result, TEMP_DB_ID};
-use turso_parser::ast;
 
 /// Renames a table in every row of `sqlite_schema` of its database, in its
 /// row of `sqlite_sequence`, in the row of its AUTOINCREMENT backing table,

@@ -15,7 +15,7 @@ mod collections;
 pub use allocation_site::{
     current_allocation_site, enter_allocation_site, AllocationSite, AllocationSiteGuard,
     BTreeAllocationSite, FtsAllocationSite, MvStoreAllocationSite, MvccCheckpointAllocationSite,
-    SchemaAllocationSite, ValueBlobAllocationSite, VectorAllocationSite,
+    SchemaAllocationSite, StatementAllocationSite, ValueBlobAllocationSite, VectorAllocationSite,
 };
 /// The underlying allocator trait: `allocator_api2::alloc::Allocator` on
 /// stable, `std::alloc::Allocator` on `--cfg nightly` builds.
@@ -27,7 +27,7 @@ pub(crate) use collections::impl_try_clone_via_clone;
 #[cfg(nightly)]
 pub use collections::TursoFromIteratorIn;
 pub use collections::{
-    DynBoxedSlice, DynVec, TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt,
+    DynBox, DynBoxedSlice, DynVec, TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt,
     TursoFromIterator, TursoHashMapExt, TursoHashSetExt, TursoIteratorExt, TursoNewExt,
     TursoSliceExt, TursoTryNewExt, TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt,
     TursoVecInExt,

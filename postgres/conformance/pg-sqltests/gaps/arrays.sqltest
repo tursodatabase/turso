@@ -1,0 +1,83 @@
+# Known tursopg gaps against PostgreSQL: arrays
+#
+# Each test with a `@compat-gap "<kind>:<object>"` label records a known
+# difference: its default `expect` block is PostgreSQL 18's answer and its
+# `expect @tursopg` block is tursopg's current wrong answer. When tursopg
+# gives the PostgreSQL answer, the tursopg run fails with "gap fixed": then
+# delete only `@compat-gap` and the `expect @tursopg` block, and keep the
+# test.
+#
+# While a query runs, an array is a binary record. tursopg converts it to
+# the text the client sees at the end of every SELECT, including a SELECT
+# inside a subquery or one that feeds CREATE TABLE AS, so the outer query
+# receives text and reads it as no array.
+
+@database :memory:
+
+setup t_arr {
+    CREATE TABLE t (id int, a int[]);
+    INSERT INTO t VALUES (2, ARRAY[7]), (1, ARRAY[5,6]);
+}
+
+@compat-gap "syntax:array subscript of a subquery column"
+test array-subscript-of-subquery-literal {
+    SELECT s.e[1] FROM (SELECT ARRAY[10,20,30] AS e) s;
+}
+expect {
+    10
+}
+expect @tursopg {
+
+}
+
+@compat-gap "syntax:array subscript of a subquery column"
+@setup t_arr
+test array-subscript-of-ordered-subquery-column {
+    SELECT x[1] FROM (SELECT a AS x FROM t ORDER BY id) s;
+}
+expect {
+    5
+    7
+}
+expect @tursopg {
+
+
+}
+
+# tursopg returns the bytes of the binary record as text.
+@compat-gap "cast:int[] -> text"
+@setup t_arr
+test array-column-cast-to-text {
+    SELECT CASE WHEN a::text = '{5,6}' THEN '{5,6}' ELSE 'other text' END FROM t WHERE id = 1;
+}
+expect {
+    {5,6}
+}
+expect @tursopg {
+    other text
+}
+
+@compat-gap "cast:int[] -> integer"
+test array-cast-to-int {
+    SELECT CAST(ARRAY[1,2] AS int);
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    0
+}
+
+@compat-gap "syntax:create table as with array column"
+@setup t_arr
+test ctas-array-column-subscript {
+    CREATE TABLE c AS SELECT a FROM t;
+    SELECT a[1] FROM c ORDER BY 1;
+}
+expect {
+    5
+    7
+}
+expect @tursopg {
+
+
+}

@@ -78,14 +78,11 @@ export default async function setup() {
 
     const tempDir = await mkdtemp(join(tmpdir(), 'turso-sync-wasm-'));
     const mvccDatabase = join(tempDir, 'remote.db');
-    await run(localSyncServer, [mvccDatabase, "PRAGMA journal_mode = 'mvcc'; CREATE TABLE mvcc_server_ready(x);"]);
+    await run(localSyncServer, [mvccDatabase, "PRAGMA journal_mode = 'mvcc'; CREATE TABLE mvcc_server_ready(x); PRAGMA wal_checkpoint(TRUNCATE);"]);
     await Promise.all([
         startServer(localSyncServer, process.env.VITE_TURSO_DB_URL || 'http://localhost:10001'),
         startServer(localSyncServer, process.env.VITE_TURSO_MVCC_DB_URL || 'http://localhost:10002', mvccDatabase),
     ]);
-    // Keep the server's open MVCC connection, but force its first logical pull
-    // through the same page-base fallback used by a fresh hosted replica.
-    await rm(join(tempDir, 'remote.db-log'));
 
     return async () => {
         for (const child of children) {

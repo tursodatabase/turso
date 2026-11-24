@@ -17,6 +17,8 @@ pub trait DataCompletion<T>: Send + Sync + 'static {
 pub trait SyncEngineIo: Send + Sync + 'static {
     type DataCompletionBytes: DataCompletion<u8>;
     type DataCompletionTransform: DataCompletion<DatabaseRowTransformResult>;
+    /// Read a host file: 404 if missing, 204 if empty, 200 otherwise.
+    /// Hosts backed by core IO may omit the status.
     fn full_read(&self, path: &str) -> Result<Self::DataCompletionBytes>;
     fn full_write(&self, path: &str, content: Vec<u8>) -> Result<Self::DataCompletionBytes>;
     fn transform(

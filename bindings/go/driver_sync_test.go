@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,8 +16,10 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -944,4 +947,352 @@ func TestSyncPullAfterCanceledPull(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Pull blocked after a previous Pull was canceled")
 	}
+}
+
+func TestSyncCipherRejectsNULBeforeOpening(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	for _, cipher := range []string{"aes256gcm\x00suffix", "AES-256-GCM\x00", "aegis_256x4\x00suffix"} {
+		t.Run(cipher, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			path := filepath.Join(t.TempDir(), "replica.db")
+			noBootstrap := false
+			replica, err := NewTursoSyncDb(ctx, TursoSyncDbConfig{
+				Path: path, RemoteUrl: server.URL, BootstrapIfEmpty: &noBootstrap,
+				ExperimentalFeatures:   "encryption,sync_encryption",
+				RemoteEncryptionCipher: cipher,
+				RemoteEncryptionKey:    base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{11}, 32)),
+			})
+			if replica != nil {
+				turso_sync_database_deinit(replica.db)
+				replica.client.CloseIdleConnections()
+			}
+			require.ErrorContains(t, err, "NUL")
+			require.NoFileExists(t, path)
+			require.Zero(t, requests.Load())
+		})
+	}
+}
+
+func TestSyncEncryptionRedirects(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		encrypted bool
+		tls       bool
+		redirect  func(string, string) string
+		allowed   bool
+		loop      bool
+	}{
+		{name: "same origin", encrypted: true, redirect: func(source, _ string) string { return source + "/redirected" }, allowed: true},
+		{name: "different hostname", encrypted: true, redirect: func(source, _ string) string {
+			return strings.Replace(source, "127.0.0.1", "localhost", 1) + "/redirected"
+		}},
+		{name: "different port", encrypted: true, redirect: func(_, target string) string { return target }},
+		{name: "HTTPS to HTTP", encrypted: true, tls: true, redirect: func(_, target string) string { return target }},
+		{name: "plaintext cross origin", redirect: func(_, target string) string { return target }, allowed: true},
+		{name: "redirect limit", encrypted: true, redirect: func(source, _ string) string { return source + "/pull-updates" }, loop: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cloudKey := ""
+			if tc.encrypted {
+				cloudKey = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{11}, 32))
+			}
+			received := make(chan http.Header, 1)
+			targetHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				received <- r.Header.Clone()
+				w.WriteHeader(http.StatusServiceUnavailable)
+			})
+			target := httptest.NewServer(targetHandler)
+			defer target.Close()
+			var destination string
+			var sourceRequests atomic.Int32
+			var sourceKeyMatches atomic.Bool
+			source := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/redirected" {
+					targetHandler.ServeHTTP(w, r)
+					return
+				}
+				sourceRequests.Add(1)
+				sourceKeyMatches.Store(r.Header.Get("x-turso-encryption-key") == cloudKey)
+				http.Redirect(w, r, destination, http.StatusTemporaryRedirect)
+			}))
+			if tc.tls {
+				source.StartTLS()
+			} else {
+				source.Start()
+			}
+			defer source.Close()
+			destination = tc.redirect(source.URL, target.URL)
+			noBootstrap := false
+			config := TursoSyncDbConfig{
+				Path: filepath.Join(t.TempDir(), "replica.db"), RemoteUrl: source.URL,
+				BootstrapIfEmpty: &noBootstrap, RemoteEncryptionKey: cloudKey,
+			}
+			if tc.encrypted {
+				config.RemoteEncryptionCipher = "aes256gcm"
+			}
+			replica, err := NewTursoSyncDb(ctx, config)
+			require.NoError(t, err)
+			defer turso_sync_database_deinit(replica.db)
+			if tc.tls {
+				replica.client.Transport = source.Client().Transport
+			}
+			defer replica.client.CloseIdleConnections()
+			_, err = replica.Pull(ctx)
+			require.True(t, sourceKeyMatches.Load())
+			if tc.loop {
+				require.ErrorContains(t, err, "stopped after 10 redirects")
+				require.EqualValues(t, 10, sourceRequests.Load())
+				require.Empty(t, received)
+				return
+			}
+			require.EqualValues(t, 1, sourceRequests.Load())
+			if tc.allowed {
+				require.ErrorContains(t, err, "status=503")
+				require.Len(t, received, 1)
+				require.Equal(t, cloudKey, (<-received).Get("x-turso-encryption-key"))
+			} else {
+				require.ErrorContains(t, err, "refusing encrypted sync redirect to a different origin")
+				require.Empty(t, received)
+			}
+		})
+	}
+}
+
+func TestSyncEncryptionRedirectOrigins(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		from    string
+		to      string
+		allowed bool
+	}{
+		{name: "default HTTPS port", from: "https://db.example", to: "https://db.example:443/path", allowed: true},
+		{name: "default HTTP port", from: "http://db.example:80", to: "http://db.example/path", allowed: true},
+		{name: "hostname case", from: "https://DB.example", to: "https://db.example/path", allowed: true},
+		{name: "downgrade on same port", from: "https://db.example:443", to: "http://db.example:443/path"},
+		{name: "subdomain", from: "https://db.example", to: "https://other.db.example/path"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			initial, err := http.NewRequest(http.MethodPost, tc.from, nil)
+			require.NoError(t, err)
+			initial.Header.Set("x-turso-encryption-key", "test-key")
+			redirect, err := http.NewRequest(http.MethodPost, tc.to, nil)
+			require.NoError(t, err)
+			err = checkSyncRedirect(redirect, []*http.Request{initial})
+			if tc.allowed {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, "refusing encrypted sync redirect to a different origin")
+			}
+		})
+	}
+}
+
+func TestSyncEncryptionCipherAliasesReserveNativeMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		cipher string
+		bytes  int
+	}{
+		{"aes-256-gcm", 28},
+		{"AES_128_GCM", 28},
+		{"aegis-128x2", 32},
+		{"AEGIS_256X4", 48},
+	} {
+		t.Run(tc.cipher, func(t *testing.T) {
+			require.Equal(t, tc.bytes, syncEncryptionReservedBytes(tc.cipher))
+
+			file := filepath.Join(t.TempDir(), "replica.db")
+			noBootstrap := false
+			ctx := context.Background()
+			replica, err := NewTursoSyncDb(ctx, TursoSyncDbConfig{
+				Path: file, BootstrapIfEmpty: &noBootstrap,
+				RemoteEncryptionCipher: tc.cipher,
+			})
+			require.NoError(t, err)
+			defer turso_sync_database_deinit(replica.db)
+			conn, err := replica.Connect(ctx)
+			require.NoError(t, err)
+			defer conn.Close()
+			_, err = conn.Exec("CREATE TABLE reserved(value INTEGER)")
+			require.NoError(t, err)
+			require.NoError(t, replica.Checkpoint(ctx))
+			header, err := os.ReadFile(file)
+			require.NoError(t, err)
+			require.Greater(t, len(header), 20)
+			require.Equal(t, byte(tc.bytes), header[20])
+		})
+	}
+}
+
+func TestSyncEncryptionRequiresExperimentalFeature(t *testing.T) {
+	for _, features := range []string{"", "encryption", "sync_encryption_extra"} {
+		t.Run(features, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "replica.db")
+			_, err := NewTursoSyncDb(context.Background(), TursoSyncDbConfig{
+				Path: file, RemoteUrl: "http://127.0.0.1:1", ExperimentalFeatures: features,
+				RemoteEncryptionCipher: "aes256gcm", RemoteEncryptionKey: "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws=",
+				LocalEncryptionKey: strings.Repeat("16", 32),
+			})
+			require.ErrorContains(t, err, "sync_encryption")
+			_, statErr := os.Stat(file)
+			require.True(t, os.IsNotExist(statErr))
+			_, statErr = os.Stat(file + "-info")
+			require.True(t, os.IsNotExist(statErr))
+		})
+	}
+}
+
+func TestSyncEncryptionRealIncrementalRoundtrip(t *testing.T) {
+	for _, cipher := range []string{"aes256gcm", "aes128gcm", "aegis128l"} {
+		t.Run(cipher, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			size := 16
+			if cipher == "aes256gcm" {
+				size = 32
+			}
+			cloud := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{11}, size))
+			local := strings.Repeat("16", size)
+			key := filepath.Join(dir, "key.hex")
+			require.NoError(t, os.WriteFile(key, []byte(strings.Repeat("0b", size)), 0600))
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			address := listener.Addr().String()
+			require.NoError(t, listener.Close())
+			executable := os.Getenv("LOCAL_SYNC_SERVER")
+			if executable == "" {
+				executable = "../../target/debug/tursodb"
+				if runtime.GOOS == "windows" {
+					executable += ".exe"
+				}
+			}
+			log, err := os.Create(filepath.Join(dir, "server.log"))
+			require.NoError(t, err)
+			process := exec.Command(executable, "--sync-server", address, "--sync-encryption-cipher", cipher,
+				"--sync-encryption-key-file", key, filepath.Join(dir, "source.db"))
+			process.Stdout, process.Stderr = log, log
+			require.NoError(t, process.Start())
+			t.Cleanup(func() { _ = process.Process.Kill(); _ = process.Wait(); _ = log.Close() })
+			require.Eventually(t, func() bool {
+				conn, err := net.DialTimeout("tcp", address, 100*time.Millisecond)
+				if err != nil {
+					return false
+				}
+				_ = conn.Close()
+				return true
+			}, 10*time.Second, 25*time.Millisecond)
+			url := "http://" + address
+			remoteSQL := func(sql string) {
+				body, err := json.Marshal(map[string]any{"requests": []any{map[string]any{"type": "execute", "stmt": map[string]any{"sql": sql}}}})
+				require.NoError(t, err)
+				request, err := http.NewRequestWithContext(ctx, "POST", url+"/v2/pipeline", bytes.NewReader(body))
+				require.NoError(t, err)
+				request.Header.Set("x-turso-encryption-key", cloud)
+				request.Header.Set("x-turso-encryption-cipher", cipher)
+				response, err := (&http.Client{Timeout: 10 * time.Second}).Do(request)
+				require.NoError(t, err)
+				defer response.Body.Close()
+				var result struct{ Results []struct{ Type string } }
+				require.NoError(t, json.NewDecoder(response.Body).Decode(&result))
+				require.Equal(t, http.StatusOK, response.StatusCode)
+				require.Len(t, result.Results, 1)
+				require.Equal(t, "ok", result.Results[0].Type)
+			}
+			remoteSQL("PRAGMA journal_mode=mvcc")
+			remoteSQL("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
+			remoteSQL("INSERT INTO items VALUES (1, 'nonempty bootstrap')")
+			config := TursoSyncDbConfig{Path: filepath.Join(dir, "replica.db"), RemoteUrl: url,
+				ExperimentalFeatures: "sync_encryption", RemoteEncryptionCipher: cipher, RemoteEncryptionKey: cloud, LocalEncryptionKey: local}
+			replica, err := NewTursoSyncDb(ctx, config)
+			require.NoError(t, err)
+			conn, err := replica.Connect(ctx)
+			require.NoError(t, err)
+			var value string
+			require.NoError(t, conn.QueryRow("SELECT value FROM items WHERE id=1").Scan(&value))
+			require.Equal(t, "nonempty bootstrap", value)
+			_, err = conn.Exec("INSERT INTO items VALUES (2, 'go local marker')")
+			require.NoError(t, err)
+			require.NoError(t, replica.Push(ctx))
+			// Updating the remote copy proves that push installed row 2.
+			remoteSQL("UPDATE items SET value='pushed' WHERE id=2")
+			remoteSQL("INSERT INTO items VALUES (3, hex(zeroblob(40000)))")
+			_, err = replica.Pull(ctx)
+			require.NoError(t, err)
+			require.NoError(t, conn.QueryRow("SELECT value FROM items WHERE id=2").Scan(&value))
+			require.Equal(t, "pushed", value)
+			var length int
+			require.NoError(t, conn.QueryRow("SELECT length(value) FROM items WHERE id=3").Scan(&length))
+			require.Equal(t, 80000, length)
+			require.NoError(t, replica.Checkpoint(ctx))
+			require.NoError(t, conn.Close())
+			turso_sync_database_deinit(replica.db)
+			noBootstrap := false
+			config.BootstrapIfEmpty, config.RemoteUrl, config.RemoteEncryptionKey = &noBootstrap, "", ""
+			replica, err = NewTursoSyncDb(ctx, config)
+			require.NoError(t, err)
+			conn, err = replica.Connect(ctx)
+			require.NoError(t, err)
+			var count int
+			require.NoError(t, conn.QueryRow("SELECT count(*) FROM items").Scan(&count))
+			require.Equal(t, 3, count)
+			require.NoError(t, conn.Close())
+			turso_sync_database_deinit(replica.db)
+		})
+	}
+}
+
+func TestSyncEncryptionBootstrapOfflineReopen(t *testing.T) {
+	ctx := context.Background()
+	cloudKey := "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws="
+	localKey := strings.Repeat("16", 32)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, cloudKey, r.Header.Get("x-turso-encryption-key"))
+		require.Equal(t, "aes256gcm", r.Header.Get("x-turso-encryption-cipher"))
+		require.NotContains(t, fmt.Sprint(r.Header), localKey)
+		_, _ = w.Write([]byte{9, 10, 3, 114, 101, 118, 26, 0, 64, 1})
+	}))
+	defer server.Close()
+	file := filepath.Join(t.TempDir(), "replica.db")
+	config := TursoSyncDbConfig{Path: file, RemoteUrl: server.URL,
+		ExperimentalFeatures: "sync_encryption", RemoteEncryptionCipher: "aes256gcm", RemoteEncryptionKey: cloudKey, LocalEncryptionKey: localKey}
+	replica, err := NewTursoSyncDb(ctx, config)
+	require.NoError(t, err)
+	conn, err := replica.Connect(ctx)
+	require.NoError(t, err)
+	_, err = conn.Exec("CREATE TABLE t(value TEXT)")
+	require.NoError(t, err)
+	_, err = conn.Exec("INSERT INTO t VALUES ('binding private marker')")
+	require.NoError(t, err)
+	require.NoError(t, replica.Checkpoint(ctx))
+	require.NoError(t, conn.Close())
+	turso_sync_database_deinit(replica.db)
+	meta, err := os.ReadFile(file + "-info")
+	require.NoError(t, err)
+	require.True(t, bytes.HasPrefix(meta, []byte("TSYNMETA")))
+	data, err := os.ReadFile(file)
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "binding private marker")
+	noBootstrap := false
+	config.BootstrapIfEmpty = &noBootstrap
+	config.RemoteUrl = ""
+	config.RemoteEncryptionKey = ""
+	replica, err = NewTursoSyncDb(ctx, config)
+	require.NoError(t, err)
+	conn, err = replica.Connect(ctx)
+	require.NoError(t, err)
+	var value string
+	require.NoError(t, conn.QueryRow("SELECT value FROM t").Scan(&value))
+	require.Equal(t, "binding private marker", value)
+	require.NoError(t, conn.Close())
+	turso_sync_database_deinit(replica.db)
+	config.LocalEncryptionKey = strings.Repeat("17", 32)
+	_, err = NewTursoSyncDb(ctx, config)
+	require.Error(t, err)
 }

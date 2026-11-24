@@ -11,13 +11,14 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::{ConnectOpts, Database, StatementTimes, Value, WallClockInstant};
 use turso_pg::{
-    split_statements, sql_parse_error, sqlstate_error, PgConnection, StatementResultKind,
-    TransactionState,
+    parse_pg_bool, split_statements, sql_parse_error, sqlstate_error, PgConnection,
+    StatementResultKind, TransactionState,
 };
 use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_PROTOCOL_VIOLATION,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_PARAMETER_VALUE,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_PROTOCOL_VIOLATION,
 };
 use turso_pg_parser::ParseResult;
 
@@ -433,6 +434,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         }
         let stmt = conn.prepare(&target.statement).map_err(pg_error)?;
 
+        // FIXME(pg-catalog): This describes a parameter with no declared type as text, where PostgreSQL gives the type its context requires. A typed expression tree replaces this.
         let param_types: Vec<Type> = target
             .parameter_types
             .iter()
@@ -710,6 +712,7 @@ fn resolve_pg_type_for_column(stmt: &turso_pg::Statement, idx: usize) -> Type {
     base
 }
 
+/// FIXME(pg-catalog): This hand-codes typarray of pg_type, and sends an array of any type it does not list as text[]. A lookup of typarray in a pg_type table replaces this.
 /// Map a scalar PG type to its array counterpart.
 fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
     if *scalar == Type::INT4 {
@@ -895,6 +898,7 @@ fn bind_portal_parameters(
     Ok(())
 }
 
+/// FIXME(pg-catalog): This refuses a binary parameter of unknown type because Turso cannot work out its type from the query. A typed expression tree replaces this refusal.
 /// Reads parameter `$n` sent in binary format as `pg_type`, the type Parse
 /// declared for it. A type whose binary format is its text is read as in text
 /// format. A parameter whose type Parse left out or left unspecified (OID 0)
@@ -914,6 +918,7 @@ fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResul
     }
 }
 
+/// FIXME(pg-catalog): This hand-codes the input function (typinput in pg_type) of each declared parameter type, and differs from it: it reads numeric as a float. A call to the typinput function of the declared type replaces this.
 /// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
 /// Assumes text format encoding (UTF-8 string representations).
 fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
@@ -940,12 +945,12 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
             })?;
             Ok(Value::from_f64(f))
         }
-        Type::BOOL => match text {
-            "t" | "true" | "TRUE" | "1" | "yes" | "on" => Ok(Value::from_i64(1)),
-            "f" | "false" | "FALSE" | "0" | "no" | "off" => Ok(Value::from_i64(0)),
-            _ => Err(PgWireError::UserError(Box::new(error_info(&format!(
-                "invalid boolean parameter: {text}"
-            ))))),
+        Type::BOOL => match parse_pg_bool(text) {
+            Some(truth) => Ok(Value::from_i64(i64::from(truth))),
+            None => Err(wire_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!("invalid input syntax for type boolean: \"{text}\""),
+            )),
         },
         Type::BYTEA => {
             // PostgreSQL text format for bytea uses \x hex encoding
@@ -961,6 +966,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 Ok(Value::from_blob(bytes.to_vec()))
             }
         }
+        // FIXME(pg-catalog): PostgreSQL resolves an unknown-type parameter from its context, as an operand of an operator or a function or as a target column. A typed expression tree replaces this guess.
         // UNKNOWN: try to infer type from text content (numeric-looking values
         // should be bound as numbers so comparisons with COUNT/SUM etc. work)
         Type::UNKNOWN => {
@@ -1082,6 +1088,7 @@ fn binary_value_not_supported(pg_type: &Type) -> turso_core::LimboError {
     sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, message, None)
 }
 
+/// FIXME(pg-catalog): This is a second hand-written map from type names to pg_type entries, besides `pg_type_oid` in postgres/frontend/catalog.rs, and the two disagree: this one sends smallint as int4, numeric without a precision as float8 and timetz as time, where pg_type has int2 (21), numeric (1700) and timetz (1266). A lookup in a pg_type table replaces this.
 fn sqlite_type_to_pg_type(type_str: &str) -> Type {
     let upper = type_str.to_uppercase();
     match upper.as_str() {
@@ -1660,6 +1667,88 @@ mod tests {
         }
     }
 
+    /// A parameter sent without a type has type unknown, which PostgreSQL
+    /// reads as text input, whatever the text looks like.
+    #[test]
+    fn untyped_parameters_are_text_input_for_time_and_json_types() {
+        let conn = memory_connection();
+        conn.execute("CREATE TABLE w (j json, ts timestamp)")
+            .unwrap();
+        let bind = |sql: &str, text: &str| {
+            let mut portal = Portal::<String>::default();
+            portal.statement = Arc::new(StoredStatement::new(
+                String::new(),
+                String::new(),
+                vec![None],
+            ));
+            portal.parameters = vec![Some(text.as_bytes().to_vec().into())];
+            let mut stmt = conn.prepare(sql).unwrap();
+            bind_portal_parameters(&mut stmt, &portal).unwrap();
+            stmt.run_collect_rows().unwrap()
+        };
+        bind("INSERT INTO w (j) VALUES ($1)", "123");
+        bind("INSERT INTO w (ts) VALUES ($1)", "20200101");
+        let rows = bind("SELECT $1::timestamp::text", "20200103");
+        assert_eq!(rows, [[Value::from_text("2020-01-03 00:00:00")]]);
+        let rows = bind(
+            "SELECT (SELECT j::text FROM w WHERE j IS NOT NULL), (SELECT ts::text FROM w WHERE ts IS NOT NULL), $1::text",
+            "x",
+        );
+        assert_eq!(
+            rows,
+            [[
+                Value::from_text("123"),
+                Value::from_text("2020-01-01 00:00:00"),
+                Value::from_text("x")
+            ]]
+        );
+    }
+
+    /// Known gap: PostgreSQL stores the text 'true' of an untyped parameter in
+    /// a jsonb column as the JSON value true. tursopg binds it as a boolean,
+    /// which the column stores as the number 1.
+    #[test]
+    fn untyped_parameter_true_in_jsonb_is_a_known_gap() {
+        let conn = memory_connection();
+        conn.execute("CREATE TABLE w (j jsonb)").unwrap();
+        let mut portal = Portal::<String>::default();
+        portal.statement = Arc::new(StoredStatement::new(
+            String::new(),
+            String::new(),
+            vec![None],
+        ));
+        portal.parameters = vec![Some(b"true".to_vec().into())];
+        let mut stmt = conn.prepare("INSERT INTO w VALUES ($1)").unwrap();
+        bind_portal_parameters(&mut stmt, &portal).unwrap();
+        stmt.run_collect_rows().unwrap();
+        let mut stmt = conn.prepare("SELECT j::text FROM w").unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(rows, [[Value::from_text("1")]]);
+    }
+
+    /// Known gap: PostgreSQL reads the text '20240101' of an untyped
+    /// parameter compared with a date column as the date 2024-01-01.
+    /// tursopg binds the number-like text as a number, and the comparison
+    /// refuses it with 22007 "only text can be converted to date".
+    #[test]
+    fn untyped_number_like_parameter_compared_with_date_is_a_known_gap() {
+        let conn = memory_connection();
+        conn.execute("CREATE TABLE w (d date)").unwrap();
+        conn.execute("INSERT INTO w VALUES ('2024-01-01')").unwrap();
+        let mut portal = Portal::<String>::default();
+        portal.statement = Arc::new(StoredStatement::new(
+            String::new(),
+            String::new(),
+            vec![None],
+        ));
+        portal.parameters = vec![Some(b"20240101".to_vec().into())];
+        let mut stmt = conn.prepare("SELECT count(*) FROM w WHERE d = $1").unwrap();
+        bind_portal_parameters(&mut stmt, &portal).unwrap();
+        // PostgreSQL 18 returns one row with count 1.
+        let error = stmt.run_collect_rows().unwrap_err();
+        assert_eq!(error.sqlstate, "22007");
+    }
+
     #[test]
     fn a_refused_binary_format_aborts_the_transaction_block() {
         let (mut client, _conn) = copy_test_client();
@@ -2095,6 +2184,20 @@ mod tests {
         assert_eq!(val, Value::from_i64(0));
     }
 
+    /// A boolean parameter is read as boolean text in SQL is: in any case,
+    /// from the first letters of a word, and with whitespace around it.
+    #[test]
+    fn test_pg_bytes_to_value_bool_reads_text_as_postgres_does() {
+        for text in ["y", "True", " t", "tr", "YES", "on", "1"] {
+            let val = pg_bytes_to_value(text.as_bytes(), &Type::BOOL).unwrap();
+            assert_eq!(val, Value::from_i64(1), "{text:?}");
+        }
+        for text in ["n", "False", "f ", "fals", "NO", "of", "off", "0"] {
+            let val = pg_bytes_to_value(text.as_bytes(), &Type::BOOL).unwrap();
+            assert_eq!(val, Value::from_i64(0), "{text:?}");
+        }
+    }
+
     #[test]
     fn test_pg_bytes_to_value_text() {
         let val = pg_bytes_to_value(b"hello world", &Type::TEXT).unwrap();
@@ -2141,8 +2244,16 @@ mod tests {
 
     #[test]
     fn test_pg_bytes_to_value_bool_invalid() {
-        let result = pg_bytes_to_value(b"maybe", &Type::BOOL);
-        assert!(result.is_err());
+        for text in ["maybe", "o", "truex", ""] {
+            let Err(error) = pg_bytes_to_value(text.as_bytes(), &Type::BOOL) else {
+                panic!("{text:?}: no error");
+            };
+            assert_eq!(
+                sqlstate(error),
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
@@ -2220,5 +2331,25 @@ mod tests {
         // UNKNOWN type should keep text for non-numeric strings
         let val = pg_bytes_to_value(b"hello", &Type::UNKNOWN).unwrap();
         assert!(matches!(val, Value::Text(_)));
+    }
+
+    /// Known gap: PostgreSQL 18 describes `5::int2` as int2 (oid 21) and
+    /// `1.5::numeric` as numeric (oid 1700). tursopg describes them as int4
+    /// and float8, so a client decodes the values with the wrong type.
+    #[test]
+    fn smallint_and_numeric_result_column_oids_are_a_known_gap() {
+        let (mut client, _conn) = copy_test_client();
+        let events = client.simple_query("SELECT 5::int2, 1.5::numeric").unwrap();
+        let oids: Vec<u32> = events
+            .iter()
+            .find_map(|event| match event {
+                BackendEvent::RowDescription(columns) => {
+                    Some(columns.iter().map(|c| c.type_oid).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{events:?}"));
+        // PostgreSQL 18 sends [21, 1700].
+        assert_eq!(oids, [Type::INT4.oid(), Type::FLOAT8.oid()]);
     }
 }

@@ -1,0 +1,121 @@
+# Known tursopg gaps against PostgreSQL: SQL that a todo app writes
+#
+# Each test with a `@compat-gap "<kind>:<object>"` label records a known
+# difference: its default `expect` block is PostgreSQL 18's answer and its
+# `expect @tursopg` block is tursopg's current wrong answer. When tursopg
+# gives the PostgreSQL answer, the tursopg run fails with "gap fixed": then
+# delete only `@compat-gap` and the `expect @tursopg` block, and keep the
+# test.
+#
+# These tests come from running the queries that a todo app, or a model
+# asked to write one, sends to PostgreSQL 18 and to tursopg.
+
+@database :memory:
+
+setup todo_schema {
+    CREATE TABLE users (id serial PRIMARY KEY, email text UNIQUE NOT NULL, name text, created_at timestamptz NOT NULL DEFAULT now());
+    CREATE TABLE todos (id serial PRIMARY KEY, user_id int NOT NULL REFERENCES users(id) ON DELETE CASCADE, title text NOT NULL, description text, completed boolean NOT NULL DEFAULT false, priority int NOT NULL DEFAULT 2 CHECK (priority BETWEEN 1 AND 3), due_at timestamptz, completed_at timestamptz, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now());
+    CREATE TABLE tags (id serial PRIMARY KEY, name text UNIQUE NOT NULL);
+    CREATE TABLE todo_tags (todo_id int REFERENCES todos(id) ON DELETE CASCADE, tag_id int REFERENCES tags(id) ON DELETE CASCADE, PRIMARY KEY (todo_id, tag_id));
+    CREATE INDEX todos_user_id_idx ON todos (user_id);
+    CREATE INDEX todos_due_at_idx ON todos (due_at);
+    INSERT INTO users (email, name, created_at) VALUES ('ann@example.com', 'Ann', '2026-01-01 09:00Z'), ('bob@example.com', 'Bob', '2026-01-02 09:00Z');
+    INSERT INTO todos (user_id, title, completed, priority, due_at, completed_at, created_at) VALUES (1, 'Buy milk', false, 1, '2000-01-01 12:00Z', NULL, '2026-01-01 10:00Z'), (1, 'Write report', true, 3, '2099-01-01 17:00Z', '2026-01-03 15:30Z', '2026-01-02 08:00Z'), (1, 'Call mom', false, 2, NULL, NULL, '2026-01-03 09:15+02'), (2, 'Fix bike', true, 2, '2000-06-01Z', '2026-01-04 11:00Z', '2026-01-02 12:00Z'), (2, 'Plan trip', false, 3, '2099-06-01Z', NULL, '2026-01-05 18:45Z');
+    INSERT INTO tags (name) VALUES ('home'), ('work'), ('urgent');
+    INSERT INTO todo_tags VALUES (1, 1), (1, 3), (2, 2), (4, 1);
+}
+
+@setup todo_schema
+test todos-per-day {
+    SELECT date_trunc('day', created_at) AS day, count(*) FROM todos GROUP BY 1 ORDER BY 1 DESC;
+}
+expect {
+    2026-01-05 00:00:00+00|1
+    2026-01-03 00:00:00+00|1
+    2026-01-02 00:00:00+00|2
+    2026-01-01 00:00:00+00|1
+}
+
+@compat-gap "function:to_char"
+@setup todo_schema
+test todos-formatted-date {
+    SELECT id, to_char(created_at, 'YYYY-MM-DD HH24:MI') FROM todos ORDER BY id;
+}
+expect {
+    1|2026-01-01 10:00
+    2|2026-01-02 08:00
+    3|2026-01-03 07:15
+    4|2026-01-02 12:00
+    5|2026-01-05 18:45
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "function:to_char"
+@setup todo_schema
+test todos-per-week {
+    SELECT to_char(created_at, 'IYYY-IW') AS week, count(*) FROM todos GROUP BY 1 ORDER BY 1;
+}
+expect {
+    2026-01|4
+    2026-02|1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "operator:timestamptz - timestamptz"
+@setup todo_schema
+test todos-average-completion-hours {
+    SELECT round(avg(extract(epoch FROM completed_at - created_at) / 3600)::numeric, 2) FROM todos WHERE completed_at IS NOT NULL;
+}
+expect {
+    39.25
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+@compat-gap "function:left"
+@setup todo_schema
+test todos-title-prefix {
+    SELECT id, length(title), upper(left(title, 3)) FROM todos ORDER BY id;
+}
+expect {
+    1|8|BUY
+    2|12|WRI
+    3|8|CAL
+    4|8|FIX
+    5|9|PLA
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+@compat-gap "syntax:update"
+@setup todo_schema
+test todos-update-from {
+    UPDATE todos t SET priority = 3 FROM todo_tags tt WHERE tt.todo_id = t.id AND tt.tag_id = 3 RETURNING t.id;
+}
+expect {
+    1
+}
+@sqlstate 42P01
+expect @tursopg error {}
+
+@compat-gap "type:timestamptz"
+@setup todo_schema
+test todos-insert-javascript-date-string {
+    INSERT INTO todos (user_id, title, due_at) VALUES (1, 'js', 'Sun Mar 01 2026 09:00:00 GMT+0000') RETURNING due_at;
+}
+expect {
+    2026-03-01 09:00:00+00
+}
+@sqlstate 22007
+expect @tursopg error {}
+
+test todos-overdue-by-due-date {
+    CREATE TABLE todos (id serial PRIMARY KEY, title text NOT NULL, completed boolean NOT NULL DEFAULT false, due_date date, created_at timestamptz NOT NULL DEFAULT now());
+    INSERT INTO todos (title, completed, due_date, created_at) VALUES ('Buy milk', false, '2000-01-01', '2026-01-01 10:00Z'), ('Write report', true, '2099-01-01', '2026-01-02 08:00Z'), ('Call mom', false, NULL, '2026-01-03 09:15Z');
+    SELECT id FROM todos WHERE due_date < CURRENT_DATE AND NOT completed;
+}
+expect {
+    1
+}

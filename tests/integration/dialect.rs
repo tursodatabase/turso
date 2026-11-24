@@ -1,4 +1,8 @@
 use std::sync::Arc;
+use turso_core::ast::Cmd;
+use turso_core::ast::CreateTableBody;
+use turso_core::ast::QualifiedName;
+use turso_core::ast::Stmt;
 use turso_core::dialect::*;
 use turso_core::function::ScalarFunc;
 use turso_core::io::PlatformIO;
@@ -10,7 +14,9 @@ use turso_core::security::roles::SessionRole;
 use turso_core::storage::database::DatabaseFile;
 use turso_core::sync::atomic::AtomicUsize;
 use turso_core::sync::atomic::Ordering;
+use turso_core::types::Conversion;
 use turso_core::types::IOResultOr;
+use turso_core::types::Type;
 use turso_core::vdbe::Register;
 use turso_core::ConnectOpts;
 use turso_core::Connection;
@@ -33,10 +39,6 @@ use turso_ext::IndexInfo;
 use turso_ext::OrderByInfo;
 use turso_ext::ResultCode;
 use turso_ext::VTabKind;
-use turso_parser::ast::Cmd;
-use turso_parser::ast::CreateTableBody;
-use turso_parser::ast::QualifiedName;
-use turso_parser::ast::Stmt;
 use turso_sqlite::SqliteDialect;
 
 /// A dialect that counts schema-row parses and strips a `/* test */ `
@@ -57,14 +59,14 @@ impl Dialect for TestDialect {
     fn parse_internal(
         &self,
         sql: &str,
-    ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
         turso_sqlite::SqliteDialect.parse_internal(sql)
     }
 
     fn parse_internal_column_definition(
         &self,
         sql: &str,
-    ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+    ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
     }
 
@@ -164,14 +166,14 @@ impl Dialect for StrictTestDialect {
     fn parse_internal(
         &self,
         sql: &str,
-    ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
         turso_sqlite::SqliteDialect.parse_internal(sql)
     }
 
     fn parse_internal_column_definition(
         &self,
         sql: &str,
-    ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+    ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
     }
 
@@ -554,14 +556,14 @@ impl Dialect for NoFunctionsDialect {
     fn parse_internal(
         &self,
         sql: &str,
-    ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
         turso_sqlite::SqliteDialect.parse_internal(sql)
     }
 
     fn parse_internal_column_definition(
         &self,
         sql: &str,
-    ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+    ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
     }
 
@@ -623,14 +625,14 @@ impl Dialect for ShoutingUpperDialect {
     fn parse_internal(
         &self,
         sql: &str,
-    ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
         turso_sqlite::SqliteDialect.parse_internal(sql)
     }
 
     fn parse_internal_column_definition(
         &self,
         sql: &str,
-    ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+    ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
     }
 
@@ -1153,14 +1155,14 @@ impl Dialect for NamespacesAndOwnBuilderDialect {
     fn parse_internal(
         &self,
         sql: &str,
-    ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
         turso_sqlite::SqliteDialect.parse_internal(sql)
     }
 
     fn parse_internal_column_definition(
         &self,
         sql: &str,
-    ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+    ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
     }
 
@@ -1187,6 +1189,427 @@ impl Dialect for NamespacesAndOwnBuilderDialect {
         &self,
         enable_custom_types: bool,
     ) -> Result<turso_core::schema::SchemaBuilder> {
-        turso_core::schema::builtin::schema_builder(self, enable_custom_types)
+        turso_core::schema::builtin::schema_builder(enable_custom_types)
     }
+}
+
+#[test]
+fn dialect_registers_a_type_written_in_rust() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_db(&io, "dialect-rust-type.db", Arc::new(RustTypesDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    // `bool` is another name of the boolean type of core.
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s loud, b boolean, b2 bool) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'Hello', 'si', 'no'), (2, NULL, NULL, NULL)")
+        .unwrap();
+    let rows = conn
+        .prepare("SELECT s, b, b2 FROM t ORDER BY id")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            // ENCODE stored HELLO, and DECODE added the question mark.
+            vec![
+                Value::build_text("HELLO?"),
+                Value::from_i64(1),
+                Value::from_i64(0)
+            ],
+            // Neither runs on NULL.
+            vec![Value::Null, Value::Null, Value::Null],
+        ]
+    );
+
+    // The boolean type of the dialect replaced the type of core, which
+    // reads `yes` as true, under both of its names.
+    for values in ["(3, 'x', 'yes', 'no')", "(3, 'x', 'si', 'yes')"] {
+        let error = conn
+            .execute(format!("INSERT INTO t VALUES {values}"))
+            .unwrap_err();
+        assert!(error.to_string().contains("not si or no"), "{error}");
+    }
+    conn.close().unwrap();
+}
+
+/// A type with a cast conversion takes values in a CAST that a column of the
+/// type refuses.
+#[test]
+fn cast_conversion_of_a_type_runs_in_a_cast_and_not_in_a_column() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_db(&io, "dialect-type-cast.db", Arc::new(RustTypesDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    // The conversion turns 5 into `si`, which ENCODE reads. It leaves text
+    // to ENCODE, and it does not run on NULL.
+    conn.execute("CREATE DOMAIN flag AS boolean").unwrap();
+    let rows = conn
+        .prepare(
+            "SELECT CAST(5 AS boolean), CAST(0 AS boolean), CAST('si' AS boolean), \
+             CAST(NULL AS boolean), CAST(5 AS flag)",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::from_i64(1),
+            Value::from_i64(0),
+            Value::from_i64(1),
+            Value::Null,
+            // A domain converts as the type it is based on.
+            Value::from_i64(1),
+        ]]
+    );
+
+    // Text that ENCODE refuses fails in a CAST too.
+    let error = conn
+        .prepare("SELECT CAST('yes' AS boolean)")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap_err();
+    assert!(error.to_string().contains("yes is not si or no"), "{error}");
+
+    // A column of the type does not run the conversion.
+    conn.execute("CREATE TABLE t (b boolean) STRICT").unwrap();
+    let error = conn.execute("INSERT INTO t VALUES (5)").unwrap_err();
+    assert!(error.to_string().contains("5 is not si or no"), "{error}");
+    conn.close().unwrap();
+}
+
+/// A dialect that registers two types written in Rust: `loud`, and a
+/// `boolean` that replaces the type of core.
+struct RustTypesDialect;
+
+impl Dialect for RustTypesDialect {
+    fn name(&self) -> &'static str {
+        "rust-types"
+    }
+
+    fn parse_internal(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
+        turso_sqlite::SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
+        turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn parameter_marker_ranges(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<Vec<std::ops::Range<usize>>> {
+        turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
+    }
+
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
+    }
+
+    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        SqliteDialect.parse_internal(sql)
+    }
+
+    fn requires_custom_types(&self) -> bool {
+        true
+    }
+
+    fn schema_builder(
+        &self,
+        enable_custom_types: bool,
+    ) -> Result<turso_core::schema::SchemaBuilder> {
+        turso_core::schema::builtin::schema_builder(enable_custom_types)?
+            .builtin_type(&Loud)?
+            .builtin_type(&SiNoBoolean)
+    }
+}
+
+/// Text that is stored in upper case and read with a question mark after it.
+#[derive(Debug)]
+struct Loud;
+
+impl Type for Loud {
+    fn name(&self) -> &str {
+        "loud"
+    }
+
+    fn params(&self) -> Vec<turso_core::ast::TypeParam> {
+        vec![value_param("text")]
+    }
+
+    fn base(&self) -> &str {
+        "text"
+    }
+
+    fn encode(&self) -> Option<Conversion> {
+        Some(Conversion::Function(|value, _params| {
+            Ok(Value::build_text(value.to_string().to_uppercase()))
+        }))
+    }
+
+    fn decode(&self) -> Option<Conversion> {
+        Some(Conversion::Function(|value, _params| {
+            Ok(Value::build_text(format!("{value}?")))
+        }))
+    }
+
+    fn reads_as(&self) -> Option<turso_core::types::StorageClass> {
+        Some(turso_core::types::StorageClass::Text)
+    }
+}
+
+/// A boolean that reads `si` as true and `no` as false. A CAST to it also
+/// takes an integer.
+#[derive(Debug)]
+struct SiNoBoolean;
+
+impl Type for SiNoBoolean {
+    fn name(&self) -> &str {
+        "boolean"
+    }
+
+    fn params(&self) -> Vec<turso_core::ast::TypeParam> {
+        vec![value_param("any")]
+    }
+
+    fn base(&self) -> &str {
+        "integer"
+    }
+
+    fn encode(&self) -> Option<Conversion> {
+        Some(Conversion::Function(|value, _params| {
+            match value.to_string().as_str() {
+                "si" => Ok(Value::from_i64(1)),
+                "no" => Ok(Value::from_i64(0)),
+                other => Err(LimboError::Constraint(format!("{other} is not si or no"))),
+            }
+        }))
+    }
+
+    fn cast(&self) -> Option<Conversion> {
+        Some(Conversion::Function(|value, _params| match value {
+            Value::Numeric(Numeric::Integer(0)) => Ok(Value::build_text("no")),
+            Value::Numeric(Numeric::Integer(_)) => Ok(Value::build_text("si")),
+            other => Ok(other.clone()),
+        }))
+    }
+}
+
+fn value_param(ty: &str) -> turso_core::ast::TypeParam {
+    turso_core::ast::TypeParam {
+        name: "value".to_string(),
+        ty: Some(ty.to_string()),
+    }
+}
+
+/// A dialect that is SQLite's with catalog `C`.
+struct DialectWithCatalog<C> {
+    catalog: C,
+}
+
+impl<C: turso_core::Catalog + 'static> Dialect for DialectWithCatalog<C> {
+    fn name(&self) -> &'static str {
+        "catalog-test"
+    }
+
+    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        SqliteDialect.parse(sql)
+    }
+
+    fn parse_internal(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> Result<turso_core::ast::ColumnDefinition> {
+        SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn parameter_marker_ranges(&self, sql: &str) -> Result<Vec<std::ops::Range<usize>>> {
+        SqliteDialect.parameter_marker_ranges(sql)
+    }
+
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
+    }
+
+    fn catalog(&self) -> &dyn turso_core::Catalog {
+        &self.catalog
+    }
+}
+
+struct CatalogWithAStep {
+    /// One entry for each run of the step: did the schema have table `t`?
+    table_seen_by_each_load: Arc<std::sync::Mutex<Vec<bool>>>,
+}
+
+impl turso_core::Catalog for CatalogWithAStep {
+    fn emit(
+        &self,
+        program: &mut turso_core::ProgramBuilder,
+        ctx: &turso_core::CmdContext<'_>,
+        cmd: &turso_core::CatalogCmd<'_>,
+    ) -> Result<()> {
+        turso_core::SqliteCatalog.emit(program, ctx, cmd)
+    }
+
+    fn load_steps(&self) -> Vec<Box<dyn turso_core::LoadStep>> {
+        vec![Box::new(LooksForTheTable {
+            queried: false,
+            table_seen_by_each_load: self.table_seen_by_each_load.clone(),
+        })]
+    }
+}
+
+/// A step that reads one row and notes whether table `t` is in the schema
+/// being loaded.
+struct LooksForTheTable {
+    queried: bool,
+    table_seen_by_each_load: Arc<std::sync::Mutex<Vec<bool>>>,
+}
+
+impl turso_core::LoadStep for LooksForTheTable {
+    fn next_query(
+        &mut self,
+        _load: &mut turso_core::SchemaLoad,
+    ) -> Result<Option<turso_core::LoadQuery>> {
+        let query = (!self.queried).then(|| {
+            turso_core::LoadQuery::engine_metadata_read("SELECT count(*) FROM sqlite_schema")
+        });
+        self.queried = true;
+        Ok(query)
+    }
+
+    fn row(&mut self, load: &mut turso_core::SchemaLoad, _row: &turso_core::Row) -> Result<()> {
+        self.table_seen_by_each_load
+            .lock()
+            .unwrap()
+            .push(load.schema().has_table(turso_core::NamespaceId::ROOT, "t"));
+        Ok(())
+    }
+}
+
+/// A catalog's step runs after the engine's steps, so it can see the tables
+/// that they loaded.
+#[test]
+fn steps_of_the_catalog_run_after_the_engine_steps_at_open_and_at_reload() {
+    let table_seen_by_each_load = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialect = Arc::new(DialectWithCatalog {
+        catalog: CatalogWithAStep {
+            table_seen_by_each_load: table_seen_by_each_load.clone(),
+        },
+    });
+    let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", dialect).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert_eq!(*table_seen_by_each_load.lock().unwrap(), [false]);
+    conn.execute("CREATE TABLE t (x)").unwrap();
+
+    conn.force_reparse_schema_without_publish().unwrap();
+
+    assert_eq!(*table_seen_by_each_load.lock().unwrap(), [false, true]);
+}
+
+/// A catalog that stores what SQLite's stores and notes the commands about
+/// triggers and virtual tables that it gets.
+struct NotesCommands {
+    commands: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl turso_core::Catalog for NotesCommands {
+    fn emit(
+        &self,
+        program: &mut turso_core::ProgramBuilder,
+        ctx: &turso_core::CmdContext<'_>,
+        cmd: &turso_core::CatalogCmd<'_>,
+    ) -> Result<()> {
+        match cmd {
+            turso_core::CatalogCmd::CreateTrigger(trigger) => {
+                self.commands.lock().unwrap().push(format!(
+                    "create {} on {}: {}",
+                    trigger.name, trigger.table, trigger.sql
+                ));
+            }
+            turso_core::CatalogCmd::DropTrigger(trigger) => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(format!("drop {}", trigger.name));
+            }
+            turso_core::CatalogCmd::CreateVirtualTable(table) => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(format!("create virtual table {}", table.name));
+            }
+            _ => {}
+        }
+        turso_core::SqliteCatalog.emit(program, ctx, cmd)
+    }
+}
+
+#[test]
+fn the_catalog_gets_a_new_trigger_and_a_dropped_trigger() {
+    let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialect = Arc::new(DialectWithCatalog {
+        catalog: NotesCommands {
+            commands: commands.clone(),
+        },
+    });
+    let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", dialect).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t (x)").unwrap();
+
+    conn.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END")
+        .unwrap();
+    conn.execute("DROP TRIGGER tr").unwrap();
+
+    assert_eq!(
+        *commands.lock().unwrap(),
+        [
+            "create tr on t: CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+            "drop tr"
+        ]
+    );
+}
+
+#[test]
+fn the_catalog_gets_a_new_virtual_table() {
+    let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialect = Arc::new(DialectWithCatalog {
+        catalog: NotesCommands {
+            commands: commands.clone(),
+        },
+    });
+    let options = OpenOptions::new(dialect).native_module(
+        "one_row",
+        turso_ext::VTabKind::VirtualTable,
+        TestCatalogTable,
+    );
+    let db = Database::open(Arc::new(MemoryIO::new()), ":memory:", options).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.execute("CREATE VIRTUAL TABLE v USING one_row")
+        .unwrap();
+
+    assert_eq!(*commands.lock().unwrap(), ["create virtual table v"]);
 }

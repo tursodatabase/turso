@@ -478,17 +478,12 @@ expect error {
     invalid input value for enum "it's ""x""": "b"
 }
 
-@compat-gap "type:date"
 test select-cast-to-domain {
     CREATE DOMAIN dd AS date;
     SELECT '2024-01-01'::dd;
 }
 expect {
     2024-01-01
-}
-@sqlstate 0A000
-expect @tursopg error {
-    type "date" is not supported
 }
 
 test select-cast-to-domain-checks-constraint {
@@ -497,6 +492,13 @@ test select-cast-to-domain-checks-constraint {
 }
 @sqlstate 23514
 expect error {}
+
+test select-cast-function-integer-to-boolean {
+    SELECT bool(5), bool(0);
+}
+expect {
+    t|f
+}
 
 test select-cast-integer-to-domain-over-boolean {
     CREATE DOMAIN db AS boolean;
@@ -518,7 +520,7 @@ test select-cast-text-that-is-not-a-boolean-to-domain-over-boolean-errors {
 }
 expect error {}
 
-@compat-gap "type:date"
+@compat-gap "type:time"
 test select-cast-text-to-date-and-time {
     SELECT '2024-01-15 10:30:00'::date, CAST('2024-01-15 10:30:00' AS time);
 }
@@ -527,7 +529,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    type "date" is not supported
+    type "time" is not supported
 }
 
 test select-cast-text-to-timestamp {
@@ -537,16 +539,11 @@ expect {
     2024-01-15 10:30:00
 }
 
-@compat-gap "type:date"
 test select-cast-invalid-text-to-date {
     SELECT 'hello'::date;
 }
 @sqlstate 22007
 expect error {}
-@sqlstate 0A000
-expect @tursopg error {
-    type "date" is not supported
-}
 
 test select-cast-invalid-text-to-timestamp {
     SELECT 'hello'::timestamp;
@@ -872,7 +869,7 @@ test exists-subquery-with-empty-select-list-rejects-group-by-position {
 expect error {
 }
 
-@compat-gap "type:date"
+@compat-gap "type:timetz"
 test select-current-data-and-time {
     SELECT 'ok'
     WHERE CURRENT_DATE IS NOT NULL
@@ -884,7 +881,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    type "date" is not supported
+    type "timetz" is not supported
 }
 
 setup comma_and_join {
@@ -1940,6 +1937,196 @@ expect {
     3
 }
 
+test recursive-cte-limit-is-not-implemented {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 LIMIT 2) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    LIMIT in a recursive query is not implemented
+}
+
+test recursive-cte-fetch-first-is-not-implemented {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 FETCH FIRST 2 ROWS ONLY) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    LIMIT in a recursive query is not implemented
+}
+
+test recursive-cte-limit-all-is-not-implemented {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 LIMIT ALL) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    LIMIT in a recursive query is not implemented
+}
+
+test recursive-cte-offset-is-not-implemented {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 OFFSET 3) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    OFFSET in a recursive query is not implemented
+}
+
+test recursive-cte-limit-and-offset-reports-offset {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 LIMIT 10 OFFSET 1) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    OFFSET in a recursive query is not implemented
+}
+
+test recursive-cte-offset-null-is-not-implemented {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 LIMIT 5 OFFSET NULL) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    OFFSET in a recursive query is not implemented
+}
+
+test recursive-cte-order-by-is-not-implemented {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 ORDER BY 1 DESC) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    ORDER BY in a recursive query is not implemented
+}
+
+test recursive-cte-order-by-with-self-reference-only-in-order-by {
+    WITH RECURSIVE x(n) AS (SELECT 0 UNION SELECT 1 ORDER BY (SELECT n FROM x)) SELECT * FROM x;
+}
+@sqlstate 0A000
+expect error {
+    ORDER BY in a recursive query is not implemented
+}
+
+test recursive-cte-intersect-with-limit-is-not-union {
+    WITH RECURSIVE r(n) AS (SELECT 1 INTERSECT SELECT n FROM r LIMIT 1) SELECT n FROM r;
+}
+@sqlstate 42P19
+expect error {
+    recursive query "r" does not have the form non-recursive-term UNION \[ALL\] recursive-term
+}
+
+test recursive-cte-except-with-order-by-is-not-union {
+    WITH RECURSIVE r(n) AS (SELECT 1 EXCEPT SELECT n FROM r ORDER BY 1) SELECT n FROM r;
+}
+@sqlstate 42P19
+expect error {
+    recursive query "r" does not have the form non-recursive-term UNION \[ALL\] recursive-term
+}
+
+test recursive-cte-intersect-is-not-union {
+    WITH RECURSIVE r(n) AS (SELECT 1 INTERSECT SELECT n FROM r) SELECT n FROM r;
+}
+@sqlstate 42P19
+expect error {
+    recursive query "r" does not have the form non-recursive-term UNION \[ALL\] recursive-term
+}
+
+test recursive-cte-top-level-except-after-union-is-not-union {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT n + 1 FROM r WHERE n < 3 EXCEPT SELECT 2 LIMIT 1) SELECT n FROM r;
+}
+@sqlstate 42P19
+expect error {
+    recursive query "r" does not have the form non-recursive-term UNION \[ALL\] recursive-term
+}
+
+test recursive-cte-without-set-operation-is-not-union {
+    WITH RECURSIVE r(n) AS (SELECT n FROM r LIMIT 1) SELECT n FROM r;
+}
+@sqlstate 42P19
+expect error {
+    recursive query "r" does not have the form non-recursive-term UNION \[ALL\] recursive-term
+}
+
+test recursive-cte-for-update-is-not-implemented {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 FOR UPDATE) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    FOR UPDATE/SHARE in a recursive query is not implemented
+}
+
+test recursive-cte-limit-is-reported-before-cycle-clause {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 LIMIT 2) CYCLE n SET c USING p SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    LIMIT in a recursive query is not implemented
+}
+
+test recursive-cte-order-by-non-integer-constant-is-not-implemented {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3 ORDER BY 'a') SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    ORDER BY in a recursive query is not implemented
+}
+
+test recursive-cte-limit-is-not-implemented-when-no-query-reads-the-cte {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 LIMIT 2) SELECT 1;
+}
+@sqlstate 0A000
+expect error {
+    LIMIT in a recursive query is not implemented
+}
+
+test recursive-cte-limit-is-not-implemented-when-a-derived-table-has-its-name {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 LIMIT 2) SELECT n FROM (SELECT 5) AS r(n);
+}
+@sqlstate 0A000
+expect error {
+    LIMIT in a recursive query is not implemented
+}
+
+test create-view-with-recursive-cte-limit-is-not-implemented {
+    CREATE VIEW recursive_cte_limit_view AS WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 LIMIT 2) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    LIMIT in a recursive query is not implemented
+}
+
+test recursive-cte-reference-before-inner-cte-of-the-same-name-is-checked {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n FROM (WITH q(n) AS (SELECT n FROM r), r(n) AS (SELECT 5) SELECT n FROM q) s ORDER BY 1) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    ORDER BY in a recursive query is not implemented
+}
+
+test with-recursive-cte-reading-inner-cte-of-the-same-name-keeps-limit {
+    WITH RECURSIVE r(n) AS (WITH r(n) AS (SELECT 1) SELECT n FROM r UNION ALL SELECT 2 LIMIT 1) SELECT n FROM r;
+}
+expect {
+    1
+}
+
+test with-recursive-cte-reading-inner-cte-of-the-same-name-in-subquery-keeps-order-by {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n FROM (WITH r(n) AS (SELECT 5) SELECT n FROM r) s ORDER BY 1) SELECT n FROM r;
+}
+expect {
+    1
+    5
+}
+
+test with-recursive-cte-without-self-reference-keeps-limit-and-order-by {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 2 ORDER BY 1 DESC LIMIT 1) SELECT n FROM r;
+}
+expect {
+    2
+}
+
+test with-recursive-cte-without-self-reference-accepts-limit-all-and-offset-null {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 2 LIMIT ALL OFFSET NULL) SELECT n FROM r;
+}
+expect {
+    1
+    2
+}
+
 test limit-negative-is-an-error {
     SELECT * FROM generate_series(1, 3) LIMIT -1;
 }
@@ -2162,6 +2349,7 @@ expect {
     4.00|1
 }
 
+@compat-gap "syntax:window-range-offset"
 test window-range-offset-over-date-is-an-error {
     CREATE TABLE range_dates(d date);
     SELECT count(*) OVER (ORDER BY d RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM range_dates;
@@ -2170,9 +2358,9 @@ test window-range-offset-over-date-is-an-error {
 expect error {
     RANGE with offset PRECEDING/FOLLOWING is not supported for column type date
 }
-@sqlstate 0A000
+@sqlstate 42601
 expect @tursopg error {
-    type "date" is not supported
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type date
 }
 
 test window-range-decimal-offset-over-bigint-is-an-error {

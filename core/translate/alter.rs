@@ -1,4 +1,5 @@
 use crate::alloc::TursoIteratorExt;
+use crate::ast::{self, TableInternalId};
 use crate::dialect::{
     AccessStatement, AddColumn, AlterColumn, CatalogCmd, CmdContext, DropColumn, NewOwner,
     RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, TempTriggerOfRenamedTable,
@@ -9,7 +10,6 @@ use crate::sync::Arc;
 use crate::translate::row_security;
 use crate::types::StrictType;
 use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
-use turso_parser::ast::{self, TableInternalId};
 
 use super::{
     index::emit_refill_index,
@@ -1186,7 +1186,7 @@ pub fn translate_alter_table(
             column = btree.columns().last().unwrap().clone();
 
             if is_stored {
-                btree.check_stored_columns_have_no_custom_types(resolver.schema())?;
+                btree.check_stored_columns_have_no_composite_types(resolver.schema())?;
                 emit_halt_if_table_has_rows(
                     program,
                     &original_btree,

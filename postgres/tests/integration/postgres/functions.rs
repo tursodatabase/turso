@@ -715,18 +715,37 @@ fn test_pg_native_timestamps_are_registered_before_connection_wrapping(db: TempD
         let Value::Text(timestamp) = &rows[0][0] else {
             panic!("expected timestamp text for {name}")
         };
-        assert_eq!(timestamp.as_str().len(), 23);
-        for (index, separator) in [
-            (4, b'-'),
-            (7, b'-'),
-            (10, b' '),
-            (13, b':'),
-            (16, b':'),
-            (19, b'.'),
-        ] {
-            assert_eq!(timestamp.as_str().as_bytes()[index], separator, "{name}");
-        }
+        assert!(
+            is_timestamp_text(timestamp.as_str()),
+            "{name} returned {}",
+            timestamp.as_str()
+        );
     }
+}
+
+/// Whether `text` is `YYYY-MM-DD HH:MM:SS`, optionally followed by `.` and one
+/// to six digits, the form PostgreSQL prints a timestamp in.
+fn is_timestamp_text(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() < 19 {
+        return false;
+    }
+    let (seconds, fraction) = bytes.split_at(19);
+    let seconds_match = seconds
+        .iter()
+        .zip(b"0000-00-00 00:00:00")
+        .all(|(byte, pattern)| match pattern {
+            b'0' => byte.is_ascii_digit(),
+            _ => byte == pattern,
+        });
+    let fraction_match = match fraction {
+        [] => true,
+        [b'.', digits @ ..] => {
+            (1..=6).contains(&digits.len()) && digits.iter().all(u8::is_ascii_digit)
+        }
+        _ => false,
+    };
+    seconds_match && fraction_match
 }
 
 #[turso_macros::test(mvcc)]
@@ -902,4 +921,89 @@ fn test_pg_stored_star_argument_of_scalar_function_still_loads(db: TempDatabase)
         [1]
     );
     assert!(conn.execute("SELECT pi(*)").is_err());
+}
+
+/// A Data API sends the values of a filter as parameters. `->>` compares them
+/// as text, reads a text parameter as the name of a field, and reads an
+/// integer parameter as the index of an array element.
+#[turso_macros::test(mvcc)]
+fn test_pg_jsonb_arrows_with_parameters(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE items (id int PRIMARY KEY, data jsonb)")
+        .unwrap();
+    conn.execute(
+        r#"INSERT INTO items VALUES (1, '{"qty":10,"$.a":"x"}'), (2, '{"qty":2,"dims":{"w":20}}'), (3, '[5,6]')"#,
+    )
+    .unwrap();
+    let param = |index| std::num::NonZero::new(index).unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT id FROM items WHERE data ->> $1 = $2")
+        .unwrap();
+    for (key, value, expected_id) in [("qty", "2", 2), ("qty", "10", 1), ("$.a", "x", 1)] {
+        stmt.bind_at(param(1), Value::build_text(key)).unwrap();
+        stmt.bind_at(param(2), Value::build_text(value)).unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(expected_id)]],
+            "data ->> '{key}' = '{value}'"
+        );
+        stmt.reset().unwrap();
+    }
+
+    let mut stmt = conn
+        .prepare("SELECT id FROM items WHERE data -> $1 ->> $2 = $3")
+        .unwrap();
+    stmt.bind_at(param(1), Value::build_text("dims")).unwrap();
+    stmt.bind_at(param(2), Value::build_text("w")).unwrap();
+    stmt.bind_at(param(3), Value::build_text("20")).unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![vec![Value::from_i64(2)]]
+    );
+
+    let mut stmt = conn
+        .prepare("SELECT data ->> $1 FROM items WHERE id = 3")
+        .unwrap();
+    stmt.bind_at(param(1), Value::from_i64(-1)).unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("6")]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_containment_with_parameters(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE items (id int PRIMARY KEY, data jsonb, tags text[])")
+        .unwrap();
+    conn.execute(
+        r#"INSERT INTO items VALUES (1, '{"qty":10,"tags":["fruit"]}', '{fruit,red}'), (2, '{"qty":2}', '{bakery}')"#,
+    )
+    .unwrap();
+    let param = |index| std::num::NonZero::new(index).unwrap();
+
+    for (sql, value, expected_id) in [
+        ("SELECT id FROM items WHERE data @> $1", r#"{"qty":2}"#, 2),
+        (
+            "SELECT id FROM items WHERE data @> $1",
+            r#"{"tags":["fruit"]}"#,
+            1,
+        ),
+        (
+            "SELECT id FROM items WHERE data <@ $1",
+            r#"{"qty":2,"other":1}"#,
+            2,
+        ),
+        ("SELECT id FROM items WHERE tags @> $1", "{red}", 1),
+        ("SELECT id FROM items WHERE tags <@ $1", "{bakery,bread}", 2),
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.bind_at(param(1), Value::build_text(value)).unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(expected_id)]],
+            "{sql} with $1 = {value}"
+        );
+    }
 }

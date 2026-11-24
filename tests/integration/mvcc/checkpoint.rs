@@ -40,7 +40,7 @@ const MANY_ROWS: usize = COLLECT_PREEMPTION_THRESHOLD + 10;
 #[test]
 fn collection_yields_while_walking_many_table_rows() {
     for walk in [Walk::EveryRow, Walk::ChangedRows] {
-        let db = TempDatabase::new_with_mvcc("collect_many_table_rows");
+        let db = database_for_walk("collect_many_table_rows", walk);
         let conn = connect_without_auto_checkpoint(&db);
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
             .unwrap();
@@ -111,7 +111,7 @@ fn collection_yields_while_walking_many_schema_rows() {
 #[test]
 fn collection_yields_while_walking_many_index_rows() {
     for walk in [Walk::EveryRow, Walk::ChangedRows] {
-        let db = TempDatabase::new_with_mvcc("collect_many_index_rows");
+        let db = database_for_walk("collect_many_index_rows", walk);
         let conn = connect_without_auto_checkpoint(&db);
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
             .unwrap();
@@ -171,7 +171,7 @@ fn rows_of_a_table_dropped_before_its_first_checkpoint_are_not_collected() {
 
 #[test]
 fn only_table_rows_changed_since_the_last_checkpoint_are_collected() {
-    let db = TempDatabase::new_with_mvcc("collect_changed_table_rows");
+    let db = passive_checkpoint_database("collect_changed_table_rows");
     let conn = connect_without_auto_checkpoint(&db);
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
@@ -194,7 +194,7 @@ fn only_table_rows_changed_since_the_last_checkpoint_are_collected() {
 
 #[test]
 fn only_index_rows_changed_since_the_last_checkpoint_are_collected() {
-    let db = TempDatabase::new_with_mvcc("collect_changed_index_rows");
+    let db = passive_checkpoint_database("collect_changed_index_rows");
     let conn = connect_without_auto_checkpoint(&db);
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
@@ -213,7 +213,7 @@ fn only_index_rows_changed_since_the_last_checkpoint_are_collected() {
 
 #[test]
 fn first_checkpoint_after_reopen_collects_rows_that_no_commit_marked() {
-    let db = TempDatabase::new_with_mvcc("collect_after_reopen");
+    let db = passive_checkpoint_database("collect_after_reopen");
     {
         let conn = connect_without_auto_checkpoint(&db);
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -223,7 +223,10 @@ fn first_checkpoint_after_reopen_collects_rows_that_no_commit_marked() {
     }
     let path = db.path.clone();
     drop(db);
-    let db = TempDatabase::new_with_existent(&path);
+    let db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true),
+    );
     let conn = connect_without_auto_checkpoint(&db);
     let table = btree_id(&conn, "t");
     assert!(
@@ -398,7 +401,7 @@ fn row_changed_after_collection_stays_marked_for_the_next_checkpoint() {
 
 #[test]
 fn clearing_the_marks_yields_on_many_rows() {
-    let db = TempDatabase::new_with_mvcc("prune_many_rows");
+    let db = passive_checkpoint_database("prune_many_rows");
     let conn = connect_without_auto_checkpoint(&db);
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
@@ -416,6 +419,152 @@ fn clearing_the_marks_yields_on_many_rows() {
     checkpoint.finish();
 
     assert!(store.checkpoint_dirty_table_keys.is_empty());
+}
+
+/// With the passive checkpoint off, commits mark no row as changed, and a blocking checkpoint
+/// still writes every row and index entry committed since the last checkpoint.
+#[test]
+fn blocking_checkpoint_writes_rows_that_no_commit_marked() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+        insert_rows(&conn, "t", 1, 5);
+        let store = db.get_mvcc_store();
+        assert!(store.checkpoint_dirty_table_keys.is_empty());
+        assert!(store.checkpoint_dirty_index_keys.is_empty());
+
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("UPDATE t SET v = 'changed' WHERE id = 2")
+            .unwrap();
+        conn.execute("DELETE FROM t WHERE id = 3").unwrap();
+        conn.execute("INSERT INTO t VALUES (6, 'new')").unwrap();
+        assert!(
+            store.checkpoint_dirty_table_keys.is_empty(),
+            "a commit must not mark table rows when the passive checkpoint is off"
+        );
+        assert!(
+            store.checkpoint_dirty_index_keys.is_empty(),
+            "a commit must not mark index rows when the passive checkpoint is off"
+        );
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        get_rows(&conn, "SELECT id, v FROM t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), Value::build_text("v00000001")],
+            vec![Value::from_i64(2), Value::build_text("changed")],
+            vec![Value::from_i64(4), Value::build_text("v00000004")],
+            vec![Value::from_i64(5), Value::build_text("v00000005")],
+            vec![Value::from_i64(6), Value::build_text("new")],
+        ]
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM t INDEXED BY t_v ORDER BY v"),
+        [2, 6, 1, 4, 5].map(|id| vec![Value::from_i64(id)]).to_vec(),
+        "the index entries follow the rows"
+    );
+    assert_eq!(
+        get_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+}
+
+/// A blocking checkpoint cannot start while a commit is paused just before the step where a
+/// commit with the passive checkpoint on marks its rows. The next checkpoint writes the row.
+#[test]
+fn blocking_checkpoint_waits_for_a_commit_paused_before_marking_rows() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        let writer = db.connect();
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer
+            .execute("INSERT INTO t VALUES (1, 'paused')")
+            .unwrap();
+        writer.set_yield_injector(Some(FixedYieldInjector::new([
+            CommitYieldPoint::LogRecordPrepared.point(),
+        ])));
+        let mut commit = writer.prepare("COMMIT").unwrap();
+        assert!(
+            matches!(commit.step().unwrap(), StepResult::Yield),
+            "the commit must pause after it takes its commit timestamp"
+        );
+        assert!(
+            matches!(
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)"),
+                Err(LimboError::Busy)
+            ),
+            "a blocking checkpoint must not run while a commit is in progress"
+        );
+        commit.run_ignore_rows().unwrap();
+        drop(commit);
+        assert!(db.get_mvcc_store().checkpoint_dirty_table_keys.is_empty());
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        get_rows(&conn, "SELECT id, v FROM t"),
+        vec![vec![Value::from_i64(1), Value::build_text("paused")]]
+    );
+}
+
+/// A commit that is abandoned after it takes its commit timestamp rolls back. With the passive
+/// checkpoint off it leaves no marked row, and the next blocking checkpoint writes only the
+/// rows of the transactions that committed.
+#[test]
+fn blocking_checkpoint_after_an_abandoned_commit_writes_only_committed_rows() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'committed')")
+            .unwrap();
+
+        let writer = db.connect();
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer
+            .execute("INSERT INTO t VALUES (2, 'abandoned')")
+            .unwrap();
+        writer.set_yield_injector(Some(FixedYieldInjector::new([
+            CommitYieldPoint::LogRecordPrepared.point(),
+        ])));
+        {
+            let mut commit = writer.prepare("COMMIT").unwrap();
+            assert!(matches!(commit.step().unwrap(), StepResult::Yield));
+        }
+        writer.set_yield_injector(None);
+        let store = db.get_mvcc_store();
+        assert!(store.checkpoint_dirty_table_keys.is_empty());
+
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        assert!(store.checkpoint_dirty_table_keys.is_empty());
+    }
+
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        get_rows(&conn, "SELECT id, v FROM t"),
+        vec![vec![Value::from_i64(1), Value::build_text("committed")]]
+    );
 }
 
 #[test]
@@ -2292,6 +2441,190 @@ fn recovered_rows_are_written_by_the_first_checkpoint_after_restart() {
         1,
         "row replayed from the logical log was not checkpointed: {rows:?}"
     );
+}
+
+/// A passive checkpoint runs while a COMMIT rewrites its row versions from its
+/// transaction id to its timestamp, and stamps those versions as written. The
+/// rewrite must keep the stamps: the checkpoint removed the keys from the dirty
+/// set, so no later checkpoint stamps them again, and GC would never drop the
+/// versions.
+///
+/// The checkpoint includes the rows of the COMMIT only if its snapshot reaches
+/// a later commit B, so B must finish while the COMMIT is still in the rewrite.
+/// Without group commit, the COMMIT waits in BuildLogRecord with its end
+/// timestamp while B commits. With group commit, a leader writes the record of
+/// the COMMIT and finishes first.
+#[test]
+fn checkpoint_during_commit_rewrite_keeps_written_versions_collectable() {
+    rewrite_window_checkpoint_test(false, CommitEnd::Finish);
+}
+
+/// Same as above, with the COMMIT written by a group commit leader.
+#[test]
+fn checkpoint_during_group_commit_rewrite_keeps_written_versions_collectable() {
+    rewrite_window_checkpoint_test(true, CommitEnd::Finish);
+}
+
+/// Same as above, but the COMMIT statement is dropped in the rewrite window,
+/// so the rest of the rewrite runs when the dropped statement is cleaned up.
+#[test]
+fn checkpoint_during_dropped_commit_rewrite_keeps_written_versions_collectable() {
+    rewrite_window_checkpoint_test(false, CommitEnd::Drop);
+}
+
+/// How [`rewrite_window_checkpoint_test`] ends the COMMIT it paused.
+#[derive(Clone, Copy)]
+enum CommitEnd {
+    Finish,
+    Drop,
+}
+
+fn rewrite_window_checkpoint_test(group_commit: bool, commit_end: CommitEnd) {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let setup = db.connect();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup
+        .execute(if group_commit {
+            "PRAGMA mvcc_group_commit = yes"
+        } else {
+            "PRAGMA mvcc_group_commit = no"
+        })
+        .unwrap();
+    setup
+        .execute("CREATE TABLE t(pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    let store = store(&setup);
+    let table = btree_id(&setup, "t");
+
+    // An open reader keeps GC from dropping the last version of a row, so the
+    // versions stamped during the rewrite are still in memory after it.
+    let reader = db.connect();
+    reader.execute("BEGIN").unwrap();
+    assert_eq!(
+        get_rows(&reader, "SELECT count(*) FROM t")[0][0],
+        Value::from_i64(0)
+    );
+
+    // More rows than one step of BuildLogRecord or of the rewrite handles, so
+    // both yield before they are done.
+    let conn_a = db.connect();
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    for pk in 1..=1100 {
+        conn_a
+            .execute(format!("INSERT INTO t VALUES ({pk}, {pk})"))
+            .unwrap();
+    }
+    let tx_a = conn_a.get_mv_tx().unwrap().0;
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+
+    let conn_leader = db.connect();
+    let conn_b = db.connect();
+    if group_commit {
+        // The leader waits for the commit lock first and A second, so the
+        // leader writes the records of both.
+        assert!(store.lock_commits_for_testing());
+        conn_leader.execute("BEGIN CONCURRENT").unwrap();
+        conn_leader
+            .execute("INSERT INTO t VALUES (9000, 1)")
+            .unwrap();
+        let mut commit_leader = conn_leader.prepare("COMMIT").unwrap();
+        step_commit_until_waiting(&mut commit_leader, &store, 1);
+        step_commit_until_waiting(&mut commit_a, &store, 2);
+        store.unlock_commits_for_testing();
+        step_commit_until_done(&mut commit_leader);
+    } else {
+        step_commit_until_state(&mut commit_a, &store, tx_a, |state| {
+            matches!(state, TransactionState::Preparing(_))
+        });
+        // B takes a larger end timestamp than A and commits to the end.
+        conn_b.execute("BEGIN CONCURRENT").unwrap();
+        conn_b.execute("INSERT INTO t VALUES (5000, 1)").unwrap();
+        conn_b.execute("COMMIT").unwrap();
+    }
+
+    step_commit_until_state(&mut commit_a, &store, tx_a, |state| {
+        matches!(state, TransactionState::Committed(_))
+    });
+    if group_commit {
+        // A holds no commit lock in the rewrite, so B leads alone and finishes.
+        conn_b.execute("BEGIN CONCURRENT").unwrap();
+        conn_b.execute("INSERT INTO t VALUES (5000, 1)").unwrap();
+        conn_b.execute("COMMIT").unwrap();
+    }
+
+    let checkpointer = db.connect();
+    checkpointer
+        .execute("PRAGMA wal_checkpoint(PASSIVE)")
+        .unwrap();
+
+    match commit_end {
+        CommitEnd::Finish => step_commit_until_done(&mut commit_a),
+        CommitEnd::Drop => drop(commit_a),
+    }
+    assert!(store.tx_snapshot(tx_a).is_none(), "COMMIT of A did not end");
+    reader.execute("COMMIT").unwrap();
+    for _ in 0..3 {
+        checkpointer
+            .execute("PRAGMA wal_checkpoint(PASSIVE)")
+            .unwrap();
+    }
+
+    let check = db.connect();
+    let expected_rows = if group_commit { 1102 } else { 1101 };
+    assert_eq!(
+        get_rows(&check, "SELECT count(*) FROM t")[0][0],
+        Value::from_i64(expected_rows)
+    );
+    assert_eq!(
+        table_version_count(&store, table),
+        0,
+        "versions stamped by the checkpoint during the rewrite stayed in memory"
+    );
+}
+
+/// Steps a COMMIT until `waiting` commits wait for the commit lock.
+fn step_commit_until_waiting(commit: &mut turso_core::Statement, store: &Store, waiting: usize) {
+    for _ in 0..1000 {
+        if store.waiting_commit_count_for_testing() == waiting {
+            return;
+        }
+        commit.step().unwrap();
+    }
+    panic!("COMMIT never waited for the commit lock");
+}
+
+fn step_commit_until_done(commit: &mut turso_core::Statement) {
+    for _ in 0..100_000 {
+        match commit.step().unwrap() {
+            StepResult::Done => return,
+            StepResult::IO | StepResult::Yield => {}
+            other => panic!("COMMIT returned {other:?}"),
+        }
+    }
+    panic!("COMMIT did not finish");
+}
+
+/// Steps a COMMIT until a step returns IO or Yield while the transaction is in
+/// a state that `reached` accepts.
+fn step_commit_until_state(
+    commit: &mut turso_core::Statement,
+    store: &Store,
+    tx_id: u64,
+    reached: impl Fn(TransactionState) -> bool,
+) {
+    for _ in 0..100_000 {
+        match commit.step().unwrap() {
+            StepResult::IO | StepResult::Yield => {
+                if reached(store.tx_snapshot(tx_id).unwrap().state) {
+                    return;
+                }
+            }
+            other => panic!("COMMIT returned {other:?} before the expected state"),
+        }
+    }
+    panic!("COMMIT never yielded in the expected state");
 }
 
 /// What this test checks: Checkpoint transitions preserve DB/WAL/log ordering and watermark updates for the tested edge case.
@@ -5058,10 +5391,19 @@ const PASSIVE: CheckpointMode = CheckpointMode::Passive {
 /// Which rows the checkpoint under test walks to find what to write.
 #[derive(Debug, Clone, Copy)]
 enum Walk {
-    /// Every row in the store. The first checkpoint after an open does this.
+    /// Every row in the store. A blocking checkpoint, and the first passive checkpoint after
+    /// an open, do this.
     EveryRow,
-    /// Only the rows that commits marked as changed. Later checkpoints do this.
+    /// Only the rows that commits marked as changed. Later passive checkpoints do this.
     ChangedRows,
+}
+
+/// A database whose checkpoints can do `walk`: only a passive checkpoint walks changed rows.
+fn database_for_walk(name: &str, walk: Walk) -> TempDatabase {
+    match walk {
+        Walk::EveryRow => TempDatabase::new_with_mvcc(name),
+        Walk::ChangedRows => passive_checkpoint_database(name),
+    }
 }
 
 /// Completes one checkpoint first when the test wants the next one to walk changed rows only.
@@ -5752,6 +6094,7 @@ fn update_survives_restart_when_prune_cannot_mark_its_key_again() {
                         fault.clone(),
                     )),
                     fts: turso_core::alloc::DynAllocator::default(),
+                    statement: turso_core::alloc::DynAllocator::default(),
                 }),
         )
         .unwrap();
@@ -6013,4 +6356,42 @@ fn close_of_last_connection_fsyncs_wal_with_frames_not_in_db_file() {
     let before = io.counts();
     reader.close().unwrap();
     assert_eq!(io.counts().wal - before.wal, 1);
+}
+
+/// A checkpoint whose logical-log truncate completes on a later I/O step must
+/// still leave the log offset at 0, so that VACUUM and the connection statistics see
+/// the empty log.
+#[test]
+fn checkpoint_with_queued_log_truncate_resets_log_offset() {
+    use crate::queued_io::QueuedIo;
+
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open_file_with_flags(
+        io,
+        "queued-truncate.db",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_vacuum(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let mv_store = conn.mv_store().as_ref().unwrap().clone();
+    assert!(mv_store.logical_log_offset() > 0);
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(mv_store.logical_log_offset(), 0);
+    conn.execute("VACUUM").unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT id, v FROM t"),
+        vec![vec![Value::from_i64(1), Value::build_text("a")]]
+    );
 }

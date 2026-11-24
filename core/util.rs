@@ -1,3 +1,4 @@
+use crate::ast::{self, Expr, Literal, UnaryOperator};
 use crate::dialect::Dialect;
 use crate::namespace::NamespaceId;
 use crate::numeric::StrToF64;
@@ -19,7 +20,6 @@ use either::Either;
 use rustc_hash::FxHashMap as HashMap;
 use std::future::Future;
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{self, Expr, Literal, UnaryOperator};
 
 #[macro_export]
 macro_rules! io_yield_one {
@@ -134,7 +134,7 @@ pub fn escape_sql_string_literal(literal: &str) -> String {
 /// Format an identifier for error messages the way SQLite's `%T` does: the
 /// token exactly as the user wrote it, keeping the original quote characters.
 /// `CREATE TABLE "t"` reports an existing table as `table "t" already exists`.
-pub fn identifier_token_for_error(name: &turso_parser::ast::Name) -> String {
+pub fn identifier_token_for_error(name: &crate::ast::Name) -> String {
     if name.quoted() {
         name.as_ident()
     } else {
@@ -206,7 +206,7 @@ pub fn dequote(source: &str) -> String {
 /// Format a table reference for error messages the way SQLite does: the name
 /// as the user wrote it with quotes stripped, keeping any database prefix.
 /// `SELECT * FROM main."T1"` reports the missing table as `main.T1`.
-pub fn table_name_for_error(name: &turso_parser::ast::QualifiedName) -> String {
+pub fn table_name_for_error(name: &crate::ast::QualifiedName) -> String {
     match &name.namespace {
         Some(db) => format!("{}.{}", db.as_str(), name.name.as_str()),
         None => name.name.as_str().to_owned(),
@@ -1151,6 +1151,14 @@ pub fn checked_cast_text_to_numeric(text: &str, lossless: bool) -> std::result::
         return Err(());
     }
 
+    // `str_to_f64` rounds the same way as sqlite3AtoF. `str::parse::<f64>` rounds
+    // correctly, which gives a different double for some inputs.
+    let parse_real = || {
+        f64::from(
+            crate::numeric::str_to_f64(text)
+                .expect("parse_numeric_str returns text with at least one digit"),
+        )
+    };
     match kind {
         ValueType::Integer => match text.parse::<i64>() {
             Ok(i) => Ok(Value::from_i64(i)),
@@ -1160,19 +1168,13 @@ pub fn checked_cast_text_to_numeric(text: &str, lossless: bool) -> std::result::
                     std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow
                 ) {
                     // if overflow, we return the representation as a real.
-                    // we have to match sqlite exactly here, so we match sqlite3AtoF
-                    let value = text.parse::<f64>().unwrap_or_default();
-                    let factor = 10f64.powi(15 - value.abs().log10().ceil() as i32);
-                    Ok(Value::from_f64((value * factor).round() / factor))
+                    Ok(Value::from_f64(parse_real()))
                 } else {
                     Err(())
                 }
             }
         },
-        ValueType::Float => {
-            let value = text.parse::<f64>().unwrap_or(0.0);
-            Ok(real_to_numeric_value(value))
-        }
+        ValueType::Float => Ok(real_to_numeric_value(parse_real())),
         _ => unreachable!(),
     }
 }
@@ -1241,13 +1243,15 @@ fn parse_numeric_str(text: &str) -> Result<(ValueType, &str), ()> {
     if !has_mantissa_digit {
         return Err(());
     }
-    // edge case: if it ends with exponent, strip and cast valid digits as float
+    // like sqlite3AtoF, an exponent with no digits ("12e", "12e+") is not part of
+    // the number, so it does not make the text a real either
     let last = bytes[end - 1];
     if last.eq_ignore_ascii_case(&b'e') {
-        return Ok((ValueType::Float, &text[0..end - 1]));
-    // edge case: ends with extponent / sign
+        end -= 1;
+        has_exponent = false;
     } else if has_exponent && (last == b'-' || last == b'+') {
-        return Ok((ValueType::Float, &text[0..end - 2]));
+        end -= 2;
+        has_exponent = false;
     }
     Ok((
         if !has_decimal && !has_exponent {
@@ -2178,8 +2182,8 @@ pub fn check_expr_references_column(expr: &ast::Expr, col_name_normalized: &str)
 pub mod tests {
     use super::*;
 
+    use crate::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type, Variable};
     use crate::schema::Type as SchemaValueType;
-    use turso_parser::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type, Variable};
 
     #[test]
     fn test_normalize_ident() {
@@ -2837,7 +2841,7 @@ pub mod tests {
         // Overflow becomes Float (different from cast_text_to_integer which returned 0)
         assert_eq!(
             checked_cast_text_to_numeric("9223372036854775808", false).unwrap(),
-            Value::from_f64(9.22337203685478e18)
+            Value::from_f64(9223372036854775808.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-9223372036854775808", false).unwrap(),
@@ -2846,7 +2850,7 @@ pub mod tests {
         // Overflow becomes Float (different from cast_text_to_integer which returned 0)
         assert_eq!(
             checked_cast_text_to_numeric("-9223372036854775809", false).unwrap(),
-            Value::from_f64(-9.22337203685478e18)
+            Value::from_f64(-9223372036854775808.0)
         );
         assert!(checked_cast_text_to_numeric("-", false).is_err());
     }
@@ -3006,7 +3010,7 @@ pub mod tests {
         );
         assert_eq!(
             checked_cast_text_to_numeric("9223372036854775808", false).unwrap(),
-            Value::from_f64(9.22337203685478e18)
+            Value::from_f64(9223372036854775808.0)
         ); // Exceeds i64, becomes float
         assert_eq!(
             checked_cast_text_to_numeric("-9223372036854775808", false).unwrap(),
@@ -3014,7 +3018,7 @@ pub mod tests {
         );
         assert_eq!(
             checked_cast_text_to_numeric("-9223372036854775809", false).unwrap(),
-            Value::from_f64(-9.22337203685478e18)
+            Value::from_f64(-9223372036854775808.0)
         ); // Exceeds i64, becomes float
 
         assert_eq!(
@@ -3165,11 +3169,12 @@ pub mod tests {
 
     #[test]
     fn test_parse_numeric_str_edge_cases() {
-        assert_eq!(parse_numeric_str("1e"), Ok((ValueType::Float, "1")));
-        assert_eq!(parse_numeric_str("1e-"), Ok((ValueType::Float, "1")));
-        assert_eq!(parse_numeric_str("1e+"), Ok((ValueType::Float, "1")));
-        assert_eq!(parse_numeric_str("-1e"), Ok((ValueType::Float, "-1")));
-        assert_eq!(parse_numeric_str("-1e-"), Ok((ValueType::Float, "-1")));
+        assert_eq!(parse_numeric_str("1e"), Ok((ValueType::Integer, "1")));
+        assert_eq!(parse_numeric_str("1e-"), Ok((ValueType::Integer, "1")));
+        assert_eq!(parse_numeric_str("1e+"), Ok((ValueType::Integer, "1")));
+        assert_eq!(parse_numeric_str("-1e"), Ok((ValueType::Integer, "-1")));
+        assert_eq!(parse_numeric_str("-1e-"), Ok((ValueType::Integer, "-1")));
+        assert_eq!(parse_numeric_str("1.e"), Ok((ValueType::Float, "1.")));
     }
 
     #[test]
@@ -3491,7 +3496,7 @@ pub mod tests {
 
     #[test]
     fn capture_parameters_treats_numbered_markers_as_placeholders() {
-        use turso_parser::ast::{Literal, Variable};
+        use crate::ast::{Literal, Variable};
         // Index-method patterns use ?N to share one captured argument
         // across several call sites (fts_score/fts_match); a numbered
         // marker carries its "?N" spelling as its name and must still

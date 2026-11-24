@@ -1,9 +1,9 @@
 use crate::{alloc, turso_assert, turso_assert_eq, types::AsValueRef, Result, Value, ValueRef};
 
+use crate::ast::{self, ResolveType, SortOrder, TableInternalId};
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Range;
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
 use crate::{
     index_method::IndexMethodAttachment,
@@ -284,6 +284,16 @@ pub struct ProgramBuilder {
     /// that are deemed to be compile-time constant and can be hoisted out of loops
     /// so that they get evaluated only once at the start of the program.
     pub constant_spans: Vec<(usize, usize)>,
+    /// Constant expressions that `resolve_expr` moved to the init section, with
+    /// the register that holds the value of each. An equal constant reads that
+    /// register instead of loading the value again, as SQLite's
+    /// `sqlite3ExprCodeRunJustOnce()` does.
+    reusable_constants: Vec<(ast::Expr, usize)>,
+    /// The number of [Self::constants_in_place_start] calls that
+    /// [Self::constant_spans_invalidate_after] has not ended. While it is not
+    /// zero, a constant stays where it is emitted, so its register cannot be
+    /// reused.
+    constants_in_place_depth: usize,
     /// Cursors that are referenced by the program. Indexed by [CursorKey].
     /// Certain types of cursors do not need a [CursorKey] (e.g. temp tables, sorter),
     /// because they never need to use [ProgramBuilder::resolve_cursor_id] to find it
@@ -294,7 +304,15 @@ pub struct ProgramBuilder {
     /// before* the label's logical "next-insn" anchor. The label resolves to
     /// `anchor_offset + 1` so it tracks whichever instruction ends up at that
     /// position, even after `emit_constant_insns` reorders the program.
+    /// Only `set_label_anchor` writes an anchor, so that `max_label_anchor`
+    /// stays correct.
     label_to_resolved_offset: Vec<Option<InsnReference>>,
+    /// The largest anchor in `label_to_resolved_offset`. While instructions
+    /// are emitted, a label is only anchored to the last instruction or to the
+    /// anchor of another label, so no anchor is past the last instruction, and
+    /// a label targets the next instruction exactly when this anchor is the
+    /// last instruction.
+    max_label_anchor: Option<InsnReference>,
     explain: ExplainInfo,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
@@ -347,7 +365,8 @@ pub struct ProgramBuilder {
     /// The mode in which the query is being executed.
     mode: BuilderQueryMode,
     pub flags: ProgramBuilderFlags,
-    /// True once any `Insn::Function` has been emitted. See [`Self::may_abort`].
+    /// True once any `Insn::Function` or `Insn::TypeConversion` has been
+    /// emitted. See [`Self::may_abort`].
     emitted_function_call: bool,
     next_free_register: usize,
     free_register_ranges: Vec<Range<usize>>,
@@ -762,6 +781,9 @@ macro_rules! emit_explain {
 impl ProgramBuilder {
     /// Register an `ast::Variable` in the parameter list. Returns the
     /// `NonZeroUsize` index for use in `Insn::Variable`.
+    // Translation registers each variable of a statement two times, and a
+    // multirow INSERT can have thousands of variables.
+    #[inline]
     pub fn register_variable(&mut self, variable: &ast::Variable) -> NonZeroUsize {
         let index = usize::try_from(variable.index.get())
             .expect("u32 variable index must fit into usize")
@@ -879,7 +901,10 @@ impl ProgramBuilder {
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
             constant_spans: Vec::new(),
+            reusable_constants: Vec::new(),
+            constants_in_place_depth: 0,
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
+            max_label_anchor: None,
             explain: ExplainInfo::default(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
@@ -1146,6 +1171,24 @@ impl ProgramBuilder {
         self.subprogram_depth
     }
 
+    /// Nesting level of a trigger or foreign key action program that this
+    /// program starts, or `None` when that level is past
+    /// [MAX_TRIGGER_DEPTH](crate::vdbe::MAX_TRIGGER_DEPTH). For `None`, the
+    /// method emits a `Halt` with the error of SQLite instead of the program.
+    /// Thus, as in SQLite, the error occurs only if the statement gets to that
+    /// level.
+    pub fn nested_subprogram_depth(&mut self) -> Option<usize> {
+        let depth = self.subprogram_depth + 1;
+        if depth > crate::vdbe::MAX_TRIGGER_DEPTH {
+            self.emit_halt_err(
+                crate::error::SQLITE_ERROR,
+                crate::vdbe::TRIGGER_DEPTH_ERROR.to_string(),
+            );
+            return None;
+        }
+        Some(depth)
+    }
+
     /// Whether the main database uses MVCC journal mode. See `Self::mvcc_enabled`.
     pub const fn is_mvcc_enabled(&self) -> bool {
         self.mvcc_enabled
@@ -1166,7 +1209,11 @@ impl ProgramBuilder {
     }
 
     pub fn extend(&mut self, opts: &ProgramBuilderOpts) {
-        self.insns.reserve(opts.approx_num_insns);
+        let needed = self.insns.len() + opts.approx_num_insns;
+        if needed > self.insns.capacity() {
+            // At least double the capacity, as `Vec::reserve` does.
+            self.move_insns_to_capacity(needed.max(2 * self.insns.capacity()));
+        }
         self.cursor_ref.reserve(opts.num_cursors);
         self.label_to_resolved_offset
             .reserve(opts.approx_num_labels);
@@ -1178,9 +1225,19 @@ impl ProgramBuilder {
     pub fn reserve_insns(&mut self, additional: usize) {
         let needed = self.insns.len() + additional;
         if needed > self.insns.capacity() {
-            self.insns
-                .reserve_exact(needed.next_power_of_two() - self.insns.len());
+            self.move_insns_to_capacity(needed.next_power_of_two());
         }
+    }
+
+    /// Move the instructions to a new allocation for `capacity` instructions.
+    /// `Vec::reserve` calls `realloc`, which copies all of the old allocation,
+    /// because it does not know which part of it holds instructions. When a
+    /// statement reserves its estimate, only a few of the 32 instructions that
+    /// the builder starts with are in use.
+    fn move_insns_to_capacity(&mut self, capacity: usize) {
+        let mut insns = Vec::with_capacity(capacity);
+        insns.append(&mut self.insns);
+        self.insns = insns;
     }
 
     /// Start a new constant span. The next instruction to be emitted will be the first
@@ -1227,7 +1284,12 @@ impl ProgramBuilder {
         );
         let first_span_of_emit = self.constant_spans.len();
         let first_insn = self.insns.len();
-        let result = emit(self)?;
+        // The code that `emit` emits can branch, so a constant inside it is
+        // not always loaded, and its register cannot be reused.
+        self.constants_in_place_depth += 1;
+        let result = emit(self);
+        self.constants_in_place_depth -= 1;
+        let result = result?;
         // One span over everything `emit` emitted replaces the spans of the
         // constant expressions inside it.
         self.constant_spans.truncate(first_span_of_emit);
@@ -1245,9 +1307,15 @@ impl ProgramBuilder {
     }
 
     /// Get the index of the next constant span.
-    /// Used in `crate::translate::expr::translate_expr_no_constant_opt()` to invalidate
-    /// all constant spans after the given index.
     pub const fn constant_spans_next_idx(&self) -> usize {
+        self.constant_spans.len()
+    }
+
+    /// Starts code whose constant expressions stay where they are emitted,
+    /// and returns the index of the next constant span. The code ends with
+    /// [Self::constant_spans_invalidate_after] called with that index.
+    pub fn constants_in_place_start(&mut self) -> usize {
+        self.constants_in_place_depth += 1;
         self.constant_spans.len()
     }
 
@@ -1255,7 +1323,44 @@ impl ProgramBuilder {
     /// be sure that constant optimization is never used for translating a given expression.
     /// See `crate::translate::expr::translate_expr_no_constant_opt()` for more details.
     pub fn constant_spans_invalidate_after(&mut self, idx: usize) {
+        self.constants_in_place_depth -= 1;
         self.constant_spans.truncate(idx);
+    }
+
+    /// Whether the register of a constant can be given to an equal constant.
+    /// A subprogram does not move its constants to an init section (see
+    /// [Self::epilogue]), and [Self::constants_in_place_start] keeps them
+    /// where they are emitted, so in both a constant is not loaded before
+    /// every instruction that would read its register.
+    fn constants_are_reusable(&self) -> bool {
+        !self.flags.is_subprogram() && self.constants_in_place_depth == 0
+    }
+
+    /// The register of a constant equal to `expr` that
+    /// [Self::add_reusable_constant] recorded.
+    pub fn reusable_constant_register(&self, expr: &ast::Expr) -> Option<usize> {
+        if !self.constants_are_reusable() {
+            return None;
+        }
+        self.reusable_constants
+            .iter()
+            .find(|(constant, _)| constant == expr)
+            .map(|(_, reg)| *reg)
+    }
+
+    /// Records that `reg` holds the value of the constant `expr`, which the
+    /// instructions from the start of the constant span `span_idx` to the last
+    /// instruction load. It records nothing unless all of those instructions
+    /// are in that span: only then do they move to the init section, which
+    /// runs before any instruction that can read `reg`.
+    pub fn add_reusable_constant(&mut self, expr: &ast::Expr, reg: usize, span_idx: usize) {
+        if !self.constants_are_reusable() || self.constant_spans.len() != span_idx + 1 {
+            return;
+        }
+        let (start, end) = self.constant_spans[span_idx];
+        if start <= end && end + 1 == self.insns.len() {
+            self.reusable_constants.push((expr.clone(), reg));
+        }
     }
 
     pub fn alloc_register(&mut self) -> usize {
@@ -1448,8 +1553,9 @@ impl ProgramBuilder {
         tracing::trace!("");
         self.flags
             .set_readonly(self.flags.readonly() & insn.is_readonly());
-        // Any function can raise at runtime; see Self::may_abort.
-        if matches!(insn, Insn::Function { .. }) {
+        // Any function can raise at runtime, and so can the conversion of a
+        // type; see Self::may_abort.
+        if matches!(insn, Insn::Function { .. } | Insn::TypeConversion { .. }) {
             self.emitted_function_call = true;
         }
         if let Insn::Column {
@@ -1557,7 +1663,12 @@ impl ProgramBuilder {
             return false;
         };
         let last = last as u32;
-        self.label_to_resolved_offset.contains(&Some(last))
+        let targets = self.max_label_anchor == Some(last);
+        crate::turso_debug_assert!(
+            targets == self.label_to_resolved_offset.contains(&Some(last)),
+            "the largest label anchor gives another answer than the labels"
+        );
+        targets
     }
 
     /// Emit an instruction that should not start or extend a constant span on its own.
@@ -1728,36 +1839,39 @@ impl ProgramBuilder {
         // where they are executed once after Init jumps to it.
 
         // Stable partition: non-constant instructions first, then constant.
+        // `extract_if` takes the constant instructions out and moves the other
+        // instructions back in the same buffer, so the instructions before the
+        // first constant one stay where they are, and no second buffer for
+        // the whole program is necessary.
         // Since spans are sorted and non-overlapping, we track our position
         // in the span list and never look back - O(n + m) total, where
         // n = number of instructions, m = number of constant spans.
-        // One more slot for the `Goto` that `epilogue` emits after the constant
-        // instructions. Without it, that push copies the whole program to a
-        // larger buffer.
-        let mut non_constant = Vec::with_capacity(self.insns.len() + 1);
-        let mut constant = Vec::new();
+        let len = self.insns.len();
+        // The spans are inclusive, so their lengths add up to the number of
+        // constant instructions. A `Vec` that starts empty copies all of its
+        // instructions each time it doubles.
+        let num_constant = self
+            .constant_spans
+            .iter()
+            .map(|&(start, end)| end.saturating_add(1).min(len).saturating_sub(start))
+            .sum::<usize>()
+            .min(len);
+        let mut constant = Vec::with_capacity(num_constant);
+        let spans = &self.constant_spans;
         let mut span_idx = 0;
-
-        for item in self.insns.drain(..) {
-            let idx = item.1;
-
+        constant.extend(self.insns.extract_if(.., |&mut (_, idx)| {
             // Advance past spans we've completely passed
-            while span_idx < self.constant_spans.len() && self.constant_spans[span_idx].1 < idx {
+            while span_idx < spans.len() && spans[span_idx].1 < idx {
                 span_idx += 1;
             }
 
             // Check if current span contains this index
-            let is_constant =
-                span_idx < self.constant_spans.len() && self.constant_spans[span_idx].0 <= idx;
+            span_idx < spans.len() && spans[span_idx].0 <= idx
+        }));
 
-            if is_constant {
-                constant.push(item);
-            } else {
-                non_constant.push(item);
-            }
-        }
-
-        self.insns = non_constant;
+        // One more slot for the `Goto` that `epilogue` emits after the constant
+        // instructions. Without it, a full buffer doubles for that push.
+        self.insns.reserve_exact(constant.len() + 1);
         self.insns.extend(constant);
 
         // Build old index -> new position mapping
@@ -1766,9 +1880,13 @@ impl ProgramBuilder {
             old_to_new[*old_idx] = new_pos;
         }
 
-        for resolved_offset in self.label_to_resolved_offset.iter_mut() {
-            if let Some(old_offset) = resolved_offset {
-                *resolved_offset = Some(old_to_new[*old_offset as usize] as u32);
+        // A remapped anchor can be smaller than before, so the largest anchor
+        // is found again.
+        self.max_label_anchor = None;
+        for label_index in 0..self.label_to_resolved_offset.len() {
+            if let Some(old_offset) = self.label_to_resolved_offset[label_index] {
+                let new_offset = old_to_new[old_offset as usize] as InsnReference;
+                self.set_label_anchor(label_index, new_offset);
             }
         }
 
@@ -1822,7 +1940,7 @@ impl ProgramBuilder {
             unreachable!("preassign_label_to_next_insn requires a Label, got {label:?}");
         };
         let anchor = self.offset().as_offset_int().saturating_sub(1);
-        self.label_to_resolved_offset[label_number as usize] = Some(anchor);
+        self.set_label_anchor(label_number as usize, anchor);
     }
 
     /// Resolve `dest` so that it ends up pointing at the same final offset as
@@ -1846,7 +1964,15 @@ impl ProgramBuilder {
         };
         let resolution = self.label_to_resolved_offset[anchor_n as usize]
             .expect("anchor label must already be preassigned/resolved");
-        self.label_to_resolved_offset[dest_n as usize] = Some(resolution);
+        self.set_label_anchor(dest_n as usize, resolution);
+    }
+
+    /// Anchor the label with index `label_index` at the instruction offset
+    /// `anchor`, and keep `max_label_anchor` the largest anchor.
+    #[inline]
+    fn set_label_anchor(&mut self, label_index: usize, anchor: InsnReference) {
+        self.label_to_resolved_offset[label_index] = Some(anchor);
+        self.max_label_anchor = self.max_label_anchor.max(Some(anchor));
     }
 
     /// Resolve unresolved labels to a specific offset in the instruction list.
@@ -2094,6 +2220,7 @@ impl ProgramBuilder {
             }
         }
         self.label_to_resolved_offset.clear();
+        self.max_label_anchor = None;
         Ok(())
     }
 

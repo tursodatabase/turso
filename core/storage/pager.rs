@@ -56,7 +56,7 @@ use super::sqlite3_ondisk::{
 };
 use super::sqlite3_ondisk::{read_varint, read_varint_len, split_varint};
 use super::wal::{CheckpointMode, WalAutoActions};
-use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
+use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey, SQLITE_HEADER};
 
 /// SQLite's default maximum page count
 const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
@@ -1651,10 +1651,10 @@ impl SharedPagerState {
     }
 
     pub(crate) fn initialized(&self) -> bool {
-        #[cfg(shuttle)]
+        #[cfg(all(test, shuttle))]
         crate::sync::encryption_schedule_point(true);
         let initialized = self.init_page_1.load().is_none();
-        #[cfg(shuttle)]
+        #[cfg(all(test, shuttle))]
         {
             crate::thread::yield_now();
             crate::sync::encryption_schedule_point(false);
@@ -1663,10 +1663,10 @@ impl SharedPagerState {
     }
 
     fn initial_page_1(&self) -> Option<PageRef> {
-        #[cfg(shuttle)]
+        #[cfg(all(test, shuttle))]
         crate::sync::encryption_schedule_point(true);
         let page = self.init_page_1.load_full();
-        #[cfg(shuttle)]
+        #[cfg(all(test, shuttle))]
         {
             crate::thread::yield_now();
             crate::sync::encryption_schedule_point(false);
@@ -1675,10 +1675,10 @@ impl SharedPagerState {
     }
 
     fn set_initial_page_1(&self, page: Option<PageRef>) {
-        #[cfg(shuttle)]
+        #[cfg(all(test, shuttle))]
         crate::sync::encryption_schedule_point(true);
         self.init_page_1.store(page);
-        #[cfg(shuttle)]
+        #[cfg(all(test, shuttle))]
         {
             crate::thread::yield_now();
             crate::sync::encryption_schedule_point(false);
@@ -3133,16 +3133,13 @@ impl Pager {
 
     /// Allocate a new overflow page.
     /// This is done when a cell overflows and new space is needed.
+    ///
+    /// The page can contain bytes from an earlier use of its buffer. The caller
+    /// writes every byte of the page.
     // FIXME: handle no room in page cache
     pub fn allocate_overflow_page(&self) -> IOResultOr<PageRef> {
         let page = return_if_io!(self.allocate_page());
         tracing::debug!("Pager::allocate_overflow_page(id={})", page.get().id());
-
-        // setup overflow page
-        let contents = page.get_contents();
-        let buf = contents.as_ptr();
-        buf.fill(0);
-
         Ok(IOResult::Done(page))
     }
 
@@ -5047,23 +5044,40 @@ impl Pager {
             ));
         };
         let (header, raw_page) = parse_wal_frame_header(frame);
+        if header.page_number == 0 {
+            return Err(LimboError::InvalidArgument(
+                "WAL frame page number must be one-based".into(),
+            ));
+        }
         if self.encryption_cipher() != CipherMode::None || self.has_external_page_codec() {
             if raw_page.len() != self.get_page_size_unchecked().get() as usize {
                 return Err(LimboError::InvalidArgument(
                     "WAL import cannot change the protected page size".into(),
                 ));
             }
+            let reserved = self.io_ctx.read().get_reserved_space_bytes();
             if header.page_number == 1 {
                 let imported: &DatabaseHeader =
                     bytemuck::from_bytes(&raw_page[..DatabaseHeader::SIZE]);
-                let reserved = self.io_ctx.read().get_reserved_space_bytes();
-                if imported.page_size.get() != self.get_page_size_unchecked().get()
+                if !raw_page.starts_with(SQLITE_HEADER)
+                    || imported.page_size.get() != self.get_page_size_unchecked().get()
                     || imported.reserved_space != reserved
                 {
                     return Err(LimboError::InvalidArgument(
                         "WAL import cannot change the protected page layout".into(),
                     ));
                 }
+            }
+            // Encryption stores its nonce and tag in the reserved tail, so a
+            // plaintext page must leave the tail empty.
+            if self.encryption_cipher() != CipherMode::None
+                && raw_page[raw_page.len() - reserved as usize..]
+                    .iter()
+                    .any(|byte| *byte != 0)
+            {
+                return Err(LimboError::InvalidArgument(
+                    "WAL import page has a non-empty encryption reserve".into(),
+                ));
             }
         }
         let frame_is_new = frame_no > wal.get_max_frame();

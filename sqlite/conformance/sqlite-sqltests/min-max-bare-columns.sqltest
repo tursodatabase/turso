@@ -1,0 +1,305 @@
+@database :memory:
+
+# In an aggregate query with a min() or max(), the bare columns, the columns
+# used outside aggregate functions, take their values from the last row that
+# set a new minimum or maximum, as in SQLite. A row whose value equals the
+# current minimum or maximum, or is NULL, does not set it.
+
+setup tables {
+    CREATE TABLE t(a, b, g);
+    INSERT INTO t VALUES (1, 10, 1), (3, 30, 1), (2, 20, 1), (3, 35, 1), (NULL, 40, 1);
+    INSERT INTO t VALUES (5, 50, 2), (4, 40, 2), (6, 60, 2), (NULL, 70, 2);
+}
+
+@setup tables
+test max-bare-column {
+    SELECT max(a), b FROM t;
+}
+expect {
+    6|60
+}
+
+@setup tables
+test min-bare-column {
+    SELECT min(a), b FROM t;
+}
+expect {
+    1|10
+}
+
+@setup tables
+test max-bare-column-in-expression {
+    SELECT max(a) * 100 + b FROM t;
+}
+expect {
+    660
+}
+
+@setup tables
+test max-bare-column-with-where {
+    SELECT max(a), b FROM t WHERE g = 1;
+}
+expect {
+    3|30
+}
+
+# The last min() or max() in the query decides.
+@setup tables
+test min-and-max-bare-column {
+    SELECT min(a), max(a), b FROM t;
+}
+expect {
+    1|6|60
+}
+
+@setup tables
+test max-and-min-bare-column {
+    SELECT max(a), min(a), b FROM t;
+}
+expect {
+    6|1|10
+}
+
+@setup tables
+test max-with-count-bare-column {
+    SELECT max(a), count(*), b FROM t;
+}
+expect {
+    6|9|60
+}
+
+@setup tables
+test max-no-rows-bare-column {
+    SELECT max(a), b FROM t WHERE 0;
+}
+expect {
+    |
+}
+
+# A filter that skips the min() or max() on a row does not read that row,
+# except for the first row when every min() and max() has a filter.
+@setup tables
+test max-with-filter-bare-column {
+    SELECT max(a) FILTER (WHERE g = 1), b FROM t;
+}
+expect {
+    3|30
+}
+
+@setup tables
+test max-with-filter-matching-no-row-bare-column {
+    SELECT max(a) FILTER (WHERE g = 3), b FROM t;
+}
+expect {
+    |10
+}
+
+@setup tables
+test max-with-filter-and-min-bare-column {
+    SELECT max(a) FILTER (WHERE g = 1), min(a), b FROM t;
+}
+expect {
+    3|1|10
+}
+
+# A row whose value is a duplicate skips the max() step and keeps the decision
+# of the row before it: (NULL, 70) repeats the NULL of (NULL, 40) and comes
+# after (6, 60), which set the maximum.
+@setup tables
+test max-distinct-bare-column {
+    SELECT max(DISTINCT a), b FROM t;
+}
+expect {
+    6|70
+}
+
+@setup tables
+test max-bare-column-per-group {
+    SELECT g, max(a), b FROM t GROUP BY g;
+}
+expect {
+    1|3|30
+    2|6|60
+}
+
+@setup tables
+test min-bare-column-per-group {
+    SELECT g, min(a), b FROM t GROUP BY g;
+}
+expect {
+    1|1|10
+    2|4|40
+}
+
+@setup tables
+test max-bare-column-per-group-in-having {
+    SELECT g, max(a) FROM t GROUP BY g HAVING b = 60;
+}
+expect {
+    2|6
+}
+
+@setup tables
+test max-bare-column-per-group-expression-key {
+    SELECT max(a), b FROM t GROUP BY g + 0;
+}
+expect {
+    3|30
+    6|60
+}
+
+@setup tables
+test max-with-filter-bare-column-per-group {
+    SELECT g, max(a) FILTER (WHERE b < 50), b FROM t GROUP BY g;
+}
+expect {
+    1|3|30
+    2|4|40
+}
+
+# With GROUP BY, each filtered min() or max() starts from the first-row flag
+# also when an unfiltered min() or max() comes before it: a row that its
+# FILTER skips is read only when it is the first row of the group.
+@setup tables
+test max-and-filtered-min-bare-column-per-group {
+    SELECT g, max(a), min(b) FILTER (WHERE b > 100), b FROM t GROUP BY g;
+}
+expect {
+    1|3||10
+    2|6||50
+}
+
+@setup tables
+test max-and-filtered-max-bare-column-per-group {
+    SELECT g, max(b), max(a) FILTER (WHERE a < 0), b FROM t GROUP BY g;
+}
+expect {
+    1|40||10
+    2|70||50
+}
+
+# Each run of the correlated subquery starts again from its first row.
+@setup tables
+test max-bare-column-in-correlated-subquery {
+    SELECT g, (SELECT max(a) * 100 + b FROM t AS t2 WHERE t2.g = t.g) FROM t GROUP BY g;
+}
+expect {
+    1|330
+    2|660
+}
+
+# With GROUP BY, an expression that the index used for the group order stores
+# is saved whole into the group's row, also when the index covers the query
+# and the table cursor is never opened.
+setup grouped-expression-index {
+    CREATE TABLE e(a, b, g);
+    CREATE INDEX e_gab ON e(g, a + b);
+    INSERT INTO e VALUES (1, 10, 1), (2, 20, 1), (5, 6, 2);
+}
+
+@setup grouped-expression-index
+test indexed-expression-bare-column-per-group {
+    SELECT g, a + b FROM e GROUP BY g;
+}
+expect {
+    1|11
+    2|11
+}
+
+@setup grouped-expression-index
+test max-indexed-expression-bare-column-per-group {
+    SELECT g, max(a + b), a + b FROM e GROUP BY g;
+}
+expect {
+    1|22|22
+    2|11|11
+}
+
+@setup grouped-expression-index
+test indexed-expression-in-having-per-group {
+    SELECT g, count(*) FROM e GROUP BY g HAVING a + b = 11;
+}
+expect {
+    1|2
+    2|1
+}
+
+@setup grouped-expression-index
+test indexed-expression-in-order-by-per-group {
+    SELECT g FROM e GROUP BY g ORDER BY a + b DESC, g DESC;
+}
+expect {
+    2
+    1
+}
+
+# Without GROUP BY, a correlated subquery in a result column that holds an
+# aggregate reads the same row as the bare columns, not the last row.
+@setup tables
+test count-plus-correlated-subquery {
+    SELECT count(*) + (SELECT t.b) FROM t;
+}
+expect {
+    19
+}
+
+@setup tables
+test max-plus-correlated-subquery {
+    SELECT max(a) + (SELECT t.b), (SELECT t.b) FROM t;
+}
+expect {
+    66|60
+}
+
+@setup tables
+test max-plus-correlated-subquery-no-rows {
+    SELECT max(a) + (SELECT t.b) IS NULL FROM t WHERE a > 100;
+}
+expect {
+    1
+}
+
+@setup tables
+test max-plus-correlated-subquery-rerun {
+    SELECT o.g, (SELECT max(a) + (SELECT t.b) FROM t WHERE t.g = o.g)
+    FROM (SELECT DISTINCT g FROM t) AS o ORDER BY o.g;
+}
+expect {
+    1|33
+    2|66
+}
+
+# An aggregate in the WHERE clause of a subquery is a misuse, as in SQLite,
+# even when the subquery runs after the outer query has computed that
+# aggregate.
+@setup tables
+test aggregate-in-where-of-correlated-result-column-subquery {
+    SELECT max(a), (SELECT t.b WHERE max(t.a) = 6) FROM t;
+}
+expect error {
+    misuse of aggregate function max()
+}
+
+@setup tables
+test count-star-in-where-of-correlated-result-column-subquery {
+    SELECT count(*), (SELECT t.b WHERE count(*) = 9) FROM t;
+}
+expect error {
+    misuse of aggregate function count()
+}
+
+@setup tables
+test aggregate-in-where-of-correlated-having-subquery {
+    SELECT count(*) FROM t HAVING (SELECT t.a WHERE count(*) = 9) = 1;
+}
+expect error {
+    misuse of aggregate function count()
+}
+
+@setup tables
+test aggregate-in-where-of-correlated-having-subquery-per-group {
+    SELECT count(*) FROM t GROUP BY g HAVING (SELECT t.a WHERE count(*) = 5) = 1;
+}
+expect error {
+    misuse of aggregate function count()
+}

@@ -1,4 +1,5 @@
 use super::*;
+use crate::ast::{Expr, Literal, Name, UnaryOperator, Variable};
 use crate::{
     alloc::TursoVecInExt,
     index_method::{
@@ -9,7 +10,6 @@ use crate::{
 };
 use rustc_hash::FxHashMap;
 use std::num::NonZeroU32;
-use turso_parser::ast::{Expr, Literal, Name, UnaryOperator, Variable};
 
 #[test]
 fn field_weights_accept_finite_positive_boundaries() {

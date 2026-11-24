@@ -214,6 +214,10 @@ pub enum CheckpointState {
     /// truncation, the old frames come back, but their `commit_ts` is at or below
     /// `persistent_tx_ts_max`, so recovery skips them.
     TruncateLogicalLog,
+    /// Apply the finished truncate of the logical log to the in-memory log
+    /// state. A truncate that completes after `DurableStorage::truncate`
+    /// returned leaves the old log offset in place until this step.
+    FinishTruncateLogicalLog,
     /// Truncate the WAL file after the DB file is durable.
     TruncateWal,
     GcTableRows {
@@ -3262,27 +3266,33 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             CheckpointState::TruncateLogicalLog => {
                 tracing::debug!("Truncating logical log file");
                 let c = self.truncate_logical_log()?;
-                self.state = CheckpointState::TruncateWal;
+                self.state = CheckpointState::FinishTruncateLogicalLog;
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
-                    if self.clears_whole_logical_log() {
-                        turso_assert!(
-                            self.mvstore.storage.logical_log_offset() == 0,
-                            "TRUNCATE checkpoint must reset logical log offset to 0"
-                        );
-                        turso_assert!(
-                            self.mvstore
-                                .get_logical_log_file()
-                                .size()
-                                .expect("logical log file size should be readable after truncate")
-                                == 0,
-                            "TRUNCATE checkpoint must zero the logical log file"
-                        );
-                    }
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions(c)))
                 }
+            }
+
+            CheckpointState::FinishTruncateLogicalLog => {
+                self.mvstore.storage.finish_truncate();
+                if self.clears_whole_logical_log() {
+                    turso_assert!(
+                        self.mvstore.storage.logical_log_offset() == 0,
+                        "TRUNCATE checkpoint must reset logical log offset to 0"
+                    );
+                    turso_assert!(
+                        self.mvstore
+                            .get_logical_log_file()
+                            .size()
+                            .expect("logical log file size should be readable after truncate")
+                            == 0,
+                        "TRUNCATE checkpoint must zero the logical log file"
+                    );
+                }
+                self.state = CheckpointState::TruncateWal;
+                Ok(TransitionResult::Continue)
             }
 
             CheckpointState::CheckpointWal => {
@@ -3423,7 +3433,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 if let Some(io) = self.gc_checkpointed_index_versions() {
                     return Ok(TransitionResult::Io(io));
                 }
-                self.state = CheckpointState::PruneDirtyKeys;
+                // With the passive checkpoint off, commits record no dirty keys, and the
+                // full-scan request is never cleared, so every checkpoint reads every key.
+                self.state = if self.mvstore.uses_passive_checkpoint() {
+                    CheckpointState::PruneDirtyKeys
+                } else {
+                    CheckpointState::Finalize
+                };
                 Ok(TransitionResult::Continue)
             }
 
@@ -3972,11 +3988,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
 mod tests {
     use super::*;
     use crate::alloc::vec;
+    use crate::ast::SortOrder;
     use crate::mvcc::database::tests::MvccTestDbNoConn;
     use crate::mvcc::database::{Row, SortableIndexKey};
     use crate::translate::collate::CollationSeq;
     use crate::types::{IndexInfo, KeyInfo};
-    use turso_parser::ast::SortOrder;
 
     fn sqlite_schema_row_version(
         rowid: i64,
@@ -4200,9 +4216,11 @@ mod tests {
         (row.id, version)
     }
 
+    /// A checkpoint on a store with the passive checkpoint on, because only that store walks
+    /// the dirty keys.
     fn checkpoint_for_collect_tests(
     ) -> CheckpointStateMachine<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator> {
-        let db = MvccTestDbNoConn::new();
+        let db = MvccTestDbNoConn::new_passive();
         let conn = db.connect();
         let mvstore = db.get_mvcc_store();
         let pager = conn.pager.load().clone();

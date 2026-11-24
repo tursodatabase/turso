@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
+use turso_core::ast;
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::Schema;
 use turso_core::security::roles::RoleId;
@@ -25,7 +26,6 @@ use turso_core::{
     to_u32, CatalogApply, Connection, CursorType, InsertFlags, Insn, LimboError, Numeric,
     ProgramBuilder, RegisterOrLiteral, Value, MAIN_DB_ID, SQLITE_ERROR,
 };
-use turso_parser::ast;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE,
     SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_UNDEFINED_OBJECT,
@@ -35,6 +35,7 @@ use crate::catalog::{pg_role_by_name, PgRole, PG_DATABASE_OWNER_NAME};
 use crate::error::sqlstate_error;
 use crate::functions::role_name_in;
 use crate::roles::{schema_roles, RoleCatalog};
+use crate::schema_init::TableInit;
 use crate::schema_state::{change_schema_state, emit_catalog_apply};
 use crate::unique_index::emit_unique_index_insert;
 
@@ -43,8 +44,7 @@ pub(crate) const AUTH_MEMBERS_TABLE_NAME: &str = "__turso_internal_auth_members"
 
 /// Creates [`AUTH_MEMBERS_TABLE_NAME`]. The rowid of a row is the id of its
 /// membership.
-pub(crate) const CREATE_AUTH_MEMBERS_TABLE_SQL: &str =
-    "CREATE TABLE __turso_internal_auth_members (\
+const CREATE_AUTH_MEMBERS_TABLE_SQL: &str = "CREATE TABLE __turso_internal_auth_members (\
     id INTEGER PRIMARY KEY, \
     roleid INTEGER NOT NULL, \
     member INTEGER NOT NULL, \
@@ -61,12 +61,20 @@ const AUTH_MEMBERS_ROLE_MEMBER_INDEX_NAME: &str = "__turso_internal_auth_members
 /// Keeps a membership unique in the stored table, whatever writes it: the
 /// in-memory catalog refuses a table with a duplicate, which would leave the
 /// database unable to open.
-pub(crate) const CREATE_AUTH_MEMBERS_ROLE_MEMBER_INDEX_SQL: &str =
+const CREATE_AUTH_MEMBERS_ROLE_MEMBER_INDEX_SQL: &str =
     "CREATE UNIQUE INDEX __turso_internal_auth_members_role_member \
      ON __turso_internal_auth_members (roleid, member, grantor)";
 
 /// The number of columns of [`AUTH_MEMBERS_TABLE_NAME`].
 const AUTH_MEMBERS_COLUMN_COUNT: usize = 7;
+
+pub(crate) const TABLE_INIT: TableInit = TableInit {
+    table: AUTH_MEMBERS_TABLE_NAME,
+    statements: &[
+        CREATE_AUTH_MEMBERS_TABLE_SQL,
+        CREATE_AUTH_MEMBERS_ROLE_MEMBER_INDEX_SQL,
+    ],
+};
 
 /// The query that reads the memberships for the frontend's schema state, or
 /// None when the database has no membership table, as one that an earlier

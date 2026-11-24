@@ -161,18 +161,22 @@ impl MemStore {
             let bytes_to_write = remaining.min(PAGE_SIZE - page_offset);
             let src = &data[buf_offset..buf_offset + bytes_to_write];
             match inner.pages.entry(page_no) {
-                // The write gives all the bytes of this new page, so the page
-                // is made from them instead of a page of zeros that the copy
-                // then overwrites.
-                Entry::Vacant(slot) if bytes_to_write == PAGE_SIZE => {
-                    let page: MemPage = Box::<[u8]>::from(src)
+                // A new page is made from the written bytes, with zeros only
+                // before and after them, instead of a page of zeros that the
+                // copy then partly overwrites.
+                Entry::Vacant(slot) => {
+                    let mut page = Vec::with_capacity(PAGE_SIZE);
+                    page.resize(page_offset, 0);
+                    page.extend_from_slice(src);
+                    page.resize(PAGE_SIZE, 0);
+                    let page: MemPage = page
+                        .into_boxed_slice()
                         .try_into()
-                        .expect("a full-page write has PAGE_SIZE bytes");
+                        .expect("a new page has PAGE_SIZE bytes");
                     slot.insert(page);
                 }
-                entry => {
-                    let page = entry.or_insert_with(|| Box::new([0; PAGE_SIZE]));
-                    page[page_offset..page_offset + bytes_to_write].copy_from_slice(src);
+                Entry::Occupied(mut slot) => {
+                    slot.get_mut()[page_offset..page_offset + bytes_to_write].copy_from_slice(src);
                 }
             }
             offset += bytes_to_write;
@@ -355,9 +359,9 @@ mod tests {
     use super::*;
     use std::{sync::mpsc, time::Duration};
 
-    /// A write that covers a whole new page makes the page from its bytes,
-    /// and the other writes copy into a page of zeros. Both must give the
-    /// bytes of a flat file, with zeros in the holes.
+    /// A write into a new page makes the page from its bytes, with zeros
+    /// before and after them, and a write into an existing page copies into
+    /// it. Both must give the bytes of a flat file, with zeros in the holes.
     #[test]
     fn writes_read_back_like_a_flat_file() {
         let store = MemStore::new();

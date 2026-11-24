@@ -13,6 +13,7 @@ mod options;
 mod pg_type;
 mod policies;
 mod roles;
+mod schema_init;
 mod schema_state;
 mod session;
 mod settings;
@@ -24,6 +25,7 @@ mod unnest;
 pub use catalog::PostgresDialect;
 pub use copy::CopyTextEncoder;
 pub use error::{sql_parse_error, sqlstate_error, Error, ErrorReport, Result};
+pub use functions::parse_pg_bool;
 pub use open::{open_database_async, OpenDatabaseState};
 pub use session::PgConnection as Connection;
 pub use session::{

@@ -2,9 +2,23 @@ use super::*;
 use crate::translate::{plan::IndexMethodQuery, subquery::emit_non_from_clause_subquery};
 
 fn condition_references_subquery(expr: &Expr, subqueries: &[NonFromClauseSubquery]) -> bool {
-    subqueries
-        .iter()
-        .any(|s| expr_references_subquery_id(expr, s.internal_id))
+    if subqueries.is_empty() {
+        return false;
+    }
+    // emit_conditions calls this function for each term at each loop. One walk
+    // that compares each subquery result with all subqueries costs less than
+    // one walk for each subquery.
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+        if let Expr::SubqueryResult { subquery_id, .. } = e {
+            if subqueries.iter().any(|s| s.internal_id == *subquery_id) {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
 }
 
 /// Emit correlated subqueries at the loop that checks their conditions.
@@ -111,6 +125,18 @@ fn emit_conditions(
         .filter(|(cond_idx, _)| !prefiltered_terms.contains(cond_idx))
         .map(|(_, cond)| cond)
         .filter(|cond| cond.origin.is_outer_join() == from_outer_join)
+        // Each loop calls this function twice, once for each filter, and a
+        // term passes the filter of only one of the two calls. Check the
+        // filter before the loop of the term, which walks the term three
+        // times, so that each call finds the loop only of its own terms.
+        .filter(|cond| match subquery_ref_filter {
+            SubqueryRefFilter::WithoutSubqueryRefs => {
+                !condition_references_subquery(&cond.expr, subqueries)
+            }
+            SubqueryRefFilter::WithSubqueryRefs => {
+                condition_references_subquery(&cond.expr, subqueries)
+            }
+        })
         .filter(|cond| {
             cond.should_eval_at_loop(
                 join_index,
@@ -119,14 +145,6 @@ fn emit_conditions(
                 Some(table_references),
                 &t_ctx.resolver,
             )
-        })
-        .filter(|cond| match subquery_ref_filter {
-            SubqueryRefFilter::WithoutSubqueryRefs => {
-                !condition_references_subquery(&cond.expr, subqueries)
-            }
-            SubqueryRefFilter::WithSubqueryRefs => {
-                condition_references_subquery(&cond.expr, subqueries)
-            }
         })
     {
         emit_where_term(program, table_references, cond, next, &t_ctx.resolver)?;

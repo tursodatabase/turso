@@ -1,4 +1,4 @@
-use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
+use crate::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::namespace::NamespaceRef;
@@ -6,9 +6,8 @@ use crate::translate::emitter::emit_columns_and_dependencies;
 use crate::translate::expr::{emit_constraint_values_decode, emit_stored_column};
 use crate::translate::plan::ColumnMask;
 use crate::turso_assert;
-use crate::vdbe::{MAX_TRIGGER_DEPTH, TRIGGER_DEPTH_ERROR};
 use crate::{
-    error::{SQLITE_CONSTRAINT_FOREIGNKEY, SQLITE_ERROR},
+    error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef},
     sync::{Arc, OnceLock, Weak},
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
@@ -660,41 +659,6 @@ pub fn emit_fk_restrict_halt(
         on_error: None,
         description_reg: None,
     });
-    Ok(())
-}
-
-/// Stabilize the NEW row image for FK checks (UPDATE):
-/// fill in unmodified PK columns from the current row so the NEW PK vector is complete.
-pub fn stabilize_new_row_for_fk(
-    program: &mut ProgramBuilder,
-    table_btree: &BTreeTable,
-    set_cols: &ColumnMask,
-    cursor_id: usize,
-    start: usize,
-    rowid_new_reg: usize,
-) -> Result<()> {
-    if table_btree.primary_key_columns.is_empty() {
-        return Ok(());
-    }
-
-    let layout = table_btree.column_layout()?;
-    for (pk_name, _) in &table_btree.primary_key_columns {
-        let (pos, col) = table_btree
-            .get_column(pk_name)
-            .ok_or_else(|| LimboError::InternalError(format!("pk col {pk_name} missing")))?;
-        if !set_cols.get(pos) {
-            let dst_reg = layout.to_register(start, pos);
-            if col.is_rowid_alias() {
-                program.emit_insn(Insn::Copy {
-                    src_reg: rowid_new_reg,
-                    dst_reg,
-                    extra_amount: 0,
-                });
-            } else {
-                program.emit_column_or_rowid(cursor_id, pos, dst_reg);
-            }
-        }
-    }
     Ok(())
 }
 
@@ -1898,12 +1862,9 @@ fn emit_fk_action_subprogram(
         );
         Subprogram::Pending(slot)
     } else {
-        let depth = program.subprogram_depth() + 1;
-        if depth > MAX_TRIGGER_DEPTH {
-            // As in SQLite, the error occurs only if the statement gets to this level.
-            program.emit_halt_err(SQLITE_ERROR, TRIGGER_DEPTH_ERROR.to_string());
+        let Some(depth) = program.nested_subprogram_depth() else {
             return Ok(());
-        }
+        };
         let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
             QueryMode::Normal,
             program.capture_data_changes_info().clone(),

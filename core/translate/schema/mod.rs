@@ -8,7 +8,9 @@ pub(crate) use sqlite_schema_rows::{
     SchemaEntryType,
 };
 
-use crate::dialect::{AutomaticIndex, CatalogCmd, CmdContext, CreateTable, DropTable, TableText};
+use crate::dialect::{
+    AutomaticIndex, CatalogCmd, CmdContext, CreateTable, CreateVirtualTable, DropTable, TableText,
+};
 use crate::sync::Arc;
 use crate::HashMap;
 use crate::LimboError;
@@ -21,7 +23,7 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
     BTreeTable, ColDef, Column, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
-    TypeDefKind, TypeOrigin, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME,
+    TypeDefKind, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME,
     TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
@@ -30,7 +32,8 @@ use crate::translate::catalog::CatalogContext;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{prepare_cdc_if_necessary, Resolver};
 use crate::translate::expr::expr_type::{
-    base_value_type, decode_type, iif_values, value_type, ExprType,
+    base_value_type, decode_type, first_and_third_arguments, iif_values, query_column_type,
+    value_type, ExprType,
 };
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
@@ -38,6 +41,7 @@ use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
+use crate::types::Conversion;
 use crate::util::{
     check_expr_references_column, column_declared_type, dequote, escape_sql_string_literal,
     is_builtin_strict_type, normalize_ident, quote_identifier, walk_expr_with_subqueries,
@@ -50,9 +54,9 @@ use crate::vdbe::insn::{
 use crate::{bail_parse_error, turso_assert, turso_assert_eq, Result};
 use crate::{Connection, Value, MAIN_DB_ID};
 
+use crate::ast;
+use crate::ast::ColumnDefinition;
 use turso_ext::VTabKind;
-use turso_parser::ast;
-use turso_parser::ast::ColumnDefinition;
 
 /// Validate a CHECK constraint expression at CREATE TABLE / ALTER TABLE ADD COLUMN time.
 /// Rejects non-existent columns, non-existent functions, aggregates, window functions,
@@ -462,6 +466,9 @@ fn resolve_func_return_type(
         ResultType::OneOfTheIifValues => {
             common_check_type(iif_values(args).map(|arg| type_of(arg)))
         }
+        ResultType::OneOfTheFirstAndThirdArguments => {
+            common_check_type(first_and_third_arguments(args).map(|arg| type_of(arg)))
+        }
         // ceil, floor and trunc give an integer for an integer and a real for
         // a real. A text or blob argument is first converted to a number,
         // which may be either.
@@ -809,7 +816,7 @@ fn validate(
             table.check_collates_are_allowed(resolver.schema())?;
         }
         table.check_keys_are_not_lossy(resolver.schema())?;
-        table.check_stored_columns_have_no_custom_types(resolver.schema())?;
+        table.check_stored_columns_have_no_composite_types(resolver.schema())?;
     }
     Ok(())
 }
@@ -907,6 +914,7 @@ pub(crate) fn validate_generated_function_calls(
 struct CtasInfo {
     plan: Plan,
     schema_sql: String,
+    column_names: Vec<String>,
 }
 
 /// Pre-plan the SELECT to derive the schema for a CTAS table.
@@ -968,14 +976,14 @@ fn derive_ctas_schema(
     let mut sql_parts = Vec::with_capacity(result_columns.len());
     let mut col_defs = Vec::with_capacity(result_columns.len());
 
-    for (column_index, (col, name)) in result_columns.iter().zip(names).enumerate() {
+    for (column_index, (col, name)) in result_columns.iter().zip(&names).enumerate() {
         // Names come from the leftmost arm, but compound affinity can weaken its type.
         let ty = compound_arms
             .as_ref()
             .map(|arms| compound_column_affinity(arms, column_index).short_type_name())
             .unwrap_or_else(|| col.declared_type(table_refs));
 
-        let quoted = quote_identifier(&name);
+        let quoted = quote_identifier(name);
         if ty.is_empty() {
             sql_parts.push(quoted);
         } else {
@@ -992,7 +1000,7 @@ fn derive_ctas_schema(
             })
         };
         col_defs.push(ColumnDefinition {
-            col_name: ast::Name::exact(name),
+            col_name: ast::Name::exact(name.clone()),
             col_type,
             constraints: vec![],
         });
@@ -1000,9 +1008,41 @@ fn derive_ctas_schema(
 
     let info = CtasInfo {
         plan,
+        column_names: names,
         schema_sql: format!("CREATE TABLE {table_name_in_sql}({})", sql_parts.join(",")),
     };
     Ok((info, col_defs))
+}
+
+/// The new CTAS table types its columns with SQLite declared types, so the
+/// dialect decides what happens to a column of a custom type before the table
+/// is created. Every arm of a compound select is checked.
+fn check_ctas_column_types(
+    plan: &Plan,
+    names: &[String],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let dialect = connection.dialect();
+    for (column_index, name) in names.iter().enumerate() {
+        let ty = query_column_type(plan, column_index, resolver);
+        let element = match &ty {
+            ExprType::Array { element, .. } => element.as_ref(),
+            scalar => scalar,
+        };
+        match element {
+            ExprType::Custom { type_def, .. }
+                if type_def.is_domain || type_def.changes_stored_value() =>
+            {
+                dialect.check_ctas_column_type(name, Some(&type_def.name))?
+            }
+            // An expression that cannot be typed here, such as DEFAULT, could
+            // be a custom type.
+            ExprType::NotKnownYet => dialect.check_ctas_column_type(name, None)?,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Emit bytecode to populate a newly-created CTAS table from the SELECT.
@@ -1258,6 +1298,12 @@ pub fn translate_create_table(
         }
     }
 
+    // The column types are checked after the name is known to be free, so IF NOT
+    // EXISTS on an existing table succeeds whatever the SELECT returns.
+    if let Some(info) = &ctas_info {
+        check_ctas_column_types(&info.plan, &info.column_names, resolver, connection)?;
+    }
+
     // Like SQLite, the body is only checked when the table is really created,
     // so IF NOT EXISTS on an existing table succeeds whatever the body says.
     validate(
@@ -1406,7 +1452,13 @@ pub fn translate_create_table(
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L2856-L2871
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
 
-    let index_regs = collect_autoindexes(&body, program, &mangled_tbl_name, resolver)?;
+    let mut table = create_table(
+        &mangled_tbl_name,
+        &body,
+        0,
+        resolver.catalog.dialect.supports_namespaces(),
+    )?;
+    let index_regs = collect_autoindexes(&table, program)?;
 
     // SQLite compiles `SELECT * FROM t` at the end of CREATE TABLE, after all other
     // checks, and that fails on a RAISE outside a trigger. The SELECT reads STORED
@@ -1458,6 +1510,11 @@ pub fn translate_create_table(
     } else {
         TableText::Statement(input)
     };
+    // The schema of the table's database does the same when it loads the
+    // table, so the catalog sees the table as a later statement will.
+    resolver.with_schema(database_id, |schema| {
+        table.resolve_types_and_domains(schema)
+    })?;
     let cmd_context = CmdContext::new(connection, resolver, database_id);
     resolver.catalog.dialect.catalog().emit(
         program,
@@ -1469,6 +1526,7 @@ pub fn translate_create_table(
             temporary,
             if_not_exists,
             body: &body,
+            table: &table,
             text,
             root_reg: table_root_reg,
             automatic_indexes: &automatic_indexes,
@@ -1772,18 +1830,9 @@ pub const SQLITE_TABLEID: &str = "sqlite_schema";
 ///
 /// Otherwise, an automatic PRIMARY KEY index is required.
 fn collect_autoindexes(
-    body: &ast::CreateTableBody,
+    table: &BTreeTable,
     program: &mut ProgramBuilder,
-    tbl_name: &str,
-    resolver: &Resolver,
 ) -> Result<Option<Vec<usize>>> {
-    let table = create_table(
-        tbl_name,
-        body,
-        0,
-        resolver.catalog.dialect.supports_namespaces(),
-    )?;
-
     let mut regs: Vec<usize> = Vec::new();
 
     // include UNIQUE singles, include PK single only if not rowid alias
@@ -1938,26 +1987,15 @@ pub fn translate_create_virtual_table(
         table_name: table_name_reg,
         args_reg,
     });
-    let sqlite_schema_cursor_id =
-        open_sqlite_schema_for_write(program, resolver, crate::MAIN_DB_ID);
-
-    let cdc_table = prepare_cdc_if_necessary(
-        program,
-        resolver.schema(),
-        crate::MAIN_DB_ID,
-        Some(SQLITE_TABLEID),
-    )?;
     let sql = create_vtable_body_to_str(&vtab, vtab_module.clone());
-    emit_schema_entry(
+    let cmd_context = CmdContext::new(connection, resolver, crate::MAIN_DB_ID);
+    resolver.catalog.dialect.catalog().emit(
         program,
-        resolver,
-        sqlite_schema_cursor_id,
-        cdc_table.map(|x| x.0),
-        SchemaEntryType::Table,
-        tbl_name.name.as_str(),
-        tbl_name.name.as_str(),
-        0, // virtual tables dont have a root page
-        Some(sql),
+        &cmd_context,
+        &CatalogCmd::CreateVirtualTable(CreateVirtualTable {
+            name: tbl_name.name.as_str(),
+            sql: &sql,
+        }),
     )?;
 
     program.emit_insn(Insn::SetCookie {
@@ -2888,8 +2926,7 @@ pub fn translate_create_type(
             validate_type_expr(decode, "DECODE", &resolver.catalog)?;
         }
         crate::schema::check_type_param_use(params, encode, decode)?;
-        let type_def =
-            TypeDef::from_create_type(&normalized_name, body, TypeOrigin::User, String::new())?;
+        let type_def = TypeDef::from_create_type(&normalized_name, body, String::new())?;
         resolver
             .schema()
             .plain_value_type(&normalized_name, type_def.value_input_type())?;
@@ -3365,6 +3402,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
         accepts_collate: _,
         range_offsets: _,
         stored_form_sorts_in_value_order: _,
+        casts_to_numbers_and_booleans: _,
         sql: _,
         domain_checks,
         kind,
@@ -3376,6 +3414,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
             encode,
             coerce,
             decode,
+            cast,
             default,
             // These name functions and comparison rules, never a type.
             ordering: _,
@@ -3389,10 +3428,12 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
                 // with inner_t.
                 .chain(params.iter().filter_map(|param| param.ty.as_deref()))
                 .collect(),
-            [encode, coerce, decode, default]
+            // A conversion written in Rust names no type.
+            [encode, coerce, decode, cast]
                 .into_iter()
                 .flatten()
-                .map(|expr| expr.as_ref())
+                .filter_map(Conversion::expr)
+                .chain(default.as_deref())
                 .collect(),
         ),
         TypeDefKind::Struct(StructDef { fields }) => (

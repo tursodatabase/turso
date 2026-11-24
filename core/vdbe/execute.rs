@@ -1,5 +1,5 @@
 use crate::alloc::{
-    DynAllocator, TryClone, TursoAllocExt, TursoIteratorExt, TursoSliceExt,
+    DynAllocator, DynBox, TryClone, TursoAllocExt, TursoIteratorExt, TursoSliceExt,
     TursoTryWithCapacityExt, TursoVecExt,
 };
 use crate::cdc::TURSO_CDC_VERSION_TABLE_NAME;
@@ -157,8 +157,8 @@ use super::{
     },
     CommitState,
 };
+use crate::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
 use crate::sync::RwLock;
-use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
 
 use super::sorter::Sorter;
 use crate::vdbe::vacuum::{
@@ -812,8 +812,8 @@ pub fn op_compare(
         if let Some((a, b)) = integer_operands(state, start_reg_a, start_reg_b) {
             let cmp = a.cmp(&b);
             state.last_compare = Some(match key_info[0].sort_order {
-                turso_parser::ast::SortOrder::Asc => cmp,
-                turso_parser::ast::SortOrder::Desc => cmp.reverse(),
+                crate::ast::SortOrder::Asc => cmp,
+                crate::ast::SortOrder::Desc => cmp.reverse(),
             });
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
@@ -826,8 +826,8 @@ pub fn op_compare(
             {
                 let cmp = a.as_str().cmp(b.as_str());
                 state.last_compare = Some(match key_info[0].sort_order {
-                    turso_parser::ast::SortOrder::Asc => cmp,
-                    turso_parser::ast::SortOrder::Desc => cmp.reverse(),
+                    crate::ast::SortOrder::Asc => cmp,
+                    crate::ast::SortOrder::Desc => cmp.reverse(),
                 });
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
@@ -1126,7 +1126,10 @@ fn op_comparison_slow(
         (_, _) => {}
     }
 
-    // If all else failed, do an affinity-aware comparison
+    // If all else failed, do an affinity-aware comparison. As in SQLite, the
+    // converted values are only compared, and the registers keep their values:
+    // other instructions read them too, such as the other uses of a constant,
+    // or the record of a row that a CHECK constraint compares a column of.
     let (new_lhs, new_rhs) = (
         affinity.convert_for_compare(lhs_value),
         affinity.convert_for_compare(rhs_value),
@@ -1139,24 +1142,6 @@ fn op_comparison_slow(
         .as_ref()
         .map_or(Either::Left(rhs_value), Either::Right);
     let should_jump = op.compare(lhs_for_compare, rhs_for_compare, collation)?;
-
-    match (new_lhs, new_rhs) {
-        (Some(new_lhs), None) => {
-            state.registers[lhs].set_value(new_lhs.as_value_ref().to_owned()?);
-        }
-        (None, Some(new_rhs)) => {
-            state.registers[rhs].set_value(new_rhs.as_value_ref().to_owned()?);
-        }
-        (Some(new_lhs), Some(new_rhs)) => {
-            let (new_lhs, new_rhs) = (
-                new_lhs.as_value_ref().to_owned()?,
-                new_rhs.as_value_ref().to_owned()?,
-            );
-            state.registers[lhs].set_value(new_lhs);
-            state.registers[rhs].set_value(new_rhs);
-        }
-        (None, None) => {}
-    }
 
     take_jump_if!(should_jump);
 }
@@ -2417,6 +2402,49 @@ fn op_column_fetch_overflowing(
         state,
         cursor.read_payload(KeptRead::Values, values_start, values_end - values_start)
     );
+    if let [(i, _, serial_type)] = values_in_overflow[..] {
+        // The run is one BLOB, so the bytes that the cursor read are the
+        // value. Move them into the register instead of copying them, and give
+        // the cursor the old buffer of the register to read into next time.
+        let is_blob = serial_type >= 12 && serial_type & 1 == 0;
+        if is_blob && bytes.len() as u64 == (serial_type - 12) / 2 {
+            let reg = &mut state.registers[dest + i];
+            let old_blob = match reg {
+                Register::Value(Value::Blob(blob)) => std::mem::replace(blob, crate::alloc::vec![]),
+                _ => crate::alloc::vec![],
+            };
+            reg.set_blob(cursor.take_kept_values(old_blob))?;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        // A TEXT value moves in the same way. The `String` of a TEXT value
+        // uses the global allocator. In nightly builds, the buffer of the
+        // cursor uses the Turso allocator, so there the bytes are copied.
+        #[cfg(not(nightly))]
+        {
+            let is_text = serial_type >= 13 && serial_type & 1 == 1;
+            if is_text
+                && bytes.len() as u64 == (serial_type - 13) / 2
+                && crate::types::validate_utf8(bytes).is_some()
+            {
+                let reg = &mut state.registers[dest + i];
+                let old_text = match reg {
+                    Register::Value(Value::Text(Text {
+                        value: std::borrow::Cow::Owned(text),
+                        ..
+                    })) => std::mem::take(text).into_bytes(),
+                    _ => crate::alloc::vec![],
+                };
+                let bytes = cursor.take_kept_values(old_text);
+                // SAFETY: `validate_utf8` found that these bytes are UTF-8.
+                let text = Text::new(unsafe { String::from_utf8_unchecked(bytes) });
+                match reg {
+                    Register::Value(value) => *value = Value::Text(text),
+                    _ => *reg = Register::Value(Value::Text(text)),
+                }
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
     for (i, offset, serial_type) in values_in_overflow {
         decode_serial_type_into_register(
             serial_type,
@@ -2629,7 +2657,7 @@ pub fn op_type_check(
     assert!(table_reference.is_strict);
     table_reference.columns().iter().enumerate().try_for_each(
         |(column_idx, col)| -> Result<(), LimboError> {
-            if col.is_virtual_generated() && !check_generated {
+            if col.is_generated() && !check_generated {
                 return Ok(());
             }
             let offset = table_reference.logical_to_physical_column(column_idx);
@@ -2689,6 +2717,58 @@ pub fn op_convert_to_type(
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_type_conversion(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _connection: &Arc<Connection>,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        TypeConversion {
+            function,
+            reg,
+            params_reg,
+            param_count,
+            description: _
+        },
+        insn
+    );
+    let value = state.registers[*reg].get_value();
+    if !matches!(value, Value::Null) {
+        let params: SmallVec<[Value; 2]> = state.registers[*params_reg..*params_reg + *param_count]
+            .iter()
+            .map(|param| param.get_value().clone())
+            .collect();
+        let converted = function(value, &params).map_err(|error| {
+            if program.trigger.is_some() {
+                raised_in_trigger(error)
+            } else {
+                error
+            }
+        })?;
+        state.registers[*reg].set_value(converted);
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// A type conversion raises a range or format error as RAISE(ABORT) does
+/// outside a trigger: a plain error. Inside a trigger RAISE(ABORT) is a
+/// trigger constraint error, so `error` becomes one.
+fn raised_in_trigger(error: LimboError) -> LimboError {
+    let LimboError::Raise(resolve_type, raised) = error else {
+        return error;
+    };
+    let raised = match *raised {
+        LimboError::SqlError(message) => LimboError::ConstraintViolation(Box::new(
+            ConstraintViolation::new(ConstraintKind::Trigger, message),
+        )),
+        other => other,
+    };
+    LimboError::Raise(resolve_type, Box::new(raised))
 }
 
 pub fn op_is_type(
@@ -5974,7 +6054,7 @@ pub enum OpProgramState {
     /// Step state tracks whether we're executing a trigger subprogram (vs FK action subprogram)
     Step {
         is_trigger: bool,
-        statement: Box<Statement>,
+        statement: DynBox<Statement>,
         /// Saved last_insert_rowid to restore after trigger subprogram completes.
         /// Per SQLite docs, trigger-body INSERTs must not overwrite the top-level rowid.
         saved_last_insert_rowid: Option<i64>,
@@ -6099,15 +6179,7 @@ pub fn op_program(
                         cached.reset_for_subprogram_reuse();
                         cached
                     } else {
-                        Box::new(Statement::new_with_origin(
-                            Program::from_prepared(subprogram.clone()),
-                            connection.clone(),
-                            pager.clone(),
-                            QueryMode::Normal,
-                            0,
-                            crate::statement::StatementOrigin::Subprogram,
-                            false,
-                        ))
+                        new_subprogram_statement(&subprogram, connection, pager)?
                     };
                 statement.set_subprogram_depth(state.subprogram_depth + 1);
 
@@ -6270,6 +6342,34 @@ pub fn op_program(
             }
         }
     }
+}
+
+/// Makes the statement of a nested trigger or foreign key action program in
+/// memory from the statement allocator of the database. The execution of
+/// nested programs recurses one time for each level through [op_program], so
+/// the large statement must not be in its stack frame. Thus this function
+/// makes the statement in its own frame, and it must not be inlined.
+#[inline(never)]
+fn new_subprogram_statement(
+    subprogram: &Arc<super::PreparedProgram>,
+    connection: &Arc<Connection>,
+    pager: &Arc<Pager>,
+) -> Result<DynBox<Statement>> {
+    let statement = Statement::new_with_origin(
+        Program::from_prepared(subprogram.clone()),
+        connection.clone(),
+        pager.clone(),
+        QueryMode::Normal,
+        0,
+        crate::statement::StatementOrigin::Subprogram,
+        false,
+    )?;
+    let alloc = connection.db.allocators.statement.clone();
+    let statement = crate::with_statement_allocation_site!(
+        SubprogramStatement,
+        DynBox::try_new_in(statement, alloc)
+    )?;
+    Ok(statement)
 }
 
 pub(super) fn abort_active_subprogram(
@@ -9679,10 +9779,18 @@ fn op_agg_step_min_max(
         state.registers.get_disjoint_mut([data.col, data.acc_reg])
     {
         if let Some(best) = payload.first_mut() {
-            step_min_max(is_max, arg, best, data.collation)?;
+            let keeps_best = step_min_max(is_max, arg, best, data.collation)?;
+            if let Some(reg) = data.minmax_keeps_best_reg {
+                state.registers[reg].set_int(keeps_best as i64);
+            }
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
+    }
+    // The accumulator is not initialized yet, so no earlier row set a minimum
+    // or maximum.
+    if let Some(reg) = data.minmax_keeps_best_reg {
+        state.registers[reg].set_int(0);
     }
     op_agg_step_slow(state, data, connection)
 }
@@ -9690,13 +9798,14 @@ fn op_agg_step_min_max(
 /// One step of MIN (`is_max` false) or MAX (`is_max` true): `best` takes a
 /// copy of `arg` when `arg` is not NULL and `best` is NULL, or when `arg`
 /// orders strictly after (MAX) or before (MIN) `best` under `collation`.
+/// Returns true when `best` was not NULL and keeps its value.
 #[inline(always)]
 fn step_min_max(
     is_max: bool,
     arg: &Value,
     best: &mut Value,
     collation: CollationSeq,
-) -> Result<()> {
+) -> Result<bool> {
     // Two integers under a text collation compare as integers, and the copy
     // of an integer does not allocate.
     if let (Value::Numeric(Numeric::Integer(arg)), Value::Numeric(Numeric::Integer(best))) =
@@ -9705,12 +9814,13 @@ fn step_min_max(
         if matches!(collation, CollationSeq::Text(_)) {
             if (is_max && *arg > *best) || (!is_max && *arg < *best) {
                 *best = *arg;
+                return Ok(false);
             }
-            return Ok(());
+            return Ok(true);
         }
     }
     if matches!(arg, Value::Null) {
-        return Ok(());
+        return Ok(!matches!(best, Value::Null));
     }
     let better = matches!(best, Value::Null) || {
         let order = collation.compare(arg.as_ref(), best.as_ref());
@@ -9723,7 +9833,7 @@ fn step_min_max(
     if better {
         best.try_clone_from(arg)?;
     }
-    Ok(())
+    Ok(!better)
 }
 
 #[inline(never)]
@@ -9738,6 +9848,7 @@ fn op_agg_step_slow(
         delimiter,
         func,
         collation,
+        minmax_keeps_best_reg: _,
     } = data;
 
     if let AccumulatorFunc::Window(win_func) = func {
@@ -12356,7 +12467,15 @@ pub fn op_insert(
                 // instead of page 1.
                 let is_schema_root = root_page == 1
                     || root_page == i64::from(crate::mvcc::database::SQLITE_SCHEMA_MVCC_TABLE_ID);
-                if !is_schema_root && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT) {
+                // A cursor opened with OpenEphemeral, OpenAutoindex or OpenDup writes to an
+                // ephemeral B-tree, so the emitter does not have to set the flag for it.
+                let is_ephemeral = flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
+                    || program
+                        .prepared()
+                        .explain
+                        .ephemeral_cursors
+                        .contains(cursor_id);
+                if !is_schema_root && !is_ephemeral {
                     state.active_op_state.insert().sub_state = OpInsertSubState::UpdateLastRowid;
                 } else {
                     // Schema table and ephemeral writes must not produce
@@ -12726,9 +12845,17 @@ pub fn op_delete(
     }
 
     state.active_op_state.clear();
-    if !is_part_of_update {
-        // DELETEs do not count towards the total changes if they are part of an UPDATE statement,
-        // i.e. the DELETE and subsequent INSERT of a row are the same "change".
+    // DELETEs do not count towards the total changes if they are part of an UPDATE statement,
+    // i.e. the DELETE and subsequent INSERT of a row are the same "change". Rows removed
+    // from an ephemeral table, such as a recursive CTE queue or a window frame buffer,
+    // are not changes to the database either.
+    if !is_part_of_update
+        && !program
+            .prepared()
+            .explain
+            .ephemeral_cursors
+            .contains(cursor_id)
+    {
         state.record_statement_change();
     }
     state.pc += 1;
@@ -15710,7 +15837,7 @@ pub fn op_populate_materialized_views(
                 0,
                 crate::statement::StatementOrigin::Subprogram,
                 false,
-            )));
+            )?));
         }
 
         let populate_state = state

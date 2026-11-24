@@ -38,7 +38,7 @@ set test_files {
   affinity3            pass
   aggerror             fail
   aggnested            fail
-  aggorderby           fail
+  aggorderby           pass
   alias                fail
   alter                fail
   alter2               fail
@@ -175,7 +175,7 @@ set test_files {
   corruptN             fail
   cost                 fail
   count                fail
-  countofview          fail
+  countofview          pass
   coveridxscan         fail
   createtab            fail
   cse                  pass
@@ -250,7 +250,7 @@ set test_files {
   fallocate            fail
   filectrl             pass
   filefmt              fail
-  filter1              fail
+  filter1              pass
   filter2              pass
   fkey1                fail
   fkey2                fail
@@ -389,7 +389,7 @@ set test_files {
   minmax               fail
   minmax2              fail
   minmax3              fail
-  minmax4              fail
+  minmax4              pass
   misc1                fail
   misc2                fail
   misc3                pass
@@ -423,7 +423,7 @@ set test_files {
   offset1              pass
   openv2               fail
   orderby1             fail
-  orderby2             fail
+  orderby2             pass
   orderby3             pass
   orderby4             pass
   orderby5             fail
@@ -507,7 +507,7 @@ set test_files {
   seekscan1            pass
   select1              pass
   select2              pass
-  select3              fail
+  select3              pass
   select4              fail
   select5              pass
   select6              fail

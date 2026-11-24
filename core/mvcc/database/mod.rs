@@ -2,6 +2,7 @@ use crate::alloc::{
     ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator, TursoVecInExt,
     ALLOC_ERR_MSG,
 };
+use crate::ast::SortOrder;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 use crate::mvcc::sqlite_schema_row::{types_table_root_page, SqliteSchemaRow};
@@ -59,7 +60,6 @@ use std::ops::Bound;
 use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
-use turso_parser::ast::SortOrder;
 
 pub mod checkpoint;
 #[cfg(not(nightly))]
@@ -2267,77 +2267,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
     ) -> Result<()> {
         // Check for conflicts - iterate in reverse for faster early termination
         for version in row_versions.iter().rev() {
-            // A row that we are trying to commit was deleted/updated by another
-            // committed transaction after our begin timestamp. Even if that
-            // version is now "ended", this is still a write-write conflict.
-            if let Some(TxTimestampOrID::Timestamp(end_ts)) = version.end() {
-                turso_assert!(
-                    end_ts != tx.begin_ts,
-                    "committed end_ts and begin_ts cannot be equal: txn timestamps are strictly monotonic"
-                );
-                if end_ts > tx.begin_ts {
-                    return Err(LimboError::WriteWriteConflict);
-                }
-            }
-
-            // B-tree tombstones (begin: None, end: TxID) act as write locks.
-            // When another transaction has created a tombstone to delete a
-            // B-tree-resident row, that tombstone is effectively a write lock
-            // on the row — same as Hekaton's End field. We must detect this
-            // as a write-write conflict using the same state-based logic used
-            // for begin: TxID checks below.
-            if version.begin().is_none() {
-                // Committed tombstones (end: Timestamp) are already handled by
-                // the check above at lines 1070-1074. Here we only need to check
-                // in-flight tombstones (end: TxID) from other transactions.
-                if let Some(TxTimestampOrID::TxID(other_tx_id)) = version.end() {
-                    if other_tx_id != self.tx_id {
-                        // The other transaction may already have moved from
-                        // `txs` to `finalized_tx_states`; consult both
-                        // instead of panicking on the race.
-                        let other_state = lookup_tx_state(
-                            &mvcc_store.txs,
-                            &mvcc_store.finalized_tx_states,
-                            other_tx_id,
-                        );
-                        match other_state {
-                            Some(TransactionState::Committed(_)) => {
-                                return Err(LimboError::WriteWriteConflict);
-                            }
-                            Some(TransactionState::Preparing(other_end_ts)) => {
-                                if other_end_ts < end_ts {
-                                    return Err(LimboError::WriteWriteConflict);
-                                }
-                            }
-                            Some(TransactionState::Active) => {}
-                            Some(TransactionState::Aborted | TransactionState::Terminated)
-                            | None => {}
-                        }
-                    }
-                }
-                // Tombstones have no meaningful begin field — skip begin checks
-                continue;
-            }
-
             match version.end() {
-                Some(TxTimestampOrID::Timestamp(end_ts)) => {
-                    // Committed deletion. If end_ts > our begin_ts, the conflict
-                    // would have been already caught earlier when we iterate through
-                    // the row versions in reverse. If end_ts < our
-                    // begin_ts, the deletion predates our snapshot — no conflict.
+                Some(TxTimestampOrID::Timestamp(version_end_ts)) => {
+                    // A row that we are trying to commit was deleted/updated by another
+                    // committed transaction after our begin timestamp. Even if that
+                    // version is now "ended", this is still a write-write conflict.
+                    // If the deletion predates our snapshot, the version is not live.
                     turso_assert!(
-                        end_ts < tx.begin_ts,
-                        "row version's end_ts cannot be greater than txns begin_ts"
+                        version_end_ts != tx.begin_ts,
+                        "committed end_ts and begin_ts cannot be equal: txn timestamps are strictly monotonic"
                     );
+                    if version_end_ts > tx.begin_ts {
+                        return Err(LimboError::WriteWriteConflict);
+                    }
                     continue;
                 }
                 Some(TxTimestampOrID::TxID(end_tx_id)) => {
-                    // Deletion not yet finalized; the deleting transaction may still be in Preparing.
                     if end_tx_id == self.tx_id {
                         // We deleted this version ourselves, so it cannot conflict with our commit.
                         continue;
                     }
-
+                    // The deleting transaction may not have replaced its TxID with
+                    // its end timestamp yet. Resolve it the same way as `is_end_visible`.
                     match lookup_tx_state(
                         &mvcc_store.txs,
                         &mvcc_store.finalized_tx_states,
@@ -2353,8 +2304,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                             }
                             continue;
                         }
+                        // Hekaton speculative ignore: the deletion is in our snapshot
+                        // if the deleting transaction commits, so we commit only if it does.
+                        Some(TransactionState::Preparing(other_end_ts))
+                            if other_end_ts < tx.begin_ts =>
+                        {
+                            register_commit_dependency(&mvcc_store.txs, tx, end_tx_id);
+                            continue;
+                        }
+                        Some(TransactionState::Preparing(other_end_ts)) => {
+                            // The deletion is not in our snapshot. A B-tree tombstone
+                            // (begin: None) acts as a write lock on a B-tree-resident row,
+                            // same as Hekaton's End field: lower end_ts wins. Other
+                            // versions fall through to check begin for conflicts.
+                            if version.begin().is_none() && other_end_ts < end_ts {
+                                return Err(LimboError::WriteWriteConflict);
+                            }
+                        }
                         _ => {
-                            // Deleting tx is Active, Preparing, Aborted, or gone.
+                            // Deleting tx is Active, Aborted, or gone.
                             // The deletion may not stick, so this version may still be live.
                             // Fall through to check begin for conflicts.
                         }
@@ -2417,7 +2385,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     return Err(LimboError::WriteWriteConflict);
                 }
                 None => {
-                    // Invalid version
+                    // B-tree tombstone: no begin to check.
                 }
             }
         }
@@ -2852,15 +2820,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         else {
             unreachable!("step_mark_dirty_keys requires MarkDirtyKeys state")
         };
-        let (next, total) = mvcc_store.mark_tx_write_set_dirty(
-            tx.value(),
-            *end_ts,
-            *cursor,
-            MVCC_COMMIT_BATCH_SIZE,
-        )?;
-        if next < total {
-            *cursor = next;
-            return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
+        // Only the passive checkpoint reads the dirty keys. A blocking checkpoint reads
+        // every key of the MvStore, so recording them would only cost time.
+        if mvcc_store.uses_passive_checkpoint() {
+            let (next, total) = mvcc_store.mark_tx_write_set_dirty(
+                tx.value(),
+                *end_ts,
+                *cursor,
+                MVCC_COMMIT_BATCH_SIZE,
+            )?;
+            if next < total {
+                *cursor = next;
+                return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
+            }
         }
         let end_ts = *end_ts;
         let log_record = log_record
@@ -7244,7 +7216,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         let dirty_stamp = match tx.state.load() {
             TransactionState::Active => None,
-            TransactionState::Preparing(end_ts) => Some(end_ts),
+            // Commits record dirty keys only for the passive checkpoint.
+            TransactionState::Preparing(end_ts) => {
+                self.experimental_mvcc_passive_checkpoint.then_some(end_ts)
+            }
             other => {
                 unreachable!("rollback_tx requires Active or Preparing, got {other:?}")
             }
@@ -9328,12 +9303,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// top of the restored database image. To make the reset durable, call
     /// `sync_logical_log` after the completion finishes.
     pub fn reset_logical_log_after_external_restore(&self) -> Result<Completion> {
-        if self.storage.encryption_ctx().is_some() {
-            return Err(LimboError::InvalidArgument(
-                "external restore is not supported with built-in encryption".into(),
-            ));
-        }
-
         self.storage.reset_to_fresh_header()
     }
 
@@ -10975,16 +10944,25 @@ impl RowVersion {
     /// timestamp `end_ts`. Shared by the chunked commit step
     /// (`step_rewrite_live_versions`) and the dropped-statement cleanup path
     /// (`rewrite_live_versions_for_committed_tx`) so the two cannot drift.
+    ///
+    /// Keeps `materialized_at`. `tx_id` is already `Committed(end_ts)`, and
+    /// `stamp_chain_materialized` resolves a `TxID` through that state, so the
+    /// rewrite does not change the state a checkpoint wrote to the B-tree. A
+    /// checkpoint pass that ran before the rewrite already removed the key from
+    /// the dirty set, so a reset stamp is never set again and GC never drops
+    /// the version.
     #[inline]
     fn rewrite_txid_to_timestamp(&mut self, tx_id: TxID, end_ts: u64) {
         if let Some(TxTimestampOrID::TxID(rv_id)) = self.begin() {
             if rv_id == tx_id {
-                self.set_begin(Some(TxTimestampOrID::Timestamp(end_ts)));
+                self.begin =
+                    crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(end_ts)));
             }
         }
         if let Some(TxTimestampOrID::TxID(rv_id)) = self.end() {
             if rv_id == tx_id {
-                self.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
+                self.end =
+                    crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(end_ts)));
             }
         }
     }

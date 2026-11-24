@@ -773,3 +773,122 @@ expect {
 expect @tursopg error {
     a virtual generated column is not supported
 }
+
+test stored-generated-smallint-column-computed-on-insert {
+    CREATE TABLE t (a int, b smallint GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (100);
+    SELECT a, b FROM t;
+}
+expect {
+    100|200
+}
+
+test stored-generated-smallint-column-checks-its-range {
+    CREATE TABLE t (a int, b smallint GENERATED ALWAYS AS (a * 1000) STORED);
+    INSERT INTO t (a) VALUES (100);
+}
+@sqlstate 22003
+expect error {
+    out of range
+}
+
+test stored-generated-bigint-column-computed-on-update {
+    CREATE TABLE t (a bigint, b bigint GENERATED ALWAYS AS (a + 1) STORED);
+    INSERT INTO t (a) VALUES (1);
+    UPDATE t SET a = 10;
+    SELECT a, b FROM t;
+}
+expect {
+    10|11
+}
+
+test stored-generated-varchar-column-computed-on-insert {
+    CREATE TABLE t (a text, b varchar(3) GENERATED ALWAYS AS (a || 'x') STORED);
+    INSERT INTO t (a) VALUES ('ab');
+    SELECT a, b FROM t;
+}
+expect {
+    ab|abx
+}
+
+test stored-generated-varchar-column-checks-its-length {
+    CREATE TABLE t (a text, b varchar(3) GENERATED ALWAYS AS (a || 'x') STORED);
+    INSERT INTO t (a) VALUES ('abc');
+}
+@sqlstate 22001
+expect error {
+    too long
+}
+
+test stored-generated-numeric-column-in-a-multi-row-insert {
+    CREATE TABLE t (a numeric(10,2), g numeric(10,2) GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (1.234), (4.5), (7);
+    SELECT a, g FROM t ORDER BY a;
+}
+expect {
+    1.23|2.46
+    4.50|9.00
+    7.00|14.00
+}
+
+test stored-generated-numeric-column-reads-the-coerced-update-value {
+    CREATE TABLE t (a numeric(10,2), g numeric(10,2) GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (1.5), (2.5);
+    UPDATE t SET a = 3.456 WHERE a < 2;
+    SELECT a, g FROM t ORDER BY a;
+}
+expect {
+    2.50|5.00
+    3.46|6.92
+}
+
+test stored-generated-numeric-column-reads-the-coerced-upsert-value {
+    CREATE TABLE t (id int PRIMARY KEY, a numeric(10,2), g numeric(10,2) GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (id, a) VALUES (1, 1.5);
+    INSERT INTO t (id, a) VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET a = 3.333;
+    SELECT id, a, g FROM t;
+}
+expect {
+    1|3.33|6.66
+}
+
+test stored-generated-numeric-column-rounds-its-value {
+    CREATE TABLE t (a int, g numeric(10,2) GENERATED ALWAYS AS (a / 3.0) STORED);
+    INSERT INTO t (a) VALUES (5), (6);
+    SELECT a, g FROM t ORDER BY a;
+}
+expect {
+    5|1.67
+    6|2.00
+}
+
+test stored-generated-numeric-column-with-an-index {
+    CREATE TABLE t (a numeric(10,2), g numeric(10,2) GENERATED ALWAYS AS (a * 2) STORED);
+    CREATE INDEX t_g ON t (g);
+    INSERT INTO t (a) VALUES (1.234), (4.5);
+    SELECT a FROM t WHERE g = 9;
+    SELECT a FROM t WHERE g = 2.47;
+}
+expect {
+    4.50
+}
+
+test stored-generated-numeric-column-returning {
+    CREATE TABLE t (a numeric(10,2), g numeric(10,2) GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (1.234), (4.5) RETURNING a, g;
+}
+expect {
+    1.23|2.46
+    4.50|9.00
+}
+
+test stored-generated-uuid-column-computed-on-insert-and-update {
+    CREATE TABLE t (a text, g uuid GENERATED ALWAYS AS (a::uuid) STORED);
+    INSERT INTO t (a) VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), ('b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    UPDATE t SET a = 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' WHERE a LIKE 'a%';
+    SELECT g FROM t ORDER BY g;
+}
+expect {
+    b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}

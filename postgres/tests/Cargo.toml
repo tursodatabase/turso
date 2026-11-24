@@ -31,7 +31,6 @@ zerocopy = "0.8.26"
 ctor = "0.5.0"
 twox-hash = "2.1.1"
 sql_generation = { path = "../../sql_generation" }
-turso_parser = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing = { workspace = true }
 turso-dbhash.workspace = true

@@ -383,6 +383,13 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_COLUMN
     } else if msg.contains("no such function") || msg.contains("no such window") {
         SQLSTATE_UNDEFINED_FUNCTION
+    } else if msg.starts_with("cannot cast type ") {
+        SQLSTATE_CANNOT_COERCE
+    } else if msg.starts_with("cannot compare type ") {
+        // tursopg refuses comparisons that PostgreSQL may run, and it does not know
+        // which ones. PostgreSQL itself reports 42883 for some of these, so this
+        // code differs from 42883 only where PostgreSQL also refuses.
+        SQLSTATE_FEATURE_NOT_SUPPORTED
     } else if msg.contains("already exists") {
         SQLSTATE_DUPLICATE_TABLE
     } else if msg.starts_with("ambiguous column name") || msg.ends_with("\" is ambiguous") {
