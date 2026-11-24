@@ -1156,6 +1156,22 @@ impl<'a> TranslateCtx<'a> {
             unsafe_testing,
         }
     }
+
+    /// Makes a context in a [Box].
+    ///
+    /// The emitter makes a context for each level of nested queries, and its
+    /// functions are on the stack one time for each level. This function is not
+    /// inlined, so that the large context is made in this frame, and not in the
+    /// frame of the caller.
+    #[inline(never)]
+    pub fn new_boxed(
+        program: &mut ProgramBuilder,
+        resolver: Resolver<'a>,
+        table_count: usize,
+        unsafe_testing: bool,
+    ) -> Box<Self> {
+        Box::new(Self::new(program, resolver, table_count, unsafe_testing))
+    }
 }
 
 #[derive(Debug, Clone)]
