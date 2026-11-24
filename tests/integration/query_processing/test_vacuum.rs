@@ -4969,6 +4969,97 @@ fn test_plain_vacuum_preserves_sqlite_stat1(tmp_db: TempDatabase) -> anyhow::Res
     Ok(())
 }
 
+/// Plain VACUUM must keep ANALYZE statistics loaded in the schema so the query
+/// planner continues using them without running ANALYZE again.
+#[turso_macros::test(mvcc)]
+fn test_plain_vacuum_preserves_analyze_stats_for_planner(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(a, b)")?;
+    conn.execute("CREATE INDEX ia ON t(a)")?;
+    conn.execute("CREATE INDEX ib ON t(b)")?;
+    conn.execute(
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 2000) \
+         INSERT INTO t SELECT 1, x FROM c",
+    )?;
+    conn.execute("ANALYZE")?;
+
+    let plan_before: Vec<(i64, i64, i64, String)> =
+        conn.exec_rows("EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5");
+    assert!(
+        plan_before
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("USING INDEX ib")),
+        "expected planner to use ib before VACUUM, got: {plan_before:?}"
+    );
+
+    run_plain_vacuum_and_assert_round_trip(&tmp_db, &conn)?;
+
+    assert!(
+        conn.current_schema()
+            .analyze_stats
+            .table_stats(turso_core::namespace::NamespaceId::ROOT, "t")
+            .is_some(),
+        "expected connection schema to keep analyze_stats after VACUUM"
+    );
+
+    let plan_after: Vec<(i64, i64, i64, String)> =
+        conn.exec_rows("EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5");
+    assert!(
+        plan_after
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("USING INDEX ib")),
+        "expected planner to keep using ib after VACUUM, got: {plan_after:?}"
+    );
+
+    let plan_conn2: Vec<(i64, i64, i64, String)> =
+        conn2.exec_rows("EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5");
+    assert!(
+        plan_conn2
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("USING INDEX ib")),
+        "expected another connection to keep using ib after VACUUM, got: {plan_conn2:?}"
+    );
+
+    Ok(())
+}
+
+/// Plain VACUUM must stay best-effort when loading `sqlite_stat1`: a malformed
+/// `sqlite_stat1` schema (for example created via `writable_schema`) must not
+/// cause VACUUM to fail, matching SQLite.
+#[turso_macros::test]
+fn test_plain_vacuum_succeeds_with_malformed_sqlite_stat1(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("malformed_stat1.db");
+    {
+        let sqlite = rusqlite::Connection::open(&db_path)?;
+        sqlite.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE t(a);
+             INSERT INTO t VALUES (1);
+             ANALYZE;
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema
+                SET sql = 'CREATE TABLE sqlite_stat1(only_one_col)'
+              WHERE name = 'sqlite_stat1';
+             PRAGMA writable_schema = OFF;",
+        )?;
+    }
+
+    let db = TempDatabase::new_with_existent_with_opts(&db_path, tmp_db.db_opts);
+    let conn = db.connect_limbo();
+    conn.execute("VACUUM")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM t");
+    assert_eq!(rows, vec![(1,)]);
+
+    Ok(())
+}
+
 /// Plain VACUUM must preserve custom index-method indexes on the source
 /// connection after schema reload.
 #[turso_macros::test]
