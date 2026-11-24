@@ -387,6 +387,14 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn type_of(
+        &self,
+        expr: &turso_core::ast::Expr,
+        env: &dyn turso_core::dialect::types::TypeEnv,
+    ) -> Option<Arc<dyn turso_core::dialect::types::DialectType>> {
+        crate::dialect_types::type_of(expr, env)
+    }
+
     fn write_array_blob_element(&self, out: &mut String, blob: &[u8]) {
         out.push_str(&crate::text::encode_bytea(blob, true));
     }

@@ -474,7 +474,6 @@ expect @tursopg {
 }
 
 # C-42: ::text cast of a boolean
-@compat-gap "cast:bool -> text"
 test text-cast-of-boolean {
     CREATE TABLE flags (b boolean);
     INSERT INTO flags VALUES (true), (false);
@@ -484,9 +483,57 @@ expect {
     false|true|false
     true|true|false
 }
-expect @tursopg {
-    0|1|0
-    1|1|0
+
+test text-cast-of-boolean-in-an-index-expression {
+    CREATE TABLE flags (id int, b boolean);
+    INSERT INTO flags VALUES (1, true);
+    CREATE INDEX flags_as_text ON flags ((b::text));
+    INSERT INTO flags VALUES (2, true), (3, false);
+    SELECT id FROM flags WHERE b::text = 'true' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test text-cast-of-boolean-in-a-view {
+    CREATE TABLE flags (id int, b boolean);
+    INSERT INTO flags VALUES (1, true), (2, false);
+    CREATE VIEW flags_as_text AS SELECT id, b::text AS s FROM flags;
+    SELECT s FROM flags_as_text ORDER BY id;
+}
+expect {
+    true
+    false
+}
+
+test text-cast-of-case-that-gives-a-boolean {
+    CREATE TABLE flags (id int, b boolean);
+    INSERT INTO flags VALUES (1, true), (2, false);
+    SELECT (CASE WHEN id > 0 THEN b END)::text FROM flags ORDER BY id;
+}
+expect {
+    true
+    false
+}
+
+test text-cast-of-a-comparison-and-of-boolean-operators {
+    CREATE TABLE flags (id int, b boolean);
+    INSERT INTO flags VALUES (1, true), (2, false);
+    SELECT (id = 1)::text, (NOT b)::text, (b IS NULL)::text, (b AND id > 0)::text, (id IN (1, 3))::text, (id BETWEEN 2 AND 3)::text FROM flags ORDER BY id;
+}
+expect {
+    true|false|false|true|true|false
+    false|true|false|false|false|true
+}
+
+test text-cast-of-boolean-array-is-not-the-cast-of-a-boolean {
+    CREATE TABLE flags (arr boolean[]);
+    INSERT INTO flags VALUES ('{t}');
+    SELECT count(*) FROM flags WHERE arr::text = 'true';
+}
+expect {
+    0
 }
 
 # C-43: result column type of bool comparison via pg_typeof
@@ -526,5 +573,5 @@ expect {
     b"}|t
 }
 expect @tursopg {
-    {"a\nb"}|1
+    {"a\nb"}|t
 }

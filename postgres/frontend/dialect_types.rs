@@ -1,39 +1,187 @@
 //! The types of the PostgreSQL frontend.
 //!
-//! This is a literal copy of the SQLite types in `sqlite/frontend/types.rs`.
-//! The translator writes types with the names of SQLite types and of Turso's
-//! custom types, and core used to read those names by SQLite's rules
-//! whatever the dialect. The copy keeps that behavior. It is a copy and not
-//! shared code so that the PostgreSQL types can change without touching
-//! SQLite's.
+//! This started as a literal copy of the SQLite types in
+//! `sqlite/frontend/types.rs`. The translator writes types with the names of
+//! SQLite types and of Turso's custom types, and core used to read those
+//! names by SQLite's rules whatever the dialect. It is a copy and not shared
+//! code so that the PostgreSQL types can change without touching SQLite's.
+//! What differs from SQLite so far: a CAST of a boolean to text.
 
 use std::sync::{Arc, LazyLock};
-use turso_core::ast::{TypeHandle, TypePlace, TypeResolver};
-use turso_core::dialect::types::{type_handle, CastContext, DialectType};
-use turso_core::{Affinity, Result, Value};
+use turso_core::ast::{self, TypeHandle, TypePlace, TypeResolver};
+use turso_core::dialect::types::{handle_type, type_handle, CastContext, DialectType, TypeEnv};
+use turso_core::{Affinity, Numeric, Result, Value};
 
 /// Gives the translator the type of each type name it writes.
 pub struct PostgresTypes;
 
 impl TypeResolver for PostgresTypes {
     fn resolve(&self, type_name: &str, place: TypePlace) -> TypeHandle {
-        handle_of(affinity_of_type_name(type_name, place))
+        if is_boolean_type(type_name) {
+            boolean_handle()
+        } else if type_name.eq_ignore_ascii_case("text") {
+            text_handle()
+        } else {
+            handle_of(affinity_of_type_name(type_name, place))
+        }
     }
 }
 
-/// A type that is nothing but an affinity.
+fn boolean_handle() -> TypeHandle {
+    static BOOLEAN: LazyLock<TypeHandle> = LazyLock::new(|| {
+        type_handle(Arc::new(PostgresType {
+            affinity: affinity_of_type_name("boolean", TypePlace::Column),
+            name: TypeName::Boolean,
+        }))
+    });
+    BOOLEAN.clone()
+}
+
+fn text_handle() -> TypeHandle {
+    static TEXT: LazyLock<TypeHandle> = LazyLock::new(|| {
+        type_handle(Arc::new(PostgresType {
+            affinity: affinity_of_type_name("text", TypePlace::Column),
+            name: TypeName::Text,
+        }))
+    });
+    TEXT.clone()
+}
+
+/// The type of a column or of a CAST, and boolean for an expression that
+/// always gives a boolean, such as a comparison. The type of any other
+/// expression, such as a function call, is not worked out.
+pub(crate) fn type_of(expr: &ast::Expr, env: &dyn TypeEnv) -> Option<Arc<dyn DialectType>> {
+    match expr {
+        ast::Expr::Column { table, column, .. } => env.column_type(*table, *column),
+        ast::Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } if type_name.array_dimensions == 0 => type_name
+            .resolved
+            .as_ref()
+            .map(|handle| Arc::clone(handle_type(handle))),
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => type_of(&exprs[0], env),
+        _ => {
+            let column_is_boolean = |table, column| {
+                env.column_type(table, column)
+                    .is_some_and(|ty| is_boolean(&*ty))
+            };
+            match boolean_result_type(expr, &column_is_boolean) {
+                BooleanResultType::Boolean => Some(Arc::clone(handle_type(&boolean_handle()))),
+                BooleanResultType::Null | BooleanResultType::Other => None,
+            }
+        }
+    }
+}
+
+pub(crate) enum BooleanResultType {
+    Boolean,
+    Null,
+    Other,
+}
+
+// FIXME(pg-catalog): This guesses from the shape of the expression whether an
+// expression is boolean, because Turso has no typed expression tree. With
+// better binding and resolved expression support, read the type from the
+// resolved expression instead. Inferring it from expression shapes here
+// is fragile: new expressions and rewrites can lose the boolean type.
+pub(crate) fn boolean_result_type(
+    expr: &ast::Expr,
+    column_is_boolean: &dyn Fn(ast::TableInternalId, usize) -> bool,
+) -> BooleanResultType {
+    use ast::{Expr, Literal, Operator, UnaryOperator};
+
+    match expr {
+        Expr::Literal(Literal::Null) => BooleanResultType::Null,
+        Expr::Cast {
+            type_name: Some(ty),
+            ..
+        } if ty.array_dimensions == 0 && is_boolean_type(&ty.name) => BooleanResultType::Boolean,
+        Expr::Column { table, column, .. } => {
+            if column_is_boolean(*table, *column) {
+                BooleanResultType::Boolean
+            } else {
+                BooleanResultType::Other
+            }
+        }
+        Expr::Binary(
+            _,
+            Operator::And
+            | Operator::Or
+            | Operator::Equals
+            | Operator::NotEquals
+            | Operator::Less
+            | Operator::LessEquals
+            | Operator::Greater
+            | Operator::GreaterEquals
+            | Operator::Is
+            | Operator::IsNot,
+            _,
+        )
+        | Expr::Unary(UnaryOperator::Not, _)
+        | Expr::IsNull(_)
+        | Expr::NotNull(_)
+        | Expr::Like { .. }
+        | Expr::Between { .. }
+        | Expr::InList { .. }
+        | Expr::InSelect { .. }
+        | Expr::InTable { .. }
+        | Expr::Exists(_) => BooleanResultType::Boolean,
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            boolean_result_type(&exprs[0], column_is_boolean)
+        }
+        Expr::Collate(expr, _) => boolean_result_type(expr, column_is_boolean),
+        Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } => {
+            let mut result = BooleanResultType::Null;
+            for expr in when_then_pairs
+                .iter()
+                .map(|(_, then)| then.as_ref())
+                .chain(else_expr.as_deref())
+            {
+                match boolean_result_type(expr, column_is_boolean) {
+                    BooleanResultType::Boolean => result = BooleanResultType::Boolean,
+                    BooleanResultType::Null => {}
+                    BooleanResultType::Other => return BooleanResultType::Other,
+                }
+            }
+            result
+        }
+        _ => BooleanResultType::Other,
+    }
+}
+
+pub(crate) fn is_boolean_type(name: &str) -> bool {
+    name.eq_ignore_ascii_case("boolean") || name.eq_ignore_ascii_case("bool")
+}
+
 #[derive(Debug)]
 struct PostgresType {
     affinity: Affinity,
+    name: TypeName,
+}
+
+/// The types that the frontend tells apart from an affinity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeName {
+    Boolean,
+    Text,
+    Other,
 }
 
 impl DialectType for PostgresType {
     fn cast(
         &self,
         value: &Value,
-        _from: Option<&dyn DialectType>,
+        from: Option<&dyn DialectType>,
         _context: CastContext,
     ) -> Result<Value> {
+        if self.name == TypeName::Text && from.is_some_and(is_boolean) {
+            return Ok(boolean_as_text(value));
+        }
         Ok(value.exec_cast(self.affinity)?)
     }
 
@@ -52,6 +200,20 @@ impl std::fmt::Display for PostgresType {
     }
 }
 
+fn is_boolean(ty: &dyn DialectType) -> bool {
+    ty.as_any()
+        .downcast_ref::<PostgresType>()
+        .is_some_and(|ty| ty.name == TypeName::Boolean)
+}
+
+/// A boolean is stored as the integer 1 or 0.
+fn boolean_as_text(value: &Value) -> Value {
+    match value {
+        Value::Numeric(Numeric::Integer(0)) => Value::build_text("false"),
+        _ => Value::build_text("true"),
+    }
+}
+
 /// The one handle of each affinity, so that reading a type allocates nothing.
 fn handle_of(affinity: Affinity) -> TypeHandle {
     static HANDLES: LazyLock<[TypeHandle; 6]> = LazyLock::new(|| {
@@ -63,7 +225,12 @@ fn handle_of(affinity: Affinity) -> TypeHandle {
             Affinity::Real,
             Affinity::None,
         ]
-        .map(|affinity| type_handle(Arc::new(PostgresType { affinity })))
+        .map(|affinity| {
+            type_handle(Arc::new(PostgresType {
+                affinity,
+                name: TypeName::Other,
+            }))
+        })
     });
     HANDLES[affinity as usize - 1].clone()
 }

@@ -11,6 +11,7 @@ use turso_core::{
     Value,
 };
 
+use crate::dialect_types::{is_boolean_type, BooleanResultType};
 use crate::error::in_failed_sql_transaction_error;
 use crate::session::DeferredExecution;
 use crate::Result;
@@ -603,70 +604,18 @@ impl Statement {
     }
 }
 
-enum BooleanResultType {
-    Boolean,
-    Null,
-    Other,
-}
-
-// FIXME(pg-catalog): This guesses from the shape of the expression whether a
-// result column is boolean, because Turso has no typed expression tree. With
-// better binding and resolved expression support, read the result type from
-// the resolved expression instead. Inferring it from expression shapes here
-// is fragile: new expressions and rewrites can lose the boolean type.
 fn boolean_result_type(
     expr: &turso_core::ast::Expr,
     program: &turso_core::Program,
 ) -> BooleanResultType {
-    use turso_core::ast::{Expr, Literal};
-
-    match expr {
-        Expr::Literal(Literal::Null) => BooleanResultType::Null,
-        Expr::Cast {
-            type_name: Some(ty),
-            ..
-        } if ty.array_dimensions == 0 && is_boolean_type(&ty.name) => BooleanResultType::Boolean,
-        Expr::Column { table, column, .. } => {
-            let column = program
-                .table_references
-                .find_table_by_internal_id(*table)
-                .and_then(|(_, table)| table.get_column_at(*column));
-            match column {
-                Some(column)
-                    if column.array_dimensions() == 0 && is_boolean_type(&column.ty_str) =>
-                {
-                    BooleanResultType::Boolean
-                }
-                _ => BooleanResultType::Other,
-            }
-        }
-        Expr::Parenthesized(exprs) if exprs.len() == 1 => boolean_result_type(&exprs[0], program),
-        Expr::Collate(expr, _) => boolean_result_type(expr, program),
-        Expr::Case {
-            when_then_pairs,
-            else_expr,
-            ..
-        } => {
-            let mut result = BooleanResultType::Null;
-            for expr in when_then_pairs
-                .iter()
-                .map(|(_, then)| then.as_ref())
-                .chain(else_expr.as_deref())
-            {
-                match boolean_result_type(expr, program) {
-                    BooleanResultType::Boolean => result = BooleanResultType::Boolean,
-                    BooleanResultType::Null => {}
-                    BooleanResultType::Other => return BooleanResultType::Other,
-                }
-            }
-            result
-        }
-        _ => BooleanResultType::Other,
-    }
-}
-
-fn is_boolean_type(name: &str) -> bool {
-    name.eq_ignore_ascii_case("boolean") || name.eq_ignore_ascii_case("bool")
+    let column_is_boolean = |table, column: usize| {
+        program
+            .table_references
+            .find_table_by_internal_id(table)
+            .and_then(|(_, table)| table.get_column_at(column))
+            .is_some_and(|column| column.array_dimensions() == 0 && is_boolean_type(&column.ty_str))
+    };
+    crate::dialect_types::boolean_result_type(expr, &column_is_boolean)
 }
 
 impl std::ops::Deref for Statement {
