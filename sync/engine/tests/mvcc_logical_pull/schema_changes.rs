@@ -153,3 +153,37 @@ fn drop_newest_table_and_create_another_table_in_one_transaction() -> Result<()>
     assert_eq!(replica.snapshot()?, remote.snapshot()?);
     Ok(())
 }
+
+/// `tag` is a generated column that uses another generated column,
+/// `surname_norm`.
+const MUGGLES_IN_LONDON: &[&str] = &[
+    r#"CREATE TABLE "muggles-in-london" (
+        id TEXT PRIMARY KEY,
+        surname TEXT,
+        surname_norm TEXT AS (CAST (surname AS TEXT)),
+        tag TEXT AS (LOWER (surname_norm))
+    )"#,
+    r#"INSERT INTO "muggles-in-london" (id, surname) VALUES ('a', 'Smith')"#,
+];
+
+/// Changes the expression of `surname_norm`. `tag` uses `surname_norm`, so
+/// `tag` is dropped first and added again at the end with the same
+/// expression.
+const REDEFINE_SURNAME_NORM: &[&str] = &[
+    r#"ALTER TABLE "muggles-in-london" DROP COLUMN tag"#,
+    r#"ALTER TABLE "muggles-in-london" DROP COLUMN surname_norm"#,
+    r#"ALTER TABLE "muggles-in-london" ADD COLUMN surname_norm TEXT AS (UPPER (surname))"#,
+    r#"ALTER TABLE "muggles-in-london" ADD COLUMN tag TEXT AS (LOWER (surname_norm))"#,
+];
+
+#[test]
+fn redefine_generated_column_used_by_another_in_one_transaction() -> Result<()> {
+    let remote = Remote::new(MUGGLES_IN_LONDON)?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(REDEFINE_SURNAME_NORM)?;
+    replica.pull()?;
+
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
