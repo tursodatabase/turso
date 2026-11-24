@@ -155,7 +155,7 @@ impl<'a> CmdContext<'a> {
 
     /// Opens the seeded table `name` of the main database for writing, and
     /// returns its writer. `name` is the name of a seeded table of the
-    /// catalog.
+    /// catalog or of core.
     ///
     /// When the schema of the statement has the table stored, the writer
     /// opens it. Otherwise this is the first write: the writer creates the

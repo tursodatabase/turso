@@ -2773,60 +2773,27 @@ fn persist_type_definition(
     sql: String,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
 ) -> Result<()> {
-    // Ensure sqlite_turso_types table exists (lazy creation)
-    let types_table: Arc<BTreeTable>;
-    let types_root_page: RegisterOrLiteral<i64>;
-    let existing_types_table = resolver
+    // The first type stores the table of types, which emits a cookie.
+    let storing_types_table = resolver
         .schema()
-        .get_btree_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME);
-    let creating_types_table = existing_types_table.is_none();
+        .get_btree_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME)
+        .is_none();
+    let cmd_context = CmdContext::new(connection, resolver, MAIN_DB_ID);
+    let types = cmd_context.open_seeded_table_for_write(program, TURSO_TYPES_TABLE_NAME)?;
 
-    if let Some(existing) = existing_types_table {
-        types_table = existing.clone();
-        types_root_page = RegisterOrLiteral::Literal(existing.root_page);
-    } else {
-        let created = emit_create_internal_table(
-            program,
-            resolver,
-            TURSO_TYPES_TABLE_NAME,
-            &format!("CREATE TABLE {TURSO_TYPES_TABLE_NAME}(name TEXT PRIMARY KEY, sql TEXT)"),
-        )?;
-        (types_table, types_root_page) = (created.table, created.root_page);
-    }
-
-    // Open sqlite_turso_types for writing
-    let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: types_cursor_id,
-        root_page: types_root_page,
-        db: MAIN_DB_ID,
+    // Insert the (name, sql) row
+    let name_reg = program.alloc_registers(2);
+    program.emit_insn(Insn::String8 {
+        value: normalized_name,
+        dest: name_reg,
     });
-
-    // Insert (name, sql) record
-    let rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: types_cursor_id,
-        rowid_reg,
-        prev_largest_reg: 0,
+    program.emit_insn(Insn::String8 {
+        value: sql.clone(),
+        dest: name_reg + 1,
     });
-    let name_reg = program.emit_string8_new_reg(normalized_name);
-    program.emit_string8_new_reg(sql.clone());
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(name_reg),
-        count: to_u32(2),
-        dest_reg: to_u32(record_reg),
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: types_cursor_id,
-        key_reg: rowid_reg,
-        record_reg,
-        flag: InsertFlags::new(),
-        table_name: TURSO_TYPES_TABLE_NAME.to_string(),
-    });
+    types.emit_insert(program, name_reg);
 
     // Add the type to the in-memory registry
     program.emit_insn(Insn::AddType {
@@ -2834,12 +2801,11 @@ fn persist_type_definition(
         sql,
     });
 
-    if !creating_types_table {
-        // Only when this path emitted no cookie above. `AddType` registers the type in the
-        // connection schema but allocates nothing, so its failure needs no restore and a cookie
-        // emitted before it only leaves the connection and the database out of step: inside an
-        // explicit transaction, the statement rollback restores neither and `COMMIT` fails with
-        // "Database schema changed".
+    if !storing_types_table {
+        // Only when storing the table of types emitted no cookie above. The
+        // cookie comes after `AddType`, which registers the type in the
+        // connection schema but allocates nothing: when `AddType` fails, the
+        // statement has not changed the cookie.
         emit_schema_cookie(resolver, program);
     }
 
@@ -2893,6 +2859,7 @@ pub fn translate_create_type(
     if_not_exists: bool,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
 ) -> Result<()> {
     let normalized_name = normalize_ident(type_name);
 
@@ -2952,7 +2919,7 @@ pub fn translate_create_type(
     // Build canonical SQL (without IF NOT EXISTS) for persistence
     let sql = build_create_type_sql(&normalized_name, body);
 
-    persist_type_definition(normalized_name, sql, resolver, program)
+    persist_type_definition(normalized_name, sql, resolver, program, connection)
 }
 
 /// Refuse a DECODE when the kind of value it returns can't be worked out:
@@ -3092,6 +3059,7 @@ pub fn translate_create_domain(
     if_not_exists: bool,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
 ) -> Result<()> {
     let normalized_name = normalize_ident(domain_name);
 
@@ -3177,7 +3145,7 @@ pub fn translate_create_domain(
         s
     };
 
-    persist_type_definition(normalized_name, sql, resolver, program)
+    persist_type_definition(normalized_name, sql, resolver, program, connection)
 }
 
 /// Refuse a new type or domain whose name an existing type or stored
@@ -3208,6 +3176,7 @@ pub fn translate_drop_type(
     is_domain_drop: bool,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
 ) -> Result<()> {
     let normalized_name = normalize_ident(type_name);
     let kind = if is_domain_drop { "domain" } else { "type" };
@@ -3252,17 +3221,18 @@ pub fn translate_drop_type(
         bail_parse_error!("cannot drop type {normalized_name}: type {name} depends on it");
     }
 
-    // Open cursor to sqlite_turso_types table
-    let types_table = resolver
+    // Open the stored table of types, which has the row of every type that is
+    // not built-in.
+    if resolver
         .schema()
         .get_btree_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME)
-        .ok_or_else(|| crate::LimboError::ParseError(format!("no such type: {normalized_name}")))?;
-    let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: types_cursor_id,
-        root_page: types_table.root_page.into(),
-        db: MAIN_DB_ID,
-    });
+        .is_none()
+    {
+        bail_parse_error!("no such type: {normalized_name}");
+    }
+    let cmd_context = CmdContext::new(connection, resolver, MAIN_DB_ID);
+    let types = cmd_context.open_seeded_table_for_write(program, TURSO_TYPES_TABLE_NAME)?;
+    let types_cursor_id = types.cursor_id();
 
     // Search for matching row: name=type_name (col 0)
     let name_reg = program.alloc_register();
@@ -3295,12 +3265,8 @@ pub fn translate_drop_type(
         collation: CollationSeq::for_internal_values(),
     });
 
-    // Delete matching row
-    program.emit_insn(Insn::Delete {
-        cursor_id: types_cursor_id,
-        table_name: TURSO_TYPES_TABLE_NAME.to_string(),
-        is_part_of_update: false,
-    });
+    // Delete matching row, and its index entries
+    types.emit_delete(program);
 
     program.preassign_label_to_next_insn(skip_delete_label);
 

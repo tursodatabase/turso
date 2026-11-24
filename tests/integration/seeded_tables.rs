@@ -1432,3 +1432,250 @@ fn large_seed_fills_wal() {
 fn large_seed_fills_mvcc() {
     large_seed_fills(true);
 }
+
+fn open_with_custom_types(path: &Path, mvcc: bool) -> TempDatabase {
+    TempDatabase::builder()
+        .with_db_path(path)
+        .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+        .with_mvcc(mvcc)
+        .build()
+}
+
+/// The table of the types made by CREATE TYPE has the automatic index of
+/// its `name TEXT PRIMARY KEY` column, so SQLite finds the file intact.
+#[test]
+fn types_table_has_its_automatic_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    {
+        let db = open_with_custom_types(&path, false);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TYPE cents BASE integer").unwrap();
+        assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    assert_eq!(sqlite_integrity_check(&path), "ok");
+}
+
+/// `SELECT name FROM __turso_internal_types`, by name.
+fn stored_type_names(conn: &Arc<Connection>) -> Vec<Vec<SqlValue>> {
+    rows(
+        conn,
+        "SELECT name FROM __turso_internal_types ORDER BY name",
+    )
+}
+
+/// The `type` and `name` of the `sqlite_schema` rows of the table of types.
+fn types_table_schema_rows(conn: &Arc<Connection>) -> Vec<Vec<SqlValue>> {
+    rows(
+        conn,
+        "SELECT type, name FROM sqlite_schema \
+         WHERE tbl_name = '__turso_internal_types' ORDER BY rowid",
+    )
+}
+
+/// CREATE TYPE stores the table of types with its index on the first type,
+/// and DROP TYPE deletes the index entry of the type, so the index stays
+/// intact. A database without types has no table of types.
+fn types_table_index_is_kept(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    {
+        let db = open_with_custom_types(&path, mvcc);
+        let conn = db.connect_limbo();
+        let err = error_of(&conn, "SELECT * FROM __turso_internal_types");
+        assert!(err.contains("no such table"), "{err}");
+        conn.execute("CREATE TYPE cents BASE integer").unwrap();
+        conn.execute("CREATE TYPE dollars BASE integer").unwrap();
+        assert_eq!(
+            types_table_schema_rows(&conn),
+            vec![
+                vec![text("table"), text("__turso_internal_types")],
+                vec![
+                    text("index"),
+                    text("sqlite_autoindex___turso_internal_types_1")
+                ],
+            ]
+        );
+        conn.execute("DROP TYPE cents").unwrap();
+        assert_eq!(stored_type_names(&conn), vec![vec![text("dollars")]]);
+        assert_eq!(
+            rows(
+                &conn,
+                "SELECT name FROM __turso_internal_types WHERE name = 'dollars'"
+            ),
+            vec![vec![text("dollars")]]
+        );
+        assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+        conn.execute("CREATE TYPE cents BASE text").unwrap();
+        if !mvcc {
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        conn.close().unwrap();
+    }
+    if !mvcc {
+        assert_eq!(sqlite_integrity_check(&path), "ok");
+    }
+    let db = open_with_custom_types(&path, mvcc);
+    let conn = db.connect_limbo();
+    assert_eq!(
+        stored_type_names(&conn),
+        vec![vec![text("cents")], vec![text("dollars")]]
+    );
+    conn.execute("CREATE TABLE prices (amount dollars, label cents) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO prices VALUES (5, 'five')")
+        .unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT amount, label FROM prices"),
+        vec![vec![int(5), text("five")]]
+    );
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn types_table_index_is_kept_wal() {
+    types_table_index_is_kept(false);
+}
+
+#[test]
+fn types_table_index_is_kept_mvcc() {
+    types_table_index_is_kept(true);
+}
+
+/// The SQL text that Turso stores for `create_type`.
+fn stored_type_sql(create_type: &str) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_with_custom_types(&new_path(&dir), false);
+    let conn = db.connect_limbo();
+    conn.execute(create_type).unwrap();
+    match &rows(&conn, "SELECT sql FROM __turso_internal_types")[..] {
+        [row] => match &row[0] {
+            SqlValue::Text(sql) => sql.clone(),
+            other => panic!("the sql of a type is {other:?}"),
+        },
+        other => panic!("one type has {} rows", other.len()),
+    }
+}
+
+/// Writes at `path` the file that an older Turso wrote after
+/// `CREATE TYPE cents BASE integer`: the table of types has a
+/// `name TEXT PRIMARY KEY` column but no automatic index.
+fn write_old_types_database(path: &Path) {
+    let cents_sql = stored_type_sql("CREATE TYPE cents BASE integer");
+    let sqlite = rusqlite::Connection::open(path).unwrap();
+    let mode: String = sqlite
+        .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    sqlite
+        .execute_batch("CREATE TABLE __turso_internal_types(name TEXT, sql TEXT)")
+        .unwrap();
+    sqlite
+        .execute(
+            "INSERT INTO __turso_internal_types VALUES ('cents', ?1)",
+            [&cents_sql],
+        )
+        .unwrap();
+    sqlite
+        .execute_batch(
+            "PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema
+                SET sql = 'CREATE TABLE __turso_internal_types(name TEXT PRIMARY KEY, sql TEXT)'
+              WHERE name = '__turso_internal_types';
+             PRAGMA writable_schema = OFF;",
+        )
+        .unwrap();
+}
+
+/// A database that an older Turso wrote keeps working: its table of types
+/// has no automatic index, and Turso goes on without one. It does not write
+/// an index, because an index that misses the rows of the older types would
+/// be broken.
+fn old_types_table_keeps_working(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    write_old_types_database(&path);
+    {
+        let db = open_with_custom_types(&path, mvcc);
+        let conn = db.connect_limbo();
+        assert_eq!(stored_type_names(&conn), vec![vec![text("cents")]]);
+        conn.execute("CREATE TABLE prices (amount cents) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO prices VALUES (5)").unwrap();
+        conn.execute("CREATE TYPE dollars BASE integer").unwrap();
+        conn.execute("CREATE TYPE euros BASE integer").unwrap();
+        conn.execute("DROP TYPE dollars").unwrap();
+        assert_eq!(
+            stored_type_names(&conn),
+            vec![vec![text("cents")], vec![text("euros")]]
+        );
+        assert_eq!(
+            types_table_schema_rows(&conn),
+            vec![vec![text("table"), text("__turso_internal_types")]]
+        );
+        assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+        conn.close().unwrap();
+    }
+    let db = open_with_custom_types(&path, mvcc);
+    let conn = db.connect_limbo();
+    assert_eq!(
+        stored_type_names(&conn),
+        vec![vec![text("cents")], vec![text("euros")]]
+    );
+    assert_eq!(rows(&conn, "SELECT amount FROM prices"), vec![vec![int(5)]]);
+    conn.execute("CREATE TABLE costs (amount euros) STRICT")
+        .unwrap();
+    let err = error_of(&conn, "DROP TYPE cents");
+    assert!(err.contains("used by"), "{err}");
+    conn.execute("DROP TABLE prices").unwrap();
+    conn.execute("DROP TYPE cents").unwrap();
+    assert_eq!(stored_type_names(&conn), vec![vec![text("euros")]]);
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn old_types_table_keeps_working_wal() {
+    old_types_table_keeps_working(false);
+}
+
+#[test]
+fn old_types_table_keeps_working_mvcc() {
+    old_types_table_keeps_working(true);
+}
+
+/// CREATE TYPE and DROP TYPE write catalog rows, which are not changes that
+/// the user made: as for other DDL, `changes()`, `total_changes()` and
+/// `last_insert_rowid()` keep the values of the last INSERT. The first type
+/// stores the table of types, and the second one writes to it.
+fn type_statements_keep_change_counters(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_with_custom_types(&new_path(&dir), mvcc);
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (a)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    let counters = "SELECT changes(), total_changes(), last_insert_rowid()";
+    let expected = vec![vec![int(3), int(3), int(3)]];
+    assert_eq!(rows(&conn, counters), expected);
+    for sql in [
+        "CREATE TYPE cents BASE integer",
+        "CREATE TYPE dollars BASE integer",
+        "CREATE DOMAIN positive AS integer CHECK (value > 0)",
+        "DROP TYPE cents",
+        "DROP DOMAIN positive",
+    ] {
+        conn.execute(sql).unwrap();
+        assert_eq!(rows(&conn, counters), expected, "after {sql}");
+    }
+}
+
+#[test]
+fn type_statements_keep_change_counters_wal() {
+    type_statements_keep_change_counters(false);
+}
+
+#[test]
+fn type_statements_keep_change_counters_mvcc() {
+    type_statements_keep_change_counters(true);
+}

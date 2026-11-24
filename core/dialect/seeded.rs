@@ -8,11 +8,11 @@
 //! that copy table-valued functions into a new schema, or into the temp
 //! schema, do not copy it.
 
-use crate::dialect::{Dialect, SeededTable};
+use crate::dialect::{Dialect, Seed, SeededTable};
 use crate::namespace::NamespaceId;
 use crate::numeric::Numeric;
-use crate::schema::{BTreeTable, Column, Index, Schema, Table};
-use crate::sync::{Arc, RwLock};
+use crate::schema::{BTreeTable, Column, Index, Schema, Table, TURSO_TYPES_TABLE_NAME};
+use crate::sync::{Arc, OnceLock, RwLock};
 use crate::util::{UnparsedFromSqlIndex, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX};
 use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor, VirtualTable};
 use crate::SymbolTable;
@@ -28,24 +28,66 @@ pub(crate) const SEED_SCAN: usize = SCAN as usize;
 /// `idx_num` of a lookup of the row whose rowid is the first argument.
 const FIND: i32 = 1;
 
+/// The seeded tables of core. Core stores each one on its first write, as it
+/// stores the seeded tables of a catalog, but core gives them no read-only
+/// table: their seeds are empty, and a database without the stored table
+/// has no table of that name.
+static CORE_SEEDED_TABLES: [SeededTable; 1] = [SeededTable {
+    name: TURSO_TYPES_TABLE_NAME,
+    create_sql: TURSO_TYPES_TABLE_SQL,
+    index_sql: &[],
+    seed: &EmptySeed,
+}];
+
+/// The `CREATE TABLE` statement of the table of the types made by
+/// `CREATE TYPE` and `CREATE DOMAIN`.
+const TURSO_TYPES_TABLE_SQL: &str =
+    "CREATE TABLE __turso_internal_types(name TEXT PRIMARY KEY, sql TEXT)";
+
+/// A seed without rows.
+struct EmptySeed;
+
+impl Seed for EmptySeed {
+    fn len(&self) -> usize {
+        0
+    }
+
+    fn row(&self, index: usize, _out: &mut Vec<Value>) {
+        unreachable!("an empty seed has no row {index}");
+    }
+
+    fn find(&self, _rowid: i64) -> Option<usize> {
+        None
+    }
+
+    fn version(&self) -> u32 {
+        0
+    }
+}
+
 /// The seeded tables of a database, built once when the database is opened:
 /// the read-only tables of its catalog's seeded tables, and how each seeded
-/// table is stored.
+/// table of the catalog and of core is stored.
 pub(crate) struct SeededTables {
     /// Each read-only table under its normalized name.
     tables: Vec<(String, Arc<Table>)>,
-    /// How each seeded table is stored.
+    /// How each seeded table of the catalog is stored.
     stored_forms: Vec<StoredForm>,
+    /// How each seeded table of core is stored, built on the first write,
+    /// so that the open of a database parses no SQL of core. None when the
+    /// database has no seeded tables.
+    core_stored_forms: Option<OnceLock<std::result::Result<Vec<StoredForm>, String>>>,
 }
 
 impl SeededTables {
-    /// The seeded tables of `dialect`'s catalog, or none when `enabled` is
-    /// false.
+    /// The seeded tables of `dialect`'s catalog and of core, or none when
+    /// `enabled` is false.
     pub(crate) fn new(dialect: &dyn Dialect, enabled: bool) -> Result<Self> {
         if !enabled {
             return Ok(Self {
                 tables: Vec::new(),
                 stored_forms: Vec::new(),
+                core_stored_forms: None,
             });
         }
         let catalog_tables = dialect.catalog().seeded_tables();
@@ -58,18 +100,26 @@ impl SeededTables {
             tables.push((name, read_only.clone()));
             stored_forms.push(StoredForm::new(dialect, seeded_table, Some(read_only))?);
         }
-        for (position, form) in stored_forms.iter().enumerate() {
-            turso_assert!(
-                stored_forms[..position]
+        let names = stored_forms
+            .iter()
+            .map(|form| form.name.clone())
+            .chain(
+                CORE_SEEDED_TABLES
                     .iter()
-                    .all(|other| other.name != form.name),
+                    .map(|table| crate::util::normalize_ident(table.name)),
+            )
+            .collect::<Vec<_>>();
+        for (position, name) in names.iter().enumerate() {
+            turso_assert!(
+                !names[..position].contains(name),
                 "two seeded tables have the same name",
-                { "name": form.name }
+                { "name": name }
             );
         }
         Ok(Self {
             tables,
             stored_forms,
+            core_stored_forms: Some(OnceLock::new()),
         })
     }
 
@@ -79,10 +129,30 @@ impl SeededTables {
     }
 
     /// How the seeded table `name` is stored, or None when no seeded table
-    /// has the name.
-    pub(crate) fn stored_form(&self, name: &str) -> Option<&StoredForm> {
+    /// has the name. `dialect` is the dialect of the database.
+    pub(crate) fn stored_form(
+        &self,
+        dialect: &dyn Dialect,
+        name: &str,
+    ) -> Result<Option<&StoredForm>> {
         let name = crate::util::normalize_ident(name);
-        self.stored_forms.iter().find(|form| form.name == name)
+        if let Some(form) = self.stored_forms.iter().find(|form| form.name == name) {
+            return Ok(Some(form));
+        }
+        let Some(core_stored_forms) = &self.core_stored_forms else {
+            return Ok(None);
+        };
+        let core_stored_forms = core_stored_forms
+            .get_or_init(|| {
+                CORE_SEEDED_TABLES
+                    .iter()
+                    .map(|seeded_table| StoredForm::new(dialect, seeded_table, None))
+                    .collect::<Result<Vec<_>>>()
+                    .map_err(|err| err.to_string())
+            })
+            .as_ref()
+            .map_err(|err| LimboError::InternalError(err.clone()))?;
+        Ok(core_stored_forms.iter().find(|form| form.name == name))
     }
 
     /// Whether `table` is the read-only table of the seeded table `name`.
@@ -139,7 +209,7 @@ pub(crate) struct StoredForm {
     pub(crate) name: String,
     pub(crate) seeded_table: &'static SeededTable,
     /// The read-only table that serves the seed rows before the table is
-    /// stored.
+    /// stored. Core's seeded tables have none.
     pub(crate) read_only: Option<Arc<Table>>,
     pub(crate) table: Arc<BTreeTable>,
     /// The `sqlite_schema` rows of the indexes, in the order they are
@@ -167,6 +237,11 @@ impl StoredForm {
         read_only: Option<Arc<Table>>,
     ) -> Result<Self> {
         let name = crate::util::normalize_ident(seeded_table.name);
+        turso_assert!(
+            read_only.is_some() || seeded_table.seed.is_empty(),
+            "a seeded table of core has an empty seed",
+            { "name": name }
+        );
         let refuse = |reason: &str| {
             Err(LimboError::InternalError(format!(
                 "seeded table {name} cannot be stored: {reason}"

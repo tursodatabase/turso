@@ -510,7 +510,14 @@ fn translate_statement(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?
+            schema::translate_create_type(
+                &type_name,
+                &body,
+                if_not_exists,
+                resolver,
+                program,
+                connection,
+            )?
         }
         ast::Stmt::CreateDomain {
             if_not_exists,
@@ -532,6 +539,7 @@ fn translate_statement(
                 if_not_exists,
                 resolver,
                 program,
+                connection,
             )?
         }
         ast::Stmt::DropType {
@@ -541,7 +549,9 @@ fn translate_statement(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_drop_type(&type_name, if_exists, false, resolver, program)?
+            schema::translate_drop_type(
+                &type_name, if_exists, false, resolver, program, connection,
+            )?
         }
         ast::Stmt::DropDomain {
             if_exists,
@@ -550,7 +560,14 @@ fn translate_statement(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_drop_type(&domain_name, if_exists, true, resolver, program)?
+            schema::translate_drop_type(
+                &domain_name,
+                if_exists,
+                true,
+                resolver,
+                program,
+                connection,
+            )?
         }
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")

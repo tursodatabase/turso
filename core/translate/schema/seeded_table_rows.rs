@@ -43,7 +43,12 @@ pub(crate) fn open_seeded_table_for_write(
     name: &str,
 ) -> Result<SeededTableWriter> {
     let connection = ctx.connection;
-    let Some(form) = connection.db.seeded_tables.stored_form(name) else {
+    let dialect = connection.db.dialect();
+    let Some(form) = connection
+        .db
+        .seeded_tables
+        .stored_form(dialect.as_ref(), name)?
+    else {
         return Err(LimboError::InternalError(format!(
             "no seeded table is named {name}"
         )));
@@ -78,7 +83,7 @@ pub(crate) fn open_seeded_table_for_write(
             "cannot store seeded table {}: another object has the name",
             form.name
         ),
-        // No object has the name.
+        // A seeded table of core has no read-only table.
         None => store_seeded_table(ctx, program, form),
     }
 }
