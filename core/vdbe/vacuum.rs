@@ -440,12 +440,9 @@ pub(crate) fn mirror_symbols(source: &Connection, target: &Connection) {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone())),
     );
-    target_syms.vtab_modules.extend(
-        source_syms
-            .vtab_modules
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone())),
-    );
+    for (k, v) in &source_syms.vtab_modules {
+        target_syms.insert_vtab_module(k.clone(), v.clone());
+    }
     target_syms.index_methods.extend(
         source_syms
             .index_methods

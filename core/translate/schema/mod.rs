@@ -1934,8 +1934,7 @@ pub fn translate_create_virtual_table(
     let Some(vtab_module) = resolver
         .catalog
         .symbol_table
-        .vtab_modules
-        .get(&module_name_str)
+        .resolve_vtab_module(&module_name_str)
     else {
         bail_parse_error!("no such module: {}", module_name_str);
     };

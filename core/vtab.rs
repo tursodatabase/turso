@@ -88,7 +88,7 @@ impl VirtualTable {
         name: &str,
         syms: &SymbolTable,
     ) -> crate::Result<Arc<VirtualTable>> {
-        let module = syms.vtab_modules.get(name);
+        let module = syms.resolve_vtab_module(name);
         let (vtab_type, schema) = if module.is_some() {
             crate::ext::create_virtual_table(
                 name,
@@ -121,7 +121,7 @@ impl VirtualTable {
         args: Vec<Value>,
         syms: &SymbolTable,
     ) -> crate::Result<Arc<VirtualTable>> {
-        let module = syms.vtab_modules.get(module_name);
+        let module = syms.resolve_vtab_module(module_name);
         let (vtab_type, schema) =
             crate::ext::create_virtual_table(module_name, module, args, VTabKind::VirtualTable)?;
         let vtab = VirtualTable {

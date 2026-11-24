@@ -2952,3 +2952,114 @@ fn declared_return_type_of_extension_functions_matches_what_they_return() {
         );
     }
 }
+
+#[test]
+fn virtual_table_module_names_are_matched_case_insensitively() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let make_rows_module = |value: i64| {
+        InnocuousModule(RowsModule {
+            queue: queue.clone(),
+            rows: Arc::new(Mutex::new(vec![(1, value)])),
+            events: Arc::new(Mutex::new(Vec::new())),
+            writable: false,
+        })
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("vtab_module_case.db");
+    let db_path_str = db_path.to_str().unwrap();
+
+    let open_opts = || {
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .native_module("rows", VTabKind::VirtualTable, make_rows_module(10))
+            .native_module("MixedRows", VTabKind::VirtualTable, make_rows_module(20))
+            .native_module("dup_mod", VTabKind::VirtualTable, make_rows_module(1))
+            .native_module("DUP_MOD", VTabKind::VirtualTable, make_rows_module(99))
+            .native_module("MyTvf", VTabKind::TableValuedFunction, make_rows_module(30))
+    };
+
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let db = Database::open(io.clone(), db_path_str, open_opts()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.execute("CREATE VIRTUAL TABLE vt_upper USING ROWS")
+        .unwrap();
+    conn.execute("CREATE VIRTUAL TABLE vt_quoted USING \"RoWs\"")
+        .unwrap();
+    conn.execute("CREATE VIRTUAL TABLE vt_bracket USING [rOwS]")
+        .unwrap();
+    conn.execute("CREATE VIRTUAL TABLE vt_mixed_lower USING mixedrows")
+        .unwrap();
+    conn.execute("CREATE VIRTUAL TABLE vt_mixed_upper USING MIXEDROWS")
+        .unwrap();
+    conn.execute("CREATE VIRTUAL TABLE vt_dup USING dup_mod")
+        .unwrap();
+
+    for (tbl, expected) in [
+        ("vt_upper", 10),
+        ("vt_quoted", 10),
+        ("vt_bracket", 10),
+        ("vt_mixed_lower", 20),
+        ("vt_mixed_upper", 20),
+        ("vt_dup", 99),
+    ] {
+        let mut stmt = conn.prepare(format!("SELECT value FROM {tbl}")).unwrap();
+        let rows = collect(&mut stmt, &queue);
+        assert_eq!(rows, vec![vec![Value::from_i64(expected)]], "table {tbl}");
+    }
+
+    // Re-registering a module with different case replaces the earlier entry
+    // instead of leaving duplicates in PRAGMA module_list.
+    let dup_count = conn
+        .get_syms_vtab_mods()
+        .into_iter()
+        .filter(|name| name.eq_ignore_ascii_case("dup_mod"))
+        .count();
+    assert_eq!(dup_count, 1);
+
+    // Table-valued function module rejected as a virtual table regardless of case.
+    let err = conn
+        .execute("CREATE VIRTUAL TABLE vt_tvf USING mytvf")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not a virtual table"),
+        "unexpected error: {err}"
+    );
+
+    // Missing module keeps the user's spelling in the error message.
+    let err = conn
+        .execute("CREATE VIRTUAL TABLE vt_missing USING NoSuchMod")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no such module: NoSuchMod"),
+        "unexpected error: {err}"
+    );
+
+    drop(conn);
+    drop(db);
+
+    // Reopening the database must also resolve mixed-case module names stored
+    // in sqlite_schema.
+    let db = Database::open(io, db_path_str, open_opts()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    for (tbl, expected) in [
+        ("vt_upper", 10),
+        ("vt_quoted", 10),
+        ("vt_bracket", 10),
+        ("vt_mixed_lower", 20),
+        ("vt_mixed_upper", 20),
+        ("vt_dup", 99),
+    ] {
+        let mut stmt = conn.prepare(format!("SELECT value FROM {tbl}")).unwrap();
+        let rows = collect(&mut stmt, &queue);
+        assert_eq!(
+            rows,
+            vec![vec![Value::from_i64(expected)]],
+            "reopened table {tbl}"
+        );
+    }
+}
