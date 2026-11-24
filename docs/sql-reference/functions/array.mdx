@@ -535,7 +535,7 @@ SELECT ARRAY[1,2,3] @> ARRAY[1,4];
 -- 0
 ```
 
-Through the PostgreSQL frontend, `@>` and `<@` also compare jsonb values, as in PostgreSQL: `a <@ b` is `b @> a`. If an operand is an array, the operator compares arrays. If neither operand has an array type, it tests whether the left JSON value contains the right one: `'{"a":1,"b":2}'::jsonb @> '{"a":1}'` is true. But if the two values are arrays and not JSON documents, the operator compares them as arrays. Thus a column of a VALUES list, which has no array type, and `'{a}'` are compared as arrays. An index expression and a stored generated column compare arrays only.
+Through the PostgreSQL frontend, `@>` and `<@` also compare jsonb values, as in PostgreSQL: `a <@ b` is `b @> a`. If an operand is an array, the operator compares arrays. If neither operand has an array type, it tests whether the left JSON value contains the right one: `'{"a":1,"b":2}'::jsonb @> '{"a":1}'` is true. But if the two values are arrays and not JSON documents, the operator compares them as arrays. Thus a column of a VALUES list, which has no array type, and `'{a}'` are compared as arrays.
 
 ### Overlap: &&
 
