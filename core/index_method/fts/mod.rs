@@ -40,7 +40,7 @@ use crate::{
 };
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::{
     cell::RefCell,
@@ -486,8 +486,11 @@ struct FtsRuntimeStats {
 /// look them up; rollback purges them.
 #[derive(Debug, Default)]
 struct SegmentByteCache {
-    /// Least recently used first.
-    entries: Vec<(SegmentId, Arc<SegmentData>)>,
+    /// Least recently used first. When a query looks up its segments in
+    /// the same order as the previous query, each hit is at the front.
+    /// `VecDeque::remove` then moves no other entry, but `Vec::remove`
+    /// moves all of them.
+    entries: VecDeque<(SegmentId, Arc<SegmentData>)>,
 }
 
 impl SegmentByteCache {
@@ -503,9 +506,12 @@ impl SegmentByteCache {
             return None;
         }
         let position = self.entries.iter().position(|(entry, _)| entry == id)?;
-        let entry = self.entries.remove(position);
+        let entry = self
+            .entries
+            .remove(position)
+            .expect("position() returned an index in the cache");
         let data = Arc::clone(&entry.1);
-        self.entries.push(entry);
+        self.entries.push_back(entry);
         Some(data)
     }
 
@@ -515,10 +521,10 @@ impl SegmentByteCache {
             return;
         }
         self.entries.retain(|(entry, _)| *entry != id);
-        self.entries.push((id, data));
+        self.entries.push_back((id, data));
         // Always keep the newest entry; evict older ones to fit the budget.
         while self.entries.len() > 1 && self.total_bytes() > budget {
-            self.entries.remove(0);
+            self.entries.pop_front();
         }
     }
 
