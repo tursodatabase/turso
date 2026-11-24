@@ -512,7 +512,7 @@ test jsonb-contains-of-number-beyond-numeric-limits-errors {
 expect error {}
 
 test bytea-contains-errors {
-    SELECT '\x01'::bytea @> '{}';
+    SELECT 'abc'::bytea @> '{}';
 }
 @sqlstate 42883
 expect error {}

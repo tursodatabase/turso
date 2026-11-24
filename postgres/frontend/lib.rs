@@ -27,6 +27,7 @@ pub use copy::CopyTextEncoder;
 pub use error::{sql_parse_error, sqlstate_error, Error, ErrorReport, Result};
 pub use functions::parse_pg_bool;
 pub use open::{open_database_async, OpenDatabaseState};
+pub use pg_type::parse_pg_bytea;
 pub use session::PgConnection as Connection;
 pub use session::{
     open_database, open_database_with_io, split_statements, tursopg_database_opts, PgConnection,

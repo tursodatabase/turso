@@ -570,6 +570,53 @@ expect @tursopg {
     \x31
 }
 
+@compat-gap "type:bytea"
+test bytea-cast-to-text-prints-hex {
+    SELECT 'abc'::bytea::text;
+}
+expect {
+    \\x616263
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a cast of bytea to text
+}
+
+@compat-gap "type:bytea"
+test bytea-column-cast-to-text-prints-hex {
+    CREATE TABLE t(b bytea);
+    INSERT INTO t VALUES ('abc');
+    SELECT b::text FROM t;
+}
+expect {
+    \\x616263
+}
+expect @tursopg {
+    abc
+}
+
+@compat-gap "type:bytea"
+test bytea-of-one-byte-has-no-jsonb-contains {
+    SELECT '\x01'::bytea @> '{}';
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    1
+}
+
+@compat-gap "type:bytea"
+test bytea-column-refuses-an-integer {
+    CREATE TABLE t(b bytea);
+    INSERT INTO t VALUES (12);
+    SELECT length(b) FROM t;
+}
+@sqlstate 42804
+expect error {}
+expect @tursopg {
+    2
+}
+
 # PostgreSQL 18 has no regdatabase type.
 @compat-gap "type:regdatabase"
 test regdatabase-type-does-not-exist {

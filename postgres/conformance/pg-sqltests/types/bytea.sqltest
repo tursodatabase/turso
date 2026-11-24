@@ -1,0 +1,154 @@
+# The bytea type reads text as PostgreSQL does, in a column and in a cast, and
+# writes bytes as text in hex.
+
+@database :memory:
+
+test bytea-reads-hex {
+    SELECT '\x0102'::bytea, '\x'::bytea, '\xDEADbeef'::bytea;
+}
+expect {
+    \\x0102|\\x|\\xdeadbeef
+}
+
+# Whitespace may come before a pair of digits, not inside one.
+test bytea-reads-hex-with-whitespace-between-pairs {
+    SELECT '\x01 02 0A'::bytea, '\x 01'::bytea, '\x01 '::bytea;
+}
+expect {
+    \\x01020a|\\x01|\\x01
+}
+
+test bytea-reads-escape-format {
+    SELECT 'abc\000def'::bytea, 'a\101b'::bytea, 'a\377'::bytea, 'abc'::bytea, ''::bytea;
+}
+expect {
+    \\x61626300646566|\\x614162|\\x61ff|\\x616263|\\x
+}
+
+test bytea-reads-utf8-text-as-bytes {
+    SELECT 'é'::bytea;
+}
+expect {
+    \\xc3a9
+}
+
+test bytea-reads-text-in-column {
+    CREATE TABLE t (id int, b bytea);
+    INSERT INTO t VALUES (1, '\x0102'), (2, 'abc'), (3, 'a\000b');
+    SELECT id, b, length(b) FROM t ORDER BY id;
+}
+expect {
+    1|\\x0102|2
+    2|\\x616263|3
+    3|\\x610062|3
+}
+
+test bytea-reads-text-in-update {
+    CREATE TABLE t (b bytea);
+    INSERT INTO t VALUES ('\x01');
+    UPDATE t SET b = '\xff00';
+    SELECT b FROM t;
+}
+expect {
+    \\xff00
+}
+
+test bytea-compares-by-bytes {
+    SELECT ('\x61'::bytea = 'a'::bytea)::int, ('\x01'::bytea < '\x02'::bytea)::int;
+}
+expect {
+    1|1
+}
+
+test cast-as-bytea-form {
+    SELECT CAST('\x01' AS bytea), CAST('ab' AS bytea);
+}
+expect {
+    \\x01|\\x6162
+}
+
+test bytea-refuses-hex-with-odd-digit-count {
+    SELECT '\x0'::bytea;
+}
+@sqlstate 22023
+expect error {
+    invalid hexadecimal data: odd number of digits
+}
+
+test bytea-refuses-hex-with-bad-digit {
+    SELECT '\x0g'::bytea;
+}
+@sqlstate 22023
+expect error {
+    invalid hexadecimal digit: "g"
+}
+
+test bytea-refuses-whitespace-inside-a-pair {
+    SELECT '\x01 0 2'::bytea;
+}
+@sqlstate 22023
+expect error {
+    invalid hexadecimal digit: " "
+}
+
+test bytea-refuses-capital-x-in-hex-prefix {
+    SELECT '\X0A'::bytea;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bytea
+}
+
+test bytea-refuses-backslash-that-is-not-an-escape {
+    SELECT 'a\zb'::bytea;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bytea
+}
+
+test bytea-refuses-octal-above-377 {
+    SELECT 'a\400'::bytea;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bytea
+}
+
+test bytea-refuses-short-octal {
+    SELECT 'a\37'::bytea;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bytea
+}
+
+test bytea-refuses-trailing-backslash {
+    SELECT 'a\'::bytea;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bytea
+}
+
+test invalid-bytea-into-bytea-column {
+    CREATE TABLE t (b bytea);
+    INSERT INTO t VALUES ('\x0');
+}
+@sqlstate 22023
+expect error {}
+
+test bytea-refuses-form-feed-between-pairs {
+    SELECT ('\x01' || chr(12) || '02')::bytea;
+}
+@sqlstate 22023
+expect error {
+    invalid hexadecimal digit
+}
+
+test bytea-refuses-vertical-tab-between-pairs {
+    SELECT pg_input_is_valid('\x01' || chr(11) || '02', 'bytea');
+}
+expect {
+    f
+}
