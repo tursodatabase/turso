@@ -331,7 +331,9 @@ fn is_nondeterministic_scalar_like_function(func: &Func) -> bool {
     }
 }
 
-fn expr_contains_function(
+/// Returns true if this expression calls a function for which
+/// `matches_function` returns true.
+pub(super) fn expr_contains_function(
     expr: &ast::Expr,
     resolver: &Resolver<'_>,
     matches_function: impl Fn(&Func) -> bool,
