@@ -7375,6 +7375,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_pg_catalog_gen"
+version = "0.9.0-pre.6"
+
+[[package]]
 name = "turso_pg_client"
 version = "0.9.0-pre.6"
 dependencies = [
