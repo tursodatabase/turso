@@ -336,6 +336,9 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "jsonb_field_text"(FunctionArity::Exact(2), true) => {
             exec_jsonb_field_text(args[0].get_value(), args[1].get_value())?
         },
+        "jsonb_concat"(FunctionArity::Exact(2), true) => {
+            exec_jsonb_concat(args[0].get_value(), args[1].get_value())?
+        },
         "jsonb_delete"(FunctionArity::Variadic, true) => exec_jsonb_delete(args)?,
         "jsonb_contains"(FunctionArity::Exact(2), true) => {
             exec_jsonb_contains(args[0].get_value(), args[1].get_value())?
@@ -1043,6 +1046,47 @@ pub(crate) fn exec_json_each(value: &Value, rows: &mut Vec<[Value; 2]>) -> Resul
     })
 }
 
+/// PostgreSQL's `jsonb || jsonb`, which is also its function jsonb_concat().
+/// Two objects give an object with the fields of both, and of two fields with
+/// the same name, the field of the right object counts. Otherwise, a value
+/// that is not an array counts as an array with one element, and the result
+/// is an array with the elements of both: `'[1]' || '2'` is `[1,2]`, and
+/// `'{"a":1}' || '[2]'` is `[{"a":1},2]`. Only the top level is joined. The
+/// fields keep their order: first the fields of the left object, then the new
+/// fields of the right object.
+fn exec_jsonb_concat(left: &Value, right: &Value) -> Result<Option<Jsonb>> {
+    let (left, right) = match (left, right) {
+        (Value::Null, _) | (_, Value::Null) => return Ok(None),
+        (Value::Text(left), Value::Text(right)) => (left.as_str(), right.as_str()),
+        // The operator gives the function two jsonb values, which read as
+        // text. A call written in SQL can give it other values.
+        _ => {
+            return Err(undefined_function(
+                "jsonb_concat",
+                &[pg_type_name(left), pg_type_name(right)],
+            ))
+        }
+    };
+    for json in [left, right] {
+        serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
+    }
+    let left = json_members(left)?;
+    let right = json_members(right)?;
+    let mut out = String::new();
+    match (left, right) {
+        (JsonMembers::Object(left), JsonMembers::Object(right)) => {
+            push_json_object(left.into_iter().chain(right), &mut out)
+        }
+        (left, right) => {
+            let mut elements = Vec::new();
+            left.push_as_elements(&mut elements);
+            right.push_as_elements(&mut elements);
+            push_json_array(&elements, &mut out);
+        }
+    }
+    Ok(Some(Jsonb(out)))
+}
+
 /// What `jsonb - x` deletes from a jsonb value.
 enum JsonDeletion {
     /// The fields of an object with these names, or the string elements of
@@ -1102,7 +1146,7 @@ fn exec_jsonb_delete(args: &[Register]) -> Result<Option<Jsonb>> {
     };
     serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
     let not_deleted = match (json_members(json)?, deletion) {
-        (JsonMembers::Scalar, _) => {
+        (JsonMembers::Scalar(_), _) => {
             return Err(sqlstate_error(
                 SQLSTATE_INVALID_PARAMETER_VALUE,
                 "cannot delete from scalar",
@@ -1149,7 +1193,7 @@ fn exec_jsonb_delete(args: &[Register]) -> Result<Option<Jsonb>> {
     match not_deleted {
         JsonMembers::Object(fields) => push_json_object(fields, &mut out),
         JsonMembers::Array(elements) => push_json_array(&elements, &mut out),
-        JsonMembers::Scalar => unreachable!("a scalar fails before"),
+        JsonMembers::Scalar(_) => unreachable!("a scalar fails before"),
     }
     Ok(Some(Jsonb(out)))
 }
@@ -1208,8 +1252,27 @@ enum JsonMembers<'a> {
     Object(Vec<(JsonName<'a>, &'a str)>),
     /// The text of each element of an array.
     Array(Vec<&'a str>),
-    /// A scalar.
-    Scalar,
+    /// The text of a scalar.
+    Scalar(&'a str),
+}
+
+impl<'a> JsonMembers<'a> {
+    /// Appends the elements of an array to `elements`, or the document
+    /// itself when it is not an array, as `||` reads it. An object gets one
+    /// field for each name, as `push_json_object` writes it.
+    fn push_as_elements(self, elements: &mut Vec<String>) {
+        match self {
+            Self::Array(array_elements) => {
+                elements.extend(array_elements.into_iter().map(str::to_string))
+            }
+            Self::Object(fields) => {
+                let mut object = String::new();
+                push_json_object(fields, &mut object);
+                elements.push(object);
+            }
+            Self::Scalar(scalar) => elements.push(scalar.to_string()),
+        }
+    }
 }
 
 /// The members of the JSON document `json`, which must be valid JSON. The
@@ -1226,7 +1289,7 @@ fn json_members(json: &str) -> Result<JsonMembers<'_>> {
     Ok(match json.as_bytes()[0] {
         b'{' => JsonMembers::Object(fields),
         b'[' => JsonMembers::Array(elements),
-        _ => JsonMembers::Scalar,
+        _ => JsonMembers::Scalar(json),
     })
 }
 

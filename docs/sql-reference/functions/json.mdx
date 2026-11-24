@@ -286,6 +286,10 @@ SELECT '{"count":42}' ->> '$.count';
 
 Through the PostgreSQL frontend, a cast to jsonb, such as `'{"a": 1}'::jsonb`, converts the value as a jsonb column does. Text that is not JSON fails with SQLSTATE 22P02. The result has no white space between its tokens: `'{"a": 1}'::jsonb` is `{"a":1}`. A jsonb value holds at most 500 levels of nested arrays and objects, and a deeper value fails with SQLSTATE 22P02.
 
+Through the PostgreSQL frontend, `||` joins two jsonb values, as in PostgreSQL. Two objects give an object with the fields of both. Of two fields with the same name, the field of the right object counts: `'{"a":1}'::jsonb || '{"a":2,"b":3}'` is `{"a":2,"b":3}`. Two arrays give an array with the elements of both. A value that is not an array counts as an array with one element: `'[1]'::jsonb || '2'` is `[1,2]`. Only the top level is joined.
+
+A string literal or a parameter on the other side of `||` is read as jsonb. A value of another type, such as text, is joined as text. The result has no white space between its tokens, and an object keeps the order of its fields. The function `jsonb_concat` does the same as `||`.
+
 Through the PostgreSQL frontend, `-` deletes from a jsonb value, as in PostgreSQL. `jsonb - text` deletes a field of an object, or the string elements of an array that are equal to the text: `'{"a":1,"b":2}'::jsonb - 'a'` is `{"b":2}`. `jsonb - integer` deletes the element at an index of an array, and a negative index counts from the end. `jsonb - text[]` deletes each element of the text array.
 
 `-` on a scalar fails with SQLSTATE 22023, and `jsonb - integer` on an object fails with SQLSTATE 22023 too. The result has no white space between its tokens, and an object keeps the order of its fields. The function `jsonb_delete` does the same as `-`.
