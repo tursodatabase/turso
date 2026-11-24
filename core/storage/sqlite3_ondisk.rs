@@ -1619,6 +1619,9 @@ impl BuildSharedWal {
                     self.phase = BuildSharedWalPhase::AwaitHeader(c);
                 }
                 BuildSharedWalPhase::AwaitHeader(c) => {
+                    if let Some(err) = c.get_error() {
+                        return Err(err.into());
+                    }
                     if !c.succeeded() {
                         io_yield_one!(c);
                     }
@@ -1646,6 +1649,9 @@ impl BuildSharedWal {
                     };
                 }
                 BuildSharedWalPhase::AwaitChunk { completion, offset } => {
+                    if let Some(err) = completion.get_error() {
+                        return Err(err.into());
+                    }
                     if !completion.succeeded() {
                         io_yield_one!(completion);
                     }

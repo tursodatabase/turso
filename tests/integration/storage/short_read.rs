@@ -241,7 +241,8 @@ fn test_wal_short_reads_fail_open_without_losing_rows() {
     use crate::queued_io::QueuedIo;
     use std::sync::Arc;
     use turso_core::{
-        Buffer, Completion, CompletionError, Database, LimboError, OpenFlags, OpenOptions, IO,
+        Buffer, Completion, CompletionError, Database, IOResult, LimboError, OpenFlags,
+        OpenOptions, WalFileShared, IO,
     };
     use turso_sqlite::SqliteDialect;
 
@@ -282,6 +283,34 @@ fn test_wal_short_reads_fail_open_without_losing_rows() {
             io.wait_for_completion(c).unwrap();
         }
         io.limit_wal_reads(limit);
+        let recovery_io: Arc<dyn IO> = io.clone();
+        let mut recovery = WalFileShared::open_shared_if_exists_begin(
+            &recovery_io,
+            &format!("{path}-wal"),
+            OpenFlags::Create,
+        )
+        .unwrap();
+        let err = 'recovery: {
+            for _ in 0..100 {
+                match recovery.poll() {
+                    Err(err) => break 'recovery err,
+                    Ok(IOResult::Done(_)) => panic!("WAL read limit {limit}: recovery succeeded"),
+                    Ok(IOResult::IO(c)) => {
+                        while !c.finished() {
+                            io.step().unwrap();
+                        }
+                    }
+                }
+            }
+            panic!("WAL read limit {limit}: recovery did not finish");
+        };
+        assert!(
+            matches!(
+                *err,
+                LimboError::CompletionError(CompletionError::ShortReadWalFrame { .. })
+            ),
+            "WAL read limit {limit}: unexpected recovery error {err:?}"
+        );
         match Database::open(io.clone(), path, OpenOptions::new(Arc::new(SqliteDialect))) {
             Err(LimboError::CompletionError(CompletionError::ShortReadWalFrame { .. })) => {}
             Err(err) => panic!("WAL read limit {limit}: unexpected open error {err:?}"),
