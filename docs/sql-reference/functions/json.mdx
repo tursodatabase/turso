@@ -288,7 +288,7 @@ Through the PostgreSQL frontend, a cast to jsonb, such as `'{"a": 1}'::jsonb`, c
 
 Through the PostgreSQL frontend, `-` deletes from a jsonb value, as in PostgreSQL. `jsonb - text` deletes a field of an object, or the string elements of an array that are equal to the text: `'{"a":1,"b":2}'::jsonb - 'a'` is `{"b":2}`. `jsonb - integer` deletes the element at an index of an array, and a negative index counts from the end. `jsonb - text[]` deletes each element of the text array.
 
-`-` on a scalar fails with SQLSTATE 22023, and `jsonb - integer` on an object fails with SQLSTATE 22023 too. The result has no white space between its tokens, and an object keeps the order of its fields. The function `jsonb_delete` does the same as `-`.
+`-` on a scalar fails with SQLSTATE 22023, and `jsonb - integer` on an object fails with SQLSTATE 22023 too. The result has no white space between its tokens. An object keeps the order of its fields, and it keeps two fields with the same name, as a jsonb column does: `'{"a":1,"a":2}'::jsonb - 'b'` is `{"a":1,"a":2}`, where PostgreSQL gives `{"a": 2}`. The function `jsonb_delete` does the same as `-`.
 
 Through the PostgreSQL frontend, `->` and `->>` work as in PostgreSQL. The right operand is the name of a field or the index of an array element, not a JSON path: `'{"$.a":1}'::jsonb ->> '$.a'` is `1`. A negative index counts from the end of the array. If an object has two fields with the same name, the last one counts. `->>` returns text: `'{"n":2}'::jsonb ->> 'n'` is the text `2`, a number is written as jsonb writes it (`'{"n":1e2}'::jsonb ->> 'n'` is `100`), and a JSON boolean is `true` or `false`. A JSON null is NULL. A `CREATE INDEX` or a stored generated column that uses `->` or `->>` fails with SQLSTATE 0A000.
 

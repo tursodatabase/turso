@@ -1231,25 +1231,16 @@ fn json_members(json: &str) -> Result<JsonMembers<'_>> {
 }
 
 /// Appends the JSON object with the fields `fields` to `out`, without white
-/// space between its tokens, as a jsonb column reads an object. Of two fields
-/// with the same name, the last one counts, at the place of the first one.
+/// space between its tokens, as a jsonb column reads an object. A jsonb
+/// column keeps two fields with the same name, where PostgreSQL keeps only
+/// the last one. This function keeps them too, so `j - 'k'` equals `j` when
+/// `j` has no field `k`.
 fn push_json_object<'a>(
     fields: impl IntoIterator<Item = (JsonName<'a>, &'a str)>,
     out: &mut String,
 ) {
-    let mut unique: Vec<(JsonName<'a>, &'a str)> = Vec::new();
-    let mut places = std::collections::HashMap::<String, usize>::new();
-    for (name, value) in fields {
-        match places.get(&name.decoded) {
-            Some(&place) => unique[place] = (name, value),
-            None => {
-                places.insert(name.decoded.clone(), unique.len());
-                unique.push((name, value));
-            }
-        }
-    }
     out.push('{');
-    for (i, (name, value)) in unique.iter().enumerate() {
+    for (i, (name, value)) in fields.into_iter().enumerate() {
         if i > 0 {
             out.push(',');
         }

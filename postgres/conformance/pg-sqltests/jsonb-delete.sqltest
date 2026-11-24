@@ -64,6 +64,17 @@ expect {
     []|[]|{}|{}
 }
 
+# A key that the object does not have deletes nothing, also when the object
+# has two fields with the same name. Of these fields, the last one counts.
+@setup items_with_jsonb_rows
+test jsonb-delete-from-object-with-repeated-field-names {
+    INSERT INTO items VALUES (5, '{"b":1,"a":2,"b":3}');
+    SELECT (data - 'zz' = data)::int, (data - 'zz') ->> 'b', (data - 'b' = '{"a":2}')::int FROM items WHERE id = 5;
+}
+expect {
+    1|3|1
+}
+
 test jsonb-delete-of-null-is-null {
     SELECT coalesce(('{"a":1}'::jsonb - NULL::text)::text, 'none'), coalesce(('[1]'::jsonb - NULL::int)::text, 'none'), coalesce((NULL::jsonb - 'a')::text, 'none');
 }
