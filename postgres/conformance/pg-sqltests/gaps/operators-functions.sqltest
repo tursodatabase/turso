@@ -956,15 +956,17 @@ expect @tursopg {
 }
 
 # B-92: date_trunc / extract
-@compat-gap "type:date"
+@compat-gap "function:extract"
 test date-trunc-extract {
     SELECT date_trunc('day', '2026-10-08 12:34:56+00'::timestamptz), extract(year FROM '2026-10-08'::date), extract(epoch FROM '1970-01-02 00:00:00+00'::timestamptz);
 }
 expect {
     2026-10-08 00:00:00+00|2026|86400.000000
 }
-@sqlstate 0A000
-expect @tursopg error {}
+@sqlstate 42883
+expect @tursopg error {
+    no such function: extract
+}
 
 # date_trunc(text, timestamp) returns a timestamp. tursopg supports only
 # timestamptz arguments.
@@ -1267,15 +1269,12 @@ expect {
 }
 
 # B-115: text concat with typed values
-@compat-gap "operator:text || anynonarray"
 test text-concat-with-typed-values {
     SELECT 'id=' || 1::int || ' at ' || '2026-10-08'::date;
 }
 expect {
     id=1 at 2026-10-08
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
 # B-116: to_char(timestamptz)
 @compat-gap "function:to_char"
@@ -1501,4 +1500,34 @@ expect error {
 }
 expect @tursopg raw {
  12
+}
+
+# Unquoted C folds to c, and PostgreSQL has no collation named "c".
+@compat-gap "syntax:collate"
+test unquoted-collate-c-does-not-exist {
+    SELECT 'a' COLLATE C;
+}
+@sqlstate 42704
+expect error {}
+expect @tursopg {
+    a
+}
+
+# The default collation of the database is en_US.utf8 in PostgreSQL 18;
+# tursopg compares text bytewise, so uppercase sorts before lowercase.
+@compat-gap "operator:text < text"
+test text-order-by-uses-database-collation {
+    SELECT x FROM (VALUES ('b'), ('B'), ('a'), ('A')) v(x) ORDER BY x;
+}
+expect {
+    a
+    A
+    b
+    B
+}
+expect @tursopg {
+    A
+    B
+    a
+    b
 }

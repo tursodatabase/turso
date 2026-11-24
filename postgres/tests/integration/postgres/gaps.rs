@@ -120,18 +120,16 @@ fn gap_a_33_timestamptz_n_param_with_offset(db: TempDatabase) {
     assert_eq!(out, "2026-10-08 12:00:00");
 }
 
-// A-41 (S2): date $n param
-// tursopg: a date cast of a param is not supported.
-// PostgreSQL: 2026-10-08
+// A-41: date $n param
 #[turso_macros::test(views)]
-fn gap_a_41_tursopg_returns_wrong_result_date_n_param(db: TempDatabase) {
+fn gap_a_41_date_n_param(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::date",
         params: &[P::Text("2026-10-08")],
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "ERROR 0A000");
+    assert_eq!(out, "2026-10-08");
 }
 
 // A-49 (S1): invalid jsonb param

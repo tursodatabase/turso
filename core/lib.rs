@@ -149,10 +149,10 @@ pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 pub use dialect::{
     AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
     CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,
-    CreateView, Dependent, DependentObject, Dialect, DropColumn, DropIndex, DropSequence,
-    DropTable, DropView, NewOwner, OwnerColumn, RelationName, RenameColumn, RenameTable,
-    RewrittenTrigger, RewrittenView, SqliteCatalog, StatementTimes, TableText,
-    TempTriggerOfRenamedTable,
+    CreateTrigger, CreateView, CreateVirtualTable, Dependent, DependentObject, Dialect, DropColumn,
+    DropIndex, DropSequence, DropTable, DropTrigger, DropView, NewOwner, OwnerColumn, RelationName,
+    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, SqliteCatalog, StatementTimes,
+    TableText, TempTriggerOfRenamedTable,
 };
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
@@ -180,6 +180,7 @@ pub use io::{
 };
 pub use namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 pub use numeric::{decimal::format_numeric_text, nonnan::NonNan, Numeric};
+pub use schema::load::{LoadQuery, LoadStep, QueryFailure, SchemaLoad};
 pub use security::roles::SessionRole;
 pub use statement::{
     ColumnOrigin, ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter,

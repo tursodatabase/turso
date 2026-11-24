@@ -252,7 +252,6 @@ test table-select-into-nested-rejected {
 @sqlstate 42601
 expect error {}
 
-@compat-gap "type:date"
 test table-date-arithmetic {
     CREATE TABLE dates (a date, b date);
     INSERT INTO dates VALUES ('2025-01-05', '2025-01-01');
@@ -261,12 +260,7 @@ test table-date-arithmetic {
 expect {
     2025-01-06|2025-01-04|4
 }
-@sqlstate 0A000
-expect @tursopg error {
-    type "date" is not supported
-}
 
-@compat-gap "type:date"
 test table-indexed-date-column-with-default {
     CREATE TABLE dates (a int, b int, c date DEFAULT '2000-01-01');
     INSERT INTO dates VALUES (1, 2, '2024-05-06');
@@ -278,12 +272,8 @@ expect {
     2024-05-06
     1|2024-05-06
 }
-@sqlstate 0A000
-expect @tursopg error {
-    type "date" is not supported
-}
 
-@compat-gap "type:date"
+@compat-gap "type:time"
 test table-cast-timestamp-column-to-date-and-time {
     CREATE TABLE events (ts timestamp);
     INSERT INTO events VALUES ('2024-01-15 10:30:00');
@@ -294,7 +284,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    type "date" is not supported
+    type "time" is not supported
 }
 
 test table-check-on-smallint-column {
@@ -873,7 +863,7 @@ expect {
     2|public
 }
 
-@compat-gap "type:date"
+@compat-gap "type:_date"
 test array-columns-hold-element-values {
     -- tursopg prints a boolean result as 1, PostgreSQL as t, so every
     -- boolean is cast to int.
@@ -897,7 +887,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    type "date" is not supported
+    type "date\[\]" is not supported
 }
 
 test array-of-booleans-from-literal-and-aggregate {

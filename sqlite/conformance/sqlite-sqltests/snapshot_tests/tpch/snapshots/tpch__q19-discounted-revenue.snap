@@ -73,45 +73,45 @@ addr  opcode       p1  p2  p3  p4                                     p5  commen
   20    Lt         19  20  25  Binary                                  0  if r[19]<r[20] goto 25
   21    Column      0   4  22                                          0  r[22]=lineitem.L_QUANTITY
   22    Gt         22  23  25  Binary                                  0  if r[22]>r[23] goto 25
-  23    Column      1   5  27                                          0  r[27]=part.P_SIZE
-  24    Le         27  28  51  Binary                                  0  if r[27]<=r[28] goto 51
-  25    Column      1   3  30                                          0  r[30]=part.P_BRAND
-  26    Ne         30  31  38  Binary                                  0  if r[30]!=r[31] goto 38
-  27    Column      1   6  32                                          0  r[32]=part.P_CONTAINER
-  28    Eq         32  33  32  Binary                                  0  if r[32]==r[33] goto 32
-  29    Eq         32  34  32  Binary                                  0  if r[32]==r[34] goto 32
-  30    Eq         32  35  32  Binary                                  0  if r[32]==r[35] goto 32
-  31    Ne         32  36  38  Binary                                  0  if r[32]!=r[36] goto 38
-  32    Column      0   4  38                                          0  r[38]=lineitem.L_QUANTITY
-  33    Lt         38  39  38  Binary                                  0  if r[38]<r[39] goto 38
-  34    Column      0   4  41                                          0  r[41]=lineitem.L_QUANTITY
-  35    Gt         41  42  38  Binary                                  0  if r[41]>r[42] goto 38
-  36    Column      1   5  45                                          0  r[45]=part.P_SIZE
-  37    Le         45  46  51  Binary                                  0  if r[45]<=r[46] goto 51
-  38    Column      1   3  48                                          0  r[48]=part.P_BRAND
-  39    Ne         48  49  62  Binary                                  0  if r[48]!=r[49] goto 62
-  40    Column      1   6  50                                          0  r[50]=part.P_CONTAINER
-  41    Eq         50  51  45  Binary                                  0  if r[50]==r[51] goto 45
-  42    Eq         50  52  45  Binary                                  0  if r[50]==r[52] goto 45
-  43    Eq         50  53  45  Binary                                  0  if r[50]==r[53] goto 45
-  44    Ne         50  54  62  Binary                                  0  if r[50]!=r[54] goto 62
-  45    Column      0   4  56                                          0  r[56]=lineitem.L_QUANTITY
-  46    Lt         56  57  62  Binary                                  0  if r[56]<r[57] goto 62
-  47    Column      0   4  59                                          0  r[59]=lineitem.L_QUANTITY
-  48    Gt         59  60  62  Binary                                  0  if r[59]>r[60] goto 62
-  49    Column      1   5  64                                          0  r[64]=part.P_SIZE
-  50    Gt         64  65  62  Binary                                  0  if r[64]>r[65] goto 62
-  51    Column      1   3  66                                          0  r[66]=part.P_BRAND
-  52    Eq         66  67  55  Binary                                  0  if r[66]==r[67] goto 55
-  53    Eq         66  68  55  Binary                                  0  if r[66]==r[68] goto 55
-  54    Ne         66  69  62  Binary                                  0  if r[66]!=r[69] goto 62
-  55    Column      1   5  71                                          0  r[71]=part.P_SIZE
-  56    Lt         71  72  62  Binary                                  0  if r[71]<r[72] goto 62
-  57    Column      0   5  74                                          0  r[74]=lineitem.L_EXTENDEDPRICE
-  58    Column      0   6  77                                          0  r[77]=lineitem.L_DISCOUNT
-  59    Subtract   76  77  75                                          0  r[75]=r[76]-r[77]
-  60    Multiply   74  75  73                                          0  r[73]=r[74]*r[75]
-  61    AggStep     0  73   2  sum                                     0  accum=r[2] step(r[73])
+  23    Column      1   5  26                                          0  r[26]=part.P_SIZE
+  24    Le         26  27  51  Binary                                  0  if r[26]<=r[27] goto 51
+  25    Column      1   3  29                                          0  r[29]=part.P_BRAND
+  26    Ne         29  30  38  Binary                                  0  if r[29]!=r[30] goto 38
+  27    Column      1   6  31                                          0  r[31]=part.P_CONTAINER
+  28    Eq         31  32  32  Binary                                  0  if r[31]==r[32] goto 32
+  29    Eq         31  33  32  Binary                                  0  if r[31]==r[33] goto 32
+  30    Eq         31  34  32  Binary                                  0  if r[31]==r[34] goto 32
+  31    Ne         31  35  38  Binary                                  0  if r[31]!=r[35] goto 38
+  32    Column      0   4  37                                          0  r[37]=lineitem.L_QUANTITY
+  33    Lt         37  38  38  Binary                                  0  if r[37]<r[38] goto 38
+  34    Column      0   4  40                                          0  r[40]=lineitem.L_QUANTITY
+  35    Gt         40  41  38  Binary                                  0  if r[40]>r[41] goto 38
+  36    Column      1   5  43                                          0  r[43]=part.P_SIZE
+  37    Le         43  38  51  Binary                                  0  if r[43]<=r[38] goto 51
+  38    Column      1   3  45                                          0  r[45]=part.P_BRAND
+  39    Ne         45  46  62  Binary                                  0  if r[45]!=r[46] goto 62
+  40    Column      1   6  47                                          0  r[47]=part.P_CONTAINER
+  41    Eq         47  48  45  Binary                                  0  if r[47]==r[48] goto 45
+  42    Eq         47  49  45  Binary                                  0  if r[47]==r[49] goto 45
+  43    Eq         47  50  45  Binary                                  0  if r[47]==r[50] goto 45
+  44    Ne         47  51  62  Binary                                  0  if r[47]!=r[51] goto 62
+  45    Column      0   4  53                                          0  r[53]=lineitem.L_QUANTITY
+  46    Lt         53  54  62  Binary                                  0  if r[53]<r[54] goto 62
+  47    Column      0   4  56                                          0  r[56]=lineitem.L_QUANTITY
+  48    Gt         56  57  62  Binary                                  0  if r[56]>r[57] goto 62
+  49    Column      1   5  59                                          0  r[59]=part.P_SIZE
+  50    Gt         59  60  62  Binary                                  0  if r[59]>r[60] goto 62
+  51    Column      1   3  61                                          0  r[61]=part.P_BRAND
+  52    Eq         61  62  55  Binary                                  0  if r[61]==r[62] goto 55
+  53    Eq         61  63  55  Binary                                  0  if r[61]==r[63] goto 55
+  54    Ne         61  64  62  Binary                                  0  if r[61]!=r[64] goto 62
+  55    Column      1   5  66                                          0  r[66]=part.P_SIZE
+  56    Lt         66  67  62  Binary                                  0  if r[66]<r[67] goto 62
+  57    Column      0   5  69                                          0  r[69]=lineitem.L_EXTENDEDPRICE
+  58    Column      0   6  71                                          0  r[71]=lineitem.L_DISCOUNT
+  59    Subtract   67  71  70                                          0  r[70]=r[67]-r[71]
+  60    Multiply   69  70  68                                          0  r[68]=r[69]*r[70]
+  61    AggStep     0  68   2  sum                                     0  accum=r[2] step(r[68])
   62  Next          0   5   0                                          1
   63  AggFinal      0   2   0  sum                                     0  accum=r[2]
   64  Copy          2   1   0                                          0  r[1]=r[2]
@@ -127,32 +127,26 @@ addr  opcode       p1  p2  p3  p4                                     p5  commen
   74  String8       0  16   0  SM PACK                                 0  r[16]='SM PACK'
   75  String8       0  17   0  SM PKG                                  0  r[17]='SM PKG'
   76  Integer       8  20   0                                          0  r[20]=8
-  77  Integer       8  24   0                                          0  r[24]=8
-  78  Integer      10  25   0                                          0  r[25]=10
-  79  Add          24  25  23                                          0  r[23]=r[24]+r[25]
-  80  Integer       5  28   0                                          0  r[28]=5
-  81  String8       0  31   0  Brand#23                                0  r[31]='Brand#23'
-  82  String8       0  33   0  MED BAG                                 0  r[33]='MED BAG'
-  83  String8       0  34   0  MED BOX                                 0  r[34]='MED BOX'
-  84  String8       0  35   0  MED PKG                                 0  r[35]='MED PKG'
-  85  String8       0  36   0  MED PACK                                0  r[36]='MED PACK'
-  86  Integer      10  39   0                                          0  r[39]=10
-  87  Integer      10  43   0                                          0  r[43]=10
-  88  Add          43  43  42                                          0  r[42]=r[43]+r[43]
-  89  Integer      10  46   0                                          0  r[46]=10
-  90  String8       0  49   0  Brand#12                                0  r[49]='Brand#12'
-  91  String8       0  51   0  LG CASE                                 0  r[51]='LG CASE'
-  92  String8       0  52   0  LG BOX                                  0  r[52]='LG BOX'
-  93  String8       0  53   0  LG PACK                                 0  r[53]='LG PACK'
-  94  String8       0  54   0  LG PKG                                  0  r[54]='LG PKG'
-  95  Integer      24  57   0                                          0  r[57]=24
-  96  Integer      24  61   0                                          0  r[61]=24
-  97  Integer      10  62   0                                          0  r[62]=10
-  98  Add          61  62  60                                          0  r[60]=r[61]+r[62]
-  99  Integer      15  65   0                                          0  r[65]=15
- 100  String8       0  67   0  Brand#22                                0  r[67]='Brand#22'
- 101  String8       0  68   0  Brand#23                                0  r[68]='Brand#23'
- 102  String8       0  69   0  Brand#12                                0  r[69]='Brand#12'
- 103  Integer       1  72   0                                          0  r[72]=1
- 104  Integer       1  76   0                                          0  r[76]=1
- 105  Goto          0   1   0                                          0
+  77  Integer      10  24   0                                          0  r[24]=10
+  78  Add          20  24  23                                          0  r[23]=r[20]+r[24]
+  79  Integer       5  27   0                                          0  r[27]=5
+  80  String8       0  30   0  Brand#23                                0  r[30]='Brand#23'
+  81  String8       0  32   0  MED BAG                                 0  r[32]='MED BAG'
+  82  String8       0  33   0  MED BOX                                 0  r[33]='MED BOX'
+  83  String8       0  34   0  MED PKG                                 0  r[34]='MED PKG'
+  84  String8       0  35   0  MED PACK                                0  r[35]='MED PACK'
+  85  Integer      10  38   0                                          0  r[38]=10
+  86  Add          38  38  41                                          0  r[41]=r[38]+r[38]
+  87  String8       0  46   0  Brand#12                                0  r[46]='Brand#12'
+  88  String8       0  48   0  LG CASE                                 0  r[48]='LG CASE'
+  89  String8       0  49   0  LG BOX                                  0  r[49]='LG BOX'
+  90  String8       0  50   0  LG PACK                                 0  r[50]='LG PACK'
+  91  String8       0  51   0  LG PKG                                  0  r[51]='LG PKG'
+  92  Integer      24  54   0                                          0  r[54]=24
+  93  Add          54  38  57                                          0  r[57]=r[54]+r[38]
+  94  Integer      15  60   0                                          0  r[60]=15
+  95  String8       0  62   0  Brand#22                                0  r[62]='Brand#22'
+  96  String8       0  63   0  Brand#23                                0  r[63]='Brand#23'
+  97  String8       0  64   0  Brand#12                                0  r[64]='Brand#12'
+  98  Integer       1  67   0                                          0  r[67]=1
+  99  Goto          0   1   0                                          0

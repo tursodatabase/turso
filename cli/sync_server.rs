@@ -872,15 +872,6 @@ impl TursoSyncServer {
         db: &DbHandle,
         req: &PullUpdatesReqProtoBody,
     ) -> Result<HttpResponse> {
-        let (db_size, fallback_revision, legacy_current_revision) = {
-            let conn = db.conn.lock().expect("database connection lock poisoned");
-            let wal_state = conn.wal_state()?;
-            (
-                current_snapshot_db_size_pages(&conn, wal_state.max_frame)?,
-                format!("page:{}", wal_state.max_frame),
-                wal_state.max_frame.to_string(),
-            )
-        };
         let log_path = match logical_log_path(&db.path) {
             Ok(path) => path,
             Err(_) if is_in_memory_db_path(&db.path) => {
@@ -891,7 +882,32 @@ impl TursoSyncServer {
             }
             Err(err) => return Err(err),
         };
-        let log = match std::fs::read(&log_path) {
+        let (db_size, fallback_revision, legacy_current_revision, log) = {
+            let conn = db.conn.lock().expect("database connection lock poisoned");
+            let wal_state = conn.wal_state()?;
+            // The log is read under the connection lock so that no commit or
+            // checkpoint changes it between the snapshot and the read.
+            let log = std::fs::read(&log_path).map(|mut log| {
+                if let Some(mv_store) = conn.mv_store().as_ref() {
+                    // Recovery ends the log at the last valid frame without
+                    // truncating the file, and the next commit overwrites
+                    // only part of the bytes after it. Serve only the
+                    // frames up to the write offset, as core reads them.
+                    // Core reports offset 0 until its first commit, while the
+                    // file already holds the header, so keep the header.
+                    let offset = mv_store.logical_log_offset() as usize;
+                    log.truncate(offset.max(MVCC_LOG_HEADER_SIZE));
+                }
+                log
+            });
+            (
+                current_snapshot_db_size_pages(&conn, wal_state.max_frame)?,
+                format!("page:{}", wal_state.max_frame),
+                wal_state.max_frame.to_string(),
+                log,
+            )
+        };
+        let log = match log {
             Ok(log) => log,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 info!(
@@ -2397,6 +2413,120 @@ mod tests {
         assert!(server
             .read_snapshot_pages(&handle, Some(revision), Some(&selector))
             .is_err());
+    }
+
+    fn pull_logical(
+        server: &TursoSyncServer,
+        handle: &DbHandle,
+        revision: &str,
+    ) -> Result<(PullUpdatesRespProtoBody, Vec<u8>)> {
+        let request = PullUpdatesReqProtoBody {
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            client_revision: revision.into(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let response = server.handle_pull_updates(handle, &request)?;
+        assert_eq!(response.status, 200);
+        let mut bytes = response.body.as_slice();
+        let header = PullUpdatesRespProtoBody::decode_length_delimited(&mut bytes)?;
+        Ok((header, bytes.to_vec()))
+    }
+
+    #[test]
+    fn bytes_after_the_last_valid_frame_do_not_fail_logical_pulls() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path;
+        let torn_frame;
+        {
+            let server = plaintext_server(dir.path(), false);
+            let handle = server
+                .resolve_db(None)
+                .unwrap_or_else(|_| panic!("open source"));
+            log_path = logical_log_path(&handle.path).unwrap();
+            let conn = handle.conn.lock().unwrap();
+            conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'small')").unwrap();
+            let start = std::fs::metadata(&log_path).unwrap().len();
+            conn.execute("INSERT INTO t VALUES (2, printf('%020000d', 2))")
+                .unwrap();
+            torn_frame = start..std::fs::metadata(&log_path).unwrap().len();
+            conn.close().unwrap();
+        }
+        // A crash during the write of the last frame leaves half of it on disk.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&log_path)
+            .unwrap();
+        file.set_len(torn_frame.start + (torn_frame.end - torn_frame.start) / 2)
+            .unwrap();
+        drop(file);
+
+        let log_end = {
+            let server = plaintext_server(dir.path(), false);
+            let handle = server
+                .resolve_db(None)
+                .unwrap_or_else(|_| panic!("open source"));
+            let (header, _) =
+                pull_logical(&server, &handle, "g1:o0").expect("a torn last frame is skipped");
+            assert_eq!(header.server_revision, format!("g1:o{}", torn_frame.start));
+            // Recovery ended the log before the torn frame, so this commit
+            // overwrites the start of it and the rest of it stays after the
+            // new frame.
+            let conn = handle.conn.lock().unwrap().clone();
+            conn.execute("INSERT INTO t VALUES (3, 'small')").unwrap();
+            let log_end = conn.mv_store().as_ref().unwrap().logical_log_offset();
+            assert!(std::fs::metadata(&log_path).unwrap().len() > log_end);
+            let (header, body) = pull_logical(&server, &handle, "g1:o0")
+                .expect("bytes after the last valid frame are skipped");
+            assert_eq!(header.server_revision, format!("g1:o{log_end}"));
+            assert_eq!(body, std::fs::read(&log_path).unwrap()[..log_end as usize]);
+            conn.close().unwrap();
+            log_end
+        };
+
+        // A power loss can leave zero bytes after the last valid frame.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&log_path)
+            .unwrap();
+        file.set_len(log_end + 4096).unwrap();
+        drop(file);
+        let server = plaintext_server(dir.path(), false);
+        let handle = server
+            .resolve_db(None)
+            .unwrap_or_else(|_| panic!("open source"));
+        let (header, _) = pull_logical(&server, &handle, "g1:o0")
+            .expect("zero bytes after the last valid frame are skipped");
+        assert_eq!(header.server_revision, format!("g1:o{log_end}"));
+    }
+
+    #[test]
+    fn header_only_logical_log_keeps_its_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let server = plaintext_server(dir.path(), false);
+            let handle = server
+                .resolve_db(None)
+                .unwrap_or_else(|_| panic!("open source"));
+            let conn = handle.conn.lock().unwrap().clone();
+            conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+            let (header, _) = pull_logical(&server, &handle, "g1:o0").unwrap();
+            assert_eq!(
+                header.server_revision,
+                format!("g1:o{MVCC_LOG_HEADER_SIZE}")
+            );
+            conn.close().unwrap();
+        }
+        let server = plaintext_server(dir.path(), false);
+        let handle = server
+            .resolve_db(None)
+            .unwrap_or_else(|_| panic!("open source"));
+        let revision = format!("g1:o{MVCC_LOG_HEADER_SIZE}");
+        let (header, _) = pull_logical(&server, &handle, &revision).unwrap();
+        assert_eq!(header.server_revision, revision);
     }
 
     #[test]

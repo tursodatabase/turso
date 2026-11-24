@@ -187,13 +187,13 @@ impl InProcessServer {
             .map(|pulls| pulls.fetch_add(1, Ordering::Relaxed) + 1);
         if let (Some(pull), false) = (pull, self.remote.mvcc) {
             let database = self.remote.checkpoint_and_read_database_file()?;
-            Ok(self.pages(&self.remote, database, revision_at(pull), false))
+            self.pages(&self.remote, database, revision_at(pull), false)
         } else if pull.is_some_and(|pull| pull % 2 == 0) {
             // How the sync server answers a logical pull it cannot serve from the log. The
             // client then pulls the log from the revision it was given.
             let database = self.remote.checkpoint_and_read_database_file()?;
             let log_end = self.remote.read_logical_log()?.len();
-            Ok(self.pages(&self.remote, database, revision_at(log_end), true))
+            self.pages(&self.remote, database, revision_at(log_end), true)
         } else if request.client_revision.is_empty() || self.force_page_updates {
             self.page_bootstrap(false)
         } else if self.replace_once.swap(false, Ordering::SeqCst) {
@@ -214,12 +214,12 @@ impl InProcessServer {
         } else {
             self.bootstrap_base.read_logical_log()?.len()
         };
-        Ok(self.pages(
+        self.pages(
             &self.bootstrap_base,
             database,
             revision_at(log_end),
             replace,
-        ))
+        )
     }
 
     fn pages(
@@ -228,7 +228,7 @@ impl InProcessServer {
         database: Vec<u8>,
         server_revision: String,
         replace: bool,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>> {
         let header = PullUpdatesRespProtoBody {
             server_revision,
             db_size: (database.len() / PAGE_SIZE) as u64,
@@ -248,10 +248,21 @@ impl InProcessServer {
             } as i32,
         };
         let mut response = header.encode_length_delimited_to_vec();
+        let failure = self.bootstrap_failure.load(Ordering::SeqCst);
         for (page_id, page) in database.chunks_exact(PAGE_SIZE).enumerate() {
             let mut page = page.to_vec();
-            if self.bootstrap_failure.load(Ordering::SeqCst) == 2 && page_id == 0 {
+            if failure == 2 && page_id == 0 {
                 page[PAGE_SIZE - 1] = 1;
+            }
+            // Serve page 1 as an encrypted remote stores it, without the SQLite
+            // magic but with plaintext page size and reserved-space fields.
+            if failure == 3 && page_id == 0 {
+                let crypto = self
+                    .bootstrap_base
+                    .crypto
+                    .as_ref()
+                    .expect("failure 3 needs an encrypted remote");
+                page = crypto.encrypt_page(&page, 1)?;
             }
             let page = PageData {
                 page_id: page_id as u64,
@@ -259,7 +270,20 @@ impl InProcessServer {
             };
             response.extend(page.encode_length_delimited_to_vec());
         }
-        response
+        // Append a page whose zero-based id does not map to a u32 page number:
+        // u32::MAX for failure 4, 2^32 for failure 5.
+        if failure == 4 || failure == 5 {
+            let page = PageData {
+                page_id: if failure == 4 {
+                    u64::from(u32::MAX)
+                } else {
+                    1 << 32
+                },
+                encoded_page: Bytes::from(database[database.len() - PAGE_SIZE..].to_vec()),
+            };
+            response.extend(page.encode_length_delimited_to_vec());
+        }
+        Ok(response)
     }
 
     fn logical_log_since(&self, offset: usize) -> Result<Vec<u8>> {

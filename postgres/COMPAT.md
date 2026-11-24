@@ -118,6 +118,16 @@ column defaults in `pg_attrdef.adbin`, as PostgreSQL does for the forms the
 manual lists under `CREATE POLICY`, and return TursoPG's stored SQL for
 other forms; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
+Casting a value of date, time, timestamp, timestamptz, json, inet, cidr,
+macaddr, macaddr8 or an enum to a type that does not read text fails with
+42846. A number cast to, or stored in a column of, one of these types or jsonb
+is read as its text: `20200101::date` and storing 20200101 in a date column
+give 2020-01-01, where PostgreSQL refuses both. TursoPG binds a parameter sent
+without a type as a number when its text is one, so refusing numbers would
+refuse such parameters too. `date::json` and `date::inet` are still accepted, as are `1::json`, `1::jsonb`,
+`1::inet`, `1::cidr` and `1::macaddr`, which PostgreSQL refuses. A jsonb value
+may be cast to a number: `'1'::jsonb::int`, `::bigint`, `::numeric`, `::float8`.
+`'true'::jsonb::boolean` gives 0 where PostgreSQL gives true, as does `'true'::text::boolean`.
 `pg_input_is_valid`, `to_char` (numeric; other argument types fail with
 0A000), `now`/`clock_timestamp`/
 `transaction_timestamp`/`statement_timestamp`. `to_timestamp` fails with 0A000.
@@ -172,21 +182,23 @@ Type mapping: serial/smallserial/bigserial (and serial2/4/8) become
 `INTEGER NOT NULL DEFAULT nextval(...)` with an implicit sequence named
 `<table>_<column>_seq`, or, when a relation of the schema has that name,
 the first of `<table>_<column>_seq1`, `..._seq2`, ... that none has. boolean,
-smallint, bigint, uuid, timestamp[tz], bytea, json, jsonb, inet,
+smallint, bigint, uuid, date, timestamp[tz], bytea, json, jsonb, inet,
 cidr, macaddr, macaddr8 map to Turso custom types. varchar(n) and
 numeric(p,s) keep their type modifiers; type modifiers on any other type,
 including char(n), timestamp(p) and bit(n), are rejected. xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
 
-date, time, timetz and interval, and arrays of every date and time type
-(`timestamp[]` and `timestamptz[]` included), are rejected as not supported
-(0A000) in column types, casts, typed literals and domains. So are
-`CURRENT_DATE`, `CURRENT_TIME`, `LOCALTIME` and the built-in functions that
-return date, time, timetz or interval, such as `age` and `make_date`.
+time, timetz and interval, and arrays of every date and time type
+(`date[]`, `timestamp[]` and `timestamptz[]` included), are rejected as not
+supported (0A000) in column types, casts, typed literals and domains. So are
+`CURRENT_TIME`, `LOCALTIME` and the built-in functions that
+return date, time, timetz or interval, such as `age`, `make_date`, `to_date`
+and `date()`.
 
 `now()`, `transaction_timestamp()` and `CURRENT_TIMESTAMP` are the time the
-transaction started, and `LOCALTIMESTAMP` is that time as a timestamp in UTC;
+transaction started, `LOCALTIMESTAMP` is that time as a timestamp in UTC, and
+`CURRENT_DATE` is its date;
 `statement_timestamp()` is the time the client's query arrived, shared by all
 statements of one query string;
 `clock_timestamp()` reads the clock at each call. All of them have microsecond
@@ -196,23 +208,30 @@ Comparing values of two different custom types fails when either type changes
 the values it stores (a STRUCT or UNION, a type with ENCODE or a DECODE other
 than `value`), unless the two already have one order in common, as `numeric`
 and `bigint` do. A domain compares as the type it is declared on, so two
-domains over one type compare as that type. So a `timestamp` with a
-`timestamptz`, and a `timestamptz` with a `varchar(n)`, fail. PostgreSQL refuses
-the second pair too, with 42883.
+domains over one type compare as that type. So a `date`, a `timestamp` and a
+`timestamptz` fail with one another, and so does a `timestamptz` with a
+`varchar(n)`. PostgreSQL refuses the `timestamptz` with `varchar(n)` pair too,
+with 42883.
 The error is `cannot compare type x with type y` with SQLSTATE 0A000. Turso
 refuses comparisons that PostgreSQL may run and does not know which ones, so
 the code differs from PostgreSQL's 42883 where PostgreSQL also refuses. It covers `=`, `<`,
-`IS DISTINCT FROM`, BETWEEN, IN and `IN (SELECT ...)`, `CASE x WHEN`, `NULLIF`,
-`min` and `max`, and joins, with or without an index. The same two types in
-one result column fail the same way: in UNION, UNION ALL, INTERSECT, EXCEPT, a
+`IS DISTINCT FROM`, BETWEEN, IN, `IN (SELECT ...)` and `IN (VALUES ...)`,
+`CASE x WHEN`, `NULLIF`, `min` and `max`, and joins, with or without an index.
+Not refused yet, and compared as stored: a join with a VALUES list in FROM or
+in a CTE, such as `WITH v(x) AS (VALUES (ts)) SELECT * FROM t, v WHERE d = x`.
+The same two types in
+one result column fail the same way: in UNION, UNION ALL, INTERSECT and EXCEPT,
+also with a VALUES part such as `SELECT d FROM t UNION ALL VALUES (CAST('2024-01-05' AS timestamp))`, a
 multi-row VALUES that is not the row source of an INSERT, a recursive CTE with
-UNION, the results of CASE, `coalesce`, `ifnull` and `iif`, and `lag` and `lead`
-with a default of another type. Not refused yet, and compared as stored: a
-recursive CTE with UNION ALL, a comparison with a VALUES subquery such as
-`d IN (VALUES (ts))`, and array functions that compare elements, such as
-`array_position`. PostgreSQL converts or refuses these. A string literal compared with a custom type is read as that type.
+UNION or UNION ALL, the results of CASE, `coalesce`, `ifnull` and `iif`, and `lag` and `lead`
+with a default of another type. A string literal compared with a custom type is read as that type.
 Two arrays compare when their element types compare, so `date[]` with
-`timestamp[]` fails. Two types that only check a value, such as `varchar(n)` and
+`timestamp[]` fails. So do the array functions and operators that compare
+an array's elements with other values or put values into one array, such as
+`array_position(ats, d)`, `array_append(ats, d)`, `array_set_element(ats, 1, d)`,
+`ats || d`, `ARRAY[d, ts]`, `@>`, `<@` and `&&` for a `timestamp[]` and a
+`date`. A function that turns its arguments into text, such as `concat(ats, d)`,
+compares nothing and is accepted. PostgreSQL converts or refuses these. Two types that only check a value, such as `varchar(n)` and
 `smallint`, compare as they did before this check, as stored. PostgreSQL refuses
 that pair, so Turso accepts a comparison that PostgreSQL rejects.
 

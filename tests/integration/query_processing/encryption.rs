@@ -258,7 +258,9 @@ fn authenticated_wal_import_preserves_target_encryption() -> anyhow::Result<()> 
             writer.wal_get_frame(index, &mut frame)?;
             if u32::from_be_bytes(frame[..4].try_into().unwrap()) == 1 {
                 let before = std::fs::read(format!("{}-wal", path.display()))?;
-                for offset in [24 + 16, 24 + 20] {
+                // The SQLite magic, the page size, the reserved-space size, and
+                // the reserved tail, where encryption writes its nonce and tag.
+                for offset in [24, 24 + 16, 24 + 20, frame.len() - 1] {
                     frame[offset] ^= 1;
                     assert!(importer.wal_insert_frame(index, &frame).is_err());
                     assert_eq!(std::fs::read(format!("{}-wal", path.display()))?, before);

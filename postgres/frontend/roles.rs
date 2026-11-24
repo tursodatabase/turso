@@ -38,6 +38,7 @@ use crate::auth_members::{emit_memberships_delete, Membership, Memberships};
 use crate::catalog::{pg_role_by_name, relation_name, PgRole};
 use crate::classes::class_catalog;
 use crate::error::sqlstate_error;
+use crate::schema_init::TableInit;
 use crate::schema_state::{change_schema_state, emit_catalog_apply};
 use crate::unique_index::emit_unique_index_insert;
 
@@ -48,7 +49,7 @@ pub(crate) const AUTHID_TABLE_NAME: &str = "__turso_internal_authid";
 const AUTHID_NAME_INDEX_NAME: &str = "__turso_internal_authid_rolname";
 
 /// Creates [`AUTHID_TABLE_NAME`]. The rowid of a row is the id of its role.
-pub(crate) const CREATE_AUTHID_TABLE_SQL: &str = "CREATE TABLE __turso_internal_authid (\
+const CREATE_AUTHID_TABLE_SQL: &str = "CREATE TABLE __turso_internal_authid (\
     id INTEGER PRIMARY KEY, \
     rolname TEXT NOT NULL, \
     rolsuper INTEGER NOT NULL, \
@@ -56,11 +57,16 @@ pub(crate) const CREATE_AUTHID_TABLE_SQL: &str = "CREATE TABLE __turso_internal_
     rolbypassrls INTEGER NOT NULL)";
 
 /// Keeps role names unique in the stored table, whatever writes it.
-pub(crate) const CREATE_AUTHID_NAME_INDEX_SQL: &str =
+const CREATE_AUTHID_NAME_INDEX_SQL: &str =
     "CREATE UNIQUE INDEX __turso_internal_authid_rolname ON __turso_internal_authid (rolname)";
 
 /// The number of columns of [`AUTHID_TABLE_NAME`].
 const AUTHID_COLUMN_COUNT: usize = 5;
+
+pub(crate) const TABLE_INIT: TableInit = TableInit {
+    table: AUTHID_TABLE_NAME,
+    statements: &[CREATE_AUTHID_TABLE_SQL, CREATE_AUTHID_NAME_INDEX_SQL],
+};
 
 /// The query that reads the roles for the frontend's schema state, or None
 /// when the database has no roles table, as in a read-only open of an empty
@@ -134,16 +140,27 @@ impl RoleCatalog {
             }
             catalog.add(role);
         }
-        catalog.memberships = Memberships::new(membership_rows)?;
-        let exists = |id| id == RoleId::SUPERUSER || catalog.roles.contains_key(&id);
-        if let Some(membership) = catalog.memberships.iter().find(|membership| {
+        catalog.set_memberships(membership_rows)?;
+        Ok(catalog)
+    }
+
+    /// Replaces the memberships with the rows read from the membership
+    /// table, after checking that each names roles of this catalog.
+    pub(crate) fn set_memberships(
+        &mut self,
+        membership_rows: &[Vec<Value>],
+    ) -> turso_core::Result<()> {
+        let memberships = Memberships::new(membership_rows)?;
+        let exists = |id| id == RoleId::SUPERUSER || self.roles.contains_key(&id);
+        if let Some(membership) = memberships.iter().find(|membership| {
             !exists(membership.role) || !exists(membership.member) || !exists(membership.grantor)
         }) {
             return Err(LimboError::Corrupt(format!(
                 "a role membership names a role that does not exist: {membership:?}"
             )));
         }
-        Ok(catalog)
+        self.memberships = memberships;
+        Ok(())
     }
 
     /// The stored role with id `id`. None for a built-in id.
