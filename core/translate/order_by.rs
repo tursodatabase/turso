@@ -504,8 +504,13 @@ impl EmitOrderBy {
             let skip_label = program.allocate_label();
             let limit = t_ctx.limit_ctx.as_ref().expect("limit must be set");
             let limit_reg = t_ctx.reg_limit_offset_sum.unwrap_or(limit.reg_limit);
+            program.emit_insn(Insn::IfPos {
+                reg: limit_reg,
+                target_pc: insert_label,
+                decrement_by: 1,
+            });
             // A negative LIMIT means no limit, so every row is inserted.
-            program.emit_insn(Insn::IfNotZero {
+            program.emit_insn(Insn::IfNeg {
                 reg: limit_reg,
                 target_pc: insert_label,
             });

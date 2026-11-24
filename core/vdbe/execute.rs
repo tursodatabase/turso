@@ -958,38 +958,6 @@ pub fn op_if_pos(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub fn op_if_not_zero(
-    _program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _connection: &Arc<Connection>,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(IfNotZero { reg, target_pc }, insn);
-    if !target_pc.is_offset() {
-        return Err(unresolved_branch_target(*target_pc));
-    }
-    match state.registers[*reg].get_value() {
-        Value::Numeric(Numeric::Integer(0)) => {
-            state.pc += 1;
-        }
-        Value::Numeric(Numeric::Integer(n)) => {
-            if *n > 0 {
-                state.registers[*reg].set_int(*n - 1);
-            }
-            state.pc = target_pc.as_offset_int();
-        }
-        _ => {
-            mark_unlikely();
-            return Err(LimboError::InternalError(
-                "IfNotZero: the value in the register is not an integer".into(),
-            )
-            .into());
-        }
-    }
-    Ok(InsnFunctionStepResult::Step)
-}
-
 pub fn op_not_null(
     _program: &Program,
     state: &mut ProgramState,
