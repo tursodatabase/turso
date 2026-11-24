@@ -1926,11 +1926,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                                 self.db_id,
                             );
                         }
-                    } else if self.mvcc_store.txs.get(&batch.writing.tx_id).is_some() {
-                        // The owner is still alive and will take the retry.
-                        // This read is outside the group mutex. If the owner
-                        // drops first, drop_pending records the ticket and
-                        // request_retry does not leave a hole.
+                    } else {
                         self.commit_coordinator.request_retry(batch.writing.ticket);
                     }
                 }
