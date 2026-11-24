@@ -2610,6 +2610,35 @@ fn cached_open_with_different_io_uses_only_the_verifier() -> anyhow::Result<()> 
 }
 
 #[test]
+fn warm_encrypted_mvcc_connect_skips_the_page_one_read_lock() -> anyhow::Result<()> {
+    let database = ReadLockDatabase::new("warm-mvcc")?;
+    database.owner.execute("PRAGMA journal_mode = 'mvcc'")?;
+    assert!(database.db.mvcc_enabled());
+    let options = |key| -> anyhow::Result<_> {
+        Ok(ConnectOpts::new(turso_core::SessionRole::Superuser)
+            .with_encryption_key(Some(EncryptionKey::from_hex_string(key)?)))
+    };
+    let mut state = turso_core::ConnectAsyncState::new();
+    assert_wrong_key_refusal(
+        database
+            .db
+            .connect_async(options(KEY_B)?, &mut state)
+            .map_err(|error| *error),
+    );
+    let result = database.db.connect_async(options(KEY_A)?, &mut state)?;
+    assert!(
+        database.db.wal_read_slots_with_readers().is_empty(),
+        "warm MVCC pager initialization must not pin the WAL"
+    );
+    let IOResult::Done(connection) = result else {
+        panic!("the committed MVCC header should satisfy pager initialization without I/O");
+    };
+    let rows: Vec<(String,)> = connection.exec_rows("SELECT value FROM secrets");
+    assert_eq!(rows, [("protected value".into(),)]);
+    Ok(())
+}
+
+#[test]
 fn connect_async_yields_and_cancellation_releases_read_transactions() -> anyhow::Result<()> {
     for wrong in [false, true] {
         let database = ReadLockDatabase::new(if wrong {

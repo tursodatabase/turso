@@ -519,11 +519,12 @@ impl Connection {
                     }));
                 }
                 AttachDatabaseState::Init(init) => {
-                    let mut pager = Arc::new(crate::return_if_io!(init.db._init_nonblock(
+                    let initialized = crate::return_if_io!(init.db._init_nonblock(
                         &mut init.init_st,
                         init.encryption_key.as_ref(),
                         None,
-                    )));
+                    ));
+                    let mut pager = Arc::new(initialized.pager);
 
                     if !init.attached_is_fresh {
                         self.reject_initialized_attach_mismatches(&init.alias, &init.db, &pager)?;
