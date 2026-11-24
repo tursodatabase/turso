@@ -865,8 +865,8 @@ expect {
 
 @compat-gap "type:_date"
 test array-columns-hold-element-values {
-    -- tursopg prints a boolean result as 1, PostgreSQL as t, so every
-    -- boolean is cast to int.
+    -- Every boolean is cast to int: the test was written when tursopg
+    -- printed a boolean result as 1.
     CREATE TABLE array_values (
         id int PRIMARY KEY,
         u uuid, us uuid[],

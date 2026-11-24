@@ -58,7 +58,6 @@ expect {
 
 # B-04: IS TRUE / IS NOT TRUE on bool col
 @setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "type:bool"
 test is-true-is-not-true-on-bool-col {
     SELECT id, ok IS TRUE, ok IS NOT TRUE FROM t ORDER BY id;
 }
@@ -67,12 +66,6 @@ expect {
     2|f|t
     3|f|t
     4|f|t
-}
-expect @tursopg {
-    1|1|0
-    2|0|1
-    3|0|1
-    4|0|1
 }
 
 # B-05: IS UNKNOWN
@@ -95,15 +88,11 @@ expect {
 }
 
 # B-07: LIKE case-sensitive literal
-@compat-gap "type:bool"
 test like-case-sensitive-literal {
     SELECT 'ABC' LIKE 'abc', 'abc' LIKE 'a%', 'abc' LIKE 'A%';
 }
 expect {
     f|t|f
-}
-expect @tursopg {
-    0|1|0
 }
 
 # B-08: LIKE default escape \_
@@ -152,7 +141,7 @@ expect {
     t
 }
 expect @tursopg {
-    0
+    f
 }
 
 # B-14: NOT LIKE / NOT ILIKE
@@ -234,51 +223,35 @@ expect {
 }
 
 # B-21: regex classes \d and escapes
-@compat-gap "type:bool"
 test regex-classes-d-and-escapes {
     SELECT 'a1' ~ '^a\d$', 'a.c' ~ '^a\.c$', 'abc' ~ '^a\.c$';
 }
 expect {
     t|t|f
 }
-expect @tursopg {
-    1|1|0
-}
 
 # B-22: SIMILAR TO
-@compat-gap "type:bool"
 test similar-to {
     SELECT 'abc' SIMILAR TO 'a(b|x)c', 'abc' SIMILAR TO 'b';
 }
 expect {
     t|f
 }
-expect @tursopg {
-    1|0
-}
 
 # B-23: IN with NULL (three-valued)
-@compat-gap "type:bool"
 test in-with-null-three-valued {
     SELECT 1 IN (1, NULL), 2 IN (1, NULL), 2 NOT IN (1, NULL);
 }
 expect {
     t||
 }
-expect @tursopg {
-    1||
-}
 
 # B-25: = ANY('{..}'::int[])
-@compat-gap "type:bool"
 test eq-any-int-array-literal {
     SELECT 1 = ANY('{1,2}'::int[]), 3 = ANY('{1,2}'::int[]);
 }
 expect {
     t|f
-}
-expect @tursopg {
-    1|0
 }
 
 # B-26: > ALL / < ANY (non-equality)
@@ -349,15 +322,11 @@ expect {
 }
 
 # B-35: ARRAY @> ARRAY literal
-@compat-gap "type:bool"
 test array-array-literal {
     SELECT ARRAY[1,2] @> ARRAY[1], ARRAY['a'] <@ ARRAY['a','b'], ARRAY[1] && ARRAY[2];
 }
 expect {
     t|t|f
-}
-expect @tursopg {
-    1|1|0
 }
 
 # B-36: array subscript 1-based + out of range
@@ -805,19 +774,15 @@ expect {
     t
 }
 expect @tursopg {
-    0
+    f
 }
 
 # B-78: gen_random_uuid() format
-@compat-gap "type:bool"
 test gen-random-uuid-format {
     SELECT gen_random_uuid()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
 }
 expect {
     t
-}
-expect @tursopg {
-    1
 }
 
 # B-79: set_config + current_setting
@@ -1003,7 +968,7 @@ expect {
     t|f
 }
 expect @tursopg {
-    0|1
+    f|t
 }
 
 # B-96: length / char_length bytes vs chars
@@ -1015,15 +980,11 @@ expect {
 }
 
 # B-97: current_user / current_role
-@compat-gap "type:bool"
 test current-user-current-role {
     SELECT current_user = current_role;
 }
 expect {
     t
-}
-expect @tursopg {
-    1
 }
 
 # B-98: pg_catalog.-qualified function
@@ -1112,28 +1073,20 @@ expect {
 
 # B-106: boolean comparison output
 @setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "type:bool"
 test boolean-comparison-output {
     SELECT id < 2, n IS NULL FROM t WHERE id = 1;
 }
 expect {
     t|f
 }
-expect @tursopg {
-    1|0
-}
 
 # B-107: EXISTS subquery output
 @setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "type:bool"
 test exists-subquery-output {
     SELECT EXISTS (SELECT 1 FROM t WHERE id = 1);
 }
 expect {
     t
-}
-expect @tursopg {
-    1
 }
 
 # B-117: VALUES list with column aliases v(x)
@@ -1326,7 +1279,6 @@ expect @tursopg raw {
  12
 }
 
-@compat-gap "function:to_char"
 test to-char-null-timestamptz-row {
     CREATE TABLE to_char_times (at timestamptz);
     INSERT INTO to_char_times VALUES (NULL);
@@ -1334,9 +1286,6 @@ test to-char-null-timestamptz-row {
 }
 expect {
     t
-}
-expect @tursopg {
-    1
 }
 
 # to_timestamp(double precision)
@@ -1376,17 +1325,11 @@ expect {
 expect @tursopg error {}
 
 # B-127: ->> of a JSON boolean is the text true
-# After the fix of ->>, the output still differs because of B-04: a boolean
-# prints as 0 or 1.
-@compat-gap "type:bool"
 test of-a-json-boolean-is-the-text-true {
     SELECT '{"a": true}'::jsonb ->> 'a', '{"a": true}'::jsonb ->> 'a' <> 'true';
 }
 expect {
     true|f
-}
-expect @tursopg {
-    true|0
 }
 
 # B-128: jsonb || concatenates two objects
