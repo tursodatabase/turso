@@ -3590,7 +3590,15 @@ impl PostgreSQLTranslator {
                 if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
                     expr = Box::new(int8_cast_operand(arg, *expr));
                 }
-                let type_name = pg_type_name_to_ast_type(pg_type_name)?;
+                let mut type_name = pg_type_name_to_ast_type(pg_type_name)?;
+                // The definition of a table is translated again each time the
+                // schema is read. A cast to jsonb in a generation expression
+                // stays the cast to text of earlier versions, so that a stored
+                // column gives new rows the values that it gave old rows.
+                if type_name.name == "jsonb" && self.generation_expression_table.borrow().is_some()
+                {
+                    type_name.name = "TEXT".to_string();
+                }
                 Ok(ast::Expr::Cast {
                     expr,
                     type_name: Some(type_name),
@@ -7843,9 +7851,13 @@ fn pg_type_name_to_ast_type(
         "TIME" => "time",
         "TIMESTAMP" => "timestamp",
         "TIMESTAMPTZ" => "timestamptz",
+        // A cast to jsonb converts the value as a jsonb column does, so that
+        // core runs the operators of jsonb on it: `'{"a":1}'::jsonb || '{}'`
+        // joins two objects, not two texts.
+        "JSONB" => "jsonb",
         // For CAST expressions, map all text-like PG types to TEXT.
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INET" | "JSON" | "JSONB"
-        | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INET" | "JSON" | "XML"
+        | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
         "BYTEA" | "BLOB" => "BLOB",
         _ => &pg_type,
     };

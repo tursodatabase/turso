@@ -358,7 +358,7 @@ expect {
     {"a": 1, "b": 2, "aa": [1, 2]}
 }
 expect @tursopg {
-    {"b": 2,  "a":1, "aa": [1,  2]}
+    {"b":2,"a":1,"aa":[1,2]}
 }
 
 # A-46: jsonb duplicate keys keep last
@@ -382,15 +382,11 @@ expect {
 }
 
 # A-48: invalid jsonb literal
-@compat-gap "type:jsonb"
 test invalid-jsonb-literal {
     SELECT 'not json'::jsonb;
 }
 @sqlstate 22P02
 expect error {}
-expect @tursopg {
-    not json
-}
 
 # A-50: jsonb number precision
 test jsonb-number-precision {

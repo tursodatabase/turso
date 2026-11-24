@@ -185,15 +185,46 @@ expect {
     4
 }
 
+test jsonb-arrow-of-input-nested-500-levels {
+    SELECT length(((repeat('[', 500) || repeat(']', 500))::jsonb -> 0)::text);
+}
+expect {
+    998
+}
+
+# A jsonb value of tursopg holds at most 500 levels of nested arrays and
+# objects, and a deeper value fails with 22P02. The depth limit of
+# PostgreSQL depends on max_stack_depth.
+@compat-gap "type:jsonb"
 test jsonb-arrow-of-input-nested-1000-levels {
     SELECT length(((repeat('[', 1000) || repeat(']', 1000))::jsonb -> 0)::text);
 }
 expect {
     1998
 }
+@sqlstate 22P02
+expect @tursopg error {}
 
+@compat-gap "type:jsonb"
 test jsonb-arrow-of-deeply-nested-input-errors {
     SELECT (repeat('[', 50000) || repeat(']', 50000))::jsonb -> 0;
+}
+@sqlstate 54001
+expect error {}
+@sqlstate 22P02
+expect @tursopg error {}
+
+# A json value reads as text, so -> reads it to the depth limit of the
+# frontend.
+test json-arrow-of-input-nested-1000-levels {
+    SELECT length(((repeat('[', 1000) || repeat(']', 1000))::json -> 0)::text);
+}
+expect {
+    1998
+}
+
+test json-arrow-of-deeply-nested-input-errors {
+    SELECT (repeat('[', 50000) || repeat(']', 50000))::json -> 0;
 }
 @sqlstate 54001
 expect error {}
@@ -478,25 +509,51 @@ expect {
     1|0|0
 }
 
+test jsonb-contains-input-nested-500-levels {
+    SELECT ((repeat('[', 500) || repeat(']', 500))::jsonb @> (repeat('[', 499) || repeat(']', 499))::jsonb)::int;
+}
+expect {
+    1
+}
+
+test jsonb-contains-objects-nested-500-levels {
+    SELECT ((repeat('{"a":', 500) || '1' || repeat('}', 500))::jsonb @> (repeat('{"a":', 500) || '1' || repeat('}', 500))::jsonb)::int;
+}
+expect {
+    1
+}
+
+# A jsonb value of tursopg holds at most 500 levels of nested arrays and
+# objects, and a deeper value fails with 22P02. The depth limit of
+# PostgreSQL depends on max_stack_depth.
+@compat-gap "type:jsonb"
 test jsonb-contains-input-nested-1000-levels {
     SELECT ((repeat('[', 1000) || repeat(']', 1000))::jsonb @> (repeat('[', 999) || repeat(']', 999))::jsonb)::int;
 }
 expect {
     1
 }
+@sqlstate 22P02
+expect @tursopg error {}
 
+@compat-gap "type:jsonb"
 test jsonb-contains-objects-nested-1000-levels {
     SELECT ((repeat('{"a":', 1000) || '1' || repeat('}', 1000))::jsonb @> (repeat('{"a":', 1000) || '1' || repeat('}', 1000))::jsonb)::int;
 }
 expect {
     1
 }
+@sqlstate 22P02
+expect @tursopg error {}
 
+@compat-gap "type:jsonb"
 test jsonb-contains-of-deeply-nested-input-errors {
     SELECT '[1]'::jsonb @> (repeat('[', 50000) || repeat(']', 50000))::jsonb;
 }
 @sqlstate 54001
 expect error {}
+@sqlstate 22P02
+expect @tursopg error {}
 
 test jsonb-contains-invalid-json-errors {
     SELECT '{"a":1}'::jsonb @> 'not json';
@@ -583,6 +640,23 @@ test jsonb-contains-with-an-index-on-the-same-expression {
 }
 expect {
     1
+}
+
+# The definition of a table is translated again each time the schema is read.
+# A cast to jsonb in a generation expression thus stays the cast to text of
+# earlier versions, so that the column gives new rows the values that it gave
+# old rows.
+@compat-gap "type:jsonb"
+test jsonb-cast-in-generated-column-is-a-cast-to-text {
+    CREATE TABLE gen_texts (data text, normal text GENERATED ALWAYS AS (data::jsonb::text) STORED);
+    INSERT INTO gen_texts (data) VALUES ('[1,  2]');
+    SELECT normal FROM gen_texts;
+}
+expect {
+    [1, 2]
+}
+expect @tursopg {
+    [1,  2]
 }
 
 # A generation expression can use only core functions too, so a generated
