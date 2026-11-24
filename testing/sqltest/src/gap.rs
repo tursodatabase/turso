@@ -244,7 +244,7 @@ fn check_gap_test(
                         .to_string(),
                 );
             }
-            Some(SkipCondition::Mvcc | SkipCondition::Sqlite) => {}
+            Some(SkipCondition::Mvcc | SkipCondition::Sqlite | SkipCondition::Debug) => {}
         }
     }
     // The postgres and tursopg backends have no capabilities, so a requirement

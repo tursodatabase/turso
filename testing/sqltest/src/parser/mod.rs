@@ -695,8 +695,12 @@ impl Parser {
                 self.advance();
                 Ok(ast::SkipCondition::Postgres)
             }
+            Some(Token::Identifier(name)) if name == "debug" => {
+                self.advance();
+                Ok(ast::SkipCondition::Debug)
+            }
             Some(token) => Err(self.error(format!(
-                "expected skip condition (mvcc, sqlite, postgres), got {token}"
+                "expected skip condition (mvcc, sqlite, postgres, debug), got {token}"
             ))),
             None => Err(self.error("expected skip condition, got EOF".to_string())),
         }
@@ -1653,6 +1657,30 @@ expect {
     }
 
     #[test]
+    fn test_parse_global_skip_if_debug() {
+        let input = r#"
+@database :memory:
+@skip-file-if debug "deep queries overflow the stack of a debug build"
+
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(
+            file.global_skip,
+            vec![ast::Skip {
+                reason: "deep queries overflow the stack of a debug build".to_string(),
+                condition: Some(ast::SkipCondition::Debug),
+            }]
+        );
+    }
+
+    #[test]
     fn test_parse_global_skip_if_postgres() {
         let input = r#"
 @database :memory:
@@ -1693,7 +1721,7 @@ expect {
         let err = parse(input).unwrap_err();
         assert!(
             err.to_string()
-                .contains("expected skip condition (mvcc, sqlite, postgres), got mysql"),
+                .contains("expected skip condition (mvcc, sqlite, postgres, debug), got mysql"),
             "{err}"
         );
     }
