@@ -1526,7 +1526,7 @@ fn steps_of_the_catalog_run_after_the_engine_steps_at_open_and_at_reload() {
 }
 
 /// A catalog that stores what SQLite's stores and notes the commands about
-/// triggers and virtual tables that it gets.
+/// triggers, virtual tables and types that it gets.
 struct NotesCommands {
     commands: Arc<std::sync::Mutex<Vec<String>>>,
 }
@@ -1556,6 +1556,18 @@ impl turso_core::Catalog for NotesCommands {
                     .lock()
                     .unwrap()
                     .push(format!("create virtual table {}", table.name));
+            }
+            turso_core::CatalogCmd::CreateType(ty) => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(format!("create type {}: {}", ty.name, ty.sql));
+            }
+            turso_core::CatalogCmd::DropType(ty) => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(format!("drop type {}", ty.name));
             }
             _ => {}
         }
@@ -1612,4 +1624,47 @@ fn the_catalog_gets_a_new_virtual_table() {
         .unwrap();
 
     assert_eq!(*commands.lock().unwrap(), ["create virtual table v"]);
+}
+
+#[test]
+fn the_catalog_gets_new_and_dropped_types_and_domains() {
+    let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialect = Arc::new(DialectWithCatalog {
+        catalog: NotesCommands {
+            commands: commands.clone(),
+        },
+    });
+    let options = OpenOptions::new(dialect).db_opts(DatabaseOpts::new().with_custom_types(true));
+    let db = Database::open(Arc::new(MemoryIO::new()), ":memory:", options).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+        .unwrap();
+    conn.execute("CREATE DOMAIN positive AS integer CHECK (value > 0)")
+        .unwrap();
+    conn.execute("DROP TYPE cents").unwrap();
+    conn.execute("DROP DOMAIN positive").unwrap();
+
+    let commands = commands.lock().unwrap();
+    let names: Vec<&str> = commands
+        .iter()
+        .map(|command| command.split(':').next().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "create type cents",
+            "create type positive",
+            "drop type cents",
+            "drop type positive"
+        ]
+    );
+    assert!(commands[0].contains("CREATE TYPE cents"), "{}", commands[0]);
+    assert!(
+        commands[1].contains("CREATE DOMAIN positive"),
+        "{}",
+        commands[1]
+    );
 }
