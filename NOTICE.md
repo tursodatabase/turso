@@ -109,6 +109,12 @@ The PostgreSQL dump fuzzer uses comfy-table, distributed by its authors:
 * License: licenses/testing/comfy-table-mit-license.md (MIT License)
 * Homepage: https://github.com/nukesor/comfy-table
 
+postgres/catalog/upstream/postgres.bki is the file that PostgreSQL's genbki.pl
+generates from the catalog data files of the PostgreSQL source tree:
+
+* License: licenses/postgres-license.md (PostgreSQL License)
+* Homepage: https://www.postgresql.org/
+
 The PostgreSQL frontend vendors the default bool, integer, float, and bytea
 text-formatting routines from pgwire 0.36.3 in
 postgres/frontend/copy/pgwire_text.rs, with local buffer and API adaptations:
