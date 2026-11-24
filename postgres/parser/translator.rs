@@ -3592,6 +3592,11 @@ impl PostgreSQLTranslator {
                     expr = Box::new(int8_cast_operand(arg, *expr));
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
+                if type_name.name == "TEXT"
+                    && cast_or_case_name(arg).is_some_and(|name| name.eq_ignore_ascii_case("bytea"))
+                {
+                    return Err(ParseError::not_supported("a cast of bytea to text"));
+                }
                 Ok(ast::Expr::Cast {
                     expr,
                     type_name: Some(type_name),
@@ -7912,7 +7917,8 @@ fn pg_type_name_to_ast_type(
         // For CAST expressions, map all text-like PG types to TEXT.
         "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INET" | "JSON" | "JSONB"
         | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
-        "BYTEA" | "BLOB" => "BLOB",
+        "BYTEA" => "bytea",
+        "BLOB" => "BLOB",
         _ => &pg_type,
     };
 
