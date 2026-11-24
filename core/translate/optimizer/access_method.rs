@@ -487,7 +487,13 @@ pub(super) fn choose_best_btree_candidate(
 
     // `best_choice` starts as a table scan even when INDEXED BY removed that choice.
     // Do not return that placeholder if all forced candidates were rejected.
-    Ok(has_valid_candidate.then_some(best_choice))
+    // Not `has_valid_candidate.then_some(best_choice)`: for it, the compiler
+    // copies the candidate three times, and for `Ok(Some(best_choice))` once.
+    // The join order search calls this function for each table that it tries.
+    if !has_valid_candidate {
+        return Ok(None);
+    }
+    Ok(Some(best_choice))
 }
 
 fn consumed_where_terms_from_constraint_refs(
@@ -951,7 +957,16 @@ fn find_best_access_method_for_btree<'a>(
             iter_dir: best.iter_dir,
             index: best.index,
             build_index: false,
-            constraint_refs: best.constraint_refs.into_vec(),
+            // For refs that the `SmallVec` keeps inline, `into_vec` moves the
+            // `SmallVec` into an iterator and collects the refs one at a time
+            // into a `Vec` with space for four. A copy of the slice allocates
+            // only space for the refs. Spilled refs already have a heap
+            // buffer, which `into_vec` keeps.
+            constraint_refs: if best.constraint_refs.spilled() {
+                best.constraint_refs.into_vec()
+            } else {
+                best.constraint_refs.to_vec()
+            },
         },
     };
     let mut best_cost_with_filters =

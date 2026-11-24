@@ -2402,6 +2402,49 @@ fn op_column_fetch_overflowing(
         state,
         cursor.read_payload(KeptRead::Values, values_start, values_end - values_start)
     );
+    if let [(i, _, serial_type)] = values_in_overflow[..] {
+        // The run is one BLOB, so the bytes that the cursor read are the
+        // value. Move them into the register instead of copying them, and give
+        // the cursor the old buffer of the register to read into next time.
+        let is_blob = serial_type >= 12 && serial_type & 1 == 0;
+        if is_blob && bytes.len() as u64 == (serial_type - 12) / 2 {
+            let reg = &mut state.registers[dest + i];
+            let old_blob = match reg {
+                Register::Value(Value::Blob(blob)) => std::mem::replace(blob, crate::alloc::vec![]),
+                _ => crate::alloc::vec![],
+            };
+            reg.set_blob(cursor.take_kept_values(old_blob))?;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        // A TEXT value moves in the same way. The `String` of a TEXT value
+        // uses the global allocator. In nightly builds, the buffer of the
+        // cursor uses the Turso allocator, so there the bytes are copied.
+        #[cfg(not(nightly))]
+        {
+            let is_text = serial_type >= 13 && serial_type & 1 == 1;
+            if is_text
+                && bytes.len() as u64 == (serial_type - 13) / 2
+                && crate::types::validate_utf8(bytes).is_some()
+            {
+                let reg = &mut state.registers[dest + i];
+                let old_text = match reg {
+                    Register::Value(Value::Text(Text {
+                        value: std::borrow::Cow::Owned(text),
+                        ..
+                    })) => std::mem::take(text).into_bytes(),
+                    _ => crate::alloc::vec![],
+                };
+                let bytes = cursor.take_kept_values(old_text);
+                // SAFETY: `validate_utf8` found that these bytes are UTF-8.
+                let text = Text::new(unsafe { String::from_utf8_unchecked(bytes) });
+                match reg {
+                    Register::Value(value) => *value = Value::Text(text),
+                    _ => *reg = Register::Value(Value::Text(text)),
+                }
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
     for (i, offset, serial_type) in values_in_overflow {
         decode_serial_type_into_register(
             serial_type,
