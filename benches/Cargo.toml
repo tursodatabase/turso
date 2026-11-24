@@ -164,6 +164,11 @@ path = "record_recycling.rs"
 harness = false
 
 [[bench]]
+name = "seek_benchmark"
+path = "seek_benchmark.rs"
+harness = false
+
+[[bench]]
 name = "select_star_benchmark"
 path = "select_star_benchmark.rs"
 harness = false
