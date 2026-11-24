@@ -144,21 +144,17 @@ fn exec_timestamp_plus_interval(args: &[Register]) -> Result<Value> {
 
 /// `time` plus `months`, then `days`, then `micros`, as PostgreSQL's
 /// timestamp_pl_interval adds them, or None if a step leaves chrono's range.
+/// Adding months clamps the day to the last day of the target month, as
+/// PostgreSQL does.
 fn add_interval(time: NaiveDateTime, months: i64, days: i64, micros: i64) -> Option<NaiveDateTime> {
-    use chrono::{Datelike, Duration, NaiveDate};
-    let date = time.date();
-    let month_index = i64::from(date.year())
-        .checked_mul(12)?
-        .checked_add(i64::from(date.month0()))?
-        .checked_add(months)?;
-    let year = i32::try_from(month_index.div_euclid(12)).ok()?;
-    let month = u32::try_from(month_index.rem_euclid(12)).ok()? + 1;
-    let first_of_month = NaiveDate::from_ymd_opt(year, month, 1)?;
-    let first_of_next_month = first_of_month.checked_add_months(chrono::Months::new(1))?;
-    let last_day = first_of_next_month.pred_opt()?.day();
-    let date = first_of_month.with_day(date.day().min(last_day))?;
-    let date = date.checked_add_signed(Duration::try_days(days)?)?;
-    date.and_time(time.time())
+    use chrono::{Duration, Months};
+    let month_count = Months::new(u32::try_from(months.unsigned_abs()).ok()?);
+    let time = if months >= 0 {
+        time.checked_add_months(month_count)?
+    } else {
+        time.checked_sub_months(month_count)?
+    };
+    time.checked_add_signed(Duration::try_days(days)?)?
         .checked_add_signed(Duration::microseconds(micros))
 }
 
