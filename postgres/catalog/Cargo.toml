@@ -10,5 +10,10 @@ description = "The built-in rows of PostgreSQL's system catalogs, for Turso"
 [lints]
 workspace = true
 
+[dependencies]
+# The seed of each catalog writes its rows as values of core. A user of this crate
+# chooses the other features of core. Core does not build without "fs".
+turso_core = { path = "../../core", version = "0.9.0-pre.6", default-features = false, features = ["fs"] }
+
 [dev-dependencies]
 turso_pg_catalog_gen = { path = "generator" }

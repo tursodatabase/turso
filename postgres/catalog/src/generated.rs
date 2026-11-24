@@ -2,6 +2,10 @@
 // Do not edit. To change this file, run postgres/catalog/update.sh or
 // `cargo run -p turso_pg_catalog_gen`.
 
+use turso_core::Value;
+
+use crate::seed::{value, Array, CatalogRow, CatalogSeed, Vector};
+use crate::seeded::SeededTable;
 use crate::Oid;
 
 /// A row of `pg_aggregate`.
@@ -212,6 +216,20 @@ impl PgAggregate {
     }
 }
 
+impl CatalogRow for PgAggregate {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.aggfnoid), value(self.aggkind), value(self.aggnumdirectargs), value(self.aggtransfn), value(self.aggfinalfn), value(self.aggcombinefn), value(self.aggserialfn), value(self.aggdeserialfn), value(self.aggmtransfn), value(self.aggminvtransfn), value(self.aggmfinalfn), value(self.aggfinalextra), value(self.aggmfinalextra), value(self.aggfinalmodify), value(self.aggmfinalmodify), value(self.aggsortop), value(self.aggtranstype), value(self.aggtransspace), value(self.aggmtranstype), value(self.aggmtransspace), value(self.agginitval), value(self.aggminitval)]);
+    }
+}
+
+/// `pg_aggregate` as a seeded table, with the rows of [`PG_AGGREGATE`].
+pub const PG_AGGREGATE_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_aggregate",
+    create_sql: PgAggregate::CREATE_SQL,
+    index_sql: PgAggregate::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_AGGREGATE, None, 0x34fb32c2),
+};
+
 /// A row of `pg_am`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgAm {
@@ -245,6 +263,20 @@ impl PgAm {
         Some(&PG_AM[position])
     }
 }
+
+impl CatalogRow for PgAm {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.amname), value(self.amhandler), value(self.amtype)]);
+    }
+}
+
+/// `pg_am` as a seeded table, with the rows of [`PG_AM`].
+pub const PG_AM_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_am",
+    create_sql: PgAm::CREATE_SQL,
+    index_sql: PgAm::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_AM, Some(|row| row.oid), 0xc29f9c3b),
+};
 
 /// A row of `pg_amop`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1224,6 +1256,20 @@ impl PgAmop {
     }
 }
 
+impl CatalogRow for PgAmop {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.amopfamily), value(self.amoplefttype), value(self.amoprighttype), value(self.amopstrategy), value(self.amoppurpose), value(self.amopopr), value(self.amopmethod), value(self.amopsortfamily)]);
+    }
+}
+
+/// `pg_amop` as a seeded table, with the rows of [`PG_AMOP`].
+pub const PG_AMOP_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_amop",
+    create_sql: PgAmop::CREATE_SQL,
+    index_sql: PgAmop::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_AMOP, Some(|row| row.oid), 0xbc70c4ad),
+};
+
 /// A row of `pg_amproc`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgAmproc {
@@ -1967,6 +2013,20 @@ impl PgAmproc {
     }
 }
 
+impl CatalogRow for PgAmproc {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.amprocfamily), value(self.amproclefttype), value(self.amprocrighttype), value(self.amprocnum), value(self.amproc)]);
+    }
+}
+
+/// `pg_amproc` as a seeded table, with the rows of [`PG_AMPROC`].
+pub const PG_AMPROC_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_amproc",
+    create_sql: PgAmproc::CREATE_SQL,
+    index_sql: PgAmproc::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_AMPROC, Some(|row| row.oid), 0xf628c125),
+};
+
 /// A row of `pg_attrdef`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgAttrdef {
@@ -1993,6 +2053,20 @@ impl PgAttrdef {
         Some(&PG_ATTRDEF[position])
     }
 }
+
+impl CatalogRow for PgAttrdef {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.adrelid), value(self.adnum), value(self.adbin)]);
+    }
+}
+
+/// `pg_attrdef` as a seeded table, with the rows of [`PG_ATTRDEF`].
+pub const PG_ATTRDEF_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_attrdef",
+    create_sql: PgAttrdef::CREATE_SQL,
+    index_sql: PgAttrdef::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_ATTRDEF, Some(|row| row.oid), 0xa105d3c2),
+};
 
 /// A row of `pg_attribute`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2038,6 +2112,20 @@ impl PgAttribute {
     ];
 }
 
+impl CatalogRow for PgAttribute {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.attrelid), value(self.attname), value(self.atttypid), value(self.attlen), value(self.attnum), value(self.atttypmod), value(self.attndims), value(self.attbyval), value(self.attalign), value(self.attstorage), value(self.attcompression), value(self.attnotnull), value(self.atthasdef), value(self.atthasmissing), value(self.attidentity), value(self.attgenerated), value(self.attisdropped), value(self.attislocal), value(self.attinhcount), value(self.attcollation), value(self.attstattarget), value(self.attacl.map(Array)), value(self.attoptions.map(Array)), value(self.attfdwoptions.map(Array)), value(self.attmissingval)]);
+    }
+}
+
+/// `pg_attribute` as a seeded table, with the rows of [`PG_ATTRIBUTE`].
+pub const PG_ATTRIBUTE_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_attribute",
+    create_sql: PgAttribute::CREATE_SQL,
+    index_sql: PgAttribute::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_ATTRIBUTE, None, 0x35da79f9),
+};
+
 /// A row of `pg_auth_members`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgAuthMembers {
@@ -2069,6 +2157,20 @@ impl PgAuthMembers {
         Some(&PG_AUTH_MEMBERS[position])
     }
 }
+
+impl CatalogRow for PgAuthMembers {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.roleid), value(self.member), value(self.grantor), value(self.admin_option), value(self.inherit_option), value(self.set_option)]);
+    }
+}
+
+/// `pg_auth_members` as a seeded table, with the rows of [`PG_AUTH_MEMBERS`].
+pub const PG_AUTH_MEMBERS_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_auth_members",
+    create_sql: PgAuthMembers::CREATE_SQL,
+    index_sql: PgAuthMembers::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_AUTH_MEMBERS, Some(|row| row.oid), 0x3c3bd911),
+};
 
 /// A row of `pg_authid`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2121,6 +2223,20 @@ impl PgAuthid {
         Some(&PG_AUTHID[position])
     }
 }
+
+impl CatalogRow for PgAuthid {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.rolname), value(self.rolsuper), value(self.rolinherit), value(self.rolcreaterole), value(self.rolcreatedb), value(self.rolcanlogin), value(self.rolreplication), value(self.rolbypassrls), value(self.rolconnlimit), value(self.rolpassword), value(self.rolvaliduntil)]);
+    }
+}
+
+/// `pg_authid` as a seeded table, with the rows of [`PG_AUTHID`].
+pub const PG_AUTHID_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_authid",
+    create_sql: PgAuthid::CREATE_SQL,
+    index_sql: PgAuthid::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_AUTHID, Some(|row| row.oid), 0x6ae4e522),
+};
 
 /// A row of `pg_cast`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2386,6 +2502,20 @@ impl PgCast {
     }
 }
 
+impl CatalogRow for PgCast {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.castsource), value(self.casttarget), value(self.castfunc), value(self.castcontext), value(self.castmethod)]);
+    }
+}
+
+/// `pg_cast` as a seeded table, with the rows of [`PG_CAST`].
+pub const PG_CAST_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_cast",
+    create_sql: PgCast::CREATE_SQL,
+    index_sql: PgCast::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_CAST, Some(|row| row.oid), 0x1b33f10c),
+};
+
 /// A row of `pg_class`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgClass {
@@ -2444,6 +2574,20 @@ impl PgClass {
     }
 }
 
+impl CatalogRow for PgClass {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.relname), value(self.relnamespace), value(self.reltype), value(self.reloftype), value(self.relowner), value(self.relam), value(self.relfilenode), value(self.reltablespace), value(self.relpages), value(self.reltuples), value(self.relallvisible), value(self.relallfrozen), value(self.reltoastrelid), value(self.relhasindex), value(self.relisshared), value(self.relpersistence), value(self.relkind), value(self.relnatts), value(self.relchecks), value(self.relhasrules), value(self.relhastriggers), value(self.relhassubclass), value(self.relrowsecurity), value(self.relforcerowsecurity), value(self.relispopulated), value(self.relreplident), value(self.relispartition), value(self.relrewrite), value(self.relfrozenxid), value(self.relminmxid), value(self.relacl.map(Array)), value(self.reloptions.map(Array)), value(self.relpartbound)]);
+    }
+}
+
+/// `pg_class` as a seeded table, with the rows of [`PG_CLASS`].
+pub const PG_CLASS_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_class",
+    create_sql: PgClass::CREATE_SQL,
+    index_sql: PgClass::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_CLASS, Some(|row| row.oid), 0x048eed69),
+};
+
 /// A row of `pg_collation`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgCollation {
@@ -2485,6 +2629,20 @@ impl PgCollation {
         Some(&PG_COLLATION[position])
     }
 }
+
+impl CatalogRow for PgCollation {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.collname), value(self.collnamespace), value(self.collowner), value(self.collprovider), value(self.collisdeterministic), value(self.collencoding), value(self.collcollate), value(self.collctype), value(self.colllocale), value(self.collicurules), value(self.collversion)]);
+    }
+}
+
+/// `pg_collation` as a seeded table, with the rows of [`PG_COLLATION`].
+pub const PG_COLLATION_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_collation",
+    create_sql: PgCollation::CREATE_SQL,
+    index_sql: PgCollation::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_COLLATION, Some(|row| row.oid), 0x2f8dadd8),
+};
 
 /// A row of `pg_constraint`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2539,6 +2697,20 @@ impl PgConstraint {
         Some(&PG_CONSTRAINT[position])
     }
 }
+
+impl CatalogRow for PgConstraint {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.conname), value(self.connamespace), value(self.contype), value(self.condeferrable), value(self.condeferred), value(self.conenforced), value(self.convalidated), value(self.conrelid), value(self.contypid), value(self.conindid), value(self.conparentid), value(self.confrelid), value(self.confupdtype), value(self.confdeltype), value(self.confmatchtype), value(self.conislocal), value(self.coninhcount), value(self.connoinherit), value(self.conperiod), value(self.conkey.map(Array)), value(self.confkey.map(Array)), value(self.conpfeqop.map(Array)), value(self.conppeqop.map(Array)), value(self.conffeqop.map(Array)), value(self.confdelsetcols.map(Array)), value(self.conexclop.map(Array)), value(self.conbin)]);
+    }
+}
+
+/// `pg_constraint` as a seeded table, with the rows of [`PG_CONSTRAINT`].
+pub const PG_CONSTRAINT_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_constraint",
+    create_sql: PgConstraint::CREATE_SQL,
+    index_sql: PgConstraint::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_CONSTRAINT, Some(|row| row.oid), 0xea2835ed),
+};
 
 /// A row of `pg_conversion`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2700,6 +2872,20 @@ impl PgConversion {
     }
 }
 
+impl CatalogRow for PgConversion {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.conname), value(self.connamespace), value(self.conowner), value(self.conforencoding), value(self.contoencoding), value(self.conproc), value(self.condefault)]);
+    }
+}
+
+/// `pg_conversion` as a seeded table, with the rows of [`PG_CONVERSION`].
+pub const PG_CONVERSION_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_conversion",
+    create_sql: PgConversion::CREATE_SQL,
+    index_sql: PgConversion::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_CONVERSION, Some(|row| row.oid), 0xe2dc1681),
+};
+
 /// A row of `pg_database`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgDatabase {
@@ -2741,6 +2927,20 @@ impl PgDatabase {
     }
 }
 
+impl CatalogRow for PgDatabase {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.datname), value(self.datdba), value(self.encoding), value(self.datlocprovider), value(self.datistemplate), value(self.datallowconn), value(self.dathasloginevt), value(self.datconnlimit), value(self.datfrozenxid), value(self.datminmxid), value(self.dattablespace), value(self.datcollate), value(self.datctype), value(self.datlocale), value(self.daticurules), value(self.datcollversion), value(self.datacl.map(Array))]);
+    }
+}
+
+/// `pg_database` as a seeded table, with the rows of [`PG_DATABASE`].
+pub const PG_DATABASE_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_database",
+    create_sql: PgDatabase::CREATE_SQL,
+    index_sql: PgDatabase::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_DATABASE, Some(|row| row.oid), 0x43bea119),
+};
+
 /// A row of `pg_db_role_setting`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgDbRoleSetting {
@@ -2761,6 +2961,20 @@ impl PgDbRoleSetting {
         "CREATE UNIQUE INDEX pg_db_role_setting_databaseid_rol_index ON pg_db_role_setting(setdatabase, setrole)",
     ];
 }
+
+impl CatalogRow for PgDbRoleSetting {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.setdatabase), value(self.setrole), value(self.setconfig.map(Array))]);
+    }
+}
+
+/// `pg_db_role_setting` as a seeded table, with the rows of [`PG_DB_ROLE_SETTING`].
+pub const PG_DB_ROLE_SETTING_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_db_role_setting",
+    create_sql: PgDbRoleSetting::CREATE_SQL,
+    index_sql: PgDbRoleSetting::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_DB_ROLE_SETTING, None, 0x85f1b7f2),
+};
 
 /// A row of `pg_default_acl`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2790,6 +3004,20 @@ impl PgDefaultAcl {
     }
 }
 
+impl CatalogRow for PgDefaultAcl {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.defaclrole), value(self.defaclnamespace), value(self.defaclobjtype), value(Array(self.defaclacl))]);
+    }
+}
+
+/// `pg_default_acl` as a seeded table, with the rows of [`PG_DEFAULT_ACL`].
+pub const PG_DEFAULT_ACL_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_default_acl",
+    create_sql: PgDefaultAcl::CREATE_SQL,
+    index_sql: PgDefaultAcl::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_DEFAULT_ACL, Some(|row| row.oid), 0x4119d77d),
+};
+
 /// A row of `pg_depend`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgDepend {
@@ -2815,6 +3043,20 @@ impl PgDepend {
         "CREATE INDEX pg_depend_reference_index ON pg_depend(refclassid, refobjid, refobjsubid)",
     ];
 }
+
+impl CatalogRow for PgDepend {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.classid), value(self.objid), value(self.objsubid), value(self.refclassid), value(self.refobjid), value(self.refobjsubid), value(self.deptype)]);
+    }
+}
+
+/// `pg_depend` as a seeded table, with the rows of [`PG_DEPEND`].
+pub const PG_DEPEND_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_depend",
+    create_sql: PgDepend::CREATE_SQL,
+    index_sql: PgDepend::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_DEPEND, None, 0x0301618e),
+};
 
 /// A row of `pg_description`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6513,6 +6755,20 @@ impl PgDescription {
     ];
 }
 
+impl CatalogRow for PgDescription {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.objoid), value(self.classoid), value(self.objsubid), value(self.description)]);
+    }
+}
+
+/// `pg_description` as a seeded table, with the rows of [`PG_DESCRIPTION`].
+pub const PG_DESCRIPTION_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_description",
+    create_sql: PgDescription::CREATE_SQL,
+    index_sql: PgDescription::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_DESCRIPTION, None, 0x969430ad),
+};
+
 /// A row of `pg_enum`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgEnum {
@@ -6540,6 +6796,20 @@ impl PgEnum {
         Some(&PG_ENUM[position])
     }
 }
+
+impl CatalogRow for PgEnum {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.enumtypid), value(self.enumsortorder), value(self.enumlabel)]);
+    }
+}
+
+/// `pg_enum` as a seeded table, with the rows of [`PG_ENUM`].
+pub const PG_ENUM_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_enum",
+    create_sql: PgEnum::CREATE_SQL,
+    index_sql: PgEnum::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_ENUM, Some(|row| row.oid), 0x874f3bfe),
+};
 
 /// A row of `pg_event_trigger`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6571,6 +6841,20 @@ impl PgEventTrigger {
     }
 }
 
+impl CatalogRow for PgEventTrigger {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.evtname), value(self.evtevent), value(self.evtowner), value(self.evtfoid), value(self.evtenabled), value(self.evttags.map(Array))]);
+    }
+}
+
+/// `pg_event_trigger` as a seeded table, with the rows of [`PG_EVENT_TRIGGER`].
+pub const PG_EVENT_TRIGGER_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_event_trigger",
+    create_sql: PgEventTrigger::CREATE_SQL,
+    index_sql: PgEventTrigger::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_EVENT_TRIGGER, Some(|row| row.oid), 0xbcc20d47),
+};
+
 /// A row of `pg_extension`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgExtension {
@@ -6601,6 +6885,20 @@ impl PgExtension {
         Some(&PG_EXTENSION[position])
     }
 }
+
+impl CatalogRow for PgExtension {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.extname), value(self.extowner), value(self.extnamespace), value(self.extrelocatable), value(self.extversion), value(self.extconfig.map(Array)), value(self.extcondition.map(Array))]);
+    }
+}
+
+/// `pg_extension` as a seeded table, with the rows of [`PG_EXTENSION`].
+pub const PG_EXTENSION_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_extension",
+    create_sql: PgExtension::CREATE_SQL,
+    index_sql: PgExtension::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_EXTENSION, Some(|row| row.oid), 0x78337abd),
+};
 
 /// A row of `pg_foreign_data_wrapper`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6634,6 +6932,20 @@ impl PgForeignDataWrapper {
     }
 }
 
+impl CatalogRow for PgForeignDataWrapper {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.fdwname), value(self.fdwowner), value(self.fdwhandler), value(self.fdwvalidator), value(self.fdwacl.map(Array)), value(self.fdwoptions.map(Array))]);
+    }
+}
+
+/// `pg_foreign_data_wrapper` as a seeded table, with the rows of [`PG_FOREIGN_DATA_WRAPPER`].
+pub const PG_FOREIGN_DATA_WRAPPER_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_foreign_data_wrapper",
+    create_sql: PgForeignDataWrapper::CREATE_SQL,
+    index_sql: PgForeignDataWrapper::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_FOREIGN_DATA_WRAPPER, Some(|row| row.oid), 0x2f63b1db),
+};
+
 /// A row of `pg_foreign_server`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgForeignServer {
@@ -6665,6 +6977,20 @@ impl PgForeignServer {
     }
 }
 
+impl CatalogRow for PgForeignServer {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.srvname), value(self.srvowner), value(self.srvfdw), value(self.srvtype), value(self.srvversion), value(self.srvacl.map(Array)), value(self.srvoptions.map(Array))]);
+    }
+}
+
+/// `pg_foreign_server` as a seeded table, with the rows of [`PG_FOREIGN_SERVER`].
+pub const PG_FOREIGN_SERVER_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_foreign_server",
+    create_sql: PgForeignServer::CREATE_SQL,
+    index_sql: PgForeignServer::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_FOREIGN_SERVER, Some(|row| row.oid), 0x22825d0a),
+};
+
 /// A row of `pg_foreign_table`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgForeignTable {
@@ -6692,6 +7018,20 @@ impl PgForeignTable {
         Some(&PG_FOREIGN_TABLE[position])
     }
 }
+
+impl CatalogRow for PgForeignTable {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.ftrelid), value(self.ftserver), value(self.ftoptions.map(Array))]);
+    }
+}
+
+/// `pg_foreign_table` as a seeded table, with the rows of [`PG_FOREIGN_TABLE`].
+pub const PG_FOREIGN_TABLE_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_foreign_table",
+    create_sql: PgForeignTable::CREATE_SQL,
+    index_sql: PgForeignTable::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_FOREIGN_TABLE, None, 0x209e63da),
+};
 
 /// A row of `pg_index`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6740,6 +7080,20 @@ impl PgIndex {
     }
 }
 
+impl CatalogRow for PgIndex {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.indexrelid), value(self.indrelid), value(self.indnatts), value(self.indnkeyatts), value(self.indisunique), value(self.indnullsnotdistinct), value(self.indisprimary), value(self.indisexclusion), value(self.indimmediate), value(self.indisclustered), value(self.indisvalid), value(self.indcheckxmin), value(self.indisready), value(self.indislive), value(self.indisreplident), value(Vector(self.indkey)), value(Vector(self.indcollation)), value(Vector(self.indclass)), value(Vector(self.indoption)), value(self.indexprs), value(self.indpred)]);
+    }
+}
+
+/// `pg_index` as a seeded table, with the rows of [`PG_INDEX`].
+pub const PG_INDEX_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_index",
+    create_sql: PgIndex::CREATE_SQL,
+    index_sql: PgIndex::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_INDEX, None, 0x60dd3f80),
+};
+
 /// A row of `pg_inherits`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgInherits {
@@ -6763,6 +7117,20 @@ impl PgInherits {
     ];
 }
 
+impl CatalogRow for PgInherits {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.inhrelid), value(self.inhparent), value(self.inhseqno), value(self.inhdetachpending)]);
+    }
+}
+
+/// `pg_inherits` as a seeded table, with the rows of [`PG_INHERITS`].
+pub const PG_INHERITS_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_inherits",
+    create_sql: PgInherits::CREATE_SQL,
+    index_sql: PgInherits::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_INHERITS, None, 0xf2c1ba77),
+};
+
 /// A row of `pg_init_privs`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgInitPrivs {
@@ -6785,6 +7153,20 @@ impl PgInitPrivs {
         "CREATE UNIQUE INDEX pg_init_privs_o_c_o_index ON pg_init_privs(objoid, classoid, objsubid)",
     ];
 }
+
+impl CatalogRow for PgInitPrivs {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.objoid), value(self.classoid), value(self.objsubid), value(self.privtype), value(Array(self.initprivs))]);
+    }
+}
+
+/// `pg_init_privs` as a seeded table, with the rows of [`PG_INIT_PRIVS`].
+pub const PG_INIT_PRIVS_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_init_privs",
+    create_sql: PgInitPrivs::CREATE_SQL,
+    index_sql: PgInitPrivs::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_INIT_PRIVS, None, 0x8f9d6394),
+};
 
 /// A row of `pg_language`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6821,6 +7203,20 @@ impl PgLanguage {
     }
 }
 
+impl CatalogRow for PgLanguage {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.lanname), value(self.lanowner), value(self.lanispl), value(self.lanpltrusted), value(self.lanplcallfoid), value(self.laninline), value(self.lanvalidator), value(self.lanacl.map(Array))]);
+    }
+}
+
+/// `pg_language` as a seeded table, with the rows of [`PG_LANGUAGE`].
+pub const PG_LANGUAGE_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_language",
+    create_sql: PgLanguage::CREATE_SQL,
+    index_sql: PgLanguage::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_LANGUAGE, Some(|row| row.oid), 0xca150d37),
+};
+
 /// A row of `pg_largeobject`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgLargeobject {
@@ -6841,6 +7237,20 @@ impl PgLargeobject {
         "CREATE UNIQUE INDEX pg_largeobject_loid_pn_index ON pg_largeobject(loid, pageno)",
     ];
 }
+
+impl CatalogRow for PgLargeobject {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.loid), value(self.pageno), value(self.data)]);
+    }
+}
+
+/// `pg_largeobject` as a seeded table, with the rows of [`PG_LARGEOBJECT`].
+pub const PG_LARGEOBJECT_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_largeobject",
+    create_sql: PgLargeobject::CREATE_SQL,
+    index_sql: PgLargeobject::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_LARGEOBJECT, None, 0xf8a2859d),
+};
 
 /// A row of `pg_largeobject_metadata`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6867,6 +7277,20 @@ impl PgLargeobjectMetadata {
         Some(&PG_LARGEOBJECT_METADATA[position])
     }
 }
+
+impl CatalogRow for PgLargeobjectMetadata {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.lomowner), value(self.lomacl.map(Array))]);
+    }
+}
+
+/// `pg_largeobject_metadata` as a seeded table, with the rows of [`PG_LARGEOBJECT_METADATA`].
+pub const PG_LARGEOBJECT_METADATA_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_largeobject_metadata",
+    create_sql: PgLargeobjectMetadata::CREATE_SQL,
+    index_sql: PgLargeobjectMetadata::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_LARGEOBJECT_METADATA, Some(|row| row.oid), 0x16af5813),
+};
 
 /// A row of `pg_namespace`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6897,6 +7321,20 @@ impl PgNamespace {
         Some(&PG_NAMESPACE[position])
     }
 }
+
+impl CatalogRow for PgNamespace {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.nspname), value(self.nspowner), value(self.nspacl.map(Array))]);
+    }
+}
+
+/// `pg_namespace` as a seeded table, with the rows of [`PG_NAMESPACE`].
+pub const PG_NAMESPACE_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_namespace",
+    create_sql: PgNamespace::CREATE_SQL,
+    index_sql: PgNamespace::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_NAMESPACE, Some(|row| row.oid), 0x4163f0f7),
+};
 
 /// A row of `pg_opclass`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -7106,6 +7544,20 @@ impl PgOpclass {
         Some(&PG_OPCLASS[position])
     }
 }
+
+impl CatalogRow for PgOpclass {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.opcmethod), value(self.opcname), value(self.opcnamespace), value(self.opcowner), value(self.opcfamily), value(self.opcintype), value(self.opcdefault), value(self.opckeytype)]);
+    }
+}
+
+/// `pg_opclass` as a seeded table, with the rows of [`PG_OPCLASS`].
+pub const PG_OPCLASS_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_opclass",
+    create_sql: PgOpclass::CREATE_SQL,
+    index_sql: PgOpclass::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_OPCLASS, Some(|row| row.oid), 0xa2b590bf),
+};
 
 /// A row of `pg_operator`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -7944,6 +8396,20 @@ impl PgOperator {
     }
 }
 
+impl CatalogRow for PgOperator {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.oprname), value(self.oprnamespace), value(self.oprowner), value(self.oprkind), value(self.oprcanmerge), value(self.oprcanhash), value(self.oprleft), value(self.oprright), value(self.oprresult), value(self.oprcom), value(self.oprnegate), value(self.oprcode), value(self.oprrest), value(self.oprjoin)]);
+    }
+}
+
+/// `pg_operator` as a seeded table, with the rows of [`PG_OPERATOR`].
+pub const PG_OPERATOR_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_operator",
+    create_sql: PgOperator::CREATE_SQL,
+    index_sql: PgOperator::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_OPERATOR, Some(|row| row.oid), 0x50244ec3),
+};
+
 /// A row of `pg_opfamily`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgOpfamily {
@@ -8118,6 +8584,20 @@ impl PgOpfamily {
     }
 }
 
+impl CatalogRow for PgOpfamily {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.opfmethod), value(self.opfname), value(self.opfnamespace), value(self.opfowner)]);
+    }
+}
+
+/// `pg_opfamily` as a seeded table, with the rows of [`PG_OPFAMILY`].
+pub const PG_OPFAMILY_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_opfamily",
+    create_sql: PgOpfamily::CREATE_SQL,
+    index_sql: PgOpfamily::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_OPFAMILY, Some(|row| row.oid), 0xd5041022),
+};
+
 /// A row of `pg_parameter_acl`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgParameterAcl {
@@ -8143,6 +8623,20 @@ impl PgParameterAcl {
         Some(&PG_PARAMETER_ACL[position])
     }
 }
+
+impl CatalogRow for PgParameterAcl {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.parname), value(self.paracl.map(Array))]);
+    }
+}
+
+/// `pg_parameter_acl` as a seeded table, with the rows of [`PG_PARAMETER_ACL`].
+pub const PG_PARAMETER_ACL_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_parameter_acl",
+    create_sql: PgParameterAcl::CREATE_SQL,
+    index_sql: PgParameterAcl::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_PARAMETER_ACL, Some(|row| row.oid), 0x2b293729),
+};
 
 /// A row of `pg_partitioned_table`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -8177,6 +8671,20 @@ impl PgPartitionedTable {
     }
 }
 
+impl CatalogRow for PgPartitionedTable {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.partrelid), value(self.partstrat), value(self.partnatts), value(self.partdefid), value(Vector(self.partattrs)), value(Vector(self.partclass)), value(Vector(self.partcollation)), value(self.partexprs)]);
+    }
+}
+
+/// `pg_partitioned_table` as a seeded table, with the rows of [`PG_PARTITIONED_TABLE`].
+pub const PG_PARTITIONED_TABLE_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_partitioned_table",
+    create_sql: PgPartitionedTable::CREATE_SQL,
+    index_sql: PgPartitionedTable::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_PARTITIONED_TABLE, None, 0xffebc6b1),
+};
+
 /// A row of `pg_policy`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgPolicy {
@@ -8207,6 +8715,20 @@ impl PgPolicy {
         Some(&PG_POLICY[position])
     }
 }
+
+impl CatalogRow for PgPolicy {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.polname), value(self.polrelid), value(self.polcmd), value(self.polpermissive), value(Array(self.polroles)), value(self.polqual), value(self.polwithcheck)]);
+    }
+}
+
+/// `pg_policy` as a seeded table, with the rows of [`PG_POLICY`].
+pub const PG_POLICY_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_policy",
+    create_sql: PgPolicy::CREATE_SQL,
+    index_sql: PgPolicy::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_POLICY, Some(|row| row.oid), 0xc1a4aa75),
+};
 
 /// A row of `pg_proc`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -11658,6 +12180,20 @@ impl PgProc {
     }
 }
 
+impl CatalogRow for PgProc {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.proname), value(self.pronamespace), value(self.proowner), value(self.prolang), value(self.procost), value(self.prorows), value(self.provariadic), value(self.prosupport), value(self.prokind), value(self.prosecdef), value(self.proleakproof), value(self.proisstrict), value(self.proretset), value(self.provolatile), value(self.proparallel), value(self.pronargs), value(self.pronargdefaults), value(self.prorettype), value(Vector(self.proargtypes)), value(self.proallargtypes.map(Array)), value(self.proargmodes.map(Array)), value(self.proargnames.map(Array)), value(self.proargdefaults), value(self.protrftypes.map(Array)), value(self.prosrc), value(self.probin), value(self.prosqlbody), value(self.proconfig.map(Array)), value(self.proacl.map(Array))]);
+    }
+}
+
+/// `pg_proc` as a seeded table, with the rows of [`PG_PROC`].
+pub const PG_PROC_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_proc",
+    create_sql: PgProc::CREATE_SQL,
+    index_sql: PgProc::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_PROC, Some(|row| row.oid), 0x133e6212),
+};
+
 /// A row of `pg_publication`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgPublication {
@@ -11691,6 +12227,20 @@ impl PgPublication {
     }
 }
 
+impl CatalogRow for PgPublication {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.pubname), value(self.pubowner), value(self.puballtables), value(self.pubinsert), value(self.pubupdate), value(self.pubdelete), value(self.pubtruncate), value(self.pubviaroot), value(self.pubgencols)]);
+    }
+}
+
+/// `pg_publication` as a seeded table, with the rows of [`PG_PUBLICATION`].
+pub const PG_PUBLICATION_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_publication",
+    create_sql: PgPublication::CREATE_SQL,
+    index_sql: PgPublication::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_PUBLICATION, Some(|row| row.oid), 0x922071bf),
+};
+
 /// A row of `pg_publication_namespace`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgPublicationNamespace {
@@ -11718,6 +12268,20 @@ impl PgPublicationNamespace {
         Some(&PG_PUBLICATION_NAMESPACE[position])
     }
 }
+
+impl CatalogRow for PgPublicationNamespace {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.pnpubid), value(self.pnnspid)]);
+    }
+}
+
+/// `pg_publication_namespace` as a seeded table, with the rows of [`PG_PUBLICATION_NAMESPACE`].
+pub const PG_PUBLICATION_NAMESPACE_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_publication_namespace",
+    create_sql: PgPublicationNamespace::CREATE_SQL,
+    index_sql: PgPublicationNamespace::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_PUBLICATION_NAMESPACE, Some(|row| row.oid), 0xb31bc6cf),
+};
 
 /// A row of `pg_publication_rel`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -11749,6 +12313,20 @@ impl PgPublicationRel {
         Some(&PG_PUBLICATION_REL[position])
     }
 }
+
+impl CatalogRow for PgPublicationRel {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.prpubid), value(self.prrelid), value(self.prqual), value(self.prattrs.map(Vector))]);
+    }
+}
+
+/// `pg_publication_rel` as a seeded table, with the rows of [`PG_PUBLICATION_REL`].
+pub const PG_PUBLICATION_REL_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_publication_rel",
+    create_sql: PgPublicationRel::CREATE_SQL,
+    index_sql: PgPublicationRel::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_PUBLICATION_REL, Some(|row| row.oid), 0x0271c476),
+};
 
 /// A row of `pg_range`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -11789,6 +12367,20 @@ impl PgRange {
     }
 }
 
+impl CatalogRow for PgRange {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.rngtypid), value(self.rngsubtype), value(self.rngmultitypid), value(self.rngcollation), value(self.rngsubopc), value(self.rngcanonical), value(self.rngsubdiff)]);
+    }
+}
+
+/// `pg_range` as a seeded table, with the rows of [`PG_RANGE`].
+pub const PG_RANGE_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_range",
+    create_sql: PgRange::CREATE_SQL,
+    index_sql: PgRange::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_RANGE, None, 0x074138da),
+};
+
 /// A row of `pg_replication_origin`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgReplicationOrigin {
@@ -11816,6 +12408,20 @@ impl PgReplicationOrigin {
         Some(&PG_REPLICATION_ORIGIN[position])
     }
 }
+
+impl CatalogRow for PgReplicationOrigin {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.roident), value(self.roname)]);
+    }
+}
+
+/// `pg_replication_origin` as a seeded table, with the rows of [`PG_REPLICATION_ORIGIN`].
+pub const PG_REPLICATION_ORIGIN_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_replication_origin",
+    create_sql: PgReplicationOrigin::CREATE_SQL,
+    index_sql: PgReplicationOrigin::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_REPLICATION_ORIGIN, None, 0x9b3a0812),
+};
 
 /// A row of `pg_rewrite`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -11848,6 +12454,20 @@ impl PgRewrite {
     }
 }
 
+impl CatalogRow for PgRewrite {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.rulename), value(self.ev_class), value(self.ev_type), value(self.ev_enabled), value(self.is_instead), value(self.ev_qual), value(self.ev_action)]);
+    }
+}
+
+/// `pg_rewrite` as a seeded table, with the rows of [`PG_REWRITE`].
+pub const PG_REWRITE_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_rewrite",
+    create_sql: PgRewrite::CREATE_SQL,
+    index_sql: PgRewrite::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_REWRITE, Some(|row| row.oid), 0x6a9349c7),
+};
+
 /// A row of `pg_seclabel`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgSeclabel {
@@ -11870,6 +12490,20 @@ impl PgSeclabel {
         "CREATE UNIQUE INDEX pg_seclabel_object_index ON pg_seclabel(objoid, classoid, objsubid, provider)",
     ];
 }
+
+impl CatalogRow for PgSeclabel {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.objoid), value(self.classoid), value(self.objsubid), value(self.provider), value(self.label)]);
+    }
+}
+
+/// `pg_seclabel` as a seeded table, with the rows of [`PG_SECLABEL`].
+pub const PG_SECLABEL_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_seclabel",
+    create_sql: PgSeclabel::CREATE_SQL,
+    index_sql: PgSeclabel::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_SECLABEL, None, 0x8e3dfa13),
+};
 
 /// A row of `pg_sequence`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -11904,6 +12538,20 @@ impl PgSequence {
     }
 }
 
+impl CatalogRow for PgSequence {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.seqrelid), value(self.seqtypid), value(self.seqstart), value(self.seqincrement), value(self.seqmax), value(self.seqmin), value(self.seqcache), value(self.seqcycle)]);
+    }
+}
+
+/// `pg_sequence` as a seeded table, with the rows of [`PG_SEQUENCE`].
+pub const PG_SEQUENCE_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_sequence",
+    create_sql: PgSequence::CREATE_SQL,
+    index_sql: PgSequence::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_SEQUENCE, None, 0x6a2a4d2f),
+};
+
 /// A row of `pg_shdepend`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgShdepend {
@@ -11930,6 +12578,20 @@ impl PgShdepend {
     ];
 }
 
+impl CatalogRow for PgShdepend {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.dbid), value(self.classid), value(self.objid), value(self.objsubid), value(self.refclassid), value(self.refobjid), value(self.deptype)]);
+    }
+}
+
+/// `pg_shdepend` as a seeded table, with the rows of [`PG_SHDEPEND`].
+pub const PG_SHDEPEND_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_shdepend",
+    create_sql: PgShdepend::CREATE_SQL,
+    index_sql: PgShdepend::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_SHDEPEND, None, 0xd5d04f0d),
+};
+
 /// A row of `pg_shdescription`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgShdescription {
@@ -11952,6 +12614,20 @@ impl PgShdescription {
     ];
 }
 
+impl CatalogRow for PgShdescription {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.objoid), value(self.classoid), value(self.description)]);
+    }
+}
+
+/// `pg_shdescription` as a seeded table, with the rows of [`PG_SHDESCRIPTION`].
+pub const PG_SHDESCRIPTION_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_shdescription",
+    create_sql: PgShdescription::CREATE_SQL,
+    index_sql: PgShdescription::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_SHDESCRIPTION, None, 0xaf161a3d),
+};
+
 /// A row of `pg_shseclabel`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgShseclabel {
@@ -11973,6 +12649,20 @@ impl PgShseclabel {
         "CREATE UNIQUE INDEX pg_shseclabel_object_index ON pg_shseclabel(objoid, classoid, provider)",
     ];
 }
+
+impl CatalogRow for PgShseclabel {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.objoid), value(self.classoid), value(self.provider), value(self.label)]);
+    }
+}
+
+/// `pg_shseclabel` as a seeded table, with the rows of [`PG_SHSECLABEL`].
+pub const PG_SHSECLABEL_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_shseclabel",
+    create_sql: PgShseclabel::CREATE_SQL,
+    index_sql: PgShseclabel::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_SHSECLABEL, None, 0xb0f43fb6),
+};
 
 /// A row of `pg_statistic`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -12023,6 +12713,20 @@ impl PgStatistic {
     ];
 }
 
+impl CatalogRow for PgStatistic {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.starelid), value(self.staattnum), value(self.stainherit), value(self.stanullfrac), value(self.stawidth), value(self.stadistinct), value(self.stakind1), value(self.stakind2), value(self.stakind3), value(self.stakind4), value(self.stakind5), value(self.staop1), value(self.staop2), value(self.staop3), value(self.staop4), value(self.staop5), value(self.stacoll1), value(self.stacoll2), value(self.stacoll3), value(self.stacoll4), value(self.stacoll5), value(self.stanumbers1.map(Array)), value(self.stanumbers2.map(Array)), value(self.stanumbers3.map(Array)), value(self.stanumbers4.map(Array)), value(self.stanumbers5.map(Array)), value(self.stavalues1), value(self.stavalues2), value(self.stavalues3), value(self.stavalues4), value(self.stavalues5)]);
+    }
+}
+
+/// `pg_statistic` as a seeded table, with the rows of [`PG_STATISTIC`].
+pub const PG_STATISTIC_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_statistic",
+    create_sql: PgStatistic::CREATE_SQL,
+    index_sql: PgStatistic::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_STATISTIC, None, 0xbcc8d066),
+};
+
 /// A row of `pg_statistic_ext`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgStatisticExt {
@@ -12056,6 +12760,20 @@ impl PgStatisticExt {
     }
 }
 
+impl CatalogRow for PgStatisticExt {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.stxrelid), value(self.stxname), value(self.stxnamespace), value(self.stxowner), value(Vector(self.stxkeys)), value(self.stxstattarget), value(Array(self.stxkind)), value(self.stxexprs)]);
+    }
+}
+
+/// `pg_statistic_ext` as a seeded table, with the rows of [`PG_STATISTIC_EXT`].
+pub const PG_STATISTIC_EXT_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_statistic_ext",
+    create_sql: PgStatisticExt::CREATE_SQL,
+    index_sql: PgStatisticExt::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_STATISTIC_EXT, Some(|row| row.oid), 0xfde2823c),
+};
+
 /// A row of `pg_statistic_ext_data`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgStatisticExtData {
@@ -12079,6 +12797,20 @@ impl PgStatisticExtData {
         "CREATE UNIQUE INDEX pg_statistic_ext_data_stxoid_inh_index ON pg_statistic_ext_data(stxoid, stxdinherit)",
     ];
 }
+
+impl CatalogRow for PgStatisticExtData {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.stxoid), value(self.stxdinherit), value(self.stxdndistinct), value(self.stxddependencies), value(self.stxdmcv), value(self.stxdexpr)]);
+    }
+}
+
+/// `pg_statistic_ext_data` as a seeded table, with the rows of [`PG_STATISTIC_EXT_DATA`].
+pub const PG_STATISTIC_EXT_DATA_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_statistic_ext_data",
+    create_sql: PgStatisticExtData::CREATE_SQL,
+    index_sql: PgStatisticExtData::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_STATISTIC_EXT_DATA, None, 0x63029ee1),
+};
 
 /// A row of `pg_subscription`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -12121,6 +12853,20 @@ impl PgSubscription {
     }
 }
 
+impl CatalogRow for PgSubscription {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.subdbid), value(self.subskiplsn), value(self.subname), value(self.subowner), value(self.subenabled), value(self.subbinary), value(self.substream), value(self.subtwophasestate), value(self.subdisableonerr), value(self.subpasswordrequired), value(self.subrunasowner), value(self.subfailover), value(self.subconninfo), value(self.subslotname), value(self.subsynccommit), value(Array(self.subpublications)), value(self.suborigin)]);
+    }
+}
+
+/// `pg_subscription` as a seeded table, with the rows of [`PG_SUBSCRIPTION`].
+pub const PG_SUBSCRIPTION_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_subscription",
+    create_sql: PgSubscription::CREATE_SQL,
+    index_sql: PgSubscription::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_SUBSCRIPTION, Some(|row| row.oid), 0xa99dc474),
+};
+
 /// A row of `pg_subscription_rel`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgSubscriptionRel {
@@ -12142,6 +12888,20 @@ impl PgSubscriptionRel {
         "CREATE UNIQUE INDEX pg_subscription_rel_srrelid_srsubid_index ON pg_subscription_rel(srrelid, srsubid)",
     ];
 }
+
+impl CatalogRow for PgSubscriptionRel {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.srsubid), value(self.srrelid), value(self.srsubstate), value(self.srsublsn)]);
+    }
+}
+
+/// `pg_subscription_rel` as a seeded table, with the rows of [`PG_SUBSCRIPTION_REL`].
+pub const PG_SUBSCRIPTION_REL_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_subscription_rel",
+    create_sql: PgSubscriptionRel::CREATE_SQL,
+    index_sql: PgSubscriptionRel::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_SUBSCRIPTION_REL, None, 0x853ed20e),
+};
 
 /// A row of `pg_tablespace`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -12173,6 +12933,20 @@ impl PgTablespace {
     }
 }
 
+impl CatalogRow for PgTablespace {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.spcname), value(self.spcowner), value(self.spcacl.map(Array)), value(self.spcoptions.map(Array))]);
+    }
+}
+
+/// `pg_tablespace` as a seeded table, with the rows of [`PG_TABLESPACE`].
+pub const PG_TABLESPACE_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_tablespace",
+    create_sql: PgTablespace::CREATE_SQL,
+    index_sql: PgTablespace::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_TABLESPACE, Some(|row| row.oid), 0x7b0fcca8),
+};
+
 /// A row of `pg_transform`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgTransform {
@@ -12200,6 +12974,20 @@ impl PgTransform {
         Some(&PG_TRANSFORM[position])
     }
 }
+
+impl CatalogRow for PgTransform {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.trftype), value(self.trflang), value(self.trffromsql), value(self.trftosql)]);
+    }
+}
+
+/// `pg_transform` as a seeded table, with the rows of [`PG_TRANSFORM`].
+pub const PG_TRANSFORM_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_transform",
+    create_sql: PgTransform::CREATE_SQL,
+    index_sql: PgTransform::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_TRANSFORM, Some(|row| row.oid), 0x019256fe),
+};
 
 /// A row of `pg_trigger`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -12244,6 +13032,20 @@ impl PgTrigger {
     }
 }
 
+impl CatalogRow for PgTrigger {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.tgrelid), value(self.tgparentid), value(self.tgname), value(self.tgfoid), value(self.tgtype), value(self.tgenabled), value(self.tgisinternal), value(self.tgconstrrelid), value(self.tgconstrindid), value(self.tgconstraint), value(self.tgdeferrable), value(self.tginitdeferred), value(self.tgnargs), value(Vector(self.tgattr)), value(self.tgargs), value(self.tgqual), value(self.tgoldtable), value(self.tgnewtable)]);
+    }
+}
+
+/// `pg_trigger` as a seeded table, with the rows of [`PG_TRIGGER`].
+pub const PG_TRIGGER_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_trigger",
+    create_sql: PgTrigger::CREATE_SQL,
+    index_sql: PgTrigger::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_TRIGGER, Some(|row| row.oid), 0xe6f15829),
+};
+
 /// A row of `pg_ts_config`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgTsConfig {
@@ -12272,6 +13074,20 @@ impl PgTsConfig {
         Some(&PG_TS_CONFIG[position])
     }
 }
+
+impl CatalogRow for PgTsConfig {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.cfgname), value(self.cfgnamespace), value(self.cfgowner), value(self.cfgparser)]);
+    }
+}
+
+/// `pg_ts_config` as a seeded table, with the rows of [`PG_TS_CONFIG`].
+pub const PG_TS_CONFIG_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_ts_config",
+    create_sql: PgTsConfig::CREATE_SQL,
+    index_sql: PgTsConfig::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_TS_CONFIG, Some(|row| row.oid), 0x54670829),
+};
 
 /// A row of `pg_ts_config_map`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -12314,6 +13130,20 @@ impl PgTsConfigMap {
     ];
 }
 
+impl CatalogRow for PgTsConfigMap {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.mapcfg), value(self.maptokentype), value(self.mapseqno), value(self.mapdict)]);
+    }
+}
+
+/// `pg_ts_config_map` as a seeded table, with the rows of [`PG_TS_CONFIG_MAP`].
+pub const PG_TS_CONFIG_MAP_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_ts_config_map",
+    create_sql: PgTsConfigMap::CREATE_SQL,
+    index_sql: PgTsConfigMap::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_TS_CONFIG_MAP, None, 0x07d6d456),
+};
+
 /// A row of `pg_ts_dict`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgTsDict {
@@ -12343,6 +13173,20 @@ impl PgTsDict {
         Some(&PG_TS_DICT[position])
     }
 }
+
+impl CatalogRow for PgTsDict {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.dictname), value(self.dictnamespace), value(self.dictowner), value(self.dicttemplate), value(self.dictinitoption)]);
+    }
+}
+
+/// `pg_ts_dict` as a seeded table, with the rows of [`PG_TS_DICT`].
+pub const PG_TS_DICT_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_ts_dict",
+    create_sql: PgTsDict::CREATE_SQL,
+    index_sql: PgTsDict::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_TS_DICT, Some(|row| row.oid), 0x2d2a484c),
+};
 
 /// A row of `pg_ts_parser`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -12376,6 +13220,20 @@ impl PgTsParser {
     }
 }
 
+impl CatalogRow for PgTsParser {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.prsname), value(self.prsnamespace), value(self.prsstart), value(self.prstoken), value(self.prsend), value(self.prsheadline), value(self.prslextype)]);
+    }
+}
+
+/// `pg_ts_parser` as a seeded table, with the rows of [`PG_TS_PARSER`].
+pub const PG_TS_PARSER_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_ts_parser",
+    create_sql: PgTsParser::CREATE_SQL,
+    index_sql: PgTsParser::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_TS_PARSER, Some(|row| row.oid), 0xb20b248d),
+};
+
 /// A row of `pg_ts_template`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgTsTemplate {
@@ -12407,6 +13265,20 @@ impl PgTsTemplate {
         Some(&PG_TS_TEMPLATE[position])
     }
 }
+
+impl CatalogRow for PgTsTemplate {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.tmplname), value(self.tmplnamespace), value(self.tmplinit), value(self.tmpllexize)]);
+    }
+}
+
+/// `pg_ts_template` as a seeded table, with the rows of [`PG_TS_TEMPLATE`].
+pub const PG_TS_TEMPLATE_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_ts_template",
+    create_sql: PgTsTemplate::CREATE_SQL,
+    index_sql: PgTsTemplate::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_TS_TEMPLATE, Some(|row| row.oid), 0x6d4a9c4e),
+};
 
 /// A row of `pg_type`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -12656,6 +13528,20 @@ impl PgType {
     }
 }
 
+impl CatalogRow for PgType {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.typname), value(self.typnamespace), value(self.typowner), value(self.typlen), value(self.typbyval), value(self.typtype), value(self.typcategory), value(self.typispreferred), value(self.typisdefined), value(self.typdelim), value(self.typrelid), value(self.typsubscript), value(self.typelem), value(self.typarray), value(self.typinput), value(self.typoutput), value(self.typreceive), value(self.typsend), value(self.typmodin), value(self.typmodout), value(self.typanalyze), value(self.typalign), value(self.typstorage), value(self.typnotnull), value(self.typbasetype), value(self.typtypmod), value(self.typndims), value(self.typcollation), value(self.typdefaultbin), value(self.typdefault), value(self.typacl.map(Array))]);
+    }
+}
+
+/// `pg_type` as a seeded table, with the rows of [`PG_TYPE`].
+pub const PG_TYPE_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_type",
+    create_sql: PgType::CREATE_SQL,
+    index_sql: PgType::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_TYPE, Some(|row| row.oid), 0x842b21b8),
+};
+
 /// A row of `pg_user_mapping`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PgUserMapping {
@@ -12682,3 +13568,85 @@ impl PgUserMapping {
         Some(&PG_USER_MAPPING[position])
     }
 }
+
+impl CatalogRow for PgUserMapping {
+    fn write_values(&self, out: &mut Vec<Value>) {
+        out.extend([value(self.oid), value(self.umuser), value(self.umserver), value(self.umoptions.map(Array))]);
+    }
+}
+
+/// `pg_user_mapping` as a seeded table, with the rows of [`PG_USER_MAPPING`].
+pub const PG_USER_MAPPING_SEEDED_TABLE: SeededTable = SeededTable {
+    name: "pg_user_mapping",
+    create_sql: PgUserMapping::CREATE_SQL,
+    index_sql: PgUserMapping::INDEX_SQL,
+    seed: &CatalogSeed::new(&PG_USER_MAPPING, Some(|row| row.oid), 0xd2708538),
+};
+
+/// Each catalog as a seeded table, in the order of `postgres.bki`.
+pub static SEEDED_TABLES: [SeededTable; 64] = [
+    PG_AGGREGATE_SEEDED_TABLE,
+    PG_AM_SEEDED_TABLE,
+    PG_AMOP_SEEDED_TABLE,
+    PG_AMPROC_SEEDED_TABLE,
+    PG_ATTRDEF_SEEDED_TABLE,
+    PG_ATTRIBUTE_SEEDED_TABLE,
+    PG_AUTH_MEMBERS_SEEDED_TABLE,
+    PG_AUTHID_SEEDED_TABLE,
+    PG_CAST_SEEDED_TABLE,
+    PG_CLASS_SEEDED_TABLE,
+    PG_COLLATION_SEEDED_TABLE,
+    PG_CONSTRAINT_SEEDED_TABLE,
+    PG_CONVERSION_SEEDED_TABLE,
+    PG_DATABASE_SEEDED_TABLE,
+    PG_DB_ROLE_SETTING_SEEDED_TABLE,
+    PG_DEFAULT_ACL_SEEDED_TABLE,
+    PG_DEPEND_SEEDED_TABLE,
+    PG_DESCRIPTION_SEEDED_TABLE,
+    PG_ENUM_SEEDED_TABLE,
+    PG_EVENT_TRIGGER_SEEDED_TABLE,
+    PG_EXTENSION_SEEDED_TABLE,
+    PG_FOREIGN_DATA_WRAPPER_SEEDED_TABLE,
+    PG_FOREIGN_SERVER_SEEDED_TABLE,
+    PG_FOREIGN_TABLE_SEEDED_TABLE,
+    PG_INDEX_SEEDED_TABLE,
+    PG_INHERITS_SEEDED_TABLE,
+    PG_INIT_PRIVS_SEEDED_TABLE,
+    PG_LANGUAGE_SEEDED_TABLE,
+    PG_LARGEOBJECT_SEEDED_TABLE,
+    PG_LARGEOBJECT_METADATA_SEEDED_TABLE,
+    PG_NAMESPACE_SEEDED_TABLE,
+    PG_OPCLASS_SEEDED_TABLE,
+    PG_OPERATOR_SEEDED_TABLE,
+    PG_OPFAMILY_SEEDED_TABLE,
+    PG_PARAMETER_ACL_SEEDED_TABLE,
+    PG_PARTITIONED_TABLE_SEEDED_TABLE,
+    PG_POLICY_SEEDED_TABLE,
+    PG_PROC_SEEDED_TABLE,
+    PG_PUBLICATION_SEEDED_TABLE,
+    PG_PUBLICATION_NAMESPACE_SEEDED_TABLE,
+    PG_PUBLICATION_REL_SEEDED_TABLE,
+    PG_RANGE_SEEDED_TABLE,
+    PG_REPLICATION_ORIGIN_SEEDED_TABLE,
+    PG_REWRITE_SEEDED_TABLE,
+    PG_SECLABEL_SEEDED_TABLE,
+    PG_SEQUENCE_SEEDED_TABLE,
+    PG_SHDEPEND_SEEDED_TABLE,
+    PG_SHDESCRIPTION_SEEDED_TABLE,
+    PG_SHSECLABEL_SEEDED_TABLE,
+    PG_STATISTIC_SEEDED_TABLE,
+    PG_STATISTIC_EXT_SEEDED_TABLE,
+    PG_STATISTIC_EXT_DATA_SEEDED_TABLE,
+    PG_SUBSCRIPTION_SEEDED_TABLE,
+    PG_SUBSCRIPTION_REL_SEEDED_TABLE,
+    PG_TABLESPACE_SEEDED_TABLE,
+    PG_TRANSFORM_SEEDED_TABLE,
+    PG_TRIGGER_SEEDED_TABLE,
+    PG_TS_CONFIG_SEEDED_TABLE,
+    PG_TS_CONFIG_MAP_SEEDED_TABLE,
+    PG_TS_DICT_SEEDED_TABLE,
+    PG_TS_PARSER_SEEDED_TABLE,
+    PG_TS_TEMPLATE_SEEDED_TABLE,
+    PG_TYPE_SEEDED_TABLE,
+    PG_USER_MAPPING_SEEDED_TABLE,
+];
