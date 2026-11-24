@@ -684,3 +684,16 @@ expect error {
 expect @tursopg {
     0
 }
+
+# PostgreSQL has no cast from json to integer.
+@compat-gap "cast:json -> int"
+test json-to-int-cast {
+    SELECT '1'::json::int;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type json to integer
+}
+expect @tursopg {
+    1
+}

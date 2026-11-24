@@ -1431,22 +1431,22 @@ where
                 y_iso.i_jd += (3 - days_after_mon(&p)) * 86400000;
                 y_iso.valid_ymd = false;
                 y_iso.compute_ymd();
-                write!(res, "{:02}", y_iso.y % 100).unwrap();
+                push_zero_padded(&mut res, i64::from(y_iso.y % 100), 2);
             }
             Some('G') => {
                 let mut y_iso = p;
                 y_iso.i_jd += (3 - days_after_mon(&p)) * 86400000;
                 y_iso.valid_ymd = false;
                 y_iso.compute_ymd();
-                write!(res, "{:04}", y_iso.y).unwrap();
+                push_zero_padded(&mut res, i64::from(y_iso.y), 4);
             }
             Some('H') => push_zero_padded(&mut res, i64::from(p.h), 2),
             Some('I') => {
                 let h = if p.h % 12 == 0 { 12 } else { p.h % 12 };
-                write!(res, "{h:02}").unwrap();
+                push_zero_padded(&mut res, i64::from(h), 2);
             }
             Some('j') => {
-                write!(res, "{:03}", days_after_jan1(&p) + 1).unwrap();
+                push_zero_padded(&mut res, days_after_jan1(&p) + 1, 3);
             }
             Some('J') => {
                 let julian_day = Value::from_f64(p.i_jd as f64 / 86400000.0);
@@ -1459,8 +1459,8 @@ where
             }
             Some('m') => push_zero_padded(&mut res, i64::from(p.m), 2),
             Some('M') => push_zero_padded(&mut res, i64::from(p.min), 2),
-            Some('p') => write!(res, "{}", if p.h >= 12 { "PM" } else { "AM" }).unwrap(),
-            Some('P') => write!(res, "{}", if p.h >= 12 { "pm" } else { "am" }).unwrap(),
+            Some('p') => res.push_str(if p.h >= 12 { "PM" } else { "AM" }),
+            Some('P') => res.push_str(if p.h >= 12 { "pm" } else { "am" }),
             Some('R') => {
                 push_zero_padded(&mut res, i64::from(p.h), 2);
                 res.push(':');
@@ -1487,11 +1487,11 @@ where
                 if w == 0 {
                     w = 7;
                 }
-                write!(res, "{w}").unwrap();
+                push_zero_padded(&mut res, w, 1);
             }
             Some('U') => {
                 let w = (days_after_jan1(&p) - days_after_sun(&p) + 7) / 7;
-                write!(res, "{w:02}").unwrap();
+                push_zero_padded(&mut res, w, 2);
             }
             Some('V') => {
                 let mut temp = p;
@@ -1499,14 +1499,12 @@ where
                 temp.valid_ymd = false;
                 temp.compute_ymd();
                 let w = days_after_jan1(&temp) / 7 + 1;
-                write!(res, "{w:02}").unwrap();
+                push_zero_padded(&mut res, w, 2);
             }
-            Some('w') => {
-                write!(res, "{}", days_after_sun(&p)).unwrap();
-            }
+            Some('w') => push_zero_padded(&mut res, days_after_sun(&p), 1),
             Some('W') => {
                 let w = (days_after_jan1(&p) - days_after_mon(&p) + 7) / 7;
-                write!(res, "{w:02}").unwrap();
+                push_zero_padded(&mut res, w, 2);
             }
             Some('Y') => push_zero_padded(&mut res, i64::from(p.y), 4),
             Some('%') => res.push('%'),
@@ -1585,9 +1583,13 @@ fn arg_as_text(value: ValueRef<'_>) -> ValueRef<'_> {
 /// Append `value` as `write!(res, "{value:0width$}")` does: zero padded to
 /// `width` characters, with the sign counted in the width.
 fn push_zero_padded(res: &mut String, value: i64, width: usize) {
-    // Most date and time fields are two or four digits with no sign.
+    // Most date and time fields are two, three or four digits with no sign.
     match (width, u16::try_from(value)) {
         (2, Ok(value @ 0..=99)) => push_two_digits(res, value),
+        (3, Ok(value @ 0..=999)) => {
+            res.push(char::from(b'0' + (value / 100) as u8));
+            push_two_digits(res, value % 100);
+        }
         (4, Ok(value @ 0..=9999)) => {
             push_two_digits(res, value / 100);
             push_two_digits(res, value % 100);
@@ -1597,14 +1599,21 @@ fn push_zero_padded(res: &mut String, value: i64, width: usize) {
 }
 
 /// Append `value`, which is less than 100, as two digits.
+#[inline(always)]
 fn push_two_digits(res: &mut String, value: u16) {
-    let digit = |digit: u16| {
-        char::from_digit(u32::from(digit), 10).expect("a number less than 100 has two digits")
-    };
-    res.push(digit(value / 10));
-    res.push(digit(value % 10));
+    // One `push_str` copies both digits, where a `push` for each digit
+    // checks the capacity two times.
+    let start = usize::from(value) * 2;
+    res.push_str(&crate::numeric::DIGIT_PAIRS[start..start + 2]);
 }
 
+/// Append `value` as `push_zero_padded` does, for the widths and values that
+/// `push_zero_padded` does not format itself.
+///
+/// Not inlined: `push_zero_padded` is inlined at each date and time field, and
+/// a copy of this function at each field makes the code larger for values
+/// that are rare.
+#[inline(never)]
 fn push_zero_padded_any_width(res: &mut String, value: i64, width: usize) {
     let mut buf = [0u8; 20];
     let digits = crate::numeric::write_decimal_digits(&mut buf, value.unsigned_abs());

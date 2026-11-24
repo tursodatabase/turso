@@ -28,6 +28,7 @@ use crate::runner::SimIO;
 use crate::runner::cli::IoBackend;
 use crate::runner::io::SimulatorIO;
 use crate::runner::memory::io::MemorySimIO;
+use crate::runner::swarm;
 const DEFAULT_CACHE_SIZE: usize = 2000;
 use super::cli::SimulatorCLI;
 use turso_core::SessionRole;
@@ -2022,12 +2023,15 @@ impl SimulatorEnv {
             // SQLite does not have LATERAL joins, so we can't use this property.
             opts.disable_lateral_matches_json_each = true;
         }
+        let mut io_backend = cli_opts.io_backend.unwrap_or_default();
+        if cli_opts.swarm {
+            swarm::apply(seed, cli_opts, &mut profile, &mut opts, &mut io_backend);
+        }
 
         profile.validate().unwrap();
 
         let latency_prof = &profile.io.latency;
 
-        let io_backend = cli_opts.io_backend;
         let io: Arc<dyn SimIO> = match io_backend {
             IoBackend::Memory => Arc::new(MemorySimIO::new(
                 opts.seed,

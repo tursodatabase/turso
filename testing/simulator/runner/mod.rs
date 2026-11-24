@@ -9,6 +9,7 @@ pub mod execution;
 pub mod file;
 pub mod io;
 pub mod memory;
+pub mod swarm;
 
 pub const FAULT_ERROR_MSG: &str = "Injected Fault";
 

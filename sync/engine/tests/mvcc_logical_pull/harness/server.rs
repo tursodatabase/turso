@@ -208,14 +208,38 @@ impl InProcessServer {
             } as i32,
         };
         let mut response = header.encode_length_delimited_to_vec();
+        let failure = self.bootstrap_failure.load(Ordering::SeqCst);
         for (page_id, page) in database.chunks_exact(PAGE_SIZE).enumerate() {
             let mut page = page.to_vec();
-            if self.bootstrap_failure.load(Ordering::SeqCst) == 2 && page_id == 0 {
+            if failure == 2 && page_id == 0 {
                 page[PAGE_SIZE - 1] = 1;
+            }
+            // Serve page 1 as an encrypted remote stores it, without the SQLite
+            // magic but with plaintext page size and reserved-space fields.
+            if failure == 3 && page_id == 0 {
+                let crypto = self
+                    .bootstrap_base
+                    .crypto
+                    .as_ref()
+                    .expect("failure 3 needs an encrypted remote");
+                page = crypto.encrypt_page(&page, 1)?;
             }
             let page = PageData {
                 page_id: page_id as u64,
                 encoded_page: Bytes::from(page),
+            };
+            response.extend(page.encode_length_delimited_to_vec());
+        }
+        // Append a page whose zero-based id does not map to a u32 page number:
+        // u32::MAX for failure 4, 2^32 for failure 5.
+        if failure == 4 || failure == 5 {
+            let page = PageData {
+                page_id: if failure == 4 {
+                    u64::from(u32::MAX)
+                } else {
+                    1 << 32
+                },
+                encoded_page: Bytes::from(database[database.len() - PAGE_SIZE..].to_vec()),
             };
             response.extend(page.encode_length_delimited_to_vec());
         }

@@ -1,6 +1,6 @@
 use crate::alloc::TursoVecExt;
 use crate::ast::{NullsOrder, SortOrder};
-use crate::schema::{Index, IndexColumn, PseudoCursorType};
+use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
 use crate::translate::collate::{first_collation, CollationSeq};
 use crate::translate::compound_select::{
@@ -14,7 +14,7 @@ use crate::translate::emitter::{
 use crate::translate::eqp::EqpDetail;
 use crate::translate::expr_context::ExprContext;
 use crate::translate::plan::{
-    Plan, QueryDestination, RecursiveCtePlan, RecursiveCteQueueKey, SelectPlan,
+    Plan, QueryDestination, RecursiveCtePlan, RecursiveCteQueue, RecursiveCteQueueKey, SelectPlan,
 };
 use crate::translate::result_row::{emit_columns_to_destination, emit_offset};
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
@@ -46,79 +46,106 @@ pub(crate) fn emit_recursive_cte(
         num_fields: num_result_columns,
     });
 
-    let mut queue_index_columns = crate::alloc::try_vec![]?;
-    let mut queue_sort_keys = crate::alloc::try_vec![]?;
-    if let Some(queue_order) = &recursive_cte.queue_order {
-        for (result_column_index, order, nulls, explicit_collation) in queue_order {
-            let default_nulls = match order {
-                SortOrder::Asc => NullsOrder::First,
-                SortOrder::Desc => NullsOrder::Last,
-            };
-            let nulls_override = nulls.filter(|nulls| *nulls != default_nulls);
-            if nulls_override.is_some() {
+    let queue_name = format!("recursive-queue-{}", recursive_cte.name);
+    let (queue_cursor_id, queue) = match &recursive_cte.queue_order {
+        None => {
+            let table = Arc::new(BTreeTable::new(
+                0,
+                queue_name,
+                crate::alloc::vec![],
+                crate::alloc::vec![],
+                BTreeCharacteristics::HAS_ROWID,
+                crate::alloc::vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
+                None,
+            ));
+            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+            program.emit_insn(Insn::OpenEphemeral {
+                cursor_id,
+                is_table: true,
+            });
+            (cursor_id, RecursiveCteQueue::Fifo { table })
+        }
+        Some(queue_order) => {
+            let mut queue_index_columns = crate::alloc::try_vec![]?;
+            let mut queue_sort_keys = crate::alloc::try_vec![]?;
+            for (result_column_index, order, nulls, explicit_collation) in queue_order {
+                let default_nulls = match order {
+                    SortOrder::Asc => NullsOrder::First,
+                    SortOrder::Desc => NullsOrder::Last,
+                };
+                let nulls_override = nulls.filter(|nulls| *nulls != default_nulls);
+                if nulls_override.is_some() {
+                    queue_index_columns.try_push(IndexColumn {
+                        name: format!("null-rank-{}", queue_sort_keys.len()),
+                        order: SortOrder::Asc,
+                        nulls_order: None,
+                        pos_in_table: queue_index_columns.len(),
+                        collation: CollationSeq::BINARY,
+                        explicit_collation: None,
+                        default: None,
+                        expr: None,
+                    })?;
+                }
+                let collation = match explicit_collation {
+                    Some(collation) => *collation,
+                    None => collations[*result_column_index],
+                };
                 queue_index_columns.try_push(IndexColumn {
-                    name: format!("null-rank-{}", queue_sort_keys.len()),
-                    order: SortOrder::Asc,
+                    name: format!("priority-{}", queue_sort_keys.len()),
+                    order: *order,
                     nulls_order: None,
                     pos_in_table: queue_index_columns.len(),
-                    collation: CollationSeq::BINARY,
+                    collation,
                     explicit_collation: None,
                     default: None,
                     expr: None,
                 })?;
+                queue_sort_keys.try_push(RecursiveCteQueueKey {
+                    result_column_index: *result_column_index,
+                    nulls_override,
+                })?;
             }
-            let collation = match explicit_collation {
-                Some(collation) => *collation,
-                None => collations[*result_column_index],
-            };
-            queue_index_columns.try_push(IndexColumn {
-                name: format!("priority-{}", queue_sort_keys.len()),
-                order: *order,
-                nulls_order: None,
-                pos_in_table: queue_index_columns.len(),
-                collation,
-                explicit_collation: None,
-                default: None,
-                expr: None,
-            })?;
-            queue_sort_keys.try_push(RecursiveCteQueueKey {
-                result_column_index: *result_column_index,
-                nulls_override,
-            })?;
+            queue_index_columns.try_push(IndexColumn::new(
+                "sequence",
+                queue_index_columns.len(),
+                CollationSeq::BINARY,
+            ))?;
+            for result_column_index in 0..num_result_columns {
+                queue_index_columns.try_push(IndexColumn::new(
+                    format!("result-{result_column_index}"),
+                    queue_index_columns.len(),
+                    CollationSeq::BINARY,
+                ))?;
+            }
+            let index = Arc::new(Index {
+                name: queue_name,
+                table_name: String::new(),
+                root_page: 0,
+                columns: queue_index_columns,
+                unique: true,
+                ephemeral: true,
+                has_rowid: false,
+                where_clause: None,
+                index_method: None,
+                on_conflict: None,
+                constraint_name: None,
+            });
+            let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+            program.emit_insn(Insn::OpenEphemeral {
+                cursor_id,
+                is_table: false,
+            });
+            (
+                cursor_id,
+                RecursiveCteQueue::Ordered {
+                    index,
+                    sort_keys: queue_sort_keys,
+                },
+            )
         }
-    }
-    let queue_sort_column_count = queue_index_columns.len();
-    queue_index_columns.try_push(IndexColumn::new(
-        "sequence",
-        queue_index_columns.len(),
-        CollationSeq::BINARY,
-    ))?;
-    for result_column_index in 0..num_result_columns {
-        queue_index_columns.try_push(IndexColumn::new(
-            format!("result-{result_column_index}"),
-            queue_index_columns.len(),
-            CollationSeq::BINARY,
-        ))?;
-    }
-
-    let queue_index = Arc::new(Index {
-        name: format!("recursive-queue-{}", recursive_cte.name),
-        table_name: String::new(),
-        root_page: 0,
-        columns: queue_index_columns,
-        unique: true,
-        ephemeral: true,
-        has_rowid: false,
-        where_clause: None,
-        index_method: None,
-        on_conflict: None,
-        constraint_name: None,
-    });
-    let queue_cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(queue_index.clone()));
-    program.emit_insn(Insn::OpenEphemeral {
-        cursor_id: queue_cursor_id,
-        is_table: false,
-    });
+    };
     let seen_rows = if recursive_cte.union_all {
         None
     } else {
@@ -158,8 +185,7 @@ pub(crate) fn emit_recursive_cte(
     let seen_rows_cursor_id = seen_rows.as_ref().map(|(cursor_id, _)| *cursor_id);
     let queue_destination = QueryDestination::RecursiveCteQueue {
         cursor_id: queue_cursor_id,
-        index: queue_index,
-        sort_keys: queue_sort_keys,
+        queue: queue.clone(),
         seen_rows,
     };
 
@@ -189,31 +215,59 @@ pub(crate) fn emit_recursive_cte(
         pc_if_empty: recursive_cte_end,
     });
 
-    let queue_column_count = queue_sort_column_count + 1 + num_result_columns;
-    let queue_row_regs = program.alloc_registers(queue_column_count);
-    for queue_column_index in 0..queue_column_count {
-        program.emit_insn(Insn::Column {
-            cursor_id: queue_cursor_id,
-            column: queue_column_index,
-            dest: queue_row_regs + queue_column_index,
-            default: None,
-        });
-    }
-    let result_row_regs = queue_row_regs + queue_sort_column_count + 1;
-    program.emit_insn(Insn::IdxDelete {
-        start_reg: queue_row_regs,
-        num_regs: queue_column_count,
-        cursor_id: queue_cursor_id,
-        raise_error_if_no_matching_entry: false,
-    });
-
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(result_row_regs),
-        count: to_u32(num_result_columns),
-        dest_reg: to_u32(input_record_reg),
-        index_name: None,
-        affinity_str: None,
-    });
+    let result_row_regs = match &queue {
+        RecursiveCteQueue::Fifo { table } => {
+            let result_row_regs = program.alloc_registers(num_result_columns);
+            // The queued record is the row itself, so it becomes the content
+            // of the input cursor without being decoded and encoded again.
+            program.emit_insn(Insn::RowData {
+                cursor_id: queue_cursor_id,
+                dest: input_record_reg,
+            });
+            program.emit_insn(Insn::Delete {
+                cursor_id: queue_cursor_id,
+                table_name: table.name.clone(),
+                is_part_of_update: false,
+            });
+            for result_column_index in 0..num_result_columns {
+                program.emit_insn(Insn::Column {
+                    cursor_id: input_cursor_id,
+                    column: result_column_index,
+                    dest: result_row_regs + result_column_index,
+                    default: None,
+                });
+            }
+            result_row_regs
+        }
+        RecursiveCteQueue::Ordered { index, .. } => {
+            let queue_column_count = index.columns.len();
+            let queue_row_regs = program.alloc_registers(queue_column_count);
+            for queue_column_index in 0..queue_column_count {
+                program.emit_insn(Insn::Column {
+                    cursor_id: queue_cursor_id,
+                    column: queue_column_index,
+                    dest: queue_row_regs + queue_column_index,
+                    default: None,
+                });
+            }
+            program.emit_insn(Insn::IdxDelete {
+                start_reg: queue_row_regs,
+                num_regs: queue_column_count,
+                cursor_id: queue_cursor_id,
+                raise_error_if_no_matching_entry: false,
+            });
+            // The result columns follow the sort keys and the sequence number.
+            let result_row_regs = queue_row_regs + queue_column_count - num_result_columns;
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u32(result_row_regs),
+                count: to_u32(num_result_columns),
+                dest_reg: to_u32(input_record_reg),
+                index_name: None,
+                affinity_str: None,
+            });
+            result_row_regs
+        }
+    };
 
     emit_offset(
         program,

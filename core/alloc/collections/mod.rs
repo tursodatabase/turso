@@ -23,7 +23,7 @@ fn trusted_len(size_hint: (usize, Option<usize>)) -> Result<usize, super::TryRes
     Ok(additional)
 }
 
-pub use boxed::DynBoxedSlice;
+pub use boxed::{DynBox, DynBoxedSlice};
 pub(crate) use traits::impl_try_clone_via_clone;
 #[cfg(nightly)]
 pub use traits::TursoFromIteratorIn;

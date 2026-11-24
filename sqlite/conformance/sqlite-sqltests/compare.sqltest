@@ -738,3 +738,34 @@ expect {
     1997-06-01|1|1|1|0|1|1|1|0
     1997-09-01|1|0|1|0|0|0|0|0
 }
+
+# A comparison converts its operands for its affinity without changing them,
+# as in SQLite. An equal constant elsewhere in the statement, or a column value
+# that a CHECK constraint compares before the row is written, reads the same
+# register, and must still see the value as written.
+test compare-text-affinity-keeps-shared-constant {
+    CREATE TABLE t(txt TEXT, b);
+    INSERT INTO t VALUES ('0', 200), ('0', 50);
+    SELECT b, b < 100, txt < 100, b < 100 FROM t WHERE txt < 100 AND b < 100;
+}
+expect {
+    50|1|1|1
+}
+
+test compare-numeric-affinity-keeps-shared-constant {
+    CREATE TABLE s(x INTEGER, b);
+    INSERT INTO s VALUES (100, '1e2'), (100, 100);
+    SELECT x = '1e2', b = '1e2', b FROM s WHERE x = '1e2' AND b = '1e2';
+}
+expect {
+    1|1|1e2
+}
+
+test compare-check-constraint-keeps-column-value {
+    CREATE TABLE t(a INTEGER, b, c INTEGER, CHECK(a < b), CHECK(b = c));
+    INSERT INTO t VALUES (5, '1e2', 100);
+    SELECT a, b, typeof(b) FROM t;
+}
+expect {
+    5|1e2|text
+}
