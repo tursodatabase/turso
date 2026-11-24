@@ -550,6 +550,7 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// FIXME(pg-catalog): This hand-codes the result type that the pg_operator and pg_proc entries give mod(integer, integer). A lookup in those tables replaces this.
     /// Whether `mod` of two integers returns an integer.
     ///
     /// PostgreSQL returns an integer. SQLite always returns a REAL.
@@ -586,6 +587,7 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// FIXME(pg-catalog): This hand-codes the pg_cast entry from integer to boolean as a method on the dialect. A lookup in a pg_cast table replaces this.
     /// Whether a cast of an integer to the built-in `boolean` type gives
     /// true for every nonzero integer.
     ///
