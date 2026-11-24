@@ -7145,7 +7145,7 @@ fn is_serial_type(pg_type: &str) -> bool {
 /// built-in Turso type exists, otherwise returns the base SQLite type.
 /// For array types (e.g. `INTEGER[]`, `_int4`), returns the base scalar type
 /// with `array_dimensions > 0` so native Turso arrays are used.
-// FIXME(pg-catalog): This maps PostgreSQL type names to Turso or SQLite type names by hand, and lowers types with no equivalent (money, point, bit, oid) to a base type. A pg_type lookup replaces this.
+// FIXME(pg-catalog): This maps PostgreSQL type names to Turso or SQLite type names by hand, and lowers types Turso does not have to another type: money to REAL; point, bit and xml to TEXT; oid and the reg types to INTEGER. It also maps numeric without a precision to REAL and char without a length to TEXT, where pg_type keeps numeric and makes char a bpchar of length 1. A pg_type lookup replaces this.
 pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
     // Check for array types first
     if pg_type.ends_with("[]") || pg_type.starts_with('_') {
@@ -7640,7 +7640,7 @@ fn json_type_or_raise(
     }
 }
 
-/// FIXME(pg-catalog): This finds an int8 cast by its type name and checks the literal in the parser because there is no typed expression tree. The int8 entry of pg_cast, applied to a typed literal, replaces this.
+/// FIXME(pg-catalog): This finds a cast to int8 by its type name and checks a numeric literal in the parser because there is no typed expression tree. The pg_cast entry from numeric to bigint (function int8(numeric)), applied to a literal typed numeric, replaces this.
 /// The operand of an int8 cast, made to raise "bigint out of range" when it is
 /// a numeric literal outside the bigint range, where `CAST(x AS INTEGER)` would
 /// clamp it. The literal is checked from its text, because a literal just past
@@ -7783,7 +7783,7 @@ fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
     Some(format!("{sign}{digits}"))
 }
 
-/// FIXME(pg-catalog): This lowers PostgreSQL types to SQLite types in the parser (boolean to INTEGER; json, inet and uuid to TEXT), so the PostgreSQL type is gone before the cast is checked. A pg_type lookup and a typed expression tree that keeps the type replace this.
+/// FIXME(pg-catalog): This lowers PostgreSQL types to SQLite types in the parser (boolean, smallint and oid to INTEGER; numeric and money to REAL; json, inet and uuid to TEXT), so the PostgreSQL type is gone before the cast is checked. A pg_type lookup and a typed expression tree that keeps the type replace this.
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types. Other names are kept as
 /// written so that enums and domains resolve to their custom type.
@@ -8268,7 +8268,7 @@ fn validate_column_qualifiers(
     Ok(())
 }
 
-/// FIXME(pg-catalog): This hand-codes provolatile of the pg_proc functions behind the pg_operator and pg_cast entries that apply to the operand types. A lookup in pg_operator, pg_cast and pg_proc replaces this.
+/// FIXME(pg-catalog): This hand-codes provolatile of the pg_proc functions behind pg_operator entries: timestamptz plus or minus interval is stable, and text || anynonarray is a stable SQL function that PostgreSQL inlines into a cast of the other operand to text, so it takes the volatility of that cast. It leaves out the comparisons of date and timestamp with timestamptz, which are stable. A lookup in pg_operator and pg_proc, with inlining of SQL functions, replaces this.
 /// Whether operator `name` on operands of types `left` and `right` is immutable.
 fn operator_is_immutable(name: &str, left: ExprType, right: ExprType) -> bool {
     use ExprType::*;
@@ -8283,7 +8283,7 @@ fn operator_is_immutable(name: &str, left: ExprType, right: ExprType) -> bool {
     }
 }
 
-/// FIXME(pg-catalog): This hand-codes provolatile of the pg_proc functions behind the pg_cast entries between date and time types. A lookup in pg_cast and pg_proc replaces this.
+/// FIXME(pg-catalog): This hand-codes the volatility of casts among date and time types, which is provolatile of the pg_cast function, and of casts between text and date and time types, which have no pg_cast entry and run the typinput or typoutput function of pg_type: all of them are stable except time_out and timetz_out. A lookup in pg_cast, pg_type and pg_proc replaces this.
 /// Whether a cast from `source` to `target` is immutable.
 fn cast_is_immutable(source: ExprType, target: ExprType) -> bool {
     use ExprType::*;
@@ -10532,7 +10532,7 @@ fn reject_column_aliases(
     Ok(())
 }
 
-// FIXME(pg-catalog): This guesses the type of an expression from its shape. The typed expression tree replaces it.
+// FIXME(pg-catalog): This guesses from the shape of the second argument whether substring() resolves to the pg_proc entry substring(text, text), which takes a regular expression, instead of substring(text, integer). Function resolution in pg_proc on a typed expression tree replaces this.
 fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
     use pg_query::protobuf::node::Node;
     match &node.node {

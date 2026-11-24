@@ -6,9 +6,8 @@ use std::sync::Arc;
 use turso_core::schema::RelationKind;
 use turso_core::Connection;
 
-// FIXME(pg-catalog): The three lists of type names stand in for a pg_type catalog. A lookup in a pg_type table, as described below, replaces them.
-// FIXME: three places that do not know about each other say what a type
-// name is:
+// FIXME(pg-catalog): three places that do not know about each other say what
+// a type name is, in place of a pg_type catalog:
 //
 // - the built-in lists of turso_pg_parser (`BASE_TYPES`, `PSEUDO_TYPES` and
 //   `POLYMORPHIC_TYPES` in create_function.rs),

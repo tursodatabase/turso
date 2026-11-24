@@ -916,7 +916,7 @@ fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResul
     }
 }
 
-/// FIXME(pg-catalog): This reads a parameter by the type that Parse declared, and the UNKNOWN arm guesses one for the others. A typed expression tree that gives each parameter the type of its context replaces this.
+/// FIXME(pg-catalog): This hand-codes the input function (typinput in pg_type) of each declared parameter type, and differs from it: it accepts fewer spellings of boolean than boolin (not True, y or a value with spaces) and reads numeric as a float. A call to the typinput function of the declared type replaces this.
 /// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
 /// Assumes text format encoding (UTF-8 string representations).
 fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {

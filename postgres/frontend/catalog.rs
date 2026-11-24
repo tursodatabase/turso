@@ -516,7 +516,7 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
     pg_type_oid(ty_str).unwrap_or(25) // default to text
 }
 
-/// FIXME(pg-catalog): This maps type names to pg_type oids by hand, and a type it does not list reads as text elsewhere. A lookup in a pg_type table replaces this.
+/// FIXME(pg-catalog): This maps type names to pg_type oids by hand, and a type it does not list reads as text elsewhere. It maps CHAR to varchar (1043), where PostgreSQL's char is bpchar (1042). A lookup in a pg_type table replaces this.
 /// The oid of the PostgreSQL type of a column declared as `ty_str`, or None
 /// for a type name tursopg does not know.
 pub(crate) fn pg_type_oid(ty_str: &str) -> Option<i64> {

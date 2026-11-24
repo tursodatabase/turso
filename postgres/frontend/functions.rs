@@ -1174,7 +1174,7 @@ enum JsonElement {
 }
 
 impl JsonElement {
-    // FIXME(pg-catalog): This picks how an element is written by type name, as the typoutput and typsend entries of pg_type would. A lookup in a pg_type table replaces this.
+    // FIXME(pg-catalog): PostgreSQL also picks how to_json writes a value by type oid (json_categorize_type), so the named arms stay. The last arm stands in for the cast to json in pg_cast of a type that has one, and for the typoutput function in pg_type of the others. A pg_cast and pg_type lookup replaces that arm.
     fn of_type(name: &str) -> Self {
         match name {
             "boolean" => Self::Boolean,
@@ -1607,7 +1607,7 @@ fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {
     }
 }
 
-/// FIXME(pg-catalog): This table of oids and names was copied by hand from pg_type. A lookup in a pg_type table replaces this.
+/// FIXME(pg-catalog): This table of oids and names was copied by hand from pg_type. It prints unknown for an oid it does not list, where PostgreSQL prints the name of that pg_type row, and character for bpchar with typemod -1, where PostgreSQL prints bpchar. A lookup in a pg_type table replaces this.
 /// The name of a type as `format_type` prints it.
 fn format_type(type_oid: i64, typemod: i64) -> String {
     match type_oid {
