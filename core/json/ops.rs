@@ -97,7 +97,7 @@ where
             return Ok(Value::Null);
         };
         let mut op = DeleteOperation::new();
-        let _ = json.operate_on_path(&path, &mut op);
+        json.operate_on_path(&path, &mut op)?;
     }
 
     let el_type = json.element_type()?;
@@ -132,7 +132,7 @@ where
             return Ok(Value::Null);
         };
         let mut op = DeleteOperation::new();
-        let _ = json.operate_on_path(&path, &mut op);
+        json.operate_on_path(&path, &mut op)?;
     }
 
     Ok(Value::Blob(json.data()))
@@ -171,7 +171,7 @@ where
             let value = convert_dbtype_to_jsonb(&second, Conv::SetValue)?;
             let mut op = ReplaceOperation::new(value);
 
-            let _ = json.operate_on_path(&path, &mut op);
+            json.operate_on_path(&path, &mut op)?;
         }
     }
 
@@ -213,7 +213,7 @@ where
             let value = convert_dbtype_to_jsonb(&second, Conv::SetValue)?;
             let mut op = ReplaceOperation::new(value);
 
-            let _ = json.operate_on_path(&path, &mut op);
+            json.operate_on_path(&path, &mut op)?;
         }
     }
 
@@ -256,7 +256,7 @@ where
             let value = convert_dbtype_to_jsonb(&second, Conv::SetValue)?;
             let mut op = InsertOperation::new(value);
 
-            let _ = json.operate_on_path(&path, &mut op);
+            json.operate_on_path(&path, &mut op)?;
         }
     }
 
@@ -299,7 +299,7 @@ where
             let value = convert_dbtype_to_jsonb(&second, Conv::SetValue)?;
             let mut op = InsertOperation::new(value);
 
-            let _ = json.operate_on_path(&path, &mut op);
+            json.operate_on_path(&path, &mut op)?;
         }
     }
 
