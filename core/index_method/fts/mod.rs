@@ -33,7 +33,7 @@ use crate::{
     schema::IndexColumn,
     storage::btree::CursorTrait,
     translate::collate::CollationSeq,
-    turso_assert,
+    turso_assert, turso_debug_assert,
     types::{IOResult, KeyInfo, SeekKey, SeekOp, SeekResult},
     vdbe::Register,
     Connection, LimboError, Result, Value,
@@ -1114,8 +1114,14 @@ enum FtsState {
     /// No control row: rewinding to tell an empty store from one written
     /// by the pre-registry FTS implementation (which is refused).
     ProbeFormat { rewound: bool },
-    /// Range-scanning the visible `(SEGMENT, *)` registry rows.
-    ScanSegments { seeked: bool, advance_pending: bool },
+    /// Range-scanning the visible `(SEGMENT, *)` registry rows. `seen`
+    /// holds the ids that this scan put in `scan_descriptors`, so that a
+    /// duplicate row is found without a search through all of them.
+    ScanSegments {
+        seeked: bool,
+        advance_pending: bool,
+        seen: HashSet<SegmentId>,
+    },
     /// Range-scanning the visible tombstone rows.
     ScanTombs { seeked: bool, advance_pending: bool },
     /// Loading chunk rows for visible segments absent from the byte cache.
@@ -1680,6 +1686,7 @@ impl FtsCursor {
                     self.state = FtsState::ScanSegments {
                         seeked: false,
                         advance_pending: false,
+                        seen: HashSet::default(),
                     };
                 }
                 FtsState::ProbeFormat { rewound } => {
@@ -1742,11 +1749,16 @@ impl FtsCursor {
                 FtsState::ScanSegments {
                     seeked,
                     advance_pending,
+                    seen,
                 } => {
                     let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
                         LimboError::InternalError("cursor not initialized".into())
                     })?;
                     if !*seeked {
+                        turso_debug_assert!(
+                            self.scan_descriptors.is_empty() && seen.is_empty(),
+                            "FTS registry scan started with descriptors of another scan"
+                        );
                         let seek_key = seek_key_for_path(FTS2_SEGMENT_PREFIX)?;
                         let seek_result = return_if_io!(cursor.seek(
                             SeekKey::IndexKey(seek_key.as_record_ref()),
@@ -1806,11 +1818,7 @@ impl FtsCursor {
                     // Duplicate segment ids in one searcher trip a
                     // SearcherGeneration assert inside Tantivy; dedupe the
                     // registry scan defensively.
-                    if self
-                        .scan_descriptors
-                        .iter()
-                        .all(|existing| existing.segment_id != segment_id)
-                    {
+                    if seen.insert(segment_id) {
                         self.scan_descriptors.push(descriptor);
                     } else {
                         let existing = self
@@ -2078,6 +2086,7 @@ impl FtsCursor {
             self.state = FtsState::ScanSegments {
                 seeked: false,
                 advance_pending: false,
+                seen: HashSet::default(),
             };
         }
         self.probe_only = false;
