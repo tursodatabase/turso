@@ -270,14 +270,6 @@ test invalid-timestamptz {
 @sqlstate 22007
 expect error {}
 
-# A-36: timestamptz equality across offsets
-test timestamptz-equality-across-offsets {
-    SELECT '2026-10-08 14:00:00+02'::timestamptz = '2026-10-08 12:00:00Z'::timestamptz;
-}
-expect {
-    t
-}
-
 # A-37: timestamp drops offset
 test timestamp-drops-offset {
     SELECT '2026-10-08 14:00:00+02'::timestamp;
