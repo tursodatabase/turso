@@ -28,6 +28,13 @@ expect {
     2026-01-02 00:00:00|2026-01-02 00:00:00|2026-01-02 00:00:00|2026-01-01 22:00:00|2026-01-02 00:00:00
 }
 
+test timestamp-plus-interval-abbreviated-units {
+    SELECT timestamp '2026-01-31 00:00:00' + interval '1 mon 2 hrs 5 min';
+}
+expect {
+    2026-02-28 02:05:00
+}
+
 test timestamptz-minus-interval-clamps-to-month-end {
     SELECT timestamptz '2026-03-31 10:00:00+00' - interval '1 month',
            timestamp '2024-01-31' + interval '1 month',

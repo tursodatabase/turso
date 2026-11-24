@@ -3,6 +3,7 @@
 // This module translates pg_query's PostgreSQL AST into Turso's SQL AST
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
+use crate::datetime_unit::DatetimeUnit;
 use crate::functions::{datetime_result_type, is_system_column, pg_func, Immutability};
 use crate::names::{
     extract_key_columns, is_default_schema, is_pg_catalog, object_name, schema_qualifier,
@@ -8031,8 +8032,8 @@ fn interval_literal(node: &pg_query::protobuf::Node) -> Result<Option<IntervalPa
 
 /// The parts of the interval text `text`, or None unless it is a list of
 /// optionally signed integers, each followed by a unit: microsecond,
-/// millisecond, second, minute, hour, day, week, month or year, singular or
-/// plural. As in PostgreSQL, the units are read without regard to case, a
+/// millisecond, second, minute, hour, day, week, month or year, in any
+/// spelling of `DatetimeUnit::parse`. As in PostgreSQL, the units are read without regard to case, a
 /// unit may appear only once, and a value out of the range of its part is an
 /// error. PostgreSQL reads many more forms, such as `1:30` or `1 day ago`,
 /// which are not supported.
@@ -8051,26 +8052,35 @@ fn interval_parts(text: &str) -> Option<IntervalParts> {
             return None;
         }
         let value: i64 = number.parse().ok()?;
-        let unit = words.next()?.to_ascii_lowercase();
-        let unit = unit.strip_suffix('s').unwrap_or(&unit).to_string();
+        let unit = DatetimeUnit::parse(words.next()?)?;
         if seen_units.contains(&unit) {
             return None;
         }
         let small = |value: i64| i32::try_from(value).ok();
-        match unit.as_str() {
-            "microsecond" => parts.micros = parts.micros.checked_add(value)?,
-            "millisecond" => parts.micros = parts.micros.checked_add(value.checked_mul(1_000)?)?,
-            "second" => parts.micros = parts.micros.checked_add(value.checked_mul(1_000_000)?)?,
-            "minute" => parts.micros = parts.micros.checked_add(value.checked_mul(60_000_000)?)?,
-            "hour" => {
+        match unit {
+            DatetimeUnit::Microsecond => parts.micros = parts.micros.checked_add(value)?,
+            DatetimeUnit::Millisecond => {
+                parts.micros = parts.micros.checked_add(value.checked_mul(1_000)?)?
+            }
+            DatetimeUnit::Second => {
+                parts.micros = parts.micros.checked_add(value.checked_mul(1_000_000)?)?
+            }
+            DatetimeUnit::Minute => {
+                parts.micros = parts.micros.checked_add(value.checked_mul(60_000_000)?)?
+            }
+            DatetimeUnit::Hour => {
                 parts.micros = parts
                     .micros
                     .checked_add(value.checked_mul(3_600_000_000)?)?
             }
-            "day" => parts.days = parts.days.checked_add(small(value)?)?,
-            "week" => parts.days = parts.days.checked_add(small(value.checked_mul(7)?)?)?,
-            "month" => parts.months = parts.months.checked_add(small(value)?)?,
-            "year" => parts.months = parts.months.checked_add(small(value.checked_mul(12)?)?)?,
+            DatetimeUnit::Day => parts.days = parts.days.checked_add(small(value)?)?,
+            DatetimeUnit::Week => {
+                parts.days = parts.days.checked_add(small(value.checked_mul(7)?)?)?
+            }
+            DatetimeUnit::Month => parts.months = parts.months.checked_add(small(value)?)?,
+            DatetimeUnit::Year => {
+                parts.months = parts.months.checked_add(small(value.checked_mul(12)?)?)?
+            }
             _ => return None,
         }
         seen_units.push(unit);

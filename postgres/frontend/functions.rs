@@ -14,6 +14,7 @@ use turso_core::{
     exec_temporal_encode, Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions,
     Register, Result, Value, WallClockInstant,
 };
+use turso_pg_parser::datetime_unit::DatetimeUnit;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR,
     SQLSTATE_INVALID_DATETIME_FORMAT, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
@@ -229,12 +230,13 @@ fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
             ))
         })?;
     let lowered_field = field.as_str().to_ascii_lowercase();
-    if is_time_zone_unit(&lowered_field) {
+    let parsed = DatetimeUnit::parse(field.as_str());
+    if parsed == Some(DatetimeUnit::TimeZone) {
         return Err(not_supported(format!(
             "unit \"{lowered_field}\" not supported for type timestamp with time zone"
         )));
     }
-    let Some(unit) = TruncUnit::parse(field.as_str()) else {
+    let Some(unit) = parsed else {
         return Err(sqlstate_error(
             SQLSTATE_INVALID_PARAMETER_VALUE,
             format!("unit \"{lowered_field}\" not recognized for type timestamp with time zone"),
@@ -251,90 +253,40 @@ fn exec_date_trunc(args: &[Register]) -> Result<Option<Timestamptz>> {
     Ok(Some(Timestamptz(timestamp_text(truncated))))
 }
 
-/// The units of PostgreSQL's interval unit table that are time zone fields,
-/// not truncation units. date_trunc refuses them with 0A000 rather than 22023.
-/// `lowered` is matched on its first 10 bytes, as in `TruncUnit::parse`.
-fn is_time_zone_unit(lowered: &str) -> bool {
-    let key = &lowered.as_bytes()[..lowered.len().min(10)];
-    matches!(key, b"timezone" | b"timezone_h" | b"timezone_m")
-}
-
-#[derive(Clone, Copy)]
-enum TruncUnit {
-    Microseconds,
-    Milliseconds,
-    Second,
-    Minute,
-    Hour,
-    Day,
-    Week,
-    Month,
-    Quarter,
-    Year,
-    Decade,
-    Century,
-    Millennium,
-}
-
-impl TruncUnit {
-    /// The unit named by `name`, spelled as in PostgreSQL's interval unit
-    /// table (deltatktbl in src/backend/utils/adt/datetime.c). PostgreSQL
-    /// matches the lowercased name on its first 10 bytes only, so
-    /// "microsecondsXY" is the unit "microsecon". None for a name that is
-    /// not a unit of date_trunc.
-    fn parse(name: &str) -> Option<Self> {
-        let lowered = name.to_ascii_lowercase();
-        let key = &lowered.as_bytes()[..lowered.len().min(10)];
-        Some(match key {
-            b"microsecon" | b"us" | b"usec" | b"usecond" | b"useconds" | b"usecs" => {
-                Self::Microseconds
-            }
-            b"millisecon" | b"ms" | b"msec" | b"msecond" | b"mseconds" | b"msecs" => {
-                Self::Milliseconds
-            }
-            b"second" | b"seconds" | b"s" | b"sec" | b"secs" => Self::Second,
-            b"minute" | b"minutes" | b"m" | b"min" | b"mins" => Self::Minute,
-            b"hour" | b"hours" | b"h" | b"hr" | b"hrs" => Self::Hour,
-            b"day" | b"days" | b"d" => Self::Day,
-            b"week" | b"weeks" | b"w" => Self::Week,
-            b"month" | b"months" | b"mon" | b"mons" => Self::Month,
-            b"quarter" | b"qtr" => Self::Quarter,
-            b"year" | b"years" | b"y" | b"yr" | b"yrs" => Self::Year,
-            b"decade" | b"decades" | b"dec" | b"decs" => Self::Decade,
-            b"century" | b"centuries" | b"c" | b"cent" => Self::Century,
-            b"millennium" | b"millennia" | b"mil" | b"mils" => Self::Millennium,
-            _ => return None,
-        })
-    }
-}
-
 /// `time` truncated to `unit`, as PostgreSQL's date_trunc does it, or None
 /// when the result is before year 1: PostgreSQL prints it as BC, which the
 /// timestamptz encoding cannot store. Weeks start on Monday; century and
 /// millennium start at years ending in 01, as in PostgreSQL.
-fn truncate_timestamp(time: NaiveDateTime, unit: TruncUnit) -> Option<NaiveDateTime> {
+fn truncate_timestamp(time: NaiveDateTime, unit: DatetimeUnit) -> Option<NaiveDateTime> {
     use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Timelike};
     let date = time.date();
     let first_day_of_year = |year: i32| NaiveDate::from_ymd_opt(year, 1, 1);
     let day = match unit {
-        TruncUnit::Microseconds => return Some(time),
-        TruncUnit::Milliseconds => {
+        DatetimeUnit::Microsecond => return Some(time),
+        DatetimeUnit::Millisecond => {
             let nanos = time.nanosecond() / 1_000_000 * 1_000_000;
             return time.with_nanosecond(nanos);
         }
-        TruncUnit::Second => return time.with_nanosecond(0),
-        TruncUnit::Minute => return time.with_nanosecond(0)?.with_second(0),
-        TruncUnit::Hour => return time.with_nanosecond(0)?.with_second(0)?.with_minute(0),
-        TruncUnit::Day => date,
-        TruncUnit::Week => date - Duration::days(i64::from(date.weekday().num_days_from_monday())),
-        TruncUnit::Month => date.with_day(1)?,
-        TruncUnit::Quarter => {
+        DatetimeUnit::Second => return time.with_nanosecond(0),
+        DatetimeUnit::Minute => return time.with_nanosecond(0)?.with_second(0),
+        DatetimeUnit::Hour => return time.with_nanosecond(0)?.with_second(0)?.with_minute(0),
+        DatetimeUnit::Day => date,
+        DatetimeUnit::Week => {
+            date - Duration::days(i64::from(date.weekday().num_days_from_monday()))
+        }
+        DatetimeUnit::Month => date.with_day(1)?,
+        DatetimeUnit::Quarter => {
             NaiveDate::from_ymd_opt(date.year(), (date.month() - 1) / 3 * 3 + 1, 1)?
         }
-        TruncUnit::Year => first_day_of_year(date.year())?,
-        TruncUnit::Decade => first_day_of_year(date.year().div_euclid(10) * 10)?,
-        TruncUnit::Century => first_day_of_year((date.year() - 1).div_euclid(100) * 100 + 1)?,
-        TruncUnit::Millennium => first_day_of_year((date.year() - 1).div_euclid(1000) * 1000 + 1)?,
+        DatetimeUnit::Year => first_day_of_year(date.year())?,
+        DatetimeUnit::Decade => first_day_of_year(date.year().div_euclid(10) * 10)?,
+        DatetimeUnit::Century => first_day_of_year((date.year() - 1).div_euclid(100) * 100 + 1)?,
+        DatetimeUnit::Millennium => {
+            first_day_of_year((date.year() - 1).div_euclid(1000) * 1000 + 1)?
+        }
+        DatetimeUnit::TimeZone => {
+            unreachable!("date_trunc refuses the time zone units before truncating")
+        }
     };
     // A year before 1 is BC in PostgreSQL. Only the decade of years 1 to 9
     // gets here, because the other units stay in the year of `time` or start
