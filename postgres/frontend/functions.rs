@@ -78,6 +78,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
                 |_, args| exec_timestamp_plus_interval(args),
             )
             .receiving_argument_types()
+            .checking_argument_types(check_timestamp_plus_interval_types)
             // FIXME(pg-catalog): pg_operator declares the result type per left
             // type (timestamp_pl_interval gives timestamp, timestamptz_pl_interval
             // gives timestamptz), so a domain over timestamptz gives timestamptz.
@@ -87,31 +88,45 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         )
 }
 
+/// Refuses the left side of `+ interval` when it is not timestamp or
+/// timestamptz. `types` are the argument type names; the first is the left
+/// side. PostgreSQL has the operator for date, time, timetz and interval, which
+/// tursopg does not support (0A000), and none for other types (42883). The
+/// translator turns `-` into `+` of the negated interval, so the message
+/// always says `+`.
+// FIXME(pg-catalog): the check runs at compile time now, but the list of
+// types is still written by hand. A pg_operator lookup replaces it.
+fn check_timestamp_plus_interval_types(types: &[String]) -> Result<()> {
+    let time_type = types[0].as_str();
+    match time_type {
+        "timestamp" | "timestamptz" => Ok(()),
+        "date" | "time" | "timetz" | "interval" => Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "adding an interval is supported only for timestamp and timestamptz, not {time_type}"
+            ),
+            None,
+        )),
+        _ => Err(sqlstate_error(
+            SQLSTATE_UNDEFINED_FUNCTION,
+            format!("operator does not exist: {time_type} + interval"),
+            None,
+        )),
+    }
+}
+
 /// `timestamp + interval` and `timestamptz + interval` for an interval
 /// literal, which the translator passes as its months, days and microseconds:
 /// `(time, months, days, microseconds)`. The result has the type of `time`.
 /// The parts are added as PostgreSQL's timestamp_pl_interval adds them: the
 /// months first, moving a day past the end of the month back to its last day,
 /// then the days, then the microseconds. Only UTC is supported, so timestamptz
-/// is computed like timestamp. Other types of `time`, such as date, fail with
-/// 0A000, because PostgreSQL gives them a different result type.
+/// is computed like timestamp. The type of `time` is checked when the
+/// statement is compiled.
 fn exec_timestamp_plus_interval(args: &[Register]) -> Result<Value> {
     use chrono::Datelike;
     let (args, types) = args.split_at(args.len() / 2);
     let time_type = types[0].get_value().to_string();
-    // FIXME(pg-catalog): PostgreSQL refuses any other left type when it plans
-    // the statement (42883, no operator). This check runs for each row, so a
-    // statement over no rows succeeds. A pg_operator lookup at plan time
-    // replaces this.
-    if !matches!(time_type.as_str(), "timestamp" | "timestamptz") {
-        return Err(sqlstate_error(
-            SQLSTATE_FEATURE_NOT_SUPPORTED,
-            format!(
-                "adding an interval is supported only for timestamp and timestamptz, not {time_type}"
-            ),
-            None,
-        ));
-    }
     // The function can be called by name with any arguments, and a value
     // typed timestamp can reach it in a form the ENCODE of timestamp would
     // not write, so unexpected arguments are errors, not assertions.

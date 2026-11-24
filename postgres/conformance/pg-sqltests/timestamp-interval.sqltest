@@ -170,7 +170,7 @@ test untyped-literal-minus-interval {
 expect error {
     invalid input syntax for type interval: "2026-01-01"
 }
-@sqlstate 0A000
+@sqlstate 42883
 expect @tursopg error {
 }
 
@@ -303,7 +303,8 @@ expect @tursopg error {
     an interval in an index expression is not supported
 }
 
-@compat-gap "operator:text - interval"
+# The translator turns `-` into `+` of the negated interval, so tursopg names
+# the wrong operator in its message.
 test text-column-minus-interval {
     CREATE TABLE t (a text);
     INSERT INTO t VALUES ('2026-01-01');
@@ -313,9 +314,9 @@ test text-column-minus-interval {
 expect error {
     operator does not exist: text - interval
 }
-@sqlstate 0A000
+@sqlstate 42883
 expect @tursopg error {
-    adding an interval is supported only for timestamp and timestamptz, not text
+    operator does not exist: text \+ interval
 }
 
 @compat-gap "function:coalesce"

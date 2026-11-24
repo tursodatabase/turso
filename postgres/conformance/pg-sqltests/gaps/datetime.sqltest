@@ -844,16 +844,13 @@ expect @tursopg {
     1
 }
 
-# tursopg checks the left side of `+ interval` when it computes a row, not
-# when it plans the statement, so with no rows to compute there is no error.
-@compat-gap "operator:integer + interval"
 test integer-plus-interval-over-no-rows {
     CREATE TABLE t (i int);
     SELECT i + interval '1 day' FROM t;
 }
 @sqlstate 42883
-expect error {}
-expect @tursopg {
+expect error {
+    operator does not exist: integer \+ interval
 }
 
 # PostgreSQL compares a date with a timestamp as the timestamp at midnight of

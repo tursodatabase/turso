@@ -31,6 +31,7 @@ impl ExternalFunc {
                 deterministic,
                 return_type: <<F::Call as ScalarCall>::Output as ScalarReturn>::TYPE,
                 receives_argument_types: false,
+                check_argument_types: None,
                 returns_first_argument_type: false,
                 function: Arc::new(function),
             },
@@ -50,6 +51,26 @@ impl ExternalFunc {
             panic!("only a native scalar function can receive its argument types");
         };
         *receives_argument_types = true;
+        self
+    }
+
+    /// Sets a function that is called at compile time with the type name of
+    /// each argument, as `receiving_argument_types` passes them; an error
+    /// refuses the statement. Needs `receiving_argument_types`.
+    pub fn checking_argument_types(mut self, check: crate::function::ArgumentTypeCheck) -> Self {
+        let ExtFunc::NativeScalar {
+            receives_argument_types,
+            check_argument_types,
+            ..
+        } = &mut self.func
+        else {
+            panic!("only a native scalar function can check its argument types");
+        };
+        assert!(
+            *receives_argument_types,
+            "checking argument types needs receiving_argument_types"
+        );
+        *check_argument_types = Some(check);
         self
     }
 

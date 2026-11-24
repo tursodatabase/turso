@@ -127,6 +127,10 @@ pub enum ExtFunc {
         /// Whether a call also gets the type name of each argument, such as
         /// `boolean[]`, as one more text argument per argument, after them.
         receives_argument_types: bool,
+        /// Called at compile time with the type name of each argument, as
+        /// `receives_argument_types` passes them; an error refuses the
+        /// statement.
+        check_argument_types: Option<ArgumentTypeCheck>,
         /// Whether the result has the type of the first argument, instead of
         /// `return_type`.
         returns_first_argument_type: bool,
@@ -137,6 +141,10 @@ pub enum ExtFunc {
         function: Arc<dyn crate::native_ext::AggregateFactory>,
     },
 }
+
+/// A function called at compile time with the type name of each argument; an
+/// error refuses the statement.
+pub type ArgumentTypeCheck = fn(&[String]) -> crate::Result<()>;
 
 #[derive(Debug)]
 pub struct ExternalContext {
@@ -196,6 +204,16 @@ impl ExtFunc {
                 ..
             }
         )
+    }
+
+    pub fn check_argument_types(&self) -> Option<ArgumentTypeCheck> {
+        match self {
+            Self::NativeScalar {
+                check_argument_types,
+                ..
+            } => *check_argument_types,
+            _ => None,
+        }
     }
 
     /// How the type of the function's result follows from its arguments.

@@ -1153,9 +1153,14 @@ fn translate_function_call_expr(
             let argument_types: Vec<String> = match &func_ctx.func {
                 Func::External(external) if external.func.receives_argument_types() => {
                     let env = TypeEnv::new(referenced_tables, resolver);
-                    args.iter()
+                    let types: Vec<String> = args
+                        .iter()
                         .map(|arg| name_without_domains(type_of(arg, &env), resolver.schema()))
-                        .collect()
+                        .collect();
+                    if let Some(check) = external.func.check_argument_types() {
+                        check(&types)?;
+                    }
+                    types
                 }
                 _ => Vec::new(),
             };
