@@ -54,7 +54,11 @@ SELECT 1;    -- true
 SELECT 0;    -- false
 ```
 
-The PostgreSQL frontend supports `TRUE` and `FALSE` literals. Boolean literals and boolean-valued `CASE` expressions are sent to PostgreSQL clients as booleans (`t` or `f` in text format).
+The PostgreSQL frontend has a `boolean` type, and supports `TRUE` and `FALSE` literals. Every condition is a boolean there: a comparison, `AND`, `OR`, `NOT`, `IS NULL` and the other `IS` tests, `IN`, `BETWEEN`, `LIKE`, `EXISTS`, the regular expression operators (`~`, `~*`, `!~`, `!~*`, `SIMILAR TO`), the array operators `@>`, `<@` and `&&`, and `= ANY(array)`. A boolean is sent to PostgreSQL clients as a boolean (`t` or `f` in text format), also when it comes from a `CASE`, a subquery, a view or a `VALUES` list.
+
+As in PostgreSQL, a boolean has no arithmetic operators: `(1 < 2) + 1` fails with `operator does not exist: boolean + integer`. Cast it to an integer first: `(1 < 2)::int + 1`.
+
+`CREATE TABLE ... AS SELECT` of a boolean, such as `CREATE TABLE c AS SELECT 1 < 2 AS x`, is not supported in the PostgreSQL frontend and fails with SQLSTATE `0A000`.
 
 ## Operators
 
@@ -88,7 +92,7 @@ SELECT CAST(10 AS REAL) / 3;  -- 3.333...
 | `<=` | Less than or equal | `x <= 5` |
 | `>=` | Greater than or equal | `x >= 5` |
 
-All comparison operators return `1` (true), `0` (false), or `NULL` (if either operand is NULL).
+All comparison operators return `1` (true), `0` (false), or `NULL` (if either operand is NULL). In the PostgreSQL frontend they return a boolean (see [Boolean Literals](#boolean-literals)).
 
 Comparison operators, `IN` and `BETWEEN` also accept row values, which compare element by element: `(a, b) = (1, 2)`, `(a, b) < (1, 3)`, `(a, b) IN ((1, 2), (3, 4))`, `(a, b) BETWEEN (1, 1) AND (2, 0)`. The PostgreSQL frontend also accepts the `ROW(a, b)` spelling. As an expression, a `ROW` constructor needs at least two values. Anywhere a single value is expected, such as a result column, an inserted value, a function argument, a window key, or an element of another row value, a row value is an error (`row value misused`). The source of a multiple-column `SET`, as in `SET (a) = ROW(1)`, may have one value.
 
