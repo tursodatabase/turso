@@ -295,7 +295,7 @@ pub(crate) fn emit_returning_results<'a>(
         }
 
         // Decode array columns in RETURNING results (record blob -> JSON text).
-        crate::translate::result_row::emit_array_decode_for_results(
+        crate::translate::result_row::emit_array_decode_for_returning(
             program,
             result_columns,
             table_references,

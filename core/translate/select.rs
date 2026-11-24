@@ -164,6 +164,16 @@ pub fn emit_select_plan(
     };
 
     program.extend(&opts);
+    // The ResultRows destination converts array columns to display text by
+    // these types, so they must be known before the rows are emitted.
+    if matches!(
+        plan.select_query_destination(),
+        Some(QueryDestination::ResultRows)
+    ) && connection.experimental_custom_types_enabled()
+    {
+        program.result_column_types =
+            super::result_column_types::plan_result_column_types(&plan, resolver);
+    }
     emit_program(connection, resolver, program, plan)?;
     Ok(num_result_cols)
 }

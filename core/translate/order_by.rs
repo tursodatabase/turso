@@ -383,15 +383,6 @@ impl EmitOrderBy {
             }
         }
 
-        // Decode array blobs to JSON text for display, after extracting from sorter
-        super::result_row::emit_array_decode_for_results(
-            program,
-            result_columns,
-            &plan.table_references,
-            start_reg,
-            &t_ctx.resolver,
-        )?;
-
         emit_result_row_and_limit(
             program,
             plan,

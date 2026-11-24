@@ -6,7 +6,7 @@ use crate::ast;
 
 use super::emitter::Resolver;
 use super::expr::expr_type::{type_of, BuiltinType, ExprType, TypeEnv};
-use super::plan::{ResultSetColumn, TableReferences};
+use super::plan::{Plan, ResultSetColumn, TableReferences};
 use crate::schema::Schema;
 use crate::statement::{ColumnTypeInfo, ColumnTypeKind};
 
@@ -25,6 +25,66 @@ pub(crate) fn result_column_types(
             expr => expression_type(&type_of(expr, &env), resolver.schema()),
         })
         .collect()
+}
+
+/// The types of the rows a SELECT, compound SELECT or recursive CTE returns.
+/// A compound SELECT takes each column's type from its leftmost arm. Where that
+/// arm returns a NULL literal, the column takes its type from the first later
+/// arm that has one, so that `SELECT NULL UNION ALL SELECT ARRAY[1]` is an
+/// array column.
+pub(crate) fn plan_result_column_types(
+    plan: &Plan,
+    resolver: &Resolver,
+) -> Vec<Option<ColumnTypeInfo>> {
+    match plan {
+        Plan::Select(select) => {
+            result_column_types(&select.result_columns, &select.table_references, resolver)
+        }
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            let mut arms = left
+                .iter()
+                .map(|(select, _)| select)
+                .chain(std::iter::once(right_most.as_ref()));
+            let leftmost = arms.next().expect("a compound SELECT has a leftmost arm");
+            let mut types = result_column_types(
+                &leftmost.result_columns,
+                &leftmost.table_references,
+                resolver,
+            );
+            let untyped_null: Vec<usize> = leftmost
+                .result_columns
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| matches!(column.expr, ast::Expr::Literal(ast::Literal::Null)))
+                .map(|(i, _)| i)
+                .collect();
+            // FIXME(pg-catalog): this hand-codes one case of PostgreSQL's UNION
+            // type resolution (an untyped NULL takes the type of the other
+            // arms). An expression tree that carries PostgreSQL types would give
+            // the compound column its type, from every arm.
+            if untyped_null.is_empty() {
+                return types;
+            }
+            for arm in arms {
+                let arm_types =
+                    result_column_types(&arm.result_columns, &arm.table_references, resolver);
+                for &i in &untyped_null {
+                    if types[i].is_none() {
+                        types[i].clone_from(&arm_types[i]);
+                    }
+                }
+            }
+            types
+        }
+        Plan::RecursiveCte(recursive_cte) => {
+            plan_result_column_types(&recursive_cte.initial_query, resolver)
+        }
+        Plan::Delete(_) | Plan::Update(_) => {
+            unreachable!("plan_result_column_types called on a non-SELECT plan")
+        }
+    }
 }
 
 /// A table column reports the type name it was declared with.
@@ -46,8 +106,9 @@ fn table_column_type(
 }
 
 /// Any other expression reports the SQLite primitive behind its type: INTEGER,
-/// REAL, NUMERIC or TEXT, or nothing when the value may be anything. An
-/// expression of a custom type reports it the way a column of that type does.
+/// REAL, NUMERIC or TEXT, or nothing when the value may be anything. An array
+/// of values that may be anything reports BLOB or ANY elements. An expression
+/// of a custom type reports it the way a column of that type does.
 fn expression_type(ty: &ExprType, schema: &Schema) -> Option<ColumnTypeInfo> {
     let (element, array_dimensions) = match ty {
         ExprType::Array {
@@ -57,7 +118,13 @@ fn expression_type(ty: &ExprType, schema: &Schema) -> Option<ColumnTypeInfo> {
         scalar => (scalar, 0),
     };
     let declared_name = match element {
-        ExprType::Builtin(builtin) => builtin_primitive(*builtin)?.to_string(),
+        ExprType::Builtin(builtin) => match builtin_primitive(*builtin) {
+            Some(primitive) => primitive.to_string(),
+            // An array is reported as one whatever its elements are, because
+            // the rows the statement returns convert it to text by this type.
+            None if array_dimensions > 0 => builtin.sqlite_name().to_string(),
+            None => return None,
+        },
         ExprType::Untyped => "TEXT".to_string(),
         ExprType::Custom { type_def, .. } => {
             let (base_type, kind) = custom_type_info(&type_def.name, true, schema);
@@ -72,7 +139,12 @@ fn expression_type(ty: &ExprType, schema: &Schema) -> Option<ColumnTypeInfo> {
         | ExprType::Unknown
         | ExprType::NotKnownYet
         | ExprType::RowValue
-        | ExprType::Array { .. } => return None,
+        | ExprType::Array { .. } => {
+            if array_dimensions == 0 {
+                return None;
+            }
+            "ANY".to_string()
+        }
     };
     Some(ColumnTypeInfo {
         declared_name,

@@ -1074,6 +1074,33 @@ expect {
     1|{17,9}
 }
 
+# A subquery and a sorted subquery pass an array on as an array; only the row
+# the client reads shows it as text.
+test array-from-subquery-keeps-elements {
+    SELECT s.e[1] FROM (SELECT ARRAY[10,20,30] AS e) s;
+}
+expect {
+    10
+}
+
+test array-from-ordered-subquery-keeps-elements {
+    CREATE TABLE ordered_arrays (id int, a int[]);
+    INSERT INTO ordered_arrays VALUES (2, ARRAY[7]), (1, ARRAY[5,6]);
+    SELECT x[1] FROM (SELECT a AS x FROM ordered_arrays ORDER BY id) s;
+}
+expect {
+    5
+    7
+}
+
+test union-of-null-and-array-is-array {
+    SELECT 0, NULL UNION ALL SELECT 1, ARRAY[1,2];
+}
+expect {
+    0|
+    1|{1,2}
+}
+
 test array-subquery-projection-alias-keeps-order-by-meaning {
     SELECT ARRAY(SELECT 9 AS _turso_array_value UNION ALL SELECT 17
                  ORDER BY _turso_array_value DESC LIMIT 1);

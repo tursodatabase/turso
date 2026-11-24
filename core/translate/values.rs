@@ -185,11 +185,8 @@ fn emit_values_to_destination(
     end_label: BranchOffset,
 ) -> Result<()> {
     match &plan.query_destination {
-        QueryDestination::ResultRows => {
-            program.emit_insn(Insn::ResultRow {
-                start_reg,
-                count: row_len,
-            });
+        destination @ QueryDestination::ResultRows => {
+            emit_columns_to_destination(program, destination, start_reg, row_len)?;
             if let Some(limit_ctx) = t_ctx.limit_ctx {
                 program.emit_insn(Insn::DecrJumpZero {
                     reg: limit_ctx.reg_limit,

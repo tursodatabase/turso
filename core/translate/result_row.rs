@@ -135,19 +135,6 @@ pub fn emit_select_result(
         }
     }
 
-    // Emit ArrayDecode for result columns that produce array blobs.
-    // Array values are stored as record-format blobs internally; decode
-    // them to JSON text for user-facing display.
-    if !skip_column_eval {
-        emit_array_decode_for_results(
-            program,
-            &plan.result_columns,
-            &plan.table_references,
-            start_reg,
-            resolver,
-        )?;
-    }
-
     // Handle SELECT DISTINCT deduplication
     if let Distinctness::Distinct { ctx, .. } = &plan.distinctness {
         let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
@@ -182,6 +169,7 @@ pub fn emit_columns_to_destination(
 ) -> Result<()> {
     match destination {
         QueryDestination::ResultRows => {
+            emit_array_decode_for_output(program, start_reg, num_columns);
             program.emit_insn(Insn::ResultRow {
                 start_reg,
                 count: num_columns,
@@ -546,10 +534,36 @@ pub fn emit_offset(program: &mut ProgramBuilder, jump_to: BranchOffset, reg_offs
     });
 }
 
-/// Emit ArrayDecode for result columns that produce array record blobs.
-/// Array values are stored as record-format blobs internally; this converts
-/// them to JSON text for user-facing display, just before ResultRow.
-pub(crate) fn emit_array_decode_for_results(
+/// Converts the array columns of a row the statement returns from their record
+/// blobs to display text. Subqueries, CTEs, sorters, DISTINCT and the sources of
+/// INSERT ... SELECT and CREATE TABLE AS all carry the blob; only the client
+/// sees text. The types come from `program.result_column_types`, which
+/// `emit_select_plan` sets before the rows are emitted.
+fn emit_array_decode_for_output(
+    program: &mut ProgramBuilder,
+    start_reg: usize,
+    num_columns: usize,
+) {
+    if program.flags.reads_stored_values() {
+        return;
+    }
+    let array_columns: Vec<usize> = program
+        .result_column_types
+        .iter()
+        .take(num_columns)
+        .enumerate()
+        .filter(|(_, ty)| ty.as_ref().is_some_and(|ty| ty.array_dimensions > 0))
+        .map(|(i, _)| i)
+        .collect();
+    for i in array_columns {
+        program.emit_insn(Insn::ArrayDecode { reg: start_reg + i });
+    }
+}
+
+/// Emit ArrayDecode for the array columns of a RETURNING row. RETURNING rows
+/// reach the client without passing the ResultRows destination of
+/// [emit_columns_to_destination], so they are converted to display text here.
+pub(crate) fn emit_array_decode_for_returning(
     program: &mut ProgramBuilder,
     result_columns: &[ResultSetColumn],
     table_references: &TableReferences,

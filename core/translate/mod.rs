@@ -660,7 +660,8 @@ fn translate_statement(
         }
     }
 
-    if connection.experimental_custom_types_enabled() {
+    // A SELECT computed its types before emission (see emit_select_plan).
+    if connection.experimental_custom_types_enabled() && program.result_column_types.is_empty() {
         program.result_column_types = result_column_types::result_column_types(
             &program.result_columns,
             &program.table_references,

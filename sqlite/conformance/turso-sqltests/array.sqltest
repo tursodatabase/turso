@@ -2023,3 +2023,15 @@ test array-2d-refuses-nested-text-input-of-integers {
 expect error {
     cannot store non-array value in INTEGER column m.a
 }
+
+# A subquery passes an array on as an array; only the row the client reads
+# shows it as text.
+test array-from-subquery-keeps-elements {
+    CREATE TABLE sub_src (id INTEGER, a INTEGER[]) STRICT;
+    INSERT INTO sub_src VALUES (2, ARRAY[7]), (1, ARRAY[5,6]);
+    SELECT x[1] FROM (SELECT a AS x FROM sub_src ORDER BY id) s;
+}
+expect {
+    5
+    7
+}
