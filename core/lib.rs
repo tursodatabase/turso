@@ -105,6 +105,11 @@ pub use functions::datetime_input::exec_temporal_encode;
 /// by the C API's sqlite3_mprintf/sqlite3_snprintf so both share one
 /// formatting implementation.
 pub use functions::printf::{exec_printf_values, printf_c_arg_plan, PrintfCArg};
+/// The SQL function `json()`, which also gives the text of a jsonb column. The
+/// PostgreSQL frontend uses it to write the jsonb values that its functions
+/// return in the same form.
+#[cfg(feature = "json")]
+pub use json::get_json;
 
 use crate::ast::Cmd;
 use crate::{

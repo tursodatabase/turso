@@ -1151,7 +1151,7 @@ fn exec_jsonb_delete(args: &[Register]) -> Result<Option<Jsonb>> {
         JsonMembers::Array(elements) => push_json_array(&elements, &mut out),
         JsonMembers::Scalar => unreachable!("a scalar fails before"),
     }
-    Ok(Some(Jsonb(out)))
+    Jsonb::from_json(out).map(Some)
 }
 
 /// What the right operand `name` of `jsonb - name` deletes, or None for NULL.
@@ -1230,11 +1230,10 @@ fn json_members(json: &str) -> Result<JsonMembers<'_>> {
     })
 }
 
-/// Appends the JSON object with the fields `fields` to `out`, without white
-/// space between its tokens, as a jsonb column reads an object. A jsonb
-/// column keeps two fields with the same name, where PostgreSQL keeps only
-/// the last one. This function keeps them too, so `j - 'k'` equals `j` when
-/// `j` has no field `k`.
+/// Appends the JSON object with the fields `fields` to `out`. A jsonb column
+/// keeps two fields with the same name, where PostgreSQL keeps only the last
+/// one. This function keeps them too, so `j - 'k'` equals `j` when `j` has no
+/// field `k`.
 fn push_json_object<'a>(
     fields: impl IntoIterator<Item = (JsonName<'a>, &'a str)>,
     out: &mut String,
@@ -1246,47 +1245,33 @@ fn push_json_object<'a>(
         }
         out.push_str(name.written);
         out.push(':');
-        out.push_str(&minified_json(value));
+        out.push_str(value);
     }
     out.push('}');
 }
 
-/// Appends the JSON array with the elements `elements`, which must be valid
-/// JSON, to `out`, without white space between its tokens, as a jsonb column
-/// reads an array.
+/// Appends the JSON array with the elements `elements` to `out`.
 fn push_json_array(elements: &[impl AsRef<str>], out: &mut String) {
     out.push('[');
     for (i, element) in elements.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        out.push_str(&minified_json(element.as_ref()));
+        out.push_str(element.as_ref());
     }
     out.push(']');
 }
 
-/// The JSON value `json`, which must be valid JSON, without white space
-/// between its tokens, as a jsonb column reads a value.
-fn minified_json(json: &str) -> String {
-    let mut out = String::with_capacity(json.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    for c in json.chars() {
-        if in_string {
-            out.push(c);
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-        } else if !matches!(c, ' ' | '\t' | '\n' | '\r') {
-            in_string = c == '"';
-            out.push(c);
-        }
+impl Jsonb {
+    /// The jsonb value of the JSON text `json`, which must be valid JSON. The
+    /// json() of core writes it, as it writes the text of a jsonb column: with
+    /// no white space between its tokens.
+    fn from_json(json: String) -> Result<Self> {
+        let Value::Text(text) = turso_core::get_json(&Value::build_text(json), None)? else {
+            unreachable!("json() of a text is a text");
+        };
+        Ok(Self(text.as_str().to_string()))
     }
-    out
 }
 
 /// PostgreSQL's `json -> key` and `jsonb -> key`: the JSON text of the field
