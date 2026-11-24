@@ -124,8 +124,9 @@ macaddr, macaddr8 or an enum to a type that does not read text fails with
 is read as its text: `20200101::date` and storing 20200101 in a date column
 give 2020-01-01, where PostgreSQL refuses both. TursoPG binds a parameter sent
 without a type as a number when its text is one, so refusing numbers would
-refuse such parameters too. `date::json` and `date::inet` are still accepted, as are `1::json`, `1::jsonb`,
-`1::inet`, `1::cidr` and `1::macaddr`, which PostgreSQL refuses. A jsonb value
+refuse such parameters too. `date::json` is still accepted, as are `1::json`, `1::jsonb`,
+`1::cidr` and `1::macaddr`, which PostgreSQL refuses. `1::inet` and `date::inet` fail with 23000,
+because the text is not an address, where PostgreSQL gives 42846. A jsonb value
 may be cast to a number: `'1'::jsonb::int`, `::bigint`, `::numeric`, `::float8`.
 `pg_input_is_valid`, `to_char` (numeric; other argument types fail with
 0A000), `now`/`clock_timestamp`/

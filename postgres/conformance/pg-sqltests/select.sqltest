@@ -493,12 +493,31 @@ test select-cast-to-domain-checks-constraint {
 @sqlstate 23514
 expect error {}
 
+test select-cast-integer-to-boolean {
+    SELECT 5::boolean, 0::boolean, (-3)::boolean;
+}
+expect {
+    t|f|t
+}
+
 test select-cast-function-integer-to-boolean {
     SELECT bool(5), bool(0);
 }
 expect {
     t|f
 }
+
+test select-cast-text-that-is-not-a-boolean-to-boolean-errors {
+    SELECT '5'::boolean;
+}
+@sqlstate 22P02
+expect error {}
+
+test select-cast-function-to-smallint-checks-the-range {
+    SELECT int2(40000);
+}
+@sqlstate 22003
+expect error {}
 
 test select-cast-integer-to-domain-over-boolean {
     CREATE DOMAIN db AS boolean;
