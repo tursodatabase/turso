@@ -3984,6 +3984,9 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
         fn logical_log_offset(&self) -> u64 {
             self.inner.logical_log_offset()
         }
+        fn logical_log_salt(&self) -> Result<u64> {
+            self.inner.logical_log_salt()
+        }
         fn should_checkpoint(&self) -> bool {
             self.inner.should_checkpoint()
         }

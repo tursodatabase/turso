@@ -11027,6 +11027,9 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
         fn logical_log_offset(&self) -> u64 {
             self.inner.logical_log_offset()
         }
+        fn logical_log_salt(&self) -> Result<u64> {
+            self.inner.logical_log_salt()
+        }
         fn should_checkpoint(&self) -> bool {
             self.inner.should_checkpoint()
         }
@@ -11262,6 +11265,9 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
         }
         fn logical_log_offset(&self) -> u64 {
             self.inner.logical_log_offset()
+        }
+        fn logical_log_salt(&self) -> Result<u64> {
+            self.inner.logical_log_salt()
         }
         fn should_checkpoint(&self) -> bool {
             self.inner.should_checkpoint()

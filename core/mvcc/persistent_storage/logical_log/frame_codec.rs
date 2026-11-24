@@ -27,6 +27,11 @@ impl ValidatedLogHeader {
         derive_initial_crc(self.header.salt)
     }
 
+    /// The random salt of the log. Each truncation of the log regenerates it.
+    pub fn salt(&self) -> u64 {
+        self.header.salt
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }

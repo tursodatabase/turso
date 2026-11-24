@@ -131,6 +131,10 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         self.inner.logical_log_offset()
     }
 
+    fn logical_log_salt(&self) -> turso_core::Result<u64> {
+        self.inner.logical_log_salt()
+    }
+
     fn should_checkpoint(&self) -> bool {
         self.inner.should_checkpoint()
     }

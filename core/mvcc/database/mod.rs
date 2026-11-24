@@ -9295,6 +9295,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.storage.logical_log_offset()
     }
 
+    /// The salt of the logical log header; see `DurableStorage::logical_log_salt`.
+    pub fn logical_log_salt(&self) -> Result<u64> {
+        self.storage.logical_log_salt()
+    }
+
     /// Replace the logical log with a fresh valid header after the database
     /// file was restored outside MVCC.
     ///
