@@ -99,8 +99,8 @@ gaps: build-runner
 # Fail when a gap test in the checkout at $(BASE) is gone from this one:
 # deleted, renamed, or converted into a plain test with other SQL, setups or
 # PostgreSQL answer. A fixed gap keeps its test and loses only @compat-gap and
-# the expect @tursopg block. CI runs it on pull requests with BASE set to the
-# target branch:
+# the expect @tursopg block; the test may move to another file. CI runs it on
+# pull requests with BASE set to the target branch:
 # make check-gap-removals BASE=/path/to/base/checkout
 check-gap-removals: build-runner
 	@test -n "$(BASE)" || { echo "set BASE to the checkout to compare with" >&2; exit 2; }
