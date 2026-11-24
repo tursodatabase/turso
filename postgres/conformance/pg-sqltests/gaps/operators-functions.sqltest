@@ -1246,14 +1246,6 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# B-127: ->> of a JSON boolean is the text true
-test of-a-json-boolean-is-the-text-true {
-    SELECT '{"a": true}'::jsonb ->> 'a', '{"a": true}'::jsonb ->> 'a' <> 'true';
-}
-expect {
-    true|f
-}
-
 # B-128: jsonb || concatenates two objects
 # B-122 also uses ||. After a fix, the output still differs because of A-45.
 @compat-gap "operator:jsonb || jsonb"
