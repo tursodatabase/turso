@@ -1608,6 +1608,7 @@ fn wire_conditions_of_every_kind_report_bool() {
             "SELECT 1 IN (1, 2)",
             "SELECT 1 IS NULL",
             "SELECT EXISTS (SELECT 1)",
+            "SELECT pg_is_in_recovery()",
             "SELECT count(*) > 0 FROM (SELECT 1) AS s",
             "SELECT CASE WHEN 1 < 2 THEN 1 < 3 ELSE false END",
             "SELECT coalesce(NULL, 1 < 2)",

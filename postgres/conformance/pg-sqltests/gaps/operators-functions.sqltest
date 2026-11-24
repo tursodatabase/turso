@@ -1468,3 +1468,14 @@ expect @tursopg {
     a
     b
 }
+
+@compat-gap "function:pg_is_in_recovery"
+test pg-is-in-recovery-is-false-on-a-primary {
+    SELECT pg_is_in_recovery();
+}
+expect {
+    f
+}
+expect @tursopg {
+    t
+}

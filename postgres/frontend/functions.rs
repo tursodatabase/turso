@@ -395,8 +395,8 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             role_name(connection, connection.session_role())?
         },
         "pg_backend_pid"(FunctionArity::Exact(0), true) => std::process::id() as i64,
-        // Temporary pg_dump compatibility: "t" means true, not actual recovery state.
-        "pg_is_in_recovery"(FunctionArity::Exact(0), false) => "t",
+        // Temporary pg_dump compatibility: true, not the actual recovery state.
+        "pg_is_in_recovery"(FunctionArity::Exact(0), false) => Boolean(true),
         "pg_lock_access_share"(FunctionArity::Exact(0), false) => {
             if connection.get_auto_commit() {
                 return Err(LimboError::InvalidArgument(
