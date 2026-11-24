@@ -2035,3 +2035,14 @@ expect {
     5
     7
 }
+
+# CREATE TABLE AS declares its columns with affinities, and only a STRICT
+# table has array columns, so an array result column is refused.
+test create-table-as-with-an-array-column-is-refused {
+    CREATE TABLE ctas_src (a INTEGER[]) STRICT;
+    INSERT INTO ctas_src VALUES (ARRAY[5,6]);
+    CREATE TABLE ctas_copy AS SELECT a FROM ctas_src;
+}
+expect error {
+    CREATE TABLE AS with an array column is not supported
+}

@@ -1252,3 +1252,18 @@ expect {
 }
 @sqlstate 42P01
 expect @tursopg error {}
+
+# CREATE TABLE AS declares its columns with SQLite affinities, which cannot
+# hold an array, so tursopg refuses an array column instead of storing text.
+@compat-gap "syntax:create-table-as"
+test create-table-as-with-an-array-column {
+    CREATE TABLE ctas_array_source (a int[]);
+    INSERT INTO ctas_array_source VALUES (ARRAY[5,6]);
+    CREATE TABLE ctas_array_copy AS SELECT a FROM ctas_array_source;
+    SELECT a, a[1] FROM ctas_array_copy;
+}
+expect {
+    {5,6}|5
+}
+@sqlstate 0A000
+expect @tursopg error {}

@@ -38,6 +38,7 @@ use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::result_column_types::plan_result_column_types;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::types::Conversion;
@@ -969,6 +970,19 @@ fn derive_ctas_schema(
             *name = format!("{name}:{count}");
         }
         *count += 1;
+    }
+
+    // The new table declares each column with an affinity, and an array column
+    // is allowed only in a STRICT table, so the copy could not store the array.
+    let column_types = plan_result_column_types(&plan, resolver);
+    if let Some(index) = column_types
+        .iter()
+        .position(|ty| ty.as_ref().is_some_and(|ty| ty.array_dimensions > 0))
+    {
+        bail_parse_error!(
+            "CREATE TABLE AS with an array column is not supported (column \"{}\")",
+            names[index]
+        );
     }
 
     let mut sql_parts = Vec::with_capacity(result_columns.len());
