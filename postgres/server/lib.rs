@@ -11,13 +11,14 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::{ConnectOpts, Database, StatementTimes, Value, WallClockInstant};
 use turso_pg::{
-    split_statements, sql_parse_error, sqlstate_error, PgConnection, StatementResultKind,
-    TransactionState,
+    parse_pg_bool, split_statements, sql_parse_error, sqlstate_error, PgConnection,
+    StatementResultKind, TransactionState,
 };
 use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_PROTOCOL_VIOLATION,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_PARAMETER_VALUE,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_PROTOCOL_VIOLATION,
 };
 use turso_pg_parser::ParseResult;
 
@@ -917,7 +918,7 @@ fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResul
     }
 }
 
-/// FIXME(pg-catalog): This hand-codes the input function (typinput in pg_type) of each declared parameter type, and differs from it: it accepts fewer spellings of boolean than boolin (not True, y or a value with spaces) and reads numeric as a float. A call to the typinput function of the declared type replaces this.
+/// FIXME(pg-catalog): This hand-codes the input function (typinput in pg_type) of each declared parameter type, and differs from it: it reads numeric as a float. A call to the typinput function of the declared type replaces this.
 /// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
 /// Assumes text format encoding (UTF-8 string representations).
 fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
@@ -944,12 +945,12 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
             })?;
             Ok(Value::from_f64(f))
         }
-        Type::BOOL => match text {
-            "t" | "true" | "TRUE" | "1" | "yes" | "on" => Ok(Value::from_i64(1)),
-            "f" | "false" | "FALSE" | "0" | "no" | "off" => Ok(Value::from_i64(0)),
-            _ => Err(PgWireError::UserError(Box::new(error_info(&format!(
-                "invalid boolean parameter: {text}"
-            ))))),
+        Type::BOOL => match parse_pg_bool(text) {
+            Some(truth) => Ok(Value::from_i64(i64::from(truth))),
+            None => Err(wire_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!("invalid input syntax for type boolean: \"{text}\""),
+            )),
         },
         Type::BYTEA => {
             // PostgreSQL text format for bytea uses \x hex encoding
@@ -2183,6 +2184,20 @@ mod tests {
         assert_eq!(val, Value::from_i64(0));
     }
 
+    /// A boolean parameter is read as boolean text in SQL is: in any case,
+    /// from the first letters of a word, and with whitespace around it.
+    #[test]
+    fn test_pg_bytes_to_value_bool_reads_text_as_postgres_does() {
+        for text in ["y", "True", " t", "tr", "YES", "on", "1"] {
+            let val = pg_bytes_to_value(text.as_bytes(), &Type::BOOL).unwrap();
+            assert_eq!(val, Value::from_i64(1), "{text:?}");
+        }
+        for text in ["n", "False", "f ", "fals", "NO", "of", "off", "0"] {
+            let val = pg_bytes_to_value(text.as_bytes(), &Type::BOOL).unwrap();
+            assert_eq!(val, Value::from_i64(0), "{text:?}");
+        }
+    }
+
     #[test]
     fn test_pg_bytes_to_value_text() {
         let val = pg_bytes_to_value(b"hello world", &Type::TEXT).unwrap();
@@ -2229,8 +2244,16 @@ mod tests {
 
     #[test]
     fn test_pg_bytes_to_value_bool_invalid() {
-        let result = pg_bytes_to_value(b"maybe", &Type::BOOL);
-        assert!(result.is_err());
+        for text in ["maybe", "o", "truex", ""] {
+            let Err(error) = pg_bytes_to_value(text.as_bytes(), &Type::BOOL) else {
+                panic!("{text:?}: no error");
+            };
+            assert_eq!(
+                sqlstate(error),
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

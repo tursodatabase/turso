@@ -2211,7 +2211,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
 /// and the case of the letters do not matter, and the start of true, false,
 /// yes or no is enough. For on and off, the first two letters are necessary.
 /// None when the text is not a boolean literal.
-pub(crate) fn parse_pg_bool(text: &str) -> Option<bool> {
+pub fn parse_pg_bool(text: &str) -> Option<bool> {
     let word = text
         .trim_matches(|c: char| c.is_ascii_whitespace() || c == '\u{b}')
         .to_ascii_lowercase();
