@@ -1,6 +1,7 @@
-# The boolean type reads text as PostgreSQL does. In each row of a result, the
-# text that was written is on the left and the boolean that the column stored
-# is on the right.
+# The boolean type reads text as PostgreSQL does, in a column and in a cast.
+# In each row of a result of a test that writes to a column, the text that was
+# written is on the left and the boolean that the column stored is on the
+# right.
 
 @database :memory:
 
@@ -99,4 +100,42 @@ test bool-refuses-empty-text {
 @sqlstate 22P02
 expect error {
     invalid input syntax for type boolean: ""
+}
+
+# A cast to boolean reads a value as a boolean column does.
+
+test bool-literal-casts-true-forms {
+    SELECT 't'::boolean, 'true'::boolean, 'yes'::boolean, 'on'::boolean, '1'::boolean, 'TRUE'::boolean, 'y'::boolean;
+}
+expect {
+    t|t|t|t|t|t|t
+}
+
+test bool-literal-casts-false-forms {
+    SELECT 'f'::boolean, 'false'::boolean, 'no'::boolean, 'off'::boolean, '0'::boolean;
+}
+expect {
+    f|f|f|f|f
+}
+
+test bool-invalid-literal {
+    SELECT 'maybe'::boolean;
+}
+@sqlstate 22P02
+expect error {}
+
+test cast-as-boolean-form {
+    SELECT CAST('true' AS boolean), CAST(1 AS boolean), CAST(0 AS boolean);
+}
+expect {
+    t|t|f
+}
+
+test jsonb-column-cast-to-boolean {
+    CREATE TABLE j (b jsonb);
+    INSERT INTO j VALUES ('true');
+    SELECT b::boolean FROM j;
+}
+expect {
+    t
 }

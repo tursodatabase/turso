@@ -19,37 +19,6 @@ setup t_b {
     CREATE TABLE t (b boolean);
 }
 
-# A-01: bool literal casts, true forms
-test bool-literal-casts-true-forms {
-    SELECT 't'::boolean, 'true'::boolean, 'yes'::boolean, 'on'::boolean, '1'::boolean, 'TRUE'::boolean, 'y'::boolean;
-}
-expect {
-    t|t|t|t|t|t|t
-}
-
-# A-02: bool literal casts, false forms
-test bool-literal-casts-false-forms {
-    SELECT 'f'::boolean, 'false'::boolean, 'no'::boolean, 'off'::boolean, '0'::boolean;
-}
-expect {
-    f|f|f|f|f
-}
-
-# A-04: bool invalid literal
-test bool-invalid-literal {
-    SELECT 'maybe'::boolean;
-}
-@sqlstate 22P02
-expect error {}
-
-# A-06: CAST(... AS boolean) form
-test cast-as-boolean-form {
-    SELECT CAST('true' AS boolean), CAST(1 AS boolean), CAST(0 AS boolean);
-}
-expect {
-    t|t|f
-}
-
 # A-07: int4 overflow literal cast
 @compat-gap "type:int4"
 test int4-overflow-literal-cast {
@@ -570,15 +539,6 @@ test numeric-10-2-column-rounds-on-insert {
 expect {
     1.01
     1.50
-}
-
-test jsonb-column-cast-to-boolean {
-    CREATE TABLE j (b jsonb);
-    INSERT INTO j VALUES ('true');
-    SELECT b::boolean FROM j;
-}
-expect {
-    t
 }
 
 # PostgreSQL has a cast to boolean only from int4, not from int2 or int8.
