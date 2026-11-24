@@ -1,11 +1,14 @@
-# The jsonb operators ->, ->>, @> and <@. The Data API turns a filter on a
-# jsonb field into `data ->> 'field' = 'value'`.
+# The jsonb operators ->, ->>, @>, <@, ?, ?|, ?&, #> and #>>. The Data API
+# turns a filter on a jsonb field into `data ->> 'field' = 'value'`.
 #
 # -> returns the field as JSON text, and ->> returns it as text: a string has
 # no quotes, a number is written as jsonb writes it (`1e2` as `100`), a
 # boolean is `true` or `false`, and a JSON null is NULL. A text key is the
 # name of a field, not a JSON path, and of two fields with the same name the
 # last one counts. @> and <@ compare jsonb values by containment.
+#
+# ? finds a key at the top level, and ?| and ?& find any or each key of an
+# array. #> and #>> find the value at a path, as a chain of -> and ->> does.
 
 @database :memory:
 
@@ -598,3 +601,206 @@ expect {
 expect @tursopg {
     -1
 }
+
+# ?, ?| and ?&
+
+@setup items_with_jsonb_rows
+test jsonb-key-exists {
+    SELECT id FROM items WHERE data ? 'dims' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup items_with_jsonb_rows
+test jsonb-key-exists-with-null-value {
+    SELECT id FROM items WHERE data ? 'note';
+}
+expect {
+    2
+}
+
+# ? looks only at the top level: w is a field of dims.
+@setup items_with_jsonb_rows
+test jsonb-key-exists-only-at-top-level {
+    SELECT count(*) FROM items WHERE data ? 'w';
+}
+expect {
+    0
+}
+
+# The string elements of an array and a string scalar count as keys. A
+# number and a nested array do not.
+test jsonb-key-exists-in-array-and-string {
+    SELECT ('["a",1]'::jsonb ? 'a')::int, ('["a",1]'::jsonb ? '1')::int, ('"foo"'::jsonb ? 'foo')::int, ('[["a"]]'::jsonb ? 'a')::int;
+}
+expect {
+    1|0|1|0
+}
+
+@setup items_with_jsonb_rows
+test jsonb-key-exists-of-null-is-null {
+    SELECT id, (data ? NULL IS NULL)::int FROM items WHERE (data ? 'qty') IS NULL;
+}
+expect {
+    4|1
+}
+
+@setup items_with_jsonb_rows
+test jsonb-any-key-exists {
+    SELECT id FROM items WHERE data ?| array['note','zzz'];
+}
+expect {
+    2
+}
+
+@setup items_with_jsonb_rows
+test jsonb-all-keys-exist {
+    SELECT id FROM items WHERE data ?& '{name,qty}' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup items_with_jsonb_rows
+test jsonb-all-keys-exist-not-when-one-is-missing {
+    SELECT id FROM items WHERE data ?& array['name','note'];
+}
+expect {
+    2
+}
+
+# Of an empty array, no key exists and each key exists.
+test jsonb-any-and-all-keys-of-empty-array {
+    SELECT ('{"a":1}'::jsonb ?| '{}')::int, ('{"a":1}'::jsonb ?& '{}')::int;
+}
+expect {
+    0|1
+}
+
+# A NULL element of the array is skipped.
+test jsonb-key-arrays-skip-null-elements {
+    SELECT ('{"a":1}'::jsonb ?| array['a',NULL])::int, ('{"a":1}'::jsonb ?& array['a',NULL])::int, ('{"a":1}'::jsonb ?& array[NULL::text])::int, ('{"a":1}'::jsonb ?| array[NULL::text])::int;
+}
+expect {
+    1|1|1|0
+}
+
+test jsonb-key-exists-with-integer-key-errors {
+    SELECT '{"a":1}'::jsonb ? 1;
+}
+@sqlstate 42883
+expect error {}
+
+# #> and #>>
+
+@setup items_with_jsonb_rows
+test jsonb-path-of-nested-field {
+    SELECT data #> '{dims,w}', data #>> '{dims,w}', data #>> ARRAY['name'] FROM items WHERE id = 1;
+}
+expect {
+    3|3|apple
+}
+
+@setup items_with_jsonb_rows
+test jsonb-path-text-compared-to-text {
+    SELECT id FROM items WHERE data #>> '{dims,w}' = '20';
+}
+expect {
+    2
+}
+
+# An index can be negative, and counts from the end of the array then.
+@setup items_with_jsonb_rows
+test jsonb-path-of-array-element {
+    SELECT data #> '{tags,0}', data #>> '{tags,1}', data #>> '{tags,-1}', data #>> '{tags,2}' FROM items WHERE id = 1;
+}
+expect {
+    "fruit"|red|red|
+}
+
+# PostgreSQL reads an index with strtol(), so white space and a sign may come
+# before the digits.
+test jsonb-path-index-with-white-space-and-sign {
+    SELECT '[1,2,3]'::jsonb #>> '{" 1"}', '[1,2,3]'::jsonb #>> '{+1}', '[1,2,3]'::jsonb #>> '{-3}';
+}
+expect {
+    2|2|1
+}
+
+@setup items_with_jsonb_rows
+test jsonb-path-index-that-is-not-in-the-array-is-null {
+    SELECT count(*) FROM items WHERE id = 3 AND data #> '{1x}' IS NULL AND data #> '{-4}' IS NULL AND data #> '{3}' IS NULL AND data #> '{a}' IS NULL;
+}
+expect {
+    1
+}
+
+# #> does not read a scalar document as an array of one element, as
+# PostgreSQL's -> does for jsonb.
+test jsonb-path-into-a-scalar-is-null {
+    SELECT ('"x"'::jsonb #> '{0}' IS NULL)::int, ('{"a":1}'::jsonb #> '{a,b}' IS NULL)::int;
+}
+expect {
+    1|1
+}
+
+# An empty path gives the document itself.
+test jsonb-empty-path {
+    SELECT '"x"'::jsonb #>> '{}', ('null'::jsonb #>> '{}' IS NULL)::int, 'null'::jsonb #> '{}', '1.50'::jsonb #>> '{}';
+}
+expect {
+    x|1|null|1.50
+}
+
+@setup items_with_jsonb_rows
+test jsonb-path-to-json-null {
+    SELECT data #> '{note}', (data #>> '{note}' IS NULL)::int FROM items WHERE id = 2;
+}
+expect {
+    null|1
+}
+
+@setup items_with_jsonb_rows
+test jsonb-path-with-null-element-is-null {
+    SELECT count(*) FROM items WHERE id = 1 AND data #> ARRAY['dims',NULL] IS NULL AND data #>> ARRAY[NULL,'w'] IS NULL;
+}
+expect {
+    1
+}
+
+test json-path {
+    SELECT '{"a":[1,"x"]}'::json #>> '{a,1}', '{"a":[1,"x"]}'::json #> '{a,0}';
+}
+expect {
+    x|1
+}
+
+test jsonb-path-that-is-not-an-array-errors {
+    SELECT '{"a":1}'::jsonb #> 'a';
+}
+@sqlstate 22P02
+expect error {}
+
+# An index expression can use only core functions, and ?, ?|, ?&, #> and #>>
+# run functions of the PostgreSQL frontend.
+
+# TODO let expression indexes use frontend functions
+@setup items_with_jsonb_rows
+@skip-if postgres "Expression indexes can't use functions from frontends yet"
+test jsonb-key-exists-in-index-expression-errors {
+    CREATE INDEX items_has_note ON items ((data ? 'note'));
+}
+@sqlstate 0A000
+expect error {}
+
+# TODO let expression indexes use frontend functions
+@setup items_with_jsonb_rows
+@skip-if postgres "Expression indexes can't use functions from frontends yet"
+test jsonb-path-in-index-expression-errors {
+    CREATE INDEX items_width ON items ((data #>> '{dims,w}'));
+}
+@sqlstate 0A000
+expect error {}

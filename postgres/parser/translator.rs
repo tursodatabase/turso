@@ -4234,8 +4234,10 @@ impl PostgreSQLTranslator {
             // PostgreSQL has -> and ->> only for json and jsonb, so they run the
             // frontend's functions. SQLite's operators read a text key such as
             // '$.a' as a JSON path, take the first of two equal keys, and give
-            // numbers and booleans as SQL values instead of text.
-            "->" | "->>" => {
+            // numbers and booleans as SQL values instead of text. #> and #>>
+            // exist only for json and jsonb, and ?, ?| and ?& only for jsonb,
+            // so they run the frontend's functions too.
+            "->" | "->>" | "#>" | "#>>" | "?" | "?|" | "?&" => {
                 // An index expression and a generation expression can use only
                 // core functions.
                 if self.translating_index.get() {
@@ -4252,10 +4254,15 @@ impl PostgreSQLTranslator {
                         ),
                     });
                 }
-                let func_name = if op_name == "->" {
-                    "jsonb_field"
-                } else {
-                    "jsonb_field_text"
+                let func_name = match op_name {
+                    "->" => "jsonb_field",
+                    "->>" => "jsonb_field_text",
+                    "#>" => "jsonb_field_path",
+                    "#>>" => "jsonb_field_path_text",
+                    "?" => "jsonb_exists",
+                    "?|" => "jsonb_exists_any",
+                    "?&" => "jsonb_exists_all",
+                    _ => unreachable!("the arm matches only the json operators"),
                 };
                 return Ok(function_call(func_name, vec![*left, *right]));
             }

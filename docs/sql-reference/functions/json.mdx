@@ -279,6 +279,12 @@ Through the PostgreSQL frontend, `->` and `->>` work as in PostgreSQL. The right
 
 Through the PostgreSQL frontend, `@>` and `<@` compare jsonb values as in PostgreSQL: `'{"a":1,"b":2}'::jsonb @> '{"a":1}'` is true, and `a <@ b` is `b @> a`. An object contains an object when it has each field of that object, with a value that contains the value of the field. An array contains an array when each element of that array is contained by one of its elements, in any order. Only at the top level does an array also contain a scalar that is one of its elements. Numbers compare by value, so `1.5` equals `1.50`. If an object has two fields with the same name, the last one counts. An index expression and a stored generated column use the array function for `@>` and `<@`, which returns NULL for jsonb values. [Array Functions](/docs/sql-reference/functions/array) describes `@>` and `<@` for arrays.
 
+Through the PostgreSQL frontend, `?`, `?|` and `?&` find keys in a jsonb value, as in PostgreSQL. `j ? 'k'` is true when `k` is the name of a field of the object `j`, a string element of the array `j`, or the string `j` itself. Only the top level counts. `j ?| '{a,b}'` is true when one of the keys exists, and `j ?& '{a,b}'` is true when each key exists. These operators skip a NULL element of the array.
+
+Through the PostgreSQL frontend, `#>` and `#>>` find the value at a path, as a chain of `->` and `->>` does: `'{"a":{"b":[1,2]}}'::jsonb #>> '{a,b,1}'` is `2`. Each element of the text array is the name of a field, or the index of an element when the value is an array. A negative index counts from the end of the array. An empty path gives the document itself. A path into a scalar, or a path with a NULL element, gives NULL. `#>` returns the JSON text of the value, as `->` does, and `#>>` returns text, as `->>` does.
+
+A `CREATE INDEX` or a stored generated column that uses `?`, `?|`, `?&`, `#>` or `#>>` fails with SQLSTATE 0A000.
+
 ### json_type
 
 Returns the type of a JSON value as a string: `"null"`, `"true"`, `"false"`, `"integer"`, `"real"`, `"text"`, `"array"`, or `"object"`.
