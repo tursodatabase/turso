@@ -412,6 +412,8 @@ SELECT datetime(0, 'unixepoch');
 | `localtime` | Convert from UTC to local time |
 | `utc` | Convert from local time to UTC |
 
+As in SQLite, for a date before 1970-01-01 or after 2038-01-18 these modifiers use the time zone offset of the same date and time in one of the years 2000 to 2003, chosen so that leap years match.
+
 ```sql
 SELECT datetime('2025-06-15 14:30:00', 'localtime');
 -- '2025-06-15 07:30:00' (example: UTC-7)
