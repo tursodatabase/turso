@@ -4636,6 +4636,7 @@ impl PostgreSQLTranslator {
             _ => func_name,
         };
 
+        // FIXME(pg-catalog): This hand-codes the pg_proc functions named after a type (float8, float4, int4, int2, int8, bool, text) as casts, and casts int2 and float4 to the wider INTEGER and REAL, so int2(70000) does not raise "smallint out of range" as it does in PostgreSQL. Function resolution in pg_proc, which finds the cast functions of pg_cast, replaces this.
         // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
             "FLOAT8" | "FLOAT4" => Some("REAL"),
@@ -10610,6 +10611,7 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
 /// tursopg functions that PostgreSQL does not have, so user SQL cannot call them.
 const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &["int8_out_of_range"];
 
+// FIXME(pg-collation): This hand-codes the pg_collation entries that compare bytes (C, POSIX, ucs_basic) and counts default among them, where PostgreSQL's default collation is the one of the database (pg_database.datcollate, en_US.utf8 in the postgres:18 image). It matches the names without regard to case, so it accepts `COLLATE C`, which PostgreSQL folds to "c" and refuses. A lookup in a pg_collation table replaces this.
 fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
     let Ok(names) = extract_key_columns(collname) else {
         return false;

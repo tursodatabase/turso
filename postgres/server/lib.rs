@@ -711,6 +711,7 @@ fn resolve_pg_type_for_column(stmt: &turso_pg::Statement, idx: usize) -> Type {
     base
 }
 
+/// FIXME(pg-catalog): This hand-codes typarray of pg_type, and sends an array of any type it does not list as text[]. A lookup of typarray in a pg_type table replaces this.
 /// Map a scalar PG type to its array counterpart.
 fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
     if *scalar == Type::INT4 {
@@ -1086,6 +1087,7 @@ fn binary_value_not_supported(pg_type: &Type) -> turso_core::LimboError {
     sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, message, None)
 }
 
+/// FIXME(pg-catalog): This is a second hand-written map from type names to pg_type entries, besides `pg_type_oid` in postgres/frontend/catalog.rs, and the two disagree: this one sends smallint as int4, numeric without a precision as float8 and timetz as time, where pg_type has int2 (21), numeric (1700) and timetz (1266). A lookup in a pg_type table replaces this.
 fn sqlite_type_to_pg_type(type_str: &str) -> Type {
     let upper = type_str.to_uppercase();
     match upper.as_str() {
