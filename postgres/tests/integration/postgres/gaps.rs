@@ -21,11 +21,9 @@ use crate::common::TempDatabase;
 use std::num::NonZero;
 use turso_core::{Numeric, Value};
 
-// A-03 (S1): bool $n param cast (text param)
-// tursopg: boolean text params all cast to false.
-// PostgreSQL: 1|1|0|1
+// A-03: bool $n param cast (text param)
 #[turso_macros::test(views)]
-fn gap_a_03_tursopg_returns_wrong_result_bool_n_param_cast_text_param(db: TempDatabase) {
+fn gap_a_03_bool_n_param_cast_text_param(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::boolean, $2::boolean, $3::boolean, $4::boolean",
         params: &[
@@ -37,21 +35,19 @@ fn gap_a_03_tursopg_returns_wrong_result_bool_n_param_cast_text_param(db: TempDa
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "0|0|0|0");
+    assert_eq!(out, "1|1|0|1");
 }
 
-// A-05 (S1): bool invalid param
-// tursopg: an invalid boolean param casts to false instead of failing.
-// PostgreSQL: ERROR 22P02
+// A-05: bool invalid param
 #[turso_macros::test(views)]
-fn gap_a_05_tursopg_returns_wrong_result_bool_invalid_param(db: TempDatabase) {
+fn gap_a_05_bool_invalid_param(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::boolean",
         params: &[P::Text("maybe")],
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "0");
+    assert_eq!(out, "ERROR 22P02");
 }
 
 // A-12 (S1): invalid int param cast

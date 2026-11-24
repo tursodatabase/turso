@@ -1,0 +1,141 @@
+# The boolean type reads text as PostgreSQL does, in a column and in a cast.
+# In each row of a result of a test that writes to a column, the text that was
+# written is on the left and the boolean that the column stored is on the
+# right.
+
+@database :memory:
+
+test bool-reads-whole-words {
+    CREATE TABLE t (id int, input text, b boolean);
+    INSERT INTO t VALUES
+        (1, 'true', 'true'), (2, 'false', 'false'), (3, 'yes', 'yes'), (4, 'no', 'no'),
+        (5, 'on', 'on'), (6, 'off', 'off'), (7, '1', '1'), (8, '0', '0');
+    SELECT input, b FROM t ORDER BY id;
+}
+expect {
+    true|t
+    false|f
+    yes|t
+    no|f
+    on|t
+    off|f
+    1|t
+    0|f
+}
+
+# The first letters of true, false, yes or no are enough.
+test bool-reads-first-letters-of-a-word {
+    CREATE TABLE t (id int, input text, b boolean);
+    INSERT INTO t VALUES (1, 'y', 'y'), (2, 'n', 'n'), (3, 'tr', 'tr'), (4, 'fals', 'fals');
+    SELECT input, b FROM t ORDER BY id;
+}
+expect {
+    y|t
+    n|f
+    tr|t
+    fals|f
+}
+
+# off needs two letters, because on starts with o too.
+test bool-reads-of-as-off {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('of');
+    SELECT b FROM t;
+}
+expect {
+    f
+}
+
+test bool-refuses-o {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('o');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type boolean: "o"
+}
+
+# Whitespace around the text and the case of the letters do not count.
+test bool-reads-text-with-whitespace-and-capitals {
+    CREATE TABLE t (id int, input text, b boolean);
+    INSERT INTO t VALUES (1, ' true ', ' true '), (2, 'FALSE', 'FALSE');
+    SELECT '[' || input || ']', b FROM t ORDER BY id;
+}
+expect {
+    [ true ]|t
+    [FALSE]|f
+}
+
+test bool-reads-text-in-update {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES (true);
+    UPDATE t SET b = 'n';
+    SELECT b FROM t;
+}
+expect {
+    f
+}
+
+test invalid-bool-into-bool-column {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('maybe');
+}
+@sqlstate 22P02
+expect error {}
+
+# Text that goes on after the word is not a boolean.
+test bool-refuses-text-longer-than-the-word {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('truex');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type boolean: "truex"
+}
+
+test bool-refuses-empty-text {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type boolean: ""
+}
+
+# A cast to boolean reads a value as a boolean column does.
+
+test bool-literal-casts-true-forms {
+    SELECT 't'::boolean, 'true'::boolean, 'yes'::boolean, 'on'::boolean, '1'::boolean, 'TRUE'::boolean, 'y'::boolean;
+}
+expect {
+    t|t|t|t|t|t|t
+}
+
+test bool-literal-casts-false-forms {
+    SELECT 'f'::boolean, 'false'::boolean, 'no'::boolean, 'off'::boolean, '0'::boolean;
+}
+expect {
+    f|f|f|f|f
+}
+
+test bool-invalid-literal {
+    SELECT 'maybe'::boolean;
+}
+@sqlstate 22P02
+expect error {}
+
+test cast-as-boolean-form {
+    SELECT CAST('true' AS boolean), CAST(1 AS boolean), CAST(0 AS boolean);
+}
+expect {
+    t|t|f
+}
+
+test jsonb-column-cast-to-boolean {
+    CREATE TABLE j (b jsonb);
+    INSERT INTO j VALUES ('true');
+    SELECT b::boolean FROM j;
+}
+expect {
+    t
+}
