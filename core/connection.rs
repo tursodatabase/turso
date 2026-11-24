@@ -574,8 +574,8 @@ pub struct Connection {
     /// How many of `n_active_read_statements` free a b-tree
     /// (`PreparedProgram::destroys_btree`), as DROP TABLE and DROP INDEX do.
     pub(crate) n_active_destroy_statements: AtomicI32,
-    /// How many MVCC commits of this connection are running, as counted by
-    /// `CommitStateMachine::is_active_commit`. While it is above 0,
+    /// How many MVCC commit state machines of this connection exist, from
+    /// `CommitStateMachine::new` until they are dropped. While it is above 0,
     /// only the statement stepping the commit may step (see `Statement::_step`).
     pub(crate) n_active_mvcc_commits: AtomicI32,
     /// Prevents root statements and explicit checkpoints from overlapping on this connection.

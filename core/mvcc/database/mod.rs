@@ -1728,12 +1728,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> ProvidesYieldContext
 pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
     state: CommitState<Clock, A>,
     is_finalized: bool,
-    /// Whether this commit is counted in `Connection::n_active_mvcc_commits`,
-    /// which keeps the other statements of the connection from running from
-    /// the start of the commit until the transaction is removed from `txs`
-    /// and from the connection, or, when the connection has an attached or
-    /// temp database, until the state machine is dropped.
-    is_active_commit: bool,
     #[cfg(any(test, injected_yields))]
     yield_instance_id: u64,
     did_commit_schema_change: bool,
@@ -1775,7 +1769,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for CommitStateMachine<C
 impl<Clock: LogicalClock, A: ConcurrentAllocator> Drop for CommitStateMachine<Clock, A> {
     fn drop(&mut self) {
         self.cleanup_unfinished_commit();
-        self.end_active_commit();
+        // `new` counted this commit in `n_active_mvcc_commits`. The count
+        // stays up while the auto-checkpoint runs: the checkpoint runs on
+        // this connection and its pager, which a statement run then would use
+        // too, and the COMMIT may still have to commit the transactions of
+        // attached databases, which such a statement would join or roll back.
+        let previous = self
+            .connection
+            .n_active_mvcc_commits
+            .fetch_sub(1, Ordering::SeqCst);
+        turso_assert!(previous > 0, "n_active_mvcc_commits went below 0");
     }
 }
 
@@ -1863,7 +1866,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         Ok(Self {
             state,
             is_finalized: false,
-            is_active_commit: true,
             #[cfg(any(test, injected_yields))]
             yield_instance_id: connection.next_yield_instance_id(),
             did_commit_schema_change: schema_did_change_from_tx,
@@ -1987,18 +1989,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             "Connection should not still reference an MVCC tx after a successful commit",
             { "tx_id": tx_id, "db_id": db_id }
         );
-    }
-
-    fn end_active_commit(&mut self) {
-        if !self.is_active_commit {
-            return;
-        }
-        self.is_active_commit = false;
-        let previous = self
-            .connection
-            .n_active_mvcc_commits
-            .fetch_sub(1, Ordering::SeqCst);
-        turso_assert!(previous > 0, "n_active_mvcc_commits went below 0");
     }
 
     fn take_next_group_record(&mut self) -> bool {
@@ -3816,16 +3806,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         auto_checkpoint_mode,
                     ));
                     let state_machine = Box::new(Mutex::new(state_machine));
-                    // The transaction is gone from `txs` and from the
-                    // connection, so the connection's next statements start a
-                    // new transaction and may run while the checkpoint yields.
-                    // With an attached or temp database they wait until the
-                    // COMMIT ends: it may still have to commit the
-                    // transactions of those databases, which a statement run
-                    // now would join or roll back.
-                    if !self.connection.has_non_main_pagers.load(Ordering::Acquire) {
-                        self.end_active_commit();
-                    }
                     self.state = CommitState::Checkpoint { state_machine };
                     return Ok(TransitionResult::Continue);
                 }

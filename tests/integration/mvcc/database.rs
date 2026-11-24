@@ -14016,81 +14016,95 @@ fn statements_of_a_connection_wait_for_a_yielded_nextval_commit() {
     );
 }
 
-/// A COMMIT that covers the main database and an attached MVCC database
-/// commits the attached transaction after the main database's
-/// auto-checkpoint. While that checkpoint yields, the other statements of the
-/// connection wait: a ROLLBACK run then removed the attached transaction, and
-/// the COMMIT still returned Ok without the attached rows.
+/// With `mvcc_checkpoint_threshold = 0` a COMMIT runs an auto-checkpoint
+/// after it has removed its transaction. While that checkpoint yields, the
+/// other statements of the connection wait. Without an attached database, an
+/// INSERT run then returned Ok and was lost, and every later write got Busy.
+/// With an attached MVCC database, which the COMMIT commits after the
+/// checkpoint, a ROLLBACK run then removed the attached transaction, and the
+/// COMMIT still returned Ok without the attached rows.
 #[test]
-fn statements_of_a_connection_wait_for_the_attached_part_of_its_commit() {
-    for point in [
-        CheckpointYieldPoint::BeforeAcquireLock,
-        CheckpointYieldPoint::BeforePagerCommit,
-    ] {
-        let opts = DatabaseOpts::new().with_attach(true);
-        let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(opts);
-        let aux_dir = tempfile::TempDir::new().unwrap();
-        let aux_path = aux_dir.path().join("aux.db");
-        let attach = format!("ATTACH '{}' AS aux", aux_path.to_str().unwrap());
-        let conn = db.connect();
-        conn.execute(&attach).unwrap();
-        conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
-            .unwrap();
-        conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY)")
-            .unwrap();
-        conn.execute("CREATE TABLE aux.u (x INTEGER PRIMARY KEY)")
-            .unwrap();
-        conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
-            .unwrap();
-        conn.execute("BEGIN").unwrap();
-        conn.execute("INSERT INTO t VALUES (1)").unwrap();
-        conn.execute("INSERT INTO aux.u VALUES (0), (1), (2), (3), (4)")
-            .unwrap();
-
-        let injector = FixedYieldInjector::new([point.point()]);
-        conn.set_yield_injector(Some(injector.clone()));
-        let mut commit = conn.prepare("COMMIT").unwrap();
-        while !injector.is_empty() {
-            assert!(
-                matches!(commit.step().unwrap(), StepResult::Yield | StepResult::IO),
-                "COMMIT finished without reaching {point:?}"
-            );
-        }
-        conn.set_yield_injector(None);
-
-        for sql in [
-            "BEGIN",
-            "ROLLBACK",
-            "INSERT INTO aux.u VALUES (99)",
-            "SELECT count(*) FROM aux.u",
+fn statements_of_a_connection_wait_for_the_auto_checkpoint_of_its_commit() {
+    for with_attached in [false, true] {
+        for point in [
+            CheckpointYieldPoint::BeforeAcquireLock,
+            CheckpointYieldPoint::BeforePagerCommit,
         ] {
-            let result = conn.execute(sql);
-            assert!(
-                matches!(result, Err(LimboError::StatementsInProgress(_))),
-                "{sql} during a COMMIT paused at {point:?} returned {result:?}"
+            let opts = DatabaseOpts::new().with_attach(true);
+            let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(opts);
+            let aux_dir = tempfile::TempDir::new().unwrap();
+            let aux_path = aux_dir.path().join("aux.db");
+            let attach = format!("ATTACH '{}' AS aux", aux_path.to_str().unwrap());
+            let table = if with_attached { "aux.u" } else { "t" };
+            let conn = db.connect();
+            if with_attached {
+                conn.execute(&attach).unwrap();
+                conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+                    .unwrap();
+                conn.execute("CREATE TABLE aux.u (x INTEGER PRIMARY KEY)")
+                    .unwrap();
+            }
+            conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY)")
+                .unwrap();
+            conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+                .unwrap();
+            conn.execute("BEGIN").unwrap();
+            conn.execute("INSERT INTO t VALUES (0)").unwrap();
+            if with_attached {
+                conn.execute("INSERT INTO aux.u VALUES (0), (1), (2), (3), (4)")
+                    .unwrap();
+            }
+
+            let injector = FixedYieldInjector::new([point.point()]);
+            conn.set_yield_injector(Some(injector.clone()));
+            let mut commit = conn.prepare("COMMIT").unwrap();
+            while !injector.is_empty() {
+                assert!(
+                    matches!(commit.step().unwrap(), StepResult::Yield | StepResult::IO),
+                    "COMMIT finished without reaching {point:?}"
+                );
+            }
+            conn.set_yield_injector(None);
+
+            for sql in [
+                "BEGIN".to_string(),
+                "ROLLBACK".to_string(),
+                format!("INSERT INTO {table} VALUES (51)"),
+                format!("SELECT count(*) FROM {table}"),
+            ] {
+                let result = conn.execute(&sql);
+                assert!(
+                    matches!(result, Err(LimboError::StatementsInProgress(_))),
+                    "{sql} during a COMMIT paused at {point:?} (attached: {with_attached}) returned {result:?}"
+                );
+            }
+            commit.run_ignore_rows().unwrap();
+            drop(commit);
+            let expected = if with_attached { 5 } else { 1 };
+            assert_eq!(
+                get_rows(&conn, &format!("SELECT count(*) FROM {table}")),
+                vec![vec![Value::from_i64(expected)]]
+            );
+            conn.execute(format!("INSERT INTO {table} VALUES (52)"))
+                .unwrap();
+            drop(conn);
+
+            db.restart();
+            let conn = db.connect();
+            if with_attached {
+                conn.execute(&attach).unwrap();
+                conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+                    .unwrap();
+            }
+            assert_eq!(
+                get_rows(&conn, "SELECT count(*) FROM t"),
+                vec![vec![Value::from_i64(if with_attached { 1 } else { 2 })]]
+            );
+            assert_eq!(
+                get_rows(&conn, &format!("SELECT count(*) FROM {table}")),
+                vec![vec![Value::from_i64(expected + 1)]],
+                "reopened database after a COMMIT paused at {point:?} (attached: {with_attached})"
             );
         }
-        commit.run_ignore_rows().unwrap();
-        drop(commit);
-        assert_eq!(
-            get_rows(&conn, "SELECT count(*) FROM aux.u"),
-            vec![vec![Value::from_i64(5)]]
-        );
-        drop(conn);
-
-        db.restart();
-        let conn = db.connect();
-        conn.execute(&attach).unwrap();
-        conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
-            .unwrap();
-        assert_eq!(
-            get_rows(&conn, "SELECT count(*) FROM t"),
-            vec![vec![Value::from_i64(1)]]
-        );
-        assert_eq!(
-            get_rows(&conn, "SELECT count(*) FROM aux.u"),
-            vec![vec![Value::from_i64(5)]],
-            "reopened database after a COMMIT paused at {point:?}"
-        );
     }
 }

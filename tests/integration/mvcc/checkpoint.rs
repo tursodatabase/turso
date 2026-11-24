@@ -3951,8 +3951,8 @@ fn test_schema_frame_recovery_rename_column_then_drop_index_checkpoints_after_re
 ///    enabled, making the index schema row durable after the delayed checkpoint's
 ///    schema snapshot.
 /// 3. A later INSERT writes a fresh index row version for that now-durable index.
-/// 4. The background connection observes the new schema through normal SQL, so
-///    the resumed checkpoint no longer fails early as a stale-schema write.
+/// 4. The background connection adopts the new schema, so the resumed
+///    checkpoint no longer fails early as a stale-schema write.
 /// 5. Resuming the delayed checkpoint refreshes its durable watermark, skips the
 ///    durable CREATE INDEX schema row, but still collects the fresh index row.
 ///    The checkpoint-local `index_id_to_index` map must have been refreshed
@@ -4005,11 +4005,9 @@ fn test_auto_checkpoint_refreshes_index_metadata_after_schema_change() {
         .execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
         .unwrap();
     conn_a.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
-    let rows = get_rows(
-        &conn_b,
-        "SELECT name FROM sqlite_schema WHERE type = 'index' AND name = 'idx'",
-    );
-    assert_eq!(rows.len(), 1);
+    // A statement of conn_b cannot run while conn_b's commit is unfinished,
+    // so conn_b adopts the new schema directly.
+    conn_b.maybe_update_schema();
 
     delayed_ckpt.run_ignore_rows().unwrap();
 
