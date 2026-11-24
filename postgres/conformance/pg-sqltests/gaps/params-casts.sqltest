@@ -654,3 +654,19 @@ expect error {}
 expect @tursopg {
     1
 }
+
+# PostgreSQL stores an array in a text column through its assignment cast to
+# text; tursopg has no assignment cast from an array to text.
+@compat-gap "cast:_int4 -> text"
+test insert-select-array-into-text-column {
+    CREATE TABLE assign_array_source (a int[]);
+    INSERT INTO assign_array_source VALUES (ARRAY[1,2]);
+    CREATE TABLE assign_text_target (s text);
+    INSERT INTO assign_text_target (s) SELECT a FROM assign_array_source;
+    SELECT s FROM assign_text_target;
+}
+expect {
+    {1,2}
+}
+@sqlstate 23000
+expect @tursopg error {}
