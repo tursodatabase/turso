@@ -54,6 +54,7 @@ pub(crate) fn is_pg_catalog(schema: &str) -> bool {
     schema == "pg_catalog"
 }
 
+/// FIXME(pg-namespace): This accepts pg_catalog, information_schema and public as the schema of every built-in type and function, because types and functions are not stored per schema. PostgreSQL refuses `1::public.int4` and `public.lower(x)`. A pg_namespace entry for each type and function, found through search_path, replaces this.
 /// Whether `schema` names the schema that types and functions are looked
 /// up in anyway: the catalog, or public, where PostgreSQL puts user types.
 pub(crate) fn is_default_schema(schema: &str) -> bool {

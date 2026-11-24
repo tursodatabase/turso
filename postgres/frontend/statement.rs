@@ -609,8 +609,10 @@ enum BooleanResultType {
     Other,
 }
 
-// TODO: With better binding and resolved expression support, read the result type
-// from the resolved expression instead. Inferring it from expression shapes here
+// FIXME(pg-catalog): This guesses from the shape of the expression whether a
+// result column is boolean, because Turso has no typed expression tree. With
+// better binding and resolved expression support, read the result type from
+// the resolved expression instead. Inferring it from expression shapes here
 // is fragile: new expressions and rewrites can lose the boolean type.
 fn boolean_result_type(
     expr: &turso_core::ast::Expr,

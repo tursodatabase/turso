@@ -975,6 +975,7 @@ fn check_type_accepts_collate(ty: &ExprType, schema: &Schema) -> Result<()> {
     )))
 }
 
+/// FIXME(pg-catalog): This decides from the stored forms of two types whether they compare, in place of looking up a pg_operator entry for the pair, so it refuses comparisons that PostgreSQL runs: pg_operator has `=` and `<` for timestamp with timestamptz and for date with either. A lookup in pg_operator, with pg_cast for implicit coercion, replaces this.
 /// The one decision that two values of different custom types do not compare.
 /// A domain compares as the type it is declared on, so two domains over one
 /// type, or a domain and its base, compare as that type does. After that,

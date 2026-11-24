@@ -433,6 +433,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         }
         let stmt = conn.prepare(&target.statement).map_err(pg_error)?;
 
+        // FIXME(pg-catalog): This describes a parameter with no declared type as text, where PostgreSQL gives the type its context requires. A typed expression tree replaces this.
         let param_types: Vec<Type> = target
             .parameter_types
             .iter()
@@ -710,6 +711,7 @@ fn resolve_pg_type_for_column(stmt: &turso_pg::Statement, idx: usize) -> Type {
     base
 }
 
+/// FIXME(pg-catalog): This hand-codes typarray of pg_type, and sends an array of any type it does not list as text[]. A lookup of typarray in a pg_type table replaces this.
 /// Map a scalar PG type to its array counterpart.
 fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
     if *scalar == Type::INT4 {
@@ -895,6 +897,7 @@ fn bind_portal_parameters(
     Ok(())
 }
 
+/// FIXME(pg-catalog): This refuses a binary parameter of unknown type because Turso cannot work out its type from the query. A typed expression tree replaces this refusal.
 /// Reads parameter `$n` sent in binary format as `pg_type`, the type Parse
 /// declared for it. A type whose binary format is its text is read as in text
 /// format. A parameter whose type Parse left out or left unspecified (OID 0)
@@ -914,6 +917,7 @@ fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResul
     }
 }
 
+/// FIXME(pg-catalog): This hand-codes the input function (typinput in pg_type) of each declared parameter type, and differs from it: it accepts fewer spellings of boolean than boolin (not True, y or a value with spaces) and reads numeric as a float. A call to the typinput function of the declared type replaces this.
 /// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
 /// Assumes text format encoding (UTF-8 string representations).
 fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
@@ -961,6 +965,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 Ok(Value::from_blob(bytes.to_vec()))
             }
         }
+        // FIXME(pg-catalog): PostgreSQL resolves an unknown-type parameter from its context, as an operand of an operator or a function or as a target column. A typed expression tree replaces this guess.
         // UNKNOWN: try to infer type from text content (numeric-looking values
         // should be bound as numbers so comparisons with COUNT/SUM etc. work)
         Type::UNKNOWN => {
@@ -1082,6 +1087,7 @@ fn binary_value_not_supported(pg_type: &Type) -> turso_core::LimboError {
     sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, message, None)
 }
 
+/// FIXME(pg-catalog): This is a second hand-written map from type names to pg_type entries, besides `pg_type_oid` in postgres/frontend/catalog.rs, and the two disagree: this one sends smallint as int4, numeric without a precision as float8 and timetz as time, where pg_type has int2 (21), numeric (1700) and timetz (1266). A lookup in a pg_type table replaces this.
 fn sqlite_type_to_pg_type(type_str: &str) -> Type {
     let upper = type_str.to_uppercase();
     match upper.as_str() {

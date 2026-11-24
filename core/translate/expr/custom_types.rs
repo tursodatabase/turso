@@ -2,6 +2,7 @@ use super::*;
 use crate::schema::ResolvedType;
 use crate::types::{Conversion, StorageClass, StrictType};
 
+/// FIXME(pg-catalog): This types literals by the rules of SQLite: TRUE and FALSE are integer and 1.5 is real, where PostgreSQL types them boolean and numeric. The type decides whether an operator of a custom type encodes the literal to that type. A typed expression tree that gives literals the types of the dialect replaces this.
 /// Get the effective type name of a literal expression.
 pub(super) fn literal_type_name(expr: &ast::Expr) -> Option<&'static str> {
     match expr {
