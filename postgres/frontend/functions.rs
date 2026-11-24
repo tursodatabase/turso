@@ -78,6 +78,11 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
                 |_, args| exec_timestamp_plus_interval(args),
             )
             .receiving_argument_types()
+            // FIXME(pg-catalog): pg_operator declares the result type per left
+            // type (timestamp_pl_interval gives timestamp, timestamptz_pl_interval
+            // gives timestamptz), so a domain over timestamptz gives timestamptz.
+            // Taking the first argument's type gives the domain. A pg_operator
+            // lookup replaces this.
             .returning_first_argument_type(),
         )
 }
@@ -94,6 +99,10 @@ fn exec_timestamp_plus_interval(args: &[Register]) -> Result<Value> {
     use chrono::Datelike;
     let (args, types) = args.split_at(args.len() / 2);
     let time_type = types[0].get_value().to_string();
+    // FIXME(pg-catalog): PostgreSQL refuses any other left type when it plans
+    // the statement (42883, no operator). This check runs for each row, so a
+    // statement over no rows succeeds. A pg_operator lookup at plan time
+    // replaces this.
     if !matches!(time_type.as_str(), "timestamp" | "timestamptz") {
         return Err(sqlstate_error(
             SQLSTATE_FEATURE_NOT_SUPPORTED,

@@ -318,7 +318,7 @@ expect @tursopg error {
     adding an interval is supported only for timestamp and timestamptz, not text
 }
 
-@compat-gap "function:coalesce(timestamp, timestamptz)"
+@compat-gap "function:coalesce"
 test coalesce-timestamp-timestamptz-plus-interval {
     CREATE TABLE ts_coalesce (ts timestamp);
     INSERT INTO ts_coalesce VALUES ('2026-01-01');

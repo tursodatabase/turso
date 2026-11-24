@@ -4153,6 +4153,13 @@ impl PostgreSQLTranslator {
             };
         }
 
+        // FIXME(pg-catalog): PostgreSQL picks the operator for `lhs + rhs` from
+        // pg_operator by the types of both operands when it plans the statement.
+        // This matches the syntax of the right operand instead, so it misses
+        // `interval '1 day' + ts` (interval_pl_timestamp) and `ts + '1 day'`, whose
+        // untyped literal PostgreSQL resolves as interval, and the left operand's
+        // type is checked only when a row is computed. A pg_operator lookup on an
+        // expression tree that carries PostgreSQL types replaces this.
         if matches!(op_name, "+" | "-") {
             let rhs = a_expr.rexpr.as_deref();
             if let Some(interval) = rhs.map(interval_literal).transpose()?.flatten() {
