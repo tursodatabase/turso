@@ -38,10 +38,10 @@ addr  opcode           p1  p2  p3  p4        p5  comment
   14    Integer         0   9   0             0  r[9]=0
   15    InitCoroutine   1   0   2             0
   16      Yield         1  26   0             0
-  17      RowId         1  13   0             0  r[13]=watchlist.rowid
-  18      Copy          3  14   0             0  r[14]=r[3]
-  19      Add          13  14  11             0  r[11]=r[13]+r[14]
-  20      Le           11  12  25  Binary     0  if r[11]<=r[12] goto 25
+  17      RowId         1  12   0             0  r[12]=watchlist.rowid
+  18      Copy          3  13   0             0  r[13]=r[3]
+  19      Add          12  13  11             0  r[11]=r[12]+r[13]
+  20      Le           11  14  25  Binary     0  if r[11]<=r[14] goto 25
   21      Integer       1   9   0             0  r[9]=1
   22      RowId         1   7   0             0  r[7]=watchlist.rowid
   23      Copy          3   8   0             0  r[8]=r[3]
@@ -54,5 +54,5 @@ addr  opcode           p1  p2  p3  p4        p5  comment
   30  Halt              0   0   0             0
   31  Transaction       0   1   2             0  iDb=0 tx_mode=Read
   32  Integer          10   6   0             0  r[6]=10
-  33  Integer          20  12   0             0  r[12]=20
+  33  Integer          20  14   0             0  r[14]=20
   34  Goto              0   1   0             0

@@ -48,6 +48,7 @@ pub(crate) fn default_text(
     Some(format!("{}::{type_name}", printed.text))
 }
 
+/// FIXME(pg-catalog): This recomputes the PostgreSQL type of each printed expression by hand: it hand-codes the implicit pg_cast entries among smallint, integer, bigint and numeric (`number_rank`), and finds a boolean constant by the shape `CAST(1 AS boolean)` that the translator lowers `true` to. The typed expression tree of the binder, with its implicit casts from pg_cast, replaces this.
 /// The types that decide how PostgreSQL prints an expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PgType {

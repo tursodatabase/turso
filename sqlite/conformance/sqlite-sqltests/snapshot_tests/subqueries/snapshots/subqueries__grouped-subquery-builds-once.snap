@@ -32,18 +32,18 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode            p1  p2  p3  p4            p5  comment
-   0  Init               0  87   0                 0  Start at 87
+   0  Init               0  86   0                 0  Start at 86
    1  OpenRead           1   2   0  k(2,B)         0  table=repeat_top, root=2, iDb=0
-   2  Rewind             1  86   0                 0  Rewind table repeat_top
+   2  Rewind             1  85   0                 0  Rewind table repeat_top
    3    BeginSubrtn      4   0   0                 0  r[4]=NULL
    4    Null             0   1   0                 0  r[1]=NULL
-   5    Once            51   0   0                 0  goto 51
+   5    Once            50   0   0                 0  goto 50
    6    OpenEphemeral    0   0   0                 0  cursor=0 is_table=false
    7    Null             0  11   0                 0  r[11]=NULL
    8    SorterOpen       2   2   0  k(1,B)         0  cursor=2
    9    Integer          0   8   0                 0  r[8]=0; clear group by abort flag
   10    Null             0   9   0                 0  r[9]=NULL; initialize group by comparison registers to NULL
-  11    Gosub           15  48   0                 0  ; go to clear accumulator subroutine
+  11    Gosub           15  47   0                 0  ; go to clear accumulator subroutine
   12    OpenRead         4   4   0  k(3,B,B)       0  table=repeat_inner, root=4, iDb=0
   13    Rewind           4  18   0                 0  Rewind table repeat_inner
   14      ColumnRange    4   0  13  2              0  r[13..14]=repeat_inner.k..x
@@ -58,8 +58,8 @@ addr  opcode            p1  p2  p3  p4            p5  comment
   23      Jump          24  28  24                 0  ; start new group if comparison is not equal
   24      Gosub          6  38   0                 0  ; check if ended group had data, and output if so
   25      Move          16   9   1                 0  r[9..9]=r[16..16]
-  26      IfPos          8  51   0                 0  r[8]>0 -> r[8]-=0, goto 51; check abort flag
-  27      Gosub         15  48   0                 0  ; goto clear accumulator subroutine
+  26      IfPos          8  50   0                 0  r[8]>0 -> r[8]-=0, goto 50; check abort flag
+  27      Gosub         15  47   0                 0  ; goto clear accumulator subroutine
   28      Column         3   1  17                 0  r[17]=pseudo.column 1
   29      AggStep        0  17  11  avg            0  accum=r[11] step(r[17])
   30      If             7  32   0                 0  if r[7] goto 32; don't emit group columns if continuing existing group
@@ -67,58 +67,57 @@ addr  opcode            p1  p2  p3  p4            p5  comment
   32      Integer        1   7   0                 0  r[7]=1; indicate data in accumulator
   33    SorterNext       2  20   0                 0
   34    Gosub            6  38   0                 0  ; emit row for final group
-  35    Goto             0  51   0                 0  ; group by finished
+  35    Goto             0  50   0                 0  ; group by finished
   36    Integer          1   8   0                 0  r[8]=1
   37    Return           6   0   0                 0
   38    IfPos            7  40   0                 0  r[7]>0 -> r[7]-=0, goto 40; output group by row subroutine start
   39    Return           6   0   0                 0
   40    AggFinal         0  11   0  avg            0  accum=r[11]
-  41    Copy            11  19   0                 0  r[19]=r[11]
-  42    Integer          0  20   0                 0  r[20]=0
-  43    Le              19  20  39  Binary         0  if r[19]<=r[20] goto 39
-  44    Copy            10   5   0                 0  r[5]=r[10]
-  45    MakeRecord       5   1  21                 0  r[21]=mkrec(r[5..5]); for ephemeral_index_where_sub_t4
-  46    IdxInsert        0  21   0                 8  key=r[21]
-  47    Return           6   0   0                 0
-  48    Null             0  10  11                 0  r[10..11]=NULL; clear accumulator subroutine start
-  49    Integer          0   7   0                 0  r[7]=0
-  50    Return          15   0   0                 0
-  51    Null             0  23   0                 0  r[23]=NULL
-  52    Integer          1  24   0                 0  r[24]=1; LIMIT counter
-  53    IfNot           24  81   0                 0  if !r[24] goto 81
-  54    OpenRead         5   3   0  k(3,B,B)       0  table=repeat_middle, root=3, iDb=0
-  55    Rewind           5  78   0                 0  Rewind table repeat_middle
-  56      Column         5   1  26                 0  r[26]=repeat_middle.tk
-  57      Column         1   0  27                 0  r[27]=repeat_top.t
-  58      Ne            26  27  77  Binary         0  if r[26]!=r[27] goto 77
-  59      Integer        0  28   0                 0  r[28]=0
-  60      Column         5   0  29                 0  r[29]=repeat_middle.sk
-  61      IsNull        29  65   0                 0  if (r[29]==NULL) goto 65
-  62      Affinity      29   1   0                 0  r[29..30] = C
-  63      NotFound       0  65  29                 0  if not found goto 65
-  64      Goto           0  70   0                 0
-  65      Rewind         0  72   0                 0  Rewind  ephemeral(ephemeral_index_where_sub_t4)
-  66      IsNull        29  74   0                 0  if (r[29]==NULL) goto 74
-  67      Column         0   0  30                 0  r[30]=ephemeral(ephemeral_index_where_sub_t4).k
-  68      IsNull        30  74   0                 0  if (r[30]==NULL) goto 74
-  69      Goto           0  72   0                 0
-  70      Integer        1  28   0                 0  r[28]=1
-  71      Goto           0  75   0                 0
-  72      Integer        0  28   0                 0  r[28]=0
-  73      Goto           0  75   0                 0
-  74      Null           0  28   0                 0  r[28]=NULL
-  75      IfNot         28  77   1                 0  if !r[28] goto 77
-  76      AggStep        0  31  23  count          0  accum=r[23] step(r[31])
-  77    Next             5  56   0                 1
-  78    AggFinal         0  23   0  count          0  accum=r[23]
-  79    Copy            23  22   0                 0  r[22]=r[23]
-  80    Copy            22   1   0                 0  r[1]=r[22]
-  81    Return           4   0   1                 0
-  82    Column           1   0   2                 0  r[2]=repeat_top.t
-  83    Copy             1   3   0                 0  r[3]=r[1]
-  84    ResultRow        2   2   0                 0  output=r[2..3]
-  85  Next               1   3   0                 1
-  86  Halt               0   0   0                 0
-  87  Transaction        0   1   3                 0  iDb=0 tx_mode=Read
-  88  Integer            1  31   0                 0  r[31]=1
-  89  Goto               0   1   0                 0
+  41    Integer          0  19   0                 0  r[19]=0
+  42    Le              11  19  39  Binary         0  if r[11]<=r[19] goto 39
+  43    Copy            10   5   0                 0  r[5]=r[10]
+  44    MakeRecord       5   1  20                 0  r[20]=mkrec(r[5..5]); for ephemeral_index_where_sub_t4
+  45    IdxInsert        0  20   0                 8  key=r[20]
+  46    Return           6   0   0                 0
+  47    Null             0  10  11                 0  r[10..11]=NULL; clear accumulator subroutine start
+  48    Integer          0   7   0                 0  r[7]=0
+  49    Return          15   0   0                 0
+  50    Null             0  22   0                 0  r[22]=NULL
+  51    Integer          1  23   0                 0  r[23]=1; LIMIT counter
+  52    IfNot           23  80   0                 0  if !r[23] goto 80
+  53    OpenRead         5   3   0  k(3,B,B)       0  table=repeat_middle, root=3, iDb=0
+  54    Rewind           5  77   0                 0  Rewind table repeat_middle
+  55      Column         5   1  25                 0  r[25]=repeat_middle.tk
+  56      Column         1   0  26                 0  r[26]=repeat_top.t
+  57      Ne            25  26  76  Binary         0  if r[25]!=r[26] goto 76
+  58      Integer        0  27   0                 0  r[27]=0
+  59      Column         5   0  28                 0  r[28]=repeat_middle.sk
+  60      IsNull        28  64   0                 0  if (r[28]==NULL) goto 64
+  61      Affinity      28   1   0                 0  r[28..29] = C
+  62      NotFound       0  64  28                 0  if not found goto 64
+  63      Goto           0  69   0                 0
+  64      Rewind         0  71   0                 0  Rewind  ephemeral(ephemeral_index_where_sub_t4)
+  65      IsNull        28  73   0                 0  if (r[28]==NULL) goto 73
+  66      Column         0   0  29                 0  r[29]=ephemeral(ephemeral_index_where_sub_t4).k
+  67      IsNull        29  73   0                 0  if (r[29]==NULL) goto 73
+  68      Goto           0  71   0                 0
+  69      Integer        1  27   0                 0  r[27]=1
+  70      Goto           0  74   0                 0
+  71      Integer        0  27   0                 0  r[27]=0
+  72      Goto           0  74   0                 0
+  73      Null           0  27   0                 0  r[27]=NULL
+  74      IfNot         27  76   1                 0  if !r[27] goto 76
+  75      AggStep        0  30  22  count          0  accum=r[22] step(r[30])
+  76    Next             5  55   0                 1
+  77    AggFinal         0  22   0  count          0  accum=r[22]
+  78    Copy            22  21   0                 0  r[21]=r[22]
+  79    Copy            21   1   0                 0  r[1]=r[21]
+  80    Return           4   0   1                 0
+  81    Column           1   0   2                 0  r[2]=repeat_top.t
+  82    Copy             1   3   0                 0  r[3]=r[1]
+  83    ResultRow        2   2   0                 0  output=r[2..3]
+  84  Next               1   3   0                 1
+  85  Halt               0   0   0                 0
+  86  Transaction        0   1   3                 0  iDb=0 tx_mode=Read
+  87  Integer            1  30   0                 0  r[30]=1
+  88  Goto               0   1   0                 0

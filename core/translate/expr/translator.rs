@@ -63,7 +63,7 @@ pub fn translate_expr_no_constant_opt(
         expr,
         deopt_reason
     );
-    let next_span_idx = program.constant_spans_next_idx();
+    let next_span_idx = program.constants_in_place_start();
     let translated = translate_expr(program, referenced_tables, expr, target_register, resolver)?;
     program.constant_spans_invalidate_after(next_span_idx);
     Ok(translated)
@@ -73,10 +73,13 @@ pub fn translate_expr_no_constant_opt(
 ///
 /// Unlike `translate_expr`, this does not require a pre-allocated target register.
 /// If the expression is found in the `expr_to_reg_cache`, the cached register is
-/// returned directly without emitting a Copy instruction. Otherwise, a new register
-/// is allocated and the expression is translated into it.
+/// returned directly without emitting a Copy instruction. If an equal constant
+/// was already moved to the init section by this function, its register is
+/// returned. Otherwise, a new register is allocated and the expression is
+/// translated into it.
 ///
-/// Callers MUST use the returned register — they cannot assume a specific destination.
+/// Callers MUST use the returned register, and MUST NOT write to it — they
+/// cannot assume a specific destination.
 #[must_use = "the returned register must be used, because that is where the expression value is stored"]
 pub fn resolve_expr(
     program: &mut ProgramBuilder,
@@ -89,8 +92,23 @@ pub fn resolve_expr(
             return Ok(reg);
         }
     }
+    // As in SQLite, a constant that calls a function is not reused: the
+    // translation of some functions depends on where they are called, such as
+    // `union_value()` on the column it writes.
+    let reusable =
+        expr.is_constant(resolver) && !walk::expr_contains_function(expr, resolver, |_| true)?;
+    if reusable {
+        if let Some(reg) = program.reusable_constant_register(expr) {
+            return Ok(reg);
+        }
+    }
     let dest_reg = program.alloc_register();
-    translate_expr(program, referenced_tables, expr, dest_reg, resolver)
+    let span_idx = program.constant_spans_next_idx();
+    translate_expr(program, referenced_tables, expr, dest_reg, resolver)?;
+    if reusable {
+        program.add_reusable_constant(expr, dest_reg, span_idx);
+    }
+    Ok(dest_reg)
 }
 
 /// Translate an expression into bytecode.

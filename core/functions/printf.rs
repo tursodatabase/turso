@@ -439,14 +439,16 @@ fn fp_decode(r: f64, i_round: i32, max_round: usize) -> (Vec<u8>, i32) {
         (rr[0] as u64).wrapping_add(rr[1] as u64)
     };
 
-    // Extract decimal digits from u64
-    let mut buf = Vec::with_capacity(20);
-    let mut temp = v;
-    while temp > 0 {
-        buf.push((temp % 10) as u8);
-        temp /= 10;
-    }
-    buf.reverse();
+    // The decimal digits of `v` as the values 0 to 9, with no digits for 0.
+    let mut text = [0u8; 20];
+    let digits: &[u8] = if v == 0 {
+        &[]
+    } else {
+        crate::numeric::write_decimal_digits(&mut text, v)
+    };
+    // One more byte for a carry digit that the rounding below can insert.
+    let mut buf = Vec::with_capacity(digits.len() + 1);
+    buf.extend(digits.iter().map(|digit| digit - b'0'));
 
     let n = buf.len();
     let mut dp = n as i32 + exp;

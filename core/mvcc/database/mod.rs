@@ -10944,16 +10944,25 @@ impl RowVersion {
     /// timestamp `end_ts`. Shared by the chunked commit step
     /// (`step_rewrite_live_versions`) and the dropped-statement cleanup path
     /// (`rewrite_live_versions_for_committed_tx`) so the two cannot drift.
+    ///
+    /// Keeps `materialized_at`. `tx_id` is already `Committed(end_ts)`, and
+    /// `stamp_chain_materialized` resolves a `TxID` through that state, so the
+    /// rewrite does not change the state a checkpoint wrote to the B-tree. A
+    /// checkpoint pass that ran before the rewrite already removed the key from
+    /// the dirty set, so a reset stamp is never set again and GC never drops
+    /// the version.
     #[inline]
     fn rewrite_txid_to_timestamp(&mut self, tx_id: TxID, end_ts: u64) {
         if let Some(TxTimestampOrID::TxID(rv_id)) = self.begin() {
             if rv_id == tx_id {
-                self.set_begin(Some(TxTimestampOrID::Timestamp(end_ts)));
+                self.begin =
+                    crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(end_ts)));
             }
         }
         if let Some(TxTimestampOrID::TxID(rv_id)) = self.end() {
             if rv_id == tx_id {
-                self.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
+                self.end =
+                    crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(end_ts)));
             }
         }
     }

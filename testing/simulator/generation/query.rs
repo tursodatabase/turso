@@ -90,19 +90,36 @@ fn random_pragma<R: rand::Rng + ?Sized>(
     rng: &mut R,
     conn_ctx: &impl GenerationContext,
     allow_checkpoints: bool,
+    mvcc: bool,
 ) -> Query {
     if allow_checkpoints && !conn_ctx.tables().is_empty() && rng.random_bool(0.35) {
-        let modes = [
-            CheckpointMode::Passive,
-            CheckpointMode::Full,
-            CheckpointMode::Restart,
-            CheckpointMode::Truncate,
-        ];
-        let table = conn_ctx.tables().choose(rng).unwrap();
-        let database = table
-            .name
-            .split_once('.')
-            .map(|(database, _)| database.to_string());
+        // MVCC rejects PASSIVE unless `experimental_mvcc_passive_checkpoint` is on.
+        let modes: &[CheckpointMode] = if mvcc {
+            &[
+                CheckpointMode::Full,
+                CheckpointMode::Restart,
+                CheckpointMode::Truncate,
+            ]
+        } else {
+            &[
+                CheckpointMode::Passive,
+                CheckpointMode::Full,
+                CheckpointMode::Restart,
+                CheckpointMode::Truncate,
+            ]
+        };
+        // An MVCC checkpoint of an attached database panics: it reads the
+        // sequences of the main schema in `pending_sequence_compactions` and
+        // looks up their root pages in the MvStore of the attached database.
+        let database = if mvcc {
+            None
+        } else {
+            let table = conn_ctx.tables().choose(rng).unwrap();
+            table
+                .name
+                .split_once('.')
+                .map(|(database, _)| database.to_string())
+        };
         return Query::Pragma(Pragma::WalCheckpoint {
             database,
             mode: *modes.choose(rng).unwrap(),
@@ -294,6 +311,7 @@ pub(super) struct QueryDistribution {
     weights: WeightedIndex<u32>,
     sequence_info: Vec<(String, i64, i64)>,
     allow_checkpoints: bool,
+    mvcc: bool,
 }
 
 impl QueryDistribution {
@@ -301,6 +319,7 @@ impl QueryDistribution {
         queries: &'static [QueryDiscriminants],
         remaining: &Remaining,
         allow_checkpoints: bool,
+        mvcc: bool,
     ) -> Self {
         let query_weights = queries
             .iter()
@@ -313,6 +332,7 @@ impl QueryDistribution {
             weights,
             sequence_info: remaining.sequence_info.clone(),
             allow_checkpoints,
+            mvcc,
         }
     }
 
@@ -365,7 +385,9 @@ impl WeightedDistribution for QueryDistribution {
                 random_drop_sequence(rng, &names)
             }
             QueryDiscriminants::Setval => random_setval(rng, &self.sequence_info),
-            QueryDiscriminants::Pragma => random_pragma(rng, ctx, self.allow_checkpoints),
+            QueryDiscriminants::Pragma => {
+                random_pragma(rng, ctx, self.allow_checkpoints, self.mvcc)
+            }
             _ => {
                 let query_fn = discriminant
                     .gen_function()

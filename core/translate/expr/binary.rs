@@ -98,10 +98,11 @@ fn emit_row_valued_binary_expr(
 }
 
 /// Function instructions read contiguous registers start_reg..start_reg+arg_count.
-/// When both operands are equivalent the compiler reuses a single shared register,
-/// so copy it into a contiguous pair.
+/// The operands are in registers that [resolve_expr()] chose, which can be one
+/// shared register or two registers that are not next to each other, so copy
+/// them into a contiguous pair then.
 fn contiguous_operands(program: &mut ProgramBuilder, lhs: usize, rhs: usize) -> usize {
-    if lhs != rhs {
+    if rhs == lhs + 1 {
         return lhs;
     }
     let regs = program.alloc_registers(2);
@@ -111,7 +112,7 @@ fn contiguous_operands(program: &mut ProgramBuilder, lhs: usize, rhs: usize) -> 
         extra_amount: 0,
     });
     program.emit_insn(Insn::Copy {
-        src_reg: lhs,
+        src_reg: rhs,
         dst_reg: regs + 1,
         extra_amount: 0,
     });
@@ -133,8 +134,7 @@ pub(super) fn emit_binary_expr_scalar(
     if exprs_are_equivalent(e1, e2)
         && !expr_contains_nondeterministic_scalar_function(e1, resolver)?
     {
-        let shared_reg = program.alloc_register();
-        translate_expr(program, referenced_tables, e1, shared_reg, resolver)?;
+        let shared_reg = resolve_expr(program, referenced_tables, e1, resolver)?;
 
         match emit_mode {
             BinaryEmitMode::Value => emit_binary_insn(
@@ -163,15 +163,17 @@ pub(super) fn emit_binary_expr_scalar(
         }
         Ok(target_register)
     } else {
-        let e1_reg = program.alloc_registers(2);
-        let e2_reg = e1_reg + 1;
-
-        if op.is_comparison() {
-            translate_compared_pair(program, referenced_tables, e1, e2, e1_reg, e2_reg, resolver)?;
+        let (e1_reg, e2_reg) = if op.is_comparison() {
+            (
+                resolve_compared_value(program, referenced_tables, e1, e2, resolver)?,
+                resolve_compared_value(program, referenced_tables, e2, e1, resolver)?,
+            )
         } else {
-            translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
-            translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
-        }
+            (
+                resolve_expr(program, referenced_tables, e1, resolver)?,
+                resolve_expr(program, referenced_tables, e2, resolver)?,
+            )
+        };
 
         match emit_mode {
             BinaryEmitMode::Value => emit_binary_insn(

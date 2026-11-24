@@ -463,7 +463,7 @@ pub fn emit_aggregate_step(
             minmax_keeps_best_reg,
         );
     };
-    let span_idx = program.constant_spans_next_idx();
+    let span_idx = program.constants_in_place_start();
     let key_count = aggregate.order_by().len();
     let column_count = key_count + 1 + 2 * aggregate.args.len();
     let start = program.alloc_registers(column_count);
@@ -954,19 +954,29 @@ pub fn translate_aggregation_step(
                 );
             }
             let argc = num_args;
-            let expr_reg = if argc == 0 {
-                0
-            } else {
-                agg_arg_source.translate(program, referenced_tables, resolver, 0)?
+            // AggStep reads the argc registers that start at expr_reg, but
+            // AggArgumentSource::translate can return the register of an equal constant
+            // that the statement loaded earlier, so each argument gets its own register.
+            let expr_reg = match &agg_arg_source {
+                _ if argc == 0 => 0,
+                AggArgumentSource::Register { src_reg_start, .. } => *src_reg_start,
+                AggArgumentSource::Expression { args, .. } => {
+                    let start_reg = program.alloc_registers(argc);
+                    for (i, arg) in args.iter().enumerate() {
+                        translate_expr(
+                            program,
+                            Some(referenced_tables),
+                            arg,
+                            start_reg + i,
+                            resolver,
+                        )?;
+                    }
+                    start_reg
+                }
             };
-            for i in 0..argc {
-                if i != 0 {
-                    let _ = agg_arg_source.translate(program, referenced_tables, resolver, i)?;
-                }
-                // invariant: distinct aggregates are only supported for single-argument functions
-                if argc == 1 {
-                    handle_distinct(program, agg_arg_source.distinctness(), expr_reg + i);
-                }
+            // invariant: distinct aggregates are only supported for single-argument functions
+            if argc == 1 {
+                handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             }
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {

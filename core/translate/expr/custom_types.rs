@@ -2,6 +2,7 @@ use super::*;
 use crate::schema::ResolvedType;
 use crate::types::{Conversion, StorageClass, StrictType};
 
+/// FIXME(pg-catalog): This types literals by the rules of SQLite: TRUE and FALSE are integer and 1.5 is real, where PostgreSQL types them boolean and numeric. The type decides whether an operator of a custom type encodes the literal to that type. A typed expression tree that gives literals the types of the dialect replaces this.
 /// Get the effective type name of a literal expression.
 pub(super) fn literal_type_name(expr: &ast::Expr) -> Option<&'static str> {
     match expr {
@@ -111,6 +112,32 @@ fn translate_compared_value(
             resolver,
         ),
         None => translate_expr(program, referenced_tables, operand, reg, resolver),
+    }
+}
+
+/// Like [translate_compared_value], but returns the register that holds
+/// `operand`. [resolve_expr()] chooses it, unless `operand` is read as a value
+/// of a custom type.
+pub(crate) fn resolve_compared_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    other: &ast::Expr,
+    resolver: &Resolver,
+) -> Result<usize> {
+    match untyped_operand_type(operand, other, referenced_tables, resolver)? {
+        Some(resolved) => {
+            let reg = program.alloc_register();
+            translate_untyped_operand_as(
+                program,
+                referenced_tables,
+                operand,
+                &resolved,
+                reg,
+                resolver,
+            )
+        }
+        None => resolve_expr(program, referenced_tables, operand, resolver),
     }
 }
 

@@ -45,6 +45,14 @@ A release build takes several times longer than a debug build and doubles the si
 - Put PostgreSQL code in `postgres/`.
 - If the PostgreSQL frontend cannot execute a statement exactly as PostgreSQL does,
   return an error with SQLSTATE 0A000 (feature_not_supported).
+- When code hand-codes a PostgreSQL rule because Turso lacks the PostgreSQL facility
+  that holds it, put a `FIXME(pg-<facility>):` comment at the place that decides.
+  The comment says which rule the code hand-codes and what would replace it.
+  `FIXME(pg-catalog)` marks code that a lookup in pg_type, pg_cast, pg_proc or
+  pg_operator, or an expression tree that carries PostgreSQL types, would replace.
+  For a different missing facility, reuse a tag from `rg 'FIXME\(pg-'` or start a
+  new one, such as `FIXME(pg-search-path)`. Check each PostgreSQL fact in the
+  comment against PostgreSQL itself, for example with a catalog query.
 - For an impossible state, use an assertion.
 - Index inserts, deletes and conflict resolution happen in the same order as in SQLite.
   Compare the `EXPLAIN` output of both.

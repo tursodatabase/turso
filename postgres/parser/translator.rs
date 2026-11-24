@@ -4712,6 +4712,7 @@ impl PostgreSQLTranslator {
             _ => func_name,
         };
 
+        // FIXME(pg-catalog): This hand-codes the pg_proc functions named after a type (float8, float4, int4, int2, int8, bool, text) as casts, and casts int2 and float4 to the wider INTEGER and REAL, so int2(70000) does not raise "smallint out of range" as it does in PostgreSQL. Function resolution in pg_proc, which finds the cast functions of pg_cast, replaces this.
         // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
             "FLOAT8" | "FLOAT4" => Some("REAL"),
@@ -7221,6 +7222,7 @@ fn is_serial_type(pg_type: &str) -> bool {
 /// built-in Turso type exists, otherwise returns the base SQLite type.
 /// For array types (e.g. `INTEGER[]`, `_int4`), returns the base scalar type
 /// with `array_dimensions > 0` so native Turso arrays are used.
+// FIXME(pg-catalog): This maps PostgreSQL type names to Turso or SQLite type names by hand, and lowers types Turso does not have to another type: money to REAL; point, bit and xml to TEXT; oid and the reg types to INTEGER. It also maps numeric without a precision to REAL and char without a length to TEXT, where pg_type keeps numeric and makes char a bpchar of length 1. A pg_type lookup replaces this.
 pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
     // Check for array types first
     if pg_type.ends_with("[]") || pg_type.starts_with('_') {
@@ -7715,6 +7717,7 @@ fn json_type_or_raise(
     }
 }
 
+/// FIXME(pg-catalog): This finds a cast to int8 by its type name and checks a numeric literal in the parser because there is no typed expression tree. The pg_cast entry from numeric to bigint (function int8(numeric)), applied to a literal typed numeric, replaces this.
 /// The operand of an int8 cast, made to raise "bigint out of range" when it is
 /// a numeric literal outside the bigint range, where `CAST(x AS INTEGER)` would
 /// clamp it. The literal is checked from its text, because a literal just past
@@ -7857,6 +7860,7 @@ fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
     Some(format!("{sign}{digits}"))
 }
 
+/// FIXME(pg-catalog): This lowers PostgreSQL types to SQLite types in the parser (boolean, smallint and oid to INTEGER; numeric and money to REAL; json, inet and uuid to TEXT), so the PostgreSQL type is gone before the cast is checked. A pg_type lookup and a typed expression tree that keeps the type replace this.
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types. Other names are kept as
 /// written so that enums and domains resolve to their custom type.
@@ -8456,6 +8460,7 @@ fn validate_column_qualifiers(
     Ok(())
 }
 
+/// FIXME(pg-catalog): This hand-codes provolatile of the pg_proc functions behind pg_operator entries: timestamptz plus or minus interval is stable, and text || anynonarray is a stable SQL function that PostgreSQL inlines into a cast of the other operand to text, so it takes the volatility of that cast. It leaves out the comparisons of date and timestamp with timestamptz, which are stable. A lookup in pg_operator and pg_proc, with inlining of SQL functions, replaces this.
 /// Whether operator `name` on operands of types `left` and `right` is immutable.
 fn operator_is_immutable(name: &str, left: ExprType, right: ExprType) -> bool {
     use ExprType::*;
@@ -8470,6 +8475,7 @@ fn operator_is_immutable(name: &str, left: ExprType, right: ExprType) -> bool {
     }
 }
 
+/// FIXME(pg-catalog): This hand-codes the volatility of casts among date and time types, which is provolatile of the pg_cast function, and of casts between text and date and time types, which have no pg_cast entry and run the typinput or typoutput function of pg_type: all of them are stable except time_out and timetz_out. A lookup in pg_cast, pg_type and pg_proc replaces this.
 /// Whether a cast from `source` to `target` is immutable.
 fn cast_is_immutable(source: ExprType, target: ExprType) -> bool {
     use ExprType::*;
@@ -8483,6 +8489,7 @@ fn cast_is_immutable(source: ExprType, target: ExprType) -> bool {
     }
 }
 
+/// FIXME(pg-catalog): This is a small typed expression tree that knows only text and date and time types, built by hand for the volatility check. The typed expression tree of the binder replaces it.
 /// The type of a value in a generation expression, as far as the volatility checks need it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExprType {
@@ -8546,6 +8553,7 @@ impl ExprType {
         }
     }
 
+    /// FIXME(pg-catalog): This hand-codes the result types of the pg_operator entries for text and date and time operands. A lookup in a pg_operator table replaces this.
     /// The type an operator gives its result, for the operand types it has a rule for.
     fn operator_result(name: &str, left: Option<Self>, right: Option<Self>) -> Option<Self> {
         use ExprType::*;
@@ -10716,6 +10724,7 @@ fn reject_column_aliases(
     Ok(())
 }
 
+// FIXME(pg-catalog): This guesses from the shape of the second argument whether substring() resolves to the pg_proc entry substring(text, text), which takes a regular expression, instead of substring(text, integer). Function resolution in pg_proc on a typed expression tree replaces this.
 fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
     use pg_query::protobuf::node::Node;
     match &node.node {
@@ -10793,6 +10802,7 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
 /// tursopg functions that PostgreSQL does not have, so user SQL cannot call them.
 const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &["int8_out_of_range"];
 
+// FIXME(pg-collation): This hand-codes the pg_collation entries that compare bytes (C, POSIX, ucs_basic) and counts default among them, where PostgreSQL's default collation is the one of the database (pg_database.datcollate, en_US.utf8 in the postgres:18 image). It matches the names without regard to case, so it accepts `COLLATE C`, which PostgreSQL folds to "c" and refuses. A lookup in a pg_collation table replaces this.
 fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
     let Ok(names) = extract_key_columns(collname) else {
         return false;
