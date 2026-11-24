@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+#[cfg(not(feature = "codspeed"))]
 use std::time::{Duration, Instant};
 use turso_sqlite::SqliteDialect;
 
@@ -232,6 +233,7 @@ const GHOST_SEQ_BASE: i64 = 100_000_000;
 const GHOST_ROWID_BASE: i64 = 1_000_000_000;
 /// Rebuild the database (and ghost) every this many measured batches to keep the
 /// committed-row footprint bounded over a long Criterion run.
+#[cfg(not(feature = "codspeed"))]
 const HUGE_WRITE_RESET_EVERY: u64 = 2_000;
 
 fn payload_columns() -> String {
@@ -386,6 +388,24 @@ fn run_huge_multi_write(c: &mut Criterion, group_name: &str, placement: GhostPla
         group.bench_function(
             format!("rows={HUGE_WRITE_ROWS_PER_BATCH}/pending_invisible={pending}"),
             |b| {
+                // codspeed-criterion-compat does not run the closure of `iter_custom`,
+                // so a CodSpeed build runs one batch per `iter` call. The harness is
+                // built before `iter`, which keeps the database setup out of the
+                // measurement. `iter` calls its closure only a few times, so the
+                // committed rows stay bounded without a rebuild.
+                #[cfg(feature = "codspeed")]
+                {
+                    let harness = HugeMultiWriteHarness::new(pending, placement);
+                    let mut stmt = harness.conn.prepare(&sql).unwrap();
+                    let mut base = HUGE_WRITE_SEQ_BASE;
+                    b.iter(|| {
+                        stmt.bind_at(idx1, Value::from_i64(base)).unwrap();
+                        run_to_completion(&harness.db, &mut stmt);
+                        stmt.reset().unwrap();
+                        base += HUGE_WRITE_ROWS_PER_BATCH as i64;
+                    });
+                }
+                #[cfg(not(feature = "codspeed"))]
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
                     let mut harness: Option<HugeMultiWriteHarness> = None;
@@ -409,7 +429,7 @@ fn run_huge_multi_write(c: &mut Criterion, group_name: &str, placement: GhostPla
                         base += HUGE_WRITE_ROWS_PER_BATCH as i64;
                     }
                     total
-                })
+                });
             },
         );
     }
