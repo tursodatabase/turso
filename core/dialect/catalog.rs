@@ -52,6 +52,60 @@ pub trait Catalog: Send + Sync {
     fn load_steps(&self) -> Vec<Box<dyn LoadStep>> {
         Vec::new()
     }
+
+    /// The tables of this catalog that have rows before anything is
+    /// stored. Core serves the rows, and stores them on the first write.
+    ///
+    /// The list is static, because the schema of a database needs it before
+    /// a statement compiles. The main schema has a read-only table for each
+    /// seeded table whose name no stored object has.
+    fn seeded_tables(&self) -> &'static [SeededTable] {
+        &[]
+    }
+}
+
+/// A table that has a fixed set of rows, the seed, before anything is
+/// stored. Until a statement stores the table, core serves the seed rows
+/// through a read-only table named `name`.
+pub struct SeededTable {
+    /// The name of the table, such as `pg_proc`.
+    pub name: &'static str,
+    /// The `CREATE TABLE` statement of the table, in SQLite syntax. It gives
+    /// the columns of the read-only table and of the stored table. The table
+    /// must have a rowid.
+    pub create_sql: &'static str,
+    /// The `CREATE INDEX` statements of the stored table, in SQLite syntax.
+    pub index_sql: &'static [&'static str],
+    /// The rows of the table before it is stored.
+    pub seed: &'static dyn Seed,
+}
+
+/// The rows of a [`SeededTable`] before the table is stored. A row has an
+/// index from 0 to `len() - 1`, and the rows are in index order.
+///
+/// The rowid of a row is the value of the column that the table's
+/// `create_sql` declares `INTEGER PRIMARY KEY`. When no column is declared
+/// so, the rowid of the row at `index` is `index + 1`. Rowids are unique.
+pub trait Seed: Send + Sync {
+    /// The number of rows.
+    fn len(&self) -> usize;
+
+    /// Whether the seed has no rows.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Writes the values of the row at `index`, in column order, to the end
+    /// of `out`. The caller gives an empty `out`. When the table has an
+    /// `INTEGER PRIMARY KEY` column, the value of that column is an integer.
+    fn row(&self, index: usize, out: &mut Vec<Value>);
+
+    /// The index of the row whose rowid is `rowid`, or None when no row has
+    /// it, so that `WHERE oid = ...` does not scan.
+    fn find(&self, rowid: i64) -> Option<usize>;
+
+    /// Changes when the rows change.
+    fn version(&self) -> u32;
 }
 
 /// The statement that a [`Catalog`] emits bytecode for. `schema` is the schema of

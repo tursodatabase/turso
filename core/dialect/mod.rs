@@ -30,7 +30,7 @@ pub use catalog::{
     CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,
     CreateTrigger, CreateView, CreateVirtualTable, Dependent, DependentObject, DropColumn,
     DropIndex, DropSequence, DropTable, DropTrigger, DropView, NewOwner, OwnerColumn, RelationName,
-    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, TableText,
+    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, Seed, SeededTable, TableText,
     TempTriggerOfRenamedTable,
 };
 
