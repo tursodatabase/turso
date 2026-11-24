@@ -255,8 +255,6 @@ Do not add a trailing period. Conventional Commit prefixes such as
 
 <non-obvious implementation details or tradeoffs, if needed>
 
-Tests: <relevant validation, if useful>
-
 Fixes #1234
 ```
 
@@ -270,14 +268,12 @@ replacement row, leaving stale physical B-tree state after checkpoint.
 
 Keep B-tree-resident delete markers when collapsing adjacent versions.
 
-Tests: added an update/reopen/delete/checkpoint regression test
-
 Fixes #1234
 ```
 
 The body should explain the intent and why the change is needed, rather than
 narrating the diff. Include non-obvious implementation details and tradeoffs
-that will matter to reviewers or future maintainers. The body, test summary,
+that will matter to reviewers or future maintainers. The body,
 and issue reference are optional when they do not add useful information.
 
 To produce pull requests like this, you should learn how to use Git's interactive rebase (`git rebase -i`).
