@@ -997,6 +997,7 @@ fn derive_ctas_schema(
                 name: ty.to_string(),
                 size: None,
                 array_dimensions: 0,
+                ty_annotation: None,
             })
         };
         col_defs.push(ColumnDefinition {

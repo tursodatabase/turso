@@ -9389,6 +9389,7 @@ mod tests {
                     name: "real".to_string(),
                     size: None,
                     array_dimensions: 0,
+                    ty_annotation: None,
                 }),
             })),
             operators: std::vec![],

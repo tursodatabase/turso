@@ -603,6 +603,29 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// What the dialect knows beyond its name about `ty`, a type that has no
+    /// annotation because core read it from stored SQL: the declared type of
+    /// a column, or a type made with `CREATE TYPE`. For an array type the
+    /// answer describes the element type.
+    ///
+    /// SQLite has no identifiers for its types, so it knows nothing more.
+    /// PostgreSQL gives the oid of the type.
+    fn type_annotation(&self, ty: &ast::Type) -> Option<ast::TypeAnnotation> {
+        let _ = ty;
+        None
+    }
+
+    /// What the dialect knows about the type of `literal`, a literal other
+    /// than NULL and a string, which take the type of the values they are
+    /// used with.
+    ///
+    /// SQLite has no identifiers for its types. PostgreSQL gives the oid of
+    /// boolean for `true` and `false`.
+    fn literal_type_annotation(&self, literal: &ast::Literal) -> Option<ast::TypeAnnotation> {
+        let _ = literal;
+        None
+    }
+
     /// Whether constraint errors report the values that broke the constraint.
     ///
     /// PostgreSQL shows them in the error DETAIL, so custom type and array

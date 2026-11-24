@@ -1037,6 +1037,7 @@ fn get_subquery_parser<'a>(
                                         name: "NUMERIC".to_string(),
                                         size: None,
                                         array_dimensions: 0,
+                                        ty_annotation: None,
                                     }),
                                 )),
                             )),
