@@ -843,3 +843,19 @@ expect error {}
 expect @tursopg {
     1
 }
+
+# PostgreSQL compares a date with a timestamp as the timestamp at midnight of
+# that date; tursopg compares the stored text when the timestamp comes from a
+# VALUES list in a CTE.
+@compat-gap "operator:date = timestamp"
+test date-equals-timestamp-from-values-cte {
+    CREATE TABLE t (id int, d date);
+    INSERT INTO t VALUES (1, '2024-01-05');
+    WITH v(x) AS (VALUES (CAST('2024-01-05 00:00:00' AS timestamp))) SELECT count(*) FROM t, v WHERE d = x;
+}
+expect {
+    1
+}
+expect @tursopg {
+    0
+}

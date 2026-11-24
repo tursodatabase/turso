@@ -601,3 +601,56 @@ expect {
 expect @tursopg {
     0
 }
+
+# PostgreSQL has a cast to boolean only from int4, not from int2 or int8.
+@compat-gap "cast:int2 -> bool"
+test int2-to-bool-cast-does-not-exist {
+    SELECT 5::int2::boolean;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    5
+}
+
+@compat-gap "cast:int8 -> bool"
+test int8-to-bool-cast-does-not-exist {
+    SELECT 5::int8::boolean;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    5
+}
+
+@compat-gap "cast:jsonb -> bytea"
+test jsonb-to-bytea-cast-does-not-exist {
+    SELECT '1'::jsonb::bytea;
+}
+@sqlstate 42846
+expect error {}
+expect @tursopg {
+    \x31
+}
+
+# PostgreSQL 18 has no regdatabase type.
+@compat-gap "type:regdatabase"
+test regdatabase-type-does-not-exist {
+    SELECT 1::regdatabase;
+}
+@sqlstate 42704
+expect error {}
+expect @tursopg {
+    1
+}
+
+# Built-in types live in pg_catalog, so public.int4 names no type.
+@compat-gap "syntax:type-name"
+test public-qualified-builtin-type-does-not-exist {
+    SELECT 1::public.int4;
+}
+@sqlstate 42704
+expect error {}
+expect @tursopg {
+    1
+}
