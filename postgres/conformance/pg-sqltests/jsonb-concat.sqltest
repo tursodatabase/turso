@@ -1,0 +1,191 @@
+# The jsonb operator ||, which joins two jsonb values.
+#
+# Two objects give an object with the fields of both. Otherwise, a value that
+# is not an array counts as an array with one element, and the result is an
+# array with the elements of both. Only the top level is joined.
+
+@database :memory:
+
+setup items_with_jsonb_rows {
+    CREATE TABLE items (id int PRIMARY KEY, data jsonb);
+    INSERT INTO items VALUES
+        (1, '{"name":"apple","price":1.50,"qty":10,"active":true,"tags":["fruit","red"],"dims":{"w":3,"h":4}}'),
+        (2, '{"name":"bread","price":2,"qty":2,"active":false,"tags":["bakery"],"dims":{"w":20,"h":10},"note":null}'),
+        (3, '[1,2,3]'),
+        (4, NULL);
+}
+
+# jsonb || jsonb
+
+# The tests that follow compare a result with a jsonb value or read one of its
+# fields, so that they do not depend on A-45, where tursopg writes jsonb
+# without the spaces of PostgreSQL. A comparison is cast to int, because of
+# B-04.
+
+@setup items_with_jsonb_rows
+test jsonb-concat-adds-fields {
+    SELECT (data || '{"qty":99,"new":true}') ->> 'qty', (data || '{"qty":99,"new":true}') ->> 'new', (data || '{"qty":99}') ->> 'name' FROM items WHERE id = 1;
+}
+expect {
+    99|true|apple
+}
+
+# Of two fields with the same name, the field of the right object counts.
+test jsonb-concat-of-objects {
+    SELECT ('{"a":1,"b":2}'::jsonb || '{"a":3,"c":4}' = '{"a":3,"b":2,"c":4}')::int, ('{"a":1}'::jsonb || '{"a":2}' = '{"a":2}')::int, '{}'::jsonb || '{}';
+}
+expect {
+    1|1|{}
+}
+
+test jsonb-concat-of-arrays {
+    SELECT ('[1,2]'::jsonb || '[2,3]' = '[1,2,2,3]')::int, ('[1]'::jsonb || '[[2]]' = '[1,[2]]')::int, '[]'::jsonb || '[]';
+}
+expect {
+    1|1|[]
+}
+
+# A value that is not an array counts as an array with one element.
+test jsonb-concat-of-other-values {
+    SELECT ('[1]'::jsonb || '2' = '[1,2]')::int, ('{"a":1}'::jsonb || '[2]' = '[{"a":1},2]')::int, ('[2]'::jsonb || '{"a":1}' = '[2,{"a":1}]')::int, ('1'::jsonb || '"x"' = '[1,"x"]')::int, '{}'::jsonb || '[]', '[]'::jsonb || '1';
+}
+expect {
+    1|1|1|1|[{}]|[1]
+}
+
+# Only the top level is joined.
+test jsonb-concat-joins-only-the-top-level {
+    SELECT ('{"a":{"b":1}}'::jsonb || '{"a":{"c":2}}') -> 'a' ->> 'c', coalesce(('{"a":{"b":1}}'::jsonb || '{"a":{"c":2}}') -> 'a' ->> 'b', 'none');
+}
+expect {
+    2|none
+}
+
+# A string literal on the other side is read as jsonb, also on the left.
+test jsonb-concat-reads-a-string-literal-as-jsonb {
+    SELECT ('[1]' || '[2]'::jsonb = '[1,2]')::int, ('{"a":1}'::jsonb || '{"b": 2}' = '{"a":1,"b":2}')::int;
+}
+expect {
+    1|1
+}
+
+test jsonb-concat-of-invalid-json-literal-errors {
+    SELECT '[1]'::jsonb || 'not json';
+}
+@sqlstate 22P02
+expect error {}
+
+# A value of type text on the other side is joined as text.
+test jsonb-concat-of-text-joins-text {
+    SELECT '[1]'::jsonb || 'x'::text, 'x'::text || '[1]'::jsonb;
+}
+expect {
+    [1]x|x[1]
+}
+
+test jsonb-concat-of-null-is-null {
+    SELECT coalesce(('[1]'::jsonb || NULL)::text, 'none'), coalesce((NULL || '[1]'::jsonb)::text, 'none');
+}
+expect {
+    none|none
+}
+
+# The result is jsonb, so the operators of jsonb run on it.
+test jsonb-concat-result-is-jsonb {
+    SELECT ('[1]'::jsonb || '[2]' || '[3]' = '[1,2,3]')::int, (('{"a":1}'::jsonb || '{"b":2}') - 'a') ->> 'b';
+}
+expect {
+    1|2
+}
+
+@setup items_with_jsonb_rows
+test jsonb-concat-in-update {
+    UPDATE items SET data = data || '{"qty":3}' WHERE id = 2;
+    SELECT data ->> 'qty', data ->> 'name' FROM items WHERE id = 2;
+}
+expect {
+    3|bread
+}
+
+test jsonb-concat-function {
+    SELECT (jsonb_concat('{"a":1}', '{"b":2}') = '{"a":1,"b":2}')::int;
+}
+expect {
+    1
+}
+
+# Core runs || and - on jsonb values, so an index expression can use them.
+@setup items_with_jsonb_rows
+test jsonb-concat-and-delete-in-index-expressions {
+    CREATE INDEX items_without_name ON items ((data - 'name'));
+    CREATE INDEX items_with_flag ON items ((data || '{"flag":1}'));
+    UPDATE items SET data = data || '{"qty":5}' WHERE id = 2;
+    SELECT id FROM items WHERE data - 'name' = '{"price":2,"qty":5,"active":false,"tags":["bakery"],"dims":{"w":20,"h":10},"note":null}' OR (data || '{"flag":1}') ->> 'qty' = '10' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# A generation expression runs || on a cast to jsonb too.
+test jsonb-concat-in-generated-column {
+    CREATE TABLE gen_more (id int, data text, more text GENERATED ALWAYS AS (data::jsonb || '[2]') STORED);
+    INSERT INTO gen_more (id, data) VALUES (1, '[1]'), (2, '{"a":1}');
+    SELECT (more::jsonb = '[1,2]')::int, (more::jsonb = '[{"a":1},2]')::int FROM gen_more ORDER BY id;
+}
+expect {
+    1|0
+    0|1
+}
+
+# Known differences of ||
+
+# tursopg joins text for a value that is not jsonb, such as an integer, where
+# PostgreSQL has no `jsonb || integer`.
+@compat-gap "operator:jsonb || int4"
+test jsonb-concat-of-integer {
+    SELECT '[1]'::jsonb || 5;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    [1]5
+}
+
+# A cast to json is a cast to text in tursopg, so || joins text.
+@compat-gap "operator:jsonb || json"
+test jsonb-concat-of-json {
+    SELECT '[1]'::jsonb || '[2]'::json;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    [1][2]
+}
+
+# A result keeps the order of the fields, where PostgreSQL sorts the fields of
+# a jsonb object by the length of their names and then by name.
+@compat-gap "type:jsonb"
+test jsonb-concat-keeps-the-order-of-the-fields {
+    SELECT '{"b":1}'::jsonb || '{"a":2}';
+}
+expect {
+    {"a": 2, "b": 1}
+}
+expect @tursopg {
+    {"b":1,"a":2}
+}
+
+# A varchar with a length is a custom type of tursopg that has no ||. Thus ||
+# of a jsonb value and such a varchar fails, where PostgreSQL joins text.
+@compat-gap "operator:jsonb || varchar"
+test jsonb-concat-of-varchar {
+    CREATE TABLE jv (j jsonb, v varchar(5));
+    INSERT INTO jv VALUES ('[1]', 'x');
+    SELECT j || v FROM jv;
+}
+expect {
+    [1]x
+}
+@sqlstate 42601
+expect @tursopg error {}
