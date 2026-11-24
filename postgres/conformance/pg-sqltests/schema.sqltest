@@ -424,13 +424,14 @@ expect error {
     ALTER SCHEMA ... RENAME is not supported
 }
 
-test drop-sequence-clears-the-session-currval {
+test recreated-sequence-has-no-currval-of-the-dropped-one {
     CREATE SEQUENCE s;
     SELECT nextval('s');
     DROP SEQUENCE s;
     CREATE SEQUENCE s;
     SELECT currval('s');
 }
+@sqlstate 55000
 expect error {
     currval of sequence "s" is not yet defined in this session
 }

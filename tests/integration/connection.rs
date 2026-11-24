@@ -408,6 +408,21 @@ fn test_setval_uncalled_emits_stored_value_as_next() -> Result<()> {
     Ok(())
 }
 
+/// Rebuilding the schema from disk must keep the connection's `currval` of a
+/// sequence that is still there.
+#[test]
+fn currval_is_kept_when_the_schema_is_read_again_from_disk() -> Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("currval_reparse.db");
+    let conn = open_connection_with_opts(&path, DatabaseOpts::new());
+
+    conn.execute("CREATE SEQUENCE s START 42")?;
+    assert_eq!(query_single_i64(&conn, "SELECT nextval('s')"), 42);
+    conn.force_reparse_schema()?;
+    assert_eq!(query_single_i64(&conn, "SELECT currval('s')"), 42);
+    Ok(())
+}
+
 #[test]
 fn consume_stmt_reports_parse_error() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());

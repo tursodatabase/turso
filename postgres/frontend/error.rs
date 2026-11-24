@@ -431,7 +431,10 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         || (msg.contains("DISTINCT ON") && msg.ends_with(" is not supported"))
     {
         SQLSTATE_FEATURE_NOT_SUPPORTED
-    } else if msg == "sequence must have same owner as table it is linked to" {
+    } else if msg == "sequence must have same owner as table it is linked to"
+        || (msg.starts_with("currval of sequence \"")
+            && msg.ends_with("\" is not yet defined in this session"))
+    {
         SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE
     } else if (msg.starts_with("schema \"") && msg.ends_with("\" does not exist"))
         || msg == "no schema has been selected to create in"
@@ -728,6 +731,10 @@ mod tests {
             ),
             (
                 "sequence must have same owner as table it is linked to",
+                SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+            ),
+            (
+                "currval of sequence \"s\" is not yet defined in this session",
                 SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE,
             ),
             (
