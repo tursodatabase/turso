@@ -717,6 +717,13 @@ expect @tursopg {
     -1
 }
 
+test of-a-json-boolean-is-the-text-true {
+    SELECT '{"a": true}'::jsonb ->> 'a', '{"a": true}'::jsonb ->> 'a' <> 'true';
+}
+expect {
+    true|f
+}
+
 # Known differences of @> and <@
 
 # tursopg compares a json or text value as jsonb, where PostgreSQL has @> only
