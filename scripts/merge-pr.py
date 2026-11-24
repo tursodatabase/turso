@@ -15,7 +15,6 @@ import sys
 import tempfile
 import textwrap
 import time
-from collections import Counter
 
 
 def run_command(command, capture_output=True):
@@ -84,68 +83,6 @@ def get_pr_info(pr_number):
     }
 
 
-def load_pr_template(template_path=".github/pull_request_template.md") -> str:
-    try:
-        with open(template_path, "r", encoding="utf-8") as f:
-            # Normalize newlines
-            return f.read().replace("\r\n", "\n").replace("\r", "\n")
-    except FileNotFoundError:
-        return ""
-
-def truncate_body_at_marker(body: str) -> str:
-    """
-    Truncate PR body at the given markdown header marker (inclusive).
-    Everything at or below the marker is removed.
-    """
-    if not body:
-        return ""
-
-    lines = body.split("\n")
-    for i, line in enumerate(lines):
-        if line.strip() == "### Description of AI":
-            return "\n".join(lines[:i]).rstrip()
-
-    return body.strip()
-
-def strip_pr_template_from_body(body: str, template_path=".github/pull_request_template.md") -> str:
-    """
-    Remove unchanged PR template lines from the PR body.
-    Strategy: line-level subtraction of template lines (multiset) outside of fenced
-    code blocks. Lines that the author edited will not match and will be retained.
-    """
-    template = load_pr_template(template_path)
-    if not template or not body:
-        return (body or "").strip()
-
-    # Normalize newlines and compare lines ignoring trailing whitespace
-    template_lines = [ln.rstrip() for ln in template.split("\n")]
-    body_lines = body.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    # Use a multiset so repeated lines (e.g., blank lines, repeated headings) are handled correctly
-    tmpl_counts = Counter([ln for ln in template_lines if ln != ""])
-    out_lines = []
-    in_code_block = False
-
-    for raw in body_lines:
-        line = raw.rstrip()
-        # Preserve code blocks verbatim
-        if line.strip().startswith("```"):
-            in_code_block = not in_code_block
-            out_lines.append(raw)
-            continue
-
-        if in_code_block:
-            out_lines.append(raw)
-            continue
-
-        # Drop lines that exactly match a template line (outside code blocks)
-        if line != "" and tmpl_counts.get(line, 0) > 0:
-            tmpl_counts[line] -= 1
-            continue
-        out_lines.append(raw)
-    cleaned = "\n".join(out_lines).strip()
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned
-
 def wrap_text(text, width=72):
     lines = text.split("\n")
     wrapped_lines = []
@@ -162,7 +99,15 @@ def wrap_text(text, width=72):
         elif line.strip() == "":
             wrapped_lines.extend(wrap_paragraph(paragraph, width))
             paragraph = []
-            wrapped_lines.append("")
+            # Markdown shows a sequence of blank lines as one paragraph break.
+            if wrapped_lines and wrapped_lines[-1] != "":
+                wrapped_lines.append("")
+        elif is_issue_closing_line(line):
+            # The PR template tells authors to put "Closes #XXXX" on a separate line.
+            # Thus this line is not joined to the text before it or after it.
+            wrapped_lines.extend(wrap_paragraph(paragraph, width))
+            paragraph = []
+            wrapped_lines.extend(wrap_paragraph([line], width))
         else:
             paragraph.append(line)
     wrapped_lines.extend(wrap_paragraph(paragraph, width))
@@ -182,6 +127,13 @@ def wrap_paragraph(lines, width):
 
 def is_markdown_block_line(line):
     return re.match(r"^(\s+|[-*+] |\d+[.)] |#|>|\|)", line) is not None
+
+
+def is_issue_closing_line(line):
+    """Return True if the line starts with a GitHub keyword that closes an issue, as in "Closes #123"."""
+    keyword = r"(close[sd]?|fix(e[sd])?|resolve[sd]?):?"
+    issue = r"(#|[\w.-]+/[\w.-]+#|https://github\.com/)"
+    return re.match(keyword + r"\s+" + issue, line, re.IGNORECASE) is not None
 
 
 def check_pr_status(pr_number):
@@ -364,11 +316,8 @@ def merge_pr(pr_number, use_api=True):
     print(f"PR found: '{pr_info['title']}' by {pr_info['author']}")
 
     commit_title = f"Merge '{pr_info['title']}' from {pr_info['author_name']}"
-    body = pr_info["body"]
-    body = truncate_body_at_marker(body)
-    body = strip_pr_template_from_body(body, ".github/pull_request_template.md")
-
-    commit_body = wrap_text(body)
+    body = pr_info["body"].replace("\r\n", "\n").replace("\r", "\n")
+    commit_body = wrap_text(remove_pr_template(body).strip())
 
     commit_message_parts = [commit_title]
     if commit_body:
@@ -388,6 +337,28 @@ def merge_pr(pr_number, use_api=True):
         merge_remote(pr_number, commit_body_for_api, commit_title)
     else:
         merge_local(pr_number, commit_message)
+
+
+def remove_pr_template(body, template_path=".github/pull_request_template.md"):
+    """Remove the first unchanged copy of the PR template from the PR body."""
+    # The template is one HTML comment, and GitHub does not show it. To find all the HTML
+    # comments, a full Markdown parser is necessary. A pattern that is not exact can remove
+    # text that GitHub shows, for example text in code. Thus only the template is removed.
+    try:
+        with open(template_path, encoding="utf-8") as f:
+            template = f.read().replace("\r\n", "\n").replace("\r", "\n").strip()
+    except FileNotFoundError:
+        return body
+    if not template:
+        return body
+    # Some editors remove the spaces at the end of a line, so the comparison ignores them.
+    template_lines = [line.rstrip() for line in template.split("\n")]
+    body_lines = body.split("\n")
+    for start in range(len(body_lines) - len(template_lines) + 1):
+        end = start + len(template_lines)
+        if [line.rstrip() for line in body_lines[start:end]] == template_lines:
+            return "\n".join(body_lines[:start] + body_lines[end:])
+    return body
 
 
 def check_gh_auth():
