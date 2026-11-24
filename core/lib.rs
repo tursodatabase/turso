@@ -151,8 +151,8 @@ pub use dialect::{
     CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,
     CreateTrigger, CreateView, CreateVirtualTable, Dependent, DependentObject, Dialect, DropColumn,
     DropIndex, DropSequence, DropTable, DropTrigger, DropView, NewOwner, OwnerColumn, RelationName,
-    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, SqliteCatalog, StatementTimes,
-    TableText, TempTriggerOfRenamedTable,
+    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, SeededTableWriter, SqliteCatalog,
+    StatementTimes, TableText, TempTriggerOfRenamedTable,
 };
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,

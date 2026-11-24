@@ -11,9 +11,11 @@
 use crate::dialect::{Dialect, SeededTable};
 use crate::namespace::NamespaceId;
 use crate::numeric::Numeric;
-use crate::schema::{Column, Schema, Table};
+use crate::schema::{BTreeTable, Column, Index, Schema, Table};
 use crate::sync::{Arc, RwLock};
+use crate::util::{UnparsedFromSqlIndex, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX};
 use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor, VirtualTable};
+use crate::SymbolTable;
 use crate::{ast, turso_assert, Connection, LimboError, Result, Value};
 use turso_ext::{
     ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
@@ -21,41 +23,74 @@ use turso_ext::{
 
 /// `idx_num` of a scan of all rows.
 const SCAN: i32 = 0;
+/// `idx_num` of a scan of all rows, for a `VFilter` that core emits.
+pub(crate) const SEED_SCAN: usize = SCAN as usize;
 /// `idx_num` of a lookup of the row whose rowid is the first argument.
 const FIND: i32 = 1;
 
-/// The read-only tables of the seeded tables of a database, built once when
-/// the database is opened.
+/// The seeded tables of a database, built once when the database is opened:
+/// the read-only tables of its catalog's seeded tables, and how each seeded
+/// table is stored.
 pub(crate) struct SeededTables {
-    /// Each table under its normalized name.
+    /// Each read-only table under its normalized name.
     tables: Vec<(String, Arc<Table>)>,
+    /// How each seeded table is stored.
+    stored_forms: Vec<StoredForm>,
 }
 
 impl SeededTables {
-    /// The read-only tables of the seeded tables of `dialect`'s catalog, or
-    /// none when `enabled` is false.
+    /// The seeded tables of `dialect`'s catalog, or none when `enabled` is
+    /// false.
     pub(crate) fn new(dialect: &dyn Dialect, enabled: bool) -> Result<Self> {
-        let seeded_tables = if enabled {
-            dialect.catalog().seeded_tables()
-        } else {
-            &[]
-        };
-        let mut tables = Vec::with_capacity(seeded_tables.len());
-        for seeded_table in seeded_tables {
-            let vtab = read_only_table(dialect, seeded_table)?;
-            let name = crate::util::normalize_ident(seeded_table.name);
-            turso_assert!(
-                tables.iter().all(|(other, _)| *other != name),
-                "two seeded tables have the same name",
-                { "name": name }
-            );
-            tables.push((name, Arc::new(Table::Virtual(Arc::new(vtab)))));
+        if !enabled {
+            return Ok(Self {
+                tables: Vec::new(),
+                stored_forms: Vec::new(),
+            });
         }
-        Ok(Self { tables })
+        let catalog_tables = dialect.catalog().seeded_tables();
+        let mut tables = Vec::with_capacity(catalog_tables.len());
+        let mut stored_forms = Vec::with_capacity(catalog_tables.len());
+        for seeded_table in catalog_tables {
+            let vtab = read_only_table(dialect, seeded_table)?;
+            let read_only = Arc::new(Table::Virtual(Arc::new(vtab)));
+            let name = crate::util::normalize_ident(seeded_table.name);
+            tables.push((name, read_only.clone()));
+            stored_forms.push(StoredForm::new(dialect, seeded_table, Some(read_only))?);
+        }
+        for (position, form) in stored_forms.iter().enumerate() {
+            turso_assert!(
+                stored_forms[..position]
+                    .iter()
+                    .all(|other| other.name != form.name),
+                "two seeded tables have the same name",
+                { "name": form.name }
+            );
+        }
+        Ok(Self {
+            tables,
+            stored_forms,
+        })
     }
 
+    /// Whether the database has no read-only tables.
     pub(crate) fn is_empty(&self) -> bool {
         self.tables.is_empty()
+    }
+
+    /// How the seeded table `name` is stored, or None when no seeded table
+    /// has the name.
+    pub(crate) fn stored_form(&self, name: &str) -> Option<&StoredForm> {
+        let name = crate::util::normalize_ident(name);
+        self.stored_forms.iter().find(|form| form.name == name)
+    }
+
+    /// Whether `table` is the read-only table of the seeded table `name`.
+    pub(crate) fn is_read_only_table(&self, name: &str, table: &Arc<Table>) -> bool {
+        let name = crate::util::normalize_ident(name);
+        self.tables
+            .iter()
+            .any(|(other, read_only)| *other == name && Arc::ptr_eq(read_only, table))
     }
 
     /// Whether `schema` has no object under the name of one of the tables.
@@ -94,6 +129,135 @@ impl SeededTables {
 
 fn name_is_used(schema: &Schema, name: &str) -> bool {
     schema.get_object_type(NamespaceId::ROOT, name).is_some()
+}
+
+/// How a seeded table is stored: its `sqlite_schema` rows, and the table and
+/// indexes that the schema gets when it reads them. The table and the
+/// indexes have root page 0, because the B-trees do not exist yet.
+pub(crate) struct StoredForm {
+    /// The normalized name of the table.
+    pub(crate) name: String,
+    pub(crate) seeded_table: &'static SeededTable,
+    /// The read-only table that serves the seed rows before the table is
+    /// stored.
+    pub(crate) read_only: Option<Arc<Table>>,
+    pub(crate) table: Arc<BTreeTable>,
+    /// The `sqlite_schema` rows of the indexes, in the order they are
+    /// written: the automatic indexes, then the indexes of `index_sql`.
+    pub(crate) index_rows: Vec<IndexRow>,
+    /// The indexes in the order that the schema lists them, which is the
+    /// order in which an insert writes them.
+    pub(crate) indexes: Vec<Arc<Index>>,
+}
+
+/// The `sqlite_schema` row of an index of a seeded table.
+pub(crate) struct IndexRow {
+    pub(crate) name: String,
+    /// The SQL text, or None for an automatic index, as `CREATE TABLE`
+    /// stores it.
+    pub(crate) sql: Option<&'static str>,
+}
+
+impl StoredForm {
+    /// Reads the table and its indexes from the rows that storing
+    /// `seeded_table` writes, as the schema reads them.
+    fn new(
+        dialect: &dyn Dialect,
+        seeded_table: &'static SeededTable,
+        read_only: Option<Arc<Table>>,
+    ) -> Result<Self> {
+        let name = crate::util::normalize_ident(seeded_table.name);
+        let refuse = |reason: &str| {
+            Err(LimboError::InternalError(format!(
+                "seeded table {name} cannot be stored: {reason}"
+            )))
+        };
+        let table = dialect.parse_table_sql(seeded_table.create_sql, 0)?;
+        if table.name != name {
+            return refuse("its CREATE TABLE has a different name");
+        }
+        if let Some(reason) = unwritable_table_reason(&table) {
+            return refuse(reason);
+        }
+        let table = Arc::new(table);
+
+        // Fake root pages tell the indexes apart until they have names.
+        let automatic_count = crate::translate::schema::automatic_index_count(&table)?;
+        let mut index_rows = Vec::with_capacity(automatic_count + seeded_table.index_sql.len());
+        let mut automatic = Vec::with_capacity(automatic_count);
+        for number in 1..=automatic_count {
+            let index_name = format!("{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{name}_{number}");
+            automatic.push((index_name.clone(), index_rows.len() as i64 + 2));
+            index_rows.push(IndexRow {
+                name: index_name,
+                sql: None,
+            });
+        }
+        let mut from_sql = Vec::with_capacity(seeded_table.index_sql.len());
+        for sql in seeded_table.index_sql {
+            let on_table = match crate::dialect::parse_statement(dialect, sql)? {
+                Some(ast::Cmd::Stmt(ast::Stmt::CreateIndex { tbl_name, .. })) => {
+                    crate::util::normalize_ident(tbl_name.as_str())
+                }
+                _ => return refuse("index_sql has a statement that is not CREATE INDEX"),
+            };
+            if on_table != name {
+                return refuse("an index of index_sql is on another table");
+            }
+            from_sql.push(UnparsedFromSqlIndex {
+                table_name: name.clone(),
+                root_page: index_rows.len() as i64 + 2,
+                sql: sql.to_string(),
+            });
+            index_rows.push(IndexRow {
+                name: String::new(),
+                sql: Some(sql),
+            });
+        }
+        let mut automatic_indices = crate::HashMap::default();
+        if !automatic.is_empty() {
+            automatic_indices.insert(name.clone(), automatic);
+        }
+
+        let mut schema = Schema::new();
+        schema.add_btree_table(NamespaceId::ROOT, table.clone())?;
+        schema.populate_indices(
+            dialect,
+            &SymbolTable::new(),
+            from_sql,
+            automatic_indices,
+            false,
+        )?;
+        let mut indexes = Vec::with_capacity(index_rows.len());
+        for index in schema.get_indices(NamespaceId::ROOT, &name) {
+            if let Some(reason) = unwritable_index_reason(index) {
+                return refuse(reason);
+            }
+            let row = usize::try_from(index.root_page - 2)
+                .ok()
+                .and_then(|position| index_rows.get_mut(position));
+            let Some(row) = row else {
+                unreachable!("each index has the root page of its row");
+            };
+            row.name.clone_from(&index.name);
+            let mut index = Index::clone(index);
+            index.root_page = 0;
+            indexes.push(Arc::new(index));
+        }
+        turso_assert!(
+            indexes.len() == index_rows.len(),
+            "the schema has one index for each index row",
+            { "name": name }
+        );
+        Ok(Self {
+            name,
+            seeded_table,
+            read_only,
+            table,
+            index_rows,
+            indexes,
+        })
+    }
 }
 
 /// The read-only table of `seeded_table`. Its columns are the columns that
@@ -385,5 +549,42 @@ fn key_of(value: &Value) -> Key {
             }
         }
         Value::Text(_) | Value::Blob(_) => Key::AnyRow,
+    }
+}
+
+/// Why a [`SeededTableWriter`] cannot write `table`, or None when it can.
+/// The insert of a row checks NOT NULL and UNIQUE constraints only, and
+/// computes no column.
+///
+/// [`SeededTableWriter`]: crate::dialect::SeededTableWriter
+pub(crate) fn unwritable_table_reason(table: &BTreeTable) -> Option<&'static str> {
+    if !table.has_rowid {
+        Some("it has no rowid")
+    } else if table.is_strict {
+        Some("it is STRICT")
+    } else if table.has_autoincrement {
+        Some("it has AUTOINCREMENT")
+    } else if table.has_virtual_columns || table.columns().iter().any(|c| c.is_generated()) {
+        Some("it has generated columns")
+    } else if !table.check_constraints.is_empty() {
+        Some("it has CHECK constraints")
+    } else if !table.foreign_keys.is_empty() {
+        Some("it has foreign keys")
+    } else {
+        None
+    }
+}
+
+/// Why a [`SeededTableWriter`] cannot write `index`, or None when it can.
+/// The writer copies the key of an index from the columns of the row.
+///
+/// [`SeededTableWriter`]: crate::dialect::SeededTableWriter
+pub(crate) fn unwritable_index_reason(index: &Index) -> Option<&'static str> {
+    if index.is_expression_index() || index.where_clause.is_some() {
+        Some("an index has an expression or a WHERE clause")
+    } else if index.index_method.is_some() {
+        Some("an index uses an index method")
+    } else {
+        None
     }
 }

@@ -25,7 +25,7 @@ pub(crate) mod seeded;
 pub use crate::functions::builtin::{
     call_builtin_scalar, resolve_builtin_function, SQLITE_VERSION, SQLITE_VERSION_NUMBER,
 };
-pub use crate::translate::schema::SqliteCatalog;
+pub use crate::translate::schema::{SeededTableWriter, SqliteCatalog};
 pub use catalog::{
     AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
     CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,

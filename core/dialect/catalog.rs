@@ -10,14 +10,17 @@ use crate::{
         emitter::Resolver,
         schema::{
             alloc_sqlite_schema_cursor, emit_open_sqlite_schema_cursor,
-            open_sqlite_schema_for_write,
+            open_seeded_table_for_write, open_sqlite_schema_for_write, SeededTableWriter,
         },
     },
     util::renamed_automatic_index_name,
     vdbe::{builder::ProgramBuilder, insn::Insn},
     Connection, LimboError, Result, Value,
 };
-use std::{cell::Cell, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    sync::Arc,
+};
 
 /// Where a dialect stores the objects of a database. DDL translation
 /// creates and fills the B-trees; the catalog stores what describes them.
@@ -118,6 +121,12 @@ pub struct CmdContext<'a> {
     pub(crate) resolver: &'a Resolver<'a>,
     sqlite_schema_cursor: Cell<SqliteSchemaCursor>,
     sqlite_schema_rowid_reg: Cell<Option<usize>>,
+    /// The statement's cursor for writing `sqlite_schema` of the main
+    /// database, when the statement changes another database.
+    main_sqlite_schema_cursor: Cell<Option<usize>>,
+    /// The seeded tables that the statement writes, under their normalized
+    /// names.
+    seeded_table_writers: RefCell<Vec<(String, SeededTableWriter)>>,
 }
 
 impl<'a> CmdContext<'a> {
@@ -139,7 +148,55 @@ impl<'a> CmdContext<'a> {
             resolver,
             sqlite_schema_cursor: Cell::new(SqliteSchemaCursor::Unallocated),
             sqlite_schema_rowid_reg: Cell::new(None),
+            main_sqlite_schema_cursor: Cell::new(None),
+            seeded_table_writers: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Opens the seeded table `name` of the main database for writing, and
+    /// returns its writer. `name` is the name of a seeded table of the
+    /// catalog.
+    ///
+    /// When the schema of the statement has the table stored, the writer
+    /// opens it. Otherwise this is the first write: the writer creates the
+    /// table and its indexes in the transaction of the statement, and copies
+    /// the seed rows into it. From then on the name is the stored table's.
+    /// When the statement asks again for the same table, it gets the same
+    /// writer.
+    pub fn open_seeded_table_for_write(
+        &self,
+        program: &mut ProgramBuilder,
+        name: &str,
+    ) -> Result<SeededTableWriter> {
+        let name = crate::util::normalize_ident(name);
+        if let Some((_, writer)) = self
+            .seeded_table_writers
+            .borrow()
+            .iter()
+            .find(|(other, _)| *other == name)
+        {
+            return Ok(writer.clone());
+        }
+        let writer = open_seeded_table_for_write(self, program, &name)?;
+        self.seeded_table_writers
+            .borrow_mut()
+            .push((name, writer.clone()));
+        Ok(writer)
+    }
+
+    /// The statement's cursor for writing `sqlite_schema` of the main
+    /// database. It is [`Self::sqlite_schema_cursor`] when the statement
+    /// changes the main database. The first call opens it.
+    pub(crate) fn main_sqlite_schema_cursor(&self, program: &mut ProgramBuilder) -> usize {
+        if self.database_id == crate::MAIN_DB_ID {
+            return self.sqlite_schema_cursor(program);
+        }
+        if let Some(cursor_id) = self.main_sqlite_schema_cursor.get() {
+            return cursor_id;
+        }
+        let cursor_id = open_sqlite_schema_for_write(program, self.resolver, crate::MAIN_DB_ID);
+        self.main_sqlite_schema_cursor.set(Some(cursor_id));
+        cursor_id
     }
 
     /// The statement's cursor for writing `sqlite_schema` of the database

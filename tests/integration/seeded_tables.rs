@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use turso_core::dialect::{
-    Catalog, CatalogCmd, CmdContext, Dialect, Seed, SeededTable, SqliteCatalog,
+    Catalog, CatalogCmd, CmdContext, CmdOrigin, Dialect, Seed, SeededTable, SqliteCatalog,
 };
-use turso_core::{Connection, ProgramBuilder, Result, Value};
+use turso_core::{Connection, Insn, LimboError, ProgramBuilder, Result, Value};
 use turso_sqlite::SqliteDialect;
 
 const ITEMS_SQL: &str =
@@ -87,18 +87,95 @@ struct SeedCatalog {
 }
 
 impl Catalog for SeedCatalog {
+    /// Stores objects as SQLite does. Like pg_class, `seed_items` also gets
+    /// a row for each table that a user creates in the main database:
+    /// `(NULL, name, 'user table', NULL)`. The name of the table chooses
+    /// what else the catalog does:
+    /// - `plain...`: no row.
+    /// - `dup...`: the row has oid 10, which a seed row has.
+    /// - `twice...`: the catalog opens `seed_items` twice and writes two rows.
+    /// - `words...`: `seed_words` also gets a row `(name, length of name)`.
     fn emit(
         &self,
         program: &mut ProgramBuilder,
         ctx: &CmdContext<'_>,
         cmd: &CatalogCmd<'_>,
     ) -> Result<()> {
-        SqliteCatalog.emit(program, ctx, cmd)
+        SqliteCatalog.emit(program, ctx, cmd)?;
+        let CatalogCmd::CreateTable(table) = cmd else {
+            return Ok(());
+        };
+        if ctx.origin != CmdOrigin::User
+            || ctx.database_id != 0
+            || table.temporary
+            || table.name.starts_with("plain")
+        {
+            return Ok(());
+        }
+        let oid = if table.name.starts_with("dup") {
+            Some(10)
+        } else {
+            None
+        };
+        emit_item_row(program, ctx, table.name, oid)?;
+        if table.name.starts_with("twice") {
+            emit_item_row(program, ctx, &format!("{} again", table.name), None)?;
+        }
+        if table.name.starts_with("words") {
+            let words = ctx.open_seeded_table_for_write(program, "seed_words")?;
+            let start = program.alloc_registers(2);
+            program.emit_insn(Insn::String8 {
+                value: table.name.to_string(),
+                dest: start,
+            });
+            program.emit_insn(Insn::Integer {
+                value: table.name.len() as i64,
+                dest: start + 1,
+            });
+            words.emit_insert(program, start);
+        }
+        Ok(())
     }
 
     fn seeded_tables(&self) -> &'static [SeededTable] {
         self.tables
     }
+}
+
+/// Writes the row `(oid, name, 'user table', NULL)` to `seed_items`. A
+/// `None` oid gives a new one.
+fn emit_item_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    name: &str,
+    oid: Option<i64>,
+) -> Result<()> {
+    let items = ctx.open_seeded_table_for_write(program, "seed_items")?;
+    let start = program.alloc_registers(4);
+    match oid {
+        Some(oid) => program.emit_insn(Insn::Integer {
+            value: oid,
+            dest: start,
+        }),
+        None => program.emit_insn(Insn::Null {
+            dest: start,
+            dest_end: None,
+        }),
+    }
+    program.emit_insn(Insn::String8 {
+        value: name.to_string(),
+        dest: start + 1,
+    });
+    program.emit_insn(Insn::String8 {
+        value: "user table".to_string(),
+        dest: start + 2,
+    });
+    program.emit_insn(Insn::Null {
+        dest: start + 3,
+        dest_end: None,
+    });
+    items.emit_insert(program, start);
+    Ok(())
 }
 
 /// A SQLite dialect whose catalog has seeded tables. Each test makes its
@@ -109,29 +186,31 @@ struct SeedDialect {
 
 impl SeedDialect {
     fn new() -> Arc<Self> {
-        let items: &'static CountingSeed = Box::leak(Box::new(CountingSeed::new(
+        Self::with_items(vec![
             vec![
-                vec![
-                    Value::from_i64(10),
-                    Value::from_text("alpha"),
-                    Value::Null,
-                    Value::from_f64(1.5),
-                ],
-                vec![
-                    Value::from_i64(20),
-                    Value::from_text("beta"),
-                    Value::from_text("second"),
-                    Value::from_f64(2.0),
-                ],
-                vec![
-                    Value::from_i64(30),
-                    Value::from_text("gamma"),
-                    Value::Null,
-                    Value::from_f64(-0.25),
-                ],
+                Value::from_i64(10),
+                Value::from_text("alpha"),
+                Value::Null,
+                Value::from_f64(1.5),
             ],
-            Some(0),
-        )));
+            vec![
+                Value::from_i64(20),
+                Value::from_text("beta"),
+                Value::from_text("second"),
+                Value::from_f64(2.0),
+            ],
+            vec![
+                Value::from_i64(30),
+                Value::from_text("gamma"),
+                Value::Null,
+                Value::from_f64(-0.25),
+            ],
+        ])
+    }
+
+    /// A dialect whose `seed_items` has the rows `items`.
+    fn with_items(items: Vec<Vec<Value>>) -> Arc<Self> {
+        let items: &'static CountingSeed = Box::leak(Box::new(CountingSeed::new(items, Some(0))));
         let words: &'static CountingSeed = Box::leak(Box::new(CountingSeed::new(
             vec![
                 vec![Value::from_text("one"), Value::from_i64(3)],
@@ -368,15 +447,15 @@ fn lookup_by_rowid_uses_find(mvcc: bool) {
     assert_eq!(items.calls(), (1, 1));
 
     // A join looks up the seeded table once for each outer row.
-    conn.execute("CREATE TABLE refs (k INTEGER)").unwrap();
-    conn.execute("INSERT INTO refs VALUES (20), (99), (10)")
+    conn.execute("CREATE TABLE plain_refs (k INTEGER)").unwrap();
+    conn.execute("INSERT INTO plain_refs VALUES (20), (99), (10)")
         .unwrap();
     items.reset();
     assert_eq!(
         rows(
             &conn,
-            "SELECT refs.k, s.name FROM refs LEFT JOIN seed_items s ON s.oid = refs.k \
-             ORDER BY refs.rowid"
+            "SELECT r.k, s.name FROM plain_refs r LEFT JOIN seed_items s ON s.oid = r.k \
+             ORDER BY r.rowid"
         ),
         vec![
             vec![int(20), text("beta")],
@@ -475,11 +554,11 @@ fn visible_after_schema_change_and_reopen(mvcc: bool) {
             rows(&other, "SELECT count(*) FROM seed_items"),
             vec![vec![int(3)]]
         );
-        conn.execute("CREATE TABLE x (a)").unwrap();
-        conn.execute("INSERT INTO x VALUES (1)").unwrap();
+        conn.execute("CREATE TABLE plain_x (a)").unwrap();
+        conn.execute("INSERT INTO plain_x VALUES (1)").unwrap();
         assert_eq!(rows(&conn, "SELECT * FROM seed_items"), seed_item_rows());
         // The other connection reads the schema change first.
-        assert_eq!(rows(&other, "SELECT * FROM x"), vec![vec![int(1)]]);
+        assert_eq!(rows(&other, "SELECT * FROM plain_x"), vec![vec![int(1)]]);
         assert_eq!(rows(&other, "SELECT * FROM seed_items"), seed_item_rows());
         // A connection made after the change.
         let third = db.connect_limbo();
@@ -500,7 +579,7 @@ fn visible_after_schema_change_and_reopen(mvcc: bool) {
     }
     let db = open(&path, dialect, mvcc);
     let conn = db.connect_limbo();
-    assert_eq!(rows(&conn, "SELECT * FROM x"), vec![vec![int(1)]]);
+    assert_eq!(rows(&conn, "SELECT * FROM plain_x"), vec![vec![int(1)]]);
     assert_eq!(rows(&conn, "SELECT * FROM seed_items"), seed_item_rows());
     assert_eq!(
         rows(&conn, "SELECT rowid, * FROM seed_words"),
@@ -665,4 +744,691 @@ fn renamed_stored_table_gives_back_the_name() {
         vec![vec![text("stored one")]]
     );
     assert_eq!(rows(&conn, "SELECT * FROM seed_items"), seed_item_rows());
+}
+
+/// The rows that the catalog wrote to `seed_items` for user tables.
+fn user_table_rows(conn: &Arc<Connection>) -> Vec<Vec<SqlValue>> {
+    rows(
+        conn,
+        "SELECT name FROM seed_items WHERE note = 'user table' ORDER BY oid",
+    )
+}
+
+/// The `sqlite_schema` rows of `seed_items`.
+fn seed_items_schema_rows(conn: &Arc<Connection>) -> Vec<Vec<SqlValue>> {
+    rows(
+        conn,
+        "SELECT type, name, tbl_name, sql IS NULL FROM sqlite_schema \
+         WHERE tbl_name = 'seed_items' ORDER BY rowid",
+    )
+}
+
+fn stored_seed_items_schema_rows() -> Vec<Vec<SqlValue>> {
+    vec![
+        vec![
+            text("table"),
+            text("seed_items"),
+            text("seed_items"),
+            int(0),
+        ],
+        vec![
+            text("index"),
+            text("seed_items_name"),
+            text("seed_items"),
+            int(0),
+        ],
+    ]
+}
+
+/// A statement stores `seed_items` and writes to it: the stored table takes
+/// the name from the read-only table in the same statement, and keeps it in
+/// the transaction, after the commit, for another connection and after a
+/// reopen.
+fn same_statement_takes_the_name(mvcc: bool, explicit_transaction: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    let dialect = SeedDialect::new();
+    {
+        let db = open(&path, dialect.clone(), mvcc);
+        let conn = db.connect_limbo();
+        let other = db.connect_limbo();
+        assert_eq!(rows(&other, "SELECT * FROM seed_items"), seed_item_rows());
+        if explicit_transaction {
+            conn.execute("BEGIN").unwrap();
+        }
+        conn.execute("CREATE TABLE t1 (a)").unwrap();
+        dialect.items().reset();
+        assert_eq!(user_table_rows(&conn), vec![vec![text("t1")]]);
+        assert_eq!(
+            dialect.items().calls(),
+            (0, 0),
+            "the stored table has the name"
+        );
+        assert_eq!(
+            seed_items_schema_rows(&conn),
+            stored_seed_items_schema_rows()
+        );
+        // A second write in the transaction opens the stored table.
+        conn.execute("CREATE TABLE t2 (a)").unwrap();
+        assert_eq!(
+            user_table_rows(&conn),
+            vec![vec![text("t1")], vec![text("t2")]]
+        );
+        if explicit_transaction {
+            conn.execute("COMMIT").unwrap();
+        }
+        dialect.items().reset();
+        assert_eq!(
+            user_table_rows(&other),
+            vec![vec![text("t1")], vec![text("t2")]]
+        );
+        assert_eq!(
+            seed_items_schema_rows(&other),
+            stored_seed_items_schema_rows()
+        );
+        assert_eq!(dialect.items().calls(), (0, 0));
+        conn.close().unwrap();
+        other.close().unwrap();
+    }
+    let db = open(&path, dialect.clone(), mvcc);
+    let conn = db.connect_limbo();
+    dialect.items().reset();
+    assert_eq!(
+        user_table_rows(&conn),
+        vec![vec![text("t1")], vec![text("t2")]]
+    );
+    assert_eq!(
+        seed_items_schema_rows(&conn),
+        stored_seed_items_schema_rows()
+    );
+    assert_eq!(dialect.items().calls(), (0, 0));
+}
+
+#[test]
+fn same_statement_takes_the_name_wal() {
+    same_statement_takes_the_name(false, false);
+}
+
+#[test]
+fn same_statement_takes_the_name_wal_in_transaction() {
+    same_statement_takes_the_name(false, true);
+}
+
+#[test]
+fn same_statement_takes_the_name_mvcc() {
+    same_statement_takes_the_name(true, false);
+}
+
+#[test]
+fn same_statement_takes_the_name_mvcc_in_transaction() {
+    same_statement_takes_the_name(true, true);
+}
+
+fn turso_integrity_check(conn: &Arc<Connection>) -> Vec<Vec<SqlValue>> {
+    rows(conn, "PRAGMA integrity_check")
+}
+
+fn sqlite_integrity_check(path: &Path) -> String {
+    let sqlite = rusqlite::Connection::open(path).unwrap();
+    sqlite
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap()
+}
+
+/// All rows of `seed_items`, by oid.
+fn all_items(conn: &Arc<Connection>) -> Vec<Vec<SqlValue>> {
+    rows(conn, "SELECT * FROM seed_items ORDER BY oid")
+}
+
+/// The seed rows, then a row that the catalog wrote for each of `tables`,
+/// with the oids that follow the last seed row.
+fn items_with_user_tables(tables: &[&str]) -> Vec<Vec<SqlValue>> {
+    let mut expected = seed_item_rows();
+    for (position, table) in tables.iter().enumerate() {
+        expected.push(vec![
+            int(31 + position as i64),
+            text(table),
+            text("user table"),
+            SqlValue::Null,
+        ]);
+    }
+    expected
+}
+
+/// Asserts that `seed_items` is the read-only table on `conn`: it returns
+/// the seed rows, which it reads from the seed, and no `sqlite_schema` row
+/// has the name.
+fn assert_read_only_items(conn: &Arc<Connection>, dialect: &SeedDialect) {
+    dialect.items().reset();
+    assert_eq!(all_items(conn), seed_item_rows());
+    let (_, row_calls) = dialect.items().calls();
+    assert!(row_calls > 0, "the rows come from the seed");
+    assert_eq!(
+        rows(
+            conn,
+            "SELECT count(*) FROM sqlite_schema WHERE tbl_name = 'seed_items'"
+        ),
+        vec![vec![int(0)]]
+    );
+}
+
+/// Fact 1: the first write stores the seed rows and the catalog's row, in
+/// the statement's transaction. Every later reader sees the stored table,
+/// and the file is intact.
+fn first_write_stores_seed_rows(mvcc: bool, explicit_transaction: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    let dialect = SeedDialect::new();
+    let expected = items_with_user_tables(&["t1"]);
+    {
+        let db = open(&path, dialect.clone(), mvcc);
+        let conn = db.connect_limbo();
+        let other = db.connect_limbo();
+        if explicit_transaction {
+            conn.execute("BEGIN").unwrap();
+        }
+        conn.execute("CREATE TABLE t1 (a)").unwrap();
+        assert_eq!(all_items(&conn), expected);
+        if explicit_transaction {
+            // The transaction is not committed: the other connection still
+            // reads the read-only table.
+            assert_read_only_items(&other, &dialect);
+            conn.execute("COMMIT").unwrap();
+        }
+        dialect.items().reset();
+        assert_eq!(all_items(&other), expected);
+        let third = db.connect_limbo();
+        assert_eq!(all_items(&third), expected);
+        assert_eq!(dialect.items().calls(), (0, 0));
+        // Only the table that the statement wrote is stored.
+        assert_eq!(
+            rows(
+                &conn,
+                "SELECT count(*) FROM sqlite_schema WHERE tbl_name = 'seed_words'"
+            ),
+            vec![vec![int(0)]]
+        );
+        assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+        if !mvcc {
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        conn.close().unwrap();
+        other.close().unwrap();
+        third.close().unwrap();
+    }
+    if !mvcc {
+        assert_eq!(sqlite_integrity_check(&path), "ok");
+        let sqlite = rusqlite::Connection::open(&path).unwrap();
+        let mut stmt = sqlite
+            .prepare("SELECT * FROM seed_items ORDER BY oid")
+            .unwrap();
+        let stored: Vec<Vec<SqlValue>> = stmt
+            .query_map([], |row| (0..4).map(|i| row.get(i)).collect())
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(stored, expected);
+    }
+    let db = open(&path, dialect.clone(), mvcc);
+    let conn = db.connect_limbo();
+    dialect.items().reset();
+    assert_eq!(all_items(&conn), expected);
+    assert_eq!(dialect.items().calls(), (0, 0));
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn first_write_stores_seed_rows_wal() {
+    first_write_stores_seed_rows(false, false);
+}
+
+#[test]
+fn first_write_stores_seed_rows_wal_in_transaction() {
+    first_write_stores_seed_rows(false, true);
+}
+
+#[test]
+fn first_write_stores_seed_rows_mvcc() {
+    first_write_stores_seed_rows(true, false);
+}
+
+#[test]
+fn first_write_stores_seed_rows_mvcc_in_transaction() {
+    first_write_stores_seed_rows(true, true);
+}
+
+/// Asserts that each seed row is stored once: the oids are distinct, and
+/// the stored rows are the seed rows and one row for each of `tables`.
+fn assert_seed_stored_once(conn: &Arc<Connection>, tables: &[&str]) {
+    assert_eq!(
+        rows(conn, "SELECT count(*), count(DISTINCT oid) FROM seed_items"),
+        vec![vec![
+            int(3 + tables.len() as i64),
+            int(3 + tables.len() as i64)
+        ]]
+    );
+    assert_eq!(all_items(conn), items_with_user_tables(tables));
+}
+
+/// Fact 2: a statement compiled while the table was not stored, run after
+/// another connection stored it, compiles again and does not fill again.
+fn prepared_first_write_runs_after_another_store(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let dialect = SeedDialect::new();
+    let db = open(&new_path(&dir), dialect.clone(), mvcc);
+    let a = db.connect_limbo();
+    let b = db.connect_limbo();
+    let mut statement = a.prepare("CREATE TABLE a1 (a)").unwrap();
+    b.execute("CREATE TABLE b1 (a)").unwrap();
+    dialect.items().reset();
+    statement.run_ignore_rows().unwrap();
+    assert_eq!(dialect.items().calls(), (0, 0), "no second fill");
+    assert_seed_stored_once(&a, &["b1", "a1"]);
+    assert_seed_stored_once(&b, &["b1", "a1"]);
+    assert_eq!(turso_integrity_check(&a), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn prepared_first_write_runs_after_another_store_wal() {
+    prepared_first_write_runs_after_another_store(false);
+}
+
+#[test]
+fn prepared_first_write_runs_after_another_store_mvcc() {
+    prepared_first_write_runs_after_another_store(true);
+}
+
+/// Fact 2: two transactions do the first write at the same time. A schema
+/// change takes the database's write lock, so the second first write fails
+/// with `expected` (Busy, or BusySnapshot when its WAL snapshot is older
+/// than the first commit) and fills nothing. A retry in a new transaction
+/// opens the stored table and does not fill again.
+fn concurrent_first_writes(
+    mvcc: bool,
+    begin: &str,
+    second_reads_first: bool,
+    expected: fn(&LimboError) -> bool,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let dialect = SeedDialect::new();
+    let db = open(&new_path(&dir), dialect.clone(), mvcc);
+    let a = db.connect_limbo();
+    let b = db.connect_limbo();
+    a.execute(begin).unwrap();
+    a.execute("CREATE TABLE a1 (a)").unwrap();
+    b.execute(begin).unwrap();
+    if second_reads_first {
+        // The second transaction reads the read-only table, then the first
+        // commits.
+        assert_read_only_items(&b, &dialect);
+        a.execute("COMMIT").unwrap();
+    }
+    dialect.items().reset();
+    let err = b.execute("CREATE TABLE b1 (a)").unwrap_err();
+    assert!(expected(&err), "mvcc={mvcc} {begin}: {err:?}");
+    assert_eq!(dialect.items().calls(), (0, 0), "no fill");
+    if !second_reads_first {
+        a.execute("COMMIT").unwrap();
+    }
+    if !b.get_auto_commit() {
+        b.execute("ROLLBACK").unwrap();
+    }
+    assert_seed_stored_once(&b, &["a1"]);
+
+    dialect.items().reset();
+    b.execute(begin).unwrap();
+    b.execute("CREATE TABLE b1 (a)").unwrap();
+    b.execute("COMMIT").unwrap();
+    assert_eq!(dialect.items().calls(), (0, 0), "no second fill");
+    assert_seed_stored_once(&b, &["a1", "b1"]);
+    assert_seed_stored_once(&a, &["a1", "b1"]);
+    assert_eq!(turso_integrity_check(&a), vec![vec![text("ok")]]);
+}
+
+fn is_busy(err: &LimboError) -> bool {
+    matches!(err, LimboError::Busy)
+}
+
+fn is_busy_snapshot(err: &LimboError) -> bool {
+    matches!(err, LimboError::BusySnapshot)
+}
+
+#[test]
+fn concurrent_first_writes_wal() {
+    concurrent_first_writes(false, "BEGIN", false, is_busy);
+}
+
+#[test]
+fn concurrent_first_writes_wal_after_commit() {
+    concurrent_first_writes(false, "BEGIN", true, is_busy_snapshot);
+}
+
+#[test]
+fn concurrent_first_writes_mvcc() {
+    concurrent_first_writes(true, "BEGIN", false, is_busy);
+}
+
+#[test]
+fn concurrent_first_writes_mvcc_after_commit() {
+    concurrent_first_writes(true, "BEGIN", true, is_busy);
+}
+
+#[test]
+fn concurrent_first_writes_mvcc_concurrent_transactions() {
+    concurrent_first_writes(true, "BEGIN CONCURRENT", false, is_busy);
+}
+
+#[test]
+fn concurrent_first_writes_mvcc_concurrent_transactions_after_commit() {
+    concurrent_first_writes(true, "BEGIN CONCURRENT", true, is_busy);
+}
+
+/// How a test rolls back the first write.
+#[derive(Clone, Copy, Debug)]
+enum FirstWriteRollback {
+    /// The statement fails after the fill in autocommit mode: the
+    /// catalog's row has the oid of a seed row.
+    FailedStatement,
+    /// The same statement fails inside a transaction, which goes on and
+    /// commits.
+    FailedStatementInTransaction,
+    /// The statement succeeds inside a transaction, and ROLLBACK ends it.
+    Rollback,
+}
+
+/// Fact 3: a first write that is rolled back leaves the name on the
+/// read-only table, for this connection and for a connection that shares
+/// the schema, and leaves no `sqlite_schema` row. A later first write
+/// stores the table.
+fn rolled_back_first_write_leaves_read_only_table(mvcc: bool, rollback: FirstWriteRollback) {
+    let dir = tempfile::tempdir().unwrap();
+    let dialect = SeedDialect::new();
+    let db = open(&new_path(&dir), dialect.clone(), mvcc);
+    let conn = db.connect_limbo();
+    let other = db.connect_limbo();
+    assert_read_only_items(&other, &dialect);
+
+    let assert_failed = |err: String| {
+        assert!(
+            err.contains("UNIQUE constraint failed: seed_items.oid"),
+            "{rollback:?}: {err}"
+        );
+    };
+    match rollback {
+        FirstWriteRollback::FailedStatement => {
+            assert_failed(error_of(&conn, "CREATE TABLE dup1 (a)"));
+        }
+        FirstWriteRollback::FailedStatementInTransaction => {
+            conn.execute("BEGIN").unwrap();
+            assert_failed(error_of(&conn, "CREATE TABLE dup1 (a)"));
+            assert_read_only_items(&conn, &dialect);
+            assert_read_only_items(&other, &dialect);
+            conn.execute("CREATE TABLE plain_kept (a)").unwrap();
+            conn.execute("COMMIT").unwrap();
+            assert_eq!(
+                rows(&other, "SELECT count(*) FROM plain_kept"),
+                vec![vec![int(0)]]
+            );
+        }
+        FirstWriteRollback::Rollback => {
+            conn.execute("BEGIN").unwrap();
+            conn.execute("CREATE TABLE t1 (a)").unwrap();
+            assert_eq!(all_items(&conn), items_with_user_tables(&["t1"]));
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+    assert_read_only_items(&conn, &dialect);
+    assert_read_only_items(&other, &dialect);
+    for table in ["dup1", "t1"] {
+        let err = error_of(&other, &format!("SELECT * FROM {table}"));
+        assert!(err.contains("no such table"), "{err}");
+    }
+
+    // A new first write.
+    conn.execute("CREATE TABLE t2 (a)").unwrap();
+    assert_eq!(all_items(&conn), items_with_user_tables(&["t2"]));
+    assert_eq!(all_items(&other), items_with_user_tables(&["t2"]));
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn failed_first_write_leaves_read_only_table_wal() {
+    rolled_back_first_write_leaves_read_only_table(false, FirstWriteRollback::FailedStatement);
+}
+
+#[test]
+fn failed_first_write_leaves_read_only_table_mvcc() {
+    rolled_back_first_write_leaves_read_only_table(true, FirstWriteRollback::FailedStatement);
+}
+
+#[test]
+fn failed_first_write_in_transaction_leaves_read_only_table_wal() {
+    rolled_back_first_write_leaves_read_only_table(
+        false,
+        FirstWriteRollback::FailedStatementInTransaction,
+    );
+}
+
+#[test]
+fn failed_first_write_in_transaction_leaves_read_only_table_mvcc() {
+    rolled_back_first_write_leaves_read_only_table(
+        true,
+        FirstWriteRollback::FailedStatementInTransaction,
+    );
+}
+
+#[test]
+fn rolled_back_first_write_leaves_read_only_table_wal() {
+    rolled_back_first_write_leaves_read_only_table(false, FirstWriteRollback::Rollback);
+}
+
+#[test]
+fn rolled_back_first_write_leaves_read_only_table_mvcc() {
+    rolled_back_first_write_leaves_read_only_table(true, FirstWriteRollback::Rollback);
+}
+
+/// The opcodes of the program of `sql`.
+fn opcodes(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
+    rows(conn, &format!("EXPLAIN {sql}"))
+        .into_iter()
+        .map(|row| match &row[1] {
+            SqlValue::Text(opcode) => opcode.clone(),
+            other => panic!("opcode is {other:?}"),
+        })
+        .collect()
+}
+
+fn count_opcode(opcodes: &[String], opcode: &str) -> usize {
+    opcodes.iter().filter(|other| *other == opcode).count()
+}
+
+/// A statement that asks twice for the same seeded table stores it once.
+fn same_table_twice_in_one_statement(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let dialect = SeedDialect::new();
+    let db = open(&new_path(&dir), dialect.clone(), mvcc);
+    let conn = db.connect_limbo();
+    let program = opcodes(&conn, "CREATE TABLE twice1 (a)");
+    // twice1, seed_items and its index seed_items_name.
+    assert_eq!(count_opcode(&program, "CreateBtree"), 3, "{program:?}");
+    assert_eq!(count_opcode(&program, "VOpen"), 1, "{program:?}");
+    assert_eq!(count_opcode(&program, "ParseSchema"), 2, "{program:?}");
+    conn.execute("CREATE TABLE twice1 (a)").unwrap();
+    assert_eq!(
+        all_items(&conn),
+        items_with_user_tables(&["twice1", "twice1 again"])
+    );
+    // Once stored, the statement creates only its own table.
+    let program = opcodes(&conn, "CREATE TABLE twice2 (a)");
+    assert_eq!(count_opcode(&program, "CreateBtree"), 1, "{program:?}");
+    assert_eq!(count_opcode(&program, "VOpen"), 0, "{program:?}");
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn same_table_twice_in_one_statement_wal() {
+    same_table_twice_in_one_statement(false);
+}
+
+#[test]
+fn same_table_twice_in_one_statement_mvcc() {
+    same_table_twice_in_one_statement(true);
+}
+
+/// One statement stores two seeded tables. The table without a rowid alias
+/// keeps the rowids of the seed rows.
+fn two_tables_in_one_statement(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    let dialect = SeedDialect::new();
+    let expected_words = vec![
+        vec![int(1), text("one"), int(3)],
+        vec![int(2), text("three"), int(5)],
+        vec![int(3), text("words1"), int(6)],
+    ];
+    {
+        let db = open(&path, dialect.clone(), mvcc);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE words1 (a)").unwrap();
+        assert_eq!(all_items(&conn), items_with_user_tables(&["words1"]));
+        assert_eq!(
+            rows(&conn, "SELECT rowid, * FROM seed_words ORDER BY rowid"),
+            expected_words
+        );
+        assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+        conn.close().unwrap();
+    }
+    let db = open(&path, dialect.clone(), mvcc);
+    let conn = db.connect_limbo();
+    dialect.words().reset();
+    assert_eq!(
+        rows(&conn, "SELECT rowid, * FROM seed_words ORDER BY rowid"),
+        expected_words
+    );
+    assert_eq!(dialect.words().calls(), (0, 0));
+}
+
+#[test]
+fn two_tables_in_one_statement_wal() {
+    two_tables_in_one_statement(false);
+}
+
+#[test]
+fn two_tables_in_one_statement_mvcc() {
+    two_tables_in_one_statement(true);
+}
+
+/// The fill writes the index of `index_sql`, so a query that uses the index
+/// finds the seed rows.
+fn index_has_the_seed_rows(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let dialect = SeedDialect::new();
+    let db = open(&new_path(&dir), dialect.clone(), mvcc);
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t1 (a)").unwrap();
+    let plan = rows(
+        &conn,
+        "EXPLAIN QUERY PLAN SELECT oid FROM seed_items WHERE name = 'beta'",
+    );
+    assert!(
+        format!("{plan:?}").contains("seed_items_name"),
+        "the query uses the index: {plan:?}"
+    );
+    assert_eq!(
+        rows(&conn, "SELECT oid FROM seed_items WHERE name = 'beta'"),
+        vec![vec![int(20)]]
+    );
+    assert_eq!(
+        rows(&conn, "SELECT oid FROM seed_items WHERE name = 't1'"),
+        vec![vec![int(31)]]
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT name FROM seed_items WHERE name > 'a' ORDER BY name"
+        ),
+        vec![
+            vec![text("alpha")],
+            vec![text("beta")],
+            vec![text("gamma")],
+            vec![text("t1")],
+        ]
+    );
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn index_has_the_seed_rows_wal() {
+    index_has_the_seed_rows(false);
+}
+
+#[test]
+fn index_has_the_seed_rows_mvcc() {
+    index_has_the_seed_rows(true);
+}
+
+/// A seed of some thousands of rows fills a table of many pages.
+fn large_seed_fills(mvcc: bool) {
+    const ROWS: i64 = 5000;
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    let items = (0..ROWS)
+        .map(|i| {
+            vec![
+                Value::from_i64(i * 2 + 1),
+                Value::from_text(format!("name {i:05}")),
+                Value::from_text("x".repeat(100)),
+                Value::from_f64(i as f64 / 4.0),
+            ]
+        })
+        .collect();
+    let dialect = SeedDialect::with_items(items);
+    {
+        let db = open(&path, dialect.clone(), mvcc);
+        let conn = db.connect_limbo();
+        // A small cache makes the fill write pages out before the commit.
+        conn.execute("PRAGMA cache_size = 20").unwrap();
+        conn.execute("CREATE TABLE t1 (a)").unwrap();
+        assert_eq!(
+            rows(
+                &conn,
+                "SELECT count(*), count(DISTINCT oid), max(oid) FROM seed_items"
+            ),
+            vec![vec![int(ROWS + 1), int(ROWS + 1), int(ROWS * 2)]]
+        );
+        conn.close().unwrap();
+    }
+    let db = open(&path, dialect.clone(), mvcc);
+    let conn = db.connect_limbo();
+    dialect.items().reset();
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT oid, name, weight FROM seed_items WHERE oid = 4001"
+        ),
+        vec![vec![int(4001), text("name 02000"), real(500.0)]]
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT oid FROM seed_items WHERE name = 'name 04999'"
+        ),
+        vec![vec![int(9999)]]
+    );
+    assert_eq!(
+        rows(&conn, "SELECT name, note FROM seed_items WHERE oid = 10000"),
+        vec![vec![text("t1"), text("user table")]]
+    );
+    assert_eq!(dialect.items().calls(), (0, 0));
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn large_seed_fills_wal() {
+    large_seed_fills(false);
+}
+
+#[test]
+fn large_seed_fills_mvcc() {
+    large_seed_fills(true);
 }

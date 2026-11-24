@@ -15459,6 +15459,9 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                     let mut dbsp_state_index_roots = crate::HashMap::default();
                     let mut materialized_view_info = crate::HashMap::default();
                     for row in &rows {
+                        if db == crate::MAIN_DB_ID && row.ty == "table" {
+                            remove_read_only_seeded_table(conn, schema, &row.name);
+                        }
                         schema.handle_schema_row(
                             &row.ty,
                             &row.name,
@@ -15536,6 +15539,21 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 return Err(LimboError::Busy.into());
             }
         }
+    }
+}
+
+/// Removes the read-only table of the seeded table `name` from `schema`, if
+/// the schema has it. A statement that stores the seeded table writes its
+/// `sqlite_schema` row and then parses it in the same statement, while the
+/// schema still has the read-only table under the name. The stored table
+/// takes the name, as it does when the schema is loaded. A table of another
+/// kind under the name is left, so that adding the stored table fails.
+fn remove_read_only_seeded_table(conn: &Connection, schema: &mut Schema, name: &str) {
+    let Some(table) = schema.get_table(NamespaceId::ROOT, name) else {
+        return;
+    };
+    if conn.db.seeded_tables.is_read_only_table(name, &table) {
+        schema.remove_table(NamespaceId::ROOT, name);
     }
 }
 

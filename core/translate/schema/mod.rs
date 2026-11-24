@@ -1,5 +1,9 @@
+mod seeded_table_rows;
 mod sqlite_schema_alter_rows;
 mod sqlite_schema_rows;
+
+pub(crate) use seeded_table_rows::open_seeded_table_for_write;
+pub use seeded_table_rows::SeededTableWriter;
 
 pub use sqlite_schema_rows::SqliteCatalog;
 pub(crate) use sqlite_schema_rows::{
@@ -1833,7 +1837,18 @@ fn collect_autoindexes(
     table: &BTreeTable,
     program: &mut ProgramBuilder,
 ) -> Result<Option<Vec<usize>>> {
-    let mut regs: Vec<usize> = Vec::new();
+    let count = automatic_index_count(table)?;
+    if count == 0 {
+        return Ok(None);
+    }
+    Ok(Some((0..count).map(|_| program.alloc_register()).collect()))
+}
+
+/// The number of automatic indexes that `CREATE TABLE` gives `table`, as
+/// [`collect_autoindexes`] describes them. They are named
+/// `sqlite_autoindex_<table>_<n>`, from 1, in this order.
+pub(crate) fn automatic_index_count(table: &BTreeTable) -> Result<usize> {
+    let mut count = 0;
 
     // include UNIQUE singles, include PK single only if not rowid alias
     for us in table.unique_sets.iter().filter(|us| us.columns.len() == 1) {
@@ -1853,7 +1868,7 @@ fn collect_autoindexes(
         };
 
         if needs_index {
-            regs.push(program.alloc_register());
+            count += 1;
         }
     }
 
@@ -1861,13 +1876,9 @@ fn collect_autoindexes(
         if !table.has_rowid && _us.is_primary_key {
             continue;
         }
-        regs.push(program.alloc_register());
+        count += 1;
     }
-    if regs.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(regs))
-    }
+    Ok(count)
 }
 
 fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImpl>) -> String {
