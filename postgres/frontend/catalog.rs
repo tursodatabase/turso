@@ -396,6 +396,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn insert_implicit_target_allows_fewer_values(&self) -> bool {
+        true
+    }
+
     fn generates_integer_primary_keys(&self) -> bool {
         false
     }
