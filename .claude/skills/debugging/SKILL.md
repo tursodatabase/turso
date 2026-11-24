@@ -62,10 +62,18 @@ debug builds do not reuse stack slots, so their frames say little about what use
 scripts/stack/frame-sizes.sh '<function name pattern>'        # frame size per function; -c compares two binaries
 scripts/stack/min-stack.sh -S -b target/release/tursodb deep.sql   # smallest stack that runs a script
 scripts/stack/stack-profile.sh deep.sql                 # functions on the stack at its deepest point (lldb)
+scripts/stack/check-deep-queries.sh -s 2048             # deepest permitted queries on a 2 MiB stack
 ```
 
 Functions that recurse per level should be small. Move rare and large paths into
-`#[inline(never)]` helpers, like SQLite's `SQLITE_NOINLINE`.
+`#[inline(never)]` helpers, like SQLite's `SQLITE_NOINLINE`. LLVM reserves the full
+frame when a function starts, so a large value in any branch counts at each level.
+Move the work before and after the recursive call into `#[inline(never)]` helpers,
+and keep large values (plans, contexts, AST nodes) in a `Box`.
+
+The Stack Sizes workflow runs `check-deep-queries.sh` on each pull request. Its
+scripts come from `scripts/stack/deep-queries.py`, which nests queries as deeply as
+the limits permit. When you add a kind of nesting, add a script there.
 
 ## Corruption
 

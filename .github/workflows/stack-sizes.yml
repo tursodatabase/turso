@@ -112,6 +112,12 @@ jobs:
 
           test -f "$STACK_BINARY"
 
+      # Rust gives a thread that it starts a 2 MiB stack. The deepest queries
+      # that the limits of Turso permit must run on such a stack.
+      - name: Run the deepest permitted queries on a 2 MiB stack
+        shell: bash
+        run: scripts/stack/check-deep-queries.sh -b "$STACK_BINARY" -s 2048
+
       - name: Dump .stack_sizes section
         shell: bash
         run: |

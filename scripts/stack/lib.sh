@@ -24,3 +24,29 @@ demangle_rust() {
 strip_rust_hash() {
   sed -E 's/::h[0-9a-f]{16}$//'
 }
+
+# Prints the largest stack, in KiB, that a run with `ulimit -s` can get: the
+# hard limit of the shell, but at most 1 GiB.
+max_stack_kib() {
+  local max_kib
+  max_kib=$(ulimit -H -s)
+  if [ "$max_kib" = "unlimited" ] || [ "$max_kib" -gt 1048576 ]; then
+    max_kib=1048576
+  fi
+  echo "$max_kib"
+}
+
+# Runs a SQL script on an in-memory database with a stack of the given size,
+# and prints the exit code on the first line, then the output. KIND is tursodb
+# or sqlite3. The CLI runs statements on the main thread, so `ulimit -s` sets
+# the stack that they get.
+run_with_stack() {
+  local kind="$1" bin="$2" script="$3" kib="$4" out code
+  if [ "$kind" = sqlite3 ]; then
+    out=$( (ulimit -s "$kib" && "$bin" :memory: < "$script") 2>&1)
+  else
+    out=$( (ulimit -s "$kib" && "$bin" -q -m list :memory: < "$script") 2>&1)
+  fi
+  code=$?
+  printf '%s\n%s' "$code" "$out"
+}
