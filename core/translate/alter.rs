@@ -4650,16 +4650,13 @@ impl crate::util::AstVisitor for RenameTableRefCheck<'_> {
     }
 
     fn trigger_table(&mut self, trigger: &crate::schema::Trigger) -> Result<()> {
-        // A TEMP trigger `ON aux.s` keeps the database its qualifier resolved
-        // to, so name its table with that database rather than looking `s` up
-        // in temp and main. A database that is no longer attached has no name,
-        // and the bare name reports the table as missing, as before.
+        // Name a TEMP trigger's own table with the `aux.` its `ON aux.s`
+        // writes, so it is looked up in aux rather than in temp and main.
+        // The qualifier is resolved by name, as SQLite does, so a database
+        // that was detached and attached again is still found.
         let table_name = ast::Name::exact(trigger.table_name.clone());
-        let name = match trigger
-            .target_database_id
-            .and_then(|database_id| self.resolver.namespace_name(database_id))
-        {
-            Some(db_name) => ast::QualifiedName::fullname(ast::Name::exact(db_name), table_name),
+        let name = match trigger.written_table_qualifier(self.resolver.catalog.dialect.as_ref()) {
+            Some(db_name) => ast::QualifiedName::fullname(db_name, table_name),
             None => ast::QualifiedName::single(table_name),
         };
         self.table(&name)

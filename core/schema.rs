@@ -86,6 +86,22 @@ pub struct Trigger {
 }
 
 impl Trigger {
+    /// The database qualifier of the trigger's `ON db.t` clause as its SQL
+    /// writes it, or `None` when the table name is unqualified (or the SQL
+    /// does not parse). SQLite resolves that qualifier by name.
+    pub fn written_table_qualifier(
+        &self,
+        dialect: &dyn crate::dialect::Dialect,
+    ) -> Option<turso_parser::ast::Name> {
+        match crate::dialect::parse_statement(dialect, &self.sql) {
+            Ok(Some(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateTrigger {
+                tbl_name,
+                ..
+            }))) => tbl_name.namespace,
+            _ => None,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,

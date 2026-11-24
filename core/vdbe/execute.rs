@@ -16895,11 +16895,11 @@ pub fn op_cast(
 }
 
 /// Regenerate trigger SQL from its in-memory fields to keep trigger.sql
-/// in sync after table/column renames. `table_db_name` is the database a
-/// TEMP trigger's `ON db.t` qualifier names, which the SQL has to keep.
+/// in sync after table/column renames. `table_qualifier` is the `db.` of the
+/// trigger's `ON db.t` as its SQL wrote it, which the new SQL has to keep.
 fn regenerate_trigger_sql(
     trigger: &crate::schema::Trigger,
-    table_db_name: Option<String>,
+    table_qualifier: Option<Name>,
 ) -> String {
     use crate::translate::trigger::create_trigger_to_sql;
 
@@ -16909,7 +16909,7 @@ fn regenerate_trigger_sql(
         alias: None,
     };
     let tbl_name = QualifiedName {
-        namespace: table_db_name.map(Name::from_string),
+        namespace: table_qualifier,
         name: Name::from_string(&trigger.table_name),
         alias: None,
     };
@@ -16944,16 +16944,15 @@ fn rewrite_trigger_for_table_rename(
     normalized_to: &str,
 ) {
     let old_sql = trigger.sql.clone();
-    let table_db_name = trigger
-        .target_database_id
-        .and_then(|database_id| conn.namespace_name(database_id));
+    // Keep `ON aux.t` qualified and `ON t` unqualified, as written.
+    let table_qualifier = trigger.written_table_qualifier(conn.dialect().as_ref());
     for cmd in &mut trigger.commands {
         rewrite_trigger_cmd_table_refs(cmd, normalized_from, normalized_to);
     }
     if let Some(ref mut when) = trigger.when_clause {
         rewrite_check_expr_table_refs(when, normalized_from, normalized_to);
     }
-    let new_sql = regenerate_trigger_sql(trigger, table_db_name);
+    let new_sql = regenerate_trigger_sql(trigger, table_qualifier);
     if new_sql != old_sql {
         trigger.sql = new_sql;
     }

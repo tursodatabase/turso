@@ -2594,6 +2594,62 @@ expect {
     1
 }
 
+# An unqualified TEMP trigger on a main table keeps its unqualified `ON` name
+# when its SQL is rebuilt after a RENAME TO or RENAME COLUMN.
+test alter-table-rename-keeps-unqualified-temp-trigger-table {
+    CREATE TABLE tt_m10 (x);
+    CREATE TABLE tt_o10 (b);
+    CREATE TEMP TRIGGER tt_tr10 AFTER INSERT ON tt_m10 BEGIN SELECT * FROM tt_o10; END;
+    ALTER TABLE tt_o10 RENAME TO tt_o10b;
+    ALTER TABLE tt_m10 RENAME COLUMN x TO y;
+    SELECT instr(sql, 'ON tt_m10') > 0, instr(sql, 'main.') = 0, instr(sql, 'tt_o10b') > 0
+    FROM sqlite_temp_schema WHERE name = 'tt_tr10';
+    ALTER TABLE tt_m10 RENAME TO tt_m10b;
+    SELECT instr(sql, 'tt_m10b') > 0, instr(sql, 'main.') = 0
+    FROM sqlite_temp_schema WHERE name = 'tt_tr10';
+}
+expect {
+    1|1|1
+    1|1
+}
+
+# A TEMP trigger ON aux.s whose body names o: RENAME o TO o2 rebuilds the
+# trigger's SQL, which must keep `aux.` so a later RENAME COLUMN still finds s.
+test alter-table-rename-body-table-keeps-attached-temp-trigger-qualifier {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.tt_s11 (a);
+    CREATE TABLE tt_o11 (b);
+    CREATE TABLE tt_p11 (q);
+    CREATE TEMP TRIGGER tt_tr11 AFTER INSERT ON aux.tt_s11 BEGIN SELECT * FROM tt_o11; END;
+    ALTER TABLE tt_o11 RENAME TO tt_o11b;
+    ALTER TABLE tt_p11 RENAME COLUMN q TO r;
+    SELECT sql FROM sqlite_schema WHERE name = 'tt_p11';
+    SELECT instr(sql, 'ON aux.tt_s11') > 0, instr(sql, 'tt_o11b') > 0
+    FROM sqlite_temp_schema WHERE name = 'tt_tr11';
+}
+expect {
+    CREATE TABLE tt_p11 (r)
+    1|1
+}
+
+# The trigger's `ON aux.` names the database by name. After aux is detached
+# and attached again under another index, ALTER TABLE still finds aux.s.
+test alter-table-temp-trigger-on-reattached-database {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.tt_s12 (a);
+    CREATE TABLE tt_p12 (q);
+    CREATE TEMP TRIGGER tt_tr12 AFTER INSERT ON aux.tt_s12 BEGIN SELECT 1; END;
+    DETACH aux;
+    ATTACH ':memory:' AS tt_x12;
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.tt_s12 (a);
+    ALTER TABLE tt_p12 RENAME COLUMN q TO r;
+    SELECT sql FROM sqlite_schema WHERE name = 'tt_p12';
+}
+expect {
+    CREATE TABLE tt_p12 (r)
+}
+
 test temp-trigger-attached-read-cross-table {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.src_temp_aux_read (a INTEGER PRIMARY KEY, b);
