@@ -1,0 +1,129 @@
+# The ON CONFLICT clause of a PRIMARY KEY that is not a rowid alias belongs to the
+# automatic index that enforces the key. A collision on the implicit rowid of such
+# a table is a separate constraint, and its action is ABORT unless the statement
+# names another one (INSERT OR ...).
+
+@database :memory:
+
+setup composite-pk-replace {
+    CREATE TABLE t_rep(a, b, c, PRIMARY KEY(b, c) ON CONFLICT REPLACE);
+    INSERT INTO t_rep(rowid, a, b, c) VALUES (1, 'x', 1, 1);
+    INSERT INTO t_rep(rowid, a, b, c) VALUES (2, 'y', 2, 2);
+}
+
+setup composite-pk-ignore {
+    CREATE TABLE t_ign(a, b, c, PRIMARY KEY(b, c) ON CONFLICT IGNORE);
+    INSERT INTO t_ign(rowid, a, b, c) VALUES (1, 'x', 1, 1);
+    INSERT INTO t_ign(rowid, a, b, c) VALUES (2, 'y', 2, 2);
+}
+
+setup single-pk-replace {
+    CREATE TABLE t_one_rep(a, b PRIMARY KEY ON CONFLICT REPLACE);
+    INSERT INTO t_one_rep(rowid, a, b) VALUES (1, 'x', 1);
+}
+
+setup single-pk-ignore {
+    CREATE TABLE t_one_ign(a, b PRIMARY KEY ON CONFLICT IGNORE);
+    INSERT INTO t_one_ign(rowid, a, b) VALUES (1, 'x', 1);
+}
+
+@setup composite-pk-replace
+test insert-rowid-collision-pk-replace {
+    INSERT INTO t_rep(rowid, a, b, c) VALUES (1, 'z', 3, 3);
+}
+expect error {
+    UNIQUE constraint failed: t_rep.rowid
+}
+
+@setup composite-pk-ignore
+test insert-rowid-collision-pk-ignore {
+    INSERT INTO t_ign(rowid, a, b, c) VALUES (1, 'z', 3, 3);
+}
+expect error {
+    UNIQUE constraint failed: t_ign.rowid
+}
+
+@setup single-pk-replace
+test insert-rowid-collision-single-column-pk-replace {
+    INSERT INTO t_one_rep(rowid, a, b) VALUES (1, 'z', 2);
+}
+expect error {
+    UNIQUE constraint failed: t_one_rep.rowid
+}
+
+@setup single-pk-ignore
+test insert-rowid-collision-single-column-pk-ignore {
+    INSERT INTO t_one_ign(rowid, a, b) VALUES (1, 'z', 2);
+}
+expect error {
+    UNIQUE constraint failed: t_one_ign.rowid
+}
+
+@setup composite-pk-ignore
+test update-rowid-collision-pk-ignore {
+    UPDATE t_ign SET rowid = rowid + 1;
+}
+expect error {
+    UNIQUE constraint failed: t_ign.rowid
+}
+
+@setup composite-pk-replace
+test update-rowid-collision-pk-replace {
+    UPDATE t_rep SET rowid = 1 WHERE rowid = 2;
+}
+expect error {
+    UNIQUE constraint failed: t_rep.rowid
+}
+
+# The clause still governs the key itself.
+@setup composite-pk-replace
+test pk-replace-still-replaces-on-key-collision {
+    INSERT INTO t_rep(rowid, a, b, c) VALUES (3, 'z', 1, 1);
+    SELECT rowid, a, b, c FROM t_rep ORDER BY rowid;
+}
+expect {
+    2|y|2|2
+    3|z|1|1
+}
+
+@setup composite-pk-ignore
+test pk-ignore-still-ignores-on-key-collision {
+    INSERT INTO t_ign(rowid, a, b, c) VALUES (3, 'z', 1, 1);
+    SELECT rowid, a, b, c FROM t_ign ORDER BY rowid;
+}
+expect {
+    1|x|1|1
+    2|y|2|2
+}
+
+# A clause in the statement overrides the constraint clauses, as before.
+@setup composite-pk-ignore
+test statement-or-replace-still-wins-on-rowid-collision {
+    INSERT OR REPLACE INTO t_ign(rowid, a, b, c) VALUES (1, 'z', 3, 3);
+    SELECT rowid, a, b, c FROM t_ign ORDER BY rowid;
+}
+expect {
+    1|z|3|3
+    2|y|2|2
+}
+
+# An INTEGER PRIMARY KEY is the rowid, so its clause applies to the rowid.
+test integer-primary-key-replace-applies-to-rowid {
+    CREATE TABLE t_ipk(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, v);
+    INSERT INTO t_ipk VALUES (1, 'x');
+    INSERT INTO t_ipk VALUES (1, 'y');
+    SELECT id, v FROM t_ipk;
+}
+expect {
+    1|y
+}
+
+test integer-primary-key-ignore-applies-to-rowid {
+    CREATE TABLE t_ipk_ign(id INTEGER PRIMARY KEY ON CONFLICT IGNORE, v);
+    INSERT INTO t_ipk_ign VALUES (1, 'x');
+    INSERT INTO t_ipk_ign VALUES (1, 'y');
+    SELECT id, v FROM t_ipk_ign;
+}
+expect {
+    1|x
+}

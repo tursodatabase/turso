@@ -7789,10 +7789,11 @@ pub fn create_table(
         .chain(unique_sets_constraints)
         .try_collect::<Vec<_>>()?;
     // Capture PK conflict clause before the rowid-alias UniqueSet is removed.
-    let rowid_alias_conflict_clause = unique_sets
+    let primary_key_conflict_clause = unique_sets
         .iter()
         .find(|us| us.is_primary_key)
         .and_then(|us| us.conflict_clause);
+    let mut primary_key_is_rowid_alias = false;
     let primary_key_constraint_name = unique_sets
         .iter()
         .find(|set| set.is_primary_key)
@@ -7813,9 +7814,19 @@ pub fn create_table(
             });
             if let Some(u) = unique_set_w_only_rowid_alias {
                 unique_sets.remove(u);
+                primary_key_is_rowid_alias = true;
             }
         }
     }
+    // The conflict clause of the PRIMARY KEY applies to the rowid only when the PRIMARY KEY is
+    // the rowid (an INTEGER PRIMARY KEY) or the table has no rowid. Any other PRIMARY KEY is
+    // enforced by an automatic index that carries its own clause, and a collision on the
+    // implicit rowid of such a table is a separate constraint with the default action ABORT.
+    let rowid_alias_conflict_clause = if primary_key_is_rowid_alias || !has_rowid {
+        primary_key_conflict_clause
+    } else {
+        None
+    };
 
     let mut table = BTreeTable {
         root_page,
