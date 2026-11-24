@@ -114,6 +114,59 @@ test jsonb-delete-of-bigint-errors {
 @sqlstate 42883
 expect error {}
 
+# PostgreSQL has no - whose right operand is a boolean, json, uuid or oid
+# value. tursopg gives core a boolean expression as an integer, and a cast
+# to json, uuid or oid as a cast to text or to an integer. Thus the
+# translator refuses these right operands by their syntax.
+test jsonb-delete-of-comparison-errors {
+    SELECT '[1,2,3]'::jsonb - (1 = 1);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-null-test-errors {
+    SELECT '[1,2,3]'::jsonb - (1 IS NULL);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-like-errors {
+    SELECT '["a","b"]'::jsonb - ('a' LIKE 'a');
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-exists-errors {
+    SELECT '[1,2,3]'::jsonb - EXISTS (SELECT 1);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-json-errors {
+    SELECT '{"a":1}'::jsonb - '"a"'::json;
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-uuid-errors {
+    SELECT '{"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11":1}'::jsonb - 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid;
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-oid-errors {
+    SELECT '[1,2]'::jsonb - 1::oid;
+}
+@sqlstate 42883
+expect error {}
+
+# The check does not depend on the left operand.
+test integer-minus-comparison-errors {
+    SELECT 5 - (1 = 1);
+}
+@sqlstate 42883
+expect error {}
+
 @setup items_with_jsonb_rows
 test jsonb-delete-in-update {
     UPDATE items SET data = data - 'dims' - 'tags' WHERE id = 1;
@@ -165,6 +218,28 @@ test jsonb-delete-of-jsonb-errors {
 @sqlstate 42883
 expect error {}
 @sqlstate 42601
+expect @tursopg error {}
+
+# Only inet - inet takes an inet on the right. tursopg gives core a cast to
+# inet as a cast to text, so it cannot run inet - inet. It refuses an inet
+# on the right of - with 0A000, also when the left operand is jsonb.
+@compat-gap "operator:jsonb - inet"
+test jsonb-delete-of-inet-errors {
+    SELECT '{"10.0.0.1":1}'::jsonb - '10.0.0.1'::inet;
+}
+@sqlstate 42883
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "operator:inet - inet"
+test inet-minus-inet-is-not-supported {
+    SELECT '10.0.0.2'::inet - '10.0.0.1'::inet;
+}
+expect {
+    1
+}
+@sqlstate 0A000
 expect @tursopg error {}
 
 # The check of the types of a CHECK constraint does not know the operators

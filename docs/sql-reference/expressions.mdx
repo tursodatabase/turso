@@ -77,6 +77,8 @@ SELECT 10 / 3.0;         -- 3.333... (real division)
 SELECT CAST(10 AS REAL) / 3;  -- 3.333...
 ```
 
+Through the PostgreSQL frontend, `-` fails with SQLSTATE 42883, as in PostgreSQL, when its right operand is a boolean expression such as `a = b`. It also fails with 42883 when its right operand is a cast to json, uuid, xml, macaddr, bit, varbit, tsvector, tsquery, oid, regclass or regtype. A cast to inet or cidr on the right of `-` fails with SQLSTATE 0A000, because the frontend cannot run `inet - inet`.
+
 ### Comparison Operators
 
 | Operator | Description | Example |

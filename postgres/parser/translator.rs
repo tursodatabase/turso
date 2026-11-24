@@ -4170,6 +4170,11 @@ impl PostgreSQLTranslator {
                 );
             }
         }
+        if op_name == "-" {
+            if let Some(rhs) = a_expr.rexpr.as_deref() {
+                check_minus_right_operand(rhs)?;
+            }
+        }
 
         // Translate left and right expressions
         let left = Box::new(self.translate_operand(a_expr.lexpr.as_ref().unwrap())?);
@@ -8117,6 +8122,112 @@ fn interval_parts(text: &str) -> Option<IntervalParts> {
         any = true;
     }
     any.then_some(parts)
+}
+
+/// Refuses `rhs`, the right operand of a binary `-`, when its syntax shows a
+/// type that no `-` operator of PostgreSQL takes on the right (see
+/// `minus_right_operand_type`). PostgreSQL then fails with 42883 for each left
+/// operand. Only `inet - inet` takes an inet or a cidr on the right, so such an
+/// operand fails with 0A000.
+// FIXME(pg-catalog): PostgreSQL has no `-` operator whose right operand is a
+// boolean, json, uuid, xml, macaddr, bit, varbit, tsvector, tsquery, oid,
+// regclass or regtype value, and these types have no implicit cast to a type
+// that has one. The translator gives core a boolean expression as an integer,
+// and a cast to one of these types as a cast to text or to an integer (see
+// `pg_type_name_to_ast_type`). Thus core would run `jsonb - integer` or
+// `jsonb - text` on them. This check reads the syntax of the right operand
+// instead of its type. A lookup in pg_operator by the types of the operands,
+// in an expression tree that carries PostgreSQL types, replaces this.
+fn check_minus_right_operand(rhs: &pg_query::protobuf::Node) -> Result<(), ParseError> {
+    let Some(type_name) = minus_right_operand_type(rhs) else {
+        return Ok(());
+    };
+    if matches!(type_name.as_str(), "inet" | "cidr") {
+        return Err(ParseError::not_supported(format!(
+            "- with a right operand of type {type_name}"
+        )));
+    }
+    Err(ParseError::Sqlstate {
+        sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
+        message: format!("no operator - takes a right operand of type {type_name}"),
+    })
+}
+
+/// The PostgreSQL type of `rhs`, the right operand of `-`, when its syntax
+/// shows a type that the translator gives core as an integer or as text, and
+/// that no `-` operator of PostgreSQL takes on the right, except `inet - inet`.
+/// A comparison, AND, OR, NOT, EXISTS, IN, LIKE, BETWEEN, a test such as IS
+/// NULL, and a boolean literal give `boolean`. A cast gives the type of the
+/// cast, such as `uuid` or `json[]`.
+fn minus_right_operand_type(rhs: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::{a_const::Val, node::Node, AExprKind, SubLinkType};
+    let is_boolean = match rhs.node.as_ref()? {
+        Node::BoolExpr(_) | Node::NullTest(_) | Node::BooleanTest(_) => true,
+        Node::AConst(constant) => matches!(constant.val, Some(Val::Boolval(_))),
+        Node::SubLink(sub_link) => matches!(
+            sub_link.sub_link_type(),
+            SubLinkType::ExistsSublink
+                | SubLinkType::AllSublink
+                | SubLinkType::AnySublink
+                | SubLinkType::RowcompareSublink
+        ),
+        Node::AExpr(a_expr) => match a_expr.kind() {
+            AExprKind::AexprOp => {
+                a_expr.lexpr.is_some()
+                    && matches!(
+                        last_string(&a_expr.name).as_deref(),
+                        Some(
+                            "=" | "<>"
+                                | "!="
+                                | "<"
+                                | "<="
+                                | ">"
+                                | ">="
+                                | "~~"
+                                | "!~~"
+                                | "~~*"
+                                | "!~~*"
+                                | "~"
+                                | "!~"
+                                | "~*"
+                                | "!~*"
+                                | "@>"
+                                | "<@"
+                                | "&&"
+                        )
+                    )
+            }
+            AExprKind::AexprOpAny
+            | AExprKind::AexprOpAll
+            | AExprKind::AexprDistinct
+            | AExprKind::AexprNotDistinct
+            | AExprKind::AexprIn
+            | AExprKind::AexprLike
+            | AExprKind::AexprIlike
+            | AExprKind::AexprSimilar
+            | AExprKind::AexprBetween
+            | AExprKind::AexprNotBetween
+            | AExprKind::AexprBetweenSym
+            | AExprKind::AexprNotBetweenSym => true,
+            AExprKind::Undefined | AExprKind::AexprNullif => false,
+        },
+        Node::TypeCast(cast) => {
+            let type_name = cast.type_name.as_ref()?;
+            let name = last_string(&type_name.names)?.to_lowercase();
+            let name = match name.as_str() {
+                "bool" | "boolean" => "boolean",
+                "json" | "uuid" | "xml" | "macaddr" | "bit" | "varbit" | "tsvector" | "tsquery"
+                | "oid" | "regclass" | "regtype" | "inet" | "cidr" => name.as_str(),
+                _ => return None,
+            };
+            return Some(format!(
+                "{name}{}",
+                "[]".repeat(type_name.array_bounds.len())
+            ));
+        }
+        _ => false,
+    };
+    is_boolean.then(|| "boolean".to_string())
 }
 
 /// Extract an integer value from a DefElem's arg node.
