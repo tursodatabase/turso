@@ -233,6 +233,7 @@ impl Profile {
             ProfileType::WriteHeavySpill => Self::write_heavy_spill(),
             ProfileType::Faultless => Self::faultless(),
             ProfileType::SimpleMvcc => Self::simple_mvcc(),
+            ProfileType::MvccSingleConnection => Self::mvcc_single_connection(),
             ProfileType::WriteStress => Self::write_stress(),
             ProfileType::SavepointStress => Self::savepoint_stress(),
             ProfileType::Custom(path) => {
@@ -240,6 +241,23 @@ impl Profile {
             }
         };
         Ok(profile)
+    }
+
+    /// MVCC with one connection, I/O faults and many checkpoint statements, so
+    /// that faults hit MVCC checkpoints. It has one connection because MVCC
+    /// plans with more connections fail on table-content assertions.
+    pub fn mvcc_single_connection() -> Self {
+        let profile = Profile {
+            mvcc: true,
+            max_connections: 1,
+            query: QueryProfile {
+                pragma_weight: 60,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        profile.validate().unwrap();
+        profile
     }
 
     // TODO: in the future handle extension and composability of profiles here
@@ -275,6 +293,7 @@ pub enum ProfileType {
     WriteHeavySpill,
     Faultless,
     SimpleMvcc,
+    MvccSingleConnection,
     WriteStress,
     SavepointStress,
     #[strum(disabled)]
