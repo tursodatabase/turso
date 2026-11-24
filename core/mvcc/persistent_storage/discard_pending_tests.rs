@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use crate::io::MemoryIO;
-use crate::mvcc::persistent_storage::{DurableStorage, Storage};
+use crate::mvcc::persistent_storage::{DurableStorage, LogicalLogTruncateOutcome, Storage};
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::OpenFlags;
 
@@ -53,4 +53,38 @@ fn discard_pending_log_write_clears_staged_pending_crc() {
         "discard_pending_log_write left the staged pending running CRC in place: \
          the success path consumed a CRC staged for an aborted deferred write"
     );
+}
+
+#[test]
+fn discard_pending_log_write_truncates_unconfirmed_frame_and_preserves_checkpoint_boundary() {
+    let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+    let file = io
+        .open_file("issue_12000.db-log", OpenFlags::Create, false)
+        .unwrap();
+    let storage = Storage::new(file.clone(), io.clone(), None);
+    let write_tx = |timestamp| {
+        let mut tx =
+            crate::mvcc::database::LogRecord::new(timestamp, crate::alloc::DynAllocator::default())
+                .unwrap();
+        storage
+            .serialize_database_header(&mut tx, &DatabaseHeader::default())
+            .unwrap();
+        let (completion, bytes) = storage.log_tx(tx, None).unwrap();
+        io.wait_for_completion(completion).unwrap();
+        bytes
+    };
+
+    let bytes = write_tx(10);
+    storage
+        .advance_logical_log_offset_after_success(bytes)
+        .unwrap();
+    let confirmed_offset = storage.logical_log_offset();
+    write_tx(20);
+    assert!(file.size().unwrap() > confirmed_offset);
+
+    storage.discard_pending_log_write().unwrap();
+    assert_eq!(file.size().unwrap(), confirmed_offset);
+    let (completion, outcome) = storage.truncate(10).unwrap();
+    assert_eq!(outcome, LogicalLogTruncateOutcome::Truncated);
+    io.wait_for_completion(completion).unwrap();
 }

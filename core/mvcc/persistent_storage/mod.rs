@@ -279,8 +279,7 @@ impl DurableStorage for Storage {
     }
 
     fn discard_pending_log_write(&self) -> Result<()> {
-        self.with_log(|log| log.discard_pending_write());
-        Ok(())
+        self.with_log(|log| log.discard_pending_write())
     }
 
     fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32) {
