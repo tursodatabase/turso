@@ -20,7 +20,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode          p1  p2  p3  p4           p5  comment
-   0  Init             0  26   0                0  Start at 26
+   0  Init             0  27   0                0  Start at 27
    1  Gosub            2   3   0                0
    2  Goto             0  14   0                0
    3  Once            13   0   0                0  goto 13
@@ -36,15 +36,16 @@ addr  opcode          p1  p2  p3  p4           p5  comment
   13  Return           2   0   0                0
   14  Gosub            2   3   0                0
   15  Null             0   7   0                0  r[7]=NULL
-  16  Last             0  22   0                0
+  16  Last             0  23   0                0
   17    Column         0   0   1                0  r[1]=ephemeral().price
   18    Copy           1   8   0                0  r[8]=r[1]
-  19    AggStep        0   8   7  max(Binary)   0  accum=r[7] step(r[8])
-  20    Goto           0  22   0                0
-  21  Prev             0  17   0                0
-  22  AggFinal         0   7   0  max           0  accum=r[7]
-  23  Copy             7   6   0                0  r[6]=r[7]
-  24  ResultRow        6   1   0                0  output=r[6]
-  25  Halt             0   0   0                0
-  26  Transaction      0   1  14                0  iDb=0 tx_mode=Read
-  27  Goto             0   1   0                0
+  19    IsNull         8  22   0                0  if (r[8]==NULL) goto 22
+  20    AggStep        0   8   7  max(Binary)   0  accum=r[7] step(r[8])
+  21    Goto           0  23   0                0
+  22  Prev             0  17   0                0
+  23  AggFinal         0   7   0  max           0  accum=r[7]
+  24  Copy             7   6   0                0  r[6]=r[7]
+  25  ResultRow        6   1   0                0  output=r[6]
+  26  Halt             0   0   0                0
+  27  Transaction      0   1  14                0  iDb=0 tx_mode=Read
+  28  Goto             0   1   0                0

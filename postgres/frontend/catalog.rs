@@ -4,7 +4,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::sync::Arc;
-use turso_core::ast::{self, RefAct, SortOrder};
+use turso_core::ast::{self, NullsOrder, RefAct, SortOrder};
 use turso_core::schema::RelationKind;
 use turso_core::{
     dialect::{
@@ -14,8 +14,8 @@ use turso_core::{
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{
-        generated_expr_with_names, BTreeTable, GeneratedType, Schema, Sequence, Table, UniqueSet,
-        AUTOINCREMENT_SEQ_PREFIX,
+        generated_expr_with_names, BTreeTable, GeneratedType, IndexColumn, Schema, Sequence, Table,
+        UniqueSet, AUTOINCREMENT_SEQ_PREFIX,
     },
     security::policy::RowPolicy,
     security::roles::RoleId,
@@ -4692,8 +4692,14 @@ impl Display for IndexDefinition<'_> {
                 None => f.write_str(&quote_identifier(&column.name))?,
             }
             match column.order {
-                SortOrder::Asc => {}
-                SortOrder::Desc => f.write_str(" DESC")?,
+                SortOrder::Asc => match column.nulls_order {
+                    NullsOrder::First => f.write_str(" NULLS FIRST")?,
+                    NullsOrder::Last => {}
+                },
+                SortOrder::Desc => match column.nulls_order {
+                    NullsOrder::First => f.write_str(" DESC")?,
+                    NullsOrder::Last => f.write_str(" DESC NULLS LAST")?,
+                },
             }
         }
         f.write_str(")")?;
@@ -4762,6 +4768,7 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                     position,
                     expression: None,
                     order: SortOrder::Asc,
+                    nulls_order: NullsOrder::Last,
                 }],
                 unique: true,
                 primary: true,
@@ -4772,10 +4779,11 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
             .get_indices(namespace, table_name)
             .filter(|index| !index.ephemeral)
         {
+            let made_by_constraint = index
+                .name
+                .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX);
             let primary = btree.get_rowid_alias_column().is_none()
-                && index
-                    .name
-                    .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+                && made_by_constraint
                 && index
                     .columns
                     .iter()
@@ -4808,6 +4816,7 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                         position: column.pos_in_table,
                         expression: column.expr.as_ref().map(ToString::to_string),
                         order: column.order,
+                        nulls_order: index_columns_nulls_order(column, btree, made_by_constraint),
                     })
                     .collect(),
                 unique: index.unique,
@@ -4819,11 +4828,35 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
     indexes
 }
 
+/// An index column with no NULL order in its SQL keeps NULLs in SQLite's default order. A NOT NULL
+/// column has no NULLs to place, so it gets PostgreSQL's default, which the definition leaves out.
+/// The index of a PRIMARY KEY or UNIQUE constraint also gets PostgreSQL's default, although it
+/// keeps NULLs first: its definition is shown as before, until such an index gets PostgreSQL's NULL
+/// order.
+fn index_columns_nulls_order(
+    column: &IndexColumn,
+    btree: &Arc<BTreeTable>,
+    made_by_constraint: bool,
+) -> NullsOrder {
+    if made_by_constraint
+        || (column.expression().is_none() && btree.columns()[column.pos_in_table].notnull())
+    {
+        column.nulls_order.unwrap_or_else(|| {
+            turso_pg_parser::translator::PostgreSQLTranslator::postgres_default_nulls_order(
+                column.order,
+            )
+        })
+    } else {
+        column.effective_nulls_order()
+    }
+}
+
 struct CatalogIndexColumn {
     name: String,
     position: usize,
     expression: Option<String>,
     order: SortOrder,
+    nulls_order: NullsOrder,
 }
 
 /// The names of the PRIMARY KEY and UNIQUE constraints of `table`. PostgreSQL

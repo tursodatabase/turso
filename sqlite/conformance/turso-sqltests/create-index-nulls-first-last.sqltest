@@ -868,3 +868,48 @@ test upsert-explicit-nulls-conflict-target-rejected {
 expect error {
     NULLS
 }
+
+@setup single_data
+test max-skips-nulls-on-nulls-last-index {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    SELECT max(a) FROM t;
+}
+expect {
+    3
+}
+
+@setup single_data
+test max-skips-nulls-on-desc-nulls-first-index {
+    CREATE INDEX idx ON t(a DESC NULLS FIRST);
+    SELECT max(a) FROM t;
+}
+expect {
+    3
+}
+
+@setup single_data
+test min-on-nulls-last-index {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    SELECT min(a) FROM t;
+}
+expect {
+    1
+}
+
+@setup comp_data
+test max-with-equality-prefix-skips-nulls-on-nulls-last-index {
+    CREATE INDEX idx ON t(a, b NULLS LAST);
+    SELECT max(b) FROM t WHERE a = 1;
+}
+expect {
+    30
+}
+
+test max-of-all-null-column-on-nulls-last-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT);
+    CREATE INDEX idx ON t(a NULLS LAST);
+    INSERT INTO t VALUES (1, NULL), (2, NULL), (3, NULL);
+    SELECT max(a) FROM t;
+}
+expect {
+}

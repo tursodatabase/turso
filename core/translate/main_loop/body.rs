@@ -243,18 +243,14 @@ fn emit_loop_source<'a>(
                 let loop_end = t_ctx
                     .label_main_loop_end
                     .expect("simple min/max requires the main-loop end label");
-                let label_on_null = if matches!(min_max.func, crate::function::AggFunc::Min) {
-                    // Ascending index order places NULLs first. Keep scanning until
-                    // the first non-NULL value, then jump straight to AggFinal.
-                    let label_on_null = program.allocate_label();
-                    program.emit_insn(Insn::IsNull {
-                        reg: expr_reg,
-                        target_pc: label_on_null,
-                    });
-                    Some(label_on_null)
-                } else {
-                    None
-                };
+                // MIN and MAX ignore NULLs, and the scan can reach NULLs before any value: where
+                // they are depends on the NULL order of the index and on the scan direction. Keep
+                // scanning until the first non-NULL value, then jump straight to AggFinal.
+                let label_on_null = program.allocate_label();
+                program.emit_insn(Insn::IsNull {
+                    reg: expr_reg,
+                    target_pc: label_on_null,
+                });
 
                 program.emit_insn(Insn::AggStep {
                     data: Box::new(AggStepData {
@@ -270,9 +266,7 @@ fn emit_loop_source<'a>(
                     target_pc: loop_end,
                 });
 
-                if let Some(label_on_null) = label_on_null {
-                    program.preassign_label_to_next_insn(label_on_null);
-                }
+                program.preassign_label_to_next_insn(label_on_null);
                 return Ok(());
             }
 
