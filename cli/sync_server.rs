@@ -81,6 +81,9 @@ pub struct TursoSyncServer {
     interrupt_count: Arc<AtomicUsize>,
     workers: usize,
     encryption: Option<SyncEncryption>,
+    /// The options of the served databases. A replace-base pull opens a copy
+    /// of a database with them.
+    db_opts: DatabaseOpts,
 }
 
 struct ConnectionQueue {
@@ -103,6 +106,7 @@ impl TursoSyncServer {
         interrupt_count: Arc<AtomicUsize>,
         workers: usize,
         encryption: Option<SyncEncryption>,
+        db_opts: DatabaseOpts,
     ) -> Result<Self> {
         require_server_key(encryption.as_ref())?;
         anyhow::ensure!(conn.get_encryption_cipher_mode() == encryption.as_ref().map(|e| e.cipher()),
@@ -119,6 +123,7 @@ impl TursoSyncServer {
             interrupt_count,
             workers,
             encryption,
+            db_opts,
         })
     }
 
@@ -140,6 +145,7 @@ impl TursoSyncServer {
         Ok(Self {
             address,
             encryption: config.encryption.clone(),
+            db_opts: config.db_opts,
             source: DbSource::Dir {
                 base: base.canonicalize()?,
                 config: Box::new(config),
@@ -935,14 +941,17 @@ impl TursoSyncServer {
         };
         let snapshot = &normalized.snapshot;
         // The frames between a revision of an earlier log and the current log
-        // are gone after a checkpoint, so such a client gets the page base
-        // and the start of the current log.
+        // are gone after a checkpoint, so such a client gets a page base.
         let Some((start_offset, start)) = client_offset.and_then(|offset| {
             normalized
                 .wire_offsets
                 .get(&offset)
                 .map(|&start| (offset, start))
         }) else {
+            if snapshot.end_offset > MVCC_LOG_HEADER_SIZE as u64 {
+                return self.handle_replace_base_with_log(db);
+            }
+            // The log has no frames, so the pages hold every commit.
             return self.handle_replace_base_pages(db, log_start);
         };
         let log = normalized.body.as_ref();
@@ -1054,6 +1063,74 @@ impl TursoSyncServer {
         self.handle_snapshot_pages(
             db,
             server_revision,
+            PullUpdatesApplyMode::ReplaceBase,
+            PullUpdatesProtocol::MvccLogical,
+            None,
+            None,
+        )
+    }
+
+    /// Answers a pull from a revision that is not a position in the current
+    /// logical log with the pages of a copy of the database whose checkpoint
+    /// wrote that log, and with the revision of the end of the log.
+    ///
+    /// The pages of the database hold only what the last checkpoint wrote. A
+    /// replica that pushed after that checkpoint would get a base without its
+    /// push. It would apply the push on that base, and send it again with its
+    /// next push, over later changes of the server to the same rows.
+    fn handle_replace_base_with_log(&self, db: &DbHandle) -> Result<HttpResponse> {
+        // Declared first, so that it is dropped last: the directory is removed
+        // only after the database of the copy is closed.
+        let dir = tempfile::Builder::new()
+            .prefix("tursodb-replace-base")
+            .tempdir()?;
+        let db_file = db_file_path(&db.path)?;
+        let file_name = db_file
+            .file_name()
+            .ok_or_else(|| anyhow!("database path has no file name: {}", db.path))?;
+        let copy_path = dir.path().join(file_name);
+        let log = {
+            let conn = db.conn.lock().expect("database connection lock poisoned");
+            // The lock keeps commits and checkpoints out while the files are
+            // copied, so the copy and the log are of the same moment.
+            let log = read_mvcc_log(&conn, &db.path)?
+                .ok_or_else(|| anyhow!("{} has no MVCC log", db.path))?;
+            std::fs::copy(&db_file, &copy_path)?;
+            copy_if_present(&wal_path(&db_file), &wal_path(&copy_path))?;
+            log
+        };
+        let crypto = self
+            .encryption
+            .as_ref()
+            .map(SyncEncryption::local_context)
+            .transpose()?
+            .flatten();
+        let end_offset = normalize_mvcc_log(&log.bytes, crypto.as_ref())?
+            .snapshot
+            .end_offset;
+        // Only complete frames go into the copy, so that its recovery ends at
+        // the same offset as the revision.
+        std::fs::write(
+            logical_log_path(&copy_path.to_string_lossy())?,
+            &log.bytes[..end_offset as usize],
+        )?;
+        let copy = open_db_handle(
+            &copy_path,
+            &OpenConfig {
+                vfs: None,
+                flags: OpenFlags::Create,
+                db_opts: self.db_opts,
+                max_open: 1,
+                encryption: self.encryption.clone(),
+            },
+        )?;
+        copy.conn
+            .lock()
+            .expect("database connection lock poisoned")
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        self.handle_snapshot_pages(
+            &copy,
+            log.revision(end_offset),
             PullUpdatesApplyMode::ReplaceBase,
             PullUpdatesProtocol::MvccLogical,
             None,
@@ -1347,6 +1424,20 @@ impl MvccLogSnapshot {
 
 fn logical_log_path(db_path: &str) -> Result<PathBuf> {
     Ok(db_file_path(db_path)?.with_extension("db-log"))
+}
+
+fn wal_path(db_file: &Path) -> PathBuf {
+    let mut path = db_file.as_os_str().to_owned();
+    path.push("-wal");
+    PathBuf::from(path)
+}
+
+fn copy_if_present(from: &Path, to: &Path) -> Result<()> {
+    match std::fs::copy(from, to) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn is_in_memory_db_path(db_path: &str) -> bool {
@@ -2638,28 +2729,65 @@ mod tests {
         (server, handle)
     }
 
-    /// Asserts that a pull from `revision` returns the page base and the
-    /// start of the current log, and that a pull from there returns the whole
-    /// current log.
-    fn assert_pull_replaces_base(server: &TursoSyncServer, handle: &DbHandle, revision: &str) {
+    /// Asserts that a pull from `revision` replaces the base with pages that
+    /// hold the rows `ids` of table `t`, also the rows that only the frames of
+    /// the current log hold, and gives the revision of the end of that log.
+    fn assert_pull_replaces_base(
+        server: &TursoSyncServer,
+        handle: &DbHandle,
+        revision: &str,
+        ids: std::ops::RangeInclusive<i64>,
+    ) {
         let log_path = logical_log_path(&handle.path).unwrap();
-        let log = std::fs::read(&log_path).unwrap();
-        let (header, _) = pull_logical(server, handle, revision).unwrap();
+        let log_len = std::fs::metadata(&log_path).unwrap().len();
+        assert!(log_len > MVCC_LOG_HEADER_SIZE as u64, "the log has frames");
+        let (header, pages) = pull_logical(server, handle, revision).unwrap();
         assert_eq!(
             header.apply_mode,
             PullUpdatesApplyMode::ReplaceBase as i32,
             "a pull from {revision} must replace the base, got {header:?}"
         );
         assert_eq!(header.stream_kind, PullUpdatesStreamKind::Pages as i32);
-        assert_eq!(header.server_revision, log_revision(&log_path, 0));
+        assert_eq!(header.server_revision, log_revision(&log_path, log_len));
+        assert_eq!(ids_in_pages(&pages), ids.collect::<Vec<_>>());
         let (header, frames) = pull_logical(server, handle, &header.server_revision).unwrap();
         assert_eq!(header.apply_mode, PullUpdatesApplyMode::Incremental as i32);
-        assert_eq!(frames, log);
-        let range = &header.mvcc_log.unwrap().ranges[0];
-        assert_eq!(
-            (range.start_offset, range.end_offset),
-            (0, log.len() as u64)
-        );
+        assert!(frames.is_empty());
+    }
+
+    /// The ids of the rows of table `t` in the database that `pages`, the
+    /// pages after the header of a pull response, make.
+    fn ids_in_pages(pages: &[u8]) -> Vec<i64> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pages.db");
+        let mut file = Vec::new();
+        let mut bytes = pages;
+        while !bytes.is_empty() {
+            let page = PageData::decode_length_delimited(&mut bytes).unwrap();
+            let start = page.page_id as usize * PAGE_SIZE;
+            file.resize(file.len().max(start + PAGE_SIZE), 0);
+            file[start..start + PAGE_SIZE].copy_from_slice(&page.encoded_page);
+        }
+        std::fs::write(&path, file).unwrap();
+        let db = Database::open_file_with_flags(
+            Arc::new(turso_core::PlatformIO::new().unwrap()),
+            path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.prepare("SELECT id FROM t ORDER BY id")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .iter()
+            .map(|row| row[0].as_int().unwrap())
+            .collect()
     }
 
     #[test]
@@ -2677,7 +2805,7 @@ mod tests {
             insert_rows(&handle, 6..=8, "value");
             checkpoint(&handle);
             insert_rows(&handle, 9..=15, value_after_checkpoint);
-            assert_pull_replaces_base(&server, &handle, &client_revision);
+            assert_pull_replaces_base(&server, &handle, &client_revision, 1..=15);
         }
     }
 
@@ -2692,11 +2820,12 @@ mod tests {
             checkpoint(&handle);
             if commit_after_checkpoint {
                 insert_rows(&handle, 6..=8, "value");
-                assert_pull_replaces_base(&server, &handle, &client_revision);
+                assert_pull_replaces_base(&server, &handle, &client_revision, 1..=8);
             } else {
-                let (header, _) = pull_logical(&server, &handle, &client_revision).unwrap();
+                let (header, pages) = pull_logical(&server, &handle, &client_revision).unwrap();
                 assert_eq!(header.apply_mode, PullUpdatesApplyMode::ReplaceBase as i32);
                 assert_ne!(header.server_revision, client_revision);
+                assert_eq!(ids_in_pages(&pages), (1..=5).collect::<Vec<_>>());
             }
         }
     }
@@ -2728,8 +2857,47 @@ mod tests {
                 .execute("PRAGMA journal_mode=mvcc")
                 .unwrap();
             insert_rows(&handle, 9..=10, "value");
-            assert_pull_replaces_base(&server, &handle, &client_revision);
+            let first = if rows_before_pull { 1 } else { 6 };
+            assert_pull_replaces_base(&server, &handle, &client_revision, first..=10);
         }
+    }
+
+    #[test]
+    fn an_encrypted_replace_base_includes_the_current_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let encryption = SyncEncryption::new(
+            CipherMode::Aes256Gcm,
+            Some(EncryptionKey::new_256([11; 32])),
+            None,
+        )
+        .unwrap();
+        let handle = open_db_handle(
+            &dir.path().join("data"),
+            &OpenConfig {
+                vfs: None,
+                flags: OpenFlags::Create,
+                db_opts: DatabaseOpts::new(),
+                max_open: 1,
+                encryption: Some(encryption.clone()),
+            },
+        )
+        .unwrap();
+        {
+            let conn = handle.conn.lock().unwrap();
+            conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+        }
+        checkpoint(&handle);
+        let mut server = dir_server(dir.path());
+        server.encryption = Some(encryption);
+        insert_rows(&handle, 1..=3, "value");
+        let (header, _) = pull(&server, &handle, PullUpdatesStreamKind::Pages, "").unwrap();
+        let (header, _) = pull_logical(&server, &handle, &header.server_revision).unwrap();
+        let client_revision = header.server_revision;
+        checkpoint(&handle);
+        insert_rows(&handle, 4..=6, "value");
+        assert_pull_replaces_base(&server, &handle, &client_revision, 1..=6);
     }
 
     #[test]
@@ -2877,6 +3045,7 @@ mod tests {
             Arc::new(AtomicUsize::new(0)),
             TEST_WORKERS,
             None,
+            DatabaseOpts::new(),
         )
         .unwrap()
     }

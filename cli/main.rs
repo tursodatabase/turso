@@ -78,6 +78,7 @@ fn run_sync_server(app: app::Limbo) -> anyhow::Result<()> {
             interrupt_count,
             app.opts.sync_workers,
             app.sync_encryption.clone(),
+            app.db_opts,
         )?,
     };
 
