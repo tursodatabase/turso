@@ -177,6 +177,21 @@ pub trait Dialect: Send + Sync + 'static {
     /// string literals, quoted identifiers and comments are not parameters.
     fn parameter_marker_ranges(&self, sql: &str) -> Result<Vec<Range<usize>>>;
 
+    /// The byte ranges of the encryption keys that the statements in `sql`
+    /// carry, such as the value in `PRAGMA hexkey = '<key>'`. Core hides
+    /// these ranges, and the keys in URI parameters, when it writes SQL text
+    /// to its log. The text can be any text that a user sends, also text that
+    /// does not parse. The ranges can overlap, and they can cover text that
+    /// is not a key: a hidden value that is not a key costs less than a key
+    /// in a log file.
+    ///
+    /// The default hides all the text, because core does not know the syntax
+    /// of the dialect, so it cannot tell which statements carry a key.
+    fn key_ranges(&self, sql: &str) -> Vec<Range<usize>> {
+        let all_text = 0..sql.len();
+        vec![all_text]
+    }
+
     /// The dialect for the statements that core and the frontend run for
     /// themselves. Those statements are SQLite syntax and expect SQLite
     /// rules in every database.

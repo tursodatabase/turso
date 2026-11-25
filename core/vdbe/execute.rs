@@ -6446,7 +6446,7 @@ pub fn op_string8(
     // without first copying the string into a String that is then freed.
     match &mut state.registers[*dest] {
         Register::Value(Value::Text(existing)) => existing.do_extend(&value.as_str())?,
-        register => register.set_text(Text::new(value.clone()))?,
+        register => register.set_text(Text::new(value.as_str().to_owned()))?,
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -10888,9 +10888,7 @@ pub fn op_function(
             let dbname = state.registers[*start_reg + 1].get_value();
             let key = state.registers[*start_reg + 2].get_value();
             if !matches!(key, Value::Null) {
-                return Err(LimboError::InvalidArgument(
-                    "ATTACH KEY is not supported; provide cipher and hexkey in the attached database URI".into(),
-                ).into());
+                return Err(crate::attach::attach_key_not_supported().into());
             }
 
             let Value::Text(filename_str) = filename else {

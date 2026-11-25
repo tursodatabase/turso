@@ -1391,7 +1391,7 @@ fn emit_class_row_insert(
         dest_end: None,
     });
     program.emit_insn(Insn::String8 {
-        value: name.to_string(),
+        value: name.to_string().into(),
         dest: first_column_reg + 1,
     });
     program.emit_insn(Insn::Integer {
@@ -1399,7 +1399,7 @@ fn emit_class_row_insert(
         dest: first_column_reg + 2,
     });
     program.emit_insn(Insn::String8 {
-        value: relkind_letter(kind).to_string(),
+        value: relkind_letter(kind).to_string().into(),
         dest: first_column_reg + 3,
     });
     program.emit_insn(Insn::Integer {
@@ -1720,7 +1720,7 @@ fn emit_class_row_set_policies(
         }
         StoredPolicies::Text(text) => {
             program.emit_insn(Insn::String8 {
-                value: text,
+                value: text.into(),
                 dest: policies_reg,
             });
         }
@@ -1730,7 +1730,7 @@ fn emit_class_row_set_policies(
         } => {
             let oid_reg = emit_allocate_oid(program, cursors);
             program.emit_insn(Insn::String8 {
-                value: before_oid,
+                value: before_oid.into(),
                 dest: policies_reg,
             });
             program.emit_insn(Insn::Concat {
@@ -2223,7 +2223,10 @@ fn emit_class_record(
         let dest = first_column_reg + 1 + offset;
         match column {
             ClassRecordColumn::Literal(value) => {
-                program.emit_insn(Insn::String8 { value, dest });
+                program.emit_insn(Insn::String8 {
+                    value: value.into(),
+                    dest,
+                });
             }
             ClassRecordColumn::LiteralInt(value) => {
                 program.emit_insn(Insn::Integer { value, dest });
@@ -2299,7 +2302,7 @@ fn emit_class_name_index_insert(
         dest: key_reg,
     });
     program.emit_insn(Insn::String8 {
-        value: name.to_string(),
+        value: name.to_string().into(),
         dest: key_reg + 1,
     });
     program.emit_insn(Insn::Copy {
@@ -2331,7 +2334,7 @@ fn emit_class_name_index_delete(
         dest: key_reg,
     });
     program.emit_insn(Insn::String8 {
-        value: name.to_string(),
+        value: name.to_string().into(),
         dest: key_reg + 1,
     });
     program.emit_insn(Insn::Copy {

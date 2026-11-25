@@ -5,6 +5,7 @@ use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
+use crate::redact::RedactKeys;
 use crate::security::roles::RoleId;
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
@@ -1139,7 +1140,7 @@ impl Connection {
         }
         let result = (|| {
             let sql = sql.as_ref();
-            tracing::debug!("Preparing: {}", sql);
+            tracing::debug!("Preparing: {}", RedactKeys(self.dialect().as_ref(), sql));
 
             let (cmd, byte_offset_end) = {
                 crate::stack::trace_stack!("parse");
@@ -1501,7 +1502,10 @@ impl Connection {
             ));
         }
         let sql = sql.as_ref();
-        tracing::trace!("Preparing and executing batch: {}", sql);
+        tracing::trace!(
+            "Preparing and executing batch: {}",
+            RedactKeys(self.dialect().as_ref(), sql)
+        );
 
         let mut remaining = sql;
         while let (Some(cmd), byte_offset_end) = self.parse_sql(remaining)? {
@@ -1521,7 +1525,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
-        tracing::trace!("Querying: {}", sql);
+        tracing::trace!("Querying: {}", RedactKeys(self.dialect().as_ref(), sql));
 
         let (cmd, byte_offset_end) = self.parse_sql(sql)?;
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])

@@ -86,6 +86,7 @@ use execute::{
 };
 
 use crate::io::TempFile;
+use crate::redact::{RedactKeysDebug, RedactUriKeys};
 use crate::storage::sqlite3_ondisk::split_varint;
 use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
@@ -4173,12 +4174,14 @@ impl Program {
                         if wrote_without_savepoint {
                             tracing::error!(
                                 "statement wrote, then failed without a \
-                                 statement savepoint: {err:?}"
+                                 statement savepoint: {}",
+                                RedactKeysDebug(&err)
                             );
                             debug_assert!(
                                 false,
                                 "statement wrote, then failed without a \
-                                 statement savepoint: {err:?}"
+                                 statement savepoint: {}",
+                                RedactKeysDebug(&err)
                             );
                         }
                         if can_autocommit_now || forces_rollback || wrote_without_savepoint {
@@ -4306,17 +4309,21 @@ pub fn registers_to_ref_values<'a>(
     registers.iter().map(|reg| reg.get_value().as_ref())
 }
 
-#[instrument(skip(program), level = Level::DEBUG)]
+#[instrument(
+    skip(program, insn),
+    fields(insn = %RedactKeysDebug(insn)),
+    level = Level::DEBUG
+)]
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
     tracing::trace!(
         "\n{}",
-        explain::insn_to_str(
+        RedactUriKeys(&explain::insn_to_str(
             program,
             addr,
             insn,
             String::new(),
             program.explain.comment_at(addr)
-        )
+        ))
     );
 }
 

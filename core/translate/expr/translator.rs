@@ -59,8 +59,8 @@ pub fn translate_expr_no_constant_opt(
     deopt_reason: NoConstantOptReason,
 ) -> Result<usize> {
     tracing::debug!(
-        "translate_expr_no_constant_opt: expr={:?}, deopt_reason={:?}",
-        expr,
+        "translate_expr_no_constant_opt: expr={}, deopt_reason={:?}",
+        crate::redact::RedactKeysDebug(expr),
         deopt_reason
     );
     let next_span_idx = program.constants_in_place_start();
@@ -1141,7 +1141,7 @@ fn translate_function_call_expr(
             }
             for (i, type_name) in argument_types.into_iter().enumerate() {
                 program.emit_insn(Insn::String8 {
-                    value: type_name,
+                    value: type_name.into(),
                     dest: regs + args_count + i,
                 });
             }
@@ -2565,7 +2565,7 @@ fn translate_id_expr(
     }
     // DQS enabled: treat double-quoted identifiers as string literals (SQLite compatibility)
     program.emit_insn(Insn::String8 {
-        value: id.as_str().to_string(),
+        value: id.as_str().to_string().into(),
         dest: target_register,
     });
     Ok(target_register)

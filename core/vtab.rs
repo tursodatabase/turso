@@ -651,7 +651,7 @@ impl ExtVirtualTableCursor {
         unsafe { (self.implementation.rowid)(self.cursor.as_ptr()) }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, args), fields(args = %crate::redact::RedactKeysDebug(&args)))]
     pub(crate) fn filter(
         &self,
         idx_num: i32,

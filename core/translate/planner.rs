@@ -2577,6 +2577,16 @@ fn add_schema_table(
     let tbl_ref = if let Table::Virtual(tbl) = table {
         if let VirtualTableType::Pragma(pragma) = &tbl.vtab_type {
             roles::check_pragma_function(resolver, &pragma.pragma_name)?;
+            // Reject an argument of pragma_hexkey() before the program holds
+            // it, because the compiled instructions show their literals in the
+            // TRACE log and in EXPLAIN. Encryption is set only when the
+            // database opens.
+            if !args.is_empty() && pragma.pragma_name == ast::PragmaName::EncryptionKey.to_string()
+            {
+                return Err(crate::LimboError::InvalidArgument(
+                    "encryption must be configured when opening the database".into(),
+                ));
+            }
         }
         row_security::check_virtual_table(tbl, resolver)?;
         transform_args_into_where_terms(args, internal_id, vtab_predicates, table)?;

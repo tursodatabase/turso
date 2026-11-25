@@ -1,6 +1,7 @@
 use crate::{alloc, turso_assert, turso_assert_eq, types::AsValueRef, Result, Value, ValueRef};
 
 use crate::ast::{self, ResolveType, SortOrder, TableInternalId};
+use crate::redact::RedactKeysDebug;
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Range;
 use tracing::{instrument, Level};
@@ -1472,7 +1473,11 @@ impl ProgramBuilder {
         key: Option<CursorKey>,
         index: &Arc<Index>,
     ) -> crate::Result<usize> {
-        tracing::debug!("alloc cursor: {:?} {:?}", key, index.index_method.is_some());
+        tracing::debug!(
+            "alloc cursor: {} {:?}",
+            RedactKeysDebug(&key),
+            index.index_method.is_some()
+        );
         let module = index.index_method.as_ref();
         if let Some(m) = module {
             if !m.definition().backing_btree {
@@ -1548,7 +1553,11 @@ impl ProgramBuilder {
         });
     }
 
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[instrument(
+        skip(self, insn),
+        fields(insn = %RedactKeysDebug(&insn)),
+        level = Level::DEBUG
+    )]
     pub fn emit_insn(&mut self, insn: Insn) {
         // This seemingly empty trace here is needed so that a function span is emmited with it
         tracing::trace!("");
@@ -1675,7 +1684,11 @@ impl ProgramBuilder {
     /// Emit an instruction that should not start or extend a constant span on its own.
     /// If a parent constant span is already open, the instruction is emitted normally
     /// within that span (the parent's `is_constant` classification takes precedence).
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[instrument(
+        skip(self, insn),
+        fields(insn = %RedactKeysDebug(&insn)),
+        level = Level::DEBUG
+    )]
     pub fn emit_no_constant_insn(&mut self, insn: Insn) {
         if !self.constant_span_is_open() {
             self.constant_span_end_all();
@@ -1690,12 +1703,18 @@ impl ProgramBuilder {
     }
 
     pub fn emit_string8(&mut self, value: String, dest: usize) {
-        self.emit_insn(Insn::String8 { value, dest });
+        self.emit_insn(Insn::String8 {
+            value: value.into(),
+            dest,
+        });
     }
 
     pub fn emit_string8_new_reg(&mut self, value: String) -> usize {
         let dest = self.alloc_register();
-        self.emit_insn(Insn::String8 { value, dest });
+        self.emit_insn(Insn::String8 {
+            value: value.into(),
+            dest,
+        });
         dest
     }
 

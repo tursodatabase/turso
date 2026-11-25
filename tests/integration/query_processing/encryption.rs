@@ -213,6 +213,90 @@ fn attach_key_rejects_non_null_values_before_creating_a_file() -> anyhow::Result
     Ok(())
 }
 
+#[test]
+fn attach_key_literal_is_rejected_when_prepared() -> anyhow::Result<()> {
+    let (_main_db, conn) = open_main_db()?;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("attached.db");
+    let attach = |key: &str| format!("ATTACH '{}' AS aux KEY {key}", path.display());
+    let assert_refused = |error: turso_core::LimboError| {
+        assert!(
+            error.to_string().contains("ATTACH KEY is not supported"),
+            "{error}"
+        );
+    };
+    // A compiled program shows its literals in the log, so preparation
+    // rejects a key literal.
+    for key in ["'secret'", "x'AB'", "42", "-42", "('secret')", "+'secret'"] {
+        assert_refused(conn.prepare(attach(key)).unwrap_err());
+    }
+    // The value of any other expression is checked when the statement runs,
+    // before the target opens.
+    let mut stmt = conn.prepare(attach("lower('SECRET')"))?;
+    assert_refused(stmt.run_ignore_rows().unwrap_err());
+    drop(stmt);
+    let mut stmt = conn.prepare(attach("?"))?;
+    stmt.bind_at(
+        std::num::NonZero::new(1).unwrap(),
+        turso_core::Value::build_text("secret"),
+    )?;
+    assert_refused(stmt.run_ignore_rows().unwrap_err());
+    drop(stmt);
+    assert!(!path.exists());
+    // An expression whose value is NULL attaches the database, as in SQLite.
+    for key in [
+        "NULL",
+        "(NULL)",
+        "?",
+        "CAST(NULL AS TEXT)",
+        "NULL+1",
+        "NULL||'x'",
+        "nullif(1, 1)",
+    ] {
+        conn.prepare(attach(key))?.run_ignore_rows()?;
+        conn.execute("DETACH aux")?;
+    }
+    let mut stmt = conn.prepare(attach("?1||''"))?;
+    stmt.bind_at(std::num::NonZero::new(1).unwrap(), turso_core::Value::Null)?;
+    stmt.run_ignore_rows()?;
+    drop(stmt);
+    conn.execute("DETACH aux")?;
+    assert!(path.exists());
+    Ok(())
+}
+
+#[test]
+fn pragma_hexkey_argument_is_rejected_when_prepared() -> anyhow::Result<()> {
+    let (_main_db, conn) = open_main_db()?;
+    // A compiled program shows its literals in the log, so preparation
+    // rejects an argument, which a user means as a key.
+    for sql in [
+        "SELECT * FROM pragma_hexkey('secret')",
+        "SELECT * FROM main.pragma_hexkey(lower('SECRET'))",
+    ] {
+        let error = conn.prepare(sql).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("encryption must be configured when opening the database"),
+            "{error}"
+        );
+    }
+    for sql in [
+        "SELECT * FROM pragma_hexkey",
+        "SELECT * FROM pragma_hexkey()",
+    ] {
+        let rows = conn.prepare(sql)?.run_collect_rows()?;
+        assert_eq!(
+            rows,
+            vec![vec![turso_core::Value::build_text(
+                "encryption key is not set for this session"
+            )]]
+        );
+    }
+    Ok(())
+}
+
 fn attach_matrix_options(cipher: Option<&str>, mvcc: bool, key: &str) -> OpenOptions {
     OpenOptions::new(Arc::new(SqliteDialect))
         .db_opts(
@@ -3294,4 +3378,214 @@ fn encrypted_mvcc_reload_preserves_key_and_log_encryption() -> anyhow::Result<()
     let rows = conn.prepare("SELECT count(*) FROM t")?.run_collect_rows()?;
     assert_eq!(rows, vec![vec![turso_core::Value::from_i64(2)]]);
     Ok(())
+}
+
+#[test]
+fn encryption_opts_debug_output_hides_the_key() {
+    let opts = EncryptionOpts {
+        cipher: CIPHER_A.to_string(),
+        hexkey: KEY_A.to_string(),
+    };
+    let printed = format!("{opts:?}");
+    assert!(!printed.contains(KEY_A), "{printed}");
+    assert!(printed.contains(CIPHER_A), "{printed}");
+}
+
+/// SQL text can carry an encryption key. The DEBUG and TRACE logs must not
+/// show it.
+#[test]
+fn encryption_keys_in_sql_are_not_logged() -> anyhow::Result<()> {
+    let tables = ["secret_a", "secret_b", "secret_c", "secret_d", "secret_e"];
+    let mut databases = Vec::new();
+    for table in tables {
+        databases.push(create_encrypted_db(CIPHER_A, KEY_A, table, table)?);
+    }
+    let uri = |index: usize| {
+        format!(
+            "file:{}?cipher={CIPHER_A}&hexkey={KEY_A}",
+            databases[index].0.display()
+        )
+    };
+    let (_main_db, conn) = open_main_db()?;
+    let log = capture_trace_log(|| {
+        conn.prepare(format!("ATTACH '{}' AS aux_a", uri(0)))?
+            .run_ignore_rows()?;
+        // The engine removes white space around a key, so this key works.
+        let spaced = uri(1).replace("hexkey=", "hexkey= ");
+        conn.prepare(format!("ATTACH '{spaced}' AS aux_b"))?
+            .run_ignore_rows()?;
+        // The URI is a literal inside an expression.
+        conn.prepare(format!("ATTACH coalesce(NULL, '{}') AS aux_c", uri(2)))?
+            .run_ignore_rows()?;
+        conn.prepare(format!("ATTACH CASE WHEN 1 THEN '{}' END AS aux_d", uri(3)))?
+            .run_ignore_rows()?;
+        // A bound parameter keeps the key out of the SQL text.
+        let mut attach = conn.prepare("ATTACH ? AS aux_e")?;
+        attach.bind_at(
+            std::num::NonZero::new(1).unwrap(),
+            turso_core::Value::build_text(uri(4)),
+        )?;
+        attach.run_ignore_rows()?;
+        for (alias, table) in ["aux_a", "aux_b", "aux_c", "aux_d", "aux_e"]
+            .into_iter()
+            .zip(tables)
+        {
+            let rows = conn
+                .prepare(format!("SELECT value FROM {alias}.{table}"))?
+                .run_collect_rows()?;
+            assert_eq!(rows, vec![vec![turso_core::Value::build_text(table)]]);
+        }
+        // Statements that store and compare a URI that carries a key.
+        conn.execute("CREATE TABLE uris(u TEXT)")?;
+        conn.prepare(format!("INSERT INTO uris VALUES ('{}'), ('x')", uri(0)))?
+            .run_ignore_rows()?;
+        let rows = conn
+            .prepare(format!(
+                "SELECT count(*) FROM uris WHERE u IN ('{}', 'x')",
+                uri(0)
+            ))?
+            .run_collect_rows()?;
+        assert_eq!(rows, vec![vec![turso_core::Value::from_i64(2)]]);
+        // The engine rejects these statements after it logs their text.
+        let refused = databases[0].1.path().join("refused.db");
+        for key in [format!("'{KEY_B}'"), format!("x'{KEY_B}'")] {
+            let attach = format!("ATTACH '{}' AS aux_f KEY {key}", refused.display());
+            let error = conn
+                .prepare(attach)
+                .and_then(|mut stmt| stmt.run_ignore_rows())
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("ATTACH KEY is not supported"),
+                "{error}"
+            );
+        }
+        let pragma = format!("PRAGMA hexkey = '{KEY_B}'");
+        assert!(conn.prepare(&pragma).is_err());
+        assert!(conn.prepare_execute_batch(&pragma).is_err());
+        assert!(conn.query(&pragma).is_err());
+        for function in ["pragma_hexkey", "pragma_key", "pragma_rekey"] {
+            let select = format!("SELECT * FROM {function}('{KEY_B}')");
+            assert!(conn
+                .prepare(select)
+                .and_then(|mut stmt| stmt.run_ignore_rows())
+                .is_err());
+        }
+        // The lexer reads `[` as a subscript, so the `]` in the string ends
+        // nothing, and the PRAGMA is a statement of its own.
+        let subscript = format!("SELECT x[length('a]')] FROM t; PRAGMA hexkey='{KEY_B}'");
+        assert!(conn.prepare(&subscript).is_err());
+        assert!(conn.prepare_execute_batch(&subscript).is_err());
+        // The lexer reads a TCL variable, such as `$a(')`, as one parameter,
+        // so the quote in it does not start a string, and the PRAGMA is a
+        // statement of its own.
+        for variable in TCL_VARIABLES {
+            let batch = format!("SELECT {variable} ; PRAGMA hexkey = '{KEY_B}' --'");
+            assert!(conn.prepare_execute_batch(&batch).is_err());
+        }
+        // A query plan is not SQL, so the plan log keeps all its text.
+        for sql in [
+            "CREATE TABLE mi(a INTEGER, b INTEGER, c INTEGER)",
+            "CREATE INDEX mi_a ON mi(a)",
+            "CREATE INDEX mi_b ON mi(b)",
+            "UPDATE mi SET c = 8 WHERE a = 1 OR b = 2",
+        ] {
+            conn.execute(sql)?;
+        }
+        Ok(())
+    })?;
+    assert!(
+        log.contains("Preparing: SELECT value FROM aux_a.secret_a"),
+        "the log does not show a statement that has no key"
+    );
+    assert_no_key_in_log(&log);
+    // The log still shows the statements that carry a key, without the key.
+    for statement in [
+        "&hexkey=<redacted>' AS aux_a",
+        "&hexkey=<redacted>' AS aux_b",
+        "&hexkey=<redacted>') AS aux_c",
+        "&hexkey=<redacted>' END AS aux_d",
+        "AS aux_f KEY <redacted>",
+        "Preparing: PRAGMA hexkey <redacted>",
+        "Preparing: SELECT * FROM pragma_hexkey<redacted>",
+        "FROM t; PRAGMA hexkey<redacted>",
+        "MULTI-INDEX OR mi (mi_a, mi_b)",
+    ] {
+        assert!(log.contains(statement), "the log does not show {statement}");
+    }
+    for variable in TCL_VARIABLES {
+        let statement = format!("{variable} ; PRAGMA hexkey <redacted> --'");
+        assert!(
+            log.contains(&statement),
+            "the log does not show {statement}"
+        );
+    }
+    Ok(())
+}
+
+/// TCL variables with a quote in the subscript. Each one is one parameter.
+const TCL_VARIABLES: [&str; 4] = ["$a(')", "@a(')", ":a(')", "$::a(')"];
+
+/// Runs `f` and returns the DEBUG and TRACE log that it writes on this thread.
+fn capture_trace_log(f: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<String> {
+    let log = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer({
+            let log = log.clone();
+            move || log.clone()
+        })
+        .finish();
+    tracing::subscriber::with_default(subscriber, f)?;
+    Ok(log.text())
+}
+
+/// Fails if a line of the log shows `KEY_A` or `KEY_B`.
+fn assert_no_key_in_log(log: &str) {
+    let leaks: Vec<&str> = log.lines().filter(|line| shows_a_key(line)).collect();
+    assert!(
+        leaks.is_empty(),
+        "the log shows an encryption key:\n{}",
+        leaks.join("\n")
+    );
+}
+
+/// Whether a log line shows `KEY_A` or `KEY_B`: as hex text, or as the byte
+/// values of the key, which `Debug` prints for a blob such as `x'<key>'`.
+fn shows_a_key(line: &str) -> bool {
+    let line = line.to_ascii_lowercase();
+    [KEY_A, KEY_B].into_iter().any(|key| {
+        let bytes: Vec<u8> = (0..key.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&key[at..at + 2], 16).unwrap())
+            .collect();
+        line.contains(key) || line.contains(&byte_list(&bytes))
+    })
+}
+
+/// The bytes as `Debug` prints them, without the brackets.
+fn byte_list(bytes: &[u8]) -> String {
+    let list = format!("{bytes:?}");
+    list[1..list.len() - 1].to_string()
+}
+
+/// A log writer that keeps the text in memory.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLog {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }

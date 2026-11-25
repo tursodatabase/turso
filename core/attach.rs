@@ -1,7 +1,7 @@
 //! ATTACH and DETACH: open a database on the connection and give it a
 //! namespace, or remove both.
 
-use crate::ast::{Expr, Literal};
+use crate::ast::{Expr, Literal, UnaryOperator};
 use crate::function::{Func, ScalarFunc};
 #[cfg(feature = "fs")]
 use crate::io::{MemoryIO, IO};
@@ -39,6 +39,13 @@ pub fn translate_attach(
             "ATTACH is an experimental feature. Enable with --experimental-attach flag".to_string(),
         ));
     }
+    // Reject a key literal before the program holds it, because the compiled
+    // instructions show their literals in the TRACE log and in EXPLAIN. Any
+    // other KEY expression can be NULL when the statement runs, as SQLite
+    // allows, so the ATTACH function checks its value.
+    if key.as_deref().is_some_and(is_key_literal) {
+        return Err(attach_key_not_supported());
+    }
 
     // SQLite treats ATTACH as a function call to sqlite_attach(filename, dbname, key)
     // We'll allocate registers for the arguments and call the function
@@ -52,7 +59,7 @@ pub fn translate_attach(
         Expr::Literal(Literal::String(s)) => {
             // For ATTACH, string literals should be used directly (without quotes)
             program.emit_insn(Insn::String8 {
-                value: sanitize_string(s),
+                value: sanitize_string(s).into(),
                 dest: arg_reg,
             });
         }
@@ -60,14 +67,14 @@ pub fn translate_attach(
             // For ATTACH, qualified expressions like "foo.db" should be treated as filename strings
             let filename = expr.to_string();
             program.emit_insn(Insn::String8 {
-                value: filename,
+                value: filename.into(),
                 dest: arg_reg,
             });
         }
         Expr::Id(id) => {
             // For ATTACH, identifiers should be treated as filename strings
             program.emit_insn(Insn::String8 {
-                value: normalize_ident(id.as_str()),
+                value: normalize_ident(id.as_str()).into(),
                 dest: arg_reg,
             });
         }
@@ -82,7 +89,7 @@ pub fn translate_attach(
         Expr::Literal(Literal::String(s)) => {
             // For ATTACH, string literals should be used directly (without quotes)
             program.emit_insn(Insn::String8 {
-                value: sanitize_string(s),
+                value: sanitize_string(s).into(),
                 dest: arg_reg + 1,
             });
         }
@@ -90,7 +97,7 @@ pub fn translate_attach(
             // For ATTACH, qualified expressions should be treated as name strings
             let db_name_str = format!("{db_name}");
             program.emit_insn(Insn::String8 {
-                value: db_name_str,
+                value: db_name_str.into(),
                 dest: arg_reg + 1,
             });
         }
@@ -98,7 +105,7 @@ pub fn translate_attach(
             // For ATTACH, identifiers should be treated as name strings
             // Use normalize_ident to strip quotes from double-quoted identifiers
             program.emit_insn(Insn::String8 {
-                value: normalize_ident(id.as_str()),
+                value: normalize_ident(id.as_str()).into(),
                 dest: arg_reg + 1,
             });
         }
@@ -132,6 +139,29 @@ pub fn translate_attach(
     Ok(())
 }
 
+/// Whether an ATTACH KEY expression is a string, blob or number literal,
+/// alone, in parentheses or with a sign. This is how users write a key, as in
+/// `KEY 'secret'` or `KEY x'00ff'`.
+fn is_key_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(Literal::String(_) | Literal::Blob(_) | Literal::Numeric(_)) => true,
+        Expr::Parenthesized(exprs) => matches!(exprs.as_slice(), [expr] if is_key_literal(expr)),
+        Expr::Unary(UnaryOperator::Positive | UnaryOperator::Negative, expr) => {
+            is_key_literal(expr)
+        }
+        _ => false,
+    }
+}
+
+/// The error for a KEY value in ATTACH. Turso reads the key of an attached
+/// database from the `cipher` and `hexkey` parameters of its URI.
+pub(crate) fn attach_key_not_supported() -> LimboError {
+    LimboError::InvalidArgument(
+        "ATTACH KEY is not supported; provide cipher and hexkey in the attached database URI"
+            .into(),
+    )
+}
+
 /// Translate DETACH statement
 pub fn translate_detach(
     expr: &Expr,
@@ -155,7 +185,7 @@ pub fn translate_detach(
         Expr::Literal(Literal::String(s)) => {
             // For DETACH, string literals should be used directly (without quotes)
             program.emit_insn(Insn::String8 {
-                value: sanitize_string(s),
+                value: sanitize_string(s).into(),
                 dest: arg_reg,
             });
         }
@@ -163,7 +193,7 @@ pub fn translate_detach(
             // For DETACH, qualified expressions should be treated as name strings
             let db_name_str = format!("{expr}");
             program.emit_insn(Insn::String8 {
-                value: db_name_str,
+                value: db_name_str.into(),
                 dest: arg_reg,
             });
         }
@@ -171,7 +201,7 @@ pub fn translate_detach(
             // For DETACH, identifiers should be treated as name strings
             // Use normalize_ident to strip quotes from double-quoted identifiers
             program.emit_insn(Insn::String8 {
-                value: normalize_ident(id.as_str()),
+                value: normalize_ident(id.as_str()).into(),
                 dest: arg_reg,
             });
         }

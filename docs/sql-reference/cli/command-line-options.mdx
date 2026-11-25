@@ -100,6 +100,20 @@ Write internal log traces to a file. Useful for debugging and performance analys
 tursodb -t trace.log mydata.db
 ```
 
+The `RUST_LOG` environment variable sets the log level. The default level is `warn`. At the `debug` level, the log can show the text of SQL statements. At the `trace` level, it can also show the bytecode that the statements compile to.
+
+In the log, Turso replaces encryption keys with `<redacted>`: the value of a URI parameter or PRAGMA whose name ends in `key`, such as `hexkey`, the arguments of the table function of such a PRAGMA, such as `pragma_hexkey()`, and the `KEY` clause of `ATTACH`. This is best effort, and it works on literal text only:
+
+- A key that an SQL expression puts together, for example with `'file:a.db?cipher=aegis256&hexkey=' || '<key>'`, `printf()` or `replace()`, can get into the log.
+- Turso finds a key PRAGMA or a `KEY` clause only when `PRAGMA` or `ATTACH` is the first word of the statement, after an optional `EXPLAIN` or `EXPLAIN QUERY PLAN`. A statement that does not parse, for example `(PRAGMA hexkey = '<key>')`, can show its key. Turso rejects such a statement.
+- When SQL text has something that Turso's lexer rejects, such as a quote without an end or a character that is not SQL, Turso hides the rest of that text, because it cannot tell where the statements and keys are.
+- A key PRAGMA inside an SQL comment is not hidden. Turso never uses it as a key.
+- Turso rejects a key literal in an `ATTACH ... KEY` clause, such as `KEY '<key>'`, before it compiles the statement. It checks any other `KEY` expression, such as `KEY lower('<key>')`, when the statement runs, so a key literal inside that expression can show in the bytecode at the `trace` level.
+- Logs at the `debug` and `trace` levels can still show stored row data, and a key URI that is stored as row data is not hidden. The schema stores the SQL of each `CREATE` statement as row data, so a key URI literal in the definition of a view, a table or a trigger can show in a row dump.
+- With `--sync-server`, the server writes the SQL text of each request to the log at the `debug` level, and it does not hide the keys in that text.
+
+To keep a key out of the log, bind the URI as a parameter, or write it as one string literal. The output of `EXPLAIN` and `PRAGMA vdbe_trace` is not a log. It shows the literals of a statement as they are, keys included.
+
 ### `--readonly`
 
 Open the database in read-only mode. Write operations will return an error.

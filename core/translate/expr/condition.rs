@@ -41,7 +41,14 @@ pub(super) fn in_expr_affinity(lhs: &ast::Expr, metadata: &impl ExprProperties) 
     }
 }
 
-#[instrument(skip(program, referenced_tables, resolver), level = Level::DEBUG)]
+#[instrument(
+    skip(program, referenced_tables, lhs, rhs, resolver),
+    fields(
+        lhs = %crate::redact::RedactKeysDebug(lhs),
+        rhs = %crate::redact::RedactKeysDebug(rhs),
+    ),
+    level = Level::DEBUG
+)]
 pub(super) fn translate_in_list(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,

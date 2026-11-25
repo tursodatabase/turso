@@ -66,7 +66,10 @@ pub unsafe extern "C" fn execute(
                         }
                         crate::LimboError::Interrupt => ResultCode::Interrupt,
                         _ => {
-                            tracing::error!("execute: failed to execute query: {:?}", err);
+                            tracing::error!(
+                                "execute: failed to execute query: {}",
+                                crate::redact::RedactKeysDebug(&err)
+                            );
                             ResultCode::Error
                         }
                     },
@@ -74,7 +77,10 @@ pub unsafe extern "C" fn execute(
                 return rc;
             }
             Ok(None) => tracing::error!("query: no statement returned"),
-            Err(e) => tracing::error!("query: failed to execute query: {:?}", e),
+            Err(e) => tracing::error!(
+                "query: failed to execute query: {}",
+                crate::redact::RedactKeysDebug(&e)
+            ),
         };
     }
     ResultCode::Error
@@ -117,7 +123,10 @@ pub unsafe extern "C" fn prepare_stmt(ctx: *mut ExtConn, sql: *const c_char) -> 
                 )))
             }
             Err(e) => {
-                tracing::error!("prepare_stmt: failed to prepare statement: {:?}", e);
+                tracing::error!(
+                    "prepare_stmt: failed to prepare statement: {}",
+                    crate::redact::RedactKeysDebug(&e)
+                );
                 ptr::null_mut()
             }
         }

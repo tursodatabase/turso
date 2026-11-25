@@ -78,6 +78,7 @@ mod percentile;
 mod pragma;
 mod progress;
 mod pseudo;
+mod redact;
 mod regexp;
 #[cfg(feature = "series")]
 mod series;
@@ -216,7 +217,9 @@ pub use vdbe::array::{
     array_contains_all, array_values_from_any, parse_text_array_of_texts, text_array_literal,
 };
 pub use vdbe::builder::{CursorType, ProgramBuilder};
-pub use vdbe::insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
+pub use vdbe::insn::{
+    to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral, String8Value,
+};
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     explain::EXPLAIN_QUERY_PLAN_JSON_COLUMNS, FromValueRow, PrepareContext, PreparedProgram,

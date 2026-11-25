@@ -107,6 +107,10 @@ impl Dialect for PostgresDialect {
         turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
     }
 
+    fn key_ranges(&self, sql: &str) -> Vec<std::ops::Range<usize>> {
+        crate::key_ranges::key_ranges(sql)
+    }
+
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
         Arc::new(turso_sqlite::SqliteDialect)
     }

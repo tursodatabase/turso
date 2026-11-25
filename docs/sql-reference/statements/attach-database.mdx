@@ -69,7 +69,7 @@ The main and attached databases select encryption independently: either can be p
 ATTACH 'file:encrypted.db?cipher=aegis256&hexkey=YOUR_HEX_KEY' AS encrypted;
 ```
 
-Non-NULL `ATTACH ... KEY` values are rejected before the target is opened. Use the URI parameters above to configure encryption. `KEY NULL` is accepted.
+Use the URI parameters above to configure encryption. The value of the `ATTACH ... KEY` clause must be NULL. Turso rejects a key literal, such as `KEY 'secret'` or `KEY x'00ff'`, when it prepares the statement, so that the literal does not get into the compiled program, `EXPLAIN` output or the log. Turso rejects any other `KEY` expression whose value is not NULL when the statement runs, before it opens the target.
 
 ## See Also
 

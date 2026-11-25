@@ -651,7 +651,9 @@ pub fn optimize_plan(
         program.release_registers(*start, *count);
     }
     // When debug tracing is enabled, print the optimized plan as a SQL string for debugging
-    tracing::debug!(plan_sql = plan.to_string());
+    // A plan draws its tree with characters that are not SQL, such as "`--",
+    // so it gets only the URI scan.
+    tracing::debug!(plan_sql = %crate::redact::RedactUriKeys(&plan.to_string()));
     Ok(())
 }
 

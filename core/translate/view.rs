@@ -635,24 +635,24 @@ pub fn translate_drop_view(
         let dbsp_table_name_reg_2 = program.alloc_register();
         program.emit_insn(Insn::String8 {
             dest: dbsp_table_name_reg_2,
-            value: dbsp_table_name.clone(),
+            value: dbsp_table_name.clone().into(),
         });
         let table_type_reg_2 = program.alloc_register();
         program.emit_insn(Insn::String8 {
             dest: table_type_reg_2,
-            value: "table".to_string(),
+            value: "table".to_string().into(),
         });
         let index_type_reg_2 = program.alloc_register();
         program.emit_insn(Insn::String8 {
             dest: index_type_reg_2,
-            value: "index".to_string(),
+            value: "index".to_string().into(),
         });
         let dbsp_index_name_reg_2 = program.alloc_register();
         let dbsp_index_name_2 =
             format!("{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{dbsp_table_name}_1");
         program.emit_insn(Insn::String8 {
             dest: dbsp_index_name_reg_2,
-            value: dbsp_index_name_2,
+            value: dbsp_index_name_2.into(),
         });
 
         // Allocate column registers once (outside the loop)
