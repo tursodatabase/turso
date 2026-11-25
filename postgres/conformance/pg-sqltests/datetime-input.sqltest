@@ -904,12 +904,10 @@ expect @tursopg error {
     type "time" is not supported
 }
 
-# A timestamp compared with a timestamptz fails in tursopg, where PostgreSQL
-# reads the timestamp as a timestamptz in the session time zone. Stored
-# timestamps and timestamptz values are different texts, so comparing them
-# as stored would give wrong rows;
-# no rule says how one converts into the other, so the comparison is refused
-# whichever way the query is run.
+# A timestamp compared with a timestamptz works in tursopg only because the
+# session time zone is always UTC, so both store the same UTC text (a
+# hard-coded exception, see timestamp_compared_with_timestamptz in
+# core/translate/collate.rs). A UNION of the two is still refused.
 
 setup datetime-compare-ts-tz {
     CREATE TABLE a (id int, ts timestamp);
@@ -918,7 +916,6 @@ setup datetime-compare-ts-tz {
     INSERT INTO b VALUES (1, '2024-01-05 10:00:00+00'), (2, '2024-01-05 12:00:00+02');
 }
 
-@compat-gap "operator:timestamp = timestamptz"
 @setup datetime-compare-ts-tz
 test datetime-compare-timestamp-eq-timestamptz-scan {
     SELECT a.id, b.id FROM a, b WHERE a.ts = b.tz ORDER BY a.id, b.id;
@@ -927,9 +924,25 @@ expect {
     2|1
     2|2
 }
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type timestamp with type timestamptz
+
+# The index on b.tz makes the join a seek, and the IN forms compare the two
+# types through an ephemeral index.
+@setup datetime-compare-ts-tz
+test datetime-compare-timestamp-timestamptz-seek-and-in {
+    CREATE INDEX b_tz ON b (tz);
+    SELECT a.id, b.id FROM a, b WHERE a.ts = b.tz ORDER BY a.id, b.id;
+    SELECT id FROM a WHERE ts IN (SELECT tz FROM b);
+    SELECT id FROM b WHERE tz IN (SELECT ts FROM a);
+    SELECT a.id, b.id FROM a, b WHERE a.ts IN (b.tz, b.tz) ORDER BY a.id, b.id;
+}
+expect {
+    2|1
+    2|2
+    2
+    1
+    2
+    2|1
+    2|2
 }
 
 @compat-gap "operator:timestamp UNION timestamptz"
