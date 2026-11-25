@@ -134,6 +134,10 @@ pub(crate) struct TempDbContext {
     /// end. Mirrors the `schema_did_change` field inside
     /// `TransactionState::Write` for the main DB.
     pub(crate) schema_did_change: AtomicBool,
+    /// The page size of the empty TEMP database that an ATTACH of an encrypted database
+    /// dropped, or 0. The next TEMP database takes it, so that the drop does not lose a page
+    /// size that `PRAGMA temp.page_size` set.
+    pub(crate) dropped_page_size: AtomicU32,
 }
 
 impl TempDbContext {
@@ -142,6 +146,7 @@ impl TempDbContext {
             database: RwLock::new(None),
             committed_schema: RwLock::new(None),
             schema_did_change: AtomicBool::new(false),
+            dropped_page_size: AtomicU32::new(0),
         }
     }
 }
@@ -742,7 +747,7 @@ impl Connection {
     fn create_temp_database(&self) -> Result<TempDatabase> {
         let temp_store = self.effective_temp_store();
         let db_opts = self.make_temp_database_opts();
-        let page_size = self.get_page_size();
+        let page_size = self.new_temp_database_page_size();
 
         if matches!(temp_store, crate::TempStore::Memory) {
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -837,13 +842,20 @@ impl Connection {
             self.db.dialect(),
         )?;
         let pager = Arc::new(db._init(None, None)?);
-        pager.set_initial_page_size(self.get_page_size())?;
+        pager.set_initial_page_size(self.new_temp_database_page_size())?;
         Ok(TempDatabase {
             db,
             pager,
             #[cfg(not(target_family = "wasm"))]
             _temp_dir: None,
         })
+    }
+
+    /// The page size of a new TEMP database: the page size of the TEMP database that an ATTACH
+    /// of an encrypted database dropped, else that of the main database.
+    fn new_temp_database_page_size(&self) -> PageSize {
+        PageSize::new(self.temp.dropped_page_size.load(Ordering::Acquire))
+            .unwrap_or_else(|| self.get_page_size())
     }
 
     /// Where the temporary files of this connection go, and their cipher if they are on disk.
@@ -903,6 +915,8 @@ impl Connection {
         if guard.is_none() {
             self.has_non_main_pagers.store(true, Ordering::Release);
             *guard = Some(temp_db);
+            // The new TEMP database took the page size that an ATTACH kept, if any.
+            self.temp.dropped_page_size.store(0, Ordering::Release);
         }
         Ok(())
     }
@@ -918,6 +932,140 @@ impl Connection {
         }
         *self.temp.committed_schema.write() = None;
         self.temp.schema_did_change.store(false, Ordering::Release);
+        // A reset TEMP database loses its page size, also one that an ATTACH kept.
+        self.temp.dropped_page_size.store(0, Ordering::Release);
+    }
+
+    /// Makes the TEMP database ready for an ATTACH of an encrypted database. A TEMP database
+    /// chooses its encryption when it is created, so rows copied from the encrypted database
+    /// into an unencrypted TEMP file would go to disk in plaintext. An unencrypted TEMP file
+    /// that holds no data and that no transaction uses is dropped, so that its next use creates
+    /// it again, encrypted. Any other unencrypted TEMP file is an error, because dropping it
+    /// would lose data.
+    #[cfg(feature = "fs")]
+    pub(crate) fn prepare_temp_database_for_encrypted_attach(&self) -> Result<()> {
+        let mut temp_database = self.temp.database.write();
+        let Some(temp_db) = temp_database.as_ref() else {
+            return Ok(());
+        };
+        if temp_db.db.is_in_memory_db() || temp_db.pager.encryption_cipher() != CipherMode::None {
+            return Ok(());
+        }
+        if temp_db.pager.holds_read_lock() || temp_db.pager.holds_write_lock() {
+            return Err(LimboError::InvalidArgument(
+                "cannot attach an encrypted database while a transaction uses the unencrypted \
+                 TEMP database of this connection: attach it outside the transaction"
+                    .to_string(),
+            ));
+        }
+        // A TEMP database that has not written its first page holds nothing.
+        if temp_db.pager.db_initialized() {
+            let pager = &temp_db.pager;
+            // In a read transaction, the reads see the WAL of the TEMP database.
+            pager.begin_read_tx()?;
+            let kept_data = Self::kept_temp_data(pager);
+            pager.end_read_tx();
+            if let Some(message) = kept_data? {
+                return Err(LimboError::InvalidArgument(message));
+            }
+        }
+        // The TEMP database that replaces this one keeps its page size.
+        if let Some(page_size) = temp_db.pager.get_page_size() {
+            self.temp
+                .dropped_page_size
+                .store(page_size.get(), Ordering::Release);
+        }
+        // No transaction uses the TEMP database, so there is nothing to roll back. Dropping it
+        // deletes its file.
+        drop(temp_database.take());
+        drop(temp_database);
+        *self.temp.committed_schema.write() = None;
+        self.temp.schema_did_change.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Returns why the TEMP database of `pager` cannot be dropped, or None if it holds no
+    /// data. Its data are the objects in its sqlite_schema, the rows of its `sqlite_sequence`
+    /// and `sqlite_stat1`, and a user_version or an application_id that is not 0. An empty
+    /// `sqlite_sequence` or `sqlite_stat1` is not data: a dropped AUTOINCREMENT table leaves
+    /// an empty `sqlite_sequence`, and the user cannot drop it. All of this is read from the
+    /// file, so every kind of object counts. A read transaction must be open.
+    #[cfg(feature = "fs")]
+    fn kept_temp_data(pager: &Arc<Pager>) -> Result<Option<String>> {
+        use crate::storage::btree::{BTreeCursor, CursorTrait};
+        use crate::types::ValueRef;
+        // The tables that are not data while they are empty, with their column counts.
+        const ROW_TABLES: [(&str, usize); 2] = [
+            (crate::schema::SQLITE_SEQUENCE_TABLE_NAME, 2),
+            (crate::stats::STATS_TABLE, 3),
+        ];
+        // The name, root page and column count of each of these tables in the TEMP database.
+        let mut row_tables = Vec::new();
+        let mut cursor = BTreeCursor::new_table(pager.clone(), 1, 5);
+        pager.io.block(|| cursor.rewind())?;
+        loop {
+            // None at the end of sqlite_schema. Else the row, with the table that it describes
+            // if that is one of ROW_TABLES.
+            let row = pager.io.block(|| {
+                let Some(record) = crate::return_if_io!(cursor.record()) else {
+                    return Ok(IOResult::Done(None));
+                };
+                let row_table = match (record.get_value(1)?, record.get_value(3)?) {
+                    (
+                        ValueRef::Text(name),
+                        ValueRef::Numeric(crate::numeric::Numeric::Integer(root_page)),
+                    ) => ROW_TABLES
+                        .into_iter()
+                        .find(|(table, _)| name.as_str().eq_ignore_ascii_case(table))
+                        .map(|(table, columns)| (table, root_page, columns)),
+                    _ => None,
+                };
+                Ok(IOResult::Done(Some(row_table)))
+            })?;
+            match row {
+                None => break,
+                Some(Some(row_table)) => {
+                    row_tables.push(row_table);
+                    pager.io.block(|| cursor.next())?;
+                }
+                Some(None) => {
+                    return Ok(Some(
+                        "cannot attach an encrypted database while TEMP objects of this \
+                         connection are stored in an unencrypted file: drop the TEMP objects \
+                         first, or attach the encrypted database before creating TEMP objects"
+                            .to_string(),
+                    ))
+                }
+            }
+        }
+        for (table, root_page, columns) in row_tables {
+            let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, columns);
+            pager.io.block(|| cursor.rewind())?;
+            let has_rows = pager.io.block(|| {
+                Ok(IOResult::Done(
+                    crate::return_if_io!(cursor.record()).is_some(),
+                ))
+            })?;
+            if has_rows {
+                return Ok(Some(format!(
+                    "cannot attach an encrypted database while the unencrypted TEMP database of \
+                     this connection has rows in {table}: delete them first, or attach the \
+                     encrypted database before using TEMP"
+                )));
+            }
+        }
+        let header_values = pager.io.block(|| {
+            pager.with_header(|header| (header.user_version.get(), header.application_id.get()))
+        })?;
+        if header_values != (0, 0) {
+            return Ok(Some(
+                "cannot attach an encrypted database while the unencrypted TEMP database of this \
+                 connection has a user_version or application_id that is not 0: set them to 0 \
+                 first, or attach the encrypted database before setting them"
+                    .to_string(),
+            ));
+        }
+        Ok(None)
     }
 
     /// Flag a temp-schema mutation within the current transaction so the

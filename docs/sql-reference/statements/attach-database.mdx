@@ -71,6 +71,8 @@ ATTACH 'file:encrypted.db?cipher=aegis256&hexkey=YOUR_HEX_KEY' AS encrypted;
 
 Non-NULL `ATTACH ... KEY` values are rejected before the target is opened. Use the URI parameters above to configure encryption. `KEY NULL` is accepted.
 
+While a database of the connection is encrypted, the connection encrypts its temporary files on disk. The TEMP database chooses its encryption when it is created. If the TEMP database is an unencrypted file that holds no objects and no rows in `sqlite_sequence` or `sqlite_stat1`, and its `user_version` and `application_id` are 0, ATTACH of an encrypted database drops it, and its next use creates it again, encrypted, with the same page size. If the unencrypted TEMP database holds objects or such rows, has a `user_version` or `application_id` that is not 0, or a transaction uses it, ATTACH of an encrypted database is rejected before the target is opened. Drop the TEMP objects, delete the rows, and set these values to 0 first, or attach the encrypted database before you use TEMP. See [Encryption](/docs/sql-reference/pragmas#encryption).
+
 ## See Also
 
 - [DETACH DATABASE](/docs/sql-reference/statements/detach-database) for removing an attached database

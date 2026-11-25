@@ -3296,6 +3296,179 @@ fn encrypted_mvcc_reload_preserves_key_and_log_encryption() -> anyhow::Result<()
     Ok(())
 }
 
+/// A TEMP database chooses its encryption when it is created, so ATTACH of an encrypted
+/// database must not leave an unencrypted TEMP file in use. An empty unencrypted TEMP file is
+/// dropped, so that its next use creates it encrypted. One that holds objects, or that a
+/// transaction uses, makes the ATTACH fail before the target file is created.
+#[test]
+fn encrypted_attach_drops_an_empty_unencrypted_temp_file_and_refuses_a_used_one(
+) -> anyhow::Result<()> {
+    let tmp = TempDatabaseBuilder::new()
+        .with_opts(DatabaseOpts::new().with_attach(true))
+        .build();
+    let target = |name: &str| tmp.path.with_file_name(format!("{name}.db"));
+    let attach = |conn: &Arc<turso_core::Connection>, name: &str| {
+        conn.execute(format!(
+            "ATTACH 'file:{}?cipher={CIPHER_A}&hexkey={KEY_A}' AS {name}",
+            target(name).display()
+        ))
+    };
+
+    // A read of the TEMP schema creates an empty TEMP file.
+    let conn = tmp.connect_limbo();
+    let _: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM temp.sqlite_schema");
+    assert!(conn.has_temp_database());
+    attach(&conn, "after_read")?;
+    assert!(!conn.has_temp_database());
+    conn.execute("CREATE TEMP TABLE copied AS SELECT 'secret' AS x")?;
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT x FROM temp.copied");
+    assert_eq!(rows, [("secret".to_string(),)]);
+
+    // A TEMP table that was dropped leaves an empty TEMP file.
+    let conn = tmp.connect_limbo();
+    conn.execute("CREATE TEMP TABLE scratch(x)")?;
+    conn.execute("DROP TABLE temp.scratch")?;
+    attach(&conn, "after_drop")?;
+    assert!(!conn.has_temp_database());
+
+    // The first use of TEMP after a DETACH creates an unencrypted TEMP file.
+    let conn = tmp.connect_limbo();
+    attach(&conn, "detached")?;
+    conn.execute("DETACH detached")?;
+    let _: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM temp.sqlite_schema");
+    attach(&conn, "after_detach")?;
+    assert!(!conn.has_temp_database());
+
+    // A dropped AUTOINCREMENT table leaves an empty sqlite_sequence, which the user cannot
+    // drop. An empty sqlite_sequence or sqlite_stat1 holds no data.
+    let conn = tmp.connect_limbo();
+    conn.execute("CREATE TEMP TABLE counted(id INTEGER PRIMARY KEY AUTOINCREMENT, x)")?;
+    conn.execute("INSERT INTO counted(x) VALUES (1)")?;
+    conn.execute("CREATE INDEX temp.counted_x ON counted(x)")?;
+    conn.execute("ANALYZE temp")?;
+    let error = attach(&conn, "after_counters").unwrap_err();
+    assert!(error.to_string().contains("TEMP objects"), "{error}");
+    conn.execute("DROP TABLE temp.counted")?;
+    // DROP TABLE does not delete the statistics of the table, as SQLite does.
+    conn.execute("DELETE FROM temp.sqlite_stat1")?;
+    let tables: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM temp.sqlite_schema ORDER BY name");
+    assert_eq!(
+        tables,
+        [
+            ("sqlite_sequence".to_string(),),
+            ("sqlite_stat1".to_string(),)
+        ]
+    );
+    attach(&conn, "after_counters")?;
+    assert!(!conn.has_temp_database());
+
+    // Rows in sqlite_sequence or sqlite_stat1 are data, so the ATTACH fails and keeps them.
+    for (table, name_column, row) in [
+        ("sqlite_sequence", "name", "('kept', 42)"),
+        ("sqlite_stat1", "tbl", "('kept', NULL, '42')"),
+    ] {
+        let conn = tmp.connect_limbo();
+        conn.execute("CREATE TEMP TABLE counted(id INTEGER PRIMARY KEY AUTOINCREMENT, x)")?;
+        conn.execute("INSERT INTO counted(x) VALUES (1)")?;
+        conn.execute("CREATE INDEX temp.counted_x ON counted(x)")?;
+        conn.execute("ANALYZE temp")?;
+        conn.execute("DROP TABLE temp.counted")?;
+        conn.execute("DELETE FROM temp.sqlite_stat1")?;
+        conn.execute(format!("INSERT INTO temp.{table} VALUES {row}"))?;
+        let name = format!("with_{table}_rows");
+        let error = attach(&conn, &name).unwrap_err();
+        assert!(error.to_string().contains(table), "{error}");
+        assert!(!target(&name).exists());
+        let rows: Vec<(String,)> =
+            conn.exec_rows(&format!("SELECT {name_column} FROM temp.{table}"));
+        assert_eq!(rows, [("kept".to_string(),)]);
+        conn.execute(format!("DELETE FROM temp.{table}"))?;
+        attach(&conn, &name)?;
+        assert!(!conn.has_temp_database());
+    }
+
+    // The user_version and application_id of the TEMP database would be lost.
+    for pragma in ["user_version", "application_id"] {
+        let conn = tmp.connect_limbo();
+        conn.execute(format!("PRAGMA temp.{pragma} = 7"))?;
+        let name = format!("after_{pragma}");
+        let error = attach(&conn, &name).unwrap_err();
+        assert!(error.to_string().contains(pragma), "{error}");
+        assert!(!target(&name).exists());
+        let rows: Vec<(i64,)> = conn.exec_rows(&format!("PRAGMA temp.{pragma}"));
+        assert_eq!(rows, [(7,)]);
+        conn.execute(format!("PRAGMA temp.{pragma} = 0"))?;
+        attach(&conn, &name)?;
+        assert!(!conn.has_temp_database());
+    }
+
+    // The TEMP database that replaces the dropped one keeps the page size that PRAGMA
+    // temp.page_size set. `after_read` is an encrypted database that exists.
+    let conn = tmp.connect_limbo();
+    let temp_page_size = |conn: &Arc<turso_core::Connection>| {
+        let rows: Vec<(i64,)> = conn.exec_rows("PRAGMA temp.page_size");
+        rows[0].0
+    };
+    conn.execute("PRAGMA temp.page_size = 8192")?;
+    attach(&conn, "after_read")?;
+    assert!(!conn.has_temp_database());
+    assert_eq!(temp_page_size(&conn), 8192);
+    conn.execute("CREATE TEMP TABLE kept_page_size(a)")?;
+    assert_eq!(temp_page_size(&conn), 8192);
+
+    // A transaction that uses the empty TEMP file keeps it until the transaction ends.
+    let conn = tmp.connect_limbo();
+    conn.execute("BEGIN")?;
+    let _: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM temp.sqlite_schema");
+    let error = attach(&conn, "in_transaction").unwrap_err();
+    assert!(error.to_string().contains("transaction"), "{error}");
+    assert!(!target("in_transaction").exists());
+    conn.execute("COMMIT")?;
+    attach(&conn, "in_transaction")?;
+
+    // TEMP objects in an unencrypted file make the ATTACH fail.
+    let conn = tmp.connect_limbo();
+    conn.execute("CREATE TEMP TABLE scratch(x)")?;
+    conn.execute("INSERT INTO scratch VALUES (1)")?;
+    let error = attach(&conn, "with_objects").unwrap_err();
+    assert!(error.to_string().contains("TEMP objects"), "{error}");
+    assert!(!target("with_objects").exists());
+    // A URI with a key but no cipher fails with its own error.
+    let error = conn
+        .execute(format!(
+            "ATTACH 'file:{}?hexkey={KEY_A}' AS with_objects",
+            target("with_objects").display()
+        ))
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cipher is required when hexkey is provided"),
+        "{error}"
+    );
+    // A plaintext database can still be attached.
+    conn.execute(format!(
+        "ATTACH '{}' AS plain",
+        target("plaintext").display()
+    ))?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM temp.scratch");
+    assert_eq!(rows, [(1,)]);
+    // A view and a trigger are objects too.
+    conn.execute("DROP TABLE temp.scratch")?;
+    conn.execute("CREATE TEMP VIEW numbers AS SELECT 1 AS x")?;
+    let error = attach(&conn, "with_objects").unwrap_err();
+    assert!(error.to_string().contains("TEMP objects"), "{error}");
+    conn.execute("DROP VIEW temp.numbers")?;
+    conn.execute("CREATE TABLE main.watched(x)")?;
+    conn.execute("CREATE TEMP TRIGGER watcher AFTER INSERT ON main.watched BEGIN SELECT 1; END")?;
+    let error = attach(&conn, "with_objects").unwrap_err();
+    assert!(error.to_string().contains("TEMP objects"), "{error}");
+    conn.execute("DROP TRIGGER temp.watcher")?;
+    attach(&conn, "with_objects")?;
+    Ok(())
+}
+
 /// The name of the test that `temp_storage_of_encrypted_database_holds_no_plaintext` runs in a
 /// child process.
 #[cfg(unix)]
