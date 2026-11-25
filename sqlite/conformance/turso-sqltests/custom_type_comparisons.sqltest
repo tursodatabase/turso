@@ -797,14 +797,14 @@ expect error {
 
 @requires strict "uses STRICT tables"
 test cmp-array-operator-window-range-offset-is-an-error {
-    -- Nothing declares the type of + on an array, so the value takes no RANGE
-    -- offsets.
+    -- + does not exist for an array, so the window has no ORDER BY value to
+    -- take RANGE offsets from.
     CREATE TABLE t(a integer[]) STRICT;
     INSERT INTO t VALUES ('{1}');
     SELECT count(*) OVER (ORDER BY a + 1 RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
 }
 expect error {
-    RANGE with offset PRECEDING/FOLLOWING is not supported for column type unknown
+    operator does not exist: integer\[\] \+ integer
 }
 
 @requires strict "uses STRICT tables"
