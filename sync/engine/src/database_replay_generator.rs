@@ -756,6 +756,139 @@ impl DatabaseReplayGenerator {
         }
     }
 
+    /// Changes the columns of the local table to the columns of the remote
+    /// table, `create_table`, after the renames and drops of
+    /// `rename_and_drop_local_columns_to_match_remote`. It adds the missing
+    /// columns, and it changes each generated column that differs from the
+    /// remote one. A pull matches the values of a row with the columns by
+    /// position, and a later refresh matches the columns by position, so a
+    /// column must keep its place. So a changed generated column changes in
+    /// place, with ALTER COLUMN, unless it is at the end of the table with the
+    /// generated columns that use it: those are dropped and added again. Core
+    /// also refuses to drop a column that an index or a foreign key uses. If
+    /// core refuses a change in place, this fails and does not move the column.
+    /// Returns false if there is no local table.
+    pub async fn change_columns_to_match_remote<Ctx>(
+        &self,
+        coro: &Coro<Ctx>,
+        create_table: &str,
+    ) -> Result<bool> {
+        let mut parser = Parser::new(create_table.as_bytes());
+        let Some(Ok(turso_core::ast::Cmd::Stmt(turso_core::ast::Stmt::CreateTable {
+            tbl_name,
+            body:
+                turso_core::ast::CreateTableBody::ColumnsAndConstraints {
+                    columns,
+                    constraints,
+                    ..
+                },
+            ..
+        }))) = parser.next()
+        else {
+            return Ok(false);
+        };
+        let table_name = tbl_name.name.as_str();
+        let Some((mut local_columns, local_constraints)) =
+            self.local_table_definition(coro, table_name).await?
+        else {
+            return Ok(false);
+        };
+        let changed_columns = changed_generated_columns(
+            &tbl_name,
+            (&local_columns, &local_constraints),
+            (&columns, &constraints),
+        )
+        .into_iter()
+        .filter(|name| has_column(&columns, name))
+        .collect::<Vec<_>>();
+        let indexes = if changed_columns.is_empty() {
+            Vec::new()
+        } else {
+            self.local_indexes(coro, table_name).await?
+        };
+        let undroppable_columns = local_columns
+            .iter()
+            .map(|column| column.col_name.as_str())
+            .filter(|name| {
+                has_foreign_key(name, &local_columns, &local_constraints)
+                    || indexes
+                        .iter()
+                        .any(|(_, _, read_columns)| contains_name(read_columns, name))
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let altered_columns = changed_columns_to_alter_in_place(
+            &local_columns,
+            &changed_columns,
+            &columns,
+            &undroppable_columns,
+        );
+        // Core decides by itself whether ALTER COLUMN builds an index again, and
+        // it keeps an index as it is after a change of COLLATE. So each index
+        // that reads an altered column, directly or through a generated column,
+        // is dropped first and created again at the end.
+        let mut changed_values = generated_columns_that_use(&local_columns, &altered_columns);
+        changed_values.extend(altered_columns.iter().cloned());
+        let indexes = indexes
+            .into_iter()
+            .filter(|(_, _, read_columns)| {
+                read_columns
+                    .iter()
+                    .any(|name| contains_name(&changed_values, name))
+            })
+            .collect::<Vec<_>>();
+        for (index_name, _, _) in &indexes {
+            self.execute_ddl(&format!("DROP INDEX {}", quote_ident(index_name)))?;
+        }
+        // The other changed columns are at the end of the table, so dropping
+        // and adding them again keeps their place. A new definition can read a
+        // column that the remote added, so the missing columns are added before
+        // the changes.
+        let dropped_columns = changed_columns
+            .into_iter()
+            .filter(|name| !contains_name(&altered_columns, name))
+            .collect();
+        self.drop_columns_and_their_users(
+            &tbl_name,
+            &mut local_columns,
+            dropped_columns,
+            &columns,
+        )?;
+        self.add_missing_columns(&tbl_name, &local_columns, &columns)?;
+        if altered_columns.is_empty() {
+            return Ok(true);
+        }
+        // DROP COLUMN and ADD COLUMN write the table text again, with each
+        // foreign key as a table constraint.
+        let (local_columns, local_constraints) = self
+            .local_table_definition(coro, table_name)
+            .await?
+            .expect("ALTER TABLE keeps the table");
+        let mut pending_columns = altered_columns;
+        while !pending_columns.is_empty() {
+            let name = pending_columns.remove(next_column_to_alter(&pending_columns, &columns));
+            let definition = definition_for_alter_column(
+                &tbl_name,
+                &name,
+                (&local_columns, &local_constraints),
+                (&columns, &constraints),
+            )?;
+            let alter_column = format!(
+                "ALTER TABLE {tbl_name} ALTER COLUMN {} TO {definition}",
+                definition.col_name
+            );
+            self.execute_ddl(&alter_column).map_err(|error| {
+                Error::DatabaseTapeError(format!(
+                    "the pull cannot change the generated column {name} of table {tbl_name} to its definition on the server: {error}"
+                ))
+            })?;
+        }
+        for (_, index_sql, _) in &indexes {
+            self.execute_ddl(index_sql)?;
+        }
+        Ok(true)
+    }
+
     /// Execute a DDL statement idempotently: CREATE TABLE for an existing table
     /// drops the generated columns that it removes or changes and adds the
     /// columns that are missing, named schema objects are skipped when already
@@ -801,14 +934,7 @@ impl DatabaseReplayGenerator {
                         changed_columns,
                         remote_columns,
                     )?;
-                    // add the missing remote columns
-                    for column in remote_columns {
-                        if has_column(&local_columns, column.col_name.as_str()) {
-                            continue;
-                        }
-                        let add_column = format!("ALTER TABLE {tbl_name} ADD COLUMN {column}");
-                        self.execute_ddl(&add_column)?;
-                    }
+                    self.add_missing_columns(tbl_name, &local_columns, remote_columns)?;
                 }
                 Ok(())
             }
@@ -940,6 +1066,73 @@ impl DatabaseReplayGenerator {
             self.execute_ddl(&drop_column)?;
         }
         Ok(())
+    }
+
+    /// Adds the columns of `remote_columns` that `local_columns`, the columns
+    /// of the table `tbl_name`, do not have, in the order of `remote_columns`.
+    fn add_missing_columns(
+        &self,
+        tbl_name: &turso_core::ast::QualifiedName,
+        local_columns: &[turso_core::ast::ColumnDefinition],
+        remote_columns: &[turso_core::ast::ColumnDefinition],
+    ) -> Result<()> {
+        for column in remote_columns {
+            if has_column(local_columns, column.col_name.as_str()) {
+                continue;
+            }
+            let add_column = format!("ALTER TABLE {tbl_name} ADD COLUMN {column}");
+            self.execute_ddl(&add_column)?;
+        }
+        Ok(())
+    }
+
+    /// Returns the name, the SQL text and the read columns of each index of the
+    /// table `table_name` that has an SQL text. The read columns are the ones
+    /// that its key or its WHERE clause reads. The indexes of UNIQUE and
+    /// PRIMARY KEY constraints have no SQL text.
+    async fn local_indexes<Ctx>(
+        &self,
+        coro: &Coro<Ctx>,
+        table_name: &str,
+    ) -> Result<Vec<(String, String, Vec<String>)>> {
+        let table_name_literal = sql_string_literal(table_name);
+        let mut stmt = self.conn.prepare(format!(
+            "SELECT name, sql FROM sqlite_schema WHERE type = 'index' AND tbl_name = {table_name_literal} COLLATE NOCASE AND sql IS NOT NULL"
+        ))?;
+        let mut indexes = Vec::new();
+        while let Some(row) = run_stmt_once(coro, &mut stmt).await? {
+            let (turso_core::Value::Text(name), turso_core::Value::Text(sql)) =
+                (row.get_value(0), row.get_value(1))
+            else {
+                return Err(Error::DatabaseTapeError(format!(
+                    "unexpected index row for table '{table_name}' in sqlite_schema"
+                )));
+            };
+            let mut parser = Parser::new(sql.as_str().as_bytes());
+            let Some(Ok(turso_core::ast::Cmd::Stmt(turso_core::ast::Stmt::CreateIndex {
+                columns,
+                where_clause,
+                ..
+            }))) = parser.next()
+            else {
+                return Err(Error::DatabaseTapeError(format!(
+                    "unexpected definition of an index of table '{table_name}' in sqlite_schema: {}",
+                    sql.as_str()
+                )));
+            };
+            let read_columns = columns
+                .iter()
+                .map(|column| column.expr.as_ref())
+                .chain(where_clause.as_deref())
+                .flat_map(|expr| turso_core::schema::collect_column_dependencies_of_expr(expr, &[]))
+                .collect();
+            indexes.push((
+                name.as_str().to_string(),
+                sql.as_str().to_string(),
+                read_columns,
+            ));
+        }
+        Ok(indexes)
     }
 
     /// Returns `None` if there is no matching local table
@@ -1153,6 +1346,195 @@ fn changed_generated_columns(
         .collect()
 }
 
+/// Returns the columns of `changed`, generated columns of `columns` that differ
+/// from the remote table, that must change in place. Dropping columns and
+/// adding them again keeps their place only when they are the last columns,
+/// with the generated columns that use them. Core also refuses to drop the
+/// columns of `undroppable`, which an index or a foreign key uses. ADD COLUMN
+/// cannot add a column whose new definition in `remote_columns` reads a later
+/// column. The other changed columns change in place.
+fn changed_columns_to_alter_in_place(
+    columns: &[turso_core::ast::ColumnDefinition],
+    changed: &[String],
+    remote_columns: &[turso_core::ast::ColumnDefinition],
+    undroppable: &[String],
+) -> Vec<String> {
+    let remote_position = |name: &str| {
+        remote_columns
+            .iter()
+            .position(|column| column.col_name.as_str().eq_ignore_ascii_case(name))
+    };
+    let reads_later_column = |name: &str| {
+        remote_position(name).is_some_and(|position| {
+            columns_read_by(&remote_columns[position])
+                .iter()
+                .any(|read| remote_position(read).is_some_and(|read| read > position))
+        })
+    };
+    // An end that can be dropped and added again holds only changed columns and
+    // the generated columns that use them, so it starts in the longest such end.
+    let all_users = generated_columns_that_use(columns, changed);
+    let first_start = columns
+        .iter()
+        .rposition(|column| {
+            let name = column.col_name.as_str();
+            !contains_name(changed, name) && !contains_name(&all_users, name)
+        })
+        .map_or(0, |position| position + 1);
+    let start = (first_start..=columns.len())
+        .find(|&start| {
+            let end = &columns[start..];
+            let changed_at_end = changed
+                .iter()
+                .filter(|name| has_column(end, name))
+                .cloned()
+                .collect::<Vec<_>>();
+            let users = generated_columns_that_use(columns, &changed_at_end);
+            users.iter().all(|user| has_column(end, user))
+                && end.iter().all(|column| {
+                    let name = column.col_name.as_str();
+                    (contains_name(&changed_at_end, name) || contains_name(&users, name))
+                        && !reads_later_column(name)
+                        && !contains_name(undroppable, name)
+                })
+        })
+        .expect("an empty end is always valid");
+    changed
+        .iter()
+        .filter(|name| !has_column(&columns[start..], name))
+        .cloned()
+        .collect()
+}
+
+/// Returns the index in `names` of the next column to change in place: the
+/// first one whose new definition in `remote_columns` reads no other column of
+/// `names`. If each of them reads another one, it returns the first one, and
+/// core then refuses the change with an error.
+fn next_column_to_alter(
+    names: &[String],
+    remote_columns: &[turso_core::ast::ColumnDefinition],
+) -> usize {
+    names
+        .iter()
+        .position(|name| {
+            let read_columns = remote_columns
+                .iter()
+                .find(|column| column.col_name.as_str().eq_ignore_ascii_case(name))
+                .map(columns_read_by)
+                .unwrap_or_default();
+            !names.iter().any(|other| {
+                !other.eq_ignore_ascii_case(name) && contains_name(&read_columns, other)
+            })
+        })
+        .unwrap_or(0)
+}
+
+/// Returns the definition that ALTER COLUMN gets to change the column `name` of
+/// the local table, `local`, to the column of the remote table, `remote`. Each
+/// table is its columns and its table constraints. ALTER COLUMN replaces the
+/// foreign keys written in the definition of the column, and keeps the ones
+/// that are table constraints. So the definition holds each foreign key of the
+/// remote column that the local table does not have as a table constraint.
+/// This fails when the local table has a foreign key of the column as a table
+/// constraint that the remote column does not have, or when the definition
+/// must hold a foreign key on more than one column. If core cannot make a
+/// table of the columns, this returns the remote column as it is.
+fn definition_for_alter_column(
+    tbl_name: &turso_core::ast::QualifiedName,
+    name: &str,
+    local: (
+        &[turso_core::ast::ColumnDefinition],
+        &[turso_core::ast::NamedTableConstraint],
+    ),
+    remote: (
+        &[turso_core::ast::ColumnDefinition],
+        &[turso_core::ast::NamedTableConstraint],
+    ),
+) -> Result<turso_core::ast::ColumnDefinition> {
+    let (local_columns, local_constraints) = local;
+    let (remote_columns, remote_constraints) = remote;
+    let remote_column = remote_columns
+        .iter()
+        .find(|column| column.col_name.as_str().eq_ignore_ascii_case(name))
+        .expect("the remote table has each altered column");
+    let without_foreign_keys = |column: &turso_core::ast::ColumnDefinition| {
+        let mut column = column.clone();
+        column.constraints.retain(|constraint| {
+            !matches!(
+                constraint.constraint,
+                turso_core::ast::ColumnConstraint::ForeignKey { .. }
+            )
+        });
+        column
+    };
+    let local_columns = local_columns
+        .iter()
+        .map(without_foreign_keys)
+        .collect::<Vec<_>>();
+    let (Some((_, local_table_constraints)), Some((_, remote_written_constraints))) = (
+        table_as_core_writes_it(tbl_name, &local_columns, local_constraints),
+        table_as_core_writes_it(tbl_name, remote_columns, remote_constraints),
+    ) else {
+        return Ok(remote_column.clone());
+    };
+    let mut definition = without_foreign_keys(remote_column);
+    let mut local_foreign_keys = foreign_keys_of(name, &local_table_constraints);
+    for foreign_key in foreign_key_constraints_of(name, &remote_written_constraints) {
+        let text = foreign_key.to_string();
+        if let Some(position) = local_foreign_keys.iter().position(|local| *local == text) {
+            local_foreign_keys.remove(position);
+            continue;
+        }
+        let turso_core::ast::TableConstraint::ForeignKey {
+            columns,
+            clause,
+            defer_clause,
+        } = &foreign_key.constraint
+        else {
+            unreachable!("foreign_key_constraints_of returns only foreign keys");
+        };
+        if columns.len() != 1 {
+            return Err(Error::DatabaseTapeError(format!(
+                "the pull cannot change the generated column {name} of table {tbl_name} to its definition on the server: ALTER COLUMN cannot add the foreign key {text}, which uses more than one column"
+            )));
+        }
+        definition
+            .constraints
+            .push(turso_core::ast::NamedColumnConstraint {
+                name: foreign_key.name.clone(),
+                constraint: turso_core::ast::ColumnConstraint::ForeignKey {
+                    clause: clause.clone(),
+                    defer_clause: defer_clause.clone(),
+                },
+            });
+    }
+    if !local_foreign_keys.is_empty() {
+        return Err(Error::DatabaseTapeError(format!(
+            "the pull cannot change the generated column {name} of table {tbl_name} to its definition on the server: ALTER COLUMN cannot remove the foreign keys {}, which are table constraints",
+            local_foreign_keys.join(", ")
+        )));
+    }
+    Ok(definition)
+}
+
+/// Returns whether a foreign key of the table with the columns `columns` and
+/// the table constraints `constraints` uses the column `name`.
+fn has_foreign_key(
+    name: &str,
+    columns: &[turso_core::ast::ColumnDefinition],
+    constraints: &[turso_core::ast::NamedTableConstraint],
+) -> bool {
+    columns.iter().any(|column| {
+        column.col_name.as_str().eq_ignore_ascii_case(name)
+            && column.constraints.iter().any(|constraint| {
+                matches!(
+                    constraint.constraint,
+                    turso_core::ast::ColumnConstraint::ForeignKey { .. }
+                )
+            })
+    }) || !foreign_key_constraints_of(name, constraints).is_empty()
+}
+
 /// returns true if a local column is generated and the remote either removed it or modified it
 fn generated_column_changed_between_local_and_remote(
     local_column: &turso_core::ast::ColumnDefinition,
@@ -1217,7 +1599,20 @@ fn foreign_keys_of(
     name: &str,
     constraints: &[turso_core::ast::NamedTableConstraint],
 ) -> Vec<String> {
-    let mut foreign_keys = constraints
+    let mut foreign_keys = foreign_key_constraints_of(name, constraints)
+        .into_iter()
+        .map(|constraint| constraint.to_string())
+        .collect::<Vec<_>>();
+    foreign_keys.sort();
+    foreign_keys
+}
+
+/// Returns the foreign keys of `constraints` that use the column `name`.
+fn foreign_key_constraints_of<'a>(
+    name: &str,
+    constraints: &'a [turso_core::ast::NamedTableConstraint],
+) -> Vec<&'a turso_core::ast::NamedTableConstraint> {
+    constraints
         .iter()
         .filter(|constraint| {
             matches!(
@@ -1226,10 +1621,7 @@ fn foreign_keys_of(
                     if columns.iter().any(|column| column.col_name.as_str().eq_ignore_ascii_case(name))
             )
         })
-        .map(|constraint| constraint.to_string())
-        .collect::<Vec<_>>();
-    foreign_keys.sort();
-    foreign_keys
+        .collect()
 }
 
 /// Returns whether `column` is a generated column.

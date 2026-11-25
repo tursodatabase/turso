@@ -721,18 +721,29 @@ impl DatabaseReplaySession {
                                 "failed to replay schema refresh DDL `{sql}`: {err}"
                             ))
                         };
-                        if kind == DatabaseSchemaKind::Table {
+                        // A table refresh does not replay the CREATE TABLE text
+                        // after it changes the columns. Core writes a column in
+                        // another form after ALTER COLUMN, so CREATE TABLE could
+                        // take the column as changed again, and move it.
+                        let refreshed_table = if kind == DatabaseSchemaKind::Table {
                             self.generator
                                 .rename_and_drop_local_columns_to_match_remote(coro, &sql)
                                 .await
                                 .map_err(refresh_error)?;
+                            self.generator
+                                .change_columns_to_match_remote(coro, &sql)
+                                .await
+                                .map_err(refresh_error)?
                         } else {
                             self.conn.execute(Self::schema_drop_sql(kind, &name))?;
+                            false
+                        };
+                        if !refreshed_table {
+                            self.generator
+                                .execute_ddl_idempotent(coro, &sql)
+                                .await
+                                .map_err(refresh_error)?;
                         }
-                        self.generator
-                            .execute_ddl_idempotent(coro, &sql)
-                            .await
-                            .map_err(refresh_error)?;
                     }
                     DatabaseSchemaReplay::Drop { kind, name } => {
                         self.conn.execute(Self::schema_drop_sql(kind, &name))?;
