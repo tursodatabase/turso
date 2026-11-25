@@ -9,6 +9,7 @@ use crate::ast;
 
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
+use crate::dialect::{EngineType, OperandType};
 use crate::function::{AggFunc, Func, ResultType, ReturnType, ScalarFunc, WindowFunc};
 use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
@@ -264,14 +265,14 @@ impl<'a> TypeEnv<'a> {
         }
     }
 
-    fn tables(&self) -> Option<&TableReferences> {
+    pub(super) fn tables(&self) -> Option<&TableReferences> {
         match self {
             Self::Statement { tables, .. } => *tables,
             Self::Table { .. } | Self::TypeBody { .. } => None,
         }
     }
 
-    fn resolver(&self) -> Option<&Resolver<'a>> {
+    pub(super) fn resolver(&self) -> Option<&Resolver<'a>> {
         match self {
             Self::Statement { resolver, .. } => Some(resolver),
             Self::Table { .. } | Self::TypeBody { .. } => None,
@@ -1255,6 +1256,82 @@ pub(crate) fn common_type<'e>(
     env: &TypeEnv,
 ) -> ExprType {
     common_of_types(exprs.map(|expr| type_of(expr, env)), env.schema())
+}
+
+/// The type of the operand `expr`, whose type is `ty`, as a dialect sees it.
+/// A plain type is only named for a value whose type is declared (see
+/// [reads_only_declared_types]).
+pub(super) fn dialect_operand_type(expr: &ast::Expr, ty: ExprType, env: &TypeEnv) -> OperandType {
+    let schema = env.schema();
+    let (element, dimensions) = match without_domain(ty, schema) {
+        ExprType::Array {
+            element,
+            dimensions,
+        } => (without_domain(*element, schema), dimensions),
+        scalar => (scalar, 0),
+    };
+    let registered = |name: &str| {
+        OperandType::Registered(ast::Type {
+            name: name.to_string(),
+            size: None,
+            array_dimensions: dimensions,
+        })
+    };
+    let engine = |ty| OperandType::Engine {
+        ty,
+        array_dimensions: dimensions,
+    };
+    match element {
+        ExprType::Untyped => match without_wrappers(expr) {
+            ast::Expr::Literal(ast::Literal::String(text)) => {
+                OperandType::StringLiteral(super::sanitize_string(text))
+            }
+            _ => OperandType::Untyped,
+        },
+        ExprType::Builtin(BuiltinType::Any) => OperandType::Untyped,
+        ExprType::Custom { type_def, .. } => registered(&type_def.name),
+        ExprType::Builtin(BuiltinType::Boolean) => match schema.type_of_conditions() {
+            Some(type_def) => registered(&type_def.name),
+            None => engine(EngineType::Integer),
+        },
+        ExprType::Builtin(builtin) if reads_only_declared_types(expr, env) => {
+            engine(match builtin {
+                BuiltinType::Integer | BuiltinType::Boolean => EngineType::Integer,
+                BuiltinType::Real => EngineType::Real,
+                BuiltinType::Decimal => EngineType::Decimal,
+                BuiltinType::Numeric => EngineType::Number,
+                BuiltinType::Text => EngineType::Text,
+                BuiltinType::Blob => EngineType::Blob,
+                BuiltinType::Any => return OperandType::Untyped,
+            })
+        }
+        _ => OperandType::Unnamed,
+    }
+}
+
+/// FIXME(registered-types): The catalog tables declare some columns with another type than PostgreSQL (a boolean as INTEGER, a regproc as TEXT), and a subquery column does not say what type it has. So an operand that reads any of them is not checked. Once types are registered, every column and subquery column has its own type and this function goes away.
+/// Whether every value that `expr` reads has a declared type. A column of a
+/// table that is not STRICT, such as a virtual table, may hold any value, and
+/// the type of a subquery's column does not say where its values come from.
+fn reads_only_declared_types(expr: &ast::Expr, env: &TypeEnv) -> bool {
+    let mut declared = true;
+    let _ = super::walk_expr(
+        expr,
+        &mut |expr: &ast::Expr| -> Result<super::WalkControl> {
+            declared &= match expr {
+                ast::Expr::Column { table, .. } => env
+                    .tables()
+                    .and_then(|tables| tables.find_table_by_internal_id(*table))
+                    .is_some_and(|(_, table)| table.is_strict()),
+                ast::Expr::SubqueryResult { .. }
+                | ast::Expr::Subquery(_)
+                | ast::Expr::Register { .. } => false,
+                _ => true,
+            };
+            Ok(super::WalkControl::Continue)
+        },
+    );
+    declared
 }
 
 fn common_of_types(types: impl Iterator<Item = ExprType>, schema: &Schema) -> ExprType {

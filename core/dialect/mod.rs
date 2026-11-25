@@ -657,6 +657,109 @@ pub trait Dialect: Send + Sync + 'static {
     fn json_contains_function(&self) -> Option<&'static str> {
         None
     }
+
+    /// Chooses the operator `op` for operands of the given types: one type
+    /// for a prefix operator, two for the others. `op` is an arithmetic, bit
+    /// or comparison operator. An error refuses the operator. `operands` gives
+    /// the types, and is only called by a dialect that needs them.
+    fn choose_operator(
+        &self,
+        _op: &str,
+        _operands: &dyn Fn() -> Vec<OperandType>,
+    ) -> Result<OperatorChoice> {
+        Ok(OperatorChoice::LeftToTheEngine)
+    }
+
+    /// The error for an operator that no function runs for operands of these
+    /// types, such as `date * 2`. `operand_types` has one name for a prefix
+    /// operator and two for the others.
+    fn undefined_operator_error(&self, op: &str, operand_types: &[String]) -> LimboError {
+        LimboError::ParseError(undefined_operator_message(op, operand_types))
+    }
+}
+
+/// The message of the default [Dialect::undefined_operator_error].
+pub fn undefined_operator_message(op: &str, operand_types: &[String]) -> String {
+    match operand_types {
+        [operand] => format!("operator does not exist: {op} {operand}"),
+        [left, right] => format!("operator does not exist: {left} {op} {right}"),
+        _ => unreachable!("an operator has one or two operands"),
+    }
+}
+
+/// What a dialect decided for an operator.
+#[derive(Debug, Clone)]
+pub enum OperatorChoice {
+    /// The engine's own rules run the operator. SQLite always gives this.
+    LeftToTheEngine,
+    /// The dialect's operator runs. The engine reads each operand that is a
+    /// string literal as the type the operator takes.
+    Chosen(ChosenOperator),
+}
+
+/// The operator a dialect chose: which operator it is, and the type it takes for each operand.
+///
+/// FIXME(registered-types): The engine reads `id` for nothing yet. It can read a string literal as a type but cannot cast any other operand or know the type of the result, which still come from `type_of` and `find_operator_call`. Once types are registered, the operand casts and the result type come from the operator that `id` names.
+#[derive(Debug, Clone)]
+pub struct ChosenOperator {
+    /// The dialect's own identifier of the operator: the oid of its pg_operator row for PostgreSQL.
+    pub id: i64,
+    pub operands: Vec<ast::Type>,
+}
+
+/// What is known about the type of an operand.
+#[derive(Debug, Clone)]
+pub enum OperandType {
+    /// A string literal, with its text. Its type comes from where it is used.
+    StringLiteral(String),
+    /// A parameter. Its type comes from where it is used.
+    Untyped,
+    /// A type registered in the schema, such as `smallint`, `date` or `uuid`.
+    /// The name is exactly the type of the value.
+    Registered(ast::Type),
+    /// FIXME(registered-types): The engine's own storage type of a value that has no registered type. One engine type stands for several types that the dialect tells apart: see [EngineType]. Once those types are registered, they are `Registered`, and this variant and the workarounds in `postgres/frontend/operators.rs` go away.
+    Engine {
+        ty: EngineType,
+        array_dimensions: u32,
+    },
+    /// FIXME(registered-types): Every value has a registered type, so this variant goes away.
+    /// A value that nothing declares a type for: NULL, a subquery, or a value
+    /// read from a column of a table that is not STRICT.
+    Unnamed,
+}
+
+/// The types that the engine stores without registering them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineType {
+    /// An integer column, an integer expression or a boolean when the schema
+    /// registers no type for conditions. A dialect with a 32-bit and a 64-bit
+    /// integer cannot tell them apart: `count(*)` is the same type as an
+    /// integer column.
+    Integer,
+    /// A real number. A dialect with a single and a double precision cannot
+    /// tell them apart.
+    Real,
+    /// A decimal number written in the statement, such as `0.5`.
+    Decimal,
+    /// A number that may be an integer or a real.
+    Number,
+    /// Text. It is also the type of a value that a cast to a registered type
+    /// such as uuid, json or inet gives.
+    Text,
+    Blob,
+}
+
+impl EngineType {
+    /// The SQL name that a CAST to this type uses.
+    pub fn sql_name(self) -> &'static str {
+        match self {
+            Self::Integer => "INTEGER",
+            Self::Real => "REAL",
+            Self::Decimal | Self::Number => "NUMERIC",
+            Self::Text => "TEXT",
+            Self::Blob => "BLOB",
+        }
+    }
 }
 
 /// How an ORDER BY or DISTINCT ON term is matched to the output columns.

@@ -14,6 +14,7 @@ use crate::{
         catalog::CatalogContext,
         emitter::Resolver,
         expr::{
+            check_in_subquery_operator,
             expr_type::{
                 first_and_third_arguments, iif_values, query_column_type, same_type_def, type_of,
                 type_ordering, ExprType,
@@ -552,6 +553,14 @@ pub fn in_subquery_collation(
         query_column_type(query, column, resolver),
     ];
     check_comparable(&types[0], &types[1], resolver.schema())?;
+    check_in_subquery_operator(
+        lhs,
+        &lhs_context.type_env(),
+        rhs,
+        &rhs_context.type_env(),
+        types[1].clone(),
+        resolver,
+    )?;
     let has_collate = has_collate_operator(lhs) || has_collate_operator(rhs);
     if let Some(ordering) = common_ordering(&types, resolver.schema(), has_collate)? {
         return Ok(CollationSeq::Type(ordering));

@@ -716,6 +716,171 @@ fn dialect_owns_builtin_scalar_function_behavior() {
     conn.close().unwrap();
 }
 
+/// A dialect that is SQLite's but has no `-` and no `<` for a text operand,
+/// and reads a string literal next to an integer as an integer.
+struct NoMinusForTextDialect;
+
+impl Dialect for NoMinusForTextDialect {
+    fn name(&self) -> &'static str {
+        "no-minus-for-text"
+    }
+
+    fn parse_internal(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<(Option<turso_core::ast::Cmd>, usize)> {
+        turso_sqlite::SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<turso_core::ast::ColumnDefinition> {
+        turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn parameter_marker_ranges(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<Vec<std::ops::Range<usize>>> {
+        turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
+    }
+
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
+    }
+
+    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
+        turso_core::schema::BTreeTable::from_stored_sql(self, sql, root_page, false)
+    }
+
+    fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
+        turso_core::dialect::parse_table_sql_ast(self, sql)
+    }
+
+    fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
+        turso_core::dialect::table_sql_for_replay(self, sql)
+    }
+
+    fn format_table_sql(
+        &self,
+        _input: &str,
+        tbl_name: &QualifiedName,
+        body: &CreateTableBody,
+    ) -> Result<String> {
+        turso_core::dialect::format_table_sql(tbl_name, body)
+    }
+
+    fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
+        turso_core::dialect::resolve_builtin_function(name, arg_count)
+    }
+
+    fn choose_operator(
+        &self,
+        op: &str,
+        operands: &dyn Fn() -> Vec<OperandType>,
+    ) -> Result<OperatorChoice> {
+        let operands = operands();
+        let type_names: Vec<String> = operands
+            .iter()
+            .map(|operand| match operand {
+                OperandType::Registered(ty) => ty.name.to_ascii_lowercase(),
+                OperandType::Engine { ty, .. } => ty.sql_name().to_ascii_lowercase(),
+                OperandType::StringLiteral(_) => "literal".to_string(),
+                OperandType::Untyped => "untyped".to_string(),
+                OperandType::Unnamed => "unnamed".to_string(),
+            })
+            .collect();
+        if matches!(op, "-" | "<") && type_names.iter().any(|name| name == "text") {
+            return Err(LimboError::ParseError(format!(
+                "no operator {op} for {}",
+                type_names.join(" and ")
+            )));
+        }
+        let has_integer = operands.iter().any(|operand| {
+            matches!(
+                operand,
+                OperandType::Engine {
+                    ty: EngineType::Integer,
+                    ..
+                }
+            )
+        });
+        let integer = turso_core::ast::Type {
+            name: "INTEGER".to_string(),
+            size: None,
+            array_dimensions: 0,
+        };
+        Ok(if has_integer {
+            OperatorChoice::Chosen(ChosenOperator {
+                id: 0,
+                operands: vec![integer; operands.len()],
+            })
+        } else {
+            OperatorChoice::LeftToTheEngine
+        })
+    }
+}
+
+#[test]
+fn dialect_refuses_an_operator_by_the_types_of_its_operands() {
+    let options = OpenOptions::new(Arc::new(NoMinusForTextDialect))
+        .db_opts(DatabaseOpts::new().with_custom_types(true));
+    let db = Database::open(Arc::new(MemoryIO::new()), ":memory:", options).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t (s TEXT, i INTEGER) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES ('5', 7)").unwrap();
+
+    let error = |sql: &str| conn.prepare(sql).err().map(|error| error.to_string());
+    for (sql, message) in [
+        ("SELECT s - 1 FROM t", "no operator - for text and integer"),
+        ("SELECT 1 - s FROM t", "no operator - for integer and text"),
+        ("SELECT -s FROM t", "no operator - for text"),
+        (
+            "SELECT s - 'a' FROM t",
+            "no operator - for text and literal",
+        ),
+        ("SELECT s < 1 FROM t", "no operator < for text and integer"),
+        (
+            "SELECT (i, s) < (1, 1) FROM t",
+            "no operator < for text and integer",
+        ),
+        (
+            "SELECT 1 FROM t WHERE 0 AND i < s",
+            "no operator < for integer and text",
+        ),
+    ] {
+        let error = error(sql).unwrap_or_else(|| panic!("{sql} did not fail"));
+        assert!(error.contains(message), "{sql}: {error}");
+    }
+
+    let rows = conn
+        .prepare("SELECT i - 1, -i, i < 1, s + 1, s > 1, 7 = '7', i IN ('7') FROM t")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::from_i64(6),
+            Value::from_i64(-7),
+            Value::from_i64(0),
+            Value::from_i64(6),
+            Value::from_i64(1),
+            Value::from_i64(1),
+            Value::from_i64(1),
+        ]]
+    );
+    conn.close().unwrap();
+}
+
 #[test]
 fn dialect_scalar_function_resolves_and_executes() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
