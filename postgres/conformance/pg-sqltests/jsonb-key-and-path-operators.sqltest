@@ -1,0 +1,494 @@
+# The jsonb operators #>, #>>, ?, ?| and ?&.
+#
+# #> and #>> find the value at a path of field names and array indexes, and
+# return it as -> and ->> do. ?, ?| and ?& test the keys at the top level:
+# the names of the fields of an object, or the string elements of an array.
+
+@database :memory:
+
+setup items_with_jsonb_rows {
+    CREATE TABLE items (id int PRIMARY KEY, data jsonb);
+    INSERT INTO items VALUES
+        (1, '{"name":"apple","price":1.50,"qty":10,"active":true,"tags":["fruit","red"],"dims":{"w":3,"h":4}}'),
+        (2, '{"name":"bread","price":2,"qty":2,"active":false,"tags":["bakery"],"dims":{"w":20,"h":10},"note":null}'),
+        (3, '[1,2,3]'),
+        (4, NULL);
+}
+
+# ?, ?| and ?&
+
+# A field whose value is null is a key too.
+@setup items_with_jsonb_rows
+test jsonb-has-key {
+    SELECT id FROM items WHERE data ? 'note';
+}
+expect {
+    2
+}
+
+# Only the fields of the top-level object are keys.
+@setup items_with_jsonb_rows
+test jsonb-has-key-only-at-top-level {
+    SELECT count(*) FROM items WHERE data ? 'w';
+}
+expect {
+    0
+}
+
+# The keys of an array are its string elements, and a scalar string document
+# is an array with one element in jsonb. A number element is not a key.
+test jsonb-has-key-of-array-or-scalar {
+    SELECT ('["a",1]'::jsonb ? 'a')::int, ('["a",1]'::jsonb ? '1')::int, ('"a"'::jsonb ? 'a')::int, ('1'::jsonb ? '1')::int, ('[["a"]]'::jsonb ? 'a')::int;
+}
+expect {
+    1|0|1|0|0
+}
+
+test jsonb-has-key-compares-keys-after-escapes {
+    SELECT ('{"é":1}'::jsonb ? 'é')::int, ('["a\"b"]'::jsonb ? 'a"b')::int, ('{"a":1,"a":2}'::jsonb ? 'a')::int;
+}
+expect {
+    1|1|1
+}
+
+@setup items_with_jsonb_rows
+test jsonb-has-key-of-null-is-null {
+    SELECT id FROM items WHERE (data ? 'name') IS NULL OR ('{"a":1}'::jsonb ? NULL) IS NOT NULL;
+}
+expect {
+    4
+}
+
+# A string literal on the left is read as jsonb, because PostgreSQL has ? only
+# for jsonb.
+test jsonb-has-key-of-string-literal {
+    SELECT ('{"a":1}' ? 'a')::int;
+}
+expect {
+    1
+}
+
+test jsonb-has-key-of-invalid-json-errors {
+    SELECT 'not json' ? 'a';
+}
+@sqlstate 22P02
+expect error {}
+
+test bytea-has-key-errors {
+    SELECT '\x01'::bytea ? 'a';
+}
+@sqlstate 42883
+expect error {}
+
+@setup items_with_jsonb_rows
+test jsonb-has-any-key {
+    SELECT id FROM items WHERE data ?| array['note','zzz'];
+}
+expect {
+    2
+}
+
+# A string literal on the right is read as a text array.
+@setup items_with_jsonb_rows
+test jsonb-has-any-key-of-array-literal {
+    SELECT id FROM items WHERE data ?| '{dims,zzz}' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup items_with_jsonb_rows
+test jsonb-has-all-keys {
+    SELECT id FROM items WHERE data ?& array['name','note'];
+}
+expect {
+    2
+}
+
+@setup items_with_jsonb_rows
+test jsonb-has-all-keys-of-array-literal {
+    SELECT id FROM items WHERE data ?& '{name,tags}' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# A NULL element does not count, so ?| finds no key and ?& finds every key in
+# an array that has no other element.
+test jsonb-has-any-or-all-keys-skips-null-elements {
+    SELECT ('{"a":1}'::jsonb ?| array[NULL,'a'])::int, ('{"a":1}'::jsonb ?| array[NULL]::text[])::int, ('{"a":1}'::jsonb ?| array[]::text[])::int, ('{"a":1}'::jsonb ?& array[NULL,'b'])::int, ('{"a":1}'::jsonb ?& array[NULL]::text[])::int, ('{"a":1}'::jsonb ?& array[]::text[])::int;
+}
+expect {
+    1|0|0|0|1|1
+}
+
+test jsonb-has-any-or-all-keys-of-null-array-is-null {
+    SELECT coalesce(('{"a":1}'::jsonb ?| NULL)::int, -1), coalesce(('{"a":1}'::jsonb ?& NULL)::int, -1);
+}
+expect {
+    -1|-1
+}
+
+test jsonb-has-key-functions {
+    SELECT jsonb_exists('{"a":1}', 'a')::int, jsonb_exists_any('{"a":1}', '{a,b}')::int, jsonb_exists_all('{"a":1}', '{a,b}')::int;
+}
+expect {
+    1|1|0
+}
+
+# PostgreSQL has ?| and ?& only for a text array on the right.
+test jsonb-has-any-key-of-integer-array {
+    SELECT '{"1":0}'::jsonb ?| ARRAY[1];
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-has-all-keys-of-integer-array {
+    SELECT '{"1":0}'::jsonb ?& ARRAY[1];
+}
+@sqlstate 42883
+expect error {}
+
+# A string literal on the right of ?| is read as a text array, so text that
+# is not an array literal fails.
+test jsonb-has-any-key-of-text-that-is-not-an-array-errors {
+    SELECT '{"a":1}'::jsonb ?| 'abc';
+}
+@sqlstate 22P02
+expect error {}
+
+# #> and #>>
+
+@setup items_with_jsonb_rows
+test jsonb-path-of-nested-field {
+    SELECT data #> '{tags,0}', data #>> '{tags,0}', data #>> '{dims,w}' FROM items WHERE id = 1;
+}
+expect {
+    "fruit"|fruit|3
+}
+
+@setup items_with_jsonb_rows
+test jsonb-path-in-filter {
+    SELECT id FROM items WHERE data #>> '{dims,h}' = '10';
+}
+expect {
+    2
+}
+
+# A negative index counts from the end of the array.
+@setup items_with_jsonb_rows
+test jsonb-path-with-array-index {
+    SELECT data #>> '{tags,-1}', data #>> '{tags,1}' FROM items WHERE id = 1;
+    SELECT data #> '{1}', data #>> '{-3}' FROM items WHERE id = 3;
+}
+expect {
+    red|red
+    2|1
+}
+
+# An index is read as C's strtol() reads it: after white space and an
+# optional sign, decimal digits only, and nothing after them. An index that
+# does not fit in 32 bits leads nowhere.
+test jsonb-path-index-is-read-as-a-c-integer {
+    SELECT '[1,2]'::jsonb #>> '{" 1"}', '[1,2]'::jsonb #>> '{+1}', '[1,2]'::jsonb #>> '{01}', '[1,2]'::jsonb #>> '{-0}', coalesce('[1,2]'::jsonb #>> '{"1 "}', 'none'), coalesce('[1,2]'::jsonb #>> '{0x1}', 'none'), coalesce('[1,2]'::jsonb #>> '{1.0}', 'none'), coalesce('[1,2]'::jsonb #>> '{2147483648}', 'none'), coalesce('[1,2]'::jsonb #>> '{-2147483648}', 'none');
+}
+expect {
+    2|2|2|1|none|none|none|none|none
+}
+
+# A path element of an object is the name of a field, also when it looks like
+# an index.
+test jsonb-path-of-field-named-like-an-index {
+    SELECT '{"1":"x"}'::jsonb #>> '{1}', '{"a":[1,{"b":2}]}'::jsonb #>> '{a,-1,b}', '[[1,2],[3]]'::jsonb #>> '{0,1}';
+}
+expect {
+    x|2|2
+}
+
+test jsonb-path-takes-the-last-of-two-equal-keys {
+    SELECT '{"a":1,"a":2}'::jsonb #>> '{a}';
+}
+expect {
+    2
+}
+
+test jsonb-empty-path-gives-the-whole-document {
+    SELECT '"s"'::jsonb #> '{}', '"s"'::jsonb #>> '{}', '[1]'::jsonb #>> '{}', 'null'::jsonb #> '{}', coalesce('null'::jsonb #>> '{}', 'sql null');
+}
+expect {
+    "s"|s|[1]|null|sql null
+}
+
+# A scalar has no value at a path that is not empty, and neither has a path
+# with a NULL element.
+test jsonb-path-to-no-value-is-null {
+    SELECT coalesce('"s"'::jsonb #>> '{0}', 'none'), coalesce('[1,2]'::jsonb #>> '{a}', 'none'), coalesce('{"a":1}'::jsonb #>> '{a,b}', 'none'), coalesce('{"a":1}'::jsonb #>> '{b}', 'none'), coalesce('{"a":1}'::jsonb #>> array['a',NULL], 'none'), coalesce('{"a":1}'::jsonb #>> NULL, 'none');
+}
+expect {
+    none|none|none|none|none|none
+}
+
+test jsonb-path-to-json-null {
+    SELECT '{"a":null}'::jsonb #> '{a}', coalesce('{"a":null}'::jsonb #>> '{a}', 'sql null');
+}
+expect {
+    null|sql null
+}
+
+test json-path {
+    SELECT '{"a":{"b":1}}'::json #> '{a,b}', '{"a":{"b":"x"}}'::json #>> '{a,b}';
+}
+expect {
+    1|x
+}
+
+# The functions take the path as more arguments. A text argument is one
+# element, not a text array.
+test jsonb-path-functions {
+    SELECT jsonb_extract_path('{"a":{"b":1}}', 'a', 'b'), jsonb_extract_path_text('{"a":{"b":"x"}}', 'a', 'b'), jsonb_extract_path_text('{"{a}":"y"}', '{a}'), coalesce(jsonb_extract_path_text('{"a":1}', 'a', NULL), 'none');
+}
+expect {
+    1|x|y|none
+}
+
+# PostgreSQL has #> and #>> only for a text array on the right.
+test jsonb-path-of-integer-array {
+    SELECT '{"1":{"2":3}}'::jsonb #> ARRAY[1,2];
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-text-path-of-integer-array {
+    SELECT '{"1":{"2":3}}'::jsonb #>> ARRAY[1,2];
+}
+@sqlstate 42883
+expect error {}
+
+# A string literal on the right of #> is read as a text array, so text that
+# is not an array literal fails.
+test jsonb-path-of-text-that-is-not-an-array-errors {
+    SELECT '{"a":1}'::jsonb #> 'abc';
+}
+@sqlstate 22P02
+expect error {}
+
+# The functions take a text array as the path only after the keyword
+# VARIADIC.
+test jsonb-extract-path-of-text-array {
+    SELECT jsonb_extract_path('{"a":{"b":1}}', ARRAY['a','b']);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-extract-path-text-of-text-array {
+    SELECT jsonb_extract_path_text('{"a":{"b":1}}', ARRAY['a','b']);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-path-of-nul-escape-errors {
+    SELECT '{"b":"\u0000","a":1}'::json #> '{a}';
+}
+@sqlstate 22P05
+expect error {}
+
+# The operators run functions of the PostgreSQL frontend. Thus tursopg
+# refuses them with 0A000 in an index expression and in a generation
+# expression, which can use only core functions.
+
+# TODO let expression indexes use frontend functions
+@setup items_with_jsonb_rows
+@compat-gap "syntax:create-index"
+test jsonb-has-key-in-index-expression {
+    CREATE INDEX items_noted ON items ((data ? 'note'));
+    SELECT id FROM items WHERE data ? 'note';
+}
+expect {
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# TODO let expression indexes use frontend functions
+@setup items_with_jsonb_rows
+@compat-gap "syntax:create-index"
+test jsonb-path-in-partial-index {
+    CREATE INDEX items_wide ON items (id) WHERE data #>> '{dims,w}' = '20';
+    SELECT id FROM items WHERE data #>> '{dims,w}' = '20';
+}
+expect {
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# TODO let generated columns use frontend functions
+@compat-gap "syntax:generated-column"
+test jsonb-path-in-generated-column {
+    CREATE TABLE gen_items_3 (data text, w text GENERATED ALWAYS AS (data::jsonb #>> '{dims,w}') STORED);
+    INSERT INTO gen_items_3 (data) VALUES ('{"dims":{"w":3}}');
+    SELECT w FROM gen_items_3;
+}
+expect {
+    3
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# PostgreSQL roles belong to the whole server, so the test uses its own role
+# and table names.
+test jsonb-has-key-in-row-security-policy {
+    CREATE ROLE jk_reader_1;
+    CREATE TABLE jk_docs_1 (id int PRIMARY KEY, data jsonb);
+    INSERT INTO jk_docs_1 VALUES (1, '{"public":true}'), (2, '{"owner":"x"}');
+    GRANT SELECT ON jk_docs_1 TO jk_reader_1;
+    ALTER TABLE jk_docs_1 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY jk_public_1 ON jk_docs_1 FOR SELECT USING (data ? 'public');
+    SET ROLE jk_reader_1;
+    SELECT id FROM jk_docs_1;
+    RESET ROLE;
+}
+expect {
+    1
+}
+
+# Known differences of ?, ?|, ?&, #> and #>>
+
+# tursopg reads a json or text value on the left of ?, ?| and ?& as jsonb,
+# where PostgreSQL has these operators only for jsonb.
+@compat-gap "operator:json ? text"
+test json-has-key {
+    SELECT '{"a":1}'::json ? 'a';
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    t
+}
+
+@compat-gap "operator:text ? text"
+test text-has-key {
+    SELECT '{"a":1}'::text ? 'a';
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    t
+}
+
+@compat-gap "operator:json ?| _text"
+test json-has-any-key {
+    SELECT '{"a":1}'::json ?| array['a'];
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    t
+}
+
+@compat-gap "operator:json ?& _text"
+test json-has-all-keys {
+    SELECT '{"a":1}'::json ?& array['a'];
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    t
+}
+
+# tursopg casts the right operand of ? to text. Thus a number works there,
+# where PostgreSQL has ? only for text.
+@compat-gap "operator:jsonb ? int4"
+test jsonb-has-integer-key {
+    SELECT '{"1":0}'::jsonb ? 1;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    t
+}
+
+# PostgreSQL has #> and #>> for json and for jsonb, so it cannot choose one
+# for two string literals. tursopg reads the left one as JSON.
+@compat-gap "operator:unknown #> unknown"
+test path-of-two-string-literals {
+    SELECT '{"a":{"b":1}}' #> '{a,b}';
+}
+@sqlstate 42725
+expect error {}
+expect @tursopg {
+    1
+}
+
+@compat-gap "operator:unknown #>> unknown"
+test text-path-of-two-string-literals {
+    SELECT '{"a":{"b":1}}' #>> '{a,b}';
+}
+@sqlstate 42725
+expect error {}
+expect @tursopg {
+    1
+}
+
+# tursopg reads a text value on the right of ?|, ?&, #> and #>> as a text
+# array literal, where PostgreSQL has these operators only for text arrays.
+@compat-gap "operator:jsonb ?| text"
+test jsonb-has-any-key-of-text-value {
+    SELECT '{"a":1}'::jsonb ?| '{a}'::text;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    t
+}
+
+@compat-gap "operator:jsonb #> text"
+test jsonb-path-of-text-value {
+    SELECT '{"a":1}'::jsonb #> '{a}'::text;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    1
+}
+
+# tursopg does not read an unquoted element with a space inside, such as
+# `- 1`, of a text array literal.
+@compat-gap "type:_text"
+test jsonb-path-with-unquoted-element-with-a-space {
+    SELECT coalesce('[1,2]'::jsonb #>> '{- 1}', 'none');
+}
+expect {
+    none
+}
+@sqlstate 22P02
+expect @tursopg error {}
+
+# tursopg reads an array literal with two dimensions as an array with one
+# dimension, whose elements are the inner literals, such as `{a}`. PostgreSQL
+# reads each element of both dimensions as a key.
+@compat-gap "type:_text"
+test jsonb-has-any-key-of-two-dimensional-array-literal {
+    SELECT '{"a":1}'::jsonb ?| '{ {a}, {b} }';
+}
+expect {
+    t
+}
+expect @tursopg {
+    f
+}
+
+# #> returns text in tursopg, not jsonb, as -> does, so || joins text on its
+# result, where PostgreSQL joins jsonb values.
+@compat-gap "operator:jsonb #> _text"
+test jsonb-path-result-is-text {
+    SELECT ('{"a":[1]}'::jsonb #> '{a}') || '[2]';
+}
+expect {
+    [1, 2]
+}
+expect @tursopg {
+    [1][2]
+}

@@ -628,10 +628,15 @@ impl Catalog for PostgresCatalog {
                     emit_dropped_column_comments(program, ctx, column);
                 }
             }
-            // A trigger has no class row, and neither has a virtual table.
+            // A trigger has no class row, and neither has a virtual table,
+            // a type, a domain or a schema.
             CatalogCmd::CreateTrigger(_)
             | CatalogCmd::DropTrigger(_)
-            | CatalogCmd::CreateVirtualTable(_) => {}
+            | CatalogCmd::CreateVirtualTable(_)
+            | CatalogCmd::CreateType(_)
+            | CatalogCmd::DropType(_)
+            | CatalogCmd::CreateSchema(_)
+            | CatalogCmd::DropSchema(_) => {}
         }
         Ok(())
     }

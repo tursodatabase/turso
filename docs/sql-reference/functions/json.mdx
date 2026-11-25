@@ -288,6 +288,14 @@ Through the PostgreSQL frontend, `->` and `->>` work as in PostgreSQL. The right
 
 Through the PostgreSQL frontend, `@>` and `<@` compare jsonb values as in PostgreSQL: `'{"a":1,"b":2}'::jsonb @> '{"a":1}'` is true, and `a <@ b` is `b @> a`. An object contains an object when it has each field of that object, with a value that contains the value of the field. An array contains an array when each element of that array is contained by one of its elements, in any order. Only at the top level does an array also contain a scalar that is one of its elements. Numbers compare by value, so `1.5` equals `1.50`. If an object has two fields with the same name, the last one counts. An index expression and a stored generated column use the array function for `@>` and `<@`, which returns NULL for jsonb values. [Array Functions](/docs/sql-reference/functions/array) describes `@>` and `<@` for arrays.
 
+Through the PostgreSQL frontend, `#>` and `#>>` find the value at a path, as in PostgreSQL. The right operand is a text array: `'{"a":{"b":[1,2]}}'::jsonb #>> '{a,b,1}'` is `2`. Each element of the path is the name of a field of an object, or the index of an element of an array. An index is a decimal integer, and a negative index counts from the end of the array. A path to no value, or a path with a NULL element, gives NULL. The empty path `'{}'` gives the whole document.
+
+`#>` returns the JSON text of the value, as `->` does, and `#>>` returns the value as text, as `->>` does. The functions `jsonb_extract_path(json, key, ...)` and `jsonb_extract_path_text(json, key, ...)` take the elements of the path as more arguments.
+
+Through the PostgreSQL frontend, `?`, `?|` and `?&` test the keys at the top level of a jsonb value, as in PostgreSQL. A key is the name of a field of an object, or a string element of an array. Thus `'{"a":1}'::jsonb ? 'a'` and `'["a",1]'::jsonb ? 'a'` are true, but `'["a",1]'::jsonb ? '1'` is false.
+
+`?|` is true when the value has one of the keys of a text array, and `?&` is true when the value has all of them. Thus `'{"a":1}'::jsonb ?| '{a,b}'` is true, and `'{"a":1}'::jsonb ?& '{a,b}'` is false. A NULL element of the array does not count. The functions `jsonb_exists`, `jsonb_exists_any` and `jsonb_exists_all` do the same tests. A `CREATE INDEX` or a stored generated column that uses `#>`, `#>>`, `?`, `?|` or `?&` fails with SQLSTATE 0A000.
+
 ### json_type
 
 Returns the type of a JSON value as a string: `"null"`, `"true"`, `"false"`, `"integer"`, `"real"`, `"text"`, `"array"`, or `"object"`.

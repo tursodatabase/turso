@@ -21,12 +21,12 @@ addr  opcode         p1  p2  p3  p4  p5  comment
    3  Integer         1   2   0       0  r[2]=1
    4  SoftNull        3   0   0       0
    5  Integer         2   4   0       0  r[4]=2
-   6  Affinity        3   2   0       0  r[3..5] = D, D
-   7  NotNull         2   9   0       0  r[2]!=NULL -> goto 9
-   8  Goto            0  11   0       0
-   9  MustBeInt       2   0   0       0
-  10  Goto            0  12   0       0
-  11  NewRowid        1   2   0       0  r[2]=rowid
+   6  NotNull         2   8   0       0  r[2]!=NULL -> goto 8
+   7  Goto            0  10   0       0
+   8  MustBeInt       2   0   0       0
+   9  Goto            0  11   0       0
+  10  NewRowid        1   2   0       0  r[2]=rowid
+  11  Affinity        3   2   0       0  r[3..5] = D, D
   12  Copy            2   8   0       0  r[8]=r[2]
   13  Copy            4   9   0       0  r[9]=r[4]
   14  Add             8   9   5       0  r[5]=r[8]+r[9]

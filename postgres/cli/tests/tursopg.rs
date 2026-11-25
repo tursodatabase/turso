@@ -1237,6 +1237,7 @@ fn extract_row_description_oids(data: &[u8]) -> Vec<u32> {
 // PostgreSQL versions, so test expectations stay valid. Only the OIDs the
 // current wire tests assert against are declared; add more here as new
 // tests need them.
+const OID_BOOL: u32 = 16;
 const OID_INT4: u32 = 23;
 const OID_TEXT: u32 = 25;
 const OID_FLOAT8: u32 = 701;
@@ -1573,19 +1574,60 @@ fn wire_bitwise_ops_report_int4() {
     });
 }
 
-/// Comparison and logical ops return INT4 — SQLite returns 0/1 as INTEGER
-/// at runtime; tursopg's wire layer reports INT4 here. A future change
-/// could map these to BOOL OID, but for now stable + assertable.
+/// Comparison and logical operators report BOOL, as PostgreSQL does. The
+/// engine computes them as the integers 1 and 0.
 #[test]
-fn wire_comparison_and_logical_report_int4() {
+fn wire_comparison_and_logical_report_bool() {
     with_pg_client(|c| {
-        assert_eq!(c.query_column_oids("SELECT 1 = 1"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 2 < 3"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 5 > 4"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 1 AND 0"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 1 OR 0"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 1 = 1"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 2 < 3"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 5 > 4"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 1 AND 0"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 1 OR 0"), vec![OID_BOOL]);
         // Nested: arithmetic feeding a comparison still propagates correctly.
-        assert_eq!(c.query_column_oids("SELECT 42 + 1 = 43"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 42 + 1 = 43"), vec![OID_BOOL]);
+    });
+}
+
+/// Every kind of condition reports BOOL and prints t or f, in a plain query
+/// and in a described prepared statement.
+#[test]
+fn wire_conditions_of_every_kind_report_bool() {
+    with_pg_client(|c| {
+        for sql in [
+            "SELECT 'abc' ~ 'b'",
+            "SELECT 'abc' ~* 'B'",
+            "SELECT 'abc' !~ 'b'",
+            "SELECT 'abc' !~* 'B'",
+            "SELECT 'abc' SIMILAR TO '%b%'",
+            "SELECT ARRAY[1, 2] && ARRAY[2]",
+            "SELECT ARRAY[1, 2] @> ARRAY[2]",
+            "SELECT 1 = ANY(ARRAY[1, 2])",
+            "SELECT 'abc' LIKE 'a%'",
+            "SELECT 1 BETWEEN 0 AND 2",
+            "SELECT 1 IN (1, 2)",
+            "SELECT 1 IS NULL",
+            "SELECT EXISTS (SELECT 1)",
+            "SELECT pg_is_in_recovery()",
+            "SELECT count(*) > 0 FROM (SELECT 1) AS s",
+            "SELECT * FROM (VALUES (1 < 2), (false)) AS v(x)",
+            "SELECT x FROM (SELECT 1 < 2 AS x UNION ALL SELECT false) AS s",
+            "VALUES (1 < 2)",
+            "WITH c AS (VALUES (1 < 2)) SELECT * FROM c",
+            "SELECT CASE WHEN 1 < 2 THEN 1 < 3 ELSE false END",
+            "SELECT coalesce(NULL, 1 < 2)",
+        ] {
+            assert_eq!(c.query_column_oids(sql), vec![OID_BOOL], "{sql}");
+            let text = c.query_single_text(sql);
+            assert!(text == "t" || text == "f", "{sql} printed {text}");
+            c.send_extended(sql, true);
+            let response = c.read_until_ready();
+            assert_eq!(
+                extract_row_description_oids(&response),
+                vec![OID_BOOL],
+                "{sql}"
+            );
+        }
     });
 }
 
@@ -1609,7 +1651,7 @@ fn wire_unary_and_parens_propagate() {
         assert_eq!(c.query_column_oids("SELECT -42"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT +5"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT (1 + 2) * 3"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT NOT 1"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT NOT 1"), vec![OID_BOOL]);
     });
 }
 

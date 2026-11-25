@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Artifact",
+      "mcp__Claude_Docs"
+    ]
+  }
+}

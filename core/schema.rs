@@ -459,6 +459,10 @@ pub struct TypeDef {
     /// built-in date and time types, which store one text form with a 4-digit
     /// year. False for a domain, whose index then serves only `=`.
     pub stored_form_sorts_in_value_order: bool,
+    /// Whether a comparison and the other conditions give a value of this
+    /// type (see `Type::is_type_of_conditions`). False for a domain, a user
+    /// type and a STRUCT or UNION.
+    pub is_type_of_conditions: bool,
     /// FIXME(pg-catalog): This field hand-codes that pg_cast has entries from jsonb to boolean, smallint, integer, bigint, real, double precision and numeric, and none from the other types that read text. A lookup in a pg_cast table replaces this.
     /// Whether values of the type may be cast to number and boolean types, as
     /// PostgreSQL casts jsonb to the integer types, real, double precision,
@@ -791,6 +795,7 @@ impl TypeDef {
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
                     stored_form_sorts_in_value_order: false,
+                    is_type_of_conditions: false,
                     casts_to_numbers_and_booleans: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
@@ -827,6 +832,7 @@ impl TypeDef {
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
                     stored_form_sorts_in_value_order: false,
+                    is_type_of_conditions: false,
                     casts_to_numbers_and_booleans: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
@@ -857,6 +863,7 @@ impl TypeDef {
             range_offsets: Some(ty.range_offsets()),
             accepts_collate: Some(ty.accepts_collate()),
             stored_form_sorts_in_value_order: ty.stored_form_sorts_in_value_order(),
+            is_type_of_conditions: ty.is_type_of_conditions(),
             casts_to_numbers_and_booleans: ty.casts_to_numbers_and_booleans(),
             sql,
             domain_checks: std::vec::Vec::new(),
@@ -894,6 +901,7 @@ impl TypeDef {
             range_offsets: None,
             accepts_collate: None,
             stored_form_sorts_in_value_order: false,
+            is_type_of_conditions: false,
             casts_to_numbers_and_booleans: false,
             sql,
             domain_checks: constraints.to_vec(),
@@ -1421,7 +1429,7 @@ impl SchemaBuilder {
     /// define a built-in type differently from core. Every other name of a
     /// replaced type then names `ty` too: a dialect that defines `boolean`
     /// also defines `bool`, which core registered as an alias of its own
-    /// `boolean`.
+    /// `boolean`. A schema has at most one type of conditions.
     pub fn builtin_type(mut self, ty: &dyn crate::types::Type) -> crate::Result<Self> {
         let type_def = Arc::new(TypeDef::builtin(ty)?);
         for name in std::iter::once(ty.name()).chain(ty.aliases().iter().copied()) {
@@ -1433,6 +1441,17 @@ impl SchemaBuilder {
                 if Arc::ptr_eq(registered, &replaced) {
                     *registered = Arc::clone(&type_def);
                 }
+            }
+        }
+        if type_def.is_type_of_conditions {
+            let other = self.schema.type_registry.values().find(|registered| {
+                registered.is_type_of_conditions && !Arc::ptr_eq(registered, &type_def)
+            });
+            if let Some(other) = other {
+                return Err(crate::LimboError::InternalError(format!(
+                    "built-in types {} and {} are both the type of conditions",
+                    other.name, type_def.name
+                )));
             }
         }
         for alias in ty.aliases() {
@@ -2238,6 +2257,14 @@ impl Schema {
     /// CREATE TABLE validation, CAST).
     pub fn get_type_def_unchecked(&self, type_name: &str) -> Option<&Arc<TypeDef>> {
         self.type_registry.get(&type_registry_key(type_name))
+    }
+
+    /// The type that a comparison and the other conditions give a value of,
+    /// when the schema has one (see `Type::is_type_of_conditions`).
+    pub fn type_of_conditions(&self) -> Option<&Arc<TypeDef>> {
+        self.type_registry
+            .values()
+            .find(|type_def| type_def.is_type_of_conditions)
     }
 
     /// Resolve a custom type fully: look it up (with strictness gate) and chase
@@ -7762,10 +7789,11 @@ pub fn create_table(
         .chain(unique_sets_constraints)
         .try_collect::<Vec<_>>()?;
     // Capture PK conflict clause before the rowid-alias UniqueSet is removed.
-    let rowid_alias_conflict_clause = unique_sets
+    let primary_key_conflict_clause = unique_sets
         .iter()
         .find(|us| us.is_primary_key)
         .and_then(|us| us.conflict_clause);
+    let mut primary_key_is_rowid_alias = false;
     let primary_key_constraint_name = unique_sets
         .iter()
         .find(|set| set.is_primary_key)
@@ -7786,9 +7814,19 @@ pub fn create_table(
             });
             if let Some(u) = unique_set_w_only_rowid_alias {
                 unique_sets.remove(u);
+                primary_key_is_rowid_alias = true;
             }
         }
     }
+    // The conflict clause of the PRIMARY KEY applies to the rowid only when the PRIMARY KEY is
+    // the rowid (an INTEGER PRIMARY KEY) or the table has no rowid. Any other PRIMARY KEY is
+    // enforced by an automatic index that carries its own clause, and a collision on the
+    // implicit rowid of such a table is a separate constraint with the default action ABORT.
+    let rowid_alias_conflict_clause = if primary_key_is_rowid_alias || !has_rowid {
+        primary_key_conflict_clause
+    } else {
+        None
+    };
 
     let mut table = BTreeTable {
         root_page,

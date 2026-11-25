@@ -4235,6 +4235,48 @@ impl PostgreSQLTranslator {
             _ => {}
         }
 
+        // PostgreSQL has these operators only for json and jsonb, so they run
+        // the frontend's functions. SQLite's -> and ->> read a text key such
+        // as '$.a' as a JSON path, take the first of two equal keys, and give
+        // numbers and booleans as SQL values instead of text. SQLite has no
+        // #>, #>>, ?, ?| or ?&.
+        let json_function = match op_name {
+            "->" => Some("jsonb_field"),
+            "->>" => Some("jsonb_field_text"),
+            "#>" => Some("jsonb_extract_path_op"),
+            "#>>" => Some("jsonb_extract_path_text_op"),
+            "?" => Some("jsonb_exists"),
+            "?|" => Some("jsonb_exists_any"),
+            "?&" => Some("jsonb_exists_all"),
+            _ => None,
+        };
+        if let Some(func_name) = json_function {
+            // An index expression and a generation expression can use only
+            // core functions.
+            if self.translating_index.get() {
+                return Err(ParseError::Sqlstate {
+                    sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    message: format!("CREATE INDEX does not support the {op_name} operator"),
+                });
+            }
+            if self.generation_expression_table.borrow().is_some() {
+                return Err(ParseError::Sqlstate {
+                    sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    message: format!("a generated column does not support the {op_name} operator"),
+                });
+            }
+            // FIXME(pg-catalog): This hand-codes the right operand type of the pg_operator entry `jsonb ? text` with a cast, so that a parameter that the server binds as a number, such as 1, is read as text, as PostgreSQL reads a parameter of type unknown for a text operand. A lookup in pg_operator by the types of the operands, in an expression tree that carries PostgreSQL types, replaces this.
+            // The functions of ?|, ?&, #> and #>> read their text array
+            // operand themselves. A cast to a text array would also accept an
+            // array of numbers, which PostgreSQL rejects.
+            let key = if op_name == "?" {
+                text_cast(*right)
+            } else {
+                *right
+            };
+            return Ok(function_call(func_name, vec![*left, key]));
+        }
+
         // Map PostgreSQL operators to Turso operators
         let binary_op = match op_name {
             "=" => ast::Operator::Equals,
@@ -4249,34 +4291,6 @@ impl PostgreSQLTranslator {
             "/" => ast::Operator::Divide,
             "%" => ast::Operator::Modulus,
             "||" => ast::Operator::Concat,
-            // PostgreSQL has -> and ->> only for json and jsonb, so they run the
-            // frontend's functions. SQLite's operators read a text key such as
-            // '$.a' as a JSON path, take the first of two equal keys, and give
-            // numbers and booleans as SQL values instead of text.
-            "->" | "->>" => {
-                // An index expression and a generation expression can use only
-                // core functions.
-                if self.translating_index.get() {
-                    return Err(ParseError::Sqlstate {
-                        sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
-                        message: format!("CREATE INDEX does not support the {op_name} operator"),
-                    });
-                }
-                if self.generation_expression_table.borrow().is_some() {
-                    return Err(ParseError::Sqlstate {
-                        sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
-                        message: format!(
-                            "a generated column does not support the {op_name} operator"
-                        ),
-                    });
-                }
-                let func_name = if op_name == "->" {
-                    "jsonb_field"
-                } else {
-                    "jsonb_field_text"
-                };
-                return Ok(function_call(func_name, vec![*left, *right]));
-            }
             "&" => ast::Operator::BitwiseAnd,
             "|" => ast::Operator::BitwiseOr,
             "<<" => ast::Operator::LeftShift,
@@ -10298,6 +10312,18 @@ fn function_call(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
             filter_clause: None,
             over_clause: None,
         },
+    }
+}
+
+/// `CAST(expr AS TEXT)`.
+fn text_cast(expr: ast::Expr) -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(expr),
+        type_name: Some(ast::Type {
+            name: "TEXT".to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
     }
 }
 

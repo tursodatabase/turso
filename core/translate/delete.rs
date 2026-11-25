@@ -521,6 +521,7 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
             alias: None,
             implicit_column_name: None,
             contains_aggregates: false,
+            values_condition_type: None,
         }],
         where_clause: std::mem::take(&mut plan.where_clause),
         group_by: None,

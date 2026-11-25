@@ -841,7 +841,7 @@ test in-values-mixing-integer-and-timestamp {
 @sqlstate 42804
 expect error {}
 expect @tursopg {
-    1
+    t
 }
 
 # tursopg refuses at compile time with 0A000 because it cannot tell which types
@@ -861,8 +861,7 @@ expect @tursopg error {
 }
 
 # PostgreSQL compares a date with a timestamp as the timestamp at midnight of
-# that date; tursopg compares the stored text when the timestamp comes from a
-# VALUES list in a CTE.
+# that date; tursopg refuses the comparison.
 @compat-gap "operator:date = timestamp"
 test date-equals-timestamp-from-values-cte {
     CREATE TABLE t (id int, d date);
@@ -872,9 +871,8 @@ test date-equals-timestamp-from-values-cte {
 expect {
     1
 }
-expect @tursopg {
-    0
-}
+@sqlstate 0A000
+expect @tursopg error {}
 
 # sum, avg and abs have no date version in PostgreSQL. tursopg applies them
 # to the number the date is stored as.
@@ -942,7 +940,7 @@ expect error {
     operator does not exist: date ~~ unknown
 }
 expect @tursopg {
-    1
+    t
 }
 
 # PostgreSQL accepts the special date value infinity. tursopg refuses it as

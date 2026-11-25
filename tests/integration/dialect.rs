@@ -1284,8 +1284,108 @@ fn cast_conversion_of_a_type_runs_in_a_cast_and_not_in_a_column() {
     conn.close().unwrap();
 }
 
-/// A dialect that registers two types written in Rust: `loud`, and a
-/// `boolean` that replaces the type of core.
+/// A comparison is reported as the type that a dialect registers for
+/// conditions.
+#[test]
+fn conditions_are_reported_as_the_type_a_dialect_registers_for_them() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_db(&io, "dialect-conditions.db", Arc::new(RustTypesDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER, f truth) STRICT")
+        .unwrap();
+
+    let declared_names = |sql: &str| -> Vec<String> {
+        let stmt = conn.prepare(sql).unwrap();
+        (0..stmt.num_columns())
+            .map(|index| {
+                stmt.get_column_type_info(index)
+                    .unwrap()
+                    .unwrap()
+                    .declared_name
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        declared_names(
+            "SELECT a < 2, NOT a, a IN (1, 2), a IS NULL, a BETWEEN 1 AND 2, \
+             'a' LIKE 'a', EXISTS (SELECT 1), a < 2 AND a > 0 FROM t"
+        ),
+        vec!["truth"; 8]
+    );
+    // A condition keeps its type through a subquery, and with a value of
+    // the type in a CASE.
+    assert_eq!(
+        declared_names(
+            "SELECT x, CASE WHEN x THEN f ELSE a < 2 END FROM (SELECT a < 2 AS x, a, f FROM t)"
+        ),
+        vec!["truth"; 2]
+    );
+    // A condition keeps its type in a VALUES list.
+    assert_eq!(declared_names("VALUES (1 < 2), (NOT 1)"), vec!["truth"]);
+    assert_eq!(
+        declared_names("SELECT column1 FROM (VALUES (1 < 2))"),
+        vec!["truth"]
+    );
+    assert_eq!(
+        declared_names("WITH c AS (VALUES (1 < 2)) SELECT * FROM c"),
+        vec!["truth"]
+    );
+    assert_eq!(
+        declared_names("VALUES (1 < 2) UNION ALL VALUES (NOT 1)"),
+        vec!["truth"]
+    );
+    // A condition and an integer in a CASE give an integer.
+    assert_eq!(
+        declared_names("SELECT CASE WHEN a THEN a < 2 ELSE 5 END FROM t"),
+        vec!["INTEGER"]
+    );
+    // A condition has the operators of the type, and truth declares none.
+    for sql in ["SELECT (a < 2) + 1 FROM t", "SELECT f + 1 FROM t"] {
+        let error = conn.prepare(sql).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("operator does not exist: truth + integer"),
+            "{error}"
+        );
+    }
+
+    // The value is still the integer 1 or 0.
+    conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    let rows = conn
+        .prepare("SELECT a < 2, a > 2 FROM t")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(1), Value::from_i64(0)]]);
+    conn.close().unwrap();
+}
+
+#[test]
+fn schema_has_at_most_one_type_of_conditions() {
+    let builder = || {
+        turso_core::schema::builtin::schema_builder(true)
+            .unwrap()
+            .builtin_type(&Truth)
+    };
+    assert!(builder().unwrap().builtin_type(&Truth).is_ok());
+    let Err(error) = builder().unwrap().builtin_type(&Verdict) else {
+        panic!("a second type of conditions was accepted");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("truth and verdict are both the type of conditions"),
+        "{error}"
+    );
+}
+
+/// A dialect that registers three types written in Rust: `loud`, a
+/// `boolean` that replaces the type of core, and `truth`, the type of
+/// conditions.
 struct RustTypesDialect;
 
 impl Dialect for RustTypesDialect {
@@ -1332,7 +1432,8 @@ impl Dialect for RustTypesDialect {
     ) -> Result<turso_core::schema::SchemaBuilder> {
         turso_core::schema::builtin::schema_builder(enable_custom_types)?
             .builtin_type(&Loud)?
-            .builtin_type(&SiNoBoolean)
+            .builtin_type(&SiNoBoolean)?
+            .builtin_type(&Truth)
     }
 }
 
@@ -1407,6 +1508,50 @@ impl Type for SiNoBoolean {
     }
 }
 
+/// The type of conditions: it stores the integers 1 and 0 as they are.
+#[derive(Debug)]
+struct Truth;
+
+impl Type for Truth {
+    fn name(&self) -> &str {
+        "truth"
+    }
+
+    fn params(&self) -> Vec<turso_core::ast::TypeParam> {
+        vec![value_param("integer")]
+    }
+
+    fn base(&self) -> &str {
+        "integer"
+    }
+
+    fn is_type_of_conditions(&self) -> bool {
+        true
+    }
+}
+
+/// A second type of conditions, which a schema refuses.
+#[derive(Debug)]
+struct Verdict;
+
+impl Type for Verdict {
+    fn name(&self) -> &str {
+        "verdict"
+    }
+
+    fn params(&self) -> Vec<turso_core::ast::TypeParam> {
+        vec![value_param("integer")]
+    }
+
+    fn base(&self) -> &str {
+        "integer"
+    }
+
+    fn is_type_of_conditions(&self) -> bool {
+        true
+    }
+}
+
 fn value_param(ty: &str) -> turso_core::ast::TypeParam {
     turso_core::ast::TypeParam {
         name: "value".to_string(),
@@ -1414,9 +1559,11 @@ fn value_param(ty: &str) -> turso_core::ast::TypeParam {
     }
 }
 
-/// A dialect that is SQLite's with catalog `C`.
+/// A dialect that is SQLite's with catalog `C`, and with namespaces when
+/// `namespaces` is set.
 struct DialectWithCatalog<C> {
     catalog: C,
+    namespaces: bool,
 }
 
 impl<C: turso_core::Catalog + 'static> Dialect for DialectWithCatalog<C> {
@@ -1449,6 +1596,10 @@ impl<C: turso_core::Catalog + 'static> Dialect for DialectWithCatalog<C> {
 
     fn catalog(&self) -> &dyn turso_core::Catalog {
         &self.catalog
+    }
+
+    fn supports_namespaces(&self) -> bool {
+        self.namespaces
     }
 }
 
@@ -1512,6 +1663,7 @@ fn steps_of_the_catalog_run_after_the_engine_steps_at_open_and_at_reload() {
         catalog: CatalogWithAStep {
             table_seen_by_each_load: table_seen_by_each_load.clone(),
         },
+        namespaces: false,
     });
     let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", dialect).unwrap();
     let conn = db
@@ -1526,7 +1678,7 @@ fn steps_of_the_catalog_run_after_the_engine_steps_at_open_and_at_reload() {
 }
 
 /// A catalog that stores what SQLite's stores and notes the commands about
-/// triggers and virtual tables that it gets.
+/// triggers, virtual tables, types and schemas that it gets.
 struct NotesCommands {
     commands: Arc<std::sync::Mutex<Vec<String>>>,
 }
@@ -1557,6 +1709,30 @@ impl turso_core::Catalog for NotesCommands {
                     .unwrap()
                     .push(format!("create virtual table {}", table.name));
             }
+            turso_core::CatalogCmd::CreateType(ty) => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(format!("create type {}: {}", ty.name, ty.sql));
+            }
+            turso_core::CatalogCmd::DropType(ty) => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(format!("drop type {}", ty.name));
+            }
+            turso_core::CatalogCmd::CreateSchema(schema) => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(format!("create schema {}", schema.name));
+            }
+            turso_core::CatalogCmd::DropSchema(schema) => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(format!("drop schema {}", schema.name));
+            }
             _ => {}
         }
         turso_core::SqliteCatalog.emit(program, ctx, cmd)
@@ -1570,6 +1746,7 @@ fn the_catalog_gets_a_new_trigger_and_a_dropped_trigger() {
         catalog: NotesCommands {
             commands: commands.clone(),
         },
+        namespaces: false,
     });
     let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", dialect).unwrap();
     let conn = db
@@ -1597,6 +1774,7 @@ fn the_catalog_gets_a_new_virtual_table() {
         catalog: NotesCommands {
             commands: commands.clone(),
         },
+        namespaces: false,
     });
     let options = OpenOptions::new(dialect).native_module(
         "one_row",
@@ -1612,4 +1790,71 @@ fn the_catalog_gets_a_new_virtual_table() {
         .unwrap();
 
     assert_eq!(*commands.lock().unwrap(), ["create virtual table v"]);
+}
+
+#[test]
+fn the_catalog_gets_new_and_dropped_types_and_domains() {
+    let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialect = Arc::new(DialectWithCatalog {
+        catalog: NotesCommands {
+            commands: commands.clone(),
+        },
+        namespaces: false,
+    });
+    let options = OpenOptions::new(dialect).db_opts(DatabaseOpts::new().with_custom_types(true));
+    let db = Database::open(Arc::new(MemoryIO::new()), ":memory:", options).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+        .unwrap();
+    conn.execute("CREATE DOMAIN positive AS integer CHECK (value > 0)")
+        .unwrap();
+    conn.execute("DROP TYPE cents").unwrap();
+    conn.execute("DROP DOMAIN positive").unwrap();
+
+    let commands = commands.lock().unwrap();
+    let names: Vec<&str> = commands
+        .iter()
+        .map(|command| command.split(':').next().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "create type cents",
+            "create type positive",
+            "drop type cents",
+            "drop type positive"
+        ]
+    );
+    assert!(commands[0].contains("CREATE TYPE cents"), "{}", commands[0]);
+    assert!(
+        commands[1].contains("CREATE DOMAIN positive"),
+        "{}",
+        commands[1]
+    );
+}
+
+#[test]
+fn the_catalog_gets_a_new_schema_and_a_dropped_schema() {
+    let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialect = Arc::new(DialectWithCatalog {
+        catalog: NotesCommands {
+            commands: commands.clone(),
+        },
+        namespaces: true,
+    });
+    let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", dialect).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.create_namespace("app").unwrap();
+    conn.drop_namespace("app").unwrap();
+
+    assert_eq!(
+        *commands.lock().unwrap(),
+        ["create schema app", "drop schema app"]
+    );
 }

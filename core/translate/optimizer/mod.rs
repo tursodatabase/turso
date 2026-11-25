@@ -1040,6 +1040,12 @@ fn rewritten_form_is_emittable(rewritten: &SelectPlan) -> bool {
     !rewritten.contains_constant_false_condition
 }
 
+/// Optimizes one query and its subqueries.
+///
+/// This function is on the stack one time for each level of nested
+/// subqueries. The work for a query with correlated subqueries is in
+/// [optimize_correlated_select_plan], which is not inlined, so that its values
+/// are not in this frame while a query without them is optimized.
 #[turso_macros::trace_stack]
 fn optimize_select_plan_with_cache(
     plan: &mut SelectPlan,
@@ -1059,19 +1065,28 @@ fn optimize_select_plan_with_cache(
         return optimize_select_plan_form(plan, resolver, cache);
     }
 
+    optimize_correlated_select_plan(plan, resolver, cache)
+}
+
+/// Optimizes a query that has correlated subqueries. It compares the query with
+/// a form in which the subqueries are joins, and keeps the form that costs less.
+///
+/// This function is on the stack one time for each level of nested subqueries
+/// that have correlated subqueries. The copy of the query and the table plans
+/// are in boxes, and the other work is in functions that are not inlined, so
+/// that the frame stays small.
+#[inline(never)]
+fn optimize_correlated_select_plan(
+    plan: &mut SelectPlan,
+    resolver: &Resolver,
+    cache: &mut SubqueryPlanCache,
+) -> Result<()> {
     // TODO: Let join search run a correlated subquery as soon as all columns
     // that it needs are ready. It can then compare that step with the added
     // join tables in one search. Until then, both forms need their own search.
-    let mut rewritten = plan.clone();
-    if !unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)? {
+    let Some(mut rewritten) = unnested_select_plan_form(plan, resolver)? else {
         return optimize_select_plan_form(plan, resolver, cache);
-    }
-    // The join limit counts only the tables of the FROM clause, as in SQLite.
-    // When the rewrite moves subquery tables into the join past that limit,
-    // run the subqueries in their correlated form instead.
-    if rewritten.table_references.joined_tables().len() > TableReferences::MAX_JOINED_TABLES {
-        return optimize_select_plan_form(plan, resolver, cache);
-    }
+    };
 
     #[cfg(feature = "simulator")]
     if resolver.subquery_unnesting_mode() == crate::SubqueryUnnestingMode::Forced {
@@ -1080,7 +1095,7 @@ fn optimize_select_plan_with_cache(
         if !rewritten_form_is_emittable(&rewritten) {
             return optimize_select_plan_form(plan, resolver, cache);
         }
-        *plan = rewritten;
+        std::mem::swap(plan, &mut rewritten);
         apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
         return Ok(());
     }
@@ -1094,28 +1109,55 @@ fn optimize_select_plan_with_cache(
     let cost_limit = plan.estimated_cost.map(Cost);
     let rewritten_table_plan =
         find_select_plan_form(&mut rewritten, resolver, cache, false, cost_limit)?;
-    // A form that returns no rows costs nothing, so it would always win the
-    // comparison below. Check that it can be emitted before comparing costs.
-    let use_rewritten = rewritten_form_is_emittable(&rewritten)
-        && matches!(
-            (plan.estimated_cost, rewritten.estimated_cost),
-            (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
-        );
-    tracing::debug!(
-        original_cost = plan.estimated_cost,
-        rewritten_cost = rewritten.estimated_cost,
-        use_rewritten,
-        "correlated-subquery form cost comparison"
-    );
-    if use_rewritten {
+    if use_unnested_form(plan, &rewritten) {
         // Equal work is better without one subquery call per outer row.
-        *plan = rewritten;
+        std::mem::swap(plan, &mut rewritten);
         apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
     } else {
         apply_select_table_plan(plan, original_table_plan, resolver)?;
     }
 
     Ok(())
+}
+
+/// Returns a copy of a query in which correlated subqueries are joins, or
+/// `None` if the rewrite does not apply.
+#[inline(never)]
+fn unnested_select_plan_form(
+    plan: &SelectPlan,
+    resolver: &Resolver,
+) -> Result<Option<Box<SelectPlan>>> {
+    let mut rewritten = Box::new(plan.clone());
+    if !unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)? {
+        return Ok(None);
+    }
+    // The join limit counts only the tables of the FROM clause, as in SQLite.
+    // When the rewrite moves subquery tables into the join past that limit,
+    // run the subqueries in their correlated form instead.
+    if rewritten.table_references.joined_tables().len() > TableReferences::MAX_JOINED_TABLES {
+        return Ok(None);
+    }
+    Ok(Some(rewritten))
+}
+
+/// Whether the form of a query in which correlated subqueries are joins costs
+/// no more than the original form, and can be emitted.
+#[inline(never)]
+fn use_unnested_form(original: &SelectPlan, rewritten: &SelectPlan) -> bool {
+    // A form that returns no rows costs nothing, so it would always win the
+    // comparison below. Check that it can be emitted before comparing costs.
+    let use_rewritten = rewritten_form_is_emittable(rewritten)
+        && matches!(
+            (original.estimated_cost, rewritten.estimated_cost),
+            (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
+        );
+    tracing::debug!(
+        original_cost = original.estimated_cost,
+        rewritten_cost = rewritten.estimated_cost,
+        use_rewritten,
+        "correlated-subquery form cost comparison"
+    );
+    use_rewritten
 }
 
 /// Choose table reads for one version of a query.
@@ -1189,18 +1231,27 @@ fn distinct_is_redundant(plan: &SelectPlan, resolver: &Resolver) -> Result<bool>
 }
 
 /// Find the table reads for one version of a query.
+///
+/// This function is on the stack one time for each level of nested subqueries.
+/// The work before and after the optimization of the FROM clause subqueries is
+/// in functions that are not inlined, so that their values are not in this
+/// frame while the subqueries are optimized.
 fn find_select_plan_form(
     plan: &mut SelectPlan,
     resolver: &Resolver,
     cache: &mut SubqueryPlanCache,
     save_subquery_plans: bool,
     cost_limit: Option<Cost>,
-) -> Result<Option<TableAccessPlan>> {
-    let schema = resolver.schema();
-    #[cfg(feature = "optimizer_params")]
-    let params: &cost_params::CostModelParams = &cost_params::LOADED_PARAMS;
-    #[cfg(not(feature = "optimizer_params"))]
-    let params: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
+) -> Result<Option<Box<TableAccessPlan>>> {
+    simplify_select_plan_form(plan, resolver)?;
+    optimize_subqueries(plan, resolver, cache, save_subquery_plans)?;
+    choose_select_table_plan(plan, resolver, cache, save_subquery_plans, cost_limit)
+}
+
+/// Resets the estimates of one version of a query, and makes the changes that
+/// come before the optimization of its FROM clause subqueries.
+#[inline(never)]
+fn simplify_select_plan_form(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
     plan.estimated_output_rows = None;
     plan.estimated_cost = None;
 
@@ -1235,7 +1286,25 @@ fn find_select_plan_form(
             }
         }
     }
-    optimize_subqueries(plan, resolver, cache, save_subquery_plans)?;
+    Ok(())
+}
+
+/// Chooses the table reads for one version of a query after its FROM clause
+/// subqueries are optimized, plans its correlated subqueries, and sets its
+/// estimates.
+#[inline(never)]
+fn choose_select_table_plan(
+    plan: &mut SelectPlan,
+    resolver: &Resolver,
+    cache: &mut SubqueryPlanCache,
+    save_subquery_plans: bool,
+    cost_limit: Option<Cost>,
+) -> Result<Option<Box<TableAccessPlan>>> {
+    let schema = resolver.schema();
+    #[cfg(feature = "optimizer_params")]
+    let params: &cost_params::CostModelParams = &cost_params::LOADED_PARAMS;
+    #[cfg(not(feature = "optimizer_params"))]
+    let params: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
     let available_indexes =
         AvailableIndexes::for_table_references(resolver, &plan.table_references);
     rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
@@ -1380,7 +1449,7 @@ fn find_select_plan_form(
         }
     }
 
-    Ok(table_plan)
+    Ok(table_plan.map(Box::new))
 }
 
 fn required_group_sort_and_read_cost(
@@ -1404,10 +1473,13 @@ fn required_group_sort_and_read_cost(
     estimate_sort_cpu_cost(rows, params) + estimate_scan_cost(rows, 1.0, params)
 }
 
-/// Write the winning table plan into one version of a query.
+/// Write the winning table plan into one version of a query. This function is
+/// not inlined, so that its values are not in the frames of the functions that
+/// optimize nested subqueries.
+#[inline(never)]
 fn apply_select_table_plan(
     plan: &mut SelectPlan,
-    table_plan: Option<TableAccessPlan>,
+    table_plan: Option<Box<TableAccessPlan>>,
     resolver: &Resolver,
 ) -> Result<()> {
     let Some(table_plan) = table_plan else {
@@ -1421,7 +1493,7 @@ fn apply_select_table_plan(
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut plan.group_by,
-        table_plan,
+        *table_plan,
     )?;
     keep_distinct_on_if_order_by_was_removed(plan, distinct_on_order_by);
     Ok(())
@@ -1859,6 +1931,7 @@ fn build_update_write_set_plan(
         alias: None,
         implicit_column_name: None,
         contains_aggregates: false,
+        values_condition_type: None,
     });
 
     let join_order = default_join_order(&write_set_tables);
@@ -1962,6 +2035,7 @@ fn update_from_set_result_columns(set_clauses: &[UpdateSetClause]) -> Vec<Result
             alias: Some(update_from_scratch_col_name(idx)),
             implicit_column_name: None,
             contains_aggregates: false,
+            values_condition_type: None,
         })
         .collect()
 }
@@ -4350,9 +4424,12 @@ impl Optimizable for ast::Expr {
                 }
                 ast::Literal::String(s) => {
                     // Use Numeric::from to match SQLite's string-to-numeric conversion,
-                    // which extracts leading numeric prefixes (e.g., '9S' -> 9, 'abc' -> 0)
-                    let without_quotes = s.trim_matches('\'');
-                    let numeric = Numeric::from(without_quotes);
+                    // which extracts leading numeric prefixes (e.g., '9S' -> 9, 'abc' -> 0).
+                    // `s` is the quoted source text, so convert the value of the literal:
+                    // in '''1' the value is `'1`, which has no numeric prefix. Trimming
+                    // every quote from both ends would read it as 1.
+                    let value = crate::translate::expr::sanitize_string(s);
+                    let numeric = Numeric::from(value.as_str());
                     match numeric.to_bool() {
                         true => Ok(Some(AlwaysTrueOrFalse::AlwaysTrue)),
                         false => Ok(Some(AlwaysTrueOrFalse::AlwaysFalse)),

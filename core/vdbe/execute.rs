@@ -1346,12 +1346,11 @@ pub fn op_open_read(
             // This is a materialized view with storage
             // Create btree cursor for reading the persistent data
 
-            let btree_cursor = BTreeCursor::new_table(
+            let btree_cursor = BTreeCursor::new_table_boxed(
                 pager.clone(),
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 num_columns,
-            )
-            .into_boxed();
+            );
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
 
             // The cursor observes the transaction-wide change-log generation
@@ -1376,20 +1375,18 @@ pub fn op_open_read(
                 .into());
             }
             let btree_cursor: Box<BTreeCursor> = if table.has_rowid {
-                BTreeCursor::new_table(
+                BTreeCursor::new_table_boxed(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                     num_columns,
                 )
-                .into_boxed()
             } else {
-                BTreeCursor::new_without_rowid_table(
+                BTreeCursor::new_without_rowid_table_boxed(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                     table.as_ref(),
                     num_columns,
                 )
-                .into_boxed()
             };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
@@ -13871,21 +13868,21 @@ pub fn op_open_write(
             let btree_cursor: Box<BTreeCursor> = match cursor_type {
                 CursorType::BTreeTable(table_rc) if !table_rc.has_rowid => {
                     btree_cursor_with_yield_context(
-                        Box::new(BTreeCursor::new_without_rowid_table(
+                        BTreeCursor::new_without_rowid_table_boxed(
                             pager,
                             maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                             table_rc.as_ref(),
                             num_columns,
-                        )),
+                        ),
                         connection,
                     )
                 }
                 _ => btree_cursor_with_yield_context(
-                    Box::new(BTreeCursor::new_table(
+                    BTreeCursor::new_table_boxed(
                         pager,
                         maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                         num_columns,
-                    )),
+                    ),
                     connection,
                 ),
             };
@@ -16429,16 +16426,16 @@ pub fn op_open_ephemeral(
             };
 
             let cursor = if let CursorType::BTreeIndex(index) = cursor_type {
-                BTreeCursor::new_index(pager.clone(), root_page, index, num_columns)
+                BTreeCursor::new_index_boxed(pager.clone(), root_page, index, num_columns)
             } else {
-                Ok(BTreeCursor::new_table(
+                Ok(BTreeCursor::new_table_boxed(
                     pager.clone(),
                     root_page,
                     num_columns,
                 ))
             }?;
             *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::Rewind {
-                cursor: Box::new(cursor),
+                cursor,
                 temp_file: temp_file.take(),
             };
         }
@@ -16550,18 +16547,18 @@ pub fn op_open_dup(
                 .into());
             }
             let cursor: Box<BTreeCursor> = if table.has_rowid {
-                Box::new(BTreeCursor::new_table(
+                BTreeCursor::new_table_boxed(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                     table.columns().len(),
-                ))
+                )
             } else {
-                Box::new(BTreeCursor::new_without_rowid_table(
+                BTreeCursor::new_without_rowid_table_boxed(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                     table.as_ref(),
                     table.columns().len(),
-                ))
+                )
             };
             let cursor = if !is_ephemeral {
                 if let Some(tx_id) = connection.get_mv_tx_id() {

@@ -43,7 +43,7 @@ use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
 use crate::ast::TableInternalId;
 
 use super::emitter::OperationMode;
-use super::expr::expr_type::{compound_column_type, type_of, type_ordering, ExprType};
+use super::expr::expr_type::{query_column_type, type_ordering, ExprType};
 
 /// Infer the affinity of a subquery result column from its expression.
 ///
@@ -250,6 +250,9 @@ pub struct ResultSetColumn {
     pub implicit_column_name: Option<String>,
     // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
     pub contains_aggregates: bool,
+    /// The type of this column of a VALUES list, when it is the schema's type
+    /// for conditions. `expr` is only a placeholder in a VALUES list.
+    pub(crate) values_condition_type: Option<ExprType>,
 }
 
 impl ResultSetColumn {
@@ -1790,6 +1793,7 @@ fn star_result_column(
         implicit_column_name: None,
         expr,
         contains_aggregates: false,
+        values_condition_type: None,
     }
 }
 
@@ -3652,7 +3656,6 @@ pub(super) fn query_output_columns(
         .try_collect::<alloc::Vec<_>>()?;
 
     let context = ExprContext::new(Some(table_references), resolver);
-    let env = context.type_env();
     let mut column_types = alloc::Vec::try_with_capacity_ext(columns.len())?;
     for (column_index, column) in columns.iter_mut().enumerate() {
         let result_expr = &result_columns[column_index].expr;
@@ -3660,10 +3663,12 @@ pub(super) fn query_output_columns(
         // text collation of the leftmost SELECT only, as in SQLite. The
         // compound itself removes duplicates with the collation of
         // `compound_column_collation`, which looks at every SELECT.
-        let result_type = match &compound_arms {
-            Some(arms) => compound_column_type(arms.iter().copied(), column_index, resolver),
-            None => type_of(result_expr, &env),
-        };
+        let mut result_type = query_column_type(plan, column_index, resolver);
+        let is_values_list = matches!(plan, Plan::Select(select) if !select.values.is_empty());
+        // A subquery hands its arrays to the outer query as text, which an array-typed column can't read.
+        if is_values_list && result_type.is_array() {
+            result_type = ExprType::Unknown;
+        }
         let text_collation = expr_text_collation(result_expr, &context, context.catalog())?;
         let dimensions = result_type.array_dimensions();
         if dimensions > ast::MAX_ARRAY_DIMENSIONS {

@@ -3,13 +3,14 @@ mod sqlite_schema_rows;
 
 pub use sqlite_schema_rows::SqliteCatalog;
 pub(crate) use sqlite_schema_rows::{
-    alloc_sqlite_schema_cursor, emit_create_internal_table, emit_delete_sequence_backing_table_row,
+    alloc_sqlite_schema_cursor, emit_delete_sequence_backing_table_row,
     emit_open_sqlite_schema_cursor, emit_schema_entry, open_sqlite_schema_for_write,
     SchemaEntryType,
 };
 
 use crate::dialect::{
-    AutomaticIndex, CatalogCmd, CmdContext, CreateTable, CreateVirtualTable, DropTable, TableText,
+    AutomaticIndex, CatalogCmd, CmdContext, CreateSchema, CreateTable, CreateType,
+    CreateVirtualTable, DropSchema, DropTable, DropType, TableText,
 };
 use crate::sync::Arc;
 use crate::HashMap;
@@ -23,8 +24,7 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
     BTreeTable, ColDef, Column, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
-    TypeDefKind, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME,
-    TURSO_TYPES_TABLE_NAME,
+    TypeDefKind, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -33,7 +33,7 @@ use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{prepare_cdc_if_necessary, Resolver};
 use crate::translate::expr::expr_type::{
     base_value_type, decode_type, first_and_third_arguments, iif_values, query_column_type,
-    value_type, ExprType,
+    value_type, BuiltinType, ExprType,
 };
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
@@ -454,7 +454,9 @@ fn resolve_func_return_type(
     // after DECODE. Its type is not declared, so the result's type is unknown.
     let first_argument = || args.first().map(|arg| type_of(arg)).transpose();
     match func.result_type() {
-        ResultType::Declared(ReturnType::Integer) => Ok(CheckExprType::Integer),
+        ResultType::Declared(ReturnType::Integer | ReturnType::Boolean) => {
+            Ok(CheckExprType::Integer)
+        }
         ResultType::Declared(ReturnType::Real) => Ok(CheckExprType::Real),
         ResultType::Declared(ReturnType::Text) => Ok(CheckExprType::Text),
         ResultType::Declared(ReturnType::Blob) => Ok(CheckExprType::Blob),
@@ -1061,6 +1063,13 @@ fn check_ctas_column_types(
             {
                 dialect.check_ctas_column_type(name, Some(&type_def.name))?
             }
+            ExprType::Builtin(BuiltinType::Boolean) => {
+                if let Some(type_def) = resolver.schema().type_of_conditions() {
+                    if type_def.changes_stored_value() {
+                        dialect.check_ctas_column_type(name, Some(&type_def.name))?
+                    }
+                }
+            }
             // An expression that cannot be typed here, such as DEFAULT, could
             // be a custom type.
             ExprType::NotKnownYet => dialect.check_ctas_column_type(name, None)?,
@@ -1596,6 +1605,29 @@ pub fn translate_create_table(
         }
     }
 
+    // For CTAS, fill the new table from the SELECT before the in-memory
+    // schema changes, as SQLite does. The SELECT can fail, and a statement
+    // rollback undoes only the pages: it does not undo SetCookie and
+    // ParseSchema in the in-memory schema.
+    if let Some(info) = ctas_info {
+        let col_count = match &body {
+            ast::CreateTableBody::ColumnsAndConstraints { columns, .. } => columns.len(),
+            _ => unreachable!("CTAS body was converted to ColumnsAndConstraints above"),
+        };
+        emit_ctas_insert(
+            program,
+            resolver,
+            info.plan,
+            &info.stores_values_unchanged,
+            &body,
+            table_root_reg,
+            col_count,
+            database_id,
+            &normalized_tbl_name,
+            connection,
+        )?;
+    }
+
     program.preassign_label_to_next_insn(parse_schema_label);
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
@@ -1628,26 +1660,6 @@ pub fn translate_create_table(
         trigger_target_database_id: None,
     });
 
-    // For CTAS, emit bytecode to populate the new table from the SELECT
-    if let Some(info) = ctas_info {
-        let col_count = match &body {
-            ast::CreateTableBody::ColumnsAndConstraints { columns, .. } => columns.len(),
-            _ => unreachable!("CTAS body was converted to ColumnsAndConstraints above"),
-        };
-        emit_ctas_insert(
-            program,
-            resolver,
-            info.plan,
-            &info.stores_values_unchanged,
-            &body,
-            table_root_reg,
-            col_count,
-            database_id,
-            &normalized_tbl_name,
-            connection,
-        )?;
-    }
-
     Ok(())
 }
 
@@ -1657,6 +1669,7 @@ pub fn translate_create_table(
 pub fn translate_create_schema(
     name: &ast::Name,
     resolver: &Resolver,
+    connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     if !resolver.catalog.dialect.supports_namespaces() {
@@ -1674,8 +1687,15 @@ pub fn translate_create_schema(
     let schema_version = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
     program.begin_write_on_database(MAIN_DB_ID, schema_version)?;
 
-    let cursor_id = open_namespaces_table_for_writing(program, resolver)?;
-    emit_namespace_row(program, cursor_id, id, &normalized_name);
+    let cmd_context = CmdContext::new(connection, resolver, MAIN_DB_ID);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::CreateSchema(CreateSchema {
+            id,
+            name: &normalized_name,
+        }),
+    )?;
     program.emit_insn(Insn::AddNamespace {
         db: MAIN_DB_ID,
         namespace: id,
@@ -1696,6 +1716,7 @@ pub fn translate_create_schema(
 pub fn translate_drop_schema(
     name: &ast::Name,
     resolver: &Resolver,
+    connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     if !resolver.catalog.dialect.supports_namespaces() {
@@ -1708,38 +1729,15 @@ pub fn translate_drop_schema(
     let schema_version = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
     program.begin_write_on_database(MAIN_DB_ID, schema_version)?;
 
-    let cursor_id = open_namespaces_table_for_writing(program, resolver)?;
-    let id_reg = program.alloc_register();
-    program.emit_insn(Insn::Integer {
-        dest: id_reg,
-        value: i64::from(id.as_u32()),
-    });
-    let missing_row_label = program.allocate_label();
-    let delete_done_label = program.allocate_label();
-    program.emit_insn(Insn::NotExists {
-        cursor: cursor_id,
-        rowid_reg: id_reg,
-        target_pc: missing_row_label,
-    });
-    program.emit_insn(Insn::Delete {
-        cursor_id,
-        table_name: TURSO_NAMESPACES_TABLE_NAME.to_string(),
-        is_part_of_update: false,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: delete_done_label,
-    });
-    program.preassign_label_to_next_insn(missing_row_label);
-    program.emit_insn(Insn::Halt {
-        constraint_info: None,
-        err_code: crate::error::SQLITE_ERROR,
-        description: format!(
-            "{TURSO_NAMESPACES_TABLE_NAME} has no row for namespace {normalized_name}"
-        ),
-        on_error: None,
-        description_reg: None,
-    });
-    program.preassign_label_to_next_insn(delete_done_label);
+    let cmd_context = CmdContext::new(connection, resolver, MAIN_DB_ID);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::DropSchema(DropSchema {
+            id,
+            name: &normalized_name,
+        }),
+    )?;
 
     program.emit_insn(Insn::DropNamespace {
         db: MAIN_DB_ID,
@@ -1752,104 +1750,6 @@ pub fn translate_drop_schema(
         p5: 0,
     });
     Ok(())
-}
-
-/// Opens the namespaces table of the main database for writing. A database
-/// that has never created or dropped a namespace has no namespaces table
-/// yet, so it is created first with a row for each namespace the database
-/// has, which are its default namespaces.
-fn open_namespaces_table_for_writing(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-) -> Result<usize> {
-    let existing = resolver.with_schema(MAIN_DB_ID, |s| {
-        s.get_btree_table(NamespaceId::ROOT, TURSO_NAMESPACES_TABLE_NAME)
-    });
-    let created = existing.is_none();
-    let (table, root_page) = match existing {
-        Some(table) => {
-            let root_page = RegisterOrLiteral::Literal(table.root_page);
-            (table, root_page)
-        }
-        None => {
-            let created = emit_create_internal_table(
-                program,
-                resolver,
-                TURSO_NAMESPACES_TABLE_NAME,
-                &format!(
-                    "CREATE TABLE {TURSO_NAMESPACES_TABLE_NAME}(id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
-                ),
-            )?;
-            (created.table, created.root_page)
-        }
-    };
-    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id,
-        root_page,
-        db: MAIN_DB_ID,
-    });
-    if created {
-        let namespaces = resolver.with_schema(MAIN_DB_ID, |s| {
-            s.namespaces()
-                .map(|(id, name)| (id, name.to_string()))
-                .collect::<Vec<_>>()
-        });
-        for (id, name) in namespaces {
-            emit_namespace_row(program, cursor_id, id, &name);
-        }
-    }
-    Ok(cursor_id)
-}
-
-/// Inserts the row of namespace `id` called `name` into the namespaces
-/// table open at `cursor_id`, failing if the table has a row with that id.
-fn emit_namespace_row(program: &mut ProgramBuilder, cursor_id: usize, id: NamespaceId, name: &str) {
-    let id_reg = program.alloc_register();
-    program.emit_insn(Insn::Integer {
-        dest: id_reg,
-        value: i64::from(id.as_u32()),
-    });
-    let insert_label = program.allocate_label();
-    program.emit_insn(Insn::NotExists {
-        cursor: cursor_id,
-        rowid_reg: id_reg,
-        target_pc: insert_label,
-    });
-    program.emit_insn(Insn::Halt {
-        constraint_info: None,
-        err_code: crate::error::SQLITE_CONSTRAINT_PRIMARYKEY,
-        description: format!("UNIQUE constraint failed: {TURSO_NAMESPACES_TABLE_NAME}.id"),
-        on_error: None,
-        description_reg: None,
-    });
-    program.preassign_label_to_next_insn(insert_label);
-    // The id is the rowid, so the record keeps NULL for it, as SQLite does
-    // for an INTEGER PRIMARY KEY column.
-    let record_start_reg = program.alloc_registers(2);
-    program.emit_insn(Insn::Null {
-        dest: record_start_reg,
-        dest_end: None,
-    });
-    program.emit_insn(Insn::String8 {
-        value: name.to_string(),
-        dest: record_start_reg + 1,
-    });
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(record_start_reg),
-        count: to_u32(2),
-        dest_reg: to_u32(record_reg),
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: cursor_id,
-        key_reg: id_reg,
-        record_reg,
-        flag: InsertFlags::new(),
-        table_name: TURSO_NAMESPACES_TABLE_NAME.to_string(),
-    });
 }
 
 pub const SQLITE_TABLEID: &str = "sqlite_schema";
@@ -2789,67 +2689,31 @@ fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &CatalogContext) -
     Ok(())
 }
 
-/// Shared persistence logic for CREATE TYPE / CREATE DOMAIN.
-/// Persists the type SQL into __turso_internal_types and registers it in memory.
+/// Stores a new type or domain through the catalog and adds it to the
+/// schema of the connection.
 fn persist_type_definition(
     normalized_name: String,
     sql: String,
     resolver: &Resolver,
+    connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    // Ensure sqlite_turso_types table exists (lazy creation)
-    let types_table: Arc<BTreeTable>;
-    let types_root_page: RegisterOrLiteral<i64>;
-    let existing_types_table = resolver
+    // The catalog creates the types table when the database has none, and
+    // creating it sets the schema cookie.
+    let types_table_exists = resolver
         .schema()
-        .get_btree_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME);
-    let creating_types_table = existing_types_table.is_none();
+        .get_btree_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME)
+        .is_some();
 
-    if let Some(existing) = existing_types_table {
-        types_table = existing.clone();
-        types_root_page = RegisterOrLiteral::Literal(existing.root_page);
-    } else {
-        let created = emit_create_internal_table(
-            program,
-            resolver,
-            TURSO_TYPES_TABLE_NAME,
-            &format!("CREATE TABLE {TURSO_TYPES_TABLE_NAME}(name TEXT PRIMARY KEY, sql TEXT)"),
-        )?;
-        (types_table, types_root_page) = (created.table, created.root_page);
-    }
-
-    // Open sqlite_turso_types for writing
-    let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: types_cursor_id,
-        root_page: types_root_page,
-        db: MAIN_DB_ID,
-    });
-
-    // Insert (name, sql) record
-    let rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: types_cursor_id,
-        rowid_reg,
-        prev_largest_reg: 0,
-    });
-    let name_reg = program.emit_string8_new_reg(normalized_name);
-    program.emit_string8_new_reg(sql.clone());
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(name_reg),
-        count: to_u32(2),
-        dest_reg: to_u32(record_reg),
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: types_cursor_id,
-        key_reg: rowid_reg,
-        record_reg,
-        flag: InsertFlags::new(),
-        table_name: TURSO_TYPES_TABLE_NAME.to_string(),
-    });
+    let cmd_context = CmdContext::new(connection, resolver, MAIN_DB_ID);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::CreateType(CreateType {
+            name: &normalized_name,
+            sql: &sql,
+        }),
+    )?;
 
     // Add the type to the in-memory registry
     program.emit_insn(Insn::AddType {
@@ -2857,7 +2721,7 @@ fn persist_type_definition(
         sql,
     });
 
-    if !creating_types_table {
+    if types_table_exists {
         // Only when this path emitted no cookie above. `AddType` registers the type in the
         // connection schema but allocates nothing, so its failure needs no restore and a cookie
         // emitted before it only leaves the connection and the database out of step: inside an
@@ -2915,6 +2779,7 @@ pub fn translate_create_type(
     body: &ast::CreateTypeBody,
     if_not_exists: bool,
     resolver: &Resolver,
+    connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let normalized_name = normalize_ident(type_name);
@@ -2975,7 +2840,7 @@ pub fn translate_create_type(
     // Build canonical SQL (without IF NOT EXISTS) for persistence
     let sql = build_create_type_sql(&normalized_name, body);
 
-    persist_type_definition(normalized_name, sql, resolver, program)
+    persist_type_definition(normalized_name, sql, resolver, connection, program)
 }
 
 /// Refuse a DECODE when the kind of value it returns can't be worked out:
@@ -3114,6 +2979,7 @@ pub fn translate_create_domain(
     default: Option<Box<ast::Expr>>,
     if_not_exists: bool,
     resolver: &Resolver,
+    connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let normalized_name = normalize_ident(domain_name);
@@ -3200,7 +3066,7 @@ pub fn translate_create_domain(
         s
     };
 
-    persist_type_definition(normalized_name, sql, resolver, program)
+    persist_type_definition(normalized_name, sql, resolver, connection, program)
 }
 
 /// Refuse a new type or domain whose name an existing type or stored
@@ -3230,6 +3096,7 @@ pub fn translate_drop_type(
     if_exists: bool,
     is_domain_drop: bool,
     resolver: &Resolver,
+    connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let normalized_name = normalize_ident(type_name);
@@ -3275,66 +3142,14 @@ pub fn translate_drop_type(
         bail_parse_error!("cannot drop type {normalized_name}: type {name} depends on it");
     }
 
-    // Open cursor to sqlite_turso_types table
-    let types_table = resolver
-        .schema()
-        .get_btree_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME)
-        .ok_or_else(|| crate::LimboError::ParseError(format!("no such type: {normalized_name}")))?;
-    let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: types_cursor_id,
-        root_page: types_table.root_page.into(),
-        db: MAIN_DB_ID,
-    });
-
-    // Search for matching row: name=type_name (col 0)
-    let name_reg = program.alloc_register();
-    program.emit_insn(Insn::String8 {
-        dest: name_reg,
-        value: normalized_name.clone(),
-    });
-
-    let end_loop_label = program.allocate_label();
-    let loop_start_label = program.allocate_label();
-
-    program.emit_insn(Insn::Rewind {
-        cursor_id: types_cursor_id,
-        pc_if_empty: end_loop_label,
-    });
-    program.preassign_label_to_next_insn(loop_start_label);
-
-    // Read name (col 0)
-    let col0_reg = program.alloc_register();
-    program.emit_column_or_rowid(types_cursor_id, 0, col0_reg);
-
-    let skip_delete_label = program.allocate_label();
-
-    // Check name=type_name
-    program.emit_insn(Insn::Ne {
-        lhs: col0_reg,
-        rhs: name_reg,
-        target_pc: skip_delete_label,
-        flags: CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
-    });
-
-    // Delete matching row
-    program.emit_insn(Insn::Delete {
-        cursor_id: types_cursor_id,
-        table_name: TURSO_TYPES_TABLE_NAME.to_string(),
-        is_part_of_update: false,
-    });
-
-    program.preassign_label_to_next_insn(skip_delete_label);
-
-    program.emit_insn(Insn::Next {
-        cursor_id: types_cursor_id,
-        pc_if_next: loop_start_label,
-        fullscan: false,
-        is_index: false,
-    });
-
-    program.preassign_label_to_next_insn(end_loop_label);
+    let cmd_context = CmdContext::new(connection, resolver, MAIN_DB_ID);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::DropType(DropType {
+            name: &normalized_name,
+        }),
+    )?;
 
     // Remove from in-memory schema
     program.emit_insn(Insn::DropType {
@@ -3436,6 +3251,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
         accepts_collate: _,
         range_offsets: _,
         stored_form_sorts_in_value_order: _,
+        is_type_of_conditions: _,
         casts_to_numbers_and_booleans: _,
         sql: _,
         domain_checks,

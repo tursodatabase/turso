@@ -81,3 +81,16 @@ expect @tursopg {
 
 
 }
+
+# An array stores a boolean as the integer 1 or 0 and prints it so. An array
+# of conditions is described as integer[].
+@compat-gap "type:_bool"
+test boolean-array-prints-t-and-f {
+    SELECT ARRAY[true, false], ARRAY[1 < 2];
+}
+expect {
+    {t,f}|{t}
+}
+expect @tursopg {
+    {1,0}|{1}
+}

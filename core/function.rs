@@ -1286,8 +1286,6 @@ impl ScalarFunc {
             Self::Changes
             | Self::TotalChanges
             | Self::LastInsertRowid
-            | Self::Glob
-            | Self::Like
             | Self::Instr
             | Self::Random
             | Self::Length
@@ -1304,13 +1302,15 @@ impl ScalarFunc {
             | Self::BooleanToInt
             | Self::DateDiff
             | Self::ArrayLength
-            | Self::ArrayContains
             | Self::ArrayPosition
-            | Self::ArrayOverlap
-            | Self::ArrayContainsAll
             | Self::NextVal
             | Self::CurrVal
             | Self::SetVal => ResultType::Declared(ReturnType::Integer),
+            Self::Glob
+            | Self::Like
+            | Self::ArrayContains
+            | Self::ArrayOverlap
+            | Self::ArrayContainsAll => ResultType::Declared(ReturnType::Boolean),
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => ResultType::Declared(ReturnType::Integer),
             Self::JulianDay => ResultType::Declared(ReturnType::Real),
@@ -2051,6 +2051,9 @@ impl Deterministic for Func {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReturnType {
     Integer,
+    /// 1 or 0: the function answers a condition, as `like` and
+    /// `array_contains` do. See `BuiltinType::Boolean`.
+    Boolean,
     Real,
     Text,
     Blob,

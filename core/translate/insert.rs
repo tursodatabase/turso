@@ -608,32 +608,13 @@ pub fn translate_insert(
 
     let has_user_provided_rowid = ctx.table.has_rowid && insertion.key.is_provided_by_user();
 
-    // For non-STRICT tables, apply column affinity to the values early.
-    // This must happen before BEFORE triggers (matching SQLite's order) so that
-    // trigger bodies see affinity-applied values. Affinity is idempotent, so
-    // applying it here means we can skip the per-trigger Copy+Affinity in fire_trigger.
-    if !ctx.table.is_strict {
-        let affinity = insertion
-            .col_mappings
-            .iter()
-            .filter(|cm| !cm.column.is_virtual_generated())
-            .map(|col_mapping| col_mapping.column.affinity());
-
-        // Only emit Affinity if there's meaningful affinity to apply
-        // (i.e., not all BLOB/NONE affinity)
-        if affinity.clone().any(|a| a != Affinity::Blob) {
-            if let Ok(count) = NonZeroUsize::try_from(insertion.num_non_virtual_cols) {
-                program.emit_insn(Insn::Affinity {
-                    start_reg: insertion.first_col_register(),
-                    count,
-                    affinities: affinity.map(|a| a.aff_mask()).collect(),
-                });
-            }
-        }
-    }
-
-    // Fire BEFORE INSERT triggers
-
+    // The row is now in the registers of `insertion`, as the source gave it. The rest follows
+    // the order of sqlite3Insert:
+    //   1. BEFORE triggers, which see a converted copy of the row
+    //   2. rowid: NewRowid or MustBeInt
+    //   3. NOT NULL, conversion to the column types, generated columns
+    //   4. CHECK, uniqueness, foreign keys
+    //   5. MakeRecord, Insert, AFTER triggers
     let relevant_before_triggers = get_triggers_including_temp(
         resolver,
         namespace,
@@ -643,75 +624,15 @@ pub fn translate_insert(
         &btree_table,
         connection,
     );
-
-    // The inserted values are the user's values until ENCODE runs below.
-    let dml_ctx = DmlColumnContext::from_column_reg_mapping(
-        insertion.col_mappings.iter().map(|cm| {
-            (
-                cm.column,
-                if cm.column.is_rowid_alias() {
-                    insertion.key_register()
-                } else {
-                    cm.register
-                },
-            )
-        }),
-        DmlRowForm::UserFacing,
-    );
-
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
-        compute_generated_columns(
+        let new_registers = emit_new_row_for_before_triggers(
             program,
-            &ctx.table.columns_topo_sort()?,
-            &dml_ctx,
             resolver,
+            &insertion,
             &btree_table,
+            has_user_provided_rowid,
         )?;
-
-        // In SQLite, NEW.<rowid_alias> returns -1 in BEFORE INSERT triggers when the rowid
-        // hasn't been assigned yet (i.e., it's NULL). We need to temporarily set the key
-        // register to -1 so the trigger sees the correct value.
-        let saved_key_reg = if has_user_provided_rowid {
-            // User provided a value that might be NULL. Save original value, replace NULL with -1.
-            let save_reg = program.alloc_register();
-            program.emit_insn(Insn::Copy {
-                src_reg: insertion.key_register(),
-                dst_reg: save_reg,
-                extra_amount: 0,
-            });
-            let skip_label = program.allocate_label();
-            program.emit_insn(Insn::NotNull {
-                reg: insertion.key_register(),
-                target_pc: skip_label,
-            });
-            program.emit_insn(Insn::Integer {
-                value: -1,
-                dest: insertion.key_register(),
-            });
-            program.preassign_label_to_next_insn(skip_label);
-            Some(save_reg)
-        } else {
-            // Key is auto-generated, register is uninitialized. Set to -1.
-            program.emit_insn(Insn::Integer {
-                value: -1,
-                dest: insertion.key_register(),
-            });
-            None
-        };
-        // Build NEW registers: for rowid alias columns, use the rowid register; otherwise use column register
-        let new_registers: Vec<usize> = insertion
-            .col_mappings
-            .iter()
-            .map(|col_mapping| {
-                if col_mapping.column.is_rowid_alias() {
-                    insertion.key_register()
-                } else {
-                    col_mapping.register
-                }
-            })
-            .chain(std::iter::once(insertion.key_register()))
-            .collect();
         // Determine the conflict resolution to propagate to triggers:
         // 1. If there's already an override from UPSERT DO UPDATE context, use it (forces ABORT)
         // 2. If the INSERT uses an explicit ON CONFLICT clause, propagate it to
@@ -742,16 +663,22 @@ pub fn translate_insert(
                 ctx.loop_labels.row_done,
             )?;
         }
-        // Restore the original key register value so the post-trigger NotNull check
-        // correctly routes NULL keys to NewRowid generation.
-        if let Some(save_reg) = saved_key_reg {
-            program.emit_insn(Insn::Copy {
-                src_reg: save_reg,
-                dst_reg: insertion.key_register(),
-                extra_amount: 0,
-            });
-        }
     }
+
+    // The inserted values are the user's values until ENCODE runs below.
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(
+        insertion.col_mappings.iter().map(|cm| {
+            (
+                cm.column,
+                if cm.column.is_rowid_alias() {
+                    insertion.key_register()
+                } else {
+                    cm.register
+                },
+            )
+        }),
+        DmlRowForm::UserFacing,
+    );
 
     if has_user_provided_rowid {
         emit_check_for_user_provided_rowid(program, &insertion, &ctx);
@@ -826,10 +753,10 @@ pub fn translate_insert(
     //    2. compute `b`
     //    3. check that `b` isn't null (the NOT NULL constraint)
     //
-    // SQLite checks NOT NULL before the STRICT types, unless the table has generated columns or
-    // BEFORE triggers: then the row is type checked first, before computing the generated
-    // columns or firing the triggers. Columns with a custom type are always checked for NOT NULL
-    // after encoding, because their NOT NULL check looks at the decoded value.
+    // SQLite checks NOT NULL before the STRICT types, unless the table has generated columns:
+    // then the row is type checked first, before computing the generated columns. Columns with
+    // a custom type are always checked for NOT NULL after encoding, because their NOT NULL
+    // check looks at the decoded value.
     //TODO building the type-check table is expensive, we should cache it somehow.
     let maybe_type_check_table = ctx
         .table
@@ -840,27 +767,21 @@ pub fn translate_insert(
             .schema()
             .column_has_custom_type(column, ctx.table.is_strict)
     };
-    let types_checked_first = has_before_triggers || insertion.has_generated_columns();
+    let types_checked_first = insertion.has_generated_columns();
     if !types_checked_first {
         emit_notnulls(program, &ctx, &insertion, resolver, false, |column| {
             !column.is_generated() && !has_custom_type(column)
         })?;
     }
+    emit_column_type_conversion(
+        program,
+        resolver,
+        ctx.table,
+        insertion.first_col_register(),
+        insertion.num_non_virtual_cols,
+    )?;
     if let Some(type_check_table) = &maybe_type_check_table {
         if !program.flags.writes_stored_values() {
-            // Pre-encoding TypeCheck: validate input types match the custom type's declared value type
-            // to catch things like a TEXT value inserted into an INTEGER-based custom type.
-            program.emit_insn(Insn::TypeCheck {
-                start_reg: insertion.first_col_register(),
-                count: insertion.num_non_virtual_cols,
-                check_generated: false,
-                table_reference: BTreeTable::input_type_check_table_ref(
-                    ctx.table,
-                    resolver.schema(),
-                    None,
-                )?,
-            });
-
             // Encode values for columns with custom types.
             emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
         }
@@ -1271,6 +1192,141 @@ pub fn translate_insert(
 
     program.result_columns = result_columns;
     program.table_references.extend(table_references);
+    Ok(())
+}
+
+/// Builds the row that BEFORE INSERT triggers see as NEW, in registers of its own, and returns
+/// the register of each column followed by the register of the rowid.
+fn emit_new_row_for_before_triggers(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    insertion: &Insertion,
+    table: &Arc<BTreeTable>,
+    has_user_provided_rowid: bool,
+) -> Result<Vec<usize>> {
+    let column_count = insertion.col_mappings.len();
+    let new_key_reg = program.alloc_registers(column_count + 1);
+    let new_first_col_reg = new_key_reg + 1;
+
+    if has_user_provided_rowid {
+        program.emit_insn(Insn::Copy {
+            src_reg: insertion.key_register(),
+            dst_reg: new_key_reg,
+            extra_amount: 0,
+        });
+        let key_is_given = program.allocate_label();
+        program.emit_insn(Insn::NotNull {
+            reg: new_key_reg,
+            target_pc: key_is_given,
+        });
+        program.emit_insn(Insn::Integer {
+            value: -1,
+            dest: new_key_reg,
+        });
+        program.preassign_label_to_next_insn(key_is_given);
+        program.emit_insn(Insn::MustBeInt {
+            reg: new_key_reg,
+            target_pc: None,
+        });
+    } else {
+        // The rowid is not generated yet. SQLite shows -1 to the trigger.
+        program.emit_insn(Insn::Integer {
+            value: -1,
+            dest: new_key_reg,
+        });
+    }
+
+    program.emit_insn(Insn::Copy {
+        src_reg: insertion.first_col_register(),
+        dst_reg: new_first_col_reg,
+        extra_amount: insertion.num_non_virtual_cols - 1,
+    });
+    emit_column_type_conversion(
+        program,
+        resolver,
+        table,
+        new_first_col_reg,
+        insertion.num_non_virtual_cols,
+    )?;
+
+    let new_registers: Vec<usize> = insertion
+        .col_mappings
+        .iter()
+        .map(|mapping| {
+            if mapping.column.is_rowid_alias() {
+                new_key_reg
+            } else {
+                new_first_col_reg + (mapping.register - insertion.first_col_register())
+            }
+        })
+        .collect();
+    if insertion.has_generated_columns() {
+        let dml_ctx = DmlColumnContext::from_column_reg_mapping(
+            insertion
+                .col_mappings
+                .iter()
+                .map(|mapping| mapping.column)
+                .zip(new_registers.iter().copied()),
+            DmlRowForm::UserFacing,
+        );
+        compute_generated_columns(
+            program,
+            &table.columns_topo_sort()?,
+            &dml_ctx,
+            resolver,
+            table,
+        )?;
+    }
+
+    Ok(new_registers
+        .into_iter()
+        .chain(std::iter::once(new_key_reg))
+        .collect())
+}
+
+/// Converts the stored columns of a row, in the registers that start at `first_col_reg`, to the
+/// types of their columns: affinity, or the type check of a STRICT table.
+pub(crate) fn emit_column_type_conversion(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table: &Arc<BTreeTable>,
+    first_col_reg: usize,
+    num_non_virtual_cols: usize,
+) -> Result<()> {
+    if table.is_strict {
+        // Stored values are already in the stored form.
+        if !program.flags.writes_stored_values() {
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: first_col_reg,
+                count: num_non_virtual_cols,
+                check_generated: false,
+                table_reference: BTreeTable::input_type_check_table_ref(
+                    table,
+                    resolver.schema(),
+                    None,
+                )?,
+            });
+        }
+        return Ok(());
+    }
+    let affinities = table
+        .columns()
+        .iter()
+        .filter(|column| !column.is_virtual_generated())
+        .map(|column| column.affinity());
+    if affinities
+        .clone()
+        .all(|affinity| affinity == Affinity::Blob)
+    {
+        return Ok(());
+    }
+    if let Ok(count) = NonZeroUsize::try_from(num_non_virtual_cols) {
+        program.emit_insn(Insn::Affinity {
+            start_reg: first_col_reg,
+            count,
+            affinities: affinities.map(|affinity| affinity.aff_mask()).collect(),
+        });
+    }
     Ok(())
 }
 
@@ -2283,7 +2339,11 @@ fn insert_target_column<'a>(
     position: usize,
 ) -> Option<&'a Column> {
     if columns.is_empty() {
-        return table.columns().iter().filter(|c| !c.hidden()).nth(position);
+        return table
+            .columns()
+            .iter()
+            .filter(|c| !c.hidden() && !c.is_generated())
+            .nth(position);
     }
     columns.get(position).and_then(|name| {
         let name = crate::util::normalize_ident(name.as_str());
@@ -2599,44 +2659,12 @@ fn init_source_emission<'a>(
                     });
 
                     let record_reg = program.alloc_register();
-                    let affinity_str = if columns.is_empty() {
-                        ctx.table
-                            .columns()
-                            .iter()
-                            .filter(|col| !col.hidden() && !col.is_generated())
-                            .map(|col| col.affinity().aff_mask())
-                            .collect::<String>()
-                    } else {
-                        columns
-                            .iter()
-                            .map(|col_name| {
-                                let column_name = normalize_ident(col_name.as_str());
-                                if ROWID_STRS
-                                    .iter()
-                                    .any(|s| s.eq_ignore_ascii_case(&column_name))
-                                {
-                                    return Ok(Affinity::Integer.aff_mask());
-                                }
-                                table
-                                    .get_column_by_name(&column_name)
-                                    .map(|(_, col)| col.affinity().aff_mask())
-                                    .ok_or_else(|| {
-                                        crate::error::LimboError::ParseError(format!(
-                                            "table {} has no column named {}",
-                                            table.get_name(),
-                                            column_name
-                                        ))
-                                    })
-                            })
-                            .collect::<Result<String>>()?
-                    };
-
                     program.emit_insn(Insn::MakeRecord {
                         start_reg: to_u32(program.reg_result_cols_start.unwrap_or(yield_reg + 1)),
                         count: to_u32(num_result_cols),
                         dest_reg: to_u32(record_reg),
                         index_name: None,
-                        affinity_str: Some(affinity_str),
+                        affinity_str: None,
                     });
 
                     let rowid_reg = program.alloc_register();

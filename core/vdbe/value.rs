@@ -1635,9 +1635,19 @@ impl Value {
             return Value::Null;
         };
 
+        // SQLite inserts the separator only after at least one byte of an
+        // earlier argument, so an empty leading argument does not start the
+        // result but an empty later one still gets a separator.
         let parts: SmallVec<[Cow<'_, str>; 8]> =
             registers.filter_map(Value::cast_text_ref).collect();
-        Value::build_text(parts.join(&separator))
+        // Everything before the first non-empty argument joins to an empty
+        // string, so joining from that argument on emits the same separators
+        // in one allocation.
+        let first_non_empty = parts
+            .iter()
+            .position(|part| !part.is_empty())
+            .unwrap_or(parts.len());
+        Value::build_text(parts[first_non_empty..].join(&separator))
     }
 
     pub fn exec_char<'a, T: Iterator<Item = &'a Self>>(values: T) -> Self {

@@ -1,6 +1,7 @@
 use crate::functions::validate_pg_input;
 use crate::roles::{connection_roles, schema_roles, Role, RoleCatalog};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::borrow::Cow;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -8,8 +9,8 @@ use turso_core::ast::{self, RefAct, SortOrder};
 use turso_core::schema::RelationKind;
 use turso_core::{
     dialect::{
-        identity_table_sql_marker, split_identity_table_sql_marker, SortTermMatching,
-        POSTGRES_TABLE_SQL_PREFIX,
+        call_builtin_scalar, identity_table_sql_marker, split_identity_table_sql_marker,
+        ScalarFuncContext, SortTermMatching, POSTGRES_TABLE_SQL_PREFIX,
     },
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
@@ -20,7 +21,8 @@ use turso_core::{
     security::policy::RowPolicy,
     security::roles::RoleId,
     text_array_literal, walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError,
-    NamespaceId, NamespaceRef, OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
+    NamespaceId, NamespaceRef, OpenOptions, Register, Result, ScalarFunc, Statement, Value,
+    WalkControl, MAIN_DB_ID,
 };
 use turso_core::{Dependent, DependentObject};
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
@@ -253,6 +255,23 @@ impl Dialect for PostgresDialect {
         turso_core::dialect::resolve_builtin_function(name, arg_count)
     }
 
+    fn call_scalar(
+        &self,
+        context: &ScalarFuncContext<'_>,
+        func: &ScalarFunc,
+        args: &[Register],
+    ) -> Result<Value> {
+        // PostgreSQL joins every argument that is not NULL, so an empty one
+        // keeps its place and its separator: 'concat_ws(",", "", "a")' is
+        // ",a". The shared implementation follows SQLite instead, where the
+        // separator only goes after content, so concat_ws alone needs the
+        // PostgreSQL rule here.
+        if matches!(func, ScalarFunc::ConcatWs) {
+            return Ok(concat_ws_joining_empty_arguments(args));
+        }
+        call_builtin_scalar(context, func, args)
+    }
+
     fn requires_custom_types(&self) -> bool {
         true
     }
@@ -439,6 +458,23 @@ impl Dialect for PostgresDialect {
     fn json_contains_function(&self) -> Option<&'static str> {
         Some("jsonb_contains")
     }
+}
+
+/// `concat_ws(separator, ...)` with PostgreSQL's rule: every argument that is
+/// not NULL takes part in the join, an empty one included, so an empty leading
+/// argument still gets a separator before the argument after it.
+fn concat_ws_joining_empty_arguments(args: &[Register]) -> Value {
+    let Some((separator, arguments)) = args.split_first() else {
+        return Value::Null;
+    };
+    let Some(separator) = separator.get_value().cast_text_ref() else {
+        return Value::Null;
+    };
+    let parts: Vec<Cow<'_, str>> = arguments
+        .iter()
+        .filter_map(|argument| argument.get_value().cast_text_ref())
+        .collect();
+    Value::build_text(parts.join(&separator))
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
