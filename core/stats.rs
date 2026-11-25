@@ -348,18 +348,17 @@ fn load_sqlite_stat1_row(
     if numbers.is_empty() {
         return Ok(());
     }
+    // Match SQLite's analysisLoader: if idx is NULL or does not name an index
+    // on this table, record the first number as the table's row count.
+    let idx_name = idx_name
+        .map(|name| normalize_ident(&name))
+        .filter(|name| schema.get_index(namespace, table_name, name).is_some());
     let Some(idx_name) = idx_name else {
         if let Some(total_rows) = numbers.first().copied() {
             stats.table_stats_mut(namespace, table_name).row_count = Some(total_rows);
         }
         return Ok(());
     };
-
-    // Index-level entry: only keep if the index exists on this table.
-    let idx_name = normalize_ident(&idx_name);
-    if schema.get_index(namespace, table_name, &idx_name).is_none() {
-        return Ok(());
-    }
 
     let total_rows = numbers.first().copied();
     {

@@ -1,3 +1,4 @@
+use asserting::prelude::*;
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::Schema;
 use turso_core::security::roles::SessionRole;
@@ -9,6 +10,9 @@ use turso_core::OpenFlags;
 use turso_core::PlatformIO;
 use turso_core::IO;
 use turso_sqlite::SqliteDialect;
+
+use crate::assertions::AssertQueryPlan;
+use crate::common::limbo_exec_rows;
 
 /// Regression test for #11581: once a database has `sqlite_stat1`, opening
 /// a new connection must not deep-clone the whole schema just to install
@@ -219,11 +223,11 @@ fn reopen_loads_valid_stats_when_stat1_has_null_tbl_row() {
         vec![1]
     );
 
-    let plan = explain_query_plan(&conn, "SELECT * FROM t WHERE a = 1 AND b > 5");
-    assert!(
-        plan.contains("USING INDEX ib"),
-        "expected planner to use selective index ib, got: {plan}"
-    );
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5",
+    ))
+    .uses_index("ib");
 }
 
 /// Regression test for #12397: non-text `tbl` rows that do not match any table
@@ -271,16 +275,15 @@ fn reopen_loads_valid_stats_when_stat1_has_non_text_tbl_rows() {
         vec![1]
     );
 
-    let plan = explain_query_plan(&conn, "SELECT * FROM t WHERE a = 1 AND b > 5");
-    assert!(
-        plan.contains("USING INDEX ib"),
-        "expected planner to use selective index ib, got: {plan}"
-    );
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5",
+    ))
+    .uses_index("ib");
 }
 
 /// Regression test for #12397: non-text `tbl`, `idx`, and `stat` values in
-/// `sqlite_stat1` are coerced to text on reopen (like SQLite's analysisLoader),
-/// and an unmatched non-text `idx` does not overwrite the table row count.
+/// `sqlite_stat1` are coerced to text on reopen (like SQLite's analysisLoader).
 #[test]
 fn reopen_coerces_non_text_stat1_columns_to_text() {
     let dir = tempfile::tempdir().unwrap();
@@ -305,7 +308,6 @@ fn reopen_coerces_non_text_stat1_columns_to_text() {
                  (123, 111, '2000 2000'),
                  (123, 222, '2000 1'),
                  ('counts', NULL, 50000),
-                 ('counts', 999, '5'),
                  (X'626c6f625f74', X'626961', X'323030302032303030'),
                  (X'626c6f625f74', X'626962', X'323030302031');",
         )
@@ -365,6 +367,74 @@ fn reopen_coerces_non_text_stat1_columns_to_text() {
     );
 }
 
+/// Regression test for #12397: matching SQLite's analysisLoader, a `sqlite_stat1`
+/// row whose `idx` does not match any index on `tbl` (whether non-text or text)
+/// sets the table's row count from the first number in `stat`.
+#[test]
+fn reopen_unmatched_idx_sets_table_row_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stat1_unmatched_idx.db");
+    let path_str = path.to_str().unwrap();
+
+    {
+        let db = open_db_at(path_str, DatabaseOpts::new());
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE x(a);
+             CREATE TABLE y(a);
+             CREATE INDEX xa ON x(a);
+             CREATE INDEX ya ON y(a);
+             CREATE TABLE z(a);
+             ANALYZE;
+             DELETE FROM sqlite_stat1;
+             INSERT INTO sqlite_stat1 VALUES
+                 ('x', 1, '1000000'),
+                 ('y', 1, '10'),
+                 ('z', 'nosuchidx', '42');",
+        )
+        .unwrap();
+    }
+
+    let db = open_db_at(path_str, DatabaseOpts::new());
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let schema = conn.current_schema();
+    assert_eq!(
+        schema
+            .analyze_stats
+            .table_stats(NamespaceId::ROOT, "x")
+            .unwrap()
+            .row_count,
+        Some(1_000_000)
+    );
+    assert_eq!(
+        schema
+            .analyze_stats
+            .table_stats(NamespaceId::ROOT, "y")
+            .unwrap()
+            .row_count,
+        Some(10)
+    );
+    assert_eq!(
+        schema
+            .analyze_stats
+            .table_stats(NamespaceId::ROOT, "z")
+            .unwrap()
+            .row_count,
+        Some(42)
+    );
+
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN SELECT * FROM x, y WHERE x.a = y.a",
+    ))
+    .has_table_access_order(["y", "x"])
+    .uses_index("xa");
+}
+
 /// Regression test for #12397: VACUUM schema reparse also preserves valid
 /// statistics when `sqlite_stat1` contains a NULL `tbl` row.
 #[test]
@@ -391,11 +461,11 @@ fn vacuum_preserves_valid_stats_when_stat1_has_null_tbl_row() {
     )
     .unwrap();
 
-    let plan = explain_query_plan(&conn, "SELECT * FROM t WHERE a = 1 AND b > 5");
-    assert!(
-        plan.contains("USING INDEX ib"),
-        "expected planner to use selective index ib after VACUUM, got: {plan}"
-    );
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5",
+    ))
+    .uses_index("ib");
 }
 
 /// Open a fresh temporary database for the stats tests above.
@@ -418,16 +488,6 @@ fn open_db_at(path: &str, opts: DatabaseOpts) -> Arc<Database> {
         Arc::new(SqliteDialect),
     )
     .unwrap()
-}
-
-/// Run EXPLAIN QUERY PLAN for `sql` and return the joined detail lines.
-fn explain_query_plan(conn: &Arc<turso_core::Connection>, sql: &str) -> String {
-    let mut stmt = conn.prepare(format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-    let rows = stmt.run_collect_rows().unwrap();
-    rows.into_iter()
-        .map(|row| row[3].to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Create table `t` (2 rows, 2 indexes) and ANALYZE it on a fresh

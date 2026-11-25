@@ -87,3 +87,39 @@ test stat1-blob-columns-coerced-to-text {
 expect pattern {
     SEARCH t USING INDEX ib \(b>\?\)
 }
+
+test stat1-unmatched-idx-sets-table-row-count {
+    CREATE TABLE x(a);
+    CREATE TABLE y(a);
+    CREATE INDEX xa ON x(a);
+    CREATE INDEX ya ON y(a);
+    CREATE TABLE other(k);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1 VALUES
+        ('x', 1, '1000000'),
+        ('y', 1, '10');
+    ANALYZE other;
+    EXPLAIN QUERY PLAN SELECT * FROM x, y WHERE x.a = y.a;
+}
+expect pattern {
+    SCAN y[\s\S]*SEARCH x USING COVERING INDEX xa \(a=\?\)
+}
+
+test stat1-unmatched-text-idx-sets-table-row-count {
+    CREATE TABLE x(a);
+    CREATE TABLE y(a);
+    CREATE INDEX xa ON x(a);
+    CREATE INDEX ya ON y(a);
+    CREATE TABLE other(k);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1 VALUES
+        ('x', 'nosuchidx', '1000000'),
+        ('y', 'nosuchidx', '10');
+    ANALYZE other;
+    EXPLAIN QUERY PLAN SELECT * FROM x, y WHERE x.a = y.a;
+}
+expect pattern {
+    SCAN y[\s\S]*SEARCH x USING COVERING INDEX xa \(a=\?\)
+}
