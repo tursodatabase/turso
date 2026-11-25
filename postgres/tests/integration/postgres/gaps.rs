@@ -142,18 +142,16 @@ fn gap_a_41_date_n_param(db: TempDatabase) {
     assert_eq!(out, "2026-10-08");
 }
 
-// A-49 (S1): invalid jsonb param
-// tursopg: an invalid jsonb param is accepted.
-// PostgreSQL: ERROR 22P02
+// A-49: invalid jsonb param
 #[turso_macros::test(views)]
-fn gap_a_49_tursopg_returns_wrong_result_invalid_jsonb_param(db: TempDatabase) {
+fn gap_a_49_invalid_jsonb_param(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::jsonb",
         params: &[P::Text("{bad")],
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "{bad");
+    assert_eq!(out, "ERROR 22P02");
 }
 
 // A-53: = ANY($1::bigint[]) text param

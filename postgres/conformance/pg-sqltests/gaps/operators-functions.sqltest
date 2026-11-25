@@ -1342,9 +1342,8 @@ test jsonb-removes-a-key {
 expect {
     {"b": 2}
 }
-expect @tursopg {
-    0
-}
+@sqlstate 42601
+expect @tursopg error {}
 
 # B-130: 16 nested scalar subqueries
 # Same cause as B-124. tursopg accepts 15 levels, so this is the first depth that fails.
