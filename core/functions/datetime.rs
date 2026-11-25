@@ -587,7 +587,7 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
             .get(..8)
             .is_some_and(|s| s.eq_ignore_ascii_case("weekday ")) =>
         {
-            if let Ok(val) = z[8..].trim().parse::<f64>() {
+            if let Some(val) = parse_modifier_number(z[8..].trim()) {
                 if (0.0..7.0).contains(&val) && (val as i64 as f64) == val {
                     let n = val as i64;
                     p.compute_ymd_hms();
@@ -740,7 +740,7 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
     // Case 3: NNN Units
     let is_sqlite_space = |c: char| u8::try_from(c).is_ok_and(is_space);
     if let Some((val_str, rest)) = z.split_once(is_sqlite_space) {
-        if let Ok(val) = val_str.parse::<f64>() {
+        if let Some(val) = parse_modifier_number(val_str) {
             let unit = rest.trim_start_matches(is_sqlite_space);
             let limit_check = |v: f64, limit: f64| v.abs() < limit;
             if unit.eq_ignore_ascii_case("day") || unit.eq_ignore_ascii_case("days") {
@@ -841,6 +841,28 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
     }
 
     Err(InvalidModifier(format!("Invalid arithmetic modifier: {z}")))
+}
+
+/// Parses the number of a modifier, as `str::parse::<f64>` does.
+///
+/// Most modifiers have a whole number, for example `+7 days` or `weekday 0`.
+/// A whole number with at most 15 digits converts to `f64` with no rounding,
+/// so this function converts it without the general parser of `f64`, which
+/// costs more than the rest of the modifier.
+fn parse_modifier_number(s: &str) -> Option<f64> {
+    let (negative, digits) = match s.as_bytes() {
+        [b'-', digits @ ..] => (true, digits),
+        [b'+', digits @ ..] => (false, digits),
+        digits => (false, digits),
+    };
+    if (1..=15).contains(&digits.len()) && digits.iter().all(u8::is_ascii_digit) {
+        let value = digits
+            .iter()
+            .fold(0u64, |value, &digit| value * 10 + u64::from(digit - b'0'))
+            as f64;
+        return Some(if negative { -value } else { value });
+    }
+    s.parse::<f64>().ok()
 }
 
 fn parse_ymd_offset(z: &str) -> Option<(i32, i32, i32, &str)> {
@@ -1676,6 +1698,59 @@ mod tests {
             let mut res = String::new();
             push_seconds(&mut res, s);
             assert_eq!(res, format!("{s:06.3}"), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn parse_modifier_number_matches_parse_f64() {
+        let mut inputs: Vec<String> = [
+            "",
+            "+",
+            "-",
+            "0",
+            "+0",
+            "-0",
+            "007",
+            "-007",
+            "+-7",
+            "--7",
+            " 7",
+            "7 ",
+            "1.5",
+            "-1.5",
+            ".5",
+            "5.",
+            "1e3",
+            "1E3",
+            "inf",
+            "-inf",
+            "infinity",
+            "nan",
+            "NaN",
+            "0x10",
+            "123456789012345",
+            "-999999999999999",
+            "1234567890123456",
+            "9007199254740993",
+            "18446744073709551616",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for n in -1000i64..=1000 {
+            inputs.push(n.to_string());
+            inputs.push(format!("+{n}"));
+        }
+        for digits in 1..=20 {
+            inputs.push("9".repeat(digits));
+            inputs.push(format!("-{}", "9".repeat(digits)));
+        }
+        for input in inputs {
+            assert_eq!(
+                parse_modifier_number(&input).map(f64::to_bits),
+                input.parse::<f64>().ok().map(f64::to_bits),
+                "{input:?}"
+            );
         }
     }
 
