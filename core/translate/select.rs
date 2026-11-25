@@ -2023,17 +2023,21 @@ pub fn emit_simple_count(
         .cache_expr_reg(Cow::Owned(agg.original_expr.clone()), target_reg, false);
     t_ctx.resolver.enable_expr_to_reg_cache();
 
+    // The row counts against the LIMIT and OFFSET, which the arms of a
+    // compound SELECT share.
+    let label_after_row = program.allocate_label();
     emit_select_result(
         program,
         &t_ctx.resolver,
         plan,
+        Some(label_after_row),
+        Some(label_after_row),
         None,
-        None,
-        None,
-        None,
+        t_ctx.reg_offset,
         t_ctx.reg_result_cols_start.unwrap(),
         t_ctx.limit_ctx,
     )?;
+    program.preassign_label_to_next_insn(label_after_row);
     Ok(true)
 }
 
