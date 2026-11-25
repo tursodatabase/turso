@@ -735,9 +735,9 @@ pub(crate) fn type_ordering(ty: &ExprType, schema: &Schema) -> Option<TypeOrderi
                 ExprType::Builtin(BuiltinType::Text) | ExprType::Untyped
             );
             Some(if element_is_text {
-                TypeOrdering::TextArray
+                TypeOrdering::TEXT_ARRAY
             } else {
-                TypeOrdering::Array
+                TypeOrdering::ARRAY
             })
         }
         ExprType::Builtin(_)

@@ -585,7 +585,7 @@ impl Type for Numeric {
     }
 
     fn ordering(&self) -> Option<TypeOrdering> {
-        Some(TypeOrdering::Numeric)
+        Some(TypeOrdering::NUMERIC)
     }
 
     fn reads_as(&self) -> Option<StorageClass> {
