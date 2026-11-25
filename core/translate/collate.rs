@@ -1056,6 +1056,72 @@ fn timestamp_compared_with_timestamptz(x: &TypeDef, y: &TypeDef) -> bool {
     (is(x, "timestamp") && is(y, "timestamptz")) || (is(x, "timestamptz") && is(y, "timestamp"))
 }
 
+/// Fails when `expr`, an expression stored in the schema (a generated column,
+/// an index expression or a partial index WHERE), compares a timestamp with a
+/// timestamptz, with `message` as the error. PostgreSQL refuses that there,
+/// because its comparison functions of the two types are STABLE and a schema
+/// expression must be IMMUTABLE. CHECK and DEFAULT expressions are not checked,
+/// since PostgreSQL allows them. Does nothing when the dialect does not allow the
+/// comparison, as it is refused everywhere then.
+///
+/// FIXME(pg-catalog): HACK. This stands in for pg_proc.provolatile of the
+/// comparison functions of timestamp with timestamptz. Delete it together with
+/// [timestamp_compared_with_timestamptz].
+///
+/// FIXME: Turso has no single place where a schema expression is type-checked
+/// at DDL time, so each DDL statement that stores one (CREATE TABLE, ALTER TABLE ADD
+/// COLUMN, CREATE INDEX) calls this on its own.
+/// It must not be called when the schema loads: databases that have such an
+/// expression must keep opening.
+pub(crate) fn refuse_timestamp_timestamptz_comparison_in_schema_expr(
+    expr: &Expr,
+    table: &crate::schema::BTreeTable,
+    resolver: &Resolver,
+    message: &str,
+) -> Result<()> {
+    let catalog = &resolver.catalog;
+    if !catalog.dialect.compares_timestamp_with_timestamptz() {
+        return Ok(());
+    }
+    let schema = resolver.schema();
+    let type_of_expr =
+        |e: &Expr| crate::translate::index::expression_type(e, table, schema, catalog.symbol_table);
+    let mixed = |a: &Expr, b: &Expr| -> Result<bool> {
+        let (ExprType::Custom { type_def: x, .. }, ExprType::Custom { type_def: y, .. }) =
+            (type_of_expr(a)?, type_of_expr(b)?)
+        else {
+            return Ok(false);
+        };
+        let (Some(x), Some(y)) = (schema.without_domains(&x)?, schema.without_domains(&y)?) else {
+            return Ok(false);
+        };
+        Ok(timestamp_compared_with_timestamptz(&x, &y))
+    };
+    let mut found = false;
+    crate::translate::expr::walk_expr(expr, &mut |e: &Expr| {
+        found = found
+            || match e {
+                Expr::Binary(lhs, op, rhs) if op.is_comparison() => mixed(lhs, rhs)?,
+                Expr::Between {
+                    lhs, start, end, ..
+                } => mixed(lhs, start)? || mixed(lhs, end)?,
+                Expr::InList { lhs, rhs, .. } => {
+                    let mut any = false;
+                    for item in rhs {
+                        any = any || mixed(lhs, item)?;
+                    }
+                    any
+                }
+                _ => false,
+            };
+        Ok(crate::translate::expr::WalkControl::Continue)
+    })?;
+    if found {
+        return Err(LimboError::ParseError(message.to_string()));
+    }
+    Ok(())
+}
+
 /// [check_comparable] for the types of `lhs` and `rhs`.
 fn check_comparable_exprs(
     lhs: &Expr,

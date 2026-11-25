@@ -1075,6 +1075,13 @@ pub fn translate_alter_table(
                         ast::ColumnConstraint::Generated { expr, .. } => {
                             crate::schema::validate_generated_expr(expr)?;
                             validate_generated_function_calls(expr, &resolver.catalog)?;
+                            // FIXME(pg-catalog): HACK. See refuse_timestamp_timestamptz_comparison_in_schema_expr.
+                            crate::translate::collate::refuse_timestamp_timestamptz_comparison_in_schema_expr(
+                                expr,
+                                &btree,
+                                resolver,
+                                "generation expression is not immutable",
+                            )?;
                         }
                         ast::ColumnConstraint::Default(_) => {
                             return Err(LimboError::ParseError(format!(

@@ -960,6 +960,57 @@ expect {
     2|2
 }
 
+# PostgreSQL refuses the comparison of a timestamp with a timestamptz in a
+# generated column, an index expression and a partial index predicate, because
+# its comparison functions are STABLE and these must be IMMUTABLE. A CHECK
+# constraint allows it. (FIXME(pg-catalog): HACK, see
+# refuse_timestamp_timestamptz_comparison_in_schema_expr in
+# core/translate/collate.rs.)
+
+test datetime-compare-ts-tz-generated-column-is-an-error {
+    CREATE TABLE gc (ts timestamp, f boolean GENERATED ALWAYS AS (ts > '2026-01-01+00'::timestamptz) STORED);
+}
+@sqlstate 42P17
+expect error {
+    generation expression is not immutable
+}
+
+test datetime-compare-ts-tz-alter-add-generated-column-is-an-error {
+    CREATE TABLE ga (ts timestamp);
+    ALTER TABLE ga ADD COLUMN f boolean GENERATED ALWAYS AS (ts > '2026-01-01+00'::timestamptz) STORED;
+}
+@sqlstate 42P17
+expect error {
+    generation expression is not immutable
+}
+
+test datetime-compare-ts-tz-index-expression-is-an-error {
+    CREATE TABLE ie (ts timestamp);
+    CREATE INDEX ie_i ON ie ((ts > '2026-01-01+00'::timestamptz));
+}
+@sqlstate 42P17
+expect error {
+    functions in index expression must be marked IMMUTABLE
+}
+
+test datetime-compare-ts-tz-partial-index-is-an-error {
+    CREATE TABLE ip (ts timestamp);
+    CREATE INDEX ip_i ON ip (ts) WHERE ts > '2026-01-01+00'::timestamptz;
+}
+@sqlstate 42P17
+expect error {
+    functions in index predicate must be marked IMMUTABLE
+}
+
+test datetime-compare-ts-tz-check-constraint-is-allowed {
+    CREATE TABLE ck (ts timestamp, CHECK (ts > '2026-01-01+00'::timestamptz));
+    INSERT INTO ck VALUES ('2026-02-01 00:00:00');
+    SELECT ts FROM ck;
+}
+expect {
+    2026-02-01 00:00:00
+}
+
 @compat-gap "operator:timestamp UNION timestamptz"
 @setup datetime-compare-ts-tz
 test datetime-result-union {
