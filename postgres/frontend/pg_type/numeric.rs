@@ -105,6 +105,12 @@ fn numeric_call(op: &'static str, args: &[OperatorArg], function: &str) -> Opera
     }
 }
 
+/// Fails as a numeric column does when `text` is not a number that numeric
+/// takes.
+pub fn check_pg_numeric(text: &str) -> Result<()> {
+    numeric_encode(&Value::build_text(text.to_string()), &[]).map(|_| ())
+}
+
 fn numeric_encode(value: &Value, _params: &[Value]) -> Result<Value> {
     exec_numeric_encode(value).map_err(numeric_error)
 }

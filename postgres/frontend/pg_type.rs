@@ -11,6 +11,7 @@ mod numeric;
 pub(crate) use integer::split_sign;
 pub use integer::IntegerType;
 pub(crate) use integer_operators::{register_integer_operator_functions, IntegerOperator};
+pub use numeric::check_pg_numeric;
 
 use crate::session::relation_lookup_namespaces;
 use std::sync::Arc;
