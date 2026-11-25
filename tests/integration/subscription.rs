@@ -373,3 +373,27 @@ fn in_place_vacuum_invalidates_hidden_rowids(db: TempDatabase) {
     assert_eq!(sub.try_recv(), Some(ChangeBatch::Refresh));
     assert_eq!(sub.try_recv(), None);
 }
+
+#[turso_macros::test(mvcc)]
+fn unrelated_tables_do_not_overflow_a_filter(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE watched(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    for i in 0..40 {
+        conn.execute(format!("CREATE TABLE t{i}(id INTEGER PRIMARY KEY)"))
+            .unwrap();
+    }
+    let existing = db.db.subscribe_changes(ChangeFilter::Table {
+        table: "watched".into(),
+    });
+    conn.execute("BEGIN").unwrap();
+    for i in 0..40 {
+        conn.execute(format!("INSERT INTO t{i} VALUES(1)")).unwrap();
+    }
+    let late = db
+        .db
+        .subscribe_changes(ChangeFilter::Table { table: "t0".into() });
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(existing.try_recv(), None);
+    assert_eq!(late.try_recv(), Some(ChangeBatch::Refresh));
+}

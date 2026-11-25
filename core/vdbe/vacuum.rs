@@ -1862,9 +1862,7 @@ fn install_committed_vacuum_image(
         replace_shared_schema_after_vacuum(source_db.as_ref(), schema);
     }
     // The rebuilt image can assign new hidden rowids when SQL cannot name the old ones.
-    source_db
-        .subscriptions
-        .publish(&crate::ChangeBatch::Refresh);
+    source_db.subscriptions.refresh();
 }
 
 fn reload_physical_schema_for_mvcc_vacuum(

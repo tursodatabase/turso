@@ -21,12 +21,14 @@ use turso_sqlite::SqliteDialect;
 
 struct CountingAllocator;
 
+static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = System.alloc(layout);
         if !ptr.is_null() {
+            ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
             LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         }
         ptr
@@ -35,6 +37,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let ptr = System.alloc_zeroed(layout);
         if !ptr.is_null() {
+            ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
             LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         }
         ptr
@@ -48,6 +51,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new_ptr = System.realloc(ptr, layout, new_size);
         if !new_ptr.is_null() {
+            ALLOCATED_BYTES.fetch_add(new_size, Ordering::Relaxed);
             LIVE_BYTES.fetch_add(new_size, Ordering::Relaxed);
             LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
         }
@@ -205,4 +209,44 @@ fn database_lifecycle_does_not_leak_mvcc() {
 #[serial_test::serial]
 fn database_lifecycle_does_not_leak_wal() {
     assert_no_per_database_leak(false);
+}
+
+#[test]
+#[serial_test::serial]
+fn updating_one_row_does_not_copy_pending_subscription_keys() {
+    let db = Database::open_file(
+        Arc::new(turso_core::MemoryIO::new()),
+        ":memory:",
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    for i in 0..16 {
+        conn.execute(format!("CREATE TABLE t{i}(k TEXT PRIMARY KEY, x INTEGER)"))
+            .unwrap();
+        conn.execute(format!("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<128) INSERT INTO t{i} SELECT printf('%0800d',i),0 FROM n")).unwrap();
+    }
+    let _sub = db.subscribe_changes(turso_core::ChangeFilter::All);
+    let mut update = conn.prepare("UPDATE t0 SET x=x+1 WHERE rowid=1").unwrap();
+    let mut measure = || {
+        update.reset().unwrap();
+        let before = ALLOCATED_BYTES.load(Ordering::Relaxed);
+        update.run_ignore_rows().unwrap();
+        ALLOCATED_BYTES.load(Ordering::Relaxed) - before
+    };
+    conn.execute("BEGIN").unwrap();
+    let baseline = measure();
+    for i in 0..16 {
+        conn.execute(format!("UPDATE t{i} SET x=x+1")).unwrap();
+    }
+    let populated = measure();
+    eprintln!("one update allocated {baseline} bytes with an empty batch and {populated} with 2048 pending keys");
+    assert!(
+        populated < baseline + 65536,
+        "additional allocation: {} bytes",
+        populated.saturating_sub(baseline)
+    );
+    conn.execute("ROLLBACK").unwrap();
 }

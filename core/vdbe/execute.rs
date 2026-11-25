@@ -3638,9 +3638,8 @@ pub fn op_blob_write(
         }
         Err(err) => return Err(err),
     }
-    if let Some(table) = subscription_table(program, state, *cursor) {
-        connection.record_subscription_change(Some(&table.name), None);
-    }
+    subscription_table(program, state, connection, *cursor);
+    state.subscription_capture.record(connection, None);
     state.registers[*dest].set_value(Value::Numeric(Numeric::Integer(1)));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -5332,7 +5331,9 @@ pub fn op_transaction_inner(
                             connection.transaction_changes.is_empty(),
                             "write statement started with view changes left by an earlier statement"
                         );
-                        state.change_snapshot = connection.pending_changes.snapshot();
+                        if state.has_stmt_transaction {
+                            connection.pending_changes.begin_statement();
+                        }
                         state.is_active_write = true;
                         state.tx_read_only_at_start = connection.is_tx_read_only();
                         if is_main_db {
@@ -12246,21 +12247,31 @@ fn check_db_write_allowed(
 /// consult the registry at execution time, including trigger subprograms.
 fn subscription_table<'a>(
     program: &'a Program,
-    state: &ProgramState,
+    state: &mut ProgramState,
+    connection: &Connection,
     id: usize,
 ) -> Option<&'a crate::schema::BTreeTable> {
-    if state.cursor_databases.get(id).copied().flatten() != Some(MAIN_DB_ID)
-        || program.prepared().explain.ephemeral_cursors.contains(&id)
-    {
-        return None;
+    let db = state.cursor_databases[id];
+    if state.subscription_cursor != Some((id, db)) {
+        state.subscription_cursor = Some((id, db));
+        state.subscription_capture = match &program.cursor_ref[id].1 {
+            CursorType::BTreeTable(table)
+                if db == Some(MAIN_DB_ID)
+                    && !program.prepared().explain.ephemeral_cursors.contains(&id) =>
+            {
+                connection.subscription_route(table)
+            }
+            _ => crate::subscription::Capture::Ignore,
+        };
     }
-    let (_, CursorType::BTreeTable(table)) = program.cursor_ref.get(id)? else {
-        return None;
-    };
-    if table.root_page == 1 || crate::schema::is_system_table(&table.name) {
-        return None;
+    if state.subscription_capture.wants_keys() {
+        let CursorType::BTreeTable(table) = &program.cursor_ref[id].1 else {
+            unreachable!()
+        };
+        Some(table)
+    } else {
+        None
     }
-    Some(table)
 }
 
 /// An UPDATE can overwrite a row in place. Capture its previous logical key
@@ -12272,11 +12283,7 @@ fn overwritten_subscription_key(
     cursor_id: usize,
     key_reg: usize,
 ) -> IOResultOr<Option<Option<std::vec::Vec<Value>>>> {
-    if !connection.db.subscriptions.active() {
-        // A listener can register while the physical write is suspended.
-        return Ok(IOResult::Done(Some(None)));
-    }
-    let Some(table) = subscription_table(program, state, cursor_id) else {
+    let Some(table) = subscription_table(program, state, connection, cursor_id) else {
         return Ok(IOResult::Done(None));
     };
     if !table.has_rowid
@@ -12528,27 +12535,23 @@ pub fn op_insert(
                             cursor.insert(&BTreeKey::new_index_key(record.as_record_ref()))
                         );
                     }
-                    if let Some(table) = subscription_table(program, state, *cursor_id) {
-                        let old_key = state.active_op_state.insert().old_subscription_key.take();
-                        if let Some(key) = old_key {
-                            connection.record_subscription_change(Some(&table.name), key);
-                        }
-                        let key = if connection.db.subscriptions.active() {
-                            let rowid = if table.has_rowid {
-                                state.registers[*key_reg].get_value().as_int()
-                            } else {
-                                None
-                            };
+                    let key = subscription_table(program, state, connection, *cursor_id).and_then(
+                        |table| {
+                            let rowid = table
+                                .has_rowid
+                                .then(|| state.registers[*key_reg].get_value().as_int())
+                                .flatten();
                             let record = match &state.registers[*record_reg] {
                                 Register::Record(record) => Some(record),
                                 _ => None,
                             };
                             crate::subscription::primary_key(table, rowid, record)
-                        } else {
-                            None
-                        };
-                        connection.record_subscription_change(Some(&table.name), key);
+                        },
+                    );
+                    if let Some(old) = state.active_op_state.insert().old_subscription_key.take() {
+                        state.subscription_capture.record(connection, old);
                     }
+                    state.subscription_capture.record(connection, key);
                     state.record_rows_written(1);
                 }
                 // Only update last_insert_rowid for regular table inserts, not schema modifications
@@ -12828,20 +12831,18 @@ pub fn op_delete(
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
-                if connection.db.subscriptions.active() {
-                    if let Some(table) = subscription_table(program, state, *cursor_id) {
-                        let cursor = state.get_cursor(*cursor_id).as_btree_mut();
-                        let rowid = return_if_io!(state, cursor.rowid());
-                        let record = if table.primary_key_columns.is_empty()
-                            || table.get_rowid_alias_column().is_some()
-                        {
-                            None
-                        } else {
-                            return_if_io!(state, cursor.record())
-                        };
-                        let key = crate::subscription::primary_key(table, rowid, record);
-                        state.active_op_state.delete().subscription_key = key;
-                    }
+                if let Some(table) = subscription_table(program, state, connection, *cursor_id) {
+                    let cursor = state.get_cursor(*cursor_id).as_btree_mut();
+                    let rowid = return_if_io!(state, cursor.rowid());
+                    let record = if table.primary_key_columns.is_empty()
+                        || table.get_rowid_alias_column().is_some()
+                    {
+                        None
+                    } else {
+                        return_if_io!(state, cursor.record())
+                    };
+                    let key = crate::subscription::primary_key(table, rowid, record);
+                    state.active_op_state.delete().subscription_key = key;
                 }
                 let route = if program.prepared().has_materialized_views {
                     change_log_route(program, state, connection, *cursor_id)?
@@ -12891,10 +12892,8 @@ pub fn op_delete(
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(state, cursor.delete());
                 }
-                if let Some(table) = subscription_table(program, state, *cursor_id) {
-                    let key = state.active_op_state.delete().subscription_key.take();
-                    connection.record_subscription_change(Some(&table.name), key);
-                }
+                let key = state.active_op_state.delete().subscription_key.take();
+                state.subscription_capture.record(connection, key);
                 // Increment metrics for row write (DELETE is a write operation)
                 state.record_rows_written(1);
                 let has_change_log_subscribers = state
@@ -14392,15 +14391,16 @@ fn op_clear_btree_inner(
                             ))
                         })?;
                         if removed_entries > 0 && *db == MAIN_DB_ID {
-                            let schema = connection.schema.read();
-                            let table = schema
+                            let table = connection
+                                .schema
+                                .read()
                                 .all_tables()
                                 .filter_map(|t| t.btree())
                                 .find(|t| t.root_page == *root);
-                            if let Some(table) =
-                                table.filter(|t| !crate::schema::is_system_table(&t.name))
-                            {
-                                connection.record_subscription_change(Some(&table.name), None);
+                            if let Some(table) = table {
+                                connection
+                                    .subscription_route(&table)
+                                    .record(connection, None);
                             }
                         }
                         state.record_statement_changes(changes);
@@ -16146,7 +16146,7 @@ pub fn op_set_cookie(
     }
 
     if *db == MAIN_DB_ID && matches!(cookie, Cookie::SchemaVersion) {
-        connection.record_subscription_change(None, None);
+        connection.pending_changes.record_refresh(connection);
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
