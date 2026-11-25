@@ -75,7 +75,7 @@ Basics not enumerated by the official feature matrix.
 | LOCK TABLE | 🟡 Partial | ACCESS SHARE without NOWAIT is accepted as a no-op inside a transaction for pg_dump compatibility; table names are not checked, no locks are acquired, and no read snapshot is started; other modes are rejected |
 | Casts (`expr::type`, CAST) | ✅ Supported | Also `int4(x)`-style cast functions |
 | Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
-| Operators: `\|\|`, `%`, bitwise, LIKE/ILIKE [ESCAPE], SIMILAR TO [ESCAPE], `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | BETWEEN SYMMETRIC is rejected. Regex operators lower to REGEXP; `~*`/`!~*` add the `(?i)` flag. SIMILAR TO converts its pattern to a regex the way `similar_to_escape()` does. LIKE is case-sensitive with `\` as the default escape; ILIKE applies LOWER() to both sides, then matches like LIKE. In CREATE INDEX, LIKE and ILIKE need a string-literal pattern without ESCAPE, and SIMILAR TO needs a string-literal pattern and ESCAPE |
+| Operators: `\|\|`, `%`, bitwise, LIKE/ILIKE [ESCAPE], SIMILAR TO [ESCAPE], `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | BETWEEN SYMMETRIC is rejected. Regex operators lower to REGEXP; `~*`/`!~*` add the `(?i)` flag. SIMILAR TO converts its pattern to a regex the way `similar_to_escape()` does. LIKE is case-sensitive with `\` as the default escape; ILIKE applies LOWER() to both sides, then matches like LIKE. In CREATE INDEX, LIKE and ILIKE need a string-literal pattern without ESCAPE, and SIMILAR TO needs a string-literal pattern and ESCAPE. A comparison, an arithmetic or a bit operator fails with 42883 when `pg_operator` has no row for operands of these kinds of types: see `pg_operator` in the Backend section |
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
 | generate_series | ✅ Supported | In FROM and with joins; table aliases name the output column (`AS g` gives `g`), explicit column aliases take precedence (`AS g(x)` gives `x`), and without an alias the column is named `generate_series`; qualified and unqualified calls resolve even with an empty search_path |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
@@ -113,6 +113,30 @@ timestamptz, which fail with 0A000, every operator of another type, such as
 bytea, time, interval, json, jsonb, inet and the array types, and every other
 operator name, such as `^`, `@` and `~~`. `oprcode`, `oprrest` and `oprjoin`
 are 0, because `pg_proc` does not have PostgreSQL's functions under their oids.
+A comparison (also of BETWEEN, an IN list, `IN (SELECT ...)`, `CASE x WHEN`,
+NULLIF and each pair of two row values), an arithmetic operator or a
+bit operator is refused with 42883 (`operator does not exist`) when no row of
+that name has operand types of the same type category (`pg_type.typcategory`)
+as the operands: `text_column = 1`, `timestamptz_column > 5`, `true = 1`,
+`-date_column`. A string literal or a parameter fits any type. The arithmetic and bit operators
+with a date, or a numeric that has a precision such as `numeric(10, 2)`, are not
+decided by `pg_operator` but by the operator list of the engine, which fails
+with 42883 too; its message names the engine's type (`numeric % real` where
+PostgreSQL says `numeric % double precision`). Every comparison is decided by
+`pg_operator`. Still different
+from PostgreSQL, because the implicit casts of `pg_cast` are not used: two
+operands of the same category always pass, so `1.5::float8 % 2` and `5 & 1.0`
+run where PostgreSQL has no such operator. A value of type text may be a
+uuid, json, jsonb or inet value that a cast or a function returned, so only
+the comparisons of text are checked: `text_column + 1` runs, and
+`uuid_column = text_column` is compared. An operand of a type without rows
+(bytea, time, json, jsonb, inet, arrays, domains over them, enums) is not
+checked. Neither is an operand that is a subquery, or that reads a column of
+a subquery, a CTE, a view or a catalog table, unless the column has one of the
+types boolean, smallint, bigint, numeric, varchar, date, timestamp,
+timestamptz or uuid: `text_column = (SELECT 1)` is compared. The message names the
+type that Turso gives the value: `1::smallint = 'a'::text` says
+`integer = text`, where PostgreSQL says `smallint = text`.
 `pg_statistic_ext` exposes the hidden system column
 `tableoid` for pg_dump discovery. `pg_trigger` exposes `tgparentid` for
 parent-trigger lookup and hidden `tableoid` during dump discovery.
@@ -204,7 +228,7 @@ functions that answer a condition are boolean: they print as `t` or `f` and are
 described with OID 16. The type is kept through a subquery in FROM, a CTE, a
 view, a VALUES list, a UNION, a CASE and a coalesce. Still different from
 PostgreSQL: a boolean cast to text is `1` or `0`, a boolean in an array prints
-as `1` or `0`, arithmetic on a boolean fails with 42601 and not 42883, CREATE
+as `1` or `0`, CREATE
 TABLE AS of a condition fails with 0A000, and `pg_is_in_recovery()` is true
 where a primary gives false. A subquery in FROM and a VALUES list in FROM keep only this type
 and the types of table columns: any other column, such as `1` or `now()`, is
@@ -247,12 +271,10 @@ the values it stores (a STRUCT or UNION, a type with ENCODE or a DECODE other
 than `value`), unless the two already have one order in common, as `numeric`
 and `bigint` do. A domain compares as the type it is declared on, so two
 domains over one type compare as that type. So a `date`, a `timestamp` and a
-`timestamptz` fail with one another, and so does a `timestamptz` with a
-`varchar(n)`. PostgreSQL refuses the `timestamptz` with `varchar(n)` pair too,
-with 42883.
-The error is `cannot compare type x with type y` with SQLSTATE 0A000. Turso
-refuses comparisons that PostgreSQL may run and does not know which ones, so
-the code differs from PostgreSQL's 42883 where PostgreSQL also refuses. It covers `=`, `<`,
+`timestamptz` fail with one another.
+The error is `cannot compare type x with type y` with SQLSTATE 0A000. A pair
+that `pg_operator` has no comparison for, such as a `timestamptz` with a
+`varchar(n)`, fails with 42883 before this check, as in PostgreSQL. It covers `=`, `<`,
 `IS DISTINCT FROM`, BETWEEN, IN, `IN (SELECT ...)` and `IN (VALUES ...)`,
 `CASE x WHEN`, `NULLIF`, `min` and `max`, and joins, with or without an index.
 Not refused yet, and compared as stored: a join with a VALUES list in FROM or
