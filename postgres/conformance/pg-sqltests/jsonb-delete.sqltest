@@ -1,0 +1,352 @@
+# The jsonb operator -, which deletes from a jsonb value.
+#
+# jsonb - text deletes a field of an object, or the string elements of an
+# array that are equal to the text. jsonb - integer deletes the element at an
+# index of an array, and jsonb - text[] deletes each element of the array.
+
+@database :memory:
+
+setup items_with_jsonb_rows {
+    CREATE TABLE items (id int PRIMARY KEY, data jsonb);
+    INSERT INTO items VALUES
+        (1, '{"name":"apple","price":1.50,"qty":10,"active":true,"tags":["fruit","red"],"dims":{"w":3,"h":4}}'),
+        (2, '{"name":"bread","price":2,"qty":2,"active":false,"tags":["bakery"],"dims":{"w":20,"h":10},"note":null}'),
+        (3, '[1,2,3]'),
+        (4, NULL);
+}
+
+# jsonb - x
+
+# The tests that follow compare a result with a jsonb value or read one of its
+# fields, so that they do not depend on A-45, where tursopg writes jsonb
+# without the spaces of PostgreSQL. A comparison is cast to int, because of
+# B-04.
+
+@setup items_with_jsonb_rows
+test jsonb-delete-key {
+    SELECT coalesce((data - 'name') ->> 'name', 'none'), (data - 'name') ->> 'qty' FROM items WHERE id = 1;
+}
+expect {
+    none|10
+}
+
+# A text deletes the string elements of an array that are equal to it, and
+# only at the top level.
+test jsonb-delete-string-elements {
+    SELECT ('["a","b","a",1]'::jsonb - 'a' = '["b",1]')::int, '["1",1]'::jsonb - '1', '["a",["a"]]'::jsonb - 'a', ('{"a":1,"b":{"a":2}}'::jsonb - 'a' = '{"b":{"a":2}}')::int;
+}
+expect {
+    1|[1]|[["a"]]|1
+}
+
+# A negative index counts from the end. An index past either end deletes
+# nothing.
+test jsonb-delete-element {
+    SELECT '[1,2]'::jsonb - 0, '[1,2]'::jsonb - -1, ('[1,2]'::jsonb - 2 = '[1,2]')::int, ('[1,2]'::jsonb - -3 = '[1,2]')::int, ('[1,2,3]'::jsonb - (-2147483648) = '[1,2,3]')::int;
+}
+expect {
+    [2]|[1]|1|1|1
+}
+
+# A text array deletes each of its elements, and a NULL element deletes
+# nothing. A string literal is a text, not a text array.
+test jsonb-delete-keys {
+    SELECT '{"a":1,"b":2}'::jsonb - '{a,b}'::text[], '{"a":1,"b":2}'::jsonb - ARRAY['a','b'], ('{"a":1,"b":2}'::jsonb - ARRAY['a',NULL]) ->> 'b', ('{"a":1,"b":2}'::jsonb - '{a,b}' = '{"a":1,"b":2}')::int, '["a","b"]'::jsonb - ARRAY['a','b'];
+}
+expect {
+    {}|{}|2|1|[]
+}
+
+test jsonb-delete-from-empty-value {
+    SELECT '[]'::jsonb - 0, '[]'::jsonb - 'a', '{}'::jsonb - 'a', '{}'::jsonb - '{a}'::text[];
+}
+expect {
+    []|[]|{}|{}
+}
+
+# A key that the object does not have deletes nothing, also when the object
+# has two fields with the same name. Of these fields, the last one counts.
+@setup items_with_jsonb_rows
+test jsonb-delete-from-object-with-repeated-field-names {
+    INSERT INTO items VALUES (5, '{"b":1,"a":2,"b":3}');
+    SELECT (data - 'zz' = data)::int, (data - 'zz') ->> 'b', (data - 'b' = '{"a":2}')::int FROM items WHERE id = 5;
+}
+expect {
+    1|3|1
+}
+
+test jsonb-delete-of-null-is-null {
+    SELECT coalesce(('{"a":1}'::jsonb - NULL::text)::text, 'none'), coalesce(('[1]'::jsonb - NULL::int)::text, 'none'), coalesce((NULL::jsonb - 'a')::text, 'none');
+}
+expect {
+    none|none|none
+}
+
+test jsonb-delete-from-scalar-errors {
+    SELECT '"a"'::jsonb - 'a';
+}
+@sqlstate 22023
+expect error {}
+
+test jsonb-delete-index-from-object-errors {
+    SELECT '{}'::jsonb - 0;
+}
+@sqlstate 22023
+expect error {}
+
+test jsonb-delete-of-two-dimensional-array-errors {
+    SELECT '{"a":1}'::jsonb - ARRAY[ARRAY['a']];
+}
+@sqlstate 2202E
+expect error {}
+
+# PostgreSQL has `jsonb - integer`, and no `jsonb - numeric` or
+# `jsonb - bigint`.
+test jsonb-delete-of-decimal-errors {
+    SELECT '[1]'::jsonb - 1.5;
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-bigint-errors {
+    SELECT '[1]'::jsonb - 3000000000;
+}
+@sqlstate 42883
+expect error {}
+
+# PostgreSQL has no - whose right operand is a boolean, json, uuid or oid
+# value. tursopg gives core a boolean expression as an integer, and a cast
+# to json, uuid or oid as a cast to text or to an integer. Thus the
+# translator refuses these right operands by their syntax.
+test jsonb-delete-of-comparison-errors {
+    SELECT '[1,2,3]'::jsonb - (1 = 1);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-null-test-errors {
+    SELECT '[1,2,3]'::jsonb - (1 IS NULL);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-like-errors {
+    SELECT '["a","b"]'::jsonb - ('a' LIKE 'a');
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-exists-errors {
+    SELECT '[1,2,3]'::jsonb - EXISTS (SELECT 1);
+}
+@sqlstate 42883
+expect error {}
+
+# The check also reads the result of a scalar subquery, CASE, COALESCE,
+# GREATEST and NULLIF.
+test jsonb-delete-of-boolean-subquery-errors {
+    SELECT '[1,2]'::jsonb - (SELECT 1 < 2);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-boolean-case-errors {
+    SELECT '[1,2]'::jsonb - CASE WHEN true THEN 1 = 1 END;
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-boolean-coalesce-errors {
+    SELECT '[1,2]'::jsonb - coalesce(1 = 2, false);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-boolean-greatest-errors {
+    SELECT '[1,2]'::jsonb - greatest(1 = 1, false);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-boolean-nullif-errors {
+    SELECT '[1,2]'::jsonb - nullif(1 = 1, false);
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-uuid-subquery-errors {
+    SELECT '{}'::jsonb - (SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid);
+}
+@sqlstate 42883
+expect error {}
+
+# A subquery or a CASE that gives an integer deletes an element.
+test jsonb-delete-of-integer-subquery-and-case {
+    SELECT '[1,2]'::jsonb - (SELECT 1), '[1,2]'::jsonb - CASE WHEN true THEN 0 END;
+}
+expect {
+    [1]|[2]
+}
+
+test jsonb-delete-of-json-errors {
+    SELECT '{"a":1}'::jsonb - '"a"'::json;
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-uuid-errors {
+    SELECT '{"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11":1}'::jsonb - 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid;
+}
+@sqlstate 42883
+expect error {}
+
+test jsonb-delete-of-oid-errors {
+    SELECT '[1,2]'::jsonb - 1::oid;
+}
+@sqlstate 42883
+expect error {}
+
+# The check does not depend on the left operand.
+test integer-minus-comparison-errors {
+    SELECT 5 - (1 = 1);
+}
+@sqlstate 42883
+expect error {}
+
+@setup items_with_jsonb_rows
+test jsonb-delete-in-update {
+    UPDATE items SET data = data - 'dims' - 'tags' WHERE id = 1;
+    SELECT coalesce(data ->> 'dims', 'none'), coalesce(data ->> 'tags', 'none'), data ->> 'qty' FROM items WHERE id = 1;
+}
+expect {
+    none|none|10
+}
+
+test jsonb-delete-function {
+    SELECT jsonb_delete('{"a":1,"b":2,"c":3}', 'a', 'b') ->> 'c', jsonb_delete('[1,2]', 0);
+}
+expect {
+    3|[2]
+}
+
+# Core runs - on jsonb values, so an index expression can use it.
+@setup items_with_jsonb_rows
+test jsonb-delete-in-index-expression {
+    CREATE INDEX items_without_name ON items ((data - 'name'));
+    UPDATE items SET data = data - 'note' WHERE id = 2;
+    SELECT id FROM items WHERE data - 'name' = '{"price":2,"qty":2,"active":false,"tags":["bakery"],"dims":{"w":20,"h":10}}' OR (data - 'name') ->> 'qty' = '10' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# A generation expression runs - on a cast to jsonb too.
+test jsonb-delete-in-generated-column {
+    CREATE TABLE gen_rest (id int, data text, rest text GENERATED ALWAYS AS (data::jsonb - 'a') STORED);
+    INSERT INTO gen_rest (id, data) VALUES (1, '[1]'), (2, '["a","b"]'), (3, '{"a":1}');
+    SELECT rest FROM gen_rest ORDER BY id;
+}
+expect {
+    [1]
+    ["b"]
+    {}
+}
+
+# Known differences of -
+
+# The error of an operator that a type does not have reports 42601 in
+# tursopg.
+@compat-gap "operator:jsonb - jsonb"
+test jsonb-delete-of-jsonb-errors {
+    SELECT '{"a":1}'::jsonb - '{"a":1}'::jsonb;
+}
+@sqlstate 42883
+expect error {}
+@sqlstate 42601
+expect @tursopg error {}
+
+# Only inet - inet takes an inet on the right. tursopg gives core a cast to
+# inet as a cast to text, so it cannot run inet - inet. It refuses an inet
+# on the right of - with 0A000, also when the left operand is jsonb.
+@compat-gap "operator:jsonb - inet"
+test jsonb-delete-of-inet-errors {
+    SELECT '{"10.0.0.1":1}'::jsonb - '10.0.0.1'::inet;
+}
+@sqlstate 42883
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "operator:inet - inet"
+test inet-minus-inet-is-not-supported {
+    SELECT '10.0.0.2'::inet - '10.0.0.1'::inet;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# The check of the right operand of - reads its syntax. It does not see a
+# boolean that a column of a subquery gives, so - reads the boolean as the
+# integer 1 and deletes the element at index 1.
+@compat-gap "operator:jsonb - boolean"
+test jsonb-delete-of-boolean-column-of-subquery {
+    SELECT j - b FROM (SELECT '[1,2]'::jsonb AS j, 1 < 2 AS b) s;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    [1]
+}
+
+# gen_random_uuid() gives its uuid as text, so - reads it as a key.
+@compat-gap "operator:jsonb - uuid"
+test jsonb-delete-of-uuid-function {
+    SELECT '{}'::jsonb - gen_random_uuid();
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    {}
+}
+
+# The check of the types of a CHECK constraint does not know the operators
+# of custom types.
+@compat-gap "operator:jsonb - text"
+test jsonb-delete-in-check-constraint {
+    CREATE TABLE checked_rest (data jsonb CHECK (data - 'a' <> '{}'));
+    INSERT INTO checked_rest VALUES ('{"a":1,"b":2}');
+    SELECT count(*) FROM checked_rest;
+}
+expect {
+    1
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+@compat-gap "type:jsonb"
+test jsonb-delete-keeps-the-order-of-the-fields {
+    SELECT '{"b":1,"a":2}'::jsonb - 'c';
+}
+expect {
+    {"a": 2, "b": 1}
+}
+expect @tursopg {
+    {"b":1,"a":2}
+}
+
+# PostgreSQL has `jsonb - integer` and no `jsonb - bigint`. tursopg deletes
+# the element at the index that the bigint gives.
+@compat-gap "operator:jsonb - int8"
+test jsonb-delete-of-bigint {
+    CREATE TABLE jb (j jsonb, b bigint);
+    INSERT INTO jb VALUES ('[1,2]', 0);
+    SELECT j - b FROM jb;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    [2]
+}

@@ -1749,6 +1749,27 @@ mod tests {
         assert_eq!(error.sqlstate, "22007");
     }
 
+    /// Known gap: PostgreSQL reads the text '1' of an untyped parameter on the
+    /// right of jsonb `-` as text, and deletes the string element "1".
+    /// tursopg binds the number-like text as a number, so `-` deletes the
+    /// element at index 1.
+    #[test]
+    fn untyped_number_like_parameter_of_jsonb_minus_is_a_known_gap() {
+        let conn = memory_connection();
+        let mut portal = Portal::<String>::default();
+        portal.statement = Arc::new(StoredStatement::new(
+            String::new(),
+            String::new(),
+            vec![None],
+        ));
+        portal.parameters = vec![Some(b"1".to_vec().into())];
+        let mut stmt = conn.prepare(r#"SELECT '["1","b"]'::jsonb - $1"#).unwrap();
+        bind_portal_parameters(&mut stmt, &portal).unwrap();
+        // PostgreSQL 18 returns ["b"].
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(rows, [[Value::from_text(r#"["1"]"#)]]);
+    }
+
     #[test]
     fn a_refused_binary_format_aborts_the_transaction_block() {
         let (mut client, _conn) = copy_test_client();

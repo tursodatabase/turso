@@ -326,12 +326,12 @@ impl Type for Date {
     fn operator_signatures(&self) -> Vec<OperatorSignature> {
         use OperatorArg::{EncodableLiteral, Integer, Value};
         vec![
-            call("+", &[Value, Integer], "date_plus", "date"),
-            call("+", &[Integer, Value], "date_plus", "date"),
-            call("-", &[Value, Value], "date_diff", "integer"),
-            call("-", &[Value, EncodableLiteral], "date_diff", "integer"),
-            call("-", &[EncodableLiteral, Value], "date_diff", "integer"),
-            call("-", &[Value, Integer], "date_minus", "date"),
+            OperatorSignature::call("+", &[Value, Integer], "date_plus", "date"),
+            OperatorSignature::call("+", &[Integer, Value], "date_plus", "date"),
+            OperatorSignature::call("-", &[Value, Value], "date_diff", "integer"),
+            OperatorSignature::call("-", &[Value, EncodableLiteral], "date_diff", "integer"),
+            OperatorSignature::call("-", &[EncodableLiteral, Value], "date_diff", "integer"),
+            OperatorSignature::call("-", &[Value, Integer], "date_minus", "date"),
         ]
     }
 }
@@ -612,13 +612,18 @@ impl Type for Numeric {
             ("%", "numeric_mod"),
         ] {
             for args in [[Value, Value], [Value, Exact], [Exact, Value]] {
-                signatures.push(call(op, &args, func, "numeric"));
+                signatures.push(OperatorSignature::call(op, &args, func, "numeric"));
             }
             if op != "%" {
                 signatures.extend(sqlite_operator(op, Real));
             }
         }
-        signatures.push(call("-", &[Value], "numeric_neg", "numeric"));
+        signatures.push(OperatorSignature::call(
+            "-",
+            &[Value],
+            "numeric_neg",
+            "numeric",
+        ));
         signatures
     }
 }
@@ -654,22 +659,6 @@ fn less_than() -> Vec<ast::TypeOperator> {
         op: "<".to_string(),
         func_name: None,
     }]
-}
-
-/// The signature of an operator that runs the SQL function `func`, which
-/// returns a value of the type `result`.
-fn call(
-    op: &'static str,
-    args: &[OperatorArg],
-    func: &str,
-    result: &'static str,
-) -> OperatorSignature {
-    OperatorSignature {
-        op,
-        args: args.to_vec(),
-        func: Some(func.to_string()),
-        result: Some(result),
-    }
 }
 
 /// The operators of a type that stores plain integers: SQLite's operators

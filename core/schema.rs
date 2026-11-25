@@ -295,6 +295,20 @@ pub struct OperatorSignature {
     /// The type `func` returns. `None` when SQLite's operator runs.
     pub result: Option<&'static str>,
 }
+
+impl OperatorSignature {
+    /// The signature of an operator that runs the SQL function `func`, which
+    /// returns a value of the type `result`.
+    pub fn call(op: &'static str, args: &[OperatorArg], func: &str, result: &'static str) -> Self {
+        Self {
+            op,
+            args: args.to_vec(),
+            func: Some(func.to_string()),
+            result: Some(result),
+        }
+    }
+}
+
 /// An operand that a signature accepts. "This type" is the type that declares
 /// the signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1458,6 +1472,47 @@ impl SchemaBuilder {
             self = self.type_def(alias, Arc::clone(&type_def));
         }
         Ok(self.type_def(ty.name(), type_def))
+    }
+
+    /// Gives the built-in type `name` the operator signatures `signatures`,
+    /// which are tried before the signatures that the type has. Thus a dialect
+    /// gives a type of core operators that run functions of the dialect. Every
+    /// name of the type then names the type with the new signatures.
+    pub fn builtin_type_operator_signatures(
+        mut self,
+        name: &str,
+        signatures: std::vec::Vec<OperatorSignature>,
+    ) -> crate::Result<Self> {
+        let Some(registered) = self.schema.type_registry.get(&name.to_lowercase()) else {
+            return Err(crate::LimboError::InternalError(format!(
+                "no built-in type is named {name}"
+            )));
+        };
+        let registered = Arc::clone(registered);
+        let mut type_def = TypeDef::clone(&registered);
+        let TypeDefKind::Custom {
+            operator_signatures,
+            ..
+        } = &mut type_def.kind
+        else {
+            return Err(crate::LimboError::InternalError(format!(
+                "the type {name} has no operators"
+            )));
+        };
+        if !type_def.is_builtin {
+            return Err(crate::LimboError::InternalError(format!(
+                "the type {name} is not built in"
+            )));
+        }
+        let own_signatures = std::mem::take(operator_signatures);
+        *operator_signatures = signatures.into_iter().chain(own_signatures).collect();
+        let type_def = Arc::new(type_def);
+        for registered_type in self.schema.type_registry.values_mut() {
+            if Arc::ptr_eq(registered_type, &registered) {
+                *registered_type = Arc::clone(&type_def);
+            }
+        }
+        Ok(self)
     }
 
     /// Adds the type `type_def` under `name`. A type can have several names.

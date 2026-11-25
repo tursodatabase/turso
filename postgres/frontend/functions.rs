@@ -17,12 +17,13 @@ use turso_core::{
 };
 use turso_pg_parser::datetime_unit::DatetimeUnit;
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR,
-    SQLSTATE_INVALID_DATETIME_FORMAT, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
-    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
-    SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
-    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
+    SQLSTATE_ARRAY_SUBSCRIPT_ERROR, SQLSTATE_DATETIME_FIELD_OVERFLOW,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_DATETIME_FORMAT,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_PARAMETER_VALUE,
+    SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -336,6 +337,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "jsonb_field_text"(FunctionArity::Exact(2), true) => {
             exec_jsonb_field_text(args[0].get_value(), args[1].get_value())?
         },
+        "jsonb_delete"(FunctionArity::Variadic, true) => exec_jsonb_delete(args)?,
         "jsonb_contains"(FunctionArity::Exact(2), true) => {
             exec_jsonb_contains(args[0].get_value(), args[1].get_value())?
         },
@@ -529,6 +531,19 @@ struct Json(String);
 
 impl ScalarReturn for Json {
     const TYPE: Option<ReturnType> = Some(ReturnType::Custom("json"));
+
+    fn into_value(self) -> Value {
+        Value::build_text(self.0)
+    }
+}
+
+/// A `jsonb` value in its text form, as a jsonb column reads it. Returning one
+/// gives the function the type `jsonb`, so that the operators of jsonb run on
+/// its result: `a - 'k' - 'j'` deletes the keys `k` and `j`.
+struct Jsonb(String);
+
+impl ScalarReturn for Jsonb {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Custom("jsonb"));
 
     fn into_value(self) -> Value {
         Value::build_text(self.0)
@@ -1043,8 +1058,242 @@ pub(crate) fn exec_json_each(value: &Value, rows: &mut Vec<[Value; 2]>) -> Resul
     }
     walk_json_members(json, |key, value| {
         let key = key.expect("every member of an object has a key");
-        rows.push([Value::build_text(key), Value::build_text(value.to_string())]);
+        rows.push([
+            Value::build_text(key.decoded),
+            Value::build_text(value.to_string()),
+        ]);
     })
+}
+
+/// What `jsonb - x` deletes from a jsonb value.
+enum JsonDeletion {
+    /// The fields of an object with these names, or the string elements of
+    /// an array that are equal to one of them.
+    Keys(Vec<String>),
+    /// The element at this index of an array. A negative index counts from
+    /// the end.
+    Index(i32),
+}
+
+/// PostgreSQL's `jsonb - text`, `jsonb - integer` and `jsonb - text[]`, which
+/// are also its function jsonb_delete(): the jsonb value `args[0]` without
+/// what `args[1]` names (see `JsonDeletion`). A text array names each of its
+/// elements, and a NULL element names nothing. Only the top level counts.
+/// The translator gives core the operator, and core gives this function the
+/// value of the right operand, whose kind chooses what is deleted. A call
+/// written in SQL can give the names as more arguments, as PostgreSQL's
+/// VARIADIC parameter does.
+///
+/// A scalar fails with 22023, and an integer on an object too. An empty
+/// object or array, or no name, gives the value unchanged.
+fn exec_jsonb_delete(args: &[Register]) -> Result<Option<Jsonb>> {
+    let Some((json, names)) = args.split_first().filter(|(_, names)| !names.is_empty()) else {
+        let arg_types = vec!["jsonb"; args.len()];
+        return Err(undefined_function("jsonb_delete", &arg_types));
+    };
+    let json = match json.get_value() {
+        Value::Null => return Ok(None),
+        Value::Text(json) => json.as_str(),
+        // The operator gives the function a jsonb value, which reads as text.
+        // A call written in SQL can give it another value.
+        other => {
+            return Err(undefined_function(
+                "jsonb_delete",
+                &[pg_type_name(other), "text"],
+            ))
+        }
+    };
+    let deletion = match names {
+        [name] => match json_deletion(name.get_value())? {
+            Some(deletion) => deletion,
+            None => return Ok(None),
+        },
+        _ => JsonDeletion::Keys(
+            names
+                .iter()
+                .filter_map(|name| match name.get_value() {
+                    Value::Null => None,
+                    Value::Text(name) => Some(Ok(name.as_str().to_string())),
+                    other => Some(Err(undefined_function(
+                        "jsonb_delete",
+                        &["jsonb", pg_type_name(other)],
+                    ))),
+                })
+                .collect::<Result<_>>()?,
+        ),
+    };
+    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
+    let not_deleted = match (json_members(json)?, deletion) {
+        (JsonMembers::Scalar, _) => {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "cannot delete from scalar",
+                None,
+            ))
+        }
+        (JsonMembers::Object(_), JsonDeletion::Index(_)) => {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "cannot delete from object using integer index",
+                None,
+            ))
+        }
+        (JsonMembers::Object(fields), JsonDeletion::Keys(keys)) => JsonMembers::Object(
+            fields
+                .into_iter()
+                .filter(|(name, _)| !keys.contains(&name.decoded))
+                .collect(),
+        ),
+        (JsonMembers::Array(elements), JsonDeletion::Keys(keys)) => {
+            let mut kept = Vec::with_capacity(elements.len());
+            for element in elements {
+                if !element.starts_with('"')
+                    || !keys.contains(&decode_json_string(element, &mut 0)?)
+                {
+                    kept.push(element);
+                }
+            }
+            JsonMembers::Array(kept)
+        }
+        (JsonMembers::Array(mut elements), JsonDeletion::Index(index)) => {
+            let count = elements.len() as i64;
+            let index = i64::from(index);
+            // An index before the first element deletes nothing, as one past
+            // the last does.
+            let index = if index < 0 { count + index } else { index };
+            if (0..count).contains(&index) {
+                elements.remove(index as usize);
+            }
+            JsonMembers::Array(elements)
+        }
+    };
+    let mut out = String::new();
+    match not_deleted {
+        JsonMembers::Object(fields) => push_json_object(fields, &mut out),
+        JsonMembers::Array(elements) => push_json_array(&elements, &mut out),
+        JsonMembers::Scalar => unreachable!("a scalar fails before"),
+    }
+    Jsonb::from_json(out).map(Some)
+}
+
+/// What the right operand `name` of `jsonb - name` deletes, or None for NULL.
+/// Its kind chooses, as its type does in PostgreSQL: a text is a key, an
+/// integer an index, and a text array a list of keys.
+fn json_deletion(name: &Value) -> Result<Option<JsonDeletion>> {
+    Ok(Some(match name {
+        Value::Null => return Ok(None),
+        Value::Text(name) => JsonDeletion::Keys(vec![name.as_str().to_string()]),
+        Value::Numeric(Numeric::Integer(index)) => match i32::try_from(*index) {
+            Ok(index) => JsonDeletion::Index(index),
+            // PostgreSQL has `jsonb - integer` and no `jsonb - bigint`.
+            Err(_) => return Err(undefined_operator("jsonb", "-", "bigint")),
+        },
+        Value::Numeric(Numeric::Float(_)) => {
+            return Err(undefined_operator("jsonb", "-", "numeric"))
+        }
+        Value::Blob(_) => {
+            let Some(elements) = turso_core::array_values_from_any(name) else {
+                return Err(undefined_operator("jsonb", "-", "bytea"));
+            };
+            let mut keys = Vec::with_capacity(elements.len());
+            for element in elements {
+                match element {
+                    Value::Null => {}
+                    Value::Text(key) => keys.push(key.as_str().to_string()),
+                    // An element that is an array: the array has more than one
+                    // dimension.
+                    Value::Blob(_) => {
+                        return Err(sqlstate_error(
+                            SQLSTATE_ARRAY_SUBSCRIPT_ERROR,
+                            "wrong number of array subscripts",
+                            None,
+                        ))
+                    }
+                    other => {
+                        return Err(undefined_operator(
+                            "jsonb",
+                            "-",
+                            &format!("{}[]", pg_type_name(&other)),
+                        ))
+                    }
+                }
+            }
+            JsonDeletion::Keys(keys)
+        }
+    }))
+}
+
+/// The members of a JSON document.
+enum JsonMembers<'a> {
+    /// The fields of an object, with their names and the text of their
+    /// values, in the order of the document.
+    Object(Vec<(JsonName<'a>, &'a str)>),
+    /// The text of each element of an array.
+    Array(Vec<&'a str>),
+    /// A scalar.
+    Scalar,
+}
+
+/// The members of the JSON document `json`, which must be valid JSON. The
+/// whole document is read, so that a bad escape or deep nesting anywhere in
+/// it errors as in PostgreSQL.
+fn json_members(json: &str) -> Result<JsonMembers<'_>> {
+    let json = json.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r'));
+    let mut fields = Vec::new();
+    let mut elements = Vec::new();
+    walk_json_members(json, |name, value| match name {
+        Some(name) => fields.push((name, value)),
+        None => elements.push(value),
+    })?;
+    Ok(match json.as_bytes()[0] {
+        b'{' => JsonMembers::Object(fields),
+        b'[' => JsonMembers::Array(elements),
+        _ => JsonMembers::Scalar,
+    })
+}
+
+/// Appends the JSON object with the fields `fields` to `out`. A jsonb column
+/// keeps two fields with the same name, where PostgreSQL keeps only the last
+/// one. This function keeps them too, so `j - 'k'` equals `j` when `j` has no
+/// field `k`.
+fn push_json_object<'a>(
+    fields: impl IntoIterator<Item = (JsonName<'a>, &'a str)>,
+    out: &mut String,
+) {
+    out.push('{');
+    for (i, (name, value)) in fields.into_iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(name.written);
+        out.push(':');
+        out.push_str(value);
+    }
+    out.push('}');
+}
+
+/// Appends the JSON array with the elements `elements` to `out`.
+fn push_json_array(elements: &[impl AsRef<str>], out: &mut String) {
+    out.push('[');
+    for (i, element) in elements.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(element.as_ref());
+    }
+    out.push(']');
+}
+
+impl Jsonb {
+    /// The jsonb value of the JSON text `json`, which must be valid JSON. The
+    /// json() of core writes it, as it writes the text of a jsonb column: with
+    /// no white space between its tokens.
+    fn from_json(json: String) -> Result<Self> {
+        let Value::Text(text) = turso_core::get_json(&Value::build_text(json), None)? else {
+            unreachable!("json() of a text is a text");
+        };
+        Ok(Self(text.as_str().to_string()))
+    }
 }
 
 /// PostgreSQL's `json -> key` and `jsonb -> key`: the JSON text of the field
@@ -1377,7 +1626,7 @@ fn json_field_span<'a>(json: &'a str, key: &JsonKey) -> Result<Option<&'a str>> 
     let mut found = None;
     let mut elements = Vec::new();
     walk_json_members(json, |member_key, value| match (member_key, key) {
-        (Some(name), JsonKey::Field(field)) if name == *field => found = Some(value),
+        (Some(name), JsonKey::Field(field)) if name.decoded == *field => found = Some(value),
         (None, JsonKey::Index(_)) => elements.push(value),
         // A name on an array or an index on an object.
         _ => {}
@@ -1395,12 +1644,12 @@ fn json_field_span<'a>(json: &'a str, key: &JsonKey) -> Result<Option<&'a str>> 
         .and_then(|index| elements.get(index).copied()))
 }
 
-/// Calls `visit` with the key and the text of the value of each member of the
-/// JSON object `json`, or with None and the text of each element of the JSON
-/// array `json`. A scalar has no members. `json` must be valid JSON.
+/// Calls `visit` with the name and the text of the value of each member of
+/// the JSON object `json`, or with None and the text of each element of the
+/// JSON array `json`. A scalar has no members. `json` must be valid JSON.
 fn walk_json_members<'a>(
     json: &'a str,
-    mut visit: impl FnMut(Option<String>, &'a str),
+    mut visit: impl FnMut(Option<JsonName<'a>>, &'a str),
 ) -> Result<()> {
     let bytes = json.as_bytes();
     let mut pos = 0;
@@ -1426,11 +1675,13 @@ fn walk_json_members<'a>(
             _ => {}
         }
         let key = if is_object {
-            let key = decode_json_string(json, &mut pos)?;
+            let start = pos;
+            let decoded = decode_json_string(json, &mut pos)?;
+            let written = &json[start..pos];
             skip_json_whitespace(bytes, &mut pos);
             pos += 1; // ':'
             skip_json_whitespace(bytes, &mut pos);
-            Some(key)
+            Some(JsonName { decoded, written })
         } else {
             None
         };
@@ -1440,6 +1691,14 @@ fn walk_json_members<'a>(
         visit(key, &json[start..pos]);
     }
     Ok(())
+}
+
+/// The name of a member of a JSON object.
+struct JsonName<'a> {
+    /// The name without quotes and escapes.
+    decoded: String,
+    /// The name as the document writes it, with its quotes.
+    written: &'a str,
 }
 
 /// PostgreSQL's `jsonb @> jsonb`, which is also its function jsonb_contains():

@@ -4170,6 +4170,11 @@ impl PostgreSQLTranslator {
                 );
             }
         }
+        if op_name == "-" {
+            if let Some(rhs) = a_expr.rexpr.as_deref() {
+                check_minus_right_operand(rhs)?;
+            }
+        }
 
         // Translate left and right expressions
         let left = Box::new(self.translate_operand(a_expr.lexpr.as_ref().unwrap())?);
@@ -7898,6 +7903,17 @@ fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
     Some(format!("{sign}{digits}"))
 }
 
+/// The PostgreSQL types, other than the text types, that a cast gives core as
+/// TEXT. No `-` operator of PostgreSQL takes one of them on the right, except
+/// `inet - inet` (see `check_minus_right_operand`).
+const NON_TEXT_TYPES_CAST_AS_TEXT: [&str; 10] = [
+    "UUID", "INET", "JSON", "XML", "CIDR", "MACADDR", "BIT", "VARBIT", "TSVECTOR", "TSQUERY",
+];
+
+/// The PostgreSQL types, other than the integer types, that a cast gives core
+/// as INTEGER. No `-` operator of PostgreSQL takes one of them on the right.
+const NON_INTEGER_TYPES_CAST_AS_INTEGER: [&str; 3] = ["OID", "REGCLASS", "REGTYPE"];
+
 /// FIXME(pg-catalog): This lowers PostgreSQL types to SQLite types in the parser (smallint and oid to INTEGER; numeric and money to REAL; json, inet and uuid to TEXT), so the PostgreSQL type is gone before the cast is checked. A pg_type lookup and a typed expression tree that keeps the type replace this.
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types. A type that the frontend
@@ -7909,8 +7925,8 @@ fn pg_type_name_to_ast_type(
     let pg_type = supported_type_name(type_name)?;
 
     let name = match pg_type.to_uppercase().as_str() {
-        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" | "OID"
-        | "REGCLASS" | "REGTYPE" => "INTEGER",
+        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" => "INTEGER",
+        name if NON_INTEGER_TYPES_CAST_AS_INTEGER.contains(&name) => "INTEGER",
         // Casts like INTEGER; the name types the result as int8.
         "BIGINT" | "INT8" | "BIGSERIAL" => "BIGINT",
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
@@ -7928,8 +7944,8 @@ fn pg_type_name_to_ast_type(
         // joins two objects, not two texts.
         "JSONB" => "jsonb",
         // For CAST expressions, map all text-like PG types to TEXT.
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INET" | "JSON" | "XML"
-        | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" => "TEXT",
+        name if NON_TEXT_TYPES_CAST_AS_TEXT.contains(&name) => "TEXT",
         "BYTEA" | "BLOB" => "BLOB",
         _ => &pg_type,
     };
@@ -8131,6 +8147,159 @@ fn interval_parts(text: &str) -> Option<IntervalParts> {
         any = true;
     }
     any.then_some(parts)
+}
+
+/// Refuses `rhs`, the right operand of a binary `-`, when its syntax shows a
+/// type that no `-` operator of PostgreSQL takes on the right (see
+/// `minus_right_operand_type`). PostgreSQL then fails with 42883 for each left
+/// operand. Only `inet - inet` takes an inet or a cidr on the right, so such an
+/// operand fails with 0A000.
+// FIXME(pg-catalog): PostgreSQL has no `-` operator whose right operand is a
+// boolean, json, uuid, xml, macaddr, bit, varbit, tsvector, tsquery, oid,
+// regclass or regtype value, and these types have no implicit cast to a type
+// that has one. The translator gives core a boolean expression as an integer,
+// and a cast to one of these types as a cast to text or to an integer (see
+// `pg_type_name_to_ast_type`). Thus core would run `jsonb - integer` or
+// `jsonb - text` on them. This check reads the syntax of the right operand
+// instead of its type, so it does not see such a value when a function or a
+// column of a subquery gives it. A lookup in pg_operator by the types of the
+// operands, in an expression tree that carries PostgreSQL types, replaces
+// this.
+fn check_minus_right_operand(rhs: &pg_query::protobuf::Node) -> Result<(), ParseError> {
+    let Some(type_name) = minus_right_operand_type(rhs) else {
+        return Ok(());
+    };
+    if matches!(type_name.as_str(), "inet" | "cidr") {
+        return Err(ParseError::not_supported(format!(
+            "- with a right operand of type {type_name}"
+        )));
+    }
+    Err(ParseError::Sqlstate {
+        sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
+        message: format!("no operator - takes a right operand of type {type_name}"),
+    })
+}
+
+/// The PostgreSQL type of `rhs`, the right operand of `-`, when its syntax
+/// shows a type that the translator gives core as an integer or as text, and
+/// that no `-` operator of PostgreSQL takes on the right, except `inet - inet`.
+/// A comparison, AND, OR, NOT, EXISTS, IN, LIKE, BETWEEN, a test such as IS
+/// NULL, and a boolean literal give `boolean`. A cast gives the type of the
+/// cast, such as `uuid` or `json[]`. A scalar subquery, CASE, COALESCE,
+/// GREATEST, LEAST or NULLIF gives such a type when one of its results does.
+fn minus_right_operand_type(rhs: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::{a_const::Val, node::Node, AExprKind, SubLinkType};
+    let is_boolean = match rhs.node.as_ref()? {
+        Node::BoolExpr(_) | Node::NullTest(_) | Node::BooleanTest(_) => true,
+        Node::AConst(constant) => matches!(constant.val, Some(Val::Boolval(_))),
+        Node::SubLink(sub_link) => match sub_link.sub_link_type() {
+            SubLinkType::ExistsSublink
+            | SubLinkType::AllSublink
+            | SubLinkType::AnySublink
+            | SubLinkType::RowcompareSublink => true,
+            SubLinkType::ExprSublink => {
+                return scalar_subquery_value(sub_link).and_then(minus_right_operand_type)
+            }
+            _ => false,
+        },
+        Node::CaseExpr(case) => {
+            let mut results = case.args.iter().filter_map(|when| match &when.node {
+                Some(Node::CaseWhen(when)) => when.result.as_deref(),
+                _ => None,
+            });
+            return results
+                .find_map(minus_right_operand_type)
+                .or_else(|| case.defresult.as_deref().and_then(minus_right_operand_type));
+        }
+        Node::CoalesceExpr(coalesce) => {
+            return coalesce.args.iter().find_map(minus_right_operand_type)
+        }
+        Node::MinMaxExpr(min_max) => return min_max.args.iter().find_map(minus_right_operand_type),
+        Node::AExpr(a_expr) => match a_expr.kind() {
+            AExprKind::AexprOp => {
+                a_expr.lexpr.is_some()
+                    && matches!(
+                        last_string(&a_expr.name).as_deref(),
+                        Some(
+                            "=" | "<>"
+                                | "!="
+                                | "<"
+                                | "<="
+                                | ">"
+                                | ">="
+                                | "~~"
+                                | "!~~"
+                                | "~~*"
+                                | "!~~*"
+                                | "~"
+                                | "!~"
+                                | "~*"
+                                | "!~*"
+                                | "@>"
+                                | "<@"
+                                | "&&"
+                        )
+                    )
+            }
+            AExprKind::AexprOpAny
+            | AExprKind::AexprOpAll
+            | AExprKind::AexprDistinct
+            | AExprKind::AexprNotDistinct
+            | AExprKind::AexprIn
+            | AExprKind::AexprLike
+            | AExprKind::AexprIlike
+            | AExprKind::AexprSimilar
+            | AExprKind::AexprBetween
+            | AExprKind::AexprNotBetween
+            | AExprKind::AexprBetweenSym
+            | AExprKind::AexprNotBetweenSym => true,
+            // NULLIF(a, b) has the type of `a`.
+            AExprKind::AexprNullif => {
+                return a_expr.lexpr.as_deref().and_then(minus_right_operand_type)
+            }
+            AExprKind::Undefined => false,
+        },
+        Node::TypeCast(cast) => {
+            let type_name = cast.type_name.as_ref()?;
+            let name = last_string(&type_name.names)?.to_uppercase();
+            let name = match name.as_str() {
+                "BOOL" | "BOOLEAN" => "boolean".to_string(),
+                name if NON_TEXT_TYPES_CAST_AS_TEXT.contains(&name)
+                    || NON_INTEGER_TYPES_CAST_AS_INTEGER.contains(&name) =>
+                {
+                    name.to_lowercase()
+                }
+                _ => return None,
+            };
+            return Some(format!(
+                "{name}{}",
+                "[]".repeat(type_name.array_bounds.len())
+            ));
+        }
+        _ => false,
+    };
+    is_boolean.then(|| "boolean".to_string())
+}
+
+/// The expression of the only column of the scalar subquery `sub_link`, when
+/// its SELECT has one column and no UNION, INTERSECT or EXCEPT.
+fn scalar_subquery_value(
+    sub_link: &pg_query::protobuf::SubLink,
+) -> Option<&pg_query::protobuf::Node> {
+    use pg_query::protobuf::{node::Node, SetOperation};
+    let Some(Node::SelectStmt(select)) = sub_link.subselect.as_deref()?.node.as_ref() else {
+        return None;
+    };
+    if select.op() != SetOperation::SetopNone {
+        return None;
+    }
+    let [target] = select.target_list.as_slice() else {
+        return None;
+    };
+    match target.node.as_ref()? {
+        Node::ResTarget(target) => target.val.as_deref(),
+        _ => None,
+    }
 }
 
 /// Extract an integer value from a DefElem's arg node.
