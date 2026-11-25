@@ -75,6 +75,11 @@ nesting limits, and one level past them, on the CLI backend. CI runs it with a
 release build and an 8 MiB stack. A debug build skips it. When you add a kind of
 nesting, add a query there.
 
+`sqlite/conformance/turso-sqltests/trigger-depth-limits.sqltest` runs chains of
+triggers and of foreign key actions at the trigger depth limit, on the CLI
+backend. CI runs it with a release build and an 8 MiB stack. A debug build skips
+it. When you add a kind of nested program, add a chain there.
+
 ## Corruption
 
 For WAL corruption and integrity failures, use `scripts/corruption-debug-tools/`.

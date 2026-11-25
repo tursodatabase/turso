@@ -1220,10 +1220,13 @@ pub fn emit_program(
     program: &mut ProgramBuilder,
     plan: Plan,
 ) -> Result<()> {
+    // This function is on the recursive path of nested programs (see
+    // translate_inner), so the arms give the plans to the emitters in their
+    // boxes.
     match plan {
-        Plan::Select(plan) => emit_program_for_select(program, resolver, *plan),
-        Plan::Delete(plan) => emit_program_for_delete(connection, resolver, program, *plan),
-        Plan::Update(plan) => emit_program_for_update(connection, resolver, program, *plan),
+        Plan::Select(plan) => emit_boxed_select(program, resolver, plan),
+        Plan::Delete(plan) => emit_program_for_delete(connection, resolver, program, plan),
+        Plan::Update(plan) => emit_program_for_update(connection, resolver, program, plan),
         mut plan @ Plan::CompoundSelect { .. } => {
             emit_program_for_compound_select(program, resolver, &mut plan).map(|_| ())
         }
@@ -1232,6 +1235,18 @@ pub fn emit_program(
                 .map(|_| ())
         }
     }
+}
+
+/// Emits a SELECT plan for [emit_program]. The plan leaves its [Box] here. This
+/// function is not inlined, so that the plan is in the stack frame of this
+/// function, and not in the frame of [emit_program].
+#[inline(never)]
+fn emit_boxed_select(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    plan: Box<super::plan::SelectPlan>,
+) -> Result<()> {
+    emit_program_for_select(program, resolver, *plan)
 }
 
 /// Returns the single-column schema used by rowid-only hash build inputs.

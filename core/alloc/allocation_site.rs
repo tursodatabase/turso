@@ -32,7 +32,7 @@ impl From<FtsAllocationSite> for AllocationSite {
 /// [DatabaseAllocators](crate::DatabaseAllocators).
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum StatementAllocationSite {
-    /// The program builder of a nested trigger program.
+    /// The program builder of a nested trigger or foreign key action program.
     TriggerProgramBuilder,
     /// The statement that executes a nested trigger or foreign key action
     /// program.

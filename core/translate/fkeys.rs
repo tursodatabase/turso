@@ -1,6 +1,9 @@
 use crate::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
-use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
+use super::{
+    build_program, new_program_builder, translate_inner, ProgramBuilder, ProgramBuilderOpts,
+};
+use crate::alloc::StatementAllocationSite;
 use crate::namespace::NamespaceRef;
 use crate::translate::emitter::emit_columns_and_dependencies;
 use crate::translate::expr::{emit_constraint_values_decode, emit_stored_column};
@@ -1847,7 +1850,7 @@ fn emit_fk_action_subprogram(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
     connection: &Arc<Connection>,
-    stmt: ast::Stmt,
+    stmt: Box<ast::Stmt>,
     ctx: &FkActionContext,
     foreign_key: Arc<ForeignKey>,
     description: &'static str,
@@ -1865,13 +1868,22 @@ fn emit_fk_action_subprogram(
         let Some(depth) = program.nested_subprogram_depth() else {
             return Ok(());
         };
-        let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
-            QueryMode::Normal,
-            program.capture_data_changes_info().clone(),
-            FK_SUBPROGRAM_OPTS,
-            program.is_mvcc_enabled(),
-            depth,
-        );
+        // new_program_builder makes the large builder in its own stack frame,
+        // and not in this frame, which is on the recursive path of nested
+        // programs (see translate_inner).
+        let mut subprogram_builder = new_program_builder(
+            connection,
+            StatementAllocationSite::TriggerProgramBuilder,
+            || {
+                ProgramBuilder::new_for_subprogram(
+                    QueryMode::Normal,
+                    program.capture_data_changes_info().clone(),
+                    FK_SUBPROGRAM_OPTS,
+                    program.is_mvcc_enabled(),
+                    depth,
+                )
+            },
+        )?;
         subprogram_builder
             .flags
             .set_writes_stored_values(ctx.new_key_is_stored);
@@ -1890,7 +1902,7 @@ fn emit_fk_action_subprogram(
             )
         })?;
         subprogram_builder.epilogue(resolver.schema());
-        let built = subprogram_builder.build(connection, true, description)?;
+        let built = build_program(subprogram_builder, connection, true, description)?;
         let prepared = built.prepared().clone();
         entry
             .slot
@@ -1928,14 +1940,19 @@ fn qualified_table_name(table_name: &str, db_name: Option<&str>) -> QualifiedNam
 
 /// Generate a DELETE statement AST for CASCADE DELETE:
 /// DELETE FROM child_table WHERE fk_col1 = ?1 AND fk_col2 = ?2 ...
+///
+/// It returns the statement in a [Box] and it is not inlined, so that the frames
+/// on the recursive path of nested programs keep only the [Box] (see
+/// [translate_inner]).
+#[inline(never)]
 fn generate_cascade_delete_stmt(
     child_table: &str,
     child_cols: &[String],
     parent_collations: &[CollationSeq],
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
-) -> ast::Stmt {
-    ast::Stmt::Delete {
+) -> Box<ast::Stmt> {
+    Box::new(ast::Stmt::Delete {
         with: None,
         tbl_name: qualified_table_name(child_table, db_name),
         indexed: None,
@@ -1946,18 +1963,23 @@ fn generate_cascade_delete_stmt(
         ))),
         returning: vec![],
         truncate: false,
-    }
+    })
 }
 
 /// Generate an UPDATE statement AST for SET NULL:
 /// UPDATE child_table SET fk_col1 = NULL, fk_col2 = NULL ... WHERE fk_col1 = ?1 AND fk_col2 = ?2 ...
+///
+/// It returns the statement in a [Box] and it is not inlined, so that the frames
+/// on the recursive path of nested programs keep only the [Box] (see
+/// [translate_inner]).
+#[inline(never)]
 fn generate_set_null_stmt(
     child_table: &str,
     child_cols: &[String],
     parent_collations: &[CollationSeq],
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
-) -> ast::Stmt {
+) -> Box<ast::Stmt> {
     // Build SET clause: fk_col1 = NULL, fk_col2 = NULL ...
     let sets: Vec<ast::Set> = child_cols
         .iter()
@@ -1966,7 +1988,7 @@ fn generate_set_null_stmt(
             expr: Box::new(Expr::Literal(Literal::Null)),
         })
         .collect();
-    ast::Stmt::Update(ast::Update {
+    Box::new(ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
         tbl_name: qualified_table_name(child_table, db_name),
@@ -1979,18 +2001,23 @@ fn generate_set_null_stmt(
             ctx,
         ))),
         returning: vec![],
-    })
+    }))
 }
 
 /// Generate an UPDATE statement AST for SET DEFAULT:
 /// UPDATE child_table SET fk_col1 = default1, fk_col2 = default2 ... WHERE fk_col1 = ?old1 AND fk_col2 = ?old2 ...
+///
+/// It returns the statement in a [Box] and it is not inlined, so that the frames
+/// on the recursive path of nested programs keep only the [Box] (see
+/// [translate_inner]).
+#[inline(never)]
 fn generate_set_default_stmt(
     child_table: &BTreeTable,
     child_cols: &[String],
     parent_collations: &[CollationSeq],
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
-) -> ast::Stmt {
+) -> Box<ast::Stmt> {
     // Build SET clause: if no default is defined for a column, we use NULL
     let sets: Vec<ast::Set> = child_cols
         .iter()
@@ -2007,7 +2034,7 @@ fn generate_set_default_stmt(
         })
         .collect();
 
-    ast::Stmt::Update(ast::Update {
+    Box::new(ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
         tbl_name: qualified_table_name(&child_table.name, db_name),
@@ -2020,18 +2047,23 @@ fn generate_set_default_stmt(
             ctx,
         ))),
         returning: vec![],
-    })
+    }))
 }
 
 /// Generate an UPDATE statement AST for CASCADE UPDATE:
 /// UPDATE child_table SET fk_col1 = ?new1, fk_col2 = ?new2 ... WHERE fk_col1 = ?old1 AND fk_col2 = ?old2 ...
+///
+/// It returns the statement in a [Box] and it is not inlined, so that the frames
+/// on the recursive path of nested programs keep only the [Box] (see
+/// [translate_inner]).
+#[inline(never)]
 fn generate_cascade_update_stmt(
     child_table: &str,
     child_cols: &[String],
     parent_collations: &[CollationSeq],
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
-) -> ast::Stmt {
+) -> Box<ast::Stmt> {
     // Build SET clause
     let sets: Vec<ast::Set> = child_cols
         .iter()
@@ -2053,7 +2085,7 @@ fn generate_cascade_update_stmt(
         .collect();
 
     let where_clause = build_fk_match_where_clause(child_cols, parent_collations, ctx);
-    ast::Stmt::Update(ast::Update {
+    Box::new(ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
         tbl_name: qualified_table_name(child_table, db_name),
@@ -2062,7 +2094,7 @@ fn generate_cascade_update_stmt(
         from: None,
         where_clause: Some(Box::new(where_clause)),
         returning: vec![],
-    })
+    }))
 }
 
 /// Build a WHERE clause that matches FK columns to parameter values:
@@ -2407,7 +2439,10 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
         if prepared.is_empty() {
             return Ok(());
         }
-        for action in prepared {
+        // The actions stay in the vector, so that no copy of an action is in
+        // this frame, which is on the recursive path of nested programs (see
+        // translate_inner).
+        for action in &prepared {
             match action.fk_ref.fk.on_delete {
                 RefAct::Cascade => {
                     fire_fk_cascade_delete(
