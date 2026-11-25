@@ -88,18 +88,13 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             )
             .receiving_argument_types()
             .checking_argument_types(check_timestamp_plus_interval_types)
-            // FIXME(pg-catalog): The check refuses a domain on the left because
-            // the result would get the domain's type, where pg_operator gives
-            // the base type (timestamp or timestamptz). A pg_operator lookup
-            // replaces this.
             .returning_argument_type(0),
         )
 }
 
 /// Refuses the left side of `+ interval` when it is not timestamp or
-/// timestamptz. `types` are the argument type names, with domain names kept;
-/// the first is the left side, so a domain over timestamp or timestamptz is
-/// refused. Every other type gets 0A000, including the ones that have no operator
+/// timestamptz. `types` are the argument type names, with a domain replaced by
+/// its base type; the first is the left side. Every other type gets 0A000, including the ones that have no operator
 /// in PostgreSQL (which gives 42883), because the type name does not say
 /// whether PostgreSQL has one. The translator turns `-` into `+` of the
 /// negated interval, so the message always says `+`.
@@ -122,18 +117,15 @@ fn check_timestamp_plus_interval_types(types: &[String]) -> Result<()> {
 }
 
 /// Refuses date_trunc when its second argument is not timestamp or
-/// timestamptz. `types` are the argument type names, with domain names kept,
-/// so a domain over timestamp or timestamptz is refused: the result gets the
-/// second argument's type, which would be the domain's type where PostgreSQL
-/// gives the base type.
+/// timestamptz. `types` are the argument type names, with a domain replaced by
+/// its base type, as PostgreSQL resolves it.
 // FIXME(pg-catalog): HACK. This is a hand-written overload rule: the second
 // argument of date_trunc is timestamp or timestamptz, and the result has that
 // type (see `returning_argument_type(1)` where date_trunc is registered). It
 // stands in for the pg_proc rows date_trunc(text, timestamp) returns timestamp
 // and date_trunc(text, timestamptz) returns timestamptz. It refuses with 0A000
 // arguments that PostgreSQL accepts, such as a date, which PostgreSQL casts to
-// timestamptz, and a domain over timestamp or timestamptz, for which
-// PostgreSQL returns the base type. A pg_proc lookup replaces it.
+// timestamptz. A pg_proc lookup replaces it.
 fn check_date_trunc_types(types: &[String]) -> Result<()> {
     let time_type = types[1].as_str();
     match time_type {

@@ -3085,6 +3085,18 @@ expect {
     |1
 }
 
+# date_trunc of a domain over timestamptz resolves the domain as its base type,
+# including in a CHECK constraint.
+test date-trunc-domain-over-timestamptz {
+    CREATE DOMAIN dtz AS timestamptz;
+    CREATE TABLE trunc_dtz (b dtz, CHECK (date_trunc('day', b) IS NOT NULL));
+    INSERT INTO trunc_dtz VALUES ('2020-03-04 05:06:07+00');
+    SELECT date_trunc('day', b) FROM trunc_dtz;
+}
+expect {
+    2020-03-04 00:00:00+00
+}
+
 # date_trunc accepts the unit spellings of PostgreSQL's interval unit table,
 # in any letter case. A name longer than 10 characters matches on its first 10.
 test date-trunc-unit-aliases {

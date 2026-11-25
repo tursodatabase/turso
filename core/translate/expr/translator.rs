@@ -1123,8 +1123,11 @@ fn translate_function_call_expr(
                     let written_types: Vec<ExprType> =
                         args.iter().map(|arg| type_of(arg, &env)).collect();
                     if let Some(check) = external.func.check_argument_types() {
-                        let names: Vec<String> =
-                            written_types.iter().map(|ty| ty.to_string()).collect();
+                        // A domain is checked as its base type, as PostgreSQL resolves it.
+                        let names: Vec<String> = written_types
+                            .iter()
+                            .map(|ty| name_without_domains(ty.clone(), resolver.schema()))
+                            .collect();
                         check(&names)?;
                     }
                     written_types

@@ -924,8 +924,6 @@ expect {
 }
 
 # date_trunc of a domain over timestamp returns the base type, timestamp.
-# tursopg would give the result the domain's type, so it refuses the call.
-@compat-gap "function:date_trunc"
 test date-trunc-domain-over-timestamp {
     CREATE DOMAIN trunc_ts AS timestamp;
     CREATE TABLE trunc_domain_events (at trunc_ts);
@@ -934,10 +932,6 @@ test date-trunc-domain-over-timestamp {
 }
 expect {
     2026-10-08 00:00:00
-}
-@sqlstate 0A000
-expect @tursopg error {
-    date_trunc is supported only for timestamp and timestamptz, not trunc_ts
 }
 
 # B-93: nullif / greatest / least
