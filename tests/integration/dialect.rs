@@ -1,3 +1,5 @@
+use std::cmp::Ordering as CmpOrdering;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use turso_core::ast::Cmd;
 use turso_core::ast::CreateTableBody;
@@ -14,6 +16,7 @@ use turso_core::security::roles::SessionRole;
 use turso_core::storage::database::DatabaseFile;
 use turso_core::sync::atomic::AtomicUsize;
 use turso_core::sync::atomic::Ordering;
+use turso_core::type_ordering::{OrderingDef, TypeOrdering};
 use turso_core::types::Conversion;
 use turso_core::types::IOResultOr;
 use turso_core::types::Type;
@@ -32,6 +35,7 @@ use turso_core::OpenOptions;
 use turso_core::Result;
 use turso_core::StatementStatusCounter;
 use turso_core::Value;
+use turso_core::ValueRef;
 use turso_core::IO;
 use turso_ext::ConstraintInfo;
 use turso_ext::ConstraintUsage;
@@ -1689,9 +1693,10 @@ fn a_type_with_an_encode_cannot_be_a_rowid_alias() {
     );
 }
 
-/// A dialect that registers four types written in Rust: `loud`, a
+/// A dialect that registers five types written in Rust: `loud`, a
 /// `boolean` that replaces the type of core, `truth`, the type of
-/// conditions, and `percent`, whose primary key is the rowid.
+/// conditions, `percent`, whose primary key is the rowid, and
+/// `magnitude_int`, which has an order of its own.
 struct RustTypesDialect;
 
 impl Dialect for RustTypesDialect {
@@ -1740,7 +1745,8 @@ impl Dialect for RustTypesDialect {
             .builtin_type(&Loud)?
             .builtin_type(&SiNoBoolean)?
             .builtin_type(&Truth)?
-            .builtin_type(&Percent)
+            .builtin_type(&Percent)?
+            .builtin_type(&MagnitudeInt)
     }
 
     fn choose_operator(
@@ -2246,4 +2252,179 @@ fn the_catalog_gets_a_new_schema_and_a_dropped_schema() {
         *commands.lock().unwrap(),
         ["create schema app", "drop schema app"]
     );
+}
+
+/// An integer that is stored as 8 bytes, which sort in another order than the
+/// integers, and that compares by its absolute value: -5 equals 5.
+#[derive(Debug)]
+struct MagnitudeInt;
+
+impl Type for MagnitudeInt {
+    fn name(&self) -> &str {
+        "magnitude_int"
+    }
+
+    fn params(&self) -> Vec<turso_core::ast::TypeParam> {
+        vec![value_param("integer")]
+    }
+
+    fn base(&self) -> &str {
+        "blob"
+    }
+
+    fn encode(&self) -> Option<Conversion> {
+        Some(Conversion::Function(|value, _params| match value {
+            Value::Numeric(Numeric::Integer(integer)) => {
+                Ok(Value::from_blob(integer.to_be_bytes().to_vec()))
+            }
+            other => Err(LimboError::Constraint(format!("{other} is not an integer"))),
+        }))
+    }
+
+    fn decode(&self) -> Option<Conversion> {
+        Some(Conversion::Function(|value, _params| match value {
+            Value::Blob(bytes) => match <[u8; 8]>::try_from(bytes.as_slice()) {
+                Ok(bytes) => Ok(Value::from_i64(i64::from_be_bytes(bytes))),
+                Err(_) => Err(LimboError::Constraint("not 8 bytes".to_string())),
+            },
+            other => Ok(other.clone()),
+        }))
+    }
+
+    fn reads_as(&self) -> Option<turso_core::types::StorageClass> {
+        Some(turso_core::types::StorageClass::Integer)
+    }
+
+    fn ordering(&self) -> Option<TypeOrdering> {
+        Some(TypeOrdering::new(&BY_MAGNITUDE))
+    }
+}
+
+static BY_MAGNITUDE: OrderingDef = OrderingDef {
+    name: "by_magnitude",
+    compare: magnitude_compare,
+    compare_operands: None,
+    hash: magnitude_hash,
+};
+
+/// The absolute value of a stored integer or of a plain integer, which is what
+/// a comparison with a literal brings.
+fn magnitude(value: ValueRef) -> Option<u64> {
+    match value {
+        ValueRef::Blob(bytes) => <[u8; 8]>::try_from(bytes)
+            .ok()
+            .map(|bytes| i64::from_be_bytes(bytes).unsigned_abs()),
+        ValueRef::Numeric(Numeric::Integer(integer)) => Some(integer.unsigned_abs()),
+        _ => None,
+    }
+}
+
+fn magnitude_compare(left: ValueRef, right: ValueRef) -> CmpOrdering {
+    match (magnitude(left), magnitude(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (None, None) => left.cmp(&right),
+        (None, Some(_)) => CmpOrdering::Less,
+        (Some(_), None) => CmpOrdering::Greater,
+    }
+}
+
+fn magnitude_hash(value: ValueRef, mut state: &mut dyn Hasher) {
+    magnitude(value).hash(&mut state);
+}
+
+fn integers(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<i64>> {
+    conn.prepare(sql)
+        .unwrap()
+        .run_collect_rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.iter().map(|value| value.as_int().unwrap()).collect())
+        .collect()
+}
+
+#[test]
+fn a_type_sorts_and_compares_in_its_own_order() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_db(&io, "dialect-order.db", Arc::new(RustTypesDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, m magnitude_int) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, -5), (2, 3), (3, -1), (4, 1), (5, 5)")
+        .unwrap();
+
+    assert_eq!(
+        integers(&conn, "SELECT m FROM t ORDER BY m, id"),
+        vec![vec![-1], vec![1], vec![3], vec![-5], vec![5]]
+    );
+    assert_eq!(
+        integers(&conn, "SELECT id FROM t WHERE m = 1 ORDER BY id"),
+        vec![vec![3], vec![4]]
+    );
+    assert_eq!(
+        integers(&conn, "SELECT id FROM t WHERE m = -5 ORDER BY id"),
+        vec![vec![1], vec![5]]
+    );
+    assert_eq!(
+        integers(&conn, "SELECT id FROM t WHERE m < 3 ORDER BY id"),
+        vec![vec![3], vec![4]]
+    );
+    assert_eq!(
+        integers(
+            &conn,
+            "SELECT id FROM t WHERE m BETWEEN 2 AND 4 ORDER BY id"
+        ),
+        vec![vec![2]]
+    );
+    assert_eq!(
+        integers(&conn, "SELECT count(*) FROM (SELECT DISTINCT m FROM t)"),
+        vec![vec![3]]
+    );
+    assert_eq!(
+        integers(&conn, "SELECT count(*) FROM t GROUP BY m ORDER BY 1"),
+        vec![vec![1], vec![2], vec![2]]
+    );
+
+    conn.execute("CREATE TABLE u (n magnitude_int) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO u VALUES (-3), (1)").unwrap();
+    assert_eq!(
+        integers(
+            &conn,
+            "SELECT t.id, u.n FROM t JOIN u ON t.m = u.n ORDER BY t.id"
+        ),
+        vec![vec![2, -3], vec![3, 1], vec![4, 1]]
+    );
+    conn.close().unwrap();
+}
+
+#[test]
+fn an_index_on_a_type_with_its_own_order_keeps_that_order() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_db(&io, "dialect-order-index.db", Arc::new(RustTypesDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE u (n magnitude_int) STRICT")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX u_n ON u (n)").unwrap();
+    conn.execute("INSERT INTO u VALUES (-3), (1), (-7)")
+        .unwrap();
+
+    let error = conn.execute("INSERT INTO u VALUES (3)").unwrap_err();
+    assert!(error.to_string().contains("UNIQUE"), "{error}");
+    assert_eq!(
+        integers(&conn, "SELECT n FROM u WHERE n = 3"),
+        vec![vec![-3]]
+    );
+    assert_eq!(
+        integers(&conn, "SELECT n FROM u WHERE n > 2 ORDER BY n"),
+        vec![vec![-3], vec![-7]]
+    );
+    assert_eq!(
+        integers(&conn, "SELECT n FROM u ORDER BY n DESC"),
+        vec![vec![-7], vec![-3], vec![1]]
+    );
+    conn.close().unwrap();
 }
