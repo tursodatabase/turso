@@ -48,6 +48,7 @@ fn run_mcp_server(app: app::Limbo) -> anyhow::Result<()> {
         app.get_io().as_ref(),
         app.opts.db_file.clone(),
         interrupt_count,
+        app.db_opts,
     );
 
     mcp_server.run()

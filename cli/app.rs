@@ -2438,12 +2438,28 @@ fn fetch_single_i64(rows: &mut turso_core::Statement) -> anyhow::Result<i64> {
     result.ok_or_else(|| anyhow!("query did not return a row"))
 }
 
+/// Returns the database name `name` without its URI query, for messages.
+/// The query can hold the encryption key, which a message must not show.
+pub(crate) fn database_name_without_query(name: &str) -> &str {
+    if name.starts_with("file:") {
+        // The URI parser ends the path at the first '?' or '#'.
+        return name.split(['?', '#']).next().unwrap_or(name);
+    }
+    match name.rfind('?') {
+        // database_uri reads the name as a URI, and normalize_db_path
+        // starts the query at the last '?'.
+        Some(pos) if database_uri(name).is_some() => &name[..pos],
+        _ => name,
+    }
+}
+
 /// Returns the `file:` URI that the database name `name` stands for, or
-/// `None` if `name` is a plain file name. The database argument of tursodb
-/// and `.open` both use this function. Thus both take the open options,
-/// such as the `cipher` and `hexkey` of an encrypted database, from the URI
-/// query, and neither uses the query as a part of a file name.
-fn database_uri(name: &str) -> Option<String> {
+/// `None` if `name` is a plain file name. The database argument of tursodb,
+/// `.open` and the `open_database` tool of the MCP server use this
+/// function. Thus all of them take the open options, such as the `cipher`
+/// and `hexkey` of an encrypted database, from the URI query, and none of
+/// them uses the query as a part of a file name.
+pub(crate) fn database_uri(name: &str) -> Option<String> {
     let name = normalize_db_path(name.to_string());
     name.starts_with("file:").then_some(name)
 }
@@ -2651,6 +2667,22 @@ mod tests {
             normalize_db_path("a%#?b.db?mode=ro".into()),
             "file:a%25%23%3Fb.db?mode=ro"
         );
+    }
+
+    #[test]
+    fn test_database_name_without_query() {
+        for (name, shown) in [
+            ("x.db", "x.db"),
+            (":memory:", ":memory:"),
+            ("what?.db", "what?.db"),
+            ("x.db?cipher=aegis256&hexkey=00", "x.db"),
+            ("a?b.db?mode=ro", "a?b.db"),
+            ("notes#2.db?mode=ro", "notes#2.db"),
+            ("file:x.db?cipher=aegis256&hexkey=00", "file:x.db"),
+            ("file:x.db#fragment", "file:x.db"),
+        ] {
+            assert_eq!(database_name_without_query(name), shown, "{name}");
+        }
     }
 
     #[test]

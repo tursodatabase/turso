@@ -121,6 +121,8 @@ tursodb --readonly production.db "INSERT INTO users VALUES (1, 'test');"
 
 Start a Model Context Protocol server instead of the interactive shell. This allows AI assistants and other MCP clients to interact with the database via JSON-RPC.
 
+The `open_database` tool of the server reads a database name as the `.open` command does, and opens the database with the options given on the command line, such as `--experimental-encryption`. Its messages show the name without the URI parameters, because they can hold the encryption key.
+
 ```bash
 tursodb --mcp mydata.db
 ```
