@@ -3196,7 +3196,7 @@ pub fn op_union_tag(
     );
 
     let val = state.registers[*src_reg].get_value();
-    let result = match val {
+    let tag_name = match val {
         Value::Blob(blob) if !blob.is_empty() => {
             let tag_index = blob[0] as usize;
             debug_assert!(
@@ -3204,15 +3204,20 @@ pub fn op_union_tag(
                 "union tag index {tag_index} out of range (len={})",
                 tag_names.len()
             );
-            match tag_names.get(tag_index) {
-                Some(name) => Value::build_text(name.clone()),
-                None => Value::Null,
-            }
+            tag_names.get(tag_index)
         }
-        _ => Value::Null,
+        _ => None,
     };
 
-    state.registers[*dest].set_value(result);
+    // A register that holds text keeps its buffer: copy the name into it,
+    // without first copying the name into a String that is then freed.
+    match (tag_name, &mut state.registers[*dest]) {
+        (Some(name), Register::Value(Value::Text(existing))) => {
+            existing.do_extend(&name.as_str())?
+        }
+        (Some(name), register) => register.set_text(Text::new(name.clone()))?,
+        (None, register) => register.set_null(),
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
