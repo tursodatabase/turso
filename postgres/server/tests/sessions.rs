@@ -74,11 +74,16 @@ fn schema_dropped_by_one_client_is_gone_for_another() {
 fn time_zone_other_than_utc_is_refused_at_connection() {
     let server = TestServer::start();
     for startup in [
-        ("TimeZone", "America/New_York"),
-        ("options", "-c TimeZone=America/New_York"),
-        ("options", "--TimeZone=America/New_York"),
+        vec![("TimeZone", "America/New_York")],
+        vec![("options", "-c TimeZone=America/New_York")],
+        vec![("options", "--TimeZone=America/New_York")],
+        // PostgreSQL would run this one in New York.
+        vec![
+            ("TimeZone", "America/New_York"),
+            ("options", "-c TimeZone=UTC"),
+        ],
     ] {
-        let error = server.connect_error(&[startup]);
+        let error = server.connect_error(&startup);
         assert!(error.contains("0A000"), "{startup:?}: {error}");
         assert!(error.contains("America/New_York"), "{startup:?}: {error}");
     }

@@ -203,36 +203,40 @@ impl StartupHandler for UtcOnlyStartupHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         if let PgWireFrontendMessage::Startup(startup) = &message {
-            let requested = startup.parameters.iter().fold(None, |zone, (name, value)| {
-                if name.eq_ignore_ascii_case("timezone") {
-                    Some(value.as_str())
-                } else if name == "options" {
-                    time_zone_in_options(value).or(zone)
-                } else {
-                    zone
-                }
-            });
-            if let Some(zone) = requested {
-                if !is_utc(zone) {
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "FATAL".to_owned(),
-                        SQLSTATE_FEATURE_NOT_SUPPORTED.to_owned(),
-                        format!(
-                            "time zone \"{}\" is not supported; tursopg supports only UTC",
-                            error_field_value(zone)
-                        ),
-                    ))));
-                }
+            // PostgreSQL gives the TimeZone parameter priority over `options`.
+            // Refusing any non-UTC zone needs no precedence rule.
+            let non_utc = startup
+                .parameters
+                .iter()
+                .flat_map(|(name, value)| -> Vec<&str> {
+                    if name.eq_ignore_ascii_case("timezone") {
+                        vec![value.as_str()]
+                    } else if name == "options" {
+                        time_zones_in_options(value)
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .find(|zone| !is_utc(zone));
+            if let Some(zone) = non_utc {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".to_owned(),
+                    SQLSTATE_FEATURE_NOT_SUPPORTED.to_owned(),
+                    format!(
+                        "time zone \"{}\" is not supported; tursopg supports only UTC",
+                        error_field_value(zone)
+                    ),
+                ))));
             }
         }
         NoopHandler.on_startup(client, message).await
     }
 }
 
-/// The last time zone that the `options` startup parameter sets, with
+/// Every time zone that the `options` startup parameter sets, with
 /// `-c TimeZone=x`, `-cTimeZone=x` or `--TimeZone=x`.
-fn time_zone_in_options(options: &str) -> Option<&str> {
-    let mut zone = None;
+fn time_zones_in_options(options: &str) -> Vec<&str> {
+    let mut zones = Vec::new();
     let mut words = options.split_whitespace();
     while let Some(word) = words.next() {
         let setting = if word == "-c" {
@@ -242,11 +246,11 @@ fn time_zone_in_options(options: &str) -> Option<&str> {
         };
         if let Some((name, value)) = setting.and_then(|setting| setting.split_once('=')) {
             if name.eq_ignore_ascii_case("timezone") {
-                zone = Some(value);
+                zones.push(value);
             }
         }
     }
-    zone
+    zones
 }
 
 /// Whether `zone` names UTC exactly.
