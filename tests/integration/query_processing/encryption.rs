@@ -3295,3 +3295,467 @@ fn encrypted_mvcc_reload_preserves_key_and_log_encryption() -> anyhow::Result<()
     assert_eq!(rows, vec![vec![turso_core::Value::from_i64(2)]]);
     Ok(())
 }
+
+/// The name of the test that `temp_storage_of_encrypted_database_holds_no_plaintext` runs in a
+/// child process.
+#[cfg(unix)]
+const TEMP_STORAGE_CHILD_TEST: &str =
+    "query_processing::encryption::temp_storage_of_encrypted_database_child_process";
+/// The directory that holds all temporary files of the child process. The child scans it.
+#[cfg(unix)]
+const TEMP_STORAGE_SCAN_DIR_ENV: &str = "TURSO_TEST_TEMP_STORAGE_SCAN_DIR";
+/// The directory that holds the databases of the child process. It is not scanned.
+#[cfg(unix)]
+const TEMP_STORAGE_DB_DIR_ENV: &str = "TURSO_TEST_TEMP_STORAGE_DB_DIR";
+/// Every value in the encrypted table starts with this text.
+#[cfg(unix)]
+const TEMP_STORAGE_MARKER: &str = "plaintext-marker-7d41c9e2";
+/// The number of rows in the encrypted table.
+#[cfg(unix)]
+const TEMP_STORAGE_ROWS: i64 = 2000;
+
+/// Rows that an encrypted database copies to temporary files on disk must not be in plaintext
+/// there, both when the main database is encrypted and when only an attached database is.
+/// This test runs the child process with TMPDIR and TURSO_TMPDIR set to a directory of the
+/// test, so that the child can scan every temporary file that the engine creates.
+#[cfg(unix)]
+#[test]
+fn temp_storage_of_encrypted_database_holds_no_plaintext() -> anyhow::Result<()> {
+    let scan_dir = tempfile::tempdir()?;
+    let db_dir = tempfile::tempdir()?;
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args([TEMP_STORAGE_CHILD_TEST, "--exact", "--nocapture"])
+        .env(TEMP_STORAGE_SCAN_DIR_ENV, scan_dir.path())
+        .env(TEMP_STORAGE_DB_DIR_ENV, db_dir.path())
+        .env("TMPDIR", scan_dir.path())
+        .env("TURSO_TMPDIR", scan_dir.path())
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "child process failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// The body of `temp_storage_of_encrypted_database_holds_no_plaintext`. It does nothing
+/// unless that test starts it.
+#[cfg(unix)]
+#[test]
+fn temp_storage_of_encrypted_database_child_process() -> anyhow::Result<()> {
+    let (Some(scan_dir), Some(db_dir)) = (
+        std::env::var_os(TEMP_STORAGE_SCAN_DIR_ENV),
+        std::env::var_os(TEMP_STORAGE_DB_DIR_ENV),
+    ) else {
+        return Ok(());
+    };
+    let scan_dir = std::path::PathBuf::from(scan_dir);
+    let db_dir = std::path::PathBuf::from(db_dir);
+    let spills = Arc::new(SpillWrites::default());
+    let io: Arc<dyn IO> = Arc::new(SpillWatchingIo {
+        inner: Arc::new(PlatformIO::new()?),
+        spills: spills.clone(),
+    });
+    let mut failures = Vec::new();
+
+    // The main database is encrypted.
+    let (db, conn) = open_temp_storage_database(
+        &io,
+        &db_dir.join("encrypted-main.db"),
+        Some((CIPHER_A, KEY_A)),
+    )?;
+    fill_temp_storage_table(&conn, "main")?;
+    check_spills(&conn, "main", "secrets", &spills, &mut failures)?;
+    check_temp_table(&conn, "main", &scan_dir, &mut failures)?;
+    // Dropping the connection deletes its TEMP database, so that the next scans see only the
+    // files of the next connection.
+    conn.close()?;
+    drop(conn);
+    drop(db);
+
+    // Only an attached database is encrypted. The TEMP database exists, empty, before the
+    // ATTACH.
+    let (db, conn) = open_temp_storage_database(&io, &db_dir.join("plaintext-main.db"), None)?;
+    let _: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM temp.sqlite_schema");
+    conn.execute(format!(
+        "ATTACH 'file:{}?cipher={CIPHER_A}&hexkey={KEY_B}' AS aux",
+        db_dir.join("encrypted-aux.db").display()
+    ))?;
+    fill_temp_storage_table(&conn, "aux")?;
+    check_spills(&conn, "aux", "secrets", &spills, &mut failures)?;
+    check_temp_table(&conn, "aux", &scan_dir, &mut failures)?;
+
+    // After DETACH, the TEMP database still holds rows of the encrypted database.
+    conn.execute("DETACH aux")?;
+    check_spills(&conn, "temp", "copied", &spills, &mut failures)?;
+    check_temp_files(
+        &scan_dir,
+        "TEMP database after DETACH",
+        Some("tursodb-temp.db"),
+        &mut failures,
+    )?;
+    conn.close()?;
+    drop(conn);
+    drop(db);
+
+    // The TEMP database has a page size other than that of the main database.
+    let (db, conn) = open_temp_storage_database(
+        &io,
+        &db_dir.join("encrypted-main.db"),
+        Some((CIPHER_A, KEY_A)),
+    )?;
+    conn.execute("PRAGMA temp.page_size = 8192")?;
+    conn.execute("CREATE TEMP TABLE large_pages AS SELECT value FROM main.secrets")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("PRAGMA temp.page_size");
+    assert_eq!(rows, [(8192,)]);
+    check_temp_files(
+        &scan_dir,
+        "TEMP database with 8 KiB pages",
+        Some("tursodb-temp.db"),
+        &mut failures,
+    )?;
+    check_spills(&conn, "temp", "large_pages", &spills, &mut failures)?;
+    conn.close()?;
+    drop(conn);
+    drop(db);
+
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    Ok(())
+}
+
+/// Opens the database at `path`, encrypted with `encryption` if it is set.
+#[cfg(unix)]
+fn open_temp_storage_database(
+    io: &Arc<dyn IO>,
+    path: &std::path::Path,
+    encryption: Option<(&str, &str)>,
+) -> anyhow::Result<(Arc<Database>, Arc<turso_core::Connection>)> {
+    // Small pages make an ephemeral table spill to its file with less data.
+    let mut options = OpenOptions::new(Arc::new(SqliteDialect))
+        .db_opts(
+            DatabaseOpts::new()
+                .with_encryption(encryption.is_some())
+                .with_attach(true),
+        )
+        .page_size(turso_core::storage::sqlite3_ondisk::PageSize::new(1024).unwrap());
+    let mut key = None;
+    if let Some((cipher, hexkey)) = encryption {
+        options = options.encryption(EncryptionOpts {
+            cipher: cipher.into(),
+            hexkey: hexkey.into(),
+        });
+        key = Some(EncryptionKey::from_hex_string(hexkey)?);
+    }
+    let db = Database::open(io.clone(), path.to_str().unwrap(), options)?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(key))?;
+    Ok((db, conn))
+}
+
+/// Creates the table `secrets` in the database `schema`. Every value starts with
+/// `TEMP_STORAGE_MARKER`.
+#[cfg(unix)]
+fn fill_temp_storage_table(conn: &Arc<turso_core::Connection>, schema: &str) -> anyhow::Result<()> {
+    conn.execute(format!(
+        "CREATE TABLE {schema}.secrets(id INTEGER PRIMARY KEY, value TEXT)"
+    ))?;
+    conn.execute(format!(
+        "INSERT INTO {schema}.secrets(value) SELECT '{TEMP_STORAGE_MARKER}' \
+         || printf('%06d', value) || hex(randomblob(600)) \
+         FROM generate_series(1, {TEMP_STORAGE_ROWS})"
+    ))?;
+    Ok(())
+}
+
+/// Makes a sorter, a hash table and an ephemeral index write the rows of `schema.table` to
+/// their files, and records in `failures` each statement that wrote a row in plaintext or
+/// wrote nothing.
+#[cfg(unix)]
+fn check_spills(
+    conn: &Arc<turso_core::Connection>,
+    schema: &str,
+    table: &str,
+    spills: &SpillWrites,
+    failures: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let source = format!("{schema}.{table}");
+    let mut check = |statement: &str, spill_expected: bool| {
+        let (bytes, plaintext_writes) = spills.take();
+        if spill_expected && bytes == 0 {
+            failures.push(format!("{source}: {statement} wrote no spill file"));
+        }
+        if plaintext_writes > 0 {
+            failures.push(format!(
+                "{source}: {statement} wrote {plaintext_writes} times in plaintext"
+            ));
+        }
+    };
+    spills.take();
+
+    // UNION keeps its rows in an ephemeral index, which is larger than its page cache.
+    let rows: Vec<(i64,)> = conn.exec_rows(&format!(
+        "SELECT count(*) FROM (SELECT value FROM {source} UNION SELECT value FROM {source})"
+    ));
+    assert_eq!(rows, [(TEMP_STORAGE_ROWS,)]);
+    check("UNION", true);
+
+    // DISTINCT keeps its keys in a hash table. Debug builds give a hash table 32 KiB of
+    // memory, so it writes partitions to its file.
+    let rows: Vec<(String,)> = conn.exec_rows(&format!("SELECT DISTINCT value FROM {source}"));
+    assert_eq!(rows.len() as i64, TEMP_STORAGE_ROWS);
+    check("DISTINCT", cfg!(debug_assertions));
+
+    // A 64 KiB sort buffer makes ORDER BY and CREATE INDEX write sorted runs to their files.
+    let cache_size: Vec<(i64,)> = conn.exec_rows("PRAGMA cache_size");
+    conn.execute("PRAGMA cache_size = -64")?;
+    let rows: Vec<(String,)> =
+        conn.exec_rows(&format!("SELECT value FROM {source} ORDER BY value DESC"));
+    assert_eq!(rows.len() as i64, TEMP_STORAGE_ROWS);
+    assert!(rows[0]
+        .0
+        .starts_with(&format!("{TEMP_STORAGE_MARKER}{TEMP_STORAGE_ROWS:06}")));
+    check("ORDER BY", true);
+
+    conn.execute(format!(
+        "CREATE INDEX {schema}.{table}_value ON {table}(value)"
+    ))?;
+    let rows: Vec<(i64,)> = conn.exec_rows(&format!(
+        "SELECT count(*) FROM {source} WHERE value > '{TEMP_STORAGE_MARKER}'"
+    ));
+    assert_eq!(rows, [(TEMP_STORAGE_ROWS,)]);
+    check("CREATE INDEX", true);
+    conn.execute(format!("PRAGMA cache_size = {}", cache_size[0].0))?;
+    Ok(())
+}
+
+/// Copies the rows of `schema.secrets` to a TEMP table, and records in `failures` each file
+/// of the TEMP database that holds one of them in plaintext.
+#[cfg(unix)]
+fn check_temp_table(
+    conn: &Arc<turso_core::Connection>,
+    schema: &str,
+    scan_dir: &std::path::Path,
+    failures: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    conn.execute(format!(
+        "CREATE TEMP TABLE copied AS SELECT value FROM {schema}.secrets"
+    ))?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM temp.copied");
+    assert_eq!(rows, [(TEMP_STORAGE_ROWS,)]);
+    check_temp_files(
+        scan_dir,
+        &format!("{schema}: CREATE TEMP TABLE ... AS SELECT"),
+        Some("tursodb-temp.db"),
+        failures,
+    )
+}
+
+/// Records in `failures` each file under `dir` that contains `TEMP_STORAGE_MARKER`. Also
+/// records a missing file whose name starts with `expected_file`, because then `step` did not
+/// write to disk and the scan proves nothing.
+#[cfg(unix)]
+fn check_temp_files(
+    dir: &std::path::Path,
+    step: &str,
+    expected_file: Option<&str>,
+    failures: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let mut found_expected_file = false;
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            found_expected_file |= path.file_name().is_some_and(|name| {
+                expected_file.is_some_and(|expected| name.to_string_lossy().starts_with(expected))
+            });
+            if contains_temp_storage_marker(&std::fs::read(&path)?) {
+                failures.push(format!("{step}: plaintext in {}", path.display()));
+            }
+        }
+    }
+    if let Some(expected) = expected_file.filter(|_| !found_expected_file) {
+        failures.push(format!("{step}: no {expected} file in {}", dir.display()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn contains_temp_storage_marker(bytes: &[u8]) -> bool {
+    bytes
+        .windows(TEMP_STORAGE_MARKER.len())
+        .any(|window| window == TEMP_STORAGE_MARKER.as_bytes())
+}
+
+/// What `SpillWatchingIo` saw written to spill files.
+#[cfg(unix)]
+#[derive(Default)]
+struct SpillWrites {
+    bytes: std::sync::atomic::AtomicUsize,
+    plaintext_writes: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(unix)]
+impl SpillWrites {
+    fn record(&self, bytes: &[u8]) {
+        use std::sync::atomic::Ordering;
+        self.bytes.fetch_add(bytes.len(), Ordering::SeqCst);
+        if contains_temp_storage_marker(bytes) {
+            self.plaintext_writes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Returns the bytes written and the writes in plaintext since the last call.
+    fn take(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering;
+        (
+            self.bytes.swap(0, Ordering::SeqCst),
+            self.plaintext_writes.swap(0, Ordering::SeqCst),
+        )
+    }
+}
+
+/// An IO that records in `spills` every write to a spill file of a sorter, hash table or
+/// ephemeral table. These files are deleted when their statement ends, so a scan of the
+/// directory after the statement cannot see them.
+#[cfg(unix)]
+struct SpillWatchingIo {
+    inner: Arc<dyn IO>,
+    spills: Arc<SpillWrites>,
+}
+
+#[cfg(unix)]
+impl turso_core::Clock for SpillWatchingIo {
+    fn current_time_monotonic(&self) -> turso_core::MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> turso_core::WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+#[cfg(unix)]
+impl IO for SpillWatchingIo {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn turso_core::File>> {
+        let file = self.inner.open_file(path, flags, direct)?;
+        if !path.ends_with("tursodb_temp_file") {
+            return Ok(file);
+        }
+        Ok(Arc::new(SpillWatchingFile {
+            inner: file,
+            spills: self.spills.clone(),
+        }))
+    }
+
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
+        self.inner.file_id(path)
+    }
+
+    fn step(&self) -> turso_core::Result<()> {
+        self.inner.step()
+    }
+
+    fn cancel(&self, completions: &[turso_core::Completion]) -> turso_core::Result<()> {
+        self.inner.cancel(completions)
+    }
+
+    fn drain_completions(&self, completions: &[turso_core::Completion]) -> turso_core::Result<()> {
+        self.inner.drain_completions(completions)
+    }
+
+    fn wait_for_completion(&self, completion: turso_core::Completion) -> turso_core::Result<()> {
+        self.inner.wait_for_completion(completion)
+    }
+
+    fn generate_random_number(&self) -> i64 {
+        self.inner.generate_random_number()
+    }
+
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        self.inner.fill_bytes(dest);
+    }
+
+    fn yield_now(&self) {
+        self.inner.yield_now();
+    }
+}
+
+#[cfg(unix)]
+struct SpillWatchingFile {
+    inner: Arc<dyn turso_core::File>,
+    spills: Arc<SpillWrites>,
+}
+
+#[cfg(unix)]
+impl turso_core::File for SpillWatchingFile {
+    fn lock_file(&self, exclusive: bool) -> turso_core::Result<()> {
+        self.inner.lock_file(exclusive)
+    }
+
+    fn unlock_file(&self) -> turso_core::Result<()> {
+        self.inner.unlock_file()
+    }
+
+    fn pread(
+        &self,
+        pos: u64,
+        c: turso_core::Completion,
+    ) -> turso_core::Result<turso_core::Completion> {
+        self.inner.pread(pos, c)
+    }
+
+    fn pwrite(
+        &self,
+        pos: u64,
+        buffer: Arc<turso_core::Buffer>,
+        c: turso_core::Completion,
+    ) -> turso_core::Result<turso_core::Completion> {
+        self.spills.record(buffer.as_slice());
+        self.inner.pwrite(pos, buffer, c)
+    }
+
+    fn pwritev(
+        &self,
+        pos: u64,
+        buffers: Vec<Arc<turso_core::Buffer>>,
+        c: turso_core::Completion,
+    ) -> turso_core::Result<turso_core::Completion> {
+        for buffer in &buffers {
+            self.spills.record(buffer.as_slice());
+        }
+        self.inner.pwritev(pos, buffers, c)
+    }
+
+    fn sync(
+        &self,
+        c: turso_core::Completion,
+        sync_type: turso_core::io::FileSyncType,
+    ) -> turso_core::Result<turso_core::Completion> {
+        self.inner.sync(c, sync_type)
+    }
+
+    fn size(&self) -> turso_core::Result<u64> {
+        self.inner.size()
+    }
+
+    fn truncate(
+        &self,
+        len: u64,
+        c: turso_core::Completion,
+    ) -> turso_core::Result<turso_core::Completion> {
+        self.inner.truncate(len, c)
+    }
+}
