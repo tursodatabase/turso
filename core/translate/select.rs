@@ -33,7 +33,8 @@ use crate::translate::planner::{
 use crate::translate::result_row::emit_select_result;
 use crate::translate::row_security;
 use crate::translate::subquery::{
-    plan_limit_offset_subqueries, plan_subqueries_from_select_plan, plan_subqueries_from_values,
+    has_having_without_group_by, plan_limit_offset_subqueries, plan_subqueries_from_select_plan,
+    plan_subqueries_from_values, validate_having_without_group_by_before_subqueries,
 };
 use crate::translate::window::plan_windows;
 use crate::util::{exprs_are_equivalent, exprs_are_equivalent_as_written, normalize_ident};
@@ -864,12 +865,7 @@ fn finish_select_plan(
             && resolver.move_aggregate_to_enclosing_query(agg.clone()))
     });
 
-    // HAVING without GROUP BY requires aggregates in the SELECT
-    if let Some(ref group_by) = plan.group_by {
-        if group_by.exprs.is_empty() && group_by.having.is_some() && plan.aggregates.is_empty() {
-            crate::bail_parse_error!("HAVING clause on a non-aggregate query");
-        }
-    }
+    validate_having_without_group_by_before_subqueries(&plan, resolver)?;
 
     // Parse the ORDER BY clause
     let mut key = Vec::new();
@@ -948,8 +944,12 @@ fn finish_select_plan(
 
     {
         trace_stack!("process_order_by");
+        // A query with HAVING and no GROUP BY that passed the HAVING
+        // check above is an aggregate query, or the check after its
+        // subqueries are planned rejects it with the HAVING error.
         let is_aggregate_query = has_group_by
             || agg_count_before_order_by > 0
+            || has_having_without_group_by(&plan)
             || result_columns_contain_aggregate(&plan.result_columns, resolver)?;
         if !is_aggregate_query {
             for (expr, _, _) in key.iter().take(distinct_on_expr_count) {

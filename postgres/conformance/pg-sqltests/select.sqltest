@@ -1226,11 +1226,36 @@ expect {
     0|
 }
 
+# Unlike SQLite, PostgreSQL counts an aggregate in HAVING: the query is an
+# aggregate query even when no result column contains an aggregate.
+@setup having_t
+test having-without-group-by-with-aggregate-only-in-having {
+    SELECT 1 FROM t HAVING max(y) > 0;
+}
+expect {
+    1
+}
+
 @compat-gap "syntax:having"
 test having-without-group-by-or-aggregate-errors-instead-of-ignoring-having {
     SELECT 1 HAVING 1 = 0;
 }
 expect {
+}
+@sqlstate 42601
+expect @tursopg error {
+    HAVING clause on a non-aggregate query
+}
+
+# PostgreSQL makes every query with HAVING an aggregate query, but Turso
+# does not count an aggregate in ORDER BY.
+@setup having_t
+@compat-gap "syntax:having"
+test having-without-group-by-with-aggregate-only-in-order-by-errors {
+    SELECT 1 FROM t HAVING true ORDER BY max(x);
+}
+expect {
+    1
 }
 @sqlstate 42601
 expect @tursopg error {
