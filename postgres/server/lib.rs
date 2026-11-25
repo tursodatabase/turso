@@ -46,7 +46,7 @@ use pgwire::messages::response::{
     EmptyQueryResponse, ErrorResponse, ReadyForQuery, TransactionStatus,
 };
 use pgwire::messages::simplequery::Query;
-use pgwire::messages::PgWireBackendMessage;
+use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
 
@@ -182,8 +182,91 @@ impl PgWireServerHandlers for TursoPgFactory {
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        Arc::new(NoopHandler)
+        Arc::new(UtcOnlyStartupHandler)
     }
+}
+
+/// Accepts a connection like `NoopHandler`, except when the startup packet
+/// asks for a session time zone other than UTC.
+struct UtcOnlyStartupHandler;
+
+#[async_trait]
+impl StartupHandler for UtcOnlyStartupHandler {
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if let PgWireFrontendMessage::Startup(startup) = &message {
+            let requested = startup.parameters.iter().fold(None, |zone, (name, value)| {
+                if name.eq_ignore_ascii_case("timezone") {
+                    Some(value.as_str())
+                } else if name == "options" {
+                    time_zone_in_options(value).or(zone)
+                } else {
+                    zone
+                }
+            });
+            if let Some(zone) = requested {
+                if !is_utc(zone) {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "FATAL".to_owned(),
+                        SQLSTATE_FEATURE_NOT_SUPPORTED.to_owned(),
+                        format!(
+                            "time zone \"{}\" is not supported; tursopg supports only UTC",
+                            error_field_value(zone)
+                        ),
+                    ))));
+                }
+            }
+        }
+        NoopHandler.on_startup(client, message).await
+    }
+}
+
+/// The last time zone that the `options` startup parameter sets, with
+/// `-c TimeZone=x`, `-cTimeZone=x` or `--TimeZone=x`.
+fn time_zone_in_options(options: &str) -> Option<&str> {
+    let mut zone = None;
+    let mut words = options.split_whitespace();
+    while let Some(word) = words.next() {
+        let setting = if word == "-c" {
+            words.next()
+        } else {
+            word.strip_prefix("-c").or_else(|| word.strip_prefix("--"))
+        };
+        if let Some((name, value)) = setting.and_then(|setting| setting.split_once('=')) {
+            if name.eq_ignore_ascii_case("timezone") {
+                zone = Some(value);
+            }
+        }
+    }
+    zone
+}
+
+/// Whether `zone` names UTC exactly.
+fn is_utc(zone: &str) -> bool {
+    const UTC_NAMES: [&str; 12] = [
+        "utc",
+        "etc/utc",
+        "gmt",
+        "etc/gmt",
+        "z",
+        "uct",
+        "universal",
+        "zulu",
+        "+00",
+        "+00:00",
+        "00:00",
+        "0",
+    ];
+    let zone = zone.trim();
+    UTC_NAMES.iter().any(|name| zone.eq_ignore_ascii_case(name))
 }
 
 #[async_trait]

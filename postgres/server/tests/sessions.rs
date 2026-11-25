@@ -70,6 +70,24 @@ fn schema_dropped_by_one_client_is_gone_for_another() {
     query_error(&mut client2, "SELECT count(*) FROM s.t");
 }
 
+#[test]
+fn time_zone_other_than_utc_is_refused_at_connection() {
+    let server = TestServer::start();
+    for startup in [
+        ("TimeZone", "America/New_York"),
+        ("options", "-c TimeZone=America/New_York"),
+        ("options", "--TimeZone=America/New_York"),
+    ] {
+        let error = server.connect_error(&[startup]);
+        assert!(error.contains("0A000"), "{startup:?}: {error}");
+        assert!(error.contains("America/New_York"), "{startup:?}: {error}");
+    }
+    for startup in [("TimeZone", "UTC"), ("options", "-c TimeZone=Etc/UTC")] {
+        let mut client = server.connect_with(&[startup]);
+        assert_eq!(query(&mut client, "SELECT 1"), ["1"]);
+    }
+}
+
 struct TestServer {
     port: u16,
     _dir: TempDir,
@@ -103,6 +121,22 @@ impl TestServer {
     }
 
     fn connect(&self) -> PgConn {
+        self.connect_with(&[])
+    }
+
+    fn connect_with(&self, startup: &[(&str, &str)]) -> PgConn {
+        self.try_connect(startup).unwrap()
+    }
+
+    /// The error of a connection that the server refuses, with its SQLSTATE.
+    fn connect_error(&self, startup: &[(&str, &str)]) -> String {
+        format!(
+            "{:?}",
+            self.try_connect(startup).err().expect("expected a refusal")
+        )
+    }
+
+    fn try_connect(&self, startup: &[(&str, &str)]) -> turso_pg_client::Result<PgConn> {
         let params = ConnParams {
             host: "127.0.0.1".to_string(),
             port: self.port,
@@ -110,7 +144,7 @@ impl TestServer {
             password: None,
             database: "main".to_string(),
         };
-        PgConn::connect(&params, &[]).unwrap()
+        PgConn::connect(&params, startup)
     }
 }
 
