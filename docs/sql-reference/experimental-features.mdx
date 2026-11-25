@@ -132,15 +132,15 @@ Give both the cipher and the key. If you give only one of them, or a key that is
 
 ## .NET SDK
 
-The .NET binding currently supports encryption through the C FFI:
+The .NET binding supports encryption through the `Encryption Cipher` and `Encryption Key` connection string options:
 
 ```csharp
-var db = Database.OpenWithEncryption(
-    "database.db",
-    "aegis256",
-    "your-hex-key-here"
-);
+using var connection = new TursoConnection(
+    "Data Source=database.db;Encryption Cipher=aegis256;Encryption Key=your-hex-key-here");
+connection.Open();
 ```
+
+Give both options. If you give only one of them, `Open()` throws an `InvalidOperationException` and does not create the database file. A value that is empty or has only whitespace counts as not given. A key that is not valid for the cipher also makes `Open()` fail without creating the file.
 
 ## See Also
 

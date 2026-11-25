@@ -289,8 +289,8 @@ Supported common connection string keywords include:
 | `Default Timeout` | Used as the default command timeout. Aliases include `Command Timeout`. |
 | `Pooling` | Defaults to `True`. Local files stay open after the last connection closes so the next `Open()` skips reloading the schema and WAL; each connection still gets fresh connection state. Call `SqliteConnection.ClearPool` or `ClearAllPools` before deleting or replacing a pooled file. `:memory:` and shared in-memory databases are never pooled. |
 | `Vfs` | Parsed and preserved for compatibility. |
-| `Encryption Cipher` | Turso local encryption cipher. |
-| `Encryption Key` | Hex-encoded encryption key used with `Encryption Cipher`. |
+| `Encryption Cipher` | Not supported by `SqliteConnection`, which rejects it. `TursoConnection` only: local encryption cipher. Give it together with `Encryption Key`. |
+| `Encryption Key` | Not supported by `SqliteConnection`, which rejects it. `TursoConnection` only: hex-encoded local encryption key. Give it together with `Encryption Cipher`. |
 | `Auth Token` | Bearer token for remote Turso/libSQL URLs. Aliases include `AuthToken` and `Authentication Token`. |
 | `Replica Path` | Local path for an embedded replica of the remote `Data Source`. |
 | `Read Your Writes` | Keeps the remote Hrana session baton across commands. Defaults to `True`. Set `False` for stateless one-shot remote requests. |
