@@ -126,6 +126,30 @@ expect {
     E'a\\\\b'
 }
 
+# PostgreSQL joins every argument that is not NULL, so an empty one keeps its
+# place and its separator. SQLite does not: see
+# sqlite/conformance/sqlite-sqltests/concat.sqltest.
+test concat-ws-joins-empty-arguments {
+    SELECT '[' || concat_ws(',', '', 'a') || ']';
+    SELECT '[' || concat_ws(',', 'a', '', 'b') || ']';
+    SELECT '[' || concat_ws(',', NULL, '', 'a') || ']';
+    SELECT '[' || concat_ws(',', '', '', 'a') || ']';
+    SELECT '[' || concat_ws(',', 'a', '', '') || ']';
+    SELECT '[' || concat_ws('', '', 'a') || ']';
+    SELECT '[' || concat_ws(',', '', '') || ']';
+    SELECT '[' || concat_ws(',', NULL, NULL) || ']';
+}
+expect {
+    [,a]
+    [a,,b]
+    [,a]
+    [,,a]
+    [a,,]
+    [a]
+    [,]
+    []
+}
+
 test current-schema-default {
     SELECT current_schema();
 }
