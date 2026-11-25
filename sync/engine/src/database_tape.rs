@@ -4323,6 +4323,94 @@ mod tests {
         );
     }
 
+    /// A local CREATE TABLE replays onto a table that came from the remote with
+    /// another generated column. Change capture must record what the replay
+    /// changes, so that the next push sends the local definition.
+    #[test]
+    pub fn test_database_tape_replay_records_changed_generated_column() {
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let files = [(); 3].map(|_| NamedTempFile::new().unwrap());
+        let [local, replica, server] = files.each_ref().map(|file| {
+            let db = turso_core::Database::open_file(
+                io.clone(),
+                file.path().to_str().unwrap(),
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            Arc::new(DatabaseTape::new(db))
+        });
+
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                local
+                    .connect(&coro)
+                    .await
+                    .unwrap()
+                    .execute(
+                        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, g TEXT AS (upper(a)))",
+                    )
+                    .unwrap();
+                for db in [&replica, &server] {
+                    let conn = db.connect(&coro).await.unwrap();
+                    conn.execute(
+                        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, g TEXT AS (lower(a)))",
+                    )
+                    .unwrap();
+                    conn.execute("DELETE FROM turso_cdc").unwrap();
+                }
+
+                replay_changes(&coro, &local, &replica).await;
+                replay_changes(&coro, &replica, &server).await;
+
+                let conn = server.connect(&coro).await.unwrap();
+                let mut stmt = conn
+                    .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
+                    .unwrap();
+                let row = run_stmt_once(&coro, &mut stmt).await.unwrap().unwrap();
+                let turso_core::Value::Text(sql) = row.get_value(0) else {
+                    panic!("table t has no sql text");
+                };
+                assert!(
+                    sql.as_str().contains("upper"),
+                    "the server did not get the local definition: {}",
+                    sql.as_str()
+                );
+                crate::Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Replays every change that `from` captured onto `to`, in one replay
+    /// session.
+    async fn replay_changes(coro: &Coro<()>, from: &DatabaseTape, to: &DatabaseTape) {
+        let opts = DatabaseReplaySessionOpts {
+            use_implicit_rowid: false,
+        };
+        let mut session = to.start_replay_session(coro, opts).await.unwrap();
+        let iterate_opts = DatabaseChangesIteratorOpts {
+            ignore_schema_changes: false,
+            ..Default::default()
+        };
+        let mut changes = from.iterate_changes(iterate_opts).unwrap();
+        while let Some(operation) = changes.next(coro).await.unwrap() {
+            session.replay(coro, operation).await.unwrap();
+        }
+        session
+            .replay(coro, DatabaseTapeOperation::Commit)
+            .await
+            .unwrap();
+    }
+
     fn replay_on_table_with_generated_columns(
         setup: &[&str],
         operations: Vec<DatabaseTapeOperation>,
