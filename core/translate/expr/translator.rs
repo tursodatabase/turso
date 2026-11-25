@@ -1084,7 +1084,11 @@ pub(crate) fn is_sqlite_cast_to(type_def: &TypeDef, type_name: &ast::Type) -> bo
         None => 0,
     };
     let user_param_count = type_def.user_params().count();
-    !type_def.is_domain && user_param_count != 0 && type_arg_count != user_param_count
+    let may_omit_arguments = type_arg_count == 0 && type_def.params_may_be_omitted;
+    !type_def.is_domain
+        && user_param_count != 0
+        && type_arg_count != user_param_count
+        && !may_omit_arguments
 }
 
 #[inline(never)]

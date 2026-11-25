@@ -970,3 +970,18 @@ test check-added-by-alter-sees-decoded-values {
 expect error {
     CHECK constraint failed
 }
+
+@requires strict "uses STRICT tables"
+test strict-numeric-column-needs-its-parameters {
+    CREATE TABLE t(n numeric) STRICT;
+}
+expect error {
+    requires 2 parameter\(s\), got 0
+}
+
+test cast-to-numeric-without-parameters-is-sqlites-cast {
+    SELECT typeof(CAST('1.50' AS NUMERIC));
+}
+expect {
+    real
+}
