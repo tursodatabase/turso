@@ -719,7 +719,7 @@ fn common_ordering(
     match (found, array_of_unknown_elements) {
         (None, Some(_)) => Ok(Some(TypeOrdering::ARRAY)),
         (Some((other, other_ty)), Some(array_ty))
-            if !matches!(other, TypeOrdering::ARRAY | TypeOrdering::TEXT_ARRAY) =>
+            if other != TypeOrdering::ARRAY && other != TypeOrdering::TEXT_ARRAY =>
         {
             Err(cannot_compare(other_ty, array_ty))
         }
