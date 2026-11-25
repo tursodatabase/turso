@@ -17015,7 +17015,9 @@ pub fn op_cast(
 ) -> InsnResult {
     load_insn!(Cast { reg, affinity }, insn);
 
-    let value = state.registers[*reg].get_value().clone();
+    // `exec_cast` reads the value through a reference, so the value needs no
+    // clone.
+    let value = state.registers[*reg].get_value();
     let result = match affinity {
         Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
         Affinity::Text => value.exec_cast("TEXT"),
@@ -17023,7 +17025,6 @@ pub fn op_cast(
         Affinity::Integer => value.exec_cast("INTEGER"),
         Affinity::Real => value.exec_cast("REAL"),
     }?;
-
     state.registers[*reg].set_value(result);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
