@@ -272,6 +272,27 @@ impl Dialect for PostgresDialect {
         call_builtin_scalar(context, func, args)
     }
 
+    fn choose_operator(
+        &self,
+        op: &str,
+        operands: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+    ) -> Result<turso_core::dialect::OperatorChoice> {
+        crate::operators::choose_operator(op, &operands())
+    }
+
+    fn choose_list_operator(
+        &self,
+        op: &str,
+        operands: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+    ) -> Result<Option<turso_core::dialect::OperatorChoice>> {
+        crate::operators::choose_list_operator(op, &operands())
+    }
+
+    fn undefined_operator_error(&self, op: &str, operand_types: &[String]) -> LimboError {
+        let names: Vec<&str> = operand_types.iter().map(String::as_str).collect();
+        crate::functions::undefined_operator_of(op, &names)
+    }
+
     fn requires_custom_types(&self) -> bool {
         true
     }
@@ -2140,6 +2161,20 @@ const PG_ARRAY_TYPES: &[(i64, &str, i64)] = &[
 
 const PG_TYPE_SQL: &str = "CREATE TABLE pg_type (oid INTEGER, typname TEXT, typnamespace INTEGER, typowner INTEGER, typlen INTEGER, typbyval BOOLEAN, typtype TEXT, typcategory TEXT, typispreferred BOOLEAN, typisdefined BOOLEAN, typdelim TEXT, typrelid INTEGER, typsubscript TEXT, typelem INTEGER, typarray INTEGER, typinput TEXT, typoutput TEXT, typreceive TEXT, typsend TEXT, typmodin TEXT, typmodout TEXT, typanalyze TEXT, typalign TEXT, typstorage TEXT, typnotnull BOOLEAN, typbasetype INTEGER, typtypmod INTEGER, typndims INTEGER, typcollation INTEGER, typdefaultbin TEXT, typdefault TEXT, typacl TEXT, tableoid INTEGER HIDDEN)";
 
+fn pg_base_type(oid: i64) -> Option<&'static PgTypeInfo> {
+    PG_BASE_TYPES.iter().find(|info| info.oid == oid)
+}
+
+/// The `typname` of the built-in type with this oid.
+pub(crate) fn pg_type_name(oid: i64) -> Option<&'static str> {
+    pg_base_type(oid).map(|info| info.name)
+}
+
+/// The `typcategory` of the built-in type with this oid.
+pub(crate) fn pg_type_category(oid: i64) -> Option<&'static str> {
+    pg_base_type(oid).map(|info| info.typcategory)
+}
+
 #[derive(Debug)]
 struct PgTypeTable;
 
@@ -3165,16 +3200,12 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgLanguageTable>(PhantomData),
     );
+    options = options.native_module(
+        "pg_operator",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgOperatorTable>(PhantomData),
+    );
     for (name, create_sql) in [
-        (
-            "pg_operator",
-            "CREATE TABLE pg_operator (
-            oid INTEGER, oprname TEXT, oprnamespace INTEGER, oprowner INTEGER,
-            oprkind TEXT, oprcanmerge BOOLEAN, oprcanhash BOOLEAN, oprleft INTEGER,
-            oprright INTEGER, oprresult INTEGER, oprcom INTEGER, oprnegate INTEGER,
-            oprcode INTEGER, oprrest INTEGER, oprjoin INTEGER, tableoid INTEGER HIDDEN
-        )",
-        ),
         (
             "pg_opclass",
             "CREATE TABLE pg_opclass (
@@ -3333,6 +3364,50 @@ impl SnapshotRows for PgLanguageTable {
                     Value::from_i64(0),
                     Value::from_i64(0),
                     Value::Null,
+                ]
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct PgOperatorTable;
+
+impl SnapshotRows for PgOperatorTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_operator (
+        oid INTEGER, oprname TEXT, oprnamespace INTEGER, oprowner INTEGER,
+        oprkind TEXT, oprcanmerge BOOLEAN, oprcanhash BOOLEAN, oprleft INTEGER,
+        oprright INTEGER, oprresult INTEGER, oprcom INTEGER, oprnegate INTEGER,
+        oprcode INTEGER, oprrest INTEGER, oprjoin INTEGER, tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2617);
+    const ESTIMATED_COST: f64 = 10.0;
+    const ESTIMATED_ROWS: u32 = 200;
+
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        // FIXME(pg-catalog): pg_operator has 216 of PostgreSQL 18's 799 rows. The rest need types the frontend does not have yet (interval, time, bytea, json, jsonb, inet, arrays) and operators it does not parse (`^`, `@`, `~~`, `#`).
+        // FIXME(pg-catalog): oprcode, oprrest and oprjoin are 0, because pg_proc does not list PostgreSQL's functions under PostgreSQL's oids. The oids of the pg_proc rows replace this.
+        const NO_FUNCTION: i64 = 0;
+        crate::operators::OPERATORS
+            .iter()
+            .map(|operator| {
+                let kind = if operator.left == 0 { "l" } else { "b" };
+                vec![
+                    Value::from_i64(operator.oid),
+                    Value::build_text(operator.name),
+                    Value::from_i64(11),
+                    Value::from_i64(SUPERUSER_OID),
+                    Value::build_text(kind),
+                    Value::from_i64(i64::from(operator.can_merge)),
+                    Value::from_i64(i64::from(operator.can_hash)),
+                    Value::from_i64(operator.left),
+                    Value::from_i64(operator.right),
+                    Value::from_i64(operator.result),
+                    Value::from_i64(operator.commutator),
+                    Value::from_i64(operator.negator),
+                    Value::from_i64(NO_FUNCTION),
+                    Value::from_i64(NO_FUNCTION),
+                    Value::from_i64(NO_FUNCTION),
                 ]
             })
             .collect()

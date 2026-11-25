@@ -127,16 +127,12 @@ expect @tursopg {
     2026-01-01 00:00:00+00
 }
 
-@compat-gap "operator:timestamptz > int4"
 test compare-timestamptz-with-integer {
     CREATE TABLE t (ts timestamptz);
     INSERT INTO t VALUES ('2026-01-01Z'); SELECT count(*) FROM t WHERE ts > 5;
 }
 @sqlstate 42883
 expect error {}
-expect @tursopg {
-    0
-}
 
 @compat-gap "cast:int4 -> timestamptz"
 test update-timestamptz-to-integer {
@@ -160,16 +156,12 @@ expect @tursopg {
     2026-01-01 10:00:00+00
 }
 
-@compat-gap "operator:timestamptz = text"
 test compare-timestamptz-with-text-column {
     CREATE TABLE t (ts timestamptz);
     CREATE TABLE s (v text); INSERT INTO s VALUES ('2026-01-01 10:00Z'); SELECT count(*) FROM t, s WHERE t.ts = s.v;
 }
 @sqlstate 42883
 expect error {}
-expect @tursopg {
-    0
-}
 
 test timestamptz-cast-to-bigint {
     SELECT timestamptz '2026-01-31Z'::bigint;
@@ -382,7 +374,7 @@ test timestamptz-plus-untyped-literal {
 expect {
     2026-02-01 10:00:00+00
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {}
 
 # PostgreSQL resolves the untyped literal of now() - '7 days' as timestamptz.
@@ -394,7 +386,7 @@ test now-minus-untyped-literal {
 }
 @sqlstate 22007
 expect error {}
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {}
 
 @compat-gap "operator:timestamptz - timestamptz"
@@ -406,7 +398,7 @@ test timestamptz-minus-timestamptz {
 expect {
     2 days 02:30:00
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {}
 
 @compat-gap "operator:timestamp - timestamp"
@@ -418,7 +410,7 @@ test timestamp-minus-timestamp {
 expect {
     30 days 10:20:30.5
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {}
 
 # The common type of timestamptz and timestamp is timestamptz.

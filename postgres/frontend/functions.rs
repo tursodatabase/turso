@@ -2178,7 +2178,7 @@ fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {
 
 /// FIXME(pg-catalog): This table of oids and names was copied by hand from pg_type. It prints unknown for an oid it does not list, where PostgreSQL prints the name of that pg_type row, and character for bpchar with typemod -1, where PostgreSQL prints bpchar. A lookup in a pg_type table replaces this.
 /// The name of a type as `format_type` prints it.
-fn format_type(type_oid: i64, typemod: i64) -> String {
+pub(crate) fn format_type(type_oid: i64, typemod: i64) -> String {
     match type_oid {
         16 => "boolean".to_string(),
         17 => "bytea".to_string(),
@@ -2302,9 +2302,19 @@ fn undefined_function(name: &str, arg_types: &[&str]) -> LimboError {
 }
 
 fn undefined_operator(left_type: &str, op: &str, right_type: &str) -> LimboError {
+    undefined_operator_of(op, &[left_type, right_type])
+}
+
+/// The 42883 error for an operator with one operand (a prefix operator) or two.
+pub(crate) fn undefined_operator_of(op: &str, operand_types: &[&str]) -> LimboError {
+    let signature = match operand_types {
+        [operand] => format!("{op} {operand}"),
+        [left, right] => format!("{left} {op} {right}"),
+        _ => unreachable!("an operator has one or two operands"),
+    };
     sqlstate_error(
         SQLSTATE_UNDEFINED_FUNCTION,
-        format!("operator does not exist: {left_type} {op} {right_type}"),
+        format!("operator does not exist: {signature}"),
         None,
     )
 }

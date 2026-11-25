@@ -57,7 +57,7 @@ impl Type for Boolean {
         Some(StorageClass::Integer)
     }
 
-    /// FIXME(pg-catalog): This hand-codes that the comparison operators and the other conditions return boolean, which is `oprresult` of each operator in pg_operator. A lookup of the operator in a pg_operator table replaces this.
+    /// FIXME(pg-catalog): This hand-codes two things. One is `oprresult` of the comparison and pattern operators, which pg_operator now lists for some types only: the engine asks for the type of a condition with a schema in hand, not with the operator and its operand types, and a comparison of types without rows (arrays, jsonb, a subquery, a catalog column) would have no type. The other is the type of AND, OR, NOT, the IS tests, IN, BETWEEN and EXISTS, which are not operators: PostgreSQL's parser gives them the type boolean itself. A result type in the operator the dialect chooses, for every type, replaces the first.
     /// A comparison is a boolean in PostgreSQL.
     fn is_type_of_conditions(&self) -> bool {
         true

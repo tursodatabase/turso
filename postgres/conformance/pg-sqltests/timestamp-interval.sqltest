@@ -131,7 +131,7 @@ test timestamptz-minus-timestamptz {
 expect {
     1 day
 }
-@sqlstate 42601
+@sqlstate 42883
 expect @tursopg error {
     operator does not exist: timestamptz - timestamptz
 }

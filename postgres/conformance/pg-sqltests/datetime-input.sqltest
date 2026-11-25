@@ -948,9 +948,6 @@ expect @tursopg error {
 }
 
 # PostgreSQL has no operator that compares a timestamptz with a varchar.
-# tursopg does not know which type pairs PostgreSQL compares, so it refuses
-# every comparison of two different custom types with 0A000.
-@compat-gap "operator:timestamptz = varchar"
 test datetime-compare-timestamptz-eq-varchar-is-an-error {
     CREATE TABLE tv (tz timestamptz, v varchar(40));
     INSERT INTO tv VALUES ('2024-01-05 02:00:00+02', '2024-01-05 02:00:00+02');
@@ -959,10 +956,6 @@ test datetime-compare-timestamptz-eq-varchar-is-an-error {
 @sqlstate 42883
 expect error {
     operator does not exist
-}
-@sqlstate 0A000
-expect @tursopg error {
-    cannot compare type timestamptz with type varchar
 }
 
 # lag's result is one type in PostgreSQL: the timestamp rows convert to
