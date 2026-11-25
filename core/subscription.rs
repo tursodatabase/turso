@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
+use std::task::{Poll, Waker};
 
 use parking_lot::{Condvar, Mutex};
 
@@ -94,33 +95,58 @@ impl ChangeBatch {
         }
     }
 
-    fn for_filter(&self, filter: &ChangeFilter) -> Option<Self> {
+    fn table_for_filter(&self, filter: &ChangeFilter) -> Option<(&String, &ChangedKeys)> {
         let Self::Tables(tables) = self else {
-            return Some(Self::Refresh);
+            return None;
         };
-        let filter_name = match filter {
-            ChangeFilter::All => return (!tables.is_empty()).then(|| self.clone()),
-            ChangeFilter::Table { table } | ChangeFilter::Row { table, .. } => table,
+        let (ChangeFilter::Table { table } | ChangeFilter::Row { table, .. }) = filter else {
+            return None;
         };
-        let (name, keys) = tables
+        let entry = tables
             .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(filter_name))?;
+            .find(|(name, _)| name.eq_ignore_ascii_case(table))?;
+        if let (ChangeFilter::Row { primary_key, .. }, ChangedKeys::Keys(keys)) = (filter, entry.1)
+        {
+            if !keys.contains(primary_key) {
+                return None;
+            }
+        }
+        Some(entry)
+    }
+}
+
+// The writer shares one immutable batch across all matching inboxes. The receiver
+// copies only its requested keys, after releasing the inbox lock.
+enum Delivery {
+    Refresh,
+    Batch(Arc<ChangeBatch>),
+}
+
+impl Delivery {
+    fn into_batch(self, filter: &ChangeFilter) -> ChangeBatch {
+        let Self::Batch(batch) = self else {
+            return ChangeBatch::Refresh;
+        };
+        if matches!(filter, ChangeFilter::All) {
+            return Arc::unwrap_or_clone(batch);
+        }
+        let (name, keys) = batch
+            .table_for_filter(filter)
+            .expect("queued matching batch");
         let keys = match (filter, keys) {
-            (ChangeFilter::Row { primary_key, .. }, ChangedKeys::Keys(keys)) => {
-                if !keys.contains(primary_key) {
-                    return None;
-                }
+            (ChangeFilter::Row { primary_key, .. }, ChangedKeys::Keys(_)) => {
                 ChangedKeys::Keys(BTreeSet::from([primary_key.clone()]))
             }
-            (_, keys) => keys.clone(),
+            _ => keys.clone(),
         };
-        Some(Self::Tables(BTreeMap::from([(name.clone(), keys)])))
+        ChangeBatch::Tables(BTreeMap::from([(name.clone(), keys)]))
     }
 }
 
 #[derive(Default)]
 struct Inbox {
-    batches: VecDeque<ChangeBatch>,
+    batches: VecDeque<Delivery>,
+    waker: Option<Waker>,
     closed: bool,
 }
 
@@ -145,12 +171,49 @@ impl ChangeSubscription {
         while inbox.batches.is_empty() && !inbox.closed {
             self.listener.ready.wait(&mut inbox);
         }
-        inbox.batches.pop_front()
+        let delivery = inbox.batches.pop_front();
+        drop(inbox);
+        delivery.map(|d| d.into_batch(&self.listener.filter))
+    }
+
+    /// Await a committed invalidation without blocking the executor thread.
+    /// Cancelling a pending receive leaves the next invalidation in the inbox.
+    pub async fn recv_async(&mut self) -> Option<ChangeBatch> {
+        let waiter = AsyncWaiter(&self.listener);
+        let delivery = std::future::poll_fn(|cx| {
+            let mut inbox = waiter.0.inbox.lock();
+            if let Some(delivery) = inbox.batches.pop_front() {
+                Poll::Ready(Some(delivery))
+            } else if inbox.closed {
+                Poll::Ready(None)
+            } else {
+                if !inbox
+                    .waker
+                    .as_ref()
+                    .is_some_and(|w| w.will_wake(cx.waker()))
+                {
+                    inbox.waker = Some(cx.waker().clone());
+                }
+                Poll::Pending
+            }
+        })
+        .await;
+        delivery.map(|d| d.into_batch(&self.listener.filter))
     }
 
     /// Take a pending invalidation without blocking.
     pub fn try_recv(&self) -> Option<ChangeBatch> {
-        self.listener.inbox.lock().batches.pop_front()
+        let delivery = self.listener.inbox.lock().batches.pop_front();
+        delivery.map(|d| d.into_batch(&self.listener.filter))
+    }
+}
+
+struct AsyncWaiter<'a>(&'a Listener);
+
+impl Drop for AsyncWaiter<'_> {
+    fn drop(&mut self) {
+        let waker = self.0.inbox.lock().waker.take();
+        drop(waker);
     }
 }
 
@@ -266,22 +329,28 @@ impl ChangeRegistry {
         self.publish(0, None);
     }
 
-    fn publish(&self, through: u64, batch: Option<&ChangeBatch>) {
+    fn publish(&self, through: u64, batch: Option<&Arc<ChangeBatch>>) {
         if !self.active() {
             return;
         }
         let state = self.state.lock();
-        if state.generation != through || matches!(batch, Some(ChangeBatch::Refresh)) {
+        let mut wakers = Vec::new();
+        if state.generation != through
+            || matches!(batch.map(Arc::as_ref), Some(ChangeBatch::Refresh))
+        {
             for listener in state.buckets.values().flatten() {
                 if listener.id > through {
-                    listener.enqueue(ChangeBatch::Refresh);
+                    listener.enqueue(Delivery::Refresh, &mut wakers);
                 } else if let Some(batch) = batch {
-                    listener.deliver(batch);
+                    listener.deliver(batch, &mut wakers);
                 }
             }
-        } else if let Some(batch @ ChangeBatch::Tables(tables)) = batch {
+        } else if let Some(batch) = batch {
+            let ChangeBatch::Tables(tables) = batch.as_ref() else {
+                unreachable!()
+            };
             for listener in state.buckets.get(&None).into_iter().flatten() {
-                listener.deliver(batch);
+                listener.deliver(batch, &mut wakers);
             }
             for name in tables.keys() {
                 for listener in state
@@ -290,28 +359,37 @@ impl ChangeRegistry {
                     .into_iter()
                     .flatten()
                 {
-                    listener.deliver(batch);
+                    listener.deliver(batch, &mut wakers);
                 }
             }
+        }
+        drop(state);
+        for waker in wakers {
+            waker.wake();
         }
     }
 }
 
 impl Listener {
-    fn deliver(&self, batch: &ChangeBatch) {
-        if let Some(batch) = batch.for_filter(&self.filter) {
-            self.enqueue(batch);
+    fn deliver(&self, batch: &Arc<ChangeBatch>, wakers: &mut Vec<Waker>) {
+        if matches!(batch.as_ref(), ChangeBatch::Refresh) {
+            self.enqueue(Delivery::Refresh, wakers);
+        } else if matches!(self.filter, ChangeFilter::All)
+            || batch.table_for_filter(&self.filter).is_some()
+        {
+            self.enqueue(Delivery::Batch(batch.clone()), wakers);
         }
     }
 
-    fn enqueue(&self, batch: ChangeBatch) {
+    fn enqueue(&self, delivery: Delivery, wakers: &mut Vec<Waker>) {
         let mut inbox = self.inbox.lock();
         if inbox.batches.len() == MAX_BATCHES {
             inbox.batches.clear();
-            inbox.batches.push_back(ChangeBatch::Refresh);
+            inbox.batches.push_back(Delivery::Refresh);
         } else {
-            inbox.batches.push_back(batch);
+            inbox.batches.push_back(delivery);
         }
+        wakers.extend(inbox.waker.take());
         self.ready.notify_one();
     }
 }
@@ -319,8 +397,14 @@ impl Listener {
 impl Drop for ChangeRegistry {
     fn drop(&mut self) {
         for listener in self.state.get_mut().buckets.values().flatten() {
-            listener.inbox.lock().closed = true;
+            let mut inbox = listener.inbox.lock();
+            inbox.closed = true;
+            let waker = inbox.waker.take();
+            drop(inbox);
             listener.ready.notify_all();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
         }
     }
 }
@@ -418,7 +502,7 @@ impl ChangeSnapshot {
 
     fn publish(&self, registry: &ChangeRegistry) {
         if let Some(through) = self.through {
-            registry.publish(through, self.batch.as_deref());
+            registry.publish(through, self.batch.as_ref());
         }
     }
 }

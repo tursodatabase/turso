@@ -397,3 +397,55 @@ fn unrelated_tables_do_not_overflow_a_filter(db: TempDatabase) {
     assert_eq!(existing.try_recv(), None);
     assert_eq!(late.try_recv(), Some(ChangeBatch::Refresh));
 }
+
+#[test]
+fn async_receive_wakes_on_commit_and_close() {
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    #[derive(Default)]
+    struct Flag(AtomicBool);
+    impl Wake for Flag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let db = TempDatabase::new_empty();
+    let writer = db.connect_limbo();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let mut sub = db.db.subscribe_changes(ChangeFilter::All);
+    let flag = Arc::new(Flag::default());
+    let waker = Waker::from(flag.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut read = Box::pin(sub.recv_async());
+    assert!(read.as_mut().poll(&mut cx).is_pending());
+    writer.execute("BEGIN").unwrap();
+    writer.execute("INSERT INTO t VALUES(9)").unwrap();
+    assert!(!flag.0.load(Ordering::Acquire));
+    writer.execute("COMMIT").unwrap();
+    assert!(flag.0.swap(false, Ordering::AcqRel));
+    assert_eq!(
+        read.as_mut().poll(&mut cx),
+        Poll::Ready(Some(batch("t", [vec![Value::from_i64(9)]])))
+    );
+    drop(read);
+    let mut cancelled = Box::pin(sub.recv_async());
+    assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+    drop(cancelled);
+    writer.execute("INSERT INTO t VALUES(10)").unwrap();
+    assert!(!flag.0.load(Ordering::Acquire));
+    assert_eq!(
+        sub.try_recv(),
+        Some(batch("t", [vec![Value::from_i64(10)]]))
+    );
+    let mut read = Box::pin(sub.recv_async());
+    assert!(read.as_mut().poll(&mut cx).is_pending());
+    drop(writer);
+    drop(db);
+    assert!(flag.0.load(Ordering::Acquire));
+    assert_eq!(read.as_mut().poll(&mut cx), Poll::Ready(None));
+}
