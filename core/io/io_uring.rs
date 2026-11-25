@@ -530,38 +530,46 @@ impl IO for UringIO {
         // wakers on every completion drained: including ours. The
         // follower returns Ok immediately and lets the calling Future
         // park on its completion's waker.
-        let Some(_wait_guard) = self.wait_lock.try_lock() else {
-            return Ok(());
-        };
-
-        // Leader path: keep draining until the ring is empty. Looping
-        // here matters: while we were in the kernel, more submitters
-        // may have queued SQEs, and their futures need *us* to drain
-        // their CQEs before the calling task can make progress.
         loop {
-            let pending = {
-                let mut state = self.state.lock();
-                // SAFETY: holding `state` Mutex.
-                unsafe { state.flush_overflow(&self.ring) };
-                if state.empty() {
-                    return Ok(());
-                }
-                state.pending_ops
+            let Some(_wait_guard) = self.wait_lock.try_lock() else {
+                return Ok(());
             };
 
-            let wants = std::cmp::min(pending, MAX_WAIT);
-            tracing::trace!("submit_and_wait for {wants} pending operations to complete");
-            match self.ring.submit_and_wait(wants) {
-                Ok(_) => {}
-                // A signal (a profiler, a debugger attaching, a timer) cuts
-                // the wait short without completing anything. That is not
-                // an I/O error: go round again and keep waiting.
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => return Err(io_error(e, "io_uring_submit_and_wait")),
-            }
+            // Leader path: keep draining until the ring is empty. Looping
+            // here matters: while we were in the kernel, more submitters
+            // may have queued SQEs, and their futures need *us* to drain
+            // their CQEs before the calling task can make progress.
+            'drain: loop {
+                let pending = {
+                    let mut state = self.state.lock();
+                    // SAFETY: holding `state` Mutex.
+                    unsafe { state.flush_overflow(&self.ring) };
+                    if state.empty() {
+                        break 'drain;
+                    }
+                    state.pending_ops
+                };
 
-            // Drain while still holding `_wait_guard`.
-            self.drain_cq()?;
+                let wants = std::cmp::min(pending, MAX_WAIT);
+                tracing::trace!("submit_and_wait for {wants} pending operations to complete");
+                match self.ring.submit_and_wait(wants) {
+                    Ok(_) => {}
+                    // A signal (a profiler, a debugger attaching, a timer) cuts
+                    // the wait short without completing anything. That is not
+                    // an I/O error: go round again and keep waiting.
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(io_error(e, "io_uring_submit_and_wait")),
+                }
+
+                // Drain while still holding `_wait_guard`.
+                self.drain_cq()?;
+            }
+            drop(_wait_guard);
+            // A caller that queued an SQE after our last empty check found
+            // `wait_lock` held and parked on its completion: lead again.
+            if self.state.lock().empty() {
+                return Ok(());
+            }
         }
     }
 
