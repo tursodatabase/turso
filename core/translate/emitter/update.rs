@@ -1,4 +1,5 @@
 use super::gencol::{compute_generated_columns, emit_row_from_cursor, sets_custom_type_column};
+use super::new_values::{emit_input_conversion, StatementValues};
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::ast::{RefAct, ResolveType, TriggerEvent, TriggerTime};
@@ -1107,29 +1108,6 @@ fn emit_deferred_notnull_checks<'a>(
     Ok(())
 }
 
-/// Check the new values of the SET columns against their declared types, before
-/// custom type encoding.
-fn emit_input_type_check(
-    program: &mut ProgramBuilder,
-    btree: &Arc<BTreeTable>,
-    start: usize,
-    layout: &ColumnLayout,
-    updated_column_indices: &ColumnMask,
-    resolver: &Resolver,
-) -> crate::Result<()> {
-    program.emit_insn(Insn::TypeCheck {
-        start_reg: start,
-        count: layout.num_non_virtual_cols(),
-        check_generated: false,
-        table_reference: BTreeTable::input_type_check_table_ref(
-            btree,
-            resolver.schema(),
-            Some(updated_column_indices),
-        )?,
-    });
-    Ok(())
-}
-
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
 /// Emits the instructions for the UPDATE loop.
@@ -1502,16 +1480,14 @@ fn emit_update_insns<'a>(
                     old_registers.expect("old_registers allocated when has_before_triggers");
                 // SQLite rejects a wrong type before firing the triggers, so they
                 // never see it.
-                if btree_table.is_strict {
-                    emit_input_type_check(
-                        program,
-                        &btree_table,
-                        start,
-                        &layout,
-                        &user_value_columns,
-                        &t_ctx.resolver,
-                    )?;
-                }
+                emit_input_conversion(
+                    program,
+                    &t_ctx.resolver,
+                    &btree_table,
+                    start,
+                    &layout,
+                    StatementValues::Only(&user_value_columns),
+                )?;
                 // NEW row values are already in 'start' registers.
                 // If the rowid is being updated (INTEGER PRIMARY KEY in SET clause),
                 // use the new rowid register; otherwise use the current rowid (beg).
@@ -1667,17 +1643,14 @@ fn emit_update_insns<'a>(
     let update_affects_virtual_columns = affected_columns.count() > updated_column_indices.count();
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
     if let Table::BTree(ref btree) = target_table.table {
-        if btree.is_strict {
-            // pre-encode typecheck for updated columns
-            emit_input_type_check(
-                program,
-                btree,
-                start,
-                &layout,
-                &user_value_columns,
-                &t_ctx.resolver,
-            )?;
-        }
+        emit_input_conversion(
+            program,
+            &t_ctx.resolver,
+            btree,
+            start,
+            &layout,
+            StatementValues::Only(&user_value_columns),
+        )?;
         if notnull_checks_follow_type_check {
             // Before the generated columns are computed again below, so that
             // they read the DEFAULT that OR REPLACE put in place of a NULL.

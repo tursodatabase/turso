@@ -10,6 +10,7 @@ use crate::ast::{self, TriggerEvent, TriggerTime, Upsert};
 use super::emitter::gencol::{
     compute_generated_columns, emit_row_from_cursor, sets_custom_type_column,
 };
+use super::emitter::new_values::{emit_input_conversion, StatementValues};
 use super::insert::column_default_expr;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_ERROR};
@@ -24,8 +25,8 @@ use crate::translate::fkeys::{
     fire_fk_update_actions, ParentKeyNewProbeMode,
 };
 use crate::translate::insert::{
-    emit_column_type_conversion, emit_remember_written_rowid, emit_returning_subqueries,
-    expr_contains_subquery, format_unique_violation_desc, InsertEmitCtx,
+    emit_remember_written_rowid, emit_returning_subqueries, expr_contains_subquery,
+    format_unique_violation_desc, InsertEmitCtx,
 };
 use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
@@ -827,12 +828,13 @@ pub fn emit_upsert(
     }
 
     if let Some(bt) = table.btree() {
-        emit_column_type_conversion(
+        emit_input_conversion(
             program,
             resolver,
             &bt,
             new_start,
-            layout.num_non_virtual_cols(),
+            &layout,
+            StatementValues::of_insert(program),
         )?;
     }
 

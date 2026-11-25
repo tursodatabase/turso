@@ -2619,16 +2619,14 @@ fn emit_strict_column_conversion(
             reg: layout.to_register(start_reg, column_index),
         });
     }
-    program.emit_insn(Insn::TypeCheck {
+    crate::translate::emitter::new_values::emit_input_conversion(
+        program,
+        resolver,
+        &rewritten_table,
         start_reg,
-        count: layout.num_non_virtual_cols(),
-        check_generated: false,
-        table_reference: BTreeTable::input_type_check_table_ref(
-            &rewritten_table,
-            resolver.schema(),
-            Some(&column_mask),
-        )?,
-    });
+        layout,
+        crate::translate::emitter::new_values::StatementValues::Only(&column_mask),
+    )?;
     crate::translate::expr::emit_custom_type_encode_columns(
         program,
         resolver,

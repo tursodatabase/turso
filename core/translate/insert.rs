@@ -7,6 +7,7 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::ColumnLayout;
 use crate::security::permission::Object;
 use crate::translate::collate::CollationSeq;
+use crate::translate::emitter::new_values::{emit_input_conversion, StatementValues};
 use crate::translate::emitter::RegisterColumn;
 use crate::translate::emitter::{
     emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
@@ -725,12 +726,13 @@ pub fn translate_insert(
             !column.is_generated() && !has_custom_type(column)
         })?;
     }
-    emit_column_type_conversion(
+    emit_input_conversion(
         program,
         resolver,
         ctx.table,
         insertion.first_col_register(),
-        insertion.num_non_virtual_cols,
+        &ctx.table.column_layout()?,
+        StatementValues::of_insert(program),
     )?;
     if let Some(type_check_table) = &maybe_type_check_table {
         if !program.flags.writes_stored_values() {
@@ -1179,12 +1181,13 @@ fn emit_new_row_for_before_triggers(
         dst_reg: new_first_col_reg,
         extra_amount: insertion.num_non_virtual_cols - 1,
     });
-    emit_column_type_conversion(
+    emit_input_conversion(
         program,
         resolver,
         table,
         new_first_col_reg,
-        insertion.num_non_virtual_cols,
+        &table.column_layout()?,
+        StatementValues::of_insert(program),
     )?;
 
     let new_registers: Vec<usize> = insertion
@@ -1220,52 +1223,6 @@ fn emit_new_row_for_before_triggers(
         .into_iter()
         .chain(std::iter::once(new_key_reg))
         .collect())
-}
-
-/// Converts the stored columns of a row, in the registers that start at `first_col_reg`, to the
-/// types of their columns: affinity, or the type check of a STRICT table.
-pub(crate) fn emit_column_type_conversion(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    table: &Arc<BTreeTable>,
-    first_col_reg: usize,
-    num_non_virtual_cols: usize,
-) -> Result<()> {
-    if table.is_strict {
-        // Stored values are already in the stored form.
-        if !program.flags.writes_stored_values() {
-            program.emit_insn(Insn::TypeCheck {
-                start_reg: first_col_reg,
-                count: num_non_virtual_cols,
-                check_generated: false,
-                table_reference: BTreeTable::input_type_check_table_ref(
-                    table,
-                    resolver.schema(),
-                    None,
-                )?,
-            });
-        }
-        return Ok(());
-    }
-    let affinities = table
-        .columns()
-        .iter()
-        .filter(|column| !column.is_virtual_generated())
-        .map(|column| column.affinity());
-    if affinities
-        .clone()
-        .all(|affinity| affinity == Affinity::Blob)
-    {
-        return Ok(());
-    }
-    if let Ok(count) = NonZeroUsize::try_from(num_non_virtual_cols) {
-        program.emit_insn(Insn::Affinity {
-            start_reg: first_col_reg,
-            count,
-            affinities: affinities.map(|affinity| affinity.aff_mask()).collect(),
-        });
-    }
-    Ok(())
 }
 
 /// Emits the RETURNING subqueries of an INSERT against the row whose column
