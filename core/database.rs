@@ -200,6 +200,18 @@ impl EncryptionOpts {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Checks that the cipher name is known, that the key is valid hex, and that the key has the
+    /// size that the cipher needs. It does not check the key against a database.
+    ///
+    /// The open functions of [`Database`] call this before they open or create the database file,
+    /// so that invalid options do not leave a new, empty file. A caller that opens the file itself
+    /// and then gives the storage to [`Database::open_async`] must call it first.
+    pub fn validate(&self) -> Result<()> {
+        let cipher = CipherMode::try_from(self.cipher.as_str())?;
+        let key = EncryptionKey::from_hex_string(&self.hexkey)?;
+        cipher.check_key_size(&key)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1130,10 +1142,15 @@ impl Database {
                 "built-in encryption cannot be combined with an external page codec".to_string(),
             ));
         }
-        if options.encryption.is_some() && !options.db_opts.enable_encryption {
-            return Err(LimboError::InvalidArgument(
-                "encryption is an opt in feature".into(),
-            ));
+        if let Some(encryption) = &options.encryption {
+            if !options.db_opts.enable_encryption {
+                return Err(LimboError::InvalidArgument(
+                    "encryption is an opt in feature".into(),
+                ));
+            }
+            // The open parses the cipher and the key only after it has opened the file. Check
+            // them here, before the file is created, so that invalid options leave no empty file.
+            encryption.validate()?;
         }
         Ok(())
     }
