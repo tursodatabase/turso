@@ -1861,6 +1861,10 @@ fn install_committed_vacuum_image(
     } else {
         replace_shared_schema_after_vacuum(source_db.as_ref(), schema);
     }
+    // The rebuilt image can assign new hidden rowids when SQL cannot name the old ones.
+    source_db
+        .subscriptions
+        .publish(&crate::ChangeBatch::Refresh);
 }
 
 fn reload_physical_schema_for_mvcc_vacuum(
@@ -2514,9 +2518,9 @@ fn vacuum_in_place_step(
 
             VacuumInPlacePhase::InstallCommittedImage => {
                 let committed_image = committed_image
-                    .as_ref()
+                    .take()
                     .expect("VACUUM metadata install requires captured committed image");
-                install_committed_vacuum_image(connection, db, committed_image);
+                install_committed_vacuum_image(connection, db, &committed_image);
                 drop(cleanup_state.mvcc_guard.take());
 
                 *phase = VacuumInPlacePhase::Done;

@@ -2169,6 +2169,9 @@ impl Connection {
             }
             wal.end_write_tx();
             wal.end_read_tx();
+            let committed = force_commit && commit_err.is_none();
+            self.pending_changes
+                .finish(None, committed.then_some(&self.db.subscriptions));
             if let Some(err) = commit_err {
                 return Err(err);
             }

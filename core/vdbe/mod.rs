@@ -1876,9 +1876,8 @@ impl ProgramState {
                 "ending a writer with {previous} active writer(s)"
             );
             self.is_active_write = false;
-            let snapshot = std::mem::take(&mut self.change_snapshot);
-            if end_statement == EndStatement::RollbackSavepoint {
-                connection.pending_changes.restore(snapshot);
+            if end_statement == EndStatement::ReleaseSavepoint || !self.has_stmt_transaction {
+                self.change_snapshot = Default::default();
             }
         }
         // A write statement that keeps its changes must have applied them to
@@ -1943,8 +1942,12 @@ impl ProgramState {
                 let pager_err = if let Some(mv_store) = connection.mv_store().as_ref() {
                     let mut err = None;
                     if let Some(tx_id) = connection.get_mv_tx_id() {
-                        if let Err(e) = mv_store.rollback_first_savepoint(tx_id) {
-                            err = Some(e);
+                        match mv_store.rollback_first_savepoint(tx_id) {
+                            Ok(true) if ends_write_statement => connection
+                                .pending_changes
+                                .restore(std::mem::take(&mut self.change_snapshot)),
+                            Ok(_) => {}
+                            Err(e) => err = Some(e),
                         }
                     }
                     connection.for_each_attached_mv_tx(|db_id, tx_id| {
@@ -1966,7 +1969,12 @@ impl ProgramState {
                     err
                 } else if self.uses_subjournal {
                     match pager.rollback_to_newest_savepoint() {
-                        Ok(_) => {
+                        Ok(rolled_back) => {
+                            if rolled_back && ends_write_statement {
+                                connection
+                                    .pending_changes
+                                    .restore(std::mem::take(&mut self.change_snapshot));
+                            }
                             let mut err = None;
                             for p in &attached_pagers {
                                 if let Err(e) = p.rollback_to_newest_savepoint() {

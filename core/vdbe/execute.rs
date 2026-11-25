@@ -14397,10 +14397,11 @@ fn op_clear_btree_inner(
                                 .all_tables()
                                 .filter_map(|t| t.btree())
                                 .find(|t| t.root_page == *root);
-                            connection.record_subscription_change(
-                                table.as_ref().map(|t| t.name.as_str()),
-                                None,
-                            );
+                            if let Some(table) =
+                                table.filter(|t| !crate::schema::is_system_table(&t.name))
+                            {
+                                connection.record_subscription_change(Some(&table.name), None);
+                            }
                         }
                         state.record_statement_changes(changes);
                         state.record_rows_written(removed_entries);

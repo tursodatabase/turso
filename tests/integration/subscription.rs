@@ -289,3 +289,87 @@ fn returning_waits_for_commit(db: TempDatabase) {
     stmt.run_ignore_rows().unwrap();
     assert_eq!(sub.try_recv(), Some(batch("t", [vec![Value::from_i64(1)]])));
 }
+
+#[turso_macros::test(mvcc)]
+fn strict_update_keeps_changes_before_error(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x INTEGER) STRICT").unwrap();
+    conn.execute("INSERT INTO t VALUES(1),(2)").unwrap();
+    let sub = db.db.subscribe_changes(ChangeFilter::All);
+    conn.execute("BEGIN").unwrap();
+    conn.execute("UPDATE t SET x=CASE x WHEN 1 THEN 3 ELSE 'invalid' END")
+        .unwrap_err();
+    assert_eq!(sub.try_recv(), None);
+    conn.execute("COMMIT").unwrap();
+    let rows = conn
+        .prepare("SELECT x FROM t ORDER BY rowid")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![Value::from_i64(3)], vec![Value::from_i64(2)]]
+    );
+    assert_eq!(sub.try_recv(), Some(batch("t", [vec![Value::from_i64(1)]])));
+}
+
+#[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+#[turso_macros::test]
+fn wal_session_sql_changes(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let sub = db.db.subscribe_changes(ChangeFilter::All);
+    conn.wal_insert_begin().unwrap();
+    conn.execute("INSERT INTO t VALUES(1)").unwrap();
+    conn.wal_insert_end(true).unwrap();
+    assert_eq!(sub.try_recv(), Some(batch("t", [vec![Value::from_i64(1)]])));
+    conn.wal_insert_begin().unwrap();
+    conn.execute("INSERT INTO t VALUES(2)").unwrap();
+    conn.wal_insert_end(false).unwrap();
+    assert_eq!(sub.try_recv(), None);
+    conn.execute("INSERT INTO t VALUES(3)").unwrap();
+    assert_eq!(sub.try_recv(), Some(batch("t", [vec![Value::from_i64(3)]])));
+    let rows = conn
+        .prepare("SELECT id FROM t ORDER BY id")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(3)]]
+    );
+}
+
+#[turso_macros::test]
+fn bulk_delete_of_internal_table_is_silent(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT)")
+        .unwrap();
+    conn.execute("INSERT INTO t DEFAULT VALUES").unwrap();
+    let sub = db.db.subscribe_changes(ChangeFilter::All);
+    conn.execute("DELETE FROM sqlite_sequence").unwrap();
+    assert_eq!(sub.try_recv(), None);
+}
+
+#[turso_macros::test(mvcc)]
+fn in_place_vacuum_invalidates_hidden_rowids(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(rowid TEXT, oid TEXT, _rowid_ TEXT, payload INT)")
+        .unwrap();
+    conn.execute("INSERT INTO t(payload) VALUES(1),(2)")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE payload=1").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let sub = db.db.subscribe_changes(ChangeFilter::Row {
+        table: "t".into(),
+        primary_key: vec![Value::from_i64(2)],
+    });
+    conn.execute("BEGIN").unwrap();
+    conn.execute("VACUUM").unwrap_err();
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(sub.try_recv(), None);
+    conn.execute("VACUUM").unwrap();
+    assert_eq!(sub.try_recv(), Some(ChangeBatch::Refresh));
+    assert_eq!(sub.try_recv(), None);
+}
