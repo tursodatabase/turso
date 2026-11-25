@@ -255,12 +255,11 @@ fn time_zones_in_options(options: &str) -> Vec<&str> {
 
 /// Whether `zone` names UTC exactly.
 fn is_utc(zone: &str) -> bool {
-    const UTC_NAMES: [&str; 12] = [
+    const UTC_NAMES: [&str; 11] = [
         "utc",
         "etc/utc",
         "gmt",
         "etc/gmt",
-        "z",
         "uct",
         "universal",
         "zulu",
