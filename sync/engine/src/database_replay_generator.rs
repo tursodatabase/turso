@@ -681,23 +681,39 @@ impl DatabaseReplayGenerator {
         else {
             return Ok(());
         };
-        let Some(local_columns) = self
-            .local_column_definitions(coro, tbl_name.name.as_str())
-            .await?
-        else {
+        let table_name = tbl_name.name.as_str();
+        let Some(mut local_columns) = self.local_column_definitions(coro, table_name).await? else {
             return Ok(());
         };
         let (renamed_columns, dropped_columns) =
             renamed_and_dropped_columns(&local_columns, &columns);
+        let dropped_columns = dropped_columns
+            .into_iter()
+            .map(|name| name.as_str().to_string())
+            .collect::<Vec<_>>();
+        let renamed_any_column = !renamed_columns.is_empty();
         for (old_name, new_name) in renamed_columns {
             let rename_column =
                 format!("ALTER TABLE {tbl_name} RENAME COLUMN {old_name} TO {new_name}");
             self.execute_ddl(&rename_column)?;
         }
-        for name in dropped_columns.into_iter().rev() {
-            let drop_column = format!("ALTER TABLE {tbl_name} DROP COLUMN {name}");
-            self.execute_ddl(&drop_column)?;
+        if dropped_columns.is_empty() {
+            return Ok(());
         }
+        if renamed_any_column {
+            // RENAME COLUMN also changes the expressions of the generated
+            // columns that use the renamed column.
+            local_columns = self
+                .local_column_definitions(coro, table_name)
+                .await?
+                .expect("RENAME COLUMN keeps the table");
+        }
+        self.drop_columns_and_their_users(
+            &tbl_name,
+            &mut local_columns,
+            dropped_columns,
+            &columns,
+        )?;
         return Ok(());
 
         fn renamed_and_dropped_columns<'a>(
@@ -769,18 +785,22 @@ impl DatabaseReplayGenerator {
                 } = body
                 {
                     // drop the generated columns that were changed
-                    for index in (0..local_columns.len()).rev() {
-                        if !generated_column_changed_between_local_and_remote(
-                            &local_columns[index],
-                            remote_columns,
-                        ) {
-                            continue;
-                        }
-                        let dropped = local_columns.remove(index);
-                        let drop_column =
-                            format!("ALTER TABLE {tbl_name} DROP COLUMN {}", dropped.col_name);
-                        self.execute_ddl(&drop_column)?;
-                    }
+                    let changed_columns = local_columns
+                        .iter()
+                        .filter(|column| {
+                            generated_column_changed_between_local_and_remote(
+                                column,
+                                remote_columns,
+                            )
+                        })
+                        .map(|column| column.col_name.as_str().to_string())
+                        .collect();
+                    self.drop_columns_and_their_users(
+                        tbl_name,
+                        &mut local_columns,
+                        changed_columns,
+                        remote_columns,
+                    )?;
                     // add the missing remote columns
                     for column in remote_columns {
                         if has_column(&local_columns, column.col_name.as_str()) {
@@ -848,6 +868,78 @@ impl DatabaseReplayGenerator {
                 Ok(())
             }
         }
+    }
+
+    /// Drops the columns `names` of the table `tbl_name`, and removes them from
+    /// `local_columns`, the current columns of the table. Core refuses to drop
+    /// a column that a generated column uses. So this also drops each
+    /// generated column that uses a column of `names`, directly or through
+    /// other generated columns, and it drops a column only when no remaining
+    /// column uses it. The caller then adds those generated columns again
+    /// from `remote_columns`.
+    fn drop_columns_and_their_users(
+        &self,
+        tbl_name: &turso_core::ast::QualifiedName,
+        local_columns: &mut Vec<turso_core::ast::ColumnDefinition>,
+        mut names: Vec<String>,
+        remote_columns: &[turso_core::ast::ColumnDefinition],
+    ) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let users = generated_columns_that_use(local_columns, &names);
+        if !users.is_empty() {
+            // The users are added again from `remote_columns`. A generated
+            // column gets its values again, but a regular column stays empty.
+            // A user that the remote table has as a regular column comes from
+            // a wrong match of the columns, for example after the remote
+            // renamed columns in a chain.
+            let regular_users = users
+                .iter()
+                .filter(|user| {
+                    !remote_columns.iter().any(|column| {
+                        column.col_name.as_str().eq_ignore_ascii_case(user) && is_generated(column)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !regular_users.is_empty() {
+                return Err(Error::DatabaseTapeError(format!(
+                    "the generated columns {} of table {tbl_name} use a dropped column, but the remote table does not have them as generated columns",
+                    regular_users.join(", ")
+                )));
+            }
+            names.extend(users.iter().cloned());
+            // The users are added again at the end of the table. A pull
+            // matches the values of a row with the columns by position, so the
+            // columns that stay must be the first columns of the remote table.
+            // A column that stays and is generated on one side only also comes
+            // from a wrong match of the columns.
+            let Some(staying_columns) =
+                staying_columns_with_remote(local_columns, &names, remote_columns)
+            else {
+                return Err(Error::DatabaseTapeError(format!(
+                    "the generated columns {} of table {tbl_name} use a dropped column, but they are not the last columns of the remote table",
+                    users.join(", ")
+                )));
+            };
+            if let Some((column, _)) = staying_columns
+                .iter()
+                .find(|(column, remote_column)| is_generated(column) != is_generated(remote_column))
+            {
+                return Err(Error::DatabaseTapeError(format!(
+                    "the generated columns {} of table {tbl_name} use a dropped column, but the column {} is generated on one side only",
+                    users.join(", "),
+                    column.col_name
+                )));
+            }
+        }
+        while let Some(index) = next_column_to_drop(local_columns, &names) {
+            let dropped = local_columns.remove(index);
+            let drop_column = format!("ALTER TABLE {tbl_name} DROP COLUMN {}", dropped.col_name);
+            self.execute_ddl(&drop_column)?;
+        }
+        Ok(())
     }
 
     /// Returns `None` if there is no matching local table
@@ -997,16 +1089,116 @@ fn generated_column_changed_between_local_and_remote(
         // remote has removed the gencol
         return true;
     };
-    return is_generated(remote_column) && remote_column.to_string() != local_column.to_string();
+    is_generated(remote_column) && remote_column.to_string() != local_column.to_string()
+}
 
-    fn is_generated(column: &turso_core::ast::ColumnDefinition) -> bool {
-        column.constraints.iter().any(|constraint| {
-            matches!(
-                constraint.constraint,
-                turso_core::ast::ColumnConstraint::Generated { .. }
-            )
-        })
+/// Returns whether `column` is a generated column.
+fn is_generated(column: &turso_core::ast::ColumnDefinition) -> bool {
+    column.constraints.iter().any(|constraint| {
+        matches!(
+            constraint.constraint,
+            turso_core::ast::ColumnConstraint::Generated { .. }
+        )
+    })
+}
+
+/// Returns the names of the generated columns of `columns` that use a column
+/// of `names`, directly or through other generated columns. The result holds
+/// no name of `names`.
+fn generated_columns_that_use(
+    columns: &[turso_core::ast::ColumnDefinition],
+    names: &[String],
+) -> Vec<String> {
+    let mut users = Vec::new();
+    while let Some(user) = columns.iter().find(|column| {
+        let name = column.col_name.as_str();
+        !contains_name(names, name)
+            && !contains_name(&users, name)
+            && columns_read_by(column)
+                .iter()
+                .any(|read| contains_name(names, read) || contains_name(&users, read))
+    }) {
+        users.push(user.col_name.as_str().to_string());
     }
+    users
+}
+
+/// Returns each column of `local_columns` that is not in `names`, with the
+/// column at its place among the first columns of `remote_columns`. Returns
+/// `None` if their names differ: then dropping the columns `names` and adding
+/// them again at the end changes the column order of the remote table.
+fn staying_columns_with_remote<'a>(
+    local_columns: &'a [turso_core::ast::ColumnDefinition],
+    names: &[String],
+    remote_columns: &'a [turso_core::ast::ColumnDefinition],
+) -> Option<
+    Vec<(
+        &'a turso_core::ast::ColumnDefinition,
+        &'a turso_core::ast::ColumnDefinition,
+    )>,
+> {
+    let mut remote_columns = remote_columns.iter();
+    local_columns
+        .iter()
+        .filter(|column| !contains_name(names, column.col_name.as_str()))
+        .map(|column| {
+            let remote_column = remote_columns.next()?;
+            remote_column
+                .col_name
+                .as_str()
+                .eq_ignore_ascii_case(column.col_name.as_str())
+                .then_some((column, remote_column))
+        })
+        .collect()
+}
+
+/// Returns the index in `columns` of the next column of `names` to drop: the
+/// last one that no other column of `columns` uses. If each of them is in
+/// use, it returns the last one, and core then refuses the drop with an error.
+/// That needs a cycle of generated columns, which core refuses to create. The
+/// schema comes from another database, so a pull reports an error for it and
+/// does not stop the process with an assertion.
+fn next_column_to_drop(
+    columns: &[turso_core::ast::ColumnDefinition],
+    names: &[String],
+) -> Option<usize> {
+    let candidates = (0..columns.len())
+        .rev()
+        .filter(|&index| contains_name(names, columns[index].col_name.as_str()))
+        .collect::<Vec<_>>();
+    let last = *candidates.first()?;
+    let is_unused = |index: usize| {
+        let name = columns[index].col_name.as_str();
+        columns
+            .iter()
+            .enumerate()
+            .all(|(other, column)| other == index || !contains_name(&columns_read_by(column), name))
+    };
+    Some(
+        candidates
+            .into_iter()
+            .find(|&index| is_unused(index))
+            .unwrap_or(last),
+    )
+}
+
+/// Returns the names that the expression of the generated column `column`
+/// uses, as core finds them, or no names if `column` is not generated.
+fn columns_read_by(column: &turso_core::ast::ColumnDefinition) -> Vec<String> {
+    column
+        .constraints
+        .iter()
+        .filter_map(|constraint| match &constraint.constraint {
+            turso_core::ast::ColumnConstraint::Generated { expr, .. } => Some(expr),
+            _ => None,
+        })
+        .flat_map(|expr| turso_core::schema::collect_column_dependencies_of_expr(expr, &[]))
+        .collect()
+}
+
+/// Returns whether `names` holds `name`. Like SQL, it ignores ASCII case.
+fn contains_name(names: &[String], name: &str) -> bool {
+    names.iter().any(|other| other.eq_ignore_ascii_case(name))
 }
 
 fn has_column(columns: &[turso_core::ast::ColumnDefinition], name: &str) -> bool {

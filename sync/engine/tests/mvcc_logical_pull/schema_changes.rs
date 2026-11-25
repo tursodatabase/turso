@@ -317,3 +317,113 @@ fn drop_and_rename_columns_of_generated_column_in_one_transaction() -> Result<()
     assert_eq!(replica.snapshot()?, remote.snapshot()?);
     Ok(())
 }
+
+/// The remote renames `wand` to `wand_wood`, and then `house` to `wand`. The
+/// replica matches the columns by position, so it takes `house` as dropped,
+/// and `motto`, which uses `house`, as renamed to `wand_wood`.
+#[test]
+fn rename_chain_beside_generated_column_keeps_values() -> Result<()> {
+    assert_pulls_keep_values(
+        r#"CREATE TABLE "muggles-in-london" (
+            id TEXT PRIMARY KEY,
+            house TEXT,
+            wand TEXT,
+            motto TEXT AS (house || '!')
+        )"#,
+        &[
+            r#"ALTER TABLE "muggles-in-london" RENAME COLUMN wand TO wand_wood"#,
+            r#"ALTER TABLE "muggles-in-london" RENAME COLUMN house TO wand"#,
+        ],
+    )
+}
+
+/// The remote renames `wand` to `wand_key`, which was a generated column, and
+/// then `house` to `wand`. The replica matches the columns by position, so it
+/// takes `house` as dropped and keeps the generated `wand_key` where the
+/// remote has the regular `wand_key`.
+#[test]
+fn rename_chain_onto_generated_column_keeps_values() -> Result<()> {
+    assert_pulls_keep_values(
+        r#"CREATE TABLE "muggles-in-london" (
+            id TEXT PRIMARY KEY,
+            house TEXT,
+            wand TEXT,
+            wand_key TEXT AS (id || '-key'),
+            motto TEXT AS (upper(house))
+        )"#,
+        &[
+            r#"ALTER TABLE "muggles-in-london" DROP COLUMN motto"#,
+            r#"ALTER TABLE "muggles-in-london" DROP COLUMN wand_key"#,
+            r#"ALTER TABLE "muggles-in-london" RENAME COLUMN wand TO wand_key"#,
+            r#"ALTER TABLE "muggles-in-london" RENAME COLUMN house TO wand"#,
+            r#"ALTER TABLE "muggles-in-london" ADD COLUMN motto TEXT AS (upper(wand))"#,
+        ],
+    )
+}
+
+/// The remote drops every column but `id`, and adds `wand` again as a
+/// generated column. The replica matches `wand` by name, so it keeps the
+/// regular `wand` where the remote has the generated `wand`.
+#[test]
+fn regular_column_added_again_as_generated_column_keeps_values() -> Result<()> {
+    assert_pulls_keep_values(
+        r#"CREATE TABLE "muggles-in-london" (
+            id TEXT PRIMARY KEY,
+            house TEXT,
+            wand TEXT,
+            motto TEXT AS (upper(house))
+        )"#,
+        &[
+            r#"ALTER TABLE "muggles-in-london" DROP COLUMN motto"#,
+            r#"ALTER TABLE "muggles-in-london" DROP COLUMN house"#,
+            r#"ALTER TABLE "muggles-in-london" DROP COLUMN wand"#,
+            r#"ALTER TABLE "muggles-in-london" ADD COLUMN wand TEXT AS (id || '-wand')"#,
+            r#"ALTER TABLE "muggles-in-london" ADD COLUMN motto TEXT AS (id || '!')"#,
+        ],
+    )
+}
+
+/// The remote drops every column but `id`, and adds a new generated column
+/// `wand_key`. The replica matches the columns by position, so it takes
+/// `house` as renamed to the regular `wand_key`.
+#[test]
+fn new_generated_column_matched_by_position_keeps_values() -> Result<()> {
+    assert_pulls_keep_values(
+        r#"CREATE TABLE "muggles-in-london" (
+            id TEXT PRIMARY KEY,
+            house TEXT,
+            wand TEXT,
+            motto TEXT AS (upper(wand))
+        )"#,
+        &[
+            r#"ALTER TABLE "muggles-in-london" DROP COLUMN motto"#,
+            r#"ALTER TABLE "muggles-in-london" DROP COLUMN wand"#,
+            r#"ALTER TABLE "muggles-in-london" DROP COLUMN house"#,
+            r#"ALTER TABLE "muggles-in-london" ADD COLUMN wand_key TEXT AS (id || '-key')"#,
+            r#"ALTER TABLE "muggles-in-london" ADD COLUMN motto TEXT AS (id || '!')"#,
+        ],
+    )
+}
+
+/// Bootstraps a replica of a remote that created the table with `create_table`
+/// and inserted a row. Then the remote runs `transaction`, and the replica
+/// pulls. Then the remote inserts another row, and the replica pulls again.
+/// A pull can fail, but after a pull that succeeds the replica must have the
+/// schema and the values of the remote.
+fn assert_pulls_keep_values(create_table: &str, transaction: &[&str]) -> Result<()> {
+    let remote = Remote::new(&[
+        create_table,
+        r#"INSERT INTO "muggles-in-london" (id, house, wand) VALUES ('a', 'Gryffindor', 'Holly')"#,
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(transaction)?;
+    if replica.pull().is_ok() {
+        assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    }
+    remote.execute_transaction(&[r#"INSERT INTO "muggles-in-london" (id) VALUES ('b')"#])?;
+    if replica.pull().is_ok() {
+        assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    }
+    Ok(())
+}
