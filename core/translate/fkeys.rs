@@ -1847,7 +1847,7 @@ fn emit_fk_action_subprogram(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
     connection: &Arc<Connection>,
-    stmt: ast::Stmt,
+    stmt: Box<ast::Stmt>,
     ctx: &FkActionContext,
     foreign_key: Arc<ForeignKey>,
     description: &'static str,
@@ -1928,14 +1928,19 @@ fn qualified_table_name(table_name: &str, db_name: Option<&str>) -> QualifiedNam
 
 /// Generate a DELETE statement AST for CASCADE DELETE:
 /// DELETE FROM child_table WHERE fk_col1 = ?1 AND fk_col2 = ?2 ...
+///
+/// It returns the statement in a [Box] and it is not inlined, so that the frames
+/// on the recursive path of nested programs keep only the [Box] (see
+/// [translate_inner]).
+#[inline(never)]
 fn generate_cascade_delete_stmt(
     child_table: &str,
     child_cols: &[String],
     parent_collations: &[CollationSeq],
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
-) -> ast::Stmt {
-    ast::Stmt::Delete {
+) -> Box<ast::Stmt> {
+    Box::new(ast::Stmt::Delete {
         with: None,
         tbl_name: qualified_table_name(child_table, db_name),
         indexed: None,
@@ -1946,18 +1951,23 @@ fn generate_cascade_delete_stmt(
         ))),
         returning: vec![],
         truncate: false,
-    }
+    })
 }
 
 /// Generate an UPDATE statement AST for SET NULL:
 /// UPDATE child_table SET fk_col1 = NULL, fk_col2 = NULL ... WHERE fk_col1 = ?1 AND fk_col2 = ?2 ...
+///
+/// It returns the statement in a [Box] and it is not inlined, so that the frames
+/// on the recursive path of nested programs keep only the [Box] (see
+/// [translate_inner]).
+#[inline(never)]
 fn generate_set_null_stmt(
     child_table: &str,
     child_cols: &[String],
     parent_collations: &[CollationSeq],
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
-) -> ast::Stmt {
+) -> Box<ast::Stmt> {
     // Build SET clause: fk_col1 = NULL, fk_col2 = NULL ...
     let sets: Vec<ast::Set> = child_cols
         .iter()
@@ -1966,7 +1976,7 @@ fn generate_set_null_stmt(
             expr: Box::new(Expr::Literal(Literal::Null)),
         })
         .collect();
-    ast::Stmt::Update(ast::Update {
+    Box::new(ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
         tbl_name: qualified_table_name(child_table, db_name),
@@ -1979,18 +1989,23 @@ fn generate_set_null_stmt(
             ctx,
         ))),
         returning: vec![],
-    })
+    }))
 }
 
 /// Generate an UPDATE statement AST for SET DEFAULT:
 /// UPDATE child_table SET fk_col1 = default1, fk_col2 = default2 ... WHERE fk_col1 = ?old1 AND fk_col2 = ?old2 ...
+///
+/// It returns the statement in a [Box] and it is not inlined, so that the frames
+/// on the recursive path of nested programs keep only the [Box] (see
+/// [translate_inner]).
+#[inline(never)]
 fn generate_set_default_stmt(
     child_table: &BTreeTable,
     child_cols: &[String],
     parent_collations: &[CollationSeq],
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
-) -> ast::Stmt {
+) -> Box<ast::Stmt> {
     // Build SET clause: if no default is defined for a column, we use NULL
     let sets: Vec<ast::Set> = child_cols
         .iter()
@@ -2007,7 +2022,7 @@ fn generate_set_default_stmt(
         })
         .collect();
 
-    ast::Stmt::Update(ast::Update {
+    Box::new(ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
         tbl_name: qualified_table_name(&child_table.name, db_name),
@@ -2020,18 +2035,23 @@ fn generate_set_default_stmt(
             ctx,
         ))),
         returning: vec![],
-    })
+    }))
 }
 
 /// Generate an UPDATE statement AST for CASCADE UPDATE:
 /// UPDATE child_table SET fk_col1 = ?new1, fk_col2 = ?new2 ... WHERE fk_col1 = ?old1 AND fk_col2 = ?old2 ...
+///
+/// It returns the statement in a [Box] and it is not inlined, so that the frames
+/// on the recursive path of nested programs keep only the [Box] (see
+/// [translate_inner]).
+#[inline(never)]
 fn generate_cascade_update_stmt(
     child_table: &str,
     child_cols: &[String],
     parent_collations: &[CollationSeq],
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
-) -> ast::Stmt {
+) -> Box<ast::Stmt> {
     // Build SET clause
     let sets: Vec<ast::Set> = child_cols
         .iter()
@@ -2053,7 +2073,7 @@ fn generate_cascade_update_stmt(
         .collect();
 
     let where_clause = build_fk_match_where_clause(child_cols, parent_collations, ctx);
-    ast::Stmt::Update(ast::Update {
+    Box::new(ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
         tbl_name: qualified_table_name(child_table, db_name),
@@ -2062,7 +2082,7 @@ fn generate_cascade_update_stmt(
         from: None,
         where_clause: Some(Box::new(where_clause)),
         returning: vec![],
-    })
+    }))
 }
 
 /// Build a WHERE clause that matches FK columns to parameter values:

@@ -196,7 +196,13 @@ pub fn translate(
                 &mut program,
             )?;
         }
-        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
+        stmt => translate_inner(
+            Box::new(stmt),
+            &mut resolver,
+            &mut program,
+            &connection,
+            input,
+        )?,
     };
 
     program.epilogue(schema);
@@ -243,9 +249,16 @@ pub(crate) fn build_program(
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
 // statements, we would have to return a program builder instead
 /// Translate SQL statement into bytecode program.
+///
+/// A trigger body and a foreign key action are nested programs. Their
+/// compilation recurses through this function one time for each level of nested
+/// triggers or foreign key actions, up to the trigger depth limit, and each level
+/// uses stack. Thus, the functions on this recursive path keep their large values
+/// in a [Box], or in functions that are not inlined. The statement is in a [Box]
+/// for the same reason.
 #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
 pub fn translate_inner(
-    stmt: ast::Stmt,
+    stmt: Box<ast::Stmt>,
     resolver: &mut Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
@@ -271,14 +284,14 @@ pub fn translate_inner(
 /// together were more than twice as large as the one frame.
 #[inline(always)]
 fn translate_statement(
-    mut stmt: ast::Stmt,
+    mut stmt: Box<ast::Stmt>,
     resolver: &mut Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
 ) -> Result<()> {
     let is_write = matches!(
-        stmt,
+        *stmt,
         ast::Stmt::AlterTable { .. }
             | ast::Stmt::Analyze { .. }
             | ast::Stmt::CreateIndex { .. }
@@ -310,7 +323,7 @@ fn translate_statement(
             | ast::Stmt::CreatePolicy(_)
             | ast::Stmt::DropPolicy { .. }
     );
-    let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
+    let is_vacuum = matches!(*stmt, ast::Stmt::Vacuum { .. });
 
     if is_vacuum && connection.get_query_only() {
         bail_parse_error!("Cannot execute VACUUM in query_only mode")
@@ -320,9 +333,9 @@ fn translate_statement(
         bail_parse_error!("Cannot execute write statement in query_only mode")
     }
 
-    let is_select = matches!(stmt, ast::Stmt::Select { .. });
+    let is_select = matches!(*stmt, ast::Stmt::Select { .. });
     let is_dml = matches!(
-        stmt,
+        *stmt,
         ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }
     );
 
@@ -333,7 +346,7 @@ fn translate_statement(
         && !connection.is_nested_stmt()
         && !program.flags.is_subprogram()
     {
-        match &stmt {
+        match &*stmt {
             ast::Stmt::Insert { .. } => Some("rows inserted"),
             ast::Stmt::Update { .. } => Some("rows updated"),
             ast::Stmt::Delete { .. } => Some("rows deleted"),
@@ -346,12 +359,213 @@ fn translate_statement(
     let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
         && sequence::bind_sequence_names_in_stored_expressions(&mut stmt, resolver)?;
     if resolver.catalog.dialect.binds_names_at_create() {
-        if let ast::Stmt::CreateView { select, .. } = &mut stmt {
+        if let ast::Stmt::CreateView { select, .. } = &mut *stmt {
             view::bind_table_names(select, resolver);
         }
     }
 
-    match stmt {
+    // The compilation of nested triggers and foreign key actions recurses
+    // through this function one time for each level, with a DELETE, INSERT,
+    // UPDATE or SELECT. Each kind of statement is translated in a function
+    // that is not inlined, so that the values of the other kinds are not in
+    // the stack frame of this function.
+    match *stmt {
+        ast::Stmt::Delete { .. } => {
+            translate_delete_statement(stmt, resolver, program, connection)?
+        }
+        ast::Stmt::Insert { .. } => {
+            translate_insert_statement(stmt, resolver, program, connection)?
+        }
+        ast::Stmt::Update(_) => translate_update_statement(stmt, resolver, program, connection)?,
+        ast::Stmt::Select(_) => translate_select_statement(stmt, resolver, program, connection)?,
+        _ => translate_other_statement(
+            stmt,
+            resolver,
+            program,
+            connection,
+            input,
+            bound_sequence_names,
+        )?,
+    };
+
+    if is_write {
+        if is_dml {
+            // DML translators register their actual write database. Keep a
+            // main read transaction to coordinate connection-level autocommit,
+            // without upgrading an unrelated main snapshot for attached-only
+            // writes.
+            program.begin_read_operation()?;
+        } else {
+            program.begin_write_operation()?;
+        }
+    }
+
+    // Indicate read operations so that in the epilogue we can emit the correct type of transaction
+    if is_select && !program.table_references.is_empty() {
+        program.begin_read_operation()?;
+    }
+
+    // A statement with RETURNING already produces rows, so it never also returns
+    // a count row (same as SQLite).
+    if let Some(column_name) = count_changes_column {
+        if program.result_columns.is_empty() {
+            let reg = program.alloc_register();
+            program.emit_insn(crate::vdbe::insn::Insn::ChangeCount { dest: reg });
+            program.emit_result_row(reg, 1);
+            program.add_pragma_result_column(column_name.to_string());
+        }
+    }
+
+    if connection.experimental_custom_types_enabled() {
+        program.result_column_types = result_column_types::result_column_types(
+            &program.result_columns,
+            &program.table_references,
+            resolver,
+        );
+    }
+
+    // After translation so that name resolution errors come first, as in
+    // PostgreSQL, which rejects read-only violations when the command starts
+    // executing.
+    if is_write
+        && connection.is_tx_read_only()
+        && matches!(program.get_query_mode(), QueryMode::Normal)
+    {
+        return Err(crate::LimboError::ReadOnly);
+    }
+
+    Ok(())
+}
+
+/// Translates a DELETE for [translate_statement]. This function is not
+/// inlined, so that its stack frame has only the values of a DELETE.
+#[inline(never)]
+fn translate_delete_statement(
+    stmt: Box<ast::Stmt>,
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let ast::Stmt::Delete {
+        tbl_name,
+        where_clause,
+        returning,
+        indexed,
+        with,
+        truncate,
+    } = *stmt
+    else {
+        unreachable!("translate_delete_statement translates a DELETE")
+    };
+    if where_clause.is_none() && connection.get_dml_require_where() {
+        bail_parse_error!(
+            "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+        );
+    }
+    translate_delete(
+        &tbl_name,
+        resolver,
+        where_clause,
+        returning,
+        indexed,
+        with,
+        truncate,
+        program,
+        connection,
+    )
+}
+
+/// Translates an INSERT for [translate_statement]. This function is not
+/// inlined, so that its stack frame has only the values of an INSERT.
+#[inline(never)]
+fn translate_insert_statement(
+    stmt: Box<ast::Stmt>,
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let ast::Stmt::Insert {
+        with,
+        or_conflict,
+        tbl_name,
+        columns,
+        body,
+        returning,
+        overriding_system_value,
+    } = *stmt
+    else {
+        unreachable!("translate_insert_statement translates an INSERT")
+    };
+    translate_insert(
+        resolver,
+        or_conflict,
+        tbl_name,
+        columns,
+        body,
+        returning,
+        with,
+        overriding_system_value,
+        program,
+        connection,
+    )
+}
+
+/// Translates an UPDATE for [translate_statement]. This function is not
+/// inlined, so that its stack frame has only the values of an UPDATE.
+#[inline(never)]
+fn translate_update_statement(
+    stmt: Box<ast::Stmt>,
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let ast::Stmt::Update(update) = *stmt else {
+        unreachable!("translate_update_statement translates an UPDATE")
+    };
+    if update.where_clause.is_none() && connection.get_dml_require_where() {
+        bail_parse_error!(
+            "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+        );
+    }
+    translate_update(update, resolver, program, connection)
+}
+
+/// Translates a SELECT for [translate_statement]. This function is not
+/// inlined, so that its stack frame has only the values of a SELECT.
+#[inline(never)]
+fn translate_select_statement(
+    stmt: Box<ast::Stmt>,
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let ast::Stmt::Select(select) = *stmt else {
+        unreachable!("translate_select_statement translates a SELECT")
+    };
+    translate_select(
+        select,
+        resolver,
+        program,
+        plan::QueryDestination::ResultRows,
+        connection,
+    )?;
+    Ok(())
+}
+
+/// Translates the statements that are not a DELETE, an INSERT, an UPDATE or
+/// a SELECT, for [translate_statement]. This function is not inlined, so that
+/// the values of these statements are not in the stack frame of
+/// [translate_statement].
+#[inline(never)]
+fn translate_other_statement(
+    stmt: Box<ast::Stmt>,
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    input: &str,
+    bound_sequence_names: bool,
+) -> Result<()> {
+    match *stmt {
         ast::Stmt::AlterTable(alter) => {
             translate_alter_table(alter, resolver, program, connection, input)?;
         }
@@ -375,7 +589,7 @@ fn translate_statement(
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, resolver, stmt)?;
+            translate_create_index(program, connection, resolver, *stmt)?;
         }
         ast::Stmt::CreateTable {
             temporary,
@@ -449,31 +663,6 @@ fn translate_statement(
         )?,
         ast::Stmt::CreateVirtualTable(vtab) => {
             translate_create_virtual_table(vtab, resolver, program, connection)?
-        }
-        ast::Stmt::Delete {
-            tbl_name,
-            where_clause,
-            returning,
-            indexed,
-            with,
-            truncate,
-        } => {
-            if where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
-            translate_delete(
-                &tbl_name,
-                resolver,
-                where_clause,
-                returning,
-                indexed,
-                with,
-                truncate,
-                program,
-                connection,
-            )?
         }
         ast::Stmt::Detach { name } => {
             crate::attach::translate_detach(&name, resolver, program, connection.clone())?
@@ -587,49 +776,12 @@ fn translate_statement(
             savepoint_name,
         } => translate_rollback(program, tx_name, savepoint_name)?,
         ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
-        ast::Stmt::Select(select) => {
-            translate_select(
-                select,
-                resolver,
-                program,
-                plan::QueryDestination::ResultRows,
-                connection,
-            )?;
-        }
-        ast::Stmt::Update(update) => {
-            if update.where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
-            translate_update(update, resolver, program, connection)?
-        }
         ast::Stmt::Vacuum { name, into } => vacuum::translate_vacuum(
             program,
             resolver,
             name.as_ref(),
             into.as_deref(),
             connection.clone(),
-        )?,
-        ast::Stmt::Insert {
-            with,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-            overriding_system_value,
-        } => translate_insert(
-            resolver,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-            with,
-            overriding_system_value,
-            program,
-            connection,
         )?,
         ast::Stmt::CreateSequence {
             if_not_exists,
@@ -691,54 +843,13 @@ fn translate_statement(
                 connection,
             )?;
         }
+        ast::Stmt::Delete { .. }
+        | ast::Stmt::Insert { .. }
+        | ast::Stmt::Update(_)
+        | ast::Stmt::Select(_) => {
+            unreachable!("translate_statement translates DELETE, INSERT, UPDATE and SELECT")
+        }
     };
-
-    if is_write {
-        if is_dml {
-            // DML translators register their actual write database. Keep a
-            // main read transaction to coordinate connection-level autocommit,
-            // without upgrading an unrelated main snapshot for attached-only
-            // writes.
-            program.begin_read_operation()?;
-        } else {
-            program.begin_write_operation()?;
-        }
-    }
-
-    // Indicate read operations so that in the epilogue we can emit the correct type of transaction
-    if is_select && !program.table_references.is_empty() {
-        program.begin_read_operation()?;
-    }
-
-    // A statement with RETURNING already produces rows, so it never also returns
-    // a count row (same as SQLite).
-    if let Some(column_name) = count_changes_column {
-        if program.result_columns.is_empty() {
-            let reg = program.alloc_register();
-            program.emit_insn(crate::vdbe::insn::Insn::ChangeCount { dest: reg });
-            program.emit_result_row(reg, 1);
-            program.add_pragma_result_column(column_name.to_string());
-        }
-    }
-
-    if connection.experimental_custom_types_enabled() {
-        program.result_column_types = result_column_types::result_column_types(
-            &program.result_columns,
-            &program.table_references,
-            resolver,
-        );
-    }
-
-    // After translation so that name resolution errors come first, as in
-    // PostgreSQL, which rejects read-only violations when the command starts
-    // executing.
-    if is_write
-        && connection.is_tx_read_only()
-        && matches!(program.get_query_mode(), QueryMode::Normal)
-    {
-        return Err(crate::LimboError::ReadOnly);
-    }
-
     Ok(())
 }
 

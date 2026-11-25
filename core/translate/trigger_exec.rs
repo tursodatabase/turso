@@ -263,11 +263,16 @@ fn rewrite_upsert_exprs_for_subprogram(
 }
 
 /// Convert TriggerCmd to Stmt, rewriting NEW/OLD to Variable expressions (for subprogram compilation)
+///
+/// It returns the statement in a [Box] and it is not inlined, so that the frames
+/// on the recursive path of nested programs keep only the [Box] (see
+/// [crate::translate::translate_inner]).
 #[turso_macros::trace_stack(detail = trigger_command_kind(cmd))]
+#[inline(never)]
 fn trigger_cmd_to_stmt_for_subprogram(
     cmd: &ast::TriggerCmd,
     subprogram_ctx: &TriggerSubprogramContext,
-) -> Result<ast::Stmt> {
+) -> Result<Box<ast::Stmt>> {
     use ast::{InsertBody, QualifiedName};
 
     match cmd {
@@ -291,7 +296,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
             // If override_conflict is set (e.g., in UPSERT DO UPDATE context),
             // use it instead of the command's or_conflict to ensure errors propagate.
             let effective_or_conflict = subprogram_ctx.override_conflict.or(*or_conflict);
-            Ok(ast::Stmt::Insert {
+            Ok(Box::new(ast::Stmt::Insert {
                 overriding_system_value: false,
                 with: None,
                 or_conflict: effective_or_conflict,
@@ -303,7 +308,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 columns: col_names.clone(),
                 body,
                 returning: returning.clone(),
-            })
+            }))
         }
         ast::TriggerCmd::Update {
             or_conflict,
@@ -334,7 +339,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
             // If override_conflict is set (e.g., in UPSERT DO UPDATE context),
             // use it instead of the command's or_conflict to ensure errors propagate.
             let effective_or_conflict = subprogram_ctx.override_conflict.or(*or_conflict);
-            Ok(ast::Stmt::Update(ast::Update {
+            Ok(Box::new(ast::Stmt::Update(ast::Update {
                 with: None,
                 or_conflict: effective_or_conflict,
                 tbl_name: QualifiedName {
@@ -347,7 +352,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 from: from_clone,
                 where_clause: where_clause_clone,
                 returning: vec![],
-            }))
+            })))
         }
         ast::TriggerCmd::Delete {
             tbl_name,
@@ -359,7 +364,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 rewrite_trigger_expr_for_subprogram(where_expr, subprogram_ctx)?;
             }
 
-            Ok(ast::Stmt::Delete {
+            Ok(Box::new(ast::Stmt::Delete {
                 tbl_name: QualifiedName {
                     namespace: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),
@@ -370,13 +375,13 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 indexed: None,
                 with: None,
                 truncate: false,
-            })
+            }))
         }
         ast::TriggerCmd::Select(select) => {
             // Rewrite NEW/OLD references in the SELECT
             let mut select_clone = select.clone();
             rewrite_expressions_in_select_for_subprogram(&mut select_clone, subprogram_ctx)?;
-            Ok(ast::Stmt::Select(select_clone))
+            Ok(Box::new(ast::Stmt::Select(select_clone)))
         }
     }
 }
