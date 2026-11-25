@@ -163,6 +163,7 @@ pub struct HeadersArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct CloneArgs {
+    /// Path or file: URI of the new database
     pub output_file: String,
 }
 

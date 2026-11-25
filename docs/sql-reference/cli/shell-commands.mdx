@@ -453,6 +453,19 @@ tursodb> .clone backup.db
 employees... done
 ```
 
+If the file `OUTPUT_FILE` exists, `.clone` shows an error and does not change the file.
+
+`OUTPUT_FILE` can also be a `file:` URI, or a path that ends with `?key=value` parameters. `.clone` reads it as `.open` does, and the parameters are not part of the file name. To make an encrypted copy, use the `cipher` and `hexkey` parameters. They work only if encryption is enabled, for example with `--experimental-encryption`.
+
+```
+tursodb> .clone 'file:backup.db?cipher=aegis256&hexkey=YOUR_HEX_KEY'
+employees... done
+```
+
+For a URI, `.clone` looks for the file that the URI names before it opens the URI, and it does not open that file if it exists. If a URI parameter is not correct, `.clone` shows an error. Some errors, for example a key that is not valid, can leave an empty file with that name. Remove the file before the next `.clone` to that name.
+
+Without the `cipher` and `hexkey` parameters, the copy is not encrypted. This is also true when the current database is encrypted. As for `.open`, the history file of the interactive shell keeps a key that you type.
+
 ### .read
 
 Execute SQL statements from a file.

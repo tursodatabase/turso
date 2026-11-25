@@ -2118,17 +2118,35 @@ impl Limbo {
 
     fn clone_database(&mut self, output_file: &str) -> anyhow::Result<()> {
         use std::path::Path;
-        if Path::new(output_file).exists() {
-            anyhow::bail!("Refusing to overwrite existing file: {output_file}");
-        }
-        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
-        let db = Database::open_file(io.clone(), output_file, Arc::new(SqliteDialect))?;
-        let target = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+        let target = if let Some(uri) = database_uri(output_file) {
+            self.open_clone_target_uri(&uri)?
+        } else {
+            if Path::new(output_file).exists() {
+                anyhow::bail!("Refusing to overwrite existing file: {output_file}");
+            }
+            let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
+            let db = Database::open_file(io.clone(), output_file, Arc::new(SqliteDialect))?;
+            db.connect(ConnectOpts::new(SessionRole::Superuser))?
+        };
 
         let mut applier = ApplyWriter::new(&target);
         Self::dump_database_from_conn(false, self.conn.clone(), &mut applier, StderrProgress)?;
         applier.finish()?;
         Ok(())
+    }
+
+    /// Opens the new database of `.clone` that the URI `uri` names, with the
+    /// options of the shell. Fails if the database file exists.
+    fn open_clone_target_uri(&self, uri: &str) -> anyhow::Result<Arc<Connection>> {
+        // Examine the file that the URI names, not the URI, and do it before
+        // the open. An open can change an existing database: for example, it
+        // sets WAL mode in the header of a database in rollback journal mode.
+        let path = turso_core::database_path_from_uri(uri)?;
+        if std::path::Path::new(&path).exists() {
+            anyhow::bail!("Refusing to overwrite existing file: {path}");
+        }
+        let (_io, conn) = Connection::from_uri(uri, self.db_opts, Arc::new(SqliteDialect))?;
+        Ok(conn)
     }
 
     fn read_sql_file(&mut self, path: &str) -> anyhow::Result<()> {
