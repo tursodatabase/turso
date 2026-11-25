@@ -2648,7 +2648,7 @@ impl BTreeCursor {
         Ok(IOResult::Done(outcome.result))
     }
 
-    #[inline(never)]
+    #[inline(always)]
     fn try_start_seek_on_current_table_leaf(
         &mut self,
         rowid: i64,
@@ -2662,7 +2662,21 @@ impl BTreeCursor {
         {
             return Ok(CurrentTableLeafSeek::SearchFromRoot);
         }
+        self.start_seek_on_current_table_leaf(rowid, seek_op)
+    }
 
+    /// The part of [Self::try_start_seek_on_current_table_leaf] after the
+    /// checks of the cursor state: it reads the cells of the current leaf.
+    ///
+    /// This function is not inlined, so that `seek` stays small. The checks
+    /// before it are inlined: a cursor that is not on a row fails them, and
+    /// a call for each such seek costs more than the checks.
+    #[inline(never)]
+    fn start_seek_on_current_table_leaf(
+        &mut self,
+        rowid: i64,
+        seek_op: SeekOp,
+    ) -> Result<CurrentTableLeafSeek> {
         let (seek, cell_count) = {
             let page = self.stack.top_ref();
             turso_debug_assert!(page.is_loaded(), "the current table leaf must be loaded");
