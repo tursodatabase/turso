@@ -728,7 +728,7 @@ test json-contains {
 @sqlstate 42883
 expect error {}
 expect @tursopg {
-    1
+    t
 }
 
 @compat-gap "operator:text @> text"
@@ -738,7 +738,7 @@ test text-contains {
 @sqlstate 42883
 expect error {}
 expect @tursopg {
-    1
+    t
 }
 
 # PostgreSQL has @> for jsonb and for arrays, so it cannot choose one for two
@@ -750,7 +750,7 @@ test contains-of-two-string-literals {
 @sqlstate 42725
 expect error {}
 expect @tursopg {
-    1
+    t
 }
 
 # tursopg compares two values that are arrays and not JSON documents as
