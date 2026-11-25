@@ -3165,16 +3165,12 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgLanguageTable>(PhantomData),
     );
+    options = options.native_module(
+        "pg_operator",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgOperatorTable>(PhantomData),
+    );
     for (name, create_sql) in [
-        (
-            "pg_operator",
-            "CREATE TABLE pg_operator (
-            oid INTEGER, oprname TEXT, oprnamespace INTEGER, oprowner INTEGER,
-            oprkind TEXT, oprcanmerge BOOLEAN, oprcanhash BOOLEAN, oprleft INTEGER,
-            oprright INTEGER, oprresult INTEGER, oprcom INTEGER, oprnegate INTEGER,
-            oprcode INTEGER, oprrest INTEGER, oprjoin INTEGER, tableoid INTEGER HIDDEN
-        )",
-        ),
         (
             "pg_opclass",
             "CREATE TABLE pg_opclass (
@@ -3333,6 +3329,49 @@ impl SnapshotRows for PgLanguageTable {
                     Value::from_i64(0),
                     Value::from_i64(0),
                     Value::Null,
+                ]
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct PgOperatorTable;
+
+impl SnapshotRows for PgOperatorTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_operator (
+        oid INTEGER, oprname TEXT, oprnamespace INTEGER, oprowner INTEGER,
+        oprkind TEXT, oprcanmerge BOOLEAN, oprcanhash BOOLEAN, oprleft INTEGER,
+        oprright INTEGER, oprresult INTEGER, oprcom INTEGER, oprnegate INTEGER,
+        oprcode INTEGER, oprrest INTEGER, oprjoin INTEGER, tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2617);
+    const ESTIMATED_COST: f64 = 10.0;
+    const ESTIMATED_ROWS: u32 = 200;
+
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        // FIXME(pg-catalog): oprcode, oprrest and oprjoin are 0, because pg_proc does not list PostgreSQL's functions under PostgreSQL's oids. The oids of the pg_proc rows replace this.
+        const NO_FUNCTION: i64 = 0;
+        crate::operators::OPERATORS
+            .iter()
+            .map(|operator| {
+                let kind = if operator.left == 0 { "l" } else { "b" };
+                vec![
+                    Value::from_i64(operator.oid),
+                    Value::build_text(operator.name),
+                    Value::from_i64(11),
+                    Value::from_i64(SUPERUSER_OID),
+                    Value::build_text(kind),
+                    Value::from_i64(i64::from(operator.can_merge)),
+                    Value::from_i64(i64::from(operator.can_hash)),
+                    Value::from_i64(operator.left),
+                    Value::from_i64(operator.right),
+                    Value::from_i64(operator.result),
+                    Value::from_i64(operator.commutator),
+                    Value::from_i64(operator.negator),
+                    Value::from_i64(NO_FUNCTION),
+                    Value::from_i64(NO_FUNCTION),
+                    Value::from_i64(NO_FUNCTION),
                 ]
             })
             .collect()

@@ -9,6 +9,7 @@ mod descriptions;
 mod error;
 mod functions;
 mod open;
+mod operators;
 mod options;
 mod pg_type;
 mod policies;

@@ -103,6 +103,16 @@ the view, and depends on each table and view that the view reads, as whole
 relations and not column by column. The rule is not in `pg_rewrite` and the
 view is not in `pg_class`. DROP reads these rows to find the views that depend
 on what it drops.
+`pg_operator` has the rows of PostgreSQL 18, with PostgreSQL's oids, for the
+operators `=`, `<>`, `<`, `<=`, `>`, `>=`, `+`, `-`, `*`, `/`, `%`, `&`, `|`,
+`<<`, `>>`, `~`, `!~`, `~*`, `!~*` and `||` whose operand and result types are
+all among boolean, smallint, integer, bigint, real, double precision, numeric,
+text, date, timestamp, timestamptz and uuid: 216 of PostgreSQL's 799 rows. It
+leaves out the comparisons of two different types among date, timestamp and
+timestamptz, which fail with 0A000, every operator of another type, such as
+bytea, time, interval, json, jsonb, inet and the array types, and every other
+operator name, such as `^`, `@` and `~~`. `oprcode`, `oprrest` and `oprjoin`
+are 0, because `pg_proc` does not have PostgreSQL's functions under their oids.
 `pg_statistic_ext` exposes the hidden system column
 `tableoid` for pg_dump discovery. `pg_trigger` exposes `tgparentid` for
 parent-trigger lookup and hidden `tableoid` during dump discovery.
