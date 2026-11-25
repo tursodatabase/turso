@@ -48,6 +48,10 @@ impl Type for Numeric {
         Some(Conversion::Function(numeric_decode))
     }
 
+    fn params_may_be_omitted(&self) -> bool {
+        true
+    }
+
     fn range_offsets(&self) -> RangeOffsets {
         RangeOffsets::Numeric
     }

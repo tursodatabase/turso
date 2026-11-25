@@ -250,9 +250,10 @@ Type mapping: serial, smallserial and bigserial (and serial2/4/8) become
 implicit sequence named `<table>_<column>_seq`, or, when a relation of the
 schema has that name, the first of `<table>_<column>_seq1`, `..._seq2`, ...
 that none has. A primary key of one smallint, integer or bigint column is the
-rowid of its table and has no index of its own. boolean, smallint, integer, bigint, uuid, date, timestamp[tz], bytea, json, jsonb, inet,
+rowid of its table and has no index of its own. boolean, smallint, integer, bigint, numeric, uuid, date, timestamp[tz], bytea, json, jsonb, inet,
 cidr, macaddr, macaddr8 map to Turso custom types. varchar(n) and
-numeric(p,s) keep their type modifiers; type modifiers on any other type,
+numeric(p,s) keep their type modifiers, and a numeric without them keeps each
+value with the digits it was written with; type modifiers on any other type,
 including char(n), timestamp(p) and bit(n), are rejected. xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.

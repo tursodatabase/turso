@@ -290,8 +290,6 @@ expect {
     5
 }
 
-# A numeric without a type modifier is a REAL, which rounds half to even.
-@compat-gap "cast:numeric -> int4"
 test insert-select-a-numeric-column-without-a-modifier-into-an-integer-column {
     CREATE TABLE n (x numeric);
     INSERT INTO n VALUES (4.5);
@@ -301,9 +299,6 @@ test insert-select-a-numeric-column-without-a-modifier-into-an-integer-column {
 }
 expect {
     5
-}
-expect @tursopg {
-    4
 }
 
 test insert-select-from-another-table-casts-a-boolean-to-text {

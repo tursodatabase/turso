@@ -7477,7 +7477,7 @@ fn is_serial_type(pg_type: &str) -> bool {
 /// built-in Turso type exists, otherwise returns the base SQLite type.
 /// For array types (e.g. `INTEGER[]`, `_int4`), returns the base scalar type
 /// with `array_dimensions > 0` so native Turso arrays are used.
-// FIXME(pg-catalog): This maps PostgreSQL type names to Turso or SQLite type names by hand, and lowers types Turso does not have to another type: money to REAL; point, bit and xml to TEXT; oid and the reg types to INTEGER. It also maps numeric without a precision to REAL and char without a length to TEXT, where pg_type keeps numeric and makes char a bpchar of length 1. A pg_type lookup replaces this.
+// FIXME(pg-catalog): This maps PostgreSQL type names to Turso or SQLite type names by hand, and lowers types Turso does not have to another type: money to REAL; point, bit and xml to TEXT; oid and the reg types to INTEGER. It also maps char without a length to TEXT, where pg_type keeps numeric and makes char a bpchar of length 1. A pg_type lookup replaces this.
 pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
     // Check for array types first
     if pg_type.ends_with("[]") || pg_type.starts_with('_') {
@@ -7525,7 +7525,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
             return match params {
                 [p, s] => Some(PgTypeMapping::with_params("numeric", vec![*p, *s])),
                 [p] => Some(PgTypeMapping::with_params("numeric", vec![*p, 0])),
-                _ => Some(PgTypeMapping::scalar("REAL")),
+                _ => Some(PgTypeMapping::scalar("numeric")),
             };
         }
 
@@ -11411,7 +11411,7 @@ mod tests {
             map_pg_type("NUMERIC", &[10]),
             Some(PgTypeMapping::with_params("numeric", vec![10, 0]))
         );
-        assert_eq!(map_pg_type("NUMERIC", no_params), Some(s("REAL")));
+        assert_eq!(map_pg_type("NUMERIC", no_params), Some(s("numeric")));
 
         // Network types → custom types
         assert_eq!(map_pg_type("CIDR", no_params), Some(s("cidr")));
