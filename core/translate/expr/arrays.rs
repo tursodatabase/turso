@@ -103,6 +103,7 @@ pub(super) fn emit_array_element_loop(
     program.emit_insn(Insn::AggFinal {
         register: reg_acc,
         func: array_agg,
+        collation: None,
     });
     program.emit_insn(Insn::Copy {
         src_reg: reg_acc,

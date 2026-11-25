@@ -64,11 +64,6 @@ impl TypeOrdering {
     pub const NUMERIC: Self = Self(0);
     pub const ALL: [Self; 5] = [Self(0), Self(1), Self(2), Self(3), Self(4)];
 
-    /// The number of the order among all orders, from 0.
-    pub const fn number(self) -> u16 {
-        self.0
-    }
-
     /// An array order with the database's rule for encoded NaN elements.
     pub const fn array(policy: crate::types::NanPolicy) -> Self {
         match policy {
