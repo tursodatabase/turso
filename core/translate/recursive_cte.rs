@@ -19,13 +19,165 @@ use crate::translate::plan::{
 use crate::translate::result_row::{emit_columns_to_destination, emit_offset};
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, Insn};
+use crate::vdbe::CursorID;
 use crate::{emit_explain, LimboError, Result};
 
+/// Emits a recursive CTE, and returns the first register of its result columns.
+///
+/// This function is on the stack one time for each level of nested recursive
+/// CTEs. The cursors are opened in [open_recursive_cte_cursors], which is not
+/// inlined, so that its values are not in this frame while the queries of the
+/// CTE are emitted.
 pub(crate) fn emit_recursive_cte(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     recursive_cte: &mut RecursiveCtePlan,
 ) -> Result<usize> {
+    let RecursiveCteCursors {
+        num_result_columns,
+        input_record_reg,
+        input_cursor_id,
+        queue_cursor_id,
+        queue,
+        seen_rows_cursor_id,
+    } = open_recursive_cte_cursors(program, resolver, recursive_cte)?;
+
+    let recursive_cte_end = program.allocate_label();
+    let dequeue_next_row = program.allocate_label();
+    let run_recursive_query = program.allocate_label();
+    let mut output_limit_context = TranslateCtx::new_boxed(program, resolver.fork(), 0, false);
+    output_limit_context.label_main_loop_end = Some(recursive_cte_end);
+    init_limit(
+        program,
+        &mut output_limit_context,
+        &recursive_cte.limit,
+        &recursive_cte.offset,
+        recursive_cte_end,
+    )?;
+
+    emit_explain!(program, true, EqpDetail::RecursiveSetup);
+    emit_recursive_cte_query(program, resolver, &mut recursive_cte.initial_query)?;
+    program.pop_current_parent_explain();
+
+    program.preassign_label_to_next_insn(dequeue_next_row);
+    program.emit_insn(Insn::Rewind {
+        cursor_id: queue_cursor_id,
+        pc_if_empty: recursive_cte_end,
+    });
+
+    let result_row_regs = match &queue {
+        RecursiveCteQueue::Fifo { table } => {
+            let result_row_regs = program.alloc_registers(num_result_columns);
+            // The queued record is the row itself, so it becomes the content
+            // of the input cursor without being decoded and encoded again.
+            program.emit_insn(Insn::RowData {
+                cursor_id: queue_cursor_id,
+                dest: input_record_reg,
+            });
+            program.emit_insn(Insn::Delete {
+                cursor_id: queue_cursor_id,
+                table_name: table.name.clone(),
+                is_part_of_update: false,
+            });
+            for result_column_index in 0..num_result_columns {
+                program.emit_insn(Insn::Column {
+                    cursor_id: input_cursor_id,
+                    column: result_column_index,
+                    dest: result_row_regs + result_column_index,
+                    default: None,
+                });
+            }
+            result_row_regs
+        }
+        RecursiveCteQueue::Ordered { index, .. } => {
+            let queue_column_count = index.columns.len();
+            let queue_row_regs = program.alloc_registers(queue_column_count);
+            for queue_column_index in 0..queue_column_count {
+                program.emit_insn(Insn::Column {
+                    cursor_id: queue_cursor_id,
+                    column: queue_column_index,
+                    dest: queue_row_regs + queue_column_index,
+                    default: None,
+                });
+            }
+            program.emit_insn(Insn::IdxDelete {
+                start_reg: queue_row_regs,
+                num_regs: queue_column_count,
+                cursor_id: queue_cursor_id,
+                raise_error_if_no_matching_entry: false,
+            });
+            // The result columns follow the sort keys and the sequence number.
+            let result_row_regs = queue_row_regs + queue_column_count - num_result_columns;
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u32(result_row_regs),
+                count: to_u32(num_result_columns),
+                dest_reg: to_u32(input_record_reg),
+                index_name: None,
+                affinity_str: None,
+            });
+            result_row_regs
+        }
+    };
+
+    emit_offset(
+        program,
+        run_recursive_query,
+        output_limit_context.reg_offset,
+    );
+    emit_columns_to_destination(
+        program,
+        &recursive_cte.query_destination,
+        result_row_regs,
+        num_result_columns,
+    )?;
+    if let Some(limit) = output_limit_context.limit_ctx {
+        program.emit_insn(Insn::DecrJumpZero {
+            reg: limit.reg_limit,
+            target_pc: recursive_cte_end,
+        });
+    }
+
+    program.preassign_label_to_next_insn(run_recursive_query);
+    emit_explain!(program, true, EqpDetail::RecursiveStep);
+    emit_recursive_cte_query(program, resolver, &mut recursive_cte.recursive_query)?;
+    program.pop_current_parent_explain();
+    program.emit_insn(Insn::Goto {
+        target_pc: dequeue_next_row,
+    });
+
+    program.preassign_label_to_next_insn(recursive_cte_end);
+    program.emit_insn(Insn::Close {
+        cursor_id: queue_cursor_id,
+    });
+    if let Some(cursor_id) = seen_rows_cursor_id {
+        program.emit_insn(Insn::Close { cursor_id });
+    }
+    program.emit_insn(Insn::Close {
+        cursor_id: input_cursor_id,
+    });
+    program.result_columns = recursive_cte.initial_query.select_result_columns().to_vec();
+    program.reg_result_cols_start = Some(result_row_regs);
+    Ok(result_row_regs)
+}
+
+/// The cursors and registers that a recursive CTE reads and writes.
+struct RecursiveCteCursors {
+    num_result_columns: usize,
+    input_record_reg: usize,
+    input_cursor_id: CursorID,
+    queue_cursor_id: CursorID,
+    queue: RecursiveCteQueue,
+    seen_rows_cursor_id: Option<CursorID>,
+}
+
+/// Opens the input cursor, the queue and the index of seen rows of a recursive
+/// CTE, and makes both of its queries write to the queue.
+#[inline(never)]
+fn open_recursive_cte_cursors(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    recursive_cte: &mut RecursiveCtePlan,
+) -> Result<RecursiveCteCursors> {
     let num_result_columns = recursive_cte.initial_query.select_result_columns().len();
     // Computed for UNION ALL too, which compares no rows: each column is one
     // result of both queries, so this fails when they give it two types that
@@ -191,123 +343,14 @@ pub(crate) fn emit_recursive_cte(
 
     set_select_plan_destination(&mut recursive_cte.initial_query, &queue_destination);
     set_select_plan_destination(&mut recursive_cte.recursive_query, &queue_destination);
-
-    let recursive_cte_end = program.allocate_label();
-    let dequeue_next_row = program.allocate_label();
-    let run_recursive_query = program.allocate_label();
-    let mut output_limit_context = TranslateCtx::new(program, resolver.fork(), 0, false);
-    output_limit_context.label_main_loop_end = Some(recursive_cte_end);
-    init_limit(
-        program,
-        &mut output_limit_context,
-        &recursive_cte.limit,
-        &recursive_cte.offset,
-        recursive_cte_end,
-    )?;
-
-    emit_explain!(program, true, EqpDetail::RecursiveSetup);
-    emit_recursive_cte_query(program, resolver, &mut recursive_cte.initial_query)?;
-    program.pop_current_parent_explain();
-
-    program.preassign_label_to_next_insn(dequeue_next_row);
-    program.emit_insn(Insn::Rewind {
-        cursor_id: queue_cursor_id,
-        pc_if_empty: recursive_cte_end,
-    });
-
-    let result_row_regs = match &queue {
-        RecursiveCteQueue::Fifo { table } => {
-            let result_row_regs = program.alloc_registers(num_result_columns);
-            // The queued record is the row itself, so it becomes the content
-            // of the input cursor without being decoded and encoded again.
-            program.emit_insn(Insn::RowData {
-                cursor_id: queue_cursor_id,
-                dest: input_record_reg,
-            });
-            program.emit_insn(Insn::Delete {
-                cursor_id: queue_cursor_id,
-                table_name: table.name.clone(),
-                is_part_of_update: false,
-            });
-            for result_column_index in 0..num_result_columns {
-                program.emit_insn(Insn::Column {
-                    cursor_id: input_cursor_id,
-                    column: result_column_index,
-                    dest: result_row_regs + result_column_index,
-                    default: None,
-                });
-            }
-            result_row_regs
-        }
-        RecursiveCteQueue::Ordered { index, .. } => {
-            let queue_column_count = index.columns.len();
-            let queue_row_regs = program.alloc_registers(queue_column_count);
-            for queue_column_index in 0..queue_column_count {
-                program.emit_insn(Insn::Column {
-                    cursor_id: queue_cursor_id,
-                    column: queue_column_index,
-                    dest: queue_row_regs + queue_column_index,
-                    default: None,
-                });
-            }
-            program.emit_insn(Insn::IdxDelete {
-                start_reg: queue_row_regs,
-                num_regs: queue_column_count,
-                cursor_id: queue_cursor_id,
-                raise_error_if_no_matching_entry: false,
-            });
-            // The result columns follow the sort keys and the sequence number.
-            let result_row_regs = queue_row_regs + queue_column_count - num_result_columns;
-            program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u32(result_row_regs),
-                count: to_u32(num_result_columns),
-                dest_reg: to_u32(input_record_reg),
-                index_name: None,
-                affinity_str: None,
-            });
-            result_row_regs
-        }
-    };
-
-    emit_offset(
-        program,
-        run_recursive_query,
-        output_limit_context.reg_offset,
-    );
-    emit_columns_to_destination(
-        program,
-        &recursive_cte.query_destination,
-        result_row_regs,
+    Ok(RecursiveCteCursors {
         num_result_columns,
-    )?;
-    if let Some(limit) = output_limit_context.limit_ctx {
-        program.emit_insn(Insn::DecrJumpZero {
-            reg: limit.reg_limit,
-            target_pc: recursive_cte_end,
-        });
-    }
-
-    program.preassign_label_to_next_insn(run_recursive_query);
-    emit_explain!(program, true, EqpDetail::RecursiveStep);
-    emit_recursive_cte_query(program, resolver, &mut recursive_cte.recursive_query)?;
-    program.pop_current_parent_explain();
-    program.emit_insn(Insn::Goto {
-        target_pc: dequeue_next_row,
-    });
-
-    program.preassign_label_to_next_insn(recursive_cte_end);
-    program.emit_insn(Insn::Close {
-        cursor_id: queue_cursor_id,
-    });
-    if let Some(cursor_id) = seen_rows_cursor_id {
-        program.emit_insn(Insn::Close { cursor_id });
-    }
-    program.emit_insn(Insn::Close {
-        cursor_id: input_cursor_id,
-    });
-    program.result_columns = recursive_cte.initial_query.select_result_columns().to_vec();
-    program.reg_result_cols_start = Some(result_row_regs);
-    Ok(result_row_regs)
+        input_record_reg,
+        input_cursor_id,
+        queue_cursor_id,
+        queue,
+        seen_rows_cursor_id,
+    })
 }
 
 /// The collation of a result column of a recursive CTE: that of the first
@@ -353,7 +396,7 @@ fn emit_recursive_cte_query(
 ) -> Result<()> {
     match query {
         Plan::Select(select_plan) => {
-            let mut context = TranslateCtx::new(
+            let mut context = TranslateCtx::new_boxed(
                 program,
                 resolver.fork_with_expr_cache(),
                 select_plan.joined_tables().len(),
