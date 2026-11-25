@@ -32,6 +32,11 @@ const QUERIES: &[(&str, &str)] = &[
         "substr_concat",
         "SELECT substr(payload, 2, 20) || name FROM t",
     ),
+    (
+        "cast_text_to_integer",
+        "SELECT CAST(name AS INTEGER) FROM t",
+    ),
+    ("cast_integer_to_text", "SELECT CAST(v AS TEXT) FROM t"),
 ];
 
 fn seed(conn: &Arc<Connection>) {
