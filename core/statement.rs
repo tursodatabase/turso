@@ -1147,6 +1147,7 @@ impl Statement {
             conn.maybe_reparse_schema()?;
         }
 
+        conn.reload_main_schema_if_pending()?;
         // While the connection holds a read snapshot, compile against the schema in it. Otherwise
         // copy the shared schema cache when it is newer, or when an MVCC checkpoint changed btree
         // roots without changing the schema version.

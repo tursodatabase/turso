@@ -1261,6 +1261,9 @@ pub struct ProgramState {
     pub(crate) tx_read_only_at_start: bool,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
+    /// [`Connection::main_schema_changes`] when the statement opened its
+    /// statement savepoint in a transaction.
+    main_schema_changes_at_start: Option<u64>,
     pub n_change: AtomicI64,
     pub n_total_change: AtomicI64,
     /// The connection's MvStore handle, revalidated with one pointer compare
@@ -1368,6 +1371,7 @@ impl ProgramState {
             tx_read_only_at_start: false,
             write_baseline: WriteBaseline::None,
             has_stmt_transaction: false,
+            main_schema_changes_at_start: None,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
             n_total_change: AtomicI64::new(0),
@@ -1560,6 +1564,7 @@ impl ProgramState {
         self.tx_read_only_at_start = false;
         self.write_baseline = WriteBaseline::None;
         self.has_stmt_transaction = false;
+        self.main_schema_changes_at_start = None;
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
         *self.n_change.get_mut() = 0;
@@ -1884,6 +1889,8 @@ impl ProgramState {
                 result?;
                 self.uses_subjournal = true;
             }
+            self.main_schema_changes_at_start =
+                Some(connection.main_schema_changes.load(Ordering::Acquire));
         }
 
         self.has_stmt_transaction = true;
@@ -1934,6 +1941,7 @@ impl ProgramState {
                 "write statement kept changes that never reached its materialized views"
             );
         }
+        let main_schema_changes_at_start = self.main_schema_changes_at_start.take();
         // If begin_statement was never called, no savepoint/FK cleanup needed.
         if !self.has_stmt_transaction {
             return Ok(());
@@ -2031,6 +2039,19 @@ impl ProgramState {
                 } else {
                     None
                 };
+
+                // The savepoint rollback undid the pages of the statement's
+                // DDL, so the in-memory main schema must lose that DDL too.
+                // Like SQLite, which resets the schema after such a rollback,
+                // the connection reads it again before the next statement
+                // compiles, instead of keeping a copy of the schema.
+                if pager_err.is_none()
+                    && main_schema_changes_at_start.is_some_and(|changes| {
+                        changes != connection.main_schema_changes.load(Ordering::Acquire)
+                    })
+                {
+                    connection.request_main_schema_reload(pager);
+                }
 
                 // Always restore FK violation counters on statement rollback,
                 // regardless of whether a pager savepoint was opened.
