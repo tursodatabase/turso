@@ -169,6 +169,20 @@ test error-drop-domain-builtin-type {
 @sqlstate 42809
 expect error {}
 
+test error-drop-domain-of-an-enum-type {
+    CREATE TYPE err_mood AS ENUM ('a');
+    DROP DOMAIN err_mood;
+}
+@sqlstate 42809
+expect error {}
+
+test error-drop-domain-if-exists-of-an-enum-type {
+    CREATE TYPE err_mood2 AS ENUM ('a');
+    DROP DOMAIN IF EXISTS err_mood2;
+}
+@sqlstate 42809
+expect error {}
+
 # Only an unqualified or pg_catalog name is the built-in type.
 test error-drop-builtin-type-name-in-public {
     DROP TYPE public.int4;

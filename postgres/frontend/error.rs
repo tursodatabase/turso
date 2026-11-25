@@ -373,6 +373,11 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
     } else if msg.starts_with("no such type: ") || msg.starts_with("no such domain: ") {
         // DROP TYPE or DROP DOMAIN of a type that does not exist.
         SQLSTATE_UNDEFINED_OBJECT
+    } else if msg.ends_with(" is a type, not a domain. Use DROP TYPE instead") {
+        // The engine says this for DROP DOMAIN of an enum or another type that
+        // is not a domain. The type name comes first, so this is checked before
+        // the rules that look for a phrase anywhere in the message.
+        SQLSTATE_WRONG_OBJECT_TYPE
     } else if msg.contains("no such table")
         || msg.starts_with("no such view")
         || msg.contains("table not found")
@@ -709,6 +714,14 @@ mod tests {
             ("\"t\" is not a sequence", SQLSTATE_WRONG_OBJECT_TYPE),
             ("\"t\" is not an index", SQLSTATE_WRONG_OBJECT_TYPE),
             ("\"t_x\" is an index", SQLSTATE_WRONG_OBJECT_TYPE),
+            (
+                "mood is a type, not a domain. Use DROP TYPE instead",
+                SQLSTATE_WRONG_OBJECT_TYPE,
+            ),
+            (
+                "no such table is a type, not a domain. Use DROP TYPE instead",
+                SQLSTATE_WRONG_OBJECT_TYPE,
+            ),
             (
                 "cannot change owner of sequence \"s\"",
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
