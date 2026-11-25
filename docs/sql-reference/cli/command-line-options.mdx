@@ -17,6 +17,8 @@ tursodb [OPTIONS] [DATABASE] [SQL]
 | `DATABASE` | `:memory:` | Path to a SQLite database file. If omitted, an in-memory database is created |
 | `SQL` | — | SQL statement to execute. If provided, the shell runs the query and exits |
 
+`DATABASE` can also be a `file:` URI, such as `file:data.db?mode=ro`. A path that ends with `?key=value` parameters is also read as a URI. In such a path, all characters before the last `?`, including `%` and `#`, are part of the file name. For a URI, `tursodb` does not use the `--vfs` and `--readonly` options.
+
 ### Examples
 
 ```bash

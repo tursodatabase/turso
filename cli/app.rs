@@ -2431,8 +2431,11 @@ fn fetch_single_i64(rows: &mut turso_core::Statement) -> anyhow::Result<i64> {
 /// being treated as part of the filename.
 ///
 /// Only the *last* `?` that introduces a valid `key=value` query string is
-/// treated as the query separator. Earlier `?` characters are
-/// percent-encoded (`%3F`) so they remain part of the filename.
+/// treated as the query separator. In the path before it, `%`, `#` and `?`
+/// are percent-encoded (`%25`, `%23`, `%3F`) so they remain part of the
+/// filename. The URI has no authority: after `file:`, a `//` starts an
+/// authority, and the parser changes a path after an authority. If the path
+/// starts with `//`, the second `/` is written as `%2F`.
 /// A trailing `?` with no `key=value` pair is left alone (it is just part
 /// of the filename).
 fn normalize_db_path(db_file: String) -> String {
@@ -2446,9 +2449,21 @@ fn normalize_db_path(db_file: String) -> String {
         let query = &db_file[pos + 1..];
         if query.contains('=') {
             let path = &db_file[..pos];
-            // Percent-encode any '?' inside the path portion so the URI
-            // parser does not mistake them for the query separator.
-            let encoded_path = path.replace('?', "%3F");
+            // The URI parser decodes '%' escapes, cuts the URI at the first
+            // '#' (the fragment) and at the first '?' (the query). Encode
+            // these characters in the path, so that they stay in the file
+            // name and the query is not lost. Encode '%' first, so that the
+            // escapes of '#' and '?' are not encoded again.
+            let mut encoded_path = path
+                .replace('%', "%25")
+                .replace('#', "%23")
+                .replace('?', "%3F");
+            // After `file:`, a "//" starts an authority, and the parser
+            // changes a path after an authority. Encode the second '/', so
+            // that the URI has no authority and the path stays the same.
+            if encoded_path.starts_with("//") {
+                encoded_path.replace_range(1..2, "%2F");
+            }
             return format!("file:{encoded_path}?{query}");
         }
     }
@@ -2528,6 +2543,51 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_db_path_backslash_absolute_path_with_query() {
+        // The URI parser changes a path after an authority. It must not
+        // change this path, so no authority is written.
+        assert_eq!(
+            normalize_db_path("/C:\\zz.db?mode=rwc".into()),
+            "file:/C:\\zz.db?mode=rwc"
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_keeps_the_whole_path() {
+        // The real URI parser must give back the part of the name before the
+        // query, character for character.
+        for name in [
+            "notes#2.db?mode=ro",
+            "100%41.db?mode=ro",
+            "a%#?b.db?mode=ro",
+            "/tmp/x.db?mode=ro",
+            "//tmp/s.db?mode=rwc",
+            "///x.db?mode=rwc",
+            "/C:\\zz.db?mode=rwc",
+            "/C:/zz.db?mode=rwc",
+            "rel/dir/x.db?mode=rwc",
+            "a b.db?cipher=aegis256&hexkey=00",
+        ] {
+            let expected = &name[..name.rfind('?').unwrap()];
+            let uri = normalize_db_path(name.to_string());
+            assert_eq!(
+                turso_core::database_path_from_uri(&uri).unwrap(),
+                expected,
+                "name {name:?}, uri {uri:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_db_path_double_slash_path_with_query() {
+        // `file://tmp/s.db` would make "tmp" the authority (a host name).
+        assert_eq!(
+            normalize_db_path("//tmp/s.db?mode=rwc".into()),
+            "file:/%2Ftmp/s.db?mode=rwc"
+        );
+    }
+
+    #[test]
     fn test_normalize_db_path_question_mark_in_filename_no_query() {
         // '?' is legitimately part of the filename, no key=value follows
         assert_eq!(normalize_db_path("what?.db".into()), "what?.db");
@@ -2542,6 +2602,39 @@ mod tests {
             normalize_db_path("foo.bar?mode=ro?mode=ro".into()),
             "file:foo.bar%3Fmode=ro?mode=ro"
         );
+    }
+
+    #[test]
+    fn test_normalize_db_path_hash_in_filename_with_query() {
+        // Without the escape, the URI parser would read "#2.db?mode=ro" as a
+        // fragment, and open "notes" without the query.
+        assert_eq!(
+            normalize_db_path("notes#2.db?mode=ro".into()),
+            "file:notes%232.db?mode=ro"
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_percent_in_filename_with_query() {
+        // Without the escape, the URI parser would decode "%41" to "A".
+        assert_eq!(
+            normalize_db_path("100%41.db?mode=ro".into()),
+            "file:100%2541.db?mode=ro"
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_escapes_percent_before_other_characters() {
+        assert_eq!(
+            normalize_db_path("a%#?b.db?mode=ro".into()),
+            "file:a%25%23%3Fb.db?mode=ro"
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_hash_and_percent_without_query_unchanged() {
+        assert_eq!(normalize_db_path("notes#2.db".into()), "notes#2.db");
+        assert_eq!(normalize_db_path("100%41.db".into()), "100%41.db");
     }
 
     #[test]
