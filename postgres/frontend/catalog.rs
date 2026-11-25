@@ -2852,6 +2852,17 @@ impl SnapshotRows for PgSequencesTable {
     }
 }
 
+/// The seeded table of `pg_collation`. It is a static, so that the catalog
+/// can refer to it for the life of the process.
+static PG_COLLATION_SEEDED_TABLE: turso_pg_catalog::SeededTable =
+    turso_pg_catalog::PG_COLLATION_SEEDED_TABLE;
+
+/// `pg_collation` with the built-in rows of PostgreSQL 18. Its oid in
+/// `pg_class` is 3456, as the line `create pg_collation 3456` of
+/// `postgres.bki` says.
+const PG_COLLATION_CATALOG: crate::seeded::SeededCatalog =
+    crate::seeded::SeededCatalog::new(&PG_COLLATION_SEEDED_TABLE, 3456);
+
 pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions {
     options = options.native_module(
         "unnest",
@@ -3039,15 +3050,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_collation",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable {
-            create_sql: "CREATE TABLE pg_collation (
-                oid INTEGER, collname TEXT, collnamespace INTEGER, collowner INTEGER,
-                collprovider TEXT, collisdeterministic INTEGER, collencoding INTEGER,
-                collcollate TEXT, collctype TEXT, colliculocale TEXT, collicurules TEXT,
-                collversion TEXT, tableoid INTEGER HIDDEN
-            )"
-            .to_string(),
-        },
+        PG_COLLATION_CATALOG,
     );
     options = options.native_module(
         "pg_seclabels",

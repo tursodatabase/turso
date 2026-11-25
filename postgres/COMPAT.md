@@ -90,8 +90,11 @@ The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 `pg_policy` (row-level security policies, with `polqual` and `polwithcheck`
 as the text `pg_get_expr` prints), `pg_policies`, plus `pg_input_error_info`. Present but
 always empty: `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
-`pg_foreign_table`, `pg_partitioned_table`, `pg_collation`,
+`pg_foreign_table`, `pg_partitioned_table`,
 `pg_publication*`, `pg_seclabels` (security labels are not supported).
+`pg_collation` has the 7 built-in rows and the columns of PostgreSQL 18. It
+does not have the collations of the operating system, which PostgreSQL adds
+when it creates a cluster.
 `pg_description` is a stored table. It has the comments that `COMMENT ON`
 stored, and the default `standard public schema` comment for `public`, so
 pg_dump does not emit a command to clear that comment on restore. Dropping a

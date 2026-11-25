@@ -2240,3 +2240,66 @@ expect {
     dep_base|n
     dep_other|n
 }
+
+# pg_collation has the built-in rows of PostgreSQL 18. PostgreSQL also adds
+# the collations of the operating system when it creates a cluster, with
+# oids from 12000. Turso does not have them.
+test pg-collation-builtin-rows {
+    SELECT oid, collname, collnamespace, collowner, collprovider, collisdeterministic,
+           collencoding, collcollate, collctype
+    FROM pg_collation WHERE oid IN (100, 950, 951) ORDER BY oid;
+}
+expect {
+    100|default|11|10|d|t|-1||
+    950|C|11|10|c|t|-1|C|C
+    951|POSIX|11|10|c|t|-1|POSIX|POSIX
+}
+
+test pg-collation-builtin-row-count {
+    SELECT count(*) FROM pg_catalog.pg_collation WHERE oid < 12000;
+}
+expect {
+    7
+}
+
+test pg-collation-lookup-by-oid {
+    SELECT collname FROM pg_collation WHERE oid = 950;
+    SELECT collname FROM pg_collation WHERE 963 = oid;
+    SELECT collname FROM pg_collation WHERE oid = 1;
+    SELECT collname FROM pg_collation WHERE oid = NULL;
+    SELECT collname FROM pg_collation WHERE oid = '951';
+}
+expect {
+    C
+    unicode
+    POSIX
+}
+
+test pg-collation-lookup-by-name {
+    SELECT oid, colllocale, collversion FROM pg_collation WHERE collname = 'pg_c_utf8';
+}
+expect {
+    811|C.UTF-8|1
+}
+
+test pg-collation-tableoid {
+    SELECT DISTINCT tableoid FROM pg_catalog.pg_collation;
+    SELECT c.collname FROM pg_collation c WHERE c.tableoid = 3456 AND c.oid = 100;
+}
+expect {
+    3456
+    default
+}
+
+# A join looks up one collation for each row of the other table.
+test pg-collation-join-by-oid {
+    SELECT k.id, c.collname
+    FROM (VALUES (951), (5), (100)) AS k(id)
+    LEFT JOIN pg_collation c ON c.oid = k.id
+    ORDER BY k.id;
+}
+expect {
+    5|
+    100|default
+    951|POSIX
+}

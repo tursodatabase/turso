@@ -7369,6 +7369,7 @@ dependencies = [
  "turso_core",
  "turso_ext",
  "turso_parser",
+ "turso_pg_catalog",
  "turso_pg_parser",
  "turso_sqlite",
  "uuid",

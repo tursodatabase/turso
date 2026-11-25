@@ -15,6 +15,7 @@ mod policies;
 mod roles;
 mod schema_init;
 mod schema_state;
+mod seeded;
 mod session;
 mod settings;
 mod statement;
