@@ -679,7 +679,9 @@ pub(crate) fn validate_function_tail(
         Err(err) if filter_over.over_clause.is_some() => {
             match crate::functions::builtin::resolve_builtin_function_name(name, arg_count) {
                 Ok(Some(Func::Scalar(_))) => {
-                    crate::bail_parse_error!("{} may not be used as a window function", name)
+                    return Err(crate::LimboError::WrongObjectType(format!(
+                        "{name} may not be used as a window function"
+                    )))
                 }
                 _ => return Err(err),
             }
@@ -689,13 +691,15 @@ pub(crate) fn validate_function_tail(
     match func {
         Some(Func::Agg(_) | Func::Window(_)) | None => Ok(()),
         Some(Func::External(func)) if func.func.is_aggregate() => Ok(()),
-        _ if has_order_by => {
-            crate::bail_parse_error!("ORDER BY may not be used with non-aggregate {}()", name)
-        }
-        _ if filter_over.over_clause.is_some() => {
-            crate::bail_parse_error!("{} may not be used as a window function", name)
-        }
-        _ => crate::bail_parse_error!("FILTER may not be used with non-aggregate {}()", name),
+        _ if has_order_by => Err(crate::LimboError::WrongObjectType(format!(
+            "ORDER BY may not be used with non-aggregate {name}()"
+        ))),
+        _ if filter_over.over_clause.is_some() => Err(crate::LimboError::WrongObjectType(format!(
+            "{name} may not be used as a window function"
+        ))),
+        _ => Err(crate::LimboError::WrongObjectType(format!(
+            "FILTER may not be used with non-aggregate {name}()"
+        ))),
     }
 }
 
