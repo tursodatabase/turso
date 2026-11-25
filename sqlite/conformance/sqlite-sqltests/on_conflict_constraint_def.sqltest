@@ -403,6 +403,63 @@ expect error {
     UNIQUE constraint failed
 }
 
+# ---- UPDATE with constraint-level REPLACE visits rows in rowid order ----
+# The row that an UPDATE updates last deletes the other rows with the same
+# key. When a REPLACE constraint can fire, SQLite collects the rowids first
+# and updates the rows in rowid order, also when the WHERE clause uses an
+# index. The scan of index tw finds row 2 before row 1, so a one-pass UPDATE
+# in index order would keep row 1 instead of row 2.
+
+setup update-replace-index-scan {
+    CREATE TABLE t_upd_rep(id INTEGER PRIMARY KEY, u UNIQUE ON CONFLICT REPLACE, w);
+    CREATE INDEX t_upd_rep_w ON t_upd_rep(w);
+    INSERT INTO t_upd_rep VALUES(1, 10, 'b'), (2, 20, 'a');
+}
+
+@setup update-replace-index-scan
+test update-unique-replace-through-index-in-rowid-order {
+    UPDATE t_upd_rep SET u = 0 WHERE w >= 'a';
+    SELECT * FROM t_upd_rep ORDER BY id;
+}
+expect {
+    2|0|a
+}
+
+setup update-pk-replace-index-scan {
+    CREATE TABLE t_upd_pkrep(k TEXT PRIMARY KEY ON CONFLICT REPLACE, w);
+    CREATE INDEX t_upd_pkrep_w ON t_upd_pkrep(w);
+    INSERT INTO t_upd_pkrep VALUES('x', 'b'), ('y', 'a');
+}
+
+@setup update-pk-replace-index-scan
+test update-pk-replace-through-index-in-rowid-order {
+    UPDATE t_upd_pkrep SET k = 'z' WHERE w >= 'a';
+    SELECT rowid, * FROM t_upd_pkrep ORDER BY rowid;
+}
+expect {
+    2|z|a
+}
+
+# A statement-level conflict clause replaces the REPLACE of the constraint.
+# IGNORE does not delete rows, so SQLite updates the rows in index order: row
+# 2 gets u = 0 first, and the UPDATE of row 1 is skipped.
+
+setup update-ignore-index-scan {
+    CREATE TABLE t_upd_ign(id INTEGER PRIMARY KEY, u UNIQUE ON CONFLICT REPLACE, w);
+    CREATE INDEX t_upd_ign_w ON t_upd_ign(w);
+    INSERT INTO t_upd_ign VALUES(1, 10, 'b'), (2, 20, 'a');
+}
+
+@setup update-ignore-index-scan
+test update-or-ignore-overrides-unique-replace-through-index {
+    UPDATE OR IGNORE t_upd_ign SET u = 0 WHERE w >= 'a';
+    SELECT * FROM t_upd_ign ORDER BY id;
+}
+expect {
+    1|10|b
+    2|0|a
+}
+
 # ==============================================================================
 # Targeted regression tests for constraint-level FAIL/ROLLBACK semantics.
 #

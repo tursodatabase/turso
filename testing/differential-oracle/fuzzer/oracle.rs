@@ -339,9 +339,9 @@ impl DifferentialOracle {
         }
     }
 
-    fn snapshot_query(table: &sql_gen::Table) -> String {
+    fn snapshot_query(table: &sql_gen::Table, order: &str) -> String {
         format!(
-            "SELECT rowid, * FROM {} ORDER BY rowid",
+            "SELECT rowid, * FROM {} ORDER BY rowid {order}",
             table.qualified_name()
         )
     }
@@ -352,8 +352,14 @@ impl DifferentialOracle {
         schema: &Schema,
         stmt: &GeneratedStatement,
     ) -> OracleResult {
-        for table in &schema.tables {
-            let snapshot_sql = Self::snapshot_query(table);
+        // The reverse scan reads the table with prev() instead of next(). An
+        // MVCC cursor merges B-tree and MvStore rows in both directions.
+        let snapshots = schema
+            .tables
+            .iter()
+            .flat_map(|table| ["ASC", "DESC"].map(|order| (table, order)));
+        for (table, order) in snapshots {
+            let snapshot_sql = Self::snapshot_query(table, order);
             let turso_rows = Self::execute_turso(turso_conn, &snapshot_sql);
             let sqlite_rows = Self::execute_sqlite(sqlite_conn, &snapshot_sql);
             match (turso_rows, sqlite_rows) {
@@ -483,6 +489,21 @@ fn check_subquery_unnesting_invariant(
             "Subquery unnesting changed success or result shape:\n  SQL: {stmt}\n  Forced unnesting: {rewritten:?}\n  Unnesting disabled: {correlated:?}"
         )),
     })
+}
+
+/// True for a statement that the runner runs on Turso only: it sets a Turso
+/// mode (MVCC) or moves data inside Turso's storage (a checkpoint), and SQLite
+/// has nothing that matches it. A replay of the run's history must also run it
+/// on Turso only.
+pub fn is_turso_only(sql: &str) -> bool {
+    let sql = sql.trim_start().to_ascii_lowercase();
+    [
+        "pragma journal_mode",
+        "pragma wal_checkpoint",
+        "pragma mvcc_",
+    ]
+    .iter()
+    .any(|prefix| sql.starts_with(prefix))
 }
 
 /// Execute a statement on both databases and check the differential oracle.

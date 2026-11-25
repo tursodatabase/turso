@@ -292,7 +292,9 @@ impl SchemaIntrospector {
                 Some(db_name) => format!("PRAGMA {db_name}.table_info(\"{table_name}\")"),
                 None => format!("PRAGMA table_info(\"{table_name}\")"),
             };
-            let columns = Self::get_columns_turso_query(conn, &columns_query)?;
+            let mut columns = Self::get_columns_turso_query(conn, &columns_query)?;
+            let (indexes, unique_columns) = Self::get_indexes_turso(conn, db_name, &table_name)?;
+            mark_unique_columns(&mut columns, &unique_columns);
             if !columns.is_empty() {
                 let table = if strict {
                     Table::new_strict(table_name.clone(), columns)
@@ -306,7 +308,7 @@ impl SchemaIntrospector {
                 builder = builder.table(table);
             }
 
-            for index in Self::get_indexes_turso(conn, db_name, &table_name)? {
+            for index in indexes {
                 builder = builder.index(index);
             }
         }
@@ -328,7 +330,9 @@ impl SchemaIntrospector {
         }
 
         for (table_name, strict) in Self::get_table_info_sqlite(conn, db_name)? {
-            let columns = Self::get_columns_sqlite_query(conn, db_name, &table_name)?;
+            let mut columns = Self::get_columns_sqlite_query(conn, db_name, &table_name)?;
+            let (indexes, unique_columns) = Self::get_indexes_sqlite(conn, db_name, &table_name)?;
+            mark_unique_columns(&mut columns, &unique_columns);
             if !columns.is_empty() {
                 let table = if strict {
                     Table::new_strict(table_name.clone(), columns)
@@ -342,7 +346,7 @@ impl SchemaIntrospector {
                 builder = builder.table(table);
             }
 
-            for index in Self::get_indexes_sqlite(conn, db_name, &table_name)? {
+            for index in indexes {
                 builder = builder.index(index);
             }
         }
@@ -397,16 +401,19 @@ impl SchemaIntrospector {
         Ok(result)
     }
 
+    /// Returns the user-created indexes of the table, and the columns that
+    /// have a single-column UNIQUE constraint.
     fn get_indexes_turso(
         conn: &Arc<turso_core::Connection>,
         db_name: Option<&str>,
         table_name: &str,
-    ) -> Result<Vec<Index>> {
+    ) -> Result<(Vec<Index>, Vec<String>)> {
         let query = match db_name {
             Some(db_name) => format!("PRAGMA {db_name}.index_list(\"{table_name}\")"),
             None => format!("PRAGMA index_list(\"{table_name}\")"),
         };
         let mut indexes = Vec::new();
+        let mut unique_columns = Vec::new();
         let mut rows = conn
             .query(&query)
             .context("Failed to query index info")?
@@ -425,17 +432,19 @@ impl SchemaIntrospector {
                 turso_core::Value::Text(s) => Some(s.as_str().to_string()),
                 _ => None,
             };
-            if origin.as_deref().is_some_and(|origin| origin != "c")
-                || name.starts_with("sqlite_autoindex_")
-            {
-                return Ok(());
-            }
-
             let columns = Self::get_index_columns_turso(conn, db_name, &name).map_err(|err| {
                 turso_core::LimboError::InternalError(format!(
                     "Failed to introspect index columns for {name}: {err}"
                 ))
             })?;
+            if origin.as_deref() == Some("u") && columns.len() == 1 {
+                unique_columns.extend(columns.iter().cloned());
+            }
+            if origin.as_deref().is_some_and(|origin| origin != "c")
+                || name.starts_with("sqlite_autoindex_")
+            {
+                return Ok(());
+            }
             let mut index = Index::new(name, table_name.to_string(), columns);
             if unique {
                 index = index.unique();
@@ -448,14 +457,16 @@ impl SchemaIntrospector {
         })
         .context("Failed to iterate index_list")?;
 
-        Ok(indexes)
+        Ok((indexes, unique_columns))
     }
 
+    /// Returns the user-created indexes of the table, and the columns that
+    /// have a single-column UNIQUE constraint.
     fn get_indexes_sqlite(
         conn: &rusqlite::Connection,
         db_name: Option<&str>,
         table_name: &str,
-    ) -> Result<Vec<Index>> {
+    ) -> Result<(Vec<Index>, Vec<String>)> {
         let query = match db_name {
             Some(db_name) => format!("PRAGMA {db_name}.index_list(\"{table_name}\")"),
             None => format!("PRAGMA index_list(\"{table_name}\")"),
@@ -465,6 +476,7 @@ impl SchemaIntrospector {
             .context("Failed to prepare PRAGMA index_list")?;
 
         let mut indexes = Vec::new();
+        let mut unique_columns = Vec::new();
         let rows = stmt
             .query_map([], |row| {
                 let name: String = row.get(1)?;
@@ -476,10 +488,13 @@ impl SchemaIntrospector {
 
         for row in rows {
             let (name, unique, origin) = row.context("Failed to read index_list row")?;
+            let columns = Self::get_index_columns_sqlite(conn, db_name, &name)?;
+            if origin == "u" && columns.len() == 1 {
+                unique_columns.extend(columns.iter().cloned());
+            }
             if origin != "c" || name.starts_with("sqlite_autoindex_") {
                 continue;
             }
-            let columns = Self::get_index_columns_sqlite(conn, db_name, &name)?;
             let mut index = Index::new(name, table_name.to_string(), columns);
             if unique {
                 index = index.unique();
@@ -490,7 +505,7 @@ impl SchemaIntrospector {
             indexes.push(index);
         }
 
-        Ok(indexes)
+        Ok((indexes, unique_columns))
     }
 
     fn get_index_columns_turso(
@@ -578,6 +593,15 @@ impl SchemaIntrospector {
         } else {
             // TEXT affinity for everything else (CHAR, CLOB, TEXT, VARCHAR, etc.)
             DataType::Text
+        }
+    }
+}
+
+/// Sets `unique` on the columns that have a single-column UNIQUE constraint.
+fn mark_unique_columns(columns: &mut [ColumnDef], unique_columns: &[String]) {
+    for column in columns {
+        if unique_columns.contains(&column.name) {
+            column.unique = true;
         }
     }
 }

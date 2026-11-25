@@ -56,6 +56,12 @@ pub enum WeightProfile {
     /// SELECT-heavy workload with chained joins of every join type.
     Joins,
     OrderedAggregates,
+    /// Writes to tables with UNIQUE ... ON CONFLICT REPLACE/IGNORE columns
+    /// and small value domains, so that statements hit conflicts. Use it with
+    /// `--mvcc`: the runner checkpoints at random points, so rows are split
+    /// between the B-tree and MvStore. That is where bugs in the MVCC cursor
+    /// hide, for example a step after an exact lookup.
+    MvccCursor,
 }
 
 impl WeightProfile {
@@ -102,6 +108,7 @@ impl WeightProfile {
             // Use fewer inserts because each row can multiply a chained join.
             WeightProfile::OrderedAggregates => base(80, 15, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0),
             WeightProfile::Joins => base(80, 4, 0, 0, 3, 0, 0, 2, 0, 0, 0, 0),
+            WeightProfile::MvccCursor => base(20, 30, 30, 12, 4, 1, 0, 6, 1, 0, 0, 0),
         }
     }
 
@@ -144,6 +151,39 @@ impl WeightProfile {
             policy.select_config.compound_probability = 0.0;
             policy.max_expr_depth = 2;
             policy.max_subquery_depth = 1;
+        }
+
+        if self == WeightProfile::MvccCursor {
+            // Few columns and small value domains, so that writes often hit
+            // a UNIQUE conflict and WHERE clauses often match rows.
+            let table = &mut policy.create_table_config;
+            table.main_database_only = true;
+            table.min_columns = 2;
+            table.max_columns = 4;
+            table.unique_probability = 0.5;
+            table.unique_replace_probability = 0.5;
+            table.unique_ignore_probability = 0.2;
+            table.generated_column_probability = 0.0;
+            table.check_constraint_probability = 0.05;
+            let literals = &mut policy.literal_config;
+            literals.int_min = 0;
+            literals.int_max = 12;
+            literals.real_min = 0.0;
+            literals.real_max = 4.0;
+            literals.string_min_len = 1;
+            literals.string_max_len = 1;
+            literals.string_charset = sql_gen::StringCharset::Numeric;
+            literals.blob_min_size = 1;
+            literals.blob_max_size = 1;
+            // INSERT OR REPLACE visits rows in VALUES order in both engines.
+            policy.insert_config.or_replace_probability = 0.15;
+            policy.insert_config.explicit_rowid = true;
+            // With a REPLACE or IGNORE column, the rows that an UPDATE keeps
+            // depend on the order it visits rows. Turso and SQLite can choose
+            // different plans, so pin the plan in the SQL.
+            policy.update_config.pin_access_path = true;
+            policy.update_config.where_probability = 0.6;
+            policy.update_config.from_probability = 0.1;
         }
 
         if self == WeightProfile::Joins {
@@ -252,7 +292,6 @@ impl SqlGenBackend {
                     .without_order_dependent_aggregates(),
             );
         policy.select_config.require_order_by_with_limit = true;
-        profile.configure_policy(&mut policy);
         policy.select_config.window_function_probability = window_function_probability;
         if window_function_probability > 0.0 {
             policy.select_config.window_frame_policy = WindowFramePolicy::Exclude;
@@ -284,6 +323,8 @@ impl SqlGenBackend {
         policy.update_config.subquery_from_probability = 0.0;
         policy.update_config.target_alias_probability = 0.2;
         policy.update_config.from_set_reference_probability = 0.5;
+        // Last, so that a profile can override the defaults above.
+        profile.configure_policy(&mut policy);
         Self { ctx, policy }
     }
 }
@@ -731,6 +772,7 @@ mod tests {
             WeightProfile::CorrelatedSubqueries,
             WeightProfile::OrderedAggregates,
             WeightProfile::Joins,
+            WeightProfile::MvccCursor,
         ] {
             let w = profile.stmt_weights();
             assert!(w.select > 0, "{profile:?} never selects");
@@ -746,6 +788,7 @@ mod tests {
             WeightProfile::Triggers,
             WeightProfile::Writes,
             WeightProfile::CorrelatedSubqueries,
+            WeightProfile::MvccCursor,
         ] {
             let w = profile.stmt_weights();
             assert!(w.update > 0, "{profile:?} never updates");

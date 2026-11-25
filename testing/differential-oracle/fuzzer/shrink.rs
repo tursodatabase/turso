@@ -27,7 +27,7 @@ use turso_parser::parser::Parser;
 use turso_sqlite::SqliteDialect;
 
 use crate::memory::MemorySimIO;
-use crate::oracle::{DifferentialOracle, QueryResult, QueryValue};
+use crate::oracle::{DifferentialOracle, QueryResult, QueryValue, is_turso_only};
 use turso_core::SessionRole;
 
 /// Upper bound on candidate executions per shrink, so a pathological
@@ -110,7 +110,11 @@ impl EnginePair {
                 continue;
             }
             let turso_result = DifferentialOracle::execute_turso(&turso, stmt);
-            let sqlite_result = DifferentialOracle::execute_sqlite(&sqlite, stmt);
+            let sqlite_result = if is_turso_only(stmt) {
+                QueryResult::Ok
+            } else {
+                DifferentialOracle::execute_sqlite(&sqlite, stmt)
+            };
             if surface_errors {
                 if let QueryResult::Error(err) = &turso_result {
                     anyhow::bail!(
@@ -129,6 +133,11 @@ impl EnginePair {
             sqlite,
             _turso_db: turso_db,
         })
+    }
+
+    /// Run `sql` on Turso only. See [`is_turso_only`].
+    pub fn run_turso(&self, sql: &str) -> QueryResult {
+        DifferentialOracle::execute_turso(&self.turso, sql)
     }
 
     /// Run `sql` on both engines and return both raw results (turso, sqlite).
@@ -167,7 +176,11 @@ impl EnginePair {
             } else {
                 format!("{db}.sqlite_master")
             };
-            let names_sql = format!("SELECT name FROM {master} WHERE type='table' ORDER BY name");
+            // MVCC mode adds a Turso-internal table that SQLite does not have.
+            let names_sql = format!(
+                "SELECT name FROM {master} WHERE type='table' \
+                 AND substr(name, 1, 16) != '__turso_internal' ORDER BY name"
+            );
             let turso_names = DifferentialOracle::execute_turso(&self.turso, &names_sql);
             let sqlite_names = DifferentialOracle::execute_sqlite(&self.sqlite, &names_sql);
             if query_results_differ(&turso_names, &sqlite_names) {
@@ -1065,7 +1078,9 @@ pub fn shrink_statement(
         pair.classify(failing_sql)
     };
     if baseline.is_none() {
-        let pair = EnginePair::build_strict(history_sql)?;
+        // Not strict: the history keeps statements that failed on both
+        // engines, such as an INSERT that broke a UNIQUE constraint.
+        let pair = EnginePair::build(history_sql)?;
         baseline = pair.classify(failing_sql);
         if baseline.is_some() {
             tracing::info!(

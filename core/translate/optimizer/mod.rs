@@ -46,6 +46,7 @@ use crate::{
             NonFromClauseSubquery, QueryDestination, ResultSetColumn, Scan, SeekKeyComponent,
             SubqueryEvalPhase, SubqueryOrigin, SubqueryState, UpdateSetClause, WriteSetPlan,
         },
+        stmt_journal::any_index_or_ipk_has_replace,
         trigger_exec::has_triggers_including_temp,
     },
     types::SeekOp,
@@ -1776,9 +1777,19 @@ fn update_write_set_reason(
             break 'requires Some(DmlSafetyReason::SubqueryInWhere);
         }
 
-        // REPLACE mode requires ephemeral table because REPLACE deletes conflicting rows,
-        // which can corrupt the iteration order when iterating via an index.
-        if matches!(plan.or_conflict, Some(crate::ast::ResolveType::Replace)) {
+        // REPLACE deletes conflicting rows while the scan runs, and the row that is
+        // updated last wins. SQLite collects the rowids first and updates the rows in
+        // rowid order (bReplace in sqlite3Update), also for a REPLACE that comes from a
+        // UNIQUE or PRIMARY KEY constraint. A statement-level conflict clause replaces
+        // the constraint's clause.
+        let replace = match plan.or_conflict {
+            Some(resolve_type) => resolve_type == crate::ast::ResolveType::Replace,
+            None => any_index_or_ipk_has_replace(
+                None,
+                plan.indexes_to_update.iter().map(|index| index.on_conflict),
+            ),
+        };
+        if replace {
             break 'requires Some(DmlSafetyReason::ReplaceMode);
         }
 
