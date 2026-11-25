@@ -108,18 +108,11 @@ fn random_pragma<R: rand::Rng + ?Sized>(
                 CheckpointMode::Truncate,
             ]
         };
-        // An MVCC checkpoint of an attached database panics: it reads the
-        // sequences of the main schema in `pending_sequence_compactions` and
-        // looks up their root pages in the MvStore of the attached database.
-        let database = if mvcc {
-            None
-        } else {
-            let table = conn_ctx.tables().choose(rng).unwrap();
-            table
-                .name
-                .split_once('.')
-                .map(|(database, _)| database.to_string())
-        };
+        let table = conn_ctx.tables().choose(rng).unwrap();
+        let database = table
+            .name
+            .split_once('.')
+            .map(|(database, _)| database.to_string());
         return Query::Pragma(Pragma::WalCheckpoint {
             database,
             mode: *modes.choose(rng).unwrap(),
