@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use crate::ast;
+use crate::translate::catalog::AggregateClauses;
 
 use crate::{
     bail_parse_error,
@@ -830,8 +831,21 @@ fn prepare_policy_expr(
             ast::Expr::Variable(_) => {
                 bail_parse_error!("there is no parameter $1")
             }
-            ast::Expr::FunctionCall { name, args, .. } => {
-                check_policy_function(name.as_str(), args.len(), resolver)?;
+            ast::Expr::FunctionCall { .. } => {
+                let clauses = AggregateClauses::of(expr);
+                let ast::Expr::FunctionCall { name, args, .. } = &*expr else {
+                    unreachable!("the arm matches a function call");
+                };
+                // A function that the dialect expands is not stored with the
+                // policy: a statement that applies the policy expands the
+                // call with the function's definition at that time.
+                let expanded = resolver
+                    .catalog
+                    .expand_function_call(name.as_str(), args, clauses)?
+                    .is_some();
+                if !expanded {
+                    check_policy_function(name.as_str(), args.len(), resolver)?;
+                }
             }
             ast::Expr::FunctionCallStar { name, .. } => {
                 check_policy_function(name.as_str(), 0, resolver)?;
