@@ -224,7 +224,7 @@ pub fn translate_create_index(
             expr,
             &tbl,
             resolver,
-            "functions in index expression must be marked IMMUTABLE",
+            crate::translate::collate::INDEX_EXPRESSION_NOT_IMMUTABLE,
         )?;
     }
     if let Some(where_clause) = &where_clause {
@@ -232,7 +232,7 @@ pub fn translate_create_index(
             where_clause,
             &tbl,
             resolver,
-            "functions in index predicate must be marked IMMUTABLE",
+            crate::translate::collate::INDEX_PREDICATE_NOT_IMMUTABLE,
         )?;
     }
 

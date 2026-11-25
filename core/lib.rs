@@ -119,6 +119,10 @@ use schema::Schema;
 use std::time::Duration;
 use storage::sqlite3_ondisk::PageSize;
 use tracing::instrument;
+pub use translate::collate::{
+    GENERATION_EXPRESSION_NOT_IMMUTABLE, INDEX_EXPRESSION_NOT_IMMUTABLE,
+    INDEX_PREDICATE_NOT_IMMUTABLE,
+};
 pub use translate::emitter::TransactionMode;
 use turso_macros::AtomicEnum;
 

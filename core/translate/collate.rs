@@ -1056,6 +1056,16 @@ fn timestamp_compared_with_timestamptz(x: &TypeDef, y: &TypeDef) -> bool {
     (is(x, "timestamp") && is(y, "timestamptz")) || (is(x, "timestamptz") && is(y, "timestamp"))
 }
 
+/// The errors of [refuse_timestamp_timestamptz_comparison_in_schema_expr], as
+/// PostgreSQL words them. The PostgreSQL frontend reports them as 42P17.
+///
+/// FIXME(pg-catalog): HACK. Delete together with [timestamp_compared_with_timestamptz].
+pub const GENERATION_EXPRESSION_NOT_IMMUTABLE: &str = "generation expression is not immutable";
+pub const INDEX_EXPRESSION_NOT_IMMUTABLE: &str =
+    "functions in index expression must be marked IMMUTABLE";
+pub const INDEX_PREDICATE_NOT_IMMUTABLE: &str =
+    "functions in index predicate must be marked IMMUTABLE";
+
 /// Fails when `expr`, an expression stored in the schema (a generated column,
 /// an index expression or a partial index WHERE), compares a timestamp with a
 /// timestamptz, with `message` as the error. PostgreSQL refuses that there,

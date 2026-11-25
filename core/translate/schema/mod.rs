@@ -1476,7 +1476,7 @@ pub fn translate_create_table(
                 expr,
                 &table,
                 resolver,
-                "generation expression is not immutable",
+                crate::translate::collate::GENERATION_EXPRESSION_NOT_IMMUTABLE,
             )?;
         }
     }

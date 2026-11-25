@@ -1080,7 +1080,7 @@ pub fn translate_alter_table(
                                 expr,
                                 &btree,
                                 resolver,
-                                "generation expression is not immutable",
+                                crate::translate::collate::GENERATION_EXPRESSION_NOT_IMMUTABLE,
                             )?;
                         }
                         ast::ColumnConstraint::Default(_) => {
