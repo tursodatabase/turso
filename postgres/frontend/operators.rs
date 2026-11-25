@@ -1,11 +1,15 @@
 //! The operators of PostgreSQL's `pg_operator` that the frontend has, and
 //! the refusal of an operator that has no row for the types of its operands.
 
-use crate::catalog::{pg_type_category, pg_type_oid};
-use crate::functions::{format_type, undefined_operator_of};
+use crate::catalog::{pg_type_category, pg_type_name, pg_type_oid};
+use crate::error::sqlstate_error;
+use crate::functions::{format_type, undefined_operator_of, validate_pg_input};
 use turso_core::ast;
-use turso_core::dialect::{EngineType, OperandType, OperatorChoice};
+use turso_core::dialect::{ChosenOperator, EngineType, OperandType, OperatorChoice};
 use turso_core::Result;
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+};
 
 /// A row of `pg_operator`. A type is the `oid` of its `pg_type` row, and
 /// `left` is `NONE` for a prefix operator.
@@ -31,7 +35,9 @@ pub(crate) struct Operator {
 ///    `OPERATORS_RUN_BY_CORE`: the operator signatures of that type in core
 ///    decide whether the operator exists. The rows are not asked.
 /// 3. No row can take the operands: the operator is refused with 42883.
-/// 4. Otherwise the engine runs its own operator.
+/// 4. A string literal is next to an operand of a number type, and a row
+///    takes two operands of that type: the literal is read as that type.
+/// 5. Otherwise the engine runs its own operator.
 pub(crate) fn choose_operator(op: &str, operands: &[OperandType]) -> Result<OperatorChoice> {
     let Some(types) = checked_operand_types(operands) else {
         return Ok(OperatorChoice::LeftToTheEngine);
@@ -43,7 +49,28 @@ pub(crate) fn choose_operator(op: &str, operands: &[OperandType]) -> Result<Oper
             .collect();
         check_operator(op, &oids)?;
     }
-    Ok(OperatorChoice::LeftToTheEngine)
+    let (literal, ty) = match (operands, types.as_slice()) {
+        ([OperandType::StringLiteral(literal), _], [_, Some(ty)])
+        | ([_, OperandType::StringLiteral(literal)], [Some(ty), _]) => (literal, ty),
+        _ => return Ok(OperatorChoice::LeftToTheEngine),
+    };
+    // The engine reads a literal next to a value of another type as that
+    // type already, with the input function of the type.
+    if pg_type_category(ty.oid) != Some("N") {
+        return Ok(OperatorChoice::LeftToTheEngine);
+    }
+    let takes_two = |row: &&Operator| row.name == op && row.left == ty.oid && row.right == ty.oid;
+    let Some(row) = OPERATORS.iter().find(takes_two) else {
+        return Ok(OperatorChoice::LeftToTheEngine);
+    };
+    if is_spelling_left_to_the_engine(literal, ty.oid) {
+        return Ok(OperatorChoice::LeftToTheEngine);
+    }
+    check_number_literal(literal, ty)?;
+    Ok(OperatorChoice::Chosen(ChosenOperator {
+        id: row.oid,
+        operands: vec![ty.cast_to.clone(), ty.cast_to.clone()],
+    }))
 }
 
 /// The operand types whose operators are decided by core's operator signatures
@@ -65,9 +92,61 @@ fn is_run_by_core(op: &str, types: &[Option<Checked>]) -> bool {
             .any(|ty| ty.engine.is_none() && OPERATORS_RUN_BY_CORE.contains(&ty.oid))
 }
 
+/// FIXME(registered-types): The engine stores numeric and double precision both as REAL, and cannot hold NaN or an exponent past a double, so these spellings are compared as text and give false. Once numeric is a registered type with its own storage, the input function of the type reads every spelling and this function goes away.
+/// Whether `literal` is a value of the type `oid` that PostgreSQL reads but
+/// the engine cannot store or the input check here does not know: a number in
+/// the hex, octal or binary spelling or with underscores between digits, NaN and the infinities of a real, a double
+/// precision or a numeric, and a number with an exponent past the range of a
+/// double, which a numeric holds. The engine names a numeric REAL, like a
+/// double precision, so that exponent is not refused for either. The operator
+/// is left to the engine for these, as for any literal.
+fn is_spelling_left_to_the_engine(literal: &str, oid: i64) -> bool {
+    let text = literal.trim();
+    let digits = text.trim_start_matches(['+', '-']);
+    let lower = digits.to_ascii_lowercase();
+    let has_prefix = ["0x", "0o", "0b"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix));
+    if has_prefix || digits.contains('_') {
+        return true;
+    }
+    if ![FLOAT4, FLOAT8, NUMERIC].contains(&oid) {
+        return false;
+    }
+    if ["nan", "inf", "infinity"]
+        .iter()
+        .any(|special| digits.eq_ignore_ascii_case(special))
+    {
+        return true;
+    }
+    [FLOAT8, NUMERIC].contains(&oid) && text.parse::<f64>().is_ok_and(f64::is_infinite)
+}
+
+/// Fails when `literal` is not a value of the number type `ty`.
+fn check_number_literal(literal: &str, ty: &Checked) -> Result<()> {
+    let type_name = pg_type_name(ty.oid).expect("an operand type is a row of pg_type");
+    let Some((message, sqlstate)) = validate_pg_input(literal, type_name) else {
+        return Ok(());
+    };
+    // FIXME(pg-catalog): The engine names every integer that is not a smallint or bigint column INTEGER, also the bigint that count(*) returns. So a literal out of the range of int4 is only refused when it is out of the range of int8. The type of each value, from pg_proc and pg_operator, replaces this.
+    let out_of_range = sqlstate == SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE;
+    let is_engine_integer = ty.engine == Some(EngineType::Integer);
+    if out_of_range && is_engine_integer && validate_pg_input(literal, "int8").is_none() {
+        return Ok(());
+    }
+    let sqlstate = if out_of_range {
+        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
+    } else {
+        SQLSTATE_INVALID_TEXT_REPRESENTATION
+    };
+    Err(sqlstate_error(sqlstate, message, None))
+}
+
 /// An operand whose type the rows of `OPERATORS` decide.
 struct Checked {
     oid: i64,
+    /// The type that a string literal next to the operand is cast to.
+    cast_to: ast::Type,
     /// The engine type of the operand, or `None` for a registered type.
     engine: Option<EngineType>,
 }
@@ -95,7 +174,11 @@ fn checked_registered_type(ty: &ast::Type) -> Option<Checked> {
         return None;
     }
     let oid = pg_type_oid(&ty.name).filter(|oid| CHECKED_TYPES.contains(oid))?;
-    Some(Checked { oid, engine: None })
+    Some(Checked {
+        oid,
+        cast_to: ty.clone(),
+        engine: None,
+    })
 }
 
 fn checked_engine_type(ty: EngineType, array_dimensions: u32) -> Option<Checked> {
@@ -105,6 +188,11 @@ fn checked_engine_type(ty: EngineType, array_dimensions: u32) -> Option<Checked>
     let oid = engine_type_oid(ty)?;
     Some(Checked {
         oid,
+        cast_to: ast::Type {
+            name: ty.sql_name().to_string(),
+            size: None,
+            array_dimensions: 0,
+        },
         engine: Some(ty),
     })
 }
@@ -476,6 +564,34 @@ mod tests {
         }
     }
 
+    fn chosen_id(op: &str, operands: &[OperandType]) -> Option<i64> {
+        match choose_operator(op, operands).unwrap() {
+            OperatorChoice::Chosen(chosen) => Some(chosen.id),
+            OperatorChoice::LeftToTheEngine => None,
+        }
+    }
+
+    #[test]
+    fn a_literal_next_to_a_number_chooses_the_row_of_that_type() {
+        let literal = || OperandType::StringLiteral("1".to_string());
+        let integer = || engine(EngineType::Integer);
+        assert_eq!(chosen_id("=", &[integer(), literal()]), Some(96));
+        assert_eq!(chosen_id("<", &[literal(), integer()]), Some(97));
+        assert_eq!(
+            chosen_id("+", &[registered("smallint"), literal()]),
+            Some(550)
+        );
+        assert_eq!(
+            chosen_id("=", &[registered("numeric"), literal()]),
+            Some(1752)
+        );
+        assert_eq!(
+            chosen_id("=", &[engine(EngineType::Decimal), literal()]),
+            Some(1752)
+        );
+        assert_eq!(chosen_id("=", &[integer(), integer()]), None);
+    }
+
     #[test]
     fn core_decides_the_arithmetic_of_a_registered_date_or_numeric() {
         let integer = || engine(EngineType::Integer);
@@ -485,7 +601,7 @@ mod tests {
                 [integer(), registered("numeric")],
                 [registered("date"), engine(EngineType::Decimal)],
             ] {
-                assert!(choose_operator(op, &operands).is_ok(), "{op}");
+                assert_eq!(chosen_id(op, &operands), None, "{op}");
             }
         }
     }

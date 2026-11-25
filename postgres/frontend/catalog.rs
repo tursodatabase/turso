@@ -2157,6 +2157,11 @@ fn pg_base_type(oid: i64) -> Option<&'static PgTypeInfo> {
     PG_BASE_TYPES.iter().find(|info| info.oid == oid)
 }
 
+/// The `typname` of the built-in type with this oid.
+pub(crate) fn pg_type_name(oid: i64) -> Option<&'static str> {
+    pg_base_type(oid).map(|info| info.name)
+}
+
 /// The `typcategory` of the built-in type with this oid.
 pub(crate) fn pg_type_category(oid: i64) -> Option<&'static str> {
     pg_base_type(oid).map(|info| info.typcategory)

@@ -58,7 +58,7 @@ The PostgreSQL frontend has a `boolean` type, and supports `TRUE` and `FALSE` li
 
 As in PostgreSQL, a boolean has no arithmetic operators: `(1 < 2) + 1` fails with `operator does not exist: boolean + integer`. Cast it to an integer first: `(1 < 2)::int + 1`.
 
-The PostgreSQL frontend refuses a comparison, an arithmetic operator or a bit operator that PostgreSQL does not have for the types of its operands. `text_column = 1`, `timestamptz_column > 5`, `true = 1` and `-date_column` fail with `operator does not exist` (SQLSTATE `42883`). Cast an operand to the type of the other, as in `text_column = 1::text`.
+The PostgreSQL frontend refuses a comparison, an arithmetic operator or a bit operator that PostgreSQL does not have for the types of its operands. `text_column = 1`, `timestamptz_column > 5`, `true = 1` and `-date_column` fail with `operator does not exist` (SQLSTATE `42883`). Cast an operand to the type of the other, as in `text_column = 1::text`. A string literal takes the type of the other operand, so `text_column = '1'`, `timestamptz_column > '2024-01-01'` and `1 = '1'` work, and a literal that is not a value of that type fails: `1 = 'a'` fails with `invalid input syntax for type integer` (SQLSTATE `22P02`).
 
 `CREATE TABLE ... AS SELECT` of a boolean, such as `CREATE TABLE c AS SELECT 1 < 2 AS x`, is not supported in the PostgreSQL frontend and fails with SQLSTATE `0A000`.
 

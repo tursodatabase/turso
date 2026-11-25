@@ -134,7 +134,12 @@ the comparisons of text are checked: `text_column + 1` runs, and
 checked. Neither is an operand that is a subquery, or that reads a column of
 a subquery, a CTE, a view or a catalog table, unless the column has one of the
 types boolean, smallint, bigint, numeric, varchar, date, timestamp,
-timestamptz or uuid: `text_column = (SELECT 1)` is compared. The message names the
+timestamptz or uuid: `text_column = (SELECT 1)` is compared. A string literal next to a value of a number type is read as that type when
+`pg_operator` has the operator for two operands of the type: `1 = '1'` is
+true, and `1 = 'a'`, `'a' + 1` and `int_column IN (1, 'x')` fail with 22P02.
+Still different from PostgreSQL: a literal next to an integer is checked
+against the range of bigint, a literal that is NaN, an infinity or a numeric past the range
+of a double next to a real, a double precision or a numeric is compared as text, `x IS DISTINCT FROM y` does not choose an operator unless an operand is a string literal, and `-'1'` is -1 where PostgreSQL fails with 42725. The message names the
 type that Turso gives the value: `1::smallint = 'a'::text` says
 `integer = text`, where PostgreSQL says `smallint = text`.
 `pg_statistic_ext` exposes the hidden system column

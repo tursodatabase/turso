@@ -234,6 +234,142 @@ expect error {
     operator does not exist: ~ boolean
 }
 
+# A string literal takes the type of the other operand.
+@setup operands
+test string-literal-is-compared-as-the-other-operand {
+    SELECT i = '1', s = '1', b = 'yes', d = '2024-01-05', tz > '2020-01-01',
+           u = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'
+    FROM operands;
+}
+expect {
+    t|t|t|t|t|t
+}
+
+# Next to a number, a string literal is read as the type of the number.
+test string-literal-next-to-an-integer-is-an-integer {
+    SELECT 1 = '1', 1 = ' 1 ', 2 < '10', '3' > 2, '2' + 1, 7 - '3', 1.5 = '1.50', 1.5 + '1';
+}
+expect {
+    t|t|t|t|3|4|t|2.5
+}
+
+@setup operands
+test string-literal-next-to-a-number-column-is-read-as-its-type {
+    SELECT i = '1', i + '1', i IN (5, '1'), i BETWEEN '0' AND '9', i2 = '2', i8 + '1',
+           n = '4.50', f > '5'
+    FROM operands;
+}
+expect {
+    t|2|t|t|t|4|t|t
+}
+
+test string-literal-that-is-not-an-integer-errors {
+    SELECT 1 = 'a';
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "a"
+}
+
+test string-literal-with-a-fraction-next-to-an-integer-errors {
+    SELECT 1 = '1.5';
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1.5"
+}
+
+test string-literal-plus-an-integer-errors {
+    SELECT 'a' + 1;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "a"
+}
+
+@setup operands
+test string-literal-compared-with-a-bigint-column-errors {
+    SELECT i8 = 'abc' FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bigint: "abc"
+}
+
+@setup operands
+test string-literal-out-of-the-range-of-smallint-errors {
+    SELECT i2 = '99999' FROM operands;
+}
+@sqlstate 22003
+expect error {
+    value "99999" is out of range for type smallint
+}
+
+@setup operands
+test string-literal-added-to-a-double-precision-column-errors {
+    SELECT f + 'abc' FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type double precision: "abc"
+}
+
+# PostgreSQL reads the literal when it plans the statement, so a value that
+# no row reaches fails too.
+@setup operands
+test string-literal-in-an-in-list-that-is-not-an-integer-errors {
+    SELECT i IN (1, 'x') FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "x"
+}
+
+@setup operands
+test string-literal-in-a-between-that-is-not-an-integer-errors {
+    SELECT i BETWEEN 0 AND 'x' FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "x"
+}
+
+@setup operands
+test string-literal-compared-with-an-indexed-integer-column-uses-the-value {
+    CREATE INDEX operands_i ON operands (i);
+    INSERT INTO operands (i) VALUES (10), (11);
+    SELECT i FROM operands WHERE i = '10';
+    SELECT count(*) FROM operands WHERE i > '9';
+}
+expect {
+    10
+    2
+}
+
+# tursopg does not tell an integer column from a bigint that a function
+# returns, so it checks the literal against the range of bigint.
+@compat-gap "type:int4"
+@setup operands
+test string-literal-out-of-the-range-of-integer-errors {
+    SELECT i = '9999999999' FROM operands;
+}
+@sqlstate 22003
+expect error {
+    value "9999999999" is out of range for type integer
+}
+expect @tursopg {
+    f
+}
+
+@setup operands
+test string-literal-in-a-case-that-is-not-an-integer-errors {
+    SELECT CASE i WHEN 'x' THEN 1 ELSE 0 END FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "x"
+}
+
 # Number types are compared and computed with each other.
 @setup operands
 test number-types-have-operators-with-each-other {
@@ -314,6 +450,24 @@ expect {
     0
 }
 
+# A string literal that PostgreSQL reads as NaN, an infinity or a huge
+# numeric next to a number is a value, not an error.
+@setup operands
+test nan-literal-next-to-numbers-is-not-an-error {
+    SELECT n = 'NaN', f = 'NaN', f = 'Infinity', f = '-Infinity', 1.5 = 'NaN', 1.5 = 'Infinity', n = '1e400' FROM operands;
+}
+expect {
+    f|f|f|f|f|f|f
+}
+
+@setup operands
+test hex-and-underscore-literals-next-to-an-integer-are-not-an-error {
+    SELECT i = '0x10', i = '1_000' FROM operands;
+}
+expect {
+    f|f
+}
+
 @setup operands
 test unary-minus-of-boolean-errors {
     SELECT -b FROM operands;
@@ -321,6 +475,32 @@ test unary-minus-of-boolean-errors {
 @sqlstate 42883
 expect error {
     operator does not exist: - boolean
+}
+
+@setup operands
+test nan-literal-next-to-an-integer-errors {
+    SELECT i = 'NaN' FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "NaN"
+}
+
+@setup operands
+test case-with-a-base-reads-the-literal-of-a-when {
+    SELECT CASE i WHEN '1' THEN 'one' ELSE 'other' END FROM operands;
+}
+expect {
+    one
+}
+
+@setup operands
+test case-with-a-base-refuses-a-literal-that-is-not-a-number {
+    SELECT CASE i WHEN 'x' THEN 'one' ELSE 'other' END FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "x"
 }
 
 @setup operands
@@ -333,12 +513,46 @@ expect error {
 }
 
 @setup operands
+test distinct-from-reads-the-literal {
+    SELECT i IS DISTINCT FROM '1', i IS NOT DISTINCT FROM '1' FROM operands;
+}
+expect {
+    f|t
+}
+
+@setup operands
+test distinct-from-refuses-a-literal-that-is-not-a-number {
+    SELECT i IS DISTINCT FROM 'x' FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "x"
+}
+
+@setup operands
 test nullif-refuses-text-and-integer {
     SELECT NULLIF(s, 1) FROM operands;
 }
 @sqlstate 42883
 expect error {
     operator does not exist: text = integer
+}
+
+@setup operands
+test nullif-reads-the-literal {
+    SELECT NULLIF(i, '2'), NULLIF(i, '1') IS NULL FROM operands;
+}
+expect {
+    1|t
+}
+
+@setup operands
+test nullif-refuses-a-literal-that-is-not-a-number {
+    SELECT NULLIF(i, 'x') FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "x"
 }
 
 @setup operands
@@ -356,6 +570,15 @@ test row-values-refuse-a-pair-that-is-text-and-integer {
 @sqlstate 42883
 expect error {
     operator does not exist: text = integer
+}
+
+@setup operands
+test row-values-refuse-a-literal-that-is-not-a-number {
+    SELECT (i, 1) = ('a', 1) FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "a"
 }
 
 @setup operands
@@ -476,4 +699,3 @@ expect error {
 expect @tursopg {
     f
 }
-
