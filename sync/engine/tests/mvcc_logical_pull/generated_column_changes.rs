@@ -95,6 +95,29 @@ fn add_column_beside_unique_generated_column() -> Result<()> {
     ])
 }
 
+/// The remote changes only the case of the name of a generated column that is
+/// not the last column, and that another generated column and an index use.
+/// The replica must rename the column too, and not take it as a changed
+/// generated column, which would move it.
+#[test]
+fn rename_middle_generated_column_in_case_only() -> Result<()> {
+    let remote = Remote::new(&[
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, g TEXT AS (upper(a)), h TEXT AS (g || '!'), b TEXT)",
+        "CREATE INDEX t_g ON t (g)",
+        "INSERT INTO t (id, a, b) VALUES (1, 'x', 'y')",
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+
+    remote.execute_transaction(&["ALTER TABLE t RENAME COLUMN g TO G"])?;
+    replica.pull()?;
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+
+    remote.execute_transaction(&["INSERT INTO t (id, a, b) VALUES (2, 'p', 'q')"])?;
+    replica.pull()?;
+    assert_eq!(replica.snapshot()?, remote.snapshot()?);
+    Ok(())
+}
+
 /// Bootstraps a replica of a remote that ran `setup`. Then the remote adds a
 /// column to table `t`, and the replica pulls. The replica must then be the
 /// same as the remote.

@@ -737,6 +737,10 @@ impl DatabaseReplayGenerator {
                     .as_str()
                     .eq_ignore_ascii_case(remote_name.as_str())
                 {
+                    // The remote can change only the case of a name.
+                    if local_name.as_str() != remote_name.as_str() {
+                        renamed.push((local_name, remote_name));
+                    }
                     remote_columns.next();
                 } else if has_column(&local_columns[index + 1..], remote_name.as_str()) {
                     // This doesn't correctly handle a remote transaction that swaps two columns,

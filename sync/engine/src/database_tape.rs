@@ -4300,7 +4300,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Turso currently rejects case-only renames, see https://github.com/tursodatabase/turso/issues/9429"]
     pub fn test_schema_refresh_renames_column_whose_name_changed_only_in_case() {
         let rows = replay_on_table_with_generated_columns(
             &["CREATE TABLE core (id TEXT PRIMARY KEY, a TEXT, b TEXT)"],
