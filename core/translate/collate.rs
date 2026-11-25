@@ -1017,8 +1017,7 @@ fn check_comparable(
     // PostgreSQL has no array operator for timestamp[] with timestamptz[], so
     // that pair stays refused.
     if let (ExprType::Array { element: x, .. }, ExprType::Array { element: y, .. }) = (a, b) {
-        return check_comparable(x, y, schema, false)
-            .map_err(|_| cannot_compare(a, b));
+        return check_comparable(x, y, schema, false).map_err(|_| cannot_compare(a, b));
     }
     let (ExprType::Custom { type_def: x, .. }, ExprType::Custom { type_def: y, .. }) = (a, b)
     else {
