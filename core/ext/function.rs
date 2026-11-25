@@ -61,8 +61,8 @@ impl ExternalFunc {
     /// pg_operator lookup replaces it; remove it then.
     ///
     /// Sets a function that is called at compile time with the type name of
-    /// each argument, with domain names kept (`receiving_argument_types`
-    /// passes the domain's base type); an error refuses the statement. Needs
+    /// each argument, with a domain replaced by its base type, the same names
+    /// `receiving_argument_types` passes; an error refuses the statement. Needs
     /// `receiving_argument_types`.
     pub fn checking_argument_types(mut self, check: crate::function::ArgumentTypeCheck) -> Self {
         let ExtFunc::NativeScalar {
