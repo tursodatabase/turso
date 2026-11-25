@@ -533,10 +533,13 @@ struct PendingState {
 }
 
 impl PendingChanges {
-    pub(crate) fn begin_statement(&self) {
+    pub(crate) fn begin_statement(&self, owner: Option<u64>) {
         let mut pending = self.0.lock();
         debug_assert!(pending.statement.is_none());
-        pending.statement = Some(ChangeSnapshot::default());
+        pending.statement = Some(ChangeSnapshot {
+            owner,
+            ..Default::default()
+        });
     }
 
     pub(crate) fn end_statement(&self, rolled_back: bool) {

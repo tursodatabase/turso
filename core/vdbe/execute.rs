@@ -5332,7 +5332,9 @@ pub fn op_transaction_inner(
                             "write statement started with view changes left by an earlier statement"
                         );
                         if state.has_stmt_transaction {
-                            connection.pending_changes.begin_statement();
+                            connection
+                                .pending_changes
+                                .begin_statement(connection.get_mv_tx_id());
                         }
                         state.is_active_write = true;
                         state.tx_read_only_at_start = connection.is_tx_read_only();

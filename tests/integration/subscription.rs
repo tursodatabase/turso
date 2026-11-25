@@ -483,3 +483,31 @@ fn local_wal_import_refreshes_at_each_new_commit_frame() {
         .unwrap();
     assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
 }
+
+#[test]
+fn mvcc_busy_schema_writer_can_retry_with_a_subscription() {
+    let db = TempDatabase::builder().with_mvcc(true).build();
+    let holder = db.connect_limbo();
+    let contender = db.connect_limbo();
+    holder
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let sub = db.db.subscribe_changes(ChangeFilter::All);
+    holder.execute("BEGIN CONCURRENT").unwrap();
+    holder
+        .execute("ALTER TABLE t ADD COLUMN held INTEGER")
+        .unwrap();
+    contender.execute("BEGIN CONCURRENT").unwrap();
+    assert!(contender
+        .execute("ALTER TABLE t ADD COLUMN retried INTEGER")
+        .is_err());
+    holder.execute("ROLLBACK").unwrap();
+    assert_eq!(sub.try_recv(), None);
+    contender
+        .execute("ALTER TABLE t ADD COLUMN retried INTEGER")
+        .unwrap();
+    contender.execute("COMMIT").unwrap();
+    assert_eq!(sub.try_recv(), Some(ChangeBatch::Refresh));
+    contender.execute("INSERT INTO t(id) VALUES(7)").unwrap();
+    assert_eq!(sub.try_recv(), Some(batch("t", [vec![Value::from_i64(7)]])));
+}
