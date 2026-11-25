@@ -716,6 +716,16 @@ pub trait Dialect: Send + Sync + 'static {
         Ok(CastDecision::EngineRules)
     }
 
+    /// Whether a statement converts the new values of a row to the types of
+    /// their columns before it checks NOT NULL.
+    ///
+    /// PostgreSQL does, so a value that its conversion turns into NULL fails
+    /// the check. SQLite checks NOT NULL first, unless the table is STRICT
+    /// and has generated columns.
+    fn converts_values_before_not_null(&self) -> bool {
+        false
+    }
+
     /// Fails when the DEFAULT of the column `column_name` cannot be written to
     /// a column of the type `column_type`. `source` gives the type of the
     /// DEFAULT.

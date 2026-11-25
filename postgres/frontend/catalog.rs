@@ -492,6 +492,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn converts_values_before_not_null(&self) -> bool {
+        true
+    }
+
     fn allows_qualified_columns_in_index_terms(&self) -> bool {
         true
     }

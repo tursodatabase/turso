@@ -1229,7 +1229,8 @@ pub fn translate_alter_table(
                 let has_non_constant_default = column.default.as_ref().is_some_and(|default| {
                     default_requires_empty_table(default) || !is_strict_constant_default(default)
                 });
-                computes_default_for_existing_rows = has_non_constant_default
+                computes_default_for_existing_rows = (has_non_constant_default
+                    || dialect_converts_default(&column, resolver)?)
                     && connection
                         .dialect()
                         .add_column_computes_default_for_existing_rows();
@@ -1256,7 +1257,7 @@ pub fn translate_alter_table(
                     )?;
                 }
 
-                if default_type_mismatch {
+                if default_type_mismatch && !computes_default_for_existing_rows {
                     emit_halt_if_table_has_rows(
                         program,
                         &original_btree,
@@ -2037,6 +2038,24 @@ pub fn translate_alter_table(
     };
 
     Ok(())
+}
+
+/// Whether the dialect's cast on assignment changes the DEFAULT of `column`
+/// when a row stores it.
+fn dialect_converts_default(column: &Column, resolver: &Resolver) -> Result<bool> {
+    let Some(default) = column.default.as_deref() else {
+        return Ok(false);
+    };
+    let source = || {
+        crate::translate::expr::expr_type::cast_source_of(
+            default,
+            &crate::translate::expr::expr_type::TypeEnv::new(None, resolver),
+            resolver.schema(),
+        )
+    };
+    let converted =
+        crate::translate::emitter::new_values::assignment_cast(default, &source, column, resolver)?;
+    Ok(converted.is_some_and(|converted| converted != *default))
 }
 
 /// Translates `ALTER TABLE name OWNER TO role`, and the same for the other

@@ -1438,7 +1438,13 @@ fn emit_update_insns<'a>(
     // columns, so on such a table a wrong type wins over a NOT NULL violation.
     let notnull_checks_follow_type_check = !has_before_triggers
         && target_table.table.btree().is_some_and(|btree| {
-            btree.is_strict && btree.columns().iter().any(|c| c.is_generated())
+            btree.is_strict
+                && (btree.columns().iter().any(|c| c.is_generated())
+                    || t_ctx
+                        .resolver
+                        .catalog
+                        .dialect
+                        .converts_values_before_not_null())
         });
 
     let table_column_was_read = emit_update_column_values(

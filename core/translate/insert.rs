@@ -724,7 +724,8 @@ pub fn translate_insert(
             .schema()
             .column_has_custom_type(column, ctx.table.is_strict)
     };
-    let types_checked_first = insertion.has_generated_columns();
+    let types_checked_first = insertion.has_generated_columns()
+        || resolver.catalog.dialect.converts_values_before_not_null();
     if !types_checked_first {
         emit_notnulls(program, &ctx, &insertion, resolver, false, |column| {
             !column.is_generated() && !has_custom_type(column)
