@@ -55,6 +55,7 @@ turso-dbhash.workspace = true
 
 [dev-dependencies]
 branches = { version = "0.4.3", default-features = false }
+crc32c = "0.6.8"
 similar-asserts.workspace = true
 asserting.workspace = true
 serial_test = { version = "3", features = ["file_locks"] }

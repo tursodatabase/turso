@@ -1196,6 +1196,7 @@ dependencies = [
  "assert_cmd",
  "asserting",
  "branches",
+ "crc32c",
  "crossbeam-epoch",
  "ctor 0.5.0",
  "env_logger",

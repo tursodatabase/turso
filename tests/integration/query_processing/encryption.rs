@@ -2862,6 +2862,156 @@ fn encrypted_recovery_rejects_files_encrypted_with_another_key() -> anyhow::Resu
     Ok(())
 }
 
+/// The frame checksums of the MVCC log are not keyed, so anyone who can write the
+/// log can recompute them. Recovery must still reject a log whose complete frames
+/// were removed, replayed or reordered, because such an edit silently changes
+/// committed data: removing a DELETE frame brings the deleted row back.
+#[test]
+fn encrypted_mvcc_recovery_rejects_removed_or_reordered_frames() -> anyhow::Result<()> {
+    for cipher in [CIPHER_A, CIPHER_B] {
+        let source = TempDatabaseBuilder::new()
+            .with_encryption(cipher, KEY_A)
+            .with_mvcc(true)
+            .build();
+        let conn = source.connect_limbo();
+        let log_path = format!("{}-log", source.path.display());
+        let mut frame_ends = Vec::new();
+        for sql in [
+            "CREATE TABLE secrets(id INTEGER PRIMARY KEY, value TEXT)",
+            "INSERT INTO secrets VALUES (1, 'secret')",
+            "INSERT INTO secrets VALUES (2, 'later')",
+            "DELETE FROM secrets WHERE id = 1",
+            "UPDATE secrets SET value = 'later-v2' WHERE id = 2",
+            "UPDATE secrets SET value = 'later-v3' WHERE id = 2",
+        ] {
+            conn.execute(sql)?;
+            frame_ends.push(std::fs::metadata(&log_path)?.len() as usize);
+        }
+        let log = std::fs::read(&log_path)?;
+        let frames = encrypted_log_frames(&log, cipher)?;
+        // Each statement committed one transaction, which appended one frame.
+        assert_eq!(
+            frames.iter().map(|frame| frame.end).collect::<Vec<_>>(),
+            frame_ends
+        );
+        let (create, insert_secret, insert_later, delete_secret, first_update, second_update) =
+            (0, 1, 2, 3, 4, 5);
+        let committed = [
+            create,
+            insert_secret,
+            insert_later,
+            delete_secret,
+            first_update,
+            second_update,
+        ];
+        // The recomputed checksums are the checksums that the engine wrote.
+        assert_eq!(rechained_log(&log, &frames, &committed), log);
+        let text = |value: &'static str| vec![turso_core::Value::build_text(value)];
+        assert_eq!(recover_with_log(&source, cipher, &log)?, [text("later-v3")]);
+        // A torn final frame is dropped without an error.
+        assert_eq!(
+            recover_with_log(&source, cipher, &log[..log.len() - 1])?,
+            [text("later-v2")]
+        );
+
+        let edits: [(&str, &[usize]); 3] = [
+            (
+                "removing the DELETE frame",
+                &[
+                    create,
+                    insert_secret,
+                    insert_later,
+                    first_update,
+                    second_update,
+                ],
+            ),
+            (
+                "swapping the UPDATE frames",
+                &[
+                    create,
+                    insert_secret,
+                    insert_later,
+                    delete_secret,
+                    second_update,
+                    first_update,
+                ],
+            ),
+            (
+                "replaying the INSERT frame after the DELETE frame",
+                &[
+                    create,
+                    insert_secret,
+                    insert_later,
+                    delete_secret,
+                    insert_secret,
+                    first_update,
+                    second_update,
+                ],
+            ),
+        ];
+        for (edit, order) in edits {
+            let edited = rechained_log(&log, &frames, order);
+            let error = recover_with_log(&source, cipher, &edited)
+                .expect_err(&format!("{cipher}: recovery accepted {edit}"));
+            assert!(
+                error.to_string().to_ascii_lowercase().contains("decrypt"),
+                "{cipher}: {edit}: {error}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Returns the byte range of each frame in an encrypted MVCC log that holds only
+/// complete frames.
+fn encrypted_log_frames(log: &[u8], cipher: &str) -> anyhow::Result<Vec<std::ops::Range<usize>>> {
+    use turso_core::mvcc::persistent_storage::logical_log::{frame_codec, LOG_HDR_SIZE};
+    let cipher = turso_core::CipherMode::try_from(cipher)?;
+    let overhead = Some((cipher.tag_size(), cipher.nonce_size()));
+    let mut frames = Vec::new();
+    let mut start = LOG_HDR_SIZE;
+    while start < log.len() {
+        let layout = frame_codec::inspect_frame_prefix_with_overhead(&log[start..], overhead)?
+            .expect("complete frame header");
+        frames.push(start..start + layout.stored_size());
+        start += layout.stored_size();
+    }
+    assert_eq!(start, log.len(), "the log ends inside a frame");
+    Ok(frames)
+}
+
+/// Returns the log header followed by the frames at the indexes in `order`. Each
+/// frame checksum is recomputed for the new position of the frame in the
+/// checksum chain, which starts from the CRC of the header salt.
+fn rechained_log(log: &[u8], frames: &[std::ops::Range<usize>], order: &[usize]) -> Vec<u8> {
+    use turso_core::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE;
+    const TRAILER_SIZE: usize = 8;
+    let mut edited = log[..LOG_HDR_SIZE].to_vec();
+    let mut crc = crc32c::crc32c(&log[8..16]);
+    for &index in order {
+        let start = edited.len();
+        edited.extend_from_slice(&log[frames[index].clone()]);
+        let trailer = edited.len() - TRAILER_SIZE;
+        crc = crc32c::crc32c_append(crc, &edited[start..trailer]);
+        edited[trailer..trailer + 4].copy_from_slice(&crc.to_le_bytes());
+    }
+    edited
+}
+
+/// Copies the database files of `source` with `log` as the MVCC log, opens the
+/// copy with the key, and returns the rows of the `secrets` table.
+fn recover_with_log(
+    source: &TempDatabase,
+    cipher: &str,
+    log: &[u8],
+) -> anyhow::Result<Vec<Vec<turso_core::Value>>> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("fresh.db");
+    copy_encrypted_test_files(source, &path)?;
+    std::fs::write(format!("{}-log", path.display()), log)?;
+    fresh_encrypted_rows(&path, cipher)
+}
+
 fn copy_encrypted_test_files(source: &TempDatabase, path: &std::path::Path) -> anyhow::Result<()> {
     for suffix in ["", "-wal", "-log"] {
         let source_path = format!("{}{suffix}", source.path.display());
