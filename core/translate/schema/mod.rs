@@ -1572,6 +1572,28 @@ pub fn translate_create_table(
         }
     }
 
+    // For CTAS, fill the new table from the SELECT before the in-memory
+    // schema changes, as SQLite does. The SELECT can fail, and a statement
+    // rollback undoes only the pages: it does not undo SetCookie and
+    // ParseSchema in the in-memory schema.
+    if let Some(info) = ctas_info {
+        let col_count = match &body {
+            ast::CreateTableBody::ColumnsAndConstraints { columns, .. } => columns.len(),
+            _ => unreachable!("CTAS body was converted to ColumnsAndConstraints above"),
+        };
+        emit_ctas_insert(
+            program,
+            resolver,
+            info.plan,
+            &body,
+            table_root_reg,
+            col_count,
+            database_id,
+            &normalized_tbl_name,
+            connection,
+        )?;
+    }
+
     program.preassign_label_to_next_insn(parse_schema_label);
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
@@ -1603,25 +1625,6 @@ pub fn translate_create_table(
         where_clause: Some(parse_schema_where_clause),
         trigger_target_database_id: None,
     });
-
-    // For CTAS, emit bytecode to populate the new table from the SELECT
-    if let Some(info) = ctas_info {
-        let col_count = match &body {
-            ast::CreateTableBody::ColumnsAndConstraints { columns, .. } => columns.len(),
-            _ => unreachable!("CTAS body was converted to ColumnsAndConstraints above"),
-        };
-        emit_ctas_insert(
-            program,
-            resolver,
-            info.plan,
-            &body,
-            table_root_reg,
-            col_count,
-            database_id,
-            &normalized_tbl_name,
-            connection,
-        )?;
-    }
 
     Ok(())
 }
