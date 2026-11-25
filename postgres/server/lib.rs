@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::{ConnectOpts, Database, StatementTimes, Value, WallClockInstant};
 use turso_pg::{
-    parse_pg_bool, split_statements, sql_parse_error, sqlstate_error, PgConnection,
+    parse_pg_bool, split_statements, sql_parse_error, sqlstate_error, IntegerType, PgConnection,
     StatementResultKind, TransactionState,
 };
 use turso_pg_parser::cmdtag::CommandTag;
@@ -1015,14 +1015,9 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     })?;
 
     match *pg_type {
-        Type::INT2 | Type::INT4 | Type::INT8 => {
-            let i: i64 = text.parse().map_err(|e| {
-                PgWireError::UserError(Box::new(error_info(&format!(
-                    "invalid integer parameter: {e}"
-                ))))
-            })?;
-            Ok(Value::from_i64(i))
-        }
+        Type::INT2 => integer_parameter(IntegerType::Int2, text),
+        Type::INT4 => integer_parameter(IntegerType::Int4, text),
+        Type::INT8 => integer_parameter(IntegerType::Int8, text),
         Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => {
             let f: f64 = text.parse().map_err(|e| {
                 PgWireError::UserError(Box::new(error_info(&format!(
@@ -1070,6 +1065,13 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
         }
         // TEXT, VARCHAR, and all other types → text
         _ => Ok(Value::from_text(text.to_owned())),
+    }
+}
+
+fn integer_parameter(ty: IntegerType, text: &str) -> PgWireResult<Value> {
+    match ty.parse(text) {
+        Ok(integer) => Ok(Value::from_i64(integer)),
+        Err(error) => Err(pg_error(error.into())),
     }
 }
 
@@ -2250,6 +2252,30 @@ mod tests {
     }
 
     #[test]
+    fn test_pg_bytes_to_value_integer_reads_text_as_postgres_does() {
+        for (text, expected) in [(" 42 ", 42), ("+7", 7), ("0x1F", 31), ("1_000", 1000)] {
+            for pg_type in [Type::INT2, Type::INT4, Type::INT8] {
+                let val = pg_bytes_to_value(text.as_bytes(), &pg_type).unwrap();
+                assert_eq!(val, Value::from_i64(expected), "{text:?} as {pg_type}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_integer_outside_the_range_of_its_type() {
+        for (text, pg_type) in [
+            ("32768", Type::INT2),
+            ("-2147483649", Type::INT4),
+            ("9223372036854775808", Type::INT8),
+        ] {
+            let Err(error) = pg_bytes_to_value(text.as_bytes(), &pg_type) else {
+                panic!("{text:?} as {pg_type}: no error");
+            };
+            assert_eq!(sqlstate(error), "22003", "{text:?} as {pg_type}");
+        }
+    }
+
+    #[test]
     fn test_pg_bytes_to_value_float() {
         let val = pg_bytes_to_value(b"3.25", &Type::FLOAT8).unwrap();
         assert_eq!(val, Value::from_f64(3.25));
@@ -2324,8 +2350,16 @@ mod tests {
 
     #[test]
     fn test_pg_bytes_to_value_integer_parse_error() {
-        let result = pg_bytes_to_value(b"not_a_number", &Type::INT4);
-        assert!(result.is_err());
+        for text in ["not_a_number", "1.5", "1e2", ""] {
+            let Err(error) = pg_bytes_to_value(text.as_bytes(), &Type::INT4) else {
+                panic!("{text:?}: no error");
+            };
+            assert_eq!(
+                sqlstate(error),
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
