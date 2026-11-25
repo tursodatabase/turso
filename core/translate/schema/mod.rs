@@ -47,6 +47,7 @@ use crate::util::{
     is_builtin_strict_type, normalize_ident, quote_identifier, walk_expr_with_subqueries,
     walk_schema_expressions, SchemaExprOwner, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
     to_u32, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
@@ -318,7 +319,7 @@ fn resolve_check_expr_type(
         ast::Expr::Collate(inner, _) => resolve_check_expr_type(inner, columns, resolver),
         ast::Expr::Cast { type_name, .. } => {
             if let Some(ref tn) = type_name {
-                resolve_type_name(&dequote(&tn.name), resolver)
+                Ok(resolve_cast_type_name(&dequote(&tn.name), resolver))
             } else {
                 bail_parse_error!(
                     "cannot determine type of CAST in CHECK constraint; use CAST with explicit type"
@@ -548,8 +549,32 @@ fn resolve_column_type(
     }
 }
 
+/// The type a CAST to `type_name` gives. A name that is no type is read by
+/// its affinity, as the CAST itself reads it: `CAST(x AS int4)` is an integer.
+fn resolve_cast_type_name(type_name: &str, resolver: &CatalogContext) -> CheckExprType {
+    if let Some(ty) = known_type_name(type_name, resolver) {
+        return ty;
+    }
+    match Affinity::of_written_type(type_name) {
+        Affinity::Integer => CheckExprType::Integer,
+        Affinity::Real => CheckExprType::Real,
+        Affinity::Text => CheckExprType::Text,
+        Affinity::Blob => CheckExprType::Blob,
+        // An integer or a real, whichever the value reads as.
+        Affinity::Numeric | Affinity::None => CheckExprType::Any,
+    }
+}
+
 /// Resolve a type name string to a CheckExprType.
 fn resolve_type_name(type_name: &str, resolver: &CatalogContext) -> Result<CheckExprType> {
+    match known_type_name(type_name, resolver) {
+        Some(ty) => Ok(ty),
+        None => bail_parse_error!("unknown type '{}' in CHECK constraint", type_name),
+    }
+}
+
+/// The type named `type_name`: a type of a STRICT table or a custom type.
+fn known_type_name(type_name: &str, resolver: &CatalogContext) -> Option<CheckExprType> {
     let name_bytes = type_name.as_bytes();
     let result = turso_macros::match_ignore_ascii_case!(match name_bytes {
         b"INT" | b"INTEGER" => Some(CheckExprType::Integer),
@@ -559,19 +584,21 @@ fn resolve_type_name(type_name: &str, resolver: &CatalogContext) -> Result<Check
         b"ANY" => Some(CheckExprType::Any),
         _ => None,
     });
-    if let Some(ty) = result {
-        return Ok(ty);
+    if result.is_some() {
+        return result;
     }
     // Check if it's a known custom type
-    if let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) {
-        // Domains are transparent wrappers — resolve to the base primitive type
-        // so CHECK constraint type checking compares primitives, not domain names.
-        if resolved.is_domain() || resolved.reads_stored_values_unchanged() {
-            return resolve_type_name(&resolved.primitive, resolver);
-        }
-        return Ok(CheckExprType::CustomType(type_name.to_lowercase()));
+    let resolved = resolver
+        .schema()
+        .resolve_type_unchecked(type_name)
+        .ok()
+        .flatten()?;
+    // Domains are transparent wrappers — resolve to the base primitive type
+    // so CHECK constraint type checking compares primitives, not domain names.
+    if resolved.is_domain() || resolved.reads_stored_values_unchanged() {
+        return known_type_name(&resolved.primitive, resolver);
     }
-    bail_parse_error!("unknown type '{}' in CHECK constraint", type_name);
+    Some(CheckExprType::CustomType(type_name.to_lowercase()))
 }
 
 /// Walk a CHECK expression and validate that all comparisons have compatible types.
