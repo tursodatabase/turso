@@ -229,6 +229,17 @@ expect {
     3|[2]
 }
 
+# A cast to jsonb gives the jsonb type to the result of -> and to a column
+# of a VALUES list, so - deletes from them.
+test jsonb-delete-of-cast-to-jsonb {
+    SELECT (('{"a":{"b":1,"c":2}}'::jsonb -> 'a')::jsonb - 'b' = '{"c":2}')::int;
+    SELECT (j::jsonb - 'a' = '{"b":2}')::int FROM (VALUES ('{"a":1,"b":2}'::jsonb)) v(j);
+}
+expect {
+    1
+    1
+}
+
 # Core runs - on jsonb values, so an index expression can use it.
 @setup items_with_jsonb_rows
 test jsonb-delete-in-index-expression {
@@ -349,4 +360,89 @@ test jsonb-delete-of-bigint {
 expect error {}
 expect @tursopg {
     [2]
+}
+
+# A cast to bigint and count(*), whose type is bigint, also delete by index.
+@compat-gap "operator:jsonb - int8"
+test jsonb-delete-of-bigint-cast {
+    SELECT '[1,2]'::jsonb - 1::bigint;
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    [1]
+}
+
+@compat-gap "operator:jsonb - int8"
+test jsonb-delete-of-count {
+    SELECT '[1,2]'::jsonb - count(*);
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    [1]
+}
+
+# A length makes varchar(n) a custom type of tursopg, and jsonb has no -
+# for it. PostgreSQL casts varchar to text and deletes the key.
+@compat-gap "operator:jsonb - text"
+test jsonb-delete-of-varchar-column {
+    CREATE TABLE vc (j jsonb, k varchar(5));
+    INSERT INTO vc VALUES ('{"a":1,"b":2}', 'a');
+    SELECT j - k FROM vc;
+}
+expect {
+    {"b": 2}
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# jsonb_delete() chooses what it deletes by the values of its arguments,
+# without the check of the right operand of -. A boolean is the integer 1.
+@compat-gap "function:jsonb_delete"
+test jsonb-delete-function-of-boolean {
+    SELECT jsonb_delete('[1,2]'::jsonb, 1 = 1);
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    [1]
+}
+
+# - deletes only when its left operand has the jsonb type. The result of
+# -> is text in tursopg, so - subtracts numbers and gives 0.
+@compat-gap "operator:jsonb -> text"
+test jsonb-delete-of-arrow-result {
+    SELECT ('{"a":{"b":1,"c":2}}'::jsonb -> 'a') - 'b';
+}
+expect {
+    {"c": 2}
+}
+expect @tursopg {
+    0
+}
+
+# A column of a VALUES list in FROM has no type in tursopg, so - subtracts
+# numbers and gives 0.
+@compat-gap "syntax:values"
+test jsonb-delete-of-values-column {
+    SELECT j - 'a' FROM (VALUES ('{"a":1,"b":2}'::jsonb)) v(j);
+}
+expect {
+    {"b": 2}
+}
+expect @tursopg {
+    0
+}
+
+# json has no - in PostgreSQL. tursopg reads a json value as text, so -
+# subtracts numbers and gives 0.
+@compat-gap "operator:json - text"
+test json-minus-text {
+    SELECT '{"a":1}'::json - 'a';
+}
+@sqlstate 42883
+expect error {}
+expect @tursopg {
+    0
 }
