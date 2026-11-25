@@ -407,12 +407,7 @@ impl Value {
                 if quotes == 0 {
                     quoted.push_str(text);
                 } else {
-                    for (i, part) in text.split('\'').enumerate() {
-                        if i > 0 {
-                            quoted.push_str("''");
-                        }
-                        quoted.push_str(part);
-                    }
+                    push_doubling_quotes(&mut quoted, text);
                 }
                 quoted.push('\'');
                 Value::build_text(quoted)
@@ -1678,6 +1673,27 @@ impl Value {
             .collect();
         Value::build_text(result)
     }
+}
+
+/// Append `text` to `out`, with each quote doubled.
+///
+/// Not inlined: `exec_quote` calls it only for text that has a quote, and
+/// the loop inlined into `exec_quote` made the quote of other text slower.
+#[inline(never)]
+fn push_doubling_quotes(out: &mut String, text: &str) {
+    // Each part ends with a quote, and the push after it adds the second
+    // quote. A quote is ASCII, so each part ends on a character boundary. On
+    // short text, this loop costs less than `split('\'')`, which searches
+    // for a char.
+    let mut start = 0;
+    for (i, byte) in text.bytes().enumerate() {
+        if byte == b'\'' {
+            out.push_str(&text[start..=i]);
+            out.push('\'');
+            start = i + 1;
+        }
+    }
+    out.push_str(&text[start..]);
 }
 
 /// `bytes` as upper-case hex digits, two for each byte, as `hex::encode_upper`
