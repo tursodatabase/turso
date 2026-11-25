@@ -670,6 +670,20 @@ pub trait Dialect: Send + Sync + 'static {
         Ok(OperatorChoice::LeftToTheEngine)
     }
 
+    /// Chooses the `=` of `x IN (a, b, ...)` for the values that read no
+    /// column, when the dialect picks one type for `x` and all of them at
+    /// once. `operands` gives the types of `x` and then of each value, and is
+    /// only called by a dialect that needs them. `None` compares each value
+    /// with `x` alone through [Dialect::choose_operator], as SQLite does, and
+    /// so is a value that reads a column.
+    fn choose_list_operator(
+        &self,
+        _op: &str,
+        _operands: &dyn Fn() -> Vec<OperandType>,
+    ) -> Result<Option<OperatorChoice>> {
+        Ok(None)
+    }
+
     /// The error for an operator that no function runs for operands of these
     /// types, such as `date * 2`. `operand_types` has one name for a prefix
     /// operator and two for the others.

@@ -779,6 +779,20 @@ impl Dialect for NoMinusForTextDialect {
         turso_core::dialect::resolve_builtin_function(name, arg_count)
     }
 
+    fn choose_list_operator(
+        &self,
+        _op: &str,
+        operands: &dyn Fn() -> Vec<OperandType>,
+    ) -> Result<Option<OperatorChoice>> {
+        let values = operands().len() - 1;
+        if values > 1 {
+            return Err(LimboError::ParseError(format!(
+                "no IN list of {values} values"
+            )));
+        }
+        Ok(None)
+    }
+
     fn choose_operator(
         &self,
         op: &str,
@@ -824,6 +838,33 @@ impl Dialect for NoMinusForTextDialect {
             OperatorChoice::LeftToTheEngine
         })
     }
+}
+
+#[test]
+fn dialect_chooses_the_values_of_an_in_list_that_read_no_column_together() {
+    let options = OpenOptions::new(Arc::new(NoMinusForTextDialect))
+        .db_opts(DatabaseOpts::new().with_custom_types(true));
+    let db = Database::open(Arc::new(MemoryIO::new()), ":memory:", options).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t (s TEXT, i INTEGER) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES ('5', 7)").unwrap();
+
+    let error = |sql: &str| conn.prepare(sql).err().map(|error| error.to_string());
+    for sql in [
+        "SELECT i IN (1, 2) FROM t",
+        "SELECT i IN (s, 1, 2) FROM t",
+        "SELECT i NOT IN (1, 2, 3) FROM t",
+    ] {
+        let error = error(sql).unwrap_or_else(|| panic!("{sql} did not fail"));
+        assert!(error.contains("no IN list of"), "{sql}: {error}");
+    }
+    for sql in ["SELECT i IN (1) FROM t", "SELECT i IN (s, 7) FROM t"] {
+        assert!(error(sql).is_none(), "{sql}");
+    }
+    conn.close().unwrap();
 }
 
 #[test]

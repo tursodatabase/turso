@@ -130,26 +130,51 @@ fn read_as_chosen_types(
     dialect: &dyn Dialect,
     types: &mut [Option<ast::Type>],
 ) -> Result<()> {
-    let operand_types = || -> Vec<OperandType> {
-        operator
-            .operands
+    let operand_types = |slots: &[usize], null: OperandType| -> Vec<OperandType> {
+        slots
             .iter()
-            .map(|&slot| operand_type(operands[slot], env))
+            .map(|&slot| operand_type(operands[slot], env, null.clone()))
             .collect()
     };
-    let choice = dialect.choose_operator(operator.name, &operand_types)?;
-    record_chosen_types(choice, &operator.operands, operands, types);
+    let choose_pair = |slots: &[usize]| {
+        dialect.choose_operator(operator.name, &|| {
+            operand_types(slots, OperandType::Unnamed)
+        })
+    };
+    match operator.kind {
+        UseKind::Each => {
+            let choice = choose_pair(&operator.operands)?;
+            record_chosen_types(choice, &operator.operands, operands, types);
+        }
+        UseKind::ListValues => {
+            // A NULL fits any type, like a parameter.
+            let choice = dialect.choose_list_operator(operator.name, &|| {
+                operand_types(&operator.operands, OperandType::Untyped)
+            })?;
+            match choice {
+                Some(choice) => record_chosen_types(choice, &operator.operands, operands, types),
+                None => {
+                    for &value in &operator.operands[1..] {
+                        let slots = [operator.operands[0], value];
+                        let choice = choose_pair(&slots)?;
+                        record_chosen_types(choice, &slots, operands, types);
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
-/// What the dialect is told about `expr`: its type, and no type when it is
-/// NULL or a hidden column, which the engine compares with the argument itself.
-fn operand_type(expr: &ast::Expr, env: &TypeEnv) -> OperandType {
+/// What the dialect is told about `expr`: its type, `null` when it is NULL,
+/// and no type when it is a hidden column, which the engine compares with the
+/// argument itself.
+fn operand_type(expr: &ast::Expr, env: &TypeEnv, null: OperandType) -> OperandType {
     if is_hidden_column(expr, env) {
         return OperandType::Unnamed;
     }
     match type_of(expr, env) {
-        ExprType::Null => OperandType::Unnamed,
+        ExprType::Null => null,
         ty => dialect_operand_type(expr, ty, env),
     }
 }
@@ -179,6 +204,15 @@ fn record_chosen_types(
 struct OperatorUse {
     name: &'static str,
     operands: Vec<usize>,
+    kind: UseKind,
+}
+
+enum UseKind {
+    /// The operator takes exactly the operands.
+    Each,
+    /// The first operand is compared with all the other operands as the
+    /// values of an IN list, which a dialect may read as one type.
+    ListValues,
 }
 
 /// The operands of `expr` and the operators it applies to them: the
@@ -221,7 +255,8 @@ fn operator_uses(expr: &mut ast::Expr) -> (Vec<&mut ast::Expr>, Vec<OperatorUse>
                 .map(|i| OperatorUse {
                     name,
                     operands: vec![i, count + i],
-                        })
+                    kind: UseKind::Each,
+                })
                 .collect();
             let operands = left
                 .iter_mut()
@@ -236,7 +271,8 @@ fn operator_uses(expr: &mut ast::Expr) -> (Vec<&mut ast::Expr>, Vec<OperatorUse>
                     vec![OperatorUse {
                         name,
                         operands: vec![0],
-                                }]
+                        kind: UseKind::Each,
+                    }]
                 })
                 .unwrap_or_default();
             (vec![operand.as_mut()], uses)
@@ -248,8 +284,20 @@ fn operator_uses(expr: &mut ast::Expr) -> (Vec<&mut ast::Expr>, Vec<OperatorUse>
             uses.extend(first_with_each("<=", 2..3));
             (vec![lhs.as_mut(), start.as_mut(), end.as_mut()], uses)
         }
-        ast::Expr::InList { lhs, rhs, .. } => {
-            let uses = first_with_each("=", 1..rhs.len() + 1);
+        ast::Expr::InList { lhs, not, rhs } => {
+            let name = if *not { "<>" } else { "=" };
+            let (with_columns, without_columns): (Vec<usize>, Vec<usize>) =
+                (1..=rhs.len()).partition(|&slot| reads_a_column(&rhs[slot - 1]));
+            let mut uses = first_with_each(name, with_columns);
+            if !without_columns.is_empty() {
+                let mut operands = vec![0];
+                operands.extend(&without_columns);
+                uses.push(OperatorUse {
+                    name,
+                    operands,
+                    kind: UseKind::ListValues,
+                });
+            }
             let operands = std::iter::once(lhs.as_mut())
                 .chain(rhs.iter_mut().map(|value| value.as_mut()))
                 .collect();
@@ -317,8 +365,29 @@ fn first_with_each(
         .map(|operand| OperatorUse {
             name,
             operands: vec![0, operand],
+            kind: UseKind::Each,
         })
         .collect()
+}
+
+/// Whether `expr` reads a column of the query, as an item of an IN list does
+/// that PostgreSQL compares with the left side alone.
+fn reads_a_column(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        found |= matches!(
+            expr,
+            ast::Expr::Column { .. }
+                | ast::Expr::RowId { .. }
+                | ast::Expr::MergedColumn(_)
+                | ast::Expr::Id(_)
+                | ast::Expr::Name(_)
+                | ast::Expr::Qualified(..)
+                | ast::Expr::DoublyQualified(..)
+        );
+        Ok(WalkControl::Continue)
+    });
+    found
 }
 
 fn comparison_symbol(op: &ast::Operator) -> Option<&'static str> {
