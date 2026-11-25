@@ -92,12 +92,11 @@ impl Trigger {
     pub fn written_table_qualifier(
         &self,
         dialect: &dyn crate::dialect::Dialect,
-    ) -> Option<turso_parser::ast::Name> {
+    ) -> Option<ast::Name> {
         match crate::dialect::parse_statement(dialect, &self.sql) {
-            Ok(Some(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateTrigger {
-                tbl_name,
-                ..
-            }))) => tbl_name.namespace,
+            Ok(Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger { tbl_name, .. }))) => {
+                tbl_name.namespace
+            }
             _ => None,
         }
     }
