@@ -1445,6 +1445,24 @@ expect {
     NULL|NULL|NULL|NULL|NULL|NULL
 }
 
+# A text date that is a number is a Julian day number, as in the other date
+# and time functions. Spaces around it are allowed, and text that is not a
+# date and not a number gives NULL.
+test strftime-numeric-text-date {
+    SELECT strftime('%Y-%m-%d %H:%M:%S', '2460512.5'),
+           strftime('%Y-%m-%d', ' 2460512.5 '),
+           strftime('%s', '1700000000', 'unixepoch'),
+           quote(strftime('%Y', '-1')),
+           quote(strftime('%Y', 'inf')),
+           strftime('%J', '2460512'),
+           quote(strftime('%Y', '1e3')),
+           quote(strftime('%Y-%m-%d', '+2460512')),
+           quote(strftime('%Y', '12:30 x'));
+}
+expect {
+    2024-07-21 00:00:00|2024-07-21|1700000000|NULL|NULL|2460512|'-4710'|'2024-07-20'|NULL
+}
+
 test strftime-modifiers-out-of-range-where {
     WITH t1(a, b) AS (VALUES (0, '-1 day'), (5373484, '+1 day'))
     SELECT count(*) FROM t1 WHERE strftime('%Y', a, b) IS NOT NULL;

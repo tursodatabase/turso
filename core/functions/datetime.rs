@@ -1335,24 +1335,11 @@ where
     } else {
         let init_val = values.next().unwrap();
         match arg_as_text(init_val.as_value_ref()) {
+            // parse_date_or_time also reads "now" and a number, after the
+            // date and time forms, as exec_datetime_general uses it.
             ValueRef::Text(s) => {
-                let s_str = s.as_str();
-                if s_str.eq_ignore_ascii_case("now") {
-                    set_to_current(&mut p, clock);
-                } else if let Ok(val) = s_str.parse::<f64>() {
-                    p.s = val;
-                    p.raw_s = true;
-                    if p.s >= 0.0 && p.s < 5373484.5 {
-                        p.i_jd = (p.s * JD_TO_MS as f64 + 0.5) as i64;
-                        p.valid_jd = true;
-                    }
-                } else {
-                    let mut temp_p = DateTime::default();
-                    if parse_date_or_time(s_str, &mut temp_p, clock).is_ok() {
-                        p = temp_p;
-                    } else {
-                        return Value::Null;
-                    }
+                if parse_date_or_time(s.as_str(), &mut p, clock).is_err() {
+                    return Value::Null;
                 }
             }
             ValueRef::Numeric(Numeric::Integer(i)) => {
