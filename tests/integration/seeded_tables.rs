@@ -22,15 +22,17 @@ struct CountingSeed {
     rows: Vec<Vec<Value>>,
     /// The position of the INTEGER PRIMARY KEY column, if there is one.
     rowid_column: Option<usize>,
+    version: u32,
     find_calls: AtomicUsize,
     row_calls: AtomicUsize,
 }
 
 impl CountingSeed {
-    fn new(rows: Vec<Vec<Value>>, rowid_column: Option<usize>) -> Self {
+    fn new(rows: Vec<Vec<Value>>, rowid_column: Option<usize>, version: u32) -> Self {
         Self {
             rows,
             rowid_column,
+            version,
             find_calls: AtomicUsize::new(0),
             row_calls: AtomicUsize::new(0),
         }
@@ -74,7 +76,7 @@ impl Seed for CountingSeed {
     }
 
     fn version(&self) -> u32 {
-        1
+        self.version
     }
 }
 
@@ -95,6 +97,10 @@ impl Catalog for SeedCatalog {
     /// - `plain...`: no row.
     /// - `dup...`: the row has oid 10, which a seed row has.
     /// - `inside...`: the row has oid 15, which is in the seed row range.
+    /// - `far...`: the row has oid 150.
+    /// - `tempwrite...`: a temporary table that gets a row, which the
+    ///   statement writes without a change to the schema of the main
+    ///   database.
     /// - `twice...`: the catalog opens `seed_items` twice and writes two rows.
     /// - `words...`: `seed_words` also gets a row `(name, length of name)`.
     fn emit(
@@ -107,9 +113,12 @@ impl Catalog for SeedCatalog {
         let CatalogCmd::CreateTable(table) = cmd else {
             return Ok(());
         };
+        // As pg_class has a row for a temporary table, a temporary table
+        // named `tempwrite...` gets a row in the main database.
+        let temporary_with_row = table.temporary && table.name.starts_with("tempwrite");
         if ctx.origin != CmdOrigin::User
-            || ctx.database_id != 0
-            || table.temporary
+            || (ctx.database_id != 0 && !temporary_with_row)
+            || (table.temporary && !temporary_with_row)
             || table.name.starts_with("plain")
         {
             return Ok(());
@@ -118,6 +127,8 @@ impl Catalog for SeedCatalog {
             Some(10)
         } else if table.name.starts_with("inside") {
             Some(15)
+        } else if table.name.starts_with("far") {
+            Some(150)
         } else {
             None
         };
@@ -180,6 +191,51 @@ fn emit_item_row(
     });
     items.emit_insert(program, start);
     Ok(())
+}
+
+/// The seeds of a [`SeedDialect`].
+struct Seeds {
+    items: Vec<Vec<Value>>,
+    /// The seed row range of `seed_items`.
+    item_rows: SeedRowRange,
+    words: Vec<Vec<Value>>,
+    /// The version of both seeds.
+    version: u32,
+}
+
+/// The seeds of [`SeedDialect::newer`].
+fn newer_seeds() -> Seeds {
+    Seeds {
+        items: vec![
+            vec![
+                Value::from_i64(10),
+                Value::from_text("alpha"),
+                Value::from_text("changed"),
+                Value::from_f64(1.5),
+            ],
+            vec![
+                Value::from_i64(25),
+                Value::from_text("delta"),
+                Value::Null,
+                Value::from_f64(4.0),
+            ],
+            vec![
+                Value::from_i64(30),
+                Value::from_text("gamma"),
+                Value::Null,
+                Value::from_f64(-0.25),
+            ],
+        ],
+        item_rows: SeedRowRange {
+            column: "oid",
+            range: 0..31,
+        },
+        words: vec![
+            vec![Value::from_text("uno"), Value::from_i64(3)],
+            vec![Value::from_text("four"), Value::from_i64(4)],
+        ],
+        version: 2,
+    }
 }
 
 /// A SQLite dialect whose catalog has seeded tables. Each test makes its
@@ -264,14 +320,41 @@ impl SeedDialect {
         item_rows: SeedRowRange,
         words_hidden_columns: &'static [HiddenColumn],
     ) -> Arc<Self> {
-        let items: &'static CountingSeed = Box::leak(Box::new(CountingSeed::new(items, Some(0))));
-        let words: &'static CountingSeed = Box::leak(Box::new(CountingSeed::new(
-            vec![
-                vec![Value::from_text("one"), Value::from_i64(3)],
-                vec![Value::from_text("three"), Value::from_i64(5)],
-            ],
-            None,
-        )));
+        Self::with_seeds(
+            Seeds {
+                items,
+                item_rows,
+                words: vec![
+                    vec![Value::from_text("one"), Value::from_i64(3)],
+                    vec![Value::from_text("three"), Value::from_i64(5)],
+                ],
+                version: 1,
+            },
+            words_hidden_columns,
+        )
+    }
+
+    /// The dialect of a newer binary, whose seeds have other rows and the
+    /// version 2. Against [`Self::new`], `seed_items` changes the row 10,
+    /// has no row 20 and has a new row 25, and `seed_words` changes the row
+    /// `one`, has no row `three` and has a new row `four`.
+    fn newer() -> Arc<Self> {
+        Self::with_seeds(newer_seeds(), &[])
+    }
+
+    /// A dialect with the seeds `seeds`, whose `seed_words` has the hidden
+    /// columns `words_hidden_columns`.
+    fn with_seeds(seeds: Seeds, words_hidden_columns: &'static [HiddenColumn]) -> Arc<Self> {
+        let Seeds {
+            items,
+            item_rows,
+            words,
+            version,
+        } = seeds;
+        let items: &'static CountingSeed =
+            Box::leak(Box::new(CountingSeed::new(items, Some(0), version)));
+        let words: &'static CountingSeed =
+            Box::leak(Box::new(CountingSeed::new(words, None, version)));
         let tables: &'static [SeededTable] = Box::leak(Box::new([
             SeededTable {
                 name: "seed_items",
@@ -2055,4 +2138,859 @@ fn seed_row_range_column_is_checked_at_open() {
             "{column}: {err}"
         );
     }
+}
+
+/// Opens the file at `path` with `dialect`, stores `seed_items` and
+/// `seed_words` with the rows of the user tables `t1` and `words1`, and
+/// closes it. With `checkpoint`, the rows are in the database file, and
+/// otherwise in the WAL or the logical log.
+fn store_both_tables(path: &Path, dialect: Arc<SeedDialect>, mvcc: bool, checkpoint: bool) {
+    let db = open(path, dialect, mvcc);
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t1 (a)").unwrap();
+    conn.execute("CREATE TABLE words1 (a)").unwrap();
+    if checkpoint {
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    conn.close().unwrap();
+}
+
+/// The rows of `seed_words`, by length and word.
+fn all_words(conn: &Arc<Connection>) -> Vec<Vec<SqlValue>> {
+    rows(
+        conn,
+        "SELECT word, length FROM seed_words ORDER BY length, word",
+    )
+}
+
+/// The rows of [`SeedDialect::new`] in `seed_words`, and the rows that the
+/// catalog wrote for each of `tables`.
+fn words_with_user_tables(seed: &[(&str, i64)], tables: &[&str]) -> Vec<Vec<SqlValue>> {
+    let mut expected: Vec<Vec<SqlValue>> = seed
+        .iter()
+        .map(|(word, length)| vec![text(word), int(*length)])
+        .collect();
+    for table in tables {
+        expected.push(vec![text(table), int(table.len() as i64)]);
+    }
+    expected.sort_by_key(|row| match (&row[0], &row[1]) {
+        (SqlValue::Text(word), SqlValue::Integer(length)) => (*length, word.clone()),
+        other => panic!("a row of seed_words is {other:?}"),
+    });
+    expected
+}
+
+const OLDER_WORDS: [(&str, i64); 2] = [("one", 3), ("three", 5)];
+const NEWER_WORDS: [(&str, i64); 2] = [("uno", 3), ("four", 4)];
+
+/// The rows of [`SeedDialect::newer`] in `seed_items`, then a row that the
+/// catalog wrote for each of `tables`, with the oids from 31.
+fn newer_items_with_user_tables(tables: &[&str]) -> Vec<Vec<SqlValue>> {
+    let mut expected = vec![
+        vec![int(10), text("alpha"), text("changed"), real(1.5)],
+        vec![int(25), text("delta"), SqlValue::Null, real(4.0)],
+        vec![int(30), text("gamma"), SqlValue::Null, real(-0.25)],
+    ];
+    for (position, table) in tables.iter().enumerate() {
+        expected.push(vec![
+            int(31 + position as i64),
+            text(table),
+            text("user table"),
+            SqlValue::Null,
+        ]);
+    }
+    expected
+}
+
+/// The bytes of the database file and of its WAL and logical log, for each
+/// file that exists.
+fn file_bytes(path: &Path) -> Vec<(String, Vec<u8>)> {
+    ["", "-wal", "-log"]
+        .iter()
+        .filter_map(|suffix| {
+            let file = format!("{}{suffix}", path.display());
+            std::fs::read(&file).ok().map(|bytes| (file, bytes))
+        })
+        .collect()
+}
+
+/// A database whose seeded tables were filled by the seeds of the binary
+/// opens and is written without a refill, and an open that only reads
+/// writes nothing to the files.
+fn same_version_fills_nothing_again(mvcc: bool, checkpoint: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    store_both_tables(&path, SeedDialect::new(), mvcc, checkpoint);
+    let before = file_bytes(&path);
+    let dialect = SeedDialect::new();
+    {
+        let db = open(&path, dialect.clone(), mvcc);
+        let conn = db.connect_limbo();
+        assert_eq!(all_items(&conn), items_with_user_tables(&["t1", "words1"]));
+        assert_eq!(
+            all_words(&conn),
+            words_with_user_tables(&OLDER_WORDS, &["words1"])
+        );
+        assert_eq!(
+            seed_versions(&conn),
+            vec![
+                vec![text("seed_items"), int(1)],
+                vec![text("seed_words"), int(1)],
+            ]
+        );
+        assert_eq!(dialect.items().calls(), (0, 0));
+        conn.close().unwrap();
+    }
+    assert!(
+        file_bytes(&path) == before,
+        "an open that reads writes nothing"
+    );
+
+    let db = open(&path, dialect.clone(), mvcc);
+    let conn = db.connect_limbo();
+    let program = opcodes(&conn, "CREATE TABLE t2 (a)");
+    assert_eq!(count_opcode(&program, "VOpen"), 0, "{program:?}");
+    assert_eq!(count_opcode(&program, "CatalogApply"), 0, "{program:?}");
+    conn.execute("CREATE TABLE t2 (a)").unwrap();
+    assert_eq!(dialect.items().calls(), (0, 0), "no refill");
+    assert_eq!(
+        all_items(&conn),
+        items_with_user_tables(&["t1", "words1", "t2"])
+    );
+    assert_eq!(seed_versions(&conn).len(), 2);
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn same_version_fills_nothing_again_wal() {
+    same_version_fills_nothing_again(false, false);
+}
+
+#[test]
+fn same_version_fills_nothing_again_wal_after_checkpoint() {
+    same_version_fills_nothing_again(false, true);
+}
+
+#[test]
+fn same_version_fills_nothing_again_mvcc_before_checkpoint() {
+    same_version_fills_nothing_again(true, false);
+}
+
+#[test]
+fn same_version_fills_nothing_again_mvcc_after_checkpoint() {
+    same_version_fills_nothing_again(true, true);
+}
+
+/// A newer binary has other seeds. Until a statement writes a stored
+/// seeded table, readers see its old seed rows. The first write of each
+/// table replaces its seed rows with the new ones, keeps the rows that the
+/// catalog wrote, and records the new version. The indexes follow, and a
+/// later write or reopen does not fill the table again.
+fn changed_seed_fills_again_on_write(mvcc: bool, checkpoint: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    store_both_tables(&path, SeedDialect::new(), mvcc, checkpoint);
+    let dialect = SeedDialect::newer();
+    {
+        let db = open(&path, dialect.clone(), mvcc);
+        let conn = db.connect_limbo();
+        let other = db.connect_limbo();
+        assert_eq!(all_items(&conn), items_with_user_tables(&["t1", "words1"]));
+        assert_eq!(
+            seed_versions(&conn),
+            vec![
+                vec![text("seed_items"), int(1)],
+                vec![text("seed_words"), int(1)],
+            ]
+        );
+        let user_items = |conn: &Arc<Connection>| {
+            rows(
+                conn,
+                "SELECT rowid, * FROM seed_items WHERE oid >= 31 ORDER BY rowid",
+            )
+        };
+        let user_words = |conn: &Arc<Connection>| {
+            rows(
+                conn,
+                "SELECT rowid, * FROM seed_words WHERE length >= 6 ORDER BY rowid",
+            )
+        };
+        let items_before = user_items(&conn);
+        let words_before = user_words(&conn);
+        assert_eq!(items_before.len(), 2);
+        assert_eq!(words_before.len(), 1);
+
+        conn.execute("CREATE TABLE t2 (a)").unwrap();
+        // The rows that the catalog wrote are as they were, with their
+        // rowids, and the index finds them.
+        assert_eq!(&user_items(&conn)[..2], &items_before[..]);
+        let plan = rows(
+            &conn,
+            "EXPLAIN QUERY PLAN SELECT oid FROM seed_items WHERE name = 't1'",
+        );
+        assert!(
+            format!("{plan:?}").contains("seed_items_name"),
+            "the query uses the index: {plan:?}"
+        );
+        for (name, oid) in [("t1", 31), ("words1", 32), ("t2", 33), ("alpha", 10)] {
+            assert_eq!(
+                rows(
+                    &conn,
+                    &format!("SELECT oid FROM seed_items WHERE name = '{name}'")
+                ),
+                vec![vec![int(oid)]]
+            );
+        }
+        let expected = newer_items_with_user_tables(&["t1", "words1", "t2"]);
+        assert_eq!(all_items(&conn), expected);
+        assert_eq!(all_items(&other), expected);
+        assert_eq!(
+            seed_versions(&other),
+            vec![
+                vec![text("seed_items"), int(2)],
+                vec![text("seed_words"), int(1)],
+            ]
+        );
+        // seed_words was not written, so it keeps its old seed rows.
+        assert_eq!(
+            all_words(&conn),
+            words_with_user_tables(&OLDER_WORDS, &["words1"])
+        );
+        assert_eq!(
+            rows(&conn, "SELECT oid FROM seed_items WHERE name = 'delta'"),
+            vec![vec![int(25)]]
+        );
+        assert!(rows(&conn, "SELECT oid FROM seed_items WHERE name = 'beta'").is_empty());
+
+        // The refill of a table without a rowid alias gives new rowids.
+        conn.execute("CREATE TABLE words2 (a)").unwrap();
+        assert_eq!(&user_words(&conn)[..1], &words_before[..]);
+        assert_eq!(
+            all_words(&conn),
+            words_with_user_tables(&NEWER_WORDS, &["words1", "words2"])
+        );
+        assert_eq!(
+            rows(&conn, "SELECT count(DISTINCT rowid) FROM seed_words"),
+            vec![vec![int(4)]]
+        );
+        assert_eq!(
+            seed_versions(&conn),
+            vec![
+                vec![text("seed_items"), int(2)],
+                vec![text("seed_words"), int(2)],
+            ]
+        );
+        assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+        if !mvcc {
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        conn.close().unwrap();
+        other.close().unwrap();
+    }
+    if !mvcc {
+        assert_eq!(sqlite_integrity_check(&path), "ok");
+    }
+    let db = open(&path, dialect.clone(), mvcc);
+    let conn = db.connect_limbo();
+    dialect.items().reset();
+    let program = opcodes(&conn, "CREATE TABLE t3 (a)");
+    assert_eq!(count_opcode(&program, "VOpen"), 0, "{program:?}");
+    conn.execute("CREATE TABLE t3 (a)").unwrap();
+    assert_eq!(dialect.items().calls(), (0, 0), "no second refill");
+    assert_eq!(
+        all_items(&conn),
+        newer_items_with_user_tables(&["t1", "words1", "t2", "words2", "t3"])
+    );
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn changed_seed_fills_again_on_write_wal() {
+    changed_seed_fills_again_on_write(false, false);
+}
+
+#[test]
+fn changed_seed_fills_again_on_write_wal_after_checkpoint() {
+    changed_seed_fills_again_on_write(false, true);
+}
+
+#[test]
+fn changed_seed_fills_again_on_write_mvcc_before_checkpoint() {
+    changed_seed_fills_again_on_write(true, false);
+}
+
+#[test]
+fn changed_seed_fills_again_on_write_mvcc_after_checkpoint() {
+    changed_seed_fills_again_on_write(true, true);
+}
+
+/// In a transaction, the first write fills the table again and the next
+/// statement does not. Another connection sees the new rows after the
+/// commit. A ROLLBACK leaves the old rows and the old version, and the next
+/// write fills the table again.
+fn changed_seed_fills_again_in_transaction(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    store_both_tables(&path, SeedDialect::new(), mvcc, false);
+    let dialect = SeedDialect::newer();
+    let db = open(&path, dialect.clone(), mvcc);
+    let conn = db.connect_limbo();
+    let other = db.connect_limbo();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE t2 (a)").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(all_items(&conn), items_with_user_tables(&["t1", "words1"]));
+    assert_eq!(seed_versions(&conn)[0], vec![text("seed_items"), int(1)]);
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE t2 (a)").unwrap();
+    let program = opcodes(&conn, "CREATE TABLE t3 (a)");
+    assert_eq!(count_opcode(&program, "VOpen"), 0, "{program:?}");
+    dialect.items().reset();
+    conn.execute("CREATE TABLE t3 (a)").unwrap();
+    assert_eq!(dialect.items().calls(), (0, 0), "no second refill");
+    assert_eq!(seed_versions(&conn)[0], vec![text("seed_items"), int(2)]);
+    assert_eq!(all_items(&other), items_with_user_tables(&["t1", "words1"]));
+    conn.execute("COMMIT").unwrap();
+    // In MVCC mode the rolled back transaction used the oid 33, so the
+    // test compares the seed rows and the names of the user tables.
+    let seed_part = |conn: &Arc<Connection>| rows(conn, "SELECT * FROM seed_items WHERE oid < 31");
+    let expected = newer_items_with_user_tables(&[]);
+    for conn in [&conn, &other] {
+        assert_eq!(seed_part(conn), expected);
+        assert_eq!(
+            user_table_rows(conn),
+            vec![
+                vec![text("t1")],
+                vec![text("words1")],
+                vec![text("t2")],
+                vec![text("t3")],
+            ]
+        );
+    }
+    assert_eq!(seed_versions(&other)[0], vec![text("seed_items"), int(2)]);
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn changed_seed_fills_again_in_transaction_wal() {
+    changed_seed_fills_again_in_transaction(false);
+}
+
+#[test]
+fn changed_seed_fills_again_in_transaction_mvcc() {
+    changed_seed_fills_again_in_transaction(true);
+}
+
+/// A refill that fails changes nothing: the old rows and the old version
+/// stay. Inside a transaction, the transaction goes on and commits.
+fn failed_refill_changes_nothing(mvcc: bool, explicit_transaction: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    store_both_tables(&path, SeedDialect::new(), mvcc, false);
+    // The newer seed has a row outside its range, which stops the refill
+    // after it deleted the old seed rows.
+    let mut seeds = newer_seeds();
+    seeds.items.push(vec![
+        Value::from_i64(40),
+        Value::from_text("outside"),
+        Value::Null,
+        Value::Null,
+    ]);
+    let dialect = SeedDialect::with_seeds(seeds, &[]);
+    let db = open(&path, dialect, mvcc);
+    let conn = db.connect_limbo();
+    let other = db.connect_limbo();
+    if explicit_transaction {
+        conn.execute("BEGIN").unwrap();
+    }
+    let err = error_of(&conn, "CREATE TABLE t2 (a)");
+    assert!(
+        err.contains(
+            "a seed row of seeded table seed_items is outside its seed row range: \
+             oid must be at least 0 and less than 31"
+        ),
+        "{err}"
+    );
+    let unchanged = |conn: &Arc<Connection>| {
+        assert_eq!(all_items(conn), items_with_user_tables(&["t1", "words1"]));
+        assert_eq!(
+            seed_versions(conn),
+            vec![
+                vec![text("seed_items"), int(1)],
+                vec![text("seed_words"), int(1)],
+            ]
+        );
+        let err = error_of(conn, "SELECT * FROM t2");
+        assert!(err.contains("no such table"), "{err}");
+    };
+    unchanged(&conn);
+    if explicit_transaction {
+        conn.execute("CREATE TABLE plain_kept (a)").unwrap();
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(
+            rows(&other, "SELECT count(*) FROM plain_kept"),
+            vec![vec![int(0)]]
+        );
+    }
+    unchanged(&other);
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn failed_refill_changes_nothing_wal() {
+    failed_refill_changes_nothing(false, false);
+}
+
+#[test]
+fn failed_refill_changes_nothing_wal_in_transaction() {
+    failed_refill_changes_nothing(false, true);
+}
+
+#[test]
+fn failed_refill_changes_nothing_mvcc() {
+    failed_refill_changes_nothing(true, false);
+}
+
+#[test]
+fn failed_refill_changes_nothing_mvcc_in_transaction() {
+    failed_refill_changes_nothing(true, true);
+}
+
+/// A statement that another connection prepared before a refill prepares
+/// again after it, and does not fill the table a second time. A second
+/// refill that starts while the first is not committed fails as two schema
+/// changes do, and its retry fills nothing.
+fn refill_on_two_connections(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    store_both_tables(&path, SeedDialect::new(), mvcc, false);
+    let dialect = SeedDialect::newer();
+    let db = open(&path, dialect.clone(), mvcc);
+    let a = db.connect_limbo();
+    let b = db.connect_limbo();
+
+    let mut prepared = b.prepare("CREATE TABLE b1 (a)").unwrap();
+    a.execute("CREATE TABLE a1 (a)").unwrap();
+    dialect.items().reset();
+    prepared.run_ignore_rows().unwrap();
+    assert_eq!(dialect.items().calls(), (0, 0), "no second refill");
+    assert_eq!(
+        all_items(&b),
+        newer_items_with_user_tables(&["t1", "words1", "a1", "b1"])
+    );
+
+    a.execute("BEGIN").unwrap();
+    a.execute("CREATE TABLE words2 (a)").unwrap();
+    b.execute("BEGIN").unwrap();
+    let err = b.execute("CREATE TABLE words3 (a)").unwrap_err();
+    assert!(matches!(err, LimboError::Busy), "{err:?}");
+    a.execute("COMMIT").unwrap();
+    b.execute("ROLLBACK").unwrap();
+    dialect.words().reset();
+    b.execute("CREATE TABLE words3 (a)").unwrap();
+    assert_eq!(dialect.words().calls(), (0, 0), "no second refill");
+    assert_eq!(
+        all_words(&a),
+        words_with_user_tables(&NEWER_WORDS, &["words1", "words2", "words3"])
+    );
+    assert_eq!(seed_versions(&a)[1], vec![text("seed_words"), int(2)]);
+    assert_eq!(turso_integrity_check(&a), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn refill_on_two_connections_wal() {
+    refill_on_two_connections(false);
+}
+
+#[test]
+fn refill_on_two_connections_mvcc() {
+    refill_on_two_connections(true);
+}
+
+/// A read-only open of a database whose seeds are old shows the old seed
+/// rows, fails a write and changes no file.
+///
+/// The test records what core does now. What a read-only database with old
+/// seed rows must show is an open question for the user.
+fn read_only_open_of_old_seeds(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    store_both_tables(&path, SeedDialect::new(), mvcc, false);
+    let before = file_bytes(&path);
+    {
+        let db = TempDatabase::builder()
+            .with_db_path(&path)
+            .with_dialect(SeedDialect::newer())
+            .with_flags(turso_core::OpenFlags::ReadOnly)
+            .build();
+        let conn = db.connect_limbo();
+        assert_eq!(all_items(&conn), items_with_user_tables(&["t1", "words1"]));
+        assert_eq!(seed_versions(&conn)[0], vec![text("seed_items"), int(1)]);
+        assert!(conn.execute("CREATE TABLE t2 (a)").is_err());
+        assert_eq!(all_items(&conn), items_with_user_tables(&["t1", "words1"]));
+        conn.close().unwrap();
+    }
+    assert!(
+        file_bytes(&path) == before,
+        "a read-only open writes nothing"
+    );
+}
+
+#[test]
+fn read_only_open_of_old_seeds_wal() {
+    read_only_open_of_old_seeds(false);
+}
+
+#[test]
+fn read_only_open_of_old_seeds_mvcc() {
+    read_only_open_of_old_seeds(true);
+}
+
+/// A database whose seeded tables were stored before core kept seed
+/// versions has no table of seed versions. Core does not know which seed
+/// filled the tables, so it never fills them again, and it adds no version.
+#[test]
+fn table_stored_without_a_version_is_never_filled_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    store_both_tables(&path, SeedDialect::new(), false, true);
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch("DROP TABLE __turso_internal_seed_versions")
+        .unwrap();
+    drop(sqlite);
+
+    let dialect = SeedDialect::newer();
+    let db = open(&path, dialect.clone(), false);
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t2 (a)").unwrap();
+    conn.execute("CREATE TABLE words2 (a)").unwrap();
+    assert_eq!(dialect.items().calls(), (0, 0));
+    assert_eq!(dialect.words().calls(), (0, 0));
+    assert_eq!(
+        all_items(&conn),
+        items_with_user_tables(&["t1", "words1", "t2", "words2"])
+    );
+    assert_eq!(
+        all_words(&conn),
+        words_with_user_tables(&OLDER_WORDS, &["words1", "words2"])
+    );
+    let err = error_of(&conn, "SELECT * FROM __turso_internal_seed_versions");
+    assert!(err.contains("no such table"), "{err}");
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+fn open_with_dialect_and_custom_types(
+    path: &Path,
+    dialect: Arc<SeedDialect>,
+    mvcc: bool,
+) -> TempDatabase {
+    TempDatabase::builder()
+        .with_db_path(path)
+        .with_dialect(dialect)
+        .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+        .with_mvcc(mvcc)
+        .build()
+}
+
+/// The table of types is a seeded table of core with no version and no
+/// seed rows: a refill of a seeded table of the catalog leaves it and its
+/// rows as they are.
+fn refill_leaves_the_types_table(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    {
+        let db = open_with_dialect_and_custom_types(&path, SeedDialect::new(), mvcc);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TYPE cents BASE integer").unwrap();
+        conn.execute("CREATE TABLE t1 (a)").unwrap();
+        conn.close().unwrap();
+    }
+    let db = open_with_dialect_and_custom_types(&path, SeedDialect::newer(), mvcc);
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t2 (a)").unwrap();
+    assert_eq!(
+        all_items(&conn),
+        newer_items_with_user_tables(&["t1", "t2"])
+    );
+    assert_eq!(stored_type_names(&conn), vec![vec![text("cents")]]);
+    assert_eq!(seed_versions(&conn), vec![vec![text("seed_items"), int(2)]]);
+    conn.execute("CREATE TYPE dollars BASE integer").unwrap();
+    conn.execute("DROP TYPE cents").unwrap();
+    assert_eq!(stored_type_names(&conn), vec![vec![text("dollars")]]);
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn refill_leaves_the_types_table_wal() {
+    refill_leaves_the_types_table(false);
+}
+
+#[test]
+fn refill_leaves_the_types_table_mvcc() {
+    refill_leaves_the_types_table(true);
+}
+
+/// A newer binary whose seed has another seed row range does not fill the
+/// table again: a row that the catalog wrote outside the old range can be
+/// inside the new one, and a refill would delete it. The statement fails
+/// and changes nothing.
+fn changed_seed_row_range_refuses_the_refill(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    let older_items = SeedDialect::new().items().rows.clone();
+    {
+        let dialect = SeedDialect::with_item_rows(
+            older_items.clone(),
+            SeedRowRange {
+                column: "oid",
+                range: 0..100,
+            },
+            &[],
+        );
+        let db = open(&path, dialect, mvcc);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE far1 (a)").unwrap();
+        conn.close().unwrap();
+    }
+    let mut seeds = newer_seeds();
+    seeds.item_rows = SeedRowRange {
+        column: "oid",
+        range: 0..200,
+    };
+    let dialect = SeedDialect::with_seeds(seeds, &[]);
+    let db = open(&path, dialect.clone(), mvcc);
+    let conn = db.connect_limbo();
+    let expected = {
+        let mut expected = seed_item_rows();
+        expected.push(vec![
+            int(150),
+            text("far1"),
+            text("user table"),
+            SqlValue::Null,
+        ]);
+        expected
+    };
+    assert_eq!(all_items(&conn), expected);
+    let err = error_of(&conn, "CREATE TABLE t2 (a)");
+    assert!(
+        err.contains(
+            "cannot fill seeded table seed_items again: its seed row range changed from \
+             oid at least 0 and less than 100 to oid at least 0 and less than 200"
+        ),
+        "{err}"
+    );
+    assert_eq!(dialect.items().calls(), (0, 0));
+    assert_eq!(all_items(&conn), expected);
+    assert_eq!(
+        rows(&conn, "SELECT * FROM __turso_internal_seed_versions"),
+        vec![vec![
+            text("seed_items"),
+            int(1),
+            text("oid"),
+            int(0),
+            int(100)
+        ]]
+    );
+    let err = error_of(&conn, "SELECT * FROM t2");
+    assert!(err.contains("no such table"), "{err}");
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn changed_seed_row_range_refuses_the_refill_wal() {
+    changed_seed_row_range_refuses_the_refill(false);
+}
+
+#[test]
+fn changed_seed_row_range_refuses_the_refill_mvcc() {
+    changed_seed_row_range_refuses_the_refill(true);
+}
+
+/// A refill bumps the schema cookie although it changes no schema row. A
+/// statement that writes a temporary table changes only the cookie of the
+/// temp database, but its catalog row fills `seed_items` of the main
+/// database again. A statement that another connection prepared before
+/// must then prepare again: it sees the new version and does not fill the
+/// table a second time.
+fn refill_makes_other_connections_prepare_again(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    store_both_tables(&path, SeedDialect::new(), mvcc, false);
+    let dialect = SeedDialect::newer();
+    let db = open(&path, dialect.clone(), mvcc);
+    let a = db.connect_limbo();
+    let b = db.connect_limbo();
+    let mut prepared = b.prepare("CREATE TABLE b1 (a)").unwrap();
+
+    let program = opcodes(&a, "CREATE TEMP TABLE tempwrite1 (a)");
+    assert_eq!(count_opcode(&program, "VOpen"), 1, "{program:?}");
+    a.execute("CREATE TEMP TABLE tempwrite1 (a)").unwrap();
+    assert_eq!(seed_versions(&b)[0], vec![text("seed_items"), int(2)]);
+
+    dialect.items().reset();
+    prepared.run_ignore_rows().unwrap();
+    assert_eq!(dialect.items().calls(), (0, 0), "no second refill");
+    assert_eq!(
+        all_items(&b),
+        newer_items_with_user_tables(&["t1", "words1", "tempwrite1", "b1"])
+    );
+    assert_eq!(seed_versions(&b)[0], vec![text("seed_items"), int(2)]);
+    assert_eq!(turso_integrity_check(&b), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn refill_makes_other_connections_prepare_again_wal() {
+    refill_makes_other_connections_prepare_again(false);
+}
+
+#[test]
+fn refill_makes_other_connections_prepare_again_mvcc() {
+    refill_makes_other_connections_prepare_again(true);
+}
+
+/// How a test rolls back a refill.
+#[derive(Clone, Copy, Debug)]
+enum RefillRollback {
+    /// The statement fails after the refill in autocommit mode: the
+    /// catalog's row has the oid of a seed row.
+    FailedStatement,
+    /// The same statement fails inside a transaction, which goes on.
+    FailedStatementInTransaction,
+    /// The statement succeeds inside a transaction, and ROLLBACK ends it.
+    Rollback,
+}
+
+/// A refill that is rolled back leaves the old seed rows, the old version
+/// and every row that the catalog wrote. The next write fills the table
+/// again, once.
+fn rolled_back_refill_leaves_old_rows(mvcc: bool, rollback: RefillRollback) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    store_both_tables(&path, SeedDialect::new(), mvcc, false);
+    let dialect = SeedDialect::newer();
+    let db = open(&path, dialect.clone(), mvcc);
+    let conn = db.connect_limbo();
+    let other = db.connect_limbo();
+    let unchanged = |conn: &Arc<Connection>| {
+        assert_eq!(
+            all_items(conn),
+            items_with_user_tables(&["t1", "words1"]),
+            "{rollback:?}"
+        );
+        assert_eq!(
+            seed_versions(conn)[0],
+            vec![text("seed_items"), int(1)],
+            "{rollback:?}"
+        );
+    };
+    match rollback {
+        RefillRollback::FailedStatement => {
+            let err = error_of(&conn, "CREATE TABLE dup1 (a)");
+            assert!(err.contains("UNIQUE constraint failed"), "{err}");
+        }
+        RefillRollback::FailedStatementInTransaction => {
+            conn.execute("BEGIN").unwrap();
+            let err = error_of(&conn, "CREATE TABLE dup1 (a)");
+            assert!(err.contains("UNIQUE constraint failed"), "{err}");
+            unchanged(&conn);
+        }
+        RefillRollback::Rollback => {
+            conn.execute("BEGIN").unwrap();
+            conn.execute("CREATE TABLE t2 (a)").unwrap();
+            assert_eq!(seed_versions(&conn)[0], vec![text("seed_items"), int(2)]);
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+    unchanged(&conn);
+    unchanged(&other);
+
+    dialect.items().reset();
+    conn.execute("CREATE TABLE t3 (a)").unwrap();
+    conn.execute("CREATE TABLE t4 (a)").unwrap();
+    // One refill reads each of the 3 seed rows once.
+    assert_eq!(dialect.items().calls(), (0, 3), "one refill");
+    if !conn.get_auto_commit() {
+        conn.execute("COMMIT").unwrap();
+    }
+    assert_eq!(
+        user_table_rows(&other),
+        vec![
+            vec![text("t1")],
+            vec![text("words1")],
+            vec![text("t3")],
+            vec![text("t4")],
+        ]
+    );
+    assert_eq!(
+        rows(&other, "SELECT * FROM seed_items WHERE oid < 31"),
+        newer_items_with_user_tables(&[])
+    );
+    assert_eq!(seed_versions(&other)[0], vec![text("seed_items"), int(2)]);
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
+}
+
+#[test]
+fn failed_statement_rolls_back_the_refill_wal() {
+    rolled_back_refill_leaves_old_rows(false, RefillRollback::FailedStatement);
+}
+
+#[test]
+fn failed_statement_rolls_back_the_refill_mvcc() {
+    rolled_back_refill_leaves_old_rows(true, RefillRollback::FailedStatement);
+}
+
+#[test]
+fn failed_statement_in_transaction_rolls_back_the_refill_wal() {
+    rolled_back_refill_leaves_old_rows(false, RefillRollback::FailedStatementInTransaction);
+}
+
+#[test]
+fn failed_statement_in_transaction_rolls_back_the_refill_mvcc() {
+    rolled_back_refill_leaves_old_rows(true, RefillRollback::FailedStatementInTransaction);
+}
+
+#[test]
+fn rollback_rolls_back_the_refill_wal() {
+    rolled_back_refill_leaves_old_rows(false, RefillRollback::Rollback);
+}
+
+#[test]
+fn rollback_rolls_back_the_refill_mvcc() {
+    rolled_back_refill_leaves_old_rows(true, RefillRollback::Rollback);
+}
+
+/// A stored row inside the seed row range belongs to the seed, also when
+/// the old seed did not have it, as in a file that another program wrote.
+/// A refill deletes it with the old seed rows: that is the contract of the
+/// range.
+#[test]
+fn refill_deletes_a_row_inside_the_range_that_the_seed_did_not_have() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = new_path(&dir);
+    store_both_tables(&path, SeedDialect::new(), false, true);
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute(
+            "INSERT INTO seed_items VALUES (15, 'crafted', NULL, NULL)",
+            [],
+        )
+        .unwrap();
+    drop(sqlite);
+
+    let db = open(&path, SeedDialect::newer(), false);
+    let conn = db.connect_limbo();
+    assert_eq!(
+        rows(&conn, "SELECT name FROM seed_items WHERE oid = 15"),
+        vec![vec![text("crafted")]]
+    );
+    conn.execute("CREATE TABLE t2 (a)").unwrap();
+    assert_eq!(
+        all_items(&conn),
+        newer_items_with_user_tables(&["t1", "words1", "t2"])
+    );
+    assert!(rows(&conn, "SELECT oid FROM seed_items WHERE name = 'crafted'").is_empty());
+    assert_eq!(turso_integrity_check(&conn), vec![vec![text("ok")]]);
 }

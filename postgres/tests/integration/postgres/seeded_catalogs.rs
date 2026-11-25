@@ -519,6 +519,69 @@ fn database_written_before_the_catalogs_had_rows_opens() {
     );
 }
 
+/// A database that the release before seed versions wrote opens without a
+/// change: it has no stored seeded table, so the open and the reads of the
+/// catalogs write nothing, and no table of seed versions appears.
+#[test]
+fn database_written_before_seed_versions_stays_unchanged() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("integration/postgres/fixtures");
+    let dir = tempfile::tempdir().unwrap();
+    let mut before = Vec::new();
+    for suffix in ["", "-log"] {
+        let to = dir.path().join(format!("{OLD_DATABASE}{suffix}"));
+        std::fs::copy(fixtures.join(format!("{OLD_DATABASE}{suffix}")), &to).unwrap();
+        before.push((to.clone(), std::fs::read(&to).unwrap()));
+    }
+    let path = dir.path().join(OLD_DATABASE);
+    {
+        let (_io, db) = turso_pg::open_database(
+            path.to_str().unwrap(),
+            None,
+            turso_core::OpenFlags::default(),
+            turso_pg::tursopg_database_opts(),
+        )
+        .unwrap();
+        let conn = turso_pg::Connection::connect(&db).unwrap();
+        for (catalog, _, row_count) in CATALOGS {
+            assert_eq!(
+                rows(&conn, &format!("SELECT count(*) FROM pg_catalog.{catalog}")),
+                vec![vec![int(row_count as i64)]]
+            );
+        }
+        // No seeded table and no table of seed versions is stored.
+        let core = db
+            .connect(turso_core::ConnectOpts::new(
+                turso_core::SessionRole::Superuser,
+            ))
+            .unwrap();
+        let tables: Vec<String> = core
+            .pragma_query("table_list")
+            .unwrap()
+            .iter()
+            .map(|row| row[1].to_string())
+            .collect();
+        // The table `items` of the namespace `public`.
+        assert!(
+            tables.iter().any(|table| table == "__turso_ns1_items"),
+            "{tables:?}"
+        );
+        assert!(
+            !tables
+                .iter()
+                .any(|table| table.starts_with("__turso_internal_seed")
+                    || CATALOGS.iter().any(|(catalog, _, _)| table == catalog)),
+            "{tables:?}"
+        );
+    }
+    for (file, bytes) in before {
+        assert!(
+            std::fs::read(&file).unwrap() == bytes,
+            "{} changed",
+            file.display()
+        );
+    }
+}
+
 /// The catalogs whose rows refer to functions keep no rows and the columns
 /// they had, and every role gets 42501 for a change, as before.
 fn catalogs_that_refer_to_functions_are_empty(mvcc: bool) {

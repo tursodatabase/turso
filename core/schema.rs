@@ -1676,6 +1676,12 @@ impl Schema {
         self.namespace_names_loaded
     }
 
+    /// The seed that filled the stored seeded table `name`, or None when
+    /// the table of seed versions has no row for it. `name` is normalized.
+    pub(crate) fn seed_version(&self, name: &str) -> Option<&StoredSeed> {
+        self.seed_versions.get(name)
+    }
+
     /// Records that `seed` filled the stored seeded table `name`. `name` is
     /// normalized.
     pub(crate) fn set_seed_version(&mut self, name: &str, seed: StoredSeed) {

@@ -8,7 +8,7 @@ use crate::dialect::seeded::{
 use crate::dialect::CmdContext;
 use crate::error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_ERROR};
 use crate::namespace::NamespaceId;
-use crate::schema::{BTreeTable, Index, Table, TURSO_SEED_VERSIONS_TABLE_NAME};
+use crate::schema::{BTreeTable, Index, StoredSeed, Table, TURSO_SEED_VERSIONS_TABLE_NAME};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
@@ -53,6 +53,14 @@ enum RowOwner {
 /// indexes. Otherwise it creates the table and its indexes, writes their
 /// `sqlite_schema` rows, makes the schema read them, and copies the seed
 /// rows into the table.
+///
+/// When the stored table of a catalog was filled by a seed of another
+/// version than the seed in the binary, the statement first fills it again:
+/// see [`emit_refill`]. The refill happens only here, on the first write of
+/// the table after the seed changed. Until a statement writes the table,
+/// the stored seed rows stay old for SQL readers, while name resolution
+/// uses the seed in the binary. A stored table without a version row was
+/// not filled by this code, and core never fills it again.
 pub(crate) fn open_seeded_table_for_write(
     ctx: &CmdContext<'_>,
     program: &mut ProgramBuilder,
@@ -82,7 +90,21 @@ pub(crate) fn open_seeded_table_for_write(
     });
     match in_schema {
         Some(table) => match table.as_ref() {
-            Table::BTree(btree) => open_stored_table(ctx, program, form, btree.clone()),
+            Table::BTree(btree) => {
+                let writer = open_stored_table(ctx, program, form, btree.clone())?;
+                let stored_seed = resolver.with_schema(MAIN_DB_ID, |schema| {
+                    schema.seed_version(&form.name).cloned()
+                });
+                // A seeded table of core has no seed in the binary to compare.
+                if let (Some(stored_seed), Some(binary_seed)) = (stored_seed, form.seed_of_binary())
+                {
+                    if stored_seed.version != binary_seed.version {
+                        refuse_changed_seed_row_range(&form.name, &stored_seed, &binary_seed)?;
+                        emit_refill(ctx, program, form, &writer)?;
+                    }
+                }
+                Ok(writer)
+            }
             _ if connection
                 .db
                 .seeded_tables
@@ -165,6 +187,120 @@ fn open_stored_table(
         indexes: index_cursors,
         seed_rows: form.seed_rows.clone(),
     })
+}
+
+/// Refuses to fill the stored table `name` again when the seed in the
+/// binary has another seed row range than the seed that filled it. The
+/// catalog wrote its rows outside the old range, and some of them can be
+/// inside the new range, where a refill would delete them. An error is
+/// better than lost rows.
+fn refuse_changed_seed_row_range(
+    name: &str,
+    stored: &StoredSeed,
+    binary: &StoredSeed,
+) -> Result<()> {
+    if stored.column.eq_ignore_ascii_case(&binary.column) && stored.range == binary.range {
+        return Ok(());
+    }
+    bail_parse_error!(
+        "cannot fill seeded table {name} again: its seed row range changed from {} at least {} \
+         and less than {} to {} at least {} and less than {}, and rows that are not seed rows \
+         can be in the new range",
+        stored.column,
+        stored.range.start,
+        stored.range.end,
+        binary.column,
+        binary.range.start,
+        binary.range.end
+    )
+}
+
+/// Fills the stored table of `form` again with the seed rows of the binary,
+/// in the transaction of the statement. It deletes the rows inside the seed
+/// row range, with their index entries, and copies the seed rows in. A
+/// table without an `INTEGER PRIMARY KEY` gives the copied rows new rowids,
+/// because rows that the catalog wrote can have the rowids of the seed.
+/// Then it writes the new version to the table of seed versions and to the
+/// schema. It writes nothing else: rows outside the range stay as they are.
+///
+/// The refill bumps the schema cookie, although it changes no
+/// `sqlite_schema` row. The seed version is part of the schema of each
+/// connection, and the cookie makes the other connections read the schema
+/// again and prepare their statements again, so that they do not fill the
+/// table a second time.
+fn emit_refill(
+    ctx: &CmdContext<'_>,
+    program: &mut ProgramBuilder,
+    form: &StoredForm,
+    writer: &SeededTableWriter,
+) -> Result<()> {
+    let Some(seed_rows) = &form.seed_rows else {
+        unreachable!("a seeded table of a catalog has a seed row range");
+    };
+    emit_delete_seed_rows(program, writer, seed_rows);
+    if !form.seeded_table.seed.is_empty() {
+        emit_fill(program, form, writer, false);
+    }
+    emit_record_seed_version(ctx, program, form)?;
+    emit_schema_cookie(ctx.resolver, program);
+    Ok(())
+}
+
+/// Deletes the rows of the table of `writer` whose seed row column is in
+/// the range of `seed_rows`, with their index entries, as
+/// `DELETE FROM t WHERE column >= start AND column < end` does.
+fn emit_delete_seed_rows(
+    program: &mut ProgramBuilder,
+    writer: &SeededTableWriter,
+    seed_rows: &SeedRowColumn,
+) {
+    let cursor_id = writer.cursor_id();
+    let bounds_reg = program.alloc_registers(2);
+    program.emit_insn(Insn::Integer {
+        value: seed_rows.range.start,
+        dest: bounds_reg,
+    });
+    program.emit_insn(Insn::Integer {
+        value: seed_rows.range.end,
+        dest: bounds_reg + 1,
+    });
+    let done = program.allocate_label();
+    let next_row = program.allocate_label();
+    let keep = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id,
+        pc_if_empty: done,
+    });
+    program.preassign_label_to_next_insn(next_row);
+    let value_reg = program.alloc_register();
+    program.emit_column_or_rowid(cursor_id, seed_rows.position, value_reg);
+    program.emit_insn(Insn::IsNull {
+        reg: value_reg,
+        target_pc: keep,
+    });
+    program.emit_insn(Insn::Lt {
+        lhs: value_reg,
+        rhs: bounds_reg,
+        target_pc: keep,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+    program.emit_insn(Insn::Ge {
+        lhs: value_reg,
+        rhs: bounds_reg + 1,
+        target_pc: keep,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+    writer.emit_delete(program);
+    program.preassign_label_to_next_insn(keep);
+    program.emit_insn(Insn::Next {
+        cursor_id,
+        pc_if_next: next_row,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(done);
 }
 
 /// Creates the B-trees of the table and of its indexes, writes their
@@ -267,7 +403,7 @@ fn store_seeded_table(
         seed_rows: form.seed_rows.clone(),
     };
     if !form.seeded_table.seed.is_empty() {
-        emit_fill(program, form, &writer);
+        emit_fill(program, form, &writer, true);
     }
     // A seeded table of core has no read-only table and no version: its
     // seed is empty and stays empty.
@@ -277,10 +413,17 @@ fn store_seeded_table(
     Ok(writer)
 }
 
-/// Copies the seed rows into the new table, as
+/// Copies the seed rows into the table, as
 /// `INSERT INTO t SELECT rowid, * FROM <read-only table>` does: a scan of the
-/// read-only table, and an insert of each row with its rowid.
-fn emit_fill(program: &mut ProgramBuilder, form: &StoredForm, writer: &SeededTableWriter) {
+/// read-only table, and an insert of each row. When `seed_rowids` is true,
+/// each row gets the rowid that the read-only table gives it. Otherwise a
+/// table without an `INTEGER PRIMARY KEY` gives each row a new rowid.
+fn emit_fill(
+    program: &mut ProgramBuilder,
+    form: &StoredForm,
+    writer: &SeededTableWriter,
+    seed_rowids: bool,
+) {
     let read_only = form
         .read_only
         .as_ref()
@@ -309,12 +452,15 @@ fn emit_fill(program: &mut ProgramBuilder, form: &StoredForm, writer: &SeededTab
             dest: values_reg + column,
         });
     }
-    let rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::RowId {
-        cursor_id,
-        dest: rowid_reg,
+    let rowid_reg = seed_rowids.then(|| {
+        let rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::RowId {
+            cursor_id,
+            dest: rowid_reg,
+        });
+        rowid_reg
     });
-    writer.emit_insert_row(program, values_reg, Some(rowid_reg), RowOwner::Seed);
+    writer.emit_insert_row(program, values_reg, rowid_reg, RowOwner::Seed);
     program.emit_insn(Insn::VNext {
         cursor_id,
         pc_if_next: next_row,
