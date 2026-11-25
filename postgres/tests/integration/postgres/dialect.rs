@@ -1173,7 +1173,7 @@ fn test_postgres_add_column_with_a_default_of_the_wrong_type_fails(db: TempDatab
     assert!(
         error
             .to_string()
-            .contains("a value of type text cannot be assigned to type int8"),
+            .contains("column \"n\" is of type integer but default expression is of type text"),
         "{error}"
     );
     assert!(conn.query("SELECT n FROM t").is_err());

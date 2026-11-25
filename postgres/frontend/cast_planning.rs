@@ -4,10 +4,11 @@
 
 use crate::casts::{convert, resolve, CastType, CastType::*, Resolution};
 use crate::error::sqlstate_error;
+use crate::functions::format_type;
 use turso_core::ast;
 use turso_core::dialect::{CastContext, CastDecision, CastSource, TypeIdentity, TypeRef};
-use turso_core::{LimboError, Register, Result, Value};
-use turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED;
+use turso_core::{DialectError, LimboError, Register, Result, Value};
+use turso_pg_parser::sqlstate::{SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_FEATURE_NOT_SUPPORTED};
 
 /// Decides a CAST of `operand` to `target` as PostgreSQL does when `CASTS`
 /// covers both types, and fails when PostgreSQL has no such cast.
@@ -27,6 +28,34 @@ pub(crate) fn apply_cast(
         _ => operand.clone(),
     };
     Ok(CastDecision::Applied(operand))
+}
+
+/// Fails as PostgreSQL does when the DEFAULT of the column `column_name` has a
+/// type with no assignment cast to `column_type`.
+pub(crate) fn check_column_default(
+    column_name: &str,
+    source: &dyn Fn() -> CastSource,
+    column_type: &TypeRef,
+) -> Result<()> {
+    let Some(cast) = table_cast(source, column_type, CastContext::Assignment)? else {
+        return Ok(());
+    };
+    if resolve(cast.source, cast.target, cast.context).is_ok() {
+        return Ok(());
+    }
+    let type_oid = |name: &str| {
+        crate::catalog::pg_type_oid(name).expect("a type with casts has a pg_type oid")
+    };
+    Err(LimboError::Dialect(Box::new(DialectError {
+        code: SQLSTATE_DATATYPE_MISMATCH,
+        message: format!(
+            "column \"{column_name}\" is of type {} but default expression is of type {}",
+            format_type(type_oid(column_type.name()), -1),
+            format_type(type_oid(cast.source.name()), -1),
+        ),
+        detail: None,
+        hint: Some("You will need to rewrite or cast the expression.".to_string()),
+    })))
 }
 
 /// A cast between two types of `CASTS`, in the context it is resolved in.

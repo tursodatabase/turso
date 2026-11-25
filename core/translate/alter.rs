@@ -1124,6 +1124,7 @@ pub fn translate_alter_table(
             }
 
             check_column_type(&col_def, table_name, btree.is_strict, resolver.schema())?;
+            crate::translate::schema::check_default_type(&column, resolver)?;
             let default_type_mismatch = btree.is_strict && strict_default_type_mismatch(&column)?;
             if btree.is_strict {
                 column.resolve_custom_type(resolver.schema())?;

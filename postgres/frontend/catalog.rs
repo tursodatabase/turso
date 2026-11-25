@@ -307,6 +307,15 @@ impl Dialect for PostgresDialect {
         crate::cast_planning::apply_cast(operand, source, target, context)
     }
 
+    fn check_column_default(
+        &self,
+        column_name: &str,
+        source: &dyn Fn() -> turso_core::dialect::CastSource,
+        column_type: &turso_core::dialect::TypeRef,
+    ) -> Result<()> {
+        crate::cast_planning::check_column_default(column_name, source, column_type)
+    }
+
     fn requires_custom_types(&self) -> bool {
         true
     }

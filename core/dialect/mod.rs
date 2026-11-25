@@ -715,6 +715,18 @@ pub trait Dialect: Send + Sync + 'static {
     ) -> Result<CastDecision> {
         Ok(CastDecision::EngineRules)
     }
+
+    /// Fails when the DEFAULT of the column `column_name` cannot be written to
+    /// a column of the type `column_type`. `source` gives the type of the
+    /// DEFAULT.
+    fn check_column_default(
+        &self,
+        _column_name: &str,
+        _source: &dyn Fn() -> CastSource,
+        _column_type: &TypeRef,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The message of the default [Dialect::undefined_operator_error].
