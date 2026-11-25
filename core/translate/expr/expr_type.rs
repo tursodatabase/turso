@@ -871,6 +871,12 @@ fn binary_type(
             if rhs.is_array() {
                 return rhs;
             }
+            // `||` of two blobs is a blob at runtime (`Value::exec_concat`).
+            if matches!(lhs, ExprType::Builtin(BuiltinType::Blob))
+                && matches!(rhs, ExprType::Builtin(BuiltinType::Blob))
+            {
+                return rhs;
+            }
             ExprType::Builtin(BuiltinType::Text)
         }
         // `->` gives the JSON text of what it extracts, or NULL (SQLite's

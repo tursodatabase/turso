@@ -115,6 +115,17 @@ fn computed_bytea_is_described_as_bytea() {
         ),
         vec![BYTEA_OID]
     );
+    assert_eq!(
+        column_type_oids(&mut client, "SELECT v::bytea || v::bytea AS x FROM t1"),
+        vec![BYTEA_OID]
+    );
+    assert_eq!(
+        column_type_oids(
+            &mut client,
+            "SELECT x FROM (SELECT v::bytea || v::bytea AS x FROM t1) s"
+        ),
+        vec![BYTEA_OID]
+    );
 }
 
 struct TestServer {
