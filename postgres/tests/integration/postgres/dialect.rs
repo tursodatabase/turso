@@ -232,7 +232,6 @@ fn comment_on_a_kind_of_object_without_stored_comments_is_refused(db: TempDataba
         "COMMENT ON DOMAIN email IS 'x'",
         "COMMENT ON TYPE status IS 'x'",
         "COMMENT ON TRIGGER audit_changes ON comment_docs IS 'x'",
-        "COMMENT ON FUNCTION format_comment(integer) IS 'x'",
         "COMMENT ON OPERATOR CLASS int4_ops USING btree IS 'x'",
         "COMMENT ON POLICY access_policy ON comment_docs IS 'x'",
         "COMMENT ON RULE update_rule ON comment_docs IS 'x'",

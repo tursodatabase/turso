@@ -1,16 +1,15 @@
 # CREATE FUNCTION, CREATE PROCEDURE and the statements around them.
 #
-# tursopg does not support functions yet. When PostgreSQL rejects a
-# statement, tursopg gives the same error. Otherwise tursopg names the first
-# feature it does not support. Each gap test has a `@compat-gap` label; when tursopg
-# gives the PostgreSQL answer the tursopg run fails with "gap fixed", and then
-# you delete `@compat-gap` and the `expect @tursopg` block.
+# tursopg supports functions in the SQL language whose body is one SELECT of
+# one expression. When PostgreSQL rejects a statement, tursopg gives the same
+# error. Otherwise tursopg names the first feature it does not support. Each
+# gap test has a `@compat-gap` label; when tursopg gives the PostgreSQL answer
+# the tursopg run fails with "gap fixed", and then you delete `@compat-gap`
+# and the `expect @tursopg` block.
 
 @database :memory:
 
-# A plain SQL function, which is the first kind of function tursopg will
-# support.
-@compat-gap "syntax:create-function"
+# A plain SQL function.
 test sql-function {
     CREATE FUNCTION one() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT one();
@@ -18,12 +17,7 @@ test sql-function {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {
-    CREATE FUNCTION is not supported
-}
 
-@compat-gap "syntax:create-function"
 test sql-function-with-parameter {
     CREATE FUNCTION add_one(int) RETURNS int AS $$ SELECT $1 + 1 $$ LANGUAGE sql;
     SELECT add_one(41);
@@ -31,12 +25,7 @@ test sql-function-with-parameter {
 expect {
     42
 }
-@sqlstate 0A000
-expect @tursopg error {
-    CREATE FUNCTION is not supported
-}
 
-@compat-gap "syntax:create-function"
 test sql-function-in-public-schema {
     CREATE FUNCTION public.one() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT public.one();
@@ -44,12 +33,7 @@ test sql-function-in-public-schema {
 expect {
     1
 }
-@sqlstate 0A000
-expect @tursopg error {
-    CREATE FUNCTION is not supported
-}
 
-@compat-gap "syntax:create-function"
 test sql-function-in-other-schema {
     CREATE SCHEMA app;
     CREATE FUNCTION app.one() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
@@ -57,10 +41,6 @@ test sql-function-in-other-schema {
 }
 expect {
     1
-}
-@sqlstate 0A000
-expect @tursopg error {
-    a schema-qualified function name is not supported
 }
 
 test sql-function-in-missing-schema {
@@ -71,17 +51,12 @@ expect error {
     schema "nosuch" does not exist
 }
 
-@compat-gap "syntax:create-function"
 test create-or-replace-function {
     CREATE OR REPLACE FUNCTION one() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT one();
 }
 expect {
     1
-}
-@sqlstate 0A000
-expect @tursopg error {
-    CREATE OR REPLACE FUNCTION is not supported
 }
 
 @compat-gap "syntax:create-procedure"
@@ -142,17 +117,12 @@ expect error {
 
 # Function bodies
 
-@compat-gap "syntax:create-function"
 test single-quoted-function-body {
     CREATE FUNCTION one() RETURNS int AS 'SELECT 1' LANGUAGE sql;
     SELECT one();
 }
 expect {
     1
-}
-@sqlstate 0A000
-expect @tursopg error {
-    a function body that is not dollar-quoted is not supported
 }
 
 @compat-gap "syntax:create-function"
@@ -309,17 +279,12 @@ expect error {
     cannot determine result data type
 }
 
-@compat-gap "syntax:create-function"
 test named-parameter {
     CREATE FUNCTION add_one(x int) RETURNS int AS $$ SELECT x + 1 $$ LANGUAGE sql;
     SELECT add_one(41);
 }
 expect {
     42
-}
-@sqlstate 0A000
-expect @tursopg error {
-    a named function parameter is not supported
 }
 
 @compat-gap "syntax:create-function"
@@ -438,26 +403,16 @@ expect error {
     type nosuch does not exist
 }
 
-@compat-gap "syntax:create-function"
 test range-parameter {
     CREATE FUNCTION f(int4range) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
 }
 expect {
 }
-@sqlstate 0A000
-expect @tursopg error {
-    CREATE FUNCTION is not supported
-}
 
-@compat-gap "syntax:create-function"
 test pg-lsn-result {
     CREATE FUNCTION f() RETURNS pg_lsn AS $$ SELECT '0/0'::pg_lsn $$ LANGUAGE sql;
 }
 expect {
-}
-@sqlstate 0A000
-expect @tursopg error {
-    CREATE FUNCTION is not supported
 }
 
 test missing-qualified-parameter-type {
@@ -657,7 +612,6 @@ expect error {
 
 # Options
 
-@compat-gap "syntax:create-function"
 test immutable-function {
     CREATE FUNCTION one() RETURNS int IMMUTABLE AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT provolatile FROM pg_proc WHERE proname = 'one';
@@ -665,12 +619,7 @@ test immutable-function {
 expect {
     i
 }
-@sqlstate 0A000
-expect @tursopg error {
-    IMMUTABLE in CREATE FUNCTION is not supported
-}
 
-@compat-gap "syntax:create-function"
 test stable-function {
     CREATE FUNCTION one() RETURNS int STABLE AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT provolatile FROM pg_proc WHERE proname = 'one';
@@ -678,22 +627,13 @@ test stable-function {
 expect {
     s
 }
-@sqlstate 0A000
-expect @tursopg error {
-    STABLE in CREATE FUNCTION is not supported
-}
 
-@compat-gap "syntax:create-function"
 test volatile-function {
     CREATE FUNCTION one() RETURNS int VOLATILE AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT provolatile FROM pg_proc WHERE proname = 'one';
 }
 expect {
     v
-}
-@sqlstate 0A000
-expect @tursopg error {
-    VOLATILE in CREATE FUNCTION is not supported
 }
 
 @compat-gap "syntax:create-function"
@@ -709,7 +649,6 @@ expect @tursopg error {
     WINDOW in CREATE FUNCTION is not supported
 }
 
-@compat-gap "syntax:create-function"
 test leakproof-function {
     CREATE FUNCTION one() RETURNS int LEAKPROOF AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT proleakproof FROM pg_proc WHERE proname = 'one';
@@ -717,22 +656,13 @@ test leakproof-function {
 expect {
     t
 }
-@sqlstate 0A000
-expect @tursopg error {
-    LEAKPROOF in CREATE FUNCTION is not supported
-}
 
-@compat-gap "syntax:create-function"
 test not-leakproof-function {
     CREATE FUNCTION one() RETURNS int NOT LEAKPROOF AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT proleakproof FROM pg_proc WHERE proname = 'one';
 }
 expect {
     f
-}
-@sqlstate 0A000
-expect @tursopg error {
-    NOT LEAKPROOF in CREATE FUNCTION is not supported
 }
 
 @compat-gap "syntax:create-function"
@@ -748,7 +678,6 @@ expect @tursopg error {
     SECURITY DEFINER in CREATE FUNCTION is not supported
 }
 
-@compat-gap "syntax:create-function"
 test security-invoker-function {
     CREATE FUNCTION one() RETURNS int EXTERNAL SECURITY INVOKER AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT prosecdef FROM pg_proc WHERE proname = 'one';
@@ -756,12 +685,7 @@ test security-invoker-function {
 expect {
     f
 }
-@sqlstate 0A000
-expect @tursopg error {
-    SECURITY INVOKER in CREATE FUNCTION is not supported
-}
 
-@compat-gap "syntax:create-function"
 test called-on-null-input-function {
     CREATE FUNCTION one() RETURNS int CALLED ON NULL INPUT AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT proisstrict FROM pg_proc WHERE proname = 'one';
@@ -769,13 +693,8 @@ test called-on-null-input-function {
 expect {
     f
 }
-@sqlstate 0A000
-expect @tursopg error {
-    CALLED ON NULL INPUT in CREATE FUNCTION is not supported
-}
 
 # RETURNS NULL ON NULL INPUT is another spelling of STRICT.
-@compat-gap "syntax:create-function"
 test returns-null-on-null-input-function {
     CREATE FUNCTION one() RETURNS int RETURNS NULL ON NULL INPUT AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT proisstrict FROM pg_proc WHERE proname = 'one';
@@ -783,12 +702,7 @@ test returns-null-on-null-input-function {
 expect {
     t
 }
-@sqlstate 0A000
-expect @tursopg error {
-    STRICT in CREATE FUNCTION is not supported
-}
 
-@compat-gap "syntax:create-function"
 test parallel-function {
     CREATE FUNCTION one() RETURNS int PARALLEL SAFE AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT proparallel FROM pg_proc WHERE proname = 'one';
@@ -796,12 +710,9 @@ test parallel-function {
 expect {
     s
 }
-@sqlstate 0A000
-expect @tursopg error {
-    PARALLEL SAFE in CREATE FUNCTION is not supported
-}
 
-@compat-gap "syntax:create-function"
+# tursopg prints a real as 10.0, where PostgreSQL prints 10.
+@compat-gap "type:float4"
 test cost-function {
     CREATE FUNCTION one() RETURNS int COST 10 AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT procost FROM pg_proc WHERE proname = 'one';
@@ -809,9 +720,8 @@ test cost-function {
 expect {
     10
 }
-@sqlstate 0A000
-expect @tursopg error {
-    COST in CREATE FUNCTION is not supported
+expect @tursopg {
+    10.0
 }
 
 test zero-cost-function {
@@ -941,21 +851,14 @@ expect @tursopg error {
     a named argument in a function call is not supported
 }
 
-# Statements on functions and triggers. No function or trigger can exist, so
-# PostgreSQL rejects them too. To give PostgreSQL's errors, tursopg would have
-# to look the functions and triggers up.
+# Statements on functions and triggers that do not exist.
 
-@compat-gap "syntax:drop-function"
 test drop-function {
     DROP FUNCTION nosuch;
 }
 @sqlstate 42883
 expect error {
     could not find a function named "nosuch"
-}
-@sqlstate 0A000
-expect @tursopg error {
-    DROP FUNCTION is not supported
 }
 
 @compat-gap "syntax:drop-function"
@@ -1072,4 +975,647 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {
     a function parameter of type app\.emp is not supported
+}
+
+# Functions that tursopg defines and expands where they are called.
+
+test create-function-without-parameters {
+    CREATE FUNCTION answer() RETURNS int LANGUAGE sql AS 'SELECT 42';
+    SELECT answer(), answer() + 1;
+}
+expect {
+    42|43
+}
+
+test create-function-reads-a-parameter-by-name {
+    CREATE FUNCTION add_one(x int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT x + 1';
+    SELECT add_one(41), add_one(add_one(1));
+}
+expect {
+    42|3
+}
+
+test create-function-reads-a-parameter-by-number {
+    CREATE FUNCTION twice(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2';
+    SELECT twice(21);
+}
+expect {
+    42
+}
+
+test create-function-with-two-parameters {
+    CREATE FUNCTION label(id int, name text) RETURNS text LANGUAGE sql AS $$ SELECT name || '#' || id::text $$;
+    SELECT label(7, 'row');
+}
+expect {
+    row#7
+}
+
+test create-function-with-language-after-the-body-and-a-semicolon-in-the-body {
+    CREATE FUNCTION answer() RETURNS int AS $$
+        SELECT 42;
+    $$ LANGUAGE sql STABLE;
+    SELECT answer();
+}
+expect {
+    42
+}
+
+test function-reads-a-parameter-twice {
+    CREATE FUNCTION double(x int) RETURNS int LANGUAGE sql AS 'SELECT x + x';
+    CREATE FUNCTION add_one(x int) RETURNS int LANGUAGE sql AS 'SELECT x + 1';
+    SELECT double(4), double(add_one(1)), double(abs(-3)), double(double(1));
+}
+expect {
+    8|4|6|4
+}
+
+test function-returns-a-uuid-and-text {
+    CREATE FUNCTION an_id() RETURNS uuid LANGUAGE sql AS $$ SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid $$;
+    CREATE FUNCTION a_name() RETURNS text LANGUAGE sql AS $$ SELECT 'row' $$;
+    SELECT an_id(), a_name() || '!';
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|row!
+}
+
+test function-argument-is-cast-to-the-parameter-type {
+    CREATE FUNCTION as_id(id uuid) RETURNS text LANGUAGE sql AS 'SELECT id::text';
+    SELECT as_id('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11');
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+test function-calls-another-function {
+    CREATE FUNCTION add_one(x int) RETURNS int LANGUAGE sql AS 'SELECT x + 1';
+    CREATE FUNCTION add_two(x int) RETURNS int LANGUAGE sql AS 'SELECT add_one(add_one(x))';
+    SELECT add_two(40);
+}
+expect {
+    42
+}
+
+test function-body-reads-a-table-in-a-subquery {
+    CREATE TABLE settings (name text PRIMARY KEY, value int);
+    INSERT INTO settings VALUES ('limit', 10);
+    CREATE FUNCTION row_limit() RETURNS int LANGUAGE sql STABLE AS $$ SELECT (SELECT value FROM settings WHERE name = 'limit') $$;
+    SELECT row_limit();
+    UPDATE settings SET value = 20;
+    SELECT row_limit();
+}
+expect {
+    10
+    20
+}
+
+test function-in-where-default-and-view {
+    CREATE FUNCTION current_tenant() RETURNS int LANGUAGE sql STABLE AS $$ SELECT nullif(current_setting('app.tenant', true), '')::int $$;
+    CREATE TABLE notes (id int PRIMARY KEY, tenant int DEFAULT current_tenant(), body text);
+    CREATE VIEW my_notes AS SELECT id, body FROM notes WHERE tenant = current_tenant();
+    SELECT set_config('app.tenant', '1', false);
+    INSERT INTO notes (id, body) VALUES (1, 'one');
+    SELECT set_config('app.tenant', '2', false);
+    INSERT INTO notes (id, body) VALUES (2, 'two'), (3, 'three');
+    SELECT id FROM notes WHERE tenant = current_tenant() ORDER BY id;
+    SELECT * FROM my_notes ORDER BY id;
+    SELECT set_config('app.tenant', '1', false);
+    SELECT * FROM my_notes ORDER BY id;
+}
+expect {
+    1
+    2
+    2
+    3
+    2|two
+    3|three
+    1
+    1|one
+}
+
+test function-in-a-schema {
+    CREATE SCHEMA app;
+    CREATE FUNCTION app.answer() RETURNS int LANGUAGE sql AS 'SELECT 42';
+    SELECT app.answer();
+    SET search_path TO app, public;
+    SELECT answer();
+    CREATE FUNCTION seven() RETURNS int LANGUAGE sql AS 'SELECT 7';
+    SELECT app.seven();
+}
+expect {
+    42
+    42
+    7
+}
+
+test function-of-a-schema-is-not-found-without-the-schema {
+    CREATE SCHEMA app;
+    CREATE FUNCTION app.answer() RETURNS int LANGUAGE sql AS 'SELECT 42';
+    SELECT answer();
+}
+@sqlstate 42883
+expect error {
+    function answer\(\) does not exist
+}
+@sqlstate 42883
+expect @tursopg error {
+    no such function: answer
+}
+
+test functions-with-the-same-name-and-different-numbers-of-parameters {
+    CREATE FUNCTION pick(a int) RETURNS int LANGUAGE sql AS 'SELECT a';
+    CREATE FUNCTION pick(a int, b int) RETURNS int LANGUAGE sql AS 'SELECT b';
+    SELECT pick(1), pick(1, 2);
+}
+expect {
+    1|2
+}
+
+test create-or-replace-function-changes-the-body {
+    CREATE FUNCTION answer() RETURNS int LANGUAGE sql AS 'SELECT 1';
+    CREATE VIEW answers AS SELECT answer() AS a;
+    CREATE OR REPLACE FUNCTION answer() RETURNS int LANGUAGE sql AS 'SELECT 42';
+    SELECT answer();
+    SELECT a FROM answers;
+}
+expect {
+    42
+    42
+}
+
+test create-function-that-exists-errors {
+    CREATE FUNCTION answer() RETURNS int LANGUAGE sql AS 'SELECT 1';
+    CREATE FUNCTION answer() RETURNS int LANGUAGE sql AS 'SELECT 2';
+}
+@sqlstate 42723
+expect error {
+    function "answer" already exists with same argument types
+}
+
+test create-or-replace-function-with-another-return-type-errors {
+    CREATE FUNCTION answer() RETURNS int LANGUAGE sql AS 'SELECT 1';
+    CREATE OR REPLACE FUNCTION answer() RETURNS text LANGUAGE sql AS $$ SELECT 'x' $$;
+}
+@sqlstate 42P13
+expect error {
+    cannot change return type of existing function
+}
+
+test create-function-without-language-errors {
+    CREATE FUNCTION answer() RETURNS int AS 'SELECT 1';
+}
+@sqlstate 42P13
+expect error {
+    no language specified
+}
+
+test create-function-in-a-missing-schema-errors {
+    CREATE FUNCTION nowhere.answer() RETURNS int LANGUAGE sql AS 'SELECT 1';
+}
+@sqlstate 3F000
+expect error {
+    schema "nowhere" does not exist
+}
+
+test create-function-whose-body-names-a-missing-column-errors {
+    CREATE FUNCTION broken(x int) RETURNS int LANGUAGE sql AS 'SELECT y';
+}
+@sqlstate 42703
+expect error {
+    column "y" does not exist
+}
+
+test create-function-whose-body-names-a-missing-parameter-errors {
+    CREATE FUNCTION broken(x int) RETURNS int LANGUAGE sql AS 'SELECT $2';
+}
+@sqlstate 42P02
+expect error {
+    there is no parameter \$2
+}
+
+test create-function-whose-body-calls-a-missing-function-errors {
+    CREATE FUNCTION broken() RETURNS int LANGUAGE sql AS 'SELECT no_such_function(1)';
+}
+@sqlstate 42883
+expect error {
+    function no_such_function\(integer\) does not exist
+}
+@sqlstate 42883
+expect @tursopg error {
+    no such function: no_such_function
+}
+
+test create-function-is-undone-by-rollback {
+    BEGIN;
+    CREATE FUNCTION answer() RETURNS int LANGUAGE sql AS 'SELECT 42';
+    SELECT answer();
+    ROLLBACK;
+    SELECT count(*) FROM pg_proc WHERE proname = 'answer';
+    CREATE FUNCTION answer() RETURNS int LANGUAGE sql AS 'SELECT 43';
+    SELECT answer();
+}
+expect {
+    42
+    0
+    43
+}
+
+test create-function-is-undone-by-rollback-to-savepoint {
+    BEGIN;
+    CREATE FUNCTION kept() RETURNS int LANGUAGE sql AS 'SELECT 1';
+    SAVEPOINT s;
+    CREATE FUNCTION dropped() RETURNS int LANGUAGE sql AS 'SELECT 2';
+    CREATE OR REPLACE FUNCTION kept() RETURNS int LANGUAGE sql AS 'SELECT 3';
+    ROLLBACK TO SAVEPOINT s;
+    COMMIT;
+    SELECT kept();
+    SELECT count(*) FROM pg_proc WHERE proname = 'dropped';
+}
+expect {
+    1
+    0
+}
+
+test pg-proc-lists-a-function {
+    CREATE FUNCTION label(id int, name text) RETURNS text LANGUAGE sql STABLE AS 'SELECT name';
+    SELECT proname, pronargs, provolatile, prosrc, proargnames, prorettype, proargtypes, prolang, oid >= 16384
+    FROM pg_proc WHERE proname = 'label';
+    SELECT n.nspname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.proname = 'label';
+}
+expect {
+    label|2|s|SELECT name|{id,name}|25|23 25|14|t
+    public
+}
+
+test pg-proc-quotes-argument-names-as-postgres-does {
+    CREATE FUNCTION odd_names(int, "a b" int, "null" int, "q""t" int, x int) RETURNS int LANGUAGE sql AS 'SELECT 1';
+    SELECT proargnames FROM pg_proc WHERE proname = 'odd_names';
+}
+expect {
+    {"","a b","null","q\"t",x}
+}
+
+test drop-function-removes-the-function {
+    CREATE FUNCTION answer() RETURNS int LANGUAGE sql AS 'SELECT 42';
+    DROP FUNCTION answer();
+    SELECT count(*) FROM pg_proc WHERE proname = 'answer';
+    CREATE FUNCTION answer() RETURNS int LANGUAGE sql AS 'SELECT 43';
+    DROP FUNCTION answer;
+    SELECT count(*) FROM pg_proc WHERE proname = 'answer';
+}
+expect {
+    0
+    0
+}
+
+test drop-function-with-arguments-drops-the-function-with-that-many {
+    CREATE FUNCTION pick(a int) RETURNS int LANGUAGE sql AS 'SELECT a';
+    CREATE FUNCTION pick(a int, b int) RETURNS int LANGUAGE sql AS 'SELECT b';
+    DROP FUNCTION pick(int);
+    SELECT pick(1, 2);
+    SELECT count(*) FROM pg_proc WHERE proname = 'pick';
+}
+expect {
+    2
+    1
+}
+
+test call-of-a-dropped-function-errors {
+    CREATE FUNCTION answer() RETURNS int LANGUAGE sql AS 'SELECT 42';
+    DROP FUNCTION answer();
+    SELECT answer();
+}
+@sqlstate 42883
+expect error {
+    function answer\(\) does not exist
+}
+@sqlstate 42883
+expect @tursopg error {
+    no such function: answer
+}
+
+test drop-function-that-does-not-exist-errors {
+    DROP FUNCTION nothing();
+}
+@sqlstate 42883
+expect error {
+    function nothing\(\) does not exist
+}
+
+test drop-function-without-arguments-that-does-not-exist-errors {
+    DROP FUNCTION nothing;
+}
+@sqlstate 42883
+expect error {
+    could not find a function named "nothing"
+}
+
+test drop-function-if-exists-that-does-not-exist {
+    DROP FUNCTION IF EXISTS nothing();
+    DROP FUNCTION IF EXISTS nowhere.nothing();
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test drop-function-name-that-two-functions-have-errors {
+    CREATE FUNCTION pick(a int) RETURNS int LANGUAGE sql AS 'SELECT a';
+    CREATE FUNCTION pick(a int, b int) RETURNS int LANGUAGE sql AS 'SELECT b';
+    DROP FUNCTION pick;
+}
+@sqlstate 42725
+expect error {
+    function name "pick" is not unique
+}
+
+test drop-schema-with-a-function-needs-cascade {
+    CREATE SCHEMA app;
+    CREATE FUNCTION app.answer() RETURNS int LANGUAGE sql AS 'SELECT 42';
+    DROP SCHEMA app;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop schema app because other objects depend on it
+}
+@sqlstate 2BP01
+expect @tursopg error {
+    cannot drop schema "app" because other objects depend on it
+}
+
+test drop-schema-cascade-drops-its-functions {
+    CREATE SCHEMA app;
+    CREATE FUNCTION app.answer() RETURNS int LANGUAGE sql AS 'SELECT 42';
+    DROP SCHEMA app CASCADE;
+    SELECT count(*) FROM pg_proc WHERE proname = 'answer';
+    CREATE SCHEMA app;
+    CREATE FUNCTION app.answer() RETURNS int LANGUAGE sql AS 'SELECT 43';
+    SELECT app.answer();
+}
+expect {
+    0
+    43
+}
+
+# Calls
+
+@compat-gap "syntax:create-function"
+test function-that-calls-itself-in-a-subquery-errors-when-called {
+    CREATE FUNCTION h() RETURNS int LANGUAGE sql AS 'SELECT 1';
+    CREATE OR REPLACE FUNCTION h() RETURNS int LANGUAGE sql AS $$ SELECT (SELECT h()) $$;
+    SELECT h();
+}
+@sqlstate 54001
+expect error {
+    stack depth limit exceeded
+}
+@sqlstate 0A000
+expect @tursopg error {
+    function h calls itself, which is not supported
+}
+
+@compat-gap "syntax:create-function"
+test functions-that-call-each-other-in-subqueries-error-when-called {
+    CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1';
+    CREATE FUNCTION g() RETURNS int LANGUAGE sql AS $$ SELECT (SELECT f()) + 1 $$;
+    CREATE OR REPLACE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT (SELECT g()) + 1 $$;
+    SELECT g();
+}
+@sqlstate 54001
+expect error {
+    stack depth limit exceeded
+}
+@sqlstate 0A000
+expect @tursopg error {
+    function g calls itself, which is not supported
+}
+
+test call-of-a-sql-function-with-over-errors {
+    CREATE FUNCTION ten(x int) RETURNS int LANGUAGE sql AS 'SELECT x * 10';
+    SELECT ten(1) OVER ();
+}
+@sqlstate 42809
+expect error {
+    OVER specified, but ten is not a window function nor an aggregate function
+}
+@sqlstate 42809
+expect @tursopg error {
+    ten may not be used as a window function
+}
+
+test call-of-a-sql-function-with-filter-errors {
+    CREATE FUNCTION ten(x int) RETURNS int LANGUAGE sql AS 'SELECT x * 10';
+    SELECT ten(1) FILTER (WHERE true);
+}
+@sqlstate 42809
+expect error {
+    FILTER specified, but ten is not an aggregate function
+}
+@sqlstate 42809
+expect @tursopg error {
+    FILTER may not be used with non-aggregate ten\(\)
+}
+
+test call-of-a-sql-function-with-distinct-errors {
+    CREATE FUNCTION ten(x int) RETURNS int LANGUAGE sql AS 'SELECT x * 10';
+    SELECT ten(DISTINCT 1);
+}
+@sqlstate 42809
+expect error {
+    DISTINCT specified, but ten is not an aggregate function
+}
+@sqlstate 42809
+expect @tursopg error {
+    DISTINCT may not be used with non-aggregate ten\(\)
+}
+
+test call-of-a-sql-function-with-order-by-errors {
+    CREATE FUNCTION ten(x int) RETURNS int LANGUAGE sql AS 'SELECT x * 10';
+    SELECT ten(1 ORDER BY 1);
+}
+@sqlstate 42809
+expect error {
+    ORDER BY specified, but ten is not an aggregate function
+}
+@sqlstate 42809
+expect @tursopg error {
+    ORDER BY may not be used with non-aggregate ten\(\)
+}
+
+@compat-gap "syntax:create-function"
+test sql-function-in-an-index-expression {
+    CREATE FUNCTION ten(x int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT x * 10';
+    CREATE TABLE t (a int);
+    CREATE INDEX t_ten ON t (ten(a));
+    SELECT 1;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    function ten is not supported in an index
+}
+
+@compat-gap "syntax:create-function"
+test sql-function-in-the-where-clause-of-a-partial-index {
+    CREATE FUNCTION ten(x int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT x * 10';
+    CREATE TABLE t (a int);
+    CREATE INDEX t_a ON t (a) WHERE ten(a) > 0;
+    SELECT 1;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    function ten is not supported in an index
+}
+
+@compat-gap "syntax:create-function"
+test sql-function-in-a-generated-column {
+    CREATE FUNCTION ten(x int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT x * 10';
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (ten(a)) STORED);
+    INSERT INTO t (a) VALUES (2);
+    SELECT b FROM t;
+}
+expect {
+    20
+}
+@sqlstate 0A000
+expect @tursopg error {
+    function ten is not supported in a generated column
+}
+
+# Names
+
+@compat-gap "syntax:create-function"
+test function-name-with-an-uppercase-letter {
+    CREATE FUNCTION "MyFn"() RETURNS int LANGUAGE sql AS 'SELECT 1';
+    SELECT "MyFn"();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    an uppercase letter in the name of CREATE FUNCTION is not supported
+}
+
+@compat-gap "syntax:create-function"
+test function-name-with-a-dot {
+    CREATE FUNCTION "a.b"() RETURNS int LANGUAGE sql AS 'SELECT 4';
+    SELECT "a.b"();
+}
+expect {
+    4
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a dot in the function or schema name of CREATE FUNCTION is not supported
+}
+
+@compat-gap "syntax:create-function"
+test function-in-a-schema-whose-name-has-a-dot {
+    CREATE SCHEMA "my.s";
+    CREATE FUNCTION "my.s".f() RETURNS int LANGUAGE sql AS 'SELECT 5';
+    SELECT "my.s".f();
+}
+expect {
+    5
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a dot in the function or schema name of CREATE FUNCTION is not supported
+}
+
+test call-of-a-name-with-a-dot-does-not-call-a-function-of-a-schema {
+    CREATE SCHEMA a;
+    CREATE FUNCTION a.b() RETURNS int LANGUAGE sql AS 'SELECT 1';
+    SELECT "a.b"();
+}
+@sqlstate 42883
+expect error {
+    function a.b\(\) does not exist
+}
+@sqlstate 42883
+expect @tursopg error {
+    no such function: a.b
+}
+
+@compat-gap "syntax:create-function"
+test function-with-the-name-of-a-built-in-function {
+    CREATE FUNCTION hex(x int) RETURNS text LANGUAGE sql AS $$ SELECT 'h' $$;
+    SELECT hex(5);
+}
+expect {
+    h
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function with the name and number of parameters of the built-in function hex is not supported
+}
+
+@compat-gap "syntax:create-function"
+test function-with-the-name-of-a-function-that-a-cast-calls {
+    CREATE FUNCTION jsonb_in(x text) RETURNS text LANGUAGE sql AS $$ SELECT 'mine' $$;
+    SELECT '{"a":1}'::jsonb;
+}
+expect {
+    {"a": 1}
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function with the name and number of parameters of the built-in function jsonb_in is not supported
+}
+
+test drop-function-of-a-database-name-errors {
+    DROP FUNCTION main.f();
+}
+@sqlstate 3F000
+expect error {
+    schema "main" does not exist
+}
+
+test comment-on-function {
+    CREATE FUNCTION answer() RETURNS int LANGUAGE sql AS 'SELECT 42';
+    COMMENT ON FUNCTION answer() IS 'the answer';
+    SELECT obj_description(oid, 'pg_proc') FROM pg_proc WHERE proname = 'answer';
+    COMMENT ON FUNCTION answer IS NULL;
+    SELECT coalesce(obj_description(oid, 'pg_proc'), '<none>') FROM pg_proc WHERE proname = 'answer';
+}
+expect {
+    the answer
+    <none>
+}
+
+test drop-function-deletes-its-comment {
+    CREATE FUNCTION answer() RETURNS int LANGUAGE sql AS 'SELECT 42';
+    COMMENT ON FUNCTION answer() IS 'goes with the function';
+    DROP FUNCTION answer();
+    SELECT count(*) FROM pg_description WHERE description = 'goes with the function';
+}
+expect {
+    0
+}
+
+test drop-schema-cascade-deletes-the-comments-of-its-functions {
+    CREATE SCHEMA app;
+    CREATE FUNCTION app.answer() RETURNS int LANGUAGE sql AS 'SELECT 42';
+    COMMENT ON FUNCTION app.answer() IS 'goes with the schema';
+    DROP SCHEMA app CASCADE;
+    SELECT count(*) FROM pg_description WHERE description = 'goes with the schema';
+    SELECT count(*) FROM pg_proc WHERE proname = 'answer';
+}
+expect {
+    0
+    0
+}
+
+test comment-on-function-that-does-not-exist-errors {
+    COMMENT ON FUNCTION nosuch() IS 'x';
+}
+@sqlstate 42883
+expect error {
+    function nosuch\(\) does not exist
 }

@@ -3,16 +3,16 @@
 //!
 //! A row names its object as PostgreSQL does: `objoid` is the oid of the
 //! object, `classoid` the oid of the catalog that lists it, and `objsubid`
-//! the number of a column, 0 for the object itself. Relations, their columns
-//! and schemas have comments. `COMMENT ON` any other kind of object is
+//! the number of a column, 0 for the object itself. Relations, their columns,
+//! schemas and functions have comments. `COMMENT ON` any other kind of object is
 //! refused.
 //!
 //! Nothing in memory holds these rows. `COMMENT ON` writes them with
 //! statements of the engine in the user's transaction, and
 //! `obj_description` and `col_description` are queries on the table.
-//! A statement that drops a relation or a column deletes its comments in
-//! its own bytecode, and one that drops a schema is followed by an engine
-//! statement that does.
+//! A statement that drops a relation, a column or a function deletes its
+//! comments in its own bytecode, and one that drops a schema is followed by
+//! an engine statement that does.
 
 use std::sync::Arc;
 
@@ -28,6 +28,7 @@ use turso_pg_parser::sqlstate::{
 };
 use turso_pg_parser::translator::{
     is_catalog_table_name, PgCommentObject, PgCommentOnStmt, PG_CLASS_OID, PG_NAMESPACE_OID,
+    PG_PROC_OID,
 };
 
 use crate::catalog::{key_constraint_names, namespace_oid, PUBLIC_NAMESPACE_OID};
@@ -222,6 +223,24 @@ fn described_object(conn: &Arc<Connection>, object: &PgCommentObject) -> Result<
                 objsubid: 0,
             })
         }
+        PgCommentObject::Function(target) => {
+            let function = crate::sql_functions::find_named_function(conn, &schema, target, false)?
+                .ok_or_else(|| crate::sql_functions::undefined_function(target))?;
+            if !conn.current_role_is_superuser()
+                && !schema_roles(&schema).has_privileges_of(conn.current_role(), function.owner)
+            {
+                return Err(sqlstate_error(
+                    SQLSTATE_INSUFFICIENT_PRIVILEGE,
+                    format!("must be owner of function {}", function.name),
+                    None,
+                ));
+            }
+            Ok(DescribedObject {
+                objoid: function.oid,
+                classoid: PG_PROC_OID,
+                objsubid: 0,
+            })
+        }
         PgCommentObject::Unsupported(kind) => Err(sqlstate_error(
             SQLSTATE_FEATURE_NOT_SUPPORTED,
             format!("COMMENT ON {kind} is not supported"),
@@ -328,18 +347,21 @@ fn check_owner(
     ))
 }
 
-/// What the running statement removes from a relation.
+/// What the running statement drops: a relation, a column of one, or a
+/// function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Dropped {
     /// The relation itself: its comment and the comments of its columns go.
     Relation,
+    /// A function: its comment goes.
+    Function,
     /// The column with this number. Its comment goes, and the comments of
     /// the columns after it move to the numbers those columns now have.
     Column(i64),
 }
 
 /// Deletes the comments that go with what the running statement drops from
-/// the relation with oid `oid`.
+/// the relation or function with oid `oid`.
 pub(crate) fn emit_delete_comments(
     program: &mut ProgramBuilder,
     schema: &Schema,
@@ -358,7 +380,11 @@ pub(crate) fn emit_delete_comments(
     let objoid_reg = program.alloc_register();
     program.emit_int(oid, objoid_reg);
     let classoid_reg = program.alloc_register();
-    program.emit_int(PG_CLASS_OID, classoid_reg);
+    let classoid = match dropped {
+        Dropped::Relation | Dropped::Column(_) => PG_CLASS_OID,
+        Dropped::Function => PG_PROC_OID,
+    };
+    program.emit_int(classoid, classoid_reg);
 
     let loop_end = program.allocate_label();
     program.emit_insn(Insn::Rewind {
@@ -381,7 +407,7 @@ pub(crate) fn emit_delete_comments(
         });
     }
     match dropped {
-        Dropped::Relation => emit_delete_current_row(program, cursor_id),
+        Dropped::Relation | Dropped::Function => emit_delete_current_row(program, cursor_id),
         Dropped::Column(number) => {
             let number_reg = program.alloc_register();
             program.emit_int(number, number_reg);

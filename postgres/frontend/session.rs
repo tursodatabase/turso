@@ -14,6 +14,7 @@ use crate::settings::{
     find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SetRole,
     SettingScope,
 };
+use crate::sql_functions;
 use crate::statement::{PgTxState, PostRunFn, StatementResultKind, TxRole};
 use turso_core::ast::{self};
 use turso_core::dialect::Dialect;
@@ -1249,6 +1250,21 @@ impl DeferredOperation {
                         }
                         drop_relations_commands(conn, stmt)?
                     }
+                    FrontendStmt::CreateFunction(stmt) => {
+                        if conn.is_tx_read_only() {
+                            return Err(LimboError::ReadOnly);
+                        }
+                        vec![ast_statement(sql_functions::create_statement(conn, stmt)?)]
+                    }
+                    FrontendStmt::DropFunction(stmt) => {
+                        if conn.is_tx_read_only() {
+                            return Err(LimboError::ReadOnly);
+                        }
+                        sql_functions::drop_statement(conn, stmt)?
+                            .map(ast_statement)
+                            .into_iter()
+                            .collect()
+                    }
                     FrontendStmt::CopyFrom(stmt) => {
                         *active = Some(crate::Statement::new(prepare_copy_columns(
                             conn,
@@ -1926,6 +1942,8 @@ fn try_prepare_special(
         | FrontendStmt::CreateSchema(_)
         | FrontendStmt::DropSchema(_)
         | FrontendStmt::DropRelations(_)
+        | FrontendStmt::CreateFunction(_)
+        | FrontendStmt::DropFunction(_)
         | FrontendStmt::CopyFrom(_)
         | FrontendStmt::RefreshMatview(_)
         | FrontendStmt::CommentOn(_)
@@ -2023,6 +2041,25 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
         ),
         FrontendStmt::DropSchema(stmt) => {
             PermissionDenied::owner(Action::Drop, Object::Schema(stmt.name.to_lowercase()))
+        }
+        FrontendStmt::CreateFunction(stmt) => PermissionDenied::privilege(
+            Action::Create,
+            Object::Schema(sql_functions::creation_schema_name(
+                conn,
+                stmt.schema.as_deref(),
+            )?),
+        ),
+        FrontendStmt::DropFunction(stmt) => {
+            let name = stmt
+                .functions
+                .first()
+                .map(|function| function.name.as_str())
+                .unwrap_or_default();
+            return Err(sqlstate_error(
+                SQLSTATE_INSUFFICIENT_PRIVILEGE,
+                format!("must be owner of function {name}"),
+                None,
+            ));
         }
         FrontendStmt::CopyFrom(stmt) => {
             PermissionDenied::privilege(Action::Read, Object::File(stmt.filename.clone()))
@@ -2460,7 +2497,9 @@ fn drop_schema_commands(
     }
 
     let objects = schema_objects(conn, &name);
-    if !stmt.cascade && !objects.is_empty() {
+    let namespace = conn.qualifier(&name).expect("the schema exists").target.id;
+    let has_functions = sql_functions::schema_has_functions(conn, namespace);
+    if !stmt.cascade && (!objects.is_empty() || has_functions) {
         return Err(sqlstate_error(
             SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
             format!("cannot drop schema \"{name}\" because other objects depend on it"),
@@ -2508,6 +2547,13 @@ fn drop_schema_commands(
 fn engine_statement(sql: String) -> DeferredStatement {
     DeferredStatement {
         command: DeferredCommand::Engine(sql),
+        context: CommandContext::Default,
+    }
+}
+
+fn ast_statement(stmt: ast::Stmt) -> DeferredStatement {
+    DeferredStatement {
+        command: DeferredCommand::Ast(stmt),
         context: CommandContext::Default,
     }
 }
