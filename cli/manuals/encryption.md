@@ -8,6 +8,8 @@ display_name: "encryption at-rest"
 
 Turso supports transparent at-rest encryption to protect your database files from unauthorized access. Database pages, WAL frames, and MVCC logical logs are encrypted and decrypted with the credentials supplied when opening the database.
 
+New encrypted databases bind each page to its page number, so a page that moves to a different position in the database file or the WAL fails to decrypt. This check does not detect an older copy of a page at the same position. It also does not detect a page from another database that uses the same key, such as a backup, a copy, or the temporary database of an in-place VACUUM, when that page replaces the page at the same position. Encrypted databases that earlier versions of Turso created keep their original encryption format, which does not have this check. Earlier versions of Turso cannot open a database in the new format: they report `Decryption failed for page=1`, which is the same error as for a wrong key.
+
 ## Supported Ciphers
 
 Turso supports multiple encryption algorithms with different performance and security characteristics:

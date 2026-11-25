@@ -1568,7 +1568,14 @@ first 16 bytes):
        Turso Encrypted Header: "Turso" + Version + Cipher ID + Unused
 ```
 
-The current version is 0x00. The cipher IDs are:
+The version byte stores the version of the encryption format, which sets the associated data of every page except page 1:
+
+- Version 1 is the format of new databases. The associated data of a page is its page number as a 4-byte big-endian integer, so a page decrypts only at its own page number. A page that moves to a different page number in the database file or in the WAL fails to decrypt.
+- Version 0 is the format of databases that earlier versions of Turso created. Those pages have no associated data, so a page also decrypts at a different page number. Turso continues to read and write these databases in version 0.
+
+Page 1 always uses its header as associated data, and the header includes the version byte. Turso reads the version byte before it decrypts page 1, and decrypting page 1 authenticates it, so a changed version byte makes page 1 fail to decrypt. The page number does not detect an older copy of a page at the same page number, or the page with the same number from another database that uses the same key. Earlier versions of Turso cannot open a database in version 1.
+
+The cipher IDs are:
 
 | Algorithm | Cipher ID |
 |-----------|-----------|

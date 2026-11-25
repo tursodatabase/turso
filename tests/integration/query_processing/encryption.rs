@@ -854,7 +854,7 @@ fn test_turso_header_structure(db: TempDatabase) -> anyhow::Result<()> {
                 b"Turso",
                 "Magic bytes should be 'Turso' for {description}"
             );
-            assert_eq!(header[5], 0x00, "Version should be 0x00 for {description}");
+            assert_eq!(header[5], 0x01, "Version should be 0x01 for {description}");
             assert_eq!(
                 header[6], expected_cipher_id,
                 "Cipher ID should be {expected_cipher_id} for {description}"
@@ -2931,6 +2931,103 @@ fn moved_encrypted_pages_fail_authentication() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An encrypted database that an earlier version of Turso created has
+/// encryption format version 0, in which pages are not bound to their page
+/// numbers. It must still open, and Turso must keep it in version 0 when it
+/// writes the WAL, checkpoints, runs an in-place VACUUM, and connects through
+/// the cached database, which does not read page 1.
+#[test]
+fn encrypted_databases_in_format_0_keep_their_format() -> anyhow::Result<()> {
+    for cipher in [CIPHER_A, CIPHER_B] {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("format-0.db");
+        std::fs::copy(format_0_fixture(cipher), &path)?;
+        let tmp = TempDatabaseBuilder::new()
+            .with_db_path(&path)
+            .with_encryption(cipher, KEY_A)
+            .build();
+        let conn = tmp.connect_limbo();
+        let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, value FROM t ORDER BY id");
+        assert_eq!(
+            rows,
+            [(1, "one".into()), (2, "two".into()), (3, "three".into())],
+            "{cipher}"
+        );
+        conn.execute("INSERT INTO t VALUES (4, 'four')")?;
+
+        let cached = tmp.connect_limbo();
+        let rows: Vec<(i64,)> = cached.exec_rows("SELECT id FROM t WHERE value = 'four'");
+        assert_eq!(rows, [(4,)], "{cipher}");
+
+        // A new database object reads the new row from a WAL frame in version 0.
+        let wal_copy = dir.path().join("format-0-wal.db");
+        copy_encrypted_test_files(&tmp, &wal_copy)?;
+        let rows: Vec<(i64,)> =
+            connect_encrypted_copy(&wal_copy, cipher)?.exec_rows("SELECT count(*) FROM t");
+        assert_eq!(rows, [(4,)], "{cipher}");
+
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        conn.execute("VACUUM")?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        // The database file now has the page 1 that VACUUM wrote.
+        let wal_size = std::fs::metadata(format!("{}-wal", path.display()))?.len();
+        assert_eq!(wal_size, 0, "{cipher}");
+        let cipher_id = turso_core::CipherMode::try_from(cipher)?.cipher_id();
+        assert_eq!(
+            std::fs::read(&path)?[..7],
+            [b'T', b'u', b'r', b's', b'o', 0, cipher_id],
+            "{cipher}: the database must keep encryption format version 0"
+        );
+        let vacuumed = dir.path().join("format-0-vacuumed.db");
+        copy_encrypted_test_files(&tmp, &vacuumed)?;
+        let conn = connect_encrypted_copy(&vacuumed, cipher)?;
+        let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, value FROM t ORDER BY value");
+        assert_eq!(
+            rows,
+            [
+                (4, "four".into()),
+                (1, "one".into()),
+                (3, "three".into()),
+                (2, "two".into())
+            ],
+            "{cipher}"
+        );
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, [("ok".into(),)], "{cipher}");
+    }
+    Ok(())
+}
+
+/// An external restore cannot change the encryption format of an encrypted
+/// database, because the open pagers keep the format of the database.
+#[test]
+fn encrypted_restore_rejects_another_encryption_format() -> anyhow::Result<()> {
+    for cipher in [CIPHER_A, CIPHER_B] {
+        let tmp = TempDatabaseBuilder::new()
+            .with_encryption(cipher, KEY_A)
+            .build();
+        let owner = tmp.connect_limbo();
+        owner.execute("CREATE TABLE secrets(value TEXT)")?;
+        owner.execute("INSERT INTO secrets VALUES ('protected value')")?;
+        owner.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let original = std::fs::read(&tmp.path)?;
+        std::fs::copy(format_0_fixture(cipher), &tmp.path)?;
+        let error = owner.reload_wal_after_external_restore().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot change the encryption format"),
+            "{cipher}: {error}"
+        );
+        std::fs::write(&tmp.path, &original)?;
+        owner.reload_wal_after_external_restore()?;
+        owner.publish_schema_after_external_restore()?;
+        let rows: Vec<(String,)> = owner.exec_rows("SELECT value FROM secrets");
+        assert_eq!(rows, [("protected value".into(),)], "{cipher}");
+    }
+    Ok(())
+}
+
 fn copy_encrypted_test_files(source: &TempDatabase, path: &std::path::Path) -> anyhow::Result<()> {
     for suffix in ["", "-wal", "-log"] {
         let source_path = format!("{}{suffix}", source.path.display());
@@ -3041,6 +3138,16 @@ fn swap_wal_frame_page_numbers(path: &str, a: u32, b: u32) -> anyhow::Result<()>
     );
     std::fs::write(path, bytes)?;
     Ok(())
+}
+
+/// Returns the path of a database in encryption format version 0 that Turso
+/// 0.9.0-pre.6 (commit 4f61bc742f) wrote with `cipher` and `KEY_A`. The
+/// database has the table `t(id INTEGER PRIMARY KEY, value TEXT)`, the index
+/// `t_value` on `value`, and the rows (1, 'one'), (2, 'two') and (3, 'three').
+fn format_0_fixture(cipher: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "integration/encryption_compat/fixtures/encrypted_{cipher}_v0.9.0-pre.6.db"
+    ))
 }
 
 #[test]

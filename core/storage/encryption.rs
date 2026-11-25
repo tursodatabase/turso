@@ -95,7 +95,7 @@ pub enum EncryptionFormat {
 
 impl EncryptionFormat {
     /// The format of new databases.
-    pub const CURRENT: Self = Self::V0;
+    pub const CURRENT: Self = Self::V1;
 
     /// Reads the format from the Turso header of an encrypted page 1, as stored on disk. Returns
     /// `None` if the page does not start with the Turso header. The version byte is not

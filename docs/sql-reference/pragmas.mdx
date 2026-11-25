@@ -830,9 +830,13 @@ Every open and connection independently authenticates its credentials before sha
 
 Each encrypted attachment requires its own cipher/key URI. Non-NULL `ATTACH ... KEY` values are rejected before opening or creating the target. `KEY NULL` uses the URI credentials. Serialize other opens of a fresh target until ATTACH completes. In-place VACUUM preserves encryption for the main database and rejects encrypted attached databases. VACUUM INTO produces a plaintext destination.
 
-After an external storage restore, reload through the connection with its current encryption key. Reload rejects database or sidecar files encrypted with another key and cannot change the page size or reserved bytes. Sync encryption is not supported.
+After an external storage restore, reload through the connection with its current encryption key. Reload rejects database or sidecar files encrypted with another key and cannot change the page size, the reserved bytes, or the encryption format. Sync encryption is not supported.
 
 Built-in encryption protects database storage, WAL, and encrypted MVCC storage. Serialize writes until the first page of a new database has been initialized, including across connections, raw/custom-storage opens, and separate processes. Recovery after a failed or abandoned initial write is not guaranteed.
+
+New encrypted databases use encryption format version 1, which binds each encrypted page to its page number. If a page in the database file or in the WAL moves to a different page number, a read of that page fails with a decryption error. This check does not find an older copy of a page at the same page number, or an older copy of the full database. It also does not find a page from another database that uses the same key, such as a backup, a copy, or the temporary database of an in-place VACUUM, when that page replaces the page with the same number.
+
+An encrypted database that an earlier version of Turso created uses encryption format version 0, which does not have this check. Turso continues to read and write it in version 0. Earlier versions of Turso cannot open a database in version 1. They report `Decryption failed for page=1`, which is the same error as for a wrong key.
 
 MVCC recovery ignores an incomplete or checksum-invalid log tail and keeps the preceding committed frames. A checksum-valid encrypted frame that cannot be decrypted with the configured key causes opening or recovery to fail.
 
