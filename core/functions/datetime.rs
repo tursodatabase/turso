@@ -722,14 +722,11 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
         }
     }
 
-    // Case 2: HH:MM:SS Arithmetic
-    if z.contains(':') {
-        let time_str = if z.starts_with('+') || z.starts_with('-') {
-            &z[1..]
-        } else {
-            z
-        };
-        if let Some(ms) = parse_time_of_day_ms(time_str) {
+    // Case 2: HH:MM:SS Arithmetic. parse_hh_mm_ss reads two digits and then
+    // a ':', so text without a ':' at index 2 is not a time. This test reads
+    // one byte, where a search for ':' reads all of the modifier.
+    if clean_z.as_bytes().get(2) == Some(&b':') {
+        if let Some(ms) = parse_time_of_day_ms(clean_z) {
             p.compute_jd();
             p.i_jd = p.i_jd.wrapping_add((sign as i64).wrapping_mul(ms));
             p.clear_ymd_hms_tz();
@@ -866,8 +863,12 @@ fn parse_modifier_number(s: &str) -> Option<f64> {
 }
 
 fn parse_ymd_offset(z: &str) -> Option<(i32, i32, i32, &str)> {
+    // The year has 4 or 5 digits, so the first '-' of an offset is at index
+    // 4 or 5. Only the first 6 bytes can hold it: a search of all the text
+    // gives the same result, and reads all of the modifier.
     let year_digits = z
         .bytes()
+        .take(6)
         .position(|b| b == b'-')
         .filter(|&n| n == 4 || n == 5)?;
     let (y, rest) = get_digits(z, year_digits, 0, 99999)?;

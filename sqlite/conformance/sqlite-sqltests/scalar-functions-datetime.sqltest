@@ -362,6 +362,26 @@ expect {
     2025-01-01 10:00:00|2023-12-31 10:00:00
 }
 
+# A time offset has two digits of hours before its ':', and a date offset has
+# four or five digits of years before its first '-'. A ':' or a '-' at another
+# place does not make an offset.
+test datetime-offset-forms-need-the-separators-at-their-places {
+    SELECT quote(datetime('2024-01-01 10:00', '+1:30')),
+           quote(datetime('2024-01-01 10:00', '+123:45')),
+           quote(datetime('2024-01-01 10:00', '+00001-01-01')),
+           quote(datetime('2024-01-01 10:00', '+1-01-01')),
+           quote(datetime('2024-01-01 10:00', '+10 days')),
+           quote(datetime('2024-01-01 10:00', '+01:30')),
+           quote(datetime('2024-01-01 10:00', '01:30')),
+           quote(datetime('2024-01-01 10:00', '+0001-01-01 01:30')),
+           quote(datetime('2024-01-01 10:00', '+0001-01-01x')),
+           quote(datetime('2024-01-01 10:00', '+10 days 1:2')),
+           quote(datetime('2024-01-01 10:00', '-000001-01-01'));
+}
+expect {
+    NULL|NULL|'2025-02-02 10:00:00'|NULL|'2024-01-11 10:00:00'|'2024-01-01 11:30:00'|'2024-01-01 11:30:00'|'2025-02-02 11:30:00'|NULL|NULL|NULL
+}
+
 test date-with-auto-julianday-top {
     SELECT date(5373484, 'auto');
 }
