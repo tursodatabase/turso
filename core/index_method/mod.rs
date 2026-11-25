@@ -758,11 +758,11 @@ pub(crate) fn open_table_cursor(
         )));
     };
     let root_page = table.get_root_page()?;
-    let cursor = Box::new(BTreeCursor::new_table(
+    let cursor = BTreeCursor::new_table_boxed(
         pager,
         btree_root_page(connection, database_id, root_page),
         table.columns().len(),
-    ));
+    );
     promote_to_mvcc_cursor(
         connection,
         database_id,

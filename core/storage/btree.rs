@@ -1362,13 +1362,9 @@ impl BTreeCursor {
         Self::new(pager, root_page, num_columns)
     }
 
-    /// Moves the cursor to the heap, into an allocation retired by an earlier
-    /// cursor on the same pager when the pool has one.
-    pub fn into_boxed(self) -> Box<Self> {
-        match self.pager.take_cursor_allocation() {
-            Some(allocation) => Box::write(allocation, self),
-            None => Box::new(self),
-        }
+    /// Like [Self::new_table], but on the heap (see [Self::new_boxed_with_index_info]).
+    pub fn new_table_boxed(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Box<Self> {
+        Self::new_boxed_with_index_info(pager, root_page, num_columns, None)
     }
 
     pub fn new_without_rowid_table(
@@ -1377,6 +1373,24 @@ impl BTreeCursor {
         table: &BTreeTable,
         num_columns: usize,
     ) -> Self {
+        let index_info = Self::without_rowid_index_info(table);
+        Self::new_with_index_info(pager, root_page, num_columns, Some(index_info))
+    }
+
+    /// Like [Self::new_without_rowid_table], but on the heap (see
+    /// [Self::new_boxed_with_index_info]).
+    pub fn new_without_rowid_table_boxed(
+        pager: Arc<Pager>,
+        root_page: i64,
+        table: &BTreeTable,
+        num_columns: usize,
+    ) -> Box<Self> {
+        let index_info = Self::without_rowid_index_info(table);
+        Self::new_boxed_with_index_info(pager, root_page, num_columns, Some(index_info))
+    }
+
+    /// The key of a WITHOUT ROWID table: its primary key columns.
+    fn without_rowid_index_info(table: &BTreeTable) -> Arc<IndexInfo> {
         let key_info = table.primary_key_columns.iter().map(|(col_name, order)| {
             let (_, column) = table
                 .get_column(col_name)
@@ -1387,11 +1401,10 @@ impl BTreeCursor {
                 nulls_order: None,
             }
         });
-        let index_info = Arc::new(
+        Arc::new(
             IndexInfo::new(key_info, false, table.primary_key_columns.len(), true)
                 .expect(crate::alloc::ALLOC_ERR_MSG),
-        );
-        Self::new_with_index_info(pager, root_page, num_columns, Some(index_info))
+        )
     }
 
     pub fn new_index(
@@ -1416,7 +1429,31 @@ impl BTreeCursor {
         num_columns: usize,
     ) -> Result<Box<Self>> {
         let index_info = Arc::new(IndexInfo::new_from_index(index)?);
-        Ok(Self::new_with_index_info(pager, root_page, num_columns, Some(index_info)).into_boxed())
+        Ok(Self::new_boxed_with_index_info(
+            pager,
+            root_page,
+            num_columns,
+            Some(index_info),
+        ))
+    }
+
+    /// Builds the cursor on the heap, in an allocation retired by an earlier
+    /// cursor on the same pager when the pool has one. The allocation is
+    /// taken before the cursor is built, so that the cursor is written into
+    /// it and is not built on the stack and copied.
+    fn new_boxed_with_index_info(
+        pager: Arc<Pager>,
+        root_page: i64,
+        num_columns: usize,
+        index_info: Option<Arc<IndexInfo>>,
+    ) -> Box<Self> {
+        let allocation = pager
+            .take_cursor_allocation()
+            .unwrap_or_else(Box::new_uninit);
+        Box::write(
+            allocation,
+            Self::new_with_index_info(pager, root_page, num_columns, index_info),
+        )
     }
 
     /// Resets the cached count state so the next `count()` call re-traverses the
