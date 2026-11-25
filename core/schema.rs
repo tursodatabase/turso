@@ -4554,7 +4554,8 @@ impl Schema {
                     // name is tracked so DROP VIEW can remove the row.
                     tracing::warn!(
                         "view '{view_name}' has unparseable SQL in sqlite_schema; \
-                         it is unavailable but can be removed with DROP VIEW: {sql}"
+                         it is unavailable but can be removed with DROP VIEW: {}",
+                        crate::redact::RedactKeys(dialect, sql)
                     );
                     self.namespace_mut(namespace).broken_views.insert(view_name);
                 } else if let Ok(Some(Cmd::Stmt(stmt))) = parsed {
@@ -7305,7 +7306,10 @@ pub fn create_table(
     supports_namespaces: bool,
 ) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
-    trace!("Creating table {}", table_name);
+    trace!(
+        "Creating table {}",
+        crate::redact::RedactUriKeys(&table_name)
+    );
     let has_rowid;
     let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];

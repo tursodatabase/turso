@@ -90,7 +90,10 @@ pub fn translate(
     input: &str,
     origin: crate::statement::StatementOrigin,
 ) -> Result<Program> {
-    tracing::trace!("querying {}", input);
+    tracing::trace!(
+        "querying {}",
+        crate::redact::RedactKeys(connection.dialect().as_ref(), input)
+    );
     let change_cnt_on = matches!(
         stmt,
         ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }

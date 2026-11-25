@@ -59,8 +59,8 @@ pub fn translate_expr_no_constant_opt(
     deopt_reason: NoConstantOptReason,
 ) -> Result<usize> {
     tracing::debug!(
-        "translate_expr_no_constant_opt: expr={:?}, deopt_reason={:?}",
-        expr,
+        "translate_expr_no_constant_opt: expr={}, deopt_reason={:?}",
+        crate::redact::RedactKeysDebug(expr),
         deopt_reason
     );
     let next_span_idx = program.constants_in_place_start();

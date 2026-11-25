@@ -78,6 +78,7 @@ mod percentile;
 mod pragma;
 mod progress;
 mod pseudo;
+mod redact;
 mod regexp;
 #[cfg(feature = "series")]
 mod series;
