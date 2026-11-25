@@ -2339,7 +2339,11 @@ fn insert_target_column<'a>(
     position: usize,
 ) -> Option<&'a Column> {
     if columns.is_empty() {
-        return table.columns().iter().filter(|c| !c.hidden()).nth(position);
+        return table
+            .columns()
+            .iter()
+            .filter(|c| !c.hidden() && !c.is_generated())
+            .nth(position);
     }
     columns.get(position).and_then(|name| {
         let name = crate::util::normalize_ident(name.as_str());

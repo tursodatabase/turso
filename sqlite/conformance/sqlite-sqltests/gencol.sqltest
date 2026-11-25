@@ -7463,3 +7463,15 @@ setup gencol_virtual_columns_delete_trigger {
 snapshot gencol_delete_old_row_computes_virtual_columns_from_registers {
     DELETE FROM t WHERE b = 3;
 }
+
+@skip-if sqlite "SQLite has no DEFAULT in a VALUES row"
+test gencol_default_keyword_after_generated_column_in_positional_insert {
+    CREATE TABLE t1(a INTEGER, g INTEGER AS (a + 1), b INTEGER DEFAULT 5, c TEXT DEFAULT 'x');
+    INSERT INTO t1 VALUES (1, DEFAULT, 'y');
+    INSERT INTO t1 VALUES (2, 7, DEFAULT);
+    SELECT a, g, b, c FROM t1 ORDER BY a;
+}
+expect {
+    1|2|5|y
+    2|3|7|x
+}
