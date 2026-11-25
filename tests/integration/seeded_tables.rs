@@ -317,3 +317,100 @@ fn statement_cannot_take_the_name_of_a_seeded_table() {
         );
     }
 }
+
+/// Runs `sql` as a statement of the engine, as a frontend does for the
+/// tables of its own.
+fn execute_engine_statement(conn: &Arc<Connection>, sql: &str) -> Result<()> {
+    let mut stmt = conn.prepare_engine_schema_statement(sql)?;
+    stmt.run_with_row_callback(|_| Ok(()))
+}
+
+/// A statement of the engine stores a seeded table: the stored table takes
+/// the name in the connection that stores it, in another connection, and
+/// after the database is opened again.
+fn engine_statement_stores_a_seeded_table(mvcc: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("first-write.db");
+    let dialect = SeedDialect::new(&["seed_catalog"]);
+    {
+        let options =
+            OpenOptions::new(dialect.clone()).db_opts(DatabaseOpts::new().with_mvcc(mvcc));
+        let db = Database::open(
+            Arc::new(PlatformIO::new().unwrap()),
+            path.to_str().unwrap(),
+            options,
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let other = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        assert_eq!(
+            integers(&other, "SELECT value FROM seed_catalog"),
+            vec![SEED_VALUE]
+        );
+
+        // A rollback of the statement that stores the table gives the name
+        // back to the virtual table.
+        conn.execute("BEGIN").unwrap();
+        execute_engine_statement(&conn, "CREATE TABLE seed_catalog (value INTEGER)").unwrap();
+        conn.execute("INSERT INTO seed_catalog VALUES (1)").unwrap();
+        assert_eq!(integers(&conn, "SELECT value FROM seed_catalog"), vec![1]);
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            integers(&conn, "SELECT value FROM seed_catalog"),
+            vec![SEED_VALUE]
+        );
+
+        // The first write stores the table and copies the seed row.
+        conn.execute("BEGIN").unwrap();
+        execute_engine_statement(&conn, "CREATE TABLE seed_catalog (value INTEGER)").unwrap();
+        conn.execute(format!("INSERT INTO seed_catalog VALUES ({SEED_VALUE})"))
+            .unwrap();
+        conn.execute("INSERT INTO seed_catalog VALUES (7)").unwrap();
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(
+            integers(&conn, "SELECT value FROM seed_catalog ORDER BY value"),
+            vec![7, SEED_VALUE]
+        );
+        assert_eq!(
+            integers(&other, "SELECT value FROM seed_catalog ORDER BY value"),
+            vec![7, SEED_VALUE]
+        );
+        conn.close().unwrap();
+        other.close().unwrap();
+    }
+    let conn = open(&path, dialect, mvcc).unwrap();
+    assert_eq!(
+        integers(&conn, "SELECT value FROM seed_catalog ORDER BY value"),
+        vec![7, SEED_VALUE]
+    );
+}
+
+#[test]
+fn engine_statement_stores_a_seeded_table_wal() {
+    engine_statement_stores_a_seeded_table(false);
+}
+
+#[test]
+fn engine_statement_stores_a_seeded_table_mvcc() {
+    engine_statement_stores_a_seeded_table(true);
+}
+
+/// A statement of the engine cannot take the name of a virtual table that
+/// the catalog does not list as a seeded table.
+#[test]
+fn engine_statement_cannot_store_another_virtual_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(&dir.path().join("new.db"), SeedDialect::new(&[]), false).unwrap();
+    let err = execute_engine_statement(&conn, "CREATE TABLE seed_catalog (value INTEGER)")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("seed_catalog already exists"), "{err}");
+    let err = execute_engine_statement(&conn, "CREATE TABLE json_each (value INTEGER)")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("json_each already exists"), "{err}");
+}

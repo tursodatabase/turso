@@ -3147,6 +3147,26 @@ impl Schema {
         Ok(())
     }
 
+    /// Whether `name` has the virtual table of a seeded table: the catalog
+    /// of the dialect lists the name as a seeded table, and no table is
+    /// stored under it yet.
+    pub(crate) fn has_virtual_table_of_seeded_table(
+        &self,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> bool {
+        namespace.is_root()
+            && self
+                .seeded_tables
+                .iter()
+                .any(|seeded| seeded.eq_ignore_ascii_case(name))
+            && self
+                .namespace(namespace)
+                .tables
+                .get(&normalize_ident(name))
+                .is_some_and(|table| matches!(table.as_ref(), Table::Virtual(_)))
+    }
+
     /// Removes the virtual table of a seeded table from `name`, so that the
     /// stored table that is being added takes the name. A schema starts
     /// with the virtual tables that the dialect registers, and gets the
@@ -3157,24 +3177,14 @@ impl Schema {
     /// virtual table, such as `json_each`, the stored table fails as a
     /// duplicate.
     ///
-    /// A statement cannot use this to take the name: CREATE TABLE and
-    /// ALTER TABLE RENAME fail at translation when the name has a table.
+    /// A statement of a user cannot use this to take the name: CREATE TABLE
+    /// and ALTER TABLE RENAME fail at translation when the name has a
+    /// table. Only a statement of the engine can store a seeded table.
     fn remove_virtual_table_of_seeded_table(&mut self, namespace: NamespaceId, name: &str) {
-        if !namespace.is_root()
-            || !self
-                .seeded_tables
-                .iter()
-                .any(|seeded| seeded.eq_ignore_ascii_case(name))
-        {
-            return;
-        }
-        let name = normalize_ident(name);
-        let tables = &mut self.namespace_mut(namespace).tables;
-        if tables
-            .get(&name)
-            .is_some_and(|table| matches!(table.as_ref(), Table::Virtual(_)))
-        {
-            tables.remove(&name);
+        if self.has_virtual_table_of_seeded_table(namespace, name) {
+            self.namespace_mut(namespace)
+                .tables
+                .remove(&normalize_ident(name));
         }
     }
 

@@ -1265,13 +1265,28 @@ pub fn translate_create_table(
         );
     }
 
-    if relation_name_is_taken(resolver, namespace, &normalized_tbl_name, if_not_exists)? {
+    // A statement of the engine stores a seeded table: the name has the
+    // virtual table that served the rows, and the stored table replaces it
+    // when the schema adds it. A statement of a user gets the name
+    // conflict.
+    let stores_seeded_table = connection.is_nested_stmt()
+        && resolver.with_schema(database_id, |s| {
+            s.has_virtual_table_of_seeded_table(namespace.id, &normalized_tbl_name)
+        });
+    if !stores_seeded_table
+        && relation_name_is_taken(resolver, namespace, &normalized_tbl_name, if_not_exists)?
+    {
         return Ok(());
     }
     // Check for name conflicts with existing schema objects
-    if let Some(object_type) = resolver.with_schema(database_id, |s| {
-        s.get_object_type(namespace.id, &normalized_tbl_name)
-    }) {
+    let name_conflict = if stores_seeded_table {
+        None
+    } else {
+        resolver.with_schema(database_id, |s| {
+            s.get_object_type(namespace.id, &normalized_tbl_name)
+        })
+    };
+    if let Some(object_type) = name_conflict {
         match object_type {
             // IF NOT EXISTS suppresses errors for table/view conflicts
             SchemaObjectType::Table | SchemaObjectType::View if if_not_exists => {
