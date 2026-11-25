@@ -1002,6 +1002,24 @@ expect error {
     functions in index predicate must be marked IMMUTABLE
 }
 
+test datetime-compare-ts-tz-index-expression-case-operand-is-an-error {
+    CREATE TABLE ic (ts timestamp);
+    CREATE INDEX ic_i ON ic ((CASE ts WHEN '2026-01-01+00'::timestamptz THEN 1 END));
+}
+@sqlstate 42P17
+expect error {
+    functions in index expression must be marked IMMUTABLE
+}
+
+test datetime-compare-ts-tz-partial-index-row-value-is-an-error {
+    CREATE TABLE ir (ts timestamp, tz timestamptz);
+    CREATE INDEX ir_i ON ir (ts) WHERE (ts, 1) = (tz, 1);
+}
+@sqlstate 42P17
+expect error {
+    functions in index predicate must be marked IMMUTABLE
+}
+
 test datetime-compare-ts-tz-check-constraint-is-allowed {
     CREATE TABLE ck (ts timestamp, CHECK (ts > '2026-01-01+00'::timestamptz));
     INSERT INTO ck VALUES ('2026-02-01 00:00:00');

@@ -1079,46 +1079,29 @@ pub(crate) fn refuse_timestamp_timestamptz_comparison_in_schema_expr(
     resolver: &Resolver,
     message: &str,
 ) -> Result<()> {
-    let catalog = &resolver.catalog;
-    if !catalog.dialect.compares_timestamp_with_timestamptz() {
+    if !resolver
+        .catalog
+        .dialect
+        .compares_timestamp_with_timestamptz()
+    {
         return Ok(());
     }
-    let schema = resolver.schema();
-    let type_of_expr =
-        |e: &Expr| crate::translate::index::expression_type(e, table, schema, catalog.symbol_table);
-    let mixed = |a: &Expr, b: &Expr| -> Result<bool> {
-        let (ExprType::Custom { type_def: x, .. }, ExprType::Custom { type_def: y, .. }) =
-            (type_of_expr(a)?, type_of_expr(b)?)
-        else {
-            return Ok(false);
-        };
-        let (Some(x), Some(y)) = (schema.without_domains(&x)?, schema.without_domains(&y)?) else {
-            return Ok(false);
-        };
-        Ok(timestamp_compared_with_timestamptz(&x, &y))
-    };
-    let mut found = false;
-    crate::translate::expr::walk_expr(expr, &mut |e: &Expr| {
-        found = found
-            || match e {
-                Expr::Binary(lhs, op, rhs) if op.is_comparison() => mixed(lhs, rhs)?,
-                Expr::Between {
-                    lhs, start, end, ..
-                } => mixed(lhs, start)? || mixed(lhs, end)?,
-                Expr::InList { lhs, rhs, .. } => {
-                    let mut any = false;
-                    for item in rhs {
-                        any = any || mixed(lhs, item)?;
-                    }
-                    any
-                }
-                _ => false,
-            };
+    // The comparisons of `expr` are checked as the translator checks them
+    // (CASE operands, row values, BETWEEN, IN), once with the comparison of a
+    // timestamp with a timestamptz refused and once as the dialect allows it.
+    // It is the mixed comparison that is refused when the first fails and
+    // the second passes. Other errors are the translator's to report.
+    let mut expr = expr.clone();
+    crate::schema::resolve_gencol_expr_columns(&mut expr, table.columns())?;
+    let refusing = ExprContext::over_schema_table(table, resolver, true);
+    let allowing = ExprContext::over_schema_table(table, resolver, false);
+    crate::translate::expr::walk_expr(&expr, &mut |e: &Expr| {
+        if check_expr_collation(e, &refusing).is_err() && check_expr_collation(e, &allowing).is_ok()
+        {
+            return Err(LimboError::ParseError(message.to_string()));
+        }
         Ok(crate::translate::expr::WalkControl::Continue)
     })?;
-    if found {
-        return Err(LimboError::ParseError(message.to_string()));
-    }
     Ok(())
 }
 
@@ -1133,10 +1116,7 @@ fn check_comparable_exprs(
         &type_of(lhs, &lhs_context.type_env()),
         &type_of(rhs, &rhs_context.type_env()),
         lhs_context.schema(),
-        lhs_context
-            .catalog()
-            .dialect
-            .compares_timestamp_with_timestamptz(),
+        lhs_context.compares_timestamp_with_timestamptz(),
     )
 }
 
@@ -1153,10 +1133,7 @@ fn check_in_list_comparable(
             &lhs_type,
             &type_of(item, &env),
             context.schema(),
-            context
-                .catalog()
-                .dialect
-                .compares_timestamp_with_timestamptz(),
+            context.compares_timestamp_with_timestamptz(),
         )
     })
 }
