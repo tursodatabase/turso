@@ -280,19 +280,16 @@ pub fn plan_subqueries_from_select_plan(
     {
         crate::stack::trace_stack!("select_where");
         let aggregates_moved_before_where = resolver.count_aggregates_moved_from_subqueries();
-        plan_subqueries_with_outer_query_access(
+        plan_subqueries_from_where_terms(
             program,
             &mut plan.non_from_clause_subqueries,
             &mut plan.table_references,
+            &mut plan.where_clause,
             resolver,
-            plan.where_clause.iter_mut().map(|t| &mut t.expr),
             connection,
-            SubqueryPosition::Where,
             SubqueryOrigin::SelectWhere,
-            SubqueryPosition::Where.allow_correlated(),
             &mut cse_map,
             &mut same_query_map,
-            &[],
         )?;
         // A subquery in WHERE moves an aggregate of this query's columns up to
         // this query, but this query cannot compute an aggregate in WHERE. ON
@@ -476,22 +473,63 @@ pub fn plan_subqueries_from_where_clause(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    plan_subqueries_with_outer_query_access(
+    plan_subqueries_from_where_terms(
         program,
         non_from_clause_subqueries,
         table_references,
+        where_clause,
         resolver,
-        where_clause.iter_mut().map(|term| &mut term.expr),
         connection,
-        SubqueryPosition::Where,
         SubqueryOrigin::DmlWhere,
-        SubqueryPosition::Where.allow_correlated(),
         &mut Vec::new(),
         &mut Vec::new(),
-        &[],
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
+    Ok(())
+}
+
+/// Compute query plans for subqueries in WHERE terms. A subquery in an ON
+/// condition cannot name the tables that the condition cannot name, so each run
+/// of terms that hide the same tables is planned together.
+#[allow(clippy::too_many_arguments)]
+fn plan_subqueries_from_where_terms(
+    program: &mut ProgramBuilder,
+    out_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    where_clause: &mut [WhereTerm],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    origin: SubqueryOrigin,
+    cse_map: &mut Vec<(ast::Expr, ast::Expr)>,
+    same_query_map: &mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
+) -> Result<()> {
+    let mut start = 0;
+    while start < where_clause.len() {
+        let hidden_tables = table_references
+            .tables_hidden_from_term(where_clause[start].origin)
+            .to_vec();
+        let end = where_clause[start..]
+            .iter()
+            .position(|term| table_references.tables_hidden_from_term(term.origin) != hidden_tables)
+            .map_or(where_clause.len(), |len| start + len);
+        plan_subqueries_with_outer_query_access_except(
+            program,
+            out_subqueries,
+            table_references,
+            resolver,
+            where_clause[start..end].iter_mut().map(|t| &mut t.expr),
+            connection,
+            SubqueryPosition::Where,
+            origin,
+            SubqueryPosition::Where.allow_correlated(),
+            cse_map,
+            same_query_map,
+            &[],
+            &hidden_tables,
+        )?;
+        start = end;
+    }
     Ok(())
 }
 
@@ -659,7 +697,6 @@ pub fn plan_subqueries_in_expr_without_from_clause(
 
 /// Compute query plans for subqueries in the WHERE clause and HAVING clause (both of which have access to the outer query scope)
 #[allow(clippy::too_many_arguments)]
-#[turso_macros::trace_stack]
 fn plan_subqueries_with_outer_query_access<'a>(
     program: &mut ProgramBuilder,
     out_subqueries: &mut Vec<NonFromClauseSubquery>,
@@ -674,6 +711,47 @@ fn plan_subqueries_with_outer_query_access<'a>(
     same_query_map: &mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
     shared: &[ast::Expr],
 ) -> Result<()> {
+    plan_subqueries_with_outer_query_access_except(
+        program,
+        out_subqueries,
+        referenced_tables,
+        resolver,
+        exprs,
+        connection,
+        position,
+        origin,
+        allow_correlated,
+        cse_map,
+        same_query_map,
+        shared,
+        &[],
+    )
+}
+
+/// Like [plan_subqueries_with_outer_query_access], but the subqueries cannot
+/// name the joined tables in `hidden_tables`.
+#[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
+fn plan_subqueries_with_outer_query_access_except<'a>(
+    program: &mut ProgramBuilder,
+    out_subqueries: &mut Vec<NonFromClauseSubquery>,
+    referenced_tables: &mut TableReferences,
+    resolver: &Resolver,
+    exprs: impl Iterator<Item = &'a mut ast::Expr>,
+    connection: &Arc<Connection>,
+    position: SubqueryPosition,
+    origin: SubqueryOrigin,
+    allow_correlated: bool,
+    cse_map: &mut Vec<(ast::Expr, ast::Expr)>,
+    same_query_map: &mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
+    shared: &[ast::Expr],
+    hidden_tables: &[TableInternalId],
+) -> Result<()> {
+    let outer_query_refs = |referenced_tables: &TableReferences| {
+        let mut outer_refs = outer_query_refs_for_correlated_subquery(referenced_tables)?;
+        outer_refs.retain(|outer_ref| !hidden_tables.contains(&outer_ref.internal_id));
+        Ok(outer_refs)
+    };
     // Only custom types and arrays fail the checks below, and without custom
     // types enabled there are neither.
     let custom_types_enabled = !resolver.schema().type_registry.is_empty();
@@ -685,7 +763,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
             referenced_tables,
             resolver,
             connection,
-            &outer_query_refs_for_correlated_subquery,
+            &outer_query_refs,
             position,
             origin,
             allow_correlated,

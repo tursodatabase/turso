@@ -374,9 +374,13 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         || msg.starts_with("no such view")
         || msg.contains("table not found")
         || msg.starts_with("no such object")
+        || (msg.starts_with("table ") && msg.contains(" is not in FROM clause"))
     {
         SQLSTATE_UNDEFINED_TABLE
-    } else if msg.contains("no such column") || msg.contains("column not found") {
+    } else if msg.contains("no such column")
+        || msg.contains("column not found")
+        || msg.starts_with("cannot join using column ")
+    {
         SQLSTATE_UNDEFINED_COLUMN
     } else if msg.contains("no such function") || msg.contains("no such window") {
         SQLSTATE_UNDEFINED_FUNCTION
@@ -658,7 +662,15 @@ mod tests {
         for (msg, code) in [
             ("no such table: t", SQLSTATE_UNDEFINED_TABLE),
             ("no such view: v", SQLSTATE_UNDEFINED_TABLE),
+            (
+                "table t is not in FROM clause — cross-database column references require the table to be explicitly joined",
+                SQLSTATE_UNDEFINED_TABLE,
+            ),
             ("no such column: c", SQLSTATE_UNDEFINED_COLUMN),
+            (
+                "cannot join using column c - column not present in both tables",
+                SQLSTATE_UNDEFINED_COLUMN,
+            ),
             ("no such function: f", SQLSTATE_UNDEFINED_FUNCTION),
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
             ("relation \"t\" already exists", SQLSTATE_DUPLICATE_TABLE),

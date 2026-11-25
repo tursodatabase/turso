@@ -2198,6 +2198,10 @@ pub struct TableReferences {
     outer_query_refs: Vec<OuterQueryReference>,
     /// The affinity of each single-column scalar subquery in this query scope.
     scalar_subquery_affinities: Vec<(TableInternalId, Affinity)>,
+    /// The right table of each join whose ON condition cannot name some joined
+    /// tables, with those tables. Subqueries in the ON condition are planned
+    /// after all tables are joined, so they read this to leave the tables out.
+    join_condition_hidden_tables: Vec<(TableInternalId, Vec<TableInternalId>)>,
 }
 
 impl Default for TableReferences {
@@ -2218,6 +2222,7 @@ impl TableReferences {
             joined_tables,
             outer_query_refs,
             scalar_subquery_affinities: Vec::new(),
+            join_condition_hidden_tables: Vec::new(),
         }
     }
 
@@ -2231,6 +2236,7 @@ impl TableReferences {
             joined_tables: vec![target_table],
             outer_query_refs: from_tables.outer_query_refs.to_vec(),
             scalar_subquery_affinities: from_tables.scalar_subquery_affinities.clone(),
+            join_condition_hidden_tables: Vec::new(),
         }
     }
 
@@ -2239,6 +2245,7 @@ impl TableReferences {
             joined_tables: Vec::new(),
             outer_query_refs: Vec::new(),
             scalar_subquery_affinities: Vec::new(),
+            join_condition_hidden_tables: Vec::new(),
         }
     }
 
@@ -2280,6 +2287,27 @@ impl TableReferences {
             .iter()
             .find(|(id, _)| *id == subquery_id)
             .map(|(_, affinity)| *affinity)
+    }
+
+    /// Record that the ON condition of the join with `right_table` cannot name `hidden`.
+    pub(crate) fn hide_tables_from_join_condition(
+        &mut self,
+        right_table: TableInternalId,
+        hidden: Vec<TableInternalId>,
+    ) {
+        self.join_condition_hidden_tables
+            .push((right_table, hidden));
+    }
+
+    /// The tables that a WHERE term from `origin` cannot name.
+    pub(crate) fn tables_hidden_from_term(&self, origin: WhereTermOrigin) -> &[TableInternalId] {
+        let WhereTermOrigin::Join(join) = origin else {
+            return &[];
+        };
+        self.join_condition_hidden_tables
+            .iter()
+            .find(|(id, _)| *id == join.right_table())
+            .map_or(&[], |(_, hidden)| hidden)
     }
 
     /// Returns an immutable reference to the [JoinedTable]s in the query plan.
@@ -2627,6 +2655,7 @@ impl TableReferences {
             joined_tables,
             outer_query_refs,
             scalar_subquery_affinities,
+            join_condition_hidden_tables,
         } = other;
 
         // Avoid `Vec::extend` here: `JoinedTable` is large, and many prepare
@@ -2638,6 +2667,10 @@ impl TableReferences {
         take_or_append(
             &mut self.scalar_subquery_affinities,
             scalar_subquery_affinities,
+        );
+        take_or_append(
+            &mut self.join_condition_hidden_tables,
+            join_condition_hidden_tables,
         );
     }
 }

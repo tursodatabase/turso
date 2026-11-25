@@ -237,6 +237,16 @@ JOIN products p ON oi.product_id = p.id
 WHERE o.order_date > '2024-01-01';
 ```
 
+### Joins After a Comma
+
+With SQLite syntax a comma is one more join operator, so the `ON`, `USING` or `NATURAL` condition of a join can name every table before it. In the PostgreSQL frontend `JOIN` binds tighter than a comma, as in PostgreSQL: `FROM a, b JOIN c ON ...` joins `a` with `b JOIN c`, and the condition can only name `b` and `c`.
+
+```sql
+SELECT * FROM a, b JOIN c ON a.x = c.z;
+-- SQLite syntax: accepted
+-- PostgreSQL frontend: error, a is not visible in the ON condition
+```
+
 ### LATERAL Joins
 
 **Turso Extension**: SQLite does not support `LATERAL`.

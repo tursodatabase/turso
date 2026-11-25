@@ -340,6 +340,16 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether the ON, USING or NATURAL condition of a join can only name the
+    /// tables listed since the last comma in FROM.
+    ///
+    /// In SQLite a comma is one more join operator, so the condition of
+    /// `a, b JOIN c ON ...` sees `a`. In PostgreSQL JOIN binds tighter than a
+    /// comma: the condition only sees `b` and `c`.
+    fn join_condition_reads_only_tables_since_comma(&self) -> bool {
+        false
+    }
+
     /// Whether a sequence named without a schema in an expression stored in
     /// the schema is bound to the schema it is found in when the expression
     /// is created.

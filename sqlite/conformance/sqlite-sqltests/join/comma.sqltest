@@ -1,0 +1,40 @@
+@database :memory:
+
+# In SQLite a comma is one more join operator, so the ON, USING or NATURAL
+# condition of a JOIN that follows a comma can read the tables before the
+# comma. The PostgreSQL frontend does not allow this
+# (postgres/conformance/pg-sqltests/select.sqltest).
+
+setup comma_tables {
+    create table a(x int);
+    create table b(y int);
+    create table c(z int, x int);
+    insert into a values (1), (2);
+    insert into b values (5);
+    insert into c values (1, 1), (2, 3);
+}
+
+@setup comma_tables
+test join-on-after-a-comma-reads-a-table-before-the-comma {
+    select * from a, b join c on a.x = c.z order by 1;
+}
+expect {
+    1|5|1|1
+    2|5|2|3
+}
+
+@setup comma_tables
+test join-using-after-a-comma-reads-a-table-before-the-comma {
+    select * from a, b join c using (x) order by 1;
+}
+expect {
+    1|5|1
+}
+
+@setup comma_tables
+test natural-join-after-a-comma-reads-a-table-before-the-comma {
+    select * from a, b natural join c order by 1;
+}
+expect {
+    1|5|1
+}

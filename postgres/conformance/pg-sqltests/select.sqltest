@@ -888,9 +888,11 @@ setup comma_and_join {
     CREATE TABLE ca (x int);
     CREATE TABLE cb (y int);
     CREATE TABLE cc (z int);
+    CREATE TABLE cd (z int, x int);
     INSERT INTO ca VALUES (1);
     INSERT INTO cb VALUES (2), (4);
     INSERT INTO cc VALUES (3);
+    INSERT INTO cd VALUES (3, 1);
 }
 
 @setup comma_and_join
@@ -916,6 +918,187 @@ test parenthesized-join-on-the-right-of-join-keeps-the-table-order {
 }
 expect {
     1|2|3
+}
+
+@setup comma_and_join
+test join-on-after-a-comma-cannot-read-a-table-before-the-comma {
+    SELECT * FROM ca, cb JOIN cc ON ca.x < cc.z;
+}
+@sqlstate 42P01
+expect error {
+}
+
+@setup comma_and_join
+test join-on-after-a-comma-cannot-read-a-schema-qualified-table-before-the-comma {
+    SELECT * FROM ca, cb JOIN cc ON public.ca.x < cc.z;
+}
+@sqlstate 42P01
+expect error {
+}
+
+@setup comma_and_join
+test left-join-on-after-a-comma-cannot-read-a-table-before-the-comma {
+    SELECT * FROM ca, cb LEFT JOIN cc ON ca.x < cc.z;
+}
+@sqlstate 42P01
+expect error {
+}
+
+@setup comma_and_join
+test join-on-after-a-comma-cannot-read-a-column-of-a-table-before-the-comma {
+    SELECT * FROM ca, cb JOIN cc ON x = 1;
+}
+@sqlstate 42703
+expect error {
+}
+
+@setup comma_and_join
+test second-join-after-a-comma-cannot-read-a-table-before-the-comma {
+    SELECT * FROM ca, cb JOIN cc ON true JOIN cd ON cd.x = ca.x;
+}
+@sqlstate 42P01
+expect error {
+}
+
+@setup comma_and_join
+test join-after-a-comma-cannot-read-the-join-before-the-comma {
+    SELECT * FROM ca JOIN cc ON true, cb JOIN cd ON cd.x = ca.x;
+}
+@sqlstate 42P01
+expect error {
+}
+
+@setup comma_and_join
+test join-on-reads-only-the-tables-after-the-last-comma {
+    SELECT * FROM ca, cb, cc JOIN cd ON cd.x = cb.y;
+}
+@sqlstate 42P01
+expect error {
+}
+
+@setup comma_and_join
+test join-on-after-a-comma-reads-an-unqualified-column-of-its-own-tables {
+    SELECT * FROM ca, cb JOIN cd ON x = 1 ORDER BY 2;
+}
+expect {
+    1|2|3|1
+    1|4|3|1
+}
+
+@setup comma_and_join
+test join-using-after-a-comma-cannot-read-a-table-before-the-comma {
+    SELECT * FROM ca, cb JOIN cd USING (x);
+}
+@sqlstate 42703
+expect error {
+}
+
+@setup comma_and_join
+test natural-join-after-a-comma-ignores-the-tables-before-the-comma {
+    SELECT * FROM ca, cb NATURAL JOIN cd ORDER BY 2;
+}
+expect {
+    1|2|3|1
+    1|4|3|1
+}
+
+@setup comma_and_join
+test lateral-join-after-a-comma-reads-a-table-before-the-comma {
+    SELECT * FROM ca, cb JOIN LATERAL (SELECT ca.x AS w) s ON true ORDER BY 2;
+}
+expect {
+    1|2|1
+    1|4|1
+}
+
+@setup comma_and_join
+test exists-in-join-on-after-a-comma-cannot-read-a-table-before-the-comma {
+    SELECT * FROM ca, cb JOIN cc ON EXISTS (SELECT 1 WHERE ca.x = 1);
+}
+@sqlstate 42P01
+expect error {
+}
+
+@setup comma_and_join
+test scalar-subquery-in-join-on-after-a-comma-cannot-read-a-table-before-the-comma {
+    SELECT * FROM ca, cb JOIN cc ON (SELECT ca.x) = 1;
+}
+@sqlstate 42P01
+expect error {
+}
+
+@setup comma_and_join
+test in-subquery-in-join-on-after-a-comma-cannot-read-a-table-before-the-comma {
+    SELECT * FROM ca, cb JOIN cc ON cc.z IN (SELECT ca.x);
+}
+@sqlstate 42P01
+expect error {
+}
+
+@setup comma_and_join
+test nested-subquery-in-join-on-after-a-comma-cannot-read-a-table-before-the-comma {
+    SELECT * FROM ca, cb JOIN cc ON EXISTS (SELECT 1 WHERE (SELECT ca.x) = 1);
+}
+@sqlstate 42P01
+expect error {
+}
+
+@setup comma_and_join
+test subquery-in-join-on-after-a-comma-cannot-read-a-column-of-a-table-before-the-comma {
+    SELECT * FROM ca, cb JOIN cc ON (SELECT x) = 1;
+}
+@sqlstate 42703
+expect error {
+}
+
+@setup comma_and_join
+test subquery-in-second-join-on-after-a-comma-cannot-read-a-table-before-the-comma {
+    SELECT * FROM ca, cb JOIN cc ON true JOIN cd ON cd.x = (SELECT ca.x);
+}
+@sqlstate 42P01
+expect error {
+}
+
+@setup comma_and_join
+test subquery-in-join-on-after-a-comma-reads-its-own-tables {
+    SELECT * FROM ca, cb JOIN cc ON EXISTS (SELECT 1 WHERE cb.y = 2 AND cc.z = 3);
+}
+expect {
+    1|2|3
+}
+
+@setup comma_and_join
+test subquery-in-join-on-after-a-comma-reads-an-outer-table-of-the-hidden-name {
+    SELECT ca.z FROM cd ca
+    WHERE EXISTS (SELECT 1 FROM ca, cb JOIN cc ON cc.z IN (SELECT ca.z));
+}
+expect {
+    3
+}
+
+@setup comma_and_join
+test subquery-in-update-from-join-on-after-a-comma-cannot-read-a-table-before-the-comma {
+    UPDATE cd SET z = 7 FROM ca, cb JOIN cc ON cc.z IN (SELECT ca.x);
+}
+@sqlstate 42P01
+expect error {
+}
+
+@setup comma_and_join
+test exists-in-update-from-join-on-after-a-comma-cannot-read-a-table-before-the-comma {
+    UPDATE cd SET z = 7 FROM ca, cb JOIN cc ON EXISTS (SELECT 1 WHERE ca.x = 1);
+}
+@sqlstate 42P01
+expect error {
+}
+
+@setup comma_and_join
+test subquery-in-update-from-join-on-after-a-comma-reads-its-own-tables {
+    UPDATE cd SET z = 7 FROM ca, cb JOIN cc ON cc.z IN (SELECT cb.y + 1);
+    SELECT * FROM cd;
+}
+expect {
+    7|1
 }
 
 setup outer_join_of_a_parenthesized_join {
