@@ -5584,6 +5584,47 @@ fn index_version_count(store: &Store, index: MVTableId) -> usize {
     })
 }
 
+/// What this test checks: checkpointing an attached database must not compact sequence
+/// backing rows from the main database. Here the main sequence backing table and the
+/// attached table have the same root page number, so using the wrong schema deletes
+/// committed rows instead of only failing with a panic.
+#[test]
+fn attached_checkpoint_does_not_compact_main_sequence_rows() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir
+        .path()
+        .join(format!("aux_{}.db", rand::random::<u64>()));
+    let aux_path_str = aux_path.to_str().unwrap().to_string();
+    let conn = db.connect();
+
+    conn.execute(format!("ATTACH '{aux_path_str}' AS aux"))
+        .unwrap();
+    conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+        .unwrap();
+    conn.execute("CREATE TABLE aux.a(x)").unwrap();
+    conn.execute("INSERT INTO aux.a VALUES ('one'), ('two'), ('three')")
+        .unwrap();
+    conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
+
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    conn.execute("SELECT nextval('s')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    conn.execute("INSERT INTO aux.a VALUES ('four')").unwrap();
+    conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
+
+    assert_eq!(
+        get_rows(&conn, "SELECT rowid, x FROM aux.a ORDER BY rowid"),
+        vec![
+            vec![Value::from_i64(1), Value::build_text("one")],
+            vec![Value::from_i64(2), Value::build_text("two")],
+            vec![Value::from_i64(3), Value::build_text("three")],
+            vec![Value::from_i64(4), Value::build_text("four")],
+        ]
+    );
+}
+
 #[test]
 fn attached_reader_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
     use turso_core::StepResult;

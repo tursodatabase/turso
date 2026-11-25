@@ -807,7 +807,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 .current_root_page(&table_id)
                 .map(|rp| rp as i64)
         };
-        let db_id = crate::MAIN_DB_ID;
+        let db_id = self.database_id;
         Ok(self
             .connection
             .with_schema(db_id, |schema| {
