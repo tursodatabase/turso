@@ -430,6 +430,194 @@ expect {
     one|1
 }
 
+# A cast to an integer type.
+
+test int-cast-reads-text-with-whitespace-and-a-sign {
+    SELECT ' 42 '::integer, '+7'::smallint, '-7'::bigint, '007'::int;
+}
+expect {
+    42|7|-7|7
+}
+
+test int-cast-reads-hexadecimal-octal-and-binary-text {
+    SELECT '0x1F'::integer, '0o17'::smallint, '0b101'::bigint, '-0X10'::int;
+}
+expect {
+    31|15|5|-16
+}
+
+test int-cast-reads-underscores-between-digits {
+    SELECT '1_000'::integer, '0x_ff'::int, '1_2_3'::smallint;
+}
+expect {
+    1000|255|123
+}
+
+test int-cast-reads-the-ends-of-each-range {
+    SELECT '-32768'::int2, '32767'::int2, '-2147483648'::int4, '2147483647'::int4,
+        '-9223372036854775808'::int8, '9223372036854775807'::int8;
+}
+expect {
+    -32768|32767|-2147483648|2147483647|-9223372036854775808|9223372036854775807
+}
+
+test smallint-cast-refuses-text-that-is-not-an-integer {
+    SELECT 'abc'::smallint;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type smallint: "abc"
+}
+
+test bigint-cast-refuses-text-with-an-exponent {
+    SELECT '1e2'::bigint;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bigint: "1e2"
+}
+
+test int-cast-refuses-empty-text {
+    SELECT ''::integer;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: ""
+}
+
+test int-cast-refuses-an-underscore-after-the-last-digit {
+    SELECT '1_'::integer;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1_"
+}
+
+test int-cast-refuses-two-numbers {
+    SELECT '1 2'::integer;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1 2"
+}
+
+test int-cast-reads-text-of-a-column {
+    CREATE TABLE t (s text);
+    INSERT INTO t VALUES (' 12 '), ('0x10');
+    SELECT s::int + 1 FROM t ORDER BY 1;
+}
+expect {
+    13
+    17
+}
+
+test int-cast-refuses-text-of-a-column-that-is-not-an-integer {
+    CREATE TABLE t (s text);
+    INSERT INTO t VALUES ('12'), ('twelve');
+    SELECT s::int FROM t;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "twelve"
+}
+
+test bigint-cast-refuses-text-above-its-range {
+    SELECT '9223372036854775808'::bigint;
+}
+@sqlstate 22003
+expect error {
+    value "9223372036854775808" is out of range for type bigint
+}
+
+test int-cast-refuses-hexadecimal-text-above-its-range {
+    SELECT '0xFFFFFFFF'::integer;
+}
+@sqlstate 22003
+expect error {
+    value "0xFFFFFFFF" is out of range for type integer
+}
+
+test smallint-cast-refuses-a-number-above-its-range {
+    SELECT 40000::smallint;
+}
+@sqlstate 22003
+expect error {
+    smallint out of range
+}
+
+test int-cast-refuses-a-number-above-its-range {
+    SELECT 3000000000::integer;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test int-cast-refuses-a-decimal-above-its-range {
+    SELECT 2147483647.5::integer;
+}
+@sqlstate 22003
+expect error {
+    integer out of range
+}
+
+test int-cast-rounds-a-decimal-inside-its-range {
+    SELECT 2147483647.4::integer, 0.5::smallint, (-0.5)::bigint, 1.4::int;
+}
+expect {
+    2147483647|1|-1|1
+}
+
+test int-cast-with-cast-syntax {
+    SELECT CAST('12' AS smallint), CAST(' 13' AS integer), CAST('14 ' AS bigint);
+}
+expect {
+    12|13|14
+}
+
+test int2-function-refuses-a-number-above-its-range {
+    SELECT int2(70000);
+}
+@sqlstate 22003
+expect error {
+    smallint out of range
+}
+
+test int-functions-cast-as-the-types-do {
+    SELECT int2(7.6), int4(7.5), int8(-7.5);
+}
+expect {
+    8|8|-8
+}
+
+test int-cast-of-a-boolean {
+    SELECT true::integer, false::int;
+}
+expect {
+    1|0
+}
+
+test int-cast-of-null {
+    SELECT NULL::integer IS NULL, NULL::smallint IS NULL, NULL::bigint IS NULL;
+}
+expect {
+    t|t|t
+}
+
+test jsonb-number-cast-to-each-int-type {
+    SELECT '5'::jsonb::smallint, '6'::jsonb::integer, '7'::jsonb::bigint;
+}
+expect {
+    5|6|7
+}
+
+test int-array-cast-reads-each-element {
+    SELECT '{1, 2,3}'::int[];
+}
+expect {
+    {1,2,3}
+}
+
 test pg-input-is-valid-reads-integers-as-the-types-do {
     SELECT pg_input_is_valid('0x10', 'integer'), pg_input_is_valid(' 7 ', 'bigint'),
         pg_input_is_valid('1.5', 'integer'), pg_input_is_valid('40000', 'smallint');

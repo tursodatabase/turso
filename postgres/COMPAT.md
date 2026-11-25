@@ -183,7 +183,11 @@ A smallint, integer or bigint column refuses a value outside its range with
 22003, also when the column is the primary key. An error that names the type
 of an integer value may say `int4`, where PostgreSQL says `integer`. Text that is not an integer and
 a decimal written to such a column fail with 23000, where PostgreSQL fails with
-22P02 for the text and rounds the decimal. Arithmetic on these types is 64-bit:
+22P02 for the text and rounds the decimal. A cast to one of these types reads
+text as PostgreSQL does (white space around the number, a sign, `0x`, `0o` and
+`0b`, `_` between digits; 22P02 for other text, 22003 outside the range) and
+rounds a decimal half away from zero. A float8 is rounded the same way, where
+PostgreSQL rounds it half to even. Arithmetic on these types is 64-bit:
 `2147483647::int4 + 1` gives 2147483648, where PostgreSQL fails with 22003.
 On the wire, smallint is still described as int4.
 `pg_input_is_valid`, `to_char` (numeric; other argument types fail with
