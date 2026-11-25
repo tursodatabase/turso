@@ -422,6 +422,43 @@ expect error {
 }
 
 @setup operands
+test string-literal-with-the-digits-a-double-keeps-is-compared-as-a-number {
+    CREATE TABLE doubles (n numeric, r double precision);
+    INSERT INTO doubles VALUES (0.1, 0.1);
+    SELECT n = '0.1', r = '0.1', n < '0.2' FROM doubles;
+    SELECT n = '9007199254740992' FROM doubles;
+}
+expect {
+    t|t|t
+    f
+}
+
+@compat-gap "type:numeric"
+@setup operands
+test string-literal-with-more-digits-than-a-double-next-to-a-numeric-column-errors {
+    CREATE TABLE doubles (n numeric);
+    INSERT INTO doubles VALUES (9007199254740992);
+    SELECT n = '9007199254740993' FROM doubles;
+}
+expect {
+    f
+}
+@sqlstate 0A000
+expect @tursopg error {
+    has more digits than a double keeps
+}
+
+@setup operands
+test string-literal-with-more-digits-than-a-double-next-to-a-registered-numeric-column {
+    CREATE TABLE exact (n numeric(20, 0));
+    INSERT INTO exact VALUES (9007199254740992);
+    SELECT n = '9007199254740993', n < '9007199254740993' FROM exact;
+}
+expect {
+    f|t
+}
+
+@setup operands
 test string-literal-in-a-between-that-is-not-an-integer-errors {
     SELECT i BETWEEN 0 AND 'x' FROM operands;
 }

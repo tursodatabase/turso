@@ -8,7 +8,8 @@ use turso_core::ast;
 use turso_core::dialect::{ChosenOperator, EngineType, OperandType, OperatorChoice};
 use turso_core::Result;
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
 };
 
 /// A row of `pg_operator`. A type is the `oid` of its `pg_type` row, and
@@ -248,11 +249,50 @@ fn is_spelling_left_to_the_engine(literal: &str, oid: i64) -> bool {
     [FLOAT8, NUMERIC].contains(&oid) && text.parse::<f64>().is_ok_and(f64::is_infinite)
 }
 
+/// FIXME(registered-types): TEMPORARY. This check goes away once numeric and double precision are registered types. The engine stores a numeric and a double precision both as REAL, and cannot tell them apart, so a literal next to one of them is cast to a double. PostgreSQL keeps all the digits of a numeric, so a literal that a double does not keep gives another answer: `n = '9007199254740993'` is true for a numeric column that holds 9007199254740992. A registered numeric stores the value exactly, and a registered double precision rounds it, as PostgreSQL does.
+/// Fails with 0A000 when `ty` is a number that the engine stores as a double
+/// and a double does not keep `literal` exactly.
+fn check_a_double_keeps(literal: &str, ty: &Checked) -> Result<()> {
+    let is_stored_as_a_double = ty.engine.is_some() && [FLOAT8, NUMERIC].contains(&ty.oid);
+    if !is_stored_as_a_double || a_double_keeps(literal) {
+        return Ok(());
+    }
+    Err(sqlstate_error(
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        format!("the number \"{literal}\" has more digits than a double keeps, and the engine stores a numeric and a double precision as a double"),
+        None,
+    ))
+}
+
+/// Whether a double keeps the number `text` exactly: at most 15 significant
+/// digits always do, and more only when the shortest text of the double is the
+/// same number.
+fn a_double_keeps(text: &str) -> bool {
+    let Ok(value) = text.trim().parse::<f64>() else {
+        return true;
+    };
+    let digits_of = |number: &str| -> (String, usize) {
+        let number = number.trim_start_matches(['+', '-']);
+        let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+        let fraction = fraction.trim_end_matches('0');
+        let digits = format!("{whole}{fraction}");
+        (digits.trim_start_matches('0').to_string(), fraction.len())
+    };
+    let (digits, fraction_digits) = digits_of(text.trim());
+    if digits.trim_end_matches('0').len() <= 15 {
+        return true;
+    }
+    if text.contains(['e', 'E']) {
+        return false;
+    }
+    digits_of(&format!("{value}")) == (digits, fraction_digits)
+}
+
 /// Fails when `literal` is not a value of the number type `ty`.
 fn check_number_literal(literal: &str, ty: &Checked) -> Result<()> {
     let type_name = pg_type_name(ty.oid).expect("an operand type is a row of pg_type");
     let Some((message, sqlstate)) = validate_pg_input(literal, type_name) else {
-        return Ok(());
+        return check_a_double_keeps(literal, ty);
     };
     // FIXME(pg-catalog): The engine names every integer that is not a smallint or bigint column INTEGER, also the bigint that count(*) returns. So a literal out of the range of int4 is only refused when it is out of the range of int8. The type of each value, from pg_proc and pg_operator, replaces this.
     let out_of_range = sqlstate == SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE;
@@ -758,6 +798,28 @@ mod tests {
             engine(EngineType::Decimal),
         ];
         assert!(list_choice("=", &boolean_and_numeric).is_none());
+    }
+
+    #[test]
+    fn a_double_keeps_the_numbers_up_to_fifteen_digits_and_the_ones_it_reads_back() {
+        for kept in [
+            "0.1",
+            "1.50",
+            "-123456789012345",
+            "9007199254740992",
+            "1e5",
+            "100000000000000000000",
+        ] {
+            assert!(a_double_keeps(kept), "{kept}");
+        }
+        for lost in [
+            "9007199254740993",
+            "3.14159265358979323846",
+            "1.5000000000000000001",
+            "1.2345678901234567e5",
+        ] {
+            assert!(!a_double_keeps(lost), "{lost}");
+        }
     }
 
     #[test]
