@@ -89,6 +89,28 @@ impl EncryptionKey {
         Self::Key128(key)
     }
 
+    /// Returns a new key from the random number generator of the operating system, with the
+    /// size that `cipher` requires.
+    pub(crate) fn random(cipher: CipherMode) -> Result<Self> {
+        let mut key = match cipher.required_key_size() {
+            16 => Self::Key128([0; 16]),
+            32 => Self::Key256([0; 32]),
+            size => {
+                return Err(LimboError::InternalError(format!(
+                    "cannot make a random key of {size} bytes for cipher {cipher}"
+                )))
+            }
+        };
+        // Fill the key in place: a separate array would be a copy of the key that `Drop`
+        // does not zero.
+        let bytes = match &mut key {
+            Self::Key128(bytes) => bytes.as_mut_slice(),
+            Self::Key256(bytes) => bytes.as_mut_slice(),
+        };
+        fill_random(bytes)?;
+        Ok(key)
+    }
+
     pub fn from_hex_string(s: &str) -> Result<Self> {
         let hex_str = s.trim();
         let bytes = hex::decode(hex_str)
@@ -191,7 +213,7 @@ macro_rules! define_aegis_cipher {
             }
 
             fn encrypt(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, [u8; $nonce_size])> {
-                let nonce = generate_secure_nonce::<$nonce_size>();
+                let nonce = generate_secure_nonce::<$nonce_size>()?;
                 let key_bytes = self.key.$key_method()
                     .ok_or_else(|| -> LimboError { CipherError::InvalidKeySize { cipher: $name, expected: $key_size }.into() })?;
                 let (ciphertext, tag) = <$cipher_type>::new(key_bytes, &nonce).encrypt(plaintext, ad);
@@ -207,9 +229,6 @@ macro_rules! define_aegis_cipher {
                 tag_out: &mut [u8],
                 nonce_out: &mut [u8],
             ) -> Result<()> {
-                if tag_out.len() != Self::TAG_SIZE {
-                    return Err(CipherError::InvalidTagSize { cipher: $name }.into());
-                }
                 if nonce_out.len() != $nonce_size {
                     return Err(LimboError::InternalError(format!(
                         "Invalid nonce size for {}: expected {}, got {}",
@@ -218,7 +237,30 @@ macro_rules! define_aegis_cipher {
                         nonce_out.len()
                     )));
                 }
-                let nonce = generate_secure_nonce::<$nonce_size>();
+                nonce_out.copy_from_slice(&generate_secure_nonce::<$nonce_size>()?);
+                self.encrypt_in_place_with_nonce(plaintext_ciphertext, ad, tag_out, nonce_out)
+            }
+
+            /// Like `encrypt_in_place`, but with the nonce of the caller. The caller must
+            /// never use the nonce again with this key.
+            fn encrypt_in_place_with_nonce(
+                &self,
+                plaintext_ciphertext: &mut [u8],
+                ad: &[u8],
+                tag_out: &mut [u8],
+                nonce: &[u8],
+            ) -> Result<()> {
+                if tag_out.len() != Self::TAG_SIZE {
+                    return Err(CipherError::InvalidTagSize { cipher: $name }.into());
+                }
+                let nonce: [u8; $nonce_size] = nonce.try_into().map_err(|_| {
+                    LimboError::InternalError(format!(
+                        "Invalid nonce size for {}: expected {}, got {}",
+                        $name,
+                        $nonce_size,
+                        nonce.len()
+                    ))
+                })?;
                 let key_bytes = self.key.$key_method().ok_or_else(|| -> LimboError {
                     CipherError::InvalidKeySize {
                         cipher: $name,
@@ -229,7 +271,6 @@ macro_rules! define_aegis_cipher {
                 let tag = <$cipher_type>::new(key_bytes, &nonce)
                     .encrypt_in_place(plaintext_ciphertext, ad);
                 tag_out.copy_from_slice(&tag);
-                nonce_out.copy_from_slice(&nonce);
                 Ok(())
             }
 
@@ -318,9 +359,6 @@ macro_rules! define_aes_gcm_cipher {
                 tag_out: &mut [u8],
                 nonce_out: &mut [u8],
             ) -> Result<()> {
-                if tag_out.len() != Self::TAG_SIZE {
-                    return Err(CipherError::InvalidTagSize { cipher: $name }.into());
-                }
                 if nonce_out.len() != Self::NONCE_SIZE {
                     return Err(LimboError::InternalError(format!(
                         "Invalid nonce size for {}: expected {}, got {}",
@@ -329,15 +367,37 @@ macro_rules! define_aes_gcm_cipher {
                         nonce_out.len()
                     )));
                 }
-                let nonce = <$cipher_type>::generate_nonce(&mut OsRng);
+                nonce_out.copy_from_slice(&<$cipher_type>::generate_nonce(&mut OsRng));
+                self.encrypt_in_place_with_nonce(plaintext_ciphertext, ad, tag_out, nonce_out)
+            }
+
+            /// Like `encrypt_in_place`, but with the nonce of the caller. The caller must
+            /// never use the nonce again with this key.
+            fn encrypt_in_place_with_nonce(
+                &self,
+                plaintext_ciphertext: &mut [u8],
+                ad: &[u8],
+                tag_out: &mut [u8],
+                nonce: &[u8],
+            ) -> Result<()> {
+                if tag_out.len() != Self::TAG_SIZE {
+                    return Err(CipherError::InvalidTagSize { cipher: $name }.into());
+                }
+                if nonce.len() != Self::NONCE_SIZE {
+                    return Err(LimboError::InternalError(format!(
+                        "Invalid nonce size for {}: expected {}, got {}",
+                        $name,
+                        Self::NONCE_SIZE,
+                        nonce.len()
+                    )));
+                }
                 let tag = self
                     .cipher
-                    .encrypt_in_place_detached(&nonce, ad, plaintext_ciphertext)
+                    .encrypt_in_place_detached(Nonce::from_slice(nonce), ad, plaintext_ciphertext)
                     .map_err(|e| {
                         LimboError::InternalError(format!("{} encryption failed: {e:?}", $name))
                     })?;
                 tag_out.copy_from_slice(&tag);
-                nonce_out.copy_from_slice(&nonce);
                 Ok(())
             }
 
@@ -644,6 +704,35 @@ impl EncryptionContext {
         nonce_out: &mut [u8],
     ) -> Result<()> {
         self.encrypt_raw_with_ad_in_place(plaintext_ciphertext, aad, tag_out, nonce_out)
+    }
+
+    /// Like [`EncryptionContext::encrypt_chunk_in_place`], but with the nonce of the caller,
+    /// which has [`EncryptionContext::nonce_size`] bytes. The caller must never use the nonce
+    /// again with this key, because two messages with the same key and nonce reveal each
+    /// other.
+    pub(crate) fn encrypt_chunk_in_place_with_nonce(
+        &self,
+        plaintext_ciphertext: &mut [u8],
+        aad: &[u8],
+        tag_out: &mut [u8],
+        nonce: &[u8],
+    ) -> Result<()> {
+        macro_rules! encrypt_cipher {
+            ($cipher:expr) => {{
+                $cipher.encrypt_in_place_with_nonce(plaintext_ciphertext, aad, tag_out, nonce)
+            }};
+        }
+
+        match &self.cipher {
+            Cipher::Aes128Gcm(cipher) => encrypt_cipher!(cipher),
+            Cipher::Aes256Gcm(cipher) => encrypt_cipher!(cipher),
+            Cipher::Aegis256(cipher) => encrypt_cipher!(cipher),
+            Cipher::Aegis256X2(cipher) => encrypt_cipher!(cipher),
+            Cipher::Aegis256X4(cipher) => encrypt_cipher!(cipher),
+            Cipher::Aegis128L(cipher) => encrypt_cipher!(cipher),
+            Cipher::Aegis128X2(cipher) => encrypt_cipher!(cipher),
+            Cipher::Aegis128X4(cipher) => encrypt_cipher!(cipher),
+        }
     }
 
     pub fn decrypt_chunk(&self, ciphertext: &[u8], nonce: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
@@ -1051,12 +1140,18 @@ impl EncryptionContext {
     }
 }
 
-fn generate_secure_nonce<const N: usize>() -> [u8; N] {
-    // use OsRng directly to fill bytes, generic over nonce size
+/// Fills `dest` with random bytes from the operating system.
+pub(crate) fn fill_random(dest: &mut [u8]) -> Result<()> {
     use aes_gcm::aead::rand_core::RngCore;
+    OsRng
+        .try_fill_bytes(dest)
+        .map_err(|e| LimboError::InternalError(format!("cannot read random bytes: {e}")))
+}
+
+fn generate_secure_nonce<const N: usize>() -> Result<[u8; N]> {
     let mut nonce = [0u8; N];
-    OsRng.fill_bytes(&mut nonce);
-    nonce
+    fill_random(&mut nonce)?;
+    Ok(nonce)
 }
 
 // Helper functions for consistent error messages

@@ -832,6 +832,38 @@ impl Connection {
         })
     }
 
+    /// Where the temporary files of this connection go, and their cipher if they are on disk.
+    pub(crate) fn temp_file_options(&self) -> crate::io::TempFileOptions {
+        crate::io::TempFileOptions {
+            temp_store: self.get_temp_store(),
+            cipher: self.temp_file_cipher(),
+        }
+    }
+
+    /// The cipher of the temporary files that this connection writes to disk, or None when
+    /// no database of the connection uses built-in encryption. Temporary files hold rows
+    /// copied from the databases, so they are encrypted when one of the databases is.
+    ///
+    /// They use the cipher of the main database, or else the cipher of the encrypted attached
+    /// database with the lowest database id. An attached database has the page size of the
+    /// main database, like the TEMP database, so the TEMP database can use its page layout.
+    pub(crate) fn temp_file_cipher(&self) -> Option<CipherMode> {
+        let main_cipher = self.pager.load().encryption_cipher();
+        if main_cipher != CipherMode::None {
+            return Some(main_cipher);
+        }
+        if !self.has_non_main_pagers.load(Ordering::Acquire) {
+            return None;
+        }
+        self.attached_databases
+            .read()
+            .index_to_data
+            .iter()
+            .filter(|(_, attached)| attached.pager.encryption_cipher() != CipherMode::None)
+            .min_by_key(|(database_id, _)| **database_id)
+            .map(|(_, attached)| attached.pager.encryption_cipher())
+    }
+
     /// Returns true once the per-connection temp database has been created.
     pub fn has_temp_database(&self) -> bool {
         self.temp.database.read().is_some()

@@ -1200,8 +1200,11 @@ mod tests {
     use std::task::{Wake, Waker};
 
     use crate::{
-        io::{common, win_iocp::get_generic_limboerror_from_os_err, OpenFlags, TempFile},
-        Buffer, Completion, IO,
+        io::{
+            common, win_iocp::get_generic_limboerror_from_os_err, OpenFlags, TempFile,
+            TempFileOptions, TEMP_FILE_ENCRYPTION_BLOCK_SIZE,
+        },
+        Buffer, Completion, TempStore, IO,
     };
 
     use super::WindowsIOCP;
@@ -1227,7 +1230,7 @@ mod tests {
         const OPERATIONS: u64 = 64;
 
         let iocp: Arc<dyn IO> = Arc::new(WindowsIOCP::new().unwrap());
-        let file = TempFile::new(&iocp).unwrap();
+        let file = plaintext_temp_file(&iocp);
 
         let mut completions = Vec::new();
         let mut wakers = Vec::new();
@@ -1276,7 +1279,7 @@ mod tests {
     #[test]
     fn test_file_read_write() {
         let iocp: Arc<dyn IO> = Arc::new(WindowsIOCP::new().unwrap());
-        let file = TempFile::new(&iocp).unwrap();
+        let file = plaintext_temp_file(&iocp);
 
         const WRITE: &[u8] = b"ABCD";
 
@@ -1331,7 +1334,7 @@ mod tests {
     fn test_proper_drop() {
         let write = b"Abcd";
         let iocp: Arc<dyn IO> = Arc::new(WindowsIOCP::new().unwrap());
-        let file = TempFile::new(&iocp).unwrap();
+        let file = plaintext_temp_file(&iocp);
         let comp = Completion::new_write(|_| {});
         let buffer = Arc::new(Buffer::new_temporary(write.len()));
 
@@ -1360,5 +1363,15 @@ mod tests {
     #[test]
     fn test_multiple_processes_cannot_open_file() {
         common::tests::test_multiple_processes_cannot_open_file(WindowsIOCP::new);
+    }
+
+    /// A temporary file whose content is not encrypted. With the `fs` feature, `iocp` creates
+    /// it on disk at its first write.
+    fn plaintext_temp_file(iocp: &Arc<dyn IO>) -> TempFile {
+        let options = TempFileOptions {
+            temp_store: TempStore::File,
+            cipher: None,
+        };
+        TempFile::with_options(iocp, options, TEMP_FILE_ENCRYPTION_BLOCK_SIZE).unwrap()
     }
 }

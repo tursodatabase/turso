@@ -24,7 +24,10 @@ fn create_hash_table(mem_budget: usize) -> HashTable {
         mem_budget,
         num_keys: 1,
         collations: turso_core::alloc::vec![CollationSeq::BINARY],
-        temp_store: turso_core::TempStore::Default,
+        temp_files: turso_core::io::TempFileOptions {
+            temp_store: turso_core::TempStore::Default,
+            cipher: None,
+        },
         track_matched: false,
         partition_count: None,
     };
@@ -246,7 +249,10 @@ fn bench_text_key_hashing(c: &mut Criterion) {
                         mem_budget: 64 * 1024,
                         num_keys: 1,
                         collations: turso_core::alloc::vec![CollationSeq::BINARY],
-                        temp_store: turso_core::TempStore::Default,
+                        temp_files: turso_core::io::TempFileOptions {
+                            temp_store: turso_core::TempStore::Default,
+                            cipher: None,
+                        },
                         track_matched: false,
                         partition_count: None,
                     };
@@ -270,7 +276,10 @@ fn bench_text_key_hashing(c: &mut Criterion) {
                         mem_budget: 64 * 1024,
                         num_keys: 1,
                         collations: turso_core::alloc::vec![CollationSeq::NOCASE],
-                        temp_store: turso_core::TempStore::Default,
+                        temp_files: turso_core::io::TempFileOptions {
+                            temp_store: turso_core::TempStore::Default,
+                            cipher: None,
+                        },
                         track_matched: false,
                         partition_count: None,
                     };
