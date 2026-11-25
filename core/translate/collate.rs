@@ -106,7 +106,7 @@ impl CollationSeq {
             Self::Text(TextCollation::Rtrim) => 3,
             Self::Text(TextCollation::Locale(id)) => id.to_bits(),
             Self::Text(TextCollation::Custom(_)) => Self::NO_COLLATION_BITS,
-            Self::Type(ordering) => Self::FIRST_TYPE_ORDERING_BITS + ordering.to_bits(),
+            Self::Type(ordering) => Self::FIRST_TYPE_ORDERING_BITS + ordering.number(),
         }
     }
 
