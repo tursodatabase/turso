@@ -325,6 +325,102 @@ expect error {
     invalid input syntax for type integer: "x"
 }
 
+# PostgreSQL gives the values of an IN list that read no column one type
+# together with the left side. A value that reads a column is compared with
+# the left side alone.
+@setup operands
+test in-list-reads-a-string-literal-as-the-widest-number-type {
+    SELECT 1 IN ('1.5', 1.5);
+    SELECT '1.5' IN (1, 2.5);
+    SELECT i IN ('1.5', 1.5) FROM operands;
+    SELECT i IN ('1.5', 1.5, n) FROM operands;
+    SELECT i NOT IN ('1.5', 1.5) FROM operands;
+    SELECT i IN (i8, '1.5', 1.5) FROM operands;
+}
+expect {
+    f
+    f
+    f
+    f
+    t
+    f
+}
+
+@setup operands
+test in-list-reads-a-string-literal-as-the-type-of-the-left-side {
+    SELECT 1 IN ('2', 3);
+    SELECT n IN ('4.50', 1) FROM operands;
+    SELECT f IN ('5.5', 2) FROM operands;
+}
+expect {
+    f
+    t
+    t
+}
+
+@setup operands
+test in-list-with-one-value-reads-the-literal-as-the-type-of-the-left-side {
+    SELECT 1 IN ('1.5');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1.5"
+}
+
+@setup operands
+test in-list-literal-next-to-a-number-of-the-left-type-errors {
+    SELECT 1 IN ('1.5', 2);
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1.5"
+}
+
+@setup operands
+test in-list-literal-that-is-not-a-number-errors-as-the-common-type {
+    SELECT 1 IN ('a', 1.5);
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type numeric: "a"
+}
+
+@setup operands
+test in-list-value-that-reads-a-column-is-compared-with-the-left-side-alone {
+    SELECT i IN ('1.5', n) FROM operands;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1.5"
+}
+
+@setup operands
+test in-list-without-a-common-type-compares-each-value {
+    SELECT s IN ('a', 1) FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text = integer
+}
+
+@setup operands
+test not-in-list-names-the-not-equals-operator {
+    SELECT s NOT IN (1, 2) FROM operands;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: text <> integer
+}
+
+@setup operands
+test in-list-with-a-null-reads-a-string-literal-as-the-left-type {
+    SELECT 1 IN (NULL, '1.5');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "1.5"
+}
+
 @setup operands
 test string-literal-in-a-between-that-is-not-an-integer-errors {
     SELECT i BETWEEN 0 AND 'x' FROM operands;

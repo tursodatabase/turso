@@ -73,6 +73,132 @@ pub(crate) fn choose_operator(op: &str, operands: &[OperandType]) -> Result<Oper
     }))
 }
 
+/// PostgreSQL's choice of the `=` (`<>` for NOT IN) of `x IN (a, b, ...)` for
+/// the values that read no column (`transformAExprIn` in parse_expr.c). The
+/// operands are `x` and then each of those values:
+///
+/// 1. An operand has a type that `CHECKED_TYPES` does not name, or has no
+///    type at all: the engine runs its own comparisons.
+/// 2. There is one such value, or the operands have no common type
+///    (`select_common_type`): each value is compared with `x` alone, which
+///    `choose_operator` decides.
+/// 3. The common type is a number type, and a row takes two operands of that
+///    type: each string literal is read as that type.
+/// 4. Otherwise the engine runs its own comparisons.
+///
+/// Every type of `CHECKED_TYPES` has a row for `=` and `<>` with itself, so
+/// a common type never makes the operator undefined.
+pub(crate) fn choose_list_operator(
+    op: &str,
+    operands: &[OperandType],
+) -> Result<Option<OperatorChoice>> {
+    let Some(types) = checked_operand_types(operands) else {
+        return Ok(Some(OperatorChoice::LeftToTheEngine));
+    };
+    let oids: Vec<Option<i64>> = types
+        .iter()
+        .map(|ty| ty.as_ref().map(|ty| ty.oid))
+        .collect();
+    let values = &oids[1..];
+    let Some(common) = common_type(&oids).filter(|_| values.len() > 1) else {
+        return Ok(None);
+    };
+    let takes_two = |row: &&Operator| row.name == op && row.left == common && row.right == common;
+    let row = OPERATORS.iter().find(takes_two);
+    let Some(ty) = types.iter().flatten().find(|ty| ty.oid == common) else {
+        return Ok(Some(OperatorChoice::LeftToTheEngine));
+    };
+    let Some(row) = row.filter(|_| pg_type_category(common) == Some("N")) else {
+        return Ok(Some(OperatorChoice::LeftToTheEngine));
+    };
+    let literals: Vec<&String> = operands
+        .iter()
+        .filter_map(|operand| match operand {
+            OperandType::StringLiteral(literal) => Some(literal),
+            _ => None,
+        })
+        .collect();
+    let mut left_to_the_engine = literals.is_empty();
+    for literal in literals {
+        if is_spelling_left_to_the_engine(literal, common) {
+            left_to_the_engine = true;
+        } else {
+            check_number_literal(literal, ty)?;
+        }
+    }
+    if left_to_the_engine {
+        return Ok(Some(OperatorChoice::LeftToTheEngine));
+    }
+    Ok(Some(OperatorChoice::Chosen(ChosenOperator {
+        id: row.oid,
+        operands: vec![ty.cast_to.clone(); operands.len()],
+    })))
+}
+
+/// The type that `select_common_type` (parse_coerce.c) gives these operands, a
+/// string literal or parameter being `None`: the first type, replaced by a
+/// later one of its category when the first casts to the later implicitly and
+/// not the other way, unless the first is the preferred type of the category.
+/// It is `None` when two types are of different categories or a type does not
+/// cast implicitly to the one chosen, and text when no operand has a type.
+fn common_type(types: &[Option<i64>]) -> Option<i64> {
+    let mut chosen: Option<i64> = None;
+    for &ty in types.iter().flatten() {
+        let Some(current) = chosen else {
+            chosen = Some(ty);
+            continue;
+        };
+        if ty == current {
+            continue;
+        }
+        if pg_type_category(ty) != pg_type_category(current) {
+            return None;
+        }
+        if !PREFERRED_TYPES.contains(&current)
+            && casts_implicitly(current, ty)
+            && !casts_implicitly(ty, current)
+        {
+            chosen = Some(ty);
+        }
+    }
+    let chosen = chosen.unwrap_or(TEXT);
+    let all_cast = types
+        .iter()
+        .flatten()
+        .all(|&ty| ty == chosen || casts_implicitly(ty, chosen));
+    all_cast.then_some(chosen)
+}
+
+fn casts_implicitly(from: i64, to: i64) -> bool {
+    IMPLICIT_CASTS.contains(&(from, to))
+}
+
+/// FIXME(pg-catalog): This hand-codes the rows of pg_cast with castcontext 'i' between the types of `CHECKED_TYPES`, and `PREFERRED_TYPES` the pg_type rows with typispreferred. A lookup in pg_cast and pg_type replaces both, and `fits`, which takes the implicit casts to be every cast within a typcategory, uses the same lookup.
+const IMPLICIT_CASTS: [(i64, i64); 20] = [
+    (DATE, TIMESTAMP),
+    (DATE, TIMESTAMPTZ),
+    (TIMESTAMP, TIMESTAMPTZ),
+    (FLOAT4, FLOAT8),
+    (INT2, INT4),
+    (INT2, INT8),
+    (INT2, FLOAT4),
+    (INT2, FLOAT8),
+    (INT2, NUMERIC),
+    (INT4, INT8),
+    (INT4, FLOAT4),
+    (INT4, FLOAT8),
+    (INT4, NUMERIC),
+    (INT8, FLOAT4),
+    (INT8, FLOAT8),
+    (INT8, NUMERIC),
+    (NUMERIC, FLOAT4),
+    (NUMERIC, FLOAT8),
+    (TEXT, VARCHAR),
+    (VARCHAR, TEXT),
+];
+
+const PREFERRED_TYPES: [i64; 4] = [BOOL, TEXT, FLOAT8, TIMESTAMPTZ];
+
 /// The operand types whose operators are decided by core's operator signatures
 /// for the arithmetic and bit operators, and the prefix `-` and `~`. Core has
 /// no signature for a comparison, so `OPERATORS` decides every comparison.
@@ -590,6 +716,71 @@ mod tests {
             Some(1752)
         );
         assert_eq!(chosen_id("=", &[integer(), integer()]), None);
+    }
+
+    fn list_choice(op: &str, operands: &[OperandType]) -> Option<OperatorChoice> {
+        choose_list_operator(op, operands).unwrap()
+    }
+
+    #[test]
+    fn an_in_list_gives_a_literal_the_common_type_of_its_values() {
+        let literal = || OperandType::StringLiteral("1.5".to_string());
+        let integer = || engine(EngineType::Integer);
+        let decimal = || engine(EngineType::Decimal);
+        let Some(OperatorChoice::Chosen(chosen)) =
+            list_choice("=", &[integer(), literal(), decimal()])
+        else {
+            panic!("a row takes numeric and numeric");
+        };
+        assert_eq!(chosen.id, 1752);
+        assert_eq!(chosen.operands.len(), 3);
+        assert!(chosen.operands.iter().all(|ty| ty.name == "NUMERIC"));
+
+        let two = || OperandType::StringLiteral("2".to_string());
+        let Some(OperatorChoice::Chosen(chosen)) =
+            list_choice("<>", &[integer(), two(), integer()])
+        else {
+            panic!("a row takes int4 and int4");
+        };
+        assert_eq!(chosen.id, 518);
+    }
+
+    #[test]
+    fn an_in_list_compares_each_value_when_there_is_no_common_type_or_one_value() {
+        let literal = || OperandType::StringLiteral("a".to_string());
+        let integer = || engine(EngineType::Integer);
+        let text = || engine(EngineType::Text);
+        assert!(list_choice("=", &[integer(), literal()]).is_none());
+        assert!(list_choice("=", &[text(), integer(), integer()]).is_none());
+        let boolean_and_numeric = [
+            registered("boolean"),
+            literal(),
+            engine(EngineType::Decimal),
+        ];
+        assert!(list_choice("=", &boolean_and_numeric).is_none());
+    }
+
+    #[test]
+    fn the_common_type_follows_the_implicit_casts() {
+        assert_eq!(
+            common_type(&[Some(INT4), None, Some(NUMERIC)]),
+            Some(NUMERIC)
+        );
+        assert_eq!(common_type(&[Some(NUMERIC), Some(INT4)]), Some(NUMERIC));
+        assert_eq!(
+            common_type(&[Some(INT2), Some(INT8), Some(INT4)]),
+            Some(INT8)
+        );
+        assert_eq!(
+            common_type(&[Some(INT4), Some(FLOAT8), Some(NUMERIC)]),
+            Some(FLOAT8)
+        );
+        assert_eq!(
+            common_type(&[Some(DATE), Some(TIMESTAMPTZ)]),
+            Some(TIMESTAMPTZ)
+        );
+        assert_eq!(common_type(&[Some(INT4), Some(TEXT)]), None);
+        assert_eq!(common_type(&[None, None]), Some(TEXT));
     }
 
     #[test]

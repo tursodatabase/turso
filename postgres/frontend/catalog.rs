@@ -280,6 +280,14 @@ impl Dialect for PostgresDialect {
         crate::operators::choose_operator(op, &operands())
     }
 
+    fn choose_list_operator(
+        &self,
+        op: &str,
+        operands: &dyn Fn() -> Vec<turso_core::dialect::OperandType>,
+    ) -> Result<Option<turso_core::dialect::OperatorChoice>> {
+        crate::operators::choose_list_operator(op, &operands())
+    }
+
     fn undefined_operator_error(&self, op: &str, operand_types: &[String]) -> LimboError {
         let names: Vec<&str> = operand_types.iter().map(String::as_str).collect();
         crate::functions::undefined_operator_of(op, &names)

@@ -136,7 +136,13 @@ a subquery, a CTE, a view or a catalog table, unless the column has one of the
 types boolean, smallint, bigint, numeric, varchar, date, timestamp,
 timestamptz or uuid: `text_column = (SELECT 1)` is compared. A string literal next to a value of a number type is read as that type when
 `pg_operator` has the operator for two operands of the type: `1 = '1'` is
-true, and `1 = 'a'`, `'a' + 1` and `int_column IN (1, 'x')` fail with 22P02.
+true, and `1 = 'a'`, `'a' + 1` and `int_column IN (1, 'x')` fail with 22P02. The values of an IN list that
+read no column are given one type together with the left side, as PostgreSQL
+does with `select_common_type`: `1 IN ('1.5', 1.5)` reads `'1.5'` as a
+numeric and is false, while `1 IN ('1.5', 2)` fails with 22P02. A value that
+reads a column is compared with the left side alone. The implicit casts of that choice are the
+rows of `pg_cast` between the types that `pg_operator` has rows for, written
+in the frontend.
 Still different from PostgreSQL: a literal next to an integer is checked
 against the range of bigint, a literal that is NaN, an infinity or a numeric past the range
 of a double next to a real, a double precision or a numeric is compared as text, `x IS DISTINCT FROM y` does not choose an operator unless an operand is a string literal, and `-'1'` is -1 where PostgreSQL fails with 42725. The message names the
