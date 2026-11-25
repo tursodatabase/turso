@@ -108,6 +108,14 @@ pub enum LimboError {
     SequenceExhausted { name: String, ascending: bool },
     #[error("{0}")]
     ParseError(String),
+    /// A statement uses something the engine does not support, such as a
+    /// feature in a place where the engine cannot run it.
+    #[error("{0}")]
+    NotSupported(String),
+    /// A statement uses an object as an object of another kind, such as a
+    /// function that is not an aggregate with ORDER BY.
+    #[error("{0}")]
+    WrongObjectType(String),
     /// Boxed: the parser error is ~96 bytes inline and would dominate
     /// `LimboError`'s size, which rides in every hot-path `Result`.
     #[error(transparent)]

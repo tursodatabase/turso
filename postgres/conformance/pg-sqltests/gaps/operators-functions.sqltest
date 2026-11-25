@@ -565,7 +565,7 @@ test json-agg {
 expect {
     [1, 2, 3, 4]
 }
-@sqlstate 42601
+@sqlstate 42809
 expect @tursopg error {}
 
 # B-66: jsonb_agg
@@ -577,7 +577,7 @@ test jsonb-agg {
 expect {
     [1, 2, 3, 4]
 }
-@sqlstate 42601
+@sqlstate 42809
 expect @tursopg error {}
 
 # B-67: to_json(scalar)
@@ -634,7 +634,7 @@ test json-object-agg {
 expect {
     { "abc" : 10, "Abd" : null }
 }
-@sqlstate 42601
+@sqlstate 42809
 expect @tursopg error {}
 
 # B-72: coalesce(json_agg(...), '[]')

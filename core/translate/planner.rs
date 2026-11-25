@@ -611,10 +611,10 @@ pub fn resolve_window_and_aggregate_functions(
                 }
 
                 if !order_by.is_empty() && filter_over.over_clause.is_some() {
-                    crate::bail_parse_error!(
+                    return Err(crate::LimboError::WrongObjectType(format!(
                         "ORDER BY may not be used with non-aggregate {}()",
                         name.as_str()
-                    );
+                    )));
                 }
                 let args_count = args.len();
                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
@@ -699,10 +699,10 @@ pub fn resolve_window_and_aggregate_functions(
                     _ => {}
                 }
                 if !order_by.is_empty() {
-                    crate::bail_parse_error!(
+                    return Err(crate::LimboError::WrongObjectType(format!(
                         "ORDER BY may not be used with non-aggregate {}()",
                         name.as_str()
-                    );
+                    )));
                 }
             }
             Expr::FunctionCallStar { name, filter_over } => {
