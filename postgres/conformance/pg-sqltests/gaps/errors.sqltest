@@ -316,17 +316,6 @@ expect error {}
 @sqlstate 0A000
 expect @tursopg error {}
 
-# D-32: numeric(p,s) overflow
-@compat-gap "type:numeric"
-test numeric-p-s-overflow {
-    CREATE TABLE t (n numeric(5,2));
-    INSERT INTO t VALUES (12345.678);
-}
-@sqlstate 22003
-expect error {}
-@sqlstate 23000
-expect @tursopg error {}
-
 # D-34: smallint column overflow
 test smallint-column-overflow {
     CREATE TABLE t (n smallint);

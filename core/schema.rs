@@ -324,7 +324,7 @@ pub const BINARY_OPERATORS: [&str; 9] = ["+", "-", "*", "/", "%", "&", "|", "<<"
 pub const PREFIX_OPERATORS: [&str; 2] = ["-", "~"];
 
 /// SQLite's binary operator `op` on a value of the type and an operand `other`.
-pub(crate) fn sqlite_operator(op: &'static str, other: OperatorArg) -> [OperatorSignature; 2] {
+pub fn sqlite_operator(op: &'static str, other: OperatorArg) -> [OperatorSignature; 2] {
     use OperatorArg::Value;
     [[Value, other], [other, Value]].map(|args| OperatorSignature {
         op,

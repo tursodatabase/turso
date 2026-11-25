@@ -6,6 +6,7 @@
 mod boolean;
 mod integer;
 mod integer_operators;
+mod numeric;
 
 pub(crate) use integer::split_sign;
 pub use integer::IntegerType;
@@ -24,7 +25,8 @@ pub(crate) fn register_builtin_types(builder: SchemaBuilder) -> Result<SchemaBui
         .builtin_type(&boolean::Boolean)?
         .builtin_type(&IntegerType::Int2)?
         .builtin_type(&IntegerType::Int4)?
-        .builtin_type(&IntegerType::Int8)
+        .builtin_type(&IntegerType::Int8)?
+        .builtin_type(&numeric::Numeric)
 }
 
 // FIXME(pg-catalog): three places that do not know about each other say what

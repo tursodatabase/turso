@@ -1305,7 +1305,7 @@ pub(crate) fn exec_validate_ipaddr(value: &Value) -> crate::Result<Value> {
 }
 
 /// The stored form of the number `value` as a numeric.
-pub(crate) fn exec_numeric_encode(value: &Value) -> crate::Result<Value> {
+pub fn exec_numeric_encode(value: &Value) -> crate::Result<Value> {
     Ok(match value {
         Value::Null => Value::Null,
         other => {
@@ -1317,11 +1317,7 @@ pub(crate) fn exec_numeric_encode(value: &Value) -> crate::Result<Value> {
 
 /// The stored numeric `value` rounded to `scale`, or an error when it has
 /// more digits than `precision` allows.
-pub(crate) fn exec_numeric_fit(
-    value: &Value,
-    precision: &Value,
-    scale: &Value,
-) -> crate::Result<Value> {
+pub fn exec_numeric_fit(value: &Value, precision: &Value, scale: &Value) -> crate::Result<Value> {
     Ok(match value {
         Value::Null => Value::Null,
         Value::Blob(stored) => {
@@ -1348,7 +1344,7 @@ pub(crate) fn exec_numeric_fit(
 }
 
 /// The text of the stored numeric `value`.
-pub(crate) fn exec_numeric_decode(value: &Value) -> crate::Result<Value> {
+pub fn exec_numeric_decode(value: &Value) -> crate::Result<Value> {
     Ok(match value {
         Value::Null => Value::Null,
         Value::Blob(b) => Value::build_text(format_numeric(&blob_to_bigdecimal(b)?)),

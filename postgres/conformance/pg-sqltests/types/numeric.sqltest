@@ -1,0 +1,28 @@
+# The numeric type rounds to the scale of its column and fails with PostgreSQL's errors.
+
+@database :memory:
+
+test numeric-column-rounds-half-away-from-zero {
+    CREATE TABLE t (n numeric(10,2));
+    INSERT INTO t VALUES ('1.005'), ('2.675'), ('-1.005');
+    SELECT n FROM t;
+}
+expect {
+    1.01
+    2.68
+    -1.01
+}
+
+test numeric-column-rejects-text-that-is-not-a-number {
+    CREATE TABLE t (n numeric(5,2));
+    INSERT INTO t VALUES ('abc');
+}
+@sqlstate 22P02
+expect error {}
+
+test numeric-p-s-overflow {
+    CREATE TABLE t (n numeric(5,2));
+    INSERT INTO t VALUES (12345.678);
+}
+@sqlstate 22003
+expect error {}
