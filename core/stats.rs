@@ -326,39 +326,37 @@ fn load_sqlite_stat1_row(
     schema: &Schema,
     stats: &mut AnalyzeStats,
 ) -> Result<()> {
-    let (namespace, table_name) = schema.demangle_name(row.get::<&str>(0)?);
-    let idx_value = row.get::<&Value>(1)?;
-    let stat_value = row.get::<&Value>(2)?;
-
-    let idx_name = match idx_value {
-        Value::Null => None,
-        Value::Text(s) => Some(s.as_str()),
-        _ => None,
+    // Match SQLite's analysisLoader (sqlite3_exec / sqlite3_column_text):
+    // skip rows with NULL tbl or stat and coerce non-NULL values to text
+    // instead of failing the whole scan on a type mismatch.
+    let Some(tbl_text) = row.get::<&Value>(0)?.cast_text_ref() else {
+        return Ok(());
     };
-    let stat = match stat_value {
-        Value::Text(s) => s.as_str(),
-        _ => return Ok(()),
+    let (namespace, table_name) = schema.demangle_name(&tbl_text);
+    let idx_name = row.get::<&Value>(1)?.cast_text_ref();
+    let Some(stat) = row.get::<&Value>(2)?.cast_text_ref() else {
+        return Ok(());
     };
 
     // Skip if table is not a regular B-tree.
     if schema.get_btree_table(namespace, table_name).is_none() {
         return Ok(());
     }
-    let Some(numbers) = parse_stat_numbers(stat) else {
+    let Some(numbers) = parse_stat_numbers(&stat) else {
         return Ok(());
     };
     if numbers.is_empty() {
         return Ok(());
     }
-    if idx_name.is_none() {
+    let Some(idx_name) = idx_name else {
         if let Some(total_rows) = numbers.first().copied() {
             stats.table_stats_mut(namespace, table_name).row_count = Some(total_rows);
         }
         return Ok(());
-    }
+    };
 
     // Index-level entry: only keep if the index exists on this table.
-    let idx_name = normalize_ident(idx_name.unwrap());
+    let idx_name = normalize_ident(&idx_name);
     if schema.get_index(namespace, table_name, &idx_name).is_none() {
         return Ok(());
     }
