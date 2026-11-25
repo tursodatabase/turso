@@ -511,3 +511,36 @@ fn mvcc_busy_schema_writer_can_retry_with_a_subscription() {
     contender.execute("INSERT INTO t(id) VALUES(7)").unwrap();
     assert_eq!(sub.try_recv(), Some(batch("t", [vec![Value::from_i64(7)]])));
 }
+
+#[turso_macros::test(mvcc)]
+fn nested_named_savepoints_bound_the_commit_batch(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let sub = db.db.subscribe_changes(ChangeFilter::All);
+    for end in ["COMMIT", "RELEASE outermost"] {
+        for sql in [
+            "SAVEPOINT outermost",
+            "INSERT INTO t VALUES(1)",
+            "SAVEPOINT s",
+            "INSERT INTO t VALUES(2)",
+            "SAVEPOINT s",
+            "INSERT INTO t VALUES(3)",
+            "RELEASE s",
+            "ROLLBACK TO s",
+            "INSERT INTO t VALUES(4)",
+            "SAVEPOINT final",
+            "INSERT INTO t VALUES(5)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        assert_eq!(sub.try_recv(), None);
+        conn.execute(end).unwrap();
+        assert_eq!(
+            sub.try_recv(),
+            Some(batch("t", [1, 4, 5].map(|k| vec![Value::from_i64(k)])))
+        );
+        conn.execute("DELETE FROM t").unwrap();
+        assert!(sub.try_recv().is_some());
+    }
+}

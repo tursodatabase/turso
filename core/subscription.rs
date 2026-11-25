@@ -471,7 +471,7 @@ impl Capture {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ChangeSnapshot {
+struct ChangeSnapshot {
     // MVCC sequences may commit an inner transaction on the same connection.
     owner: Option<u64>,
     // Listeners registered after this ID may have missed a write.
@@ -527,6 +527,9 @@ pub(crate) struct PendingChanges(Mutex<PendingState>);
 
 #[derive(Default, Debug)]
 struct PendingState {
+    // Each frame holds the changes preceding its named savepoint. The current
+    // transaction delta contains only changes since the newest savepoint.
+    saved: Vec<ChangeSnapshot>,
     transaction: ChangeSnapshot,
     // Present only while a statement may roll back independently.
     statement: Option<ChangeSnapshot>,
@@ -551,12 +554,25 @@ impl PendingChanges {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> ChangeSnapshot {
-        self.0.lock().transaction.clone()
+    pub(crate) fn open_savepoint(&self) {
+        let mut pending = self.0.lock();
+        let prefix = std::mem::take(&mut pending.transaction);
+        pending.saved.push(prefix);
     }
 
-    pub(crate) fn restore(&self, snapshot: ChangeSnapshot) {
-        self.0.lock().transaction = snapshot;
+    pub(crate) fn release_savepoints(&self, depth: usize) {
+        let mut pending = self.0.lock();
+        while pending.saved.len() > depth {
+            let mut prefix = pending.saved.pop().expect("named savepoint");
+            prefix.merge(std::mem::take(&mut pending.transaction));
+            pending.transaction = prefix;
+        }
+    }
+
+    pub(crate) fn rollback_to_savepoint(&self, depth: usize) {
+        let mut pending = self.0.lock();
+        pending.saved.truncate(depth + 1);
+        pending.transaction = ChangeSnapshot::default();
     }
 
     fn record(
@@ -570,6 +586,7 @@ impl PendingChanges {
         let PendingState {
             transaction,
             statement,
+            ..
         } = &mut *pending;
         let changes = statement.as_mut().unwrap_or(transaction);
         if changes.through.is_none() {
@@ -590,30 +607,47 @@ impl PendingChanges {
         tx_id: u64,
         registry: &Arc<ChangeRegistry>,
     ) -> Option<CommitNotification> {
-        let state = self.0.lock();
-        let pending = &state.transaction;
-        if pending.owner != Some(tx_id) || pending.through.is_none() {
-            return None;
+        let pending = self.0.lock();
+        let mut changes = ChangeSnapshot::default();
+        for delta in pending
+            .saved
+            .iter()
+            .chain(std::iter::once(&pending.transaction))
+        {
+            if delta.owner == Some(tx_id) {
+                changes.merge(delta.clone());
+            }
         }
-        Some(CommitNotification {
+        changes.through.map(|_| CommitNotification {
             registry: Arc::downgrade(registry),
-            changes: pending.clone(),
+            changes,
         })
     }
 
     pub(crate) fn finish(&self, owner: Option<u64>, registry: Option<&ChangeRegistry>) {
         let mut state = self.0.lock();
-        if state.statement.as_ref().is_some_and(|s| s.owner == owner) {
-            if let Some(delta) = state.statement.take() {
-                state.transaction.merge(delta);
+        let PendingState {
+            saved,
+            transaction,
+            statement,
+        } = &mut *state;
+        let mut statement = statement.take_if(|s| s.owner == owner);
+        let mut changes = ChangeSnapshot::default();
+        for delta in saved
+            .iter_mut()
+            .chain(std::iter::once(transaction))
+            .chain(statement.iter_mut())
+        {
+            if delta.owner == owner {
+                let delta = std::mem::take(delta);
+                if registry.is_some() {
+                    changes.merge(delta);
+                }
             }
         }
-        if state.transaction.owner == owner {
-            let batch = std::mem::take(&mut state.transaction);
-            drop(state);
-            if let Some(registry) = registry {
-                batch.publish(registry);
-            }
+        drop(state);
+        if let Some(registry) = registry {
+            changes.publish(registry);
         }
     }
 }

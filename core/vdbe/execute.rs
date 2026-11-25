@@ -5773,7 +5773,6 @@ pub fn op_savepoint(
                         )?;
                     }
                     let frame = crate::connection::NamedSavepointFrame {
-                        change_snapshot: conn.pending_changes.snapshot(),
                         name: name.clone(),
                         starts_transaction,
                         deferred_fk_violations,
@@ -14403,6 +14402,8 @@ fn op_clear_btree_inner(
                                 connection
                                     .subscription_route(&table)
                                     .record(connection, None);
+                            } else {
+                                connection.pending_changes.record_refresh(connection);
                             }
                         }
                         state.record_statement_changes(changes);

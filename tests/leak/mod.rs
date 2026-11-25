@@ -248,5 +248,12 @@ fn updating_one_row_does_not_copy_pending_subscription_keys() {
         "additional allocation: {} bytes",
         populated.saturating_sub(baseline)
     );
+    conn.execute("SAVEPOINT nested").unwrap();
+    let saved = measure();
+    assert!(
+        saved < baseline + 65536,
+        "update after SAVEPOINT allocated {saved} bytes"
+    );
+    conn.execute("ROLLBACK TO nested").unwrap();
     conn.execute("ROLLBACK").unwrap();
 }

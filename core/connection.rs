@@ -148,7 +148,6 @@ impl TempDbContext {
 
 #[derive(Debug, Clone)]
 pub(crate) struct NamedSavepointFrame {
-    pub(crate) change_snapshot: crate::subscription::ChangeSnapshot,
     pub(crate) name: String,
     pub(crate) starts_transaction: bool,
     pub(crate) deferred_fk_violations: isize,
@@ -4779,7 +4778,9 @@ impl Connection {
     }
 
     pub(crate) fn push_named_savepoint(&self, frame: NamedSavepointFrame) {
-        self.named_savepoints.write().push(frame);
+        let mut frames = self.named_savepoints.write();
+        self.pending_changes.open_savepoint();
+        frames.push(frame);
     }
 
     /// Snapshot the in-memory schemas (main, temp, attached) for a
@@ -4817,6 +4818,7 @@ impl Connection {
         if savepoints[target_idx].starts_transaction && target_idx == 0 {
             return SavepointResult::Commit;
         }
+        self.pending_changes.release_savepoints(target_idx);
         savepoints.truncate(target_idx);
         SavepointResult::Release
     }
@@ -4827,7 +4829,7 @@ impl Connection {
             .iter()
             .rposition(|savepoint| savepoint.name == name)?;
         let frame = &savepoints[target_idx];
-        self.pending_changes.restore(frame.change_snapshot.clone());
+        self.pending_changes.rollback_to_savepoint(target_idx);
         let info = RollbackFrameInfo {
             main_schema_snapshot: frame.main_schema_snapshot.clone(),
             temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
@@ -4841,7 +4843,11 @@ impl Connection {
     }
 
     pub(crate) fn clear_named_savepoints(&self) {
-        self.named_savepoints.write().clear();
+        let mut frames = self.named_savepoints.write();
+        if !frames.is_empty() {
+            self.pending_changes.release_savepoints(0);
+            frames.clear();
+        }
     }
 
     /// Park a statement's index-method cursor on the connection until the
