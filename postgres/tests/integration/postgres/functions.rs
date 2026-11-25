@@ -768,6 +768,35 @@ fn test_pg_quote_functions(db: TempDatabase) {
     }
 }
 
+/// An untyped bind parameter that looks like a number, such as '12', reaches
+/// these functions as an integer, but PostgreSQL types it as text.
+#[turso_macros::test(mvcc)]
+fn test_pg_text_functions_read_numeric_parameters_as_text(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    for (sql, parameter, expected) in [
+        ("SELECT quote_ident($1)", 12, "\"12\""),
+        ("SELECT to_char(5, $1)", 9, " 5"),
+        (
+            "SELECT CASE WHEN pg_input_is_valid($1, 'int4') THEN 'valid' ELSE 'invalid' END",
+            12,
+            "valid",
+        ),
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.bind_at(
+            std::num::NonZero::new(1).unwrap(),
+            Value::from_i64(parameter),
+        )
+        .unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::build_text(expected)]],
+            "{sql}"
+        );
+    }
+}
+
 #[turso_macros::test(mvcc)]
 fn test_pg_quote_literal(db: TempDatabase) {
     let conn = db.connect_postgres();
