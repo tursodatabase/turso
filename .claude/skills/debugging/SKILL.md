@@ -71,9 +71,9 @@ Move the work before and after the recursive call into `#[inline(never)]` helper
 and keep large values (plans, contexts, AST nodes) in a `Box`.
 
 `sqlite/conformance/turso-sqltests/nesting-limits.sqltest` runs queries at the
-nesting limits, and one level past them, on the CLI backend. CI runs it with a
-release build and an 8 MiB stack. A debug build skips it. When you add a kind of
-nesting, add a query there.
+nesting limits, and one level past them, on the Rust backend. CI runs it with a
+release build, on worker threads with a 2 MiB stack. A debug build skips it. When
+you add a kind of nesting, add a query there.
 
 ## Corruption
 

@@ -7,10 +7,12 @@
 # the optimizer or the emitter. If a stack frame on one of these paths becomes
 # larger, a query at the limit can overflow the stack.
 #
-# The tests run only on the CLI backend, in a tursodb process that has the
-# main-thread stack of the runner: 8 MiB in CI. A stack overflow then stops
-# only that process. The file is skipped in a debug build, because debug
-# frames are much larger: there, 100 nested FROM subqueries need 5.7 MiB.
+# The tests run only on the Rust backend, which runs each test on a worker
+# thread with a 2 MiB stack. This is the stack that Rust gives to a thread that
+# it starts. The CLI and JS backends have a larger stack. If a query overflows
+# the stack, the whole runner stops with "has overflowed its stack". The file is
+# skipped in a debug build, because debug frames are much larger: there, 100
+# nested FROM subqueries need 5.7 MiB.
 #
 # The comment before each pair of tests gives the Python expression that makes
 # the query for a depth D.
@@ -24,7 +26,7 @@ setup t {
 #     "SELECT * FROM " + "(SELECT * FROM " * D + "t" + ")" * D + ";"
 
 @setup t
-@backend cli
+@backend rust
 test from-subquery-at-limit {
     SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT
     * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM
@@ -117,7 +119,7 @@ expect {
 }
 
 @setup t
-@backend cli
+@backend rust
 test from-subquery-over-limit {
     SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT
     * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM
@@ -213,7 +215,7 @@ expect error {
 #     "SELECT t.x FROM t JOIN (" * D + "SELECT x FROM t" + ") ON 1" * D + ";"
 
 @setup t
-@backend cli
+@backend rust
 test join-subquery-at-limit {
     SELECT t.x FROM t JOIN (SELECT t.x FROM t JOIN (SELECT t.x FROM t JOIN (SELECT t.x FROM t JOIN
     (SELECT t.x FROM t JOIN (SELECT t.x FROM t JOIN (SELECT t.x FROM t JOIN (SELECT t.x FROM t JOIN
@@ -378,7 +380,7 @@ expect {
 }
 
 @setup t
-@backend cli
+@backend rust
 test join-subquery-over-limit {
     SELECT t.x FROM t JOIN (SELECT t.x FROM t JOIN (SELECT t.x FROM t JOIN (SELECT t.x FROM t JOIN
     (SELECT t.x FROM t JOIN (SELECT t.x FROM t JOIN (SELECT t.x FROM t JOIN (SELECT t.x FROM t JOIN
@@ -547,7 +549,7 @@ expect error {
 #     + "SELECT * FROM (SELECT 1 AS x UNION ALL " * (D - 1) + "SELECT 1" + ")" * D + ";"
 
 @setup t
-@backend cli
+@backend rust
 test compound-subquery-at-limit {
     SELECT count(*) FROM (SELECT 1 AS x UNION ALL SELECT * FROM (SELECT 1 AS x UNION ALL SELECT *
     FROM (SELECT 1 AS x UNION ALL SELECT * FROM (SELECT 1 AS x UNION ALL SELECT * FROM (SELECT 1 AS
@@ -762,7 +764,7 @@ expect {
 }
 
 @setup t
-@backend cli
+@backend rust
 test compound-subquery-over-limit {
     SELECT count(*) FROM (SELECT 1 AS x UNION ALL SELECT * FROM (SELECT 1 AS x UNION ALL SELECT *
     FROM (SELECT 1 AS x UNION ALL SELECT * FROM (SELECT 1 AS x UNION ALL SELECT * FROM (SELECT 1 AS
@@ -982,7 +984,7 @@ expect error {
 #     sql = f"WITH n{i} AS ({sql}) SELECT * FROM n{i}"
 
 @setup t
-@backend cli
+@backend rust
 test nested-cte-at-limit {
     WITH n499 AS (WITH n498 AS (WITH n497 AS (WITH n496 AS (WITH n495 AS (WITH n494 AS (WITH n493 AS
     (WITH n492 AS (WITH n491 AS (WITH n490 AS (WITH n489 AS (WITH n488 AS (WITH n487 AS (WITH n486
@@ -1170,7 +1172,7 @@ expect {
 }
 
 @setup t
-@backend cli
+@backend rust
 test nested-cte-over-limit {
     WITH n500 AS (WITH n499 AS (WITH n498 AS (WITH n497 AS (WITH n496 AS (WITH n495 AS (WITH n494 AS
     (WITH n493 AS (WITH n492 AS (WITH n491 AS (WITH n490 AS (WITH n489 AS (WITH n488 AS (WITH n487
@@ -1362,7 +1364,7 @@ expect error {
 #     f"SELECT count(*) FROM (SELECT {cols} FROM t);"
 
 @setup t
-@backend cli
+@backend rust
 test windows-at-limit {
     SELECT count(*) FROM (SELECT sum(x) OVER (ORDER BY x ROWS 0 PRECEDING), sum(x) OVER (ORDER BY x
     ROWS 1 PRECEDING), sum(x) OVER (ORDER BY x ROWS 2 PRECEDING), sum(x) OVER (ORDER BY x ROWS 3
@@ -1620,7 +1622,7 @@ expect {
 }
 
 @setup t
-@backend cli
+@backend rust
 test windows-over-limit {
     SELECT count(*) FROM (SELECT sum(x) OVER (ORDER BY x ROWS 0 PRECEDING), sum(x) OVER (ORDER BY x
     ROWS 1 PRECEDING), sum(x) OVER (ORDER BY x ROWS 2 PRECEDING), sum(x) OVER (ORDER BY x ROWS 3
@@ -2389,7 +2391,7 @@ setup views {
 
 @setup views
 @skip-if mvcc "views not supported in MVCC mode"
-@backend cli
+@backend rust
 test view-chain-at-limit {
     SELECT * FROM v499;
 }
@@ -2399,7 +2401,7 @@ expect {
 
 @setup views
 @skip-if mvcc "views not supported in MVCC mode"
-@backend cli
+@backend rust
 test view-chain-over-limit {
     SELECT * FROM v500;
 }
