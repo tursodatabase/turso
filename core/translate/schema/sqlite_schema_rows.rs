@@ -251,11 +251,11 @@ pub(crate) fn emit_delete_sequence_backing_table_row(
     let type_str_reg = program.alloc_register();
     program.emit_insn(Insn::String8 {
         dest: seq_name_reg,
-        value: backing_table_name,
+        value: backing_table_name.into(),
     });
     program.emit_insn(Insn::String8 {
         dest: type_str_reg,
-        value: "table".to_string(),
+        value: "table".to_string().into(),
     });
 
     // Scan sqlite_schema for (type='table' AND name=backing_table_name) and delete the row.
@@ -766,11 +766,11 @@ fn emit_drop_view_row(
 
     program.emit_insn(Insn::String8 {
         dest: view_name_reg,
-        value: ctx.resolver.mangle_name(namespace, view.name),
+        value: ctx.resolver.mangle_name(namespace, view.name).into(),
     });
     program.emit_insn(Insn::String8 {
         dest: type_reg,
-        value: "view".to_string(),
+        value: "view".to_string().into(),
     });
 
     let end_loop_label = program.allocate_label();
@@ -1061,7 +1061,7 @@ fn emit_delete_type_row(
     let name_reg = program.alloc_register();
     program.emit_insn(Insn::String8 {
         dest: name_reg,
-        value: ty.name.to_string(),
+        value: ty.name.to_string().into(),
     });
 
     let end_loop_label = program.allocate_label();
@@ -1237,7 +1237,7 @@ fn emit_namespace_row(program: &mut ProgramBuilder, cursor_id: usize, id: Namesp
         dest_end: None,
     });
     program.emit_insn(Insn::String8 {
-        value: name.to_string(),
+        value: name.to_string().into(),
         dest: record_start_reg + 1,
     });
     let record_reg = program.alloc_register();

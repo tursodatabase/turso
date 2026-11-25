@@ -838,7 +838,7 @@ fn emit_virtual_table_scan_start(
         let register = program.alloc_register();
         program.emit_insn(Insn::String8 {
             dest: register,
-            value: value.to_owned(),
+            value: value.to_owned().into(),
         });
         register
     });

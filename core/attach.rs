@@ -59,7 +59,7 @@ pub fn translate_attach(
         Expr::Literal(Literal::String(s)) => {
             // For ATTACH, string literals should be used directly (without quotes)
             program.emit_insn(Insn::String8 {
-                value: sanitize_string(s),
+                value: sanitize_string(s).into(),
                 dest: arg_reg,
             });
         }
@@ -67,14 +67,14 @@ pub fn translate_attach(
             // For ATTACH, qualified expressions like "foo.db" should be treated as filename strings
             let filename = expr.to_string();
             program.emit_insn(Insn::String8 {
-                value: filename,
+                value: filename.into(),
                 dest: arg_reg,
             });
         }
         Expr::Id(id) => {
             // For ATTACH, identifiers should be treated as filename strings
             program.emit_insn(Insn::String8 {
-                value: normalize_ident(id.as_str()),
+                value: normalize_ident(id.as_str()).into(),
                 dest: arg_reg,
             });
         }
@@ -89,7 +89,7 @@ pub fn translate_attach(
         Expr::Literal(Literal::String(s)) => {
             // For ATTACH, string literals should be used directly (without quotes)
             program.emit_insn(Insn::String8 {
-                value: sanitize_string(s),
+                value: sanitize_string(s).into(),
                 dest: arg_reg + 1,
             });
         }
@@ -97,7 +97,7 @@ pub fn translate_attach(
             // For ATTACH, qualified expressions should be treated as name strings
             let db_name_str = format!("{db_name}");
             program.emit_insn(Insn::String8 {
-                value: db_name_str,
+                value: db_name_str.into(),
                 dest: arg_reg + 1,
             });
         }
@@ -105,7 +105,7 @@ pub fn translate_attach(
             // For ATTACH, identifiers should be treated as name strings
             // Use normalize_ident to strip quotes from double-quoted identifiers
             program.emit_insn(Insn::String8 {
-                value: normalize_ident(id.as_str()),
+                value: normalize_ident(id.as_str()).into(),
                 dest: arg_reg + 1,
             });
         }
@@ -185,7 +185,7 @@ pub fn translate_detach(
         Expr::Literal(Literal::String(s)) => {
             // For DETACH, string literals should be used directly (without quotes)
             program.emit_insn(Insn::String8 {
-                value: sanitize_string(s),
+                value: sanitize_string(s).into(),
                 dest: arg_reg,
             });
         }
@@ -193,7 +193,7 @@ pub fn translate_detach(
             // For DETACH, qualified expressions should be treated as name strings
             let db_name_str = format!("{expr}");
             program.emit_insn(Insn::String8 {
-                value: db_name_str,
+                value: db_name_str.into(),
                 dest: arg_reg,
             });
         }
@@ -201,7 +201,7 @@ pub fn translate_detach(
             // For DETACH, identifiers should be treated as name strings
             // Use normalize_ident to strip quotes from double-quoted identifiers
             program.emit_insn(Insn::String8 {
-                value: normalize_ident(id.as_str()),
+                value: normalize_ident(id.as_str()).into(),
                 dest: arg_reg,
             });
         }

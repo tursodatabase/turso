@@ -1141,7 +1141,7 @@ fn translate_function_call_expr(
             }
             for (i, type_name) in argument_types.into_iter().enumerate() {
                 program.emit_insn(Insn::String8 {
-                    value: type_name,
+                    value: type_name.into(),
                     dest: regs + args_count + i,
                 });
             }
@@ -2565,7 +2565,7 @@ fn translate_id_expr(
     }
     // DQS enabled: treat double-quoted identifiers as string literals (SQLite compatibility)
     program.emit_insn(Insn::String8 {
-        value: id.as_str().to_string(),
+        value: id.as_str().to_string().into(),
         dest: target_register,
     });
     Ok(target_register)

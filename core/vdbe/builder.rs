@@ -1703,12 +1703,18 @@ impl ProgramBuilder {
     }
 
     pub fn emit_string8(&mut self, value: String, dest: usize) {
-        self.emit_insn(Insn::String8 { value, dest });
+        self.emit_insn(Insn::String8 {
+            value: value.into(),
+            dest,
+        });
     }
 
     pub fn emit_string8_new_reg(&mut self, value: String) -> usize {
         let dest = self.alloc_register();
-        self.emit_insn(Insn::String8 { value, dest });
+        self.emit_insn(Insn::String8 {
+            value: value.into(),
+            dest,
+        });
         dest
     }
 

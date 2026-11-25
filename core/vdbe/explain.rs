@@ -1178,7 +1178,7 @@ pub fn insn_to_row(
                 0,
                 *dest as i64,
                 0,
-                Value::build_text(value.clone()),
+                Value::build_text(value.as_str().to_owned()),
                 0,
                 format!("r[{dest}]='{value}'"),
             ),

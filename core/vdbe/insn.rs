@@ -1274,7 +1274,7 @@ pub enum Insn {
 
     // Write a string value into a register.
     String8 {
-        value: String,
+        value: String8Value,
         dest: usize,
     },
 
@@ -2813,6 +2813,39 @@ pub enum Cookie {
     PageSize = 9,
 }
 
+/// The string of an [`Insn::String8`] instruction. Its `Debug` output hides
+/// the encryption key in each URI parameter, because the string can be the
+/// URI of ATTACH, such as `file:a.db?cipher=aegis256&hexkey=<key>`, and logs
+/// and panic messages show instructions with `Debug`. Its `Display` output is
+/// the string as it is.
+#[derive(Clone)]
+pub struct String8Value(String);
+
+impl String8Value {
+    /// The string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for String8Value {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl std::fmt::Debug for String8Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&crate::redact::RedactKeysDebug(&self.0), f)
+    }
+}
+
+impl std::fmt::Display for String8Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -2824,6 +2857,20 @@ mod tests {
             std::mem::size_of::<super::Insn>() <= 96,
             "Insn grew to {} bytes",
             std::mem::size_of::<super::Insn>()
+        );
+    }
+
+    /// A String8 can hold the URI of ATTACH. Its Debug output, which logs and
+    /// panic messages show, hides the key in the URI.
+    #[test]
+    fn string8_debug_output_hides_uri_keys() {
+        let insn = super::Insn::String8 {
+            value: "file:a.db?cipher=aegis256&hexkey=5ec7e7".to_string().into(),
+            dest: 1,
+        };
+        assert_eq!(
+            format!("{insn:?}"),
+            "String8 { value: \"file:a.db?cipher=aegis256&hexkey=<redacted>\", dest: 1 }"
         );
     }
 }

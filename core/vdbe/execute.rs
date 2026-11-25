@@ -6446,7 +6446,7 @@ pub fn op_string8(
     // without first copying the string into a String that is then freed.
     match &mut state.registers[*dest] {
         Register::Value(Value::Text(existing)) => existing.do_extend(&value.as_str())?,
-        register => register.set_text(Text::new(value.clone()))?,
+        register => register.set_text(Text::new(value.as_str().to_owned()))?,
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

@@ -317,7 +317,7 @@ pub(crate) fn translate_create_role(
         dest_end: None,
     });
     program.emit_insn(Insn::String8 {
-        value: name.to_string(),
+        value: name.to_string().into(),
         dest: first_column_reg + 1,
     });
     program.emit_insn(Insn::Integer {
@@ -652,7 +652,7 @@ fn emit_role_delete(
     program.preassign_label_to_next_insn(found);
     let key_reg = program.alloc_registers(2);
     program.emit_insn(Insn::String8 {
-        value: role.name.clone(),
+        value: role.name.clone().into(),
         dest: key_reg,
     });
     program.emit_insn(Insn::Copy {
@@ -714,7 +714,7 @@ fn emit_name_index_insert(
 ) {
     let key_reg = program.alloc_registers(2);
     program.emit_insn(Insn::String8 {
-        value: name.to_string(),
+        value: name.to_string().into(),
         dest: key_reg,
     });
     program.emit_insn(Insn::Copy {

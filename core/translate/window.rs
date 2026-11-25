@@ -1112,7 +1112,7 @@ fn emit_window_check_offset(
         // there too.
         let reg_empty = program.alloc_register();
         program.emit_insn(Insn::String8 {
-            value: String::new(),
+            value: String::new().into(),
             dest: reg_empty,
         });
         program.emit_insn(Insn::Ge {
@@ -2699,7 +2699,7 @@ fn emit_window_range_test(
     if type_arithmetic.is_none() {
         let reg_empty = program.alloc_register();
         program.emit_insn(Insn::String8 {
-            value: String::new(),
+            value: String::new().into(),
             dest: reg_empty,
         });
         program.emit_insn(Insn::Ge {

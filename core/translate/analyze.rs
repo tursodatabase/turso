@@ -290,7 +290,7 @@ pub fn translate_analyze(
         let mangled_table_name = resolver.mangle_name(namespace, &target_table.name);
         let target_tbl_reg = program.alloc_register();
         program.emit_insn(Insn::String8 {
-            value: mangled_table_name.clone(),
+            value: mangled_table_name.clone().into(),
             dest: target_tbl_reg,
         });
         program.mark_last_insn_constant();
@@ -314,7 +314,7 @@ pub fn translate_analyze(
             });
             let target_idx_reg = program.alloc_register();
             program.emit_insn(Insn::String8 {
-                value: idx.name.to_string(),
+                value: idx.name.to_string().into(),
                 dest: target_idx_reg,
             });
             program.mark_last_insn_constant();
@@ -377,7 +377,7 @@ pub fn translate_analyze(
         });
         let tablename_reg = program.alloc_register();
         program.emit_insn(Insn::String8 {
-            value: mangled_table_name.clone(),
+            value: mangled_table_name.clone().into(),
             dest: tablename_reg,
         });
         program.mark_last_insn_constant();
@@ -639,12 +639,12 @@ fn emit_index_stats(
     // Allocate contiguous registers for MakeRecord: tablename, indexname, stat
     let record_start = program.alloc_registers(3);
     program.emit_insn(Insn::String8 {
-        value: mangled_table_name.to_string(),
+        value: mangled_table_name.to_string().into(),
         dest: record_start,
     });
     program.mark_last_insn_constant();
     program.emit_insn(Insn::String8 {
-        value: index.name.to_string(),
+        value: index.name.to_string().into(),
         dest: record_start + 1,
     });
     program.mark_last_insn_constant();

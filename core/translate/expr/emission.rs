@@ -28,7 +28,7 @@ pub fn emit_literal(
         }
         ast::Literal::String(s) => {
             program.emit_insn(Insn::String8 {
-                value: sanitize_string(s),
+                value: sanitize_string(s).into(),
                 dest: target_register,
             });
             Ok(target_register)
