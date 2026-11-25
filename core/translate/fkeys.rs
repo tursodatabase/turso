@@ -1,6 +1,9 @@
 use crate::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
-use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
+use super::{
+    build_program, new_program_builder, translate_inner, ProgramBuilder, ProgramBuilderOpts,
+};
+use crate::alloc::StatementAllocationSite;
 use crate::namespace::NamespaceRef;
 use crate::translate::emitter::emit_columns_and_dependencies;
 use crate::translate::expr::{emit_constraint_values_decode, emit_stored_column};
@@ -1865,13 +1868,22 @@ fn emit_fk_action_subprogram(
         let Some(depth) = program.nested_subprogram_depth() else {
             return Ok(());
         };
-        let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
-            QueryMode::Normal,
-            program.capture_data_changes_info().clone(),
-            FK_SUBPROGRAM_OPTS,
-            program.is_mvcc_enabled(),
-            depth,
-        );
+        // new_program_builder makes the large builder in its own stack frame,
+        // and not in this frame, which is on the recursive path of nested
+        // programs (see translate_inner).
+        let mut subprogram_builder = new_program_builder(
+            connection,
+            StatementAllocationSite::TriggerProgramBuilder,
+            || {
+                ProgramBuilder::new_for_subprogram(
+                    QueryMode::Normal,
+                    program.capture_data_changes_info().clone(),
+                    FK_SUBPROGRAM_OPTS,
+                    program.is_mvcc_enabled(),
+                    depth,
+                )
+            },
+        )?;
         subprogram_builder
             .flags
             .set_writes_stored_values(ctx.new_key_is_stored);
@@ -1890,7 +1902,7 @@ fn emit_fk_action_subprogram(
             )
         })?;
         subprogram_builder.epilogue(resolver.schema());
-        let built = subprogram_builder.build(connection, true, description)?;
+        let built = build_program(subprogram_builder, connection, true, description)?;
         let prepared = built.prepared().clone();
         entry
             .slot

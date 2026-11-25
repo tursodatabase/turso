@@ -87,13 +87,16 @@ fn statement_allocation_sites_fail_only_the_statement() {
     assert!(matches!(err, LimboError::OutOfMemory), "{err}");
     disarm_fault();
 
-    // The compilation of the trigger program fails.
-    arm_fault(StatementAllocationSite::TriggerProgramBuilder);
-    let Err(err) = conn.prepare("INSERT INTO t VALUES (1)") else {
-        panic!("the compilation of the trigger program must fail");
-    };
-    assert!(matches!(err, LimboError::OutOfMemory), "{err}");
-    disarm_fault();
+    // The compilation of the trigger program and of the foreign key action
+    // program fails.
+    for sql in ["INSERT INTO t VALUES (1)", "DELETE FROM parent"] {
+        arm_fault(StatementAllocationSite::TriggerProgramBuilder);
+        let Err(err) = conn.prepare(sql) else {
+            panic!("{sql}: the compilation of the nested program must fail");
+        };
+        assert!(matches!(err, LimboError::OutOfMemory), "{sql}: {err}");
+        disarm_fault();
+    }
 
     // The statements that execute a trigger program and a foreign key action
     // program fail.
