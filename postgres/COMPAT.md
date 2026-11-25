@@ -353,7 +353,7 @@ that pair, so Turso accepts a comparison that PostgreSQL rejects.
 | Phrase search | ❌ Not supported | tsvector/tsquery degrade to TEXT; no full-text search |
 | Range types | ❌ Not supported | |
 | smallserial type | ✅ Supported | serial2/serial4/serial8 aliases too; serial implies NOT NULL + implicit sequence, not PRIMARY KEY |
-| Type modifier support | 🟡 Partial | varchar(n) length enforced ("value too long for varchar"); numeric(p,s) scale applied; modifiers on other types and in casts (`x::varchar(3)`) rejected |
+| Type modifier support | 🟡 Partial | varchar(n) length enforced ("value too long for varchar"); numeric(p,s) rounds half away from zero and fails with 22003 when a value has too many digits, in a column and in a cast (`x::numeric(10,2)`); modifiers on other types and in other casts (`x::varchar(3)`) rejected. Division of numerics gives more digits than PostgreSQL, and `sum` and `avg` of a numeric return a real |
 | UUIDv7 | ❌ Not supported | |
 | XML data type | ❌ Not supported | xml columns degrade to TEXT; no XML functions |
 
