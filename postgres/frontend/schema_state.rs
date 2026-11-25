@@ -1,8 +1,8 @@
 //! The PostgreSQL frontend's schema state: what the engine keeps for it as
 //! the opaque dialect schema state of the main database. It holds the
-//! relation catalog of [`crate::classes`], and the roles of [`crate::roles`]
-//! with their memberships of [`crate::auth_members`], each loaded from its
-//! own table.
+//! relation catalog of [`crate::classes`], the roles of [`crate::roles`]
+//! with their memberships of [`crate::auth_members`], and the functions of
+//! [`crate::function_catalog`], each loaded from its own table.
 
 use std::sync::Arc;
 
@@ -14,12 +14,14 @@ use turso_core::{
 
 use crate::auth_members;
 use crate::classes::{self, ClassCatalog};
+use crate::function_catalog::{self, FunctionCatalog};
 use crate::roles::{self, RoleCatalog};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SchemaState {
     pub(crate) classes: Arc<ClassCatalog>,
     pub(crate) roles: Arc<RoleCatalog>,
+    pub(crate) functions: Arc<FunctionCatalog>,
 }
 
 /// The frontend's schema state, or None when it is not loaded, as in a
@@ -33,16 +35,17 @@ pub(crate) fn load_steps() -> Vec<Box<dyn LoadStep>> {
     vec![Box::new(SchemaStateRows::default())]
 }
 
-/// Loads the frontend's schema state. It reads three tables in order:
-/// classes, roles, memberships. `reading` is the table being read now, None
-/// before the first one. When a table ends, its rows go into `classes` or
-/// `roles`. The step stores the result only after the last table, because
+/// Loads the frontend's schema state. It reads four tables in order:
+/// classes, roles, memberships, functions. `reading` is the table being
+/// read now, None before the first one. When a table ends, its rows go into
+/// `classes`, `roles` or `functions`. The step stores the result only after the last table, because
 /// a statement must never see classes without their roles.
 #[derive(Default)]
 struct SchemaStateRows {
     reading: Option<TableRows>,
     classes: ClassCatalog,
     roles: RoleCatalog,
+    functions: FunctionCatalog,
 }
 
 struct TableRows {
@@ -55,6 +58,7 @@ enum Table {
     Classes,
     Roles,
     Memberships,
+    Functions,
 }
 
 impl LoadStep for SchemaStateRows {
@@ -68,7 +72,10 @@ impl LoadStep for SchemaStateRows {
             Some(Table::Roles) => {
                 auth_members::schema_state_query(schema).map(|sql| (Table::Memberships, sql))
             }
-            Some(Table::Memberships) => None,
+            Some(Table::Memberships) => {
+                function_catalog::schema_state_query(schema).map(|sql| (Table::Functions, sql))
+            }
+            Some(Table::Functions) => None,
         };
         // Stop at the first table that is missing. Memberships point at
         // roles, so without a roles table there are none to read.
@@ -98,6 +105,7 @@ impl LoadStep for SchemaStateRows {
             Table::Classes => self.classes = ClassCatalog::build(load.schema(), rows)?,
             Table::Roles => self.roles = RoleCatalog::new(rows, &[])?,
             Table::Memberships => self.roles.set_memberships(rows)?,
+            Table::Functions => self.functions = FunctionCatalog::new(rows)?,
         }
         Ok(())
     }
@@ -108,6 +116,7 @@ impl SchemaStateRows {
         load.schema_mut()?.dialect_schema = Some(Arc::new(SchemaState {
             classes: Arc::new(std::mem::take(&mut self.classes)),
             roles: Arc::new(std::mem::take(&mut self.roles)),
+            functions: Arc::new(std::mem::take(&mut self.functions)),
         }));
         Ok(())
     }

@@ -269,6 +269,24 @@ impl Dialect for PostgresDialect {
         turso_core::dialect::resolve_builtin_function(name, arg_count)
     }
 
+    fn expand_function_call(
+        &self,
+        scope: &turso_core::FunctionScope<'_>,
+        name: &str,
+        args: &[Box<ast::Expr>],
+    ) -> Result<Option<ast::Expr>> {
+        crate::sql_functions::expand_call(scope, name, args)
+    }
+
+    fn stored_function_name(
+        &self,
+        scope: &turso_core::FunctionScope<'_>,
+        name: &str,
+        argument_count: usize,
+    ) -> Result<Option<String>> {
+        crate::sql_functions::stored_call_name(scope, name, argument_count)
+    }
+
     fn call_scalar(
         &self,
         context: &ScalarFuncContext<'_>,
@@ -1392,9 +1410,9 @@ impl SnapshotRows for PgProcTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 100;
 
-    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         const INTERNAL_LANGUAGE: i64 = 12;
-        crate::procs::PROCS
+        let mut rows: Vec<Vec<Value>> = crate::procs::PROCS
             .iter()
             .map(|proc| {
                 let arg_types = proc
@@ -1435,8 +1453,121 @@ impl SnapshotRows for PgProcTable {
                     Value::Null,
                 ]
             })
-            .collect()
+            .collect();
+        rows.extend(sql_function_rows(conn));
+        rows
     }
+}
+
+/// PostgreSQL's oid of the `sql` language in `pg_language`.
+const SQL_LANGUAGE_OID: i64 = 14;
+
+/// The `pg_proc` rows of the functions that users defined with CREATE
+/// FUNCTION.
+fn sql_function_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    let schema = conn.current_schema();
+    let Some(state) = crate::schema_state::schema_state(&schema) else {
+        return Vec::new();
+    };
+    state
+        .functions
+        .iter()
+        .filter_map(|function| {
+            // A function whose stored statement cannot be read cannot be
+            // called either, and is left out.
+            let definition = function.definition().ok()?;
+            let argument_types = definition
+                .parameters
+                .iter()
+                .map(|parameter| sqlite_type_to_pg_oid(&parameter.type_name).to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let has_argument_names = definition
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name.is_some());
+            let argument_names = if has_argument_names {
+                // PostgreSQL stores an empty name for a parameter without
+                // one when another parameter has a name.
+                let names = definition
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.name.as_deref().unwrap_or_default());
+                Value::build_text(text_array_out(names))
+            } else {
+                Value::Null
+            };
+            Some(vec![
+                Value::from_i64(function.oid),                                   // oid
+                Value::build_text(function.name.clone()),                        // proname
+                Value::from_i64(namespace_oid(&schema, function.namespace)),     // pronamespace
+                Value::from_i64(role_oid(function.owner)),                       // proowner
+                Value::from_i64(SQL_LANGUAGE_OID),                               // prolang
+                Value::from_f64(definition.hints.cost),                          // procost
+                Value::from_f64(0.0),                                            // prorows
+                Value::from_i64(0),                                              // provariadic
+                Value::build_text("f"),                                          // prokind
+                Value::from_i64(0),                                              // prosecdef
+                Value::from_i64(definition.hints.leakproof.into()),              // proleakproof
+                Value::from_i64(definition.hints.strict.into()),                 // proisstrict
+                Value::from_i64(0),                                              // proretset
+                Value::build_text(definition.volatility.letter()),               // provolatile
+                Value::build_text(definition.hints.parallel.to_string()),        // proparallel
+                Value::from_i64(function.argument_count as i64),                 // pronargs
+                Value::from_i64(0),                                              // pronargdefaults
+                Value::from_i64(sqlite_type_to_pg_oid(&definition.return_type)), // prorettype
+                Value::build_text(argument_types),                               // proargtypes
+                Value::Null,                                                     // proallargtypes
+                Value::Null,                                                     // proargmodes
+                argument_names,                                                  // proargnames
+                Value::Null,                                                     // proargdefaults
+                Value::Null,                                                     // protrftypes
+                Value::build_text(definition.source.clone()),                    // prosrc
+                Value::Null,                                                     // probin
+                Value::Null,                                                     // prosqlbody
+                Value::Null,                                                     // proconfig
+                Value::Null,                                                     // proacl
+            ])
+        })
+        .collect()
+}
+
+/// Formats texts as PostgreSQL's `array_out` formats a `text[]`, such as
+/// `{id,"a b"}`.
+///
+/// `turso_core::text_array_literal` is not used because it writes a newline
+/// or a tab as an escape, and quotes an element that has a Unicode space.
+/// `array_out` writes these characters unchanged and quotes an element only
+/// for the characters it tests below.
+fn text_array_out<'a>(elements: impl IntoIterator<Item = &'a str>) -> String {
+    let mut result = String::from("{");
+    for (i, element) in elements.into_iter().enumerate() {
+        if i > 0 {
+            result.push(',');
+        }
+        let needs_quotes = element.is_empty()
+            || element.eq_ignore_ascii_case("NULL")
+            || element.bytes().any(|byte| {
+                matches!(
+                    byte,
+                    b'"' | b'\\' | b'{' | b'}' | b',' | b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c
+                )
+            });
+        if !needs_quotes {
+            result.push_str(element);
+            continue;
+        }
+        result.push('"');
+        for ch in element.chars() {
+            if ch == '"' || ch == '\\' {
+                result.push('\\');
+            }
+            result.push(ch);
+        }
+        result.push('"');
+    }
+    result.push('}');
+    result
 }
 
 /// Virtual table implementation for pg_catalog.pg_database
@@ -3073,25 +3204,31 @@ impl SnapshotRows for PgLanguageTable {
     )";
     const TABLE_OID: Option<i64> = Some(2612);
     const ESTIMATED_COST: f64 = 1.0;
-    const ESTIMATED_ROWS: u32 = 2;
+    const ESTIMATED_ROWS: u32 = 3;
 
     fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        [(12, "internal"), (13, "c")]
-            .into_iter()
-            .map(|(oid, name)| {
-                vec![
-                    Value::from_i64(oid),
-                    Value::build_text(name),
-                    Value::from_i64(10),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
-                    Value::Null,
-                ]
-            })
-            .collect()
+        // The languages and whether each is trusted, as in pg_language.dat.
+        // CREATE FUNCTION makes functions in `sql`.
+        [
+            (12, "internal", false),
+            (13, "c", false),
+            (SQL_LANGUAGE_OID, "sql", true),
+        ]
+        .into_iter()
+        .map(|(oid, name, trusted)| {
+            vec![
+                Value::from_i64(oid),
+                Value::build_text(name),
+                Value::from_i64(10),
+                Value::from_i64(0),
+                Value::from_i64(trusted as i64),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::Null,
+            ]
+        })
+        .collect()
     }
 }
 

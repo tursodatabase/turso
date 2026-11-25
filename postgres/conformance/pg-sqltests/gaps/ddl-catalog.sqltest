@@ -565,14 +565,11 @@ expect {
 }
 
 # E-46: CREATE FUNCTION language sql
-@compat-gap "syntax:create-function"
 test create-function-language-sql {
     CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
 }
 expect {
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
 # E-47: CREATE TRIGGER
 @setup t_id
