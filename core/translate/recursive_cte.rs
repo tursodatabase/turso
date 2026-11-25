@@ -18,7 +18,7 @@ use crate::translate::plan::{
 };
 use crate::translate::result_row::{emit_columns_to_destination, emit_offset};
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
-use crate::vdbe::insn::{to_u32, Insn};
+use crate::vdbe::insn::Insn;
 use crate::vdbe::CursorID;
 use crate::{emit_explain, LimboError, Result};
 
@@ -65,9 +65,8 @@ pub(crate) fn emit_recursive_cte(
         pc_if_empty: recursive_cte_end,
     });
 
-    let result_row_regs = match &queue {
+    match &queue {
         RecursiveCteQueue::Fifo { table } => {
-            let result_row_regs = program.alloc_registers(num_result_columns);
             // The queued record is the row itself, so it becomes the content
             // of the input cursor without being decoded and encoded again.
             program.emit_insn(Insn::RowData {
@@ -79,51 +78,40 @@ pub(crate) fn emit_recursive_cte(
                 table_name: table.name.clone(),
                 is_part_of_update: false,
             });
-            for result_column_index in 0..num_result_columns {
-                program.emit_insn(Insn::Column {
-                    cursor_id: input_cursor_id,
-                    column: result_column_index,
-                    dest: result_row_regs + result_column_index,
-                    default: None,
-                });
-            }
-            result_row_regs
         }
         RecursiveCteQueue::Ordered { index, .. } => {
-            let queue_column_count = index.columns.len();
-            let queue_row_regs = program.alloc_registers(queue_column_count);
-            for queue_column_index in 0..queue_column_count {
-                program.emit_insn(Insn::Column {
-                    cursor_id: queue_cursor_id,
-                    column: queue_column_index,
-                    dest: queue_row_regs + queue_column_index,
-                    default: None,
-                });
-            }
-            program.emit_insn(Insn::IdxDelete {
-                start_reg: queue_row_regs,
-                num_regs: queue_column_count,
+            // The last column of the key is the record of the row, so it
+            // becomes the content of the input cursor, as in SQLite.
+            program.emit_insn(Insn::Column {
                 cursor_id: queue_cursor_id,
-                raise_error_if_no_matching_entry: false,
+                column: index.columns.len() - 1,
+                dest: input_record_reg,
+                default: None,
             });
-            // The result columns follow the sort keys and the sequence number.
-            let result_row_regs = queue_row_regs + queue_column_count - num_result_columns;
-            program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u32(result_row_regs),
-                count: to_u32(num_result_columns),
-                dest_reg: to_u32(input_record_reg),
-                index_name: None,
-                affinity_str: None,
+            program.emit_insn(Insn::Delete {
+                cursor_id: queue_cursor_id,
+                table_name: index.name.clone(),
+                is_part_of_update: false,
             });
-            result_row_regs
         }
-    };
+    }
 
     emit_offset(
         program,
         run_recursive_query,
         output_limit_context.reg_offset,
     );
+    // The result columns are decoded after the OFFSET test, so the rows that
+    // OFFSET skips are not decoded.
+    let result_row_regs = program.alloc_registers(num_result_columns);
+    for result_column_index in 0..num_result_columns {
+        program.emit_insn(Insn::Column {
+            cursor_id: input_cursor_id,
+            column: result_column_index,
+            dest: result_row_regs + result_column_index,
+            default: None,
+        });
+    }
     emit_columns_to_destination(
         program,
         &recursive_cte.query_destination,
@@ -264,13 +252,13 @@ fn open_recursive_cte_cursors(
                 queue_index_columns.len(),
                 CollationSeq::BINARY,
             ))?;
-            for result_column_index in 0..num_result_columns {
-                queue_index_columns.try_push(IndexColumn::new(
-                    format!("result-{result_column_index}"),
-                    queue_index_columns.len(),
-                    CollationSeq::BINARY,
-                ))?;
-            }
+            // The queued row is one record in the last column, as in SQLite,
+            // so that taking a row reads one column.
+            queue_index_columns.try_push(IndexColumn::new(
+                "row",
+                queue_index_columns.len(),
+                CollationSeq::BINARY,
+            ))?;
             let index = Arc::new(Index {
                 name: queue_name,
                 table_name: String::new(),

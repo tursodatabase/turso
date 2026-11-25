@@ -2142,27 +2142,25 @@ fn op_column_fetch_pseudo(
                 "Column: pseudo-cursor content register {content_reg} and destination register {dest} must be distinct"
             ))
         })?;
-    match content {
-        Register::Record(record) => {
-            // Decode straight into the register; going through an owned
-            // Value would allocate for every TEXT/BLOB column on every row.
-            let mut payload_iterator = record.iter()?;
-            match payload_iterator.nth_into_register(column, dest_reg) {
-                Some(result) => result?,
-                // A pseudo cursor is opened with num_fields matching the
-                // record built for it, so every emitted Column index is in
-                // range. NULL on a missing column matches the b-tree arm.
-                None => {
-                    turso_debug_assert!(
-                        false,
-                        "pseudo-cursor column out of range for record",
-                        { "column": column }
-                    );
-                    dest_reg.set_null();
-                }
-            }
+    let Some(payload) = pseudo_cursor_payload(content) else {
+        dest_reg.set_null();
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    // Decode straight into the register; going through an owned
+    // Value would allocate for every TEXT/BLOB column on every row.
+    match ValueIterator::new(payload)?.nth_into_register(column, dest_reg) {
+        Some(result) => result?,
+        // A pseudo cursor is opened with num_fields matching the
+        // record built for it, so every emitted Column index is in
+        // range. NULL on a missing column matches the b-tree arm.
+        None => {
+            turso_debug_assert!(
+                false,
+                "pseudo-cursor column out of range for record",
+                { "column": column }
+            );
+            dest_reg.set_null();
         }
-        _ => dest_reg.set_null(),
     }
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2561,18 +2559,13 @@ fn op_column_range_fetch_other(
                 let (left, right) = state.registers.split_at_mut(dest + count);
                 (&mut right[content_reg - (dest + count)], &mut left[dest..])
             };
-            match content {
-                Register::Record(record) => {
-                    let filled = record
-                        .iter()?
-                        .decode_into_registers_after(start_column, dest_regs)?;
-                    if filled < count {
-                        crate::bail_parse_error!("pseudo-cursor column out of range for record");
-                    }
-                }
-                other => {
-                    crate::bail_parse_error!("non-register register in pseudo-record ({other:?})")
-                }
+            let Some(payload) = pseudo_cursor_payload(content) else {
+                crate::bail_parse_error!("non-register register in pseudo-record ({content:?})")
+            };
+            let filled = ValueIterator::new(payload)?
+                .decode_into_registers_after(start_column, dest_regs)?;
+            if filled < count {
+                crate::bail_parse_error!("pseudo-cursor column out of range for record");
             }
         }
         other => {
@@ -2580,6 +2573,17 @@ fn op_column_range_fetch_other(
         }
     }
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// The record in the content register of a pseudo cursor: a record that
+/// SorterData or MakeRecord wrote, or a blob that Column read from a
+/// recursive CTE queue, which keeps each row as a record in one column.
+fn pseudo_cursor_payload(content: &Register) -> Option<&[u8]> {
+    match content {
+        Register::Record(record) => Some(record.get_payload()),
+        Register::Value(Value::Blob(blob)) => Some(blob),
+        _ => None,
+    }
 }
 
 pub fn op_column_has_field(

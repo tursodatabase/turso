@@ -802,6 +802,34 @@ expect {
     4
 }
 
+# Taking a row from the queue deletes it from an ephemeral index; that delete
+# is not a row change of the INSERT.
+@cross-check-integrity
+test recursive-cte-insert-select-counts-inserted-rows-only {
+    CREATE TABLE output(x INTEGER);
+    INSERT INTO output
+    WITH RECURSIVE seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM seq WHERE x < 4
+    )
+    SELECT x FROM seq;
+    SELECT changes(), total_changes();
+    INSERT INTO output
+    WITH RECURSIVE seq(x) AS (
+        VALUES(1)
+        UNION
+        SELECT x + 1 FROM seq WHERE x < 5
+        ORDER BY 1 DESC
+    )
+    SELECT x FROM seq;
+    SELECT changes(), total_changes();
+}
+expect {
+    4|4
+    5|9
+}
+
 @cross-check-integrity
 test recursive-cte-delete-subquery {
     CREATE TABLE output(x INTEGER);
@@ -2091,4 +2119,30 @@ test recursive-cte-queue-rows-not-counted-as-changes {
 expect {
     5|5
     3|8
+}
+
+# The queue keeps each row as one record. OFFSET skips rows of every type
+# before their columns are read, and the skipped rows still feed the
+# recursive step.
+test recursive-cte-order-offset-mixed-types {
+    WITH RECURSIVE t(n, v) AS (
+        SELECT 1, NULL
+        UNION ALL
+        SELECT n + 1, CASE n % 4
+            WHEN 0 THEN NULL
+            WHEN 1 THEN x'00ff'
+            WHEN 2 THEN 'text-' || n
+            ELSE n + 0.5
+        END
+        FROM t WHERE n < 8
+        ORDER BY 1 DESC
+        LIMIT 4 OFFSET 3
+    )
+    SELECT n, typeof(v), quote(v) FROM t;
+}
+expect {
+    4|real|3.5
+    5|null|NULL
+    6|blob|X'00FF'
+    7|text|'text-6'
 }
