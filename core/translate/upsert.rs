@@ -24,8 +24,8 @@ use crate::translate::fkeys::{
     fire_fk_update_actions, ParentKeyNewProbeMode,
 };
 use crate::translate::insert::{
-    emit_remember_written_rowid, emit_returning_subqueries, expr_contains_subquery,
-    format_unique_violation_desc, InsertEmitCtx,
+    emit_column_type_conversion, emit_remember_written_rowid, emit_returning_subqueries,
+    expr_contains_subquery, format_unique_violation_desc, InsertEmitCtx,
 };
 use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
@@ -61,7 +61,6 @@ use crate::{
     },
     util::{exprs_are_equivalent, normalize_ident},
     vdbe::{
-        affinity::Affinity,
         builder::{DmlColumnContext, DmlRowForm, ProgramBuilder},
         insn::{IdxInsertFlags, InsertFlags, Insn},
     },
@@ -826,40 +825,13 @@ pub fn emit_upsert(
     }
 
     if let Some(bt) = table.btree() {
-        if bt.is_strict {
-            // Pre-encode TypeCheck: all columns are decoded (user-facing) at this point.
-            // We need to do this before regenerating virtual columns, because TypeCheck applies
-            // affinity in-place to its registers, which could affect virtual columns.
-            program.emit_insn(Insn::TypeCheck {
-                start_reg: new_start,
-                count: layout.num_non_virtual_cols(),
-                check_generated: false,
-                table_reference: BTreeTable::input_type_check_table_ref(
-                    &bt,
-                    resolver.schema(),
-                    None,
-                )?,
-            });
-        } else {
-            // For non-STRICT tables, apply column affinity to the values.
-            // This must happen early so that both index records and the table record
-            // use the converted values.
-            let affinity = bt
-                .columns()
-                .iter()
-                .filter(|c| !c.is_virtual_generated())
-                .map(|c| c.affinity());
-
-            if affinity.clone().any(|a| a != Affinity::Blob) {
-                if let Ok(count) = NonZeroUsize::try_from(layout.num_non_virtual_cols()) {
-                    program.emit_insn(Insn::Affinity {
-                        start_reg: new_start,
-                        count,
-                        affinities: affinity.map(|a| a.aff_mask()).collect(),
-                    });
-                }
-            }
-        }
+        emit_column_type_conversion(
+            program,
+            resolver,
+            &bt,
+            new_start,
+            layout.num_non_virtual_cols(),
+        )?;
     }
 
     // Recompute generated columns for the new row after SET clauses have modified base columns.
@@ -2197,6 +2169,10 @@ fn rewrite_expr_to_registers(
                             if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&c)) {
                                 *expr = Expr::register(ins.key_register());
                             } else if let Some(cm) = ins.get_col_mapping_by_name(&c) {
+                                if cm.column.is_rowid_alias() {
+                                    *expr = Expr::register(ins.key_register());
+                                    return Ok(WalkControl::Continue);
+                                }
                                 // Use decoded excluded registers when available
                                 // to prevent double-encoding of custom type values
                                 if let Some(decoded_start) = excluded_decoded_start {
