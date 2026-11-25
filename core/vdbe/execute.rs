@@ -11980,40 +11980,46 @@ pub fn op_yield(
         },
         insn
     );
-    if let Value::Numeric(Numeric::Integer(pc)) = state.registers[*yield_reg].get_value() {
-        if state.ended_coroutine.contains(&(*yield_reg as u32)) {
-            state.pc = end_offset.as_offset_int();
-        } else {
-            let pc: u32 = (*pc)
-                .try_into()
-                .unwrap_or_else(|_| panic!("Yield: pc overflow: {pc}"));
-            // swap the program counter with the value in the yield register
-            // this is the mechanism that allows jumping back and forth between the coroutine and the caller
-            state.registers[*yield_reg].set_int((state.pc + 1) as i64);
-            state.pc = pc;
-
-            // Strip JSON subtypes from co-routine output columns so they do not
-            // survive the subquery boundary, matching SQLite's OP_Copy P5=0x0002.
-            // subtype_clear_count > 0 only for coroutine body yields.
-            #[cfg(feature = "json")]
-            if *subtype_clear_count > 0 {
-                use crate::types::TextSubtype;
-                for reg in &mut state.registers
-                    [*subtype_clear_start_reg..*subtype_clear_start_reg + *subtype_clear_count]
-                {
-                    if let Register::Value(Value::Text(text)) = reg {
-                        if text.subtype == TextSubtype::Json {
-                            text.subtype = TextSubtype::Text;
-                        }
-                    }
-                }
-            }
-        }
-    } else {
+    let next_pc = (state.pc + 1) as i64;
+    let Register::Value(Value::Numeric(Numeric::Integer(pc_slot))) =
+        &mut state.registers[*yield_reg]
+    else {
         unreachable!(
             "yield_reg {} contains non-integer value: {:?}",
             *yield_reg, state.registers[*yield_reg]
         );
+    };
+    // Only EndCoroutine adds to this list, so it is usually empty. The
+    // search of a list sets up a vector loop before it reads the length,
+    // and this opcode runs for each row of a coroutine.
+    if !state.ended_coroutine.is_empty() && state.ended_coroutine.contains(&(*yield_reg as u32)) {
+        state.pc = end_offset.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    let pc = *pc_slot;
+    let pc: u32 = pc
+        .try_into()
+        .unwrap_or_else(|_| panic!("Yield: pc overflow: {pc}"));
+    // swap the program counter with the value in the yield register
+    // this is the mechanism that allows jumping back and forth between the coroutine and the caller
+    *pc_slot = next_pc;
+    state.pc = pc;
+
+    // Strip JSON subtypes from co-routine output columns so they do not
+    // survive the subquery boundary, matching SQLite's OP_Copy P5=0x0002.
+    // subtype_clear_count > 0 only for coroutine body yields.
+    #[cfg(feature = "json")]
+    if *subtype_clear_count > 0 {
+        use crate::types::TextSubtype;
+        for reg in &mut state.registers
+            [*subtype_clear_start_reg..*subtype_clear_start_reg + *subtype_clear_count]
+        {
+            if let Register::Value(Value::Text(text)) = reg {
+                if text.subtype == TextSubtype::Json {
+                    text.subtype = TextSubtype::Text;
+                }
+            }
+        }
     }
     Ok(InsnFunctionStepResult::Step)
 }
