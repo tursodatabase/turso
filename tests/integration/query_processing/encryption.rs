@@ -2862,6 +2862,75 @@ fn encrypted_recovery_rejects_files_encrypted_with_another_key() -> anyhow::Resu
     Ok(())
 }
 
+/// An encrypted page must authenticate only at its own page number. A person
+/// who can write the database files, but who does not have the key, swaps the
+/// root pages of two tables in the database file, or swaps the page numbers
+/// of their WAL frames and writes a valid WAL checksum chain again. A read of
+/// either table must then fail with a decryption error. It must not return
+/// the rows of the other table.
+#[test]
+fn moved_encrypted_pages_fail_authentication() -> anyhow::Result<()> {
+    let mut accepted = Vec::new();
+    for cipher in [CIPHER_A, CIPHER_B] {
+        for in_wal in [false, true] {
+            let case = if in_wal {
+                format!("{cipher}, swapped WAL frames")
+            } else {
+                format!("{cipher}, swapped database pages")
+            };
+            let source = TempDatabaseBuilder::new()
+                .with_encryption(cipher, KEY_A)
+                .build();
+            let conn = source.connect_limbo();
+            conn.execute("CREATE TABLE t1(value TEXT)")?;
+            conn.execute("CREATE TABLE t2(value TEXT)")?;
+            conn.execute("INSERT INTO t1 VALUES ('row of t1')")?;
+            conn.execute("INSERT INTO t2 VALUES ('row of t2')")?;
+            let roots: Vec<(String, i64)> =
+                conn.exec_rows("SELECT name, rootpage FROM sqlite_schema ORDER BY name");
+            assert_eq!(roots, [("t1".into(), 2), ("t2".into(), 3)], "{case}");
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            if in_wal {
+                conn.execute("UPDATE t1 SET value = 'new row of t1'")?;
+                conn.execute("UPDATE t2 SET value = 'new row of t2'")?;
+            }
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("moved-pages.db");
+            copy_encrypted_test_files(&source, &path)?;
+            if in_wal {
+                swap_wal_frame_page_numbers(&format!("{}-wal", path.display()), 2, 3)?;
+            } else {
+                swap_database_pages(&path, 2, 3)?;
+            }
+
+            let conn = connect_encrypted_copy(&path, cipher)?;
+            for (table, page) in [("t1", 2), ("t2", 3)] {
+                let result = conn
+                    .prepare(format!("SELECT value FROM {table}"))?
+                    .run_collect_rows();
+                if !matches!(
+                    result,
+                    Err(LimboError::CompletionError(
+                        CompletionError::DecryptionError { page_idx }
+                    )) if page_idx == page
+                ) {
+                    accepted.push(format!("{case}: SELECT from {table} returned {result:?}"));
+                }
+            }
+            let result = conn.prepare("PRAGMA integrity_check")?.run_collect_rows();
+            if result.is_ok() {
+                accepted.push(format!("{case}: integrity_check returned {result:?}"));
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "moved encrypted pages were accepted:\n{}",
+        accepted.join("\n")
+    );
+    Ok(())
+}
+
 fn copy_encrypted_test_files(source: &TempDatabase, path: &std::path::Path) -> anyhow::Result<()> {
     for suffix in ["", "-wal", "-log"] {
         let source_path = format!("{}{suffix}", source.path.display());
@@ -2876,6 +2945,18 @@ fn fresh_encrypted_rows(
     path: &std::path::Path,
     cipher: &str,
 ) -> anyhow::Result<Vec<Vec<turso_core::Value>>> {
+    let conn = connect_encrypted_copy(path, cipher)?;
+    Ok(conn
+        .prepare("SELECT value FROM secrets")?
+        .run_collect_rows()?)
+}
+
+/// Opens the database at `path` as a new database object, with `cipher` and
+/// `KEY_A`, and connects to it.
+fn connect_encrypted_copy(
+    path: &std::path::Path,
+    cipher: &str,
+) -> anyhow::Result<Arc<turso_core::Connection>> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
     let db = Database::open_file_with_flags(
         io,
@@ -2888,13 +2969,78 @@ fn fresh_encrypted_rows(
         }),
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(
+    Ok(db.connect(
         ConnectOpts::new(SessionRole::Superuser)
             .with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?)),
-    )?;
-    Ok(conn
-        .prepare("SELECT value FROM secrets")?
-        .run_collect_rows()?)
+    )?)
+}
+
+/// Swaps the bytes of pages `a` and `b` in a database file with 4096-byte
+/// pages.
+fn swap_database_pages(path: &std::path::Path, a: usize, b: usize) -> anyhow::Result<()> {
+    const PAGE_SIZE: usize = 4096;
+    let mut bytes = std::fs::read(path)?;
+    let (a, b) = ((a - 1) * PAGE_SIZE, (b - 1) * PAGE_SIZE);
+    let page_a = bytes[a..a + PAGE_SIZE].to_vec();
+    bytes.copy_within(b..b + PAGE_SIZE, a);
+    bytes[b..b + PAGE_SIZE].copy_from_slice(&page_a);
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+/// Swaps the page numbers in the WAL frames of pages `a` and `b`, then writes
+/// the checksum of every frame again. The WAL checksums do not use a key, so
+/// a person without the key can do this.
+fn swap_wal_frame_page_numbers(path: &str, a: u32, b: u32) -> anyhow::Result<()> {
+    use turso_core::storage::sqlite3_ondisk::{
+        checksum_wal, WalHeader, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
+    };
+    let mut bytes = std::fs::read(path)?;
+    let field = |offset: usize| u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
+    let header = WalHeader {
+        magic: field(0),
+        file_format: field(4),
+        page_size: field(8),
+        checkpoint_seq: field(12),
+        salt_1: field(16),
+        salt_2: field(20),
+        checksum_1: field(24),
+        checksum_2: field(28),
+    };
+    let native_endian = cfg!(target_endian = "big") == ((header.magic & 1) != 0);
+    let frame_size = WAL_FRAME_HEADER_SIZE + header.page_size as usize;
+    let mut checksum = (header.checksum_1, header.checksum_2);
+    let mut moved_frames = Vec::new();
+    for frame in bytes[WAL_HEADER_SIZE..].chunks_exact_mut(frame_size) {
+        let page = u32::from_be_bytes(frame[0..4].try_into().unwrap());
+        let moved_page = if page == a {
+            b
+        } else if page == b {
+            a
+        } else {
+            page
+        };
+        if moved_page != page {
+            moved_frames.push(page);
+        }
+        frame[0..4].copy_from_slice(&moved_page.to_be_bytes());
+        checksum = checksum_wal(&frame[0..8], &header, checksum, native_endian);
+        checksum = checksum_wal(
+            &frame[WAL_FRAME_HEADER_SIZE..],
+            &header,
+            checksum,
+            native_endian,
+        );
+        frame[16..20].copy_from_slice(&checksum.0.to_be_bytes());
+        frame[20..24].copy_from_slice(&checksum.1.to_be_bytes());
+    }
+    moved_frames.sort_unstable();
+    anyhow::ensure!(
+        moved_frames == [a.min(b), a.max(b)],
+        "expected one WAL frame for each of pages {a} and {b}, found {moved_frames:?}"
+    );
+    std::fs::write(path, bytes)?;
+    Ok(())
 }
 
 #[test]
