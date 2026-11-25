@@ -97,7 +97,7 @@ impl TypeOrdering {
 
 impl PartialEq for TypeOrdering {
     fn eq(&self, other: &Self) -> bool {
-        self.0.name == other.0.name
+        std::ptr::eq(self.0, other.0)
     }
 }
 
@@ -105,7 +105,7 @@ impl Eq for TypeOrdering {}
 
 impl Hash for TypeOrdering {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.name.hash(state)
+        std::ptr::from_ref(self.0).hash(state)
     }
 }
 
@@ -117,7 +117,10 @@ impl PartialOrd for TypeOrdering {
 
 impl Ord for TypeOrdering {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0.name.cmp(other.0.name)
+        self.0
+            .name
+            .cmp(other.0.name)
+            .then_with(|| std::ptr::from_ref(self.0).cmp(&std::ptr::from_ref(other.0)))
     }
 }
 
@@ -289,6 +292,25 @@ mod tests {
 
     fn int(i: i64) -> Value {
         Value::Numeric(Numeric::Integer(i))
+    }
+
+    #[test]
+    fn two_orders_are_the_same_when_they_have_the_same_definition() {
+        static FIRST: OrderingDef = OrderingDef {
+            name: "same_name",
+            compare: |_, _| Ordering::Equal,
+            compare_operands: None,
+            hash: |_, _| {},
+        };
+        static SECOND: OrderingDef = OrderingDef {
+            name: "same_name",
+            compare: |_, _| Ordering::Equal,
+            compare_operands: None,
+            hash: |_, _| {},
+        };
+        assert_eq!(TypeOrdering::new(&FIRST), TypeOrdering::new(&FIRST));
+        assert_ne!(TypeOrdering::new(&FIRST), TypeOrdering::new(&SECOND));
+        assert_ne!(TypeOrdering::new(&FIRST), TypeOrdering::NUMERIC);
     }
 
     #[test]

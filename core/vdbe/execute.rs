@@ -806,17 +806,20 @@ pub fn op_compare(
         return Err(LimboError::InternalError("Compare registers overlap".to_string()).into());
     }
 
-    // One integer against another needs no collation and no NULL order:
-    // the case of every GROUP BY on an integer key.
+    // One integer against another needs no text collation and no NULL order:
+    // the case of every GROUP BY on an integer key. The order of a type
+    // applies to integers too, so it takes the slow path.
     if key_info.len() == 1 {
-        if let Some((a, b)) = integer_operands(state, start_reg_a, start_reg_b) {
-            let cmp = a.cmp(&b);
-            state.last_compare = Some(match key_info[0].sort_order {
-                crate::ast::SortOrder::Asc => cmp,
-                crate::ast::SortOrder::Desc => cmp.reverse(),
-            });
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
+        if matches!(key_info[0].collation, CollationSeq::Text(_)) {
+            if let Some((a, b)) = integer_operands(state, start_reg_a, start_reg_b) {
+                let cmp = a.cmp(&b);
+                state.last_compare = Some(match key_info[0].sort_order {
+                    crate::ast::SortOrder::Asc => cmp,
+                    crate::ast::SortOrder::Desc => cmp.reverse(),
+                });
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
         }
         // Two texts under BINARY compare byte by byte, and NULL order does
         // not apply to them: the case of every GROUP BY on a text key.
