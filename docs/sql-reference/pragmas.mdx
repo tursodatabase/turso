@@ -818,6 +818,8 @@ Reports whether the current connection has an encryption key. It never returns k
 PRAGMA hexkey;
 ```
 
+The table-valued function `pragma_hexkey()` takes no argument. Turso rejects an argument when it prepares the statement, so that the argument does not get into the compiled program, `EXPLAIN` output or the log.
+
 Supply both cipher and key at open time, for example:
 
 ```shell

@@ -265,6 +265,38 @@ fn attach_key_literal_is_rejected_when_prepared() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn pragma_hexkey_argument_is_rejected_when_prepared() -> anyhow::Result<()> {
+    let (_main_db, conn) = open_main_db()?;
+    // A compiled program shows its literals in the log, so preparation
+    // rejects an argument, which a user means as a key.
+    for sql in [
+        "SELECT * FROM pragma_hexkey('secret')",
+        "SELECT * FROM main.pragma_hexkey(lower('SECRET'))",
+    ] {
+        let error = conn.prepare(sql).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("encryption must be configured when opening the database"),
+            "{error}"
+        );
+    }
+    for sql in [
+        "SELECT * FROM pragma_hexkey",
+        "SELECT * FROM pragma_hexkey()",
+    ] {
+        let rows = conn.prepare(sql)?.run_collect_rows()?;
+        assert_eq!(
+            rows,
+            vec![vec![turso_core::Value::build_text(
+                "encryption key is not set for this session"
+            )]]
+        );
+    }
+    Ok(())
+}
+
 fn attach_matrix_options(cipher: Option<&str>, mvcc: bool, key: &str) -> OpenOptions {
     OpenOptions::new(Arc::new(SqliteDialect))
         .db_opts(
