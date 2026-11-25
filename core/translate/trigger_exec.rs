@@ -631,6 +631,34 @@ fn execute_trigger_commands(
     subprogram_builder.epilogue(resolver.schema());
     let built_subprogram =
         build_program(subprogram_builder, connection, true, "trigger subprogram")?;
+    emit_trigger_program_call(
+        program,
+        resolver,
+        ctx,
+        &subprogram_ctx,
+        built_subprogram,
+        ignore_jump_target,
+    )?;
+    Ok(true)
+}
+
+/// Emits the Program instruction that runs a built trigger program, for
+/// [execute_trigger_commands]. It also starts the transactions that the
+/// trigger program needs, and gives the program the registers of the NEW and
+/// OLD columns that it reads.
+///
+/// This function is not inlined, so that its values are not in the stack frame
+/// of [execute_trigger_commands], which is on the recursive path of nested
+/// programs (see [crate::translate::translate_inner]).
+#[inline(never)]
+fn emit_trigger_program_call(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    ctx: &TriggerContext,
+    subprogram_ctx: &TriggerSubprogramContext,
+    built_subprogram: crate::Program,
+    ignore_jump_target: BranchOffset,
+) -> Result<()> {
     let subprogram_prepared = built_subprogram.prepared();
 
     // Trigger subprograms do not emit Transaction opcodes, so the parent statement
@@ -689,8 +717,7 @@ fn execute_trigger_commands(
         program: Subprogram::PreparedProgram(built_subprogram.prepared().clone()),
         ignore_jump_target,
     });
-
-    Ok(true)
+    Ok(())
 }
 
 /// Check if there are any triggers for a given event (regardless of time).
@@ -940,76 +967,31 @@ pub fn fire_trigger(
             region_end: firing_end,
         });
 
-        // Evaluate WHEN clause if present
-        if let Some(mut when_expr) = trigger.when_clause.clone() {
-            crate::stack::trace_stack!("when_clause");
-            // Rewrite NEW/OLD references in WHEN clause to use registers
-            // NEW and OLD registers hold decoded values, so they say which
-            // custom type they hold.
-            let column_types = column_custom_type_names(
-                ctx.table.columns(),
-                ctx.table.is_strict,
-                resolver.schema(),
-            );
-            rewrite_trigger_expr_for_when_clause(&mut when_expr, ctx, &column_types)?;
-
-            // Plan and emit any subqueries in the WHEN clause (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
-            // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
-            let mut subqueries = Vec::new();
-            plan_subqueries_in_expr_without_from_clause(
-                program,
-                &mut subqueries,
-                &mut when_expr,
-                resolver,
-                connection,
-            )?;
-            // Emit the planned subqueries so their results are available when we evaluate the WHEN expression.
-            // Always treat these as correlated (no `Once` caching) because the WHEN clause is evaluated
-            // per-row, and trigger bodies may modify the tables referenced by the subquery between evaluations.
-            for subquery in &mut subqueries {
-                let plan = subquery.consume_plan(crate::translate::plan::EvalAt::BeforeLoop);
-                emit_non_from_clause_subquery(
-                    program,
-                    resolver,
-                    *plan,
-                    &subquery.query_type,
-                    true, // always re-evaluate: trigger WHEN is checked per-row
-                )?;
-            }
-
-            let when_reg = program.alloc_register();
-            translate_expr(program, None, &when_expr, when_reg, resolver)?;
-
-            let skip_label = program.allocate_label();
-            program.emit_insn(Insn::IfNot {
-                reg: when_reg,
-                jump_if_null: true,
-                target_pc: skip_label,
-            });
-
-            // Execute trigger commands if WHEN clause is true
-            execute_trigger_commands(
+        // Evaluate WHEN clause if present. The code jumps over the trigger
+        // commands when it is false or NULL.
+        let skip_label = match &trigger.when_clause {
+            Some(when_clause) => Some(emit_trigger_when_clause(
                 program,
                 resolver,
-                &trigger,
                 ctx,
                 connection,
-                namespace,
-                ignore_jump_target,
-            )?;
+                when_clause,
+            )?),
+            None => None,
+        };
 
+        execute_trigger_commands(
+            program,
+            resolver,
+            &trigger,
+            ctx,
+            connection,
+            namespace,
+            ignore_jump_target,
+        )?;
+
+        if let Some(skip_label) = skip_label {
             program.preassign_label_to_next_insn(skip_label);
-        } else {
-            // No WHEN clause - always execute
-            execute_trigger_commands(
-                program,
-                resolver,
-                &trigger,
-                ctx,
-                connection,
-                namespace,
-                ignore_jump_target,
-            )?;
         }
 
         // Marks the end of this firing's instruction range for ResetOnce above.
@@ -1018,6 +1000,66 @@ pub fn fire_trigger(
     })();
     resolver.register_columns = saved_register_columns;
     result
+}
+
+/// Emits the WHEN clause of a trigger for [fire_trigger], and a jump to the
+/// returned label when the clause is false or NULL. The caller assigns the
+/// label after the trigger commands.
+///
+/// This function is not inlined, so that the values of the WHEN clause are not
+/// in the stack frame of [fire_trigger], which is on the recursive path of nested
+/// programs (see [crate::translate::translate_inner]).
+#[inline(never)]
+fn emit_trigger_when_clause(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    ctx: &TriggerContext,
+    connection: &Arc<crate::Connection>,
+    when_clause: &ast::Expr,
+) -> Result<BranchOffset> {
+    crate::stack::trace_stack!("when_clause");
+    let mut when_expr = when_clause.clone();
+    // Rewrite NEW/OLD references in WHEN clause to use registers
+    // NEW and OLD registers hold decoded values, so they say which
+    // custom type they hold.
+    let column_types =
+        column_custom_type_names(ctx.table.columns(), ctx.table.is_strict, resolver.schema());
+    rewrite_trigger_expr_for_when_clause(&mut when_expr, ctx, &column_types)?;
+
+    // Plan and emit any subqueries in the WHEN clause (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
+    // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
+    let mut subqueries = Vec::new();
+    plan_subqueries_in_expr_without_from_clause(
+        program,
+        &mut subqueries,
+        &mut when_expr,
+        resolver,
+        connection,
+    )?;
+    // Emit the planned subqueries so their results are available when we evaluate the WHEN expression.
+    // Always treat these as correlated (no `Once` caching) because the WHEN clause is evaluated
+    // per-row, and trigger bodies may modify the tables referenced by the subquery between evaluations.
+    for subquery in &mut subqueries {
+        let plan = subquery.consume_plan(crate::translate::plan::EvalAt::BeforeLoop);
+        emit_non_from_clause_subquery(
+            program,
+            resolver,
+            *plan,
+            &subquery.query_type,
+            true, // always re-evaluate: trigger WHEN is checked per-row
+        )?;
+    }
+
+    let when_reg = program.alloc_register();
+    translate_expr(program, None, &when_expr, when_reg, resolver)?;
+
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IfNot {
+        reg: when_reg,
+        jump_if_null: true,
+        target_pc: skip_label,
+    });
+    Ok(skip_label)
 }
 
 fn trigger_event_kind(event: &TriggerEvent) -> &'static str {
