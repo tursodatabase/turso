@@ -8,6 +8,8 @@ display_name: "encryption at-rest"
 
 Turso supports transparent at-rest encryption to protect your database files from unauthorized access. Database pages, WAL frames, and MVCC logical logs are encrypted and decrypted with the credentials supplied when opening the database.
 
+Temporary files that a connection writes to disk while one of its databases is encrypted are encrypted too: the TEMP database, and the files to which sorts, hash tables, and ephemeral tables spill. A TEMP database that holds rows of an encrypted database stays encrypted after that database is detached. Each temporary file gets a new random key that is never written to disk.
+
 ## Supported Ciphers
 
 Turso supports multiple encryption algorithms with different performance and security characteristics:

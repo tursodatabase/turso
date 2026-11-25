@@ -3759,3 +3759,71 @@ impl turso_core::File for SpillWatchingFile {
         self.inner.truncate(len, c)
     }
 }
+
+/// While a database of the connection is encrypted, the TEMP database is encrypted too. Still,
+/// PRAGMA temp.page_size sets its page size before any TEMP object is created, as for an
+/// unencrypted TEMP database, and does nothing once the TEMP database holds data.
+#[test]
+fn pragma_temp_page_size_sets_the_page_size_of_an_encrypted_temp_database() -> anyhow::Result<()> {
+    let tmp = TempDatabaseBuilder::new().build();
+    let open = |name: &str| -> anyhow::Result<Arc<turso_core::Connection>> {
+        let uri = format!(
+            "file:{}?cipher={CIPHER_A}&hexkey={KEY_A}",
+            tmp.path.with_file_name(format!("{name}.db")).display()
+        );
+        let opts = DatabaseOpts::new().with_encryption(true);
+        Ok(turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect))?.1)
+    };
+    let temp_page_size = |conn: &Arc<turso_core::Connection>| {
+        let rows: Vec<(i64,)> = conn.exec_rows("PRAGMA temp.page_size");
+        rows[0].0
+    };
+
+    // Before the first use of TEMP.
+    let conn = open("before_first_use")?;
+    conn.execute("PRAGMA temp.page_size = 8192")?;
+    assert_eq!(temp_page_size(&conn), 8192);
+    conn.execute(
+        "CREATE TEMP TABLE large_pages AS SELECT value AS id, hex(randomblob(300)) AS payload \
+         FROM generate_series(1, 3000)",
+    )?;
+    assert_eq!(temp_page_size(&conn), 8192);
+    // Small page caches make the TEMP database read its pages back from its file, and make
+    // the sort, the hash table of DISTINCT and the index of UNION spill to their files.
+    conn.execute("PRAGMA temp.cache_size = -64")?;
+    conn.execute("PRAGMA cache_size = -64")?;
+    let rows: Vec<(i64, i64)> = conn.exec_rows(
+        "SELECT count(DISTINCT payload), count(*) \
+         FROM (SELECT payload FROM temp.large_pages ORDER BY payload)",
+    );
+    assert_eq!(rows, [(3000, 3000)]);
+    let rows: Vec<(i64,)> = conn.exec_rows(
+        "SELECT count(*) FROM \
+         (SELECT payload FROM temp.large_pages UNION SELECT payload FROM temp.large_pages)",
+    );
+    assert_eq!(rows, [(3000,)]);
+    let rows: Vec<(String,)> = conn.exec_rows("PRAGMA temp.integrity_check");
+    assert_eq!(rows, [("ok".to_string(),)]);
+
+    // The TEMP database exists but has not written its first page, also inside a transaction.
+    let conn = open("before_first_page")?;
+    conn.execute("BEGIN")?;
+    let _: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM temp.sqlite_schema");
+    conn.execute("PRAGMA temp.page_size = 16384")?;
+    conn.execute("CREATE TEMP TABLE t(x)")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    conn.execute("COMMIT")?;
+    assert_eq!(temp_page_size(&conn), 16384);
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM temp.t");
+    assert_eq!(rows, [(1,)]);
+
+    // Once the TEMP database holds data, the PRAGMA does nothing. Only the TEMP database can
+    // take a page size after it was opened encrypted.
+    let conn = open("after_first_page")?;
+    conn.execute("CREATE TEMP TABLE t(x)")?;
+    conn.execute("PRAGMA temp.page_size = 8192")?;
+    assert_eq!(temp_page_size(&conn), 4096);
+    let error = conn.execute("PRAGMA main.page_size = 8192").unwrap_err();
+    assert!(error.to_string().contains("page size is fixed"), "{error}");
+    Ok(())
+}

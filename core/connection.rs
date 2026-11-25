@@ -777,15 +777,29 @@ impl Connection {
             // with `--io-backend=memory`) that can't access real
             // filesystem paths produced by `tempfile::tempdir()`.
             let io = Database::io_for_path(temp_path_str)?;
-            let db = Database::open_file_with_flags(
-                io,
-                temp_path_str,
-                OpenFlags::Create,
-                db_opts,
-                None,
-                self.db.dialect(),
-            )?;
-            let pager = Arc::new(db._init(None, None)?);
+            let mut options = crate::OpenOptions::new(self.db.dialect())
+                .flags(OpenFlags::Create)
+                .db_opts(db_opts);
+            // The TEMP database holds rows copied from the other databases, so it is
+            // encrypted when one of them is. Only this connection reads the file, and only
+            // while the file exists, so a new random key is sufficient. The user's key is
+            // not used, and the random key is never written to disk.
+            let encryption_key = match self.temp_file_cipher() {
+                Some(cipher) => {
+                    let key = EncryptionKey::random(cipher)?;
+                    options = options
+                        .db_opts(db_opts.with_encryption(true))
+                        .encryption(EncryptionOpts {
+                            cipher: cipher.to_string(),
+                            hexkey: hex::encode(key.as_slice()),
+                        })
+                        .page_size(page_size);
+                    Some(key)
+                }
+                None => None,
+            };
+            let db = Database::open(io, temp_path_str, options)?;
+            let pager = Arc::new(db._init(encryption_key.as_ref(), None)?);
             pager.set_initial_page_size(page_size)?;
             Ok(TempDatabase {
                 db,
@@ -842,11 +856,13 @@ impl Connection {
 
     /// The cipher of the temporary files that this connection writes to disk, or None when
     /// no database of the connection uses built-in encryption. Temporary files hold rows
-    /// copied from the databases, so they are encrypted when one of the databases is.
+    /// copied from the databases, so they are encrypted when one of the databases is. The
+    /// TEMP database counts too: it keeps the rows of an encrypted database after DETACH.
     ///
-    /// They use the cipher of the main database, or else the cipher of the encrypted attached
-    /// database with the lowest database id. An attached database has the page size of the
-    /// main database, like the TEMP database, so the TEMP database can use its page layout.
+    /// They use the cipher of the main database, or else the cipher of the TEMP database, or
+    /// else the cipher of the encrypted attached database with the lowest database id. An
+    /// attached database has the page size of the main database, like the TEMP database, so
+    /// the TEMP database can use its page layout.
     pub(crate) fn temp_file_cipher(&self) -> Option<CipherMode> {
         let main_cipher = self.pager.load().encryption_cipher();
         if main_cipher != CipherMode::None {
@@ -854,6 +870,14 @@ impl Connection {
         }
         if !self.has_non_main_pagers.load(Ordering::Acquire) {
             return None;
+        }
+        // `ensure_temp_database` calls this while it creates the TEMP database, and it holds
+        // no lock on `temp.database` then.
+        if let Some(temp_db) = self.temp.database.read().as_ref() {
+            let temp_cipher = temp_db.pager.encryption_cipher();
+            if temp_cipher != CipherMode::None {
+                return Some(temp_cipher);
+            }
         }
         self.attached_databases
             .read()
@@ -2650,12 +2674,16 @@ impl Connection {
     /// is first created, if it does not already exist when the page_size pragma is issued,
     /// or at the next VACUUM command that is run on the same database connection while not in WAL mode.
     /// `VACUUM INTO` uses it for the output database even in WAL mode.
+    ///
+    /// An encrypted database keeps the page size with which it was opened, so this fails for
+    /// it. The TEMP database is an exception: it takes the page size until its first page is
+    /// written, also when it is encrypted.
     pub fn reset_page_size(&self, database_id: usize, size: u32) -> Result<()> {
-        if self
-            .get_pager_from_database_index(&database_id)?
-            .encryption_cipher()
-            != CipherMode::None
-        {
+        // This creates the TEMP database if it does not exist, so that the checks below see it
+        // and not the main database.
+        let pager = self.get_pager_from_database_index(&database_id)?;
+        let is_temp = database_id == crate::TEMP_DB_ID;
+        if !is_temp && pager.encryption_cipher() != CipherMode::None {
             return Err(LimboError::InvalidArgument(
                 "encrypted database page size is fixed when opening the database".into(),
             ));
@@ -2668,8 +2696,14 @@ impl Connection {
             return Ok(());
         };
 
-        let pager = self.get_pager_from_database_index(&database_id)?;
-        pager.set_initial_page_size(size)?;
+        if is_temp {
+            // Only this connection reads the TEMP database, with a random key that no later
+            // open needs, so it can take another page size until its first page is written,
+            // also when it is encrypted.
+            pager.replace_initial_page_size(size)?;
+        } else {
+            pager.set_initial_page_size(size)?;
+        }
         // MvStore caches a copy of the database header in `global_header`, captured from the
         // pager during bootstrap (before any PRAGMA page_size can run). Propagate the new
         // page size so subsequent transactions and any header lookups see the same value the
