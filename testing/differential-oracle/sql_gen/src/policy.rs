@@ -1416,6 +1416,12 @@ pub struct InsertConfig {
     /// Probability of using INSERT OR IGNORE.
     pub or_ignore_probability: f64,
 
+    /// Always give the INTEGER PRIMARY KEY column a non-NULL value, so that
+    /// the engine never chooses the rowid. In MVCC mode Turso never reuses a
+    /// rowid, while SQLite takes the largest rowid plus one, so a chosen
+    /// rowid can differ after a DELETE.
+    pub explicit_rowid: bool,
+
     /// Probability each cell in VALUES uses an expression instead of a literal.
     pub expression_value_probability: f64,
 
@@ -1448,6 +1454,7 @@ impl Default for InsertConfig {
             default_probability: 0.1,
             or_replace_probability: 0.0,
             or_ignore_probability: 0.0,
+            explicit_rowid: false,
             expression_value_probability: 0.3,
             expression_value_max_depth: 2,
             cte_probability: 0.1,
@@ -1502,6 +1509,16 @@ pub struct UpdateConfig {
     /// Probability of using UPDATE OR IGNORE.
     pub or_ignore_probability: f64,
 
+    /// Give an UPDATE that sets a UNIQUE or PRIMARY KEY column `NOT INDEXED`
+    /// or `INDEXED BY <index>`, so that both engines visit rows in the same
+    /// order. With a REPLACE or IGNORE conflict the rows that remain depend
+    /// on that order.
+    pub pin_access_path: bool,
+
+    /// With `pin_access_path`, the probability of `INDEXED BY` instead of
+    /// `NOT INDEXED`.
+    pub indexed_by_probability: f64,
+
     /// Probability of including a primary key column in SET clauses.
     pub primary_key_update_probability: f64,
 
@@ -1544,6 +1561,8 @@ impl Default for UpdateConfig {
             where_probability: 0.8,
             or_replace_probability: 0.0,
             or_ignore_probability: 0.0,
+            pin_access_path: false,
+            indexed_by_probability: 0.0,
             primary_key_update_probability: 0.1,
             expression_value_probability: 0.4,
             expression_value_max_depth: 2,
@@ -1668,6 +1687,18 @@ pub struct CreateTableConfig {
     /// Probability of UNIQUE constraint on a column.
     pub unique_probability: f64,
 
+    /// Probability that a UNIQUE column gets `ON CONFLICT REPLACE`. A REPLACE
+    /// constraint makes UPDATE and INSERT delete the conflicting row in the
+    /// middle of the statement.
+    pub unique_replace_probability: f64,
+
+    /// Probability that a UNIQUE column gets `ON CONFLICT IGNORE`.
+    pub unique_ignore_probability: f64,
+
+    /// Create tables only in the main database, not in `temp` or an attached
+    /// database. In MVCC mode only main-database tables use MVCC cursors.
+    pub main_database_only: bool,
+
     /// Probability of DEFAULT value on a column.
     pub default_probability: f64,
 
@@ -1705,6 +1736,9 @@ impl Default for CreateTableConfig {
             max_columns: 6,
             not_null_probability: 0.3,
             unique_probability: 0.15,
+            unique_replace_probability: 0.0,
+            unique_ignore_probability: 0.0,
+            main_database_only: false,
             default_probability: 0.2,
             if_not_exists_probability: 0.5,
             check_constraint_probability: 0.15,

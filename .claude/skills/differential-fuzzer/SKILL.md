@@ -20,6 +20,17 @@ cargo run --bin differential_fuzzer -- loop 50                     # 50 runs wit
 
 Run with `--help` for all options (statement count, tables, columns, `--profile`, `--verbose`).
 
+### MVCC cursor sequences
+
+```bash
+cargo run --bin differential_fuzzer -- --mvcc --profile mvcc-cursor loop 50
+```
+
+The `mvcc-cursor` profile writes to tables with `UNIQUE ON CONFLICT REPLACE/IGNORE`
+columns and small value domains, and the runner checkpoints Turso at random points
+(`--checkpoint-probability`, default 0.1 for this profile), so rows are split between
+the B-tree and MvStore.
+
 ## Output Files
 
 All output goes to `simulator-output/` directory:

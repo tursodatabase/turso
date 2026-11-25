@@ -80,6 +80,24 @@ struct Args {
     /// defining query.
     #[arg(long, conflicts_with = "mvcc")]
     ivm: bool,
+
+    /// Probability (0.0..=1.0) that the runner checkpoints Turso before a
+    /// statement. Default: 0.1 for `--profile mvcc-cursor`, else 0.
+    #[arg(long)]
+    checkpoint_probability: Option<f64>,
+}
+
+impl Args {
+    fn checkpoint_probability(&self) -> f64 {
+        let default = if self.profile == WeightProfile::MvccCursor {
+            0.1
+        } else {
+            0.0
+        };
+        self.checkpoint_probability
+            .unwrap_or(default)
+            .clamp(0.0, 1.0)
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -119,6 +137,7 @@ struct ConfigRecord {
     recursive_cte_focus: bool,
     profile: String,
     ivm: bool,
+    checkpoint_probability: f64,
 }
 
 /// Summary written to the JSON report file.
@@ -140,6 +159,7 @@ impl ConfigRecord {
             recursive_cte_focus: args.recursive_cte_focus,
             profile: format!("{:?}", args.profile),
             ivm: args.ivm,
+            checkpoint_probability: args.checkpoint_probability(),
         }
     }
 }
@@ -290,6 +310,8 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
         recursive_cte_focus: args.recursive_cte_focus,
         weight_profile: args.profile,
         ivm: args.ivm,
+        checkpoint_probability: args.checkpoint_probability(),
+        out_dir: "simulator-output".into(),
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);

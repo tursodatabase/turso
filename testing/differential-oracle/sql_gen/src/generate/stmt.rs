@@ -13,7 +13,7 @@ use crate::error::GenError;
 use crate::generate::expr::{generate_condition, generate_expr};
 use crate::generate::literal::generate_literal;
 use crate::generate::select::{generate_select, generate_with_clause};
-use crate::policy::AlterTableConfig;
+use crate::policy::{AlterTableConfig, CreateTableConfig};
 use crate::schema::{ColumnDef, DataType, Table};
 use crate::trace::{Origin, StmtKind};
 use sql_gen_macros::trace_gen;
@@ -260,7 +260,9 @@ pub fn generate_insert<C: Capabilities>(
         table
             .columns
             .iter()
-            .filter(|c| !c.nullable || ctx.gen_bool())
+            .filter(|c| {
+                !c.nullable || (insert_config.explicit_rowid && is_rowid_alias(c)) || ctx.gen_bool()
+            })
             .map(|c| c.name.clone())
             .collect()
     };
@@ -355,13 +357,24 @@ fn generate_insert_values<C: Capabilities>(
                     }
                 }
             }
-            let lit = generate_literal(ctx, col.data_type, generator.policy());
+            let mut lit = generate_literal(ctx, col.data_type, generator.policy());
+            while insert_config.explicit_rowid
+                && is_rowid_alias(col)
+                && matches!(lit, Literal::Null)
+            {
+                lit = generate_literal(ctx, col.data_type, generator.policy());
+            }
             row.push(Expr::literal(ctx, lit));
         }
         values.push(row);
     }
 
     values
+}
+
+/// An INTEGER PRIMARY KEY column, which is an alias of the rowid.
+fn is_rowid_alias(column: &ColumnDef) -> bool {
+    column.primary_key && column.data_type == DataType::Integer
 }
 
 /// Generate an UPDATE statement.
@@ -464,6 +477,20 @@ pub fn generate_update<C: Capabilities>(
             None
         };
 
+        let pin = update_config.pin_access_path
+            && from_clause.is_none()
+            && sets.iter().any(|(name, _)| {
+                table
+                    .columns
+                    .iter()
+                    .any(|c| &c.name == name && (c.unique || c.primary_key))
+            });
+        let indexed_by = if pin && ctx.gen_bool_with_prob(update_config.indexed_by_probability) {
+            choose_update_index(generator, &table, ctx)
+        } else {
+            None
+        };
+
         Ok(Stmt::Update(UpdateStmt {
             with_clause: with_clause.clone(),
             table: table.qualified_name(),
@@ -478,9 +505,22 @@ pub fn generate_update<C: Capabilities>(
             // source rows uses one of them, chosen by scan order. Force a table
             // scan on the target and sources so SQLite and Turso pick the same
             // one. Plain UPDATEs are order-independent and keep their coverage.
-            not_indexed: from_clause.is_some(),
+            not_indexed: from_clause.is_some() || (pin && indexed_by.is_none()),
+            indexed_by,
         }))
     })
+}
+
+/// Pick an index of `table` for `INDEXED BY`, if it has one.
+fn choose_update_index<C: Capabilities>(
+    generator: &SqlGen<C>,
+    table: &Table,
+    ctx: &mut Context,
+) -> Option<String> {
+    let indexes = generator
+        .schema()
+        .indexes_for_table_in_database(&table.name, table.database.as_deref());
+    ctx.choose(&indexes).map(|index| index.name.clone())
 }
 
 /// Generate the SET clause for an UPDATE statement.
@@ -750,7 +790,9 @@ pub fn generate_create_table<C: Capabilities>(
     let create_table_config = &generator.policy().create_table_config;
 
     let attached = &generator.schema().attached_databases;
-    let target_db = {
+    let target_db = if create_table_config.main_database_only {
+        None
+    } else {
         let mut choices: Vec<Option<&str>> = vec![None];
         choices.push(Some("temp"));
         for db in attached {
@@ -783,6 +825,7 @@ pub fn generate_create_table<C: Capabilities>(
         primary_key: true,
         not_null: true,
         unique: false,
+        unique_conflict: None,
         default: None,
         check: None,
         generated: None,
@@ -847,6 +890,11 @@ pub fn generate_create_table<C: Capabilities>(
             not_null = false;
             unique = false;
         }
+        let unique_conflict = if unique {
+            generate_unique_conflict(ctx, create_table_config)
+        } else {
+            None
+        };
 
         columns.push(ColumnDefStmt {
             name,
@@ -854,6 +902,7 @@ pub fn generate_create_table<C: Capabilities>(
             primary_key: false,
             not_null,
             unique,
+            unique_conflict,
             default,
             check,
             generated,
@@ -906,6 +955,26 @@ pub fn generate_create_table<C: Capabilities>(
         strict,
         temporary,
     }))
+}
+
+/// Pick the `ON CONFLICT` resolution of a UNIQUE column, or none. A zero
+/// probability draws no random value, so that policies that do not use this
+/// generate the same statements as before for the same seed.
+fn generate_unique_conflict(
+    ctx: &mut Context,
+    config: &CreateTableConfig,
+) -> Option<ConflictClause> {
+    if config.unique_replace_probability > 0.0
+        && ctx.gen_bool_with_prob(config.unique_replace_probability)
+    {
+        Some(ConflictClause::Replace)
+    } else if config.unique_ignore_probability > 0.0
+        && ctx.gen_bool_with_prob(config.unique_ignore_probability)
+    {
+        Some(ConflictClause::Ignore)
+    } else {
+        None
+    }
 }
 
 /// Generate a DROP TABLE statement.
@@ -1020,6 +1089,7 @@ fn generate_alter_table_action<C: Capabilities>(
                 primary_key: false,
                 not_null,
                 unique: false,
+                unique_conflict: None,
                 default: None,
                 check: None,
                 generated: None,

@@ -36,6 +36,8 @@ pub use sql_gen::TreeMode;
 use turso_core::SessionRole;
 
 const MAX_GENERATED_SQL_BYTES: usize = 64 * 1024;
+const MVCC_PRAGMA: &str = "PRAGMA journal_mode = 'mvcc'";
+const CHECKPOINT_SQL: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
 
 fn generated_sql_is_too_large(sql: &str) -> bool {
     sql.len() > MAX_GENERATED_SQL_BYTES
@@ -212,6 +214,14 @@ pub struct SimConfig {
     /// verify after every statement that each view equals a fresh evaluation
     /// of its defining query.
     pub ivm: bool,
+    /// Probability that the runner checkpoints Turso before a statement.
+    /// In MVCC mode a checkpoint moves rows from MvStore to the B-tree, so
+    /// later statements read rows from both. SQLite has nothing to match it.
+    pub checkpoint_probability: f64,
+    /// Directory for run artifacts. Turso's in-memory database is also
+    /// registered under a path in it, so two fuzzers that run at the same
+    /// time need different directories.
+    pub out_dir: PathBuf,
 }
 
 impl Default for SimConfig {
@@ -231,6 +241,8 @@ impl Default for SimConfig {
             recursive_cte_focus: false,
             weight_profile: WeightProfile::default(),
             ivm: false,
+            checkpoint_probability: 0.0,
+            out_dir: "simulator-output".into(),
         }
     }
 }
@@ -345,6 +357,8 @@ impl SimStats {
 pub struct Fuzzer {
     config: SimConfig,
     rng: RefCell<ChaCha8Rng>,
+    /// Decides where checkpoints go. See [`Fuzzer::maybe_checkpoint`].
+    checkpoint_rng: RefCell<ChaCha8Rng>,
     turso_conn: Arc<turso_core::Connection>,
     sqlite_conn: rusqlite::Connection,
     #[expect(dead_code)]
@@ -364,8 +378,9 @@ impl Fuzzer {
     ///
     /// Uses `MemorySimIO` for deterministic in-memory storage.
     pub fn new(config: SimConfig) -> Result<Self> {
-        let out_dir: PathBuf = "simulator-output".into();
+        let out_dir = config.out_dir.clone();
         let rng = ChaCha8Rng::seed_from_u64(config.seed);
+        let checkpoint_rng = ChaCha8Rng::seed_from_u64(config.seed ^ 0xC4EC_4901);
 
         if !out_dir.exists() {
             std::fs::create_dir_all(&out_dir)?;
@@ -417,13 +432,14 @@ impl Fuzzer {
         // Enable MVCC after ATTACH (ATTACH is not supported in MVCC mode)
         if config.mvcc {
             turso_conn
-                .execute("PRAGMA journal_mode = 'mvcc'")
+                .execute(MVCC_PRAGMA)
                 .context("Failed to enable MVCC mode")?;
         }
 
         Ok(Self {
             config,
             rng: RefCell::new(rng),
+            checkpoint_rng: RefCell::new(checkpoint_rng),
             turso_conn,
             sqlite_conn,
             turso_db,
@@ -648,6 +664,11 @@ impl Fuzzer {
 
         let mut schema = self.introspect_and_verify_schemas()?;
         let mut ivm_state = self.config.ivm.then(IvmState::new);
+        if self.config.mvcc {
+            // Fuzzer::new enabled MVCC. Put it in the history too, so that a
+            // replay of the history runs in the same mode.
+            executed_sql.push(MVCC_PRAGMA.to_string());
+        }
 
         // Bootstrap the collation/mixed-type probe table on both engines, up
         // front, so it is an ordinary tracked table (read and written by the
@@ -783,6 +804,8 @@ impl Fuzzer {
                 }
             }
 
+            self.maybe_checkpoint(executed_sql)?;
+
             let stmt = generator.generate(&schema)?;
 
             // A generated expression can branch into several subqueries at
@@ -915,6 +938,29 @@ impl Fuzzer {
 
         *coverage_out = generator.take_coverage();
 
+        Ok(())
+    }
+
+    /// With probability `checkpoint_probability`, checkpoint Turso. Only in
+    /// autocommit mode, because a checkpoint cannot run inside a transaction.
+    fn maybe_checkpoint(&self, executed_sql: &mut Vec<String>) -> Result<()> {
+        let probability = self.config.checkpoint_probability;
+        if probability <= 0.0 || !self.turso_conn.get_auto_commit() {
+            return Ok(());
+        }
+        // Draw from a separate stream, so that a run with checkpoints
+        // generates the same statements as a run without them.
+        let draw = {
+            let mut rng = self.checkpoint_rng.borrow_mut();
+            rand::Rng::random_bool(&mut *rng, probability.clamp(0.0, 1.0))
+        };
+        if !draw {
+            return Ok(());
+        }
+        match DifferentialOracle::execute_turso(&self.turso_conn, CHECKPOINT_SQL) {
+            QueryResult::Error(e) => bail!("{CHECKPOINT_SQL} failed on Turso: {e}"),
+            _ => executed_sql.push(CHECKPOINT_SQL.to_string()),
+        }
         Ok(())
     }
 
@@ -1160,6 +1206,8 @@ mod tests {
             recursive_cte_focus: false,
             weight_profile: WeightProfile::default(),
             ivm: false,
+            checkpoint_probability: 0.0,
+            out_dir: "simulator-output".into(),
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());

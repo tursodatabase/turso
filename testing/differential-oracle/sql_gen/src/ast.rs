@@ -966,6 +966,19 @@ pub enum ConflictClause {
     Rollback,
 }
 
+impl ConflictClause {
+    /// The resolution name, as used after `ON CONFLICT` in a column constraint.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            ConflictClause::Abort => "ABORT",
+            ConflictClause::Fail => "FAIL",
+            ConflictClause::Ignore => "IGNORE",
+            ConflictClause::Replace => "REPLACE",
+            ConflictClause::Rollback => "ROLLBACK",
+        }
+    }
+}
+
 impl fmt::Display for ConflictClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1048,6 +1061,8 @@ pub struct UpdateStmt {
     /// scan, so the results differ. Pinning both engines to a table scan makes
     /// the choice deterministic.
     pub not_indexed: bool,
+    /// Emit `INDEXED BY <index>` on the target instead of `NOT INDEXED`.
+    pub indexed_by: Option<String>,
 }
 
 impl fmt::Display for UpdateStmt {
@@ -1075,7 +1090,10 @@ impl fmt::Display for UpdateStmt {
         if let Some(alias) = &self.alias {
             write!(f, " AS {alias}")?;
         }
-        write!(f, "{}", not_indexed(&self.table))?;
+        match &self.indexed_by {
+            Some(index) => write!(f, " INDEXED BY {index}")?,
+            None => write!(f, "{}", not_indexed(&self.table))?,
+        }
         write!(f, " SET ")?;
 
         for (i, (col, val)) in self.sets.iter().enumerate() {
@@ -1226,6 +1244,8 @@ pub struct ColumnDefStmt {
     pub primary_key: bool,
     pub not_null: bool,
     pub unique: bool,
+    /// `UNIQUE ON CONFLICT <resolution>`. Only used when `unique` is set.
+    pub unique_conflict: Option<ConflictClause>,
     pub default: Option<Expr>,
     pub check: Option<Expr>,
     /// `GENERATED ALWAYS AS (<expr>) STORED`. `None` means a regular column.
@@ -1248,6 +1268,9 @@ impl fmt::Display for ColumnDefStmt {
 
             if self.unique && !self.primary_key {
                 write!(f, " UNIQUE")?;
+                if let Some(conflict) = self.unique_conflict {
+                    write!(f, " ON CONFLICT {}", conflict.keyword())?;
+                }
             }
 
             if let Some(default) = &self.default {
@@ -2646,6 +2669,7 @@ mod tests {
             conflict: None,
             returning: None,
             not_indexed: true,
+            indexed_by: None,
         };
         assert_eq!(
             stmt.to_string(),
@@ -2675,6 +2699,7 @@ mod tests {
             conflict: None,
             returning: None,
             not_indexed: true,
+            indexed_by: None,
         };
         assert_eq!(
             stmt.to_string(),
@@ -3259,6 +3284,7 @@ mod tests {
                 primary_key: true,
                 not_null: true,
                 unique: false,
+                unique_conflict: None,
                 default: None,
                 check: None,
                 generated: None,

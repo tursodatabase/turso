@@ -22,7 +22,7 @@
 use std::io::Read;
 
 use anyhow::Result;
-use differential_fuzzer::oracle::QueryResult;
+use differential_fuzzer::oracle::{QueryResult, is_turso_only};
 use differential_fuzzer::shrink::{EnginePair, query_results_differ};
 
 fn brief(result: &QueryResult) -> String {
@@ -66,6 +66,11 @@ fn main() -> Result<()> {
     for (lineno, line) in script.lines().enumerate() {
         let stmt = line.trim();
         if stmt.is_empty() || stmt.starts_with("--") {
+            continue;
+        }
+        if is_turso_only(stmt) {
+            println!("line {:>3}: {stmt}", lineno + 1);
+            println!("  turso : {} (turso only)", brief(&pair.run_turso(stmt)));
             continue;
         }
         let (turso, sqlite) = pair.run_both(stmt);
