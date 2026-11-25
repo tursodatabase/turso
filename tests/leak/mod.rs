@@ -257,3 +257,48 @@ fn updating_one_row_does_not_copy_pending_subscription_keys() {
     conn.execute("ROLLBACK TO nested").unwrap();
     conn.execute("ROLLBACK").unwrap();
 }
+
+#[test]
+#[serial_test::serial]
+fn bulk_update_stops_copying_keys_after_a_table_invalidation() {
+    let db = Database::open_file(
+        Arc::new(turso_core::MemoryIO::new()),
+        ":memory:",
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t(k TEXT PRIMARY KEY, x INTEGER)")
+        .unwrap();
+    conn.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1200) INSERT INTO t SELECT printf('%0800d',i),0 FROM n").unwrap();
+    let mut update = conn.prepare("UPDATE t SET x=1-x").unwrap();
+    let mut measure = || {
+        conn.execute("BEGIN").unwrap();
+        update.reset().unwrap();
+        let before = ALLOCATED_BYTES.load(Ordering::Relaxed);
+        update.run_ignore_rows().unwrap();
+        let bytes = ALLOCATED_BYTES.load(Ordering::Relaxed) - before;
+        // Exclude commit and auto-checkpoint allocations from row capture.
+        conn.execute("COMMIT").unwrap();
+        bytes
+    };
+    measure();
+    let idle = measure();
+    let sub = db.subscribe_changes(turso_core::ChangeFilter::All);
+    let watched = measure();
+    let extra = watched.saturating_sub(idle);
+    eprintln!("capturing a 1200-row update allocated {extra} extra bytes");
+    // The bounded batch needs at most 129 old and new 800-byte keys.
+    assert!(
+        extra < 512 * 1024,
+        "capturing the batch allocated {extra} extra bytes"
+    );
+    assert_eq!(
+        sub.try_recv(),
+        Some(turso_core::ChangeBatch::Tables(
+            [("t".into(), turso_core::ChangedKeys::All)].into()
+        ))
+    );
+}

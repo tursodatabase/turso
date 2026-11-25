@@ -54,11 +54,14 @@ const MAX_KEY_BYTES: usize = 1024;
 const MAX_BATCHES: usize = 8;
 
 impl ChangeBatch {
-    fn record(&mut self, name: &str, key: Option<Vec<Value>>) {
-        let Self::Tables(tables) = self else { return };
+    /// Returns whether another key could make the invalidation more precise.
+    fn record(&mut self, name: &str, key: Option<Vec<Value>>) -> bool {
+        let Self::Tables(tables) = self else {
+            return false;
+        };
         if tables.len() >= MAX_TABLES && !tables.contains_key(name) {
             *self = Self::Refresh;
-            return;
+            return false;
         }
         let entry = if let Some(entry) = tables.get_mut(name) {
             entry
@@ -71,11 +74,12 @@ impl ChangeBatch {
             if let Some(key) = key {
                 keys.insert(key);
                 if keys.len() <= MAX_KEYS_PER_TABLE {
-                    return;
+                    return true;
                 }
             }
             *entry = ChangedKeys::All;
         }
+        false
     }
 
     fn merge(&mut self, other: Self) {
@@ -85,10 +89,14 @@ impl ChangeBatch {
         };
         for (name, keys) in tables {
             match keys {
-                ChangedKeys::All => self.record(&name, None),
+                ChangedKeys::All => {
+                    self.record(&name, None);
+                }
                 ChangedKeys::Keys(keys) => {
                     for key in keys {
-                        self.record(&name, Some(key));
+                        if !self.record(&name, Some(key)) {
+                            break;
+                        }
                     }
                 }
             }
@@ -464,7 +472,9 @@ impl Capture {
                 *self = Self::Ignore;
             }
             Self::Keys { name, through } => {
-                conn.pending_changes.record(conn, *through, Some(name), key)
+                if !conn.pending_changes.record(conn, *through, Some(name), key) {
+                    *self = Self::Ignore;
+                }
             }
         }
     }
@@ -581,7 +591,7 @@ impl PendingChanges {
         through: u64,
         table: Option<&str>,
         key: Option<Vec<Value>>,
-    ) {
+    ) -> bool {
         let mut pending = self.0.lock();
         let PendingState {
             transaction,
@@ -593,9 +603,9 @@ impl PendingChanges {
             changes.owner = conn.get_mv_tx_id();
         }
         changes.record_generation(through);
-        if let Some(name) = table {
-            Arc::make_mut(changes.batch.get_or_insert_with(Arc::default)).record(name, key);
-        }
+        table.is_some_and(|name| {
+            Arc::make_mut(changes.batch.get_or_insert_with(Arc::default)).record(name, key)
+        })
     }
 
     pub(crate) fn record_refresh(&self, conn: &crate::Connection) {
