@@ -4,6 +4,8 @@
 //! SQL and `sqlite_schema` rows are canonical SQLite text, parsed with the
 //! SQLite parser.
 
+mod key_ranges;
+
 use std::{ops::Range, sync::Arc};
 use turso_core::{ast, Dialect, Result};
 use turso_parser::{lexer::Lexer, parser::Parser, token::TokenType};
@@ -42,6 +44,10 @@ impl Dialect for SqliteDialect {
             }
         }
         Ok(markers)
+    }
+
+    fn key_ranges(&self, sql: &str) -> Vec<Range<usize>> {
+        key_ranges::key_ranges(sql)
     }
 
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {

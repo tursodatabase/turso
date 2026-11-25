@@ -8,6 +8,7 @@ mod deparse;
 mod descriptions;
 mod error;
 mod functions;
+mod key_ranges;
 mod open;
 mod options;
 mod pg_type;
