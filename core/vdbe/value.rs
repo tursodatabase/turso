@@ -704,7 +704,7 @@ impl Value {
             _ => match ignored_chars {
                 None => match self.cast_text_ref() {
                     Some(text) => {
-                        let input = &text[0..text.find('\0').unwrap_or(text.len())];
+                        let input = sqlite_text_prefix(&text);
                         let mut bytes = crate::alloc::vec![0; input.len() / 2];
                         match hex::decode_to_slice(input, &mut bytes) {
                             Ok(()) => Value::from_blob(bytes),
