@@ -3,6 +3,7 @@ using System.Data.Common;
 using AwesomeAssertions;
 using Turso.Raw.Public;
 using Turso.Raw.Public.Value;
+using Turso.Tests.Support;
 
 namespace Turso.Tests;
 
@@ -458,5 +459,19 @@ public class TursoTests
         {
             if (File.Exists(tempPath)) File.Delete(tempPath);
         }
+    }
+
+    [TestCase("")]
+    [TestCase("Encryption Cipher=;")]
+    public void TestEncryptionKeyWithoutCipherIsRejected(string cipherOption)
+    {
+        using var directory = new TemporaryDirectory();
+        var path = directory.File("key-without-cipher.db");
+        var hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+        using var connection = new TursoConnection($"Data Source={path};{cipherOption}Encryption Key={hexkey}");
+
+        connection.Invoking(x => x.Open()).Should().Throw<InvalidOperationException>()
+            .WithMessage("Encryption Cipher is required when Encryption Key is specified.");
+        File.Exists(path).Should().BeFalse();
     }
 }
