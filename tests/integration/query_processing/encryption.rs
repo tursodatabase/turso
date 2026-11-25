@@ -213,6 +213,58 @@ fn attach_key_rejects_non_null_values_before_creating_a_file() -> anyhow::Result
     Ok(())
 }
 
+#[test]
+fn attach_key_literal_is_rejected_when_prepared() -> anyhow::Result<()> {
+    let (_main_db, conn) = open_main_db()?;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("attached.db");
+    let attach = |key: &str| format!("ATTACH '{}' AS aux KEY {key}", path.display());
+    let assert_refused = |error: turso_core::LimboError| {
+        assert!(
+            error.to_string().contains("ATTACH KEY is not supported"),
+            "{error}"
+        );
+    };
+    // A compiled program shows its literals in the log, so preparation
+    // rejects a key literal.
+    for key in ["'secret'", "x'AB'", "42", "-42", "('secret')", "+'secret'"] {
+        assert_refused(conn.prepare(attach(key)).unwrap_err());
+    }
+    // The value of any other expression is checked when the statement runs,
+    // before the target opens.
+    let mut stmt = conn.prepare(attach("lower('SECRET')"))?;
+    assert_refused(stmt.run_ignore_rows().unwrap_err());
+    drop(stmt);
+    let mut stmt = conn.prepare(attach("?"))?;
+    stmt.bind_at(
+        std::num::NonZero::new(1).unwrap(),
+        turso_core::Value::build_text("secret"),
+    )?;
+    assert_refused(stmt.run_ignore_rows().unwrap_err());
+    drop(stmt);
+    assert!(!path.exists());
+    // An expression whose value is NULL attaches the database, as in SQLite.
+    for key in [
+        "NULL",
+        "(NULL)",
+        "?",
+        "CAST(NULL AS TEXT)",
+        "NULL+1",
+        "NULL||'x'",
+        "nullif(1, 1)",
+    ] {
+        conn.prepare(attach(key))?.run_ignore_rows()?;
+        conn.execute("DETACH aux")?;
+    }
+    let mut stmt = conn.prepare(attach("?1||''"))?;
+    stmt.bind_at(std::num::NonZero::new(1).unwrap(), turso_core::Value::Null)?;
+    stmt.run_ignore_rows()?;
+    drop(stmt);
+    conn.execute("DETACH aux")?;
+    assert!(path.exists());
+    Ok(())
+}
+
 fn attach_matrix_options(cipher: Option<&str>, mvcc: bool, key: &str) -> OpenOptions {
     OpenOptions::new(Arc::new(SqliteDialect))
         .db_opts(

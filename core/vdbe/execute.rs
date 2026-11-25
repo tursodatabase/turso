@@ -10888,9 +10888,7 @@ pub fn op_function(
             let dbname = state.registers[*start_reg + 1].get_value();
             let key = state.registers[*start_reg + 2].get_value();
             if !matches!(key, Value::Null) {
-                return Err(LimboError::InvalidArgument(
-                    "ATTACH KEY is not supported; provide cipher and hexkey in the attached database URI".into(),
-                ).into());
+                return Err(crate::attach::attach_key_not_supported().into());
             }
 
             let Value::Text(filename_str) = filename else {

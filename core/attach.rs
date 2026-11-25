@@ -1,7 +1,7 @@
 //! ATTACH and DETACH: open a database on the connection and give it a
 //! namespace, or remove both.
 
-use crate::ast::{Expr, Literal};
+use crate::ast::{Expr, Literal, UnaryOperator};
 use crate::function::{Func, ScalarFunc};
 #[cfg(feature = "fs")]
 use crate::io::{MemoryIO, IO};
@@ -38,6 +38,13 @@ pub fn translate_attach(
         return Err(crate::LimboError::ParseError(
             "ATTACH is an experimental feature. Enable with --experimental-attach flag".to_string(),
         ));
+    }
+    // Reject a key literal before the program holds it, because the compiled
+    // instructions show their literals in the TRACE log and in EXPLAIN. Any
+    // other KEY expression can be NULL when the statement runs, as SQLite
+    // allows, so the ATTACH function checks its value.
+    if key.as_deref().is_some_and(is_key_literal) {
+        return Err(attach_key_not_supported());
     }
 
     // SQLite treats ATTACH as a function call to sqlite_attach(filename, dbname, key)
@@ -130,6 +137,29 @@ pub fn translate_attach(
     });
 
     Ok(())
+}
+
+/// Whether an ATTACH KEY expression is a string, blob or number literal,
+/// alone, in parentheses or with a sign. This is how users write a key, as in
+/// `KEY 'secret'` or `KEY x'00ff'`.
+fn is_key_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(Literal::String(_) | Literal::Blob(_) | Literal::Numeric(_)) => true,
+        Expr::Parenthesized(exprs) => matches!(exprs.as_slice(), [expr] if is_key_literal(expr)),
+        Expr::Unary(UnaryOperator::Positive | UnaryOperator::Negative, expr) => {
+            is_key_literal(expr)
+        }
+        _ => false,
+    }
+}
+
+/// The error for a KEY value in ATTACH. Turso reads the key of an attached
+/// database from the `cipher` and `hexkey` parameters of its URI.
+pub(crate) fn attach_key_not_supported() -> LimboError {
+    LimboError::InvalidArgument(
+        "ATTACH KEY is not supported; provide cipher and hexkey in the attached database URI"
+            .into(),
+    )
 }
 
 /// Translate DETACH statement
