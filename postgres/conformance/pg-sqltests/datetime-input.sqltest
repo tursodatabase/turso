@@ -434,6 +434,21 @@ expect {
     1
 }
 
+# PostgreSQL has no = operator for timestamp[] with timestamptz[], so tursopg
+# keeps refusing it although it allows the scalar comparison.
+@compat-gap "operator:timestamp[] = timestamptz[]"
+test datetime-compare-timestamp-array-eq-timestamptz-array {
+    SELECT ARRAY['2024-01-05 10:00:00'::timestamp] = ARRAY['2024-01-05 10:00:00+00'::timestamptz];
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp without time zone\[\] = timestamp with time zone\[\]
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type timestamp\[\] with type timestamptz\[\]
+}
+
 # A date compared with a timestamp or a timestamptz fails in tursopg, where
 # PostgreSQL reads the date as midnight of that day in the other type. A date
 # and a timestamp are stored as different texts, and no rule says how one

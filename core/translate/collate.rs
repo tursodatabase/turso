@@ -1014,8 +1014,10 @@ fn check_comparable(
     allow_timestamp_with_timestamptz: bool,
 ) -> Result<()> {
     // Two arrays compare element by element, so their elements must compare.
+    // PostgreSQL has no array operator for timestamp[] with timestamptz[], so
+    // that pair stays refused.
     if let (ExprType::Array { element: x, .. }, ExprType::Array { element: y, .. }) = (a, b) {
-        return check_comparable(x, y, schema, allow_timestamp_with_timestamptz)
+        return check_comparable(x, y, schema, false)
             .map_err(|_| cannot_compare(a, b));
     }
     let (ExprType::Custom { type_def: x, .. }, ExprType::Custom { type_def: y, .. }) = (a, b)
@@ -1046,8 +1048,8 @@ fn check_comparable(
 /// the stored texts compare as PostgreSQL's values do. It becomes WRONG as
 /// soon as a session time zone other than UTC exists (a SET TIME ZONE, or a
 /// TimeZone setting): then a timestamp must be read in that zone before it is
-/// compared. It covers comparisons only ([check_comparable] with
-/// `allow_timestamp_with_timestamptz`): a CASE, coalesce or UNION of the two stays refused, since
+/// compared. It covers comparisons of the two scalar types only ([check_comparable] with
+/// `allow_timestamp_with_timestamptz`; arrays of them stay refused): a CASE, coalesce or UNION of the two stays refused, since
 /// PostgreSQL's result is a timestamptz, which we would print without `+00`.
 /// Delete it when pg_operator and pg_cast are vendored.
 fn timestamp_compared_with_timestamptz(x: &TypeDef, y: &TypeDef) -> bool {
