@@ -1227,6 +1227,10 @@ fn build_ordered_set_aggregate(
 /// Plans one use of a CTE.
 ///
 /// Each use gets separate table and cursor IDs unless it shares materialized rows.
+/// This function is on the stack one time for each level of nested CTEs, and
+/// one time for each CTE in a chain of CTEs that read each other. It returns
+/// the table in a [Box], and the work before and after the planning of the
+/// body is in functions that are not inlined, so that its frame stays small.
 #[allow(clippy::too_many_arguments)]
 fn plan_cte(
     cte_definition_index: usize,
@@ -1236,7 +1240,7 @@ fn plan_cte(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     validate_explicit_column_count: bool,
-) -> Result<JoinedTable> {
+) -> Result<Box<JoinedTable>> {
     let cte_definition = &cte_definitions[cte_definition_index];
     if program.is_cte_being_defined(&cte_definition.name) {
         crate::bail_parse_error!("circular reference: {}", cte_definition.name);
@@ -1245,51 +1249,14 @@ fn plan_cte(
     // Plan only the other CTEs this definition names. Planning every preceding
     // CTE here would repeatedly plan the same transitive dependencies.
     program.push_cte_being_defined(cte_definition.name.clone());
-    let outer_query_refs: Result<Vec<OuterQueryReference>> = (|| {
-        let mut outer_query_refs = base_outer_query_refs.to_vec();
-        for &referenced_cte_index in &cte_definition.referenced_cte_indices {
-            let referenced_cte_name = &cte_definitions[referenced_cte_index].name;
-            if outer_query_refs
-                .iter()
-                .any(|reference| &reference.identifier == referenced_cte_name)
-            {
-                continue;
-            }
-            // The plan of this CTE holds the plan of the CTE that it reads, so a
-            // chain of CTEs in one WITH clause nests its plans one in another.
-            let nested_query = resolver.enter_nested_query()?;
-            let referenced_cte_table = plan_cte(
-                referenced_cte_index,
-                cte_definitions,
-                base_outer_query_refs,
-                resolver,
-                program,
-                connection,
-                false,
-            )?;
-            drop(nested_query);
-            outer_query_refs.push(OuterQueryReference {
-                identifier: referenced_cte_table.identifier.clone(),
-                has_alias: referenced_cte_table.has_alias,
-                internal_id: referenced_cte_table.internal_id,
-                table: referenced_cte_table.table.clone(),
-                namespace: referenced_cte_table.namespace,
-                join_info: None,
-                col_used_mask: ColumnUsedMask::default(),
-                cte_select: None,
-                cte_explicit_columns: vec![],
-                cte_id: Some(cte_definitions[referenced_cte_index].cte_id),
-                // This entry only lets the body's FROM clause find the sibling
-                // CTE by name; its columns become visible when a FROM clause
-                // actually adds the table.
-                cte_definition_only: true,
-                rowid_referenced: false,
-                outer_join_may_null_extend: false,
-                scope_depth: 0,
-            });
-        }
-        Ok(outer_query_refs)
-    })();
+    let outer_query_refs = referenced_cte_outer_query_refs(
+        cte_definition,
+        cte_definitions,
+        base_outer_query_refs,
+        resolver,
+        program,
+        connection,
+    );
     program.pop_cte_being_defined();
     let outer_query_refs = outer_query_refs?;
 
@@ -1317,6 +1284,101 @@ fn plan_cte(
         plan?
     };
 
+    cte_table_from_plan(
+        cte_definition,
+        cte_query_plan,
+        validate_explicit_column_count,
+        resolver,
+        program,
+    )
+}
+
+/// Returns the outer query references for the body of a CTE. They are
+/// `base_outer_query_refs` and the other CTEs of the same WITH clause that the
+/// body names, which this function plans. This function is not inlined, so
+/// that its values are not in the frame of [plan_cte] while the body is planned.
+#[inline(never)]
+fn referenced_cte_outer_query_refs(
+    cte_definition: &CteDefinition,
+    cte_definitions: &[CteDefinition],
+    base_outer_query_refs: &[OuterQueryReference],
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<Vec<OuterQueryReference>> {
+    let mut outer_query_refs = base_outer_query_refs.to_vec();
+    for &referenced_cte_index in &cte_definition.referenced_cte_indices {
+        let referenced_cte_name = &cte_definitions[referenced_cte_index].name;
+        if outer_query_refs
+            .iter()
+            .any(|reference| &reference.identifier == referenced_cte_name)
+        {
+            continue;
+        }
+        // The plan of this CTE holds the plan of the CTE that it reads, so a
+        // chain of CTEs in one WITH clause nests its plans one in another.
+        let nested_query = resolver.enter_nested_query()?;
+        let referenced_cte_table = plan_cte(
+            referenced_cte_index,
+            cte_definitions,
+            base_outer_query_refs,
+            resolver,
+            program,
+            connection,
+            false,
+        )?;
+        drop(nested_query);
+        push_referenced_cte_outer_query_ref(
+            &mut outer_query_refs,
+            &referenced_cte_table,
+            cte_definitions[referenced_cte_index].cte_id,
+        );
+    }
+    Ok(outer_query_refs)
+}
+
+/// Adds a CTE that the body of another CTE names to the outer query references
+/// of that body. This function is not inlined, so that its large
+/// [OuterQueryReference] is not in the frame of [referenced_cte_outer_query_refs]
+/// while the CTEs of a chain are planned.
+#[inline(never)]
+fn push_referenced_cte_outer_query_ref(
+    outer_query_refs: &mut Vec<OuterQueryReference>,
+    referenced_cte_table: &JoinedTable,
+    cte_id: usize,
+) {
+    outer_query_refs.push(OuterQueryReference {
+        identifier: referenced_cte_table.identifier.clone(),
+        has_alias: referenced_cte_table.has_alias,
+        internal_id: referenced_cte_table.internal_id,
+        table: referenced_cte_table.table.clone(),
+        namespace: referenced_cte_table.namespace,
+        join_info: None,
+        col_used_mask: ColumnUsedMask::default(),
+        cte_select: None,
+        cte_explicit_columns: vec![],
+        cte_id: Some(cte_id),
+        // This entry only lets the body's FROM clause find the sibling
+        // CTE by name; its columns become visible when a FROM clause
+        // actually adds the table.
+        cte_definition_only: true,
+        rowid_referenced: false,
+        outer_join_may_null_extend: false,
+        scope_depth: 0,
+    });
+}
+
+/// Makes the table of one use of a CTE from the plan of its body. This
+/// function is not inlined, so that its large [JoinedTable] is not in the
+/// frame of [plan_cte] while the body is planned.
+#[inline(never)]
+fn cte_table_from_plan(
+    cte_definition: &CteDefinition,
+    cte_query_plan: Plan,
+    validate_explicit_column_count: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<Box<JoinedTable>> {
     let explicit_columns = if cte_definition.explicit_columns.is_empty() {
         None
     } else {
@@ -1341,7 +1403,7 @@ fn plan_cte(
 
     match cte_query_plan {
         Plan::Select(_) | Plan::CompoundSelect { .. } | Plan::RecursiveCte(_) => {
-            JoinedTable::new_subquery_from_plan(
+            Ok(Box::new(JoinedTable::new_subquery_from_plan(
                 cte_definition.name.clone(),
                 cte_query_plan,
                 None,
@@ -1350,7 +1412,7 @@ fn plan_cte(
                 Some(cte_definition.cte_id),
                 cte_definition.materialize_hint,
                 resolver,
-            )
+            )?))
         }
         Plan::Delete(_) | Plan::Update(_) => {
             crate::bail_parse_error!("DELETE/UPDATE queries are not supported in CTEs")
@@ -1358,6 +1420,13 @@ fn plan_cte(
     }
 }
 
+/// Plans the body of a recursive CTE.
+///
+/// This function is on the stack one time for each level of nested recursive
+/// CTEs. The checks before the planning of the initial and recursive queries,
+/// and the work after it, are in functions that are not inlined, so that their
+/// values are not in this frame while the queries are planned.
+#[inline(never)]
 fn prepare_recursive_cte_plan(
     cte_definition: &CteDefinition,
     resolver: &Resolver,
@@ -1365,6 +1434,72 @@ fn prepare_recursive_cte_plan(
     outer_query_refs: &[OuterQueryReference],
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
+    let select = &cte_definition.select;
+    let (first_recursive_query_index, recursive_compound_operator) =
+        find_recursive_cte_queries(cte_definition)?;
+
+    let initial_query = prepare_select_plan_from_arms(
+        select.body.select.clone(),
+        select.body.compounds[..first_recursive_query_index - 1]
+            .iter()
+            .cloned(),
+        select.with.clone(),
+        vec![],
+        None,
+        resolver,
+        program,
+        outer_query_refs,
+        QueryDestination::placeholder_for_subquery(),
+        connection,
+        false,
+    )?;
+
+    let (input_table_id, recursive_query_outer_refs) = recursive_query_outer_refs(
+        cte_definition,
+        &initial_query,
+        outer_query_refs,
+        resolver,
+        program,
+    )?;
+
+    let recursive_query = prepare_select_plan_from_arms(
+        select.body.compounds[first_recursive_query_index - 1]
+            .select
+            .clone(),
+        select.body.compounds[first_recursive_query_index..]
+            .iter()
+            .map(|compound| ast::CompoundSelect {
+                operator: ast::CompoundOperator::UnionAll,
+                select: compound.select.clone(),
+            }),
+        select.with.clone(),
+        vec![],
+        None,
+        resolver,
+        program,
+        &recursive_query_outer_refs,
+        QueryDestination::placeholder_for_subquery(),
+        connection,
+        false,
+    )?;
+
+    finish_recursive_cte_plan(
+        cte_definition,
+        initial_query,
+        recursive_query,
+        input_table_id,
+        recursive_compound_operator,
+        resolver,
+    )
+}
+
+/// Finds the first recursive query of a recursive CTE, and checks that the
+/// queries read the CTE and use compound operators as SQLite permits. Returns
+/// the index of the first recursive query and the operator in front of it.
+#[inline(never)]
+fn find_recursive_cte_queries(
+    cte_definition: &CteDefinition,
+) -> Result<(usize, ast::CompoundOperator)> {
     let select = &cte_definition.select;
     let mut first_recursive_query_index = None;
     let ref_counter = RecursiveRefCounter {
@@ -1415,15 +1550,14 @@ fn prepare_recursive_cte_plan(
 
     let recursive_compound_operator =
         select.body.compounds[first_recursive_query_index - 1].operator;
-    let union_all = match recursive_compound_operator {
-        ast::CompoundOperator::UnionAll => true,
-        ast::CompoundOperator::Union => false,
+    match recursive_compound_operator {
+        ast::CompoundOperator::UnionAll | ast::CompoundOperator::Union => {}
         ast::CompoundOperator::Except | ast::CompoundOperator::Intersect => {
             crate::bail_parse_error!(
                 "recursive CTEs must use UNION ALL or UNION between the initial and recursive queries"
             );
         }
-    };
+    }
     for compound in select
         .body
         .compounds
@@ -1434,23 +1568,22 @@ fn prepare_recursive_cte_plan(
             crate::bail_parse_error!("recursive CTE queries must use the same UNION operator");
         }
     }
+    Ok((first_recursive_query_index, recursive_compound_operator))
+}
 
-    let initial_query = prepare_select_plan_from_arms(
-        select.body.select.clone(),
-        select.body.compounds[..first_recursive_query_index - 1]
-            .iter()
-            .cloned(),
-        select.with.clone(),
-        vec![],
-        None,
-        resolver,
-        program,
-        outer_query_refs,
-        QueryDestination::placeholder_for_subquery(),
-        connection,
-        false,
-    )?;
-
+/// Makes the input table of a recursive CTE from the plan of its initial
+/// query. Returns the ID of the input table, and the outer query references of
+/// the recursive query: `outer_query_refs` and the input table. This function
+/// is not inlined, so that its large values are not in the frame of
+/// [prepare_recursive_cte_plan] while the queries are planned.
+#[inline(never)]
+fn recursive_query_outer_refs(
+    cte_definition: &CteDefinition,
+    initial_query: &Plan,
+    outer_query_refs: &[OuterQueryReference],
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<(TableInternalId, Vec<OuterQueryReference>)> {
     let explicit_columns = (!cte_definition.explicit_columns.is_empty())
         .then_some(cte_definition.explicit_columns.as_slice());
     if let Some(columns) = explicit_columns {
@@ -1467,7 +1600,7 @@ fn prepare_recursive_cte_plan(
 
     let input_table = JoinedTable::new_recursive_cte_input(
         cte_definition.name.clone(),
-        &initial_query,
+        initial_query,
         program.table_reference_counter.next(),
         explicit_columns,
         resolver,
@@ -1491,28 +1624,21 @@ fn prepare_recursive_cte_plan(
         outer_join_may_null_extend: false,
         scope_depth: 0,
     });
+    Ok((input_table_id, recursive_query_outer_refs))
+}
 
-    let recursive_query = prepare_select_plan_from_arms(
-        select.body.compounds[first_recursive_query_index - 1]
-            .select
-            .clone(),
-        select.body.compounds[first_recursive_query_index..]
-            .iter()
-            .map(|compound| ast::CompoundSelect {
-                operator: ast::CompoundOperator::UnionAll,
-                select: compound.select.clone(),
-            }),
-        select.with.clone(),
-        vec![],
-        None,
-        resolver,
-        program,
-        &recursive_query_outer_refs,
-        QueryDestination::placeholder_for_subquery(),
-        connection,
-        false,
-    )?;
-
+/// Makes the plan of a recursive CTE from the plans of its initial and
+/// recursive queries. This function is not inlined, so that its values are not
+/// in the frame of [prepare_recursive_cte_plan] while the queries are planned.
+#[inline(never)]
+fn finish_recursive_cte_plan(
+    cte_definition: &CteDefinition,
+    initial_query: Plan,
+    recursive_query: Plan,
+    input_table_id: TableInternalId,
+    recursive_compound_operator: ast::CompoundOperator,
+    resolver: &Resolver,
+) -> Result<Plan> {
     if initial_query.select_result_columns().len() != recursive_query.select_result_columns().len()
     {
         crate::bail_parse_error!(
@@ -1522,6 +1648,7 @@ fn prepare_recursive_cte_plan(
     }
     reject_aggregates_and_windows_in_recursive_query(&recursive_query)?;
 
+    let select = &cte_definition.select;
     let queue_order = super::select::resolve_recursive_cte_queue_order(
         &select.order_by,
         &initial_query,
@@ -1539,7 +1666,7 @@ fn prepare_recursive_cte_plan(
             initial_query: Box::new(initial_query),
             recursive_query: Box::new(recursive_query),
             input_table_id,
-            union_all,
+            union_all: recursive_compound_operator == ast::CompoundOperator::UnionAll,
             limit,
             offset,
             queue_order,
@@ -2045,7 +2172,7 @@ fn parse_table(
                 cte_definitions,
             );
             // Only a real FROM/JOIN use should report an explicit column-count mismatch.
-            let mut cte_table = plan_cte(
+            let cte_table = plan_cte(
                 cte_definition_index,
                 cte_definitions,
                 &planning_outer_query_refs,
@@ -2054,21 +2181,12 @@ fn parse_table(
                 connection,
                 true,
             )?;
-
-            // If there's an alias provided, update the identifier to use that alias
-            if let Some(a) = maybe_alias {
-                cte_table.identifier = normalize_ident(a.name().as_str());
-                cte_table.has_alias = true;
-            }
-
-            // Mark the pre-planned outer_query_ref as "CTE definition only" so it is
-            // still available for CTE lookup in subquery FROM clauses (e.g.
-            // EXISTS (SELECT 1 FROM <cte_name> ...)), but no longer participates in
-            // column resolution. Column resolution now goes through the joined_table
-            // which has the alias (if any) or the original name.
-            table_references.mark_outer_query_ref_cte_definition_only(&normalized_qualified_name);
-
-            table_references.add_joined_table(cte_table);
+            add_cte_table(
+                table_references,
+                cte_table,
+                &normalized_qualified_name,
+                maybe_alias,
+            );
             return Ok(());
         }
 
@@ -2471,6 +2589,32 @@ fn transform_args_into_where_terms(
     }
 
     Ok(())
+}
+
+/// Adds a planned use of a CTE of the current WITH clause to `table_references`.
+/// This function is not inlined, so that the [JoinedTable] that it moves is not
+/// in the frame of [parse_table].
+#[inline(never)]
+fn add_cte_table(
+    table_references: &mut TableReferences,
+    mut cte_table: Box<JoinedTable>,
+    cte_name: &str,
+    maybe_alias: Option<&As>,
+) {
+    // If there's an alias provided, update the identifier to use that alias
+    if let Some(a) = maybe_alias {
+        cte_table.identifier = normalize_ident(a.name().as_str());
+        cte_table.has_alias = true;
+    }
+
+    // Mark the pre-planned outer_query_ref as "CTE definition only" so it is
+    // still available for CTE lookup in subquery FROM clauses (e.g.
+    // EXISTS (SELECT 1 FROM <cte_name> ...)), but no longer participates in
+    // column resolution. Column resolution now goes through the joined_table
+    // which has the alias (if any) or the original name.
+    table_references.mark_outer_query_ref_cte_definition_only(cte_name);
+
+    table_references.add_joined_table(*cte_table);
 }
 
 /// Build a stable outer-scope reference set for CTE planning.
