@@ -575,12 +575,14 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     /// Forward scan over `index_rows`; see [`IndexShadowScan`].
     index_shadow_scan: IndexShadowScan<A>,
     /// [`MvStore::table_rows_epoch`] or [`MvStore::index_rows_epoch`], by cursor
-    /// type, read before the MVCC peek was taken.
+    /// type, read before the MVCC peek was taken. `None` after an exact seek,
+    /// which stops the MVCC iterator at the seek key.
     /// See [`Self::reseek_mvcc_if_rows_changed`].
-    mvcc_peek_epoch: u64,
+    mvcc_peek_epoch: Option<u64>,
     /// The direction in which `next()` or `prev()` can reuse the two peeks.
-    /// `None` after an exact seek, an existence probe, or insertion at another
-    /// key. The next step then seeks both sources past the complete current key.
+    /// `None` after an exact seek that found no B-tree row, an existence
+    /// probe, or insertion at another key. The next step then seeks both
+    /// sources past the complete current key.
     peeks_valid_for: Option<IterationDirection>,
 }
 
@@ -650,7 +652,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             btree_advance_state: None,
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
-            mvcc_peek_epoch: 0,
+            mvcc_peek_epoch: Some(0),
             peeks_valid_for: None,
         })
     }
@@ -901,7 +903,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     /// The iterator sees a key added ahead of its position, but not one added
     /// between the current key and the peek, nor any key once it is exhausted.
     /// And the peek itself may have been deleted since. Either can be a write
-    /// of this cursor's own transaction.
+    /// of this cursor's own transaction. It also seeks again after an exact
+    /// seek, which stops the iterator at the seek key.
     ///
     /// Returns true if it seeked: the MVCC peek is then already past the
     /// current key and must not be advanced again.
@@ -910,10 +913,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             return Ok(false);
         };
         let epoch = self.mvcc_rows_epoch();
-        if epoch == self.mvcc_peek_epoch {
+        if self.mvcc_peek_epoch == Some(epoch) {
             return Ok(false);
         }
-        self.mvcc_peek_epoch = epoch;
+        self.mvcc_peek_epoch = Some(epoch);
         let found = match &row_id.row_id {
             RowKey::Int(_) => self
                 .db
@@ -1227,7 +1230,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     fn reset_dual_peek(&mut self) {
         self.peeks_valid_for = None;
         self.dual_peek = DualCursorPeek::default();
-        self.mvcc_peek_epoch = self.mvcc_rows_epoch();
+        self.mvcc_peek_epoch = Some(self.mvcc_rows_epoch());
         self.eq_seek_row = None;
         // The forward scan is monotonic; a reposition invalidates it.
         self.index_shadow_scan.reset();
@@ -1499,7 +1502,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 let uninitialized = self.dual_peek.both_uninitialized();
                 if uninitialized {
                     // Initialize MVCC iterator and get first peek
-                    self.mvcc_peek_epoch = self.mvcc_rows_epoch();
+                    self.mvcc_peek_epoch = Some(self.mvcc_rows_epoch());
                     self.init_mvcc_iterator_forward()?;
                     self.advance_mvcc_iterator();
                     self.state
@@ -1892,9 +1895,19 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     // Now pick the winner based on direction
                     let winner_pos = self.position_from_peeks(direction);
                     self.state = None;
-                    // Exact lookups prepare matches for their key, not neighbors.
-                    // A later step must seek both sources past the complete current key.
-                    self.peeks_valid_for = if op.eq_only() { None } else { Some(direction) };
+                    // An exact seek stops the MVCC iterator at the seek key, so the next
+                    // step seeks it again past the current key. A B-tree peek that holds
+                    // a row is the first visible B-tree row from the seek key in
+                    // `direction`, so the step can use it without a second B-tree seek.
+                    // A B-tree peek without a row can come from a B-tree seek that
+                    // stopped at the key, so the step must seek both sources again.
+                    self.peeks_valid_for = Some(direction);
+                    if op.eq_only() {
+                        self.mvcc_peek_epoch = None;
+                        if self.dual_peek.btree_peek.get_row_key().is_none() {
+                            self.peeks_valid_for = None;
+                        }
+                    }
                     if let CursorPosition::Loaded {
                         row_id,
                         in_btree,
