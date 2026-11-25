@@ -552,7 +552,15 @@ pub fn in_subquery_collation(
         type_of(lhs, &lhs_context.type_env()),
         query_column_type(query, column, resolver),
     ];
-    check_comparable(&types[0], &types[1], resolver.schema(), true)?;
+    check_comparable(
+        &types[0],
+        &types[1],
+        resolver.schema(),
+        resolver
+            .catalog
+            .dialect
+            .compares_timestamp_with_timestamptz(),
+    )?;
     check_in_subquery_operator(
         lhs,
         &lhs_context.type_env(),
@@ -1003,11 +1011,12 @@ fn check_comparable(
     a: &ExprType,
     b: &ExprType,
     schema: &Schema,
-    is_comparison: bool,
+    allow_timestamp_with_timestamptz: bool,
 ) -> Result<()> {
     // Two arrays compare element by element, so their elements must compare.
     if let (ExprType::Array { element: x, .. }, ExprType::Array { element: y, .. }) = (a, b) {
-        return check_comparable(x, y, schema, is_comparison).map_err(|_| cannot_compare(a, b));
+        return check_comparable(x, y, schema, allow_timestamp_with_timestamptz)
+            .map_err(|_| cannot_compare(a, b));
     }
     let (ExprType::Custom { type_def: x, .. }, ExprType::Custom { type_def: y, .. }) = (a, b)
     else {
@@ -1016,7 +1025,7 @@ fn check_comparable(
     let (Some(x), Some(y)) = (schema.without_domains(x)?, schema.without_domains(y)?) else {
         return Ok(());
     };
-    if is_comparison && timestamp_compared_with_timestamptz(&x, &y) {
+    if allow_timestamp_with_timestamptz && timestamp_compared_with_timestamptz(&x, &y) {
         return Ok(());
     }
     if same_type_def(&x, &y) || !(x.changes_stored_value() || y.changes_stored_value()) {
@@ -1038,7 +1047,7 @@ fn check_comparable(
 /// soon as a session time zone other than UTC exists (a SET TIME ZONE, or a
 /// TimeZone setting): then a timestamp must be read in that zone before it is
 /// compared. It covers comparisons only ([check_comparable] with
-/// `is_comparison`): a CASE, coalesce or UNION of the two stays refused, since
+/// `allow_timestamp_with_timestamptz`): a CASE, coalesce or UNION of the two stays refused, since
 /// PostgreSQL's result is a timestamptz, which we would print without `+00`.
 /// Delete it when pg_operator and pg_cast are vendored.
 fn timestamp_compared_with_timestamptz(x: &TypeDef, y: &TypeDef) -> bool {
@@ -1057,7 +1066,10 @@ fn check_comparable_exprs(
         &type_of(lhs, &lhs_context.type_env()),
         &type_of(rhs, &rhs_context.type_env()),
         lhs_context.schema(),
-        true,
+        lhs_context
+            .catalog()
+            .dialect
+            .compares_timestamp_with_timestamptz(),
     )
 }
 
@@ -1070,7 +1082,15 @@ fn check_in_list_comparable(
     let env = context.type_env();
     let lhs_type = type_of(lhs, &env);
     items.iter().try_for_each(|item| {
-        check_comparable(&lhs_type, &type_of(item, &env), context.schema(), true)
+        check_comparable(
+            &lhs_type,
+            &type_of(item, &env),
+            context.schema(),
+            context
+                .catalog()
+                .dialect
+                .compares_timestamp_with_timestamptz(),
+        )
     })
 }
 

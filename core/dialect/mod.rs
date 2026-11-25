@@ -321,6 +321,18 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a comparison of a `timestamp` with a `timestamptz` is allowed.
+    ///
+    /// FIXME(pg-catalog): HACK. This stands in for pg_operator's comparison
+    /// operators of the two types and for pg_cast's implicit cast of timestamp
+    /// to timestamptz. It is correct ONLY while both types store the same UTC
+    /// text and the session time zone is always UTC. Delete it with the
+    /// pg_operator and pg_cast lookup. The SQLite frontend has no such cast,
+    /// so the comparison is an error there.
+    fn compares_timestamp_with_timestamptz(&self) -> bool {
+        false
+    }
+
     /// Whether `t.c` reads only the nearest query that has a table named `t`.
     ///
     /// SQLite keeps searching outer queries when that table has no column
