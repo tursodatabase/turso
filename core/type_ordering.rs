@@ -65,11 +65,6 @@ impl TypeOrdering {
         self.functions().name
     }
 
-    /// The number of the order among all orders, from 0.
-    pub const fn number(self) -> u16 {
-        self.0
-    }
-
     pub fn compare(self, left: ValueRef, right: ValueRef) -> Ordering {
         (self.functions().compare)(left, right)
     }

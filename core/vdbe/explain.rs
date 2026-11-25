@@ -1423,7 +1423,7 @@ pub fn insn_to_row(
                 0,
                 format!("accum=r[{}] inverse(r[{}])", *acc_reg, *col),
             ),
-            Insn::AggFinal { register, func } => (
+            Insn::AggFinal { register, func, .. } => (
                 "AggFinal",
                 0,
                 *register as i64,
@@ -1436,6 +1436,7 @@ pub fn insn_to_row(
                 acc_reg,
                 dest_reg,
                 func,
+                ..
             } => (
                 "AggValue",
                 0,

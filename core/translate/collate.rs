@@ -92,60 +92,6 @@ impl CollationSeq {
         Self::BINARY
     }
 
-    /// The value [Self::to_bits] never returns for a built-in or locale
-    /// collation, so stored bits can use it for "no collation".
-    pub const NO_COLLATION_BITS: u16 = 0;
-
-    /// A compact number for the collation, for storing it in column flags and
-    /// aggregate state. A custom collation has none and gets
-    /// [Self::NO_COLLATION_BITS].
-    #[inline]
-    pub const fn to_bits(self) -> u16 {
-        match self {
-            Self::Text(TextCollation::Binary) => 1,
-            Self::Text(TextCollation::NoCase) => 2,
-            Self::Text(TextCollation::Rtrim) => 3,
-            Self::Text(TextCollation::Locale(id)) => id.to_bits(),
-            Self::Text(TextCollation::Custom(_)) => Self::NO_COLLATION_BITS,
-            Self::Type(ordering) => Self::FIRST_TYPE_ORDERING_BITS + ordering.number(),
-        }
-    }
-
-    /// Type orderings take the numbers from here up to the first number of a
-    /// locale collation.
-    const FIRST_TYPE_ORDERING_BITS: u16 = 4;
-
-    /// The collation [Self::to_bits] turned into `bits`. Any other value,
-    /// including [Self::NO_COLLATION_BITS], is an error.
-    pub fn from_bits(bits: u16) -> Result<Self> {
-        match bits {
-            1 => Ok(Self::BINARY),
-            2 => Ok(Self::NOCASE),
-            3 => Ok(Self::RTRIM),
-            bits if (Self::FIRST_TYPE_ORDERING_BITS..LocaleCollationId::FIRST_STORAGE_BIT)
-                .contains(&bits) =>
-            {
-                let ordering = TypeOrdering::ALL
-                    .get(usize::from(bits - Self::FIRST_TYPE_ORDERING_BITS))
-                    .ok_or_else(|| {
-                        LimboError::InternalError(format!("no collation has the number {bits}"))
-                    })?;
-                Ok(Self::Type(*ordering))
-            }
-            bits if bits >= LocaleCollationId::FIRST_STORAGE_BIT
-                && LocaleCollationRegistry::global()
-                    .is_registered(LocaleCollationId::from_bits(bits)) =>
-            {
-                Ok(Self::Text(TextCollation::Locale(
-                    LocaleCollationId::from_bits(bits),
-                )))
-            }
-            bits => Err(LimboError::InternalError(format!(
-                "no collation has the number {bits}"
-            ))),
-        }
-    }
-
     #[inline]
     pub const fn is_custom(self) -> bool {
         matches!(self, Self::Text(TextCollation::Custom(_)))
@@ -370,24 +316,13 @@ impl std::fmt::Display for CollationSeq {
 pub struct LocaleCollationId(u16);
 
 impl LocaleCollationId {
-    const FIRST_STORAGE_BIT: u16 =
-        CollationSeq::FIRST_TYPE_ORDERING_BITS + TypeOrdering::ALL.len() as u16;
-
     fn from_index(index: usize) -> Result<Self> {
-        if index > (u16::MAX - Self::FIRST_STORAGE_BIT) as usize {
+        if index > u16::MAX as usize {
             return Err(crate::LimboError::ParseError(
                 "too many locale collation sequences".to_string(),
             ));
         }
         Ok(Self(index as u16))
-    }
-
-    const fn from_bits(bits: u16) -> Self {
-        Self(bits - Self::FIRST_STORAGE_BIT)
-    }
-
-    const fn to_bits(self) -> u16 {
-        self.0 + Self::FIRST_STORAGE_BIT
     }
 }
 
@@ -460,10 +395,6 @@ impl LocaleCollationRegistry {
                 .expect("Vec collation key sink should be infallible");
             key
         })
-    }
-
-    fn is_registered(&self, id: LocaleCollationId) -> bool {
-        (id.0 as usize) < self.collations.read().len()
     }
 
     fn name(&self, id: LocaleCollationId) -> String {
@@ -1487,27 +1418,6 @@ mod tests {
             TextCollation::Locale(_)
         ));
         assert!(TextCollation::new("compile_options").is_err());
-    }
-
-    #[test]
-    fn collation_bits_round_trip_and_unknown_bits_are_an_error() {
-        let locale = CollationSeq::new("fr-FR").unwrap();
-        for collation in [
-            CollationSeq::BINARY,
-            CollationSeq::NOCASE,
-            CollationSeq::RTRIM,
-            locale,
-        ]
-        .into_iter()
-        .chain(TypeOrdering::ALL.map(CollationSeq::Type))
-        {
-            assert_eq!(
-                CollationSeq::from_bits(collation.to_bits()).unwrap(),
-                collation
-            );
-        }
-        assert!(CollationSeq::from_bits(CollationSeq::NO_COLLATION_BITS).is_err());
-        assert!(CollationSeq::from_bits(u16::MAX).is_err());
     }
 
     #[test]

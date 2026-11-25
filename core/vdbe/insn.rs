@@ -1444,6 +1444,7 @@ pub enum Insn {
     AggFinal {
         register: usize,
         func: AccumulatorFunc,
+        collation: Option<CollationSeq>,
     },
 
     /// Similar to AggFinal, but instead of writing the result back into the
@@ -1453,6 +1454,7 @@ pub enum Insn {
         acc_reg: usize,
         dest_reg: usize,
         func: AccumulatorFunc,
+        collation: Option<CollationSeq>,
     },
 
     /// Materialize an aggregate accumulator register from its persisted state
@@ -2706,6 +2708,9 @@ impl Insn {
                 .map(|(_, collation, _)| *collation)
                 .collect(),
             Insn::AggStep { data } => vec![data.collation],
+            Insn::AggFinal { collation, .. } | Insn::AggValue { collation, .. } => {
+                collation.iter().copied().collect()
+            }
             Insn::HashBuild { data } => data.collations.clone(),
             Insn::HashDistinct { data } => data.collations.clone(),
             Insn::Function { func, .. } => vec![func.collation],

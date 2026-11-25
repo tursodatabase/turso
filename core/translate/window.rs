@@ -2331,6 +2331,7 @@ fn emit_window_agg_final(
             program.emit_insn(Insn::AggFinal {
                 register: acc_reg,
                 func: func.func.clone(),
+                collation: None,
             });
             program.emit_insn(Insn::Copy {
                 src_reg: acc_reg,
@@ -2346,6 +2347,7 @@ fn emit_window_agg_final(
                 acc_reg,
                 dest_reg: result_reg,
                 func: func.func.clone(),
+                collation: None,
             });
         }
     }

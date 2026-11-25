@@ -7652,15 +7652,13 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
             payload.push(Value::from_i64(0));
         }
         AggFunc::Mode => {
-            payload.try_reserve_exact(2)?;
-            // [0] = collation bits, [1] = count, [2..] = buffered values.
-            payload.push(Value::from_i64(0));
+            payload.try_reserve_exact(1)?;
+            // [0] = count, [1..] = buffered values.
             payload.push(Value::from_i64(0));
         }
         AggFunc::PercentileCont | AggFunc::PercentileDisc => {
-            payload.try_reserve_exact(3)?;
-            // [0] = collation bits, [1] = count, [2] = fraction, [3..] = buffered values.
-            payload.push(Value::from_i64(0));
+            payload.try_reserve_exact(2)?;
+            // [0] = count, [1] = fraction, [2..] = buffered values.
             payload.push(Value::from_i64(0));
             payload.push(Value::Null);
         }
@@ -8055,24 +8053,21 @@ fn update_agg_payload(
             payload.try_push(arg.try_clone()?)?;
         }
         AggFunc::Mode => {
-            // Record the value's collation (constant per group) for finalize-time sorting, then
-            // buffer the value. Ordered-set aggregates ignore NULL inputs.
-            payload[0] = Value::from_i64(collation.to_bits() as i64);
+            // Ordered-set aggregates ignore NULL inputs.
             if !matches!(arg, Value::Null) {
-                let count = payload[1].as_int().unwrap_or(0) as usize;
-                payload[1] = Value::from_i64((count + 1) as i64);
+                let count = payload[0].as_int().unwrap_or(0) as usize;
+                payload[0] = Value::from_i64((count + 1) as i64);
                 payload.try_push(arg.try_clone()?)?;
             }
         }
         AggFunc::PercentileCont | AggFunc::PercentileDisc => {
-            payload[0] = Value::from_i64(collation.to_bits() as i64);
             // The fraction is a per-group constant; record it on every step.
             if let Some(fraction) = maybe_arg2 {
-                payload[2].try_clone_from(fraction)?;
+                payload[1].try_clone_from(fraction)?;
             }
             if !matches!(arg, Value::Null) {
-                let count = payload[1].as_int().unwrap_or(0) as usize;
-                payload[1] = Value::from_i64((count + 1) as i64);
+                let count = payload[0].as_int().unwrap_or(0) as usize;
+                payload[0] = Value::from_i64((count + 1) as i64);
                 payload.try_push(arg.try_clone()?)?;
             }
         }
@@ -8419,7 +8414,12 @@ pub(crate) fn agg_payload_width(func: &AggFunc) -> Option<usize> {
 /// that is the first payload value, as for MIN, MAX, group_concat and
 /// string_agg, moves out of the payload instead of being copied. A copy of a
 /// group_concat result copies each byte of the concatenation.
-fn finalize_agg_payload(func: &AggFunc, payload: &mut [Value], take_first: bool) -> Result<Value> {
+fn finalize_agg_payload(
+    func: &AggFunc,
+    payload: &mut [Value],
+    take_first: bool,
+    collation: Option<CollationSeq>,
+) -> Result<Value> {
     let val = match func {
         AggFunc::Count | AggFunc::Count0 => payload[0].clone(),
         AggFunc::Avg => {
@@ -8519,36 +8519,41 @@ fn finalize_agg_payload(func: &AggFunc, payload: &mut [Value], take_first: bool)
             }
         }
         AggFunc::Mode => {
-            // payload: [0]=collation bits, [1]=count, [2..]=buffered values.
-            let collation = CollationSeq::from_bits(payload[0].as_int().unwrap_or(0) as u16)?;
-            let count = payload[1].as_int().unwrap_or(0) as usize;
-            if count == 0 || 2 + count > payload.len() {
+            // payload: [0]=count, [1..]=buffered values.
+            let count = payload[0].as_int().unwrap_or(0) as usize;
+            if count == 0 || 1 + count > payload.len() {
                 Value::Null
             } else {
-                ordered_set_mode(&payload[2..2 + count], collation)
+                ordered_set_mode(
+                    &payload[1..1 + count],
+                    ordered_set_collation(func, collation)?,
+                )
             }
         }
         AggFunc::PercentileCont | AggFunc::PercentileDisc => {
-            // payload: [0]=collation bits, [1]=count, [2]=fraction, [3..]=buffered values.
+            // payload: [0]=count, [1]=fraction, [2..]=buffered values.
             // The fraction was range-checked in translate (pre-loop), so it is
             // here either NULL (→ NULL output, matching PG) or a valid number.
-            if matches!(payload[2], Value::Null) {
+            if matches!(payload[1], Value::Null) {
                 return Ok(Value::Null);
             }
-            let collation = CollationSeq::from_bits(payload[0].as_int().unwrap_or(0) as u16)?;
-            let count = payload[1].as_int().unwrap_or(0) as usize;
-            let fraction = payload[2].as_float();
+            let count = payload[0].as_int().unwrap_or(0) as usize;
+            let fraction = payload[1].as_float();
             if count == 0 {
                 Value::Null
-            } else if 3 + count > payload.len() {
+            } else if 2 + count > payload.len() {
                 return Err(LimboError::InternalError(format!(
                     "percentile: count ({count}) exceeds payload length ({})",
                     payload.len()
                 )));
             } else {
-                let values = &payload[3..3 + count];
+                let values = &payload[2..2 + count];
                 if matches!(func, AggFunc::PercentileDisc) {
-                    ordered_set_percentile_disc(values, fraction, collation)
+                    ordered_set_percentile_disc(
+                        values,
+                        fraction,
+                        ordered_set_collation(func, collation)?,
+                    )
                 } else {
                     ordered_set_percentile_cont(values, fraction)
                 }
@@ -8608,6 +8613,12 @@ fn first_payload_value(payload: &mut [Value], take: bool) -> Value {
 /// Most frequent value of an ordered set (`mode() WITHIN GROUP (ORDER BY x)`).
 /// Ties are broken by the smallest value, matching PostgreSQL (the first value the
 /// ascending ordering would return).
+fn ordered_set_collation(func: &AggFunc, collation: Option<CollationSeq>) -> Result<CollationSeq> {
+    collation.ok_or_else(|| {
+        LimboError::InternalError(format!("{func}() was finalized without a collation"))
+    })
+}
+
 fn ordered_set_mode(values: &[Value], collation: CollationSeq) -> Value {
     // NULLs were already dropped at step time.
     let mut sorted: Vec<Value> = values.to_vec();
@@ -10017,13 +10028,18 @@ pub fn op_agg_final(
     _connection: &Arc<Connection>,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    let (acc_reg, dest_reg, func) = match insn {
-        Insn::AggFinal { register, func } => (*register, *register, func),
+    let (acc_reg, dest_reg, func, collation) = match insn {
+        Insn::AggFinal {
+            register,
+            func,
+            collation,
+        } => (*register, *register, func, *collation),
         Insn::AggValue {
             acc_reg,
             dest_reg,
             func,
-        } => (*acc_reg, *dest_reg, func),
+            collation,
+        } => (*acc_reg, *dest_reg, func, *collation),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
 
@@ -10058,7 +10074,7 @@ pub fn op_agg_final(
                     }
                     // A result that replaces the accumulator can take the
                     // first payload value: the payload is not used again.
-                    _ => finalize_agg_payload(func, payload, acc_reg == dest_reg)?,
+                    _ => finalize_agg_payload(func, payload, acc_reg == dest_reg, collation)?,
                 },
             };
             value.check_length_limit()?;
@@ -20966,7 +20982,7 @@ mod tests {
     #[test]
     fn test_finalize_count() {
         let mut payload = vec![Value::from_i64(42)];
-        let result = finalize_agg_payload(&AggFunc::Count, &mut payload, false).unwrap();
+        let result = finalize_agg_payload(&AggFunc::Count, &mut payload, false, None).unwrap();
         assert_eq!(result, Value::from_i64(42));
     }
 
@@ -20980,7 +20996,7 @@ mod tests {
             Value::from_i64(0),
             Value::from_i64(0),
         ];
-        let result = finalize_agg_payload(&AggFunc::Avg, &mut payload, false).unwrap();
+        let result = finalize_agg_payload(&AggFunc::Avg, &mut payload, false, None).unwrap();
         assert_eq!(result, Value::from_f64(10.0));
     }
 
@@ -20994,7 +21010,7 @@ mod tests {
             Value::from_i64(0),
             Value::from_i64(0),
         ];
-        let result = finalize_agg_payload(&AggFunc::Avg, &mut payload, false).unwrap();
+        let result = finalize_agg_payload(&AggFunc::Avg, &mut payload, false, None).unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -21027,7 +21043,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = finalize_agg_payload(&AggFunc::Avg, &mut payload, false).unwrap();
+        let result = finalize_agg_payload(&AggFunc::Avg, &mut payload, false, None).unwrap();
         assert_eq!(result, Value::from_f64(0.5));
     }
 
@@ -21045,7 +21061,7 @@ mod tests {
             payload.push(Value::from_i64(i));
         }
 
-        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &mut payload, false).unwrap();
+        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &mut payload, false, None).unwrap();
         let blob = match &result {
             Value::Blob(b) => b,
             _ => panic!("Expected Blob, got {result:?}"),
@@ -21064,7 +21080,7 @@ mod tests {
         let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::ArrayAgg, &mut payload).unwrap();
         // No values accumulated — count stays 0.
-        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &mut payload, false).unwrap();
+        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &mut payload, false, None).unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -21073,7 +21089,7 @@ mod tests {
         // If payload[0] count is larger than the actual payload length,
         // finalize should return an error rather than panicking.
         let mut payload = vec![Value::from_i64(999)]; // claims 999 elements but has none
-        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &mut payload, false);
+        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &mut payload, false, None);
         assert!(
             result.is_err(),
             "Should error on count exceeding payload length"
