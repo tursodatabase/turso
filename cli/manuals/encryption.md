@@ -67,6 +67,12 @@ After opening, create tables and insert data normally. Encryption identity, page
 tursodb --experimental-encryption "file:database.db?cipher=aegis256&hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
 ```
 
+In a shell that was started with `--experimental-encryption`, `.open` accepts the same URI:
+
+```
+.open "file:database.db?cipher=aegis256&hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
+```
+
 Attempting to open an encrypted database without the correct cipher and key will fail.
 
 ## Troubleshooting

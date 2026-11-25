@@ -307,14 +307,12 @@ impl Limbo {
             .with_experimental_mvcc_passive_checkpoint(opts.experimental_mvcc_passive_checkpoint)
             .with_unsafe_testing(opts.unsafe_testing);
 
-        let db_file = normalize_db_path(db_file);
-
-        let (io, conn) = if db_file.starts_with("file:") {
+        let (io, conn) = if let Some(uri) = database_uri(&db_file) {
             anyhow::ensure!(
                 sync_encryption.is_none(),
                 "use a database path, not a file URI, with --sync-encryption-cipher"
             );
-            Connection::from_uri(&db_file, db_opts, Arc::new(SqliteDialect))?
+            Connection::from_uri(&uri, db_opts, Arc::new(SqliteDialect))?
         } else {
             let flags = open_flags(opts.readonly);
             let (io, db) = Database::open_new(
@@ -531,7 +529,21 @@ impl Limbo {
     }
 
     fn open_db(&mut self, path: &str, vfs_name: Option<&str>) -> anyhow::Result<()> {
+        let uri = database_uri(path);
+        // The VFS path below cannot read a URI: it would use the whole URI,
+        // with the query, as the file name.
+        anyhow::ensure!(
+            uri.is_none() || vfs_name.is_none(),
+            "a VFS argument cannot be used with a database URI"
+        );
         self.conn.close()?;
+        if let Some(uri) = uri {
+            let (io, conn) = Connection::from_uri(&uri, self.db_opts, Arc::new(SqliteDialect))?;
+            self.io = io;
+            self.conn = conn;
+            self.opts.db_file = path.to_string();
+            return Ok(());
+        }
         let (io, db) = if let Some(vfs_name) = vfs_name {
             self.conn
                 .open_new(path, vfs_name, Arc::new(SqliteDialect))?
@@ -2424,6 +2436,16 @@ fn fetch_single_i64(rows: &mut turso_core::Statement) -> anyhow::Result<i64> {
         Ok(())
     })?;
     result.ok_or_else(|| anyhow!("query did not return a row"))
+}
+
+/// Returns the `file:` URI that the database name `name` stands for, or
+/// `None` if `name` is a plain file name. The database argument of tursodb
+/// and `.open` both use this function. Thus both take the open options,
+/// such as the `cipher` and `hexkey` of an encrypted database, from the URI
+/// query, and neither uses the query as a part of a file name.
+fn database_uri(name: &str) -> Option<String> {
+    let name = normalize_db_path(name.to_string());
+    name.starts_with("file:").then_some(name)
 }
 
 /// Normalize `path?key=val` to `file:path?key=val` so query parameters

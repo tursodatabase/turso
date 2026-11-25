@@ -27,6 +27,18 @@ tursodb> .open mydata.db
 tursodb> .open mydata.db memory
 ```
 
+`PATH` can also be a `file:` URI, as for the `DATABASE` argument of `tursodb`. The shell also reads a path that ends with `?key=value` parameters as a URI. In such a path, all characters before the last `?`, including `%` and `#`, are part of the file name.
+
+`.open` uses the URI parameters `mode`, `modeof`, `vfs`, `cipher` and `hexkey`, and ignores other parameters, such as `cache` and `immutable`. The `cipher` and `hexkey` parameters open an [encrypted database](/docs/sql-reference/pragmas#encryption). They work only if encryption is enabled, for example with `--experimental-encryption`. You cannot give a `VFS` argument with a URI.
+
+```
+tursodb> .open 'file:secret.db?cipher=aegis256&hexkey=YOUR_HEX_KEY'
+```
+
+If the shell already has the file open, for example when you open the current database again, `.open` uses that database, and the `mode` and `vfs` parameters have no effect. `.open` does not use the `--readonly` option. For a URI, it does not use the `--vfs` option either.
+
+The interactive shell saves each line that you type in `~/.limbo_history`, so the history file keeps a key that you type in a URI.
+
 ### .quit
 
 Exit the shell. Aliases: `.q`, `.qu`, `.qui`.

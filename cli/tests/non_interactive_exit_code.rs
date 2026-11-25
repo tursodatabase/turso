@@ -421,6 +421,98 @@ fn dot_open_applies_encryption_uri_parameters() {
     }
 }
 
+/// `.open` reports a URI with incorrect encryption parameters, and it does
+/// not create a file.
+#[test]
+fn dot_open_reports_invalid_encryption_uri() {
+    let hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    for (args, name, error) in [
+        (
+            &["--experimental-encryption", "-m", "list"][..],
+            "file:secret.db?cipher=aegis256".to_string(),
+            "hexkey is required when cipher is provided",
+        ),
+        (
+            &["-m", "list"][..],
+            format!("file:secret.db?cipher=aegis256&hexkey={hexkey}"),
+            "encryption is an opt in feature",
+        ),
+    ] {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("turso-dot-open-bad-uri-")
+            .tempdir()
+            .expect("failed to create temp dir");
+        let dir = temp_dir.path();
+
+        let output = run_cli_in_dir(dir, args, &format!(".open \"{name}\"\n"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.lines().any(|line| line == error),
+            "{name}: stdout: {stdout} stderr: {stderr}"
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("failed to list temp dir")
+            .collect();
+        assert!(entries.is_empty(), "{name}: .open created {entries:?}");
+    }
+}
+
+/// `.open` does not accept a VFS argument together with a URI. The shell
+/// keeps the database that is open, and no file is created.
+#[test]
+fn dot_open_rejects_vfs_argument_with_database_uri() {
+    let hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    let temp_dir = tempfile::Builder::new()
+        .prefix("turso-dot-open-uri-vfs-")
+        .tempdir()
+        .expect("failed to create temp dir");
+    let dir = temp_dir.path();
+
+    let script = format!(
+        ".open \"file:secret.db?cipher=aegis256&hexkey={hexkey}\" syscall\nSELECT 'still open';\n"
+    );
+    let output = run_cli_in_dir(dir, &["--experimental-encryption", "-m", "list"], &script);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "a VFS argument cannot be used with a database URI",
+            "still open"
+        ],
+        "stderr: {stderr}"
+    );
+    let entries: Vec<_> = std::fs::read_dir(dir)
+        .expect("failed to list temp dir")
+        .collect();
+    assert!(entries.is_empty(), ".open created {entries:?}");
+}
+
+/// `.open` with a VFS argument opens a plain path with that VFS.
+#[test]
+fn dot_open_with_vfs_argument_opens_plain_path() {
+    let temp_dir = tempfile::Builder::new()
+        .prefix("turso-dot-open-vfs-")
+        .tempdir()
+        .expect("failed to create temp dir");
+    let dir = temp_dir.path();
+
+    let script = ".open plain.db memory\nCREATE TABLE t(v TEXT);\nINSERT INTO t VALUES ('memory vfs');\nSELECT v FROM t;\n";
+    let output = run_cli_in_dir(dir, &["-m", "list"], script);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["memory vfs"],
+        "stderr: {stderr}"
+    );
+    let entries: Vec<_> = std::fs::read_dir(dir)
+        .expect("failed to list temp dir")
+        .collect();
+    assert!(entries.is_empty(), "the memory VFS created {entries:?}");
+}
+
 /// Runs tursodb with `args` in the directory `dir`, writes `input` to its
 /// stdin, and waits until it exits.
 fn run_cli_in_dir(dir: &std::path::Path, args: &[&str], input: &str) -> Output {
