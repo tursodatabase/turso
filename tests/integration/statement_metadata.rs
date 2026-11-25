@@ -545,25 +545,24 @@ mod tests {
         assert_eq!(expect_info(&stmt, 1).declared_name, "INTEGER");
     }
 
-    /// Expressions whose primitive can't be determined statically — function
-    /// calls without a declared return affinity, BLOB literals, NULL literals
-    /// — yield `Ok(None)`. Callers fall through to their own default (TEXT
-    /// is the typical wire-protocol choice).
+    /// An expression that always gives a blob reports BLOB.
+    #[test]
+    fn type_info_blob_for_blob_expressions() {
+        let db = fresh_db_with_custom_types("type_info_blob.db");
+        let conn = db.connect_limbo();
+        for sql in ["SELECT randomblob(8)", "SELECT x'AB'"] {
+            let stmt = conn.prepare(sql).unwrap();
+            assert_eq!(expect_info(&stmt, 0).declared_name, "BLOB", "{sql}");
+        }
+    }
+
+    /// A NULL literal's type can't be determined statically, so it yields
+    /// `Ok(None)`. Callers fall through to their own default (TEXT is the
+    /// typical wire-protocol choice).
     #[test]
     fn type_info_none_for_indeterminate_expressions() {
         let db = fresh_db_with_custom_types("type_info_indet.db");
         let conn = db.connect_limbo();
-
-        // `randomblob(N)` returns a BLOB — no useful wire primitive to
-        // report. Use any function call with no declared return affinity.
-        let blob = conn.prepare("SELECT randomblob(8)").unwrap();
-        assert!(blob.get_column_type_info(0).unwrap().is_none());
-
-        // Blob literals carry a concrete value type but no useful primitive
-        // to expose in wire-protocol terms (clients consuming BYTEA already
-        // get an exact byte stream; there's nothing to "report").
-        let blob_lit = conn.prepare("SELECT x'AB'").unwrap();
-        assert!(blob_lit.get_column_type_info(0).unwrap().is_none());
 
         // NULL literal: type is genuinely indeterminate at compile time.
         let null_lit = conn.prepare("SELECT NULL").unwrap();
