@@ -3,7 +3,7 @@ use crate::namespace::NamespaceRef;
 use crate::schema::Table;
 use crate::security::policy::Command;
 use crate::sync::Arc;
-use crate::translate::emitter::{emit_program, Resolver};
+use crate::translate::emitter::Resolver;
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{
@@ -84,41 +84,11 @@ fn validate_delete(
     Ok(table)
 }
 
+/// Plans and optimizes a DELETE, up to its emission with
+/// [crate::translate::emitter::emit_program].
 #[allow(clippy::too_many_arguments)]
 #[turso_macros::trace_stack]
-pub fn translate_delete(
-    tbl_name: &QualifiedName,
-    resolver: &Resolver,
-    where_clause: Option<Box<Expr>>,
-    returning: Vec<ResultColumn>,
-    indexed: Option<crate::ast::Indexed>,
-    with: Option<With>,
-    truncate: bool,
-    program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
-) -> Result<()> {
-    let delete_plan = plan_delete(
-        tbl_name,
-        resolver,
-        where_clause,
-        returning,
-        indexed,
-        with,
-        truncate,
-        program,
-        connection,
-    )?;
-    emit_program(connection, resolver, program, delete_plan)?;
-    Ok(())
-}
-
-/// Plans and optimizes a DELETE for [translate_delete]. The compilation of
-/// nested triggers and foreign key actions recurses through [translate_delete]
-/// one time for each level. This function is not inlined, so that the large
-/// values of the planning are not in the stack frame of [translate_delete].
-#[allow(clippy::too_many_arguments)]
-#[inline(never)]
-fn plan_delete(
+pub fn plan_delete(
     tbl_name: &QualifiedName,
     resolver: &Resolver,
     where_clause: Option<Box<Expr>>,

@@ -58,7 +58,8 @@ use crate::ast;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
-use crate::translate::delete::translate_delete;
+use crate::translate::delete::plan_delete;
+use crate::translate::emitter::emit_program;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::WalkControl;
 use crate::util::walk_stmt_expressions;
@@ -74,7 +75,7 @@ use schema::{translate_create_table, translate_create_virtual_table, translate_d
 use select::translate_select;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
-use update::translate_update;
+use update::plan_update;
 
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
@@ -446,6 +447,21 @@ fn translate_delete_statement(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    let plan = plan_delete_statement(stmt, resolver, program, connection)?;
+    emit_program(connection, resolver, program, plan)
+}
+
+/// Plans a DELETE for [translate_delete_statement]. This function is not
+/// inlined, so that the values of the planning are not in the stack frame of
+/// [translate_delete_statement], which is on the recursive path of nested
+/// programs (see [translate_inner]).
+#[inline(never)]
+fn plan_delete_statement(
+    stmt: Box<ast::Stmt>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<plan::Plan> {
     let ast::Stmt::Delete {
         tbl_name,
         where_clause,
@@ -455,14 +471,14 @@ fn translate_delete_statement(
         truncate,
     } = *stmt
     else {
-        unreachable!("translate_delete_statement translates a DELETE")
+        unreachable!("plan_delete_statement plans a DELETE")
     };
     if where_clause.is_none() && connection.get_dml_require_where() {
         bail_parse_error!(
             "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
         );
     }
-    translate_delete(
+    plan_delete(
         &tbl_name,
         resolver,
         where_clause,
@@ -519,15 +535,30 @@ fn translate_update_statement(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    let plan = plan_update_statement(stmt, resolver, program, connection)?;
+    emit_program(connection, resolver, program, plan)
+}
+
+/// Plans an UPDATE for [translate_update_statement]. This function is not
+/// inlined, so that the values of the planning are not in the stack frame of
+/// [translate_update_statement], which is on the recursive path of nested
+/// programs (see [translate_inner]).
+#[inline(never)]
+fn plan_update_statement(
+    stmt: Box<ast::Stmt>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<plan::Plan> {
     let ast::Stmt::Update(update) = *stmt else {
-        unreachable!("translate_update_statement translates an UPDATE")
+        unreachable!("plan_update_statement plans an UPDATE")
     };
     if update.where_clause.is_none() && connection.get_dml_require_where() {
         bail_parse_error!(
             "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
         );
     }
-    translate_update(update, resolver, program, connection)
+    plan_update(update, resolver, program, connection)
 }
 
 /// Translates a SELECT for [translate_statement]. This function is not

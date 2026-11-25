@@ -63,12 +63,14 @@ addr  opcode         p1    p2    p3    p4             p5  comment
 17    Integer        5     7     0                    0   r[7]=5
 18    Goto           0     1     0                    0
 */
-pub fn translate_update(
+/// Plans and optimizes an UPDATE, up to its emission with
+/// [crate::translate::emitter::emit_program].
+pub fn plan_update(
     body: ast::Update,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
-) -> crate::Result<()> {
+) -> crate::Result<Plan> {
     let plan = prepare_and_optimize_update_plan(program, resolver, body, connection, false, None)?;
     let Plan::Update(ref update_plan) = plan else {
         unreachable!("prepare_and_optimize_update_plan must return Plan::Update");
@@ -77,8 +79,7 @@ pub fn translate_update(
 
     let opts = ProgramBuilderOpts::new(1, 20, 4);
     program.extend(&opts);
-    emit_program(connection, resolver, program, plan)?;
-    Ok(())
+    Ok(plan)
 }
 
 /// Normalize a planned UPDATE RHS into the per-column expressions consumed by SET.
