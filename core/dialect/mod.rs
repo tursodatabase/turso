@@ -125,6 +125,7 @@ impl dyn Dialect {
             .schema_builder(enable_custom_types)?
             .supports_namespaces(self.supports_namespaces())
             .default_namespaces(self.default_namespaces())
+            .seeded_tables(self.catalog().seeded_tables())
             .build())
     }
 }

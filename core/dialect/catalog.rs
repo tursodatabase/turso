@@ -52,6 +52,19 @@ pub trait Catalog: Send + Sync {
     fn load_steps(&self) -> Vec<Box<dyn LoadStep>> {
         Vec::new()
     }
+
+    /// The names of the seeded tables of this catalog. A seeded table has
+    /// rows before anything is stored: the dialect registers a virtual
+    /// table under the name, which serves the rows from memory. When a
+    /// statement stores a table with the name, the stored table replaces
+    /// the virtual table in the schema.
+    ///
+    /// A stored table cannot replace any other virtual table. With the
+    /// default, which is no names, a stored table named `json_each` fails
+    /// as a duplicate.
+    fn seeded_tables(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// The statement that a [`Catalog`] emits bytecode for. `schema` is the schema of

@@ -1262,6 +1262,11 @@ pub struct Schema {
     /// dialect of the database says.
     default_namespaces: &'static [&'static str],
 
+    /// The names of the seeded tables, as the catalog of the dialect of the
+    /// database says. A stored table with one of these names replaces the
+    /// virtual table that has the name.
+    seeded_tables: &'static [&'static str],
+
     /// Whether the names of the namespaces are loaded. They come from the
     /// namespaces table, which is read after the schema rows.
     namespace_names_loaded: bool,
@@ -1390,6 +1395,7 @@ impl SchemaBuilder {
                 custom_types_enabled: false,
                 supports_namespaces: false,
                 default_namespaces: &[],
+                seeded_tables: &[],
                 namespace_names_loaded: true,
                 pending_materialized_views: None,
                 dialect_schema: None,
@@ -1413,6 +1419,12 @@ impl SchemaBuilder {
     /// The names of the namespaces that every database has.
     pub(crate) fn default_namespaces(mut self, names: &'static [&'static str]) -> Self {
         self.schema.default_namespaces = names;
+        self
+    }
+
+    /// The names of the seeded tables of the dialect's catalog.
+    pub(crate) fn seeded_tables(mut self, names: &'static [&'static str]) -> Self {
+        self.schema.seeded_tables = names;
         self
     }
 
@@ -3123,6 +3135,7 @@ impl Schema {
         namespace: NamespaceId,
         table: Arc<BTreeTable>,
     ) -> Result<()> {
+        self.remove_virtual_table_of_seeded_table(namespace, &table.name);
         self.check_object_name_conflict(namespace, &table.name, SchemaObjectType::Table)?;
         let name = normalize_ident(&table.name);
         #[cfg(feature = "conn_raw_api")]
@@ -3132,6 +3145,37 @@ impl Schema {
             .tables
             .insert(name, Table::BTree(table).into());
         Ok(())
+    }
+
+    /// Removes the virtual table of a seeded table from `name`, so that the
+    /// stored table that is being added takes the name. A schema starts
+    /// with the virtual tables that the dialect registers, and gets the
+    /// stored tables after.
+    ///
+    /// Only a name that the catalog of the dialect lists as a seeded table
+    /// can change from a virtual table to a stored table. For each other
+    /// virtual table, such as `json_each`, the stored table fails as a
+    /// duplicate.
+    ///
+    /// A statement cannot use this to take the name: CREATE TABLE and
+    /// ALTER TABLE RENAME fail at translation when the name has a table.
+    fn remove_virtual_table_of_seeded_table(&mut self, namespace: NamespaceId, name: &str) {
+        if !namespace.is_root()
+            || !self
+                .seeded_tables
+                .iter()
+                .any(|seeded| seeded.eq_ignore_ascii_case(name))
+        {
+            return;
+        }
+        let name = normalize_ident(name);
+        let tables = &mut self.namespace_mut(namespace).tables;
+        if tables
+            .get(&name)
+            .is_some_and(|table| matches!(table.as_ref(), Table::Virtual(_)))
+        {
+            tables.remove(&name);
+        }
     }
 
     pub fn add_virtual_table(
@@ -5203,6 +5247,7 @@ impl TryClone for Schema {
             analyze_stats: self.analyze_stats.clone(),
             supports_namespaces: self.supports_namespaces,
             default_namespaces: self.default_namespaces,
+            seeded_tables: self.seeded_tables,
             namespace_names_loaded: self.namespace_names_loaded,
             pending_materialized_views: self.pending_materialized_views.clone(),
             dialect_schema: self.dialect_schema.clone(),

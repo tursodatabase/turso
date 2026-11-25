@@ -44,6 +44,7 @@ mod queued_io;
 mod reindex;
 mod schema;
 mod security;
+mod seeded_tables;
 mod statement;
 mod statement_lifecycle;
 mod statement_metadata;
