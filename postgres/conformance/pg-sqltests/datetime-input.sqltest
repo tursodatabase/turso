@@ -922,7 +922,7 @@ expect @tursopg error {
 # A timestamp compared with a timestamptz works in tursopg only because the
 # session time zone is always UTC, so both store the same UTC text (a
 # hard-coded exception, see timestamp_compared_with_timestamptz in
-# core/translate/collate.rs). A UNION of the two is still refused.
+# core/translate/collate.rs). A UNION or JOIN USING of the two is still refused.
 
 setup datetime-compare-ts-tz {
     CREATE TABLE a (id int, ts timestamp);
@@ -969,6 +969,23 @@ expect {
     2024-01-05 09:00:00+00
     2024-01-05 10:00:00+00
     2024-01-05 11:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type timestamp with type timestamptz
+}
+
+@compat-gap "operator:timestamp JOIN USING timestamptz"
+@setup datetime-compare-ts-tz
+test datetime-result-join-using {
+    CREATE TABLE u1 (k timestamp, v int);
+    CREATE TABLE u2 (k timestamptz, w int);
+    INSERT INTO u1 VALUES ('2024-01-05 10:00:00', 1);
+    INSERT INTO u2 VALUES ('2024-01-05 10:00:00+00', 10);
+    SELECT k FROM u1 JOIN u2 USING (k);
+}
+expect {
+    2024-01-05 10:00:00+00
 }
 @sqlstate 0A000
 expect @tursopg error {

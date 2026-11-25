@@ -3727,6 +3727,19 @@ fn plan_join_constraint(
                         }),
                     );
 
+                    // USING makes one merged column whose type PostgreSQL derives
+                    // from both sides, so the pair must pass the result check even
+                    // where a comparison of it is allowed.
+                    if let Expr::Binary(l, _, r) = &expr {
+                        crate::translate::collate::check_comparable_results(
+                            [l.as_ref(), r.as_ref()].into_iter(),
+                            &crate::translate::expr_context::ExprContext::new(
+                                Some(&*table_references),
+                                resolver,
+                            ),
+                        )?;
+                    }
+
                     for (left_table_id, left_col_idx) in left_column.source_columns {
                         table_references.mark_column_used(left_table_id, left_col_idx);
                     }
