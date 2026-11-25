@@ -184,6 +184,8 @@ pub enum CatalogCmd<'a> {
     DropType(DropType<'a>),
     CreateSchema(CreateSchema<'a>),
     DropSchema(DropSchema<'a>),
+    CreateFunction(CreateFunction<'a>),
+    DropFunction(DropFunction<'a>),
 }
 
 /// A new table. The statement has already emitted the creation of its
@@ -473,6 +475,26 @@ pub struct CreateSchema<'a> {
 pub struct DropSchema<'a> {
     pub id: NamespaceId,
     pub name: &'a str,
+}
+
+/// A function that a user defines, which `CREATE [OR REPLACE] FUNCTION`
+/// creates or replaces. The engine does not store functions: a catalog that
+/// stores none refuses the statement.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateFunction<'a> {
+    pub or_replace: bool,
+    pub name: &'a ast::QualifiedName,
+    pub argument_count: usize,
+    /// The text of the statement in the frontend's syntax.
+    pub sql: &'a str,
+}
+
+/// The functions that `DROP FUNCTION` names. A catalog that stores no
+/// functions refuses the statement.
+#[derive(Debug, Clone, Copy)]
+pub struct DropFunction<'a> {
+    pub if_exists: bool,
+    pub functions: &'a [ast::FunctionSignature],
 }
 
 /// A statement about roles, ownership, privileges or row-level security.

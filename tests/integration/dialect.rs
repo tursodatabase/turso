@@ -2282,6 +2282,24 @@ impl turso_core::Catalog for NotesCommands {
                     .unwrap()
                     .push(format!("drop schema {}", schema.name));
             }
+            // SQLite's catalog stores no functions, so this one stores
+            // nothing either.
+            turso_core::CatalogCmd::CreateFunction(function) => {
+                self.commands.lock().unwrap().push(format!(
+                    "create function {} with {} parameters: {}",
+                    function.name, function.argument_count, function.sql
+                ));
+                return Ok(());
+            }
+            turso_core::CatalogCmd::DropFunction(drop) => {
+                for function in drop.functions {
+                    self.commands
+                        .lock()
+                        .unwrap()
+                        .push(format!("drop function {}", function.name));
+                }
+                return Ok(());
+            }
             _ => {}
         }
         turso_core::SqliteCatalog.emit(program, ctx, cmd)
@@ -2314,6 +2332,80 @@ fn the_catalog_gets_a_new_trigger_and_a_dropped_trigger() {
             "drop tr"
         ]
     );
+}
+
+/// A CREATE FUNCTION and a DROP FUNCTION as a frontend translates them.
+fn function_statements() -> [turso_core::ast::Stmt; 2] {
+    use turso_core::ast::{FunctionSignature, Name, QualifiedName, Stmt};
+    let name = QualifiedName::single(Name::exact("answer".to_string()));
+    [
+        Stmt::CreateFunction {
+            or_replace: false,
+            name: name.clone(),
+            argument_count: 0,
+            sql: "CREATE FUNCTION answer() RETURNS int AS 'SELECT 42'".to_string(),
+        },
+        Stmt::DropFunction {
+            if_exists: false,
+            functions: vec![FunctionSignature {
+                name,
+                argument_types: Some(Vec::new()),
+            }],
+        },
+    ]
+}
+
+#[test]
+fn the_catalog_gets_a_new_function_and_a_dropped_function() {
+    let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialect = Arc::new(DialectWithCatalog {
+        catalog: NotesCommands {
+            commands: commands.clone(),
+        },
+        namespaces: false,
+    });
+    let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", dialect).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    for stmt in function_statements() {
+        conn.prepare_ast_stmt(stmt)
+            .unwrap()
+            .run_ignore_rows()
+            .unwrap();
+    }
+
+    assert_eq!(
+        *commands.lock().unwrap(),
+        [
+            "create function answer with 0 parameters: \
+             CREATE FUNCTION answer() RETURNS int AS 'SELECT 42'",
+            "drop function answer"
+        ]
+    );
+}
+
+#[test]
+fn sqlite_catalog_refuses_functions() {
+    let db = Database::open_file(
+        Arc::new(MemoryIO::new()),
+        ":memory:",
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    let [create, drop] = function_statements();
+    for (stmt, message) in [
+        (create, "CREATE FUNCTION is not supported"),
+        (drop, "DROP FUNCTION is not supported"),
+    ] {
+        let error = conn.prepare_ast_stmt(stmt).expect_err("refused");
+        assert!(error.to_string().contains(message), "{error}");
+    }
 }
 
 #[test]
