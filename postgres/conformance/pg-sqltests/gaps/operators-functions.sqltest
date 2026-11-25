@@ -400,15 +400,12 @@ expect {
 
 # B-42: jsonb #> / #>> path
 @setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "operator:jsonb #> _text"
 test jsonb-path {
     SELECT j #> '{a,b}', j #>> '{a,b}', j #>> '{tags,1}' FROM t WHERE id = 1;
 }
 expect {
     1|1|y
 }
-@sqlstate 42601
-expect @tursopg error {}
 
 # B-43: jsonb @> filter
 @setup t_id_s_n_arr_ia_j_ok_with_rows
@@ -430,31 +427,24 @@ expect {
 
 # B-46: jsonb ? key
 @setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "operator:jsonb ? text"
 test jsonb-key {
     SELECT id FROM t WHERE j ? 'tags' ORDER BY id;
 }
 expect {
     1
 }
-@sqlstate 42601
-expect @tursopg error {}
 
 # B-47: jsonb ?| array
 @setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "operator:jsonb ?| _text"
 test jsonb-has-any-key-in-array {
     SELECT id FROM t WHERE j ?| array['tags','zzz'] ORDER BY id;
 }
 expect {
     1
 }
-@sqlstate 42601
-expect @tursopg error {}
 
 # B-48: jsonb ?& array
 @setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "operator:jsonb ?& _text"
 test jsonb-has-all-keys-in-array {
     SELECT id FROM t WHERE j ?& array['a','n'] ORDER BY id;
 }
@@ -462,8 +452,6 @@ expect {
     1
     2
 }
-@sqlstate 42601
-expect @tursopg error {}
 
 # B-49: jsonb ->> compared to text
 @setup t_id_s_n_arr_ia_j_ok_with_rows
