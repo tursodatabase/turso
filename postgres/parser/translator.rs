@@ -4285,15 +4285,9 @@ impl PostgreSQLTranslator {
             "OR" => ast::Operator::Or,
             // PostgreSQL has @> and <@ for arrays and for jsonb, and only the
             // type of an operand tells which one runs. Only core knows the
-            // types, so core chooses. `a <@ b` is `b @> a`.
-            //
-            // A generation expression and an index expression can use only
-            // core functions, so they keep the array function. Thus the values
-            // that such a column or index stored before also stay the same.
-            "@>" | "<@"
-                if self.generation_expression_table.borrow().is_none()
-                    && !self.translating_index.get() =>
-            {
+            // types, so core chooses, also in an index expression and in a
+            // generation expression. `a <@ b` is `b @> a`.
+            "@>" | "<@" => {
                 let (lhs, rhs) = if op_name == "@>" {
                     (left, right)
                 } else {
@@ -4301,17 +4295,11 @@ impl PostgreSQLTranslator {
                 };
                 return Ok(ast::Expr::Binary(lhs, ast::Operator::ArrayContains, rhs));
             }
-            "@>" | "<@" | "&&" => {
-                let (func_name, args) = match op_name {
-                    "@>" => ("array_contains_all", vec![left, right]),
-                    "<@" => ("array_contains_all", vec![right, left]), // swap: b contains all of a
-                    "&&" => ("array_overlap", vec![left, right]),
-                    _ => unreachable!(),
-                };
+            "&&" => {
                 return Ok(ast::Expr::FunctionCall {
-                    name: exact_name(func_name),
+                    name: exact_name("array_overlap"),
                     distinctness: None,
-                    args,
+                    args: vec![left, right],
                     order_by: vec![],
                     within_group: vec![],
                     filter_over: ast::FunctionTail {

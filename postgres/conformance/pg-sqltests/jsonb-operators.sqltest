@@ -572,8 +572,8 @@ expect {
     1
 }
 
-# An index expression can use only core functions, so an index on @> keeps
-# the array function. A query must not read such an index.
+# Core chooses the function of @> in an index expression too, so the index
+# and the query compare the same way.
 @setup items_with_jsonb_rows
 test jsonb-contains-with-an-index-on-the-same-expression {
     CREATE INDEX items_fruit ON items ((data @> '{"tags":["fruit"]}'));
@@ -583,10 +583,19 @@ expect {
     1
 }
 
-# A generation expression can use only core functions too, so a generated
-# column keeps the array function, which gives NULL for jsonb values.
-# TODO let generated columns use frontend functions
-@compat-gap "operator:jsonb @> jsonb"
+# An index expression on an array still compares arrays.
+test array-contains-in-index-expression {
+    CREATE TABLE jc_tagged (id int PRIMARY KEY, tags text[]);
+    CREATE INDEX jc_tagged_red ON jc_tagged ((tags @> '{red}'));
+    INSERT INTO jc_tagged VALUES (1, '{red,green}'), (2, '{blue}');
+    SELECT id FROM jc_tagged WHERE tags @> '{red}';
+}
+expect {
+    1
+}
+
+# Core chooses the function of @> in a generation expression too, so a
+# generated column on @> of a jsonb value no longer gets the array function.
 test jsonb-contains-in-generated-column-uses-the-array-function {
     CREATE TABLE gen_tags (data text, fruit int GENERATED ALWAYS AS ((data::jsonb @> '{"tags":["fruit"]}')::int) STORED);
     INSERT INTO gen_tags (data) VALUES ('{"tags":["fruit","red"]}');
@@ -594,7 +603,4 @@ test jsonb-contains-in-generated-column-uses-the-array-function {
 }
 expect {
     1
-}
-expect @tursopg {
-    -1
 }

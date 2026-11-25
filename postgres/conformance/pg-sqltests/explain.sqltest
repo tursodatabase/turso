@@ -138,3 +138,14 @@ test explain-select-seeks-index-with-subquery-of-policy {
 expect {
     1|0|0|SEARCH explain_policy_subquery_docs USING COVERING INDEX explain_policy_subquery_docs_owner (owner=?)
 }
+
+# Core chooses the function of @> in an index expression as it does in a query,
+# so a query reads an index on @> of a jsonb value.
+test explain-select-seeks-index-on-jsonb-contains {
+    CREATE TABLE explain_tagged (id int PRIMARY KEY, data jsonb);
+    CREATE INDEX explain_tagged_fruit ON explain_tagged ((data @> '{"tags":["fruit"]}'));
+    EXPLAIN SELECT id FROM explain_tagged WHERE (data @> '{"tags":["fruit"]}') = true;
+}
+expect {
+    1|0|0|SEARCH explain_tagged USING INDEX explain_tagged_fruit (data @> '{"tags":["fruit"]}'=?)
+}
