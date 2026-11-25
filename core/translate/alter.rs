@@ -673,6 +673,12 @@ pub fn translate_alter_table(
     };
     if let Some(tbl) = table.virtual_table() {
         if let ast::AlterTableBody::RenameTo(new_name) = &alter_table {
+            // Only a table that CREATE VIRTUAL TABLE made has a module that
+            // VRename can ask. SQLite gives this error for the virtual
+            // tables that every database has.
+            if !tbl.is_droppable {
+                crate::bail_parse_error!("table {} may not be altered", table_name);
+            }
             return translate_rename_virtual_table(
                 program, tbl, table_name, new_name, resolver, connection, namespace, input,
             );
