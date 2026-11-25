@@ -249,6 +249,7 @@ The `@skip-if` decorator supports the following conditions:
 | `mvcc` | Skip when MVCC mode is enabled (`--mvcc` flag) |
 | `sqlite` | Skip when running with the sqlite CLI backend |
 | `postgres` | Skip when running against a real PostgreSQL server (`--backend postgres`). |
+| `debug` | Skip when the test runner is a debug build. The Makefile builds `tursodb` with the same profile as the runner, so this also skips a debug build of `tursodb`. |
 
 #### Capabilities
 
@@ -678,6 +679,7 @@ decorator       = "@setup" IDENTIFIER NEWLINE
 skip_condition  = "mvcc"
                 | "sqlite"
                 | "postgres"
+                | "debug"
 
 capability      = "trigger" | "strict" | "materialized_views"
 

@@ -65,7 +65,15 @@ scripts/stack/stack-profile.sh deep.sql                 # functions on the stack
 ```
 
 Functions that recurse per level should be small. Move rare and large paths into
-`#[inline(never)]` helpers, like SQLite's `SQLITE_NOINLINE`.
+`#[inline(never)]` helpers, like SQLite's `SQLITE_NOINLINE`. LLVM reserves the full
+frame when a function starts, so a large value in any branch counts at each level.
+Move the work before and after the recursive call into `#[inline(never)]` helpers,
+and keep large values (plans, contexts, AST nodes) in a `Box`.
+
+`sqlite/conformance/turso-sqltests/nesting-limits.sqltest` runs queries at the
+nesting limits, and one level past them, on the CLI backend. CI runs it with a
+release build and an 8 MiB stack. A debug build skips it. When you add a kind of
+nesting, add a query there.
 
 ## Corruption
 
