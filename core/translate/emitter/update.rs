@@ -103,7 +103,7 @@ pub fn emit_program_for_update(
     connection: &Arc<Connection>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    mut plan: UpdatePlan,
+    mut plan: Box<UpdatePlan>,
 ) -> Result<()> {
     program.set_resolve_type(plan.or_conflict.unwrap_or(ResolveType::Abort));
     program
@@ -131,89 +131,11 @@ pub fn emit_program_for_update(
         None
     };
 
-    let target_table = Arc::new(plan.target_table.clone());
-    let target_tables =
-        TableReferences::for_update_target(plan.target_table.clone(), &plan.from_tables);
-    let write_set_plan = plan.write_set_plan.take();
-    let temp_cursor_id = match write_set_plan.as_ref() {
-        Some(plan) => {
-            let QueryDestination::EphemeralTable { cursor_id, .. } = &plan.select.query_destination
-            else {
-                crate::bail_parse_error!("write set plan must use an ephemeral table destination");
-            };
-            Some(*cursor_id)
-        }
-        None => None,
-    };
-    // If an ephemeral scratch table is used (either for UPDATE...FROM or general Halloween protection)
-    // then the write phase will just iterate and read from the scratch table.
-    // The target table is kept as an outer query reference so that RETURNING can reference the target table
-    // during the write phase.
+    let (target_table, mut write_phase_tables, temp_cursor_id) =
+        prepare_update_write_phase(program, resolver, &mut plan)?;
     let uses_write_set = temp_cursor_id.is_some();
-    let mut write_phase_tables = if let Some(write_set_plan) = write_set_plan {
-        let QueryDestination::EphemeralTable {
-            table: scratch_table,
-            ..
-        } = &write_set_plan.select.query_destination
-        else {
-            crate::bail_parse_error!("write set plan must use an ephemeral table destination");
-        };
-        let scratch_table = scratch_table.clone();
-        let scratch_table_internal_id = write_set_plan.scratch_table_id;
-        program.emit_insn(Insn::OpenEphemeral {
-            cursor_id: temp_cursor_id.unwrap(),
-            is_table: true,
-        });
-        program
-            .nested(|program| emit_program_for_select(program, resolver, write_set_plan.select))?;
-        let mut write_phase_tables = TableReferences::new(
-            vec![JoinedTable {
-                table: Table::BTree(scratch_table),
-                identifier: "ephemeral_scratch".to_string(),
-                has_alias: false,
-                internal_id: scratch_table_internal_id,
-                op: Operation::Scan(Scan::BTreeTable {
-                    iter_dir: IterationDirection::Forwards,
-                    index: None,
-                }),
-                unmatched_right_rows_plan: None,
-                join_info: None,
-                col_used_mask: Default::default(),
-                column_use_counts: Vec::new(),
-                expression_index_usages: Vec::new(),
-                namespace: NamespaceRef::root_of(MAIN_DB_ID),
-                indexed: None,
-                plan_estimate: None,
-                row_filter: None,
-            }],
-            vec![],
-        );
-        write_phase_tables.add_outer_query_reference(OuterQueryReference {
-            identifier: target_table.identifier.clone(),
-            has_alias: target_table.has_alias,
-            internal_id: target_table.internal_id,
-            table: target_table.table.clone(),
-            namespace: target_table.namespace,
-            join_info: None,
-            col_used_mask: target_table.col_used_mask.try_clone()?,
-            cte_select: None,
-            cte_explicit_columns: vec![],
-            cte_id: None,
-            cte_definition_only: false,
-            rowid_referenced: false,
-            outer_join_may_null_extend: false,
-            scope_depth: 0,
-        });
-        // CTEs are also visible during the write phase, so add them here.
-        for outer_ref in plan.from_tables.outer_query_refs() {
-            write_phase_tables.add_outer_query_reference(outer_ref.clone());
-        }
-        write_phase_tables
-    } else {
-        target_tables
-    };
 
-    let mut t_ctx = TranslateCtx::new(
+    let mut t_ctx = TranslateCtx::new_boxed(
         program,
         resolver.fork(),
         write_phase_tables.joined_tables().len(),
@@ -491,6 +413,104 @@ pub fn emit_program_for_update(
     program.result_columns = plan.returning.unwrap_or_default();
     program.table_references.extend(write_phase_tables);
     Ok(())
+}
+
+/// Makes the tables that the write phase of an UPDATE reads, for
+/// [emit_program_for_update]. With a write set, it also emits the SELECT that
+/// fills the write set. It returns the target table, the tables of the write
+/// phase, and the cursor of the write set if there is one.
+///
+/// This function is not inlined, so that its large values, for example the plan
+/// of the write set and the copies of the target table, are not in the stack
+/// frame of [emit_program_for_update], which is on the recursive path of nested
+/// programs (see [crate::translate::translate_inner]).
+#[inline(never)]
+fn prepare_update_write_phase(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    plan: &mut UpdatePlan,
+) -> Result<(Arc<JoinedTable>, TableReferences, Option<usize>)> {
+    let target_table = Arc::new(plan.target_table.clone());
+    let target_tables =
+        TableReferences::for_update_target(plan.target_table.clone(), &plan.from_tables);
+    let write_set_plan = plan.write_set_plan.take();
+    let temp_cursor_id = match write_set_plan.as_ref() {
+        Some(plan) => {
+            let QueryDestination::EphemeralTable { cursor_id, .. } = &plan.select.query_destination
+            else {
+                crate::bail_parse_error!("write set plan must use an ephemeral table destination");
+            };
+            Some(*cursor_id)
+        }
+        None => None,
+    };
+    // If an ephemeral scratch table is used (either for UPDATE...FROM or general Halloween protection)
+    // then the write phase will just iterate and read from the scratch table.
+    // The target table is kept as an outer query reference so that RETURNING can reference the target table
+    // during the write phase.
+    let write_phase_tables = if let Some(write_set_plan) = write_set_plan {
+        let QueryDestination::EphemeralTable {
+            table: scratch_table,
+            ..
+        } = &write_set_plan.select.query_destination
+        else {
+            crate::bail_parse_error!("write set plan must use an ephemeral table destination");
+        };
+        let scratch_table = scratch_table.clone();
+        let scratch_table_internal_id = write_set_plan.scratch_table_id;
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: temp_cursor_id.unwrap(),
+            is_table: true,
+        });
+        program
+            .nested(|program| emit_program_for_select(program, resolver, write_set_plan.select))?;
+        let mut write_phase_tables = TableReferences::new(
+            vec![JoinedTable {
+                table: Table::BTree(scratch_table),
+                identifier: "ephemeral_scratch".to_string(),
+                has_alias: false,
+                internal_id: scratch_table_internal_id,
+                op: Operation::Scan(Scan::BTreeTable {
+                    iter_dir: IterationDirection::Forwards,
+                    index: None,
+                }),
+                unmatched_right_rows_plan: None,
+                join_info: None,
+                col_used_mask: Default::default(),
+                column_use_counts: Vec::new(),
+                expression_index_usages: Vec::new(),
+                namespace: NamespaceRef::root_of(MAIN_DB_ID),
+                indexed: None,
+                plan_estimate: None,
+                row_filter: None,
+            }],
+            vec![],
+        );
+        write_phase_tables.add_outer_query_reference(OuterQueryReference {
+            identifier: target_table.identifier.clone(),
+            has_alias: target_table.has_alias,
+            internal_id: target_table.internal_id,
+            table: target_table.table.clone(),
+            namespace: target_table.namespace,
+            join_info: None,
+            col_used_mask: target_table.col_used_mask.try_clone()?,
+            cte_select: None,
+            cte_explicit_columns: vec![],
+            cte_id: None,
+            cte_definition_only: false,
+            rowid_referenced: false,
+            outer_join_may_null_extend: false,
+            scope_depth: 0,
+        });
+        // CTEs are also visible during the write phase, so add them here.
+        for outer_ref in plan.from_tables.outer_query_refs() {
+            write_phase_tables.add_outer_query_reference(outer_ref.clone());
+        }
+        write_phase_tables
+    } else {
+        target_tables
+    };
+    Ok((target_table, write_phase_tables, temp_cursor_id))
 }
 
 /// Shared state threaded through the per-column emission loop of an UPDATE.

@@ -97,6 +97,38 @@ pub fn translate_delete(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
+    let delete_plan = plan_delete(
+        tbl_name,
+        resolver,
+        where_clause,
+        returning,
+        indexed,
+        with,
+        truncate,
+        program,
+        connection,
+    )?;
+    emit_program(connection, resolver, program, delete_plan)?;
+    Ok(())
+}
+
+/// Plans and optimizes a DELETE for [translate_delete]. The compilation of
+/// nested triggers and foreign key actions recurses through [translate_delete]
+/// one time for each level. This function is not inlined, so that the large
+/// values of the planning are not in the stack frame of [translate_delete].
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn plan_delete(
+    tbl_name: &QualifiedName,
+    resolver: &Resolver,
+    where_clause: Option<Box<Expr>>,
+    returning: Vec<ResultColumn>,
+    indexed: Option<crate::ast::Indexed>,
+    with: Option<With>,
+    truncate: bool,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<Plan> {
     let (privilege, command) = if truncate {
         (ast::Privilege::Truncate, Command::Truncate)
     } else {
@@ -211,8 +243,7 @@ pub fn translate_delete(
     super::stmt_journal::set_delete_stmt_journal_flags(program, delete, resolver, connection)?;
     let opts = ProgramBuilderOpts::new(1, estimate_num_instructions(delete), 0);
     program.extend(&opts);
-    emit_program(connection, resolver, program, delete_plan)?;
-    Ok(())
+    Ok(delete_plan)
 }
 
 /// Whether WHERE or RETURNING reads the columns of the target table, which

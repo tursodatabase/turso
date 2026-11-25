@@ -2439,7 +2439,10 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
         if prepared.is_empty() {
             return Ok(());
         }
-        for action in prepared {
+        // The actions stay in the vector, so that no copy of an action is in
+        // this frame, which is on the recursive path of nested programs (see
+        // translate_inner).
+        for action in &prepared {
             match action.fk_ref.fk.on_delete {
                 RefAct::Cascade => {
                     fire_fk_cascade_delete(

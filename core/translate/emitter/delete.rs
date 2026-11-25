@@ -43,7 +43,7 @@ pub fn emit_program_for_delete(
     connection: &Arc<Connection>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    mut plan: DeletePlan,
+    mut plan: Box<DeletePlan>,
 ) -> Result<()> {
     if !emit_clear_btree_delete(connection, resolver, program, &plan)? {
         emit_row_loop_delete(connection, resolver, program, &mut plan)?;
@@ -54,18 +54,19 @@ pub fn emit_program_for_delete(
     Ok(())
 }
 
+#[inline(never)]
 fn emit_row_loop_delete(
     connection: &Arc<Connection>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     plan: &mut DeletePlan,
 ) -> Result<()> {
-    let mut t_ctx = Box::new(TranslateCtx::new(
+    let mut t_ctx = TranslateCtx::new_boxed(
         program,
         resolver.fork(),
         plan.table_references.joined_tables().len(),
         connection.db.opts.unsafe_testing,
-    ));
+    );
 
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
@@ -138,57 +139,11 @@ fn emit_row_loop_delete(
 
     // If there's a rowset_plan, materialize rowids into a RowSet first and then iterate the RowSet
     // to delete the rows.
-    if let Some(rowset_plan) = plan.rowset_plan.take() {
+    if let Some(table_cursor_id) = emit_delete_rowset(program, resolver, plan)? {
         let rowset_reg = plan
             .rowset_reg
             .expect("rowset_reg must be Some if rowset_plan is Some");
-
-        // Initialize the RowSet register with NULL (RowSet will be created on first RowSetAdd)
-        program.emit_insn(Insn::Null {
-            dest: rowset_reg,
-            dest_end: None,
-        });
-
-        // Execute the rowset SELECT plan to populate the rowset.
-        program.nested(|program| emit_program_for_select(program, resolver, rowset_plan))?;
-
-        // Close the read cursor(s) opened by the rowset plan before opening for writing
         let table_ref = plan.table_references.joined_tables().first().unwrap();
-        let table_cursor_id_read =
-            program.resolve_cursor_id(&CursorKey::table(table_ref.internal_id));
-        program.emit_insn(Insn::Close {
-            cursor_id: table_cursor_id_read,
-        });
-
-        // Open the table cursor for writing
-        let table_cursor_id = table_cursor_id_read;
-
-        if let Some(btree_table) = table_ref.table.btree() {
-            program.emit_insn(Insn::OpenWrite {
-                cursor_id: table_cursor_id,
-                root_page: RegisterOrLiteral::Literal(btree_table.root_page),
-                db: table_ref.namespace.database_id,
-            });
-
-            // Open all indexes for writing (needed for DELETE)
-            let write_indices: Vec<_> =
-                resolver.with_schema(table_ref.namespace.database_id, |s| {
-                    s.get_indices(table_ref.namespace.id, table_ref.table.get_name())
-                        .cloned()
-                        .collect()
-                });
-            for index in &write_indices {
-                let index_cursor_id = program.alloc_cursor_index(
-                    Some(CursorKey::index(table_ref.internal_id, index.clone())),
-                    index,
-                )?;
-                program.emit_insn(Insn::OpenWrite {
-                    cursor_id: index_cursor_id,
-                    root_page: RegisterOrLiteral::Literal(index.root_page),
-                    db: table_ref.namespace.database_id,
-                });
-            }
-        }
 
         // Now iterate over the RowSet and delete each rowid
         let rowset_loop_start = program.allocate_label();
@@ -292,6 +247,74 @@ fn emit_row_loop_delete(
         emit_returning_scan_back(program, buf);
     }
     Ok(())
+}
+
+/// Fills the RowSet of a DELETE with the rowids that its RowSet plan finds, and
+/// opens the target table and its indexes for writing, for
+/// [emit_row_loop_delete]. It returns the cursor of the target table, or `None`
+/// when the DELETE has no RowSet plan.
+///
+/// This function is not inlined, so that the RowSet plan is not in the stack
+/// frame of [emit_row_loop_delete], which is on the recursive path of nested
+/// programs (see [crate::translate::translate_inner]).
+#[inline(never)]
+fn emit_delete_rowset(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    plan: &mut DeletePlan,
+) -> Result<Option<usize>> {
+    let Some(rowset_plan) = plan.rowset_plan.take() else {
+        return Ok(None);
+    };
+    let rowset_reg = plan
+        .rowset_reg
+        .expect("rowset_reg must be Some if rowset_plan is Some");
+
+    // Initialize the RowSet register with NULL (RowSet will be created on first RowSetAdd)
+    program.emit_insn(Insn::Null {
+        dest: rowset_reg,
+        dest_end: None,
+    });
+
+    // Execute the rowset SELECT plan to populate the rowset.
+    program.nested(|program| emit_program_for_select(program, resolver, rowset_plan))?;
+
+    // Close the read cursor(s) opened by the rowset plan before opening for writing
+    let table_ref = plan.table_references.joined_tables().first().unwrap();
+    let table_cursor_id_read = program.resolve_cursor_id(&CursorKey::table(table_ref.internal_id));
+    program.emit_insn(Insn::Close {
+        cursor_id: table_cursor_id_read,
+    });
+
+    // Open the table cursor for writing
+    let table_cursor_id = table_cursor_id_read;
+
+    if let Some(btree_table) = table_ref.table.btree() {
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: table_cursor_id,
+            root_page: RegisterOrLiteral::Literal(btree_table.root_page),
+            db: table_ref.namespace.database_id,
+        });
+
+        // Open all indexes for writing (needed for DELETE)
+        let write_indices: Vec<_> = resolver.with_schema(table_ref.namespace.database_id, |s| {
+            s.get_indices(table_ref.namespace.id, table_ref.table.get_name())
+                .cloned()
+                .collect()
+        });
+        for index in &write_indices {
+            let index_cursor_id = program.alloc_cursor_index(
+                Some(CursorKey::index(table_ref.internal_id, index.clone())),
+                index,
+            )?;
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id: index_cursor_id,
+                root_page: RegisterOrLiteral::Literal(index.root_page),
+                db: table_ref.namespace.database_id,
+            });
+        }
+    }
+    Ok(Some(table_cursor_id))
 }
 
 fn emit_clear_btree_delete(
@@ -486,6 +509,7 @@ pub fn emit_fk_child_decrement_on_delete(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 fn emit_delete_insns<'a>(
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
@@ -908,6 +932,7 @@ fn emit_delete_row_common(
 #[expect(clippy::too_many_arguments)]
 /// Helper function to delete a row when we've already seeked to it (e.g., from a RowSet).
 /// This is similar to emit_delete_insns but assumes the cursor is already positioned at the row.
+#[inline(never)]
 fn emit_delete_insns_when_triggers_present(
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
