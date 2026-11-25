@@ -468,7 +468,7 @@ fn check_divisor(
     lhs: usize,
     rhs: usize,
 ) -> Result<(), Box<LimboError>> {
-    if !connection.dialect().errors_on_zero_divisor() {
+    if !connection.dialect_ref().errors_on_zero_divisor() {
         return Ok(());
     }
     if matches!(state.registers[lhs].get_value(), Value::Null) {
@@ -9278,7 +9278,7 @@ pub fn op_agg_inverse(
     };
     let payload = agg.payload_mut();
     let counts_infinite_inputs = matches!(func, AggFunc::Sum | AggFunc::Total | AggFunc::Avg)
-        && connection.dialect().sum_counts_infinite_inputs();
+        && connection.dialect_ref().sum_counts_infinite_inputs();
     inverse_agg_payload(func, arg, payload, counts_infinite_inputs)?;
 
     state.pc += 1;
@@ -9909,7 +9909,7 @@ fn op_agg_step_slow(
         _ => {
             let counts_infinite_inputs =
                 matches!(func, AggFunc::Sum | AggFunc::Total | AggFunc::Avg)
-                    && connection.dialect().sum_counts_infinite_inputs();
+                    && connection.dialect_ref().sum_counts_infinite_inputs();
             let arg2_reg = match func {
                 AggFunc::GroupConcat | AggFunc::StringAgg => Some(*delimiter),
                 #[cfg(feature = "json")]
@@ -10940,7 +10940,7 @@ pub fn op_function(
                 statement_times: Cell::from_mut(&mut state.statement_times),
                 collation: func.collation,
             };
-            let value = connection.dialect().call_scalar(
+            let value = connection.dialect_ref().call_scalar(
                 &context,
                 scalar_func,
                 &state.registers[*start_reg..*start_reg + arg_count],
