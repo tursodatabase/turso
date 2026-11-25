@@ -120,13 +120,15 @@ db, err := sql.Open("turso", "database.db?experimental=views,vacuum")
 The Java binding currently supports encryption through a dedicated method:
 
 ```java
-TursoDB db = TursoDB.openWithEncryption(
+TursoDB db = TursoDB.createWithEncryption(
+    "jdbc:turso:database.db",
     "database.db",
-    OpenFlags.CREATE,
-    "aegis256",
+    TursoEncryptionCipher.AEGIS_256,
     "your-hex-key-here"
 );
 ```
+
+Give both the cipher and the key. If you give only one of them, or a key that is not valid for the cipher, the method throws an `SQLException` and does not create the database file.
 
 ## .NET SDK
 
