@@ -32,7 +32,7 @@ impl ExternalFunc {
                 return_type: <<F::Call as ScalarCall>::Output as ScalarReturn>::TYPE,
                 receives_argument_types: false,
                 check_argument_types: None,
-                returns_first_argument_type: false,
+                returns_argument_type: None,
                 function: Arc::new(function),
             },
         })
@@ -54,14 +54,16 @@ impl ExternalFunc {
         self
     }
 
+    /// FIXME(pg-catalog): HACK. Its only callers are pg_timestamp_plus_interval and date_trunc in
+    /// postgres/frontend/functions.rs. It stands in for PostgreSQL choosing an
+    /// operator or function by its argument types from pg_operator or pg_proc
+    /// when it plans the statement, which tursopg cannot do yet. A pg_proc and
+    /// pg_operator lookup replaces it; remove it then.
+    ///
     /// Sets a function that is called at compile time with the type name of
     /// each argument, with domain names kept (`receiving_argument_types`
     /// passes the domain's base type); an error refuses the statement. Needs
     /// `receiving_argument_types`.
-    // FIXME(pg-catalog): only pg_timestamp_plus_interval sets this. It stands in
-    // for PostgreSQL resolving an operator or function by its argument types
-    // from pg_operator or pg_proc when it plans the statement. A pg_proc and
-    // pg_operator lookup replaces this; remove it if that lookup does not use it.
     pub fn checking_argument_types(mut self, check: crate::function::ArgumentTypeCheck) -> Self {
         let ExtFunc::NativeScalar {
             receives_argument_types,
@@ -79,28 +81,28 @@ impl ExternalFunc {
         self
     }
 
-    /// Gives the function's result the type of its first argument, as
-    /// `nullif` has, for a function whose result type depends on the type of
-    /// its first argument. The function returns `Value`, which declares no
-    /// type of its own.
-    // FIXME(pg-catalog): only pg_timestamp_plus_interval sets this. PostgreSQL
-    // takes a result type from the prorettype of pg_proc or the oprresult of
-    // pg_operator, not from an argument. A pg_proc and pg_operator lookup
-    // replaces this; remove it if that lookup does not use it.
-    pub fn returning_first_argument_type(mut self) -> Self {
+    /// FIXME(pg-catalog): HACK. Its only callers are pg_timestamp_plus_interval (index 0) and
+    /// date_trunc (index 1) in postgres/frontend/functions.rs. PostgreSQL takes
+    /// a result type from prorettype in pg_proc or oprresult in pg_operator,
+    /// not from an argument. A pg_proc and pg_operator lookup replaces it;
+    /// remove it then.
+    ///
+    /// Gives the function's result the type of the argument at `index`. The
+    /// function returns `Value`, which declares no type of its own.
+    pub fn returning_argument_type(mut self, index: usize) -> Self {
         let ExtFunc::NativeScalar {
             return_type,
-            returns_first_argument_type,
+            returns_argument_type,
             ..
         } = &mut self.func
         else {
-            panic!("only a native scalar function can return its first argument's type");
+            panic!("only a native scalar function can return an argument's type");
         };
         assert!(
             return_type.is_none(),
-            "a function that returns its first argument's type declares no return type"
+            "a function that returns an argument's type declares no return type"
         );
-        *returns_first_argument_type = true;
+        *returns_argument_type = Some(index);
         self
     }
 

@@ -891,6 +891,7 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
                     ResultType::OneOfTheArguments
                     | ResultType::Declared(_)
                     | ResultType::FirstArgument
+                    | ResultType::Argument(_)
                     | ResultType::NumberOfTheFirstArgumentsType
                     | ResultType::AbsOfTheFirstArgument
                     | ResultType::RealForARealArgument
