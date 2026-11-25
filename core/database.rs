@@ -190,7 +190,7 @@ pub struct SharedWalTestingSnapshot {
     pub frame_index_overflowed: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct EncryptionOpts {
     pub cipher: String,
     pub hexkey: String,
@@ -199,6 +199,19 @@ pub struct EncryptionOpts {
 impl EncryptionOpts {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// Shows the cipher but not the key, because debug output can go to a log.
+impl std::fmt::Debug for EncryptionOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Name every field, so that a new field does not compile until this
+        // function decides how to show it.
+        let Self { cipher, hexkey: _ } = self;
+        f.debug_struct("EncryptionOpts")
+            .field("cipher", cipher)
+            .field("hexkey", &"<redacted>")
+            .finish()
     }
 }
 

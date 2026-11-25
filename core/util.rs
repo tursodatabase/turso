@@ -863,7 +863,7 @@ pub(crate) fn is_rowid_alias_type(written_type: &ast::Type) -> bool {
             || written_type.name.eq_ignore_ascii_case("[INTEGER]"))
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Default, PartialEq)]
 pub struct OpenOptions<'a> {
     /// The authority component of the URI. may be 'localhost' or empty
     pub authority: Option<&'a str>,
@@ -883,6 +883,36 @@ pub struct OpenOptions<'a> {
     pub cipher: Option<String>,
     // The encryption key in hex format
     pub hexkey: Option<String>,
+}
+
+/// Shows every option except the key, because debug output can go to a log.
+impl std::fmt::Debug for OpenOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Name every field, so that a new field does not compile until this
+        // function decides how to show it.
+        let Self {
+            authority,
+            path,
+            vfs,
+            mode,
+            modeof,
+            cache,
+            immutable,
+            cipher,
+            hexkey,
+        } = self;
+        f.debug_struct("OpenOptions")
+            .field("authority", authority)
+            .field("path", path)
+            .field("vfs", vfs)
+            .field("mode", mode)
+            .field("modeof", modeof)
+            .field("cache", cache)
+            .field("immutable", immutable)
+            .field("cipher", cipher)
+            .field("hexkey", &hexkey.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 pub const MEMORY_PATH: &str = ":memory:";
@@ -2540,6 +2570,20 @@ pub mod tests {
         assert_eq!(opts.vfs, Some("unix".to_string()));
         assert_eq!(opts.mode, OpenMode::ReadOnly);
         assert!(opts.immutable);
+    }
+
+    #[test]
+    fn test_uri_debug_output_hides_the_key() {
+        let uri = "file:/home/user/db.sqlite?cipher=aegis256&hexkey=5ec7e7";
+        let opts = OpenOptions::parse(uri).unwrap();
+        assert_eq!(opts.hexkey, Some("5ec7e7".to_string()));
+        let printed = format!("{opts:?}");
+        assert!(!printed.contains("5ec7e7"), "{printed}");
+        assert!(
+            printed.contains("hexkey: Some(\"<redacted>\")"),
+            "{printed}"
+        );
+        assert!(printed.contains("cipher: Some(\"aegis256\")"), "{printed}");
     }
 
     #[test]
