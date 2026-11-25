@@ -2083,7 +2083,13 @@ impl Connection {
     /// If attempt to write frame at the position `frame_no` will create gap in the WAL - method will return error
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
-        self.pager.load().wal_insert_frame(frame_no, frame)
+        self.pager
+            .load()
+            .wal_insert_frame_with_commit(frame_no, frame, || {
+                // Imported pages can replace dirty SQL pages without describing their row keys.
+                self.pending_changes.finish(None, None);
+                self.db.subscriptions.refresh();
+            })
     }
 
     /// Start WAL session by initiating read+write transaction for this connection

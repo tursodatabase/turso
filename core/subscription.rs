@@ -259,8 +259,9 @@ impl ChangeFilter {
 impl Database {
     /// Subscribe before reading an initial snapshot. A commit racing the read
     /// may cause an extra refresh. A new subscriber can receive Refresh for
-    /// writes that a transaction made before it registered. The feed covers SQL and incremental
-    /// blob writes to ordinary B-tree tables in this instance's main database.
+    /// writes that a transaction made before it registered. The feed covers SQL and
+    /// incremental blob writes to ordinary B-tree tables in this instance's main
+    /// database. A locally imported WAL commit frame causes a full refresh.
     /// Connections sharing this Database see each other's commits. Other processes
     /// are outside the feed. Notifications are transient and carry no replay cursor.
     /// Use the schema-qualified table name for stored namespaces (e.g. `app.t`).

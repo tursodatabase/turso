@@ -449,3 +449,37 @@ fn async_receive_wakes_on_commit_and_close() {
     assert!(flag.0.load(Ordering::Acquire));
     assert_eq!(read.as_mut().poll(&mut cx), Poll::Ready(None));
 }
+
+#[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+#[test]
+fn local_wal_import_refreshes_at_each_new_commit_frame() {
+    let source = TempDatabase::new_empty();
+    let src = source.connect_limbo();
+    src.execute("CREATE TABLE imported(x)").unwrap();
+    src.execute("INSERT INTO imported VALUES(1)").unwrap();
+    let target = TempDatabase::new_empty();
+    let dst = target.connect_limbo();
+    let sub = target.db.subscribe_changes(ChangeFilter::Table {
+        table: "imported".into(),
+    });
+    let mut frame = [0; 24 + 4096];
+    dst.wal_insert_begin().unwrap();
+    for n in 1..=src.wal_state().unwrap().max_frame {
+        let info = src.wal_get_frame(n, &mut frame).unwrap();
+        dst.wal_insert_frame(n, &frame).unwrap();
+        assert_eq!(
+            sub.try_recv(),
+            info.is_commit_frame().then_some(ChangeBatch::Refresh)
+        );
+        dst.wal_insert_frame(n, &frame).unwrap();
+        assert_eq!(sub.try_recv(), None);
+    }
+    dst.wal_insert_end(false).unwrap();
+    assert_eq!(sub.try_recv(), None);
+    let rows = dst
+        .prepare("SELECT x FROM imported")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
+}
