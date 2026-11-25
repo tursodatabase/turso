@@ -636,7 +636,9 @@ impl Catalog for PostgresCatalog {
             | CatalogCmd::CreateType(_)
             | CatalogCmd::DropType(_)
             | CatalogCmd::CreateSchema(_)
-            | CatalogCmd::DropSchema(_) => {}
+            | CatalogCmd::DropSchema(_)
+            | CatalogCmd::CreateFunction(_)
+            | CatalogCmd::DropFunction(_) => {}
         }
         Ok(())
     }

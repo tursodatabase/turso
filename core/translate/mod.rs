@@ -48,6 +48,7 @@ pub(crate) mod trigger;
 pub(crate) mod trigger_exec;
 pub(crate) mod update;
 pub(crate) mod upsert;
+pub(crate) mod user_function;
 pub(crate) mod vacuum;
 mod values;
 pub(crate) mod view;
@@ -286,6 +287,8 @@ fn translate_statement(
             | ast::Stmt::CreateRole { .. }
             | ast::Stmt::DropRole { .. }
             | ast::Stmt::Grant(_)
+            | ast::Stmt::CreateFunction { .. }
+            | ast::Stmt::DropFunction { .. }
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
@@ -502,6 +505,26 @@ fn translate_statement(
             roles::translate_drop_role(if_exists, roles, resolver, program, connection)?
         }
         ast::Stmt::Grant(grant) => roles::translate_grant(&grant, resolver, program, connection)?,
+        ast::Stmt::CreateFunction {
+            or_replace,
+            name,
+            argument_count,
+            sql,
+        } => user_function::translate_create_function(
+            or_replace,
+            &name,
+            argument_count,
+            &sql,
+            resolver,
+            program,
+            connection,
+        )?,
+        ast::Stmt::DropFunction {
+            if_exists,
+            functions,
+        } => user_function::translate_drop_function(
+            if_exists, &functions, resolver, program, connection,
+        )?,
         ast::Stmt::CreateType {
             if_not_exists,
             type_name,
@@ -755,6 +778,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::CreateRole { .. } => "create_role",
         ast::Stmt::DropRole { .. } => "drop_role",
         ast::Stmt::Grant(_) => "grant",
+        ast::Stmt::CreateFunction { .. } => "create_function",
+        ast::Stmt::DropFunction { .. } => "drop_function",
         ast::Stmt::Delete { .. } => "delete",
         ast::Stmt::Detach { .. } => "detach",
         ast::Stmt::DropIndex { .. } => "drop_index",

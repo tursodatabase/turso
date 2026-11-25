@@ -684,6 +684,45 @@ impl WriteSql for Stmt {
                 s.comma(roles, context)
             }
             Self::Grant(grant) => grant.write_sql(s, context),
+            Self::CreateFunction {
+                or_replace, name, ..
+            } => {
+                s.keyword("CREATE")?;
+                if *or_replace {
+                    s.keyword("OR")?;
+                    s.keyword("REPLACE")?;
+                }
+                s.text("FUNCTION")?;
+                name.write_sql(s, context)
+            }
+            Self::DropFunction {
+                if_exists,
+                functions,
+            } => {
+                s.keyword("DROP")?;
+                s.text("FUNCTION")?;
+                if *if_exists {
+                    s.keyword("IF")?;
+                    s.keyword("EXISTS")?;
+                }
+                for (i, function) in functions.iter().enumerate() {
+                    if i > 0 {
+                        s.punct(",")?;
+                    }
+                    function.name.write_sql(s, context)?;
+                    if let Some(types) = &function.argument_types {
+                        s.punct("(")?;
+                        for (j, type_name) in types.iter().enumerate() {
+                            if j > 0 {
+                                s.punct(",")?;
+                            }
+                            s.text(type_name)?;
+                        }
+                        s.punct(")")?;
+                    }
+                }
+                Ok(())
+            }
             Self::CreateType {
                 if_not_exists,
                 type_name,

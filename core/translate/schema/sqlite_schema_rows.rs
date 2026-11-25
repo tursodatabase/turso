@@ -70,6 +70,13 @@ impl Catalog for SqliteCatalog {
             CatalogCmd::DropType(ty) => emit_delete_type_row(program, ctx, ty),
             CatalogCmd::CreateSchema(schema) => emit_create_schema_row(program, ctx, schema),
             CatalogCmd::DropSchema(schema) => emit_delete_schema_row(program, ctx, schema),
+            // A SQLite database has no functions that users define in SQL.
+            CatalogCmd::CreateFunction(_) => {
+                crate::bail_parse_error!("CREATE FUNCTION is not supported")
+            }
+            CatalogCmd::DropFunction(_) => {
+                crate::bail_parse_error!("DROP FUNCTION is not supported")
+            }
         }
     }
 }
