@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use genawaiter::GeneratorState;
 use tempfile::TempDir;
-use turso_core::{Database, DatabaseOpts, OpenOptions, PlatformIO, IO};
+use turso_core::{Database, DatabaseOpts, OpenOptions, PlatformIO, Value, IO};
 use turso_sqlite::SqliteDialect;
 use turso_sync_engine::database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts};
 use turso_sync_engine::database_sync_operations::SyncEngineIoStats;
@@ -169,6 +169,12 @@ impl Replica {
     pub fn snapshot(&self) -> Result<Snapshot> {
         let conn = drive(&self.io, async |coro| self.engine.connect_rw(coro).await)?;
         Snapshot::capture(&conn)
+    }
+
+    /// Returns the rows of the query `sql`.
+    pub fn query(&self, sql: &str) -> Result<Vec<Vec<Value>>> {
+        let conn = drive(&self.io, async |coro| self.engine.connect_rw(coro).await)?;
+        super::snapshot::query(&conn, sql)
     }
 }
 

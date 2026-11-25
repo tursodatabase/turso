@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, OpenOptions, PlatformIO};
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, OpenOptions, PlatformIO, Value};
 use turso_sqlite::SqliteDialect;
 use turso_sync_engine::Result;
 
@@ -82,6 +82,11 @@ impl Remote {
 
     pub fn snapshot(&self) -> Result<Snapshot> {
         Snapshot::capture(&self.conn)
+    }
+
+    /// Returns the rows of the query `sql`.
+    pub fn query(&self, sql: &str) -> Result<Vec<Vec<Value>>> {
+        super::snapshot::query(&self.conn, sql)
     }
 
     pub(super) fn checkpoint_and_read_database_file(&self) -> Result<Vec<u8>> {

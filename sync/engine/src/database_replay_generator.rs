@@ -772,8 +772,8 @@ impl DatabaseReplayGenerator {
             } => {
                 *if_not_exists = true;
                 let table_name = tbl_name.name.as_str();
-                let Some(mut local_columns) =
-                    self.local_column_definitions(coro, table_name).await?
+                let Some((mut local_columns, local_constraints)) =
+                    self.local_table_definition(coro, table_name).await?
                 else {
                     // the local table didn't exist
                     self.execute_ddl(ddl)?;
@@ -781,20 +781,16 @@ impl DatabaseReplayGenerator {
                 };
                 if let turso_core::ast::CreateTableBody::ColumnsAndConstraints {
                     columns: remote_columns,
+                    constraints: remote_constraints,
                     ..
                 } = body
                 {
                     // drop the generated columns that were changed
-                    let changed_columns = local_columns
-                        .iter()
-                        .filter(|column| {
-                            generated_column_changed_between_local_and_remote(
-                                column,
-                                remote_columns,
-                            )
-                        })
-                        .map(|column| column.col_name.as_str().to_string())
-                        .collect();
+                    let changed_columns = changed_generated_columns(
+                        tbl_name,
+                        (&local_columns, &local_constraints),
+                        (remote_columns, remote_constraints),
+                    );
                     self.drop_columns_and_their_users(
                         tbl_name,
                         &mut local_columns,
@@ -948,6 +944,24 @@ impl DatabaseReplayGenerator {
         coro: &Coro<Ctx>,
         table_name: &str,
     ) -> Result<Option<Vec<turso_core::ast::ColumnDefinition>>> {
+        Ok(self
+            .local_table_definition(coro, table_name)
+            .await?
+            .map(|(columns, _)| columns))
+    }
+
+    /// Returns the columns and the table constraints of the local table
+    /// `table_name`, or `None` if there is no such table.
+    async fn local_table_definition<Ctx>(
+        &self,
+        coro: &Coro<Ctx>,
+        table_name: &str,
+    ) -> Result<
+        Option<(
+            Vec<turso_core::ast::ColumnDefinition>,
+            Vec<turso_core::ast::NamedTableConstraint>,
+        )>,
+    > {
         let table_name_literal = sql_string_literal(table_name);
         let mut stmt = self.conn.prepare(format!(
             "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = {table_name_literal} COLLATE NOCASE"
@@ -963,7 +977,12 @@ impl DatabaseReplayGenerator {
         let sql = sql.as_str().to_string();
         let mut parser = Parser::new(sql.as_bytes());
         let Some(Ok(turso_core::ast::Cmd::Stmt(turso_core::ast::Stmt::CreateTable {
-            body: turso_core::ast::CreateTableBody::ColumnsAndConstraints { columns, .. },
+            body:
+                turso_core::ast::CreateTableBody::ColumnsAndConstraints {
+                    columns,
+                    constraints,
+                    ..
+                },
             ..
         }))) = parser.next()
         else {
@@ -971,7 +990,7 @@ impl DatabaseReplayGenerator {
                 "unexpected definition of table '{table_name}' in sqlite_schema: {sql}"
             )));
         };
-        Ok(Some(columns))
+        Ok(Some((columns, constraints)))
     }
 
     fn execute_ddl(&self, ddl: &str) -> Result<()> {
@@ -1071,6 +1090,65 @@ impl DatabaseReplayGenerator {
     }
 }
 
+/// Returns the names of the generated columns of the local table, `local`,
+/// that the remote table, `remote`, removed or changed. Each table is its
+/// columns and its table constraints. A generated column is changed when its
+/// text differs from the text of the remote column. But ADD COLUMN and DROP
+/// COLUMN write the table text again in the form of core, which also writes a
+/// foreign key as a table constraint. So a column is not changed when its text
+/// and its foreign keys are the same in that form. If core cannot make a table
+/// of them, only the texts are compared.
+fn changed_generated_columns(
+    tbl_name: &turso_core::ast::QualifiedName,
+    local: (
+        &[turso_core::ast::ColumnDefinition],
+        &[turso_core::ast::NamedTableConstraint],
+    ),
+    remote: (
+        &[turso_core::ast::ColumnDefinition],
+        &[turso_core::ast::NamedTableConstraint],
+    ),
+) -> Vec<String> {
+    let (local_columns, local_constraints) = local;
+    let (remote_columns, remote_constraints) = remote;
+    let columns_with_changed_text = local_columns
+        .iter()
+        .filter(|column| generated_column_changed_between_local_and_remote(column, remote_columns))
+        .collect::<Vec<_>>();
+    if columns_with_changed_text.is_empty() {
+        return Vec::new();
+    }
+    let (
+        Some((local_written_columns, local_written_constraints)),
+        Some((remote_written_columns, remote_written_constraints)),
+    ) = (
+        table_as_core_writes_it(tbl_name, local_columns, local_constraints),
+        table_as_core_writes_it(tbl_name, remote_columns, remote_constraints),
+    )
+    else {
+        return columns_with_changed_text
+            .iter()
+            .map(|column| column.col_name.as_str().to_string())
+            .collect();
+    };
+    columns_with_changed_text
+        .iter()
+        .filter(|column| {
+            let name = column.col_name.as_str();
+            let local_written_column = local_written_columns
+                .iter()
+                .find(|written_column| written_column.col_name.as_str().eq_ignore_ascii_case(name))
+                .expect("core writes each column of the table");
+            generated_column_changed_between_local_and_remote(
+                local_written_column,
+                &remote_written_columns,
+            ) || foreign_keys_of(name, &local_written_constraints)
+                != foreign_keys_of(name, &remote_written_constraints)
+        })
+        .map(|column| column.col_name.as_str().to_string())
+        .collect()
+}
+
 /// returns true if a local column is generated and the remote either removed it or modified it
 fn generated_column_changed_between_local_and_remote(
     local_column: &turso_core::ast::ColumnDefinition,
@@ -1090,6 +1168,64 @@ fn generated_column_changed_between_local_and_remote(
         return true;
     };
     is_generated(remote_column) && remote_column.to_string() != local_column.to_string()
+}
+
+/// Returns the columns and the table constraints of the table `tbl_name` in
+/// the form that core writes when ADD COLUMN or DROP COLUMN writes the table
+/// text again, or `None` if core cannot make a table of them. That form
+/// leaves out the VIRTUAL keyword, puts NOT NULL, UNIQUE and COLLATE before
+/// AS, and writes each foreign key as a table constraint.
+fn table_as_core_writes_it(
+    tbl_name: &turso_core::ast::QualifiedName,
+    columns: &[turso_core::ast::ColumnDefinition],
+    constraints: &[turso_core::ast::NamedTableConstraint],
+) -> Option<(
+    Vec<turso_core::ast::ColumnDefinition>,
+    Vec<turso_core::ast::NamedTableConstraint>,
+)> {
+    let body = turso_core::ast::CreateTableBody::ColumnsAndConstraints {
+        columns: columns.to_vec(),
+        constraints: constraints.to_vec(),
+        options: turso_core::ast::TableOptions::empty(),
+    };
+    let table =
+        turso_core::schema::BTreeTable::from_create_table_ast(tbl_name, &body, 0, false).ok()?;
+    let sql = table.to_sql();
+    let mut parser = Parser::new(sql.as_bytes());
+    let Some(Ok(turso_core::ast::Cmd::Stmt(turso_core::ast::Stmt::CreateTable {
+        body:
+            turso_core::ast::CreateTableBody::ColumnsAndConstraints {
+                columns,
+                constraints,
+                ..
+            },
+        ..
+    }))) = parser.next()
+    else {
+        return None;
+    };
+    Some((columns, constraints))
+}
+
+/// Returns the sorted texts of the foreign keys of `constraints` that use the
+/// column `name`.
+fn foreign_keys_of(
+    name: &str,
+    constraints: &[turso_core::ast::NamedTableConstraint],
+) -> Vec<String> {
+    let mut foreign_keys = constraints
+        .iter()
+        .filter(|constraint| {
+            matches!(
+                &constraint.constraint,
+                turso_core::ast::TableConstraint::ForeignKey { columns, .. }
+                    if columns.iter().any(|column| column.col_name.as_str().eq_ignore_ascii_case(name))
+            )
+        })
+        .map(|constraint| constraint.to_string())
+        .collect::<Vec<_>>();
+    foreign_keys.sort();
+    foreign_keys
 }
 
 /// Returns whether `column` is a generated column.

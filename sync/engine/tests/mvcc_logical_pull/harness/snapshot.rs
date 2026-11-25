@@ -47,6 +47,7 @@ impl TableRows {
     }
 }
 
-fn query(conn: &Arc<Connection>, sql: &str) -> Result<Vec<Vec<Value>>> {
+/// Returns the rows of the query `sql`.
+pub(super) fn query(conn: &Arc<Connection>, sql: &str) -> Result<Vec<Vec<Value>>> {
     Ok(conn.prepare(sql)?.run_collect_rows()?)
 }
