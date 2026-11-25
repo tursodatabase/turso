@@ -92,3 +92,24 @@ expect {
     7|2
     7|2
 }
+
+# UPDATE scans the table and, for each row, probes the REPLACE-ing UNIQUE index
+# for a conflict. After the probe for row 2 deletes row 4, the scan must go on
+# to rows 3 and 5. They are in the B-tree, while rows 2 and 4 are only in memory.
+test mvcc-update-on-conflict-replace-visits-rows-after-probe {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, u UNIQUE ON CONFLICT REPLACE, v);
+    INSERT INTO t VALUES (1, 100, 0), (3, 300, 0), (5, 500, 0);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    INSERT INTO t VALUES (2, 200, 0), (4, 10, 0);
+    UPDATE t SET u = CASE WHEN id = 2 THEN 10 ELSE u END, v = v + 1;
+    SELECT id, u, v FROM t ORDER BY id;
+}
+expect {
+    mvcc
+    0|0|0
+    1|100|1
+    2|10|1
+    3|300|1
+    5|500|1
+}
