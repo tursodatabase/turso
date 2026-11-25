@@ -35,6 +35,9 @@ use turso_sync_engine::sync_encryption::SyncEncryption;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
 const PAGE_SIZE: usize = 4096;
 const MVCC_LOG_VERSION: u8 = 3;
+/// Version of the encrypted MVCC logs that core writes. In these logs, each
+/// encrypted frame also authenticates its position in the log.
+const MVCC_ENCRYPTED_LOG_VERSION: u8 = 4;
 const MVCC_LOG_HEADER_SIZE: usize = 56;
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1295,15 +1298,18 @@ fn normalize_mvcc_log<'a>(
     );
     let header = frame_codec::validate_log_header(&log[..MVCC_LOG_HEADER_SIZE])?;
     // Only a valid older header may trigger replacement; corruption must fail.
+    // Encrypted logs that this version starts have version 4, which changes only
+    // the authentication of encrypted frames.
+    let version = header.version();
     anyhow::ensure!(
-        header.version() == MVCC_LOG_VERSION,
-        "unsupported MVCC logical log version {}",
-        header.version()
+        version == MVCC_LOG_VERSION || (version == MVCC_ENCRYPTED_LOG_VERSION && crypto.is_some()),
+        "unsupported MVCC logical log version {version}"
     );
     let mut source_crc = header.initial_crc();
     let mut wire_crc = source_crc;
     let mut offset = MVCC_LOG_HEADER_SIZE;
-    let mut body = crypto.map(|_| header.bytes().to_vec());
+    // The decrypted frames form a version 3 log, which clients accept.
+    let mut body = crypto.map(|_| header.wire_bytes().to_vec());
     let mut wire_offsets = HashMap::from([(0, 0), (offset as u64, offset)]);
     let mut crc_by_offset = vec![(offset as u64, wire_crc)];
     let mut plaintext = Vec::new();
@@ -1998,7 +2004,7 @@ mod tests {
             .encode_to_vec();
             let log_path = logical_log_path(path.to_str().unwrap()).unwrap();
             let original = std::fs::read(&log_path).unwrap();
-            assert_eq!(original[4], MVCC_LOG_VERSION);
+            assert_eq!(original[4], MVCC_ENCRYPTED_LOG_VERSION);
             assert!(original.len() > MVCC_LOG_HEADER_SIZE);
             let crypto = server.encryption.as_ref().unwrap().local_context().unwrap();
             let normalized = normalize_mvcc_log(&original, crypto.as_ref()).unwrap();
@@ -2026,7 +2032,7 @@ mod tests {
                     &normalized.body[..normalized.wire_offsets[&committed]]
                 );
             }
-            for version in [2, 4] {
+            for version in [2, MVCC_LOG_VERSION] {
                 let mut corrupt = original.clone();
                 corrupt[4] = version;
                 std::fs::write(&log_path, &corrupt).unwrap();
@@ -2037,7 +2043,7 @@ mod tests {
                 );
                 assert!(!is_nonportable_mvcc_log_error(&result.err().unwrap()));
             }
-            for version in [2, MVCC_LOG_VERSION] {
+            for version in [2, MVCC_LOG_VERSION, MVCC_ENCRYPTED_LOG_VERSION] {
                 let mut header_only = original[..MVCC_LOG_HEADER_SIZE].to_vec();
                 header_only[4] = version;
                 header_only[MVCC_LOG_HEADER_CRC_START..].fill(0);

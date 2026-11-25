@@ -13658,11 +13658,16 @@ fn assert_log_payloads_decrypt(
     let nonce_size = enc_ctx.nonce_size();
     let tag_size = enc_ctx.tag_size();
 
+    // An encrypted log has version 4 (header byte 4).
+    assert_eq!(log_bytes[4], 4, "encrypted db-log should have version 4");
     // Parse salt from log header (bytes 8..16, little-endian u64)
     let salt = u64::from_le_bytes(log_bytes[8..16].try_into().unwrap());
 
     let mut offset = LOG_HDR_SIZE;
     let mut frame_count = 0;
+    // Running CRC before the current frame; the first frame starts from the CRC
+    // of the salt.
+    let mut start_crc = crc32c::crc32c(&salt.to_le_bytes());
 
     while offset + TX_BASE_HEADER_SIZE + TX_TRAILER_SIZE <= log_bytes.len() {
         // TX Header: frame_magic(4) | payload_size(8) | op_count(4) | commit_ts(8)
@@ -13710,7 +13715,8 @@ fn assert_log_payloads_decrypt(
             let ciphertext = &blob[..chunk_plaintext_len + tag_size];
             let nonce = &blob[chunk_plaintext_len + tag_size..];
 
-            let mut aad = [0u8; 32];
+            // Version 4 AAD: the fields of the frame and its position in the log.
+            let mut aad = [0u8; 44];
             aad[..8].copy_from_slice(&salt.to_le_bytes());
             if chunk_index + 1 == chunk_count {
                 aad[8..16].copy_from_slice(&(encrypted_plaintext_size as u64).to_le_bytes());
@@ -13718,6 +13724,8 @@ fn assert_log_payloads_decrypt(
             aad[16..20].copy_from_slice(&op_count.to_le_bytes());
             aad[20..28].copy_from_slice(&commit_ts.to_le_bytes());
             aad[28..32].copy_from_slice(&(chunk_index as u32).to_le_bytes());
+            aad[32..40].copy_from_slice(&(offset as u64).to_le_bytes());
+            aad[40..44].copy_from_slice(&start_crc.to_le_bytes());
 
             enc_ctx
                 .decrypt_chunk(ciphertext, nonce, &aad)
@@ -13733,6 +13741,12 @@ fn assert_log_payloads_decrypt(
             break;
         }
 
+        start_crc = crc32c::crc32c_append(start_crc, &log_bytes[offset..payload_offset]);
+        assert_eq!(
+            log_bytes[payload_offset..payload_offset + 4],
+            start_crc.to_le_bytes(),
+            "frame {frame_count} has a wrong CRC"
+        );
         frame_count += 1;
         offset = payload_offset + TX_TRAILER_SIZE; // skip encrypted body and trailer
     }

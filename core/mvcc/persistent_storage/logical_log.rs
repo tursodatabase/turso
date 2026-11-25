@@ -60,9 +60,27 @@
 //! decryption to fail. The CRC in the trailer covers the TX header and the body
 //! as written on disk (i.e. the ciphertext when encrypted).
 //!
+//! The CRC is not keyed, so anyone who can write the file can recompute it. Thus
+//! in a version 4 log, the AAD also binds the position of the frame: its file
+//! offset and the running CRC before it. A frame authenticates only at the place
+//! where the writer appended it, after the same frames. If complete frames are
+//! removed, inserted, replayed or moved, the first frame that is not at its
+//! original place fails authentication, and recovery returns an error. This
+//! cannot detect:
+//! - a log that is cut at a frame boundary;
+//! - a log and database that are replaced by an older copy;
+//! - a frame that was written but did not commit, and that a later frame
+//!   overwrote at the same offset (for example after a torn or abandoned
+//!   write). A copy of it still authenticates at that place, so it can replace
+//!   the last frame of the log, which replays a transaction that did not commit.
+//!
 //! ### Header fields (56 bytes, little-endian)
 //! - `magic: u32` (`LOG_MAGIC`)
-//! - `version: u8` (`LOG_VERSION`)
+//! - `version: u8` (`LOG_VERSION` (3) for new plaintext logs, `LOG_VERSION_V4` (4) for
+//!   new encrypted logs. Readers also accept version 2, and encrypted logs of versions
+//!   2 and 3, whose AAD does not bind the position of a frame. The writer appends to
+//!   such a log in its format. When the log is empty (first write, truncation or
+//!   reset), an encrypted log moves to version 4 with a new salt.)
 //! - `flags: u8` (bits 1..7 must be zero; bit 0 is currently reserved/ignored)
 //! - `hdr_len: u16` (`>= 56`)
 //! - `salt: u64` (random salt, regenerated on each log truncation)
@@ -100,6 +118,11 @@
 //!     `salt(8) || plaintext_size_or_zero(8) || op_count(4) || commit_ts(8) || chunk_index(4)` (little-endian)
 //!     where the plaintext-size slot is zero for non-final chunks and carries the encrypted
 //!     plaintext size only in the final chunk
+//!   - version 4 appends the position of the frame to the AEAD additional data:
+//!     `frame_offset(8) || frame_start_crc(4)`, where `frame_offset` is the file offset of
+//!     the TX header and `frame_start_crc` is the running CRC before the frame (the trailer
+//!     CRC of the previous frame, or `crc32c(salt.to_le_bytes())` for the first frame)
+//!   - every encrypted frame of a version 4 log has at least one chunk
 //!
 //! ### TX Trailer (`TX_TRAILER_SIZE = 8`)
 //! - `crc32c: u32` (chained CRC32C: `crc32c_append(prev_frame_crc, tx_header || payload)`;
@@ -128,7 +151,11 @@
 //! Validation is availability-focused, mirroring SQLite WAL prefix semantics:
 //! - torn/incomplete tail at end-of-file is accepted as EOF (previous validated frames remain);
 //! - first invalid frame encountered during forward scan is treated as an invalid tail and ignored;
-//! - only header corruption fails closed.
+//! - header corruption fails closed;
+//! - an encrypted frame that is complete and has a valid CRC but fails authentication fails
+//!   closed. In a version 4 log, this includes a frame that is not at its original position,
+//!   and a frame without encrypted chunks;
+//! - the frames of a version 4 log cannot be read without the encryption key.
 //!
 //! ## Recovery behavior
 //!
@@ -136,7 +163,8 @@
 //! - validates header first (empty/0-byte file treated as no log);
 //! - accepts a valid header with no frames (size `<= LOG_HDR_SIZE`);
 //! - reads `persistent_tx_ts_max` from `__turso_internal_mvcc_meta` (the durable replay boundary);
-//! - streams frames in commit order until first torn tail;
+//! - streams frames in log order until first torn tail. Concurrent commits can append their
+//!   frames in an order that is not the order of their `commit_ts`;
 //! - applies only validated frames whose `commit_ts > persistent_tx_ts_max`;
 //! - sets clock to `max(persistent_tx_ts_max, max_replayed_commit_ts) + 1`;
 //! - restores writer offset to `last_valid_offset` so torn-tail bytes are overwritten.
@@ -185,13 +213,18 @@
 //!               └───────────────────────────┴───────┘
 //! ```
 //!
-//! Each chunk encrypted with AAD (32B):
+//! Each chunk encrypted with AAD (32B, or 44B in a version 4 log):
 //! ```text
 //! ┌────────┬────────────────────┬──────────┬────────────┬─────────────┐
 //! │salt (8)│plaintext_size_or_0 │op_cnt (4)│commit_ts(8)│chunk_idx (4)│
 //! └────────┴────────────────────┴──────────┴────────────┴─────────────┘
 //!           ↑
 //!           └── encrypted plaintext size only in final chunk; zero for all others
+//!
+//! Version 4 appends the position of the frame:
+//! ┌──────────────────┬───────────────────────┐
+//! │frame_offset (8)  │frame_start_crc (4)    │
+//! └──────────────────┴───────────────────────┘
 //! ```
 //!
 //! ### How Plaintext Payload Is Split Into Chunks
@@ -302,7 +335,11 @@ pub type OnSerializationComplete<'a> =
 
 const LOG_MAGIC: u32 = 0x4C4D4C32; // "LML2" in LE
 const LOG_VERSION_V2: u8 = 2;
+/// Version of new plaintext logs.
 const LOG_VERSION: u8 = 3;
+/// Version of new encrypted logs. Its frames have the version 3 layout, but the AAD
+/// of each encrypted chunk also binds the position of the frame in the log.
+const LOG_VERSION_V4: u8 = 4;
 pub const LOG_HDR_SIZE: usize = 56;
 const LOG_HDR_SALT_START: usize = 8;
 const LOG_HDR_SALT_SIZE: usize = 8;
@@ -318,6 +355,9 @@ pub const ENCRYPTED_PAYLOAD_CHUNK_SIZE: usize = 32 * 1024;
 // Fixed AAD width for one encrypted chunk:
 // salt(8) + payload_size_or_zero(8) + op_count(4) + commit_ts(8) + chunk_index(4).
 const ENCRYPTED_CHUNK_AAD_SIZE: usize = 32;
+// Fixed AAD width for one encrypted chunk in a version 4 log:
+// the 32 bytes above + frame_offset(8) + frame_start_crc(4).
+const ENCRYPTED_CHUNK_AAD_SIZE_V4: usize = 44;
 
 const OP_UPSERT_TABLE: u8 = 0;
 const OP_DELETE_TABLE: u8 = 1;
@@ -435,22 +475,58 @@ fn encrypted_payload_blob_size(
         .ok_or_else(|| LimboError::Corrupt("encrypted payload total size overflow".to_string()))
 }
 
+/// The position of a transaction frame in the log. In a version 4 log, every
+/// encrypted chunk of the frame binds this position in its AAD. Thus the frame
+/// authenticates only at the place where the writer appended it, after the same
+/// preceding frames.
+#[derive(Clone, Copy, Debug)]
+struct FramePosition {
+    /// File offset of the first byte of the frame.
+    offset: u64,
+    /// Running CRC of the log before the frame: the trailer CRC of the previous
+    /// frame, or the CRC of the salt for the first frame.
+    start_crc: u32,
+}
+
+/// AEAD additional data of one encrypted chunk.
+struct EncryptedChunkAad {
+    bytes: [u8; ENCRYPTED_CHUNK_AAD_SIZE_V4],
+    len: usize,
+}
+
+impl EncryptedChunkAad {
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+/// Builds the AAD of one encrypted chunk. `position` is `Some` only in a version 4
+/// log; logs of earlier versions do not bind the position of a frame.
 fn build_encrypted_chunk_aad(
     salt: u64,
     payload_size_in_aad: Option<u64>,
     op_count: u32,
     commit_ts: u64,
     chunk_index: u32,
-) -> [u8; ENCRYPTED_CHUNK_AAD_SIZE] {
-    let mut aad = [0u8; ENCRYPTED_CHUNK_AAD_SIZE];
-    aad[..8].copy_from_slice(&salt.to_le_bytes());
+    position: Option<FramePosition>,
+) -> EncryptedChunkAad {
+    let mut bytes = [0u8; ENCRYPTED_CHUNK_AAD_SIZE_V4];
+    bytes[..8].copy_from_slice(&salt.to_le_bytes());
     if let Some(payload_size) = payload_size_in_aad {
-        aad[8..16].copy_from_slice(&payload_size.to_le_bytes());
+        bytes[8..16].copy_from_slice(&payload_size.to_le_bytes());
     }
-    aad[16..20].copy_from_slice(&op_count.to_le_bytes());
-    aad[20..28].copy_from_slice(&commit_ts.to_le_bytes());
-    aad[28..32].copy_from_slice(&chunk_index.to_le_bytes());
-    aad
+    bytes[16..20].copy_from_slice(&op_count.to_le_bytes());
+    bytes[20..28].copy_from_slice(&commit_ts.to_le_bytes());
+    bytes[28..32].copy_from_slice(&chunk_index.to_le_bytes());
+    let len = match position {
+        None => ENCRYPTED_CHUNK_AAD_SIZE,
+        Some(position) => {
+            bytes[32..40].copy_from_slice(&position.offset.to_le_bytes());
+            bytes[40..44].copy_from_slice(&position.start_crc.to_le_bytes());
+            ENCRYPTED_CHUNK_AAD_SIZE_V4
+        }
+    };
+    EncryptedChunkAad { bytes, len }
 }
 
 /// Log's Header, the first 56 bytes of any logical log file.
@@ -465,13 +541,19 @@ pub struct LogHeader {
 }
 
 impl LogHeader {
-    pub(crate) fn new(io: &Arc<dyn crate::IO>) -> Self {
-        Self::new_with_version(io, LOG_VERSION)
+    /// A header for a new log, with a new salt. An encrypted log uses version 4.
+    pub(crate) fn new(io: &Arc<dyn crate::IO>, encrypted: bool) -> Self {
+        let version = if encrypted {
+            LOG_VERSION_V4
+        } else {
+            LOG_VERSION
+        };
+        Self::new_with_version(io, version)
     }
 
     fn new_with_version(io: &Arc<dyn crate::IO>, version: u8) -> Self {
         turso_assert!(
-            version == LOG_VERSION_V2 || version == LOG_VERSION,
+            matches!(version, LOG_VERSION_V2 | LOG_VERSION | LOG_VERSION_V4),
             "unsupported logical log header version: {version}"
         );
         Self {
@@ -510,7 +592,7 @@ impl LogHeader {
             return Err(LimboError::Corrupt("Invalid logical log magic".to_string()));
         }
         let version = buf[4];
-        if version != LOG_VERSION && version != LOG_VERSION_V2 {
+        if !matches!(version, LOG_VERSION_V2 | LOG_VERSION | LOG_VERSION_V4) {
             return Err(LimboError::Corrupt(format!(
                 "Unsupported logical log version {version}"
             )));
@@ -730,13 +812,35 @@ impl LogicalLog {
         let has_portable_changes = portable_changes_enabled;
 
         // 1. Ensure we have a log header object (created lazily on first write).
-        // New logs are always LML3, so a later portable frame never needs the
-        // header rewritten in place.
+        // New logs are always LML3 or later, so a later portable frame never
+        // needs the header rewritten in place. The first write also writes the
+        // header, and no frame is before it, so the log can change its version
+        // here: an encrypted log that an older version started moves to
+        // version 4.
         let is_first_write = self.offset == 0;
-        if is_first_write && self.header.is_none() {
-            let header = LogHeader::new(&self.io);
-            self.running_crc = derive_initial_crc(header.salt);
-            self.header = Some(header);
+        if is_first_write {
+            match self.header.as_ref().map(|header| header.version) {
+                None => {
+                    let header = LogHeader::new(&self.io, self.encryption_ctx.is_some());
+                    self.running_crc = derive_initial_crc(header.salt);
+                    self.header = Some(header);
+                }
+                Some(version) => {
+                    let empty_log_version = self.empty_log_version(version);
+                    if empty_log_version != version {
+                        // If a crash keeps the old header bytes but writes the
+                        // frame, the new salt makes the frame fail its CRC check,
+                        // so recovery drops it as a torn tail. With the old salt,
+                        // the frame would pass the CRC check and then fail
+                        // authentication, which stops recovery.
+                        let salt = self.io.generate_random_number() as u64;
+                        let header = self.header.as_mut().expect("log header is set");
+                        header.version = empty_log_version;
+                        header.salt = salt;
+                        self.running_crc = derive_initial_crc(salt);
+                    }
+                }
+            }
         }
         if portable_changes_enabled {
             let header = self
@@ -807,19 +911,33 @@ impl LogicalLog {
         // consumers can load transaction metadata before scanning recovery ops.
         // Encrypted frames encrypt both parts as one authenticated body.
         if let Some(enc_ctx) = &self.encryption_ctx {
-            let salt = self
+            let header = self
                 .header
                 .as_ref()
-                .expect("log header must be set before writing")
-                .salt;
+                .expect("log header must be set before writing");
+            // In a version 4 log, the AAD binds the frame to this place in the
+            // log, so a removed, replayed or reordered frame fails authentication.
+            let position = (header.version == LOG_VERSION_V4).then_some(FramePosition {
+                offset: if is_first_write {
+                    LOG_HDR_SIZE as u64
+                } else {
+                    self.offset
+                },
+                start_crc: self.running_crc,
+            });
+            turso_assert!(
+                position.is_none() || plaintext_size > 0,
+                "an encrypted frame of a version 4 log has no payload to authenticate its position"
+            );
             LogSerializer::new(&mut tx.buf).encrypt_payload_in_place(EncryptedPayload {
                 enc_ctx,
                 payload_start: frame_payload_start,
                 plaintext_size,
                 chunk_size: self.encrypted_payload_chunk_size,
-                salt,
+                salt: header.salt,
                 op_count,
                 commit_ts,
+                position,
             })?;
         }
         // Unencrypted: plaintext bytes are already in place after the TX header.
@@ -1007,7 +1125,7 @@ impl LogicalLog {
         }
         if self.offset == 0 {
             // Valid path: checkpoint can run before the first logical-log append.
-            return Ok(LogHeader::new(&self.io));
+            return Ok(LogHeader::new(&self.io, self.encryption_ctx.is_some()));
         }
         Err(LimboError::InternalError(
             "Logical log header not initialized".to_string(),
@@ -1082,6 +1200,7 @@ impl LogicalLog {
         // Regenerate salt so stale frames (from before truncation) cannot validate
         // against the new CRC chain.
         header.salt = self.io.generate_random_number() as u64;
+        header.version = self.empty_log_version(header.version);
 
         let completion = Completion::new_trunc(move |result| {
             if let Err(err) = result {
@@ -1139,6 +1258,7 @@ impl LogicalLog {
         self.pending_running_crc = None;
         self.running_crc = derive_initial_crc(header.salt);
         header.salt = self.io.generate_random_number() as u64;
+        header.version = self.empty_log_version(header.version);
 
         let mut group = CompletionGroup::new(|_| {});
         let _header_c = self.write_header_and_publish_on_success(header, Some(&mut group))?;
@@ -1150,6 +1270,21 @@ impl LogicalLog {
         group.add(&c);
         let _truncate_c = self.file.truncate(LOG_HDR_SIZE as u64, c)?;
         Ok(group.build())
+    }
+
+    /// Returns the version of the header for an empty log, given the version of
+    /// the current header. An encrypted log uses version 4, whose AAD binds the
+    /// position of each frame. Only encrypted logs use version 4, so a plaintext
+    /// log with a version 4 header goes back to version 3. Otherwise a plaintext
+    /// log keeps its version.
+    fn empty_log_version(&self, version: u8) -> u8 {
+        if self.encryption_ctx.is_some() {
+            LOG_VERSION_V4
+        } else if version == LOG_VERSION_V4 {
+            LOG_VERSION
+        } else {
+            version
+        }
     }
 
     /// Publishes a finished header write or truncate and checks that none is
@@ -2199,6 +2334,7 @@ impl StreamingLogicalLogReader {
             u32::try_from(chunk_index).map_err(|_| {
                 LimboError::Corrupt("encrypted payload chunk index exceeds u32".to_string())
             })?,
+            payload_ctx.position,
         );
 
         if self.remaining_bytes() < on_disk_size {
@@ -2219,7 +2355,12 @@ impl StreamingLogicalLogReader {
             let next_crc = crc32c::crc32c_append(running_crc, blob);
             let ciphertext = &blob[..plaintext_len + payload_ctx.tag_size];
             let nonce = &blob[plaintext_len + payload_ctx.tag_size..];
-            encryption_ctx.decrypt_chunk_into(ciphertext, nonce, &aad, decrypt_scratch)?;
+            encryption_ctx.decrypt_chunk_into(
+                ciphertext,
+                nonce,
+                aad.as_bytes(),
+                decrypt_scratch,
+            )?;
             (next_crc, decrypt_scratch.len())
         };
 
@@ -2334,12 +2475,14 @@ impl StreamingLogicalLogReader {
     /// then incrementally parsing ops from the resulting plaintext.
     /// Encrypted on-disk payload layout is a concatenation of chunk blobs:
     /// ciphertext(chunk_plain_len + tag_size) | nonce(nonce_size), one blob per chunk.
+    /// `position` is the position of the frame, which a version 4 log binds in the AAD.
     fn parse_encrypted_payload(
         &mut self,
         op_count: u32,
         payload_size: usize,
         commit_ts: u64,
         running_crc: u32,
+        position: Option<FramePosition>,
     ) -> IOResultOr<PayloadParseResult> {
         let (nonce_size, tag_size) = {
             let enc = self
@@ -2360,6 +2503,7 @@ impl StreamingLogicalLogReader {
             salt,
             nonce_size,
             tag_size,
+            position,
         };
         let mut running_crc = running_crc;
         // carry contains the payload from previous chunk.
@@ -2469,12 +2613,15 @@ impl StreamingLogicalLogReader {
         )))
     }
 
+    /// Reads and decrypts the whole encrypted body of a frame. `position` is the
+    /// position of the frame, which a version 4 log binds in the AAD.
     fn read_encrypted_plaintext(
         &mut self,
         plaintext_size: usize,
         op_count: u32,
         commit_ts: u64,
         running_crc: u32,
+        position: Option<FramePosition>,
     ) -> IOResultOr<ReadEncryptedResult> {
         let (nonce_size, tag_size) = {
             let enc = self
@@ -2495,6 +2642,7 @@ impl StreamingLogicalLogReader {
             salt,
             nonce_size,
             tag_size,
+            position,
         };
         let chunk_count =
             encrypted_payload_chunk_count(plaintext_size, self.encrypted_payload_chunk_size);
@@ -2786,6 +2934,7 @@ impl StreamingLogicalLogReader {
     /// local state. `frame_start` is captured once at frame open (never
     /// recomputed) so an invalid frame reports the correct `last_valid_offset`.
     fn parse_next_transaction(&mut self) -> IOResultOr<ParseResult> {
+        self.check_frames_readable()?;
         loop {
             if self.frame_in_progress.is_none() {
                 // Start a fresh frame at the current consume cursor.
@@ -3046,9 +3195,18 @@ impl StreamingLogicalLogReader {
         {
             return Ok(IOResult::Done(PayloadOutcome::Eof));
         }
-        let (payload_size, op_count, commit_ts, extension_size, extension_record_count, header_crc) = {
+        let (
+            frame_start,
+            payload_size,
+            op_count,
+            commit_ts,
+            extension_size,
+            extension_record_count,
+            header_crc,
+        ) = {
             let fip = self.frame_in_progress.as_ref().expect("frame in progress");
             (
+                fip.frame_start,
                 fip.payload_size,
                 fip.op_count,
                 fip.commit_ts,
@@ -3057,6 +3215,7 @@ impl StreamingLogicalLogReader {
                 fip.running_crc,
             )
         };
+        let position = self.frame_position(frame_start);
         let encrypted_extension_size = if self.encryption_ctx.is_some() {
             extension_size
         } else {
@@ -3074,6 +3233,7 @@ impl StreamingLogicalLogReader {
                 op_count,
                 commit_ts,
                 header_crc,
+                position,
             )) else {
                 return Ok(IOResult::Done(PayloadOutcome::Eof));
             };
@@ -3100,11 +3260,26 @@ impl StreamingLogicalLogReader {
         }
 
         if self.encryption_ctx.is_some() {
+            // The frame is complete and its checksum is valid. In a version 4 log,
+            // a frame without encrypted chunks has no tag that authenticates its
+            // position, and the writer never appends such a frame. This is not a
+            // `Corrupt` error: `parse_next_transaction` treats a `Corrupt` error
+            // from this phase as a torn tail and drops the frame and the rest of
+            // the log without an error. A complete frame that fails
+            // authentication must stop recovery instead, as a failed tag check
+            // does (the cipher reports it as an `InternalError`).
+            if position.is_some() && payload_size == 0 {
+                return Err(LimboError::InternalError(format!(
+                    "encrypted logical log frame at offset {frame_start} has no payload to authenticate"
+                ))
+                .into());
+            }
             let (parsed_ops, running_crc) = match self.parse_encrypted_payload(
                 op_count,
                 payload_size,
                 commit_ts,
                 header_crc,
+                position,
             )? {
                 IOResult::Done(PayloadParseResult::Ok(ops, crc)) => (ops, crc),
                 IOResult::Done(PayloadParseResult::Eof) => {
@@ -3247,6 +3422,7 @@ impl StreamingLogicalLogReader {
     }
 
     fn parse_next_portable_changes_frame(&mut self) -> IOResultOr<ParseResult> {
+        self.check_frames_readable()?;
         // See `parse_next_transaction`: rewind to the frame anchor so a mid-frame
         // IO yield resumes correctly on re-entry.
         self.buffer_offset = self.frame_anchor;
@@ -3376,11 +3552,13 @@ impl StreamingLogicalLogReader {
                 .ok_or_else(|| {
                     LimboError::Corrupt("encrypted plaintext size overflows usize".into())
                 })?;
+            let position = self.frame_position(frame_start);
             let Some((plaintext, running_crc)) = return_if_io!(self.read_encrypted_plaintext(
                 plaintext_size,
                 op_count,
                 commit_ts,
                 running_crc,
+                position,
             )) else {
                 return Ok(IOResult::Done(ParseResult::Eof));
             };
@@ -3467,6 +3645,38 @@ impl StreamingLogicalLogReader {
             commit_ts,
             end_offset: self.last_valid_offset,
         })))
+    }
+
+    /// Returns an error when the frames cannot be read: only an encrypted log
+    /// uses version 4, so its frames need the encryption key. Without this check,
+    /// the encrypted frames would look like a corrupt tail and recovery would drop
+    /// them.
+    fn check_frames_readable(&self) -> Result<()> {
+        let is_v4 = self
+            .header
+            .as_ref()
+            .is_some_and(|header| header.version == LOG_VERSION_V4);
+        if is_v4 && self.encryption_ctx.is_none() {
+            return Err(LimboError::Corrupt(
+                "logical log version 4 is encrypted, but no encryption key is set".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the position of the frame that starts at file offset `frame_start`,
+    /// which a version 4 log binds in the AAD of its chunks, or `None` for a log of
+    /// an earlier version. Call it before the frame is committed, while
+    /// `running_crc` is still the CRC before the frame.
+    fn frame_position(&self, frame_start: usize) -> Option<FramePosition> {
+        let is_v4 = self
+            .header
+            .as_ref()
+            .is_some_and(|header| header.version == LOG_VERSION_V4);
+        is_v4.then_some(FramePosition {
+            offset: frame_start as u64,
+            start_crc: self.running_crc,
+        })
     }
 
     pub(crate) fn parsed_op_to_streaming(
@@ -3865,6 +4075,8 @@ struct EncryptedPayloadReadContext {
     salt: u64,
     nonce_size: usize,
     tag_size: usize,
+    /// The position of the frame, which a version 4 log binds in the AAD.
+    position: Option<FramePosition>,
 }
 
 /// Result of parsing just the payload portion of a transaction frame.
@@ -4005,11 +4217,12 @@ mod tests {
     use super::{
         build_encrypted_chunk_aad, derive_initial_crc, encrypted_chunk_blob_size,
         encrypted_chunk_plaintext_len, encrypted_payload_blob_size, encrypted_payload_chunk_count,
-        HeaderReadResult, LogHeader, LogSerializer, LogTxFrameInfo, LogicalLog, ParseResult,
-        ParsedOp, StreamingLogicalLogReader, ENCRYPTED_CHUNK_AAD_SIZE,
-        ENCRYPTED_PAYLOAD_CHUNK_SIZE, END_MAGIC, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_CRC_START,
-        LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION, LOG_VERSION_V2, TX_EXT_HEADER_SIZE,
-        TX_HEADER_SIZE, TX_HEADER_SIZE_V2, TX_TRAILER_SIZE,
+        FramePosition, HeaderReadResult, LogHeader, LogSerializer, LogTxFrameInfo, LogicalLog,
+        ParseResult, ParsedOp, StreamingLogicalLogReader, ENCRYPTED_CHUNK_AAD_SIZE,
+        ENCRYPTED_CHUNK_AAD_SIZE_V4, ENCRYPTED_PAYLOAD_CHUNK_SIZE, END_MAGIC, EXT_FRAME_MAGIC,
+        FRAME_MAGIC, LOG_HDR_CRC_START, LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION,
+        LOG_VERSION_V2, LOG_VERSION_V4, TX_EXT_HEADER_SIZE, TX_HEADER_SIZE, TX_HEADER_SIZE_V2,
+        TX_TRAILER_SIZE,
     };
     #[cfg(feature = "conn_raw_api")]
     use super::{EXTENSION_RECORD_HEADER_SIZE, EXTENSION_TYPE_PORTABLE_CHANGES, OP_UPSERT_TABLE};
@@ -5845,7 +6058,7 @@ mod tests {
     fn test_logical_log_header_crc_roundtrip() {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
-        let header = LogHeader::new(&io);
+        let header = LogHeader::new(&io, false);
         assert_eq!(header.version, LOG_VERSION);
         assert_ne!(header.salt, 0, "salt should be non-zero from IO RNG");
         let bytes = header.encode();
@@ -6183,6 +6396,12 @@ mod tests {
                 let file = open_test_file(&io, "codec.db-log");
                 let mut log = LogicalLog::new(file.clone(), io.clone(), Some(crypto.clone()));
                 for size in [0, 100, 32768, 100_000] {
+                    // An encrypted frame needs a payload to authenticate its
+                    // position. A commit without ops writes no frame, so only a
+                    // portable frame, whose extension block is a payload, has no rows.
+                    if size == 0 && !portable {
+                        continue;
+                    }
                     let rows = if size == 0 {
                         Vec::new()
                     } else {
@@ -6201,10 +6420,13 @@ mod tests {
                 }
                 let stored = read_file_bytes(file, &io);
                 let header = validate_log_header(&stored[..LOG_HDR_SIZE]).expect("header");
+                assert_eq!(header.version(), LOG_VERSION_V4);
                 let mut source_crc = header.initial_crc();
                 let mut wire_crc = source_crc;
                 let mut offset = LOG_HDR_SIZE;
-                let mut normalized = header.bytes().to_vec();
+                // The plaintext frames form a version 3 log.
+                let mut normalized = header.wire_bytes().to_vec();
+                assert_eq!(normalized[4], LOG_VERSION);
                 let mut output = Vec::new();
                 while offset < stored.len() {
                     let layout = inspect_frame_prefix(&stored[offset..], Some(&crypto))
@@ -6243,7 +6465,8 @@ mod tests {
                 overwrite_file_bytes(plain_file.clone(), &io, &normalized);
                 let mut reader = StreamingLogicalLogReader::new(plain_file, None);
                 reader.read_header(&io).expect("wire header");
-                for expected_ops in [0, 1, 1, 1] {
+                let frame_ops: &[usize] = if portable { &[0, 1, 1, 1] } else { &[1, 1, 1] };
+                for &expected_ops in frame_ops {
                     let ParseResult::Frame(frame) = io
                         .block(|| reader.parse_next_transaction())
                         .expect("wire decode")
@@ -6381,6 +6604,12 @@ mod tests {
         .len();
         assert!(extension_size >= EXTENSION_RECORD_HEADER_SIZE);
 
+        assert_eq!(log_header.version(), LOG_VERSION_V4);
+        // The malformed frames replace the first frame, so they bind its position.
+        let position = Some(FramePosition {
+            offset: LOG_HDR_SIZE as u64,
+            start_crc: log_header.initial_crc(),
+        });
         let encode = |header: &[u8], plaintext: &[u8]| {
             let mut frame = header.to_vec();
             let count = plaintext.len().div_ceil(ENCRYPTED_PAYLOAD_CHUNK_SIZE);
@@ -6391,8 +6620,9 @@ mod tests {
                     u32::from_le_bytes(header[12..16].try_into().unwrap()),
                     u64::from_le_bytes(header[16..24].try_into().unwrap()),
                     index as u32,
+                    position,
                 );
-                let (ciphertext, nonce) = crypto.encrypt_chunk(chunk, &aad).unwrap();
+                let (ciphertext, nonce) = crypto.encrypt_chunk(chunk, aad.as_bytes()).unwrap();
                 frame.extend(ciphertext);
                 frame.extend(nonce);
             }
@@ -7395,9 +7625,11 @@ mod tests {
     fn test_encrypted_log_format_assumptions_are_pinned() {
         assert_eq!(LOG_VERSION_V2, 2);
         assert_eq!(LOG_VERSION, 3);
+        assert_eq!(LOG_VERSION_V4, 4);
         assert_eq!(LOG_HDR_SIZE, 56);
         assert_eq!(ENCRYPTED_PAYLOAD_CHUNK_SIZE, 32 * 1024);
         assert_eq!(ENCRYPTED_CHUNK_AAD_SIZE, 32);
+        assert_eq!(ENCRYPTED_CHUNK_AAD_SIZE_V4, 44);
         assert_eq!(FRAME_MAGIC, 0x5854_564D);
         assert_eq!(EXT_FRAME_MAGIC, 0x5845_564D);
         assert_eq!(END_MAGIC, 0x4554_564D);
@@ -7972,7 +8204,7 @@ mod tests {
             .open_file("sync-frame-lml2.db-log", OpenFlags::Create, false)
             .unwrap();
 
-        let mut header = LogHeader::new(&io);
+        let mut header = LogHeader::new(&io, false);
         header.version = LOG_VERSION_V2;
         let buffer = Arc::new(Buffer::new(header.encode().to_vec()));
         let c = Completion::new_write(|_| {});
@@ -7997,9 +8229,10 @@ mod tests {
             0x2122_2324,
             0x3132_3334_3536_3738,
             0x4142_4344,
+            None,
         );
         assert_eq!(
-            non_last_aad,
+            non_last_aad.as_bytes(),
             [
                 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // salt
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -8016,10 +8249,11 @@ mod tests {
             0x2122_2324,
             0x3132_3334_3536_3738,
             0x4142_4344,
+            None,
         );
 
         assert_eq!(
-            last_aad,
+            last_aad.as_bytes(),
             [
                 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // salt
                 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12,
@@ -8027,6 +8261,31 @@ mod tests {
                 0x24, 0x23, 0x22, 0x21, // op_count
                 0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31, // commit_ts
                 0x44, 0x43, 0x42, 0x41, // chunk_index
+            ]
+        );
+
+        let positioned_aad = build_encrypted_chunk_aad(
+            0x0102_0304_0506_0708,
+            Some(0x1112_1314_1516_1718),
+            0x2122_2324,
+            0x3132_3334_3536_3738,
+            0x4142_4344,
+            Some(FramePosition {
+                offset: 0x5152_5354_5556_5758,
+                start_crc: 0x6162_6364,
+            }),
+        );
+        assert_eq!(
+            positioned_aad.as_bytes(),
+            [
+                0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // salt
+                0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12,
+                0x11, // payload_size (final chunk only)
+                0x24, 0x23, 0x22, 0x21, // op_count
+                0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31, // commit_ts
+                0x44, 0x43, 0x42, 0x41, // chunk_index
+                0x58, 0x57, 0x56, 0x55, 0x54, 0x53, 0x52, 0x51, // frame offset (version 4)
+                0x64, 0x63, 0x62, 0x61, // running CRC before the frame (version 4)
             ]
         );
     }
@@ -8428,6 +8687,333 @@ mod tests {
             io.block(|| reader.parse_next_transaction()).unwrap(),
             ParseResult::Eof
         ));
+    }
+
+    /// In a version 4 log, the AAD of a frame binds its offset and the CRC before
+    /// it. A frame that is removed, replayed or moved fails authentication even when
+    /// the CRCs are recomputed. The reader and the frame codec return an error
+    /// instead of a log with other committed data.
+    #[test]
+    fn test_encrypted_log_rejects_moved_frames() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = open_test_file(&io, "enc-moved-frames.db-log");
+        let table_id: MVTableId = (-2).into();
+        let enc_ctx = test_enc_ctx();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+        let mut frame_ends = vec![LOG_HDR_SIZE];
+        for i in 0..3u64 {
+            let tx = crate::mvcc::database::LogRecord::for_test(
+                100 + i,
+                &[make_test_row_version(table_id, i as i64, "data", 100 + i)],
+                None,
+            );
+            append_encrypted_tx(&mut log, &io, tx);
+            frame_ends.push(log.offset as usize);
+        }
+        let stored = read_file_bytes(file.clone(), &io);
+        assert_eq!(stored[4], LOG_VERSION_V4);
+        let salt = LogHeader::decode(&stored).unwrap().salt;
+        // Returns the log header and the frames at the indexes in `order`, with
+        // the CRCs recomputed.
+        let rechain = |order: &[usize]| {
+            let mut edited = stored[..LOG_HDR_SIZE].to_vec();
+            let mut crc = derive_initial_crc(salt);
+            for &index in order {
+                let start = edited.len();
+                edited.extend_from_slice(&stored[frame_ends[index]..frame_ends[index + 1]]);
+                let trailer = edited.len() - TX_TRAILER_SIZE;
+                crc = crc32c::crc32c_append(crc, &edited[start..trailer]);
+                edited[trailer..trailer + 4].copy_from_slice(&crc.to_le_bytes());
+            }
+            edited
+        };
+        assert_eq!(rechain(&[0, 1, 2]), stored);
+
+        // Each edit, with the number of frames before the first frame that moved.
+        for (edit, order, unmoved_frames) in [
+            ("removed frame", &[0, 2][..], 1),
+            ("swapped frames", &[1, 0, 2][..], 0),
+            ("replayed frame", &[0, 1, 0, 2][..], 2),
+        ] {
+            let edited = rechain(order);
+            overwrite_file_bytes(file.clone(), &io, &edited);
+            let mut reader = StreamingLogicalLogReader::new(file.clone(), Some(enc_ctx.clone()));
+            reader.read_header(&io).unwrap();
+            for _ in 0..unmoved_frames {
+                assert!(matches!(
+                    io.block(|| reader.parse_next_transaction()).unwrap(),
+                    ParseResult::Frame(_)
+                ));
+            }
+            let error = io.block(|| reader.parse_next_transaction()).unwrap_err();
+            assert!(
+                error.to_string().contains("decryption failed"),
+                "{edit}: {error}"
+            );
+
+            #[cfg(feature = "conn_raw_api")]
+            {
+                use super::frame_codec::{
+                    inspect_frame_prefix, validate_frame_into, validate_log_header,
+                };
+                let header = validate_log_header(&edited[..LOG_HDR_SIZE]).unwrap();
+                let mut crc = header.initial_crc();
+                let mut offset = LOG_HDR_SIZE;
+                let mut output = Vec::new();
+                for frame in 0..=unmoved_frames {
+                    let size = inspect_frame_prefix(&edited[offset..], Some(&enc_ctx))
+                        .unwrap()
+                        .unwrap()
+                        .stored_size();
+                    let validated = validate_frame_into(
+                        &header,
+                        offset as u64,
+                        &edited[offset..offset + size],
+                        crc,
+                        Some(&enc_ctx),
+                        &mut output,
+                    );
+                    if frame < unmoved_frames {
+                        crc = validated.unwrap().source_crc();
+                    } else {
+                        let error = validated.unwrap_err();
+                        assert!(
+                            error.to_string().contains("authentication failed"),
+                            "{edit}: {error}"
+                        );
+                    }
+                    offset += size;
+                }
+            }
+        }
+    }
+
+    /// Encrypted logs that older versions wrote have version 3, and the AAD of their
+    /// frames does not bind a position. The reader still reads them, and the writer
+    /// appends frames in the same format until a truncation empties the log. The
+    /// first frame after the truncation starts a version 4 log.
+    #[test]
+    fn test_lml3_encrypted_log_is_read_and_appended_until_truncated() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = open_test_file(&io, "enc-lml3.db-log");
+        let table_id: MVTableId = (-2).into();
+        let enc_ctx = test_enc_ctx();
+        let tx = |commit_ts: u64| {
+            crate::mvcc::database::LogRecord::for_test(
+                commit_ts,
+                &[make_test_row_version(
+                    table_id,
+                    commit_ts as i64,
+                    "data",
+                    commit_ts,
+                )],
+                None,
+            )
+        };
+        let read_commit_timestamps = |file: &Arc<dyn crate::File>| -> crate::Result<Vec<u64>> {
+            let mut reader = StreamingLogicalLogReader::new(file.clone(), Some(enc_ctx.clone()));
+            reader.read_header(&io)?;
+            let mut commit_timestamps = Vec::new();
+            while let Some(ops) = io.block(|| reader.next_frame())? {
+                for op in ops {
+                    let ParsedOp::UpsertTable { commit_ts, .. } = op else {
+                        panic!("expected a table upsert, got {op:?}");
+                    };
+                    commit_timestamps.push(commit_ts);
+                }
+            }
+            Ok(commit_timestamps)
+        };
+
+        // Recovery leaves the writer of a version 3 log after its last frame.
+        let header = LogHeader::new_with_version(&io, LOG_VERSION);
+        overwrite_file_bytes(file.clone(), &io, &header.encode());
+        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+        log.set_header(header);
+        log.offset = LOG_HDR_SIZE as u64;
+        append_encrypted_tx(&mut log, &io, tx(100));
+        append_encrypted_tx(&mut log, &io, tx(101));
+        let stored = read_file_bytes(file.clone(), &io);
+        assert_eq!(stored[4], LOG_VERSION);
+        assert_eq!(read_commit_timestamps(&file).unwrap(), [100, 101]);
+
+        // The header version selects the AAD, so these frames fail as version 4 frames.
+        let mut relabeled_header = LogHeader::decode(&stored).unwrap();
+        relabeled_header.version = LOG_VERSION_V4;
+        let mut relabeled = stored.clone();
+        relabeled[..LOG_HDR_SIZE].copy_from_slice(&relabeled_header.encode());
+        overwrite_file_bytes(file.clone(), &io, &relabeled);
+        let error = read_commit_timestamps(&file).unwrap_err();
+        assert!(error.to_string().contains("decryption failed"), "{error}");
+        overwrite_file_bytes(file.clone(), &io, &stored);
+
+        let (c, _) = log.truncate(u64::MAX).unwrap();
+        io.wait_for_completion(c).unwrap();
+        append_encrypted_tx(&mut log, &io, tx(102));
+        assert_eq!(read_file_bytes(file.clone(), &io)[4], LOG_VERSION_V4);
+        assert_eq!(read_commit_timestamps(&file).unwrap(), [102]);
+    }
+
+    /// The first write to a header-only log that an older version started moves an
+    /// encrypted log to version 4, with a new salt. If a crash keeps the old header
+    /// bytes but writes the frame, the frame fails its CRC check, so recovery drops
+    /// it as a torn tail instead of returning an authentication error. A reset
+    /// writes a version 4 header at once.
+    #[test]
+    fn test_encrypted_lml3_header_only_log_moves_to_v4_with_a_new_salt() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let enc_ctx = test_enc_ctx();
+        let file = open_test_file(&io, "enc-lml3-header-only.db-log");
+        let old_header = LogHeader::new_with_version(&io, LOG_VERSION);
+        let old_header_bytes = old_header.encode();
+        overwrite_file_bytes(file.clone(), &io, &old_header_bytes);
+        // Recovery of a header-only log sets the header and leaves the offset at 0.
+        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
+        log.set_header(old_header.clone());
+        let tx = crate::mvcc::database::LogRecord::for_test(
+            100,
+            &[make_test_row_version((-2).into(), 1, "data", 100)],
+            None,
+        );
+        append_encrypted_tx(&mut log, &io, tx);
+        let mut stored = read_file_bytes(file.clone(), &io);
+        let new_header = LogHeader::decode(&stored).unwrap();
+        assert_eq!(new_header.version, LOG_VERSION_V4);
+        assert_ne!(new_header.salt, old_header.salt);
+
+        // A torn write that kept the old header bytes.
+        stored[..LOG_HDR_SIZE].copy_from_slice(&old_header_bytes);
+        overwrite_file_bytes(file.clone(), &io, &stored);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), Some(enc_ctx.clone()));
+        reader.read_header(&io).unwrap();
+        assert!(io.block(|| reader.next_frame()).unwrap().is_none());
+        assert_eq!(reader.last_valid_offset(), LOG_HDR_SIZE);
+
+        let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx));
+        log.set_header(old_header);
+        io.wait_for_completion(log.reset_to_fresh_header().unwrap())
+            .unwrap();
+        let reset = read_file_bytes(file, &io);
+        assert_eq!(reset.len(), LOG_HDR_SIZE);
+        assert_eq!(reset[4], LOG_VERSION_V4);
+    }
+
+    /// Only encrypted logs use version 4. A plaintext writer that finds a version 4
+    /// header, for example in a header-only log that came from another database,
+    /// writes version 3 when the log is empty, so that its frames can be read
+    /// without a key.
+    #[test]
+    fn test_plaintext_writer_does_not_keep_v4_header() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = open_test_file(&io, "plain-v4-header.db-log");
+        let v4_header = LogHeader::new_with_version(&io, LOG_VERSION_V4);
+        overwrite_file_bytes(file.clone(), &io, &v4_header.encode());
+        // Recovery of a header-only log sets the header and leaves the offset at 0.
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        log.set_header(v4_header);
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 10, false, false, "a");
+        assert_eq!(read_file_bytes(file.clone(), &io)[4], LOG_VERSION);
+        assert_eq!(commit_timestamps(file.clone(), &io), [10]);
+
+        // A truncation also starts a version 3 log.
+        log.header.as_mut().unwrap().version = LOG_VERSION_V4;
+        let (c, _) = log.truncate(u64::MAX).unwrap();
+        io.wait_for_completion(c).unwrap();
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 20, false, false, "b");
+        assert_eq!(read_file_bytes(file.clone(), &io)[4], LOG_VERSION);
+        assert_eq!(commit_timestamps(file, &io), [20]);
+    }
+
+    /// Only an encrypted log has version 4. Without the key, a reader reads the
+    /// header but returns an error for the frames, instead of treating them as a
+    /// corrupt tail that recovery drops.
+    #[test]
+    fn test_v4_log_frames_need_the_key() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let tx = crate::mvcc::database::LogRecord::for_test(
+            100,
+            &[make_test_row_version((-2).into(), 1, "data", 100)],
+            None,
+        );
+        let file = write_single_encrypted_tx(&io, "enc-v4-no-key.db-log", &test_enc_ctx(), tx);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        assert!(matches!(
+            reader.try_read_header(&io).unwrap(),
+            HeaderReadResult::Valid(_)
+        ));
+        let error = io.block(|| reader.next_frame()).unwrap_err();
+        assert!(error.to_string().contains("no encryption key"), "{error}");
+
+        #[cfg(feature = "conn_raw_api")]
+        {
+            use super::frame_codec::{validate_frame_into, validate_log_header};
+            let stored = read_file_bytes(file, &io);
+            let header = validate_log_header(&stored[..LOG_HDR_SIZE]).unwrap();
+            let error = validate_frame_into(
+                &header,
+                LOG_HDR_SIZE as u64,
+                &stored[LOG_HDR_SIZE..],
+                header.initial_crc(),
+                None,
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("no encryption key"), "{error}");
+        }
+    }
+
+    /// The writer never appends an encrypted frame without a payload, and such a
+    /// frame has no tag that could authenticate its position. In a version 4 log,
+    /// a complete frame of this kind with a valid CRC is an error.
+    #[test]
+    fn test_v4_encrypted_frame_without_payload_is_rejected() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let enc_ctx = test_enc_ctx();
+        let file = open_test_file(&io, "enc-v4-empty-frame.db-log");
+        let header = LogHeader::new_with_version(&io, LOG_VERSION_V4);
+        // FRAME_MAGIC | payload_size = 0 | op_count = 0 | commit_ts
+        let mut frame = vec![0u8; TX_HEADER_SIZE];
+        frame[..4].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
+        frame[16..24].copy_from_slice(&100u64.to_le_bytes());
+        let crc = crc32c::crc32c_append(derive_initial_crc(header.salt), &frame);
+        frame.extend(crc.to_le_bytes());
+        frame.extend(END_MAGIC.to_le_bytes());
+        let mut stored = header.encode().to_vec();
+        stored.extend(&frame);
+        overwrite_file_bytes(file.clone(), &io, &stored);
+
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
+        reader.read_header(&io).unwrap();
+        let error = io.block(|| reader.parse_next_transaction()).unwrap_err();
+        assert!(
+            error.to_string().contains("no payload to authenticate"),
+            "{error}"
+        );
+
+        #[cfg(feature = "conn_raw_api")]
+        {
+            use super::frame_codec::{validate_frame_into, validate_log_header};
+            let header = validate_log_header(&stored[..LOG_HDR_SIZE]).unwrap();
+            let error = validate_frame_into(
+                &header,
+                LOG_HDR_SIZE as u64,
+                &frame,
+                header.initial_crc(),
+                Some(&enc_ctx),
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("no payload to authenticate"),
+                "{error}"
+            );
+        }
     }
 
     /// AEAD integrity: wrong key and tampered ciphertext must both be rejected.

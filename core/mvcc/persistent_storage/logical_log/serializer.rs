@@ -454,6 +454,7 @@ impl<B: LogBufferExt + ?Sized> LogSerializer<'_, B> {
                         "encrypted payload chunk index exceeds u32".to_string(),
                     )
                 })?,
+                payload.position,
             );
             let tag_start = ciphertext_start + plaintext_len;
             let nonce_start = tag_start + tag_size;
@@ -463,7 +464,7 @@ impl<B: LogBufferExt + ?Sized> LogSerializer<'_, B> {
             let (tag, nonce) = tag_and_nonce.split_at_mut(tag_size);
             payload
                 .enc_ctx
-                .encrypt_chunk_in_place(ciphertext, &aad, tag, nonce)?;
+                .encrypt_chunk_in_place(ciphertext, aad.as_bytes(), tag, nonce)?;
         }
 
         turso_assert!(
@@ -791,6 +792,8 @@ pub(crate) struct EncryptedPayload<'a> {
     pub(super) salt: u64,
     pub(super) op_count: u32,
     pub(super) commit_ts: u64,
+    /// The position of the frame, which a version 4 log binds in the AAD.
+    pub(super) position: Option<FramePosition>,
 }
 
 #[cfg(test)]

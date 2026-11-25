@@ -836,6 +836,14 @@ Built-in encryption protects database storage, WAL, and encrypted MVCC storage. 
 
 MVCC recovery ignores an incomplete or checksum-invalid log tail and keeps the preceding committed frames. A checksum-valid encrypted frame that cannot be decrypted with the configured key causes opening or recovery to fail.
 
+Each committed transaction in an encrypted MVCC log authenticates only at its original position in the log. If complete transactions are removed from the log, added to it, or moved in it, the first transaction that is not at its original position fails authentication, and opening or recovery fails. This is also true when the log checksums are recomputed. This protection does not detect:
+
+- a log that was cut at a transaction boundary,
+- a database and log that were replaced by an older copy,
+- a last transaction that was replaced by a transaction that did not commit, which an older copy of the log holds at the same position (for example after an interrupted write).
+
+A new encrypted MVCC database uses this log format (log version 4). An encrypted MVCC log that an older Turso version started (log version 2 or 3) does not have this protection. It keeps its format until a checkpoint empties the log. Older Turso versions cannot open a database whose encrypted MVCC log has version 4: they report `Corrupt database: Logical log header corrupt and no WAL recovery available`. Before you open the database with an older version, run `PRAGMA wal_checkpoint(TRUNCATE)` with the newer version to empty the log.
+
 ## Custom Types
 
 <Info>

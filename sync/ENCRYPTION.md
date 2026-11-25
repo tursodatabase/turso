@@ -206,14 +206,22 @@ records. There is no scratch-file header or footer: a completed batch's identity
 counts, and size stay in memory. Scratch writes complete before apply, without
 an fsync; abandoned downloads are reset after restart.
 
-The native MVCC codec checks body-chunk AEAD tags and frame CRCs; it does not
-authenticate whole frames or log ordering. Existing native log versions do not
-bind frame offsets, preceding frames, or all header fields, including the split
-between extension and recovery bytes. An attacker who can modify stored logs
+The native MVCC codec checks body-chunk AEAD tags and frame CRCs. Core writes
+encrypted native logs with version 4, where the tags of each frame also bind the
+frame offset and the CRC of the log before the frame. When frames are dropped,
+replayed, or reordered, the first frame that is not at its original position
+fails authentication, also when the CRCs are recomputed. Dropping frames at the
+end of the log is not detected. Encrypted logs of versions 2 and 3, which older
+versions wrote, do not bind these values: an attacker who can modify such a log
 can drop, replay, or reorder complete frames and recompute CRCs without a key.
-The codec can also accept a changed extension boundary with the same total body
-length. Fixing these limitations requires a new native log version and compatible
-recovery readers; the sync codec does not change the existing format. See the
+No version detects a log that was replaced by an older copy. A frame that was
+written but did not commit, and that a later frame overwrote at the same offset,
+still authenticates at that offset, so a kept copy of it can replace the last
+frame. Native logs do not authenticate all header fields, including the split
+between extension and recovery bytes, so the codec can also accept a changed
+extension boundary with the same total body length. The decrypted frames of a version 4 log form a version
+3 log: servers send them after the header from `ValidatedLogHeader::wire_bytes`,
+because clients accept only version 3. See the
 [native log review](https://github.com/tursodatabase/turso/pull/11515).
 
 ## Validation

@@ -257,7 +257,8 @@ impl InProcessServer {
                 let mut source_crc = header.initial_crc();
                 let mut wire_crc = header.initial_crc();
                 if offset == 0 {
-                    normalized.extend_from_slice(header.bytes());
+                    // The decrypted frames form a version 3 log.
+                    normalized.extend_from_slice(&header.wire_bytes());
                 }
                 let mut pos = 56;
                 while pos < log.len() {

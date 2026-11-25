@@ -6,9 +6,10 @@
 
 use super::{
     build_encrypted_chunk_aad, derive_initial_crc, encrypted_payload_blob_size,
-    encrypted_payload_chunk_count, EncryptionContext, LogHeader, ENCRYPTED_PAYLOAD_CHUNK_SIZE,
-    END_MAGIC, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE, LOG_VERSION_V2, TX_EXT_HEADER_SIZE,
-    TX_HEADER_SIZE, TX_TRAILER_SIZE,
+    encrypted_payload_chunk_count, EncryptionContext, FramePosition, LogHeader,
+    ENCRYPTED_PAYLOAD_CHUNK_SIZE, END_MAGIC, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE,
+    LOG_VERSION, LOG_VERSION_V2, LOG_VERSION_V4, TX_EXT_HEADER_SIZE, TX_HEADER_SIZE,
+    TX_TRAILER_SIZE,
 };
 use crate::{LimboError, Result};
 
@@ -27,8 +28,25 @@ impl ValidatedLogHeader {
         derive_initial_crc(self.header.salt)
     }
 
+    /// Returns the header bytes of the source log, as they are stored. Do not send
+    /// them before the frames that `plaintext_wire_parts` makes: an encrypted
+    /// source log has version 4, which sync clients reject. Send `wire_bytes`
+    /// instead.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Returns the header of the plaintext stream that `plaintext_wire_parts`
+    /// makes from the frames of this log. Version 4 differs from version 3 only
+    /// in the AAD of encrypted chunks, so the plaintext stream of a version 4 log
+    /// is a version 3 log with the same salt. Other headers are returned unchanged.
+    pub fn wire_bytes(&self) -> [u8; LOG_HDR_SIZE] {
+        if self.header.version != LOG_VERSION_V4 {
+            return self.bytes;
+        }
+        let mut header = self.header.clone();
+        header.version = LOG_VERSION;
+        header.encode()
     }
 }
 
@@ -199,7 +217,10 @@ impl ValidatedFrame<'_> {
 /// Validate a complete stored frame and write its plaintext body to `output`.
 /// Checks framing, the chained CRC, extension records, and encrypted chunk tags.
 /// `source_start` is the frame's offset in the source log, used to calculate
-/// the returned end offset. The caller must enforce the selected source range.
+/// the returned end offset. `source_crc` is the running CRC of the log before
+/// the frame. In a version 4 log, the encrypted chunks authenticate both values,
+/// so a frame validates only at the place where the writer appended it.
+/// The caller must enforce the selected source range.
 pub fn validate_frame_into<'a>(
     log: &ValidatedLogHeader,
     source_start: u64,
@@ -209,6 +230,13 @@ pub fn validate_frame_into<'a>(
     output: &'a mut Vec<u8>,
 ) -> Result<ValidatedFrame<'a>> {
     output.clear();
+    // Only an encrypted log has version 4, and its frame sizes include the
+    // encryption overhead.
+    if log.version() == LOG_VERSION_V4 && crypto.is_none() {
+        return Err(corrupt(
+            "logical log version 4 is encrypted, but no encryption key is set",
+        ));
+    }
     let layout = inspect_frame_prefix(stored_frame, crypto)?
         .ok_or_else(|| corrupt("truncated logical log frame header"))?;
     if stored_frame.len() != layout.stored_size {
@@ -233,9 +261,18 @@ pub fn validate_frame_into<'a>(
         return Err(corrupt("logical log frame checksum or trailer mismatch"));
     }
     let stored_body = &stored_frame[layout.header_size..trailer_start];
+    let position = (log.version() == LOG_VERSION_V4).then_some(FramePosition {
+        offset: source_start,
+        start_crc: source_crc,
+    });
     if let Some(crypto) = crypto {
         let chunks =
             encrypted_payload_chunk_count(layout.plaintext_size, ENCRYPTED_PAYLOAD_CHUNK_SIZE);
+        if position.is_some() && chunks == 0 {
+            return Err(corrupt(
+                "encrypted logical log frame has no payload to authenticate",
+            ));
+        }
         let mut offset = 0;
         for index in 0..chunks {
             let plaintext_len = (layout.plaintext_size - index * ENCRYPTED_PAYLOAD_CHUNK_SIZE)
@@ -248,11 +285,12 @@ pub fn validate_frame_into<'a>(
                 u32_at(stored_frame, 12),
                 u64_at(stored_frame, 16),
                 index as u32,
+                position,
             );
             let plaintext = match crypto.decrypt_chunk(
                 &stored_body[offset..ciphertext_end],
                 &stored_body[ciphertext_end..chunk_end],
-                &aad,
+                aad.as_bytes(),
             ) {
                 Ok(plaintext) => plaintext,
                 Err(_) => {
