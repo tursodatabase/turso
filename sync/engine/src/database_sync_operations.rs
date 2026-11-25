@@ -4926,6 +4926,7 @@ mod tests {
             turso_core::CipherMode::Aes256Gcm,
             &turso_core::EncryptionKey::new_256([3; 32]),
             super::PAGE_SIZE,
+            turso_core::EncryptionFormat::CURRENT,
         )
         .unwrap()
     }
@@ -6817,8 +6818,20 @@ mod tests {
         let local_config =
             crate::sync_encryption::SyncEncryption::new(cipher, Some(local_key.clone()), None)
                 .unwrap();
-        let source_crypto = EncryptionContext::new(cipher, &source_key, super::PAGE_SIZE).unwrap();
-        let local_crypto = EncryptionContext::new(cipher, &local_key, super::PAGE_SIZE).unwrap();
+        let source_crypto = EncryptionContext::new(
+            cipher,
+            &source_key,
+            super::PAGE_SIZE,
+            turso_core::EncryptionFormat::CURRENT,
+        )
+        .unwrap();
+        let local_crypto = EncryptionContext::new(
+            cipher,
+            &local_key,
+            super::PAGE_SIZE,
+            turso_core::EncryptionFormat::CURRENT,
+        )
+        .unwrap();
         {
             let db = turso_core::Database::open_file_with_flags(
                 core_io.clone(),

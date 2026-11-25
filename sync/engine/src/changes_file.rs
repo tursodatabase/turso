@@ -610,6 +610,7 @@ mod tests {
             CipherMode::Aes256Gcm,
             &EncryptionKey::new_256([3; 32]),
             4096,
+            turso_core::EncryptionFormat::CURRENT,
         )
         .expect("crypto")
     }

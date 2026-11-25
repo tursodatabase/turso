@@ -6715,7 +6715,13 @@ pub mod test {
         let key = EncryptionKey::from_hex_string("000102030405060708090a0b0c0d0e0f").unwrap();
         let mut io_ctx = IOContext::default();
         io_ctx.set_encryption(
-            EncryptionContext::new(CipherMode::Aes128Gcm, &key, page_size).unwrap(),
+            EncryptionContext::new(
+                CipherMode::Aes128Gcm,
+                &key,
+                page_size,
+                crate::storage::encryption::EncryptionFormat::CURRENT,
+            )
+            .unwrap(),
         );
         wal.set_io_context(io_ctx);
     }

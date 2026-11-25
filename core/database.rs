@@ -35,7 +35,7 @@ use crate::{
         self,
         checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
         database::IOContext,
-        encryption::{EncryptionContext, SQLITE_HEADER, TURSO_HEADER_PREFIX},
+        encryption::{EncryptionContext, EncryptionFormat, SQLITE_HEADER, TURSO_HEADER_PREFIX},
         journal_mode,
         page_cache::PageCache,
         page_transform::PageTransform,
@@ -3717,9 +3717,11 @@ impl Database {
             match st {
                 HeaderAuthenticationState::ReadHeader(hdr_st) => {
                     if let Some(key) = encryption_key {
-                        if let Some(page_size) =
-                            self.pager_state.page_size().filter(|_| use_cached_header)
-                        {
+                        // A cached open also needs the encryption format, which is known when the
+                        // database is new or a pager has authenticated page 1.
+                        if let Some(page_size) = self.pager_state.page_size().filter(|_| {
+                            use_cached_header && self.pager_state.encryption_format().is_some()
+                        }) {
                             let mut context = self.pager_state.verify_encryption_key(key)?;
                             context.set_page_size(page_size);
                             let mut io_ctx = IOContext::default();
@@ -3737,6 +3739,11 @@ impl Database {
                         let header = return_if_io!(self.read_db_header_buf(hdr_st));
                         let (reserved_space, page_size) =
                             Self::plain_header_page_info(&header, true)?;
+                        // Decrypting page 1 below authenticates its format, because the Turso
+                        // header is associated data of page 1. A page 1 without the Turso
+                        // header fails to decrypt there too.
+                        let format = EncryptionFormat::from_page_1(header.bytes())?
+                            .unwrap_or(EncryptionFormat::CURRENT);
                         if !use_cached_header
                             && (reserved_space as usize != cipher.metadata_size()
                                 || self
@@ -3747,6 +3754,18 @@ impl Database {
                             return Err(LimboError::InvalidArgument(
                                 "external restore cannot change the encrypted database page layout"
                                     .into(),
+                            )
+                            .into());
+                        }
+                        // The pagers of this database keep the format that they use.
+                        if !use_cached_header
+                            && self
+                                .pager_state
+                                .encryption_format()
+                                .is_some_and(|current| current != format)
+                        {
+                            return Err(LimboError::InvalidArgument(
+                                "external restore cannot change the encryption format".into(),
                             )
                             .into());
                         }
@@ -3768,6 +3787,7 @@ impl Database {
                             cipher,
                             key,
                             page_size.get() as usize,
+                            format,
                         )?);
                         // Keep this authentication read out of the page cache. Normal pager
                         // reads must still choose the current page from the WAL or database file.

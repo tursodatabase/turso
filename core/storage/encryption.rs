@@ -66,13 +66,67 @@ use turso_macros::{match_ignore_ascii_case, AtomicEnum};
 ///        Turso Encrypted Header: "Turso" + Version + Cipher ID + Unused
 /// ```
 ///
+/// The version byte stores the version of the [`EncryptionFormat`], which sets the associated data
+/// of the pages 2..N. In version 1, the associated data of a page is its page number as a 4-byte
+/// big-endian integer, so a page decrypts only at its own page number. In version 0, those pages
+/// have no associated data, so a page also decrypts at a different page number. The version byte
+/// is part of the associated data of page 1, so a changed version makes page 1 fail to decrypt.
+/// The page number does not identify the copy of a page: an older copy of a page at the same page
+/// number still decrypts, and so does the page with that number from another database that uses
+/// the same key.
+///
 /// constants used for the Turso page header in the encrypted dbs.
 pub const TURSO_HEADER_PREFIX: &[u8] = b"Turso";
 pub const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
-const TURSO_VERSION: u8 = 0x00;
 const VERSION_OFFSET: usize = 5;
 const CIPHER_OFFSET: usize = 6;
 const TURSO_HEADER_SIZE: usize = 16;
+
+/// The encryption format of a database: how its pages are encrypted. The version byte of the Turso
+/// header on page 1 stores the version of the format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionFormat {
+    /// Version 0. The pages 2..N have no associated data. Databases created before version 1 use
+    /// this format, and Turso keeps reading and writing them in it.
+    V0,
+    /// Version 1. The associated data of each page 2..N is its page number.
+    V1,
+}
+
+impl EncryptionFormat {
+    /// The format of new databases.
+    pub const CURRENT: Self = Self::V0;
+
+    /// Reads the format from the Turso header of an encrypted page 1, as stored on disk. Returns
+    /// `None` if the page does not start with the Turso header. The version byte is not
+    /// authenticated until page 1 is decrypted.
+    pub fn from_page_1(page: &[u8]) -> Result<Option<Self>> {
+        if page.len() < TURSO_HEADER_SIZE || !page.starts_with(TURSO_HEADER_PREFIX) {
+            return Ok(None);
+        }
+        Self::from_version(page[VERSION_OFFSET]).map(Some)
+    }
+
+    /// Returns the format with version byte `version`. A version that this build does not know
+    /// can come from a newer version of Turso, so the error does not report corruption.
+    pub fn from_version(version: u8) -> Result<Self> {
+        match version {
+            0 => Ok(Self::V0),
+            1 => Ok(Self::V1),
+            _ => Err(LimboError::InvalidArgument(format!(
+                "unsupported encryption format version {version} (a newer version of Turso may have created this database)"
+            ))),
+        }
+    }
+
+    /// Returns the version byte of this format.
+    pub fn version(self) -> u8 {
+        match self {
+            Self::V0 => 0,
+            Self::V1 => 1,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub enum EncryptionKey {
@@ -576,10 +630,20 @@ pub struct EncryptionContext {
     cipher_mode: CipherMode,
     cipher: Cipher,
     page_size: usize,
+    /// The format of the pages that this context encrypts and decrypts.
+    format: EncryptionFormat,
 }
 
 impl EncryptionContext {
-    pub fn new(cipher_mode: CipherMode, key: &EncryptionKey, page_size: usize) -> Result<Self> {
+    /// Creates a context for pages in `format`. A new database uses [`EncryptionFormat::CURRENT`].
+    /// The pages of an existing database must use the format that its page 1 stores, see
+    /// [`EncryptionFormat::from_page_1`]: a page encrypted in another format does not decrypt.
+    pub fn new(
+        cipher_mode: CipherMode,
+        key: &EncryptionKey,
+        page_size: usize,
+        format: EncryptionFormat,
+    ) -> Result<Self> {
         let required_size = cipher_mode.required_key_size();
         if key.len() != required_size {
             return Err(crate::LimboError::InvalidArgument(format!(
@@ -609,7 +673,19 @@ impl EncryptionContext {
             cipher_mode,
             cipher,
             page_size,
+            format,
         })
+    }
+
+    /// Returns this context for pages in `format`.
+    pub(crate) fn with_format(mut self, format: EncryptionFormat) -> Self {
+        self.format = format;
+        self
+    }
+
+    /// Returns the format of the pages that this context encrypts and decrypts.
+    pub fn format(&self) -> EncryptionFormat {
+        self.format
     }
 
     pub fn cipher_mode(&self) -> CipherMode {
@@ -676,7 +752,7 @@ impl EncryptionContext {
         header[..TURSO_HEADER_PREFIX.len()].copy_from_slice(TURSO_HEADER_PREFIX);
 
         // version byte (1 byte)
-        header[VERSION_OFFSET] = TURSO_VERSION;
+        header[VERSION_OFFSET] = self.format.version();
 
         // cipher identifier (1 byte)
         header[CIPHER_OFFSET] = self.cipher_mode.cipher_id();
@@ -699,10 +775,13 @@ impl EncryptionContext {
             ));
         }
 
+        // A database uses one format for all of its pages, so page 1 must have the version of
+        // the format that the other pages are decrypted with.
         let version = header[VERSION_OFFSET];
-        if version != TURSO_VERSION {
+        let expected = self.format.version();
+        if version != expected {
             return Err(LimboError::InternalError(format!(
-                "Unsupported Turso header version: expected {TURSO_VERSION}, got {version}"
+                "Unexpected Turso header version: expected {expected}, got {version}"
             )));
         }
 
@@ -756,7 +835,9 @@ impl EncryptionContext {
         }
 
         let payload = &page[..self.page_size - metadata_size];
-        let (encrypted, nonce) = self.encrypt_raw(payload)?;
+        let mut page_number = [0; 4];
+        let ad = self.page_associated_data(page_id, &mut page_number)?;
+        let (encrypted, nonce) = self.encrypt_raw_with_ad(payload, ad)?;
 
         let nonce_size = self.cipher_mode.nonce_size();
         assert_eq!(
@@ -797,7 +878,9 @@ impl EncryptionContext {
         let payload = &encrypted_page[..nonce_offset];
         let nonce = &encrypted_page[nonce_offset..];
 
-        let decrypted_data = self.decrypt_raw(payload, nonce)?;
+        let mut page_number = [0; 4];
+        let ad = self.page_associated_data(page_id, &mut page_number)?;
+        let decrypted_data = self.decrypt_raw_with_ad(payload, nonce, ad)?;
         let metadata_size = self.cipher_mode.metadata_size();
         assert_eq!(
             decrypted_data.len(),
@@ -817,6 +900,26 @@ impl EncryptionContext {
             self.page_size
         );
         Ok(result)
+    }
+
+    /// Returns the associated data of page `page_id`, which is not page 1. In format 0 it is empty.
+    /// In format 1 it is the page number as 4 big-endian bytes, which this function writes to
+    /// `page_number`, so the ciphertext of a page does not decrypt at a different page number.
+    #[cfg(feature = "encryption")]
+    fn page_associated_data<'a>(
+        &self,
+        page_id: usize,
+        page_number: &'a mut [u8; 4],
+    ) -> Result<&'a [u8]> {
+        match self.format {
+            EncryptionFormat::V0 => Ok(&[]),
+            EncryptionFormat::V1 => {
+                *page_number = u32::try_from(page_id)
+                    .map_err(|_| LimboError::IntegerOverflow)?
+                    .to_be_bytes();
+                Ok(page_number)
+            }
+        }
     }
 
     #[cfg(feature = "encryption")]
@@ -940,12 +1043,6 @@ impl EncryptionContext {
         Ok(result)
     }
 
-    /// encrypts raw data using the configured cipher, returns ciphertext and nonce
-    fn encrypt_raw(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-        const AD: &[u8] = b"";
-        self.encrypt_raw_with_ad(plaintext, AD)
-    }
-
     /// encrypts raw data with associated data using the configured cipher
     fn encrypt_raw_with_ad(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         macro_rules! encrypt_cipher {
@@ -990,11 +1087,6 @@ impl EncryptionContext {
             Cipher::Aegis128X2(cipher) => encrypt_cipher!(cipher),
             Cipher::Aegis128X4(cipher) => encrypt_cipher!(cipher),
         }
-    }
-
-    fn decrypt_raw(&self, ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
-        const AD: &[u8] = b"";
-        self.decrypt_raw_with_ad(ciphertext, nonce, AD)
     }
 
     fn decrypt_raw_with_ad(&self, ciphertext: &[u8], nonce: &[u8], ad: &[u8]) -> Result<Vec<u8>> {
@@ -1148,16 +1240,21 @@ mod tests {
             #[test]
             fn $test_name() {
                 let key = EncryptionKey::from_hex_string(&$key_gen()).unwrap();
-                let ctx = EncryptionContext::new($cipher_mode, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
-                    .unwrap();
+                let ctx = EncryptionContext::new(
+                    $cipher_mode,
+                    &key,
+                    DEFAULT_ENCRYPTED_PAGE_SIZE,
+                    EncryptionFormat::CURRENT,
+                )
+                .unwrap();
 
                 let plaintext = $message.as_bytes();
-                let (ciphertext, nonce) = ctx.encrypt_raw(plaintext).unwrap();
+                let (ciphertext, nonce) = ctx.encrypt_raw_with_ad(plaintext, b"").unwrap();
 
                 assert_eq!(nonce.len(), $nonce_size);
                 assert_ne!(ciphertext[..plaintext.len()], plaintext[..]);
 
-                let decrypted = ctx.decrypt_raw(&ciphertext, &nonce).unwrap();
+                let decrypted = ctx.decrypt_raw_with_ad(&ciphertext, &nonce, b"").unwrap();
                 assert_eq!(decrypted, plaintext);
 
                 let mut in_place_ciphertext = plaintext.to_vec();
@@ -1166,7 +1263,9 @@ mod tests {
                 ctx.encrypt_chunk_in_place(&mut in_place_ciphertext, b"", &mut tag, &mut nonce)
                     .unwrap();
                 in_place_ciphertext.extend_from_slice(&tag);
-                let decrypted = ctx.decrypt_raw(&in_place_ciphertext, &nonce).unwrap();
+                let decrypted = ctx
+                    .decrypt_raw_with_ad(&in_place_ciphertext, &nonce, b"")
+                    .unwrap();
                 assert_eq!(decrypted, plaintext);
             }
         };
@@ -1214,8 +1313,13 @@ mod tests {
     #[test]
     fn test_page_1_encrypt_decrypt_round_trip_with_ad() {
         let key = EncryptionKey::from_hex_string(&generate_random_hex_key()).unwrap();
-        let ctx = EncryptionContext::new(CipherMode::Aegis256, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
-            .unwrap();
+        let ctx = EncryptionContext::new(
+            CipherMode::Aegis256,
+            &key,
+            DEFAULT_ENCRYPTED_PAGE_SIZE,
+            EncryptionFormat::CURRENT,
+        )
+        .unwrap();
 
         let page_data = create_test_page_1();
         let encrypted = ctx.encrypt_page(&page_data, 1).unwrap();
@@ -1228,7 +1332,7 @@ mod tests {
 
         // check that header is readable directly from disk (not encrypted)
         assert_eq!(&encrypted[..5], b"Turso");
-        assert_eq!(encrypted[5], TURSO_VERSION);
+        assert_eq!(encrypted[5], EncryptionFormat::CURRENT.version());
         assert_eq!(encrypted[6], CipherMode::Aegis256.cipher_id());
 
         // header should be unencrypted, but data after DatabaseHeader::SIZE should be different
@@ -1247,8 +1351,13 @@ mod tests {
     #[test]
     fn test_turso_header_validation() {
         let key = EncryptionKey::from_hex_string(&generate_random_hex_key()).unwrap();
-        let ctx = EncryptionContext::new(CipherMode::Aegis256, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
-            .unwrap();
+        let ctx = EncryptionContext::new(
+            CipherMode::Aegis256,
+            &key,
+            DEFAULT_ENCRYPTED_PAGE_SIZE,
+            EncryptionFormat::CURRENT,
+        )
+        .unwrap();
 
         // test cipher_id conversion
         assert_eq!(CipherMode::Aes128Gcm.cipher_id(), 1);
@@ -1267,7 +1376,7 @@ mod tests {
         // test header creation
         let header = ctx.create_turso_header();
         assert_eq!(&header[..5], b"Turso");
-        assert_eq!(header[5], TURSO_VERSION);
+        assert_eq!(header[5], EncryptionFormat::CURRENT.version());
         assert_eq!(header[6], 3); // AEGIS-256
         assert_eq!(&header[7..], &[0u8; 9]); // unused bytes are zero
     }
@@ -1275,8 +1384,13 @@ mod tests {
     #[test]
     fn test_invalid_turso_header_fails_decrypt() {
         let key = EncryptionKey::from_hex_string(&generate_random_hex_key()).unwrap();
-        let ctx = EncryptionContext::new(CipherMode::Aegis256, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
-            .unwrap();
+        let ctx = EncryptionContext::new(
+            CipherMode::Aegis256,
+            &key,
+            DEFAULT_ENCRYPTED_PAGE_SIZE,
+            EncryptionFormat::CURRENT,
+        )
+        .unwrap();
 
         let page_data = create_test_page_1();
         let encrypted = ctx.encrypt_page(&page_data, 1).unwrap();
@@ -1295,8 +1409,13 @@ mod tests {
     #[test]
     fn test_associated_data_validation() {
         let key = EncryptionKey::from_hex_string(&generate_random_hex_key()).unwrap();
-        let ctx = EncryptionContext::new(CipherMode::Aegis256, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
-            .unwrap();
+        let ctx = EncryptionContext::new(
+            CipherMode::Aegis256,
+            &key,
+            DEFAULT_ENCRYPTED_PAGE_SIZE,
+            EncryptionFormat::CURRENT,
+        )
+        .unwrap();
 
         let page_data = create_test_page_1();
         let encrypted = ctx.encrypt_page(&page_data, 1).unwrap();
@@ -1316,8 +1435,13 @@ mod tests {
     #[test]
     fn test_turso_header_corruption_detection() {
         let key = EncryptionKey::from_hex_string(&generate_random_hex_key()).unwrap();
-        let ctx = EncryptionContext::new(CipherMode::Aegis256, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
-            .unwrap();
+        let ctx = EncryptionContext::new(
+            CipherMode::Aegis256,
+            &key,
+            DEFAULT_ENCRYPTED_PAGE_SIZE,
+            EncryptionFormat::CURRENT,
+        )
+        .unwrap();
 
         let page_data = create_test_page_1();
         let encrypted = ctx.encrypt_page(&page_data, 1).unwrap();
@@ -1330,6 +1454,129 @@ mod tests {
             decrypt_result.is_err(),
             "Decryption should fail with corrupted Turso header"
         );
+    }
+
+    #[test]
+    fn test_format_1_binds_pages_to_their_page_numbers() {
+        for (cipher_mode, key) in all_cipher_keys() {
+            let ctx = EncryptionContext::new(
+                cipher_mode,
+                &key,
+                DEFAULT_ENCRYPTED_PAGE_SIZE,
+                EncryptionFormat::V1,
+            )
+            .unwrap();
+            let page = create_test_page(cipher_mode);
+            for page_id in [2, 3, u32::MAX as usize] {
+                let encrypted = ctx.encrypt_page(&page, page_id).unwrap();
+                assert_eq!(ctx.decrypt_page(&encrypted, page_id).unwrap(), page);
+                for other_page_id in [2, 3, u32::MAX as usize] {
+                    if other_page_id != page_id {
+                        assert!(
+                            ctx.decrypt_page(&encrypted, other_page_id).is_err(),
+                            "{cipher_mode}: page {page_id} decrypted as page {other_page_id}"
+                        );
+                    }
+                }
+            }
+            #[cfg(target_pointer_width = "64")]
+            assert!(ctx.encrypt_page(&page, u32::MAX as usize + 1).is_err());
+        }
+    }
+
+    #[test]
+    fn test_format_0_pages_have_no_associated_data() {
+        for (cipher_mode, key) in all_cipher_keys() {
+            let new_ctx = |format| {
+                EncryptionContext::new(cipher_mode, &key, DEFAULT_ENCRYPTED_PAGE_SIZE, format)
+                    .unwrap()
+            };
+            let format_0 = new_ctx(EncryptionFormat::V0);
+            let format_1 = new_ctx(EncryptionFormat::V1);
+            let page = create_test_page(cipher_mode);
+            // Databases in format 0 keep the behavior that they had before format 1.
+            let encrypted = format_0.encrypt_page(&page, 2).unwrap();
+            assert_eq!(format_0.decrypt_page(&encrypted, 3).unwrap(), page);
+            // A page in one format does not decrypt in the other format.
+            assert!(format_1.decrypt_page(&encrypted, 2).is_err());
+            let encrypted = format_1.encrypt_page(&page, 2).unwrap();
+            assert!(format_0.decrypt_page(&encrypted, 2).is_err());
+        }
+    }
+
+    #[test]
+    fn test_page_1_stores_the_format() {
+        let key = EncryptionKey::from_hex_string(&generate_random_hex_key()).unwrap();
+        let new_ctx = |format| {
+            EncryptionContext::new(
+                CipherMode::Aegis256,
+                &key,
+                DEFAULT_ENCRYPTED_PAGE_SIZE,
+                format,
+            )
+            .unwrap()
+        };
+        let page = create_test_page_1();
+        assert_eq!(EncryptionFormat::from_page_1(&page).unwrap(), None);
+        for (format, other) in [
+            (EncryptionFormat::V0, EncryptionFormat::V1),
+            (EncryptionFormat::V1, EncryptionFormat::V0),
+        ] {
+            let ctx = new_ctx(format);
+            let encrypted = ctx.encrypt_page(&page, 1).unwrap();
+            assert_eq!(encrypted[VERSION_OFFSET], format.version());
+            assert_eq!(
+                EncryptionFormat::from_page_1(&encrypted).unwrap(),
+                Some(format)
+            );
+            assert_eq!(ctx.decrypt_page(&encrypted, 1).unwrap(), page);
+
+            // A context for the other format refuses this page 1, also after the version byte
+            // is changed to its version, because the version byte is associated data.
+            let other_ctx = new_ctx(other);
+            assert!(other_ctx.decrypt_page(&encrypted, 1).is_err());
+            let mut changed = encrypted.clone();
+            changed[VERSION_OFFSET] = other.version();
+            assert!(other_ctx.decrypt_page(&changed, 1).is_err());
+
+            changed[VERSION_OFFSET] = 2;
+            assert!(EncryptionFormat::from_page_1(&changed).is_err());
+        }
+    }
+
+    /// Returns every cipher with a random key of the size that it requires.
+    fn all_cipher_keys() -> Vec<(CipherMode, EncryptionKey)> {
+        [
+            CipherMode::Aes128Gcm,
+            CipherMode::Aes256Gcm,
+            CipherMode::Aegis256,
+            CipherMode::Aegis256X2,
+            CipherMode::Aegis256X4,
+            CipherMode::Aegis128L,
+            CipherMode::Aegis128X2,
+            CipherMode::Aegis128X4,
+        ]
+        .into_iter()
+        .map(|cipher_mode| {
+            let hex_key = if cipher_mode.required_key_size() == 16 {
+                generate_random_hex_key_128()
+            } else {
+                generate_random_hex_key()
+            };
+            (
+                cipher_mode,
+                EncryptionKey::from_hex_string(&hex_key).unwrap(),
+            )
+        })
+        .collect()
+    }
+
+    /// Returns a page with random content and the empty reserved space that `cipher_mode`
+    /// needs.
+    fn create_test_page(cipher_mode: CipherMode) -> Vec<u8> {
+        let mut page = vec![0u8; DEFAULT_ENCRYPTED_PAGE_SIZE];
+        rand::rng().fill(&mut page[..DEFAULT_ENCRYPTED_PAGE_SIZE - cipher_mode.metadata_size()]);
+        page
     }
 
     #[test]
@@ -1348,8 +1595,13 @@ mod tests {
         };
 
         let key = EncryptionKey::from_hex_string(&generate_random_hex_key_128()).unwrap();
-        let ctx = EncryptionContext::new(CipherMode::Aes128Gcm, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
-            .unwrap();
+        let ctx = EncryptionContext::new(
+            CipherMode::Aes128Gcm,
+            &key,
+            DEFAULT_ENCRYPTED_PAGE_SIZE,
+            EncryptionFormat::CURRENT,
+        )
+        .unwrap();
 
         let page_id = 42;
         let encrypted = ctx.encrypt_page(&page_data, page_id).unwrap();
@@ -1378,8 +1630,13 @@ mod tests {
         };
 
         let key = EncryptionKey::from_hex_string(&generate_random_hex_key()).unwrap();
-        let ctx = EncryptionContext::new(CipherMode::Aes256Gcm, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
-            .unwrap();
+        let ctx = EncryptionContext::new(
+            CipherMode::Aes256Gcm,
+            &key,
+            DEFAULT_ENCRYPTED_PAGE_SIZE,
+            EncryptionFormat::CURRENT,
+        )
+        .unwrap();
 
         let page_id = 42;
         let encrypted = ctx.encrypt_page(&page_data, page_id).unwrap();
@@ -1424,8 +1681,13 @@ mod tests {
         };
 
         let key = EncryptionKey::from_hex_string(&generate_random_hex_key()).unwrap();
-        let ctx = EncryptionContext::new(CipherMode::Aegis256, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
-            .unwrap();
+        let ctx = EncryptionContext::new(
+            CipherMode::Aegis256,
+            &key,
+            DEFAULT_ENCRYPTED_PAGE_SIZE,
+            EncryptionFormat::CURRENT,
+        )
+        .unwrap();
 
         let page_id = 42;
         let encrypted = ctx.encrypt_page(&page_data, page_id).unwrap();
@@ -1469,8 +1731,13 @@ mod tests {
         };
 
         let key = EncryptionKey::from_hex_string(&generate_random_hex_key_128()).unwrap();
-        let ctx = EncryptionContext::new(CipherMode::Aegis128X2, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
-            .unwrap();
+        let ctx = EncryptionContext::new(
+            CipherMode::Aegis128X2,
+            &key,
+            DEFAULT_ENCRYPTED_PAGE_SIZE,
+            EncryptionFormat::CURRENT,
+        )
+        .unwrap();
 
         let page_id = 42;
         let encrypted = ctx.encrypt_page(&page_data, page_id).unwrap();
@@ -1514,8 +1781,13 @@ mod tests {
         };
 
         let key = EncryptionKey::from_hex_string(&generate_random_hex_key_128()).unwrap();
-        let ctx = EncryptionContext::new(CipherMode::Aegis128L, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
-            .unwrap();
+        let ctx = EncryptionContext::new(
+            CipherMode::Aegis128L,
+            &key,
+            DEFAULT_ENCRYPTED_PAGE_SIZE,
+            EncryptionFormat::CURRENT,
+        )
+        .unwrap();
 
         let page_id = 42;
         let encrypted = ctx.encrypt_page(&page_data, page_id).unwrap();
@@ -1559,8 +1831,13 @@ mod tests {
         };
 
         let key = EncryptionKey::from_hex_string(&generate_random_hex_key_128()).unwrap();
-        let ctx = EncryptionContext::new(CipherMode::Aegis128X4, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
-            .unwrap();
+        let ctx = EncryptionContext::new(
+            CipherMode::Aegis128X4,
+            &key,
+            DEFAULT_ENCRYPTED_PAGE_SIZE,
+            EncryptionFormat::CURRENT,
+        )
+        .unwrap();
 
         let page_id = 42;
         let encrypted = ctx.encrypt_page(&page_data, page_id).unwrap();
@@ -1604,8 +1881,13 @@ mod tests {
         };
 
         let key = EncryptionKey::from_hex_string(&generate_random_hex_key()).unwrap();
-        let ctx = EncryptionContext::new(CipherMode::Aegis256X2, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
-            .unwrap();
+        let ctx = EncryptionContext::new(
+            CipherMode::Aegis256X2,
+            &key,
+            DEFAULT_ENCRYPTED_PAGE_SIZE,
+            EncryptionFormat::CURRENT,
+        )
+        .unwrap();
 
         let page_id = 42;
         let encrypted = ctx.encrypt_page(&page_data, page_id).unwrap();
@@ -1649,8 +1931,13 @@ mod tests {
         };
 
         let key = EncryptionKey::from_hex_string(&generate_random_hex_key()).unwrap();
-        let ctx = EncryptionContext::new(CipherMode::Aegis256X4, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
-            .unwrap();
+        let ctx = EncryptionContext::new(
+            CipherMode::Aegis256X4,
+            &key,
+            DEFAULT_ENCRYPTED_PAGE_SIZE,
+            EncryptionFormat::CURRENT,
+        )
+        .unwrap();
 
         let page_id = 42;
         let encrypted = ctx.encrypt_page(&page_data, page_id).unwrap();

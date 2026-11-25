@@ -193,7 +193,7 @@ pub use statement::{
 pub use storage::{
     buffer_pool::BufferPool,
     database::{DatabaseStorage, IOContext},
-    encryption::{CipherMode, EncryptionContext, EncryptionKey},
+    encryption::{CipherMode, EncryptionContext, EncryptionFormat, EncryptionKey},
     page_transform::{PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation},
     pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},

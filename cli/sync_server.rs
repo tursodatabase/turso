@@ -2163,6 +2163,7 @@ mod tests {
                     EncryptionKey::new_256([12; 32])
                 },
                 PAGE_SIZE,
+                turso_core::EncryptionFormat::CURRENT,
             )
             .unwrap();
             assert!(normalize_mvcc_log(&log, Some(&wrong_key)).is_err());

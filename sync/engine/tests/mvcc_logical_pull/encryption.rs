@@ -94,6 +94,7 @@ fn interrupted_encrypted_bootstrap_requires_explicit_cleanup() {
             turso_core::CipherMode::Aes256Gcm,
             &turso_core::EncryptionKey::new_256([22; 32]),
             4096,
+            turso_core::EncryptionFormat::CURRENT,
         )
         .unwrap();
         let page = crypto.decrypt_page(&bytes[..4096], 1).unwrap();
@@ -454,6 +455,7 @@ fn encrypted_bootstrap_failures_around_sync_and_metadata_publication() {
             turso_core::CipherMode::Aes256Gcm,
             &turso_core::EncryptionKey::new_256([22; 32]),
             4096,
+            turso_core::EncryptionFormat::CURRENT,
         )
         .unwrap();
         for (index, page) in main.chunks_exact(4096).enumerate() {

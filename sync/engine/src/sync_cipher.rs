@@ -186,7 +186,8 @@ mod tests {
             } else {
                 EncryptionKey::new_256([7; 32])
             };
-            EncryptionContext::new(cipher, &key, 4096).expect("valid cipher")
+            EncryptionContext::new(cipher, &key, 4096, turso_core::EncryptionFormat::CURRENT)
+                .expect("valid cipher")
         })
     }
 
@@ -276,6 +277,7 @@ mod tests {
             CipherMode::Aes128Gcm,
             &EncryptionKey::new_128([8; 16]),
             4096,
+            turso_core::EncryptionFormat::CURRENT,
         )
         .expect("context");
         let bytes = seal_metadata(&crypto, b"metadata").expect("seal");

@@ -6160,7 +6160,7 @@ mod tests {
     #[test]
     fn strict_frame_codec_matches_native_writer() {
         use super::frame_codec::*;
-        use crate::{CipherMode, EncryptionContext, EncryptionKey};
+        use crate::{CipherMode, EncryptionContext, EncryptionFormat, EncryptionKey};
 
         for cipher in [
             CipherMode::Aes128Gcm,
@@ -6177,7 +6177,8 @@ mod tests {
             } else {
                 EncryptionKey::new_256([42; 32])
             };
-            let crypto = EncryptionContext::new(cipher, &key, 4096).expect("crypto");
+            let crypto = EncryptionContext::new(cipher, &key, 4096, EncryptionFormat::CURRENT)
+                .expect("crypto");
             for portable in [false, true] {
                 let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
                 let file = open_test_file(&io, "codec.db-log");
@@ -6460,17 +6461,27 @@ mod tests {
     }
 
     fn test_enc_ctx() -> crate::storage::encryption::EncryptionContext {
-        use crate::storage::encryption::{CipherMode, EncryptionKey};
+        use crate::storage::encryption::{CipherMode, EncryptionFormat, EncryptionKey};
         let key = EncryptionKey::Key128([0x42u8; 16]);
-        crate::storage::encryption::EncryptionContext::new(CipherMode::Aes128Gcm, &key, 4096)
-            .unwrap()
+        crate::storage::encryption::EncryptionContext::new(
+            CipherMode::Aes128Gcm,
+            &key,
+            4096,
+            EncryptionFormat::CURRENT,
+        )
+        .unwrap()
     }
 
     fn wrong_key_enc_ctx() -> crate::storage::encryption::EncryptionContext {
-        use crate::storage::encryption::{CipherMode, EncryptionKey};
+        use crate::storage::encryption::{CipherMode, EncryptionFormat, EncryptionKey};
         let key = EncryptionKey::Key128([0xFFu8; 16]);
-        crate::storage::encryption::EncryptionContext::new(CipherMode::Aes128Gcm, &key, 4096)
-            .unwrap()
+        crate::storage::encryption::EncryptionContext::new(
+            CipherMode::Aes128Gcm,
+            &key,
+            4096,
+            EncryptionFormat::CURRENT,
+        )
+        .unwrap()
     }
 
     fn make_test_row_version(

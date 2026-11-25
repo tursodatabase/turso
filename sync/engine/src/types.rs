@@ -904,6 +904,7 @@ mod tests {
             turso_core::CipherMode::Aes256Gcm,
             &turso_core::EncryptionKey::new_256([7; 32]),
             4096,
+            turso_core::EncryptionFormat::CURRENT,
         )
         .unwrap();
         let sealed = meta.dump_with_encryption(Some(&crypto)).unwrap();

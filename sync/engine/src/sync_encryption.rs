@@ -1,4 +1,6 @@
-use turso_core::{CipherMode, ConnectOpts, EncryptionContext, EncryptionKey, EncryptionOpts};
+use turso_core::{
+    CipherMode, ConnectOpts, EncryptionContext, EncryptionFormat, EncryptionKey, EncryptionOpts,
+};
 
 use crate::{errors::Error, types::Secret, Result};
 
@@ -77,9 +79,15 @@ impl SyncEncryption {
 
     /// Encryption context for the local database, absent when there is no local key.
     pub fn local_context(&self) -> Result<Option<EncryptionContext>> {
+        // The sync engine encrypts pages with this context only when a bootstrap writes a new
+        // database, so the pages use the format of new databases. Core opens the database later
+        // and reads that format from page 1.
         self.local_key
             .as_ref()
-            .map(|key| EncryptionContext::new(self.cipher, key, 4096).map_err(Error::from))
+            .map(|key| {
+                EncryptionContext::new(self.cipher, key, 4096, EncryptionFormat::CURRENT)
+                    .map_err(Error::from)
+            })
             .transpose()
     }
 

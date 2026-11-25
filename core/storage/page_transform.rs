@@ -159,7 +159,10 @@ impl EncryptionPageCodec {
 
 impl PageCodec for EncryptionPageCodec {
     fn codec_id(&self) -> PageCodecId {
-        let mut id = *b"turso-encrypt-v0";
+        // The encryption format and the cipher both change the encoded bytes.
+        let mut id = [0; 16];
+        id[..14].copy_from_slice(b"turso-encrypt-");
+        id[14] = self.context.format().version();
         id[15] = self.context.cipher_mode().cipher_id();
         PageCodecId::new(id)
     }
@@ -250,9 +253,11 @@ mod tests {
 
     #[test]
     fn encryption_encoder_rejects_changed_page_one_layout_before_writing_output() {
-        use crate::storage::encryption::{CipherMode, EncryptionKey};
+        use crate::storage::encryption::{CipherMode, EncryptionFormat, EncryptionKey};
         let key = EncryptionKey::new_256([7; 32]);
-        let ctx = EncryptionContext::new(CipherMode::Aegis256, &key, 4096).unwrap();
+        let ctx =
+            EncryptionContext::new(CipherMode::Aegis256, &key, 4096, EncryptionFormat::CURRENT)
+                .unwrap();
         let codec = EncryptionPageCodec { context: ctx };
         let mut page = vec![0; 4096];
         page[..16].copy_from_slice(b"SQLite format 3\0");

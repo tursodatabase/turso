@@ -9576,7 +9576,13 @@ fn test_mvcc_portable_changes_are_encrypted_with_log_body() {
     assert!(!bytes_contain(&log_bytes, b"secret-alpha"));
 
     let key = EncryptionKey::from_hex_string(hex_key).unwrap();
-    let enc_ctx = EncryptionContext::new(CipherMode::Aes256Gcm, &key, 4096).unwrap();
+    let enc_ctx = EncryptionContext::new(
+        CipherMode::Aes256Gcm,
+        &key,
+        4096,
+        turso_core::EncryptionFormat::CURRENT,
+    )
+    .unwrap();
     let portable_changes = collect_mvcc_portable_change_bytes_with_encryption(&conn, enc_ctx);
     let txns = decode_portable_change_txns(&portable_changes);
     let objects = decoded_object_maps(&txns);
@@ -13502,6 +13508,7 @@ fn test_encrypted_recovery_corrupted_later_chunk_keeps_checkpointed_prefix() {
         turso_core::CipherMode::Aes256Gcm,
         &EncryptionKey::from_hex_string(hex_key).unwrap(),
         4096,
+        turso_core::EncryptionFormat::CURRENT,
     )
     .unwrap();
     let first_chunk_on_disk_size =
@@ -13654,7 +13661,8 @@ fn assert_log_payloads_decrypt(
     );
 
     let key = EncryptionKey::from_hex_string(hex_key).unwrap();
-    let enc_ctx = EncryptionContext::new(cipher, &key, 4096).unwrap();
+    let enc_ctx =
+        EncryptionContext::new(cipher, &key, 4096, turso_core::EncryptionFormat::CURRENT).unwrap();
     let nonce_size = enc_ctx.nonce_size();
     let tag_size = enc_ctx.tag_size();
 

@@ -37,7 +37,12 @@ impl Remote {
         let crypto = key
             .as_ref()
             .map(|key| {
-                turso_core::EncryptionContext::new(turso_core::CipherMode::Aes256Gcm, key, 4096)
+                turso_core::EncryptionContext::new(
+                    turso_core::CipherMode::Aes256Gcm,
+                    key,
+                    4096,
+                    turso_core::EncryptionFormat::CURRENT,
+                )
             })
             .transpose()?;
         let dir = tempfile::tempdir()?;

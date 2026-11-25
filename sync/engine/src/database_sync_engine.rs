@@ -4325,6 +4325,7 @@ mod tests {
             turso_core::CipherMode::Aes256Gcm,
             &turso_core::EncryptionKey::new_256([1; 32]),
             4096,
+            turso_core::EncryptionFormat::CURRENT,
         )
         .expect("crypto");
         let mut gen = genawaiter::sync::Gen::new(|co| async {
@@ -4996,6 +4997,7 @@ mod tests {
                         turso_core::CipherMode::Aes256Gcm,
                         &turso_core::EncryptionKey::new_256([3; 32]),
                         4096,
+                        turso_core::EncryptionFormat::CURRENT,
                     )
                     .unwrap();
                     let mut staging = crate::changes_file::ChangesFile::new(file, Some(crypto));

@@ -56,7 +56,9 @@ use super::sqlite3_ondisk::{
 };
 use super::sqlite3_ondisk::{read_varint, read_varint_len, split_varint};
 use super::wal::{CheckpointMode, WalAutoActions};
-use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey, SQLITE_HEADER};
+use crate::storage::encryption::{
+    CipherMode, EncryptionContext, EncryptionFormat, EncryptionKey, SQLITE_HEADER,
+};
 
 /// SQLite's default maximum page count
 const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
@@ -1584,8 +1586,15 @@ pub struct SharedPagerState {
     encryption_cipher: CipherMode,
     /// Encrypted sample for checking keys before the first write and on cached opens.
     encryption_verifier: Option<Box<[u8]>>,
+    /// The version byte of the encryption format of an encrypted database, or
+    /// `ENCRYPTION_FORMAT_NOT_SET`. A new database uses the current format. For an existing
+    /// database it is set when a pager first authenticates page 1, which stores the format.
+    encryption_format: AtomicU8,
     page_size: AtomicU32,
 }
+
+/// The value of `SharedPagerState::encryption_format` before the format is known.
+const ENCRYPTION_FORMAT_NOT_SET: u8 = u8::MAX;
 
 impl SharedPagerState {
     pub fn new(init_page_1: Option<PageRef>) -> Self {
@@ -1611,6 +1620,7 @@ impl SharedPagerState {
                 cipher,
                 key.expect("encrypted pager initialization requires a key"),
                 contents.as_ptr().len(),
+                EncryptionFormat::CURRENT,
             )?;
             Some(
                 context
@@ -1620,11 +1630,18 @@ impl SharedPagerState {
         } else {
             None
         };
+        // This database object writes page 1 of a new database, in the current format.
+        let encryption_format = if cipher != CipherMode::None && init_page_1.is_some() {
+            EncryptionFormat::CURRENT.version()
+        } else {
+            ENCRYPTION_FORMAT_NOT_SET
+        };
         Ok(Self {
             init_lock: Mutex::new(()),
             init_page_1: ArcSwapOption::new(init_page_1),
             encryption_cipher: cipher,
             encryption_verifier,
+            encryption_format: AtomicU8::new(encryption_format),
             page_size: AtomicU32::new(page_size),
         })
     }
@@ -1633,17 +1650,57 @@ impl SharedPagerState {
         self.encryption_cipher
     }
 
+    /// Checks `key` and returns a context for the pages of the database. The context uses the
+    /// recorded encryption format, or the current format if the format is not known yet.
     pub(crate) fn verify_encryption_key(&self, key: &EncryptionKey) -> Result<EncryptionContext> {
         // The key is not stored in shared database state, so verify it by decrypting the sample.
         let sample = self
             .encryption_verifier
             .as_deref()
             .expect("encrypted database has a verifier");
-        let context = EncryptionContext::new(self.encryption_cipher, key, sample.len())?;
+        // The sample is in the current format, which can be different from the database format.
+        let context = EncryptionContext::new(
+            self.encryption_cipher,
+            key,
+            sample.len(),
+            EncryptionFormat::CURRENT,
+        )?;
         context.decrypt_page(sample, 1).map_err(|_| {
             LimboError::CompletionError(CompletionError::DecryptionError { page_idx: 1 })
         })?;
-        Ok(context)
+        Ok(context.with_format(
+            self.encryption_format()
+                .unwrap_or(EncryptionFormat::CURRENT),
+        ))
+    }
+
+    /// Returns the encryption format of an encrypted database, if it is known.
+    pub(crate) fn encryption_format(&self) -> Option<EncryptionFormat> {
+        match self.encryption_format.load(Ordering::Acquire) {
+            ENCRYPTION_FORMAT_NOT_SET => None,
+            version => Some(
+                EncryptionFormat::from_version(version)
+                    .expect("only valid format versions are stored"),
+            ),
+        }
+    }
+
+    /// Records the encryption format from an authenticated page 1. All the pages of a database
+    /// use one format, so a different format than the recorded one is an error.
+    pub(crate) fn set_encryption_format(&self, format: EncryptionFormat) -> Result<()> {
+        match self.encryption_format.compare_exchange(
+            ENCRYPTION_FORMAT_NOT_SET,
+            format.version(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(current) if current == format.version() => Ok(()),
+            Err(current) => Err(LimboError::InvalidArgument(format!(
+                "page 1 has encryption format version {}, but the database uses encryption format version {current}",
+                format.version()
+            ))),
+        }
     }
 
     pub(crate) fn page_size(&self) -> Option<PageSize> {
@@ -6436,6 +6493,11 @@ impl Pager {
 
     pub(crate) fn set_authenticated_header(&mut self, header: AuthenticatedHeader) -> Result<()> {
         let (page_size, reserved_space, io_ctx) = header.into_parts(&self.shared)?;
+        // Other pagers of this database use the recorded format, also when they skip reading
+        // page 1 because the database is cached.
+        if let Some(context) = io_ctx.encryption_context() {
+            self.shared.set_encryption_format(context.format())?;
+        }
         self.set_page_size(page_size);
         if let Some(reserved_space) = reserved_space {
             self.set_reserved_space(reserved_space);
@@ -6936,6 +6998,52 @@ mod tests {
         let page_key = PageCacheKey::new(1);
         let page = cache.get(&page_key).unwrap();
         assert_eq!(page.unwrap().get().id(), 1);
+    }
+
+    /// All the pagers of a database use one encryption format. A new database uses the current format,
+    /// and an existing database uses the format that its authenticated page 1 has.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn shared_pager_state_keeps_one_encryption_format() {
+        use crate::storage::encryption::{CipherMode, EncryptionFormat, EncryptionKey};
+
+        let cipher = CipherMode::Aegis256;
+        let key = EncryptionKey::new_256([1; 32]);
+        let new_database = SharedPagerState::with_encryption(
+            Some(default_page1(Some(&cipher))),
+            cipher,
+            Some(&key),
+        )
+        .unwrap();
+        assert_eq!(
+            new_database.encryption_format(),
+            Some(EncryptionFormat::CURRENT)
+        );
+        assert_eq!(
+            new_database.verify_encryption_key(&key).unwrap().format(),
+            EncryptionFormat::CURRENT
+        );
+
+        for (format, other) in [
+            (EncryptionFormat::V0, EncryptionFormat::V1),
+            (EncryptionFormat::V1, EncryptionFormat::V0),
+        ] {
+            let existing_database =
+                SharedPagerState::with_encryption(None, cipher, Some(&key)).unwrap();
+            assert_eq!(existing_database.encryption_format(), None);
+            existing_database.set_encryption_format(format).unwrap();
+            existing_database.set_encryption_format(format).unwrap();
+            assert!(existing_database.set_encryption_format(other).is_err());
+            assert_eq!(existing_database.encryption_format(), Some(format));
+            // A cached open does not read page 1, so it gets the recorded format.
+            assert_eq!(
+                existing_database
+                    .verify_encryption_key(&key)
+                    .unwrap()
+                    .format(),
+                format
+            );
+        }
     }
 }
 
